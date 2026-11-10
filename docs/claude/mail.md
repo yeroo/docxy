@@ -2871,22 +2871,36 @@ links in one cheap read.
   as #2088's does. A link minted before #2096 carries the old `$select` and `$expand`, so
   new mail through it would never get either id, and `isDraft` would stay unread. The
   cost is one more re-enumeration. A pre-#2054 store runs every migration on one open.
+  In the same transaction, a one-off body fix: a draft body an engine from before #1901
+  wrote as compose html under `content_type = 'text'` becomes `html`, so lookxy's text
+  branch does not show (and save) its tags. It touches only a local write (`fetched_as IS
+  NULL`) of a draft row (`is_draft`, or filed in Drafts or the local sentinel, as
+  `get_body_for` decides) whose content starts as `compose_html::to_html` output does
+  (`<p>`, `<ul><li>`, `<ol><li>`). A genuine text body (a plain-text `createReply`), a
+  fetched body and a non-draft body are left alone. Every pre-#1901 store is pre-#2096,
+  so each gets the fix once.
 - Readers of `is_draft` that change behaviour:
-  - lookxy (`app.rs`, the list's Enter, and its cursor preview and PgUp/PgDn, which
-    skip drafts) sends an `is_draft` row to `open_draft`. A draft synced from Outlook
-    or the web now opens in compose, as Outlook does, once its body is stored. Nothing
-    fetches a draft's body on its own (`body_candidates` and `needs_body` skip drafts),
-    and `Store::draft` joins `bodies`. So `open_draft` opens a draft row with no stored
-    body in the reader, whose `reload_body` sends `FetchBody`, and the next activate
-    opens compose. A list click (`on_left_click`) on a draft row activates it at once,
-    as Enter does: the click-to-preview path skips drafts, so a click could otherwise
-    never open one. Compose honours the stored body's type (`draft_rich_text`): an
-    `html` body is parsed as HTML, and any other (the `text` body `FetchBody` stores
-    under lookxy's `BodyFormat::Text`, a plain-text `createReply`) becomes one
-    paragraph per line, so line breaks and `<alice@x>` survive and Save does not PATCH
-    a mangled body. Known limit: a draft an older `update_draft_fields` left as html
-    under `content_type = 'text'` now opens showing its tags. That is a visible host
-    change.
+  - lookxy: a draft made in Outlook or on the web opens read-only in the reader, as it
+    did before #2096 (when it read `is_draft = 0`); editing it in lookxy is not
+    supported (a follow-up). `open_draft` opens the composer only for a draft whose body
+    was written here (`Store::draft_body_is_local`: a body row with `fetched_as IS
+    NULL`, which only `update_draft_fields`, `create_local_draft` and a composed
+    reply/forward's `put_body` write). A draft with no body, or with one `FetchBody`
+    stored (Graph's rendering, text under lookxy's `BodyFormat::Text`), opens in the
+    reader (`open_message`), which fetches a missing body. So Graph's rendering is
+    never edited and saved back over the server's draft. `Store::draft`, which the
+    outbox also reads, is unchanged.
+  - lookxy's list: Enter, and a click on a message row (flat, or a thread's message
+    row; `on_left_click` activates a draft row at once, since the click-to-preview path
+    skips drafts), both go through `open_draft`. A click on a thread header still only
+    selects and toggles. Cursor preview and PgUp/PgDn skip drafts, as before.
+  - lookxy's composer honours a local body's type (`draft_rich_text`): an `html` body is
+    parsed as HTML, and any other (a `createReply` of a plain-text message) becomes one
+    paragraph per line, so line breaks and `<alice@x>` survive. Esc on a draft unchanged
+    since `open_draft` opened it (`App::compose_baseline`, a `ComposeSnapshot` of the
+    fields, the body's HTML and the attachments) saves nothing: no `update_draft_fields`,
+    no `SaveDraft`. A `local:` draft still saves, since its Save is what creates it on
+    Graph, and Send always sends.
   - Known limit: `Store::headerless_message_ids` leaves out `is_draft = 1` rows as
     made here. A new row first seen as a partial delta item carrying `isDraft: true`
     and no `receivedDateTime` is never completed by #1899's repair (before this issue a
@@ -2895,7 +2909,9 @@ links in one cheap read.
   - The `mark_sent` race (SendDraft's optimistic `is_draft = 0`, then a Drafts delta
     reporting the draft as 1) adds no new failure mode: the folder already flips back in
     that race, and the outbox drains before a folder's delta.
-- Not done: any host UI (lookxy's list shows no `[Draft]`), matching on
+- Not done: editing a draft made elsewhere in lookxy (it opens read-only; a follow-up:
+  fetch it as html for compose and keep that body from the reader's text), any host UI
+  (lookxy's list shows no `[Draft]`), matching on
   `conversation_id` alone or on a draft's `References`, and backfilling `in_reply_to`
   from a body fetch's headers (#2015) for rows stored before.
 - Tests: `model.rs` `in_reply_to_prop_id_matches_its_forms_only`,
@@ -2915,6 +2931,12 @@ links in one cheap read.
   link; ComposeReply and ComposeReplyAll answering M1 with only the POST and the body,
   ComposeForward answering nothing, and a reply to a moved original through
   `current_id`); lookxy
-  `a_synced_draft_without_a_body_opens_the_reader_then_the_composer`,
-  `one_click_opens_a_synced_draft`, `a_draft_s_html_body_still_opens_as_html`; and
+  `a_synced_draft_opens_read_only_in_the_reader`,
+  `one_click_opens_a_synced_draft_in_the_reader`,
+  `a_draft_with_a_local_text_body_opens_in_compose_as_text`,
+  `a_draft_s_html_body_still_opens_as_html`,
+  `esc_on_an_unchanged_draft_saves_nothing_and_after_an_edit_saves`,
+  `esc_on_an_unchanged_new_message_still_saves_it`; store
+  `draft_body_is_local_only_for_a_body_written_here`, and the migration test's body fix;
+  and
   `a_plain_text_reply_draft_is_not_a_refetch_candidate`, which now expects `is_draft`.
