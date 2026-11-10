@@ -122,7 +122,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   The fixture adds, after the 2x2 table, a 100% table imported from HTML
   (`fitted_html`, with a link to `CELL_URL`; in the model only) and a fixed
   12000-twip table.
-- Out of scope: Find (#1887), Print Layout (#1888), keyboard selection in
+- Out of scope: Print Layout (#1888), keyboard selection in
   read-only mode (the editing mode has it), table selection zones, a
   context menu, anchor links scrolling inside the view (they reach the
   callback as `#name`), macOS ⌘-key routing for the view (untested).
@@ -286,6 +286,59 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   The `issue 2003` test in `uiharness/cases/ext-doc-view.uit` (a 1000 px
   window) checks 904 → 956 px of text, column at 48 → 22 and the page
   `262626` dark / `ffffff` light, and shoots each.
+
+## Find in the embedded view (#1887)
+
+- Ctrl+F (⌘F on macOS) in a focused `DocView` opens the view's own Find
+  box at its top right (`doc_view/find.rs`; drawn by `DocView::find_box`
+  over the scroll bars, in the theme's chrome palette), in either mode; it
+  never reaches the suite. With the box open, Ctrl+F gives its field the
+  keys again. Opening, or that, selects the field's whole text. Opening seeds the query from a
+  one-line selection, as a document tab's Find does, and stays on the
+  match the editor is already on (a reopen after Escape), else steps from
+  the caret. Escape (whatever the field focus) closes it; the match stays
+  selected and the query is kept. With the box closed Escape is the
+  editing map's again (it collapses a selection).
+- Matching and stepping are the document tab's: `Editor::find_visible`
+  (case-insensitive) and `find_step_in`, by index while `is_at_found`,
+  else from the caret; typing finds again from the top. An empty query or
+  one with no match changes nothing in the document. The current match is
+  the editor's selection; the other hits paint as amber quads at 35% over
+  the glyphs (`find::hit_quads` over this frame's `Words`, in the
+  `viewport` canvas, clipped to `find::find_view`), not in the shared
+  renderer. A step reveals the match's start piece in y and, unlike the
+  caret's reveal, in x too (`find::reveal_dx`: a match in a table wider
+  than the view). `find::find_view` (clear of both bars, and below the open
+  box's `BOX_BAND`) is what every reveal, `caret_in_view`,
+  `current_in_view` and the hit clip use, so the caret is never revealed
+  under the box either.
+- Keys (`find::find_key`, run before `edit_key`): Escape and F3 /
+  Shift+F3 while open; while the field has the keys, Enter / Shift+Enter
+  step, typing (`edit::typed_text`, the editing map's rule: AltGr types,
+  a plain Alt off macOS never does), Backspace/Delete (Ctrl too),
+  Left/Right/Home/End (Shift moves as the plain key), Ctrl+A/C/X/V on the
+  field (the view's `ClipboardStore`; Ctrl+C/X copy nothing without a
+  field selection), the scroll and zoom keys to the read-only map
+  (`view_key`), Tab / Shift+Tab nothing (`tab_action`), any other unmodified key
+  dropped and any other chord (Ctrl+W, Ctrl+S, Ctrl+Tab, Ctrl+B, Alt,
+  F-keys) on to the suite without the editing map. A press in the document
+  gives the keys back (`begin_select`, `set_caret`, the root's press); the
+  box stays with its hits. A press on the box never reaches the document
+  (`block_mouse_except_scroll`, the wheel still scrolls).
+- The suite's root never opens the document tab's Find bar on an extension
+  tab, nor routes keys to it there (`on_key`'s two `active_is_ext` checks):
+  that bar is drawn on document tabs only, and a bar left open by one used
+  to take the letters and Escape a read-only view passes on.
+- Harness: `ext-doc-read`'s `find` (`open`, `query`, `field_focused`,
+  `count`, `current` 1-based or null, `current_path`, `current_in_view`,
+  `hits_painted`: quads painted in view in the last frame, the current
+  match excluded), the regions `ext-doc-find:<field|prev|next|close>` and
+  the registered input `ext-doc-find` (`inputs.rs`, `Surface::Ext`;
+  `inputs::press` / `read` take the `App` to reach the view). The
+  `issue 1887` tests in `uiharness/cases/ext-doc-view.uit`.
+- Not done: Replace, Match case and whole words, a host API to open Find
+  from an extension's ribbon, F3 with the box closed (it bubbles as before),
+  IME and dead keys in the box (the view's plain key-downs, as #1947).
 
 ## Extension ribbons and the suite theme (#1870)
 
