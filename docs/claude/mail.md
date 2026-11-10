@@ -3131,16 +3131,22 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   although the user moved it out first. A move op does not record its source folder, and
   parents change while ops wait, so one ordering rule guards every path instead of parent
   tracking:
-  - R1: a `DeleteFolder` is sent only when no message `Move` or `MoveFolder` with a smaller
-    `seq` is still queued (`moves_queued_before`). Otherwise the drain skips it, it stays
-    queued in place, and the drain goes on. Typically an earlier move got a 4xx and is kept
-    for its next attempt.
-  - R2: a move that leaves the outbox without reaching Graph refuses locally every
+  - One predicate says which ops decide where something is, `OutboxOp::decides_location`
+    (r8, matched exhaustively): a message `Move`, a `MoveFolder`, and a draft's `SendDraft`
+    (it re-files the draft into Sent Items at command time) or `SaveDraft`. R1, R2 and the
+    r7 re-file (`messages_with_a_queued_move`, its message ops) all ask it, so they cannot
+    drift apart. `SaveDraft` only makes a delete wait for a pending save, which is harmless.
+  - R1: a `DeleteFolder` is sent only when no such op with a smaller `seq` is still queued
+    (`moves_queued_before`). Otherwise the drain skips it, it stays queued in place, and the
+    drain goes on. Typically an earlier move got a 4xx, or a send that may have gone out
+    failed its delivery check, and the op is kept for its next attempt.
+  - R2: such an op that leaves the outbox without reaching Graph refuses locally every
     `DeleteFolder` queued after it (`refuse_deletes_queued_after`, no Graph call). That covers
-    a `MoveFolder` refused for good, a message `Move` quarantined after `MAX_OP_ATTEMPTS`, a
-    move that sent nothing (`Applied::MoveNotSent`: a `local:` folder or dest), and moves the
-    store dropped with a removed `local:` folder (`delete_folder` and `discard_local_folder`
-    return their seqs). Each refused delete is dropped and its snapshot restored, and it is
+    a `MoveFolder` refused for good, a quarantined message `Move`, `SendDraft` or `SaveDraft`
+    (after `MAX_OP_ATTEMPTS`), a send that failed for good (`fail_send`: the draft never left
+    the folder Graph has it in, while the store shows it in Drafts), a move that sent nothing
+    (`Applied::MoveNotSent`: a `local:` folder or dest), and moves the store dropped with a
+    removed `local:` folder (`delete_folder` and `discard_local_folder` return their seqs). Each refused delete is dropped and its snapshot restored, and it is
     reported as `FolderWriteFailed { id, write: Delete, status: None, error: "a move queued
     before it did not reach the server" }` plus its `Error`, ahead of the move's own failure,
     with one `FoldersUpdated`. A delete that `delete_folder` queued itself (from
@@ -3261,7 +3267,9 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `relist_owed_survives_reopening_the_store`,
   `queued_moves_and_drafts_decide_a_folder_and_refile_moves_only_the_folder`; engine
   `a_reconverge_refiles_a_protected_message_its_quarantined_move_left_elsewhere`,
-  `a_protected_message_with_a_queued_move_is_not_refiled`).
+  `a_protected_message_with_a_queued_move_is_not_refiled`,
+  `a_failed_send_refuses_the_delete_of_the_folder_its_draft_never_left`,
+  `a_delete_waits_behind_a_send_that_may_have_gone_out`).
 - Not done: a lookxy folder-management UI; dedup of a create retried after a lost POST answer
   (a retry may 409 on the name Graph already has; the refusal discards the local row and the
   next listing brings Graph's folder); `GET /me/mailFolders/delta`; search folders; folders in
