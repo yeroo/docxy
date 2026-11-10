@@ -7,7 +7,7 @@
 //! attachments, full-text search, and the outbox queue (triage mutations
 //! queued here for `sync::outbox::apply_op` to push to Graph later).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use rusqlite::functions::FunctionFlags;
@@ -451,6 +451,15 @@ pub enum OutboxOp {
         parent: Option<String>,
         prev_parent: Option<String>,
     },
+    /// Mark every unread message Graph holds in `folder` received at or
+    /// before `before` (ISO-8601 UTC, fixed at the command) read (#1913,
+    /// `Store::mark_folder_read`). Run by the engine, not `apply_op`: it
+    /// pages the ids and PATCHes them through `$batch`. A `local:` id never
+    /// re-keyed sends nothing.
+    MarkFolderRead {
+        folder: String,
+        before: String,
+    },
 }
 
 impl OutboxOp {
@@ -483,7 +492,8 @@ impl OutboxOp {
             | OutboxOp::DeleteContact { .. }
             | OutboxOp::CreateFolder { .. }
             | OutboxOp::RenameFolder { .. }
-            | OutboxOp::MoveFolder { .. } => None,
+            | OutboxOp::MoveFolder { .. }
+            | OutboxOp::MarkFolderRead { .. } => None,
         }
     }
 
@@ -516,6 +526,7 @@ impl OutboxOp {
             OutboxOp::CreateFolder { .. } => "createFolder",
             OutboxOp::RenameFolder { .. } => "renameFolder",
             OutboxOp::MoveFolder { .. } => "moveFolder",
+            OutboxOp::MarkFolderRead { .. } => "markFolderRead",
         }
     }
 
@@ -656,6 +667,11 @@ impl OutboxOp {
                 ("dest".to_string(), optional_str(dest)),
                 ("parent".to_string(), optional_str(parent)),
                 ("prevParent".to_string(), optional_str(prev_parent)),
+            ]),
+            OutboxOp::MarkFolderRead { folder, before } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("folder".to_string(), Value::Str(folder.clone())),
+                ("before".to_string(), Value::Str(before.clone())),
             ]),
             OutboxOp::CancelEvent { id, comment } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
@@ -839,6 +855,10 @@ impl OutboxOp {
                     .get("prevParent")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+            }),
+            "markFolderRead" => Some(OutboxOp::MarkFolderRead {
+                folder: v.get("folder")?.as_str()?.to_string(),
+                before: v.get("before")?.as_str()?.to_string(),
             }),
             _ => None,
         }
@@ -1568,6 +1588,7 @@ impl Store {
         migrate_message_protection(&conn)?;
         migrate_meeting_reminder(&conn)?;
         migrate_reply_links(&conn)?;
+        migrate_fts_update_trigger(&conn)?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_reminder
                  ON messages(reminder_signal_at) WHERE is_reminder_on = 1",
@@ -5293,6 +5314,11 @@ pub(crate) struct LocalFolderDiscard {
 pub(crate) struct QueuedFolderWrites {
     pub renamed: HashSet<String>,
     pub moved: HashSet<String>,
+    /// Each folder a queued `MarkFolderRead` names (#1913), with the latest
+    /// `before` among its queued ones: a listing keeps its stored
+    /// `unread_count`, and a delta item received at or before it is stored
+    /// read.
+    pub marked_read: HashMap<String, String>,
 }
 
 /// Folder writes (#1910). Each command's write is one IMMEDIATE transaction
@@ -5609,14 +5635,81 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// The folders a queued rename or move names (#1910), resolved through
-    /// `folder_aliases`.
+    /// Marks every stored message of `folder` read, zeroes its
+    /// `unread_count` and queues its `MarkFolderRead` (#1913), in one
+    /// IMMEDIATE transaction: all or nothing. The op's `before` is the
+    /// later of `now_utc` and the newest stored `received_at` in the folder
+    /// (a fractional second rounded up to the next whole one, so Graph's
+    /// `receivedDateTime le` still takes that message), so a client clock
+    /// behind Graph's still covers the mail the user saw, and every stored
+    /// row is at or before it.
+    /// Every command queues its own op: a `MarkRead` to unread queued
+    /// between two of them must not win. Refused: an unknown folder and the
+    /// drafts sentinel.
+    pub(crate) fn mark_folder_read(
+        &self,
+        folder: &str,
+        now_utc: &str,
+    ) -> Result<FolderWriteResult, StoreError> {
+        let tx = self.write_tx()?;
+        let id = current_folder_id_on(&tx, folder)?;
+        if let Some(r) = check_folder_on(&tx, &id)? {
+            return Ok(FolderWriteResult::Refused(r));
+        }
+        let newest: Option<String> = tx.query_row(
+            "SELECT MAX(received_at) FROM messages WHERE folder_id = ?1 AND received_at <> ''",
+            params![id],
+            |r| r.get(0),
+        )?;
+        let newest = newest.map(|n| ceil_to_whole_second(&n));
+        let before = match newest {
+            Some(n) if n.as_str() > now_utc => n,
+            _ => now_utc.to_string(),
+        };
+        tx.execute(
+            "UPDATE messages SET is_read = 1 WHERE folder_id = ?1 AND is_read = 0",
+            params![id],
+        )?;
+        tx.execute(
+            "UPDATE folders SET unread_count = 0 WHERE id = ?1",
+            params![id],
+        )?;
+        enqueue_op_on(
+            &tx,
+            &OutboxOp::MarkFolderRead {
+                folder: id.clone(),
+                before,
+            },
+        )?;
+        tx.commit()?;
+        Ok(FolderWriteResult::Written(id))
+    }
+
+    /// Starts `folder`'s delta afresh (#1913): its delta and backfill links
+    /// and their scopes are cleared, so the next passes re-read every
+    /// message they cover (the read states a refused `MarkFolderRead` left
+    /// wrong). Only this folder; no reconverge.
+    pub(crate) fn restart_folder_delta(&self, folder: &str) -> Result<(), StoreError> {
+        clear_folder_links_on(&self.conn, folder)
+    }
+
+    /// The folders a queued rename or move names (#1910), and those a
+    /// queued `MarkFolderRead` names with its latest cutoff (`marked_read`,
+    /// #1913), resolved through `folder_aliases`.
     pub(crate) fn queued_folder_writes(&self) -> Result<QueuedFolderWrites, StoreError> {
         let mut q = QueuedFolderWrites::default();
         for row in pending_ops_on(&self.conn)? {
             let (id, set) = match row.op {
                 OutboxOp::RenameFolder { id, .. } => (id, &mut q.renamed),
                 OutboxOp::MoveFolder { id, .. } => (id, &mut q.moved),
+                OutboxOp::MarkFolderRead { folder, before } => {
+                    let folder = current_folder_id_on(&self.conn, &folder)?;
+                    let latest = q.marked_read.entry(folder).or_default();
+                    if *latest < before {
+                        *latest = before;
+                    }
+                    continue;
+                }
                 _ => continue,
             };
             set.insert(current_folder_id_on(&self.conn, &id)?);
@@ -5860,14 +5953,41 @@ fn rekey_folder_on(
         params![old, new],
     )?;
     if clear_links {
-        conn.execute(
-            "UPDATE folders SET delta_link = NULL, backfill_link = NULL,
-                 backfill_synced = 0, history_scope = NULL, backfill_scope = NULL,
-                 reminder_expand_refused = 0, backfill_expand_refused = 0
-             WHERE id = ?1",
-            params![new],
-        )?;
+        clear_folder_links_on(conn, new)?;
     }
+    Ok(())
+}
+
+/// A Graph instant as `YYYY-MM-DDTHH:MM:SSZ`, a fractional second rounded
+/// up to the next whole one (#1913): `…07.512Z` is `…08Z`, carrying across
+/// a minute, an hour or a day. Whole seconds (`…07Z`, `…07.000Z`) keep their
+/// second; a string of another shape is returned as it is.
+fn ceil_to_whole_second(s: &str) -> String {
+    let (Some(whole), Some(rest)) = (s.get(..19), s.get(19..)) else {
+        return s.to_string();
+    };
+    let Some(secs) = iso8601_to_unix_secs(&format!("{whole}Z")) else {
+        return s.to_string();
+    };
+    let fraction = match rest.strip_prefix('.').and_then(|r| r.strip_suffix('Z')) {
+        Some(f) if !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()) => f,
+        _ => return s.to_string(),
+    };
+    let up = i64::from(fraction.bytes().any(|b| b != b'0'));
+    unix_secs_to_iso8601(secs + up)
+}
+
+/// Clears one folder's delta and backfill links and what they carried
+/// (#1910's re-key by a move, #1913's refused `MarkFolderRead`): its next
+/// passes start from scratch.
+fn clear_folder_links_on(conn: &Connection, id: &str) -> Result<(), StoreError> {
+    conn.execute(
+        "UPDATE folders SET delta_link = NULL, backfill_link = NULL,
+             backfill_synced = 0, history_scope = NULL, backfill_scope = NULL,
+             reminder_expand_refused = 0, backfill_expand_refused = 0
+         WHERE id = ?1",
+        params![id],
+    )?;
     Ok(())
 }
 
@@ -7073,6 +7193,28 @@ fn migrate_meeting_reminder(conn: &Connection) -> Result<bool, StoreError> {
     tx.execute_batch(
         "ALTER TABLE messages ADD COLUMN meeting_reminder_on INTEGER NOT NULL DEFAULT 0;",
     )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Installs `messages_fts_au` as `schema::MESSAGES_FTS_AU_SQL` has it
+/// (#1913): fired only by an UPDATE of the columns the FTS row reads. A
+/// database from before, whose trigger fired on every UPDATE, has it
+/// replaced; a new one gets it here (`SCHEMA_SQL` leaves it out). The FTS
+/// rows themselves are unchanged. Whether it wrote the trigger.
+fn migrate_fts_update_trigger(conn: &Connection) -> Result<bool, StoreError> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let current: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'trigger' AND name = 'messages_fts_au' AND sql LIKE '%AFTER UPDATE OF%'",
+        [],
+        |r| r.get(0),
+    )?;
+    if current > 0 {
+        return Ok(false);
+    }
+    tx.execute_batch("DROP TRIGGER IF EXISTS messages_fts_au;")?;
+    tx.execute_batch(schema::MESSAGES_FTS_AU_SQL)?;
     tx.commit()?;
     Ok(true)
 }
@@ -19779,6 +19921,7 @@ mod folder_write_tests {
             QueuedFolderWrites {
                 renamed: ["A".to_string()].into(),
                 moved: ["B".to_string()].into(),
+                marked_read: HashMap::new(),
             }
         );
     }
@@ -20208,5 +20351,396 @@ mod folder_write_tests {
             "not local:"
         );
         assert!(row(&s, "A").is_some());
+    }
+}
+
+#[cfg(test)]
+mod mark_folder_read_tests {
+    use super::*;
+    use crate::graph::model::MailFolder;
+
+    const NOW: &str = "2026-11-10T18:00:00Z";
+
+    fn folder(s: &Store, id: &str, unread: i64) {
+        s.upsert_folder(&MailFolder {
+            id: id.into(),
+            display_name: id.into(),
+            parent_id: Some("ROOT".into()),
+            total_count: unread,
+            unread_count: unread,
+            well_known_name: None,
+        })
+        .unwrap();
+    }
+
+    fn unread(s: &Store, id: &str, folder: &str, received: &str) {
+        s.conn
+            .execute(
+                "INSERT INTO messages (id, folder_id, received_at, is_read) VALUES (?1, ?2, ?3, 0)",
+                params![id, folder, received],
+            )
+            .unwrap();
+    }
+
+    fn is_read(s: &Store, id: &str) -> bool {
+        s.conn
+            .query_row(
+                "SELECT is_read FROM messages WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn unread_count(s: &Store, id: &str) -> i64 {
+        s.folders()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == id)
+            .unwrap()
+            .unread_count
+    }
+
+    fn ops(s: &Store) -> Vec<OutboxOp> {
+        s.pending_ops().unwrap().into_iter().map(|r| r.op).collect()
+    }
+
+    #[test]
+    fn mark_folder_read_op_round_trips_json() {
+        let op = OutboxOp::MarkFolderRead {
+            folder: "F".into(),
+            before: NOW.into(),
+        };
+        let text = op.to_json().to_string();
+        assert_eq!(
+            text,
+            r#"{"kind":"markFolderRead","folder":"F","before":"2026-11-10T18:00:00Z"}"#
+        );
+        assert_eq!(
+            OutboxOp::from_json(&json::parse(&text).unwrap()),
+            Some(op.clone())
+        );
+        assert_eq!(op.message_id(), None);
+    }
+
+    #[test]
+    fn mark_folder_read_marks_zeroes_and_queues_in_one_transaction() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F", 40);
+        folder(&s, "G", 7);
+        unread(&s, "F1", "F", "2026-11-01T00:00:00Z");
+        unread(&s, "F2", "F", "2026-11-02T00:00:00Z");
+        unread(&s, "G1", "G", "2026-11-02T00:00:00Z");
+        assert_eq!(
+            s.mark_folder_read("F", NOW).unwrap(),
+            FolderWriteResult::Written("F".into())
+        );
+        assert!(is_read(&s, "F1") && is_read(&s, "F2"));
+        assert!(!is_read(&s, "G1"), "another folder's mail is untouched");
+        assert_eq!(unread_count(&s, "F"), 0);
+        assert_eq!(unread_count(&s, "G"), 7);
+        assert_eq!(
+            ops(&s),
+            vec![OutboxOp::MarkFolderRead {
+                folder: "F".into(),
+                before: NOW.into(),
+            }]
+        );
+        let q = s.queued_folder_writes().unwrap();
+        assert_eq!(q.marked_read.get("F").map(String::as_str), Some(NOW));
+        assert!(!q.marked_read.contains_key("G"));
+    }
+
+    #[test]
+    fn mark_folder_read_is_all_or_nothing_on_5000_rows() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F", 5000);
+        // The setup only: each INSERT's FTS trigger scans the whole FTS
+        // table (`message_id` is UNINDEXED), 10 s for 5 000 rows. This test
+        // searches nothing.
+        s.conn
+            .execute_batch("DROP TRIGGER messages_fts_ai")
+            .unwrap();
+        {
+            let tx = s.conn.unchecked_transaction().unwrap();
+            for i in 0..5000 {
+                tx.execute(
+                    "INSERT INTO messages (id, folder_id, received_at, is_read)
+                     VALUES (?1, 'F', '2026-11-01T00:00:00Z', 0)",
+                    params![format!("M{i:04}")],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        // Whatever order the UPDATE walks the rows in, the one it aborts on
+        // comes after others it already marked: they must all roll back.
+        s.conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER abort_last BEFORE UPDATE OF is_read ON messages
+                 WHEN NEW.id = 'M4999'
+                 BEGIN SELECT RAISE(ABORT, 'test abort'); END;",
+            )
+            .unwrap();
+        assert!(s.mark_folder_read("F", NOW).is_err());
+        let read: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM messages WHERE is_read = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(read, 0, "no row is left read");
+        assert_eq!(unread_count(&s, "F"), 5000);
+        assert!(ops(&s).is_empty(), "nothing queued");
+
+        s.conn.execute_batch("DROP TRIGGER abort_last").unwrap();
+        assert_eq!(
+            s.mark_folder_read("F", NOW).unwrap(),
+            FolderWriteResult::Written("F".into())
+        );
+        let read: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM messages WHERE is_read = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(read, 5000);
+        assert_eq!(unread_count(&s, "F"), 0);
+        assert_eq!(ops(&s).len(), 1);
+    }
+
+    #[test]
+    fn mark_folder_read_refuses_unknown_and_the_drafts_sentinel() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F", 1);
+        unread(&s, "F1", "F", NOW);
+        assert_eq!(
+            s.mark_folder_read("NOPE", NOW).unwrap(),
+            FolderWriteResult::Refused(FolderRefusal::Unknown("NOPE".into()))
+        );
+        s.conn
+            .execute(
+                "INSERT INTO folders (id, display_name) VALUES (?1, 'Drafts')",
+                params![LOCAL_DRAFTS_SENTINEL_FOLDER_ID],
+            )
+            .unwrap();
+        assert_eq!(
+            s.mark_folder_read(LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NOW)
+                .unwrap(),
+            FolderWriteResult::Refused(FolderRefusal::DraftsSentinel)
+        );
+        assert!(ops(&s).is_empty());
+        assert!(!is_read(&s, "F1"));
+    }
+
+    #[test]
+    fn a_second_mark_folder_read_after_a_mark_unread_is_queued_again() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F", 1);
+        unread(&s, "M", "F", "2026-11-01T00:00:00Z");
+        s.mark_folder_read("F", NOW).unwrap();
+        s.set_read("M", false);
+        s.enqueue_op(&OutboxOp::MarkRead {
+            id: "M".into(),
+            read: false,
+        })
+        .unwrap();
+        let later = "2026-11-10T18:05:00Z";
+        s.mark_folder_read("F", later).unwrap();
+        assert!(is_read(&s, "M"));
+        assert_eq!(
+            ops(&s),
+            vec![
+                OutboxOp::MarkFolderRead {
+                    folder: "F".into(),
+                    before: NOW.into(),
+                },
+                OutboxOp::MarkRead {
+                    id: "M".into(),
+                    read: false,
+                },
+                OutboxOp::MarkFolderRead {
+                    folder: "F".into(),
+                    before: later.into(),
+                },
+            ]
+        );
+        // The guard uses the latest cutoff.
+        let q = s.queued_folder_writes().unwrap();
+        assert_eq!(q.marked_read.get("F").map(String::as_str), Some(later));
+    }
+
+    #[test]
+    fn mark_folder_read_cutoff_is_the_later_of_now_and_the_newest_row() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F", 2);
+        // The client clock is behind Graph's: a row is newer than "now".
+        unread(&s, "OLD", "F", "2026-11-01T00:00:00Z");
+        unread(&s, "NEW", "F", "2026-11-10T18:03:07.5120000Z");
+        unread(&s, "NONE", "F", "");
+        s.mark_folder_read("F", NOW).unwrap();
+        assert!(is_read(&s, "NEW") && is_read(&s, "OLD") && is_read(&s, "NONE"));
+        // An empty folder, or one with only older mail, takes "now".
+        folder(&s, "E", 0);
+        s.mark_folder_read("E", NOW).unwrap();
+        let befores: Vec<String> = ops(&s)
+            .into_iter()
+            .map(|op| match op {
+                OutboxOp::MarkFolderRead { before, .. } => before,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        // Rounded up: Graph's `le` must still take the 07.512 message.
+        assert_eq!(befores, vec!["2026-11-10T18:03:08Z", NOW]);
+        // Every stored row is at or before its cutoff, as strings compare.
+        assert!("2026-11-10T18:03:07.5120000Z" <= "2026-11-10T18:03:08Z");
+    }
+
+    #[test]
+    fn ceil_to_whole_second_rounds_a_fraction_up_with_carries() {
+        for (given, want) in [
+            ("2026-11-10T18:03:07Z", "2026-11-10T18:03:07Z"),
+            ("2026-11-10T18:03:07.000Z", "2026-11-10T18:03:07Z"),
+            ("2026-11-10T18:03:07.512Z", "2026-11-10T18:03:08Z"),
+            ("2026-11-10T18:03:59.5Z", "2026-11-10T18:04:00Z"),
+            ("2026-12-31T23:59:59.0000001Z", "2027-01-01T00:00:00Z"),
+            ("2028-02-28T23:59:59.9Z", "2028-02-29T00:00:00Z"),
+            ("not a time", "not a time"),
+        ] {
+            assert_eq!(ceil_to_whole_second(given), want, "{given}");
+        }
+    }
+
+    #[test]
+    fn mark_folder_read_follows_a_folder_alias() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "NEW", 1);
+        unread(&s, "M", "NEW", NOW);
+        s.conn
+            .execute(
+                "INSERT INTO folder_aliases (old_id, id) VALUES ('OLD', 'NEW')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            s.mark_folder_read("OLD", NOW).unwrap(),
+            FolderWriteResult::Written("NEW".into())
+        );
+        assert!(is_read(&s, "M"));
+    }
+
+    fn fts_rows(s: &Store, id: &str) -> i64 {
+        s.conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE message_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_read_state_update_leaves_the_fts_row_alone() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F", 1);
+        s.conn
+            .execute(
+                "INSERT INTO messages (id, folder_id, subject) VALUES ('M', 'F', 'quarterly')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(fts_rows(&s, "M"), 1);
+        // With its FTS row gone, an UPDATE the old trigger fired on would
+        // write it back: a read state, a flag, a folder do not.
+        s.conn
+            .execute("DELETE FROM messages_fts WHERE message_id = 'M'", [])
+            .unwrap();
+        s.set_read("M", true);
+        s.set_flag("M", true);
+        s.mark_folder_read("F", NOW).unwrap();
+        assert_eq!(fts_rows(&s, "M"), 0);
+        // A subject, a sender and a re-key still rewrite it.
+        s.conn
+            .execute("UPDATE messages SET subject = 'annual' WHERE id = 'M'", [])
+            .unwrap();
+        assert_eq!(s.search("annual", 10).unwrap().len(), 1);
+        s.conn
+            .execute("UPDATE messages SET from_name = 'Ada' WHERE id = 'M'", [])
+            .unwrap();
+        assert_eq!(s.search("Ada", 10).unwrap().len(), 1);
+        s.conn
+            .execute("UPDATE messages SET id = 'M2' WHERE id = 'M'", [])
+            .unwrap();
+        assert_eq!((fts_rows(&s, "M"), fts_rows(&s, "M2")), (0, 1));
+        assert_eq!(s.search("annual", 10).unwrap()[0].id, "M2");
+    }
+
+    #[test]
+    fn migrate_fts_update_trigger_replaces_an_old_trigger_once() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(!migrate_fts_update_trigger(&s.conn).unwrap(), "open did it");
+        // A database from before #1913: the trigger fires on every UPDATE.
+        s.conn
+            .execute_batch(
+                "DROP TRIGGER messages_fts_au;
+                 CREATE TRIGGER messages_fts_au AFTER UPDATE ON messages BEGIN
+                     DELETE FROM messages_fts WHERE message_id = old.id;
+                     INSERT INTO messages_fts(message_id, subject, from_text, body)
+                     SELECT new.id, new.subject, new.from_name || ' ' || new.from_addr, '';
+                 END;",
+            )
+            .unwrap();
+        assert!(migrate_fts_update_trigger(&s.conn).unwrap());
+        assert!(!migrate_fts_update_trigger(&s.conn).unwrap());
+        let sql: String = s
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'messages_fts_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("AFTER UPDATE OF id, subject, from_name, from_addr"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn restart_folder_delta_clears_only_that_folder() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F", 0);
+        folder(&s, "G", 0);
+        s.set_delta_link("F", "https://graph/delta?F").unwrap();
+        s.set_delta_link("G", "https://graph/delta?G").unwrap();
+        s.conn
+            .execute(
+                "UPDATE folders SET backfill_link = 'b', backfill_synced = 3",
+                [],
+            )
+            .unwrap();
+        s.restart_folder_delta("F").unwrap();
+        assert_eq!(s.get_delta_link("F").unwrap(), None);
+        assert_eq!(
+            s.get_delta_link("G").unwrap().as_deref(),
+            Some("https://graph/delta?G")
+        );
+        let links: Vec<(String, Option<String>, i64)> = {
+            let mut st = s
+                .conn
+                .prepare("SELECT id, backfill_link, backfill_synced FROM folders ORDER BY id")
+                .unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(
+            links,
+            vec![
+                ("F".to_string(), None, 0),
+                ("G".to_string(), Some("b".to_string()), 3)
+            ]
+        );
     }
 }

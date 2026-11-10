@@ -93,6 +93,12 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Ap
         OutboxOp::MoveFolder {
             id, dest, parent, ..
         } => move_folder(client, store, id, dest.as_deref(), parent.as_deref()),
+        // The engine runs it itself (#1913: it pages the ids and PATCHes
+        // them through `$batch`, across drains); it never reaches here.
+        // Should it, nothing is sent, and `Parse` is final: the safe failure.
+        OutboxOp::MarkFolderRead { .. } => Err(GraphError::Parse(
+            "MarkFolderRead is run by the engine".to_string(),
+        )),
         op => apply_other(client, store, op).map(|()| Applied::Done),
     }
 }
@@ -211,7 +217,10 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
         OutboxOp::SetCategories { id, categories } => {
             client.set_message_categories(&resolve(store, id)?, categories)
         }
-        OutboxOp::Move { .. } | OutboxOp::CreateFolder { .. } | OutboxOp::MoveFolder { .. } => {
+        OutboxOp::Move { .. }
+        | OutboxOp::CreateFolder { .. }
+        | OutboxOp::MoveFolder { .. }
+        | OutboxOp::MarkFolderRead { .. } => {
             unreachable!("apply_op handles it")
         }
         OutboxOp::RenameFolder { id, name, .. } => match graph_folder(store, id)? {
@@ -828,6 +837,23 @@ mod tests {
         .unwrap();
         let reqs = srv.requests();
         assert_eq!(reqs[0].body, r#"{"isRead":true}"#);
+    }
+
+    #[test]
+    fn apply_op_mark_folder_read_sends_nothing() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let r = apply_op(
+            &c,
+            &store,
+            &OutboxOp::MarkFolderRead {
+                folder: "F".into(),
+                before: "2026-11-10T18:00:00Z".into(),
+            },
+        );
+        assert!(matches!(r, Err(GraphError::Parse(_))), "{r:?}");
+        assert!(srv.requests().is_empty());
     }
 
     #[test]

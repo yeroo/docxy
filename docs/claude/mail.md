@@ -3144,3 +3144,108 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   the local row and the next listing brings Graph's folder); `GET /me/mailFolders/delta`; search
   folders; folders in other mailboxes; returning the `local:` id synchronously (a host finds the
   new row on `FoldersUpdated`; `FolderCreated` names both ids).
+
+## Mark a folder read (#1913)
+
+- `SyncCommand::MarkFolderRead { folder }` marks the whole folder read, on Graph too, not only
+  the mail the store holds. `EmptyFolder` is #2110, built on the same `$batch` client.
+- Store (`Store::mark_folder_read(folder, now_utc)`, crate-private): one IMMEDIATE transaction
+  marks every stored message of the folder read, sets its `unread_count` to 0 and queues
+  `OutboxOp::MarkFolderRead { folder, before }` (kind `markFolderRead`). It is all or nothing,
+  and the test proves it on 5 000 rows with an aborting trigger. `before` is the cutoff: the later
+  of the command's UTC time and the newest stored `received_at` in the folder. A fractional
+  second rounds up to the next whole one (`ceil_to_whole_second`, carrying across a minute or
+  a day), so Graph's `receivedDateTime le` still takes a message at `…07.512Z` (r1). Mail
+  Graph receives after the command, or while the engine is offline, is not the command's, and
+  a client clock behind Graph's still covers the mail the user saw. Every
+  command queues its own op, with no dedup: `MarkFolderRead`, then `MarkRead` to unread, then
+  `MarkFolderRead` again must end read. An unknown folder or the drafts sentinel is refused
+  (`FolderWriteFailed { write: MarkRead, status: None }` plus `Error`), and nothing is written.
+  On `Written`, `MessagesUpdated { folder_id }` and `FoldersUpdated` follow, then a drain.
+- `messages_fts_au` fires only on an UPDATE of `id`, `subject`, `from_name` or `from_addr`
+  (`schema::MESSAGES_FTS_AU_SQL`, installed and replaced in older databases by
+  `migrate_fts_update_trigger`). Its `DELETE` scans the whole FTS table (`message_id` is
+  `UNINDEXED`), so firing it on every read-state UPDATE took about 32 s for 5 000 rows. It now
+  takes about 20 ms. `messages_fts_ai` still scans once per INSERT (not changed here).
+- Graph (`GraphClient::batch`, `BatchRequest`, `BatchResponse`, `BATCH_MAX` = 20):
+  `POST /$batch`. Sub-request ids are their 1-based index. An answer is matched back by id and
+  returned in request order. A missing, duplicate or unknown id is `Parse`, and so is more than
+  20 requests (nothing is sent). A sub-response's `Retry-After` is read case-insensitively. A
+  sub-response 401 makes the whole call `Unauthorized`. `GraphClient::mark_read_request(id)`
+  is `PATCH /me/messages/{id}` `{"isRead":true}` with `Prefer: return=minimal`, which Graph
+  answers with 204. `unread_message_ids(folder, before)`:
+  `GET /me/mailFolders/{id}/messages?$filter=isRead eq false and receivedDateTime le {before}
+  &$select=id&$top=1000`, following `@odata.nextLink`, ids deduplicated.
+- The engine runs the op itself (`run_mark_folder_read`). `apply_op` answers it `Parse` and
+  sends nothing, and `folder_op()` leaves it out. The first step pages every id into `bulk:
+  Option<BulkRun>` before the first PATCH, because paging an `isRead eq false` listing while
+  PATCHes clear it shifts its skip-token pages and skips ids. The run then sends 20 ids a batch.
+  A batch's ids leave the run only once Graph has answered.
+  - A 2xx or a 404 (the message is gone) is done.
+  - A 429 or 503 puts its ids back at the front and stops the drain for the batch's longest
+    `Retry-After` (default 30 s). `schedule_retry` holds the passes, and `hold_outbox` sets the
+    drain's own gate (`op_retry`, a later one kept), because `next_retry` alone would let a
+    command's drain (`drain_queued`) send the throttled ids again at once (r1). A whole-call
+    `Throttled` holds the outbox the same way, and `due` wakes the loop when the hold ends.
+  - Another 5xx puts its ids back under the outbox back-off (`op_retry`; the op's attempts are
+    bumped, and it is never quarantined).
+  - Any other status is recorded and reported once the rest are done: `"{n} of {total} messages
+    could not be marked read: {first error}"`.
+
+  `checkpoint()` runs between batches, and a stop there keeps the run. A whole-call failure of
+  the listing or of a batch takes the drain's usual arms: auth, throttle and transport stop it,
+  and a 5xx defers it. Anything else (a 404, another 4xx, `Parse`) is final
+  (`refuse_mark_read`). A run whose op is gone is cleared at the next drain. A restart loses
+  the run, and the op pages again, which is safe, since mail already read is not listed.
+- A refusal drops the op, with no attempts and no quarantine. It sends `FolderWriteFailed { id,
+  write: MarkRead, status, error }`, then `Error("mark all read in folder {id}: {error}")`,
+  and clears that folder's links (`Store::restart_folder_delta`, the statement a moved folder's
+  re-key uses), so the next passes read its read states again. In whole-mailbox mode, rows older
+  than the head window are corrected when the folder's backfill runs again.
+- A folder still `local:` when the op drains (its create never reached Graph) sends nothing, and
+  the op is dropped.
+- While the op is queued (`QueuedFolderWrites::marked_read`, folder → latest `before`), a pass
+  keeps the folder's stored `unread_count`. This covers the listing (`sync_folders`) and one
+  folder's count read (`refresh_folder`, `kept_unread_count`). `merge_delta_items` (heads,
+  stored-link rounds, backfill pages) stores some items read (`read_guard`, `ReadGuard`, read
+  once per page):
+  - before the run has paged, an item received at or before the cutoff;
+  - once it has paged, only an id the run still holds in `todo` (r1). Mail that came into the
+    folder after the listing, for example moved in with an older `receivedDateTime`, is never
+    PATCHed, so it keeps Graph's state.
+
+  An id another queued op names (`protected_ids`) is never forced, on stored-link rounds too,
+  so a `MarkRead` to unread queued after the op keeps its own state (r1). Newer mail keeps
+  Graph's state, so the count can read 0 beside a newer unread row until the op drains.
+  `FetchMessage`, search hits and header repair are not guarded: each mark the op makes comes
+  back as a delta change.
+- Known limit: a long throttled run holds every op queued behind it, sends too, until it ends.
+  Graph throttles per mailbox, so a send would be throttled meanwhile anyway. The drain order is
+  what keeps a later per-message `MarkRead` or `Move` correct, so don't reorder.
+- lookxy has no "Mark all as read" yet.
+- Tests: `client.rs` `batch_posts_numbered_sub_requests_and_matches_answers_by_id`,
+  `batch_reads_retry_after_from_a_sub_response`, `batch_sub_response_401_is_unauthorized`,
+  `batch_answer_missing_an_id_is_a_parse_error`, `batch_of_more_than_20_is_refused`,
+  `batch_status_is_classified`, `unread_message_ids_follows_next_link_and_dedups`; store
+  `mark_folder_read_tests` (`mark_folder_read_op_round_trips_json`,
+  `mark_folder_read_marks_zeroes_and_queues_in_one_transaction`,
+  `mark_folder_read_is_all_or_nothing_on_5000_rows`,
+  `mark_folder_read_refuses_unknown_and_the_drafts_sentinel`,
+  `a_second_mark_folder_read_after_a_mark_unread_is_queued_again`,
+  `mark_folder_read_cutoff_is_the_later_of_now_and_the_newest_row`,
+  `ceil_to_whole_second_rounds_a_fraction_up_with_carries`,
+  `mark_folder_read_follows_a_folder_alias`, `a_read_state_update_leaves_the_fts_row_alone`,
+  `migrate_fts_update_trigger_replaces_an_old_trigger_once`,
+  `restart_folder_delta_clears_only_that_folder`); `outbox.rs`
+  `apply_op_mark_folder_read_sends_nothing`; `engine.rs` `folder_writes::mark_folder_read`
+  (`mark_folder_read_pages_and_batches_every_server_unread_id_once`,
+  `a_429_inside_a_batch_is_retried_after_retry_after`,
+  `a_sync_pass_keeps_a_queued_mark_folder_read`,
+  `before_the_run_pages_mail_up_to_the_cutoff_is_stored_read`,
+  `mark_folder_read_leaves_mail_received_after_the_command_unread`,
+  `mail_the_paged_run_does_not_hold_keeps_graphs_state`,
+  `a_mark_unread_queued_after_the_op_keeps_its_state`,
+  `a_throttled_batch_holds_a_commands_drain_until_retry_after`,
+  `mark_folder_read_refusals_report_and_restart_the_folder_delta`,
+  `mark_folder_read_survives_a_restart`,
+  `mark_folder_read_of_an_unknown_folder_reports_and_queues_nothing`).
