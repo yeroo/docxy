@@ -73,11 +73,12 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Ap
         OutboxOp::Move { id, dest } => {
             let old_id = resolve(store, id)?;
             // A folder created locally is sent under its Graph id (#1910).
-            // One still `local:` never reached Graph: nothing is sent. Its
-            // create was refused, or the folder was deleted before its
-            // create was sent; either way the store dropped the folder with
-            // the message and started a mail reconverge, which brings the
-            // message back where Graph has it.
+            // One still `local:` never reached Graph: nothing is sent. The
+            // store drops such a move when it removes the folder (its
+            // create refused, or the folder deleted before its create was
+            // sent), filing a draft moved there back in Drafts and starting
+            // a mail reconverge for other mail, which brings it back where
+            // Graph has it; this is the guard for a move it missed.
             let dest = store.current_folder_id(dest).map_err(store_err)?;
             if dest.starts_with("local:") {
                 return Ok(Applied::Done);
@@ -171,11 +172,12 @@ fn create_folder(
 /// `MoveFolder` (#1910): POST the move with the dest resolved now, then
 /// store Graph's answer (`Store::apply_moved_folder`). A dest still
 /// `local:` is refused as `Parse`: its create was refused (the refusal
-/// reverts this move). A folder still `local:` sends nothing. One whose row
+/// reverts this move). A delete of a `local:` dest drops every move into
+/// it (`Store::delete_folder`), and a moved folder still under it gets a
+/// delete of its own. A folder still `local:` sends nothing. One whose row
 /// is gone is still moved: a delete of the Graph folder it was moved under
 /// took it, and that delete, queued after this move, must find it there on
-/// Graph too. (A delete of a `local:` folder it was moved under drops this
-/// move and queues the folder's own delete instead: `Store::delete_folder`.)
+/// Graph too.
 fn move_folder(
     client: &GraphClient,
     store: &Store,
