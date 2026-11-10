@@ -73,9 +73,11 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Ap
         OutboxOp::Move { id, dest } => {
             let old_id = resolve(store, id)?;
             // A folder created locally is sent under its Graph id (#1910).
-            // One still `local:` never reached Graph (its create was
-            // refused): nothing is sent, and the refusal's reconverge
-            // brings the message back where Graph has it.
+            // One still `local:` never reached Graph: nothing is sent. Its
+            // create was refused, or the folder was deleted before its
+            // create was sent; either way the store dropped the folder with
+            // the message and started a mail reconverge, which brings the
+            // message back where Graph has it.
             let dest = store.current_folder_id(dest).map_err(store_err)?;
             if dest.starts_with("local:") {
                 return Ok(Applied::Done);
@@ -168,8 +170,10 @@ fn create_folder(
 
 /// `MoveFolder` (#1910): POST the move with the dest resolved now (one
 /// still `local:` never reached Graph: refused as `Parse`), then store
-/// Graph's answer (`Store::apply_moved_folder`). A folder still `local:`,
-/// or gone, sends nothing.
+/// Graph's answer (`Store::apply_moved_folder`). A folder still `local:`
+/// sends nothing. One whose row is gone is still moved: a delete of the
+/// folder it was moved under took it, and that delete, queued after this
+/// move, must find it there on Graph too.
 fn move_folder(
     client: &GraphClient,
     store: &Store,
@@ -177,9 +181,10 @@ fn move_folder(
     dest: Option<&str>,
     parent: Option<&str>,
 ) -> Result<Applied, GraphError> {
-    let Some(target) = graph_folder(store, id)? else {
+    let target = store.current_folder_id(id).map_err(store_err)?;
+    if target.starts_with("local:") {
         return Ok(Applied::Done);
-    };
+    }
     let dest = dest
         .map(|d| store.current_folder_id(d).map_err(store_err))
         .transpose()?;
@@ -4222,7 +4227,7 @@ mod tests {
 
         let gone = written(store.create_local_folder(None, "Gone").unwrap());
         let op = last_op(&store);
-        written(store.delete_folder(&gone).unwrap());
+        written(store.delete_folder(&gone).unwrap().0);
         assert_eq!(apply_op(&c, &store, &op).unwrap(), Applied::Done);
         assert_eq!(
             apply_op(&c, &store, &last_op(&store)).unwrap(),
@@ -4317,7 +4322,7 @@ mod tests {
         let srv = FakeServer::start(vec![route("DELETE", "/me/mailFolders/ARCH", 404, "{}")]);
         let c = GraphClient::new(&srv.base_url, "AT");
         let store = folder_store();
-        written(store.delete_folder("ARCH").unwrap());
+        written(store.delete_folder("ARCH").unwrap().0);
         assert_eq!(
             apply_op(&c, &store, &last_op(&store)).unwrap(),
             Applied::Done
