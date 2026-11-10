@@ -5333,6 +5333,12 @@ pub(crate) enum FolderRefusal {
     /// into Sent Items), or one with an unpushed edit (`local_edit`, #2082).
     /// The cascade would lose it for good.
     HoldsUnsentMail,
+    /// A delete while a mail reconverge is pending (the engine refuses it,
+    /// #1910 r5): a move that failed may have left mail shown out of the
+    /// folder it is still in on Graph, and the reconverge never reads a
+    /// folder whose delete is queued, so a held delete would take that
+    /// mail. The host deletes again once the reconverge is done.
+    Rereading,
 }
 
 impl std::fmt::Display for FolderRefusal {
@@ -5346,6 +5352,9 @@ impl std::fmt::Display for FolderRefusal {
                 f.write_str("a folder cannot move into itself or a folder inside it")
             }
             FolderRefusal::HoldsUnsentMail => f.write_str("folder holds unsent mail"),
+            FolderRefusal::Rereading => f.write_str(
+                "mail is being read again from the server; delete again once it is done",
+            ),
         }
     }
 }
