@@ -199,6 +199,19 @@ CREATE TABLE IF NOT EXISTS contact_aliases (
     id       TEXT NOT NULL
 );
 
+-- The id a mail folder was re-keyed to (#1910): a folder created locally
+-- under a `local:` id, once its create reached Graph
+-- (`Store::reconcile_created_folder`), or a folder Graph answered a move
+-- with a new id for. An op or a host holding the old id still reaches it
+-- (`Store::current_folder_id`). Every alias names the newest id (a re-key
+-- re-points the aliases to the old id), so one lookup resolves. No foreign
+-- key: an alias outlives the row, so an op queued by the old id still
+-- reaches the Graph folder.
+CREATE TABLE IF NOT EXISTS folder_aliases (
+    old_id TEXT PRIMARY KEY,
+    id     TEXT NOT NULL
+);
+
 -- Contacts a refused write must read again from Graph (#2063), once no
 -- queued contact op names them (`Store::owe_contact_reread`). Persisted, so a
 -- restart before the last such op drains still re-reads.

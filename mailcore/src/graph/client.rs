@@ -933,6 +933,46 @@ impl GraphClient {
         Ok((count("totalItemCount"), count("unreadItemCount")))
     }
 
+    /// Creates a mail folder (#1910): `POST /me/mailFolders` at the top of
+    /// the mailbox, or `POST /me/mailFolders/{parent}/childFolders`, with
+    /// `{"displayName": name}`. Returns the folder as Graph answers it (its
+    /// id and parent); an answer without an id is a `Parse` error.
+    pub fn create_folder(
+        &self,
+        parent: Option<&str>,
+        name: &str,
+    ) -> Result<MailFolder, GraphError> {
+        let path = match parent {
+            Some(p) => format!("/me/mailFolders/{}/childFolders", encode_path_segment(p)),
+            None => "/me/mailFolders".to_string(),
+        };
+        let resp = self.send(Method::Post, &path, Some(display_name_body(name)), &[])?;
+        parse_folder_answer(resp, "created folder")
+    }
+
+    /// `PATCH /me/mailFolders/{id}` with `{"displayName": name}` (#1910).
+    /// Graph's answer body is not read.
+    pub fn rename_folder(&self, id: &str, name: &str) -> Result<(), GraphError> {
+        let path = format!("/me/mailFolders/{}", encode_path_segment(id));
+        self.send(Method::Patch, &path, Some(display_name_body(name)), &[])?;
+        Ok(())
+    }
+
+    /// `POST /me/mailFolders/{id}/move` with `{"destinationId": dest}`
+    /// (#1910); `None` is the top of the mailbox, `"msgfolderroot"`.
+    /// Returns the folder as Graph answers it: its parent, and its id,
+    /// which may differ from `id`.
+    pub fn move_folder(&self, id: &str, dest: Option<&str>) -> Result<MailFolder, GraphError> {
+        let path = format!("/me/mailFolders/{}/move", encode_path_segment(id));
+        let body = Value::Object(vec![(
+            "destinationId".to_string(),
+            Value::Str(dest.unwrap_or("msgfolderroot").to_string()),
+        )])
+        .to_string();
+        let resp = self.send(Method::Post, &path, Some(body), &[])?;
+        parse_folder_answer(resp, "moved folder")
+    }
+
     /// GET a folder's `/messages/delta` (a first call, `DeltaCursor::Head`
     /// or `DeltaCursor::Full`) or a stored `nextLink`/`deltaLink`
     /// (`DeltaCursor::Link`), requesting pages of 50 via
@@ -2337,6 +2377,24 @@ pub const BODY_SELECT: &str = "body,internetMessageHeaders";
 /// [`JSON_MAX`] bytes ([`parse_body_capped`]).
 fn parse_body(resp: ureq::Response) -> Result<Value, GraphError> {
     parse_body_capped(resp, JSON_MAX)
+}
+
+/// `{"displayName": name}`, a folder create's or rename's body (#1910).
+fn display_name_body(name: &str) -> String {
+    Value::Object(vec![(
+        "displayName".to_string(),
+        Value::Str(name.to_string()),
+    )])
+    .to_string()
+}
+
+/// A folder write's answer (#1910): the `mailFolder` Graph returns. One
+/// without an id is a `Parse` error naming `what`.
+fn parse_folder_answer(resp: ureq::Response, what: &str) -> Result<MailFolder, GraphError> {
+    let v = parse_body(resp)?;
+    MailFolder::from_json(&v)
+        .filter(|f| !f.id.is_empty())
+        .ok_or_else(|| GraphError::Parse(format!("{what} has no id")))
 }
 
 /// Reads a successful response's body, at most `max` bytes, and parses it
@@ -6158,6 +6216,102 @@ mod tests {
         assert_eq!(reqs[0].method, "PATCH");
         assert_eq!(reqs[0].path, "/me/contacts/G%2F1");
         assert_eq!(reqs[0].body, r#"{"jobTitle":"","birthday":null}"#);
+    }
+
+    fn folder_route(method: &str, path: &str, status: u16, body: &str) -> Route {
+        Route {
+            method: method.into(),
+            path_prefix: path.into(),
+            status,
+            headers: vec![],
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn create_folder_posts_top_level_and_child() {
+        let srv = FakeServer::start(vec![
+            folder_route(
+                "POST",
+                "/me/mailFolders/P%2F1/childFolders",
+                201,
+                r#"{"id":"C1","displayName":"Kid","parentFolderId":"P/1"}"#,
+            ),
+            folder_route(
+                "POST",
+                "/me/mailFolders",
+                201,
+                r#"{"id":"T1","displayName":"Top","parentFolderId":"ROOT"}"#,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let top = c.create_folder(None, "Top").unwrap();
+        assert_eq!(top.id, "T1");
+        assert_eq!(top.parent_id.as_deref(), Some("ROOT"));
+        let kid = c.create_folder(Some("P/1"), "Kid \"2\"").unwrap();
+        assert_eq!(kid.id, "C1");
+        assert_eq!(kid.parent_id.as_deref(), Some("P/1"));
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/me/mailFolders");
+        assert_eq!(reqs[0].body, r#"{"displayName":"Top"}"#);
+        assert_eq!(reqs[1].path, "/me/mailFolders/P%2F1/childFolders");
+        let sent = json::parse(&reqs[1].body).unwrap();
+        assert_eq!(
+            sent.get("displayName").and_then(Value::as_str),
+            Some("Kid \"2\"")
+        );
+    }
+
+    #[test]
+    fn create_folder_answer_without_an_id_is_a_parse_error() {
+        let srv = FakeServer::start(vec![folder_route(
+            "POST",
+            "/me/mailFolders",
+            201,
+            r#"{"displayName":"Top"}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.create_folder(None, "Top"),
+            Err(GraphError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn rename_folder_patches_display_name() {
+        let srv = FakeServer::start(vec![folder_route(
+            "PATCH",
+            "/me/mailFolders/F1",
+            200,
+            r#"{"id":"F1","displayName":"New"}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.rename_folder("F1", "New").unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(reqs[0].path, "/me/mailFolders/F1");
+        assert_eq!(reqs[0].body, r#"{"displayName":"New"}"#);
+    }
+
+    #[test]
+    fn move_folder_posts_destination_and_root() {
+        let srv = FakeServer::start(vec![folder_route(
+            "POST",
+            "/me/mailFolders/F1/move",
+            200,
+            r#"{"id":"F1b","displayName":"F","parentFolderId":"D1"}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let moved = c.move_folder("F1", Some("D1")).unwrap();
+        assert_eq!(moved.id, "F1b");
+        assert_eq!(moved.parent_id.as_deref(), Some("D1"));
+        c.move_folder("F1", None).unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/me/mailFolders/F1/move");
+        assert_eq!(reqs[0].body, r#"{"destinationId":"D1"}"#);
+        assert_eq!(reqs[1].body, r#"{"destinationId":"msgfolderroot"}"#);
     }
 
     #[test]

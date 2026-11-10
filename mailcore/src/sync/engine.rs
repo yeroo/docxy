@@ -56,13 +56,13 @@ use crate::graph::model::{
     SearchHit,
 };
 use crate::store::{
-    CalendarRound, FetchedCalendar, FolderHistory, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee,
-    NewEvent, OutboundAttachment, OutboxOp, OutboxRow, RangeStamp, SCOPE_ALL, SCOPE_WINDOW, Store,
-    StoreError, SyncedCalendar,
+    CalendarRound, FetchedCalendar, FolderHistory, FolderRow, FolderWriteResult,
+    LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee, NewEvent, OutboundAttachment, OutboxOp,
+    OutboxRow, RangeStamp, SCOPE_ALL, SCOPE_WINDOW, Store, StoreError, SyncedCalendar,
 };
 use crate::sync::outbox::{Applied, apply_op, apply_send, send_error_text};
 use crate::tokencache;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -559,8 +559,50 @@ pub enum SyncCommand {
     /// [`SyncEvent::ContactsUpdated`]. A 404 is success (already gone). As
     /// `CreateContact`, the next drain sends the op without the command. Needs `Contacts.ReadWrite`, as `CreateContact`.
     DeleteContact { id: String },
+    /// Create a mail folder named `name` under `parent` (#1910; `None`: the
+    /// top of the mailbox). The store has it at once under a `local:` id
+    /// ([`SyncEvent::FoldersUpdated`]); `POST /me/mailFolders` (or the
+    /// parent's `childFolders`) follows through the outbox, and once Graph
+    /// answers the row is re-keyed to Graph's id
+    /// ([`SyncEvent::FolderCreated`], `FoldersUpdated`). Anything aimed at
+    /// the `local:` id meanwhile (a rename, a move, a child folder, a
+    /// message moved into it) follows it (`Store::current_folder_id`). An
+    /// unknown parent or the drafts sentinel is refused at once
+    /// ([`SyncEvent::FolderWriteFailed`] with no status).
+    CreateFolder {
+        parent: Option<String>,
+        name: String,
+    },
+    /// Rename a mail folder (#1910): the store at once, then
+    /// `PATCH /me/mailFolders/{id}` with `displayName`. `sort_order` and
+    /// `is_expanded` are kept. The same name does nothing.
+    RenameFolder { id: String, name: String },
+    /// Move a mail folder under `dest` (#1910; `None`: the top of the
+    /// mailbox, `msgfolderroot`): the store at once, then
+    /// `POST /me/mailFolders/{id}/move`; Graph's answer gives the stored
+    /// parent, and the id if it differs. A dest that is the folder or one
+    /// inside it is refused at once.
+    MoveFolder { id: String, dest: Option<String> },
     /// Exit the sync thread cleanly.
     Shutdown,
+}
+
+/// Which folder write [`SyncEvent::FolderWriteFailed`] reports (#1910).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderWrite {
+    Create,
+    Rename,
+    Move,
+}
+
+impl FolderWrite {
+    fn verb(self) -> &'static str {
+        match self {
+            FolderWrite::Create => "create",
+            FolderWrite::Rename => "rename",
+            FolderWrite::Move => "move",
+        }
+    }
 }
 
 /// Which contact write [`SyncEvent::ContactWriteFailed`] reports (#2063).
@@ -699,6 +741,37 @@ pub enum SyncEvent {
         /// edit is not lost silently; `None` for a delete (and for a row
         /// already gone).
         attempted: Option<FolderContact>,
+    },
+    /// A folder created locally reached Graph (#1910): the row created as
+    /// `local_id` is stored as `id` now, with its messages and child
+    /// folders. The `local:` id still resolves (`Store::current_folder_id`).
+    /// [`SyncEvent::FoldersUpdated`] follows.
+    FolderCreated { local_id: String, id: String },
+    /// A folder write was refused (#1910): by Graph for good (any failure
+    /// but a 401, a throttle, a transport error or a 5xx, which keep the op
+    /// queued; a 404 too), or by the store at once (`status: None`, nothing
+    /// queued: an unknown folder, the drafts sentinel, a move into itself).
+    /// Graph's refusal is final at once and reverts the store:
+    /// - a refused create removes its `local:` folder: unsent mail moved
+    ///   into it (a draft) is filed back in Drafts, or the drafts sentinel,
+    ///   with [`SyncEvent::MessagesUpdated`] for that folder before this
+    ///   event; other mail moved into it comes back by a mail reconverge;
+    /// - a rename or move puts the previous name or parent back (best
+    ///   effort; the next listing corrects the rest).
+    ///
+    /// Each `FolderWriteFailed` is followed by its [`SyncEvent::Error`],
+    /// `"{create|rename|move} folder {id}: {error}"`; after Graph's refusal
+    /// one [`SyncEvent::FoldersUpdated`] ends them.
+    FolderWriteFailed {
+        /// The folder's id as stored when it failed (the Graph id once a
+        /// create re-keyed it); for a create the store refused, its parent.
+        id: String,
+        write: FolderWrite,
+        /// The HTTP status Graph answered (`NotFound` is `Some(404)`);
+        /// `None` when the store refused it, or no status explains it.
+        status: Option<u16>,
+        /// The error, one line.
+        error: String,
     },
     /// Attendee availability (from [`SyncCommand::FetchSchedule`]); the UI fills
     /// its free/busy grid.
@@ -1027,9 +1100,20 @@ fn contact_op(op: &OutboxOp) -> Option<(ContactWrite, &str)> {
     }
 }
 
-/// The HTTP status a refused contact write reports (#2063): Graph's 404 is
-/// its own `GraphError` variant.
-fn contact_write_status(e: &GraphError) -> Option<u16> {
+/// The write and the folder a folder op (#1910) names, as it was queued;
+/// `None` for every other op.
+fn folder_op(op: &OutboxOp) -> Option<(FolderWrite, &str)> {
+    match op {
+        OutboxOp::CreateFolder { id, .. } => Some((FolderWrite::Create, id)),
+        OutboxOp::RenameFolder { id, .. } => Some((FolderWrite::Rename, id)),
+        OutboxOp::MoveFolder { id, .. } => Some((FolderWrite::Move, id)),
+        _ => None,
+    }
+}
+
+/// The HTTP status a refused contact (#2063) or folder (#1910) write
+/// reports: Graph's 404 is its own `GraphError` variant.
+fn refused_write_status(e: &GraphError) -> Option<u16> {
     match e {
         GraphError::Http { status, .. } => Some(*status),
         GraphError::NotFound => Some(404),
@@ -1808,6 +1892,9 @@ impl Engine {
             SyncCommand::SetFastFolders { ids } => {
                 let mut set: Vec<String> = Vec::with_capacity(ids.len());
                 for id in ids {
+                    // A folder created here is synced under its Graph id
+                    // once re-keyed (#1910).
+                    let id = self.store.current_folder_id(&id).unwrap_or(id);
                     if !set.contains(&id) {
                         set.push(id);
                     }
@@ -1851,6 +1938,9 @@ impl Engine {
                 // is a NOT NULL foreign key) must be surfaced, not swallowed.
                 // `id`/`dest` are message/folder ids, never secrets.
                 let id = self.store.current_id(&id).unwrap_or(id);
+                // A folder created here may have been re-keyed since the
+                // host read its id (#1910).
+                let dest = self.store.current_folder_id(&dest).unwrap_or(dest);
                 if let Err(e) = self.store.move_message(&id, &dest) {
                     self.emit(SyncEvent::Error(format!(
                         "local move of {id} to {dest} failed: {e}"
@@ -2066,6 +2156,19 @@ impl Engine {
                     self.emit(SyncEvent::ContactsUpdated);
                 }
             }
+            SyncCommand::CreateFolder { parent, name } => {
+                let r = self.store.create_local_folder(parent.as_deref(), &name);
+                let id = parent.unwrap_or_default();
+                self.folder_command(FolderWrite::Create, &id, r);
+            }
+            SyncCommand::RenameFolder { id, name } => {
+                let r = self.store.rename_folder(&id, &name);
+                self.folder_command(FolderWrite::Rename, &id, r);
+            }
+            SyncCommand::MoveFolder { id, dest } => {
+                let r = self.store.move_folder(&id, dest.as_deref());
+                self.folder_command(FolderWrite::Move, &id, r);
+            }
             // Handled in `main_loop` so the thread can actually return.
             SyncCommand::Shutdown => {}
         }
@@ -2104,7 +2207,9 @@ impl Engine {
                 return;
             }
         };
-        for f in &folders {
+        // A `local:` folder (one created here whose create has not reached
+        // Graph, #1910, or the drafts sentinel) has nothing on the server.
+        for f in folders.iter().filter(|f| !f.id.starts_with("local:")) {
             if !self.checkpoint() || !self.sync_folder_delta(&f.id) {
                 return;
             }
@@ -2157,6 +2262,11 @@ impl Engine {
     /// surfaced and skipped. Returns `false` when the caller must stop (an
     /// auth, throttle or transport failure, already handled by `react`).
     fn refresh_folder(&mut self, folder_id: &str) -> bool {
+        // A folder created here that has not reached Graph yet (#1910) has
+        // nothing there to read.
+        if folder_id.starts_with("local:") {
+            return true;
+        }
         if !self.sync_folder_delta(folder_id) {
             return false;
         }
@@ -2177,6 +2287,13 @@ impl Engine {
     /// sync cut short keeps the state its failure set (Offline,
     /// SignInRequired, or settled by a throttle).
     fn sync_one_folder(&mut self, id: &str) {
+        // A folder created under a `local:` id is synced under Graph's once
+        // re-keyed (#1910).
+        let id = self
+            .store
+            .current_folder_id(id)
+            .unwrap_or_else(|_| id.to_string());
+        let id = id.as_str();
         match self.store.folders() {
             Ok(folders) if folders.iter().any(|f| f.id == id) => {}
             Ok(_) => {
@@ -2196,7 +2313,13 @@ impl Engine {
         self.set_state(SyncState::Syncing);
         if self.drain_outbox().carry_on()
             && self.refresh_if_calendar_reset_owed()
-            && self.refresh_folder(id)
+            // The drain may have re-keyed it (#1910).
+            && self.refresh_folder(
+                &self
+                    .store
+                    .current_folder_id(id)
+                    .unwrap_or_else(|_| id.to_string()),
+            )
         {
             self.clear_backoff();
             self.settle_state();
@@ -2342,8 +2465,35 @@ impl Engine {
         match self.with_auth(|c| c.list_folders()) {
             Ok(listing) => {
                 let mut changed = false;
+                // A folder write still queued (#1910) is not undone by the
+                // listing: a pending rename keeps its name, and a pending
+                // move its parent. The commands that queue them run on this
+                // thread, so the queue cannot change meanwhile.
+                let queued = match self.store.queued_folder_writes() {
+                    Ok(q) => q,
+                    Err(e) => {
+                        self.emit(SyncEvent::Error(e.to_string()));
+                        return true;
+                    }
+                };
+                let stored: HashMap<String, FolderRow> = match self.store.folders() {
+                    Ok(f) => f.into_iter().map(|f| (f.id.clone(), f)).collect(),
+                    Err(e) => {
+                        self.emit(SyncEvent::Error(e.to_string()));
+                        return true;
+                    }
+                };
                 for f in &listing.folders {
-                    changed |= self.store.upsert_folder(f).unwrap_or(false);
+                    let mut f = f.clone();
+                    if let Some(row) = stored.get(&f.id) {
+                        if queued.renamed.contains(&f.id) {
+                            f.display_name = row.display_name.clone();
+                        }
+                        if queued.moved.contains(&f.id) {
+                            f.parent_id = row.parent_id.clone();
+                        }
+                    }
+                    changed |= self.store.upsert_folder(&f).unwrap_or(false);
                 }
                 if let Some(drafts) = listing
                     .folders
@@ -2388,11 +2538,19 @@ impl Engine {
     fn folders_to_keep(&mut self, listed: &[MailFolder]) -> (Vec<String>, bool) {
         let mut keep: Vec<String> = listed.iter().map(|f| f.id.clone()).collect();
         let missing: Vec<String> = match self.store.folders() {
-            Ok(stored) => stored
-                .into_iter()
-                .map(|f| f.id)
-                .filter(|id| id != LOCAL_DRAFTS_SENTINEL_FOLDER_ID && !keep.contains(id))
-                .collect(),
+            Ok(stored) => {
+                let ids: Vec<String> = stored
+                    .into_iter()
+                    .map(|f| f.id)
+                    .filter(|id| id != LOCAL_DRAFTS_SENTINEL_FOLDER_ID && !keep.contains(id))
+                    .collect();
+                // A folder created here (#1910) is never listed before its
+                // create reaches Graph: kept without asking.
+                let (local, missing): (Vec<String>, Vec<String>) =
+                    ids.into_iter().partition(|id| id.starts_with("local:"));
+                keep.extend(local);
+                missing
+            }
             Err(e) => {
                 self.emit(SyncEvent::Error(e.to_string()));
                 return (keep, true);
@@ -3540,6 +3698,12 @@ impl Engine {
         let mut sent = Vec::new();
         let mut deferred = false;
         for row in ops {
+            // A refusal earlier in this drain may have dropped it (#1910: a
+            // refused create drops the message ops of the mail moved into
+            // its folder, `Store::discard_local_folder`).
+            if !self.store.has_op(row.seq).unwrap_or(true) {
+                continue;
+            }
             match self.apply_op_with_retry(&row) {
                 Ok(applied) => {
                     self.store.drop_op(row.seq);
@@ -3548,6 +3712,15 @@ impl Engine {
                         Applied::Moved { old_id, new_id } => self.follow_move(old_id, new_id),
                         Applied::ContactCreated { local_id, id } => {
                             self.emit(SyncEvent::ContactCreated { local_id, id });
+                        }
+                        Applied::FolderCreated { local_id, id } => {
+                            self.follow_folder_rekeys();
+                            self.emit(SyncEvent::FolderCreated { local_id, id });
+                            self.emit(SyncEvent::FoldersUpdated);
+                        }
+                        Applied::FoldersChanged => {
+                            self.follow_folder_rekeys();
+                            self.emit(SyncEvent::FoldersUpdated);
                         }
                         Applied::Done => {}
                     }
@@ -3594,6 +3767,13 @@ impl Engine {
                     // A contact op (#2063): the first refusal is final.
                     if contact_op(&row.op).is_some() {
                         self.refuse_contact_write(&row, &other);
+                        continue;
+                    }
+                    // A folder op (#1910) too: retrying a 400 or a 409
+                    // changes nothing. The revert is best effort; the next
+                    // listing corrects the rest.
+                    if folder_op(&row.op).is_some() {
+                        self.refuse_folder_write(&row, &other);
                         continue;
                     }
                     // A reminder op (#2025) wrote nothing locally, and a
@@ -3674,9 +3854,7 @@ impl Engine {
                         // (see `reconverge_pending`) so it restores the message
                         // even if it has aged past the window during the retry
                         // back-off.
-                        let _ = self.store.clear_delta_links();
-                        self.backfill_done = false;
-                        self.reconverge_pending = true;
+                        self.start_mail_reconverge();
                         let is_event_op = writes_event_locally(&row.op);
                         self.emit(SyncEvent::Error(format!(
                             "quarantined outbox op seq {} after {attempts_after} attempts: {other}",
@@ -3750,7 +3928,7 @@ impl Engine {
         self.emit(SyncEvent::ContactWriteFailed {
             id: id.clone(),
             write,
-            status: contact_write_status(err),
+            status: refused_write_status(err),
             error: error.clone(),
             attempted,
         });
@@ -3759,6 +3937,132 @@ impl Engine {
             write.verb()
         )));
         self.emit(SyncEvent::ContactsUpdated);
+    }
+
+    /// A folder command's store write (#1910): `FoldersUpdated` and a drain
+    /// when it wrote and queued its op, nothing when there was nothing to
+    /// do, and `FolderWriteFailed` + `Error` when the store refused it
+    /// (nothing queued). `id` is the folder the command named (a create's
+    /// parent).
+    fn folder_command(
+        &mut self,
+        write: FolderWrite,
+        id: &str,
+        result: Result<FolderWriteResult, StoreError>,
+    ) {
+        let error = match result {
+            Ok(FolderWriteResult::Written(_)) => {
+                self.emit(SyncEvent::FoldersUpdated);
+                self.drain_queued();
+                return;
+            }
+            Ok(FolderWriteResult::Unchanged) => return,
+            Ok(FolderWriteResult::Refused(r)) => r.to_string(),
+            Err(e) => e.to_string(),
+        };
+        self.report_folder_failure(id, write, None, error);
+    }
+
+    /// A folder op Graph refused for good (#1910): drop it and revert its
+    /// store write, then report it ([`SyncEvent::FolderWriteFailed`], an
+    /// `Error` line, `FoldersUpdated`). A refused create removes its
+    /// `local:` folder: unsent mail in it is filed back in Drafts (or the
+    /// drafts sentinel), with `MessagesUpdated` for that folder, and when
+    /// other mail had been moved into it, the mail reconverges as after a
+    /// quarantine (every delta link cleared), so it comes back in the
+    /// folder Graph has it in. The `local:` folders created under it go too,
+    /// each reported (`FolderWriteFailed` with no status, "its parent folder
+    /// could not be created"); one only moved under it stays, and its move
+    /// there is refused next. A refused rename or move reverts best effort
+    /// (`prev` values are not chained); the next listing corrects the rest.
+    fn refuse_folder_write(&mut self, row: &OutboxRow, err: &GraphError) {
+        let Some((write, queued_id)) = folder_op(&row.op) else {
+            return;
+        };
+        let id = self
+            .store
+            .current_folder_id(queued_id)
+            .unwrap_or_else(|_| queued_id.to_string());
+        self.store.drop_op(row.seq);
+        let mut also_discarded = Vec::new();
+        match &row.op {
+            OutboxOp::CreateFolder { .. } => {
+                let discard = self.store.discard_local_folder(&id).unwrap_or_default();
+                also_discarded = discard.also_discarded;
+                if discard.had_mail {
+                    self.start_mail_reconverge();
+                }
+                // Drafts moved into it are filed back in Drafts.
+                if let Some(folder_id) = discard.refiled_into {
+                    self.emit(SyncEvent::MessagesUpdated { folder_id });
+                }
+            }
+            OutboxOp::RenameFolder {
+                name, prev_name, ..
+            } => {
+                let _ = self.store.revert_folder_name(&id, prev_name, name);
+            }
+            OutboxOp::MoveFolder {
+                parent,
+                prev_parent,
+                ..
+            } => {
+                let _ =
+                    self.store
+                        .revert_folder_parent(&id, prev_parent.as_deref(), parent.as_deref());
+            }
+            _ => {}
+        }
+        self.report_folder_failure(&id, write, refused_write_status(err), err.to_string());
+        // The `local:` folders created under a refused create went with it
+        // (`Store::discard_local_folder`): each is reported, none silently.
+        for other in &also_discarded {
+            self.report_folder_failure(
+                other,
+                FolderWrite::Create,
+                None,
+                "its parent folder could not be created".to_string(),
+            );
+        }
+        self.emit(SyncEvent::FoldersUpdated);
+    }
+
+    /// `FolderWriteFailed` and its `Error` line (#1910).
+    fn report_folder_failure(
+        &self,
+        id: &str,
+        write: FolderWrite,
+        status: Option<u16>,
+        error: String,
+    ) {
+        let line = format!("{} folder {id}: {error}", write.verb());
+        self.emit(SyncEvent::FolderWriteFailed {
+            id: id.to_string(),
+            write,
+            status,
+            error,
+        });
+        self.emit(SyncEvent::Error(line));
+    }
+
+    /// Brings messages a `local:` folder took with it back where Graph has
+    /// them (#1910): the reconverge a quarantine starts (every delta link
+    /// cleared, the next passes re-enumerate the mailbox with no cutoff).
+    fn start_mail_reconverge(&mut self) {
+        let _ = self.store.clear_delta_links();
+        self.backfill_done = false;
+        self.reconverge_pending = true;
+    }
+
+    /// Maps the fast folders (`SetFastFolders`) through `folder_aliases`
+    /// after a folder re-key (#1910), so a folder the host chose under its
+    /// `local:` id keeps its fast ticks under Graph's.
+    fn follow_folder_rekeys(&mut self) {
+        for id in &mut self.fast_folders {
+            if let Ok(current) = self.store.current_folder_id(id) {
+                *id = current;
+            }
+        }
     }
 
     /// Re-reads every owed contact (`Store::owe_contact_reread`, #2063)
@@ -4079,7 +4383,25 @@ impl Engine {
             });
             return false;
         }
-        match self.with_auth(|c| c.search_messages(folder_id.as_deref(), &query, top)) {
+        // A folder created here is searched under its Graph id; one whose
+        // create has not reached Graph has nothing there (#1910).
+        let scope = match folder_id.as_deref() {
+            Some(f) => Some(
+                self.store
+                    .current_folder_id(f)
+                    .unwrap_or_else(|_| f.to_string()),
+            ),
+            None => None,
+        };
+        if scope.as_deref().is_some_and(|f| f.starts_with("local:")) {
+            self.emit(SyncEvent::MessageSearchResults {
+                query,
+                folder_id,
+                hits: Vec::new(),
+            });
+            return false;
+        }
+        match self.with_auth(|c| c.search_messages(scope.as_deref(), &query, top)) {
             Ok(hits) => {
                 self.emit(SyncEvent::MessageSearchResults {
                     query,
@@ -26466,6 +26788,1139 @@ mod tests {
                     let _ = std::fs::remove_dir_all(&dir);
                 }
             }
+        }
+    }
+
+    /// Folder writes through the outbox (#1910).
+    mod folder_writes {
+        use super::*;
+
+        /// A listed folder: id, parent, well-known name.
+        type Listed = (&'static str, Option<&'static str>, Option<&'static str>);
+
+        /// Inbox, Archive and Other at the top; Projects under Inbox, Sub
+        /// under Projects. Each display name is its id.
+        const TREE: &[Listed] = &[
+            ("INBOX", Some("ROOT"), Some("inbox")),
+            ("ARCH", Some("ROOT"), None),
+            ("OTHER", Some("ROOT"), None),
+            ("PROJ", Some("INBOX"), None),
+            ("SUB", Some("PROJ"), None),
+        ];
+
+        fn opt_json(v: Option<&str>) -> String {
+            v.map_or("null".to_string(), |v| format!("\"{v}\""))
+        }
+
+        fn listed_json(id: &str, parent: Option<&str>, wk: Option<&str>) -> String {
+            format!(
+                r#"{{"id":"{id}","displayName":"{id}","parentFolderId":{},"totalItemCount":0,"unreadItemCount":0,"childFolderCount":0,"wellKnownName":{}}}"#,
+                opt_json(parent),
+                opt_json(wk)
+            )
+        }
+
+        /// A folder write's route.
+        fn write(method: &str, path: &str, status: u16, body: &str) -> (Route, Option<usize>) {
+            (any_route(method, path, status, body), None)
+        }
+
+        fn once(method: &str, path: &str, status: u16, body: &str) -> (Route, Option<usize>) {
+            (any_route(method, path, status, body), Some(1))
+        }
+
+        fn answer(id: &str, parent: &str) -> String {
+            format!(r#"{{"id":"{id}","displayName":"{id}","parentFolderId":"{parent}"}}"#)
+        }
+
+        /// `writes` first, then what a pass reads for `tree`: the listing,
+        /// each folder's counts and deltas (its first delta carries the
+        /// messages `mail` files in it; a round on its link is empty), and
+        /// the full pass's people, contacts, categories and calendars.
+        fn world(
+            writes: Vec<(Route, Option<usize>)>,
+            tree: &[Listed],
+            mail: &[(&str, &str)],
+        ) -> Vec<(Route, Option<usize>)> {
+            let mut routes = writes;
+            for (id, _, _) in tree {
+                let delta = format!("/me/mailFolders/{id}/messages/delta");
+                let link = format!("{delta}?token=D-{id}");
+                routes.push((get_route(&link, 200, &delta_page(&[], &link)), None));
+                let items: Vec<String> = mail
+                    .iter()
+                    .filter(|(f, _)| f == id)
+                    .map(|(_, m)| full_message_json(m, m, "2026-07-16T10:00:00Z"))
+                    .collect();
+                routes.push((get_route(&delta, 200, &delta_page(&items, &link)), None));
+                routes.push((
+                    get_route(
+                        &format!("/me/mailFolders/{id}?"),
+                        200,
+                        r#"{"totalItemCount":0,"unreadItemCount":0}"#,
+                    ),
+                    None,
+                ));
+            }
+            let listed: Vec<String> = tree
+                .iter()
+                .map(|(id, parent, wk)| listed_json(id, *parent, *wk))
+                .collect();
+            routes.push((
+                get_route(
+                    "/me/mailFolders?",
+                    200,
+                    &format!(r#"{{"value":[{}]}}"#, listed.join(",")),
+                ),
+                None,
+            ));
+            routes.push((get_route("/me/calendars?", 200, r#"{"value":[]}"#), None));
+            routes.extend(folder_contacts_routes(
+                CAROL_PERSON,
+                &[("/me/contacts", 200, r#"{"value":[]}"#, None)],
+            ));
+            routes
+        }
+
+        /// An engine on `routes`, after its startup pass.
+        fn engine(
+            tag: &str,
+            routes: Vec<(Route, Option<usize>)>,
+            fast: Option<Duration>,
+        ) -> (FakeServer, SyncHandle, Store, PathBuf) {
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) = spawn_fast(&srv, tag, HOUR, fast, |_| {});
+            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+            let store = Store::open(&store_path).unwrap();
+            (srv, handle, store, dir)
+        }
+
+        fn stop(handle: SyncHandle, dir: PathBuf) {
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        fn send(handle: &SyncHandle, cmd: SyncCommand) {
+            handle.cmd_tx.send(cmd).unwrap();
+        }
+
+        fn row(store: &Store, id: &str) -> Option<FolderRow> {
+            store.folders().unwrap().into_iter().find(|f| f.id == id)
+        }
+
+        fn local_folders(store: &Store) -> Vec<String> {
+            store
+                .folders()
+                .unwrap()
+                .into_iter()
+                .map(|f| f.id)
+                .filter(|id| id.starts_with("local:") && id != LOCAL_DRAFTS_SENTINEL_FOLDER_ID)
+                .collect()
+        }
+
+        fn mail_in(store: &Store, folder: &str) -> Vec<String> {
+            store
+                .messages_in_folder(folder, 50, 0)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect()
+        }
+
+        /// Every request but a GET: the writes, in order.
+        fn writes_sent(srv: &FakeServer) -> Vec<(String, String, String)> {
+            srv.requests()
+                .into_iter()
+                .filter(|r| r.method != "GET")
+                .map(|r| (r.method, r.path, r.body))
+                .collect()
+        }
+
+        fn wait_requests(srv: &FakeServer, method: &str, path: &str, n: usize) {
+            assert!(
+                wait_until(ENGINE_WAIT, || hits(srv, method, path) >= n),
+                "{method} {path}: {:?}",
+                writes_sent(srv)
+            );
+        }
+
+        fn wait_drained(store: &Store) {
+            assert!(wait_until(ENGINE_WAIT, || store
+                .pending_ops()
+                .unwrap()
+                .is_empty()));
+        }
+
+        fn wait_queued(store: &Store, n: usize) {
+            assert!(
+                wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().len() == n),
+                "{:?}",
+                store.pending_ops().unwrap()
+            );
+        }
+
+        /// No request named a folder by a `local:` id.
+        fn no_local_request(srv: &FakeServer) {
+            let local: Vec<String> = srv
+                .requests()
+                .into_iter()
+                .map(|r| r.path)
+                .filter(|p| p.contains("local"))
+                .collect();
+            assert!(local.is_empty(), "{local:?}");
+        }
+
+        /// Waits out a refused folder write: `FolderWriteFailed`, then the
+        /// refusal's `FoldersUpdated`. Returns the failure and every event,
+        /// and checks the order: the failure, its `Error` line, then
+        /// `FoldersUpdated`.
+        fn wait_refused(handle: &SyncHandle) -> (SyncEvent, Vec<SyncEvent>) {
+            let mut seen = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::FolderWriteFailed { .. })
+            });
+            seen.extend(wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::FoldersUpdated)
+            }));
+            let failed = seen
+                .iter()
+                .position(|e| matches!(e, SyncEvent::FolderWriteFailed { .. }))
+                .unwrap();
+            let SyncEvent::FolderWriteFailed {
+                id, write, error, ..
+            } = &seen[failed]
+            else {
+                unreachable!()
+            };
+            let line = format!("{} folder {id}: {error}", write.verb());
+            assert_eq!(
+                seen.get(failed + 1),
+                Some(&SyncEvent::Error(line)),
+                "{seen:?}"
+            );
+            assert_eq!(seen.last(), Some(&SyncEvent::FoldersUpdated));
+            (seen[failed].clone(), seen)
+        }
+
+        /// A failure the store refused: `FolderWriteFailed` with no status,
+        /// then its `Error` line.
+        fn wait_store_refused(handle: &SyncHandle) -> SyncEvent {
+            let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+            let failed = seen
+                .iter()
+                .find(|e| matches!(e, SyncEvent::FolderWriteFailed { .. }))
+                .cloned()
+                .unwrap_or_else(|| panic!("{seen:?}"));
+            let SyncEvent::FolderWriteFailed {
+                id,
+                write,
+                status,
+                error,
+            } = &failed
+            else {
+                unreachable!()
+            };
+            assert_eq!(*status, None);
+            assert_eq!(
+                seen.last(),
+                Some(&SyncEvent::Error(format!(
+                    "{} folder {id}: {error}",
+                    write.verb()
+                )))
+            );
+            failed
+        }
+
+        const EXISTS: &str = r#"{"error":{"code":"ErrorFolderExists","message":"A folder with the specified name already exists."}}"#;
+        const BAD: &str = r#"{"error":{"code":"ErrorInvalidRequest","message":"Not allowed."}}"#;
+
+        #[test]
+        fn create_folder_round_trip_at_the_top_and_under_a_parent() {
+            let (srv, handle, store, dir) = engine(
+                "folder-create",
+                world(
+                    vec![
+                        write(
+                            "POST",
+                            "/me/mailFolders/INBOX/childFolders",
+                            201,
+                            &answer("G1", "INBOX"),
+                        ),
+                        write(
+                            "POST",
+                            "/me/mailFolders/G1/childFolders",
+                            201,
+                            &answer("G3", "G1"),
+                        ),
+                        write("POST", "/me/mailFolders", 201, &answer("G2", "ROOT")),
+                    ],
+                    TREE,
+                    &[],
+                ),
+                None,
+            );
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some("INBOX".into()),
+                    name: "Kid".into(),
+                },
+            );
+            let mut seen = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::FolderCreated { .. })
+            });
+            seen.extend(wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::FoldersUpdated)
+            }));
+            let created = seen
+                .iter()
+                .position(|e| matches!(e, SyncEvent::FolderCreated { .. }))
+                .unwrap();
+            assert!(
+                seen[..created].contains(&SyncEvent::FoldersUpdated),
+                "the local write is shown first: {seen:?}"
+            );
+            let SyncEvent::FolderCreated { local_id, id } = seen[created].clone() else {
+                unreachable!()
+            };
+            assert!(local_id.starts_with("local:"), "{local_id}");
+            assert_eq!(id, "G1");
+            let g1 = row(&store, "G1").unwrap();
+            assert_eq!(g1.display_name, "Kid");
+            assert_eq!(g1.parent_id.as_deref(), Some("INBOX"));
+            assert!(row(&store, &local_id).is_none());
+            assert_eq!(store.current_folder_id(&local_id).unwrap(), "G1");
+
+            // A child aimed at the `local:` id goes under Graph's.
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some(local_id.clone()),
+                    name: "Grandkid".into(),
+                },
+            );
+            wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::FolderCreated { id, .. } if id == "G3"),
+            );
+            assert_eq!(row(&store, "G3").unwrap().parent_id.as_deref(), Some("G1"));
+
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: None,
+                    name: "Top".into(),
+                },
+            );
+            wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::FolderCreated { id, .. } if id == "G2"),
+            );
+            let g2 = row(&store, "G2").unwrap();
+            assert_eq!(g2.display_name, "Top");
+            assert_eq!(g2.parent_id.as_deref(), Some("ROOT"));
+            assert_eq!(
+                writes_sent(&srv),
+                [
+                    (
+                        "POST".to_string(),
+                        "/me/mailFolders/INBOX/childFolders".to_string(),
+                        r#"{"displayName":"Kid"}"#.to_string()
+                    ),
+                    (
+                        "POST".to_string(),
+                        "/me/mailFolders/G1/childFolders".to_string(),
+                        r#"{"displayName":"Grandkid"}"#.to_string()
+                    ),
+                    (
+                        "POST".to_string(),
+                        "/me/mailFolders".to_string(),
+                        r#"{"displayName":"Top"}"#.to_string()
+                    ),
+                ]
+            );
+            assert!(local_folders(&store).is_empty());
+            wait_drained(&store);
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn rename_folder_patches_and_keeps_local_state() {
+            let (srv, handle, store, dir) = engine(
+                "folder-rename",
+                world(
+                    vec![write("PATCH", "/me/mailFolders/PROJ", 200, "{}")],
+                    TREE,
+                    &[],
+                ),
+                None,
+            );
+            store.set_folder_expanded("PROJ", true).unwrap();
+            send(
+                &handle,
+                SyncCommand::RenameFolder {
+                    id: "PROJ".into(),
+                    name: "Projects".into(),
+                },
+            );
+            wait_requests(&srv, "PATCH", "/me/mailFolders/PROJ", 1);
+            wait_drained(&store);
+            assert_eq!(
+                writes_sent(&srv),
+                [(
+                    "PATCH".to_string(),
+                    "/me/mailFolders/PROJ".to_string(),
+                    r#"{"displayName":"Projects"}"#.to_string()
+                )]
+            );
+            let proj = row(&store, "PROJ").unwrap();
+            assert_eq!(proj.display_name, "Projects");
+            assert!(proj.is_expanded);
+            assert!(proj.delta_link.is_some());
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn move_folder_to_the_top_and_under_a_folder_stores_graphs_answer() {
+            let (srv, handle, store, dir) = engine(
+                "folder-move",
+                world(
+                    vec![
+                        write(
+                            "POST",
+                            "/me/mailFolders/PROJ/move",
+                            200,
+                            &answer("PROJ2", "ROOT"),
+                        ),
+                        write(
+                            "POST",
+                            "/me/mailFolders/SUB/move",
+                            200,
+                            &answer("SUB", "ARCH"),
+                        ),
+                    ],
+                    TREE,
+                    &[("PROJ", "P1")],
+                ),
+                None,
+            );
+            assert_eq!(mail_in(&store, "PROJ"), ["P1"]);
+            store.set_folder_expanded("PROJ", true).unwrap();
+            send(
+                &handle,
+                SyncCommand::MoveFolder {
+                    id: "PROJ".into(),
+                    dest: None,
+                },
+            );
+            wait_requests(&srv, "POST", "/me/mailFolders/PROJ/move", 1);
+            wait_drained(&store);
+            assert!(wait_until(ENGINE_WAIT, || row(&store, "PROJ2").is_some()));
+            assert!(row(&store, "PROJ").is_none());
+            let moved = row(&store, "PROJ2").unwrap();
+            assert_eq!(moved.parent_id.as_deref(), Some("ROOT"));
+            assert!(moved.is_expanded);
+            assert_eq!(moved.delta_link, None, "the old link names the old id");
+            assert_eq!(mail_in(&store, "PROJ2"), ["P1"]);
+            assert_eq!(
+                row(&store, "SUB").unwrap().parent_id.as_deref(),
+                Some("PROJ2")
+            );
+            assert_eq!(store.current_folder_id("PROJ").unwrap(), "PROJ2");
+
+            send(
+                &handle,
+                SyncCommand::MoveFolder {
+                    id: "SUB".into(),
+                    dest: Some("ARCH".into()),
+                },
+            );
+            wait_requests(&srv, "POST", "/me/mailFolders/SUB/move", 1);
+            wait_drained(&store);
+            assert_eq!(
+                row(&store, "SUB").unwrap().parent_id.as_deref(),
+                Some("ARCH")
+            );
+            assert_eq!(
+                writes_sent(&srv)
+                    .into_iter()
+                    .map(|(_, _, body)| body)
+                    .collect::<Vec<_>>(),
+                [
+                    r#"{"destinationId":"msgfolderroot"}"#,
+                    r#"{"destinationId":"ARCH"}"#
+                ]
+            );
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn rename_move_and_message_move_queued_behind_a_deferred_create_follow_it() {
+            let child = "/me/mailFolders/INBOX/childFolders";
+            let (srv, handle, store, dir) = engine(
+                "folder-create-5xx",
+                world(
+                    vec![
+                        once("POST", child, 500, "busy"),
+                        write("POST", child, 201, &answer("G1", "INBOX")),
+                        write(
+                            "POST",
+                            "/me/mailFolders/G1/move",
+                            200,
+                            &answer("G1", "ARCH"),
+                        ),
+                        write("PATCH", "/me/mailFolders/G1", 200, "{}"),
+                        write("POST", "/me/messages/I1/move", 201, r#"{"id":"I1b"}"#),
+                    ],
+                    TREE,
+                    &[("INBOX", "I1")],
+                ),
+                None,
+            );
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some("INBOX".into()),
+                    name: "One".into(),
+                },
+            );
+            wait_requests(&srv, "POST", child, 1);
+            let local = local_folders(&store).pop().expect("the local: row");
+            send(
+                &handle,
+                SyncCommand::RenameFolder {
+                    id: local.clone(),
+                    name: "Two".into(),
+                },
+            );
+            send(
+                &handle,
+                SyncCommand::MoveFolder {
+                    id: local.clone(),
+                    dest: Some("ARCH".into()),
+                },
+            );
+            send(
+                &handle,
+                SyncCommand::Move {
+                    id: "I1".into(),
+                    dest: local.clone(),
+                },
+            );
+            wait_queued(&store, 4);
+            assert_eq!(mail_in(&store, &local), ["I1"]);
+            assert_eq!(writes_sent(&srv).len(), 1, "all wait behind the 500");
+
+            // Refresh resends at once: a pass first, whose listing does not
+            // undo the queued writes, then the drain.
+            send(&handle, SyncCommand::Refresh);
+            wait_requests(&srv, "POST", "/me/messages/I1/move", 1);
+            wait_drained(&store);
+            let order: Vec<(String, String)> = writes_sent(&srv)
+                .into_iter()
+                .map(|(m, p, _)| (m, p))
+                .collect();
+            let want = [
+                ("POST", child),
+                ("POST", child),
+                ("PATCH", "/me/mailFolders/G1"),
+                ("POST", "/me/mailFolders/G1/move"),
+                ("POST", "/me/messages/I1/move"),
+            ]
+            .map(|(m, p)| (m.to_string(), p.to_string()));
+            assert_eq!(order, want);
+            let bodies: Vec<String> = writes_sent(&srv).into_iter().map(|(_, _, b)| b).collect();
+            assert_eq!(bodies[1], r#"{"displayName":"One"}"#);
+            assert_eq!(bodies[2], r#"{"displayName":"Two"}"#);
+            assert_eq!(bodies[3], r#"{"destinationId":"ARCH"}"#);
+            assert_eq!(bodies[4], r#"{"destinationId":"G1"}"#);
+            let g1 = row(&store, "G1").unwrap();
+            assert_eq!(g1.display_name, "Two");
+            assert_eq!(g1.parent_id.as_deref(), Some("ARCH"));
+            assert!(local_folders(&store).is_empty());
+            assert!(wait_until(ENGINE_WAIT, || mail_in(&store, "G1") == ["I1b"]));
+            no_local_request(&srv);
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn refused_folder_writes_revert_and_report() {
+            let (srv, handle, store, dir) = engine(
+                "folder-refused",
+                world(
+                    vec![
+                        write("POST", "/me/mailFolders/INBOX/childFolders", 409, EXISTS),
+                        write("PATCH", "/me/mailFolders/PROJ", 400, BAD),
+                        write("PATCH", "/me/mailFolders/OTHER", 404, "{}"),
+                        write("POST", "/me/mailFolders/SUB/move", 409, EXISTS),
+                    ],
+                    TREE,
+                    &[],
+                ),
+                None,
+            );
+            let status = |e: &SyncEvent| match e {
+                SyncEvent::FolderWriteFailed { write, status, .. } => (*write, *status),
+                _ => unreachable!(),
+            };
+
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some("INBOX".into()),
+                    name: "Dup".into(),
+                },
+            );
+            let (failed, _) = wait_refused(&handle);
+            assert_eq!(status(&failed), (FolderWrite::Create, Some(409)));
+            let SyncEvent::FolderWriteFailed { id, error, .. } = &failed else {
+                unreachable!()
+            };
+            assert!(id.starts_with("local:"), "{id}");
+            assert!(error.contains("already exists"), "{error}");
+            assert!(local_folders(&store).is_empty(), "the local: row is gone");
+
+            store.set_folder_expanded("PROJ", true).unwrap();
+            send(
+                &handle,
+                SyncCommand::RenameFolder {
+                    id: "PROJ".into(),
+                    name: "Nope".into(),
+                },
+            );
+            let (failed, _) = wait_refused(&handle);
+            assert_eq!(status(&failed), (FolderWrite::Rename, Some(400)));
+            let proj = row(&store, "PROJ").unwrap();
+            assert_eq!(proj.display_name, "PROJ");
+            assert!(proj.is_expanded);
+
+            // A 404 on a rename is a refusal too.
+            send(
+                &handle,
+                SyncCommand::RenameFolder {
+                    id: "OTHER".into(),
+                    name: "Gone".into(),
+                },
+            );
+            let (failed, _) = wait_refused(&handle);
+            assert_eq!(status(&failed), (FolderWrite::Rename, Some(404)));
+            assert_eq!(row(&store, "OTHER").unwrap().display_name, "OTHER");
+
+            send(
+                &handle,
+                SyncCommand::MoveFolder {
+                    id: "SUB".into(),
+                    dest: Some("OTHER".into()),
+                },
+            );
+            let (failed, _) = wait_refused(&handle);
+            assert_eq!(status(&failed), (FolderWrite::Move, Some(409)));
+            assert_eq!(
+                row(&store, "SUB").unwrap().parent_id.as_deref(),
+                Some("PROJ")
+            );
+
+            assert!(store.pending_ops().unwrap().is_empty());
+            assert_eq!(writes_sent(&srv).len(), 4, "each sent once, no retry");
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn refused_create_of_a_folder_holding_moved_mail_reconverges() {
+            let child = "/me/mailFolders/INBOX/childFolders";
+            let (srv, handle, store, dir) = engine(
+                "folder-refused-mail",
+                world(
+                    vec![
+                        once("POST", child, 500, "busy"),
+                        write("POST", child, 400, BAD),
+                        write("POST", "/me/messages/I1/move", 201, r#"{"id":"I1b"}"#),
+                        write("PATCH", "/me/messages/I1", 200, "{}"),
+                    ],
+                    TREE,
+                    &[("INBOX", "I1")],
+                ),
+                None,
+            );
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some("INBOX".into()),
+                    name: "New".into(),
+                },
+            );
+            wait_requests(&srv, "POST", child, 1);
+            let local = local_folders(&store).pop().unwrap();
+            send(
+                &handle,
+                SyncCommand::Move {
+                    id: "I1".into(),
+                    dest: local.clone(),
+                },
+            );
+            // A flag on I1 too, queued after the create: the refusal drops
+            // it with the move, mid-drain (the drain's `has_op` skip).
+            send(
+                &handle,
+                SyncCommand::SetFlag {
+                    id: "I1".into(),
+                    flagged: true,
+                },
+            );
+            wait_queued(&store, 3);
+            assert_eq!(mail_in(&store, &local), ["I1"]);
+
+            send(&handle, SyncCommand::Refresh);
+            let (failed, _) = wait_refused(&handle);
+            assert!(matches!(
+                failed,
+                SyncEvent::FolderWriteFailed {
+                    write: FolderWrite::Create,
+                    status: Some(400),
+                    ..
+                }
+            ));
+            wait_drained(&store);
+            assert!(row(&store, &local).is_none());
+            assert!(
+                !store.message_exists("I1").unwrap(),
+                "it went with the folder"
+            );
+            // The reconverge brings it back where Graph has it.
+            send(&handle, SyncCommand::Refresh);
+            assert!(wait_until(ENGINE_WAIT, || mail_in(&store, "INBOX") == ["I1"]));
+            assert_eq!(hits(&srv, "POST", "/me/messages/I1/move"), 0);
+            assert_eq!(
+                hits(&srv, "PATCH", "/me/messages/I1"),
+                0,
+                "the dropped flag is not sent"
+            );
+            no_local_request(&srv);
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn a_refused_create_files_a_draft_moved_into_it_back_in_drafts() {
+            let child = "/me/mailFolders/INBOX/childFolders";
+            let mut tree = TREE.to_vec();
+            tree.push(("DRAFTS", Some("ROOT"), Some("drafts")));
+            let created = r#"{"id":"D1","conversationId":"C","subject":"Hi","from":{"emailAddress":{"name":"","address":""}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":false,"hasAttachments":false,"importance":"normal","bodyPreview":"","isDraft":true}"#;
+            let (srv, handle, store, dir) = engine(
+                "folder-refused-draft",
+                world(
+                    vec![
+                        once("POST", child, 500, "busy"),
+                        write("POST", child, 409, EXISTS),
+                        write("POST", "/me/messages", 201, created),
+                    ],
+                    &tree,
+                    &[],
+                ),
+                None,
+            );
+            let draft = store
+                .create_local_draft("Hi", "bob@x", "", "<p>hi</p>")
+                .unwrap();
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some("INBOX".into()),
+                    name: "L".into(),
+                },
+            );
+            wait_requests(&srv, "POST", child, 1);
+            let local = local_folders(&store).pop().unwrap();
+            send(&handle, SyncCommand::SaveDraft { id: draft.clone() });
+            send(
+                &handle,
+                SyncCommand::Move {
+                    id: draft.clone(),
+                    dest: local.clone(),
+                },
+            );
+            wait_queued(&store, 3);
+            assert_eq!(mail_in(&store, &local), std::slice::from_ref(&draft));
+
+            send(&handle, SyncCommand::Refresh);
+            let (failed, seen) = wait_refused(&handle);
+            assert!(matches!(
+                failed,
+                SyncEvent::FolderWriteFailed {
+                    write: FolderWrite::Create,
+                    status: Some(409),
+                    ..
+                }
+            ));
+            assert!(
+                seen.contains(&SyncEvent::MessagesUpdated {
+                    folder_id: "DRAFTS".into()
+                }),
+                "{seen:?}"
+            );
+            // Its save, still queued, creates it on Graph.
+            wait_requests(&srv, "POST", "/me/messages", 1);
+            wait_drained(&store);
+            assert!(wait_until(ENGINE_WAIT, || mail_in(&store, "DRAFTS") == ["D1"]));
+            assert!(row(&store, &local).is_none());
+            assert!(
+                !srv.requests().iter().any(|r| r.path.ends_with("/move")),
+                "the move into L is never sent"
+            );
+            stop(handle, dir);
+        }
+
+        /// The `FolderWriteFailed` events in `seen`, as (id, write, status).
+        fn failures(seen: &[SyncEvent]) -> Vec<(String, FolderWrite, Option<u16>)> {
+            seen.iter()
+                .filter_map(|e| match e {
+                    SyncEvent::FolderWriteFailed {
+                        id, write, status, ..
+                    } => Some((id.clone(), *write, *status)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn a_folder_only_moved_under_a_refused_create_keeps_its_own_create() {
+            // X (top) and Y (under INBOX) are created while X's create waits
+            // behind a 500; Y is moved under X. Graph refuses X (409): Y's
+            // create still goes under INBOX, and its move into X is refused.
+            let top = "/me/mailFolders";
+            let child = "/me/mailFolders/INBOX/childFolders";
+            let (srv, handle, store, dir) = engine(
+                "folder-moved-under-refused",
+                world(
+                    vec![
+                        write("POST", child, 201, &answer("GY", "INBOX")),
+                        once("POST", top, 500, "busy"),
+                        write("POST", top, 409, EXISTS),
+                    ],
+                    TREE,
+                    &[],
+                ),
+                None,
+            );
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: None,
+                    name: "X".into(),
+                },
+            );
+            wait_requests(&srv, "POST", top, 1);
+            let x = local_folders(&store).pop().unwrap();
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some("INBOX".into()),
+                    name: "Y".into(),
+                },
+            );
+            wait_queued(&store, 2);
+            let y = local_folders(&store).into_iter().find(|f| *f != x).unwrap();
+            send(
+                &handle,
+                SyncCommand::MoveFolder {
+                    id: y.clone(),
+                    dest: Some(x.clone()),
+                },
+            );
+            wait_queued(&store, 3);
+
+            send(&handle, SyncCommand::Refresh);
+            let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+            wait_drained(&store);
+            assert_eq!(
+                failures(&seen),
+                [
+                    (x.clone(), FolderWrite::Create, Some(409)),
+                    ("GY".to_string(), FolderWrite::Move, None),
+                ]
+            );
+            let order: Vec<(String, String)> = writes_sent(&srv)
+                .into_iter()
+                .map(|(m, p, _)| (m, p))
+                .collect();
+            let want = [("POST", top), ("POST", top), ("POST", child)]
+                .map(|(m, p)| (m.to_string(), p.to_string()));
+            assert_eq!(order, want, "no move of Y into X is sent");
+            let gy = row(&store, "GY").unwrap();
+            assert_eq!(gy.display_name, "Y");
+            assert_eq!(gy.parent_id.as_deref(), Some("INBOX"));
+            assert!(row(&store, &x).is_none());
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn a_folder_created_under_a_refused_create_is_reported() {
+            // Y is created under X, then moved to the top, while X's create
+            // waits behind a 500. Graph refuses X: Y could never be created.
+            let top = "/me/mailFolders";
+            let (srv, handle, store, dir) = engine(
+                "folder-created-under-refused",
+                world(
+                    vec![
+                        once("POST", top, 500, "busy"),
+                        write("POST", top, 409, EXISTS),
+                    ],
+                    TREE,
+                    &[],
+                ),
+                None,
+            );
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: None,
+                    name: "X".into(),
+                },
+            );
+            wait_requests(&srv, "POST", top, 1);
+            let x = local_folders(&store).pop().unwrap();
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some(x.clone()),
+                    name: "Y".into(),
+                },
+            );
+            wait_queued(&store, 2);
+            let y = local_folders(&store).into_iter().find(|f| *f != x).unwrap();
+            send(
+                &handle,
+                SyncCommand::MoveFolder {
+                    id: y.clone(),
+                    dest: None,
+                },
+            );
+            wait_queued(&store, 3);
+
+            send(&handle, SyncCommand::Refresh);
+            let (_, seen) = wait_refused(&handle);
+            wait_drained(&store);
+            assert_eq!(
+                failures(&seen),
+                [
+                    (x.clone(), FolderWrite::Create, Some(409)),
+                    (y.clone(), FolderWrite::Create, None),
+                ]
+            );
+            assert!(seen.contains(&SyncEvent::Error(format!(
+                "create folder {y}: its parent folder could not be created"
+            ))));
+            assert!(row(&store, &y).is_none());
+            assert_eq!(writes_sent(&srv).len(), 2, "only X's creates");
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn a_sync_pass_keeps_folder_writes_still_queued() {
+            let (srv, handle, store, dir) = engine(
+                "folder-pending",
+                world(
+                    vec![write("PATCH", "/me/mailFolders/ARCH", 500, "busy")],
+                    TREE,
+                    &[],
+                ),
+                None,
+            );
+            send(
+                &handle,
+                SyncCommand::RenameFolder {
+                    id: "ARCH".into(),
+                    name: "Archive".into(),
+                },
+            );
+            wait_requests(&srv, "PATCH", "/me/mailFolders/ARCH", 1);
+            send(
+                &handle,
+                SyncCommand::MoveFolder {
+                    id: "OTHER".into(),
+                    dest: Some("ARCH".into()),
+                },
+            );
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some("INBOX".into()),
+                    name: "New".into(),
+                },
+            );
+            wait_queued(&store, 3);
+            let local = local_folders(&store).pop().unwrap();
+
+            // The listing still has Graph's names and parents.
+            let before = srv.requests().len();
+            send(&handle, SyncCommand::Refresh);
+            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+            assert!(
+                paths_from(&srv, before).iter().any(|p| is_folder_list(p)),
+                "a listing ran"
+            );
+            assert_eq!(row(&store, "ARCH").unwrap().display_name, "Archive");
+            assert_eq!(
+                row(&store, "OTHER").unwrap().parent_id.as_deref(),
+                Some("ARCH")
+            );
+            assert!(row(&store, &local).is_some());
+            assert_eq!(store.pending_ops().unwrap().len(), 3);
+
+            // Nothing is read from Graph for the `local:` folder.
+            send(&handle, SyncCommand::SyncFolder { id: local.clone() });
+            send(
+                &handle,
+                SyncCommand::SearchMessages {
+                    query: "x".into(),
+                    folder_id: Some(local.clone()),
+                    top: 10,
+                },
+            );
+            let seen = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::MessageSearchResults { .. })
+            });
+            assert!(
+                seen.contains(&SyncEvent::MessageSearchResults {
+                    query: "x".into(),
+                    folder_id: Some(local.clone()),
+                    hits: Vec::new(),
+                }),
+                "{seen:?}"
+            );
+            assert!(
+                !srv.requests().iter().any(|r| r.path.contains("search")),
+                "no server search"
+            );
+            no_local_request(&srv);
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn folder_commands_the_store_refuses_report_and_queue_nothing() {
+            let (srv, handle, store, dir) =
+                engine("folder-local-refusal", world(vec![], TREE, &[]), None);
+            send(
+                &handle,
+                SyncCommand::MoveFolder {
+                    id: "PROJ".into(),
+                    dest: Some("SUB".into()),
+                },
+            );
+            assert_eq!(
+                wait_store_refused(&handle),
+                SyncEvent::FolderWriteFailed {
+                    id: "PROJ".into(),
+                    write: FolderWrite::Move,
+                    status: None,
+                    error: "a folder cannot move into itself or a folder inside it".into(),
+                }
+            );
+            let sentinel = store.drafts_folder_id().unwrap();
+            assert_eq!(sentinel, LOCAL_DRAFTS_SENTINEL_FOLDER_ID);
+            send(
+                &handle,
+                SyncCommand::RenameFolder {
+                    id: sentinel.clone(),
+                    name: "x".into(),
+                },
+            );
+            assert_eq!(
+                wait_store_refused(&handle),
+                SyncEvent::FolderWriteFailed {
+                    id: sentinel.clone(),
+                    write: FolderWrite::Rename,
+                    status: None,
+                    error: "the local drafts folder is not on the server".into(),
+                }
+            );
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some("NOPE".into()),
+                    name: "x".into(),
+                },
+            );
+            assert_eq!(
+                wait_store_refused(&handle),
+                SyncEvent::FolderWriteFailed {
+                    id: "NOPE".into(),
+                    write: FolderWrite::Create,
+                    status: None,
+                    error: "no folder NOPE".into(),
+                }
+            );
+            assert!(store.pending_ops().unwrap().is_empty());
+            assert!(writes_sent(&srv).is_empty());
+            assert_eq!(
+                row(&store, "PROJ").unwrap().parent_id.as_deref(),
+                Some("INBOX")
+            );
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn fast_folders_follow_a_created_folder() {
+            let child = "/me/mailFolders/INBOX/childFolders";
+            let mut tree = TREE.to_vec();
+            // G1's reads, once it exists; it is never listed.
+            let routes = world(
+                vec![
+                    once("POST", child, 500, "busy"),
+                    write("POST", child, 201, &answer("G1", "INBOX")),
+                ],
+                &{
+                    tree.push(("G1", Some("INBOX"), None));
+                    tree.clone()
+                },
+                &[],
+            );
+            // G1 is never listed: the listing is `TREE`'s, ahead of the one
+            // `world` built.
+            let listing: Vec<String> = TREE
+                .iter()
+                .map(|(id, parent, wk)| listed_json(id, *parent, *wk))
+                .collect();
+            let mut routes = routes;
+            routes.insert(
+                0,
+                (
+                    get_route(
+                        "/me/mailFolders?",
+                        200,
+                        &format!(r#"{{"value":[{}]}}"#, listing.join(",")),
+                    ),
+                    None,
+                ),
+            );
+            let (srv, handle, store, dir) = engine("folder-fast", routes, Some(FAST));
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some("INBOX".into()),
+                    name: "G1".into(),
+                },
+            );
+            wait_requests(&srv, "POST", child, 1);
+            let local = local_folders(&store).pop().unwrap();
+            send(&handle, SyncCommand::SetFastFolders { ids: vec![local] });
+            // The create goes through; a pass then gives G1 its delta link.
+            send(&handle, SyncCommand::Refresh);
+            wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::FolderCreated { .. })
+            });
+            send(&handle, SyncCommand::Refresh);
+            assert!(wait_until(ENGINE_WAIT, || row(&store, "G1")
+                .is_some_and(|f| f.delta_link.is_some())));
+            let fast_counts = || {
+                count(&srv, |p| {
+                    p.starts_with("/me/mailFolders/G1?$select=totalItemCount")
+                })
+            };
+            assert!(
+                wait_until(ENGINE_WAIT, || fast_counts() >= 1),
+                "the fast tick syncs G1"
+            );
+            no_local_request(&srv);
+            stop(handle, dir);
         }
     }
 }
