@@ -783,26 +783,37 @@ pub enum SyncEvent {
     FolderCreated { local_id: String, id: String },
     /// A folder write was refused (#1910): by Graph for good (any failure
     /// but a 401, a throttle, a transport error or a 5xx, which keep the op
-    /// queued; a 404 too), or by the store at once (`status: None`, nothing
-    /// queued: an unknown folder, the drafts sentinel, a move into itself).
+    /// queued; a 404 too, except for a delete, where a 404 is done), or by
+    /// the store at once (`status: None`, nothing queued: an unknown folder,
+    /// the drafts sentinel, a move into itself, a delete of folders holding
+    /// unsent mail). A queued delete is also refused, with `status: None`
+    /// and nothing sent, when its walk of Graph finds an item the store
+    /// shows elsewhere or removed (#2107).
     /// Graph's refusal is final at once and reverts the store:
     /// - a refused create removes its `local:` folder: unsent mail moved
     ///   into it (a draft) is filed back in Drafts, or the drafts sentinel,
     ///   with [`SyncEvent::MessagesUpdated`] for that folder before this
     ///   event; other mail moved into it comes back by a mail reconverge;
     /// - a rename or move puts the previous name or parent back (best
-    ///   effort; the next listing corrects the rest).
+    ///   effort; the next listing corrects the rest);
+    /// - a refused delete (Graph's or the walk's) is not reverted: the
+    ///   folders are listed again once the drain ends, and come back where
+    ///   Graph has them, their mail with their next delta (#2107).
     ///
     /// Each `FolderWriteFailed` is followed by its [`SyncEvent::Error`],
-    /// `"{create|rename|move} folder {id}: {error}"`; after Graph's refusal
-    /// one [`SyncEvent::FoldersUpdated`] ends them.
+    /// `"{create|rename|move|mark all read in|delete} folder {id}: {error}"`;
+    /// after Graph's refusal (or a walk's) one [`SyncEvent::FoldersUpdated`]
+    /// ends them.
     FolderWriteFailed {
         /// The folder's id as stored when it failed (the Graph id once a
-        /// create re-keyed it); for a create the store refused, its parent.
+        /// create re-keyed it); for a create the store refused, its parent;
+        /// for a queued delete, the root it was queued for (resolved
+        /// through `folder_aliases`).
         id: String,
         write: FolderWrite,
         /// The HTTP status Graph answered (`NotFound` is `Some(404)`);
-        /// `None` when the store refused it, or no status explains it.
+        /// `None` when the store refused it, a delete's walk did, or no
+        /// status explains it.
         status: Option<u16>,
         /// The error, one line.
         error: String,
@@ -4376,31 +4387,14 @@ impl Engine {
         }
     }
 
-    /// A `DeleteFolder`'s walk or DELETE failed (#2107), as any op's call:
-    /// auth, throttle and transport stop the drain, a 5xx defers it (its
-    /// attempts bumped, never quarantined), and anything else refuses it.
+    /// A `DeleteFolder`'s walk or DELETE failed (#2107), as a
+    /// `MarkFolderRead`'s call (`engine_op_call_failed`: a throttle also
+    /// holds the outbox for its `Retry-After`, r1); anything it hands back
+    /// refuses the delete.
     fn delete_call_failed(&mut self, seq: i64, id: &str, batch: &str, e: GraphError) -> BulkStep {
-        match e {
-            GraphError::Unauthorized => {
-                self.enter_signin();
-                BulkStep::Stopped
-            }
-            GraphError::Throttled { retry_after_secs } => {
-                self.schedule_retry(Duration::from_secs(retry_after_secs));
-                self.settle_state();
-                BulkStep::Stopped
-            }
-            GraphError::Transport(_) => {
-                self.go_offline();
-                BulkStep::Stopped
-            }
-            GraphError::Http { status, .. } if status >= 500 => {
-                self.store.bump_op_attempts(seq, &e.to_string());
-                self.op_retry = Some(Instant::now() + self.op_backoff);
-                self.op_backoff = (self.op_backoff * 2).min(BACKOFF_MAX);
-                BulkStep::Deferred
-            }
-            e => {
+        match self.engine_op_call_failed(seq, e) {
+            Ok(step) => step,
+            Err(e) => {
                 let status = refused_write_status(&e);
                 self.refuse_folder_delete(seq, id, batch, status, e.to_string());
                 BulkStep::Finished
@@ -4524,7 +4518,7 @@ impl Engine {
                 return BulkStep::Stopped;
             }
             if let Some(error) = server_error {
-                self.defer_mark_read(seq, &error);
+                self.defer_op(seq, &error);
                 return BulkStep::Deferred;
             }
             let more = self.bulk.as_ref().is_some_and(|r| !r.todo.is_empty());
@@ -4540,30 +4534,43 @@ impl Engine {
     /// that did not parse) refuses it for good. The run keeps every id it
     /// had: a batch's ids leave it only on Graph's answer.
     fn mark_read_call_failed(&mut self, seq: i64, folder: &str, e: GraphError) -> BulkStep {
+        match self.engine_op_call_failed(seq, e) {
+            Ok(step) => step,
+            Err(e) => {
+                let status = refused_write_status(&e);
+                self.refuse_mark_read(seq, folder, status, e.to_string());
+                BulkStep::Finished
+            }
+        }
+    }
+
+    /// A call of an op the engine runs itself (`MarkFolderRead`, #1913;
+    /// `DeleteFolder`, #2107) failed: a 401 starts the sign-in, a throttle
+    /// holds the outbox for its `Retry-After` (`hold_outbox`) and stops the
+    /// drain, a transport error goes offline, and a 5xx defers the op under
+    /// the outbox back-off (`defer_op`). Anything else is handed back: the
+    /// caller refuses the op for good.
+    fn engine_op_call_failed(&mut self, seq: i64, e: GraphError) -> Result<BulkStep, GraphError> {
         match e {
             GraphError::Unauthorized => {
                 self.enter_signin();
-                BulkStep::Stopped
+                Ok(BulkStep::Stopped)
             }
             GraphError::Throttled { retry_after_secs } => {
                 self.hold_outbox(retry_after_secs);
                 self.schedule_retry(Duration::from_secs(retry_after_secs));
                 self.settle_state();
-                BulkStep::Stopped
+                Ok(BulkStep::Stopped)
             }
             GraphError::Transport(_) => {
                 self.go_offline();
-                BulkStep::Stopped
+                Ok(BulkStep::Stopped)
             }
             GraphError::Http { status, .. } if status >= 500 => {
-                self.defer_mark_read(seq, &e.to_string());
-                BulkStep::Deferred
+                self.defer_op(seq, &e.to_string());
+                Ok(BulkStep::Deferred)
             }
-            e => {
-                let status = refused_write_status(&e);
-                self.refuse_mark_read(seq, folder, status, e.to_string());
-                BulkStep::Finished
-            }
+            e => Err(e),
         }
     }
 
@@ -4577,9 +4584,10 @@ impl Engine {
         self.op_retry = Some(self.op_retry.map_or(until, |t| t.max(until)));
     }
 
-    /// The outbox's 5xx back-off for a `MarkFolderRead` (#1913), as the
-    /// drain gives any op: its attempts bumped, never quarantined.
-    fn defer_mark_read(&mut self, seq: i64, error: &str) {
+    /// The outbox's 5xx back-off for an op the engine runs itself
+    /// (`MarkFolderRead`, #1913; `DeleteFolder`, #2107), as the drain gives
+    /// any op: its attempts bumped, never quarantined.
+    fn defer_op(&mut self, seq: i64, error: &str) {
         self.store.bump_op_attempts(seq, error);
         self.op_retry = Some(Instant::now() + self.op_backoff);
         self.op_backoff = (self.op_backoff * 2).min(BACKOFF_MAX);
@@ -28712,6 +28720,23 @@ mod tests {
                     1,
                     "a throttle is no attempt"
                 );
+                // r1: the throttle holds the outbox for its `Retry-After`:
+                // a command's drain sends nothing meanwhile.
+                let mark = srv.requests().len();
+                send(
+                    &handle,
+                    SyncCommand::MarkRead {
+                        id: "S0".into(),
+                        read: true,
+                    },
+                );
+                barrier(&handle);
+                assert_eq!(paths_from(&srv, mark), Vec::<String>::new());
+                for r in store.pending_ops().unwrap() {
+                    if matches!(r.op, OutboxOp::MarkRead { .. }) {
+                        store.drop_op(r.seq);
+                    }
+                }
                 send(&handle, SyncCommand::Refresh);
                 wait_requests(&srv, "DELETE", DELETE_PROJ, 3);
                 wait_drained(&store);
@@ -29082,75 +29107,136 @@ mod tests {
                 stop(handle, dir);
             }
 
-            /// Case 27: a folder whose move into the deleted one is refused
-            /// stays on Graph where it was: once the batch is done, the
-            /// listing brings it back there.
+            /// Cases 4 and 27 (r1): ARCH's move into PROJ is still queued
+            /// (behind a deferred create) when PROJ is deleted. The move,
+            /// whose row is gone, could only send nothing, so it is dropped
+            /// and ARCH is deleted where Graph has it, as its own root. Its
+            /// DELETE answered 204, nothing is listed back; answered 403
+            /// (27), ARCH is listed back under its Graph parent.
             #[test]
-            fn a_folder_whose_move_in_was_refused_comes_back() {
-                let child = "/me/mailFolders/INBOX/childFolders";
-                let mut writes = vec![
-                    once("POST", child, 500, "busy"),
-                    write("POST", child, 201, &answer("G1", "INBOX")),
-                    write("POST", "/me/mailFolders/ARCH/move", 400, BAD),
-                ];
-                writes.extend(proj_walk(&[], &[("SUB", 0)]));
-                writes.push(write("DELETE", DELETE_PROJ, 204, ""));
-                // Graph lists PROJ and SUB until the DELETE: the startup
-                // pass and the first refresh; then only the rest.
-                let full: Vec<String> = TREE
-                    .iter()
-                    .map(|(id, parent, wk)| listed_json(id, *parent, *wk))
-                    .collect();
-                let after: Vec<String> = TREE
-                    .iter()
-                    .filter(|(id, _, _)| *id != "PROJ" && *id != "SUB")
-                    .map(|(id, parent, wk)| listed_json(id, *parent, *wk))
-                    .collect();
-                let mut routes = vec![(
-                    get_route(
-                        "/me/mailFolders?",
-                        200,
-                        &format!(r#"{{"value":[{}]}}"#, full.join(",")),
-                    ),
-                    Some(2),
-                )];
-                routes.push((
-                    get_route(
-                        "/me/mailFolders?",
-                        200,
-                        &format!(r#"{{"value":[{}]}}"#, after.join(",")),
-                    ),
-                    None,
-                ));
-                routes.extend(world(writes, TREE, &[]));
-                let (srv, handle, store, dir) =
-                    engine("folder-delete-move-in-refused", routes, None);
-                send(
-                    &handle,
-                    SyncCommand::CreateFolder {
-                        parent: Some("INBOX".into()),
-                        name: "G1".into(),
-                    },
-                );
-                wait_requests(&srv, "POST", child, 1);
-                send(
-                    &handle,
-                    SyncCommand::MoveFolder {
-                        id: "ARCH".into(),
-                        dest: Some("PROJ".into()),
-                    },
-                );
-                send(&handle, SyncCommand::DeleteFolder { id: "PROJ".into() });
-                wait_queued(&store, 3);
-                assert!(row(&store, "ARCH").is_none());
-                send(&handle, SyncCommand::Refresh);
-                wait_requests(&srv, "DELETE", DELETE_PROJ, 1);
-                wait_drained(&store);
-                send(&handle, SyncCommand::Refresh);
-                assert!(wait_until(ENGINE_WAIT, || row(&store, "ARCH")
-                    .is_some_and(|f| f.parent_id.as_deref() == Some("ROOT"))));
-                assert!(row(&store, "PROJ").is_none());
-                stop(handle, dir);
+            fn a_folder_whose_move_in_is_still_queued_is_deleted_where_it_is() {
+                for status in [204, 403] {
+                    let child = "/me/mailFolders/INBOX/childFolders";
+                    let mut writes = vec![
+                        once("POST", child, 500, "busy"),
+                        write("POST", child, 201, &answer("G1", "INBOX")),
+                        write(
+                            "POST",
+                            "/me/mailFolders/ARCH/move",
+                            200,
+                            &answer("ARCH", "PROJ"),
+                        ),
+                    ];
+                    writes.extend(proj_walk(&[], &[("SUB", 0)]));
+                    writes.extend(walk("ARCH", &[("A1", "")], &[]));
+                    writes.push(write("DELETE", DELETE_PROJ, 204, ""));
+                    writes.push(write("DELETE", "/me/mailFolders/ARCH", status, BAD));
+                    // Graph lists PROJ and SUB until their DELETE (the
+                    // startup pass and the first refresh), then the rest;
+                    // ARCH only while its DELETE has not gone through.
+                    let full: Vec<String> = TREE
+                        .iter()
+                        .map(|(id, parent, wk)| listed_json(id, *parent, *wk))
+                        .collect();
+                    let after: Vec<String> = TREE
+                        .iter()
+                        .filter(|(id, _, _)| {
+                            *id != "PROJ" && *id != "SUB" && (status != 204 || *id != "ARCH")
+                        })
+                        .map(|(id, parent, wk)| listed_json(id, *parent, *wk))
+                        .collect();
+                    let listing = |items: &[String]| {
+                        get_route(
+                            "/me/mailFolders?",
+                            200,
+                            &format!(r#"{{"value":[{}]}}"#, items.join(",")),
+                        )
+                    };
+                    let mut routes = vec![(listing(&full), Some(2)), (listing(&after), None)];
+                    routes.extend(world(writes, TREE, &[("ARCH", "A1")]));
+                    let (srv, handle, store, dir) = engine(
+                        &format!("folder-delete-queued-move-in-{status}"),
+                        routes,
+                        None,
+                    );
+                    send(
+                        &handle,
+                        SyncCommand::CreateFolder {
+                            parent: Some("INBOX".into()),
+                            name: "G1".into(),
+                        },
+                    );
+                    wait_requests(&srv, "POST", child, 1);
+                    send(
+                        &handle,
+                        SyncCommand::MoveFolder {
+                            id: "ARCH".into(),
+                            dest: Some("PROJ".into()),
+                        },
+                    );
+                    send(&handle, SyncCommand::DeleteFolder { id: "PROJ".into() });
+                    barrier(&handle);
+                    let queued: Vec<OutboxOp> = store
+                        .pending_ops()
+                        .unwrap()
+                        .into_iter()
+                        .map(|r| r.op)
+                        .collect();
+                    assert!(
+                        matches!(
+                            queued.as_slice(),
+                            [
+                                OutboxOp::CreateFolder { .. },
+                                OutboxOp::DeleteFolder { id: a, .. },
+                                OutboxOp::DeleteFolder { id: b, .. },
+                            ] if a == "PROJ" && b == "ARCH"
+                        ),
+                        "{queued:?}"
+                    );
+                    assert!(row(&store, "ARCH").is_none());
+                    send(&handle, SyncCommand::Refresh);
+                    wait_requests(&srv, "DELETE", "/me/mailFolders/ARCH", 1);
+                    wait_drained(&store);
+                    let mut seen = barrier(&handle);
+                    let order: Vec<String> = writes_sent(&srv)
+                        .into_iter()
+                        .map(|(m, p, _)| format!("{m} {p}"))
+                        .collect();
+                    assert_eq!(
+                        order,
+                        [
+                            format!("POST {child}"),
+                            format!("POST {child}"),
+                            "DELETE /me/mailFolders/PROJ".to_string(),
+                            "DELETE /me/mailFolders/ARCH".to_string(),
+                        ]
+                    );
+                    if status == 403 {
+                        assert!(wait_until(ENGINE_WAIT, || row(&store, "ARCH")
+                            .is_some_and(|f| f.parent_id.as_deref() == Some("ROOT"))));
+                        seen.extend(barrier(&handle));
+                        assert!(
+                            matches!(
+                                failures(&seen).as_slice(),
+                                [SyncEvent::FolderWriteFailed {
+                                    id,
+                                    write: FolderWrite::Delete,
+                                    status: Some(403),
+                                    ..
+                                }] if id == "ARCH"
+                            ),
+                            "{seen:?}"
+                        );
+                    } else {
+                        assert!(failures(&seen).is_empty(), "{seen:?}");
+                        send(&handle, SyncCommand::Refresh);
+                        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+                        barrier(&handle);
+                        assert!(row(&store, "ARCH").is_none());
+                    }
+                    assert!(row(&store, "PROJ").is_none());
+                    stop(handle, dir);
+                }
             }
         }
 

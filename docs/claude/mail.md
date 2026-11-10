@@ -3162,9 +3162,12 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   (`drop_local_folder_mail_on`, then a mail reconverge), and every queued `MoveFolder` into one
   goes, wherever the moved folder is now; the folder's next queued move inherits its
   `prev_parent`, and with none a folder outside the subtree is put back under it. Queued
-  `MarkFolderRead`s of the subtree go too. The Graph roots are `id` (when Graph has it) and each
-  Graph folder moved locally under a removed `local:` one: one `OutboxOp::DeleteFolder { id,
-  batch }` each, sharing a `batch`.
+  `MarkFolderRead`s of the subtree go too. The Graph roots are `id` (when Graph has it), each
+  Graph folder moved locally under a removed `local:` one, and each Graph folder of the subtree
+  with a queued `MoveFolder` (r1: once its row is gone the move would send nothing and Graph
+  would keep it where it was, so its moves are dropped and it is deleted where it is): one
+  `OutboxOp::DeleteFolder { id, batch }` each, sharing a `batch`. A root Graph has inside
+  another one is done when its walk answers 404.
 - The allow-list (`folder_delete_allow`, per batch): every Graph folder and every message
   (with its `internet_message_id`) the subtree showed, written before the rows go.
 - Tombstones (`forgotten_ids`): triggers on `messages` and `folders`
@@ -3194,8 +3197,10 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   status: None, error: "it holds n item(s) the store shows elsewhere or removed" }` (a
   tombstone can also be the user's own message delete whose op was quarantined). Else
   `DELETE /me/mailFolders/{id}`; 2xx or 404 is done.
-- Failures: auth, throttle and transport stop the drain; another 5xx defers it (attempts
-  bumped, never quarantined); a 4xx or `Parse` refuses it (`refuse_folder_delete`): the op
+- Failures (`engine_op_call_failed`, shared with `MarkFolderRead`): auth, throttle and
+  transport stop the drain, and a throttle holds the outbox for its `Retry-After`
+  (`hold_outbox`, r1); another 5xx defers it (`defer_op`: attempts bumped, never
+  quarantined); a 4xx or `Parse` refuses it (`refuse_folder_delete`): the op
   goes (the batch's allow-list with its last op), `FolderWriteFailed { write: Delete }` +
   `Error` + `FoldersUpdated`, and a listing after the drain (`relist_after_drain`) brings the
   folders back where Graph has them; their mail follows with their next delta (no link). A
@@ -3212,8 +3217,9 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   it under Deleted Items instead, the next listing shows it there. A UI that wants "delete to
   Deleted Items" sends `MoveFolder` there. The engine does not refuse well-known folders: Graph
   does.
-- Known shapes: a folder (or message) whose move into the deleted tree is refused stays on
-  Graph where it was and comes back with the listing once the batch ends. The empty shell of a
+- Known shapes: a message whose move into the deleted tree is refused stays on Graph where it
+  was and comes back with its folder's next delta once the batch ends (a folder with a queued
+  move into it is its own root instead, r1). The empty shell of a
   folder whose `MoveFolder` answer was lost and that was then moved back is not detected (the
   mail inside is, by its internet message ids). Another client changing Graph between the
   walk and the DELETE is out of scope. Hidden folders are never listed, so never held.
@@ -3239,7 +3245,11 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `a_graph_folder_moved_under_a_deleted_local_folder_is_deleted_by_its_own_op`,
   `nothing_is_read_for_a_folder_being_deleted`,
   `a_queued_mark_folder_read_of_the_subtree_is_dropped`, `the_delete_waits_for_older_ops`,
-  `a_folder_whose_move_in_was_refused_comes_back`).
+  `a_folder_whose_move_in_is_still_queued_is_deleted_where_it_is`), store
+  `a_graph_folder_with_a_queued_move_into_the_subtree_is_its_own_root`.
+- `SyncEvent::FolderWriteFailed` for a delete: a 404 is done, not a failure; `status: None`
+  is the store's refusal (unsent mail too) or the walk's; a refusal is followed by a relist,
+  not a revert; the `Error` verb is `delete`; `id` is the root as queued, resolved.
 
 ## Mark a folder read (#1913)
 

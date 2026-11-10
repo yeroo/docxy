@@ -5810,9 +5810,12 @@ impl Store {
     /// (`drop_local_folder_mail_on`, [`FolderDelete::had_mail`]). Queued
     /// `MarkFolderRead`s of a removed folder go too.
     ///
-    /// The Graph roots are `id` when Graph has it, and every Graph folder of
+    /// The Graph roots are `id` when Graph has it, every Graph folder of
     /// the subtree whose stored parent is a removed `local:` folder (moved
-    /// there locally: Graph still has it under its old parent). Before any
+    /// there locally: Graph still has it under its old parent), and every
+    /// Graph folder of the subtree with a queued `MoveFolder`, which is
+    /// dropped: once the row is gone the move would send nothing, and the
+    /// folder would stay on Graph where it was (r1). Before any
     /// row goes, the batch's allow-list (`folder_delete_allow`) records
     /// every Graph folder and message the subtree showed: what the user saw
     /// and chose to delete. Their tombstones are cleared again; every other
@@ -5857,9 +5860,25 @@ impl Store {
             ));
         }
         out.had_mail = drop_local_folder_mail_on(&tx, &local)?;
+        // A Graph folder of the subtree with a queued move (into it, or
+        // within it) is still where Graph has it: its moves would send
+        // nothing once its row is gone, so they go, and it is deleted where
+        // it is, as its own root (r1).
+        let mut moved = Vec::new();
+        for row in pending_ops_on(&tx)? {
+            if let OutboxOp::MoveFolder { id: m, .. } = &row.op {
+                let m = current_folder_id_on(&tx, m)?;
+                if subtree.contains(&m) && !m.starts_with("local:") {
+                    tx.execute("DELETE FROM outbox WHERE seq = ?1", params![row.seq])?;
+                    if !moved.contains(&m) {
+                        moved.push(m);
+                    }
+                }
+            }
+        }
         drop_folder_ops_on(&tx, &local, &removed)?;
-        // The Graph roots: `id`, and every Graph folder moved locally under
-        // a removed `local:` one.
+        // The Graph roots: `id`, every Graph folder moved locally under a
+        // removed `local:` one, and every one whose move was dropped above.
         let mut roots = Vec::new();
         for f in subtree.iter().filter(|f| !f.starts_with("local:")) {
             let parent: Option<String> = tx.query_row(
@@ -5867,7 +5886,7 @@ impl Store {
                 params![f],
                 |r| r.get(0),
             )?;
-            if *f == id || parent.is_some_and(|p| local.contains(&p)) {
+            if *f == id || parent.is_some_and(|p| local.contains(&p)) || moved.contains(f) {
                 roots.push(f.clone());
             }
         }
@@ -21225,6 +21244,33 @@ mod folder_delete_tests {
                 ("message".into(), "MB".into())
             ]
         );
+    }
+
+    /// Case 4 (store, r1): a Graph folder of the subtree with a queued move
+    /// would send nothing once its row is gone: the move is dropped and the
+    /// folder is its own root, deleted where Graph has it.
+    #[test]
+    fn a_graph_folder_with_a_queued_move_into_the_subtree_is_its_own_root() {
+        let s = mailbox();
+        written(s.move_folder("ARCH", Some("B")).unwrap());
+        message(&s, "MA", "ARCH", "");
+        let (d, batch) = delete(&s, "A");
+        let batch = batch.unwrap();
+        assert_eq!(d.removed, ["A", "B", "ARCH"]);
+        assert_eq!(
+            ops(&s),
+            [
+                OutboxOp::DeleteFolder {
+                    id: "A".into(),
+                    batch: batch.clone(),
+                },
+                OutboxOp::DeleteFolder {
+                    id: "ARCH".into(),
+                    batch: batch.clone(),
+                },
+            ]
+        );
+        assert!(check(&s, &batch, &[], &[("MA", "")]).is_empty());
     }
 
     /// Case 8 (store): a move into a deleted `local:` folder goes wherever
