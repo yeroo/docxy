@@ -275,7 +275,11 @@ pub(crate) fn hit_quads(
 
 /// The part of the view a match or the caret is in view in: clear of the
 /// horizontal bar (#2080) and, with the bar shown, of the vertical one, and
-/// below the open box's band.
+/// (`box_open`) below the open box's band. The band is the view's whole
+/// width, though the box covers only its right: a revealed match or caret is
+/// never under the box, at the cost of one band's scroll for a caret typed
+/// on the top line left of it. The hits paint without the band
+/// ([`visible_hits`]): the box, drawn after them, covers its own part.
 pub(crate) fn find_view(
     view: Bounds<Pixels>,
     hbar_shown: bool,
@@ -292,6 +296,15 @@ pub(crate) fn find_view(
         v.size.height -= band;
     }
     v
+}
+
+/// Of the hit quads, those that paint in `clip` (the view clear of the
+/// bars, not of the box's band: a hit on the top line left of the box shows).
+pub(crate) fn visible_hits(
+    quads: Vec<Bounds<Pixels>>,
+    clip: Bounds<Pixels>,
+) -> Vec<Bounds<Pixels>> {
+    quads.into_iter().filter(|q| q.intersects(&clip)).collect()
 }
 
 /// The change of the scroll area's x offset that brings `piece` into
@@ -608,6 +621,23 @@ mod tests {
         assert_eq!(v.top(), px(100. + BOX_BAND));
         assert_eq!(v.bottom(), px(500. - crate::doc_scrollbar::BAR_PX));
         assert_eq!(v.right(), px(600. - crate::doc_scrollbar::BAR_PX));
+    }
+
+    #[test]
+    fn a_hit_in_the_box_band_left_of_the_box_still_paints() {
+        let view = Bounds::new(point(px(0.), px(100.)), size(px(600.), px(400.)));
+        // On the top line, left of the box: inside the band a reveal keeps
+        // clear of, but nothing covers it.
+        let top_left = Bounds::new(point(px(48.), px(108.)), size(px(40.), px(20.)));
+        let below = Bounds::new(point(px(48.), px(300.)), size(px(40.), px(20.)));
+        let under_hbar = Bounds::new(point(px(48.), px(495.)), size(px(40.), px(4.)));
+        let clip = find_view(view, true, true, false);
+        assert_eq!(
+            visible_hits(vec![top_left, below, under_hbar], clip),
+            [top_left, below]
+        );
+        // The reveal's view keeps the band: the same hit is not "in view".
+        assert!(!find_view(view, true, true, true).contains(&top_left.origin));
     }
 
     #[test]

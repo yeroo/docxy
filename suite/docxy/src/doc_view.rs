@@ -1398,13 +1398,14 @@ impl Render for DocView {
                             }
                         }
                         if !hits.is_empty() {
-                            let quads: Vec<_> = painted_hits(&words, &hits)
-                                .into_iter()
-                                .filter(|q| q.intersects(&view))
-                                .collect();
+                            // Hits paint over the whole view clear of the
+                            // bars, the box's band included: the box is drawn
+                            // after this canvas and covers what is under it.
+                            let clip = find::find_view(b, hbar.shown(), vbar.shown(), false);
+                            let quads = find::visible_hits(painted_hits(&words, &hits), clip);
                             hits_painted.set(quads.len());
                             window.with_content_mask(
-                                Some(ContentMask { bounds: view }),
+                                Some(ContentMask { bounds: clip }),
                                 |window| {
                                     for q in quads {
                                         window.paint_quad(fill(q, find::hit_color()));

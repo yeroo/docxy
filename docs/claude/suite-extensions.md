@@ -305,13 +305,16 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   one with no match changes nothing in the document. The current match is
   the editor's selection; the other hits paint as amber quads at 35% over
   the glyphs (`find::hit_quads` over this frame's `Words`, in the
-  `viewport` canvas, clipped to `find::find_view`), not in the shared
+  `viewport` canvas, clipped to the view clear of the bars only,
+  `find::visible_hits`: the box, drawn after, covers its own part, and a hit
+  on the top line left of it shows), not in the shared
   renderer. A step reveals the match's start piece in y and, unlike the
   caret's reveal, in x too (`find::reveal_dx`: a match in a table wider
   than the view). `find::find_view` (clear of both bars, and below the open
-  box's `BOX_BAND`) is what every reveal, `caret_in_view`,
-  `current_in_view` and the hit clip use, so the caret is never revealed
-  under the box either.
+  box's `BOX_BAND`, across the view's whole width) is what every reveal,
+  `caret_in_view` and `current_in_view` use, so neither a match nor the
+  caret is revealed under the box; a caret typed on the top line left of
+  the box costs one band's scroll.
 - Keys (`find::find_key`, run before `edit_key`): Escape and F3 /
   Shift+F3 while open; while the field has the keys, Enter / Shift+Enter
   step, typing (`edit::typed_text`, the editing map's rule: AltGr types,
