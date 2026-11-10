@@ -2878,7 +2878,15 @@ links in one cheap read.
     fetches a draft's body on its own (`body_candidates` and `needs_body` skip drafts),
     and `Store::draft` joins `bodies`. So `open_draft` opens a draft row with no stored
     body in the reader, whose `reload_body` sends `FetchBody`, and the next activate
-    opens compose. That is a visible host change.
+    opens compose. A list click (`on_left_click`) on a draft row activates it at once,
+    as Enter does: the click-to-preview path skips drafts, so a click could otherwise
+    never open one. Compose honours the stored body's type (`draft_rich_text`): an
+    `html` body is parsed as HTML, and any other (the `text` body `FetchBody` stores
+    under lookxy's `BodyFormat::Text`, a plain-text `createReply`) becomes one
+    paragraph per line, so line breaks and `<alice@x>` survive and Save does not PATCH
+    a mangled body. Known limit: a draft an older `update_draft_fields` left as html
+    under `content_type = 'text'` now opens showing its tags. That is a visible host
+    change.
   - Known limit: `Store::headerless_message_ids` leaves out `is_draft = 1` rows as
     made here. A new row first seen as a partial delta item carrying `isDraft: true`
     and no `receivedDateTime` is never completed by #1899's repair (before this issue a
@@ -2907,5 +2915,6 @@ links in one cheap read.
   link; ComposeReply and ComposeReplyAll answering M1 with only the POST and the body,
   ComposeForward answering nothing, and a reply to a moved original through
   `current_id`); lookxy
-  `a_synced_draft_without_a_body_opens_the_reader_then_the_composer`; and
+  `a_synced_draft_without_a_body_opens_the_reader_then_the_composer`,
+  `one_click_opens_a_synced_draft`, `a_draft_s_html_body_still_opens_as_html`; and
   `a_plain_text_reply_draft_is_not_a_refetch_candidate`, which now expects `is_draft`.
