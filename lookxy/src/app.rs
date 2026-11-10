@@ -195,11 +195,13 @@ pub struct App {
     /// on an unchanged draft saves nothing. `None` for a composer opened
     /// some other way, which then saves as before.
     pub compose_baseline: Option<ComposeSnapshot>,
-    /// The list row the last left click landed on (#2096), so a second
-    /// click on a thread header whose latest message is a draft (never
-    /// previewed, so never `selected_msg`) still toggles it. Any click
-    /// elsewhere clears it.
-    pub last_list_click: Option<usize>,
+    /// What the last left click on the list landed on (#2096): the folder,
+    /// the row's target and whether it was a thread header. A second click
+    /// on a thread header whose latest message is a draft (never previewed,
+    /// so never `selected_msg`) toggles it only when it lands on the same
+    /// thing, never on whatever row a reload, a move or a toggle put at the
+    /// same position. Any click elsewhere clears it.
+    pub last_list_click: Option<ListClick>,
     /// The top-level view — mail three-pane, or the calendar agenda +
     /// detail (`ui::calendar`). Toggled by `g` (see `toggle_mode`).
     pub mode: Mode,
@@ -1647,10 +1649,15 @@ impl App {
                 } else {
                     self.msg_index = idx;
                 }
-                let again = last_list_click == Some(idx);
-                self.last_list_click = Some(idx);
                 let on_header =
                     self.threaded_active() && matches!(self.selected_row(), Some(Row::Header(_)));
+                let clicked = ListClick {
+                    folder: self.selected_folder.clone(),
+                    target: self.cursor_target().map(|(id, _)| id),
+                    header: on_header,
+                };
+                let again = last_list_click.as_ref() == Some(&clicked);
+                self.last_list_click = Some(clicked);
                 // Click-to-select, click-again-to-open: a second click on the
                 // already-open row activates it (the terminal "double-click").
                 // A draft is never previewed (#2096: a synced draft is
@@ -1659,7 +1666,8 @@ impl App {
                 //   activates on the first click, as Enter does;
                 // - a thread header whose latest message is a draft only
                 //   selects on the first click, and a second click on the
-                //   same row activates (toggles) it, as for any header.
+                //   same header (same folder, same latest message) activates
+                //   (toggles) it, as for any header.
                 match self.cursor_target() {
                     Some((id, _)) if self.selected_msg.as_deref() == Some(id.as_str()) => {
                         self.activate_selected()
@@ -3075,9 +3083,9 @@ impl App {
     ///
     /// Only a draft whose body was written here opens in the composer
     /// (`Store::draft_body_is_local`: compose's own saves, a new message, a
-    /// composed reply/forward; a draft's text body fetched before #1901,
-    /// stored with no format, is marked fetched by the store's #2096
-    /// migration). A draft made in Outlook or on the web (`is_draft` since
+    /// composed reply/forward; a text body fetched before #1901, stored
+    /// with no format, is marked fetched by the store's #2096 migration in
+    /// any folder). A draft made in Outlook or on the web (`is_draft` since
     /// #2096) has no body, or one `FetchBody` stored, which is Graph's
     /// rendering of it (text, here): it opens read-only in the
     /// reader (which fetches a missing body), as it did before #2096, so its
@@ -4182,6 +4190,16 @@ fn parse_attendee_part(part: &str) -> Vec<(String, String)> {
         .filter(|s| !s.is_empty())
         .map(|addr| (String::new(), addr.to_string()))
         .collect()
+}
+
+/// What a left click on the list landed on (#2096, `App::last_list_click`):
+/// the folder shown, the row's target (`cursor_target`'s id: a header's
+/// latest message, else the row's own), and whether it was a thread header.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListClick {
+    folder: Option<String>,
+    target: Option<String>,
+    header: bool,
 }
 
 /// Everything Esc's save writes for a draft (#2096): its fields, its body
@@ -7155,6 +7173,106 @@ pub(crate) mod tests {
         click(&mut app, 200); // outside every pane
         click(&mut app, row);
         assert!(!app.threads[t].expanded);
+    }
+
+    #[test]
+    fn a_click_on_another_header_at_the_same_row_only_selects_it() {
+        // Header A (c3, newest) at row 0 is clicked; then A leaves the
+        // folder and a reload puts header B (c1, whose latest is the synced
+        // draft d1) at row 0. One click on B selects it and toggles
+        // nothing: the remembered click was A, not "row 0".
+        use mailcore::graph::model::{MailFolder, Message, Recipient};
+        let mut app = App::for_test_with_seeded_store();
+        let _cmd_rx = seed_synced_draft(&mut app);
+        let a = |id: &str, received: &str| Message {
+            id: id.into(),
+            conversation_id: "c3".into(),
+            subject: "Newer".into(),
+            from: Recipient {
+                name: "Carol".into(),
+                address: "carol@example.com".into(),
+            },
+            to: vec![],
+            cc: vec![],
+            received: received.into(),
+            sent: String::new(),
+            is_read: true,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: "a".into(),
+            is_draft: false,
+            is_meeting_request: false,
+            meeting_message_type: None,
+            protection: Default::default(),
+            meeting_reminder_on: false,
+            categories: Vec::new(),
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
+        };
+        app.store
+            .upsert_message("inbox", &a("a1", "2026-07-17T10:00:00Z"))
+            .unwrap();
+        app.store
+            .upsert_message("inbox", &a("a2", "2026-07-17T11:00:00Z"))
+            .unwrap();
+        app.threaded = true;
+        app.reload_messages();
+        let header_at = |app: &App, pos: usize| match app.visible_rows[pos] {
+            Row::Header(t) => Some(t),
+            _ => None,
+        };
+        let t_a = header_at(&app, 0).expect("A's header first");
+        assert!(
+            app.threads[t_a]
+                .thread
+                .messages
+                .iter()
+                .any(|m| m.id == "a2")
+        );
+        app.list_rect = Rect::new(25, 0, 30, 10);
+        app.list_row0 = 1;
+        let click = |app: &mut App| {
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 27,
+                row: 1,
+                modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+            });
+        };
+        click(&mut app); // A: previewed, selected
+        assert_eq!(app.selected_msg.as_deref(), Some("a2"));
+        // A leaves the folder; B is now at row 0.
+        app.store
+            .upsert_folder(&MailFolder {
+                id: "archive".into(),
+                display_name: "Archive".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: None,
+            })
+            .unwrap();
+        app.store.move_message("a1", "archive").unwrap();
+        app.store.move_message("a2", "archive").unwrap();
+        app.reload_messages();
+        let t_b = header_at(&app, 0).expect("B's header first now");
+        assert!(
+            app.threads[t_b]
+                .thread
+                .messages
+                .iter()
+                .any(|m| m.id == "d1")
+        );
+        click(&mut app); // B, first click: selects only
+        assert!(!app.threads[t_b].expanded);
+        assert!(app.compose.is_none());
+        click(&mut app); // B, second click: toggles
+        assert!(app.threads[t_b].expanded);
     }
 
     #[test]
