@@ -458,18 +458,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   but never over a local edit. That rule holds for every delta that starts
   fresh and so carries every message it covers, not only what changed (a
   head, a small folder's inline full delta, a backfill page:
-  `merge_delta_items` with `protect`): it merges nothing over an id a
-  queued outbox op names (`Store::pending_message_ids`,
-  `Engine::protected_ids`: an optimistic write waiting after a 5xx, and a
-  deleted message is not put back). Since #1910 r7 such a message is still
-  re-filed to the folder Graph reports it in (`Store::refile_message`:
-  `folder_id` only, an existing row only), unless a queued message `Move`,
-  `SaveDraft` or `SendDraft` still decides its folder
-  (`Store::messages_with_a_queued_move`, read once per page). A protected
-  message in another folder with no move queued can only come from a move
-  that did not land (quarantined, dropped with a `local:` folder) or one
-  made on another client; keeping it out of Graph's folder would let a
-  folder delete take it there. It merges every other row with
+  `merge_delta_items` with `protect`): it skips every id a queued outbox op
+  names (`Store::pending_message_ids`, `Engine::protected_ids`: an
+  optimistic write waiting after a 5xx, and a deleted message is not put
+  back), and merges every other row with
   `Store::merge_message_unless_edited`, which leaves a draft with an
   unsaved edit (below) alone in the same statement as the write, so a
   compose save on lookxy's connection during the fetch is never lost;
@@ -554,13 +546,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   correct rows the dropped op left wrong, drafts included, still skipping
   `protected_ids`). It is cleared only when a pass ran
   every folder's delta and no folder's backfill remains, else by the step
-  that completes the last folder. Since #1910 r6 every stored Graph
-  folder must have a delta link and a complete history, parked walks and
-  failed phase-1 deltas included (`backfill_remains`): a folder delete is
-  refused while it is set, as the store may still show mail out of the
-  folder Graph has it in. A page that keeps failing therefore holds the
-  reconverge, and the cutoff, off until a later pass reads it (#1871
-  first let a parked walk end it). It is persisted (`meta.reconverge_pending`,
+  that completes the last folder, or by the one that parks the last walk
+  left: parked walks do not count (`backfill_remains`), so a page that
+  fails (it is parked) cannot hold the reconverge, and the cutoff, off for
+  good. It is persisted (`meta.reconverge_pending`,
   set by `clear_delta_links` in the same transaction, loaded by `run`,
   cleared by `Engine::end_reconverge`), so an engine restarted in the
   middle still runs the walks without the cutoff.
@@ -3031,247 +3020,119 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `search_contacts_ranks_prefix_first_then_frequency` and
   `search_contacts_treats_underscore_literally`.
 
-## Folder writes: create, rename, move, delete (#1910)
+## Folder writes: create, rename, move (#1910)
 
 - `SyncCommand::{CreateFolder { parent, name }, RenameFolder { id, name }, MoveFolder { id,
-  dest }, DeleteFolder { id }}`. Each command's store write is one IMMEDIATE transaction that
-  writes the folder row(s) and queues the op (as the contact writes, #2063 r1), then
-  `FoldersUpdated` and a drain. Graph: `POST /me/mailFolders` (`parent: None`) or
-  `POST /me/mailFolders/{parent}/childFolders` with `{"displayName"}`;
-  `PATCH /me/mailFolders/{id}` with `{"displayName"}`; `POST /me/mailFolders/{id}/move` with
-  `{"destinationId"}`, `"msgfolderroot"` for `dest: None`; `DELETE /me/mailFolders/{id}`
-  (`GraphClient::{create,rename,move,delete}_folder`; an answer without an id is `Parse`).
-- Store (`Store::{create_local_folder, rename_folder, move_folder, delete_folder}`,
-  crate-private, as are their result types: hosts use the commands; `current_folder_id` is
-  public). Each returns `FolderWriteResult::{Written(id),
-  Unchanged, Refused(FolderRefusal)}`. A rename writes only `display_name`, a move only
-  `parent_id`, so `sort_order`, `is_expanded` and the delta link stay. The same name or the
-  same parent is `Unchanged`: nothing is queued and no event is sent. A folder made at the top
-  (and a move to the top) stores the root id the listing gives top folders
+  dest }}`. Each command's store write is one IMMEDIATE transaction that writes the folder row
+  and queues the op (as the contact writes, #2063 r1), then `FoldersUpdated` and a drain.
+  Graph: `POST /me/mailFolders` (`parent: None`) or `POST /me/mailFolders/{parent}/childFolders`
+  with `{"displayName"}`; `PATCH /me/mailFolders/{id}` with `{"displayName"}`;
+  `POST /me/mailFolders/{id}/move` with `{"destinationId"}`, `"msgfolderroot"` for `dest: None`
+  (`GraphClient::{create,rename,move}_folder`; an answer without an id is `Parse`).
+- Deleting a folder: #2107 (split from #1910 after review).
+- Store (`Store::{create_local_folder, rename_folder, move_folder}`, crate-private, as are their
+  result types: hosts use the commands; `current_folder_id` is public). Each returns
+  `FolderWriteResult::{Written(id), Unchanged, Refused(FolderRefusal)}`. A rename writes only
+  `display_name`, a move only `parent_id`, so `sort_order`, `is_expanded` and the delta link stay.
+  The same name or the same parent is `Unchanged`: nothing is queued and no event is sent. A
+  folder made at the top (and a move to the top) stores the root id the listing gives top folders
   (`root_folder_id_on`: the parent most stored folders share that is not itself stored; NULL
-  before any listing). Graph's move answer then stores the real one.
-- Refused by the store, with nothing written or queued: an unknown id, parent or dest; the
-  drafts sentinel (`local:drafts-pending`) as any of them, since Graph never had it; a move
-  into the folder itself or a folder under it (the stored `parent_id` would hold a cycle); and
-  a delete whose subtree holds mail Graph does not have (`HoldsUnsentMail`). That is a
-  `local:` message, one a queued `SaveDraft`/`SendDraft` names (resolved through `current_id`),
-  or one with `local_edit > 0` (#2082). The cascade would lose it for good even though Graph
-  refuses the delete: `SendDraft` re-files the draft into Sent Items at command time, and its
-  op reads the row at send time (`ensure_draft_on_graph`). This is not a well-known-folder
-  rule. The engine never refuses a folder for being well known; Graph does. Reported as
-  `FolderWriteFailed { status: None }` plus `Error`; its `id` is the folder named, or a
-  create's parent.
+  before any listing); Graph's move answer then stores the real one.
+- Refused by the store, with nothing written or queued: an unknown id, parent or dest; the drafts
+  sentinel (`local:drafts-pending`) as any of them, since Graph never had it; and a move into the
+  folder itself or a folder under it (the stored `parent_id` would hold a cycle). The engine never
+  refuses a folder for being well known; Graph does. Reported as `FolderWriteFailed { status:
+  None }` plus `Error`; its `id` is the folder named, or a create's parent.
 - A created folder lives under a `local:` id (`local_draft_id`) until its create reaches Graph.
   `Store::reconcile_created_folder` then re-keys it (`rekey_folder_on`): the row,
   `messages.folder_id` and the children's `parent_id`. Foreign keys are deferred to the commit
-  (`PRAGMA defer_foreign_keys`, as `messages.folder_id` has no `ON UPDATE CASCADE`), so the
-  row keeps every column, including ones added later. A stale row already under the new id
-  hands its messages and children to the kept row before it goes. `folder_aliases (old_id →
-  id)` records it, also when the row was deleted first. `Store::current_folder_id` resolves an
-  old id in one lookup: a re-key re-points the aliases that named the old id. Every folder op,
-  the message `Move` command and op (`dest`), `SyncFolder`, `SetFastFolders` and a scoped
-  `SearchMessages` resolve through it. `SyncEvent::FolderCreated { local_id, id }` and
-  `FoldersUpdated` follow a create, and the engine's fast folders are mapped through the alias.
+  (`PRAGMA defer_foreign_keys`, as `messages.folder_id` has no `ON UPDATE CASCADE`), so the row
+  keeps every column, including ones added later. A stale row already under the new id hands its
+  messages and children to the kept row before it goes. `folder_aliases (old_id → id)` records
+  it, also when the row is gone. `Store::current_folder_id` resolves an old id in one lookup: a
+  re-key re-points the aliases that named the old id. Every folder op, the message `Move`
+  command and op (`dest`), `SyncFolder`, `SetFastFolders` and a scoped `SearchMessages` resolve
+  through it. `SyncEvent::FolderCreated { local_id, id }` and `FoldersUpdated` follow a create,
+  and the engine's fast folders are mapped through the alias.
 - `CreateFolder` sends the name it was created with. A rename or move made before the create
   reached Graph is its own queued op, sent after it under the Graph id. A queued op on a folder
-  still `local:` (its create was refused and discarded) sends nothing. A create under a parent,
-  or a move into a dest, that is still `local:` is refused (`Parse`). A message `Move` into a
-  folder still `local:` sends nothing; it is only a guard. When the store removes such a
-  folder (its create refused, or the folder deleted before its create was sent) it drops
-  every queued message move into it, whatever the folder still holds. A draft moved there is
-  filed back in Drafts on a refused create (a delete refuses to take one), and other mail
-  comes back by a mail reconverge, where Graph has it. A folder move is sent even when its
-  row is gone, as long as its id is not `local:`: a delete of the Graph folder it was moved
-  under took the row, and that delete, queued after the move, must find it there on Graph
-  too. A move under a `local:` dest can never be sent: `delete_folder` drops every queued
-  `MoveFolder` into a `local:` folder it removes, wherever the moved folder is now (deleted
-  itself, or moved on). A Graph folder still under the removed one also loses its other
-  queued moves and gets a `DeleteFolder` of its own (`delete_roots`), carrying its part of the
-  snapshot (no row is in two snapshots). Its snapshot row takes the parent Graph has it under
-  (the first dropped move's `prev_parent`), so a refusal restores it there.
+  still `local:` (its create was refused and discarded), or on a row that is gone, sends nothing.
+  A create under a parent, or a move into a dest, that is still `local:` is refused (`Parse`). A
+  message `Move` into a folder still `local:` sends nothing; it is only a guard, as a refused
+  create drops every queued message move into its folder.
 - A move whose answer has a new id re-keys the folder like a create, and also clears
   `delta_link` and the backfill columns, since the links name the old id; phase 1 runs again.
   The answer's parent is stored only while the stored parent is still the one the op wrote (a
   later queued move keeps its own). `Applied::FoldersChanged` then sends `FoldersUpdated`.
-- Delete: the folder and every folder under it go in one statement (recursive CTE on
-  `parent_id`), and their messages go by `ON DELETE CASCADE` (bodies, attachments, search
-  rows), with the delta links, as `retain_folders` removes them (#1886). The op carries a
-  snapshot of the removed rows that are not `local:` (`FolderSnapshot`: name, parent, counts,
-  well-known name, `sort_order`, `is_expanded`). A 404 is success. When a `local:` folder it
-  removes held a message (one moved there locally, which Graph still has where it was), the
-  delete drops, in the same transaction, the queued message ops that name such a message or
-  move one into such a folder (`drop_local_folder_mail_on`). Those ops could send nothing that
-  matters now, and while queued they would block the message's return, because a fresh delta
-  skips every id a queued op names. The engine then starts the quarantine's mail reconverge
-  (`start_mail_reconverge`). A user's read, flag or category change on such a message is lost
-  with it; the message comes back as Graph has it. Soft delete (hidden rows)
-  was rejected: every message reader would need a filter. "Delete to Deleted Items" is a
-  `MoveFolder` there.
 - Refusals: 401, a throttle (429 and 503), transport and other 5xx keep the op queued and in
-  order, as for every op. Anything else (4xx, a rename's or move's 404, `Parse`) is final at
-  once (`refuse_folder_write`): the op is dropped, the store reverted, and
-  `FolderWriteFailed { id, write, status, error }`, `Error("{create|rename|move|delete} folder
-  {id}: {error}")` and `FoldersUpdated` are sent. There are no five attempts and no
-  quarantine. The status comes from `refused_write_status`, shared with the contact writes.
-  A refused create removes its `local:` folder and the `local:` folders reached from it
-  through `local:` parents only (`discard_local_folder`, `local_subtree_ids_on`). A folder
-  Graph has that was moved under it is left for its own queued move's refusal, and so is a
-  `local:` folder created under that one, whose create still goes to Graph under it. Mail Graph does not have in them (`unsent_mail_in_on`, the predicate
-  a delete's `HoldsUnsentMail` uses: a `local:` id, `local_edit > 0`, or a queued
-  `SaveDraft`/`SendDraft`) is first filed back in Drafts (or the drafts sentinel), its own save
-  or send still queued, with `MessagesUpdated` for that folder. Any other message moved into
-  the discarded folder loses its queued ops, and the mail reconverges as for a delete, so it
-  comes back where Graph has it. A refused rename or move puts `prev_name` / `prev_parent`
-  back only while the stored
-  value is still the op's own (`revert_folder_name`, `revert_folder_parent`). A refused delete
-  puts the snapshot back at once (`restore_folders`, `INSERT OR IGNORE`, no delta link); its
-  messages come back with the next pass's delta.
-- **Deletes and the moves before them (r4).** A folder or message moved out of F, with F then
-  deleted, is still in F on Graph until its move lands; `DELETE F` would take it and its mail
-  although the user moved it out first. A move op does not record its source folder, and
-  parents change while ops wait, so one ordering rule guards every path instead of parent
-  tracking:
-  - One predicate says which ops decide where something is, `OutboxOp::decides_location`
-    (r8, matched exhaustively): a message `Move`, a `MoveFolder`, and a draft's `SendDraft`
-    (it re-files the draft into Sent Items at command time) or `SaveDraft`. R1, R2 and the
-    r7 re-file (`messages_with_a_queued_move`, its message ops) all ask it, so they cannot
-    drift apart. `SaveDraft` only makes a delete wait for a pending save, which is harmless.
-  - R1: a `DeleteFolder` is sent only when no such op with a smaller `seq` is still queued
-    (`moves_queued_before`). Otherwise the drain skips it, it stays queued in place, and the
-    drain goes on. Typically an earlier move got a 4xx, or a send that may have gone out
-    failed its delivery check, and the op is kept for its next attempt.
-  - R2: such an op that leaves the outbox without reaching Graph refuses locally every
-    `DeleteFolder` queued after it (`refuse_deletes_queued_after`, no Graph call). That covers
-    a `MoveFolder` refused for good, a quarantined message `Move`, `SendDraft` or `SaveDraft`
-    (after `MAX_OP_ATTEMPTS`), a send that failed for good (`fail_send`: the draft never left
-    the folder Graph has it in, while the store shows it in Drafts), a move that sent nothing
-    (`Applied::MoveNotSent`: a `local:` folder or dest), and moves the store dropped with a
-    removed `local:` folder (`delete_folder` and `discard_local_folder` return their seqs). Each refused delete is dropped and its snapshot restored, and it is
-    reported as `FolderWriteFailed { id, write: Delete, status: None, error: "a move queued
-    before it did not reach the server" }` plus its `Error`, ahead of the move's own failure,
-    with one `FoldersUpdated`. A delete that `delete_folder` queued itself (from
-    `queued_from` on) is not refused by the moves it dropped. A delete of a `local:` folder
-    sends nothing and has an empty snapshot, so it is left.
-  - This is deliberately conservative: an unrelated delete queued after a failed move is
-    refused too, and so is one that already took the moved folder with it. The user deletes
-    again; the alternative is mail deleted on Graph. Nothing extra is persisted: the refusal
-    happens when the move leaves the outbox, and the deletes are still queued then.
-  - R3 (r5, r6): a `DeleteFolder` command is refused at once (`FolderRefusal::Rereading`,
-    `status: None`, "folders and mail are being read again from the server; delete again once
-    that is done") while the store may not show what Graph has (`deletes_unsafe`):
-    - (a) a mail reconverge is pending (`reconverge_pending`, persisted);
-    - (b) a reconverge's reads are not all done. While `reconverge_pending` is set,
-      `backfill_remains` counts every stored Graph folder (not `local:`, not the sentinel)
-      without a delta link (a phase 1 that failed without a fatal error) or without a complete
-      history, parked walks included. So the reconverge, and its age cutoff being off, lasts
-      until a later pass has read them all. This reverses #1871's rule that a parked walk does
-      not hold a reconverge open (`a_parked_walk_holds_a_reconverge_open_until_it_completes`).
-      A separate "reread owed" flag was rejected: in window mode the cutoff would apply again
-      once the reconverge ended, and mail older than the window would never come back;
-    - (c) Graph refused a folder create, rename or move since the last complete listing
-      (`relist_owed`, persisted in `meta`). A revert can show a parent Graph does not have:
-      two refused moves of one folder revert it to the first move's dest. `sync_folders`
-      clears it after a complete, non-empty listing, which rewrites every folder no queued op
-      protects. This covers the unchained `prev` limit for deletes, without chaining.
-    R2 sees only the deletes queued when the move leaves the outbox. After a quarantined move,
-    or a move dropped with a refused or deleted `local:` folder, the store still shows the
-    message out of the folder Graph has it in until the reconverge has read that folder.
-    Holding a delete issued in that window does not help: the reconverge never reads a folder
-    whose delete is queued (the pass reads stored folders, and the listing skips it), so the
-    message is never shown back there, and the held `DELETE` would take it on Graph while it
-    is still shown in its stale folder. Once the reads are done it is shown where Graph has it,
-    a message a queued field op protects included (r7: the fresh read re-files it, keeping
-    the op's optimistic edit, unless a queued move still decides its folder), and a new
-    delete takes what the user sees. No event says deletes are safe again; the host
-    retries after a later `FoldersUpdated`. Starvation: a delete can be refused until the next
-    complete read (every folder's, after any quarantine) or the next complete listing. A
-    folder whose read keeps failing (a persistent 403) keeps deletes refused. That is the safe
-    side.
-  - A refusal may drop ops a drain has already read (a delete, a refused create's message
-    moves), so the drain checks that each op is still queued (`Store::has_op`) before it sends
-    it.
-- Known revert limits, healed by the next listing once no op protects the row: `prev` values
+  order, as for every op. Anything else (4xx, a 404, `Parse`) is final at once
+  (`refuse_folder_write`): the op is dropped, the store reverted, and `FolderWriteFailed { id,
+  write, status, error }`, `Error("{create|rename|move} folder {id}: {error}")` and
+  `FoldersUpdated` are sent. There are no five attempts and no quarantine. The status comes from
+  `refused_write_status`, shared with the contact writes.
+- A refused create removes its `local:` folder and the `local:` folders reached from it through
+  `local:` parents only (`discard_local_folder`, `local_subtree_ids_on`). A folder Graph has that
+  was moved under it is left for its own queued move's refusal, and so is a `local:` folder
+  created under that one, whose create still goes to Graph under it. Mail Graph does not have in
+  them (`unsent_mail_in_on`: a `local:` id, `local_edit > 0`, or a queued `SaveDraft`/`SendDraft`)
+  is first filed back in Drafts (or the drafts sentinel), its own save or send still queued, with
+  `MessagesUpdated` for that folder. Every queued message move into them is dropped, and when
+  other mail was moved there, so are the queued message ops naming it
+  (`drop_local_folder_mail_on`): a fresh delta skips every id a queued op names, and Graph still
+  has that mail where it was. The mail then reconverges as after a quarantine
+  (`start_mail_reconverge`, every delta link cleared), so it comes back where Graph has it. A
+  read, flag or category change on such a message is lost with it. These drops happen mid-drain,
+  after the drain read its ops, so the drain checks that each op is still queued
+  (`Store::has_op`) before it sends it.
+- A refused rename or move puts `prev_name` / `prev_parent` back only while the stored value is
+  still the op's own (`revert_folder_name`, `revert_folder_parent`). Best effort: `prev` values
   are not chained (op1 A→B refused while op2 B→C waits leaves op2's `prev` B, a name or parent
-  Graph never had, possibly a removed `local:` folder), and a `local:` child created before
-  its parent's delete is not restored (its create sent nothing). Neither reaches Graph: no
-  delete goes out past a move that did not land (R1, R2).
+  Graph never had), and the next listing, once no op protects the row, rewrites it.
 - While an op is queued, a sync pass does not undo it (`sync_folders` reads
-  `Store::queued_folder_writes` first). A listed folder named by a queued delete, or by its
-  `removed` snapshot, or under one in the listing, is not upserted. The snapshot covers a
-  folder moved under the deleted one locally, which Graph still lists under its old parent
-  until its move is sent. One a queued rename names keeps its stored name, and one a
-  queued move names its stored parent; counts and the well-known name still update. A stored
-  `local:` folder is kept without a `folder_exists` GET. No Graph read is sent for a `local:`
-  folder: the pass's delta loop skips it (and so, now, the drafts sentinel, which used to get
-  a delta Graph could only refuse), `refresh_folder` (`SyncFolder`, fast ticks) sends nothing for it, and a
-  search scoped to it answers `MessageSearchResults` with no hits and sends no request. The
-  backfill needs a delta link, which such a folder never has.
+  `Store::queued_folder_writes` first): a folder a queued rename names keeps its stored name, and
+  one a queued move names its stored parent; counts and the well-known name still update. A
+  stored `local:` folder is kept without a `folder_exists` GET. No Graph read is sent for a
+  `local:` folder: the pass's delta loop skips it (and so, now, the drafts sentinel, which used
+  to get a delta Graph could only refuse), `refresh_folder` (`SyncFolder`, fast ticks) sends
+  nothing for it, and a search scoped to it answers `MessageSearchResults` with no hits and sends
+  no request. The backfill needs a delta link, which such a folder never has.
 - A deferred op in the tests is answered 500, not 503: a 503 is a throttle, retried at once.
 - lookxy ignores `FolderCreated` and `FolderWriteFailed`: it has no folder management.
 - Tests: `client.rs` `create_folder_posts_top_level_and_child`,
-  `create_folder_answer_without_an_id_is_a_parse_error`,
-  `rename_folder_patches_display_name`, `move_folder_posts_destination_and_root`,
-  `delete_folder_sends_delete_and_404_is_not_found`; store `folder_write_tests`
+  `create_folder_answer_without_an_id_is_a_parse_error`, `rename_folder_patches_display_name`,
+  `move_folder_posts_destination_and_root`; store `folder_write_tests`
   (`folder_ops_round_trip_json`, `folder_writes_queue_their_op_in_the_same_transaction`,
   `create_at_the_top_stores_the_listed_root_as_parent`,
   `folder_writes_refuse_unknown_folders_and_the_drafts_sentinel`,
   `move_into_itself_or_a_folder_inside_it_is_refused`,
   `rename_and_move_keep_sort_order_and_expanded`,
-  `delete_folder_removes_subtree_messages_and_delta_links`,
-  `delete_folder_holding_unsent_mail_is_refused`,
+  `discarding_a_local_folder_drops_the_ops_of_mail_moved_into_it`,
+  `a_refused_create_files_unsent_mail_back_in_drafts`,
   `reconcile_created_folder_rekeys_messages_children_and_aliases`,
   `reconcile_keeps_the_mail_of_a_stale_row_under_the_graph_id`,
-  `reconcile_of_a_deleted_row_still_aliases`, `current_folder_id_follows_chained_aliases`,
+  `reconcile_of_a_row_gone_still_aliases`, `current_folder_id_follows_chained_aliases`,
   `a_move_answered_with_a_new_id_rekeys_and_clears_the_links`,
   `a_move_answer_gives_the_parent_unless_a_later_move_wrote_one`,
   `revert_folder_name_keeps_a_later_rename`, `revert_folder_parent_keeps_a_later_move`,
-  `discard_local_folder_leaves_folders_graph_has`,
-  `deleting_a_local_folder_drops_the_ops_of_mail_moved_into_it`,
-  `a_queued_delete_names_every_folder_it_removed`,
-  `a_refused_create_files_unsent_mail_back_in_drafts`,
-  `a_graph_folder_moved_under_a_deleted_local_folder_gets_its_own_delete`,
-  `deleting_a_local_folder_drops_every_move_into_it`); `outbox.rs`
+  `discard_local_folder_leaves_folders_graph_has`); `outbox.rs`
   `create_folder_reconciles_the_local_id`,
   `create_folder_retry_after_reconcile_or_of_a_deleted_row_sends_nothing`,
   `create_folder_under_a_parent_that_never_reached_graph_is_refused`,
   `rename_and_move_after_a_create_reach_the_graph_id`,
-  `move_folder_stores_the_answer_and_refuses_a_local_dest`, `delete_folder_404_is_success`,
+  `move_folder_stores_the_answer_and_refuses_a_local_dest`,
   `message_move_into_a_created_folder_sends_its_graph_id`; `engine.rs` `folder_writes`
   (`create_folder_round_trip_at_the_top_and_under_a_parent`,
   `rename_folder_patches_and_keeps_local_state`,
   `move_folder_to_the_top_and_under_a_folder_stores_graphs_answer`,
-  `delete_folder_removes_children_and_messages_and_404_is_success`,
   `rename_move_and_message_move_queued_behind_a_deferred_create_follow_it`,
   `refused_folder_writes_revert_and_report`,
-  `refused_create_of_a_folder_holding_moved_mail_reconverges`,
+  `refused_create_of_a_folder_holding_moved_mail_reconverges` (its dropped flag covers the
+  `has_op` skip), `a_refused_create_files_a_draft_moved_into_it_back_in_drafts`,
   `a_sync_pass_keeps_folder_writes_still_queued`,
   `folder_commands_the_store_refuses_report_and_queue_nothing`,
-  `delete_of_sent_items_holding_a_queued_send_is_refused_and_the_send_goes_out`,
-  `fast_folders_follow_a_created_folder`,
-  `deleting_a_local_folder_holding_moved_mail_brings_it_back`,
-  `deleting_a_folder_above_a_local_folder_holding_moved_mail_brings_it_back`,
-  `a_folder_moved_under_a_deleted_folder_goes_with_it`,
-  `a_refused_create_files_a_draft_moved_into_it_back_in_drafts`,
-  `a_graph_folder_moved_under_a_deleted_local_folder_is_deleted_on_graph`,
-  `a_refused_move_out_of_a_folder_refuses_the_queued_delete_of_its_old_parent`,
-  `a_refused_delete_of_a_folder_moved_under_a_deleted_local_folder_restores_it`,
-  `a_folder_moved_through_a_deleted_local_folder_keeps_its_old_parents_delete_back`,
-  `a_refused_create_keeps_the_delete_of_the_folder_its_moved_mail_left`,
-  `a_delete_waits_for_a_message_move_out_of_it_and_a_quarantine_refuses_it`,
-  `a_delete_after_a_quarantined_move_waits_for_the_reconverge`,
-  `a_delete_after_a_refused_create_took_moved_mail_waits_for_the_reconverge`,
-  `deleting_a_local_folder_refuses_the_delete_its_moved_mail_left`,
-  `a_delete_waits_while_a_reconverge_read_failed`,
-  `a_delete_waits_for_a_listing_after_refused_moves`; and `backfill`
-  `a_parked_walk_holds_a_reconverge_open_until_it_completes`; store
-  `relist_owed_survives_reopening_the_store`,
-  `queued_moves_and_drafts_decide_a_folder_and_refile_moves_only_the_folder`; engine
-  `a_reconverge_refiles_a_protected_message_its_quarantined_move_left_elsewhere`,
-  `a_protected_message_with_a_queued_move_is_not_refiled`,
-  `a_failed_send_refuses_the_delete_of_the_folder_its_draft_never_left`,
-  `a_delete_waits_behind_a_send_that_may_have_gone_out`).
-- Not done: a lookxy folder-management UI; dedup of a create retried after a lost POST answer
-  (a retry may 409 on the name Graph already has; the refusal discards the local row and the
-  next listing brings Graph's folder); `GET /me/mailFolders/delta`; search folders; folders in
-  other mailboxes; returning the `local:` id synchronously (a host finds the new row on
-  `FoldersUpdated`; `FolderCreated` names both ids).
+  `fast_folders_follow_a_created_folder`).
+- Not done: deleting a folder (#2107); a lookxy folder-management UI; dedup of a create retried
+  after a lost POST answer (a retry may 409 on the name Graph already has; the refusal discards
+  the local row and the next listing brings Graph's folder); `GET /me/mailFolders/delta`; search
+  folders; folders in other mailboxes; returning the `local:` id synchronously (a host finds the
+  new row on `FoldersUpdated`; `FolderCreated` names both ids).
