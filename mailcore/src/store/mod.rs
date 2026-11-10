@@ -550,6 +550,44 @@ impl OutboxOp {
         }
     }
 
+    /// Whether this op decides where a message or a folder is (#1910 r8):
+    /// a message `Move`, a `MoveFolder`, and a draft's `SendDraft` (it
+    /// re-files the draft into Sent Items at command time) or `SaveDraft`.
+    /// One definition for every rule that asks it: a folder delete waits
+    /// behind such an op queued before it (R1), such an op leaving the
+    /// outbox without landing refuses the deletes queued after it (R2), and
+    /// a fresh delta does not re-file a message such an op names (r7).
+    /// Exhaustive, so a new op must say.
+    pub fn decides_location(&self) -> bool {
+        match self {
+            OutboxOp::Move { .. }
+            | OutboxOp::MoveFolder { .. }
+            | OutboxOp::SendDraft { .. }
+            | OutboxOp::SaveDraft { .. } => true,
+            OutboxOp::MarkRead { .. }
+            | OutboxOp::SetFlag { .. }
+            | OutboxOp::SetCategories { .. }
+            | OutboxOp::Delete { .. }
+            | OutboxOp::RespondEvent { .. }
+            | OutboxOp::CreateEvent { .. }
+            | OutboxOp::UpdateEvent { .. }
+            | OutboxOp::DeleteEvent { .. }
+            | OutboxOp::CancelEvent { .. }
+            | OutboxOp::ForwardEvent { .. }
+            | OutboxOp::UpdateEventSeries { .. }
+            | OutboxOp::DismissReminder { .. }
+            | OutboxOp::SnoozeReminder { .. }
+            | OutboxOp::DismissMessageReminder { .. }
+            | OutboxOp::SnoozeMessageReminder { .. }
+            | OutboxOp::CreateContact { .. }
+            | OutboxOp::UpdateContact { .. }
+            | OutboxOp::DeleteContact { .. }
+            | OutboxOp::CreateFolder { .. }
+            | OutboxOp::RenameFolder { .. }
+            | OutboxOp::DeleteFolder { .. } => false,
+        }
+    }
+
     /// The `kind` tag stored alongside the JSON payload (used for the
     /// `outbox.op` column, which is `NOT NULL`; the payload itself is the
     /// source of truth when reading a row back).
@@ -2006,18 +2044,19 @@ impl Store {
     }
 
     /// The message ids whose folder a queued op still decides (#1910 r7),
-    /// sorted, each resolved through `current_id`: a message `Move`, and a
-    /// draft's `SaveDraft` or `SendDraft` (a send re-files the draft into
+    /// sorted, each resolved through `current_id`: the message ops
+    /// [`OutboxOp::decides_location`] names (a message `Move`, and a
+    /// draft's `SaveDraft` or `SendDraft`: a send re-files the draft into
     /// Sent Items at command time; drafts keep their own Drafts handling).
     /// A fresh delta re-files any other protected message to the folder
     /// Graph reports it in (`Store::refile_message`).
     pub(crate) fn messages_with_a_queued_move(&self) -> Result<Vec<String>, StoreError> {
         let mut ids = Vec::new();
         for row in pending_ops_on(&self.conn)? {
-            if let OutboxOp::Move { id, .. }
-            | OutboxOp::SaveDraft { id }
-            | OutboxOp::SendDraft { id } = &row.op
-            {
+            if !row.op.decides_location() {
+                continue;
+            }
+            if let Some(id) = row.op.message_id() {
                 ids.push(current_id_on(&self.conn, id)?);
             }
         }
@@ -2040,8 +2079,12 @@ impl Store {
 
     /// The message ids queued outbox ops name (#1871): every delta that
     /// starts fresh (a head, a small folder's full delta, a backfill page)
-    /// leaves them alone, as their optimistic local write (a read flag, a
-    /// move, a delete, a draft's fields) has not reached Graph yet. Calendar
+    /// merges none of their fields, as their optimistic local write (a read
+    /// flag, a move, a delete, a draft's fields) has not reached Graph yet.
+    /// Such a delta still re-files one to the folder Graph reports it in
+    /// unless a queued op decides its folder (#1910 r7,
+    /// `messages_with_a_queued_move`), and a deleted one is never put back
+    /// (the re-file only moves an existing row). Calendar
     /// event ops name events, not messages, and are left out. Each id is
     /// the one its message is stored under now (`current_id`: an op queued
     /// before a move still protects the re-keyed row, #1896).

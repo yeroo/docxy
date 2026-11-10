@@ -2883,7 +2883,10 @@ impl Engine {
     /// With `protect` (`protected_ids`, sorted) the page is a fresh
     /// delta's (#1871: a head, a small folder's full delta, a backfill
     /// page), which carries every message it covers, not only what changed:
-    /// it never merges over a local edit. It skips those ids, and merges
+    /// it never merges over a local edit. It merges none of those ids'
+    /// fields, but re-files one to `folder_id` when no queued op decides its
+    /// folder (#1910 r7, `Store::messages_with_a_queued_move`): a move that
+    /// did not land, or one made on another client. It merges
     /// every other row with `Store::merge_message_unless_edited`, which
     /// leaves a draft holding an unsaved edit alone in the same statement
     /// as the write (compose saves on lookxy's own connection, at any
@@ -4003,14 +4006,19 @@ impl Engine {
                         // below, and the row stays where it is.
                         if !self.store.send_posted(row.seq).unwrap_or(true) {
                             self.fail_send(row.seq, id, &other);
+                            // The draft never left where Graph has it (R2).
+                            if self.refuse_deletes_queued_after(row.seq, None) {
+                                self.emit(SyncEvent::FoldersUpdated);
+                            }
                             continue;
                         }
                     }
                     let attempts_after = row.attempts + 1;
                     if attempts_after >= MAX_OP_ATTEMPTS {
                         self.store.drop_op(row.seq);
-                        // A quarantined message move never landed (R2).
-                        if matches!(row.op, OutboxOp::Move { .. })
+                        // A quarantined op that decided where a message is
+                        // (a move, a draft's save or send) never landed (R2).
+                        if row.op.decides_location()
                             && self.refuse_deletes_queued_after(row.seq, None)
                         {
                             self.emit(SyncEvent::FoldersUpdated);
@@ -4234,20 +4242,21 @@ impl Engine {
         }
     }
 
-    /// Whether a message `Move` or a `MoveFolder` queued before `seq` is
-    /// still queued (#1910, R1).
+    /// Whether an op that decides where something is
+    /// ([`OutboxOp::decides_location`]) queued before `seq` is still queued
+    /// (#1910, R1).
     fn moves_queued_before(&self, seq: i64) -> bool {
-        self.store.pending_ops().is_ok_and(|ops| {
-            ops.iter().any(|r| {
-                r.seq < seq && matches!(r.op, OutboxOp::Move { .. } | OutboxOp::MoveFolder { .. })
-            })
-        })
+        self.store
+            .pending_ops()
+            .is_ok_and(|ops| ops.iter().any(|r| r.seq < seq && r.op.decides_location()))
     }
 
-    /// R2 (#1910): a move (message or folder) left the outbox without
-    /// reaching Graph (refused, quarantined, sent nothing, or dropped by the
-    /// store), so whatever it moved out of a folder is still in that folder
-    /// on Graph. The move does not know its source folder, so every folder
+    /// R2 (#1910): an op that decides where something is
+    /// ([`OutboxOp::decides_location`]: a move, a folder move, a draft's
+    /// send or save) left the outbox without reaching Graph (refused, a
+    /// failed send, quarantined, sent nothing, or dropped by the store), so
+    /// whatever it moved out of a folder is still in that folder on Graph.
+    /// The op does not know its source folder, so every folder
     /// delete queued after it (`seq` above `after`, and below `before`: a
     /// delete the dropping call queued itself is its own) is refused here
     /// before it is sent: dropped, its rows put back (`restore_folders`, as
@@ -28822,6 +28831,115 @@ mod tests {
             );
             assert_eq!(mail_in(&store, "OTHER"), ["A1"]);
             assert!(mail_in(&store, "ARCH").is_empty());
+            stop(handle, dir);
+        }
+
+        /// A Graph draft D1 in ARCH (a user folder), with Sent Items listed,
+        /// on `writes` and the world's reads; D1's body is stored.
+        fn draft_in_arch(
+            tag: &str,
+            writes: Vec<(Route, Option<usize>)>,
+        ) -> (FakeServer, SyncHandle, Store, PathBuf) {
+            let mut tree = TREE.to_vec();
+            tree.push(("SENT", Some("ROOT"), Some("sentitems")));
+            let draft = r#"{"id":"D1","conversationId":"C","subject":"Hi","from":{"emailAddress":{"name":"","address":""}},"toRecipients":[{"emailAddress":{"name":"Bob","address":"bob@x"}}],"ccRecipients":[],"receivedDateTime":"2026-07-16T10:00:00Z","sentDateTime":"","isRead":true,"hasAttachments":false,"importance":"normal","bodyPreview":"","isDraft":true}"#;
+            let first = "/me/mailFolders/ARCH/messages/delta?$";
+            let link = "/me/mailFolders/ARCH/messages/delta?token=D-ARCH";
+            let mut routes = vec![(
+                get_route(first, 200, &delta_page(&[draft.to_string()], link)),
+                None,
+            )];
+            routes.extend(world(writes, &tree, &[]));
+            let (srv, handle, store, dir) = engine(tag, routes, None);
+            assert_eq!(mail_in(&store, "ARCH"), ["D1"]);
+            store
+                .put_body(
+                    "D1",
+                    &crate::graph::model::Body {
+                        content_type: "html".into(),
+                        content: "<p>hi</p>".into(),
+                    },
+                )
+                .unwrap();
+            (srv, handle, store, dir)
+        }
+
+        #[test]
+        fn a_failed_send_refuses_the_delete_of_the_folder_its_draft_never_left() {
+            // D1's send waits behind a 500; ARCH, where Graph has D1, looks
+            // empty (the send re-filed D1 into Sent Items) and is deleted.
+            // Graph then refuses the send for good.
+            let (srv, handle, store, dir) = draft_in_arch(
+                "folder-delete-after-failed-send",
+                vec![
+                    once("PATCH", "/me/messages/D1", 500, "busy"),
+                    write("PATCH", "/me/messages/D1", 200, "{}"),
+                    write("POST", "/me/messages/D1/send", 400, BAD),
+                    write("DELETE", "/me/mailFolders/ARCH", 204, ""),
+                ],
+            );
+            send(&handle, SyncCommand::SendDraft { id: "D1".into() });
+            wait_requests(&srv, "PATCH", "/me/messages/D1", 1);
+            assert_eq!(mail_in(&store, "SENT"), ["D1"]);
+            send(&handle, SyncCommand::DeleteFolder { id: "ARCH".into() });
+            wait_queued(&store, 2);
+
+            send(&handle, SyncCommand::Refresh);
+            let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+            assert!(
+                seen.iter()
+                    .any(|e| matches!(e, SyncEvent::SendFailed { .. })),
+                "{seen:?}"
+            );
+            assert_eq!(
+                failures(&seen),
+                [("ARCH".to_string(), FolderWrite::Delete, None)]
+            );
+            wait_drained(&store);
+            assert_eq!(hits(&srv, "DELETE", "/me/mailFolders/ARCH"), 0);
+            assert!(row(&store, "ARCH").is_some());
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn a_delete_waits_behind_a_send_that_may_have_gone_out() {
+            // D1's `/send` answers 500 (it may have gone out), and every
+            // delivery check is refused 403: the send is bumped and kept, and
+            // ARCH's delete waits behind it (R1) until its quarantine refuses
+            // the delete (R2).
+            let (srv, handle, store, dir) = draft_in_arch(
+                "folder-delete-behind-posted-send",
+                vec![
+                    write("PATCH", "/me/messages/D1", 200, "{}"),
+                    once("POST", "/me/messages/D1/send", 500, "busy"),
+                    write("GET", "/me/messages/D1?$select=isDraft", 403, BAD),
+                    write("DELETE", "/me/mailFolders/ARCH", 204, ""),
+                ],
+            );
+            send(&handle, SyncCommand::SendDraft { id: "D1".into() });
+            wait_requests(&srv, "POST", "/me/messages/D1/send", 1);
+            send(&handle, SyncCommand::DeleteFolder { id: "ARCH".into() });
+            wait_queued(&store, 2);
+
+            let mut seen = Vec::new();
+            for _ in 0..MAX_OP_ATTEMPTS {
+                send(&handle, SyncCommand::Refresh);
+                seen.extend(wait_for(&handle.evt_rx, |e| {
+                    matches!(e, SyncEvent::ContactsUpdated)
+                }));
+                assert_eq!(hits(&srv, "DELETE", "/me/mailFolders/ARCH"), 0, "R1");
+                if !failures(&seen).is_empty() {
+                    break;
+                }
+                assert_eq!(store.pending_ops().unwrap().len(), 2);
+            }
+            assert_eq!(
+                failures(&seen),
+                [("ARCH".to_string(), FolderWrite::Delete, None)],
+                "R2 after the send's quarantine"
+            );
+            wait_drained(&store);
+            assert_eq!(hits(&srv, "DELETE", "/me/mailFolders/ARCH"), 0);
             stop(handle, dir);
         }
 
