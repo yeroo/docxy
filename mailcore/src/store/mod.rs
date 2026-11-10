@@ -451,68 +451,6 @@ pub enum OutboxOp {
         parent: Option<String>,
         prev_parent: Option<String>,
     },
-    /// DELETE a folder (#1910, `Store::delete_folder`), which the command
-    /// removed locally with its subtree; `removed` is a snapshot of the
-    /// removed rows Graph has (not `local:` ones), put back if Graph
-    /// refuses. A 404 is done.
-    DeleteFolder {
-        id: String,
-        removed: Vec<FolderSnapshot>,
-    },
-}
-
-/// A folder row as a refused `DeleteFolder` puts it back (#1910): what the
-/// listing gives plus the local state (`sort_order`, `is_expanded`). No
-/// delta link: the next pass's delta brings its messages back.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FolderSnapshot {
-    pub id: String,
-    pub parent_id: Option<String>,
-    pub display_name: String,
-    pub total_count: i64,
-    pub unread_count: i64,
-    pub well_known_name: Option<String>,
-    pub sort_order: Option<i64>,
-    pub is_expanded: bool,
-}
-
-impl FolderSnapshot {
-    fn to_json(&self) -> Value {
-        Value::Object(vec![
-            ("id".to_string(), Value::Str(self.id.clone())),
-            ("parentId".to_string(), optional_str(&self.parent_id)),
-            (
-                "displayName".to_string(),
-                Value::Str(self.display_name.clone()),
-            ),
-            ("total".to_string(), Value::Num(self.total_count as f64)),
-            ("unread".to_string(), Value::Num(self.unread_count as f64)),
-            (
-                "wellKnownName".to_string(),
-                optional_str(&self.well_known_name),
-            ),
-            (
-                "sortOrder".to_string(),
-                self.sort_order
-                    .map_or(Value::Null, |n| Value::Num(n as f64)),
-            ),
-            ("expanded".to_string(), Value::Bool(self.is_expanded)),
-        ])
-    }
-
-    fn from_json(v: &Value) -> Option<FolderSnapshot> {
-        let opt = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
-        Some(FolderSnapshot {
-            id: v.get("id")?.as_str()?.to_string(),
-            parent_id: opt("parentId"),
-            display_name: v.get("displayName")?.as_str()?.to_string(),
-            total_count: v.get("total").and_then(Value::as_i64).unwrap_or(0),
-            unread_count: v.get("unread").and_then(Value::as_i64).unwrap_or(0),
-            well_known_name: opt("wellKnownName"),
-            sort_order: v.get("sortOrder").and_then(Value::as_i64),
-            is_expanded: v.get("expanded").and_then(Value::as_bool).unwrap_or(false),
-        })
-    }
 }
 
 impl OutboxOp {
@@ -545,46 +483,7 @@ impl OutboxOp {
             | OutboxOp::DeleteContact { .. }
             | OutboxOp::CreateFolder { .. }
             | OutboxOp::RenameFolder { .. }
-            | OutboxOp::MoveFolder { .. }
-            | OutboxOp::DeleteFolder { .. } => None,
-        }
-    }
-
-    /// Whether this op decides where a message or a folder is (#1910 r8):
-    /// a message `Move`, a `MoveFolder`, and a draft's `SendDraft` (it
-    /// re-files the draft into Sent Items at command time) or `SaveDraft`.
-    /// One definition for every rule that asks it: a folder delete waits
-    /// behind such an op queued before it (R1), such an op leaving the
-    /// outbox without landing refuses the deletes queued after it (R2), and
-    /// a fresh delta does not re-file a message such an op names (r7).
-    /// Exhaustive, so a new op must say.
-    pub fn decides_location(&self) -> bool {
-        match self {
-            OutboxOp::Move { .. }
-            | OutboxOp::MoveFolder { .. }
-            | OutboxOp::SendDraft { .. }
-            | OutboxOp::SaveDraft { .. } => true,
-            OutboxOp::MarkRead { .. }
-            | OutboxOp::SetFlag { .. }
-            | OutboxOp::SetCategories { .. }
-            | OutboxOp::Delete { .. }
-            | OutboxOp::RespondEvent { .. }
-            | OutboxOp::CreateEvent { .. }
-            | OutboxOp::UpdateEvent { .. }
-            | OutboxOp::DeleteEvent { .. }
-            | OutboxOp::CancelEvent { .. }
-            | OutboxOp::ForwardEvent { .. }
-            | OutboxOp::UpdateEventSeries { .. }
-            | OutboxOp::DismissReminder { .. }
-            | OutboxOp::SnoozeReminder { .. }
-            | OutboxOp::DismissMessageReminder { .. }
-            | OutboxOp::SnoozeMessageReminder { .. }
-            | OutboxOp::CreateContact { .. }
-            | OutboxOp::UpdateContact { .. }
-            | OutboxOp::DeleteContact { .. }
-            | OutboxOp::CreateFolder { .. }
-            | OutboxOp::RenameFolder { .. }
-            | OutboxOp::DeleteFolder { .. } => false,
+            | OutboxOp::MoveFolder { .. } => None,
         }
     }
 
@@ -617,7 +516,6 @@ impl OutboxOp {
             OutboxOp::CreateFolder { .. } => "createFolder",
             OutboxOp::RenameFolder { .. } => "renameFolder",
             OutboxOp::MoveFolder { .. } => "moveFolder",
-            OutboxOp::DeleteFolder { .. } => "deleteFolder",
         }
     }
 
@@ -758,14 +656,6 @@ impl OutboxOp {
                 ("dest".to_string(), optional_str(dest)),
                 ("parent".to_string(), optional_str(parent)),
                 ("prevParent".to_string(), optional_str(prev_parent)),
-            ]),
-            OutboxOp::DeleteFolder { id, removed } => Value::Object(vec![
-                ("kind".to_string(), Value::Str(self.kind().to_string())),
-                ("id".to_string(), Value::Str(id.clone())),
-                (
-                    "removed".to_string(),
-                    Value::Array(removed.iter().map(FolderSnapshot::to_json).collect()),
-                ),
             ]),
             OutboxOp::CancelEvent { id, comment } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
@@ -949,17 +839,6 @@ impl OutboxOp {
                     .get("prevParent")
                     .and_then(Value::as_str)
                     .map(str::to_string),
-            }),
-            // A snapshot row that does not parse makes the whole row
-            // corrupt, as a recipient without an address does.
-            "deleteFolder" => Some(OutboxOp::DeleteFolder {
-                id: id()?,
-                removed: v
-                    .get("removed")?
-                    .as_array()?
-                    .iter()
-                    .map(FolderSnapshot::from_json)
-                    .collect::<Option<Vec<_>>>()?,
             }),
             _ => None,
         }
@@ -2043,48 +1922,10 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// The message ids whose folder a queued op still decides (#1910 r7),
-    /// sorted, each resolved through `current_id`: the message ops
-    /// [`OutboxOp::decides_location`] names (a message `Move`, and a
-    /// draft's `SaveDraft` or `SendDraft`: a send re-files the draft into
-    /// Sent Items at command time; drafts keep their own Drafts handling).
-    /// A fresh delta re-files any other protected message to the folder
-    /// Graph reports it in (`Store::refile_message`).
-    pub(crate) fn messages_with_a_queued_move(&self) -> Result<Vec<String>, StoreError> {
-        let mut ids = Vec::new();
-        for row in pending_ops_on(&self.conn)? {
-            if !row.op.decides_location() {
-                continue;
-            }
-            if let Some(id) = row.op.message_id() {
-                ids.push(current_id_on(&self.conn, id)?);
-            }
-        }
-        ids.sort();
-        ids.dedup();
-        Ok(ids)
-    }
-
-    /// Files the stored message `id` under `folder_id` and changes nothing
-    /// else (#1910 r7): a fresh delta found it there on Graph, while a
-    /// queued op protects its fields. Whether the row moved (a missing row
-    /// is not inserted).
-    pub(crate) fn refile_message(&self, id: &str, folder_id: &str) -> Result<bool, StoreError> {
-        let n = self.conn.execute(
-            "UPDATE messages SET folder_id = ?2 WHERE id = ?1 AND folder_id IS NOT ?2",
-            params![id, folder_id],
-        )?;
-        Ok(n > 0)
-    }
-
     /// The message ids queued outbox ops name (#1871): every delta that
     /// starts fresh (a head, a small folder's full delta, a backfill page)
-    /// merges none of their fields, as their optimistic local write (a read
-    /// flag, a move, a delete, a draft's fields) has not reached Graph yet.
-    /// Such a delta still re-files one to the folder Graph reports it in
-    /// unless a queued op decides its folder (#1910 r7,
-    /// `messages_with_a_queued_move`), and a deleted one is never put back
-    /// (the re-file only moves an existing row). Calendar
+    /// leaves them alone, as their optimistic local write (a read flag, a
+    /// move, a delete, a draft's fields) has not reached Graph yet. Calendar
     /// event ops name events, not messages, and are left out. Each id is
     /// the one its message is stored under now (`current_id`: an op queued
     /// before a move still protects the re-keyed row, #1896).
@@ -2576,33 +2417,6 @@ impl Store {
     pub fn clear_reconverge_pending(&self) -> Result<(), StoreError> {
         self.conn
             .execute("DELETE FROM meta WHERE key = 'reconverge_pending'", [])?;
-        Ok(())
-    }
-
-    /// Whether the folder tree owes a complete listing (#1910 r6): Graph
-    /// refused a folder write, whose revert may show a parent or name Graph
-    /// does not have. The engine refuses folder deletes until the next
-    /// complete listing clears it. Persisted in `meta`.
-    pub(crate) fn relist_owed(&self) -> Result<bool, StoreError> {
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM meta WHERE key = 'relist_owed')",
-            [],
-            |r| r.get(0),
-        )?)
-    }
-
-    /// Sets or clears [`Store::relist_owed`].
-    pub(crate) fn set_relist_owed(&self, owed: bool) -> Result<(), StoreError> {
-        if owed {
-            self.conn.execute(
-                "INSERT INTO meta (key, value) VALUES ('relist_owed', '1')
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                [],
-            )?;
-        } else {
-            self.conn
-                .execute("DELETE FROM meta WHERE key = 'relist_owed'", [])?;
-        }
         Ok(())
     }
 
@@ -5426,24 +5240,11 @@ pub(crate) enum FolderRefusal {
     /// No stored folder has this id (after `folder_aliases`).
     Unknown(String),
     /// The local drafts sentinel (`local:drafts-pending`), which Graph
-    /// never had: it is never renamed, moved, deleted or a parent.
+    /// never had: it is never renamed, moved or a parent.
     DraftsSentinel,
     /// A move into the folder itself or a folder inside it: the stored
     /// `parent_id` would hold a cycle.
     IntoItself,
-    /// A delete whose subtree holds mail Graph does not have: a `local:`
-    /// message, one a queued `SaveDraft`/`SendDraft` names (a send re-filed
-    /// into Sent Items), or one with an unpushed edit (`local_edit`, #2082).
-    /// The cascade would lose it for good.
-    HoldsUnsentMail,
-    /// A delete while the store may not show what Graph has (the engine
-    /// refuses it, #1910 r5, r6): a mail reconverge is pending (its reads
-    /// not all done), or the folder tree owes a complete listing after a
-    /// refused folder write. A move that failed may have left mail or a
-    /// folder shown out of the folder it is still in on Graph, and the
-    /// reconverge never reads a folder whose delete is queued, so a held
-    /// delete would take it. The host deletes again later.
-    Rereading,
 }
 
 impl std::fmt::Display for FolderRefusal {
@@ -5456,11 +5257,6 @@ impl std::fmt::Display for FolderRefusal {
             FolderRefusal::IntoItself => {
                 f.write_str("a folder cannot move into itself or a folder inside it")
             }
-            FolderRefusal::HoldsUnsentMail => f.write_str("folder holds unsent mail"),
-            FolderRefusal::Rereading => f.write_str(
-                "folders and mail are being read again from the server; \
-                 delete again once that is done",
-            ),
         }
     }
 }
@@ -5485,22 +5281,6 @@ pub(crate) struct LocalFolderDiscard {
     /// The folder unsent mail in them was filed back in (Drafts, or the
     /// drafts sentinel).
     pub refiled_into: Option<String>,
-    /// The queued message moves into them it dropped, oldest first: they
-    /// never reach Graph, so the engine refuses the deletes queued after
-    /// them.
-    pub dropped_moves: Vec<i64>,
-}
-
-/// What `Store::delete_folder` did besides the delete (#1910).
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct FolderDeleteEffects {
-    /// A `local:` folder it removed held a message Graph has elsewhere:
-    /// only a mail reconverge brings it back.
-    pub dropped_mail: bool,
-    /// The queued moves (message or folder) it dropped, oldest first.
-    pub dropped_moves: Vec<i64>,
-    /// The first op it queued: deletes from here on are its own.
-    pub queued_from: Option<i64>,
 }
 
 /// The folders queued folder ops name (#1910), each id resolved through
@@ -5509,7 +5289,6 @@ pub(crate) struct FolderDeleteEffects {
 pub(crate) struct QueuedFolderWrites {
     pub renamed: HashSet<String>,
     pub moved: HashSet<String>,
-    pub deleted: HashSet<String>,
 }
 
 /// Folder writes (#1910). Each command's write is one IMMEDIATE transaction
@@ -5669,153 +5448,6 @@ impl Store {
         Ok(FolderWriteResult::Written(id))
     }
 
-    /// Removes a stored folder and every folder under it, and queues its
-    /// `DeleteFolder` with a snapshot of the removed rows Graph has. Their
-    /// messages go by `ON DELETE CASCADE` (bodies, attachments, search
-    /// rows) and their delta links with the rows, as `retain_folders`
-    /// removes a folder deleted on the server (#1886). Refused, before
-    /// anything is written, when the subtree holds mail Graph does not have
-    /// ([`FolderRefusal::HoldsUnsentMail`]).
-    ///
-    /// [`FolderDeleteEffects`] says whether a `local:` folder it removed
-    /// held a message: one moved there locally, which Graph still has where
-    /// it was, so only a mail reconverge brings it back. The queued message
-    /// ops naming such a message go in the same transaction
-    /// (`drop_local_folder_mail_on`): they could send nothing that matters
-    /// now, and while queued they would keep the reconverge's fresh deltas
-    /// from storing it again. It also lists the queued moves it dropped,
-    /// which never reach Graph: the engine refuses the deletes queued after
-    /// them (the ones before `queued_from`, the first op this call queued).
-    pub(crate) fn delete_folder(
-        &self,
-        id: &str,
-    ) -> Result<(FolderWriteResult, FolderDeleteEffects), StoreError> {
-        let tx = self.write_tx()?;
-        let id = current_folder_id_on(&tx, id)?;
-        let mut effects = FolderDeleteEffects::default();
-        if let Some(r) = check_folder_on(&tx, &id)? {
-            return Ok((FolderWriteResult::Refused(r), effects));
-        }
-        let subtree_ids = subtree_ids_on(&tx, &id)?;
-        let subtree = ids_json(&subtree_ids);
-        if !unsent_mail_in_on(&tx, &subtree_ids)?.is_empty() {
-            return Ok((
-                FolderWriteResult::Refused(FolderRefusal::HoldsUnsentMail),
-                effects,
-            ));
-        }
-        let local = local_folders(subtree_ids.clone());
-        let (dropped_mail, mut dropped_moves) = drop_local_folder_mail_on(&tx, &local)?;
-        effects.dropped_mail = dropped_mail;
-        let removed = {
-            let mut stmt = tx.prepare(
-                "SELECT id, parent_id, display_name, total_count, unread_count,
-                        well_known_name, sort_order, is_expanded
-                 FROM folders
-                 WHERE id IN (SELECT value FROM json_each(?1))
-                   AND substr(id, 1, 6) <> 'local:'
-                 ORDER BY id",
-            )?;
-            stmt.query_map(params![subtree], |r| {
-                Ok(FolderSnapshot {
-                    id: r.get(0)?,
-                    parent_id: r.get(1)?,
-                    display_name: r.get(2)?,
-                    total_count: r.get(3)?,
-                    unread_count: r.get(4)?,
-                    well_known_name: r.get(5)?,
-                    sort_order: r.get(6)?,
-                    is_expanded: r.get::<_, i64>(7)? != 0,
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?
-        };
-        // A folder Graph has that was moved under a removed `local:`
-        // folder has no Graph parent to go with: its move could never be
-        // sent (the dest never reached Graph). It gets a delete of its own,
-        // with its own part of the snapshot, and its queued moves go; its
-        // snapshot row takes the parent Graph has it under, the first
-        // dropped move's `prev_parent`, so a refused delete restores it
-        // there. Any other queued move into a removed `local:` folder goes
-        // too, wherever the moved folder is now (deleted itself, or moved
-        // on): it could only be refused.
-        let roots = delete_roots(&id, &removed, &local);
-        let orphans: Vec<&String> = roots.iter().filter(|r| **r != id).collect();
-        let mut graph_parents: Vec<(String, Option<String>)> = Vec::new();
-        for row in pending_ops_on(&tx)? {
-            let OutboxOp::MoveFolder {
-                id: moved,
-                dest,
-                prev_parent,
-                ..
-            } = &row.op
-            else {
-                continue;
-            };
-            let moved = current_folder_id_on(&tx, moved)?;
-            let into_local = match dest {
-                Some(d) => local.contains(&current_folder_id_on(&tx, d)?),
-                None => false,
-            };
-            let orphan = orphans.contains(&&moved);
-            if orphan && !graph_parents.iter().any(|(m, _)| *m == moved) {
-                let prev = prev_parent
-                    .as_deref()
-                    .map(|p| current_folder_id_on(&tx, p))
-                    .transpose()?;
-                graph_parents.push((moved.clone(), prev));
-            }
-            if orphan || into_local {
-                tx.execute("DELETE FROM outbox WHERE seq = ?1", params![row.seq])?;
-                dropped_moves.push(row.seq);
-            }
-        }
-        let mut removed = removed;
-        for row in &mut removed {
-            if let Some((_, prev)) = graph_parents.iter().find(|(m, _)| *m == row.id) {
-                row.parent_id = prev.clone();
-            }
-        }
-        tx.execute(
-            "DELETE FROM folders WHERE id IN (SELECT value FROM json_each(?1))",
-            params![subtree],
-        )?;
-        let mut parts: Vec<(String, Vec<FolderSnapshot>)> = Vec::new();
-        for (row, root) in removed.into_iter().zip(roots) {
-            match parts.iter_mut().find(|(r, _)| *r == root) {
-                Some((_, rows)) => rows.push(row),
-                None => parts.push((root, vec![row])),
-            }
-        }
-        for (root, rows) in parts.iter().filter(|(r, _)| *r != id) {
-            let seq = enqueue_op_on(
-                &tx,
-                &OutboxOp::DeleteFolder {
-                    id: root.clone(),
-                    removed: rows.clone(),
-                },
-            )?;
-            effects.queued_from.get_or_insert(seq);
-        }
-        let removed = parts
-            .into_iter()
-            .find(|(r, _)| *r == id)
-            .map(|(_, rows)| rows)
-            .unwrap_or_default();
-        let seq = enqueue_op_on(
-            &tx,
-            &OutboxOp::DeleteFolder {
-                id: id.clone(),
-                removed,
-            },
-        )?;
-        effects.queued_from.get_or_insert(seq);
-        dropped_moves.sort_unstable();
-        effects.dropped_moves = dropped_moves;
-        tx.commit()?;
-        Ok((FolderWriteResult::Written(id), effects))
-    }
-
     /// Re-keys a folder created locally to the id Graph gave it (#1910), in
     /// one transaction (`rekey_folder_on`): its messages and child folders
     /// follow, and every other column (name and parent as stored, which a
@@ -5884,14 +5516,14 @@ impl Store {
     /// folders reached from it through `local:` parents
     /// (`local_subtree_ids_on`), queueing nothing. A folder Graph has that
     /// was moved under it locally is left, with everything under that
-    /// folder: its own queued move is refused next and reverts it. Mail Graph does not have (`unsent_mail_in_on`: a
-    /// draft moved there) is first filed back in Drafts (or the drafts
-    /// sentinel before Drafts is stored), its own `SaveDraft`/`SendDraft`
-    /// still queued. Any other message that went with them was moved there
-    /// locally and only a mail reconverge brings it back
-    /// ([`LocalFolderDiscard::had_mail`]); the queued message ops naming it
-    /// go too, as in `delete_folder`. An id that is not `local:`, or the
-    /// drafts sentinel, removes nothing.
+    /// folder: its own queued move is refused next and reverts it. Mail
+    /// Graph does not have (`unsent_mail_in_on`: a draft moved there) is
+    /// first filed back in Drafts (or the drafts sentinel before Drafts is
+    /// stored), its own `SaveDraft`/`SendDraft` still queued. Any other
+    /// message that went with them was moved there locally and only a mail
+    /// reconverge brings it back ([`LocalFolderDiscard::had_mail`]); the
+    /// queued message ops naming it go too (`drop_local_folder_mail_on`).
+    /// An id that is not `local:`, or the drafts sentinel, removes nothing.
     pub(crate) fn discard_local_folder(&self, id: &str) -> Result<LocalFolderDiscard, StoreError> {
         let mut out = LocalFolderDiscard::default();
         if !id.starts_with("local:") || id == LOCAL_DRAFTS_SENTINEL_FOLDER_ID {
@@ -5909,9 +5541,7 @@ impl Store {
             )?;
             out.refiled_into = Some(drafts);
         }
-        let (had_mail, dropped_moves) = drop_local_folder_mail_on(&tx, &local)?;
-        out.had_mail = had_mail;
-        out.dropped_moves = dropped_moves;
+        out.had_mail = drop_local_folder_mail_on(&tx, &local)?;
         let local = ids_json(&local);
         tx.execute(
             "DELETE FROM folders WHERE id IN (SELECT value FROM json_each(?1))",
@@ -5962,53 +5592,14 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// Puts back the folder rows a refused delete removed (#1910), with
-    /// their `sort_order` and `is_expanded`; a row stored again since (a
-    /// listing) is left. No delta link: the next pass's delta brings their
-    /// messages back from Graph, which still has them. Whether any came
-    /// back.
-    pub(crate) fn restore_folders(&self, rows: &[FolderSnapshot]) -> Result<bool, StoreError> {
-        let tx = self.write_tx()?;
-        let mut restored = false;
-        for f in rows {
-            restored |= tx.execute(
-                "INSERT OR IGNORE INTO folders
-                     (id, parent_id, display_name, total_count, unread_count,
-                      well_known_name, sort_order, is_expanded)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    f.id,
-                    f.parent_id,
-                    f.display_name,
-                    f.total_count,
-                    f.unread_count,
-                    f.well_known_name,
-                    f.sort_order,
-                    f.is_expanded as i64
-                ],
-            )? > 0;
-        }
-        tx.commit()?;
-        Ok(restored)
-    }
-
-    /// The folders a queued rename, move or delete names (#1910), resolved
-    /// through `folder_aliases`. `deleted` also holds every folder a queued
-    /// delete removed with it (its `removed` snapshot): one moved under the
-    /// deleted folder locally is listed under its old parent until its
-    /// move reaches Graph.
+    /// The folders a queued rename or move names (#1910), resolved through
+    /// `folder_aliases`.
     pub(crate) fn queued_folder_writes(&self) -> Result<QueuedFolderWrites, StoreError> {
         let mut q = QueuedFolderWrites::default();
         for row in pending_ops_on(&self.conn)? {
             let (id, set) = match row.op {
                 OutboxOp::RenameFolder { id, .. } => (id, &mut q.renamed),
                 OutboxOp::MoveFolder { id, .. } => (id, &mut q.moved),
-                OutboxOp::DeleteFolder { id, removed } => {
-                    for f in removed {
-                        q.deleted.insert(current_folder_id_on(&self.conn, &f.id)?);
-                    }
-                    (id, &mut q.deleted)
-                }
                 _ => continue,
             };
             set.insert(current_folder_id_on(&self.conn, &id)?);
@@ -6020,8 +5611,8 @@ impl Store {
 /// The messages filed in `folders` that Graph does not have (#1910): a
 /// `local:` id, an unpushed edit (`local_edit > 0`, #2082), or one a queued
 /// `SaveDraft`/`SendDraft` names (resolved through `current_id`; a send
-/// re-files its draft into Sent Items at command time). A delete refuses
-/// to cascade them; a refused create files them back in Drafts.
+/// re-files its draft into Sent Items at command time). A refused create
+/// files them back in Drafts.
 fn unsent_mail_in_on(conn: &Connection, folders: &[String]) -> Result<Vec<String>, StoreError> {
     if folders.is_empty() {
         return Ok(Vec::new());
@@ -6067,67 +5658,17 @@ fn local_subtree_ids_on(conn: &Connection, id: &str) -> Result<Vec<String>, Stor
     Ok(ids)
 }
 
-/// For each row of a delete's snapshot (`removed`, rows Graph has), the
-/// folder whose `DeleteFolder` carries it (#1910): `target`, or the
-/// highest folder above the row whose stored parent is a removed `local:`
-/// folder (one moved under it here), which has no Graph parent to go with.
-fn delete_roots(target: &str, removed: &[FolderSnapshot], local: &[String]) -> Vec<String> {
-    removed
-        .iter()
-        .map(|row| {
-            let mut at = row;
-            // Bounded by the snapshot's size, so a cycle cannot hang it.
-            for _ in 0..removed.len() {
-                if at.id == target {
-                    break;
-                }
-                let Some(parent) = at.parent_id.as_deref() else {
-                    break;
-                };
-                if local.iter().any(|l| l == parent) {
-                    break;
-                }
-                match removed.iter().find(|f| f.id == parent) {
-                    Some(p) => at = p,
-                    None => break,
-                }
-            }
-            if at.id != target
-                && at
-                    .parent_id
-                    .as_deref()
-                    .is_some_and(|p| local.iter().any(|l| l == p))
-            {
-                at.id.clone()
-            } else {
-                target.to_string()
-            }
-        })
-        .collect()
-}
-
-/// The `local:` folders (created here, not on Graph yet) among `ids`,
-/// never the drafts sentinel.
-fn local_folders(ids: Vec<String>) -> Vec<String> {
-    ids.into_iter()
-        .filter(|f| f.starts_with("local:") && f != LOCAL_DRAFTS_SENTINEL_FOLDER_ID)
-        .collect()
-}
-
-/// Before the `local:` folders `local` are removed (#1910): whether they
-/// hold a message. Every queued message move into one of them is dropped
-/// (it could only send nothing), and when they hold mail, so is every
-/// other queued message op naming it. Such a message was moved there
-/// locally and Graph still has it where it was; a mail reconverge brings
-/// it back, which a queued op naming it would block (a fresh delta skips
-/// every id a queued op names). A draft's own save or send is kept.
-fn drop_local_folder_mail_on(
-    conn: &Connection,
-    local: &[String],
-) -> Result<(bool, Vec<i64>), StoreError> {
-    let mut dropped_moves = Vec::new();
+/// Before the `local:` folders `local` are removed (#1910, a refused
+/// create): whether they hold a message. Every queued message move into
+/// one of them is dropped (it could only send nothing), and when they hold
+/// mail, so is every other queued message op naming it. Such a message was
+/// moved there locally and Graph still has it where it was; a mail
+/// reconverge brings it back, which a queued op naming it would block (a
+/// fresh delta skips every id a queued op names). A draft's own save or
+/// send is kept.
+fn drop_local_folder_mail_on(conn: &Connection, local: &[String]) -> Result<bool, StoreError> {
     if local.is_empty() {
-        return Ok((false, dropped_moves));
+        return Ok(false);
     }
     let local_json = ids_json(local);
     let had_mail: bool = conn.query_row(
@@ -6140,8 +5681,8 @@ fn drop_local_folder_mail_on(
     // Drafts first, or a message moved on since).
     for row in pending_ops_on(conn)? {
         // A draft's own save or send is kept: unsent mail never reaches
-        // here (a delete refuses it, a refused create files it back in
-        // Drafts first), and its op must still create it on Graph.
+        // here (a refused create files it back in Drafts first), and its
+        // op must still create it on Graph.
         if matches!(
             row.op,
             OutboxOp::SaveDraft { .. } | OutboxOp::SendDraft { .. }
@@ -6169,12 +5710,9 @@ fn drop_local_folder_mail_on(
             .optional()?;
         if into_local || (had_mail && folder.is_some_and(|f| local.contains(&f))) {
             conn.execute("DELETE FROM outbox WHERE seq = ?1", params![row.seq])?;
-            if matches!(row.op, OutboxOp::Move { .. }) {
-                dropped_moves.push(row.seq);
-            }
         }
     }
-    Ok((had_mail, dropped_moves))
+    Ok(had_mail)
 }
 
 /// `Store::current_folder_id` on `conn`.
@@ -20146,16 +19684,6 @@ mod folder_write_tests {
 
     #[test]
     fn folder_ops_round_trip_json() {
-        let snapshot = FolderSnapshot {
-            id: "A".into(),
-            parent_id: Some("INBOX".into()),
-            display_name: "A \"x\"".into(),
-            total_count: 4,
-            unread_count: 2,
-            well_known_name: Some("archive".into()),
-            sort_order: Some(3),
-            is_expanded: true,
-        };
         for op in [
             OutboxOp::CreateFolder {
                 id: "local:1".into(),
@@ -20184,19 +19712,6 @@ mod folder_write_tests {
                 parent: None,
                 prev_parent: None,
             },
-            OutboxOp::DeleteFolder {
-                id: "A".into(),
-                removed: vec![
-                    snapshot.clone(),
-                    FolderSnapshot {
-                        parent_id: None,
-                        well_known_name: None,
-                        sort_order: None,
-                        is_expanded: false,
-                        ..snapshot.clone()
-                    },
-                ],
-            },
         ] {
             let text = op.to_json().to_string();
             let back = OutboxOp::from_json(&json::parse(&text).unwrap());
@@ -20211,7 +19726,6 @@ mod folder_write_tests {
         assert!(local.starts_with("local:"), "{local}");
         written(s.rename_folder("A", "A2").unwrap());
         written(s.move_folder("B", Some("ARCH")).unwrap());
-        written(s.delete_folder("ARCH").unwrap().0);
         assert_eq!(
             ops(&s),
             [
@@ -20231,31 +19745,6 @@ mod folder_write_tests {
                     parent: Some("ARCH".into()),
                     prev_parent: Some("A".into()),
                 },
-                OutboxOp::DeleteFolder {
-                    id: "ARCH".into(),
-                    removed: vec![
-                        FolderSnapshot {
-                            id: "ARCH".into(),
-                            parent_id: Some("ROOT".into()),
-                            display_name: "ARCH".into(),
-                            total_count: 0,
-                            unread_count: 0,
-                            well_known_name: None,
-                            sort_order: None,
-                            is_expanded: false,
-                        },
-                        FolderSnapshot {
-                            id: "B".into(),
-                            parent_id: Some("ARCH".into()),
-                            display_name: "B".into(),
-                            total_count: 0,
-                            unread_count: 0,
-                            well_known_name: None,
-                            sort_order: None,
-                            is_expanded: false,
-                        },
-                    ],
-                },
             ]
         );
         let new = row(&s, &local).unwrap();
@@ -20266,8 +19755,6 @@ mod folder_write_tests {
             QueuedFolderWrites {
                 renamed: ["A".to_string()].into(),
                 moved: ["B".to_string()].into(),
-                // B was moved under ARCH: the delete took it too.
-                deleted: ["ARCH".to_string(), "B".to_string()].into(),
             }
         );
     }
@@ -20303,12 +19790,10 @@ mod folder_write_tests {
         assert_eq!(s.rename_folder("NOPE", "x").unwrap(), unknown());
         assert_eq!(s.move_folder("NOPE", None).unwrap(), unknown());
         assert_eq!(s.move_folder("A", Some("NOPE")).unwrap(), unknown());
-        assert_eq!(s.delete_folder("NOPE").unwrap().0, unknown());
         assert_eq!(s.create_local_folder(Some(&sentinel), "x").unwrap(), drafts);
         assert_eq!(s.rename_folder(&sentinel, "x").unwrap(), drafts);
         assert_eq!(s.move_folder(&sentinel, Some("A")).unwrap(), drafts);
         assert_eq!(s.move_folder("A", Some(&sentinel)).unwrap(), drafts);
-        assert_eq!(s.delete_folder(&sentinel).unwrap().0, drafts);
         assert!(ops(&s).is_empty());
         let kept = row(&s, &sentinel).unwrap();
         assert_ne!(kept.display_name, "x");
@@ -20359,148 +19844,44 @@ mod folder_write_tests {
     }
 
     #[test]
-    fn delete_folder_removes_subtree_messages_and_delta_links() {
+    fn discarding_a_local_folder_drops_the_ops_of_mail_moved_into_it() {
+        // L, created here (its create refused), holds M, moved in from
+        // INBOX, which Graph still has there.
         let s = mailbox();
-        let local = written(s.create_local_folder(Some("B"), "L").unwrap());
-        for id in ["A", "B"] {
-            s.set_delta_link(id, "LINK").unwrap();
+        let local = written(s.create_local_folder(Some("ARCH"), "L").unwrap());
+        message(&s, "M", &local);
+        message(&s, "N", "INBOX");
+        for op in [
+            OutboxOp::MarkRead {
+                id: "M".into(),
+                read: true,
+            },
+            OutboxOp::Move {
+                id: "M".into(),
+                dest: local.clone(),
+            },
+            OutboxOp::SetFlag {
+                id: "N".into(),
+                flagged: true,
+            },
+        ] {
+            s.enqueue_op(&op).unwrap();
         }
-        message(&s, "m-a", "A");
-        message(&s, "m-b", "B");
-        message(&s, "m-inbox", "INBOX");
-        s.set_folder_expanded("B", true).unwrap();
-        written(s.delete_folder("A").unwrap().0);
-        for id in ["A", "B", local.as_str()] {
-            assert!(row(&s, id).is_none(), "{id} removed");
-        }
-        assert_eq!(folder_of(&s, "m-a"), None);
-        assert_eq!(folder_of(&s, "m-b"), None);
-        assert_eq!(folder_of(&s, "m-inbox").as_deref(), Some("INBOX"));
-        let Some(OutboxOp::DeleteFolder { id, removed }) = ops(&s).pop() else {
-            panic!("no delete queued")
-        };
-        assert_eq!(id, "A");
-        let ids: Vec<&str> = removed.iter().map(|f| f.id.as_str()).collect();
-        assert_eq!(ids, ["A", "B"], "the local: folder is not snapshot");
-
-        // A refused delete puts the rows back with their local state, and
-        // without a delta link.
-        assert!(s.restore_folders(&removed).unwrap());
-        let b = row(&s, "B").unwrap();
-        assert_eq!(b.parent_id.as_deref(), Some("A"));
-        assert!(b.is_expanded);
-        assert_eq!(b.delta_link, None);
-        assert!(row(&s, "A").is_some());
-        assert!(!s.restore_folders(&removed).unwrap(), "already back");
-    }
-
-    #[test]
-    fn delete_folder_holding_unsent_mail_is_refused() {
-        let unsent = FolderWriteResult::Refused(FolderRefusal::HoldsUnsentMail);
-        // A local draft, in a folder under the one deleted.
-        let s = mailbox();
-        message(&s, "local:d1", "B");
-        assert_eq!(s.delete_folder("A").unwrap().0, unsent);
-        // A send queued: SendDraft re-filed the draft into this folder.
-        let s = mailbox();
-        message(&s, "G1", "ARCH");
-        s.enqueue_op(&OutboxOp::SendDraft { id: "G1".into() })
-            .unwrap();
-        assert_eq!(s.delete_folder("ARCH").unwrap().0, unsent);
-        // A queued save by the `local:` id a draft was reconciled from.
-        let s = mailbox();
-        message(&s, "G2", "ARCH");
-        s.conn
-            .execute(
-                "UPDATE messages SET local_id = 'local:x' WHERE id = 'G2'",
-                [],
-            )
-            .unwrap();
-        s.enqueue_op(&OutboxOp::SaveDraft {
-            id: "local:x".into(),
-        })
-        .unwrap();
-        assert_eq!(s.delete_folder("ARCH").unwrap().0, unsent);
-        // An unpushed edit (#2082).
-        let s = mailbox();
-        message(&s, "G3", "ARCH");
-        s.conn
-            .execute("UPDATE messages SET local_edit = 2 WHERE id = 'G3'", [])
-            .unwrap();
-        assert_eq!(s.delete_folder("ARCH").unwrap().0, unsent);
-        assert!(row(&s, "ARCH").is_some());
-        assert_eq!(folder_of(&s, "G3").as_deref(), Some("ARCH"));
-        assert_eq!(ops(&s).len(), 0);
-        // Mail Graph has, with other ops queued, is no reason.
-        let s = mailbox();
-        message(&s, "G4", "ARCH");
-        s.enqueue_op(&OutboxOp::MarkRead {
-            id: "G4".into(),
-            read: true,
-        })
-        .unwrap();
-        written(s.delete_folder("ARCH").unwrap().0);
-    }
-
-    #[test]
-    fn deleting_a_local_folder_drops_the_ops_of_mail_moved_into_it() {
-        // L, created here, holds M (moved in from INBOX) and sits under
-        // ARCH; deleting L, or ARCH, takes M, which Graph still has in INBOX.
-        for target in ["L", "ARCH"] {
-            let s = mailbox();
-            let local = written(s.create_local_folder(Some("ARCH"), "L").unwrap());
-            message(&s, "M", &local);
-            message(&s, "N", "INBOX");
-            for op in [
-                OutboxOp::MarkRead {
-                    id: "M".into(),
-                    read: true,
-                },
-                OutboxOp::Move {
-                    id: "M".into(),
-                    dest: local.clone(),
-                },
-                OutboxOp::SetFlag {
-                    id: "N".into(),
-                    flagged: true,
-                },
-            ] {
-                s.enqueue_op(&op).unwrap();
-            }
-            let id = if target == "L" {
-                local.as_str()
-            } else {
-                "ARCH"
-            };
-            let (result, dropped) = s.delete_folder(id).unwrap();
-            written(result);
-            assert!(dropped.dropped_mail, "{target}: M went with {local}");
-            assert_eq!(dropped.dropped_moves.len(), 1, "{target}: M's move into L");
-            assert!(folder_of(&s, "M").is_none());
-            let left: Vec<&'static str> = ops(&s).iter().map(|op| op.kind()).collect();
-            assert_eq!(
-                left,
-                ["createFolder", "setFlag", "deleteFolder"],
-                "{target}: M's ops go, N's stays"
-            );
-        }
+        let discard = s.discard_local_folder(&local).unwrap();
+        assert!(discard.had_mail, "M went with L");
+        assert!(folder_of(&s, "M").is_none());
+        let left: Vec<&'static str> = ops(&s).iter().map(|op| op.kind()).collect();
+        assert_eq!(left, ["createFolder", "setFlag"], "M's ops go, N's stays");
         // A local folder with no mail drops nothing.
         let s = mailbox();
         let local = written(s.create_local_folder(None, "Empty").unwrap());
-        let (result, dropped) = s.delete_folder(&local).unwrap();
-        written(result);
-        assert!(!dropped.dropped_mail);
-        // Nor does a Graph folder's own mail.
-        let s = mailbox();
-        message(&s, "A1", "A");
         s.enqueue_op(&OutboxOp::MarkRead {
-            id: "A1".into(),
+            id: "N".into(),
             read: true,
         })
         .unwrap();
-        let (_, dropped) = s.delete_folder("A").unwrap();
-        assert!(!dropped.dropped_mail);
-        assert_eq!(ops(&s).len(), 2, "its op is kept");
+        assert!(!s.discard_local_folder(&local).unwrap().had_mail);
+        assert_eq!(ops(&s).len(), 2, "N's op is kept");
     }
 
     #[test]
@@ -20539,9 +19920,6 @@ mod folder_write_tests {
             LocalFolderDiscard {
                 had_mail: true,
                 refiled_into: Some(LOCAL_DRAFTS_SENTINEL_FOLDER_ID.to_string()),
-                // Both moves into L (seq 4 and 5, after the two creates and
-                // the save).
-                dropped_moves: vec![4, 5],
             }
         );
         assert_eq!(
@@ -20582,195 +19960,6 @@ mod folder_write_tests {
             !ops(&s).iter().any(|op| matches!(op, OutboxOp::Move { .. })),
             "the move into L goes although no other mail was there"
         );
-    }
-
-    #[test]
-    fn a_graph_folder_moved_under_a_deleted_local_folder_gets_its_own_delete() {
-        // OTHER (with a child) is moved under L, which is under ARCH;
-        // deleting L, or ARCH, cannot send OTHER's move: OTHER gets a
-        // delete of its own.
-        for target in ["L", "ARCH"] {
-            let s = mailbox();
-            s.upsert_folder(&listed("OTHER", Some("ROOT"), "OTHER"))
-                .unwrap();
-            s.upsert_folder(&listed("OKID", Some("OTHER"), "OKID"))
-                .unwrap();
-            let local = written(s.create_local_folder(Some("ARCH"), "L").unwrap());
-            written(s.move_folder("OTHER", Some(&local)).unwrap());
-            let id = if target == "L" {
-                local.clone()
-            } else {
-                "ARCH".into()
-            };
-            written(s.delete_folder(&id).unwrap().0);
-            let deletes: Vec<(String, Vec<String>)> = ops(&s)
-                .into_iter()
-                .filter_map(|op| match op {
-                    OutboxOp::DeleteFolder { id, removed } => {
-                        Some((id, removed.into_iter().map(|f| f.id).collect()))
-                    }
-                    _ => None,
-                })
-                .collect();
-            let own: Vec<String> = if target == "ARCH" {
-                vec!["ARCH".into()]
-            } else {
-                vec![]
-            };
-            assert_eq!(
-                deletes,
-                [
-                    (
-                        "OTHER".to_string(),
-                        vec!["OKID".to_string(), "OTHER".to_string()]
-                    ),
-                    (id.clone(), own)
-                ],
-                "{target}"
-            );
-            // A refusal restores OTHER under the parent Graph has it under.
-            let Some(OutboxOp::DeleteFolder { removed, .. }) = ops(&s)
-                .into_iter()
-                .find(|op| matches!(op, OutboxOp::DeleteFolder { id, .. } if id == "OTHER"))
-            else {
-                unreachable!()
-            };
-            let parents: Vec<(String, Option<String>)> =
-                removed.into_iter().map(|f| (f.id, f.parent_id)).collect();
-            assert_eq!(
-                parents,
-                [
-                    ("OKID".to_string(), Some("OTHER".to_string())),
-                    ("OTHER".to_string(), Some("ROOT".to_string()))
-                ],
-                "{target}"
-            );
-            assert!(
-                !ops(&s)
-                    .iter()
-                    .any(|op| matches!(op, OutboxOp::MoveFolder { .. })),
-                "{target}: OTHER's move goes"
-            );
-            let deleted = s.queued_folder_writes().unwrap().deleted;
-            assert!(deleted.contains("OTHER") && deleted.contains("OKID"));
-        }
-    }
-
-    #[test]
-    fn deleting_a_local_folder_drops_every_move_into_it() {
-        // (a) OTHER moved under L, then deleted itself, then L deleted.
-        let s = mailbox();
-        s.upsert_folder(&listed("OTHER", Some("ROOT"), "OTHER"))
-            .unwrap();
-        let local = written(s.create_local_folder(None, "L").unwrap());
-        written(s.move_folder("OTHER", Some(&local)).unwrap());
-        written(s.delete_folder("OTHER").unwrap().0);
-        written(s.delete_folder(&local).unwrap().0);
-        assert!(
-            !ops(&s)
-                .iter()
-                .any(|op| matches!(op, OutboxOp::MoveFolder { .. })),
-            "(a) {:?}",
-            ops(&s)
-        );
-        // (b) OTHER moved under L, then on under ARCH, then L deleted: only
-        // the move into L goes.
-        let s = mailbox();
-        s.upsert_folder(&listed("OTHER", Some("ROOT"), "OTHER"))
-            .unwrap();
-        let local = written(s.create_local_folder(None, "L").unwrap());
-        written(s.move_folder("OTHER", Some(&local)).unwrap());
-        written(s.move_folder("OTHER", Some("ARCH")).unwrap());
-        written(s.delete_folder(&local).unwrap().0);
-        let moves: Vec<Option<String>> = ops(&s)
-            .into_iter()
-            .filter_map(|op| match op {
-                OutboxOp::MoveFolder { dest, .. } => Some(dest),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(moves, [Some("ARCH".to_string())], "(b)");
-        assert_eq!(row(&s, "OTHER").unwrap().parent_id.as_deref(), Some("ARCH"));
-    }
-
-    #[test]
-    fn queued_moves_and_drafts_decide_a_folder_and_refile_moves_only_the_folder() {
-        let s = mailbox();
-        for id in ["M1", "M2", "D1", "D2", "F1"] {
-            message(&s, id, "INBOX");
-        }
-        message(&s, "local:d", "INBOX");
-        s.conn
-            .execute(
-                "UPDATE messages SET local_id = 'local:x' WHERE id = 'D2'",
-                [],
-            )
-            .unwrap();
-        for op in [
-            OutboxOp::Move {
-                id: "M1".into(),
-                dest: "ARCH".into(),
-            },
-            OutboxOp::SendDraft { id: "D1".into() },
-            OutboxOp::SaveDraft {
-                id: "local:x".into(),
-            },
-            OutboxOp::SetFlag {
-                id: "F1".into(),
-                flagged: true,
-            },
-        ] {
-            s.enqueue_op(&op).unwrap();
-        }
-        assert_eq!(
-            s.messages_with_a_queued_move().unwrap(),
-            ["D1", "D2", "M1"],
-            "a flag does not decide the folder; a reconciled draft resolves"
-        );
-        s.conn
-            .execute("UPDATE messages SET is_flagged = 1 WHERE id = 'F1'", [])
-            .unwrap();
-        assert!(s.refile_message("F1", "ARCH").unwrap());
-        assert!(!s.refile_message("F1", "ARCH").unwrap(), "already there");
-        assert!(!s.refile_message("GONE", "ARCH").unwrap(), "never inserted");
-        assert!(!s.message_exists("GONE").unwrap());
-        assert_eq!(folder_of(&s, "F1").as_deref(), Some("ARCH"));
-        let flagged: bool = s
-            .conn
-            .query_row("SELECT is_flagged FROM messages WHERE id = 'F1'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert!(flagged, "nothing but the folder changes");
-    }
-
-    #[test]
-    fn relist_owed_survives_reopening_the_store() {
-        let dir = std::env::temp_dir().join(format!(
-            "mailcore-relist-owed-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("mail.db");
-        assert!(!Store::open(&path).unwrap().relist_owed().unwrap());
-        Store::open(&path).unwrap().set_relist_owed(true).unwrap();
-        assert!(Store::open(&path).unwrap().relist_owed().unwrap());
-        Store::open(&path).unwrap().set_relist_owed(false).unwrap();
-        assert!(!Store::open(&path).unwrap().relist_owed().unwrap());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_queued_delete_names_every_folder_it_removed() {
-        let s = mailbox();
-        written(s.move_folder("ARCH", Some("B")).unwrap());
-        written(s.delete_folder("A").unwrap().0);
-        let deleted = s.queued_folder_writes().unwrap().deleted;
-        let mut deleted: Vec<String> = deleted.into_iter().collect();
-        deleted.sort();
-        assert_eq!(deleted, ["A", "ARCH", "B"]);
     }
 
     #[test]
@@ -20820,10 +20009,10 @@ mod folder_write_tests {
     }
 
     #[test]
-    fn reconcile_of_a_deleted_row_still_aliases() {
+    fn reconcile_of_a_row_gone_still_aliases() {
         let s = mailbox();
         let local = written(s.create_local_folder(None, "New").unwrap());
-        written(s.delete_folder(&local).unwrap().0);
+        s.discard_local_folder(&local).unwrap();
         assert!(
             !s.reconcile_created_folder(&local, &listed("G1", Some("ROOT"), "New"))
                 .unwrap()

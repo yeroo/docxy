@@ -801,7 +801,7 @@ impl App {
             | SyncEvent::ContactCreated { .. }
             | SyncEvent::ContactWriteFailed { .. }
             // lookxy has no folder management, so it never creates,
-            // renames, moves or deletes a folder (#1910).
+            // renames or moves a folder (#1910).
             | SyncEvent::FolderCreated { .. }
             | SyncEvent::FolderWriteFailed { .. }
             | SyncEvent::FolderProgress { .. }

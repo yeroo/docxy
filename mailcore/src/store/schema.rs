@@ -205,7 +205,7 @@ CREATE TABLE IF NOT EXISTS contact_aliases (
 -- with a new id for. An op or a host holding the old id still reaches it
 -- (`Store::current_folder_id`). Every alias names the newest id (a re-key
 -- re-points the aliases to the old id), so one lookup resolves. No foreign
--- key: an alias outlives the row, so a delete queued by the old id still
+-- key: an alias outlives the row, so an op queued by the old id still
 -- reaches the Graph folder.
 CREATE TABLE IF NOT EXISTS folder_aliases (
     old_id TEXT PRIMARY KEY,

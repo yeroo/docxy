@@ -54,11 +54,6 @@ pub enum Applied {
     /// A `MoveFolder`'s answer changed the stored folder (its parent, or a
     /// new id, #1910): the caller emits `FoldersUpdated`.
     FoldersChanged,
-    /// A message `Move` or a `MoveFolder` sent nothing (#1910): its folder,
-    /// or its dest, never reached Graph. The op is done, but the move never
-    /// happened there: the caller refuses the folder deletes queued after
-    /// it.
-    MoveNotSent,
 }
 
 /// The id the message `id` names is stored under now (#1884, #1896).
@@ -79,14 +74,14 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Ap
             let old_id = resolve(store, id)?;
             // A folder created locally is sent under its Graph id (#1910).
             // One still `local:` never reached Graph: nothing is sent. The
-            // store drops such a move when it removes the folder (its
-            // create refused, or the folder deleted before its create was
-            // sent), filing a draft moved there back in Drafts and starting
-            // a mail reconverge for other mail, which brings it back where
-            // Graph has it; this is the guard for a move it missed.
+            // store drops such a move when it discards the folder (its
+            // create refused), filing a draft moved there back in Drafts
+            // and starting a mail reconverge for other mail, which brings
+            // it back where Graph has it; this is the guard for a move it
+            // missed.
             let dest = store.current_folder_id(dest).map_err(store_err)?;
             if dest.starts_with("local:") {
-                return Ok(Applied::MoveNotSent);
+                return Ok(Applied::Done);
             }
             let new_id = client.move_message(&old_id, &dest)?;
             Ok(Applied::Moved { old_id, new_id })
@@ -141,9 +136,9 @@ fn graph_folder(store: &Store, id: &str) -> Result<Option<String>, GraphError> {
 
 /// `CreateFolder` (#1910): POST the op's name under its parent (resolved
 /// now; one still `local:` never reached Graph, so this create is refused
-/// as `Parse`), then re-key the row. A row deleted before the drain sends
-/// nothing, nor does an id that already resolves to a Graph id (a retry
-/// after the re-key).
+/// as `Parse`), then re-key the row. A row gone before the drain (a refused
+/// create discarded it) sends nothing, nor does an id that already resolves
+/// to a Graph id (a retry after the re-key).
 fn create_folder(
     client: &GraphClient,
     store: &Store,
@@ -177,12 +172,7 @@ fn create_folder(
 /// `MoveFolder` (#1910): POST the move with the dest resolved now, then
 /// store Graph's answer (`Store::apply_moved_folder`). A dest still
 /// `local:` is refused as `Parse`: its create was refused (the refusal
-/// reverts this move). A delete of a `local:` dest drops every move into
-/// it (`Store::delete_folder`), and a moved folder still under it gets a
-/// delete of its own. A folder still `local:` sends nothing. One whose row
-/// is gone is still moved: a delete of the Graph folder it was moved under
-/// took it, and that delete, queued after this move, must find it there on
-/// Graph too.
+/// reverts this move). A folder still `local:`, or gone, sends nothing.
 fn move_folder(
     client: &GraphClient,
     store: &Store,
@@ -190,10 +180,9 @@ fn move_folder(
     dest: Option<&str>,
     parent: Option<&str>,
 ) -> Result<Applied, GraphError> {
-    let target = store.current_folder_id(id).map_err(store_err)?;
-    if target.starts_with("local:") {
-        return Ok(Applied::MoveNotSent);
-    }
+    let Some(target) = graph_folder(store, id)? else {
+        return Ok(Applied::Done);
+    };
     let dest = dest
         .map(|d| store.current_folder_id(d).map_err(store_err))
         .transpose()?;
@@ -228,19 +217,6 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
             Some(id) => client.rename_folder(&id, name),
             None => Ok(()),
         },
-        // A 404 is done: the folder is gone either way. A folder never
-        // re-keyed (still `local:`) never reached Graph; its row is gone
-        // already, so the id is all there is to resolve.
-        OutboxOp::DeleteFolder { id, .. } => {
-            let id = store.current_folder_id(id).map_err(store_err)?;
-            if id.starts_with("local:") {
-                return Ok(());
-            }
-            match client.delete_folder(&id) {
-                Err(GraphError::NotFound) => Ok(()),
-                r => r,
-            }
-        }
         OutboxOp::Delete { id } => {
             // A reconciled draft's `local:` id is deleted under its Graph id
             // (#1884), a moved message's old id under its new one (#1896).
@@ -4236,13 +4212,8 @@ mod tests {
 
         let gone = written(store.create_local_folder(None, "Gone").unwrap());
         let op = last_op(&store);
-        written(store.delete_folder(&gone).unwrap().0);
+        store.discard_local_folder(&gone).unwrap();
         assert_eq!(apply_op(&c, &store, &op).unwrap(), Applied::Done);
-        assert_eq!(
-            apply_op(&c, &store, &last_op(&store)).unwrap(),
-            Applied::Done,
-            "its delete neither"
-        );
         assert!(srv.requests().is_empty());
     }
 
@@ -4278,10 +4249,9 @@ mod tests {
         let rename = last_op(&store);
         written(store.move_folder(&local, Some("ARCH")).unwrap());
         let mv = last_op(&store);
-        // Before the create reached Graph neither sends anything; the move
-        // says so (the engine refuses the deletes queued after it).
+        // Before the create reached Graph neither sends anything.
         assert_eq!(apply_op(&c, &store, &rename).unwrap(), Applied::Done);
-        assert_eq!(apply_op(&c, &store, &mv).unwrap(), Applied::MoveNotSent);
+        assert_eq!(apply_op(&c, &store, &mv).unwrap(), Applied::Done);
         assert!(srv.requests().is_empty());
 
         store
@@ -4328,19 +4298,6 @@ mod tests {
     }
 
     #[test]
-    fn delete_folder_404_is_success() {
-        let srv = FakeServer::start(vec![route("DELETE", "/me/mailFolders/ARCH", 404, "{}")]);
-        let c = GraphClient::new(&srv.base_url, "AT");
-        let store = folder_store();
-        written(store.delete_folder("ARCH").unwrap().0);
-        assert_eq!(
-            apply_op(&c, &store, &last_op(&store)).unwrap(),
-            Applied::Done
-        );
-        assert_eq!(srv.requests()[0].method, "DELETE");
-    }
-
-    #[test]
     fn message_move_into_a_created_folder_sends_its_graph_id() {
         let srv = FakeServer::start(vec![route(
             "POST",
@@ -4356,7 +4313,7 @@ mod tests {
             dest: local.clone(),
         };
         // Its create never reached Graph: nothing is sent.
-        assert_eq!(apply_op(&c, &store, &mv).unwrap(), Applied::MoveNotSent);
+        assert_eq!(apply_op(&c, &store, &mv).unwrap(), Applied::Done);
         assert!(srv.requests().is_empty());
         store
             .reconcile_created_folder(&local, &mail_folder("G1", Some("ROOT")))

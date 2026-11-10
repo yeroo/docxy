@@ -973,14 +973,6 @@ impl GraphClient {
         parse_folder_answer(resp, "moved folder")
     }
 
-    /// `DELETE /me/mailFolders/{id}` (#1910). A 404 is `NotFound`, as every
-    /// call returns it: the outbox treats it as done.
-    pub fn delete_folder(&self, id: &str) -> Result<(), GraphError> {
-        let path = format!("/me/mailFolders/{}", encode_path_segment(id));
-        self.send(Method::Delete, &path, None, &[])?;
-        Ok(())
-    }
-
     /// GET a folder's `/messages/delta` (a first call, `DeltaCursor::Head`
     /// or `DeltaCursor::Full`) or a stored `nextLink`/`deltaLink`
     /// (`DeltaCursor::Link`), requesting pages of 50 via
@@ -6320,26 +6312,6 @@ mod tests {
         assert_eq!(reqs[0].path, "/me/mailFolders/F1/move");
         assert_eq!(reqs[0].body, r#"{"destinationId":"D1"}"#);
         assert_eq!(reqs[1].body, r#"{"destinationId":"msgfolderroot"}"#);
-    }
-
-    #[test]
-    fn delete_folder_sends_delete_and_404_is_not_found() {
-        let srv = FakeServer::start_limited(vec![
-            (
-                folder_route("DELETE", "/me/mailFolders/F1", 204, ""),
-                Some(1),
-            ),
-            (
-                folder_route("DELETE", "/me/mailFolders/F1", 404, "{}"),
-                None,
-            ),
-        ]);
-        let c = GraphClient::new(&srv.base_url, "AT");
-        c.delete_folder("F1").unwrap();
-        assert!(matches!(c.delete_folder("F1"), Err(GraphError::NotFound)));
-        let reqs = srv.requests();
-        assert_eq!(reqs[0].method, "DELETE");
-        assert_eq!(reqs[0].path, "/me/mailFolders/F1");
     }
 
     #[test]
