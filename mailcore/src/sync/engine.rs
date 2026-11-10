@@ -3896,9 +3896,7 @@ impl Engine {
                         // (see `reconverge_pending`) so it restores the message
                         // even if it has aged past the window during the retry
                         // back-off.
-                        let _ = self.store.clear_delta_links();
-                        self.backfill_done = false;
-                        self.reconverge_pending = true;
+                        self.start_mail_reconverge();
                         let is_event_op = writes_event_locally(&row.op);
                         self.emit(SyncEvent::Error(format!(
                             "quarantined outbox op seq {} after {attempts_after} attempts: {other}",
@@ -4033,8 +4031,13 @@ impl Engine {
         self.store.drop_op(row.seq);
         match &row.op {
             OutboxOp::CreateFolder { .. } => {
-                if self.store.discard_local_folder(&id).unwrap_or(false) {
+                let discard = self.store.discard_local_folder(&id).unwrap_or_default();
+                if discard.had_mail {
                     self.start_mail_reconverge();
+                }
+                // Drafts moved into it are filed back in Drafts.
+                if let Some(folder_id) = discard.refiled_into {
+                    self.emit(SyncEvent::MessagesUpdated { folder_id });
                 }
             }
             OutboxOp::RenameFolder {
@@ -27689,6 +27692,130 @@ mod tests {
             .map(|(m, p)| (m.to_string(), p.to_string()));
             assert_eq!(order, want);
             assert!(row(&store, "OTHER").is_none());
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn a_refused_create_files_a_draft_moved_into_it_back_in_drafts() {
+            let child = "/me/mailFolders/INBOX/childFolders";
+            let mut tree = TREE.to_vec();
+            tree.push(("DRAFTS", Some("ROOT"), Some("drafts")));
+            let created = r#"{"id":"D1","conversationId":"C","subject":"Hi","from":{"emailAddress":{"name":"","address":""}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":false,"hasAttachments":false,"importance":"normal","bodyPreview":"","isDraft":true}"#;
+            let (srv, handle, store, dir) = engine(
+                "folder-refused-draft",
+                world(
+                    vec![
+                        once("POST", child, 500, "busy"),
+                        write("POST", child, 409, EXISTS),
+                        write("POST", "/me/messages", 201, created),
+                    ],
+                    &tree,
+                    &[],
+                ),
+                None,
+            );
+            let draft = store
+                .create_local_draft("Hi", "bob@x", "", "<p>hi</p>")
+                .unwrap();
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some("INBOX".into()),
+                    name: "L".into(),
+                },
+            );
+            wait_requests(&srv, "POST", child, 1);
+            let local = local_folders(&store).pop().unwrap();
+            send(&handle, SyncCommand::SaveDraft { id: draft.clone() });
+            send(
+                &handle,
+                SyncCommand::Move {
+                    id: draft.clone(),
+                    dest: local.clone(),
+                },
+            );
+            wait_queued(&store, 3);
+            assert_eq!(mail_in(&store, &local), std::slice::from_ref(&draft));
+
+            send(&handle, SyncCommand::Refresh);
+            let (failed, seen) = wait_refused(&handle);
+            assert!(matches!(
+                failed,
+                SyncEvent::FolderWriteFailed {
+                    write: FolderWrite::Create,
+                    status: Some(409),
+                    ..
+                }
+            ));
+            assert!(
+                seen.contains(&SyncEvent::MessagesUpdated {
+                    folder_id: "DRAFTS".into()
+                }),
+                "{seen:?}"
+            );
+            // Its save, still queued, creates it on Graph.
+            wait_requests(&srv, "POST", "/me/messages", 1);
+            wait_drained(&store);
+            assert!(wait_until(ENGINE_WAIT, || mail_in(&store, "DRAFTS") == ["D1"]));
+            assert!(row(&store, &local).is_none());
+            assert!(
+                !srv.requests().iter().any(|r| r.path.ends_with("/move")),
+                "the move into L is never sent"
+            );
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn a_graph_folder_moved_under_a_deleted_local_folder_is_deleted_on_graph() {
+            let child = "/me/mailFolders/INBOX/childFolders";
+            let (srv, handle, store, dir) = engine(
+                "folder-orphan-delete",
+                world(
+                    vec![
+                        once("POST", child, 500, "busy"),
+                        write("DELETE", "/me/mailFolders/OTHER", 204, ""),
+                    ],
+                    TREE,
+                    &[("OTHER", "O1")],
+                ),
+                None,
+            );
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some("INBOX".into()),
+                    name: "L".into(),
+                },
+            );
+            wait_requests(&srv, "POST", child, 1);
+            let local = local_folders(&store).pop().unwrap();
+            send(
+                &handle,
+                SyncCommand::MoveFolder {
+                    id: "OTHER".into(),
+                    dest: Some(local.clone()),
+                },
+            );
+            send(&handle, SyncCommand::DeleteFolder { id: local.clone() });
+            // The create, OTHER's own delete and L's; OTHER's move is gone.
+            wait_queued(&store, 3);
+            assert!(row(&store, "OTHER").is_none());
+
+            send(&handle, SyncCommand::Refresh);
+            let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+            wait_drained(&store);
+            assert!(
+                !seen
+                    .iter()
+                    .any(|e| matches!(e, SyncEvent::FolderWriteFailed { .. })),
+                "{seen:?}"
+            );
+            assert_eq!(hits(&srv, "DELETE", "/me/mailFolders/OTHER"), 1);
+            assert!(!srv.requests().iter().any(|r| r.path.ends_with("/move")));
+            assert!(row(&store, "OTHER").is_none(), "not listed back");
+            assert!(!store.message_exists("O1").unwrap());
+            assert_eq!(hits(&srv, "POST", child), 1, "L's create never went");
+            no_local_request(&srv);
             stop(handle, dir);
         }
 

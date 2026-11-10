@@ -168,12 +168,14 @@ fn create_folder(
     })
 }
 
-/// `MoveFolder` (#1910): POST the move with the dest resolved now (one
-/// still `local:` never reached Graph: refused as `Parse`), then store
-/// Graph's answer (`Store::apply_moved_folder`). A folder still `local:`
-/// sends nothing. One whose row is gone is still moved: a delete of the
-/// folder it was moved under took it, and that delete, queued after this
-/// move, must find it there on Graph too.
+/// `MoveFolder` (#1910): POST the move with the dest resolved now, then
+/// store Graph's answer (`Store::apply_moved_folder`). A dest still
+/// `local:` is refused as `Parse`: its create was refused (the refusal
+/// reverts this move). A folder still `local:` sends nothing. One whose row
+/// is gone is still moved: a delete of the Graph folder it was moved under
+/// took it, and that delete, queued after this move, must find it there on
+/// Graph too. (A delete of a `local:` folder it was moved under drops this
+/// move and queues the folder's own delete instead: `Store::delete_folder`.)
 fn move_folder(
     client: &GraphClient,
     store: &Store,
