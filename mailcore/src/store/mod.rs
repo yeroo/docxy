@@ -10,6 +10,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use crate::graph::client::{AttendeeInput, ContactFieldSet, EventFieldSet, event_zone_error};
@@ -1461,6 +1462,7 @@ impl Store {
         // After `migrate_reply_links`, never in `schema.rs`: its batch runs
         // before the migrations, when an old table lacks `in_reply_to`.
         conn.execute(REPLY_DRAFTS_INDEX_SQL, [])?;
+        register_contact_match(&conn)?;
         Ok(Store { conn })
     }
 
@@ -4657,33 +4659,35 @@ impl Store {
         Ok(())
     }
 
-    /// Ranked autocomplete matches for `query` (matched case-insensitively
-    /// against name and address). Prefix matches rank ahead of interior
-    /// matches; then by Graph relevance (lower first, nulls last), then
-    /// frequency (higher first), then recency, then name.
+    /// Ranked autocomplete matches for `query`, matched case-insensitively
+    /// against name and address in any script (#1890).
     ///
-    /// `query` is escaped before being bound as the `LIKE` argument: `\`,
-    /// `%`, and `_` are all LIKE metacharacters (`_` matches any single
-    /// character, `%` matches any run of characters), and `_` in particular
-    /// is common in email addresses, so leaving it unescaped would make a
-    /// query like `"a_b"` match `"axb"`, `"a.b"`, etc. — far broader than the
-    /// literal substring the user typed. Escaping `\` first (so a literal
-    /// backslash in the query doesn't get mistaken for part of one of the
-    /// two escapes added after it) and pairing every `LIKE` with `ESCAPE
-    /// '\'` restores literal matching.
+    /// Both sides are folded in Rust (`fold_contact_text`: Unicode
+    /// `to_lowercase`, final `ς` as `σ`) by the `contact_match` SQL
+    /// function, never by SQLite's `lower()`/`LIKE`, which fold ASCII only
+    /// in this ICU-less bundled build. The match is a literal substring
+    /// (`_`, `%` and `\` are plain characters).
+    ///
+    /// A word-prefix match ranks first: the query starts the name or the
+    /// address, or starts right after a character that is not alphanumeric
+    /// (a space, `-`, `'`, `,` …) in the name or in the address' local part
+    /// (before its `@`; never in the domain). A name that is itself an
+    /// address (an `@`, no whitespace) takes the address rule. Any other
+    /// occurrence ranks after those. Then Graph relevance (lower first,
+    /// nulls last), frequency (higher first), recency, name.
+    ///
+    /// An empty `query` matches every contact, in that tie order. A
+    /// negative `limit` means no limit (SQLite's `LIMIT -1`). A caller that
+    /// does its own matching reads `all_contacts` instead.
     pub fn search_contacts(&self, query: &str, limit: i64) -> Result<Vec<Contact>, StoreError> {
-        let q = query
-            .to_lowercase()
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
+        let q = fold_contact_text(query);
         let mut stmt = self.conn.prepare(
-            "SELECT address, name, source, last_seen, frequency, relevance
-             FROM contacts
-             WHERE lower(name) LIKE '%' || ?1 || '%' ESCAPE '\\' OR lower(address) LIKE '%' || ?1 || '%' ESCAPE '\\'
+            "SELECT address, name, source, last_seen, frequency, relevance FROM (
+                 SELECT *, contact_match(name, address, ?1) AS m FROM contacts)
+             WHERE m IS NOT NULL
              ORDER BY
-                 (CASE WHEN lower(name) LIKE ?1 || '%' ESCAPE '\\' OR lower(address) LIKE ?1 || '%' ESCAPE '\\' THEN 0 ELSE 1 END) ASC,
-                 (CASE WHEN relevance IS NULL THEN 1 ELSE 0 END) ASC,
+                 m ASC,
+                 (relevance IS NULL) ASC,
                  relevance ASC,
                  frequency DESC,
                  last_seen DESC,
@@ -4691,16 +4695,27 @@ impl Store {
              LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(params![q, limit], |row| {
-                Ok(Contact {
-                    address: row.get(0)?,
-                    name: row.get(1)?,
-                    source: row.get(2)?,
-                    last_seen: row.get(3)?,
-                    frequency: row.get(4)?,
-                    relevance: row.get(5)?,
-                })
-            })?
+            .query_map(params![q, limit], contact_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Every contact, in `search_contacts`' tie order: Graph relevance
+    /// (lower first, nulls last), frequency (higher first), recency, name.
+    /// For a caller that does its own matching (#1890).
+    pub fn all_contacts(&self) -> Result<Vec<Contact>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT address, name, source, last_seen, frequency, relevance
+             FROM contacts
+             ORDER BY
+                 (relevance IS NULL) ASC,
+                 relevance ASC,
+                 frequency DESC,
+                 last_seen DESC,
+                 name ASC",
+        )?;
+        let rows = stmt
+            .query_map([], contact_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -5433,6 +5448,98 @@ fn read_contact_on(conn: &Connection, id: &str) -> Result<Option<FolderContact>,
 /// `Ärger@x.com` does not match a sender spelled `ärger@x.com`.
 fn folder_contact_key(address: &str) -> String {
     address.trim().to_ascii_lowercase()
+}
+
+/// A `contacts` row, in `search_contacts`' and `all_contacts`' column order:
+/// address, name, source, last_seen, frequency, relevance.
+fn contact_from_row(row: &Row<'_>) -> rusqlite::Result<Contact> {
+    Ok(Contact {
+        address: row.get(0)?,
+        name: row.get(1)?,
+        source: row.get(2)?,
+        last_seen: row.get(3)?,
+        frequency: row.get(4)?,
+        relevance: row.get(5)?,
+    })
+}
+
+/// Contact search's case fold (#1890), for the query and both columns
+/// alike: Unicode `to_lowercase`, then a final sigma `ς` as `σ`, as
+/// Unicode case folding does. `to_lowercase` alone writes a capital `Σ`
+/// that ends a word as `ς`, so `ΟΔΥΣ` (`οδυς`) would never be found in
+/// `Οδυσσέας` (`οδυσσέας`). Spelling equivalences (`ß`/`ss`), accents and
+/// Unicode normalisation are not folded.
+fn fold_contact_text(s: &str) -> String {
+    s.to_lowercase().replace('ς', "σ")
+}
+
+/// Whether `q` occurs in `hay` at a word start lying before byte `end`: at
+/// 0, or right after a character that is not alphanumeric. Every char
+/// boundary is tried, so an earlier mid-word occurrence never hides a later
+/// word-start one.
+fn has_word_prefix(hay: &str, q: &str, end: usize) -> bool {
+    let mut prev_alnum = false;
+    for (i, c) in hay.char_indices() {
+        if i >= end {
+            break;
+        }
+        if !prev_alnum && hay[i..].starts_with(q) {
+            return true;
+        }
+        prev_alnum = c.is_alphanumeric();
+    }
+    false
+}
+
+/// The `contact_match` rank of one contact for an already folded query
+/// (#1890): `Some(0)` for a word-prefix match (in the name, or in the
+/// address' local part, before the `@`; a name that is itself an address,
+/// an `@` and no whitespace, takes the address rule), `Some(1)` for any
+/// other occurrence in the folded name or address, `None` for no match.
+/// An empty query matches every contact at `Some(0)`.
+fn contact_match_rank(name: &str, address: &str, folded_query: &str) -> Option<i64> {
+    if folded_query.is_empty() {
+        return Some(0);
+    }
+    let name = fold_contact_text(name);
+    let address = fold_contact_text(address);
+    let local_part_end = |s: &str| s.find('@').unwrap_or(s.len());
+    let name_end = if name.contains('@') && !name.contains(char::is_whitespace) {
+        local_part_end(&name)
+    } else {
+        name.len()
+    };
+    if has_word_prefix(&name, folded_query, name_end)
+        || has_word_prefix(&address, folded_query, local_part_end(&address))
+    {
+        Some(0)
+    } else if name.contains(folded_query) || address.contains(folded_query) {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// Registers `contact_match(name, address, folded_query)` on `conn`:
+/// `contact_match_rank` as a deterministic SQL function, a NULL argument
+/// read as `''`. `Store::init` calls it, so every connection has it.
+fn register_contact_match(conn: &Connection) -> Result<(), StoreError> {
+    conn.create_scalar_function(
+        "contact_match",
+        3,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let name: Option<String> = ctx.get(0)?;
+            let address: Option<String> = ctx.get(1)?;
+            let query: Option<String> = ctx.get(2)?;
+            Ok(contact_match_rank(
+                name.as_deref().unwrap_or(""),
+                address.as_deref().unwrap_or(""),
+                query.as_deref().unwrap_or(""),
+            ))
+        },
+    )?;
+    Ok(())
 }
 
 /// `Store::drafts_folder_id` on `conn`, which `create_local_draft` passes
@@ -8065,9 +8172,9 @@ mod tests {
 
         // A literal "_" in the query must match only the literal "_" in
         // "a_b@x.com" — NOT stand in for the "x" of "axb@x.com" as a LIKE
-        // wildcard would. Unescaped, "a_b" LIKE '%a_b%' matches both rows
-        // (the `_` matches any single character, including "x"), so this
-        // is the assertion that would fail without `ESCAPE '\'`.
+        // wildcard would. An unescaped "a_b" LIKE '%a_b%' matches both rows
+        // (the `_` matches any single character, including "x"); the match
+        // is a literal substring since #1890's `contact_match`.
         let got = s.search_contacts("a_b", 10).unwrap();
         let addrs: Vec<&str> = got.iter().map(|c| c.address.as_str()).collect();
         assert_eq!(addrs, ["a_b@x.com"]); // "axb@x.com" must NOT show up here
@@ -8077,6 +8184,204 @@ mod tests {
         let got = s.search_contacts("axb", 10).unwrap();
         let addrs: Vec<&str> = got.iter().map(|c| c.address.as_str()).collect();
         assert_eq!(addrs, ["axb@x.com"]);
+    }
+
+    /// A local contact with `name`, `address` and `frequency`, for the
+    /// contact search tests (#1890).
+    fn search_contact(name: &str, address: &str, frequency: i64) -> Contact {
+        Contact {
+            name: name.into(),
+            address: address.into(),
+            source: "local".into(),
+            last_seen: "2026-07-01T00:00:00Z".into(),
+            frequency,
+            relevance: None,
+        }
+    }
+
+    fn found_addresses(s: &Store, query: &str, limit: i64) -> Vec<String> {
+        s.search_contacts(query, limit)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.address)
+            .collect()
+    }
+
+    #[test]
+    fn search_contacts_folds_any_script() {
+        // #1890: SQLite's `lower()`/`LIKE` fold ASCII only, so none of these
+        // was found by its lowercase spelling, nor even typed as stored.
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_contact(&search_contact("Борис Кудряшов", "boris@x.com", 1))
+            .unwrap();
+        s.upsert_contact(&search_contact("Élise Martin", "elise@x.com", 1))
+            .unwrap();
+        s.upsert_contact(&search_contact("Οδυσσέας Ελύτης", "odysseas@x.com", 1))
+            .unwrap();
+        for q in ["борис", "кудр", "Борис", "БОРИС", "Кудряшов"] {
+            assert_eq!(found_addresses(&s, q, 6), ["boris@x.com"], "query {q:?}");
+        }
+        for q in ["élise", "Élise", "ÉLISE"] {
+            assert_eq!(found_addresses(&s, q, 6), ["elise@x.com"], "query {q:?}");
+        }
+        // `to_lowercase` writes a word-final capital Σ as ς ("οδυς"), which
+        // only the fold's ς -> σ step finds in "οδυσσέας".
+        for q in ["ΟΔΥΣ", "οδυσ", "Οδυσσέας", "ελύτ"] {
+            assert_eq!(found_addresses(&s, q, 6), ["odysseas@x.com"], "query {q:?}");
+        }
+    }
+
+    #[test]
+    fn search_contacts_ranks_word_prefix_with_name_prefix() {
+        // #1890: "Wei Li" matches "li" at a word start, so it ranks with
+        // whole-name prefixes, ahead of 60 frequent mid-word matches that a
+        // small limit used to keep instead.
+        let s = Store::open_in_memory().unwrap();
+        for i in 0..60 {
+            s.upsert_contact(&search_contact(
+                &format!("Amelia N{i}"),
+                &format!("amelia{i}@x.com"),
+                50,
+            ))
+            .unwrap();
+        }
+        // "li" only in the domain: a word start there never ranks first.
+        s.upsert_contact(&search_contact("Zed", "zed@linkedin.com", 100))
+            .unwrap();
+        s.upsert_contact(&search_contact("Wei Li", "wei@x.com", 1))
+            .unwrap();
+        let got = found_addresses(&s, "li", 6);
+        assert_eq!(got.len(), 6);
+        assert_eq!(got[0], "wei@x.com");
+        // The rest are frequency-ordered interior matches: Zed first.
+        assert_eq!(got[1], "zed@linkedin.com");
+    }
+
+    #[test]
+    fn search_contacts_empty_query_and_negative_limit() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_contact(&search_contact("Ann Lee", "ann@x.com", 1))
+            .unwrap();
+        s.upsert_contact(&search_contact("Борис", "boris@x.com", 9))
+            .unwrap();
+        s.upsert_contact(&search_contact("", "noname@x.com", 5))
+            .unwrap();
+        // An empty query matches every contact, in the tie order.
+        assert_eq!(
+            found_addresses(&s, "", 10),
+            ["boris@x.com", "noname@x.com", "ann@x.com"]
+        );
+        // A negative limit means no limit.
+        assert_eq!(found_addresses(&s, "", -1).len(), 3);
+        assert_eq!(found_addresses(&s, "x.com", -1).len(), 3);
+        assert_eq!(found_addresses(&s, "", 2).len(), 2);
+    }
+
+    #[test]
+    fn all_contacts_lists_every_row_in_rank_order() {
+        let s = Store::open_in_memory().unwrap();
+        let mut graph = search_contact("Graph Two", "g2@x.com", 0);
+        graph.relevance = Some(2);
+        s.upsert_contact(&graph).unwrap();
+        let mut graph = search_contact("Graph One", "g1@x.com", 0);
+        graph.relevance = Some(1);
+        s.upsert_contact(&graph).unwrap();
+        s.upsert_contact(&search_contact("Rare", "rare@x.com", 1))
+            .unwrap();
+        s.upsert_contact(&search_contact("Often", "often@x.com", 7))
+            .unwrap();
+        let mut older = search_contact("Often Too", "older@x.com", 7);
+        older.last_seen = "2026-06-01T00:00:00Z".into();
+        s.upsert_contact(&older).unwrap();
+        let mut b = search_contact("Bea", "bea@x.com", 3);
+        b.last_seen = "2026-05-01T00:00:00Z".into();
+        s.upsert_contact(&b).unwrap();
+        let mut a = search_contact("Abe", "abe@x.com", 3);
+        a.last_seen = "2026-05-01T00:00:00Z".into();
+        s.upsert_contact(&a).unwrap();
+        let all: Vec<String> = s
+            .all_contacts()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.address)
+            .collect();
+        let order = [
+            "g1@x.com",    // relevance 1
+            "g2@x.com",    // relevance 2
+            "often@x.com", // nulls last; frequency 7, newer
+            "older@x.com", // frequency 7, older
+            "abe@x.com",   // frequency 3, same date: name
+            "bea@x.com",
+            "rare@x.com", // frequency 1
+        ];
+        assert_eq!(all, order);
+        // The same order as an empty search.
+        assert_eq!(found_addresses(&s, "", -1), order);
+    }
+
+    #[test]
+    fn contact_match_rank_word_starts_and_fold() {
+        let rank = |name: &str, address: &str, q: &str| {
+            contact_match_rank(name, address, &fold_contact_text(q))
+        };
+        // Word starts in the name: at 0, after a space, after `-` / `'` / `,`.
+        assert_eq!(rank("Wei Li", "w@x.com", "wei"), Some(0));
+        assert_eq!(rank("Wei Li", "w@x.com", "li"), Some(0));
+        assert_eq!(rank("Jean-Luc Picard", "j@x.com", "luc"), Some(0));
+        assert_eq!(rank("Sean O'Brien", "s@x.com", "brien"), Some(0));
+        assert_eq!(rank("Li, Wei", "w@x.com", "wei"), Some(0));
+        assert_eq!(rank("Борис-Кудряшов", "b@x.com", "кудр"), Some(0));
+        // Mid-word only: an interior match.
+        assert_eq!(rank("Amelia", "a@x.com", "li"), Some(1));
+        // A mid-word occurrence does not hide a later word-start one.
+        assert_eq!(rank("Amelia Lin", "a@x.com", "li"), Some(0));
+        // A query spanning a word start; one that a non-overlapping scan
+        // would skip ("a a" first matches at 1, the word start is at 3).
+        assert_eq!(rank("xa a a", "q@x.com", "a a"), Some(0));
+        // The address: start and a `.` in the local part are word starts…
+        assert_eq!(rank("", "john.smith@x.com", "john"), Some(0));
+        assert_eq!(rank("", "john.smith@x.com", "smith"), Some(0));
+        assert_eq!(rank("", "ann@x.com", "ann@x"), Some(0));
+        // …the domain never is.
+        assert_eq!(rank("Zed", "zed@linkedin.com", "li"), Some(1));
+        assert_eq!(rank("Zed", "zed@linkedin.com", "@li"), Some(1));
+        // A name that is itself an address takes the address rule.
+        assert_eq!(rank("zed@linkedin.com", "zed@linkedin.com", "li"), Some(1));
+        assert_eq!(rank("Zed (zed@linkedin.com)", "z@x.com", "linked"), Some(0));
+        // No match, an empty name, an empty query.
+        assert_eq!(rank("Wei Li", "w@x.com", "bob"), None);
+        assert_eq!(rank("", "w@x.com", "bob"), None);
+        assert_eq!(rank("", "", ""), Some(0));
+        assert_eq!(rank("Wei Li", "w@x.com", ""), Some(0));
+        // Final sigma: "ΟΔΥΣ" lowercases to "οδυς"; folded, it is "οδυσ".
+        assert_eq!(fold_contact_text("ΟΔΥΣ"), "οδυσ");
+        assert_eq!(rank("Οδυσσέας", "o@x.com", "ΟΔΥΣ"), Some(0));
+        assert_eq!(rank("Οδυσσέας", "o@x.com", "δυσσεας"), None); // accents are kept
+        assert_eq!(rank("Οδυσσέας", "o@x.com", "δυσσέας"), Some(1));
+        // Lowercasing that changes the length never panics: `İ` becomes
+        // `i` + U+0307, `ß` stays `ß` (and does not match `ss`).
+        assert_eq!(rank("İstanbul Ali", "i@x.com", "ali"), Some(0));
+        assert_eq!(rank("İstanbul", "i@x.com", "i"), Some(0));
+        assert_eq!(rank("Straße", "s@x.com", "STRASSE"), None);
+        assert_eq!(rank("Straße", "s@x.com", "STRAßE"), Some(0));
+    }
+
+    #[test]
+    fn contact_match_reads_a_null_argument_as_empty() {
+        // The SQL function never fails the query on a NULL column.
+        let s = Store::open_in_memory().unwrap();
+        let got: Option<i64> = s
+            .conn
+            .query_row("SELECT contact_match(NULL, 'w@x.com', 'w')", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(got, Some(0));
+        let got: Option<i64> = s
+            .conn
+            .query_row("SELECT contact_match('Wei', NULL, NULL)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(got, Some(0));
     }
 
     #[test]
