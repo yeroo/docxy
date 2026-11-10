@@ -2377,11 +2377,8 @@ impl Engine {
     /// auth, throttle or transport failure, already handled by `react`).
     fn refresh_folder(&mut self, folder_id: &str) -> bool {
         // A folder created here that has not reached Graph yet (#1910) has
-        // nothing there to read, and one a queued delete removed (#2107)
-        // nothing to read into.
-        if folder_id.starts_with("local:")
-            || self.store.folder_being_deleted(folder_id).unwrap_or(false)
-        {
+        // nothing there to read.
+        if folder_id.starts_with("local:") {
             return true;
         }
         if !self.sync_folder_delta(folder_id) {
