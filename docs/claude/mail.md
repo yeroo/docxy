@@ -3139,6 +3139,18 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
     refused too, and so is one that already took the moved folder with it. The user deletes
     again; the alternative is mail deleted on Graph. Nothing extra is persisted: the refusal
     happens when the move leaves the outbox, and the deletes are still queued then.
+  - R3 (r5): a `DeleteFolder` command while a mail reconverge is pending is refused at once
+    (`FolderRefusal::Rereading`, `status: None`, "mail is being read again from the server;
+    delete again once it is done"). R2 sees only the deletes queued when the move leaves the
+    outbox. After a quarantined move, or a move dropped with a refused or deleted `local:`
+    folder, the store still shows the message out of the folder Graph has it in until the
+    reconverge's pass. Holding a delete issued in that window does not help: the reconverge
+    never reads a folder whose delete is queued (the pass reads stored folders, and the listing
+    skips it), so the message is never shown back there and the held `DELETE` would take it on
+    Graph while it is still shown in its stale folder. After the pass it is shown where Graph
+    has it, and a new delete takes what the user sees. Starvation: deletes are refused for as
+    long as the reconverge runs, its backfill included, after any quarantine. That is the safe
+    side.
   - A refusal may drop ops a drain has already read (a delete, a refused create's message
     moves), so the drain checks that each op is still queued (`Store::has_op`) before it sends
     it.
@@ -3209,7 +3221,10 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `a_refused_delete_of_a_folder_moved_under_a_deleted_local_folder_restores_it`,
   `a_folder_moved_through_a_deleted_local_folder_keeps_its_old_parents_delete_back`,
   `a_refused_create_keeps_the_delete_of_the_folder_its_moved_mail_left`,
-  `a_delete_waits_for_a_message_move_out_of_it_and_a_quarantine_refuses_it`).
+  `a_delete_waits_for_a_message_move_out_of_it_and_a_quarantine_refuses_it`,
+  `a_delete_after_a_quarantined_move_waits_for_the_reconverge`,
+  `a_delete_after_a_refused_create_took_moved_mail_waits_for_the_reconverge`,
+  `deleting_a_local_folder_refuses_the_delete_its_moved_mail_left`).
 - Not done: a lookxy folder-management UI; dedup of a create retried after a lost POST answer
   (a retry may 409 on the name Graph already has; the refusal discards the local row and the
   next listing brings Graph's folder); `GET /me/mailFolders/delta`; search folders; folders in
