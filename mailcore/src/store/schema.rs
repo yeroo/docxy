@@ -79,7 +79,11 @@ CREATE TABLE IF NOT EXISTS messages (
     is_reminder_on     INTEGER NOT NULL DEFAULT 0,
     reminder_at        TEXT NOT NULL DEFAULT '',
     reminder_signal_at TEXT NOT NULL DEFAULT '',
-    flag_due_at        TEXT NOT NULL DEFAULT ''
+    flag_due_at        TEXT NOT NULL DEFAULT '',
+    -- The meeting message type (#2081): Graph's `meetingMessageType` name
+    -- (`MeetingMessageType::as_graph`), NULL for any other message. An old
+    -- file gets it, and its delta links reset, in `Store::init`.
+    meeting_message_type TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received

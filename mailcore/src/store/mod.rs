@@ -15,8 +15,9 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use crate::graph::client::{AttendeeInput, ContactFieldSet, EventFieldSet, event_zone_error};
 use crate::graph::model::{
     AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Calendar, ContactFields, Event,
-    EventRecurrence, FolderContact, MailFolder, MasterCategory, Message, MessageFields,
-    MessageHeader, PhysicalAddress, Recipient, Recurrence, is_stored_header, meeting_link_in,
+    EventRecurrence, FolderContact, MailFolder, MasterCategory, MeetingMessageType, Message,
+    MessageFields, MessageHeader, PhysicalAddress, Recipient, Recurrence, is_stored_header,
+    meeting_link_in,
 };
 use crate::json::{self, Value};
 
@@ -179,6 +180,12 @@ pub struct MessageRow {
     pub reminder_signal_at: String,
     /// The flag's due time (`flag.dueDateTime`), UTC, or `""`.
     pub flag_due_at: String,
+    /// The message's meeting message type (#2081,
+    /// `Message::meeting_message_type`): a request, a cancellation or an
+    /// attendee's response, `None` for any other message or a row stored
+    /// before the type was (until a sync re-reads it or
+    /// `FetchMeetingMessage` answers for it). A host's list shows its icon.
+    pub meeting_message_type: Option<MeetingMessageType>,
 }
 
 /// A file the user has attached to an outbound draft — a reference (path +
@@ -1418,6 +1425,7 @@ impl Store {
             [],
         )?;
         migrate_message_reminders(&conn)?;
+        migrate_meeting_message_type(&conn)?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_reminder
                  ON messages(reminder_signal_at) WHERE is_reminder_on = 1",
@@ -1550,8 +1558,9 @@ impl Store {
     /// every property carried it writes every column (`upsert_message`).
     /// `is_meeting_request` and `is_draft` follow
     /// `MessageFields::writes_meeting_request` / `writes_is_draft`, the
-    /// reminder columns `writes_reminder` and `flag_due_at` the flag
-    /// (#2054). The reminder is on only while the row is flagged (the
+    /// reminder columns `writes_reminder`, `flag_due_at` the flag (#2054)
+    /// and `meeting_message_type` `writes_meeting_type` (#2081: only when
+    /// the item carried it). The reminder is on only while the row is flagged (the
     /// stored flag when the item carries none), so an unflag or a completed
     /// flag Graph reports leaves it off even if Exchange kept
     /// `PidLidReminderSet`.
@@ -1597,9 +1606,10 @@ impl Store {
                  to_recipients, cc_recipients, received_at, sent_at,
                  is_read, is_flagged, has_attachments, importance, preview, is_draft,
                  is_meeting_request, categories,
-                 is_reminder_on, reminder_at, reminder_signal_at, flag_due_at
+                 is_reminder_on, reminder_at, reminder_signal_at, flag_due_at,
+                 meeting_message_type
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                       ?35 AND ?12, ?36, ?37, ?38)
+                       ?35 AND ?12, ?36, ?37, ?38, ?40)
              ON CONFLICT(id) DO UPDATE SET
                  folder_id = excluded.folder_id,
                  conversation_id = CASE WHEN ?19 THEN excluded.conversation_id ELSE messages.conversation_id END,
@@ -1624,7 +1634,9 @@ impl Store {
                  reminder_at = CASE WHEN ?39 THEN excluded.reminder_at ELSE messages.reminder_at END,
                  reminder_signal_at = CASE WHEN ?39 THEN excluded.reminder_signal_at
                                            ELSE messages.reminder_signal_at END,
-                 flag_due_at = CASE WHEN ?27 THEN excluded.flag_due_at ELSE messages.flag_due_at END
+                 flag_due_at = CASE WHEN ?27 THEN excluded.flag_due_at ELSE messages.flag_due_at END,
+                 meeting_message_type = CASE WHEN ?41 THEN excluded.meeting_message_type
+                                             ELSE messages.meeting_message_type END
              WHERE NOT ?34 OR messages.local_edit = 0",
             params![
                 m.id,
@@ -1666,6 +1678,8 @@ impl Store {
                 m.reminder_signal_at,
                 m.flag_due_at,
                 fields.writes_reminder(),
+                m.meeting_message_type.map(MeetingMessageType::as_graph),
+                fields.writes_meeting_type(),
             ],
         )?;
         Ok(n > 0)
@@ -1874,6 +1888,7 @@ impl Store {
                         is_read, is_flagged, has_attachments, importance, preview, is_draft,
                         bcc_recipients, is_meeting_request, categories,
                         is_reminder_on, reminder_at, reminder_signal_at, flag_due_at,
+                        meeting_message_type,
                         CASE WHEN conversation_id <> '' THEN conversation_id
                              ELSE 'msg:' || id END AS conv_key
                  FROM messages
@@ -1890,7 +1905,8 @@ impl Store {
                     k.to_recipients, k.cc_recipients, k.received_at, k.sent_at,
                     k.is_read, k.is_flagged, k.has_attachments, k.importance, k.preview, k.is_draft,
                     k.bcc_recipients, k.is_meeting_request, k.categories,
-                    k.is_reminder_on, k.reminder_at, k.reminder_signal_at, k.flag_due_at
+                    k.is_reminder_on, k.reminder_at, k.reminder_signal_at, k.flag_due_at,
+                    k.meeting_message_type
              FROM keyed k
              JOIN ranked r ON k.conv_key = r.conv_key
              ORDER BY r.latest DESC, k.received_at ASC",
@@ -3083,15 +3099,11 @@ impl Store {
     /// of which means there's nothing for compose to load. One statement, so
     /// the row and body always belong together.
     pub fn draft(&self, id: &str) -> Result<Option<(MessageRow, Body)>, StoreError> {
-        let mut stmt = self.conn.prepare(concat!(
-            "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
-                    to_recipients, cc_recipients, received_at, sent_at,
-                    is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                    bcc_recipients, is_meeting_request, categories,
-                    is_reminder_on, reminder_at, reminder_signal_at, flag_due_at,
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MESSAGE_ROW_COLUMNS},
                     bodies.content_type, bodies.content
              FROM messages JOIN bodies ON bodies.message_id = messages.id
-             WHERE ",
+             WHERE {}",
             draft_row_sql!()
         ))?;
         let found = stmt
@@ -3099,8 +3111,8 @@ impl Store {
                 Ok((
                     map_message_row(r)?,
                     Body {
-                        content_type: r.get(23)?,
-                        content: r.get(24)?,
+                        content_type: r.get(BODY_AFTER_ROW_COLUMNS)?,
+                        content: r.get(BODY_AFTER_ROW_COLUMNS + 1)?,
                     },
                 ))
             })?
@@ -3228,6 +3240,32 @@ impl Store {
     /// here first.
     pub fn current_id(&self, id: &str) -> Result<String, StoreError> {
         current_id_on(&self.conn, id)
+    }
+
+    /// Writes a message's meeting message type (#2081), on the row `id`
+    /// resolves to now ([`Store::current_id`], so an id from before a move
+    /// still reaches it): what `FetchMeetingMessage`'s answer gives a row
+    /// stored before the type was. Returns the row's folder id when the
+    /// stored value changed, for the engine's `MessagesUpdated`; `None` when
+    /// it already held the value or no row has the id.
+    pub fn set_meeting_message_type(
+        &self,
+        id: &str,
+        meeting_type: Option<MeetingMessageType>,
+    ) -> Result<Option<String>, StoreError> {
+        let tx = self.write_tx()?;
+        let id = current_id_on(&tx, id)?;
+        let folder = tx
+            .query_row(
+                "UPDATE messages SET meeting_message_type = ?2
+                 WHERE id = ?1 AND meeting_message_type IS NOT ?2
+                 RETURNING folder_id",
+                params![id, meeting_type.map(MeetingMessageType::as_graph)],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        tx.commit()?;
+        Ok(folder)
     }
 
     /// Resolves the Drafts folder's id, for filing a new local draft (or a
@@ -3362,17 +3400,13 @@ impl Store {
         if sanitized.is_empty() {
             return Ok(Vec::new());
         }
-        let mut stmt = self.conn.prepare(
-            "SELECT id, folder_id, conversation_id, subject, from_name, from_addr,
-                    to_recipients, cc_recipients, received_at, sent_at,
-                    is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                    bcc_recipients, is_meeting_request, categories,
-                    is_reminder_on, reminder_at, reminder_signal_at, flag_due_at
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {MESSAGE_ROW_COLUMNS}
              FROM messages
              WHERE id IN (SELECT message_id FROM messages_fts WHERE messages_fts MATCH ?1)
              ORDER BY received_at DESC
-             LIMIT ?2",
-        )?;
+             LIMIT ?2"
+        ))?;
         let rows = stmt
             .query_map(params![sanitized, limit], map_message_row)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -5917,6 +5951,36 @@ fn migrate_message_reminders(conn: &Connection) -> Result<bool, StoreError> {
     Ok(true)
 }
 
+/// Brings a store from before #2081 up to date: adds
+/// `messages.meeting_message_type` (old rows read `None`) and resets every
+/// folder's delta and backfill state, as `migrate_message_reminders` does
+/// and for the same reason: a link Graph minted before then carries the old
+/// `$expand`, without the message class, so new mail through it would
+/// never get its type. The expand-refused marks reset with the links, so
+/// the next walk asks again. One IMMEDIATE transaction that probes for the
+/// column first; a store that has it (every fresh one) is left alone.
+/// Returns whether it migrated.
+fn migrate_meeting_message_type(conn: &Connection) -> Result<bool, StoreError> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let has: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'meeting_message_type'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has > 0 {
+        return Ok(false);
+    }
+    tx.execute_batch(
+        "ALTER TABLE messages ADD COLUMN meeting_message_type TEXT;
+         UPDATE folders SET delta_link = NULL, backfill_link = NULL,
+                            backfill_synced = 0, history_scope = NULL,
+                            backfill_scope = NULL, reminder_expand_refused = 0,
+                            backfill_expand_refused = 0;",
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
 /// Mints a fresh local draft id: `local:` followed by 16 bytes of
 /// OS randomness as lowercase hex (reusing `pkce::random_bytes`, the same
 /// OS-entropy source the PKCE verifier uses, rather than pulling in a
@@ -6258,14 +6322,20 @@ fn sanitize_recipient_name(name: &str) -> String {
 }
 
 /// The `messages` columns `map_message_row` reads, in its order.
-/// `messages_in_folder`, `message_row` and `message_rows` select this list,
-/// so they cannot drift from the mapping; `search`, `draft` and
-/// `conversations_in_folder` still spell the columns out.
+/// `messages_in_folder`, `message_row`, `message_rows`, `search`, `draft`
+/// and `due_message_reminders` select this list, so they cannot drift from
+/// the mapping; only `conversations_in_folder` still spells the columns
+/// out (twice: its `keyed` CTE and its outer select).
 const MESSAGE_ROW_COLUMNS: &str = "id, folder_id, conversation_id, subject, from_name, from_addr,
     to_recipients, cc_recipients, received_at, sent_at,
     is_read, is_flagged, has_attachments, importance, preview, is_draft,
     bcc_recipients, is_meeting_request, categories,
-    is_reminder_on, reminder_at, reminder_signal_at, flag_due_at";
+    is_reminder_on, reminder_at, reminder_signal_at, flag_due_at,
+    meeting_message_type";
+
+/// How many columns `MESSAGE_ROW_COLUMNS` names: the index of the first
+/// column a query selects after them (`Store::draft`'s body).
+const BODY_AFTER_ROW_COLUMNS: usize = 24;
 
 /// `Store::due_message_reminders`'s statement (#2054): flagged rows whose
 /// reminder is on and whose next signal (`reminder_signal_at`, else
@@ -6326,6 +6396,10 @@ fn map_message_row(row: &Row) -> rusqlite::Result<MessageRow> {
         reminder_at: row.get(20)?,
         reminder_signal_at: row.get(21)?,
         flag_due_at: row.get(22)?,
+        meeting_message_type: row
+            .get::<_, Option<String>>(23)?
+            .as_deref()
+            .and_then(MeetingMessageType::from_graph),
     })
 }
 
@@ -6504,6 +6578,7 @@ mod tests {
             preview: "p".into(),
             is_draft: false,
             is_meeting_request: false,
+            meeting_message_type: None,
             categories: Vec::new(),
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -7062,6 +7137,7 @@ mod tests {
             preview: String::new(),
             is_draft: false,
             is_meeting_request: false,
+            meeting_message_type: None,
             categories: vec![],
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -7145,6 +7221,7 @@ mod tests {
         m.reminder_at = "2026-07-13T08:00:00Z".into();
         m.reminder_signal_at = "2026-07-13T09:00:00Z".into();
         m.flag_due_at = "2026-07-14T00:00:00Z".into();
+        m.meeting_message_type = Some(MeetingMessageType::Declined);
         m.to = vec![Recipient {
             name: "B".into(),
             address: "b@x".into(),
@@ -7181,6 +7258,7 @@ mod tests {
             ("reminder_at", t("2026-07-13T08:00:00Z")),
             ("reminder_signal_at", t("2026-07-13T09:00:00Z")),
             ("flag_due_at", t("2026-07-14T00:00:00Z")),
+            ("meeting_message_type", t("meetingDeclined")),
         ];
         expect(&s, "13", &first);
 
@@ -7208,6 +7286,7 @@ mod tests {
             preview: String::new(),
             is_draft: false,
             is_meeting_request: false,
+            meeting_message_type: None,
             categories: vec![],
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -7244,6 +7323,7 @@ mod tests {
                 ("reminder_at", t("")),
                 ("reminder_signal_at", t("")),
                 ("flag_due_at", t("")),
+                ("meeting_message_type", V::Null),
             ],
         );
     }
@@ -12936,6 +13016,7 @@ mod search_tests {
             preview: "".into(),
             is_draft: false,
             is_meeting_request: false,
+            meeting_message_type: None,
             categories: Vec::new(),
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -13803,6 +13884,7 @@ mod local_id_tests {
             preview: String::new(),
             is_draft: true,
             is_meeting_request: false,
+            meeting_message_type: None,
             categories: Vec::new(),
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -13909,6 +13991,7 @@ mod body_format_tests {
             preview: String::new(),
             is_draft,
             is_meeting_request: false,
+            meeting_message_type: None,
             categories: Vec::new(),
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -14613,6 +14696,7 @@ mod kept_body_tests {
             preview: String::new(),
             is_draft,
             is_meeting_request: false,
+            meeting_message_type: None,
             categories: Vec::new(),
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -14833,6 +14917,7 @@ mod folder_retain_tests {
             preview: "p".into(),
             is_draft: false,
             is_meeting_request: false,
+            meeting_message_type: None,
             categories: Vec::new(),
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -15257,6 +15342,7 @@ mod backfill_tests {
             preview: String::new(),
             is_draft: false,
             is_meeting_request: false,
+            meeting_message_type: None,
             categories: vec![],
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -15428,6 +15514,7 @@ mod moved_id_tests {
             preview: String::new(),
             is_draft: false,
             is_meeting_request: false,
+            meeting_message_type: None,
             categories: Vec::new(),
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -15794,6 +15881,7 @@ mod message_reminder_tests {
             preview: "p".into(),
             is_draft: false,
             is_meeting_request: false,
+            meeting_message_type: None,
             categories: vec![],
             is_reminder_on: true,
             reminder_at: at.into(),
@@ -16415,5 +16503,333 @@ mod message_reminder_tests {
             s.enqueue_op(&op).unwrap();
         }
         assert_eq!(s.pending_message_ids().unwrap(), ["M2", "NEW"]);
+    }
+}
+
+#[cfg(test)]
+mod meeting_message_type_tests {
+    //! Each message's meeting message type on its row (#2081): the column
+    //! through every row read, the merge rule, the migration and
+    //! `set_meeting_message_type`.
+    use super::*;
+    use MeetingMessageType as T;
+
+    const TYPES: [Option<MeetingMessageType>; 6] = [
+        Some(T::Request),
+        Some(T::Cancelled),
+        Some(T::Accepted),
+        Some(T::TentativelyAccepted),
+        Some(T::Declined),
+        None,
+    ];
+
+    fn folder(s: &Store, id: &str) {
+        s.upsert_folder(&MailFolder {
+            id: id.into(),
+            display_name: id.into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: None,
+        })
+        .unwrap();
+    }
+
+    fn msg(id: &str, t: Option<MeetingMessageType>) -> Message {
+        Message {
+            id: id.into(),
+            conversation_id: format!("C{id}"),
+            subject: format!("budget {id}"),
+            from: Recipient {
+                name: "A".into(),
+                address: "a@x".into(),
+            },
+            to: vec![],
+            cc: vec![],
+            received: format!("2026-11-01T00:00:0{}Z", id.len() % 10),
+            sent: String::new(),
+            is_read: false,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: "p".into(),
+            is_draft: false,
+            is_meeting_request: t == Some(T::Request),
+            meeting_message_type: t,
+            categories: vec![],
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
+        }
+    }
+
+    fn type_of(s: &Store, id: &str) -> Option<MeetingMessageType> {
+        s.message_row(id).unwrap().unwrap().meeting_message_type
+    }
+
+    /// The ids `M0`..`M5`, one per entry of `TYPES`.
+    fn ids() -> Vec<String> {
+        (0..TYPES.len()).map(|i| format!("M{i}")).collect()
+    }
+
+    #[test]
+    fn message_round_trips_meeting_message_type() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        for (id, t) in ids().iter().zip(TYPES) {
+            s.upsert_message("F", &msg(id, t)).unwrap();
+        }
+        let want: Vec<(String, Option<MeetingMessageType>)> =
+            ids().into_iter().zip(TYPES).collect();
+        let sorted = |rows: Vec<MessageRow>| {
+            let mut got: Vec<_> = rows
+                .into_iter()
+                .map(|r| (r.id, r.meeting_message_type))
+                .collect();
+            got.sort_by(|a, b| a.0.cmp(&b.0));
+            got
+        };
+        // `message_row`.
+        for (id, t) in &want {
+            assert_eq!(type_of(&s, id), *t, "{id}");
+        }
+        // `message_rows`.
+        let id_refs: Vec<&str> = want.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(sorted(s.message_rows(&id_refs).unwrap()), want);
+        // The folder rows.
+        assert_eq!(sorted(s.messages_in_folder("F", 50, 0).unwrap()), want);
+        assert_eq!(sorted(s.conversations_in_folder("F", 50, 0).unwrap()), want);
+        // `search` (the local full-text index).
+        assert_eq!(sorted(s.search("budget", 50).unwrap()), want);
+        // `draft`, whose body columns follow the row's.
+        let mut d = msg("D1", Some(T::Cancelled));
+        d.is_draft = true;
+        s.upsert_message("F", &d).unwrap();
+        s.put_body(
+            "D1",
+            &Body {
+                content_type: "html".into(),
+                content: "<p>hi</p>".into(),
+            },
+        )
+        .unwrap();
+        let (row, body) = s.draft("D1").unwrap().unwrap();
+        assert_eq!(row.meeting_message_type, Some(T::Cancelled));
+        assert_eq!(row.subject, "budget D1");
+        assert_eq!(body.content_type, "html");
+        assert_eq!(body.content, "<p>hi</p>");
+    }
+
+    #[test]
+    fn due_message_reminders_carry_meeting_message_type() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        let mut m = msg("M1", Some(T::Request));
+        m.is_flagged = true;
+        m.is_reminder_on = true;
+        m.reminder_at = "2026-11-08T10:00:00Z".into();
+        s.upsert_message("F", &m).unwrap();
+        let due = s.due_message_reminders("2026-11-08T12:00:00Z").unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].meeting_message_type, Some(T::Request));
+    }
+
+    #[test]
+    fn an_unknown_stored_value_reads_none() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.upsert_message("F", &msg("M1", None)).unwrap();
+        s.conn
+            .execute(
+                "UPDATE messages SET meeting_message_type = 'meetingSomethingNew'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(type_of(&s, "M1"), None);
+    }
+
+    #[test]
+    fn partial_merge_keeps_meeting_message_type() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.upsert_message("F", &msg("M1", Some(T::Cancelled)))
+            .unwrap();
+        // `{id, isRead}`: partial, carries no type.
+        let read = Message {
+            is_read: true,
+            ..msg("M1", None)
+        };
+        let fields = MessageFields {
+            is_read: true,
+            ..MessageFields::default()
+        };
+        s.merge_message("F", &read, &fields).unwrap();
+        assert_eq!(type_of(&s, "M1"), Some(T::Cancelled));
+        assert!(s.message_row("M1").unwrap().unwrap().is_read);
+        // A complete item read without the expand (`reminder_unasked`).
+        let unasked = MessageFields {
+            reminder: false,
+            reminder_unasked: true,
+            meeting_type: false,
+            ..MessageFields::all()
+        };
+        s.merge_message("F", &msg("M1", None), &unasked).unwrap();
+        assert_eq!(type_of(&s, "M1"), Some(T::Cancelled));
+        // A complete item asked for it that came without the class.
+        let bare = MessageFields {
+            meeting_type: false,
+            ..MessageFields::all()
+        };
+        s.merge_message("F", &msg("M1", None), &bare).unwrap();
+        assert_eq!(type_of(&s, "M1"), Some(T::Cancelled));
+        // An item that carries the class writes it, a plain one too.
+        let carried = MessageFields::all();
+        s.merge_message("F", &msg("M1", Some(T::Declined)), &carried)
+            .unwrap();
+        assert_eq!(type_of(&s, "M1"), Some(T::Declined));
+        s.merge_message("F", &msg("M1", None), &carried).unwrap();
+        assert_eq!(type_of(&s, "M1"), None);
+        // A missing row is inserted with what the item carried.
+        s.merge_message("F", &msg("M2", Some(T::Accepted)), &carried)
+            .unwrap();
+        assert_eq!(type_of(&s, "M2"), Some(T::Accepted));
+    }
+
+    #[test]
+    fn set_meeting_message_type_follows_a_move_and_reports_a_change() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        folder(&s, "G");
+        s.upsert_message("F", &msg("OLD", None)).unwrap();
+        assert!(s.follow_move("OLD", "NEW").unwrap());
+        s.conn
+            .execute("UPDATE messages SET folder_id = 'G' WHERE id = 'NEW'", [])
+            .unwrap();
+        // The old id reaches the moved row; its folder is reported.
+        assert_eq!(
+            s.set_meeting_message_type("OLD", Some(T::Cancelled))
+                .unwrap()
+                .as_deref(),
+            Some("G")
+        );
+        assert_eq!(type_of(&s, "NEW"), Some(T::Cancelled));
+        // The same value again changes nothing.
+        assert_eq!(
+            s.set_meeting_message_type("NEW", Some(T::Cancelled))
+                .unwrap(),
+            None
+        );
+        // Another value does, and `None` clears it.
+        assert_eq!(
+            s.set_meeting_message_type("NEW", Some(T::Request))
+                .unwrap()
+                .as_deref(),
+            Some("G")
+        );
+        assert_eq!(
+            s.set_meeting_message_type("NEW", None).unwrap().as_deref(),
+            Some("G")
+        );
+        assert_eq!(type_of(&s, "NEW"), None);
+        // No such row.
+        assert_eq!(
+            s.set_meeting_message_type("NOPE", Some(T::Request))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn messages_without_2081_column_migrate_and_reset_delta_links() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-meeting-type-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        {
+            let s = Store::open(&path).unwrap();
+            folder(&s, "F");
+            folder(&s, "G");
+            s.upsert_message("F", &msg("M1", Some(T::Request))).unwrap();
+            s.complete_backfill("F", "https://graph/F?$deltatoken=1", SCOPE_ALL, 7, None)
+                .unwrap();
+            s.set_head_link("G", "https://graph/G?$deltatoken=2", false)
+                .unwrap();
+            s.set_backfill_progress("G", "https://graph/G?$skiptoken=3", 4, SCOPE_ALL)
+                .unwrap();
+            s.set_reminder_expand_refused("G", true).unwrap();
+            // Back to a store from before #2081.
+            s.conn
+                .execute_batch("ALTER TABLE messages DROP COLUMN meeting_message_type;")
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        // The column is there and the old row reads `None`, the rest of it
+        // kept.
+        let row = s.message_row("M1").unwrap().unwrap();
+        assert_eq!(row.meeting_message_type, None);
+        assert!(row.is_meeting_request);
+        assert_eq!(row.subject, "budget M1");
+        // Every folder's delta and backfill state is reset, the expand
+        // refusals with it, with no reconverge.
+        for f in ["F", "G"] {
+            assert_eq!(s.get_delta_link(f).unwrap(), None, "{f}");
+            let (backfill, synced, history, scope): (
+                Option<String>,
+                i64,
+                Option<String>,
+                Option<String>,
+            ) = s
+                .conn
+                .query_row(
+                    "SELECT backfill_link, backfill_synced, history_scope, backfill_scope
+                     FROM folders WHERE id = ?1",
+                    [f],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (backfill, synced, history, scope),
+                (None, 0, None, None),
+                "{f}"
+            );
+            assert!(!s.reminder_expand_refused(f).unwrap(), "{f}");
+            assert!(!s.backfill_expand_refused(f).unwrap(), "{f}");
+        }
+        assert!(!s.reconverge_pending().unwrap());
+        // The type is written from now on, and a link stored after the
+        // migration survives the next open.
+        s.set_meeting_message_type("M1", Some(T::Request)).unwrap();
+        s.set_head_link("F", "https://graph/F?$deltatoken=new", false)
+            .unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.get_delta_link("F").unwrap().as_deref(),
+            Some("https://graph/F?$deltatoken=new")
+        );
+        assert_eq!(type_of(&s, "M1"), Some(T::Request));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_store_has_the_column_and_is_not_migrated() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(schema::SCHEMA_SQL).unwrap();
+        assert!(!migrate_meeting_message_type(&conn).unwrap());
+    }
+
+    #[test]
+    fn a_store_without_the_column_migrates_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(schema::SCHEMA_SQL).unwrap();
+        conn.execute_batch("ALTER TABLE messages DROP COLUMN meeting_message_type;")
+            .unwrap();
+        assert!(migrate_meeting_message_type(&conn).unwrap());
+        assert!(!migrate_meeting_message_type(&conn).unwrap());
     }
 }

@@ -679,17 +679,20 @@ pub struct EventInput {
 const MESSAGE_SELECT: &str = "id,conversationId,subject,from,toRecipients,ccRecipients,\
 receivedDateTime,sentDateTime,isRead,flag,hasAttachments,importance,bodyPreview,categories";
 
-/// The `$expand` that brings a message's Outlook reminder (#2054): the
-/// three PSETID_Common named properties `Message::from_json` reads
-/// (`PidLidReminderSet`, `PidLidReminderTime`, `PidLidReminderSignalTime`,
-/// the `REMINDER_*_PROP` ids), filtered so nothing else comes. Quotes and
+/// The `$expand` that brings a message's Outlook reminder (#2054) and its
+/// message class (#2081): the three PSETID_Common named properties
+/// `Message::from_json` reads (`PidLidReminderSet`, `PidLidReminderTime`,
+/// `PidLidReminderSignalTime`, the `REMINDER_*_PROP` ids) and
+/// `PidTagMessageClass` (`MESSAGE_CLASS_PROP`), from which a meeting
+/// message's type is read, filtered so nothing else comes. Quotes and
 /// braces are percent-encoded, so the URL goes out as written here.
 const MESSAGE_EXPAND: &str = "singleValueExtendedProperties($filter=\
 id%20eq%20%27Boolean%20%7B00062008-0000-0000-C000-000000000046%7D%20Id%200x8503%27%20or%20\
 id%20eq%20%27SystemTime%20%7B00062008-0000-0000-C000-000000000046%7D%20Id%200x8502%27%20or%20\
-id%20eq%20%27SystemTime%20%7B00062008-0000-0000-C000-000000000046%7D%20Id%200x8560%27)";
+id%20eq%20%27SystemTime%20%7B00062008-0000-0000-C000-000000000046%7D%20Id%200x8560%27%20or%20\
+id%20eq%20%27String%200x001A%27)";
 
-/// `target` with the reminder `$expand` (#2054) appended.
+/// `target` with the reminder and class `$expand` (#2054, #2081) appended.
 fn with_expand(target: &str) -> String {
     format!("{target}&$expand={MESSAGE_EXPAND}")
 }
@@ -985,8 +988,15 @@ impl GraphClient {
     }
 
     /// Searches messages on the server (#2006): GET
-    /// `/me/messages?$search=…&$select=MESSAGE_SELECT,parentFolderId&$top=…`,
-    /// or `/me/mailFolders/{id}/messages?…` with a folder. `query` is KQL as
+    /// `/me/messages?$search=…&$select=MESSAGE_SELECT,parentFolderId&$top=…
+    /// &$expand=MESSAGE_EXPAND`, or `/me/mailFolders/{id}/messages?…` with a
+    /// folder. The expand brings each hit's reminder and meeting message
+    /// type (#2081); should Graph refuse it (a 400), the first request is
+    /// sent once more without it, as `delta`'s is, and the hits are marked
+    /// `MessageFields::reminder_unasked`. A 400 with another cause (bad KQL)
+    /// costs that one extra request, and the second answer is returned as
+    /// it is. A `nextLink` is sent as is (it keeps what the first request
+    /// asked). `query` is KQL as
     /// the client wrote it; it goes in one quoted `$search` value
     /// (`search_value`), so a `"` or `\` in it cannot end the clause.
     /// Graph allows neither `$orderby` nor `$filter` with `$search`: the hits
@@ -1011,14 +1021,27 @@ impl GraphClient {
             search_value(query)
         );
         let mut hits = Vec::new();
+        let mut first = true;
+        let mut expanded = true;
         loop {
-            let resp = self.send(Method::Get, &target, None, &[])?;
+            let resp = if first {
+                first = false;
+                let (resp, asked) = self.get_with_expand(&target, &[])?;
+                expanded = asked;
+                resp
+            } else {
+                self.send(Method::Get, &target, None, &[])?
+            };
             let v = parse_body(resp)?;
             let before = hits.len();
             hits.extend(
                 value_array(&v, "value")?
                     .iter()
-                    .filter_map(SearchHit::from_json),
+                    .filter_map(SearchHit::from_json)
+                    .map(|mut hit| {
+                        hit.fields.reminder_unasked = !expanded;
+                        hit
+                    }),
             );
             if hits.len() >= top {
                 hits.truncate(top);
@@ -3005,7 +3028,8 @@ mod tests {
         assert_eq!(
             reqs[0].path,
             format!(
-                "/me/messages?$search=%22budget%22&$select={MESSAGE_SELECT},parentFolderId&$top=25"
+                "/me/messages?$search=%22budget%22&$select={MESSAGE_SELECT},parentFolderId&$top=25\
+                 &$expand={MESSAGE_EXPAND}"
             )
         );
     }
@@ -3020,7 +3044,7 @@ mod tests {
             path,
             &format!(
                 "/me/mailFolders/A%2FB%2BC%3D/messages?$search=%22budget%22\
-                 &$select={MESSAGE_SELECT},parentFolderId&$top=10"
+                 &$select={MESSAGE_SELECT},parentFolderId&$top=10&$expand={MESSAGE_EXPAND}"
             )
         );
     }
@@ -3037,9 +3061,11 @@ mod tests {
             ),
             "{path}"
         );
-        // Graph allows neither with `$search` on messages.
+        // Graph allows neither with `$search` on messages (as query
+        // options: the expand's own `$filter` is inside its parentheses).
         assert!(!path.contains("$orderby"), "{path}");
-        assert!(!path.contains("$filter"), "{path}");
+        assert!(!path.contains("&$filter"), "{path}");
+        assert!(!path.contains("?$filter"), "{path}");
     }
 
     #[test]
@@ -3052,7 +3078,10 @@ mod tests {
         let tops: Vec<String> = srv
             .requests()
             .iter()
-            .map(|r| r.path.rsplit("$top=").next().unwrap().to_string())
+            .map(|r| {
+                let top = r.path.rsplit("$top=").next().unwrap();
+                top.split('&').next().unwrap().to_string()
+            })
             .collect();
         assert_eq!(tops, ["1", "1000", "1000"]);
     }
@@ -7773,9 +7802,9 @@ mod tests {
     }
 
     #[test]
-    fn message_expand_names_the_three_reminder_properties() {
+    fn message_expand_names_the_reminder_and_class_properties() {
         // The `$filter` inside the expand, decoded, is exactly the three
-        // property ids the model reads.
+        // reminder property ids and the message class id the model reads.
         let decoded = MESSAGE_EXPAND
             .replace("%20", " ")
             .replace("%27", "'")
@@ -7785,11 +7814,116 @@ mod tests {
             decoded,
             format!(
                 "singleValueExtendedProperties($filter=id eq '{REMINDER_SET_PROP}' or \
-                 id eq '{}' or id eq '{REMINDER_SIGNAL_TIME_PROP}')",
-                crate::graph::model::REMINDER_TIME_PROP
+                 id eq '{}' or id eq '{REMINDER_SIGNAL_TIME_PROP}' or id eq '{}')",
+                crate::graph::model::REMINDER_TIME_PROP,
+                crate::graph::model::MESSAGE_CLASS_PROP
             )
         );
         assert!(!MESSAGE_EXPAND.contains(' '));
+    }
+
+    #[test]
+    fn delta_page_reads_each_message_class_as_its_meeting_type() {
+        // The class comes back in the expand Graph's way (the short id
+        // form): each meeting class is its type, a plain message `None`,
+        // and every item carried it, so each writes.
+        let item = |id: &str, class: &str| {
+            format!(
+                r#"{{"id":"{id}","subject":"s","singleValueExtendedProperties":[
+                    {{"id":"String 0x1a","value":"{class}"}}]}}"#
+            )
+        };
+        let body = format!(
+            r#"{{"value":[{},{},{}],"@odata.deltaLink":"http://x/d"}}"#,
+            item("M1", "IPM.Schedule.Meeting.Canceled"),
+            item("M2", "IPM.Schedule.Meeting.Resp.Tent"),
+            item("M3", "IPM.Note")
+        );
+        let srv = FakeServer::start(vec![get_route("/me/mailFolders/F1/", 200, &body)]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let page = c.delta(DeltaCursor::Full("F1".to_string())).unwrap();
+        let got: Vec<_> = page
+            .items
+            .iter()
+            .map(|i| match i {
+                crate::graph::model::DeltaItem::Upsert(m, f) => (
+                    m.id.as_str(),
+                    m.meeting_message_type,
+                    f.writes_meeting_type(),
+                ),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("M1", Some(MeetingMessageType::Cancelled), true),
+                ("M2", Some(MeetingMessageType::TentativelyAccepted), true),
+                ("M3", None, true),
+            ]
+        );
+        assert!(
+            srv.requests()[0]
+                .path
+                .ends_with(&format!("&$expand={MESSAGE_EXPAND}"))
+        );
+    }
+
+    #[test]
+    fn search_messages_reads_the_meeting_type_of_each_hit() {
+        let srv = FakeServer::start(vec![search_page(
+            "/me/messages?",
+            r#"{"id":"M1","parentFolderId":"F1","singleValueExtendedProperties":[
+                {"id":"String 0x001A","value":"IPM.Schedule.Meeting.Request"}]},
+               {"id":"M2","parentFolderId":"F1"}"#,
+            None,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let hits = c.search_messages(None, "budget", 5).unwrap();
+        let got: Vec<_> = hits
+            .iter()
+            .map(|h| (h.message.meeting_message_type, h.fields.reminder_unasked))
+            .collect();
+        assert_eq!(
+            got,
+            [(Some(MeetingMessageType::Request), false), (None, false)]
+        );
+    }
+
+    #[test]
+    fn search_messages_retries_without_expand_on_400() {
+        // Only the first request asks for the expand; a refusal sends it
+        // once more without it, marks its hits unasked, and a nextLink is
+        // then followed as Graph minted it.
+        let plain = format!(
+            "/me/messages?$search=%22budget%22&$select={MESSAGE_SELECT},parentFolderId&$top=5"
+        );
+        let srv = FakeServer::start(vec![
+            get_route(&format!("{plain}&$expand="), 400, "{}"),
+            search_page(
+                "/me/messages?$skiptoken=2",
+                r#"{"id":"M2","parentFolderId":"F1"}"#,
+                None,
+            ),
+            search_page(
+                &plain,
+                r#"{"id":"M1","parentFolderId":"F1"}"#,
+                Some("/me/messages?$skiptoken=2"),
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let hits = c.search_messages(None, "budget", 5).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| h.fields.reminder_unasked));
+        let paths: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
+        assert_eq!(
+            paths,
+            [
+                format!("{plain}&$expand={MESSAGE_EXPAND}"),
+                plain.clone(),
+                "/me/messages?$skiptoken=2".to_string()
+            ]
+        );
     }
 
     #[test]
