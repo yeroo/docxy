@@ -711,6 +711,32 @@ fn with_expand(target: &str) -> String {
     format!("{target}&$expand={MESSAGE_EXPAND}")
 }
 
+/// The most sub-requests one `POST /$batch` takes: Graph's limit (#1913).
+pub const BATCH_MAX: usize = 20;
+
+/// The page size of [`GraphClient::unread_message_ids`] (#1913).
+const UNREAD_IDS_TOP: usize = 1000;
+
+/// One sub-request of a [`GraphClient::batch`] (#1913). `url` is relative
+/// to the API version (`/me/messages/{id}`); `body` is its JSON body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchRequest {
+    pub method: &'static str,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Value>,
+}
+
+/// One sub-response of a [`GraphClient::batch`] (#1913): its status, the
+/// `Retry-After` its headers carry (read case-insensitively), and its body
+/// as JSON text (empty when it had none).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchResponse {
+    pub status: u16,
+    pub retry_after_secs: Option<u64>,
+    pub body: String,
+}
+
 enum Method {
     Get,
     Patch,
@@ -1221,6 +1247,158 @@ impl GraphClient {
         let body = Value::Object(vec![("isRead".to_string(), Value::Bool(read))]).to_string();
         self.send(Method::Patch, &path, Some(body), &[])?;
         Ok(())
+    }
+
+    /// PATCH `{"isRead":true}` for one message as a [`GraphClient::batch`]
+    /// sub-request (#1913), with `Prefer: return=minimal`: Graph answers
+    /// 204, not the whole message.
+    pub fn mark_read_request(id: &str) -> BatchRequest {
+        BatchRequest {
+            method: "PATCH",
+            url: format!("/me/messages/{}", encode_path_segment(id)),
+            headers: vec![("Prefer".to_string(), "return=minimal".to_string())],
+            body: Some(Value::Object(vec![(
+                "isRead".to_string(),
+                Value::Bool(true),
+            )])),
+        }
+    }
+
+    /// POST `/$batch` (#1913): Graph JSON batching, at most
+    /// [`BATCH_MAX`] sub-requests (more is a caller bug, answered `Parse`
+    /// with nothing sent). Each sub-request's `id` is its 1-based index in
+    /// `reqs`; one with a body also gets `Content-Type: application/json`.
+    /// The answers are matched back by `id` (Graph does not promise their
+    /// order) and returned in request order; an answer missing an id, or
+    /// naming one twice or one never sent, is `Parse`. A sub-response 401
+    /// makes the whole call `Unauthorized`, for the caller's refresh and
+    /// retry. The batch's own status goes through `classify_status`.
+    pub fn batch(&self, reqs: &[BatchRequest]) -> Result<Vec<BatchResponse>, GraphError> {
+        if reqs.len() > BATCH_MAX {
+            return Err(GraphError::Parse(format!(
+                "a batch holds at most {BATCH_MAX} requests, not {}",
+                reqs.len()
+            )));
+        }
+        let requests = reqs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let mut headers = r.headers.clone();
+                if r.body.is_some()
+                    && !headers
+                        .iter()
+                        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                {
+                    headers.push(("Content-Type".to_string(), "application/json".to_string()));
+                }
+                let mut entry = vec![
+                    ("id".to_string(), Value::Str((i + 1).to_string())),
+                    ("method".to_string(), Value::Str(r.method.to_string())),
+                    ("url".to_string(), Value::Str(r.url.clone())),
+                ];
+                if !headers.is_empty() {
+                    entry.push((
+                        "headers".to_string(),
+                        Value::Object(
+                            headers
+                                .into_iter()
+                                .map(|(k, v)| (k, Value::Str(v)))
+                                .collect(),
+                        ),
+                    ));
+                }
+                if let Some(body) = &r.body {
+                    entry.push(("body".to_string(), body.clone()));
+                }
+                Value::Object(entry)
+            })
+            .collect();
+        let body = Value::Object(vec![("requests".to_string(), Value::Array(requests))]);
+        let resp = self.send(Method::Post, "/$batch", Some(body.to_string()), &[])?;
+        let v = parse_body(resp)?;
+        let mut out: Vec<Option<BatchResponse>> = vec![None; reqs.len()];
+        for item in value_array(&v, "responses")? {
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| GraphError::Parse("batch response without an id".to_string()))?;
+            let slot = id
+                .parse::<usize>()
+                .ok()
+                .filter(|n| (1..=reqs.len()).contains(n))
+                .ok_or_else(|| GraphError::Parse(format!("batch response for unknown id {id}")))?
+                - 1;
+            if out[slot].is_some() {
+                return Err(GraphError::Parse(format!("batch answered id {id} twice")));
+            }
+            let status = item
+                .get("status")
+                .and_then(Value::as_i64)
+                .and_then(|s| u16::try_from(s).ok())
+                .ok_or_else(|| GraphError::Parse(format!("batch response {id} has no status")))?;
+            if status == 401 {
+                return Err(GraphError::Unauthorized);
+            }
+            let retry_after_secs = match item.get("headers") {
+                Some(Value::Object(h)) => h
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("retry-after"))
+                    .and_then(|(_, v)| match v {
+                        Value::Str(s) => s.trim().parse().ok(),
+                        other => other.as_i64().and_then(|n| u64::try_from(n).ok()),
+                    }),
+                _ => None,
+            };
+            let body = item.get("body").map(Value::to_string).unwrap_or_default();
+            out[slot] = Some(BatchResponse {
+                status,
+                retry_after_secs,
+                body,
+            });
+        }
+        out.into_iter()
+            .enumerate()
+            .map(|(i, r)| {
+                r.ok_or_else(|| GraphError::Parse(format!("batch answer is missing id {}", i + 1)))
+            })
+            .collect()
+    }
+
+    /// GET `/me/mailFolders/{folder}/messages`, the ids of the unread
+    /// messages received at or before `before` (an ISO-8601 UTC instant),
+    /// 1000 a page, following `@odata.nextLink` (#1913). Deduplicated in
+    /// first-seen order; an item without an id is skipped. Any page's
+    /// failure is an `Err`, never a partial list.
+    pub fn unread_message_ids(
+        &self,
+        folder_id: &str,
+        before: &str,
+    ) -> Result<Vec<String>, GraphError> {
+        let folder_id = encode_path_segment(folder_id);
+        let mut target = format!(
+            "/me/mailFolders/{folder_id}/messages\
+             ?$filter=isRead%20eq%20false%20and%20receivedDateTime%20le%20{before}\
+             &$select=id&$top={UNREAD_IDS_TOP}"
+        );
+        let mut ids = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let resp = self.send(Method::Get, &target, None, &[])?;
+            let v = parse_body(resp)?;
+            for item in value_array(&v, "value")? {
+                if let Some(id) = item.get("id").and_then(Value::as_str) {
+                    if !id.is_empty() && seen.insert(id.to_string()) {
+                        ids.push(id.to_string());
+                    }
+                }
+            }
+            match v.get("@odata.nextLink").and_then(Value::as_str) {
+                Some(next) => target = next.to_string(),
+                None => break,
+            }
+        }
+        Ok(ids)
     }
 
     /// PATCH `/me/messages/{id}` with `{"flag":{"flagStatus":"flagged"|"notFlagged"}}`.
@@ -3582,6 +3760,163 @@ mod tests {
         c.mark_read("M1", true).unwrap();
         let reqs = srv.requests();
         assert_eq!(reqs[0].body, r#"{"isRead":true}"#);
+    }
+
+    fn batch_route(body: &str) -> Route {
+        Route {
+            method: "POST".into(),
+            path_prefix: "/$batch".into(),
+            status: 200,
+            headers: vec![],
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn batch_posts_numbered_sub_requests_and_matches_answers_by_id() {
+        // Answered in reverse id order, with a 404 in the middle.
+        let srv = FakeServer::start(vec![batch_route(
+            r#"{"responses":[{"id":"3","status":204,"headers":{}},
+                {"id":"2","status":404,"body":{"error":{"code":"ErrorItemNotFound"}}},
+                {"id":"1","status":204}]}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let reqs: Vec<BatchRequest> = ["M1", "M/2", "M3"]
+            .iter()
+            .map(|id| GraphClient::mark_read_request(id))
+            .collect();
+        let out = c.batch(&reqs).unwrap();
+        assert_eq!(
+            out.iter().map(|r| r.status).collect::<Vec<_>>(),
+            vec![204, 404, 204]
+        );
+        assert_eq!(out[1].body, r#"{"error":{"code":"ErrorItemNotFound"}}"#);
+        assert_eq!(out[0].body, "");
+        let sent = srv.requests();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].method, "POST");
+        assert_eq!(sent[0].path, "/$batch");
+        assert_eq!(
+            sent[0].body,
+            r#"{"requests":[{"id":"1","method":"PATCH","url":"/me/messages/M1","headers":{"Prefer":"return=minimal","Content-Type":"application/json"},"body":{"isRead":true}},{"id":"2","method":"PATCH","url":"/me/messages/M%2F2","headers":{"Prefer":"return=minimal","Content-Type":"application/json"},"body":{"isRead":true}},{"id":"3","method":"PATCH","url":"/me/messages/M3","headers":{"Prefer":"return=minimal","Content-Type":"application/json"},"body":{"isRead":true}}]}"#
+        );
+    }
+
+    #[test]
+    fn batch_reads_retry_after_from_a_sub_response() {
+        let srv = FakeServer::start(vec![batch_route(
+            r#"{"responses":[{"id":"1","status":429,"headers":{"retry-after":"7"}},
+                {"id":"2","status":503,"headers":{"Retry-After":"3"}},
+                {"id":"3","status":429}]}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let reqs: Vec<BatchRequest> = ["M1", "M2", "M3"]
+            .iter()
+            .map(|id| GraphClient::mark_read_request(id))
+            .collect();
+        let out = c.batch(&reqs).unwrap();
+        assert_eq!(
+            out.iter().map(|r| r.retry_after_secs).collect::<Vec<_>>(),
+            vec![Some(7), Some(3), None]
+        );
+    }
+
+    #[test]
+    fn batch_sub_response_401_is_unauthorized() {
+        let srv = FakeServer::start(vec![batch_route(
+            r#"{"responses":[{"id":"1","status":204},{"id":"2","status":401}]}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let reqs = vec![
+            GraphClient::mark_read_request("M1"),
+            GraphClient::mark_read_request("M2"),
+        ];
+        assert_eq!(c.batch(&reqs), Err(GraphError::Unauthorized));
+    }
+
+    #[test]
+    fn batch_answer_missing_an_id_is_a_parse_error() {
+        let c_reqs = vec![
+            GraphClient::mark_read_request("M1"),
+            GraphClient::mark_read_request("M2"),
+        ];
+        for body in [
+            r#"{"responses":[{"id":"1","status":204}]}"#,
+            r#"{"responses":[{"id":"1","status":204},{"id":"1","status":204}]}"#,
+            r#"{"responses":[{"id":"1","status":204},{"id":"9","status":204}]}"#,
+            r#"{"value":[]}"#,
+        ] {
+            let srv = FakeServer::start(vec![batch_route(body)]);
+            let c = GraphClient::new(&srv.base_url, "AT");
+            assert!(
+                matches!(c.batch(&c_reqs), Err(GraphError::Parse(_))),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_of_more_than_20_is_refused() {
+        let srv = FakeServer::start(vec![batch_route(r#"{"responses":[]}"#)]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let reqs: Vec<BatchRequest> = (0..=BATCH_MAX)
+            .map(|i| GraphClient::mark_read_request(&format!("M{i}")))
+            .collect();
+        assert!(matches!(c.batch(&reqs), Err(GraphError::Parse(_))));
+        assert!(srv.requests().is_empty(), "nothing is sent");
+    }
+
+    #[test]
+    fn batch_status_is_classified() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/$batch".into(),
+            status: 429,
+            headers: vec![("Retry-After".into(), "4".into())],
+            body: String::new(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.batch(&[GraphClient::mark_read_request("M1")]),
+            Err(GraphError::Throttled {
+                retry_after_secs: 4
+            })
+        );
+    }
+
+    #[test]
+    fn unread_message_ids_follows_next_link_and_dedups() {
+        // The second page's route must come first: both share the prefix.
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F%201/messages?$skiptoken=P2".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"B"},{"id":"C"},{"x":1}]}"#.into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F%201/messages".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"A"},{"id":"B"}],
+                    "@odata.nextLink":"/me/mailFolders/F%201/messages?$skiptoken=P2"}"#
+                    .into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let ids = c.unread_message_ids("F 1", "2026-11-10T18:00:00Z").unwrap();
+        assert_eq!(ids, vec!["A", "B", "C"]);
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(
+            reqs[0].path,
+            "/me/mailFolders/F%201/messages\
+             ?$filter=isRead%20eq%20false%20and%20receivedDateTime%20le%202026-11-10T18:00:00Z\
+             &$select=id&$top=1000"
+        );
+        assert_eq!(reqs[1].path, "/me/mailFolders/F%201/messages?$skiptoken=P2");
     }
 
     #[test]
