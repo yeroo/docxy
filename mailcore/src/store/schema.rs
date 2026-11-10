@@ -512,9 +512,9 @@ END;
 -- messages_fts_au is created by `migrate_fts_update_trigger`
 -- (`MESSAGES_FTS_AU_SQL`), which also replaces an older database's.
 
-CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
-    DELETE FROM messages_fts WHERE message_id = old.id;
-END;
+-- messages_fts_ad and bodies_fts_ad are `FTS_DELETE_TRIGGERS_SQL`, run by
+-- `Store::init` right after this: `Store::empty_folder` drops and re-creates
+-- them from that one text (#2110).
 
 CREATE TRIGGER IF NOT EXISTS bodies_fts_ai AFTER INSERT ON bodies BEGIN
     DELETE FROM messages_fts WHERE message_id = new.message_id;
@@ -529,14 +529,25 @@ CREATE TRIGGER IF NOT EXISTS bodies_fts_au AFTER UPDATE ON bodies BEGIN
     SELECT id, subject, from_name || ' ' || from_addr, new.content
     FROM messages WHERE id = new.message_id;
 END;
+"#;
 
+/// The FTS triggers of a deleted message or body (#2110: moved out of
+/// `SCHEMA_SQL`, the text unchanged). Each one's `DELETE` scans the whole
+/// FTS table (`message_id` is `UNINDEXED`), so deleting a folder's thousands
+/// of rows one trigger at a time is quadratic: `Store::empty_folder` drops
+/// both inside its transaction, deletes the folder's FTS rows in one
+/// statement, and runs this text again before it commits. Created by
+/// `Store::init` right after `SCHEMA_SQL`; idempotent.
+pub(crate) const FTS_DELETE_TRIGGERS_SQL: &str = "\
+CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+    DELETE FROM messages_fts WHERE message_id = old.id;
+END;
 CREATE TRIGGER IF NOT EXISTS bodies_fts_ad AFTER DELETE ON bodies BEGIN
     DELETE FROM messages_fts WHERE message_id = old.message_id;
     INSERT INTO messages_fts(message_id, subject, from_text, body)
     SELECT id, subject, from_name || ' ' || from_addr, ''
     FROM messages WHERE id = old.message_id;
-END;
-"#;
+END;";
 
 /// The triggers that fill `forgotten_ids` (#2107): a deleted message or
 /// folder row, and an id a re-key leaves, are recorded; a row inserted or

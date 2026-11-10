@@ -105,6 +105,12 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Ap
         OutboxOp::DeleteFolder { .. } => Err(GraphError::Parse(
             "DeleteFolder is run by the engine".to_string(),
         )),
+        // The engine runs it itself (#2110: it pages the folder's ids, checks
+        // them against the command's allow-list and deletes them through
+        // `$batch`). Should it reach here, nothing is sent.
+        OutboxOp::EmptyFolder { .. } => Err(GraphError::Parse(
+            "EmptyFolder is run by the engine".to_string(),
+        )),
         op => apply_other(client, store, op).map(|()| Applied::Done),
     }
 }
@@ -227,7 +233,8 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
         | OutboxOp::CreateFolder { .. }
         | OutboxOp::MoveFolder { .. }
         | OutboxOp::MarkFolderRead { .. }
-        | OutboxOp::DeleteFolder { .. } => {
+        | OutboxOp::DeleteFolder { .. }
+        | OutboxOp::EmptyFolder { .. } => {
             unreachable!("apply_op handles it")
         }
         OutboxOp::RenameFolder { id, name, .. } => match graph_folder(store, id)? {
@@ -857,6 +864,25 @@ mod tests {
             &OutboxOp::MarkFolderRead {
                 folder: "F".into(),
                 before: "2026-11-10T18:00:00Z".into(),
+            },
+        );
+        assert!(matches!(r, Err(GraphError::Parse(_))), "{r:?}");
+        assert!(srv.requests().is_empty());
+    }
+
+    /// #2110: the engine runs it; `apply_op` sends nothing.
+    #[test]
+    fn apply_op_empty_folder_sends_nothing() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let r = apply_op(
+            &c,
+            &store,
+            &OutboxOp::EmptyFolder {
+                folder: "F".into(),
+                before: "2026-11-10T18:00:00Z".into(),
+                batch: "empty:1".into(),
             },
         );
         assert!(matches!(r, Err(GraphError::Parse(_))), "{r:?}");
