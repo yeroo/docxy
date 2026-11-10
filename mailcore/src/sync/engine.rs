@@ -213,8 +213,12 @@ pub enum SyncCommand {
     /// for the reader's meeting banner. Emits
     /// [`SyncEvent::MeetingMessageFetched`]; a plain message is an all-`None`
     /// [`MeetingMessage`], not an error. Signed out it is a
-    /// [`SyncEvent::Error`]; a failed GET goes through `react`. Direct call,
-    /// nothing stored.
+    /// [`SyncEvent::Error`]; a failed GET goes through `react`. Direct call.
+    /// A type in the answer is also written to the stored row (#2081,
+    /// `Store::set_meeting_message_type`, through `current_id`), with a
+    /// `MessagesUpdated` for its folder first when that changed it; a store
+    /// failure is a `SyncEvent::Error`, and the fetched event still comes.
+    /// No type writes nothing.
     FetchMeetingMessage { message_id: String },
     /// Remove a cancelled meeting from the user's calendar without sending
     /// anything (#2024, Outlook's "Remove from Calendar" on a cancellation).
@@ -4597,10 +4601,24 @@ impl Engine {
             return;
         }
         match self.with_auth(|c| c.meeting_message(&message_id)) {
-            Ok(meeting) => self.emit(SyncEvent::MeetingMessageFetched {
-                message_id,
-                meeting,
-            }),
+            Ok(meeting) => {
+                // The answer's type goes on the stored row too (#2081), so
+                // a row stored before the type was gets it once opened. A
+                // `None` says nothing the class did not: the row is kept.
+                if let Some(t) = meeting.message_type {
+                    match self.store.set_meeting_message_type(&message_id, Some(t)) {
+                        Ok(Some(folder_id)) => self.emit(SyncEvent::MessagesUpdated { folder_id }),
+                        Ok(None) => {}
+                        Err(e) => self.emit(SyncEvent::Error(format!(
+                            "store meeting message type of {message_id}: {e}"
+                        ))),
+                    }
+                }
+                self.emit(SyncEvent::MeetingMessageFetched {
+                    message_id,
+                    meeting,
+                });
+            }
             Err(e) => {
                 self.react(e);
             }
@@ -6462,6 +6480,7 @@ mod tests {
                             preview: String::new(),
                             is_draft: false,
                             is_meeting_request: false,
+                            meeting_message_type: None,
                             categories: vec![],
                             is_reminder_on: false,
                             reminder_at: String::new(),
@@ -19820,6 +19839,7 @@ mod tests {
                 preview: String::new(),
                 is_draft: true,
                 is_meeting_request: false,
+                meeting_message_type: None,
                 categories: Vec::new(),
                 is_reminder_on: false,
                 reminder_at: String::new(),
@@ -20480,6 +20500,259 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- Each message's meeting message type on its row (#2081) ----------
+
+    mod meeting_message_types {
+        use super::*;
+
+        /// `message_json` with its message class, as the expand brings it
+        /// (Graph's short id form).
+        fn classed_json(id: &str, class: &str) -> String {
+            let plain = message_json(id, false, false, &[]);
+            format!(
+                r#"{},"singleValueExtendedProperties":[{{"id":"String 0x1a","value":"{class}"}}]}}"#,
+                plain.strip_suffix('}').unwrap()
+            )
+        }
+
+        fn types_of(store: &Store, ids: &[&str]) -> Vec<(String, Option<MeetingMessageType>)> {
+            let mut rows: Vec<_> = store
+                .message_rows(ids)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.id, r.meeting_message_type))
+                .collect();
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            rows
+        }
+
+        #[test]
+        fn delta_stores_each_meeting_message_type_and_a_later_round_keeps_it() {
+            use MeetingMessageType as T;
+            let startup = [
+                classed_json("M1", "IPM.Schedule.Meeting.Request"),
+                classed_json("M2", "IPM.Schedule.Meeting.Canceled"),
+                classed_json("M3", "IPM.Schedule.Meeting.Resp.Pos"),
+                classed_json("M4", "IPM.Schedule.Meeting.Resp.Tent"),
+                classed_json("M5", "IPM.Schedule.Meeting.Resp.Neg"),
+                classed_json("M6", "IPM.Note"),
+            ];
+            // The next round's M2 comes without its class (complete, read
+            // now): its stored type is kept.
+            let later = [message_json("M2", true, false, &[])];
+            let mut routes = vec![calendar_route()];
+            routes.extend(deltas("F1", &startup, &later));
+            routes.extend(startup_then(
+                "/me/mailFolders?",
+                &list(&[tree_folder("F1", "Inbox", None, (6, 6), 0)]),
+                &list(&[tree_folder("F1", "Inbox", None, (6, 5), 0)]),
+            ));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) =
+                spawn_fast(&srv, "meeting-type-delta", TICK, None, |_| {});
+            let store = Store::open(&store_path).unwrap();
+            let ids = ["M1", "M2", "M3", "M4", "M5", "M6"];
+            let want = vec![
+                ("M1".to_string(), Some(T::Request)),
+                ("M2".to_string(), Some(T::Cancelled)),
+                ("M3".to_string(), Some(T::Accepted)),
+                ("M4".to_string(), Some(T::TentativelyAccepted)),
+                ("M5".to_string(), Some(T::Declined)),
+                ("M6".to_string(), None),
+            ];
+            assert!(
+                wait_until(TICK_WAIT, || types_of(&store, &ids) == want),
+                "{:?}",
+                types_of(&store, &ids)
+            );
+            // The first call asked for the class.
+            let first = srv
+                .requests()
+                .into_iter()
+                .find(|r| r.path.starts_with("/me/mailFolders/F1/messages/delta?$"))
+                .unwrap();
+            assert!(
+                first
+                    .path
+                    .contains("%20or%20id%20eq%20%27String%200x001A%27)"),
+                "{}",
+                first.path
+            );
+            // The later round's M2 landed (read), its type kept.
+            assert!(wait_until(TICK_WAIT, || store
+                .message_row("M2")
+                .unwrap()
+                .is_some_and(|r| r.is_read)));
+            assert_eq!(types_of(&store, &ids), want);
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `M1` in `F1`, stored without a type (as before #2081).
+        fn seed_m1(s: &Store) {
+            s.upsert_folder(&crate::graph::model::MailFolder {
+                id: "F1".into(),
+                display_name: "Inbox".into(),
+                parent_id: None,
+                total_count: 1,
+                unread_count: 0,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+            let v = crate::json::parse(&message_json("M1", false, false, &[])).unwrap();
+            s.upsert_message("F1", &Message::from_json(&v).unwrap())
+                .unwrap();
+        }
+
+        fn fetched(seen: &[SyncEvent]) -> Vec<SyncEvent> {
+            seen.iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        SyncEvent::MessagesUpdated { .. }
+                            | SyncEvent::MeetingMessageFetched { .. }
+                            | SyncEvent::Error(_)
+                    )
+                })
+                .cloned()
+                .collect()
+        }
+
+        fn fetch(handle: &SyncHandle, id: &str) -> Vec<SyncEvent> {
+            handle
+                .cmd_tx
+                .send(SyncCommand::FetchMeetingMessage {
+                    message_id: id.into(),
+                })
+                .unwrap();
+            fetched(&wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::MeetingMessageFetched { .. })
+            }))
+        }
+
+        #[test]
+        fn fetch_meeting_message_stores_the_type_on_an_old_row() {
+            let cancelled = r#"{"id":"M1","meetingMessageType":"meetingCancelled",
+                "event":{"id":"E1","isOrganizer":false}}"#;
+            let mut routes = vec![
+                (get_route("/me/messages/M1?", 200, cancelled), None),
+                (
+                    get_route(
+                        "/me/messages/M9?",
+                        200,
+                        r#"{"id":"M9","meetingMessageType":"meetingRequest"}"#,
+                    ),
+                    None,
+                ),
+            ];
+            routes.extend(folder_routes(&[("F1", "Inbox", Some("inbox"))], &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) =
+                spawn_fast(&srv, "meeting-type-fetch", HOUR, None, seed_m1);
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || store
+                .get_delta_link("F1")
+                .unwrap()
+                .is_some()));
+            assert_eq!(
+                store
+                    .message_row("M1")
+                    .unwrap()
+                    .unwrap()
+                    .meeting_message_type,
+                None
+            );
+            let _ = handle.evt_rx.try_iter().count();
+            let meeting = MeetingMessage {
+                message_type: Some(MeetingMessageType::Cancelled),
+                event_id: Some("E1".into()),
+                is_organizer: false,
+            };
+            // The row gets the type, and its folder's list is told first.
+            assert_eq!(
+                fetch(&handle, "M1"),
+                [
+                    SyncEvent::MessagesUpdated {
+                        folder_id: "F1".into()
+                    },
+                    SyncEvent::MeetingMessageFetched {
+                        message_id: "M1".into(),
+                        meeting: meeting.clone(),
+                    },
+                ]
+            );
+            assert_eq!(
+                store
+                    .message_row("M1")
+                    .unwrap()
+                    .unwrap()
+                    .meeting_message_type,
+                Some(MeetingMessageType::Cancelled)
+            );
+            // The same answer again changes nothing: no list update.
+            assert_eq!(
+                fetch(&handle, "M1"),
+                [SyncEvent::MeetingMessageFetched {
+                    message_id: "M1".into(),
+                    meeting,
+                }]
+            );
+            // A message the store does not hold: the answer only.
+            assert_eq!(
+                fetch(&handle, "M9"),
+                [SyncEvent::MeetingMessageFetched {
+                    message_id: "M9".into(),
+                    meeting: MeetingMessage {
+                        message_type: Some(MeetingMessageType::Request),
+                        ..MeetingMessage::default()
+                    },
+                }]
+            );
+            assert!(store.message_row("M9").unwrap().is_none());
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn fetch_meeting_message_without_a_type_keeps_the_row() {
+            let mut routes = vec![(
+                get_route("/me/messages/M1?", 200, r#"{"id":"M1","subject":"Lunch?"}"#),
+                None,
+            )];
+            routes.extend(folder_routes(&[("F1", "Inbox", Some("inbox"))], &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) =
+                spawn_fast(&srv, "meeting-type-fetch-none", HOUR, None, |s| {
+                    seed_m1(s);
+                    s.set_meeting_message_type("M1", Some(MeetingMessageType::Declined))
+                        .unwrap();
+                });
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || store
+                .get_delta_link("F1")
+                .unwrap()
+                .is_some()));
+            let _ = handle.evt_rx.try_iter().count();
+            assert_eq!(
+                fetch(&handle, "M1"),
+                [SyncEvent::MeetingMessageFetched {
+                    message_id: "M1".into(),
+                    meeting: MeetingMessage::default(),
+                }]
+            );
+            assert_eq!(
+                store
+                    .message_row("M1")
+                    .unwrap()
+                    .unwrap()
+                    .meeting_message_type,
+                Some(MeetingMessageType::Declined)
+            );
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     // --- A flagged message's reminder (#2054) ------------------------------
 
     mod message_reminders {
@@ -20527,6 +20800,7 @@ mod tests {
                     preview: String::new(),
                     is_draft: false,
                     is_meeting_request: false,
+                    meeting_message_type: None,
                     categories: vec![],
                     is_reminder_on: true,
                     reminder_at: "2026-11-08T10:00:00Z".into(),
@@ -21247,6 +21521,7 @@ mod tests {
                     preview: String::new(),
                     is_draft: false,
                     is_meeting_request: false,
+                    meeting_message_type: None,
                     categories: vec![],
                     is_reminder_on: false,
                     reminder_at: String::new(),
@@ -24764,13 +25039,17 @@ mod tests {
                     assert_eq!(paths.len(), 2, "{paths:?}");
                     assert!(
                         paths[0].starts_with("/me/messages?$search=%22budget%22&$select=id,")
-                            && paths[0].ends_with(",parentFolderId&$top=25"),
+                            && paths[0].contains(
+                                ",parentFolderId&$top=25&$expand=singleValueExtendedProperties(",
+                            ),
                         "{paths:?}"
                     );
                     assert!(
                         paths[1].starts_with(
                             "/me/mailFolders/F2/messages?$search=%22nothing%22&$select=id,"
-                        ) && paths[1].ends_with(",parentFolderId&$top=5"),
+                        ) && paths[1].contains(
+                            ",parentFolderId&$top=5&$expand=singleValueExtendedProperties(",
+                        ),
                         "{paths:?}"
                     );
                     stop(handle);

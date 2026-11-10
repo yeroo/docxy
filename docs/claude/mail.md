@@ -1800,12 +1800,14 @@ from the calendar without sending anything.
   value and an absent one are `None`, never an error. `MeetingMessage::from_json` never
   fails either: a plain message is all `None` and `is_organizer: false`, and so is an
   `event` without `isOrganizer` (for the organizer flag) or with an empty id (for the id).
-- Not stored. The type is a derived-type property, and the delta `$select`
-  (`MESSAGE_SELECT`) holds base `message` fields only; a type-cast select there would put
-  every sync round at risk. The reader needs the type only for the open message's banner,
-  so it asks with `SyncCommand::FetchMeetingMessage { message_id }`, which emits
-  `SyncEvent::MeetingMessageFetched { message_id, meeting }`. The stored
-  `Message::is_meeting_request` (from `@odata.type`) still marks invites in the list.
+- On demand here; each row stores its type since #2081 (read from the message class, not
+  this property: see "A message's meeting type on its row (#2081)"). The type is a
+  derived-type property, and the delta `$select` (`MESSAGE_SELECT`) holds base `message`
+  fields only; a type-cast select there would put every sync round at risk. The reader
+  asks for the open message's banner with `SyncCommand::FetchMeetingMessage { message_id
+  }`, which emits `SyncEvent::MeetingMessageFetched { message_id, meeting }` (and, since
+  #2081, writes the type to the stored row). The stored `Message::is_meeting_request`
+  (from `@odata.type`) still marks invites in the list.
 - `SyncCommand::RemoveFromCalendar { message_id }` resolves the message when the remove
   runs. Its refusals are a `SyncEvent::Error` with nothing queued or sent: a message whose
   type is not `Cancelled` (removing a live meeting is a decline, or `DeleteEvent`), and an
@@ -1826,7 +1828,7 @@ from the calendar without sending anything.
   delete the row first. The command is in `command_writes_event_locally`, next to
   `CancelEvent`. Both commands start with the signed-in guard (`Error("not signed in")`,
   nothing sent), and a failed GET goes through `react`.
-- Not done: the type is not stored, so there is no list icon. The cancellation message
+- Not done: lookxy shows no list icon for the stored type (#2081 stores it). The cancellation message
   stays in mail after a remove (Outlook moves it to Deleted Items; the host may delete
   it). A `DELETE` answered 404 (the event removed between the GET and the drain) keeps
   `DeleteEvent`'s drain policy. lookxy has no meeting banner: its `on_sync_event` takes
@@ -2080,14 +2082,19 @@ so the user's other devices follow.
 ## Server search and opening a hit (#2006)
 
 - `GraphClient::search_messages(folder_id, query, top)`: `GET
-  /me/messages?$search=…&$select=MESSAGE_SELECT,parentFolderId&$top=…`, or
-  `/me/mailFolders/{id}/messages?…` with a folder (that folder only, not
+  /me/messages?$search=…&$select=MESSAGE_SELECT,parentFolderId&$top=…&$expand=MESSAGE_EXPAND`,
+  or `/me/mailFolders/{id}/messages?…` with a folder (that folder only, not
   its subfolders). `query` is KQL as the client wrote it: `search_value`
   puts it in double quotes, escapes its `\` and `"` with a backslash so it
   cannot end the clause, and percent-encodes the whole value with
   `encode_path_segment`. Graph allows neither `$orderby` nor `$filter` with
-  a message `$search`, so the hits come in Graph's order; none is sent, nor
-  a `Prefer: odata.maxpagesize`. `top` is clamped to `1..=SEARCH_TOP_MAX`
+  a message `$search` as query options, so the hits come in Graph's order;
+  neither is sent (the expand's own `$filter` sits inside its parentheses),
+  nor a `Prefer: odata.maxpagesize`. Since #2081 the first request carries
+  the expand through `get_with_expand`, for each hit's reminder and meeting
+  type: a 400 sends it once more without it and marks the hits
+  `reminder_unasked`, so bad KQL now costs two requests (see "A message's
+  meeting type on its row (#2081)"). `top` is clamped to `1..=SEARCH_TOP_MAX`
   (1000, Graph's cap; `0` asks for one). `@odata.nextLink` is sent as is
   (through `full_url`, like a delta link) until `top` hits are in (the rest
   truncated), a page has no link, or a page brings no hit (a looping link;
@@ -2171,8 +2178,9 @@ so the user's other devices follow.
   asserts that plan (`SEARCH messages ... (id=?)`, no `SCAN messages`). The
   store never runs `ANALYZE`, whose stats could change it.
 - `MESSAGE_ROW_COLUMNS` is `map_message_row`'s column list, used by these
-  two and `messages_in_folder`; `search`, `draft` and
-  `conversations_in_folder` still spell theirs out.
+  two, `messages_in_folder` and, since #2081, `search`, `draft` and
+  `due_message_reminders`; only `conversations_in_folder` still spells it
+  out (twice: its `keyed` CTE and its outer select).
 
 ## A flagged message's reminder (#2054)
 
@@ -2190,7 +2198,8 @@ Outlook's "Follow Up › Add Reminder" on a message: read, stored, snoozed and d
   `REMINDER_SIGNAL_TIME_PROP`, one source for the parse and the PATCH.
 - Read: `client::MESSAGE_EXPAND` (`$expand=singleValueExtendedProperties($filter=id eq
   … or …)`, quotes and braces percent-encoded) goes on a delta's first call (`Head`,
-  `Full`), `get_message` and `get_message_hit`, not on search hits (not stored, #2006).
+  `Full`), `get_message` and `get_message_hit`, and since #2081 (which adds the message
+  class to it) on a search's first request too.
   Graph keeps a first call's options in every link it mints, so a `Link` is sent as is.
   Nothing showed delta accepts this exact expand, so a 400 on it (`get_with_expand`)
   sends the call once more without it, and the folder still syncs. A 400 with another
@@ -2279,7 +2288,7 @@ Outlook's "Follow Up › Add Reminder" on a message: read, stored, snoozed and d
   `message_reminder_with_an_offset_time_is_unreadable`,
   `flag_due_date_time_is_normalised_utc`, `flag_due_in_a_named_zone_is_empty`,
   `message_fields_reminder_written_only_when_carried_or_complete`; `client.rs`
-  `message_expand_names_the_three_reminder_properties`, the delta / `get_message_hit`
+  `message_expand_names_the_reminder_and_class_properties`, the delta / `get_message_hit`
   URL tests, `get_message_expands_the_reminder`, `delta_link_is_sent_as_it_is`,
   `delta_head_retries_without_expand_on_400`,
   `delta_full_retries_without_expand_on_400_only`,
@@ -2564,3 +2573,76 @@ series' first day.
   reply all, M3 forward, three events in order); `moved::`
   `compose_reply_by_the_old_id_after_a_move_names_the_old_id` (`createReply` POSTs to
   `NEW1`, the event names `OLD1`).
+
+## A message's meeting type on its row (#2081)
+
+A host's message list tells a meeting request, a cancellation and an attendee's accepted,
+tentative or declined response from ordinary mail without a request per row: each
+message's `MeetingMessageType` (#2024's enum) is stored on its row.
+
+- Source: MAPI `PidTagMessageClass` (tag `0x001A`, PT_UNICODE; every message has one),
+  as the `singleValueExtendedProperties` entry `model::MESSAGE_CLASS_PROP` (`String
+  0x001A`). It is one more `or id eq` term in #2054's `client::MESSAGE_EXPAND`, so it rides
+  every request that already sends the expand (a delta's first call, `get_message`,
+  `get_message_hit`), Graph keeps it in the links it mints, and a refused expand falls
+  back as #2054's does. No new request, no new failure mode on the sync path. Rejected:
+  a delta `$select` of the cast `microsoft.graph.eventMessage/meetingMessageType` (no doc
+  shows delta accepting a type-cast select, and a refused `$select` has no fallback), and
+  `@odata.type` (a cancellation is a plain `eventMessage`, as a `none` one is; a response's
+  kind is in another derived property).
+- Classes (`MeetingMessageType::from_message_class`, MS-OXOCAL):
+  `IPM.Schedule.Meeting.Request` → `Request`, `.Canceled` → `Cancelled`, `.Resp.Pos` →
+  `Accepted`, `.Resp.Tent` → `TentativelyAccepted`, `.Resp.Neg` → `Declined`; ASCII case
+  ignored (MAPI does), and a subclass (`.` and a non-empty suffix) keeps its base's type.
+  Anything else (`IPM.Note`, `IPM.Schedule.Meeting.Notification.Forward`,
+  `…Meeting.RequestX`) is `None`.
+- Parse (`model::parse_meeting_message_type`, lenient, never an error): a top-level
+  `meetingMessageType` string wins (a plain GET of an `eventMessage` has it; `none` and
+  unknown values are `None`), else the class entry with a string value. The id matches
+  through `is_message_class_prop`: `String ` in any case and a hex tag equal to `0x1A`,
+  so Graph's short echo (`String 0x1a`) matches and `Integer 0x001A` does not.
+- Written only when carried: `MessageFields::meeting_type` is the parse's carried flag,
+  and `writes_meeting_type` is that alone. Every message has a class, so a request that
+  asked for it always gets it back, and a carried `IPM.Note` writes `None`. An item
+  without it (partial, read without the expand, or an expand Graph dropped without a 400)
+  says nothing, and the stored type, perhaps one `FetchMeetingMessage` wrote, is kept.
+  Unlike the reminder, whose key Graph leaves out when nothing matches, there is no
+  "complete item" term: it would blank every row on a silently dropped expand.
+- Store: `messages.meeting_message_type` (TEXT, NULL for none) holds
+  `MeetingMessageType::as_graph` (Graph's names, `meetingTenativelyAccepted` included),
+  read back by `from_graph`, so an unknown stored value reads `None`. `MessageRow` carries
+  it from every row read; `search` and `draft` now select `MESSAGE_ROW_COLUMNS` too, and
+  `draft`'s body columns follow at `BODY_AFTER_ROW_COLUMNS`. Only
+  `conversations_in_folder` still spells the list out, twice (its `keyed` CTE and outer
+  select).
+- Migration: `migrate_meeting_message_type`, modelled on `migrate_message_reminders` (one
+  IMMEDIATE transaction that probes `pragma_table_info`), adds the column (old rows read
+  `None`) and resets every folder's delta and backfill state and both expand-refused
+  marks, without a reconverge: a link minted before #2081 carries the old expand, so new
+  mail through it would never get a type. The cost is one re-enumeration, as #2054's.
+  A pre-#2054 store runs both on one open.
+- `FetchMeetingMessage`: an answer with a type writes it to the stored row
+  (`Store::set_meeting_message_type`, through `current_id`, `UPDATE … WHERE … IS NOT ?2
+  RETURNING folder_id`) and, when that changed it, emits `MessagesUpdated { folder_id }`
+  before `MeetingMessageFetched`. An answer without one writes nothing; a store failure
+  is an `Error`, and the event still comes. `RemoveFromCalendar` does not write it.
+- Search hits (`search_messages`, #2006) ask for the expand on their first request
+  through `get_with_expand`, so a hit's `Message` carries the type; a refusal marks the
+  hits `reminder_unasked`, and a 400 from bad KQL now costs a second request that gets
+  the same 400. Graph forbids `$filter` with `$search` as a query option; the expand's own
+  `$filter` is inside its parentheses, and the fallback covers a Graph that refuses it.
+- Tests: `model.rs` `meeting_message_type_from_message_class`,
+  `meeting_message_type_round_trips_its_graph_name`,
+  `message_class_prop_id_matches_its_forms_only`,
+  `message_reads_meeting_type_from_class_and_top_level`,
+  `writes_meeting_type_only_when_carried`; `client.rs`
+  `message_expand_names_the_reminder_and_class_properties`,
+  `delta_page_reads_each_message_class_as_its_meeting_type`,
+  `search_messages_reads_the_meeting_type_of_each_hit`,
+  `search_messages_retries_without_expand_on_400`; `store` `meeting_message_type_tests`
+  (every read path, `draft`'s body, the merge rule, the migration, a pre-#2054 store
+  running both migrations in order (`a_store_from_before_2054_runs_both_migrations_in_order`:
+  `migrate_meeting_message_type` resets the marks `migrate_message_reminders` adds, so
+  the order in `Store::init` matters), `set_meeting_message_type` through a move); `engine.rs` `meeting_message_types::` (a delta page of each type and a
+  plain message, a later round without the class keeping it, `FetchMeetingMessage`
+  writing an old row and its events, an answer without a type keeping the row).

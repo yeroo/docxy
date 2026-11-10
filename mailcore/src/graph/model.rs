@@ -251,11 +251,20 @@ pub struct Message {
     /// `flag.dueDateTime` in UTC (`YYYY-MM-DDTHH:MM:SSZ`); `""` when the
     /// flag has none, or a zone other than UTC (no zone database here).
     pub flag_due_at: String,
+    /// What meeting message this is (#2081): a request, a cancellation or
+    /// an attendee's response, `None` for any other message. Read from a
+    /// top-level `meetingMessageType` when the item carries one (a plain GET
+    /// of an `eventMessage`), else from its `PidTagMessageClass`
+    /// ([`MESSAGE_CLASS_PROP`], which the delta's `$expand` brings): see
+    /// [`parse_meeting_message_type`]. Lenient: an absent, unknown or
+    /// `none` value is `None`.
+    pub meeting_message_type: Option<MeetingMessageType>,
 }
 
 impl Message {
     pub fn from_json(v: &Value) -> Option<Self> {
         let (is_reminder_on, reminder_at, reminder_signal_at) = parse_message_reminder(v);
+        let (_, meeting_message_type) = parse_meeting_message_type(v);
         Some(Message {
             id: str_field(v, "id"),
             conversation_id: str_field(v, "conversationId"),
@@ -284,7 +293,63 @@ impl Message {
             reminder_at,
             reminder_signal_at,
             flag_due_at: parse_flag_due(v),
+            meeting_message_type,
         })
+    }
+}
+
+/// `PidTagMessageClass` (property tag `0x001A`, PT_UNICODE) as a Graph
+/// extended property id (#2081): every message's class, such as `IPM.Note`
+/// or `IPM.Schedule.Meeting.Request`, from which its meeting message type
+/// is read ([`MeetingMessageType::from_message_class`]).
+pub const MESSAGE_CLASS_PROP: &str = "String 0x001A";
+
+/// Whether `id` names [`MESSAGE_CLASS_PROP`] (#2081): `String ` (any case)
+/// and a hex tag equal to `0x1A`, so the short form Graph may echo back
+/// (`String 0x1a`) matches too. Another type (`Integer 0x001A`) or tag
+/// does not.
+pub fn is_message_class_prop(id: &str) -> bool {
+    let Some(rest) = id
+        .get(..7)
+        .filter(|p| p.eq_ignore_ascii_case("String "))
+        .and_then(|_| id.get(7..))
+    else {
+        return false;
+    };
+    let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) else {
+        return false;
+    };
+    !hex.is_empty()
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        && u32::from_str_radix(hex, 16) == Ok(0x1A)
+}
+
+/// A message's meeting message type (#2081), and whether the item carried
+/// it: a top-level `meetingMessageType` string (read by
+/// [`MeetingMessageType::from_graph`]) wins, else a
+/// `singleValueExtendedProperties` entry for [`MESSAGE_CLASS_PROP`] with a
+/// string value ([`MeetingMessageType::from_message_class`]). Neither, or
+/// only non-string values, is not carried: `(false, None)`, so a stored
+/// type is kept (`MessageFields::writes_meeting_type`). Never an error.
+pub fn parse_meeting_message_type(v: &Value) -> (bool, Option<MeetingMessageType>) {
+    if let Some(s) = v.get("meetingMessageType").and_then(Value::as_str) {
+        return (true, MeetingMessageType::from_graph(s));
+    }
+    let class = v
+        .get("singleValueExtendedProperties")
+        .and_then(Value::as_array)
+        .unwrap_or(&[])
+        .iter()
+        .find_map(|p| {
+            let id = p.get("id").and_then(Value::as_str)?;
+            if !is_message_class_prop(id) {
+                return None;
+            }
+            p.get("value").and_then(Value::as_str)
+        });
+    match class {
+        Some(c) => (true, MeetingMessageType::from_message_class(c)),
+        None => (false, None),
     }
 }
 
@@ -418,6 +483,53 @@ impl MeetingMessageType {
             _ => None,
         }
     }
+
+    /// Graph's value for the type, as [`MeetingMessageType::from_graph`]
+    /// reads it back: what the store keeps in `messages.meeting_message_type`
+    /// (#2081). Tentative is the v1.0 enum's own spelling.
+    pub fn as_graph(self) -> &'static str {
+        match self {
+            MeetingMessageType::Request => "meetingRequest",
+            MeetingMessageType::Cancelled => "meetingCancelled",
+            MeetingMessageType::Accepted => "meetingAccepted",
+            MeetingMessageType::TentativelyAccepted => "meetingTenativelyAccepted",
+            MeetingMessageType::Declined => "meetingDeclined",
+        }
+    }
+
+    /// The type a message class names (#2081, Outlook's meeting classes,
+    /// MS-OXOCAL): `IPM.Schedule.Meeting.Request`, `.Canceled`,
+    /// `.Resp.Pos`, `.Resp.Tent` and `.Resp.Neg`. MAPI compares classes
+    /// ASCII-case-insensitively, and a class may be subclassed (`.` and a
+    /// suffix), which keeps its base's type. Anything else (`IPM.Note`, a
+    /// meeting forward notification, `""`) is `None`.
+    pub fn from_message_class(class: &str) -> Option<MeetingMessageType> {
+        const CLASSES: [(&str, MeetingMessageType); 5] = [
+            ("IPM.Schedule.Meeting.Request", MeetingMessageType::Request),
+            (
+                "IPM.Schedule.Meeting.Canceled",
+                MeetingMessageType::Cancelled,
+            ),
+            (
+                "IPM.Schedule.Meeting.Resp.Pos",
+                MeetingMessageType::Accepted,
+            ),
+            (
+                "IPM.Schedule.Meeting.Resp.Tent",
+                MeetingMessageType::TentativelyAccepted,
+            ),
+            (
+                "IPM.Schedule.Meeting.Resp.Neg",
+                MeetingMessageType::Declined,
+            ),
+        ];
+        CLASSES.iter().find_map(|&(base, t)| {
+            let head = class.get(..base.len())?;
+            let tail = &class[base.len()..];
+            let subclass = tail.len() > 1 && tail.starts_with('.');
+            (head.eq_ignore_ascii_case(base) && (tail.is_empty() || subclass)).then_some(t)
+        })
+    }
 }
 
 /// A message's meeting facts (#2024), from
@@ -494,6 +606,10 @@ pub struct MessageFields {
     /// from such a call), so its lack of `singleValueExtendedProperties`
     /// says nothing. Never set by `of` or `all`.
     pub reminder_unasked: bool,
+    /// The meeting message type (#2081): a top-level `meetingMessageType`
+    /// string or a `PidTagMessageClass` entry with a string value
+    /// (`parse_meeting_message_type`'s carried flag).
+    pub meeting_type: bool,
 }
 
 impl MessageFields {
@@ -518,6 +634,7 @@ impl MessageFields {
             categories: has("categories"),
             reminder: has("singleValueExtendedProperties"),
             reminder_unasked: false,
+            meeting_type: parse_meeting_message_type(v).0,
         }
     }
 
@@ -542,6 +659,7 @@ impl MessageFields {
             categories: true,
             reminder: true,
             reminder_unasked: false,
+            meeting_type: true,
         }
     }
 
@@ -578,6 +696,16 @@ impl MessageFields {
     /// stored reminder is kept. An item carrying the key always writes.
     pub fn writes_reminder(&self) -> bool {
         self.reminder || (!self.is_partial() && !self.reminder_unasked)
+    }
+
+    /// Whether `meeting_message_type` is to be written (#2081): only when
+    /// the item carried it. Every message has a class, so a request that
+    /// asked for it always gets it back; an item without it (partial, read
+    /// without the `$expand`, or a silently dropped expand) says nothing,
+    /// and the stored type, perhaps one `FetchMeetingMessage` wrote, is
+    /// kept. A carried `IPM.Note` writes `None`.
+    pub fn writes_meeting_type(&self) -> bool {
+        self.meeting_type
     }
 }
 
@@ -2096,6 +2224,189 @@ mod tests {
         for (wire, want) in cases {
             assert_eq!(MeetingMessageType::from_graph(wire), want, "{wire:?}");
         }
+    }
+
+    #[test]
+    fn meeting_message_type_round_trips_its_graph_name() {
+        use MeetingMessageType as T;
+        for t in [
+            T::Request,
+            T::Cancelled,
+            T::Accepted,
+            T::TentativelyAccepted,
+            T::Declined,
+        ] {
+            assert_eq!(MeetingMessageType::from_graph(t.as_graph()), Some(t));
+        }
+    }
+
+    #[test]
+    fn meeting_message_type_from_message_class() {
+        use MeetingMessageType as T;
+        let cases = [
+            ("IPM.Schedule.Meeting.Request", Some(T::Request)),
+            ("IPM.Schedule.Meeting.Canceled", Some(T::Cancelled)),
+            ("IPM.Schedule.Meeting.Resp.Pos", Some(T::Accepted)),
+            (
+                "IPM.Schedule.Meeting.Resp.Tent",
+                Some(T::TentativelyAccepted),
+            ),
+            ("IPM.Schedule.Meeting.Resp.Neg", Some(T::Declined)),
+            // MAPI compares classes ignoring ASCII case.
+            ("ipm.schedule.meeting.request", Some(T::Request)),
+            ("IPM.SCHEDULE.MEETING.RESP.NEG", Some(T::Declined)),
+            // A subclass keeps its base's type.
+            ("IPM.Schedule.Meeting.Request.x", Some(T::Request)),
+            ("IPM.Schedule.Meeting.Canceled.SMIME", Some(T::Cancelled)),
+            // Anything else is no meeting message type.
+            ("IPM.Note", None),
+            ("IPM.Schedule.Meeting.Notification.Forward", None),
+            ("IPM.Schedule.Meeting.RequestX", None),
+            ("IPM.Schedule.Meeting.Request.", None),
+            ("IPM.Schedule.Meeting", None),
+            ("IPM.Schedule.Meeting.Resp", None),
+            ("", None),
+        ];
+        for (class, want) in cases {
+            assert_eq!(
+                MeetingMessageType::from_message_class(class),
+                want,
+                "{class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn message_class_prop_id_matches_its_forms_only() {
+        for id in [
+            MESSAGE_CLASS_PROP,
+            "String 0x001A",
+            "String 0x1A",
+            "string 0x1a",
+            "STRING 0X001a",
+        ] {
+            assert!(is_message_class_prop(id), "{id:?}");
+        }
+        for id in [
+            "Integer 0x001A",
+            "String 0x001AB",
+            "String 0x1B",
+            "String 0x",
+            "String 0x+1A",
+            "String 001A",
+            "String  0x1A",
+            "String 0x1A ",
+            "String {00062008-0000-0000-C000-000000000046} Id 0x001A",
+            "",
+        ] {
+            assert!(!is_message_class_prop(id), "{id:?}");
+        }
+    }
+
+    #[test]
+    fn message_reads_meeting_type_from_class_and_top_level() {
+        use MeetingMessageType as T;
+        let read = |json: &str| {
+            let v = parse(json).unwrap();
+            let m = Message::from_json(&v).unwrap();
+            let f = MessageFields::of(&v);
+            (m.meeting_message_type, f.meeting_type)
+        };
+        let class = |id: &str, value: &str| {
+            format!(
+                r#"{{"id":"M1","singleValueExtendedProperties":[{{"id":"{id}","value":{value}}}]}}"#
+            )
+        };
+        // The class, in the long, short and lower-case id forms.
+        assert_eq!(
+            read(&class(
+                "String 0x001A",
+                r#""IPM.Schedule.Meeting.Canceled""#
+            )),
+            (Some(T::Cancelled), true)
+        );
+        assert_eq!(
+            read(&class("String 0x1A", r#""IPM.Schedule.Meeting.Resp.Pos""#)),
+            (Some(T::Accepted), true)
+        );
+        assert_eq!(
+            read(&class("string 0x1a", r#""IPM.Schedule.Meeting.Resp.Neg""#)),
+            (Some(T::Declined), true)
+        );
+        // A plain class is carried, and is no type.
+        assert_eq!(read(&class("String 0x001A", r#""IPM.Note""#)), (None, true));
+        // A non-string value is no class, and not carried.
+        assert_eq!(read(&class("String 0x001A", "42")), (None, false));
+        assert_eq!(read(&class("String 0x001A", "null")), (None, false));
+        // Beside the reminder properties.
+        let both = r#"{"id":"M1","singleValueExtendedProperties":[
+            {"id":"Boolean {00062008-0000-0000-C000-000000000046} Id 0x8503","value":"true"},
+            {"id":"String 0x1a","value":"IPM.Schedule.Meeting.Request"}]}"#;
+        assert_eq!(read(both), (Some(T::Request), true));
+        // A top-level `meetingMessageType` wins over the class, `none` too.
+        let top = r#"{"id":"M1","meetingMessageType":"meetingTenativelyAccepted",
+            "singleValueExtendedProperties":[{"id":"String 0x001A","value":"IPM.Note"}]}"#;
+        assert_eq!(read(top), (Some(T::TentativelyAccepted), true));
+        let none = r#"{"id":"M1","meetingMessageType":"none",
+            "singleValueExtendedProperties":[
+              {"id":"String 0x001A","value":"IPM.Schedule.Meeting.Request"}]}"#;
+        assert_eq!(read(none), (None, true));
+        // A non-string top-level value falls back to the class.
+        let odd = r#"{"id":"M1","meetingMessageType":7,
+            "singleValueExtendedProperties":[
+              {"id":"String 0x001A","value":"IPM.Schedule.Meeting.Request"}]}"#;
+        assert_eq!(read(odd), (Some(T::Request), true));
+        // Neither, an unknown value, or an empty array: nothing carried
+        // but what the key says.
+        assert_eq!(read(r#"{"id":"M1","subject":"s"}"#), (None, false));
+        assert_eq!(
+            read(r#"{"id":"M1","meetingMessageType":"meetingX"}"#),
+            (None, true)
+        );
+        assert_eq!(
+            read(r#"{"id":"M1","singleValueExtendedProperties":[]}"#),
+            (None, false)
+        );
+        assert_eq!(
+            read(r#"{"id":"M1","singleValueExtendedProperties":"junk"}"#),
+            (None, false)
+        );
+    }
+
+    #[test]
+    fn writes_meeting_type_only_when_carried() {
+        let fields = |json: &str| MessageFields::of(&parse(json).unwrap());
+        let complete = r#""subject":"s","from":{"emailAddress":{"address":"a@x"}},
+            "receivedDateTime":"2026-11-10T00:00:00Z""#;
+        // A carried meeting class, or a carried `IPM.Note`, writes.
+        let meeting = format!(
+            r#"{{"id":"M1",{complete},"singleValueExtendedProperties":[
+                {{"id":"String 0x001A","value":"IPM.Schedule.Meeting.Request"}}]}}"#
+        );
+        assert!(fields(&meeting).writes_meeting_type());
+        let plain = format!(
+            r#"{{"id":"M1",{complete},"singleValueExtendedProperties":[
+                {{"id":"String 0x001A","value":"IPM.Note"}}]}}"#
+        );
+        assert!(fields(&plain).writes_meeting_type());
+        // A complete item asked for the class that came without it keeps
+        // the stored type (an expand dropped without a 400).
+        let bare = fields(&format!(r#"{{"id":"M1",{complete}}}"#));
+        assert!(!bare.is_partial() && !bare.reminder_unasked);
+        assert!(bare.writes_reminder(), "the reminder is still written");
+        assert!(!bare.writes_meeting_type());
+        // A partial item, an unasked one, a non-string class: kept.
+        assert!(!fields(r#"{"id":"M1","isRead":true}"#).writes_meeting_type());
+        let mut unasked = bare;
+        unasked.reminder_unasked = true;
+        assert!(!unasked.writes_meeting_type());
+        let odd = format!(
+            r#"{{"id":"M1",{complete},"singleValueExtendedProperties":[
+                {{"id":"String 0x001A","value":1}}]}}"#
+        );
+        assert!(!fields(&odd).writes_meeting_type());
+        // A merge of a `Message` built in code writes it.
+        assert!(MessageFields::all().writes_meeting_type());
     }
 
     #[test]

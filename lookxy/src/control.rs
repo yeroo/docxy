@@ -801,6 +801,7 @@ mod tests {
                     preview: "hi there".into(),
                     is_draft: false,
                     is_meeting_request: false,
+                    meeting_message_type: None,
                     categories: Vec::new(),
                     is_reminder_on: false,
                     reminder_at: String::new(),
