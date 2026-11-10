@@ -2082,14 +2082,19 @@ so the user's other devices follow.
 ## Server search and opening a hit (#2006)
 
 - `GraphClient::search_messages(folder_id, query, top)`: `GET
-  /me/messages?$search=…&$select=MESSAGE_SELECT,parentFolderId&$top=…`, or
-  `/me/mailFolders/{id}/messages?…` with a folder (that folder only, not
+  /me/messages?$search=…&$select=MESSAGE_SELECT,parentFolderId&$top=…&$expand=MESSAGE_EXPAND`,
+  or `/me/mailFolders/{id}/messages?…` with a folder (that folder only, not
   its subfolders). `query` is KQL as the client wrote it: `search_value`
   puts it in double quotes, escapes its `\` and `"` with a backslash so it
   cannot end the clause, and percent-encodes the whole value with
   `encode_path_segment`. Graph allows neither `$orderby` nor `$filter` with
-  a message `$search`, so the hits come in Graph's order; none is sent, nor
-  a `Prefer: odata.maxpagesize`. `top` is clamped to `1..=SEARCH_TOP_MAX`
+  a message `$search` as query options, so the hits come in Graph's order;
+  neither is sent (the expand's own `$filter` sits inside its parentheses),
+  nor a `Prefer: odata.maxpagesize`. Since #2081 the first request carries
+  the expand through `get_with_expand`, for each hit's reminder and meeting
+  type: a 400 sends it once more without it and marks the hits
+  `reminder_unasked`, so bad KQL now costs two requests (see "A message's
+  meeting type on its row (#2081)"). `top` is clamped to `1..=SEARCH_TOP_MAX`
   (1000, Graph's cap; `0` asks for one). `@odata.nextLink` is sent as is
   (through `full_url`, like a delta link) until `top` hits are in (the rest
   truncated), a page has no link, or a page brings no hit (a looping link;
@@ -2173,8 +2178,9 @@ so the user's other devices follow.
   asserts that plan (`SEARCH messages ... (id=?)`, no `SCAN messages`). The
   store never runs `ANALYZE`, whose stats could change it.
 - `MESSAGE_ROW_COLUMNS` is `map_message_row`'s column list, used by these
-  two and `messages_in_folder`; `search`, `draft` and
-  `conversations_in_folder` still spell theirs out.
+  two, `messages_in_folder` and, since #2081, `search`, `draft` and
+  `due_message_reminders`; only `conversations_in_folder` still spells it
+  out (twice: its `keyed` CTE and its outer select).
 
 ## A flagged message's reminder (#2054)
 
@@ -2282,7 +2288,7 @@ Outlook's "Follow Up › Add Reminder" on a message: read, stored, snoozed and d
   `message_reminder_with_an_offset_time_is_unreadable`,
   `flag_due_date_time_is_normalised_utc`, `flag_due_in_a_named_zone_is_empty`,
   `message_fields_reminder_written_only_when_carried_or_complete`; `client.rs`
-  `message_expand_names_the_three_reminder_properties`, the delta / `get_message_hit`
+  `message_expand_names_the_reminder_and_class_properties`, the delta / `get_message_hit`
   URL tests, `get_message_expands_the_reminder`, `delta_link_is_sent_as_it_is`,
   `delta_head_retries_without_expand_on_400`,
   `delta_full_retries_without_expand_on_400_only`,
@@ -2634,7 +2640,9 @@ message's `MeetingMessageType` (#2024's enum) is stored on its row.
   `delta_page_reads_each_message_class_as_its_meeting_type`,
   `search_messages_reads_the_meeting_type_of_each_hit`,
   `search_messages_retries_without_expand_on_400`; `store` `meeting_message_type_tests`
-  (every read path, `draft`'s body, the merge rule, the migration, `set_meeting_message_type`
-  through a move); `engine.rs` `meeting_message_types::` (a delta page of each type and a
+  (every read path, `draft`'s body, the merge rule, the migration, a pre-#2054 store
+  running both migrations in order (`a_store_from_before_2054_runs_both_migrations_in_order`:
+  `migrate_meeting_message_type` resets the marks `migrate_message_reminders` adds, so
+  the order in `Store::init` matters), `set_meeting_message_type` through a move); `engine.rs` `meeting_message_types::` (a delta page of each type and a
   plain message, a later round without the class keeping it, `FetchMeetingMessage`
   writing an old row and its events, an answer without a type keeping the row).
