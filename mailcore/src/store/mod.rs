@@ -16817,6 +16817,99 @@ mod meeting_message_type_tests {
     }
 
     #[test]
+    fn a_store_from_before_2054_runs_both_migrations_in_order() {
+        // `migrate_meeting_message_type` resets the expand-refused marks
+        // that `migrate_message_reminders` adds, so a store without either
+        // opens only with the two run in that order.
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-pre-2054-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        {
+            let s = Store::open(&path).unwrap();
+            folder(&s, "F");
+            folder(&s, "G");
+            s.upsert_message("F", &msg("M1", Some(T::Request))).unwrap();
+            s.complete_backfill("F", "https://graph/F?$deltatoken=1", SCOPE_ALL, 7, None)
+                .unwrap();
+            s.set_head_link("G", "https://graph/G?$deltatoken=2", false)
+                .unwrap();
+            s.set_backfill_progress("G", "https://graph/G?$skiptoken=3", 4, SCOPE_ALL)
+                .unwrap();
+            // Back to a store from before #2054 (and so before #2081).
+            s.conn
+                .execute_batch(
+                    "DROP INDEX idx_messages_reminder;
+                     ALTER TABLE messages DROP COLUMN is_reminder_on;
+                     ALTER TABLE messages DROP COLUMN reminder_at;
+                     ALTER TABLE messages DROP COLUMN reminder_signal_at;
+                     ALTER TABLE messages DROP COLUMN flag_due_at;
+                     ALTER TABLE messages DROP COLUMN meeting_message_type;
+                     ALTER TABLE folders DROP COLUMN reminder_expand_refused;
+                     ALTER TABLE folders DROP COLUMN backfill_expand_refused;",
+                )
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        // Both migrations' columns are there; the old row reads empty
+        // reminder fields and no type, the rest of it kept.
+        let row = s.message_row("M1").unwrap().unwrap();
+        assert_eq!(row.meeting_message_type, None);
+        assert!(!row.is_reminder_on);
+        assert_eq!(
+            (
+                row.reminder_at.as_str(),
+                row.reminder_signal_at.as_str(),
+                row.flag_due_at.as_str()
+            ),
+            ("", "", "")
+        );
+        assert_eq!(row.subject, "budget M1");
+        // Every folder's delta and backfill state is reset.
+        for f in ["F", "G"] {
+            assert_eq!(s.get_delta_link(f).unwrap(), None, "{f}");
+            let (backfill, synced, history, scope): (
+                Option<String>,
+                i64,
+                Option<String>,
+                Option<String>,
+            ) = s
+                .conn
+                .query_row(
+                    "SELECT backfill_link, backfill_synced, history_scope, backfill_scope
+                     FROM folders WHERE id = ?1",
+                    [f],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (backfill, synced, history, scope),
+                (None, 0, None, None),
+                "{f}"
+            );
+            assert!(!s.reminder_expand_refused(f).unwrap(), "{f}");
+            assert!(!s.backfill_expand_refused(f).unwrap(), "{f}");
+        }
+        assert!(!s.reconverge_pending().unwrap());
+        // Neither migration runs again: a later open keeps a new link.
+        assert!(!migrate_message_reminders(&s.conn).unwrap());
+        assert!(!migrate_meeting_message_type(&s.conn).unwrap());
+        s.set_head_link("F", "https://graph/F?$deltatoken=new", false)
+            .unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.get_delta_link("F").unwrap().as_deref(),
+            Some("https://graph/F?$deltatoken=new")
+        );
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_fresh_store_has_the_column_and_is_not_migrated() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(schema::SCHEMA_SQL).unwrap();
