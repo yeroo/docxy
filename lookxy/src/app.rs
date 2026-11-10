@@ -195,6 +195,11 @@ pub struct App {
     /// on an unchanged draft saves nothing. `None` for a composer opened
     /// some other way, which then saves as before.
     pub compose_baseline: Option<ComposeSnapshot>,
+    /// The list row the last left click landed on (#2096), so a second
+    /// click on a thread header whose latest message is a draft (never
+    /// previewed, so never `selected_msg`) still toggles it. Any click
+    /// elsewhere clears it.
+    pub last_list_click: Option<usize>,
     /// The top-level view — mail three-pane, or the calendar agenda +
     /// detail (`ui::calendar`). Toggled by `g` (see `toggle_mode`).
     pub mode: Mode,
@@ -534,6 +539,7 @@ impl App {
             compose: None,
             compose_action: None,
             compose_baseline: None,
+            last_list_click: None,
             mode: Mode::Mail,
             agenda: Vec::new(),
             agenda_index: 0,
@@ -1607,6 +1613,8 @@ impl App {
 
     fn on_left_click(&mut self, x: u16, y: u16) {
         let pos = Position { x, y };
+        // Only a list click keeps it (below); any other click forgets it.
+        let last_list_click = self.last_list_click.take();
         if self.rail_rect.contains(pos) {
             let row = y.saturating_sub(self.rail_rect.y + 1);
             self.set_mode(if row == 0 { Mode::Mail } else { Mode::Calendar });
@@ -1639,23 +1647,25 @@ impl App {
                 } else {
                     self.msg_index = idx;
                 }
+                let again = last_list_click == Some(idx);
+                self.last_list_click = Some(idx);
+                let on_header =
+                    self.threaded_active() && matches!(self.selected_row(), Some(Row::Header(_)));
                 // Click-to-select, click-again-to-open: a second click on the
                 // already-open row activates it (the terminal "double-click").
-                // A draft is never previewed, so it opens on the first click,
-                // as Enter opens it (#2096: a synced draft is `is_draft`).
+                // A draft is never previewed (#2096: a synced draft is
+                // `is_draft`), so:
+                // - a draft's message row (flat, or a thread's message row)
+                //   activates on the first click, as Enter does;
+                // - a thread header whose latest message is a draft only
+                //   selects on the first click, and a second click on the
+                //   same row activates (toggles) it, as for any header.
                 match self.cursor_target() {
                     Some((id, _)) if self.selected_msg.as_deref() == Some(id.as_str()) => {
                         self.activate_selected()
                     }
-                    // Only a message row (flat, or a thread's message row):
-                    // a click on a thread header still selects and toggles
-                    // through preview, never opening a draft.
-                    Some((_, true))
-                        if !self.threaded_active()
-                            || matches!(self.selected_row(), Some(Row::Message(..))) =>
-                    {
-                        self.activate_selected()
-                    }
+                    Some((_, true)) if !on_header => self.activate_selected(),
+                    Some((_, true)) if again => self.activate_selected(),
                     _ => self.preview_selected_message(),
                 }
             }
@@ -3065,9 +3075,11 @@ impl App {
     ///
     /// Only a draft whose body was written here opens in the composer
     /// (`Store::draft_body_is_local`: compose's own saves, a new message, a
-    /// composed reply/forward). A draft made in Outlook or on the web
-    /// (`is_draft` since #2096) has no body, or one `FetchBody` stored, which
-    /// is Graph's rendering of it (text, here): it opens read-only in the
+    /// composed reply/forward; a draft's text body fetched before #1901,
+    /// stored with no format, is marked fetched by the store's #2096
+    /// migration). A draft made in Outlook or on the web (`is_draft` since
+    /// #2096) has no body, or one `FetchBody` stored, which is Graph's
+    /// rendering of it (text, here): it opens read-only in the
     /// reader (which fetches a missing body), as it did before #2096, so its
     /// rendering is never saved back over it. Editing such a draft here is
     /// not supported.
@@ -7094,6 +7106,55 @@ pub(crate) mod tests {
         click(&mut app);
         assert_in_the_reader(&app);
         assert_eq!(drain(&cmd_rx), (vec![], false));
+    }
+
+    #[test]
+    fn two_clicks_on_a_header_whose_latest_is_a_draft_toggle_it() {
+        // c1 = [m1 10:00, d1 11:00]: the header's latest is the synced draft,
+        // which is never previewed. The first click only selects; the
+        // second on the same row expands, as for any header.
+        let mut app = App::for_test_with_seeded_store();
+        let cmd_rx = seed_synced_draft(&mut app);
+        app.threaded = true;
+        app.reload_messages();
+        let pos = app
+            .visible_rows
+            .iter()
+            .position(|r| matches!(r, Row::Header(_)))
+            .unwrap();
+        let Row::Header(t) = app.visible_rows[pos] else {
+            unreachable!()
+        };
+        assert!(!app.threads[t].expanded);
+        app.list_rect = Rect::new(25, 0, 30, 10);
+        app.list_row0 = 1;
+        let row = 1 + pos as u16;
+        let click = |app: &mut App, row: u16| {
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 27,
+                row,
+                modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+            });
+        };
+        click(&mut app, row);
+        assert!(!app.threads[t].expanded);
+        assert!(app.compose.is_none() && app.selected_msg.is_none());
+        click(&mut app, row);
+        assert!(app.threads[t].expanded);
+        // Expanding opens the latest message, the synced draft, read-only.
+        assert!(app.compose.is_none());
+        assert_eq!(app.selected_msg.as_deref(), Some("d1"));
+        assert_eq!(drain(&cmd_rx), (vec!["d1".to_string()], false));
+        // A click elsewhere in between forgets the row: the next header
+        // click only selects again.
+        app.threads[t].expanded = false;
+        app.rebuild_visible_rows();
+        app.selected_msg = None;
+        app.focus = Pane::List;
+        click(&mut app, 200); // outside every pane
+        click(&mut app, row);
+        assert!(!app.threads[t].expanded);
     }
 
     #[test]
