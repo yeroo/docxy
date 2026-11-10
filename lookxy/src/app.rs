@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::ui::compose::{Compose, ComposeAction, ComposeField};
+use editcore::model::{Block, RichText, Run};
 use editcore::ops::Editor;
 use mailcore::compose_html;
 use mailcore::graph::client::{AttendeeInput, RsvpKind};
@@ -1635,10 +1636,13 @@ impl App {
                 }
                 // Click-to-select, click-again-to-open: a second click on the
                 // already-open row activates it (the terminal "double-click").
+                // A draft is never previewed, so it opens on the first click,
+                // as Enter opens it (#2096: a synced draft is `is_draft`).
                 match self.cursor_target() {
                     Some((id, _)) if self.selected_msg.as_deref() == Some(id.as_str()) => {
                         self.activate_selected()
                     }
+                    Some((_, true)) => self.activate_selected(),
                     _ => self.preview_selected_message(),
                 }
             }
@@ -3061,7 +3065,7 @@ impl App {
             }
             Err(_) => return,
         };
-        let editor = Editor::from(compose_html::from_html(&body.content));
+        let editor = Editor::from(draft_rich_text(&body));
         let attachments = self.store.outbound_attachments(&row.id).unwrap_or_default();
         self.compose = Some(Compose {
             to: row.to_recipients,
@@ -4134,6 +4138,33 @@ fn parse_attendee_part(part: &str) -> Vec<(String, String)> {
         .filter(|s| !s.is_empty())
         .map(|addr| (String::new(), addr.to_string()))
         .collect()
+}
+
+/// The compose editor's document for a stored draft body (#2096): an
+/// `html` body is parsed as HTML (`compose_html::from_html`); any other is
+/// plain text, one paragraph per line (`\r\n` or `\n`, an empty line an
+/// empty paragraph), so its line breaks and any `<…>` survive. A text body
+/// is what `FetchBody` stores under lookxy's `BodyFormat::Text` for a draft
+/// synced from elsewhere, and what `createReply` gives for a plain-text
+/// original; parsed as HTML its newlines would fold into spaces and
+/// `<alice@x>` would vanish as a tag, and Save would PATCH that onto Graph.
+fn draft_rich_text(body: &Body) -> RichText {
+    if body.content_type.eq_ignore_ascii_case("html") {
+        return compose_html::from_html(&body.content);
+    }
+    let blocks = body
+        .content
+        .split('\n')
+        .map(|line| {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            if line.is_empty() {
+                Block::Paragraph(Vec::new())
+            } else {
+                Block::Paragraph(vec![Run::plain(line)])
+            }
+        })
+        .collect();
+    RichText { blocks }
 }
 
 /// Builds the initial body HTML for a new message: empty when the signature is
@@ -6861,16 +6892,13 @@ pub(crate) mod tests {
         assert_eq!(compose.draft_id, id);
     }
 
-    #[test]
-    fn a_synced_draft_without_a_body_opens_the_reader_then_the_composer() {
-        use mailcore::graph::model::{Body, Message, Recipient};
-        use std::sync::mpsc;
-
-        let mut app = App::for_test_with_seeded_store();
-        let (cmd_tx, cmd_rx) = mpsc::channel();
+    /// Seeds `d1`, a reply draft made in Outlook on the web and synced as
+    /// a draft (#2096) with no body in the store, into the flat list, and
+    /// returns the receiver of the commands the app sends.
+    fn seed_synced_draft(app: &mut App) -> std::sync::mpsc::Receiver<SyncCommand> {
+        use mailcore::graph::model::{Message, Recipient};
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         app.sync.cmd_tx = cmd_tx;
-        // A reply draft made in Outlook on the web, synced as a draft
-        // (#2096) with no body in the store.
         app.store
             .upsert_message(
                 "inbox",
@@ -6914,6 +6942,56 @@ pub(crate) mod tests {
         app.focus = Pane::List;
         app.msg_index = app.messages.iter().position(|m| m.id == "d1").unwrap();
         assert!(app.messages[app.msg_index].is_draft);
+        cmd_rx
+    }
+
+    /// The ids of the `FetchBody` commands `rx` holds.
+    fn fetched_bodies(rx: &std::sync::mpsc::Receiver<SyncCommand>) -> Vec<String> {
+        rx.try_iter()
+            .filter_map(|c| match c {
+                SyncCommand::FetchBody { id } => Some(id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Stores `d1`'s body as `FetchBody` does under lookxy's
+    /// `BodyFormat::Text` (the engine's default): plain text.
+    const SYNCED_DRAFT_TEXT: &str = "Hi\r\n\r\nFrom: Alice <alice@x>";
+
+    fn store_fetched_text_body(app: &App) {
+        use mailcore::graph::model::{Body, BodyFormat};
+        let stored = app
+            .store
+            .put_fetched_body_with_headers(
+                "d1",
+                &Body {
+                    content_type: "text".into(),
+                    content: SYNCED_DRAFT_TEXT.into(),
+                },
+                BodyFormat::Text,
+                &[],
+            )
+            .unwrap();
+        assert!(stored);
+    }
+
+    /// The composer holds `d1`'s text body as text: one paragraph per line,
+    /// the empty one kept, `<alice@x>` intact.
+    fn assert_compose_has_the_text_body(app: &App) {
+        let compose = app.compose.as_ref().expect("compose should be open");
+        assert_eq!(compose.draft_id, "d1");
+        assert_eq!(compose.editor.text.blocks.len(), 3);
+        assert_eq!(
+            compose.editor.text.plain(),
+            SYNCED_DRAFT_TEXT.replace("\r\n", "\n")
+        );
+    }
+
+    #[test]
+    fn a_synced_draft_without_a_body_opens_the_reader_then_the_composer() {
+        let mut app = App::for_test_with_seeded_store();
+        let cmd_rx = seed_synced_draft(&mut app);
 
         // Activated: the reader opens it and fetches its body, rather than
         // nothing happening.
@@ -6922,30 +7000,60 @@ pub(crate) mod tests {
         assert_eq!(app.selected_msg.as_deref(), Some("d1"));
         assert_eq!(app.focus, Pane::Reading);
         assert!(app.body_loading);
-        let fetched: Vec<String> = cmd_rx
-            .try_iter()
-            .filter_map(|c| match c {
-                SyncCommand::FetchBody { id } => Some(id),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(fetched, ["d1"]);
+        assert_eq!(fetched_bodies(&cmd_rx), ["d1"]);
 
-        // With its body stored, the next activate opens the composer.
+        // With its body stored as text, the next activate opens the
+        // composer on it as text.
+        store_fetched_text_body(&app);
+        app.focus = Pane::List;
+        app.activate_selected();
+        assert_compose_has_the_text_body(&app);
+    }
+
+    #[test]
+    fn one_click_opens_a_synced_draft() {
+        let mut app = App::for_test_with_seeded_store();
+        let cmd_rx = seed_synced_draft(&mut app);
+        app.list_rect = Rect::new(25, 0, 30, 10);
+        app.list_row0 = 1;
+        let row = 1 + app.msg_index as u16;
+        let click = |app: &mut App| {
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 27,
+                row,
+                modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+            });
+        };
+        // No body: one click opens the reader, which fetches it once.
+        click(&mut app);
+        assert!(app.compose.is_none());
+        assert_eq!(app.selected_msg.as_deref(), Some("d1"));
+        assert_eq!(app.focus, Pane::Reading);
+        assert_eq!(fetched_bodies(&cmd_rx), ["d1"]);
+        // With its body stored, a click opens the composer.
+        store_fetched_text_body(&app);
+        click(&mut app);
+        assert_compose_has_the_text_body(&app);
+    }
+
+    #[test]
+    fn a_draft_s_html_body_still_opens_as_html() {
+        use mailcore::graph::model::Body;
+        let mut app = App::for_test_with_seeded_store();
+        let _cmd_rx = seed_synced_draft(&mut app);
         app.store
             .put_body(
                 "d1",
                 &Body {
-                    content_type: "html".into(),
-                    content: "<p>Thanks</p>".into(),
+                    content_type: "HTML".into(),
+                    content: "<p>Thanks</p><p>a &lt;b&gt;</p>".into(),
                 },
             )
             .unwrap();
-        app.focus = Pane::List;
         app.activate_selected();
         let compose = app.compose.as_ref().expect("compose should be open");
-        assert_eq!(compose.draft_id, "d1");
-        assert_eq!(compose.editor.text.plain(), "Thanks");
+        assert_eq!(compose.editor.text.plain(), "Thanks\na <b>");
     }
 
     #[test]
