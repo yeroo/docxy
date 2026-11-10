@@ -2239,11 +2239,14 @@ impl Engine {
                 self.folder_command(FolderWrite::Move, &id, r);
             }
             SyncCommand::DeleteFolder { id } => {
-                // A move that failed (quarantined, or dropped with a refused
-                // or deleted `local:` folder) left mail shown out of the
-                // folder it is still in on Graph until the reconverge runs,
-                // and the reconverge never reads a folder whose delete is
-                // queued: a delete now would take that mail on Graph.
+                // The store may not show what Graph has (R3): (a, b) a move
+                // that failed (quarantined, or dropped with a refused or
+                // deleted `local:` folder) left mail shown out of the folder
+                // it is still in on Graph until the reconverge has read every
+                // folder, and the reconverge never reads a folder whose delete
+                // is queued; (c) a refused folder write's revert may show a
+                // parent Graph does not have until the next complete listing
+                // (`relist_owed`). A delete now would take that on Graph.
                 if self.deletes_unsafe() {
                     let r = Ok(FolderWriteResult::Refused(FolderRefusal::Rereading));
                     self.folder_command(FolderWrite::Delete, &id, r);
@@ -2311,12 +2314,13 @@ impl Engine {
                 return;
             }
         }
-        // Every folder's delta just completed without a hard failure, so a
-        // pending reconverge (upsert-everything, cutoff ignored) is satisfied
-        // once no folder's backfill remains either (#1871: the old mail comes
-        // back through it); else the step that completes the last folder,
-        // or parks the last walk left (parked walks do not count,
-        // `backfill_remains`), clears it. Clear it before draining: if the drain quarantines a
+        // The pass ran every folder's delta that did not fail hard. A pending
+        // reconverge (upsert-everything, cutoff ignored) is satisfied once
+        // every stored Graph folder has a delta link and a complete history
+        // (#1871: the old mail comes back through the backfill; #1910 r6: a
+        // folder whose delta failed, or whose walk is parked, still counts,
+        // `backfill_remains`); else the step that completes the last folder
+        // clears it. Clear it before draining: if the drain quarantines a
         // fresh op it will re-arm reconverge for the next pass.
         if !self.backfill_remains() {
             self.end_reconverge();
@@ -2907,6 +2911,12 @@ impl Engine {
         new_ids: &mut Vec<String>,
     ) -> u64 {
         let note_new = self.config.options.prefetch_body_days > 0;
+        // A protected message no queued move decides the folder of is
+        // re-filed where Graph has it (#1910 r7). On a store error none is.
+        let moving = match protect {
+            Some(_) => self.store.messages_with_a_queued_move().ok(),
+            None => None,
+        };
         let mut upserts = 0;
         for item in items {
             match item {
@@ -2934,7 +2944,21 @@ impl Engine {
                         continue;
                     }
                     match protect {
-                        Some(ids) if ids.binary_search(&m.id).is_ok() => {}
+                        // A queued op's optimistic field edit (read, flag,
+                        // categories, reminder) is kept: nothing is merged.
+                        // Its folder is Graph's, unless a queued move (or a
+                        // draft's save or send) still decides it: a move
+                        // that did not land, or one made on another client,
+                        // must not keep it out of the folder Graph has it in
+                        // (#1910 r7: a folder delete would take it there).
+                        Some(ids) if ids.binary_search(&m.id).is_ok() => {
+                            if moving
+                                .as_ref()
+                                .is_some_and(|mv| mv.binary_search(&m.id).is_err())
+                            {
+                                let _ = self.store.refile_message(&m.id, folder_id);
+                            }
+                        }
                         Some(_) => {
                             let _ = self.store.merge_message_unless_edited(folder_id, m, fields);
                         }
@@ -3913,7 +3937,8 @@ impl Engine {
                         continue;
                     }
                     // A folder op (#1910) too: retrying a 400 or a 409
-                    // changes nothing, and the revert is exact.
+                    // changes nothing. The revert is best effort: deletes wait
+                    // for a complete listing after it (`relist_owed`).
                     if folder_op(&row.op).is_some() {
                         self.refuse_folder_write(&row, &other);
                         continue;
@@ -28676,6 +28701,127 @@ mod tests {
             );
             send(&handle, SyncCommand::DeleteFolder { id: "PROJ".into() });
             wait_requests(&srv, "DELETE", "/me/mailFolders/PROJ", 1);
+            stop(handle, dir);
+        }
+
+        fn flagged(store: &Store, folder: &str, id: &str) -> Option<bool> {
+            store
+                .messages_in_folder(folder, 50, 0)
+                .unwrap()
+                .into_iter()
+                .find(|m| m.id == id)
+                .map(|m| m.is_flagged)
+        }
+
+        #[test]
+        fn a_reconverge_refiles_a_protected_message_its_quarantined_move_left_elsewhere() {
+            // A1's move out of ARCH is quarantined (404 every time), and a
+            // flag on A1 waits behind a 500: A1 is protected through the
+            // reconverge's read of ARCH, yet must be shown in ARCH again.
+            let (srv, handle, store, dir) = engine(
+                "folder-refile-protected",
+                world(
+                    vec![
+                        write("POST", "/me/messages/A1/move", 404, "{}"),
+                        write("PATCH", "/me/messages/A1", 500, "busy"),
+                        write("DELETE", "/me/mailFolders/ARCH", 204, ""),
+                    ],
+                    TREE,
+                    &[("ARCH", "A1")],
+                ),
+                None,
+            );
+            send(
+                &handle,
+                SyncCommand::Move {
+                    id: "A1".into(),
+                    dest: "OTHER".into(),
+                },
+            );
+            wait_requests(&srv, "POST", "/me/messages/A1/move", 1);
+            send(
+                &handle,
+                SyncCommand::SetFlag {
+                    id: "A1".into(),
+                    flagged: true,
+                },
+            );
+            wait_requests(&srv, "PATCH", "/me/messages/A1", 1);
+            assert_eq!(flagged(&store, "OTHER", "A1"), Some(true));
+            let mut quarantined = false;
+            for _ in 0..MAX_OP_ATTEMPTS {
+                send(&handle, SyncCommand::Refresh);
+                let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+                if seen
+                    .iter()
+                    .any(|e| matches!(e, SyncEvent::Error(m) if m.contains("quarantined")))
+                {
+                    quarantined = true;
+                    break;
+                }
+            }
+            assert!(quarantined);
+            assert_eq!(
+                flagged(&store, "OTHER", "A1"),
+                Some(true),
+                "still misplaced"
+            );
+
+            // The reconverge's pass reads ARCH: A1 is filed back there, and
+            // its queued flag (still waiting) is kept.
+            send(&handle, SyncCommand::Refresh);
+            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+            assert_eq!(flagged(&store, "ARCH", "A1"), Some(true));
+            assert!(mail_in(&store, "OTHER").is_empty());
+            assert!(
+                store
+                    .pending_ops()
+                    .unwrap()
+                    .iter()
+                    .any(|r| matches!(r.op, OutboxOp::SetFlag { .. })),
+                "the flag still waits"
+            );
+            // A delete of ARCH now takes A1 with it, as the user sees.
+            send(&handle, SyncCommand::DeleteFolder { id: "ARCH".into() });
+            assert!(wait_until(ENGINE_WAIT, || !store
+                .message_exists("A1")
+                .unwrap()));
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn a_protected_message_with_a_queued_move_is_not_refiled() {
+            // A1's move out of ARCH waits behind a 500; a fresh read of ARCH
+            // (links cleared) reports it there, and it stays in OTHER.
+            let (srv, handle, store, dir) = engine(
+                "folder-no-refile-moving",
+                world(
+                    vec![write("POST", "/me/messages/A1/move", 500, "busy")],
+                    TREE,
+                    &[("ARCH", "A1")],
+                ),
+                None,
+            );
+            send(
+                &handle,
+                SyncCommand::Move {
+                    id: "A1".into(),
+                    dest: "OTHER".into(),
+                },
+            );
+            wait_requests(&srv, "POST", "/me/messages/A1/move", 1);
+            store.clear_delta_links().unwrap();
+            let before = srv.requests().len();
+            send(&handle, SyncCommand::Refresh);
+            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+            assert!(
+                paths_from(&srv, before)
+                    .iter()
+                    .any(|p| p.starts_with("/me/mailFolders/ARCH/messages/delta?$")),
+                "a fresh read of ARCH ran"
+            );
+            assert_eq!(mail_in(&store, "OTHER"), ["A1"]);
+            assert!(mail_in(&store, "ARCH").is_empty());
             stop(handle, dir);
         }
 

@@ -2005,6 +2005,39 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// The message ids whose folder a queued op still decides (#1910 r7),
+    /// sorted, each resolved through `current_id`: a message `Move`, and a
+    /// draft's `SaveDraft` or `SendDraft` (a send re-files the draft into
+    /// Sent Items at command time; drafts keep their own Drafts handling).
+    /// A fresh delta re-files any other protected message to the folder
+    /// Graph reports it in (`Store::refile_message`).
+    pub(crate) fn messages_with_a_queued_move(&self) -> Result<Vec<String>, StoreError> {
+        let mut ids = Vec::new();
+        for row in pending_ops_on(&self.conn)? {
+            if let OutboxOp::Move { id, .. }
+            | OutboxOp::SaveDraft { id }
+            | OutboxOp::SendDraft { id } = &row.op
+            {
+                ids.push(current_id_on(&self.conn, id)?);
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// Files the stored message `id` under `folder_id` and changes nothing
+    /// else (#1910 r7): a fresh delta found it there on Graph, while a
+    /// queued op protects its fields. Whether the row moved (a missing row
+    /// is not inserted).
+    pub(crate) fn refile_message(&self, id: &str, folder_id: &str) -> Result<bool, StoreError> {
+        let n = self.conn.execute(
+            "UPDATE messages SET folder_id = ?2 WHERE id = ?1 AND folder_id IS NOT ?2",
+            params![id, folder_id],
+        )?;
+        Ok(n > 0)
+    }
+
     /// The message ids queued outbox ops name (#1871): every delta that
     /// starts fresh (a head, a small folder's full delta, a backfill page)
     /// leaves them alone, as their optimistic local write (a read flag, a
@@ -20615,6 +20648,57 @@ mod folder_write_tests {
             .collect();
         assert_eq!(moves, [Some("ARCH".to_string())], "(b)");
         assert_eq!(row(&s, "OTHER").unwrap().parent_id.as_deref(), Some("ARCH"));
+    }
+
+    #[test]
+    fn queued_moves_and_drafts_decide_a_folder_and_refile_moves_only_the_folder() {
+        let s = mailbox();
+        for id in ["M1", "M2", "D1", "D2", "F1"] {
+            message(&s, id, "INBOX");
+        }
+        message(&s, "local:d", "INBOX");
+        s.conn
+            .execute(
+                "UPDATE messages SET local_id = 'local:x' WHERE id = 'D2'",
+                [],
+            )
+            .unwrap();
+        for op in [
+            OutboxOp::Move {
+                id: "M1".into(),
+                dest: "ARCH".into(),
+            },
+            OutboxOp::SendDraft { id: "D1".into() },
+            OutboxOp::SaveDraft {
+                id: "local:x".into(),
+            },
+            OutboxOp::SetFlag {
+                id: "F1".into(),
+                flagged: true,
+            },
+        ] {
+            s.enqueue_op(&op).unwrap();
+        }
+        assert_eq!(
+            s.messages_with_a_queued_move().unwrap(),
+            ["D1", "D2", "M1"],
+            "a flag does not decide the folder; a reconciled draft resolves"
+        );
+        s.conn
+            .execute("UPDATE messages SET is_flagged = 1 WHERE id = 'F1'", [])
+            .unwrap();
+        assert!(s.refile_message("F1", "ARCH").unwrap());
+        assert!(!s.refile_message("F1", "ARCH").unwrap(), "already there");
+        assert!(!s.refile_message("GONE", "ARCH").unwrap(), "never inserted");
+        assert!(!s.message_exists("GONE").unwrap());
+        assert_eq!(folder_of(&s, "F1").as_deref(), Some("ARCH"));
+        let flagged: bool = s
+            .conn
+            .query_row("SELECT is_flagged FROM messages WHERE id = 'F1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(flagged, "nothing but the folder changes");
     }
 
     #[test]
