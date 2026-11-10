@@ -20903,10 +20903,15 @@ mod tests {
         /// and no extended properties, as Graph's POST response carries
         /// none.
         fn composed(action: &str, id: &str) -> (Route, Option<usize>) {
+            composed_for("M1", action, id)
+        }
+
+        /// `composed`, for the original stored under `original`.
+        fn composed_for(original: &str, action: &str, id: &str) -> (Route, Option<usize>) {
             (
                 Route {
                     method: "POST".into(),
-                    path_prefix: format!("/me/messages/M1/{action}"),
+                    path_prefix: format!("/me/messages/{original}/{action}"),
                     status: 200,
                     headers: vec![],
                     body: format!(
@@ -21004,6 +21009,45 @@ mod tests {
                 |e| matches!(e, SyncEvent::DraftReady { id, .. } if id == "FW1"),
             );
             assert_eq!(ids(&store, "FW1"), want(true, "<FW1@x>", ""));
+            assert_eq!(
+                store.reply_draft_links().unwrap(),
+                [("C1".to_string(), "<M1@x>".to_string())]
+            );
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_reply_to_a_moved_original_answers_it_under_its_new_id() {
+            // M1 moved since the list showed it (#1896): Graph is asked by
+            // its new id, and the draft's link reads the row stored under
+            // it, though the command names the old one.
+            let mut routes = vec![composed_for("M1N", "createReply", "R1"), body_route("R1")];
+            routes.extend(folder_routes(&[("F1", "Inbox", Some("inbox"))], &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) =
+                spawn_fast(&srv, "reply-links-moved", HOUR, None, |s| {
+                    seed_m1(s);
+                    assert!(s.follow_move("M1", "M1N").unwrap());
+                });
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || store
+                .get_delta_link("F1")
+                .unwrap()
+                .is_some()));
+            assert!(row(&store, "M1").is_none() && row(&store, "M1N").is_some());
+            handle
+                .cmd_tx
+                .send(SyncCommand::ComposeReply {
+                    id: "M1".into(),
+                    all: false,
+                })
+                .unwrap();
+            wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::DraftReady { id, original, .. } if id == "R1" && original == "M1"),
+            );
+            assert_eq!(ids(&store, "R1"), want(true, "<R1@x>", "<M1@x>"));
             assert_eq!(
                 store.reply_draft_links().unwrap(),
                 [("C1".to_string(), "<M1@x>".to_string())]
