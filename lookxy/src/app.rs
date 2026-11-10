@@ -191,6 +191,10 @@ pub struct App {
     /// the request here; it never performs the action or closes `compose`
     /// itself. `None` in the steady state.
     pub compose_action: Option<crate::ui::compose::ComposeAction>,
+    /// What the composer held when `open_draft` opened it (#2096), so Esc
+    /// on an unchanged draft saves nothing. `None` for a composer opened
+    /// some other way, which then saves as before.
+    pub compose_baseline: Option<ComposeSnapshot>,
     /// The top-level view — mail three-pane, or the calendar agenda +
     /// detail (`ui::calendar`). Toggled by `g` (see `toggle_mode`).
     pub mode: Mode,
@@ -529,6 +533,7 @@ impl App {
             test_cmd_rx: None,
             compose: None,
             compose_action: None,
+            compose_baseline: None,
             mode: Mode::Mail,
             agenda: Vec::new(),
             agenda_index: 0,
@@ -1642,7 +1647,15 @@ impl App {
                     Some((id, _)) if self.selected_msg.as_deref() == Some(id.as_str()) => {
                         self.activate_selected()
                     }
-                    Some((_, true)) => self.activate_selected(),
+                    // Only a message row (flat, or a thread's message row):
+                    // a click on a thread header still selects and toggles
+                    // through preview, never opening a draft.
+                    Some((_, true))
+                        if !self.threaded_active()
+                            || matches!(self.selected_row(), Some(Row::Message(..))) =>
+                    {
+                        self.activate_selected()
+                    }
                     _ => self.preview_selected_message(),
                 }
             }
@@ -3040,30 +3053,37 @@ impl App {
 
     /// Loads draft/reply/forward-draft `id` from the store and opens the
     /// composer on it: `Store::draft` for the message row + body,
-    /// `compose_html::from_html` to parse the body back into an editable
-    /// `RichText`, `editcore::ops::Editor::from` to wrap it. Three callers
-    /// share this: `compose_new` (a just-created empty draft),
-    /// `on_sync_event`'s `DraftReady` handling (a reply/forward draft the
-    /// engine just fetched), and `ui::activate` (resuming a message already
-    /// sitting in Drafts, via `MessageRow::is_draft`). A no-op if the store
-    /// has nothing for `id` — a stale/foreign id, or (for `DraftReady`) a
-    /// race where the row was deleted before this ran.
+    /// `draft_rich_text` to turn the body into an editable `RichText` (an
+    /// html body parsed, a text one line by line),
+    /// `editcore::ops::Editor::from` to wrap it. Three callers share this:
+    /// `compose_new` (a just-created empty draft), `on_sync_event`'s
+    /// `DraftReady` handling (a reply/forward draft the engine just
+    /// fetched), and `ui::activate` (resuming a message already sitting in
+    /// Drafts, via `MessageRow::is_draft`). A no-op if the store has nothing
+    /// for `id` — a stale/foreign id, or (for `DraftReady`) a race where the
+    /// row was deleted before this ran.
     ///
-    /// A draft row with no stored body (one made in Outlook or on the web,
-    /// synced as a draft since #2096: nothing fetches a draft's body on its
-    /// own) opens in the reader instead, which fetches it (`reload_body`);
-    /// once the body is stored, the next activate opens the composer.
+    /// Only a draft whose body was written here opens in the composer
+    /// (`Store::draft_body_is_local`: compose's own saves, a new message, a
+    /// composed reply/forward). A draft made in Outlook or on the web
+    /// (`is_draft` since #2096) has no body, or one `FetchBody` stored, which
+    /// is Graph's rendering of it (text, here): it opens read-only in the
+    /// reader (which fetches a missing body), as it did before #2096, so its
+    /// rendering is never saved back over it. Editing such a draft here is
+    /// not supported.
     pub fn open_draft(&mut self, id: &str) {
-        let (row, body) = match self.store.draft(id) {
-            Ok(Some(found)) => found,
-            Ok(None) => {
-                if let Ok(Some(_)) = self.store.message_row(id) {
-                    self.open_message(id);
-                    self.focus = Pane::Reading;
-                }
-                return;
+        let local = self.store.draft_body_is_local(id).unwrap_or(false);
+        let found = if local {
+            self.store.draft(id).ok().flatten()
+        } else {
+            None
+        };
+        let Some((row, body)) = found else {
+            if let Ok(Some(_)) = self.store.message_row(id) {
+                self.open_message(id);
+                self.focus = Pane::Reading;
             }
-            Err(_) => return,
+            return;
         };
         let editor = Editor::from(draft_rich_text(&body));
         let attachments = self.store.outbound_attachments(&row.id).unwrap_or_default();
@@ -3078,6 +3098,7 @@ impl App {
             autocomplete: None,
             attachments,
         });
+        self.compose_baseline = self.compose.as_ref().map(ComposeSnapshot::of);
     }
 
     /// Acts on the last request the compose view's key handling recorded on
@@ -3104,9 +3125,20 @@ impl App {
         let Some(action) = self.compose_action.take() else {
             return;
         };
+        let baseline = self.compose_baseline.take();
         let Some(compose) = self.compose.take() else {
             return;
         };
+        // Esc on a draft nothing was changed in since it opened saves
+        // nothing (#2096): no local write and no `SaveDraft` that would PATCH
+        // the server's draft with what it already has. A `local:` draft
+        // still saves: its Save is what creates it on Graph.
+        if action == ComposeAction::Save
+            && !compose.draft_id.starts_with("local:")
+            && baseline.as_ref() == Some(&ComposeSnapshot::of(&compose))
+        {
+            return;
+        }
         if action == ComposeAction::Discard {
             // Only the files not on the Graph draft yet: one a failed send
             // uploaded stays listed, as Send would still deliver it (#1874).
@@ -4138,6 +4170,34 @@ fn parse_attendee_part(part: &str) -> Vec<(String, String)> {
         .filter(|s| !s.is_empty())
         .map(|addr| (String::new(), addr.to_string()))
         .collect()
+}
+
+/// Everything Esc's save writes for a draft (#2096): its fields, its body
+/// as the HTML it would save, and its attachments. Equal snapshots at open
+/// and at Esc mean nothing changed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComposeSnapshot {
+    draft_id: String,
+    subject: String,
+    to: String,
+    cc: String,
+    bcc: String,
+    html: String,
+    attachments: Vec<mailcore::store::OutboundAttachment>,
+}
+
+impl ComposeSnapshot {
+    fn of(c: &Compose) -> ComposeSnapshot {
+        ComposeSnapshot {
+            draft_id: c.draft_id.clone(),
+            subject: c.subject.clone(),
+            to: c.to.clone(),
+            cc: c.cc.clone(),
+            bcc: c.bcc.clone(),
+            html: compose_html::to_html(&c.editor.text),
+            attachments: c.attachments.clone(),
+        }
+    }
 }
 
 /// The compose editor's document for a stored draft body (#2096): an
@@ -6945,73 +7005,73 @@ pub(crate) mod tests {
         cmd_rx
     }
 
-    /// The ids of the `FetchBody` commands `rx` holds.
-    fn fetched_bodies(rx: &std::sync::mpsc::Receiver<SyncCommand>) -> Vec<String> {
-        rx.try_iter()
-            .filter_map(|c| match c {
-                SyncCommand::FetchBody { id } => Some(id),
-                _ => None,
-            })
-            .collect()
+    /// The commands `rx` holds: the ids of its `FetchBody`s, and whether
+    /// any `SaveDraft` or `SendDraft` came.
+    fn drain(rx: &std::sync::mpsc::Receiver<SyncCommand>) -> (Vec<String>, bool) {
+        let mut fetched = Vec::new();
+        let mut saved = false;
+        for c in rx.try_iter() {
+            match c {
+                SyncCommand::FetchBody { id } => fetched.push(id),
+                SyncCommand::SaveDraft { .. } | SyncCommand::SendDraft { .. } => saved = true,
+                _ => {}
+            }
+        }
+        (fetched, saved)
     }
 
-    /// Stores `d1`'s body as `FetchBody` does under lookxy's
-    /// `BodyFormat::Text` (the engine's default): plain text.
-    const SYNCED_DRAFT_TEXT: &str = "Hi\r\n\r\nFrom: Alice <alice@x>";
-
-    fn store_fetched_text_body(app: &App) {
-        use mailcore::graph::model::{Body, BodyFormat};
+    /// Stores `d1`'s body as `FetchBody` does: Graph's rendering, recorded
+    /// with the format asked for (lookxy's engine asks for text).
+    fn store_fetched_body(app: &App, format: mailcore::graph::model::BodyFormat, t: &str) {
+        use mailcore::graph::model::Body;
         let stored = app
             .store
             .put_fetched_body_with_headers(
                 "d1",
                 &Body {
-                    content_type: "text".into(),
+                    content_type: t.into(),
                     content: SYNCED_DRAFT_TEXT.into(),
                 },
-                BodyFormat::Text,
+                format,
                 &[],
             )
             .unwrap();
         assert!(stored);
     }
 
-    /// The composer holds `d1`'s text body as text: one paragraph per line,
-    /// the empty one kept, `<alice@x>` intact.
-    fn assert_compose_has_the_text_body(app: &App) {
-        let compose = app.compose.as_ref().expect("compose should be open");
-        assert_eq!(compose.draft_id, "d1");
-        assert_eq!(compose.editor.text.blocks.len(), 3);
-        assert_eq!(
-            compose.editor.text.plain(),
-            SYNCED_DRAFT_TEXT.replace("\r\n", "\n")
-        );
-    }
+    const SYNCED_DRAFT_TEXT: &str = "Hi\r\n\r\nFrom: Alice <alice@x>";
 
-    #[test]
-    fn a_synced_draft_without_a_body_opens_the_reader_then_the_composer() {
-        let mut app = App::for_test_with_seeded_store();
-        let cmd_rx = seed_synced_draft(&mut app);
-
-        // Activated: the reader opens it and fetches its body, rather than
-        // nothing happening.
-        app.activate_selected();
+    /// Asserts `d1` is open read-only in the reader, never the composer.
+    fn assert_in_the_reader(app: &App) {
         assert!(app.compose.is_none());
         assert_eq!(app.selected_msg.as_deref(), Some("d1"));
         assert_eq!(app.focus, Pane::Reading);
-        assert!(app.body_loading);
-        assert_eq!(fetched_bodies(&cmd_rx), ["d1"]);
-
-        // With its body stored as text, the next activate opens the
-        // composer on it as text.
-        store_fetched_text_body(&app);
-        app.focus = Pane::List;
-        app.activate_selected();
-        assert_compose_has_the_text_body(&app);
     }
 
     #[test]
-    fn one_click_opens_a_synced_draft() {
+    fn a_synced_draft_opens_read_only_in_the_reader() {
+        use mailcore::graph::model::BodyFormat;
+        let mut app = App::for_test_with_seeded_store();
+        let cmd_rx = seed_synced_draft(&mut app);
+        // No body yet: the reader opens it and fetches the body once.
+        app.activate_selected();
+        assert_in_the_reader(&app);
+        assert!(app.body_loading);
+        assert_eq!(drain(&cmd_rx), (vec!["d1".to_string()], false));
+        // With Graph's rendering stored, as text or html, it still opens in
+        // the reader, never the composer, and nothing is saved back.
+        for (format, t) in [(BodyFormat::Text, "text"), (BodyFormat::Html, "html")] {
+            store_fetched_body(&app, format, t);
+            app.focus = Pane::List;
+            app.activate_selected();
+            assert_in_the_reader(&app);
+            assert_eq!(drain(&cmd_rx), (vec![], false), "{t}");
+        }
+    }
+
+    #[test]
+    fn one_click_opens_a_synced_draft_in_the_reader() {
+        use mailcore::graph::model::BodyFormat;
         let mut app = App::for_test_with_seeded_store();
         let cmd_rx = seed_synced_draft(&mut app);
         app.list_rect = Rect::new(25, 0, 30, 10);
@@ -7025,16 +7085,42 @@ pub(crate) mod tests {
                 modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
             });
         };
-        // No body: one click opens the reader, which fetches it once.
+        // One click opens the reader, which fetches the body once.
         click(&mut app);
-        assert!(app.compose.is_none());
-        assert_eq!(app.selected_msg.as_deref(), Some("d1"));
-        assert_eq!(app.focus, Pane::Reading);
-        assert_eq!(fetched_bodies(&cmd_rx), ["d1"]);
-        // With its body stored, a click opens the composer.
-        store_fetched_text_body(&app);
+        assert_in_the_reader(&app);
+        assert_eq!(drain(&cmd_rx), (vec!["d1".to_string()], false));
+        // With the body fetched, a click still opens the reader.
+        store_fetched_body(&app, BodyFormat::Text, "text");
         click(&mut app);
-        assert_compose_has_the_text_body(&app);
+        assert_in_the_reader(&app);
+        assert_eq!(drain(&cmd_rx), (vec![], false));
+    }
+
+    #[test]
+    fn a_draft_with_a_local_text_body_opens_in_compose_as_text() {
+        // A `createReply` of a plain-text message: a body written here, as
+        // text. One paragraph per line, the empty one kept, `<alice@x>`
+        // intact.
+        use mailcore::graph::model::Body;
+        let mut app = App::for_test_with_seeded_store();
+        let _cmd_rx = seed_synced_draft(&mut app);
+        app.store
+            .put_body(
+                "d1",
+                &Body {
+                    content_type: "text".into(),
+                    content: SYNCED_DRAFT_TEXT.into(),
+                },
+            )
+            .unwrap();
+        app.activate_selected();
+        let compose = app.compose.as_ref().expect("compose should be open");
+        assert_eq!(compose.draft_id, "d1");
+        assert_eq!(compose.editor.text.blocks.len(), 3);
+        assert_eq!(
+            compose.editor.text.plain(),
+            SYNCED_DRAFT_TEXT.replace("\r\n", "\n")
+        );
     }
 
     #[test]
@@ -7054,6 +7140,63 @@ pub(crate) mod tests {
         app.activate_selected();
         let compose = app.compose.as_ref().expect("compose should be open");
         assert_eq!(compose.editor.text.plain(), "Thanks\na <b>");
+    }
+
+    #[test]
+    fn esc_on_an_unchanged_draft_saves_nothing_and_after_an_edit_saves() {
+        use mailcore::graph::model::Body;
+        let mut app = App::for_test_with_seeded_store();
+        let cmd_rx = seed_synced_draft(&mut app);
+        let local = Body {
+            content_type: "text".into(),
+            content: SYNCED_DRAFT_TEXT.into(),
+        };
+        app.store.put_body("d1", &local).unwrap();
+        let body = |app: &App| app.store.get_body("d1").unwrap().unwrap();
+
+        // Opened and closed with Esc, untouched: no write, no `SaveDraft`.
+        app.activate_selected();
+        assert!(app.compose.is_some());
+        app.compose_action = Some(ComposeAction::Save);
+        app.apply_compose_action();
+        assert!(app.compose.is_none());
+        assert_eq!(body(&app), local);
+        assert_eq!(drain(&cmd_rx), (vec![], false));
+
+        // Opened again and edited: Esc saves as before.
+        app.focus = Pane::List;
+        app.activate_selected();
+        app.compose.as_mut().unwrap().editor.insert_text("!");
+        app.compose_action = Some(ComposeAction::Save);
+        app.apply_compose_action();
+        assert_eq!(body(&app).content_type, "html");
+        assert_eq!(drain(&cmd_rx), (vec![], true));
+
+        // A field edit counts too, and Send always sends.
+        app.focus = Pane::List;
+        app.activate_selected();
+        app.compose.as_mut().unwrap().subject.push('!');
+        app.compose_action = Some(ComposeAction::Save);
+        app.apply_compose_action();
+        assert_eq!(drain(&cmd_rx), (vec![], true));
+        app.focus = Pane::List;
+        app.activate_selected();
+        app.compose_action = Some(ComposeAction::Send);
+        app.apply_compose_action();
+        assert_eq!(drain(&cmd_rx), (vec![], true));
+    }
+
+    #[test]
+    fn esc_on_an_unchanged_new_message_still_saves_it() {
+        // A `local:` draft's Save is what creates it on Graph.
+        let mut app = App::for_test_with_seeded_store();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        app.sync.cmd_tx = cmd_tx;
+        app.compose_new();
+        assert!(app.compose.is_some());
+        app.compose_action = Some(ComposeAction::Save);
+        app.apply_compose_action();
+        assert_eq!(drain(&cmd_rx), (vec![], true));
     }
 
     #[test]
