@@ -147,6 +147,7 @@ issue number to find its notes.
   folders created, renamed and moved through the outbox (#1910), a folder deleted only
   after a walk of Graph finds nothing the store shows elsewhere (#2107),
   a whole folder marked read on the server through `$batch` (#1913),
+  a folder emptied on the server through `$batch`, unsent mail kept, FTS rows in bulk (#2110),
   OAuth tokens in the platform secret store, a plaintext fallback and its
   warning (#1877), contact search folded in Rust, word-prefix rank, `all_contacts`
   (#1890).

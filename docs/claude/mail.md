@@ -3258,7 +3258,7 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
 ## Mark a folder read (#1913)
 
 - `SyncCommand::MarkFolderRead { folder }` marks the whole folder read, on Graph too, not only
-  the mail the store holds. `EmptyFolder` is #2110, built on the same `$batch` client.
+  the mail the store holds. `EmptyFolder` (#2110, below) shares its `$batch` loop (`bulk_batches`).
 - Store (`Store::mark_folder_read(folder, now_utc)`, crate-private): one IMMEDIATE transaction
   marks every stored message of the folder read, sets its `unread_count` to 0 and queues
   `OutboxOp::MarkFolderRead { folder, before }` (kind `markFolderRead`). It is all or nothing,
@@ -3359,3 +3359,117 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `mark_folder_read_refusals_report_and_restart_the_folder_delta`,
   `mark_folder_read_survives_a_restart`,
   `mark_folder_read_of_an_unknown_folder_reports_and_queues_nothing`).
+
+## Empty a folder (#2110)
+
+- `SyncCommand::EmptyFolder { folder, subfolders }` empties a folder on the server too. It is
+  #1913's sibling (the `$batch` loop) and #2107's (the allow-list check), and follows their
+  rules. The rule is #2107's: a delete never takes, on Graph, a message the store shows
+  elsewhere.
+- Store (`Store::empty_folder(folder, now_utc)`, one IMMEDIATE transaction, all or nothing; the
+  test proves it on 5 000 rows with an aborting trigger). An unknown folder or the drafts
+  sentinel is refused (`FolderWriteFailed { write: Empty, status: None }` + `Error`), and nothing
+  is written. Unsent mail (`unsent_mail_in_on`: a `local:` id, `local_edit > 0`, a queued
+  `SaveDraft`/`SendDraft`) stays. Refusing the command for it, as a folder delete does, would make
+  "Empty Drafts" useless while one draft is open. Every other row of the folder goes (bodies,
+  attachments and headers by cascade), recorded first in the allow-list (`folder_delete_allow`,
+  kind `message`, batch `empty:…`) with its internet message id. Its tombstones are cleared as
+  `delete_folder` clears its own. The counts become those of the kept rows. The folder's delta and
+  backfill links are cleared (`clear_folder_links_on`): no stored link resumes over the removed
+  mail, and no backfill picks the folder (`incomplete_histories` needs a delta link). Then
+  `OutboxOp::EmptyFolder { folder, before, batch }` (kind `emptyFolder`) is queued. `before` is
+  `mark_folder_read`'s cutoff (`folder_cutoff_on`, shared). Every command queues its own op.
+- FTS: `messages_fts_ad` and `bodies_fts_ad` scan the whole FTS table per deleted row
+  (`message_id` is `UNINDEXED`). They are now `schema::FTS_DELETE_TRIGGERS_SQL`, run by `init`
+  right after `SCHEMA_SQL`, with the text unchanged. `empty_folder` drops both inside its
+  transaction, deletes the folder's FTS rows in one statement, deletes the rows, and runs that same
+  text again before the commit. DDL is transactional, so a rollback restores them; the test
+  compares `sqlite_master` byte for byte after a commit and after a rollback. Measured in a
+  release build, deleting 5 000 rows:
+
+  | FTS rows of other folders | per-row triggers | `empty_folder` |
+  |---|---|---|
+  | 0 | 5.4 s | 0.10 s |
+  | 20 000 | 43.5 s | 0.04 s |
+
+  With 1 000 rows the per-row triggers took 0.17 s and `empty_folder` 0.01 s. The schema change
+  makes lookxy's connection re-prepare its statements once, which is harmless.
+- The command emits `MessagesUpdated { folder }`, then `FoldersUpdated` and a drain
+  (`folder_command`). With `subfolders`, each folder stored right under it (read before the
+  write) is then deleted by `Engine::delete_folder`. Its `DeleteFolder` is queued after the
+  `EmptyFolder` and waits for it. Each child is refused or not on its own, and is reported as
+  #2107 reports it.
+- The drain (`run_empty_folder`, never `apply_op`, which answers it `Parse`; `folder_op()` leaves
+  it out). Like a `DeleteFolder`, it waits until no older op is queued (`has_older_op`, no
+  attempt, no back-off). The drain passes a non-final 4xx, so without this a move into the folder
+  refused once would land after the empty and bring the mail back. A folder still `local:` sends
+  nothing: the op and its allow-list go. The first step pages every message Graph holds there
+  received at or before `before` (`GraphClient::folder_messages_before`:
+  `$filter=receivedDateTime le {before}&$select=id,internetMessageId&$top=1000`, following
+  `@odata.nextLink`, deduplicated, an item without an id `Parse`), all before the first DELETE,
+  since deleting while paging shifts the pages. It then checks them with
+  `Store::delete_allow_check(batch, &[], items)`.
+  - An id refused there that the store holds in this very folder is the unsent mail the command
+    kept, its own choice: left alone and not reported.
+  - Any other refused id is kept, as the store shows it elsewhere or removed it.
+  - The rest go 20 a `$batch` (`GraphClient::delete_message_request`: `DELETE /me/messages/{id}`,
+    the soft delete `OutboxOp::Delete` sends), through `bulk_batches`, the loop
+    `run_mark_folder_read` now shares (`BulkRun` has a `kind`, `kept` and `rows_deleted`).
+    A 2xx or 404 is done, and the stored row of that id goes too, wherever it is, should one
+    have come back meanwhile (a search hit, a fetch); `MessagesUpdated` then follows at the end.
+    429/503: back at the front, `hold_outbox` for the longest `Retry-After`. Another 5xx: back,
+    `defer_op`. Anything else is recorded.
+- The end (`finish_empty_folder`): `Store::finish_folder_empty(seq, batch, folder)` drops the op
+  and the batch's allow rows and clears the folder's links in one transaction, so no crash leaves
+  the op gone with an old link in place. The next pass reads the folder afresh: mail that came
+  after the listing, and what the run kept or could not delete. One report if anything failed or
+  was kept: `FolderWriteFailed { write: Empty, status }` + `Error("empty folder {id}: …")`, the
+  error joining `"{n} of {total} messages could not be deleted: {first error}"` and `"{k} of
+  {total} messages were kept: the store shows them elsewhere or removed"` with `"; "`. `status` is
+  the first refused id's, `None` when only kept mail is reported. `total` counts what the run took
+  on: listed, less the unsent mail it left.
+- Whole-call failures go through `engine_op_call_failed`: auth, throttle and transport stop the
+  drain, and a 5xx defers. Anything else (a 404, another 4xx, `Parse`) refuses it
+  (`refuse_empty_folder`): `finish_folder_empty`, `bulk` cleared, and the report. The cleared
+  links bring back the mail Graph still has. A restart loses the run, and the op pages again,
+  which is safe: deleted mail is no longer listed, and the allow-list is in the store.
+- While the op is queued (`QueuedFolderWrites::emptied`, `Store::folder_being_emptied`) nothing is
+  read for the folder. `sync_folder_delta` returns at once, so a pass, a fast tick and the
+  post-send sync skip it; `refresh_folder` (`SyncFolder`, fast ticks) sends no delta and no count
+  read. A listing keeps its stored `total_count` and `unread_count`, and a search scoped to it
+  answers no hits with no request. Guarding delta items one by one was rejected: any page the guard
+  misjudged would bring a deleted item back. Not guarded: an unscoped search hit stored, a
+  `FetchMessage`, a list row by id (#2053). The run deletes the row of each id Graph answered for,
+  and the end's fresh delta re-reads the folder.
+- `Store::delete_folder` (#2107) of the folder or a folder above it drops a queued `EmptyFolder`
+  and its allow-list (`drop_folder_ops_on`), and `drain_outbox` then drops a run whose op is
+  gone. The delete's walk still allows the mail the empty removed because the store never held
+  it any more: there is no row, and the empty cleared its own tombstones, so no tombstone either
+  (the internet-message-id rule then finds no row or tombstone). Don't "fix" that clearing.
+- Known shapes: mail moved into the folder on Graph by a rule or another client after the
+  command, with an old `receivedDateTime`, is deleted (never held, before the cutoff), as #1913
+  marks it read. While the op is queued no new mail shows in the folder (often Inbox, a fast
+  folder); a long throttled run makes that visible. A long run holds every op queued behind it,
+  as #1913's does. Another client changing the folder between the listing and the deletes is out
+  of scope, as are "empty to Deleted Items" (a move), `permanentDelete`, emptying subfolders'
+  mail without deleting them, and a lookxy UI (lookxy ignores `FolderWrite::Empty`).
+- Tests: store `empty_folder_tests` (`empty_folder_op_round_trips_json`,
+  `empty_folder_removes_the_folders_mail_zeroes_and_queues_in_one_transaction`,
+  `empty_folder_is_all_or_nothing_on_5000_rows` (with 10 000 FTS rows of another folder: over 30 s
+  in a debug build with the per-row triggers), `empty_folder_keeps_unsent_mail_and_counts_it`,
+  `empty_folder_fts_rows_go_and_the_fts_triggers_come_back`,
+  `empty_folder_refuses_unknown_and_the_drafts_sentinel`, `empty_folder_allow_list_and_tombstones`,
+  `empty_folder_cutoff_is_the_later_of_now_and_the_newest_row`,
+  `delete_folder_drops_a_queued_empty_folder_and_its_allow_list`); `client.rs`
+  `folder_messages_before_filters_pages_and_dedups`, `delete_message_request_is_a_delete`;
+  `outbox.rs` `apply_op_empty_folder_sends_nothing`; `engine.rs` `folder_writes::empty_folder`
+  (`empty_folder_pages_and_deletes_every_server_id_once`,
+  `a_429_inside_a_batch_is_retried_after_retry_after`,
+  `a_sync_pass_reads_nothing_for_a_folder_being_emptied`,
+  `empty_folder_keeps_mail_the_store_shows_elsewhere`,
+  `empty_folder_waits_for_an_older_move_into_it_and_deletes_it_under_its_new_id`,
+  `empty_folder_keeps_unsent_drafts_and_reports_nothing`,
+  `empty_folder_refusals_report_and_restart_the_folder_delta`, `empty_folder_survives_a_restart`,
+  `empty_folder_with_subfolders_deletes_the_children`,
+  `a_delete_of_the_folder_drops_its_queued_empty`,
+  `empty_folder_of_an_unknown_folder_reports_and_queues_nothing`).
