@@ -3153,9 +3153,11 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   marks every stored message of the folder read, sets its `unread_count` to 0 and queues
   `OutboxOp::MarkFolderRead { folder, before }` (kind `markFolderRead`). It is all or nothing,
   and the test proves it on 5 000 rows with an aborting trigger. `before` is the cutoff: the later
-  of the command's UTC time and the newest stored `received_at` in the folder, cut to whole
-  seconds. Mail Graph receives after the command, or while the engine is offline, is not
-  the command's, and a client clock behind Graph's still covers the mail the user saw. Every
+  of the command's UTC time and the newest stored `received_at` in the folder. A fractional
+  second rounds up to the next whole one (`ceil_to_whole_second`, carrying across a minute or
+  a day), so Graph's `receivedDateTime le` still takes a message at `…07.512Z` (r1). Mail
+  Graph receives after the command, or while the engine is offline, is not the command's, and
+  a client clock behind Graph's still covers the mail the user saw. Every
   command queues its own op, with no dedup: `MarkFolderRead`, then `MarkRead` to unread, then
   `MarkFolderRead` again must end read. An unknown folder or the drafts sentinel is refused
   (`FolderWriteFailed { write: MarkRead, status: None }` plus `Error`), and nothing is written.
@@ -3181,7 +3183,10 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   A batch's ids leave the run only once Graph has answered.
   - A 2xx or a 404 (the message is gone) is done.
   - A 429 or 503 puts its ids back at the front and stops the drain for the batch's longest
-    `Retry-After` (default 30 s, `schedule_retry`), as a throttled op does.
+    `Retry-After` (default 30 s). `schedule_retry` holds the passes, and `hold_outbox` sets the
+    drain's own gate (`op_retry`, a later one kept), because `next_retry` alone would let a
+    command's drain (`drain_queued`) send the throttled ids again at once (r1). A whole-call
+    `Throttled` holds the outbox the same way, and `due` wakes the loop when the hold ends.
   - Another 5xx puts its ids back under the outbox back-off (`op_retry`; the op's attempts are
     bumped, and it is never quarantined).
   - Any other status is recorded and reported once the rest are done: `"{n} of {total} messages
@@ -3202,11 +3207,18 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
 - While the op is queued (`QueuedFolderWrites::marked_read`, folder → latest `before`), a pass
   keeps the folder's stored `unread_count`. This covers the listing (`sync_folders`) and one
   folder's count read (`refresh_folder`, `kept_unread_count`). `merge_delta_items` (heads,
-  stored-link rounds, backfill pages) stores an item read when it was received at or before the
-  cutoff. Newer mail keeps Graph's state, so the count can read 0 beside a newer unread row
-  until the op drains. Protected ids are still skipped first, so a `MarkRead` queued after the op
-  keeps its own state. `FetchMessage`, search hits and header repair are not guarded: each mark
-  the op makes comes back as a delta change.
+  stored-link rounds, backfill pages) stores some items read (`read_guard`, `ReadGuard`, read
+  once per page):
+  - before the run has paged, an item received at or before the cutoff;
+  - once it has paged, only an id the run still holds in `todo` (r1). Mail that came into the
+    folder after the listing, for example moved in with an older `receivedDateTime`, is never
+    PATCHed, so it keeps Graph's state.
+
+  An id another queued op names (`protected_ids`) is never forced, on stored-link rounds too,
+  so a `MarkRead` to unread queued after the op keeps its own state (r1). Newer mail keeps
+  Graph's state, so the count can read 0 beside a newer unread row until the op drains.
+  `FetchMessage`, search hits and header repair are not guarded: each mark the op makes comes
+  back as a delta change.
 - Known limit: a long throttled run holds every op queued behind it, sends too, until it ends.
   Graph throttles per mailbox, so a send would be throttled meanwhile anyway. The drain order is
   what keeps a later per-message `MarkRead` or `Move` correct, so don't reorder.
@@ -3221,6 +3233,7 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `mark_folder_read_refuses_unknown_and_the_drafts_sentinel`,
   `a_second_mark_folder_read_after_a_mark_unread_is_queued_again`,
   `mark_folder_read_cutoff_is_the_later_of_now_and_the_newest_row`,
+  `ceil_to_whole_second_rounds_a_fraction_up_with_carries`,
   `mark_folder_read_follows_a_folder_alias`, `a_read_state_update_leaves_the_fts_row_alone`,
   `migrate_fts_update_trigger_replaces_an_old_trigger_once`,
   `restart_folder_delta_clears_only_that_folder`); `outbox.rs`
@@ -3228,7 +3241,11 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   (`mark_folder_read_pages_and_batches_every_server_unread_id_once`,
   `a_429_inside_a_batch_is_retried_after_retry_after`,
   `a_sync_pass_keeps_a_queued_mark_folder_read`,
+  `before_the_run_pages_mail_up_to_the_cutoff_is_stored_read`,
   `mark_folder_read_leaves_mail_received_after_the_command_unread`,
+  `mail_the_paged_run_does_not_hold_keeps_graphs_state`,
+  `a_mark_unread_queued_after_the_op_keeps_its_state`,
+  `a_throttled_batch_holds_a_commands_drain_until_retry_after`,
   `mark_folder_read_refusals_report_and_restart_the_folder_delta`,
   `mark_folder_read_survives_a_restart`,
   `mark_folder_read_of_an_unknown_folder_reports_and_queues_nothing`).
