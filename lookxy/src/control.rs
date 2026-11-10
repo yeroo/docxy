@@ -803,6 +803,7 @@ mod tests {
                     is_meeting_request: false,
                     meeting_message_type: None,
                     protection: Default::default(),
+                    meeting_reminder_on: false,
                     categories: Vec::new(),
                     is_reminder_on: false,
                     reminder_at: String::new(),

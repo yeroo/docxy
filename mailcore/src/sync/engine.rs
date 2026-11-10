@@ -6482,6 +6482,7 @@ mod tests {
                             is_meeting_request: false,
                             meeting_message_type: None,
                             protection: Default::default(),
+                            meeting_reminder_on: false,
                             categories: vec![],
                             is_reminder_on: false,
                             reminder_at: String::new(),
@@ -19842,6 +19843,7 @@ mod tests {
                 is_meeting_request: false,
                 meeting_message_type: None,
                 protection: Default::default(),
+                meeting_reminder_on: false,
                 categories: Vec::new(),
                 is_reminder_on: false,
                 reminder_at: String::new(),
@@ -20704,6 +20706,293 @@ mod tests {
         }
     }
 
+    // --- A meeting message's own reminder on its row (#2089) -------------
+
+    mod meeting_reminders {
+        use super::*;
+
+        const SET: &str = "Boolean {00062008-0000-0000-C000-000000000046} Id 0x8503";
+        const AT: &str = "SystemTime {00062008-0000-0000-C000-000000000046} Id 0x8502";
+        const REQUEST: &str = "#microsoft.graph.eventMessageRequest";
+
+        /// `message_json` as the expand brings it: with `odata` as its
+        /// `@odata.type` (if any) and `props` (`(id, value)`) as its
+        /// extended properties, the class among them when given.
+        fn item(
+            id: &str,
+            read: bool,
+            flagged: bool,
+            odata: Option<&str>,
+            props: &[(&str, &str)],
+        ) -> String {
+            let plain = message_json(id, read, flagged, &[]);
+            let odata = odata
+                .map(|t| format!(r#""@odata.type":"{t}","#))
+                .unwrap_or_default();
+            let entries: Vec<String> = props
+                .iter()
+                .map(|(id, v)| format!(r#"{{"id":"{id}","value":"{v}"}}"#))
+                .collect();
+            format!(
+                r#"{{{odata}{},"singleValueExtendedProperties":[{}]}}"#,
+                plain.strip_prefix('{').unwrap().strip_suffix('}').unwrap(),
+                entries.join(",")
+            )
+        }
+
+        /// A meeting request with its class, the set bit `set` (none when
+        /// `None`) and no reminder time.
+        fn request(id: &str, read: bool, set: Option<&str>) -> String {
+            let mut props = vec![("String 0x1a", "IPM.Schedule.Meeting.Request")];
+            if let Some(v) = set {
+                props.push((SET, v));
+            }
+            item(id, read, false, Some(REQUEST), &props)
+        }
+
+        fn row(store: &Store, id: &str) -> Option<crate::store::MessageRow> {
+            store.message_row(id).unwrap()
+        }
+
+        fn on(store: &Store, id: &str) -> Option<(bool, bool)> {
+            row(store, id).map(|r| (r.is_read, r.meeting_reminder_on))
+        }
+
+        fn inbox_routes(startup: &[String], later: &[String]) -> Vec<(Route, Option<usize>)> {
+            let mut routes = vec![calendar_route()];
+            routes.extend(deltas("F1", startup, later));
+            routes.extend(startup_then(
+                "/me/mailFolders?",
+                &list(&[tree_folder("F1", "Inbox", None, (1, 0), 0)]),
+                &list(&[tree_folder("F1", "Inbox", None, (1, 0), 0)]),
+            ));
+            routes
+        }
+
+        #[test]
+        fn delta_stores_a_meeting_request_s_reminder_and_nothing_else_s() {
+            let startup = [
+                // A meeting request with its reminder set: on.
+                request("M1", false, Some("true")),
+                // One without the bit, and one with it false: off.
+                request("M2", false, None),
+                request("M3", false, Some("false")),
+                // A plain unflagged message with the bit and a time: off,
+                // and no flag reminder either.
+                item(
+                    "N1",
+                    false,
+                    false,
+                    None,
+                    &[
+                        ("String 0x1a", "IPM.Note"),
+                        (SET, "true"),
+                        (AT, "2026-11-08T10:00:00Z"),
+                    ],
+                ),
+                // A flagged meeting request with the bit and a time: its
+                // flag reminder is due as before, and its own is on.
+                item(
+                    "M4",
+                    false,
+                    true,
+                    Some(REQUEST),
+                    &[
+                        ("String 0x1a", "IPM.Schedule.Meeting.Request"),
+                        (SET, "true"),
+                        (AT, "2026-11-08T10:00:00Z"),
+                    ],
+                ),
+            ];
+            let srv = FakeServer::start_limited(inbox_routes(&startup, &[]));
+            let (handle, store_path, dir) =
+                spawn_fast(&srv, "meeting-reminder", TICK, None, |_| {});
+            let store = Store::open(&store_path).unwrap();
+            assert!(
+                wait_until(TICK_WAIT, || ["M1", "M2", "M3", "N1", "M4"]
+                    .iter()
+                    .all(|id| row(&store, id).is_some())),
+                "{:?}",
+                store.messages_in_folder("F1", 10, 0)
+            );
+            let got: Vec<_> = ["M1", "M2", "M3", "N1", "M4"]
+                .iter()
+                .map(|id| {
+                    let r = row(&store, id).unwrap();
+                    (*id, r.meeting_reminder_on, r.is_reminder_on)
+                })
+                .collect();
+            assert_eq!(
+                got,
+                [
+                    ("M1", true, false),
+                    ("M2", false, false),
+                    ("M3", false, false),
+                    ("N1", false, false),
+                    ("M4", true, true),
+                ]
+            );
+            // The flag reminders' due query is unchanged: only the flagged
+            // one, never an unflagged meeting request with its bit set.
+            let due: Vec<String> = store
+                .due_message_reminders("2100-01-01T00:00:00Z")
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            assert_eq!(due, ["M4"]);
+            // The folder's rows carry it too.
+            let mut listed: Vec<_> = store
+                .messages_in_folder("F1", 10, 0)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.id, r.meeting_reminder_on))
+                .collect();
+            listed.sort();
+            assert_eq!(
+                listed,
+                [
+                    ("M1".to_string(), true),
+                    ("M2".to_string(), false),
+                    ("M3".to_string(), false),
+                    ("M4".to_string(), true),
+                    ("N1".to_string(), false),
+                ]
+            );
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_later_round_keeps_it_without_the_class_and_clears_it_with_it() {
+            let startup = [
+                request("M1", false, Some("true")),
+                request("M2", false, Some("true")),
+            ];
+            // The next round: M1 without its class (complete, read now)
+            // keeps it; M2 with its class and no bit (read now) clears it.
+            let later = [
+                message_json("M1", true, false, &[]),
+                request("M2", true, None),
+            ];
+            let srv = FakeServer::start_limited(inbox_routes(&startup, &later));
+            let (handle, store_path, dir) =
+                spawn_fast(&srv, "meeting-reminder-later", TICK, None, |_| {});
+            let store = Store::open(&store_path).unwrap();
+            // The later round landed: both read.
+            assert!(
+                wait_until(TICK_WAIT, || on(&store, "M1").is_some_and(|(read, _)| read)
+                    && on(&store, "M2").is_some_and(|(read, _)| read)),
+                "{:?} {:?}",
+                on(&store, "M1"),
+                on(&store, "M2")
+            );
+            assert_eq!(on(&store, "M1"), Some((true, true)));
+            assert_eq!(on(&store, "M2"), Some((true, false)));
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// `M1` in `F1`: a meeting request whose own reminder is on.
+        fn seed_m1(s: &Store) {
+            s.upsert_folder(&crate::graph::model::MailFolder {
+                id: "F1".into(),
+                display_name: "Inbox".into(),
+                parent_id: None,
+                total_count: 1,
+                unread_count: 1,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+            let v = crate::json::parse(&request("M1", false, Some("true"))).unwrap();
+            let m = Message::from_json(&v).unwrap();
+            assert!(m.meeting_reminder_on);
+            s.upsert_message("F1", &m).unwrap();
+        }
+
+        fn patch_route(status: u16, body: &str) -> (Route, Option<usize>) {
+            (
+                Route {
+                    method: "PATCH".into(),
+                    path_prefix: "/me/messages/M1".into(),
+                    status,
+                    headers: vec![],
+                    body: body.into(),
+                },
+                None,
+            )
+        }
+
+        fn spawn_m1(
+            tag: &str,
+            extra: Vec<(Route, Option<usize>)>,
+        ) -> (FakeServer, SyncHandle, Store, PathBuf) {
+            let mut routes = extra;
+            routes.extend(folder_routes(&[("F1", "Inbox", Some("inbox"))], &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) = spawn_fast(&srv, tag, HOUR, None, seed_m1);
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || store
+                .get_delta_link("F1")
+                .unwrap()
+                .is_some()));
+            (srv, handle, store, dir)
+        }
+
+        #[test]
+        fn dismiss_turns_it_off_and_a_refused_one_re_reads_it_on() {
+            // Accepted: the PATCH turns PidLidReminderSet off on Graph, and
+            // the row's meeting reminder goes off with it.
+            let (_srv, handle, store, dir) =
+                spawn_m1("meeting-reminder-dismiss", vec![patch_route(200, "{}")]);
+            assert_eq!(on(&store, "M1"), Some((false, true)));
+            handle
+                .cmd_tx
+                .send(SyncCommand::DismissMessageReminder { id: "M1".into() })
+                .unwrap();
+            let _ = reminder_barrier(&handle);
+            assert_eq!(on(&store, "M1"), Some((false, false)));
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+
+            // Refused: the row is re-read through the single fetch
+            // (`get_message`, with the expand), which brings the class and
+            // the bit back.
+            let (srv, handle, store, dir) = spawn_m1(
+                "meeting-reminder-dismiss-400",
+                vec![
+                    patch_route(
+                        400,
+                        r#"{"error":{"code":"ErrorInvalidProperty","message":"Bad property"}}"#,
+                    ),
+                    (
+                        get_route(
+                            "/me/messages/M1?$select=",
+                            200,
+                            &request("M1", false, Some("true")),
+                        ),
+                        None,
+                    ),
+                ],
+            );
+            handle
+                .cmd_tx
+                .send(SyncCommand::DismissMessageReminder { id: "M1".into() })
+                .unwrap();
+            let _ = reminder_barrier(&handle);
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            assert!(
+                srv.requests()
+                    .iter()
+                    .any(|r| r.method == "GET" && r.path.starts_with("/me/messages/M1?$select=")),
+                "{:?}",
+                srv.requests()
+            );
+            assert_eq!(on(&store, "M1"), Some((false, true)));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     // --- Each message's meeting message type on its row (#2081) ----------
 
     mod meeting_message_types {
@@ -21006,6 +21295,7 @@ mod tests {
                     is_meeting_request: false,
                     meeting_message_type: None,
                     protection: Default::default(),
+                    meeting_reminder_on: false,
                     categories: vec![],
                     is_reminder_on: true,
                     reminder_at: "2026-11-08T10:00:00Z".into(),
@@ -21728,6 +22018,7 @@ mod tests {
                     is_meeting_request: false,
                     meeting_message_type: None,
                     protection: Default::default(),
+                    meeting_reminder_on: false,
                     categories: vec![],
                     is_reminder_on: false,
                     reminder_at: String::new(),

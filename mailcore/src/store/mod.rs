@@ -192,6 +192,13 @@ pub struct MessageRow {
     /// it was, until a sync re-reads it. For a host's list to show a lock
     /// or a label without opening the message.
     pub protection: MessageProtection,
+    /// A meeting message's own reminder is set (#2089,
+    /// `Message::meeting_reminder_on`): for a host's list to show classic
+    /// Outlook's bell beside the meeting icon. Independent of the flag and
+    /// of `is_reminder_on`; it never fires a reminder (it is not in
+    /// `due_message_reminders`' condition). False for any other message, and
+    /// for a row stored before it was, until a sync re-reads it.
+    pub meeting_reminder_on: bool,
 }
 
 /// A file the user has attached to an outbound draft — a reference (path +
@@ -1433,6 +1440,7 @@ impl Store {
         migrate_message_reminders(&conn)?;
         migrate_meeting_message_type(&conn)?;
         migrate_message_protection(&conn)?;
+        migrate_meeting_reminder(&conn)?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_reminder
                  ON messages(reminder_signal_at) WHERE is_reminder_on = 1",
@@ -1568,7 +1576,9 @@ impl Store {
     /// reminder columns `writes_reminder`, `flag_due_at` the flag (#2054)
     /// `meeting_message_type` `writes_meeting_type` (#2081: only when
     /// the item carried it) and the protection columns `writes_protection`
-    /// (#2088: only when the item carried its class). The reminder is on only while the row is flagged (the
+    /// (#2088: only when the item carried its class), `meeting_reminder_on`
+    /// `writes_meeting_reminder` (#2089: likewise, and with no flag term).
+    /// The reminder is on only while the row is flagged (the
     /// stored flag when the item carries none), so an unflag or a completed
     /// flag Graph reports leaves it off even if Exchange kept
     /// `PidLidReminderSet`.
@@ -1616,9 +1626,10 @@ impl Store {
                  is_meeting_request, categories,
                  is_reminder_on, reminder_at, reminder_signal_at, flag_due_at,
                  meeting_message_type,
-                 sensitivity, has_sensitivity_label, sensitivity_label_name, is_rights_protected
+                 sensitivity, has_sensitivity_label, sensitivity_label_name, is_rights_protected,
+                 meeting_reminder_on
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                       ?35 AND ?12, ?36, ?37, ?38, ?40, ?42, ?43, ?44, ?45)
+                       ?35 AND ?12, ?36, ?37, ?38, ?40, ?42, ?43, ?44, ?45, ?47)
              ON CONFLICT(id) DO UPDATE SET
                  folder_id = excluded.folder_id,
                  conversation_id = CASE WHEN ?19 THEN excluded.conversation_id ELSE messages.conversation_id END,
@@ -1652,7 +1663,9 @@ impl Store {
                  sensitivity_label_name = CASE WHEN ?46 THEN excluded.sensitivity_label_name
                                                ELSE messages.sensitivity_label_name END,
                  is_rights_protected = CASE WHEN ?46 THEN excluded.is_rights_protected
-                                            ELSE messages.is_rights_protected END
+                                            ELSE messages.is_rights_protected END,
+                 meeting_reminder_on = CASE WHEN ?48 THEN excluded.meeting_reminder_on
+                                            ELSE messages.meeting_reminder_on END
              WHERE NOT ?34 OR messages.local_edit = 0",
             params![
                 m.id,
@@ -1701,6 +1714,8 @@ impl Store {
                 m.protection.label_name,
                 m.protection.is_rights_protected,
                 fields.writes_protection(),
+                m.meeting_reminder_on,
+                fields.writes_meeting_reminder(),
             ],
         )?;
         Ok(n > 0)
@@ -1911,7 +1926,7 @@ impl Store {
                         is_reminder_on, reminder_at, reminder_signal_at, flag_due_at,
                         meeting_message_type,
                         sensitivity, has_sensitivity_label, sensitivity_label_name,
-                        is_rights_protected,
+                        is_rights_protected, meeting_reminder_on,
                         CASE WHEN conversation_id <> '' THEN conversation_id
                              ELSE 'msg:' || id END AS conv_key
                  FROM messages
@@ -1931,7 +1946,7 @@ impl Store {
                     k.is_reminder_on, k.reminder_at, k.reminder_signal_at, k.flag_due_at,
                     k.meeting_message_type,
                     k.sensitivity, k.has_sensitivity_label, k.sensitivity_label_name,
-                    k.is_rights_protected
+                    k.is_rights_protected, k.meeting_reminder_on
              FROM keyed k
              JOIN ranked r ON k.conv_key = r.conv_key
              ORDER BY r.latest DESC, k.received_at ASC",
@@ -1972,9 +1987,13 @@ impl Store {
     /// `SyncCommand::DismissMessageReminder`, #2054), under exactly `id`
     /// (the engine resolves a moved id first). See `set_read` for why this
     /// doesn't return a `Result`.
+    ///
+    /// `meeting_reminder_on` goes off too (#2089): the dismiss PATCHes
+    /// `PidLidReminderSet` false, the bit it is read from, so this matches
+    /// what the next sync reports; a refused PATCH's reread restores it.
     pub fn dismiss_message_reminder(&self, id: &str) {
         let _ = self.conn.execute(
-            "UPDATE messages SET is_reminder_on = 0 WHERE id = ?1",
+            "UPDATE messages SET is_reminder_on = 0, meeting_reminder_on = 0 WHERE id = ?1",
             params![id],
         );
     }
@@ -6041,6 +6060,35 @@ fn migrate_message_protection(conn: &Connection) -> Result<bool, StoreError> {
     Ok(true)
 }
 
+/// Brings a store from before #2089 up to date: adds
+/// `messages.meeting_reminder_on` (old rows read false). Unlike the
+/// migrations before it, the delta and backfill state is **not** reset:
+/// the `$expand` did not change (`PidLidReminderSet` came in #2054 and the
+/// class in #2081), so every stored link already brings what new and
+/// changed mail needs, and a store older than #2088 has just been reset by
+/// `migrate_message_protection`. Rows stored before read false until a
+/// sync re-reports them; a third whole-mailbox re-enumeration for a bell on
+/// old mail is not worth it. One IMMEDIATE transaction that probes for the
+/// column first, so a second connection opening the same file at once
+/// waits and then finds it; a store that has it (every fresh one) is left
+/// alone. Returns whether it migrated.
+fn migrate_meeting_reminder(conn: &Connection) -> Result<bool, StoreError> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let has: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'meeting_reminder_on'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has > 0 {
+        return Ok(false);
+    }
+    tx.execute_batch(
+        "ALTER TABLE messages ADD COLUMN meeting_reminder_on INTEGER NOT NULL DEFAULT 0;",
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
 /// Mints a fresh local draft id: `local:` followed by 16 bytes of
 /// OS randomness as lowercase hex (reusing `pkce::random_bytes`, the same
 /// OS-entropy source the PKCE verifier uses, rather than pulling in a
@@ -6392,11 +6440,12 @@ const MESSAGE_ROW_COLUMNS: &str = "id, folder_id, conversation_id, subject, from
     bcc_recipients, is_meeting_request, categories,
     is_reminder_on, reminder_at, reminder_signal_at, flag_due_at,
     meeting_message_type,
-    sensitivity, has_sensitivity_label, sensitivity_label_name, is_rights_protected";
+    sensitivity, has_sensitivity_label, sensitivity_label_name, is_rights_protected,
+    meeting_reminder_on";
 
 /// How many columns `MESSAGE_ROW_COLUMNS` names: the index of the first
 /// column a query selects after them (`Store::draft`'s body).
-const BODY_AFTER_ROW_COLUMNS: usize = 28;
+const BODY_AFTER_ROW_COLUMNS: usize = 29;
 
 /// `Store::due_message_reminders`'s statement (#2054): flagged rows whose
 /// reminder is on and whose next signal (`reminder_signal_at`, else
@@ -6467,6 +6516,7 @@ fn map_message_row(row: &Row) -> rusqlite::Result<MessageRow> {
             label_name: row.get(26)?,
             is_rights_protected: row.get(27)?,
         },
+        meeting_reminder_on: row.get(28)?,
     })
 }
 
@@ -6647,6 +6697,7 @@ mod tests {
             is_meeting_request: false,
             meeting_message_type: None,
             protection: Default::default(),
+            meeting_reminder_on: false,
             categories: Vec::new(),
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -7207,6 +7258,7 @@ mod tests {
             is_meeting_request: false,
             meeting_message_type: None,
             protection: Default::default(),
+            meeting_reminder_on: false,
             categories: vec![],
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -7297,6 +7349,7 @@ mod tests {
             label_name: "General".into(),
             is_rights_protected: true,
         };
+        m.meeting_reminder_on = true;
         m.to = vec![Recipient {
             name: "B".into(),
             address: "b@x".into(),
@@ -7338,6 +7391,7 @@ mod tests {
             ("has_sensitivity_label", V::Integer(1)),
             ("sensitivity_label_name", t("General")),
             ("is_rights_protected", V::Integer(1)),
+            ("meeting_reminder_on", V::Integer(1)),
         ];
         expect(&s, "13", &first);
 
@@ -7367,6 +7421,7 @@ mod tests {
             is_meeting_request: false,
             meeting_message_type: None,
             protection: Default::default(),
+            meeting_reminder_on: false,
             categories: vec![],
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -7408,6 +7463,7 @@ mod tests {
                 ("has_sensitivity_label", V::Integer(0)),
                 ("sensitivity_label_name", t("")),
                 ("is_rights_protected", V::Integer(0)),
+                ("meeting_reminder_on", V::Integer(0)),
             ],
         );
     }
@@ -13102,6 +13158,7 @@ mod search_tests {
             is_meeting_request: false,
             meeting_message_type: None,
             protection: Default::default(),
+            meeting_reminder_on: false,
             categories: Vec::new(),
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -13971,6 +14028,7 @@ mod local_id_tests {
             is_meeting_request: false,
             meeting_message_type: None,
             protection: Default::default(),
+            meeting_reminder_on: false,
             categories: Vec::new(),
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -14079,6 +14137,7 @@ mod body_format_tests {
             is_meeting_request: false,
             meeting_message_type: None,
             protection: Default::default(),
+            meeting_reminder_on: false,
             categories: Vec::new(),
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -14785,6 +14844,7 @@ mod kept_body_tests {
             is_meeting_request: false,
             meeting_message_type: None,
             protection: Default::default(),
+            meeting_reminder_on: false,
             categories: Vec::new(),
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -15007,6 +15067,7 @@ mod folder_retain_tests {
             is_meeting_request: false,
             meeting_message_type: None,
             protection: Default::default(),
+            meeting_reminder_on: false,
             categories: Vec::new(),
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -15433,6 +15494,7 @@ mod backfill_tests {
             is_meeting_request: false,
             meeting_message_type: None,
             protection: Default::default(),
+            meeting_reminder_on: false,
             categories: vec![],
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -15606,6 +15668,7 @@ mod moved_id_tests {
             is_meeting_request: false,
             meeting_message_type: None,
             protection: Default::default(),
+            meeting_reminder_on: false,
             categories: Vec::new(),
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -15974,6 +16037,7 @@ mod message_reminder_tests {
             is_meeting_request: false,
             meeting_message_type: None,
             protection: Default::default(),
+            meeting_reminder_on: false,
             categories: vec![],
             is_reminder_on: true,
             reminder_at: at.into(),
@@ -16649,6 +16713,7 @@ mod meeting_message_type_tests {
             is_meeting_request: t == Some(T::Request),
             meeting_message_type: t,
             protection: Default::default(),
+            meeting_reminder_on: false,
             categories: vec![],
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -16933,11 +16998,12 @@ mod meeting_message_type_tests {
                 .unwrap();
             s.set_backfill_progress("G", "https://graph/G?$skiptoken=3", 4, SCOPE_ALL)
                 .unwrap();
-            // Back to a store from before #2054 (and so before #2081 and
-            // #2088).
+            // Back to a store from before #2054 (and so before #2081,
+            // #2088 and #2089).
             s.conn
                 .execute_batch(
                     "DROP INDEX idx_messages_reminder;
+                     ALTER TABLE messages DROP COLUMN meeting_reminder_on;
                      ALTER TABLE messages DROP COLUMN is_reminder_on;
                      ALTER TABLE messages DROP COLUMN reminder_at;
                      ALTER TABLE messages DROP COLUMN reminder_signal_at;
@@ -16954,10 +17020,12 @@ mod meeting_message_type_tests {
         }
         let s = Store::open(&path).unwrap();
         // Every migration's columns are there; the old row reads empty
-        // reminder fields, no type and no protection, the rest of it kept.
+        // reminder fields, no type, no protection and no meeting reminder,
+        // the rest of it kept.
         let row = s.message_row("M1").unwrap().unwrap();
         assert_eq!(row.meeting_message_type, None);
         assert_eq!(row.protection, MessageProtection::default());
+        assert!(!row.meeting_reminder_on);
         assert!(!row.is_reminder_on);
         assert_eq!(
             (
@@ -16998,6 +17066,7 @@ mod meeting_message_type_tests {
         assert!(!migrate_message_reminders(&s.conn).unwrap());
         assert!(!migrate_meeting_message_type(&s.conn).unwrap());
         assert!(!migrate_message_protection(&s.conn).unwrap());
+        assert!(!migrate_meeting_reminder(&s.conn).unwrap());
         s.set_head_link("F", "https://graph/F?$deltatoken=new", false)
             .unwrap();
         drop(s);
@@ -17068,6 +17137,7 @@ mod message_protection_tests {
             is_meeting_request: false,
             meeting_message_type: None,
             protection: p,
+            meeting_reminder_on: false,
             categories: vec![],
             is_reminder_on: false,
             reminder_at: String::new(),
@@ -17338,5 +17408,305 @@ mod message_protection_tests {
         .unwrap();
         assert!(migrate_message_protection(&conn).unwrap());
         assert!(!migrate_message_protection(&conn).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod meeting_reminder_tests {
+    //! A meeting message's own reminder on its row (#2089): the column
+    //! through every row read, the merge rule (no flag term), that it never
+    //! fires, dismiss, and the migration without a delta reset.
+    use super::*;
+
+    fn folder(s: &Store, id: &str) {
+        s.upsert_folder(&MailFolder {
+            id: id.into(),
+            display_name: id.into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: None,
+        })
+        .unwrap();
+    }
+
+    fn msg(id: &str, on: bool) -> Message {
+        Message {
+            id: id.into(),
+            conversation_id: format!("C{id}"),
+            subject: format!("standup {id}"),
+            from: Recipient {
+                name: "A".into(),
+                address: "a@x".into(),
+            },
+            to: vec![],
+            cc: vec![],
+            received: "2026-11-01T00:00:00Z".into(),
+            sent: String::new(),
+            is_read: false,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: "p".into(),
+            is_draft: false,
+            is_meeting_request: true,
+            meeting_message_type: Some(MeetingMessageType::Request),
+            protection: Default::default(),
+            meeting_reminder_on: on,
+            categories: vec![],
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
+        }
+    }
+
+    fn on(s: &Store, id: &str) -> bool {
+        s.message_row(id).unwrap().unwrap().meeting_reminder_on
+    }
+
+    #[test]
+    fn meeting_reminder_round_trips_on_every_row_read() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        let want = vec![("M0".to_string(), true), ("M1".to_string(), false)];
+        for (id, v) in &want {
+            s.upsert_message("F", &msg(id, *v)).unwrap();
+        }
+        let sorted = |rows: Vec<MessageRow>| {
+            let mut got: Vec<_> = rows
+                .into_iter()
+                .map(|r| (r.id, r.meeting_reminder_on))
+                .collect();
+            got.sort_by(|a, b| a.0.cmp(&b.0));
+            got
+        };
+        // `message_row`.
+        for (id, v) in &want {
+            assert_eq!(on(&s, id), *v, "{id}");
+        }
+        // `message_rows`.
+        assert_eq!(sorted(s.message_rows(&["M0", "M1"]).unwrap()), want);
+        // The folder rows.
+        assert_eq!(sorted(s.messages_in_folder("F", 50, 0).unwrap()), want);
+        assert_eq!(sorted(s.conversations_in_folder("F", 50, 0).unwrap()), want);
+        // `search` (the local full-text index).
+        assert_eq!(sorted(s.search("standup", 50).unwrap()), want);
+        // `due_message_reminders`: a flagged meeting request whose flag
+        // reminder is due carries its meeting reminder too.
+        let mut r = msg("R1", true);
+        r.is_flagged = true;
+        r.is_reminder_on = true;
+        r.reminder_at = "2026-11-08T10:00:00Z".into();
+        s.upsert_message("F", &r).unwrap();
+        let due = s.due_message_reminders("2026-11-08T12:00:00Z").unwrap();
+        assert_eq!(due.len(), 1);
+        assert!(due[0].meeting_reminder_on);
+        // `draft`, whose body columns follow the row's.
+        let mut d = msg("D1", true);
+        d.is_draft = true;
+        s.upsert_message("F", &d).unwrap();
+        s.put_body(
+            "D1",
+            &Body {
+                content_type: "html".into(),
+                content: "<p>hi</p>".into(),
+            },
+        )
+        .unwrap();
+        let (row, body) = s.draft("D1").unwrap().unwrap();
+        assert!(row.meeting_reminder_on);
+        assert_eq!(row.subject, "standup D1");
+        assert_eq!(body.content_type, "html");
+        assert_eq!(body.content, "<p>hi</p>");
+    }
+
+    #[test]
+    fn merge_writes_the_meeting_reminder_only_when_carried() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.upsert_message("F", &msg("M1", true)).unwrap();
+        // `{id, isRead}`: partial, carries no class.
+        let read = Message {
+            is_read: true,
+            ..msg("M1", false)
+        };
+        let fields = MessageFields {
+            is_read: true,
+            ..MessageFields::default()
+        };
+        s.merge_message("F", &read, &fields).unwrap();
+        assert!(on(&s, "M1"));
+        assert!(s.message_row("M1").unwrap().unwrap().is_read);
+        // A complete item read without the expand (`reminder_unasked`).
+        let unasked = MessageFields {
+            reminder: false,
+            reminder_unasked: true,
+            meeting_type: false,
+            protection: false,
+            meeting_reminder: false,
+            ..MessageFields::all()
+        };
+        s.merge_message("F", &msg("M1", false), &unasked).unwrap();
+        assert!(on(&s, "M1"));
+        // A complete item whose expand came without the class.
+        let bare = MessageFields {
+            meeting_reminder: false,
+            ..MessageFields::all()
+        };
+        s.merge_message("F", &msg("M1", false), &bare).unwrap();
+        assert!(on(&s, "M1"));
+        // A carried item writes it: off, then on again.
+        let carried = MessageFields::all();
+        s.merge_message("F", &msg("M1", false), &carried).unwrap();
+        assert!(!on(&s, "M1"));
+        s.merge_message("F", &msg("M1", true), &carried).unwrap();
+        assert!(on(&s, "M1"));
+        // A missing row is inserted with what the item carried, and the
+        // fresh-delta merge writes it too.
+        s.merge_message("F", &msg("M2", true), &carried).unwrap();
+        assert!(on(&s, "M2"));
+        assert!(
+            s.merge_message_unless_edited("F", &msg("M2", false), &carried)
+                .unwrap()
+        );
+        assert!(!on(&s, "M2"));
+    }
+
+    #[test]
+    fn the_meeting_reminder_has_no_flag_term_and_never_fires() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        // Unflagged, its own reminder set: stored on, and the flag
+        // reminder stays off whatever `is_reminder_on` the item had.
+        let mut m = msg("M1", true);
+        m.is_reminder_on = true;
+        m.reminder_at = "2026-11-08T10:00:00Z".into();
+        s.upsert_message("F", &m).unwrap();
+        let row = s.message_row("M1").unwrap().unwrap();
+        assert!(row.meeting_reminder_on);
+        assert!(!row.is_reminder_on);
+        assert!(
+            s.due_message_reminders("2100-01-01T00:00:00Z")
+                .unwrap()
+                .is_empty()
+        );
+        // Clearing the flag leaves it alone (`set_flag`), as a snooze does.
+        s.set_flag("M1", true);
+        s.set_flag("M1", false);
+        s.snooze_message_reminder("M1", "2026-11-09T10:00:00Z");
+        assert!(on(&s, "M1"));
+        // A flagged one with a due flag reminder is due exactly as before.
+        let mut f = msg("M2", false);
+        f.is_flagged = true;
+        f.is_reminder_on = true;
+        f.reminder_at = "2026-11-08T10:00:00Z".into();
+        s.upsert_message("F", &f).unwrap();
+        let due: Vec<_> = s
+            .due_message_reminders("2100-01-01T00:00:00Z")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(due, ["M2"]);
+    }
+
+    #[test]
+    fn dismiss_turns_the_meeting_reminder_off() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.upsert_message("F", &msg("M1", true)).unwrap();
+        s.upsert_message("F", &msg("M2", true)).unwrap();
+        s.dismiss_message_reminder("M1");
+        assert!(!on(&s, "M1"));
+        assert!(on(&s, "M2"));
+    }
+
+    #[test]
+    fn messages_without_2089_column_migrate_without_a_delta_reset() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-meeting-reminder-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        {
+            let s = Store::open(&path).unwrap();
+            folder(&s, "F");
+            folder(&s, "G");
+            s.upsert_message("F", &msg("M1", true)).unwrap();
+            s.complete_backfill("F", "https://graph/F?$deltatoken=1", SCOPE_ALL, 7, None)
+                .unwrap();
+            s.set_head_link("G", "https://graph/G?$deltatoken=2", false)
+                .unwrap();
+            s.set_backfill_progress("G", "https://graph/G?$skiptoken=3", 4, SCOPE_ALL)
+                .unwrap();
+            s.set_reminder_expand_refused("G", true).unwrap();
+            // Back to a store from before #2089 (after #2088).
+            s.conn
+                .execute_batch("ALTER TABLE messages DROP COLUMN meeting_reminder_on;")
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        // The column is there and the old row reads false, the rest of it
+        // kept.
+        let row = s.message_row("M1").unwrap().unwrap();
+        assert!(!row.meeting_reminder_on);
+        assert_eq!(row.meeting_message_type, Some(MeetingMessageType::Request));
+        assert_eq!(row.subject, "standup M1");
+        // No folder's delta or backfill state is touched: the links
+        // already carry the expand that brings the bit.
+        assert_eq!(
+            s.get_delta_link("F").unwrap().as_deref(),
+            Some("https://graph/F?$deltatoken=1")
+        );
+        assert_eq!(
+            s.get_delta_link("G").unwrap().as_deref(),
+            Some("https://graph/G?$deltatoken=2")
+        );
+        let (link, synced): (Option<String>, i64) = s
+            .conn
+            .query_row(
+                "SELECT backfill_link, backfill_synced FROM folders WHERE id = 'G'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (link.as_deref(), synced),
+            (Some("https://graph/G?$skiptoken=3"), 4)
+        );
+        assert!(s.reminder_expand_refused("G").unwrap());
+        assert!(!s.reconverge_pending().unwrap());
+        // It is written from now on, and a second open is a no-op.
+        s.upsert_message("F", &msg("M1", true)).unwrap();
+        assert!(!migrate_meeting_reminder(&s.conn).unwrap());
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert!(on(&s, "M1"));
+        assert_eq!(
+            s.get_delta_link("F").unwrap().as_deref(),
+            Some("https://graph/F?$deltatoken=1")
+        );
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_store_has_the_column_and_is_not_migrated() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(schema::SCHEMA_SQL).unwrap();
+        assert!(!migrate_meeting_reminder(&conn).unwrap());
+    }
+
+    #[test]
+    fn a_store_without_the_column_migrates_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(schema::SCHEMA_SQL).unwrap();
+        conn.execute_batch("ALTER TABLE messages DROP COLUMN meeting_reminder_on;")
+            .unwrap();
+        assert!(migrate_meeting_reminder(&conn).unwrap());
+        assert!(!migrate_meeting_reminder(&conn).unwrap());
     }
 }
