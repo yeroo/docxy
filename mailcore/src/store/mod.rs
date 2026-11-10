@@ -460,6 +460,17 @@ pub enum OutboxOp {
         folder: String,
         before: String,
     },
+    /// Delete a mail folder Graph has, with everything in it (#2107,
+    /// `Store::delete_folder`): `DELETE /me/mailFolders/{id}`, after the
+    /// engine walked Graph's subtree of `id` and found only what the batch
+    /// allows (`Store::delete_allow_check`). `batch` names the command's
+    /// allow-list (`folder_delete_allow`), shared by every root it queued.
+    /// Run by the engine, not `apply_op`; sent only once no older op is
+    /// queued. A 404 is done.
+    DeleteFolder {
+        id: String,
+        batch: String,
+    },
 }
 
 impl OutboxOp {
@@ -493,7 +504,8 @@ impl OutboxOp {
             | OutboxOp::CreateFolder { .. }
             | OutboxOp::RenameFolder { .. }
             | OutboxOp::MoveFolder { .. }
-            | OutboxOp::MarkFolderRead { .. } => None,
+            | OutboxOp::MarkFolderRead { .. }
+            | OutboxOp::DeleteFolder { .. } => None,
         }
     }
 
@@ -527,6 +539,7 @@ impl OutboxOp {
             OutboxOp::RenameFolder { .. } => "renameFolder",
             OutboxOp::MoveFolder { .. } => "moveFolder",
             OutboxOp::MarkFolderRead { .. } => "markFolderRead",
+            OutboxOp::DeleteFolder { .. } => "deleteFolder",
         }
     }
 
@@ -672,6 +685,11 @@ impl OutboxOp {
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("folder".to_string(), Value::Str(folder.clone())),
                 ("before".to_string(), Value::Str(before.clone())),
+            ]),
+            OutboxOp::DeleteFolder { id, batch } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                ("batch".to_string(), Value::Str(batch.clone())),
             ]),
             OutboxOp::CancelEvent { id, comment } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
@@ -859,6 +877,10 @@ impl OutboxOp {
             "markFolderRead" => Some(OutboxOp::MarkFolderRead {
                 folder: v.get("folder")?.as_str()?.to_string(),
                 before: v.get("before")?.as_str()?.to_string(),
+            }),
+            "deleteFolder" => Some(OutboxOp::DeleteFolder {
+                id: id()?,
+                batch: v.get("batch")?.as_str()?.to_string(),
             }),
             _ => None,
         }
@@ -1589,6 +1611,9 @@ impl Store {
         migrate_meeting_reminder(&conn)?;
         migrate_reply_links(&conn)?;
         migrate_fts_update_trigger(&conn)?;
+        // After `migrate_reply_links`: they read `internet_message_id`.
+        conn.execute_batch(schema::FORGOTTEN_TRIGGERS_SQL)?;
+        prune_forgotten_on(&conn, FORGOTTEN_CAP)?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_reminder
                  ON messages(reminder_signal_at) WHERE is_reminder_on = 1",
@@ -5266,6 +5291,10 @@ pub(crate) enum FolderRefusal {
     /// A move into the folder itself or a folder inside it: the stored
     /// `parent_id` would hold a cycle.
     IntoItself,
+    /// A delete of folders holding mail Graph does not have (#2107): a
+    /// `local:` draft, an unpushed edit, or one a queued save or send names.
+    /// Deleting them would lose it, so the command is refused instead.
+    UnsentMail(usize),
 }
 
 impl std::fmt::Display for FolderRefusal {
@@ -5278,6 +5307,7 @@ impl std::fmt::Display for FolderRefusal {
             FolderRefusal::IntoItself => {
                 f.write_str("a folder cannot move into itself or a folder inside it")
             }
+            FolderRefusal::UnsentMail(n) => write!(f, "it holds {n} unsent message(s)"),
         }
     }
 }
@@ -5319,7 +5349,28 @@ pub(crate) struct QueuedFolderWrites {
     /// `unread_count`, and a delta item received at or before it is stored
     /// read.
     pub marked_read: HashMap<String, String>,
+    /// Each folder a queued `DeleteFolder`'s batch removed (#2107): a
+    /// listing does not bring it, or what Graph has under it, back.
+    pub deleted: HashSet<String>,
 }
+
+/// What `Store::delete_folder` removed besides the folder (#2107).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct FolderDelete {
+    /// Graph mail moved locally into a removed `local:` folder went with it:
+    /// only a mail reconverge brings it back where Graph has it.
+    pub had_mail: bool,
+    /// The `local:` folders created under a removed `local:` one and moved
+    /// out of the subtree since: their creates could never reach Graph, so
+    /// they went too. The engine reports each.
+    pub also_discarded: Vec<String>,
+    /// Every folder id removed: the subtree, then `also_discarded`.
+    pub removed: Vec<String>,
+}
+
+/// The newest tombstones `forgotten_ids` keeps (#2107), pruned at each
+/// `Store::delete_folder` and on open.
+pub(crate) const FORGOTTEN_CAP: i64 = 100_000;
 
 /// Folder writes (#1910). Each command's write is one IMMEDIATE transaction
 /// that writes the row(s) and queues the op, so no listing sees the change
@@ -5614,7 +5665,11 @@ impl Store {
 
     /// Puts a refused move's previous parent back (#1910), only while the
     /// stored parent is still the one the op wrote (`attempted`), each id
-    /// resolved through `folder_aliases`. Whether it wrote.
+    /// resolved through `folder_aliases`. A previous parent the store
+    /// deleted (#2107: a `DeleteFolder` batch removed it, or it is
+    /// tombstoned) is not written: the folder stays where the user last saw
+    /// it, not under a missing row, until a listing places it. Whether it
+    /// wrote.
     pub(crate) fn revert_folder_parent(
         &self,
         id: &str,
@@ -5627,6 +5682,18 @@ impl Store {
         let attempted = attempted
             .map(|p| current_folder_id_on(&tx, p))
             .transpose()?;
+        if let Some(p) = &prev
+            && !folder_exists_on(&tx, p)?
+            && (forgotten_on(&tx, "folder", p)?
+                || exists_on(
+                    &tx,
+                    "SELECT EXISTS(SELECT 1 FROM folder_delete_allow
+                                   WHERE kind = 'folder' AND id = ?1)",
+                    p,
+                )?)
+        {
+            return Ok(false);
+        }
         let n = tx.execute(
             "UPDATE folders SET parent_id = ?2 WHERE id = ?1 AND parent_id IS ?3",
             params![id, prev, attempted],
@@ -5714,8 +5781,466 @@ impl Store {
             };
             set.insert(current_folder_id_on(&self.conn, &id)?);
         }
+        q.deleted = deleting_folders_on(&self.conn)?;
         Ok(q)
     }
+
+    /// Whether `id` (resolved through `folder_aliases`) is a folder a queued
+    /// `DeleteFolder`'s batch removed (#2107): nothing is read from Graph
+    /// for it meanwhile.
+    pub(crate) fn folder_being_deleted(&self, id: &str) -> Result<bool, StoreError> {
+        let id = current_folder_id_on(&self.conn, id)?;
+        Ok(deleting_folders_on(&self.conn)?.contains(&id))
+    }
+
+    /// Deletes the folder `id` and its subtree from the store, and queues a
+    /// `DeleteFolder` per Graph root, in one IMMEDIATE transaction (#2107).
+    ///
+    /// Refused, with nothing written: an unknown folder or the drafts
+    /// sentinel (as `id` or inside it), and a subtree holding mail Graph
+    /// does not have (`unsent_mail_in_on`), which deleting would lose.
+    ///
+    /// The `local:` folders in it, and those created under them and moved
+    /// out since (`refused_creates_on`, [`FolderDelete::also_discarded`]),
+    /// never reached Graph: their creates go, every queued folder move into
+    /// one of them goes wherever the moved folder is now (its next queued
+    /// move inherits the dropped one's `prev_parent`; with none, a folder
+    /// outside the subtree is put back under it), and Graph mail moved into
+    /// them is dropped as a refused create drops it
+    /// (`drop_local_folder_mail_on`, [`FolderDelete::had_mail`]). Queued
+    /// `MarkFolderRead`s of a removed folder go too.
+    ///
+    /// The Graph roots are `id` when Graph has it, and every Graph folder of
+    /// the subtree whose stored parent is a removed `local:` folder (moved
+    /// there locally: Graph still has it under its old parent). Before any
+    /// row goes, the batch's allow-list (`folder_delete_allow`) records
+    /// every Graph folder and message the subtree showed: what the user saw
+    /// and chose to delete. Their tombstones are cleared again; every other
+    /// removed message keeps its own.
+    pub(crate) fn delete_folder(
+        &self,
+        id: &str,
+    ) -> Result<(FolderWriteResult, FolderDelete), StoreError> {
+        let mut out = FolderDelete::default();
+        let tx = self.write_tx()?;
+        let id = current_folder_id_on(&tx, id)?;
+        if let Some(r) = check_folder_on(&tx, &id)? {
+            return Ok((FolderWriteResult::Refused(r), out));
+        }
+        let subtree = subtree_ids_on(&tx, &id)?;
+        if subtree.iter().any(|f| f == LOCAL_DRAFTS_SENTINEL_FOLDER_ID) {
+            return Ok((
+                FolderWriteResult::Refused(FolderRefusal::DraftsSentinel),
+                out,
+            ));
+        }
+        let mut local: Vec<String> = Vec::new();
+        for l in subtree.iter().filter(|f| f.starts_with("local:")) {
+            for c in refused_creates_on(&tx, l)? {
+                if !local.contains(&c) {
+                    local.push(c);
+                }
+            }
+        }
+        for other in &local {
+            if !subtree.contains(other) && folder_exists_on(&tx, other)? {
+                out.also_discarded.push(other.clone());
+            }
+        }
+        let mut removed = subtree.clone();
+        removed.extend(out.also_discarded.iter().cloned());
+        let unsent = unsent_mail_in_on(&tx, &removed)?;
+        if !unsent.is_empty() {
+            return Ok((
+                FolderWriteResult::Refused(FolderRefusal::UnsentMail(unsent.len())),
+                FolderDelete::default(),
+            ));
+        }
+        out.had_mail = drop_local_folder_mail_on(&tx, &local)?;
+        drop_folder_ops_on(&tx, &local, &removed)?;
+        // The Graph roots: `id`, and every Graph folder moved locally under
+        // a removed `local:` one.
+        let mut roots = Vec::new();
+        for f in subtree.iter().filter(|f| !f.starts_with("local:")) {
+            let parent: Option<String> = tx.query_row(
+                "SELECT parent_id FROM folders WHERE id = ?1",
+                params![f],
+                |r| r.get(0),
+            )?;
+            if *f == id || parent.is_some_and(|p| local.contains(&p)) {
+                roots.push(f.clone());
+            }
+        }
+        let batch = local_draft_id().replacen("local:", "delete:", 1);
+        if !roots.is_empty() {
+            let subtree_json = ids_json(&subtree);
+            tx.execute(
+                "INSERT OR IGNORE INTO folder_delete_allow (batch, kind, id)
+                 SELECT ?1, 'folder', value FROM json_each(?2)
+                 WHERE substr(value, 1, 6) <> 'local:'",
+                params![batch, subtree_json],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO folder_delete_allow (batch, kind, id, imid)
+                 SELECT ?1, 'message', id, internet_message_id FROM messages
+                 WHERE folder_id IN (SELECT value FROM json_each(?2))",
+                params![batch, subtree_json],
+            )?;
+            for root in &roots {
+                enqueue_op_on(
+                    &tx,
+                    &OutboxOp::DeleteFolder {
+                        id: root.clone(),
+                        batch: batch.clone(),
+                    },
+                )?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM folders WHERE id IN (SELECT value FROM json_each(?1))",
+            params![ids_json(&removed)],
+        )?;
+        // What the user saw and deleted is allowed by the batch, not held.
+        tx.execute(
+            "DELETE FROM forgotten_ids WHERE (kind, id) IN
+                 (SELECT kind, id FROM folder_delete_allow WHERE batch = ?1)",
+            params![batch],
+        )?;
+        prune_forgotten_on(&tx, FORGOTTEN_CAP)?;
+        tx.commit()?;
+        out.removed = removed;
+        Ok((FolderWriteResult::Written(id), out))
+    }
+
+    /// Checks what a walk of Graph found under a folder a `DeleteFolder` of
+    /// `batch` is about to delete (#2107): `folders` (its descendants) and
+    /// `messages` (`(id, internetMessageId)`, anywhere in the subtree).
+    /// Returns the items the DELETE must not take; empty when it may go.
+    ///
+    /// An item is allowed when the batch's allow-list has it (resolved
+    /// through `moved_ids` / `folder_aliases`) and no row holds it now, or
+    /// when the store never held it: no row, no alias, no tombstone
+    /// (`forgotten_ids`) and no queued op names it (mail never synced, or
+    /// come since). Graph mints a new message id on a move, so a move whose
+    /// answer was lost leaves an id the store never saw: messages are also
+    /// counted per non-empty internet message id `i`, and the walked ones
+    /// with `i` are refused when they outnumber the batch's allowed ones
+    /// with `i` and a row or a tombstone holds `i` (a copy filed by a rule
+    /// beside its original passes).
+    pub(crate) fn delete_allow_check(
+        &self,
+        batch: &str,
+        folders: &[String],
+        messages: &[(String, String)],
+    ) -> Result<Vec<String>, StoreError> {
+        let conn = &self.conn;
+        let mut allowed_folders: HashSet<String> = HashSet::new();
+        let mut allowed_messages: HashSet<String> = HashSet::new();
+        let mut allowed_imids: HashMap<String, usize> = HashMap::new();
+        {
+            let mut stmt =
+                conn.prepare("SELECT kind, id, imid FROM folder_delete_allow WHERE batch = ?1")?;
+            let rows = stmt
+                .query_map(params![batch], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (kind, id, imid) in rows {
+                if kind == "folder" {
+                    allowed_folders.insert(current_folder_id_on(conn, &id)?);
+                    allowed_folders.insert(id);
+                } else {
+                    allowed_messages.insert(current_id_on(conn, &id)?);
+                    allowed_messages.insert(id);
+                    if !imid.is_empty() {
+                        *allowed_imids.entry(imid).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let named = queued_op_ids_on(conn)?;
+        let mut refused = Vec::new();
+        for f in folders {
+            let stored = folder_exists_on(conn, f)?;
+            let ok = if allowed_folders.contains(f) {
+                !stored
+            } else {
+                !stored
+                    && current_folder_id_on(conn, f)? == *f
+                    && !exists_on(
+                        conn,
+                        "SELECT EXISTS(SELECT 1 FROM folder_aliases WHERE id = ?1)",
+                        f,
+                    )?
+                    && !forgotten_on(conn, "folder", f)?
+                    && !named.contains(f)
+            };
+            if !ok {
+                refused.push(f.clone());
+            }
+        }
+        let mut walked_imids: HashMap<&str, usize> = HashMap::new();
+        for (m, imid) in messages {
+            if !imid.is_empty() {
+                *walked_imids.entry(imid.as_str()).or_default() += 1;
+            }
+            let stored = message_exists_on(conn, m)?;
+            let ok = if allowed_messages.contains(m) {
+                !stored
+            } else {
+                !stored
+                    && current_id_on(conn, m)? == *m
+                    && !exists_on(
+                        conn,
+                        "SELECT EXISTS(SELECT 1 FROM moved_ids WHERE message_id = ?1)",
+                        m,
+                    )?
+                    && !forgotten_on(conn, "message", m)?
+                    && !named.contains(m)
+            };
+            if !ok {
+                refused.push(m.clone());
+            }
+        }
+        for (imid, n) in walked_imids {
+            if n <= allowed_imids.get(imid).copied().unwrap_or(0) {
+                continue;
+            }
+            let held: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE internet_message_id = ?1)
+                     OR EXISTS(SELECT 1 FROM forgotten_ids
+                               WHERE kind = 'message' AND imid = ?1)",
+                params![imid],
+                |r| r.get(0),
+            )?;
+            if held {
+                for (m, i) in messages {
+                    if i == imid && !refused.contains(m) {
+                        refused.push(m.clone());
+                    }
+                }
+            }
+        }
+        Ok(refused)
+    }
+
+    /// A `DeleteFolder` is done, or refused (#2107): its op goes, and its
+    /// batch's allow-list once no op of the batch is left. One transaction.
+    pub(crate) fn finish_folder_delete(&self, seq: i64, batch: &str) -> Result<(), StoreError> {
+        let tx = self.write_tx()?;
+        tx.execute("DELETE FROM outbox WHERE seq = ?1", params![seq])?;
+        let left = pending_ops_on(&tx)?
+            .into_iter()
+            .any(|r| matches!(&r.op, OutboxOp::DeleteFolder { batch: b, .. } if b == batch));
+        if !left {
+            tx.execute(
+                "DELETE FROM folder_delete_allow WHERE batch = ?1",
+                params![batch],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether an op older than `seq` is still queued (#2107: a
+    /// `DeleteFolder` waits until it is the oldest).
+    pub(crate) fn has_older_op(&self, seq: i64) -> Result<bool, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM outbox WHERE seq < ?1)",
+            params![seq],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Keeps the newest `cap` tombstones of `forgotten_ids` (#2107); the
+    /// store prunes to `FORGOTTEN_CAP` itself.
+    #[cfg(test)]
+    pub(crate) fn prune_forgotten(&self, cap: i64) -> Result<(), StoreError> {
+        prune_forgotten_on(&self.conn, cap)
+    }
+}
+
+/// The folders the batches of the queued `DeleteFolder`s removed (#2107),
+/// resolved through `folder_aliases`.
+fn deleting_folders_on(conn: &Connection) -> Result<HashSet<String>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT a.id FROM folder_delete_allow a
+         WHERE a.kind = 'folder'
+           AND EXISTS(SELECT 1 FROM outbox o
+                      WHERE o.op = 'deleteFolder'
+                        AND json_extract(o.payload, '$.batch') = a.batch)",
+    )?;
+    let ids = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut out = HashSet::new();
+    for id in ids {
+        out.insert(current_folder_id_on(conn, &id)?);
+        out.insert(id);
+    }
+    Ok(out)
+}
+
+/// Drops the queued folder ops a delete leaves pointless (#2107): the
+/// creates of the removed `local:` folders `local` and every other op
+/// naming one of them, the `MarkFolderRead`s of the `removed` folders, and
+/// every `MoveFolder` into a removed `local:` folder, wherever the moved
+/// folder is now. The next queued move of that folder inherits the dropped
+/// one's `prev_parent`, so a refusal of it reverts to a parent Graph has;
+/// with none, a folder outside `removed` still under the dropped move's
+/// parent is put back under its `prev_parent`.
+fn drop_folder_ops_on(
+    conn: &Connection,
+    local: &[String],
+    removed: &[String],
+) -> Result<(), StoreError> {
+    let mut ops = pending_ops_on(conn)?;
+    let mut i = 0;
+    while i < ops.len() {
+        let seq = ops[i].seq;
+        let op = ops[i].op.clone();
+        let drop = match &op {
+            OutboxOp::CreateFolder { id, .. } | OutboxOp::RenameFolder { id, .. } => {
+                local.contains(&current_folder_id_on(conn, id)?)
+            }
+            OutboxOp::MarkFolderRead { folder, .. } => {
+                let f = current_folder_id_on(conn, folder)?;
+                removed.contains(&f) || local.contains(&f)
+            }
+            OutboxOp::MoveFolder {
+                id,
+                dest,
+                parent,
+                prev_parent,
+            } => {
+                let moved = current_folder_id_on(conn, id)?;
+                let into = match dest {
+                    Some(d) => local.contains(&current_folder_id_on(conn, d)?),
+                    None => false,
+                };
+                if local.contains(&moved) {
+                    true
+                } else if into {
+                    let next = ops.iter().position(|r| {
+                        r.seq > seq
+                            && matches!(&r.op, OutboxOp::MoveFolder { id: other, .. }
+                                if current_folder_id_on(conn, other).ok().as_deref()
+                                    == Some(moved.as_str()))
+                    });
+                    match next {
+                        Some(j) => {
+                            if let OutboxOp::MoveFolder {
+                                prev_parent: inherited,
+                                ..
+                            } = &mut ops[j].op
+                            {
+                                *inherited = prev_parent.clone();
+                            }
+                            conn.execute(
+                                "UPDATE outbox SET payload = ?2 WHERE seq = ?1",
+                                params![ops[j].seq, ops[j].op.to_json().to_string()],
+                            )?;
+                        }
+                        None if !removed.contains(&moved) => {
+                            let parent = parent
+                                .as_ref()
+                                .map(|p| current_folder_id_on(conn, p))
+                                .transpose()?;
+                            conn.execute(
+                                "UPDATE folders SET parent_id = ?2 WHERE id = ?1 AND parent_id IS ?3",
+                                params![moved, prev_parent, parent],
+                            )?;
+                        }
+                        None => {}
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if drop {
+            conn.execute("DELETE FROM outbox WHERE seq = ?1", params![seq])?;
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Every id a queued op names (#2107): a message op's message (as queued
+/// and resolved), and a folder op's folder, parent and dest (as queued and
+/// resolved).
+fn queued_op_ids_on(conn: &Connection) -> Result<HashSet<String>, StoreError> {
+    let mut out = HashSet::new();
+    for row in pending_ops_on(conn)? {
+        let mut add_message = |id: &str| -> Result<(), StoreError> {
+            out.insert(current_id_on(conn, id)?);
+            out.insert(id.to_string());
+            Ok(())
+        };
+        if let Some(m) = row.op.message_id() {
+            add_message(m)?;
+        }
+        let folders: Vec<&String> = match &row.op {
+            OutboxOp::Move { dest, .. } => vec![dest],
+            OutboxOp::CreateFolder { id, parent, .. } => {
+                let mut v = vec![id];
+                v.extend(parent.iter());
+                v
+            }
+            OutboxOp::RenameFolder { id, .. } => vec![id],
+            OutboxOp::MoveFolder { id, dest, .. } => {
+                let mut v = vec![id];
+                v.extend(dest.iter());
+                v
+            }
+            OutboxOp::MarkFolderRead { folder, .. } => vec![folder],
+            OutboxOp::DeleteFolder { id, .. } => vec![id],
+            _ => vec![],
+        };
+        for f in folders {
+            out.insert(current_folder_id_on(conn, f)?);
+            out.insert(f.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Whether `forgotten_ids` holds `id` of `kind` (#2107).
+fn forgotten_on(conn: &Connection, kind: &str, id: &str) -> Result<bool, StoreError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM forgotten_ids WHERE kind = ?1 AND id = ?2)",
+        params![kind, id],
+        |r| r.get(0),
+    )?)
+}
+
+/// `sql` (an `EXISTS` with one parameter) for `id`.
+fn exists_on(conn: &Connection, sql: &str, id: &str) -> Result<bool, StoreError> {
+    Ok(conn.query_row(sql, params![id], |r| r.get(0))?)
+}
+
+fn message_exists_on(conn: &Connection, id: &str) -> Result<bool, StoreError> {
+    exists_on(
+        conn,
+        "SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1)",
+        id,
+    )
+}
+
+/// Keeps the newest `cap` rows of `forgotten_ids` by rowid (#2107).
+fn prune_forgotten_on(conn: &Connection, cap: i64) -> Result<(), StoreError> {
+    conn.execute(
+        "DELETE FROM forgotten_ids
+         WHERE rowid <= (SELECT MAX(rowid) FROM forgotten_ids) - ?1",
+        params![cap],
+    )?;
+    Ok(())
 }
 
 /// The messages filed in `folders` that Graph does not have (#1910): a
@@ -19922,6 +20447,7 @@ mod folder_write_tests {
                 renamed: ["A".to_string()].into(),
                 moved: ["B".to_string()].into(),
                 marked_read: HashMap::new(),
+                deleted: HashSet::new(),
             }
         );
     }
@@ -20351,6 +20877,648 @@ mod folder_write_tests {
             "not local:"
         );
         assert!(row(&s, "A").is_some());
+    }
+}
+
+/// #2107: `Store::delete_folder`, the batch's allow-list and the walk check
+/// (`delete_allow_check`), and the `forgotten_ids` tombstones.
+#[cfg(test)]
+mod folder_delete_tests {
+    use super::*;
+    use crate::graph::model::MailFolder;
+
+    fn listed(id: &str, parent: &str) -> MailFolder {
+        MailFolder {
+            id: id.into(),
+            display_name: id.into(),
+            parent_id: Some(parent.into()),
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: None,
+        }
+    }
+
+    /// Inbox and Archive under ROOT, A under Inbox, B under A.
+    fn mailbox() -> Store {
+        let s = Store::open_in_memory().unwrap();
+        for (id, parent) in [
+            ("INBOX", "ROOT"),
+            ("ARCH", "ROOT"),
+            ("A", "INBOX"),
+            ("B", "A"),
+        ] {
+            s.upsert_folder(&listed(id, parent)).unwrap();
+        }
+        s
+    }
+
+    /// A message `id` in `folder` whose internet message id is `imid`.
+    fn message(s: &Store, id: &str, folder: &str, imid: &str) {
+        s.conn
+            .execute(
+                "INSERT INTO messages (id, folder_id, internet_message_id) VALUES (?1, ?2, ?3)",
+                params![id, folder, imid],
+            )
+            .unwrap();
+    }
+
+    fn folder_ids(s: &Store) -> Vec<String> {
+        s.folders().unwrap().into_iter().map(|f| f.id).collect()
+    }
+
+    fn parent_of(s: &Store, id: &str) -> Option<String> {
+        s.folders()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == id)
+            .and_then(|f| f.parent_id)
+    }
+
+    fn ops(s: &Store) -> Vec<OutboxOp> {
+        s.pending_ops().unwrap().into_iter().map(|r| r.op).collect()
+    }
+
+    fn written(r: FolderWriteResult) -> String {
+        match r {
+            FolderWriteResult::Written(id) => id,
+            other => panic!("not written: {other:?}"),
+        }
+    }
+
+    /// Deletes `id`, which must be written; returns what it removed and the
+    /// batch of the op it queued (`None`: no op).
+    fn delete(s: &Store, id: &str) -> (FolderDelete, Option<String>) {
+        let (r, d) = s.delete_folder(id).unwrap();
+        written(r);
+        let batch = ops(s).into_iter().rev().find_map(|op| match op {
+            OutboxOp::DeleteFolder { batch, .. } => Some(batch),
+            _ => None,
+        });
+        (d, batch)
+    }
+
+    fn forgotten(s: &Store, kind: &str, id: &str) -> bool {
+        forgotten_on(&s.conn, kind, id).unwrap()
+    }
+
+    fn allow(s: &Store, batch: &str) -> Vec<(String, String)> {
+        let mut stmt = s
+            .conn
+            .prepare("SELECT kind, id FROM folder_delete_allow WHERE batch = ?1 ORDER BY kind, id")
+            .unwrap();
+        stmt.query_map(params![batch], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn check(s: &Store, batch: &str, folders: &[&str], messages: &[(&str, &str)]) -> Vec<String> {
+        let folders: Vec<String> = folders.iter().map(|f| f.to_string()).collect();
+        let messages: Vec<(String, String)> = messages
+            .iter()
+            .map(|(m, i)| (m.to_string(), i.to_string()))
+            .collect();
+        s.delete_allow_check(batch, &folders, &messages).unwrap()
+    }
+
+    fn seq_of(s: &Store, pred: impl Fn(&OutboxOp) -> bool) -> i64 {
+        s.pending_ops()
+            .unwrap()
+            .into_iter()
+            .find(|r| pred(&r.op))
+            .unwrap()
+            .seq
+    }
+
+    #[test]
+    fn delete_folder_op_round_trips_json() {
+        let op = OutboxOp::DeleteFolder {
+            id: "F".into(),
+            batch: "delete:1".into(),
+        };
+        let text = op.to_json().to_string();
+        assert_eq!(
+            OutboxOp::from_json(&json::parse(&text).unwrap()),
+            Some(op),
+            "{text}"
+        );
+    }
+
+    /// Case 17 (store): the subtree, its mail and its delta links go in one
+    /// transaction; one op is queued, and the batch allows what it showed.
+    #[test]
+    fn delete_folder_drops_the_subtree_and_records_its_batch() {
+        let s = mailbox();
+        message(&s, "M1", "A", "<m1@x>");
+        message(&s, "M2", "B", "");
+        message(&s, "M3", "INBOX", "");
+        s.conn
+            .execute("UPDATE folders SET delta_link = 'D'", [])
+            .unwrap();
+        let (d, batch) = delete(&s, "A");
+        let batch = batch.unwrap();
+        assert_eq!(d.removed, ["A", "B"]);
+        assert!(!d.had_mail && d.also_discarded.is_empty());
+        assert_eq!(folder_ids(&s), ["INBOX", "ARCH"].map(String::from).to_vec());
+        assert!(!message_exists_on(&s.conn, "M1").unwrap());
+        assert!(!message_exists_on(&s.conn, "M2").unwrap());
+        assert!(message_exists_on(&s.conn, "M3").unwrap());
+        assert_eq!(
+            ops(&s),
+            [OutboxOp::DeleteFolder {
+                id: "A".into(),
+                batch: batch.clone(),
+            }]
+        );
+        assert_eq!(
+            allow(&s, &batch),
+            [
+                ("folder".into(), "A".into()),
+                ("folder".into(), "B".into()),
+                ("message".into(), "M1".into()),
+                ("message".into(), "M2".into()),
+            ]
+        );
+        // What the batch allows holds no tombstone.
+        for (kind, id) in [("folder", "A"), ("folder", "B"), ("message", "M1")] {
+            assert!(!forgotten(&s, kind, id), "{kind} {id}");
+        }
+        let q = s.queued_folder_writes().unwrap();
+        assert_eq!(q.deleted, HashSet::from(["A".to_string(), "B".to_string()]));
+        assert!(s.folder_being_deleted("B").unwrap());
+        assert!(!s.folder_being_deleted("INBOX").unwrap());
+        // What Graph has there is what the user saw: allowed.
+        assert!(check(&s, &batch, &["B"], &[("M1", "<m1@x>"), ("M2", "")]).is_empty());
+        let seq = seq_of(&s, |op| matches!(op, OutboxOp::DeleteFolder { .. }));
+        s.finish_folder_delete(seq, &batch).unwrap();
+        assert!(ops(&s).is_empty());
+        assert!(allow(&s, &batch).is_empty());
+        assert!(s.queued_folder_writes().unwrap().deleted.is_empty());
+    }
+
+    /// Case 1: mail Graph does not have refuses the command, with nothing
+    /// written or queued: a `local:` draft, an unpushed edit, a message a
+    /// queued save or send names (a send re-filed into Sent Items under
+    /// the folder, a reconciled `local:` id).
+    #[test]
+    fn delete_folder_refuses_unsent_mail() {
+        type Seed = Box<dyn Fn(&Store)>;
+        let cases: Vec<(&str, Seed)> = vec![
+            (
+                "local draft",
+                Box::new(|s: &Store| message(s, "local:d1", "B", "")),
+            ),
+            (
+                "unpushed edit",
+                Box::new(|s: &Store| {
+                    message(s, "D2", "B", "");
+                    s.conn
+                        .execute("UPDATE messages SET local_edit = 1 WHERE id = 'D2'", [])
+                        .unwrap();
+                }),
+            ),
+            (
+                "queued send re-filed under the folder",
+                Box::new(|s: &Store| {
+                    message(s, "D3", "B", "");
+                    s.enqueue_op(&OutboxOp::SendDraft { id: "D3".into() })
+                        .unwrap();
+                }),
+            ),
+            (
+                "queued save by a reconciled local id",
+                Box::new(|s: &Store| {
+                    message(s, "local:d4", "A", "");
+                    s.enqueue_op(&OutboxOp::SaveDraft {
+                        id: "local:d4".into(),
+                    })
+                    .unwrap();
+                    s.reconcile_id("local:d4", "D4").unwrap();
+                }),
+            ),
+        ];
+        for (what, seed) in cases {
+            let s = mailbox();
+            seed(&s);
+            let before = ops(&s);
+            let (r, d) = s.delete_folder("A").unwrap();
+            assert_eq!(
+                r,
+                FolderWriteResult::Refused(FolderRefusal::UnsentMail(1)),
+                "{what}"
+            );
+            assert_eq!(d, FolderDelete::default(), "{what}");
+            assert_eq!(folder_ids(&s).len(), 4, "{what}");
+            assert_eq!(ops(&s), before, "{what}");
+        }
+    }
+
+    /// Case 2: the drafts sentinel is never deleted, as the folder or inside
+    /// it; an unknown folder is refused.
+    #[test]
+    fn delete_folder_refuses_the_drafts_sentinel_and_unknown_folders() {
+        let s = mailbox();
+        s.create_local_draft("s", "", "", "").unwrap();
+        assert!(folder_exists_on(&s.conn, LOCAL_DRAFTS_SENTINEL_FOLDER_ID).unwrap());
+        let (r, _) = s.delete_folder(LOCAL_DRAFTS_SENTINEL_FOLDER_ID).unwrap();
+        assert_eq!(r, FolderWriteResult::Refused(FolderRefusal::DraftsSentinel));
+        s.conn
+            .execute(
+                "UPDATE folders SET parent_id = 'B' WHERE id = ?1",
+                params![LOCAL_DRAFTS_SENTINEL_FOLDER_ID],
+            )
+            .unwrap();
+        let (r, _) = s.delete_folder("A").unwrap();
+        assert_eq!(r, FolderWriteResult::Refused(FolderRefusal::DraftsSentinel));
+        let (r, _) = s.delete_folder("NOPE").unwrap();
+        assert_eq!(
+            r,
+            FolderWriteResult::Refused(FolderRefusal::Unknown("NOPE".into()))
+        );
+        assert!(folder_exists_on(&s.conn, LOCAL_DRAFTS_SENTINEL_FOLDER_ID).unwrap());
+        assert!(
+            ops(&s)
+                .iter()
+                .all(|op| !matches!(op, OutboxOp::DeleteFolder { .. }))
+        );
+    }
+
+    /// Case 3 (store): a `local:` folder never reached Graph: its delete
+    /// queues nothing, its create goes, and Graph mail moved into it is
+    /// dropped with its move (a reconverge brings it back), tombstoned
+    /// meanwhile.
+    #[test]
+    fn deleting_a_local_folder_queues_nothing_and_drops_the_mail_moved_into_it() {
+        let s = mailbox();
+        let l = written(s.create_local_folder(Some("A"), "L").unwrap());
+        let under = written(s.create_local_folder(Some(&l), "L2").unwrap());
+        message(&s, "M", "INBOX", "<m@x>");
+        s.move_message("M", &under).unwrap();
+        s.enqueue_op(&OutboxOp::Move {
+            id: "M".into(),
+            dest: under.clone(),
+        })
+        .unwrap();
+        s.enqueue_op(&OutboxOp::MarkRead {
+            id: "M".into(),
+            read: true,
+        })
+        .unwrap();
+        let (d, batch) = delete(&s, &l);
+        assert!(batch.is_none());
+        assert!(d.had_mail);
+        assert_eq!(d.removed, [l.clone(), under.clone()]);
+        assert!(ops(&s).is_empty(), "{:?}", ops(&s));
+        assert!(!message_exists_on(&s.conn, "M").unwrap());
+        assert!(forgotten(&s, "message", "M"));
+        assert!(!forgotten(&s, "folder", &l), "local: ids are not recorded");
+        assert_eq!(folder_ids(&s).len(), 4);
+    }
+
+    /// Case 5 (store): a Graph folder moved under a `local:` one is its own
+    /// root: `DeleteFolder` for it, and its move is dropped.
+    #[test]
+    fn a_graph_folder_moved_under_a_deleted_local_folder_is_its_own_root() {
+        let s = mailbox();
+        let l = written(s.create_local_folder(Some("ARCH"), "L").unwrap());
+        written(s.move_folder("B", Some(&l)).unwrap());
+        message(&s, "MB", "B", "");
+        let (d, batch) = delete(&s, &l);
+        let batch = batch.unwrap();
+        assert_eq!(d.removed, [l.clone(), "B".to_string()]);
+        assert_eq!(
+            ops(&s),
+            [OutboxOp::DeleteFolder {
+                id: "B".into(),
+                batch: batch.clone(),
+            }]
+        );
+        assert_eq!(
+            allow(&s, &batch),
+            [
+                ("folder".into(), "B".into()),
+                ("message".into(), "MB".into())
+            ]
+        );
+    }
+
+    /// Case 8 (store): a move into a deleted `local:` folder goes wherever
+    /// the folder is now, with no refusal; its next move inherits the
+    /// dropped one's `prev_parent`. With no next move, a folder outside the
+    /// subtree is put back under it.
+    #[test]
+    fn a_move_into_a_deleted_local_folder_is_dropped_and_its_prev_parent_inherited() {
+        let s = mailbox();
+        let l = written(s.create_local_folder(Some("ARCH"), "L").unwrap());
+        written(s.move_folder("B", Some(&l)).unwrap());
+        written(s.move_folder("B", Some("INBOX")).unwrap());
+        let (d, batch) = delete(&s, &l);
+        assert!(batch.is_none());
+        assert_eq!(d.removed, std::slice::from_ref(&l));
+        assert_eq!(
+            ops(&s),
+            [OutboxOp::MoveFolder {
+                id: "B".into(),
+                dest: Some("INBOX".into()),
+                parent: Some("INBOX".into()),
+                prev_parent: Some("A".into()),
+            }]
+        );
+        assert_eq!(parent_of(&s, "B").as_deref(), Some("INBOX"));
+
+        // No later move: a folder only moved into a deleted `local:` one
+        // from outside (here created under a removed one and moved out)
+        // goes back where Graph has it.
+        let s = mailbox();
+        let l = written(s.create_local_folder(Some("ARCH"), "L").unwrap());
+        let l2 = written(s.create_local_folder(Some(&l), "L2").unwrap());
+        written(s.move_folder(&l2, Some("INBOX")).unwrap());
+        written(s.move_folder("B", Some(&l2)).unwrap());
+        let (d, _) = delete(&s, &l);
+        assert_eq!(d.also_discarded, std::slice::from_ref(&l2));
+        assert_eq!(d.removed, [l.clone(), l2.clone()]);
+        assert!(ops(&s).is_empty(), "{:?}", ops(&s));
+        assert_eq!(parent_of(&s, "B").as_deref(), Some("A"));
+    }
+
+    /// Case 24 (store): a queued `MarkFolderRead` of a deleted folder goes.
+    #[test]
+    fn delete_folder_drops_a_queued_mark_folder_read_of_the_subtree() {
+        let s = mailbox();
+        written(s.mark_folder_read("B", "2026-11-10T00:00:00Z").unwrap());
+        written(s.mark_folder_read("INBOX", "2026-11-10T00:00:00Z").unwrap());
+        delete(&s, "A");
+        assert!(
+            ops(&s)
+                .iter()
+                .all(|op| !matches!(op, OutboxOp::MarkFolderRead { folder, .. } if folder == "B"))
+        );
+        assert!(
+            ops(&s).iter().any(
+                |op| matches!(op, OutboxOp::MarkFolderRead { folder, .. } if folder == "INBOX")
+            )
+        );
+    }
+
+    /// Case 18: mail the store never held (older than the window, not
+    /// backfilled yet, come since) goes with the folder.
+    #[test]
+    fn the_walk_allows_what_the_store_never_held() {
+        let s = mailbox();
+        message(&s, "M1", "A", "<m1@x>");
+        let (_, batch) = delete(&s, "A");
+        let batch = batch.unwrap();
+        assert!(
+            check(
+                &s,
+                &batch,
+                &["B", "NEWCHILD"],
+                &[("M1", "<m1@x>"), ("OLD", "<old@x>"), ("NOIMID", "")]
+            )
+            .is_empty()
+        );
+    }
+
+    /// Cases 6, 10b-16 (store): whatever path left it there, an item Graph
+    /// still has under the folder while a row shows it elsewhere is refused:
+    /// a folder whose move out was refused (6) or that two refused moves
+    /// left at a never-landed dest (13), mail whose move out failed,
+    /// quarantined or not reconverged yet (10b, 11, 12, 14), a draft whose
+    /// send failed and was filed back (15, 16).
+    #[test]
+    fn the_walk_refuses_an_item_a_row_shows_elsewhere() {
+        let s = mailbox();
+        message(&s, "OUT", "A", "<out@x>");
+        message(&s, "STAYS", "A", "");
+        // Moved out locally; Graph never moved it.
+        s.move_message("OUT", "ARCH").unwrap();
+        written(s.move_folder("B", Some("ARCH")).unwrap());
+        let (d, batch) = delete(&s, "A");
+        let batch = batch.unwrap();
+        assert_eq!(d.removed, ["A"]);
+        let mut refused = check(&s, &batch, &["B"], &[("OUT", "<out@x>"), ("STAYS", "")]);
+        refused.sort();
+        assert_eq!(refused, ["B", "OUT"]);
+        // A row the batch allows that is back (a search hit opened, say).
+        message(&s, "STAYS", "INBOX", "");
+        assert_eq!(check(&s, &batch, &[], &[("STAYS", "")]), ["STAYS"]);
+    }
+
+    /// Case 10a and the other gone-row paths: a tombstone, a moved id, and
+    /// a queued op naming it all mean the store held it.
+    #[test]
+    fn the_walk_refuses_what_the_store_held_and_no_longer_shows() {
+        let s = mailbox();
+        // 10a: moved into a `local:` folder whose create was refused.
+        message(&s, "M", "A", "<m@x>");
+        let l = written(s.create_local_folder(Some("ARCH"), "L").unwrap());
+        s.move_message("M", &l).unwrap();
+        s.discard_local_folder(&l).unwrap();
+        assert!(!message_exists_on(&s.conn, "M").unwrap());
+        // A moved message's old id.
+        message(&s, "OLD", "ARCH", "");
+        s.follow_move("OLD", "NEW").unwrap();
+        // Deleted locally with its `Delete` still queued.
+        message(&s, "DEL", "ARCH", "");
+        s.delete_message("DEL").unwrap();
+        s.conn
+            .execute("DELETE FROM forgotten_ids WHERE id = 'DEL'", [])
+            .unwrap();
+        s.enqueue_op(&OutboxOp::Delete { id: "DEL".into() })
+            .unwrap();
+        let (_, batch) = delete(&s, "B");
+        let batch = batch.unwrap();
+        let mut refused = check(
+            &s,
+            &batch,
+            &[],
+            &[("M", "<m@x>"), ("OLD", ""), ("DEL", ""), ("FRESH", "")],
+        );
+        refused.sort();
+        assert_eq!(refused, ["DEL", "M", "OLD"]);
+    }
+
+    /// Case 22 (store): a move whose answer was lost leaves an id the store
+    /// never saw; its internet message id, held by a row or a tombstone,
+    /// refuses it. A copy a rule filed beside its original (n = k) passes.
+    #[test]
+    fn the_walk_counts_internet_message_ids() {
+        let s = mailbox();
+        message(&s, "M", "ARCH", "<lost@x>");
+        message(&s, "COPY", "A", "<rule@x>");
+        message(&s, "ORIG", "INBOX", "<rule@x>");
+        message(&s, "GONE", "INBOX", "<gone@x>");
+        s.delete_message("GONE").unwrap();
+        let (_, batch) = delete(&s, "A");
+        let batch = batch.unwrap();
+        assert_eq!(
+            check(&s, &batch, &[], &[("M-PRIME", "<lost@x>")]),
+            ["M-PRIME"]
+        );
+        assert_eq!(
+            check(&s, &batch, &[], &[("GONE-PRIME", "<gone@x>")]),
+            ["GONE-PRIME"]
+        );
+        assert!(check(&s, &batch, &[], &[("COPY", "<rule@x>")]).is_empty());
+        // Two walked with one allowed: the extra one is a moved-back copy.
+        assert_eq!(
+            check(&s, &batch, &[], &[("COPY", "<rule@x>"), ("X", "<rule@x>")]).len(),
+            2
+        );
+    }
+
+    /// Cases 6 and 9 (store, critique 5): a refused move whose previous
+    /// parent a delete removed leaves the folder where it is, not under a
+    /// missing row; one whose previous parent is the unlisted root reverts.
+    #[test]
+    fn a_revert_into_a_deleted_parent_leaves_the_folder() {
+        let s = mailbox();
+        written(s.move_folder("B", Some("ARCH")).unwrap());
+        delete(&s, "A");
+        assert!(
+            !s.revert_folder_parent("B", Some("A"), Some("ARCH"))
+                .unwrap()
+        );
+        assert_eq!(parent_of(&s, "B").as_deref(), Some("ARCH"));
+        // Case 9: B → local:L → ARCH, L deleted, A (B's Graph parent)
+        // deleted, B → ARCH refused.
+        let s = mailbox();
+        let l = written(s.create_local_folder(Some("INBOX"), "L").unwrap());
+        written(s.move_folder("B", Some(&l)).unwrap());
+        written(s.move_folder("B", Some("ARCH")).unwrap());
+        delete(&s, &l);
+        let (_, batch) = delete(&s, "A");
+        let batch = batch.unwrap();
+        let move_op = ops(&s)
+            .into_iter()
+            .find(|op| matches!(op, OutboxOp::MoveFolder { .. }))
+            .unwrap();
+        let OutboxOp::MoveFolder {
+            parent,
+            prev_parent,
+            ..
+        } = move_op
+        else {
+            unreachable!()
+        };
+        assert_eq!(prev_parent.as_deref(), Some("A"));
+        assert!(
+            !s.revert_folder_parent("B", prev_parent.as_deref(), parent.as_deref())
+                .unwrap()
+        );
+        assert_eq!(parent_of(&s, "B").as_deref(), Some("ARCH"));
+        // Graph still has B under A: the delete of A does not take it.
+        assert_eq!(check(&s, &batch, &["B"], &[]), ["B"]);
+        // The root is not a deleted folder: a revert to it still writes.
+        written(s.move_folder("ARCH", Some("INBOX")).unwrap());
+        assert!(
+            s.revert_folder_parent("ARCH", Some("ROOT"), Some("INBOX"))
+                .unwrap()
+        );
+        assert_eq!(parent_of(&s, "ARCH").as_deref(), Some("ROOT"));
+    }
+
+    /// Several roots share one batch; its allow-list goes with the last op.
+    #[test]
+    fn a_batch_ends_with_its_last_op() {
+        let s = mailbox();
+        let l = written(s.create_local_folder(Some("ARCH"), "L").unwrap());
+        written(s.move_folder("B", Some(&l)).unwrap());
+        written(s.move_folder(&l, Some("A")).unwrap());
+        let (d, batch) = delete(&s, "A");
+        let batch = batch.unwrap();
+        assert_eq!(d.removed.len(), 3);
+        let roots: Vec<(i64, String)> = s
+            .pending_ops()
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| match r.op {
+                OutboxOp::DeleteFolder { id, batch: b } => {
+                    assert_eq!(b, batch);
+                    Some((r.seq, id))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            roots.iter().map(|(_, id)| id.as_str()).collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+        assert!(s.has_older_op(roots[1].0).unwrap());
+        assert!(!s.has_older_op(roots[0].0).unwrap());
+        s.finish_folder_delete(roots[0].0, &batch).unwrap();
+        assert!(!allow(&s, &batch).is_empty());
+        assert!(s.folder_being_deleted("B").unwrap());
+        s.finish_folder_delete(roots[1].0, &batch).unwrap();
+        assert!(allow(&s, &batch).is_empty());
+        assert!(!s.folder_being_deleted("B").unwrap());
+    }
+
+    /// Case 20: every removal path records a tombstone through the
+    /// triggers, a row back under the id clears it, `local:` ids are not
+    /// recorded, and the cap keeps the newest.
+    #[test]
+    fn forgotten_ids_record_every_removal_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "mailcore-forgotten-{}",
+            to_hex(&crate::pkce::random_bytes(8))
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        let s = Store::open(&path).unwrap();
+        for (id, parent) in [("INBOX", "ROOT"), ("A", "INBOX")] {
+            s.upsert_folder(&listed(id, parent)).unwrap();
+        }
+        message(&s, "M1", "INBOX", "<m1@x>");
+        message(&s, "M2", "A", "<m2@x>");
+        message(&s, "local:d", "INBOX", "");
+        // A host's delete on its own connection.
+        let host = Store::open(&path).unwrap();
+        host.delete_message("M1").unwrap();
+        assert!(forgotten(&s, "message", "M1"));
+        let imid: String = s
+            .conn
+            .query_row("SELECT imid FROM forgotten_ids WHERE id = 'M1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(imid, "<m1@x>");
+        host.delete_message("local:d").unwrap();
+        assert!(!forgotten(&s, "message", "local:d"));
+        // A folder gone from a listing takes its mail (a cascade).
+        s.retain_folders(&["INBOX".to_string()]).unwrap();
+        assert!(forgotten(&s, "folder", "A"));
+        assert!(forgotten(&s, "message", "M2"));
+        // Back under the id: cleared.
+        message(&s, "M1", "INBOX", "<m1@x>");
+        assert!(!forgotten(&s, "message", "M1"));
+        s.upsert_folder(&listed("A", "INBOX")).unwrap();
+        assert!(!forgotten(&s, "folder", "A"));
+        // A re-key leaves the old id.
+        s.follow_move("M1", "M1B").unwrap();
+        assert!(forgotten(&s, "message", "M1"));
+        assert!(!forgotten(&s, "message", "M1B"));
+        // The cap keeps the newest.
+        for i in 0..5 {
+            let id = format!("P{i}");
+            message(&s, &id, "INBOX", "");
+            s.delete_message(&id).unwrap();
+        }
+        s.prune_forgotten(2).unwrap();
+        let left: Vec<String> = {
+            let mut stmt = s
+                .conn
+                .prepare("SELECT id FROM forgotten_ids ORDER BY rowid")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(left, ["P3", "P4"]);
+        drop(host);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -99,6 +99,12 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Ap
         OutboxOp::MarkFolderRead { .. } => Err(GraphError::Parse(
             "MarkFolderRead is run by the engine".to_string(),
         )),
+        // The engine runs it itself (#2107: it walks Graph's subtree first
+        // and sends the DELETE only when the walk finds nothing the batch
+        // does not allow). Should it reach here, nothing is sent.
+        OutboxOp::DeleteFolder { .. } => Err(GraphError::Parse(
+            "DeleteFolder is run by the engine".to_string(),
+        )),
         op => apply_other(client, store, op).map(|()| Applied::Done),
     }
 }
@@ -220,7 +226,8 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
         OutboxOp::Move { .. }
         | OutboxOp::CreateFolder { .. }
         | OutboxOp::MoveFolder { .. }
-        | OutboxOp::MarkFolderRead { .. } => {
+        | OutboxOp::MarkFolderRead { .. }
+        | OutboxOp::DeleteFolder { .. } => {
             unreachable!("apply_op handles it")
         }
         OutboxOp::RenameFolder { id, name, .. } => match graph_folder(store, id)? {
