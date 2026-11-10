@@ -6072,6 +6072,21 @@ fn dispatch_verb(
                         .into(),
                     ),
                 ),
+                // This window's applied theme (`Docxy::applied`), which
+                // Switch Modes reads: set by the call itself, not by the next
+                // frame (#2095). `appearance-set`'s `applied` reads the
+                // global `cx.theme().mode` instead.
+                (
+                    "applied",
+                    Json::Str(
+                        match app.applied {
+                            Some(gpui_component::ThemeMode::Dark) => "dark",
+                            Some(_) => "light",
+                            None => "none",
+                        }
+                        .into(),
+                    ),
+                ),
             ]))
         }
         // Play the OS's Light/Dark switch (#1075) through the same handler

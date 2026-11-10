@@ -17794,11 +17794,18 @@ impl Docxy {
 
     fn set_theme_pref(&mut self, pref: ThemePref, window: &mut Window, cx: &mut Context<Self>) {
         self.theme_pref = pref;
-        self.applied = None; // force re-apply on next render
+        self.applied = None;
+        // The other windows re-apply on their next render: until it, their
+        // `applied` is `None` (only this window's is applied here).
         self.share_with_windows(cx, |d| {
             d.theme_pref = pref;
             d.applied = None;
         });
+        // This window applies it at once, as `os_appearance_changed` does, so
+        // what reads `applied` (Switch Modes, its enabled and checked states)
+        // sees the new theme before the next frame: a Switch Modes click right
+        // after the change was a no-op until a frame came (#2095).
+        self.apply_theme(window, cx);
         self.persist(cx);
         self.refocus(window, cx);
     }
