@@ -621,18 +621,21 @@ pub enum SyncCommand {
     /// Graph holds there, received at or before the command's cutoff (the
     /// later of this client's clock and the newest stored message: with a
     /// clock ahead of Graph's, mail delivered up to that skew after the
-    /// command is deleted too; later mail stays), keeps each one the store shows elsewhere (a move
-    /// out still unsent or refused, a lost move answer) or still holds in
-    /// the folder (the unsent mail), and deletes the rest through
-    /// `POST /$batch`, 20 a batch, waiting out a throttled one's
+    /// command is deleted too; later mail stays). It keeps each one the
+    /// store shows elsewhere (a move out still unsent or refused, a lost
+    /// move answer), and leaves alone the unsent mail still held in the
+    /// folder and mail moved into it since; an emptied message stored
+    /// there again (a fetch, a row read by id) is deleted with the rest,
+    /// through `POST /$batch`, 20 a batch, waiting out a throttled one's
     /// `Retry-After`. Until it is done nothing is read from Graph for the
     /// folder and its stored counts are kept; then its delta starts afresh.
     /// What could not be deleted, and what was kept as shown elsewhere, is
     /// reported once at the end as [`SyncEvent::FolderWriteFailed`]
     /// (`write: Empty`), as is a refusal; an unknown folder or the drafts
     /// sentinel is refused at once. With `subfolders`, each child folder
-    /// stored under it is then deleted as [`SyncCommand::DeleteFolder`]
-    /// deletes it (after the empty, each refused or not on its own).
+    /// stored under it is deleted as [`SyncCommand::DeleteFolder`] deletes
+    /// it, each refused or not on its own: from the store at once, with
+    /// the empty, and on Graph after the empty's run.
     EmptyFolder { folder: String, subfolders: bool },
     /// Exit the sync thread cleanly.
     Shutdown,
@@ -1147,8 +1150,9 @@ struct BulkRun {
     kind: BulkKind,
     /// The ids still to mark or delete, in the order Graph listed them.
     todo: VecDeque<String>,
-    /// How many ids the run took on: listed, less what the empty left as
-    /// its own choice (the unsent mail still stored in the folder).
+    /// How many ids the run took on: listed, less what the empty left
+    /// alone (the unsent mail still stored in the folder, and mail moved
+    /// into it since; `Store::empty_refused`).
     total: usize,
     /// The ids Graph refused for good: (id, status, error).
     failed: Vec<(String, u16, String)>,
@@ -4819,11 +4823,15 @@ impl Engine {
     /// `before` (`GraphClient::folder_messages_before`), all of them before
     /// the first DELETE, as deleting while paging would shift the pages,
     /// and checks them against the command's allow-list
-    /// (`Store::delete_allow_check`, as #2107's walk): an id refused there
-    /// that the store holds in this very folder is the unsent mail the
-    /// command kept (left alone, not reported); any other refused id is
-    /// kept as shown elsewhere or removed (reported at the end). The rest
-    /// go 20 a `$batch` DELETE (`bulk_batches`). A whole-call failure of
+    /// (`Store::delete_allow_check`, as #2107's walk). The ids refused
+    /// there are sorted by `Store::empty_refused` (r1): one stored in
+    /// another folder, or not stored (a tombstone, an internet message id
+    /// held elsewhere), is kept and reported at the end; one stored in this
+    /// folder is left alone, unreported, when it is unsent (the command's
+    /// own choice) or the batch does not allow it (moved in since), and is
+    /// deleted when the batch allows it (an emptied message another path
+    /// stored there again). The rest go 20 a `$batch` DELETE
+    /// (`bulk_batches`). A whole-call failure of
     /// the listing or a batch takes the drain's usual arms
     /// (`engine_op_call_failed`); anything else refuses the op
     /// (`refuse_empty_folder`).
@@ -30867,6 +30875,58 @@ mod tests {
                 wait_drained(&store);
                 assert_eq!(deleted(&srv), ["M1", "M2"]);
                 assert!(!store.message_exists("M1").unwrap(), "its row went too");
+                let seen = barrier(&handle);
+                assert!(failures(&seen).is_empty(), "{seen:?}");
+                stop(handle, dir);
+            }
+
+            /// r2-m3: an older op refused once more on each drain keeps the
+            /// empty waiting while a later `Move` of Archive's G1 into Inbox
+            /// lands as G1-NEW. The run then lists G1-NEW: the batch never
+            /// had it, so it is left alone (no DELETE, its row stays, no
+            /// report).
+            #[test]
+            fn mail_moved_into_the_folder_while_the_empty_waits_is_left_alone() {
+                let mut writes = vec![
+                    once("PATCH", "/me/messages/X", 400, BAD),
+                    once("PATCH", "/me/messages/X", 400, BAD),
+                    once("PATCH", "/me/messages/X", 400, BAD),
+                    write("PATCH", "/me/messages/X", 200, "{}"),
+                    write("POST", "/me/messages/G1/move", 201, r#"{"id":"G1-NEW"}"#),
+                    once("GET", LIST, 200, &items_page(&strings(&["G1-NEW"]), None)),
+                ];
+                writes.extend(inbox_deltas(&[]));
+                let (srv, handle, store, dir) = engine(
+                    "empty-moved-in-since",
+                    world(writes, TREE, &[("ARCH", "X"), ("ARCH", "G1")]),
+                    None,
+                );
+                // The older op: refused on the next three drains.
+                send(
+                    &handle,
+                    SyncCommand::MarkRead {
+                        id: "X".into(),
+                        read: true,
+                    },
+                );
+                empty_inbox(&handle);
+                send(
+                    &handle,
+                    SyncCommand::Move {
+                        id: "G1".into(),
+                        dest: "INBOX".into(),
+                    },
+                );
+                wait_requests(&srv, "POST", "/me/messages/G1/move", 1);
+                barrier(&handle);
+                assert!(listings(&srv).is_empty(), "the empty still waits");
+                assert_eq!(mail_in(&store, "INBOX"), ["G1-NEW"]);
+                // The next drain sends the older op, then runs the empty.
+                send(&handle, SyncCommand::Refresh);
+                wait_drained(&store);
+                assert_eq!(listings(&srv).len(), 1);
+                assert!(batches(&srv).is_empty(), "no DELETE");
+                assert_eq!(mail_in(&store, "INBOX"), ["G1-NEW"]);
                 let seen = barrier(&handle);
                 assert!(failures(&seen).is_empty(), "{seen:?}");
                 stop(handle, dir);

@@ -22716,6 +22716,44 @@ mod empty_folder_tests {
         assert_eq!(befores, vec!["2026-11-10T18:03:08Z", NOW]);
     }
 
+    /// r2-m3: `empty_refused` sorts a run's refused ids, each guard with a
+    /// case that fails without it: an allowed id stored in the folder
+    /// again is deleted unless it is unsent; one the batch does not allow
+    /// (moved in since) is left alone; one stored elsewhere, or not at all
+    /// (a tombstone), is kept and counted.
+    #[test]
+    fn empty_refused_sorts_what_the_check_refused() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F", 4, 0);
+        folder(&s, "G", 0, 0);
+        for id in ["UNSENT", "BACK", "ELSEWHERE", "GONE"] {
+            message(&s, id, "F", NOW, true, "");
+        }
+        written(s.empty_folder("F", NOW).unwrap());
+        let (_, _, batch) = queued(&s);
+        // Stored in F again: one now holding an unsent edit, one plain.
+        message(&s, "UNSENT", "F", NOW, true, "");
+        s.conn
+            .execute("UPDATE messages SET local_edit = 1 WHERE id = 'UNSENT'", [])
+            .unwrap();
+        message(&s, "BACK", "F", NOW, true, "");
+        // Moved into F since: the batch never had it.
+        message(&s, "MOVED-IN", "F", NOW, true, "");
+        // Stored in another folder.
+        message(&s, "ELSEWHERE", "G", NOW, true, "");
+        let refused: Vec<String> = ["UNSENT", "BACK", "MOVED-IN", "ELSEWHERE", "GONE"]
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        assert_eq!(
+            s.empty_refused(&batch, "F", &refused).unwrap(),
+            EmptyRefused {
+                delete: vec!["BACK".to_string()],
+                kept: 2,
+            }
+        );
+    }
+
     /// Criterion 11 (store): a delete of the folder, or of a folder above
     /// it, drops its queued `EmptyFolder` and the batch's allow-list; the
     /// delete's own check then allows the mail the empty removed, as the

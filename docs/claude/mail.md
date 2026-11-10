@@ -3434,7 +3434,7 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   error joining `"{n} of {total} messages could not be deleted: {first error}"` and `"{k} of
   {total} messages were kept: the store shows them elsewhere or removed"` with `"; "`. `status` is
   the first refused id's, `None` when only kept mail is reported. `total` counts what the run took
-  on: listed, less the unsent mail it left.
+  on: listed, less what it left alone (the unsent mail, and mail moved in since).
 - Whole-call failures go through `engine_op_call_failed`: auth, throttle and transport stop the
   drain, and a 5xx defers. Anything else (a 404, another 4xx, `Parse`) refuses it
   (`refuse_empty_folder`): `finish_folder_empty`, `bulk` cleared, and the report. The cleared
@@ -3469,7 +3469,8 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `empty_folder_fts_rows_go_and_the_fts_triggers_come_back`,
   `empty_folder_refuses_unknown_and_the_drafts_sentinel`, `empty_folder_allow_list_and_tombstones`,
   `empty_folder_cutoff_is_the_later_of_now_and_the_newest_row`,
-  `delete_folder_drops_a_queued_empty_folder_and_its_allow_list`); `client.rs`
+  `delete_folder_drops_a_queued_empty_folder_and_its_allow_list`,
+  `empty_refused_sorts_what_the_check_refused`); `client.rs`
   `folder_messages_before_filters_pages_and_dedups`, `delete_message_request_is_a_delete`;
   `outbox.rs` `apply_op_empty_folder_sends_nothing`; `engine.rs` `folder_writes::empty_folder`
   (`empty_folder_pages_and_deletes_every_server_id_once`,
@@ -3481,5 +3482,6 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `empty_folder_refusals_report_and_restart_the_folder_delta`, `empty_folder_survives_a_restart`,
   `empty_folder_with_subfolders_deletes_the_children` (the children gone before the run's
   listing answers), `an_emptied_message_stored_again_in_the_folder_is_deleted`,
+  `mail_moved_into_the_folder_while_the_empty_waits_is_left_alone`,
   `a_delete_of_the_folder_drops_its_queued_empty`,
   `empty_folder_of_an_unknown_folder_reports_and_queues_nothing`).
