@@ -145,7 +145,8 @@ issue number to find its notes.
   a meeting message's own reminder on its row (#2089),
   a reply draft's In-Reply-To, each message's Internet message id, `isDraft` kept (#2096),
   OAuth tokens in the platform secret store, a plaintext fallback and its
-  warning (#1877).
+  warning (#1877), contact search folded in Rust, word-prefix rank, `all_contacts`
+  (#1890).
 
 ## Build and test
 
