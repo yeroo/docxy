@@ -5635,14 +5635,14 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// The folders a queued rename or move names (#1910), resolved through
-    /// `folder_aliases`.
     /// Marks every stored message of `folder` read, zeroes its
     /// `unread_count` and queues its `MarkFolderRead` (#1913), in one
     /// IMMEDIATE transaction: all or nothing. The op's `before` is the
     /// later of `now_utc` and the newest stored `received_at` in the folder
-    /// (cut to whole seconds), so a client clock behind Graph's still covers
-    /// the mail the user saw, and every stored row is at or before it.
+    /// (a fractional second rounded up to the next whole one, so Graph's
+    /// `receivedDateTime le` still takes that message), so a client clock
+    /// behind Graph's still covers the mail the user saw, and every stored
+    /// row is at or before it.
     /// Every command queues its own op: a `MarkRead` to unread queued
     /// between two of them must not win. Refused: an unknown folder and the
     /// drafts sentinel.
@@ -5661,10 +5661,7 @@ impl Store {
             params![id],
             |r| r.get(0),
         )?;
-        let newest = newest.map(|n| match n.get(..19) {
-            Some(secs) if n.len() > 20 => format!("{secs}Z"),
-            _ => n,
-        });
+        let newest = newest.map(|n| ceil_to_whole_second(&n));
         let before = match newest {
             Some(n) if n.as_str() > now_utc => n,
             _ => now_utc.to_string(),
@@ -5696,6 +5693,9 @@ impl Store {
         clear_folder_links_on(&self.conn, folder)
     }
 
+    /// The folders a queued rename or move names (#1910), and those a
+    /// queued `MarkFolderRead` names with its latest cutoff (`marked_read`,
+    /// #1913), resolved through `folder_aliases`.
     pub(crate) fn queued_folder_writes(&self) -> Result<QueuedFolderWrites, StoreError> {
         let mut q = QueuedFolderWrites::default();
         for row in pending_ops_on(&self.conn)? {
@@ -5956,6 +5956,25 @@ fn rekey_folder_on(
         clear_folder_links_on(conn, new)?;
     }
     Ok(())
+}
+
+/// A Graph instant as `YYYY-MM-DDTHH:MM:SSZ`, a fractional second rounded
+/// up to the next whole one (#1913): `…07.512Z` is `…08Z`, carrying across
+/// a minute, an hour or a day. Whole seconds (`…07Z`, `…07.000Z`) keep their
+/// second; a string of another shape is returned as it is.
+fn ceil_to_whole_second(s: &str) -> String {
+    let (Some(whole), Some(rest)) = (s.get(..19), s.get(19..)) else {
+        return s.to_string();
+    };
+    let Some(secs) = iso8601_to_unix_secs(&format!("{whole}Z")) else {
+        return s.to_string();
+    };
+    let fraction = match rest.strip_prefix('.').and_then(|r| r.strip_suffix('Z')) {
+        Some(f) if !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()) => f,
+        _ => return s.to_string(),
+    };
+    let up = i64::from(fraction.bytes().any(|b| b != b'0'));
+    unix_secs_to_iso8601(secs + up)
 }
 
 /// Clears one folder's delta and backfill links and what they carried
@@ -7178,6 +7197,28 @@ fn migrate_meeting_reminder(conn: &Connection) -> Result<bool, StoreError> {
     Ok(true)
 }
 
+/// Installs `messages_fts_au` as `schema::MESSAGES_FTS_AU_SQL` has it
+/// (#1913): fired only by an UPDATE of the columns the FTS row reads. A
+/// database from before, whose trigger fired on every UPDATE, has it
+/// replaced; a new one gets it here (`SCHEMA_SQL` leaves it out). The FTS
+/// rows themselves are unchanged. Whether it wrote the trigger.
+fn migrate_fts_update_trigger(conn: &Connection) -> Result<bool, StoreError> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let current: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'trigger' AND name = 'messages_fts_au' AND sql LIKE '%AFTER UPDATE OF%'",
+        [],
+        |r| r.get(0),
+    )?;
+    if current > 0 {
+        return Ok(false);
+    }
+    tx.execute_batch("DROP TRIGGER IF EXISTS messages_fts_au;")?;
+    tx.execute_batch(schema::MESSAGES_FTS_AU_SQL)?;
+    tx.commit()?;
+    Ok(true)
+}
+
 /// Brings a store from before #2096 up to date: adds
 /// `messages.internet_message_id` and `messages.in_reply_to` (old rows read
 /// `""`) and resets every folder's delta and backfill state and both
@@ -7221,28 +7262,6 @@ fn migrate_meeting_reminder(conn: &Connection) -> Result<bool, StoreError> {
 /// fetches it once, and a fetch that comes still keeps an edited or queued
 /// draft's body (#2082). The html relabel above keeps its draft-row
 /// condition: it must never touch a genuine non-draft text body.
-/// Installs `messages_fts_au` as `schema::MESSAGES_FTS_AU_SQL` has it
-/// (#1913): fired only by an UPDATE of the columns the FTS row reads. A
-/// database from before, whose trigger fired on every UPDATE, has it
-/// replaced; a new one gets it here (`SCHEMA_SQL` leaves it out). The FTS
-/// rows themselves are unchanged. Whether it wrote the trigger.
-fn migrate_fts_update_trigger(conn: &Connection) -> Result<bool, StoreError> {
-    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    let current: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM sqlite_master
-         WHERE type = 'trigger' AND name = 'messages_fts_au' AND sql LIKE '%AFTER UPDATE OF%'",
-        [],
-        |r| r.get(0),
-    )?;
-    if current > 0 {
-        return Ok(false);
-    }
-    tx.execute_batch("DROP TRIGGER IF EXISTS messages_fts_au;")?;
-    tx.execute_batch(schema::MESSAGES_FTS_AU_SQL)?;
-    tx.commit()?;
-    Ok(true)
-}
-
 fn migrate_reply_links(conn: &Connection) -> Result<bool, StoreError> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let has: i64 = tx.query_row(
@@ -20571,9 +20590,25 @@ mod mark_folder_read_tests {
                 other => panic!("{other:?}"),
             })
             .collect();
-        assert_eq!(befores, vec!["2026-11-10T18:03:07Z", NOW]);
+        // Rounded up: Graph's `le` must still take the 07.512 message.
+        assert_eq!(befores, vec!["2026-11-10T18:03:08Z", NOW]);
         // Every stored row is at or before its cutoff, as strings compare.
-        assert!("2026-11-10T18:03:07.5120000Z" <= "2026-11-10T18:03:07Z");
+        assert!("2026-11-10T18:03:07.5120000Z" <= "2026-11-10T18:03:08Z");
+    }
+
+    #[test]
+    fn ceil_to_whole_second_rounds_a_fraction_up_with_carries() {
+        for (given, want) in [
+            ("2026-11-10T18:03:07Z", "2026-11-10T18:03:07Z"),
+            ("2026-11-10T18:03:07.000Z", "2026-11-10T18:03:07Z"),
+            ("2026-11-10T18:03:07.512Z", "2026-11-10T18:03:08Z"),
+            ("2026-11-10T18:03:59.5Z", "2026-11-10T18:04:00Z"),
+            ("2026-12-31T23:59:59.0000001Z", "2027-01-01T00:00:00Z"),
+            ("2028-02-28T23:59:59.9Z", "2028-02-29T00:00:00Z"),
+            ("not a time", "not a time"),
+        ] {
+            assert_eq!(ceil_to_whole_second(given), want, "{given}");
+        }
     }
 
     #[test]
