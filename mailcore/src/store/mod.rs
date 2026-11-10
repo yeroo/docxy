@@ -3222,11 +3222,12 @@ impl Store {
     /// row with no recorded fetch format (`fetched_as IS NULL`), which only
     /// compose's `update_draft_fields`, `create_local_draft` and a composed
     /// reply/forward's `put_body` write. False for no row, no body, or a
-    /// body `FetchBody` stored. A draft's text body an engine from before
-    /// #1901 fetched (stored with no format) is marked fetched by
-    /// `migrate_reply_links`, so it reads false too. Whether the row is a
-    /// draft is the caller's to know (lookxy asks only for `is_draft` rows);
-    /// a non-draft's body from before #1901 has no format either. A host opens only such a draft in its
+    /// body `FetchBody` stored. A text body an engine from before #1901
+    /// fetched (stored with no format) is marked fetched by
+    /// `migrate_reply_links` in any folder, so it reads false too. Whether
+    /// the row is a draft is the caller's to know (lookxy asks only for
+    /// `is_draft` rows); a pre-#1901 non-draft html body still has no
+    /// format, and reads true. A host opens only such a draft in its
     /// editor: a draft made elsewhere has no local body, and editing Graph's
     /// rendering of it would save that rendering back over it.
     pub fn draft_body_is_local(&self, id: &str) -> Result<bool, StoreError> {
@@ -6193,20 +6194,24 @@ fn migrate_meeting_reminder(conn: &Connection) -> Result<bool, StoreError> {
 /// non-draft body are left alone. Every pre-#1901 store is pre-#2096, so
 /// this runs on each of them once.
 ///
-/// Then the draft bodies still `text` with no recorded format are marked
-/// fetched as text (`fetched_as = 'text'`): before #1901 every body
-/// `FetchBody` stored was written with none, so a text rendering of a
-/// draft made elsewhere, viewed in a reader then, would read as a local
-/// write (`Store::draft_body_is_local`) once the re-enumeration makes it
-/// `is_draft`, and a host would open it in its editor and save the
-/// flattened text over the server's html draft. Left alone: a row holding
-/// an unpushed edit (`local_edit > 0`), a `local:` draft and a reconciled
-/// one (`local_id`), all compose's own. The cost, accepted: a plain-text
-/// `createReply` body stored before #2096 then opens read-only. Such a body
-/// now satisfies a text ask as before, and no longer satisfies an html ask
-/// (`body_satisfies`: a recorded format must match), so an html embedder
-/// fetches it once; a fetch that comes still keeps an edited or queued
-/// draft's body (#2082).
+/// Then every body still `text` with no recorded format is marked fetched
+/// as text (`fetched_as = 'text'`), in any folder: before #1901 every body
+/// `FetchBody` stored was written with none, and a draft made elsewhere
+/// reads `is_draft = 0` until the re-enumeration, wherever it is filed
+/// (Drafts, a Drafts subfolder, a user folder, Deleted Items). Without it a
+/// reader's text rendering of such a draft would read as a local write
+/// (`Store::draft_body_is_local`) once the row is `is_draft`, and a host
+/// would open it in its editor and save the flattened text over the
+/// server's html draft. Left alone, as compose's own: a row holding an
+/// unpushed edit (`local_edit > 0`), a `local:` draft, a reconciled one
+/// (`local_id`) and a row in the local Drafts sentinel. For a non-draft
+/// nothing changes: `None` and `Some("text")` both satisfy only a text ask
+/// (`body_satisfies`). The cost, accepted: a plain-text `createReply` body
+/// stored before #2096 then opens read-only; such a draft body satisfies a
+/// text ask as before and no longer an html one, so an html embedder
+/// fetches it once, and a fetch that comes still keeps an edited or queued
+/// draft's body (#2082). The html relabel above keeps its draft-row
+/// condition: it must never touch a genuine non-draft text body.
 fn migrate_reply_links(conn: &Connection) -> Result<bool, StoreError> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let has: i64 = tx.query_row(
@@ -6239,10 +6244,9 @@ fn migrate_reply_links(conn: &Connection) -> Result<bool, StoreError> {
         "UPDATE bodies SET fetched_as = 'text'
          WHERE fetched_as IS NULL AND content_type = 'text'
            AND message_id IN (
-               SELECT m.id FROM messages m LEFT JOIN folders f ON f.id = m.folder_id
-               WHERE (m.is_draft = 1 OR f.well_known_name = 'drafts' OR m.folder_id = ?1)
-                 AND m.local_edit = 0 AND m.local_id IS NULL
-                 AND substr(m.id, 1, 6) <> 'local:')",
+               SELECT id FROM messages
+               WHERE local_edit = 0 AND local_id IS NULL
+                 AND substr(id, 1, 6) <> 'local:' AND folder_id <> ?1)",
         params![LOCAL_DRAFTS_SENTINEL_FOLDER_ID],
     )?;
     tx.commit()?;
@@ -18260,10 +18264,12 @@ mod reply_link_tests {
             // Bodies for the one-off fixes: pre-#1901 compose bodies (html
             // under `text`) on drafts become html; a pre-#1901 text body of
             // a draft (a rendering FetchBody stored with no format, or a
-            // plain-text `createReply`) is marked fetched, on an `is_draft`
-            // row and on a Drafts-folder row stored before `isDraft` was;
-            // left alone: html-as-text and text on a non-draft, a fetched
-            // draft body, a row holding an unpushed edit, a `local:` draft.
+            // plain-text `createReply`) is marked fetched, and so is every
+            // other row's NULL text body, in any folder (a draft made
+            // elsewhere reads `is_draft = 0` before the re-enumeration,
+            // wherever it is filed); left alone: html-as-text on a
+            // non-draft (no relabel), a fetched body, a row holding an
+            // unpushed edit, a `local:` draft.
             s.upsert_folder(&MailFolder {
                 id: "DR".into(),
                 display_name: "Drafts".into(),
@@ -18281,6 +18287,19 @@ mod reply_link_tests {
             s.upsert_message("DR", &msg("L6", "CL", "", "")).unwrap();
             s.upsert_message("F", &draft("L7", "CL", "")).unwrap();
             s.upsert_message("F", &msg("L8", "CL", "", "")).unwrap();
+            s.upsert_folder(&MailFolder {
+                id: "TR".into(),
+                display_name: "Deleted Items".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: Some("deleteditems".into()),
+            })
+            .unwrap();
+            // Drafts made elsewhere, stored before `isDraft`, outside
+            // Drafts: in a user folder (G) and in Deleted Items.
+            s.upsert_message("G", &msg("L9", "CL", "", "")).unwrap();
+            s.upsert_message("TR", &msg("L10", "CL", "", "")).unwrap();
             let local = s.create_local_draft("s", "a@x", "", "x").unwrap();
             s.conn
                 .execute(
@@ -18304,7 +18323,9 @@ mod reply_link_tests {
                        ('L5', 'text', '<ol><li>one</li></ol>', NULL),
                        ('L6', 'text', 'rendered elsewhere', NULL),
                        ('L7', 'text', 'edited here', NULL),
-                       ('L8', 'text', 'plain mail', NULL);",
+                       ('L8', 'text', 'plain mail', NULL),
+                       ('L9', 'text', 'rendered, user folder', NULL),
+                       ('L10', 'text', 'rendered, deleted', NULL);",
                 )
                 .unwrap();
             local_id = local;
@@ -18340,23 +18361,31 @@ mod reply_link_tests {
             (t, f, s.draft_body_is_local(id).unwrap())
         };
         let b = |t: &str, f: Option<&str>, local: bool| (t.to_string(), f.map(String::from), local);
-        let ids = ["L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", &local_id];
+        let ids = [
+            "L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "L9", "L10", &local_id,
+        ];
         let got: Vec<_> = ids.iter().map(|id| body(id)).collect();
         assert_eq!(
             got,
             [
                 b("html", None, true),          // L1: legacy compose html
                 b("text", Some("text"), false), // L2: a draft's text, marked fetched
-                b("text", None, true),          // L3: not a draft, untouched
+                b("text", Some("text"), false), // L3: not a draft, not relabelled
                 b("text", Some("text"), false), // L4: already fetched
                 b("html", None, true),          // L5: legacy compose list
                 b("text", Some("text"), false), // L6: in Drafts, `is_draft = 0`
                 b("text", None, true),          // L7: an unpushed edit, untouched
-                b("text", None, true),          // L8: plain mail, untouched
+                b("text", Some("text"), false), // L8: plain mail, marked fetched
+                b("text", Some("text"), false), // L9: a user folder
+                b("text", Some("text"), false), // L10: Deleted Items
                 b("text", None, true),          // a `local:` draft, untouched
             ],
             "{ids:?}"
         );
+        // A non-draft's body behaves as before: a text ask gets it, an html
+        // ask does not.
+        assert!(s.get_body_for("L8", BodyFormat::Text).unwrap().is_some());
+        assert!(s.get_body_for("L8", BodyFormat::Html).unwrap().is_none());
         let index: i64 = s
             .conn
             .query_row(
