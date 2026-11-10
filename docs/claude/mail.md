@@ -2241,7 +2241,10 @@ Outlook's "Follow Up › Add Reminder" on a message: read, stored, snoozed and d
   `flag_due_at` with the flag. **Reminder on ⇒ flagged**: the merge ANDs it with the
   row's resulting flag, and `set_flag(false)` turns it off (times kept), so an unflag or
   a completed flag stays off even if Exchange keeps `PidLidReminderSet` and a later
-  delta says so.
+  delta says so. Since #2089 a meeting message's own `PidLidReminderSet` is kept apart,
+  in `meeting_reminder_on`, which never fires; `is_reminder_on`, this rule and
+  `due_message_reminders` are unchanged (see "A meeting message's own reminder on its
+  row (#2089)").
 - Migration: `migrate_message_reminders` probes `pragma_table_info` in one IMMEDIATE
   transaction; a store without the columns gets all four and every folder's delta and
   backfill state cleared (what `clear_delta_links` clears, without
@@ -2699,9 +2702,9 @@ protected message without opening it: each `MessageRow` (every read: `message_ro
   it.
 - Store: `messages.sensitivity` (INTEGER, `Sensitivity::as_mapi`; an odd stored value
   reads `Normal`), `has_sensitivity_label`, `sensitivity_label_name` (TEXT, `''`) and
-  `is_rights_protected`, all NOT NULL with defaults. They are the last four of
-  `MESSAGE_ROW_COLUMNS` (`BODY_AFTER_ROW_COLUMNS` 28) and of `conversations_in_folder`'s
-  two spelled lists. `merge_message`'s one statement writes all four on
+  `is_rights_protected`, all NOT NULL with defaults. They were the last four of
+  `MESSAGE_ROW_COLUMNS` (`BODY_AFTER_ROW_COLUMNS` 28; #2089 adds one after them) and of
+  `conversations_in_folder`'s two spelled lists. `merge_message`'s one statement writes all four on
   `writes_protection`.
 - Migration: `migrate_message_protection`, after `migrate_meeting_message_type` in
   `Store::init` (and after `migrate_message_reminders`, whose marks it resets), probes
@@ -2734,3 +2737,71 @@ protected message without opening it: each `MessageRow` (every read: `message_ro
   `engine.rs` `message_protection::` (a delta of a label, Sensitivity confidential, an
   IRM message and a plain message each over a stored protection, and a later round
   without the class keeping it).
+
+## A meeting message's own reminder on its row (#2089)
+
+A host's message list shows classic Outlook's reminder bell beside a meeting message's
+icon without a request per row: each `MessageRow` (every read: `message_row`,
+`message_rows`, `messages_in_folder`, `conversations_in_folder`, `search`, `draft`,
+`due_message_reminders`) and each `Message` carries `meeting_reminder_on`.
+
+- Source: `PidLidReminderSet` (`model::REMINDER_SET_PROP`), which #2054's
+  `client::MESSAGE_EXPAND` already asks for on every message, beside the class
+  (`MESSAGE_CLASS_PROP`, #2081). No new term and no new request: a delta's first call,
+  `get_message`, `get_message_hit` and a search's first request bring both.
+- Not `is_reminder_on`: that one is the flag's reminder (#2054), never true on an
+  unflagged row, and it drives `due_message_reminders`. A meeting request's own set bit
+  is kept in its own field and never fires a reminder; an unflagged meeting request with
+  the bit is not due. A flagged meeting request can have both on.
+- Parse (`model::parse_meeting_reminder`, `(carried, on)`, lenient): carried is "the
+  array holds a `MESSAGE_CLASS_PROP` entry", whatever its value, the protection's rule
+  (#2088) and for the same reason: the bit is absent on most mail, the class rides the
+  same expand, so an item carrying it was read with the expand. On is carried, a meeting
+  message and the bit, read by the private `reminder_set` that
+  `parse_message_reminder` shares (`"true"` any case, or JSON `true`). No reminder time
+  is needed: this one never fires. A meeting message is a string class `is_meeting_class`
+  accepts (`IPM.Schedule.Meeting`, or it plus `.` and at least one character, ASCII case
+  ignored, not trimmed: `from_message_class`'s subclass rule), or an `@odata.type`
+  starting `#microsoft.graph.eventMessage`, which makes the item a meeting message
+  whenever the class does not: a class entry with no string value, or a string
+  `is_meeting_class` rejects (`IPM.Note`, `IPM.Schedule.MeetingX`). The class half covers
+  the forward notification
+  (`IPM.Schedule.Meeting.Notification.Forward`), which has no `MeetingMessageType`, so the
+  rule does not key on `meeting_message_type`; `@odata.type` alone is absent on a partial
+  item. A carried message that is neither writes false.
+- Store: `messages.meeting_reminder_on` (INTEGER NOT NULL DEFAULT 0), the last of
+  `MESSAGE_ROW_COLUMNS` (`BODY_AFTER_ROW_COLUMNS` 29) and of `conversations_in_folder`'s
+  two spelled lists. `merge_message` writes it on `MessageFields::writes_meeting_reminder`
+  (`MessageFields::meeting_reminder`, the carried flag), with no flag term. A partial
+  item, a refused expand (`reminder_unasked`) or a silently dropped one keeps the stored
+  value. A composed draft (`upsert_message`, `MessageFields::all()`) writes false.
+  `set_flag` and `snooze_message_reminder` leave it alone.
+- Dismiss: `Store::dismiss_message_reminder` turns it off too, as the command's PATCH
+  sets the same `PidLidReminderSet` false, so the row matches the next delta. A refused
+  PATCH's `reread_message` (`get_message`, with the expand) restores it. Known limit: if
+  that re-read is itself refused the expand (a 400, then a plain GET), it carries no
+  class, and the row reads off until a delta reports the message again.
+- Migration: `migrate_meeting_reminder`, last in `Store::init`, probes for the column in
+  one IMMEDIATE transaction and adds it (old rows read false). It does **not** reset any
+  delta or backfill state, unlike #2054's, #2081's and #2088's: the expand did not
+  change, so every stored link already brings the bit and the class, and a store older
+  than #2088 is reset by that migration on the same open. Rows stored before read false
+  until a delta reports them again; a whole-mailbox re-enumeration for a bell on old mail
+  was judged not worth it.
+- Not done: any host UI (lookxy's list shows no bell), backfilling rows stored before the
+  migration, dismissing or snoozing a meeting message's reminder as a command of its own,
+  or any reminder that fires for a meeting message (a calendar event's reminder is
+  #2025's).
+- Tests: `model.rs` `meeting_reminder_reads_the_set_bit_of_a_meeting_message`,
+  `meeting_reminder_takes_the_type_when_the_class_has_no_string`,
+  `meeting_reminder_is_false_on_a_plain_message`,
+  `meeting_reminder_is_carried_only_with_the_class`,
+  `meeting_reminder_is_carried_exactly_when_the_protection_is` (the two carried rules
+  agree), `meeting_reminder_leaves_the_flag_reminder_alone`; `store`
+  `meeting_reminder_tests` (every read path, `draft`'s body after the shifted columns,
+  the merge rule, no flag term and never due, dismiss, the migration without a reset and
+  its idempotence), `a_store_from_before_2054_runs_every_migration_in_order`,
+  `upsert_writes_every_column`; `engine.rs` `meeting_reminders::` (a delta page of a
+  meeting request with and without the bit, a plain message with the bit and a time, a
+  flagged meeting request still due; a later round without the class keeping it and one
+  with it clearing it; dismiss, and a refused dismiss re-read on through `get_message`).

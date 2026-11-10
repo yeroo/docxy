@@ -92,7 +92,12 @@ CREATE TABLE IF NOT EXISTS messages (
     sensitivity            INTEGER NOT NULL DEFAULT 0,
     has_sensitivity_label  INTEGER NOT NULL DEFAULT 0,
     sensitivity_label_name TEXT NOT NULL DEFAULT '',
-    is_rights_protected    INTEGER NOT NULL DEFAULT 0
+    is_rights_protected    INTEGER NOT NULL DEFAULT 0,
+    -- A meeting message's own reminder is set (#2089): its
+    -- `PidLidReminderSet`, kept apart from the flag's `is_reminder_on`; it
+    -- never fires. An old file gets it in `Store::init`, without a delta
+    -- reset: the links already carry the `$expand` that brings it.
+    meeting_reminder_on    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received

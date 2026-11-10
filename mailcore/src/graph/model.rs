@@ -265,6 +265,14 @@ pub struct Message {
     /// brings them): see [`parse_message_protection`]. Lenient: absent or
     /// unreadable values are the default, unprotected.
     pub protection: MessageProtection,
+    /// A meeting message's own reminder is set (#2089): the item is a
+    /// meeting message and its `PidLidReminderSet` is true, read from its
+    /// `singleValueExtendedProperties` (the delta's `$expand` brings it):
+    /// see [`parse_meeting_reminder`]. What a list shows as classic
+    /// Outlook's bell beside the meeting icon. Independent of the flag and
+    /// of [`Message::is_reminder_on`], and it never fires a reminder.
+    /// False for any other message.
+    pub meeting_reminder_on: bool,
 }
 
 impl Message {
@@ -272,6 +280,7 @@ impl Message {
         let (is_reminder_on, reminder_at, reminder_signal_at) = parse_message_reminder(v);
         let (_, meeting_message_type) = parse_meeting_message_type(v);
         let (_, protection) = parse_message_protection(v);
+        let (_, meeting_reminder_on) = parse_meeting_reminder(v);
         Some(Message {
             id: str_field(v, "id"),
             conversation_id: str_field(v, "conversationId"),
@@ -302,6 +311,7 @@ impl Message {
             flag_due_at: parse_flag_due(v),
             meeting_message_type,
             protection,
+            meeting_reminder_on,
         })
     }
 }
@@ -581,11 +591,7 @@ pub fn parse_message_reminder(v: &Value) -> (bool, String, String) {
         };
         let value = p.get("value");
         if id.eq_ignore_ascii_case(REMINDER_SET_PROP) {
-            set = match value {
-                Some(Value::Bool(b)) => *b,
-                Some(Value::Str(s)) => s.eq_ignore_ascii_case("true"),
-                _ => false,
-            };
+            set = reminder_set(value);
         } else if id.eq_ignore_ascii_case(REMINDER_TIME_PROP) {
             at = value
                 .and_then(Value::as_str)
@@ -600,6 +606,87 @@ pub fn parse_message_reminder(v: &Value) -> (bool, String, String) {
     }
     let on = set && !(at.is_empty() && signal.is_empty());
     (on, at, signal)
+}
+
+/// A [`REMINDER_SET_PROP`] value read as a boolean (#2054): on only for
+/// JSON `true` or the string `"true"` (any case); anything else, or no
+/// value, is off. Shared by [`parse_message_reminder`] and
+/// [`parse_meeting_reminder`] so both read the bit alike.
+fn reminder_set(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Str(s)) => s.eq_ignore_ascii_case("true"),
+        _ => false,
+    }
+}
+
+/// Whether a `PidTagMessageClass` names a meeting message (#2089):
+/// `IPM.Schedule.Meeting` itself, or it followed by `.` and a subclass of
+/// at least one character, ASCII case ignored and not trimmed: the rule
+/// [`MeetingMessageType::from_message_class`] applies to each of its
+/// classes. So a request, a cancellation, a response and a meeting forward
+/// notification (`IPM.Schedule.Meeting.Notification.Forward`, which has no
+/// `MeetingMessageType`) are meeting classes; `IPM.Schedule.Meeting.` and
+/// `IPM.Schedule.MeetingX` are not (though [`parse_meeting_reminder`] still
+/// calls an item a meeting message by its `@odata.type`).
+fn is_meeting_class(class: &str) -> bool {
+    const BASE: &str = "IPM.Schedule.Meeting";
+    let Some(head) = class.get(..BASE.len()) else {
+        return false;
+    };
+    let tail = &class[BASE.len()..];
+    head.eq_ignore_ascii_case(BASE)
+        && (tail.is_empty() || (tail.len() > 1 && tail.starts_with('.')))
+}
+
+/// A meeting message's own reminder (#2089), and whether the item carried
+/// it: `(carried, on)`, one pass over its `singleValueExtendedProperties`.
+/// Lenient, never an error.
+///
+/// Carried means the array holds a [`MESSAGE_CLASS_PROP`] entry, whatever
+/// its value: the rule [`parse_message_protection`] uses, for the same
+/// reason. `PidLidReminderSet` is absent on most mail, so its absence alone
+/// cannot tell "not set" from "not asked"; the class rides the same
+/// `$expand`, so an item carrying it was read with the expand. An item
+/// without it (partial, read without the expand, a refused or silently
+/// dropped expand, a plain GET with only a top-level `meetingMessageType`)
+/// is `(false, false)`, and a stored value is kept
+/// (`MessageFields::writes_meeting_reminder`).
+///
+/// On means carried, a meeting message and the set bit
+/// ([`REMINDER_SET_PROP`], read as [`parse_message_reminder`] reads it). A
+/// meeting message is an `@odata.type` starting with
+/// `#microsoft.graph.eventMessage` or a string class
+/// [`is_meeting_class`] accepts. No reminder time is needed: unlike the
+/// flag's reminder this one never fires, and the bell is the set bit.
+pub fn parse_meeting_reminder(v: &Value) -> (bool, bool) {
+    let mut carried = false;
+    let mut meeting_class = false;
+    let mut set = false;
+    let props = v
+        .get("singleValueExtendedProperties")
+        .and_then(Value::as_array)
+        .unwrap_or(&[]);
+    for p in props {
+        let Some(id) = p.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let value = p.get("value");
+        if is_message_class_prop(id) {
+            carried = true;
+            meeting_class = value.and_then(Value::as_str).is_some_and(is_meeting_class);
+        } else if id.eq_ignore_ascii_case(REMINDER_SET_PROP) {
+            set = reminder_set(value);
+        }
+    }
+    if !carried {
+        return (false, false);
+    }
+    let meeting = meeting_class
+        || v.get("@odata.type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.starts_with("#microsoft.graph.eventMessage"));
+    (true, meeting && set)
 }
 
 /// A UTC time Graph sent (an extended property's SystemTime, a followup
@@ -811,6 +898,10 @@ pub struct MessageFields {
     /// protection properties too (`parse_message_protection`'s carried
     /// flag).
     pub protection: bool,
+    /// A meeting message's own reminder (#2089): the item carried its
+    /// `PidTagMessageClass` entry (`parse_meeting_reminder`'s carried flag,
+    /// the same rule as `protection`).
+    pub meeting_reminder: bool,
 }
 
 impl MessageFields {
@@ -837,6 +928,7 @@ impl MessageFields {
             reminder_unasked: false,
             meeting_type: parse_meeting_message_type(v).0,
             protection: parse_message_protection(v).0,
+            meeting_reminder: parse_meeting_reminder(v).0,
         }
     }
 
@@ -863,6 +955,7 @@ impl MessageFields {
             reminder_unasked: false,
             meeting_type: true,
             protection: true,
+            meeting_reminder: true,
         }
     }
 
@@ -918,6 +1011,14 @@ impl MessageFields {
     /// any protection property writes the default.
     pub fn writes_protection(&self) -> bool {
         self.protection
+    }
+
+    /// Whether `meeting_reminder_on` is to be written (#2089): only when
+    /// the item carried its message class, as for the protection. An item
+    /// without it says nothing, and the stored value is kept; a carried
+    /// item that is not a meeting message, or has no set bit, writes false.
+    pub fn writes_meeting_reminder(&self) -> bool {
+        self.meeting_reminder
     }
 }
 
@@ -4231,5 +4332,231 @@ mod tests {
         assert!(unasked.writes_reminder());
         assert!(!MessageFields::of(&flagged_with(None)).reminder_unasked);
         assert!(!MessageFields::all().reminder_unasked);
+    }
+
+    /// A message as a delta round brings it (#2089): the header keys, an
+    /// optional `@odata.type`, and `props` as its extended properties
+    /// array (none when `None`).
+    fn delta_item(odata: Option<&str>, props: Option<&str>) -> Value {
+        let odata = odata
+            .map(|t| format!(r#""@odata.type":"{t}","#))
+            .unwrap_or_default();
+        let props = props
+            .map(|p| format!(r#","singleValueExtendedProperties":{p}"#))
+            .unwrap_or_default();
+        parse(&format!(
+            r#"{{{odata}"id":"M1","subject":"s","from":{{"emailAddress":{{"address":"a@x"}}}},
+                "receivedDateTime":"2026-11-01T00:00:00Z"{props}}}"#
+        ))
+        .unwrap()
+    }
+
+    fn class(c: &str) -> String {
+        prop(MESSAGE_CLASS_PROP, &format!(r#""{c}""#))
+    }
+
+    #[test]
+    fn meeting_reminder_reads_the_set_bit_of_a_meeting_message() {
+        let req = Some("#microsoft.graph.eventMessageRequest");
+        let set = |v: &str| prop(REMINDER_SET_PROP, v);
+        // Each meeting class, with the bit and no reminder time.
+        for c in [
+            "IPM.Schedule.Meeting.Request",
+            "IPM.Schedule.Meeting.Canceled",
+            "IPM.Schedule.Meeting.Resp.Pos",
+            "IPM.Schedule.Meeting.Resp.Tent",
+            "IPM.Schedule.Meeting.Resp.Neg",
+            "IPM.Schedule.Meeting.Notification.Forward",
+            "ipm.schedule.meeting.request",
+            "IPM.Schedule.Meeting",
+        ] {
+            let v = delta_item(None, Some(&format!("[{},{}]", class(c), set(r#""true""#))));
+            assert_eq!(parse_meeting_reminder(&v), (true, true), "{c}");
+            assert!(Message::from_json(&v).unwrap().meeting_reminder_on, "{c}");
+        }
+        // The bit as Graph may send it: any case, a JSON boolean, a
+        // lower-cased GUID; with the type annotation too.
+        for bit in [
+            set(r#""TRUE""#),
+            set("true"),
+            prop(&REMINDER_SET_PROP.to_ascii_lowercase(), r#""true""#),
+        ] {
+            let v = delta_item(
+                req,
+                Some(&format!(
+                    "[{},{bit}]",
+                    class("IPM.Schedule.Meeting.Request")
+                )),
+            );
+            assert_eq!(parse_meeting_reminder(&v), (true, true), "{bit}");
+        }
+        // Off: "false", false, another value, no bit at all.
+        for bits in [
+            format!(",{}", set(r#""false""#)),
+            format!(",{}", set("false")),
+            format!(",{}", set(r#""yes""#)),
+            format!(",{}", set("null")),
+            String::new(),
+        ] {
+            let v = delta_item(
+                req,
+                Some(&format!(
+                    "[{}{bits}]",
+                    class("IPM.Schedule.Meeting.Request")
+                )),
+            );
+            assert_eq!(parse_meeting_reminder(&v), (true, false), "{bits}");
+            assert!(!Message::from_json(&v).unwrap().meeting_reminder_on);
+        }
+    }
+
+    #[test]
+    fn meeting_reminder_takes_the_type_when_the_class_has_no_string() {
+        // The class entry is there (so the expand ran) but its value is not
+        // a string: the `@odata.type` says it is a meeting message.
+        let props = format!(
+            "[{},{}]",
+            prop(MESSAGE_CLASS_PROP, "null"),
+            prop(REMINDER_SET_PROP, r#""true""#)
+        );
+        for t in [
+            "#microsoft.graph.eventMessage",
+            "#microsoft.graph.eventMessageRequest",
+            "#microsoft.graph.eventMessageResponse",
+        ] {
+            let v = delta_item(Some(t), Some(&props));
+            assert_eq!(parse_meeting_reminder(&v), (true, true), "{t}");
+        }
+        // Without the type it is not a meeting message.
+        let v = delta_item(None, Some(&props));
+        assert_eq!(parse_meeting_reminder(&v), (true, false));
+        let v = delta_item(Some("#microsoft.graph.message"), Some(&props));
+        assert_eq!(parse_meeting_reminder(&v), (true, false));
+        // The type wins over a string class that is not a meeting class:
+        // the two halves are ORed.
+        for c in ["IPM.Note", "IPM.Schedule.MeetingX"] {
+            let props = format!("[{},{}]", class(c), prop(REMINDER_SET_PROP, r#""true""#));
+            let v = delta_item(Some("#microsoft.graph.eventMessageRequest"), Some(&props));
+            assert_eq!(parse_meeting_reminder(&v), (true, true), "{c}");
+            assert!(Message::from_json(&v).unwrap().meeting_reminder_on, "{c}");
+        }
+    }
+
+    #[test]
+    fn meeting_reminder_is_false_on_a_plain_message() {
+        // An unflagged IPM.Note with the bit and readable times: no meeting
+        // reminder, and no flag reminder either, as before.
+        let set = format!(
+            "{},{},{}",
+            prop(REMINDER_SET_PROP, r#""true""#),
+            prop(REMINDER_TIME_PROP, r#""2026-11-08T10:00:00Z""#),
+            prop(REMINDER_SIGNAL_TIME_PROP, r#""2026-11-08T10:00:00Z""#)
+        );
+        for c in [
+            "IPM.Note",
+            "IPM.Schedule.Meeting.",
+            "IPM.Schedule.MeetingX",
+            "IPM.Schedule.Meetin",
+            "IPM.Appointment",
+            " IPM.Schedule.Meeting.Request",
+            "",
+        ] {
+            let v = delta_item(None, Some(&format!("[{},{set}]", class(c))));
+            assert_eq!(parse_meeting_reminder(&v), (true, false), "{c:?}");
+            let m = Message::from_json(&v).unwrap();
+            assert!(!m.meeting_reminder_on, "{c:?}");
+            assert!(m.is_reminder_on, "#2054 reads the bit as before: {c:?}");
+        }
+    }
+
+    #[test]
+    fn meeting_reminder_is_carried_only_with_the_class() {
+        let bit = prop(REMINDER_SET_PROP, r#""true""#);
+        let req = Some("#microsoft.graph.eventMessageRequest");
+        // The class alone: carried, off.
+        let v = delta_item(req, Some(&format!("[{}]", class("IPM.Note"))));
+        assert_eq!(parse_meeting_reminder(&v), (true, false));
+        assert!(MessageFields::of(&v).writes_meeting_reminder());
+        // No array, an array without the class (even with the bit and a
+        // meeting type annotation), a top-level `meetingMessageType` only,
+        // a partial item, a non-array: not carried, and off.
+        let top = parse(
+            r#"{"id":"M1","subject":"s","receivedDateTime":"2026-11-01T00:00:00Z",
+                "from":{"emailAddress":{"address":"a@x"}},"meetingMessageType":"meetingRequest"}"#,
+        )
+        .unwrap();
+        for v in [
+            delta_item(req, None),
+            delta_item(req, Some(&format!("[{bit}]"))),
+            delta_item(req, Some(r#""x""#)),
+            top,
+            parse(r#"{"id":"M1","isRead":true}"#).unwrap(),
+        ] {
+            assert_eq!(parse_meeting_reminder(&v), (false, false), "{v}");
+            assert!(!MessageFields::of(&v).writes_meeting_reminder(), "{v}");
+            assert!(!Message::from_json(&v).unwrap().meeting_reminder_on);
+        }
+        // A merge of a `Message` built in code writes it.
+        assert!(MessageFields::all().writes_meeting_reminder());
+    }
+
+    #[test]
+    fn meeting_reminder_is_carried_exactly_when_the_protection_is() {
+        // Both rest on the class proving the expand ran; a change to one
+        // rule must show here.
+        let bit = prop(REMINDER_SET_PROP, r#""true""#);
+        for v in [
+            delta_item(None, None),
+            delta_item(None, Some("[]")),
+            delta_item(None, Some(&format!("[{bit}]"))),
+            delta_item(None, Some(&format!("[{}]", class("IPM.Note")))),
+            delta_item(
+                None,
+                Some(&format!("[{},{bit}]", prop("String 0x1a", "null"))),
+            ),
+            delta_item(
+                None,
+                Some(&format!("[{}]", prop("Integer 0x001A", r#""IPM.Note""#))),
+            ),
+            parse(r#"{"id":"M1","isRead":true}"#).unwrap(),
+        ] {
+            let f = MessageFields::of(&v);
+            assert_eq!(f.meeting_reminder, f.protection, "{v}");
+            assert_eq!(
+                parse_meeting_reminder(&v).0,
+                parse_message_protection(&v).0,
+                "{v}"
+            );
+        }
+    }
+
+    #[test]
+    fn meeting_reminder_leaves_the_flag_reminder_alone() {
+        // An unflagged meeting request with the bit and a time: the flag
+        // reminder reads as #2054 reads it (the parse has no flag term; the
+        // store's merge ANDs the flag), and `MessageFields` writes the
+        // reminder columns as before.
+        let props = format!(
+            "[{},{},{}]",
+            class("IPM.Schedule.Meeting.Request"),
+            prop(REMINDER_SET_PROP, r#""true""#),
+            prop(REMINDER_TIME_PROP, r#""2026-11-08T10:00:00Z""#)
+        );
+        let v = delta_item(Some("#microsoft.graph.eventMessageRequest"), Some(&props));
+        assert_eq!(
+            parse_message_reminder(&v),
+            (true, "2026-11-08T10:00:00Z".to_string(), String::new())
+        );
+        let m = Message::from_json(&v).unwrap();
+        assert!(m.meeting_reminder_on && m.is_reminder_on && !m.is_flagged);
+        assert!(MessageFields::of(&v).writes_reminder());
+        // Without any time the flag reminder is off, the meeting one on.
+        let props = format!(
+            "[{},{}]",
+            class("IPM.Schedule.Meeting.Request"),
+            prop(REMINDER_SET_PROP, r#""true""#)
+        );
+        let m = Message::from_json(&delta_item(None, Some(&props))).unwrap();
+        assert!(m.meeting_reminder_on && !m.is_reminder_on);
     }
 }
