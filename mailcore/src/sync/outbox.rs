@@ -4143,4 +4143,216 @@ mod tests {
         assert_eq!(applied, Applied::Done);
         assert_eq!(srv.requests()[0].method, "DELETE");
     }
+
+    // --- Folder writes (#1910) -------------------------------------------
+
+    fn mail_folder(id: &str, parent: Option<&str>) -> MailFolder {
+        MailFolder {
+            id: id.into(),
+            display_name: id.into(),
+            parent_id: parent.map(str::to_string),
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: None,
+        }
+    }
+
+    /// A store listing INBOX and ARCH under ROOT.
+    fn folder_store() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_folder(&mail_folder("INBOX", Some("ROOT")))
+            .unwrap();
+        store
+            .upsert_folder(&mail_folder("ARCH", Some("ROOT")))
+            .unwrap();
+        store
+    }
+
+    /// The op the store queued last.
+    fn last_op(store: &Store) -> OutboxOp {
+        store.pending_ops().unwrap().pop().unwrap().op
+    }
+
+    fn written(r: crate::store::FolderWriteResult) -> String {
+        match r {
+            crate::store::FolderWriteResult::Written(id) => id,
+            other => panic!("not written: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_folder_reconciles_the_local_id() {
+        let srv = FakeServer::start(vec![route(
+            "POST",
+            "/me/mailFolders/INBOX/childFolders",
+            201,
+            r#"{"id":"G1","displayName":"New","parentFolderId":"INBOX"}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        let local = written(store.create_local_folder(Some("INBOX"), "New").unwrap());
+        let applied = apply_op(&c, &store, &last_op(&store)).unwrap();
+        assert_eq!(
+            applied,
+            Applied::FolderCreated {
+                local_id: local.clone(),
+                id: "G1".into()
+            }
+        );
+        assert!(store.has_folder("G1").unwrap());
+        assert!(!store.has_folder(&local).unwrap());
+        assert_eq!(store.current_folder_id(&local).unwrap(), "G1");
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].body, r#"{"displayName":"New"}"#);
+    }
+
+    #[test]
+    fn create_folder_retry_after_reconcile_or_of_a_deleted_row_sends_nothing() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        let local = written(store.create_local_folder(None, "New").unwrap());
+        let op = last_op(&store);
+        store
+            .reconcile_created_folder(&local, &mail_folder("G1", Some("ROOT")))
+            .unwrap();
+        assert_eq!(apply_op(&c, &store, &op).unwrap(), Applied::Done);
+
+        let gone = written(store.create_local_folder(None, "Gone").unwrap());
+        let op = last_op(&store);
+        written(store.delete_folder(&gone).unwrap());
+        assert_eq!(apply_op(&c, &store, &op).unwrap(), Applied::Done);
+        assert_eq!(
+            apply_op(&c, &store, &last_op(&store)).unwrap(),
+            Applied::Done,
+            "its delete neither"
+        );
+        assert!(srv.requests().is_empty());
+    }
+
+    #[test]
+    fn create_folder_under_a_parent_that_never_reached_graph_is_refused() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        let parent = written(store.create_local_folder(None, "P").unwrap());
+        written(store.create_local_folder(Some(&parent), "Kid").unwrap());
+        assert!(matches!(
+            apply_op(&c, &store, &last_op(&store)),
+            Err(GraphError::Parse(_))
+        ));
+        assert!(srv.requests().is_empty());
+    }
+
+    #[test]
+    fn rename_and_move_after_a_create_reach_the_graph_id() {
+        let srv = FakeServer::start(vec![
+            route("PATCH", "/me/mailFolders/G1", 200, "{}"),
+            route(
+                "POST",
+                "/me/mailFolders/G1/move",
+                200,
+                r#"{"id":"G1","displayName":"Two","parentFolderId":"ARCH"}"#,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        let local = written(store.create_local_folder(None, "One").unwrap());
+        written(store.rename_folder(&local, "Two").unwrap());
+        let rename = last_op(&store);
+        written(store.move_folder(&local, Some("ARCH")).unwrap());
+        let mv = last_op(&store);
+        // Before the create reached Graph neither sends anything.
+        assert_eq!(apply_op(&c, &store, &rename).unwrap(), Applied::Done);
+        assert_eq!(apply_op(&c, &store, &mv).unwrap(), Applied::Done);
+        assert!(srv.requests().is_empty());
+
+        store
+            .reconcile_created_folder(&local, &mail_folder("G1", Some("ROOT")))
+            .unwrap();
+        assert_eq!(apply_op(&c, &store, &rename).unwrap(), Applied::Done);
+        assert_eq!(
+            apply_op(&c, &store, &mv).unwrap(),
+            Applied::Done,
+            "the answer matches the store"
+        );
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(reqs[0].path, "/me/mailFolders/G1");
+        assert_eq!(reqs[0].body, r#"{"displayName":"Two"}"#);
+        assert_eq!(reqs[1].path, "/me/mailFolders/G1/move");
+        assert_eq!(reqs[1].body, r#"{"destinationId":"ARCH"}"#);
+    }
+
+    #[test]
+    fn move_folder_stores_the_answer_and_refuses_a_local_dest() {
+        let srv = FakeServer::start(vec![route(
+            "POST",
+            "/me/mailFolders/ARCH/move",
+            200,
+            r#"{"id":"ARCH2","displayName":"ARCH","parentFolderId":"INBOX"}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        written(store.move_folder("ARCH", Some("INBOX")).unwrap());
+        assert_eq!(
+            apply_op(&c, &store, &last_op(&store)).unwrap(),
+            Applied::FoldersChanged
+        );
+        assert_eq!(store.current_folder_id("ARCH").unwrap(), "ARCH2");
+
+        let local = written(store.create_local_folder(None, "L").unwrap());
+        written(store.move_folder("INBOX", Some(&local)).unwrap());
+        assert!(matches!(
+            apply_op(&c, &store, &last_op(&store)),
+            Err(GraphError::Parse(_))
+        ));
+        assert_eq!(srv.requests().len(), 1);
+    }
+
+    #[test]
+    fn delete_folder_404_is_success() {
+        let srv = FakeServer::start(vec![route("DELETE", "/me/mailFolders/ARCH", 404, "{}")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        written(store.delete_folder("ARCH").unwrap());
+        assert_eq!(
+            apply_op(&c, &store, &last_op(&store)).unwrap(),
+            Applied::Done
+        );
+        assert_eq!(srv.requests()[0].method, "DELETE");
+    }
+
+    #[test]
+    fn message_move_into_a_created_folder_sends_its_graph_id() {
+        let srv = FakeServer::start(vec![route(
+            "POST",
+            "/me/messages/M1/move",
+            201,
+            r#"{"id":"M1b"}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        let local = written(store.create_local_folder(None, "L").unwrap());
+        let mv = OutboxOp::Move {
+            id: "M1".into(),
+            dest: local.clone(),
+        };
+        // Its create never reached Graph: nothing is sent.
+        assert_eq!(apply_op(&c, &store, &mv).unwrap(), Applied::Done);
+        assert!(srv.requests().is_empty());
+        store
+            .reconcile_created_folder(&local, &mail_folder("G1", Some("ROOT")))
+            .unwrap();
+        assert_eq!(
+            apply_op(&c, &store, &mv).unwrap(),
+            Applied::Moved {
+                old_id: "M1".into(),
+                new_id: "M1b".into()
+            }
+        );
+        assert_eq!(srv.requests()[0].body, r#"{"destinationId":"G1"}"#);
+    }
 }
