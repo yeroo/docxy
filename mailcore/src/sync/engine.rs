@@ -767,12 +767,17 @@ pub enum SyncEvent {
     ///   into it (a draft) is filed back in Drafts, or the drafts sentinel,
     ///   with [`SyncEvent::MessagesUpdated`] for that folder before this
     ///   event; other mail moved into it comes back by a mail reconverge;
-    /// - a rename or move puts the previous name or parent back. When a
-    ///   delete of the folder's old parent (or a folder above it) is still
-    ///   queued, that delete is refused too, first (`status: None`): on
-    ///   Graph the folder never left that parent and would go with it;
+    /// - a rename or move puts the previous name or parent back;
     /// - a delete puts the folder rows back (their messages come back with
     ///   the next pass).
+    ///
+    /// A move (message or folder) that leaves the outbox without reaching
+    /// Graph (refused, quarantined, sending nothing, or dropped with a
+    /// folder) also refuses every folder delete queued after it, with
+    /// `status: None` and "a move queued before it did not reach the
+    /// server", before its own failure: on Graph what it moved is still in
+    /// the folder it left, and would go with it. A delete is not sent while
+    /// a move queued before it is still queued.
     ///
     /// Each `FolderWriteFailed` is followed by its [`SyncEvent::Error`],
     /// `"{create|rename|move|delete} folder {id}: {error}"`; after Graph's
@@ -2208,11 +2213,15 @@ impl Engine {
             }
             SyncCommand::DeleteFolder { id } => {
                 let r = match self.store.delete_folder(&id) {
-                    Ok((r, dropped_mail)) => {
+                    Ok((r, effects)) => {
                         // A `local:` folder it removed held mail moved there
                         // locally, which Graph still has where it was.
-                        if dropped_mail {
+                        if effects.dropped_mail {
                             self.start_mail_reconverge();
+                        }
+                        // Moves it dropped never reach Graph (R2).
+                        if let Some(first) = effects.dropped_moves.first() {
+                            self.refuse_deletes_queued_after(*first, effects.queued_from);
                         }
                         Ok(r)
                     }
@@ -3762,6 +3771,14 @@ impl Engine {
             if !self.store.has_op(row.seq).unwrap_or(true) {
                 continue;
             }
+            // R1 (#1910): a folder delete waits for every move queued before
+            // it. On Graph a folder or message moved out of the deleted one
+            // is still there until its move lands; a move that never lands
+            // refuses this delete (R2, `refuse_deletes_queued_after`).
+            if matches!(row.op, OutboxOp::DeleteFolder { .. }) && self.moves_queued_before(row.seq)
+            {
+                continue;
+            }
             match self.apply_op_with_retry(&row) {
                 Ok(applied) => {
                     self.store.drop_op(row.seq);
@@ -3779,6 +3796,11 @@ impl Engine {
                         Applied::FoldersChanged => {
                             self.follow_folder_rekeys();
                             self.emit(SyncEvent::FoldersUpdated);
+                        }
+                        Applied::MoveNotSent => {
+                            if self.refuse_deletes_queued_after(row.seq, None) {
+                                self.emit(SyncEvent::FoldersUpdated);
+                            }
                         }
                         Applied::Done => {}
                     }
@@ -3899,6 +3921,12 @@ impl Engine {
                     let attempts_after = row.attempts + 1;
                     if attempts_after >= MAX_OP_ATTEMPTS {
                         self.store.drop_op(row.seq);
+                        // A quarantined message move never landed (R2).
+                        if matches!(row.op, OutboxOp::Move { .. })
+                            && self.refuse_deletes_queued_after(row.seq, None)
+                        {
+                            self.emit(SyncEvent::FoldersUpdated);
+                        }
                         // Reconverge with server truth: the op's optimistic
                         // local write (e.g. a Delete that hid a message Graph
                         // still has) would otherwise linger, and an unchanged
@@ -4027,9 +4055,9 @@ impl Engine {
     /// drafts sentinel), with `MessagesUpdated` for that folder, and when
     /// other mail had been moved into it, the mail reconverges as after a
     /// quarantine (every delta link cleared), so it comes back in the
-    /// folder Graph has it in. A refused move first refuses a queued delete
-    /// of the folder's old parent, or of a folder above it
-    /// (`refuse_deletes_above`).
+    /// folder Graph has it in. A refused move, and a refused create's moves
+    /// into its folder, first refuse every folder delete queued after them
+    /// (`refuse_deletes_queued_after`, R2).
     fn refuse_folder_write(&mut self, row: &OutboxRow, err: &GraphError) {
         let Some((write, queued_id)) = folder_op(&row.op) else {
             return;
@@ -4044,6 +4072,10 @@ impl Engine {
                 let discard = self.store.discard_local_folder(&id).unwrap_or_default();
                 if discard.had_mail {
                     self.start_mail_reconverge();
+                }
+                // The moves into it it dropped never reach Graph (R2).
+                if let Some(first) = discard.dropped_moves.first() {
+                    self.refuse_deletes_queued_after(*first, None);
                 }
                 // Drafts moved into it are filed back in Drafts.
                 if let Some(folder_id) = discard.refiled_into {
@@ -4060,9 +4092,8 @@ impl Engine {
                 prev_parent,
                 ..
             } => {
-                if let Some(prev) = prev_parent {
-                    self.refuse_deletes_above(prev);
-                }
+                // The move never landed (R2).
+                self.refuse_deletes_queued_after(row.seq, None);
                 let _ =
                     self.store
                         .revert_folder_parent(&id, prev_parent.as_deref(), parent.as_deref());
@@ -4094,73 +4125,59 @@ impl Engine {
         self.emit(SyncEvent::Error(line));
     }
 
-    /// A move of a folder out of `folder` was refused (#1910): on Graph the
-    /// folder is still under `folder`. A queued delete of `folder`, or of a
-    /// folder above it (in the store, or in a queued delete's snapshot),
-    /// would delete it there with its mail, although the user moved it out
-    /// first. Each such delete is refused here, before it is sent: dropped,
-    /// its rows put back (`restore_folders`, as Graph's refusal of a delete
-    /// does), and reported with no status. The user may delete again.
-    fn refuse_deletes_above(&mut self, folder: &str) {
+    /// Whether a message `Move` or a `MoveFolder` queued before `seq` is
+    /// still queued (#1910, R1).
+    fn moves_queued_before(&self, seq: i64) -> bool {
+        self.store.pending_ops().is_ok_and(|ops| {
+            ops.iter().any(|r| {
+                r.seq < seq && matches!(r.op, OutboxOp::Move { .. } | OutboxOp::MoveFolder { .. })
+            })
+        })
+    }
+
+    /// R2 (#1910): a move (message or folder) left the outbox without
+    /// reaching Graph (refused, quarantined, sent nothing, or dropped by the
+    /// store), so whatever it moved out of a folder is still in that folder
+    /// on Graph. The move does not know its source folder, so every folder
+    /// delete queued after it (`seq` above `after`, and below `before`: a
+    /// delete the dropping call queued itself is its own) is refused here
+    /// before it is sent: dropped, its rows put back (`restore_folders`, as
+    /// Graph's refusal of a delete does), and reported with no status.
+    /// Conservative: an unrelated delete is refused too, and the user
+    /// deletes again; the alternative is mail deleted on Graph. A delete of
+    /// a `local:` folder sends nothing and its snapshot is empty, so it is
+    /// left. Whether any delete was refused (the caller sends the one
+    /// `FoldersUpdated`).
+    fn refuse_deletes_queued_after(&mut self, after: i64, before: Option<i64>) -> bool {
         let Ok(ops) = self.store.pending_ops() else {
-            return;
+            return false;
         };
-        let resolve = |store: &Store, id: &str| {
-            store
-                .current_folder_id(id)
-                .unwrap_or_else(|_| id.to_string())
-        };
-        let mut parents: HashMap<String, Option<String>> = self
-            .store
-            .folders()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|f| (f.id, f.parent_id))
-            .collect();
-        let mut deletes: Vec<(OutboxRow, String, HashSet<String>)> = Vec::new();
+        let mut refused = false;
         for row in ops {
+            if row.seq <= after || before.is_some_and(|b| row.seq >= b) {
+                continue;
+            }
             let OutboxOp::DeleteFolder { id, removed } = &row.op else {
                 continue;
             };
-            let id = resolve(&self.store, id);
-            let mut covered: HashSet<String> = HashSet::from([id.clone()]);
-            for f in removed {
-                let fid = resolve(&self.store, &f.id);
-                parents.insert(fid.clone(), f.parent_id.clone());
-                covered.insert(fid);
-            }
-            deletes.push((row, id, covered));
-        }
-        if deletes.is_empty() {
-            return;
-        }
-        let mut hit: Vec<usize> = Vec::new();
-        let mut at = Some(resolve(&self.store, folder));
-        for _ in 0..=parents.len() {
-            let Some(cur) = at else {
-                break;
-            };
-            for (i, (_, _, covered)) in deletes.iter().enumerate() {
-                if covered.contains(&cur) && !hit.contains(&i) {
-                    hit.push(i);
-                }
-            }
-            at = parents.get(&cur).cloned().flatten();
-        }
-        for i in hit {
-            let (row, id, _) = &deletes[i];
-            let OutboxOp::DeleteFolder { removed, .. } = &row.op else {
+            let id = self
+                .store
+                .current_folder_id(id)
+                .unwrap_or_else(|_| id.clone());
+            if id.starts_with("local:") {
                 continue;
-            };
+            }
             self.store.drop_op(row.seq);
             let _ = self.store.restore_folders(removed);
             self.report_folder_failure(
-                id,
+                &id,
                 FolderWrite::Delete,
                 None,
-                "a folder moved out of it could not be moved".to_string(),
+                "a move queued before it did not reach the server".to_string(),
             );
+            refused = true;
         }
+        refused
     }
 
     /// Brings messages a `local:` folder took with it back where Graph has
@@ -27953,7 +27970,7 @@ mod tests {
                         id: "PROJ".into(),
                         write: FolderWrite::Delete,
                         status: None,
-                        error: "a folder moved out of it could not be moved".into(),
+                        error: "a move queued before it did not reach the server".into(),
                     },
                     SyncEvent::FolderWriteFailed {
                         id: "SUB".into(),
@@ -28035,6 +28052,191 @@ mod tests {
                 Some("ROOT"),
                 "back under the parent Graph has it under"
             );
+            stop(handle, dir);
+        }
+
+        /// The `FolderWriteFailed` events in `seen`, as (id, write, status).
+        fn failures(seen: &[SyncEvent]) -> Vec<(String, FolderWrite, Option<u16>)> {
+            seen.iter()
+                .filter_map(|e| match e {
+                    SyncEvent::FolderWriteFailed {
+                        id, write, status, ..
+                    } => Some((id.clone(), *write, *status)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn a_folder_moved_through_a_deleted_local_folder_keeps_its_old_parents_delete_back() {
+            // SUB (with mail) is under PROJ. It is moved under L (created
+            // here, its create deferred), then on to ARCH; L is deleted, then
+            // PROJ. Graph refuses SUB→ARCH: SUB is still under PROJ there.
+            let child = "/me/mailFolders/INBOX/childFolders";
+            let (srv, handle, store, dir) = engine(
+                "folder-move-through-local",
+                world(
+                    vec![
+                        once("POST", child, 500, "busy"),
+                        write("POST", "/me/mailFolders/SUB/move", 404, "{}"),
+                        write("DELETE", "/me/mailFolders/PROJ", 204, ""),
+                    ],
+                    TREE,
+                    &[("SUB", "S1")],
+                ),
+                None,
+            );
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some("INBOX".into()),
+                    name: "L".into(),
+                },
+            );
+            wait_requests(&srv, "POST", child, 1);
+            let local = local_folders(&store).pop().unwrap();
+            for dest in [local.as_str(), "ARCH"] {
+                send(
+                    &handle,
+                    SyncCommand::MoveFolder {
+                        id: "SUB".into(),
+                        dest: Some(dest.into()),
+                    },
+                );
+            }
+            send(&handle, SyncCommand::DeleteFolder { id: local });
+            send(&handle, SyncCommand::DeleteFolder { id: "PROJ".into() });
+            // The create, SUB→ARCH, L's delete, PROJ's (SUB→L was dropped).
+            wait_queued(&store, 4);
+
+            send(&handle, SyncCommand::Refresh);
+            let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+            wait_drained(&store);
+            assert_eq!(hits(&srv, "DELETE", "/me/mailFolders/PROJ"), 0, "{seen:?}");
+            assert_eq!(
+                failures(&seen),
+                [
+                    ("PROJ".to_string(), FolderWrite::Delete, None),
+                    ("SUB".to_string(), FolderWrite::Move, Some(404)),
+                ]
+            );
+            assert_eq!(
+                row(&store, "PROJ").unwrap().parent_id.as_deref(),
+                Some("INBOX")
+            );
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn a_refused_create_keeps_the_delete_of_the_folder_its_moved_mail_left() {
+            // A1 is moved out of ARCH into L (created here, its create
+            // deferred), then ARCH is deleted; Graph refuses L's create, so
+            // A1 never left ARCH there.
+            let child = "/me/mailFolders/INBOX/childFolders";
+            let (srv, handle, store, dir) = engine(
+                "folder-refused-create-keeps-delete",
+                world(
+                    vec![
+                        once("POST", child, 500, "busy"),
+                        write("POST", child, 409, EXISTS),
+                        write("DELETE", "/me/mailFolders/ARCH", 204, ""),
+                    ],
+                    TREE,
+                    &[("ARCH", "A1")],
+                ),
+                None,
+            );
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some("INBOX".into()),
+                    name: "L".into(),
+                },
+            );
+            wait_requests(&srv, "POST", child, 1);
+            let local = local_folders(&store).pop().unwrap();
+            send(
+                &handle,
+                SyncCommand::Move {
+                    id: "A1".into(),
+                    dest: local,
+                },
+            );
+            send(&handle, SyncCommand::DeleteFolder { id: "ARCH".into() });
+            wait_queued(&store, 3);
+
+            send(&handle, SyncCommand::Refresh);
+            let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+            wait_drained(&store);
+            assert_eq!(hits(&srv, "DELETE", "/me/mailFolders/ARCH"), 0, "{seen:?}");
+            let got = failures(&seen);
+            assert_eq!(got.len(), 2, "{got:?}");
+            assert_eq!(got[0], ("ARCH".to_string(), FolderWrite::Delete, None));
+            assert_eq!((got[1].1, got[1].2), (FolderWrite::Create, Some(409)));
+            assert!(row(&store, "ARCH").is_some());
+            // The reconverge brings A1 back in ARCH, where Graph has it.
+            send(&handle, SyncCommand::Refresh);
+            assert!(wait_until(ENGINE_WAIT, || mail_in(&store, "ARCH") == ["A1"]));
+            stop(handle, dir);
+        }
+
+        #[test]
+        fn a_delete_waits_for_a_message_move_out_of_it_and_a_quarantine_refuses_it() {
+            // A1 is moved out of ARCH to OTHER, which Graph answers 404 every
+            // time (bumped, kept); ARCH is deleted meanwhile.
+            let (srv, handle, store, dir) = engine(
+                "folder-delete-waits-for-move",
+                world(
+                    vec![
+                        write("POST", "/me/messages/A1/move", 404, "{}"),
+                        write("DELETE", "/me/mailFolders/ARCH", 204, ""),
+                    ],
+                    TREE,
+                    &[("ARCH", "A1")],
+                ),
+                None,
+            );
+            send(
+                &handle,
+                SyncCommand::Move {
+                    id: "A1".into(),
+                    dest: "OTHER".into(),
+                },
+            );
+            wait_requests(&srv, "POST", "/me/messages/A1/move", 1);
+            send(&handle, SyncCommand::DeleteFolder { id: "ARCH".into() });
+            wait_requests(&srv, "POST", "/me/messages/A1/move", 2);
+            wait_queued(&store, 2);
+            assert_eq!(hits(&srv, "DELETE", "/me/mailFolders/ARCH"), 0, "R1");
+
+            // Each Refresh tries the move again, until its quarantine.
+            let mut seen = Vec::new();
+            for _ in 0..MAX_OP_ATTEMPTS {
+                send(&handle, SyncCommand::Refresh);
+                seen.extend(wait_for(&handle.evt_rx, |e| {
+                    matches!(e, SyncEvent::ContactsUpdated)
+                }));
+                if !failures(&seen).is_empty() {
+                    break;
+                }
+                assert_eq!(hits(&srv, "DELETE", "/me/mailFolders/ARCH"), 0, "R1");
+            }
+            assert_eq!(
+                failures(&seen),
+                [("ARCH".to_string(), FolderWrite::Delete, None)],
+                "R2 after the quarantine: {seen:?}"
+            );
+            assert!(
+                seen.iter()
+                    .any(|e| matches!(e, SyncEvent::Error(m) if m.contains("quarantined")))
+            );
+            wait_drained(&store);
+            assert_eq!(hits(&srv, "DELETE", "/me/mailFolders/ARCH"), 0);
+            assert_eq!(
+                hits(&srv, "POST", "/me/messages/A1/move"),
+                MAX_OP_ATTEMPTS as usize
+            );
+            assert!(row(&store, "ARCH").is_some());
             stop(handle, dir);
         }
 

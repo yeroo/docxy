@@ -54,6 +54,11 @@ pub enum Applied {
     /// A `MoveFolder`'s answer changed the stored folder (its parent, or a
     /// new id, #1910): the caller emits `FoldersUpdated`.
     FoldersChanged,
+    /// A message `Move` or a `MoveFolder` sent nothing (#1910): its folder,
+    /// or its dest, never reached Graph. The op is done, but the move never
+    /// happened there: the caller refuses the folder deletes queued after
+    /// it.
+    MoveNotSent,
 }
 
 /// The id the message `id` names is stored under now (#1884, #1896).
@@ -81,7 +86,7 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Ap
             // Graph has it; this is the guard for a move it missed.
             let dest = store.current_folder_id(dest).map_err(store_err)?;
             if dest.starts_with("local:") {
-                return Ok(Applied::Done);
+                return Ok(Applied::MoveNotSent);
             }
             let new_id = client.move_message(&old_id, &dest)?;
             Ok(Applied::Moved { old_id, new_id })
@@ -187,7 +192,7 @@ fn move_folder(
 ) -> Result<Applied, GraphError> {
     let target = store.current_folder_id(id).map_err(store_err)?;
     if target.starts_with("local:") {
-        return Ok(Applied::Done);
+        return Ok(Applied::MoveNotSent);
     }
     let dest = dest
         .map(|d| store.current_folder_id(d).map_err(store_err))
@@ -4273,9 +4278,10 @@ mod tests {
         let rename = last_op(&store);
         written(store.move_folder(&local, Some("ARCH")).unwrap());
         let mv = last_op(&store);
-        // Before the create reached Graph neither sends anything.
+        // Before the create reached Graph neither sends anything; the move
+        // says so (the engine refuses the deletes queued after it).
         assert_eq!(apply_op(&c, &store, &rename).unwrap(), Applied::Done);
-        assert_eq!(apply_op(&c, &store, &mv).unwrap(), Applied::Done);
+        assert_eq!(apply_op(&c, &store, &mv).unwrap(), Applied::MoveNotSent);
         assert!(srv.requests().is_empty());
 
         store
@@ -4350,7 +4356,7 @@ mod tests {
             dest: local.clone(),
         };
         // Its create never reached Graph: nothing is sent.
-        assert_eq!(apply_op(&c, &store, &mv).unwrap(), Applied::Done);
+        assert_eq!(apply_op(&c, &store, &mv).unwrap(), Applied::MoveNotSent);
         assert!(srv.requests().is_empty());
         store
             .reconcile_created_folder(&local, &mail_folder("G1", Some("ROOT")))
