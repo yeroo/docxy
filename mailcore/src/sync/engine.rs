@@ -28566,6 +28566,19 @@ mod tests {
                 routes
             }
 
+            /// Waits until every `(folder, parent)` is stored so: a listing
+            /// upserts its folders one statement at a time, so one row back
+            /// says nothing of the next (r3).
+            fn listed_back(store: &Store, want: &[(&str, &str)]) {
+                assert!(
+                    wait_until(ENGINE_WAIT, || want.iter().all(|(id, parent)| {
+                        row(store, id).is_some_and(|f| f.parent_id.as_deref() == Some(*parent))
+                    })),
+                    "{:?}",
+                    store.folders().unwrap()
+                );
+            }
+
             fn deletes(srv: &FakeServer, path: &str) -> usize {
                 hits(srv, "DELETE", path)
             }
@@ -28684,12 +28697,8 @@ mod tests {
                     (id.as_str(), write, status),
                     ("PROJ", FolderWrite::Delete, Some(403))
                 );
-                assert!(wait_until(ENGINE_WAIT, || row(&store, "SUB")
-                    .is_some_and(|f| f.parent_id.as_deref() == Some("PROJ"))));
-                assert_eq!(
-                    row(&store, "PROJ").unwrap().parent_id.as_deref(),
-                    Some("INBOX")
-                );
+                // The listing writes one row at a time: wait for both.
+                listed_back(&store, &[("PROJ", "INBOX"), ("SUB", "PROJ")]);
                 assert!(store.pending_ops().unwrap().is_empty());
                 assert_eq!(deletes(&srv, DELETE_PROJ), 1);
                 stop(handle, dir);
@@ -28860,11 +28869,9 @@ mod tests {
                         error: "it holds 1 item(s) the store shows elsewhere or removed".into(),
                     })
                 );
-                assert!(wait_until(ENGINE_WAIT, || row(&store, "PROJ").is_some()));
-                assert_eq!(
-                    row(&store, "SUB").unwrap().parent_id.as_deref(),
-                    Some("PROJ")
-                );
+                // The listing writes one row at a time: wait for both
+                // (r3: PROJ can be back before SUB is re-parented).
+                listed_back(&store, &[("PROJ", "INBOX"), ("SUB", "PROJ")]);
                 assert_eq!(deletes(&srv, DELETE_PROJ), 0);
                 stop(handle, dir);
             }
@@ -29143,12 +29150,8 @@ mod tests {
                 barrier(&handle);
                 send(&handle, SyncCommand::Refresh);
                 wait_requests(&srv, "DELETE", "/me/mailFolders/ARCH", 1);
-                assert!(wait_until(ENGINE_WAIT, || row(&store, "SUB")
-                    .is_some_and(|f| f.parent_id.as_deref() == Some("PROJ"))));
-                assert_eq!(
-                    row(&store, "PROJ").unwrap().parent_id.as_deref(),
-                    Some("INBOX")
-                );
+                // The listing writes one row at a time: wait for both.
+                listed_back(&store, &[("PROJ", "INBOX"), ("SUB", "PROJ")]);
                 barrier(&handle);
                 assert!(row(&store, "ARCH").is_none(), "ARCH's delete still waits");
                 let queued: Vec<OutboxOp> = store
