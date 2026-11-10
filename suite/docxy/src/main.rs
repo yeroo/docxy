@@ -29641,13 +29641,17 @@ impl Docxy {
             return;
         }
         // Ctrl+F toggles the find bar; while it's open, all keys go to it.
-        if ctrl && key == "f" {
+        // Not on an extension's tab (#1887): the bar is a document tab's and
+        // is not drawn there, so it never opens or takes the keys the
+        // extension's view passes on; its own view has its own Find.
+        let ext = self.active_is_ext();
+        if ctrl && key == "f" && !ext {
             return self.toggle_find(window, cx);
         }
         if self.comment_open {
             return self.comment_key(ev, ctrl, m.alt, key.as_str(), window, cx);
         }
-        if self.find_open {
+        if self.find_open && !ext {
             return self.find_key(ev, shift, ctrl, m.alt, key.as_str(), window, cx);
         }
         // Ctrl+Alt+V: Paste Special… (#753), not the Ctrl+V below.

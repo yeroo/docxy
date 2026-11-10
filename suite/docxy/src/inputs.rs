@@ -17,7 +17,10 @@
 //! `uiharness/cases/project-inputs-typing.uit`; Task > Information... is the
 //! catalogued Task Information dialog (#1368). So is the Help tab's search
 //! box (#1855), typed into by `uiharness/cases/help-docs.uit` with the
-//! fixture manual installed. The terminal editors' prompts (#1204)
+//! fixture manual installed. So is the embedded document view's Find box
+//! on an extension's tab (#1887), typed into by
+//! `uiharness/cases/ext-doc-view.uit` on the test extension's Mail tab. The
+//! terminal editors' prompts (#1204)
 //! are listed too, one id per field: docxy, xlsxy and yppxy are other
 //! programs, so the suite's verbs only name the case that types into each,
 //! `uiharness/cases/terminal-<app>-inputs-typing.uit`, which runs the editor
@@ -43,6 +46,8 @@ pub(crate) enum Surface {
     Terminal,
     /// The Help tab (#1855).
     Help,
+    /// An extension's tab: the embedded document view (#1887).
+    Ext,
 }
 
 impl Surface {
@@ -54,6 +59,7 @@ impl Surface {
             Self::Backstage => "Backstage",
             Self::Terminal => "terminal",
             Self::Help => "Help tab",
+            Self::Ext => "extension tab",
         }
     }
 }
@@ -82,6 +88,8 @@ pub(crate) struct Input {
 
 /// The Help tab's search box (#1855).
 const HELP: u32 = 1855;
+/// The embedded document view's Find box (#1887).
+const EXT: u32 = 1887;
 const SHEET: u32 = 1200;
 const DOC: u32 = 1201;
 const BACKSTAGE: u32 = 1202;
@@ -232,6 +240,12 @@ static REGISTRY: &[Input] = &[
         HELP,
     ),
     input(
+        "ext-doc-find",
+        "the embedded document view's Find box",
+        Surface::Ext,
+        EXT,
+    ),
+    input(
         "project-cell",
         "the Project grid's inline cell editor",
         Surface::Project,
@@ -341,7 +355,7 @@ fn doc_probe(id: &str) -> Option<&'static str> {
 /// says why the harness cannot reach it (the OS's file dialog); a Project
 /// input goes to [`press_project`]. A terminal editor's input names the case
 /// that types into it.
-pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
+pub(crate) fn press(app: &crate::Docxy, id: &str, cx: &gpui::App) -> Result<Press, String> {
     let i = find(id)?;
     if let Some(why) = unreachable(i) {
         return Err(why);
@@ -353,6 +367,7 @@ pub(crate) fn press(app: &crate::Docxy, id: &str) -> Result<Press, String> {
         Surface::Terminal => return Err(terminal_case(i)),
         Surface::Backstage => return press_info(app, i),
         Surface::Help => return press_help(app, i),
+        Surface::Ext => return press_ext(app, i, cx),
     }
     let v = crate::harness::sheet(app)?;
     let Some(probe) = sheet_probe(id) else {
@@ -488,6 +503,48 @@ fn help_search_json(id: &str, v: &crate::help_view::HelpView) -> Json {
     )
 }
 
+/// The embedded document view's Find box (#1887) on the test extension's
+/// tab, pressed where its field is drawn: the box is open (Ctrl+F).
+fn press_ext(app: &crate::Docxy, i: &Input, cx: &gpui::App) -> Result<Press, String> {
+    let fixture = crate::harness::ext_fixture_view(app)?;
+    let view = fixture.read(cx).doc.read(cx);
+    let b = view
+        .find_region("field")
+        .map_err(|e| format!("{} is not drawn: {e}", i.name))?;
+    Ok(Press {
+        at: b.center(),
+        double: false,
+    })
+}
+
+/// `field-read {"input":"ext-doc-find"}`: the query, its caret while the
+/// box's field has the keys, and a whole-query selection.
+fn read_ext(app: &crate::Docxy, i: &Input, cx: &gpui::App) -> Result<Json, String> {
+    let fixture = crate::harness::ext_fixture_view(app)?;
+    let view = fixture.read(cx).doc.read(cx);
+    Ok(ext_find_json(i.id, view.find_state()))
+}
+
+fn ext_find_json(id: &str, f: &crate::doc_view::FindState) -> Json {
+    let len = f.query.chars().count();
+    let focused = f.open && f.field_focused;
+    field_json(
+        id,
+        Json::Str(f.query.clone()),
+        focused,
+        if focused {
+            Json::Num(f.caret.min(len) as f64)
+        } else {
+            Json::Null
+        },
+        if f.sel && len > 0 {
+            Json::Arr(vec![Json::Num(0.0), Json::Num(len as f64)])
+        } else {
+            Json::Null
+        },
+    )
+}
+
 /// A document input, pressed where it is drawn.
 fn press_doc(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
     crate::harness::active_doc(app)?;
@@ -529,7 +586,7 @@ fn press_doc(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
 /// Name Box keeps a caret and a whole-field selection like them (#1343), and
 /// so do the Font and Font Size boxes (#1344), which read the active cell's
 /// font and size while unfocused.
-pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
+pub(crate) fn read(app: &crate::Docxy, id: &str, cx: &gpui::App) -> Result<Json, String> {
     let i = find(id)?;
     if let Some(why) = unreachable(i) {
         return Err(why);
@@ -541,6 +598,7 @@ pub(crate) fn read(app: &crate::Docxy, id: &str) -> Result<Json, String> {
         Surface::Terminal => return Err(terminal_case(i)),
         Surface::Backstage => return read_info(app, i),
         Surface::Help => return read_help(app, i),
+        Surface::Ext => return read_ext(app, i, cx),
     }
     let v = crate::harness::sheet(app)?;
     let num = |n: usize| Json::Num(n as f64);
@@ -876,8 +934,8 @@ mod tests {
         assert_eq!(ids.len(), registry().len(), "an input id repeats");
         for i in registry() {
             assert!(
-                (SHEET..=TERMINAL).contains(&i.covered_by) || i.covered_by == HELP,
-                "{} is covered by #{}, not one of #1200-#1204 or #1855",
+                (SHEET..=TERMINAL).contains(&i.covered_by) || [HELP, EXT].contains(&i.covered_by),
+                "{} is covered by #{}, not one of #1200-#1204, #1855 or #1887",
                 i.id,
                 i.covered_by
             );
@@ -890,6 +948,7 @@ mod tests {
                 Surface::Project => PROJECT,
                 Surface::Terminal => TERMINAL,
                 Surface::Help => HELP,
+                Surface::Ext => EXT,
             };
             assert_eq!(i.covered_by, want, "{}: its surface's slice", i.id);
         }
@@ -1080,6 +1139,59 @@ mod tests {
             j.get("selection"),
             Some(&Json::Arr(vec![Json::Num(0.0), Json::Num(4.0)]))
         );
+    }
+
+    /// #1887: the embedded view's Find box is typed into with real keys by
+    /// ext-doc-view.uit, after a real click, and read back.
+    #[test]
+    fn the_embedded_views_find_box_is_typed_into_by_its_case() {
+        let case = include_str!("../../../uiharness/cases/ext-doc-view.uit");
+        let ext: Vec<&Input> = registry()
+            .iter()
+            .filter(|i| i.surface == Surface::Ext)
+            .collect();
+        assert_eq!(ext.len(), 1);
+        for i in ext {
+            let click = format!("pointer-click {{\"input\":\"{}\"}}", i.id);
+            let read = format!("field-read {{\"input\":\"{}\"}}", i.id);
+            let at = case
+                .find(&click)
+                .unwrap_or_else(|| panic!("{}: never clicked", i.id));
+            let typed = case[at..]
+                .find("real-type ")
+                .unwrap_or_else(|| panic!("{}: never typed into", i.id));
+            assert!(case[at + typed..].contains(&read), "{}: never read", i.id);
+        }
+    }
+
+    #[test]
+    fn the_embedded_views_find_box_reads_its_query_caret_and_selection() {
+        use crate::field_edit::Op;
+        let mut f = crate::doc_view::FindState::default();
+        let j = ext_find_json("ext-doc-find", &f);
+        assert_eq!(j.get_str("value"), Some(""));
+        assert_eq!(j.get("focused"), Some(&Json::Bool(false)));
+        assert_eq!(j.get("caret"), Some(&Json::Null));
+        f.open = true;
+        f.focus_at_end();
+        f.edit(Op::Insert("Line 7"));
+        f.edit(Op::Left);
+        let j = ext_find_json("ext-doc-find", &f);
+        assert_eq!(j.get_str("value"), Some("Line 7"));
+        assert_eq!(j.get("focused"), Some(&Json::Bool(true)));
+        assert_eq!(j.get_usize("caret"), Some(5));
+        assert_eq!(j.get("selection"), Some(&Json::Null));
+        f.focus_select_all();
+        let j = ext_find_json("ext-doc-find", &f);
+        assert_eq!(
+            j.get("selection"),
+            Some(&Json::Arr(vec![Json::Num(0.0), Json::Num(6.0)]))
+        );
+        // A press in the document gave the keys back: no caret.
+        f.field_focused = false;
+        let j = ext_find_json("ext-doc-find", &f);
+        assert_eq!(j.get("focused"), Some(&Json::Bool(false)));
+        assert_eq!(j.get("caret"), Some(&Json::Null));
     }
 
     /// #1204: every terminal editor's input is typed into by its case, and

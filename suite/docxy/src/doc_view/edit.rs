@@ -264,6 +264,26 @@ fn printable(key_char: Option<&str>) -> Option<&str> {
     key_char.filter(|c| c.chars().next().is_some_and(|ch| !ch.is_control()))
 }
 
+/// The text a key types, if it types any: AltGr (Ctrl+Alt off macOS) and,
+/// on macOS, ⌥ make characters; a plain Alt elsewhere is never text, nor is
+/// a Ctrl (⌘) chord. Enter, Escape, Backspace and Delete are never text,
+/// whatever their `key_char`. The editing map and the Find box (#1887) both
+/// type by it.
+pub(crate) fn typed_text(ks: &Keystroke, macos: bool) -> Option<&str> {
+    let m = ks.modifiers;
+    let ctrl = m.control || m.platform;
+    let altgr = !macos && m.control && m.alt && !m.platform;
+    printable(ks.key_char.as_deref())
+        .filter(|_| {
+            if macos {
+                !m.platform && !m.control
+            } else {
+                altgr || (!ctrl && !m.alt)
+            }
+        })
+        .filter(|_| !matches!(ks.key.as_str(), "enter" | "escape" | "backspace" | "delete"))
+}
+
 /// A key on an editable view, whose package is `pkg`: the document tab's
 /// editing map. `macos` picks the Mac's ⌘/⌥ navigation (#1073).
 pub(crate) fn edit_key(
@@ -289,21 +309,9 @@ pub(crate) fn edit_key(
             mac_nav::run(ed, shift, nav);
         });
     }
-    // AltGr (Ctrl+Alt off macOS) and, on macOS, ⌥ make characters: typed.
-    // A plain Alt elsewhere is never text.
-    let altgr = !macos && m.control && m.alt && !m.platform;
-    let typed = printable(ks.key_char.as_deref()).filter(|_| {
-        if macos {
-            !m.platform && !m.control
-        } else {
-            altgr || (!ctrl && !m.alt)
-        }
-    });
-    if let Some(text) = typed {
-        if key != "enter" && key != "escape" && key != "backspace" && key != "delete" {
-            let text = text.to_string();
-            return edit(ed, |ed| ed.insert_str(&text));
-        }
+    if let Some(text) = typed_text(ks, macos) {
+        let text = text.to_string();
+        return edit(ed, |ed| ed.insert_str(&text));
     }
     if m.alt && !macos {
         return KeyOutcome::Ignored;
