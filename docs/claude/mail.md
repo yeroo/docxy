@@ -665,6 +665,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   ignored, trimmed, otherwise verbatim); mailcore never parses it, and label
   names or parents from the Information Protection API are the caller's.
   Mail stored before #2015 reads `None` until its body is fetched again.
+  Since #2088 every synced row also carries whether it has an enabled label
+  and its name, read from the same metadata as an extended property (see "A
+  message's protection on its row (#2088)"); this header is unchanged.
 - `SyncEngine::fetch_and_store_body` (FetchBody and the engine's own fetches)
   stores them with `Store::put_fetched_body_with_headers`: body and headers in
   one transaction, the message's earlier headers replaced. `put_fetched_body`
@@ -2288,7 +2291,7 @@ Outlook's "Follow Up › Add Reminder" on a message: read, stored, snoozed and d
   `message_reminder_with_an_offset_time_is_unreadable`,
   `flag_due_date_time_is_normalised_utc`, `flag_due_in_a_named_zone_is_empty`,
   `message_fields_reminder_written_only_when_carried_or_complete`; `client.rs`
-  `message_expand_names_the_reminder_and_class_properties`, the delta / `get_message_hit`
+  `message_expand_names_the_reminder_class_and_protection_properties` (#2088's name), the delta / `get_message_hit`
   URL tests, `get_message_expands_the_reminder`, `delta_link_is_sent_as_it_is`,
   `delta_head_retries_without_expand_on_400`,
   `delta_full_retries_without_expand_on_400_only`,
@@ -2636,13 +2639,98 @@ message's `MeetingMessageType` (#2024's enum) is stored on its row.
   `message_class_prop_id_matches_its_forms_only`,
   `message_reads_meeting_type_from_class_and_top_level`,
   `writes_meeting_type_only_when_carried`; `client.rs`
-  `message_expand_names_the_reminder_and_class_properties`,
+  `message_expand_names_the_reminder_class_and_protection_properties` (#2088's name),
   `delta_page_reads_each_message_class_as_its_meeting_type`,
   `search_messages_reads_the_meeting_type_of_each_hit`,
   `search_messages_retries_without_expand_on_400`; `store` `meeting_message_type_tests`
   (every read path, `draft`'s body, the merge rule, the migration, a pre-#2054 store
-  running both migrations in order (`a_store_from_before_2054_runs_both_migrations_in_order`:
+  running every migration in order (`a_store_from_before_2054_runs_every_migration_in_order`,
+  renamed in #2088, which adds a third:
   `migrate_meeting_message_type` resets the marks `migrate_message_reminders` adds, so
   the order in `Store::init` matters), `set_meeting_message_type` through a move); `engine.rs` `meeting_message_types::` (a delta page of each type and a
   plain message, a later round without the class keeping it, `FetchMeetingMessage`
   writing an old row and its events, an answer without a type keeping the row).
+
+## A message's protection on its row (#2088)
+
+A host's message list shows classic Outlook's lock, a label or a sensitivity cue on a
+protected message without opening it: each `MessageRow` (every read: `message_row`,
+`message_rows`, `messages_in_folder`, `conversations_in_folder`, `search`, `draft`,
+`due_message_reminders`) and each `Message` carries a `model::MessageProtection`.
+
+- Sources (checked on learn.microsoft.com, 2026-11-10). Graph v1.0 `message` has no
+  sensitivity or label property, so all three are `singleValueExtendedProperties`:
+  - `PidTagSensitivity`, tag `0x0036`, PT_LONG: 0 normal, 1 personal, 2 private,
+    3 confidential (MS-OXCMSG 2.2.1.13). `model::SENSITIVITY_PROP` (`Integer 0x0036`),
+    read into `Sensitivity` by `from_mapi` (anything else is `Normal`).
+  - The `msip_labels` header as a PS_INTERNET_HEADERS named property
+    (`MSIP_LABELS_PROP`, `String {00020386-0000-0000-C000-000000000046} Name
+    msip_labels`), the header #2015 stores with a body.
+  - `PidNameContentClass` (`CONTENT_CLASS_PROP`, PS_INTERNET_HEADERS, name
+    `Content-Class`): MS-OXORMMS 2.2.2.1 says a rights-managed message's is
+    `rpmsg.message`. That is `is_rights_protected` (trimmed, ASCII case ignored).
+  - The message-delta page (v1.0, updated 2026-06-19) says delta supports `$select`,
+    `$top` and `$expand` for messages, which #2054 could not find; the 400 fallback stays.
+- Request: three more `or id eq` terms in `client::MESSAGE_EXPAND`, so they ride every
+  request that already sends it (a delta's first call, `get_message`, `get_message_hit`,
+  a search's first request) and every link Graph mints from them. No new request. One
+  expand: a 400 on any term (the PS_INTERNET_HEADERS named ids in a `$filter` are the
+  least proven) sends the call again without all of them, so that walk also reads no
+  reminder or class (`reminder_unasked`; nothing is blanked).
+- The label (`model::parse_msip_labels`, lenient): `;`-separated `key=value` pairs, each
+  key `MSIP_Label_<guid>_<field>` split at its last `_` (a GUID has none); one pair of
+  surrounding `"` is stripped from a value. The label is the first GUID, in order of
+  appearance, whose `Enabled` is `true` (keys, field, value and GUID compared ignoring
+  ASCII case); its name is that GUID's `Name`. A message can carry a sender tenant's
+  label beside ours, and the tenant is not known here, so the first enabled one wins.
+  `has_label` with `label_name == ""` means labelled, but the metadata names none (newer
+  clients may leave `_Name` out). No enabled GUID, or a non-string value, is no label.
+- Written only when the class came: `parse_message_protection`'s carried flag (and
+  `MessageFields::protection`, `writes_protection`) is "the array holds a
+  `MESSAGE_CLASS_PROP` entry". The three properties are absent on most mail, so their
+  absence alone cannot tell "none" from "not asked"; every message has a class (#2081)
+  and it rides the same expand, so an item carrying it was read with the expand, and an
+  absent property then means none (a carried plain message clears a stored protection).
+  An item without the class (partial, read without the expand, a silently dropped
+  expand, a plain GET with only a top-level `meetingMessageType`) is not carried, and the
+  stored values are kept. #2054's "complete item" rule was rejected for the reason #2081
+  rejected it: it would blank every row on a silently dropped expand. A composed draft
+  (`upsert_message`, `MessageFields::all()`) writes the default; the next delta corrects
+  it.
+- Store: `messages.sensitivity` (INTEGER, `Sensitivity::as_mapi`; an odd stored value
+  reads `Normal`), `has_sensitivity_label`, `sensitivity_label_name` (TEXT, `''`) and
+  `is_rights_protected`, all NOT NULL with defaults. They are the last four of
+  `MESSAGE_ROW_COLUMNS` (`BODY_AFTER_ROW_COLUMNS` 28) and of `conversations_in_folder`'s
+  two spelled lists. `merge_message`'s one statement writes all four on
+  `writes_protection`.
+- Migration: `migrate_message_protection`, after `migrate_meeting_message_type` in
+  `Store::init` (and after `migrate_message_reminders`, whose marks it resets), probes
+  for `sensitivity` in one IMMEDIATE transaction, adds the four columns (old rows read
+  unprotected) and resets every folder's delta and backfill state and both
+  expand-refused marks, as #2081's does and for the same reason: a link minted before
+  #2088 carries the old expand (class, no protection terms), and new mail through it
+  would be written unprotected. The cost is one more re-enumeration; a pre-#2081 store
+  runs both resets on one open.
+- Known limit: a store that already has the columns but holds a link minted under the
+  older expand (an older binary syncing a store a newer one migrated, or two hosts on
+  one `mail.db` built from different commits) gets carried classes without the
+  protection terms, so its new and changed rows read unprotected until the next full
+  resync. No per-link expand version is kept.
+- Not done: any host UI (a lock icon, a label banner), setting a sensitivity or a label
+  on send, filling the row from the #2015 header on a body fetch, label names or colours
+  from the Information Protection API (or whether a label encrypts), S/MIME
+  (`IPM.Note.SMIME*`).
+- Tests: `model.rs` `sensitivity_from_mapi_reads_the_four_values_and_defaults_the_rest`,
+  `msip_labels_reads_the_enabled_label_and_its_name`,
+  `message_protection_reads_the_three_properties`,
+  `message_protection_is_carried_only_with_the_class`,
+  `protection_terms_leave_the_reminder_rule_alone`,
+  `sensitivity_prop_id_matches_its_forms_only`; `client.rs`
+  `message_expand_names_the_reminder_class_and_protection_properties` (renamed from
+  `…_reminder_and_class_properties`), `delta_page_reads_each_message_protection`;
+  `store` `message_protection_tests` (every read path, `draft`'s body after the shifted
+  columns, an odd stored sensitivity, the merge rule, the migration and its idempotence),
+  `a_store_from_before_2054_runs_every_migration_in_order`, `upsert_writes_every_column`;
+  `engine.rs` `message_protection::` (a delta of a label, Sensitivity confidential, an
+  IRM message and a plain message each over a stored protection, and a later round
+  without the class keeping it).

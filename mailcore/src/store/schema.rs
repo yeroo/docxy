@@ -83,7 +83,16 @@ CREATE TABLE IF NOT EXISTS messages (
     -- The meeting message type (#2081): Graph's `meetingMessageType` name
     -- (`MeetingMessageType::as_graph`), NULL for any other message. An old
     -- file gets it, and its delta links reset, in `Store::init`.
-    meeting_message_type TEXT
+    meeting_message_type TEXT,
+    -- The message's protection (#2088): `PidTagSensitivity` (0 normal,
+    -- 1 personal, 2 private, 3 confidential), whether it carries an enabled
+    -- Purview sensitivity label and that label's name ('' when unnamed or
+    -- none), and whether it is rights-protected (IRM). An old file gets
+    -- them, and its delta links reset, in `Store::init`.
+    sensitivity            INTEGER NOT NULL DEFAULT 0,
+    has_sensitivity_label  INTEGER NOT NULL DEFAULT 0,
+    sensitivity_label_name TEXT NOT NULL DEFAULT '',
+    is_rights_protected    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received

@@ -259,12 +259,19 @@ pub struct Message {
     /// [`parse_meeting_message_type`]. Lenient: an absent, unknown or
     /// `none` value is `None`.
     pub meeting_message_type: Option<MeetingMessageType>,
+    /// The message's protection (#2088): its Sensitivity, its Microsoft
+    /// Purview sensitivity label and whether it is rights-protected, read
+    /// from its `singleValueExtendedProperties` (the delta's `$expand`
+    /// brings them): see [`parse_message_protection`]. Lenient: absent or
+    /// unreadable values are the default, unprotected.
+    pub protection: MessageProtection,
 }
 
 impl Message {
     pub fn from_json(v: &Value) -> Option<Self> {
         let (is_reminder_on, reminder_at, reminder_signal_at) = parse_message_reminder(v);
         let (_, meeting_message_type) = parse_meeting_message_type(v);
+        let (_, protection) = parse_message_protection(v);
         Some(Message {
             id: str_field(v, "id"),
             conversation_id: str_field(v, "conversationId"),
@@ -294,6 +301,7 @@ impl Message {
             reminder_signal_at,
             flag_due_at: parse_flag_due(v),
             meeting_message_type,
+            protection,
         })
     }
 }
@@ -309,10 +317,21 @@ pub const MESSAGE_CLASS_PROP: &str = "String 0x001A";
 /// (`String 0x1a`) matches too. Another type (`Integer 0x001A`) or tag
 /// does not.
 pub fn is_message_class_prop(id: &str) -> bool {
+    is_tag_prop(id, "String", 0x1A)
+}
+
+/// Whether `id` names the tagged (not named) extended property of type
+/// `type_word` and property tag `tag`: `type_word` (ASCII case ignored),
+/// one space, `0x` or `0X` and hex digits whose value is `tag`, so a short
+/// or long form (`0x1a`, `0x001A`) matches and another type does not
+/// (#2081, #2088).
+fn is_tag_prop(id: &str, type_word: &str, tag: u32) -> bool {
+    let n = type_word.len();
     let Some(rest) = id
-        .get(..7)
-        .filter(|p| p.eq_ignore_ascii_case("String "))
-        .and_then(|_| id.get(7..))
+        .get(..n)
+        .filter(|p| p.eq_ignore_ascii_case(type_word))
+        .and_then(|_| id.get(n..))
+        .and_then(|r| r.strip_prefix(' '))
     else {
         return false;
     };
@@ -321,7 +340,184 @@ pub fn is_message_class_prop(id: &str) -> bool {
     };
     !hex.is_empty()
         && hex.bytes().all(|b| b.is_ascii_hexdigit())
-        && u32::from_str_radix(hex, 16) == Ok(0x1A)
+        && u32::from_str_radix(hex, 16) == Ok(tag)
+}
+
+/// `PidTagSensitivity` (property tag `0x0036`, PT_LONG) as a Graph extended
+/// property id (#2088): the message's Sensitivity, 0 normal, 1 personal,
+/// 2 private, 3 confidential (MS-OXCMSG 2.2.1.13).
+pub const SENSITIVITY_PROP: &str = "Integer 0x0036";
+
+/// The `msip_labels` internet header as a PS_INTERNET_HEADERS named
+/// property (#2088): the message's Microsoft Purview sensitivity label
+/// metadata (`MSIP_Label_<guid>_Enabled=true; …_Name=…; …`), the header
+/// #2015 stores with a fetched body.
+pub const MSIP_LABELS_PROP: &str = "String {00020386-0000-0000-C000-000000000046} Name msip_labels";
+
+/// `PidNameContentClass` (PS_INTERNET_HEADERS, name `Content-Class`,
+/// PT_UNICODE) as a Graph extended property id (#2088): `rpmsg.message` on
+/// a rights-managed (IRM) message (MS-OXORMMS 2.2.2.1).
+pub const CONTENT_CLASS_PROP: &str =
+    "String {00020386-0000-0000-C000-000000000046} Name Content-Class";
+
+/// A message's Sensitivity (`PidTagSensitivity`, #2088). An absent or
+/// unknown value is `Normal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sensitivity {
+    #[default]
+    Normal,
+    Personal,
+    Private,
+    Confidential,
+}
+
+impl Sensitivity {
+    /// MAPI's value: 0 normal, 1 personal, 2 private, 3 confidential;
+    /// anything else is `Normal`, never an error.
+    pub fn from_mapi(n: i64) -> Sensitivity {
+        match n {
+            1 => Sensitivity::Personal,
+            2 => Sensitivity::Private,
+            3 => Sensitivity::Confidential,
+            _ => Sensitivity::Normal,
+        }
+    }
+
+    /// MAPI's value, as [`Sensitivity::from_mapi`] reads it back: what the
+    /// store keeps in `messages.sensitivity`.
+    pub fn as_mapi(self) -> i64 {
+        match self {
+            Sensitivity::Normal => 0,
+            Sensitivity::Personal => 1,
+            Sensitivity::Private => 2,
+            Sensitivity::Confidential => 3,
+        }
+    }
+}
+
+/// What a message list needs to show a protected message without opening
+/// it (#2088). The default is an unprotected message.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MessageProtection {
+    /// `PidTagSensitivity`.
+    pub sensitivity: Sensitivity,
+    /// The message carries an enabled Microsoft Purview sensitivity label
+    /// (its `msip_labels` metadata names one with `Enabled=true`).
+    pub has_label: bool,
+    /// That label's name (`MSIP_Label_<guid>_Name`). `""` with `has_label`
+    /// means labelled, but the metadata does not name it (newer clients may
+    /// leave `_Name` out); `""` without it means no label.
+    pub label_name: String,
+    /// The message is rights-protected (IRM): its `Content-Class` is
+    /// `rpmsg.message`.
+    pub is_rights_protected: bool,
+}
+
+/// The enabled sensitivity label in an `msip_labels` value (#2088), and
+/// its name (`""` when the metadata names none): `None` when no label is
+/// enabled. The value is `;`-separated `key=value` pairs, each key
+/// `MSIP_Label_<guid>_<field>`; the GUID holds no `_`, so a key splits at
+/// its last `_`. Keys, the `Enabled` field's `true` and GUIDs compare
+/// ignoring ASCII case; a value may be wrapped in one pair of `"`. The
+/// first GUID (in order of appearance) enabled wins: a message can carry a
+/// sender tenant's label besides ours, and the tenant is not known here.
+/// Lenient: anything unreadable is skipped.
+pub(crate) fn parse_msip_labels(value: &str) -> Option<String> {
+    let mut fields: Vec<(&str, &str, &str)> = Vec::new();
+    for part in value.split(';') {
+        let Some((key, val)) = part.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let val = val.trim();
+        let val = val
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(val);
+        const PREFIX: &str = "MSIP_Label_";
+        let Some(rest) = key
+            .get(..PREFIX.len())
+            .filter(|p| p.eq_ignore_ascii_case(PREFIX))
+            .and_then(|_| key.get(PREFIX.len()..))
+        else {
+            continue;
+        };
+        let Some((guid, field)) = rest.rsplit_once('_') else {
+            continue;
+        };
+        if guid.is_empty() {
+            continue;
+        }
+        fields.push((guid, field, val));
+    }
+    let (guid, _, _) = fields.iter().find(|(_, field, val)| {
+        field.eq_ignore_ascii_case("Enabled") && val.eq_ignore_ascii_case("true")
+    })?;
+    let name = fields
+        .iter()
+        .find(|(g, field, _)| g.eq_ignore_ascii_case(guid) && field.eq_ignore_ascii_case("Name"))
+        .map(|(_, _, val)| (*val).to_string())
+        .unwrap_or_default();
+    Some(name)
+}
+
+/// A message's protection (#2088), and whether the item carried it: one
+/// pass over its `singleValueExtendedProperties`. Lenient, never an error.
+///
+/// Carried means the array holds a [`MESSAGE_CLASS_PROP`] entry. The three
+/// properties read here are each absent on most mail, so their absence
+/// alone cannot tell "none" from "not asked"; every message has a class
+/// (#2081), and the class rides the same `$expand`, so an item carrying it
+/// was read with the expand, and an absent Sensitivity, label or content
+/// class then means none. An item without the class (partial, read without
+/// the expand, a silently dropped expand) is `(false, default)`, and a
+/// stored protection is kept (`MessageFields::writes_protection`).
+///
+/// - Sensitivity ([`SENSITIVITY_PROP`]): a JSON integer or a string holding
+///   one ([`Sensitivity::from_mapi`]); anything else is `Normal`.
+/// - Label ([`MSIP_LABELS_PROP`]): [`parse_msip_labels`] of a string value.
+/// - IRM ([`CONTENT_CLASS_PROP`]): the value trimmed is `rpmsg.message`,
+///   ASCII case ignored.
+///
+/// Named ids compare ASCII-case-insensitively (Graph may lower-case the
+/// GUID, and PS_INTERNET_HEADERS names are header names); the tag id
+/// matches its short form too (`Integer 0x36`).
+pub fn parse_message_protection(v: &Value) -> (bool, MessageProtection) {
+    let mut carried = false;
+    let mut p = MessageProtection::default();
+    let props = v
+        .get("singleValueExtendedProperties")
+        .and_then(Value::as_array)
+        .unwrap_or(&[]);
+    for prop in props {
+        let Some(id) = prop.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let value = prop.get("value");
+        if is_message_class_prop(id) {
+            carried = true;
+        } else if is_tag_prop(id, "Integer", 0x36) {
+            let n = match value {
+                Some(Value::Num(n)) if n.fract() == 0.0 => Some(*n as i64),
+                Some(Value::Str(s)) => s.trim().parse::<i64>().ok(),
+                _ => None,
+            };
+            p.sensitivity = n.map(Sensitivity::from_mapi).unwrap_or_default();
+        } else if id.eq_ignore_ascii_case(MSIP_LABELS_PROP) {
+            let label = value.and_then(Value::as_str).and_then(parse_msip_labels);
+            p.has_label = label.is_some();
+            p.label_name = label.unwrap_or_default();
+        } else if id.eq_ignore_ascii_case(CONTENT_CLASS_PROP) {
+            p.is_rights_protected = value
+                .and_then(Value::as_str)
+                .is_some_and(|c| c.trim().eq_ignore_ascii_case("rpmsg.message"));
+        }
+    }
+    if carried {
+        (true, p)
+    } else {
+        (false, MessageProtection::default())
+    }
 }
 
 /// A message's meeting message type (#2081), and whether the item carried
@@ -610,6 +806,11 @@ pub struct MessageFields {
     /// string or a `PidTagMessageClass` entry with a string value
     /// (`parse_meeting_message_type`'s carried flag).
     pub meeting_type: bool,
+    /// The protection (#2088): the item carried its `PidTagMessageClass`
+    /// entry, so it was read with the `$expand` that asks for the
+    /// protection properties too (`parse_message_protection`'s carried
+    /// flag).
+    pub protection: bool,
 }
 
 impl MessageFields {
@@ -635,6 +836,7 @@ impl MessageFields {
             reminder: has("singleValueExtendedProperties"),
             reminder_unasked: false,
             meeting_type: parse_meeting_message_type(v).0,
+            protection: parse_message_protection(v).0,
         }
     }
 
@@ -660,6 +862,7 @@ impl MessageFields {
             reminder: true,
             reminder_unasked: false,
             meeting_type: true,
+            protection: true,
         }
     }
 
@@ -706,6 +909,15 @@ impl MessageFields {
     /// kept. A carried `IPM.Note` writes `None`.
     pub fn writes_meeting_type(&self) -> bool {
         self.meeting_type
+    }
+
+    /// Whether the protection columns are to be written (#2088): only when
+    /// the item carried its message class, which proves the `$expand` ran
+    /// on it (see `parse_message_protection`). An item without it says
+    /// nothing, and the stored protection is kept; a carried item without
+    /// any protection property writes the default.
+    pub fn writes_protection(&self) -> bool {
+        self.protection
     }
 }
 
@@ -2407,6 +2619,250 @@ mod tests {
         assert!(!fields(&odd).writes_meeting_type());
         // A merge of a `Message` built in code writes it.
         assert!(MessageFields::all().writes_meeting_type());
+    }
+
+    #[test]
+    fn sensitivity_from_mapi_reads_the_four_values_and_defaults_the_rest() {
+        use Sensitivity as S;
+        for (n, s) in [
+            (0, S::Normal),
+            (1, S::Personal),
+            (2, S::Private),
+            (3, S::Confidential),
+        ] {
+            assert_eq!(S::from_mapi(n), s);
+            assert_eq!(s.as_mapi(), n);
+        }
+        for n in [-1, 4, 9, i64::MAX, i64::MIN] {
+            assert_eq!(S::from_mapi(n), S::Normal, "{n}");
+        }
+        assert_eq!(S::default(), S::Normal);
+    }
+
+    #[test]
+    fn msip_labels_reads_the_enabled_label_and_its_name() {
+        const G1: &str = "f42aa342-8706-4288-bd11-ebb85995028c";
+        const G2: &str = "1b2c3d4e-0000-0000-0000-000000000002";
+        // Enabled, with its name and the other fields Purview writes.
+        let full = format!(
+            "MSIP_Label_{G1}_Enabled=true; MSIP_Label_{G1}_SetDate=2026-11-10T00:00:00Z; \
+             MSIP_Label_{G1}_Method=Standard; MSIP_Label_{G1}_Name=Confidential; \
+             MSIP_Label_{G1}_SiteId=72f988bf-0000-0000-0000-000000000000; \
+             MSIP_Label_{G1}_ActionId=0; MSIP_Label_{G1}_ContentBits=0"
+        );
+        assert_eq!(parse_msip_labels(&full).as_deref(), Some("Confidential"));
+        // Enabled without a name: labelled, unnamed.
+        assert_eq!(
+            parse_msip_labels(&format!("MSIP_Label_{G1}_Enabled=true")).as_deref(),
+            Some("")
+        );
+        // Not enabled: no label, whatever its name.
+        assert_eq!(
+            parse_msip_labels(&format!(
+                "MSIP_Label_{G1}_Enabled=False;MSIP_Label_{G1}_Name=Secret"
+            )),
+            None
+        );
+        // Two labels, the first disabled: the second's name.
+        let two = format!(
+            "MSIP_Label_{G1}_Enabled=false; MSIP_Label_{G1}_Name=Old; \
+             MSIP_Label_{G2}_Name=General; MSIP_Label_{G2}_Enabled=true"
+        );
+        assert_eq!(parse_msip_labels(&two).as_deref(), Some("General"));
+        // Two enabled: the first wins.
+        let both = format!(
+            "MSIP_Label_{G2}_Enabled=true; MSIP_Label_{G2}_Name=Theirs; \
+             MSIP_Label_{G1}_Enabled=true; MSIP_Label_{G1}_Name=Ours"
+        );
+        assert_eq!(parse_msip_labels(&both).as_deref(), Some("Theirs"));
+        // Case of key, field, `True` and GUID; spaces; quoted values.
+        let odd = format!(
+            "  msip_label_{G1}_ENABLED = \"True\" ;MSIP_LABEL_{}_name=\"Highly Confidential\"; ",
+            G1.to_ascii_uppercase()
+        );
+        assert_eq!(
+            parse_msip_labels(&odd).as_deref(),
+            Some("Highly Confidential")
+        );
+        // Garbage, empty, a key without a GUID: no label.
+        for v in [
+            "",
+            ";;;",
+            "garbage",
+            "Enabled=true",
+            "MSIP_Label__Enabled=true",
+            "MSIP_Label_Enabled=true",
+            "MSIP_Labelx_Enabled=true",
+        ] {
+            assert_eq!(parse_msip_labels(v), None, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn message_protection_reads_the_three_properties() {
+        let with = |props: &str| {
+            parse_message_protection(
+                &parse(&format!(
+                    r#"{{"id":"M1","singleValueExtendedProperties":[
+                        {{"id":"String 0x001A","value":"IPM.Note"}}{props}]}}"#
+                ))
+                .unwrap(),
+            )
+        };
+        // Sensitivity as a string (Graph's way) or a JSON number, by its
+        // long or short id.
+        for props in [
+            r#",{"id":"Integer 0x0036","value":"3"}"#,
+            r#",{"id":"integer 0x36","value":" 3 "}"#,
+            r#",{"id":"Integer 0x36","value":3}"#,
+        ] {
+            let (carried, p) = with(props);
+            assert!(carried);
+            assert_eq!(p.sensitivity, Sensitivity::Confidential, "{props}");
+        }
+        for props in [
+            r#",{"id":"Integer 0x0036","value":"x"}"#,
+            r#",{"id":"Integer 0x0036","value":2.5}"#,
+            r#",{"id":"Integer 0x0036","value":true}"#,
+            r#",{"id":"String 0x0036","value":"3"}"#,
+        ] {
+            assert_eq!(with(props).1.sensitivity, Sensitivity::Normal, "{props}");
+        }
+        assert_eq!(
+            with(r#",{"id":"Integer 0x0036","value":"2"}"#)
+                .1
+                .sensitivity,
+            Sensitivity::Private
+        );
+        // The label, by the id Graph may echo with a lower-cased GUID.
+        let (_, p) = with(
+            r#",{"id":"string {00020386-0000-0000-c000-000000000046} name MSIP_LABELS",
+                 "value":"MSIP_Label_a_Enabled=true;MSIP_Label_a_Name=General"}"#,
+        );
+        assert!(p.has_label);
+        assert_eq!(p.label_name, "General");
+        assert_eq!(
+            with(&format!(
+                r#",{{"id":"{MSIP_LABELS_PROP}","value":"MSIP_Label_a_Enabled=false"}}"#
+            ))
+            .1,
+            MessageProtection::default()
+        );
+        assert_eq!(
+            with(&format!(r#",{{"id":"{MSIP_LABELS_PROP}","value":7}}"#)).1,
+            MessageProtection::default()
+        );
+        // IRM, the content class in any case; another class is not.
+        for value in ["rpmsg.message", " RPMSG.Message "] {
+            let (_, p) = with(&format!(
+                r#",{{"id":"{CONTENT_CLASS_PROP}","value":"{value}"}}"#
+            ));
+            assert!(p.is_rights_protected, "{value:?}");
+        }
+        for value in ["urn:content-classes:message", "rpmsg.message.x", ""] {
+            let (_, p) = with(&format!(
+                r#",{{"id":"{CONTENT_CLASS_PROP}","value":"{value}"}}"#
+            ));
+            assert!(!p.is_rights_protected, "{value:?}");
+        }
+        // All three at once, and `Message::from_json` reads the same.
+        let all = format!(
+            r#"{{"id":"M1","singleValueExtendedProperties":[
+                {{"id":"{SENSITIVITY_PROP}","value":"1"}},
+                {{"id":"{MSIP_LABELS_PROP}","value":"MSIP_Label_a_Enabled=true"}},
+                {{"id":"{CONTENT_CLASS_PROP}","value":"rpmsg.message"}},
+                {{"id":"{MESSAGE_CLASS_PROP}","value":"IPM.Note"}}]}}"#
+        );
+        let want = MessageProtection {
+            sensitivity: Sensitivity::Personal,
+            has_label: true,
+            label_name: String::new(),
+            is_rights_protected: true,
+        };
+        let v = parse(&all).unwrap();
+        assert_eq!(parse_message_protection(&v), (true, want.clone()));
+        assert_eq!(Message::from_json(&v).unwrap().protection, want);
+    }
+
+    #[test]
+    fn message_protection_is_carried_only_with_the_class() {
+        let carried = |json: &str| parse_message_protection(&parse(json).unwrap());
+        let complete = r#""subject":"s","from":{"emailAddress":{"address":"a@x"}},
+            "receivedDateTime":"2026-11-10T00:00:00Z""#;
+        // The class alone: carried, unprotected.
+        let plain = format!(
+            r#"{{"id":"M1",{complete},"singleValueExtendedProperties":[
+                {{"id":"String 0x1a","value":"IPM.Note"}}]}}"#
+        );
+        assert_eq!(carried(&plain), (true, MessageProtection::default()));
+        assert!(MessageFields::of(&parse(&plain).unwrap()).writes_protection());
+        // No array, an array without the class (even with a label), a
+        // top-level `meetingMessageType` only, a partial item: not carried,
+        // and the protection read is the default.
+        for json in [
+            format!(r#"{{"id":"M1",{complete}}}"#),
+            format!(
+                r#"{{"id":"M1",{complete},"singleValueExtendedProperties":[
+                    {{"id":"{MSIP_LABELS_PROP}","value":"MSIP_Label_a_Enabled=true"}},
+                    {{"id":"{SENSITIVITY_PROP}","value":"3"}}]}}"#
+            ),
+            format!(r#"{{"id":"M1",{complete},"meetingMessageType":"meetingRequest"}}"#),
+            r#"{"id":"M1","isRead":true}"#.to_string(),
+            r#"{"id":"M1","singleValueExtendedProperties":"x"}"#.to_string(),
+        ] {
+            assert_eq!(
+                carried(&json),
+                (false, MessageProtection::default()),
+                "{json}"
+            );
+            assert!(
+                !MessageFields::of(&parse(&json).unwrap()).writes_protection(),
+                "{json}"
+            );
+        }
+        // A merge of a `Message` built in code writes it.
+        assert!(MessageFields::all().writes_protection());
+    }
+
+    #[test]
+    fn protection_terms_leave_the_reminder_rule_alone() {
+        // A complete item whose array carries only the class and a label
+        // (no reminder property) still writes "no reminder" (#2054's rule:
+        // the array is there, so the expand ran).
+        let v = parse(&format!(
+            r#"{{"id":"M1","subject":"s","from":{{"emailAddress":{{"address":"a@x"}}}},
+                "receivedDateTime":"2026-11-10T00:00:00Z","singleValueExtendedProperties":[
+                {{"id":"String 0x001A","value":"IPM.Note"}},
+                {{"id":"{MSIP_LABELS_PROP}","value":"MSIP_Label_a_Enabled=true"}}]}}"#
+        ))
+        .unwrap();
+        let f = MessageFields::of(&v);
+        assert!(f.writes_reminder() && f.writes_protection());
+        let m = Message::from_json(&v).unwrap();
+        assert!(!m.is_reminder_on);
+        assert_eq!(
+            (m.reminder_at.as_str(), m.reminder_signal_at.as_str()),
+            ("", "")
+        );
+        assert!(m.protection.has_label);
+    }
+
+    #[test]
+    fn sensitivity_prop_id_matches_its_forms_only() {
+        for id in [SENSITIVITY_PROP, "Integer 0x36", "integer 0X0036"] {
+            assert!(is_tag_prop(id, "Integer", 0x36), "{id:?}");
+        }
+        for id in [
+            "String 0x0036",
+            "Integer 0x0037",
+            "Integer  0x36",
+            "Integer0x36",
+            "Integer 36",
+            "Integer 0x36 ",
+            "",
+        ] {
+            assert!(!is_tag_prop(id, "Integer", 0x36), "{id:?}");
+        }
     }
 
     #[test]

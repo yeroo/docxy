@@ -6481,6 +6481,7 @@ mod tests {
                             is_draft: false,
                             is_meeting_request: false,
                             meeting_message_type: None,
+                            protection: Default::default(),
                             categories: vec![],
                             is_reminder_on: false,
                             reminder_at: String::new(),
@@ -19840,6 +19841,7 @@ mod tests {
                 is_draft: true,
                 is_meeting_request: false,
                 meeting_message_type: None,
+                protection: Default::default(),
                 categories: Vec::new(),
                 is_reminder_on: false,
                 reminder_at: String::new(),
@@ -20500,6 +20502,208 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- Each message's protection on its row (#2088) ---------------------
+
+    mod message_protection {
+        use super::*;
+        use crate::graph::model::{
+            CONTENT_CLASS_PROP, MSIP_LABELS_PROP, MessageProtection, SENSITIVITY_PROP, Sensitivity,
+        };
+
+        /// `message_json` with its message class and `props` (`(id,
+        /// value)`), as the expand brings them.
+        fn protected_json(id: &str, read: bool, props: &[(&str, &str)]) -> String {
+            let plain = message_json(id, read, false, &[]);
+            let mut entries = vec![r#"{"id":"String 0x1a","value":"IPM.Note"}"#.to_string()];
+            entries.extend(
+                props
+                    .iter()
+                    .map(|(id, v)| format!(r#"{{"id":"{id}","value":"{v}"}}"#)),
+            );
+            format!(
+                r#"{},"singleValueExtendedProperties":[{}]}}"#,
+                plain.strip_suffix('}').unwrap(),
+                entries.join(",")
+            )
+        }
+
+        fn protection_of(store: &Store, id: &str) -> Option<(bool, MessageProtection)> {
+            store
+                .message_row(id)
+                .unwrap()
+                .map(|r| (r.is_read, r.protection))
+        }
+
+        /// A stored protection none of the cases has, so each case's write
+        /// shows.
+        fn stored_before() -> MessageProtection {
+            MessageProtection {
+                sensitivity: Sensitivity::Personal,
+                has_label: true,
+                label_name: "Old".into(),
+                is_rights_protected: false,
+            }
+        }
+
+        /// `M1` in `F1`, unread, stored with `stored_before`.
+        fn seed_m1(s: &Store) {
+            s.upsert_folder(&crate::graph::model::MailFolder {
+                id: "F1".into(),
+                display_name: "Inbox".into(),
+                parent_id: None,
+                total_count: 1,
+                unread_count: 1,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+            let v = crate::json::parse(&message_json("M1", false, false, &[])).unwrap();
+            let mut m = Message::from_json(&v).unwrap();
+            m.protection = stored_before();
+            s.upsert_message("F1", &m).unwrap();
+        }
+
+        /// The startup delta brings `M1` (read now) with its class and
+        /// `props`; the store's row (`message_row`, and `message_rows` and
+        /// the folder's rows) reads `want`.
+        fn delta_stores(tag: &str, props: &[(&str, &str)], want: MessageProtection) {
+            let startup = [protected_json("M1", true, props)];
+            let mut routes = vec![calendar_route()];
+            routes.extend(deltas("F1", &startup, &[]));
+            routes.extend(startup_then(
+                "/me/mailFolders?",
+                &list(&[tree_folder("F1", "Inbox", None, (1, 0), 0)]),
+                &list(&[tree_folder("F1", "Inbox", None, (1, 0), 0)]),
+            ));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) = spawn_fast(&srv, tag, TICK, None, seed_m1);
+            let store = Store::open(&store_path).unwrap();
+            assert!(
+                wait_until(TICK_WAIT, || protection_of(&store, "M1")
+                    .is_some_and(|(read, _)| read)),
+                "{:?}",
+                protection_of(&store, "M1")
+            );
+            assert_eq!(protection_of(&store, "M1"), Some((true, want.clone())));
+            let rows = store.message_rows(&["M1"]).unwrap();
+            assert_eq!(rows[0].protection, want);
+            let rows = store.messages_in_folder("F1", 10, 0).unwrap();
+            assert_eq!(rows[0].protection, want);
+            // The first call asked for the protection properties.
+            let first = srv
+                .requests()
+                .into_iter()
+                .find(|r| r.path.starts_with("/me/mailFolders/F1/messages/delta?$"))
+                .unwrap();
+            assert!(
+                first.path.contains(
+                    "%20or%20id%20eq%20%27Integer%200x0036%27%20or%20\
+                     id%20eq%20%27String%20%7B00020386-0000-0000-C000-000000000046%7D%20Name%20msip_labels%27"
+                ),
+                "{}",
+                first.path
+            );
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn delta_stores_an_enabled_sensitivity_label_and_its_name() {
+            delta_stores(
+                "protection-label",
+                &[(
+                    MSIP_LABELS_PROP,
+                    "MSIP_Label_f42aa342-8706-4288-bd11-ebb85995028c_Enabled=true; \
+                     MSIP_Label_f42aa342-8706-4288-bd11-ebb85995028c_Name=Confidential",
+                )],
+                MessageProtection {
+                    has_label: true,
+                    label_name: "Confidential".into(),
+                    ..Default::default()
+                },
+            );
+        }
+
+        #[test]
+        fn delta_stores_sensitivity_confidential() {
+            delta_stores(
+                "protection-confidential",
+                &[(SENSITIVITY_PROP, "3")],
+                MessageProtection {
+                    sensitivity: Sensitivity::Confidential,
+                    ..Default::default()
+                },
+            );
+        }
+
+        #[test]
+        fn delta_stores_a_rights_protected_message() {
+            delta_stores(
+                "protection-irm",
+                &[(CONTENT_CLASS_PROP, "rpmsg.message")],
+                MessageProtection {
+                    is_rights_protected: true,
+                    ..Default::default()
+                },
+            );
+        }
+
+        #[test]
+        fn delta_stores_a_plain_message_as_unprotected() {
+            // Only the class: carried, so the stored protection is cleared.
+            delta_stores("protection-plain", &[], MessageProtection::default());
+        }
+
+        #[test]
+        fn a_later_round_without_the_class_keeps_the_protection() {
+            let labelled = MessageProtection {
+                sensitivity: Sensitivity::Confidential,
+                has_label: true,
+                label_name: "Secret".into(),
+                is_rights_protected: true,
+            };
+            let startup = [protected_json(
+                "M1",
+                false,
+                &[
+                    (SENSITIVITY_PROP, "3"),
+                    (
+                        MSIP_LABELS_PROP,
+                        "MSIP_Label_a_Enabled=true;MSIP_Label_a_Name=Secret",
+                    ),
+                    (CONTENT_CLASS_PROP, "rpmsg.message"),
+                ],
+            )];
+            // The next round's M1 comes without its class (complete, read
+            // now): its stored protection is kept.
+            let later = [message_json("M1", true, false, &[])];
+            let mut routes = vec![calendar_route()];
+            routes.extend(deltas("F1", &startup, &later));
+            routes.extend(startup_then(
+                "/me/mailFolders?",
+                &list(&[tree_folder("F1", "Inbox", None, (1, 1), 0)]),
+                &list(&[tree_folder("F1", "Inbox", None, (1, 0), 0)]),
+            ));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) =
+                spawn_fast(&srv, "protection-later", TICK, None, |_| {});
+            let store = Store::open(&store_path).unwrap();
+            // The startup round writes it. Not its read state: the later
+            // round may land before this first look.
+            assert!(
+                wait_until(TICK_WAIT, || protection_of(&store, "M1")
+                    .is_some_and(|(_, p)| p == labelled)),
+                "{:?}",
+                protection_of(&store, "M1")
+            );
+            // The later round's M1 landed (read), its protection kept.
+            assert!(wait_until(TICK_WAIT, || protection_of(&store, "M1")
+                .is_some_and(|(read, _)| read)));
+            assert_eq!(protection_of(&store, "M1"), Some((true, labelled)));
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     // --- Each message's meeting message type on its row (#2081) ----------
 
     mod meeting_message_types {
@@ -20574,7 +20778,7 @@ mod tests {
             assert!(
                 first
                     .path
-                    .contains("%20or%20id%20eq%20%27String%200x001A%27)"),
+                    .contains("%20or%20id%20eq%20%27String%200x001A%27"),
                 "{}",
                 first.path
             );
@@ -20801,6 +21005,7 @@ mod tests {
                     is_draft: false,
                     is_meeting_request: false,
                     meeting_message_type: None,
+                    protection: Default::default(),
                     categories: vec![],
                     is_reminder_on: true,
                     reminder_at: "2026-11-08T10:00:00Z".into(),
@@ -21522,6 +21727,7 @@ mod tests {
                     is_draft: false,
                     is_meeting_request: false,
                     meeting_message_type: None,
+                    protection: Default::default(),
                     categories: vec![],
                     is_reminder_on: false,
                     reminder_at: String::new(),
