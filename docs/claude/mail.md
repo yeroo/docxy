@@ -3031,7 +3031,8 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `{"destinationId"}`, `"msgfolderroot"` for `dest: None`; `DELETE /me/mailFolders/{id}`
   (`GraphClient::{create,rename,move,delete}_folder`; an answer without an id is `Parse`).
 - Store (`Store::{create_local_folder, rename_folder, move_folder, delete_folder}`,
-  crate-private: hosts use the commands). Each returns `FolderWriteResult::{Written(id),
+  crate-private, as are their result types: hosts use the commands; `current_folder_id` is
+  public). Each returns `FolderWriteResult::{Written(id),
   Unchanged, Refused(FolderRefusal)}`. A rename writes only `display_name`, a move only
   `parent_id`, so `sort_order`, `is_expanded` and the delta link stay. The same name or the
   same parent is `Unchanged`: nothing is queued and no event is sent. A folder made at the top
@@ -3064,7 +3065,12 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   reached Graph is its own queued op, sent after it under the Graph id. A queued op on a folder
   still `local:` (its create was refused and discarded) sends nothing. A create under a parent,
   or a move into a dest, that is still `local:` is refused (`Parse`). A message `Move` into a
-  folder still `local:` sends nothing.
+  folder still `local:` sends nothing. That folder's create was refused, or the folder was
+  deleted before its create was sent. Either way the store dropped the folder with the message
+  and started a mail reconverge, which brings the message back where Graph has it. A folder
+  move is sent even when its row is gone, as long as its id is not `local:`: a delete of the
+  folder it was moved under took the row, and that delete, queued after the move, must find
+  it there on Graph too.
 - A move whose answer has a new id re-keys the folder like a create, and also clears
   `delta_link` and the backfill columns, since the links name the old id; phase 1 runs again.
   The answer's parent is stored only while the stored parent is still the one the op wrote (a
@@ -3073,7 +3079,14 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `parent_id`), and their messages go by `ON DELETE CASCADE` (bodies, attachments, search
   rows), with the delta links, as `retain_folders` removes them (#1886). The op carries a
   snapshot of the removed rows that are not `local:` (`FolderSnapshot`: name, parent, counts,
-  well-known name, `sort_order`, `is_expanded`). A 404 is success. Soft delete (hidden rows)
+  well-known name, `sort_order`, `is_expanded`). A 404 is success. When a `local:` folder it
+  removes held a message (one moved there locally, which Graph still has where it was), the
+  delete drops, in the same transaction, the queued message ops that name such a message or
+  move one into such a folder (`drop_local_folder_mail_on`). Those ops could send nothing that
+  matters now, and while queued they would block the message's return, because a fresh delta
+  skips every id a queued op names. The engine then starts the quarantine's mail reconverge
+  (`start_mail_reconverge`). A user's read, flag or category change on such a message is lost
+  with it; the message comes back as Graph has it. Soft delete (hidden rows)
   was rejected: every message reader would need a filter. "Delete to Deleted Items" is a
   `MoveFolder` there.
 - Refusals: 401, a throttle (429 and 503), transport and other 5xx keep the op queued and in
@@ -3081,11 +3094,11 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   once (`refuse_folder_write`): the op is dropped, the store reverted, and
   `FolderWriteFailed { id, write, status, error }`, `Error("{create|rename|move|delete} folder
   {id}: {error}")` and `FoldersUpdated` are sent. There are no five attempts and no
-  quarantine. A refused create removes its `local:` folder and the `local:` folders under it
+  quarantine. The status comes from `refused_write_status`, shared with the contact writes.
+  A refused create removes its `local:` folder and the `local:` folders under it
   (`discard_local_folder`). A folder Graph has that was moved under it is left for its own
-  queued move's refusal. If a message had been moved into the discarded folder, the mail
-  reconverges as after a quarantine (delta links cleared), so it comes back where Graph has
-  it. A refused rename or move puts `prev_name` / `prev_parent` back only while the stored
+  queued move's refusal. If a message had been moved into the discarded folder, its queued ops
+  go and the mail reconverges, as for a delete, so it comes back where Graph has it. A refused rename or move puts `prev_name` / `prev_parent` back only while the stored
   value is still the op's own (`revert_folder_name`, `revert_folder_parent`). A refused delete
   puts the snapshot back at once (`restore_folders`, `INSERT OR IGNORE`, no delta link); its
   messages come back with the next pass's delta.
@@ -3094,8 +3107,10 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   never had), and a `local:` child created before its parent's delete is not restored (its
   create sent nothing).
 - While an op is queued, a sync pass does not undo it (`sync_folders` reads
-  `Store::queued_folder_writes` first). A listed folder named by a queued delete, or under one
-  in the listing, is not upserted. One a queued rename names keeps its stored name, and one a
+  `Store::queued_folder_writes` first). A listed folder named by a queued delete, or by its
+  `removed` snapshot, or under one in the listing, is not upserted. The snapshot covers a
+  folder moved under the deleted one locally, which Graph still lists under its old parent
+  until its move is sent. One a queued rename names keeps its stored name, and one a
   queued move names its stored parent; counts and the well-known name still update. A stored
   `local:` folder is kept without a `folder_exists` GET. No Graph read is sent for a `local:`
   folder: the pass's delta loop skips it (and so, now, the drafts sentinel, which used to get
@@ -3121,7 +3136,9 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `a_move_answered_with_a_new_id_rekeys_and_clears_the_links`,
   `a_move_answer_gives_the_parent_unless_a_later_move_wrote_one`,
   `revert_folder_name_keeps_a_later_rename`, `revert_folder_parent_keeps_a_later_move`,
-  `discard_local_folder_leaves_folders_graph_has`); `outbox.rs`
+  `discard_local_folder_leaves_folders_graph_has`,
+  `deleting_a_local_folder_drops_the_ops_of_mail_moved_into_it`,
+  `a_queued_delete_names_every_folder_it_removed`); `outbox.rs`
   `create_folder_reconciles_the_local_id`,
   `create_folder_retry_after_reconcile_or_of_a_deleted_row_sends_nothing`,
   `create_folder_under_a_parent_that_never_reached_graph_is_refused`,
@@ -3138,7 +3155,10 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `a_sync_pass_keeps_folder_writes_still_queued`,
   `folder_commands_the_store_refuses_report_and_queue_nothing`,
   `delete_of_sent_items_holding_a_queued_send_is_refused_and_the_send_goes_out`,
-  `fast_folders_follow_a_created_folder`).
+  `fast_folders_follow_a_created_folder`,
+  `deleting_a_local_folder_holding_moved_mail_brings_it_back`,
+  `deleting_a_folder_above_a_local_folder_holding_moved_mail_brings_it_back`,
+  `a_folder_moved_under_a_deleted_folder_goes_with_it`).
 - Not done: a lookxy folder-management UI; dedup of a create retried after a lost POST answer
   (a retry may 409 on the name Graph already has; the refusal discards the local row and the
   next listing brings Graph's folder); `GET /me/mailFolders/delta`; search folders; folders in
