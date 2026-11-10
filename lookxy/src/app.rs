@@ -3044,9 +3044,22 @@ impl App {
     /// sitting in Drafts, via `MessageRow::is_draft`). A no-op if the store
     /// has nothing for `id` — a stale/foreign id, or (for `DraftReady`) a
     /// race where the row was deleted before this ran.
+    ///
+    /// A draft row with no stored body (one made in Outlook or on the web,
+    /// synced as a draft since #2096: nothing fetches a draft's body on its
+    /// own) opens in the reader instead, which fetches it (`reload_body`);
+    /// once the body is stored, the next activate opens the composer.
     pub fn open_draft(&mut self, id: &str) {
-        let Ok(Some((row, body))) = self.store.draft(id) else {
-            return;
+        let (row, body) = match self.store.draft(id) {
+            Ok(Some(found)) => found,
+            Ok(None) => {
+                if let Ok(Some(_)) = self.store.message_row(id) {
+                    self.open_message(id);
+                    self.focus = Pane::Reading;
+                }
+                return;
+            }
+            Err(_) => return,
         };
         let editor = Editor::from(compose_html::from_html(&body.content));
         let attachments = self.store.outbound_attachments(&row.id).unwrap_or_default();
@@ -6846,6 +6859,93 @@ pub(crate) mod tests {
         assert_eq!(compose.cc, "carol@example.com");
         assert_eq!(compose.editor.text.plain(), "Hello");
         assert_eq!(compose.draft_id, id);
+    }
+
+    #[test]
+    fn a_synced_draft_without_a_body_opens_the_reader_then_the_composer() {
+        use mailcore::graph::model::{Body, Message, Recipient};
+        use std::sync::mpsc;
+
+        let mut app = App::for_test_with_seeded_store();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        app.sync.cmd_tx = cmd_tx;
+        // A reply draft made in Outlook on the web, synced as a draft
+        // (#2096) with no body in the store.
+        app.store
+            .upsert_message(
+                "inbox",
+                &Message {
+                    id: "d1".into(),
+                    conversation_id: "c1".into(),
+                    subject: "Re: Hello".into(),
+                    from: Recipient {
+                        name: "Me".into(),
+                        address: "me@example.com".into(),
+                    },
+                    to: vec![Recipient {
+                        name: "Alice".into(),
+                        address: "alice@example.com".into(),
+                    }],
+                    cc: vec![],
+                    received: "2026-07-16T11:00:00Z".into(),
+                    sent: String::new(),
+                    is_read: true,
+                    is_flagged: false,
+                    has_attachments: false,
+                    importance: "normal".into(),
+                    preview: "draft".into(),
+                    is_draft: true,
+                    is_meeting_request: false,
+                    meeting_message_type: None,
+                    protection: Default::default(),
+                    meeting_reminder_on: false,
+                    categories: Vec::new(),
+                    is_reminder_on: false,
+                    reminder_at: String::new(),
+                    reminder_signal_at: String::new(),
+                    flag_due_at: String::new(),
+                    internet_message_id: "<d1@x>".into(),
+                    in_reply_to: "<m1@x>".into(),
+                },
+            )
+            .unwrap();
+        app.threaded = false;
+        app.reload_messages();
+        app.focus = Pane::List;
+        app.msg_index = app.messages.iter().position(|m| m.id == "d1").unwrap();
+        assert!(app.messages[app.msg_index].is_draft);
+
+        // Activated: the reader opens it and fetches its body, rather than
+        // nothing happening.
+        app.activate_selected();
+        assert!(app.compose.is_none());
+        assert_eq!(app.selected_msg.as_deref(), Some("d1"));
+        assert_eq!(app.focus, Pane::Reading);
+        assert!(app.body_loading);
+        let fetched: Vec<String> = cmd_rx
+            .try_iter()
+            .filter_map(|c| match c {
+                SyncCommand::FetchBody { id } => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fetched, ["d1"]);
+
+        // With its body stored, the next activate opens the composer.
+        app.store
+            .put_body(
+                "d1",
+                &Body {
+                    content_type: "html".into(),
+                    content: "<p>Thanks</p>".into(),
+                },
+            )
+            .unwrap();
+        app.focus = Pane::List;
+        app.activate_selected();
+        let compose = app.compose.as_ref().expect("compose should be open");
+        assert_eq!(compose.draft_id, "d1");
+        assert_eq!(compose.editor.text.plain(), "Thanks");
     }
 
     #[test]
