@@ -464,7 +464,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   KeyTip `S`, the column's third row): toggles `Docxy::light_page`, per
   window, not persisted. Enabled only when the applied theme is dark
   (Auto resolving light counts as light); checked while the light page is
-  shown.
+  shown. It reads the window's `applied`, which `set_theme_pref` (the
+  theme cycle, `theme-set`) applies at once, not at the next frame, so a
+  Switch Modes right after a theme change takes; `theme-set`'s `applied`
+  reports it (#2095). Other windows sharing the change apply it at their
+  next render.
 - Harness: `doc {}`'s `page_mode` (`dark` / `light`) and `page_color`
   (`rrggbb`) are the page the document last drew on
   (`Docxy::painted_page`), and `inks` (`painted_inks_json`) rates every
