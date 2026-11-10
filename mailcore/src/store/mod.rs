@@ -1575,7 +1575,9 @@ impl Store {
     }
 
     /// Inserts or updates a message row, filing it under `folder_id`: every
-    /// column from `m` (`merge_message` with every property carried).
+    /// column from `m` (`merge_message` with every property carried), save
+    /// that a stored non-empty `internet_message_id` or `in_reply_to` is
+    /// never replaced by `""` (#2096).
     pub fn upsert_message(&self, folder_id: &str, m: &Message) -> Result<(), StoreError> {
         self.merge_message(folder_id, m, &MessageFields::all())
     }
@@ -2065,8 +2067,10 @@ impl Store {
     }
 
     /// The `(conversation_id, in_reply_to)` of every unsent reply draft, in
-    /// any folder (#2096): rows with `is_draft = 1` and a non-empty
-    /// `in_reply_to`, each pair once, sorted. A host marks a message that
+    /// any folder but Deleted Items (#2096): rows with `is_draft = 1` and a
+    /// non-empty `in_reply_to`, each pair once, sorted. A draft the user
+    /// discarded moves to Deleted Items with Graph's `isDraft` still true,
+    /// so a row filed in the well-known `deleteditems` folder is left out. A host marks a message that
     /// has an unsent reply draft, as classic Outlook's red `[Draft]` does,
     /// when its `conversation_id` and `internet_message_id` match a pair,
     /// without reading the Drafts folder's rows. A sent draft (`mark_sent`)
@@ -6173,15 +6177,22 @@ fn migrate_reply_links(conn: &Connection) -> Result<bool, StoreError> {
 
 /// The partial index `Store::reply_draft_links` reads (#2096): only unsent
 /// reply drafts, so it stays as small as the Drafts folder's replies. Its
-/// `WHERE` is spelled exactly as the query's, or SQLite would not use it.
+/// `WHERE` is spelled exactly as the query's, or SQLite would not use it;
+/// `folder_id` makes it covering for the query's Deleted Items join.
 const REPLY_DRAFTS_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS idx_messages_reply_drafts
-     ON messages(conversation_id, in_reply_to) WHERE is_draft = 1 AND in_reply_to <> ''";
+     ON messages(conversation_id, in_reply_to, folder_id)
+     WHERE is_draft = 1 AND in_reply_to <> ''";
 
 /// `Store::reply_draft_links`' statement (#2096), over
-/// `idx_messages_reply_drafts`; a test checks the plan.
-const REPLY_DRAFT_LINKS_SQL: &str = "SELECT DISTINCT conversation_id, in_reply_to FROM messages
-     WHERE is_draft = 1 AND in_reply_to <> ''
-     ORDER BY conversation_id, in_reply_to";
+/// `idx_messages_reply_drafts`; a test checks the plan. The `messages`
+/// side of the WHERE is the index's, spelled the same; the folder join
+/// leaves out a draft thrown away into Deleted Items (Graph keeps its
+/// `isDraft`).
+const REPLY_DRAFT_LINKS_SQL: &str = "SELECT DISTINCT m.conversation_id, m.in_reply_to
+     FROM messages m LEFT JOIN folders f ON f.id = m.folder_id
+     WHERE m.is_draft = 1 AND m.in_reply_to <> ''
+       AND COALESCE(f.well_known_name, '') <> 'deleteditems'
+     ORDER BY m.conversation_id, m.in_reply_to";
 
 /// Mints a fresh local draft id: `local:` followed by 16 bytes of
 /// OS randomness as lowercase hex (reusing `pkce::random_bytes`, the same
@@ -14442,8 +14453,9 @@ mod body_format_tests {
             )
             .unwrap();
         assert_eq!(satisfies(&s, "D"), (true, true));
-        // A complete delta item writes `is_draft = 0` (`isDraft` is not
-        // selected): the Drafts folder still says it is a draft.
+        // A row that reads `is_draft = 0` (stored before #2096, or written
+        // by a code-built `Message`): the Drafts folder still says it is a
+        // draft.
         s.upsert_message("DRAFTS", &message("D", false)).unwrap();
         assert_eq!(satisfies(&s, "D"), (true, true));
         // A message elsewhere with the same body still upgrades.
@@ -18083,6 +18095,44 @@ mod reply_link_tests {
     }
 
     #[test]
+    fn a_reply_draft_in_deleted_items_is_left_out() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "Drafts");
+        folder(&s, "Archive");
+        s.upsert_folder(&MailFolder {
+            id: "Trash".into(),
+            display_name: "Deleted Items".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("deleteditems".into()),
+        })
+        .unwrap();
+        s.upsert_message("Drafts", &draft("D1", "C1", "<m1@x>"))
+            .unwrap();
+        s.upsert_message("Archive", &draft("D2", "C2", "<m2@x>"))
+            .unwrap();
+        s.upsert_message("Drafts", &draft("D3", "C3", "<m3@x>"))
+            .unwrap();
+        let all = [
+            pair("C1", "<m1@x>"),
+            pair("C2", "<m2@x>"),
+            pair("C3", "<m3@x>"),
+        ];
+        assert_eq!(s.reply_draft_links().unwrap(), all);
+        // D3 discarded: Graph moves it to Deleted Items, still a draft.
+        s.move_message("D3", "Trash").unwrap();
+        assert!(s.message_row("D3").unwrap().unwrap().is_draft);
+        assert_eq!(
+            s.reply_draft_links().unwrap(),
+            [pair("C1", "<m1@x>"), pair("C2", "<m2@x>")]
+        );
+        // Restored to Drafts, it is back.
+        s.move_message("D3", "Drafts").unwrap();
+        assert_eq!(s.reply_draft_links().unwrap(), all);
+    }
+
+    #[test]
     fn reply_draft_links_uses_the_partial_index() {
         let s = Store::open_in_memory().unwrap();
         let plan: Vec<String> = s
@@ -18093,13 +18143,17 @@ mod reply_link_tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
+        // The messages side reads the partial index (covering: every
+        // column it needs is in it), never a scan of the table.
         assert!(
             plan.iter()
-                .any(|p| p.contains("USING COVERING INDEX idx_messages_reply_drafts")),
+                .any(|p| p.contains("SCAN m USING COVERING INDEX idx_messages_reply_drafts")),
             "{plan:?}"
         );
         assert!(
-            !plan.iter().any(|p| p.trim() == "SCAN messages"),
+            !plan
+                .iter()
+                .any(|p| p.trim() == "SCAN m" || p.trim() == "SCAN messages"),
             "{plan:?}"
         );
     }
