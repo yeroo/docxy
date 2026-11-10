@@ -46,8 +46,9 @@
 
 use crate::auth::{self, AuthConfig, TokenSet};
 use crate::graph::client::{
-    CalendarDeltaCursor, ContactFieldSet, DeltaCursor, EventInput, GraphClient, GraphError,
-    RsvpKind, event_body_json, event_zone_error, is_expired_sync_state, rsvp_proposal,
+    BATCH_MAX, BatchRequest, CalendarDeltaCursor, ContactFieldSet, DeltaCursor, EventInput,
+    GraphClient, GraphError, RsvpKind, event_body_json, event_zone_error, is_expired_sync_state,
+    rsvp_proposal,
 };
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
@@ -583,6 +584,19 @@ pub enum SyncCommand {
     /// parent, and the id if it differs. A dest that is the folder or one
     /// inside it is refused at once.
     MoveFolder { id: String, dest: Option<String> },
+    /// Mark a whole folder read (#1913), on the server too, not only the
+    /// mail the store holds. The store at once, in one transaction: every
+    /// stored message of the folder read, its `unread_count` 0, the op
+    /// queued ([`SyncEvent::MessagesUpdated`], then
+    /// [`SyncEvent::FoldersUpdated`]). Then the engine pages the ids of the
+    /// unread messages Graph holds there, received at or before the
+    /// command (mail that comes later is not marked), and PATCHes them
+    /// read through `POST /$batch`, 20 a batch, waiting out a throttled
+    /// one's `Retry-After`. Until it is done a pass keeps the folder's
+    /// stored count and stores that mail read. A refusal is
+    /// [`SyncEvent::FolderWriteFailed`] (`write: MarkRead`); an unknown
+    /// folder or the drafts sentinel is refused at once.
+    MarkFolderRead { folder: String },
     /// Exit the sync thread cleanly.
     Shutdown,
 }
@@ -593,6 +607,8 @@ pub enum FolderWrite {
     Create,
     Rename,
     Move,
+    /// [`SyncCommand::MarkFolderRead`] (#1913).
+    MarkRead,
 }
 
 impl FolderWrite {
@@ -601,6 +617,7 @@ impl FolderWrite {
             FolderWrite::Create => "create",
             FolderWrite::Rename => "rename",
             FolderWrite::Move => "move",
+            FolderWrite::MarkRead => "mark all read in",
         }
     }
 }
@@ -1066,6 +1083,32 @@ struct Repair {
     /// A row was completed or deleted, so the folder needs a reload.
     changed: bool,
 }
+/// A `MarkFolderRead` op in progress (#1913, `Engine::run_mark_folder_read`).
+#[derive(Debug)]
+struct BulkRun {
+    /// The op's outbox row.
+    seq: i64,
+    /// The ids still to mark, in the order Graph listed them.
+    todo: VecDeque<String>,
+    /// How many ids the listing gave.
+    total: usize,
+    /// The ids Graph refused for good: (id, status, error).
+    failed: Vec<(String, u16, String)>,
+}
+
+/// How a step of `Engine::run_mark_folder_read` ended, for the drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkStep {
+    /// The op is done (marked, refused or sent nothing) and dropped: the
+    /// drain goes on.
+    Finished,
+    /// A 5xx: the op stays, under the outbox back-off (`Drain::Deferred`).
+    Deferred,
+    /// Auth, throttle, transport or a checkpoint stop: the drain stops
+    /// (`Drain::Aborted`), the op and its run kept.
+    Stopped,
+}
+
 /// How `Engine::drain_outbox` ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Drain {
@@ -1423,6 +1466,7 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         warned_unencrypted: false,
         cmd_rx,
         deferred: VecDeque::new(),
+        bulk: None,
         shutting_down: false,
         body_skip: HashSet::new(),
         body_parked: false,
@@ -1540,6 +1584,10 @@ struct Engine {
     /// (every one but `FetchBody`, `SearchMessages` and `FetchMessage`), in arrival order: the main loop runs
     /// them before it reads the channel again or does any idle work.
     deferred: VecDeque<SyncCommand>,
+    /// The `MarkFolderRead` op being run (#1913): the ids still to mark,
+    /// kept across drains (a throttle, a 5xx, a checkpoint stop), so a run
+    /// goes on where it stopped instead of paging again.
+    bulk: Option<BulkRun>,
     /// A `Shutdown` came, or the UI dropped its handle, while work was
     /// running: the work stops at its next checkpoint, and the main loop
     /// returns once the commands that came before it have run.
@@ -2169,6 +2217,18 @@ impl Engine {
                 let r = self.store.move_folder(&id, dest.as_deref());
                 self.folder_command(FolderWrite::Move, &id, r);
             }
+            SyncCommand::MarkFolderRead { folder } => {
+                let r = self
+                    .store
+                    .mark_folder_read(&folder, &unix_to_iso8601(now_unix()));
+                // Its mail changed as well as its count.
+                if let Ok(FolderWriteResult::Written(id)) = &r {
+                    self.emit(SyncEvent::MessagesUpdated {
+                        folder_id: id.clone(),
+                    });
+                }
+                self.folder_command(FolderWrite::MarkRead, &folder, r);
+            }
             // Handled in `main_loop` so the thread can actually return.
             SyncCommand::Shutdown => {}
         }
@@ -2272,6 +2332,7 @@ impl Engine {
         }
         match self.with_auth(|c| c.get_folder_counts(folder_id)) {
             Ok((total, unread)) => {
+                let unread = self.kept_unread_count(folder_id).unwrap_or(unread);
                 if let Ok(true) = self.store.set_folder_counts(folder_id, total, unread) {
                     self.emit(SyncEvent::FoldersUpdated);
                 }
@@ -2279,6 +2340,22 @@ impl Engine {
             }
             Err(e) => !self.react(e),
         }
+    }
+
+    /// The stored `unread_count` of a folder a queued `MarkFolderRead` names
+    /// (#1913), which a count read from Graph must not undo; `None` for any
+    /// other folder.
+    fn kept_unread_count(&self, folder_id: &str) -> Option<i64> {
+        let queued = self.store.queued_folder_writes().ok()?;
+        if !queued.marked_read.contains_key(folder_id) {
+            return None;
+        }
+        self.store
+            .folders()
+            .ok()?
+            .into_iter()
+            .find(|f| f.id == folder_id)
+            .map(|f| f.unread_count)
     }
 
     /// `SyncCommand::SyncFolder`: an unknown id is an `Error` with no Graph
@@ -2491,6 +2568,11 @@ impl Engine {
                         }
                         if queued.moved.contains(&f.id) {
                             f.parent_id = row.parent_id.clone();
+                        }
+                        // A queued `MarkFolderRead` (#1913) keeps the 0 it
+                        // stored until Graph has done it.
+                        if queued.marked_read.contains_key(&f.id) {
+                            f.unread_count = row.unread_count;
                         }
                     }
                     changed |= self.store.upsert_folder(&f).unwrap_or(false);
@@ -2800,10 +2882,33 @@ impl Engine {
         new_ids: &mut Vec<String>,
     ) -> u64 {
         let note_new = self.config.options.prefetch_body_days > 0;
+        // A queued `MarkFolderRead` (#1913): mail received at or before its
+        // cutoff is stored read until Graph has marked it; newer mail is
+        // not the command's.
+        let read_before = self
+            .store
+            .queued_folder_writes()
+            .ok()
+            .and_then(|q| q.marked_read.get(folder_id).cloned());
         let mut upserts = 0;
         for item in items {
             match item {
                 DeltaItem::Upsert(m, fields) => {
+                    let read;
+                    let m = match &read_before {
+                        Some(before)
+                            if !m.is_read
+                                && !m.received.is_empty()
+                                && m.received.as_str() <= before.as_str() =>
+                        {
+                            read = Message {
+                                is_read: true,
+                                ..m.clone()
+                            };
+                            &read
+                        }
+                        _ => m,
+                    };
                     let marked;
                     let fields = if unasked {
                         marked = MessageFields {
@@ -3684,6 +3789,14 @@ impl Engine {
                 return Drain::Done;
             }
         };
+        // The op a kept run was for is gone (dropped meanwhile).
+        if self
+            .bulk
+            .as_ref()
+            .is_some_and(|b| !ops.iter().any(|r| r.seq == b.seq))
+        {
+            self.bulk = None;
+        }
         if ops.is_empty() {
             self.clear_op_backoff();
             if self.settle_contact_rereads() {
@@ -3703,6 +3816,17 @@ impl Engine {
             // its folder, `Store::discard_local_folder`).
             if !self.store.has_op(row.seq).unwrap_or(true) {
                 continue;
+            }
+            // Run by the engine across drains (#1913), never `apply_op`.
+            if let OutboxOp::MarkFolderRead { folder, before } = &row.op {
+                match self.run_mark_folder_read(row.seq, folder, before) {
+                    BulkStep::Finished => continue,
+                    BulkStep::Deferred => {
+                        deferred = true;
+                        break;
+                    }
+                    BulkStep::Stopped => return Drain::Aborted,
+                }
             }
             match self.apply_op_with_retry(&row) {
                 Ok(applied) => {
@@ -4043,6 +4167,184 @@ impl Engine {
             error,
         });
         self.emit(SyncEvent::Error(line));
+    }
+
+    /// Runs a queued `MarkFolderRead` (#1913). The first step pages every
+    /// unread id Graph holds in the folder, received at or before `before`,
+    /// into `self.bulk`, all of them before the first PATCH: paging an
+    /// `isRead eq false` listing while PATCHes clear it would shift its
+    /// skip-token pages and skip ids. Then the ids go out 20 a `$batch`
+    /// (`PATCH {"isRead":true}`), each batch's ids leaving the run only
+    /// once Graph answered the batch. A 2xx or a 404 (the message is gone)
+    /// is done; a 429 or 503 puts its ids back at the front and stops the
+    /// drain for the longest `Retry-After` (default 30 s), as a throttled
+    /// op does; another 5xx puts them back under the outbox back-off; any
+    /// other status is a failure, reported once the rest are done. Between
+    /// batches `checkpoint` serves the commands that cannot wait. A folder
+    /// still `local:` (its create never reached Graph) sends nothing.
+    fn run_mark_folder_read(&mut self, seq: i64, folder: &str, before: &str) -> BulkStep {
+        let folder = self
+            .store
+            .current_folder_id(folder)
+            .unwrap_or_else(|_| folder.to_string());
+        if self.bulk.as_ref().is_none_or(|b| b.seq != seq) {
+            self.bulk = None;
+            if folder.starts_with("local:") {
+                self.store.drop_op(seq);
+                return BulkStep::Finished;
+            }
+            match self.with_auth(|c| c.unread_message_ids(&folder, before)) {
+                Ok(ids) => {
+                    self.bulk = Some(BulkRun {
+                        seq,
+                        total: ids.len(),
+                        todo: ids.into(),
+                        failed: Vec::new(),
+                    });
+                }
+                Err(e) => return self.mark_read_call_failed(seq, &folder, e),
+            }
+        }
+        loop {
+            let Some(run) = self.bulk.as_ref() else {
+                return BulkStep::Finished;
+            };
+            let ids: Vec<String> = run.todo.iter().take(BATCH_MAX).cloned().collect();
+            if ids.is_empty() {
+                return self.finish_mark_folder_read(seq, &folder);
+            }
+            let reqs: Vec<BatchRequest> = ids
+                .iter()
+                .map(|id| GraphClient::mark_read_request(id))
+                .collect();
+            let answers = match self.with_auth(|c| c.batch(&reqs)) {
+                Ok(a) => a,
+                Err(e) => return self.mark_read_call_failed(seq, &folder, e),
+            };
+            let Some(run) = self.bulk.as_mut() else {
+                return BulkStep::Finished;
+            };
+            run.todo.drain(..ids.len());
+            let mut again = Vec::new();
+            let mut throttle: Option<u64> = None;
+            let mut server_error = None;
+            for (id, answer) in ids.into_iter().zip(answers) {
+                match answer.status {
+                    200..=299 | 404 => {}
+                    429 | 503 => {
+                        let secs = answer.retry_after_secs.unwrap_or(30);
+                        throttle = Some(throttle.map_or(secs, |t| t.max(secs)));
+                        again.push(id);
+                    }
+                    500..=599 => {
+                        server_error.get_or_insert_with(|| {
+                            GraphError::Http {
+                                status: answer.status,
+                                body: answer.body.clone(),
+                            }
+                            .to_string()
+                        });
+                        again.push(id);
+                    }
+                    status => {
+                        let error = GraphError::Http {
+                            status,
+                            body: answer.body,
+                        }
+                        .to_string();
+                        run.failed.push((id, status, error));
+                    }
+                }
+            }
+            for id in again.into_iter().rev() {
+                run.todo.push_front(id);
+            }
+            if let Some(secs) = throttle {
+                self.schedule_retry(Duration::from_secs(secs));
+                self.settle_state();
+                return BulkStep::Stopped;
+            }
+            if let Some(error) = server_error {
+                self.defer_mark_read(seq, &error);
+                return BulkStep::Deferred;
+            }
+            let more = self.bulk.as_ref().is_some_and(|r| !r.todo.is_empty());
+            if more && !self.checkpoint() {
+                return BulkStep::Stopped;
+            }
+        }
+    }
+
+    /// A `MarkFolderRead`'s listing or `$batch` call failed as a whole
+    /// (#1913): auth, throttle and transport stop the drain as for any op,
+    /// a 5xx defers it, and anything else (a 404, another 4xx, an answer
+    /// that did not parse) refuses it for good. The run keeps every id it
+    /// had: a batch's ids leave it only on Graph's answer.
+    fn mark_read_call_failed(&mut self, seq: i64, folder: &str, e: GraphError) -> BulkStep {
+        match e {
+            GraphError::Unauthorized => {
+                self.enter_signin();
+                BulkStep::Stopped
+            }
+            GraphError::Throttled { retry_after_secs } => {
+                self.schedule_retry(Duration::from_secs(retry_after_secs));
+                self.settle_state();
+                BulkStep::Stopped
+            }
+            GraphError::Transport(_) => {
+                self.go_offline();
+                BulkStep::Stopped
+            }
+            GraphError::Http { status, .. } if status >= 500 => {
+                self.defer_mark_read(seq, &e.to_string());
+                BulkStep::Deferred
+            }
+            e => {
+                let status = refused_write_status(&e);
+                self.refuse_mark_read(seq, folder, status, e.to_string());
+                BulkStep::Finished
+            }
+        }
+    }
+
+    /// The outbox's 5xx back-off for a `MarkFolderRead` (#1913), as the
+    /// drain gives any op: its attempts bumped, never quarantined.
+    fn defer_mark_read(&mut self, seq: i64, error: &str) {
+        self.store.bump_op_attempts(seq, error);
+        self.op_retry = Some(Instant::now() + self.op_backoff);
+        self.op_backoff = (self.op_backoff * 2).min(BACKOFF_MAX);
+    }
+
+    /// Every id of a `MarkFolderRead` was answered (#1913): the op is
+    /// dropped; the ids Graph refused, if any, are reported once.
+    fn finish_mark_folder_read(&mut self, seq: i64, folder: &str) -> BulkStep {
+        let Some(run) = self.bulk.take() else {
+            return BulkStep::Finished;
+        };
+        self.store.drop_op(seq);
+        self.clear_op_backoff();
+        if let Some((_, status, error)) = run.failed.first() {
+            let error = format!(
+                "{} of {} messages could not be marked read: {error}",
+                run.failed.len(),
+                run.total
+            );
+            self.refuse_mark_read(seq, folder, Some(*status), error);
+        }
+        BulkStep::Finished
+    }
+
+    /// A `MarkFolderRead` Graph refused (#1913): the op is dropped (no
+    /// attempts and no quarantine: retrying a 4xx changes nothing), its
+    /// failure reported (`FolderWriteFailed` with `write: MarkRead`, then
+    /// its `Error`), and the folder's delta restarted, so the next passes
+    /// read its read states again where the store marked mail Graph did
+    /// not.
+    fn refuse_mark_read(&mut self, seq: i64, folder: &str, status: Option<u16>, error: String) {
+        self.store.drop_op(seq);
+        self.bulk = None;
+        let _ = self.store.restart_folder_delta(folder);
+        self.report_folder_failure(folder, FolderWrite::MarkRead, status, error);
     }
 
     /// Brings messages a `local:` folder took with it back where Graph has
@@ -27921,6 +28223,490 @@ mod tests {
             );
             no_local_request(&srv);
             stop(handle, dir);
+        }
+
+        /// `SyncCommand::MarkFolderRead` (#1913).
+        mod mark_folder_read {
+            use super::*;
+            use crate::json::Value;
+
+            /// The first page of Inbox's unread ids.
+            const LIST: &str = "/me/mailFolders/INBOX/messages?$filter=isRead%20eq%20false";
+            const PAGE2: &str = "/me/mailFolders/INBOX/messages?$skiptoken=P2";
+
+            fn ids_page(ids: &[String], next: Option<&str>) -> String {
+                let items: Vec<String> =
+                    ids.iter().map(|id| format!(r#"{{"id":"{id}"}}"#)).collect();
+                let next = next.map_or(String::new(), |n| format!(r#","@odata.nextLink":"{n}""#));
+                format!(r#"{{"value":[{}]{next}}}"#, items.join(","))
+            }
+
+            /// A `$batch` answer: sub-request `i + 1` gets `statuses[i]`,
+            /// with its `Retry-After` when given; listed in reverse order.
+            fn batch_answer(statuses: &[(u16, Option<u64>)]) -> String {
+                let items: Vec<String> = statuses
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .map(|(i, (status, retry))| {
+                        let headers = retry
+                            .map_or("{}".to_string(), |r| format!(r#"{{"Retry-After":"{r}"}}"#));
+                        let body = if *status >= 400 {
+                            r#","body":{"error":{"code":"Denied","message":"Access is denied."}}"#
+                        } else {
+                            ""
+                        };
+                        format!(
+                            r#"{{"id":"{}","status":{status},"headers":{headers}{body}}}"#,
+                            i + 1
+                        )
+                    })
+                    .collect();
+                format!(r#"{{"responses":[{}]}}"#, items.join(","))
+            }
+
+            fn ok_batch(n: usize) -> String {
+                batch_answer(&vec![(204, None); n])
+            }
+
+            /// Each `$batch` request: when it came and the ids it PATCHed
+            /// read, checking every sub-request's shape.
+            fn batches(srv: &FakeServer) -> Vec<(Instant, Vec<String>)> {
+                srv.requests()
+                    .into_iter()
+                    .filter(|r| r.method == "POST" && r.path == "/$batch")
+                    .map(|r| {
+                        let v = crate::json::parse(&r.body).unwrap();
+                        let ids = v
+                            .get("requests")
+                            .and_then(Value::as_array)
+                            .unwrap()
+                            .iter()
+                            .map(|q| {
+                                assert_eq!(q.get("method").and_then(Value::as_str), Some("PATCH"));
+                                assert_eq!(
+                                    q.get("body").map(Value::to_string).as_deref(),
+                                    Some(r#"{"isRead":true}"#)
+                                );
+                                let url = q.get("url").and_then(Value::as_str).unwrap();
+                                url.strip_prefix("/me/messages/").unwrap().to_string()
+                            })
+                            .collect();
+                        (r.at, ids)
+                    })
+                    .collect()
+            }
+
+            fn listings(srv: &FakeServer) -> Vec<String> {
+                srv.requests()
+                    .into_iter()
+                    .map(|r| r.path)
+                    .filter(|p| p.starts_with("/me/mailFolders/") && p.contains("/messages?"))
+                    .collect()
+            }
+
+            fn is_read(store: &Store, id: &str) -> bool {
+                store.message_row(id).unwrap().unwrap().is_read
+            }
+
+            fn unread_count(store: &Store, id: &str) -> i64 {
+                row(store, id).unwrap().unread_count
+            }
+
+            fn queued_before(store: &Store) -> String {
+                match &store.pending_ops().unwrap()[..] {
+                    [r] => match &r.op {
+                        OutboxOp::MarkFolderRead { before, .. } => before.clone(),
+                        other => panic!("{other:?}"),
+                    },
+                    other => panic!("{other:?}"),
+                }
+            }
+
+            /// The listing, with Inbox's unread count `n`.
+            fn listing_with_unread(n: i64) -> String {
+                let listed: Vec<String> = TREE
+                    .iter()
+                    .map(|(id, parent, wk)| {
+                        let j = listed_json(id, *parent, *wk);
+                        if *id == "INBOX" {
+                            j.replace(
+                                r#""unreadItemCount":0"#,
+                                &format!(r#""unreadItemCount":{n}"#),
+                            )
+                        } else {
+                            j
+                        }
+                    })
+                    .collect();
+                format!(r#"{{"value":[{}]}}"#, listed.join(","))
+            }
+
+            #[test]
+            fn mark_folder_read_pages_and_batches_every_server_unread_id_once() {
+                // 30 unread on the server, 2 of them stored.
+                let server: Vec<String> = ["M1".to_string(), "M2".to_string()]
+                    .into_iter()
+                    .chain((3..=30).map(|i| format!("S{i:02}")))
+                    .collect();
+                let mut last = vec![(204, None); 10];
+                last[9] = (404, None); // gone meanwhile: no failure
+                let (srv, handle, store, dir) = engine(
+                    "mark-read-pages",
+                    world(
+                        vec![
+                            once("GET", PAGE2, 200, &ids_page(&server[20..], None)),
+                            once("GET", LIST, 200, &ids_page(&server[..20], Some(PAGE2))),
+                            once("POST", "/$batch", 200, &ok_batch(20)),
+                            once("POST", "/$batch", 200, &batch_answer(&last)),
+                        ],
+                        TREE,
+                        &[("INBOX", "M1"), ("INBOX", "M2"), ("ARCH", "G1")],
+                    ),
+                    None,
+                );
+                assert!(!is_read(&store, "M1") && !is_read(&store, "M2"));
+
+                send(
+                    &handle,
+                    SyncCommand::MarkFolderRead {
+                        folder: "INBOX".into(),
+                    },
+                );
+                let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+                let n = seen.len();
+                assert_eq!(
+                    seen[n - 2..],
+                    [
+                        SyncEvent::MessagesUpdated {
+                            folder_id: "INBOX".into()
+                        },
+                        SyncEvent::FoldersUpdated
+                    ],
+                    "{seen:?}"
+                );
+                wait_drained(&store);
+
+                // Paged first, with the cutoff; then 20 + 10, each id once.
+                let lists = listings(&srv);
+                assert_eq!(lists.len(), 2, "{lists:?}");
+                assert!(
+                    lists[0].starts_with(&format!("{LIST}%20and%20receivedDateTime%20le%20"))
+                        && lists[0].ends_with("&$select=id&$top=1000"),
+                    "{}",
+                    lists[0]
+                );
+                assert_eq!(lists[1], PAGE2);
+                let sent = batches(&srv);
+                assert_eq!(
+                    sent.iter().map(|(_, ids)| ids.len()).collect::<Vec<_>>(),
+                    vec![20, 10]
+                );
+                let all: Vec<String> = sent.into_iter().flat_map(|(_, ids)| ids).collect();
+                assert_eq!(all, server);
+
+                assert!(is_read(&store, "M1") && is_read(&store, "M2"));
+                assert!(!is_read(&store, "G1"), "another folder is untouched");
+                assert_eq!(unread_count(&store, "INBOX"), 0);
+
+                // The next pass's listing says 0.
+                send(&handle, SyncCommand::Refresh);
+                let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+                assert_eq!(unread_count(&store, "INBOX"), 0);
+                assert!(is_read(&store, "M1"));
+                assert!(
+                    !seen
+                        .iter()
+                        .any(|e| matches!(e, SyncEvent::FolderWriteFailed { .. })),
+                    "{seen:?}"
+                );
+                stop(handle, dir);
+            }
+
+            #[test]
+            fn a_429_inside_a_batch_is_retried_after_retry_after() {
+                let server: Vec<String> = ["A", "B", "C"].map(String::from).to_vec();
+                let (srv, handle, store, dir) = engine(
+                    "mark-read-429",
+                    world(
+                        vec![
+                            once("GET", LIST, 200, &ids_page(&server, None)),
+                            once(
+                                "POST",
+                                "/$batch",
+                                200,
+                                &batch_answer(&[(204, None), (429, Some(1)), (204, None)]),
+                            ),
+                            once("POST", "/$batch", 200, &ok_batch(1)),
+                        ],
+                        TREE,
+                        &[],
+                    ),
+                    None,
+                );
+                send(
+                    &handle,
+                    SyncCommand::MarkFolderRead {
+                        folder: "INBOX".into(),
+                    },
+                );
+                // Queued (the store write), then drained.
+                wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+                wait_drained(&store);
+                let sent = batches(&srv);
+                assert_eq!(
+                    sent.iter().map(|(_, ids)| ids.clone()).collect::<Vec<_>>(),
+                    vec![server.clone(), vec!["B".to_string()]],
+                    "only the throttled id again, none skipped"
+                );
+                let gap = sent[1].0.duration_since(sent[0].0);
+                assert!(gap >= Duration::from_secs(1), "{gap:?}");
+                assert_eq!(
+                    listings(&srv).len(),
+                    1,
+                    "the run kept its ids: no second listing"
+                );
+                stop(handle, dir);
+            }
+
+            /// An engine whose `$batch` always answers 500, so a
+            /// `MarkFolderRead` of Inbox stays queued; Inbox holds M1
+            /// (received 2026-07-16). Later passes list Inbox with 30
+            /// unread, count it 30, and its next delta round reports M1
+            /// unread and a new M9 received at `m9_received`, unread.
+            fn queued_world(
+                tag: &str,
+                m9_received: &str,
+            ) -> (FakeServer, SyncHandle, Store, PathBuf) {
+                let round = delta_page(
+                    &[
+                        full_message_json("M1", "M1", "2026-07-16T10:00:00Z"),
+                        full_message_json("M9", "M9", m9_received),
+                    ],
+                    "/me/mailFolders/INBOX/messages/delta?token=D-INBOX",
+                );
+                let (srv, handle, store, dir) = engine(
+                    tag,
+                    world(
+                        vec![
+                            once(
+                                "GET",
+                                "/me/mailFolders/INBOX/messages/delta?token=D-INBOX",
+                                200,
+                                &round,
+                            ),
+                            write("GET", LIST, 200, &ids_page(&["M1".to_string()], None)),
+                            write("POST", "/$batch", 500, "busy"),
+                            write("GET", "/me/mailFolders?", 200, &listing_with_unread(30)),
+                            write(
+                                "GET",
+                                "/me/mailFolders/INBOX?",
+                                200,
+                                r#"{"totalItemCount":30,"unreadItemCount":30}"#,
+                            ),
+                        ],
+                        TREE,
+                        &[("INBOX", "M1")],
+                    ),
+                    None,
+                );
+                assert_eq!(unread_count(&store, "INBOX"), 30);
+                send(
+                    &handle,
+                    SyncCommand::MarkFolderRead {
+                        folder: "INBOX".into(),
+                    },
+                );
+                wait_requests(&srv, "POST", "/$batch", 1);
+                (srv, handle, store, dir)
+            }
+
+            #[test]
+            fn a_sync_pass_keeps_a_queued_mark_folder_read() {
+                let (srv, handle, store, dir) =
+                    queued_world("mark-read-pending", "2026-07-17T10:00:00Z");
+                assert_eq!(store.pending_ops().unwrap().len(), 1);
+                let before = srv.requests().len();
+                send(&handle, SyncCommand::Refresh);
+                wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+                assert!(
+                    paths_from(&srv, before).iter().any(|p| is_folder_list(p)),
+                    "a listing ran"
+                );
+                assert!(
+                    paths_from(&srv, before)
+                        .iter()
+                        .any(|p| p.ends_with("delta?token=D-INBOX")),
+                    "a delta round ran"
+                );
+                // The listing's 30 and the round's unread M1 do not undo it,
+                // nor does M9, received before the command, stay unread.
+                assert_eq!(unread_count(&store, "INBOX"), 0);
+                assert!(is_read(&store, "M1"));
+                assert!(is_read(&store, "M9"));
+                // Nor does one folder's count read from Graph.
+                send(&handle, SyncCommand::SyncFolder { id: "INBOX".into() });
+                wait_requests(
+                    &srv,
+                    "GET",
+                    "/me/mailFolders/INBOX?$select=totalItemCount,unreadItemCount",
+                    1,
+                );
+                assert_eq!(unread_count(&store, "INBOX"), 0);
+                assert_eq!(store.pending_ops().unwrap().len(), 1, "still queued");
+                stop(handle, dir);
+            }
+
+            #[test]
+            fn mark_folder_read_leaves_mail_received_after_the_command_unread() {
+                let (srv, handle, store, dir) =
+                    queued_world("mark-read-newer", "2099-01-01T00:00:00Z");
+                let cutoff = queued_before(&store);
+                assert!(cutoff.as_str() < "2099-01-01T00:00:00Z", "{cutoff}");
+                assert_eq!(
+                    listings(&srv)[0],
+                    format!("{LIST}%20and%20receivedDateTime%20le%20{cutoff}&$select=id&$top=1000")
+                );
+                send(&handle, SyncCommand::Refresh);
+                wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+                assert!(is_read(&store, "M1"));
+                assert!(!is_read(&store, "M9"), "newer mail is not the command's");
+                stop(handle, dir);
+            }
+
+            #[test]
+            fn mark_folder_read_refusals_report_and_restart_the_folder_delta() {
+                let (srv, handle, store, dir) = engine(
+                    "mark-read-refused",
+                    world(
+                        vec![
+                            once("GET", LIST, 200, &ids_page(&["A".into(), "B".into()], None)),
+                            once(
+                                "POST",
+                                "/$batch",
+                                200,
+                                &batch_answer(&[(204, None), (403, None)]),
+                            ),
+                            write(
+                                "GET",
+                                "/me/mailFolders/ARCH/messages?",
+                                404,
+                                r#"{"error":{"code":"ErrorItemNotFound","message":"Gone."}}"#,
+                            ),
+                        ],
+                        TREE,
+                        &[],
+                    ),
+                    None,
+                );
+                assert!(store.get_delta_link("INBOX").unwrap().is_some());
+                assert!(store.get_delta_link("ARCH").unwrap().is_some());
+
+                // A 403 inside a batch.
+                send(
+                    &handle,
+                    SyncCommand::MarkFolderRead {
+                        folder: "INBOX".into(),
+                    },
+                );
+                let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+                let error = "1 of 2 messages could not be marked read: HTTP 403: Access is denied.";
+                assert_eq!(
+                    seen[seen.len() - 2..],
+                    [
+                        SyncEvent::FolderWriteFailed {
+                            id: "INBOX".into(),
+                            write: FolderWrite::MarkRead,
+                            status: Some(403),
+                            error: error.into(),
+                        },
+                        SyncEvent::Error(format!("mark all read in folder INBOX: {error}")),
+                    ],
+                    "{seen:?}"
+                );
+                assert!(store.pending_ops().unwrap().is_empty());
+                assert_eq!(store.get_delta_link("INBOX").unwrap(), None, "restarted");
+                assert!(store.get_delta_link("ARCH").unwrap().is_some());
+
+                // A 404 on the listing.
+                send(
+                    &handle,
+                    SyncCommand::MarkFolderRead {
+                        folder: "ARCH".into(),
+                    },
+                );
+                let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+                assert!(
+                    seen.contains(&SyncEvent::FolderWriteFailed {
+                        id: "ARCH".into(),
+                        write: FolderWrite::MarkRead,
+                        status: Some(404),
+                        error: "not found (404)".into(),
+                    }),
+                    "{seen:?}"
+                );
+                assert!(store.pending_ops().unwrap().is_empty());
+                assert_eq!(store.get_delta_link("ARCH").unwrap(), None);
+                assert_eq!(batches(&srv).len(), 1, "no batch for the refused listing");
+                stop(handle, dir);
+            }
+
+            #[test]
+            fn mark_folder_read_survives_a_restart() {
+                // Queued by an engine that stopped before it drained.
+                let srv = FakeServer::start_limited(world(
+                    vec![
+                        once("GET", LIST, 200, &ids_page(&["A".into()], None)),
+                        once("POST", "/$batch", 200, &ok_batch(1)),
+                    ],
+                    TREE,
+                    &[],
+                ));
+                let before = "2026-11-10T18:00:00Z";
+                let (handle, store_path, dir) =
+                    spawn_fast(&srv, "mark-read-restart", HOUR, None, |s| {
+                        s.enqueue_op(&OutboxOp::MarkFolderRead {
+                            folder: "INBOX".into(),
+                            before: before.into(),
+                        })
+                        .unwrap();
+                    });
+                let store = Store::open(&store_path).unwrap();
+                wait_drained(&store);
+                assert_eq!(
+                    listings(&srv),
+                    vec![format!(
+                        "{LIST}%20and%20receivedDateTime%20le%20{before}&$select=id&$top=1000"
+                    )]
+                );
+                assert_eq!(batches(&srv)[0].1, vec!["A".to_string()]);
+                stop(handle, dir);
+            }
+
+            #[test]
+            fn mark_folder_read_of_an_unknown_folder_reports_and_queues_nothing() {
+                let (srv, handle, store, dir) =
+                    engine("mark-read-unknown", world(vec![], TREE, &[]), None);
+                let before = srv.requests().len();
+                send(
+                    &handle,
+                    SyncCommand::MarkFolderRead {
+                        folder: "NOPE".into(),
+                    },
+                );
+                let failed = wait_store_refused(&handle);
+                assert!(
+                    matches!(
+                        &failed,
+                        SyncEvent::FolderWriteFailed { id, write: FolderWrite::MarkRead, .. }
+                            if id == "NOPE"
+                    ),
+                    "{failed:?}"
+                );
+                assert!(store.pending_ops().unwrap().is_empty());
+                assert_eq!(srv.requests().len(), before, "nothing sent");
+                stop(handle, dir);
+            }
         }
     }
 }
