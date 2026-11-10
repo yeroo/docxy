@@ -2965,3 +2965,57 @@ links in one cheap read.
   fixes;
   and
   `a_plain_text_reply_draft_is_not_a_refetch_candidate`, which now expects `is_draft`.
+
+## Contact search folds in Rust (#1890)
+
+`Store::search_contacts(query, limit)` (lookxy's attendee autocomplete) used to compare the
+query with SQLite's `lower(name) LIKE …`. This bundled SQLite has no ICU, so its `lower()` and
+`LIKE` fold ASCII only: `Борис`, `Élise` and `Ωmega` were never found by their lowercase
+spelling, nor even typed as stored, because the query was lowercased in Rust first.
+
+- `contact_match(name, address, folded_query)` is a Rust scalar SQL function (rusqlite's
+  `functions` feature, which adds no crate), `SQLITE_UTF8 | SQLITE_DETERMINISTIC`.
+  `register_contact_match` registers it at the end of `Store::init`, so every connection has
+  it: the engine's, a host's, the tests'. A NULL argument reads as `''` and never fails the
+  query. The rank lives in `contact_match_rank`.
+- The fold, `fold_contact_text`, applies to the query and to both columns: Turkish `İ` → `i`,
+  then Unicode `to_lowercase`, then `ς` → `σ`. `to_lowercase` writes `İ` as `i` + U+0307, so
+  `ilk` would never find `İlker`. It also applies Final_Sigma, so `ΟΔΥΣ` lowercases to `οδυς`,
+  which is never found in `οδυσσέας` without the last step. Unicode case folding does the same
+  with `ς`.
+- Rank `0` is a word-prefix match. The query starts the folded name, or starts right after a
+  separator, or does the same in the address' local part (before its first `@`). A separator
+  is a character that is neither `char::is_alphanumeric` nor `continues_a_word`: a space, `-`,
+  `'`, `’`, `,`, `(`. `continues_a_word` holds the common blocks of combining marks (Latin,
+  Cyrillic, Hebrew points, Arabic harakat, Indic viramas and nuktas, Thai marks), ZWNJ/ZWJ and
+  variation selectors, which are not alphanumeric but do not end a word. std has no general
+  category lookup, so these are ranges. Punctuation inside those blocks (Hebrew maqaf, the
+  Indic dandas) still separates. So `pek` in `İpek`, `lise` in an NFD `E\u{301}lise`, and the
+  letters after a virama or a ZWNJ are mid-word. The domain never counts, or `li` would rank
+  every `@linkedin.com` row first. A name that is itself an address (an `@` and no whitespace)
+  takes the address rule. Every char boundary is tried, so a mid-word occurrence does not hide
+  a later word-start one. Rank `1` is any other literal occurrence; NULL is no match. After the
+  rank, the order is relevance (nulls last), frequency desc, `last_seen` desc, then name.
+  `Wei Li` therefore ranks with whole-name prefixes for `li`.
+- The match is a plain `str::contains`, so `_`, `%` and `\` are literal and the old `LIKE`
+  escaping is gone.
+- An empty query matches every contact at rank 0, so the result is in the tie order. A
+  negative `limit` means no limit (`LIMIT -1`). `Store::all_contacts()` returns every row in
+  that same order, for a caller that does its own matching.
+- Rejected: stored `name_folded`/`address_folded` columns. They need a migration with a Rust
+  backfill, and every contact writer would have to keep them in step. The word-prefix rank
+  needs Rust anyway, and a `%q%` search is a full scan either way.
+- Known limits: no accent folding (`elise` does not find `Élise`), no spelling equivalences
+  (`STRASSE` does not find `Straße`, since `to_lowercase` keeps `ß`), and no Unicode
+  normalisation (an NFD name does not match an NFC query, and normalising needs a crate).
+  `folder_contacts()`'s `COLLATE NOCASE` order and `is_contact`'s deliberately ASCII key are
+  unchanged.
+- Tests: store `search_contacts_folds_any_script`,
+  `search_contacts_ranks_word_prefix_with_name_prefix`,
+  `search_contacts_empty_query_and_negative_limit`,
+  `all_contacts_lists_every_row_in_rank_order`,
+  `search_contacts_finds_a_turkish_dotted_capital_by_any_case`,
+  `contact_match_rank_word_starts_and_fold`,
+  `contact_match_reads_a_null_argument_as_empty`; unchanged
+  `search_contacts_ranks_prefix_first_then_frequency` and
+  `search_contacts_treats_underscore_literally`.
