@@ -3653,6 +3653,8 @@ impl Engine {
                     )));
                     return true;
                 }
+                // The re-run marks the folder synced when it completes
+                // (#2125); this round did not.
                 return self.sync_folder_delta_once(folder_id, false);
             }
             // `react` returns true when the pass must abort; a non-fatal
@@ -3668,9 +3670,13 @@ impl Engine {
             });
             return false;
         }
+        // The round is complete once its deltaLink is kept (#2125): only
+        // then is the folder marked synced. A failed mark is not reported
+        // (a display figure), like a failed link write.
+        let mut stored_link = false;
         if let Some(delta) = run.delta_link {
             if !started_fresh {
-                let _ = self.store.set_delta_link(folder_id, &delta);
+                stored_link = self.store.set_delta_link(folder_id, &delta).is_ok();
             } else if small {
                 let scope = if cutoff.is_some() {
                     SCOPE_WINDOW
@@ -3691,13 +3697,18 @@ impl Engine {
                     )
                     .is_ok()
                 {
+                    stored_link = true;
                     self.emit_progress(folder_id, run.walked, true);
                 }
             } else {
-                let _ = self
+                stored_link = self
                     .store
-                    .set_head_link(folder_id, &delta, run.expand_refused);
+                    .set_head_link(folder_id, &delta, run.expand_refused)
+                    .is_ok();
             }
+        }
+        if stored_link {
+            let _ = self.store.mark_folder_synced(folder_id);
         }
         self.emit(SyncEvent::MessagesUpdated {
             folder_id: folder_id.to_string(),
@@ -4387,6 +4398,9 @@ impl Engine {
             self.park_on_store_error(&id, e);
             return;
         }
+        // The walk and the last round on the folder's own link are done
+        // (#2125). A failed mark is not reported (a display figure).
+        let _ = self.store.mark_folder_synced(&id);
         self.emit(SyncEvent::MessagesUpdated {
             folder_id: id.clone(),
         });
@@ -31083,6 +31097,76 @@ mod tests {
                 }
             }
         }
+
+        // --- A folder's last sync time (#2125) ---
+
+        fn synced_at(dir: &std::path::Path, id: &str) -> Option<String> {
+            store_in(dir).folder_stats(id).unwrap().unwrap().synced_at
+        }
+
+        /// The head branch of `sync_folder_delta_once`: a big folder's head
+        /// marks it synced although its backfill never completes (its full
+        /// delta's first call always fails).
+        #[test]
+        fn a_head_sets_the_sync_time_before_the_backfill_ends() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[inbox()],
+                vec![(
+                    route("/me/mailFolders/F1/messages/delta?$orderby", 500, "{}"),
+                    None,
+                )],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-synced-head");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            assert!(
+                wait_until(ENGINE_WAIT, || store_in(&dir)
+                    .folder_stats("F1")
+                    .unwrap()
+                    .is_some_and(|s| s.synced_at.is_some())),
+                "{:?}",
+                paths_from(&srv, 0)
+            );
+            stop(handle);
+            assert!(count(&srv, |p| is_head(p, "F1")) > 0);
+            assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_HEAD));
+            let t = synced_at(&dir, "F1").unwrap();
+            assert!(crate::store::iso8601_to_unix_secs(&t).is_some(), "{t}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The walk's completion marks the folder synced. The sync pass's
+        /// round on the head link gets a last page with no deltaLink, which
+        /// is not a complete round and marks nothing, so the only round
+        /// that completes is the walk's last one on the folder's own link.
+        #[test]
+        fn backfill_completion_sets_the_sync_time() {
+            const OLD: &str = "2000-01-01T00:00:00Z";
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 3),
+                    ..inbox()
+                }],
+                vec![(route(&head_link("F1"), 200, r#"{"value":[]}"#), Some(1))],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-synced-complete");
+            seed_at_page_2(&dir);
+            rusqlite::Connection::open(dir.join("mail.db"))
+                .unwrap()
+                .execute("UPDATE folders SET synced_at = ?1 WHERE id = 'F1'", [OLD])
+                .unwrap();
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            until_complete(&handle, "F1");
+            stop(handle);
+            // The pass's round (no deltaLink) and the walk's last round.
+            assert_eq!(count(&srv, |p| p == head_link("F1")), 2);
+            assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_ALL));
+            let t = synced_at(&dir, "F1").unwrap();
+            assert!(t.as_str() > OLD, "{t}");
+            assert!(crate::store::iso8601_to_unix_secs(&t).is_some(), "{t}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// Folder writes through the outbox (#1910).
@@ -38374,6 +38458,196 @@ mod tests {
             let store = Store::open(&store_path).unwrap();
             assert!(ids(&store, "F1").is_empty());
             assert_eq!(store.get_delta_link("F1").unwrap(), None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A folder's last sync time and stored count (#2125), on the test
+    /// server. The store is seeded before the engine opens it; a test
+    /// writes it again only while the engine is idle (an HOUR tick, no fast
+    /// tick, no backfill left), never while a round may run.
+    mod folder_stats {
+        use super::*;
+
+        const OLD: &str = "2000-01-01T00:00:00Z";
+        const LINK: &str = "/me/mailFolders/F1/messages/delta?token=D-F1";
+        const INBOX: &[(&str, &str, Option<&str>)] = &[("F1", "Inbox", Some("inbox"))];
+
+        /// Sets F1's sync time to `OLD` through a second connection.
+        fn backdate(store_path: &std::path::Path) {
+            rusqlite::Connection::open(store_path)
+                .unwrap()
+                .execute("UPDATE folders SET synced_at = ?1 WHERE id = 'F1'", [OLD])
+                .unwrap();
+        }
+
+        /// Spawns on `srv` after seeding the store: F1 listed with `total`,
+        /// with the delta link `LINK` and a sync time of `OLD` when
+        /// `linked`. Waits for the startup pass to end.
+        fn start(
+            srv: &FakeServer,
+            tag: &str,
+            total: i64,
+            linked: bool,
+        ) -> (SyncHandle, PathBuf, PathBuf) {
+            let dir = unique_dir(tag);
+            let store_path = dir.join("mail.db");
+            let token_path = dir.join("token.bin");
+            seed_token(&token_path);
+            {
+                let s = Store::open(&store_path).unwrap();
+                s.upsert_folder(&MailFolder {
+                    id: "F1".into(),
+                    display_name: "Inbox".into(),
+                    parent_id: None,
+                    total_count: total,
+                    unread_count: 0,
+                    well_known_name: Some("inbox".into()),
+                })
+                .unwrap();
+                if linked {
+                    s.set_delta_link("F1", LINK).unwrap();
+                }
+            }
+            if linked {
+                backdate(&store_path);
+            }
+            let handle = spawn_with_bases_and_options(
+                store_path.clone(),
+                token_path,
+                test_cfg(),
+                3650,
+                srv.base_url.clone(),
+                srv.base_url.clone(),
+                HOUR,
+                EngineOptions::without_prefetch(),
+            );
+            wait_idle(&handle, &mut Vec::new());
+            (handle, store_path, dir)
+        }
+
+        fn stats(store_path: &std::path::Path) -> crate::store::FolderStats {
+            Store::open(store_path)
+                .unwrap()
+                .folder_stats("F1")
+                .unwrap()
+                .unwrap()
+        }
+
+        fn later_than_old(t: Option<String>) {
+            let t = t.expect("a sync time");
+            assert!(t.as_str() > OLD, "{t}");
+            assert!(crate::store::iso8601_to_unix_secs(&t).is_some(), "{t}");
+        }
+
+        /// The link branch: a round on the stored link that changes nothing
+        /// marks the folder; a second one, a `SyncFolder`, moves the time
+        /// past a value from before it.
+        #[test]
+        fn a_round_without_changes_sets_the_sync_time() {
+            let srv = FakeServer::start_limited(folder_routes(INBOX, &[], &[]));
+            let (handle, store_path, dir) = start(&srv, "stats-link", 0, true);
+            assert!(
+                paths_from(&srv, 0).iter().any(|p| p == LINK),
+                "a round on the stored link: {:?}",
+                paths_from(&srv, 0)
+            );
+            assert!(
+                !paths_from(&srv, 0)
+                    .iter()
+                    .any(|p| is_delta(p, "F1") && p != LINK),
+                "no fresh delta: {:?}",
+                paths_from(&srv, 0)
+            );
+            let s = stats(&store_path);
+            assert_eq!(s.stored, 0);
+            later_than_old(s.synced_at);
+
+            // Idle: no round runs until the command.
+            backdate(&store_path);
+            let mark = srv.requests().len();
+            handle
+                .cmd_tx
+                .send(SyncCommand::SyncFolder { id: "F1".into() })
+                .unwrap();
+            wait_idle(&handle, &mut Vec::new());
+            assert!(paths_from(&srv, mark).iter().any(|p| p == LINK));
+            later_than_old(stats(&store_path).synced_at);
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A round Graph answers with a 500 leaves the time as it was.
+        #[test]
+        fn a_failed_round_keeps_the_sync_time() {
+            let mut routes = vec![(get_route(LINK, 500, "{}"), None)];
+            routes.extend(folder_routes(INBOX, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) = start(&srv, "stats-failed", 0, true);
+            assert!(paths_from(&srv, 0).iter().any(|p| p == LINK));
+            assert_eq!(stats(&store_path).synced_at.as_deref(), Some(OLD));
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A folder whose delta never succeeded has no time.
+        #[test]
+        fn a_folder_whose_delta_never_succeeded_reads_none() {
+            let mut routes = vec![(
+                get_route("/me/mailFolders/F1/messages/delta", 500, "{}"),
+                None,
+            )];
+            routes.extend(folder_routes(INBOX, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) = start(&srv, "stats-never", 0, false);
+            assert!(paths_from(&srv, 0).iter().any(|p| is_delta(p, "F1")));
+            assert_eq!(stats(&store_path).synced_at, None);
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The small-folder branch: a folder of at most `SMALL_FOLDER`
+        /// messages walked whole in the pass is marked, and `stored` is the
+        /// rows its delta brought.
+        #[test]
+        fn a_small_folders_full_delta_sets_the_sync_time() {
+            let full = delta_page(
+                &[
+                    full_message_json("M1", "One", "2026-11-01T10:00:00Z"),
+                    full_message_json("M2", "Two", "2026-11-02T10:00:00Z"),
+                ],
+                LINK,
+            );
+            let mut routes = vec![(
+                get_route("/me/mailFolders/F1/messages/delta?$orderby", 200, &full),
+                None,
+            )];
+            routes.extend(folder_routes(
+                INBOX,
+                &[],
+                &[("F1", r#"{"totalItemCount":2,"unreadItemCount":0}"#)],
+            ));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) = start(&srv, "stats-small", 2, false);
+            let store = Store::open(&store_path).unwrap();
+            let h = store.folder_history("F1").unwrap().unwrap();
+            assert!(
+                h.scope.as_deref() == Some(SCOPE_WINDOW) || h.scope.as_deref() == Some(SCOPE_ALL),
+                "walked whole, not a head: {h:?}"
+            );
+            let s = stats(&store_path);
+            assert_eq!(s.stored, 2);
+            assert_eq!(
+                s.stored,
+                store.messages_in_folder("F1", i64::MAX, 0).unwrap().len() as i64
+            );
+            let t = s.synced_at.expect("a sync time");
+            assert!(crate::store::iso8601_to_unix_secs(&t).is_some(), "{t}");
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
