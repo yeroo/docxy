@@ -51,6 +51,17 @@ macro_rules! current_id_sql {
     };
 }
 
+/// SQL for now as a folder's sync time (#2125, `folders.synced_at`):
+/// SQLite's clock in the store's one UTC format, `YYYY-MM-DDTHH:MM:SSZ`
+/// (what `iso8601_to_unix_secs` reads). Spelled once, for the three
+/// statements that store a folder's link (`set_delta_link`,
+/// `set_head_link`, `complete_backfill`).
+macro_rules! synced_now {
+    () => {
+        "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"
+    };
+}
+
 /// The rows the size fill may ask Graph about (#2123): no size, never
 /// asked, with a `received_at` (the listing's filter starts at the oldest)
 /// and a Graph id. A `local:` row and a header-less one would stay unsized
@@ -245,6 +256,22 @@ pub struct FolderSize {
     /// How many stored messages have no size yet (`MessageRow::size`
     /// `None`), so a host can say the figure is incomplete.
     pub unsized_count: i64,
+}
+
+/// One folder's sync statistics (#2125, [`Store::folder_stats`]): what
+/// classic Outlook's folder Properties > Synchronization shows under
+/// "Statistics for this folder", besides the server's count
+/// (`FolderRow::total_count`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderStats {
+    /// When a sync round on the folder last completed against Graph, with
+    /// or without changes, as the store's UTC `YYYY-MM-DDTHH:MM:SSZ`.
+    /// `None` when it never did, or not since Clear Offline Items removed
+    /// the local copy.
+    pub synced_at: Option<String>,
+    /// How many messages the store holds in the folder (local drafts
+    /// included), without its subfolders.
+    pub stored: i64,
 }
 
 /// A file the user has attached to an outbound draft — a reference (path +
@@ -1873,6 +1900,7 @@ impl Store {
         // After `migrate_message_size`, never in `schema.rs`, for the same
         // reason as `REPLY_DRAFTS_INDEX_SQL`.
         conn.execute(UNSIZED_INDEX_SQL, [])?;
+        migrate_folder_synced_at(&conn)?;
         register_contact_match(&conn)?;
         Ok(Store { conn })
     }
@@ -2271,6 +2299,23 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// One folder's sync statistics (#2125): when a sync round on it last
+    /// completed and how many messages the store holds in it, in one read
+    /// (the count reads `idx_messages_folder_received`, no row). `None` for
+    /// an id with no `folders` row. By the stored id, like `folders`: an
+    /// old `local:` id a re-key replaced is unknown.
+    pub fn folder_stats(&self, folder_id: &str) -> Result<Option<FolderStats>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(FOLDER_STATS_SQL, params![folder_id], |r| {
+                Ok(FolderStats {
+                    synced_at: r.get(0)?,
+                    stored: r.get(1)?,
+                })
+            })
+            .optional()?)
     }
 
     /// The folders holding a row the engine's size fill may ask Graph
@@ -2778,10 +2823,16 @@ impl Store {
         Ok(flag)
     }
 
-    /// Stores the delta link for a folder (used to resume delta sync).
+    /// Stores the delta link for a folder (used to resume delta sync),
+    /// and marks it synced now (#2125, [`FolderStats::synced_at`], in the
+    /// same statement): a link is stored once its round completed.
     pub fn set_delta_link(&self, folder_id: &str, link: &str) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE folders SET delta_link = ?1 WHERE id = ?2",
+            concat!(
+                "UPDATE folders SET delta_link = ?1, synced_at = ",
+                synced_now!(),
+                " WHERE id = ?2"
+            ),
             params![link, folder_id],
         )?;
         Ok(())
@@ -2843,7 +2894,8 @@ impl Store {
     /// the sync pass), marking what it covers as [`SCOPE_HEAD`], and
     /// whether its walk's first call was refused the reminder `$expand`
     /// (#2054, `refused`): in the same statement, so no reader (and no
-    /// crash) ever sees the new link with the old link's mark.
+    /// crash) ever sees the new link with the old link's mark. The same
+    /// statement marks the folder synced now (#2125).
     pub fn set_head_link(
         &self,
         folder_id: &str,
@@ -2851,9 +2903,12 @@ impl Store {
         refused: bool,
     ) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE folders SET delta_link = ?2, history_scope = ?3,
-                                reminder_expand_refused = ?4
-             WHERE id = ?1",
+            concat!(
+                "UPDATE folders SET delta_link = ?2, history_scope = ?3,
+                                    reminder_expand_refused = ?4, synced_at = ",
+                synced_now!(),
+                " WHERE id = ?1"
+            ),
             params![folder_id, link, SCOPE_HEAD, refused],
         )?;
         Ok(())
@@ -2888,7 +2943,8 @@ impl Store {
     /// refused-reminder-expand mark (#2054) goes with the link, in the same
     /// statement: `refused` when the caller knows it (`Some`: a small
     /// folder walked whole in the sync pass), else the walk's own record
-    /// (`None`: `backfill_expand_refused`, a backfill that ends).
+    /// (`None`: `backfill_expand_refused`, a backfill that ends). The same
+    /// statement marks the folder synced now (#2125): the walk completed.
     pub fn complete_backfill(
         &self,
         folder_id: &str,
@@ -2898,12 +2954,15 @@ impl Store {
         refused: Option<bool>,
     ) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE folders SET delta_link = ?2, history_scope = ?3,
-                                backfill_link = NULL, backfill_synced = ?4,
-                                backfill_scope = NULL,
-                                reminder_expand_refused = COALESCE(?5, backfill_expand_refused),
-                                backfill_expand_refused = 0
-             WHERE id = ?1",
+            concat!(
+                "UPDATE folders SET delta_link = ?2, history_scope = ?3,
+                                    backfill_link = NULL, backfill_synced = ?4,
+                                    backfill_scope = NULL,
+                                    reminder_expand_refused = COALESCE(?5, backfill_expand_refused),
+                                    backfill_expand_refused = 0, synced_at = ",
+                synced_now!(),
+                " WHERE id = ?1"
+            ),
             params![folder_id, delta_link, scope, synced, refused],
         )?;
         Ok(())
@@ -6449,6 +6508,13 @@ impl Store {
         // their number bounded, as `empty_folder` does.
         prune_forgotten_on(&tx, FORGOTTEN_CAP)?;
         clear_folder_links_on(&tx, &id)?;
+        // The copy the last sync made is gone (#2125): no time until the
+        // resync completes. Not in `clear_folder_links_on`, whose other
+        // callers keep the rows.
+        tx.execute(
+            "UPDATE folders SET synced_at = NULL WHERE id = ?1",
+            params![id],
+        )?;
         tx.commit()?;
         Ok(ClearOfflineResult::Cleared {
             folder: id,
@@ -8986,8 +9052,9 @@ fn migrate_reply_links(conn: &Connection) -> Result<bool, StoreError> {
 /// engine's size fill reads the sizes of the rows stored before, and of
 /// any row a link minted before #2123 (which keeps the old `$expand`)
 /// brings later, a cheap `$select=id` listing instead of a re-enumeration.
-/// Last in `Store::init`. One IMMEDIATE transaction that probes for `size`
-/// first; a store that has it (every fresh one) is left alone. Returns
+/// In `Store::init` before `UNSIZED_INDEX_SQL`, which reads its column (and
+/// before `migrate_folder_synced_at`, #2125). One IMMEDIATE transaction that
+/// probes for `size` first; a store that has it (every fresh one) is left alone. Returns
 /// whether it migrated.
 fn migrate_message_size(conn: &Connection) -> Result<bool, StoreError> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
@@ -9006,6 +9073,31 @@ fn migrate_message_size(conn: &Connection) -> Result<bool, StoreError> {
     tx.commit()?;
     Ok(true)
 }
+
+/// Brings a store from before #2125 up to date: adds `folders.synced_at`
+/// (NULL: no folder has a known sync time yet). One IMMEDIATE transaction
+/// that probes for the column first, like `migrate_message_size`. Resets
+/// nothing. Returns whether it migrated.
+fn migrate_folder_synced_at(conn: &Connection) -> Result<bool, StoreError> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let has: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('folders') WHERE name = 'synced_at'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has > 0 {
+        return Ok(false);
+    }
+    tx.execute("ALTER TABLE folders ADD COLUMN synced_at TEXT", [])?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// `Store::folder_stats`' statement (#2125); a test checks that its count
+/// reads an index of `messages`, never the table.
+const FOLDER_STATS_SQL: &str = "SELECT f.synced_at,
+        (SELECT COUNT(*) FROM messages m WHERE m.folder_id = f.id)
+     FROM folders f WHERE f.id = ?1";
 
 /// The partial index over [`unsized_where!`]'s rows (#2123), keyed by
 /// folder, which `Store::size_fill_folders` and
@@ -25470,5 +25562,264 @@ mod clear_offline_tests {
                 .unwrap()
         };
         assert_eq!(after, triggers);
+    }
+}
+
+#[cfg(test)]
+mod folder_stats_tests {
+    use super::*;
+    use crate::graph::model::MailFolder;
+
+    const OLD: &str = "2000-01-01T00:00:00Z";
+
+    fn folder(s: &Store, id: &str) {
+        s.upsert_folder(&MailFolder {
+            id: id.into(),
+            display_name: id.into(),
+            parent_id: None,
+            total_count: 9,
+            unread_count: 0,
+            well_known_name: None,
+        })
+        .unwrap();
+    }
+
+    fn message(s: &Store, id: &str, folder: &str) {
+        s.conn
+            .execute(
+                "INSERT INTO messages (id, folder_id, received_at, is_read)
+                 VALUES (?1, ?2, '2026-11-01T00:00:00Z', 0)",
+                params![id, folder],
+            )
+            .unwrap();
+    }
+
+    fn stats(s: &Store, id: &str) -> FolderStats {
+        s.folder_stats(id).unwrap().unwrap()
+    }
+
+    fn backdate(s: &Store, id: &str) {
+        s.conn
+            .execute(
+                "UPDATE folders SET synced_at = ?2 WHERE id = ?1",
+                params![id, OLD],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn folder_stats_unknown_folder_is_none() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1");
+        assert_eq!(s.folder_stats("NOPE").unwrap(), None);
+        // A link stored for an unknown folder writes nothing, no error.
+        s.set_delta_link("NOPE", "LINK").unwrap();
+        assert_eq!(s.folder_stats("NOPE").unwrap(), None);
+    }
+
+    #[test]
+    fn folder_stats_never_synced_reads_none_and_counts_rows() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1");
+        folder(&s, "E");
+        message(&s, "M1", "F1");
+        message(&s, "M2", "F1");
+        assert_eq!(
+            stats(&s, "F1"),
+            FolderStats {
+                synced_at: None,
+                stored: 2
+            }
+        );
+        assert_eq!(
+            stats(&s, "E"),
+            FolderStats {
+                synced_at: None,
+                stored: 0
+            }
+        );
+    }
+
+    #[test]
+    fn folder_stats_counts_a_local_draft() {
+        let s = Store::open_in_memory().unwrap();
+        let local = s.create_local_draft("d", "", "", "").unwrap();
+        assert!(local.starts_with("local:"), "{local}");
+        let drafts = s.message_row(&local).unwrap().unwrap().folder_id;
+        assert_eq!(stats(&s, &drafts).stored, 1);
+    }
+
+    #[test]
+    fn folder_stats_drops_on_local_move_and_delete() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1");
+        folder(&s, "F2");
+        for id in ["M1", "M2", "M3"] {
+            message(&s, id, "F1");
+        }
+        assert_eq!(stats(&s, "F1").stored, 3);
+        s.move_message("M1", "F2").unwrap();
+        assert_eq!((stats(&s, "F1").stored, stats(&s, "F2").stored), (2, 1));
+        s.delete_message("M2").unwrap();
+        assert_eq!((stats(&s, "F1").stored, stats(&s, "F2").stored), (1, 1));
+    }
+
+    /// Each statement that stores a folder's link marks it synced now, in
+    /// the store's one UTC format, and only that folder.
+    fn assert_marks(store_link: impl Fn(&Store, &str)) {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1");
+        folder(&s, "F2");
+        store_link(&s, "F1");
+        let first = stats(&s, "F1").synced_at.unwrap();
+        // The store's one UTC format, which its own parser reads.
+        assert!(iso8601_to_unix_secs(&first).is_some(), "{first}");
+        backdate(&s, "F1");
+        store_link(&s, "F1");
+        let t = stats(&s, "F1").synced_at.unwrap();
+        assert!(t.as_str() > OLD, "{t}");
+        assert!(iso8601_to_unix_secs(&t).is_some(), "{t}");
+        assert_eq!(stats(&s, "F2").synced_at, None);
+    }
+
+    #[test]
+    fn set_delta_link_marks_the_folder_synced() {
+        assert_marks(|s, id| s.set_delta_link(id, "LINK").unwrap());
+    }
+
+    #[test]
+    fn set_head_link_marks_the_folder_synced() {
+        assert_marks(|s, id| s.set_head_link(id, "HEAD", false).unwrap());
+    }
+
+    #[test]
+    fn complete_backfill_marks_the_folder_synced() {
+        assert_marks(|s, id| s.complete_backfill(id, "FULL", SCOPE_ALL, 3, None).unwrap());
+    }
+
+    /// The other link and backfill writes keep the time: a page is not a
+    /// round, and a reset or an expiry stores no link.
+    #[test]
+    fn other_link_writes_keep_the_sync_time() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1");
+        s.set_delta_link("F1", "LINK").unwrap();
+        backdate(&s, "F1");
+        s.set_backfill_progress("F1", "NEXT", 2, SCOPE_ALL).unwrap();
+        s.reset_backfill("F1").unwrap();
+        s.expire_delta_link("F1").unwrap();
+        s.clear_delta_links().unwrap();
+        assert_eq!(stats(&s, "F1").synced_at.as_deref(), Some(OLD));
+    }
+
+    #[test]
+    fn upsert_folder_keeps_the_sync_time() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1");
+        backdate(&s, "F1");
+        s.upsert_folder(&MailFolder {
+            id: "F1".into(),
+            display_name: "Renamed".into(),
+            parent_id: None,
+            total_count: 10,
+            unread_count: 1,
+            well_known_name: None,
+        })
+        .unwrap();
+        assert_eq!(stats(&s, "F1").synced_at.as_deref(), Some(OLD));
+    }
+
+    #[test]
+    fn folder_stats_count_reads_an_index() {
+        let s = Store::open_in_memory().unwrap();
+        let plan: Vec<String> = s
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {FOLDER_STATS_SQL}"))
+            .unwrap()
+            .query_map(["F1"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let on_messages: Vec<&String> = plan.iter().filter(|p| p.contains("messages")).collect();
+        assert!(!on_messages.is_empty(), "{plan:?}");
+        // `messages` is searched through an index of `folder_id`, never
+        // scanned.
+        assert!(
+            on_messages
+                .iter()
+                .all(|p| p.starts_with("SEARCH") && p.contains("INDEX")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn clear_offline_items_forgets_the_sync_time() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1");
+        folder(&s, "F2");
+        message(&s, "M1", "F1");
+        backdate(&s, "F1");
+        backdate(&s, "F2");
+        assert!(matches!(
+            s.clear_offline_items("F1").unwrap(),
+            ClearOfflineResult::Cleared { .. }
+        ));
+        assert_eq!(
+            stats(&s, "F1"),
+            FolderStats {
+                synced_at: None,
+                stored: 0
+            }
+        );
+        assert_eq!(stats(&s, "F2").synced_at.as_deref(), Some(OLD));
+    }
+
+    /// An emptied folder's local copy matches the server's: its time stays.
+    #[test]
+    fn finish_folder_empty_keeps_the_sync_time() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1");
+        backdate(&s, "F1");
+        s.finish_folder_empty(0, "B", "F1").unwrap();
+        assert_eq!(stats(&s, "F1").synced_at.as_deref(), Some(OLD));
+    }
+
+    #[test]
+    fn migrate_folder_synced_at_adds_the_column_to_an_old_store() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-synced-at-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        {
+            let s = Store::open(&path).unwrap();
+            folder(&s, "F1");
+            message(&s, "M1", "F1");
+            s.set_delta_link("F1", "LINK").unwrap();
+            // Take the database back to before the column existed.
+            s.conn
+                .execute_batch("ALTER TABLE folders DROP COLUMN synced_at")
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            stats(&s, "F1"),
+            FolderStats {
+                synced_at: None,
+                stored: 1
+            }
+        );
+        // Nothing else is reset.
+        assert_eq!(s.get_delta_link("F1").unwrap().as_deref(), Some("LINK"));
+        assert!(!migrate_folder_synced_at(&s.conn).unwrap());
+        s.set_delta_link("F1", "LINK").unwrap();
+        drop(s);
+        // Opening again (the column there) keeps the time.
+        let s = Store::open(&path).unwrap();
+        assert!(stats(&s, "F1").synced_at.is_some());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2787,7 +2787,7 @@ icon without a request per row: each `MessageRow` (every read: `message_row`,
   PATCH's `reread_message` (`get_message`, with the expand) restores it. Known limit: if
   that re-read is itself refused the expand (a 400, then a plain GET), it carries no
   class, and the row reads off until a delta reports the message again.
-- Migration: `migrate_meeting_reminder`, last in `Store::init`, probes for the column in
+- Migration: `migrate_meeting_reminder`, in `Store::init`, probes for the column in
   one IMMEDIATE transaction and adds it (old rows read false). It does **not** reset any
   delta or backfill state, unlike #2054's, #2081's and #2088's: the expand did not
   change, so every stored link already brings the bit and the class, and a store older
@@ -2870,7 +2870,7 @@ links in one cheap read.
   join). The messages side of the query's WHERE is spelled as the index's, or SQLite
   will not use it. The index is created in `Store::init` after the migration, never in `schema.rs`:
   that batch runs before the migrations, when an old table has no `in_reply_to`.
-- Migration: `migrate_reply_links`, last in `Store::init`, probes for
+- Migration: `migrate_reply_links`, in `Store::init`, probes for
   `internet_message_id` in one IMMEDIATE transaction, adds both columns (old rows read
   `""`) and resets every folder's delta and backfill state and both expand-refused marks,
   as #2088's does. A link minted before #2096 carries the old `$select` and `$expand`, so
@@ -3591,7 +3591,8 @@ A host can draw classic Outlook's Folder Size dialog. The Local Data tab comes f
   flag is needed. A local draft (`create_local_draft`) reads `None` until Graph's copy brings
   one. `reconcile_id` and `follow_move` re-key the row and keep it. The FTS update trigger reads
   other columns (#1913), so no size write touches `messages_fts`.
-- Migration `migrate_message_size` is the last one in `Store::init`: one IMMEDIATE transaction
+- Migration `migrate_message_size` runs in `Store::init` before `UNSIZED_INDEX_SQL` (which reads
+  its column) and `migrate_folder_synced_at` (#2125): one IMMEDIATE transaction
   that probes `pragma_table_info('messages')` for `size` and adds both columns. Unlike
   #2081/#2088/#2096, it resets **no** delta or backfill state. The size fill covers both the
   rows stored before #2123 and the rows a link minted before it brings later.
@@ -4149,3 +4150,74 @@ deletes on the server too).
   and a `local:` folder whose queued create is dropped),
   `clear_offline_items_signed_out_is_refused`,
   `clear_offline_items_before_a_shutdown_clears_without_a_request`.
+
+## A folder's last sync time and stored count (#2125)
+
+Classic Outlook's folder Properties > Synchronization, "Statistics for this folder":
+**Last synchronized on** and **Offline folder contains**. "Server folder contains" is
+`FolderRow::total_count`, unchanged. `FolderRow` gets no field: a client building one
+literally would break.
+
+- `Store::folder_stats(folder_id) -> Option<FolderStats { synced_at: Option<String>, stored:
+  i64 }>`: one statement (`FOLDER_STATS_SQL`), `None` for an id with no `folders` row. `stored`
+  is `COUNT(*)` of the rows filed in the folder (local drafts included, subfolders not), read
+  through `idx_messages_folder_received` (a test checks the plan). It reads by the stored id,
+  like `folders()`: no re-key resolution.
+- `folders.synced_at TEXT`, NULL = never synced. It holds SQLite's
+  `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')` (`synced_now!`): the store's one UTC format, which
+  `iso8601_to_unix_secs` reads (no milliseconds: it would reject them). There is no Rust clock.
+  `migrate_folder_synced_at` (last in `Store::init`, after `migrate_message_size`) adds the
+  column in one IMMEDIATE transaction and resets nothing.
+- Where it is written: in the statement that stores the folder's link, so the time never lags
+  its link and costs no extra write. The PR owner chose this over a separate mark call.
+  - The three statements: `set_delta_link`, `set_head_link` and `complete_backfill`.
+  - Every production caller is a round that completed against Graph, with or without changes:
+    - `sync_folder_delta_once`'s three branches: a round on the stored link, a head, and a
+      small folder walked whole;
+    - `backfill_step`'s last round on the folder's own link (`set_delta_link`);
+    - `backfill_step`'s completion (`complete_backfill`).
+  - The first version wrote it with a second `UPDATE` between the link write and
+    `MessagesUpdated`. On a slow Windows runner, that widened the window in which
+    `meeting_message_types` tests (they wait for `get_delta_link`, drain, then expect events
+    exactly) saw an extra `MessagesUpdated` (#2147).
+  - Not marked, as no link is stored:
+    - a failed round (`react`), a checkpoint stop, a last page with no deltaLink;
+    - a failed link write (by construction);
+    - a folder being emptied;
+    - an expired link (the phase-1 re-run marks when it stores one);
+    - an intermediate backfill page (`set_backfill_progress`), `reset_backfill`,
+      `expire_delta_link`, `clear_delta_links`.
+  - A completed walk marks through `complete_backfill`, whatever its last own-link round did
+    (ran, ended without a link, or was skipped as expired): the walk's deltaLink becomes the
+    folder's sync point.
+  - A failed link write is not reported, as before. There is no `SyncEvent`: a host reads
+    `folder_stats` when its dialog opens.
+- What keeps the time and what clears it:
+  - `upsert_folder` never writes it.
+  - `Store::clear_offline_items` (#2124) sets it NULL in its transaction: the copy the last sync
+    made is gone, and its resync sets it again. Not in `clear_folder_links_on`, whose other
+    callers keep the rows.
+  - `clear_delta_links` (reconverge) and `finish_folder_empty` (#2110) keep it.
+  - `rekey_folder_on` renames the `local:` row, so a re-keyed folder carries the local row's
+    time (NULL) until its next round.
+- Tests: `store/mod.rs` `folder_stats_tests`:
+  - unknown id, never synced and counts, a local draft, a local move and delete;
+  - each link statement marks (`set_delta_link_` / `set_head_link_` /
+    `complete_backfill_marks_the_folder_synced`: the format, a later mark, only that folder);
+  - `other_link_writes_keep_the_sync_time`, `upsert_folder` keeps it;
+  - the query plan;
+  - Clear Offline Items forgets it, `finish_folder_empty` keeps it;
+  - the migration.
+
+  Each statement without its `synced_at` fails its store test and an engine test. Engine tests
+  seed the store before spawn and open `Store` only after `stop` (#2146's CI: a `Store::open`
+  polled during startup met the engine's lock). The link test's mid-run check, made while
+  the engine is idle, is one statement on a raw connection:
+  - `tests::folder_stats`: `a_round_without_changes_sets_the_sync_time` (the link branch, then
+    a `SyncFolder`), `a_failed_round_keeps_the_sync_time` (500),
+    `a_folder_whose_delta_never_succeeded_reads_none`,
+    `a_small_folders_full_delta_sets_the_sync_time` (`stored` = the rows brought).
+  - `tests::backfill`: `a_head_sets_the_sync_time_before_the_backfill_ends` (the walk's first
+    call always 500), `backfill_completion_sets_the_sync_time`. In that test both rounds on
+    the head link (the pass's and the walk's last) get a page with no deltaLink and store
+    nothing, so only `complete_backfill` can mark.
