@@ -3868,7 +3868,9 @@ already shown it as done.
   - `OutboxOp::RespondMeeting`: after `rsvp_proposal`, with the window it approved (canonical
     UTC), and `kind` as `RsvpKind::as_status` (the `RespondEvent` vocabulary).
   - `OutboxOp::RemoveFromCalendar { message_id }`: not queued again while an equal one is
-    queued.
+    queued. A live remove of the same message while it waits (r1) queues no `DeleteEvent`
+    beside it, as for an equal `DeleteEvent`: that DELETE would 404 after the kept op's and
+    be retried into a quarantine. The row still goes, and the removal is reported.
   - `OutboxOp::SetAutomaticReplies { body }`: the PATCH body (`automatic_replies_body`) built
     now and sent as stored (`GraphClient::set_automatic_replies_body`).
   - `OutboxOp::SaveAttachment { message_id, attachment_id, dest, item }`: one op for both
@@ -3910,7 +3912,7 @@ already shown it as done.
   `compose_reply_before_a_shutdown_is_dropped`, the extended
   `persists_at_shutdown_lists_the_outbox_writes`; `tests::a_refused_direct_op_is_dropped_without_a_reconverge`,
   `a_5xx_keeps_a_direct_op_queued`, `a_queued_remove_from_calendar_deletes_the_row_after_the_delete`
-  and `..._takes_a_404_as_done`; `store` `kept_at_shutdown_ops_round_trip_json_and_name_no_message`;
+  and `..._takes_a_404_as_done`, `remove_from_calendar_while_a_kept_remove_waits_queues_no_delete`; `store` `kept_at_shutdown_ops_round_trip_json_and_name_no_message`;
   `graph::client` `rsvp_kind_as_status_round_trips`.
 
 ## Backfill one folder next (#2133)

@@ -7309,15 +7309,20 @@ impl Engine {
         // that then fails would stay hidden, as delta reports no change for it.
         // A remove of the same event still queued (offline, a back-off) is
         // not queued twice: its second DELETE would 404 after the first went
-        // out, and a `DeleteEvent` 404 is retried into a quarantine. A queue
-        // that cannot be read is queued to.
+        // out, and a `DeleteEvent` 404 is retried into a quarantine. That
+        // covers a remove of the same message a shutdown queued (#2132):
+        // its op DELETEs this event too. A queue that cannot be read is
+        // queued to.
         let op = OutboxOp::DeleteEvent {
             id: event_id.clone(),
+        };
+        let kept = OutboxOp::RemoveFromCalendar {
+            message_id: message_id.clone(),
         };
         let queued = self
             .store
             .pending_ops()
-            .is_ok_and(|ops| ops.iter().any(|r| r.op == op));
+            .is_ok_and(|ops| ops.iter().any(|r| r.op == op || r.op == kept));
         if !queued && let Err(e) = self.store.enqueue_op(&op) {
             self.emit(SyncEvent::Error(format!(
                 "remove from calendar {message_id}: {e}"
@@ -16996,6 +17001,79 @@ mod tests {
             srv.requests()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2132 r1: a remove of the same message that a shutdown queued
+    /// (`OutboxOp::RemoveFromCalendar`), still waiting (its DELETE answered
+    /// 500), DELETEs this event too: a live remove does not queue a
+    /// `DeleteEvent` beside it, whose DELETE would then 404 into a
+    /// quarantine. The row still goes, and the removal is reported.
+    #[test]
+    fn remove_from_calendar_while_a_kept_remove_waits_queues_no_delete() {
+        let kept = OutboxOp::RemoveFromCalendar {
+            message_id: "M1".into(),
+        };
+        let queued = kept.clone();
+        let (srv, handle, store_path, dir) = spawn_calendar_engine(
+            "remove-from-calendar-kept-waits",
+            vec![
+                message_route(
+                    "M1",
+                    r#"{"id":"M1","meetingMessageType":"meetingCancelled",
+                        "event":{"id":"E1","isOrganizer":false}}"#,
+                ),
+                Route {
+                    status: 500,
+                    ..delete_route("/me/events/E1")
+                },
+            ],
+            |s| {
+                s.upsert_event(&meeting("E1", false)).unwrap();
+                s.upsert_event(&meeting("E2", false)).unwrap();
+                s.enqueue_op(&queued).unwrap();
+            },
+        );
+        let store = Store::open(&store_path).unwrap();
+        // The startup drain sent the kept op's DELETE and got a 500.
+        assert!(
+            wait_until(ENGINE_WAIT, || store
+                .pending_ops()
+                .unwrap()
+                .first()
+                .is_some_and(|r| r.attempts == 1)),
+            "{:?}",
+            store.pending_ops()
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::RemoveFromCalendar {
+                message_id: "M1".into(),
+            })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(
+                e,
+                SyncEvent::RemovedFromCalendar { .. } | SyncEvent::Error(_)
+            )
+        });
+        assert_eq!(
+            seen.last(),
+            Some(&SyncEvent::RemovedFromCalendar {
+                message_id: "M1".into(),
+                event_id: Some("E1".into()),
+            })
+        );
+        let ops: Vec<OutboxOp> = store
+            .pending_ops()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.op)
+            .collect();
+        assert_eq!(ops, [kept], "no DeleteEvent beside the kept remove");
+        assert_eq!(ids_in(&store, "CAL-A"), ["E2"]);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+        drop(srv);
     }
 
     #[test]
