@@ -4149,3 +4149,52 @@ deletes on the server too).
   and a `local:` folder whose queued create is dropped),
   `clear_offline_items_signed_out_is_refused`,
   `clear_offline_items_before_a_shutdown_clears_without_a_request`.
+
+## A folder's last sync time and stored count (#2125)
+
+Classic Outlook's folder Properties > Synchronization, "Statistics for this folder":
+**Last synchronized on** and **Offline folder contains**. "Server folder contains" is
+`FolderRow::total_count`, unchanged. `FolderRow` gets no field: a client building one
+literally would break.
+
+- `Store::folder_stats(folder_id) -> Option<FolderStats { synced_at: Option<String>, stored:
+  i64 }>`: one statement (`FOLDER_STATS_SQL`), `None` for an id with no `folders` row. `stored`
+  is `COUNT(*)` of the rows filed in the folder (local drafts included, subfolders not), read
+  through `idx_messages_folder_received` (a test checks the plan). It reads by the stored id,
+  like `folders()`: no re-key resolution.
+- `folders.synced_at TEXT`, NULL = never synced. `Store::mark_folder_synced` writes SQLite's
+  `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`: the store's one UTC format, which
+  `iso8601_to_unix_secs` reads (no milliseconds: it would reject them). There is no Rust clock.
+  `migrate_folder_synced_at` (last in `Store::init`, after `migrate_message_size`) adds the
+  column in one IMMEDIATE transaction and resets nothing.
+- When a folder is marked synced: a round that completes against Graph, with or without changes.
+  - `sync_folder_delta_once`, once the round's deltaLink is kept (`stored_link`): by
+    `set_delta_link` (a round on the stored link), `complete_backfill` (a small folder walked
+    whole) or `set_head_link` (a head).
+  - `backfill_step`, after `complete_backfill` (the walk and its last round on the folder's own
+    link are done).
+  - Not marked: a failed round (`react`), a checkpoint stop, a last page with no deltaLink, a
+    failed link write, a folder being emptied, an expired link (the phase-1 re-run marks when it
+    completes), an intermediate backfill page.
+  - A failed mark is not reported: it is a display figure. No `SyncEvent`: a host reads
+    `folder_stats` when its dialog opens.
+- What keeps the time and what clears it:
+  - `upsert_folder` never writes it.
+  - `Store::clear_offline_items` (#2124) sets it NULL in its transaction: the copy the last sync
+    made is gone, and its resync sets it again. Not in `clear_folder_links_on`, whose other
+    callers keep the rows.
+  - `clear_delta_links` (reconverge) and `finish_folder_empty` (#2110) keep it.
+  - `rekey_folder_on` renames the `local:` row, so a re-keyed folder carries the local row's
+    time (NULL) until its next round.
+- Tests: `store/mod.rs` `folder_stats_tests` (unknown id, never synced and counts, a local
+  draft, a local move and delete, the format and a later mark, `upsert_folder` keeps it, the
+  query plan, Clear Offline Items forgets it, `finish_folder_empty` keeps it, the migration).
+  Engine, the store seeded before spawn and written again only while the engine is idle:
+  - `tests::folder_stats`: `a_round_without_changes_sets_the_sync_time` (the link branch, then
+    a `SyncFolder`), `a_failed_round_keeps_the_sync_time` (500),
+    `a_folder_whose_delta_never_succeeded_reads_none`,
+    `a_small_folders_full_delta_sets_the_sync_time` (`stored` = the rows brought).
+  - `tests::backfill`: `a_head_sets_the_sync_time_before_the_backfill_ends` (the walk's first
+    call always 500), `backfill_completion_sets_the_sync_time`. In that test the pass's round
+    on the head link gets a page with no deltaLink and marks nothing, so only the walk's
+    completion can mark.
