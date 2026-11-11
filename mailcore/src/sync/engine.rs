@@ -584,6 +584,26 @@ pub enum SyncCommand {
     /// parent, and the id if it differs. A dest that is the folder or one
     /// inside it is refused at once.
     MoveFolder { id: String, dest: Option<String> },
+    /// Copy a mail folder, with its child folders and their mail, under
+    /// `dest` (#2118; `None`: the top of the mailbox, `msgfolderroot`), as
+    /// Outlook's Copy Folder does. The store has the copy at once under a
+    /// `local:` id beneath `dest` ([`SyncEvent::FoldersUpdated`]), named as
+    /// the source and showing its counts, with no messages and no child
+    /// folders: the store never copies mail. Once no older op is queued (a
+    /// copy is a snapshot of Graph, so what the user did before it lands
+    /// first), `POST /me/mailFolders/{id}/copy` follows through the outbox;
+    /// once Graph answers, the row is re-keyed to Graph's id
+    /// ([`SyncEvent::FolderCreated`], `FoldersUpdated`), the folders are
+    /// listed again and the copy and every folder under it are synced, so
+    /// their mail arrives under Graph's ids. Anything aimed at the `local:`
+    /// id meanwhile follows it, as for a created folder. A refusal (a name
+    /// already under `dest`, a dest inside the folder, a folder Exchange
+    /// will not copy) removes the copy and is
+    /// [`SyncEvent::FolderWriteFailed`] (`write: Copy`, naming the source).
+    /// Refused at once: an unknown folder or dest, and the drafts sentinel
+    /// as either. The engine refuses no other folder or dest: that is the
+    /// UI's rule, and Graph's.
+    CopyFolder { id: String, dest: Option<String> },
     /// Mark a whole folder read (#1913), on the server too, not only the
     /// mail the store holds. The store at once, in one transaction: every
     /// stored message of the folder read, its `unread_count` 0, the op
@@ -653,6 +673,8 @@ pub enum FolderWrite {
     Delete,
     /// [`SyncCommand::EmptyFolder`] (#2110).
     Empty,
+    /// [`SyncCommand::CopyFolder`] (#2118).
+    Copy,
 }
 
 impl FolderWrite {
@@ -664,6 +686,7 @@ impl FolderWrite {
             FolderWrite::MarkRead => "mark all read in",
             FolderWrite::Delete => "delete",
             FolderWrite::Empty => "empty",
+            FolderWrite::Copy => "copy",
         }
     }
 }
@@ -805,10 +828,11 @@ pub enum SyncEvent {
         /// already gone).
         attempted: Option<FolderContact>,
     },
-    /// A folder created locally reached Graph (#1910): the row created as
-    /// `local_id` is stored as `id` now, with its messages and child
-    /// folders. The `local:` id still resolves (`Store::current_folder_id`).
-    /// [`SyncEvent::FoldersUpdated`] follows.
+    /// A folder created (#1910) or copied (#2118) locally reached Graph: the
+    /// row created as `local_id` is stored as `id` now, with its messages
+    /// and child folders. The `local:` id still resolves
+    /// (`Store::current_folder_id`). [`SyncEvent::FoldersUpdated`] follows;
+    /// a copy's contents follow with the sync after the drain.
     FolderCreated { local_id: String, id: String },
     /// A folder write was refused (#1910): by Graph for good (any failure
     /// but a 401, a throttle, a transport error or a 5xx, which keep the op
@@ -823,6 +847,8 @@ pub enum SyncEvent {
     ///   into it (a draft) is filed back in Drafts, or the drafts sentinel,
     ///   with [`SyncEvent::MessagesUpdated`] for that folder before this
     ///   event; other mail moved into it comes back by a mail reconverge;
+    /// - a refused copy (#2118) removes its `local:` copy, as a refused
+    ///   create removes its folder; the event names the source;
     /// - a rename or move puts the previous name or parent back (best
     ///   effort; the next listing corrects the rest);
     /// - a refused delete (Graph's or the walk's) is not reverted: the
@@ -830,12 +856,13 @@ pub enum SyncEvent {
     ///   Graph has them, their mail with their next delta (#2107).
     ///
     /// Each `FolderWriteFailed` is followed by its [`SyncEvent::Error`],
-    /// `"{create|rename|move|mark all read in|delete} folder {id}: {error}"`;
+    /// `"{create|rename|move|mark all read in|delete|empty|copy} folder {id}: {error}"`;
     /// after Graph's refusal (or a walk's) one [`SyncEvent::FoldersUpdated`]
     /// ends them.
     FolderWriteFailed {
         /// The folder's id as stored when it failed (the Graph id once a
         /// create re-keyed it); for a create the store refused, its parent;
+        /// for a copy, its source (resolved through `folder_aliases`);
         /// for a queued delete, the root it was queued for (resolved
         /// through `folder_aliases`).
         id: String,
@@ -1267,6 +1294,8 @@ fn folder_op(op: &OutboxOp) -> Option<(FolderWrite, &str)> {
         OutboxOp::RenameFolder { id, .. } => Some((FolderWrite::Rename, id)),
         OutboxOp::MoveFolder { id, .. } => Some((FolderWrite::Move, id)),
         OutboxOp::DeleteFolder { id, .. } => Some((FolderWrite::Delete, id)),
+        // Named by its source, the folder the command named (#2118).
+        OutboxOp::CopyFolder { source, .. } => Some((FolderWrite::Copy, source)),
         _ => None,
     }
 }
@@ -1568,6 +1597,7 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         backfill_done: false,
         reconverge_pending,
         relist_after_drain: false,
+        copied_after_drain: Vec::new(),
         calendar_reset_owed: false,
         masters_not_found: HashSet::new(),
         masters_skipped: HashSet::new(),
@@ -1629,10 +1659,15 @@ struct Engine {
     /// count, `backfill_remains`; `end_reconverge`). Persisted (`Store::clear_delta_links` sets it,
     /// `run` loads it), so a restart in the middle keeps the cutoff off.
     reconverge_pending: bool,
-    /// A `DeleteFolder` was refused in this drain (#2107): once it ends,
-    /// the folder tree is listed again, which brings the folders back where
-    /// Graph has them.
+    /// A `DeleteFolder` was refused in this drain (#2107), or a
+    /// `CopyFolder` reached Graph (#2118): once it ends, the folder tree is
+    /// listed again, which brings the folders back where Graph has them,
+    /// and a copy's child folders.
     relist_after_drain: bool,
+    /// The Graph ids of the folders copied in this drain (#2118): once it
+    /// ends (and the folders were listed again), each and every folder
+    /// under it is synced, so the mail Graph copied arrives.
+    copied_after_drain: Vec<String>,
     /// The calendars owe a reset: initial rounds over every window. Owed
     /// when a series edit went through (#2022), and when a `RespondEvent`
     /// was refused (#2023), whose host may have written the status itself
@@ -2338,6 +2373,10 @@ impl Engine {
             SyncCommand::MoveFolder { id, dest } => {
                 let r = self.store.move_folder(&id, dest.as_deref());
                 self.folder_command(FolderWrite::Move, &id, r);
+            }
+            SyncCommand::CopyFolder { id, dest } => {
+                let r = self.store.copy_folder(&id, dest.as_deref());
+                self.folder_command(FolderWrite::Copy, &id, r);
             }
             SyncCommand::MarkFolderRead { folder } => {
                 let r = self
@@ -4058,10 +4097,26 @@ impl Engine {
                     BulkStep::Stopped => return Drain::Aborted,
                 }
             }
+            // A copy is a snapshot of Graph (#2118): it is sent only once it
+            // is the oldest op, as a `DeleteFolder`, so what the user did
+            // before it (an empty, a move into the folder retried after a
+            // 4xx) lands or is given up first. Skipping it is no deferral.
+            if matches!(row.op, OutboxOp::CopyFolder { .. })
+                && self.store.has_older_op(row.seq).unwrap_or(true)
+            {
+                continue;
+            }
             match self.apply_op_with_retry(&row) {
                 Ok(applied) => {
                     self.store.drop_op(row.seq);
                     self.clear_op_backoff();
+                    // A copy's contents are synced once the drain ends.
+                    if let (OutboxOp::CopyFolder { .. }, Applied::FolderCreated { id, .. }) =
+                        (&row.op, &applied)
+                    {
+                        self.copied_after_drain.push(id.clone());
+                        self.relist_after_drain = true;
+                    }
                     match applied {
                         Applied::Moved { old_id, new_id } => self.follow_move(old_id, new_id),
                         Applied::ContactCreated { local_id, id } => {
@@ -4242,8 +4297,12 @@ impl Engine {
         if !sent.is_empty() && !self.sync_after_send(&sent) {
             return Drain::Aborted;
         }
-        // A refused delete's folders come back where Graph has them.
+        // A refused delete's folders come back where Graph has them, and a
+        // copy's child folders are listed (#2118).
         if std::mem::take(&mut self.relist_after_drain) && !self.sync_folders(false) {
+            return Drain::Aborted;
+        }
+        if !self.copied_after_drain.is_empty() && !self.sync_copied_folders() {
             return Drain::Aborted;
         }
         if deferred {
@@ -4343,7 +4402,11 @@ impl Engine {
     /// folder Graph has it in. The `local:` folders created under it go too,
     /// each reported (`FolderWriteFailed` with no status, "its parent folder
     /// could not be created"); one only moved under it stays, and its move
-    /// there is refused next. A refused rename or move reverts best effort
+    /// there is refused next. A refused copy (#2118) removes its `local:`
+    /// copy the same way, and is reported under its source; a copy queued
+    /// into a removed folder goes too, reported as a copy of its source
+    /// ("its destination folder could not be created"). A refused rename
+    /// or move reverts best effort
     /// (`prev` values are not chained); the next listing corrects the rest.
     fn refuse_folder_write(&mut self, row: &OutboxRow, err: &GraphError) {
         let Some((write, queued_id)) = folder_op(&row.op) else {
@@ -4355,10 +4418,18 @@ impl Engine {
             .unwrap_or_else(|_| queued_id.to_string());
         self.store.drop_op(row.seq);
         let mut also_discarded = Vec::new();
+        let mut discarded_copies = Vec::new();
         match &row.op {
-            OutboxOp::CreateFolder { .. } => {
-                let discard = self.store.discard_local_folder(&id).unwrap_or_default();
+            OutboxOp::CreateFolder { .. } | OutboxOp::CopyFolder { .. } => {
+                // A copy's op names its source (#2118): the `local:` folder
+                // it made is the op's own id.
+                let local = match &row.op {
+                    OutboxOp::CopyFolder { id: copy, .. } => copy.as_str(),
+                    _ => id.as_str(),
+                };
+                let discard = self.store.discard_local_folder(local).unwrap_or_default();
                 also_discarded = discard.also_discarded;
+                discarded_copies = discard.discarded_copies;
                 if discard.had_mail {
                     self.start_mail_reconverge();
                 }
@@ -4394,7 +4465,47 @@ impl Engine {
                 "its parent folder could not be created".to_string(),
             );
         }
+        // So did the copies made under them (#2118), each named by its source.
+        for (_, source) in &discarded_copies {
+            self.report_folder_failure(
+                source,
+                FolderWrite::Copy,
+                None,
+                "its destination folder could not be created".to_string(),
+            );
+        }
         self.emit(SyncEvent::FoldersUpdated);
+    }
+
+    /// After a drain that copied folders (#2118), and the listing after it:
+    /// each copy (its id resolved now: a later op may have re-keyed it) and
+    /// every stored folder under it, which the listing brought, is synced
+    /// (`refresh_folder`: its delta, then its counts), so the mail Graph
+    /// copied arrives under Graph's ids. A copy whose row is gone (deleted
+    /// since) is skipped. `false` when the caller must stop; a copy not
+    /// synced here has no delta link, so the next pass syncs it.
+    fn sync_copied_folders(&mut self) -> bool {
+        let copied = std::mem::take(&mut self.copied_after_drain);
+        let mut seen = HashSet::new();
+        for id in copied {
+            let id = self.store.current_folder_id(&id).unwrap_or(id);
+            if !self.store.has_folder(&id).unwrap_or(false) {
+                continue;
+            }
+            let subtree = match self.store.folder_subtree(&id) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.emit(SyncEvent::Error(e.to_string()));
+                    continue;
+                }
+            };
+            for f in subtree {
+                if seen.insert(f.clone()) && !self.refresh_folder(&f) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// `FolderWriteFailed` and its `Error` line (#1910).
@@ -4446,6 +4557,14 @@ impl Engine {
                     FolderWrite::Create,
                     None,
                     "its parent folder was deleted".to_string(),
+                );
+            }
+            for (_, source) in &removed.discarded_copies {
+                self.report_folder_failure(
+                    source,
+                    FolderWrite::Copy,
+                    None,
+                    "its destination folder was deleted".to_string(),
                 );
             }
         }
@@ -28783,6 +28902,42 @@ mod tests {
                     error: "no folder NOPE".into(),
                 }
             );
+            // A copy (#2118): an unknown source or dest, the drafts
+            // sentinel as either.
+            for (id, dest, named, error) in [
+                ("NOPE", Some("ARCH"), "NOPE", "no folder NOPE"),
+                ("PROJ", Some("NOPE"), "PROJ", "no folder NOPE"),
+                (
+                    sentinel.as_str(),
+                    None,
+                    sentinel.as_str(),
+                    "the local drafts folder is not on the server",
+                ),
+                (
+                    "PROJ",
+                    Some(sentinel.as_str()),
+                    "PROJ",
+                    "the local drafts folder is not on the server",
+                ),
+            ] {
+                send(
+                    &handle,
+                    SyncCommand::CopyFolder {
+                        id: id.into(),
+                        dest: dest.map(str::to_string),
+                    },
+                );
+                assert_eq!(
+                    wait_store_refused(&handle),
+                    SyncEvent::FolderWriteFailed {
+                        id: named.into(),
+                        write: FolderWrite::Copy,
+                        status: None,
+                        error: error.into(),
+                    }
+                );
+            }
+            assert!(local_folders(&store).is_empty());
             assert!(store.pending_ops().unwrap().is_empty());
             assert!(writes_sent(&srv).is_empty());
             assert_eq!(
@@ -31097,6 +31252,480 @@ mod tests {
                 );
                 assert!(store.pending_ops().unwrap().is_empty());
                 assert_eq!(srv.requests().len(), before, "nothing sent");
+                stop(handle, dir);
+            }
+        }
+        /// #2118: `SyncCommand::CopyFolder`.
+        mod copy_folder {
+            use super::*;
+
+            /// The folder listing of `tree`, answering `uses` requests
+            /// (`None`: any number).
+            fn listing(tree: &[Listed], uses: Option<usize>) -> (Route, Option<usize>) {
+                let listed: Vec<String> = tree
+                    .iter()
+                    .map(|(id, parent, wk)| listed_json(id, *parent, *wk))
+                    .collect();
+                (
+                    get_route(
+                        "/me/mailFolders?",
+                        200,
+                        &format!(r#"{{"value":[{}]}}"#, listed.join(",")),
+                    ),
+                    uses,
+                )
+            }
+
+            /// `TREE` and `extra`.
+            fn with(extra: &[Listed]) -> Vec<Listed> {
+                TREE.iter().chain(extra).copied().collect()
+            }
+
+            fn post(path: &str, body: &str) -> (String, String, String) {
+                ("POST".to_string(), path.to_string(), body.to_string())
+            }
+
+            fn failures(events: &[SyncEvent]) -> Vec<SyncEvent> {
+                events
+                    .iter()
+                    .filter(|e| matches!(e, SyncEvent::FolderWriteFailed { .. }))
+                    .cloned()
+                    .collect()
+            }
+
+            /// Criteria 1–3: the exact POST and body (`msgfolderroot` for the
+            /// top), the copy shown at once under a `local:` id, re-keyed to
+            /// Graph's, then the folders listed again and the copy and its
+            /// subfolder synced, their mail under Graph's ids; the source and
+            /// its mail unchanged.
+            #[test]
+            fn copy_folder_round_trip_syncs_the_copy_and_its_subfolder() {
+                let copied: &[Listed] = &[("C1", Some("ARCH"), None), ("C1S", Some("C1"), None)];
+                let top: &[Listed] = &[("C2", Some("ROOT"), None)];
+                let after = with(&[copied, top].concat());
+                let (srv, handle, store, dir) = engine(
+                    "folder-copy",
+                    world(
+                        vec![
+                            listing(TREE, Some(1)),
+                            listing(&with(copied), Some(1)),
+                            write(
+                                "POST",
+                                "/me/mailFolders/PROJ/copy",
+                                201,
+                                &answer("C1", "ARCH"),
+                            ),
+                            write(
+                                "POST",
+                                "/me/mailFolders/OTHER/copy",
+                                201,
+                                &answer("C2", "ROOT"),
+                            ),
+                        ],
+                        &after,
+                        &[
+                            ("PROJ", "m-proj"),
+                            ("SUB", "m-sub"),
+                            ("C1", "m-c1"),
+                            ("C1S", "m-c1s"),
+                        ],
+                    ),
+                    None,
+                );
+                assert_eq!(mail_in(&store, "PROJ"), ["m-proj"]);
+                assert!(row(&store, "C1").is_none(), "not listed before the copy");
+                let proj = row(&store, "PROJ").unwrap();
+                let sub = row(&store, "SUB").unwrap();
+                send(
+                    &handle,
+                    SyncCommand::CopyFolder {
+                        id: "PROJ".into(),
+                        dest: Some("ARCH".into()),
+                    },
+                );
+                let mut seen = wait_for(&handle.evt_rx, |e| {
+                    matches!(e, SyncEvent::FolderCreated { .. })
+                });
+                seen.extend(wait_for(&handle.evt_rx, |e| {
+                    matches!(e, SyncEvent::FoldersUpdated)
+                }));
+                let created = seen
+                    .iter()
+                    .position(|e| matches!(e, SyncEvent::FolderCreated { .. }))
+                    .unwrap();
+                assert!(
+                    seen[..created].contains(&SyncEvent::FoldersUpdated),
+                    "the local copy is shown first: {seen:?}"
+                );
+                let SyncEvent::FolderCreated { local_id, id } = seen[created].clone() else {
+                    unreachable!()
+                };
+                assert!(local_id.starts_with("local:"), "{local_id}");
+                assert_eq!(id, "C1");
+                assert_eq!(store.current_folder_id(&local_id).unwrap(), "C1");
+                assert!(
+                    wait_until(ENGINE_WAIT, || mail_in(&store, "C1") == ["m-c1"]
+                        && mail_in(&store, "C1S") == ["m-c1s"]),
+                    "C1 {:?}, C1S {:?}",
+                    mail_in(&store, "C1"),
+                    mail_in(&store, "C1S")
+                );
+                assert_eq!(
+                    row(&store, "C1").unwrap().parent_id.as_deref(),
+                    Some("ARCH")
+                );
+                assert_eq!(row(&store, "C1S").unwrap().parent_id.as_deref(), Some("C1"));
+                assert!(row(&store, "C1").unwrap().delta_link.is_some());
+                assert!(row(&store, "C1S").unwrap().delta_link.is_some());
+                // The source is unchanged, with its mail and subfolder.
+                assert_eq!(row(&store, "PROJ").unwrap(), proj);
+                assert_eq!(row(&store, "SUB").unwrap(), sub);
+                assert_eq!(mail_in(&store, "PROJ"), ["m-proj"]);
+                assert_eq!(mail_in(&store, "SUB"), ["m-sub"]);
+
+                // To the top: `msgfolderroot`.
+                send(
+                    &handle,
+                    SyncCommand::CopyFolder {
+                        id: "OTHER".into(),
+                        dest: None,
+                    },
+                );
+                wait_for(
+                    &handle.evt_rx,
+                    |e| matches!(e, SyncEvent::FolderCreated { id, .. } if id == "C2"),
+                );
+                wait_drained(&store);
+                assert_eq!(
+                    row(&store, "C2").unwrap().parent_id.as_deref(),
+                    Some("ROOT")
+                );
+                assert!(row(&store, "OTHER").is_some());
+                assert_eq!(
+                    writes_sent(&srv),
+                    [
+                        post("/me/mailFolders/PROJ/copy", r#"{"destinationId":"ARCH"}"#),
+                        post(
+                            "/me/mailFolders/OTHER/copy",
+                            r#"{"destinationId":"msgfolderroot"}"#
+                        ),
+                    ]
+                );
+                assert!(local_folders(&store).is_empty());
+                no_local_request(&srv);
+                stop(handle, dir);
+            }
+
+            /// Criterion 4: a copy into a folder whose create is still
+            /// deferred, and a copy of it, both wait behind the create and
+            /// are sent with its Graph id.
+            #[test]
+            fn a_copy_into_or_of_a_created_folder_follows_its_create() {
+                let after = with(&[
+                    ("G1", Some("ROOT"), None),
+                    ("C1", Some("G1"), None),
+                    ("C2", Some("ARCH"), None),
+                ]);
+                let (srv, handle, store, dir) = engine(
+                    "folder-copy-created",
+                    world(
+                        vec![
+                            // The startup pass and Refresh's.
+                            listing(TREE, Some(2)),
+                            write(
+                                "POST",
+                                "/me/mailFolders/PROJ/copy",
+                                201,
+                                &answer("C1", "G1"),
+                            ),
+                            write(
+                                "POST",
+                                "/me/mailFolders/G1/copy",
+                                201,
+                                &answer("C2", "ARCH"),
+                            ),
+                            once("POST", "/me/mailFolders", 500, "busy"),
+                            write("POST", "/me/mailFolders", 201, &answer("G1", "ROOT")),
+                        ],
+                        &after,
+                        &[("C1", "m-c1")],
+                    ),
+                    None,
+                );
+                send(
+                    &handle,
+                    SyncCommand::CreateFolder {
+                        parent: None,
+                        name: "New".into(),
+                    },
+                );
+                wait_requests(&srv, "POST", "/me/mailFolders", 1);
+                let created = local_folders(&store).pop().expect("the local: row");
+                send(
+                    &handle,
+                    SyncCommand::CopyFolder {
+                        id: "PROJ".into(),
+                        dest: Some(created.clone()),
+                    },
+                );
+                send(
+                    &handle,
+                    SyncCommand::CopyFolder {
+                        id: created.clone(),
+                        dest: Some("ARCH".into()),
+                    },
+                );
+                wait_queued(&store, 3);
+                assert_eq!(local_folders(&store).len(), 3);
+                assert_eq!(writes_sent(&srv).len(), 1, "both wait behind the 500");
+
+                send(&handle, SyncCommand::Refresh);
+                wait_for(
+                    &handle.evt_rx,
+                    |e| matches!(e, SyncEvent::FolderCreated { id, .. } if id == "C2"),
+                );
+                wait_drained(&store);
+                let create = post("/me/mailFolders", r#"{"displayName":"New"}"#);
+                assert_eq!(
+                    writes_sent(&srv),
+                    [
+                        create.clone(),
+                        create,
+                        post("/me/mailFolders/PROJ/copy", r#"{"destinationId":"G1"}"#),
+                        post("/me/mailFolders/G1/copy", r#"{"destinationId":"ARCH"}"#),
+                    ]
+                );
+                assert_eq!(row(&store, "C1").unwrap().parent_id.as_deref(), Some("G1"));
+                assert_eq!(
+                    row(&store, "C2").unwrap().parent_id.as_deref(),
+                    Some("ARCH")
+                );
+                assert!(wait_until(ENGINE_WAIT, || mail_in(&store, "C1") == ["m-c1"]));
+                assert!(local_folders(&store).is_empty());
+                no_local_request(&srv);
+                stop(handle, dir);
+            }
+
+            /// Criterion 5: a 409 removes the local copy, and the folder
+            /// created and the copy made under it, each reported; a 400
+            /// likewise. The report names the source.
+            #[test]
+            fn a_refused_copy_removes_the_local_copy_and_reports() {
+                let (srv, handle, store, dir) = engine(
+                    "folder-copy-refused",
+                    world(
+                        vec![
+                            once("POST", "/me/mailFolders/PROJ/copy", 500, "busy"),
+                            write("POST", "/me/mailFolders/PROJ/copy", 409, EXISTS),
+                            write("POST", "/me/mailFolders/SUB/copy", 400, BAD),
+                        ],
+                        TREE,
+                        &[],
+                    ),
+                    None,
+                );
+                send(
+                    &handle,
+                    SyncCommand::CopyFolder {
+                        id: "PROJ".into(),
+                        dest: Some("ARCH".into()),
+                    },
+                );
+                wait_requests(&srv, "POST", "/me/mailFolders/PROJ/copy", 1);
+                let copy = local_folders(&store).pop().expect("the local copy");
+                assert_eq!(row(&store, &copy).unwrap().display_name, "PROJ");
+                send(
+                    &handle,
+                    SyncCommand::CreateFolder {
+                        parent: Some(copy.clone()),
+                        name: "Kid".into(),
+                    },
+                );
+                send(
+                    &handle,
+                    SyncCommand::CopyFolder {
+                        id: "OTHER".into(),
+                        dest: Some(copy.clone()),
+                    },
+                );
+                wait_queued(&store, 3);
+                let kid = local_folders(&store)
+                    .into_iter()
+                    .find(|f| row(&store, f).unwrap().display_name == "Kid")
+                    .unwrap();
+
+                send(&handle, SyncCommand::Refresh);
+                let (failed, seen) = wait_refused(&handle);
+                let SyncEvent::FolderWriteFailed { error, .. } = &failed else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    failed,
+                    SyncEvent::FolderWriteFailed {
+                        id: "PROJ".into(),
+                        write: FolderWrite::Copy,
+                        status: Some(409),
+                        error: error.clone(),
+                    }
+                );
+                assert!(error.contains("already exists"), "{error}");
+                assert_eq!(
+                    failures(&seen)[1..],
+                    [
+                        SyncEvent::FolderWriteFailed {
+                            id: kid,
+                            write: FolderWrite::Create,
+                            status: None,
+                            error: "its parent folder could not be created".into(),
+                        },
+                        SyncEvent::FolderWriteFailed {
+                            id: "OTHER".into(),
+                            write: FolderWrite::Copy,
+                            status: None,
+                            error: "its destination folder could not be created".into(),
+                        },
+                    ]
+                );
+                assert!(seen.contains(&SyncEvent::Error(
+                    "copy folder OTHER: its destination folder could not be created".into()
+                )));
+                wait_drained(&store);
+                assert!(local_folders(&store).is_empty());
+                assert!(row(&store, "PROJ").is_some());
+
+                // A 400.
+                send(
+                    &handle,
+                    SyncCommand::CopyFolder {
+                        id: "SUB".into(),
+                        dest: Some("OTHER".into()),
+                    },
+                );
+                let (failed, _) = wait_refused(&handle);
+                assert!(
+                    matches!(
+                        &failed,
+                        SyncEvent::FolderWriteFailed {
+                            id,
+                            write: FolderWrite::Copy,
+                            status: Some(400),
+                            ..
+                        } if id == "SUB"
+                    ),
+                    "{failed:?}"
+                );
+                wait_drained(&store);
+                assert!(local_folders(&store).is_empty());
+                assert_eq!(
+                    writes_sent(&srv)
+                        .into_iter()
+                        .map(|(_, p, _)| p)
+                        .collect::<Vec<_>>(),
+                    [
+                        "/me/mailFolders/PROJ/copy",
+                        "/me/mailFolders/PROJ/copy",
+                        "/me/mailFolders/SUB/copy",
+                    ],
+                    "nothing under the refused copy is sent"
+                );
+                stop(handle, dir);
+            }
+
+            /// A copy is a snapshot of Graph: one queued behind an empty of
+            /// its source (itself waiting behind a move refused for now)
+            /// waits too, and goes once the empty has run.
+            #[test]
+            fn a_copy_waits_for_an_older_empty_of_its_source() {
+                const LIST: &str =
+                    "/me/mailFolders/INBOX/messages?$filter=receivedDateTime%20le%20";
+                let mv = "/me/messages/G1/move";
+                let copy = "/me/mailFolders/INBOX/copy";
+                let (srv, handle, store, dir) = engine(
+                    "folder-copy-after-empty",
+                    world(
+                        vec![
+                            // The startup pass and Refresh's.
+                            listing(TREE, Some(2)),
+                            once("POST", mv, 400, BAD),
+                            once("POST", mv, 400, BAD),
+                            once("POST", mv, 400, BAD),
+                            write("POST", mv, 201, r#"{"id":"G1-NEW"}"#),
+                            once(
+                                "GET",
+                                LIST,
+                                200,
+                                r#"{"value":[{"id":"G1-NEW","internetMessageId":"<G1-NEW@x>"}]}"#,
+                            ),
+                            once(
+                                "POST",
+                                "/$batch",
+                                200,
+                                r#"{"responses":[{"id":"1","status":204,"headers":{}}]}"#,
+                            ),
+                            write("POST", copy, 201, &answer("C1", "ARCH")),
+                        ],
+                        &with(&[("C1", Some("ARCH"), None)]),
+                        &[("ARCH", "G1")],
+                    ),
+                    None,
+                );
+                send(
+                    &handle,
+                    SyncCommand::Move {
+                        id: "G1".into(),
+                        dest: "INBOX".into(),
+                    },
+                );
+                send(
+                    &handle,
+                    SyncCommand::EmptyFolder {
+                        folder: "INBOX".into(),
+                        subfolders: false,
+                    },
+                );
+                send(
+                    &handle,
+                    SyncCommand::CopyFolder {
+                        id: "INBOX".into(),
+                        dest: Some("ARCH".into()),
+                    },
+                );
+                // A barrier: answered with no request, after the commands.
+                send(
+                    &handle,
+                    SyncCommand::SearchMessages {
+                        query: " ".into(),
+                        folder_id: None,
+                        top: 1,
+                    },
+                );
+                wait_for(&handle.evt_rx, |e| {
+                    matches!(e, SyncEvent::MessageSearchFailed { .. })
+                });
+                assert_eq!(hits(&srv, "POST", mv), 3, "{:?}", writes_sent(&srv));
+                assert_eq!(hits(&srv, "POST", copy), 0, "the copy waits");
+                wait_queued(&store, 3);
+
+                send(&handle, SyncCommand::Refresh);
+                wait_for(
+                    &handle.evt_rx,
+                    |e| matches!(e, SyncEvent::FolderCreated { id, .. } if id == "C1"),
+                );
+                wait_drained(&store);
+                let reqs: Vec<(String, String)> = srv
+                    .requests()
+                    .into_iter()
+                    .map(|r| (r.method, r.path))
+                    .collect();
+                let at = |method: &str, path: &str| {
+                    reqs.iter()
+                        .rposition(|(m, p)| m == method && p.starts_with(path))
+                        .unwrap_or_else(|| panic!("{method} {path}: {reqs:?}"))
+                };
+                assert!(at("POST", mv) < at("GET", LIST), "{reqs:?}");
+                assert!(at("GET", LIST) < at("POST", "/$batch"), "{reqs:?}");
+                assert!(at("POST", "/$batch") < at("POST", copy), "{reqs:?}");
+                assert_eq!(hits(&srv, "POST", copy), 1);
                 stop(handle, dir);
             }
         }

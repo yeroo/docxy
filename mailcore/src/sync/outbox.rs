@@ -48,8 +48,9 @@ pub enum Applied {
     /// A `CreateContact` reached Graph and the store re-keyed the contact
     /// created as `local_id` to `id` (#2063). The caller reports it.
     ContactCreated { local_id: String, id: String },
-    /// A `CreateFolder` reached Graph and the store re-keyed the folder
-    /// created as `local_id` to `id` (#1910). The caller reports it.
+    /// A `CreateFolder` (#1910) or a `CopyFolder` (#2118) reached Graph and
+    /// the store re-keyed the folder created or copied as `local_id` to
+    /// `id`. The caller reports it (and syncs a copy's contents).
     FolderCreated { local_id: String, id: String },
     /// A `MoveFolder`'s answer changed the stored folder (its parent, or a
     /// new id, #1910): the caller emits `FoldersUpdated`.
@@ -93,6 +94,9 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Ap
         OutboxOp::MoveFolder {
             id, dest, parent, ..
         } => move_folder(client, store, id, dest.as_deref(), parent.as_deref()),
+        OutboxOp::CopyFolder { id, source, dest } => {
+            copy_folder(client, store, id, source, dest.as_deref())
+        }
         // The engine runs it itself (#1913: it pages the ids and PATCHes
         // them through `$batch`, across drains); it never reaches here.
         // Should it, nothing is sent, and `Parse` is final: the safe failure.
@@ -220,8 +224,53 @@ fn move_folder(
     })
 }
 
+/// `CopyFolder` (#2118): POST the copy of `source` under `dest`, both
+/// resolved now, then re-key the copy's `local:` row `id` to the folder
+/// Graph answers (`Store::reconcile_created_folder`; the answer's parent and
+/// counts come with the next listing). A source or dest still `local:`
+/// never reached Graph: the copy is refused as `Parse` (the refusal removes
+/// it). The source row is not required: a `DeleteFolder` queued after the
+/// copy removes it at once, but Graph keeps it until that delete runs,
+/// after this op. A copy row gone before the drain sends nothing, nor does
+/// an id that already resolves to a Graph id (a retry after the re-key).
+fn copy_folder(
+    client: &GraphClient,
+    store: &Store,
+    id: &str,
+    source: &str,
+    dest: Option<&str>,
+) -> Result<Applied, GraphError> {
+    if store.current_folder_id(id).map_err(store_err)? != id
+        || !store.has_folder(id).map_err(store_err)?
+    {
+        return Ok(Applied::Done);
+    }
+    let source = store.current_folder_id(source).map_err(store_err)?;
+    if source.starts_with("local:") {
+        return Err(GraphError::Parse(
+            "source folder never reached Graph".to_string(),
+        ));
+    }
+    let dest = dest
+        .map(|d| store.current_folder_id(d).map_err(store_err))
+        .transpose()?;
+    if dest.as_deref().is_some_and(|d| d.starts_with("local:")) {
+        return Err(GraphError::Parse(
+            "destination folder never reached Graph".to_string(),
+        ));
+    }
+    let copied = client.copy_folder(&source, dest.as_deref())?;
+    store
+        .reconcile_created_folder(id, &copied)
+        .map_err(store_err)?;
+    Ok(Applied::FolderCreated {
+        local_id: id.to_string(),
+        id: copied.id,
+    })
+}
+
 /// `apply_op` for every op it does not handle itself (`Move`, `CreateContact`,
-/// `CreateFolder`, `MoveFolder`).
+/// `CreateFolder`, `MoveFolder`, `CopyFolder`).
 fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(), GraphError> {
     match op {
         OutboxOp::MarkRead { id, read } => client.mark_read(&resolve(store, id)?, *read),
@@ -232,6 +281,7 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
         OutboxOp::Move { .. }
         | OutboxOp::CreateFolder { .. }
         | OutboxOp::MoveFolder { .. }
+        | OutboxOp::CopyFolder { .. }
         | OutboxOp::MarkFolderRead { .. }
         | OutboxOp::DeleteFolder { .. }
         | OutboxOp::EmptyFolder { .. } => {
@@ -4386,5 +4436,102 @@ mod tests {
             }
         );
         assert_eq!(srv.requests()[0].body, r#"{"destinationId":"G1"}"#);
+    }
+
+    // --- Copy a folder (#2118) -------------------------------------------
+
+    #[test]
+    fn copy_folder_reconciles_the_local_id() {
+        let srv = FakeServer::start(vec![route(
+            "POST",
+            "/me/mailFolders/INBOX/copy",
+            201,
+            r#"{"id":"C1","displayName":"INBOX","parentFolderId":"ARCH"}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        let local = written(store.copy_folder("INBOX", Some("ARCH")).unwrap());
+        let applied = apply_op(&c, &store, &last_op(&store)).unwrap();
+        assert_eq!(
+            applied,
+            Applied::FolderCreated {
+                local_id: local.clone(),
+                id: "C1".into()
+            }
+        );
+        assert!(store.has_folder("C1").unwrap());
+        assert!(!store.has_folder(&local).unwrap());
+        assert!(store.has_folder("INBOX").unwrap(), "the source stays");
+        assert_eq!(store.current_folder_id(&local).unwrap(), "C1");
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/me/mailFolders/INBOX/copy");
+        assert_eq!(reqs[0].body, r#"{"destinationId":"ARCH"}"#);
+    }
+
+    #[test]
+    fn copy_folder_retry_after_reconcile_or_of_a_deleted_row_sends_nothing() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        let local = written(store.copy_folder("INBOX", None).unwrap());
+        let op = last_op(&store);
+        store
+            .reconcile_created_folder(&local, &mail_folder("C1", Some("ROOT")))
+            .unwrap();
+        assert_eq!(apply_op(&c, &store, &op).unwrap(), Applied::Done);
+
+        let gone = written(store.copy_folder("INBOX", None).unwrap());
+        let op = last_op(&store);
+        store.discard_local_folder(&gone).unwrap();
+        assert_eq!(apply_op(&c, &store, &op).unwrap(), Applied::Done);
+        assert!(srv.requests().is_empty());
+    }
+
+    #[test]
+    fn copy_folder_refuses_a_local_source_or_dest() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        let local = written(store.create_local_folder(None, "L").unwrap());
+        written(store.copy_folder(&local, Some("ARCH")).unwrap());
+        match apply_op(&c, &store, &last_op(&store)) {
+            Err(GraphError::Parse(e)) => assert!(e.contains("source"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        written(store.copy_folder("INBOX", Some(&local)).unwrap());
+        match apply_op(&c, &store, &last_op(&store)) {
+            Err(GraphError::Parse(e)) => assert!(e.contains("destination"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(srv.requests().is_empty());
+    }
+
+    /// A delete of the source queued after the copy removes its row at
+    /// once; Graph keeps it until that delete runs, after the copy.
+    #[test]
+    fn copy_folder_of_a_source_being_deleted_is_still_sent() {
+        let srv = FakeServer::start(vec![route(
+            "POST",
+            "/me/mailFolders/INBOX/copy",
+            201,
+            r#"{"id":"C1","displayName":"INBOX","parentFolderId":"ARCH"}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        let local = written(store.copy_folder("INBOX", Some("ARCH")).unwrap());
+        let op = last_op(&store);
+        let (r, _) = store.delete_folder("INBOX").unwrap();
+        written(r);
+        assert!(!store.has_folder("INBOX").unwrap());
+        assert_eq!(
+            apply_op(&c, &store, &op).unwrap(),
+            Applied::FolderCreated {
+                local_id: local,
+                id: "C1".into()
+            }
+        );
+        assert_eq!(srv.requests()[0].path, "/me/mailFolders/INBOX/copy");
     }
 }
