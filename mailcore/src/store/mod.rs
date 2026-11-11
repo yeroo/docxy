@@ -532,6 +532,20 @@ pub enum OutboxOp {
         source: String,
         dest: Option<String>,
     },
+    /// Move every message Graph holds in `folder` received at or before
+    /// `before` (ISO-8601 UTC, fixed at the command) to `dest` through
+    /// `$batch` (#2126, `Store::queue_folder_messages_move`): a host's
+    /// Delete All, with `dest` its Deleted Items. Run by the engine, not
+    /// `apply_op`; sent only once no older op is queued. No stored row
+    /// moves at the command: each follows Graph's answer
+    /// (`Store::follow_folder_move`). Both ids are resolved through
+    /// `folder_aliases` at run time; a `folder` still `local:` sends
+    /// nothing, a `dest` still `local:` refuses the run.
+    MoveFolderMessages {
+        folder: String,
+        dest: String,
+        before: String,
+    },
 }
 
 impl OutboxOp {
@@ -568,7 +582,8 @@ impl OutboxOp {
             | OutboxOp::MarkFolderRead { .. }
             | OutboxOp::DeleteFolder { .. }
             | OutboxOp::EmptyFolder { .. }
-            | OutboxOp::CopyFolder { .. } => None,
+            | OutboxOp::CopyFolder { .. }
+            | OutboxOp::MoveFolderMessages { .. } => None,
         }
     }
 
@@ -605,6 +620,7 @@ impl OutboxOp {
             OutboxOp::DeleteFolder { .. } => "deleteFolder",
             OutboxOp::EmptyFolder { .. } => "emptyFolder",
             OutboxOp::CopyFolder { .. } => "copyFolder",
+            OutboxOp::MoveFolderMessages { .. } => "moveFolderMessages",
         }
     }
 
@@ -771,6 +787,16 @@ impl OutboxOp {
                 ("id".to_string(), Value::Str(id.clone())),
                 ("source".to_string(), Value::Str(source.clone())),
                 ("dest".to_string(), optional_str(dest)),
+            ]),
+            OutboxOp::MoveFolderMessages {
+                folder,
+                dest,
+                before,
+            } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("folder".to_string(), Value::Str(folder.clone())),
+                ("dest".to_string(), Value::Str(dest.clone())),
+                ("before".to_string(), Value::Str(before.clone())),
             ]),
             OutboxOp::CancelEvent { id, comment } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
@@ -972,6 +998,11 @@ impl OutboxOp {
                 id: id()?,
                 source: v.get("source")?.as_str()?.to_string(),
                 dest: v.get("dest").and_then(Value::as_str).map(str::to_string),
+            }),
+            "moveFolderMessages" => Some(OutboxOp::MoveFolderMessages {
+                folder: v.get("folder")?.as_str()?.to_string(),
+                dest: v.get("dest")?.as_str()?.to_string(),
+                before: v.get("before")?.as_str()?.to_string(),
             }),
             _ => None,
         }
@@ -3633,66 +3664,51 @@ impl Store {
         }
         let tx = self.write_tx()?;
         tx.pragma_update(None, "defer_foreign_keys", "ON")?;
-        let exists = |id: &str| -> rusqlite::Result<bool> {
-            tx.query_row(
-                "SELECT EXISTS (SELECT 1 FROM messages WHERE id = ?1)",
-                params![id],
-                |r| r.get(0),
-            )
-        };
-        const CHILDREN: [&str; 4] = [
-            "UPDATE OR IGNORE bodies SET message_id = ?2 WHERE message_id = ?1",
-            "UPDATE OR IGNORE message_headers SET message_id = ?2 WHERE message_id = ?1",
-            "UPDATE OR IGNORE attachments SET message_id = ?2 WHERE message_id = ?1",
-            "UPDATE OR IGNORE outbound_attachments SET draft_id = ?2 WHERE draft_id = ?1",
-        ];
-        if exists(old_id)? {
-            if exists(new_id)? {
-                // `local_id` is UNIQUE: off the old row before onto the new.
-                let local: Option<String> = tx.query_row(
-                    "SELECT local_id FROM messages WHERE id = ?1",
-                    params![old_id],
-                    |r| r.get(0),
-                )?;
-                tx.execute(
-                    "UPDATE messages SET local_id = NULL WHERE id = ?1",
-                    params![old_id],
-                )?;
-                tx.execute(
-                    "UPDATE messages SET local_id = COALESCE(local_id, ?2) WHERE id = ?1",
-                    params![new_id, local],
-                )?;
-                for sql in CHILDREN {
-                    tx.execute(sql, params![old_id, new_id])?;
-                }
-                // What the new row already had stays; the old row's copy
-                // goes (`outbound_attachments` has no foreign key).
-                tx.execute(
-                    "DELETE FROM outbound_attachments WHERE draft_id = ?1",
-                    params![old_id],
-                )?;
-                tx.execute("DELETE FROM messages WHERE id = ?1", params![old_id])?;
-            } else {
-                tx.execute(
-                    "UPDATE messages SET id = ?2 WHERE id = ?1",
-                    params![old_id, new_id],
-                )?;
-                for sql in CHILDREN {
-                    tx.execute(sql, params![old_id, new_id])?;
-                }
-            }
-        }
-        tx.execute(
-            "UPDATE moved_ids SET message_id = ?2 WHERE message_id = ?1",
-            params![old_id, new_id],
-        )?;
-        tx.execute("DELETE FROM moved_ids WHERE old_id = ?1", params![new_id])?;
-        tx.execute(
-            "INSERT OR REPLACE INTO moved_ids (old_id, message_id) VALUES (?1, ?2)",
-            params![old_id, new_id],
-        )?;
+        follow_move_on(&tx, old_id, new_id)?;
         tx.commit()?;
         Ok(true)
+    }
+
+    /// Follows one answer of a `MoveFolderMessages` run (#2126): Graph
+    /// moved the message `old_id` to `dest` as `new_id`. In one
+    /// transaction the stored row (if any) is filed under `dest` and then
+    /// re-keyed as [`Store::follow_move`] re-keys it (aliases recorded, a
+    /// row `new_id` already stored kept). The row is only re-keyed, not
+    /// filed, when `protected` holds `old_id` (a queued op names it: a
+    /// `Move` made after the command takes it on from the new id) or `dest`
+    /// is no longer a stored folder. Returns the folder the row was stored
+    /// in before, `None` when no row was. `new_id` empty or equal to
+    /// `old_id` re-keys nothing.
+    pub(crate) fn follow_folder_move(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        dest: &str,
+        protected: &HashSet<String>,
+    ) -> Result<Option<String>, StoreError> {
+        let tx = self.write_tx()?;
+        tx.pragma_update(None, "defer_foreign_keys", "ON")?;
+        let from: Option<String> = tx
+            .query_row(
+                "SELECT folder_id FROM messages WHERE id = ?1",
+                params![old_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if from.as_deref().is_some_and(|f| f != dest)
+            && !protected.contains(old_id)
+            && folder_exists_on(&tx, dest)?
+        {
+            tx.execute(
+                "UPDATE messages SET folder_id = ?2 WHERE id = ?1",
+                params![old_id, dest],
+            )?;
+        }
+        if old_id != new_id && !new_id.is_empty() {
+            follow_move_on(&tx, old_id, new_id)?;
+        }
+        tx.commit()?;
+        Ok(from)
     }
 
     /// Whether `id` is an id a message had before a move (#1896,
@@ -5513,6 +5529,8 @@ pub(crate) enum FolderRefusal {
     /// `local:` draft, an unpushed edit, or one a queued save or send names.
     /// Deleting them would lose it, so the command is refused instead.
     UnsentMail(usize),
+    /// A move of a folder's mail into that same folder (#2126).
+    SameFolder,
 }
 
 impl std::fmt::Display for FolderRefusal {
@@ -5526,6 +5544,7 @@ impl std::fmt::Display for FolderRefusal {
                 f.write_str("a folder cannot move into itself or a folder inside it")
             }
             FolderRefusal::UnsentMail(n) => write!(f, "it holds {n} unsent message(s)"),
+            FolderRefusal::SameFolder => f.write_str("the mail is already in that folder"),
         }
     }
 }
@@ -5609,6 +5628,22 @@ pub(crate) struct FolderDelete {
     /// Every folder id removed: the subtree, then `also_discarded`, then
     /// the `discarded_copies`.
     pub removed: Vec<String>,
+    /// The queued `MoveFolderMessages` the delete dropped (#2126): their
+    /// dest went, or their `local:` folder did. The engine ends each with
+    /// its final event.
+    pub dropped_moves: Vec<DroppedFolderMove>,
+}
+
+/// A queued `MoveFolderMessages` a folder delete dropped (#2126), its ids
+/// resolved through `folder_aliases`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DroppedFolderMove {
+    /// The op's outbox row.
+    pub seq: i64,
+    pub folder: String,
+    pub dest: String,
+    /// The dest was removed (else the `local:` folder whose mail it moved).
+    pub dest_gone: bool,
 }
 
 /// The newest tombstones `forgotten_ids` keeps (#2107), pruned at each
@@ -6203,6 +6238,73 @@ impl Store {
         Ok(out)
     }
 
+    /// Queues a move of every message Graph holds in `folder` to `dest`
+    /// (#2126, `SyncCommand::MoveFolderMessages`), in one IMMEDIATE
+    /// transaction: both ids resolved through `folder_aliases`, the cutoff
+    /// (`folder_cutoff_on`: the later of `now_utc` and the folder's newest
+    /// stored message) fixed, the op queued. No stored row changes: each
+    /// follows Graph's answer (`follow_folder_move`). Returns the folder's
+    /// id as stored.
+    ///
+    /// Refused, with nothing queued: an unknown folder or dest, the drafts
+    /// sentinel as either, and a dest that is the folder itself.
+    pub(crate) fn queue_folder_messages_move(
+        &self,
+        folder: &str,
+        dest: &str,
+        now_utc: &str,
+    ) -> Result<FolderWriteResult, StoreError> {
+        let tx = self.write_tx()?;
+        let folder = current_folder_id_on(&tx, folder)?;
+        let dest = current_folder_id_on(&tx, dest)?;
+        for id in [&folder, &dest] {
+            if let Some(r) = check_folder_on(&tx, id)? {
+                return Ok(FolderWriteResult::Refused(r));
+            }
+        }
+        if folder == dest {
+            return Ok(FolderWriteResult::Refused(FolderRefusal::SameFolder));
+        }
+        let before = folder_cutoff_on(&tx, &folder, now_utc)?;
+        enqueue_op_on(
+            &tx,
+            &OutboxOp::MoveFolderMessages {
+                folder: folder.clone(),
+                dest,
+                before,
+            },
+        )?;
+        tx.commit()?;
+        Ok(FolderWriteResult::Written(folder))
+    }
+
+    /// Which of `ids` (Graph's, as a `MoveFolderMessages` run listed them)
+    /// are mail Graph does not have as the store shows it (#2126), wherever
+    /// the store files it: a row with an unpushed edit (`local_edit > 0`),
+    /// or one a queued `SaveDraft`/`SendDraft` names, each id resolved
+    /// through `current_id` (as `unsent_mail_in_on` decides; a `SendDraft`
+    /// files its draft in Sent Items at the command while Graph still has
+    /// it in Drafts). A move would take it from under its own save or send.
+    pub(crate) fn unsent_listed(&self, ids: &[String]) -> Result<HashSet<String>, StoreError> {
+        let mut unsent: HashSet<String> = queued_draft_ids_on(&self.conn)?.into_iter().collect();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM messages WHERE local_edit > 0")?;
+        for id in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            unsent.insert(id?);
+        }
+        if unsent.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let mut out = HashSet::new();
+        for id in ids {
+            if unsent.contains(id) || unsent.contains(&current_id_on(&self.conn, id)?) {
+                out.insert(id.clone());
+            }
+        }
+        Ok(out)
+    }
+
     /// Whether `id` (resolved through `folder_aliases`) is a folder a queued
     /// `EmptyFolder` names (#2110): nothing is read from Graph for it
     /// meanwhile, and its stored counts are kept.
@@ -6281,7 +6383,10 @@ impl Store {
     /// outside the subtree is put back under it), and Graph mail moved into
     /// them is dropped as a refused create drops it
     /// (`drop_local_folder_mail_on`, [`FolderDelete::had_mail`]). Queued
-    /// `MarkFolderRead`s and `EmptyFolder`s of a removed folder go too.
+    /// `MarkFolderRead`s and `EmptyFolder`s of a removed folder go too, and
+    /// so do the `MoveFolderMessages` into a removed folder or of a removed
+    /// `local:` one ([`FolderDelete::dropped_moves`], #2126); one of a
+    /// removed folder Graph has stays, and runs before the delete.
     ///
     /// The Graph roots are `id` when Graph has it, every Graph folder of
     /// the subtree whose stored parent is a removed `local:` folder (moved
@@ -6354,7 +6459,7 @@ impl Store {
                 }
             }
         }
-        drop_folder_ops_on(&tx, &local, &removed)?;
+        out.dropped_moves = drop_folder_ops_on(&tx, &local, &removed)?;
         // The Graph roots: `id`, every Graph folder moved locally under a
         // removed `local:` one, and every one whose move was dropped above.
         let mut roots = Vec::new();
@@ -6611,7 +6716,9 @@ fn deleting_folders_on(conn: &Connection) -> Result<HashSet<String>, StoreError>
 /// Drops the queued folder ops a delete leaves pointless (#2107): the
 /// creates of the removed `local:` folders `local` and every other op
 /// naming one of them, the `MarkFolderRead`s and `EmptyFolder`s (with the
-/// latter's allow-lists, #2110) of the `removed` folders, and every
+/// latter's allow-lists, #2110) of the `removed` folders, the
+/// `MoveFolderMessages` into a removed folder or of a removed `local:` one
+/// (#2126, returned for the engine to report), and every
 /// `MoveFolder` into a removed `local:` folder, wherever the moved
 /// folder is now. The next queued move of that folder inherits the dropped
 /// one's `prev_parent`, so a refusal of it reverts to a parent Graph has;
@@ -6621,7 +6728,8 @@ fn drop_folder_ops_on(
     conn: &Connection,
     local: &[String],
     removed: &[String],
-) -> Result<(), StoreError> {
+) -> Result<Vec<DroppedFolderMove>, StoreError> {
+    let mut dropped_moves = Vec::new();
     let mut ops = pending_ops_on(conn)?;
     let mut i = 0;
     while i < ops.len() {
@@ -6634,6 +6742,25 @@ fn drop_folder_ops_on(
             OutboxOp::MarkFolderRead { folder, .. } => {
                 let f = current_folder_id_on(conn, folder)?;
                 removed.contains(&f) || local.contains(&f)
+            }
+            // #2126: a removed dest drops it, and so does a removed `local:`
+            // folder (nothing of it is on Graph). A removed folder Graph has
+            // keeps it: its `DeleteFolder` waits behind it, so its mail
+            // reaches the dest before the folder goes.
+            OutboxOp::MoveFolderMessages { folder, dest, .. } => {
+                let f = current_folder_id_on(conn, folder)?;
+                let d = current_folder_id_on(conn, dest)?;
+                let dest_gone = removed.contains(&d) || local.contains(&d);
+                let gone = dest_gone || local.contains(&f);
+                if gone {
+                    dropped_moves.push(DroppedFolderMove {
+                        seq,
+                        folder: f,
+                        dest: d,
+                        dest_gone,
+                    });
+                }
+                gone
             }
             // #2110: and its batch's allow-list with it.
             OutboxOp::EmptyFolder { folder, batch, .. } => {
@@ -6705,7 +6832,7 @@ fn drop_folder_ops_on(
         }
         i += 1;
     }
-    Ok(())
+    Ok(dropped_moves)
 }
 
 /// Every id a queued op names (#2107): a message op's message (as queued
@@ -6738,6 +6865,7 @@ fn queued_op_ids_on(conn: &Connection) -> Result<HashSet<String>, StoreError> {
             OutboxOp::MarkFolderRead { folder, .. } => vec![folder],
             OutboxOp::DeleteFolder { id, .. } => vec![id],
             OutboxOp::EmptyFolder { folder, .. } => vec![folder],
+            OutboxOp::MoveFolderMessages { folder, dest, .. } => vec![folder, dest],
             OutboxOp::CopyFolder { id, source, dest } => {
                 let mut v = vec![id, source];
                 v.extend(dest.iter());
@@ -6794,12 +6922,7 @@ fn unsent_mail_in_on(conn: &Connection, folders: &[String]) -> Result<Vec<String
     if folders.is_empty() {
         return Ok(Vec::new());
     }
-    let mut drafts = Vec::new();
-    for row in pending_ops_on(conn)? {
-        if let OutboxOp::SaveDraft { id } | OutboxOp::SendDraft { id } = row.op {
-            drafts.push(current_id_on(conn, &id)?);
-        }
-    }
+    let drafts = queued_draft_ids_on(conn)?;
     let mut stmt = conn.prepare(
         "SELECT id FROM messages
          WHERE folder_id IN (SELECT value FROM json_each(?1))
@@ -6812,6 +6935,84 @@ fn unsent_mail_in_on(conn: &Connection, folders: &[String]) -> Result<Vec<String
         .query_map(params![ids_json(folders), ids_json(&drafts)], |r| r.get(0))?
         .collect::<Result<Vec<String>, _>>()?;
     Ok(ids)
+}
+
+/// [`Store::follow_move`]'s writes, in the caller's transaction (which
+/// sets `defer_foreign_keys`): the row `old_id` (if stored) re-keyed to
+/// `new_id` or merged into a stored `new_id`, and the alias recorded.
+fn follow_move_on(conn: &Connection, old_id: &str, new_id: &str) -> Result<(), StoreError> {
+    let exists = |id: &str| -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM messages WHERE id = ?1)",
+            params![id],
+            |r| r.get(0),
+        )
+    };
+    const CHILDREN: [&str; 4] = [
+        "UPDATE OR IGNORE bodies SET message_id = ?2 WHERE message_id = ?1",
+        "UPDATE OR IGNORE message_headers SET message_id = ?2 WHERE message_id = ?1",
+        "UPDATE OR IGNORE attachments SET message_id = ?2 WHERE message_id = ?1",
+        "UPDATE OR IGNORE outbound_attachments SET draft_id = ?2 WHERE draft_id = ?1",
+    ];
+    if exists(old_id)? {
+        if exists(new_id)? {
+            // `local_id` is UNIQUE: off the old row before onto the new.
+            let local: Option<String> = conn.query_row(
+                "SELECT local_id FROM messages WHERE id = ?1",
+                params![old_id],
+                |r| r.get(0),
+            )?;
+            conn.execute(
+                "UPDATE messages SET local_id = NULL WHERE id = ?1",
+                params![old_id],
+            )?;
+            conn.execute(
+                "UPDATE messages SET local_id = COALESCE(local_id, ?2) WHERE id = ?1",
+                params![new_id, local],
+            )?;
+            for sql in CHILDREN {
+                conn.execute(sql, params![old_id, new_id])?;
+            }
+            // What the new row already had stays; the old row's copy
+            // goes (`outbound_attachments` has no foreign key).
+            conn.execute(
+                "DELETE FROM outbound_attachments WHERE draft_id = ?1",
+                params![old_id],
+            )?;
+            conn.execute("DELETE FROM messages WHERE id = ?1", params![old_id])?;
+        } else {
+            conn.execute(
+                "UPDATE messages SET id = ?2 WHERE id = ?1",
+                params![old_id, new_id],
+            )?;
+            for sql in CHILDREN {
+                conn.execute(sql, params![old_id, new_id])?;
+            }
+        }
+    }
+    conn.execute(
+        "UPDATE moved_ids SET message_id = ?2 WHERE message_id = ?1",
+        params![old_id, new_id],
+    )?;
+    conn.execute("DELETE FROM moved_ids WHERE old_id = ?1", params![new_id])?;
+    conn.execute(
+        "INSERT OR REPLACE INTO moved_ids (old_id, message_id) VALUES (?1, ?2)",
+        params![old_id, new_id],
+    )?;
+    Ok(())
+}
+
+/// The drafts a queued `SaveDraft` or `SendDraft` names, each resolved
+/// through `current_id` (#1910; #2126 shares it): mail Graph does not have
+/// as the store shows it yet.
+fn queued_draft_ids_on(conn: &Connection) -> Result<Vec<String>, StoreError> {
+    let mut drafts = Vec::new();
+    for row in pending_ops_on(conn)? {
+        if let OutboxOp::SaveDraft { id } | OutboxOp::SendDraft { id } = row.op {
+            drafts.push(current_id_on(conn, &id)?);
+        }
+    }
+    Ok(drafts)
 }
 
 /// `id` (a `local:` folder whose create Graph refused) and every `local:`

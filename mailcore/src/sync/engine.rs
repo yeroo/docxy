@@ -49,7 +49,7 @@ use crate::auth::{self, AuthConfig, TokenSet};
 use crate::graph::client::{
     BATCH_MAX, BatchRequest, CalendarDeltaCursor, ContactFieldSet, DeltaCursor, EventInput,
     GraphClient, GraphError, RsvpKind, event_body_json, event_zone_error, is_expired_sync_state,
-    rsvp_proposal,
+    moved_message_id, rsvp_proposal,
 };
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
@@ -58,13 +58,13 @@ use crate::graph::model::{
     SearchHit, parse_folder_size,
 };
 use crate::store::{
-    CalendarRound, FetchedCalendar, FolderDelete, FolderHistory, FolderRow, FolderWriteResult,
-    LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee, NewEvent, OutboundAttachment, OutboxOp,
-    OutboxRow, RangeStamp, SCOPE_ALL, SCOPE_WINDOW, Store, StoreError, SyncedCalendar,
+    CalendarRound, DroppedFolderMove, FetchedCalendar, FolderDelete, FolderHistory, FolderRow,
+    FolderWriteResult, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee, NewEvent, OutboundAttachment,
+    OutboxOp, OutboxRow, RangeStamp, SCOPE_ALL, SCOPE_WINDOW, Store, StoreError, SyncedCalendar,
 };
 use crate::sync::outbox::{Applied, apply_op, apply_send, send_error_text};
 use crate::tokencache;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -671,6 +671,33 @@ pub enum SyncCommand {
     /// it, each refused or not on its own: from the store at once, with
     /// the empty, and on Graph after the empty's run.
     EmptyFolder { folder: String, subfolders: bool },
+    /// Move every message of a mail folder to `dest` (#2126), on the server
+    /// too, not only the mail the store holds: a host's Delete All, with
+    /// `dest` its Deleted Items. The op is queued at once (nothing in the
+    /// store moves yet); then, once no older op is queued, the engine pages
+    /// every message Graph holds in the folder received at or before the
+    /// command's cutoff (the later of this client's clock and the newest
+    /// stored message), all of them before the first move, and sends
+    /// `POST /me/messages/{id}/move` through `POST /$batch`, 20 a batch,
+    /// waiting out a throttled one's `Retry-After`. Unsent mail Graph lists
+    /// there (a draft with an unpushed edit, or one a queued save or send
+    /// names) stays, uncounted. As Graph answers each batch, the stored
+    /// rows follow: filed under `dest` and re-keyed to Graph's new ids
+    /// ([`SyncEvent::MessageMoved`] for each stored row,
+    /// [`SyncEvent::MessagesUpdated`] for the folders they left and
+    /// reached); a row a queued op names (a `Move` made after the command)
+    /// is only re-keyed, and a message Graph no longer has (404) leaves the
+    /// store. Progress is [`SyncEvent::FolderMessagesMoving`]; at the end
+    /// both folders' counts are read from Graph, then one
+    /// [`SyncEvent::FolderMessagesMoved`] carries the result. A refusal,
+    /// or messages Graph would not move, is also
+    /// [`SyncEvent::FolderWriteFailed`] (`write: MoveMail`). The op survives
+    /// a restart: the next run lists again what is left. Refused at once:
+    /// an unknown folder or dest, the drafts sentinel as either, and a dest
+    /// that is the folder. A delete of the dest (or of a `local:` folder)
+    /// drops a queued move, reported the same way; a delete of a folder
+    /// Graph has waits behind the move.
+    MoveFolderMessages { folder: String, dest: String },
     /// Exit the sync thread cleanly.
     Shutdown,
 }
@@ -689,6 +716,27 @@ pub enum FolderWrite {
     Empty,
     /// [`SyncCommand::CopyFolder`] (#2118).
     Copy,
+    /// [`SyncCommand::MoveFolderMessages`] (#2126).
+    MoveMail,
+}
+
+/// Why a [`SyncCommand::MoveFolderMessages`] ended in error (#2126), in
+/// [`SyncEvent::FolderMessagesMoved`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FolderMoveError {
+    /// Refused before or instead of the run: by the store (an unknown
+    /// folder, the drafts sentinel, the same folder, a folder deleted
+    /// while queued: `status` is `None`), or by Graph, refusing the listing
+    /// or a `$batch` call as a whole (its status, `None` for an answer that
+    /// did not parse). What moved before a refusal stays moved.
+    Refused { status: Option<u16>, error: String },
+    /// The run ended, but Graph refused `failed` of the messages: the first
+    /// refusal's status and error.
+    Partial {
+        failed: usize,
+        status: u16,
+        error: String,
+    },
 }
 
 impl FolderWrite {
@@ -701,6 +749,7 @@ impl FolderWrite {
             FolderWrite::Delete => "delete",
             FolderWrite::Empty => "empty",
             FolderWrite::Copy => "copy",
+            FolderWrite::MoveMail => "move the mail of",
         }
     }
 }
@@ -870,7 +919,7 @@ pub enum SyncEvent {
     ///   Graph has them, their mail with their next delta (#2107).
     ///
     /// Each `FolderWriteFailed` is followed by its [`SyncEvent::Error`],
-    /// `"{create|rename|move|mark all read in|delete|empty|copy} folder {id}: {error}"`;
+    /// `"{create|rename|move|mark all read in|delete|empty|copy|move the mail of} folder {id}: {error}"`;
     /// after Graph's refusal (or a walk's) one [`SyncEvent::FoldersUpdated`]
     /// ends them.
     FolderWriteFailed {
@@ -1076,6 +1125,37 @@ pub enum SyncEvent {
         total: Option<i64>,
         complete: bool,
     },
+    /// A [`SyncCommand::MoveFolderMessages`] moved on (#2126): once Graph's
+    /// listing is in (`moved` and `failed` 0), then after each `$batch`
+    /// Graph answered. `total` is what the run took on: the messages
+    /// listed, less the unsent mail left alone; after a restart, what the
+    /// new listing found left. `moved` counts the messages Graph moved or
+    /// no longer had (404), `failed` those it refused; a throttled or 5xx
+    /// one is counted only once answered, so on a clean run the last event
+    /// has `moved == total`. `folder` and `dest` are the ids as stored.
+    FolderMessagesMoving {
+        folder: String,
+        dest: String,
+        moved: usize,
+        failed: usize,
+        total: usize,
+    },
+    /// A [`SyncCommand::MoveFolderMessages`] ended (#2126): exactly one per
+    /// command, also for one refused at once (`total` 0) or dropped by a
+    /// folder delete (the counts reached so far). Sent after both folders'
+    /// counts were read from Graph (a run Graph saw), with `moved`,
+    /// `failed` and `total` as in [`SyncEvent::FolderMessagesMoving`] (a
+    /// done run has `moved + failed == total`). An `Err` is also
+    /// [`SyncEvent::FolderWriteFailed`] (`write: MoveMail`) and its `Error`,
+    /// sent before it.
+    FolderMessagesMoved {
+        folder: String,
+        dest: String,
+        moved: usize,
+        failed: usize,
+        total: usize,
+        result: Result<(), FolderMoveError>,
+    },
 }
 
 /// The two channel endpoints the UI keeps: commands down, events up. Dropping
@@ -1192,8 +1272,10 @@ struct Repair {
     /// A row was completed or deleted, so the folder needs a reload.
     changed: bool,
 }
-/// A `MarkFolderRead` (#1913, `Engine::run_mark_folder_read`) or
-/// `EmptyFolder` (#2110, `Engine::run_empty_folder`) op in progress.
+/// A `MarkFolderRead` (#1913, `Engine::run_mark_folder_read`),
+/// `EmptyFolder` (#2110, `Engine::run_empty_folder`) or
+/// `MoveFolderMessages` (#2126, `Engine::run_move_folder_messages`) op in
+/// progress.
 #[derive(Debug)]
 struct BulkRun {
     /// The op's outbox row.
@@ -1213,6 +1295,83 @@ struct BulkRun {
     kept: usize,
     /// A stored row of an id Graph deleted was removed during the run.
     rows_deleted: bool,
+    /// A move run's folder and dest (#2126), as resolved when it listed.
+    moving: Option<FolderMove>,
+    /// How many ids Graph moved, or no longer had (404), so far (#2126).
+    moved: usize,
+}
+
+/// The folders of a `MoveFolderMessages` run (#2126).
+#[derive(Debug, Clone)]
+struct FolderMove {
+    folder: String,
+    dest: String,
+}
+
+/// What one answered `$batch` of a `MoveFolderMessages` run did to the
+/// store (#2126), reported once the batch is through
+/// (`Engine::bulk_batches`).
+#[derive(Debug, Default)]
+struct MoveFollow {
+    /// `(old, new)` of each stored row re-keyed: `MessageMoved`.
+    moved: Vec<(String, String)>,
+    /// The folders a row left or reached: `MessagesUpdated`, sorted.
+    folders: BTreeSet<String>,
+    /// Store failures, each an `Error`.
+    errors: Vec<String>,
+}
+
+impl MoveFollow {
+    /// Follows Graph's answer for `id`: moved as `new_id`, the stored row
+    /// (if any) is filed under `dest` and re-keyed
+    /// (`Store::follow_folder_move`, which only re-keys a row `protected`
+    /// names); with no id to follow (a 404, or an answer without one), the
+    /// stored row goes, and the next delta of the folder Graph has it in
+    /// brings it back.
+    fn follow(
+        &mut self,
+        store: &Store,
+        id: String,
+        new_id: Option<String>,
+        dest: &str,
+        protected: &HashSet<String>,
+    ) {
+        match new_id {
+            Some(new_id) => match store.follow_folder_move(&id, &new_id, dest, protected) {
+                Ok(Some(from)) => {
+                    self.folders.insert(from);
+                    self.folders.insert(dest.to_string());
+                    if new_id != id {
+                        self.moved.push((id, new_id));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => self
+                    .errors
+                    .push(format!("follow move of {id} to {new_id}: {e}")),
+            },
+            None => {
+                let from = store.message_folder(&id).ok().flatten();
+                if let (Some(from), Ok(Some(_))) = (from, store.delete_message_resolved(&id)) {
+                    self.folders.insert(from);
+                }
+            }
+        }
+    }
+
+    /// Emits what the batch did: `MessageMoved`, then `MessagesUpdated`
+    /// per folder, then the store failures.
+    fn report(self, engine: &Engine) {
+        for (old_id, new_id) in self.moved {
+            engine.emit(SyncEvent::MessageMoved { old_id, new_id });
+        }
+        for folder_id in self.folders {
+            engine.emit(SyncEvent::MessagesUpdated { folder_id });
+        }
+        for e in self.errors {
+            engine.emit(SyncEvent::Error(e));
+        }
+    }
 }
 
 /// What a [`BulkRun`]'s `$batch` sub-requests do.
@@ -1222,6 +1381,9 @@ enum BulkKind {
     MarkRead,
     /// `DELETE` (#2110); the stored row of each id Graph answered for goes.
     Delete,
+    /// `POST .../move` to the run's dest (#2126); the stored row of each
+    /// id follows Graph's answer (`Store::follow_folder_move`).
+    Move,
 }
 
 /// How `Engine::bulk_batches` ended.
@@ -1446,6 +1608,7 @@ fn persists_at_shutdown(cmd: &SyncCommand) -> bool {
         | SyncCommand::MarkFolderRead { .. }
         | SyncCommand::DeleteFolder { .. }
         | SyncCommand::EmptyFolder { .. }
+        | SyncCommand::MoveFolderMessages { .. }
         // In memory, or a local preference whose refresh the shutdown
         // skips (`set_calendars`).
         | SyncCommand::SetFastFolders { .. }
@@ -2589,6 +2752,9 @@ impl Engine {
             SyncCommand::EmptyFolder { folder, subfolders } => {
                 self.empty_folder(&folder, subfolders)
             }
+            SyncCommand::MoveFolderMessages { folder, dest } => {
+                self.move_folder_messages(&folder, &dest)
+            }
             // Handled in `main_loop` so the thread can actually return.
             SyncCommand::Shutdown => {}
         }
@@ -2693,6 +2859,22 @@ impl Engine {
         }
         if !self.sync_folder_delta(folder_id) {
             return false;
+        }
+        self.read_folder_counts(folder_id)
+    }
+
+    /// Reads one folder's counts from Graph (`GET /me/mailFolders/{id}`)
+    /// into the store, with `FoldersUpdated` when they changed (#1885;
+    /// #2126 shares it). A folder still `local:` or one a queued
+    /// `EmptyFolder` names (#2110) is not read, and a queued
+    /// `MarkFolderRead` keeps its stored unread count (#1913). Returns
+    /// `false` when the caller must stop (an auth, throttle or transport
+    /// failure, already handled by `react`).
+    fn read_folder_counts(&mut self, folder_id: &str) -> bool {
+        if folder_id.starts_with("local:")
+            || self.store.folder_being_emptied(folder_id).unwrap_or(false)
+        {
+            return true;
         }
         match self.with_auth(|c| c.get_folder_counts(folder_id)) {
             Ok((total, unread)) => {
@@ -4461,6 +4643,28 @@ impl Engine {
                     BulkStep::Stopped => return Drain::Aborted,
                 }
             }
+            // Run by the engine across drains (#2126), never `apply_op`, and
+            // only once it is the oldest op, as an `EmptyFolder`: a move into
+            // or out of the folder queued before it lands (or is given up)
+            // first, and the run lists what Graph has then.
+            if let OutboxOp::MoveFolderMessages {
+                folder,
+                dest,
+                before,
+            } = &row.op
+            {
+                if self.store.has_older_op(row.seq).unwrap_or(true) {
+                    continue;
+                }
+                match self.run_move_folder_messages(row.seq, folder, dest, before) {
+                    BulkStep::Finished => continue,
+                    BulkStep::Deferred => {
+                        deferred = true;
+                        break;
+                    }
+                    BulkStep::Stopped => return Drain::Aborted,
+                }
+            }
             // Run by the engine across drains (#1913), never `apply_op`.
             if let OutboxOp::MarkFolderRead { folder, before } = &row.op {
                 match self.run_mark_folder_read(row.seq, folder, before) {
@@ -4948,6 +5152,7 @@ impl Engine {
                     "its destination folder was deleted".to_string(),
                 );
             }
+            self.report_dropped_moves(&removed.dropped_moves);
         }
         result
     }
@@ -5074,6 +5279,8 @@ impl Engine {
                         failed: Vec::new(),
                         kept: 0,
                         rows_deleted: false,
+                        moving: None,
+                        moved: 0,
                     });
                 }
                 Err(e) => return self.mark_read_call_failed(seq, &folder, e),
@@ -5087,14 +5294,19 @@ impl Engine {
     }
 
     /// Sends the kept run's ids (`self.bulk`) 20 a `$batch` (#1913; #2110
-    /// shares it), each batch's ids leaving the run only once Graph has
-    /// answered the batch. A 2xx or a 404 is done (for a delete run, the
-    /// stored row of that id goes too, should one have come back); a 429
-    /// or 503 puts its ids back at the front and stops the drain for the
-    /// longest `Retry-After` (default 30 s); another 5xx puts them back
-    /// under the outbox back-off; any other status is recorded in
-    /// `failed`. Between batches `checkpoint` serves the commands that
-    /// cannot wait. A whole-call failure is handed back, the run kept.
+    /// and #2126 share it), each batch's ids leaving the run only once
+    /// Graph has answered the batch. A 2xx or a 404 is done (for a delete
+    /// run, the stored row of that id goes too, should one have come back;
+    /// for a move run, the stored row follows Graph's answer:
+    /// `follow_move_answer`); a 429 or 503 puts its ids back at the front
+    /// and stops the drain for the longest `Retry-After` (default 30 s);
+    /// another 5xx puts them back under the outbox back-off; any other
+    /// status is recorded in `failed`. A move run reports each answered
+    /// batch (`MessageMoved` for the stored rows that moved,
+    /// `MessagesUpdated` for the folders they left and reached, then
+    /// `FolderMessagesMoving`), before a throttle or 5xx stops it. Between
+    /// batches `checkpoint` serves the commands that cannot wait. A
+    /// whole-call failure is handed back, the run kept.
     fn bulk_batches(&mut self, seq: i64) -> BatchLoop {
         loop {
             let Some(run) = self.bulk.as_ref() else {
@@ -5104,15 +5316,34 @@ impl Engine {
             if ids.is_empty() {
                 return BatchLoop::Done;
             }
-            let request = match run.kind {
-                BulkKind::MarkRead => GraphClient::mark_read_request,
-                BulkKind::Delete => GraphClient::delete_message_request,
-            };
-            let reqs: Vec<BatchRequest> = ids.iter().map(|id| request(id)).collect();
+            let kind = run.kind;
+            let dest = run.moving.as_ref().map(|m| m.dest.clone());
+            let reqs: Vec<BatchRequest> = ids
+                .iter()
+                .map(|id| match kind {
+                    BulkKind::MarkRead => GraphClient::mark_read_request(id),
+                    BulkKind::Delete => GraphClient::delete_message_request(id),
+                    BulkKind::Move => {
+                        GraphClient::move_message_request(id, dest.as_deref().unwrap_or_default())
+                    }
+                })
+                .collect();
             let answers = match self.with_auth(|c| c.batch(&reqs)) {
                 Ok(a) => a,
                 Err(e) => return BatchLoop::CallFailed(e),
             };
+            // The rows queued ops name, read once a batch (#2126): a move
+            // only re-keys them.
+            let protected: HashSet<String> = if kind == BulkKind::Move {
+                self.store
+                    .pending_message_ids()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+            let mut followed = MoveFollow::default();
             let Some(run) = self.bulk.as_mut() else {
                 return BatchLoop::Step(BulkStep::Finished);
             };
@@ -5122,15 +5353,29 @@ impl Engine {
             let mut server_error = None;
             for (id, answer) in ids.into_iter().zip(answers) {
                 match answer.status {
-                    200..=299 | 404 => {
+                    200..=299 | 404 => match run.kind {
                         // Deleted on Graph: a row of it that came back
                         // meanwhile (a search hit, a fetch) goes too.
-                        if run.kind == BulkKind::Delete
-                            && matches!(self.store.delete_message_resolved(&id), Ok(Some(_)))
-                        {
-                            run.rows_deleted = true;
+                        BulkKind::Delete => {
+                            if matches!(self.store.delete_message_resolved(&id), Ok(Some(_))) {
+                                run.rows_deleted = true;
+                            }
                         }
-                    }
+                        BulkKind::Move => {
+                            run.moved += 1;
+                            let new_id = (answer.status != 404)
+                                .then(|| moved_message_id(&answer.body))
+                                .flatten();
+                            followed.follow(
+                                &self.store,
+                                id,
+                                new_id,
+                                dest.as_deref().unwrap_or_default(),
+                                &protected,
+                            );
+                        }
+                        BulkKind::MarkRead => {}
+                    },
                     429 | 503 => {
                         let secs = answer.retry_after_secs.unwrap_or(30);
                         throttle = Some(throttle.map_or(secs, |t| t.max(secs)));
@@ -5156,8 +5401,23 @@ impl Engine {
                     }
                 }
             }
+            let answered = reqs.len() - again.len();
             for id in again.into_iter().rev() {
                 run.todo.push_front(id);
+            }
+            let progress = match (&run.moving, answered > 0) {
+                (Some(m), true) => Some(SyncEvent::FolderMessagesMoving {
+                    folder: m.folder.clone(),
+                    dest: m.dest.clone(),
+                    moved: run.moved,
+                    failed: run.failed.len(),
+                    total: run.total,
+                }),
+                _ => None,
+            };
+            followed.report(self);
+            if let Some(progress) = progress {
+                self.emit(progress);
             }
             if let Some(secs) = throttle {
                 self.hold_outbox(secs);
@@ -5388,6 +5648,8 @@ impl Engine {
                 failed: Vec::new(),
                 kept,
                 rows_deleted: false,
+                moving: None,
+                moved: 0,
             });
         }
         match self.bulk_batches(seq) {
@@ -5472,6 +5734,272 @@ impl Engine {
         let _ = self.store.finish_folder_empty(seq, batch, folder);
         self.bulk = None;
         self.report_folder_failure(folder, FolderWrite::Empty, status, error);
+    }
+
+    /// `SyncCommand::MoveFolderMessages` (#2126): the store queues the op
+    /// (`Store::queue_folder_messages_move`; no row moves yet), then a
+    /// drain. A store refusal is `FolderWriteFailed` + `Error`, then the
+    /// command's `FolderMessagesMoved` with `Err` and nothing counted.
+    fn move_folder_messages(&mut self, folder: &str, dest: &str) {
+        let r = self
+            .store
+            .queue_folder_messages_move(folder, dest, &unix_to_iso8601(now_unix()));
+        let error = match r {
+            Ok(FolderWriteResult::Written(_)) => {
+                self.drain_queued();
+                return;
+            }
+            Ok(FolderWriteResult::Unchanged) => "nothing to move".to_string(),
+            Ok(FolderWriteResult::Refused(r)) => r.to_string(),
+            Err(e) => e.to_string(),
+        };
+        let folder = self
+            .store
+            .current_folder_id(folder)
+            .unwrap_or_else(|_| folder.to_string());
+        let dest = self
+            .store
+            .current_folder_id(dest)
+            .unwrap_or_else(|_| dest.to_string());
+        self.report_folder_failure(&folder, FolderWrite::MoveMail, None, error.clone());
+        self.emit(SyncEvent::FolderMessagesMoved {
+            folder,
+            dest,
+            moved: 0,
+            failed: 0,
+            total: 0,
+            result: Err(FolderMoveError::Refused {
+                status: None,
+                error,
+            }),
+        });
+    }
+
+    /// Runs a queued `MoveFolderMessages` (#2126). A folder still `local:`
+    /// (its create never reached Graph) has nothing there: the op goes, and
+    /// the run ends `Ok` with nothing moved. A dest still `local:` (its
+    /// create was refused) refuses the run. The first step pages every
+    /// message Graph holds in the folder received at or before `before`
+    /// (`GraphClient::folder_messages_before`), all of them before the
+    /// first move, as moving while paging would shift the pages, and leaves
+    /// out the unsent mail among them (`Store::unsent_listed`); then the
+    /// rest go 20 a `$batch` (`bulk_batches`), the stored rows following
+    /// each answer. A whole-call failure of the listing or a batch takes
+    /// the drain's usual arms (`engine_op_call_failed`); anything else
+    /// refuses the op (`refuse_move_folder_messages`). After a restart the
+    /// run lists again: what moved is no longer there.
+    fn run_move_folder_messages(
+        &mut self,
+        seq: i64,
+        folder: &str,
+        dest: &str,
+        before: &str,
+    ) -> BulkStep {
+        let folder = self
+            .store
+            .current_folder_id(folder)
+            .unwrap_or_else(|_| folder.to_string());
+        let dest = self
+            .store
+            .current_folder_id(dest)
+            .unwrap_or_else(|_| dest.to_string());
+        let target = FolderMove { folder, dest };
+        if self.bulk.as_ref().is_none_or(|b| b.seq != seq) {
+            self.bulk = None;
+            if target.folder.starts_with("local:") {
+                self.store.drop_op(seq);
+                self.clear_op_backoff();
+                self.emit(SyncEvent::FolderMessagesMoved {
+                    folder: target.folder,
+                    dest: target.dest,
+                    moved: 0,
+                    failed: 0,
+                    total: 0,
+                    result: Ok(()),
+                });
+                return BulkStep::Finished;
+            }
+            if target.dest.starts_with("local:") {
+                let error = "its destination folder could not be created".to_string();
+                self.refuse_move_folder_messages(seq, &target, None, error);
+                return BulkStep::Finished;
+            }
+            let items = match self.with_auth(|c| c.folder_messages_before(&target.folder, before)) {
+                Ok(items) => items,
+                Err(e) => return self.move_call_failed(seq, &target, e),
+            };
+            let ids: Vec<String> = items.into_iter().map(|(id, _)| id).collect();
+            let unsent = match self.store.unsent_listed(&ids) {
+                Ok(u) => u,
+                Err(e) => {
+                    let e = GraphError::Parse(e.to_string());
+                    return self.move_call_failed(seq, &target, e);
+                }
+            };
+            let todo: VecDeque<String> =
+                ids.into_iter().filter(|id| !unsent.contains(id)).collect();
+            let total = todo.len();
+            self.bulk = Some(BulkRun {
+                seq,
+                kind: BulkKind::Move,
+                total,
+                todo,
+                failed: Vec::new(),
+                kept: 0,
+                rows_deleted: false,
+                moving: Some(target.clone()),
+                moved: 0,
+            });
+            self.emit(SyncEvent::FolderMessagesMoving {
+                folder: target.folder.clone(),
+                dest: target.dest.clone(),
+                moved: 0,
+                failed: 0,
+                total,
+            });
+        }
+        // A kept run goes on with the folders it listed.
+        let target = self
+            .bulk
+            .as_ref()
+            .and_then(|b| b.moving.clone())
+            .unwrap_or(target);
+        match self.bulk_batches(seq) {
+            BatchLoop::Done => self.finish_move_folder_messages(seq, &target),
+            BatchLoop::Step(step) => step,
+            BatchLoop::CallFailed(e) => self.move_call_failed(seq, &target, e),
+        }
+    }
+
+    /// A `MoveFolderMessages`' listing or `$batch` call failed as a whole
+    /// (#2126), as a `MarkFolderRead`'s does: anything
+    /// `engine_op_call_failed` hands back refuses it for good.
+    fn move_call_failed(&mut self, seq: i64, target: &FolderMove, e: GraphError) -> BulkStep {
+        match self.engine_op_call_failed(seq, e) {
+            Ok(step) => step,
+            Err(e) => {
+                let status = refused_write_status(&e);
+                self.refuse_move_folder_messages(seq, target, status, e.to_string());
+                BulkStep::Finished
+            }
+        }
+    }
+
+    /// Every id of a `MoveFolderMessages` was answered (#2126): the op
+    /// goes, both folders' counts are read from Graph
+    /// (`read_folder_counts`), and the result is reported once: `Ok`, or
+    /// what Graph refused (`FolderWriteFailed`, `write: MoveMail`, with the
+    /// first refusal's status, then `Err(Partial)`).
+    fn finish_move_folder_messages(&mut self, seq: i64, target: &FolderMove) -> BulkStep {
+        let Some(run) = self.bulk.take() else {
+            return BulkStep::Finished;
+        };
+        self.store.drop_op(seq);
+        self.clear_op_backoff();
+        self.read_moved_folder_counts(target);
+        let result = match run.failed.first() {
+            None => Ok(()),
+            Some((_, status, error)) => {
+                let error = format!(
+                    "{} of {} messages could not be moved: {error}",
+                    run.failed.len(),
+                    run.total
+                );
+                self.report_folder_failure(
+                    &target.folder,
+                    FolderWrite::MoveMail,
+                    Some(*status),
+                    error.clone(),
+                );
+                Err(FolderMoveError::Partial {
+                    failed: run.failed.len(),
+                    status: *status,
+                    error,
+                })
+            }
+        };
+        self.emit(SyncEvent::FolderMessagesMoved {
+            folder: target.folder.clone(),
+            dest: target.dest.clone(),
+            moved: run.moved,
+            failed: run.failed.len(),
+            total: run.total,
+            result,
+        });
+        BulkStep::Finished
+    }
+
+    /// A `MoveFolderMessages` refused for good (#2126), by Graph or because
+    /// its dest was never created: the op goes (no attempts, no
+    /// quarantine), both folders' counts are read from Graph (what moved
+    /// before stays moved), and the failure is reported
+    /// (`FolderWriteFailed`, `write: MoveMail`, its `Error`, then
+    /// `FolderMessagesMoved` with `Err(Refused)` and the run's counts).
+    fn refuse_move_folder_messages(
+        &mut self,
+        seq: i64,
+        target: &FolderMove,
+        status: Option<u16>,
+        error: String,
+    ) {
+        self.store.drop_op(seq);
+        let run = match self.bulk.as_ref() {
+            Some(b) if b.seq == seq => self.bulk.take(),
+            _ => None,
+        };
+        self.read_moved_folder_counts(target);
+        self.report_folder_failure(&target.folder, FolderWrite::MoveMail, status, error.clone());
+        let (moved, failed, total) = run.map_or((0, 0, 0), |r| (r.moved, r.failed.len(), r.total));
+        self.emit(SyncEvent::FolderMessagesMoved {
+            folder: target.folder.clone(),
+            dest: target.dest.clone(),
+            moved,
+            failed,
+            total,
+            result: Err(FolderMoveError::Refused { status, error }),
+        });
+    }
+
+    /// The end of a `MoveFolderMessages` run (#2126): the folder's and the
+    /// dest's counts read from Graph (`read_folder_counts`), the dest's
+    /// skipped once a failure stopped the first.
+    fn read_moved_folder_counts(&mut self, target: &FolderMove) {
+        if self.read_folder_counts(&target.folder) {
+            self.read_folder_counts(&target.dest);
+        }
+    }
+
+    /// The queued `MoveFolderMessages` a folder delete dropped (#2126):
+    /// each ends with `FolderWriteFailed` (`write: MoveMail`, no status)
+    /// and its `Error`, then `FolderMessagesMoved` with `Err(Refused)` and
+    /// the counts of the run it stopped, if it was running.
+    fn report_dropped_moves(&mut self, dropped: &[DroppedFolderMove]) {
+        for d in dropped {
+            let run = match self.bulk.as_ref() {
+                Some(b) if b.seq == d.seq => self.bulk.take(),
+                _ => None,
+            };
+            let error = if d.dest_gone {
+                "its destination folder was deleted"
+            } else {
+                "its folder was deleted"
+            }
+            .to_string();
+            self.report_folder_failure(&d.folder, FolderWrite::MoveMail, None, error.clone());
+            let (moved, failed, total) =
+                run.map_or((0, 0, 0), |r| (r.moved, r.failed.len(), r.total));
+            self.emit(SyncEvent::FolderMessagesMoved {
+                folder: d.folder.clone(),
+                dest: d.dest.clone(),
+                moved,
+                failed,
+                total,
+                result: Err(FolderMoveError::Refused {
+                    status: None,
+                    error,
+                }),
+            });
+        }
     }
 
     /// Brings messages a `local:` folder took with it back where Graph has

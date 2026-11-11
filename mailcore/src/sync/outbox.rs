@@ -115,6 +115,12 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Ap
         OutboxOp::EmptyFolder { .. } => Err(GraphError::Parse(
             "EmptyFolder is run by the engine".to_string(),
         )),
+        // The engine runs it itself (#2126: it pages the folder's ids and
+        // moves them through `$batch`). Should it reach here, nothing is
+        // sent.
+        OutboxOp::MoveFolderMessages { .. } => Err(GraphError::Parse(
+            "MoveFolderMessages is run by the engine".to_string(),
+        )),
         op => apply_other(client, store, op).map(|()| Applied::Done),
     }
 }
@@ -284,7 +290,8 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
         | OutboxOp::CopyFolder { .. }
         | OutboxOp::MarkFolderRead { .. }
         | OutboxOp::DeleteFolder { .. }
-        | OutboxOp::EmptyFolder { .. } => {
+        | OutboxOp::EmptyFolder { .. }
+        | OutboxOp::MoveFolderMessages { .. } => {
             unreachable!("apply_op handles it")
         }
         OutboxOp::RenameFolder { id, name, .. } => match graph_folder(store, id)? {
