@@ -3262,9 +3262,7 @@ impl Engine {
             }
         };
         self.backfill_first.retain(|f| *f != id);
-        if history.has_delta_link
-            && history_complete(history.scope.as_deref(), self.whole_mailbox())
-        {
+        if history.is_complete(self.whole_mailbox()) {
             return;
         }
         self.backfill_first.insert(0, id.clone());
@@ -4005,14 +4003,14 @@ impl Engine {
 
     /// The folders whose history is not complete for this mode, in
     /// `Store::folders` order: phase 1 done (a delta link), and the scope
-    /// short of what the mode asks for (`history_complete`).
+    /// short of what the mode asks for (`FolderHistory::is_complete`).
     fn incomplete_histories(&self) -> Result<Vec<FolderHistory>, StoreError> {
         let whole = self.whole_mailbox();
         Ok(self
             .store
             .folder_histories()?
             .into_iter()
-            .filter(|h| h.has_delta_link && !history_complete(h.scope.as_deref(), whole))
+            .filter(|h| !h.is_complete(whole))
             .collect())
     }
 
@@ -8994,19 +8992,6 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
-    }
-}
-
-/// Whether a folder's history is complete for the mode (#1871), from what
-/// its `delta_link` covers (`Store::folder_history`'s `scope`), for a
-/// folder that has one (phase 1 done): a link from before #1871 (`None`)
-/// or a `window` one is complete in window mode only; an `all` one always;
-/// a `head` one never.
-fn history_complete(scope: Option<&str>, whole: bool) -> bool {
-    match scope {
-        None => !whole,
-        Some(s) if s == SCOPE_WINDOW => !whole,
-        Some(s) => s == SCOPE_ALL,
     }
 }
 
@@ -27138,7 +27123,7 @@ mod tests {
     /// pass, then the full delta one page per idle step.
     mod backfill {
         use super::*;
-        use crate::store::{FolderHistory, SCOPE_HEAD};
+        use crate::store::{FolderHistory, SCOPE_HEAD, history_complete};
 
         /// Above `SMALL_FOLDER`, so a folder gets a head first.
         const BIG: i64 = 500;
