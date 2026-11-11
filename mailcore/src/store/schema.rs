@@ -37,7 +37,11 @@ CREATE TABLE IF NOT EXISTS folders (
     -- is the same for the backfill walk under way, moved to
     -- `reminder_expand_refused` when its link becomes `delta_link`.
     reminder_expand_refused INTEGER NOT NULL DEFAULT 0,
-    backfill_expand_refused INTEGER NOT NULL DEFAULT 0
+    backfill_expand_refused INTEGER NOT NULL DEFAULT 0,
+    -- When a sync round on the folder last completed against Graph (#2125,
+    -- `Store::mark_folder_synced`), as the store's `YYYY-MM-DDTHH:MM:SSZ`
+    -- UTC; NULL: never, or not since Clear Offline Items emptied it.
+    synced_at       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
