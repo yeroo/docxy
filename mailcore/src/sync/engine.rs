@@ -31121,14 +31121,13 @@ mod tests {
             ));
             let dir = new_dir("bf-synced-head");
             let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
-            assert!(
-                wait_until(ENGINE_WAIT, || store_in(&dir)
-                    .folder_stats("F1")
-                    .unwrap()
-                    .is_some_and(|s| s.synced_at.is_some())),
-                "{:?}",
-                paths_from(&srv, 0)
-            );
+            // The store is read only once the engine stopped: an open
+            // racing the engine's own (startup, writes) can meet a lock.
+            // The walk's first call comes after the pass's head, in idle
+            // time, and its 500 is an `Error` event; wait for that.
+            wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::Error(_)) && count(&srv, |p| is_full_first(p, "F1")) > 0
+            });
             stop(handle);
             assert!(count(&srv, |p| is_head(p, "F1")) > 0);
             assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_HEAD));
@@ -38465,9 +38464,13 @@ mod tests {
     }
 
     /// A folder's last sync time and stored count (#2125), on the test
-    /// server. The store is seeded before the engine opens it; a test
-    /// writes it again only while the engine is idle (an HOUR tick, no fast
-    /// tick, no backfill left), never while a round may run.
+    /// server. The store is seeded before the engine opens it and read
+    /// through `Store` only once the engine stopped (`stop`): a
+    /// `Store::open` runs `init`'s write transactions, which can meet the
+    /// engine's lock. Only `a_round_without_changes_sets_the_sync_time`
+    /// touches it while the engine runs, and then only while it is idle (an
+    /// HOUR tick, no fast tick, no backfill left, so no round runs until
+    /// the command), with one plain statement on a raw connection.
     mod folder_stats {
         use super::*;
 
@@ -38528,6 +38531,36 @@ mod tests {
             (handle, store_path, dir)
         }
 
+        /// Stops the engine and waits for its thread to end (its event
+        /// channel closes), so the store can be opened.
+        fn stop(handle: SyncHandle) {
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let deadline = Instant::now() + ENGINE_WAIT;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match handle.evt_rx.recv_timeout(left) {
+                    Ok(_) => continue,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                    Err(RecvTimeoutError::Timeout) => panic!("engine did not stop"),
+                }
+            }
+        }
+
+        /// F1's sync time read by one statement on a read-only
+        /// connection: no `Store::init`, for an idle engine's store.
+        fn synced_at_raw(store_path: &std::path::Path) -> Option<String> {
+            rusqlite::Connection::open_with_flags(
+                store_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap()
+            .query_row("SELECT synced_at FROM folders WHERE id = 'F1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        }
+
+        /// F1's stats through `Store`, once the engine stopped.
         fn stats(store_path: &std::path::Path) -> crate::store::FolderStats {
             Store::open(store_path)
                 .unwrap()
@@ -38561,12 +38594,11 @@ mod tests {
                 "no fresh delta: {:?}",
                 paths_from(&srv, 0)
             );
-            let s = stats(&store_path);
-            assert_eq!(s.stored, 0);
-            later_than_old(s.synced_at);
+            later_than_old(synced_at_raw(&store_path));
 
             // Idle: no round runs until the command.
             backdate(&store_path);
+            assert_eq!(synced_at_raw(&store_path).as_deref(), Some(OLD));
             let mark = srv.requests().len();
             handle
                 .cmd_tx
@@ -38574,9 +38606,10 @@ mod tests {
                 .unwrap();
             wait_idle(&handle, &mut Vec::new());
             assert!(paths_from(&srv, mark).iter().any(|p| p == LINK));
-            later_than_old(stats(&store_path).synced_at);
-
-            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            stop(handle);
+            let s = stats(&store_path);
+            assert_eq!(s.stored, 0);
+            later_than_old(s.synced_at);
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -38587,10 +38620,9 @@ mod tests {
             routes.extend(folder_routes(INBOX, &[], &[]));
             let srv = FakeServer::start_limited(routes);
             let (handle, store_path, dir) = start(&srv, "stats-failed", 0, true);
+            stop(handle);
             assert!(paths_from(&srv, 0).iter().any(|p| p == LINK));
             assert_eq!(stats(&store_path).synced_at.as_deref(), Some(OLD));
-
-            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -38604,10 +38636,9 @@ mod tests {
             routes.extend(folder_routes(INBOX, &[], &[]));
             let srv = FakeServer::start_limited(routes);
             let (handle, store_path, dir) = start(&srv, "stats-never", 0, false);
+            stop(handle);
             assert!(paths_from(&srv, 0).iter().any(|p| is_delta(p, "F1")));
             assert_eq!(stats(&store_path).synced_at, None);
-
-            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
             let _ = std::fs::remove_dir_all(&dir);
         }
 
@@ -38634,6 +38665,7 @@ mod tests {
             ));
             let srv = FakeServer::start_limited(routes);
             let (handle, store_path, dir) = start(&srv, "stats-small", 2, false);
+            stop(handle);
             let store = Store::open(&store_path).unwrap();
             let h = store.folder_history("F1").unwrap().unwrap();
             assert!(
@@ -38648,8 +38680,7 @@ mod tests {
             );
             let t = s.synced_at.expect("a sync time");
             assert!(crate::store::iso8601_to_unix_secs(&t).is_some(), "{t}");
-
-            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            drop(store);
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
