@@ -628,8 +628,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   stop only on a `Shutdown` (or a dropped handle) or when the `FetchBody`
   it served got an auth, throttle or transport failure, never because of a
   back-off set before it: `Refresh` runs a pass during one. A `Shutdown`
-  stops the work at the next checkpoint; the commands that came before it
-  still run. So a click costs one round trip plus the request in flight;
+  stops the work at the next checkpoint; of the commands that came before
+  it only the writes are persisted, unsent (#2127, below). So a click costs one round trip plus the request in flight;
   any other command waits for the idle step in flight (one prefetch body,
   one backfill page, or a backfill's last step: its last round, repair and
   new-mail bodies).
@@ -642,7 +642,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   assert would change with the day they run. The #1978 tests opt in and
   date their mail relative to now. They read the store only after the
   engine stopped.
-- Not done: no checkpoint inside the outbox drain (a send with big
+- Not done: no checkpoint inside the outbox drain (it only takes the waiting
+  commands before each op, #2127; a send with big
   attachments still holds a click), the folder-tree listing or the
   calendar's pages; no `$batch`; pictures and attachments are not
   prefetched; no lookxy setting for the window.
@@ -3664,3 +3665,61 @@ A host can draw classic Outlook's Folder Size dialog. The Local Data tab comes f
     and `classify_status` a whole call). Any other sub-status fails it alone, and a whole-call
     error fails it (auth, throttle and transport also through `react_quietly`). There is no
     retry loop and no sleep on the engine thread.
+
+## Shutdown persists queued writes (#2127)
+
+A host that sends many per-message writes (`MarkRead`, `Delete`, `Move`) and then `Shutdown`
+must not lose the ones the engine has not reached. Each such command is `enqueue_and_drain`:
+one Graph round trip per op, serially. Before #2127 the `Shutdown` was honoured only after every
+one of them had been sent, so a host that waits a bounded time at quit lost the tail. The store
+already showed the host's side (row deleted, row read), so nothing looked wrong until a later
+quarantine re-listed the mailbox and brought the lost writes back.
+
+- `Engine::take_waiting` moves every command on the channel into `deferred`, in order, serving
+  none. A `Shutdown` or a dropped handle sets `shutting_down` and ends the take (commands sent
+  after the `Shutdown` stay unread).
+- `drain_outbox` returns `Drain::Aborted` at its top while `shutting_down`, and calls
+  `take_waiting` before each op it is about to send (after the `has_op` skip, before the
+  `DeleteFolder`/`EmptyFolder`/`MarkFolderRead`/`apply_op` dispatch), returning `Aborted` once
+  it sees the shutdown. So an idle engine that gets N writes and a `Shutdown` in a burst sends
+  at most the one request already in flight when the burst raced the engine's read of the
+  first command.
+- `Engine::checkpoint` is built on `take_waiting`: it reads the channel up to a waiting
+  `Shutdown` first, then serves the kept commands of a served kind (`served_at_checkpoint`:
+  `FetchBody`, `SearchMessages`, `FetchMessage`, `FetchFolderSizes`) out of `deferred`, one at
+  a time, taking again after each. A read sent before a `Shutdown` is therefore never served,
+  in the bulk runs' checkpoints inside a drain too. Outside a shutdown the order is unchanged:
+  a served kind in `deferred` is one the drain took early, which the old `checkpoint` would have
+  read from the channel and served ahead of the deferred writes the same way, and `main_loop`
+  still runs `deferred` before the channel. Without this, a read a drain took (`Delete,
+  Refresh, FetchBody` in a burst) would wait for the whole `Refresh` pass (#1978's regression
+  guard: `a_read_taken_by_a_drain_is_served_at_the_next_pass_checkpoint`).
+- `main_loop`, once `shutting_down`, pops `deferred` and runs a command only when
+  `persists_at_shutdown` (an exhaustive `match`, no `_` arm, so a new command forces a
+  decision). Its store write and `enqueue_op` happen as in `handle_command`; its drain is cut at
+  the top, and `refresh_if_calendar_reset_owed` returns `false` when shutting down. Every other
+  kept command is dropped. Then the thread returns, and the next start drains the outbox.
+  - Persisted: the message writes (`MarkRead`, `SetFlag`, `SetCategories`, `Move`, `Delete`,
+    `SaveDraft`, `SendDraft`, both message reminders), the event writes (`RespondEvent`,
+    `CreateEvent`, `UpdateEvent`, `DeleteEvent`, `CancelEvent`, `ForwardEvent`,
+    `UpdateEventSeries`, both event reminders), the contact writes (their ops were queued by the
+    host's store write; the arm only drains), the folder writes (`CreateFolder` to
+    `EmptyFolder`), and also `SetFastFolders` (in memory), `SetCalendars` (the selection is
+    stored; `set_calendars` skips its `refresh_calendar` when shutting down, and the next pass
+    refreshes) and `SignOut` (the token cache is cleared; later writes still queue, and with no
+    token nothing drains).
+  - Dropped: every read and pass (`Refresh`, `SyncFolder`, `SignIn`, the `Fetch*` commands,
+    `SearchMessages`, `SaveAttachment`, `RefreshCalendar`, ...), and the writes that reach
+    Graph outside the outbox, which have nothing durable to persist: `RespondMeeting` and
+    `RemoveFromCalendar` (they read the meeting first), `SetAutomaticReplies` (a direct PATCH),
+    and `ComposeReply`/`ComposeForward` (`createReply`).
+- A drain cut by the shutdown after an op went through returns before its post-drain syncs
+  (`sync_after_send`, `relist_after_drain`, `sync_copied_folders`). A copy applied just before it
+  gets its contents synced by the next start's pass, as after a bulk run's checkpoint stop.
+- Not done: the drain is no faster (no `$batch` for per-message ops), and hosts still do not
+  wait for the engine thread at quit (`lookxy` sends `Shutdown` and returns; a bounded wait
+  for `evt_rx` to disconnect is the host's change).
+- Tests (`engine.rs` `tests::shutdown_persists`): 20 `Delete`s against a `DELETE` paced 500 ms,
+  then a `Shutdown` or a dropped handle: the engine returns within 3 s with at most one sent,
+  and a second engine on the store sends the rest. Commands sent during a paced startup pass
+  are persisted with no write, body, search or calendar request. And the #1978 guard above.
