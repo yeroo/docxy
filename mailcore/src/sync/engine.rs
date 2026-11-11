@@ -38214,6 +38214,22 @@ mod tests {
                 ClearOfflineRefusal::NotOnServer,
                 "the drafts sentinel"
             );
+            // A folder created here whose create has not reached Graph. Its
+            // queued create is dropped, so the barrier's drain sends nothing.
+            let local = match store.create_local_folder(Some("F1"), "New").unwrap() {
+                FolderWriteResult::Written(id) => id,
+                other => panic!("{other:?}"),
+            };
+            assert!(local.starts_with("local:"), "{local}");
+            for row in store.pending_ops().unwrap() {
+                store.drop_op(row.seq);
+            }
+            clear(&handle, &local);
+            assert_eq!(
+                refusal(&handle),
+                (local.clone(), ClearOfflineRefusal::NotOnServer),
+                "a local: folder"
+            );
             // A barrier: F1's own sync after them.
             handle
                 .cmd_tx
