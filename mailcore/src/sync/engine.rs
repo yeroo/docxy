@@ -4010,7 +4010,7 @@ impl Engine {
             .store
             .folder_histories()?
             .into_iter()
-            .filter(|h| !h.is_complete(whole))
+            .filter(|h| h.has_delta_link && !h.is_complete(whole))
             .collect())
     }
 
