@@ -11834,28 +11834,21 @@ mod calendar_tests {
 
     /// #2113 (#1892 plan-5): every store connection waits `BUSY_TIMEOUT`
     /// for the other's lock, set by `Store::init` itself, not left to
-    /// rusqlite's default. That the wait works across two connections is
+    /// rusqlite's default (5 s too, so the connection here starts at zero).
+    /// That the wait works across two connections is
     /// `writes_wait_out_another_connections_write`.
     #[test]
     fn plan_5_store_sets_a_busy_timeout() {
-        let busy_ms = |s: &Store| -> i64 {
-            s.conn
-                .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+        let conn = Connection::open_in_memory().unwrap();
+        conn.busy_timeout(Duration::ZERO).unwrap();
+        let busy_ms = |c: &Connection| -> i64 {
+            c.query_row("PRAGMA busy_timeout", [], |r| r.get(0))
                 .unwrap()
         };
-        let expected = BUSY_TIMEOUT.as_millis() as i64;
-        assert!(expected > 0);
-        assert_eq!(busy_ms(&Store::open_in_memory().unwrap()), expected);
-        let dir = std::env::temp_dir().join(format!(
-            "mailcore-busy-timeout-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let s = Store::open(&dir.join("mail.db")).unwrap();
-        assert_eq!(busy_ms(&s), expected);
-        drop(s);
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(busy_ms(&conn), 0);
+        let s = Store::init(conn).unwrap();
+        assert!(!BUSY_TIMEOUT.is_zero());
+        assert_eq!(busy_ms(&s.conn), BUSY_TIMEOUT.as_millis() as i64);
     }
 
     fn ev(id: &str, start: &str, end: &str) -> NewEvent {
