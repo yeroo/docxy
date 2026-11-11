@@ -249,7 +249,11 @@ fn draw_ribbon(f: &mut Frame, app: &App, area: Rect) {
 /// Renders the reminder banner (the front queued reminder, plus a `(+N more)`
 /// count and an `[Esc to dismiss]` hint) into `area` — a 1-row yellow strip.
 fn draw_reminder_banner(f: &mut Frame, app: &App, area: Rect) {
-    let front = app.reminder_queue.front().cloned().unwrap_or_default();
+    let front = app
+        .reminder_queue
+        .front()
+        .map(|b| b.text.as_str())
+        .unwrap_or_default();
     let more = app.reminder_queue.len().saturating_sub(1);
     let extra = if more > 0 {
         format!("  (+{more} more)")
@@ -786,10 +790,14 @@ mod tests {
     #[test]
     fn reminder_banner_renders_front_and_more_count() {
         let mut app = App::for_test_with_seeded_store();
-        app.reminder_queue
-            .push_back("⏰ Standup starts in 5 min (09:00)".into());
-        app.reminder_queue
-            .push_back("⏰ Review starts in 8 min (09:03)".into());
+        app.reminder_queue.push_back(crate::app::ReminderBanner {
+            event_id: "E1".into(),
+            text: "⏰ Standup starts in 5 min (09:00)".into(),
+        });
+        app.reminder_queue.push_back(crate::app::ReminderBanner {
+            event_id: "E2".into(),
+            text: "⏰ Review starts in 8 min (09:03)".into(),
+        });
         let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let text: String = term
@@ -807,9 +815,19 @@ mod tests {
     #[test]
     fn esc_dismisses_reminder_banner() {
         let mut app = App::for_test_with_seeded_store();
-        app.reminder_queue.push_back("⏰ Standup".into());
+        app.reminder_queue.push_back(crate::app::ReminderBanner {
+            event_id: "E1".into(),
+            text: "⏰ Standup".into(),
+        });
+        let rx = app.test_cmd_rx.take().unwrap();
+        while rx.try_recv().is_ok() {}
         handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
         assert!(app.reminder_queue.is_empty());
+        // ... and on the server (#2117).
+        match rx.try_recv() {
+            Ok(SyncCommand::DismissReminder { id }) => assert_eq!(id, "E1"),
+            other => panic!("expected DismissReminder, got {other:?}"),
+        }
     }
 
     #[test]

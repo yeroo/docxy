@@ -136,6 +136,27 @@ pub struct App {
     /// `State(Idle)` right after a failed send's `SendFailed`): only the
     /// next key press does (see `main::run`).
     pub send_failure: Option<String>,
+    /// The attachment a queued send is uploading (#2117), from the last
+    /// `SyncEvent::AttachmentProgress`, for the status bar's `Uploading
+    /// <name>: <sent>/<total>`. Cleared by that draft's `Sent`/`SendFailed`,
+    /// and by `State(Offline | SignInRequired | Idle)`: a drain a sign-in,
+    /// throttle or transport error stopped sends neither, and `Idle` means the
+    /// outbox is empty.
+    pub upload_progress: Option<UploadProgress>,
+    /// The folder backfill walk under way (#2117), from the last incomplete
+    /// `SyncEvent::FolderProgress`, for the status bar's `Updating <folder>…`.
+    /// The engine walks one folder at a time, so the latest event wins; that
+    /// folder's `complete: true` clears it.
+    pub backfill: Option<FolderProgressLine>,
+    /// Folders whose history is complete (#2117), for the status bar's `This
+    /// folder is up to date`: seeded from the store
+    /// (`seed_folders_up_to_date`), since a folder synced in an earlier run
+    /// gets no `complete` event again, then kept by `FolderProgress` events.
+    pub folders_up_to_date: std::collections::HashSet<String>,
+    /// Whether the engine downloads the whole mailbox (`backfill_days <= 0`)
+    /// rather than a window: the mode `FolderHistory::is_complete` asks for.
+    /// Set by `main` from the config; `seed_folders_up_to_date` reads it.
+    pub whole_mailbox: bool,
     /// In-flight `SaveAttachment` requests keyed by their `dest` path, each
     /// mapped to whether it should be opened once it completes (`o`) or
     /// merely reported (Enter). Keyed per-request (rather than one shared
@@ -269,8 +290,8 @@ pub struct App {
     pub folder_tree_initialized: bool,
     /// Event ids already alerted this session (fire-once de-dup).
     pub alerted_reminders: std::collections::HashSet<String>,
-    /// Pending reminder banner lines (front = currently shown).
-    pub reminder_queue: std::collections::VecDeque<String>,
+    /// Pending reminder banners (front = currently shown).
+    pub reminder_queue: std::collections::VecDeque<ReminderBanner>,
     #[cfg(test)]
     pub agwinterm_notify_invocations: std::cell::Cell<u32>,
     /// The free/busy availability overlay (opened by `Ctrl-B` in the event
@@ -364,6 +385,34 @@ pub struct App {
     /// `inline_images` in `open_message`, since a newly opened message's cids
     /// are unrelated to whatever was cached for the previous one.
     pub image_protocols: std::collections::HashMap<String, ratatui_image::protocol::Protocol>,
+}
+
+/// The attachment a queued send is uploading (#2117), from
+/// `SyncEvent::AttachmentProgress`: `sent` of `total` bytes of `name`, for
+/// the draft `draft_id` (the id `SendDraft` carried).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadProgress {
+    pub draft_id: String,
+    pub name: String,
+    pub sent: u64,
+    pub total: u64,
+}
+
+/// A folder's backfill walk under way (#2117), from an incomplete
+/// `SyncEvent::FolderProgress`. `total` is `None` in window mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderProgressLine {
+    pub folder_id: String,
+    pub synced: u64,
+    pub total: Option<i64>,
+}
+
+/// A fired reminder's banner (#2117): `text` is what the banner shows, and
+/// `event_id` the agenda row it fired for, which Esc dismisses on the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReminderBanner {
+    pub event_id: String,
+    pub text: String,
 }
 
 /// Which sign-in modal is currently showing (see `App::signin_modal`):
@@ -528,6 +577,10 @@ impl App {
             attachment_notice: None,
             error_notice: None,
             send_failure: None,
+            upload_progress: None,
+            backfill: None,
+            folders_up_to_date: std::collections::HashSet::new(),
+            whole_mailbox: false,
             pending_saves: std::collections::HashMap::new(),
             token_path,
             account: None,
@@ -636,6 +689,17 @@ impl App {
                 }
                 if matches!(s, SyncState::Idle) {
                     self.error_notice = None;
+                }
+                // An upload runs inside the drain's `PendingOps`, and the
+                // engine emits a state only on a change, so none of these
+                // lands mid-upload: each means no upload is going on (#2117).
+                // A 5xx back-off stays in `PendingOps` and may leave the line
+                // until the next drain.
+                if matches!(
+                    s,
+                    SyncState::Offline | SyncState::SignInRequired | SyncState::Idle
+                ) {
+                    self.upload_progress = None;
                 }
                 self.status = s;
             }
@@ -753,23 +817,39 @@ impl App {
             // lookxy never sends `FetchEventSeries` or `FetchEventInstances`
             // (its agenda edits single events only), so neither lands (#2022).
             SyncEvent::EventSeriesFetched { .. } | SyncEvent::EventInstancesFetched { .. } => {}
-            // lookxy shows no upload progress: its composer closes when Send
-            // is pressed, so nothing is open to show it on (#1941).
-            SyncEvent::AttachmentProgress { .. } => {}
+            // The composer closes when Send is pressed, so a send's upload
+            // progress (#1941) goes on the status bar (#2117). `sent` can go
+            // down (a fallback to a new upload session): the latest wins.
+            SyncEvent::AttachmentProgress {
+                draft_id,
+                name,
+                sent,
+                total,
+                ..
+            } => {
+                self.upload_progress = Some(UploadProgress {
+                    draft_id,
+                    name,
+                    sent,
+                    total,
+                });
+            }
             // A send failed for good: the engine already put the message
             // back in Drafts (#1874). Say so where no `State(Idle)` clears it.
-            SyncEvent::SendFailed { error, .. } => {
+            SyncEvent::SendFailed { id, error } => {
+                self.clear_upload_progress(&id);
                 self.send_failure = Some(format!("Send failed: {error}"));
                 self.reload_messages();
             }
-            // `Sent` has no TUI consumer yet: the composer already closes
-            // optimistically the moment Send is pressed (`apply_compose_action`),
-            // before the engine's outbox drain even reaches Graph, so by the
-            // time this lands there's nothing left open for it to affect —
-            // it's purely a "yes, it actually got delivered" confirmation.
-            // Folded into the existing catch-all rather than given a
-            // dedicated arm so this compiles now without inventing a
-            // toast/notice mechanism the brief doesn't ask for.
+            // The composer already closed when Send was pressed, so a
+            // delivered send only ends its upload line (#2117).
+            SyncEvent::Sent { id } => self.clear_upload_progress(&id),
+            SyncEvent::FolderProgress {
+                folder_id,
+                synced,
+                total,
+                complete,
+            } => self.on_folder_progress(folder_id, synced, total, complete),
             // Cache the bytes by `content_id` — but only if they're still
             // for the message currently open; a slow fetch for a message
             // the user has since navigated away from is simply dropped
@@ -785,12 +865,13 @@ impl App {
             // The profile and photo (#1920) are for a client's title bar;
             // lookxy never asks for them. The granted scopes (#1875) are for
             // a client that asks for more than it may have been granted.
-            // lookxy shows no backfill progress (#1871): its list reloads on
-            // each page's `MessagesUpdated`. lookxy makes no trust decision
-            // on `Store::is_contact` (#1934).
+            // A backfill page's `MessagesUpdated` reloads the list only for
+            // the selected folder (#1871); its progress is `FolderProgress`'s
+            // (#2117). lookxy makes no trust decision on `Store::is_contact`
+            // (#1934). `Sending` needs nothing: the upload line comes with the
+            // first `AttachmentProgress`.
             SyncEvent::MessagesUpdated { .. }
             | SyncEvent::BodyReady { .. }
-            | SyncEvent::Sent { .. }
             | SyncEvent::Sending { .. }
             | SyncEvent::ProfileFetched { .. }
             | SyncEvent::PhotoFetched { .. }
@@ -807,7 +888,6 @@ impl App {
             // renames or moves a folder (#1910).
             | SyncEvent::FolderCreated { .. }
             | SyncEvent::FolderWriteFailed { .. }
-            | SyncEvent::FolderProgress { .. }
             // lookxy has no Delete All, so it never moves a folder's mail
             // (#2126).
             | SyncEvent::FolderMessagesMoving { .. }
@@ -824,6 +904,66 @@ impl App {
             | SyncEvent::MeetingMessageFetched { .. }
             | SyncEvent::RemovedFromCalendar { .. } => {}
         }
+    }
+
+    /// Ends the upload line when it is `draft_id`'s (#2117): another
+    /// draft's `Sent`/`SendFailed` leaves it.
+    fn clear_upload_progress(&mut self, draft_id: &str) {
+        if self
+            .upload_progress
+            .as_ref()
+            .is_some_and(|p| p.draft_id == draft_id)
+        {
+            self.upload_progress = None;
+        }
+    }
+
+    /// A folder's backfill moved on (#2117): an incomplete event is the walk
+    /// under way (and takes the folder out of "up to date": a restarted
+    /// walk); a complete one ends that folder's line and marks it up to date.
+    fn on_folder_progress(
+        &mut self,
+        folder_id: String,
+        synced: u64,
+        total: Option<i64>,
+        complete: bool,
+    ) {
+        if complete {
+            if self
+                .backfill
+                .as_ref()
+                .is_some_and(|b| b.folder_id == folder_id)
+            {
+                self.backfill = None;
+            }
+            self.folders_up_to_date.insert(folder_id);
+        } else {
+            self.folders_up_to_date.remove(&folder_id);
+            self.backfill = Some(FolderProgressLine {
+                folder_id,
+                synced,
+                total,
+            });
+        }
+    }
+
+    /// Re-reads which folders' histories are complete for the engine's mode
+    /// (`FolderHistory::is_complete`, #2117), so a folder synced in an
+    /// earlier run says "up to date" with no event. The folder whose walk is
+    /// under way (`backfill`) stays out, whatever the store says. A store
+    /// error leaves the set as it was. Called by `reload_folders`, and by
+    /// `main` once more after it sets `whole_mailbox` (`App::new` loads the
+    /// folders before that).
+    pub fn seed_folders_up_to_date(&mut self) {
+        let Ok(histories) = self.store.folder_histories() else {
+            return;
+        };
+        let walking = self.backfill.as_ref().map(|b| b.folder_id.as_str());
+        self.folders_up_to_date = histories
+            .into_iter()
+            .filter(|h| h.is_complete(self.whole_mailbox) && Some(h.folder_id.as_str()) != walking)
+            .map(|h| h.folder_id)
+            .collect();
     }
 
     /// Whether a modal is currently capturing keystrokes — the search prompt
@@ -952,6 +1092,7 @@ impl App {
     /// with `reload_messages` so the message list stays in step.
     pub fn reload_folders(&mut self) {
         self.folders = self.store.folders().unwrap_or_default();
+        self.seed_folders_up_to_date();
         self.rebuild_visible_folders();
         self.reload_messages();
     }
@@ -3335,17 +3476,31 @@ impl App {
             })
             .collect();
         for (id, msg) in due {
-            self.alerted_reminders.insert(id);
-            self.reminder_queue.push_back(msg.clone());
+            self.alerted_reminders.insert(id.clone());
             if self.reminders_notify {
                 self.notify_agwinterm(&msg);
             }
+            self.reminder_queue.push_back(ReminderBanner {
+                event_id: id,
+                text: msg,
+            });
         }
     }
 
-    /// Dismisses the front reminder banner.
+    /// Dismisses the front reminder banner, and its reminder on the server
+    /// (#2117): `SyncCommand::DismissReminder` with the agenda row's id (an
+    /// occurrence's for a series, as `events_in_window` lists it). A `local:`
+    /// event is not on Graph yet (mailcore would answer with an `Error`), so
+    /// it is dismissed here only.
     pub fn dismiss_reminder(&mut self) {
-        self.reminder_queue.pop_front();
+        let Some(banner) = self.reminder_queue.pop_front() else {
+            return;
+        };
+        if !banner.event_id.starts_with("local:") {
+            let _ = self.sync.cmd_tx.send(SyncCommand::DismissReminder {
+                id: banner.event_id,
+            });
+        }
     }
 
     /// Best-effort agwinterm overlay for a fired reminder. Production: only
@@ -4396,7 +4551,9 @@ pub(crate) mod tests {
         let now = start - 5 * 60; // 5 min before, inside the 15-min window
         app.check_due_reminders(now);
         assert_eq!(app.reminder_queue.len(), 1);
-        assert!(app.reminder_queue.front().unwrap().contains("Standup"));
+        let front = app.reminder_queue.front().unwrap();
+        assert!(front.text.contains("Standup"));
+        assert_eq!(front.event_id, "E1");
         app.check_due_reminders(now); // de-dup
         assert_eq!(app.reminder_queue.len(), 1);
     }
@@ -4435,15 +4592,61 @@ pub(crate) mod tests {
         assert_eq!(app.agwinterm_notify_invocations.get(), 1);
     }
 
+    fn banner(event_id: &str, text: &str) -> ReminderBanner {
+        ReminderBanner {
+            event_id: event_id.into(),
+            text: text.into(),
+        }
+    }
+
     #[test]
     fn dismiss_reminder_pops_the_front() {
         let mut app = App::for_test_with_seeded_store();
-        app.reminder_queue.push_back("a".into());
-        app.reminder_queue.push_back("b".into());
+        app.reminder_queue.push_back(banner("A", "a"));
+        app.reminder_queue.push_back(banner("B", "b"));
         app.dismiss_reminder();
-        assert_eq!(app.reminder_queue.front().map(String::as_str), Some("b"));
+        assert_eq!(
+            app.reminder_queue.front().map(|b| b.text.as_str()),
+            Some("b")
+        );
         app.dismiss_reminder();
         assert!(app.reminder_queue.is_empty());
+        // An empty queue sends nothing more.
+        app.dismiss_reminder();
+    }
+
+    /// #2041 plan-ui (#2117): Esc's dismiss also dismisses the reminder on
+    /// the server, for the agenda row it fired for.
+    #[test]
+    fn plan_ui_dismiss_reminder_sends_dismiss_on_the_server() {
+        let mut app = App::for_test_with_seeded_store();
+        app.agenda = vec![reminder_row("E1", "2026-07-20T09:00:00Z", 15, true)];
+        let start = crate::app::utc_to_epoch("2026-07-20T09:00:00Z");
+        app.check_due_reminders(start - 5 * 60);
+        let rx = app.test_cmd_rx.take().unwrap();
+        while rx.try_recv().is_ok() {}
+        app.dismiss_reminder();
+        assert!(app.reminder_queue.is_empty());
+        match rx.try_recv() {
+            Ok(SyncCommand::DismissReminder { id }) => assert_eq!(id, "E1"),
+            other => panic!("expected DismissReminder, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "one command only");
+    }
+
+    /// A `local:` event is not on Graph yet: dismissed here only.
+    #[test]
+    fn plan_ui_dismiss_reminder_local_event_sends_nothing() {
+        let mut app = App::for_test_with_seeded_store();
+        app.agenda = vec![reminder_row("local:7", "2026-07-20T09:00:00Z", 15, true)];
+        let start = crate::app::utc_to_epoch("2026-07-20T09:00:00Z");
+        app.check_due_reminders(start - 5 * 60);
+        assert_eq!(app.reminder_queue.len(), 1);
+        let rx = app.test_cmd_rx.take().unwrap();
+        while rx.try_recv().is_ok() {}
+        app.dismiss_reminder();
+        assert!(app.reminder_queue.is_empty());
+        assert!(rx.try_recv().is_err(), "nothing sent for a local: event");
     }
 
     #[test]
