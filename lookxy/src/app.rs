@@ -961,8 +961,9 @@ impl App {
     /// (`FolderHistory::is_complete`, #2117), so a folder synced in an
     /// earlier run says "up to date" with no event. The walk under way
     /// (`backfill`) is dropped when its folder is gone or the store says it
-    /// is complete (it stopped without a `complete` event); otherwise its
-    /// folder stays out of the set. A store error leaves both as they were.
+    /// is complete (it stopped without a `complete` event); a walk kept is
+    /// one the store calls incomplete, so its folder is not in the set. A
+    /// store error leaves both as they were.
     /// Called by `reload_folders`, and by `main` once more after it sets
     /// `whole_mailbox` (`App::new` loads the folders before that).
     pub fn seed_folders_up_to_date(&mut self) {
@@ -979,10 +980,9 @@ impl App {
         {
             self.backfill = None;
         }
-        let walking = self.backfill.as_ref().map(|b| b.folder_id.as_str());
         self.folders_up_to_date = histories
             .into_iter()
-            .filter(|h| h.is_complete(self.whole_mailbox) && Some(h.folder_id.as_str()) != walking)
+            .filter(|h| h.is_complete(self.whole_mailbox))
             .map(|h| h.folder_id)
             .collect();
     }

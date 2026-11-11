@@ -465,8 +465,8 @@ mod tests {
             .unwrap();
         app.reload_folders();
         assert!(render(&app).contains("This folder is up to date"));
-        // A walk under way stays out of the seed while the store says it is
-        // not complete ...
+        // A walk under way is kept, and its folder is not up to date, because
+        // the store calls it incomplete (here: a `window` walk in whole mode).
         app.store
             .complete_backfill("inbox", "FULL", mailcore::store::SCOPE_WINDOW, 1, None)
             .unwrap();

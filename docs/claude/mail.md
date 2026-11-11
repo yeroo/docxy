@@ -4250,7 +4250,8 @@ literally would break.
   engine walks only
   incomplete folders, a folder synced in an earlier run gets no event: `reload_folders`
   re-seeds the set from `Store::folder_histories` with `FolderHistory::is_complete`
-  (`App::whole_mailbox`, `backfill_days <= 0`), leaving out the folder being walked. `App::new`
+  (`App::whole_mailbox`, `backfill_days <= 0`); a walk it keeps is one the store calls
+  incomplete, so the walked folder is not in the set. `App::new`
   seeds before `main` sets `whole_mailbox`, so `main` seeds again after it.
 - Reminders (#2025's command): `reminder_queue` holds `ReminderBanner { event_id, text }`;
   Esc (`dismiss_reminder`) pops it and sends `DismissReminder` with the agenda row's id (an
