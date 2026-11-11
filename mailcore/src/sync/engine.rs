@@ -611,6 +611,32 @@ pub enum SyncCommand {
     /// folders; the engine does not. A UI that wants a folder in Deleted
     /// Items sends [`SyncCommand::MoveFolder`] to it.
     DeleteFolder { id: String },
+    /// Empty a mail folder (#2110), on the server too, not only the mail the
+    /// store holds. The store at once, in one transaction: every stored
+    /// message of the folder Graph has goes, unsent mail (a `local:` draft,
+    /// an unpushed edit, a queued save or send) stays, the counts become
+    /// those of what stayed, and the op is queued
+    /// ([`SyncEvent::MessagesUpdated`], then [`SyncEvent::FoldersUpdated`]).
+    /// Then, once no older op is queued, the engine pages every message
+    /// Graph holds there, received at or before the command's cutoff (the
+    /// later of this client's clock and the newest stored message: with a
+    /// clock ahead of Graph's, mail delivered up to that skew after the
+    /// command is deleted too; later mail stays). It keeps each one the
+    /// store shows elsewhere (a move out still unsent or refused, a lost
+    /// move answer), and leaves alone the unsent mail still held in the
+    /// folder and mail moved into it since; an emptied message stored
+    /// there again (a fetch, a row read by id) is deleted with the rest,
+    /// through `POST /$batch`, 20 a batch, waiting out a throttled one's
+    /// `Retry-After`. Until it is done nothing is read from Graph for the
+    /// folder and its stored counts are kept; then its delta starts afresh.
+    /// What could not be deleted, and what was kept as shown elsewhere, is
+    /// reported once at the end as [`SyncEvent::FolderWriteFailed`]
+    /// (`write: Empty`), as is a refusal; an unknown folder or the drafts
+    /// sentinel is refused at once. With `subfolders`, each child folder
+    /// stored under it is deleted as [`SyncCommand::DeleteFolder`] deletes
+    /// it, each refused or not on its own: from the store at once, with
+    /// the empty, and on Graph after the empty's run.
+    EmptyFolder { folder: String, subfolders: bool },
     /// Exit the sync thread cleanly.
     Shutdown,
 }
@@ -625,6 +651,8 @@ pub enum FolderWrite {
     MarkRead,
     /// [`SyncCommand::DeleteFolder`] (#2107).
     Delete,
+    /// [`SyncCommand::EmptyFolder`] (#2110).
+    Empty,
 }
 
 impl FolderWrite {
@@ -635,6 +663,7 @@ impl FolderWrite {
             FolderWrite::Move => "move",
             FolderWrite::MarkRead => "mark all read in",
             FolderWrite::Delete => "delete",
+            FolderWrite::Empty => "empty",
         }
     }
 }
@@ -1111,17 +1140,46 @@ struct Repair {
     /// A row was completed or deleted, so the folder needs a reload.
     changed: bool,
 }
-/// A `MarkFolderRead` op in progress (#1913, `Engine::run_mark_folder_read`).
+/// A `MarkFolderRead` (#1913, `Engine::run_mark_folder_read`) or
+/// `EmptyFolder` (#2110, `Engine::run_empty_folder`) op in progress.
 #[derive(Debug)]
 struct BulkRun {
     /// The op's outbox row.
     seq: i64,
-    /// The ids still to mark, in the order Graph listed them.
+    /// What each id's sub-request does.
+    kind: BulkKind,
+    /// The ids still to mark or delete, in the order Graph listed them.
     todo: VecDeque<String>,
-    /// How many ids the listing gave.
+    /// How many ids the run took on: listed, less what the empty left
+    /// alone (the unsent mail still stored in the folder, and mail moved
+    /// into it since; `Store::empty_refused`).
     total: usize,
     /// The ids Graph refused for good: (id, status, error).
     failed: Vec<(String, u16, String)>,
+    /// How many listed ids the empty kept, as the store shows them
+    /// elsewhere or removed (`Store::delete_allow_check`).
+    kept: usize,
+    /// A stored row of an id Graph deleted was removed during the run.
+    rows_deleted: bool,
+}
+
+/// What a [`BulkRun`]'s `$batch` sub-requests do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BulkKind {
+    /// `PATCH {"isRead":true}` (#1913).
+    MarkRead,
+    /// `DELETE` (#2110); the stored row of each id Graph answered for goes.
+    Delete,
+}
+
+/// How `Engine::bulk_batches` ended.
+enum BatchLoop {
+    /// Every id was answered.
+    Done,
+    /// The drain must stop or defer, the run kept; or the run is gone.
+    Step(BulkStep),
+    /// The `$batch` call failed as a whole, the run kept.
+    CallFailed(GraphError),
 }
 
 /// Which delta items a queued `MarkFolderRead` stores read (#1913,
@@ -2294,6 +2352,9 @@ impl Engine {
                 self.folder_command(FolderWrite::MarkRead, &folder, r);
             }
             SyncCommand::DeleteFolder { id } => self.delete_folder(&id),
+            SyncCommand::EmptyFolder { folder, subfolders } => {
+                self.empty_folder(&folder, subfolders)
+            }
             // Handled in `main_loop` so the thread can actually return.
             SyncCommand::Shutdown => {}
         }
@@ -2389,7 +2450,10 @@ impl Engine {
     fn refresh_folder(&mut self, folder_id: &str) -> bool {
         // A folder created here that has not reached Graph yet (#1910) has
         // nothing there to read.
-        if folder_id.starts_with("local:") {
+        // Nor one a queued `EmptyFolder` names (#2110): no delta, no count.
+        if folder_id.starts_with("local:")
+            || self.store.folder_being_emptied(folder_id).unwrap_or(false)
+        {
             return true;
         }
         if !self.sync_folder_delta(folder_id) {
@@ -2663,6 +2727,12 @@ impl Engine {
                         if queued.marked_read.contains_key(&f.id) {
                             f.unread_count = row.unread_count;
                         }
+                        // A queued `EmptyFolder` (#2110) keeps both counts
+                        // it stored until Graph has done it.
+                        if queued.emptied.contains(&f.id) {
+                            f.total_count = row.total_count;
+                            f.unread_count = row.unread_count;
+                        }
                     }
                     changed |= self.store.upsert_folder(&f).unwrap_or(false);
                 }
@@ -2773,6 +2843,12 @@ impl Engine {
     /// repair (so an aborted repair still shows them), and again after a
     /// repair that changed a row.
     fn sync_folder_delta(&mut self, folder_id: &str) -> bool {
+        // A folder a queued `EmptyFolder` names (#2110) is not read: a
+        // fresh delta would bring back the mail the command removed. Its
+        // links were cleared; the op's end clears them again.
+        if self.store.folder_being_emptied(folder_id).unwrap_or(false) {
+            return true;
+        }
         let stored = self.store.get_delta_link(folder_id).ok().flatten();
         // An unreadable count gets the head, like a big folder.
         let small = stored.is_none()
@@ -3949,6 +4025,28 @@ impl Engine {
                     BulkStep::Stopped => return Drain::Aborted,
                 }
             }
+            // Run by the engine across drains (#2110), never `apply_op`, and
+            // only once it is the oldest op, as a `DeleteFolder`: a move
+            // into the folder queued before it, refused once with a 4xx
+            // (which the drain passes), lands or is given up first.
+            if let OutboxOp::EmptyFolder {
+                folder,
+                before,
+                batch,
+            } = &row.op
+            {
+                if self.store.has_older_op(row.seq).unwrap_or(true) {
+                    continue;
+                }
+                match self.run_empty_folder(row.seq, folder, before, batch) {
+                    BulkStep::Finished => continue,
+                    BulkStep::Deferred => {
+                        deferred = true;
+                        break;
+                    }
+                    BulkStep::Stopped => return Drain::Aborted,
+                }
+            }
             // Run by the engine across drains (#1913), never `apply_op`.
             if let OutboxOp::MarkFolderRead { folder, before } = &row.op {
                 match self.run_mark_folder_read(row.seq, folder, before) {
@@ -4210,17 +4308,29 @@ impl Engine {
         id: &str,
         result: Result<FolderWriteResult, StoreError>,
     ) {
+        if self.folder_written(write, id, result) {
+            self.emit(SyncEvent::FoldersUpdated);
+            self.drain_queued();
+        }
+    }
+
+    /// Whether a folder command's store write wrote (and queued its op);
+    /// a refusal or a store error is reported (`FolderWriteFailed` +
+    /// `Error`), `Unchanged` is nothing.
+    fn folder_written(
+        &self,
+        write: FolderWrite,
+        id: &str,
+        result: Result<FolderWriteResult, StoreError>,
+    ) -> bool {
         let error = match result {
-            Ok(FolderWriteResult::Written(_)) => {
-                self.emit(SyncEvent::FoldersUpdated);
-                self.drain_queued();
-                return;
-            }
-            Ok(FolderWriteResult::Unchanged) => return,
+            Ok(FolderWriteResult::Written(_)) => return true,
+            Ok(FolderWriteResult::Unchanged) => return false,
             Ok(FolderWriteResult::Refused(r)) => r.to_string(),
             Err(e) => e.to_string(),
         };
         self.report_folder_failure(id, write, None, error);
+        false
     }
 
     /// A folder op Graph refused for good (#1910): drop it and revert its
@@ -4312,6 +4422,15 @@ impl Engine {
     /// with them from outside the subtree is reported. A store refusal is
     /// `FolderWriteFailed` + `Error`.
     fn delete_folder(&mut self, id: &str) {
+        let result = self.delete_folder_write(id);
+        self.folder_command(FolderWrite::Delete, id, result);
+    }
+
+    /// `delete_folder` without its events and drain (#2110 r1: an empty's
+    /// `subfolders` writes every delete before it drains): the store write,
+    /// the fast folders, a mail reconverge, and the reports of the `local:`
+    /// folders removed from outside the subtree.
+    fn delete_folder_write(&mut self, id: &str) -> Result<FolderWriteResult, StoreError> {
         let (result, removed) = match self.store.delete_folder(id) {
             Ok((r, d)) => (Ok(r), d),
             Err(e) => (Err(e), FolderDelete::default()),
@@ -4330,7 +4449,7 @@ impl Engine {
                 );
             }
         }
-        self.folder_command(FolderWrite::Delete, id, result);
+        result
     }
 
     /// Runs a queued `DeleteFolder` (#2107). A folder still `local:` (its
@@ -4449,32 +4568,53 @@ impl Engine {
                 Ok(ids) => {
                     self.bulk = Some(BulkRun {
                         seq,
+                        kind: BulkKind::MarkRead,
                         total: ids.len(),
                         todo: ids.into(),
                         failed: Vec::new(),
+                        kept: 0,
+                        rows_deleted: false,
                     });
                 }
                 Err(e) => return self.mark_read_call_failed(seq, &folder, e),
             }
         }
+        match self.bulk_batches(seq) {
+            BatchLoop::Done => self.finish_mark_folder_read(seq, &folder),
+            BatchLoop::Step(step) => step,
+            BatchLoop::CallFailed(e) => self.mark_read_call_failed(seq, &folder, e),
+        }
+    }
+
+    /// Sends the kept run's ids (`self.bulk`) 20 a `$batch` (#1913; #2110
+    /// shares it), each batch's ids leaving the run only once Graph has
+    /// answered the batch. A 2xx or a 404 is done (for a delete run, the
+    /// stored row of that id goes too, should one have come back); a 429
+    /// or 503 puts its ids back at the front and stops the drain for the
+    /// longest `Retry-After` (default 30 s); another 5xx puts them back
+    /// under the outbox back-off; any other status is recorded in
+    /// `failed`. Between batches `checkpoint` serves the commands that
+    /// cannot wait. A whole-call failure is handed back, the run kept.
+    fn bulk_batches(&mut self, seq: i64) -> BatchLoop {
         loop {
             let Some(run) = self.bulk.as_ref() else {
-                return BulkStep::Finished;
+                return BatchLoop::Step(BulkStep::Finished);
             };
             let ids: Vec<String> = run.todo.iter().take(BATCH_MAX).cloned().collect();
             if ids.is_empty() {
-                return self.finish_mark_folder_read(seq, &folder);
+                return BatchLoop::Done;
             }
-            let reqs: Vec<BatchRequest> = ids
-                .iter()
-                .map(|id| GraphClient::mark_read_request(id))
-                .collect();
+            let request = match run.kind {
+                BulkKind::MarkRead => GraphClient::mark_read_request,
+                BulkKind::Delete => GraphClient::delete_message_request,
+            };
+            let reqs: Vec<BatchRequest> = ids.iter().map(|id| request(id)).collect();
             let answers = match self.with_auth(|c| c.batch(&reqs)) {
                 Ok(a) => a,
-                Err(e) => return self.mark_read_call_failed(seq, &folder, e),
+                Err(e) => return BatchLoop::CallFailed(e),
             };
             let Some(run) = self.bulk.as_mut() else {
-                return BulkStep::Finished;
+                return BatchLoop::Step(BulkStep::Finished);
             };
             run.todo.drain(..ids.len());
             let mut again = Vec::new();
@@ -4482,7 +4622,15 @@ impl Engine {
             let mut server_error = None;
             for (id, answer) in ids.into_iter().zip(answers) {
                 match answer.status {
-                    200..=299 | 404 => {}
+                    200..=299 | 404 => {
+                        // Deleted on Graph: a row of it that came back
+                        // meanwhile (a search hit, a fetch) goes too.
+                        if run.kind == BulkKind::Delete
+                            && matches!(self.store.delete_message_resolved(&id), Ok(Some(_)))
+                        {
+                            run.rows_deleted = true;
+                        }
+                    }
                     429 | 503 => {
                         let secs = answer.retry_after_secs.unwrap_or(30);
                         throttle = Some(throttle.map_or(secs, |t| t.max(secs)));
@@ -4515,15 +4663,15 @@ impl Engine {
                 self.hold_outbox(secs);
                 self.schedule_retry(Duration::from_secs(secs));
                 self.settle_state();
-                return BulkStep::Stopped;
+                return BatchLoop::Step(BulkStep::Stopped);
             }
             if let Some(error) = server_error {
                 self.defer_op(seq, &error);
-                return BulkStep::Deferred;
+                return BatchLoop::Step(BulkStep::Deferred);
             }
             let more = self.bulk.as_ref().is_some_and(|r| !r.todo.is_empty());
             if more && !self.checkpoint() {
-                return BulkStep::Stopped;
+                return BatchLoop::Step(BulkStep::Stopped);
             }
         }
     }
@@ -4623,6 +4771,207 @@ impl Engine {
         self.bulk = None;
         let _ = self.store.restart_folder_delta(folder);
         self.report_folder_failure(folder, FolderWrite::MarkRead, status, error);
+    }
+
+    /// `SyncCommand::EmptyFolder` (#2110): the store write
+    /// (`Store::empty_folder`), then `MessagesUpdated` for the folder,
+    /// `FoldersUpdated` and a drain; a store refusal is `FolderWriteFailed`
+    /// and `Error`. With `subfolders`, each folder stored right under it
+    /// (read before the write) is deleted from the store too, as
+    /// `delete_folder` deletes it (each refused or not on its own), before
+    /// the one drain (r1): the children leave the UI at once, and their
+    /// `DeleteFolder`s, queued after the empty and waiting for it, survive
+    /// a restart.
+    fn empty_folder(&mut self, folder: &str, subfolders: bool) {
+        let children: Vec<String> = if subfolders {
+            let parent = self
+                .store
+                .current_folder_id(folder)
+                .unwrap_or_else(|_| folder.to_string());
+            self.store
+                .folders()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|f| f.parent_id.as_deref() == Some(parent.as_str()))
+                .map(|f| f.id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let r = self
+            .store
+            .empty_folder(folder, &unix_to_iso8601(now_unix()));
+        if let Ok(FolderWriteResult::Written(id)) = &r {
+            self.emit(SyncEvent::MessagesUpdated {
+                folder_id: id.clone(),
+            });
+        }
+        if !self.folder_written(FolderWrite::Empty, folder, r) {
+            return;
+        }
+        for child in children {
+            let r = self.delete_folder_write(&child);
+            self.folder_written(FolderWrite::Delete, &child, r);
+        }
+        self.emit(SyncEvent::FoldersUpdated);
+        self.drain_queued();
+    }
+
+    /// Runs a queued `EmptyFolder` (#2110). A folder still `local:` (its
+    /// create never reached Graph) sends nothing. The first step pages
+    /// every message Graph holds in the folder received at or before
+    /// `before` (`GraphClient::folder_messages_before`), all of them before
+    /// the first DELETE, as deleting while paging would shift the pages,
+    /// and checks them against the command's allow-list
+    /// (`Store::delete_allow_check`, as #2107's walk). The ids refused
+    /// there are sorted by `Store::empty_refused` (r1): one stored in
+    /// another folder, or not stored (a tombstone, an internet message id
+    /// held elsewhere), is kept and reported at the end; one stored in this
+    /// folder is left alone, unreported, when it is unsent (the command's
+    /// own choice) or the batch does not allow it (moved in since), and is
+    /// deleted when the batch allows it (an emptied message another path
+    /// stored there again). The rest go 20 a `$batch` DELETE
+    /// (`bulk_batches`). A whole-call failure of
+    /// the listing or a batch takes the drain's usual arms
+    /// (`engine_op_call_failed`); anything else refuses the op
+    /// (`refuse_empty_folder`).
+    fn run_empty_folder(&mut self, seq: i64, folder: &str, before: &str, batch: &str) -> BulkStep {
+        let folder = self
+            .store
+            .current_folder_id(folder)
+            .unwrap_or_else(|_| folder.to_string());
+        if self.bulk.as_ref().is_none_or(|b| b.seq != seq) {
+            self.bulk = None;
+            if folder.starts_with("local:") {
+                let _ = self.store.finish_folder_empty(seq, batch, &folder);
+                return BulkStep::Finished;
+            }
+            let items = match self.with_auth(|c| c.folder_messages_before(&folder, before)) {
+                Ok(items) => items,
+                Err(e) => return self.empty_call_failed(seq, &folder, batch, e),
+            };
+            let refused: HashSet<String> = match self.store.delete_allow_check(batch, &[], &items) {
+                Ok(r) => r.into_iter().collect(),
+                Err(e) => {
+                    let e = GraphError::Parse(e.to_string());
+                    return self.empty_call_failed(seq, &folder, batch, e);
+                }
+            };
+            // A refused id the batch allows that is stored in the folder
+            // again is deleted; one shown elsewhere is kept and reported;
+            // the folder's unsent mail, and mail come into it since, is
+            // left alone (`Store::empty_refused`, r1).
+            let refused_ids: Vec<String> = items
+                .iter()
+                .map(|(id, _)| id)
+                .filter(|id| refused.contains(*id))
+                .cloned()
+                .collect();
+            let split = match self.store.empty_refused(batch, &folder, &refused_ids) {
+                Ok(split) => split,
+                Err(e) => {
+                    let e = GraphError::Parse(e.to_string());
+                    return self.empty_call_failed(seq, &folder, batch, e);
+                }
+            };
+            let kept = split.kept;
+            let todo: VecDeque<String> = items
+                .into_iter()
+                .map(|(id, _)| id)
+                .filter(|id| !refused.contains(id) || split.delete.contains(id))
+                .collect();
+            self.bulk = Some(BulkRun {
+                seq,
+                kind: BulkKind::Delete,
+                total: todo.len() + kept,
+                todo,
+                failed: Vec::new(),
+                kept,
+                rows_deleted: false,
+            });
+        }
+        match self.bulk_batches(seq) {
+            BatchLoop::Done => self.finish_empty_folder(seq, &folder, batch),
+            BatchLoop::Step(step) => step,
+            BatchLoop::CallFailed(e) => self.empty_call_failed(seq, &folder, batch, e),
+        }
+    }
+
+    /// An `EmptyFolder`'s listing or `$batch` call failed as a whole
+    /// (#2110), as a `MarkFolderRead`'s does: anything
+    /// `engine_op_call_failed` hands back refuses it for good.
+    fn empty_call_failed(
+        &mut self,
+        seq: i64,
+        folder: &str,
+        batch: &str,
+        e: GraphError,
+    ) -> BulkStep {
+        match self.engine_op_call_failed(seq, e) {
+            Ok(step) => step,
+            Err(e) => {
+                let status = refused_write_status(&e);
+                self.refuse_empty_folder(seq, folder, batch, status, e.to_string());
+                BulkStep::Finished
+            }
+        }
+    }
+
+    /// Every id of an `EmptyFolder` was answered (#2110): the op and its
+    /// allow-list go and the folder's links are cleared
+    /// (`Store::finish_folder_empty`, one transaction), so its next delta
+    /// starts afresh. What Graph refused and what the check kept are
+    /// reported once (`FolderWriteFailed`, `write: Empty`; the status is
+    /// the first refusal's, `None` when only kept mail is reported).
+    fn finish_empty_folder(&mut self, seq: i64, folder: &str, batch: &str) -> BulkStep {
+        let Some(run) = self.bulk.take() else {
+            return BulkStep::Finished;
+        };
+        let _ = self.store.finish_folder_empty(seq, batch, folder);
+        self.clear_op_backoff();
+        if run.rows_deleted {
+            self.emit(SyncEvent::MessagesUpdated {
+                folder_id: folder.to_string(),
+            });
+        }
+        let mut parts = Vec::new();
+        let mut status = None;
+        if let Some((_, s, error)) = run.failed.first() {
+            parts.push(format!(
+                "{} of {} messages could not be deleted: {error}",
+                run.failed.len(),
+                run.total
+            ));
+            status = Some(*s);
+        }
+        if run.kept > 0 {
+            parts.push(format!(
+                "{} of {} messages were kept: the store shows them elsewhere or removed",
+                run.kept, run.total
+            ));
+        }
+        if !parts.is_empty() {
+            self.report_folder_failure(folder, FolderWrite::Empty, status, parts.join("; "));
+        }
+        BulkStep::Finished
+    }
+
+    /// An `EmptyFolder` refused for good (#2110): the op and its allow-list
+    /// go and the folder's links are cleared (`Store::finish_folder_empty`),
+    /// so the next passes bring back the mail Graph still has, and the
+    /// failure is reported (`FolderWriteFailed`, `write: Empty`, then its
+    /// `Error`).
+    fn refuse_empty_folder(
+        &mut self,
+        seq: i64,
+        folder: &str,
+        batch: &str,
+        status: Option<u16>,
+        error: String,
+    ) {
+        let _ = self.store.finish_folder_empty(seq, batch, folder);
+        self.bulk = None;
+        self.report_folder_failure(folder, FolderWrite::Empty, status, error);
     }
 
     /// Brings messages a `local:` folder took with it back where Graph has
@@ -4973,9 +5322,12 @@ impl Engine {
             ),
             None => None,
         };
-        // As one a queued delete removed (#2107).
+        // As one a queued delete removed (#2107), or one being emptied
+        // (#2110): its hits would be the mail the command removed.
         if scope.as_deref().is_some_and(|f| {
-            f.starts_with("local:") || self.store.folder_being_deleted(f).unwrap_or(false)
+            f.starts_with("local:")
+                || self.store.folder_being_deleted(f).unwrap_or(false)
+                || self.store.folder_being_emptied(f).unwrap_or(false)
         }) {
             self.emit(SyncEvent::MessageSearchResults {
                 query,
@@ -29889,6 +30241,856 @@ mod tests {
                     matches!(
                         &failed,
                         SyncEvent::FolderWriteFailed { id, write: FolderWrite::MarkRead, .. }
+                            if id == "NOPE"
+                    ),
+                    "{failed:?}"
+                );
+                assert!(store.pending_ops().unwrap().is_empty());
+                assert_eq!(srv.requests().len(), before, "nothing sent");
+                stop(handle, dir);
+            }
+        }
+
+        /// `SyncCommand::EmptyFolder` (#2110).
+        mod empty_folder {
+            use super::*;
+            use crate::json::Value;
+
+            /// The first page of Inbox's messages up to the cutoff.
+            const LIST: &str = "/me/mailFolders/INBOX/messages?$filter=receivedDateTime%20le%20";
+            const PAGE2: &str = "/me/mailFolders/INBOX/messages?$skiptoken=P2";
+            const DELTA: &str = "/me/mailFolders/INBOX/messages/delta";
+
+            fn items_page(ids: &[String], next: Option<&str>) -> String {
+                let items: Vec<String> = ids
+                    .iter()
+                    .map(|id| format!(r#"{{"id":"{id}","internetMessageId":"<{id}@x>"}}"#))
+                    .collect();
+                let next = next.map_or(String::new(), |n| format!(r#","@odata.nextLink":"{n}""#));
+                format!(r#"{{"value":[{}]{next}}}"#, items.join(","))
+            }
+
+            fn strings(ids: &[&str]) -> Vec<String> {
+                ids.iter().map(|s| s.to_string()).collect()
+            }
+
+            /// A `$batch` answer: sub-request `i + 1` gets `statuses[i]`,
+            /// with its `Retry-After` when given; listed in reverse order.
+            fn batch_answer(statuses: &[(u16, Option<u64>)]) -> String {
+                let items: Vec<String> = statuses
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .map(|(i, (status, retry))| {
+                        let headers = retry
+                            .map_or("{}".to_string(), |r| format!(r#"{{"Retry-After":"{r}"}}"#));
+                        let body = if *status >= 400 {
+                            r#","body":{"error":{"code":"Denied","message":"Access is denied."}}"#
+                        } else {
+                            ""
+                        };
+                        format!(
+                            r#"{{"id":"{}","status":{status},"headers":{headers}{body}}}"#,
+                            i + 1
+                        )
+                    })
+                    .collect();
+                format!(r#"{{"responses":[{}]}}"#, items.join(","))
+            }
+
+            fn ok_batch(n: usize) -> String {
+                batch_answer(&vec![(204, None); n])
+            }
+
+            /// Each `$batch` request: when it came and the ids it deleted,
+            /// checking every sub-request's shape.
+            fn batches(srv: &FakeServer) -> Vec<(Instant, Vec<String>)> {
+                srv.requests()
+                    .into_iter()
+                    .filter(|r| r.method == "POST" && r.path == "/$batch")
+                    .map(|r| {
+                        let v = crate::json::parse(&r.body).unwrap();
+                        let ids = v
+                            .get("requests")
+                            .and_then(Value::as_array)
+                            .unwrap()
+                            .iter()
+                            .map(|q| {
+                                assert_eq!(q.get("method").and_then(Value::as_str), Some("DELETE"));
+                                assert!(q.get("body").is_none(), "{q:?}");
+                                let url = q.get("url").and_then(Value::as_str).unwrap();
+                                url.strip_prefix("/me/messages/").unwrap().to_string()
+                            })
+                            .collect();
+                        (r.at, ids)
+                    })
+                    .collect()
+            }
+
+            fn deleted(srv: &FakeServer) -> Vec<String> {
+                batches(srv).into_iter().flat_map(|(_, ids)| ids).collect()
+            }
+
+            fn listings(srv: &FakeServer) -> Vec<String> {
+                srv.requests()
+                    .into_iter()
+                    .map(|r| r.path)
+                    .filter(|p| p.starts_with("/me/mailFolders/INBOX/messages?"))
+                    .collect()
+            }
+
+            fn counts(store: &Store, id: &str) -> (i64, i64) {
+                let f = row(store, id).unwrap();
+                (f.total_count, f.unread_count)
+            }
+
+            fn failures(events: &[SyncEvent]) -> Vec<SyncEvent> {
+                events
+                    .iter()
+                    .filter(|e| {
+                        matches!(e, SyncEvent::FolderWriteFailed { .. } | SyncEvent::Error(_))
+                    })
+                    .cloned()
+                    .collect()
+            }
+
+            /// A barrier: a command the engine answers with no request, so
+            /// every command sent before it has been served.
+            fn barrier(handle: &SyncHandle) -> Vec<SyncEvent> {
+                send(
+                    handle,
+                    SyncCommand::SearchMessages {
+                        query: " ".into(),
+                        folder_id: None,
+                        top: 1,
+                    },
+                );
+                wait_for(&handle.evt_rx, |e| {
+                    matches!(e, SyncEvent::MessageSearchFailed { .. })
+                })
+            }
+
+            fn empty_inbox(handle: &SyncHandle) {
+                send(
+                    handle,
+                    SyncCommand::EmptyFolder {
+                        folder: "INBOX".into(),
+                        subfolders: false,
+                    },
+                );
+            }
+
+            /// Inbox's delta: the startup pass's first one lists `mail`,
+            /// every later one (a fresh one after the empty) nothing.
+            fn inbox_deltas(mail: &[&str]) -> Vec<(Route, Option<usize>)> {
+                let link = format!("{DELTA}?token=D-INBOX");
+                let items: Vec<String> = mail
+                    .iter()
+                    .map(|m| full_message_json(m, m, "2026-07-16T10:00:00Z"))
+                    .collect();
+                vec![
+                    once("GET", DELTA, 200, &delta_page(&items, &link)),
+                    write("GET", DELTA, 200, &delta_page(&[], &link)),
+                ]
+            }
+
+            /// Criterion 1: 45 messages on Graph, 2 stored: paged first
+            /// (with the cutoff, both ids selected), then 20 + 20 + 5
+            /// DELETEs, each id once; the store holds none of Inbox's mail,
+            /// counts (0, 0), the op gone; the next pass reads Inbox's
+            /// delta afresh, not on its old link.
+            #[test]
+            fn empty_folder_pages_and_deletes_every_server_id_once() {
+                let server: Vec<String> = strings(&["M1", "M2"])
+                    .into_iter()
+                    .chain((3..=45).map(|i| format!("S{i:02}")))
+                    .collect();
+                let mut last = vec![(204, None); 5];
+                last[4] = (404, None); // gone meanwhile: no failure
+                let mut writes = vec![
+                    once("GET", PAGE2, 200, &items_page(&server[20..], None)),
+                    once("GET", LIST, 200, &items_page(&server[..20], Some(PAGE2))),
+                    once("POST", "/$batch", 200, &ok_batch(20)),
+                    once("POST", "/$batch", 200, &ok_batch(20)),
+                    once("POST", "/$batch", 200, &batch_answer(&last)),
+                ];
+                writes.extend(inbox_deltas(&["M1", "M2"]));
+                let (srv, handle, store, dir) =
+                    engine("empty-pages", world(writes, TREE, &[("ARCH", "G1")]), None);
+                assert_eq!(mail_in(&store, "INBOX").len(), 2);
+                assert!(store.get_delta_link("INBOX").unwrap().is_some());
+                empty_inbox(&handle);
+                let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+                let n = seen.len();
+                assert_eq!(
+                    seen[n - 2..],
+                    [
+                        SyncEvent::MessagesUpdated {
+                            folder_id: "INBOX".into()
+                        },
+                        SyncEvent::FoldersUpdated
+                    ],
+                    "{seen:?}"
+                );
+                assert!(mail_in(&store, "INBOX").is_empty(), "the store at once");
+                assert_eq!(counts(&store, "INBOX"), (0, 0));
+                wait_drained(&store);
+
+                let lists = listings(&srv);
+                assert_eq!(lists.len(), 2, "{lists:?}");
+                assert!(
+                    lists[0].starts_with(LIST)
+                        && lists[0].ends_with("&$select=id,internetMessageId&$top=1000"),
+                    "{}",
+                    lists[0]
+                );
+                assert_eq!(lists[1], PAGE2);
+                let sent = batches(&srv);
+                assert_eq!(
+                    sent.iter().map(|(_, ids)| ids.len()).collect::<Vec<_>>(),
+                    vec![20, 20, 5]
+                );
+                assert_eq!(deleted(&srv), server);
+                assert_eq!(
+                    mail_in(&store, "ARCH"),
+                    ["G1"],
+                    "another folder is untouched"
+                );
+                assert_eq!(store.get_delta_link("INBOX").unwrap(), None);
+
+                // The next pass reads Inbox afresh.
+                let before = srv.requests().len();
+                send(&handle, SyncCommand::Refresh);
+                let mut seen =
+                    wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+                let paths = paths_from(&srv, before);
+                assert!(
+                    paths
+                        .iter()
+                        .any(|p| p.starts_with(DELTA) && !p.contains("token=D-INBOX")),
+                    "{paths:?}"
+                );
+                assert!(mail_in(&store, "INBOX").is_empty());
+                assert_eq!(counts(&store, "INBOX"), (0, 0));
+                seen.extend(barrier(&handle));
+                assert!(failures(&seen).is_empty(), "{seen:?}");
+                stop(handle, dir);
+            }
+
+            /// Criterion 2: a 429 inside a batch: only that id again, after
+            /// its `Retry-After`, none skipped, no second listing.
+            #[test]
+            fn a_429_inside_a_batch_is_retried_after_retry_after() {
+                let server = strings(&["A", "B", "C"]);
+                let (srv, handle, store, dir) = engine(
+                    "empty-429",
+                    world(
+                        vec![
+                            once("GET", LIST, 200, &items_page(&server, None)),
+                            once(
+                                "POST",
+                                "/$batch",
+                                200,
+                                &batch_answer(&[(204, None), (429, Some(1)), (204, None)]),
+                            ),
+                            once("POST", "/$batch", 200, &ok_batch(1)),
+                        ],
+                        TREE,
+                        &[],
+                    ),
+                    None,
+                );
+                empty_inbox(&handle);
+                wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+                wait_drained(&store);
+                let sent = batches(&srv);
+                assert_eq!(
+                    sent.iter().map(|(_, ids)| ids.clone()).collect::<Vec<_>>(),
+                    vec![server.clone(), strings(&["B"])],
+                    "only the throttled id again, none skipped"
+                );
+                let gap = sent[1].0.duration_since(sent[0].0);
+                assert!(gap >= Duration::from_secs(1), "{gap:?}");
+                assert_eq!(listings(&srv).len(), 1, "the run kept its ids");
+                let seen = barrier(&handle);
+                assert!(failures(&seen).is_empty(), "{seen:?}");
+                stop(handle, dir);
+            }
+
+            /// Criterion 6: while the op is queued (its listing answers 500)
+            /// a pass, `SyncFolder` and a scoped search read nothing for
+            /// Inbox, and the listing's counts do not undo the store's; the
+            /// folder has no link, so no backfill can pick it.
+            #[test]
+            fn a_sync_pass_reads_nothing_for_a_folder_being_emptied() {
+                // Graph lists Inbox with 30 and 30.
+                let listed: Vec<String> = TREE
+                    .iter()
+                    .map(|(id, parent, wk)| {
+                        let j = listed_json(id, *parent, *wk);
+                        if *id == "INBOX" {
+                            j.replace(
+                                r#""totalItemCount":0,"unreadItemCount":0"#,
+                                r#""totalItemCount":30,"unreadItemCount":30"#,
+                            )
+                        } else {
+                            j
+                        }
+                    })
+                    .collect();
+                let mut writes = vec![
+                    write("GET", LIST, 500, "busy"),
+                    write(
+                        "GET",
+                        "/me/mailFolders?",
+                        200,
+                        &format!(r#"{{"value":[{}]}}"#, listed.join(",")),
+                    ),
+                    write(
+                        "GET",
+                        "/me/mailFolders/INBOX?",
+                        200,
+                        r#"{"totalItemCount":30,"unreadItemCount":30}"#,
+                    ),
+                ];
+                writes.extend(inbox_deltas(&["M1"]));
+                let (srv, handle, store, dir) =
+                    engine("empty-queued", world(writes, TREE, &[]), None);
+                assert_eq!(mail_in(&store, "INBOX"), ["M1"]);
+                assert_eq!(counts(&store, "INBOX"), (30, 30));
+                empty_inbox(&handle);
+                assert!(wait_until(ENGINE_WAIT, || !listings(&srv).is_empty()));
+                assert_eq!(store.pending_ops().unwrap().len(), 1);
+                let h = store.folder_history("INBOX").unwrap().unwrap();
+                assert!(!h.has_delta_link, "no backfill without a link: {h:?}");
+
+                let before = srv.requests().len();
+                send(&handle, SyncCommand::Refresh);
+                wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+                send(&handle, SyncCommand::SyncFolder { id: "INBOX".into() });
+                send(
+                    &handle,
+                    SyncCommand::SearchMessages {
+                        query: "M1".into(),
+                        folder_id: Some("INBOX".into()),
+                        top: 5,
+                    },
+                );
+                let seen = wait_for(&handle.evt_rx, |e| {
+                    matches!(e, SyncEvent::MessageSearchResults { .. })
+                });
+                assert!(
+                    seen.iter().any(|e| matches!(
+                        e,
+                        SyncEvent::MessageSearchResults { hits, .. } if hits.is_empty()
+                    )),
+                    "{seen:?}"
+                );
+                barrier(&handle);
+                let paths = paths_from(&srv, before);
+                assert!(paths.iter().any(|p| is_folder_list(p)), "a listing ran");
+                // The op's own listing may be retried; nothing else.
+                let inbox: Vec<&String> = paths
+                    .iter()
+                    .filter(|p| p.starts_with("/me/mailFolders/INBOX") && !p.starts_with(LIST))
+                    .collect();
+                assert!(inbox.is_empty(), "nothing read for Inbox: {inbox:?}");
+                assert!(
+                    !paths.iter().any(|p| p.contains("search")),
+                    "no search request: {paths:?}"
+                );
+                assert!(mail_in(&store, "INBOX").is_empty(), "nothing came back");
+                assert_eq!(counts(&store, "INBOX"), (0, 0));
+                assert_eq!(store.pending_ops().unwrap().len(), 1, "still queued");
+                stop(handle, dir);
+            }
+
+            /// Criterion 5: a message Graph still has in Inbox that the
+            /// store shows in Archive (a move out given up, not reconverged
+            /// yet) is kept, and reported; the rest goes.
+            #[test]
+            fn empty_folder_keeps_mail_the_store_shows_elsewhere() {
+                let server = strings(&["M1", "M2"]);
+                let mut writes = vec![
+                    once("GET", LIST, 200, &items_page(&server, None)),
+                    once("POST", "/$batch", 200, &ok_batch(1)),
+                ];
+                writes.extend(inbox_deltas(&["M1", "M2"]));
+                let (srv, handle, store, dir) =
+                    engine("empty-elsewhere", world(writes, TREE, &[]), None);
+                store.move_message("M1", "ARCH").unwrap();
+                empty_inbox(&handle);
+                let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+                wait_drained(&store);
+                assert_eq!(deleted(&srv), ["M2"]);
+                assert_eq!(mail_in(&store, "ARCH"), ["M1"]);
+                let failed = failures(&seen);
+                assert_eq!(
+                    failed[0],
+                    SyncEvent::FolderWriteFailed {
+                        id: "INBOX".into(),
+                        write: FolderWrite::Empty,
+                        status: None,
+                        error: "1 of 2 messages were kept: the store shows them elsewhere \
+                                or removed"
+                            .into(),
+                    },
+                    "{seen:?}"
+                );
+                assert!(
+                    matches!(&failed[1], SyncEvent::Error(e) if e.starts_with("empty folder INBOX: 1 of 2")),
+                    "{seen:?}"
+                );
+                stop(handle, dir);
+            }
+
+            /// Criteria 5 and 13: a move of Archive's G1 into Inbox, queued
+            /// before the command, answers 400 twice (the drain passes it:
+            /// the command's own drain runs it again) and then lands as
+            /// G1-NEW; the empty waits for it (no listing before the move
+            /// landed), then deletes G1-NEW, as the batch allows G1 through
+            /// its moved id.
+            #[test]
+            fn empty_folder_waits_for_an_older_move_into_it_and_deletes_it_under_its_new_id() {
+                let mut writes = vec![
+                    once("POST", "/me/messages/G1/move", 400, BAD),
+                    once("POST", "/me/messages/G1/move", 400, BAD),
+                    write("POST", "/me/messages/G1/move", 201, r#"{"id":"G1-NEW"}"#),
+                    once("GET", LIST, 200, &items_page(&strings(&["G1-NEW"]), None)),
+                    once("POST", "/$batch", 200, &ok_batch(1)),
+                ];
+                writes.extend(inbox_deltas(&[]));
+                let (srv, handle, store, dir) = engine(
+                    "empty-move-in",
+                    world(writes, TREE, &[("ARCH", "G1")]),
+                    None,
+                );
+                send(
+                    &handle,
+                    SyncCommand::Move {
+                        id: "G1".into(),
+                        dest: "INBOX".into(),
+                    },
+                );
+                empty_inbox(&handle);
+                barrier(&handle);
+                assert_eq!(hits(&srv, "POST", "/me/messages/G1/move"), 2);
+                wait_queued(&store, 2);
+                assert!(listings(&srv).is_empty(), "the empty waits for the move");
+                // The next drain retries the move first.
+                send(&handle, SyncCommand::Refresh);
+                wait_drained(&store);
+                let reqs: Vec<(String, String)> = srv
+                    .requests()
+                    .into_iter()
+                    .map(|r| (r.method, r.path))
+                    .collect();
+                let moves: Vec<usize> = reqs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (m, p))| m == "POST" && p == "/me/messages/G1/move")
+                    .map(|(i, _)| i)
+                    .collect();
+                let listed = reqs.iter().position(|(_, p)| p.starts_with(LIST)).unwrap();
+                assert_eq!(moves.len(), 3, "{reqs:?}");
+                assert!(moves[2] < listed, "listed after the move landed: {reqs:?}");
+                assert_eq!(deleted(&srv), ["G1-NEW"]);
+                assert!(!store.message_exists("G1").unwrap());
+                assert!(!store.message_exists("G1-NEW").unwrap());
+                stop(handle, dir);
+            }
+
+            /// Criterion 4: a `local:` draft and a draft holding an unsent
+            /// edit stay in the store and on Graph, and are not reported;
+            /// the counts are theirs.
+            #[test]
+            fn empty_folder_keeps_unsent_drafts_and_reports_nothing() {
+                let server = strings(&["M1", "M2"]);
+                let mut writes = vec![
+                    once("GET", LIST, 200, &items_page(&server, None)),
+                    once("POST", "/$batch", 200, &ok_batch(1)),
+                ];
+                writes.extend(inbox_deltas(&["M1", "M2"]));
+                let (srv, handle, store, dir) =
+                    engine("empty-unsent", world(writes, TREE, &[]), None);
+                store
+                    .update_draft_fields("M1", "edited", "", "", "", "<p>x</p>")
+                    .unwrap();
+                let local = store.create_local_draft("new", "", "", "<p>y</p>").unwrap();
+                store.move_message(&local, "INBOX").unwrap();
+                empty_inbox(&handle);
+                wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+                let mut kept = mail_in(&store, "INBOX");
+                kept.sort();
+                let mut want = vec!["M1".to_string(), local.clone()];
+                want.sort();
+                assert_eq!(kept, want);
+                assert_eq!(counts(&store, "INBOX").0, 2);
+                wait_drained(&store);
+                assert_eq!(deleted(&srv), ["M2"], "M1 stays on Graph");
+                let seen = barrier(&handle);
+                assert!(failures(&seen).is_empty(), "{seen:?}");
+                let mut kept = mail_in(&store, "INBOX");
+                kept.sort();
+                assert_eq!(kept, want);
+                stop(handle, dir);
+            }
+
+            /// Criterion 8: a refused listing drops the op and clears the
+            /// links, so the next pass brings the mail back; an id Graph
+            /// refuses inside a batch is reported once at the end.
+            #[test]
+            fn empty_folder_refusals_report_and_restart_the_folder_delta() {
+                let mut writes = vec![once("GET", LIST, 403, BAD)];
+                let link = format!("{DELTA}?token=D-INBOX");
+                let m1 = full_message_json("M1", "M1", "2026-07-16T10:00:00Z");
+                writes.push(write("GET", &link, 200, &delta_page(&[], &link)));
+                writes.push(write("GET", DELTA, 200, &delta_page(&[m1], &link)));
+                let (srv, handle, store, dir) =
+                    engine("empty-refused", world(writes, TREE, &[]), None);
+                assert_eq!(mail_in(&store, "INBOX"), ["M1"]);
+                empty_inbox(&handle);
+                let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+                let Some(SyncEvent::FolderWriteFailed {
+                    id, write, status, ..
+                }) = failures(&seen).into_iter().next()
+                else {
+                    panic!("{seen:?}")
+                };
+                assert_eq!(
+                    (id.as_str(), write, status),
+                    ("INBOX", FolderWrite::Empty, Some(403))
+                );
+                assert!(store.pending_ops().unwrap().is_empty());
+                assert_eq!(store.get_delta_link("INBOX").unwrap(), None);
+                assert!(batches(&srv).is_empty());
+                send(&handle, SyncCommand::Refresh);
+                wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+                assert_eq!(mail_in(&store, "INBOX"), ["M1"], "back from a fresh delta");
+                stop(handle, dir);
+
+                // One id refused inside a batch.
+                let mut writes = vec![
+                    once("GET", LIST, 200, &items_page(&strings(&["A", "B"]), None)),
+                    once(
+                        "POST",
+                        "/$batch",
+                        200,
+                        &batch_answer(&[(204, None), (403, None)]),
+                    ),
+                ];
+                writes.extend(inbox_deltas(&[]));
+                let (srv, handle, store, dir) =
+                    engine("empty-refused-id", world(writes, TREE, &[]), None);
+                empty_inbox(&handle);
+                let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+                wait_drained(&store);
+                let failed = failures(&seen);
+                let SyncEvent::FolderWriteFailed {
+                    write,
+                    status,
+                    error,
+                    ..
+                } = &failed[0]
+                else {
+                    panic!("{seen:?}")
+                };
+                assert_eq!((*write, *status), (FolderWrite::Empty, Some(403)));
+                assert!(
+                    error.starts_with("1 of 2 messages could not be deleted: "),
+                    "{error}"
+                );
+                assert_eq!(batches(&srv).len(), 1, "a refusal is not retried");
+                stop(handle, dir);
+            }
+
+            /// Criterion 9: an op queued before the engine starts is run (and
+            /// the startup pass reads nothing for Inbox meanwhile); Graph's
+            /// mail the store never held is deleted.
+            #[test]
+            fn empty_folder_survives_a_restart() {
+                let srv = FakeServer::start_limited(world(
+                    vec![
+                        once(
+                            "GET",
+                            LIST,
+                            200,
+                            &items_page(&strings(&["M1", "NEW"]), None),
+                        ),
+                        once("POST", "/$batch", 200, &ok_batch(2)),
+                    ],
+                    TREE,
+                    &[],
+                ));
+                let (handle, store_path, dir) =
+                    spawn_fast(&srv, "empty-restart", HOUR, None, |s| {
+                        s.upsert_folder(&crate::graph::model::MailFolder {
+                            id: "INBOX".into(),
+                            display_name: "INBOX".into(),
+                            parent_id: Some("ROOT".into()),
+                            total_count: 1,
+                            unread_count: 1,
+                            well_known_name: Some("inbox".into()),
+                        })
+                        .unwrap();
+                        // Queued by an engine that stopped before it drained.
+                        s.empty_folder("INBOX", "2026-11-10T18:00:00Z").unwrap();
+                    });
+                let store = Store::open(&store_path).unwrap();
+                wait_drained(&store);
+                assert_eq!(
+                    listings(&srv),
+                    vec![format!(
+                        "{LIST}2026-11-10T18:00:00Z&$select=id,internetMessageId&$top=1000"
+                    )]
+                );
+                assert_eq!(deleted(&srv), ["M1", "NEW"]);
+                stop(handle, dir);
+            }
+
+            /// r1-M1: an emptied message another path (a fetch, a list row
+            /// by id) stored in the folder again before the run is deleted
+            /// with the rest, its row too, and nothing is reported.
+            #[test]
+            fn an_emptied_message_stored_again_in_the_folder_is_deleted() {
+                let mut writes = vec![
+                    once("GET", LIST, 500, "busy"),
+                    once("GET", LIST, 200, &items_page(&strings(&["M1", "M2"]), None)),
+                    once("POST", "/$batch", 200, &ok_batch(2)),
+                ];
+                writes.extend(inbox_deltas(&["M1", "M2"]));
+                let (srv, handle, store, dir) =
+                    engine("empty-stored-again", world(writes, TREE, &[]), None);
+                empty_inbox(&handle);
+                assert!(wait_until(ENGINE_WAIT, || !listings(&srv).is_empty()));
+                assert_eq!(store.pending_ops().unwrap().len(), 1, "deferred by the 500");
+                assert!(mail_in(&store, "INBOX").is_empty());
+                // Stored again, as a fetch of a stale search hit would.
+                let v = crate::json::parse(&full_message_json("M1", "M1", "2026-07-16T10:00:00Z"))
+                    .unwrap();
+                let m = crate::graph::model::Message::from_json(&v).unwrap();
+                store.upsert_message("INBOX", &m).unwrap();
+                assert_eq!(mail_in(&store, "INBOX"), ["M1"]);
+                // The outbox back-off passes; the run lists and deletes.
+                wait_drained(&store);
+                assert_eq!(deleted(&srv), ["M1", "M2"]);
+                assert!(!store.message_exists("M1").unwrap(), "its row went too");
+                let seen = barrier(&handle);
+                assert!(failures(&seen).is_empty(), "{seen:?}");
+                stop(handle, dir);
+            }
+
+            /// r2-m3: an older op refused once more on each drain keeps the
+            /// empty waiting while a later `Move` of Archive's G1 into Inbox
+            /// lands as G1-NEW. The run then lists G1-NEW: the batch never
+            /// had it, so it is left alone (no DELETE, its row stays, no
+            /// report).
+            #[test]
+            fn mail_moved_into_the_folder_while_the_empty_waits_is_left_alone() {
+                let mut writes = vec![
+                    once("PATCH", "/me/messages/X", 400, BAD),
+                    once("PATCH", "/me/messages/X", 400, BAD),
+                    once("PATCH", "/me/messages/X", 400, BAD),
+                    write("PATCH", "/me/messages/X", 200, "{}"),
+                    write("POST", "/me/messages/G1/move", 201, r#"{"id":"G1-NEW"}"#),
+                    once("GET", LIST, 200, &items_page(&strings(&["G1-NEW"]), None)),
+                ];
+                writes.extend(inbox_deltas(&[]));
+                let (srv, handle, store, dir) = engine(
+                    "empty-moved-in-since",
+                    world(writes, TREE, &[("ARCH", "X"), ("ARCH", "G1")]),
+                    None,
+                );
+                // The older op: refused on the next three drains.
+                send(
+                    &handle,
+                    SyncCommand::MarkRead {
+                        id: "X".into(),
+                        read: true,
+                    },
+                );
+                empty_inbox(&handle);
+                send(
+                    &handle,
+                    SyncCommand::Move {
+                        id: "G1".into(),
+                        dest: "INBOX".into(),
+                    },
+                );
+                wait_requests(&srv, "POST", "/me/messages/G1/move", 1);
+                barrier(&handle);
+                assert!(listings(&srv).is_empty(), "the empty still waits");
+                assert_eq!(mail_in(&store, "INBOX"), ["G1-NEW"]);
+                // The next drain sends the older op, then runs the empty.
+                send(&handle, SyncCommand::Refresh);
+                wait_drained(&store);
+                assert_eq!(listings(&srv).len(), 1);
+                assert!(batches(&srv).is_empty(), "no DELETE");
+                assert_eq!(mail_in(&store, "INBOX"), ["G1-NEW"]);
+                let seen = barrier(&handle);
+                assert!(failures(&seen).is_empty(), "{seen:?}");
+                stop(handle, dir);
+            }
+
+            /// Criterion 10: with `subfolders`, Inbox's child PROJ (and SUB
+            /// under it) is deleted after the empty, by its own op; r1-m1:
+            /// the children leave the store, and their op is queued, before
+            /// the run's first request (its listing answers after 2 s).
+            #[test]
+            fn empty_folder_with_subfolders_deletes_the_children() {
+                let proj_messages = "/me/mailFolders/PROJ/messages?$select=";
+                let mut writes = vec![
+                    once("GET", LIST, 200, &items_page(&[], None)),
+                    write("GET", proj_messages, 200, r#"{"value":[]}"#),
+                    write(
+                        "GET",
+                        "/me/mailFolders/PROJ/childFolders",
+                        200,
+                        r#"{"value":[{"id":"SUB","displayName":"SUB","parentFolderId":"PROJ","childFolderCount":0}]}"#,
+                    ),
+                    write(
+                        "GET",
+                        "/me/mailFolders/SUB/messages?$select=",
+                        200,
+                        r#"{"value":[]}"#,
+                    ),
+                    write("DELETE", "/me/mailFolders/PROJ", 204, ""),
+                ];
+                writes.extend(inbox_deltas(&["M1"]));
+                let paced = world(writes, TREE, &[])
+                    .into_iter()
+                    .map(|(r, n)| {
+                        let delay = if r.path_prefix == LIST {
+                            Duration::from_secs(2)
+                        } else {
+                            Duration::ZERO
+                        };
+                        (r, n, delay)
+                    })
+                    .collect();
+                let srv = FakeServer::start_paced(paced);
+                let (handle, store_path, dir) =
+                    spawn_fast(&srv, "empty-subfolders", HOUR, None, |_| {});
+                wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+                let store = Store::open(&store_path).unwrap();
+                assert!(row(&store, "PROJ").is_some());
+                send(
+                    &handle,
+                    SyncCommand::EmptyFolder {
+                        folder: "INBOX".into(),
+                        subfolders: true,
+                    },
+                );
+                // While the run's listing is still unanswered.
+                assert!(wait_until(ENGINE_WAIT, || !listings(&srv).is_empty()));
+                assert!(row(&store, "PROJ").is_none() && row(&store, "SUB").is_none());
+                let queued: Vec<OutboxOp> = store
+                    .pending_ops()
+                    .unwrap()
+                    .into_iter()
+                    .map(|r| r.op)
+                    .collect();
+                assert!(
+                    matches!(
+                        &queued[..],
+                        [OutboxOp::EmptyFolder { .. }, OutboxOp::DeleteFolder { id, .. }]
+                            if id == "PROJ"
+                    ),
+                    "{queued:?}"
+                );
+                wait_requests(&srv, "DELETE", "/me/mailFolders/PROJ", 1);
+                wait_drained(&store);
+                assert!(row(&store, "PROJ").is_none() && row(&store, "SUB").is_none());
+                assert!(row(&store, "INBOX").is_some());
+                assert!(mail_in(&store, "INBOX").is_empty());
+                let reqs: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
+                let listed = reqs.iter().position(|p| p.starts_with(LIST)).unwrap();
+                let walked = reqs
+                    .iter()
+                    .position(|p| p.starts_with(proj_messages))
+                    .unwrap();
+                assert!(listed < walked, "the delete waits for the empty: {reqs:?}");
+                let seen = barrier(&handle);
+                assert!(failures(&seen).is_empty(), "{seen:?}");
+                stop(handle, dir);
+            }
+
+            /// Criterion 11: PROJ's empty, its run held by a 500, then a
+            /// delete of PROJ: the queued empty and its run go, and the
+            /// delete's walk allows P1, which the empty removed.
+            #[test]
+            fn a_delete_of_the_folder_drops_its_queued_empty() {
+                let proj_list = "/me/mailFolders/PROJ/messages?$filter=receivedDateTime%20le%20";
+                let mut writes = vec![
+                    write("GET", proj_list, 200, &items_page(&strings(&["P1"]), None)),
+                    write("POST", "/$batch", 500, "busy"),
+                    write(
+                        "GET",
+                        "/me/mailFolders/PROJ/messages?$select=",
+                        200,
+                        r#"{"value":[{"id":"P1","internetMessageId":""}]}"#,
+                    ),
+                    write(
+                        "GET",
+                        "/me/mailFolders/PROJ/childFolders",
+                        200,
+                        r#"{"value":[{"id":"SUB","displayName":"SUB","parentFolderId":"PROJ","childFolderCount":0}]}"#,
+                    ),
+                    write(
+                        "GET",
+                        "/me/mailFolders/SUB/messages?$select=",
+                        200,
+                        r#"{"value":[]}"#,
+                    ),
+                    write("DELETE", "/me/mailFolders/PROJ", 204, ""),
+                ];
+                writes.extend(inbox_deltas(&[]));
+                let (srv, handle, store, dir) = engine(
+                    "empty-then-delete",
+                    world(writes, TREE, &[("PROJ", "P1")]),
+                    None,
+                );
+                send(
+                    &handle,
+                    SyncCommand::EmptyFolder {
+                        folder: "PROJ".into(),
+                        subfolders: false,
+                    },
+                );
+                wait_requests(&srv, "POST", "/$batch", 1);
+                assert_eq!(store.pending_ops().unwrap().len(), 1, "held by the 500");
+                send(&handle, SyncCommand::DeleteFolder { id: "PROJ".into() });
+                assert!(wait_until(ENGINE_WAIT, || store
+                    .pending_ops()
+                    .unwrap()
+                    .iter()
+                    .all(|r| !matches!(r.op, OutboxOp::EmptyFolder { .. }))));
+                // The outbox back-off of the 500 passes, then the delete runs.
+                wait_requests(&srv, "DELETE", "/me/mailFolders/PROJ", 1);
+                wait_drained(&store);
+                assert_eq!(batches(&srv).len(), 1, "the dropped run sent no more");
+                let seen = barrier(&handle);
+                assert!(failures(&seen).is_empty(), "{seen:?}");
+                stop(handle, dir);
+            }
+
+            #[test]
+            fn empty_folder_of_an_unknown_folder_reports_and_queues_nothing() {
+                let (srv, handle, store, dir) =
+                    engine("empty-unknown", world(vec![], TREE, &[]), None);
+                let before = srv.requests().len();
+                send(
+                    &handle,
+                    SyncCommand::EmptyFolder {
+                        folder: "NOPE".into(),
+                        subfolders: true,
+                    },
+                );
+                let failed = wait_store_refused(&handle);
+                assert!(
+                    matches!(
+                        &failed,
+                        SyncEvent::FolderWriteFailed { id, write: FolderWrite::Empty, .. }
                             if id == "NOPE"
                     ),
                     "{failed:?}"

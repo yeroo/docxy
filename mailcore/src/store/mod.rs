@@ -471,6 +471,18 @@ pub enum OutboxOp {
         id: String,
         batch: String,
     },
+    /// Delete every message Graph holds in `folder` received at or before
+    /// `before` (ISO-8601 UTC, fixed at the command) through `$batch`
+    /// (#2110, `Store::empty_folder`), each checked first against the
+    /// command's allow-list `batch` (`folder_delete_allow`, as #2107's
+    /// walk): a message the store shows elsewhere is kept. Run by the
+    /// engine, not `apply_op`; sent only once no older op is queued. A
+    /// `local:` id never re-keyed sends nothing.
+    EmptyFolder {
+        folder: String,
+        before: String,
+        batch: String,
+    },
 }
 
 impl OutboxOp {
@@ -505,7 +517,8 @@ impl OutboxOp {
             | OutboxOp::RenameFolder { .. }
             | OutboxOp::MoveFolder { .. }
             | OutboxOp::MarkFolderRead { .. }
-            | OutboxOp::DeleteFolder { .. } => None,
+            | OutboxOp::DeleteFolder { .. }
+            | OutboxOp::EmptyFolder { .. } => None,
         }
     }
 
@@ -540,6 +553,7 @@ impl OutboxOp {
             OutboxOp::MoveFolder { .. } => "moveFolder",
             OutboxOp::MarkFolderRead { .. } => "markFolderRead",
             OutboxOp::DeleteFolder { .. } => "deleteFolder",
+            OutboxOp::EmptyFolder { .. } => "emptyFolder",
         }
     }
 
@@ -689,6 +703,16 @@ impl OutboxOp {
             OutboxOp::DeleteFolder { id, batch } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("id".to_string(), Value::Str(id.clone())),
+                ("batch".to_string(), Value::Str(batch.clone())),
+            ]),
+            OutboxOp::EmptyFolder {
+                folder,
+                before,
+                batch,
+            } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("folder".to_string(), Value::Str(folder.clone())),
+                ("before".to_string(), Value::Str(before.clone())),
                 ("batch".to_string(), Value::Str(batch.clone())),
             ]),
             OutboxOp::CancelEvent { id, comment } => Value::Object(vec![
@@ -880,6 +904,11 @@ impl OutboxOp {
             }),
             "deleteFolder" => Some(OutboxOp::DeleteFolder {
                 id: id()?,
+                batch: v.get("batch")?.as_str()?.to_string(),
+            }),
+            "emptyFolder" => Some(OutboxOp::EmptyFolder {
+                folder: v.get("folder")?.as_str()?.to_string(),
+                before: v.get("before")?.as_str()?.to_string(),
                 batch: v.get("batch")?.as_str()?.to_string(),
             }),
             _ => None,
@@ -1404,6 +1433,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(schema::SCHEMA_SQL)?;
+        conn.execute_batch(schema::FTS_DELETE_TRIGGERS_SQL)?;
         // `SCHEMA_SQL`'s `CREATE TABLE IF NOT EXISTS messages` already
         // includes `is_draft` for freshly-created databases; this
         // `ALTER TABLE` brings an *existing* database (created before this
@@ -5352,6 +5382,20 @@ pub(crate) struct QueuedFolderWrites {
     /// Each folder a queued `DeleteFolder`'s batch removed (#2107): a
     /// listing does not bring it, or what Graph has under it, back.
     pub deleted: HashSet<String>,
+    /// Each folder a queued `EmptyFolder` names (#2110): nothing is read
+    /// from Graph for it, and a listing or a count read keeps its stored
+    /// counts.
+    pub emptied: HashSet<String>,
+}
+
+/// What an `EmptyFolder` run does with the ids its check refused
+/// (`Store::empty_refused`, #2110 r1).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct EmptyRefused {
+    /// Allowed by the batch and stored in the folder again: deleted.
+    pub delete: Vec<String>,
+    /// Shown elsewhere or removed: kept, and reported.
+    pub kept: usize,
 }
 
 /// What `Store::delete_folder` removed besides the folder (#2107).
@@ -5723,16 +5767,7 @@ impl Store {
         if let Some(r) = check_folder_on(&tx, &id)? {
             return Ok(FolderWriteResult::Refused(r));
         }
-        let newest: Option<String> = tx.query_row(
-            "SELECT MAX(received_at) FROM messages WHERE folder_id = ?1 AND received_at <> ''",
-            params![id],
-            |r| r.get(0),
-        )?;
-        let newest = newest.map(|n| ceil_to_whole_second(&n));
-        let before = match newest {
-            Some(n) if n.as_str() > now_utc => n,
-            _ => now_utc.to_string(),
-        };
+        let before = folder_cutoff_on(&tx, &id, now_utc)?;
         tx.execute(
             "UPDATE messages SET is_read = 1 WHERE folder_id = ?1 AND is_read = 0",
             params![id],
@@ -5750,6 +5785,173 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(FolderWriteResult::Written(id))
+    }
+
+    /// Removes every stored message of `folder` that Graph has, and queues
+    /// its `EmptyFolder` (#2110), in one IMMEDIATE transaction: all or
+    /// nothing. Unsent mail (`unsent_mail_in_on`: a `local:` id, an unpushed
+    /// edit, a queued `SaveDraft`/`SendDraft`) stays, and the folder's
+    /// counts become those of what stayed. Before the rows go, the batch's
+    /// allow-list (`folder_delete_allow`, kind `message`) records every
+    /// message removed: what the user saw and chose to delete. Their
+    /// tombstones are cleared again, as `delete_folder` clears its own. The
+    /// folder's delta and backfill links are cleared: no stored link
+    /// resumes over the removed mail, and no backfill runs for the folder
+    /// until a pass after the op starts it again. The op's `before` is the
+    /// cutoff `mark_folder_read` takes. Every command queues its own op.
+    ///
+    /// `messages_fts_ad` and `bodies_fts_ad` scan the whole FTS table per
+    /// row, so they are dropped for the transaction: the folder's FTS rows
+    /// go in one statement, and `schema::FTS_DELETE_TRIGGERS_SQL` creates
+    /// both again before the commit (DDL is transactional: a failure rolls
+    /// the drop back too).
+    ///
+    /// Refused: an unknown folder and the drafts sentinel.
+    pub(crate) fn empty_folder(
+        &self,
+        folder: &str,
+        now_utc: &str,
+    ) -> Result<FolderWriteResult, StoreError> {
+        let tx = self.write_tx()?;
+        let id = current_folder_id_on(&tx, folder)?;
+        if let Some(r) = check_folder_on(&tx, &id)? {
+            return Ok(FolderWriteResult::Refused(r));
+        }
+        let kept = ids_json(&unsent_mail_in_on(&tx, std::slice::from_ref(&id))?);
+        let before = folder_cutoff_on(&tx, &id, now_utc)?;
+        let batch = local_draft_id().replacen("local:", "empty:", 1);
+        tx.execute(
+            "INSERT OR IGNORE INTO folder_delete_allow (batch, kind, id, imid)
+             SELECT ?1, 'message', id, internet_message_id FROM messages
+             WHERE folder_id = ?2 AND id NOT IN (SELECT value FROM json_each(?3))",
+            params![batch, id, kept],
+        )?;
+        tx.execute_batch(
+            "DROP TRIGGER IF EXISTS messages_fts_ad;
+             DROP TRIGGER IF EXISTS bodies_fts_ad;",
+        )?;
+        tx.execute(
+            "DELETE FROM messages_fts WHERE message_id IN
+                 (SELECT id FROM messages
+                  WHERE folder_id = ?1 AND id NOT IN (SELECT value FROM json_each(?2)))",
+            params![id, kept],
+        )?;
+        tx.execute(
+            "DELETE FROM messages
+             WHERE folder_id = ?1 AND id NOT IN (SELECT value FROM json_each(?2))",
+            params![id, kept],
+        )?;
+        tx.execute_batch(schema::FTS_DELETE_TRIGGERS_SQL)?;
+        // What the user saw and emptied is allowed by the batch, not held.
+        tx.execute(
+            "DELETE FROM forgotten_ids WHERE (kind, id) IN
+                 (SELECT kind, id FROM folder_delete_allow WHERE batch = ?1)",
+            params![batch],
+        )?;
+        prune_forgotten_on(&tx, FORGOTTEN_CAP)?;
+        tx.execute(
+            "UPDATE folders SET
+                 total_count = (SELECT COUNT(*) FROM messages WHERE folder_id = ?1),
+                 unread_count = (SELECT COUNT(*) FROM messages
+                                 WHERE folder_id = ?1 AND is_read = 0)
+             WHERE id = ?1",
+            params![id],
+        )?;
+        clear_folder_links_on(&tx, &id)?;
+        enqueue_op_on(
+            &tx,
+            &OutboxOp::EmptyFolder {
+                folder: id.clone(),
+                before,
+                batch,
+            },
+        )?;
+        tx.commit()?;
+        Ok(FolderWriteResult::Written(id))
+    }
+
+    /// An `EmptyFolder` is done, refused or sent nothing (#2110): its op
+    /// and its batch's allow-list go, and `folder`'s delta and backfill
+    /// links are cleared, in one transaction, so the next passes read the
+    /// folder afresh (mail that came after the listing, and what the run
+    /// kept or could not delete) and no crash leaves the op gone with an
+    /// old link in place.
+    pub(crate) fn finish_folder_empty(
+        &self,
+        seq: i64,
+        batch: &str,
+        folder: &str,
+    ) -> Result<(), StoreError> {
+        let tx = self.write_tx()?;
+        tx.execute("DELETE FROM outbox WHERE seq = ?1", params![seq])?;
+        tx.execute(
+            "DELETE FROM folder_delete_allow WHERE batch = ?1",
+            params![batch],
+        )?;
+        clear_folder_links_on(&tx, folder)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Sorts the ids of an `EmptyFolder` run's listing that
+    /// `delete_allow_check` refused (#2110 r1). An id stored in another
+    /// folder (or not stored: a tombstone, an internet message id held
+    /// elsewhere) is kept, as the store shows it elsewhere or removed it:
+    /// [`EmptyRefused::kept`]. An id stored in `folder` itself is
+    /// - kept, unreported, when it is unsent (`unsent_mail_in_on`): the
+    ///   command's own choice;
+    /// - deleted when the batch allows it ([`EmptyRefused::delete`]): mail
+    ///   the user emptied that another path (a fetch of a stale search hit,
+    ///   a list row read by id) stored there again before the run;
+    /// - else kept, unreported: mail that came into the folder after the
+    ///   command (moved in by a later op), which is not the command's.
+    pub(crate) fn empty_refused(
+        &self,
+        batch: &str,
+        folder: &str,
+        refused: &[String],
+    ) -> Result<EmptyRefused, StoreError> {
+        let conn = &self.conn;
+        let unsent: HashSet<String> = unsent_mail_in_on(conn, &[folder.to_string()])?
+            .into_iter()
+            .collect();
+        let mut allowed: HashSet<String> = HashSet::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM folder_delete_allow WHERE batch = ?1 AND kind = 'message'",
+            )?;
+            let ids = stmt
+                .query_map(params![batch], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            for id in ids {
+                allowed.insert(current_id_on(conn, &id)?);
+                allowed.insert(id);
+            }
+        }
+        let mut out = EmptyRefused::default();
+        for id in refused {
+            if self.message_folder(id)?.as_deref() != Some(folder) {
+                out.kept += 1;
+            } else if !unsent.contains(id) && allowed.contains(id) {
+                out.delete.push(id.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether `id` (resolved through `folder_aliases`) is a folder a queued
+    /// `EmptyFolder` names (#2110): nothing is read from Graph for it
+    /// meanwhile, and its stored counts are kept.
+    pub(crate) fn folder_being_emptied(&self, id: &str) -> Result<bool, StoreError> {
+        let id = current_folder_id_on(&self.conn, id)?;
+        for row in pending_ops_on(&self.conn)? {
+            if let OutboxOp::EmptyFolder { folder, .. } = &row.op {
+                if current_folder_id_on(&self.conn, folder)? == id {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Starts `folder`'s delta afresh (#1913): its delta and backfill links
@@ -5777,6 +5979,7 @@ impl Store {
                     }
                     continue;
                 }
+                OutboxOp::EmptyFolder { folder, .. } => (folder, &mut q.emptied),
                 _ => continue,
             };
             set.insert(current_folder_id_on(&self.conn, &id)?);
@@ -5808,7 +6011,7 @@ impl Store {
     /// outside the subtree is put back under it), and Graph mail moved into
     /// them is dropped as a refused create drops it
     /// (`drop_local_folder_mail_on`, [`FolderDelete::had_mail`]). Queued
-    /// `MarkFolderRead`s of a removed folder go too.
+    /// `MarkFolderRead`s and `EmptyFolder`s of a removed folder go too.
     ///
     /// The Graph roots are `id` when Graph has it, every Graph folder of
     /// the subtree whose stored parent is a removed `local:` folder (moved
@@ -6132,8 +6335,9 @@ fn deleting_folders_on(conn: &Connection) -> Result<HashSet<String>, StoreError>
 
 /// Drops the queued folder ops a delete leaves pointless (#2107): the
 /// creates of the removed `local:` folders `local` and every other op
-/// naming one of them, the `MarkFolderRead`s of the `removed` folders, and
-/// every `MoveFolder` into a removed `local:` folder, wherever the moved
+/// naming one of them, the `MarkFolderRead`s and `EmptyFolder`s (with the
+/// latter's allow-lists, #2110) of the `removed` folders, and every
+/// `MoveFolder` into a removed `local:` folder, wherever the moved
 /// folder is now. The next queued move of that folder inherits the dropped
 /// one's `prev_parent`, so a refusal of it reverts to a parent Graph has;
 /// with none, a folder outside `removed` still under the dropped move's
@@ -6155,6 +6359,18 @@ fn drop_folder_ops_on(
             OutboxOp::MarkFolderRead { folder, .. } => {
                 let f = current_folder_id_on(conn, folder)?;
                 removed.contains(&f) || local.contains(&f)
+            }
+            // #2110: and its batch's allow-list with it.
+            OutboxOp::EmptyFolder { folder, batch, .. } => {
+                let f = current_folder_id_on(conn, folder)?;
+                let gone = removed.contains(&f) || local.contains(&f);
+                if gone {
+                    conn.execute(
+                        "DELETE FROM folder_delete_allow WHERE batch = ?1",
+                        params![batch],
+                    )?;
+                }
+                gone
             }
             OutboxOp::MoveFolder {
                 id,
@@ -6246,6 +6462,7 @@ fn queued_op_ids_on(conn: &Connection) -> Result<HashSet<String>, StoreError> {
             }
             OutboxOp::MarkFolderRead { folder, .. } => vec![folder],
             OutboxOp::DeleteFolder { id, .. } => vec![id],
+            OutboxOp::EmptyFolder { folder, .. } => vec![folder],
             _ => vec![],
         };
         for f in folders {
@@ -6526,6 +6743,23 @@ fn rekey_folder_on(
         clear_folder_links_on(conn, new)?;
     }
     Ok(())
+}
+
+/// The cutoff of a folder-wide op (#1913, #2110): the later of `now_utc`
+/// and the newest stored `received_at` in `folder`, a fractional second
+/// rounded up (`ceil_to_whole_second`), so Graph's `receivedDateTime le`
+/// still takes every stored message even when the client clock is behind
+/// Graph's.
+fn folder_cutoff_on(conn: &Connection, folder: &str, now_utc: &str) -> Result<String, StoreError> {
+    let newest: Option<String> = conn.query_row(
+        "SELECT MAX(received_at) FROM messages WHERE folder_id = ?1 AND received_at <> ''",
+        params![folder],
+        |r| r.get(0),
+    )?;
+    Ok(match newest.map(|n| ceil_to_whole_second(&n)) {
+        Some(n) if n.as_str() > now_utc => n,
+        _ => now_utc.to_string(),
+    })
 }
 
 /// A Graph instant as `YYYY-MM-DDTHH:MM:SSZ`, a fractional second rounded
@@ -20518,6 +20752,7 @@ mod folder_write_tests {
                 moved: ["B".to_string()].into(),
                 marked_read: HashMap::new(),
                 deleted: HashSet::new(),
+                emptied: HashSet::new(),
             }
         );
     }
@@ -22013,6 +22248,571 @@ mod mark_folder_read_tests {
                 ("F".to_string(), None, 0),
                 ("G".to_string(), Some("b".to_string()), 3)
             ]
+        );
+    }
+}
+
+/// #2110: `Store::empty_folder`, its allow-list, its FTS shortcut and
+/// `finish_folder_empty`.
+#[cfg(test)]
+mod empty_folder_tests {
+    use super::*;
+    use crate::graph::model::MailFolder;
+
+    const NOW: &str = "2026-11-10T18:00:00Z";
+
+    /// A folder under ROOT whose listed counts are `(total, unread)`.
+    fn folder(s: &Store, id: &str, total: i64, unread: i64) {
+        s.upsert_folder(&MailFolder {
+            id: id.into(),
+            display_name: id.into(),
+            parent_id: Some("ROOT".into()),
+            total_count: total,
+            unread_count: unread,
+            well_known_name: None,
+        })
+        .unwrap();
+    }
+
+    /// A message `id` in `folder`, received at `received`, read or not,
+    /// with internet message id `imid` and subject `subject`.
+    fn message(s: &Store, id: &str, folder: &str, received: &str, read: bool, imid: &str) {
+        s.conn
+            .execute(
+                "INSERT INTO messages (id, folder_id, received_at, is_read, internet_message_id,
+                                       subject)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?1)",
+                params![id, folder, received, read, imid],
+            )
+            .unwrap();
+    }
+
+    fn ids_in(s: &Store, folder: &str) -> Vec<String> {
+        let mut stmt = s
+            .conn
+            .prepare("SELECT id FROM messages WHERE folder_id = ?1 ORDER BY id")
+            .unwrap();
+        stmt.query_map(params![folder], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn counts(s: &Store, id: &str) -> (i64, i64) {
+        let f = s
+            .folders()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == id)
+            .unwrap();
+        (f.total_count, f.unread_count)
+    }
+
+    fn ops(s: &Store) -> Vec<OutboxOp> {
+        s.pending_ops().unwrap().into_iter().map(|r| r.op).collect()
+    }
+
+    /// The one queued `EmptyFolder`'s `(seq, before, batch)`.
+    fn queued(s: &Store) -> (i64, String, String) {
+        let rows = s.pending_ops().unwrap();
+        let found: Vec<_> = rows
+            .into_iter()
+            .filter_map(|r| match r.op {
+                OutboxOp::EmptyFolder { before, batch, .. } => Some((r.seq, before, batch)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "{found:?}");
+        found.into_iter().next().unwrap()
+    }
+
+    fn allow(s: &Store, batch: &str) -> Vec<(String, String, String)> {
+        let mut stmt = s
+            .conn
+            .prepare(
+                "SELECT kind, id, imid FROM folder_delete_allow WHERE batch = ?1 ORDER BY kind, id",
+            )
+            .unwrap();
+        stmt.query_map(params![batch], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn fts_rows(s: &Store, id: &str) -> i64 {
+        s.conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_fts WHERE message_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The `sqlite_master` text of the two FTS delete triggers.
+    fn fts_delete_triggers(s: &Store) -> Vec<(String, String)> {
+        let mut stmt = s
+            .conn
+            .prepare(
+                "SELECT name, sql FROM sqlite_master
+                 WHERE type = 'trigger' AND name IN ('messages_fts_ad', 'bodies_fts_ad')
+                 ORDER BY name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn written(r: FolderWriteResult) -> String {
+        match r {
+            FolderWriteResult::Written(id) => id,
+            other => panic!("not written: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_folder_op_round_trips_json() {
+        let op = OutboxOp::EmptyFolder {
+            folder: "F".into(),
+            before: NOW.into(),
+            batch: "empty:1".into(),
+        };
+        let text = op.to_json().to_string();
+        assert_eq!(
+            text,
+            r#"{"kind":"emptyFolder","folder":"F","before":"2026-11-10T18:00:00Z","batch":"empty:1"}"#
+        );
+        assert_eq!(
+            OutboxOp::from_json(&json::parse(&text).unwrap()),
+            Some(op.clone())
+        );
+        assert_eq!(op.message_id(), None);
+    }
+
+    /// Criterion 1 (store): the folder's mail goes, its counts are 0 and
+    /// its links cleared, one op is queued, and nothing else changes;
+    /// `finish_folder_empty` drops the op and the batch and clears the
+    /// links again.
+    #[test]
+    fn empty_folder_removes_the_folders_mail_zeroes_and_queues_in_one_transaction() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F", 40, 7);
+        folder(&s, "G", 3, 1);
+        message(&s, "F1", "F", "2026-11-01T00:00:00Z", false, "<f1@x>");
+        message(&s, "F2", "F", "2026-11-02T00:00:00Z", true, "");
+        message(&s, "G1", "G", "2026-11-02T00:00:00Z", false, "<g1@x>");
+        s.set_delta_link("F", "https://graph/delta?F").unwrap();
+        s.set_delta_link("G", "https://graph/delta?G").unwrap();
+        assert!(!s.folder_being_emptied("F").unwrap());
+
+        assert_eq!(written(s.empty_folder("F", NOW).unwrap()), "F");
+        assert!(ids_in(&s, "F").is_empty());
+        assert_eq!(ids_in(&s, "G"), ["G1"], "another folder is untouched");
+        assert_eq!(counts(&s, "F"), (0, 0));
+        assert_eq!(counts(&s, "G"), (3, 1));
+        assert_eq!(s.get_delta_link("F").unwrap(), None);
+        assert_eq!(
+            s.get_delta_link("G").unwrap().as_deref(),
+            Some("https://graph/delta?G")
+        );
+        let (seq, before, batch) = queued(&s);
+        assert_eq!(before, NOW);
+        assert!(batch.starts_with("empty:"), "{batch}");
+        assert_eq!(ops(&s).len(), 1);
+        assert!(s.folder_being_emptied("F").unwrap());
+        assert!(!s.folder_being_emptied("G").unwrap());
+        let q = s.queued_folder_writes().unwrap();
+        assert!(q.emptied.contains("F") && !q.emptied.contains("G"));
+        assert_eq!(allow(&s, &batch).len(), 2);
+
+        // The end: op, batch and links (set again meanwhile) in one go.
+        s.set_delta_link("F", "https://graph/delta?F2").unwrap();
+        s.finish_folder_empty(seq, &batch, "F").unwrap();
+        assert!(ops(&s).is_empty());
+        assert!(allow(&s, &batch).is_empty());
+        assert_eq!(s.get_delta_link("F").unwrap(), None);
+        assert!(!s.folder_being_emptied("F").unwrap());
+    }
+
+    /// Criterion 3: a 5 000-row empty that fails on its last row leaves
+    /// every row, the counts, the links, the FTS rows and triggers and the
+    /// outbox as they were; without the failure it removes them all.
+    #[test]
+    fn empty_folder_is_all_or_nothing_on_5000_rows() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F", 5000, 5000);
+        folder(&s, "G", 10_000, 0);
+        s.set_delta_link("F", "https://graph/delta?F").unwrap();
+        // The setup only: each INSERT's FTS trigger scans the whole FTS
+        // table (`message_id` is UNINDEXED). The FTS rows are written in
+        // one statement instead. G's 10 000 rows stay in the FTS table, so
+        // a per-row delete trigger would scan them 5 000 times.
+        s.conn
+            .execute_batch("DROP TRIGGER messages_fts_ai")
+            .unwrap();
+        {
+            let tx = s.conn.unchecked_transaction().unwrap();
+            for i in 0..5000 {
+                tx.execute(
+                    "INSERT INTO messages (id, folder_id, received_at, is_read, subject)
+                     VALUES (?1, 'F', '2026-11-01T00:00:00Z', 0, 'quarterly')",
+                    params![format!("M{i:04}")],
+                )
+                .unwrap();
+            }
+            for i in 0..10_000 {
+                tx.execute(
+                    "INSERT INTO messages (id, folder_id, is_read, subject)
+                     VALUES (?1, 'G', 1, 'annual')",
+                    params![format!("G{i:05}")],
+                )
+                .unwrap();
+            }
+            tx.execute(
+                "INSERT INTO messages_fts(message_id, subject, from_text, body)
+                 SELECT id, subject, '', '' FROM messages",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let triggers = fts_delete_triggers(&s);
+        assert_eq!(triggers.len(), 2);
+        // Whatever order the DELETE walks the rows in, the one it aborts on
+        // comes after others it already removed: they must all come back.
+        s.conn
+            .execute_batch(
+                "CREATE TEMP TRIGGER abort_last BEFORE DELETE ON messages
+                 WHEN OLD.id = 'M4999'
+                 BEGIN SELECT RAISE(ABORT, 'test abort'); END;",
+            )
+            .unwrap();
+        assert!(s.empty_folder("F", NOW).is_err());
+        assert_eq!(ids_in(&s, "F").len(), 5000, "no row is gone");
+        assert_eq!(counts(&s, "F"), (5000, 5000));
+        assert_eq!(
+            s.get_delta_link("F").unwrap().as_deref(),
+            Some("https://graph/delta?F")
+        );
+        assert!(ops(&s).is_empty(), "nothing queued");
+        let allowed: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM folder_delete_allow", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(allowed, 0);
+        assert_eq!(fts_rows(&s, "M0000"), 1, "the FTS delete rolled back");
+        assert_eq!(fts_delete_triggers(&s), triggers, "the drop rolled back");
+
+        s.conn.execute_batch("DROP TRIGGER abort_last").unwrap();
+        let started = std::time::Instant::now();
+        written(s.empty_folder("F", NOW).unwrap());
+        let took = started.elapsed();
+        assert!(ids_in(&s, "F").is_empty());
+        assert_eq!(counts(&s, "F"), (0, 0));
+        assert_eq!(ops(&s).len(), 1);
+        let fts: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts, 10_000, "only G's FTS rows are left");
+        assert_eq!(ids_in(&s, "G").len(), 10_000);
+        assert_eq!(fts_delete_triggers(&s), triggers, "re-created as they were");
+        // Not quadratic: with the per-row triggers this took over 20 s
+        // even in a release build (5 000 deletes, each scanning the FTS
+        // table); the bulk delete takes well under a second.
+        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+    }
+
+    /// Criterion 4 (store): unsent mail stays, out of the allow-list, and
+    /// the counts are those of what stayed.
+    #[test]
+    fn empty_folder_keeps_unsent_mail_and_counts_it() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "D", 9, 9);
+        message(&s, "local:new", "D", "", false, "");
+        message(&s, "EDITED", "D", "2026-11-01T00:00:00Z", true, "<e@x>");
+        message(&s, "SAVING", "D", "2026-11-01T00:00:00Z", false, "<s@x>");
+        message(&s, "SENT", "D", "2026-11-01T00:00:00Z", false, "<n@x>");
+        s.conn
+            .execute("UPDATE messages SET local_edit = 1 WHERE id = 'EDITED'", [])
+            .unwrap();
+        s.enqueue_op(&OutboxOp::SaveDraft {
+            id: "SAVING".into(),
+        })
+        .unwrap();
+        written(s.empty_folder("D", NOW).unwrap());
+        assert_eq!(ids_in(&s, "D"), ["EDITED", "SAVING", "local:new"]);
+        assert_eq!(counts(&s, "D"), (3, 2));
+        let (_, _, batch) = queued(&s);
+        assert_eq!(
+            allow(&s, &batch),
+            [(
+                "message".to_string(),
+                "SENT".to_string(),
+                "<n@x>".to_string()
+            )]
+        );
+        assert_eq!(
+            ops(&s)[0],
+            OutboxOp::SaveDraft {
+                id: "SAVING".into()
+            },
+            "its save is still queued, first"
+        );
+    }
+
+    /// Criterion 3 (FTS): the folder's FTS rows go with its rows, another
+    /// folder's stay and are still found, and both delete triggers are
+    /// back as they were and still work.
+    #[test]
+    fn empty_folder_fts_rows_go_and_the_fts_triggers_come_back() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F", 2, 0);
+        folder(&s, "G", 2, 0);
+        message(&s, "F1", "F", "", true, "");
+        message(&s, "G1", "G", "", true, "");
+        message(&s, "G2", "G", "", true, "");
+        for id in ["F1", "G1"] {
+            s.conn
+                .execute(
+                    "INSERT INTO bodies (message_id, content_type, content)
+                     VALUES (?1, 'text', 'zebra')",
+                    params![id],
+                )
+                .unwrap();
+        }
+        let triggers = fts_delete_triggers(&s);
+        assert_eq!(triggers.len(), 2, "{triggers:?}");
+        assert_eq!(s.search("zebra", 10).unwrap().len(), 2);
+
+        written(s.empty_folder("F", NOW).unwrap());
+        assert_eq!(fts_rows(&s, "F1"), 0);
+        assert_eq!((fts_rows(&s, "G1"), fts_rows(&s, "G2")), (1, 1));
+        let hits: Vec<String> = s
+            .search("zebra", 10)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(hits, ["G1"]);
+        assert_eq!(fts_delete_triggers(&s), triggers, "byte for byte");
+        // They still fire: a body's delete, then a message's.
+        s.conn
+            .execute("DELETE FROM bodies WHERE message_id = 'G1'", [])
+            .unwrap();
+        assert!(s.search("zebra", 10).unwrap().is_empty());
+        assert_eq!(fts_rows(&s, "G1"), 1, "the subject row stays");
+        s.delete_message("G1").unwrap();
+        assert_eq!(fts_rows(&s, "G1"), 0);
+    }
+
+    /// Criterion 8 (store): nothing is written for an unknown folder or the
+    /// drafts sentinel.
+    #[test]
+    fn empty_folder_refuses_unknown_and_the_drafts_sentinel() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F", 1, 1);
+        message(&s, "F1", "F", NOW, false, "");
+        assert_eq!(
+            s.empty_folder("NOPE", NOW).unwrap(),
+            FolderWriteResult::Refused(FolderRefusal::Unknown("NOPE".into()))
+        );
+        s.conn
+            .execute(
+                "INSERT INTO folders (id, display_name) VALUES (?1, 'Drafts')",
+                params![LOCAL_DRAFTS_SENTINEL_FOLDER_ID],
+            )
+            .unwrap();
+        message(
+            &s,
+            "local:d",
+            LOCAL_DRAFTS_SENTINEL_FOLDER_ID,
+            "",
+            false,
+            "",
+        );
+        assert_eq!(
+            s.empty_folder(LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NOW)
+                .unwrap(),
+            FolderWriteResult::Refused(FolderRefusal::DraftsSentinel)
+        );
+        assert!(ops(&s).is_empty());
+        assert_eq!(ids_in(&s, "F"), ["F1"]);
+        assert_eq!(ids_in(&s, LOCAL_DRAFTS_SENTINEL_FOLDER_ID), ["local:d"]);
+    }
+
+    /// The batch allows what the folder showed (by id, through a later
+    /// move's alias, and by internet message id), the removed rows leave no
+    /// tombstone, and other tombstones stay; a row of an allowed id back
+    /// elsewhere is refused.
+    #[test]
+    fn empty_folder_allow_list_and_tombstones() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F", 2, 0);
+        folder(&s, "G", 0, 0);
+        message(&s, "F1", "F", NOW, true, "<f1@x>");
+        message(&s, "F2", "F", NOW, true, "<f2@x>");
+        message(&s, "GONE", "G", NOW, true, "<gone@x>");
+        s.delete_message("GONE").unwrap();
+        assert!(forgotten_on(&s.conn, "message", "GONE").unwrap());
+
+        written(s.empty_folder("F", NOW).unwrap());
+        let (_, _, batch) = queued(&s);
+        assert_eq!(
+            allow(&s, &batch),
+            [
+                ("message".into(), "F1".into(), "<f1@x>".into()),
+                ("message".into(), "F2".into(), "<f2@x>".into())
+            ]
+        );
+        assert!(!forgotten_on(&s.conn, "message", "F1").unwrap());
+        assert!(!forgotten_on(&s.conn, "message", "F2").unwrap());
+        assert!(forgotten_on(&s.conn, "message", "GONE").unwrap());
+        let items = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+            v.iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        // Allowed: what it showed, and mail it never held; refused: a
+        // tombstone and a row back elsewhere.
+        assert!(
+            s.delete_allow_check(&batch, &[], &items(&[("F1", "<f1@x>"), ("NEW", "<new@x>")]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            s.delete_allow_check(&batch, &[], &items(&[("GONE", "<gone@x>")]))
+                .unwrap(),
+            ["GONE"]
+        );
+        message(&s, "F2", "G", NOW, true, "<f2@x>");
+        assert_eq!(
+            s.delete_allow_check(&batch, &[], &items(&[("F2", "<f2@x>")]))
+                .unwrap(),
+            ["F2"]
+        );
+    }
+
+    /// The cutoff is `mark_folder_read`'s: the later of now and the newest
+    /// stored row, rounded up to a whole second.
+    #[test]
+    fn empty_folder_cutoff_is_the_later_of_now_and_the_newest_row() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F", 2, 0);
+        folder(&s, "E", 0, 0);
+        message(&s, "OLD", "F", "2026-11-01T00:00:00Z", true, "");
+        message(&s, "NEW", "F", "2026-11-10T18:03:07.5120000Z", true, "");
+        written(s.empty_folder("F", NOW).unwrap());
+        written(s.empty_folder("E", NOW).unwrap());
+        let befores: Vec<String> = ops(&s)
+            .into_iter()
+            .map(|op| match op {
+                OutboxOp::EmptyFolder { before, .. } => before,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(befores, vec!["2026-11-10T18:03:08Z", NOW]);
+    }
+
+    /// r2-m3: `empty_refused` sorts a run's refused ids, each guard with a
+    /// case that fails without it: an allowed id stored in the folder
+    /// again is deleted unless it is unsent; one the batch does not allow
+    /// (moved in since) is left alone; one stored elsewhere, or not at all
+    /// (a tombstone), is kept and counted.
+    #[test]
+    fn empty_refused_sorts_what_the_check_refused() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F", 4, 0);
+        folder(&s, "G", 0, 0);
+        for id in ["UNSENT", "BACK", "ELSEWHERE", "GONE"] {
+            message(&s, id, "F", NOW, true, "");
+        }
+        written(s.empty_folder("F", NOW).unwrap());
+        let (_, _, batch) = queued(&s);
+        // Stored in F again: one now holding an unsent edit, one plain.
+        message(&s, "UNSENT", "F", NOW, true, "");
+        s.conn
+            .execute("UPDATE messages SET local_edit = 1 WHERE id = 'UNSENT'", [])
+            .unwrap();
+        message(&s, "BACK", "F", NOW, true, "");
+        // Moved into F since: the batch never had it.
+        message(&s, "MOVED-IN", "F", NOW, true, "");
+        // Stored in another folder.
+        message(&s, "ELSEWHERE", "G", NOW, true, "");
+        let refused: Vec<String> = ["UNSENT", "BACK", "MOVED-IN", "ELSEWHERE", "GONE"]
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        assert_eq!(
+            s.empty_refused(&batch, "F", &refused).unwrap(),
+            EmptyRefused {
+                delete: vec!["BACK".to_string()],
+                kept: 2,
+            }
+        );
+    }
+
+    /// Criterion 11 (store): a delete of the folder, or of a folder above
+    /// it, drops its queued `EmptyFolder` and the batch's allow-list; the
+    /// delete's own check then allows the mail the empty removed, as the
+    /// store never held it any more (no row, no tombstone: the empty
+    /// cleared its own), by id and by internet message id.
+    #[test]
+    fn delete_folder_drops_a_queued_empty_folder_and_its_allow_list() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "P", 0, 0);
+        s.upsert_folder(&MailFolder {
+            id: "F".into(),
+            display_name: "F".into(),
+            parent_id: Some("P".into()),
+            total_count: 1,
+            unread_count: 0,
+            well_known_name: None,
+        })
+        .unwrap();
+        folder(&s, "OTHER", 0, 0);
+        message(&s, "F1", "F", NOW, true, "<f1@x>");
+        written(s.empty_folder("F", NOW).unwrap());
+        written(s.empty_folder("OTHER", NOW).unwrap());
+        let batches: Vec<String> = ops(&s)
+            .into_iter()
+            .filter_map(|op| match op {
+                OutboxOp::EmptyFolder { batch, .. } => Some(batch),
+                _ => None,
+            })
+            .collect();
+        let (r, _) = s.delete_folder("P").unwrap();
+        written(r);
+        let left: Vec<OutboxOp> = ops(&s);
+        assert!(
+            !left
+                .iter()
+                .any(|op| matches!(op, OutboxOp::EmptyFolder { folder, .. } if folder == "F")),
+            "{left:?}"
+        );
+        assert!(
+            left.iter()
+                .any(|op| matches!(op, OutboxOp::EmptyFolder { folder, .. } if folder == "OTHER")),
+            "another folder's empty stays"
+        );
+        assert!(allow(&s, &batches[0]).is_empty());
+        let delete_batch = left
+            .iter()
+            .find_map(|op| match op {
+                OutboxOp::DeleteFolder { batch, .. } => Some(batch.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            s.delete_allow_check(
+                &delete_batch,
+                &["F".to_string()],
+                &[("F1".to_string(), "<f1@x>".to_string())]
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 }
