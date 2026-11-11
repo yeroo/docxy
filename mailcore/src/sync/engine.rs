@@ -1395,6 +1395,97 @@ fn command_writes_event_locally(cmd: &SyncCommand) -> bool {
     )
 }
 
+/// The commands a `checkpoint` serves at once, between two requests of
+/// long work (#1978, #2006, #2123), instead of keeping them for the main
+/// loop: a click costs its own round trips plus the request in flight.
+fn served_at_checkpoint(cmd: &SyncCommand) -> bool {
+    matches!(
+        cmd,
+        SyncCommand::FetchBody { .. }
+            | SyncCommand::SearchMessages { .. }
+            | SyncCommand::FetchMessage { .. }
+            | SyncCommand::FetchFolderSizes { .. }
+    )
+}
+
+/// Whether a command that came before a `Shutdown` (or a dropped handle)
+/// still runs at shutdown (#2127): true for a write whose arm writes the
+/// store and queues its outbox op (or only drains one the host's store
+/// write queued) with no Graph request first, so what it did lasts and the
+/// next start's drain sends it; the shutdown stops the drain before its
+/// first request. False for a read, and for a write that has to reach
+/// Graph before anything can be queued (it would only be lost half way).
+/// No `_` arm: a new command has to be decided here.
+fn persists_at_shutdown(cmd: &SyncCommand) -> bool {
+    match cmd {
+        SyncCommand::MarkRead { .. }
+        | SyncCommand::SetFlag { .. }
+        | SyncCommand::SetCategories { .. }
+        | SyncCommand::Move { .. }
+        | SyncCommand::Delete { .. }
+        | SyncCommand::SaveDraft { .. }
+        | SyncCommand::SendDraft { .. }
+        | SyncCommand::RespondEvent { .. }
+        | SyncCommand::CreateEvent { .. }
+        | SyncCommand::UpdateEvent { .. }
+        | SyncCommand::DeleteEvent { .. }
+        | SyncCommand::CancelEvent { .. }
+        | SyncCommand::ForwardEvent { .. }
+        | SyncCommand::DismissReminder { .. }
+        | SyncCommand::SnoozeReminder { .. }
+        | SyncCommand::DismissMessageReminder { .. }
+        | SyncCommand::SnoozeMessageReminder { .. }
+        | SyncCommand::UpdateEventSeries { .. }
+        | SyncCommand::CreateContact { .. }
+        | SyncCommand::UpdateContact { .. }
+        | SyncCommand::DeleteContact { .. }
+        | SyncCommand::CreateFolder { .. }
+        | SyncCommand::RenameFolder { .. }
+        | SyncCommand::MoveFolder { .. }
+        | SyncCommand::CopyFolder { .. }
+        | SyncCommand::MarkFolderRead { .. }
+        | SyncCommand::DeleteFolder { .. }
+        | SyncCommand::EmptyFolder { .. }
+        // In memory, or a local preference whose refresh the shutdown
+        // skips (`set_calendars`).
+        | SyncCommand::SetFastFolders { .. }
+        | SyncCommand::SetCalendars { .. }
+        // A sign-out asked for before quitting holds: the token cache is
+        // cleared, and the writes after it are still queued.
+        | SyncCommand::SignOut => true,
+        SyncCommand::Refresh
+        | SyncCommand::SyncFolder { .. }
+        | SyncCommand::SignIn
+        | SyncCommand::RefreshCategories
+        | SyncCommand::FetchSchedule { .. }
+        | SyncCommand::FetchBody { .. }
+        | SyncCommand::SearchMessages { .. }
+        | SyncCommand::FetchMessage { .. }
+        | SyncCommand::FetchFolderSizes { .. }
+        | SyncCommand::FetchAttachments { .. }
+        | SyncCommand::SaveAttachment { .. }
+        | SyncCommand::SaveItemAttachment { .. }
+        | SyncCommand::FetchMeetingMessage { .. }
+        | SyncCommand::FetchAutomaticReplies
+        | SyncCommand::FetchProfile
+        | SyncCommand::FetchPhoto
+        | SyncCommand::FetchInlineImage { .. }
+        | SyncCommand::RefreshCalendar
+        | SyncCommand::FetchCalendarRange { .. }
+        | SyncCommand::FetchEventSeries { .. }
+        | SyncCommand::FetchEventInstances { .. }
+        // Writes that reach Graph outside the outbox: `RespondMeeting` and
+        // `RemoveFromCalendar` read the meeting first, `SetAutomaticReplies`
+        // PATCHes, `ComposeReply`/`ComposeForward` POST `createReply`.
+        | SyncCommand::RespondMeeting { .. }
+        | SyncCommand::RemoveFromCalendar { .. }
+        | SyncCommand::SetAutomaticReplies { .. }
+        | SyncCommand::ComposeReply { .. }
+        | SyncCommand::ComposeForward { .. }
+        | SyncCommand::Shutdown => false,
+    }
+}
+
 impl Drain {
     /// Whether the caller's sync goes on after the drain.
     fn carry_on(self) -> bool {
@@ -1779,18 +1870,22 @@ struct Engine {
     /// The commands from the UI. The main loop waits on it; long work
     /// drains it at each `checkpoint` (#1978).
     cmd_rx: Receiver<SyncCommand>,
-    /// Commands a `checkpoint` took off the channel and kept for later
-    /// (every one but `FetchBody`, `SearchMessages`, `FetchMessage` and
-    /// `FetchFolderSizes`, #2123), in arrival order: the main loop runs
-    /// them before it reads the channel again or does any idle work.
+    /// Commands taken off the channel and kept for later, in arrival
+    /// order (`take_waiting`: by a `checkpoint`, or by a drain before each
+    /// op, #2127): the main loop runs them before it reads the channel
+    /// again or does any idle work. A served kind (`served_at_checkpoint`)
+    /// waits here only until the next `checkpoint`, which serves it.
+    /// At shutdown only the ones `persists_at_shutdown` keeps run.
     deferred: VecDeque<SyncCommand>,
     /// The `MarkFolderRead` op being run (#1913): the ids still to mark,
     /// kept across drains (a throttle, a 5xx, a checkpoint stop), so a run
     /// goes on where it stopped instead of paging again.
     bulk: Option<BulkRun>,
     /// A `Shutdown` came, or the UI dropped its handle, while work was
-    /// running: the work stops at its next checkpoint, and the main loop
-    /// returns once the commands that came before it have run.
+    /// running: the work stops at its next checkpoint (a drain before its
+    /// next op), and the main loop returns once the commands that came
+    /// before it were persisted (#2127): the writes `persists_at_shutdown`
+    /// keeps run, their drains sending nothing; every other is dropped.
     shutting_down: bool,
     /// Ids whose body a fetch the engine made on its own (#1978) failed
     /// for a reason a retry would not fix (a 404, another 4xx, a parse
@@ -1883,15 +1978,21 @@ impl Engine {
     /// one backfill page, or a backfill's last step (its last round on the
     /// folder's own link, the repair, and new-mail bodies, which end early).
     ///
-    /// The commands a `checkpoint` kept (`deferred`) run first, in order,
-    /// before the channel is read again; then a `Shutdown` a checkpoint saw
-    /// ends the loop.
+    /// The commands a `checkpoint` or a drain kept (`deferred`) run first,
+    /// in order, before the channel is read again; then a `Shutdown` either
+    /// saw ends the loop. Once one has (#2127), a kept command runs only
+    /// when `persists_at_shutdown`: its store write and its outbox op land,
+    /// and its drain, cut by the shutdown, sends nothing; the next start
+    /// drains them. Every other kept command is dropped.
     fn main_loop(&mut self) {
         // The startup pass schedules the deadlines like any other.
         self.after_pass_if_fast();
         self.next_tick = Instant::now() + self.config.tick;
         loop {
             if let Some(cmd) = self.deferred.pop_front() {
+                if self.shutting_down && !persists_at_shutdown(&cmd) {
+                    continue;
+                }
                 self.handle_command(cmd);
                 // Without a fast tick the wait restarts on every command.
                 self.next_tick = Instant::now() + self.config.tick;
@@ -1935,56 +2036,65 @@ impl Engine {
         }
     }
 
-    /// Takes every command waiting on the channel, between two requests of
-    /// long work (#1978): a `FetchBody`, a `SearchMessages` or a
-    /// `FetchMessage` (#2006), or a `FetchFolderSizes` (#2123) is served at
-    /// once, so a click costs its own
-    /// round trips plus the request in flight, not a whole pass; every
-    /// other command is kept (`deferred`) for the main loop, in order; a
-    /// `Shutdown` or a dropped handle sets `shutting_down`. Returns whether
-    /// the work goes on: `false` when shutting down, or when a command
-    /// served here hit an auth, throttle or transport failure (`react`
-    /// returned true). A back-off set before the checkpoint does not stop
-    /// it: `Refresh` runs a pass during one.
+    /// Takes every command waiting on the channel (`take_waiting`), then
+    /// serves the kept ones of a served kind (`served_at_checkpoint`), between
+    /// two requests of long work (#1978): a `FetchBody`, a `SearchMessages`
+    /// or a `FetchMessage` (#2006), or a `FetchFolderSizes` (#2123) is
+    /// served at once, so a click costs its own round trips plus the request
+    /// in flight, not a whole pass; every other command is kept (`deferred`)
+    /// for the main loop, in order. A `Shutdown` or a dropped handle sets
+    /// `shutting_down`, and as the channel is read up to it before anything
+    /// is served, a read sent before a `Shutdown` is never served (#2127).
+    /// Returns whether the work goes on: `false` when shutting down, or when
+    /// a command served here hit an auth, throttle or transport failure
+    /// (`react` returned true). A back-off set before the checkpoint does
+    /// not stop it: `Refresh` runs a pass during one.
     fn checkpoint(&mut self) -> bool {
-        if self.shutting_down {
-            return false;
-        }
         let mut carry_on = true;
         loop {
-            match self.cmd_rx.try_recv() {
-                Ok(SyncCommand::FetchBody { id }) => {
-                    if self.fetch_body(&id) {
-                        carry_on = false;
-                    }
-                }
-                Ok(SyncCommand::SearchMessages {
+            if !self.take_waiting() {
+                return false;
+            }
+            let Some(at) = self.deferred.iter().position(served_at_checkpoint) else {
+                return carry_on;
+            };
+            let served = match self.deferred.remove(at) {
+                Some(SyncCommand::FetchBody { id }) => self.fetch_body(&id),
+                Some(SyncCommand::SearchMessages {
                     query,
                     folder_id,
                     top,
-                }) => {
-                    if self.search_messages(query, folder_id, top) {
-                        carry_on = false;
-                    }
+                }) => self.search_messages(query, folder_id, top),
+                Some(SyncCommand::FetchMessage { id }) => self.fetch_message(&id),
+                Some(SyncCommand::FetchFolderSizes { folder_ids }) => {
+                    self.fetch_folder_sizes(folder_ids)
                 }
-                Ok(SyncCommand::FetchMessage { id }) => {
-                    if self.fetch_message(&id) {
-                        carry_on = false;
-                    }
-                }
-                Ok(SyncCommand::FetchFolderSizes { folder_ids }) => {
-                    if self.fetch_folder_sizes(folder_ids) {
-                        carry_on = false;
-                    }
-                }
-                Ok(SyncCommand::Shutdown) | Err(TryRecvError::Disconnected) => {
-                    self.shutting_down = true;
-                    return false;
-                }
-                Ok(cmd) => self.deferred.push_back(cmd),
-                Err(TryRecvError::Empty) => return carry_on,
+                _ => false,
+            };
+            if served {
+                carry_on = false;
             }
         }
+    }
+
+    /// Moves every command waiting on the channel into `deferred`, in order,
+    /// serving none (#2127). A `Shutdown` or a dropped handle sets
+    /// `shutting_down` and ends the take: commands sent after a `Shutdown`
+    /// stay unread. Returns whether the work goes on (`false` once shutting
+    /// down). A drain calls it before each op, so a `Shutdown` sent behind
+    /// a burst of writes stops the drain before its next request, and a
+    /// `checkpoint` calls it before it serves anything.
+    fn take_waiting(&mut self) -> bool {
+        while !self.shutting_down {
+            match self.cmd_rx.try_recv() {
+                Ok(SyncCommand::Shutdown) | Err(TryRecvError::Disconnected) => {
+                    self.shutting_down = true;
+                }
+                Ok(cmd) => self.deferred.push_back(cmd),
+                Err(TryRecvError::Empty) => return true,
+            }
+        }
+        false
     }
 
     /// A timed wake: the tick (`on_tick`), or with a fast tick a deadline
@@ -4248,7 +4358,18 @@ impl Engine {
     /// [`Drain::Aborted`] when the drain was cut short (auth, throttle,
     /// transport, or that sync stopping), so the caller stops too and keeps
     /// the back-off.
+    ///
+    /// Before each op the commands waiting on the channel are taken
+    /// (`take_waiting`, #2127); a `Shutdown` among them, or one seen
+    /// before the drain, ends it at once ([`Drain::Aborted`]) with nothing
+    /// more sent, ahead of the post-drain syncs (`sync_after_send`, the
+    /// relist, a copy's contents), which the next start's pass covers.
     fn drain_outbox(&mut self) -> Drain {
+        // At shutdown the queue is only persisted (#2127): the next start
+        // drains it.
+        if self.shutting_down {
+            return Drain::Aborted;
+        }
         self.contact_rereads_paused = false;
         let ops = match self.store.pending_ops() {
             Ok(o) => o,
@@ -4295,6 +4416,12 @@ impl Engine {
             // its folder, `Store::discard_local_folder`).
             if !self.store.has_op(row.seq).unwrap_or(true) {
                 continue;
+            }
+            // A `Shutdown` sent behind a burst of writes (#2127) stops the
+            // drain before its next request: the commands before it are
+            // only persisted (`main_loop`), not each sent in turn.
+            if !self.take_waiting() {
+                return Drain::Aborted;
             }
             // Run by the engine (#2107), never `apply_op`, and only once it
             // is the oldest op: a move or other op queued before it lands
@@ -7093,7 +7220,9 @@ impl Engine {
             self.emit(SyncEvent::CalendarsUpdated);
         }
         let waiting = self.next_retry.is_some_and(|t| Instant::now() < t);
-        if self.token.is_some() && !waiting {
+        // At shutdown the choice is only stored (#2127): the next start's
+        // pass refreshes.
+        if self.token.is_some() && !waiting && !self.shutting_down {
             self.refresh_calendar();
         }
     }
