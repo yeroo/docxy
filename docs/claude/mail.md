@@ -3831,22 +3831,89 @@ quarantine re-listed the mailbox and brought the lost writes back.
     `EmptyFolder`), and also `SetFastFolders` and `BackfillFolder` (in memory), `SetCalendars` (the selection is
     stored; `set_calendars` skips its `refresh_calendar` when shutting down, and the next pass
     refreshes) and `SignOut` (the token cache is cleared; later writes still queue, and with no
-    token nothing drains).
+    token nothing drains). Since #2132 also the commands that otherwise reach Graph directly
+    (`RespondMeeting`, `RemoveFromCalendar`, `SetAutomaticReplies`, `SaveAttachment`,
+    `SaveItemAttachment`): at a shutdown each queues an outbox op (next section).
   - Dropped: every read and pass (`Refresh`, `SyncFolder`, `SignIn`, the `Fetch*` commands,
-    `SearchMessages`, `SaveAttachment`, `RefreshCalendar`, ...), and the writes that reach
-    Graph outside the outbox, which have nothing durable to persist: `RespondMeeting` and
-    `RemoveFromCalendar` (they read the meeting first), `SetAutomaticReplies` (a direct PATCH),
-    and `ComposeReply`/`ComposeForward` (`createReply`).
+    `SearchMessages`, `RefreshCalendar`, ...), and `ComposeReply`/`ComposeForward`
+    (`createReply`; kept dropped by #2132).
 - A drain cut by the shutdown after an op went through returns before its post-drain syncs
   (`sync_after_send`, `relist_after_drain`, `sync_copied_folders`). A copy applied just before it
   gets its contents synced by the next start's pass, as after a bulk run's checkpoint stop.
-- Not done: the drain is no faster (no `$batch` for per-message ops), and hosts still do not
+- Not done: the drain is no faster (no `$batch` for per-message ops, #2137), and hosts still do not
   wait for the engine thread at quit (`lookxy` sends `Shutdown` and returns; a bounded wait
   for `evt_rx` to disconnect is the host's change).
 - Tests (`engine.rs` `tests::shutdown_persists`): 20 `Delete`s against a `DELETE` paced 500 ms,
   then a `Shutdown` or a dropped handle: the engine returns within 3 s with at most one sent,
   and a second engine on the store sends the rest. Commands sent during a paced startup pass
   are persisted with no write, body, search or calendar request. And the #1978 guard above.
+
+## Direct writes and saves survive a shutdown (#2132)
+
+Five commands reach Graph directly, not through the outbox: answering a meeting from its invite
+(`RespondMeeting`), Remove from Calendar (`RemoveFromCalendar`), Automatic Replies
+(`SetAutomaticReplies`) and saving an attachment (`SaveAttachment`, `SaveItemAttachment`). Before
+#2132, #2127's shutdown dropped one still kept behind a burst of writes, though the host had
+already shown it as done.
+
+- Outside a shutdown nothing changed: each arm runs as before (signed-out guard, `react`,
+  Remove from Calendar's GET, queued `DeleteEvent` and optimistic row delete). They are not
+  outbox ops in normal use on purpose: a 5xx op at the head of the queue arms `op_retry` (up to
+  300 s, and a 5xx is never quarantined), so a save or an answer queued behind it would wait
+  silently; and Remove from Calendar keeps hiding the event under a 503.
+- At a shutdown (`shutting_down`, true when `main_loop` runs the kept commands) each arm keeps
+  the signed-out guard (a signed-out command is the usual "not signed in" `Error`, not
+  queued), runs its local checks only, and `enqueue_and_drain`s one op, whose drain is cut at
+  the top. `persists_at_shutdown` is `true` for the five.
+  - `OutboxOp::RespondMeeting`: after `rsvp_proposal`, with the window it approved (canonical
+    UTC), and `kind` as `RsvpKind::as_status` (the `RespondEvent` vocabulary).
+  - `OutboxOp::RemoveFromCalendar { message_id }`: not queued again while an equal one is
+    queued. A live remove of the same message while it waits (r1) queues no `DeleteEvent`
+    beside it, as for an equal `DeleteEvent`: that DELETE would 404 after the kept op's and
+    be retried into a quarantine. The row still goes, and the removal is reported.
+  - `OutboxOp::SetAutomaticReplies { body }`: the PATCH body (`automatic_replies_body`) built
+    now and sent as stored (`GraphClient::set_automatic_replies_body`).
+  - `OutboxOp::SaveAttachment { message_id, attachment_id, dest, item }`: one op for both
+    saves (`item`: `SaveItemAttachment`, `dest` its base). A `dest` that is not UTF-8 cannot be
+    stored: `Error("failed to save attachment to …: not a UTF-8 path")`, nothing queued.
+- The next start's drain sends them in queue order, behind what was queued before. `apply_op`
+  resolves the message (`Store::current_id`, so a `Move` of the invite queued first is
+  followed, #1896; an id not in the store is sent as is). RespondMeeting: `meeting_event_id`,
+  then `Store::refuses_time_proposals` (shared with the command), then `respond_event`.
+  RemoveFromCalendar: `meeting_message`, the command's refusals
+  (`outbox::remove_from_calendar_refusal`), then `delete_event`, a 404 counting as done; the
+  GET and the DELETE are one op, so a retry runs both again (after a DELETE that went through
+  the GET finds no event: `RemovedFromCalendar` with none). SaveAttachment: the bytes, which
+  the engine writes (`write_attachment`, shared with the command). The events are the
+  command's: `MeetingResponded` (the id as queued), `CalendarUpdated` +
+  `RemovedFromCalendar` after `Store::delete_event_series` (the row goes only once Graph
+  deleted the event, so the op is no `writes_event_locally`), `AutomaticRepliesUpdated`,
+  `AttachmentSaved`.
+- Refusals: a local one (not a meeting invite, not a cancellation, the user's own meeting, a
+  disallowed proposal, a corrupt RSVP kind) comes back as `Applied::Refused(text)`; the drain
+  drops the op and emits the command's own text. A 4xx, a 404 or a parse failure drops it at
+  the first try with one `Error` (`direct_op_refusal`: `respond to meeting <id>: …`,
+  `remove from calendar <id>: …`, `set automatic replies: …`, `save attachment <aid> of <id>:
+  …`), never quarantined, so no mail reconverge and no calendar reset. A file that cannot be
+  written is the command's `Error`, after the op is dropped. A 5xx keeps the op under
+  `op_retry`; auth, throttle and offline stop the drain as for every op.
+- The ops write nothing on a message: `OutboxOp::message_id()` is `None`, so they protect no
+  row from delta and `discard_local_folder` never drops one.
+- `ComposeReply`/`ComposeForward` stay dropped: Graph builds the draft from the original, so
+  nothing the user wrote is lost, and a draft created at the next start would send a
+  `DraftReady` and open a compose editor the user did not ask for then.
+- Not done: offline is not made durable (a transport error on the direct path is still an
+  `Error`, as before; queuing the three writes then is a follow-up, saves excluded for the
+  head-of-line reason above). A crash before the shutdown still loses a command in flight.
+- Tests: `engine.rs` `tests::shutdown_persists::direct_writes_and_saves_survive_a_shutdown`
+  (and `..._a_dropped_handle`: the five behind the paced burst send nothing; a second engine
+  sends the deletes, then the five in order, writes both files and emits each event),
+  `a_moved_invite_is_answered_on_its_new_id_after_a_restart`,
+  `compose_reply_before_a_shutdown_is_dropped`, the extended
+  `persists_at_shutdown_lists_the_outbox_writes`; `tests::a_refused_direct_op_is_dropped_without_a_reconverge`,
+  `a_5xx_keeps_a_direct_op_queued`, `a_queued_remove_from_calendar_deletes_the_row_after_the_delete`
+  and `..._takes_a_404_as_done`, `remove_from_calendar_while_a_kept_remove_waits_queues_no_delete`; `store` `kept_at_shutdown_ops_round_trip_json_and_name_no_message`;
+  `graph::client` `rsvp_kind_as_status_round_trips`.
 
 ## Backfill one folder next (#2133)
 

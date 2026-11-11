@@ -546,6 +546,47 @@ pub enum OutboxOp {
         dest: String,
         before: String,
     },
+    /// Answer a meeting from its invite message (#2132): a
+    /// `SyncCommand::RespondMeeting` kept at a `Shutdown`, sent by the next
+    /// start. The drain resolves the invite's event (`meeting_event_id`, on
+    /// the message as it is stored now, #1896), checks the stored event's
+    /// `allow_new_time_proposals`, then sends `respond_event`. `kind` is the
+    /// `RespondEvent` vocabulary (`RsvpKind::as_status`); the window is the
+    /// one `rsvp_proposal` approved, in canonical UTC. Nothing local changes.
+    RespondMeeting {
+        message_id: String,
+        kind: String,
+        comment: Option<String>,
+        send_response: bool,
+        proposed_start_utc: Option<String>,
+        proposed_end_utc: Option<String>,
+    },
+    /// Remove a cancelled meeting from the calendar (#2132): a
+    /// `SyncCommand::RemoveFromCalendar` kept at a `Shutdown`. The drain
+    /// reads the cancellation (`meeting_message`), refuses as the command
+    /// does, and DELETEs the event (a 404 is done); only then does the
+    /// engine delete the stored rows. Nothing local changes before.
+    RemoveFromCalendar {
+        message_id: String,
+    },
+    /// Set the mailbox's automatic replies (#2132): a
+    /// `SyncCommand::SetAutomaticReplies` kept at a `Shutdown`. `body` is
+    /// the PATCH body built at command time (`automatic_replies_body`), sent
+    /// as stored. Nothing local changes.
+    SetAutomaticReplies {
+        body: String,
+    },
+    /// Save an attachment to a file (#2132): a `SyncCommand::SaveAttachment`
+    /// (`item` false; `dest` is the file) or `SaveItemAttachment` (`item`
+    /// true; `dest` is the `dest_base`, the extension chosen by sniffing)
+    /// kept at a `Shutdown`. The drain downloads it and the engine writes
+    /// the file. Nothing in the store changes.
+    SaveAttachment {
+        message_id: String,
+        attachment_id: String,
+        dest: String,
+        item: bool,
+    },
 }
 
 impl OutboxOp {
@@ -583,7 +624,13 @@ impl OutboxOp {
             | OutboxOp::DeleteFolder { .. }
             | OutboxOp::EmptyFolder { .. }
             | OutboxOp::CopyFolder { .. }
-            | OutboxOp::MoveFolderMessages { .. } => None,
+            | OutboxOp::MoveFolderMessages { .. }
+            // A message's id, but no write on it (#2132): nothing local for
+            // delta to keep, and no folder of its own to be dropped with.
+            | OutboxOp::RespondMeeting { .. }
+            | OutboxOp::RemoveFromCalendar { .. }
+            | OutboxOp::SetAutomaticReplies { .. }
+            | OutboxOp::SaveAttachment { .. } => None,
         }
     }
 
@@ -621,6 +668,10 @@ impl OutboxOp {
             OutboxOp::EmptyFolder { .. } => "emptyFolder",
             OutboxOp::CopyFolder { .. } => "copyFolder",
             OutboxOp::MoveFolderMessages { .. } => "moveFolderMessages",
+            OutboxOp::RespondMeeting { .. } => "respondMeeting",
+            OutboxOp::RemoveFromCalendar { .. } => "removeFromCalendar",
+            OutboxOp::SetAutomaticReplies { .. } => "setAutomaticReplies",
+            OutboxOp::SaveAttachment { .. } => "saveAttachment",
         }
     }
 
@@ -841,6 +892,45 @@ impl OutboxOp {
                 ),
                 ("comment".to_string(), optional_str(comment)),
             ]),
+            OutboxOp::RespondMeeting {
+                message_id,
+                kind,
+                comment,
+                send_response,
+                proposed_start_utc,
+                proposed_end_utc,
+            } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(message_id.clone())),
+                ("rsvp".to_string(), Value::Str(kind.clone())),
+                ("comment".to_string(), optional_str(comment)),
+                ("sendResponse".to_string(), Value::Bool(*send_response)),
+                (
+                    "proposedStart".to_string(),
+                    optional_str(proposed_start_utc),
+                ),
+                ("proposedEnd".to_string(), optional_str(proposed_end_utc)),
+            ]),
+            OutboxOp::RemoveFromCalendar { message_id } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(message_id.clone())),
+            ]),
+            OutboxOp::SetAutomaticReplies { body } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("body".to_string(), Value::Str(body.clone())),
+            ]),
+            OutboxOp::SaveAttachment {
+                message_id,
+                attachment_id,
+                dest,
+                item,
+            } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(message_id.clone())),
+                ("attachment".to_string(), Value::Str(attachment_id.clone())),
+                ("dest".to_string(), Value::Str(dest.clone())),
+                ("item".to_string(), Value::Bool(*item)),
+            ]),
         }
     }
 
@@ -1003,6 +1093,30 @@ impl OutboxOp {
                 folder: v.get("folder")?.as_str()?.to_string(),
                 dest: v.get("dest")?.as_str()?.to_string(),
                 before: v.get("before")?.as_str()?.to_string(),
+            }),
+            "respondMeeting" => Some(OutboxOp::RespondMeeting {
+                message_id: id()?,
+                kind: v.get("rsvp")?.as_str()?.to_string(),
+                comment: v.get("comment").and_then(Value::as_str).map(str::to_string),
+                send_response: v.get("sendResponse")?.as_bool()?,
+                proposed_start_utc: v
+                    .get("proposedStart")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                proposed_end_utc: v
+                    .get("proposedEnd")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            }),
+            "removeFromCalendar" => Some(OutboxOp::RemoveFromCalendar { message_id: id()? }),
+            "setAutomaticReplies" => Some(OutboxOp::SetAutomaticReplies {
+                body: v.get("body")?.as_str()?.to_string(),
+            }),
+            "saveAttachment" => Some(OutboxOp::SaveAttachment {
+                message_id: id()?,
+                attachment_id: v.get("attachment")?.as_str()?.to_string(),
+                dest: v.get("dest")?.as_str()?.to_string(),
+                item: v.get("item")?.as_bool()?,
             }),
             _ => None,
         }
@@ -4081,6 +4195,16 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Whether the stored event `id` disallows new time proposals
+    /// (`allow_new_time_proposals` false, #2023): what an RSVP from an
+    /// invite checks before it proposes (`SyncCommand::RespondMeeting` and
+    /// its outbox op, #2132). A missing row, or one that cannot be read,
+    /// refuses nothing: Graph has the last word.
+    pub fn refuses_time_proposals(&self, id: &str) -> bool {
+        self.event(id)
+            .is_ok_and(|row| row.is_some_and(|r| !r.allow_new_time_proposals))
     }
 
     /// The stored event `id` (`None` if there is none): what
@@ -11543,6 +11667,70 @@ mod tests {
         s.enqueue_op(&OutboxOp::DeleteContact { id: "G1".into() })
             .unwrap();
         assert!(s.pending_message_ids().unwrap().is_empty());
+    }
+
+    /// The commands kept at a `Shutdown` (#2132): each op reads back as it
+    /// was stored, and none names a message (it writes nothing on one).
+    #[test]
+    fn kept_at_shutdown_ops_round_trip_json_and_name_no_message() {
+        let ops = [
+            OutboxOp::RespondMeeting {
+                message_id: "INV".into(),
+                kind: "declined".into(),
+                comment: Some("Can't make it".into()),
+                send_response: true,
+                proposed_start_utc: Some("2026-11-12T09:00:00Z".into()),
+                proposed_end_utc: Some("2026-11-12T10:00:00Z".into()),
+            },
+            OutboxOp::RespondMeeting {
+                message_id: "INV".into(),
+                kind: "accepted".into(),
+                comment: None,
+                send_response: false,
+                proposed_start_utc: None,
+                proposed_end_utc: None,
+            },
+            OutboxOp::RemoveFromCalendar {
+                message_id: "CAN".into(),
+            },
+            OutboxOp::SetAutomaticReplies {
+                body: r#"{"automaticRepliesSetting":{"status":"disabled"}}"#.into(),
+            },
+            OutboxOp::SaveAttachment {
+                message_id: "M1".into(),
+                attachment_id: "A1".into(),
+                dest: "/tmp/out/report.pdf".into(),
+                item: false,
+            },
+            OutboxOp::SaveAttachment {
+                message_id: "M1".into(),
+                attachment_id: "A2".into(),
+                dest: "/tmp/out/invite".into(),
+                item: true,
+            },
+        ];
+        let s = Store::open_in_memory().unwrap();
+        for op in &ops {
+            let back = OutboxOp::from_json(&json::parse(&op.to_json().to_string()).unwrap());
+            assert_eq!(back.as_ref(), Some(op));
+            assert_eq!(op.message_id(), None, "{op:?}");
+            s.enqueue_op(op).unwrap();
+        }
+        let queued: Vec<OutboxOp> = s.pending_ops().unwrap().into_iter().map(|r| r.op).collect();
+        assert_eq!(queued, ops);
+        assert!(s.pending_message_ids().unwrap().is_empty());
+        // A row missing a field the op needs is corrupt.
+        for corrupt in [
+            r#"{"kind":"respondMeeting","id":"INV","rsvp":"accepted"}"#,
+            r#"{"kind":"saveAttachment","id":"M1","attachment":"A1","dest":"/x"}"#,
+            r#"{"kind":"setAutomaticReplies"}"#,
+        ] {
+            assert_eq!(
+                OutboxOp::from_json(&json::parse(corrupt).unwrap()),
+                None,
+                "{corrupt}"
+            );
+        }
     }
 }
 
