@@ -808,6 +808,10 @@ impl App {
             | SyncEvent::FolderCreated { .. }
             | SyncEvent::FolderWriteFailed { .. }
             | SyncEvent::FolderProgress { .. }
+            // lookxy has no Delete All, so it never moves a folder's mail
+            // (#2126).
+            | SyncEvent::FolderMessagesMoving { .. }
+            | SyncEvent::FolderMessagesMoved { .. }
             // lookxy has no meeting banner yet, so it never asks for a
             // message's meeting type or a Remove from Calendar (#2024).
             | SyncEvent::MeetingMessageFetched { .. }

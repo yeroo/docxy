@@ -115,6 +115,12 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Ap
         OutboxOp::EmptyFolder { .. } => Err(GraphError::Parse(
             "EmptyFolder is run by the engine".to_string(),
         )),
+        // The engine runs it itself (#2126: it pages the folder's ids and
+        // moves them through `$batch`). Should it reach here, nothing is
+        // sent.
+        OutboxOp::MoveFolderMessages { .. } => Err(GraphError::Parse(
+            "MoveFolderMessages is run by the engine".to_string(),
+        )),
         op => apply_other(client, store, op).map(|()| Applied::Done),
     }
 }
@@ -284,7 +290,8 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
         | OutboxOp::CopyFolder { .. }
         | OutboxOp::MarkFolderRead { .. }
         | OutboxOp::DeleteFolder { .. }
-        | OutboxOp::EmptyFolder { .. } => {
+        | OutboxOp::EmptyFolder { .. }
+        | OutboxOp::MoveFolderMessages { .. } => {
             unreachable!("apply_op handles it")
         }
         OutboxOp::RenameFolder { id, name, .. } => match graph_folder(store, id)? {
@@ -933,6 +940,25 @@ mod tests {
                 folder: "F".into(),
                 before: "2026-11-10T18:00:00Z".into(),
                 batch: "empty:1".into(),
+            },
+        );
+        assert!(matches!(r, Err(GraphError::Parse(_))), "{r:?}");
+        assert!(srv.requests().is_empty());
+    }
+
+    /// #2126: the engine runs it; `apply_op` sends nothing.
+    #[test]
+    fn apply_op_move_folder_messages_sends_nothing() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let r = apply_op(
+            &c,
+            &store,
+            &OutboxOp::MoveFolderMessages {
+                folder: "F".into(),
+                dest: "D".into(),
+                before: "2026-11-10T18:00:00Z".into(),
             },
         );
         assert!(matches!(r, Err(GraphError::Parse(_))), "{r:?}");

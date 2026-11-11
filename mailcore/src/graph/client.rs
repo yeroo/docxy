@@ -754,6 +754,15 @@ pub struct BatchResponse {
     pub body: String,
 }
 
+/// The id of the moved message in a move answer's body (#2126: a
+/// [`GraphClient::move_message_request`] sub-response): its `id` alone,
+/// `None` when the body is not JSON or has no non-empty `id`.
+pub fn moved_message_id(body: &str) -> Option<String> {
+    let v = crate::json::parse(body).ok()?;
+    let id = v.get("id")?.as_str()?;
+    (!id.is_empty()).then(|| id.to_string())
+}
+
 enum Method {
     Get,
     Patch,
@@ -1493,6 +1502,22 @@ impl GraphClient {
             url: format!("/me/messages/{}", encode_path_segment(id)),
             headers: Vec::new(),
             body: None,
+        }
+    }
+
+    /// POST `/me/messages/{id}/move` with `{"destinationId": dest}` as a
+    /// [`GraphClient::batch`] sub-request (#2126), the id percent-encoded:
+    /// the move `move_message` sends. Graph answers 201 with the moved
+    /// message, under a new id ([`moved_message_id`]).
+    pub fn move_message_request(id: &str, dest: &str) -> BatchRequest {
+        BatchRequest {
+            method: "POST",
+            url: format!("/me/messages/{}/move", encode_path_segment(id)),
+            headers: Vec::new(),
+            body: Some(Value::Object(vec![(
+                "destinationId".to_string(),
+                Value::Str(dest.to_string()),
+            )])),
         }
     }
 
@@ -4226,6 +4251,33 @@ mod tests {
         assert_eq!(r.method, "DELETE");
         assert_eq!(r.url, "/me/messages/A%2FB");
         assert!(r.headers.is_empty() && r.body.is_none());
+    }
+
+    /// #2126: a move sub-request names the dest in its body, the id
+    /// percent-encoded in its URL.
+    #[test]
+    fn move_message_request_posts_destination_id() {
+        let r = GraphClient::move_message_request("A/B", "DELETED");
+        assert_eq!(r.method, "POST");
+        assert_eq!(r.url, "/me/messages/A%2FB/move");
+        assert!(r.headers.is_empty());
+        assert_eq!(
+            r.body.map(|b| b.to_string()).as_deref(),
+            Some(r#"{"destinationId":"DELETED"}"#)
+        );
+    }
+
+    /// #2126: the moved id is the answer's `id` alone; none, an empty one
+    /// or a body that is not JSON is `None`.
+    #[test]
+    fn moved_id_reads_a_move_answer() {
+        assert_eq!(
+            moved_message_id(r#"{"id":"NEW","subject":"s","parentFolderId":"D"}"#).as_deref(),
+            Some("NEW")
+        );
+        assert_eq!(moved_message_id(r#"{"subject":"s"}"#), None);
+        assert_eq!(moved_message_id(r#"{"id":""}"#), None);
+        assert_eq!(moved_message_id(""), None);
     }
 
     #[test]
