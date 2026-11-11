@@ -51,6 +51,17 @@ macro_rules! current_id_sql {
     };
 }
 
+/// SQL for now as a folder's sync time (#2125, `folders.synced_at`):
+/// SQLite's clock in the store's one UTC format, `YYYY-MM-DDTHH:MM:SSZ`
+/// (what `iso8601_to_unix_secs` reads). Spelled once, for the three
+/// statements that store a folder's link (`set_delta_link`,
+/// `set_head_link`, `complete_backfill`).
+macro_rules! synced_now {
+    () => {
+        "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"
+    };
+}
+
 /// The rows the size fill may ask Graph about (#2123): no size, never
 /// asked, with a `received_at` (the listing's filter starts at the oldest)
 /// and a Graph id. A `local:` row and a header-less one would stay unsized
@@ -2307,18 +2318,6 @@ impl Store {
             .optional()?)
     }
 
-    /// Records that a sync round on `folder_id` completed against Graph
-    /// now (#2125, [`FolderStats::synced_at`]): SQLite's clock, in the
-    /// store's `YYYY-MM-DDTHH:MM:SSZ`. An unknown id writes nothing.
-    pub fn mark_folder_synced(&self, folder_id: &str) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE folders SET synced_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-             WHERE id = ?1",
-            params![folder_id],
-        )?;
-        Ok(())
-    }
-
     /// The folders holding a row the engine's size fill may ask Graph
     /// about (#2123, [`unsized_where!`]), in `Store::folders` order: a
     /// Graph folder (not `local:`, not the local Drafts sentinel). Reads
@@ -2824,10 +2823,16 @@ impl Store {
         Ok(flag)
     }
 
-    /// Stores the delta link for a folder (used to resume delta sync).
+    /// Stores the delta link for a folder (used to resume delta sync),
+    /// and marks it synced now (#2125, [`FolderStats::synced_at`], in the
+    /// same statement): a link is stored once its round completed.
     pub fn set_delta_link(&self, folder_id: &str, link: &str) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE folders SET delta_link = ?1 WHERE id = ?2",
+            concat!(
+                "UPDATE folders SET delta_link = ?1, synced_at = ",
+                synced_now!(),
+                " WHERE id = ?2"
+            ),
             params![link, folder_id],
         )?;
         Ok(())
@@ -2889,7 +2894,8 @@ impl Store {
     /// the sync pass), marking what it covers as [`SCOPE_HEAD`], and
     /// whether its walk's first call was refused the reminder `$expand`
     /// (#2054, `refused`): in the same statement, so no reader (and no
-    /// crash) ever sees the new link with the old link's mark.
+    /// crash) ever sees the new link with the old link's mark. The same
+    /// statement marks the folder synced now (#2125).
     pub fn set_head_link(
         &self,
         folder_id: &str,
@@ -2897,9 +2903,12 @@ impl Store {
         refused: bool,
     ) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE folders SET delta_link = ?2, history_scope = ?3,
-                                reminder_expand_refused = ?4
-             WHERE id = ?1",
+            concat!(
+                "UPDATE folders SET delta_link = ?2, history_scope = ?3,
+                                    reminder_expand_refused = ?4, synced_at = ",
+                synced_now!(),
+                " WHERE id = ?1"
+            ),
             params![folder_id, link, SCOPE_HEAD, refused],
         )?;
         Ok(())
@@ -2934,7 +2943,8 @@ impl Store {
     /// refused-reminder-expand mark (#2054) goes with the link, in the same
     /// statement: `refused` when the caller knows it (`Some`: a small
     /// folder walked whole in the sync pass), else the walk's own record
-    /// (`None`: `backfill_expand_refused`, a backfill that ends).
+    /// (`None`: `backfill_expand_refused`, a backfill that ends). The same
+    /// statement marks the folder synced now (#2125): the walk completed.
     pub fn complete_backfill(
         &self,
         folder_id: &str,
@@ -2944,12 +2954,15 @@ impl Store {
         refused: Option<bool>,
     ) -> Result<(), StoreError> {
         self.conn.execute(
-            "UPDATE folders SET delta_link = ?2, history_scope = ?3,
-                                backfill_link = NULL, backfill_synced = ?4,
-                                backfill_scope = NULL,
-                                reminder_expand_refused = COALESCE(?5, backfill_expand_refused),
-                                backfill_expand_refused = 0
-             WHERE id = ?1",
+            concat!(
+                "UPDATE folders SET delta_link = ?2, history_scope = ?3,
+                                    backfill_link = NULL, backfill_synced = ?4,
+                                    backfill_scope = NULL,
+                                    reminder_expand_refused = COALESCE(?5, backfill_expand_refused),
+                                    backfill_expand_refused = 0, synced_at = ",
+                synced_now!(),
+                " WHERE id = ?1"
+            ),
             params![folder_id, delta_link, scope, synced, refused],
         )?;
         Ok(())
@@ -25599,8 +25612,8 @@ mod folder_stats_tests {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1");
         assert_eq!(s.folder_stats("NOPE").unwrap(), None);
-        // Marking an unknown folder writes nothing and is no error.
-        s.mark_folder_synced("NOPE").unwrap();
+        // A link stored for an unknown folder writes nothing, no error.
+        s.set_delta_link("NOPE", "LINK").unwrap();
         assert_eq!(s.folder_stats("NOPE").unwrap(), None);
     }
 
@@ -25651,22 +25664,52 @@ mod folder_stats_tests {
         assert_eq!((stats(&s, "F1").stored, stats(&s, "F2").stored), (1, 1));
     }
 
-    #[test]
-    fn mark_folder_synced_sets_a_utc_time_and_moves_it_later() {
+    /// Each statement that stores a folder's link marks it synced now, in
+    /// the store's one UTC format, and only that folder.
+    fn assert_marks(store_link: impl Fn(&Store, &str)) {
         let s = Store::open_in_memory().unwrap();
         folder(&s, "F1");
         folder(&s, "F2");
-        s.mark_folder_synced("F1").unwrap();
+        store_link(&s, "F1");
         let first = stats(&s, "F1").synced_at.unwrap();
         // The store's one UTC format, which its own parser reads.
         assert!(iso8601_to_unix_secs(&first).is_some(), "{first}");
         backdate(&s, "F1");
-        s.mark_folder_synced("F1").unwrap();
+        store_link(&s, "F1");
         let t = stats(&s, "F1").synced_at.unwrap();
         assert!(t.as_str() > OLD, "{t}");
         assert!(iso8601_to_unix_secs(&t).is_some(), "{t}");
-        // Only the folder named.
         assert_eq!(stats(&s, "F2").synced_at, None);
+    }
+
+    #[test]
+    fn set_delta_link_marks_the_folder_synced() {
+        assert_marks(|s, id| s.set_delta_link(id, "LINK").unwrap());
+    }
+
+    #[test]
+    fn set_head_link_marks_the_folder_synced() {
+        assert_marks(|s, id| s.set_head_link(id, "HEAD", false).unwrap());
+    }
+
+    #[test]
+    fn complete_backfill_marks_the_folder_synced() {
+        assert_marks(|s, id| s.complete_backfill(id, "FULL", SCOPE_ALL, 3, None).unwrap());
+    }
+
+    /// The other link and backfill writes keep the time: a page is not a
+    /// round, and a reset or an expiry stores no link.
+    #[test]
+    fn other_link_writes_keep_the_sync_time() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1");
+        s.set_delta_link("F1", "LINK").unwrap();
+        backdate(&s, "F1");
+        s.set_backfill_progress("F1", "NEXT", 2, SCOPE_ALL).unwrap();
+        s.reset_backfill("F1").unwrap();
+        s.expire_delta_link("F1").unwrap();
+        s.clear_delta_links().unwrap();
+        assert_eq!(stats(&s, "F1").synced_at.as_deref(), Some(OLD));
     }
 
     #[test]
@@ -25771,7 +25814,7 @@ mod folder_stats_tests {
         // Nothing else is reset.
         assert_eq!(s.get_delta_link("F1").unwrap().as_deref(), Some("LINK"));
         assert!(!migrate_folder_synced_at(&s.conn).unwrap());
-        s.mark_folder_synced("F1").unwrap();
+        s.set_delta_link("F1", "LINK").unwrap();
         drop(s);
         // Opening again (the column there) keeps the time.
         let s = Store::open(&path).unwrap();

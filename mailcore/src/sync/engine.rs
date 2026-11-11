@@ -3653,8 +3653,8 @@ impl Engine {
                     )));
                     return true;
                 }
-                // The re-run marks the folder synced when it completes
-                // (#2125); this round did not.
+                // This round stored no link, so it did not mark the
+                // folder synced (#2125); the re-run does when it stores one.
                 return self.sync_folder_delta_once(folder_id, false);
             }
             // `react` returns true when the pass must abort; a non-fatal
@@ -3670,13 +3670,13 @@ impl Engine {
             });
             return false;
         }
-        // The round is complete once its deltaLink is kept (#2125): only
-        // then is the folder marked synced. A failed mark is not reported
-        // (a display figure), like a failed link write.
-        let mut stored_link = false;
+        // Each link write below marks the folder synced in its own
+        // statement (#2125, `synced_at`): the round is complete once its
+        // deltaLink is kept, and no other write sits before
+        // `MessagesUpdated`.
         if let Some(delta) = run.delta_link {
             if !started_fresh {
-                stored_link = self.store.set_delta_link(folder_id, &delta).is_ok();
+                let _ = self.store.set_delta_link(folder_id, &delta);
             } else if small {
                 let scope = if cutoff.is_some() {
                     SCOPE_WINDOW
@@ -3697,18 +3697,13 @@ impl Engine {
                     )
                     .is_ok()
                 {
-                    stored_link = true;
                     self.emit_progress(folder_id, run.walked, true);
                 }
             } else {
-                stored_link = self
+                let _ = self
                     .store
-                    .set_head_link(folder_id, &delta, run.expand_refused)
-                    .is_ok();
+                    .set_head_link(folder_id, &delta, run.expand_refused);
             }
-        }
-        if stored_link {
-            let _ = self.store.mark_folder_synced(folder_id);
         }
         self.emit(SyncEvent::MessagesUpdated {
             folder_id: folder_id.to_string(),
@@ -4398,11 +4393,6 @@ impl Engine {
             self.park_on_store_error(&id, e);
             return;
         }
-        // The walk completed (#2125): its deltaLink is now the folder's
-        // sync point, whether the last round on the folder's own link ran,
-        // ended without a link or was skipped as expired. A failed mark is
-        // not reported (a display figure).
-        let _ = self.store.mark_folder_synced(&id);
         self.emit(SyncEvent::MessagesUpdated {
             folder_id: id.clone(),
         });
@@ -31136,10 +31126,11 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// The walk's completion marks the folder synced. The sync pass's
-        /// round on the head link gets a last page with no deltaLink, which
-        /// is not a complete round and marks nothing, so the only round
-        /// that completes is the walk's last one on the folder's own link.
+        /// The walk's completion marks the folder synced
+        /// (`complete_backfill`). Both rounds on the head link, the sync
+        /// pass's and the walk's last one, get a last page with no
+        /// deltaLink: neither stores a link, so neither marks, and only the
+        /// completion can.
         #[test]
         fn backfill_completion_sets_the_sync_time() {
             const OLD: &str = "2000-01-01T00:00:00Z";
@@ -31148,7 +31139,7 @@ mod tests {
                     pages: pages_of("F1", 3),
                     ..inbox()
                 }],
-                vec![(route(&head_link("F1"), 200, r#"{"value":[]}"#), Some(1))],
+                vec![(route(&head_link("F1"), 200, r#"{"value":[]}"#), Some(2))],
                 Duration::ZERO,
             ));
             let dir = new_dir("bf-synced-complete");
@@ -31160,7 +31151,7 @@ mod tests {
             let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
             until_complete(&handle, "F1");
             stop(handle);
-            // The pass's round (no deltaLink) and the walk's last round.
+            // The pass's round and the walk's last round, both linkless.
             assert_eq!(count(&srv, |p| p == head_link("F1")), 2);
             assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_ALL));
             let t = synced_at(&dir, "F1").unwrap();

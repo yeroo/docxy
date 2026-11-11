@@ -4163,24 +4163,34 @@ literally would break.
   is `COUNT(*)` of the rows filed in the folder (local drafts included, subfolders not), read
   through `idx_messages_folder_received` (a test checks the plan). It reads by the stored id,
   like `folders()`: no re-key resolution.
-- `folders.synced_at TEXT`, NULL = never synced. `Store::mark_folder_synced` writes SQLite's
-  `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`: the store's one UTC format, which
+- `folders.synced_at TEXT`, NULL = never synced. It holds SQLite's
+  `strftime('%Y-%m-%dT%H:%M:%SZ', 'now')` (`synced_now!`): the store's one UTC format, which
   `iso8601_to_unix_secs` reads (no milliseconds: it would reject them). There is no Rust clock.
   `migrate_folder_synced_at` (last in `Store::init`, after `migrate_message_size`) adds the
   column in one IMMEDIATE transaction and resets nothing.
-- When a folder is marked synced: a round that completes against Graph, with or without changes.
-  - `sync_folder_delta_once`, once the round's deltaLink is kept (`stored_link`): by
-    `set_delta_link` (a round on the stored link), `complete_backfill` (a small folder walked
-    whole) or `set_head_link` (a head).
-  - `backfill_step`, after `complete_backfill` (the walk and its last round on the folder's own
-    link are done).
-  - Not marked by `sync_folder_delta_once`: a failed round (`react`), a checkpoint stop, a last
-    page with no deltaLink, a failed link write, a folder being emptied, an expired link (the
-    phase-1 re-run marks when it completes). Not marked by `backfill_step`: an intermediate
-    page, or a final step whose own-link round failed or stopped. A completed walk marks
-    whatever its last own-link round did (ran, ended without a link, or was skipped as
-    expired), as the walk's deltaLink becomes the folder's sync point.
-  - A failed mark is not reported: it is a display figure. No `SyncEvent`: a host reads
+- Where it is written: in the statement that stores the folder's link, so the time never lags
+  its link and costs no extra write. The PR owner chose this over a separate mark call.
+  - The three statements: `set_delta_link`, `set_head_link` and `complete_backfill`.
+  - Every production caller is a round that completed against Graph, with or without changes:
+    - `sync_folder_delta_once`'s three branches: a round on the stored link, a head, and a
+      small folder walked whole;
+    - `backfill_step`'s last round on the folder's own link (`set_delta_link`);
+    - `backfill_step`'s completion (`complete_backfill`).
+  - The first version wrote it with a second `UPDATE` between the link write and
+    `MessagesUpdated`. On a slow Windows runner, that widened the window in which
+    `meeting_message_types` tests (they wait for `get_delta_link`, drain, then expect events
+    exactly) saw an extra `MessagesUpdated` (#2147).
+  - Not marked, as no link is stored:
+    - a failed round (`react`), a checkpoint stop, a last page with no deltaLink;
+    - a failed link write (by construction);
+    - a folder being emptied;
+    - an expired link (the phase-1 re-run marks when it stores one);
+    - an intermediate backfill page (`set_backfill_progress`), `reset_backfill`,
+      `expire_delta_link`, `clear_delta_links`.
+  - A completed walk marks through `complete_backfill`, whatever its last own-link round did
+    (ran, ended without a link, or was skipped as expired): the walk's deltaLink becomes the
+    folder's sync point.
+  - A failed link write is not reported, as before. There is no `SyncEvent`: a host reads
     `folder_stats` when its dialog opens.
 - What keeps the time and what clears it:
   - `upsert_folder` never writes it.
@@ -4190,15 +4200,24 @@ literally would break.
   - `clear_delta_links` (reconverge) and `finish_folder_empty` (#2110) keep it.
   - `rekey_folder_on` renames the `local:` row, so a re-keyed folder carries the local row's
     time (NULL) until its next round.
-- Tests: `store/mod.rs` `folder_stats_tests` (unknown id, never synced and counts, a local
-  draft, a local move and delete, the format and a later mark, `upsert_folder` keeps it, the
-  query plan, Clear Offline Items forgets it, `finish_folder_empty` keeps it, the migration).
-  Engine, the store seeded before spawn and written again only while the engine is idle:
+- Tests: `store/mod.rs` `folder_stats_tests`:
+  - unknown id, never synced and counts, a local draft, a local move and delete;
+  - each link statement marks (`set_delta_link_` / `set_head_link_` /
+    `complete_backfill_marks_the_folder_synced`: the format, a later mark, only that folder);
+  - `other_link_writes_keep_the_sync_time`, `upsert_folder` keeps it;
+  - the query plan;
+  - Clear Offline Items forgets it, `finish_folder_empty` keeps it;
+  - the migration.
+
+  Each statement without its `synced_at` fails its store test and an engine test. Engine tests
+  seed the store before spawn and open `Store` only after `stop` (#2146's CI: a `Store::open`
+  polled during startup met the engine's lock). The link test's mid-run check, made while
+  the engine is idle, is one statement on a raw connection:
   - `tests::folder_stats`: `a_round_without_changes_sets_the_sync_time` (the link branch, then
     a `SyncFolder`), `a_failed_round_keeps_the_sync_time` (500),
     `a_folder_whose_delta_never_succeeded_reads_none`,
     `a_small_folders_full_delta_sets_the_sync_time` (`stored` = the rows brought).
   - `tests::backfill`: `a_head_sets_the_sync_time_before_the_backfill_ends` (the walk's first
-    call always 500), `backfill_completion_sets_the_sync_time`. In that test the pass's round
-    on the head link gets a page with no deltaLink and marks nothing, so only the walk's
-    completion can mark.
+    call always 500), `backfill_completion_sets_the_sync_time`. In that test both rounds on
+    the head link (the pass's and the walk's last) get a page with no deltaLink and store
+    nothing, so only `complete_backfill` can mark.
