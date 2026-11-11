@@ -396,8 +396,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   reports nothing. All of them follow the command's `Sending` (a retry from
   a later drain emits no new one) and precede `Sent`/`SendFailed`. The
   engine sends them from a clone of `evt_tx` inside `apply_op_with_retry`'s
-  closure (it must not borrow `self` across `try_refresh`). lookxy ignores
-  the event: its composer closes on Send.
+  closure (it must not borrow `self` across `try_refresh`). lookxy's
+  composer closes on Send, so it shows the event on its status bar (#2117).
 - `GraphClient::upload_attachment` (`pub(crate)`, as is `UploadObserver`)
   reports to the observer: `session(Some(url))` when a session opens,
   `session(None)` when it is no good any more, `progress(sent, total)`.
@@ -543,7 +543,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   clamps. `Store::folder_history`/`folder_histories` hold the same
   persisted state (`folders.backfill_link`, `backfill_synced`,
   `history_scope`, `backfill_scope`, migrated in `Store::init`; `upsert_folder` never writes
-  them) for a UI's first draw. lookxy ignores the event.
+  them) for a UI's first draw; `FolderHistory::is_complete(whole_mailbox)`
+  is the engine's own completeness rule for a host (#2117). lookxy shows
+  the event on its status bar (#2117).
 - **Reconverge.** `clear_delta_links` also clears the backfill link, count
   and scope, so every folder runs both phases again. `reconverge_pending`
   turns off phase 2's window cutoff (its pages merge as always, to
@@ -1892,8 +1894,8 @@ so the user's other devices follow.
   quarantine, as a quarantine's mail reconverge re-enumerates the whole mailbox for an
   op that wrote nothing. A 5xx keeps the outbox back-off; 401, throttle (429, 503) and
   transport keep their central handling.
-- Not done: host UI (lookxy's Esc on the reminder banner only pops it; there is no
-  snooze, and the suite has no Mail reminders), and `GET /me/reminderView`, without
+- Not done: a snooze key in lookxy (its Esc on the reminder banner sends
+  `DismissReminder` since #2117), Mail reminders in the suite, and `GET /me/reminderView`, without
   which a snooze made on another device does not move this device's reminder.
 - Tests: `client.rs` `dismiss_reminder_posts_no_body`, `snooze_reminder_posts_new_time`,
   `reminder_ids_are_percent_encoded`, `dismiss_reminder_refused_is_an_error`; `store`
@@ -4221,3 +4223,37 @@ literally would break.
     call always 500), `backfill_completion_sets_the_sync_time`. In that test both rounds on
     the head link (the pass's and the walk's last) get a page with no deltaLink and store
     nothing, so only `complete_backfill` can mark.
+
+## lookxy status bar: progress, one line, reminder dismiss (#2117)
+
+- One row (`lookxy/src/ui/status_bar.rs` `status_line`): account — state — folder (or
+  `Calendar`) — counts, then either the error (red: `error_notice`, else `send_failure`) or,
+  dark gray, in order: the upload, the backfill walk, `This folder is up to date`, the
+  attachment notice. The whole line goes through `one_line` (every control or whitespace
+  character a space, runs collapsed, ends trimmed) and `fit_line` (display columns: cut to
+  `width - 1` plus `…`), so a multi-line or long Graph/Auth/Parse error never breaks it
+  (#1959). An error that does not fit drops the counts first, then is cut.
+- Upload (#1941 events): `App::upload_progress` from `AttachmentProgress`, as `Uploading
+  <name>: <sent>/<total>` (`human_bytes`, base 1024); the latest wins, so a session fallback
+  shows the lower value. That draft's `Sent`/`SendFailed` clears it, another draft's does
+  not; so does `State(Offline | SignInRequired | Idle)` (the upload runs inside the drain's
+  `PendingOps`, and states are emitted only on a change). A 5xx back-off stays in
+  `PendingOps` and may leave the line until the next drain.
+- Backfill (#1871 events): `App::backfill` is the last incomplete `FolderProgress` (one walk
+  at a time), `Updating <folder>… <synced> of <total>` with `synced` clamped, no `of` when
+  `total` is `None` (window mode, lookxy's default) or negative, and `mail` for a folder not
+  in `app.folders` (never the Graph id). `App::folders_up_to_date` gets a folder on its
+  `complete: true` and loses it on a later incomplete event. Since the engine walks only
+  incomplete folders, a folder synced in an earlier run gets no event: `reload_folders`
+  re-seeds the set from `Store::folder_histories` with `FolderHistory::is_complete`
+  (`App::whole_mailbox`, `backfill_days <= 0`), leaving out the folder being walked. `App::new`
+  seeds before `main` sets `whole_mailbox`, so `main` seeds again after it.
+- Reminders (#2025's command): `reminder_queue` holds `ReminderBanner { event_id, text }`;
+  Esc (`dismiss_reminder`) pops it and sends `DismissReminder` with the agenda row's id (an
+  occurrence's for a series), except for a `local:` id, which mailcore would refuse. No
+  snooze key, no `reminderView`.
+- Tests: `ui::status_bar::tests` `plan_lookxy_progress_*`, `plan_ui_folder_progress_*` (the
+  line, up to date, seeded from the store in both modes), `plan_host_status_line_*` (one
+  line, `…`, counts dropped first) and the helpers; `app::tests`
+  `plan_ui_dismiss_reminder_*`; `ui::tests::esc_dismisses_reminder_banner`; `store`
+  `folder_history_is_complete_needs_a_delta_link_and_the_mode_s_scope`.

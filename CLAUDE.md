@@ -159,6 +159,8 @@ issue number to find its notes.
   a folder's backfill walk run next on request, remembered (#2133),
   one folder's offline items cleared locally and synced again (#2124),
   a folder's last sync time and stored message count (#2125),
+  lookxy's status bar: upload and backfill progress, one line cut to fit, and Esc on a
+  reminder dismissing it on the server (#2117),
   OAuth tokens in the platform secret store, a plaintext fallback and its
   warning (#1877), contact search folded in Rust, word-prefix rank, `all_contacts`
   (#1890), a sign-out's back-off, an expired delta link re-running phase 1, a 404
