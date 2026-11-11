@@ -18613,6 +18613,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #2113 (#2038 plan-del404): a DELETE answered 404 (a retry after a
+    /// lost 204, or an event removed elsewhere) is done: the op goes at the
+    /// first answer, with no `Error`, no quarantine (no mail reconverge)
+    /// and no calendar reset, and the row stays gone.
+    #[test]
+    fn plan_del404_delete_event_404_is_dropped_as_done() {
+        let (from, to) = today_window();
+        // The view holds E1, so a calendar reset's initial round would
+        // bring the row back: none may run.
+        let mut routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[event_from_now("E1", 3600)]))],
+        );
+        routes.insert(
+            0,
+            Route {
+                method: "DELETE".into(),
+                path_prefix: "/me/events/E1".into(),
+                status: 404,
+                headers: vec![],
+                body: r#"{"error":{"code":"ErrorItemNotFound"}}"#.into(),
+            },
+        );
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("delete-event-404", routes, |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![stored_event("E1", "CAL-A", 3600)],
+                    (&from, &to),
+                    &delta_link_of("CAL-A"),
+                );
+            });
+        Store::open(&store_path)
+            .unwrap()
+            .delete_event("E1")
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::DeleteEvent { id: "E1".into() })
+            .unwrap();
+        // Commands run in order: this one's `Error` comes after the
+        // delete's drain is done.
+        fetch_range(&handle, "bad", "bad");
+        let seen = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let errors: Vec<&String> = seen
+            .iter()
+            .filter_map(|e| match e {
+                SyncEvent::Error(m) if !m.starts_with("fetch calendar range") => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.pending_ops().unwrap().is_empty(), "the op is done");
+        assert!(!store.reconverge_pending().unwrap(), "no quarantine");
+        let deletes = srv
+            .requests()
+            .iter()
+            .filter(|r| r.method == "DELETE")
+            .count();
+        assert_eq!(deletes, 1, "not retried");
+        assert!(
+            view_paths(&srv, "CAL-A")
+                .iter()
+                .all(|p| *p == delta_link_of("CAL-A")),
+            "no calendar reset: {:?}",
+            view_paths(&srv, "CAL-A")
+        );
+        assert!(ids_in(&store, "CAL-A").is_empty(), "the row stays gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- Calendar ranges on demand (#2014) ---
 
     /// A query parameter's value in a recorded request path.
