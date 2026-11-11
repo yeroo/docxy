@@ -4256,7 +4256,12 @@ mod tests {
     fn plan_1_a_reconciled_local_id_is_sent_under_its_graph_id() {
         let srv = FakeServer::start(vec![
             route("PATCH", "/me/messages/", 200, "{}"),
-            route("POST", "/me/messages/GRAPH-9/move", 201, r#"{"id":"MOVED-9"}"#),
+            route(
+                "POST",
+                "/me/messages/GRAPH-9/move",
+                201,
+                r#"{"id":"MOVED-9"}"#,
+            ),
         ]);
         let c = GraphClient::new(&srv.base_url, "AT");
         let store = Store::open_in_memory().unwrap();
