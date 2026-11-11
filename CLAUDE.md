@@ -149,6 +149,8 @@ issue number to find its notes.
   a whole folder marked read on the server through `$batch` (#1913),
   a folder emptied on the server through `$batch`, unsent mail kept, FTS rows in bulk (#2110),
   a folder copied with its contents through the outbox, synced after (#2118),
+  every message of a folder moved on the server through `$batch` (Delete All), rows
+  following Graph's answers, unsent mail kept, a dropped move reported (#2126),
   message sizes, the size fill, folder sizes on the server (#2123),
   shutdown persists the writes queued before it, without draining (#2127),
   OAuth tokens in the platform secret store, a plaintext fallback and its

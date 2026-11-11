@@ -3666,6 +3666,112 @@ A host can draw classic Outlook's Folder Size dialog. The Local Data tab comes f
     error fails it (auth, throttle and transport also through `react_quietly`). There is no
     retry loop and no sleep on the engine thread.
 
+## Move a folder's mail (#2126)
+
+- `SyncCommand::MoveFolderMessages { folder, dest }` moves every message of a folder to `dest` on
+  the server, not only the stored ones: a host's Delete All, with `dest` its Deleted Items. A
+  `Move` per stored message left the mail the store never synced (older than the head window,
+  not backfilled yet, past `backfill_days`) in the folder on Graph, and its counts with it. It
+  is #2110's sibling (`bulk_batches`, `BulkKind::Move`) without #2107's allow-list: a move
+  destroys nothing. The folder-wide mark-read the issue also asked for is #1913's
+  `MarkFolderRead`.
+- Store (`Store::queue_folder_messages_move(folder, dest, now_utc)`, one IMMEDIATE
+  transaction): both ids resolved through `folder_aliases`. Refused, with nothing queued
+  (`FolderWriteFailed { write: MoveMail, status: None }` + `Error`, then the final event): an
+  unknown folder or dest, the drafts sentinel as either, the folder as its own dest
+  (`FolderRefusal::SameFolder`, also through an alias). Then
+  `OutboxOp::MoveFolderMessages { folder, dest, before }` (kind `moveFolderMessages`) is queued,
+  `before` being `folder_cutoff_on`'s cutoff. **No stored row moves at the command**: each
+  follows Graph's answer, so a partial or refused run needs no revert. Every command queues its
+  own op.
+- The drain (`run_move_folder_messages`, never `apply_op`, which answers it `Parse`) waits until
+  no older op is queued (`has_older_op`, as an `EmptyFolder`), so a move into or out of the
+  folder queued before it lands first. Both ids are resolved at run time. A folder still `local:`
+  has nothing on Graph: the op goes and the run ends `Ok` with nothing moved. A dest still
+  `local:` (its create was refused, `discard_local_folder`) refuses the run: "its destination
+  folder could not be created". The first step pages every id
+  (`folder_messages_before`), all before the first move, and leaves out the unsent ones
+  (`Store::unsent_listed`). Then 20 a `$batch`
+  (`GraphClient::move_message_request`: `POST /me/messages/{id}/move`,
+  `{"destinationId": dest}`).
+- Unsent mail: a listed id is unsent when it (resolved through `current_id`) has an unpushed edit
+  (`local_edit > 0`) or a queued `SaveDraft`/`SendDraft` names it, **wherever the store files
+  it** (`queued_draft_ids_on`, shared with `unsent_mail_in_on`). A queued send re-files its
+  draft in Sent Items at the command while Graph still has it in Drafts, so a check limited to
+  rows stored in the folder would move it from under its send. Each batch checks its ids again:
+  a send queued during the run is served after the drain, when its draft is already among the
+  run's ids. Unsent mail stays where it is, uncounted (`total` shrinks). Every other message
+  Graph lists moves, drafts included. A host that wants other drafts kept sends per-message
+  `Move`s instead; there is no exclude list.
+- Each answer (`MoveFollow`): a 2xx whose body has an `id` (`graph::client::moved_message_id`,
+  the `id` alone) is followed by `Store::follow_folder_move(old, new, dest, protected)`, one
+  transaction: the row filed under `dest`, then `follow_move_on` (the body of `follow_move`,
+  shared: re-keyed, children and aliases following, a stored `new` kept). The row is only
+  re-keyed, not filed, when a queued op names it (`pending_message_ids`, read once a batch: a
+  `Move` made after the command takes it on from the new id) or `dest` is no longer stored (the
+  folder foreign key). A 2xx with no id, or a 404, deletes the stored row: the next delta of
+  wherever Graph has it brings it back. 429/503, other 5xx and other statuses are #1913's.
+- Events: once listed, `FolderMessagesMoving { folder, dest, moved: 0, failed: 0, total }`; after
+  each batch Graph answered (also one a throttle then stops), `MessageMoved` for each stored row
+  re-keyed (none for mail the store never held: a host would reload its list per id), then
+  `MessagesUpdated` for each folder a row left or reached (sorted), then the progress. `moved`
+  counts 2xx and 404, `failed` the refused; a throttled or 5xx id counts once answered, so a done
+  run has `moved + failed == total`. Exactly one `FolderMessagesMoved { folder, dest, moved,
+  failed, total, result }` per command ends it, with `result: Result<(), FolderMoveError>`:
+  `Refused { status, error }` (the store, a folder deleted while queued, or Graph refusing the
+  listing or a batch as a whole) or `Partial { failed, status, error }` (the first refusal's).
+  Every `Err` is also `FolderWriteFailed { write: MoveMail }` + `Error("move the mail of folder
+  {id}: …")`, sent before it; a partial run's error is `"{n} of {total} messages could not be
+  moved: {first error}"`.
+- The end (`finish_move_folder_messages`, and `refuse_move_folder_messages` once Graph saw the
+  run): the op goes, then both folders' counts are read from Graph (`read_folder_counts`, now
+  `refresh_folder`'s count half: a `local:` folder and one a queued `EmptyFolder` names are not
+  read, a queued `MarkFolderRead` keeps its unread count), the dest's skipped when the first
+  read had to stop, then the final event. A count read that fails goes through `react`; the
+  move is done all the same.
+- A folder delete (`drop_folder_ops_on`) drops a queued move into a removed folder, or of a
+  removed `local:` folder, and returns it (`FolderDelete::dropped_moves`). The engine reports
+  each ("its destination folder was deleted" / "its folder was deleted"), with the counts of the
+  run it stopped if it was running. A delete of a folder Graph has keeps its move: the
+  `DeleteFolder` waits behind it, so the mail reaches the dest (Deleted Items) before the folder
+  goes, and the walk then finds it empty. Dropping it would send the mail to Recoverable Items
+  with the folder.
+- No guard on sync passes while the op is queued: the source's `@removed` of a re-keyed old id
+  deletes nothing (`delete_message` does not follow aliases), its pre-move copy is skipped
+  (`is_moved_alias`), and the dest's upsert of a new id merges into the re-keyed row.
+- Known shapes: a restart loses the run, and the op lists again, which is safe (moved mail is no
+  longer listed); `total` and `moved` then count what was left. That re-listing, like the
+  cutoff, also takes mail moved into the folder since the command with an older
+  `receivedDateTime` (a rule, another client): a move to Deleted Items can be undone, so there is
+  no guard. A long run holds every op queued behind it, as #1913's does. The move answer is the
+  whole message, so 20 a batch can be large; `$select` on the action is not relied on. Out of
+  scope: an exclude list, subfolders' mail, `permanentDelete`, and a lookxy UI (lookxy ignores
+  both events).
+- Tests: store `move_folder_messages_tests` (`move_folder_messages_op_round_trips_json`,
+  `queue_folder_messages_move_refuses_unknown_sentinel_and_same_folder`,
+  `queue_folder_messages_move_cutoff_is_the_later_of_now_and_the_newest_row`,
+  `queue_folder_messages_move_changes_no_row`, `follow_folder_move_files_and_rekeys`,
+  `follow_folder_move_merges_into_a_moved_copy_already_stored`,
+  `follow_folder_move_of_a_protected_row_only_rekeys`,
+  `follow_folder_move_into_a_folder_no_longer_stored_only_rekeys`,
+  `unsent_listed_names_unsent_mail_wherever_it_is_stored`,
+  `delete_folder_drops_a_queued_folder_messages_move`); `client.rs`
+  `move_message_request_posts_destination_id`, `moved_id_reads_a_move_answer`; `outbox.rs`
+  `apply_op_move_folder_messages_sends_nothing`; `engine.rs` `folder_writes::move_folder_messages`
+  (`moves_every_server_message_when_the_server_holds_more_than_the_store`,
+  `progress_and_the_final_event_count_the_answered_ids`,
+  `a_429_inside_a_batch_is_retried_after_retry_after`, `survives_a_restart_in_the_middle`,
+  `the_counts_of_both_folders_are_read_from_graph_at_the_end`,
+  `a_queued_empty_of_the_dest_keeps_its_counts_when_the_move_ends`,
+  `unsent_drafts_stay_and_are_not_counted`,
+  `a_send_queued_during_the_run_keeps_its_draft_out_of_the_moves`, `waits_for_an_older_op`,
+  `a_refused_sub_request_is_reported_as_partial`,
+  `a_refused_listing_reports_refused_and_reads_the_counts`,
+  `refused_at_once_for_an_unknown_or_the_same_folder`,
+  `deleting_the_dest_drops_the_move_and_reports_it`,
+  `a_refused_create_of_the_dest_drops_the_move_and_reports_it`,
+  `delete_all_then_delete_folder_moves_before_the_folder_delete`).
+
 ## Shutdown persists queued writes (#2127)
 
 A host that sends many per-message writes (`MarkRead`, `Delete`, `Move`) and then `Shutdown`
