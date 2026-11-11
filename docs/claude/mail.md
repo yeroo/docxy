@@ -4077,3 +4077,65 @@ A batch of six small fixes from #1918, #1975, #2038, #1892 and #1959.
   `auth.rs` (hosts use `Display`). Tests (`auth.rs`):
   `plan_auth_http_display_shows_one_line_for_an_html_body`, `plan_auth_http_display_empty_body`,
   `oauth_json_error_is_still_denied`.
+
+## Clear a folder's offline items (#2124)
+
+Classic Outlook's **Clear Offline Items** (folder Properties): drop one folder's local copy
+and download it again, the way out when that folder's copy drifted from the server, without
+resetting the whole store (`clear_delta_links` resets every folder; `EmptyFolder`, #2110,
+deletes on the server too).
+
+- `SyncCommand::ClearOfflineItems { folder }` (`Engine::clear_offline_items`). Its order:
+  the folder refusals (`Store::clear_offline_check`, read-only), then signed out, both with no
+  Graph request; then the outbox drain, as `sync_one_folder` does it (not inside a back-off,
+  nor at a shutdown); then `Store::clear_offline_items`; then, when the drain carried on,
+  `refresh_if_calendar_reset_owed` and `refresh_folder` on the id the store returned (the
+  drain may re-key a folder, #1910). With no drain, or one cut short, the next pass runs the
+  folder's head (its `delta_link` is NULL). The state is touched only when the drain ran, so a
+  back-off's `Offline` stays. Once cleared, the folder leaves `parked`, `expired`,
+  `size_parked` and a running `size_fill`.
+- `Store::clear_offline_items` is one IMMEDIATE transaction, no outbox op. The folder
+  refusals (`clear_offline_folder_refusal_on`, shared with the check) come in this order:
+  - a folder a queued `DeleteFolder` takes (`deleting_folders_on`), checked first because
+    `delete_folder` removes the row at command time (it would read as unknown);
+  - not stored;
+  - `local:`, the drafts sentinel included (`NotOnServer`);
+  - a queued `EmptyFolder`, or `MoveFolderMessages` as source or dest (`FolderWriteQueued`).
+  Then `QueuedOps(n)`: n queued ops whose `message_id()` resolves (`current_id_on`) to a row
+  in the folder. A move into the folder counts (its row is filed there); a move out of it
+  does not, as the resync's fresh delta skips the protected id. A queued `MarkFolderRead`
+  does not refuse: `read_guard` (#1913) stores the resynced mail read, and the count read
+  keeps the stored unread count.
+- Kept: `unsent_mail_in_on`, a reconciled draft still a draft (`local_id` with
+  `is_draft = 1`, as a compose window may hold its `local:` handle, #1884), and a row with
+  `outbound_attachments` (uploaded only at send, #1874). A reconciled draft since sent
+  (`is_draft = 0`, re-filed under Sent Items with the draft's id) goes. Graph's sent copy has
+  its own id, and that placeholder is the kind of stale row the command clears.
+- Removed with the rows: bodies, `message_headers` and `attachments` (cascade), FTS rows (the
+  bulk delete `delete_folder_messages_on`, shared with `empty_folder`, drops and re-creates
+  the two FTS delete triggers), the `moved_ids` aliases into them, `outbound_attachments`
+  keyed by them, and the `forgotten_ids` tombstones their delete wrote. The store is then as
+  if it never synced them, so a folder delete's walk (#2107) before the resync does not refuse
+  them. `clear_folder_links_on` resets the delta, backfill and history state. The counts are
+  kept: the server's did not change, the resync's count read corrects them, and
+  `sync_folder_delta`'s small-folder choice reads the stored total (`folder_total`).
+- Events: `OfflineItemsCleared { folder_id, removed, kept }`, then `MessagesUpdated`, then the
+  resync's `MessagesUpdated` and `FoldersUpdated`. A refusal is
+  `ClearOfflineItemsRefused { folder_id, reason }` alone, with no `Error`. `reason` is the
+  public `ClearOfflineRefusal`, defined in `store` and re-exported from `sync::engine`.
+  `persists_at_shutdown` is `true`: at a shutdown the drain stops at once, so the arm is a
+  store write alone, and the next start reads the folder from nothing.
+- Not done: no UI (lookxy lists both events with its other unused folder events).
+- Tests (`store/mod.rs` `clear_offline_tests`):
+  `clear_offline_items_removes_the_folders_rows_and_keyed_data`,
+  `clear_offline_items_keeps_unsent_mail`,
+  `clear_offline_items_refuses_with_a_queued_op_on_its_mail`,
+  `clear_offline_items_refuses_unknown_sentinel_local_and_queued_folder_writes`,
+  `clear_offline_items_deletes_in_bulk`. Engine (`engine.rs` `tests::clear_offline`):
+  `clear_offline_items_clears_then_resyncs_from_nothing` (the resync's delta paced, the store
+  read before it lands), `clear_offline_items_drains_a_queued_mark_read_first` (the op queued
+  on a second connection: a 503 would set `op_retry`, and `drain_outbox` skips the drain while
+  it runs), `clear_offline_items_refuses_while_a_mark_read_stays_queued`,
+  `clear_offline_items_unknown_and_not_on_server_are_refused`,
+  `clear_offline_items_signed_out_is_refused`,
+  `clear_offline_items_before_a_shutdown_clears_without_a_request`.
