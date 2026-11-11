@@ -157,6 +157,7 @@ issue number to find its notes.
   a meeting answer, Remove from Calendar, Automatic Replies or a save kept at a
   shutdown, queued for the next start (#2132),
   a folder's backfill walk run next on request, remembered (#2133),
+  one folder's offline items cleared locally and synced again (#2124),
   OAuth tokens in the platform secret store, a plaintext fallback and its
   warning (#1877), contact search folded in Rust, word-prefix rank, `all_contacts`
   (#1890), a sign-out's back-off, an expired delta link re-running phase 1, a 404

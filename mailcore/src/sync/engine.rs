@@ -56,10 +56,12 @@ use crate::graph::model::{
     AutomaticReplies, DeltaItem, Event, EventDeltaItem, FolderContact, MailFolder, Me,
     MeetingMessage, Message, MessageFields, Recipient, ScheduleEntry, SearchHit, parse_folder_size,
 };
+pub use crate::store::ClearOfflineRefusal;
 use crate::store::{
-    CalendarRound, DroppedFolderMove, FetchedCalendar, FolderDelete, FolderHistory, FolderRow,
-    FolderWriteResult, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee, NewEvent, OutboundAttachment,
-    OutboxOp, OutboxRow, RangeStamp, SCOPE_ALL, SCOPE_WINDOW, Store, StoreError, SyncedCalendar,
+    CalendarRound, ClearOfflineResult, DroppedFolderMove, FetchedCalendar, FolderDelete,
+    FolderHistory, FolderRow, FolderWriteResult, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee,
+    NewEvent, OutboundAttachment, OutboxOp, OutboxRow, RangeStamp, SCOPE_ALL, SCOPE_WINDOW, Store,
+    StoreError, SyncedCalendar,
 };
 use crate::sync::outbox::{
     Applied, NOT_A_MEETING_INVITE, PROPOSALS_REFUSED, apply_op, apply_send,
@@ -90,6 +92,26 @@ pub enum SyncCommand {
     /// nothing, as a tick does there; a folder id not in the store is an
     /// [`SyncEvent::Error`] and makes no Graph call.
     SyncFolder { id: String },
+    /// Clear one folder's offline items and sync it again (#2124, classic
+    /// Outlook's "Clear Offline Items"): the folder's stored messages Graph
+    /// has are deleted from the local store only, with what is keyed by
+    /// them (their move aliases and tombstones stay, #1896, #2107), and
+    /// its delta and backfill state is reset; then the folder
+    /// syncs as [`SyncCommand::SyncFolder`] does, from nothing (its head;
+    /// older mail is backfilled in idle time). No Graph write, no outbox
+    /// op; subfolders and the calendar are untouched. Mail Graph lacks
+    /// stays (unsent mail, a reconciled draft, a draft's outbound
+    /// attachments). The outbox is drained first (not inside a back-off);
+    /// a queued op still naming a message of the folder after it refuses
+    /// the command, as do signed out, an unknown folder, a `local:` folder
+    /// or the drafts sentinel, and a queued folder empty, delete or
+    /// mail move of it: [`SyncEvent::ClearOfflineItemsRefused`], with
+    /// nothing deleted. Done: [`SyncEvent::OfflineItemsCleared`] and
+    /// `MessagesUpdated { folder_id }`, then the resync's own
+    /// `MessagesUpdated` and, when its counts changed, `FoldersUpdated`.
+    /// Inside a back-off, or when the drain is cut short, the clear is done
+    /// and the next pass runs the folder's head.
+    ClearOfflineItems { folder: String },
     /// Download one folder's older mail next (#2133): that folder's backfill
     /// walk (phase 2 of #1871) runs ahead of every other folder's, still one
     /// page per idle step and preempted by commands and timed wakes as every
@@ -1226,6 +1248,22 @@ pub enum SyncEvent {
         total: usize,
         finished: bool,
     },
+    /// [`SyncCommand::ClearOfflineItems`] cleared `folder_id` (the id as
+    /// stored) locally (#2124): `removed` rows went, `kept` stayed (mail
+    /// Graph lacks). `MessagesUpdated` for the folder follows at once,
+    /// then the resync.
+    OfflineItemsCleared {
+        folder_id: String,
+        removed: usize,
+        kept: usize,
+    },
+    /// [`SyncCommand::ClearOfflineItems`] was refused (#2124), with
+    /// nothing deleted. `folder_id` is the id as the command named it.
+    /// Not a sync error: no [`SyncEvent::Error`] comes with it.
+    ClearOfflineItemsRefused {
+        folder_id: String,
+        reason: ClearOfflineRefusal,
+    },
 }
 
 /// The two channel endpoints the UI keeps: commands down, events up. Dropping
@@ -1735,6 +1773,10 @@ fn persists_at_shutdown(cmd: &SyncCommand) -> bool {
         | SyncCommand::DeleteFolder { .. }
         | SyncCommand::EmptyFolder { .. }
         | SyncCommand::MoveFolderMessages { .. }
+        // A local clear (#2124): at a shutdown the drain stops before its
+        // first request, so the arm is a store write alone; the next
+        // start's pass runs the folder's head.
+        | SyncCommand::ClearOfflineItems { .. }
         // Sent directly, but queued at a shutdown (#2132).
         | SyncCommand::RespondMeeting { .. }
         | SyncCommand::RemoveFromCalendar { .. }
@@ -2603,6 +2645,7 @@ impl Engine {
                 self.after_pass_if_fast();
             }
             SyncCommand::SyncFolder { id } => self.sync_one_folder(&id),
+            SyncCommand::ClearOfflineItems { folder } => self.clear_offline_items(&folder),
             SyncCommand::BackfillFolder { id } => self.backfill_folder(&id),
             SyncCommand::SetFastFolders { ids } => {
                 let mut set: Vec<String> = Vec::with_capacity(ids.len());
@@ -3099,6 +3142,91 @@ impl Engine {
                     .unwrap_or_else(|_| id.to_string()),
             )
         {
+            self.clear_backoff();
+            self.settle_state();
+        }
+    }
+
+    /// `SyncCommand::ClearOfflineItems` (#2124). The folder refusals
+    /// (`Store::clear_offline_check`) and signed out come first, with no
+    /// Graph request; then the outbox is drained, as `sync_one_folder`
+    /// does (not inside a back-off, nor at a shutdown), so a queued op on
+    /// the folder's mail is sent rather than refused; then the store
+    /// clears the folder in one transaction, refusing if such an op is
+    /// still queued. Once cleared, the folder's in-memory walk state goes
+    /// (a parked or expired backfill, a parked or running size fill) and it
+    /// syncs as `sync_one_folder` syncs it, unless the drain was cut short,
+    /// a back-off runs or the engine is shutting down: then the next pass
+    /// runs its head (its `delta_link` is NULL).
+    fn clear_offline_items(&mut self, folder: &str) {
+        let refuse = |this: &Self, reason: ClearOfflineRefusal| {
+            this.emit(SyncEvent::ClearOfflineItemsRefused {
+                folder_id: folder.to_string(),
+                reason,
+            });
+        };
+        match self.store.clear_offline_check(folder) {
+            Ok(Ok(_)) => {}
+            Ok(Err(reason)) => return refuse(self, reason),
+            Err(e) => {
+                self.emit(SyncEvent::Error(e.to_string()));
+                return;
+            }
+        }
+        if self.token.is_none() {
+            return refuse(self, ClearOfflineRefusal::SignedOut);
+        }
+        // As `sync_one_folder`: no drain inside a back-off, nor at a
+        // shutdown (#2127), and then the state is left as it is.
+        let drained = !self.shutting_down && !self.next_retry.is_some_and(|t| Instant::now() < t);
+        // Whether the sync goes on: a drain cut short (offline, throttled,
+        // the sign-in lost) keeps the state its failure set.
+        let carry_on = drained && {
+            self.set_state(SyncState::Syncing);
+            self.drain_outbox().carry_on()
+        };
+        // A drain that lost the sign-in leaves nothing to resync with.
+        if self.token.is_none() {
+            return refuse(self, ClearOfflineRefusal::SignedOut);
+        }
+        let id = match self.store.clear_offline_items(folder) {
+            Ok(ClearOfflineResult::Cleared {
+                folder: id,
+                removed,
+                kept,
+            }) => {
+                self.emit(SyncEvent::OfflineItemsCleared {
+                    folder_id: id.clone(),
+                    removed,
+                    kept,
+                });
+                self.emit(SyncEvent::MessagesUpdated {
+                    folder_id: id.clone(),
+                });
+                id
+            }
+            Ok(ClearOfflineResult::Refused(reason)) => {
+                refuse(self, reason);
+                if carry_on {
+                    self.settle_state();
+                }
+                return;
+            }
+            Err(e) => {
+                self.emit(SyncEvent::Error(e.to_string()));
+                if carry_on {
+                    self.settle_state();
+                }
+                return;
+            }
+        };
+        self.parked.retain(|f| *f != id);
+        self.expired.retain(|f| *f != id);
+        self.size_parked.retain(|f| *f != id);
+        if self.size_fill.as_ref().is_some_and(|f| f.folder == id) {
+            self.size_fill = None;
+        }
+        if carry_on && self.refresh_if_calendar_reset_owed() && self.refresh_folder(&id) {
             self.clear_backoff();
             self.settle_state();
         }
@@ -37756,6 +37884,497 @@ mod tests {
             assert!(!persists_at_shutdown(&SyncCommand::FetchAttachments {
                 message_id: "x".into()
             }));
+        }
+    }
+
+    /// Clear Offline Items (#2124): the folder's mail goes from the store
+    /// only, before the resync's first request, and comes back from a
+    /// delta with no token; a queued op on its mail is sent first, or
+    /// refuses the command.
+    mod clear_offline {
+        use super::*;
+        use crate::testserver::RecordedRequest;
+
+        const SLOW: Duration = Duration::from_millis(1500);
+
+        fn patch_route(status: u16) -> Route {
+            Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/messages/M1".into(),
+                status,
+                headers: vec![],
+                body: if status == 200 {
+                    "{}".into()
+                } else {
+                    r#"{"error":{"code":"ServiceUnavailable","message":"busy"}}"#.into()
+                },
+            }
+        }
+
+        /// F1 and F2, with F1's every fresh delta bringing M1 and M2 (the
+        /// first at once, later ones after `resync_pace`) and a round on
+        /// its stored link bringing nothing; F1's counts read `(2, 2)`.
+        /// `extra` answers first.
+        fn routes(
+            extra: Vec<Route>,
+            resync_pace: Duration,
+        ) -> Vec<(Route, Option<usize>, Duration)> {
+            let page = delta_page(
+                &[
+                    full_message_json("M1", "One", "2026-11-01T10:00:00Z"),
+                    full_message_json("M2", "Two", "2026-11-02T10:00:00Z"),
+                ],
+                "/me/mailFolders/F1/messages/delta?token=D-F1",
+            );
+            let delta = "/me/mailFolders/F1/messages/delta";
+            let mut out: Vec<(Route, Option<usize>, Duration)> = extra
+                .into_iter()
+                .map(|r| (r, None, Duration::ZERO))
+                .collect();
+            out.push((
+                get_route(
+                    &format!("{delta}?token=D-F1"),
+                    200,
+                    &delta_page(&[], "/me/mailFolders/F1/messages/delta?token=D-F1"),
+                ),
+                None,
+                Duration::ZERO,
+            ));
+            out.push((get_route(delta, 200, &page), Some(1), Duration::ZERO));
+            out.push((get_route(delta, 200, &page), None, resync_pace));
+            out.extend(
+                folder_routes(
+                    F1_F2,
+                    &[],
+                    &[("F1", r#"{"totalItemCount":2,"unreadItemCount":2}"#)],
+                )
+                .into_iter()
+                .map(|(r, n)| (r, n, Duration::ZERO)),
+            );
+            out
+        }
+
+        /// An engine on `routes`, idle after its startup pass stored F1's
+        /// M1 and M2 with a delta link.
+        fn engine(
+            tag: &str,
+            routes: Vec<(Route, Option<usize>, Duration)>,
+        ) -> (FakeServer, SyncHandle, PathBuf, PathBuf) {
+            let srv = FakeServer::start_paced(routes);
+            let (handle, store_path, dir) = spawn_fast(&srv, tag, HOUR, None, |_| {});
+            let mut seen = Vec::new();
+            wait_idle(&handle, &mut seen);
+            let store = Store::open(&store_path).unwrap();
+            assert_eq!(ids(&store, "F1"), ["M1", "M2"]);
+            assert!(store.get_delta_link("F1").unwrap().is_some());
+            (srv, handle, store_path, dir)
+        }
+
+        fn ids(store: &Store, folder: &str) -> Vec<String> {
+            let mut ids: Vec<String> = store
+                .messages_in_folder(folder, 50, 0)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect();
+            ids.sort();
+            ids
+        }
+
+        /// The queued `MarkRead` of M1, written as a host's store write
+        /// does, on its own connection.
+        fn queue_mark_read(store: &Store) {
+            store.set_read("M1", true);
+            store
+                .enqueue_op(&OutboxOp::MarkRead {
+                    id: "M1".into(),
+                    read: true,
+                })
+                .unwrap();
+        }
+
+        fn clear(handle: &SyncHandle, folder: &str) {
+            handle
+                .cmd_tx
+                .send(SyncCommand::ClearOfflineItems {
+                    folder: folder.into(),
+                })
+                .unwrap();
+        }
+
+        fn refusal(handle: &SyncHandle) -> (String, ClearOfflineRefusal) {
+            let events = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::ClearOfflineItemsRefused { .. })
+            });
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, SyncEvent::OfflineItemsCleared { .. })),
+                "{events:?}"
+            );
+            match events.last() {
+                Some(SyncEvent::ClearOfflineItemsRefused { folder_id, reason }) => {
+                    (folder_id.clone(), reason.clone())
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+
+        /// Criteria 1, 2, 3 and 7: the rows are gone while the resync's
+        /// first delta is still held by the server; every request is a
+        /// GET; F1's delta carries no token and brings M1 and M2 back;
+        /// F2's mail is untouched; the events come in order.
+        #[test]
+        fn clear_offline_items_clears_then_resyncs_from_nothing() {
+            let (srv, handle, store_path, dir) = engine("clear-resync", routes(vec![], SLOW));
+            let store = Store::open(&store_path).unwrap();
+            // F2's own mail, which nothing may touch.
+            let v =
+                crate::json::parse(&full_message_json("G1", "G", "2026-11-03T10:00:00Z")).unwrap();
+            store
+                .upsert_message("F2", &Message::from_json(&v).unwrap())
+                .unwrap();
+            let f2_link = store.get_delta_link("F2").unwrap();
+            assert!(f2_link.is_some());
+
+            let mark = srv.requests().len();
+            clear(&handle, "F1");
+            let mut events = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::OfflineItemsCleared { .. })
+            });
+            // The resync's delta is paced: the store is read before it lands.
+            assert!(ids(&store, "F1").is_empty(), "gone before the resync");
+            assert_eq!(store.get_delta_link("F1").unwrap(), None);
+            assert_eq!(
+                events.last(),
+                Some(&SyncEvent::OfflineItemsCleared {
+                    folder_id: "F1".into(),
+                    removed: 2,
+                    kept: 0,
+                })
+            );
+            events.extend(wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::State(SyncState::Idle))
+            }));
+
+            let requests: Vec<RecordedRequest> = srv.requests().into_iter().skip(mark).collect();
+            assert!(requests.iter().all(|r| r.method == "GET"), "{requests:?}");
+            let f1_deltas: Vec<&str> = requests
+                .iter()
+                .map(|r| r.path.as_str())
+                .filter(|p| is_delta(p, "F1"))
+                .collect();
+            assert!(!f1_deltas.is_empty(), "{requests:?}");
+            for p in &f1_deltas {
+                assert!(
+                    !p.contains("token=") && !p.contains("deltatoken") && !p.contains("skiptoken"),
+                    "a delta from nothing: {p}"
+                );
+            }
+            assert!(
+                requests.iter().any(|r| is_counts(&r.path, "F1")),
+                "{requests:?}"
+            );
+            assert!(
+                !requests
+                    .iter()
+                    .any(|r| r.path.contains("/F2/") || is_counts(&r.path, "F2")),
+                "nothing of F2: {requests:?}"
+            );
+            assert_eq!(ids(&store, "F1"), ["M1", "M2"], "back under their ids");
+            assert!(store.get_delta_link("F1").unwrap().is_some());
+            assert_eq!(ids(&store, "F2"), ["G1"]);
+            assert_eq!(store.get_delta_link("F2").unwrap(), f2_link);
+
+            let cleared = events
+                .iter()
+                .position(|e| matches!(e, SyncEvent::OfflineItemsCleared { .. }))
+                .unwrap();
+            let updates: Vec<usize> = events
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "F1")
+                })
+                .map(|(i, _)| i)
+                .collect();
+            assert!(
+                updates.len() >= 2 && updates[0] == cleared + 1,
+                "MessagesUpdated right after the clear, again on the resync: {events:?}"
+            );
+            assert!(
+                events[cleared..].contains(&SyncEvent::FoldersUpdated),
+                "the counts read back changed: {events:?}"
+            );
+            assert!(
+                !events.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+                "{events:?}"
+            );
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Criterion 5: a queued `MarkRead` on M1 is sent first, and the
+        /// clear then takes M1 with the rest.
+        #[test]
+        fn clear_offline_items_drains_a_queued_mark_read_first() {
+            let (srv, handle, store_path, dir) = engine(
+                "clear-drain",
+                routes(vec![patch_route(200)], Duration::ZERO),
+            );
+            let store = Store::open(&store_path).unwrap();
+            queue_mark_read(&store);
+
+            let mark = srv.requests().len();
+            clear(&handle, "F1");
+            let events = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::State(SyncState::Idle))
+            });
+            assert!(
+                events.contains(&SyncEvent::OfflineItemsCleared {
+                    folder_id: "F1".into(),
+                    removed: 2,
+                    kept: 0,
+                }),
+                "{events:?}"
+            );
+            let requests: Vec<RecordedRequest> = srv.requests().into_iter().skip(mark).collect();
+            let patch = requests
+                .iter()
+                .position(|r| r.method == "PATCH")
+                .expect("the MarkRead was sent");
+            let delta = requests
+                .iter()
+                .position(|r| is_delta(&r.path, "F1"))
+                .expect("the resync");
+            assert!(patch < delta, "{requests:?}");
+            assert!(store.pending_ops().unwrap().is_empty());
+            assert_eq!(ids(&store, "F1"), ["M1", "M2"]);
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Criterion 5: a `MarkRead` Graph answers 503 stays queued (its
+        /// op back-off), so the command refuses with nothing deleted.
+        #[test]
+        fn clear_offline_items_refuses_while_a_mark_read_stays_queued() {
+            let (srv, handle, store_path, dir) = engine(
+                "clear-queued",
+                routes(vec![patch_route(503)], Duration::ZERO),
+            );
+            let store = Store::open(&store_path).unwrap();
+            queue_mark_read(&store);
+
+            let mark = srv.requests().len();
+            clear(&handle, "F1");
+            assert_eq!(
+                refusal(&handle),
+                ("F1".to_string(), ClearOfflineRefusal::QueuedOps(1))
+            );
+            let requests: Vec<RecordedRequest> = srv.requests().into_iter().skip(mark).collect();
+            assert_eq!(
+                requests.iter().filter(|r| r.method == "PATCH").count(),
+                1,
+                "{requests:?}"
+            );
+            assert!(
+                !requests.iter().any(|r| is_delta(&r.path, "F1")),
+                "no resync: {requests:?}"
+            );
+            assert_eq!(ids(&store, "F1"), ["M1", "M2"], "nothing deleted");
+            assert!(store.get_delta_link("F1").unwrap().is_some());
+            assert_eq!(store.pending_ops().unwrap().len(), 1);
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Criterion 6: an unknown folder, the drafts sentinel and a
+        /// `local:` folder are refused with no request, the store unchanged.
+        #[test]
+        fn clear_offline_items_unknown_and_not_on_server_are_refused() {
+            let (srv, handle, store_path, dir) =
+                engine("clear-unknown", routes(vec![], Duration::ZERO));
+            let store = Store::open(&store_path).unwrap();
+            // No Drafts folder: a draft written here files the sentinel.
+            store
+                .create_local_draft("Hi", "bob@x", "", "<p>x</p>")
+                .unwrap();
+            let mark = srv.requests().len();
+            clear(&handle, "NOPE");
+            assert_eq!(
+                refusal(&handle),
+                ("NOPE".to_string(), ClearOfflineRefusal::UnknownFolder)
+            );
+            clear(&handle, LOCAL_DRAFTS_SENTINEL_FOLDER_ID);
+            assert_eq!(
+                refusal(&handle).1,
+                ClearOfflineRefusal::NotOnServer,
+                "the drafts sentinel"
+            );
+            // A folder created here whose create has not reached Graph. Its
+            // queued create is dropped, so the barrier's drain sends nothing.
+            let local = match store.create_local_folder(Some("F1"), "New").unwrap() {
+                FolderWriteResult::Written(id) => id,
+                other => panic!("{other:?}"),
+            };
+            assert!(local.starts_with("local:"), "{local}");
+            for row in store.pending_ops().unwrap() {
+                store.drop_op(row.seq);
+            }
+            clear(&handle, &local);
+            assert_eq!(
+                refusal(&handle),
+                (local.clone(), ClearOfflineRefusal::NotOnServer),
+                "a local: folder"
+            );
+            // A barrier: F1's own sync after them.
+            handle
+                .cmd_tx
+                .send(SyncCommand::SyncFolder { id: "F1".into() })
+                .unwrap();
+            let mut seen = Vec::new();
+            wait_idle(&handle, &mut seen);
+            let paths = paths_from(&srv, mark);
+            assert!(
+                paths
+                    .iter()
+                    .all(|p| is_delta(p, "F1") || is_counts(p, "F1")),
+                "the refusals made no request: {paths:?}"
+            );
+            assert_eq!(ids(&store, "F1"), ["M1", "M2"]);
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Criterion 6: signed out, the clear is refused with no request
+        /// and nothing deleted; an unknown folder is still reported as
+        /// unknown (the folder is checked first).
+        #[test]
+        fn clear_offline_items_signed_out_is_refused() {
+            let srv = FakeServer::start(vec![]);
+            let dir = unique_dir("clear-signed-out");
+            let store_path = dir.join("mail.db");
+            {
+                let s = Store::open(&store_path).unwrap();
+                s.upsert_folder(&MailFolder {
+                    id: "F1".into(),
+                    display_name: "Inbox".into(),
+                    parent_id: None,
+                    total_count: 1,
+                    unread_count: 1,
+                    well_known_name: Some("inbox".into()),
+                })
+                .unwrap();
+                let v = crate::json::parse(&full_message_json("M1", "One", "2026-11-01T10:00:00Z"))
+                    .unwrap();
+                s.upsert_message("F1", &Message::from_json(&v).unwrap())
+                    .unwrap();
+                s.set_delta_link("F1", "https://graph/delta?F1").unwrap();
+            }
+            let handle = spawn_with_bases_and_options(
+                store_path.clone(),
+                dir.join("no-token.bin"),
+                test_cfg(),
+                3650,
+                srv.base_url.clone(),
+                srv.base_url.clone(),
+                HOUR,
+                EngineOptions::without_prefetch(),
+            );
+            clear(&handle, "F1");
+            assert_eq!(
+                refusal(&handle),
+                ("F1".to_string(), ClearOfflineRefusal::SignedOut)
+            );
+            clear(&handle, "NOPE");
+            assert_eq!(refusal(&handle).1, ClearOfflineRefusal::UnknownFolder);
+            assert!(srv.requests().is_empty(), "{:?}", srv.requests());
+            let store = Store::open(&store_path).unwrap();
+            assert_eq!(ids(&store, "F1"), ["M1"]);
+            assert!(store.get_delta_link("F1").unwrap().is_some());
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The #2127 classifier: a clear asked before a `Shutdown` is done
+        /// at the shutdown, as a store write alone (no drain, no resync),
+        /// and the next start's pass reads the folder from nothing.
+        #[test]
+        fn clear_offline_items_before_a_shutdown_clears_without_a_request() {
+            assert!(persists_at_shutdown(&SyncCommand::ClearOfflineItems {
+                folder: "F1".into()
+            }));
+            // The startup pass's listing is paced, so the commands are on
+            // the channel at its first checkpoint.
+            let srv = FakeServer::start_paced(
+                folder_routes(F1_F2, &[], &[])
+                    .into_iter()
+                    .map(|(r, n)| {
+                        let pace = if r.path_prefix == "/me/mailFolders?" {
+                            Duration::from_millis(400)
+                        } else {
+                            Duration::ZERO
+                        };
+                        (r, n, pace)
+                    })
+                    .collect(),
+            );
+            let (handle, store_path, dir) = spawn_fast(&srv, "clear-shutdown", HOUR, None, |s| {
+                s.upsert_folder(&MailFolder {
+                    id: "F1".into(),
+                    display_name: "Inbox".into(),
+                    parent_id: None,
+                    total_count: 1,
+                    unread_count: 1,
+                    well_known_name: Some("inbox".into()),
+                })
+                .unwrap();
+                let v = crate::json::parse(&full_message_json("M1", "One", "2026-11-01T10:00:00Z"))
+                    .unwrap();
+                s.upsert_message("F1", &Message::from_json(&v).unwrap())
+                    .unwrap();
+                s.set_delta_link("F1", "https://graph/delta?F1").unwrap();
+            });
+            clear(&handle, "F1");
+            handle.cmd_tx.send(SyncCommand::Shutdown).unwrap();
+            // The engine returns: its sender goes.
+            let deadline = Instant::now() + ENGINE_WAIT;
+            let mut events = Vec::new();
+            loop {
+                match handle
+                    .evt_rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                {
+                    Ok(e) => events.push(e),
+                    Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => panic!("no return: {events:?}"),
+                }
+            }
+            assert!(
+                events.contains(&SyncEvent::OfflineItemsCleared {
+                    folder_id: "F1".into(),
+                    removed: 1,
+                    kept: 0,
+                }),
+                "{events:?}"
+            );
+            let requests: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
+            // The startup pass's listing (folders and their children),
+            // no delta and no count read.
+            assert!(
+                requests.iter().all(|p| is_folder_list(p)
+                    || (p.starts_with("/me/mailFolders/") && p.contains("/childFolders"))),
+                "only the startup pass's listing: {requests:?}"
+            );
+            let store = Store::open(&store_path).unwrap();
+            assert!(ids(&store, "F1").is_empty());
+            assert_eq!(store.get_delta_link("F1").unwrap(), None);
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

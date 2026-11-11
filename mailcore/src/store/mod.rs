@@ -5691,6 +5691,57 @@ impl std::fmt::Display for FolderRefusal {
     }
 }
 
+/// Why [`SyncCommand::ClearOfflineItems`] was refused (#2124): nothing was
+/// deleted, and no Graph request was made but the outbox drain's.
+///
+/// [`SyncCommand::ClearOfflineItems`]: crate::sync::engine::SyncCommand::ClearOfflineItems
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClearOfflineRefusal {
+    /// Signed out: the folder would stay empty with no way to fill it.
+    SignedOut,
+    /// No stored folder has this id (after `folder_aliases`).
+    UnknownFolder,
+    /// A folder Graph does not have (a `local:` folder whose create has
+    /// not reached it, or the local drafts sentinel): nothing to resync
+    /// it from.
+    NotOnServer,
+    /// A queued `EmptyFolder`, folder delete or `MoveFolderMessages`
+    /// (source or dest) names the folder.
+    FolderWriteQueued,
+    /// This many queued ops still name messages of the folder after the
+    /// drain (offline, a back-off, a 5xx): clearing them would make the
+    /// op fail or drop the user's change.
+    QueuedOps(usize),
+}
+
+impl std::fmt::Display for ClearOfflineRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClearOfflineRefusal::SignedOut => f.write_str("signed out"),
+            ClearOfflineRefusal::UnknownFolder => f.write_str("no such folder"),
+            ClearOfflineRefusal::NotOnServer => f.write_str("the folder is not on the server"),
+            ClearOfflineRefusal::FolderWriteQueued => {
+                f.write_str("a folder write on it is still queued")
+            }
+            ClearOfflineRefusal::QueuedOps(n) => {
+                write!(f, "{n} change(s) to its mail are still queued")
+            }
+        }
+    }
+}
+
+/// What `Store::clear_offline_items` did (#2124).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClearOfflineResult {
+    /// The folder (its id as stored) lost `removed` rows and kept `kept`.
+    Cleared {
+        folder: String,
+        removed: usize,
+        kept: usize,
+    },
+    Refused(ClearOfflineRefusal),
+}
+
 /// What a folder command did to the store (#1910).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FolderWriteResult {
@@ -6267,22 +6318,7 @@ impl Store {
              WHERE folder_id = ?2 AND id NOT IN (SELECT value FROM json_each(?3))",
             params![batch, id, kept],
         )?;
-        tx.execute_batch(
-            "DROP TRIGGER IF EXISTS messages_fts_ad;
-             DROP TRIGGER IF EXISTS bodies_fts_ad;",
-        )?;
-        tx.execute(
-            "DELETE FROM messages_fts WHERE message_id IN
-                 (SELECT id FROM messages
-                  WHERE folder_id = ?1 AND id NOT IN (SELECT value FROM json_each(?2)))",
-            params![id, kept],
-        )?;
-        tx.execute(
-            "DELETE FROM messages
-             WHERE folder_id = ?1 AND id NOT IN (SELECT value FROM json_each(?2))",
-            params![id, kept],
-        )?;
-        tx.execute_batch(schema::FTS_DELETE_TRIGGERS_SQL)?;
+        delete_folder_messages_on(&tx, &id, &kept)?;
         // What the user saw and emptied is allowed by the batch, not held.
         tx.execute(
             "DELETE FROM forgotten_ids WHERE (kind, id) IN
@@ -6309,6 +6345,116 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(FolderWriteResult::Written(id))
+    }
+
+    /// Why `folder` cannot have its offline items cleared now (#2124), with
+    /// nothing written: [`SyncCommand::ClearOfflineItems`]'s pre-check,
+    /// run before the drain, so a folder refusal costs no Graph request.
+    /// `Ok(id)` is the folder's id as stored. The refusal for a queued op on
+    /// the folder's mail (`QueuedOps`) is `clear_offline_items`' alone: the
+    /// drain may still send it.
+    ///
+    /// [`SyncCommand::ClearOfflineItems`]: crate::sync::engine::SyncCommand::ClearOfflineItems
+    pub(crate) fn clear_offline_check(
+        &self,
+        folder: &str,
+    ) -> Result<Result<String, ClearOfflineRefusal>, StoreError> {
+        clear_offline_folder_refusal_on(&self.conn, folder)
+    }
+
+    /// Clears `folder`'s offline items (#2124), classic Outlook's "Clear
+    /// Offline Items": its stored messages Graph has go from the local
+    /// store only, and its delta and backfill state is reset, so its next
+    /// sync starts from nothing. One IMMEDIATE transaction, all or nothing;
+    /// no outbox op, nothing for Graph.
+    ///
+    /// Refused, with nothing written: the folder refusals of
+    /// `clear_offline_check` (checked again here), and any queued op naming
+    /// (through `current_id_on`) a message stored in the folder
+    /// (`QueuedOps`, how many): deleting the row would make the op fail on
+    /// it, or drop the user's change. A queued `MarkFolderRead` of the
+    /// folder does not refuse: the resync stores its mail read
+    /// (`read_guard`, #1913) and its count read keeps the stored unread
+    /// count.
+    ///
+    /// Kept, as Graph lacks something in them: unsent mail
+    /// (`unsent_mail_in_on`), a reconciled draft still a draft (`local_id`
+    /// with `is_draft = 1`: a compose window may hold its `local:` handle,
+    /// #1884) and a row with `outbound_attachments` (uploaded only at send,
+    /// #1874). A reconciled draft since sent (`is_draft = 0`, re-filed in
+    /// Sent Items under the draft's id) goes: Graph's sent copy has its own
+    /// id, and the placeholder is the kind of stale row this clears.
+    ///
+    /// With the removed rows go, by their `ON DELETE CASCADE`, their bodies,
+    /// stored headers and attachment metadata; their FTS rows (in bulk, as
+    /// `empty_folder`).
+    /// Two things stay. The `moved_ids` aliases into them, which outlive
+    /// their row by design (#1896): a queued op that names no row
+    /// (`RespondMeeting`, `RemoveFromCalendar`, `SaveAttachment`) or a host
+    /// may still hold an old id, and the resync brings the row back under
+    /// the same id. And the `forgotten_ids` tombstones their delete wrote
+    /// (#2107): until the resync stores a row again (which clears its
+    /// tombstone), a folder delete's walk of Graph refuses a copy of that
+    /// mail elsewhere rather than take it. The folder's counts are kept:
+    /// the server's did not change, the resync's count read corrects them,
+    /// and the next delta's small-folder choice reads the stored total
+    /// (`folder_total`): a zero would send a big folder down the full
+    /// delta. Subfolders, other folders and the calendar are not touched.
+    pub(crate) fn clear_offline_items(
+        &self,
+        folder: &str,
+    ) -> Result<ClearOfflineResult, StoreError> {
+        let tx = self.write_tx()?;
+        let id = match clear_offline_folder_refusal_on(&tx, folder)? {
+            Ok(id) => id,
+            Err(r) => return Ok(ClearOfflineResult::Refused(r)),
+        };
+        let mut queued = 0;
+        for row in pending_ops_on(&tx)? {
+            if let Some(m) = row.op.message_id() {
+                let current = current_id_on(&tx, m)?;
+                let here: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1 AND folder_id = ?2)",
+                    params![current, id],
+                    |r| r.get(0),
+                )?;
+                if here {
+                    queued += 1;
+                }
+            }
+        }
+        if queued > 0 {
+            return Ok(ClearOfflineResult::Refused(ClearOfflineRefusal::QueuedOps(
+                queued,
+            )));
+        }
+        let mut kept = unsent_mail_in_on(&tx, std::slice::from_ref(&id))?;
+        {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM messages
+                 WHERE folder_id = ?1
+                   AND ((local_id IS NOT NULL AND is_draft = 1)
+                        OR id IN (SELECT draft_id FROM outbound_attachments))",
+            )?;
+            let more = stmt
+                .query_map(params![id], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            kept.extend(more);
+        }
+        kept.sort();
+        kept.dedup();
+        let kept_json = ids_json(&kept);
+        let removed = delete_folder_messages_on(&tx, &id, &kept_json)?;
+        // The delete's tombstones stay (`forgotten_messages_ad`); keep
+        // their number bounded, as `empty_folder` does.
+        prune_forgotten_on(&tx, FORGOTTEN_CAP)?;
+        clear_folder_links_on(&tx, &id)?;
+        tx.commit()?;
+        Ok(ClearOfflineResult::Cleared {
+            folder: id,
+            removed,
+            kept: kept.len(),
+        })
     }
 
     /// An `EmptyFolder` is done, refused or sent nothing (#2110): its op
@@ -7451,6 +7597,75 @@ fn clear_folder_links_on(conn: &Connection, id: &str) -> Result<(), StoreError> 
         params![id],
     )?;
     Ok(())
+}
+
+/// Deletes every message of `folder` but the ids in `kept_json` (a JSON
+/// array), in the caller's transaction, and returns how many went
+/// (`empty_folder` #2110, `clear_offline_items` #2124). `messages_fts_ad`
+/// and `bodies_fts_ad` scan the whole FTS table per row, so they are
+/// dropped meanwhile: the folder's FTS rows go in one statement, and
+/// `schema::FTS_DELETE_TRIGGERS_SQL` creates both again (DDL is
+/// transactional: a failure rolls the drop back too). `bodies`,
+/// `message_headers` and `attachments` go by their `ON DELETE CASCADE`.
+fn delete_folder_messages_on(
+    conn: &Connection,
+    folder: &str,
+    kept_json: &str,
+) -> Result<usize, StoreError> {
+    conn.execute_batch(
+        "DROP TRIGGER IF EXISTS messages_fts_ad;
+         DROP TRIGGER IF EXISTS bodies_fts_ad;",
+    )?;
+    conn.execute(
+        "DELETE FROM messages_fts WHERE message_id IN
+             (SELECT id FROM messages
+              WHERE folder_id = ?1 AND id NOT IN (SELECT value FROM json_each(?2)))",
+        params![folder, kept_json],
+    )?;
+    let n = conn.execute(
+        "DELETE FROM messages
+         WHERE folder_id = ?1 AND id NOT IN (SELECT value FROM json_each(?2))",
+        params![folder, kept_json],
+    )?;
+    conn.execute_batch(schema::FTS_DELETE_TRIGGERS_SQL)?;
+    Ok(n)
+}
+
+/// The folder refusals of a Clear Offline Items (#2124), in order: a
+/// folder a queued `DeleteFolder` takes (checked first: the delete removed
+/// its row at command time, so it would otherwise read as unknown), one
+/// not stored, one Graph does not have (`local:`, the drafts sentinel
+/// included), and one a queued `EmptyFolder` or `MoveFolderMessages`
+/// (source or dest) names. `Ok` holds the id as stored (through
+/// `folder_aliases`).
+fn clear_offline_folder_refusal_on(
+    conn: &Connection,
+    folder: &str,
+) -> Result<Result<String, ClearOfflineRefusal>, StoreError> {
+    let id = current_folder_id_on(conn, folder)?;
+    let deleting = deleting_folders_on(conn)?;
+    if deleting.contains(&id) || deleting.contains(folder) {
+        return Ok(Err(ClearOfflineRefusal::FolderWriteQueued));
+    }
+    if !folder_exists_on(conn, &id)? {
+        return Ok(Err(ClearOfflineRefusal::UnknownFolder));
+    }
+    if id.starts_with("local:") {
+        return Ok(Err(ClearOfflineRefusal::NotOnServer));
+    }
+    for row in pending_ops_on(conn)? {
+        let named: Vec<&String> = match &row.op {
+            OutboxOp::EmptyFolder { folder, .. } => vec![folder],
+            OutboxOp::MoveFolderMessages { folder, dest, .. } => vec![folder, dest],
+            _ => continue,
+        };
+        for f in named {
+            if current_folder_id_on(conn, f)? == id {
+                return Ok(Err(ClearOfflineRefusal::FolderWriteQueued));
+            }
+        }
+    }
+    Ok(Ok(id))
 }
 
 /// Records `old → new` in `folder_aliases`, and points every alias that
@@ -24738,5 +24953,522 @@ mod message_size_tests {
         // engine parks it for the pass); G has the row that moved there.
         assert_eq!(s.size_fill_folders().unwrap(), ["F", "G"]);
         assert_eq!(s.mark_size_asked("F", &[]).unwrap(), 0);
+    }
+}
+
+/// Clear Offline Items (#2124): one folder's stored mail Graph has goes
+/// from the store only, with what is keyed by it, and its links are reset;
+/// nothing Graph lacks is lost, and a queued write refuses it.
+#[cfg(test)]
+mod clear_offline_tests {
+    use super::*;
+    use crate::graph::model::MailFolder;
+
+    const NOW: &str = "2026-11-10T18:00:00Z";
+
+    /// A folder under `parent` whose listed counts are `(total, unread)`.
+    fn folder_in(s: &Store, id: &str, parent: &str, well_known: Option<&str>) {
+        s.upsert_folder(&MailFolder {
+            id: id.into(),
+            display_name: id.into(),
+            parent_id: Some(parent.into()),
+            total_count: 12,
+            unread_count: 5,
+            well_known_name: well_known.map(str::to_string),
+        })
+        .unwrap();
+    }
+
+    fn folder(s: &Store, id: &str) {
+        folder_in(s, id, "ROOT", None);
+    }
+
+    /// A message `id` in `folder` with internet message id `<id@x>` and
+    /// subject `subject`.
+    fn message(s: &Store, id: &str, folder: &str, subject: &str) {
+        s.conn
+            .execute(
+                "INSERT INTO messages (id, folder_id, received_at, is_read, internet_message_id,
+                                       subject)
+                 VALUES (?1, ?2, '2026-11-01T00:00:00Z', 0, '<' || ?1 || '@x>', ?3)",
+                params![id, folder, subject],
+            )
+            .unwrap();
+    }
+
+    fn ids_in(s: &Store, folder: &str) -> Vec<String> {
+        let mut stmt = s
+            .conn
+            .prepare("SELECT id FROM messages WHERE folder_id = ?1 ORDER BY id")
+            .unwrap();
+        stmt.query_map(params![folder], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn counts(s: &Store, id: &str) -> (i64, i64) {
+        let f = s
+            .folders()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == id)
+            .unwrap();
+        (f.total_count, f.unread_count)
+    }
+
+    fn count(s: &Store, sql: &str, id: &str) -> i64 {
+        s.conn.query_row(sql, params![id], |r| r.get(0)).unwrap()
+    }
+
+    /// Every row of the tables a clear may touch, for a before/after
+    /// comparison of a refusal.
+    fn snapshot(s: &Store) -> Vec<String> {
+        let mut out = Vec::new();
+        for sql in [
+            "SELECT id || '|' || folder_id FROM messages ORDER BY id",
+            "SELECT message_id FROM bodies ORDER BY message_id",
+            "SELECT message_id FROM messages_fts ORDER BY message_id",
+            "SELECT old_id || '>' || message_id FROM moved_ids ORDER BY old_id",
+            "SELECT kind || ':' || id FROM forgotten_ids ORDER BY kind, id",
+            "SELECT id || '|' || IFNULL(delta_link, '-') || '|' || IFNULL(backfill_link, '-')
+                 || '|' || total_count || '|' || unread_count FROM folders ORDER BY id",
+            "SELECT seq || '|' || op FROM outbox ORDER BY seq",
+        ] {
+            let mut stmt = s.conn.prepare(sql).unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            out.push(rows.join(","));
+        }
+        out
+    }
+
+    fn cleared(r: ClearOfflineResult) -> (String, usize, usize) {
+        match r {
+            ClearOfflineResult::Cleared {
+                folder,
+                removed,
+                kept,
+            } => (folder, removed, kept),
+            other => panic!("not cleared: {other:?}"),
+        }
+    }
+
+    fn refused(s: &Store, folder: &str) -> ClearOfflineRefusal {
+        let before = snapshot(s);
+        let r = match s.clear_offline_items(folder).unwrap() {
+            ClearOfflineResult::Refused(r) => r,
+            other => panic!("not refused: {other:?}"),
+        };
+        assert_eq!(snapshot(s), before, "a refusal writes nothing");
+        r
+    }
+
+    /// Criterion 1 (store): the folder's rows go with their bodies,
+    /// headers, attachments and FTS rows, while the move aliases into them
+    /// and their tombstones stay (r1); its links are reset and its counts
+    /// kept; a sibling and a child are untouched.
+    #[test]
+    fn clear_offline_items_removes_the_folders_rows_and_keyed_data() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        folder(&s, "G");
+        folder_in(&s, "C", "F", None);
+        message(&s, "F1", "F", "zebra one");
+        message(&s, "F2", "F", "zebra two");
+        message(&s, "G1", "G", "zebra three");
+        message(&s, "C1", "C", "zebra four");
+        for id in ["F1", "G1"] {
+            s.conn
+                .execute(
+                    "INSERT INTO bodies (message_id, content_type, content)
+                     VALUES (?1, 'text', 'quagga')",
+                    params![id],
+                )
+                .unwrap();
+            s.conn
+                .execute(
+                    "INSERT INTO message_headers (message_id, name, value)
+                     VALUES (?1, 'X-H', 'v')",
+                    params![id],
+                )
+                .unwrap();
+            s.conn
+                .execute(
+                    "INSERT INTO attachments (id, message_id, name) VALUES ('A', ?1, 'a.txt')",
+                    params![id],
+                )
+                .unwrap();
+        }
+        s.conn
+            .execute_batch(
+                "INSERT INTO moved_ids (old_id, message_id) VALUES ('OLD-F2', 'F2');
+                 INSERT INTO moved_ids (old_id, message_id) VALUES ('OLD-G1', 'G1');",
+            )
+            .unwrap();
+        for f in ["F", "G", "C"] {
+            s.set_delta_link(f, &format!("https://graph/delta?{f}"))
+                .unwrap();
+        }
+        s.conn
+            .execute(
+                "UPDATE folders SET backfill_link = 'https://graph/back?F', backfill_synced = 7,
+                     history_scope = 'all', backfill_scope = 'all'
+                 WHERE id = 'F'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(s.search("zebra", 10).unwrap().len(), 4);
+        assert_eq!(s.search("quagga", 10).unwrap().len(), 2);
+
+        assert_eq!(
+            cleared(s.clear_offline_items("F").unwrap()),
+            ("F".to_string(), 2, 0)
+        );
+        assert!(ids_in(&s, "F").is_empty());
+        assert_eq!(ids_in(&s, "G"), ["G1"]);
+        assert_eq!(ids_in(&s, "C"), ["C1"], "a subfolder is untouched");
+        for (sql, what) in [
+            ("SELECT COUNT(*) FROM bodies WHERE message_id = ?1", "body"),
+            (
+                "SELECT COUNT(*) FROM message_headers WHERE message_id = ?1",
+                "headers",
+            ),
+            (
+                "SELECT COUNT(*) FROM attachments WHERE message_id = ?1",
+                "attachments",
+            ),
+            (
+                "SELECT COUNT(*) FROM messages_fts WHERE message_id = ?1",
+                "FTS",
+            ),
+        ] {
+            assert_eq!(count(&s, sql, "F1"), 0, "F1's {what}");
+            assert_eq!(count(&s, sql, "G1"), 1, "G1's {what}");
+        }
+        let hits: Vec<String> = s
+            .search("zebra", 10)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(!hits.iter().any(|h| h.starts_with('F')), "{hits:?}");
+        assert_eq!(s.search("quagga", 10).unwrap().len(), 1);
+        // The alias into a removed row outlives it (#1896): a queued op or
+        // a host holding the old id still reaches the row the resync
+        // brings back under the same id.
+        assert_eq!(s.current_id("OLD-F2").unwrap(), "F2");
+        assert_eq!(s.current_id("OLD-G1").unwrap(), "G1");
+        // The delete's tombstones stay (#2107) until a row is stored again.
+        let tombstone = |id: &str| {
+            count(
+                &s,
+                "SELECT COUNT(*) FROM forgotten_ids WHERE kind = 'message' AND id = ?1",
+                id,
+            )
+        };
+        assert_eq!((tombstone("F1"), tombstone("F2")), (1, 1));
+        let f = s.folder_history("F").unwrap().unwrap();
+        assert!(!f.has_delta_link);
+        assert_eq!(s.get_delta_link("F").unwrap(), None);
+        let (back, synced, hist, bscope): (Option<String>, i64, Option<String>, Option<String>) = s
+            .conn
+            .query_row(
+                "SELECT backfill_link, backfill_synced, history_scope, backfill_scope
+                     FROM folders WHERE id = 'F'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((back, synced, hist, bscope), (None, 0, None, None));
+        assert_eq!(counts(&s, "F"), (12, 5), "the server's counts are kept");
+        for f in ["G", "C"] {
+            assert_eq!(
+                s.get_delta_link(f).unwrap(),
+                Some(format!("https://graph/delta?{f}"))
+            );
+            assert_eq!(counts(&s, f), (12, 5));
+        }
+        assert!(s.pending_ops().unwrap().is_empty(), "no outbox op");
+        // The FTS delete triggers came back and still work.
+        s.delete_message("G1").unwrap();
+        assert_eq!(s.search("quagga", 10).unwrap().len(), 0);
+        // The resync storing F1 again clears its tombstone.
+        message(&s, "F1", "F", "zebra one");
+        assert_eq!((tombstone("F1"), tombstone("F2")), (0, 1));
+    }
+
+    /// Criterion 4 (store): mail Graph lacks stays; a reconciled draft
+    /// that was since sent (a placeholder in Sent Items) goes.
+    #[test]
+    fn clear_offline_items_keeps_unsent_mail() {
+        let s = Store::open_in_memory().unwrap();
+        folder_in(&s, "D", "ROOT", Some("drafts"));
+        folder_in(&s, "SENT", "ROOT", Some("sentitems"));
+        message(&s, "local:new", "D", "");
+        message(&s, "EDITED", "D", "");
+        message(&s, "RECONCILED", "D", "");
+        message(&s, "ATTACHED", "D", "");
+        message(&s, "PLAIN", "D", "");
+        s.conn
+            .execute_batch(
+                "UPDATE messages SET local_edit = 1 WHERE id = 'EDITED';
+                 UPDATE messages SET local_id = 'local:r', is_draft = 1 WHERE id = 'RECONCILED';
+                 UPDATE messages SET is_draft = 1 WHERE id IN ('ATTACHED', 'PLAIN');",
+            )
+            .unwrap();
+        s.add_outbound_attachment_bytes("ATTACHED", "p.png", "image/png", b"P", "pic1")
+            .unwrap();
+        // A draft written here, reconciled, sent, filed under Sent Items.
+        let local = s.create_local_draft("Hi", "bob@x", "", "<p>x</p>").unwrap();
+        s.reconcile_id(&local, "GRAPH-DRAFT").unwrap();
+        s.mark_sent("GRAPH-DRAFT");
+        s.move_message("GRAPH-DRAFT", "SENT").unwrap();
+        message(&s, "S1", "SENT", "");
+
+        assert_eq!(
+            cleared(s.clear_offline_items("D").unwrap()),
+            ("D".to_string(), 1, 4)
+        );
+        assert_eq!(
+            ids_in(&s, "D"),
+            ["ATTACHED", "EDITED", "RECONCILED", "local:new"]
+        );
+        assert_eq!(s.outbound_attachments("ATTACHED").unwrap().len(), 1);
+
+        assert_eq!(
+            cleared(s.clear_offline_items("SENT").unwrap()),
+            ("SENT".to_string(), 2, 0)
+        );
+        assert!(ids_in(&s, "SENT").is_empty(), "the sent placeholder goes");
+    }
+
+    /// Criterion 5 (store): a queued op on a message of the folder refuses
+    /// it, with nothing written; one on mail elsewhere, a move out of it
+    /// and a `MarkFolderRead` of it do not.
+    #[test]
+    fn clear_offline_items_refuses_with_a_queued_op_on_its_mail() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        folder(&s, "G");
+        message(&s, "F1", "F", "");
+        message(&s, "F2", "F", "");
+        message(&s, "G1", "G", "");
+        s.set_delta_link("F", "https://graph/delta?F").unwrap();
+
+        s.enqueue_op(&OutboxOp::MarkRead {
+            id: "F1".into(),
+            read: true,
+        })
+        .unwrap();
+        assert_eq!(refused(&s, "F"), ClearOfflineRefusal::QueuedOps(1));
+        // Through an alias too, and each op counts.
+        s.conn
+            .execute(
+                "INSERT INTO moved_ids (old_id, message_id) VALUES ('OLD-F2', 'F2')",
+                [],
+            )
+            .unwrap();
+        s.enqueue_op(&OutboxOp::SetFlag {
+            id: "OLD-F2".into(),
+            flagged: true,
+        })
+        .unwrap();
+        assert_eq!(refused(&s, "F"), ClearOfflineRefusal::QueuedOps(2));
+        s.conn.execute("DELETE FROM outbox", []).unwrap();
+
+        // A move into F: the row is filed under F already.
+        s.move_message("G1", "F").unwrap();
+        s.enqueue_op(&OutboxOp::Move {
+            id: "G1".into(),
+            dest: "F".into(),
+        })
+        .unwrap();
+        assert_eq!(refused(&s, "F"), ClearOfflineRefusal::QueuedOps(1));
+        // From G's side it is a move out: no refusal.
+        assert_eq!(
+            cleared(s.clear_offline_items("G").unwrap()),
+            ("G".to_string(), 0, 0)
+        );
+        s.conn.execute("DELETE FROM outbox", []).unwrap();
+
+        // An op on mail elsewhere, and a MarkFolderRead of F.
+        message(&s, "G2", "G", "");
+        s.enqueue_op(&OutboxOp::MarkRead {
+            id: "G2".into(),
+            read: true,
+        })
+        .unwrap();
+        s.enqueue_op(&OutboxOp::MarkFolderRead {
+            folder: "F".into(),
+            before: NOW.into(),
+        })
+        .unwrap();
+        assert_eq!(s.clear_offline_check("F").unwrap(), Ok("F".to_string()));
+        assert_eq!(
+            cleared(s.clear_offline_items("F").unwrap()),
+            ("F".to_string(), 3, 0)
+        );
+        assert_eq!(s.pending_ops().unwrap().len(), 2, "the ops stay queued");
+    }
+
+    /// Criterion 6 (store): the folder refusals, each with nothing
+    /// written, from both the check and the clear.
+    #[test]
+    fn clear_offline_items_refuses_unknown_sentinel_local_and_queued_folder_writes() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        folder(&s, "G");
+        folder(&s, "P");
+        folder_in(&s, "PC", "P", None);
+        message(&s, "F1", "F", "");
+        message(&s, "PC1", "PC", "");
+        let check = |id: &str| s.clear_offline_check(id).unwrap().unwrap_err();
+
+        assert_eq!(check("NOPE"), ClearOfflineRefusal::UnknownFolder);
+        assert_eq!(refused(&s, "NOPE"), ClearOfflineRefusal::UnknownFolder);
+
+        s.conn
+            .execute(
+                "INSERT INTO folders (id, display_name) VALUES (?1, 'Drafts')",
+                params![LOCAL_DRAFTS_SENTINEL_FOLDER_ID],
+            )
+            .unwrap();
+        assert_eq!(
+            refused(&s, LOCAL_DRAFTS_SENTINEL_FOLDER_ID),
+            ClearOfflineRefusal::NotOnServer
+        );
+        let local = written(s.create_local_folder(Some("F"), "New").unwrap());
+        assert!(local.starts_with("local:"), "{local}");
+        assert_eq!(check(&local), ClearOfflineRefusal::NotOnServer);
+        assert_eq!(refused(&s, &local), ClearOfflineRefusal::NotOnServer);
+        s.conn.execute("DELETE FROM outbox", []).unwrap();
+
+        let seq = s
+            .enqueue_op(&OutboxOp::EmptyFolder {
+                folder: "F".into(),
+                before: NOW.into(),
+                batch: "empty:1".into(),
+            })
+            .unwrap();
+        assert_eq!(check("F"), ClearOfflineRefusal::FolderWriteQueued);
+        assert_eq!(refused(&s, "F"), ClearOfflineRefusal::FolderWriteQueued);
+        s.conn
+            .execute("DELETE FROM outbox WHERE seq = ?1", params![seq])
+            .unwrap();
+
+        for (src, dest) in [("F", "G"), ("G", "F")] {
+            s.enqueue_op(&OutboxOp::MoveFolderMessages {
+                folder: src.into(),
+                dest: dest.into(),
+                before: NOW.into(),
+            })
+            .unwrap();
+            assert_eq!(check("F"), ClearOfflineRefusal::FolderWriteQueued);
+            assert_eq!(refused(&s, "F"), ClearOfflineRefusal::FolderWriteQueued);
+            s.conn.execute("DELETE FROM outbox", []).unwrap();
+        }
+        assert_eq!(s.clear_offline_check("F").unwrap(), Ok("F".to_string()));
+
+        // A delete queued for real: the folder's row is gone at once, yet
+        // the refusal names the queued write, for it and a child.
+        let (r, _) = s.delete_folder("P").unwrap();
+        written(r);
+        assert!(!s.has_folder("P").unwrap());
+        for id in ["P", "PC"] {
+            assert_eq!(check(id), ClearOfflineRefusal::FolderWriteQueued, "{id}");
+            assert_eq!(refused(&s, id), ClearOfflineRefusal::FolderWriteQueued);
+        }
+    }
+
+    fn written(r: FolderWriteResult) -> String {
+        match r {
+            FolderWriteResult::Written(id) => id,
+            other => panic!("not written: {other:?}"),
+        }
+    }
+
+    /// `empty_folder` and the clear share one bulk delete: a 3 000-row
+    /// clear takes well under a second (each per-row FTS trigger would
+    /// scan the whole FTS table) and leaves the FTS triggers as they were.
+    #[test]
+    fn clear_offline_items_deletes_in_bulk() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        folder(&s, "G");
+        s.conn
+            .execute_batch("DROP TRIGGER messages_fts_ai")
+            .unwrap();
+        {
+            let tx = s.conn.unchecked_transaction().unwrap();
+            for i in 0..3000 {
+                tx.execute(
+                    "INSERT INTO messages (id, folder_id, subject) VALUES (?1, 'F', 'q')",
+                    params![format!("M{i:04}")],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO messages (id, folder_id, subject) VALUES (?1, 'G', 'q')",
+                    params![format!("G{i:04}")],
+                )
+                .unwrap();
+            }
+            tx.execute(
+                "INSERT INTO messages_fts(message_id, subject, from_text, body)
+                 SELECT id, subject, '', '' FROM messages",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        let triggers: Vec<String> = {
+            let mut stmt = s
+                .conn
+                .prepare(
+                    "SELECT sql FROM sqlite_master
+                     WHERE type = 'trigger' AND name IN ('messages_fts_ad', 'bodies_fts_ad')
+                     ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(triggers.len(), 2);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            cleared(s.clear_offline_items("F").unwrap()),
+            ("F".to_string(), 3000, 0)
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        let fts: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts, 3000, "only G's FTS rows are left");
+        let after: Vec<String> = {
+            let mut stmt = s
+                .conn
+                .prepare(
+                    "SELECT sql FROM sqlite_master
+                     WHERE type = 'trigger' AND name IN ('messages_fts_ad', 'bodies_fts_ad')
+                     ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(after, triggers);
     }
 }
