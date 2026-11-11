@@ -3689,7 +3689,11 @@ A host can draw classic Outlook's Folder Size dialog. The Local Data tab comes f
   folder queued before it lands first. Both ids are resolved at run time. A folder still `local:`
   has nothing on Graph: the op goes and the run ends `Ok` with nothing moved. A dest still
   `local:` (its create was refused, `discard_local_folder`) refuses the run: "its destination
-  folder could not be created". The first step pages every id
+  folder could not be created". A dest the store no longer has (a listing pruned it: deleted on
+  Graph) refuses it before the listing, and before a kept run goes on: "its destination folder
+  was deleted" (r1-m1). Graph would answer each move 404, which reads as a message gone, and the
+  run would drop the stored rows and end `Ok`. Nothing within one drain removes a folder, so the
+  check at each run entry covers every batch. The first step pages every id
   (`folder_messages_before`), all before the first move, and leaves out the unsent ones
   (`Store::unsent_listed`). Then 20 a `$batch`
   (`GraphClient::move_message_request`: `POST /me/messages/{id}/move`,
@@ -3709,8 +3713,14 @@ A host can draw classic Outlook's Folder Size dialog. The Local Data tab comes f
   shared: re-keyed, children and aliases following, a stored `new` kept). The row is only
   re-keyed, not filed, when a queued op names it (`pending_message_ids`, read once a batch: a
   `Move` made after the command takes it on from the new id) or `dest` is no longer stored (the
-  folder foreign key). A 2xx with no id, or a 404, deletes the stored row: the next delta of
-  wherever Graph has it brings it back. 429/503, other 5xx and other statuses are #1913's.
+  folder foreign key). The alias (`moved_ids`) is recorded only for a stored row, or an id a
+  queued op names (a `Delete` made after the command, its row gone, still reaches the moved
+  message), r1-M1: an alias pointing at mail the store never held makes `delete_allow_check`
+  refuse it, so an `EmptyFolder` of Deleted Items after a Delete All would keep, every time,
+  all the never-synced mail the run moved there. A 2xx with no id, or a 404, deletes the stored
+  row: the next delta of wherever Graph has it brings it back. 429/503, other 5xx and other
+  statuses are #1913's. A store failure in the per-batch unsent re-check or the protected-id
+  read sends nothing: the batch fails as a whole (`Parse`), refusing the run (r1-m3).
 - Events: once listed, `FolderMessagesMoving { folder, dest, moved: 0, failed: 0, total }`; after
   each batch Graph answered (also one a throttle then stops), `MessageMoved` for each stored row
   re-keyed (none for mail the store never held: a host would reload its list per id), then
@@ -3727,12 +3737,13 @@ A host can draw classic Outlook's Folder Size dialog. The Local Data tab comes f
   run): the op goes, then both folders' counts are read from Graph (`read_folder_counts`, now
   `refresh_folder`'s count half: a `local:` folder and one a queued `EmptyFolder` names are not
   read, a queued `MarkFolderRead` keeps its unread count), the dest's skipped when the first
-  read had to stop, then the final event. A count read that fails goes through `react`; the
-  move is done all the same.
+  read had to stop, a folder the store no longer has not read, then the final event. A count
+  read that fails goes through `react`; the move is done all the same.
 - A folder delete (`drop_folder_ops_on`) drops a queued move into a removed folder, or of a
   removed `local:` folder, and returns it (`FolderDelete::dropped_moves`). The engine reports
   each ("its destination folder was deleted" / "its folder was deleted"), with the counts of the
-  run it stopped if it was running. A delete of a folder Graph has keeps its move: the
+  run it stopped if it was running; such a run had moved mail out of the folder, so the folder's
+  counts are read first (r1-m4; the dest is gone). A delete of a folder Graph has keeps its move: the
   `DeleteFolder` waits behind it, so the mail reaches the dest (Deleted Items) before the folder
   goes, and the walk then finds it empty. Dropping it would send the mail to Recoverable Items
   with the folder.
@@ -3770,6 +3781,9 @@ A host can draw classic Outlook's Folder Size dialog. The Local Data tab comes f
   `refused_at_once_for_an_unknown_or_the_same_folder`,
   `deleting_the_dest_drops_the_move_and_reports_it`,
   `a_refused_create_of_the_dest_drops_the_move_and_reports_it`,
+  `a_404_or_an_answer_without_an_id_drops_the_stored_row`,
+  `a_dest_gone_from_the_store_refuses_the_run`,
+  `an_empty_of_the_dest_deletes_the_mail_the_run_moved_there`,
   `delete_all_then_delete_folder_moves_before_the_folder_delete`).
 
 ## Shutdown persists queued writes (#2127)

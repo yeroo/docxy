@@ -1142,8 +1142,12 @@ pub enum SyncEvent {
     },
     /// A [`SyncCommand::MoveFolderMessages`] ended (#2126): exactly one per
     /// command, also for one refused at once (`total` 0) or dropped by a
-    /// folder delete (the counts reached so far). Sent after both folders'
-    /// counts were read from Graph (a run Graph saw), with `moved`,
+    /// folder delete (the counts reached so far). When the engine ran the
+    /// op (done, refused by Graph, or its dest gone), it is sent after the
+    /// stored folders' counts were read from Graph; when a delete of the
+    /// dest dropped a running op, after the folder's alone; with none read
+    /// when the store refused the command, a delete dropped the op before
+    /// its run, or the folder was still `local:`. With `moved`,
     /// `failed` and `total` as in [`SyncEvent::FolderMessagesMoving`] (a
     /// done run has `moved + failed == total`). An `Err` is also
     /// [`SyncEvent::FolderWriteFailed`] (`write: MoveMail`) and its `Error`,
@@ -1351,9 +1355,15 @@ impl MoveFollow {
                     .push(format!("follow move of {id} to {new_id}: {e}")),
             },
             None => {
-                let from = store.message_folder(&id).ok().flatten();
-                if let (Some(from), Ok(Some(_))) = (from, store.delete_message_resolved(&id)) {
-                    self.folders.insert(from);
+                let deleted = store
+                    .message_folder(&id)
+                    .and_then(|from| Ok((from, store.delete_message_resolved(&id)?)));
+                match deleted {
+                    Ok((Some(from), Some(_))) => {
+                        self.folders.insert(from);
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.errors.push(format!("drop moved message {id}: {e}")),
                 }
             }
         }
@@ -5298,7 +5308,7 @@ impl Engine {
     /// Graph has answered the batch. A 2xx or a 404 is done (for a delete
     /// run, the stored row of that id goes too, should one have come back;
     /// for a move run, the stored row follows Graph's answer:
-    /// `follow_move_answer`); a 429 or 503 puts its ids back at the front
+    /// `MoveFollow::follow`, `Store::follow_folder_move`); a 429 or 503 puts its ids back at the front
     /// and stops the drain for the longest `Retry-After` (default 30 s);
     /// another 5xx puts them back under the outbox back-off; any other
     /// status is recorded in `failed`. A move run reports each answered
@@ -5320,7 +5330,12 @@ impl Engine {
             // listing (#2126: a send or save queued during the run), no
             // longer counted.
             if run.kind == BulkKind::Move {
-                let unsent = self.store.unsent_listed(&ids).unwrap_or_default();
+                // A store failure sends nothing: it could hide a draft
+                // being sent (r1-m3).
+                let unsent = match self.store.unsent_listed(&ids) {
+                    Ok(u) => u,
+                    Err(e) => return BatchLoop::CallFailed(GraphError::Parse(e.to_string())),
+                };
                 if !unsent.is_empty() {
                     let Some(run) = self.bulk.as_mut() else {
                         return BatchLoop::Step(BulkStep::Finished);
@@ -5345,20 +5360,20 @@ impl Engine {
                     }
                 })
                 .collect();
+            // The rows queued ops name, read once a batch, before it is
+            // sent (#2126; only this thread queues ops): a move only
+            // re-keys them. A store failure sends nothing (r1-m3).
+            let protected: HashSet<String> = if kind == BulkKind::Move {
+                match self.store.pending_message_ids() {
+                    Ok(ids) => ids.into_iter().collect(),
+                    Err(e) => return BatchLoop::CallFailed(GraphError::Parse(e.to_string())),
+                }
+            } else {
+                HashSet::new()
+            };
             let answers = match self.with_auth(|c| c.batch(&reqs)) {
                 Ok(a) => a,
                 Err(e) => return BatchLoop::CallFailed(e),
-            };
-            // The rows queued ops name, read once a batch (#2126): a move
-            // only re-keys them.
-            let protected: HashSet<String> = if kind == BulkKind::Move {
-                self.store
-                    .pending_message_ids()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect()
-            } else {
-                HashSet::new()
             };
             let mut followed = MoveFollow::default();
             let Some(run) = self.bulk.as_mut() else {
@@ -5821,6 +5836,29 @@ impl Engine {
             .current_folder_id(dest)
             .unwrap_or_else(|_| dest.to_string());
         let target = FolderMove { folder, dest };
+        // A dest the store no longer has (a listing pruned it: deleted on
+        // Graph) refuses the run before its listing and before a kept run
+        // goes on (r1-m1): Graph would answer each move 404, which reads as
+        // a message gone. Nothing within one drain removes a folder.
+        let kept_dest = self
+            .bulk
+            .as_ref()
+            .filter(|b| b.seq == seq)
+            .and_then(|b| b.moving.as_ref())
+            .map_or(target.dest.as_str(), |m| m.dest.as_str())
+            .to_string();
+        if !kept_dest.starts_with("local:") && !self.store.folder_exists(&kept_dest).unwrap_or(true)
+        {
+            let target = self
+                .bulk
+                .as_ref()
+                .filter(|b| b.seq == seq)
+                .and_then(|b| b.moving.clone())
+                .unwrap_or(target);
+            let error = "its destination folder was deleted".to_string();
+            self.refuse_move_folder_messages(seq, &target, None, error);
+            return BulkStep::Finished;
+        }
         if self.bulk.as_ref().is_none_or(|b| b.seq != seq) {
             self.bulk = None;
             if target.folder.starts_with("local:") {
@@ -5979,10 +6017,13 @@ impl Engine {
 
     /// The end of a `MoveFolderMessages` run (#2126): the folder's and the
     /// dest's counts read from Graph (`read_folder_counts`), the dest's
-    /// skipped once a failure stopped the first.
+    /// skipped once a failure stopped the first. A folder the store no
+    /// longer has is not read (r1-m1: a dest gone would answer 404).
     fn read_moved_folder_counts(&mut self, target: &FolderMove) {
-        if self.read_folder_counts(&target.folder) {
-            self.read_folder_counts(&target.dest);
+        for id in [&target.folder, &target.dest] {
+            if self.store.folder_exists(id).unwrap_or(false) && !self.read_folder_counts(id) {
+                return;
+            }
         }
     }
 
@@ -6002,6 +6043,11 @@ impl Engine {
                 "its folder was deleted"
             }
             .to_string();
+            // A run Graph saw moved mail out of the folder (r1-m4): its
+            // counts are read again (the dest is gone).
+            if run.is_some() && self.store.folder_exists(&d.folder).unwrap_or(false) {
+                self.read_folder_counts(&d.folder);
+            }
             self.report_folder_failure(&d.folder, FolderWrite::MoveMail, None, error.clone());
             let (moved, failed, total) =
                 run.map_or((0, 0, 0), |r| (r.moved, r.failed.len(), r.total));
@@ -34491,9 +34537,16 @@ mod tests {
                 let writes = vec![
                     once("GET", LIST, 200, &items_page(&server, None)),
                     once("POST", "/$batch", 200, &last_throttled(&server[..20], 3600)),
+                    write(
+                        "GET",
+                        "/me/mailFolders/INBOX?",
+                        200,
+                        r#"{"totalItemCount":2,"unreadItemCount":1}"#,
+                    ),
                 ];
                 let (srv, handle, store, dir) =
                     engine("move-dest-deleted", world(writes, TREE, &[]), None);
+                assert_eq!(counts(&store, "INBOX"), (0, 0));
                 move_to(&handle, "INBOX", "OTHER");
                 wait_for(&handle.evt_rx, |e| {
                     matches!(e, SyncEvent::FolderMessagesMoving { moved: 19, .. })
@@ -34536,6 +34589,8 @@ mod tests {
                     "the move is dropped"
                 );
                 assert_eq!(batches_to(&srv, "OTHER").len(), 1);
+                // r1-m4: the folder's counts were read before the event.
+                assert_eq!(counts(&store, "INBOX"), (2, 1));
                 stop(handle, dir);
             }
 
@@ -34588,6 +34643,195 @@ mod tests {
                 assert!(batches(&srv).is_empty());
                 wait_drained(&store);
                 no_local_request(&srv);
+                stop(handle, dir);
+            }
+
+            /// A `$batch` answer with each sub-response's status and raw
+            /// body (JSON text, or empty for none).
+            fn raw_answer(answers: &[(u16, &str)]) -> String {
+                let items: Vec<String> = answers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (status, body))| {
+                        let body = if body.is_empty() {
+                            String::new()
+                        } else {
+                            format!(r#","body":{body}"#)
+                        };
+                        format!(
+                            r#"{{"id":"{}","status":{status},"headers":{{}}{body}}}"#,
+                            i + 1
+                        )
+                    })
+                    .collect();
+                format!(r#"{{"responses":[{}]}}"#, items.join(","))
+            }
+
+            /// r1-m5: a 404 (gone from Graph) and a 2xx without an id both
+            /// count as moved, and drop the stored row (the next delta of
+            /// wherever Graph has it brings it back); the run ends `Ok`.
+            #[test]
+            fn a_404_or_an_answer_without_an_id_drops_the_stored_row() {
+                let server = strings(&["M1", "M2", "M3"]);
+                let writes = vec![
+                    once("GET", LIST, 200, &items_page(&server, None)),
+                    once(
+                        "POST",
+                        "/$batch",
+                        200,
+                        &raw_answer(&[
+                            (
+                                404,
+                                r#"{"error":{"code":"ErrorItemNotFound","message":"x"}}"#,
+                            ),
+                            (201, r#"{"subject":"no id"}"#),
+                            (201, r#"{"id":"N-M3"}"#),
+                        ]),
+                    ),
+                ];
+                let (_srv, handle, store, dir) = engine(
+                    "move-404",
+                    world(writes, TREE, &[("INBOX", "M1"), ("INBOX", "M2")]),
+                    None,
+                );
+                move_inbox(&handle);
+                let seen = until_moved(&handle);
+                assert_eq!(
+                    ended(&seen),
+                    ("INBOX".into(), "ARCH".into(), 3, 0, 3, Ok(()))
+                );
+                assert!(mail_in(&store, "INBOX").is_empty());
+                assert!(!store.message_exists("M1").unwrap());
+                assert!(!store.message_exists("M2").unwrap());
+                assert!(mail_in(&store, "ARCH").is_empty(), "M3 was never stored");
+                assert!(moved_events(&seen).is_empty(), "{seen:?}");
+                assert!(seen.iter().any(
+                    |e| matches!(e, SyncEvent::MessagesUpdated { folder_id } if folder_id == "INBOX")
+                ));
+                assert!(failures(&seen).is_empty(), "{seen:?}");
+                stop(handle, dir);
+            }
+
+            /// r1-m1: a dest the store no longer has (a listing pruned it,
+            /// `retain_folders`, while the run waited out a throttle)
+            /// refuses the kept run before its next batch: no move is sent
+            /// to it, no count read of it, and the run ends with the counts
+            /// it reached.
+            #[test]
+            fn a_dest_gone_from_the_store_refuses_the_run() {
+                // Graph lists OTHER to the startup pass only: a pass at the
+                // throttle's end must not bring it back.
+                const NO_OTHER: &[Listed] = &[
+                    ("INBOX", Some("ROOT"), Some("inbox")),
+                    ("ARCH", Some("ROOT"), None),
+                    ("PROJ", Some("INBOX"), None),
+                    ("SUB", Some("PROJ"), None),
+                ];
+                let listed: Vec<String> = TREE
+                    .iter()
+                    .map(|(id, parent, wk)| listed_json(id, *parent, *wk))
+                    .collect();
+                let other_delta = "/me/mailFolders/OTHER/messages/delta";
+                let other_link = format!("{other_delta}?token=D-OTHER");
+                let server = numbered(21);
+                let writes = vec![
+                    once(
+                        "GET",
+                        "/me/mailFolders?",
+                        200,
+                        &format!(r#"{{"value":[{}]}}"#, listed.join(",")),
+                    ),
+                    write("GET", &other_link, 200, &delta_page(&[], &other_link)),
+                    write("GET", other_delta, 200, &delta_page(&[], &other_link)),
+                    once("GET", LIST, 200, &items_page(&server, None)),
+                    once("POST", "/$batch", 200, &last_throttled(&server[..20], 2)),
+                ];
+                let (srv, handle, store, dir) =
+                    engine("move-dest-pruned", world(writes, NO_OTHER, &[]), None);
+                assert!(row(&store, "OTHER").is_some());
+                move_to(&handle, "INBOX", "OTHER");
+                let mut seen = wait_for(&handle.evt_rx, |e| {
+                    matches!(e, SyncEvent::FolderMessagesMoving { moved: 19, .. })
+                });
+                // As a listing that no longer finds OTHER (deleted on
+                // Graph) prunes it.
+                let keep: Vec<String> = ["INBOX", "ARCH", "PROJ", "SUB"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                assert_eq!(store.retain_folders(&keep).unwrap(), 1);
+                seen.extend(until_moved(&handle));
+                let error = "its destination folder was deleted".to_string();
+                assert_eq!(
+                    ended(&seen),
+                    (
+                        "INBOX".into(),
+                        "OTHER".into(),
+                        19,
+                        0,
+                        21,
+                        Err(FolderMoveError::Refused {
+                            status: None,
+                            error: error.clone()
+                        })
+                    )
+                );
+                assert_eq!(
+                    failures(&seen),
+                    [
+                        SyncEvent::FolderWriteFailed {
+                            id: "INBOX".into(),
+                            write: FolderWrite::MoveMail,
+                            status: None,
+                            error: error.clone(),
+                        },
+                        SyncEvent::Error(format!("move the mail of folder INBOX: {error}")),
+                    ],
+                    "no count read of the gone dest"
+                );
+                assert_eq!(batches_to(&srv, "OTHER").len(), 1, "nothing more sent");
+                assert!(store.pending_ops().unwrap().is_empty());
+                stop(handle, dir);
+            }
+
+            /// r1-M1: mail the store never held, moved to Archive, is no
+            /// alias: an `EmptyFolder` of Archive afterwards deletes it,
+            /// rather than keeping it as mail the store shows elsewhere.
+            #[test]
+            fn an_empty_of_the_dest_deletes_the_mail_the_run_moved_there() {
+                let arch_list = "/me/mailFolders/ARCH/messages?$filter=receivedDateTime%20le%20";
+                let writes = vec![
+                    once("GET", LIST, 200, &items_page(&strings(&["A"]), None)),
+                    once("POST", "/$batch", 200, &ok_moves(&strings(&["A"]))),
+                    once("GET", arch_list, 200, &items_page(&strings(&["N-A"]), None)),
+                    once("POST", "/$batch", 200, &raw_answer(&[(204, "")])),
+                ];
+                let (srv, handle, store, dir) =
+                    engine("move-then-empty", world(writes, TREE, &[]), None);
+                move_inbox(&handle);
+                assert_eq!(ended(&until_moved(&handle)).5, Ok(()));
+                send(
+                    &handle,
+                    SyncCommand::EmptyFolder {
+                        folder: "ARCH".into(),
+                        subfolders: false,
+                    },
+                );
+                wait_drained(&store);
+                let seen = barrier(&handle);
+                assert!(failures(&seen).is_empty(), "nothing kept: {seen:?}");
+                let last = srv
+                    .requests()
+                    .into_iter()
+                    .filter(|r| r.method == "POST" && r.path == "/$batch")
+                    .last()
+                    .unwrap();
+                assert!(
+                    last.body
+                        .contains(r#""method":"DELETE","url":"/me/messages/N-A""#),
+                    "{}",
+                    last.body
+                );
                 stop(handle, dir);
             }
 

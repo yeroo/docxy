@@ -3679,6 +3679,13 @@ impl Store {
     /// is no longer a stored folder. Returns the folder the row was stored
     /// in before, `None` when no row was. `new_id` empty or equal to
     /// `old_id` re-keys nothing.
+    ///
+    /// The alias `old_id -> new_id` is recorded only for a stored row, or
+    /// an id a queued op names (a `Delete` made after the command, its row
+    /// already gone, still reaches the moved message), r1-M1: an alias
+    /// pointing at mail the store never held would make
+    /// `delete_allow_check` refuse it, so a later `EmptyFolder` of the dest
+    /// would keep every never-synced message the run moved there.
     pub(crate) fn follow_folder_move(
         &self,
         old_id: &str,
@@ -3704,7 +3711,8 @@ impl Store {
                 params![old_id, dest],
             )?;
         }
-        if old_id != new_id && !new_id.is_empty() {
+        if old_id != new_id && !new_id.is_empty() && (from.is_some() || protected.contains(old_id))
+        {
             follow_move_on(&tx, old_id, new_id)?;
         }
         tx.commit()?;
@@ -23841,8 +23849,26 @@ mod move_folder_messages_tests {
             .unwrap();
         assert_eq!(body, "hi");
 
+        // r1-M1: mail the store never held gets no alias, so a later
+        // check of the dest (an `EmptyFolder`'s) does not refuse it.
         assert_eq!(s.follow_folder_move("X", "Y", "D", &none()).unwrap(), None);
-        assert_eq!(s.current_id("X").unwrap(), "Y");
+        assert_eq!(s.current_id("X").unwrap(), "X");
+        assert!(!s.is_moved_alias("X").unwrap());
+        let items = [("Y".to_string(), "<y@x>".to_string())];
+        let batch = local_draft_id().replacen("local:", "empty:", 1);
+        assert!(
+            s.delete_allow_check(&batch, &[], &items)
+                .unwrap()
+                .is_empty()
+        );
+        // An id a queued op names (a `Delete` after its row went) keeps
+        // its alias: the op still reaches the moved message.
+        let protected: HashSet<String> = ["Z".to_string()].into();
+        assert_eq!(
+            s.follow_folder_move("Z", "W", "D", &protected).unwrap(),
+            None
+        );
+        assert_eq!(s.current_id("Z").unwrap(), "W");
     }
 
     /// The dest's delta stored the moved copy first: the old row merges
