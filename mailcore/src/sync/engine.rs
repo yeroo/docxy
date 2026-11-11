@@ -1947,45 +1947,7 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
             return;
         }
     };
-    // A quarantine reconverge an earlier run left unfinished (#1871).
-    let reconverge_pending = store.reconverge_pending().unwrap_or(false);
-    let mut engine = Engine {
-        store,
-        token: None,
-        config,
-        evt_tx,
-        state: SyncState::Idle,
-        next_retry: None,
-        backoff: BACKOFF_MIN,
-        backfill_done: false,
-        reconverge_pending,
-        relist_after_drain: false,
-        copied_after_drain: Vec::new(),
-        calendar_reset_owed: false,
-        masters_not_found: HashSet::new(),
-        masters_skipped: HashSet::new(),
-        parked: Vec::new(),
-        expired: Vec::new(),
-        backfill_first: Vec::new(),
-        next_tick: Instant::now(),
-        fast_folders: Vec::new(),
-        next_full: Instant::now(),
-        next_fast: Instant::now(),
-        hold_full: false,
-        op_retry: None,
-        op_backoff: BACKOFF_MIN,
-        announced_scopes: None,
-        warned_unencrypted: false,
-        cmd_rx,
-        deferred: VecDeque::new(),
-        bulk: None,
-        shutting_down: false,
-        body_skip: HashSet::new(),
-        body_parked: false,
-        contact_rereads_paused: false,
-        size_fill: None,
-        size_parked: Vec::new(),
-    };
+    let mut engine = Engine::new(config, store, cmd_rx, evt_tx);
     engine.startup();
     engine.main_loop();
 }
@@ -2171,6 +2133,55 @@ struct SizeFill {
 pub const FOLDER_SIZE_BATCH: usize = 4;
 
 impl Engine {
+    /// A new engine over an open `store`, signed out until `startup` reads
+    /// the token cache. Split from `run` (#2113) so a test can build one.
+    fn new(
+        config: EngineConfig,
+        store: Store,
+        cmd_rx: Receiver<SyncCommand>,
+        evt_tx: Sender<SyncEvent>,
+    ) -> Engine {
+        // A quarantine reconverge an earlier run left unfinished (#1871).
+        let reconverge_pending = store.reconverge_pending().unwrap_or(false);
+        Engine {
+            store,
+            token: None,
+            config,
+            evt_tx,
+            state: SyncState::Idle,
+            next_retry: None,
+            backoff: BACKOFF_MIN,
+            backfill_done: false,
+            reconverge_pending,
+            relist_after_drain: false,
+            copied_after_drain: Vec::new(),
+            calendar_reset_owed: false,
+            masters_not_found: HashSet::new(),
+            masters_skipped: HashSet::new(),
+            parked: Vec::new(),
+            expired: Vec::new(),
+            backfill_first: Vec::new(),
+            next_tick: Instant::now(),
+            fast_folders: Vec::new(),
+            next_full: Instant::now(),
+            next_fast: Instant::now(),
+            hold_full: false,
+            op_retry: None,
+            op_backoff: BACKOFF_MIN,
+            announced_scopes: None,
+            warned_unencrypted: false,
+            cmd_rx,
+            deferred: VecDeque::new(),
+            bulk: None,
+            shutting_down: false,
+            body_skip: HashSet::new(),
+            body_parked: false,
+            contact_rereads_paused: false,
+            size_fill: None,
+            size_parked: Vec::new(),
+        }
+    }
+
     // --- Startup & main loop --------------------------------------------
 
     /// Loads the cached token (refreshing if near expiry) and, if signed in,
@@ -3382,7 +3393,21 @@ impl Engine {
     /// `MessagesUpdated` is emitted once the pages are stored, before the
     /// repair (so an aborted repair still shows them), and again after a
     /// repair that changed a row.
+    ///
+    /// A round on the stored link that Graph answers with an expired sync
+    /// state (`is_expired_sync_state`: a 410, or a 400 `SyncStateNotFound`
+    /// and the like) is routine, not an error (#2113, #1975): the link is
+    /// forgotten (`Store::expire_delta_link`, which keeps a backfill walk
+    /// under way) and the folder's phase 1 runs again in the same call,
+    /// protecting local edits as any fresh delta does. Once only: the
+    /// re-run has no stored link, and a failure there goes to `react`.
     fn sync_folder_delta(&mut self, folder_id: &str) -> bool {
+        self.sync_folder_delta_once(folder_id, true)
+    }
+
+    /// `sync_folder_delta`, which re-runs phase 1 after an expired link
+    /// only while `may_expire`.
+    fn sync_folder_delta_once(&mut self, folder_id: &str, may_expire: bool) -> bool {
         // A folder a queued `EmptyFolder` names (#2110) is not read: a
         // fresh delta would bring back the mail the command removed. Its
         // links were cleared; the op's end clears them again.
@@ -3427,6 +3452,16 @@ impl Engine {
         };
         let run = match self.run_delta(folder_id, cursor, cutoff.as_deref(), pending.as_deref()) {
             Ok(run) => run,
+            Err(e) if may_expire && !started_fresh && is_expired_sync_state(&e) => {
+                if let Err(se) = self.store.expire_delta_link(folder_id) {
+                    self.emit(SyncEvent::Error(format!(
+                        "mail sync: cannot reset the expired delta link of folder {}: {se}",
+                        self.folder_label(folder_id)
+                    )));
+                    return true;
+                }
+                return self.sync_folder_delta_once(folder_id, false);
+            }
             // `react` returns true when the pass must abort; a non-fatal
             // error (a 4xx/parse on this folder) is surfaced there and we
             // stop this folder but keep the pass going.
@@ -8306,8 +8341,14 @@ impl Engine {
 
     /// Drop to signed-out: clear the token and announce `SignInRequired`.
     /// The announced grant is forgotten, so the next session announces it.
+    /// A throttle or offline back-off is over too (#2113, #1918): signed
+    /// out, no pass runs, so a passed `next_retry` would only make
+    /// `recv_timeout` zero (and a sign-in clears it anyway); the wait is
+    /// the tick again, and the next session's back-off starts at
+    /// `BACKOFF_MIN`.
     fn enter_signin(&mut self) {
         self.token = None;
+        self.clear_backoff();
         self.drop_size_fill();
         self.announced_scopes = None;
         self.masters_not_found.clear();
@@ -18613,6 +18654,115 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #2113 (#1918 plan-spin): dropping to sign-in ends a back-off, so a
+    /// signed-out engine whose throttle or offline deadline has passed
+    /// waits for its tick instead of waking at once.
+    #[test]
+    fn plan_spin_signin_clears_a_passed_retry() {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let config = EngineConfig {
+            store_path: PathBuf::from("unused.db"),
+            token_path: PathBuf::from("unused-token.json"),
+            cfg: AuthConfig::default(),
+            backfill_days: 30,
+            graph_base: "http://127.0.0.1:9".into(),
+            auth_base: "http://127.0.0.1:9".into(),
+            tick: HOUR,
+            options: EngineOptions::without_prefetch(),
+        };
+        let mut engine = Engine::new(config, Store::open_in_memory().unwrap(), cmd_rx, evt_tx);
+        engine.next_tick = Instant::now() + HOUR;
+        engine.next_retry = Some(Instant::now() - Duration::from_secs(1));
+        engine.backoff = BACKOFF_MAX;
+        assert_eq!(engine.recv_timeout(), Duration::ZERO, "the spin's cause");
+        engine.enter_signin();
+        assert!(engine.token.is_none());
+        assert_eq!(engine.next_retry, None);
+        assert_eq!(engine.backoff, BACKOFF_MIN);
+        assert!(engine.recv_timeout() > Duration::ZERO);
+        assert!(!engine.due(), "no wake is due");
+        assert!(matches!(evt_rx.try_recv(), Ok(SyncEvent::SignInRequired)));
+        drop(cmd_tx);
+    }
+
+    /// #2113 (#2038 plan-del404): a DELETE answered 404 (a retry after a
+    /// lost 204, or an event removed elsewhere) is done: the op goes at the
+    /// first answer, with no `Error`, no quarantine (no mail reconverge)
+    /// and no calendar reset, and the row stays gone.
+    #[test]
+    fn plan_del404_delete_event_404_is_dropped_as_done() {
+        let (from, to) = today_window();
+        // The view holds E1, so a calendar reset's initial round would
+        // bring the row back: none may run.
+        let mut routes = calendar_routes(
+            &[("CAL-A", true, "me@x")],
+            vec![("CAL-A", 200, events_body(&[event_from_now("E1", 3600)]))],
+        );
+        routes.insert(
+            0,
+            Route {
+                method: "DELETE".into(),
+                path_prefix: "/me/events/E1".into(),
+                status: 404,
+                headers: vec![],
+                body: r#"{"error":{"code":"ErrorItemNotFound"}}"#.into(),
+            },
+        );
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("delete-event-404", routes, |s| {
+                seed_synced_calendar(
+                    s,
+                    "CAL-A",
+                    vec![stored_event("E1", "CAL-A", 3600)],
+                    (&from, &to),
+                    &delta_link_of("CAL-A"),
+                );
+            });
+        Store::open(&store_path)
+            .unwrap()
+            .delete_event("E1")
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::DeleteEvent { id: "E1".into() })
+            .unwrap();
+        // Commands run in order: this one's `Error` comes after the
+        // delete's drain is done.
+        fetch_range(&handle, "bad", "bad");
+        let seen = wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let errors: Vec<&String> = seen
+            .iter()
+            .filter_map(|e| match e {
+                SyncEvent::Error(m) if !m.starts_with("fetch calendar range") => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.pending_ops().unwrap().is_empty(), "the op is done");
+        assert!(!store.reconverge_pending().unwrap(), "no quarantine");
+        let deletes = srv
+            .requests()
+            .iter()
+            .filter(|r| r.method == "DELETE")
+            .count();
+        assert_eq!(deletes, 1, "not retried");
+        assert!(
+            view_paths(&srv, "CAL-A")
+                .iter()
+                .all(|p| *p == delta_link_of("CAL-A")),
+            "no calendar reset: {:?}",
+            view_paths(&srv, "CAL-A")
+        );
+        assert!(ids_in(&store, "CAL-A").is_empty(), "the row stays gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- Calendar ranges on demand (#2014) ---
 
     /// A query parameter's value in a recorded request path.
@@ -28271,6 +28421,208 @@ mod tests {
             );
             assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_ALL));
             stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // --- An expired delta link (#2113, #1975 plan-410) ---
+
+        /// A store where F1's backfill completed: its walk's link (scope
+        /// ALL) is the folder's delta link, and no walk is under way.
+        fn seed_complete(dir: &std::path::Path) {
+            seed_legacy(dir);
+            store_in(dir)
+                .complete_backfill("F1", &full_link("F1"), SCOPE_ALL, 2, Some(false))
+                .unwrap();
+        }
+
+        /// The `Error` texts among `events`.
+        fn errors(events: &[SyncEvent]) -> Vec<&String> {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    SyncEvent::Error(m) => Some(m),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// F1's stored link answers `status`/`body` once: the folder runs its
+        /// head in the same pass, with no `Error`, then walks again (its
+        /// scope is the head's), and the next pass rounds on the new link.
+        fn expired_delta_link_reruns_phase_1(tag: &str, status: u16, body: &str) {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 2),
+                    ..inbox()
+                }],
+                vec![(route(&full_link("F1"), status, body), Some(1))],
+                Duration::ZERO,
+            ));
+            let dir = new_dir(tag);
+            seed_complete(&dir);
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            let events = until_complete(&handle, "F1");
+            assert!(errors(&events).is_empty(), "{:?}", errors(&events));
+            let deltas: Vec<String> = paths_from(&srv, 0)
+                .into_iter()
+                .filter(|p| is_delta(p, "F1"))
+                .collect();
+            assert_eq!(deltas[0], full_link("F1"), "{deltas:?}");
+            assert!(is_head(&deltas[1], "F1"), "the head, at once: {deltas:?}");
+            assert_eq!(count(&srv, |p| is_head(p, "F1")), 1);
+            assert!(is_full_first(&deltas[2], "F1"), "then a walk: {deltas:?}");
+            assert_eq!(deltas.last(), Some(&head_link("F1")), "its last round");
+            assert_eq!(
+                store_in(&dir).get_delta_link("F1").unwrap(),
+                Some(full_link("F1"))
+            );
+            assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_ALL));
+            // The next pass rounds on the walk's link, which now answers.
+            let before = count(&srv, |p| p == full_link("F1"));
+            handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+            assert!(
+                wait_until(ENGINE_WAIT, || count(&srv, |p| p == full_link("F1"))
+                    > before),
+                "{:?}",
+                paths_from(&srv, 0)
+            );
+            stop(handle);
+            assert_eq!(count(&srv, |p| is_head(p, "F1")), 1, "no second head");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn plan_410_expired_delta_link_reruns_phase_1() {
+            expired_delta_link_reruns_phase_1("plan-410", 410, "{}");
+        }
+
+        #[test]
+        fn plan_410_sync_state_not_found_reruns_phase_1() {
+            expired_delta_link_reruns_phase_1(
+                "plan-410-400",
+                400,
+                r#"{"error":{"code":"SyncStateNotFound","message":"gone"}}"#,
+            );
+        }
+
+        /// After the re-run the folder is at its head (scope `head`, the
+        /// head's link): a backfill page that fails parks the walk there.
+        #[test]
+        fn plan_410_rerun_leaves_the_folder_at_its_head() {
+            let bad = r#"{"error":{"code":"ErrorInvalidRequest","message":"bad page"}}"#;
+            let srv = FakeServer::start_paced(mailbox(
+                &[inbox()],
+                vec![
+                    (route(&full_link("F1"), 410, "{}"), None),
+                    (
+                        route("/me/mailFolders/F1/messages/delta?$orderby", 400, bad),
+                        None,
+                    ),
+                ],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("plan-410-head");
+            seed_complete(&dir);
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            let events = wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::Error(m) if m.contains("bad page")),
+            );
+            stop(handle);
+            assert_eq!(errors(&events).len(), 1, "{:?}", errors(&events));
+            let h = history(&dir, "F1");
+            assert_eq!(h.scope.as_deref(), Some(SCOPE_HEAD));
+            assert_eq!(h.backfill_link, None);
+            assert_eq!(
+                store_in(&dir).get_delta_link("F1").unwrap(),
+                Some(head_link("F1"))
+            );
+            assert_eq!(count(&srv, |p| p == full_link("F1")), 1, "asked once");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A walk under way when the head's link expires resumes from its
+        /// own page link: the re-run starts no walk over.
+        #[test]
+        fn plan_410_rerun_keeps_the_backfill_walk() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 3),
+                    ..inbox()
+                }],
+                vec![(route(&head_link("F1"), 410, "{}"), Some(1))],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("plan-410-walk");
+            seed_at_page_2(&dir);
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            let events = until_complete(&handle, "F1");
+            stop(handle);
+            assert!(errors(&events).is_empty(), "{:?}", errors(&events));
+            let deltas: Vec<String> = paths_from(&srv, 0)
+                .into_iter()
+                .filter(|p| is_delta(p, "F1"))
+                .collect();
+            assert_eq!(deltas[0], head_link("F1"), "{deltas:?}");
+            assert!(is_head(&deltas[1], "F1"), "{deltas:?}");
+            assert_eq!(deltas[2], page_link("F1", 2), "the walk resumes");
+            assert_eq!(count(&srv, |p| is_full_first(p, "F1")), 0, "{deltas:?}");
+            // Pages 2 and 3 on top of the 50 the walk had counted.
+            assert_eq!(progress(&events, "F1").last(), Some(&(52, Some(BIG), true)));
+            assert_eq!(
+                store_in(&dir).get_delta_link("F1").unwrap(),
+                Some(full_link("F1"))
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The re-run's head carries R1 as the server has it (unread) while
+        /// the user's MarkRead waits behind a 5xx: the local read flag stays.
+        #[test]
+        fn plan_410_rerun_keeps_a_pending_local_edit() {
+            let recent = unix_to_iso8601(now_unix() - 86400);
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    head: vec![msg("R1", &recent), msg("NEW1", &recent)],
+                    pages: vec![vec![msg("R1", &recent)]],
+                    ..inbox()
+                }],
+                vec![
+                    (route(&full_link("F1"), 410, "{}"), Some(1)),
+                    (
+                        Route {
+                            method: "PATCH".into(),
+                            path_prefix: "/me/messages/R1".into(),
+                            status: 500,
+                            headers: vec![],
+                            body: "{}".into(),
+                        },
+                        None,
+                    ),
+                ],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("plan-410-edit");
+            seed_complete(&dir);
+            {
+                let s = store_in(&dir);
+                seed_row(&s, "F1", &msg("R1", &recent));
+                s.set_read("R1", true);
+                s.enqueue_op(&OutboxOp::MarkRead {
+                    id: "R1".into(),
+                    read: true,
+                })
+                .unwrap();
+            }
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            until_complete(&handle, "F1");
+            stop(handle);
+            assert_eq!(count(&srv, |p| is_head(p, "F1")), 1, "the head re-ran");
+            assert!(row(&dir, "F1", "NEW1").is_some(), "the head was merged");
+            assert!(
+                row(&dir, "F1", "R1").unwrap().is_read,
+                "R1's local read flag kept"
+            );
             let _ = std::fs::remove_dir_all(&dir);
         }
 

@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
@@ -1603,6 +1604,12 @@ pub struct EventSendData {
     pub end_local: String,
 }
 
+/// How long a store connection waits for another connection's lock before
+/// a statement fails with `SQLITE_BUSY` (#2113, #1892 plan-5). The engine
+/// and a host each hold a connection to one WAL file. Set in `Store::init`,
+/// so it does not depend on rusqlite's own default (5 s in 0.40).
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The local mail database. Single-threaded access is assumed (the sync
 /// engine and TUI serialize their access through it); no internal locking.
 pub struct Store {
@@ -1618,8 +1625,8 @@ impl Store {
     }
 
     /// Begins a write transaction: IMMEDIATE, so it takes the write lock at
-    /// `BEGIN` and waits out another connection's write (rusqlite's 5 s busy
-    /// timeout) before it reads. The engine and a host (lookxy, its tests)
+    /// `BEGIN` and waits out another connection's write ([`BUSY_TIMEOUT`],
+    /// set in `init`) before it reads. The engine and a host (lookxy, its tests)
     /// each hold a connection to one WAL file; a DEFERRED transaction that
     /// read first and then writes after the other connection committed gets
     /// `SQLITE_BUSY_SNAPSHOT` ("database is locked") at once, with no busy
@@ -1635,6 +1642,9 @@ impl Store {
     }
 
     fn init(conn: Connection) -> Result<Store, StoreError> {
+        // First: the WAL pragma below may itself meet the other
+        // connection's lock (#2113).
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         // WAL is a no-op on an in-memory database (SQLite silently keeps
         // it at MEMORY); harmless to request unconditionally.
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -6458,6 +6468,23 @@ impl Store {
     /// wrong). Only this folder; no reconverge.
     pub(crate) fn restart_folder_delta(&self, folder: &str) -> Result<(), StoreError> {
         clear_folder_links_on(&self.conn, folder)
+    }
+
+    /// Forgets `folder_id`'s delta link, whose sync state Graph reports
+    /// expired (#2113, #1975): the link, what it covered (`history_scope`)
+    /// and its refused-expand mark (#2054), so the folder's phase 1 (a head,
+    /// or a small folder's full delta) runs again. A backfill walk under
+    /// way is kept (its link, count, scope and refused-expand mark): its own
+    /// page links did not expire, and it resumes once the head is stored.
+    /// Unlike `restart_folder_delta`, which starts the walk over too.
+    pub(crate) fn expire_delta_link(&self, folder_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE folders SET delta_link = NULL, history_scope = NULL,
+                                reminder_expand_refused = 0
+             WHERE id = ?1",
+            params![folder_id],
+        )?;
+        Ok(())
     }
 
     /// The folders a queued rename or move names (#1910), and those a
@@ -11803,6 +11830,25 @@ mod calendar_tests {
         });
         drop(a);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2113 (#1892 plan-5): every store connection waits `BUSY_TIMEOUT`
+    /// for the other's lock, set by `Store::init` itself, not left to
+    /// rusqlite's default (5 s too, so the connection here starts at zero).
+    /// That the wait works across two connections is
+    /// `writes_wait_out_another_connections_write`.
+    #[test]
+    fn plan_5_store_sets_a_busy_timeout() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.busy_timeout(Duration::ZERO).unwrap();
+        let busy_ms = |c: &Connection| -> i64 {
+            c.query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(busy_ms(&conn), 0);
+        let s = Store::init(conn).unwrap();
+        assert!(!BUSY_TIMEOUT.is_zero());
+        assert_eq!(busy_ms(&s.conn), BUSY_TIMEOUT.as_millis() as i64);
     }
 
     fn ev(id: &str, start: &str, end: &str) -> NewEvent {
@@ -23271,6 +23317,39 @@ mod mark_folder_read_tests {
                 ("F".to_string(), None, 0),
                 ("G".to_string(), Some("b".to_string()), 3)
             ]
+        );
+    }
+
+    /// #2113 (#1975 plan-410): an expired delta link goes with its scope
+    /// and refused-expand mark; the folder's backfill walk stays, and so
+    /// does every other folder's link.
+    #[test]
+    fn plan_410_expire_delta_link_keeps_the_backfill_walk() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F", 0);
+        folder(&s, "G", 0);
+        s.set_head_link("F", "https://graph/head?F", true).unwrap();
+        s.set_head_link("G", "https://graph/head?G", true).unwrap();
+        s.set_backfill_progress("F", "https://graph/page2?F", 40, SCOPE_WINDOW)
+            .unwrap();
+        s.set_backfill_expand_refused("F").unwrap();
+        s.expire_delta_link("F").unwrap();
+        assert_eq!(s.get_delta_link("F").unwrap(), None);
+        assert!(!s.reminder_expand_refused("F").unwrap());
+        let h = s.folder_history("F").unwrap().unwrap();
+        assert_eq!(h.scope, None);
+        assert!(!h.has_delta_link);
+        assert_eq!(h.backfill_link.as_deref(), Some("https://graph/page2?F"));
+        assert_eq!(h.synced, 40);
+        assert_eq!(h.backfill_scope.as_deref(), Some(SCOPE_WINDOW));
+        assert!(s.backfill_expand_refused("F").unwrap());
+        // G is untouched.
+        let g = s.folder_history("G").unwrap().unwrap();
+        assert_eq!(g.scope.as_deref(), Some(SCOPE_HEAD));
+        assert!(s.reminder_expand_refused("G").unwrap());
+        assert_eq!(
+            s.get_delta_link("G").unwrap().as_deref(),
+            Some("https://graph/head?G")
         );
     }
 }

@@ -158,7 +158,9 @@ issue number to find its notes.
   a folder's backfill walk run next on request, remembered (#2133),
   OAuth tokens in the platform secret store, a plaintext fallback and its
   warning (#1877), contact search folded in Rust, word-prefix rank, `all_contacts`
-  (#1890).
+  (#1890), a sign-out's back-off, an expired delta link re-running phase 1, a 404
+  `DeleteEvent`, `local:` ids in message ops, the store's busy timeout, one-line
+  token-endpoint errors (#2113).
 
 ## Build and test
 

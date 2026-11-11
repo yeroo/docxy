@@ -24,10 +24,21 @@
 //! `Delete`, and #2054's `DismissMessageReminder` / `SnoozeMessageReminder`)
 //! read the store only to resolve their id (`Store::current_id`) at apply
 //! time, so an op queued with an id an earlier op moved reaches the
-//! message (#1896). `Delete` and the two reminder ops send nothing for an
-//! id that still resolves to `local:` (never on Graph). `Move` hands the id Graph minted back to the
-//! caller ([`Applied::Moved`]), which re-keys the store: a store failure
-//! there must not turn into a retry of a move Graph already made.
+//! message (#1896). None of them sends an id that still resolves to
+//! `local:` (#2113, #1892 plan-1): Graph would refuse it and the op be
+//! quarantined. Such an id is a draft not on Graph yet: its `SaveDraft` was
+//! refused, or none is queued yet (a composer that has not saved). While a
+//! `SaveDraft` or `SendDraft` of that draft is queued, `MarkRead`,
+//! `SetFlag`, `SetCategories` and `Move` wait (`for_draft`: an error, so
+//! the drain keeps them, with an attempt, as before) and reach the Graph id
+//! once that op created the draft. With none queued they are done, as
+//! `Delete` and the reminder ops always are. The local write stays: once
+//! the draft is created on Graph (in Drafts), its first Drafts delta round
+//! brings Graph's state, which overwrites a flag or categories set
+//! meanwhile, and files a draft moved meanwhile back in Drafts. `Move` hands the id Graph minted
+//! back to the caller ([`Applied::Moved`]), which re-keys the store: a
+//! store failure there must not turn into a retry of a move Graph already
+//! made.
 
 use crate::graph::client::{
     EventFieldSet, EventInput, GraphClient, GraphError, HTTP_ERROR_TEXT_MAX, RsvpKind,
@@ -106,6 +117,36 @@ fn resolve(store: &Store, id: &str) -> Result<String, GraphError> {
         .map_err(|e| GraphError::Parse(e.to_string()))
 }
 
+/// The id the message `id` names on Graph now (`resolve`), or `None` while
+/// it still resolves to `local:`: it never reached Graph, so a message op
+/// sends nothing (#1884, #2113).
+fn on_graph(store: &Store, id: &str) -> Result<Option<String>, GraphError> {
+    let id = resolve(store, id)?;
+    Ok((!id.starts_with("local:")).then_some(id))
+}
+
+/// [`on_graph`] for an op that waits for its draft (#2113 r1): an id that
+/// still resolves to `local:` while a `SaveDraft` or `SendDraft` of that
+/// draft is queued is an error, so the drain keeps the op (an attempt, as
+/// any refusal) and sends it under the Graph id once that op created the
+/// draft. Nothing is sent meanwhile. With none queued: `None`, done.
+fn for_draft(store: &Store, id: &str) -> Result<Option<String>, GraphError> {
+    let target = resolve(store, id)?;
+    if !target.starts_with("local:") {
+        return Ok(Some(target));
+    }
+    for row in store.pending_ops().map_err(store_err)? {
+        if let OutboxOp::SaveDraft { id: draft } | OutboxOp::SendDraft { id: draft } = &row.op {
+            if resolve(store, draft)? == target {
+                return Err(GraphError::Parse(format!(
+                    "draft {target} is not on Graph yet"
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Dispatches `op` to the Graph mutation it represents.
 ///
 /// A message op addresses the message under the id it is stored as now
@@ -114,7 +155,9 @@ fn resolve(store: &Store, id: &str) -> Result<String, GraphError> {
 pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Applied, GraphError> {
     match op {
         OutboxOp::Move { id, dest } => {
-            let old_id = resolve(store, id)?;
+            let Some(old_id) = for_draft(store, id)? else {
+                return Ok(Applied::Done);
+            };
             // A folder created locally is sent under its Graph id (#1910).
             // One still `local:` never reached Graph: nothing is sent. The
             // store drops such a move when it discards the folder (its
@@ -415,11 +458,18 @@ fn copy_folder(
 /// `CreateFolder`, `MoveFolder`, `CopyFolder`).
 fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(), GraphError> {
     match op {
-        OutboxOp::MarkRead { id, read } => client.mark_read(&resolve(store, id)?, *read),
-        OutboxOp::SetFlag { id, flagged } => client.set_flag(&resolve(store, id)?, *flagged),
-        OutboxOp::SetCategories { id, categories } => {
-            client.set_message_categories(&resolve(store, id)?, categories)
-        }
+        OutboxOp::MarkRead { id, read } => match for_draft(store, id)? {
+            Some(id) => client.mark_read(&id, *read),
+            None => Ok(()),
+        },
+        OutboxOp::SetFlag { id, flagged } => match for_draft(store, id)? {
+            Some(id) => client.set_flag(&id, *flagged),
+            None => Ok(()),
+        },
+        OutboxOp::SetCategories { id, categories } => match for_draft(store, id)? {
+            Some(id) => client.set_message_categories(&id, categories),
+            None => Ok(()),
+        },
         OutboxOp::Move { .. }
         | OutboxOp::CreateFolder { .. }
         | OutboxOp::MoveFolder { .. }
@@ -443,17 +493,16 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
             // (#1884), a moved message's old id under its new one (#1896).
             // Graph soft-deletes it to Recoverable Items, not to Deleted
             // Items (a `Move` to that folder). An id that still resolves to
-            // `local:` is treated as
-            // never having reached Graph, so nothing is deleted there (as
-            // `DeleteEvent`). That is not an invariant: a delete on another
+            // `local:` is treated as never having reached Graph, so nothing
+            // is deleted there (as `DeleteEvent`), even while its draft's
+            // `SaveDraft` is queued (#2113: that op's fate is #1892 plan-4).
+            // That is not an invariant: a delete on another
             // connection that lands while this engine's `create_draft` is in
             // flight leaves `reconcile_id` no row to rename, and the Graph
             // draft stays for a later sync to bring back.
-            let target = resolve(store, id)?;
-            if target.starts_with("local:") {
-                Ok(())
-            } else {
-                client.delete_message(&target)
+            match on_graph(store, id)? {
+                Some(target) => client.delete_message(&target),
+                None => Ok(()),
             }
         }
         OutboxOp::SaveDraft { id } => ensure_draft_on_graph(client, store, id).map(|_id| ()),
@@ -525,9 +574,18 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
         OutboxOp::DeleteEvent { id } => {
             // A local:-only event never reached Graph; nothing to delete there.
             if id.starts_with("local:") {
-                Ok(())
-            } else {
-                client.delete_event(id)
+                return Ok(());
+            }
+            // A 404 is done (#2113, #2038 plan-del404): the event is gone,
+            // which is what the user asked for (a retry after a DELETE whose
+            // answer was lost, or an event removed elsewhere), and the
+            // caller deleted its row before the command
+            // (`SyncCommand::DeleteEvent`). As `RemoveFromCalendar`;
+            // unlike `CancelEvent`, whose 404 leaves only Graph knowing
+            // whether the cancellation went out.
+            match client.delete_event(id) {
+                Ok(()) | Err(GraphError::NotFound) => Ok(()),
+                Err(e) => Err(e),
             }
         }
         OutboxOp::CancelEvent { id, comment } => {
@@ -578,23 +636,17 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
         // stored as now (a move before the drain, #1896). The engine refuses
         // a `local:` id; one that still resolves to `local:` was never on
         // Graph and sends nothing.
-        OutboxOp::DismissMessageReminder { id } => {
-            let target = resolve(store, id)?;
-            if target.starts_with("local:") {
-                return Ok(());
-            }
-            client.dismiss_message_reminder(&target)
-        }
+        OutboxOp::DismissMessageReminder { id } => match on_graph(store, id)? {
+            Some(target) => client.dismiss_message_reminder(&target),
+            None => Ok(()),
+        },
         OutboxOp::SnoozeMessageReminder {
             id,
             new_reminder_utc,
-        } => {
-            let target = resolve(store, id)?;
-            if target.starts_with("local:") {
-                return Ok(());
-            }
-            client.snooze_message_reminder(&target, new_reminder_utc)
-        }
+        } => match on_graph(store, id)? {
+            Some(target) => client.snooze_message_reminder(&target, new_reminder_utc),
+            None => Ok(()),
+        },
         OutboxOp::CreateContact { .. } => unreachable!("apply_op handles CreateContact"),
         // Only the properties the edit changed (#2063), each with its value
         // at send time. An id still `local:` after resolving has no Graph
@@ -4182,6 +4234,196 @@ mod tests {
         .unwrap();
 
         assert!(srv.requests().is_empty());
+    }
+
+    /// #2113 (#1892 plan-1): every message op on a draft that never
+    /// reached Graph (its id still resolves to `local:`) sends nothing and
+    /// is done, as `Delete` is.
+    #[test]
+    fn plan_1_local_id_ops_send_nothing() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store.create_local_draft("Hi", "", "", "body").unwrap();
+        let ops = [
+            OutboxOp::MarkRead {
+                id: local_id.clone(),
+                read: true,
+            },
+            OutboxOp::SetFlag {
+                id: local_id.clone(),
+                flagged: true,
+            },
+            OutboxOp::SetCategories {
+                id: local_id.clone(),
+                categories: vec!["Red".into()],
+            },
+            OutboxOp::Move {
+                id: local_id.clone(),
+                dest: "ARCHIVE".into(),
+            },
+            OutboxOp::Delete {
+                id: local_id.clone(),
+            },
+        ];
+        for op in &ops {
+            assert_eq!(apply_op(&c, &store, op), Ok(Applied::Done), "{op:?}");
+        }
+        assert!(srv.requests().is_empty(), "{:?}", srv.requests());
+    }
+
+    /// #2113 r1: while the draft's own `SaveDraft` (or `SendDraft`) is
+    /// queued, a message op on its still-`local:` id waits (an error the
+    /// drain retries) with nothing sent, and reaches the Graph id once that
+    /// op created the draft. `Delete` is done at once.
+    #[test]
+    fn plan_1_an_op_waits_while_its_draft_op_is_queued() {
+        for queued in ["save", "send"] {
+            let srv = FakeServer::start(vec![route("PATCH", "/me/messages/", 200, "{}")]);
+            let c = GraphClient::new(&srv.base_url, "AT");
+            let store = Store::open_in_memory().unwrap();
+            let local_id = store.create_local_draft("Hi", "", "", "body").unwrap();
+            let other = store.create_local_draft("Other", "", "", "body").unwrap();
+            let draft_op = |id: &str| match queued {
+                "save" => OutboxOp::SaveDraft { id: id.into() },
+                _ => OutboxOp::SendDraft { id: id.into() },
+            };
+            // Another draft's op does not hold this one.
+            store.enqueue_op(&draft_op(&other)).unwrap();
+            let flag = OutboxOp::SetFlag {
+                id: local_id.clone(),
+                flagged: true,
+            };
+            assert_eq!(apply_op(&c, &store, &flag), Ok(Applied::Done));
+            store.enqueue_op(&draft_op(&local_id)).unwrap();
+            for op in [
+                OutboxOp::MarkRead {
+                    id: local_id.clone(),
+                    read: true,
+                },
+                flag.clone(),
+                OutboxOp::SetCategories {
+                    id: local_id.clone(),
+                    categories: vec!["Red".into()],
+                },
+                OutboxOp::Move {
+                    id: local_id.clone(),
+                    dest: "ARCHIVE".into(),
+                },
+            ] {
+                let r = apply_op(&c, &store, &op);
+                assert!(
+                    matches!(&r, Err(GraphError::Parse(m)) if m.contains("not on Graph yet")),
+                    "{queued} {op:?}: {r:?}"
+                );
+            }
+            assert_eq!(
+                apply_op(
+                    &c,
+                    &store,
+                    &OutboxOp::Delete {
+                        id: local_id.clone()
+                    }
+                ),
+                Ok(Applied::Done)
+            );
+            assert!(srv.requests().is_empty(), "{:?}", srv.requests());
+            // The draft op created it: the waiting op goes to the Graph id.
+            store.reconcile_id(&local_id, "GRAPH-1").unwrap();
+            assert_eq!(apply_op(&c, &store, &flag), Ok(Applied::Done));
+            let reqs = srv.requests();
+            assert_eq!(reqs.len(), 1);
+            assert_eq!(reqs[0].path, "/me/messages/GRAPH-1");
+        }
+    }
+
+    /// A reconciled `local:` id still reaches Graph, under its Graph id.
+    #[test]
+    fn plan_1_a_reconciled_local_id_is_sent_under_its_graph_id() {
+        let srv = FakeServer::start(vec![
+            route("PATCH", "/me/messages/", 200, "{}"),
+            route(
+                "POST",
+                "/me/messages/GRAPH-9/move",
+                201,
+                r#"{"id":"MOVED-9"}"#,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store.create_local_draft("Hi", "", "", "body").unwrap();
+        store.reconcile_id(&local_id, "GRAPH-9").unwrap();
+        for op in [
+            OutboxOp::MarkRead {
+                id: local_id.clone(),
+                read: true,
+            },
+            OutboxOp::SetFlag {
+                id: local_id.clone(),
+                flagged: true,
+            },
+            OutboxOp::SetCategories {
+                id: local_id.clone(),
+                categories: vec!["Red".into()],
+            },
+        ] {
+            assert_eq!(apply_op(&c, &store, &op), Ok(Applied::Done), "{op:?}");
+        }
+        let moved = apply_op(
+            &c,
+            &store,
+            &OutboxOp::Move {
+                id: local_id.clone(),
+                dest: "ARCHIVE".into(),
+            },
+        );
+        assert_eq!(
+            moved,
+            Ok(Applied::Moved {
+                old_id: "GRAPH-9".into(),
+                new_id: "MOVED-9".into()
+            })
+        );
+        let paths: Vec<(String, String)> = srv
+            .requests()
+            .into_iter()
+            .map(|r| (r.method, r.path))
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                ("PATCH", "/me/messages/GRAPH-9"),
+                ("PATCH", "/me/messages/GRAPH-9"),
+                ("PATCH", "/me/messages/GRAPH-9"),
+                ("POST", "/me/messages/GRAPH-9/move"),
+            ]
+            .map(|(m, p)| (m.to_string(), p.to_string()))
+        );
+    }
+
+    /// #2113 (#2038 plan-del404): a `DeleteEvent` answered 404 is done:
+    /// the event is gone, as the user asked. Any other refusal is still
+    /// the drain's to handle.
+    #[test]
+    fn plan_del404_delete_event_404_is_done() {
+        let srv = FakeServer::start(vec![
+            route("DELETE", "/me/events/GONE", 404, ""),
+            route(
+                "DELETE",
+                "/me/events/DENIED",
+                403,
+                r#"{"error":{"code":"ErrorAccessDenied","message":"no"}}"#,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let delete = |id: &str| apply_op(&c, &store, &OutboxOp::DeleteEvent { id: id.into() });
+        assert_eq!(delete("GONE"), Ok(Applied::Done));
+        assert!(
+            matches!(delete("DENIED"), Err(GraphError::Http { status: 403, .. })),
+            "a 403 is not done"
+        );
+        assert_eq!(srv.requests().len(), 2);
     }
 
     // --- A flagged message's reminder (#2054) ------------------------------
