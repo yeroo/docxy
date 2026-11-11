@@ -4398,8 +4398,10 @@ impl Engine {
             self.park_on_store_error(&id, e);
             return;
         }
-        // The walk and the last round on the folder's own link are done
-        // (#2125). A failed mark is not reported (a display figure).
+        // The walk completed (#2125): its deltaLink is now the folder's
+        // sync point, whether the last round on the folder's own link ran,
+        // ended without a link or was skipped as expired. A failed mark is
+        // not reported (a display figure).
         let _ = self.store.mark_folder_synced(&id);
         self.emit(SyncEvent::MessagesUpdated {
             folder_id: id.clone(),

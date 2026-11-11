@@ -2787,7 +2787,7 @@ icon without a request per row: each `MessageRow` (every read: `message_row`,
   PATCH's `reread_message` (`get_message`, with the expand) restores it. Known limit: if
   that re-read is itself refused the expand (a 400, then a plain GET), it carries no
   class, and the row reads off until a delta reports the message again.
-- Migration: `migrate_meeting_reminder`, last in `Store::init`, probes for the column in
+- Migration: `migrate_meeting_reminder`, in `Store::init`, probes for the column in
   one IMMEDIATE transaction and adds it (old rows read false). It does **not** reset any
   delta or backfill state, unlike #2054's, #2081's and #2088's: the expand did not
   change, so every stored link already brings the bit and the class, and a store older
@@ -2870,7 +2870,7 @@ links in one cheap read.
   join). The messages side of the query's WHERE is spelled as the index's, or SQLite
   will not use it. The index is created in `Store::init` after the migration, never in `schema.rs`:
   that batch runs before the migrations, when an old table has no `in_reply_to`.
-- Migration: `migrate_reply_links`, last in `Store::init`, probes for
+- Migration: `migrate_reply_links`, in `Store::init`, probes for
   `internet_message_id` in one IMMEDIATE transaction, adds both columns (old rows read
   `""`) and resets every folder's delta and backfill state and both expand-refused marks,
   as #2088's does. A link minted before #2096 carries the old `$select` and `$expand`, so
@@ -3591,7 +3591,8 @@ A host can draw classic Outlook's Folder Size dialog. The Local Data tab comes f
   flag is needed. A local draft (`create_local_draft`) reads `None` until Graph's copy brings
   one. `reconcile_id` and `follow_move` re-key the row and keep it. The FTS update trigger reads
   other columns (#1913), so no size write touches `messages_fts`.
-- Migration `migrate_message_size` is the last one in `Store::init`: one IMMEDIATE transaction
+- Migration `migrate_message_size` runs in `Store::init` before `UNSIZED_INDEX_SQL` (which reads
+  its column) and `migrate_folder_synced_at` (#2125): one IMMEDIATE transaction
   that probes `pragma_table_info('messages')` for `size` and adds both columns. Unlike
   #2081/#2088/#2096, it resets **no** delta or backfill state. The size fill covers both the
   rows stored before #2123 and the rows a link minted before it brings later.
@@ -4173,9 +4174,12 @@ literally would break.
     whole) or `set_head_link` (a head).
   - `backfill_step`, after `complete_backfill` (the walk and its last round on the folder's own
     link are done).
-  - Not marked: a failed round (`react`), a checkpoint stop, a last page with no deltaLink, a
-    failed link write, a folder being emptied, an expired link (the phase-1 re-run marks when it
-    completes), an intermediate backfill page.
+  - Not marked by `sync_folder_delta_once`: a failed round (`react`), a checkpoint stop, a last
+    page with no deltaLink, a failed link write, a folder being emptied, an expired link (the
+    phase-1 re-run marks when it completes). Not marked by `backfill_step`: an intermediate
+    page, or a final step whose own-link round failed or stopped. A completed walk marks
+    whatever its last own-link round did (ran, ended without a link, or was skipped as
+    expired), as the walk's deltaLink becomes the folder's sync point.
   - A failed mark is not reported: it is a display figure. No `SyncEvent`: a host reads
     `folder_stats` when its dialog opens.
 - What keeps the time and what clears it:

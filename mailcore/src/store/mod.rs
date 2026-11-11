@@ -9039,8 +9039,9 @@ fn migrate_reply_links(conn: &Connection) -> Result<bool, StoreError> {
 /// engine's size fill reads the sizes of the rows stored before, and of
 /// any row a link minted before #2123 (which keeps the old `$expand`)
 /// brings later, a cheap `$select=id` listing instead of a re-enumeration.
-/// Last in `Store::init`. One IMMEDIATE transaction that probes for `size`
-/// first; a store that has it (every fresh one) is left alone. Returns
+/// In `Store::init` before `UNSIZED_INDEX_SQL`, which reads its column (and
+/// before `migrate_folder_synced_at`, #2125). One IMMEDIATE transaction that
+/// probes for `size` first; a store that has it (every fresh one) is left alone. Returns
 /// whether it migrated.
 fn migrate_message_size(conn: &Connection) -> Result<bool, StoreError> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
