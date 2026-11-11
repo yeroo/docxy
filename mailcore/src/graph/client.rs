@@ -231,6 +231,16 @@ impl RsvpKind {
             _ => None,
         }
     }
+
+    /// The inverse of [`RsvpKind::from_status`]: the `response_status`
+    /// vocabulary an outbox op stores (#2132, `OutboxOp::RespondMeeting`).
+    pub fn as_status(self) -> &'static str {
+        match self {
+            RsvpKind::Accept => "accepted",
+            RsvpKind::Decline => "declined",
+            RsvpKind::Tentative => "tentativelyAccepted",
+        }
+    }
 }
 
 /// Checks an RSVP's proposed new time before anything is sent or written
@@ -2198,12 +2208,13 @@ impl GraphClient {
     /// are sent ONLY when `status == Scheduled` (a non-scheduled write that
     /// carried them would make Graph reject the PATCH or flip to scheduled).
     pub fn set_automatic_replies(&self, r: &AutomaticReplies) -> Result<(), GraphError> {
-        self.send(
-            Method::Patch,
-            "/me/mailboxSettings",
-            Some(automatic_replies_body(r)),
-            &[],
-        )?;
+        self.set_automatic_replies_body(automatic_replies_body(r))
+    }
+
+    /// PATCH `/me/mailboxSettings` with a body `automatic_replies_body`
+    /// built earlier: what an `OutboxOp::SetAutomaticReplies` stored (#2132).
+    pub fn set_automatic_replies_body(&self, body: String) -> Result<(), GraphError> {
+        self.send(Method::Patch, "/me/mailboxSettings", Some(body), &[])?;
         Ok(())
     }
 
@@ -2913,7 +2924,7 @@ fn value_array<'a>(v: &'a Value, key: &str) -> Result<&'a [Value], GraphError> {
 /// Builds the PATCH body for `set_automatic_replies`:
 /// `{"automaticRepliesSetting": {...}}`. Scheduled start/end are included only
 /// for `OofStatus::Scheduled`.
-fn automatic_replies_body(r: &AutomaticReplies) -> String {
+pub(crate) fn automatic_replies_body(r: &AutomaticReplies) -> String {
     let mut setting = vec![
         (
             "status".to_string(),
@@ -6228,6 +6239,13 @@ mod tests {
         );
         assert_eq!(RsvpKind::from_status("none"), None);
         assert_eq!(RsvpKind::from_status(""), None);
+    }
+
+    #[test]
+    fn rsvp_kind_as_status_round_trips() {
+        for kind in [RsvpKind::Accept, RsvpKind::Decline, RsvpKind::Tentative] {
+            assert_eq!(RsvpKind::from_status(kind.as_status()), Some(kind));
+        }
     }
 
     #[test]

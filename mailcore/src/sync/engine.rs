@@ -48,21 +48,23 @@
 use crate::auth::{self, AuthConfig, TokenSet};
 use crate::graph::client::{
     BATCH_MAX, BatchRequest, CalendarDeltaCursor, ContactFieldSet, DeltaCursor, EventInput,
-    GraphClient, GraphError, RsvpKind, event_body_json, event_zone_error, is_expired_sync_state,
-    moved_message_id, rsvp_proposal,
+    GraphClient, GraphError, RsvpKind, automatic_replies_body, event_body_json, event_zone_error,
+    is_expired_sync_state, moved_message_id, rsvp_proposal,
 };
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
     AutomaticReplies, DeltaItem, Event, EventDeltaItem, FolderContact, MailFolder, Me,
-    MeetingMessage, MeetingMessageType, Message, MessageFields, Recipient, ScheduleEntry,
-    SearchHit, parse_folder_size,
+    MeetingMessage, Message, MessageFields, Recipient, ScheduleEntry, SearchHit, parse_folder_size,
 };
 use crate::store::{
     CalendarRound, DroppedFolderMove, FetchedCalendar, FolderDelete, FolderHistory, FolderRow,
     FolderWriteResult, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee, NewEvent, OutboundAttachment,
     OutboxOp, OutboxRow, RangeStamp, SCOPE_ALL, SCOPE_WINDOW, Store, StoreError, SyncedCalendar,
 };
-use crate::sync::outbox::{Applied, apply_op, apply_send, send_error_text};
+use crate::sync::outbox::{
+    Applied, NOT_A_MEETING_INVITE, PROPOSALS_REFUSED, apply_op, apply_send,
+    remove_from_calendar_refusal, send_error_text,
+};
 use crate::tokencache;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -200,6 +202,10 @@ pub enum SyncCommand {
     /// is a full file path (the UI has already resolved the Downloads
     /// directory and sanitized the attachment's name into a single path
     /// component) — the engine only writes to it, it doesn't derive it.
+    /// One kept at a [`SyncCommand::Shutdown`] is queued as
+    /// [`crate::store::OutboxOp::SaveAttachment`] and saved by the next
+    /// start (#2132); a `dest` that is not UTF-8 then cannot be stored, and
+    /// is an `Error`.
     SaveAttachment {
         message_id: String,
         attachment_id: String,
@@ -210,7 +216,8 @@ pub enum SyncCommand {
     /// is chosen by sniffing the bytes (`BEGIN:VCALENDAR` → calendar item).
     /// `dest_base` is the Downloads path WITHOUT an extension (the UI can't
     /// know it until the bytes are sniffed). Emits [`SyncEvent::AttachmentSaved`]
-    /// with the extended path, the same event `SaveAttachment` uses.
+    /// with the extended path, the same event `SaveAttachment` uses. Kept
+    /// at a `Shutdown`, it is queued as `SaveAttachment` is (#2132).
     SaveItemAttachment {
         message_id: String,
         attachment_id: String,
@@ -226,6 +233,11 @@ pub enum SyncCommand {
     /// event or the response is refused: by `graph::client::rsvp_proposal`
     /// before any Graph call, or, once the invite's event id is fetched and
     /// before the response POST, by a stored event that disallows proposals.
+    /// One kept at a [`SyncCommand::Shutdown`] (#2132) is checked by
+    /// `rsvp_proposal` only and queued as
+    /// [`crate::store::OutboxOp::RespondMeeting`]; the next start's drain
+    /// does the rest, on the invite as it is stored then (a move queued
+    /// before it lands first), with the same refusals and events.
     RespondMeeting {
         message_id: String,
         kind: RsvpKind,
@@ -269,7 +281,11 @@ pub enum SyncCommand {
     /// remove while the first waits offline) is not queued again, as its
     /// DELETE would 404 once the first went out. The host must not delete the
     /// row first. The cancellation message itself stays in mail: the host may
-    /// delete it.
+    /// delete it. One kept at a [`SyncCommand::Shutdown`] (#2132) reads
+    /// nothing: it is queued as [`crate::store::OutboxOp::RemoveFromCalendar`]
+    /// (once per message), and the next start's drain reads the message,
+    /// refuses as above, sends the DELETE and only then deletes the row and
+    /// emits the events.
     RemoveFromCalendar { message_id: String },
     /// Fetch the mailbox's automatic-replies config
     /// (`GraphClient::get_automatic_replies`) and emit
@@ -277,7 +293,10 @@ pub enum SyncCommand {
     FetchAutomaticReplies,
     /// Write the mailbox's automatic-replies config
     /// (`GraphClient::set_automatic_replies`) and emit
-    /// [`SyncEvent::AutomaticRepliesUpdated`]. Direct call, no outbox.
+    /// [`SyncEvent::AutomaticRepliesUpdated`]. Direct call, no outbox,
+    /// except one kept at a [`SyncCommand::Shutdown`] (#2132): its PATCH
+    /// body is queued as [`crate::store::OutboxOp::SetAutomaticReplies`]
+    /// for the next start.
     SetAutomaticReplies { replies: AutomaticReplies },
     /// Fetch who is signed in (`GraphClient::me`) and emit
     /// [`SyncEvent::ProfileFetched`]. Direct call, no outbox.
@@ -1481,6 +1500,29 @@ enum Drain {
     Aborted,
 }
 
+/// The `Error` text for a command kept at a `Shutdown` (#2132) that Graph
+/// refused at the next start (`err`: a 4xx, a 404 or a parse failure); the
+/// drain drops it at once. `None` for every other op.
+fn direct_op_refusal(op: &OutboxOp, err: &GraphError) -> Option<String> {
+    match op {
+        OutboxOp::RespondMeeting { message_id, .. } => {
+            Some(format!("respond to meeting {message_id}: {err}"))
+        }
+        OutboxOp::RemoveFromCalendar { message_id } => {
+            Some(format!("remove from calendar {message_id}: {err}"))
+        }
+        OutboxOp::SetAutomaticReplies { .. } => Some(format!("set automatic replies: {err}")),
+        OutboxOp::SaveAttachment {
+            message_id,
+            attachment_id,
+            ..
+        } => Some(format!(
+            "save attachment {attachment_id} of {message_id}: {err}"
+        )),
+        _ => None,
+    }
+}
+
 /// The event a reminder op (#2025) names; `None` for every other op.
 fn reminder_op_event(op: &OutboxOp) -> Option<&str> {
     match op {
@@ -1598,9 +1640,13 @@ fn served_at_checkpoint(cmd: &SyncCommand) -> bool {
 /// store and queues its outbox op (or only drains one the host's store
 /// write queued) with no Graph request first, so what it did lasts and the
 /// next start's drain sends it; the shutdown stops the drain before its
-/// first request. False for a read, and for a write that has to reach
-/// Graph before anything can be queued (it would only be lost half way).
-/// No `_` arm: a new command has to be decided here.
+/// first request. True too for a write, or a save, that otherwise reaches
+/// Graph directly (#2132): at a shutdown its arm runs only its local
+/// checks and queues an outbox op for the next start. False for a read,
+/// and for a reply or forward draft: Graph builds it from the original, so
+/// nothing the user wrote is lost, and creating it at the next start would
+/// open a compose editor the user did not ask for then. No `_` arm: a new
+/// command has to be decided here.
 fn persists_at_shutdown(cmd: &SyncCommand) -> bool {
     match cmd {
         SyncCommand::MarkRead { .. }
@@ -1632,6 +1678,12 @@ fn persists_at_shutdown(cmd: &SyncCommand) -> bool {
         | SyncCommand::DeleteFolder { .. }
         | SyncCommand::EmptyFolder { .. }
         | SyncCommand::MoveFolderMessages { .. }
+        // Sent directly, but queued at a shutdown (#2132).
+        | SyncCommand::RespondMeeting { .. }
+        | SyncCommand::RemoveFromCalendar { .. }
+        | SyncCommand::SetAutomaticReplies { .. }
+        | SyncCommand::SaveAttachment { .. }
+        | SyncCommand::SaveItemAttachment { .. }
         // In memory, or a local preference whose refresh the shutdown
         // skips (`set_calendars`).
         | SyncCommand::SetFastFolders { .. }
@@ -1650,8 +1702,6 @@ fn persists_at_shutdown(cmd: &SyncCommand) -> bool {
         | SyncCommand::FetchMessage { .. }
         | SyncCommand::FetchFolderSizes { .. }
         | SyncCommand::FetchAttachments { .. }
-        | SyncCommand::SaveAttachment { .. }
-        | SyncCommand::SaveItemAttachment { .. }
         | SyncCommand::FetchMeetingMessage { .. }
         | SyncCommand::FetchAutomaticReplies
         | SyncCommand::FetchProfile
@@ -1661,12 +1711,7 @@ fn persists_at_shutdown(cmd: &SyncCommand) -> bool {
         | SyncCommand::FetchCalendarRange { .. }
         | SyncCommand::FetchEventSeries { .. }
         | SyncCommand::FetchEventInstances { .. }
-        // Writes that reach Graph outside the outbox: `RespondMeeting` and
-        // `RemoveFromCalendar` read the meeting first, `SetAutomaticReplies`
-        // PATCHes, `ComposeReply`/`ComposeForward` POST `createReply`.
-        | SyncCommand::RespondMeeting { .. }
-        | SyncCommand::RemoveFromCalendar { .. }
-        | SyncCommand::SetAutomaticReplies { .. }
+        // A reply or forward draft POSTs `createReply`/`createForward`.
         | SyncCommand::ComposeReply { .. }
         | SyncCommand::ComposeForward { .. }
         | SyncCommand::Shutdown => false,
@@ -4806,7 +4851,18 @@ impl Engine {
                             self.follow_folder_rekeys();
                             self.emit(SyncEvent::FoldersUpdated);
                         }
-                        Applied::Done => {}
+                        Applied::Done => self.direct_op_done(&row.op),
+                        Applied::Refused(e) => self.emit(SyncEvent::Error(e)),
+                        Applied::RemovedFromCalendar { event_id } => {
+                            if let OutboxOp::RemoveFromCalendar { message_id } = &row.op {
+                                self.removed_from_calendar(message_id.clone(), event_id);
+                            }
+                        }
+                        Applied::Downloaded { bytes } => {
+                            if let OutboxOp::SaveAttachment { dest, item, .. } = &row.op {
+                                self.write_attachment(PathBuf::from(dest), *item, &bytes);
+                            }
+                        }
                     }
                     // The last queued op for a contact a refusal left owed.
                     if contact_op(&row.op).is_some() && self.settle_contact_rereads() {
@@ -4858,6 +4914,17 @@ impl Engine {
                     // listing corrects the rest.
                     if folder_op(&row.op).is_some() {
                         self.refuse_folder_write(&row, &other);
+                        continue;
+                    }
+                    // A command kept at a `Shutdown` (#2132) wrote nothing
+                    // locally, and a retry of a 4xx (a 404 too: a message
+                    // gone is a failed answer or save) or a parse failure
+                    // changes nothing: drop it at the first refusal with
+                    // one `Error`, and no quarantine, whose reconverge
+                    // would have nothing to bring back.
+                    if let Some(e) = direct_op_refusal(&row.op, &other) {
+                        self.store.drop_op(row.seq);
+                        self.emit(SyncEvent::Error(e));
                         continue;
                     }
                     // A reminder op (#2025) wrote nothing locally, and a
@@ -6954,31 +7021,19 @@ impl Engine {
     /// `SyncEvent::AttachmentSaved` — or `SyncEvent::Error` on either a
     /// Graph failure (via `react`, so auth/throttle/transport get the same
     /// central handling as every other Graph call) or a filesystem failure
-    /// writing `dest`. Same signed-in guard as `fetch_body`.
+    /// writing `dest`. Same signed-in guard as `fetch_body`. At a
+    /// `Shutdown` it is queued instead (`queue_save`, #2132).
     fn save_attachment(&mut self, message_id: &str, attachment_id: &str, dest: PathBuf) {
         if self.token.is_none() {
             self.emit(SyncEvent::Error("not signed in".to_string()));
             return;
         }
+        if self.shutting_down {
+            self.queue_save(message_id, attachment_id, dest, false);
+            return;
+        }
         match self.with_auth(|c| c.get_attachment_bytes(message_id, attachment_id)) {
-            Ok(bytes) => {
-                if let Some(parent) = dest.parent() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        self.emit(SyncEvent::Error(format!(
-                            "failed to create {}: {e}",
-                            parent.display()
-                        )));
-                        return;
-                    }
-                }
-                match std::fs::write(&dest, &bytes) {
-                    Ok(()) => self.emit(SyncEvent::AttachmentSaved { path: dest }),
-                    Err(e) => self.emit(SyncEvent::Error(format!(
-                        "failed to save attachment to {}: {e}",
-                        dest.display()
-                    ))),
-                }
-            }
+            Ok(bytes) => self.write_attachment(dest, false, &bytes),
             Err(e) => {
                 self.react(e);
             }
@@ -6988,46 +7043,107 @@ impl Engine {
     /// Fetch one nested-item attachment's raw bytes
     /// (`GraphClient::get_attachment_raw_value`) and write them to
     /// `{dest_base}.ics`/`{dest_base}.eml` (sniffed via `looks_like_icalendar`),
-    /// then emit `SyncEvent::AttachmentSaved` — same error handling and
-    /// signed-in guard as `save_attachment`.
+    /// then emit `SyncEvent::AttachmentSaved` — same error handling,
+    /// signed-in guard and shutdown path as `save_attachment`.
     fn save_item_attachment(&mut self, message_id: &str, attachment_id: &str, dest_base: PathBuf) {
         if self.token.is_none() {
             self.emit(SyncEvent::Error("not signed in".to_string()));
             return;
         }
+        if self.shutting_down {
+            self.queue_save(message_id, attachment_id, dest_base, true);
+            return;
+        }
         match self.with_auth(|c| c.get_attachment_raw_value(message_id, attachment_id)) {
-            Ok(bytes) => {
-                let ext = if looks_like_icalendar(&bytes) {
-                    "ics"
-                } else {
-                    "eml"
-                };
-                // Append the extension (do NOT use with_extension — dest_base
-                // may legitimately contain dots we must keep).
-                let mut os = dest_base.into_os_string();
-                os.push(".");
-                os.push(ext);
-                let dest = std::path::PathBuf::from(os);
-                if let Some(parent) = dest.parent() {
-                    if let Err(e) = std::fs::create_dir_all(parent) {
-                        self.emit(SyncEvent::Error(format!(
-                            "failed to create {}: {e}",
-                            parent.display()
-                        )));
-                        return;
-                    }
-                }
-                match std::fs::write(&dest, &bytes) {
-                    Ok(()) => self.emit(SyncEvent::AttachmentSaved { path: dest }),
-                    Err(e) => self.emit(SyncEvent::Error(format!(
-                        "failed to save attachment to {}: {e}",
-                        dest.display()
-                    ))),
-                }
-            }
+            Ok(bytes) => self.write_attachment(dest_base, true, &bytes),
             Err(e) => {
                 self.react(e);
             }
+        }
+    }
+
+    /// A save kept at a `Shutdown` (#2132): queued as an
+    /// `OutboxOp::SaveAttachment` for the next start, with nothing sent. A
+    /// path that is not UTF-8 cannot be stored: it is refused, as a failed
+    /// save, and nothing is queued.
+    fn queue_save(&mut self, message_id: &str, attachment_id: &str, dest: PathBuf, item: bool) {
+        let dest = match dest.into_os_string().into_string() {
+            Ok(d) => d,
+            Err(d) => {
+                self.emit(SyncEvent::Error(format!(
+                    "failed to save attachment to {}: not a UTF-8 path",
+                    PathBuf::from(d).display()
+                )));
+                return;
+            }
+        };
+        self.enqueue_and_drain(OutboxOp::SaveAttachment {
+            message_id: message_id.to_string(),
+            attachment_id: attachment_id.to_string(),
+            dest,
+            item,
+        });
+    }
+
+    /// Writes a downloaded attachment to `dest` and emits
+    /// `SyncEvent::AttachmentSaved`, or `SyncEvent::Error` when the folder
+    /// or the file cannot be written. `item` (a nested item,
+    /// `SaveItemAttachment`): `dest` is the base, and the extension is
+    /// sniffed (`.ics` for a calendar item, else `.eml`). From the command
+    /// and from a queued `OutboxOp::SaveAttachment` (#2132).
+    fn write_attachment(&mut self, dest: PathBuf, item: bool, bytes: &[u8]) {
+        let dest = if item {
+            let ext = if looks_like_icalendar(bytes) {
+                "ics"
+            } else {
+                "eml"
+            };
+            // Append the extension (do NOT use with_extension — dest_base
+            // may legitimately contain dots we must keep).
+            let mut os = dest.into_os_string();
+            os.push(".");
+            os.push(ext);
+            PathBuf::from(os)
+        } else {
+            dest
+        };
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                self.emit(SyncEvent::Error(format!(
+                    "failed to create {}: {e}",
+                    parent.display()
+                )));
+                return;
+            }
+        }
+        match std::fs::write(&dest, bytes) {
+            Ok(()) => self.emit(SyncEvent::AttachmentSaved { path: dest }),
+            Err(e) => self.emit(SyncEvent::Error(format!(
+                "failed to save attachment to {}: {e}",
+                dest.display()
+            ))),
+        }
+    }
+
+    /// The events of a command kept at a `Shutdown` (#2132) whose op the
+    /// drain applied with nothing left to do: `MeetingResponded` and
+    /// `AutomaticRepliesUpdated`, as the command emits them. Nothing for any
+    /// other op.
+    fn direct_op_done(&mut self, op: &OutboxOp) {
+        match op {
+            OutboxOp::RespondMeeting {
+                message_id, kind, ..
+            } => {
+                // `apply_op` refuses a kind it cannot read before sending.
+                if let Some(kind) = RsvpKind::from_status(kind) {
+                    self.emit(SyncEvent::MeetingResponded {
+                        message_id: message_id.clone(),
+                        kind,
+                    });
+                }
+            }
+            OutboxOp::SetAutomaticReplies { .. } => self.emit(SyncEvent::AutomaticRepliesUpdated),
+            _ => {}
         }
     }
 
@@ -7035,12 +7151,8 @@ impl Engine {
     /// row's organizer disallows proposals (`allow_new_time_proposals`). A
     /// missing row refuses nothing: Graph has the last word.
     fn proposals_refused(&self, id: &str, window: &Option<(String, String)>) -> Option<String> {
-        (window.is_some()
-            && self
-                .store
-                .event(id)
-                .is_ok_and(|row| row.is_some_and(|r| !r.allow_new_time_proposals)))
-        .then(|| "the organizer does not allow new time proposals".to_string())
+        (window.is_some() && self.store.refuses_time_proposals(id))
+            .then(|| PROPOSALS_REFUSED.to_string())
     }
 
     /// Resolve a meeting-invite message's underlying event
@@ -7050,7 +7162,10 @@ impl Engine {
     /// checked first (`rsvp_proposal`, before the event id's GET; the stored
     /// event's `allow_new_time_proposals` once the id is known): a refusal
     /// emits `SyncEvent::Error` and sends nothing, and needs no reset, as
-    /// nothing was written locally. On success emit
+    /// nothing was written locally. At a `Shutdown` (#2132) a response that
+    /// passes `rsvp_proposal` is queued instead, as an
+    /// `OutboxOp::RespondMeeting` with the approved window, and the rest
+    /// runs at the next start. On success emit
     /// `SyncEvent::MeetingResponded`; a message that resolves to no event
     /// emits `SyncEvent::Error` ("not a meeting invite"); a Graph failure goes
     /// through `react` for the standard auth/throttle/transport handling. Same
@@ -7074,10 +7189,22 @@ impl Engine {
                 return;
             }
         };
+        if self.shutting_down {
+            let (proposed_start_utc, proposed_end_utc) = proposed.unzip();
+            self.enqueue_and_drain(OutboxOp::RespondMeeting {
+                message_id: message_id.to_string(),
+                kind: kind.as_status().to_string(),
+                comment,
+                send_response,
+                proposed_start_utc,
+                proposed_end_utc,
+            });
+            return;
+        }
         let event_id = match self.with_auth(|c| c.meeting_event_id(message_id)) {
             Ok(Some(id)) => id,
             Ok(None) => {
-                self.emit(SyncEvent::Error("not a meeting invite".to_string()));
+                self.emit(SyncEvent::Error(NOT_A_MEETING_INVITE.to_string()));
                 return;
             }
             Err(e) => {
@@ -7139,10 +7266,24 @@ impl Engine {
         }
     }
 
-    /// [`SyncCommand::RemoveFromCalendar`] (#2024).
+    /// [`SyncCommand::RemoveFromCalendar`] (#2024). At a `Shutdown` (#2132)
+    /// it is queued instead, as an `OutboxOp::RemoveFromCalendar` the next
+    /// start sends (once: one still queued for the message is not queued
+    /// again), with nothing read or written now.
     fn remove_from_calendar(&mut self, message_id: String) {
         if self.token.is_none() {
             self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        if self.shutting_down {
+            let op = OutboxOp::RemoveFromCalendar { message_id };
+            let queued = self
+                .store
+                .pending_ops()
+                .is_ok_and(|ops| ops.iter().any(|r| r.op == op));
+            if !queued {
+                self.enqueue_and_drain(op);
+            }
             return;
         }
         let meeting = match self.with_auth(|c| c.meeting_message(&message_id)) {
@@ -7152,28 +7293,18 @@ impl Engine {
                 return;
             }
         };
-        if meeting.message_type != Some(MeetingMessageType::Cancelled) {
-            self.emit(SyncEvent::Error(format!(
-                "remove from calendar {message_id}: not a meeting cancellation"
-            )));
+        // Not a cancellation, or the organizer's meeting, whose DELETE would
+        // send every attendee a cancellation.
+        if let Some(e) = remove_from_calendar_refusal(&message_id, &meeting) {
+            self.emit(SyncEvent::Error(e));
             return;
         }
         // Removed already (here, in another client, or by the server): the
         // user's goal holds, so this is no error, and there is nothing to send.
         let Some(event_id) = meeting.event_id else {
-            self.emit(SyncEvent::RemovedFromCalendar {
-                message_id,
-                event_id: None,
-            });
+            self.removed_from_calendar(message_id, None);
             return;
         };
-        // The organizer's DELETE would send every attendee a cancellation.
-        if meeting.is_organizer {
-            self.emit(SyncEvent::Error(format!(
-                "remove from calendar {message_id}: the user organizes this meeting"
-            )));
-            return;
-        }
         // Queue first, as `cancel_event` does: a row deleted before a queue
         // that then fails would stay hidden, as delta reports no change for it.
         // A remove of the same event still queued (offline, a back-off) is
@@ -7193,20 +7324,29 @@ impl Engine {
             )));
             return;
         }
-        // The event, or a cancelled series' master and its occurrences. A
-        // failed delete leaves the op queued: the next calendar round removes
-        // the row.
-        if let Err(e) = self.store.delete_event_series(&event_id) {
-            self.emit(SyncEvent::Error(format!(
-                "remove from calendar {message_id}: {e}"
-            )));
+        // A failed local delete leaves the op queued: the next calendar
+        // round removes the row.
+        self.removed_from_calendar(message_id, Some(event_id));
+        self.drain_queued();
+    }
+
+    /// Remove from Calendar's local half (#2024), from the command and
+    /// from its queued op (#2132): with an `event_id`, delete the stored
+    /// event, or a cancelled series' master and its occurrences, and emit
+    /// `CalendarUpdated`; then `RemovedFromCalendar`.
+    fn removed_from_calendar(&mut self, message_id: String, event_id: Option<String>) {
+        if let Some(event_id) = &event_id {
+            if let Err(e) = self.store.delete_event_series(event_id) {
+                self.emit(SyncEvent::Error(format!(
+                    "remove from calendar {message_id}: {e}"
+                )));
+            }
+            self.emit(SyncEvent::CalendarUpdated);
         }
-        self.emit(SyncEvent::CalendarUpdated);
         self.emit(SyncEvent::RemovedFromCalendar {
             message_id,
-            event_id: Some(event_id),
+            event_id,
         });
-        self.drain_queued();
     }
 
     /// Fetch the mailbox's automatic-replies config and emit
@@ -7280,6 +7420,13 @@ impl Engine {
     fn set_automatic_replies(&mut self, replies: AutomaticReplies) {
         if self.token.is_none() {
             self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        // At a `Shutdown` (#2132): the PATCH body, queued for the next start.
+        if self.shutting_down {
+            self.enqueue_and_drain(OutboxOp::SetAutomaticReplies {
+                body: automatic_replies_body(&replies),
+            });
             return;
         }
         match self.with_auth(|c| c.set_automatic_replies(&replies)) {
@@ -8638,7 +8785,7 @@ fn sign_out_error(e: &std::io::Error, file_left: bool) -> String {
 mod tests {
     use super::*;
     use crate::auth::{AuthConfig, TokenSet};
-    use crate::graph::model::{ContactFields, FolderContact};
+    use crate::graph::model::{ContactFields, FolderContact, MeetingMessageType};
     use crate::store::Store;
     use crate::testserver::{FakeServer, Route};
     use crate::tokencache;
@@ -19798,6 +19945,240 @@ mod tests {
         );
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2132: the ops a `Shutdown` queued for the commands that otherwise
+    /// reach Graph directly, as the next start finds them. A refusal, local
+    /// (not an invite, not a cancellation, a proposal the stored event
+    /// disallows) or Graph's (a 404 attachment), drops its op at once with
+    /// one `Error`, the command's own text for a local one, and no
+    /// quarantine: no reconverge, and nothing sent after it.
+    #[test]
+    fn a_refused_direct_op_is_dropped_without_a_reconverge() {
+        let dir_out = unique_dir("refused-direct-op-out");
+        let dest = dir_out.join("never.txt");
+        let ops = vec![
+            OutboxOp::RespondMeeting {
+                message_id: "M1".into(),
+                kind: "accepted".into(),
+                comment: None,
+                send_response: true,
+                proposed_start_utc: None,
+                proposed_end_utc: None,
+            },
+            OutboxOp::RemoveFromCalendar {
+                message_id: "M2".into(),
+            },
+            OutboxOp::SaveAttachment {
+                message_id: "M3".into(),
+                attachment_id: "A1".into(),
+                dest: dest.to_str().unwrap().into(),
+                item: false,
+            },
+            OutboxOp::RespondMeeting {
+                message_id: "M4".into(),
+                kind: "declined".into(),
+                comment: None,
+                send_response: true,
+                proposed_start_utc: Some("2026-07-21T14:00:00Z".into()),
+                proposed_end_utc: Some("2026-07-21T15:00:00Z".into()),
+            },
+        ];
+        let queued = ops.clone();
+        let (srv, handle, store_path, dir) = spawn_calendar_engine(
+            "refused-direct-op",
+            vec![
+                // M1 carries no event: not an invite.
+                get_route("/me/messages/M1?", 200, r#"{"id":"M1"}"#),
+                get_route(
+                    "/me/messages/M2?",
+                    200,
+                    r#"{"id":"M2","meetingMessageType":"meetingRequest",
+                        "event":{"id":"E1","isOrganizer":false}}"#,
+                ),
+                // No route for M3's attachment: a 404.
+                get_route(
+                    "/me/messages/M4?",
+                    200,
+                    r#"{"id":"M4","event":{"id":"E1"}}"#,
+                ),
+                post_route("/me/events/", 202, ""),
+            ],
+            |s| {
+                s.upsert_event(&answerable("E1", false)).unwrap();
+                for op in &queued {
+                    s.enqueue_op(op).unwrap();
+                }
+            },
+        );
+        let mine = |m: &str| {
+            m == NOT_A_MEETING_INVITE
+                || m.starts_with("remove from calendar M2")
+                || m.starts_with("save attachment A1 of M3")
+                || m == PROPOSALS_REFUSED
+        };
+        let mut errors = Vec::new();
+        wait_for(&handle.evt_rx, |e| {
+            if let SyncEvent::Error(m) = e
+                && mine(m)
+            {
+                errors.push(m.clone());
+            }
+            errors.len() == 4
+        });
+        assert_eq!(errors[0], NOT_A_MEETING_INVITE);
+        assert_eq!(
+            errors[1],
+            "remove from calendar M2: not a meeting cancellation"
+        );
+        assert!(
+            errors[2].starts_with("save attachment A1 of M3: "),
+            "{errors:?}"
+        );
+        assert_eq!(errors[3], PROPOSALS_REFUSED);
+        let store = Store::open(&store_path).unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()),
+            "every refused op is dropped: {:?}",
+            store.pending_ops()
+        );
+        assert!(!store.reconverge_pending().unwrap(), "no quarantine");
+        assert!(!dest.exists());
+        assert_eq!(ids_in(&store, "CAL-A"), ["E1"]);
+        assert!(
+            !srv.requests()
+                .iter()
+                .any(|r| r.path.starts_with("/me/events/")),
+            "no answer or delete went out: {:?}",
+            srv.requests()
+        );
+        // Each refusal is reported once.
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let later: Vec<SyncEvent> = handle.evt_rx.iter().collect();
+        assert!(
+            !later
+                .iter()
+                .any(|e| matches!(e, SyncEvent::Error(m) if mine(m))),
+            "{later:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir_out);
+    }
+
+    /// #2132: a 5xx keeps a queued `SetAutomaticReplies` under the outbox
+    /// back-off, as every op, with no `Error` and no event yet; the PATCH
+    /// sends the body stored at the command.
+    #[test]
+    fn a_5xx_keeps_a_direct_op_queued() {
+        let body = r#"{"automaticRepliesSetting":{"status":"alwaysEnabled"}}"#;
+        let op = OutboxOp::SetAutomaticReplies { body: body.into() };
+        let queued = op.clone();
+        let (srv, handle, store_path, dir) = spawn_calendar_engine(
+            "direct-op-5xx",
+            vec![patch_route("/me/mailboxSettings", 500, "")],
+            |s| {
+                s.enqueue_op(&queued).unwrap();
+            },
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || store
+                .pending_ops()
+                .unwrap()
+                .first()
+                .is_some_and(|r| r.attempts == 1)),
+            "{:?}",
+            store.pending_ops()
+        );
+        let ops: Vec<OutboxOp> = store
+            .pending_ops()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.op)
+            .collect();
+        assert_eq!(ops, [op]);
+        let patches: Vec<_> = srv
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PATCH")
+            .collect();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].body, body);
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let seen: Vec<SyncEvent> = handle.evt_rx.iter().collect();
+        assert!(
+            !seen.iter().any(|e| match e {
+                SyncEvent::AutomaticRepliesUpdated => true,
+                SyncEvent::Error(m) => m.contains("automatic replies"),
+                _ => false,
+            }),
+            "{seen:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2132: a queued `RemoveFromCalendar` reads the cancellation, sends
+    /// the DELETE (`delete_status`: a 404 is done too), and only then deletes
+    /// the row and emits `CalendarUpdated` and `RemovedFromCalendar`.
+    fn queued_remove_from_calendar(tag: &str, delete_status: u16) {
+        let op = OutboxOp::RemoveFromCalendar {
+            message_id: "M1".into(),
+        };
+        let (srv, handle, store_path, dir) = spawn_calendar_engine(
+            tag,
+            vec![
+                message_route(
+                    "M1",
+                    r#"{"id":"M1","meetingMessageType":"meetingCancelled",
+                        "event":{"id":"E1","isOrganizer":false}}"#,
+                ),
+                Route {
+                    status: delete_status,
+                    ..delete_route("/me/events/E1")
+                },
+            ],
+            |s| {
+                s.upsert_event(&meeting("E1", false)).unwrap();
+                s.upsert_event(&meeting("E2", false)).unwrap();
+                s.enqueue_op(&op).unwrap();
+            },
+        );
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::RemovedFromCalendar { .. })
+        });
+        assert_eq!(
+            seen.last(),
+            Some(&SyncEvent::RemovedFromCalendar {
+                message_id: "M1".into(),
+                event_id: Some("E1".into()),
+            })
+        );
+        assert!(seen.contains(&SyncEvent::CalendarUpdated), "{seen:?}");
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::Error(m) if m.contains("M1"))),
+            "{seen:?}"
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["E2"]);
+        assert!(store.pending_ops().unwrap().is_empty());
+        assert_eq!(
+            non_gets(&srv),
+            [("DELETE".to_string(), "/me/events/E1".to_string())]
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_queued_remove_from_calendar_deletes_the_row_after_the_delete() {
+        queued_remove_from_calendar("queued-remove-from-calendar", 204);
+    }
+
+    #[test]
+    fn a_queued_remove_from_calendar_takes_a_404_as_done() {
+        queued_remove_from_calendar("queued-remove-from-calendar-404", 404);
     }
 
     /// The organizer's view: a calendar sync stores each attendee's
@@ -35597,6 +35978,527 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// The five commands that otherwise reach Graph directly (#2132),
+        /// each with the op a shutdown queues for it. `file` is the plain
+        /// save's path, `item_base` the nested item's base.
+        fn direct_commands(file: &Path, item_base: &Path) -> (Vec<SyncCommand>, Vec<OutboxOp>) {
+            use crate::graph::model::{ExternalAudience, OofStatus};
+            let replies = AutomaticReplies {
+                status: OofStatus::AlwaysEnabled,
+                external_audience: ExternalAudience::All,
+                internal_message: "Away".into(),
+                external_message: "Away".into(),
+                scheduled_start_utc: String::new(),
+                scheduled_end_utc: String::new(),
+            };
+            let body = automatic_replies_body(&replies);
+            let commands = vec![
+                SyncCommand::RespondMeeting {
+                    message_id: "INV".into(),
+                    kind: RsvpKind::Tentative,
+                    comment: Some("maybe".into()),
+                    send_response: true,
+                    // Stored as `rsvp_proposal` normalises it.
+                    proposed_start_utc: Some("2026-07-21T14:00:00.0000000".into()),
+                    proposed_end_utc: Some("2026-07-21T15:00:00Z".into()),
+                },
+                SyncCommand::RemoveFromCalendar {
+                    message_id: "CAN".into(),
+                },
+                SyncCommand::SetAutomaticReplies { replies },
+                SyncCommand::SaveAttachment {
+                    message_id: "ATT".into(),
+                    attachment_id: "A1".into(),
+                    dest: file.to_path_buf(),
+                },
+                SyncCommand::SaveItemAttachment {
+                    message_id: "ATT".into(),
+                    attachment_id: "B2".into(),
+                    dest_base: item_base.to_path_buf(),
+                },
+            ];
+            let ops = vec![
+                OutboxOp::RespondMeeting {
+                    message_id: "INV".into(),
+                    kind: "tentativelyAccepted".into(),
+                    comment: Some("maybe".into()),
+                    send_response: true,
+                    proposed_start_utc: Some("2026-07-21T14:00:00Z".into()),
+                    proposed_end_utc: Some("2026-07-21T15:00:00Z".into()),
+                },
+                OutboxOp::RemoveFromCalendar {
+                    message_id: "CAN".into(),
+                },
+                OutboxOp::SetAutomaticReplies { body },
+                OutboxOp::SaveAttachment {
+                    message_id: "ATT".into(),
+                    attachment_id: "A1".into(),
+                    dest: file.to_str().unwrap().into(),
+                    item: false,
+                },
+                OutboxOp::SaveAttachment {
+                    message_id: "ATT".into(),
+                    attachment_id: "B2".into(),
+                    dest: item_base.to_str().unwrap().into(),
+                    item: true,
+                },
+            ];
+            (commands, ops)
+        }
+
+        /// Whether a request is one of the five commands' (#2132): an
+        /// invite or cancellation read, an attachment, an answer, a
+        /// calendar DELETE or the automatic-replies PATCH.
+        fn direct_request(path: &str) -> bool {
+            ["/me/messages/INV", "/me/messages/CAN", "/me/messages/ATT"]
+                .iter()
+                .any(|p| path.starts_with(p))
+                || path.starts_with("/me/events/")
+                || path.starts_with("/me/mailboxSettings")
+        }
+
+        /// #2132, criterion 1: behind the paced burst of `Delete`s, the
+        /// five commands that otherwise reach Graph directly and a
+        /// `Shutdown` send nothing, and the engine still returns within the
+        /// bound; each is queued behind the deletes, in order, with nothing
+        /// written. A second engine on the store sends the deletes and then
+        /// each of them, in queue order, and emits its event, writing both
+        /// files. `drop_handle`: the handle is dropped instead of a
+        /// `Shutdown`.
+        fn direct_writes_and_saves_then(tag: &str, drop_handle: bool) {
+            let all = ids(20);
+            let mut routes: Vec<(Route, Option<usize>, Duration)> =
+                vec![(route("DELETE", "/me/messages/", 204, ""), None, PACE)];
+            routes.extend(
+                inbox_routes(&all)
+                    .into_iter()
+                    .map(|r| (r, None, Duration::ZERO)),
+            );
+            let srv = FakeServer::start_paced(routes);
+            let dir = unique_dir(tag);
+            let store_path = dir.join("mail.db");
+            let token_path = dir.join("token.bin");
+            seed_token(&token_path);
+            let file = dir.join("saved").join("report.txt");
+            let item_base = dir.join("saved").join("invite");
+            let (commands, ops) = direct_commands(&file, &item_base);
+            let handle = spawn_on(&srv, &store_path, &token_path);
+            wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::State(SyncState::Idle))
+            });
+            let store = Store::open(&store_path).unwrap();
+
+            let SyncHandle { cmd_tx, evt_rx } = handle;
+            for id in &all {
+                cmd_tx.send(SyncCommand::Delete { id: id.clone() }).unwrap();
+            }
+            for cmd in commands {
+                cmd_tx.send(cmd).unwrap();
+            }
+            if drop_handle {
+                drop(cmd_tx);
+            } else {
+                cmd_tx.send(SyncCommand::Shutdown).unwrap();
+            }
+            let mut seen = Vec::new();
+            let deadline = Instant::now() + RETURN_BOUND;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match evt_rx.recv_timeout(left) {
+                    Ok(e) => seen.push(e),
+                    Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Timeout) => {
+                        panic!("the engine did not return within {RETURN_BOUND:?}")
+                    }
+                }
+            }
+
+            let direct: Vec<String> = srv
+                .requests()
+                .into_iter()
+                .map(|r| r.path)
+                .filter(|p| direct_request(p))
+                .collect();
+            assert!(direct.is_empty(), "sent at the shutdown: {direct:?}");
+            assert!(
+                !seen.iter().any(|e| matches!(
+                    e,
+                    SyncEvent::MeetingResponded { .. }
+                        | SyncEvent::RemovedFromCalendar { .. }
+                        | SyncEvent::AutomaticRepliesUpdated
+                        | SyncEvent::AttachmentSaved { .. }
+                        | SyncEvent::Error(_)
+                )),
+                "{seen:?}"
+            );
+            let sent = deletes(&srv);
+            assert!(sent.len() <= 1, "sent before the shutdown: {sent:?}");
+            let want: Vec<OutboxOp> = all
+                .iter()
+                .filter(|id| !sent.contains(id))
+                .map(|id| OutboxOp::Delete { id: id.clone() })
+                .chain(ops.iter().cloned())
+                .collect();
+            assert_eq!(queued(&store), want, "queued behind the deletes, in order");
+            assert!(!file.parent().unwrap().exists(), "nothing written yet");
+
+            // The next start sends them, behind the deletes.
+            let srv2 = FakeServer::start({
+                let mut r = vec![
+                    route("DELETE", "/me/messages/", 204, ""),
+                    route(
+                        "GET",
+                        "/me/messages/INV?",
+                        200,
+                        r#"{"id":"INV","event":{"id":"E1"}}"#,
+                    ),
+                    route("POST", "/me/events/E1/tentativelyAccept", 202, ""),
+                    route(
+                        "GET",
+                        "/me/messages/CAN?",
+                        200,
+                        r#"{"id":"CAN","meetingMessageType":"meetingCancelled","event":{"id":"E2","isOrganizer":false}}"#,
+                    ),
+                    route("DELETE", "/me/events/E2", 204, ""),
+                    route("PATCH", "/me/mailboxSettings", 200, "{}"),
+                    route(
+                        "GET",
+                        "/me/messages/ATT/attachments/A1",
+                        200,
+                        r#"{"contentBytes":"aGVsbG8="}"#,
+                    ),
+                    route(
+                        "GET",
+                        "/me/messages/ATT/attachments/B2/$value",
+                        200,
+                        "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n",
+                    ),
+                ];
+                r.extend(inbox_routes(&[]));
+                r
+            });
+            let handle2 = spawn_on(&srv2, &store_path, &token_path);
+            let mut done = 0;
+            let seen = wait_for(&handle2.evt_rx, |e| {
+                if matches!(
+                    e,
+                    SyncEvent::MeetingResponded { .. }
+                        | SyncEvent::RemovedFromCalendar { .. }
+                        | SyncEvent::AutomaticRepliesUpdated
+                        | SyncEvent::AttachmentSaved { .. }
+                ) {
+                    done += 1;
+                }
+                done == 5
+            });
+            let ics = dir.join("saved").join("invite.ics");
+            let want_events = [
+                SyncEvent::MeetingResponded {
+                    message_id: "INV".into(),
+                    kind: RsvpKind::Tentative,
+                },
+                SyncEvent::RemovedFromCalendar {
+                    message_id: "CAN".into(),
+                    event_id: Some("E2".into()),
+                },
+                SyncEvent::AutomaticRepliesUpdated,
+                SyncEvent::AttachmentSaved { path: file.clone() },
+                SyncEvent::AttachmentSaved { path: ics.clone() },
+            ];
+            let at = |want: &SyncEvent| {
+                seen.iter()
+                    .position(|e| e == want)
+                    .unwrap_or_else(|| panic!("no {want:?} in {seen:?}"))
+            };
+            let order: Vec<usize> = want_events.iter().map(at).collect();
+            assert!(order.is_sorted(), "events in queue order: {seen:?}");
+            assert!(
+                seen[..order[1]].contains(&SyncEvent::CalendarUpdated),
+                "the calendar changes before the removal: {seen:?}"
+            );
+            assert!(
+                !seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+                "{seen:?}"
+            );
+            assert_eq!(std::fs::read(&file).unwrap(), b"hello");
+            assert!(
+                std::fs::read_to_string(&ics)
+                    .unwrap()
+                    .starts_with("BEGIN:VCALENDAR")
+            );
+            assert!(
+                wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()),
+                "{:?}",
+                queued(&store)
+            );
+
+            let requests: Vec<(String, String)> = srv2
+                .requests()
+                .into_iter()
+                .filter(|r| direct_request(&r.path) || r.method == "DELETE")
+                .map(|r| (r.method, r.path))
+                .collect();
+            let mut want: Vec<(String, String)> = all
+                .iter()
+                .filter(|id| !sent.contains(id))
+                .map(|id| ("DELETE".to_string(), format!("/me/messages/{id}")))
+                .collect();
+            for (m, p) in [
+                (
+                    "GET",
+                    "/me/messages/INV?$expand=microsoft.graph.eventMessageRequest/event($select=id)",
+                ),
+                ("POST", "/me/events/E1/tentativelyAccept"),
+                (
+                    "GET",
+                    "/me/messages/CAN?$expand=microsoft.graph.eventMessage/event($select=id,isOrganizer)",
+                ),
+                ("DELETE", "/me/events/E2"),
+                ("PATCH", "/me/mailboxSettings"),
+                ("GET", "/me/messages/ATT/attachments/A1"),
+                ("GET", "/me/messages/ATT/attachments/B2/$value"),
+            ] {
+                want.push((m.to_string(), p.to_string()));
+            }
+            assert_eq!(requests, want, "the deletes, then the five, in order");
+            // The answer carries the approved window.
+            let answer = srv2
+                .requests()
+                .into_iter()
+                .find(|r| r.path == "/me/events/E1/tentativelyAccept")
+                .unwrap();
+            let v = crate::json::parse(&answer.body).unwrap();
+            assert_eq!(
+                v.get("proposedNewTime")
+                    .and_then(|t| t.get("start"))
+                    .and_then(|s| s.get("dateTime"))
+                    .and_then(crate::json::Value::as_str),
+                Some("2026-07-21T14:00:00")
+            );
+            assert_eq!(
+                v.get("comment").and_then(crate::json::Value::as_str),
+                Some("maybe")
+            );
+            let _ = handle2.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn direct_writes_and_saves_survive_a_shutdown() {
+            direct_writes_and_saves_then("shutdown-direct", false);
+        }
+
+        #[test]
+        fn direct_writes_and_saves_survive_a_dropped_handle() {
+            direct_writes_and_saves_then("shutdown-direct-dropped", true);
+        }
+
+        /// Runs a first engine whose startup pass lists the folders slowly
+        /// (as `shutdown_during_the_startup_pass_persists_writes_and_skips_reads`),
+        /// with `commands` and a `Shutdown` on the channel at its first
+        /// checkpoint, over a store holding F1 (with `messages`) and F2.
+        /// Returns the store and token paths, the directory and the first
+        /// engine's requests.
+        fn shut_down_during_startup(
+            tag: &str,
+            messages: &[&str],
+            commands: Vec<SyncCommand>,
+        ) -> (PathBuf, PathBuf, PathBuf, Vec<(String, String)>) {
+            let srv = FakeServer::start_paced(
+                inbox_routes(&[])
+                    .into_iter()
+                    .map(|r| {
+                        let pace = if r.path_prefix == "/me/mailFolders" {
+                            Duration::from_millis(400)
+                        } else {
+                            Duration::ZERO
+                        };
+                        (r, None, pace)
+                    })
+                    .collect(),
+            );
+            let dir = unique_dir(tag);
+            let store_path = dir.join("mail.db");
+            let token_path = dir.join("token.bin");
+            seed_token(&token_path);
+            {
+                let s = Store::open(&store_path).unwrap();
+                s.upsert_folder(&folder("F1", "Inbox")).unwrap();
+                s.upsert_folder(&folder("F2", "Archive")).unwrap();
+                for id in messages {
+                    let v = crate::json::parse(&message_json(id, false, false, &[])).unwrap();
+                    s.upsert_message("F1", &Message::from_json(&v).unwrap())
+                        .unwrap();
+                }
+            }
+            let handle = spawn_on(&srv, &store_path, &token_path);
+            for cmd in commands {
+                handle.cmd_tx.send(cmd).unwrap();
+            }
+            handle.cmd_tx.send(SyncCommand::Shutdown).unwrap();
+            returns_within(&handle.evt_rx, RETURN_BOUND);
+            let requests = srv
+                .requests()
+                .into_iter()
+                .map(|r| (r.method, r.path))
+                .collect();
+            (store_path, token_path, dir, requests)
+        }
+
+        /// #2132: an invite moved and then answered before a `Shutdown` is
+        /// answered at the next start on the id Graph gave it: the move
+        /// queued before the answer lands first, and the answer reads the
+        /// invite as it is stored then (#1896).
+        #[test]
+        fn a_moved_invite_is_answered_on_its_new_id_after_a_restart() {
+            let (store_path, token_path, dir, requests) = shut_down_during_startup(
+                "shutdown-moved-invite",
+                &["INV"],
+                vec![
+                    SyncCommand::Move {
+                        id: "INV".into(),
+                        dest: "F2".into(),
+                    },
+                    SyncCommand::RespondMeeting {
+                        message_id: "INV".into(),
+                        kind: RsvpKind::Accept,
+                        comment: None,
+                        send_response: true,
+                        proposed_start_utc: None,
+                        proposed_end_utc: None,
+                    },
+                ],
+            );
+            assert!(
+                requests
+                    .iter()
+                    .all(|(m, p)| m == "GET" && p.starts_with("/me/mailFolders")),
+                "only the startup pass's own requests: {requests:?}"
+            );
+            let store = Store::open(&store_path).unwrap();
+            assert_eq!(
+                queued(&store),
+                vec![
+                    OutboxOp::Move {
+                        id: "INV".into(),
+                        dest: "F2".into()
+                    },
+                    OutboxOp::RespondMeeting {
+                        message_id: "INV".into(),
+                        kind: "accepted".into(),
+                        comment: None,
+                        send_response: true,
+                        proposed_start_utc: None,
+                        proposed_end_utc: None,
+                    },
+                ]
+            );
+
+            let folders = r#"{"value":[
+                {"id":"F1","displayName":"Inbox","parentFolderId":null,"totalItemCount":0,"unreadItemCount":0,"wellKnownName":"inbox"},
+                {"id":"F2","displayName":"Archive","parentFolderId":null,"totalItemCount":0,"unreadItemCount":0}]}"#;
+            let empty_delta = |f: &str| {
+                format!(
+                    r#"{{"value":[],"@odata.deltaLink":"/me/mailFolders/{f}/messages/delta?token=D1"}}"#
+                )
+            };
+            let srv2 = FakeServer::start(vec![
+                route("POST", "/me/messages/INV/move", 201, r#"{"id":"INV2"}"#),
+                route(
+                    "GET",
+                    "/me/messages/INV2?",
+                    200,
+                    r#"{"id":"INV2","event":{"id":"E1"}}"#,
+                ),
+                route("POST", "/me/events/E1/accept", 202, ""),
+                route(
+                    "GET",
+                    "/me/mailFolders/F1/childFolders",
+                    200,
+                    r#"{"value":[]}"#,
+                ),
+                route(
+                    "GET",
+                    "/me/mailFolders/F2/childFolders",
+                    200,
+                    r#"{"value":[]}"#,
+                ),
+                route(
+                    "GET",
+                    "/me/mailFolders/F1/messages/delta",
+                    200,
+                    &empty_delta("F1"),
+                ),
+                route(
+                    "GET",
+                    "/me/mailFolders/F2/messages/delta",
+                    200,
+                    &empty_delta("F2"),
+                ),
+                route("GET", "/me/mailFolders", 200, folders),
+            ]);
+            let handle2 = spawn_on(&srv2, &store_path, &token_path);
+            let seen = wait_for(&handle2.evt_rx, |e| {
+                matches!(e, SyncEvent::MeetingResponded { .. } | SyncEvent::Error(_))
+            });
+            assert_eq!(
+                seen.last(),
+                Some(&SyncEvent::MeetingResponded {
+                    message_id: "INV".into(),
+                    kind: RsvpKind::Accept,
+                })
+            );
+            let requests: Vec<(String, String)> = srv2
+                .requests()
+                .into_iter()
+                .filter(|r| !r.path.starts_with("/me/mailFolders"))
+                .map(|r| (r.method, r.path))
+                .collect();
+            assert_eq!(
+                requests[..3],
+                [
+                    ("POST".to_string(), "/me/messages/INV/move".to_string()),
+                    (
+                        "GET".to_string(),
+                        "/me/messages/INV2?$expand=microsoft.graph.eventMessageRequest/event($select=id)"
+                            .to_string()
+                    ),
+                    ("POST".to_string(), "/me/events/E1/accept".to_string()),
+                ],
+                "{requests:?}"
+            );
+            assert!(store.pending_ops().unwrap().is_empty());
+            let _ = handle2.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// #2132: a reply draft asked for before a `Shutdown` is dropped:
+        /// nothing is sent, and nothing is queued for the next start (which
+        /// would open a compose editor the user did not ask for then).
+        #[test]
+        fn compose_reply_before_a_shutdown_is_dropped() {
+            let (store_path, _token_path, dir, requests) = shut_down_during_startup(
+                "shutdown-compose-reply",
+                &["A"],
+                vec![
+                    SyncCommand::ComposeReply {
+                        id: "A".into(),
+                        all: false,
+                    },
+                    SyncCommand::ComposeForward { id: "A".into() },
+                ],
+            );
+            assert!(
+                requests
+                    .iter()
+                    .all(|(m, p)| m == "GET" && p.starts_with("/me/mailFolders")),
+                "no createReply or createForward: {requests:?}"
+            );
+            let store = Store::open(&store_path).unwrap();
+            assert!(queued(&store).is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         #[test]
         fn persists_at_shutdown_lists_the_outbox_writes() {
             assert!(persists_at_shutdown(&SyncCommand::Delete {
@@ -35615,6 +36517,19 @@ mod tests {
             assert!(!persists_at_shutdown(&SyncCommand::Refresh));
             assert!(!persists_at_shutdown(&SyncCommand::ComposeForward {
                 id: "x".into()
+            }));
+            assert!(!persists_at_shutdown(&SyncCommand::ComposeReply {
+                id: "x".into(),
+                all: true
+            }));
+            // Sent directly, but queued at a shutdown (#2132).
+            let (direct, _) = direct_commands(Path::new("/x/a"), Path::new("/x/b"));
+            assert_eq!(direct.len(), 5);
+            for cmd in &direct {
+                assert!(persists_at_shutdown(cmd), "{cmd:?}");
+            }
+            assert!(!persists_at_shutdown(&SyncCommand::FetchAttachments {
+                message_id: "x".into()
             }));
         }
     }

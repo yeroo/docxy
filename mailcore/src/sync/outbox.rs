@@ -33,7 +33,7 @@ use crate::graph::client::{
     EventFieldSet, EventInput, GraphClient, GraphError, HTTP_ERROR_TEXT_MAX, RsvpKind,
     UploadObserver, graph_error_message, one_line,
 };
-use crate::graph::model::Recipient;
+use crate::graph::model::{MeetingMessage, MeetingMessageType, Recipient};
 use crate::store::{OutboundAttachment, OutboxOp, Store};
 
 /// What an applied op left for the caller to do.
@@ -55,6 +55,48 @@ pub enum Applied {
     /// A `MoveFolder`'s answer changed the stored folder (its parent, or a
     /// new id, #1910): the caller emits `FoldersUpdated`.
     FoldersChanged,
+    /// A command kept at a `Shutdown` (#2132) that its own checks refuse
+    /// once its meeting is read (not an invite, not a cancellation, the
+    /// user's own meeting, a proposal the organizer disallows) or before
+    /// (a corrupt RSVP kind). Nothing more is sent: the caller drops the op
+    /// and reports the text as the command would have.
+    Refused(String),
+    /// A `RemoveFromCalendar` (#2132) is done on Graph: `event_id` was
+    /// deleted (or was gone already), or `None` when the cancellation
+    /// refers to no event any more. The caller deletes the stored rows.
+    RemovedFromCalendar { event_id: Option<String> },
+    /// A `SaveAttachment` (#2132) downloaded the attachment: the caller
+    /// writes `bytes` to the op's file.
+    Downloaded { bytes: Vec<u8> },
+}
+
+/// Why an RSVP from an invite is refused (#2023): the stored event's
+/// organizer disallows proposals. `RespondMeeting`'s text, from the command
+/// and from its outbox op (#2132).
+pub(crate) const PROPOSALS_REFUSED: &str = "the organizer does not allow new time proposals";
+
+/// `RespondMeeting`'s refusal of a message that resolves to no event.
+pub(crate) const NOT_A_MEETING_INVITE: &str = "not a meeting invite";
+
+/// Why Remove from Calendar refuses the meeting message `meeting` (#2024),
+/// from the command and from its outbox op (#2132): it is not a
+/// cancellation, or it refers to an event the user organizes, whose DELETE
+/// would send every attendee a cancellation. `None`: go ahead.
+pub(crate) fn remove_from_calendar_refusal(
+    message_id: &str,
+    meeting: &MeetingMessage,
+) -> Option<String> {
+    if meeting.message_type != Some(MeetingMessageType::Cancelled) {
+        Some(format!(
+            "remove from calendar {message_id}: not a meeting cancellation"
+        ))
+    } else if meeting.event_id.is_some() && meeting.is_organizer {
+        Some(format!(
+            "remove from calendar {message_id}: the user organizes this meeting"
+        ))
+    } else {
+        None
+    }
 }
 
 /// The id the message `id` names is stored under now (#1884, #1896).
@@ -121,8 +163,102 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Ap
         OutboxOp::MoveFolderMessages { .. } => Err(GraphError::Parse(
             "MoveFolderMessages is run by the engine".to_string(),
         )),
+        OutboxOp::RespondMeeting {
+            message_id,
+            kind,
+            comment,
+            send_response,
+            proposed_start_utc,
+            proposed_end_utc,
+        } => respond_meeting(
+            client,
+            store,
+            message_id,
+            kind,
+            comment.as_deref(),
+            *send_response,
+            proposed_start_utc.clone().zip(proposed_end_utc.clone()),
+        ),
+        OutboxOp::RemoveFromCalendar { message_id } => {
+            remove_from_calendar(client, store, message_id)
+        }
+        // The body built at command time, sent as stored.
+        OutboxOp::SetAutomaticReplies { body } => client
+            .set_automatic_replies_body(body.clone())
+            .map(|()| Applied::Done),
+        // On the message as it is stored now (a move queued before it,
+        // #1896). The engine writes the file.
+        OutboxOp::SaveAttachment {
+            message_id,
+            attachment_id,
+            item,
+            ..
+        } => {
+            let id = resolve(store, message_id)?;
+            let bytes = if *item {
+                client.get_attachment_raw_value(&id, attachment_id)?
+            } else {
+                client.get_attachment_bytes(&id, attachment_id)?
+            };
+            Ok(Applied::Downloaded { bytes })
+        }
         op => apply_other(client, store, op).map(|()| Applied::Done),
     }
+}
+
+/// `RespondMeeting` (#2132), as the command does it (#2023): the invite's
+/// event, on the message as it is stored now (#1896), then the stored
+/// event's `allow_new_time_proposals`, then the response. `proposed` is the
+/// window `rsvp_proposal` approved at command time. A kind the store cannot
+/// have written is refused before anything is sent: an RSVP never falls
+/// back to accepting.
+fn respond_meeting(
+    client: &GraphClient,
+    store: &Store,
+    message_id: &str,
+    kind: &str,
+    comment: Option<&str>,
+    send_response: bool,
+    proposed: Option<(String, String)>,
+) -> Result<Applied, GraphError> {
+    let Some(rsvp) = RsvpKind::from_status(kind) else {
+        return Ok(Applied::Refused(format!("unrecognized RSVP kind: {kind}")));
+    };
+    let Some(event_id) = client.meeting_event_id(&resolve(store, message_id)?)? else {
+        return Ok(Applied::Refused(NOT_A_MEETING_INVITE.to_string()));
+    };
+    if proposed.is_some() && store.refuses_time_proposals(&event_id) {
+        return Ok(Applied::Refused(PROPOSALS_REFUSED.to_string()));
+    }
+    client.respond_event(&event_id, rsvp, comment, send_response, proposed)?;
+    Ok(Applied::Done)
+}
+
+/// `RemoveFromCalendar` (#2132): read the cancellation (on the message as
+/// it is stored now, #1896), refuse as the command does, then DELETE the
+/// event. A 404 is done: the event is gone, which is what the user asked
+/// for (a retry after a DELETE whose answer was lost, or another client).
+/// A GET after a DELETE that went through finds no event and reports the
+/// removal with none.
+fn remove_from_calendar(
+    client: &GraphClient,
+    store: &Store,
+    message_id: &str,
+) -> Result<Applied, GraphError> {
+    let meeting = client.meeting_message(&resolve(store, message_id)?)?;
+    if let Some(e) = remove_from_calendar_refusal(message_id, &meeting) {
+        return Ok(Applied::Refused(e));
+    }
+    let Some(event_id) = meeting.event_id else {
+        return Ok(Applied::RemovedFromCalendar { event_id: None });
+    };
+    match client.delete_event(&event_id) {
+        Ok(()) | Err(GraphError::NotFound) => {}
+        Err(e) => return Err(e),
+    }
+    Ok(Applied::RemovedFromCalendar {
+        event_id: Some(event_id),
+    })
 }
 
 /// A store error while applying a contact op, as the drain's `Parse`.
@@ -291,7 +427,11 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
         | OutboxOp::MarkFolderRead { .. }
         | OutboxOp::DeleteFolder { .. }
         | OutboxOp::EmptyFolder { .. }
-        | OutboxOp::MoveFolderMessages { .. } => {
+        | OutboxOp::MoveFolderMessages { .. }
+        | OutboxOp::RespondMeeting { .. }
+        | OutboxOp::RemoveFromCalendar { .. }
+        | OutboxOp::SetAutomaticReplies { .. }
+        | OutboxOp::SaveAttachment { .. } => {
             unreachable!("apply_op handles it")
         }
         OutboxOp::RenameFolder { id, name, .. } => match graph_folder(store, id)? {
