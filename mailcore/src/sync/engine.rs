@@ -2137,10 +2137,17 @@ struct Engine {
     /// waits here only until the next `checkpoint`, which serves it.
     /// At shutdown only the ones `persists_at_shutdown` keeps run.
     deferred: VecDeque<SyncCommand>,
-    /// The `MarkFolderRead` op being run (#1913): the ids still to mark,
+    /// The `MarkFolderRead` op being run (#1913; an `EmptyFolder` or
+    /// `MoveFolderMessages` too, #2110, #2126): the ids still to mark,
     /// kept across drains (a throttle, a 5xx, a checkpoint stop), so a run
     /// goes on where it stopped instead of paging again.
     bulk: Option<BulkRun>,
+    /// Other ops' runs displaced from `bulk` (#2128 r1-m1): a
+    /// `MarkFolderRead` run kept after a throttle, when an older empty or
+    /// move becomes runnable and runs first. Each resumes where it stopped
+    /// (`resume_bulk`) instead of listing again; one whose op is gone is
+    /// dropped with the drain's check.
+    parked_bulk: Vec<BulkRun>,
     /// A `Shutdown` came, or the UI dropped its handle, while work was
     /// running: the work stops at its next checkpoint (a drain before its
     /// next op), and the main loop returns once the commands that came
@@ -2230,6 +2237,7 @@ impl Engine {
             cmd_rx,
             deferred: VecDeque::new(),
             bulk: None,
+            parked_bulk: Vec::new(),
             shutting_down: false,
             body_skip: HashSet::new(),
             body_parked: false,
@@ -3763,9 +3771,14 @@ impl Engine {
                 continue;
             }
             queued = true;
-            match &self.bulk {
+            match self
+                .bulk
+                .iter()
+                .chain(&self.parked_bulk)
+                .find(|r| r.seq == row.seq)
+            {
                 // Paged: only what the run will still PATCH (r1 m6).
-                Some(run) if run.seq == row.seq => {
+                Some(run) => {
                     guard.todo.extend(run.todo.iter().cloned());
                 }
                 _ => {
@@ -4806,6 +4819,8 @@ impl Engine {
         {
             self.bulk = None;
         }
+        self.parked_bulk
+            .retain(|b| ops.iter().any(|r| r.seq == b.seq));
         if ops.is_empty() {
             self.clear_op_backoff();
             if self.settle_contact_rereads() {
@@ -5512,8 +5527,8 @@ impl Engine {
             .store
             .current_folder_id(folder)
             .unwrap_or_else(|_| folder.to_string());
-        if self.bulk.as_ref().is_none_or(|b| b.seq != seq) {
-            self.bulk = None;
+        self.resume_bulk(seq);
+        if self.bulk.is_none() {
             if folder.starts_with("local:") {
                 self.store.drop_op(seq);
                 self.end_write_progress(seq, &folder, FolderWrite::MarkRead);
@@ -5826,12 +5841,37 @@ impl Engine {
         }
     }
 
+    /// Makes `seq`'s run the kept one (#2128 r1-m1): a run of another op
+    /// in `bulk` is parked, not dropped (a `MarkFolderRead` run kept after
+    /// a throttle, when an older empty or move becomes runnable first), and
+    /// a parked run of `seq` resumes, so neither lists again.
+    fn resume_bulk(&mut self, seq: i64) {
+        if self.bulk.as_ref().is_some_and(|b| b.seq == seq) {
+            return;
+        }
+        if let Some(other) = self.bulk.take() {
+            self.parked_bulk.push(other);
+        }
+        if let Some(i) = self.parked_bulk.iter().position(|b| b.seq == seq) {
+            self.bulk = Some(self.parked_bulk.swap_remove(i));
+        }
+    }
+
+    /// Takes `seq`'s run, kept or parked.
+    fn take_bulk(&mut self, seq: i64) -> Option<BulkRun> {
+        if self.bulk.as_ref().is_some_and(|b| b.seq == seq) {
+            return self.bulk.take();
+        }
+        let i = self.parked_bulk.iter().position(|b| b.seq == seq)?;
+        Some(self.parked_bulk.swap_remove(i))
+    }
+
     /// Ends a queued mark-read or empty run (#2128): the run goes, and its
     /// last `FolderWriteProgress` (`finished`) carries the counts it
     /// reached, all 0 when it never listed (refused before, or a `local:`
     /// folder).
     fn end_write_progress(&mut self, seq: i64, folder: &str, write: FolderWrite) {
-        let event = match self.bulk.take().filter(|b| b.seq == seq) {
+        let event = match self.take_bulk(seq) {
             Some(run) => run.write_progress(folder, true),
             None => SyncEvent::FolderWriteProgress {
                 folder: folder.to_string(),
@@ -5912,8 +5952,8 @@ impl Engine {
             .store
             .current_folder_id(folder)
             .unwrap_or_else(|_| folder.to_string());
-        if self.bulk.as_ref().is_none_or(|b| b.seq != seq) {
-            self.bulk = None;
+        self.resume_bulk(seq);
+        if self.bulk.is_none() {
             if folder.starts_with("local:") {
                 let _ = self.store.finish_folder_empty(seq, batch, &folder);
                 self.end_write_progress(seq, &folder, FolderWrite::Empty);
@@ -6121,6 +6161,7 @@ impl Engine {
             .current_folder_id(dest)
             .unwrap_or_else(|_| dest.to_string());
         let target = FolderMove { folder, dest };
+        self.resume_bulk(seq);
         // A dest the store no longer has (a listing pruned it: deleted on
         // Graph) refuses the run before its listing and before a kept run
         // goes on (r1-m1): Graph would answer each move 404, which reads as
@@ -6144,8 +6185,7 @@ impl Engine {
             self.refuse_move_folder_messages(seq, &target, None, error);
             return BulkStep::Finished;
         }
-        if self.bulk.as_ref().is_none_or(|b| b.seq != seq) {
-            self.bulk = None;
+        if self.bulk.is_none() {
             if target.folder.starts_with("local:") {
                 self.store.drop_op(seq);
                 self.clear_op_backoff();
@@ -6288,10 +6328,7 @@ impl Engine {
         error: String,
     ) {
         self.store.drop_op(seq);
-        let run = match self.bulk.as_ref() {
-            Some(b) if b.seq == seq => self.bulk.take(),
-            _ => None,
-        };
+        let run = self.take_bulk(seq);
         self.read_moved_folder_counts(target);
         self.report_folder_failure(&target.folder, FolderWrite::MoveMail, status, error.clone());
         let (moved, failed, total) = run.map_or((0, 0, 0), |r| (r.done, r.failed.len(), r.total));
@@ -6323,10 +6360,7 @@ impl Engine {
     /// the counts of the run it stopped, if it was running.
     fn report_dropped_moves(&mut self, dropped: &[DroppedFolderMove]) {
         for d in dropped {
-            let run = match self.bulk.as_ref() {
-                Some(b) if b.seq == d.seq => self.bulk.take(),
-                _ => None,
-            };
+            let run = self.take_bulk(d.seq);
             let error = if d.dest_gone {
                 "its destination folder was deleted"
             } else {
@@ -34858,6 +34892,87 @@ mod tests {
                     [(0, 1, 3, false), (1, 2, 3, false), (1, 2, 3, true)]
                 );
                 wait_drained(&store);
+                stop(handle, dir);
+            }
+
+            /// r1-m1: a mark-read run kept after a throttle, displaced by an
+            /// older empty that became runnable (the move it waited for
+            /// landed), resumes where it stopped: one listing, no second
+            /// listing event, the counts going on to `finished`.
+            #[test]
+            fn a_mark_read_run_displaced_by_an_older_empty_resumes_without_listing_again() {
+                let server = numbered(21);
+                let other = "/me/mailFolders/OTHER/messages?$filter=receivedDateTime%20le%20";
+                let (srv, handle, store, dir) = engine(
+                    "progress-displaced",
+                    world(
+                        vec![
+                            // Refused with a 400 at each of the three
+                            // commands' drains (passed, kept queued), then
+                            // lands once the throttle's hold is over.
+                            once("POST", "/me/messages/G1/move", 400, BAD),
+                            once("POST", "/me/messages/G1/move", 400, BAD),
+                            once("POST", "/me/messages/G1/move", 400, BAD),
+                            write("POST", "/me/messages/G1/move", 201, r#"{"id":"G1-NEW"}"#),
+                            once("GET", UNREAD, 200, &page(&server, None)),
+                            once("GET", other, 200, &page(&strings(&["G1-NEW"]), None)),
+                            once("POST", "/$batch", 200, &last_throttled(20, 1)),
+                            once("POST", "/$batch", 200, &ok_batch(1)),
+                            once("POST", "/$batch", 200, &ok_batch(2)),
+                        ],
+                        TREE,
+                        &[("ARCH", "G1")],
+                    ),
+                    None,
+                );
+                send(
+                    &handle,
+                    SyncCommand::Move {
+                        id: "G1".into(),
+                        dest: "OTHER".into(),
+                    },
+                );
+                send(&handle, Kind::Empty.command("OTHER"));
+                send(&handle, Kind::MarkRead.command("INBOX"));
+                let seen = wait_for(&handle.evt_rx, |e| {
+                    matches!(
+                        e,
+                        SyncEvent::FolderWriteProgress { folder, finished: true, .. }
+                            if folder == "INBOX"
+                    )
+                });
+                // The empty of Other ran in between, to its end.
+                let (other_events, seen): (Vec<SyncEvent>, Vec<SyncEvent>) =
+                    seen.into_iter().partition(|e| {
+                        matches!(e, SyncEvent::FolderWriteProgress { folder, .. } if folder == "OTHER")
+                    });
+                assert_eq!(
+                    progress(&other_events, "OTHER", FolderWrite::Empty),
+                    [(0, 0, 1, false), (1, 0, 1, false), (1, 0, 1, true)]
+                );
+                assert_eq!(
+                    progress(&seen, "INBOX", FolderWrite::MarkRead),
+                    [
+                        (0, 0, 21, false),
+                        (19, 0, 21, false),
+                        (21, 0, 21, false),
+                        (21, 0, 21, true),
+                    ]
+                );
+                wait_drained(&store);
+                let reqs: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
+                let listed: Vec<&String> = reqs.iter().filter(|p| p.starts_with(UNREAD)).collect();
+                assert_eq!(listed.len(), 1, "{reqs:?}");
+                let sent = batched(&srv);
+                assert_eq!(
+                    sent,
+                    [
+                        server[..20].to_vec(),
+                        strings(&["G1-NEW"]),
+                        server[19..].to_vec()
+                    ],
+                    "the empty ran between the mark-read's batches"
+                );
                 stop(handle, dir);
             }
 

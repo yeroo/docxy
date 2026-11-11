@@ -3818,7 +3818,13 @@ A host can draw classic Outlook's Folder Size dialog. The Local Data tab comes f
   `failed` is the ids Graph refused plus, for an empty, the kept ones (`run.kept`, known at the
   listing, so the first event can already show them). A throttled or 5xx id counts once
   answered. A run that reached its end has `done + failed == total`. A restart loses the run:
-  the op lists again and the counts start over from what is left. `folder` is the id the run
+  the op lists again and the counts start over from what is left. Within a session a run is
+  never listed twice (r1-m1): a `MarkFolderRead` is not gated on `has_older_op`, so its run
+  kept after a throttle can be displaced from `Engine::bulk` by an older `EmptyFolder` or
+  `MoveFolderMessages` that becomes runnable first (the move it waited for lands). The
+  displaced run is parked (`Engine::parked_bulk`, `resume_bulk`) and resumes where it
+  stopped. `take_bulk(seq)` finds a run kept or parked, `read_guard` reads both, and the
+  drain's check drops a parked run whose op is gone. `folder` is the id the run
   resolved on entry (`current_folder_id`), passed to `bulk_batches(seq, folder)`.
 - lookxy ignores the event (no Mark All as Read or Empty Folder UI).
 - Tests: `engine.rs` `folder_writes::write_progress`, each over both kinds where it applies
@@ -3827,6 +3833,7 @@ A host can draw classic Outlook's Folder Size dialog. The Local Data tab comes f
   `*_a_refused_listing_finishes_with_nothing_counted`,
   `*_of_a_local_folder_finishes_with_nothing_counted`),
   `a_batch_refused_mid_run_finishes_with_the_counts_reached`,
+  `a_mark_read_run_displaced_by_an_older_empty_resumes_without_listing_again`,
   `a_partial_mark_read_finishes_once_after_its_failure`,
   `empty_counts_kept_and_refused_mail_as_failed`.
 
