@@ -76,7 +76,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   with no Graph call; signed out or inside `next_retry` it does nothing. A
   folder that never synced runs its phase 1 (#1871, below): the head, or
   for a small folder its full delta with the cutoff, which completes it; a
-  big folder's older mail follows in idle time.
+  big folder's older mail follows in idle time, next among the folders
+  after a `BackfillFolder` (#2133, below).
 - The fast cycle is opt-in: `EngineOptions::fast_tick` (`None` or zero: the
   old single tick, whose wait restarts on every command). With it the engine
   keeps two deadlines, `next_full` (every `tick`) and `next_fast`; commands do
@@ -501,7 +502,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 - **When a page runs.** `main_loop` waits zero while `next_backfill()` has a
   folder: signed in, outside `next_retry`, a folder list done
   (`backfill_done`), and the first folder in order with a delta link whose
-  history is not complete (`history_complete`) and that is not parked. A
+  history is not complete (`history_complete`) and that is not parked, a
+  folder a `BackfillFolder` put first going ahead of the order (#2133). A
   queued command runs first (it waits for at most the page in flight), then
   a due timed wake (`Engine::due`), and only then one page. Without a fast
   tick, `due` is the tick (`next_tick`), a passed `next_retry` or a passed
@@ -3826,7 +3828,7 @@ quarantine re-listed the mailbox and brought the lost writes back.
     `CreateEvent`, `UpdateEvent`, `DeleteEvent`, `CancelEvent`, `ForwardEvent`,
     `UpdateEventSeries`, both event reminders), the contact writes (their ops were queued by the
     host's store write; the arm only drains), the folder writes (`CreateFolder` to
-    `EmptyFolder`), and also `SetFastFolders` (in memory), `SetCalendars` (the selection is
+    `EmptyFolder`), and also `SetFastFolders` and `BackfillFolder` (in memory), `SetCalendars` (the selection is
     stored; `set_calendars` skips its `refresh_calendar` when shutting down, and the next pass
     refreshes) and `SignOut` (the token cache is cleared; later writes still queue, and with no
     token nothing drains).
@@ -3845,3 +3847,41 @@ quarantine re-listed the mailbox and brought the lost writes back.
   then a `Shutdown` or a dropped handle: the engine returns within 3 s with at most one sent,
   and a second engine on the store sends the rest. Commands sent during a paced startup pass
   are persisted with no write, body, search or calendar request. And the #1978 guard above.
+
+## Backfill one folder next (#2133)
+
+A UI whose user opens a big folder still being downloaded (fewer stored messages than its
+`total_count`, history scope not `all`) can show "there are more items in this folder on the
+server". Before #2133 it had no command to fetch them sooner: the walks ran folder by folder in
+`Store::folders` order (#1871).
+
+- `SyncCommand::BackfillFolder { id }` (`Engine::backfill_folder`) makes no Graph call. It
+  resolves the id (`current_folder_id`, #1910). An id not in the store is
+  `Error("backfill folder: unknown folder {id}")`. A folder with a delta link whose history is
+  complete for the mode (`history_complete`) does nothing: no request, no event. Otherwise it
+  moves the id to the front of `Engine::backfill_first` (the most recent request first, no
+  duplicates) and takes it out of `parked` and `expired`. Clearing `expired` too gives an
+  unparked walk whose link expired again one more start over, instead of a park at its first
+  page; each command buys at most one more request, never a loop.
+- `next_backfill` keeps its gates (token, `backfill_done`, `next_retry`). Among the incomplete,
+  unparked folders it picks the earliest of `backfill_first`, else the first in store order. So
+  the main loop is unchanged: prefetch (#1978) still goes first, and a queued command or a due
+  wake still preempts each page. The walk's events are the usual `MessagesUpdated` and
+  `FolderProgress`, ending with `complete: true`. When `backfill_step` completes the folder, it
+  leaves `backfill_first`.
+- Remembered, not dropped. Signed out, inside a back-off, or for a folder whose head has not run
+  (no delta link yet), the request is kept, and the walk is the first to run once a page may
+  (after a back-off, the pass `due()` runs at its expiry comes first). A sync pass, a sign-out
+  and a back-off keep `backfill_first`. It is in memory only: a restart forgets it, and the store
+  order applies again. A stale id (a deleted folder, a `local:` folder re-keyed later) matches
+  nothing. `persists_at_shutdown` is `true`, next to `SetFastFolders`: harmless and lost with
+  the process.
+- Not done: no UI wiring (lookxy's "more items on the server" link). The command does not run a
+  never-synced folder's head (`SyncFolder` does; a UI may send both). The #1871 limit stands: a
+  folder completed as `window` stays complete when `backfill_days` is raised later.
+- Tests (`engine.rs` `tests::backfill`): `backfill_folder_runs_that_folders_walk_next_to_completion`,
+  `a_command_is_served_between_two_pages_of_a_requested_walk`,
+  `backfill_folder_unparks_a_parked_folder` (no pass runs),
+  `backfill_folder_on_an_unknown_or_complete_folder` and
+  `backfill_folder_inside_a_back_off_is_remembered` (the 429 on a backfill page, no request
+  inside it, F2's page first after it).
