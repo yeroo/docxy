@@ -491,8 +491,9 @@ pub enum OutboxOp {
     /// mail; the engine syncs them after. `source` and `dest` are resolved
     /// again through `folder_aliases` at send time; either still `local:`
     /// (its create never reached Graph) refuses the copy. Sent only once no
-    /// older op is queued (a copy is a snapshot of Graph). A row gone, or an
-    /// id already re-keyed, sends nothing.
+    /// older op is queued (a copy is a snapshot of Graph), and no newer op is
+    /// sent before it (the drain stops at a copy that waits). A row gone, or
+    /// an id already re-keyed, sends nothing.
     CopyFolder {
         id: String,
         source: String,

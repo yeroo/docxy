@@ -3520,9 +3520,16 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `SyncEvent::FolderCreated { local_id, id }` and `FoldersUpdated`, the same meaning for a host
   ("the folder you saw as `local_id` is `id` now"). No `FolderCopied` event.
 - A copy is a snapshot of Graph, so `drain_outbox` sends it only once no older op is queued
-  (`has_older_op`, as a `DeleteFolder` or `EmptyFolder`; skipping is no deferral). Without it, a
-  copy queued after an `EmptyFolder` waiting behind a move refused once (a 4xx the drain passes)
-  would copy the mail the user had emptied.
+  (`has_older_op`, as a `DeleteFolder` or `EmptyFolder`). Without it, a copy queued after an
+  `EmptyFolder` waiting behind a move refused once (a 4xx the drain passes) would copy the mail
+  the user had emptied. A copy that waits is also a barrier (r1): the drain stops there
+  (`break`, no deferral, so the caller's sync carries on and the post-drain steps run), and
+  nothing queued after it is sent before it. Skipping it instead (as a waiting `DeleteFolder`
+  is skipped) let newer ops run: a rename or move of the copy's `local:` id sent nothing and
+  was dropped, a folder created or a message moved into it was refused or dropped, and a
+  delete or move of the source's mail reached Graph before the copy. The oldest op is never
+  held, a 4xx'd one is quarantined after `MAX_OP_ATTEMPTS`, and a bulk run ends, so the queue
+  still moves.
 - After the drain: a copy that reached Graph sets `relist_after_drain`, and after that one
   listing (which brings the copy's subfolders) `sync_copied_folders` runs `refresh_folder`
   (delta, then counts) for the copy and every stored folder under it, each id resolved then
@@ -3553,5 +3560,7 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   (`copy_folder_round_trip_syncs_the_copy_and_its_subfolder`,
   `a_copy_into_or_of_a_created_folder_follows_its_create`,
   `a_refused_copy_removes_the_local_copy_and_reports` (409 with a folder and a copy under it,
-  then 400), `a_copy_waits_for_an_older_empty_of_its_source`), and
+  then 400), `a_copy_waits_for_an_older_empty_of_its_source`,
+  `ops_queued_after_a_waiting_copy_wait_for_it` (r1: a delete of the source's mail, a rename
+  of the copy and a folder created under it, each sent after the copy, under its Graph id)), and
   `folder_commands_the_store_refuses_report_and_queue_nothing` (copy refusals).

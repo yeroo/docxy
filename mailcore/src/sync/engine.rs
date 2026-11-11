@@ -591,7 +591,8 @@ pub enum SyncCommand {
     /// the source and showing its counts, with no messages and no child
     /// folders: the store never copies mail. Once no older op is queued (a
     /// copy is a snapshot of Graph, so what the user did before it lands
-    /// first), `POST /me/mailFolders/{id}/copy` follows through the outbox;
+    /// first; nothing queued after it is sent before it),
+    /// `POST /me/mailFolders/{id}/copy` follows through the outbox;
     /// once Graph answers, the row is re-keyed to Graph's id
     /// ([`SyncEvent::FolderCreated`], `FoldersUpdated`), the folders are
     /// listed again and the copy and every folder under it are synced, so
@@ -4098,13 +4099,19 @@ impl Engine {
                 }
             }
             // A copy is a snapshot of Graph (#2118): it is sent only once it
-            // is the oldest op, as a `DeleteFolder`, so what the user did
-            // before it (an empty, a move into the folder retried after a
-            // 4xx) lands or is given up first. Skipping it is no deferral.
+            // is the oldest op, so what the user did before it (an empty, a
+            // move into the folder retried after a 4xx) lands or is given up
+            // first. And it is a barrier (r1): nothing queued after it is
+            // sent before it, as a newer op aimed at the copy's `local:` id
+            // (a rename, a child folder, mail moved in) would be dropped or
+            // refused before the re-key, and one on the source's mail would
+            // reach Graph before the snapshot. The oldest op is never held,
+            // so the queue still moves. Stopping here is no deferral: the
+            // caller's sync carries on.
             if matches!(row.op, OutboxOp::CopyFolder { .. })
                 && self.store.has_older_op(row.seq).unwrap_or(true)
             {
-                continue;
+                break;
             }
             match self.apply_op_with_retry(&row) {
                 Ok(applied) => {
@@ -31726,6 +31733,136 @@ mod tests {
                 assert!(at("GET", LIST) < at("POST", "/$batch"), "{reqs:?}");
                 assert!(at("POST", "/$batch") < at("POST", copy), "{reqs:?}");
                 assert_eq!(hits(&srv, "POST", copy), 1);
+                stop(handle, dir);
+            }
+
+            /// r1: a copy that waits is a barrier. Behind it, a delete of the
+            /// source's mail, a rename of the copy's `local:` id and a folder
+            /// created under it wait too: none is sent, dropped or refused
+            /// while the copy waits, and each goes after it, the rename and
+            /// the create under the copy's Graph id.
+            #[test]
+            fn ops_queued_after_a_waiting_copy_wait_for_it() {
+                let mv = "/me/messages/G1/move";
+                let copy = "/me/mailFolders/PROJ/copy";
+                let (srv, handle, store, dir) = engine(
+                    "folder-copy-barrier",
+                    world(
+                        vec![
+                            // The startup pass and the two Refresh passes.
+                            listing(TREE, Some(3)),
+                            // A 500 holds the outbox (its back-off) while the
+                            // commands queue; then a 400 the drain passes.
+                            once("POST", mv, 500, "busy"),
+                            once("POST", mv, 400, BAD),
+                            write("POST", mv, 201, r#"{"id":"G1-NEW"}"#),
+                            write("POST", copy, 201, &answer("C1", "ARCH")),
+                            write("PATCH", "/me/mailFolders/C1", 200, "{}"),
+                            write(
+                                "POST",
+                                "/me/mailFolders/C1/childFolders",
+                                201,
+                                &answer("K1", "C1"),
+                            ),
+                            write("DELETE", "/me/messages/m-proj", 204, ""),
+                        ],
+                        &with(&[("C1", Some("ARCH"), None), ("K1", Some("C1"), None)]),
+                        &[("ARCH", "G1"), ("PROJ", "m-proj")],
+                    ),
+                    None,
+                );
+                send(
+                    &handle,
+                    SyncCommand::Move {
+                        id: "G1".into(),
+                        dest: "INBOX".into(),
+                    },
+                );
+                wait_requests(&srv, "POST", mv, 1);
+                send(
+                    &handle,
+                    SyncCommand::CopyFolder {
+                        id: "PROJ".into(),
+                        dest: Some("ARCH".into()),
+                    },
+                );
+                assert!(wait_until(ENGINE_WAIT, || !local_folders(&store).is_empty()));
+                let local = local_folders(&store).pop().unwrap();
+                send(
+                    &handle,
+                    SyncCommand::Delete {
+                        id: "m-proj".into(),
+                    },
+                );
+                send(
+                    &handle,
+                    SyncCommand::RenameFolder {
+                        id: local.clone(),
+                        name: "Renamed".into(),
+                    },
+                );
+                send(
+                    &handle,
+                    SyncCommand::CreateFolder {
+                        parent: Some(local.clone()),
+                        name: "Kid".into(),
+                    },
+                );
+                wait_queued(&store, 5);
+                assert_eq!(writes_sent(&srv).len(), 1, "all wait behind the 500");
+
+                // One drain: the move is refused for now (a 4xx it passes),
+                // so the copy waits, and so does everything after it.
+                send(&handle, SyncCommand::Refresh);
+                assert!(
+                    wait_until(ENGINE_WAIT, || hits(&srv, "POST", mv) == 2),
+                    "{:?}",
+                    writes_sent(&srv)
+                );
+                // A barrier: answered with no request, after the Refresh.
+                send(
+                    &handle,
+                    SyncCommand::SearchMessages {
+                        query: " ".into(),
+                        folder_id: None,
+                        top: 1,
+                    },
+                );
+                wait_for(&handle.evt_rx, |e| {
+                    matches!(e, SyncEvent::MessageSearchFailed { .. })
+                });
+                assert_eq!(writes_sent(&srv).len(), 2, "{:?}", writes_sent(&srv));
+                assert_eq!(
+                    store.pending_ops().unwrap().len(),
+                    5,
+                    "nothing dropped or refused: {:?}",
+                    store.pending_ops().unwrap()
+                );
+
+                // The next drain: the move lands, then the copy, then the rest.
+                send(&handle, SyncCommand::Refresh);
+                wait_drained(&store);
+                let order: Vec<(String, String)> = writes_sent(&srv)
+                    .into_iter()
+                    .map(|(m, p, _)| (m, p))
+                    .collect();
+                let want = [
+                    ("POST", mv),
+                    ("POST", mv),
+                    ("POST", mv),
+                    ("POST", copy),
+                    ("DELETE", "/me/messages/m-proj"),
+                    ("PATCH", "/me/mailFolders/C1"),
+                    ("POST", "/me/mailFolders/C1/childFolders"),
+                ]
+                .map(|(m, p)| (m.to_string(), p.to_string()));
+                assert_eq!(order, want);
+                let bodies: Vec<String> =
+                    writes_sent(&srv).into_iter().map(|(_, _, b)| b).collect();
+                assert_eq!(bodies[5], r#"{"displayName":"Renamed"}"#);
+                assert_eq!(bodies[6], r#"{"displayName":"Kid"}"#);
+                assert!(local_folders(&store).is_empty());
+                no_local_request(&srv);
                 stop(handle, dir);
             }
         }
