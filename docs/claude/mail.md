@@ -31,7 +31,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   Graph draft for a later sync. `Move`, `MarkRead`, `SetFlag` and
   `SetCategories` resolve their id through `current_id` too since #1896
   (in the command arm and again at apply time), so a reconciled `local:`
-  id reaches the Graph id; one never reconciled still reaches Graph as is.
+  id reaches the Graph id. One that still resolves to `local:` sends nothing
+  (#2113): it waits while its draft's `SaveDraft`/`SendDraft` is queued, and
+  is otherwise done.
 - `FakeServer::start_limited` gives a route a use limit; a used-up route is
   skipped for the next match (a send that fails once, then succeeds).
 
@@ -3995,20 +3997,31 @@ A batch of six small fixes from #1918, #1975, #2038, #1892 and #1959.
   knows whether the cancellation went out. Tests: `plan_del404_delete_event_404_is_done`
   (`outbox.rs`), `plan_del404_delete_event_404_is_dropped_as_done` (`engine.rs`, through the
   drain).
-- **Message ops on a still-`local:` id send nothing** (#1892 plan-1). `MarkRead`, `SetFlag`,
-  `SetCategories` and `Move` resolve their id with `on_graph` (`current_id`, then `None` for
-  `local:`) and are done without a request, as `Delete` was (#1884). A reconciled `local:` id
-  is still sent under its Graph id. Such an id is a draft whose `SaveDraft` was refused: a
-  pending one always runs first, since a 5xx stops the drain. The local write stays. Once the
-  draft is created on Graph (in Drafts), its first Drafts delta round overwrites a flag or
-  categories set meanwhile, and files a draft moved meanwhile back in Drafts. Before, the op
-  was refused and quarantined. Tests (`outbox.rs`): `plan_1_local_id_ops_send_nothing`,
+- **Message ops on a still-`local:` id send nothing** (#1892 plan-1). A reconciled `local:` id
+  is still sent under its Graph id. One that still resolves to `local:` is a draft not on Graph
+  yet: its `SaveDraft` was refused, or none is queued yet (lookxy's `compose_new` stores the
+  draft and queues nothing until the composer saves).
+  - While a `SaveDraft` or `SendDraft` of that draft is queued (compared by resolved id),
+    `MarkRead`, `SetFlag`, `SetCategories` and `Move` wait (`for_draft`). They return
+    `GraphError::Parse("draft local:… is not on Graph yet")`, which the drain counts as an
+    attempt and keeps, as it did with Graph's 4xx before. Once that op creates the draft, they
+    reach the Graph id. Nothing is sent meanwhile. A draft op that keeps failing is quarantined
+    first (it is earlier in the queue), and from then on the waiting op is done.
+  - With none queued they are done without a request (`on_graph`), as `Delete` (#1884) and the
+    message reminder ops (#2054) always are. `Delete` does not wait: a draft that never
+    reached Graph needs nothing deleted there, and its queued `SaveDraft` is #1892 plan-4.
+  - The local write stays. Once the draft is created on Graph (in Drafts), its first Drafts
+    delta round overwrites a flag or categories set meanwhile, and files a draft moved meanwhile
+    back in Drafts.
+  Tests (`outbox.rs`): `plan_1_local_id_ops_send_nothing`,
+  `plan_1_an_op_waits_while_its_draft_op_is_queued`,
   `plan_1_a_reconciled_local_id_is_sent_under_its_graph_id`.
 - **The store's busy timeout is explicit** (#1892 plan-5). `Store::init` sets
   `store::BUSY_TIMEOUT` (5 s) first, before the WAL pragma that can itself meet the other
-  connection's lock. It was already rusqlite 0.40's default, set in `InnerConnection::open`, so
-  `plan_5_store_sets_a_busy_timeout` passed before the change and pins it now. The two-connection
-  wait is `writes_wait_out_another_connections_write` (#2023 r3).
+  connection's lock. It was already rusqlite 0.40's default, set in `InnerConnection::open`.
+  `plan_5_store_sets_a_busy_timeout` hands `Store::init` a connection set to zero, so it fails
+  if `init` stops setting it. The two-connection wait is
+  `writes_wait_out_another_connections_write` (#2023 r3).
 - **A token endpoint's non-OAuth error is one line** (#1959 plan-auth-http-display).
   `classify_error` builds `AuthError::Status { status, body }` for a non-2xx answer whose body
   is not OAuth JSON. Its `Display` is `HTTP error: ` plus `client::http_error_text` (#1954,
