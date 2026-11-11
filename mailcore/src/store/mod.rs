@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
@@ -1603,6 +1604,12 @@ pub struct EventSendData {
     pub end_local: String,
 }
 
+/// How long a store connection waits for another connection's lock before
+/// a statement fails with `SQLITE_BUSY` (#2113, #1892 plan-5). The engine
+/// and a host each hold a connection to one WAL file. Set in `Store::init`,
+/// so it does not depend on rusqlite's own default (5 s in 0.40).
+pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The local mail database. Single-threaded access is assumed (the sync
 /// engine and TUI serialize their access through it); no internal locking.
 pub struct Store {
@@ -1618,8 +1625,8 @@ impl Store {
     }
 
     /// Begins a write transaction: IMMEDIATE, so it takes the write lock at
-    /// `BEGIN` and waits out another connection's write (rusqlite's 5 s busy
-    /// timeout) before it reads. The engine and a host (lookxy, its tests)
+    /// `BEGIN` and waits out another connection's write ([`BUSY_TIMEOUT`],
+    /// set in `init`) before it reads. The engine and a host (lookxy, its tests)
     /// each hold a connection to one WAL file; a DEFERRED transaction that
     /// read first and then writes after the other connection committed gets
     /// `SQLITE_BUSY_SNAPSHOT` ("database is locked") at once, with no busy
@@ -1635,6 +1642,9 @@ impl Store {
     }
 
     fn init(conn: Connection) -> Result<Store, StoreError> {
+        // First: the WAL pragma below may itself meet the other
+        // connection's lock (#2113).
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         // WAL is a no-op on an in-memory database (SQLite silently keeps
         // it at MEMORY); harmless to request unconditionally.
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -11802,6 +11812,32 @@ mod calendar_tests {
                 .unwrap();
         });
         drop(a);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2113 (#1892 plan-5): every store connection waits `BUSY_TIMEOUT`
+    /// for the other's lock, set by `Store::init` itself, not left to
+    /// rusqlite's default. That the wait works across two connections is
+    /// `writes_wait_out_another_connections_write`.
+    #[test]
+    fn plan_5_store_sets_a_busy_timeout() {
+        let busy_ms = |s: &Store| -> i64 {
+            s.conn
+                .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                .unwrap()
+        };
+        let expected = BUSY_TIMEOUT.as_millis() as i64;
+        assert!(expected > 0);
+        assert_eq!(busy_ms(&Store::open_in_memory().unwrap()), expected);
+        let dir = std::env::temp_dir().join(format!(
+            "mailcore-busy-timeout-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = Store::open(&dir.join("mail.db")).unwrap();
+        assert_eq!(busy_ms(&s), expected);
+        drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
