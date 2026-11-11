@@ -3604,7 +3604,9 @@ A host can draw classic Outlook's Folder Size dialog. The Local Data tab comes f
     `json_each` array): a row moved here locally sits under its old id until the drain follows
     the move (#1896), and Graph has no such id in this folder. It returns the ids and the
     oldest `received_at`. A folder in the probe with no candidate is parked for the pass (no
-    request), as is one being deleted (#2107) or emptied (#2110).
+    request). Before **every** page, not only the first, a folder gone from the store, being
+    deleted (#2107) or being emptied (#2110) drops the fill and parks the folder quietly: no
+    request and no `Error`.
   - Order in `main_loop`: the prefetch, then the backfill, then the size fill. A ready fill
     makes the wait zero, and its step runs only when `!self.due()`, so a queued command and a
     due wake go first.
@@ -3627,7 +3629,9 @@ A host can draw classic Outlook's Folder Size dialog. The Local Data tab comes f
     go through `react`, and the page is asked again after. Another 5xx parks the folder until
     the next pass, and the fill starts over then. Any other 4xx (a 404 folder, a refused
     `$filter` or `$expand`) or a parse error gives up: the candidates are marked asked, with one
-    `Error`. There is no `SyncState` and no `FolderProgress`.
+    `Error`, and the folder is parked. If the store cannot mark them, the folder is parked as
+    well (with the store's `Error`), so the refused request is not sent again before the next
+    pass. There is no `SyncState` and no `FolderProgress`.
   - Accepted costs, against one re-enumeration of every folder:
     - Through a link minted before #2123, each new mail in a folder costs one small idle listing
       for as long as that link lives, because links are not reset here.

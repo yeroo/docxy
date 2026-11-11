@@ -2142,7 +2142,7 @@ impl Store {
         &self,
         folder_id: &str,
     ) -> Result<Option<(Vec<String>, String)>, StoreError> {
-        let pending = self.pending_ids_json()?;
+        let pending = ids_json(&self.pending_message_ids()?);
         let mut stmt = self.conn.prepare(concat!(
             "SELECT id, received_at FROM messages
              WHERE folder_id = ?1 AND ",
@@ -2194,28 +2194,15 @@ impl Store {
         if ids.is_empty() {
             return Ok(0);
         }
-        let pending = self.pending_ids_json()?;
-        let ids_json =
-            Value::Array(ids.iter().map(|id| Value::Str(id.clone())).collect()).to_string();
+        let pending = ids_json(&self.pending_message_ids()?);
         let n = self.conn.execute(
             "UPDATE messages SET size_asked = 1
              WHERE id IN (SELECT value FROM json_each(?2))
                AND folder_id = ?1 AND size IS NULL
                AND id NOT IN (SELECT value FROM json_each(?3))",
-            params![folder_id, ids_json, pending],
+            params![folder_id, ids_json(ids), pending],
         )?;
         Ok(n)
-    }
-
-    /// `pending_message_ids` as a JSON array, for a `json_each` (#2123).
-    fn pending_ids_json(&self) -> Result<String, StoreError> {
-        Ok(Value::Array(
-            self.pending_message_ids()?
-                .into_iter()
-                .map(Value::Str)
-                .collect(),
-        )
-        .to_string())
     }
 
     /// Up to `limit` ids of `folder_id`'s header-less rows (`received_at`
@@ -6263,6 +6250,12 @@ impl Store {
         }
         q.deleted = deleting_folders_on(&self.conn)?;
         Ok(q)
+    }
+
+    /// Whether a folder row `id` is stored (#2123: the size fill's check
+    /// before each page).
+    pub(crate) fn folder_exists(&self, id: &str) -> Result<bool, StoreError> {
+        folder_exists_on(&self.conn, id)
     }
 
     /// Whether `id` (resolved through `folder_aliases`) is a folder a queued

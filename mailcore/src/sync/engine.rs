@@ -35,7 +35,8 @@
 //! the bodies of the newest `EngineOptions::prefetch_body_days` of mail, a
 //! small batch per step, before any backfill page. A `SyncCommand::FetchBody`
 //! (and a server search or the opening of a hit, `SyncCommand::SearchMessages`
-//! and `SyncCommand::FetchMessage`, #2006) never waits for a whole pass: long
+//! and `SyncCommand::FetchMessage`, #2006, and a read of folders' sizes on
+//! the server, `SyncCommand::FetchFolderSizes`, #2123) never waits for a whole pass: long
 //! work calls `Engine::checkpoint` between folders, delta pages and body
 //! fetches, which serves it at once and keeps every other command for after
 //! the work, in order.
@@ -1779,7 +1780,8 @@ struct Engine {
     /// drains it at each `checkpoint` (#1978).
     cmd_rx: Receiver<SyncCommand>,
     /// Commands a `checkpoint` took off the channel and kept for later
-    /// (every one but `FetchBody`, `SearchMessages` and `FetchMessage`), in arrival order: the main loop runs
+    /// (every one but `FetchBody`, `SearchMessages`, `FetchMessage` and
+    /// `FetchFolderSizes`, #2123), in arrival order: the main loop runs
     /// them before it reads the channel again or does any idle work.
     deferred: VecDeque<SyncCommand>,
     /// The `MarkFolderRead` op being run (#1913): the ids still to mark,
@@ -1935,7 +1937,8 @@ impl Engine {
 
     /// Takes every command waiting on the channel, between two requests of
     /// long work (#1978): a `FetchBody`, a `SearchMessages` or a
-    /// `FetchMessage` (#2006) is served at once, so a click costs its own
+    /// `FetchMessage` (#2006), or a `FetchFolderSizes` (#2123) is served at
+    /// once, so a click costs its own
     /// round trips plus the request in flight, not a whole pass; every
     /// other command is kept (`deferred`) for the main loop, in order; a
     /// `Shutdown` or a dropped handle sets `shutting_down`. Returns whether
@@ -3429,9 +3432,11 @@ impl Engine {
         self.size_parked.clear();
     }
 
-    /// One page of `folder_id`'s size fill (#2123). A fill starts by
-    /// taking its candidates (`Store::size_fill_candidates`: none, or a
-    /// folder being deleted or emptied, parks it with no request) and
+    /// One page of `folder_id`'s size fill (#2123). Every page first
+    /// checks the folder: gone from the store, being deleted or being
+    /// emptied drops the fill and parks it, with no request. A fill starts
+    /// by taking its candidates (`Store::size_fill_candidates`: none parks
+    /// it with no request) and
     /// lists the folder from the oldest one's `received_at`
     /// (`GraphClient::message_sizes_target`). Each page's sizes are
     /// written (`Store::set_message_sizes`: the size only, on a row without
@@ -3442,33 +3447,43 @@ impl Engine {
     /// the folder until the next pass and the fill starts over then; any
     /// other failure (a 404 folder, a refused `$filter` or `$expand`, a
     /// parse error) gives up on the candidates (marked asked) with one
-    /// `Error`. No `SyncState`, no `FolderProgress`.
+    /// `Error` and parks the folder (so a store that cannot mark them does
+    /// not repeat the request). No `SyncState`, no `FolderProgress`.
     fn size_fill_step(&mut self, folder_id: String) {
+        // Before every page, not only the first: a folder deleted (#2107)
+        // or emptied (#2110), or gone from the store, since the fill began
+        // drops it quietly, with no request and no `Error`.
+        if !self.store.folder_exists(&folder_id).unwrap_or(false)
+            || self.store.folder_being_deleted(&folder_id).unwrap_or(true)
+            || self.store.folder_being_emptied(&folder_id).unwrap_or(true)
+        {
+            if self
+                .size_fill
+                .as_ref()
+                .is_some_and(|f| f.folder == folder_id)
+            {
+                self.size_fill = None;
+            }
+            self.park_size_fill(&folder_id);
+            return;
+        }
         let fill = match self.size_fill.take() {
             Some(fill) if fill.folder == folder_id => fill,
-            _ => {
-                if self.store.folder_being_deleted(&folder_id).unwrap_or(true)
-                    || self.store.folder_being_emptied(&folder_id).unwrap_or(true)
-                {
+            _ => match self.store.size_fill_candidates(&folder_id) {
+                Ok(Some((candidates, since))) => SizeFill {
+                    target: GraphClient::message_sizes_target(&folder_id, &since),
+                    folder: folder_id,
+                    candidates,
+                },
+                Ok(None) => {
                     self.park_size_fill(&folder_id);
                     return;
                 }
-                match self.store.size_fill_candidates(&folder_id) {
-                    Ok(Some((candidates, since))) => SizeFill {
-                        target: GraphClient::message_sizes_target(&folder_id, &since),
-                        folder: folder_id,
-                        candidates,
-                    },
-                    Ok(None) => {
-                        self.park_size_fill(&folder_id);
-                        return;
-                    }
-                    Err(e) => {
-                        self.size_fill_store_error(&folder_id, e);
-                        return;
-                    }
+                Err(e) => {
+                    self.size_fill_store_error(&folder_id, e);
+                    return;
                 }
-            }
+            },
         };
         let (items, next) = match self.with_auth(|c| c.message_sizes_page(&fill.target)) {
             Ok(page) => page,
@@ -3487,11 +3502,17 @@ impl Engine {
                 return;
             }
             Err(e) => {
-                let _ = self.store.mark_size_asked(&fill.folder, &fill.candidates);
+                let marked = self.store.mark_size_asked(&fill.folder, &fill.candidates);
                 self.emit(SyncEvent::Error(format!(
                     "mail sync: cannot read the message sizes of folder {}: {e}",
                     self.folder_label(&fill.folder)
                 )));
+                // Parked either way: should marking fail too, the same
+                // refused request is not sent again before the next pass.
+                match marked {
+                    Ok(_) => self.park_size_fill(&fill.folder),
+                    Err(se) => self.size_fill_store_error(&fill.folder, se),
+                }
                 return;
             }
         };
@@ -22841,11 +22862,30 @@ mod tests {
             fill: bool,
             seed: impl FnOnce(&Store),
         ) -> (SyncHandle, Store, PathBuf) {
+            spawn_sized_every(srv, tag, fill, TICK, seed, "")
+        }
+
+        /// [`spawn_sized`] with its own tick (a long one runs the startup
+        /// pass and then only idle steps) and `sql` run on the seeded store.
+        fn spawn_sized_every(
+            srv: &FakeServer,
+            tag: &str,
+            fill: bool,
+            tick: Duration,
+            seed: impl FnOnce(&Store),
+            sql: &str,
+        ) -> (SyncHandle, Store, PathBuf) {
             let dir = unique_dir(tag);
             let store_path = dir.join("mail.db");
             let token_path = dir.join("token.bin");
             seed_token(&token_path);
             seed(&Store::open(&store_path).unwrap());
+            if !sql.is_empty() {
+                rusqlite::Connection::open(&store_path)
+                    .unwrap()
+                    .execute_batch(sql)
+                    .unwrap();
+            }
             let handle = spawn_with_bases_and_options(
                 store_path.clone(),
                 token_path,
@@ -22853,7 +22893,7 @@ mod tests {
                 3650,
                 srv.base_url.clone(),
                 srv.base_url.clone(),
-                TICK,
+                tick,
                 EngineOptions {
                     size_fill: fill,
                     ..EngineOptions::without_prefetch()
@@ -23110,6 +23150,97 @@ mod tests {
             let errors: Vec<String> = std::iter::from_fn(|| handle.evt_rx.try_recv().ok())
                 .filter_map(|e| match e {
                     SyncEvent::Error(m) if m.contains("message sizes") => Some(m),
+                    _ => None,
+                })
+                .collect();
+            assert!(errors.is_empty(), "{errors:?}");
+            stop(handle, dir);
+        }
+
+        /// FIX r1 m1: a give-up whose marking fails parks the folder, so
+        /// the refused listing is not sent again and again until the next
+        /// pass (the long tick runs none).
+        #[test]
+        fn a_give_up_the_store_cannot_record_is_not_repeated() {
+            let extra = vec![(
+                get_route(
+                    FILL,
+                    400,
+                    r#"{"error":{"code":"BadRequest","message":"no"}}"#,
+                ),
+                None,
+            )];
+            let srv = FakeServer::start_limited(world(extra, &[], &[]));
+            let (handle, store, dir) = spawn_sized_every(
+                &srv,
+                "size-giveup-store",
+                true,
+                Duration::from_secs(3600),
+                |s| synced_with(s, &[("O1", "2026-01-01T00:00:00Z")]),
+                "CREATE TRIGGER refuse_asked BEFORE UPDATE OF size_asked ON messages
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            );
+            let seen = wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::Error(m) if m.contains("cannot record the message sizes")),
+            );
+            settle();
+            assert_eq!(listings(&srv).len(), 1, "{seen:?}");
+            // Nothing could be marked: the row is still the fill's, for the
+            // next pass.
+            assert!(store.size_fill_candidates("F1").unwrap().is_some());
+            stop(handle, dir);
+        }
+
+        /// FIX r1 m2: a folder deleted while its fill is between pages
+        /// gets no next page and no `Error`.
+        #[test]
+        fn a_folder_deleted_mid_fill_gets_no_next_page() {
+            let page2 = "/me/mailFolders/F1/messages?$skiptoken=S2";
+            let mut routes: Vec<(Route, Option<usize>, Duration)> = vec![
+                (
+                    get_route(page2, 200, &page(&[sized("O2", "2")], None)),
+                    None,
+                    Duration::ZERO,
+                ),
+                // The first page takes a second, in which the test deletes
+                // the folder locally.
+                (
+                    get_route(FILL, 200, &page(&[sized("O1", "1")], Some(page2))),
+                    None,
+                    Duration::from_secs(1),
+                ),
+            ];
+            routes.extend(
+                world(vec![], &[], &[])
+                    .into_iter()
+                    .map(|(r, n)| (r, n, Duration::ZERO)),
+            );
+            let srv = FakeServer::start_paced(routes);
+            let (handle, store, dir) = spawn_sized_every(
+                &srv,
+                "size-deleted-mid-fill",
+                true,
+                Duration::from_secs(3600),
+                |s| {
+                    synced_with(
+                        s,
+                        &[
+                            ("O1", "2026-01-01T00:00:00Z"),
+                            ("O2", "2026-02-01T00:00:00Z"),
+                        ],
+                    )
+                },
+                "",
+            );
+            assert!(wait_until(TICK_WAIT, || listings(&srv).len() == 1));
+            store.delete_folder("F1").unwrap();
+            settle();
+            settle();
+            assert_eq!(listings(&srv).len(), 1, "no second page");
+            let errors: Vec<String> = std::iter::from_fn(|| handle.evt_rx.try_recv().ok())
+                .filter_map(|e| match e {
+                    SyncEvent::Error(m) => Some(m),
                     _ => None,
                 })
                 .collect();
