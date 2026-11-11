@@ -104,7 +104,14 @@ CREATE TABLE IF NOT EXISTS messages (
     -- them in `Store::init`, with a delta reset; the partial index over
     -- unsent reply drafts is made there too, after that migration.
     internet_message_id    TEXT NOT NULL DEFAULT '',
-    in_reply_to            TEXT NOT NULL DEFAULT ''
+    in_reply_to            TEXT NOT NULL DEFAULT '',
+    -- The message's size in bytes (#2123, `PidTagMessageSize`), NULL when
+    -- unknown, and whether the engine's size fill has asked Graph for it
+    -- (once per row). An old file gets both in `Store::init`, without a
+    -- delta reset; the partial index over unsized rows is made there too,
+    -- after that migration.
+    size                   INTEGER,
+    size_asked             INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received

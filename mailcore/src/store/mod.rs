@@ -50,6 +50,20 @@ macro_rules! current_id_sql {
     };
 }
 
+/// The rows the size fill may ask Graph about (#2123): no size, never
+/// asked, with a `received_at` (the listing's filter starts at the oldest)
+/// and a Graph id. A `local:` row and a header-less one would stay unsized
+/// for ever, so they are left out of the index too, which then holds
+/// nothing once every row is sized: the engine's probe on every idle turn
+/// costs nothing. It is the index's WHERE, spelled the same in every
+/// query that must use it.
+macro_rules! unsized_where {
+    () => {
+        "size IS NULL AND size_asked = 0 AND received_at <> '' \
+         AND substr(id, 1, 6) <> 'local:'"
+    };
+}
+
 /// A local SQLite store error. Wraps `rusqlite::Error` behind a small,
 /// crate-local type so callers don't need to depend on `rusqlite` directly.
 #[derive(Debug)]
@@ -211,6 +225,25 @@ pub struct MessageRow {
     /// stored before #2096 until a sync re-reads it. Never cleared by a
     /// merge. With `conversation_id`, what `Store::reply_draft_links` reads.
     pub in_reply_to: String,
+    /// The message's size in bytes (#2123, `Message::size`). `None` when
+    /// Graph has not told it yet: a row stored before #2123 until the
+    /// engine's size fill reads it, a draft written here until Graph's copy
+    /// brings it. Never cleared by a merge.
+    pub size: Option<i64>,
+}
+
+/// One folder's local size (#2123, [`Store::folder_sizes`]): what the store
+/// holds of it, without its subfolders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderSize {
+    pub folder_id: String,
+    /// How many messages are stored in the folder.
+    pub messages: i64,
+    /// The sum of the stored messages' known sizes, in bytes.
+    pub sized_bytes: i64,
+    /// How many stored messages have no size yet (`MessageRow::size`
+    /// `None`), so a host can say the figure is incomplete.
+    pub unsized_count: i64,
 }
 
 /// A file the user has attached to an outbound draft — a reference (path +
@@ -1681,6 +1714,10 @@ impl Store {
         // After `migrate_reply_links`, never in `schema.rs`: its batch runs
         // before the migrations, when an old table lacks `in_reply_to`.
         conn.execute(REPLY_DRAFTS_INDEX_SQL, [])?;
+        migrate_message_size(&conn)?;
+        // After `migrate_message_size`, never in `schema.rs`, for the same
+        // reason as `REPLY_DRAFTS_INDEX_SQL`.
+        conn.execute(UNSIZED_INDEX_SQL, [])?;
         register_contact_match(&conn)?;
         Ok(Store { conn })
     }
@@ -1820,7 +1857,10 @@ impl Store {
     /// `writes_internet_message_id` / `writes_in_reply_to` (#2096: only
     /// when carried) **and** only with a non-empty value, so a stored id is
     /// never cleared, not even by a carried `""` or a `Message` built in
-    /// code (`upsert_message`).
+    /// code (`upsert_message`). `size` (#2123) is written only when the
+    /// item has one (`COALESCE`): a size never goes from known to unknown,
+    /// so a partial item, a refused or dropped expand, a link minted before
+    /// #2123 or a code-built `Message` without one keeps the stored size.
     /// The reminder is on only while the row is flagged (the
     /// stored flag when the item carries none), so an unflag or a completed
     /// flag Graph reports leaves it off even if Exchange kept
@@ -1870,9 +1910,9 @@ impl Store {
                  is_reminder_on, reminder_at, reminder_signal_at, flag_due_at,
                  meeting_message_type,
                  sensitivity, has_sensitivity_label, sensitivity_label_name, is_rights_protected,
-                 meeting_reminder_on, internet_message_id, in_reply_to
+                 meeting_reminder_on, internet_message_id, in_reply_to, size
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                       ?35 AND ?12, ?36, ?37, ?38, ?40, ?42, ?43, ?44, ?45, ?47, ?49, ?51)
+                       ?35 AND ?12, ?36, ?37, ?38, ?40, ?42, ?43, ?44, ?45, ?47, ?49, ?51, ?53)
              ON CONFLICT(id) DO UPDATE SET
                  folder_id = excluded.folder_id,
                  conversation_id = CASE WHEN ?19 THEN excluded.conversation_id ELSE messages.conversation_id END,
@@ -1913,7 +1953,8 @@ impl Store {
                                             THEN excluded.internet_message_id
                                             ELSE messages.internet_message_id END,
                  in_reply_to = CASE WHEN ?52 AND excluded.in_reply_to <> ''
-                                    THEN excluded.in_reply_to ELSE messages.in_reply_to END
+                                    THEN excluded.in_reply_to ELSE messages.in_reply_to END,
+                 size = COALESCE(excluded.size, messages.size)
              WHERE NOT ?34 OR messages.local_edit = 0",
             params![
                 m.id,
@@ -1968,6 +2009,7 @@ impl Store {
                 fields.writes_internet_message_id(),
                 m.in_reply_to,
                 fields.writes_in_reply_to(),
+                m.size,
             ],
         )?;
         Ok(n > 0)
@@ -2044,6 +2086,123 @@ impl Store {
         ids.sort();
         ids.dedup();
         Ok(ids)
+    }
+
+    /// Every folder's local size (#2123), one entry per `folders` row
+    /// sorted by `folder_id` (an empty folder reads zeros): its stored
+    /// messages, the sum of their known sizes and how many have none yet.
+    /// One grouped read of `messages`, no body touched. A folder's total
+    /// with its subfolders is the host's sum (it has `parent_id`).
+    pub fn folder_sizes(&self) -> Result<Vec<FolderSize>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.id, COALESCE(m.messages, 0), COALESCE(m.sized_bytes, 0),
+                    COALESCE(m.unsized, 0)
+             FROM folders f
+             LEFT JOIN (SELECT folder_id, COUNT(*) AS messages,
+                               TOTAL(size) AS sized_bytes,
+                               SUM(size IS NULL) AS unsized
+                        FROM messages GROUP BY folder_id) m
+                    ON m.folder_id = f.id
+             ORDER BY f.id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(FolderSize {
+                    folder_id: r.get(0)?,
+                    messages: r.get(1)?,
+                    sized_bytes: r.get::<_, f64>(2)? as i64,
+                    unsized_count: r.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The folders holding a row the engine's size fill may ask Graph
+    /// about (#2123, [`unsized_where!`]), in `Store::folders` order: a
+    /// Graph folder (not `local:`, not the local Drafts sentinel). Reads
+    /// `idx_messages_unsized` alone, so it costs nothing once every row is
+    /// sized. A folder listed here may still have no candidate (its rows
+    /// all wait on a queued op): `size_fill_candidates` decides.
+    pub fn size_fill_folders(&self) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self.conn.prepare(&size_fill_folders_sql())?;
+        let ids = stmt
+            .query_map(params![LOCAL_DRAFTS_SENTINEL_FOLDER_ID], |r| r.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(ids)
+    }
+
+    /// The rows of `folder_id` the size fill asks Graph about (#2123): those
+    /// [`unsized_where!`] keeps, less the ids a queued op owns
+    /// (`pending_message_ids`: a row moved here locally sits under its old
+    /// id until the drain follows the move, #1896, and Graph has no such id
+    /// in this folder), sorted, with the oldest one's `received_at`, from
+    /// which the listing reads. `None` when there is none.
+    pub fn size_fill_candidates(
+        &self,
+        folder_id: &str,
+    ) -> Result<Option<(Vec<String>, String)>, StoreError> {
+        let pending = ids_json(&self.pending_message_ids()?);
+        let mut stmt = self.conn.prepare(concat!(
+            "SELECT id, received_at FROM messages
+             WHERE folder_id = ?1 AND ",
+            unsized_where!(),
+            " AND id NOT IN (SELECT value FROM json_each(?2))
+             ORDER BY id"
+        ))?;
+        let rows = stmt
+            .query_map(params![folder_id, pending], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some(oldest) = rows.iter().map(|(_, at)| at).min().cloned() else {
+            return Ok(None);
+        };
+        Ok(Some((rows.into_iter().map(|(id, _)| id).collect(), oldest)))
+    }
+
+    /// Writes the sizes the size fill read (#2123), in one transaction:
+    /// `size` only, and only on a stored row without one, so a size a delta
+    /// wrote meanwhile is kept and nothing else of the row changes (no FTS
+    /// trigger fires: `messages_fts_au` reads other columns). An id not
+    /// stored is skipped. Returns how many rows it wrote.
+    pub fn set_message_sizes(&self, sizes: &[(String, i64)]) -> Result<usize, StoreError> {
+        if sizes.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.write_tx()?;
+        let mut n = 0;
+        {
+            let mut stmt =
+                tx.prepare("UPDATE messages SET size = ?2 WHERE id = ?1 AND size IS NULL")?;
+            for (id, size) in sizes {
+                n += stmt.execute(params![id, size])?;
+            }
+        }
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Marks the candidates of a size fill of `folder_id` that are still
+    /// unsized as asked (#2123), so none is asked again: Graph listed no
+    /// size for them (gone or moved on the server, or no property), or the
+    /// fill gave up. A row moved out of the folder meanwhile, or owned by a
+    /// queued op now (a local move during the fill), is left unmarked: the
+    /// folder it sits in is asked about it later. Returns how many rows it
+    /// marked.
+    pub fn mark_size_asked(&self, folder_id: &str, ids: &[String]) -> Result<usize, StoreError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let pending = ids_json(&self.pending_message_ids()?);
+        let n = self.conn.execute(
+            "UPDATE messages SET size_asked = 1
+             WHERE id IN (SELECT value FROM json_each(?2))
+               AND folder_id = ?1 AND size IS NULL
+               AND id NOT IN (SELECT value FROM json_each(?3))",
+            params![folder_id, ids_json(ids), pending],
+        )?;
+        Ok(n)
     }
 
     /// Up to `limit` ids of `folder_id`'s header-less rows (`received_at`
@@ -2157,7 +2316,7 @@ impl Store {
                         meeting_message_type,
                         sensitivity, has_sensitivity_label, sensitivity_label_name,
                         is_rights_protected, meeting_reminder_on,
-                        internet_message_id, in_reply_to,
+                        internet_message_id, in_reply_to, size,
                         CASE WHEN conversation_id <> '' THEN conversation_id
                              ELSE 'msg:' || id END AS conv_key
                  FROM messages
@@ -2178,7 +2337,7 @@ impl Store {
                     k.meeting_message_type,
                     k.sensitivity, k.has_sensitivity_label, k.sensitivity_label_name,
                     k.is_rights_protected, k.meeting_reminder_on,
-                    k.internet_message_id, k.in_reply_to
+                    k.internet_message_id, k.in_reply_to, k.size
              FROM keyed k
              JOIN ranked r ON k.conv_key = r.conv_key
              ORDER BY r.latest DESC, k.received_at ASC",
@@ -6093,6 +6252,12 @@ impl Store {
         Ok(q)
     }
 
+    /// Whether a folder row `id` is stored (#2123: the size fill's check
+    /// before each page).
+    pub(crate) fn folder_exists(&self, id: &str) -> Result<bool, StoreError> {
+        folder_exists_on(&self.conn, id)
+    }
+
     /// Whether `id` (resolved through `folder_aliases`) is a folder a queued
     /// `DeleteFolder`'s batch removed (#2107): nothing is read from Graph
     /// for it meanwhile.
@@ -8240,6 +8405,54 @@ fn migrate_reply_links(conn: &Connection) -> Result<bool, StoreError> {
     Ok(true)
 }
 
+/// Brings a store from before #2123 up to date: adds `messages.size` (old
+/// rows read `None`) and `messages.size_asked`. Unlike the migrations of
+/// #2081, #2088 and #2096 it resets no delta or backfill state: the
+/// engine's size fill reads the sizes of the rows stored before, and of
+/// any row a link minted before #2123 (which keeps the old `$expand`)
+/// brings later, a cheap `$select=id` listing instead of a re-enumeration.
+/// Last in `Store::init`. One IMMEDIATE transaction that probes for `size`
+/// first; a store that has it (every fresh one) is left alone. Returns
+/// whether it migrated.
+fn migrate_message_size(conn: &Connection) -> Result<bool, StoreError> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let has: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'size'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has > 0 {
+        return Ok(false);
+    }
+    tx.execute_batch(
+        "ALTER TABLE messages ADD COLUMN size INTEGER;
+         ALTER TABLE messages ADD COLUMN size_asked INTEGER NOT NULL DEFAULT 0;",
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// The partial index over [`unsized_where!`]'s rows (#2123), keyed by
+/// folder, which `Store::size_fill_folders` and
+/// `Store::size_fill_candidates` read.
+const UNSIZED_INDEX_SQL: &str = concat!(
+    "CREATE INDEX IF NOT EXISTS idx_messages_unsized ON messages(folder_id) WHERE ",
+    unsized_where!()
+);
+
+/// `Store::size_fill_folders`' statement (#2123): the Graph folders
+/// holding a row [`unsized_where!`] keeps, in `Store::folders` order. The
+/// subquery reads `idx_messages_unsized` alone; a test checks the plan.
+fn size_fill_folders_sql() -> String {
+    format!(
+        "SELECT id FROM folders
+         WHERE id IN (SELECT folder_id FROM messages WHERE {})
+           AND id <> ?1 AND substr(id, 1, 6) <> 'local:'
+         {FOLDER_ORDER}",
+        unsized_where!()
+    )
+}
+
 /// The partial index `Store::reply_draft_links` reads (#2096): only unsent
 /// reply drafts, so it stays as small as the Drafts folder's replies. Its
 /// `WHERE` is spelled exactly as the query's, or SQLite would not use it;
@@ -8611,11 +8824,11 @@ const MESSAGE_ROW_COLUMNS: &str = "id, folder_id, conversation_id, subject, from
     is_reminder_on, reminder_at, reminder_signal_at, flag_due_at,
     meeting_message_type,
     sensitivity, has_sensitivity_label, sensitivity_label_name, is_rights_protected,
-    meeting_reminder_on, internet_message_id, in_reply_to";
+    meeting_reminder_on, internet_message_id, in_reply_to, size";
 
 /// How many columns `MESSAGE_ROW_COLUMNS` names: the index of the first
 /// column a query selects after them (`Store::draft`'s body).
-const BODY_AFTER_ROW_COLUMNS: usize = 31;
+const BODY_AFTER_ROW_COLUMNS: usize = 32;
 
 /// `Store::due_message_reminders`'s statement (#2054): flagged rows whose
 /// reminder is on and whose next signal (`reminder_signal_at`, else
@@ -8689,6 +8902,7 @@ fn map_message_row(row: &Row) -> rusqlite::Result<MessageRow> {
         meeting_reminder_on: row.get(28)?,
         internet_message_id: row.get(29)?,
         in_reply_to: row.get(30)?,
+        size: row.get(31)?,
     })
 }
 
@@ -8877,6 +9091,7 @@ mod tests {
             flag_due_at: String::new(),
             internet_message_id: String::new(),
             in_reply_to: String::new(),
+            size: None,
         }
     }
 
@@ -9440,6 +9655,7 @@ mod tests {
             flag_due_at: String::new(),
             internet_message_id: String::new(),
             in_reply_to: String::new(),
+            size: None,
         };
         s.merge_message("G", &partial, &read_only_fields()).unwrap();
         let after = raw_row(&s, "11");
@@ -9528,6 +9744,7 @@ mod tests {
         m.meeting_reminder_on = true;
         m.internet_message_id = "<13@x>".into();
         m.in_reply_to = "<12@x>".into();
+        m.size = Some(4321);
         m.to = vec![Recipient {
             name: "B".into(),
             address: "b@x".into(),
@@ -9572,12 +9789,15 @@ mod tests {
             ("meeting_reminder_on", V::Integer(1)),
             ("internet_message_id", t("<13@x>")),
             ("in_reply_to", t("<12@x>")),
+            ("size", V::Integer(4321)),
+            ("size_asked", V::Integer(0)),
         ];
         expect(&s, "13", &first);
 
         // Over the row, with every column changed (to empty / false where
         // a value can be), moved to G; bcc (not a Graph column here) kept,
-        // and so are the two ids (#2096: a merge never clears a stored one).
+        // and so are the two ids (#2096: a merge never clears a stored one)
+        // and the size (#2123: nor a size).
         s.conn
             .execute(
                 "UPDATE messages SET bcc_recipients = 'kept' WHERE id = '13'",
@@ -9610,6 +9830,7 @@ mod tests {
             flag_due_at: String::new(),
             internet_message_id: String::new(),
             in_reply_to: String::new(),
+            size: None,
         };
         s.upsert_message("G", &m2).unwrap();
         expect(
@@ -9649,6 +9870,8 @@ mod tests {
                 ("meeting_reminder_on", V::Integer(0)),
                 ("internet_message_id", t("<13@x>")),
                 ("in_reply_to", t("<12@x>")),
+                ("size", V::Integer(4321)),
+                ("size_asked", V::Integer(0)),
             ],
         );
     }
@@ -15586,6 +15809,7 @@ mod search_tests {
             flag_due_at: String::new(),
             internet_message_id: String::new(),
             in_reply_to: String::new(),
+            size: None,
         };
         s.upsert_message("F", &m).unwrap();
         s.put_body(
@@ -16458,6 +16682,7 @@ mod local_id_tests {
             flag_due_at: String::new(),
             internet_message_id: String::new(),
             in_reply_to: String::new(),
+            size: None,
         };
         s.upsert_message(&folder, &m).unwrap();
         assert_eq!(s.current_id(&local).unwrap(), "G");
@@ -16569,6 +16794,7 @@ mod body_format_tests {
             flag_due_at: String::new(),
             internet_message_id: String::new(),
             in_reply_to: String::new(),
+            size: None,
         }
     }
 
@@ -17279,6 +17505,7 @@ mod kept_body_tests {
             flag_due_at: String::new(),
             internet_message_id: String::new(),
             in_reply_to: String::new(),
+            size: None,
         }
     }
 
@@ -17504,6 +17731,7 @@ mod folder_retain_tests {
             flag_due_at: String::new(),
             internet_message_id: String::new(),
             in_reply_to: String::new(),
+            size: None,
         }
     }
 
@@ -17933,6 +18161,7 @@ mod backfill_tests {
             flag_due_at: String::new(),
             internet_message_id: String::new(),
             in_reply_to: String::new(),
+            size: None,
         };
         let all = MessageFields::all();
         assert!(
@@ -18109,6 +18338,7 @@ mod moved_id_tests {
             flag_due_at: String::new(),
             internet_message_id: String::new(),
             in_reply_to: String::new(),
+            size: None,
         }
     }
 
@@ -18480,6 +18710,7 @@ mod message_reminder_tests {
             flag_due_at: "2026-11-09T17:00:00Z".into(),
             internet_message_id: String::new(),
             in_reply_to: String::new(),
+            size: None,
         }
     }
 
@@ -19158,6 +19389,7 @@ mod meeting_message_type_tests {
             flag_due_at: String::new(),
             internet_message_id: String::new(),
             in_reply_to: String::new(),
+            size: None,
         }
     }
 
@@ -19438,11 +19670,14 @@ mod meeting_message_type_tests {
             s.set_backfill_progress("G", "https://graph/G?$skiptoken=3", 4, SCOPE_ALL)
                 .unwrap();
             // Back to a store from before #2054 (and so before #2081,
-            // #2088, #2089 and #2096).
+            // #2088, #2089, #2096 and #2123).
             s.conn
                 .execute_batch(
                     "DROP INDEX idx_messages_reminder;
                      DROP INDEX idx_messages_reply_drafts;
+                     DROP INDEX idx_messages_unsized;
+                     ALTER TABLE messages DROP COLUMN size;
+                     ALTER TABLE messages DROP COLUMN size_asked;
                      DROP TRIGGER forgotten_messages_ad;
                      DROP TRIGGER forgotten_messages_ai;
                      DROP TRIGGER forgotten_messages_au;
@@ -19485,6 +19720,7 @@ mod meeting_message_type_tests {
             ("", "", "")
         );
         assert_eq!(row.subject, "budget M1");
+        assert_eq!(row.size, None);
         // Every folder's delta and backfill state is reset.
         for f in ["F", "G"] {
             assert_eq!(s.get_delta_link(f).unwrap(), None, "{f}");
@@ -19517,6 +19753,7 @@ mod meeting_message_type_tests {
         assert!(!migrate_message_protection(&s.conn).unwrap());
         assert!(!migrate_meeting_reminder(&s.conn).unwrap());
         assert!(!migrate_reply_links(&s.conn).unwrap());
+        assert!(!migrate_message_size(&s.conn).unwrap());
         s.set_head_link("F", "https://graph/F?$deltatoken=new", false)
             .unwrap();
         drop(s);
@@ -19595,6 +19832,7 @@ mod message_protection_tests {
             flag_due_at: String::new(),
             internet_message_id: String::new(),
             in_reply_to: String::new(),
+            size: None,
         }
     }
 
@@ -19912,6 +20150,7 @@ mod meeting_reminder_tests {
             flag_due_at: String::new(),
             internet_message_id: String::new(),
             in_reply_to: String::new(),
+            size: None,
         }
     }
 
@@ -20215,6 +20454,7 @@ mod reply_link_tests {
             flag_due_at: String::new(),
             internet_message_id: imid.into(),
             in_reply_to: irt.into(),
+            size: None,
         }
     }
 
@@ -23200,5 +23440,462 @@ mod empty_folder_tests {
             .unwrap()
             .is_empty()
         );
+    }
+}
+
+/// #2123: message sizes in the store, the size fill's reads and writes and
+/// the folders' local sizes.
+#[cfg(test)]
+mod message_size_tests {
+    use super::*;
+
+    fn folder(s: &Store, id: &str) {
+        s.upsert_folder(&MailFolder {
+            id: id.into(),
+            display_name: id.into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: None,
+        })
+        .unwrap();
+    }
+
+    fn msg(id: &str, received: &str, size: Option<i64>) -> Message {
+        Message {
+            id: id.into(),
+            conversation_id: format!("C{id}"),
+            subject: format!("quarterly {id}"),
+            from: Recipient {
+                name: "A".into(),
+                address: "a@x".into(),
+            },
+            to: vec![],
+            cc: vec![],
+            received: received.into(),
+            sent: String::new(),
+            is_read: false,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: String::new(),
+            is_draft: false,
+            is_meeting_request: false,
+            categories: vec![],
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
+            meeting_message_type: None,
+            protection: Default::default(),
+            meeting_reminder_on: false,
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
+            size,
+        }
+    }
+
+    fn size_of(s: &Store, id: &str) -> (Option<i64>, i64) {
+        s.conn
+            .query_row(
+                "SELECT size, size_asked FROM messages WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn candidates(s: &Store, f: &str) -> Option<(Vec<String>, String)> {
+        s.size_fill_candidates(f).unwrap()
+    }
+
+    #[test]
+    fn every_read_path_carries_the_size() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        let mut m = msg("M1", "2026-07-01T00:00:00Z", Some(18432));
+        m.is_flagged = true;
+        m.is_reminder_on = true;
+        m.reminder_at = "2026-07-02T08:00:00Z".into();
+        s.upsert_message("F", &m).unwrap();
+        s.put_body(
+            "M1",
+            &Body {
+                content_type: "text".into(),
+                content: "the body".into(),
+            },
+        )
+        .unwrap();
+        s.upsert_message("F", &msg("M2", "2026-07-03T00:00:00Z", None))
+            .unwrap();
+        let sizes = |rows: Vec<MessageRow>| {
+            let mut v: Vec<_> = rows.into_iter().map(|r| (r.id, r.size)).collect();
+            v.sort();
+            v
+        };
+        let both = vec![("M1".to_string(), Some(18432)), ("M2".to_string(), None)];
+        assert_eq!(sizes(s.messages_in_folder("F", 50, 0).unwrap()), both);
+        assert_eq!(sizes(s.conversations_in_folder("F", 50, 0).unwrap()), both);
+        assert_eq!(sizes(s.message_rows(&["M1", "M2"]).unwrap()), both);
+        assert_eq!(sizes(s.search("quarterly", 50).unwrap()), both);
+        assert_eq!(s.message_row("M1").unwrap().unwrap().size, Some(18432));
+        assert_eq!(s.message_row("M2").unwrap().unwrap().size, None);
+        assert_eq!(
+            sizes(s.due_message_reminders("2026-07-03T00:00:00Z").unwrap()),
+            [("M1".to_string(), Some(18432))]
+        );
+        // `draft`'s body is read after the row's columns, size included.
+        let (row, body) = s.draft("M1").unwrap().unwrap();
+        assert_eq!(row.size, Some(18432));
+        assert_eq!(
+            (body.content_type.as_str(), body.content.as_str()),
+            ("text", "the body")
+        );
+    }
+
+    #[test]
+    fn a_merge_keeps_a_stored_size_unless_one_comes() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.upsert_message("F", &msg("M", "2026-07-01T00:00:00Z", Some(10)))
+            .unwrap();
+        // A partial item (`{id, isRead}`), a complete one read without the
+        // size (a link minted before #2123) and a code-built `Message`
+        // without one all keep it.
+        let partial = MessageFields {
+            is_read: true,
+            ..MessageFields::default()
+        };
+        s.merge_message("F", &msg("M", "", None), &partial).unwrap();
+        assert_eq!(size_of(&s, "M"), (Some(10), 0));
+        s.merge_message(
+            "F",
+            &msg("M", "2026-07-01T00:00:00Z", None),
+            &MessageFields::all(),
+        )
+        .unwrap();
+        assert_eq!(size_of(&s, "M"), (Some(10), 0));
+        s.upsert_message("F", &msg("M", "2026-07-01T00:00:00Z", None))
+            .unwrap();
+        assert_eq!(size_of(&s, "M"), (Some(10), 0));
+        assert!(
+            s.merge_message_unless_edited("F", &msg("M", "2026-07-01T00:00:00Z", None), &partial)
+                .unwrap()
+        );
+        assert_eq!(size_of(&s, "M"), (Some(10), 0));
+        // A carried size replaces it, a partial item's too.
+        s.merge_message("F", &msg("M", "", Some(25)), &partial)
+            .unwrap();
+        assert_eq!(size_of(&s, "M"), (Some(25), 0));
+        // An insert writes what the item has.
+        s.merge_message("F", &msg("N", "", None), &partial).unwrap();
+        assert_eq!(size_of(&s, "N"), (None, 0));
+    }
+
+    #[test]
+    fn a_local_draft_has_no_size() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("subj", "", "", "<p>x</p>").unwrap();
+        assert_eq!(s.message_row(&id).unwrap().unwrap().size, None);
+        // And is no candidate of the fill: Graph has no such id.
+        assert!(s.size_fill_folders().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_store_without_the_size_column_migrates_once_and_keeps_its_links() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-size-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        {
+            let s = Store::open(&path).unwrap();
+            folder(&s, "F");
+            folder(&s, "G");
+            s.upsert_message("F", &msg("M1", "2026-07-01T00:00:00Z", Some(5)))
+                .unwrap();
+            s.complete_backfill("F", "https://graph/F?$deltatoken=1", SCOPE_ALL, 7, None)
+                .unwrap();
+            s.set_backfill_progress("G", "https://graph/G?$skiptoken=3", 4, SCOPE_ALL)
+                .unwrap();
+            // Back to a store from before #2123.
+            s.conn
+                .execute_batch(
+                    "DROP INDEX idx_messages_unsized;
+                     ALTER TABLE messages DROP COLUMN size;
+                     ALTER TABLE messages DROP COLUMN size_asked;",
+                )
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let row = s.message_row("M1").unwrap().unwrap();
+        assert_eq!(row.size, None);
+        assert_eq!(row.subject, "quarterly M1");
+        assert_eq!(size_of(&s, "M1"), (None, 0));
+        // No delta or backfill state is touched: the fill reads the sizes.
+        assert_eq!(
+            s.get_delta_link("F").unwrap().as_deref(),
+            Some("https://graph/F?$deltatoken=1")
+        );
+        let (link, synced): (Option<String>, i64) = s
+            .conn
+            .query_row(
+                "SELECT backfill_link, backfill_synced FROM folders WHERE id = 'G'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (link.as_deref(), synced),
+            (Some("https://graph/G?$skiptoken=3"), 4)
+        );
+        // The index is back, and the old row is the fill's.
+        assert_eq!(s.size_fill_folders().unwrap(), ["F"]);
+        assert!(!migrate_message_size(&s.conn).unwrap());
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(size_of(&s, "M1"), (None, 0));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_store_has_the_columns_and_the_index() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(!migrate_message_size(&s.conn).unwrap());
+        let n: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_unsized'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn the_size_fill_probe_reads_the_partial_index() {
+        let s = Store::open_in_memory().unwrap();
+        let plan: Vec<String> = s
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", size_fill_folders_sql()))
+            .unwrap()
+            .query_map([LOCAL_DRAFTS_SENTINEL_FOLDER_ID], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|p| p.contains("idx_messages_unsized")),
+            "{plan:?}"
+        );
+        // `messages` is read through the index alone (empty once every
+        // row is sized), never scanned.
+        assert!(
+            plan.iter()
+                .filter(|p| p.contains("messages"))
+                .all(|p| p.contains("idx_messages_unsized")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn folder_sizes_count_sum_and_unsized() {
+        let s = Store::open_in_memory().unwrap();
+        for f in ["A", "B", "E"] {
+            folder(&s, f);
+        }
+        s.upsert_message("A", &msg("1", "2026-07-01T00:00:00Z", Some(100)))
+            .unwrap();
+        s.upsert_message("A", &msg("2", "2026-07-02T00:00:00Z", Some(23)))
+            .unwrap();
+        s.upsert_message("A", &msg("3", "2026-07-03T00:00:00Z", None))
+            .unwrap();
+        s.upsert_message("B", &msg("4", "2026-07-04T00:00:00Z", None))
+            .unwrap();
+        let local = s.create_local_draft("d", "", "", "").unwrap();
+        let sizes = s.folder_sizes().unwrap();
+        let drafts_folder = s.message_row(&local).unwrap().unwrap().folder_id;
+        let mut want = vec![
+            FolderSize {
+                folder_id: "A".into(),
+                messages: 3,
+                sized_bytes: 123,
+                unsized_count: 1,
+            },
+            FolderSize {
+                folder_id: "B".into(),
+                messages: 1,
+                sized_bytes: 0,
+                unsized_count: 1,
+            },
+            FolderSize {
+                folder_id: "E".into(),
+                messages: 0,
+                sized_bytes: 0,
+                unsized_count: 0,
+            },
+            // A local draft counts, without a size.
+            FolderSize {
+                folder_id: drafts_folder,
+                messages: 1,
+                sized_bytes: 0,
+                unsized_count: 1,
+            },
+        ];
+        want.sort_by(|a, b| a.folder_id.cmp(&b.folder_id));
+        assert_eq!(sizes, want);
+    }
+
+    #[test]
+    fn size_fill_candidates_leave_out_what_graph_cannot_answer() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        folder(&s, "G");
+        s.upsert_message("F", &msg("old", "2026-01-05T00:00:00Z", None))
+            .unwrap();
+        s.upsert_message("F", &msg("new", "2026-03-01T00:00:00Z", None))
+            .unwrap();
+        s.upsert_message("F", &msg("older", "2026-01-01T00:00:00Z", None))
+            .unwrap();
+        // Sized, header-less, asked and `local:` rows are not candidates.
+        s.upsert_message("F", &msg("sized", "2025-01-01T00:00:00Z", Some(1)))
+            .unwrap();
+        s.upsert_message("F", &msg("headerless", "", None)).unwrap();
+        s.upsert_message("F", &msg("asked", "2025-01-01T00:00:00Z", None))
+            .unwrap();
+        s.conn
+            .execute("UPDATE messages SET size_asked = 1 WHERE id = 'asked'", [])
+            .unwrap();
+        s.upsert_message("F", &msg("local:x", "2025-01-01T00:00:00Z", None))
+            .unwrap();
+        // A row moved here locally, its move still queued: Graph has it in
+        // G under that id.
+        s.upsert_message("G", &msg("moved", "2025-01-01T00:00:00Z", None))
+            .unwrap();
+        s.move_message("moved", "F").unwrap();
+        s.enqueue_op(&OutboxOp::Move {
+            id: "moved".into(),
+            dest: "F".into(),
+        })
+        .unwrap();
+        let (ids, since) = candidates(&s, "F").unwrap();
+        assert_eq!(ids, ["new", "old", "older"]);
+        // The oldest candidate's, not the first row's.
+        assert_eq!(since, "2026-01-01T00:00:00Z");
+        assert_eq!(candidates(&s, "G"), None);
+        assert_eq!(s.size_fill_folders().unwrap(), ["F"]);
+        // Once Graph follows the move, the row is a candidate under its new
+        // id.
+        s.conn.execute("DELETE FROM outbox", []).unwrap();
+        s.follow_move("moved", "moved2").unwrap();
+        let (ids, since) = candidates(&s, "F").unwrap();
+        assert_eq!(ids, ["moved2", "new", "old", "older"]);
+        assert_eq!(since, "2025-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn size_fill_folders_follow_the_folder_order_and_skip_local_ones() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "zeta");
+        folder(&s, "alpha");
+        s.upsert_folder(&MailFolder {
+            id: "INBOX".into(),
+            display_name: "Inbox".into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: Some("inbox".into()),
+        })
+        .unwrap();
+        folder(&s, "local:new");
+        folder(&s, "sized");
+        for (f, id) in [
+            ("zeta", "1"),
+            ("alpha", "2"),
+            ("INBOX", "3"),
+            ("local:new", "4"),
+        ] {
+            s.upsert_message(f, &msg(id, "2026-07-01T00:00:00Z", None))
+                .unwrap();
+        }
+        s.upsert_message("sized", &msg("5", "2026-07-01T00:00:00Z", Some(9)))
+            .unwrap();
+        assert_eq!(s.size_fill_folders().unwrap(), ["INBOX", "alpha", "zeta"]);
+    }
+
+    #[test]
+    fn set_message_sizes_writes_only_a_missing_size() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.upsert_message("F", &msg("A", "2026-07-01T00:00:00Z", None))
+            .unwrap();
+        s.upsert_message("F", &msg("B", "2026-07-02T00:00:00Z", Some(7)))
+            .unwrap();
+        let before = |id: &str| {
+            let mut r = s.message_row(id).unwrap().unwrap();
+            r.size = None;
+            r
+        };
+        let (a, b) = (before("A"), before("B"));
+        let fts = |s: &Store| -> i64 {
+            s.conn
+                .query_row("SELECT COUNT(*) FROM messages_fts", [], |r| r.get(0))
+                .unwrap()
+        };
+        let fts_before = fts(&s);
+        let n = s
+            .set_message_sizes(&[
+                ("A".into(), 100),
+                ("B".into(), 200),
+                ("unstored".into(), 300),
+            ])
+            .unwrap();
+        // Only A: B keeps the size a delta wrote, an unstored id is skipped.
+        assert_eq!(n, 1);
+        assert_eq!(size_of(&s, "A"), (Some(100), 0));
+        assert_eq!(size_of(&s, "B"), (Some(7), 0));
+        assert_eq!(s.message_row("unstored").unwrap(), None);
+        // Nothing else of a row changes.
+        assert_eq!(before("A"), a);
+        assert_eq!(before("B"), b);
+        assert_eq!(fts(&s), fts_before);
+        assert_eq!(s.set_message_sizes(&[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn mark_size_asked_marks_only_rows_still_unsized_in_the_folder() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        folder(&s, "G");
+        for id in ["gone", "sized", "elsewhere", "pending"] {
+            s.upsert_message("F", &msg(id, "2026-07-01T00:00:00Z", None))
+                .unwrap();
+        }
+        let (ids, _) = candidates(&s, "F").unwrap();
+        // During the fill: one row got its size, one moved to G (followed
+        // already), one was moved locally and waits on its op.
+        s.set_message_sizes(&[("sized".into(), 3)]).unwrap();
+        s.move_message("elsewhere", "G").unwrap();
+        s.move_message("pending", "G").unwrap();
+        s.move_message("pending", "F").unwrap();
+        s.enqueue_op(&OutboxOp::Move {
+            id: "pending".into(),
+            dest: "F".into(),
+        })
+        .unwrap();
+        assert_eq!(s.mark_size_asked("F", &ids).unwrap(), 1);
+        assert_eq!(size_of(&s, "gone"), (None, 1));
+        assert_eq!(size_of(&s, "sized"), (Some(3), 0));
+        assert_eq!(size_of(&s, "elsewhere"), (None, 0));
+        assert_eq!(size_of(&s, "pending"), (None, 0));
+        // An asked row is never a candidate again.
+        assert_eq!(candidates(&s, "F"), None);
+        // F stays in the probe for its pending row, with no candidate (the
+        // engine parks it for the pass); G has the row that moved there.
+        assert_eq!(s.size_fill_folders().unwrap(), ["F", "G"]);
+        assert_eq!(s.mark_size_asked("F", &[]).unwrap(), 0);
     }
 }

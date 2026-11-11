@@ -3564,3 +3564,103 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `ops_queued_after_a_waiting_copy_wait_for_it` (r1: a delete of the source's mail, a rename
   of the copy and a folder created under it, each sent after the copy, under its Graph id)), and
   `folder_commands_the_store_refuses_report_and_queue_nothing` (copy refusals).
+
+## Message and folder sizes (#2123)
+
+A host can draw classic Outlook's Folder Size dialog. The Local Data tab comes from the store
+(`Store::folder_sizes`) and the Server Data tab from Graph (`SyncCommand::FetchFolderSizes`).
+
+- Source: `PidTagMessageSize` (tag `0x0E08`, PT_LONG) as `model::MESSAGE_SIZE_PROP`
+  (`Integer 0x0E08`), one more `or id eq` term in `client::MESSAGE_EXPAND`, so a delta, `get_message`,
+  `get_message_hit` and a search hit bring it with no extra request. `model::parse_message_size`
+  is lenient: a string (as Graph sends extended values) or a JSON integer, non-negative; no
+  array, no entry or anything else is `None`. The id matches `is_message_size_prop`
+  (`is_tag_prop(id, "Integer", 0x0E08)`: `Integer 0xe08` matches, the folder's `Long 0x0E08`
+  does not).
+- Store: `messages.size INTEGER` (NULL = unknown) and `messages.size_asked INTEGER NOT NULL
+  DEFAULT 0`; `MessageRow::size: Option<i64>` on every read (`MESSAGE_ROW_COLUMNS` gains `size`
+  last, `BODY_AFTER_ROW_COLUMNS` is 32, and `conversations_in_folder` spells it twice).
+- Merge: `size = COALESCE(excluded.size, messages.size)`. A carried size writes. Anything else
+  keeps the stored one: a partial item, a refused or dropped expand, a link minted before #2123
+  or a code-built `Message`. A size never goes from known to unknown, so no `MessageFields`
+  flag is needed. A local draft (`create_local_draft`) reads `None` until Graph's copy brings
+  one. `reconcile_id` and `follow_move` re-key the row and keep it. The FTS update trigger reads
+  other columns (#1913), so no size write touches `messages_fts`.
+- Migration `migrate_message_size` is the last one in `Store::init`: one IMMEDIATE transaction
+  that probes `pragma_table_info('messages')` for `size` and adds both columns. Unlike
+  #2081/#2088/#2096, it resets **no** delta or backfill state. The size fill covers both the
+  rows stored before #2123 and the rows a link minted before it brings later.
+- The size fill (idle, `Engine::next_size_fill` / `size_fill_step`, `EngineOptions::size_fill`,
+  on by default; `EngineOptions::without_prefetch` turns it off for the older engine tests):
+  - Candidates (`unsized_where!`, spelled the same in the partial index
+    `idx_messages_unsized ON messages(folder_id)` and in the queries that read it): `size IS
+    NULL AND size_asked = 0`, a non-empty `received_at`, and an id not `local:`. A local draft
+    and a header-less row would stay unsized for ever, so they are not in the index, which
+    holds nothing once every row is sized. The engine probes it on every idle turn
+    (`Store::size_fill_folders`: Graph folders in `Store::folders` order, no `local:` folder and
+    not the drafts sentinel; a test checks that the plan reads only the index). The index is
+    created in `Store::init` after the migration, never in `schema.rs`.
+  - `Store::size_fill_candidates(folder)` also leaves out `pending_message_ids` (passed as a
+    `json_each` array): a row moved here locally sits under its old id until the drain follows
+    the move (#1896), and Graph has no such id in this folder. It returns the ids and the
+    oldest `received_at`. A folder in the probe with no candidate is parked for the pass (no
+    request). Before **every** page, not only the first, a folder gone from the store, being
+    deleted (#2107) or being emptied (#2110) drops the fill and parks the folder quietly: no
+    request and no `Error`.
+  - Order in `main_loop`: the prefetch, then the backfill, then the size fill. A ready fill
+    makes the wait zero, and its step runs only when `!self.due()`, so a queued command and a
+    due wake go first.
+  - One page per idle step: `GraphClient::message_sizes_target(folder, oldest)` is
+    `GET /me/mailFolders/{id}/messages?$filter=receivedDateTime ge {oldest}&$select=id&$top=1000
+    &$expand=` its size alone. `message_sizes_page` then follows each `@odata.nextLink`. Graph
+    may return fewer items than `$top`, and the loop never assumes a full page.
+  - Each page goes to `Store::set_message_sizes` in one transaction (`UPDATE … SET size = ?
+    WHERE id = ? AND size IS NULL`): the size only, never over a known one, an unstored id
+    skipped. A page that wrote a row emits `MessagesUpdated`.
+  - The last page calls `Store::mark_size_asked(folder, candidates)`. It sets `size_asked = 1`
+    on the candidates that are still unsized, still in the folder and still not pending (a
+    local move during the fill stays unmarked). These are messages gone or moved on the server,
+    or with no property. No row is asked twice. Rows that arrived during the fill get their own
+    fill.
+  - The fill's state (folder, candidates, next page) is in memory only. A restart starts the
+    folder over: rows already filled are no longer candidates. Sign-out and sign-in drop it
+    and its parked folders (`drop_size_fill`), and a pass clears the parked set.
+  - Failures: 401, 429, a whole-call 503 (`classify_status` makes it `Throttled`) and transport
+    go through `react`, and the page is asked again after. Another 5xx parks the folder until
+    the next pass, and the fill starts over then. Any other 4xx (a 404 folder, a refused
+    `$filter` or `$expand`) or a parse error gives up: the candidates are marked asked, with one
+    `Error`, and the folder is parked. If the store cannot mark them, the folder is parked as
+    well (with the store's `Error`), so the refused request is not sent again before the next
+    pass. There is no `SyncState` and no `FolderProgress`.
+  - Accepted costs, against one re-enumeration of every folder:
+    - Through a link minted before #2123, each new mail in a folder costs one small idle listing
+      for as long as that link lives, because links are not reset here.
+    - An old-dated message moved into a folder from another device lists that folder from its
+      date (a 2019 message in a 20 000-message folder: about 20 pages).
+    - Rejected alternatives: a per-id `$batch` (Graph's throttling counts each sub-request) and a
+      per-folder "done" mark (a pre-#2123 link's new mail would then stay unsized for ever).
+- `Store::folder_sizes() -> Vec<FolderSize { folder_id, messages, sized_bytes, unsized_count }>`
+  has one entry per `folders` row (an empty folder reads zeros), sorted by `folder_id`. It is
+  one grouped read (`LEFT JOIN` over an aggregate) and touches no body. `unsized_count` counts
+  every row with `size IS NULL`, local drafts included, so a host can say a figure is
+  incomplete. (The field is not named `unsized`, which is a reserved word in Rust.) A total with
+  subfolders is the host's sum over `parent_id`.
+- `SyncCommand::FetchFolderSizes { folder_ids }` answers `SyncEvent::FolderSizesFetched { sizes:
+  Vec<(String, Option<i64>)> }` (one entry per id asked, in order, as asked) or
+  `FolderSizesFailed { folder_ids, error }`, never a `SyncEvent::Error`. Nothing is stored.
+  - It is served in `checkpoint` ahead of a running pass, and in the main loop, like
+    `SearchMessages` (#2006), and is tried during a back-off.
+  - Each id maps through `current_folder_id`. A `local:` folder, or one being deleted or
+    emptied, answers `None` with no request. An empty list answers `[]` with no request. Signed
+    out, it answers `FolderSizesFailed { error: "not signed in" }`.
+  - `GraphClient::folder_size_request(id)` is `GET /me/mailFolders/{id}?$select=id&$expand=`
+    `PidTagMessageSizeExtended` (`model::FOLDER_SIZE_PROP`, `Long 0x0E08`, PT_I8: the folder's
+    items without its subfolders). The requests go `engine::FOLDER_SIZE_BATCH` = 4 a `$batch`:
+    Exchange allows 4 concurrent requests per app per mailbox and evaluates every sub-request
+    against that, so 20 GETs to one mailbox come back with `MailboxConcurrency` 429s.
+  - Answers: a 2xx reads `model::parse_folder_size` (string or number, non-negative, else
+    `None`), and a 404 is `None`. A sub-response 429 or 503 fails the command and backs off
+    (`react_quietly(Throttled { Retry-After or 30 })`, as the bulk loop reads a sub-response
+    and `classify_status` a whole call). Any other sub-status fails it alone, and a whole-call
+    error fails it (auth, throttle and transport also through `react_quietly`). There is no
+    retry loop and no sleep on the engine thread.
