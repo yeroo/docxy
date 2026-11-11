@@ -23820,8 +23820,8 @@ mod move_folder_messages_tests {
     }
 
     /// The row is filed under the dest and re-keyed, its body following;
-    /// the old id resolves to the new one. With no row stored, only the
-    /// alias is recorded.
+    /// the old id resolves to the new one. With no row stored, no alias
+    /// is recorded unless a queued op names the id (r1-M1).
     #[test]
     fn follow_folder_move_files_and_rekeys() {
         let s = Store::open_in_memory().unwrap();

@@ -3733,8 +3733,10 @@ A host can draw classic Outlook's Folder Size dialog. The Local Data tab comes f
   Every `Err` is also `FolderWriteFailed { write: MoveMail }` + `Error("move the mail of folder
   {id}: …")`, sent before it; a partial run's error is `"{n} of {total} messages could not be
   moved: {first error}"`.
-- The end (`finish_move_folder_messages`, and `refuse_move_folder_messages` once Graph saw the
-  run): the op goes, then both folders' counts are read from Graph (`read_folder_counts`, now
+- The end (`finish_move_folder_messages`, and `refuse_move_folder_messages` whatever refused the
+  run: Graph refusing the listing or a batch, a store failure, a dest never created or no longer
+  stored, also before any listing): the op goes, then the counts of the folder and the dest are
+  read from Graph for each still stored (`read_moved_folder_counts` over `read_folder_counts`, now
   `refresh_folder`'s count half: a `local:` folder and one a queued `EmptyFolder` names are not
   read, a queued `MarkFolderRead` keeps its unread count), the dest's skipped when the first
   read had to stop, a folder the store no longer has not read, then the final event. A count

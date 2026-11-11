@@ -5984,12 +5984,17 @@ impl Engine {
         BulkStep::Finished
     }
 
-    /// A `MoveFolderMessages` refused for good (#2126), by Graph or because
-    /// its dest was never created: the op goes (no attempts, no
-    /// quarantine), both folders' counts are read from Graph (what moved
-    /// before stays moved), and the failure is reported
-    /// (`FolderWriteFailed`, `write: MoveMail`, its `Error`, then
-    /// `FolderMessagesMoved` with `Err(Refused)` and the run's counts).
+    /// A `MoveFolderMessages` refused for good (#2126): by Graph (the
+    /// listing or a `$batch` call refused as a whole), by a store failure
+    /// (`move_call_failed` with `Parse`), because its dest was never
+    /// created (still `local:`), or because its dest is no longer a stored
+    /// folder. The op goes (no attempts, no quarantine), the counts of the
+    /// folder and the dest are read from Graph for each that is still
+    /// stored and not `local:` (`read_moved_folder_counts`; also when it
+    /// is refused before any listing; what moved before stays moved), and
+    /// the failure is reported (`FolderWriteFailed`, `write: MoveMail`,
+    /// its `Error`, then `FolderMessagesMoved` with `Err(Refused)` and the
+    /// counts of the run, if it had listed).
     fn refuse_move_folder_messages(
         &mut self,
         seq: i64,
