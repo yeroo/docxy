@@ -1947,45 +1947,7 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
             return;
         }
     };
-    // A quarantine reconverge an earlier run left unfinished (#1871).
-    let reconverge_pending = store.reconverge_pending().unwrap_or(false);
-    let mut engine = Engine {
-        store,
-        token: None,
-        config,
-        evt_tx,
-        state: SyncState::Idle,
-        next_retry: None,
-        backoff: BACKOFF_MIN,
-        backfill_done: false,
-        reconverge_pending,
-        relist_after_drain: false,
-        copied_after_drain: Vec::new(),
-        calendar_reset_owed: false,
-        masters_not_found: HashSet::new(),
-        masters_skipped: HashSet::new(),
-        parked: Vec::new(),
-        expired: Vec::new(),
-        backfill_first: Vec::new(),
-        next_tick: Instant::now(),
-        fast_folders: Vec::new(),
-        next_full: Instant::now(),
-        next_fast: Instant::now(),
-        hold_full: false,
-        op_retry: None,
-        op_backoff: BACKOFF_MIN,
-        announced_scopes: None,
-        warned_unencrypted: false,
-        cmd_rx,
-        deferred: VecDeque::new(),
-        bulk: None,
-        shutting_down: false,
-        body_skip: HashSet::new(),
-        body_parked: false,
-        contact_rereads_paused: false,
-        size_fill: None,
-        size_parked: Vec::new(),
-    };
+    let mut engine = Engine::new(config, store, cmd_rx, evt_tx);
     engine.startup();
     engine.main_loop();
 }
@@ -2171,6 +2133,55 @@ struct SizeFill {
 pub const FOLDER_SIZE_BATCH: usize = 4;
 
 impl Engine {
+    /// A new engine over an open `store`, signed out until `startup` reads
+    /// the token cache. Split from `run` (#2113) so a test can build one.
+    fn new(
+        config: EngineConfig,
+        store: Store,
+        cmd_rx: Receiver<SyncCommand>,
+        evt_tx: Sender<SyncEvent>,
+    ) -> Engine {
+        // A quarantine reconverge an earlier run left unfinished (#1871).
+        let reconverge_pending = store.reconverge_pending().unwrap_or(false);
+        Engine {
+            store,
+            token: None,
+            config,
+            evt_tx,
+            state: SyncState::Idle,
+            next_retry: None,
+            backoff: BACKOFF_MIN,
+            backfill_done: false,
+            reconverge_pending,
+            relist_after_drain: false,
+            copied_after_drain: Vec::new(),
+            calendar_reset_owed: false,
+            masters_not_found: HashSet::new(),
+            masters_skipped: HashSet::new(),
+            parked: Vec::new(),
+            expired: Vec::new(),
+            backfill_first: Vec::new(),
+            next_tick: Instant::now(),
+            fast_folders: Vec::new(),
+            next_full: Instant::now(),
+            next_fast: Instant::now(),
+            hold_full: false,
+            op_retry: None,
+            op_backoff: BACKOFF_MIN,
+            announced_scopes: None,
+            warned_unencrypted: false,
+            cmd_rx,
+            deferred: VecDeque::new(),
+            bulk: None,
+            shutting_down: false,
+            body_skip: HashSet::new(),
+            body_parked: false,
+            contact_rereads_paused: false,
+            size_fill: None,
+            size_parked: Vec::new(),
+        }
+    }
+
     // --- Startup & main loop --------------------------------------------
 
     /// Loads the cached token (refreshing if near expiry) and, if signed in,
@@ -8306,8 +8317,14 @@ impl Engine {
 
     /// Drop to signed-out: clear the token and announce `SignInRequired`.
     /// The announced grant is forgotten, so the next session announces it.
+    /// A throttle or offline back-off is over too (#2113, #1918): signed
+    /// out, no pass runs, so a passed `next_retry` would only make
+    /// `recv_timeout` zero (and a sign-in clears it anyway); the wait is
+    /// the tick again, and the next session's back-off starts at
+    /// `BACKOFF_MIN`.
     fn enter_signin(&mut self) {
         self.token = None;
+        self.clear_backoff();
         self.drop_size_fill();
         self.announced_scopes = None;
         self.masters_not_found.clear();
@@ -18611,6 +18628,38 @@ mod tests {
             "{views:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2113 (#1918 plan-spin): dropping to sign-in ends a back-off, so a
+    /// signed-out engine whose throttle or offline deadline has passed
+    /// waits for its tick instead of waking at once.
+    #[test]
+    fn plan_spin_signin_clears_a_passed_retry() {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let config = EngineConfig {
+            store_path: PathBuf::from("unused.db"),
+            token_path: PathBuf::from("unused-token.json"),
+            cfg: AuthConfig::default(),
+            backfill_days: 30,
+            graph_base: "http://127.0.0.1:9".into(),
+            auth_base: "http://127.0.0.1:9".into(),
+            tick: HOUR,
+            options: EngineOptions::without_prefetch(),
+        };
+        let mut engine = Engine::new(config, Store::open_in_memory().unwrap(), cmd_rx, evt_tx);
+        engine.next_tick = Instant::now() + HOUR;
+        engine.next_retry = Some(Instant::now() - Duration::from_secs(1));
+        engine.backoff = BACKOFF_MAX;
+        assert_eq!(engine.recv_timeout(), Duration::ZERO, "the spin's cause");
+        engine.enter_signin();
+        assert!(engine.token.is_none());
+        assert_eq!(engine.next_retry, None);
+        assert_eq!(engine.backoff, BACKOFF_MIN);
+        assert!(engine.recv_timeout() > Duration::ZERO);
+        assert!(!engine.due(), "no wake is due");
+        assert!(matches!(evt_rx.try_recv(), Ok(SyncEvent::SignInRequired)));
+        drop(cmd_tx);
     }
 
     /// #2113 (#2038 plan-del404): a DELETE answered 404 (a retry after a
