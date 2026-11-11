@@ -3952,3 +3952,70 @@ server". Before #2133 it had no command to fetch them sooner: the walks ran fold
   `backfill_folder_on_an_unknown_or_complete_folder` and
   `backfill_folder_inside_a_back_off_is_remembered` (the 429 on a backfill page, no request
   inside it, F2's page first after it).
+
+## Sync engine and outbox robustness (#2113)
+
+A batch of six small fixes from #1918, #1975, #2038, #1892 and #1959.
+
+- **A sign-out ends the back-off** (#1918 plan-spin). `enter_signin` calls `clear_backoff`:
+  `next_retry` goes, and `backoff` is back at `BACKOFF_MIN`. Signed out, no pass runs, so a
+  passed throttle or offline deadline only made `recv_timeout` zero. Since #1871 `on_timer`
+  dropped it after that one wake, so there was no lasting spin, but the grown back-off carried
+  into the next session. `op_retry` is left alone: `recv_timeout` and `due` ignore it while
+  signed out. `Engine::new` is split from `run` (a pure move) so a test can build an engine.
+  Test: `plan_spin_signin_clears_a_passed_retry`.
+- **An expired delta link re-runs phase 1** (#1975 plan-410). In `sync_folder_delta`, a round on
+  the stored link that fails with `is_expired_sync_state` (a 410, or a 400
+  `SyncStateNotFound` / `SyncStateInvalid` / `resyncRequired`) is routine and emits no
+  `Error`. `Store::expire_delta_link` clears `delta_link`, `history_scope` and
+  `reminder_expand_refused`, and keeps a backfill walk under way (its link, count, scope and
+  `backfill_expand_refused`, since its own page links did not expire). That is unlike
+  `restart_folder_delta` (#1913), which starts the walk over. Then `sync_folder_delta_once(id,
+  false)` runs phase 1 again in the same call: the head (`set_head_link`), or a small folder's
+  full delta. Local edits are protected as in any fresh delta (`protected_ids`). The flag
+  bounds it to once: a second expiry goes through `react` as before. A store error emits
+  `Error` and keeps the pass going. `backfill_step`'s last round on the folder's own link keeps
+  its #1871 behaviour (an expired link there is replaced by the walk's).
+  Two consequences, intended or known:
+  - A folder whose backfill had completed is back at `SCOPE_HEAD`, so its whole full delta is
+    walked again in idle time. Only that walk brings the gap's changes to old mail.
+  - Deletions on Graph during the gap are not seen. A fresh delta has no `@removed` for items
+    already gone, so those rows stay, as after a quarantine reconverge. This is follow-up
+    `plan-prune`.
+  Tests (`engine.rs` `tests::backfill`): `plan_410_expired_delta_link_reruns_phase_1`,
+  `plan_410_sync_state_not_found_reruns_phase_1`, `plan_410_rerun_leaves_the_folder_at_its_head`,
+  `plan_410_rerun_keeps_the_backfill_walk`, `plan_410_rerun_keeps_a_pending_local_edit`; store:
+  `plan_410_expire_delta_link_keeps_the_backfill_walk`. An expired *calendar* delta link was
+  already handled (#2013, #2014).
+- **A `DeleteEvent` answered 404 is done** (#2038 plan-del404). `apply_other` maps the 404 to
+  `Ok`, as `RemoveFromCalendar` (#2132) does: the event is gone, which is what the user asked
+  for (a retry after a lost 204, or a delete elsewhere), and the caller deleted the row before
+  the command. There is no `Error`, attempt bump, quarantine or calendar reset. `CancelEvent`'s
+  404 keeps its own branch in the drain (#1985): it resets the calendars because only Graph
+  knows whether the cancellation went out. Tests: `plan_del404_delete_event_404_is_done`
+  (`outbox.rs`), `plan_del404_delete_event_404_is_dropped_as_done` (`engine.rs`, through the
+  drain).
+- **Message ops on a still-`local:` id send nothing** (#1892 plan-1). `MarkRead`, `SetFlag`,
+  `SetCategories` and `Move` resolve their id with `on_graph` (`current_id`, then `None` for
+  `local:`) and are done without a request, as `Delete` was (#1884). A reconciled `local:` id
+  is still sent under its Graph id. Such an id is a draft whose `SaveDraft` was refused: a
+  pending one always runs first, since a 5xx stops the drain. The local write stays. Once the
+  draft is created on Graph (in Drafts), its first Drafts delta round overwrites a flag or
+  categories set meanwhile, and files a draft moved meanwhile back in Drafts. Before, the op
+  was refused and quarantined. Tests (`outbox.rs`): `plan_1_local_id_ops_send_nothing`,
+  `plan_1_a_reconciled_local_id_is_sent_under_its_graph_id`.
+- **The store's busy timeout is explicit** (#1892 plan-5). `Store::init` sets
+  `store::BUSY_TIMEOUT` (5 s) first, before the WAL pragma that can itself meet the other
+  connection's lock. It was already rusqlite 0.40's default, set in `InnerConnection::open`, so
+  `plan_5_store_sets_a_busy_timeout` passed before the change and pins it now. The two-connection
+  wait is `writes_wait_out_another_connections_write` (#2023 r3).
+- **A token endpoint's non-OAuth error is one line** (#1959 plan-auth-http-display).
+  `classify_error` builds `AuthError::Status { status, body }` for a non-2xx answer whose body
+  is not OAuth JSON. Its `Display` is `HTTP error: ` plus `client::http_error_text` (#1954,
+  now `pub(crate)`): one line of at most `HTTP_ERROR_TEXT_MAX` characters, Graph's
+  `error.message` or the reason phrase or `HTTP {status}`, never the body. `Debug` keeps the
+  body. `AuthError::Http(String)` stays for transport and body-read failures. It is a new
+  variant of a public enum, but nothing in the repository matches `AuthError` variants outside
+  `auth.rs` (hosts use `Display`). Tests (`auth.rs`):
+  `plan_auth_http_display_shows_one_line_for_an_html_body`, `plan_auth_http_display_empty_body`,
+  `oauth_json_error_is_still_denied`.
