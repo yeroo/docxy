@@ -815,6 +815,10 @@ impl App {
             // Nor a Mark All as Read or an Empty Folder, so no progress of
             // either (#2128).
             | SyncEvent::FolderWriteProgress { .. }
+            // Nor a Clear Offline Items (#2124); the clear's own
+            // `MessagesUpdated` reloads the list.
+            | SyncEvent::OfflineItemsCleared { .. }
+            | SyncEvent::ClearOfflineItemsRefused { .. }
             // lookxy has no meeting banner yet, so it never asks for a
             // message's meeting type or a Remove from Calendar (#2024).
             | SyncEvent::MeetingMessageFetched { .. }
