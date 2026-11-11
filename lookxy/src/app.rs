@@ -812,6 +812,9 @@ impl App {
             // (#2126).
             | SyncEvent::FolderMessagesMoving { .. }
             | SyncEvent::FolderMessagesMoved { .. }
+            // Nor a Mark All as Read or an Empty Folder, so no progress of
+            // either (#2128).
+            | SyncEvent::FolderWriteProgress { .. }
             // lookxy has no meeting banner yet, so it never asks for a
             // message's meeting type or a Remove from Calendar (#2024).
             | SyncEvent::MeetingMessageFetched { .. }
