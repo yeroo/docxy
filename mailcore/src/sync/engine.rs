@@ -661,7 +661,9 @@ pub enum SyncCommand {
     /// one's `Retry-After`. Until it is done a pass keeps the folder's
     /// stored count and stores that mail read. A refusal is
     /// [`SyncEvent::FolderWriteFailed`] (`write: MarkRead`); an unknown
-    /// folder or the drafts sentinel is refused at once.
+    /// folder or the drafts sentinel is refused at once. The run's progress
+    /// is [`SyncEvent::FolderWriteProgress`] (#2128), its last one
+    /// `finished`.
     MarkFolderRead { folder: String },
     /// Delete a mail folder with its child folders and their mail (#2107).
     /// The store at once ([`SyncEvent::FoldersUpdated`]), then, once no
@@ -698,7 +700,9 @@ pub enum SyncCommand {
     /// What could not be deleted, and what was kept as shown elsewhere, is
     /// reported once at the end as [`SyncEvent::FolderWriteFailed`]
     /// (`write: Empty`), as is a refusal; an unknown folder or the drafts
-    /// sentinel is refused at once. With `subfolders`, each child folder
+    /// sentinel is refused at once. The run's progress is
+    /// [`SyncEvent::FolderWriteProgress`] (#2128), its last one `finished`.
+    /// With `subfolders`, each child folder
     /// stored under it is deleted as [`SyncCommand::DeleteFolder`] deletes
     /// it, each refused or not on its own: from the store at once, with
     /// the empty, and on Graph after the empty's run.
@@ -1192,6 +1196,36 @@ pub enum SyncEvent {
         total: usize,
         result: Result<(), FolderMoveError>,
     },
+    /// A queued [`SyncCommand::MarkFolderRead`] (`write: MarkRead`, #1913)
+    /// or [`SyncCommand::EmptyFolder`] (`write: Empty`, #2110) moved on
+    /// (#2128): once Graph's listing is in (`done` 0), after each `$batch`
+    /// Graph answered at least one id of, and once more with `finished`
+    /// when the run ends. `total` is what the run took on: for a mark-read
+    /// the unread messages listed; for an empty the messages listed, less
+    /// what it leaves alone (the unsent mail, mail moved in since). After a
+    /// restart the run lists again, so the counts start over from what is
+    /// left. `done` counts the messages Graph marked or deleted, or no
+    /// longer had (404); `failed` those it refused and, for an empty, those
+    /// kept as the store shows them elsewhere (known at the listing, so the
+    /// first event may already have some). A throttled or 5xx message is
+    /// counted only once answered. `finished` ends every queued run: a
+    /// clean one, a partial one (after its
+    /// [`SyncEvent::FolderWriteFailed`] and `Error`), one Graph or the
+    /// store refused (after its `FolderWriteFailed` and `Error`, with the
+    /// counts reached so far, all 0 when the listing was refused), and one
+    /// of a folder still `local:` (all 0). A run that reached its end has
+    /// `done + failed == total`. Not sent for a command the store refused
+    /// (no op queued: its `FolderWriteFailed` alone), nor when a delete of
+    /// the folder drops the queued op (`FoldersUpdated`: the folder is
+    /// gone). `folder` is the id as stored.
+    FolderWriteProgress {
+        folder: String,
+        write: FolderWrite,
+        done: usize,
+        failed: usize,
+        total: usize,
+        finished: bool,
+    },
 }
 
 /// The two channel endpoints the UI keeps: commands down, events up. Dropping
@@ -1333,8 +1367,31 @@ struct BulkRun {
     rows_deleted: bool,
     /// A move run's folder and dest (#2126), as resolved when it listed.
     moving: Option<FolderMove>,
-    /// How many ids Graph moved, or no longer had (404), so far (#2126).
-    moved: usize,
+    /// How many ids Graph marked, deleted or moved, or no longer had
+    /// (404), so far (#2126, #2128).
+    done: usize,
+}
+
+impl BulkRun {
+    /// A mark-read or empty run's [`SyncEvent::FolderWriteProgress`]
+    /// (#2128) for `folder`: the empty's kept mail counts as failed, as it
+    /// will not be deleted.
+    fn write_progress(&self, folder: &str, finished: bool) -> SyncEvent {
+        let write = match self.kind {
+            BulkKind::MarkRead => FolderWrite::MarkRead,
+            BulkKind::Delete => FolderWrite::Empty,
+            // Never sent: a move run reports `FolderMessagesMoving`.
+            BulkKind::Move => FolderWrite::MoveMail,
+        };
+        SyncEvent::FolderWriteProgress {
+            folder: folder.to_string(),
+            write,
+            done: self.done,
+            failed: self.failed.len() + self.kept,
+            total: self.total,
+            finished,
+        }
+    }
 }
 
 /// The folders of a `MoveFolderMessages` run (#2126).
@@ -2080,10 +2137,17 @@ struct Engine {
     /// waits here only until the next `checkpoint`, which serves it.
     /// At shutdown only the ones `persists_at_shutdown` keeps run.
     deferred: VecDeque<SyncCommand>,
-    /// The `MarkFolderRead` op being run (#1913): the ids still to mark,
+    /// The `MarkFolderRead` op being run (#1913; an `EmptyFolder` or
+    /// `MoveFolderMessages` too, #2110, #2126): the ids still to mark,
     /// kept across drains (a throttle, a 5xx, a checkpoint stop), so a run
     /// goes on where it stopped instead of paging again.
     bulk: Option<BulkRun>,
+    /// Other ops' runs displaced from `bulk` (#2128 r1-m1): a
+    /// `MarkFolderRead` run kept after a throttle, when an older empty or
+    /// move becomes runnable and runs first. Each resumes where it stopped
+    /// (`resume_bulk`) instead of listing again; one whose op is gone is
+    /// dropped with the drain's check.
+    parked_bulk: Vec<BulkRun>,
     /// A `Shutdown` came, or the UI dropped its handle, while work was
     /// running: the work stops at its next checkpoint (a drain before its
     /// next op), and the main loop returns once the commands that came
@@ -2173,6 +2237,7 @@ impl Engine {
             cmd_rx,
             deferred: VecDeque::new(),
             bulk: None,
+            parked_bulk: Vec::new(),
             shutting_down: false,
             body_skip: HashSet::new(),
             body_parked: false,
@@ -3706,9 +3771,14 @@ impl Engine {
                 continue;
             }
             queued = true;
-            match &self.bulk {
+            match self
+                .bulk
+                .iter()
+                .chain(&self.parked_bulk)
+                .find(|r| r.seq == row.seq)
+            {
                 // Paged: only what the run will still PATCH (r1 m6).
-                Some(run) if run.seq == row.seq => {
+                Some(run) => {
                     guard.todo.extend(run.todo.iter().cloned());
                 }
                 _ => {
@@ -4749,6 +4819,8 @@ impl Engine {
         {
             self.bulk = None;
         }
+        self.parked_bulk
+            .retain(|b| ops.iter().any(|r| r.seq == b.seq));
         if ops.is_empty() {
             self.clear_op_backoff();
             if self.settle_contact_rereads() {
@@ -5455,10 +5527,11 @@ impl Engine {
             .store
             .current_folder_id(folder)
             .unwrap_or_else(|_| folder.to_string());
-        if self.bulk.as_ref().is_none_or(|b| b.seq != seq) {
-            self.bulk = None;
+        self.resume_bulk(seq);
+        if self.bulk.is_none() {
             if folder.starts_with("local:") {
                 self.store.drop_op(seq);
+                self.end_write_progress(seq, &folder, FolderWrite::MarkRead);
                 return BulkStep::Finished;
             }
             match self.with_auth(|c| c.unread_message_ids(&folder, before)) {
@@ -5472,13 +5545,14 @@ impl Engine {
                         kept: 0,
                         rows_deleted: false,
                         moving: None,
-                        moved: 0,
+                        done: 0,
                     });
+                    self.emit_write_progress(&folder);
                 }
                 Err(e) => return self.mark_read_call_failed(seq, &folder, e),
             }
         }
-        match self.bulk_batches(seq) {
+        match self.bulk_batches(seq, &folder) {
             BatchLoop::Done => self.finish_mark_folder_read(seq, &folder),
             BatchLoop::Step(step) => step,
             BatchLoop::CallFailed(e) => self.mark_read_call_failed(seq, &folder, e),
@@ -5496,10 +5570,12 @@ impl Engine {
     /// status is recorded in `failed`. A move run reports each answered
     /// batch (`MessageMoved` for the stored rows that moved,
     /// `MessagesUpdated` for the folders they left and reached, then
-    /// `FolderMessagesMoving`), before a throttle or 5xx stops it. Between
+    /// `FolderMessagesMoving`), before a throttle or 5xx stops it; a
+    /// mark-read or empty run reports `FolderWriteProgress` for `folder`
+    /// there (#2128). Between
     /// batches `checkpoint` serves the commands that cannot wait. A
     /// whole-call failure is handed back, the run kept.
-    fn bulk_batches(&mut self, seq: i64) -> BatchLoop {
+    fn bulk_batches(&mut self, seq: i64, folder: &str) -> BatchLoop {
         loop {
             let Some(run) = self.bulk.as_ref() else {
                 return BatchLoop::Step(BulkStep::Finished);
@@ -5567,29 +5643,31 @@ impl Engine {
             let mut server_error = None;
             for (id, answer) in ids.into_iter().zip(answers) {
                 match answer.status {
-                    200..=299 | 404 => match run.kind {
-                        // Deleted on Graph: a row of it that came back
-                        // meanwhile (a search hit, a fetch) goes too.
-                        BulkKind::Delete => {
-                            if matches!(self.store.delete_message_resolved(&id), Ok(Some(_))) {
-                                run.rows_deleted = true;
+                    200..=299 | 404 => {
+                        run.done += 1;
+                        match run.kind {
+                            // Deleted on Graph: a row of it that came back
+                            // meanwhile (a search hit, a fetch) goes too.
+                            BulkKind::Delete => {
+                                if matches!(self.store.delete_message_resolved(&id), Ok(Some(_))) {
+                                    run.rows_deleted = true;
+                                }
                             }
+                            BulkKind::Move => {
+                                let new_id = (answer.status != 404)
+                                    .then(|| moved_message_id(&answer.body))
+                                    .flatten();
+                                followed.follow(
+                                    &self.store,
+                                    id,
+                                    new_id,
+                                    dest.as_deref().unwrap_or_default(),
+                                    &protected,
+                                );
+                            }
+                            BulkKind::MarkRead => {}
                         }
-                        BulkKind::Move => {
-                            run.moved += 1;
-                            let new_id = (answer.status != 404)
-                                .then(|| moved_message_id(&answer.body))
-                                .flatten();
-                            followed.follow(
-                                &self.store,
-                                id,
-                                new_id,
-                                dest.as_deref().unwrap_or_default(),
-                                &protected,
-                            );
-                        }
-                        BulkKind::MarkRead => {}
-                    },
+                    }
                     429 | 503 => {
                         let secs = answer.retry_after_secs.unwrap_or(30);
                         throttle = Some(throttle.map_or(secs, |t| t.max(secs)));
@@ -5620,14 +5698,15 @@ impl Engine {
                 run.todo.push_front(id);
             }
             let progress = match (&run.moving, answered > 0) {
+                (_, false) => None,
                 (Some(m), true) => Some(SyncEvent::FolderMessagesMoving {
                     folder: m.folder.clone(),
                     dest: m.dest.clone(),
-                    moved: run.moved,
+                    moved: run.done,
                     failed: run.failed.len(),
                     total: run.total,
                 }),
-                _ => None,
+                (None, true) => Some(run.write_progress(folder, false)),
             };
             followed.report(self);
             if let Some(progress) = progress {
@@ -5716,20 +5795,25 @@ impl Engine {
     }
 
     /// Every id of a `MarkFolderRead` was answered (#1913): the op is
-    /// dropped; the ids Graph refused, if any, are reported once.
+    /// dropped; the ids Graph refused, if any, are reported once. The last
+    /// `FolderWriteProgress` (#2128) follows, once.
     fn finish_mark_folder_read(&mut self, seq: i64, folder: &str) -> BulkStep {
-        let Some(run) = self.bulk.take() else {
+        let Some(run) = self.bulk.as_ref() else {
             return BulkStep::Finished;
         };
-        self.store.drop_op(seq);
-        self.clear_op_backoff();
-        if let Some((_, status, error)) = run.failed.first() {
+        let failure = run.failed.first().map(|(_, status, error)| {
             let error = format!(
                 "{} of {} messages could not be marked read: {error}",
                 run.failed.len(),
                 run.total
             );
-            self.refuse_mark_read(seq, folder, Some(*status), error);
+            (Some(*status), error)
+        });
+        self.store.drop_op(seq);
+        self.clear_op_backoff();
+        match failure {
+            Some((status, error)) => self.refuse_mark_read(seq, folder, status, error),
+            None => self.end_write_progress(seq, folder, FolderWrite::MarkRead),
         }
         BulkStep::Finished
     }
@@ -5739,12 +5823,66 @@ impl Engine {
     /// failure reported (`FolderWriteFailed` with `write: MarkRead`, then
     /// its `Error`), and the folder's delta restarted, so the next passes
     /// read its read states again where the store marked mail Graph did
-    /// not.
+    /// not. The run's last `FolderWriteProgress` (#2128) follows, with the
+    /// counts it reached.
     fn refuse_mark_read(&mut self, seq: i64, folder: &str, status: Option<u16>, error: String) {
         self.store.drop_op(seq);
-        self.bulk = None;
         let _ = self.store.restart_folder_delta(folder);
         self.report_folder_failure(folder, FolderWrite::MarkRead, status, error);
+        self.end_write_progress(seq, folder, FolderWrite::MarkRead);
+    }
+
+    /// The kept mark-read or empty run's `FolderWriteProgress` (#2128), as
+    /// it stands: once its listing is in, and after each answered batch
+    /// (`bulk_batches`).
+    fn emit_write_progress(&self, folder: &str) {
+        if let Some(run) = &self.bulk {
+            self.emit(run.write_progress(folder, false));
+        }
+    }
+
+    /// Makes `seq`'s run the kept one (#2128 r1-m1): a run of another op
+    /// in `bulk` is parked, not dropped (a `MarkFolderRead` run kept after
+    /// a throttle, when an older empty or move becomes runnable first), and
+    /// a parked run of `seq` resumes, so neither lists again.
+    fn resume_bulk(&mut self, seq: i64) {
+        if self.bulk.as_ref().is_some_and(|b| b.seq == seq) {
+            return;
+        }
+        if let Some(other) = self.bulk.take() {
+            self.parked_bulk.push(other);
+        }
+        if let Some(i) = self.parked_bulk.iter().position(|b| b.seq == seq) {
+            self.bulk = Some(self.parked_bulk.swap_remove(i));
+        }
+    }
+
+    /// Takes `seq`'s run, kept or parked.
+    fn take_bulk(&mut self, seq: i64) -> Option<BulkRun> {
+        if self.bulk.as_ref().is_some_and(|b| b.seq == seq) {
+            return self.bulk.take();
+        }
+        let i = self.parked_bulk.iter().position(|b| b.seq == seq)?;
+        Some(self.parked_bulk.swap_remove(i))
+    }
+
+    /// Ends a queued mark-read or empty run (#2128): the run goes, and its
+    /// last `FolderWriteProgress` (`finished`) carries the counts it
+    /// reached, all 0 when it never listed (refused before, or a `local:`
+    /// folder).
+    fn end_write_progress(&mut self, seq: i64, folder: &str, write: FolderWrite) {
+        let event = match self.take_bulk(seq) {
+            Some(run) => run.write_progress(folder, true),
+            None => SyncEvent::FolderWriteProgress {
+                folder: folder.to_string(),
+                write,
+                done: 0,
+                failed: 0,
+                total: 0,
+                finished: true,
+            },
+        };
+        self.emit(event);
     }
 
     /// `SyncCommand::EmptyFolder` (#2110): the store write
@@ -5814,10 +5952,11 @@ impl Engine {
             .store
             .current_folder_id(folder)
             .unwrap_or_else(|_| folder.to_string());
-        if self.bulk.as_ref().is_none_or(|b| b.seq != seq) {
-            self.bulk = None;
+        self.resume_bulk(seq);
+        if self.bulk.is_none() {
             if folder.starts_with("local:") {
                 let _ = self.store.finish_folder_empty(seq, batch, &folder);
+                self.end_write_progress(seq, &folder, FolderWrite::Empty);
                 return BulkStep::Finished;
             }
             let items = match self.with_auth(|c| c.folder_messages_before(&folder, before)) {
@@ -5863,10 +6002,11 @@ impl Engine {
                 kept,
                 rows_deleted: false,
                 moving: None,
-                moved: 0,
+                done: 0,
             });
+            self.emit_write_progress(&folder);
         }
-        match self.bulk_batches(seq) {
+        match self.bulk_batches(seq, &folder) {
             BatchLoop::Done => self.finish_empty_folder(seq, &folder, batch),
             BatchLoop::Step(step) => step,
             BatchLoop::CallFailed(e) => self.empty_call_failed(seq, &folder, batch, e),
@@ -5898,7 +6038,8 @@ impl Engine {
     /// (`Store::finish_folder_empty`, one transaction), so its next delta
     /// starts afresh. What Graph refused and what the check kept are
     /// reported once (`FolderWriteFailed`, `write: Empty`; the status is
-    /// the first refusal's, `None` when only kept mail is reported).
+    /// the first refusal's, `None` when only kept mail is reported). The
+    /// run's last `FolderWriteProgress` (#2128) comes after that.
     fn finish_empty_folder(&mut self, seq: i64, folder: &str, batch: &str) -> BulkStep {
         let Some(run) = self.bulk.take() else {
             return BulkStep::Finished;
@@ -5929,6 +6070,7 @@ impl Engine {
         if !parts.is_empty() {
             self.report_folder_failure(folder, FolderWrite::Empty, status, parts.join("; "));
         }
+        self.emit(run.write_progress(folder, true));
         BulkStep::Finished
     }
 
@@ -5936,7 +6078,8 @@ impl Engine {
     /// go and the folder's links are cleared (`Store::finish_folder_empty`),
     /// so the next passes bring back the mail Graph still has, and the
     /// failure is reported (`FolderWriteFailed`, `write: Empty`, then its
-    /// `Error`).
+    /// `Error`), then the run's last `FolderWriteProgress` (#2128), with
+    /// the counts it reached.
     fn refuse_empty_folder(
         &mut self,
         seq: i64,
@@ -5946,8 +6089,8 @@ impl Engine {
         error: String,
     ) {
         let _ = self.store.finish_folder_empty(seq, batch, folder);
-        self.bulk = None;
         self.report_folder_failure(folder, FolderWrite::Empty, status, error);
+        self.end_write_progress(seq, folder, FolderWrite::Empty);
     }
 
     /// `SyncCommand::MoveFolderMessages` (#2126): the store queues the op
@@ -6018,6 +6161,7 @@ impl Engine {
             .current_folder_id(dest)
             .unwrap_or_else(|_| dest.to_string());
         let target = FolderMove { folder, dest };
+        self.resume_bulk(seq);
         // A dest the store no longer has (a listing pruned it: deleted on
         // Graph) refuses the run before its listing and before a kept run
         // goes on (r1-m1): Graph would answer each move 404, which reads as
@@ -6041,8 +6185,7 @@ impl Engine {
             self.refuse_move_folder_messages(seq, &target, None, error);
             return BulkStep::Finished;
         }
-        if self.bulk.as_ref().is_none_or(|b| b.seq != seq) {
-            self.bulk = None;
+        if self.bulk.is_none() {
             if target.folder.starts_with("local:") {
                 self.store.drop_op(seq);
                 self.clear_op_backoff();
@@ -6085,7 +6228,7 @@ impl Engine {
                 kept: 0,
                 rows_deleted: false,
                 moving: Some(target.clone()),
-                moved: 0,
+                done: 0,
             });
             self.emit(SyncEvent::FolderMessagesMoving {
                 folder: target.folder.clone(),
@@ -6101,7 +6244,7 @@ impl Engine {
             .as_ref()
             .and_then(|b| b.moving.clone())
             .unwrap_or(target);
-        match self.bulk_batches(seq) {
+        match self.bulk_batches(seq, &target.folder) {
             BatchLoop::Done => self.finish_move_folder_messages(seq, &target),
             BatchLoop::Step(step) => step,
             BatchLoop::CallFailed(e) => self.move_call_failed(seq, &target, e),
@@ -6158,7 +6301,7 @@ impl Engine {
         self.emit(SyncEvent::FolderMessagesMoved {
             folder: target.folder.clone(),
             dest: target.dest.clone(),
-            moved: run.moved,
+            moved: run.done,
             failed: run.failed.len(),
             total: run.total,
             result,
@@ -6185,13 +6328,10 @@ impl Engine {
         error: String,
     ) {
         self.store.drop_op(seq);
-        let run = match self.bulk.as_ref() {
-            Some(b) if b.seq == seq => self.bulk.take(),
-            _ => None,
-        };
+        let run = self.take_bulk(seq);
         self.read_moved_folder_counts(target);
         self.report_folder_failure(&target.folder, FolderWrite::MoveMail, status, error.clone());
-        let (moved, failed, total) = run.map_or((0, 0, 0), |r| (r.moved, r.failed.len(), r.total));
+        let (moved, failed, total) = run.map_or((0, 0, 0), |r| (r.done, r.failed.len(), r.total));
         self.emit(SyncEvent::FolderMessagesMoved {
             folder: target.folder.clone(),
             dest: target.dest.clone(),
@@ -6220,10 +6360,7 @@ impl Engine {
     /// the counts of the run it stopped, if it was running.
     fn report_dropped_moves(&mut self, dropped: &[DroppedFolderMove]) {
         for d in dropped {
-            let run = match self.bulk.as_ref() {
-                Some(b) if b.seq == d.seq => self.bulk.take(),
-                _ => None,
-            };
+            let run = self.take_bulk(d.seq);
             let error = if d.dest_gone {
                 "its destination folder was deleted"
             } else {
@@ -6237,7 +6374,7 @@ impl Engine {
             }
             self.report_folder_failure(&d.folder, FolderWrite::MoveMail, None, error.clone());
             let (moved, failed, total) =
-                run.map_or((0, 0, 0), |r| (r.moved, r.failed.len(), r.total));
+                run.map_or((0, 0, 0), |r| (r.done, r.failed.len(), r.total));
             self.emit(SyncEvent::FolderMessagesMoved {
                 folder: d.folder.clone(),
                 dest: d.dest.clone(),
@@ -34228,6 +34365,664 @@ mod tests {
                 assert!(store.pending_ops().unwrap().is_empty());
                 assert_eq!(srv.requests().len(), before, "nothing sent");
                 stop(handle, dir);
+            }
+        }
+        /// #2128: `SyncEvent::FolderWriteProgress` of a `MarkFolderRead`
+        /// and an `EmptyFolder` run.
+        mod write_progress {
+            use super::*;
+
+            /// The first page of Inbox's unread ids (a mark-read's listing).
+            const UNREAD: &str = "/me/mailFolders/INBOX/messages?$filter=isRead%20eq%20false";
+            /// The first page of Inbox's messages up to the cutoff (an
+            /// empty's listing).
+            const ALL: &str = "/me/mailFolders/INBOX/messages?$filter=receivedDateTime%20le%20";
+            const PAGE2: &str = "/me/mailFolders/INBOX/messages?$skiptoken=P2";
+            const GONE: &str = r#"{"error":{"code":"ErrorItemNotFound","message":"Gone."}}"#;
+
+            #[derive(Clone, Copy)]
+            enum Kind {
+                MarkRead,
+                Empty,
+            }
+
+            impl Kind {
+                fn list(self) -> &'static str {
+                    match self {
+                        Kind::MarkRead => UNREAD,
+                        Kind::Empty => ALL,
+                    }
+                }
+
+                fn write(self) -> FolderWrite {
+                    match self {
+                        Kind::MarkRead => FolderWrite::MarkRead,
+                        Kind::Empty => FolderWrite::Empty,
+                    }
+                }
+
+                fn command(self, folder: &str) -> SyncCommand {
+                    match self {
+                        Kind::MarkRead => SyncCommand::MarkFolderRead {
+                            folder: folder.into(),
+                        },
+                        Kind::Empty => SyncCommand::EmptyFolder {
+                            folder: folder.into(),
+                            subfolders: false,
+                        },
+                    }
+                }
+            }
+
+            fn numbered(n: usize) -> Vec<String> {
+                (1..=n).map(|i| format!("S{i:02}")).collect()
+            }
+
+            fn strings(ids: &[&str]) -> Vec<String> {
+                ids.iter().map(|s| s.to_string()).collect()
+            }
+
+            /// A listing page: each id with its internet message id.
+            fn page(ids: &[String], next: Option<&str>) -> String {
+                let items: Vec<String> = ids
+                    .iter()
+                    .map(|id| format!(r#"{{"id":"{id}","internetMessageId":"<{id}@x>"}}"#))
+                    .collect();
+                let next = next.map_or(String::new(), |n| format!(r#","@odata.nextLink":"{n}""#));
+                format!(r#"{{"value":[{}]{next}}}"#, items.join(","))
+            }
+
+            /// A `$batch` answer: sub-request `i + 1` gets `statuses[i]`,
+            /// with its `Retry-After` when given.
+            fn batch_answer(statuses: &[(u16, Option<u64>)]) -> String {
+                let items: Vec<String> = statuses
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (status, retry))| {
+                        let headers = retry
+                            .map_or("{}".to_string(), |r| format!(r#"{{"Retry-After":"{r}"}}"#));
+                        let body = if *status >= 400 {
+                            r#","body":{"error":{"code":"Denied","message":"Access is denied."}}"#
+                        } else {
+                            ""
+                        };
+                        format!(
+                            r#"{{"id":"{}","status":{status},"headers":{headers}{body}}}"#,
+                            i + 1
+                        )
+                    })
+                    .collect();
+                format!(r#"{{"responses":[{}]}}"#, items.join(","))
+            }
+
+            fn ok_batch(n: usize) -> String {
+                batch_answer(&vec![(204, None); n])
+            }
+
+            /// `ok_batch(n)`, the last id throttled for `secs`.
+            fn last_throttled(n: usize, secs: u64) -> String {
+                let mut statuses = vec![(204, None); n];
+                *statuses.last_mut().unwrap() = (429, Some(secs));
+                batch_answer(&statuses)
+            }
+
+            /// The ids each `$batch` sent, in order.
+            fn batched(srv: &FakeServer) -> Vec<Vec<String>> {
+                srv.requests()
+                    .into_iter()
+                    .filter(|r| r.method == "POST" && r.path == "/$batch")
+                    .map(|r| {
+                        let v = crate::json::parse(&r.body).unwrap();
+                        v.get("requests")
+                            .and_then(crate::json::Value::as_array)
+                            .unwrap()
+                            .iter()
+                            .map(|q| {
+                                let url = q.get("url").and_then(crate::json::Value::as_str);
+                                url.unwrap().strip_prefix("/me/messages/").unwrap().into()
+                            })
+                            .collect()
+                    })
+                    .collect()
+            }
+
+            type Progress = (usize, usize, usize, bool);
+
+            /// `(done, failed, total, finished)` of each
+            /// `FolderWriteProgress`, each checked to be `folder`'s `write`.
+            fn progress(events: &[SyncEvent], folder: &str, write: FolderWrite) -> Vec<Progress> {
+                events
+                    .iter()
+                    .filter_map(|e| match e {
+                        SyncEvent::FolderWriteProgress {
+                            folder: f,
+                            write: w,
+                            done,
+                            failed,
+                            total,
+                            finished,
+                        } => {
+                            assert_eq!((f.as_str(), *w), (folder, write), "{events:?}");
+                            Some((*done, *failed, *total, *finished))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            }
+
+            /// Every event up to the run's last `FolderWriteProgress`.
+            fn until_finished(handle: &SyncHandle) -> Vec<SyncEvent> {
+                wait_for(&handle.evt_rx, |e| {
+                    matches!(e, SyncEvent::FolderWriteProgress { finished: true, .. })
+                })
+            }
+
+            /// The events from the run's `FolderWriteFailed` on: it, its
+            /// `Error`, then the last `FolderWriteProgress`, in that order,
+            /// the progress last.
+            fn failed_then_finished(events: &[SyncEvent]) -> (Option<u16>, String) {
+                let at = events
+                    .iter()
+                    .rposition(|e| matches!(e, SyncEvent::FolderWriteFailed { .. }))
+                    .unwrap_or_else(|| panic!("{events:?}"));
+                let tail = &events[at..];
+                let SyncEvent::FolderWriteFailed {
+                    id, status, error, ..
+                } = &tail[0]
+                else {
+                    unreachable!()
+                };
+                assert_eq!(id, "INBOX");
+                assert!(matches!(tail.get(1), Some(SyncEvent::Error(_))), "{tail:?}");
+                assert!(
+                    matches!(
+                        tail.last(),
+                        Some(SyncEvent::FolderWriteProgress { finished: true, .. })
+                    ),
+                    "{tail:?}"
+                );
+                (*status, error.clone())
+            }
+
+            /// Stops the engine and waits for its thread to end, so a
+            /// second engine can open the store.
+            fn stop_and_wait(handle: SyncHandle) {
+                let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+                let deadline = Instant::now() + ENGINE_WAIT;
+                loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    match handle.evt_rx.recv_timeout(left) {
+                        Ok(_) => continue,
+                        Err(RecvTimeoutError::Disconnected) => return,
+                        Err(RecvTimeoutError::Timeout) => panic!("engine did not stop"),
+                    }
+                }
+            }
+
+            /// Criteria 2 and 3: 45 ids over two listing pages, sent
+            /// 20 + 20 + 5: one event once listed, one per batch, then the
+            /// last, `finished`.
+            fn counts_every_page_and_batch(kind: Kind, tag: &str) {
+                let server = numbered(45);
+                let (srv, handle, store, dir) = engine(
+                    tag,
+                    world(
+                        vec![
+                            once("GET", PAGE2, 200, &page(&server[20..], None)),
+                            once("GET", kind.list(), 200, &page(&server[..20], Some(PAGE2))),
+                            once("POST", "/$batch", 200, &ok_batch(20)),
+                            once("POST", "/$batch", 200, &ok_batch(20)),
+                            once("POST", "/$batch", 200, &ok_batch(5)),
+                        ],
+                        TREE,
+                        &[],
+                    ),
+                    None,
+                );
+                send(&handle, kind.command("INBOX"));
+                let seen = until_finished(&handle);
+                assert_eq!(
+                    progress(&seen, "INBOX", kind.write()),
+                    [
+                        (0, 0, 45, false),
+                        (20, 0, 45, false),
+                        (40, 0, 45, false),
+                        (45, 0, 45, false),
+                        (45, 0, 45, true),
+                    ]
+                );
+                // The total came before the first batch was sent: each
+                // batch is after the listing's event.
+                assert_eq!(batched(&srv).concat(), server);
+                assert!(
+                    !seen
+                        .iter()
+                        .any(|e| matches!(e, SyncEvent::FolderWriteFailed { .. })),
+                    "{seen:?}"
+                );
+                wait_drained(&store);
+                stop(handle, dir);
+            }
+
+            #[test]
+            fn mark_read_progress_counts_every_page_and_batch() {
+                counts_every_page_and_batch(Kind::MarkRead, "progress-mark-pages");
+            }
+
+            #[test]
+            fn empty_progress_counts_every_page_and_batch() {
+                counts_every_page_and_batch(Kind::Empty, "progress-empty-pages");
+            }
+
+            /// Criterion 2: a throttled id counts only once answered. 21
+            /// ids: the first batch's last is throttled (19 done); the next
+            /// batch (the throttled id and the 21st) is throttled whole and
+            /// sends no event; then both are answered.
+            fn a_throttled_batch_counts_only_answered_ids(kind: Kind, tag: &str) {
+                let server = numbered(21);
+                let (srv, handle, store, dir) = engine(
+                    tag,
+                    world(
+                        vec![
+                            once("GET", kind.list(), 200, &page(&server, None)),
+                            once("POST", "/$batch", 200, &last_throttled(20, 1)),
+                            once(
+                                "POST",
+                                "/$batch",
+                                200,
+                                &batch_answer(&[(503, Some(1)), (429, Some(1))]),
+                            ),
+                            once("POST", "/$batch", 200, &ok_batch(2)),
+                        ],
+                        TREE,
+                        &[],
+                    ),
+                    None,
+                );
+                send(&handle, kind.command("INBOX"));
+                let seen = until_finished(&handle);
+                assert_eq!(
+                    progress(&seen, "INBOX", kind.write()),
+                    [
+                        (0, 0, 21, false),
+                        (19, 0, 21, false),
+                        (21, 0, 21, false),
+                        (21, 0, 21, true),
+                    ]
+                );
+                let sent = batched(&srv);
+                assert_eq!(sent.len(), 3, "{sent:?}");
+                assert_eq!(sent[1], server[19..]);
+                assert_eq!(sent[2], server[19..]);
+                wait_drained(&store);
+                stop(handle, dir);
+            }
+
+            #[test]
+            fn mark_read_a_throttled_batch_counts_only_answered_ids() {
+                a_throttled_batch_counts_only_answered_ids(Kind::MarkRead, "progress-mark-429");
+            }
+
+            #[test]
+            fn empty_a_throttled_batch_counts_only_answered_ids() {
+                a_throttled_batch_counts_only_answered_ids(Kind::Empty, "progress-empty-429");
+            }
+
+            /// Criterion 5: a restart in the middle of a run (19 of 21 done,
+            /// the 20th throttled for an hour) loses the run; the next
+            /// engine lists again what is left, and its counts start over
+            /// from it.
+            fn counts_restart_from_what_is_left(kind: Kind, tag: &str) {
+                let server = numbered(21);
+                let srv = FakeServer::start_limited(world(
+                    vec![
+                        once("GET", kind.list(), 200, &page(&server, None)),
+                        once("POST", "/$batch", 200, &last_throttled(20, 3600)),
+                    ],
+                    TREE,
+                    &[],
+                ));
+                let (handle, store_path, dir) = spawn_fast(&srv, tag, HOUR, None, |_| {});
+                wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+                send(&handle, kind.command("INBOX"));
+                let seen = wait_for(&handle.evt_rx, |e| {
+                    matches!(e, SyncEvent::FolderWriteProgress { done: 19, .. })
+                });
+                stop_and_wait(handle);
+                assert_eq!(
+                    progress(&seen, "INBOX", kind.write()),
+                    [(0, 0, 21, false), (19, 0, 21, false)]
+                );
+                let store = Store::open(&store_path).unwrap();
+                assert_eq!(store.pending_ops().unwrap().len(), 1, "still queued");
+
+                let left = server[19..].to_vec();
+                let srv2 = FakeServer::start_limited(world(
+                    vec![
+                        once("GET", kind.list(), 200, &page(&left, None)),
+                        once("POST", "/$batch", 200, &ok_batch(2)),
+                    ],
+                    TREE,
+                    &[],
+                ));
+                let handle = spawn_with_bases_and_options(
+                    store_path.clone(),
+                    dir.join("token.bin"),
+                    test_cfg(),
+                    3650,
+                    srv2.base_url.clone(),
+                    srv2.base_url.clone(),
+                    HOUR,
+                    EngineOptions::without_prefetch(),
+                );
+                let seen = until_finished(&handle);
+                assert_eq!(
+                    progress(&seen, "INBOX", kind.write()),
+                    [(0, 0, 2, false), (2, 0, 2, false), (2, 0, 2, true)]
+                );
+                assert_eq!(batched(&srv2), [left]);
+                wait_drained(&store);
+                stop(handle, dir);
+            }
+
+            #[test]
+            fn mark_read_progress_restarts_from_what_is_left_after_a_restart() {
+                counts_restart_from_what_is_left(Kind::MarkRead, "progress-mark-restart");
+            }
+
+            #[test]
+            fn empty_progress_restarts_from_what_is_left_after_a_restart() {
+                counts_restart_from_what_is_left(Kind::Empty, "progress-empty-restart");
+            }
+
+            /// Criterion 2: a refused listing ends the run with its
+            /// `FolderWriteFailed` and `Error`, then one `finished` event,
+            /// all 0, and none before.
+            fn a_refused_listing_finishes_with_nothing_counted(kind: Kind, tag: &str) {
+                let (srv, handle, store, dir) = engine(
+                    tag,
+                    world(vec![once("GET", kind.list(), 404, GONE)], TREE, &[]),
+                    None,
+                );
+                send(&handle, kind.command("INBOX"));
+                let seen = until_finished(&handle);
+                assert_eq!(
+                    failed_then_finished(&seen),
+                    (Some(404), "not found (404)".to_string())
+                );
+                assert_eq!(progress(&seen, "INBOX", kind.write()), [(0, 0, 0, true)]);
+                assert!(batched(&srv).is_empty());
+                wait_drained(&store);
+                stop(handle, dir);
+            }
+
+            #[test]
+            fn mark_read_a_refused_listing_finishes_with_nothing_counted() {
+                a_refused_listing_finishes_with_nothing_counted(
+                    Kind::MarkRead,
+                    "progress-mark-refused",
+                );
+            }
+
+            #[test]
+            fn empty_a_refused_listing_finishes_with_nothing_counted() {
+                a_refused_listing_finishes_with_nothing_counted(
+                    Kind::Empty,
+                    "progress-empty-refused",
+                );
+            }
+
+            /// Criterion 2: a `$batch` refused as a whole in the middle of a
+            /// run (a 400 on the second) refuses the run; its last event
+            /// carries the counts reached, after the failure.
+            #[test]
+            fn a_batch_refused_mid_run_finishes_with_the_counts_reached() {
+                let server = numbered(21);
+                let (_srv, handle, store, dir) = engine(
+                    "progress-mid-refused",
+                    world(
+                        vec![
+                            once("GET", UNREAD, 200, &page(&server, None)),
+                            once("POST", "/$batch", 200, &ok_batch(20)),
+                            once("POST", "/$batch", 400, BAD),
+                        ],
+                        TREE,
+                        &[],
+                    ),
+                    None,
+                );
+                send(&handle, Kind::MarkRead.command("INBOX"));
+                let seen = until_finished(&handle);
+                assert_eq!(failed_then_finished(&seen).0, Some(400));
+                assert_eq!(
+                    progress(&seen, "INBOX", FolderWrite::MarkRead),
+                    [(0, 0, 21, false), (20, 0, 21, false), (20, 0, 21, true)]
+                );
+                wait_drained(&store);
+                stop(handle, dir);
+            }
+
+            /// Criterion 2: a partial mark-read (one id refused) reports the
+            /// refusal, then ends with exactly one `finished` event, where
+            /// `done + failed == total`.
+            #[test]
+            fn a_partial_mark_read_finishes_once_after_its_failure() {
+                let (_srv, handle, store, dir) = engine(
+                    "progress-mark-partial",
+                    world(
+                        vec![
+                            once("GET", UNREAD, 200, &page(&strings(&["A", "B"]), None)),
+                            once(
+                                "POST",
+                                "/$batch",
+                                200,
+                                &batch_answer(&[(204, None), (403, None)]),
+                            ),
+                        ],
+                        TREE,
+                        &[],
+                    ),
+                    None,
+                );
+                send(&handle, Kind::MarkRead.command("INBOX"));
+                let mut seen = until_finished(&handle);
+                assert_eq!(failed_then_finished(&seen).0, Some(403));
+                // Nothing more of the run: a barrier comes next.
+                send(
+                    &handle,
+                    SyncCommand::MarkFolderRead {
+                        folder: "NOPE".into(),
+                    },
+                );
+                seen.extend(wait_store_refused_events(&handle));
+                assert_eq!(
+                    progress(&seen, "INBOX", FolderWrite::MarkRead),
+                    [(0, 0, 2, false), (1, 1, 2, false), (1, 1, 2, true)]
+                );
+                wait_drained(&store);
+                stop(handle, dir);
+            }
+
+            /// The events up to a store refusal's `Error` line.
+            fn wait_store_refused_events(handle: &SyncHandle) -> Vec<SyncEvent> {
+                wait_for(
+                    &handle.evt_rx,
+                    |e| matches!(e, SyncEvent::Error(m) if m.contains("NOPE")),
+                )
+            }
+
+            /// Criteria 2 and 3: an empty keeps M1 (the store shows it in
+            /// Archive) and Graph refuses S3: both count as failed, the
+            /// kept one from the listing's event on; the last event comes
+            /// after the end's failure, with `done + failed == total`.
+            #[test]
+            fn empty_counts_kept_and_refused_mail_as_failed() {
+                let dir_delta = "/me/mailFolders/INBOX/messages/delta";
+                let link = format!("{dir_delta}?token=D-INBOX");
+                let items: Vec<String> = ["M1", "M2"]
+                    .iter()
+                    .map(|m| full_message_json(m, m, "2026-07-16T10:00:00Z"))
+                    .collect();
+                let (_srv, handle, store, dir) = engine(
+                    "progress-empty-kept",
+                    world(
+                        vec![
+                            once("GET", ALL, 200, &page(&strings(&["M1", "M2", "S3"]), None)),
+                            once(
+                                "POST",
+                                "/$batch",
+                                200,
+                                &batch_answer(&[(204, None), (403, None)]),
+                            ),
+                            once("GET", dir_delta, 200, &delta_page(&items, &link)),
+                        ],
+                        TREE,
+                        &[],
+                    ),
+                    None,
+                );
+                store.move_message("M1", "ARCH").unwrap();
+                send(&handle, Kind::Empty.command("INBOX"));
+                let seen = until_finished(&handle);
+                let (status, error) = failed_then_finished(&seen);
+                assert_eq!(status, Some(403));
+                assert!(error.contains("were kept"), "{error}");
+                assert_eq!(
+                    progress(&seen, "INBOX", FolderWrite::Empty),
+                    [(0, 1, 3, false), (1, 2, 3, false), (1, 2, 3, true)]
+                );
+                wait_drained(&store);
+                stop(handle, dir);
+            }
+
+            /// r1-m1: a mark-read run kept after a throttle, displaced by an
+            /// older empty that became runnable (the move it waited for
+            /// landed), resumes where it stopped: one listing, no second
+            /// listing event, the counts going on to `finished`.
+            #[test]
+            fn a_mark_read_run_displaced_by_an_older_empty_resumes_without_listing_again() {
+                let server = numbered(21);
+                let other = "/me/mailFolders/OTHER/messages?$filter=receivedDateTime%20le%20";
+                let (srv, handle, store, dir) = engine(
+                    "progress-displaced",
+                    world(
+                        vec![
+                            // Refused with a 400 at each of the three
+                            // commands' drains (passed, kept queued), then
+                            // lands once the throttle's hold is over.
+                            once("POST", "/me/messages/G1/move", 400, BAD),
+                            once("POST", "/me/messages/G1/move", 400, BAD),
+                            once("POST", "/me/messages/G1/move", 400, BAD),
+                            write("POST", "/me/messages/G1/move", 201, r#"{"id":"G1-NEW"}"#),
+                            once("GET", UNREAD, 200, &page(&server, None)),
+                            once("GET", other, 200, &page(&strings(&["G1-NEW"]), None)),
+                            once("POST", "/$batch", 200, &last_throttled(20, 1)),
+                            once("POST", "/$batch", 200, &ok_batch(1)),
+                            once("POST", "/$batch", 200, &ok_batch(2)),
+                        ],
+                        TREE,
+                        &[("ARCH", "G1")],
+                    ),
+                    None,
+                );
+                send(
+                    &handle,
+                    SyncCommand::Move {
+                        id: "G1".into(),
+                        dest: "OTHER".into(),
+                    },
+                );
+                send(&handle, Kind::Empty.command("OTHER"));
+                send(&handle, Kind::MarkRead.command("INBOX"));
+                let seen = wait_for(&handle.evt_rx, |e| {
+                    matches!(
+                        e,
+                        SyncEvent::FolderWriteProgress { folder, finished: true, .. }
+                            if folder == "INBOX"
+                    )
+                });
+                // The empty of Other ran in between, to its end.
+                let (other_events, seen): (Vec<SyncEvent>, Vec<SyncEvent>) =
+                    seen.into_iter().partition(|e| {
+                        matches!(e, SyncEvent::FolderWriteProgress { folder, .. } if folder == "OTHER")
+                    });
+                assert_eq!(
+                    progress(&other_events, "OTHER", FolderWrite::Empty),
+                    [(0, 0, 1, false), (1, 0, 1, false), (1, 0, 1, true)]
+                );
+                assert_eq!(
+                    progress(&seen, "INBOX", FolderWrite::MarkRead),
+                    [
+                        (0, 0, 21, false),
+                        (19, 0, 21, false),
+                        (21, 0, 21, false),
+                        (21, 0, 21, true),
+                    ]
+                );
+                wait_drained(&store);
+                let reqs: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
+                let listed: Vec<&String> = reqs.iter().filter(|p| p.starts_with(UNREAD)).collect();
+                assert_eq!(listed.len(), 1, "{reqs:?}");
+                let sent = batched(&srv);
+                assert_eq!(
+                    sent,
+                    [
+                        server[..20].to_vec(),
+                        strings(&["G1-NEW"]),
+                        server[19..].to_vec()
+                    ],
+                    "the empty ran between the mark-read's batches"
+                );
+                stop(handle, dir);
+            }
+
+            /// Criterion 2: a run of a folder still `local:` sends nothing
+            /// to Graph and ends with one `finished` event, all 0.
+            fn a_local_folder_finishes_with_nothing_counted(kind: Kind, tag: &str) {
+                let srv = FakeServer::start_limited(world(vec![], TREE, &[]));
+                let (handle, store_path, dir) = spawn_fast(&srv, tag, HOUR, None, |s| {
+                    s.upsert_folder(&crate::graph::model::MailFolder {
+                        id: "local:NEW".into(),
+                        display_name: "NEW".into(),
+                        parent_id: Some("ROOT".into()),
+                        total_count: 0,
+                        unread_count: 0,
+                        well_known_name: None,
+                    })
+                    .unwrap();
+                    match kind {
+                        Kind::MarkRead => s
+                            .enqueue_op(&OutboxOp::MarkFolderRead {
+                                folder: "local:NEW".into(),
+                                before: "2026-11-10T18:00:00Z".into(),
+                            })
+                            .map(|_| ())
+                            .unwrap(),
+                        Kind::Empty => {
+                            s.empty_folder("local:NEW", "2026-11-10T18:00:00Z").unwrap();
+                        }
+                    }
+                });
+                let seen = until_finished(&handle);
+                assert_eq!(
+                    progress(&seen, "local:NEW", kind.write()),
+                    [(0, 0, 0, true)]
+                );
+                let store = Store::open(&store_path).unwrap();
+                wait_drained(&store);
+                assert!(batched(&srv).is_empty());
+                no_local_request(&srv);
+                stop(handle, dir);
+            }
+
+            #[test]
+            fn mark_read_of_a_local_folder_finishes_with_nothing_counted() {
+                a_local_folder_finishes_with_nothing_counted(Kind::MarkRead, "progress-mark-local");
+            }
+
+            #[test]
+            fn empty_of_a_local_folder_finishes_with_nothing_counted() {
+                a_local_folder_finishes_with_nothing_counted(Kind::Empty, "progress-empty-local");
             }
         }
         /// #2118: `SyncCommand::CopyFolder`.

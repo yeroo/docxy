@@ -152,6 +152,7 @@ issue number to find its notes.
   every message of a folder moved on the server through `$batch` (Delete All), rows
   following Graph's answers, unsent mail kept, a dropped move reported (#2126),
   message sizes, the size fill, folder sizes on the server (#2123),
+  progress of a folder's mark-read or empty, its end always `finished` (#2128),
   shutdown persists the writes queued before it, without draining (#2127),
   a meeting answer, Remove from Calendar, Automatic Replies or a save kept at a
   shutdown, queued for the next start (#2132),
