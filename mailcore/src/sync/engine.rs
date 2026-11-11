@@ -34823,8 +34823,7 @@ mod tests {
                 let last = srv
                     .requests()
                     .into_iter()
-                    .filter(|r| r.method == "POST" && r.path == "/$batch")
-                    .last()
+                    .rfind(|r| r.method == "POST" && r.path == "/$batch")
                     .unwrap();
                 assert!(
                     last.body
