@@ -3792,6 +3792,44 @@ A host can draw classic Outlook's Folder Size dialog. The Local Data tab comes f
   `an_empty_of_the_dest_deletes_the_mail_the_run_moved_there`,
   `delete_all_then_delete_folder_moves_before_the_folder_delete`).
 
+## Progress of a folder's mark-read or empty (#2128)
+
+- `SyncEvent::FolderWriteProgress { folder, write, done, failed, total, finished }` reports a
+  queued `MarkFolderRead` (`write: MarkRead`) or `EmptyFolder` (`write: Empty`) run, so a host
+  can show "Emptying… 340 of 1 200" and tell the run is over without reading the outbox. A
+  move run keeps #2126's `FolderMessagesMoving` / `FolderMessagesMoved`, unchanged.
+- When: once the listing is in (`done` 0), then from `bulk_batches` after each `$batch` Graph
+  answered at least one id of (`answered > 0`, as the move's), before a throttle or 5xx stops
+  the drain. So at most one per batch; a batch throttled whole sends none, and a kept run
+  resuming after the hold sends no second listing event.
+- `finished: true` ends **every queued run**, once: a clean end; a partial one (after its
+  `FolderWriteFailed` + `Error`); a refused one (`refuse_mark_read` / `refuse_empty_folder`: a
+  refused listing, a whole-call 4xx or `Parse` of a batch mid-run, a store failure), after its
+  `FolderWriteFailed` + `Error`, with the counts reached so far (all 0 before a listing); a
+  folder still `local:` (all 0). A host stops on `finished`; a `FolderWriteFailed { write }`
+  just before it says the run did not fully succeed. `finish_mark_folder_read` reports a
+  partial run through `refuse_mark_read`, so the final event is sent there, never twice
+  (`end_write_progress` takes the run). Not sent: for a command the store refused (no op
+  queued, `FolderWriteFailed` alone), nor when a delete of the folder drops the queued op
+  (`drop_folder_ops_on`; the folder is gone, `FoldersUpdated`).
+- Counts (`BulkRun::write_progress`): `total` is `BulkRun::total` (the mark-read's unread ids
+  listed; the empty's listed less what it leaves alone). `done` is `BulkRun::done` (was
+  `moved`), counted for every kind on a 2xx or 404; the move's events read it as `moved`.
+  `failed` is the ids Graph refused plus, for an empty, the kept ones (`run.kept`, known at the
+  listing, so the first event can already show them). A throttled or 5xx id counts once
+  answered. A run that reached its end has `done + failed == total`. A restart loses the run:
+  the op lists again and the counts start over from what is left. `folder` is the id the run
+  resolved on entry (`current_folder_id`), passed to `bulk_batches(seq, folder)`.
+- lookxy ignores the event (no Mark All as Read or Empty Folder UI).
+- Tests: `engine.rs` `folder_writes::write_progress`, each over both kinds where it applies
+  (`*_progress_counts_every_page_and_batch`, `*_a_throttled_batch_counts_only_answered_ids`,
+  `*_progress_restarts_from_what_is_left_after_a_restart`,
+  `*_a_refused_listing_finishes_with_nothing_counted`,
+  `*_of_a_local_folder_finishes_with_nothing_counted`),
+  `a_batch_refused_mid_run_finishes_with_the_counts_reached`,
+  `a_partial_mark_read_finishes_once_after_its_failure`,
+  `empty_counts_kept_and_refused_mail_as_failed`.
+
 ## Shutdown persists queued writes (#2127)
 
 A host that sends many per-message writes (`MarkRead`, `Delete`, `Move`) and then `Shutdown`
