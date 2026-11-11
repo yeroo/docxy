@@ -1256,7 +1256,11 @@ enum BulkStep {
 /// How `Engine::drain_outbox` ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Drain {
-    /// Every queued op was tried: applied, or bumped/quarantined on a 4xx.
+    /// The drain ran to its end: every queued op was tried (applied, or
+    /// bumped/quarantined on a 4xx), a `DeleteFolder` or `EmptyFolder`
+    /// waiting for an older op skipped on the way; or it stopped at a
+    /// `CopyFolder` waiting for an older op (#2118 r1), the ops after it
+    /// left for a later drain. Not a deferral: the caller's sync carries on.
     Done,
     /// An op got a 5xx: it stays queued (attempts bumped) and the drain
     /// stopped there, keeping the order, under the outbox's own back-off
@@ -3994,7 +3998,10 @@ impl Engine {
     /// it must not stop the caller's sync either. It arms the outbox's own
     /// back-off (`op_retry`, 5 s doubling to 300 s, reset when an op goes
     /// through or the queue is empty): until then a drain sends nothing and
-    /// is `Deferred` too.
+    /// is `Deferred` too. A `DeleteFolder` or `EmptyFolder` with an older op
+    /// queued is skipped (#2107, #2110); a `CopyFolder` with one ends the
+    /// drain there (#2118 r1: nothing queued after a copy is sent before
+    /// it), which is [`Drain::Done`], no deferral.
     ///
     /// After a drain that sent a draft, Drafts and then Sent Items are
     /// synced at once (`sync_after_send`, #1885). Returns
