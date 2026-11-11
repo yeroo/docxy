@@ -483,6 +483,22 @@ pub enum OutboxOp {
         before: String,
         batch: String,
     },
+    /// Copy the folder `source` under `dest` (#2118, `Store::copy_folder`;
+    /// `None`: the top of the mailbox, `msgfolderroot`): `POST
+    /// /me/mailFolders/{source}/copy`, then re-key the `local:` row `id` the
+    /// command stored for the copy to Graph's id
+    /// (`Store::reconcile_created_folder`). Graph copies the subfolders and
+    /// mail; the engine syncs them after. `source` and `dest` are resolved
+    /// again through `folder_aliases` at send time; either still `local:`
+    /// (its create never reached Graph) refuses the copy. Sent only once no
+    /// older op is queued (a copy is a snapshot of Graph), and no newer op is
+    /// sent before it (the drain stops at a copy that waits). A row gone, or
+    /// an id already re-keyed, sends nothing.
+    CopyFolder {
+        id: String,
+        source: String,
+        dest: Option<String>,
+    },
 }
 
 impl OutboxOp {
@@ -518,7 +534,8 @@ impl OutboxOp {
             | OutboxOp::MoveFolder { .. }
             | OutboxOp::MarkFolderRead { .. }
             | OutboxOp::DeleteFolder { .. }
-            | OutboxOp::EmptyFolder { .. } => None,
+            | OutboxOp::EmptyFolder { .. }
+            | OutboxOp::CopyFolder { .. } => None,
         }
     }
 
@@ -554,6 +571,7 @@ impl OutboxOp {
             OutboxOp::MarkFolderRead { .. } => "markFolderRead",
             OutboxOp::DeleteFolder { .. } => "deleteFolder",
             OutboxOp::EmptyFolder { .. } => "emptyFolder",
+            OutboxOp::CopyFolder { .. } => "copyFolder",
         }
     }
 
@@ -714,6 +732,12 @@ impl OutboxOp {
                 ("folder".to_string(), Value::Str(folder.clone())),
                 ("before".to_string(), Value::Str(before.clone())),
                 ("batch".to_string(), Value::Str(batch.clone())),
+            ]),
+            OutboxOp::CopyFolder { id, source, dest } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                ("source".to_string(), Value::Str(source.clone())),
+                ("dest".to_string(), optional_str(dest)),
             ]),
             OutboxOp::CancelEvent { id, comment } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
@@ -910,6 +934,11 @@ impl OutboxOp {
                 folder: v.get("folder")?.as_str()?.to_string(),
                 before: v.get("before")?.as_str()?.to_string(),
                 batch: v.get("batch")?.as_str()?.to_string(),
+            }),
+            "copyFolder" => Some(OutboxOp::CopyFolder {
+                id: id()?,
+                source: v.get("source")?.as_str()?.to_string(),
+                dest: v.get("dest").and_then(Value::as_str).map(str::to_string),
             }),
             _ => None,
         }
@@ -5366,6 +5395,12 @@ pub(crate) struct LocalFolderDiscard {
     /// refused one, so their creates could never reach Graph. The engine
     /// reports each.
     pub also_discarded: Vec<String>,
+    /// The `local:` copies it removed (#2118): copied under the refused
+    /// folder (or under a folder in `also_discarded`), so their copies
+    /// could never reach Graph. Each is `(copy id, source)`, the source
+    /// resolved through `folder_aliases`; the engine reports each as a
+    /// copy of its source.
+    pub discarded_copies: Vec<(String, String)>,
 }
 
 /// The folders queued folder ops name (#1910), each id resolved through
@@ -5408,7 +5443,12 @@ pub(crate) struct FolderDelete {
     /// out of the subtree since: their creates could never reach Graph, so
     /// they went too. The engine reports each.
     pub also_discarded: Vec<String>,
-    /// Every folder id removed: the subtree, then `also_discarded`.
+    /// The `local:` copies made under a removed `local:` folder and moved
+    /// out of the subtree since (#2118), as `(copy id, source)`: they went
+    /// too, as `also_discarded`. The engine reports each as a copy.
+    pub discarded_copies: Vec<(String, String)>,
+    /// Every folder id removed: the subtree, then `also_discarded`, then
+    /// the `discarded_copies`.
     pub removed: Vec<String>,
 }
 
@@ -5573,6 +5613,66 @@ impl Store {
         Ok(FolderWriteResult::Written(id))
     }
 
+    /// `id` and every stored folder under it (`parent_id`), `id` first
+    /// (#2118: a copy's subtree, synced after the copy).
+    pub(crate) fn folder_subtree(&self, id: &str) -> Result<Vec<String>, StoreError> {
+        subtree_ids_on(&self.conn, id)
+    }
+
+    /// Adds a copy of the stored folder `source` under `dest` (`None`: the
+    /// top of the mailbox, stored under the listed root id as
+    /// `create_local_folder` does) with a fresh `local:` id, and queues its
+    /// `CopyFolder` (#2118), in one IMMEDIATE transaction. The copy takes the
+    /// source's name and counts, and no messages and no subfolders: Graph
+    /// copies those, and the engine syncs them once the op has reached it.
+    /// `source` and `dest` are resolved through `folder_aliases`; an unknown
+    /// one or the drafts sentinel is refused. Nothing else is: a dest that
+    /// is the source or inside it makes no cycle in the store (the copy is
+    /// a new row), and Graph decides whether it copies there. Never
+    /// `Unchanged`: each command makes its own copy.
+    pub(crate) fn copy_folder(
+        &self,
+        source: &str,
+        dest: Option<&str>,
+    ) -> Result<FolderWriteResult, StoreError> {
+        let tx = self.write_tx()?;
+        let source = current_folder_id_on(&tx, source)?;
+        if let Some(r) = check_folder_on(&tx, &source)? {
+            return Ok(FolderWriteResult::Refused(r));
+        }
+        let dest = match dest {
+            Some(d) => {
+                let d = current_folder_id_on(&tx, d)?;
+                if let Some(r) = check_folder_on(&tx, &d)? {
+                    return Ok(FolderWriteResult::Refused(r));
+                }
+                Some(d)
+            }
+            None => None,
+        };
+        let stored_parent = match &dest {
+            Some(d) => Some(d.clone()),
+            None => root_folder_id_on(&tx)?,
+        };
+        let id = local_draft_id();
+        tx.execute(
+            "INSERT INTO folders (id, parent_id, display_name, total_count, unread_count)
+             SELECT ?1, ?2, display_name, total_count, unread_count
+             FROM folders WHERE id = ?3",
+            params![id, stored_parent, source],
+        )?;
+        enqueue_op_on(
+            &tx,
+            &OutboxOp::CopyFolder {
+                id: id.clone(),
+                source,
+                dest,
+            },
+        )?;
+        tx.commit()?;
+        Ok(FolderWriteResult::Written(id))
+    }
+
     /// Re-keys a folder created locally to the id Graph gave it (#1910), in
     /// one transaction (`rekey_folder_on`): its messages and child folders
     /// follow, and every other column (name and parent as stored, which a
@@ -5669,8 +5769,10 @@ impl Store {
             out.refiled_into = Some(drafts);
         }
         out.had_mail = drop_local_folder_mail_on(&tx, &local)?;
+        let copies = queued_copies_on(&tx)?;
         for row in pending_ops_on(&tx)? {
-            if let OutboxOp::CreateFolder { id: created, .. } = &row.op
+            if let OutboxOp::CreateFolder { id: created, .. }
+            | OutboxOp::CopyFolder { id: created, .. } = &row.op
                 && local.contains(created)
             {
                 tx.execute("DELETE FROM outbox WHERE seq = ?1", params![row.seq])?;
@@ -5678,7 +5780,10 @@ impl Store {
         }
         for other in local.iter().filter(|l| *l != id) {
             if folder_exists_on(&tx, other)? {
-                out.also_discarded.push(other.clone());
+                match copies.get(other) {
+                    Some(source) => out.discarded_copies.push((other.clone(), source.clone())),
+                    None => out.also_discarded.push(other.clone()),
+                }
             }
         }
         tx.execute(
@@ -6048,13 +6153,18 @@ impl Store {
                 }
             }
         }
+        let copies = queued_copies_on(&tx)?;
         for other in &local {
             if !subtree.contains(other) && folder_exists_on(&tx, other)? {
-                out.also_discarded.push(other.clone());
+                match copies.get(other) {
+                    Some(source) => out.discarded_copies.push((other.clone(), source.clone())),
+                    None => out.also_discarded.push(other.clone()),
+                }
             }
         }
         let mut removed = subtree.clone();
         removed.extend(out.also_discarded.iter().cloned());
+        removed.extend(out.discarded_copies.iter().map(|(c, _)| c.clone()));
         let unsent = unsent_mail_in_on(&tx, &removed)?;
         if !unsent.is_empty() {
             return Ok((
@@ -6353,9 +6463,9 @@ fn drop_folder_ops_on(
         let seq = ops[i].seq;
         let op = ops[i].op.clone();
         let drop = match &op {
-            OutboxOp::CreateFolder { id, .. } | OutboxOp::RenameFolder { id, .. } => {
-                local.contains(&current_folder_id_on(conn, id)?)
-            }
+            OutboxOp::CreateFolder { id, .. }
+            | OutboxOp::RenameFolder { id, .. }
+            | OutboxOp::CopyFolder { id, .. } => local.contains(&current_folder_id_on(conn, id)?),
             OutboxOp::MarkFolderRead { folder, .. } => {
                 let f = current_folder_id_on(conn, folder)?;
                 removed.contains(&f) || local.contains(&f)
@@ -6463,6 +6573,11 @@ fn queued_op_ids_on(conn: &Connection) -> Result<HashSet<String>, StoreError> {
             OutboxOp::MarkFolderRead { folder, .. } => vec![folder],
             OutboxOp::DeleteFolder { id, .. } => vec![id],
             OutboxOp::EmptyFolder { folder, .. } => vec![folder],
+            OutboxOp::CopyFolder { id, source, dest } => {
+                let mut v = vec![id, source];
+                v.extend(dest.iter());
+                v
+            }
             _ => vec![],
         };
         for f in folders {
@@ -6539,14 +6654,19 @@ fn unsent_mail_in_on(conn: &Connection, folders: &[String]) -> Result<Vec<String
 /// parents, `id` as its parent (#1910 r10): their creates could never reach
 /// Graph. Where they sit now does not matter: one created elsewhere and
 /// only moved under `id` keeps its own create, and one created under `id`
-/// and moved away still could not be created.
+/// and moved away still could not be created. A queued `CopyFolder`'s copy
+/// counts as created under its `dest` (#2118); a copy whose *source* is in
+/// the set is not added here: its op is refused when sent.
 fn refused_creates_on(conn: &Connection, id: &str) -> Result<Vec<String>, StoreError> {
     let mut creates: Vec<(String, Option<String>)> = Vec::new();
     for row in pending_ops_on(conn)? {
-        if let OutboxOp::CreateFolder { id, parent, .. } = row.op {
-            let parent = parent.map(|p| current_folder_id_on(conn, &p)).transpose()?;
-            creates.push((id, parent));
-        }
+        let (created, parent) = match row.op {
+            OutboxOp::CreateFolder { id, parent, .. } => (id, parent),
+            OutboxOp::CopyFolder { id, dest, .. } => (id, dest),
+            _ => continue,
+        };
+        let parent = parent.map(|p| current_folder_id_on(conn, &p)).transpose()?;
+        creates.push((created, parent));
     }
     let mut set = vec![id.to_string()];
     loop {
@@ -6560,6 +6680,19 @@ fn refused_creates_on(conn: &Connection, id: &str) -> Result<Vec<String>, StoreE
             return Ok(set);
         }
     }
+}
+
+/// The queued `CopyFolder`s (#2118): each copy's `local:` id with its
+/// source, resolved through `folder_aliases`.
+fn queued_copies_on(conn: &Connection) -> Result<HashMap<String, String>, StoreError> {
+    let mut out = HashMap::new();
+    for row in pending_ops_on(conn)? {
+        if let OutboxOp::CopyFolder { id, source, .. } = row.op {
+            let source = current_folder_id_on(conn, &source)?;
+            out.insert(id, source);
+        }
+    }
+    Ok(out)
 }
 
 /// Before the `local:` folders `local` are removed (#1910, a refused
@@ -20958,6 +21091,7 @@ mod folder_write_tests {
                 had_mail: true,
                 refiled_into: Some(LOCAL_DRAFTS_SENTINEL_FOLDER_ID.to_string()),
                 also_discarded: vec![kid.clone()],
+                discarded_copies: Vec::new(),
             }
         );
         assert_eq!(
@@ -21182,6 +21316,258 @@ mod folder_write_tests {
             "not local:"
         );
         assert!(row(&s, "A").is_some());
+    }
+
+    #[test]
+    fn copy_folder_op_round_trips_json() {
+        for op in [
+            OutboxOp::CopyFolder {
+                id: "local:1".into(),
+                source: "S".into(),
+                dest: Some("D".into()),
+            },
+            OutboxOp::CopyFolder {
+                id: "local:1".into(),
+                source: "S".into(),
+                dest: None,
+            },
+        ] {
+            let text = op.to_json().to_string();
+            assert!(text.contains(r#""kind":"copyFolder""#), "{text}");
+            let back = OutboxOp::from_json(&json::parse(&text).unwrap());
+            assert_eq!(back.as_ref(), Some(&op), "{text}");
+        }
+    }
+
+    /// #2118: the copy is a new `local:` row under the dest with the
+    /// source's name and counts, and no mail; the op is queued with it; the
+    /// source is untouched. A dest that is the source or under it is not
+    /// refused (no cycle: the copy is a new row; Graph decides).
+    #[test]
+    fn copy_folder_adds_a_local_row_with_the_source_counts_and_queues_its_op() {
+        let s = mailbox();
+        s.set_folder_counts("A", 7, 3).unwrap();
+        message(&s, "m-a", "A");
+        let before = row(&s, "A").unwrap();
+        let copy = written(s.copy_folder("A", Some("ARCH")).unwrap());
+        assert!(copy.starts_with("local:"), "{copy}");
+        let new = row(&s, &copy).unwrap();
+        assert_eq!(new.parent_id.as_deref(), Some("ARCH"));
+        assert_eq!(new.display_name, "A");
+        assert_eq!((new.total_count, new.unread_count), (7, 3));
+        assert_eq!(new.well_known_name, None);
+        assert_eq!(new.delta_link, None);
+        let in_copy: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE folder_id = ?1",
+                params![copy],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(in_copy, 0, "the store copies no mail");
+        assert_eq!(row(&s, "A").unwrap(), before, "the source is untouched");
+        assert_eq!(folder_of(&s, "m-a").as_deref(), Some("A"));
+        assert_eq!(
+            ops(&s),
+            [OutboxOp::CopyFolder {
+                id: copy.clone(),
+                source: "A".into(),
+                dest: Some("ARCH".into()),
+            }]
+        );
+        let named = queued_op_ids_on(&s.conn).unwrap();
+        for id in [copy.as_str(), "A", "ARCH"] {
+            assert!(named.contains(id), "{id} named by the queued copy");
+        }
+
+        // At the top: under the listed root, as a created folder.
+        let top = written(s.copy_folder("B", None).unwrap());
+        assert_eq!(row(&s, &top).unwrap().parent_id.as_deref(), Some("ROOT"));
+        // Into itself, and into a folder under it: written, not refused.
+        let into_self = written(s.copy_folder("A", Some("A")).unwrap());
+        assert_eq!(row(&s, &into_self).unwrap().parent_id.as_deref(), Some("A"));
+        let into_kid = written(s.copy_folder("A", Some("B")).unwrap());
+        assert_eq!(row(&s, &into_kid).unwrap().parent_id.as_deref(), Some("B"));
+        // Beside the original: written too, each command its own copy.
+        let beside = written(s.copy_folder("A", Some("INBOX")).unwrap());
+        assert_ne!(beside, copy);
+        assert_eq!(ops(&s).len(), 5);
+        assert_eq!(
+            ops(&s)[1],
+            OutboxOp::CopyFolder {
+                id: top,
+                source: "B".into(),
+                dest: None,
+            }
+        );
+    }
+
+    #[test]
+    fn copy_folder_refuses_unknown_folders_and_the_drafts_sentinel() {
+        let s = mailbox();
+        s.create_local_draft("s", "", "", "").unwrap();
+        let folders = s.folders().unwrap().len();
+        let refused = |r: FolderWriteResult| match r {
+            FolderWriteResult::Refused(r) => r,
+            other => panic!("not refused: {other:?}"),
+        };
+        assert_eq!(
+            refused(s.copy_folder("NOPE", Some("ARCH")).unwrap()),
+            FolderRefusal::Unknown("NOPE".into())
+        );
+        assert_eq!(
+            refused(s.copy_folder("A", Some("NOPE")).unwrap()),
+            FolderRefusal::Unknown("NOPE".into())
+        );
+        assert_eq!(
+            refused(
+                s.copy_folder(LOCAL_DRAFTS_SENTINEL_FOLDER_ID, None)
+                    .unwrap()
+            ),
+            FolderRefusal::DraftsSentinel
+        );
+        assert_eq!(
+            refused(
+                s.copy_folder("A", Some(LOCAL_DRAFTS_SENTINEL_FOLDER_ID))
+                    .unwrap()
+            ),
+            FolderRefusal::DraftsSentinel
+        );
+        assert_eq!(s.folders().unwrap().len(), folders, "nothing written");
+        assert!(
+            !ops(&s)
+                .iter()
+                .any(|op| matches!(op, OutboxOp::CopyFolder { .. })),
+            "nothing queued"
+        );
+        // A re-keyed id is followed, for the source and the dest.
+        let x = written(s.create_local_folder(None, "X").unwrap());
+        s.reconcile_created_folder(&x, &listed("GX", Some("ROOT"), "X"))
+            .unwrap();
+        let copy = written(s.copy_folder(&x, Some(&x)).unwrap());
+        assert!(ops(&s).contains(&OutboxOp::CopyFolder {
+            id: copy,
+            source: "GX".into(),
+            dest: Some("GX".into()),
+        }));
+    }
+
+    /// #2118: a copy queued into a `local:` folder whose create (or copy)
+    /// is refused could never reach Graph: it goes with it, reported as a
+    /// copy of its source. A copy *of* the refused folder stays: its op is
+    /// refused when sent.
+    #[test]
+    fn a_refused_create_discards_a_copy_queued_into_it() {
+        let s = mailbox();
+        let x = written(s.create_local_folder(None, "X").unwrap());
+        let into_x = written(s.copy_folder("A", Some(&x)).unwrap());
+        let of_x = written(s.copy_folder(&x, Some("ARCH")).unwrap());
+        // Moved out of X since: it still goes, as a create under X would.
+        written(s.move_folder(&into_x, None).unwrap());
+        let discard = s.discard_local_folder(&x).unwrap();
+        assert!(discard.also_discarded.is_empty(), "{discard:?}");
+        assert_eq!(discard.discarded_copies, [(into_x.clone(), "A".into())]);
+        assert!(row(&s, &into_x).is_none());
+        assert!(row(&s, &of_x).is_some(), "a copy of X stays");
+        assert_eq!(
+            ops(&s)
+                .into_iter()
+                .filter(|op| matches!(op, OutboxOp::CopyFolder { .. }))
+                .collect::<Vec<_>>(),
+            [OutboxOp::CopyFolder {
+                id: of_x.clone(),
+                source: x.clone(),
+                dest: Some("ARCH".into()),
+            }]
+        );
+
+        // A refused copy: a folder created and a copy made under it go too.
+        let s = mailbox();
+        let copy = written(s.copy_folder("A", Some("ARCH")).unwrap());
+        let kid = written(s.create_local_folder(Some(&copy), "Kid").unwrap());
+        let nested = written(s.copy_folder("B", Some(&kid)).unwrap());
+        message(&s, "local:d1", &copy);
+        s.enqueue_op(&OutboxOp::SaveDraft {
+            id: "local:d1".into(),
+        })
+        .unwrap();
+        let discard = s.discard_local_folder(&copy).unwrap();
+        assert_eq!(discard.also_discarded, [kid.as_str()]);
+        assert_eq!(discard.discarded_copies, [(nested.clone(), "B".into())]);
+        assert!(discard.refiled_into.is_some(), "the draft is filed back");
+        for gone in [&copy, &kid, &nested] {
+            assert!(row(&s, gone).is_none(), "{gone}");
+        }
+        assert!(
+            !ops(&s).iter().any(|op| matches!(
+                op,
+                OutboxOp::CopyFolder { .. } | OutboxOp::CreateFolder { .. }
+            )),
+            "{:?}",
+            ops(&s)
+        );
+    }
+
+    /// #2118: deleting a `local:` copy drops its op; a copy made under a
+    /// deleted `local:` folder and moved out goes too, reported; a copy of
+    /// a deleted folder stays (Graph has the source until the delete runs).
+    #[test]
+    fn deleting_a_local_copy_drops_its_op() {
+        let s = mailbox();
+        let copy = written(s.copy_folder("A", Some("ARCH")).unwrap());
+        written(s.rename_folder(&copy, "Renamed").unwrap());
+        let (r, d) = s.delete_folder(&copy).unwrap();
+        written(r);
+        assert!(
+            d.discarded_copies.is_empty(),
+            "the one deleted is not reported"
+        );
+        assert!(row(&s, &copy).is_none());
+        assert!(ops(&s).is_empty(), "{:?}", ops(&s));
+
+        // Under a Graph folder deleted: the copy goes with the subtree.
+        let s = mailbox();
+        let copy = written(s.copy_folder("A", Some("ARCH")).unwrap());
+        let (r, d) = s.delete_folder("ARCH").unwrap();
+        written(r);
+        assert!(d.discarded_copies.is_empty());
+        assert!(d.removed.contains(&copy));
+        assert!(
+            !ops(&s)
+                .iter()
+                .any(|op| matches!(op, OutboxOp::CopyFolder { .. })),
+            "{:?}",
+            ops(&s)
+        );
+
+        // Made under a `local:` folder and moved out: it goes, reported.
+        let s = mailbox();
+        let x = written(s.create_local_folder(None, "X").unwrap());
+        let copy = written(s.copy_folder("A", Some(&x)).unwrap());
+        written(s.move_folder(&copy, Some("INBOX")).unwrap());
+        let (r, d) = s.delete_folder(&x).unwrap();
+        written(r);
+        assert_eq!(d.discarded_copies, [(copy.clone(), "A".into())]);
+        assert!(d.also_discarded.is_empty());
+        assert!(d.removed.contains(&copy));
+        assert!(row(&s, &copy).is_none());
+        assert!(ops(&s).is_empty(), "{:?}", ops(&s));
+
+        // A copy of a deleted folder stays, its op queued.
+        let s = mailbox();
+        let copy = written(s.copy_folder("B", Some("ARCH")).unwrap());
+        let (r, _) = s.delete_folder("A").unwrap();
+        written(r);
+        assert!(row(&s, &copy).is_some());
+        assert_eq!(
+            ops(&s)[0],
+            OutboxOp::CopyFolder {
+                id: copy,
+                source: "B".into(),
+                dest: Some("ARCH".into()),
+            }
+        );
     }
 }
 
