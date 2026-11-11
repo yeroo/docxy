@@ -6470,6 +6470,23 @@ impl Store {
         clear_folder_links_on(&self.conn, folder)
     }
 
+    /// Forgets `folder_id`'s delta link, whose sync state Graph reports
+    /// expired (#2113, #1975): the link, what it covered (`history_scope`)
+    /// and its refused-expand mark (#2054), so the folder's phase 1 (a head,
+    /// or a small folder's full delta) runs again. A backfill walk under
+    /// way is kept (its link, count, scope and refused-expand mark): its own
+    /// page links did not expire, and it resumes once the head is stored.
+    /// Unlike `restart_folder_delta`, which starts the walk over too.
+    pub(crate) fn expire_delta_link(&self, folder_id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE folders SET delta_link = NULL, history_scope = NULL,
+                                reminder_expand_refused = 0
+             WHERE id = ?1",
+            params![folder_id],
+        )?;
+        Ok(())
+    }
+
     /// The folders a queued rename or move names (#1910), and those a
     /// queued `MarkFolderRead` names with its latest cutoff (`marked_read`,
     /// #1913), resolved through `folder_aliases`.
@@ -23307,6 +23324,39 @@ mod mark_folder_read_tests {
                 ("F".to_string(), None, 0),
                 ("G".to_string(), Some("b".to_string()), 3)
             ]
+        );
+    }
+
+    /// #2113 (#1975 plan-410): an expired delta link goes with its scope
+    /// and refused-expand mark; the folder's backfill walk stays, and so
+    /// does every other folder's link.
+    #[test]
+    fn plan_410_expire_delta_link_keeps_the_backfill_walk() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F", 0);
+        folder(&s, "G", 0);
+        s.set_head_link("F", "https://graph/head?F", true).unwrap();
+        s.set_head_link("G", "https://graph/head?G", true).unwrap();
+        s.set_backfill_progress("F", "https://graph/page2?F", 40, SCOPE_WINDOW)
+            .unwrap();
+        s.set_backfill_expand_refused("F").unwrap();
+        s.expire_delta_link("F").unwrap();
+        assert_eq!(s.get_delta_link("F").unwrap(), None);
+        assert!(!s.reminder_expand_refused("F").unwrap());
+        let h = s.folder_history("F").unwrap().unwrap();
+        assert_eq!(h.scope, None);
+        assert!(!h.has_delta_link);
+        assert_eq!(h.backfill_link.as_deref(), Some("https://graph/page2?F"));
+        assert_eq!(h.synced, 40);
+        assert_eq!(h.backfill_scope.as_deref(), Some(SCOPE_WINDOW));
+        assert!(s.backfill_expand_refused("F").unwrap());
+        // G is untouched.
+        let g = s.folder_history("G").unwrap().unwrap();
+        assert_eq!(g.scope.as_deref(), Some(SCOPE_HEAD));
+        assert!(s.reminder_expand_refused("G").unwrap());
+        assert_eq!(
+            s.get_delta_link("G").unwrap().as_deref(),
+            Some("https://graph/head?G")
         );
     }
 }
