@@ -4253,6 +4253,33 @@ mod tests {
         assert!(r.headers.is_empty() && r.body.is_none());
     }
 
+    /// #2126: a move sub-request names the dest in its body, the id
+    /// percent-encoded in its URL.
+    #[test]
+    fn move_message_request_posts_destination_id() {
+        let r = GraphClient::move_message_request("A/B", "DELETED");
+        assert_eq!(r.method, "POST");
+        assert_eq!(r.url, "/me/messages/A%2FB/move");
+        assert!(r.headers.is_empty());
+        assert_eq!(
+            r.body.map(|b| b.to_string()).as_deref(),
+            Some(r#"{"destinationId":"DELETED"}"#)
+        );
+    }
+
+    /// #2126: the moved id is the answer's `id` alone; none, an empty one
+    /// or a body that is not JSON is `None`.
+    #[test]
+    fn moved_id_reads_a_move_answer() {
+        assert_eq!(
+            moved_message_id(r#"{"id":"NEW","subject":"s","parentFolderId":"D"}"#).as_deref(),
+            Some("NEW")
+        );
+        assert_eq!(moved_message_id(r#"{"subject":"s"}"#), None);
+        assert_eq!(moved_message_id(r#"{"id":""}"#), None);
+        assert_eq!(moved_message_id(""), None);
+    }
+
     #[test]
     fn set_flag_sends_patch_body() {
         let srv = FakeServer::start(vec![Route {

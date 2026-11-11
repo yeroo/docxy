@@ -946,6 +946,25 @@ mod tests {
         assert!(srv.requests().is_empty());
     }
 
+    /// #2126: the engine runs it; `apply_op` sends nothing.
+    #[test]
+    fn apply_op_move_folder_messages_sends_nothing() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let r = apply_op(
+            &c,
+            &store,
+            &OutboxOp::MoveFolderMessages {
+                folder: "F".into(),
+                dest: "D".into(),
+                before: "2026-11-10T18:00:00Z".into(),
+            },
+        );
+        assert!(matches!(r, Err(GraphError::Parse(_))), "{r:?}");
+        assert!(srv.requests().is_empty());
+    }
+
     #[test]
     fn apply_op_dispatches_set_flag() {
         let srv = FakeServer::start(vec![Route {
