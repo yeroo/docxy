@@ -54,7 +54,7 @@ pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
     AutomaticReplies, DeltaItem, Event, EventDeltaItem, FolderContact, MailFolder, Me,
     MeetingMessage, MeetingMessageType, Message, MessageFields, Recipient, ScheduleEntry,
-    SearchHit,
+    SearchHit, parse_folder_size,
 };
 use crate::store::{
     CalendarRound, FetchedCalendar, FolderDelete, FolderHistory, FolderRow, FolderWriteResult,
@@ -163,6 +163,18 @@ pub enum SyncCommand {
     /// `MessageFetchFailed` too. Served ahead of a running pass, as
     /// `FetchBody` is.
     FetchMessage { id: String },
+    /// Ask Graph for folders' own sizes (#2123): each folder's
+    /// `PidTagMessageSizeExtended` (`Long 0x0E08`, its items without its
+    /// subfolders), what classic Outlook's Folder Size dialog shows on its
+    /// Server Data tab. `GraphClient::folder_size_request`s,
+    /// [`FOLDER_SIZE_BATCH`] a `$batch`. Answers with
+    /// [`SyncEvent::FolderSizesFetched`] (one entry per id asked, in order,
+    /// `None` when the folder has no such property, is gone (404), is a
+    /// `local:` folder Graph does not have yet, or is being deleted or
+    /// emptied) or [`SyncEvent::FolderSizesFailed`], never a
+    /// [`SyncEvent::Error`]. Nothing is stored. Served ahead of a running
+    /// pass, as `SearchMessages` is, and tried even during a back-off.
+    FetchFolderSizes { folder_ids: Vec<String> },
     /// Fetch attachment metadata (`GraphClient::list_attachments`) for a
     /// message and store it, then emit [`SyncEvent::AttachmentsUpdated`].
     /// `Store::put_attachments` is otherwise never populated in production
@@ -898,6 +910,17 @@ pub enum SyncEvent {
     /// [`SyncCommand::FetchMessage`] could not open the hit `id` (as the
     /// command named it, #2006). `reason` is one line.
     MessageFetchFailed { id: String, reason: String },
+    /// The server's answer to [`SyncCommand::FetchFolderSizes`] (#2123): one
+    /// entry per id asked, in the order and spelling asked, with the
+    /// folder's own size in bytes, `None` when Graph has none for it.
+    FolderSizesFetched { sizes: Vec<(String, Option<i64>)> },
+    /// [`SyncCommand::FetchFolderSizes`] could not read the sizes (#2123):
+    /// signed out, offline, throttled, or a sub-request Graph failed. Every
+    /// id asked; `error` is one line. Not a sync error.
+    FolderSizesFailed {
+        folder_ids: Vec<String>,
+        error: String,
+    },
     /// An inline image's bytes were fetched (from
     /// [`SyncCommand::FetchInlineImage`]); the UI caches them by `content_id`.
     InlineImageReady {
@@ -1457,6 +1480,12 @@ pub struct EngineOptions {
     /// (#2013; default 30 days back and 180 forward). Changing it makes
     /// the next pass run initial rounds over the new window.
     pub calendar_window: CalendarWindow,
+    /// Whether the engine reads, in idle time, the sizes of the stored
+    /// messages that have none (#2123, the size fill; default on): rows
+    /// stored before message sizes were, and any a delta link minted
+    /// before then brings. Off, a row's size comes only with its delta,
+    /// fetch or search hit.
+    pub size_fill: bool,
 }
 
 impl Default for EngineOptions {
@@ -1467,6 +1496,7 @@ impl Default for EngineOptions {
             prefetch_body_days: PREFETCH_BODY_DAYS,
             calendar_range_fresh_for: CALENDAR_RANGE_FRESH_FOR,
             calendar_window: CalendarWindow::default(),
+            size_fill: true,
         }
     }
 }
@@ -1477,10 +1507,14 @@ impl EngineOptions {
     /// engine tests from before them run with. Their fixtures are dated
     /// (some inside any recent window, some relative to now), so with the
     /// default on, what they assert would change with the day they run.
-    /// The #1978 tests turn bodies on with now-relative dates.
+    /// The #1978 tests turn bodies on with now-relative dates. The size
+    /// fill (#2123) is off too: their fake servers send no sizes and know
+    /// no size listing, so it would add requests they do not expect; the
+    /// #2123 tests turn it on.
     fn without_prefetch() -> Self {
         EngineOptions {
             prefetch_body_days: 0,
+            size_fill: false,
             ..Default::default()
         }
     }
@@ -1624,6 +1658,8 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         body_skip: HashSet::new(),
         body_parked: false,
         contact_rereads_paused: false,
+        size_fill: None,
+        size_parked: Vec::new(),
     };
     engine.startup();
     engine.main_loop();
@@ -1767,7 +1803,34 @@ struct Engine {
     /// `settle_contact_rereads` tries no more until the next drain, which
     /// clears it.
     contact_rereads_paused: bool,
+    /// The size fill in progress (#2123), one listing page per idle step:
+    /// its folder, the candidates taken at its start and the page to read
+    /// next. In memory only: a restart starts the folder over (rows filled
+    /// already are no longer candidates). Dropped on sign-out and sign-in.
+    size_fill: Option<SizeFill>,
+    /// Folders the size fill stopped until the next sync pass (#2123): a
+    /// 5xx, a store failure, a folder with no candidate after all (its
+    /// unsized rows all wait on a queued op) or one being deleted or
+    /// emptied. One try a pass, never a loop.
+    size_parked: Vec<String>,
 }
+
+/// One folder's size fill (#2123, `Engine::size_fill_step`).
+struct SizeFill {
+    folder: String,
+    /// `Store::size_fill_candidates` at the fill's start: what is marked
+    /// asked at its end (`Store::mark_size_asked`).
+    candidates: Vec<String>,
+    /// The page to GET next: `GraphClient::message_sizes_target`, then
+    /// each `@odata.nextLink`.
+    target: String,
+}
+
+/// How many folders one `$batch` of [`SyncCommand::FetchFolderSizes`] asks
+/// about (#2123): Exchange's 4 concurrent requests per app per mailbox,
+/// against which Graph evaluates every sub-request, so a larger batch of
+/// GETs to one mailbox comes back with `MailboxConcurrency` 429s.
+pub const FOLDER_SIZE_BATCH: usize = 4;
 
 impl Engine {
     // --- Startup & main loop --------------------------------------------
@@ -1841,7 +1904,12 @@ impl Engine {
             } else {
                 None
             };
-            let wait = if prefetch.is_some() || backfill.is_some() {
+            let size_fill = if prefetch.is_none() && backfill.is_none() {
+                self.next_size_fill()
+            } else {
+                None
+            };
+            let wait = if prefetch.is_some() || backfill.is_some() || size_fill.is_some() {
                 Duration::ZERO
             } else {
                 self.recv_timeout()
@@ -1853,9 +1921,10 @@ impl Engine {
                     // Without a fast tick the wait restarts on every command.
                     self.next_tick = Instant::now() + self.config.tick;
                 }
-                Err(RecvTimeoutError::Timeout) => match (prefetch, backfill) {
-                    (Some((since, ids)), _) if !self.due() => self.prefetch_step(&since, &ids),
-                    (None, Some(h)) if !self.due() => self.backfill_step(h),
+                Err(RecvTimeoutError::Timeout) => match (prefetch, backfill, size_fill) {
+                    (Some((since, ids)), _, _) if !self.due() => self.prefetch_step(&since, &ids),
+                    (None, Some(h), _) if !self.due() => self.backfill_step(h),
+                    (None, None, Some(f)) if !self.due() => self.size_fill_step(f),
                     _ => self.on_timer(),
                 },
                 // The UI dropped its `SyncHandle`: no one is listening anymore.
@@ -1897,6 +1966,11 @@ impl Engine {
                 }
                 Ok(SyncCommand::FetchMessage { id }) => {
                     if self.fetch_message(&id) {
+                        carry_on = false;
+                    }
+                }
+                Ok(SyncCommand::FetchFolderSizes { folder_ids }) => {
+                    if self.fetch_folder_sizes(folder_ids) {
                         carry_on = false;
                     }
                 }
@@ -2187,6 +2261,9 @@ impl Engine {
             SyncCommand::FetchMessage { id } => {
                 self.fetch_message(&id);
             }
+            SyncCommand::FetchFolderSizes { folder_ids } => {
+                self.fetch_folder_sizes(folder_ids);
+            }
             SyncCommand::FetchAttachments { message_id } => self.fetch_attachments(&message_id),
             SyncCommand::SaveAttachment {
                 message_id,
@@ -2425,6 +2502,7 @@ impl Engine {
         self.parked.clear();
         self.expired.clear();
         self.body_parked = false;
+        self.size_parked.clear();
 
         if !self.sync_folders(full) {
             return;
@@ -3308,6 +3386,147 @@ impl Engine {
             .ok()?
             .into_iter()
             .find(|h| !self.parked.contains(&h.folder_id))
+    }
+
+    /// The folder whose size fill page runs next (#2123), if one may run
+    /// now: the fill is on (`EngineOptions::size_fill`), signed in,
+    /// outside a back-off, after a folder list succeeded (`backfill_done`);
+    /// the fill in progress, else the first folder in `Store::folders`
+    /// order holding a row it may ask about (`Store::size_fill_folders`,
+    /// a probe of `idx_messages_unsized` that costs nothing once every row
+    /// is sized) and not parked. The main loop asks only when neither the
+    /// prefetch nor the backfill has work, so both go first. A store error
+    /// stops the fill until the next step reads it again.
+    fn next_size_fill(&self) -> Option<String> {
+        if !self.config.options.size_fill
+            || self.token.is_none()
+            || !self.backfill_done
+            || self.next_retry.is_some_and(|t| Instant::now() < t)
+        {
+            return None;
+        }
+        if let Some(fill) = &self.size_fill {
+            return Some(fill.folder.clone());
+        }
+        self.store
+            .size_fill_folders()
+            .ok()?
+            .into_iter()
+            .find(|f| !self.size_parked.contains(f))
+    }
+
+    /// Stops the size fill of `folder_id` until the next pass (#2123).
+    fn park_size_fill(&mut self, folder_id: &str) {
+        if !self.size_parked.iter().any(|f| f == folder_id) {
+            self.size_parked.push(folder_id.to_string());
+        }
+    }
+
+    /// Forgets the size fill in progress and its parked folders (#2123): on
+    /// sign-out and sign-in, so another account's links are never read.
+    fn drop_size_fill(&mut self) {
+        self.size_fill = None;
+        self.size_parked.clear();
+    }
+
+    /// One page of `folder_id`'s size fill (#2123). A fill starts by
+    /// taking its candidates (`Store::size_fill_candidates`: none, or a
+    /// folder being deleted or emptied, parks it with no request) and
+    /// lists the folder from the oldest one's `received_at`
+    /// (`GraphClient::message_sizes_target`). Each page's sizes are
+    /// written (`Store::set_message_sizes`: the size only, on a row without
+    /// one), with `MessagesUpdated` when a row changed; the last page marks
+    /// the candidates still unsized asked (`Store::mark_size_asked`), so
+    /// none is asked twice. Auth, throttle and transport go through `react`
+    /// and the page is asked again after; a 5xx or a store failure parks
+    /// the folder until the next pass and the fill starts over then; any
+    /// other failure (a 404 folder, a refused `$filter` or `$expand`, a
+    /// parse error) gives up on the candidates (marked asked) with one
+    /// `Error`. No `SyncState`, no `FolderProgress`.
+    fn size_fill_step(&mut self, folder_id: String) {
+        let fill = match self.size_fill.take() {
+            Some(fill) if fill.folder == folder_id => fill,
+            _ => {
+                if self.store.folder_being_deleted(&folder_id).unwrap_or(true)
+                    || self.store.folder_being_emptied(&folder_id).unwrap_or(true)
+                {
+                    self.park_size_fill(&folder_id);
+                    return;
+                }
+                match self.store.size_fill_candidates(&folder_id) {
+                    Ok(Some((candidates, since))) => SizeFill {
+                        target: GraphClient::message_sizes_target(&folder_id, &since),
+                        folder: folder_id,
+                        candidates,
+                    },
+                    Ok(None) => {
+                        self.park_size_fill(&folder_id);
+                        return;
+                    }
+                    Err(e) => {
+                        self.size_fill_store_error(&folder_id, e);
+                        return;
+                    }
+                }
+            }
+        };
+        let (items, next) = match self.with_auth(|c| c.message_sizes_page(&fill.target)) {
+            Ok(page) => page,
+            Err(
+                e @ (GraphError::Unauthorized
+                | GraphError::Throttled { .. }
+                | GraphError::Transport(_)),
+            ) => {
+                // Kept for after the wait; a sign-in drops it.
+                self.size_fill = Some(fill);
+                self.react(e);
+                return;
+            }
+            Err(GraphError::Http { status, .. }) if status >= 500 => {
+                self.park_size_fill(&fill.folder);
+                return;
+            }
+            Err(e) => {
+                let _ = self.store.mark_size_asked(&fill.folder, &fill.candidates);
+                self.emit(SyncEvent::Error(format!(
+                    "mail sync: cannot read the message sizes of folder {}: {e}",
+                    self.folder_label(&fill.folder)
+                )));
+                return;
+            }
+        };
+        let sizes: Vec<(String, i64)> = items
+            .into_iter()
+            .filter_map(|(id, size)| size.map(|n| (id, n)))
+            .collect();
+        match self.store.set_message_sizes(&sizes) {
+            Ok(0) => {}
+            Ok(_) => self.emit(SyncEvent::MessagesUpdated {
+                folder_id: fill.folder.clone(),
+            }),
+            Err(e) => {
+                self.size_fill_store_error(&fill.folder, e);
+                return;
+            }
+        }
+        match next {
+            Some(target) => self.size_fill = Some(SizeFill { target, ..fill }),
+            None => {
+                if let Err(e) = self.store.mark_size_asked(&fill.folder, &fill.candidates) {
+                    self.size_fill_store_error(&fill.folder, e);
+                }
+            }
+        }
+    }
+
+    /// Reports a store failure of a size fill step and parks the folder
+    /// (#2123), so it is not tried again before the next pass.
+    fn size_fill_store_error(&mut self, folder_id: &str, e: StoreError) {
+        self.emit(SyncEvent::Error(format!(
+            "mail sync: cannot record the message sizes of folder {}: {e}",
+            self.folder_label(folder_id)
+        )));
+        self.park_size_fill(folder_id);
     }
 
     /// Parks `folder_id`'s backfill until the next pass. A reconverge whose
@@ -5502,6 +5721,89 @@ impl Engine {
         }
     }
 
+    /// Serves [`SyncCommand::FetchFolderSizes`] (#2123): each id through
+    /// `Store::current_folder_id`; a `local:` folder, and one being deleted
+    /// (#2107) or emptied (#2110), answers `None` with no request (as
+    /// `search_messages` treats them); the rest are asked
+    /// [`FOLDER_SIZE_BATCH`] a `$batch`. A 2xx sub-response reads
+    /// `model::parse_folder_size`, a 404 is `None`. A sub-response 429, or
+    /// a 503 with a `Retry-After`, fails the command and backs off
+    /// (`react_quietly` of `Throttled`); any other sub-status fails it
+    /// alone; a whole-call failure fails it, and auth, throttle and
+    /// transport go through `react_quietly`. No retry loop, nothing
+    /// stored, never a `SyncEvent::Error`. Returns `react_quietly`'s answer,
+    /// for `checkpoint`.
+    fn fetch_folder_sizes(&mut self, folder_ids: Vec<String>) -> bool {
+        if self.token.is_none() {
+            self.emit(SyncEvent::FolderSizesFailed {
+                folder_ids,
+                error: "not signed in".to_string(),
+            });
+            return false;
+        }
+        let mut sizes: Vec<Option<i64>> = vec![None; folder_ids.len()];
+        let mut ask: Vec<(usize, String)> = Vec::new();
+        for (i, id) in folder_ids.iter().enumerate() {
+            let id = self
+                .store
+                .current_folder_id(id)
+                .unwrap_or_else(|_| id.clone());
+            if id.starts_with("local:")
+                || self.store.folder_being_deleted(&id).unwrap_or(false)
+                || self.store.folder_being_emptied(&id).unwrap_or(false)
+            {
+                continue;
+            }
+            ask.push((i, id));
+        }
+        for chunk in ask.chunks(FOLDER_SIZE_BATCH) {
+            let reqs: Vec<BatchRequest> = chunk
+                .iter()
+                .map(|(_, id)| GraphClient::folder_size_request(id))
+                .collect();
+            let answers = match self.with_auth(|c| c.batch(&reqs)) {
+                Ok(a) => a,
+                Err(e) => {
+                    self.emit(SyncEvent::FolderSizesFailed {
+                        folder_ids,
+                        error: e.to_string(),
+                    });
+                    return self.react_quietly(e);
+                }
+            };
+            for ((i, _), answer) in chunk.iter().zip(answers) {
+                let failure = match answer.status {
+                    200..=299 => {
+                        sizes[*i] = crate::json::parse(&answer.body)
+                            .ok()
+                            .and_then(|v| parse_folder_size(&v));
+                        continue;
+                    }
+                    404 => continue,
+                    429 => GraphError::Throttled {
+                        retry_after_secs: answer.retry_after_secs.unwrap_or(30),
+                    },
+                    503 if answer.retry_after_secs.is_some() => GraphError::Throttled {
+                        retry_after_secs: answer.retry_after_secs.unwrap_or(30),
+                    },
+                    status => GraphError::Http {
+                        status,
+                        body: answer.body,
+                    },
+                };
+                self.emit(SyncEvent::FolderSizesFailed {
+                    folder_ids,
+                    error: failure.to_string(),
+                });
+                return self.react_quietly(failure);
+            }
+        }
+        self.emit(SyncEvent::FolderSizesFetched {
+            sizes: folder_ids.into_iter().zip(sizes).collect(),
+        });
+        false
+    }
+
     /// Emits `MessageFetchFailed` for `id`.
     fn fetch_message_failed(&self, id: &str, reason: impl Into<String>) {
         self.emit(SyncEvent::MessageFetchFailed {
@@ -6960,6 +7262,7 @@ impl Engine {
                     self.note_storage(storage);
                 }
                 self.token = Some(t);
+                self.drop_size_fill();
                 self.announce_scopes();
                 self.clear_backoff();
                 // Emit an explicit past-sign-in signal BEFORE the first sync
@@ -7029,6 +7332,7 @@ impl Engine {
     /// The announced grant is forgotten, so the next session announces it.
     fn enter_signin(&mut self) {
         self.token = None;
+        self.drop_size_fill();
         self.announced_scopes = None;
         self.masters_not_found.clear();
         self.masters_skipped.clear();
@@ -7900,6 +8204,7 @@ mod tests {
                             flag_due_at: String::new(),
                             internet_message_id: String::new(),
                             in_reply_to: String::new(),
+                            size: None,
                         },
                         &crate::graph::model::MessageFields::default(),
                     )
@@ -21263,6 +21568,7 @@ mod tests {
                 flag_due_at: String::new(),
                 internet_message_id: String::new(),
                 in_reply_to: String::new(),
+                size: None,
             },
         )
         .unwrap();
@@ -23042,6 +23348,7 @@ mod tests {
                     flag_due_at: String::new(),
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
+                    size: None,
                 },
             )
             .unwrap();
@@ -23767,6 +24074,7 @@ mod tests {
                     flag_due_at: String::new(),
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
+                    size: None,
                 },
             )
             .unwrap();

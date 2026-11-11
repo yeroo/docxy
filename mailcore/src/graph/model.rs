@@ -293,6 +293,11 @@ pub struct Message {
     /// it (not trimmed): see [`parse_in_reply_to`]. `""` when absent or not
     /// a string, and on anything that is no reply.
     pub in_reply_to: String,
+    /// The message's size in bytes (#2123): `PidTagMessageSize`
+    /// ([`MESSAGE_SIZE_PROP`], which the delta's `$expand` brings): see
+    /// [`parse_message_size`]. `None` when absent or unreadable; a stored
+    /// size is never cleared by a merge (`Store::merge_message`).
+    pub size: Option<i64>,
 }
 
 impl Message {
@@ -302,6 +307,7 @@ impl Message {
         let (_, protection) = parse_message_protection(v);
         let (_, meeting_reminder_on) = parse_meeting_reminder(v);
         let (_, in_reply_to) = parse_in_reply_to(v);
+        let size = parse_message_size(v);
         Some(Message {
             id: str_field(v, "id"),
             conversation_id: str_field(v, "conversationId"),
@@ -335,6 +341,7 @@ impl Message {
             meeting_reminder_on,
             internet_message_id: str_field(v, "internetMessageId"),
             in_reply_to,
+            size,
         })
     }
 }
@@ -372,6 +379,59 @@ pub fn parse_in_reply_to(v: &Value) -> (bool, String) {
             p.get("value").and_then(Value::as_str)
         })
         .map_or((false, String::new()), |s| (true, s.to_string()))
+}
+
+/// `PidTagMessageSize` (property tag `0x0E08`, PT_LONG) as a Graph extended
+/// property id (#2123): a message's size in bytes, what classic Outlook's
+/// Folder Size dialog sums.
+pub const MESSAGE_SIZE_PROP: &str = "Integer 0x0E08";
+
+/// `PidTagMessageSizeExtended` (property tag `0x0E08`, PT_I8) as a Graph
+/// extended property id (#2123): on a mail folder, the size of the items it
+/// holds, without its subfolders.
+pub const FOLDER_SIZE_PROP: &str = "Long 0x0E08";
+
+/// Whether `id` names [`MESSAGE_SIZE_PROP`] (#2123): `Integer ` (any case)
+/// and a hex tag equal to `0x0E08`, so `Integer 0xe08` matches; `Long
+/// 0x0E08` (the folder's) does not.
+pub fn is_message_size_prop(id: &str) -> bool {
+    is_tag_prop(id, "Integer", 0x0E08)
+}
+
+/// Whether `id` names [`FOLDER_SIZE_PROP`] (#2123): `Long ` (any case) and a
+/// hex tag equal to `0x0E08`.
+pub fn is_folder_size_prop(id: &str) -> bool {
+    is_tag_prop(id, "Long", 0x0E08)
+}
+
+/// The value of the first `singleValueExtendedProperties` entry of `v` whose
+/// id `is_prop` accepts, read as a non-negative integer: a JSON integer or a
+/// string holding one (Graph sends extended values as strings). No array, no
+/// such entry or any other value is `None`, never an error.
+fn size_prop(v: &Value, is_prop: fn(&str) -> bool) -> Option<i64> {
+    let prop = v
+        .get("singleValueExtendedProperties")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|p| p.get("id").and_then(Value::as_str).is_some_and(is_prop))?;
+    let n = match prop.get("value")? {
+        Value::Num(n) if n.fract() == 0.0 && *n >= 0.0 && *n <= i64::MAX as f64 => *n as i64,
+        Value::Str(s) => s.trim().parse::<i64>().ok()?,
+        _ => return None,
+    };
+    (n >= 0).then_some(n)
+}
+
+/// A message's size (#2123): its [`MESSAGE_SIZE_PROP`] entry as a
+/// non-negative integer (string or number), else `None`.
+pub fn parse_message_size(v: &Value) -> Option<i64> {
+    size_prop(v, is_message_size_prop)
+}
+
+/// A mail folder's own size (#2123): its [`FOLDER_SIZE_PROP`] entry as a
+/// non-negative integer (string or number), else `None`.
+pub fn parse_folder_size(v: &Value) -> Option<i64> {
+    size_prop(v, is_folder_size_prop)
 }
 
 /// `PidTagMessageClass` (property tag `0x001A`, PT_UNICODE) as a Graph
@@ -4640,6 +4700,108 @@ mod tests {
         );
         let m = Message::from_json(&delta_item(None, Some(&props))).unwrap();
         assert!(m.meeting_reminder_on && !m.is_reminder_on);
+    }
+
+    /// #2123: the message size is `Integer 0x0E08` in any case and tag
+    /// form; the folder's `Long 0x0E08` is not it, and the reverse.
+    #[test]
+    fn message_size_prop_id_matches_its_forms_only() {
+        for id in [
+            MESSAGE_SIZE_PROP,
+            "Integer 0xe08",
+            "integer 0x0E08",
+            "INTEGER 0X00000E08",
+        ] {
+            assert!(is_message_size_prop(id), "{id:?}");
+            assert!(!is_folder_size_prop(id), "{id:?}");
+        }
+        for id in [FOLDER_SIZE_PROP, "long 0xe08", "LONG 0X0E08"] {
+            assert!(is_folder_size_prop(id), "{id:?}");
+            assert!(!is_message_size_prop(id), "{id:?}");
+        }
+        for id in [
+            "Integer 0x0E09",
+            "Integer 0E08",
+            "Integer0x0E08",
+            "String 0x0E08",
+            "Integer {00062008-0000-0000-C000-000000000046} Id 0x0E08",
+            "",
+        ] {
+            assert!(!is_message_size_prop(id), "{id:?}");
+            assert!(!is_folder_size_prop(id), "{id:?}");
+        }
+    }
+
+    /// #2123: a size reads from a string (as Graph sends extended values)
+    /// or a JSON integer; anything else is `None`, never an error.
+    #[test]
+    fn message_reads_its_size() {
+        let size = |json: &str| Message::from_json(&parse(json).unwrap()).unwrap().size;
+        assert_eq!(
+            size(
+                r#"{"id":"A","singleValueExtendedProperties":[
+                {"id":"String 0x001A","value":"IPM.Note"},
+                {"id":"Integer 0x0E08","value":"18432"}]}"#
+            ),
+            Some(18432)
+        );
+        assert_eq!(
+            size(
+                r#"{"id":"A","singleValueExtendedProperties":[
+                {"id":"Integer 0xe08","value":" 7 "}]}"#
+            ),
+            Some(7)
+        );
+        assert_eq!(
+            size(
+                r#"{"id":"A","singleValueExtendedProperties":[
+                {"id":"Integer 0x0E08","value":0}]}"#
+            ),
+            Some(0)
+        );
+        for json in [
+            r#"{"id":"A"}"#,
+            r#"{"id":"A","singleValueExtendedProperties":[]}"#,
+            r#"{"id":"A","singleValueExtendedProperties":{"id":"Integer 0x0E08","value":"5"}}"#,
+            r#"{"id":"A","singleValueExtendedProperties":[{"id":"Integer 0x0E08","value":"x"}]}"#,
+            r#"{"id":"A","singleValueExtendedProperties":[{"id":"Integer 0x0E08","value":"-5"}]}"#,
+            r#"{"id":"A","singleValueExtendedProperties":[{"id":"Integer 0x0E08","value":-5}]}"#,
+            r#"{"id":"A","singleValueExtendedProperties":[{"id":"Integer 0x0E08","value":1.5}]}"#,
+            r#"{"id":"A","singleValueExtendedProperties":[{"id":"Integer 0x0E08","value":null}]}"#,
+            r#"{"id":"A","singleValueExtendedProperties":[{"id":"Integer 0x0E08"}]}"#,
+            r#"{"id":"A","singleValueExtendedProperties":[{"id":"Long 0x0E08","value":"5"}]}"#,
+        ] {
+            assert_eq!(size(json), None, "{json}");
+        }
+    }
+
+    /// #2123: a folder's own size is its `Long 0x0E08`, string or number;
+    /// a message's `Integer 0x0E08` is not it.
+    #[test]
+    fn folder_size_reads_long_0x0e08() {
+        let size = |json: &str| parse_folder_size(&parse(json).unwrap());
+        assert_eq!(
+            size(
+                r#"{"id":"F","singleValueExtendedProperties":[
+                {"id":"Long 0xe08","value":"5368709120"}]}"#
+            ),
+            Some(5_368_709_120)
+        );
+        assert_eq!(
+            size(
+                r#"{"id":"F","singleValueExtendedProperties":[
+                {"id":"Long 0x0E08","value":12}]}"#
+            ),
+            Some(12)
+        );
+        for json in [
+            r#"{"id":"F"}"#,
+            r#"{"id":"F","singleValueExtendedProperties":[{"id":"Integer 0x0E08","value":"5"}]}"#,
+            r#"{"id":"F","singleValueExtendedProperties":[{"id":"Long 0x0E08","value":"-1"}]}"#,
+            r#"{"id":"F","singleValueExtendedProperties":[{"id":"Long 0x0E08","value":true}]}"#,
+        ] {
+            assert_eq!(size(json), None, "{json}");
+        }
     }
 
     #[test]

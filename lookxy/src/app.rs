@@ -718,10 +718,13 @@ impl App {
                     v.loading = false;
                 }
             }
-            // lookxy never sends `SearchMessages`/`FetchMessage` (#2006).
+            // lookxy never sends `SearchMessages`/`FetchMessage` (#2006)
+            // or `FetchFolderSizes` (#2123).
             SyncEvent::MessageSearchResults { .. }
             | SyncEvent::MessageSearchFailed { .. }
-            | SyncEvent::MessageFetchFailed { .. } => {}
+            | SyncEvent::MessageFetchFailed { .. }
+            | SyncEvent::FolderSizesFetched { .. }
+            | SyncEvent::FolderSizesFailed { .. } => {}
             SyncEvent::Error(msg) => {
                 // A fetch failure while the OOF form / free-busy overlay is open
                 // must clear its loading state so it isn't stuck on "loading…".
@@ -3911,6 +3914,7 @@ impl App {
                     flag_due_at: String::new(),
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
+                    size: None,
                 },
             )
             .expect("seed message");
@@ -4321,6 +4325,7 @@ pub(crate) mod tests {
                     flag_due_at: String::new(),
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
+                    size: None,
                 },
             )
             .expect("seed invite");
@@ -4748,6 +4753,7 @@ pub(crate) mod tests {
                     flag_due_at: String::new(),
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
+                    size: None,
                 },
             )
             .unwrap();
@@ -4990,6 +4996,7 @@ pub(crate) mod tests {
                     flag_due_at: String::new(),
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
+                    size: None,
                 },
             )
             .expect("seed m2");
@@ -5030,6 +5037,7 @@ pub(crate) mod tests {
                     flag_due_at: String::new(),
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
+                    size: None,
                 },
             )
             .expect("seed m3");
@@ -5725,6 +5733,7 @@ pub(crate) mod tests {
                     flag_due_at: String::new(),
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
+                    size: None,
                 },
             )
             .expect("update message to has_attachments=true");
@@ -5770,6 +5779,7 @@ pub(crate) mod tests {
                     flag_due_at: String::new(),
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
+                    size: None,
                 },
             )
             .expect("seed message");
@@ -6833,6 +6843,7 @@ pub(crate) mod tests {
                     flag_due_at: String::new(),
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
+                    size: None,
                 },
             )
             .expect("mark m1 has_attachments");
@@ -6868,6 +6879,7 @@ pub(crate) mod tests {
                     flag_due_at: String::new(),
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
+                    size: None,
                 },
             )
             .expect("mark m2 has_attachments");
@@ -7028,6 +7040,7 @@ pub(crate) mod tests {
                     flag_due_at: String::new(),
                     internet_message_id: "<d1@x>".into(),
                     in_reply_to: "<m1@x>".into(),
+                    size: None,
                 },
             )
             .unwrap();
@@ -7217,6 +7230,7 @@ pub(crate) mod tests {
             flag_due_at: String::new(),
             internet_message_id: String::new(),
             in_reply_to: String::new(),
+            size: None,
         };
         app.store
             .upsert_message("inbox", &a("a1", "2026-07-17T10:00:00Z"))

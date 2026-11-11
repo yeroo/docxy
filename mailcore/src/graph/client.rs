@@ -13,7 +13,7 @@ use crate::graph::model::{
     EventDeltaItem, EventDeltaPage, EventRecurrence, FolderContact, FolderListing, MailFolder,
     MasterCategory, Me, MeetingMessage, Message, MessageFields, MessageHeader, OofStatus, Person,
     PhysicalAddress, REMINDER_SET_PROP, REMINDER_SIGNAL_TIME_PROP, Recipient, Recurrence,
-    ScheduleEntry, SearchHit, SubtreeItems, plain_to_html, to_utc,
+    ScheduleEntry, SearchHit, SubtreeItems, parse_message_size, plain_to_html, to_utc,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -683,16 +683,16 @@ receivedDateTime,sentDateTime,isRead,flag,hasAttachments,importance,bodyPreview,
 internetMessageId,isDraft";
 
 /// The `$expand` that brings a message's Outlook reminder (#2054), its
-/// message class (#2081), its protection (#2088) and its In-Reply-To
-/// (#2096): the three
+/// message class (#2081), its protection (#2088), its In-Reply-To
+/// (#2096) and its size (#2123): the three
 /// PSETID_Common named properties `Message::from_json` reads
 /// (`PidLidReminderSet`, `PidLidReminderTime`, `PidLidReminderSignalTime`,
 /// the `REMINDER_*_PROP` ids), `PidTagMessageClass` (`MESSAGE_CLASS_PROP`),
 /// from which a meeting message's type is read, and `PidTagSensitivity`,
 /// the `msip_labels` header and `PidNameContentClass`
 /// (`SENSITIVITY_PROP`, `MSIP_LABELS_PROP`, `CONTENT_CLASS_PROP`), and
-/// `PidTagInReplyToId` (`IN_REPLY_TO_PROP`), filtered
-/// so nothing else comes. Quotes and braces are percent-encoded, so the URL
+/// `PidTagInReplyToId` (`IN_REPLY_TO_PROP`) and `PidTagMessageSize`
+/// (`MESSAGE_SIZE_PROP`), filtered so nothing else comes. Quotes and braces are percent-encoded, so the URL
 /// goes out as written here. One expand: a 400 on any term sends the call
 /// again without all of them.
 const MESSAGE_EXPAND: &str = "singleValueExtendedProperties($filter=\
@@ -703,10 +703,11 @@ id%20eq%20%27String%200x001A%27%20or%20\
 id%20eq%20%27Integer%200x0036%27%20or%20\
 id%20eq%20%27String%20%7B00020386-0000-0000-C000-000000000046%7D%20Name%20msip_labels%27%20or%20\
 id%20eq%20%27String%20%7B00020386-0000-0000-C000-000000000046%7D%20Name%20Content-Class%27%20or%20\
-id%20eq%20%27String%200x1042%27)";
+id%20eq%20%27String%200x1042%27%20or%20\
+id%20eq%20%27Integer%200x0E08%27)";
 
-/// `target` with the reminder, class, protection and In-Reply-To
-/// `$expand` (#2054, #2081, #2088, #2096) appended.
+/// `target` with the reminder, class, protection, In-Reply-To and size
+/// `$expand` (#2054, #2081, #2088, #2096, #2123) appended.
 fn with_expand(target: &str) -> String {
     format!("{target}&$expand={MESSAGE_EXPAND}")
 }
@@ -716,6 +717,22 @@ pub const BATCH_MAX: usize = 20;
 
 /// The page size of [`GraphClient::unread_message_ids`] (#1913).
 const UNREAD_IDS_TOP: usize = 1000;
+
+/// The page size of the size fill's listing (#2123,
+/// [`GraphClient::message_sizes_target`]): Graph's most for messages.
+/// Graph may answer fewer; the fill follows `@odata.nextLink` and never
+/// assumes a full page.
+const SIZE_FILL_TOP: usize = 1000;
+
+/// The `$expand` of the size fill's listing (#2123): `PidTagMessageSize`
+/// alone (`MESSAGE_SIZE_PROP`), percent-encoded as `MESSAGE_EXPAND` is.
+const MESSAGE_SIZE_EXPAND: &str =
+    "singleValueExtendedProperties($filter=id%20eq%20%27Integer%200x0E08%27)";
+
+/// The `$expand` of [`GraphClient::folder_size_request`] (#2123):
+/// `PidTagMessageSizeExtended` alone (`FOLDER_SIZE_PROP`).
+const FOLDER_SIZE_EXPAND: &str =
+    "singleValueExtendedProperties($filter=id%20eq%20%27Long%200x0E08%27)";
 
 /// One sub-request of a [`GraphClient::batch`] (#1913). `url` is relative
 /// to the API version (`/me/messages/{id}`); `body` is its JSON body.
@@ -1410,6 +1427,62 @@ impl GraphClient {
                 Value::Bool(true),
             )])),
         }
+    }
+
+    /// GET a mail folder's own size (#2123) as a [`GraphClient::batch`]
+    /// sub-request: `/me/mailFolders/{id}?$select=id&$expand=` its
+    /// `PidTagMessageSizeExtended` (`FOLDER_SIZE_PROP`), the id
+    /// percent-encoded. `model::parse_folder_size` reads the answer.
+    pub fn folder_size_request(id: &str) -> BatchRequest {
+        BatchRequest {
+            method: "GET",
+            url: format!(
+                "/me/mailFolders/{}?$select=id&$expand={FOLDER_SIZE_EXPAND}",
+                encode_path_segment(id)
+            ),
+            headers: Vec::new(),
+            body: None,
+        }
+    }
+
+    /// The first page of the size fill's listing of `folder_id` (#2123):
+    /// the messages received at or after `since` (an ISO-8601 UTC instant,
+    /// the oldest candidate's), their `id` and `PidTagMessageSize` alone,
+    /// [`SIZE_FILL_TOP`] a page. [`GraphClient::message_sizes_page`] reads
+    /// it and each `@odata.nextLink` after it.
+    pub fn message_sizes_target(folder_id: &str, since: &str) -> String {
+        format!(
+            "/me/mailFolders/{}/messages\
+             ?$filter=receivedDateTime%20ge%20{since}\
+             &$select=id&$top={SIZE_FILL_TOP}&$expand={MESSAGE_SIZE_EXPAND}",
+            encode_path_segment(folder_id)
+        )
+    }
+
+    /// One page of the size fill's listing (#2123): GET `target` (a
+    /// [`GraphClient::message_sizes_target`] or a `nextLink` Graph gave),
+    /// each item as `(id, size)` (`model::parse_message_size`: `None` when
+    /// it carries none or one that is unreadable), an item without an id
+    /// skipped, and the page's `@odata.nextLink`, `None` on the last page.
+    #[allow(clippy::type_complexity)]
+    pub fn message_sizes_page(
+        &self,
+        target: &str,
+    ) -> Result<(Vec<(String, Option<i64>)>, Option<String>), GraphError> {
+        let resp = self.send(Method::Get, target, None, &[])?;
+        let v = parse_body(resp)?;
+        let items = value_array(&v, "value")?
+            .iter()
+            .filter_map(|item| {
+                let id = item.get("id").and_then(Value::as_str)?;
+                (!id.is_empty()).then(|| (id.to_string(), parse_message_size(item)))
+            })
+            .collect();
+        let next = v
+            .get("@odata.nextLink")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Ok((items, next))
     }
 
     /// DELETE `/me/messages/{id}` as a [`GraphClient::batch`] sub-request
@@ -8732,11 +8805,11 @@ mod tests {
     fn message_expand_names_every_property() {
         // The `$filter` inside the expand, decoded, is exactly the three
         // reminder property ids, the message class id, the three
-        // protection ids (#2088) and the In-Reply-To id (#2096) the model
-        // reads.
+        // protection ids (#2088), the In-Reply-To id (#2096) and the size
+        // id (#2123) the model reads.
         use crate::graph::model::{
-            CONTENT_CLASS_PROP, IN_REPLY_TO_PROP, MESSAGE_CLASS_PROP, MSIP_LABELS_PROP,
-            REMINDER_TIME_PROP, SENSITIVITY_PROP,
+            CONTENT_CLASS_PROP, IN_REPLY_TO_PROP, MESSAGE_CLASS_PROP, MESSAGE_SIZE_PROP,
+            MSIP_LABELS_PROP, REMINDER_TIME_PROP, SENSITIVITY_PROP,
         };
         let decoded = MESSAGE_EXPAND
             .replace("%20", " ")
@@ -8750,7 +8823,7 @@ mod tests {
                  id eq '{REMINDER_TIME_PROP}' or id eq '{REMINDER_SIGNAL_TIME_PROP}' or \
                  id eq '{MESSAGE_CLASS_PROP}' or id eq '{SENSITIVITY_PROP}' or \
                  id eq '{MSIP_LABELS_PROP}' or id eq '{CONTENT_CLASS_PROP}' or \
-                 id eq '{IN_REPLY_TO_PROP}')"
+                 id eq '{IN_REPLY_TO_PROP}' or id eq '{MESSAGE_SIZE_PROP}')"
             )
         );
         assert!(!MESSAGE_EXPAND.contains(' '));
@@ -8821,6 +8894,124 @@ mod tests {
         assert!(
             path.ends_with(&format!("&$expand={MESSAGE_EXPAND}")),
             "{path}"
+        );
+    }
+
+    /// #2123: each delta item reads its own size from the expand (Graph's
+    /// short tag form, a string value); an item without the entry is `None`.
+    #[test]
+    fn delta_page_reads_each_message_size() {
+        let body = r#"{"value":[
+            {"id":"M1","subject":"s","singleValueExtendedProperties":[
+                {"id":"String 0x1a","value":"IPM.Note"},
+                {"id":"Integer 0xe08","value":"18432"}]},
+            {"id":"M2","subject":"s","singleValueExtendedProperties":[
+                {"id":"String 0x1a","value":"IPM.Note"}]},
+            {"id":"M3","subject":"s"}
+            ],"@odata.deltaLink":"http://x/d"}"#;
+        let srv = FakeServer::start(vec![get_route("/me/mailFolders/F1/", 200, body)]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let page = c.delta(DeltaCursor::Full("F1".to_string())).unwrap();
+        let got: Vec<_> = page
+            .items
+            .iter()
+            .map(|i| match i {
+                crate::graph::model::DeltaItem::Upsert(m, _) => (m.id.as_str(), m.size),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(got, [("M1", Some(18432)), ("M2", None), ("M3", None)]);
+        // The first call asked for the size.
+        assert!(
+            srv.requests()[0].path.contains("Integer%200x0E08"),
+            "{}",
+            srv.requests()[0].path
+        );
+    }
+
+    /// #2123: the size fill's listing reads ids and sizes only, from the
+    /// oldest candidate's date, 1000 a page, and follows the next link as
+    /// Graph gave it; an item without an id is skipped, one without a size
+    /// is `None`.
+    #[test]
+    fn message_sizes_pages_ids_and_sizes() {
+        let srv = FakeServer::start(vec![
+            // The second page's route first: both share the prefix.
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F%201/messages?$skiptoken=P2".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[{"id":"C","singleValueExtendedProperties":[
+                    {"id":"Integer 0xe08","value":7}]}]}"#
+                    .into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F%201/messages".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"value":[
+                    {"id":"A","singleValueExtendedProperties":[
+                        {"id":"Integer 0xe08","value":"100"}]},
+                    {"id":"B"},
+                    {"x":1}],
+                    "@odata.nextLink":"/me/mailFolders/F%201/messages?$skiptoken=P2"}"#
+                    .into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let first = GraphClient::message_sizes_target("F 1", "2026-01-02T03:04:05Z");
+        assert_eq!(
+            first,
+            "/me/mailFolders/F%201/messages\
+             ?$filter=receivedDateTime%20ge%202026-01-02T03:04:05Z\
+             &$select=id&$top=1000\
+             &$expand=singleValueExtendedProperties($filter=id%20eq%20%27Integer%200x0E08%27)"
+        );
+        let (items, next) = c.message_sizes_page(&first).unwrap();
+        assert_eq!(
+            items,
+            [("A".to_string(), Some(100)), ("B".to_string(), None)]
+        );
+        let next = next.unwrap();
+        assert_eq!(next, "/me/mailFolders/F%201/messages?$skiptoken=P2");
+        let (items, next) = c.message_sizes_page(&next).unwrap();
+        assert_eq!(items, [("C".to_string(), Some(7))]);
+        assert_eq!(next, None);
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].path, first);
+        assert_eq!(reqs[1].path, "/me/mailFolders/F%201/messages?$skiptoken=P2");
+    }
+
+    /// #2123: a folder's size is a GET of the folder with its
+    /// `PidTagMessageSizeExtended` alone, the id percent-encoded.
+    #[test]
+    fn folder_size_request_is_the_expanded_get() {
+        let r = GraphClient::folder_size_request("A/B+C=");
+        assert_eq!(r.method, "GET");
+        assert_eq!(
+            r.url,
+            "/me/mailFolders/A%2FB%2BC%3D?$select=id\
+             &$expand=singleValueExtendedProperties($filter=id%20eq%20%27Long%200x0E08%27)"
+        );
+        assert!(r.headers.is_empty() && r.body.is_none());
+        let decoded = FOLDER_SIZE_EXPAND.replace("%20", " ").replace("%27", "'");
+        assert_eq!(
+            decoded,
+            format!(
+                "singleValueExtendedProperties($filter=id eq '{}')",
+                crate::graph::model::FOLDER_SIZE_PROP
+            )
+        );
+        let decoded = MESSAGE_SIZE_EXPAND.replace("%20", " ").replace("%27", "'");
+        assert_eq!(
+            decoded,
+            format!(
+                "singleValueExtendedProperties($filter=id eq '{}')",
+                crate::graph::model::MESSAGE_SIZE_PROP
+            )
         );
     }
 
