@@ -3485,3 +3485,73 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `mail_moved_into_the_folder_while_the_empty_waits_is_left_alone`,
   `a_delete_of_the_folder_drops_its_queued_empty`,
   `empty_folder_of_an_unknown_folder_reports_and_queues_nothing`).
+
+## Copy a folder (#2118)
+
+- `SyncCommand::CopyFolder { id, dest }` copies a folder, with its subfolders and their mail,
+  under `dest` (`None`: the top, `msgfolderroot`), as Outlook's Copy Folder does. Graph:
+  `POST /me/mailFolders/{id}/copy` with `{"destinationId"}` (`GraphClient::copy_folder`, the
+  body shared with `move_folder` as `destination_body`; an answer without an id is `Parse`).
+  It is built from #1910's create (a `local:` row re-keyed on the answer) and move pieces.
+- Store (`Store::copy_folder(source, dest)`, one IMMEDIATE transaction): a new `local:` row
+  under `dest` (or the listed root, as `create_local_folder` stores a top folder), with the
+  source's name and counts, no mail, no subfolders, no `well_known_name`; then
+  `OutboxOp::CopyFolder { id, source, dest }` (kind `copyFolder`). The store never copies mail
+  rows: Graph copies them under new ids. Refused, nothing written (`FolderWriteFailed { write:
+  Copy, status: None }` + `Error`): an unknown source or dest, the drafts sentinel as either.
+  Nothing else: a dest that is the source or under it makes no cycle (the copy is a new row),
+  and Graph decides; a copy beside the original is a real request too (never `Unchanged`).
+- The `local:` copy is a local creation wherever the store special-cases `CreateFolder`:
+  `refused_creates_on` counts it as created under its `dest`, so a copy queued into a refused
+  or deleted `local:` folder goes with it; `discard_local_folder` and `drop_folder_ops_on` drop
+  its op; `queued_op_ids_on` names its id, source and dest. Such a discarded copy is reported as
+  a copy of its source (`LocalFolderDiscard::discarded_copies`, `FolderDelete::discarded_copies`,
+  `(copy id, source)`): "its destination folder could not be created" after a refused create
+  or copy, "its destination folder was deleted" after a delete. A copy whose *source* never
+  reaches Graph (its create refused, a `local:` source deleted) is not discarded up front: its
+  op is refused when sent (`Parse`, "source folder never reached Graph"), the path a move into
+  a refused folder takes.
+- The op (`sync/outbox.rs` `copy_folder`): the copy row gone, or its id already re-keyed (a
+  retry), sends nothing. `source` and `dest` are resolved at send time; either still `local:`
+  is `Parse`. The source row is not required: a `DeleteFolder` of the source queued after the
+  copy removes the row at once, and Graph keeps the folder until that delete runs, after the
+  copy. Then `reconcile_created_folder` re-keys the copy (its parent and counts come with the
+  listing) and the drain gets `Applied::FolderCreated`, as for a create:
+  `SyncEvent::FolderCreated { local_id, id }` and `FoldersUpdated`, the same meaning for a host
+  ("the folder you saw as `local_id` is `id` now"). No `FolderCopied` event.
+- A copy is a snapshot of Graph, so `drain_outbox` sends it only once no older op is queued
+  (`has_older_op`, as a `DeleteFolder` or `EmptyFolder`; skipping is no deferral). Without it, a
+  copy queued after an `EmptyFolder` waiting behind a move refused once (a 4xx the drain passes)
+  would copy the mail the user had emptied.
+- After the drain: a copy that reached Graph sets `relist_after_drain`, and after that one
+  listing (which brings the copy's subfolders) `sync_copied_folders` runs `refresh_folder`
+  (delta, then counts) for the copy and every stored folder under it, each id resolved then
+  (a later op may have re-keyed it), a row gone skipped. A stop there is `Drain::Aborted`; the
+  copy has no delta link, so the next pass syncs it anyway.
+- A Graph refusal (any 4xx, `Parse`; final at once, as #1910's folder writes) drops the op and
+  removes the copy with `discard_local_folder` (what was created or copied under it, drafts
+  filed back in Drafts, a mail reconverge for mail moved into it), reported as
+  `FolderWriteFailed { id: <source>, write: Copy, status }` + `Error("copy folder {source}: …")`
+  + `FoldersUpdated`. The report names the source, the folder the command named.
+- Known shapes, not fixed: a `DeleteFolder` or `EmptyFolder` of a copy whose mail has not synced
+  yet protects that mail (#2107's allow-list never saw it; the copies share the source's
+  internet message ids); a copy retried after a lost answer may 409 or make a second copy on
+  Graph (the next listing shows Graph's truth, as for a create); the copy shows the source's
+  name and counts until the listing after it. Out of scope: copying into another mailbox, search
+  folders, a lookxy Copy Folder UI (lookxy ignores `FolderWrite::Copy`).
+- Tests: `client.rs` `copy_folder_posts_destination_and_root`,
+  `copy_folder_answer_without_an_id_is_a_parse_error`; store `folder_write_tests`
+  (`copy_folder_op_round_trips_json`,
+  `copy_folder_adds_a_local_row_with_the_source_counts_and_queues_its_op` (a dest that is the
+  source or under it is not refused), `copy_folder_refuses_unknown_folders_and_the_drafts_sentinel`,
+  `a_refused_create_discards_a_copy_queued_into_it`, `deleting_a_local_copy_drops_its_op`);
+  `outbox.rs` `copy_folder_reconciles_the_local_id`,
+  `copy_folder_retry_after_reconcile_or_of_a_deleted_row_sends_nothing`,
+  `copy_folder_refuses_a_local_source_or_dest`,
+  `copy_folder_of_a_source_being_deleted_is_still_sent`;
+  `engine.rs` `folder_writes::copy_folder`
+  (`copy_folder_round_trip_syncs_the_copy_and_its_subfolder`,
+  `a_copy_into_or_of_a_created_folder_follows_its_create`,
+  `a_refused_copy_removes_the_local_copy_and_reports` (409 with a folder and a copy under it,
+  then 400), `a_copy_waits_for_an_older_empty_of_its_source`), and
+  `folder_commands_the_store_refuses_report_and_queue_nothing` (copy refusals).
