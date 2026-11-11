@@ -990,13 +990,19 @@ impl GraphClient {
     /// which may differ from `id`.
     pub fn move_folder(&self, id: &str, dest: Option<&str>) -> Result<MailFolder, GraphError> {
         let path = format!("/me/mailFolders/{}/move", encode_path_segment(id));
-        let body = Value::Object(vec![(
-            "destinationId".to_string(),
-            Value::Str(dest.unwrap_or("msgfolderroot").to_string()),
-        )])
-        .to_string();
-        let resp = self.send(Method::Post, &path, Some(body), &[])?;
+        let resp = self.send(Method::Post, &path, Some(destination_body(dest)), &[])?;
         parse_folder_answer(resp, "moved folder")
+    }
+
+    /// `POST /me/mailFolders/{id}/copy` with `{"destinationId": dest}`
+    /// (#2118); `None` is the top of the mailbox, `"msgfolderroot"`. Graph
+    /// copies the folder with its subfolders and messages, under new ids,
+    /// and answers the new folder; an answer without an id is a `Parse`
+    /// error.
+    pub fn copy_folder(&self, id: &str, dest: Option<&str>) -> Result<MailFolder, GraphError> {
+        let path = format!("/me/mailFolders/{}/copy", encode_path_segment(id));
+        let resp = self.send(Method::Post, &path, Some(destination_body(dest)), &[])?;
+        parse_folder_answer(resp, "copied folder")
     }
 
     /// `DELETE /me/mailFolders/{id}` (#2107). A 404 is `NotFound`, as every
@@ -2715,6 +2721,16 @@ fn display_name_body(name: &str) -> String {
     Value::Object(vec![(
         "displayName".to_string(),
         Value::Str(name.to_string()),
+    )])
+    .to_string()
+}
+
+/// A folder move's or copy's body (#1910, #2118): `{"destinationId": dest}`,
+/// `"msgfolderroot"` for the top of the mailbox.
+fn destination_body(dest: Option<&str>) -> String {
+    Value::Object(vec![(
+        "destinationId".to_string(),
+        Value::Str(dest.unwrap_or("msgfolderroot").to_string()),
     )])
     .to_string()
 }
@@ -6867,6 +6883,44 @@ mod tests {
         assert_eq!(reqs[0].path, "/me/mailFolders/F1/move");
         assert_eq!(reqs[0].body, r#"{"destinationId":"D1"}"#);
         assert_eq!(reqs[1].body, r#"{"destinationId":"msgfolderroot"}"#);
+    }
+
+    #[test]
+    fn copy_folder_posts_destination_and_root() {
+        let srv = FakeServer::start(vec![folder_route(
+            "POST",
+            "/me/mailFolders/F%2F1/copy",
+            201,
+            r#"{"id":"C1","displayName":"F","parentFolderId":"D1"}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let copied = c.copy_folder("F/1", Some("D1")).unwrap();
+        assert_eq!(copied.id, "C1");
+        assert_eq!(copied.parent_id.as_deref(), Some("D1"));
+        c.copy_folder("F/1", None).unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/me/mailFolders/F%2F1/copy");
+        assert_eq!(reqs[0].body, r#"{"destinationId":"D1"}"#);
+        assert_eq!(reqs[1].method, "POST");
+        assert_eq!(reqs[1].path, "/me/mailFolders/F%2F1/copy");
+        assert_eq!(reqs[1].body, r#"{"destinationId":"msgfolderroot"}"#);
+    }
+
+    #[test]
+    fn copy_folder_answer_without_an_id_is_a_parse_error() {
+        let srv = FakeServer::start(vec![folder_route(
+            "POST",
+            "/me/mailFolders/F1/copy",
+            201,
+            r#"{"displayName":"F"}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.copy_folder("F1", None),
+            Err(GraphError::Parse(_))
+        ));
     }
 
     #[test]
