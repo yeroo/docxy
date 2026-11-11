@@ -38,9 +38,11 @@ CREATE TABLE IF NOT EXISTS folders (
     -- `reminder_expand_refused` when its link becomes `delta_link`.
     reminder_expand_refused INTEGER NOT NULL DEFAULT 0,
     backfill_expand_refused INTEGER NOT NULL DEFAULT 0,
-    -- When a sync round on the folder last completed against Graph (#2125,
-    -- `Store::mark_folder_synced`), as the store's `YYYY-MM-DDTHH:MM:SSZ`
-    -- UTC; NULL: never, or not since Clear Offline Items emptied it.
+    -- When a sync round on the folder last completed against Graph (#2125),
+    -- as the store's `YYYY-MM-DDTHH:MM:SSZ` UTC, written by the statement
+    -- that stores its link (`set_delta_link`, `set_head_link`,
+    -- `complete_backfill`); NULL: never, or not since Clear Offline Items
+    -- emptied it.
     synced_at       TEXT
 );
 
