@@ -33100,4 +33100,393 @@ mod tests {
             }
         }
     }
+
+    /// #2127: a `Shutdown` (or a dropped handle) persists the write commands
+    /// sent before it, with no drain, and skips the reads.
+    mod shutdown_persists {
+        use super::*;
+        use crate::graph::model::{MailFolder, Message};
+        use std::path::Path;
+
+        /// How long a shut-down engine may take to return. The old code
+        /// sent each paced `DELETE` in turn: ~10 s for 20.
+        const RETURN_BOUND: Duration = Duration::from_secs(3);
+        const PACE: Duration = Duration::from_millis(500);
+
+        fn folder(id: &str, name: &str) -> MailFolder {
+            MailFolder {
+                id: id.into(),
+                display_name: name.into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: None,
+            }
+        }
+
+        fn ids(n: usize) -> Vec<String> {
+            (1..=n).map(|i| format!("D{i}")).collect()
+        }
+
+        fn route(method: &str, prefix: &str, status: u16, body: &str) -> Route {
+            Route {
+                method: method.into(),
+                path_prefix: prefix.into(),
+                status,
+                headers: vec![],
+                body: body.into(),
+            }
+        }
+
+        /// F1's folder routes, its delta bringing `ids` with a delta link
+        /// (so no backfill is left for the idle steps).
+        fn inbox_routes(ids: &[String]) -> Vec<Route> {
+            let msgs: Vec<String> = ids
+                .iter()
+                .map(|id| message_json(id, false, false, &[]))
+                .collect();
+            vec![
+                route(
+                    "GET",
+                    "/me/mailFolders/F1/childFolders",
+                    200,
+                    r#"{"value":[]}"#,
+                ),
+                route(
+                    "GET",
+                    "/me/mailFolders/F1/messages/delta",
+                    200,
+                    &format!(
+                        r#"{{"value":[{}],"@odata.deltaLink":"/me/mailFolders/F1/messages/delta?token=D1"}}"#,
+                        msgs.join(",")
+                    ),
+                ),
+                route(
+                    "GET",
+                    "/me/mailFolders",
+                    200,
+                    r#"{"value":[{"id":"F1","displayName":"Inbox","parentFolderId":null,"totalItemCount":0,"unreadItemCount":0,"wellKnownName":"inbox"}]}"#,
+                ),
+            ]
+        }
+
+        fn spawn_on(srv: &FakeServer, store_path: &Path, token_path: &Path) -> SyncHandle {
+            spawn_with_bases(
+                store_path.to_path_buf(),
+                token_path.to_path_buf(),
+                test_cfg(),
+                3650,
+                srv.base_url.clone(),
+                srv.base_url.clone(),
+                Duration::from_secs(3600),
+            )
+        }
+
+        /// Reads events until the engine thread drops its sender, or panics
+        /// after `bound`.
+        fn returns_within(evt_rx: &Receiver<SyncEvent>, bound: Duration) {
+            let deadline = Instant::now() + bound;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match evt_rx.recv_timeout(left) {
+                    Ok(_) => {}
+                    Err(RecvTimeoutError::Disconnected) => return,
+                    Err(RecvTimeoutError::Timeout) => {
+                        panic!("the engine did not return within {bound:?}")
+                    }
+                }
+            }
+        }
+
+        fn deletes(srv: &FakeServer) -> Vec<String> {
+            srv.requests()
+                .into_iter()
+                .filter(|r| r.method == "DELETE")
+                .map(|r| r.path.trim_start_matches("/me/messages/").to_string())
+                .collect()
+        }
+
+        fn queued(store: &Store) -> Vec<OutboxOp> {
+            store
+                .pending_ops()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.op)
+                .collect()
+        }
+
+        /// Criteria 1 and 2: an idle engine gets 20 `Delete`s and then a
+        /// `Shutdown` (or its handle dropped), with every `DELETE` paced
+        /// 500 ms. It returns within 3 s, at most the one `DELETE` in flight
+        /// when the burst raced it reached Graph, and the rest are queued;
+        /// a second engine on the same store sends them all.
+        fn burst_of_deletes_then(tag: &str, drop_handle: bool) {
+            let all = ids(20);
+            let mut routes: Vec<(Route, Option<usize>, Duration)> =
+                vec![(route("DELETE", "/me/messages/", 204, ""), None, PACE)];
+            routes.extend(
+                inbox_routes(&all)
+                    .into_iter()
+                    .map(|r| (r, None, Duration::ZERO)),
+            );
+            let srv = FakeServer::start_paced(routes);
+            let dir = unique_dir(tag);
+            let store_path = dir.join("mail.db");
+            let token_path = dir.join("token.bin");
+            seed_token(&token_path);
+            let handle = spawn_on(&srv, &store_path, &token_path);
+            // The startup pass ends settled: the engine is idle (no
+            // prefetch, no size fill, no backfill left).
+            wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::State(SyncState::Idle))
+            });
+            let store = Store::open(&store_path).unwrap();
+            assert_eq!(store.messages_in_folder("F1", 50, 0).unwrap().len(), 20);
+
+            let SyncHandle { cmd_tx, evt_rx } = handle;
+            for id in &all {
+                cmd_tx.send(SyncCommand::Delete { id: id.clone() }).unwrap();
+            }
+            if drop_handle {
+                drop(cmd_tx);
+            } else {
+                cmd_tx.send(SyncCommand::Shutdown).unwrap();
+            }
+            returns_within(&evt_rx, RETURN_BOUND);
+
+            let sent = deletes(&srv);
+            assert!(sent.len() <= 1, "sent before the shutdown: {sent:?}");
+            let rest: Vec<OutboxOp> = all
+                .iter()
+                .filter(|id| !sent.contains(id))
+                .map(|id| OutboxOp::Delete { id: id.clone() })
+                .collect();
+            assert_eq!(queued(&store), rest, "the rest are queued, in order");
+            assert!(
+                store.messages_in_folder("F1", 50, 0).unwrap().is_empty(),
+                "every row is deleted here"
+            );
+
+            // The next start drains them.
+            let srv2 = FakeServer::start({
+                let mut r = vec![route("DELETE", "/me/messages/", 204, "")];
+                r.extend(inbox_routes(&[]));
+                r
+            });
+            let handle2 = spawn_on(&srv2, &store_path, &token_path);
+            assert!(
+                wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()),
+                "the second engine drains the queue: {:?}",
+                queued(&store)
+            );
+            let mut both: Vec<String> = sent.into_iter().chain(deletes(&srv2)).collect();
+            both.sort();
+            let mut want = all.clone();
+            want.sort();
+            assert_eq!(both, want, "the two servers saw every id once");
+            let _ = handle2.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn shutdown_after_a_burst_of_deletes_persists_them_without_draining() {
+            burst_of_deletes_then("shutdown-burst", false);
+        }
+
+        #[test]
+        fn dropped_handle_after_a_burst_persists_the_writes() {
+            burst_of_deletes_then("shutdown-dropped", true);
+        }
+
+        /// Criterion 3: commands sent while the startup pass lists the
+        /// folders (paced) are all on the channel at its first checkpoint,
+        /// with a `Shutdown` behind them. The writes are persisted (store
+        /// side and queue, in order), and nothing is sent: no write, no body
+        /// or search GET, no calendar refresh for the `SetCalendars`.
+        #[test]
+        fn shutdown_during_the_startup_pass_persists_writes_and_skips_reads() {
+            let srv = FakeServer::start_paced(
+                inbox_routes(&[])
+                    .into_iter()
+                    .map(|r| {
+                        let pace = if r.path_prefix == "/me/mailFolders" {
+                            Duration::from_millis(400)
+                        } else {
+                            Duration::ZERO
+                        };
+                        (r, None, pace)
+                    })
+                    .collect(),
+            );
+            let dir = unique_dir("shutdown-startup");
+            let store_path = dir.join("mail.db");
+            let token_path = dir.join("token.bin");
+            seed_token(&token_path);
+            {
+                let s = Store::open(&store_path).unwrap();
+                s.upsert_folder(&folder("F1", "Inbox")).unwrap();
+                s.upsert_folder(&folder("F2", "Archive")).unwrap();
+                for id in ["A", "B", "C"] {
+                    let v = crate::json::parse(&message_json(id, false, false, &[])).unwrap();
+                    s.upsert_message("F1", &Message::from_json(&v).unwrap())
+                        .unwrap();
+                }
+            }
+            let handle = spawn_on(&srv, &store_path, &token_path);
+            let commands = vec![
+                SyncCommand::MarkRead {
+                    id: "A".into(),
+                    read: true,
+                },
+                SyncCommand::FetchBody { id: "A".into() },
+                SyncCommand::Move {
+                    id: "B".into(),
+                    dest: "F2".into(),
+                },
+                SyncCommand::SearchMessages {
+                    query: "hello".into(),
+                    folder_id: None,
+                    top: 10,
+                },
+                SyncCommand::Delete { id: "C".into() },
+                SyncCommand::SetCalendars {
+                    ids: Some(vec!["CAL1".into()]),
+                },
+                SyncCommand::Shutdown,
+            ];
+            for cmd in commands {
+                handle.cmd_tx.send(cmd).unwrap();
+            }
+            returns_within(&handle.evt_rx, RETURN_BOUND);
+
+            let requests: Vec<(String, String)> = srv
+                .requests()
+                .into_iter()
+                .map(|r| (r.method, r.path))
+                .collect();
+            assert!(
+                requests
+                    .iter()
+                    .all(|(m, p)| m == "GET" && p.starts_with("/me/mailFolders")),
+                "only the startup pass's own requests: {requests:?}"
+            );
+            let store = Store::open(&store_path).unwrap();
+            assert_eq!(
+                queued(&store),
+                vec![
+                    OutboxOp::MarkRead {
+                        id: "A".into(),
+                        read: true
+                    },
+                    OutboxOp::Move {
+                        id: "B".into(),
+                        dest: "F2".into()
+                    },
+                    OutboxOp::Delete { id: "C".into() },
+                ]
+            );
+            assert!(store.message_row("A").unwrap().unwrap().is_read);
+            assert_eq!(store.message_row("B").unwrap().unwrap().folder_id, "F2");
+            assert!(store.message_row("C").unwrap().is_none());
+            assert_eq!(
+                store.calendar_selection().unwrap(),
+                Some(vec!["CAL1".to_string()])
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The #1978 guard: a read that a drain took off the channel (behind
+        /// the write it drains and a `Refresh`) is still served at the
+        /// `Refresh` pass's first checkpoint, not after the whole pass.
+        #[test]
+        fn a_read_taken_by_a_drain_is_served_at_the_next_pass_checkpoint() {
+            let msgs = ids(2);
+            let mut routes: Vec<(Route, Option<usize>, Duration)> = vec![
+                (
+                    route("DELETE", "/me/messages/", 204, ""),
+                    None,
+                    Duration::ZERO,
+                ),
+                (
+                    get_route(
+                        &body_get_path("D2"),
+                        200,
+                        r#"{"body":{"contentType":"text","content":"hi"}}"#,
+                    ),
+                    None,
+                    Duration::ZERO,
+                ),
+                (
+                    route("GET", "/me/people", 200, r#"{"value":[]}"#),
+                    None,
+                    Duration::from_millis(300),
+                ),
+            ];
+            routes.extend(
+                inbox_routes(&msgs)
+                    .into_iter()
+                    .map(|r| (r, None, Duration::ZERO)),
+            );
+            let srv = FakeServer::start_paced(routes);
+            let dir = unique_dir("shutdown-read-kept");
+            let store_path = dir.join("mail.db");
+            let token_path = dir.join("token.bin");
+            seed_token(&token_path);
+            let handle = spawn_on(&srv, &store_path, &token_path);
+            wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::State(SyncState::Idle))
+            });
+            let from = srv.requests().len();
+
+            for cmd in [
+                SyncCommand::Delete { id: "D1".into() },
+                SyncCommand::Refresh,
+                SyncCommand::FetchBody { id: "D2".into() },
+            ] {
+                handle.cmd_tx.send(cmd).unwrap();
+            }
+            wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::BodyReady { id } if id == "D2"),
+            );
+            assert!(
+                wait_until(ENGINE_WAIT, || paths_from(&srv, from)
+                    .iter()
+                    .any(|p| p.starts_with("/me/people"))),
+                "the Refresh pass reaches its people step"
+            );
+            let paths = paths_from(&srv, from);
+            let at = |want: &dyn Fn(&str) -> bool| paths.iter().position(|p| want(p)).unwrap();
+            let body = at(&|p| p == body_get_path("D2"));
+            let people = at(&|p| p.starts_with("/me/people"));
+            let delta = at(&|p| p.starts_with("/me/mailFolders/F1/messages/delta"));
+            assert!(
+                body < delta && body < people,
+                "the body is served at the pass's first checkpoint: {paths:?}"
+            );
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn persists_at_shutdown_lists_the_outbox_writes() {
+            assert!(persists_at_shutdown(&SyncCommand::Delete {
+                id: "x".into()
+            }));
+            assert!(persists_at_shutdown(&SyncCommand::SendDraft {
+                id: "x".into()
+            }));
+            assert!(persists_at_shutdown(&SyncCommand::SetCalendars {
+                ids: None
+            }));
+            assert!(persists_at_shutdown(&SyncCommand::SignOut));
+            assert!(!persists_at_shutdown(&SyncCommand::FetchBody {
+                id: "x".into()
+            }));
+            assert!(!persists_at_shutdown(&SyncCommand::Refresh));
+            assert!(!persists_at_shutdown(&SyncCommand::ComposeForward {
+                id: "x".into()
+            }));
+        }
+    }
 }
