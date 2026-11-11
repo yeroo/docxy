@@ -165,7 +165,7 @@ impl FolderHistory {
 /// its `delta_link` covers ([`FolderHistory::scope`]), for a folder that has
 /// one (phase 1 done): a link from before #1871 (`None`) or a `window` one
 /// is complete in window mode only; an `all` one always; a `head` one never.
-pub(crate) fn history_complete(scope: Option<&str>, whole: bool) -> bool {
+fn history_complete(scope: Option<&str>, whole: bool) -> bool {
     match scope {
         None => !whole,
         Some(s) if s == SCOPE_WINDOW => !whole,
@@ -18848,6 +18848,23 @@ mod backfill_tests {
             ),
             (Some(SCOPE_HEAD), Some("PAGE2"), 50, 130)
         );
+    }
+
+    #[test]
+    fn history_complete_by_mode() {
+        // scope → (complete in window mode, in whole mode), for a folder
+        // with a delta link (`FolderHistory::is_complete` asks only then).
+        let cases: &[(Option<&str>, bool, bool)] = &[
+            (None, true, false),
+            (Some(SCOPE_HEAD), false, false),
+            (Some(SCOPE_WINDOW), true, false),
+            (Some(SCOPE_ALL), true, true),
+            (Some("other"), false, false),
+        ];
+        for &(scope, window, whole) in cases {
+            assert_eq!(history_complete(scope, false), window, "{scope:?} window");
+            assert_eq!(history_complete(scope, true), whole, "{scope:?} whole");
+        }
     }
 
     #[test]

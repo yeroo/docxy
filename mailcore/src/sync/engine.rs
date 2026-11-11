@@ -27123,7 +27123,7 @@ mod tests {
     /// pass, then the full delta one page per idle step.
     mod backfill {
         use super::*;
-        use crate::store::{FolderHistory, SCOPE_HEAD, history_complete};
+        use crate::store::{FolderHistory, SCOPE_HEAD};
 
         /// Above `SMALL_FOLDER`, so a folder gets a head first.
         const BIG: i64 = 500;
@@ -27385,23 +27385,6 @@ mod tests {
                 .into_iter()
                 .map(|m| m.id)
                 .collect()
-        }
-
-        #[test]
-        fn history_complete_by_mode() {
-            // scope → (complete in window mode, in whole mode), for a folder
-            // with a delta link (`incomplete_histories` asks only then).
-            let cases: &[(Option<&str>, bool, bool)] = &[
-                (None, true, false),
-                (Some(SCOPE_HEAD), false, false),
-                (Some(SCOPE_WINDOW), true, false),
-                (Some(SCOPE_ALL), true, true),
-                (Some("other"), false, false),
-            ];
-            for &(scope, window, whole) in cases {
-                assert_eq!(history_complete(scope, false), window, "{scope:?} window");
-                assert_eq!(history_complete(scope, true), whole, "{scope:?} whole");
-            }
         }
 
         #[test]
