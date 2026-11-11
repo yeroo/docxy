@@ -173,8 +173,7 @@ fn group_thousands(n: u64) -> String {
     out
 }
 
-/// A byte count as `N B`, or `N.N KB`/`MB`/`GB` (base 1024, one decimal),
-/// as the attachments popup shows a size (`2.0 KB`).
+/// A byte count as `N B`, or `N.N KB`/`MB`/`GB` (base 1024, one decimal).
 fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 3] = ["KB", "MB", "GB"];
     if n < 1024 {
@@ -466,10 +465,50 @@ mod tests {
             .unwrap();
         app.reload_folders();
         assert!(render(&app).contains("This folder is up to date"));
-        // A walk under way stays out of the seed, whatever the store says.
+        // A walk under way stays out of the seed while the store says it is
+        // not complete ...
+        app.store
+            .complete_backfill("inbox", "FULL", mailcore::store::SCOPE_WINDOW, 1, None)
+            .unwrap();
         app.on_sync_event(folder_progress("inbox", 1, None, false));
         app.reload_folders();
+        assert!(app.backfill.is_some());
         assert!(!render(&app).contains("up to date"));
+    }
+
+    /// r1-m2: a walk that stops with no `complete` event leaves no
+    /// `Updating …` line behind.
+    #[test]
+    fn plan_ui_folder_progress_a_stopped_walk_leaves_no_line() {
+        // Offline or signed out: no walk goes on.
+        for state in [SyncState::Offline, SyncState::SignInRequired] {
+            let mut app = App::for_test_with_seeded_store();
+            app.on_sync_event(folder_progress("inbox", 10, None, false));
+            app.on_sync_event(SyncEvent::State(state.clone()));
+            assert!(app.backfill.is_none(), "{state:?}");
+            assert!(!render(&app).contains("Updating"), "{state:?}");
+        }
+        // A pending state does not stop it.
+        let mut app = App::for_test_with_seeded_store();
+        app.on_sync_event(folder_progress("inbox", 10, None, false));
+        app.on_sync_event(SyncEvent::State(SyncState::PendingOps(1)));
+        assert!(app.backfill.is_some());
+        // The store says the walked folder is complete (its `complete`
+        // event never came): a reload drops the line and says up to date.
+        app.store
+            .complete_backfill("inbox", "FULL", mailcore::store::SCOPE_ALL, 1, None)
+            .unwrap();
+        app.reload_folders();
+        assert!(app.backfill.is_none());
+        let text = render(&app);
+        assert!(!text.contains("Updating"));
+        assert!(text.contains("This folder is up to date"));
+        // A folder deleted mid-walk: a reload drops its line.
+        app.on_sync_event(folder_progress("gone", 10, None, false));
+        assert!(render(&app).contains("Updating mail… 10"));
+        app.reload_folders();
+        assert!(app.backfill.is_none());
+        assert!(!render(&app).contains("Updating"));
     }
 
     /// #1959 plan-host-status-line: a multi-line error is one line.

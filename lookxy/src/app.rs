@@ -139,14 +139,19 @@ pub struct App {
     /// The attachment a queued send is uploading (#2117), from the last
     /// `SyncEvent::AttachmentProgress`, for the status bar's `Uploading
     /// <name>: <sent>/<total>`. Cleared by that draft's `Sent`/`SendFailed`,
-    /// and by `State(Offline | SignInRequired | Idle)`: a drain a sign-in,
-    /// throttle or transport error stopped sends neither, and `Idle` means the
-    /// outbox is empty.
+    /// and by `State(Offline | SignInRequired | Idle)`: a drain a sign-in or
+    /// transport error stopped sends neither, and `Idle` means the outbox is
+    /// empty. A throttle (Retry-After) or a 5xx back-off settles to
+    /// `PendingOps` and may leave the line until the next drain.
     pub upload_progress: Option<UploadProgress>,
     /// The folder backfill walk under way (#2117), from the last incomplete
     /// `SyncEvent::FolderProgress`, for the status bar's `Updating <folder>…`.
     /// The engine walks one folder at a time, so the latest event wins; that
-    /// folder's `complete: true` clears it.
+    /// folder's `complete: true` clears it. A walk can also stop with no
+    /// such event (a sign-in, throttle or transport stop, a parked page, a
+    /// folder deleted mid-walk), so `State(Offline | SignInRequired)` clears
+    /// it, and `seed_folders_up_to_date` drops it once its folder is gone or
+    /// the store says it is complete; the walk's next page sets it again.
     pub backfill: Option<FolderProgressLine>,
     /// Folders whose history is complete (#2117), for the status bar's `This
     /// folder is up to date`: seeded from the store
@@ -693,13 +698,18 @@ impl App {
                 // An upload runs inside the drain's `PendingOps`, and the
                 // engine emits a state only on a change, so none of these
                 // lands mid-upload: each means no upload is going on (#2117).
-                // A 5xx back-off stays in `PendingOps` and may leave the line
-                // until the next drain.
+                // A throttle (Retry-After) or a 5xx back-off settles to
+                // `PendingOps` and may leave the line until the next drain.
                 if matches!(
                     s,
                     SyncState::Offline | SyncState::SignInRequired | SyncState::Idle
                 ) {
                     self.upload_progress = None;
+                }
+                // Offline or signed out, no walk goes on either; its next
+                // page shows it again (#2117).
+                if matches!(s, SyncState::Offline | SyncState::SignInRequired) {
+                    self.backfill = None;
                 }
                 self.status = s;
             }
@@ -949,15 +959,26 @@ impl App {
 
     /// Re-reads which folders' histories are complete for the engine's mode
     /// (`FolderHistory::is_complete`, #2117), so a folder synced in an
-    /// earlier run says "up to date" with no event. The folder whose walk is
-    /// under way (`backfill`) stays out, whatever the store says. A store
-    /// error leaves the set as it was. Called by `reload_folders`, and by
-    /// `main` once more after it sets `whole_mailbox` (`App::new` loads the
-    /// folders before that).
+    /// earlier run says "up to date" with no event. The walk under way
+    /// (`backfill`) is dropped when its folder is gone or the store says it
+    /// is complete (it stopped without a `complete` event); otherwise its
+    /// folder stays out of the set. A store error leaves both as they were.
+    /// Called by `reload_folders`, and by `main` once more after it sets
+    /// `whole_mailbox` (`App::new` loads the folders before that).
     pub fn seed_folders_up_to_date(&mut self) {
         let Ok(histories) = self.store.folder_histories() else {
             return;
         };
+        // `folder_histories` reads the same `folders` table as `folders`:
+        // a folder missing from it is gone.
+        if let Some(b) = &self.backfill
+            && histories
+                .iter()
+                .find(|h| h.folder_id == b.folder_id)
+                .is_none_or(|h| h.is_complete(self.whole_mailbox))
+        {
+            self.backfill = None;
+        }
         let walking = self.backfill.as_ref().map(|b| b.folder_id.as_str());
         self.folders_up_to_date = histories
             .into_iter()
@@ -4602,6 +4623,8 @@ pub(crate) mod tests {
     #[test]
     fn dismiss_reminder_pops_the_front() {
         let mut app = App::for_test_with_seeded_store();
+        let rx = app.test_cmd_rx.take().unwrap();
+        while rx.try_recv().is_ok() {}
         app.reminder_queue.push_back(banner("A", "a"));
         app.reminder_queue.push_back(banner("B", "b"));
         app.dismiss_reminder();
@@ -4611,8 +4634,15 @@ pub(crate) mod tests {
         );
         app.dismiss_reminder();
         assert!(app.reminder_queue.is_empty());
+        for want in ["A", "B"] {
+            match rx.try_recv() {
+                Ok(SyncCommand::DismissReminder { id }) => assert_eq!(id, want),
+                other => panic!("expected DismissReminder {want}, got {other:?}"),
+            }
+        }
         // An empty queue sends nothing more.
         app.dismiss_reminder();
+        assert!(rx.try_recv().is_err());
     }
 
     /// #2041 plan-ui (#2117): Esc's dismiss also dismisses the reminder on

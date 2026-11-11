@@ -405,8 +405,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     // an open overlay keeps Esc priority; ahead of the mode/pane handling so
     // it isn't swallowed). Works in both Mail and Calendar mode — but NOT while
     // a text field is capturing keystrokes (search prompt, RSVP comment), where
-    // Esc means "cancel that field"; the reminder stays queued for a later Esc.
-    if key.code == KeyCode::Esc && !app.reminder_queue.is_empty() && !app.is_capturing_text() {
+    // Esc means "cancel that field", nor while the move picker or the
+    // attachments popup (routed below) is open, where Esc closes it: since
+    // #2117 a dismiss also goes to the server, on every device, with no undo.
+    // The reminder stays queued for a later Esc.
+    if key.code == KeyCode::Esc
+        && !app.reminder_queue.is_empty()
+        && !app.is_capturing_text()
+        && app.move_picker.is_none()
+        && app.attachments.is_none()
+    {
         app.dismiss_reminder();
         return;
     }
@@ -827,6 +835,50 @@ mod tests {
         match rx.try_recv() {
             Ok(SyncCommand::DismissReminder { id }) => assert_eq!(id, "E1"),
             other => panic!("expected DismissReminder, got {other:?}"),
+        }
+    }
+
+    /// r1-M1 (#2117): Esc closes an open move picker or attachments popup,
+    /// not the reminder banner, whose dismiss now reaches the server.
+    #[test]
+    fn esc_closes_a_popup_before_it_dismisses_the_reminder() {
+        for popup in ["move picker", "attachments"] {
+            let mut app = App::for_test_with_seeded_store();
+            app.reminder_queue.push_back(crate::app::ReminderBanner {
+                event_id: "E1".into(),
+                text: "⏰ Standup".into(),
+            });
+            if popup == "move picker" {
+                app.move_picker = Some(crate::app::MovePicker {
+                    folders: app.folders.clone(),
+                    index: 0,
+                    message_id: "m1".into(),
+                    thread_ids: None,
+                });
+            } else {
+                app.attachments = Some(crate::app::AttachmentsPopup {
+                    message_id: "m1".into(),
+                    items: Vec::new(),
+                    index: 0,
+                    loading: false,
+                });
+            }
+            let rx = app.test_cmd_rx.take().unwrap();
+            while rx.try_recv().is_ok() {}
+            handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+            assert!(
+                app.move_picker.is_none() && app.attachments.is_none(),
+                "{popup}"
+            );
+            assert_eq!(app.reminder_queue.len(), 1, "{popup}");
+            assert!(rx.try_recv().is_err(), "{popup}: nothing sent");
+            // The next Esc is the banner's.
+            handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+            assert!(app.reminder_queue.is_empty(), "{popup}");
+            match rx.try_recv() {
+                Ok(SyncCommand::DismissReminder { id }) => assert_eq!(id, "E1"),
+                other => panic!("{popup}: expected DismissReminder, got {other:?}"),
+            }
         }
     }
 

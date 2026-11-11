@@ -4237,23 +4237,31 @@ literally would break.
   <name>: <sent>/<total>` (`human_bytes`, base 1024); the latest wins, so a session fallback
   shows the lower value. That draft's `Sent`/`SendFailed` clears it, another draft's does
   not; so does `State(Offline | SignInRequired | Idle)` (the upload runs inside the drain's
-  `PendingOps`, and states are emitted only on a change). A 5xx back-off stays in
-  `PendingOps` and may leave the line until the next drain.
+  `PendingOps`, and states are emitted only on a change). A throttle (Retry-After) or a 5xx
+  back-off settles to `PendingOps` and may leave the line until the next drain.
 - Backfill (#1871 events): `App::backfill` is the last incomplete `FolderProgress` (one walk
   at a time), `Updating <folder>… <synced> of <total>` with `synced` clamped, no `of` when
   `total` is `None` (window mode, lookxy's default) or negative, and `mail` for a folder not
-  in `app.folders` (never the Graph id). `App::folders_up_to_date` gets a folder on its
-  `complete: true` and loses it on a later incomplete event. Since the engine walks only
+  in `app.folders` (never the Graph id). A walk can stop with no `complete` event (a sign-in,
+  throttle or transport stop, a parked page, a folder deleted mid-walk): `State(Offline |
+  SignInRequired)` clears `backfill`, and so does a folder reload once its folder is gone or
+  the store says it is complete; the walk's next page sets it again. `App::folders_up_to_date`
+  gets a folder on its `complete: true` and loses it on a later incomplete event. Since the
+  engine walks only
   incomplete folders, a folder synced in an earlier run gets no event: `reload_folders`
   re-seeds the set from `Store::folder_histories` with `FolderHistory::is_complete`
   (`App::whole_mailbox`, `backfill_days <= 0`), leaving out the folder being walked. `App::new`
   seeds before `main` sets `whole_mailbox`, so `main` seeds again after it.
 - Reminders (#2025's command): `reminder_queue` holds `ReminderBanner { event_id, text }`;
   Esc (`dismiss_reminder`) pops it and sends `DismissReminder` with the agenda row's id (an
-  occurrence's for a series), except for a `local:` id, which mailcore would refuse. No
-  snooze key, no `reminderView`.
+  occurrence's for a series), except for a `local:` id, which mailcore would refuse. The
+  dismiss reaches every device with no undo, so Esc is the banner's only when no text field
+  captures it and neither the move picker nor the attachments popup (whose Esc closes them)
+  is open. No snooze key, no `reminderView`.
 - Tests: `ui::status_bar::tests` `plan_lookxy_progress_*`, `plan_ui_folder_progress_*` (the
   line, up to date, seeded from the store in both modes), `plan_host_status_line_*` (one
   line, `…`, counts dropped first) and the helpers; `app::tests`
-  `plan_ui_dismiss_reminder_*`; `ui::tests::esc_dismisses_reminder_banner`; `store`
-  `folder_history_is_complete_needs_a_delta_link_and_the_mode_s_scope`.
+  `plan_ui_dismiss_reminder_*`; `ui::tests::esc_dismisses_reminder_banner`,
+  `esc_closes_a_popup_before_it_dismisses_the_reminder`; `store::backfill_tests`
+  `folder_history_is_complete_needs_a_delta_link_and_the_mode_s_scope`,
+  `history_complete_by_mode`.
