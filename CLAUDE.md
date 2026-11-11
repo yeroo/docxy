@@ -153,6 +153,7 @@ issue number to find its notes.
   following Graph's answers, unsent mail kept, a dropped move reported (#2126),
   message sizes, the size fill, folder sizes on the server (#2123),
   shutdown persists the writes queued before it, without draining (#2127),
+  a folder's backfill walk run next on request, remembered (#2133),
   OAuth tokens in the platform secret store, a plaintext fallback and its
   warning (#1877), contact search folded in Rust, word-prefix rank, `all_contacts`
   (#1890).

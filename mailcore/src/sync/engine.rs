@@ -79,7 +79,8 @@ pub enum SyncCommand {
     Refresh,
     /// Sync one folder now (#1885, "Update Folder"): drain the outbox, run
     /// that folder's delta (its head, phase 1 of #1871, when it never
-    /// synced; the backfill of older mail follows in idle time), and re-read
+    /// synced; the backfill of older mail follows in idle time, sooner
+    /// after a [`SyncCommand::BackfillFolder`]), and re-read
     /// its counts
     /// (`GET /me/mailFolders/{id}`). Emits `MessagesUpdated { folder_id }`
     /// and, when the counts changed, `FoldersUpdated`. No other folder is
@@ -87,6 +88,18 @@ pub enum SyncCommand {
     /// nothing, as a tick does there; a folder id not in the store is an
     /// [`SyncEvent::Error`] and makes no Graph call.
     SyncFolder { id: String },
+    /// Download one folder's older mail next (#2133): that folder's backfill
+    /// walk (phase 2 of #1871) runs ahead of every other folder's, still one
+    /// page per idle step and preempted by commands and timed wakes as every
+    /// backfill page is. Its progress comes as [`SyncEvent::FolderProgress`],
+    /// ending with `complete: true`. A walk a failed page parked is unparked
+    /// (and may start over once more after an expired link). Makes no Graph
+    /// call itself: signed out, inside a back-off or before the folder's
+    /// head ran, the request is remembered and honoured once a backfill page
+    /// may run; a restart forgets it. The most recent request goes first. A
+    /// folder whose history is complete does nothing; an id not in the
+    /// store is an [`SyncEvent::Error`].
+    BackfillFolder { id: String },
     /// The folders the fast cycle keeps fresh (#1885), replacing the set
     /// whole (duplicates dropped, order kept): a UI sends its Inbox and the
     /// folder it has open, and again when the open folder changes. Each
@@ -1622,6 +1635,7 @@ fn persists_at_shutdown(cmd: &SyncCommand) -> bool {
         // In memory, or a local preference whose refresh the shutdown
         // skips (`set_calendars`).
         | SyncCommand::SetFastFolders { .. }
+        | SyncCommand::BackfillFolder { .. }
         | SyncCommand::SetCalendars { .. }
         // A sign-out asked for before quitting holds: the token cache is
         // cleared, and the writes after it are still queued.
@@ -1907,6 +1921,7 @@ fn run(config: EngineConfig, cmd_rx: Receiver<SyncCommand>, evt_tx: Sender<SyncE
         masters_skipped: HashSet::new(),
         parked: Vec::new(),
         expired: Vec::new(),
+        backfill_first: Vec::new(),
         next_tick: Instant::now(),
         fast_folders: Vec::new(),
         next_full: Instant::now(),
@@ -2004,12 +2019,20 @@ struct Engine {
     /// (`enter_signin`) and by a restart.
     masters_skipped: HashSet<String>,
     /// Folders whose backfill a failure stopped until the next sync pass
-    /// (#1871): one request per park, never a hot loop.
+    /// (#1871), or a `BackfillFolder` for the folder (#2133): one request
+    /// per park, never a hot loop.
     parked: Vec<String>,
     /// Folders whose backfill found its sync state expired and started
-    /// over since the last pass: a second expiry parks the folder instead,
-    /// so a link that keeps expiring costs two requests a pass, not a loop.
+    /// over since the last pass (or the last `BackfillFolder` for it,
+    /// #2133): a second expiry parks the folder instead, so a link that
+    /// keeps expiring costs two requests a pass (or a command), not a loop.
     expired: Vec<String>,
+    /// Folders whose backfill walk runs ahead of `Store::folders` order
+    /// (`SyncCommand::BackfillFolder`, #2133), the most recent request
+    /// first, no duplicates. A folder leaves it when its walk completes or
+    /// a command finds it complete; a sync pass, a sign-out or a back-off
+    /// keep it. In memory only: a restart forgets it.
+    backfill_first: Vec<String>,
     /// Without a fast tick: when the next tick is due (`tick` after the
     /// last tick, the startup pass or a command). Backfill steps do not move
     /// it.
@@ -2459,6 +2482,7 @@ impl Engine {
                 self.after_pass_if_fast();
             }
             SyncCommand::SyncFolder { id } => self.sync_one_folder(&id),
+            SyncCommand::BackfillFolder { id } => self.backfill_folder(&id),
             SyncCommand::SetFastFolders { ids } => {
                 let mut set: Vec<String> = Vec::with_capacity(ids.len());
                 for id in ids {
@@ -2957,6 +2981,50 @@ impl Engine {
             self.clear_backoff();
             self.settle_state();
         }
+    }
+
+    /// `SyncCommand::BackfillFolder` (#2133): puts `id`'s backfill walk
+    /// first (`backfill_first`) and unparks it, with no Graph call, so the
+    /// main loop's next backfill page is that folder's whenever a page may
+    /// run (`next_backfill`): now, or once signed in, out of a back-off, or
+    /// after the pass that runs the folder's head. An id not in the store
+    /// is an `Error`; a folder whose history is complete for this mode
+    /// does nothing.
+    fn backfill_folder(&mut self, id: &str) {
+        // A folder created under a `local:` id is known under Graph's once
+        // re-keyed (#1910).
+        let id = self
+            .store
+            .current_folder_id(id)
+            .unwrap_or_else(|_| id.to_string());
+        // `folder_histories` lists every stored folder, so `None` is an id
+        // not in the store.
+        let history = match self.store.folder_history(&id) {
+            Ok(Some(h)) => h,
+            Ok(None) => {
+                self.emit(SyncEvent::Error(format!(
+                    "backfill folder: unknown folder {id}"
+                )));
+                return;
+            }
+            Err(e) => {
+                self.emit(SyncEvent::Error(e.to_string()));
+                return;
+            }
+        };
+        self.backfill_first.retain(|f| *f != id);
+        if history.has_delta_link
+            && history_complete(history.scope.as_deref(), self.whole_mailbox())
+        {
+            return;
+        }
+        self.backfill_first.insert(0, id.clone());
+        // Unparked, and given one more start over after an expired link:
+        // without the latter, an unparked walk whose link expired again
+        // would park at its first page. Each command buys at most one more
+        // request (or one more start over), never a loop.
+        self.parked.retain(|f| *f != id);
+        self.expired.retain(|f| *f != id);
     }
 
     /// One fast tick (#1885): drain the outbox, then sync the fast folders
@@ -3676,10 +3744,12 @@ impl Engine {
 
     /// The folder whose backfill page runs next, if one may run now: signed
     /// in, outside a back-off, after a folder list succeeded
-    /// (`backfill_done`), and the first incomplete folder that is not
-    /// parked. The main loop and `backfill_step` share it, so a ready
-    /// backfill always makes a request or parks (never a spin). A store
-    /// error stops the backfill until the next pass reads it again.
+    /// (`backfill_done`); among the incomplete folders that are not parked,
+    /// the first one a `BackfillFolder` asked for (`backfill_first`, #2133),
+    /// else the first in `Store::folders` order. The main loop and
+    /// `backfill_step` share it, so a ready backfill always makes a request
+    /// or parks (never a spin). A store error stops the backfill until the
+    /// next pass reads it again.
     fn next_backfill(&self) -> Option<FolderHistory> {
         if self.token.is_none()
             || !self.backfill_done
@@ -3687,10 +3757,18 @@ impl Engine {
         {
             return None;
         }
-        self.incomplete_histories()
+        let mut ready: Vec<FolderHistory> = self
+            .incomplete_histories()
             .ok()?
             .into_iter()
-            .find(|h| !self.parked.contains(&h.folder_id))
+            .filter(|h| !self.parked.contains(&h.folder_id))
+            .collect();
+        let at = self
+            .backfill_first
+            .iter()
+            .find_map(|id| ready.iter().position(|h| h.folder_id == *id))
+            .unwrap_or(0);
+        (at < ready.len()).then(|| ready.swap_remove(at))
     }
 
     /// The folder whose size fill page runs next (#2123), if one may run
@@ -4035,6 +4113,8 @@ impl Engine {
             folder_id: id.clone(),
         });
         self.emit_progress(&id, synced, true);
+        // A walk a `BackfillFolder` put first is done (#2133).
+        self.backfill_first.retain(|f| *f != id);
         if !self.backfill_remains() {
             self.end_reconverge();
         }
@@ -27200,6 +27280,258 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
             assert_eq!(hits(&srv), 2);
             assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_HEAD));
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// The paths' indices of `id`'s backfill requests.
+        fn backfill_at(reqs: &[crate::testserver::RecordedRequest], id: &str) -> Vec<usize> {
+            reqs.iter()
+                .enumerate()
+                .filter(|(_, r)| is_backfill(&r.path, id))
+                .map(|(i, _)| i)
+                .collect()
+        }
+
+        fn is_walking(e: &SyncEvent, id: &str) -> bool {
+            matches!(e, SyncEvent::FolderProgress { folder_id, complete: false, .. } if folder_id == id)
+        }
+
+        fn projects(pages: usize) -> Fold {
+            Fold {
+                pages: pages_of("F2", pages),
+                ..fold("F2", "Projects", None)
+            }
+        }
+
+        #[test]
+        fn backfill_folder_runs_that_folders_walk_next_to_completion() {
+            // F1 (Inbox) walks first in store order; the command, sent after
+            // its first page, puts F2's whole walk ahead of F1's rest.
+            let srv = FakeServer::start_paced(mailbox(
+                &[
+                    Fold {
+                        pages: pages_of("F1", 6),
+                        ..inbox()
+                    },
+                    projects(6),
+                ],
+                vec![],
+                Duration::from_millis(150),
+            ));
+            let dir = new_dir("bf-first");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            wait_for(&handle.evt_rx, |e| is_walking(e, "F1"));
+            let sent = Instant::now();
+            handle
+                .cmd_tx
+                .send(SyncCommand::BackfillFolder { id: "F2".into() })
+                .unwrap();
+            let events = until_complete(&handle, "F2");
+            assert!(
+                !events.iter().any(|e| is_complete(e, "F1")),
+                "F1 completed before F2: {events:?}"
+            );
+            until_complete(&handle, "F1");
+            let reqs = srv.requests();
+            let (f1, f2) = (backfill_at(&reqs, "F1"), backfill_at(&reqs, "F2"));
+            assert_eq!((f1.len(), f2.len()), (6, 6), "{:?}", paths_from(&srv, 0));
+            let (first, last) = (f2[0], f2[5]);
+            assert!(
+                !f1.iter().any(|i| first < *i && *i < last),
+                "an F1 page ran inside F2's walk: {:?}",
+                paths_from(&srv, 0)
+            );
+            let in_flight = f1
+                .iter()
+                .filter(|i| **i < first && reqs[**i].at >= sent)
+                .count();
+            assert!(in_flight <= 1, "{in_flight} F1 pages ran after the command");
+            assert!(f1.iter().any(|i| *i > last), "F1 resumes after F2");
+            assert_eq!(history(&dir, "F2").scope.as_deref(), Some(SCOPE_ALL));
+            assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_ALL));
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_command_is_served_between_two_pages_of_a_requested_walk() {
+            let srv = FakeServer::start_paced(mailbox(
+                &[
+                    Fold {
+                        head: vec![msg("M1", "2026-11-05T00:00:00Z")],
+                        pages: pages_of("F1", 20),
+                        ..inbox()
+                    },
+                    projects(20),
+                ],
+                vec![(body_route("text", "hello"), None)],
+                Duration::from_millis(200),
+            ));
+            let dir = new_dir("bf-first-preempt");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            wait_for(&handle.evt_rx, |e| is_walking(e, "F1"));
+            handle
+                .cmd_tx
+                .send(SyncCommand::BackfillFolder { id: "F2".into() })
+                .unwrap();
+            // F2 walks before F1's 20 pages end: it was put first.
+            let events = wait_for(&handle.evt_rx, |e| is_walking(e, "F2"));
+            assert!(
+                !events.iter().any(|e| is_complete(e, "F1")),
+                "F1 completed before F2 walked: {events:?}"
+            );
+            let sent = Instant::now();
+            handle
+                .cmd_tx
+                .send(SyncCommand::FetchBody { id: "M1".into() })
+                .unwrap();
+            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::BodyReady { .. }));
+            let reqs = srv.requests();
+            let body = reqs
+                .iter()
+                .position(|r| r.path.starts_with("/me/messages/M1"))
+                .unwrap();
+            let between = reqs[..body]
+                .iter()
+                .filter(|r| r.at >= sent && is_backfill(&r.path, "F2"))
+                .count();
+            assert!(between <= 1, "{between} pages ran before the command");
+            let before = reqs[..body]
+                .iter()
+                .filter(|r| is_backfill(&r.path, "F2"))
+                .count();
+            assert!(before < 20, "pages remained when the command ran");
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn backfill_folder_unparks_a_parked_folder() {
+            let bad = r#"{"error":{"code":"ErrorInvalidRequest","message":"bad page"}}"#;
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    pages: pages_of("F1", 3),
+                    ..inbox()
+                }],
+                vec![(route(&page_link("F1", 2), 400, bad), Some(1))],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-first-unpark");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::Error(m) if m.contains("bad page")),
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            let hits = |srv: &FakeServer| count(srv, |p| p == page_link("F1", 2));
+            let lists = |srv: &FakeServer| count(srv, |p| p.starts_with("/me/mailFolders?"));
+            assert_eq!(hits(&srv), 1, "parked");
+            let listed = lists(&srv);
+            handle
+                .cmd_tx
+                .send(SyncCommand::BackfillFolder { id: "F1".into() })
+                .unwrap();
+            until_complete(&handle, "F1");
+            assert_eq!(hits(&srv), 2);
+            assert_eq!(lists(&srv), listed, "no pass ran: the command unparked it");
+            assert_eq!(history(&dir, "F1").scope.as_deref(), Some(SCOPE_ALL));
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn backfill_folder_on_an_unknown_or_complete_folder() {
+            // A small folder: its one full delta completes it at startup.
+            let srv = FakeServer::start_paced(mailbox(
+                &[Fold {
+                    total: 5,
+                    ..inbox()
+                }],
+                vec![],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-first-none");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            until_complete(&handle, "F1");
+            std::thread::sleep(Duration::from_millis(300));
+            let _: Vec<SyncEvent> = handle.evt_rx.try_iter().collect();
+            let made = srv.requests().len();
+            handle
+                .cmd_tx
+                .send(SyncCommand::BackfillFolder { id: "NOPE".into() })
+                .unwrap();
+            let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+            assert_eq!(
+                events.last(),
+                Some(&SyncEvent::Error(
+                    "backfill folder: unknown folder NOPE".into()
+                ))
+            );
+            handle
+                .cmd_tx
+                .send(SyncCommand::BackfillFolder { id: "F1".into() })
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            let rest: Vec<SyncEvent> = handle.evt_rx.try_iter().collect();
+            assert!(rest.is_empty(), "a complete folder does nothing: {rest:?}");
+            assert_eq!(srv.requests().len(), made, "{:?}", paths_from(&srv, made));
+            stop(handle);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn backfill_folder_inside_a_back_off_is_remembered() {
+            // F1's page 2 is throttled for 1 s; the command for F2, sent
+            // inside that back-off, makes no request, and once it ends
+            // (a pass runs first, at the expiry) F2's walk is the first.
+            let srv = FakeServer::start_paced(mailbox(
+                &[
+                    Fold {
+                        pages: pages_of("F1", 6),
+                        ..inbox()
+                    },
+                    projects(3),
+                ],
+                vec![(throttle(&page_link("F1", 2), 1), Some(1))],
+                Duration::ZERO,
+            ));
+            let dir = new_dir("bf-first-back-off");
+            let handle = spawn_in(&srv, &dir, WHOLE_MAILBOX, HOUR, None);
+            assert!(wait_until(ENGINE_WAIT, || count(&srv, |p| p
+                == page_link("F1", 2))
+                >= 1));
+            let sent = Instant::now();
+            handle
+                .cmd_tx
+                .send(SyncCommand::BackfillFolder { id: "F2".into() })
+                .unwrap();
+            let events = until_complete(&handle, "F2");
+            assert!(
+                !events.iter().any(|e| is_complete(e, "F1")),
+                "F1 completed before F2: {events:?}"
+            );
+            until_complete(&handle, "F1");
+            let reqs = srv.requests();
+            let throttled = reqs
+                .iter()
+                .position(|r| r.path == page_link("F1", 2))
+                .unwrap();
+            let ends = reqs[throttled].at + Duration::from_millis(900);
+            assert!(
+                !reqs.iter().any(|r| r.at >= sent && r.at < ends),
+                "a request inside the back-off: {:?}",
+                paths_from(&srv, throttled)
+            );
+            let next = reqs[throttled + 1..]
+                .iter()
+                .find(|r| is_backfill(&r.path, "F1") || is_backfill(&r.path, "F2"))
+                .unwrap();
+            assert!(
+                is_backfill(&next.path, "F2"),
+                "first page after the back-off: {:?}",
+                paths_from(&srv, throttled)
+            );
             stop(handle);
             let _ = std::fs::remove_dir_all(&dir);
         }
