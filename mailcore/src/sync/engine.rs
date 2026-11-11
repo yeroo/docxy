@@ -95,7 +95,8 @@ pub enum SyncCommand {
     /// Clear one folder's offline items and sync it again (#2124, classic
     /// Outlook's "Clear Offline Items"): the folder's stored messages Graph
     /// has are deleted from the local store only, with what is keyed by
-    /// them, and its delta and backfill state is reset; then the folder
+    /// them (their move aliases and tombstones stay, #1896, #2107), and
+    /// its delta and backfill state is reset; then the folder
     /// syncs as [`SyncCommand::SyncFolder`] does, from nothing (its head;
     /// older mail is backfilled in idle time). No Graph write, no outbox
     /// op; subfolders and the calendar are untouched. Mail Graph lacks

@@ -6387,11 +6387,15 @@ impl Store {
     ///
     /// With the removed rows go, by their `ON DELETE CASCADE`, their bodies,
     /// stored headers and attachment metadata; their FTS rows (in bulk, as
-    /// `empty_folder`); the `moved_ids` aliases into them and any
-    /// `outbound_attachments` keyed by them; and the `forgotten_ids`
-    /// tombstones their delete wrote: the store is as if it never synced
-    /// them, so a folder delete's walk of Graph before the resync does not
-    /// take them for mail the store removed. The folder's counts are kept:
+    /// `empty_folder`); and any `outbound_attachments` keyed by them.
+    /// Two things stay. The `moved_ids` aliases into them, which outlive
+    /// their row by design (#1896): a queued op that names no row
+    /// (`RespondMeeting`, `RemoveFromCalendar`, `SaveAttachment`) or a host
+    /// may still hold an old id, and the resync brings the row back under
+    /// the same id. And the `forgotten_ids` tombstones their delete wrote
+    /// (#2107): until the resync stores a row again (which clears its
+    /// tombstone), a folder delete's walk of Graph refuses a copy of that
+    /// mail elsewhere rather than take it. The folder's counts are kept:
     /// the server's did not change, the resync's count read corrects them,
     /// and the next delta's small-folder choice reads the stored total
     /// (`folder_total`): a zero would send a big folder down the full
@@ -6448,22 +6452,15 @@ impl Store {
             stmt.query_map(params![id, kept_json], |r| r.get(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let removed_json = ids_json(&removed);
-        tx.execute(
-            "DELETE FROM moved_ids WHERE message_id IN (SELECT value FROM json_each(?1))",
-            params![removed_json],
-        )?;
         tx.execute(
             "DELETE FROM outbound_attachments
              WHERE draft_id IN (SELECT value FROM json_each(?1))",
-            params![removed_json],
+            params![ids_json(&removed)],
         )?;
         delete_folder_messages_on(&tx, &id, &kept_json)?;
-        tx.execute(
-            "DELETE FROM forgotten_ids
-             WHERE kind = 'message' AND id IN (SELECT value FROM json_each(?1))",
-            params![removed_json],
-        )?;
+        // The delete's tombstones stay (`forgotten_messages_ad`); keep
+        // their number bounded, as `empty_folder` does.
+        prune_forgotten_on(&tx, FORGOTTEN_CAP)?;
         clear_folder_links_on(&tx, &id)?;
         tx.commit()?;
         Ok(ClearOfflineResult::Cleared {
@@ -25084,8 +25081,9 @@ mod clear_offline_tests {
     }
 
     /// Criterion 1 (store): the folder's rows go with their bodies,
-    /// headers, attachments, FTS rows, aliases and tombstones; its links
-    /// are reset and its counts kept; a sibling and a child are untouched.
+    /// headers, attachments and FTS rows, while the move aliases into them
+    /// and their tombstones stay (r1); its links are reset and its counts
+    /// kept; a sibling and a child are untouched.
     #[test]
     fn clear_offline_items_removes_the_folders_rows_and_keyed_data() {
         let s = Store::open_in_memory().unwrap();
@@ -25173,25 +25171,20 @@ mod clear_offline_tests {
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert!(!hits.iter().any(|h| h.starts_with('F')), "{hits:?}");
         assert_eq!(s.search("quagga", 10).unwrap().len(), 1);
-        assert_eq!(
-            count(
-                &s,
-                "SELECT COUNT(*) FROM moved_ids WHERE old_id = ?1",
-                "OLD-F2"
-            ),
-            0,
-            "the alias into a removed row goes"
-        );
+        // The alias into a removed row outlives it (#1896): a queued op or
+        // a host holding the old id still reaches the row the resync
+        // brings back under the same id.
+        assert_eq!(s.current_id("OLD-F2").unwrap(), "F2");
         assert_eq!(s.current_id("OLD-G1").unwrap(), "G1");
-        assert_eq!(
+        // The delete's tombstones stay (#2107) until a row is stored again.
+        let tombstone = |id: &str| {
             count(
                 &s,
-                "SELECT COUNT(*) FROM forgotten_ids WHERE kind = 'message' AND id LIKE ?1",
-                "F%"
-            ),
-            0,
-            "no tombstone: the store is as if it never synced them"
-        );
+                "SELECT COUNT(*) FROM forgotten_ids WHERE kind = 'message' AND id = ?1",
+                id,
+            )
+        };
+        assert_eq!((tombstone("F1"), tombstone("F2")), (1, 1));
         let f = s.folder_history("F").unwrap().unwrap();
         assert!(!f.has_delta_link);
         assert_eq!(s.get_delta_link("F").unwrap(), None);
@@ -25217,6 +25210,9 @@ mod clear_offline_tests {
         // The FTS delete triggers came back and still work.
         s.delete_message("G1").unwrap();
         assert_eq!(s.search("quagga", 10).unwrap().len(), 0);
+        // The resync storing F1 again clears its tombstone.
+        message(&s, "F1", "F", "zebra one");
+        assert_eq!((tombstone("F1"), tombstone("F2")), (0, 1));
     }
 
     /// Criterion 4 (store): mail Graph lacks stays; a reconciled draft

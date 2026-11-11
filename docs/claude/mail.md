@@ -4113,11 +4113,20 @@ deletes on the server too).
   its own id, and that placeholder is the kind of stale row the command clears.
 - Removed with the rows: bodies, `message_headers` and `attachments` (cascade), FTS rows (the
   bulk delete `delete_folder_messages_on`, shared with `empty_folder`, drops and re-creates
-  the two FTS delete triggers), the `moved_ids` aliases into them, `outbound_attachments`
-  keyed by them, and the `forgotten_ids` tombstones their delete wrote. The store is then as
-  if it never synced them, so a folder delete's walk (#2107) before the resync does not refuse
-  them. `clear_folder_links_on` resets the delta, backfill and history state. The counts are
-  kept: the server's did not change, the resync's count read corrects them, and
+  the two FTS delete triggers) and `outbound_attachments` keyed by them.
+  `clear_folder_links_on` resets the delta, backfill and history state.
+- Kept, unlike the issue's "move aliases into them" (r1): the `moved_ids` aliases into the
+  removed rows. They outlive their row by design (#1896). `RespondMeeting`,
+  `RemoveFromCalendar` and `SaveAttachment` name no row (`message_id()` is `None`, so
+  `QueuedOps` does not count them), but they resolve their id through the aliases when sent,
+  and a host may hold an old id. The resync brings the row back under the same id.
+- Kept too (r1): the `forgotten_ids` tombstones the delete writes, pruned to `FORGOTTEN_CAP`.
+  Until the resync stores a row again (`forgotten_messages_ai` clears its tombstone), a folder
+  delete's walk (#2107) refuses a copy of that mail elsewhere (the same internet message id)
+  instead of taking it. Without them, the walk would read the cleared mail as never synced and
+  allow, say, a copy another client moved into the folder being deleted. A delete inside the
+  resync window is refused, and that is safe: the folder comes back.
+- The counts are kept: the server's did not change, the resync's count read corrects them, and
   `sync_folder_delta`'s small-folder choice reads the stored total (`folder_total`).
 - Events: `OfflineItemsCleared { folder_id, removed, kept }`, then `MessagesUpdated`, then the
   resync's `MessagesUpdated` and `FoldersUpdated`. A refusal is
@@ -4136,6 +4145,7 @@ deletes on the server too).
   read before it lands), `clear_offline_items_drains_a_queued_mark_read_first` (the op queued
   on a second connection: a 503 would set `op_retry`, and `drain_outbox` skips the drain while
   it runs), `clear_offline_items_refuses_while_a_mark_read_stays_queued`,
-  `clear_offline_items_unknown_and_not_on_server_are_refused`,
+  `clear_offline_items_unknown_and_not_on_server_are_refused` (unknown, the drafts sentinel,
+  and a `local:` folder whose queued create is dropped),
   `clear_offline_items_signed_out_is_refused`,
   `clear_offline_items_before_a_shutdown_clears_without_a_request`.
