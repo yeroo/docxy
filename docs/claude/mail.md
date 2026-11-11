@@ -4113,7 +4113,7 @@ deletes on the server too).
   its own id, and that placeholder is the kind of stale row the command clears.
 - Removed with the rows: bodies, `message_headers` and `attachments` (cascade), FTS rows (the
   bulk delete `delete_folder_messages_on`, shared with `empty_folder`, drops and re-creates
-  the two FTS delete triggers) and `outbound_attachments` keyed by them.
+  the two FTS delete triggers).
   `clear_folder_links_on` resets the delta, backfill and history state.
 - Kept, unlike the issue's "move aliases into them" (r1): the `moved_ids` aliases into the
   removed rows. They outlive their row by design (#1896). `RespondMeeting`,

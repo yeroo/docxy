@@ -6387,7 +6387,7 @@ impl Store {
     ///
     /// With the removed rows go, by their `ON DELETE CASCADE`, their bodies,
     /// stored headers and attachment metadata; their FTS rows (in bulk, as
-    /// `empty_folder`); and any `outbound_attachments` keyed by them.
+    /// `empty_folder`).
     /// Two things stay. The `moved_ids` aliases into them, which outlive
     /// their row by design (#1896): a queued op that names no row
     /// (`RespondMeeting`, `RemoveFromCalendar`, `SaveAttachment`) or a host
@@ -6444,20 +6444,7 @@ impl Store {
         kept.sort();
         kept.dedup();
         let kept_json = ids_json(&kept);
-        let removed: Vec<String> = {
-            let mut stmt = tx.prepare(
-                "SELECT id FROM messages
-                 WHERE folder_id = ?1 AND id NOT IN (SELECT value FROM json_each(?2))",
-            )?;
-            stmt.query_map(params![id, kept_json], |r| r.get(0))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        tx.execute(
-            "DELETE FROM outbound_attachments
-             WHERE draft_id IN (SELECT value FROM json_each(?1))",
-            params![ids_json(&removed)],
-        )?;
-        delete_folder_messages_on(&tx, &id, &kept_json)?;
+        let removed = delete_folder_messages_on(&tx, &id, &kept_json)?;
         // The delete's tombstones stay (`forgotten_messages_ad`); keep
         // their number bounded, as `empty_folder` does.
         prune_forgotten_on(&tx, FORGOTTEN_CAP)?;
@@ -6465,7 +6452,7 @@ impl Store {
         tx.commit()?;
         Ok(ClearOfflineResult::Cleared {
             folder: id,
-            removed: removed.len(),
+            removed,
             kept: kept.len(),
         })
     }
