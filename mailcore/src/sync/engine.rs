@@ -31377,20 +31377,24 @@ mod tests {
                 assert!(local_id.starts_with("local:"), "{local_id}");
                 assert_eq!(id, "C1");
                 assert_eq!(store.current_folder_id(&local_id).unwrap(), "C1");
+                // The sync after the drain: the copy's and its subfolder's
+                // rows (the listing), mail and delta links (each folder's
+                // delta stores its mail, then its link). All in one wait:
+                // the engine thread may be between those writes.
+                let synced = |id: &str, parent: &str, mail: &str| {
+                    row(&store, id).is_some_and(|f| {
+                        f.parent_id.as_deref() == Some(parent) && f.delta_link.is_some()
+                    }) && mail_in(&store, id) == [mail]
+                };
                 assert!(
-                    wait_until(ENGINE_WAIT, || mail_in(&store, "C1") == ["m-c1"]
-                        && mail_in(&store, "C1S") == ["m-c1s"]),
-                    "C1 {:?}, C1S {:?}",
+                    wait_until(ENGINE_WAIT, || synced("C1", "ARCH", "m-c1")
+                        && synced("C1S", "C1", "m-c1s")),
+                    "C1 {:?} {:?}, C1S {:?} {:?}",
+                    row(&store, "C1"),
                     mail_in(&store, "C1"),
+                    row(&store, "C1S"),
                     mail_in(&store, "C1S")
                 );
-                assert_eq!(
-                    row(&store, "C1").unwrap().parent_id.as_deref(),
-                    Some("ARCH")
-                );
-                assert_eq!(row(&store, "C1S").unwrap().parent_id.as_deref(), Some("C1"));
-                assert!(row(&store, "C1").unwrap().delta_link.is_some());
-                assert!(row(&store, "C1S").unwrap().delta_link.is_some());
                 // The source is unchanged, with its mail and subfolder.
                 assert_eq!(row(&store, "PROJ").unwrap(), proj);
                 assert_eq!(row(&store, "SUB").unwrap(), sub);
