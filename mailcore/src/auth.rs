@@ -7,6 +7,7 @@
 //! fully fake-server-testable). Token values and the PKCE code verifier are
 //! never logged.
 
+use crate::graph::client::http_error_text;
 use crate::json;
 use crate::pkce::{self, Pkce};
 use std::fmt;
@@ -62,9 +63,13 @@ pub enum AuthError {
     /// The server rejected the request (non-2xx with a parseable OAuth
     /// error body): `error`/`error_description`.
     Denied(String),
-    /// Transport-level failure, or a non-2xx response with no parseable
-    /// OAuth error body.
+    /// Transport-level failure, or a response body that could not be read.
     Http(String),
+    /// A non-2xx response with no parseable OAuth error body (#2113,
+    /// #1959): often a front end's HTML error page. `Display` shows one
+    /// capped line (`HTTP 502 Bad Gateway`), never the body; the body is
+    /// kept here for diagnostics (`Debug`).
+    Status { status: u16, body: String },
     /// The response body wasn't the JSON shape we expected.
     Parse(String),
 }
@@ -74,6 +79,9 @@ impl fmt::Display for AuthError {
         match self {
             AuthError::Denied(m) => write!(f, "authorization denied: {m}"),
             AuthError::Http(m) => write!(f, "HTTP error: {m}"),
+            AuthError::Status { status, body } => {
+                write!(f, "HTTP error: {}", http_error_text(*status, body))
+            }
             AuthError::Parse(m) => write!(f, "failed to parse token response: {m}"),
         }
     }
@@ -195,7 +203,7 @@ fn post_token(
 /// JSON (`{"error":"...","error_description":"..."}`); when we can parse
 /// one out, surface it as `Denied` (the description is diagnostic text
 /// from the server, never a token or the code verifier). Anything else
-/// becomes an opaque `Http` error.
+/// becomes a `Status` error, which keeps the body but displays one line.
 fn classify_error(status: u16, body: &str) -> AuthError {
     if let Ok(v) = json::parse(body) {
         if let Some(desc) = v.get("error_description").and_then(|d| d.as_str()) {
@@ -205,7 +213,10 @@ fn classify_error(status: u16, body: &str) -> AuthError {
             return AuthError::Denied(err.to_string());
         }
     }
-    AuthError::Http(format!("HTTP {status}: {body}"))
+    AuthError::Status {
+        status,
+        body: body.to_string(),
+    }
 }
 
 fn parse_token_response(body: &str, fallback_refresh_token: &str) -> Result<TokenSet, AuthError> {
@@ -326,6 +337,7 @@ fn preferred_username(id_token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::client::HTTP_ERROR_TEXT_MAX;
     use crate::testserver::{FakeServer, Route};
 
     fn cfg() -> AuthConfig {
@@ -479,6 +491,56 @@ mod tests {
             ),
             vec!["Calendars.Read".to_string(), "Mail.Send".to_string()]
         );
+    }
+
+    fn token_error(status: u16, body: &str) -> AuthError {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/organizations/oauth2/v2.0/token".into(),
+            status,
+            headers: vec![],
+            body: body.into(),
+        }]);
+        match refresh(&cfg(), &srv.base_url, "RT1") {
+            Ok(_) => panic!("the token endpoint answered {status}"),
+            Err(e) => e,
+        }
+    }
+
+    /// #2113 (#1959 plan-auth-http-display): a token endpoint's HTML error
+    /// page shows as one capped line naming the status, never the markup;
+    /// the body stays in the error for diagnostics.
+    #[test]
+    fn plan_auth_http_display_shows_one_line_for_an_html_body() {
+        let page = "<!DOCTYPE html>\r\n<html><head><title>502 - Web server received an invalid response</title></head>\r\n<body><h1>Server Error</h1>\r\n</body></html>\r\n";
+        let e = token_error(502, page);
+        let shown = e.to_string();
+        assert_eq!(shown, "HTTP error: HTTP 502 Bad Gateway");
+        assert!(!shown.contains('<') && !shown.contains('\n'), "{shown}");
+        assert!(shown.chars().count() <= "HTTP error: ".len() + HTTP_ERROR_TEXT_MAX);
+        assert!(format!("{e:?}").contains("Server Error"), "{e:?}");
+        // No reason phrase: the status alone.
+        assert_eq!(
+            classify_error(599, "<html>x</html>").to_string(),
+            "HTTP error: HTTP 599"
+        );
+    }
+
+    #[test]
+    fn plan_auth_http_display_empty_body() {
+        let e = token_error(503, "");
+        assert_eq!(e.to_string(), "HTTP error: HTTP 503 Service Unavailable");
+        assert!(matches!(e, AuthError::Status { status: 503, .. }), "{e:?}");
+    }
+
+    /// An OAuth JSON error body is still `Denied` with its description.
+    #[test]
+    fn oauth_json_error_is_still_denied() {
+        let e = token_error(
+            400,
+            r#"{"error":"invalid_grant","error_description":"AADSTS70008: expired"}"#,
+        );
+        assert_eq!(e.to_string(), "authorization denied: AADSTS70008: expired");
     }
 
     #[test]

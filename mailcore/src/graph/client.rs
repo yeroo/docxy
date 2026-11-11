@@ -69,7 +69,7 @@ pub(crate) const HTTP_ERROR_TEXT_MAX: usize = 200;
 /// `reason_phrase`'s table), else `HTTP {status}`. Never the body itself (an
 /// IIS 411 page is four lines of HTML); always one line, at most
 /// `HTTP_ERROR_TEXT_MAX` characters. The body stays in the error for `Debug`.
-fn http_error_text(status: u16, body: &str) -> String {
+pub(crate) fn http_error_text(status: u16, body: &str) -> String {
     let text = match (graph_error_message(body), reason_phrase(status)) {
         (Some(message), _) => format!("HTTP {status}: {message}"),
         (None, Some(reason)) => format!("HTTP {status} {reason}"),
