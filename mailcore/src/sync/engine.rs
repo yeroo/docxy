@@ -2997,9 +2997,11 @@ impl Engine {
             .store
             .current_folder_id(id)
             .unwrap_or_else(|_| id.to_string());
-        match self.store.folders() {
-            Ok(folders) if folders.iter().any(|f| f.id == id) => {}
-            Ok(_) => {
+        // `folder_histories` lists every stored folder, so `None` is an id
+        // not in the store.
+        let history = match self.store.folder_history(&id) {
+            Ok(Some(h)) => h,
+            Ok(None) => {
                 self.emit(SyncEvent::Error(format!(
                     "backfill folder: unknown folder {id}"
                 )));
@@ -3009,17 +3011,10 @@ impl Engine {
                 self.emit(SyncEvent::Error(e.to_string()));
                 return;
             }
-        }
-        let history = match self.store.folder_history(&id) {
-            Ok(h) => h,
-            Err(e) => {
-                self.emit(SyncEvent::Error(e.to_string()));
-                return;
-            }
         };
         self.backfill_first.retain(|f| *f != id);
-        let whole = self.whole_mailbox();
-        if history.is_some_and(|h| h.has_delta_link && history_complete(h.scope.as_deref(), whole))
+        if history.has_delta_link
+            && history_complete(history.scope.as_deref(), self.whole_mailbox())
         {
             return;
         }
