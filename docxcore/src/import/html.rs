@@ -331,10 +331,22 @@ struct Block {
     /// continuations. Per item, so a nested list's items leave their
     /// parent's alone.
     item_numbered: bool,
+    /// On an `li`'s own entry and below it (#2114): the item's number in
+    /// its own list as a browser counts it (each list from 1), what its
+    /// hang is as wide as.
+    item_ordinal: u32,
     /// On an `li`'s own entry (FIX r2 m1): the empty paragraph that holds
     /// the item's number until one with a line takes it, as its flow's
     /// `table_depth` and index there.
     item_held: Option<(usize, usize)>,
+}
+
+/// An open `ul` / `ol` / `dir` / `menu`.
+#[derive(Clone, Copy, Debug, Default)]
+struct OpenList {
+    ordered: bool,
+    /// The `li`s opened in it so far (#2114).
+    items: u32,
 }
 
 /// How an element takes part in the page, for its look.
@@ -689,6 +701,16 @@ const ZERO_IND: &str = "<w:ind w:left=\"0\" w:hanging=\"0\"/>";
 /// hanging indent.
 const DECIMAL_HANG: f64 = 1.1125;
 const BULLET_HANG: f64 = 1.375;
+/// What each digit past the first adds to [`DECIMAL_HANG`] (#2114):
+/// Chrome right-aligns a wider number in its marker box, `"10. "` 1.668 em.
+const DIGIT_HANG: f64 = 0.5555;
+
+/// The hang of a numbered HTML item numbered `n`, in em (#2114): wide
+/// enough for its own number, so 10 and up do not tab past the text.
+fn decimal_hang(n: u32) -> f64 {
+    let digits = n.max(1).ilog10() + 1;
+    DECIMAL_HANG + f64::from(digits - 1) * DIGIT_HANG
+}
 
 /// The paragraph-mark `w:rPr` of a run's look (#1979): its font, size,
 /// colour, bold and italic, what Word and LibreOffice draw a list marker
@@ -1678,8 +1700,8 @@ struct Html<'a> {
     /// Every open element (but void and skipped ones) and its look.
     elems: Vec<Elem>,
     blocks: Vec<(String, Block)>,
-    /// Open `ul` / `ol`: whether each is ordered.
-    lists: Vec<bool>,
+    /// Open `ul` / `ol` / `dir` / `menu`.
+    lists: Vec<OpenList>,
     table_depth: usize,
     /// Open `pre` elements on `blocks`.
     pre: usize,
@@ -1981,9 +2003,13 @@ impl<'a> Html<'a> {
                     block.mso_list = false;
                     block.item_numbered = false;
                     block.item_held = None;
-                    let numbered = self.lists.last().copied().unwrap_or(false);
+                    let numbered = self.lists.last().is_some_and(|l| l.ordered);
                     let level = self.lists.len().saturating_sub(1) as i32;
                     block.item = Some((numbered, level));
+                    block.item_ordinal = self.lists.last_mut().map_or(1, |l| {
+                        l.items = l.items.saturating_add(1);
+                        l.items
+                    });
                 }
                 if name == "td" || name == "th" {
                     // A cell starts with nothing structural inherited from
@@ -2000,7 +2026,10 @@ impl<'a> Html<'a> {
             "ul" | "ol" | "dir" | "menu" => {
                 self.end_para_if_any();
                 if self.lists.len() < MAX_DEPTH {
-                    self.lists.push(name == "ol");
+                    self.lists.push(OpenList {
+                        ordered: name == "ol",
+                        items: 0,
+                    });
                 }
             }
             // A `dl` is a block too (#2114): the line in progress ends at
@@ -2872,7 +2901,13 @@ impl<'a> Html<'a> {
                     .item_elem()
                     .map_or(css::BASE_PT, |e| font_pt(&e.look.run))
                     * 20.0;
-                let hang = (em * if numbered { DECIMAL_HANG } else { BULLET_HANG }).round();
+                let hang = (em
+                    * if numbered {
+                        decimal_hang(block.item_ordinal)
+                    } else {
+                        BULLET_HANG
+                    })
+                .round();
                 p.first_line = -(hang.clamp(0.0, 31_680.0) as i32).min(p.indent);
             }
             _ => {
@@ -2915,6 +2950,7 @@ impl<'a> Html<'a> {
             .map(|(_, b)| b.clone())
             .unwrap_or_default();
         self.after_block_object = false;
+        self.out.drop_trailing_break();
         let mut props = self.par_props();
         if let Some(a) = align {
             props.align = a;
@@ -7510,10 +7546,53 @@ mod batch_2114_tests {
     //! with its first and last child's, and a table in a centred
     //! fixed-width wrapper, each laid out as a browser does.
     use super::*;
-    use crate::import::paragraph_texts;
+    use crate::model::{Block as DocBlock, Paragraph};
 
+    fn doc(html: &str) -> Document {
+        import_html(html.as_bytes()).unwrap()
+    }
+
+    /// The same page in standards mode.
     fn standards(html: &str) -> Document {
-        import_html(format!("<!DOCTYPE html>{html}").as_bytes()).unwrap()
+        doc(&format!("<!DOCTYPE html>{html}"))
+    }
+
+    fn all_paras(d: &Document) -> Vec<Paragraph> {
+        fn walk(blocks: &[DocBlock], out: &mut Vec<Paragraph>) {
+            for b in blocks {
+                match b {
+                    DocBlock::Paragraph(p) => out.push(p.clone()),
+                    DocBlock::Table(t) => {
+                        for c in t.rows.iter().flat_map(|r| &r.cells) {
+                            walk(&c.blocks, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&d.body, &mut out);
+        out
+    }
+
+    fn texts(d: &Document) -> Vec<String> {
+        all_paras(d).iter().map(|p| p.plain_text()).collect()
+    }
+
+    fn para_of(d: &Document, text: &str) -> Paragraph {
+        all_paras(d)
+            .into_iter()
+            .find(|p| p.plain_text() == text)
+            .unwrap_or_else(|| panic!("no paragraph is {text:?} in {:?}", texts(d)))
+    }
+
+    /// The line breaks in a paragraph.
+    fn breaks(p: &Paragraph) -> usize {
+        p.content
+            .iter()
+            .filter(|i| matches!(i, Inline::Break(crate::model::BreakKind::Line, _)))
+            .count()
     }
 
     #[test]
@@ -7521,6 +7600,77 @@ mod batch_2114_tests {
         // A `dl` ends the line in progress at its start and its end, as
         // any block does: three lines, not one.
         let d = standards("a<dl>b</dl>c");
-        assert_eq!(paragraph_texts(&d), ["a", "b", "c"]);
+        assert_eq!(texts(&d), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn plan_trailing_br_a_block_s_last_break_adds_no_line() {
+        for html in [
+            "<div>text<br></div>",
+            "<p>text<br>\n</p>",
+            "<div>text<br> </div>",
+            "<table><tr><td>text<br></td></tr></table>",
+            "<div><b>text<br></b></div>",
+        ] {
+            let d = doc(html);
+            assert_eq!(texts(&d), ["text"], "{html}");
+            assert_eq!(breaks(&para_of(&d, "text")), 0, "{html}");
+        }
+        // Two: one stays, an empty line after the text.
+        let d = doc("<div>a<br><br></div>");
+        assert_eq!(all_paras(&d).len(), 1);
+        assert_eq!(breaks(&all_paras(&d)[0]), 1);
+        // Alone, it is the block's one empty line, as before.
+        // (an empty paragraph: a break alone is white space, cleared).
+        let d = doc("<div><br></div><div>b</div>");
+        assert_eq!(texts(&d), ["", "b"]);
+        // Content after it keeps it.
+        let d = doc("<div>a<br>&nbsp;</div>");
+        assert_eq!(breaks(&all_paras(&d)[0]), 1);
+        // A block's start ends the line too.
+        let d = doc("<div>a<br><div>b</div></div>");
+        assert_eq!(texts(&d), ["a", "b"]);
+        // An item stays numbered.
+        let d = doc("<ol><li>a<br></li></ol>");
+        let a = para_of(&d, "a");
+        assert_eq!((a.props.num_id, breaks(&a)), (Some(2), 0));
+        // `pre`'s newline before its end is the same break.
+        let d = doc("<pre>a\n</pre>");
+        assert_eq!(texts(&d), ["a"]);
+    }
+
+    #[test]
+    fn plan_wide_hang_fits_the_item_s_own_number() {
+        let items: String = (1..=12).map(|n| format!("<li>i{n}</li>")).collect();
+        let d = doc(&format!("<ol style='font-size:12pt'>{items}</ol>"));
+        for n in 1..=9 {
+            assert_eq!(para_of(&d, &format!("i{n}")).props.first_line, -267, "{n}");
+        }
+        let two = -(240.0f64 * (1.1125 + 0.5555)).round() as i32;
+        assert_eq!(two, -400);
+        for n in 10..=12 {
+            assert_eq!(para_of(&d, &format!("i{n}")).props.first_line, two, "{n}");
+        }
+        let items: String = (1..=100).map(|n| format!("<li>i{n}</li>")).collect();
+        let d = doc(&format!("<ol style='font-size:12pt'>{items}</ol>"));
+        let three = -(240.0f64 * (1.1125 + 2.0 * 0.5555)).round() as i32;
+        assert_eq!(para_of(&d, "i100").props.first_line, three);
+        assert_eq!(para_of(&d, "i99").props.first_line, two);
+        // A nested list counts its own items.
+        let items: String = (1..=9).map(|n| format!("<li>i{n}</li>")).collect();
+        let d = doc(&format!(
+            "<ol style='font-size:12pt'>{items}<li>i10<ol><li>inner</li></ol></li><li>i11</li></ol>"
+        ));
+        assert_eq!(para_of(&d, "inner").props.first_line, -267);
+        assert_eq!(para_of(&d, "i11").props.first_line, two);
+        // Clamped to the indent; bullets unchanged.
+        let items: String = (1..=10).map(|n| format!("<li>i{n}</li>")).collect();
+        let d = doc(&format!(
+            "<ol style='font-size:12pt;padding-left:0'>{items}</ol>"
+        ));
+        assert_eq!(para_of(&d, "i10").props.first_line, 0);
+        let items: String = (1..=10).map(|n| format!("<li>u{n}</li>")).collect();
+        let d = doc(&format!("<ul style='font-size:12pt'>{items}</ul>"));
+        assert_eq!(para_of(&d, "u10").props.first_line, -330);
     }
 }

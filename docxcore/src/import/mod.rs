@@ -571,6 +571,18 @@ impl<'b> Builder<'b> {
         }
     }
 
+    /// Drop the line break that ends the paragraph in progress, when
+    /// something comes before it (#2114): a browser's `<br>` that ends a
+    /// block adds no line, while a lone one (`<div><br></div>`) is the
+    /// block's one empty line.
+    pub(crate) fn drop_trailing_break(&mut self) {
+        if self.para.len() > 1
+            && matches!(self.para.last(), Some(Inline::Break(BreakKind::Line, _)))
+        {
+            self.para.pop();
+        }
+    }
+
     /// The text of the paragraph in progress.
     pub(crate) fn para_text(&self) -> String {
         self.para.iter().map(|i| i.text()).collect()
