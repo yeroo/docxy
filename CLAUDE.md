@@ -44,7 +44,8 @@ issue number to find its notes.
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),
   images (#1880), links (#1879), centring (#1922), rounded images (#1926),
   nested cards (#1927), page margins (#1928), Outlook mail: CSS-only spacing,
-  quirks-mode edges, list indents, item continuations, marker look (#1979).
+  quirks-mode edges, list indents, item continuations, marker look (#1979),
+  list and parent margins, trailing `<br>`, wide hangs, wrapper tables (#2114).
 - `docs/claude/email-html.md`: before changing `docxcore::export_email` (a `Document` as an
   e-mail body): inline styles only, lists and their `start`, safe links, `cid:` pictures and
   their media, the import round trip (#1948).
