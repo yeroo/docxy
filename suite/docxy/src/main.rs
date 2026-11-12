@@ -12318,9 +12318,9 @@ fn edit_caret_row(
 /// A Find bar field's text, document or sheet (#2116): the runs before and
 /// after the caret, each a click-to-caret segment ([`find_field_segment`]),
 /// with `bar` drawn between them while the field is focused; `sel` tints a
-/// whole-field selection. The row is probed as `probe_id` (`df-q-text`, …),
-/// where `pointer-click {"input":…,"x":n}` presses. Text size and colour are
-/// the field's.
+/// whole-field selection. The row carries `probe_el`, the caller's probe of
+/// the text row (`df-q-text`, …), where `pointer-click {"input":…,"x":n}`
+/// presses. Text size and colour are the field's.
 fn find_field_text(
     text: &str,
     caret: usize,
