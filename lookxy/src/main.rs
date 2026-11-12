@@ -135,6 +135,10 @@ fn main() -> io::Result<()> {
     app.threaded = config.threaded;
     app.signature = config.signature.clone();
     app.reminders_notify = config.reminders_notify;
+    // The engine's mode (#2117): `App::new` already seeded which folders are
+    // up to date as a window-mode engine's, so seed again with the mode.
+    app.whole_mailbox = config.backfill_days <= 0;
+    app.seed_folders_up_to_date();
     app.folder_tree_initialized = config.folder_tree_initialized;
     app.config_path = crate::config::config_file_path();
     // First-run default: expand the Inbox (no-op for returning users, and a

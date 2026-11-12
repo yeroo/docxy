@@ -148,6 +148,31 @@ pub struct FolderHistory {
     pub total_count: i64,
 }
 
+impl FolderHistory {
+    /// Whether this folder's history is complete for the engine's mode
+    /// (#1871): it has a delta link (phase 1 done) and what that link covers
+    /// is enough for the mode ([`history_complete`]). The engine walks only
+    /// the folders for which this is false, so a host can say "up to date"
+    /// for a folder synced in an earlier run, which gets no
+    /// `FolderProgress { complete: true }` again (#2117). `whole_mailbox`
+    /// is the engine's mode: `backfill_days <= 0`.
+    pub fn is_complete(&self, whole_mailbox: bool) -> bool {
+        self.has_delta_link && history_complete(self.scope.as_deref(), whole_mailbox)
+    }
+}
+
+/// Whether a folder's history is complete for the mode (#1871), from what
+/// its `delta_link` covers ([`FolderHistory::scope`]), for a folder that has
+/// one (phase 1 done): a link from before #1871 (`None`) or a `window` one
+/// is complete in window mode only; an `all` one always; a `head` one never.
+fn history_complete(scope: Option<&str>, whole: bool) -> bool {
+    match scope {
+        None => !whole,
+        Some(s) if s == SCOPE_WINDOW => !whole,
+        Some(s) => s == SCOPE_ALL,
+    }
+}
+
 /// `history_scope` of a folder whose `delta_link` is a filtered head delta:
 /// its recent mail only, the backfill still to come (#1871).
 pub const SCOPE_HEAD: &str = "head";
@@ -18823,6 +18848,46 @@ mod backfill_tests {
             ),
             (Some(SCOPE_HEAD), Some("PAGE2"), 50, 130)
         );
+    }
+
+    #[test]
+    fn history_complete_by_mode() {
+        // scope → (complete in window mode, in whole mode), for a folder
+        // with a delta link (`FolderHistory::is_complete` asks only then).
+        let cases: &[(Option<&str>, bool, bool)] = &[
+            (None, true, false),
+            (Some(SCOPE_HEAD), false, false),
+            (Some(SCOPE_WINDOW), true, false),
+            (Some(SCOPE_ALL), true, true),
+            (Some("other"), false, false),
+        ];
+        for &(scope, window, whole) in cases {
+            assert_eq!(history_complete(scope, false), window, "{scope:?} window");
+            assert_eq!(history_complete(scope, true), whole, "{scope:?} whole");
+        }
+    }
+
+    #[test]
+    fn folder_history_is_complete_needs_a_delta_link_and_the_mode_s_scope() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F1", 120, None);
+        // No delta link yet: never complete, whatever the mode.
+        assert!(!history(&s, "F1").is_complete(false));
+        assert!(!history(&s, "F1").is_complete(true));
+        // A head link: the backfill is still to come in either mode.
+        s.set_head_link("F1", "HEAD", false).unwrap();
+        assert!(!history(&s, "F1").is_complete(false));
+        assert!(!history(&s, "F1").is_complete(true));
+        // A window walk completes window mode only.
+        s.complete_backfill("F1", "FULL", SCOPE_WINDOW, 10, None)
+            .unwrap();
+        assert!(history(&s, "F1").is_complete(false));
+        assert!(!history(&s, "F1").is_complete(true));
+        // A walk with no cutoff completes both.
+        s.complete_backfill("F1", "FULL2", SCOPE_ALL, 12, None)
+            .unwrap();
+        assert!(history(&s, "F1").is_complete(false));
+        assert!(history(&s, "F1").is_complete(true));
     }
 
     #[test]
