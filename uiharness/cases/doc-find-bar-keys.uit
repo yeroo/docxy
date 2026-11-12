@@ -100,10 +100,37 @@ test document find: plan-ctrl-s Ctrl+Alt+S does not save
   assert reply.focused is true
   call real-key {"key":"escape"}
 
-# A document marked as final refuses the save as it does with the bar
-# closed (file-keys.uit's Shift+F12): the bar's own exemption from the
-# lock is for its typing, not for Ctrl+S. The document is clean, so the
-# status, not `dirty`, tells the refusal from a save.
+# Where the document's key gate refuses Ctrl+S with the bar closed, the
+# bar's Ctrl+S is refused too: the bar's own exemption from that gate is
+# for its typing, not for the save. Display for Review's No Markup is the
+# case only the gate refuses (a save itself would write), so `dirty`
+# tells the refusal from a save. The display mode is the window's: the
+# test puts All Markup back.
+test document find: plan-ctrl-s is refused in a view-only display
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":0}
+  call real-type {"text":"Z"}
+  assert dirty is true
+  call ribbon-click {"tab":"Review","command":"markupnone"}
+  assert view.display_mode is none
+  call real-key {"key":"ctrl+s"}
+  assert dirty is true
+  assert status is Edit blocked: Display for Review is No Markup or Original; switch to All Markup or Simple Markup to edit.
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"ctrl+s"}
+  assert dirty is true
+  assert status is Edit blocked: Display for Review is No Markup or Original; switch to All Markup or Simple Markup to edit.
+  assert find_open is true
+  call real-key {"key":"escape"}
+  call ribbon-click {"tab":"Review","command":"markupall"}
+  assert view.display_mode is all
+
+# A document marked as final refuses it as with the bar closed
+# (file-keys.uit's Shift+F12). Its save path refuses a final document as
+# well, so this pins the outcome rather than the key gate.
 test document find: plan-ctrl-s is refused on a final document
   open copy:../fixtures/final.docx
   call real-key {"key":"escape"}
