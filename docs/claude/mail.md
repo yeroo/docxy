@@ -2167,6 +2167,53 @@ so the user's other devices follow.
 - lookxy never sends the two commands. Its `on_sync_event` ignores the
   three events.
 
+## Directory search (#1942)
+
+- `GraphClient::search_users(query, top)`: `GET /users?$search="displayName:<q>" OR
+  "mail:<q>"&$select=displayName,mail,userPrincipalName,jobTitle,department&$top=…` with
+  `ConsistencyLevel: eventual`, which Graph requires for `$search` on directory objects. The
+  tenant's user directory (Graph `/users`) for a To/Cc/Bcc completion, beside `/me/people`'s
+  top 200 and the store's own addresses. It is not Exchange's global address list: disabled
+  accounts and mailboxes hidden from address lists may appear, and mailcore does not filter
+  them (`accountEnabled` is not readable under `User.ReadBasic.All`, and v1.0 has no
+  hidden-from-address-lists property, so neither is in `$select`).
+- `directory_search_value` puts the query in both quoted clauses with its `\` and `"`
+  escaped (`escape_search_text`, which `search_value` shares since #1942: its output is
+  unchanged), so `x" OR "y` stays inside them, and percent-encodes the whole value. Escaping,
+  not refusing: an odd query is still asked.
+- `top` is clamped to `1..=DIRECTORY_TOP_MAX` (999, Graph's `/users` page cap). One request:
+  no `@odata.nextLink` is followed, as a completion never wants more than `top`.
+- `DirectoryUser { name, address, job_title, department }` (`graph::model`). `address` is
+  the trimmed `mail`; with no (or a blank) `mail`, the `userPrincipalName` when
+  `looks_like_address` (one `@`, a local part, a dotted domain, no whitespace, and not a
+  guest's `#EXT#` UPN, which is no mailbox). A user with neither is skipped (a room with an
+  odd UPN, a guest without `mail`). A UPN only looks like an address: a user without `mail`
+  may have no mailbox (unlicensed, a service account), so a client may rank a UPN-only user
+  below one with `mail`. `name` is the trimmed `displayName`, `""` when absent.
+  `job_title` and `department` are `None` when absent, null, not a string or blank.
+  `Person` is not reused: it carries `rank`, and a client ranks the two sources apart.
+- `SyncCommand::SearchDirectory { query, top }` answers `SyncEvent::DirectoryResults {
+  query, users }` (the query as asked, for dropping a stale answer; no matches is an empty
+  `users`), or `SyncEvent::DirectoryUnavailable { query, forbidden, reason }`, never
+  `SyncEvent::Error`. Nothing is stored.
+- `forbidden` is true for a 403 only: the token or tenant lacks `User.ReadBasic.All`, and
+  asking again will not help, so a client stops asking. Every other failure is
+  `forbidden: false`:
+  - signed out ("not signed in") and a blank query ("empty query"), with no request;
+  - a 401 that `with_auth`'s refresh did not cure (`react` asks for sign-in);
+  - a 429 (`next_retry`) or a transport failure (Offline), through `react_quietly`, as for
+    #2006: a throttled directory search backs off the whole engine, so a client debounces
+    its keystrokes;
+  - any other 4xx or 5xx. A personal (MSA) account has no directory: whatever non-403 status
+    Graph answers there is `forbidden: false`, and the client's own fallback decides.
+- Served at `Engine::checkpoint` (`served_at_checkpoint`), as `SearchMessages` is: completion
+  is typed, so it waits only for the request in flight, never a pass
+  (`search_directory_is_served_during_a_slow_pass`). Tried during a back-off. Not kept at a
+  shutdown (`persists_at_shutdown`: a read).
+- The scope is the client's (`AuthConfig::scope`): `User.ReadBasic.All` is not in the default
+  list.
+- lookxy never sends `SearchDirectory`; its `on_sync_event` ignores the two events.
+
 ## Message rows by id (#2053)
 
 - `Store::message_row(id)` is a stored message's `MessageRow`, the row
@@ -3860,8 +3907,8 @@ quarantine re-listed the mailbox and brought the lost writes back.
   first command.
 - `Engine::checkpoint` is built on `take_waiting`: it reads the channel up to a waiting
   `Shutdown` first, then serves the kept commands of a served kind (`served_at_checkpoint`:
-  `FetchBody`, `SearchMessages`, `FetchMessage`, `FetchFolderSizes`) out of `deferred`, one at
-  a time, taking again after each. A read sent before a `Shutdown` is therefore never served,
+  `FetchBody`, `SearchMessages`, `FetchMessage`, `FetchFolderSizes`, `SearchDirectory`) out of
+  `deferred`, one at a time, taking again after each. A read sent before a `Shutdown` is therefore never served,
   in the bulk runs' checkpoints inside a drain too. Outside a shutdown the order is unchanged:
   a served kind in `deferred` is one the drain took early, which the old `checkpoint` would have
   read from the channel and served ahead of the deferred writes the same way, and `main_loop`

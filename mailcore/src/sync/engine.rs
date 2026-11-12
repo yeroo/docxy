@@ -35,8 +35,10 @@
 //! the bodies of the newest `EngineOptions::prefetch_body_days` of mail, a
 //! small batch per step, before any backfill page. A `SyncCommand::FetchBody`
 //! (and a server search or the opening of a hit, `SyncCommand::SearchMessages`
-//! and `SyncCommand::FetchMessage`, #2006, and a read of folders' sizes on
-//! the server, `SyncCommand::FetchFolderSizes`, #2123) never waits for a whole pass: long
+//! and `SyncCommand::FetchMessage`, #2006, a read of folders' sizes on
+//! the server, `SyncCommand::FetchFolderSizes`, #2123, and a search of the
+//! organisation's directory, `SyncCommand::SearchDirectory`, #1942) never
+//! waits for a whole pass: long
 //! work calls `Engine::checkpoint` between folders, delta pages and body
 //! fetches, which serves it at once and keeps every other command for after
 //! the work, in order.
@@ -53,8 +55,9 @@ use crate::graph::client::{
 };
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
-    AutomaticReplies, DeltaItem, Event, EventDeltaItem, FolderContact, MailFolder, Me,
-    MeetingMessage, Message, MessageFields, Recipient, ScheduleEntry, SearchHit, parse_folder_size,
+    AutomaticReplies, DeltaItem, DirectoryUser, Event, EventDeltaItem, FolderContact, MailFolder,
+    Me, MeetingMessage, Message, MessageFields, Recipient, ScheduleEntry, SearchHit,
+    parse_folder_size,
 };
 pub use crate::store::ClearOfflineRefusal;
 use crate::store::{
@@ -213,6 +216,16 @@ pub enum SyncCommand {
     /// [`SyncEvent::Error`]. Nothing is stored. Served ahead of a running
     /// pass, as `SearchMessages` is, and tried even during a back-off.
     FetchFolderSizes { folder_ids: Vec<String> },
+    /// Search the tenant's user directory (Graph `/users`, #1942,
+    /// `GraphClient::search_users`), for a To/Cc/Bcc completion:
+    /// users whose display name or address matches `query` (as the client
+    /// typed it), at most `top` (`1..=DIRECTORY_TOP_MAX`). Answers with
+    /// [`SyncEvent::DirectoryResults`], or
+    /// [`SyncEvent::DirectoryUnavailable`] (its `forbidden` set for a 403:
+    /// the token or tenant does not allow `User.ReadBasic.All`), never a
+    /// [`SyncEvent::Error`]. Nothing is stored. Served ahead of a running
+    /// pass, as `SearchMessages` is, and tried even during a back-off.
+    SearchDirectory { query: String, top: usize },
     /// Fetch attachment metadata (`GraphClient::list_attachments`) for a
     /// message and store it, then emit [`SyncEvent::AttachmentsUpdated`].
     /// `Store::put_attachments` is otherwise never populated in production
@@ -1029,6 +1042,24 @@ pub enum SyncEvent {
         folder_ids: Vec<String>,
         error: String,
     },
+    /// The directory's answer to [`SyncCommand::SearchDirectory`] (#1942),
+    /// with the query it was asked, so a client can drop an answer to a
+    /// query it has since changed. No matches is an empty `users`.
+    DirectoryResults {
+        query: String,
+        users: Vec<DirectoryUser>,
+    },
+    /// [`SyncCommand::SearchDirectory`] could not search the directory
+    /// (#1942): `forbidden` for a 403 (no `User.ReadBasic.All` for this
+    /// token or tenant: asking again will not help), otherwise signed out,
+    /// a blank query, offline, throttled, a 401 a refresh did not cure, or
+    /// another 4xx or 5xx. Not a sync error: a client falls back to its own
+    /// completion. `reason` is one line.
+    DirectoryUnavailable {
+        query: String,
+        forbidden: bool,
+        reason: String,
+    },
     /// An inline image's bytes were fetched (from
     /// [`SyncCommand::FetchInlineImage`]); the UI caches them by `content_id`.
     InlineImageReady {
@@ -1727,6 +1758,7 @@ fn served_at_checkpoint(cmd: &SyncCommand) -> bool {
             | SyncCommand::SearchMessages { .. }
             | SyncCommand::FetchMessage { .. }
             | SyncCommand::FetchFolderSizes { .. }
+            | SyncCommand::SearchDirectory { .. }
     )
 }
 
@@ -1800,6 +1832,7 @@ fn persists_at_shutdown(cmd: &SyncCommand) -> bool {
         | SyncCommand::SearchMessages { .. }
         | SyncCommand::FetchMessage { .. }
         | SyncCommand::FetchFolderSizes { .. }
+        | SyncCommand::SearchDirectory { .. }
         | SyncCommand::FetchAttachments { .. }
         | SyncCommand::FetchMeetingMessage { .. }
         | SyncCommand::FetchAutomaticReplies
@@ -2398,8 +2431,8 @@ impl Engine {
     /// Takes every command waiting on the channel (`take_waiting`), then
     /// serves the kept ones of a served kind (`served_at_checkpoint`), between
     /// two requests of long work (#1978): a `FetchBody`, a `SearchMessages`
-    /// or a `FetchMessage` (#2006), or a `FetchFolderSizes` (#2123) is
-    /// served at once, so a click costs its own round trips plus the request
+    /// or a `FetchMessage` (#2006), a `FetchFolderSizes` (#2123) or a
+    /// `SearchDirectory` (#1942) is served at once, so a click costs its own round trips plus the request
     /// in flight, not a whole pass; every other command is kept (`deferred`)
     /// for the main loop, in order. A `Shutdown` or a dropped handle sets
     /// `shutting_down`, and as the channel is read up to it before anything
@@ -2427,6 +2460,9 @@ impl Engine {
                 Some(SyncCommand::FetchMessage { id }) => self.fetch_message(&id),
                 Some(SyncCommand::FetchFolderSizes { folder_ids }) => {
                     self.fetch_folder_sizes(folder_ids)
+                }
+                Some(SyncCommand::SearchDirectory { query, top }) => {
+                    self.search_directory(query, top)
                 }
                 _ => false,
             };
@@ -2737,6 +2773,9 @@ impl Engine {
             }
             SyncCommand::FetchFolderSizes { folder_ids } => {
                 self.fetch_folder_sizes(folder_ids);
+            }
+            SyncCommand::SearchDirectory { query, top } => {
+                self.search_directory(query, top);
             }
             SyncCommand::FetchAttachments { message_id } => self.fetch_attachments(&message_id),
             SyncCommand::SaveAttachment {
@@ -6896,6 +6935,47 @@ impl Engine {
                 self.emit(SyncEvent::MessageSearchFailed {
                     query,
                     folder_id,
+                    reason: e.to_string(),
+                });
+                self.react_quietly(e)
+            }
+        }
+    }
+
+    // --- Directory search (#1942) ------------------------------------------
+
+    /// Serves [`SyncCommand::SearchDirectory`]: the users as
+    /// `DirectoryResults`, or `DirectoryUnavailable` (`forbidden` for a
+    /// 403), never a `SyncEvent::Error`. Signed out or with a blank query it
+    /// sends no request; the query goes to Graph as asked. Like
+    /// `search_messages` it does not wait out a back-off. Returns
+    /// `react_quietly`'s answer, for `checkpoint`.
+    fn search_directory(&mut self, query: String, top: usize) -> bool {
+        let refused = if self.token.is_none() {
+            Some("not signed in")
+        } else if query.trim().is_empty() {
+            Some("empty query")
+        } else {
+            None
+        };
+        if let Some(reason) = refused {
+            self.emit(SyncEvent::DirectoryUnavailable {
+                query,
+                forbidden: false,
+                reason: reason.to_string(),
+            });
+            return false;
+        }
+        match self.with_auth(|c| c.search_users(&query, top)) {
+            Ok(users) => {
+                self.emit(SyncEvent::DirectoryResults { query, users });
+                false
+            }
+            Err(e) => {
+                let forbidden = matches!(e, GraphError::Http { status: 403, .. });
+                self.emit(SyncEvent::DirectoryUnavailable {
+                    query,
+                    forbidden,
                     reason: e.to_string(),
                 });
                 self.react_quietly(e)
@@ -31054,6 +31134,272 @@ mod tests {
                     assert!(!store.message_exists("H1").unwrap());
                     assert_eq!(stored_ids(&dir, "F2"), ["H1N"]);
                     let _ = std::fs::remove_dir_all(&dir);
+                }
+                // --- Directory search (#1942) ---------------------------
+
+                mod directory {
+                    use super::*;
+                    use crate::testserver::RecordedRequest;
+
+                    const USERS: &str = r#"{"value":[
+                        {"displayName":"Jo Smith","mail":"jo@contoso.com","jobTitle":"Engineer","department":"R&D"},
+                        {"displayName":"Joan","mail":null,"userPrincipalName":"joan@contoso.com"},
+                        {"displayName":"Room","userPrincipalName":"room"}
+                    ]}"#;
+
+                    fn users_route(status: u16, body: &str) -> (Route, Option<usize>) {
+                        search_route("/users?$search", status, body)
+                    }
+
+                    fn search_dir(handle: &SyncHandle, query: &str, top: usize) {
+                        handle
+                            .cmd_tx
+                            .send(SyncCommand::SearchDirectory {
+                                query: query.into(),
+                                top,
+                            })
+                            .unwrap();
+                    }
+
+                    fn is_dir_answer(e: &SyncEvent) -> bool {
+                        matches!(
+                            e,
+                            SyncEvent::DirectoryResults { .. }
+                                | SyncEvent::DirectoryUnavailable { .. }
+                        )
+                    }
+
+                    /// Events until the directory search's answer, which must
+                    /// be `DirectoryUnavailable`: its query, `forbidden`,
+                    /// reason, and every event seen.
+                    fn unavailable(handle: &SyncHandle) -> (String, bool, String, Vec<SyncEvent>) {
+                        let events = wait_for(&handle.evt_rx, is_dir_answer);
+                        match events.last() {
+                            Some(SyncEvent::DirectoryUnavailable {
+                                query,
+                                forbidden,
+                                reason,
+                            }) => (query.clone(), *forbidden, reason.clone(), events),
+                            other => panic!("expected DirectoryUnavailable, got {other:?}"),
+                        }
+                    }
+
+                    fn user_searches(srv: &FakeServer) -> Vec<RecordedRequest> {
+                        srv.requests()
+                            .into_iter()
+                            .filter(|r| r.path.starts_with("/users?"))
+                            .collect()
+                    }
+
+                    #[test]
+                    fn search_directory_answers_with_its_query() {
+                        let srv = two_folders(vec![], vec![users_route(200, USERS)]);
+                        let (handle, dir) = started(&srv, "dir-answers");
+                        search_dir(&handle, "jo", 10);
+                        let events = wait_for(&handle.evt_rx, is_dir_answer);
+                        no_error(&events);
+                        assert_eq!(
+                            events.last().unwrap(),
+                            &SyncEvent::DirectoryResults {
+                                query: "jo".into(),
+                                users: vec![
+                                    DirectoryUser {
+                                        name: "Jo Smith".into(),
+                                        address: "jo@contoso.com".into(),
+                                        job_title: Some("Engineer".into()),
+                                        department: Some("R&D".into()),
+                                    },
+                                    DirectoryUser {
+                                        name: "Joan".into(),
+                                        address: "joan@contoso.com".into(),
+                                        job_title: None,
+                                        department: None,
+                                    },
+                                ],
+                            }
+                        );
+                        let reqs = user_searches(&srv);
+                        assert_eq!(reqs.len(), 1);
+                        assert_eq!(
+                            reqs[0].path,
+                            "/users?$search=%22displayName%3Ajo%22%20OR%20%22mail%3Ajo%22\
+                             &$select=displayName,mail,userPrincipalName,jobTitle,department&$top=10"
+                        );
+                        assert!(
+                            reqs[0].headers.iter().any(|(n, v)| {
+                                n.eq_ignore_ascii_case("ConsistencyLevel") && v == "eventual"
+                            }),
+                            "{:?}",
+                            reqs[0].headers
+                        );
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn search_directory_with_no_matches_answers_empty_users() {
+                        let srv = two_folders(vec![], vec![users_route(200, r#"{"value":[]}"#)]);
+                        let (handle, dir) = started(&srv, "dir-empty");
+                        search_dir(&handle, "zz", 5);
+                        let events = wait_for(&handle.evt_rx, is_dir_answer);
+                        no_error(&events);
+                        assert_eq!(
+                            events.last().unwrap(),
+                            &SyncEvent::DirectoryResults {
+                                query: "zz".into(),
+                                users: vec![],
+                            }
+                        );
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    fn directory_failing_with(status: u16, tag: &str) -> bool {
+                        let srv = two_folders(
+                            vec![],
+                            vec![users_route(
+                                status,
+                                r#"{"error":{"code":"Authorization_RequestDenied","message":"Insufficient privileges"}}"#,
+                            )],
+                        );
+                        let (handle, dir) = started(&srv, tag);
+                        search_dir(&handle, "jo", 10);
+                        let (query, forbidden, reason, events) = unavailable(&handle);
+                        assert_eq!(query, "jo");
+                        assert!(reason.contains(&status.to_string()), "{reason}");
+                        assert!(!reason.contains('\n'), "one line: {reason:?}");
+                        // The engine carries on: the next command is answered.
+                        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+                        let more = wait_for(&handle.evt_rx, is_idle);
+                        no_error(&events);
+                        no_error(&more);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                        forbidden
+                    }
+
+                    #[test]
+                    fn search_directory_403_is_forbidden_not_error() {
+                        assert!(directory_failing_with(403, "dir-403"));
+                    }
+
+                    #[test]
+                    fn search_directory_500_is_unavailable_not_error() {
+                        assert!(!directory_failing_with(500, "dir-500"));
+                    }
+
+                    #[test]
+                    fn search_directory_transport_failure_is_unavailable_not_error() {
+                        let srv = two_folders(vec![], vec![]);
+                        let (handle, dir) = started(&srv, "dir-transport");
+                        // The server goes away: the search is a transport error.
+                        drop(srv);
+                        search_dir(&handle, "jo", 10);
+                        let (query, forbidden, _reason, events) = unavailable(&handle);
+                        assert_eq!((query.as_str(), forbidden), ("jo", false));
+                        no_error(&events);
+                        // `react` takes the engine offline, still without an error.
+                        let more = wait_for(&handle.evt_rx, |e| {
+                            matches!(e, SyncEvent::State(SyncState::Offline))
+                        });
+                        no_error(&more);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn search_directory_signed_out_sends_no_request() {
+                        let srv = two_folders(vec![], vec![users_route(200, USERS)]);
+                        // No token: the engine waits for a sign-in.
+                        let dir = unique_dir("dir-signed-out");
+                        let handle = spawn_with(&srv, &dir, EngineOptions::without_prefetch());
+                        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+                        search_dir(&handle, "jo", 10);
+                        let (query, forbidden, reason, events) = unavailable(&handle);
+                        assert_eq!(
+                            (query.as_str(), forbidden, reason.as_str()),
+                            ("jo", false, "not signed in")
+                        );
+                        no_error(&events);
+                        assert!(user_searches(&srv).is_empty());
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn search_directory_blank_query_sends_no_request() {
+                        let srv = two_folders(vec![], vec![users_route(200, USERS)]);
+                        let (handle, dir) = started(&srv, "dir-blank");
+                        search_dir(&handle, " \t ", 10);
+                        let (query, forbidden, reason, events) = unavailable(&handle);
+                        assert_eq!(
+                            (query.as_str(), forbidden, reason.as_str()),
+                            (" \t ", false, "empty query")
+                        );
+                        no_error(&events);
+                        assert!(user_searches(&srv).is_empty());
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn search_directory_is_served_during_a_slow_pass() {
+                        let folders: Vec<Fold> =
+                            [("F1", "Inbox"), ("F2", "B"), ("F3", "C"), ("F4", "D")]
+                                .into_iter()
+                                .map(|(id, name)| {
+                                    small(Fold {
+                                        pages: vec![vec![msg(
+                                            &format!("M-{id}"),
+                                            "2020-01-01T00:00:00Z",
+                                        )]],
+                                        ..fold(
+                                            id,
+                                            name,
+                                            if id == "F1" { Some("inbox") } else { None },
+                                        )
+                                    })
+                                })
+                                .collect();
+                        let srv = FakeServer::start_paced(mailbox(
+                            &folders,
+                            vec![users_route(200, USERS)],
+                            Duration::from_millis(300),
+                        ));
+                        let dir = new_dir("dir-in-pass");
+                        let handle = spawn_with(&srv, &dir, EngineOptions::without_prefetch());
+                        // The startup pass is under way: some folder's delta is out.
+                        assert!(wait_until(ENGINE_WAIT, || {
+                            paths_from(&srv, 0)
+                                .iter()
+                                .any(|p| p.contains("/messages/delta?$orderby"))
+                        }));
+                        search_dir(&handle, "jo", 10);
+                        let events = wait_for(&handle.evt_rx, is_idle);
+                        assert!(
+                            events.iter().any(|e| matches!(
+                                e,
+                                SyncEvent::DirectoryResults { query, users } if query == "jo" && users.len() == 2
+                            )),
+                            "answered before the pass ended: {events:?}"
+                        );
+                        let reqs = srv.requests();
+                        let last_delta = reqs
+                            .iter()
+                            .filter(|r| r.path.contains("/messages/delta?$orderby"))
+                            .map(|r| r.at)
+                            .max()
+                            .unwrap();
+                        let searched_at: Vec<_> =
+                            user_searches(&srv).iter().map(|r| r.at).collect();
+                        assert_eq!(searched_at.len(), 1);
+                        assert!(
+                            searched_at[0] < last_delta,
+                            "the directory search came before the last delta"
+                        );
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
                 }
             }
         }
