@@ -345,6 +345,43 @@ fn doc_probe(id: &str) -> Option<&'static str> {
     }
 }
 
+/// The probe of a Find bar field's text row (#2116), from which
+/// `pointer-click {"input":id,"x":n}` counts its `n`.
+fn text_probe(id: &str) -> Option<&'static str> {
+    match id {
+        "doc-find" => Some("df-q-text"),
+        "doc-replace" => Some("df-r-text"),
+        "sheet-find" => Some("sf-q-text"),
+        "sheet-replace" => Some("sf-r-text"),
+        _ => None,
+    }
+}
+
+/// Where `pointer-click {"input":id,"x":n}` presses (#2116): `n` pixels in
+/// from the left edge of a Find bar field's text (of its placeholder, empty),
+/// mid-height, where a press on the text places the caret. Only the Find
+/// bars' fields take an `x`; [`press`] refuses what it refuses.
+pub(crate) fn press_at_x(
+    app: &crate::Docxy,
+    id: &str,
+    x: f32,
+    cx: &gpui::App,
+) -> Result<Press, String> {
+    let probe = text_probe(id).ok_or_else(|| {
+        format!("'x' is for a Find bar field (doc-find, doc-replace, sheet-find, sheet-replace), not {id}")
+    })?;
+    press(app, id, cx)?;
+    let b = app
+        .probes
+        .borrow()
+        .on_screen(probe)
+        .ok_or_else(|| format!("{id}'s text is not drawn"))?;
+    Ok(Press {
+        at: gpui::point(b.origin.x + gpui::px(x), b.center().y),
+        double: false,
+    })
+}
+
 /// Where `pointer-click {"input":id}` presses, from the frame on screen.
 /// A sheet input is pressed here: the in-cell editor is a double-click on
 /// the active cell, which opens it, refused while an entry is open, where a

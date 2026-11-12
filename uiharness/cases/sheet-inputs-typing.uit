@@ -556,8 +556,10 @@ test sheet sheet-find: focus by click
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
   call pointer-click {"input":"sheet-find"}
@@ -574,8 +576,10 @@ test sheet sheet-find: types
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-find"}
   call real-type {"text":"Ab1 "}
@@ -592,8 +596,10 @@ test sheet sheet-find: edits
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-find"}
   call real-type {"text":"abcd"}
@@ -624,8 +630,10 @@ test sheet sheet-find: select-all replaces
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-find"}
   call real-type {"text":"abcd"}
@@ -645,8 +653,10 @@ test sheet sheet-find: copies
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call clipboard {"action":"write","text":"before"}
   call pointer-click {"input":"sheet-find"}
@@ -664,8 +674,10 @@ test sheet sheet-find: pastes
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call clipboard {"action":"write","text":"Pasted"}
   call pointer-click {"input":"sheet-find"}
@@ -683,8 +695,10 @@ test sheet sheet-find: focus by Tab
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
   call real-key {"key":"tab"}
@@ -699,8 +713,10 @@ test sheet sheet-find: Enter finds the next match
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-find"}
   call real-type {"text":"West"}
@@ -717,8 +733,10 @@ test sheet sheet-find: Alt+R replaces the match
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call real-type {"text":"X"}
   call pointer-click {"input":"sheet-find"}
@@ -742,8 +760,10 @@ test sheet sheet-find: Alt+A replaces all
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call real-type {"text":"X"}
   call pointer-click {"input":"sheet-find"}
@@ -765,8 +785,10 @@ test sheet sheet-find: Escape closes the bar
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-find"}
   call real-type {"text":"West"}
@@ -786,8 +808,10 @@ test sheet sheet-replace: focus by click
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-find"}
   call pointer-click {"input":"sheet-replace"}
@@ -804,8 +828,10 @@ test sheet sheet-replace: types
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
   call real-type {"text":"Ab1 "}
@@ -822,8 +848,10 @@ test sheet sheet-replace: edits
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
   call real-type {"text":"abcd"}
@@ -854,8 +882,10 @@ test sheet sheet-replace: select-all replaces
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
   call real-type {"text":"abcd"}
@@ -875,8 +905,10 @@ test sheet sheet-replace: copies
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call clipboard {"action":"write","text":"before"}
   call pointer-click {"input":"sheet-replace"}
@@ -894,8 +926,10 @@ test sheet sheet-replace: pastes
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call clipboard {"action":"write","text":"Pasted"}
   call pointer-click {"input":"sheet-replace"}
@@ -913,8 +947,10 @@ test sheet sheet-replace: focus by Tab
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-find"}
   call real-key {"key":"tab"}
@@ -929,8 +965,10 @@ test sheet sheet-replace: Enter finds the next match
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-find"}
   call real-type {"text":"West"}
@@ -948,8 +986,10 @@ test sheet sheet-replace: Replace rewrites the found cell
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   assert dirty is false
   call pointer-click {"input":"sheet-find"}
@@ -970,8 +1010,10 @@ test sheet sheet-replace: All rewrites every match
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-find"}
   call real-type {"text":"th"}
@@ -990,8 +1032,10 @@ test sheet sheet-replace: Escape closes the bar
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"sheet-replace"}
   call real-type {"text":"Ab1"}

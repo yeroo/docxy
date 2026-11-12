@@ -42,7 +42,10 @@ Every editable input in the suite is typed into with real keys by a case:
   nothing more). Each test opens its own copy of `doc-table.docx` and checks
   one step against what Word does, except that Enter in the Replace field
   replaces, as the bar says. The suite has no Styles gallery search to type
-  into.
+  into. The Find bars' Alt+R / Alt+A, Ctrl+S, Ctrl+Alt+S and click-to-caret
+  (#2116) are in the hand-written `uiharness/cases/doc-find-bar-keys.uit`, both
+  surfaces. A centre click on a Find field can land in its text and place the
+  caret there, so the typing cases' clear step presses End before Backspace.
 - **Backstage and renames** (#1202) are in the hand-written
   `uiharness/cases/backstage-inputs-typing.uit`. The one rename the suite has
   is the sheet tab's (`sheet-tab-rename`): a double-click on the active tab's

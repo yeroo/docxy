@@ -1,0 +1,272 @@
+# The Find bars' keys and clicks that #2116 added on top of the one-line
+# fields' shared key map (`field_edit::field_key`): Alt+R / Alt+A in the
+# document Find bar past the KeyTips, Ctrl+S from a document Find field (and
+# its refusal on a document marked as final), Ctrl+Alt+S as AltGr's text in
+# both bars, and a click on a field's text placing the caret. Written by
+# hand, as doc-inputs-typing.uit, with the same setup: each test opens its
+# own copy, presses Escape (a Find bar an earlier test left open is the
+# window's, not the tab's) and clears both fields (a click, End, Backspace)
+# before it types. macOS ⌘←/⌘→ as Home/End is a unit test
+# (`plan_mac_cmd_arrows_are_home_and_end_on_macos_only`): no Linux key is ⌘.
+
+# ---- Alt+R and Alt+A: the bar's Replace and All, past the KeyTips the
+# bare Alt raised (they would pick the Review tab for R).
+
+test document find: plan-doc-alt-replace replaces past the KeyTips
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  call pointer-click {"input":"doc-find"}
+  call real-type {"text":"cell"}
+  call pointer-click {"input":"doc-replace"}
+  call real-type {"text":"X"}
+  assert dirty is false
+  call real-key {"key":"alt"}
+  assert keytips_up is true
+  call real-key {"key":"alt+r"}
+  assert keytips_up is false
+  assert dirty is true
+  assert find_open is true
+  call selection-set {"start":7,"end":7}
+  assert table.cells is [[["X A"],["cell B"]]]
+  call field-read {"input":"doc-find"}
+  assert reply.value is exactly cell
+  call real-key {"key":"escape"}
+
+test document find: plan-doc-alt-replace Alt+A replaces all
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  call pointer-click {"input":"doc-find"}
+  call real-type {"text":"cell"}
+  call pointer-click {"input":"doc-replace"}
+  call real-type {"text":"X"}
+  call real-key {"key":"alt"}
+  assert keytips_up is true
+  call real-key {"key":"alt+a"}
+  assert keytips_up is false
+  assert dirty is true
+  call selection-set {"start":7,"end":7}
+  assert table.cells is [[["X A"],["X B"]]]
+  call real-key {"key":"escape"}
+
+# ---- Ctrl+S from a Find field saves the document; the bar stays open.
+
+test document find: plan-ctrl-s saves from the Find field
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":0}
+  call real-type {"text":"Z"}
+  assert dirty is true
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"ctrl+s"}
+  assert dirty is false
+  assert find_open is true
+  call field-read {"input":"doc-find"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test document find: plan-ctrl-s Ctrl+Alt+S does not save
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":0}
+  call real-type {"text":"Z"}
+  assert dirty is true
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"ctrl+alt+s"}
+  assert dirty is true
+  assert find_open is true
+  call field-read {"input":"doc-find"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+# Where the document's key gate refuses Ctrl+S with the bar closed, the
+# bar's Ctrl+S is refused too: the bar's own exemption from that gate is
+# for its typing, not for the save. Display for Review's No Markup is the
+# case only the gate refuses (a save itself would write), so `dirty`
+# tells the refusal from a save. The display mode is the window's: the
+# test puts All Markup back.
+test document find: plan-ctrl-s is refused in a view-only display
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call selection-set {"start":0,"end":0}
+  call real-type {"text":"Z"}
+  assert dirty is true
+  call ribbon-click {"tab":"Review","command":"markupnone"}
+  assert view.display_mode is none
+  call real-key {"key":"ctrl+s"}
+  assert dirty is true
+  assert status is Edit blocked: Display for Review is No Markup or Original; switch to All Markup or Simple Markup to edit.
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"ctrl+s"}
+  assert dirty is true
+  assert status is Edit blocked: Display for Review is No Markup or Original; switch to All Markup or Simple Markup to edit.
+  assert find_open is true
+  call real-key {"key":"escape"}
+  call ribbon-click {"tab":"Review","command":"markupall"}
+  assert view.display_mode is all
+
+# A document marked as final refuses it as with the bar closed
+# (file-keys.uit's Shift+F12). Its save path refuses a final document as
+# well, so this pins the outcome rather than the key gate.
+test document find: plan-ctrl-s is refused on a final document
+  open copy:../fixtures/final.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"ctrl+s"}
+  assert status is Marked as Final — select Edit Anyway to edit
+  assert find_open is true
+  call real-key {"key":"escape"}
+
+# ---- The sheet bar's Ctrl+S passes through to the save, but Ctrl+Alt+S
+# is AltGr's text there too (it saved before #2116).
+
+test sheet find: Ctrl+Alt+S does not save
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  type 5
+  key enter
+  assert dirty is true
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"ctrl+alt+s"}
+  assert dirty is true
+  assert find_open is true
+  call field-read {"input":"sheet-find"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+# ---- A click on a field's text puts the caret under it (`x` pixels in
+# from the text's left edge); a click past the text puts it at the end.
+
+test document find: plan-click-caret places the caret
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  call pointer-click {"input":"doc-find"}
+  call real-type {"text":"abcdef"}
+  call pointer-click {"input":"doc-find","x":1}
+  call field-read {"input":"doc-find"}
+  assert reply.focused is true
+  assert reply.caret is 0
+  call real-type {"text":"Z"}
+  call field-read {"input":"doc-find"}
+  assert reply.value is exactly Zabcdef
+  assert reply.caret is 1
+  call pointer-click {"input":"doc-find","x":90}
+  call field-read {"input":"doc-find"}
+  assert reply.caret is 7
+  call real-key {"key":"escape"}
+
+test document replace: plan-click-caret places the caret
+  open copy:../fixtures/doc-table.docx
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":60}
+  call selection-set {"start":0,"end":0}
+  call pointer-click {"input":"doc-replace"}
+  call real-type {"text":"abcdef"}
+  call pointer-click {"input":"doc-find"}
+  call pointer-click {"input":"doc-replace","x":1}
+  call field-read {"input":"doc-replace"}
+  assert reply.focused is true
+  assert reply.caret is 0
+  call real-type {"text":"Z"}
+  call field-read {"input":"doc-replace"}
+  assert reply.value is exactly Zabcdef
+  call pointer-click {"input":"doc-replace","x":90}
+  call field-read {"input":"doc-replace"}
+  assert reply.caret is 7
+  call real-key {"key":"escape"}
+
+test sheet find: plan-click-caret places the caret
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-find"}
+  call real-type {"text":"abcdef"}
+  call pointer-click {"input":"sheet-find","x":1}
+  call field-read {"input":"sheet-find"}
+  assert reply.focused is true
+  assert reply.caret is 0
+  call real-type {"text":"Z"}
+  call field-read {"input":"sheet-find"}
+  assert reply.value is exactly Zabcdef
+  call pointer-click {"input":"sheet-find","x":100}
+  call field-read {"input":"sheet-find"}
+  assert reply.caret is 7
+  call real-key {"key":"escape"}
+
+test sheet replace: plan-click-caret places the caret
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call real-key {"key":"ctrl+f"}
+  assert find_open is true
+  call pointer-click {"input":"sheet-find"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":60}
+  call pointer-click {"input":"sheet-replace"}
+  call real-key {"key":"end"}
+  call real-key {"key":"backspace","times":60}
+  call real-type {"text":"abcdef"}
+  call pointer-click {"input":"sheet-find"}
+  call pointer-click {"input":"sheet-replace","x":1}
+  call field-read {"input":"sheet-replace"}
+  assert reply.focused is true
+  assert reply.caret is 0
+  call real-type {"text":"Z"}
+  call field-read {"input":"sheet-replace"}
+  assert reply.value is exactly Zabcdef
+  call pointer-click {"input":"sheet-replace","x":100}
+  call field-read {"input":"sheet-replace"}
+  assert reply.caret is 7
+  call real-key {"key":"escape"}

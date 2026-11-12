@@ -486,3 +486,40 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
 - Known limits: list numbers inside table cells are not drawn (the
   fixture's numbered list in a two-column table shows none, dark or
   light); `w:caps` is not drawn.
+
+## Document Find bar keys (#2116)
+
+- One key map for every one-line field: `field_edit::field_key` (a `FieldKey`:
+  an `Edit(Op)`, `Copy`, `Cut`, `Paste`, `Enter`, `Escape` or `Ignore`) is what
+  the Name Box, both font boxes and both Find bars do with a key
+  (`field_key_of(ev)` in `main.rs`). Ctrl+Alt is AltGr, so it types. On macOS
+  ⌘←/⌘→ (⇧ too) are Home/End; elsewhere Ctrl/Win+arrows do nothing. Each caller
+  keeps its own Enter, Escape and clipboard target: `name_box_key`,
+  `font_box_key`, `sf_field_key` (both Find bars), and the document `find_key`,
+  which takes Escape, Enter, Tab and Up/Down first, then Alt+R/A, and keeps
+  Ctrl+Backspace/Delete as a one-character delete. A fix to field keys lands in
+  `field_key` once.
+- Paste: `field_paste(keep_tabs)`. The Name Box and font boxes use `one_line`
+  (no control character). The Find fields use `one_line_keep_tabs`: a tab is
+  text a paragraph (docxcore's visible text has `Inline::Tab` as `\t`) or a
+  cell holds.
+- Alt+R / Alt+A in the document bar replace and replace all, as the sheet's
+  do. The `on_key` branch beside the sheet's lowers the KeyTips the bare Alt
+  raised. It is gated on what `find_key` would get: not while the comment
+  editor or a document font box has the keyboard. macOS ⌥R = "®" stays text
+  (`alt_replace`).
+- Ctrl+S from a document Find field saves through the document's own `ctrl`
+  match, and the bar stays open. Protected View and final documents exempt the
+  bar from their key lock for its typing only: the save chord is not exempt, so
+  it is refused as with the bar closed. Both bars use `field_edit::is_save_chord`
+  for the pass-through: the sheet bar's let Ctrl+Alt+S (AltGr) save before.
+- A press on a Find field's text (`find_field_text`, `find_field_segment`, the
+  formula bar's `fx_segment` trick) focuses the field with the caret on the
+  nearest boundary (`field_edit::caret_at`, `sf_focus_at`) and stops there. A
+  press off the text reaches the field's own `on_mouse_down` (`sf_focus`: caret
+  at the end). The sheet field moved from `on_click` to `on_mouse_down` for
+  this. The harness presses the text with
+  `pointer-click {"input":"doc-find","x":n}` (probes `df-q-text`, `df-r-text`,
+  `sf-q-text`, `sf-r-text`). A bare centre press can land in leftover text, so
+  the typing cases' clear step presses End before its Backspaces. Tests:
+  `uiharness/cases/doc-find-bar-keys.uit` and `field_edit`'s unit tests.

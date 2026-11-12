@@ -6,6 +6,7 @@
 
 use crate::{buf_backspace, buf_delete, buf_insert};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Op<'a> {
     Insert(&'a str),
     Backspace,
@@ -15,6 +16,68 @@ pub(crate) enum Op<'a> {
     Home,
     End,
     SelectAll,
+}
+
+/// What a key-down does in a one-line field (#2116): the one key map the
+/// Name Box, the font boxes and both Find bars share. Each caller keeps only
+/// what is its own: what Enter and Escape mean, where the clipboard text
+/// comes from and goes, and keys it takes before this map (the Find bars'
+/// Alt+R / Alt+A, the document bar's Tab and Up/Down).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FieldKey<'a> {
+    /// A caret edit, Ctrl+A, or typed text ([`Op::Insert`]).
+    Edit(Op<'a>),
+    Copy,
+    Cut,
+    Paste,
+    /// Enter, plain or with Ctrl.
+    Enter,
+    Escape,
+    /// Not text and not the field's: does nothing in it.
+    Ignore,
+}
+
+/// Map a key-down in a one-line field. `control` and `platform` are the
+/// keystroke's Ctrl and Cmd/Win; `mac` is whether the host is macOS, where
+/// ⌘← / ⌘→ (with ⇧ too: the field has no partial selection) go to the start /
+/// end. Ctrl+Alt is AltGr on Windows: its keys are text, not chords.
+pub(crate) fn field_key<'a>(
+    key: &str,
+    key_char: Option<&'a str>,
+    control: bool,
+    platform: bool,
+    alt: bool,
+    mac: bool,
+) -> FieldKey<'a> {
+    if (control || platform) && !alt {
+        return match key {
+            "left" if mac && platform && !control => FieldKey::Edit(Op::Home),
+            "right" if mac && platform && !control => FieldKey::Edit(Op::End),
+            "a" => FieldKey::Edit(Op::SelectAll),
+            "c" => FieldKey::Copy,
+            "x" => FieldKey::Cut,
+            "v" => FieldKey::Paste,
+            "enter" => FieldKey::Enter,
+            // Any other chord is not text.
+            _ => FieldKey::Ignore,
+        };
+    }
+    match key {
+        "escape" => FieldKey::Escape,
+        "enter" => FieldKey::Enter,
+        "backspace" => FieldKey::Edit(Op::Backspace),
+        "delete" => FieldKey::Edit(Op::Delete),
+        "left" => FieldKey::Edit(Op::Left),
+        "right" => FieldKey::Edit(Op::Right),
+        "home" => FieldKey::Edit(Op::Home),
+        "end" => FieldKey::Edit(Op::End),
+        _ => match key_char {
+            Some(c) if c.chars().next().is_some_and(|ch| !ch.is_control()) => {
+                FieldKey::Edit(Op::Insert(c))
+            }
+            _ => FieldKey::Ignore,
+        },
+    }
 }
 
 /// Whether a key-down is Excel's Alt+R / Alt+A in the Find bar: `Some(true)`
@@ -49,6 +112,41 @@ pub(crate) fn is_save_chord(ctrl: bool, alt: bool, key: &str) -> bool {
 /// character drop out (a paste into the comment bar, whose text reaches XML).
 pub(crate) fn one_line(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// `text` as one line for a Find field: as [`one_line`], but a tab stays, as
+/// it is a character a paragraph or a cell holds and the Find searches for
+/// (docxcore's visible text has a document tab as `\t`).
+pub(crate) fn one_line_keep_tabs(text: &str) -> String {
+    text.chars()
+        .filter(|&c| c == '\t' || !c.is_control())
+        .collect()
+}
+
+/// The caret, a char offset in `text`, for a press at `x` on a run of text
+/// drawn from it (#2116): `byte` is the glyph the layout puts under the press
+/// (or the end, past it), and `x_at` the x of a byte boundary. A press past a
+/// glyph's middle puts the caret after it, so the caret lands on the nearest
+/// boundary, as in a dialog field.
+pub(crate) fn caret_at(
+    text: &str,
+    byte: usize,
+    x: f32,
+    x_at: impl Fn(usize) -> Option<f32>,
+) -> usize {
+    let mut byte = byte.min(text.len());
+    while !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    if let Some(c) = text[byte..].chars().next() {
+        let next = byte + c.len_utf8();
+        if let (Some(a), Some(b)) = (x_at(byte), x_at(next)) {
+            if x > (a + b) / 2.0 {
+                byte = next;
+            }
+        }
+    }
+    text[..byte].chars().count()
 }
 
 /// The caret and selection to use for `text`: those kept, unless the text's
@@ -303,6 +401,111 @@ mod tests {
             None,
             "AltGr"
         );
+    }
+
+    #[test]
+    fn r1_m_dup_field_key_maps_chords_edits_and_typing() {
+        use FieldKey as K;
+        let key = |k: &str, ch: Option<&'static str>, ctrl: bool, alt: bool| {
+            field_key(k, ch, ctrl, false, alt, false)
+        };
+        // Chords, with Ctrl or with Cmd/Win.
+        assert_eq!(key("a", Some("a"), true, false), K::Edit(Op::SelectAll));
+        assert_eq!(
+            field_key("a", Some("a"), false, true, false, true),
+            K::Edit(Op::SelectAll),
+            "⌘A"
+        );
+        assert_eq!(key("c", None, true, false), K::Copy);
+        assert_eq!(key("x", None, true, false), K::Cut);
+        assert_eq!(key("v", None, true, false), K::Paste);
+        assert_eq!(key("enter", None, true, false), K::Enter);
+        for k in ["q", "s", "z", "escape", "home", "end", "backspace", "left"] {
+            assert_eq!(key(k, Some("q"), true, false), K::Ignore, "Ctrl+{k}");
+        }
+        // AltGr (Ctrl+Alt) is text.
+        assert_eq!(key("s", Some("ś"), true, true), K::Edit(Op::Insert("ś")));
+        assert_eq!(key("a", Some("ą"), true, true), K::Edit(Op::Insert("ą")));
+        assert_eq!(key("s", None, true, true), K::Ignore);
+        // Plain keys.
+        assert_eq!(key("escape", None, false, false), K::Escape);
+        assert_eq!(key("enter", None, false, false), K::Enter);
+        for (k, op) in [
+            ("backspace", Op::Backspace),
+            ("delete", Op::Delete),
+            ("left", Op::Left),
+            ("right", Op::Right),
+            ("home", Op::Home),
+            ("end", Op::End),
+        ] {
+            assert_eq!(key(k, None, false, false), K::Edit(op), "{k}");
+        }
+        // Typing: the key's text, not its name; a control character is not text.
+        assert_eq!(key("a", Some("A"), false, false), K::Edit(Op::Insert("A")));
+        assert_eq!(
+            key("space", Some(" "), false, false),
+            K::Edit(Op::Insert(" "))
+        );
+        assert_eq!(key("tab", Some("\t"), false, false), K::Ignore);
+        assert_eq!(key("f2", None, false, false), K::Ignore);
+        assert_eq!(key("a", Some(""), false, false), K::Ignore);
+    }
+
+    #[test]
+    fn plan_mac_cmd_arrows_are_home_and_end_on_macos_only() {
+        use FieldKey as K;
+        // macOS: ⌘← / ⌘→, with ⇧ too (no partial selection).
+        assert_eq!(
+            field_key("left", None, false, true, false, true),
+            K::Edit(Op::Home)
+        );
+        assert_eq!(
+            field_key("right", None, false, true, false, true),
+            K::Edit(Op::End)
+        );
+        // Ctrl+←/→ on macOS is not ⌘: nothing, as before.
+        assert_eq!(field_key("left", None, true, false, false, true), K::Ignore);
+        assert_eq!(
+            field_key("right", None, true, true, false, true),
+            K::Ignore,
+            "⌃⌘→"
+        );
+        // Off macOS Ctrl+←/→ and Win+←/→ still do nothing.
+        assert_eq!(
+            field_key("left", None, true, false, false, false),
+            K::Ignore
+        );
+        assert_eq!(
+            field_key("right", None, false, true, false, false),
+            K::Ignore
+        );
+    }
+
+    #[test]
+    fn r2_i1_one_line_keep_tabs_drops_breaks_keeps_tabs() {
+        assert_eq!(one_line_keep_tabs("a\r\nb\nc"), "abc");
+        assert_eq!(one_line_keep_tabs("a\tb\r\n"), "a\tb");
+        assert_eq!(one_line_keep_tabs("a\x0bb\x0cc\x1bd\0e"), "abcde");
+        assert_eq!(one_line_keep_tabs("é日 \u{1F600}"), "é日 \u{1F600}");
+    }
+
+    #[test]
+    fn plan_click_caret_lands_on_the_nearest_boundary() {
+        // "aé😀" drawn 10px a char: a at 0..10, é at 10..20, 😀 at 20..30.
+        let text = "aé😀";
+        let x_at = |b: usize| {
+            let i = text.char_indices().position(|(at, _)| at == b);
+            Some(10.0 * i.unwrap_or(text.chars().count()) as f32)
+        };
+        assert_eq!(caret_at(text, 0, 2.0, x_at), 0, "left half of a");
+        assert_eq!(caret_at(text, 0, 7.0, x_at), 1, "right half of a");
+        assert_eq!(caret_at(text, 1, 14.0, x_at), 1, "left half of é");
+        assert_eq!(caret_at(text, 1, 16.0, x_at), 2, "right half of é");
+        assert_eq!(caret_at(text, 3, 26.0, x_at), 3, "right half of 😀");
+        assert_eq!(caret_at(text, 7, 40.0, x_at), 3, "past the end");
+        assert_eq!(caret_at(text, 2, 11.0, x_at), 1, "inside é's bytes");
+        assert_eq!(caret_at("", 0, 5.0, x_at), 0);
+        assert_eq!(caret_at(text, 1, 16.0, |_| None), 1, "no layout: the glyph");
     }
 
     #[test]
