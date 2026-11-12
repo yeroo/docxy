@@ -872,7 +872,9 @@ fn drawing_inline(raw: String, rels: &Relationships) -> Inline {
     }
     // A text box / shape with text: model its content so the caret can enter it.
     if raw.contains("txbxContent") {
-        let blocks = parse_textbox_blocks(&raw);
+        // With the part's relationships, so a link in the box keeps its
+        // target (#1952 r2).
+        let blocks = textbox_blocks(&raw, rels);
         if !blocks.is_empty() {
             return Inline::TextBox { raw, blocks };
         }
@@ -2312,12 +2314,17 @@ fn mark_revision(inl: &mut Inline, kind: RevisionKind) {
 /// Parse the block content of a text box (`<w:txbxContent>`) embedded in a
 /// drawing/VML-shape's raw XML, so its text can be shown.
 pub fn parse_textbox_blocks(raw: &str) -> Vec<Block> {
-    let rels = Relationships::default();
+    textbox_blocks(raw, &Relationships::default())
+}
+
+/// [`parse_textbox_blocks`] with the relationships of the part the box is
+/// in, which its links' `r:id`s name.
+fn textbox_blocks(raw: &str, rels: &Relationships) -> Vec<Block> {
     let mut p = XmlParser::new(raw);
     loop {
         match p.next() {
             Event::Start if p.name() == "w:txbxContent" => {
-                return parse_blocks_until_end(&mut p, &rels);
+                return parse_blocks_until_end(&mut p, rels);
             }
             Event::Eof => break,
             _ => {}

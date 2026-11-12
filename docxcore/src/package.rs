@@ -4801,23 +4801,17 @@ fn esc_opener_value(v: &str) -> String {
 }
 
 /// Collect `&mut` references to every external hyperlink (`target` set),
-/// walking paragraphs and table cells recursively.
+/// walking paragraphs and table cells recursively, and the paragraphs' text
+/// boxes, tracked changes and links without a target (#1952 r2): a link
+/// the editor inserts in a text box needs a relationship too.
 fn collect_external_links<'a>(
     blocks: &'a mut [crate::model::Block],
     out: &mut Vec<&'a mut crate::model::Hyperlink>,
 ) {
-    use crate::model::{Block, Inline};
+    use crate::model::Block;
     for b in blocks {
         match b {
-            Block::Paragraph(p) => {
-                for inl in &mut p.content {
-                    if let Inline::Hyperlink(h) = inl
-                        && h.target.is_some()
-                    {
-                        out.push(h);
-                    }
-                }
-            }
+            Block::Paragraph(p) => collect_inline_links(&mut p.content, out),
             Block::Table(t) => {
                 for row in &mut t.rows {
                     for cell in &mut row.cells {
@@ -4826,6 +4820,28 @@ fn collect_external_links<'a>(
                 }
             }
             Block::SectionProperties(_) | Block::Raw(_) => {}
+        }
+    }
+}
+
+/// [`collect_external_links`] over a paragraph's (or a container's) inlines.
+fn collect_inline_links<'a>(
+    content: &'a mut [crate::model::Inline],
+    out: &mut Vec<&'a mut crate::model::Hyperlink>,
+) {
+    use crate::model::Inline;
+    for inl in content {
+        match inl {
+            Inline::Hyperlink(h) => {
+                if h.target.is_some() {
+                    out.push(h);
+                } else {
+                    collect_inline_links(&mut h.content, out);
+                }
+            }
+            Inline::TextBox { blocks, .. } => collect_external_links(blocks, out),
+            Inline::Revision { content, .. } => collect_inline_links(content, out),
+            _ => {}
         }
     }
 }

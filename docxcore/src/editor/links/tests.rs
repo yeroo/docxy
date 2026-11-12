@@ -834,3 +834,81 @@ fn retexted_content_puts_the_run_where_the_text_was_1952() {
         [Inline::Run(new), mark]
     );
 }
+
+/// #1952 r2: a paste at an empty content control inside a link goes into
+/// the link, so a new link there would nest in it: refused before anything
+/// changes, at a caret or a selection's end there.
+#[test]
+fn insert_refuses_to_nest_at_a_control_inside_a_link_1952() {
+    let body = "<w:p><w:r><w:t xml:space=\"preserve\">x </w:t></w:r><w:hyperlink r:id=\"rId1\"><w:r><w:t>ab</w:t></w:r>\
+                <w:sdt><w:sdtPr/><w:sdtContent></w:sdtContent></w:sdt></w:hyperlink></w:p>";
+    let mut ed = loaded(body);
+    assert!(!links(&ed, 0)[0].content.is_empty(), "a complex link");
+    for (a, b) in [(4, 4), (0, 4), (3, 1)] {
+        select(&mut ed, (0, a), (0, b));
+        let before = ed.doc.clone();
+        assert!(!ed.insert_hyperlink("X", "https://n.example/"), "{a}..{b}");
+        assert_eq!(ed.doc, before);
+        assert!(ed.undo_names().is_empty());
+    }
+    // Elsewhere in the paragraph a link goes in as usual.
+    select(&mut ed, (0, 0), (0, 0));
+    assert!(ed.insert_hyperlink("X", "https://n.example/"));
+    assert_eq!(links(&ed, 0).len(), 2);
+    for h in links(&ed, 0) {
+        assert!(
+            h.content.iter().all(|i| !matches!(i, Inline::Hyperlink(_))),
+            "nested: {h:?}"
+        );
+    }
+}
+
+/// #1952 r2: a link inserted in a text box gets a relationship on save
+/// and loads back with its URL.
+#[test]
+fn a_link_in_a_text_box_keeps_its_url_through_a_save_1952() {
+    let raw = "<w:r><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>in</w:t></w:r>\
+               </w:p></w:txbxContent></v:textbox></v:shape></w:pict></w:r>";
+    let blocks = vec![Block::Paragraph(Paragraph {
+        content: vec![link("https://box.example/", vec![plain("boxed")])],
+        ..Paragraph::default()
+    })];
+    let doc = Document {
+        body: vec![Block::Paragraph(Paragraph {
+            content: vec![
+                plain("a"),
+                Inline::TextBox {
+                    raw: raw.into(),
+                    blocks,
+                },
+            ],
+            ..Paragraph::default()
+        })],
+    };
+    let saved = save_package(&new_package(doc));
+    let pkg = load_package(&saved).unwrap();
+    let Block::Paragraph(p) = &pkg.document.body[0] else {
+        panic!("a paragraph");
+    };
+    let inner = p
+        .content
+        .iter()
+        .find_map(|i| match i {
+            Inline::TextBox { blocks, .. } => Some(blocks),
+            _ => None,
+        })
+        .expect("the text box");
+    let Block::Paragraph(q) = &inner[0] else {
+        panic!("a paragraph in the box");
+    };
+    let h = q
+        .content
+        .iter()
+        .find_map(|i| match i {
+            Inline::Hyperlink(h) => Some(h),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the link: {:?}", q.content));
+    assert_eq!(h.target.as_deref(), Some("https://box.example/"));
+    assert!(h.rel_id.is_some());
+}

@@ -282,7 +282,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   replaced by one run of the text in the typing props (pending toggles
   included) through `paste`, so inside a link it lands between the link's
   halves: old half, new link, old half, never nested (Word would edit the
-  old link instead). The link look is direct formatting, underline plus
+  old link instead). A paste at an empty content control inside a link
+  goes into the link, so insert refuses (false, no step) when the caret or
+  either selection end is at a top-level link holding a content control
+  (`pastes_into_a_link`, asked before anything is deleted; #1952 r2). The link look is direct formatting, underline plus
   `0563C1` unless the run has a colour, not a `Hyperlink` style, which the
   package may lack. Remove takes off a `0563C1` colour with its underline
   and a `Hyperlink` character style, nothing else.
@@ -291,7 +294,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   and `content_changed` set, so its tooltip, target frame and namespace
   declarations stay; `rel_id` is `None` and `save_package` now writes the id
   it mints into a kept opener (`with_opener_rel_id`), as
-  `link_part_hyperlinks` (now over `with_opener_attr` too) does. The link's
+  `link_part_hyperlinks` (now over `with_opener_attr` too) does. Both mint
+  for the links in text boxes, tracked changes and target-less links'
+  content too (`collect_inline_links`), and a text box loads with its
+  part's relationships (`load::textbox_blocks`), so a link inserted in a
+  text box keeps its URL (#1952 r2). The link's
   own URL and text as `caret_link` reads them are no change (true, no
   step): the URL is compared with `link_url` (so `target#anchor` keeps its
   fragment), the text after `link_text` on both sides (a TOC-style link's

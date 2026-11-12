@@ -228,6 +228,12 @@ impl Editor {
     /// The link at the caret, for a host's Edit Link dialog and its
     /// buttons; `None` off a link.
     pub fn caret_link(&self) -> Option<CaretLink> {
+        self.caret_link_found().map(|found| found.shown)
+    }
+
+    /// The link at the caret, looked up once: where it is and how
+    /// [`Editor::caret_link`] reads it.
+    fn caret_link_found(&self) -> Option<FoundLink> {
         let (path, i) = self.caret_link_index()?;
         let p = resolve_para(&self.doc.body, &path)?;
         let Inline::Hyperlink(h) = &p.content[i] else {
@@ -235,9 +241,14 @@ impl Editor {
         };
         let start = offset_of(&p.content, i);
         let end = start + inline_len(&p.content[i]);
-        Some(CaretLink {
+        let shown = CaretLink {
             text: display_text(&p.content, start, end, true, false),
             url: link_url(h),
+        };
+        Some(FoundLink {
+            path,
+            index: i,
+            shown,
         })
     }
 
@@ -272,6 +283,9 @@ impl Editor {
         if self.wrap_in_link(&text, &link) {
             return true;
         }
+        if self.pastes_into_a_link() {
+            return false;
+        }
         self.drop_collapsed_anchor();
         let pending = self.pending_format().cloned();
         self.one_step("Hyperlink", |ed| {
@@ -288,6 +302,23 @@ impl Editor {
         });
         self.anchor = None;
         true
+    }
+
+    /// Whether a paste replacing the selection could land inside a link: at
+    /// the caret or either end of the selection there is a top-level link
+    /// holding a content control, and a paste at an empty control goes into
+    /// it (`insert_inlines`), so a new link would nest in the old one. Asked
+    /// before anything changes: deleting the selection may empty a control
+    /// that has text now.
+    fn pastes_into_a_link(&self) -> bool {
+        let ends = match self.selection_range() {
+            Some((lo, hi)) => vec![lo, hi, self.caret.clone()],
+            None => vec![self.caret.clone()],
+        };
+        ends.iter().any(|end| {
+            resolve_para(&self.doc.body, &end.path)
+                .is_some_and(|p| at_link_with_a_control(&p.content, end.offset))
+        })
     }
 
     /// [`Editor::insert_hyperlink`]'s wrap: the selected runs become `link`
@@ -364,16 +395,18 @@ impl Editor {
         let Some((target, anchor)) = link_dest(url) else {
             return false;
         };
-        let (Some((path, i)), Some(shown)) = (self.caret_link_index(), self.caret_link()) else {
-            return false;
-        };
-        let Some(Inline::Hyperlink(h)) = resolve_para(&self.doc.body, &path).map(|p| &p.content[i])
+        let Some(FoundLink {
+            path,
+            index: i,
+            shown,
+            ..
+        }) = self.caret_link_found()
         else {
             return false;
         };
         // The link's own URL, as `caret_link` reads it (a URL and its
         // fragment too), is no new target.
-        let retarget = url.trim() != link_url(h);
+        let retarget = url.trim() != shown.url;
         let text = link_text(text);
         let new_text = (!text.trim().is_empty() && text != link_text(&shown.text)).then_some(text);
         if !retarget && new_text.is_none() {
@@ -455,6 +488,29 @@ impl Editor {
         });
         true
     }
+}
+
+/// The link at the caret ([`Editor::caret_link_found`]).
+struct FoundLink {
+    /// Its paragraph's path.
+    path: Vec<usize>,
+    /// Its index in the paragraph's content.
+    index: usize,
+    shown: CaretLink,
+}
+
+/// Whether caret offset `o` of `content` is inside a top-level link, or at
+/// either of its edges, whose content holds a content control.
+fn at_link_with_a_control(content: &[Inline], o: usize) -> bool {
+    let mut acc = 0;
+    content.iter().any(|inline| {
+        let len = inline_len(inline);
+        let at = acc <= o && o <= acc + len;
+        acc += len;
+        at && matches!(inline, Inline::Hyperlink(h) if h.content.iter().any(
+            |c| matches!(c, Inline::Raw(raw) if crate::hf::is_sdt_open(raw))
+        ))
+    })
 }
 
 /// The formatting a link's new text takes: its first run's (or tab's, or
