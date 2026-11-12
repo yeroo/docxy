@@ -2172,8 +2172,11 @@ so the user's other devices follow.
 - `GraphClient::search_users(query, top)`: `GET /users?$search="displayName:<q>" OR
   "mail:<q>"&$select=displayName,mail,userPrincipalName,jobTitle,department&$top=…` with
   `ConsistencyLevel: eventual`, which Graph requires for `$search` on directory objects. The
-  organisation's directory (the global address list) for a To/Cc/Bcc completion, beside
-  `/me/people`'s top 200 and the store's own addresses.
+  tenant's user directory (Graph `/users`) for a To/Cc/Bcc completion, beside `/me/people`'s
+  top 200 and the store's own addresses. It is not Exchange's global address list: disabled
+  accounts and mailboxes hidden from address lists may appear, and mailcore does not filter
+  them (`accountEnabled` is not readable under `User.ReadBasic.All`, and v1.0 has no
+  hidden-from-address-lists property, so neither is in `$select`).
 - `directory_search_value` puts the query in both quoted clauses with its `\` and `"`
   escaped (`escape_search_text`, which `search_value` shares since #1942: its output is
   unchanged), so `x" OR "y` stays inside them, and percent-encodes the whole value. Escaping,
@@ -2184,7 +2187,9 @@ so the user's other devices follow.
   the trimmed `mail`; with no (or a blank) `mail`, the `userPrincipalName` when
   `looks_like_address` (one `@`, a local part, a dotted domain, no whitespace, and not a
   guest's `#EXT#` UPN, which is no mailbox). A user with neither is skipped (a room with an
-  odd UPN, a guest without `mail`). `name` is the trimmed `displayName`, `""` when absent.
+  odd UPN, a guest without `mail`). A UPN only looks like an address: a user without `mail`
+  may have no mailbox (unlicensed, a service account), so a client may rank a UPN-only user
+  below one with `mail`. `name` is the trimmed `displayName`, `""` when absent.
   `job_title` and `department` are `None` when absent, null, not a string or blank.
   `Person` is not reused: it carries `rank`, and a client ranks the two sources apart.
 - `SyncCommand::SearchDirectory { query, top }` answers `SyncEvent::DirectoryResults {

@@ -216,8 +216,8 @@ pub enum SyncCommand {
     /// [`SyncEvent::Error`]. Nothing is stored. Served ahead of a running
     /// pass, as `SearchMessages` is, and tried even during a back-off.
     FetchFolderSizes { folder_ids: Vec<String> },
-    /// Search the organisation's directory, the global address list
-    /// (#1942, `GraphClient::search_users`), for a To/Cc/Bcc completion:
+    /// Search the tenant's user directory (Graph `/users`, #1942,
+    /// `GraphClient::search_users`), for a To/Cc/Bcc completion:
     /// users whose display name or address matches `query` (as the client
     /// typed it), at most `top` (`1..=DIRECTORY_TOP_MAX`). Answers with
     /// [`SyncEvent::DirectoryResults`], or

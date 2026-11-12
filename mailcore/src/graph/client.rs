@@ -2384,8 +2384,12 @@ impl GraphClient {
 
     /// GET `/users?$search="displayName:<q>" OR "mail:<q>"&$select=DIRECTORY_SELECT
     /// &$top=…` with `ConsistencyLevel: eventual`, which Graph requires for
-    /// `$search` on directory objects (#1942): the organisation's directory
-    /// (the global address list) for a To/Cc/Bcc completion. `query` goes in
+    /// `$search` on directory objects (#1942): the tenant's user directory
+    /// (Graph `/users`) for a To/Cc/Bcc completion. That is not Exchange's
+    /// global address list: disabled accounts and mailboxes hidden from
+    /// address lists may appear, and mailcore does not filter them
+    /// (`accountEnabled` is not readable under `User.ReadBasic.All`, and
+    /// v1.0 has no hidden-from-address-lists property). `query` goes in
     /// both quoted clauses with its `\` and `"` escaped
     /// (`directory_search_value`), so it cannot end them. `top` is clamped to
     /// `1..=`[`DIRECTORY_TOP_MAX`]; one page only, no `@odata.nextLink` is

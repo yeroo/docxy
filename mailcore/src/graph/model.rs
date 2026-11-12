@@ -88,7 +88,9 @@ pub struct DirectoryUser {
     /// `displayName`, trimmed; `""` when the directory has none.
     pub name: String,
     /// `mail`, or the `userPrincipalName` when there is no `mail` and the
-    /// UPN looks like an address.
+    /// UPN looks like an address. A user without `mail` may have no mailbox
+    /// (unlicensed, a service account), so a client may rank a UPN-only
+    /// user below one with `mail`.
     pub address: String,
     /// `jobTitle`; `None` when absent, not a string or blank.
     pub job_title: Option<String>,
@@ -99,8 +101,8 @@ pub struct DirectoryUser {
 impl DirectoryUser {
     /// A directory user, or `None` when it has no address to complete: no
     /// (or a blank) `mail` and a `userPrincipalName` that does not look like
-    /// a deliverable address ([`looks_like_address`]: a guest's `#EXT#` UPN
-    /// is not one).
+    /// an address ([`looks_like_address`]: a guest's `#EXT#` UPN does not).
+    /// A UPN that does is kept, though its user may have no mailbox.
     pub fn from_json(v: &Value) -> Option<Self> {
         let address = match non_blank_str(v, "mail") {
             Some(mail) => mail,
