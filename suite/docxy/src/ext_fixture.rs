@@ -718,17 +718,17 @@ mod tests {
         let mut ed = Editor::new(doc);
         ed.anchor = Some(Caret::at(vec![1], 0));
         ed.caret = Caret::at(vec![1], "Alpha Beta Gamma".len());
-        let (text, rtf) = crate::doc_view::copy_payload(&ed, Some(&pkg)).expect("a copy");
+        let (text, rtf) = crate::clip_payload(&ed.copy().expect("a copy"), Some(&pkg));
         assert_eq!(text, "Alpha Beta Gamma");
         let rtf = rtf.expect("RTF beside the text");
         assert!(rtf.contains("\\b"), "{rtf}");
         assert!(rtf.contains("Beta"), "{rtf}");
         // Nothing selected copies nothing.
         ed.anchor = None;
-        assert!(crate::doc_view::copy_payload(&ed, Some(&pkg)).is_none());
+        assert!(ed.copy().is_none());
         // Select All copies everything, the last line included.
         ed.select_all();
-        let (all, _) = crate::doc_view::copy_payload(&ed, Some(&pkg)).expect("a copy");
+        let (all, _) = crate::clip_payload(&ed.copy().expect("a copy"), Some(&pkg));
         assert!(all.starts_with("Embedded view"), "{all}");
         assert!(all.trim_end().ends_with("Line 80"), "{all}");
     }

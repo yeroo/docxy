@@ -236,6 +236,20 @@ pub fn capture(pkg: &Package, part: &str, clip: &docxcore::editor::Clip) -> Medi
 /// ([`Package::add_part_media`], outside any undo step, as Insert Picture
 /// does). A rid with no media, or media the part cannot take, is kept.
 pub fn carry(dst: &mut Package, part: &str, media: &Media, clip: &mut docxcore::editor::Clip) {
+    carry_avoiding(dst, part, media, clip, &[]);
+}
+
+/// [`carry`], each relationship it adds none of `taken` (#1953): the ids
+/// the story's pictures already name, defined or not, so a picture whose
+/// id its package never defined does not start to draw the pasted media
+/// ([`Package::add_part_media_avoiding`]).
+pub fn carry_avoiding(
+    dst: &mut Package,
+    part: &str,
+    media: &Media,
+    clip: &mut docxcore::editor::Clip,
+    taken: &[String],
+) {
     // The part's relationships, read once; an added one joins the list.
     let mut rels = dst.part_rel_targets(part);
     let mut map = HashMap::new();
@@ -254,7 +268,8 @@ pub fn carry(dst: &mut Package, part: &str, media: &Media, clip: &mut docxcore::
             .find(|(_, name)| same(dst, name))
             .map(|(id, _)| id.clone());
         let new = found.or_else(|| {
-            let new = dst.add_part_media(part, &m.bytes, &m.ext, &m.content_type)?;
+            let new =
+                dst.add_part_media_avoiding(part, &m.bytes, &m.ext, &m.content_type, taken)?;
             rels.push((new.clone(), dst.part_rel_target(part, &new)));
             Some(new)
         });

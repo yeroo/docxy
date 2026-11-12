@@ -6,8 +6,9 @@
 # Line 1..Line 80; see ext-doc-view.uit). The extension calls only the
 # view's public API: `ext-doc-set {"editable":...}` is `set_editable`,
 # `ext-doc-call` is `format` / `undo` / `redo` / `insert_text` / `copy` /
-# `cut` (#1977) and the link commands `insert_link` / `edit_link` /
-# `remove_link` (#1952), `ext-doc-document` reads
+# `cut` (#1977), the link commands `insert_link` / `edit_link` /
+# `remove_link` (#1952) and `insert_picture` / `paste` (#1953),
+# `ext-doc-document` reads
 # `document()` and `package()`, and `ext-doc-read` adds the caret, its
 # formatting (`caret_format`), whether the caret's painted piece is inside
 # the view (`caret_in_view`), `can_undo` / `can_redo` / `can_copy` and how many change
@@ -426,6 +427,156 @@ test issue 1952 the host links the selection, edits and removes the link at the 
   assert reply.links.0.url is https://example.com/docxy
   call ext-doc-document {}
   assert reply.paragraphs.2.runs.1.link is https://example.com/docxy
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1953 the host inserts a picture from bytes: in the package, drawn, one undo step
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-set {"editable":true}
+  call pointer-click {"region":"ext-doc-word:Gamma:end"}
+  call ext-doc-read {}
+  assert reply.pictures is 1
+  assert reply.change_calls is 0
+  # A 3x2 PNG (74 bytes) after Gamma: the fixture's logo is image1.png at
+  # rId2, so this one is image2.png at rId3.
+  call ext-doc-call {"insert_picture":{"hex":"89504e470d0a1a0a0000000d49484452000000030000000208060000009d74661a0000001149444154789c63382127f71f86199039009b150c13b39958790000000049454e44ae426082","content_type":"image/png"}}
+  assert reply.done is true
+  # A frame draws it (the count is the view's decoded pictures).
+  shot window
+  call ext-doc-read {}
+  assert reply.pictures is 2
+  assert reply.change_calls is 1
+  call ext-doc-document {}
+  assert reply.has_package is true
+  assert reply.paragraphs.1.pictures.0 is rId3
+  assert reply.media.0.rid is rId3
+  assert reply.media.0.target is word/media/image2.png
+  assert reply.media.0.content_type is image/png
+  assert reply.media.0.bytes is 74
+  assert reply.media.1.rid is rId2
+  shot window
+  # A type the bytes are not, or bytes no picture: refused, nothing changes.
+  call ext-doc-call {"insert_picture":{"hex":"89504e470d0a1a0a0000000d49484452000000030000000208060000009d74661a0000001149444154789c63382127f71f86199039009b150c13b39958790000000049454e44ae426082","content_type":"image/jpeg"}}
+  assert reply.done is false
+  call ext-doc-call {"insert_picture":{"hex":"00010203","content_type":"image/png"}}
+  assert reply.done is false
+  call ext-doc-read {}
+  assert reply.change_calls is 1
+  # One undo takes it out of the document.
+  call ext-doc-call {"undo":true}
+  assert reply.done is true
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma
+  assert reply.media.0.rid is rId2
+  # Read-only: refused.
+  call ext-doc-set {"editable":false}
+  call ext-doc-call {"insert_picture":{"hex":"89504e470d0a1a0a0000000d49484452000000030000000208060000009d74661a0000001149444154789c63382127f71f86199039009b150c13b39958790000000049454e44ae426082","content_type":"image/png"}}
+  assert reply.done is false
+  call ext-doc-read {}
+  assert reply.change_calls is {ext-doc-set.change_calls}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1953 a view given no package gets one for its first picture, and what it shows stays
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-set {"editable":true}
+  call ext-doc-load {"html": "<body><div style='font-family:Arial; font-size:12pt'>Hi there</div><ol><li style='font-family:Arial; font-size:12pt'>Item one</li><li style='font-family:Arial; font-size:12pt'>Item two</li></ol><div style='font-family:Arial; font-size:12pt'>Name</div></body>"}
+  call ext-doc-document {}
+  assert reply.has_package is false
+  shot window
+  call ext-doc-layout {}
+  assert reply.painted is true
+  assert reply.paragraphs.0.top is 0
+  assert reply.paragraphs.0.lines.0.size is 16
+  assert reply.paragraphs.1.top is 18
+  assert reply.paragraphs.1.marker.x is 22
+  assert reply.paragraphs.1.text_x is 40
+  assert reply.paragraphs.2.top is 52
+  call pointer-click {"region":"ext-doc-word:Name:end"}
+  call ext-doc-call {"insert_picture":{"hex":"89504e470d0a1a0a0000000d49484452000000030000000208060000009d74661a0000001149444154789c63382127f71f86199039009b150c13b39958790000000049454e44ae426082","content_type":"image/png"}}
+  assert reply.done is true
+  call ext-doc-document {}
+  assert reply.has_package is true
+  assert reply.media.0.target is word/media/image1.png
+  assert reply.media.0.bytes is 74
+  # The fresh package's empty styles change nothing above the picture.
+  shot window
+  call ext-doc-layout {}
+  assert reply.paragraphs.0.top is 0
+  assert reply.paragraphs.0.lines.0.size is 16
+  assert reply.paragraphs.1.top is 18
+  assert reply.paragraphs.1.marker.x is 22
+  assert reply.paragraphs.1.text_x is 40
+  assert reply.paragraphs.2.top is 52
+  call ext-doc-read {}
+  assert reply.pictures is 1
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1953 Ctrl+V pastes another copy's RTF with its bold, text, and an image alone as a picture; read-only it bubbles
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-set {"editable":true}
+  call pointer-click {"region":"ext-doc-word:Gamma:end"}
+  # Another copy's RTF beside its text: pasted with its bold.
+  call clipboard {"action":"write","text":"Plain BOLD","rtf":"{\\rtf1\\ansi Plain {\\b BOLD}}"}
+  call real-key {"key":"ctrl+v"}
+  call ext-doc-read {}
+  assert reply.change_calls is 1
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta GammaPlain BOLD
+  call pointer-click {"region":"ext-doc-word:BOLD"}
+  call ext-doc-read {}
+  assert reply.caret_format.bold is true
+  call pointer-click {"region":"ext-doc-word:Alpha"}
+  call ext-doc-read {}
+  assert reply.caret_format.bold is false
+  # One undo takes the paste back.
+  call ext-doc-call {"undo":true}
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma
+  # Plain text, by Ctrl+V and by Ctrl+Shift+V (as a document tab).
+  call clipboard {"action":"write","text":"just text"}
+  call pointer-click {"region":"ext-doc-word:Gamma:end"}
+  call real-key {"key":"ctrl+v"}
+  call real-key {"key":"ctrl+shift+v"}
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gammajust textjust text
+  # An image with no text beside it: a picture.
+  call clipboard {"action":"write","text":"","image_hex":"89504e470d0a1a0a0000000d49484452000000030000000208060000009d74661a0000001149444154789c63382127f71f86199039009b150c13b39958790000000049454e44ae426082"}
+  assert reply.image_bytes is 74
+  assert reply.text is null
+  call real-key {"key":"ctrl+v"}
+  shot window
+  call ext-doc-read {}
+  assert reply.pictures is 2
+  call ext-doc-document {}
+  assert reply.paragraphs.1.pictures.0 is rId3
+  assert reply.media.0.target is word/media/image2.png
+  assert reply.media.0.bytes is 74
+  # The host's Paste button takes the same path.
+  call ext-doc-call {"paste":true}
+  assert reply.done is true
+  call ext-doc-document {}
+  assert reply.paragraphs.1.pictures.1 is rId4
+  shot window
+  # Read-only: Ctrl+V and the host's Paste change nothing.
+  call ext-doc-set {"editable":false}
+  call real-key {"key":"ctrl+v"}
+  call ext-doc-call {"paste":true}
+  assert reply.done is false
+  call ext-doc-read {}
+  assert reply.change_calls is {ext-doc-set.change_calls}
+  call ext-doc-document {}
+  assert reply.paragraphs.1.pictures.1 is rId4
   call real-key {"key":"ctrl+w"}
   call tab-list {}
   assert reply.count is 1

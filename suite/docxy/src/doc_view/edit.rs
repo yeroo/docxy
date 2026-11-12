@@ -1,10 +1,11 @@
 //! The editing mode of the embedded document view (#1947): what a key, a
-//! Tab, a host's formatting command or its insert and cut (#1977) does to
-//! the view's [`Editor`], and
+//! Tab, a host's formatting command, its insert and cut (#1977), a picture
+//! and a paste (#1953) do to the view's [`Editor`] and package, and
 //! what the caret's formatting reads. It is the document tab's own map
-//! (`Docxy::on_key`, `apply_doc_act`, `tab_key` / `shift_tab_key`) without
-//! the suite's extras (AutoCorrect, Repeat, fields, breaks, paste), over a
-//! plain editor and package, so it is tested without a window.
+//! (`Docxy::on_key`, `apply_doc_act`, `tab_key` / `shift_tab_key`,
+//! `do_paste`) without the suite's extras (AutoCorrect, Repeat, fields,
+//! breaks, Paste Special), over a plain editor and package, so it is tested
+//! without a window.
 
 use super::*;
 use docxcore::editor::{Clip, FIELD_CHAR, LINE_BREAK};
@@ -26,6 +27,9 @@ pub(crate) enum KeyOutcome {
     /// the document changed (a cut across containers only collapses, see
     /// [`cut`]).
     Cut(Clip, bool),
+    /// Ctrl+V (and Ctrl+Shift+V, as a document tab takes it): the view
+    /// reads the clipboard and pastes ([`paste_source`], #1953).
+    Paste,
 }
 
 impl KeyOutcome {
@@ -273,6 +277,179 @@ pub(crate) fn cut(ed: &mut Editor) -> Option<(Clip, bool)> {
     clip.map(|clip| (clip, out.changed()))
 }
 
+/// The package a view given none is given for its first picture (#1953):
+/// [`docxcore::package::new_package`]'s, whose styles part is empty, so
+/// nothing the document shows changes. Its `document` is empty: the host
+/// exports [`DocView::document`] with it, as with any package.
+fn fresh_package() -> Package {
+    docxcore::package::new_package(Document { body: vec![] })
+}
+
+/// The picture a host's bytes are (#1953): what [`docxcore::image::sniff`]
+/// reads (PNG, JPEG, GIF or BMP), when `content_type` names the same kind.
+/// The type is read as a header gives it: any case, parameters after `;`
+/// dropped, with the kinds' common aliases. `None` for bytes no picture,
+/// a type of another kind, or one that is not a picture's.
+pub(crate) fn picture_kind(bytes: &[u8], content_type: &str) -> Option<docxcore::image::ImageInfo> {
+    let info = docxcore::image::sniff(bytes)?;
+    let ty = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let ext = match ty.as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" | "image/pjpeg" => "jpeg",
+        "image/gif" => "gif",
+        "image/bmp" | "image/x-bmp" | "image/x-ms-bmp" => "bmp",
+        _ => return None,
+    };
+    (ext == info.ext).then_some(info)
+}
+
+/// The text width (EMUs) a picture inserted at the caret is scaled down to
+/// when wider, as Insert Picture does: the caret's section's, the last
+/// section's through [`print_sheet::last_sect`] (the body's trailing
+/// sectPr, else the package's, else Letter with 1" margins), so a document
+/// with no sectPr, an HTML import's, still caps it.
+fn caret_text_width_emu(ed: &Editor, pkg: Option<&Package>) -> i64 {
+    let sections = ed.sections();
+    let i = ed.caret_section();
+    let raw = match sections.get(i) {
+        Some(raw) if i + 1 < sections.len() => raw.as_str(),
+        _ => print_sheet::last_sect(&ed.doc, pkg),
+    };
+    let g = docxcore::model::PageGeom::from_sect_pr(raw);
+    i64::from((g.w - g.ml - g.mr).max(1)) * 635
+}
+
+/// Every `r:embed` id in `xml`, each once.
+fn embed_ids(xml: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for piece in xml.split("r:embed=\"").skip(1) {
+        if let Some(id) = piece.split('"').next().filter(|id| !id.is_empty()) {
+            if !out.iter().any(|o| o == id) {
+                out.push(id.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// A host's picture (`info`, [`picture_kind`] of `bytes`) at the caret,
+/// replacing the selection, as Insert Picture inserts one (#1953): a new
+/// `word/media/imageN.<ext>` part related from the body, the picture its
+/// pixels at 96 dpi scaled to the text width ([`caret_text_width_emu`]),
+/// one undo step (`step`). A view with no package is given one
+/// ([`fresh_package`]). The media part is added outside the step, as a
+/// document tab's Insert Picture and paste add theirs: an undo leaves it
+/// unreferenced. Its relationship id is none a picture of the body
+/// already names, so a picture whose id the package never defined does
+/// not start to draw this one. Not run when the package cannot take the
+/// part (one without a body part). `step` names the undo step: "Insert
+/// Picture" for a host's insert, "Paste" for a clipboard image, as Word's
+/// undo names it.
+pub(crate) fn insert_picture(
+    ed: &mut Editor,
+    pkg: &mut Option<Package>,
+    bytes: &[u8],
+    info: &docxcore::image::ImageInfo,
+    step: &str,
+) -> Formatted {
+    let max_cx = caret_text_width_emu(ed, pkg.as_ref());
+    let (cx, cy) = docxcore::image::extent_emu(info, Some(max_cx));
+    let body = docxcore::serialize::blocks_to_xml(&ed.doc.body);
+    let pkg = pkg.get_or_insert_with(fresh_package);
+    // Unique among the body's drawings and every story part's.
+    let mut xmls = vec![body];
+    for name in pkg.part_names() {
+        if name.starts_with("word/") && name.ends_with(".xml") && name != BODY_PART {
+            xmls.extend(pkg.part_text(name));
+        }
+    }
+    let id = docxcore::image::next_drawing_id(xmls.iter().map(String::as_str));
+    let taken = embed_ids(&xmls[0]);
+    let Some(rid) = pkg.add_part_image_avoiding(BODY_PART, bytes, info, &taken) else {
+        return Formatted::default();
+    };
+    let run = docxcore::image::inline_picture_run(&rid, cx, cy, id, &format!("Picture {id}"));
+    let out = edit(ed, |ed| {
+        ed.one_step(step, |e| e.insert_object(vec![Inline::Raw(run)]))
+    });
+    Formatted {
+        ran: true,
+        changed: out.changed(),
+    }
+}
+
+/// What a paste in the view inserts (#1953).
+#[derive(Debug, PartialEq)]
+pub(crate) enum Pasted {
+    /// A clip, as a document tab's paste takes it ([`doc_paste_from`]).
+    Clip(PasteFrom, Clip),
+    /// Another app's picture: its bytes and what [`docxcore::image::sniff`]
+    /// read of them.
+    Picture(Vec<u8>, docxcore::image::ImageInfo),
+}
+
+/// What Ctrl+V pastes in the view (#1953): a document tab's choice
+/// ([`doc_paste_from`]: the view's own clip while it is still ours, else
+/// the RTF, else the HTML, else the text), with the clipboard's `image`
+/// before the HTML when no text is beside it. A browser's Copy Image puts
+/// an `<img>` HTML beside its picture, and Word pastes the picture. Ours
+/// never writes an image, so an image proves another copy: then only the
+/// RTF goes before it. An image beside text pastes the text, but gpui's X11
+/// client hands back only the image when both are offered (it asks for
+/// image kinds first), while Wayland reads the text first and Windows gives
+/// both: the same copy may paste the picture on X11 and the text elsewhere.
+/// An image `sniff` cannot read (WebP, SVG, TIFF, ...) counts as none, so
+/// the HTML or text after it still pastes.
+pub(crate) fn paste_source(
+    ours: Option<&DocClip>,
+    now: &ClipRead,
+    rtf: Option<&[u8]>,
+    image: Option<Vec<u8>>,
+    html: impl FnOnce() -> Option<String>,
+) -> Option<Pasted> {
+    let image = image.and_then(|b| Some((docxcore::image::sniff(&b)?, b)));
+    if let Some((info, image)) = image.filter(|_| now.text().is_none()) {
+        let rtf = rtf.and_then(|rtf| Clip::from_rtf(rtf, None));
+        return Some(match rtf {
+            Some(clip) => Pasted::Clip(PasteFrom::Rtf, clip),
+            None => Pasted::Picture(image, info),
+        });
+    }
+    doc_paste_from(ours, now, rtf, html).map(|(from, clip)| Pasted::Clip(from, clip))
+}
+
+/// Paste `clip` at the caret, replacing the selection, as a document tab's
+/// Paste: one undo step "Paste". The view's own clip (`media`: its
+/// pictures' media, read where it was copied) brings its pictures into the
+/// view's package ([`pictures::carry`], which reuses a part with the same
+/// bytes), giving a view with none a package first when a picture needs
+/// it; a relationship it adds is none a body picture already names, as
+/// for [`insert_picture`].
+pub(crate) fn paste_clip(
+    ed: &mut Editor,
+    pkg: &mut Option<Package>,
+    mut clip: Clip,
+    media: Option<&pictures::Media>,
+) -> Formatted {
+    if let Some(media) = media.filter(|m| !m.is_empty()) {
+        if clip.inline_embeds().iter().any(|r| media.contains_key(r)) {
+            let taken = embed_ids(&docxcore::serialize::blocks_to_xml(&ed.doc.body));
+            let pkg = pkg.get_or_insert_with(fresh_package);
+            pictures::carry_avoiding(pkg, BODY_PART, media, &mut clip, &taken);
+        }
+    }
+    let out = edit(ed, |ed| ed.one_step("Paste", |e| e.paste(&clip)));
+    Formatted {
+        ran: true,
+        changed: out.changed(),
+    }
+}
+
 impl From<Formatted> for KeyOutcome {
     fn from(f: Formatted) -> Self {
         if f.changed {
@@ -380,6 +557,8 @@ pub(crate) fn edit_key(
                 KeyOutcome::Moved
             }
             "c" if !shift => KeyOutcome::Copy,
+            // Ctrl+Shift+V too, as the document tab's map takes it.
+            "v" => KeyOutcome::Paste,
             "x" if !shift => match cut(ed) {
                 Some((clip, changed)) => KeyOutcome::Cut(clip, changed),
                 None => KeyOutcome::Moved,
@@ -1004,7 +1183,13 @@ mod tests {
     fn the_suites_keys_and_alt_letters_are_left_alone_and_altgr_types() {
         let mut ed = editor(&["x"]);
         for k in [
-            "ctrl-s", "ctrl-v", "ctrl-w", "f5", "ctrl-p", "alt-f", "ctrl-f1",
+            "ctrl-s",
+            "ctrl-w",
+            "f5",
+            "ctrl-p",
+            "alt-f",
+            "ctrl-f1",
+            "ctrl-alt-v",
         ] {
             assert!(
                 matches!(edit_key(&mut ed, None, &ks(k), false), KeyOutcome::Ignored),
@@ -1367,5 +1552,461 @@ mod tests {
         );
         assert!(history(&mut ed, false).changed);
         assert_eq!(text(&ed, 0), "Hi https://u.example/");
+    }
+
+    // ---- pictures and paste (#1953) ---------------------------------------
+
+    /// A PNG header `sniff` reads as `w` x `h` (the pixels are never decoded).
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut b = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        b.extend(w.to_be_bytes());
+        b.extend(h.to_be_bytes());
+        b.extend([8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        b
+    }
+
+    const PNG_INFO: &str = "image/png";
+
+    fn picture_rids(ed: &Editor, i: usize) -> Vec<String> {
+        let Block::Paragraph(p) = &ed.doc.body[i] else {
+            panic!("a paragraph")
+        };
+        p.content
+            .iter()
+            .filter_map(|c| match c {
+                Inline::Raw(raw) => docxcore::image::inline_embed(raw),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn put(ed: &mut Editor, pkg: &mut Option<Package>, bytes: &[u8]) -> Formatted {
+        let info = picture_kind(bytes, PNG_INFO).expect("a PNG");
+        insert_picture(ed, pkg, bytes, &info, "Insert Picture")
+    }
+
+    #[test]
+    fn a_host_picture_goes_into_the_package_and_is_one_undo_step_1953() {
+        let mut ed = editor(&["Alpha Beta"]);
+        let mut pkg = Some(docxcore::package::new_package(Document { body: vec![] }));
+        type_text(&mut ed, "z");
+        // Over a selection: the picture replaces it.
+        select(&mut ed, 1, 6);
+        let bytes = png(3, 2);
+        let done = put(&mut ed, &mut pkg, &bytes);
+        assert_eq!(
+            done,
+            Formatted {
+                ran: true,
+                changed: true
+            }
+        );
+        assert_eq!(text(&ed, 0).replace('\u{FFFC}', ""), "z Beta");
+        let rids = picture_rids(&ed, 0);
+        assert_eq!(rids.len(), 1);
+        let pkg_ref = pkg.as_ref().unwrap();
+        let target = pkg_ref.part_rel_target(BODY_PART, &rids[0]).unwrap();
+        assert_eq!(target, "word/media/image1.png");
+        assert_eq!(pkg_ref.part(&target), Some(&bytes[..]));
+        assert_eq!(
+            pkg_ref.part_content_type(&target).as_deref(),
+            Some("image/png")
+        );
+        // Its pixels at 96 dpi: 3 x 2 px.
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!()
+        };
+        let raw = p
+            .content
+            .iter()
+            .find_map(|c| match c {
+                Inline::Raw(raw) => Some(raw.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(raw.contains(r#"cx="28575" cy="19050""#), "{raw}");
+        // One step of its own, named as Insert Picture's.
+        assert_eq!(
+            ed.undo_names().first().map(String::as_str),
+            Some("Insert Picture")
+        );
+        assert!(history(&mut ed, false).changed);
+        assert_eq!(texts(&ed), ["zAlpha Beta"]);
+        assert!(picture_rids(&ed, 0).is_empty());
+        // The typing before it is a step of its own.
+        assert!(history(&mut ed, false).changed);
+        assert_eq!(texts(&ed), ["Alpha Beta"]);
+        // A second picture: its own part and id, and a drawing id past the
+        // first's.
+        assert!(history(&mut ed, true).changed);
+        assert!(history(&mut ed, true).changed);
+        put(&mut ed, &mut pkg, &png(5, 5));
+        let rids2 = picture_rids(&ed, 0);
+        assert_eq!(rids2.len(), 2);
+        assert_ne!(rids2[0], rids2[1]);
+        let xml = docxcore::serialize::blocks_to_xml(&ed.doc.body);
+        assert_eq!(xml.matches("docPr id=\"1\"").count(), 1, "{xml}");
+        assert_eq!(xml.matches("docPr id=\"2\"").count(), 1, "{xml}");
+    }
+
+    #[test]
+    fn only_a_picture_of_the_kind_its_type_names_is_inserted_1953() {
+        let bytes = png(3, 2);
+        for ty in ["image/png", "IMAGE/PNG", " image/png; charset=binary "] {
+            assert!(picture_kind(&bytes, ty).is_some(), "{ty}");
+        }
+        let gif = b"GIF89a\x02\0\x02\0\0\0\0".to_vec();
+        assert_eq!(picture_kind(&gif, "image/gif").map(|i| i.ext), Some("gif"));
+        assert!(picture_kind(&gif, "image/png").is_none(), "disagrees");
+        assert!(picture_kind(&bytes, "image/jpeg").is_none(), "disagrees");
+        assert!(picture_kind(&bytes, "image/webp").is_none(), "not ours");
+        assert!(picture_kind(&bytes, "").is_none());
+        let webp = b"RIFF\x10\0\0\0WEBPVP8 ".to_vec();
+        assert!(picture_kind(&webp, "image/webp").is_none());
+        assert!(picture_kind(b"not a picture", "image/png").is_none());
+    }
+
+    #[test]
+    fn a_view_with_no_package_is_given_one_and_its_look_stays_1953() {
+        use docxcore::model::{Cell, Row, Table, VMerge};
+        let bold = Block::Paragraph(Paragraph {
+            content: vec![Inline::Run(Run {
+                text: "Bold".into(),
+                props: docxcore::model::RunProps {
+                    bold: true,
+                    ..Default::default()
+                },
+            })],
+            ..Paragraph::default()
+        });
+        let table = Block::Table(Table {
+            grid: vec![100],
+            rows: vec![Row {
+                cells: vec![Cell {
+                    grid_span: 1,
+                    v_merge: VMerge::None,
+                    blocks: vec![bold],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut ed = Editor::new(Document {
+            body: vec![para("Top"), table],
+        });
+        ed.set_styles_xml(None);
+        ed.caret = Caret::at(vec![1, 0, 0, 0], 2);
+        let before = caret_format(&ed);
+        assert!(before.bold);
+        let mut pkg: Option<Package> = None;
+        ed.caret = Caret::at(vec![0], 3);
+        assert!(put(&mut ed, &mut pkg, &png(3, 2)).changed);
+        let pkg = pkg.expect("given a package");
+        assert!(
+            pkg.part_rel_target(BODY_PART, &picture_rids(&ed, 0)[0])
+                .is_some()
+        );
+        // The view seeds the new package's styles before the next edit.
+        let styles = pkg
+            .part("word/styles.xml")
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .map(std::sync::Arc::from);
+        assert!(styles.is_some());
+        ed.set_styles_xml(styles);
+        ed.caret = Caret::at(vec![1, 0, 0, 0], 2);
+        assert_eq!(caret_format(&ed), before);
+    }
+
+    #[test]
+    fn a_wide_picture_is_capped_at_the_text_width_without_a_sect_pr_1953() {
+        let mut ed = editor(&["x"]);
+        let mut pkg = None;
+        put(&mut ed, &mut pkg, &png(2000, 1000));
+        let xml = docxcore::serialize::blocks_to_xml(&ed.doc.body);
+        // Letter with 1" margins: 9360 twips of text, 635 EMUs each.
+        let width = 9360 * 635;
+        assert!(
+            xml.contains(&format!(r#"cx="{width}" cy="{}""#, width / 2)),
+            "{xml}"
+        );
+        // The section the caret is in decides: a first section half as wide.
+        let mut first = para("narrow");
+        if let Block::Paragraph(p) = &mut first {
+            p.props.section_break = Some(
+                r#"<w:sectPr><w:pgSz w:w="6120" w:h="15840"/><w:pgMar w:left="1440" w:right="1440"/></w:sectPr>"#
+                    .into(),
+            );
+        }
+        let mut ed = Editor::new(Document {
+            body: vec![first, para("wide")],
+        });
+        ed.caret = Caret::at(vec![0], 0);
+        put(&mut ed, &mut pkg, &png(2000, 1000));
+        let xml = docxcore::serialize::blocks_to_xml(&ed.doc.body[..1]);
+        assert!(xml.contains(&format!(r#"cx="{}""#, 3240 * 635)), "{xml}");
+    }
+
+    #[test]
+    fn a_new_picture_takes_no_id_an_orphan_picture_names_1953() {
+        // A document handed over without its package: its picture names
+        // rId2, which the fresh package does not define.
+        let mut ed = editor(&["x"]);
+        let orphan = docxcore::image::inline_picture_run("rId2", 9525, 9525, 7, "Old");
+        ed.caret = Caret::at(vec![0], 1);
+        ed.insert_object(vec![Inline::Raw(orphan)]);
+        let mut pkg = None;
+        put(&mut ed, &mut pkg, &png(1, 1));
+        let rids = picture_rids(&ed, 0);
+        assert_eq!(rids.len(), 2);
+        assert_eq!(rids[0], "rId2", "the orphan keeps its id");
+        assert_ne!(rids[1], "rId2");
+        let pkg = pkg.unwrap();
+        assert!(pkg.part_rel_target(BODY_PART, "rId2").is_none());
+        assert!(pkg.part_rel_target(BODY_PART, &rids[1]).is_some());
+        // Its drawing id is past the orphan's too.
+        let xml = docxcore::serialize::blocks_to_xml(&ed.doc.body);
+        assert!(xml.contains("docPr id=\"8\""), "{xml}");
+    }
+
+    // The paste source (#1953).
+
+    fn ours(text: &str) -> DocClip {
+        DocClip {
+            clip: Clip::from_text("ours"),
+            text: text.into(),
+            media: Default::default(),
+        }
+    }
+
+    const RTF_BOLD: &[u8] = br"{\rtf1\ansi {\b Bold} plain}";
+    const HTML: &str = "<p>From <b>the web</b></p>";
+
+    fn from(src: Option<Pasted>) -> Option<&'static str> {
+        src.map(|s| match s {
+            Pasted::Clip(PasteFrom::Ours, _) => "ours",
+            Pasted::Clip(PasteFrom::Rtf, _) => "rtf",
+            Pasted::Clip(PasteFrom::Html, _) => "html",
+            Pasted::Clip(PasteFrom::Text, _) => "text",
+            Pasted::Picture(..) => "picture",
+        })
+    }
+
+    #[test]
+    fn paste_takes_ours_then_rtf_then_an_image_alone_then_html_then_text_1953() {
+        let text = |t: &str| ClipRead::Text(t.into());
+        let img = || Some(png(3, 2));
+        let html = || Some(HTML.to_string());
+        let none = || None;
+        // Ours while the clipboard holds its text.
+        let o = ours("Beta");
+        assert_eq!(
+            from(paste_source(Some(&o), &text("Beta"), None, None, none)),
+            Some("ours")
+        );
+        // Another copy's RTF beside its text.
+        assert_eq!(
+            from(paste_source(
+                Some(&o),
+                &text("Bold plain"),
+                Some(RTF_BOLD),
+                None,
+                none
+            )),
+            Some("rtf")
+        );
+        // HTML with no text beside it (a browser's).
+        assert_eq!(
+            from(paste_source(None, &ClipRead::NotText, None, None, html)),
+            Some("html")
+        );
+        // Plain text.
+        assert_eq!(
+            from(paste_source(None, &text("plain"), None, None, none)),
+            Some("text")
+        );
+        // An image alone pastes as a picture, its bytes as read.
+        let Some(Pasted::Picture(bytes, info)) =
+            paste_source(None, &ClipRead::NotText, None, img(), none)
+        else {
+            panic!("a picture")
+        };
+        assert_eq!(bytes, png(3, 2));
+        assert_eq!((info.ext, info.width, info.height), ("png", 3, 2));
+        // Pasted, it is one undo step "Paste", as Word names it.
+        let mut ed = editor(&["x"]);
+        let mut pkg = None;
+        assert!(insert_picture(&mut ed, &mut pkg, &bytes, &info, "Paste").changed);
+        assert_eq!(ed.undo_names().first().map(String::as_str), Some("Paste"));
+        // A browser's Copy Image: the picture beside its <img> HTML.
+        assert_eq!(
+            from(paste_source(None, &ClipRead::NotText, None, img(), html)),
+            Some("picture")
+        );
+        // The RTF goes before the image.
+        assert_eq!(
+            from(paste_source(
+                None,
+                &ClipRead::NotText,
+                Some(RTF_BOLD),
+                img(),
+                html
+            )),
+            Some("rtf")
+        );
+        // Text beside the image (Windows, Wayland): the text.
+        assert_eq!(
+            from(paste_source(None, &text("cell"), None, img(), none)),
+            Some("text")
+        );
+        // After our picture-only copy (its text U+FFFC), another app's image
+        // is not ours.
+        let pic = ours("\u{FFFC}");
+        assert_eq!(
+            from(paste_source(
+                Some(&pic),
+                &ClipRead::NotText,
+                None,
+                img(),
+                none
+            )),
+            Some("picture")
+        );
+        // Even a clip recorded with no text: an image proves another copy.
+        let empty = ours("");
+        assert_eq!(
+            from(paste_source(
+                Some(&empty),
+                &ClipRead::NotText,
+                None,
+                img(),
+                none
+            )),
+            Some("picture")
+        );
+        // Nothing at all.
+        assert_eq!(
+            from(paste_source(None, &ClipRead::Nothing, None, None, none)),
+            None
+        );
+    }
+
+    #[test]
+    fn an_image_sniff_cannot_read_counts_as_none_1953() {
+        let webp = || Some(b"RIFF\x10\0\0\0WEBPVP8 ".to_vec());
+        let html = || Some(HTML.to_string());
+        assert_eq!(
+            from(paste_source(None, &ClipRead::NotText, None, webp(), html)),
+            Some("html")
+        );
+        assert_eq!(
+            from(paste_source(None, &ClipRead::NotText, None, webp(), || {
+                None
+            })),
+            None
+        );
+    }
+
+    #[test]
+    fn ctrl_v_and_ctrl_shift_v_paste_and_ctrl_alt_v_is_left_1953() {
+        let mut ed = editor(&["x"]);
+        assert!(matches!(press(&mut ed, "ctrl-v")[0], KeyOutcome::Paste));
+        assert!(matches!(
+            press(&mut ed, "ctrl-shift-v")[0],
+            KeyOutcome::Paste
+        ));
+        assert!(matches!(
+            press(&mut ed, "ctrl-alt-v")[0],
+            KeyOutcome::Ignored
+        ));
+        // ⌘V on macOS.
+        let k = Keystroke::parse("cmd-v").unwrap();
+        assert!(matches!(
+            edit_key(&mut ed, None, &k, true),
+            KeyOutcome::Paste
+        ));
+        // The key changes nothing itself: the view pastes.
+        assert_eq!(texts(&ed), ["x"]);
+        assert!(!KeyOutcome::Paste.changed());
+    }
+
+    #[test]
+    fn a_pasted_clip_is_one_step_and_formatting_stays_1953() {
+        let mut ed = editor(&["Alpha"]);
+        let mut pkg = None;
+        type_text(&mut ed, "z");
+        let clip = Clip::from_rtf(RTF_BOLD, None).expect("an RTF clip");
+        let done = paste_clip(&mut ed, &mut pkg, clip, None);
+        assert!(done.ran && done.changed);
+        assert!(
+            runs(&ed, 0).contains(&("Bold".into(), true)),
+            "{:?}",
+            runs(&ed, 0)
+        );
+        assert_eq!(ed.undo_names().first().map(String::as_str), Some("Paste"));
+        assert!(pkg.is_none(), "text needs no package");
+        history(&mut ed, false);
+        assert_eq!(texts(&ed), ["zAlpha"]);
+    }
+
+    #[test]
+    fn our_clip_with_a_picture_brings_its_media_once_1953() {
+        // Copy a picture from a view with a package.
+        let mut src = editor(&["ab"]);
+        let mut src_pkg = None;
+        src.caret = Caret::at(vec![0], 1);
+        put(&mut src, &mut src_pkg, &png(3, 2));
+        select(&mut src, 0, 3);
+        let clip = src.copy().expect("a selection");
+        let media = pictures::capture(src_pkg.as_ref().unwrap(), BODY_PART, &clip);
+        assert_eq!(media.len(), 1);
+        // Paste it into a view with no package: it is given one, with the
+        // picture's part.
+        let mut dst = editor(&["Z"]);
+        let mut dst_pkg = None;
+        dst.caret = Caret::at(vec![0], 1);
+        let done = paste_clip(&mut dst, &mut dst_pkg, clip.clone(), Some(&media));
+        assert!(done.changed);
+        let rids = picture_rids(&dst, 0);
+        assert_eq!(rids.len(), 1);
+        let pkg = dst_pkg.as_ref().expect("given a package");
+        let target = pkg.part_rel_target(BODY_PART, &rids[0]).unwrap();
+        assert_eq!(pkg.part(&target), Some(&png(3, 2)[..]));
+        // Pasted again: the same part, no second copy of the bytes.
+        let parts = pkg.part_names().len();
+        paste_clip(&mut dst, &mut dst_pkg, clip, Some(&media));
+        let pkg = dst_pkg.as_ref().unwrap();
+        assert_eq!(pkg.part_names().len(), parts);
+        let rids = picture_rids(&dst, 0);
+        assert_eq!(rids.len(), 2);
+        assert_eq!(rids[0], rids[1]);
+    }
+
+    #[test]
+    fn a_pasted_picture_takes_no_id_an_orphan_picture_names_1953() {
+        // Our clip, copied from a document with a picture.
+        let mut src = editor(&["ab"]);
+        let mut src_pkg = None;
+        src.caret = Caret::at(vec![0], 1);
+        put(&mut src, &mut src_pkg, &png(3, 2));
+        select(&mut src, 0, 3);
+        let clip = src.copy().expect("a selection");
+        let media = pictures::capture(src_pkg.as_ref().unwrap(), BODY_PART, &clip);
+        // The host shows another document, without its package: its
+        // picture names rId2, which no package defines.
+        let mut dst = editor(&["x"]);
+        let orphan = docxcore::image::inline_picture_run("rId2", 9525, 9525, 7, "Old");
+        dst.caret = Caret::at(vec![0], 1);
+        dst.insert_object(vec![Inline::Raw(orphan)]);
+        let mut dst_pkg = None;
+        assert!(paste_clip(&mut dst, &mut dst_pkg, clip, Some(&media)).changed);
+        let rids = picture_rids(&dst, 0);
+        assert_eq!(rids.len(), 2);
+        assert_eq!(rids[0], "rId2", "the orphan keeps its id");
+        assert_ne!(rids[1], "rId2");
+        let pkg = dst_pkg.unwrap();
+        assert!(pkg.part_rel_target(BODY_PART, "rId2").is_none());
+        let target = pkg.part_rel_target(BODY_PART, &rids[1]).unwrap();
+        assert_eq!(pkg.part(&target), Some(&png(3, 2)[..]));
     }
 }

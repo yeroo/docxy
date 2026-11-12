@@ -198,9 +198,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   replies `document()`'s top-level paragraphs (`text`, `num_id`, `ilvl`,
   `align`, `runs` with `text`/`bold`/`italic`/`underline`) and
   `package_has_numbering`. `uiharness/cases/ext-doc-edit.uit` drives it.
-- Not done here: pictures from bytes and paste of
-  pictures or the suite's formatted clipboard (#1953), so Ctrl+V bubbles
-  as before; line-wise Up/Down (paragraph-wise, `move_vert`, as a document
+- Not done here: line-wise Up/Down (paragraph-wise, `move_vert`, as a document
   tab); AutoCorrect, Repeat; IME, dead keys and Windows' WM_CHAR packet
   text (the suite's input handler is the root's, so a focused view gets
   plain key-downs only).
@@ -245,6 +243,73 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   `ext-doc-call`) add `can_copy`. The `issue 1977` test in
   `uiharness/cases/ext-doc-edit.uit` copies "Beta", then cuts the whole
   paragraph, so the second clipboard read can only be the cut's.
+
+## Insert pictures and paste (#1953)
+
+- `DocView::insert_picture(bytes, content_type)` and `paste()`, and Ctrl+V
+  (Ctrl+Shift+V too, as the document tab's map takes it; Ctrl+Alt+V,
+  Paste Special, is not the view's) in the editing mode. Read-only, both
+  return false and Ctrl+V bubbles as before. The decisions are
+  `doc_view/edit.rs`'s `picture_kind`, `insert_picture`, `paste_source`
+  and `paste_clip`, tested without a window.
+- A picture: `content_type` (any case, parameters dropped, the kinds'
+  aliases `image/jpg`, `image/pjpeg`, `image/x-bmp`, `image/x-ms-bmp`)
+  must name the kind `docxcore::image::sniff` reads (PNG, JPEG, GIF,
+  BMP); WebP, SVG, TIFF are refused, not converted. It goes in as Insert
+  Picture does: a `word/media/imageN.<ext>` part related from
+  `word/document.xml` (outside the step: an undo leaves the part
+  unreferenced), its pixels at 96 dpi scaled to the caret's section's text
+  width, the last section's through `print_sheet::last_sect` (so a
+  document with no sectPr is capped at Letter's), a `docPr` id past every
+  story's, one undo step "Insert Picture" (a pasted image's is "Paste"). Its rId is none a body picture
+  already names (`Package::add_part_image_avoiding`): a document handed
+  over without its package keeps its pictures' `r:embed`s, which must not
+  start drawing the new one. A view given no package is given
+  `new_package`'s (empty styles: what it shows does not change, checked in
+  the uit's `ext-doc-layout`), whose `document` is empty: the host exports
+  `document()` with `package()`. The picture cache renews on the package's
+  `parts_stamp`, so the new part draws on the next frame.
+- Paste: the view keeps its own last copy or cut (`clip: Option<DocClip>`,
+  with `pictures::capture`'s media, recorded in either mode), as a
+  document tab keeps its own. `paste_source` is `doc_paste_from` (ours
+  while the clipboard holds its text, else RTF, else HTML, else text) with
+  the clipboard's image before the HTML when no text is beside it: a
+  browser's Copy Image puts an `<img>` HTML beside the picture, and Word
+  pastes the picture. The view never writes an image, so an image proves
+  another copy and only the RTF goes before it. An image `sniff` cannot
+  read counts as none, so the HTML or text after it still pastes. Ours
+  brings its pictures' media into the view's package
+  (`pictures::carry_avoiding`, which reuses a part with the same bytes and
+  adds none under an id a body picture already names,
+  `Package::add_part_media_avoiding`; a package is made first when a
+  picture needs one). The clip outlives `set_document`: a copy from one
+  document pastes into the next. A document tab's copy reaches the view through its
+  RTF (formatting kept, pictures not: the view cannot read its window's
+  `Docxy`, whose update a host call may be inside), and a view copy
+  reaches a document tab the same way.
+- Platforms differ when a copy offers an image and text: gpui's X11
+  client asks for image kinds first and hands back only the image (no
+  text: `ClipRead::NotText`), Wayland reads the text first and the image
+  only without it, Windows gives both. So the same copy pastes the
+  picture on X11 and the text elsewhere; neither is a bug to fix in one
+  test. The clipboard is read once for both (`ClipboardStore::read_item`):
+  on X11 every read transfers the image again, and two reads need not see
+  the same copy.
+- Ctrl+V is taken in the editing mode even with nothing to paste, as a
+  document tab takes it. Each paste is one undo step named "Paste", a
+  clipboard image's too (`insert_picture`'s `step`, as Word's undo names
+  it; the host's `insert_picture` is "Insert Picture"), and `on_change`
+  fires only on a change.
+- Harness: `ext-doc-call` takes `{"insert_picture": {"hex": <bytes>,
+  "content_type": <type>}}` and `{"paste": true}`; `clipboard write` takes
+  `image_hex` (the private clipboard's image, dropped by any later text
+  write) and `clipboard`'s reply adds `image_bytes`; `ext-doc-document`
+  adds each paragraph's `pictures` (rIds), `has_package`, and `media`
+  (each top-level picture's `rid`, `target`, `content_type`, `bytes`).
+  The `issue 1953` tests in `uiharness/cases/ext-doc-edit.uit`.
+- Not done here: Paste Special and Keep Text Only in the view; an OS image
+  pasted into a document tab; WebP/SVG/TIFF conversion; a document tab's
+  pictures pasted into the view (RTF carries none).
 
 ## Host hyperlinks (#1952)
 

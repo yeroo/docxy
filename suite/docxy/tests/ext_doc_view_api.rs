@@ -150,6 +150,9 @@ fn compose(doc: Document, pkg: Package, cx: &mut App) -> Rc<Cell<usize>> {
         let _inserted: bool = v.insert_text("Kind regards,\nA. Sender", cx);
         let _copied: bool = v.can_copy() && v.copy(cx);
         let _cut: bool = v.can_copy() && v.editable() && v.cut(cx);
+        // A picture from bytes, and the host's Paste button (#1953).
+        let _pictured: bool = v.insert_picture(&[0x89, b'P', b'N', b'G'], "image/png", cx);
+        let _pasted: bool = v.paste(cx);
         let _body: Document = v.document();
         let _pkg: Option<Package> = v.package();
     });

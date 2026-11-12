@@ -45,7 +45,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// its harness regions and link spans are read from.
 pub(crate) type Words = Rc<RefCell<Vec<(Vec<usize>, WordSpans)>>>;
 
-/// The story part the view's pictures resolve through.
+/// The story part the view's pictures resolve through, and the one its
+/// inserted and pasted pictures are related from (#1953).
 const BODY_PART: &str = "word/document.xml";
 
 /// The zoom range and step, as the document tabs' (Ctrl+= / Ctrl+-).
@@ -264,6 +265,10 @@ pub struct DocView {
     held_scroll: Point<Pixels>,
     wheel_acc: f32,
     clipboard: ClipboardStore,
+    /// The view's own last copy or cut (#1953), as a document tab keeps
+    /// its `clip`: a paste takes it while the clipboard still holds its
+    /// text, formatting and pictures intact. Recorded in either mode.
+    clip: Option<DocClip>,
     /// The editing mode (#1947): off, the view is read-only.
     editable: bool,
     on_change: Option<ChangeFn>,
@@ -332,6 +337,7 @@ impl DocView {
             held_scroll: Point::default(),
             wheel_acc: 0.,
             clipboard: ClipboardStore::shared(windows::shared_clipboard_text(cx)),
+            clip: None,
             editable: false,
             on_change: None,
             reveal: None,
@@ -473,6 +479,89 @@ impl DocView {
         self.write_clip(&clip, cx);
         self.after_edit(changed, cx);
         true
+    }
+
+    /// Insert a picture from `bytes` at the caret (#1953), replacing the
+    /// selection, as Insert Picture does: `content_type` (`image/png`,
+    /// `image/jpeg`, `image/gif` or `image/bmp`; parameters and case are
+    /// ignored) must name the kind the bytes are. Its media part and
+    /// relationship go into the view's package, so [`DocView::package`]
+    /// holds them beside [`DocView::document`]; a view given no package is
+    /// given one, whose empty styles change nothing shown. Its pixels at 96
+    /// dpi, scaled down to the text width when wider. One undo step, which
+    /// [`DocView::on_change`] hears of. True when it was inserted; false,
+    /// changing nothing, on a read-only view, for bytes that are not such
+    /// a picture, or a type that is not one or disagrees with the bytes.
+    pub fn insert_picture(
+        &mut self,
+        bytes: &[u8],
+        content_type: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.editable {
+            return false;
+        }
+        let Some(info) = edit::picture_kind(bytes, content_type) else {
+            return false;
+        };
+        self.seed_styles();
+        let done = edit::insert_picture(
+            &mut self.editor,
+            &mut self.pkg,
+            bytes,
+            &info,
+            "Insert Picture",
+        );
+        if done.ran {
+            self.after_edit(done.changed, cx);
+        }
+        done.ran
+    }
+
+    /// Paste at the caret, as Ctrl+V does (#1953): a host's Paste button.
+    /// The view's own copy while the clipboard still holds it (formatting
+    /// and pictures), else another copy's RTF, else an image with no text
+    /// beside it as a picture, else the HTML, else the text
+    /// ([`edit::paste_source`]). One undo step, which [`DocView::on_change`]
+    /// hears of. True when something was pasted; false, changing nothing,
+    /// on a read-only view or with nothing on the clipboard to paste.
+    pub fn paste(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.editable {
+            return false;
+        }
+        self.seed_styles();
+        let done = self.paste_now(cx);
+        if done.ran {
+            self.after_edit(done.changed, cx);
+        }
+        done.ran
+    }
+
+    /// Read the clipboard and paste what [`edit::paste_source`] picks.
+    fn paste_now(&mut self, cx: &mut App) -> edit::Formatted {
+        let h = harness();
+        let (now, image) = self.clipboard.read_item(h, || cx.read_from_clipboard());
+        let rtf = self.clipboard.read_rtf(h, crate::rich_clip::read_rtf);
+        let clipboard = &self.clipboard;
+        let source = edit::paste_source(self.clip.as_ref(), &now, rtf.as_deref(), image, || {
+            clipboard.read_html(h, crate::rich_clip::read_html)
+        });
+        match source {
+            None => edit::Formatted::default(),
+            // Word's undo names a pasted picture "Paste".
+            Some(edit::Pasted::Picture(bytes, info)) => {
+                edit::insert_picture(&mut self.editor, &mut self.pkg, &bytes, &info, "Paste")
+            }
+            Some(edit::Pasted::Clip(from, clip)) => {
+                // Only the view's own clip carries its pictures' media.
+                let media = self
+                    .clip
+                    .as_ref()
+                    .filter(|_| from == PasteFrom::Ours)
+                    .map(|ours| ours.media.clone());
+                edit::paste_clip(&mut self.editor, &mut self.pkg, clip, media.as_ref())
+            }
+        }
     }
 
     /// Whether there is a selection, so [`DocView::copy`] would copy: for a
@@ -895,6 +984,12 @@ impl DocView {
                 self.write_copy(cx);
             }
             edit::KeyOutcome::Cut(clip, _) => self.write_clip(&clip, cx),
+            // Taken even with nothing to paste, as a document tab takes it.
+            edit::KeyOutcome::Paste => {
+                let done = self.paste_now(cx);
+                self.after_edit(done.changed, cx);
+                return true;
+            }
             edit::KeyOutcome::Moved | edit::KeyOutcome::Changed => {}
         }
         // Ctrl+Home / Ctrl+End go to the very top and bottom, as read-only.
@@ -1132,18 +1227,30 @@ impl DocView {
     /// private one in a harness), as a document tab's copy writes it.
     /// Whether there was a selection to write.
     fn write_copy(&mut self, cx: &mut App) -> bool {
-        let Some((text, rtf)) = copy_payload(&self.editor, self.pkg.as_ref()) else {
+        let Some(clip) = self.editor.copy() else {
             return false;
         };
-        self.clipboard.write_rich(harness(), text, rtf, cx);
+        self.write_clip(&clip, cx);
         true
     }
 
     /// What a cut took, on the clipboard as [`DocView::write_copy`] writes a
-    /// copy.
+    /// copy, and kept as the view's own clip with its pictures' media, as
+    /// a document tab's copy keeps its own (#1953): a cut leaves the
+    /// package as it was, so the media are still there to read.
     fn write_clip(&mut self, clip: &Clip, cx: &mut App) {
         let (text, rtf) = clip_payload(clip, self.pkg.as_ref());
-        self.clipboard.write_rich(harness(), text, rtf, cx);
+        let text = self.clipboard.write_rich(harness(), text, rtf, cx);
+        let media = self
+            .pkg
+            .as_ref()
+            .map(|pkg| pictures::capture(pkg, BODY_PART, clip))
+            .unwrap_or_default();
+        self.clip = Some(DocClip {
+            clip: clip.clone(),
+            text,
+            media,
+        });
     }
 
     // ---- what the harness reads -------------------------------------------
@@ -2233,15 +2340,6 @@ fn painted_hits(words: &Words, hits: &[(Vec<usize>, usize, usize)]) -> Vec<Bound
         ));
     }
     out
-}
-
-/// The text and RTF a copy of `editor`'s selection writes (the RTF resolves
-/// styles through `pkg`, as a document copy's does); `None` with no selection.
-pub(crate) fn copy_payload(
-    editor: &Editor,
-    pkg: Option<&Package>,
-) -> Option<(String, Option<String>)> {
-    Some(clip_payload(&editor.copy()?, pkg))
 }
 
 /// A colour as `rrggbb`, with no `#`: a case's `#` starts a comment.

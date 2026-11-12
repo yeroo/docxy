@@ -1822,6 +1822,23 @@ enum ExtDocCall {
     InsertText(String),
     Copy,
     Cut,
+    /// `insert_picture` (#1953): the bytes and their content type.
+    InsertPicture(Vec<u8>, String),
+    /// `paste` (#1953).
+    Paste,
+}
+
+/// Bytes given as hex (`89504e47...`, any case, no separators), for a
+/// picture a script hands the app (#1953).
+fn hex_bytes(hex: &str, what: &str) -> Result<Vec<u8>, String> {
+    let hex = hex.trim();
+    if !hex.len().is_multiple_of(2) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("'{what}' must be hex digits, two per byte"));
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
 }
 
 /// The test extension's link-under-the-pointer reports (`hover_count`,
@@ -1857,11 +1874,12 @@ fn ext_link_reports(f: &crate::ext_fixture::FixtureView) -> Vec<(String, Json)> 
 /// <name or null>}`, `{"undo": true}`, `{"redo": true}`, `{"insert_text":
 /// <text>}`, `{"copy": true}` or `{"cut": true}` (#1977), `{"insert_link":
 /// {"text": <text>, "url": <url>}}`, `{"edit_link": {"text": <text>, "url":
-/// <url>}}` or `{"remove_link": true}` (#1952).
+/// <url>}}` or `{"remove_link": true}` (#1952), `{"insert_picture": {"hex":
+/// <bytes as hex>, "content_type": <type>}}` or `{"paste": true}` (#1953).
 fn ext_doc_call(args: &Json) -> Result<ExtDocCall, String> {
     use crate::ext::DocFormat as F;
     use docxcore::model::Align;
-    const USAGE: &str = "ext-doc-call takes one of 'format', 'font', 'size', 'color', 'highlight', 'undo', 'redo', 'insert_text', 'copy', 'cut', 'insert_link', 'edit_link' or 'remove_link'";
+    const USAGE: &str = "ext-doc-call takes one of 'format', 'font', 'size', 'color', 'highlight', 'undo', 'redo', 'insert_text', 'copy', 'cut', 'insert_link', 'edit_link', 'remove_link', 'insert_picture' or 'paste'";
     let keys = [
         "format",
         "font",
@@ -1876,6 +1894,8 @@ fn ext_doc_call(args: &Json) -> Result<ExtDocCall, String> {
         "insert_link",
         "edit_link",
         "remove_link",
+        "insert_picture",
+        "paste",
     ];
     let given: Vec<&str> = keys
         .iter()
@@ -1913,7 +1933,7 @@ fn ext_doc_call(args: &Json) -> Result<ExtDocCall, String> {
         },
         "color" => F::Color(text_or_null(value)?),
         "highlight" => F::Highlight(text_or_null(value)?),
-        "undo" | "redo" | "copy" | "cut" => {
+        "undo" | "redo" | "copy" | "cut" | "paste" => {
             if *value != Json::Bool(true) {
                 return Err(format!("'{key}' must be true"));
             }
@@ -1921,8 +1941,19 @@ fn ext_doc_call(args: &Json) -> Result<ExtDocCall, String> {
                 "undo" => ExtDocCall::Undo,
                 "redo" => ExtDocCall::Redo,
                 "copy" => ExtDocCall::Copy,
+                "paste" => ExtDocCall::Paste,
                 _ => ExtDocCall::Cut,
             });
+        }
+        "insert_picture" => {
+            const TAKES: &str =
+                "'insert_picture' takes {\"hex\": <bytes as hex>, \"content_type\": <type>}";
+            let field = |name: &str| value.get(name).and_then(Json::as_str).ok_or(TAKES);
+            let bytes = hex_bytes(field("hex")?, "hex")?;
+            return Ok(ExtDocCall::InsertPicture(
+                bytes,
+                field("content_type")?.to_string(),
+            ));
         }
         "insert_text" => {
             let text = value.as_str().ok_or("'insert_text' must be a string")?;
@@ -1956,8 +1987,13 @@ fn ext_doc_call(args: &Json) -> Result<ExtDocCall, String> {
 /// `ext-doc-document`'s reply: the document's top-level paragraphs (a table
 /// is `{"table": true}`), each with its text, list (`num_id`, `ilvl`),
 /// alignment and runs (text, bold, italic, underline, colour; a link's runs
-/// among them, with its URL or `#` and bookmark as `link`, #1952), and
-/// whether the package has a numbering part.
+/// among them, with its URL or `#` and bookmark as `link`, #1952) and its
+/// inline pictures' relationship ids (`pictures`, #1953), whether the
+/// package has a numbering part, whether there is a package
+/// (`has_package`), and the media the top-level pictures name (`media`:
+/// `rid`, the part it resolves to through the body's relationships, that
+/// part's content type and byte count; `null`s for one that does not
+/// resolve).
 fn ext_doc_document_json(
     doc: &docxcore::model::Document,
     pkg: Option<&docxcore::package::Package>,
@@ -2002,8 +2038,18 @@ fn ext_doc_document_json(
                         _ => Vec::new(),
                     })
                     .collect();
+                let pictures = p
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        Inline::Raw(raw) => docxcore::image::inline_embed(raw),
+                        _ => None,
+                    })
+                    .map(Json::Str)
+                    .collect();
                 Json::obj(vec![
                     ("text", Json::Str(p.plain_text())),
+                    ("pictures", Json::Arr(pictures)),
                     (
                         "num_id",
                         p.props
@@ -2021,6 +2067,34 @@ fn ext_doc_document_json(
             _ => Json::obj(vec![("table", Json::Bool(true))]),
         })
         .collect();
+    let mut rids: Vec<String> = Vec::new();
+    for b in &doc.body {
+        if let Block::Paragraph(p) = b {
+            for c in &p.content {
+                if let Inline::Raw(raw) = c {
+                    rids.extend(docxcore::image::inline_embed(raw));
+                }
+            }
+        }
+    }
+    let media = rids
+        .into_iter()
+        .map(|rid| {
+            let target = pkg.and_then(|p| p.part_rel_target("word/document.xml", &rid));
+            let part = pkg.zip(target.as_deref());
+            let bytes = part.and_then(|(p, t)| p.part(t));
+            let ty = part.and_then(|(p, t)| p.part_content_type(t));
+            Json::obj(vec![
+                ("rid", Json::Str(rid)),
+                ("target", str_or_null(target.clone())),
+                ("content_type", str_or_null(ty)),
+                (
+                    "bytes",
+                    bytes.map_or(Json::Null, |b| Json::Num(b.len() as f64)),
+                ),
+            ])
+        })
+        .collect();
     Json::obj(vec![
         ("blocks", Json::Num(doc.body.len() as f64)),
         ("paragraphs", Json::Arr(blocks)),
@@ -2028,6 +2102,8 @@ fn ext_doc_document_json(
             "package_has_numbering",
             Json::Bool(pkg.is_some_and(|p| p.part("word/numbering.xml").is_some())),
         ),
+        ("has_package", Json::Bool(pkg.is_some())),
+        ("media", Json::Arr(media)),
     ])
 }
 
@@ -4743,6 +4819,13 @@ fn clipboard_json(app: &crate::Docxy, cx: &App) -> Json {
             str_or_null(rtf.map(|r| String::from_utf8_lossy(&r).into_owned())),
         ),
         ("rtf_bold", str_or_null(bold)),
+        (
+            "image_bytes",
+            app.clipboard
+                .read_item(app.harness, || cx.read_from_clipboard())
+                .1
+                .map_or(Json::Null, |b| Json::Num(b.len() as f64)),
+        ),
         ("html", str_or_null(html.clone())),
         ("html_bold", str_or_null(html.map(|h| html_bold_text(&h)))),
         ("app", used),
@@ -5927,6 +6010,8 @@ fn dispatch_verb(
                 ExtDocCall::InsertText(text) => v.insert_text(&text, cx),
                 ExtDocCall::Copy => v.copy(cx),
                 ExtDocCall::Cut => v.cut(cx),
+                ExtDocCall::InsertPicture(bytes, ty) => v.insert_picture(&bytes, &ty, cx),
+                ExtDocCall::Paste => v.paste(cx),
             });
             let mut reply = match doc.read(cx).harness_json(window) {
                 Json::Obj(fields) => fields,
@@ -7742,12 +7827,21 @@ fn dispatch_verb(
                         Some(Json::Str(html)) => Some(html.clone()),
                         Some(_) => return Err("'html' must be a string".into()),
                     };
+                    // Another app's picture beside the text (#1953).
+                    let image = match args.get("image_hex") {
+                        None | Some(Json::Null) => None,
+                        Some(Json::Str(hex)) => Some(hex_bytes(hex, "image_hex")?),
+                        Some(_) => return Err("'image_hex' must be a string".into()),
+                    };
                     app.clipboard_write(text.clone(), cx);
                     if let Some(rtf) = rtf {
                         app.clipboard_write_rtf(rtf, &text);
                     }
                     if let Some(html) = html {
                         app.clipboard_write_html(html, &text);
+                    }
+                    if let Some(image) = image {
+                        app.clipboard.write_private_image(image);
                     }
                 }
                 "paste-special" => {
@@ -9570,7 +9664,23 @@ mod tests {
             call(r#"{"remove_link":true}"#),
             Ok(ExtDocCall::Format(F::RemoveLink))
         );
+        // #1953: a picture's bytes as hex, and Paste.
+        assert_eq!(
+            call(r#"{"insert_picture":{"hex":"89504E47ff","content_type":"image/png"}}"#),
+            Ok(ExtDocCall::InsertPicture(
+                vec![0x89, 0x50, 0x4e, 0x47, 0xff],
+                "image/png".into()
+            ))
+        );
+        assert_eq!(call(r#"{"paste":true}"#), Ok(ExtDocCall::Paste));
         for bad in [
+            r#"{"insert_picture":"89504e47"}"#,
+            r#"{"insert_picture":{"hex":"895"}}"#,
+            r#"{"insert_picture":{"hex":"8950","content_type":3}}"#,
+            r#"{"insert_picture":{"hex":"zz","content_type":"image/png"}}"#,
+            r#"{"insert_picture":{"hex":"895","content_type":"image/png"}}"#,
+            r#"{"paste":false}"#,
+            r#"{"paste":true,"copy":true}"#,
             r#"{"insert_link":"https://b.example/"}"#,
             r#"{"insert_link":{"url":"https://b.example/"}}"#,
             r#"{"edit_link":{"text":"a","url":3}}"#,
