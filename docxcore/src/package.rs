@@ -2637,6 +2637,21 @@ impl Package {
         self.add_part_media(part, bytes, kind.ext, kind.content_type)
     }
 
+    /// [`Package::add_part_image`] whose new relationship id is none of
+    /// `taken` (#1953): the ids the story's pictures already name, whether
+    /// or not the part's relationships define them. A document handed over
+    /// without its package keeps its pictures' `r:embed`s, and a picture
+    /// added later must not take one of their ids, or they would all draw it.
+    pub fn add_part_image_avoiding(
+        &mut self,
+        part: &str,
+        bytes: &[u8],
+        kind: &crate::image::ImageInfo,
+        taken: &[String],
+    ) -> Option<String> {
+        self.add_media_rel(part, bytes, kind.ext, kind.content_type, taken)
+    }
+
     /// [`Package::add_part_image`] for media of any kind (#1639): `ext`
     /// names the new part (`word/media/imageN.<ext>`) and, when no
     /// `Default` declares the extension, `content_type` is declared for it.
@@ -2648,6 +2663,18 @@ impl Package {
         bytes: &[u8],
         ext: &str,
         content_type: &str,
+    ) -> Option<String> {
+        self.add_media_rel(part, bytes, ext, content_type, &[])
+    }
+
+    /// [`Package::add_part_media`], its relationship id none of `taken`.
+    fn add_media_rel(
+        &mut self,
+        part: &str,
+        bytes: &[u8],
+        ext: &str,
+        content_type: &str,
+        taken: &[String],
     ) -> Option<String> {
         if ext.is_empty() || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
             return None;
@@ -2693,7 +2720,9 @@ impl Package {
         };
         let mut num = next_rid_num(&rels_text);
         let rels = parse_rels_xml(&rels_text);
-        while rels.target(&format!("rId{num}")).is_some() {
+        while rels.target(&format!("rId{num}")).is_some()
+            || taken.iter().any(|t| *t == format!("rId{num}"))
+        {
             num += 1;
         }
         let rid = format!("rId{num}");
@@ -7533,6 +7562,35 @@ mod tests {
         assert_eq!(pkg.part("word/media/image3.jpeg").unwrap(), b"NEXT");
         pkg.add_media_part(b"PNG", "png");
         assert_eq!(pkg.part("word/media/image4.png").unwrap(), b"PNG");
+    }
+
+    /// #1953: a picture added to a document whose pictures already name
+    /// ids its rels do not define takes none of those ids.
+    #[test]
+    fn add_part_image_avoiding_skips_the_ids_the_story_names_1953() {
+        let mut pkg = new_package(Document { body: vec![] });
+        let png = crate::image::ImageInfo {
+            ext: "png",
+            content_type: "image/png",
+            width: 1,
+            height: 1,
+        };
+        // Only rId1 (styles) is defined; the body names rId2 and rId3.
+        let taken = ["rId2".to_string(), "rId3".to_string()];
+        let rid = pkg
+            .add_part_image_avoiding("word/document.xml", b"PNG", &png, &taken)
+            .unwrap();
+        assert_eq!(rid, "rId4");
+        assert_eq!(
+            pkg.part_rel_target("word/document.xml", &rid).as_deref(),
+            Some("word/media/image1.png")
+        );
+        // Without the list the next free id is taken, as before.
+        let mut plain = new_package(Document { body: vec![] });
+        assert_eq!(
+            plain.add_part_image("word/document.xml", b"PNG", &png),
+            Some("rId2".into())
+        );
     }
 
     #[test]
