@@ -6806,11 +6806,15 @@ fn dispatch_verb(
             }
             // A registered input outside the dialogs (#1029): where it is
             // drawn, or a double-click on the active cell for the in-cell
-            // editor (#1200).
+            // editor (#1200). A Find bar field takes `x`, pixels in from its
+            // text's left edge, where the press places the caret (#2116).
             if let Some(input) = args.get("input") {
                 let id = input.as_str().ok_or("'input' must be an input id")?;
                 app.refuse_under_dialog()?;
-                let press = crate::inputs::press(app, id, cx)?;
+                let press = match field_num(args, "x")? {
+                    Some(x) => crate::inputs::press_at_x(app, id, x as f32, cx)?,
+                    None => crate::inputs::press(app, id, cx)?,
+                };
                 let p = press.at;
                 let mut done = Done::ok(Json::obj(vec![
                     ("x", Json::Num(f64::from(p.x))),
