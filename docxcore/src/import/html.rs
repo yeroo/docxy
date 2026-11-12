@@ -2903,13 +2903,27 @@ impl<'a> Html<'a> {
             .find(|e| e.key.tag == "li")
     }
 
-    /// Whether `elems[i]` sits straight in the body or a cell (#1979): its
-    /// parent element is `html`, `body`, `td` or `th`. In quirks mode its
-    /// user-agent margins are dropped at that flow's edges.
-    fn straight(&self, i: usize) -> bool {
-        self.elems[..i]
-            .last()
-            .is_none_or(|p| matches!(p.key.tag.as_str(), "html" | "body" | "td" | "th"))
+    /// Whether the elements below `elems[i]` reach a quirky container (the
+    /// body, or a `td` / `th`, not a card) with no bottom padding between
+    /// (#1979, #2114 r2 m3): in quirks mode a block's user-agent bottom is
+    /// then dropped if its paragraph ends that flow, as Chrome drops it at
+    /// a cell's end through a `div` too.
+    fn bottom_unseparated(&self, i: usize, in_table: bool) -> bool {
+        if !self.budget.work(i / 16 + 1) {
+            return false;
+        }
+        for e in self.elems[..i].iter().rev() {
+            if matches!(e.card, CardMode::Yes(_)) {
+                return false;
+            }
+            if e.kind.table() {
+                return matches!(e.key.tag.as_str(), "td" | "th");
+            }
+            if matches!(e.kind, Kind::Block | Kind::List) && e.look.pad_after != 0 {
+                return false;
+            }
+        }
+        !in_table
     }
 
     /// Whether nothing has ended in `e`'s flow since it opened (#2114).
@@ -2925,35 +2939,53 @@ impl<'a> Html<'a> {
     /// it its top box, folded outermost first onto the margin group open
     /// at the bottom of the paragraph above in its flow ([`Builder::tail`]):
     /// positive margins collapse (the largest counts, less what is already
-    /// paid), padding closes the group, negative margins are summed. In
-    /// quirks mode a member straight in the body or a cell drops its
-    /// user-agent top when nothing comes before it there. Freshness is
-    /// monotonic (an element is stale once one inside it is), so the walk
-    /// stops at the first stale one.
+    /// paid), padding closes the group, negative margins are summed.
+    /// Freshness is monotonic (an element is stale once one inside it is),
+    /// so the walk stops at the first stale one.
+    ///
+    /// In quirks mode, at the start of the body or a cell (not a card), the
+    /// members drop their user-agent tops from the outermost in, up to and
+    /// including the first with top padding (#1979; #2114 r2 m2, measured
+    /// in Chrome: `<div dir=ltr><ol><li>` and `<td><div><p>` start at 0,
+    /// `<div style="padding-top:1px"><ol>` keeps the list's 1em).
     fn top_spacing(&self, in_table: bool) -> i32 {
         let mut chain = Vec::new();
+        // The walk reached the body (`Some(true)`), a cell or another
+        // boundary, or stopped at a stale member (`None`).
+        let mut quirky_container = None;
         if self.budget.work(self.elems.len() / 16 + 1) {
+            quirky_container = Some(!in_table);
             for (i, e) in self.elems.iter().enumerate().rev() {
-                if e.kind.table() || matches!(e.card, CardMode::Yes(_)) {
+                if matches!(e.card, CardMode::Yes(_)) {
+                    quirky_container = Some(false);
+                    break;
+                }
+                if e.kind.table() {
+                    quirky_container = Some(matches!(e.key.tag.as_str(), "td" | "th"));
                     break;
                 }
                 if matches!(e.kind, Kind::Block | Kind::List) {
                     if !self.fresh(e) {
+                        quirky_container = None;
                         break;
                     }
                     chain.push(i);
                 }
             }
         }
-        let first = self.quirks && self.out.flow_is_empty(in_table);
+        let mut dropping =
+            self.quirks && quirky_container == Some(true) && self.out.flow_is_empty(in_table);
         let above = self.out.tail(in_table).map_or(0, |t| t.open.max(0));
         let (mut group, mut paid) = (i64::from(above), i64::from(above));
         let mut before = 0i64;
         for &i in chain.iter().rev() {
             let look = &self.elems[i].look;
             let mut margin = i64::from(look.margin_before);
-            if first && self.straight(i) {
+            if dropping {
                 margin -= i64::from(look.ua_before);
+                // Its padding is inside its margin: the members within
+                // are no longer at the container's start.
+                dropping = look.pad_before == 0;
             }
             if margin > 0 {
                 group = group.max(margin);
@@ -2972,10 +3004,13 @@ impl<'a> Html<'a> {
 
     /// `elems[j]`, a block or list closing or its flow ending, gives its
     /// bottom box to the flow's last paragraph if that ended inside it
-    /// (#2114), collapsing as [`fold_bottom`] does; in quirks mode, one
-    /// straight in the body or a cell records how much of that is its
-    /// user-agent margin, dropped if the paragraph turns out its flow's
-    /// last ([`Self::flow_end_props`]).
+    /// (#2114), collapsing as [`fold_bottom`] does. In quirks mode the fold
+    /// is kept twice: with and without the quirky user-agent bottoms, a
+    /// block's that no bottom padding separates from the body or its cell
+    /// ([`Self::bottom_unseparated`]); the paragraph takes the bare one if
+    /// it turns out its flow's last ([`Self::flow_end_props`]). A list's is
+    /// never quirky (#2114 r2 m3, measured in Chrome: `<td><ol><li>` keeps
+    /// the list's 1em below, `<td><div><p>` drops the p's).
     fn apply_bottom(&mut self, j: usize) {
         let e = &self.elems[j];
         if !matches!(e.kind, Kind::Block | Kind::List) {
@@ -2992,24 +3027,18 @@ impl<'a> Html<'a> {
             return;
         };
         let (margin, pad, ua) = (e.look.margin_after, e.look.pad_after, e.look.ua_after);
+        let quirky =
+            self.quirks && ua > 0 && e.kind == Kind::Block && self.bottom_unseparated(j, in_table);
         let (after, open) = fold_bottom(tail.after, tail.open, margin, pad);
-        let quirk_bottom = if self.quirks && ua > 0 && self.straight(j) {
-            let (without, _) = fold_bottom(tail.after, tail.open, margin - ua, pad);
-            Some(after.max(0) - without.max(0)).filter(|&d| d > 0)
-        } else {
-            tail.quirk_bottom
+        let bare = match tail.bare {
+            Some((a, o)) => Some(fold_bottom(a, o, margin - if quirky { ua } else { 0 }, pad)),
+            None if quirky => Some(fold_bottom(tail.after, tail.open, margin - ua, pad)),
+            None => None,
         };
         if let Some(p) = self.out.flow_last_mut(in_table) {
             p.spacing.after = Some(after.max(0));
         }
-        self.out.set_tail(
-            in_table,
-            FlowTail {
-                after,
-                open,
-                quirk_bottom,
-            },
-        );
+        self.out.set_tail(in_table, FlowTail { after, open, bare });
     }
 
     fn par_props(&self) -> ParProps {
@@ -3235,16 +3264,18 @@ impl<'a> Html<'a> {
             }
         }
         if let Some(tail) = self.out.tail(in_table) {
-            if let Some(ua) = tail.quirk_bottom {
+            if let Some((after, open)) = tail.bare {
                 if let Some(p) = self.out.flow_last_mut(in_table) {
-                    let after = p.spacing.after.unwrap_or(0);
-                    p.spacing.after = Some((after - ua).max(0));
+                    p.spacing.after = Some(after.max(0));
                 }
-                let tail = FlowTail {
-                    quirk_bottom: None,
-                    ..tail
-                };
-                self.out.set_tail(in_table, tail);
+                self.out.set_tail(
+                    in_table,
+                    FlowTail {
+                        after,
+                        open,
+                        bare: None,
+                    },
+                );
             }
         }
         let mut props = self.par_props();
@@ -7406,8 +7437,9 @@ mod outlook_tests {
         assert_eq!(gaps(&para_of(&d, "mid")), (Some(0), Some(240)));
         assert_eq!(gaps(&para_of(&d, "a")), (Some(0), Some(240)));
         assert_eq!(gaps(&para_of(&d, "b")), (Some(0), Some(0)));
-        // Not straight in the cell: the quirk is for its children only.
-        assert_eq!(gaps(&para_of(&d, "inner")), (Some(240), Some(240)));
+        // Through a `div` with no padding too (#2114 r2, measured in
+        // Chrome: `<td><div><p>` starts and ends at the cell's edges).
+        assert_eq!(gaps(&para_of(&d, "inner")), (Some(0), Some(0)));
         // A declared top stays; text after the block makes it no last.
         assert_eq!(gaps(&para_of(&d, "declared")), (Some(150), Some(240)));
         assert_eq!(gaps(&para_of(&d, "last")), (Some(240), Some(0)));
@@ -7879,12 +7911,42 @@ mod batch_2114_tests {
         assert_eq!(gaps(&d, "x"), (Some(0), Some(240)));
     }
 
+    /// Measured in Chrome (#2114 r2 m2, m3): a list's user-agent top is
+    /// dropped at the start of the body or a cell, through `div`s with no
+    /// top padding too; its bottom is not quirky, kept at a cell's end.
     #[test]
     fn plan_list_margins_quirks_drops_them_at_the_body_s_and_a_cell_s_edges() {
         let d = doc("<ul><li>x</li></ul>");
-        assert_eq!(gaps(&d, "x"), (Some(0), Some(0)));
-        let d = doc("<table><tr><td><ul><li>x</li></ul></td></tr></table>");
-        assert_eq!(gaps(&d, "x"), (Some(0), Some(0)));
+        assert_eq!(gaps(&d, "x"), (Some(0), Some(240)));
+        let d = doc("<div dir=ltr><ol><li>x</li></ol></div>");
+        assert_eq!(gaps(&d, "x").0, Some(0));
+        let d = doc("<div><div><ul><li>x</li></ul></div></div>");
+        assert_eq!(gaps(&d, "x").0, Some(0));
+        let d = doc("<div style='padding-top:1px'><ol><li>x</li></ol></div>");
+        assert_eq!(gaps(&d, "x").0, Some(15 + 240));
+        for cell in [
+            "<td><ol><li>x</li></ol></td>",
+            "<td><div dir=ltr><ol><li>x</li></ol></div></td>",
+            "<td><div><ol><li>x</li></ol></div></td>",
+        ] {
+            let d = doc(&format!("<table><tr>{cell}</tr></table>"));
+            assert_eq!(gaps(&d, "x"), (Some(0), Some(240)), "{cell}");
+        }
+        // A `p`'s bottom is quirky at a cell's end, through a `div` too,
+        // not through bottom padding.
+        for cell in ["<td><p>x</p></td>", "<td><div><p>x</p></div></td>"] {
+            let d = doc(&format!("<table><tr>{cell}</tr></table>"));
+            assert_eq!(gaps(&d, "x"), (Some(0), Some(0)), "{cell}");
+        }
+        let d =
+            doc("<table><tr><td><div style='padding-bottom:1px'><p>x</p></div></td></tr></table>");
+        assert_eq!(gaps(&d, "x").1, Some(240 + 15));
+        // A list around the `p` keeps its own 1em below.
+        let d = doc("<table><tr><td><ul><li><p>x</p></li></ul></td></tr></table>");
+        assert_eq!(gaps(&d, "x").1, Some(240));
+        // A card is no quirky container.
+        let d = doc("<table><tr><td><div style='background:#eee'><p>x</p></div></td></tr></table>");
+        assert_eq!(gaps(&d, "x"), (Some(240), Some(240)));
         // Between paragraphs they stay.
         let d = doc("<div>a</div><ul><li>x</li></ul><div>b</div>");
         assert_eq!(gaps(&d, "x"), (Some(240), Some(240)));
@@ -8039,6 +8101,30 @@ mod batch_2114_tests {
             pr.contains("<w:jc w:val=\"center\"/>") && !pr.contains("w:tblInd"),
             "{pr}"
         );
+    }
+
+    /// A table wider than its room is over-constrained (r2 m1): it starts
+    /// at the room's left and overflows to the right, never centred.
+    #[test]
+    fn plan_2_a_wider_table_starts_at_the_wrapper_s_left() {
+        let d = doc(&format!(
+            "{WRAP}<table width='660'><tr><td>x</td></tr></table></div>"
+        ));
+        let t = tables(&d)[0];
+        let pr = tblpr(t);
+        assert_eq!(t.grid.iter().sum::<u32>(), 9900);
+        assert!(!pr.contains("<w:jc "), "{pr}");
+        assert!(pr.contains("<w:tblInd w:w=\"1503\""), "{pr}");
+        // A wrapper as wide as the body (no extra indent) leaves its table
+        // as before: no `jc`.
+        let d = doc(
+            "<div style='width:820px;margin:0 auto'><table width='820'><tr><td>x</td></tr></table></div>",
+        );
+        assert!(!tblpr(tables(&d)[0]).contains("<w:jc "));
+        let d = doc(&format!(
+            "{WRAP}<table width='660' align='center'><tr><td>x</td></tr></table></div>"
+        ));
+        assert!(!tblpr(tables(&d)[0]).contains("<w:jc "));
     }
 
     #[test]

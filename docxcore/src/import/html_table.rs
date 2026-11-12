@@ -326,8 +326,9 @@ pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
 /// Place a table laid out in `room` (#2114, #1930 plan-2) on the body: its
 /// percentage width as the twips it is in the room (Word resolves `pct`
 /// against the body and would stretch it back), and `jc center` when it
-/// fills the room or is centred in it and the room is centred in the body
-/// (its own `align` then moves nothing). Otherwise no `jc` and the
+/// fills the room exactly or is centred in it and the room is centred in
+/// the body (its own `align` then moves nothing). Otherwise (a wider table
+/// too, which a browser starts at the room's left) no `jc` and the
 /// `w:tblInd` (returned) that puts its left edge where the browser does:
 /// at the room's left, right or middle. A package with no
 /// `compatibilityMode` (the Markdown one) is laid out by Word in an older
@@ -339,7 +340,9 @@ fn place_in_room(spec: &mut TableSpec, room: Room, grid: &[u32], avail: u32) -> 
     }
     let width: u32 = grid.iter().fold(0u32, |a, &w| a.saturating_add(w));
     let place = spec.jc.take();
-    if room.centred && (width >= room.width || place == Some("center")) {
+    // Only a table that fits (r2 m1): a wider one is over-constrained, its
+    // auto margins 0, so it starts at the room's left and overflows right.
+    if room.centred && (width == room.width || (width < room.width && place == Some("center"))) {
         spec.jc = Some("center");
         return None;
     }

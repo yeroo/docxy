@@ -468,16 +468,23 @@ is #1987.
   Standard's old public ids, its common entries; `<!DOCTYPE html>` and
   XHTML are standards). Mail, Word and Outlook pages have none, and so do
   clipboard fragments.
-  - The margin quirk: a block or list straight in `body` or a `td`/`th`
-    (its parent element is `html`, `body`, `td` or `th`:
-    `Html::straight`; not in a `div` or a card) loses its UA top margin
-    when its paragraph is its flow's first, and its UA bottom margin when
-    it is its flow's last. Whether Chrome's quirk reaches through a `div`
-    with no padding or border is unmeasured; this rule is kept (#2114).
+  - The margin quirk, at the body's or a `td`/`th`'s edges (not a
+    card's), measured in Chrome (#2114 r2):
+    - The top: when its paragraph is its flow's first, every block and
+      list from the outermost in loses its UA top margin, up to and
+      including the first with top padding (`Html::top_spacing`). So
+      `<div dir=ltr><ol><li>` and `<td><div><p>` start at 0, while
+      `<div style="padding-top:1px"><ol>` keeps the list's 1em.
+    - The bottom: a block's UA bottom margin is dropped when its paragraph
+      is its flow's last and no bottom padding separates it from the body
+      or cell (`Html::bottom_unseparated`), through a `div` too. A list's
+      is never dropped (`<td><ol><li>` keeps its 1em below; at the body's
+      end, unmeasured, it is kept too).
   - The last is settled at the flow's end (`Html::flow_end_props`, at
     `</td>`, `</tr>`, `</table>`, a card's end and the page's end). The
     text in progress is ended first, as any paragraph, and then the flow's
-    last paragraph (`FlowTail::quirk_bottom`) is patched in place. The
+    last paragraph takes the bottom it would have without the quirky
+    margins (`FlowTail::bare`, folded beside the real one), in place. The
     props it returns are only for the paragraph an empty cell gets.
   - A declared margin and padding stay.
 - List geometry, through the cascade:
@@ -596,9 +603,8 @@ A batch from #1989 and #1930 (plan-2), import only.
     (`flow_at` taken), then quirks mode's bottom patch. Only that flow's:
     a card is declined before its flow ends, so the walk can pass it into
     the enclosing flow's blocks, which keep their `flow_at` (#2114 r1).
-  - Quirks: a member straight in the body or a cell drops its UA top when
-    its flow is empty, and records its UA bottom as
-    `FlowTail::quirk_bottom` (how much `after` drops without it).
+  - Quirks: see the margin quirk above. The bottom fold is kept twice,
+    with and without the quirky UA bottoms (`FlowTail::bare`).
   - Both walks charge the import's work budget.
 - Lists' user-agent margins: `ul ol dir menu dl` have 1em top and bottom
   in their own font, none when nested in another list at any depth, across
@@ -613,10 +619,11 @@ A batch from #1989 and #1930 (plan-2), import only.
     `place_in_room` writes a
     percentage `tblW` as twips, since Word resolves `pct` against the body
     and would stretch it back.
-  - A table that fills the room, or is centred in it, in a centred room
-    gets `jc center`, whatever its `align`.
+  - A table that fills the room exactly, or fits and is centred in it, in
+    a centred room gets `jc center`, whatever its `align`.
   - Otherwise it gets no `jc` and a `w:tblInd` of its left edge: the
-    room's left, right or middle.
+    room's left, right or middle. A table wider than its room is
+    over-constrained in a browser and starts at the room's left (r2).
   - The Markdown package has no `compatibilityMode`, so Word lays it out
     in an older mode, which measures `tblInd` to the first cell's text.
     The left cell margin is therefore added: `cellpadding`, else 108.

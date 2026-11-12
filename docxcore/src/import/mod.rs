@@ -460,9 +460,11 @@ pub(crate) struct FlowTail {
     /// collapse with, and what a closing element's bottom margin collapses
     /// into when no padding separates them.
     pub(crate) open: i32,
-    /// The user-agent bottom margin quirks mode drops from it if it ends
-    /// its flow.
-    pub(crate) quirk_bottom: Option<i32>,
+    /// In quirks mode, `after` and `open` as they would be without the
+    /// quirky user-agent bottom margins folded in (#1979, #2114 r2): what
+    /// `after` becomes if the paragraph turns out its flow's last. `None`
+    /// while no quirky margin has been folded.
+    pub(crate) bare: Option<(i32, i32)>,
 }
 
 /// An HTML table being read: its spec, its rows of raw cells, the cell
