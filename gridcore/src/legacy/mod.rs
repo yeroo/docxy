@@ -701,6 +701,7 @@ fn write_external_links(pkg: &mut SheetPackage, links: &[ExternalLink]) {
 /// repeat becomes `Name (2)`). References to a renamed sheet follow it
 /// ([`sheet_renames`], [`retarget`]).
 pub(crate) fn valid_sheet_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<String> {
+    use crate::sheet::SHEET_NAME_MAX;
     fn cut(s: &str, max: usize) -> String {
         s.chars().take(max).collect()
     }
@@ -713,14 +714,14 @@ pub(crate) fn valid_sheet_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec
         let clean: String = raw
             .chars()
             .map(|c| {
-                if "[]:*?/\\".contains(c) || c == COLON {
+                if crate::sheet::SHEET_NAME_FORBIDDEN.contains(c) || c == COLON {
                     '_'
                 } else {
                     c
                 }
             })
             .collect();
-        let mut name = cut(clean.trim_matches('\''), 31);
+        let mut name = cut(clean.trim_matches('\''), SHEET_NAME_MAX);
         if name.trim().is_empty() {
             name = format!("Sheet{}", i + 1);
         }
@@ -728,7 +729,10 @@ pub(crate) fn valid_sheet_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec
         let n = next.entry(base.to_lowercase()).or_insert(2);
         while taken.contains(&name.to_lowercase()) {
             let suffix = format!(" ({n})");
-            name = format!("{}{suffix}", cut(&base, 31 - suffix.chars().count()));
+            name = format!(
+                "{}{suffix}",
+                cut(&base, SHEET_NAME_MAX - suffix.chars().count())
+            );
             *n += 1;
         }
         taken.insert(name.to_lowercase());
