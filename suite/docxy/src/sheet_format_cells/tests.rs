@@ -206,8 +206,8 @@ fn the_builtin_parenthesis_codes_are_number() {
 /// category alike, except where Format Cells has no boxes for it.
 #[test]
 fn categories_agree_with_the_ribbons_names() {
-    // Scientific's boxes cannot build engineering notation, and the runtime
-    // draws tenths of a second as whole ones.
+    // Scientific's boxes cannot build engineering notation, and the Time
+    // list does not offer tenths of a second yet (a follow-up of #2115).
     let deliberate = ["##0.0E+0", "mm:ss.0"];
     let codes = (0..=49)
         .filter_map(gridcore::numfmt::builtin_code)
@@ -501,23 +501,23 @@ fn ok_unchanged_and_cancel_change_nothing() {
 #[test]
 fn an_unusable_code_is_refused_only_when_the_number_tab_changed() {
     let mut t = tab();
-    put(&mut t, "A1", CellValue::Number(5.0), coded("0 ?/4"));
+    put(&mut t, "A1", CellValue::Number(5.0), coded("0 ?/? x"));
     select(&mut t, "A1", "A1");
     let before = undo_depth(&mut t);
     open_on(&mut t);
     assert_eq!(read(&t, "category"), "Custom");
-    assert_eq!(read(&t, "code"), "0 ?/4");
+    assert_eq!(read(&t, "code"), "0 ?/? x");
     set(&mut t, "bold", Json::Bool(true));
     press(&mut t, "OK").unwrap();
     assert!(xf_at(&mut t, "A1").bold);
-    assert_eq!(xf_at(&mut t, "A1").code.as_deref(), Some("0 ?/4"));
+    assert_eq!(xf_at(&mut t, "A1").code.as_deref(), Some("0 ?/? x"));
 
     open_on(&mut t);
-    set(&mut t, "code", s("0 ?/8"));
+    set(&mut t, "code", s("0 ??/?? x"));
     let err = press(&mut t, "OK").unwrap_err();
-    assert_eq!(err, "docxy cannot use this number format: 0 ?/8");
+    assert_eq!(err, "docxy cannot use this number format: 0 ??/?? x");
     assert_eq!(top(&t).id.as_str(), "format-cells", "kept open");
-    assert_eq!(xf_at(&mut t, "A1").code.as_deref(), Some("0 ?/4"));
+    assert_eq!(xf_at(&mut t, "A1").code.as_deref(), Some("0 ?/? x"));
     assert_eq!(undo_depth(&mut t), before + 1, "only the bold step");
 }
 

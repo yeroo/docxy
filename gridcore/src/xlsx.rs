@@ -11381,11 +11381,13 @@ impl SheetPackage {
     /// Rename sheet `idx`, updating the model, any formulas that reference the
     /// old sheet name (via [`crate::edit::rename_sheet`]), and the `<sheet
     /// name="…">` entries in `workbook.xml`. Rejects a name that collides
-    /// (case-insensitively) with another sheet, or an out-of-range / empty
-    /// name. Returns whether the rename happened.
+    /// (case-insensitively) with another sheet, an out-of-range sheet, and a
+    /// name Excel refuses ([`crate::sheet::sheet_name_error`]: empty, over 31
+    /// characters, `[ ] : * ? / \`, an apostrophe first or last). Returns
+    /// whether the rename happened.
     pub fn rename_sheet(&mut self, idx: usize, name: &str) -> bool {
         let name = name.trim();
-        if name.is_empty() || idx >= self.workbook.sheets.len() {
+        if crate::sheet::sheet_name_error(name).is_some() || idx >= self.workbook.sheets.len() {
             return false;
         }
         if self
@@ -12815,6 +12817,41 @@ mod tests {
         assert!(
             moved.contains(r#"<pane ySplit="3" topLeftCell="A4""#),
             "{moved}"
+        );
+    }
+
+    /// #2115 (r1-p1): a rename to a name Excel refuses changes nothing: not
+    /// the model, not `workbook.xml`, not the formulas that name the sheet.
+    #[test]
+    fn r1_p1_rename_sheet_refuses_excels_forbidden_names() {
+        let mut pkg = new_xlsx();
+        let s2 = pkg.add_sheet("Data");
+        pkg.workbook.sheets[0]
+            .cells
+            .insert((0, 0), Cell::formula("Data!A1"));
+        let wb_before = pkg.part("xl/workbook.xml").unwrap().to_vec();
+        let long = "x".repeat(32);
+        let mut refused = vec![long.as_str(), "'Data", "Data'", "'Data'"];
+        let bad: Vec<String> = "[]:*?/\\".chars().map(|c| format!("Da{c}ta")).collect();
+        refused.extend(bad.iter().map(String::as_str));
+        for name in refused {
+            assert!(!pkg.rename_sheet(s2, name), "{name}");
+            assert_eq!(pkg.workbook.sheets[s2].name, "Data", "{name}");
+            assert_eq!(
+                pkg.workbook.sheets[0].cells[&(0, 0)].formula.as_deref(),
+                Some("Data!A1"),
+                "{name}"
+            );
+            assert_eq!(pkg.part("xl/workbook.xml").unwrap(), wb_before, "{name}");
+        }
+        // 31 characters, and an apostrophe inside, are Excel's to take.
+        let max = "y".repeat(31);
+        assert!(pkg.rename_sheet(s2, &max));
+        assert_eq!(pkg.workbook.sheets[s2].name, max);
+        assert!(pkg.rename_sheet(s2, "Bob's Data"));
+        assert_eq!(
+            pkg.workbook.sheets[0].cells[&(0, 0)].formula.as_deref(),
+            Some("'Bob''s Data'!A1")
         );
     }
 

@@ -56,6 +56,16 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   (`imeMode`); unmeasured against Excel. Clear All's Apply to all reaches
   like x14 rules too. No x14 rule is ever written.
 
+## Quote-led custom validation formulas (#2115)
+
+- Only a `list` rule's formula that starts with `"` is inline items
+  (`validation::inline_list(f, kind)`), never shifted. A custom `"Y"=A2` is a
+  formula like any: `shift_formulas`, `lossless_shift`, `as_seen_from` and
+  `RuleFormula::of` all decide by the rule's kind, so the dialog shows it
+  written for the cell, a paste shifts its references, and `add_ranges` tells
+  parts with equal text from different corners apart. The #1050 workaround
+  in `cut_rules` (`quote_led`) is gone.
+
 ## Pivot slicer and timeline caches on save (#1797)
 
 - `remove_pivot` notes the pivot as `(sheetId, name)` in

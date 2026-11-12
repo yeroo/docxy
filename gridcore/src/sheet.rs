@@ -937,6 +937,32 @@ pub struct ChartSource {
     pub cat_col: u32,
 }
 
+/// The longest sheet name Excel takes, in characters.
+pub const SHEET_NAME_MAX: usize = 31;
+
+/// The characters Excel refuses anywhere in a sheet name.
+pub const SHEET_NAME_FORBIDDEN: &str = "[]:*?/\\";
+
+/// Why Excel would refuse `name` (already trimmed) as a sheet name, or `None`
+/// when it takes it: empty, longer than [`SHEET_NAME_MAX`] characters, any of
+/// [`SHEET_NAME_FORBIDDEN`], or an apostrophe first or last (one inside, as
+/// in `Bob's Data`, is fine). A taken name is the caller's check. The one
+/// rule a rename applies; an import cleans names by the same constants
+/// (`legacy::valid_sheet_names`).
+pub fn sheet_name_error(name: &str) -> Option<&'static str> {
+    if name.trim().is_empty() {
+        Some("Sheet name is empty")
+    } else if name.chars().count() > SHEET_NAME_MAX {
+        Some("Sheet name is longer than 31 characters")
+    } else if name.contains(|c| SHEET_NAME_FORBIDDEN.contains(c)) {
+        Some("Sheet name cannot contain [ ] : * ? / \\")
+    } else if name.starts_with('\'') || name.ends_with('\'') {
+        Some("Sheet name cannot start or end with an apostrophe")
+    } else {
+        None
+    }
+}
+
 /// A sheet name as a formula/`<c:f>` reference spells it. Anything that isn't a
 /// bare identifier has to be quoted — spaces, but also `-`, `(`, `.`, `&`, a
 /// leading digit — and an apostrophe inside the name is doubled. Excel reports a
@@ -3101,6 +3127,39 @@ pub fn sheet_to_csv(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2115 (r1-p1): the sheet-name rule a rename applies, with its reason.
+    #[test]
+    fn r1_p1_sheet_name_error_rules() {
+        assert_eq!(sheet_name_error(""), Some("Sheet name is empty"));
+        assert_eq!(sheet_name_error("   "), Some("Sheet name is empty"));
+        let long = "x".repeat(32);
+        assert_eq!(
+            sheet_name_error(&long),
+            Some("Sheet name is longer than 31 characters")
+        );
+        // Characters, not bytes.
+        assert_eq!(sheet_name_error(&"é".repeat(31)), None);
+        assert_eq!(sheet_name_error(&"y".repeat(31)), None);
+        for c in SHEET_NAME_FORBIDDEN.chars() {
+            assert_eq!(
+                sheet_name_error(&format!("A{c}B")),
+                Some("Sheet name cannot contain [ ] : * ? / \\"),
+                "{c}"
+            );
+        }
+        assert_eq!(SHEET_NAME_FORBIDDEN.chars().count(), 7);
+        for name in ["'Data", "Data'"] {
+            assert_eq!(
+                sheet_name_error(name),
+                Some("Sheet name cannot start or end with an apostrophe"),
+                "{name}"
+            );
+        }
+        for name in ["Bob's Data", "Q1 2026", "Data (2)", "Sheet-1"] {
+            assert_eq!(sheet_name_error(name), None, "{name}");
+        }
+    }
 
     #[test]
     fn next_sheet_name_skips_names_taken_in_any_case() {

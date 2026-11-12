@@ -1998,9 +1998,7 @@ fn table_convert(app: &mut App, args: &Json) -> Result<Json, String> {
 fn sheet_rename(app: &mut App, args: &Json) -> Result<Json, String> {
     let si = sheet_arg_required(app, args)?;
     let name = args.get_str("name").ok_or("sheet.rename needs a 'name'")?;
-    if name.is_empty() || name.contains(['[', ']', '*', '?', ':', '/', '\\']) {
-        return Err("invalid sheet name".into());
-    }
+    // `App::rename_sheet` refuses a name Excel refuses, with the reason.
     let name = name.to_string();
     app.rename_sheet(si, &name)?;
     Ok(Json::obj(vec![("name", Json::Str(name))]))
@@ -5005,6 +5003,30 @@ mod tests {
         a.undo();
         assert_eq!(a.status.as_deref(), Some("Nothing to undo"));
         assert_eq!(a.pkg.workbook.sheets[0].name, "Ren");
+    }
+
+    #[test]
+    fn sheet_rename_refuses_a_name_excel_refuses_with_the_reason() {
+        // #2115: the reason is App::rename_sheet's (gridcore's one rule).
+        let mut a = app();
+        let long = "x".repeat(32);
+        for (name, why) in [
+            ("A[1]", "Sheet name cannot contain [ ] : * ? / \\"),
+            (long.as_str(), "Sheet name is longer than 31 characters"),
+            ("Data'", "Sheet name cannot start or end with an apostrophe"),
+            ("", "Sheet name is empty"),
+        ] {
+            let got = dispatch(
+                &mut a,
+                "sheet.rename",
+                &Json::obj(vec![
+                    ("sheet", Json::Str("Sheet1".into())),
+                    ("name", Json::Str(name.into())),
+                ]),
+            );
+            assert_eq!(got.err().as_deref(), Some(why), "{name}");
+            assert_eq!(a.pkg.workbook.sheets[0].name, "Sheet1", "{name}");
+        }
     }
 
     #[test]

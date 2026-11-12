@@ -3114,6 +3114,31 @@ fn exit_commits_typed_sheet_rename_and_follows_chart_refs() {
     assert_eq!(v.pkg.workbook.sheets[0].name, new);
 }
 
+/// #2115: a name Excel refuses is declined on Enter and on leaving the bar
+/// alike: the sheet keeps its name and the tab stays clean.
+#[test]
+fn a_rename_to_a_name_excel_refuses_changes_nothing() {
+    let mut tabs = [tab(Kind::Xlsx)];
+    let name = {
+        let Surface::Sheet(v) = &tabs[0].surface else {
+            panic!()
+        };
+        v.pkg.workbook.sheets[0].name.clone()
+    };
+    for bad in ["Bad/Name", "'Quoted", &"x".repeat(32)] {
+        assert!(!commit_rename_buffer(&mut tabs[0], 0, bad), "{bad}");
+        assert!(
+            !commit_rename_buffer_for_exit(&mut tabs[0], 0, bad),
+            "{bad}"
+        );
+        let Surface::Sheet(v) = &tabs[0].surface else {
+            panic!()
+        };
+        assert_eq!(v.pkg.workbook.sheets[0].name, name, "{bad}");
+        assert!(!tabs[0].dirty, "{bad}");
+    }
+}
+
 /// #1343: the commit an implicit leave of the rename bar (the Name Box taking
 /// the keyboard) uses: a changed name commits, an untouched or merely
 /// whitespace-different one is left alone, so the tab stays clean. This pins

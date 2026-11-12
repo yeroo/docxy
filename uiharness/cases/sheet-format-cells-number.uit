@@ -94,10 +94,10 @@ test custom refuses a code docxy cannot use and keeps the dialog open
   call real-key {"key":"down","times":10}
   call pointer-click {"dialog-field":"code"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"0 ?/4"}
+  call real-type {"text":"0 ?/? x"}
   call real-key {"key":"enter"}
   assert dialog is format-cells
-  assert status is docxy cannot use this number format: 0 ?/4
+  assert status is docxy cannot use this number format: 0 ?/? x
   call real-key {"key":"escape"}
   assert dialog is not format-cells
   call cell {"cell":"B2"}

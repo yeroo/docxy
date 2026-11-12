@@ -128,7 +128,9 @@ pub(crate) fn commit_pending_for_exit(tabs: &mut [DocTab]) {
 /// What the sheet-rename bar's Enter commits: rename the sheet and retarget
 /// the charts this session authored, which the workbook-side ref rewrite
 /// (`rename_sheet`) cannot see. `false` — nothing changed — when the tab
-/// takes no edits, isn't a workbook, or the name was declined (already taken).
+/// takes no edits, isn't a workbook, or the name was declined: already taken,
+/// or one Excel refuses (`gridcore::sheet::sheet_name_error`, whose reason the
+/// rename bar's Enter shows on the status line).
 pub(crate) fn commit_rename_buffer(tab: &mut DocTab, idx: usize, buf: &str) -> bool {
     if tab.access.locked() {
         return false;

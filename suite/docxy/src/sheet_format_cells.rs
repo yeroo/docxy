@@ -73,8 +73,9 @@ const DATES: [&str; 13] = [
     "yyyy-mm-dd",
 ];
 
-/// The Time types, shown as they render [`SAMPLE_SERIAL`]. Not `mm:ss.0`:
-/// the runtime draws it as `mm:ss`, so it would show as that item twice.
+/// The Time types, shown as they render [`SAMPLE_SERIAL`]. Not `mm:ss.0`
+/// yet: the runtime draws tenths since #2115, but the list (and the dialog
+/// catalogue's samples) does not offer it yet.
 const TIMES: [&str; 6] = [
     "h:mm:ss AM/PM",
     "h:mm",
@@ -84,8 +85,8 @@ const TIMES: [&str; 6] = [
     "[h]:mm:ss",
 ];
 
-/// The Fraction types the format runtime renders: Excel's fixed
-/// denominators (halves, quarters, …) it does not.
+/// The Fraction types the dialog offers. Excel's fixed denominators
+/// (halves, quarters, …) render since #2115, but are not listed yet.
 const FRACTIONS: [(&str, &str); 3] = [
     ("Up to one digit (1/4)", "# ?/?"),
     ("Up to two digits (21/25)", "# ??/??"),

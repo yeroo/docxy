@@ -21073,8 +21073,18 @@ impl Docxy {
             return;
         };
         if enter {
+            // A changed name Excel would refuse is declined; say why (#2115).
+            let refused = match &t.surface {
+                Surface::Sheet(v) => (v.pkg.workbook.sheets.get(idx))
+                    .filter(|s| s.name.trim() != buf.trim())
+                    .and_then(|_| gridcore::sheet::sheet_name_error(buf.trim())),
+                _ => None,
+            };
             crate::close::commit_rename_buffer(t, idx, &buf);
             self.mark_sheet_dirty();
+            if let Some(why) = refused {
+                self.set_status(why);
+            }
         } else if crate::close::commit_rename_buffer_for_exit(t, idx, &buf) {
             self.mark_sheet_dirty();
         }
