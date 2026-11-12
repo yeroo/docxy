@@ -97,12 +97,15 @@ issue number to find its notes.
   and `.mpp` carry scheduled dates: leveling as a plan edit (#1594), elapsed durations and
   Must Start On before opening (#484).
 - `docs/claude/sheet-ui.md`: before changing the sheet's tab rename (#1365), Home Font /
-  Font Size boxes (#1344) or Save As names (#804, #1807).
+  Font Size boxes (#1344) or Save As names (#804, #1807), or the number-format runtime's
+  fractions and seconds: sheet names Excel refuses on rename, fixed-denominator fractions,
+  `mm:ss.0` tenths (#2115).
 - `docs/claude/sheet-file.md`: before changing a sheet's notes, slicers, data validation
   or hyperlinks in `gridcore` (and the dialogs and Undo over them): notes that follow
   row/column insert and delete (#1335), table slicers on save and Undo of a table step
   (#1694, #1741), x14 rules in the Data Validation dialog (#1817, #1734), pivot slicer and
-  timeline caches on save (#1797), `.xls` hyperlinks and file URIs (#1726).
+  timeline caches on save (#1797), `.xls` hyperlinks and file URIs (#1726), a quote-led
+  custom validation formula shifts, inline list by kind (#2115).
 - `docs/claude/terminal-editors.md`: before changing terminal `docxy`, `xlsxy` or
   `yppxy`, or `backstagecore`'s Save As name field: docxy's Layout tab (#1274), prompts
   editing at a caret (#1372, #1373, #1374, #1375, #1379), Ctrl+C/X/V (#1377, #1378),

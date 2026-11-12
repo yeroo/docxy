@@ -12,6 +12,38 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   `field-read sheet-tab-rename` reports the caret and `[0,len]` selection.
   Click-to-place and Shift+arrows are not there.
 
+## Sheet names Excel refuses on rename (#2115)
+
+- `gridcore::sheet::sheet_name_error(name)` is the one rule, with the reason a
+  host shows: empty, over `SHEET_NAME_MAX` (31) characters, any of
+  `SHEET_NAME_FORBIDDEN` (`[ ] : * ? / \`), or an apostrophe first or last
+  (`Bob's Data` is fine). A taken name is the caller's check.
+  `legacy::valid_sheet_names` cleans imported names by the same constants.
+- `XlsxPackage::rename_sheet` declines such a name (so `close::commit_rename_buffer`
+  and its exit path change nothing). The suite's Enter on the rename bar with a
+  changed, refused name sets the status line to the reason and closes the bar;
+  Excel keeps the bar open behind a message box (a known deviation).
+- xlsxy's `App::rename_sheet` returns the reason as `Err`, which the Rename
+  sheet prompt and the `sheet.rename` control show.
+- Add paths do not check yet: `XlsxPackage::add_sheet`, xlsxy's AddSheet
+  prompt and `pivot.create`'s sheet name, gridwasm's `rename` message.
+
+## Fixed-denominator fractions and fractional seconds (#2115)
+
+- `gridcore::numfmt`: a digit 1-9 right after a bare `/` starts a fixed
+  denominator (`Tok::FixedDen`): `# ?/4`, `# ??/16`, `?/8`, `# ??/100`. It
+  renders the nearest numerator over that denominator, unreduced (`2/4`),
+  carrying to a whole (blank fraction as wide as `?/4`). A digit anywhere else,
+  or a fixed denominator outside a fraction shape (`d/4`), refuses the code.
+- In a date section, `.0`/`.00`/`.000` right after `ss` or `[s]` fold into
+  `Tok::SubSecond` (`mm:ss.0` is built-in 47). `clock_of` rounds once to the
+  shown precision: a clock time within its day, clamped at its last unit
+  (23:59:59.9) as `serial_to_parts` clamps whole seconds; a section with
+  elapsed time (`[h]`, `[m]`, `[s]`) rounds the whole span and takes every
+  part from that total, so `[m]:ss` at 59.6 s is `1:00`.
+- Format Cells does not list `mm:ss.0` or Excel's fixed-denominator types yet
+  (a follow-up); such a cell opens as Custom.
+
 ## Sheet Home ribbon Font / Font Size boxes (#1344)
 
 - The two boxes are text fields: `Docxy::font_box` (`FontBoxEdit`, tied to the
