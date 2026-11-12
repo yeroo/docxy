@@ -2455,12 +2455,14 @@ fn doc_paste_clip(
 
 /// What the harness's private clipboard holds: a copy's text and, from a
 /// document copy or another app's rich copy, its RTF (#1074), and, from a
-/// sheet copy or another app's table, its HTML table (#1248).
+/// sheet copy or another app's table, its HTML table (#1248), and another
+/// app's image (the harness's `clipboard write`'s `image_hex`, #1953).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PrivateClip {
     text: String,
     rtf: Option<String>,
     html: Option<String>,
+    image: Option<Vec<u8>>,
 }
 
 /// The harness's run-wide private clipboard (see [`ClipboardStore`]).
@@ -2501,6 +2503,7 @@ impl ClipboardStore {
                 text,
                 rtf: None,
                 html: None,
+                image: None,
             });
         } else {
             os(text);
@@ -2575,6 +2578,39 @@ impl ClipboardStore {
         } else {
             os()
         }
+    }
+
+    /// Add `image` (another app's picture) to the copy [`Self::write`] just
+    /// made, in the harness's private clipboard only: the app never writes
+    /// an image (#1953).
+    fn write_private_image(&mut self, image: Vec<u8>) {
+        if let Some(clip) = self.private.borrow_mut().as_mut() {
+            clip.image = Some(image);
+        }
+    }
+
+    /// What the clipboard holds and its image's bytes, from ONE read of the
+    /// item (#1953): on X11 each read transfers the image again, and two
+    /// reads need not see the same copy. The image is the item's first
+    /// image entry, whatever its kind; `os` reads the OS clipboard's item.
+    fn read_item(
+        &self,
+        harness: bool,
+        os: impl FnOnce() -> Option<ClipboardItem>,
+    ) -> (ClipRead, Option<Vec<u8>>) {
+        if harness {
+            let private = self.private.borrow();
+            let read = ClipRead::from_item(private.as_ref().map(|c| Some(c.text.clone())));
+            return (read, private.as_ref().and_then(|c| c.image.clone()));
+        }
+        let item = os();
+        let image = item.as_ref().and_then(|item| {
+            item.entries().iter().find_map(|e| match e {
+                ClipboardEntry::Image(img) => Some(img.bytes.clone()),
+                _ => None,
+            })
+        });
+        (ClipRead::from_item(item.map(|item| item.text())), image)
     }
 
     /// `os` reads the OS clipboard: `None` without an item, else the item's
