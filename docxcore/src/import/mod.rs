@@ -451,9 +451,15 @@ type Tail = Option<(usize, FlowTail)>;
 /// a nested table never lends it to another (#1979 r2).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FlowTail {
-    /// Its bottom margin, in twips: what the next paragraph's top margin
-    /// collapses with.
-    pub(crate) margin_after: i32,
+    /// Its bottom spacing so far, in twips, signed (its written `after` is
+    /// this, at least 0): the bottom boxes of the elements it was the last
+    /// paragraph of, applied as each closed (#2114).
+    pub(crate) after: i32,
+    /// The largest positive margin of the margin group open at its bottom,
+    /// in twips, already in `after`: what the next paragraph's top margins
+    /// collapse with, and what a closing element's bottom margin collapses
+    /// into when no padding separates them.
+    pub(crate) open: i32,
     /// The user-agent bottom margin quirks mode drops from it if it ends
     /// its flow.
     pub(crate) quirk_bottom: Option<i32>,
