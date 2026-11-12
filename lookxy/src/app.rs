@@ -792,13 +792,15 @@ impl App {
                     v.loading = false;
                 }
             }
-            // lookxy never sends `SearchMessages`/`FetchMessage` (#2006)
-            // or `FetchFolderSizes` (#2123).
+            // lookxy never sends `SearchMessages`/`FetchMessage` (#2006),
+            // `FetchFolderSizes` (#2123) or `SearchDirectory` (#1942).
             SyncEvent::MessageSearchResults { .. }
             | SyncEvent::MessageSearchFailed { .. }
             | SyncEvent::MessageFetchFailed { .. }
             | SyncEvent::FolderSizesFetched { .. }
-            | SyncEvent::FolderSizesFailed { .. } => {}
+            | SyncEvent::FolderSizesFailed { .. }
+            | SyncEvent::DirectoryResults { .. }
+            | SyncEvent::DirectoryUnavailable { .. } => {}
             SyncEvent::Error(msg) => {
                 // A fetch failure while the OOF form / free-busy overlay is open
                 // must clear its loading state so it isn't stuck on "loading…".
