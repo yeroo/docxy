@@ -9,11 +9,11 @@
 //! is never logged (it's not `Debug`-derived into any log line here).
 
 use crate::graph::model::{
-    AttachmentMeta, AutomaticReplies, Body, Calendar, ContactFields, DeltaPage, Event,
-    EventDeltaItem, EventDeltaPage, EventRecurrence, FolderContact, FolderListing, MailFolder,
-    MasterCategory, Me, MeetingMessage, Message, MessageFields, MessageHeader, OofStatus, Person,
-    PhysicalAddress, REMINDER_SET_PROP, REMINDER_SIGNAL_TIME_PROP, Recipient, Recurrence,
-    ScheduleEntry, SearchHit, SubtreeItems, parse_message_size, plain_to_html, to_utc,
+    AttachmentMeta, AutomaticReplies, Body, Calendar, ContactFields, DeltaPage, DirectoryUser,
+    Event, EventDeltaItem, EventDeltaPage, EventRecurrence, FolderContact, FolderListing,
+    MailFolder, MasterCategory, Me, MeetingMessage, Message, MessageFields, MessageHeader,
+    OofStatus, Person, PhysicalAddress, REMINDER_SET_PROP, REMINDER_SIGNAL_TIME_PROP, Recipient,
+    Recurrence, ScheduleEntry, SearchHit, SubtreeItems, parse_message_size, plain_to_html, to_utc,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -2382,6 +2382,36 @@ impl GraphClient {
         Ok(people)
     }
 
+    /// GET `/users?$search="displayName:<q>" OR "mail:<q>"&$select=DIRECTORY_SELECT
+    /// &$top=…` with `ConsistencyLevel: eventual`, which Graph requires for
+    /// `$search` on directory objects (#1942): the organisation's directory
+    /// (the global address list) for a To/Cc/Bcc completion. `query` goes in
+    /// both quoted clauses with its `\` and `"` escaped
+    /// (`directory_search_value`), so it cannot end them. `top` is clamped to
+    /// `1..=`[`DIRECTORY_TOP_MAX`]; one page only, no `@odata.nextLink` is
+    /// followed: a completion never wants more than `top`. A user without an
+    /// address to complete is skipped (`DirectoryUser::from_json`). Requires
+    /// `User.ReadBasic.All`, which `AuthConfig::default()` does not ask for:
+    /// a token or tenant without it answers 403 (`GraphError::Http`).
+    pub fn search_users(&self, query: &str, top: usize) -> Result<Vec<DirectoryUser>, GraphError> {
+        let top = top.clamp(1, DIRECTORY_TOP_MAX);
+        let path = format!(
+            "/users?$search={}&$select={DIRECTORY_SELECT}&$top={top}",
+            directory_search_value(query)
+        );
+        let resp = self.send(
+            Method::Get,
+            &path,
+            None,
+            &[("ConsistencyLevel", "eventual")],
+        )?;
+        let v = parse_body(resp)?;
+        Ok(value_array(&v, "value")?
+            .iter()
+            .filter_map(DirectoryUser::from_json)
+            .collect())
+    }
+
     /// GET `/me/contacts` (the default Contacts folder, #1934, #2063), 200 a
     /// page, following `@odata.nextLink` (a relative path or a full URL, as
     /// `calendar_view` does) until Graph stops sending one. Returns every
@@ -3308,16 +3338,36 @@ pub const SEARCH_TOP_MAX: usize = 1000;
 /// and `"` escaped with a backslash so it cannot end the quoted clause, the
 /// whole value percent-encoded ([`encode_path_segment`]).
 fn search_value(query: &str) -> String {
-    let mut quoted = String::with_capacity(query.len() + 2);
-    quoted.push('"');
-    for c in query.chars() {
+    encode_path_segment(&format!("\"{}\"", escape_search_text(query)))
+}
+
+/// The most users [`GraphClient::search_users`] returns: Graph's page cap
+/// on `/users` (#1942).
+pub const DIRECTORY_TOP_MAX: usize = 999;
+
+/// The `$select` of [`GraphClient::search_users`] (#1942).
+const DIRECTORY_SELECT: &str = "displayName,mail,userPrincipalName,jobTitle,department";
+
+/// A directory `$search` value (#1942): `"displayName:<q>" OR "mail:<q>"`,
+/// `<q>` escaped as a message search's ([`escape_search_text`]) so it
+/// cannot end either clause, the whole value percent-encoded
+/// ([`encode_path_segment`]).
+fn directory_search_value(query: &str) -> String {
+    let q = escape_search_text(query);
+    encode_path_segment(&format!("\"displayName:{q}\" OR \"mail:{q}\""))
+}
+
+/// `text` with each `\` and `"` preceded by a backslash, for the inside of
+/// a quoted `$search` clause (#2006, #1942).
+fn escape_search_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
         if c == '\\' || c == '"' {
-            quoted.push('\\');
+            out.push('\\');
         }
-        quoted.push(c);
+        out.push(c);
     }
-    quoted.push('"');
-    encode_path_segment(&quoted)
+    out
 }
 
 /// Percent-encodes every byte except RFC 3986 unreserved characters
@@ -3712,6 +3762,120 @@ mod tests {
         match c.search_messages(None, "budget", 5) {
             Err(GraphError::Http { status: 403, .. }) => {}
             other => panic!("expected a 403, got {other:?}"),
+        }
+    }
+
+    fn users_page(items: &str) -> Route {
+        Route {
+            method: "GET".into(),
+            path_prefix: "/users?".into(),
+            status: 200,
+            headers: vec![],
+            body: format!(r#"{{"value":[{items}]}}"#),
+        }
+    }
+
+    #[test]
+    fn directory_search_value_escapes_quotes_and_backslashes() {
+        assert_eq!(
+            directory_search_value("jo"),
+            "%22displayName%3Ajo%22%20OR%20%22mail%3Ajo%22"
+        );
+        // A query that tries to close the clause stays inside both.
+        assert_eq!(
+            directory_search_value(r#"x" OR "y"#),
+            "%22displayName%3Ax%5C%22%20OR%20%5C%22y%22%20OR%20%22mail%3Ax%5C%22%20OR%20%5C%22y%22"
+        );
+        assert_eq!(
+            directory_search_value(r"a\b"),
+            "%22displayName%3Aa%5C%5Cb%22%20OR%20%22mail%3Aa%5C%5Cb%22"
+        );
+    }
+
+    #[test]
+    fn search_users_sends_search_select_top_and_consistency_level() {
+        let srv = FakeServer::start(vec![users_page("")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.search_users("jo", 10).unwrap(), vec![]);
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(
+            reqs[0].path,
+            "/users?$search=%22displayName%3Ajo%22%20OR%20%22mail%3Ajo%22\
+             &$select=displayName,mail,userPrincipalName,jobTitle,department&$top=10"
+        );
+        assert!(
+            reqs[0]
+                .headers
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case("ConsistencyLevel") && v == "eventual"),
+            "{:?}",
+            reqs[0].headers
+        );
+    }
+
+    #[test]
+    fn search_users_reads_name_address_title_department() {
+        let srv = FakeServer::start(vec![users_page(
+            r#"{"displayName":"Jo Smith","mail":"jo@contoso.com","userPrincipalName":"jsmith@contoso.com","jobTitle":"Engineer","department":"R&D"},
+               {"displayName":"Ann","mail":null,"userPrincipalName":"ann@contoso.com","jobTitle":" ","department":null},
+               {"displayName":"Room","mail":null,"userPrincipalName":"room"},
+               {"displayName":"Guest","userPrincipalName":"g_fabrikam.com#EXT#@contoso.onmicrosoft.com"}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.search_users("j", 10).unwrap(),
+            vec![
+                DirectoryUser {
+                    name: "Jo Smith".into(),
+                    address: "jo@contoso.com".into(),
+                    job_title: Some("Engineer".into()),
+                    department: Some("R&D".into()),
+                },
+                DirectoryUser {
+                    name: "Ann".into(),
+                    address: "ann@contoso.com".into(),
+                    job_title: None,
+                    department: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn search_users_clamps_top_and_sends_one_request() {
+        let srv = FakeServer::start(vec![Route {
+            body: r#"{"value":[],"@odata.nextLink":"/users?$skiptoken=X"}"#.into(),
+            ..users_page("")
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.search_users("a", 0).unwrap();
+        c.search_users("a", 5000).unwrap();
+        c.search_users("a", DIRECTORY_TOP_MAX).unwrap();
+        let reqs = srv.requests();
+        // One request each: no `nextLink` is followed.
+        assert_eq!(reqs.len(), 3);
+        let tops: Vec<&str> = reqs
+            .iter()
+            .map(|r| r.path.rsplit("$top=").next().unwrap())
+            .collect();
+        assert_eq!(tops, ["1", "999", "999"]);
+    }
+
+    #[test]
+    fn search_users_maps_403_and_500() {
+        for status in [403, 500] {
+            let srv = FakeServer::start(vec![Route {
+                status,
+                body: r#"{"error":{"code":"Authorization_RequestDenied"}}"#.into(),
+                ..users_page("")
+            }]);
+            let c = GraphClient::new(&srv.base_url, "AT");
+            match c.search_users("jo", 5) {
+                Err(GraphError::Http { status: s, .. }) if s == status => {}
+                other => panic!("expected a {status}, got {other:?}"),
+            }
         }
     }
 

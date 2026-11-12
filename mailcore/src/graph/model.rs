@@ -81,6 +81,59 @@ pub struct Person {
     pub rank: i64,
 }
 
+/// One user of the organisation's directory, from Graph `/users?$search`
+/// (`GraphClient::search_users`, #1942): what a To/Cc/Bcc completion shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectoryUser {
+    /// `displayName`, trimmed; `""` when the directory has none.
+    pub name: String,
+    /// `mail`, or the `userPrincipalName` when there is no `mail` and the
+    /// UPN looks like an address.
+    pub address: String,
+    /// `jobTitle`; `None` when absent, not a string or blank.
+    pub job_title: Option<String>,
+    /// `department`; `None` when absent, not a string or blank.
+    pub department: Option<String>,
+}
+
+impl DirectoryUser {
+    /// A directory user, or `None` when it has no address to complete: no
+    /// (or a blank) `mail` and a `userPrincipalName` that does not look like
+    /// a deliverable address ([`looks_like_address`]: a guest's `#EXT#` UPN
+    /// is not one).
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let address = match non_blank_str(v, "mail") {
+            Some(mail) => mail,
+            None => non_blank_str(v, "userPrincipalName").filter(|u| looks_like_address(u))?,
+        };
+        Some(DirectoryUser {
+            name: non_blank_str(v, "displayName").unwrap_or_default(),
+            address,
+            job_title: non_blank_str(v, "jobTitle"),
+            department: non_blank_str(v, "department"),
+        })
+    }
+}
+
+/// Whether a directory `userPrincipalName` can stand in for a missing `mail`
+/// (#1942): exactly one `@` with a non-empty local part, a domain holding a
+/// `.` that neither starts nor ends it, no whitespace or control character,
+/// and not a guest's `#EXT#` UPN (`alice_contoso.com#EXT#@tenant…`), which
+/// is no mailbox.
+fn looks_like_address(s: &str) -> bool {
+    if s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    if s.to_ascii_uppercase().contains("#EXT#") {
+        return false;
+    }
+    let mut parts = s.split('@');
+    let (Some(local), Some(domain), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+}
+
 /// A postal address of a contact, as Graph's `physicalAddress` (#2063).
 /// Every field is `""` when absent.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -2618,6 +2671,15 @@ fn opt_str_field(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
+/// Reads a string field trimmed, `None` when absent, not a string or blank.
+fn non_blank_str(v: &Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// Reads a list of `Recipient`s from an array field, defaulting to empty
 /// when absent.
 fn recipient_list(v: &Value, key: &str) -> Vec<Recipient> {
@@ -2631,6 +2693,95 @@ fn recipient_list(v: &Value, key: &str) -> Vec<Recipient> {
 mod tests {
     use super::*;
     use crate::json::parse;
+
+    fn user(raw: &str) -> Option<DirectoryUser> {
+        DirectoryUser::from_json(&parse(raw).unwrap())
+    }
+
+    #[test]
+    fn directory_user_from_json_reads_name_address_title_department() {
+        assert_eq!(
+            user(
+                r#"{"displayName":" Jo Smith ","mail":" jo@contoso.com ","userPrincipalName":"jsmith@contoso.onmicrosoft.com","jobTitle":"Engineer","department":"R&D"}"#
+            ),
+            Some(DirectoryUser {
+                name: "Jo Smith".into(),
+                address: "jo@contoso.com".into(),
+                job_title: Some("Engineer".into()),
+                department: Some("R&D".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn directory_user_from_json_absent_null_or_blank_title_and_department_are_none() {
+        for raw in [
+            r#"{"displayName":"Jo","mail":"jo@contoso.com"}"#,
+            r#"{"displayName":"Jo","mail":"jo@contoso.com","jobTitle":null,"department":null}"#,
+            r#"{"displayName":"Jo","mail":"jo@contoso.com","jobTitle":"  ","department":""}"#,
+            r#"{"displayName":"Jo","mail":"jo@contoso.com","jobTitle":7,"department":true}"#,
+        ] {
+            let u = user(raw).unwrap();
+            assert_eq!((u.job_title, u.department), (None, None), "{raw}");
+        }
+    }
+
+    #[test]
+    fn directory_user_from_json_falls_back_to_an_address_like_upn() {
+        for mail in ["", r#","mail":null"#, r#","mail":"  ""#] {
+            let raw =
+                format!(r#"{{"displayName":"Jo","userPrincipalName":"jo@contoso.com"{mail}}}"#);
+            assert_eq!(user(&raw).unwrap().address, "jo@contoso.com", "{raw}");
+        }
+    }
+
+    #[test]
+    fn directory_user_from_json_without_an_address_is_none() {
+        for raw in [
+            r#"{"displayName":"Room"}"#,
+            r#"{"displayName":"Room","mail":null,"userPrincipalName":null}"#,
+            r#"{"displayName":"Room","userPrincipalName":"not-an-address"}"#,
+            // A guest's UPN is no mailbox.
+            r#"{"displayName":"Guest","userPrincipalName":"guest_fabrikam.com#EXT#@contoso.onmicrosoft.com"}"#,
+        ] {
+            assert_eq!(user(raw), None, "{raw}");
+        }
+        // A guest with a `mail` is kept by it.
+        assert_eq!(
+            user(r#"{"displayName":"Guest","mail":"guest@fabrikam.com","userPrincipalName":"guest_fabrikam.com#EXT#@contoso.onmicrosoft.com"}"#)
+                .unwrap()
+                .address,
+            "guest@fabrikam.com"
+        );
+    }
+
+    #[test]
+    fn directory_user_from_json_without_a_name_keeps_an_empty_one() {
+        assert_eq!(user(r#"{"mail":"jo@contoso.com"}"#).unwrap().name, "");
+    }
+
+    #[test]
+    fn looks_like_address_cases() {
+        for ok in ["jo@contoso.com", "j.o+x@mail.contoso.co.uk"] {
+            assert!(looks_like_address(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "jo",
+            "@contoso.com",
+            "jo@",
+            "jo@contoso",
+            "jo@.contoso.com",
+            "jo@contoso.com.",
+            "jo@a@contoso.com",
+            "jo smith@contoso.com",
+            "jo@contoso.com\n",
+            "jo_x.com#EXT#@contoso.onmicrosoft.com",
+            "jo_x.com#ext#@contoso.onmicrosoft.com",
+        ] {
+            assert!(!looks_like_address(bad), "{bad:?}");
+        }
+    }
 
     #[test]
     fn search_hit_from_json_carries_folder_and_delta_fields() {
