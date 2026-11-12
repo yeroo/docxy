@@ -6,7 +6,7 @@
 //!
 //! Honesty contract: [`parse_format`] returns `None` for constructs we don't
 //! model (locale-dependent day names beyond English, fraction shapes other
-//! than `# ?/?`-style, etc.), and
+//! than `# ?/?`-style and fixed denominators such as `# ?/4`, etc.), and
 //! callers fall back — `TEXT()` marks itself unsupported rather than
 //! fabricating output, and cell display falls back to the classified
 //! approximation.
@@ -42,6 +42,11 @@ enum Tok {
     Second(usize), // s / ss
     /// `[h]` / `[m]` / `[s]` — elapsed totals.
     Elapsed(char),
+    /// `.0` / `.00` / `.000` right after the seconds: that many digits of
+    /// the second's fraction (`mm:ss.0`).
+    SubSecond(usize),
+    /// A fraction's fixed denominator (`# ?/4`, `# ??/100`): printed as is.
+    FixedDen(u64),
     /// AM/PM (switches hours to 12-hour clock).
     AmPm,
 }
@@ -75,7 +80,11 @@ struct Section {
 struct Fraction {
     whole: bool,
     num_digits: usize,
+    /// Denominator placeholders (`?/??`); 0 with a fixed denominator.
     den_digits: usize,
+    /// A fixed denominator (`?/8`): the fraction is written over it,
+    /// unreduced, as Excel does.
+    fixed: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -230,6 +239,14 @@ fn parse_section(src: &str) -> Option<Section> {
                 }
             }
             '0' | '#' | '?' => toks.push(Tok::Digit(c)),
+            // A fraction's fixed denominator: digits right after a bare `/`
+            // (`# ?/4`, `# ??/100`). A digit 1-9 anywhere else is refused.
+            '1'..='9' if matches!(toks.last(), Some(Tok::Lit(s)) if s == "/") => {
+                let n = run_len(&chars, i, char::is_ascii_digit);
+                let den: String = chars[i..i + n].iter().collect();
+                toks.push(Tok::FixedDen(den.parse().ok()?));
+                i += n - 1;
+            }
             '.' => toks.push(Tok::Point),
             ',' => toks.push(Tok::Lit(",".into())), // classified in analyze()
             '%' => toks.push(Tok::Percent),
@@ -399,16 +416,25 @@ fn analyze(mut toks: Vec<Tok>, condition: Option<(CmpOp, f64)>) -> Option<Sectio
     if is_date && (has_percent || exp.is_some()) {
         return None;
     }
-    // Fraction formats: only the plain `# ?/?` family is modeled; any other
-    // section with a `?` and a `/` is refused rather than guessed.
+    if is_date {
+        fold_sub_seconds(&mut toks);
+    }
+    // Fraction formats: only the plain `# ?/?` family and fixed
+    // denominators (`# ?/4`) are modeled; any other section with a `?` and a
+    // `/` is refused rather than guessed.
+    let fixed_den = toks.iter().any(|t| matches!(t, Tok::FixedDen(_)));
     let mut fraction = None;
     if !is_date
-        && toks.iter().any(|t| matches!(t, Tok::Digit('?')))
+        && (fixed_den || toks.iter().any(|t| matches!(t, Tok::Digit('?'))))
         && toks
             .iter()
             .any(|t| matches!(t, Tok::Lit(s) if s.contains('/')))
     {
         fraction = Some(fraction_shape(&toks)?);
+    }
+    // A fixed denominator outside a fraction (`d/4`) is not modeled.
+    if fixed_den && fraction.is_none() {
+        return None;
     }
 
     // Comma classification: a comma between digit placeholders → grouping;
@@ -489,8 +515,9 @@ fn analyze(mut toks: Vec<Tok>, condition: Option<(CmpOp, f64)>) -> Option<Sectio
     })
 }
 
-/// Recognise `[digits " "] digits "/" digits` — the fraction shapes Excel
-/// itself assigns (`# ?/?`, `# ??/??`) and their whole-less forms.
+/// Recognise `[digits " "] digits "/" (digits | fixed)` — the fraction
+/// shapes Excel itself assigns (`# ?/?`, `# ??/??`, `# ?/4`) and their
+/// whole-less forms.
 fn fraction_shape(toks: &[Tok]) -> Option<Fraction> {
     let digits = |from: usize| {
         toks[from..]
@@ -513,6 +540,14 @@ fn fraction_shape(toks: &[Tok]) -> Option<Fraction> {
         return None;
     }
     i += 1;
+    if let (Some(&Tok::FixedDen(d)), true) = (toks.get(i), i + 1 == toks.len()) {
+        return Some(Fraction {
+            whole,
+            num_digits,
+            den_digits: 0,
+            fixed: Some(d),
+        });
+    }
     let den_digits = digits(i);
     i += den_digits;
     if den_digits == 0 || i != toks.len() {
@@ -522,13 +557,34 @@ fn fraction_shape(toks: &[Tok]) -> Option<Fraction> {
         whole,
         num_digits,
         den_digits,
+        fixed: None,
     })
 }
 
+/// In a date section, fold `.0`, `.00` or `.000` right after the seconds
+/// (`ss` or `[s]`) into one [`Tok::SubSecond`]. A point or digits anywhere
+/// else stay as they are (and print nothing).
+fn fold_sub_seconds(toks: &mut Vec<Tok>) {
+    let mut i = 0;
+    while i + 1 < toks.len() {
+        if matches!(toks[i], Tok::Second(_) | Tok::Elapsed('s')) && toks[i + 1] == Tok::Point {
+            let zeros = toks[i + 2..]
+                .iter()
+                .take_while(|t| **t == Tok::Digit('0'))
+                .count();
+            let next_digit = matches!(toks.get(i + 2 + zeros), Some(Tok::Digit(_)));
+            if (1..=3).contains(&zeros) && !next_digit {
+                toks.splice(i + 1..i + 2 + zeros, [Tok::SubSecond(zeros)]);
+            }
+        }
+        i += 1;
+    }
+}
+
 /// Render through a fraction section: the closest fraction whose denominator
-/// fits the placeholders, `?` padding with spaces as Excel does.
+/// fits the placeholders, `?` padding with spaces as Excel does; with a fixed
+/// denominator, the nearest numerator over it, not reduced (`2/4`).
 fn render_fraction(f: Fraction, x: f64, original: f64) -> String {
-    let max_den = 10u64.pow(f.den_digits.min(6) as u32) - 1;
     let a = x.abs();
     let (mut whole, rest) = if f.whole {
         (a.trunc() as u64, a.fract())
@@ -536,14 +592,20 @@ fn render_fraction(f: Fraction, x: f64, original: f64) -> String {
         (0, a)
     };
     let (mut num, mut den) = (0u64, 1u64);
-    let mut best = f64::INFINITY;
-    for d in 1..=max_den {
-        let n = (rest * d as f64).round() as u64;
-        let err = (rest - n as f64 / d as f64).abs();
-        if err < best - 1e-12 {
-            best = err;
-            num = n;
-            den = d;
+    if let Some(d) = f.fixed {
+        num = (rest * d as f64).round() as u64;
+        den = d;
+    } else {
+        let max_den = 10u64.pow(f.den_digits.min(6) as u32) - 1;
+        let mut best = f64::INFINITY;
+        for d in 1..=max_den {
+            let n = (rest * d as f64).round() as u64;
+            let err = (rest - n as f64 / d as f64).abs();
+            if err < best - 1e-12 {
+                best = err;
+                num = n;
+                den = d;
+            }
         }
     }
     if f.whole && num == den {
@@ -554,7 +616,9 @@ fn render_fraction(f: Fraction, x: f64, original: f64) -> String {
     if original < 0.0 && (whole > 0 || num > 0) {
         out.push('-');
     }
-    let frac_width = f.num_digits + 1 + f.den_digits;
+    // A fixed denominator is literal text: as wide as its digits.
+    let den_width = f.fixed.map_or(f.den_digits, |d| d.to_string().len());
+    let frac_width = f.num_digits + 1 + den_width;
     if f.whole {
         if whole > 0 || num == 0 {
             out.push_str(&whole.to_string());
@@ -801,9 +865,11 @@ pub(crate) const DAYS: [&str; 7] = [
 ];
 
 fn render_date(sect: &Section, serial: f64, date1904: bool) -> String {
-    let Some(p) = serial_to_parts(serial, date1904) else {
+    let Some(mut p) = serial_to_parts(serial, date1904) else {
         return fmt_general(serial);
     };
+    let clock = clock_of(sect, serial);
+    (p.hour, p.minute, p.second) = (clock.hour, clock.minute, clock.second);
     let twelve_hour = sect.toks.iter().any(|t| matches!(t, Tok::AmPm));
     let mut out = String::new();
     // Day-of-week from the serial: Excel's WEEKDAY convention has serial 1
@@ -851,20 +917,70 @@ fn render_date(sect: &Section, serial: f64, date1904: bool) -> String {
                     out.push_str(&p.second.to_string());
                 }
             }
-            Tok::Elapsed('h') => {
-                out.push_str(&((serial * 24.0).floor() as i64).to_string());
+            Tok::Elapsed(unit) => {
+                let secs = clock.total_secs.unwrap_or_default();
+                let n = match unit {
+                    'h' => secs / 3600,
+                    'm' => secs / 60,
+                    _ => secs,
+                };
+                out.push_str(&n.to_string());
             }
-            Tok::Elapsed('m') => {
-                out.push_str(&((serial * 24.0 * 60.0).floor() as i64).to_string());
-            }
-            Tok::Elapsed(_) => {
-                out.push_str(&((serial * 86_400.0).round() as i64).to_string());
+            Tok::SubSecond(n) => {
+                out.push('.');
+                out.push_str(&format!("{:0n$}", clock.sub, n = *n));
             }
             Tok::AmPm => out.push_str(if p.hour < 12 { "AM" } else { "PM" }),
             _ => {}
         }
     }
     out
+}
+
+/// The time a date section shows, rounded to the precision it shows: whole
+/// seconds, or the [`Tok::SubSecond`] digits.
+struct Clock {
+    hour: u32,
+    minute: u32,
+    second: u32,
+    /// The shown fraction of the second, in units of its digits.
+    sub: u64,
+    /// The whole seconds since serial 0, when the section has elapsed time
+    /// (`[h]:mm`, `[ss].0`): every part then comes from this one rounded
+    /// total, so a carry reaches `[h]` and `[m]` too.
+    total_secs: Option<u64>,
+}
+
+/// [`Clock`] for `serial` (non-negative: [`serial_to_parts`] took it). A
+/// clock time rounds within its day and stops at its last unit
+/// (23:59:59.9), as [`serial_to_parts`] does at whole seconds; elapsed time
+/// rounds the whole span.
+fn clock_of(sect: &Section, serial: f64) -> Clock {
+    let digits = sect
+        .toks
+        .iter()
+        .find_map(|t| match t {
+            Tok::SubSecond(n) => Some(*n),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let scale = 10u64.pow(digits as u32);
+    let elapsed = sect.toks.iter().any(|t| matches!(t, Tok::Elapsed(_)));
+    let (units, total) = if elapsed {
+        let units = (serial * 86_400.0 * scale as f64).round() as u64;
+        (units, true)
+    } else {
+        let units = (serial.fract() * 86_400.0 * scale as f64).round() as u64;
+        (units.min(86_400 * scale - 1), false)
+    };
+    let secs = units / scale;
+    Clock {
+        hour: ((secs / 3600) % 24) as u32,
+        minute: ((secs % 3600) / 60) as u32,
+        second: (secs % 60) as u32,
+        sub: units % scale,
+        total_secs: total.then_some(secs),
+    }
 }
 
 /// The integer and fraction digits of `x.abs()` rounded to 15 significant
@@ -1528,11 +1644,99 @@ mod tests {
         assert_eq!(fmt("?/?", 1.5), "3/2");
     }
 
+    /// #2115 (plan-fraction): a fixed denominator (`# ?/4`, `# ??/100`)
+    /// renders to that denominator, unreduced, as Excel does.
+    #[test]
+    fn plan_fraction_fixed_denominators_render_to_that_denominator() {
+        assert_eq!(fmt("# ?/4", 1.5), "1 2/4");
+        assert_eq!(fmt("# ?/4", 0.3), " 1/4");
+        // Not reduced: two quarters, not one half.
+        assert_eq!(fmt("# ?/4", 0.5), " 2/4");
+        // Rounds to a whole: the fraction is blank, as wide as `?/4`.
+        assert_eq!(fmt("# ?/4", 1.9), "2    ");
+        assert_eq!(fmt("# ?/4", 0.0), "0    ");
+        assert_eq!(fmt("# ?/4", -1.25), "-1 1/4");
+        assert_eq!(fmt("# ?/2", 0.75), "1    ");
+        // Whole-less: the numerator takes the whole part too.
+        assert_eq!(fmt("?/8", 1.5), "12/8");
+        assert_eq!(fmt("# ??/16", 0.3125), "  5/16");
+        assert_eq!(fmt("# ??/100", 0.37), " 37/100");
+        assert_eq!(fmt("# ??/100", 1.999), "2       ");
+        assert_eq!(fmt("# ?/10", 0.25), " 3/10");
+        // Its own section among others.
+        assert_eq!(fmt("# ?/8;# ?/4", 0.5), " 4/8");
+    }
+
+    /// #2115 (plan-fraction): a digit 1-9 is a fixed denominator only right
+    /// after a bare `/` of a fraction; anywhere else the code is refused.
+    #[test]
+    fn plan_fraction_a_digit_elsewhere_is_still_refused() {
+        for code in [
+            "# ?/4 4",
+            "4# ?/?",
+            "0 4",
+            "1#",
+            "?/4/",
+            "?/04",
+            "# ?/ 4",
+            "d/4",
+            "mm/1",
+            "?/99999999999999999999",
+        ] {
+            assert!(parse_format(code).is_none(), "{code}");
+        }
+    }
+
+    /// Serial of a time of `secs` seconds.
+    fn at_secs(secs: f64) -> f64 {
+        secs / 86_400.0
+    }
+
+    /// #2115 (impl-mmss0): digits after the seconds show the second's
+    /// fraction, rounded, the carry reaching minutes and elapsed totals.
+    #[test]
+    fn impl_mmss0_renders_tenths() {
+        assert_eq!(fmt("mm:ss.0", at_secs(330.26)), "05:30.3");
+        assert_eq!(fmt(builtin_code(47).unwrap(), at_secs(330.26)), "05:30.3");
+        assert_eq!(fmt("mm:ss.0", at_secs(59.96)), "01:00.0");
+        assert_eq!(fmt("h:mm:ss.00", at_secs(1.234)), "0:00:01.23");
+        assert_eq!(fmt("mm:ss.000", at_secs(1.2346)), "00:01.235");
+        assert_eq!(fmt("[ss].0", at_secs(61.26)), "61.3");
+        // Without digits: whole seconds, rounded, as before.
+        assert_eq!(fmt("mm:ss", at_secs(30.6)), "00:31");
+        assert_eq!(fmt("mm:ss", at_secs(330.26)), "05:30");
+        // A clock time stops at the day's last unit, as whole seconds do.
+        assert_eq!(fmt("h:mm:ss.0", at_secs(86_399.97)), "23:59:59.9");
+        assert_eq!(fmt("h:mm:ss", at_secs(86_399.7)), "23:59:59");
+        // With a date in front, the day stays the serial's.
+        assert_eq!(
+            fmt("m/d/yyyy h:mm:ss.0", 45306.0 + at_secs(3723.46)),
+            "1/15/2024 1:02:03.5"
+        );
+    }
+
+    /// #2115: elapsed time takes every part from one rounded total, so a
+    /// second rounded up carries into `[h]` and `[m]`.
+    #[test]
+    fn impl_mmss0_elapsed_parts_share_the_rounded_total() {
+        assert_eq!(fmt("[m]:ss", at_secs(59.6)), "1:00");
+        assert_eq!(fmt("[m]:ss.0", at_secs(59.96)), "1:00.0");
+        assert_eq!(fmt("[h]:mm:ss", at_secs(3599.6)), "1:00:00");
+        assert_eq!(fmt("[h]:mm:ss", at_secs(86_399.65)), "24:00:00");
+        assert_eq!(fmt("[h]:mm:ss", 1.0 + at_secs(59.6)), "24:01:00");
+        assert_eq!(fmt("[h]:mm:ss", 2.5), "60:00:00");
+        // Without seconds too: rounded to the second first, as a clock is.
+        assert_eq!(fmt("[h]:mm", at_secs(3599.6)), "1:00");
+        assert_eq!(fmt("h:mm", at_secs(3599.6)), "1:00");
+        assert_eq!(fmt("[h]", at_secs(3599.6)), "1");
+        assert_eq!(fmt("[h]", at_secs(3599.4)), "0");
+    }
+
     #[test]
     fn builtins_render() {
         for id in [
             0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 18, 22, 37, 38, 41, 42, 43, 44, 45,
-            46, 49,
+            46, 47, 49,
         ] {
             let code = builtin_code(id).unwrap();
             assert!(parse_format(code).is_some(), "builtin {id} = {code}");
