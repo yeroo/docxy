@@ -4745,22 +4745,7 @@ fn append_to_root(xml: &str, root: &str, added: &str) -> Option<String> {
 /// A preserved `<w:hyperlink …>` element with its opening tag's `r:id` set to
 /// `rid` (added when it had none); its children are untouched.
 fn with_opener_rel_id(raw: &str, rid: &str) -> String {
-    let mut parser = XmlParser::new(raw);
-    if parser.next() != Event::Start || parser.name() != "w:hyperlink" {
-        return raw.to_string();
-    }
-    // The value's span in `raw`, from the parser's own view of the start tag,
-    // so any spacing around the attribute or its `=` is handled.
-    let Some(attr) = parser.attrs().iter().find(|attr| attr.name == "r:id") else {
-        return raw.replacen("<w:hyperlink", &format!("<w:hyperlink r:id=\"{rid}\""), 1);
-    };
-    // The parser's values are slices of `raw` (a valueless attribute isn't).
-    let start = (attr.value.as_ptr() as usize).wrapping_sub(raw.as_ptr() as usize);
-    let end = start.wrapping_add(attr.value.len());
-    if end > raw.len() || start > end || !raw.is_char_boundary(start) {
-        return raw.to_string();
-    }
-    format!("{}{rid}{}", &raw[..start], &raw[end..])
+    with_opener_attr(raw, "r:id", Some(rid))
 }
 
 /// A preserved `<w:hyperlink …>` element with its opening tag's attribute

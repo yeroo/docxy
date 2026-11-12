@@ -31,8 +31,9 @@ pub const LINK_COLOR: &str = "0563C1";
 pub struct CaretLink {
     /// The link's text as shown: a field's result in place of its stand-in.
     pub text: String,
-    /// Its target URL, or `#` and its bookmark for a link inside the
-    /// document; empty for a link with neither.
+    /// Its target URL, `#` and its bookmark for a link inside the
+    /// document, or `target#anchor` for a link with both (a URL and its
+    /// fragment, as Word stores it); empty for a link with neither.
     pub url: String,
 }
 
@@ -79,12 +80,41 @@ pub fn link_text(text: &str) -> String {
     out
 }
 
-/// A link's URL as a host reads it: its target, else `#` and its bookmark.
+/// A link's URL as a host reads it: its target, `#` and its bookmark, or
+/// both (`target#anchor`, how Word stores a URL's fragment: an `r:id` and a
+/// `w:anchor` on one link).
 fn link_url(h: &Hyperlink) -> String {
-    h.target
-        .clone()
-        .or_else(|| h.anchor.as_ref().map(|a| format!("#{a}")))
-        .unwrap_or_default()
+    let anchor = h.anchor.as_ref().map(|a| format!("#{a}"));
+    match (&h.target, anchor) {
+        (Some(t), Some(a)) => format!("{t}{a}"),
+        (Some(t), None) => t.clone(),
+        (None, a) => a.unwrap_or_default(),
+    }
+}
+
+/// `h`'s content with its text (runs, tabs, breaks, fields, objects)
+/// replaced by `run`, standing where the first of it stood, and its
+/// zero-width inlines (bookmarks, comment ranges, content control edges)
+/// kept in place; `runs` empty. A link with text in `runs` gets `run`
+/// first.
+fn retexted_content(h: &mut Hyperlink, run: Run) -> Vec<Inline> {
+    let mut run = Some(Inline::Run(run));
+    let mut out = Vec::with_capacity(h.content.len() + 1);
+    if !h.runs.is_empty() {
+        out.extend(run.take());
+    }
+    for inline in std::mem::take(&mut h.content) {
+        if inline_len(&inline) == 0 {
+            out.push(inline);
+        } else if let Some(r) = run.take() {
+            out.push(r);
+        }
+    }
+    if let Some(r) = run {
+        out.insert(0, r);
+    }
+    h.runs.clear();
+    out
 }
 
 /// The link look on `props`: underlined and, unless it has a colour,
@@ -318,13 +348,18 @@ impl Editor {
 
     /// Edit the link at the caret: link it to `url` and, when `text` (made
     /// one line, [`link_text`]) is not blank and differs from the link's
-    /// text, show `text` instead, in the formatting of the link's first run.
-    /// One undo step "Edit Hyperlink"; the caret ends after the link. A link
-    /// loaded from a file keeps its other attributes (tooltip, target
+    /// text made one line too, show `text` instead, in the formatting of the
+    /// link's first run. The link's own text and URL as [`Editor::caret_link`]
+    /// reads them change nothing, so a link holding a tab or a field, or
+    /// a URL with a fragment (`target#anchor`), passed back as it is, stays
+    /// as it is. New text replaces the link's text (its tabs, breaks and
+    /// fields too) and keeps its zero-width inlines, its bookmarks among
+    /// them. One undo step "Edit Hyperlink"; the caret ends after the link.
+    /// A link loaded from a file keeps its other attributes (tooltip, target
     /// frame): its opening tag is rewritten, and save gives a new target a
-    /// relationship of its own. True with nothing to change (the same URL
-    /// and text), taking no step; false, with nothing done, off a link or
-    /// for a URL [`link_dest`] refuses. Not recorded while tracking changes.
+    /// relationship of its own. True with nothing to change, taking no step;
+    /// false, with nothing done, off a link or for a URL [`link_dest`]
+    /// refuses. Not recorded while tracking changes.
     pub fn edit_hyperlink(&mut self, text: &str, url: &str) -> bool {
         let Some((target, anchor)) = link_dest(url) else {
             return false;
@@ -336,9 +371,11 @@ impl Editor {
         else {
             return false;
         };
-        let retarget = h.target != target || h.anchor != anchor;
+        // The link's own URL, as `caret_link` reads it (a URL and its
+        // fragment too), is no new target.
+        let retarget = url.trim() != link_url(h);
         let text = link_text(text);
-        let new_text = (!text.trim().is_empty() && text != shown.text).then_some(text);
+        let new_text = (!text.trim().is_empty() && text != link_text(&shown.text)).then_some(text);
         if !retarget && new_text.is_none() {
             return true;
         }
@@ -362,9 +399,15 @@ impl Editor {
                 h.rel_id = None;
             }
             if let Some(text) = new_text {
-                let props = first_props(h);
-                h.runs = vec![Run { text, props }];
-                h.content.clear();
+                let run = Run {
+                    text,
+                    props: first_props(h),
+                };
+                if h.content.is_empty() {
+                    h.runs = vec![run];
+                } else {
+                    h.content = retexted_content(h, run);
+                }
                 h.content_changed |= h.raw.is_some();
             }
             let end = start + inline_len(&p.content[i]);

@@ -107,8 +107,9 @@ pub enum DocFormat {
 pub struct DocLink {
     /// The link's text.
     pub text: String,
-    /// Its target URL, or `#` and its bookmark for a link inside the
-    /// document.
+    /// Its target URL, `#` and its bookmark for a link inside the
+    /// document, or `target#anchor` for a link with both (a URL's fragment
+    /// as Word stores it).
     pub url: String,
 }
 
@@ -143,7 +144,8 @@ pub struct CaretFormat {
     pub align: Align,
     /// The link at the caret (#1952), for a host's Edit Link and Remove Link
     /// and to prefill its dialog: the one typing at the caret goes into, so
-    /// a caret just after a link is on it and one just before it is not;
+    /// a caret just after a link is on it, and one at its start after other
+    /// text is not (a link that opens the paragraph holds a caret at 0);
     /// over a selection, the link holding the whole selection. `None` off a
     /// link.
     pub link: Option<DocLink>,

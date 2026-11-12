@@ -683,3 +683,154 @@ fn an_inserted_link_keeps_its_url_through_a_save_1952() {
     assert_eq!(h.target.as_deref(), Some("https://b.example/?a=1&b=2"));
     assert!(h.rel_id.is_some());
 }
+
+/// #1952 r1 (M1): a TOC-style link (a tab and a PAGEREF field in its
+/// content) passed back its own text, as `caret_link` reads it, keeps its
+/// content; only a new URL changes, and with the same URL nothing does.
+#[test]
+fn edit_with_a_links_own_text_keeps_its_tab_and_field_1952() {
+    let mut ed = loaded(
+        "<w:p><w:hyperlink w:anchor=\"_Toc1\"><w:r><w:t>Intro</w:t></w:r><w:r><w:tab/></w:r>\
+         <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+         <w:r><w:instrText xml:space=\"preserve\"> PAGEREF _Toc1 \\h </w:instrText></w:r>\
+         <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r><w:r><w:t>3</w:t></w:r>\
+         <w:r><w:fldChar w:fldCharType=\"end\"/></w:r></w:hyperlink></w:p>",
+    );
+    ed.caret.offset = 2;
+    let shown = ed.caret_link().expect("on the link");
+    assert_eq!(shown.text, "Intro\t3");
+    assert_eq!(shown.url, "#_Toc1");
+    let before = ed.doc.clone();
+    assert!(ed.edit_hyperlink(&shown.text, &shown.url));
+    assert_eq!(ed.doc, before);
+    assert!(ed.undo_names().is_empty());
+    let (runs, content) = {
+        let h = links(&ed, 0)[0];
+        (h.runs.clone(), h.content.clone())
+    };
+    assert!(ed.edit_hyperlink(&shown.text, "#_Toc2"));
+    let h = links(&ed, 0)[0];
+    assert_eq!(h.anchor.as_deref(), Some("_Toc2"));
+    assert_eq!((&h.runs, &h.content), (&runs, &content));
+    assert!(content.iter().any(|i| matches!(i, Inline::Tab(_))));
+    assert!(content.iter().any(|i| matches!(i, Inline::Field { .. })));
+    assert_eq!(ed.undo_names(), ["Edit Hyperlink"]);
+    assert_well_formed(&document_to_xml(&ed.doc));
+}
+
+/// #1952 r1 (M2): Word stores a URL's fragment as an `r:id` and a
+/// `w:anchor` on one link. Its own URL, as `caret_link` reads it, is no
+/// change; a new URL drops the anchor, and the save reloads it.
+#[test]
+fn a_link_with_a_target_and_an_anchor_keeps_its_fragment_1952() {
+    let body = "<w:p><w:hyperlink r:id=\"rId1\" w:anchor=\"sec\" w:tooltip=\"t\">\
+                <w:r><w:t>see</w:t></w:r></w:hyperlink></w:p>";
+    let mut ed = loaded(body);
+    ed.caret.offset = 1;
+    let shown = ed.caret_link().expect("on the link");
+    assert_eq!(shown.url, "https://old.example/#sec");
+    let before = ed.doc.clone();
+    assert!(ed.edit_hyperlink(&shown.text, &shown.url));
+    assert!(ed.edit_hyperlink("", &format!(" {} ", shown.url)));
+    assert_eq!(ed.doc, before);
+    assert!(ed.undo_names().is_empty());
+
+    assert!(ed.edit_hyperlink("see", "https://new.example/"));
+    let h = links(&ed, 0)[0];
+    assert_eq!(
+        (h.target.as_deref(), h.anchor.as_deref()),
+        (Some("https://new.example/"), None)
+    );
+    let raw = h.raw.as_deref().expect("the opener kept");
+    assert!(!raw.contains("w:anchor") && !raw.contains("r:id"), "{raw}");
+    let saved = save_package(&new_package(ed.export_doc().into_owned()));
+    let pkg = load_package(&saved).unwrap();
+    let Block::Paragraph(p) = &pkg.document.body[0] else {
+        panic!("a paragraph");
+    };
+    let Inline::Hyperlink(back) = &p.content[0] else {
+        panic!("a link: {:?}", p.content);
+    };
+    assert_eq!(
+        (back.target.as_deref(), back.anchor.as_deref()),
+        (Some("https://new.example/"), None)
+    );
+}
+
+/// #1952 r1 (m1): new text keeps a link's zero-width inlines: the bookmark
+/// a wrap put inside the link is still there, and the save reloads.
+#[test]
+fn edit_with_new_text_keeps_the_links_bookmark_1952() {
+    let mark = "<w:bookmarkStart w:id=\"1\" w:name=\"b\"/>";
+    let mut ed = editor(vec![vec![
+        plain("ab"),
+        Inline::Raw(mark.into()),
+        plain("cd"),
+        Inline::Raw("<w:bookmarkEnd w:id=\"1\"/>".into()),
+    ]]);
+    select(&mut ed, (0, 1), (0, 4));
+    assert!(ed.insert_hyperlink("bcd", "https://m.example/"));
+    assert!(ed.edit_hyperlink("xyz", "https://m.example/"));
+    let h = links(&ed, 0)[0];
+    assert!(h.runs.is_empty());
+    assert_eq!(h.content.len(), 2, "{h:?}");
+    let Inline::Run(r) = &h.content[0] else {
+        panic!("the new text first: {h:?}");
+    };
+    assert_eq!(r.text, "xyz");
+    assert!(r.props.underline);
+    assert_eq!(h.content[1], Inline::Raw(mark.into()));
+    assert_eq!(text(&ed, 0), "axyz");
+    assert_eq!(ed.caret.offset, 4);
+    let xml = document_to_xml(&ed.doc);
+    assert_well_formed(&xml);
+    let saved = save_package(&new_package(ed.export_doc().into_owned()));
+    let pkg = load_package(&saved).unwrap();
+    assert_eq!(pkg.document.body[0].plain_text(), "axyz");
+    assert!(xml.contains(mark), "{xml}");
+}
+
+#[test]
+fn retexted_content_puts_the_run_where_the_text_was_1952() {
+    let mark = Inline::Raw("<w:bookmarkStart w:id=\"1\" w:name=\"b\"/>".into());
+    let new = Run {
+        text: "new".into(),
+        ..Run::default()
+    };
+    let mut h = Hyperlink {
+        content: vec![
+            mark.clone(),
+            plain("a"),
+            Inline::Tab(RunProps::default()),
+            plain("b"),
+        ],
+        ..Hyperlink::default()
+    };
+    assert_eq!(
+        retexted_content(&mut h, new.clone()),
+        [mark.clone(), Inline::Run(new.clone())]
+    );
+    // Text in `runs` too: the new run comes first.
+    let mut h = Hyperlink {
+        runs: vec![Run {
+            text: "x".into(),
+            ..Run::default()
+        }],
+        content: vec![mark.clone(), plain("y")],
+        ..Hyperlink::default()
+    };
+    assert_eq!(
+        retexted_content(&mut h, new.clone()),
+        [Inline::Run(new.clone()), mark.clone()]
+    );
+    assert!(h.runs.is_empty());
+    // No text at all in `content`: the run leads.
+    let mut h = Hyperlink {
+        content: vec![mark.clone()],
+        ..Hyperlink::default()
+    };
+    assert_eq!(
+        retexted_content(&mut h, new.clone()),
+        [Inline::Run(new), mark]
+    );
+}

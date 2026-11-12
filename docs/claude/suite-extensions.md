@@ -249,7 +249,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
 - `DocFormat::InsertLink { text, url }`, `EditLink { text, url }`,
   `RemoveLink` through `DocView::format`, and `CaretFormat::link:
   Option<DocLink>` (`DocLink { text, url }`, `#[non_exhaustive]`, `url` the
-  target or `#bookmark`): a host's link dialog prefills from
+  target, `#bookmark`, or `target#anchor` for a link with both, which is how
+  Word stores a URL's fragment): a host's link dialog prefills from
   `selected_text()` or `caret_format().link`. Each runs as one undo step
   ("Hyperlink", "Edit Hyperlink", "Remove Hyperlink") through
   `edit.rs`'s `link_step`, whose `ran` is the editor method's own answer
@@ -266,7 +267,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   the URL, as in Word.
 - The link at the caret is the top-level link typing there goes into
   (`locate`: a caret between two inlines is the one before's), so a caret
-  just after a link is on it and one at its start after other text is not;
+  just after a link is on it and one at its start after other text is not
+  (a link opening the paragraph holds a caret at 0);
   a selection is on a link only inside it (its whole text too). This
   differs on purpose from `doc_view::link_at` (`[start, end)`), which names
   painted words and follows links. Links inside tracked changes or content
@@ -289,10 +291,14 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   and `content_changed` set, so its tooltip, target frame and namespace
   declarations stay; `rel_id` is `None` and `save_package` now writes the id
   it mints into a kept opener (`with_opener_rel_id`), as
-  `link_part_hyperlinks` does. The same URL and text is true with no step
-  and no change. New text replaces the runs (a complex link's `content`
-  too) with one run in the first run's props. Edit and remove are not
-  recorded while tracking.
+  `link_part_hyperlinks` (now over `with_opener_attr` too) does. The link's
+  own URL and text as `caret_link` reads them are no change (true, no
+  step): the URL is compared with `link_url` (so `target#anchor` keeps its
+  fragment), the text after `link_text` on both sides (a TOC-style link's
+  `\t` and field stay; #1952 r1). New text replaces the link's text (runs,
+  tabs, breaks, fields) with one run in the first run's props and keeps its
+  zero-width inlines in place (`retexted_content`: a bookmark the wrap put
+  inside stays). Edit and remove are not recorded while tracking.
 - Harness: `ext-doc-call` takes `{"insert_link": {"text", "url"}}`,
   `{"edit_link": {"text", "url"}}`, `{"remove_link": true}`;
   `caret_format` adds `link` (`null` or `{text, url}`); `ext-doc-document`'s

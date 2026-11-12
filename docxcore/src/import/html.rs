@@ -91,8 +91,9 @@ pub(crate) const MAX_HREF: usize = 4096;
 /// however spelled, stays text.
 pub(crate) const LINK_SCHEMES: [&str; 4] = ["http", "https", "ftp", "mailto"];
 
-/// The colour of a link's user-agent look (#1879): Word's Hyperlink style.
-const LINK_COLOR: &str = "0563C1";
+// The colour of a link's user-agent look (#1879): Word's Hyperlink style,
+// the one the editor gives a new link (#1952).
+use crate::editor::LINK_COLOR;
 
 /// Read an HTML page. `Err` when it holds no text, or would cost more
 /// than an import may ([`TOO_BIG`]).
