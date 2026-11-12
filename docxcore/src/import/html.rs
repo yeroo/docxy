@@ -2003,6 +2003,9 @@ impl<'a> Html<'a> {
                     self.lists.push(name == "ol");
                 }
             }
+            // A `dl` is a block too (#2114): the line in progress ends at
+            // its start, so its box goes to the paragraphs inside it.
+            "dl" => self.end_para_if_any(),
             "table" => {
                 self.end_para_if_any();
                 self.table_depth += 1;
@@ -2372,7 +2375,7 @@ impl<'a> Html<'a> {
                     self.table_closed();
                 }
             }
-            "ul" | "ol" | "dir" | "menu" => {
+            "ul" | "ol" | "dir" | "menu" | "dl" => {
                 // `close_elem` cuts `lists` and `blocks` back to where the
                 // list element opened: an `li` left open in it ends, and so
                 // does a list opened in it and left open (`</ol>` over an
@@ -7497,5 +7500,27 @@ mod outlook_tests {
              <p>b</p></td></tr></table>",
         );
         assert_eq!(para_of(&d, "b").props.spacing.before, Some(240));
+    }
+}
+
+#[cfg(test)]
+mod batch_2114_tests {
+    //! #2114: a block's trailing `<br>`, hangs for numbers of 10 and up,
+    //! lists' own vertical margins, an enclosing block's margins collapsing
+    //! with its first and last child's, and a table in a centred
+    //! fixed-width wrapper, each laid out as a browser does.
+    use super::*;
+    use crate::import::paragraph_texts;
+
+    fn standards(html: &str) -> Document {
+        import_html(format!("<!DOCTYPE html>{html}").as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn plan_list_margins_a_dl_is_a_block_of_its_own() {
+        // A `dl` ends the line in progress at its start and its end, as
+        // any block does: three lines, not one.
+        let d = standards("a<dl>b</dl>c");
+        assert_eq!(paragraph_texts(&d), ["a", "b", "c"]);
     }
 }
