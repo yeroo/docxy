@@ -147,6 +147,22 @@ fn drop_link_look(props: &mut RunProps) {
     }
 }
 
+/// How a host reads the top-level hyperlink `content[index]`: its visible
+/// text and its URL, as [`Editor::caret_link`] gives them (the view's link
+/// hover and follow use it too, #1916); `None` when `content[index]` is not
+/// a link (or is past the end).
+pub fn hyperlink_shown(content: &[Inline], index: usize) -> Option<CaretLink> {
+    let Some(Inline::Hyperlink(h)) = content.get(index) else {
+        return None;
+    };
+    let start = offset_of(content, index);
+    let end = start + inline_len(&content[index]);
+    Some(CaretLink {
+        text: display_text(content, start, end, true, false),
+        url: link_url(h),
+    })
+}
+
 /// The caret offset where `content[i]` starts.
 fn offset_of(content: &[Inline], i: usize) -> usize {
     content[..i].iter().map(inline_len).sum()
@@ -236,15 +252,7 @@ impl Editor {
     fn caret_link_found(&self) -> Option<FoundLink> {
         let (path, i) = self.caret_link_index()?;
         let p = resolve_para(&self.doc.body, &path)?;
-        let Inline::Hyperlink(h) = &p.content[i] else {
-            return None;
-        };
-        let start = offset_of(&p.content, i);
-        let end = start + inline_len(&p.content[i]);
-        let shown = CaretLink {
-            text: display_text(&p.content, start, end, true, false),
-            url: link_url(h),
-        };
+        let shown = hyperlink_shown(&p.content, i)?;
         Some(FoundLink {
             path,
             index: i,

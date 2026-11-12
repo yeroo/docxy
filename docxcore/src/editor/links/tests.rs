@@ -912,3 +912,42 @@ fn a_link_in_a_text_box_keeps_its_url_through_a_save_1952() {
     assert_eq!(h.target.as_deref(), Some("https://box.example/"));
     assert!(h.rel_id.is_some());
 }
+
+#[test]
+fn hyperlink_shown_reads_every_run_field_result_and_fragment_1916() {
+    // Text in `runs` and in `content` (a run, then a field shown by its
+    // result): all of it, not one run.
+    let mut multi = link("https://a.example/", vec![plain("do"), run("cx", bold())]);
+    if let Inline::Hyperlink(h) = &mut multi {
+        h.content = vec![
+            plain("y "),
+            Inline::Field {
+                text: "link".into(),
+                raw: String::new(),
+            },
+        ];
+    }
+    let fragment = Inline::Hyperlink(Hyperlink {
+        target: Some("https://x.example/page".into()),
+        anchor: Some("frag".into()),
+        runs: vec![Run {
+            text: "page".into(),
+            props: RunProps::default(),
+        }],
+        ..Hyperlink::default()
+    });
+    let content = vec![plain("see "), multi, plain(" or "), fragment];
+    let shown = hyperlink_shown(&content, 1).expect("a link");
+    assert_eq!(shown.text, "docxy link");
+    assert_eq!(shown.url, "https://a.example/");
+    // A URL and its fragment (an `r:id` and a `w:anchor`) read as one.
+    let shown = hyperlink_shown(&content, 3).expect("a link");
+    assert_eq!(shown.url, "https://x.example/page#frag");
+    assert_eq!(shown.text, "page");
+    assert_eq!(hyperlink_shown(&content, 0), None);
+    assert_eq!(hyperlink_shown(&content, 9), None);
+    // The editor's own reading at the caret is the same.
+    let mut ed = editor(vec![content.clone()]);
+    ed.caret.offset = 6;
+    assert_eq!(ed.caret_link(), hyperlink_shown(&content, 1));
+}

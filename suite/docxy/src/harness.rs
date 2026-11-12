@@ -1824,6 +1824,32 @@ enum ExtDocCall {
     Cut,
 }
 
+/// The test extension's link-under-the-pointer reports (`hover_count`,
+/// `hover_calls`, `null` off every link) and each followed link's text
+/// (`link_texts`), #1916.
+fn ext_link_reports(f: &crate::ext_fixture::FixtureView) -> Vec<(String, Json)> {
+    let hovers = f
+        .hover_calls
+        .borrow()
+        .iter()
+        .map(|h| {
+            h.as_ref()
+                .map_or(Json::Null, crate::doc_view::link_hover_json)
+        })
+        .collect::<Vec<_>>();
+    let texts = f
+        .link_texts
+        .borrow()
+        .iter()
+        .map(crate::doc_view::link_hover_json)
+        .collect();
+    vec![
+        ("hover_count".into(), Json::Num(hovers.len() as f64)),
+        ("hover_calls".into(), Json::Arr(hovers)),
+        ("link_texts".into(), Json::Arr(texts)),
+    ]
+}
+
 /// `ext-doc-call`'s arguments: exactly one of `{"format": <command>}` (bold,
 /// italic, underline, bullets, numbering, indent, outdent, align-left,
 /// align-center, align-right, align-justify), `{"font": <name>}`,
@@ -5850,6 +5876,7 @@ fn dispatch_verb(
                 "change_calls".into(),
                 Json::Num(f.change_calls.get() as f64),
             ));
+            reply.extend(ext_link_reports(f));
             Done::ok(Json::Obj(reply))
         }
         // The test extension's side of the suite's ribbon (#1870): the
@@ -6026,6 +6053,8 @@ fn dispatch_verb(
                 "change_calls".into(),
                 Json::Num(fixture.read(cx).change_calls.get() as f64),
             ));
+            // A snapshot of the hover reports a later read compares with.
+            reply.extend(ext_link_reports(fixture.read(cx)));
             Done::ok(Json::Obj(reply))
         }
         "status-read" => {

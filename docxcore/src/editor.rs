@@ -34,7 +34,7 @@ mod tables;
 mod track;
 mod visible;
 pub use flat::{FlatDocument, FlatStory, StoryOffset};
-pub use links::{CaretLink, LINK_COLOR, link_text};
+pub use links::{CaretLink, LINK_COLOR, hyperlink_shown, link_text};
 pub use table_design::BorderCmd;
 pub use table_draw::{DRAW_MIN_HEIGHT, DRAW_MIN_WIDTH, DrawnLine, TableEdge};
 pub use table_layout::{AutoFitKind, CellSep, DeleteShift, SortKey, SortKind, SortSpec};

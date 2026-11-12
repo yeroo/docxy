@@ -20,6 +20,10 @@
 # `ext-doc-word {"text"}` gives a painted word's sheet and its place on it;
 # `ext-doc-load {"fixture":"sections"|"header-inherit"}` shows a document
 # with sections of their own geometry, or that file.
+# The extension also records each link-under-the-pointer report (#1916,
+# `ext-doc-read` hover_calls, hover_count, `null` off every link) and each
+# followed link's text (link_texts); `hovered` is the view's current one and
+# `link_hand` whether it asks for the hand cursor under the pointer.
 # Each test opens its own Mail tab and closes it at the end.
 ext fixture
 
@@ -164,6 +168,142 @@ test issue 1873 a hyperlink press reaches the extension's callback, by Ctrl+clic
   call ext-doc-read {}
   assert reply.links_followed is 3
   assert reply.selection is not empty
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1916 the link under the pointer reaches the extension with its whole text, and the pointer is a hand over it
+  # The pointer's place is this test's own, whatever the test before left:
+  # it leaves the window from the link of a first tab, which then closes.
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call pointer-move {"to":"ext-doc-word:docxy"}
+  call pointer-leave {}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+  # A new tab opened with no move since: gpui's last pointer place is on
+  # its link too, but the pointer is out of the window, so the new view
+  # finds no link there and reports nothing (r1).
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call ext-doc-read {}
+  assert reply.hover_count is 0
+  assert reply.hovered is null
+  assert reply.link_hand is false
+  # Plain text: no link, no hand, nothing reported. Every count below
+  # starts from this tab's zero.
+  call pointer-move {"to":"ext-doc-word:Alpha"}
+  call ext-doc-read {}
+  assert reply.hover_count is 0
+  assert reply.hovered is null
+  assert reply.link_hand is false
+  # Onto the link's first word: its target and the whole link's text.
+  call pointer-move {"to":"ext-doc-word:docxy"}
+  call ext-doc-read {}
+  assert reply.hover_count is 1
+  assert reply.hover_calls.0.url is https://example.com/docxy
+  assert reply.hover_calls.0.text is docxy link
+  assert reply.hovered.url is https://example.com/docxy
+  assert reply.link_hand is true
+  # Its second word is the same link: nothing new.
+  call pointer-move {"to":"ext-doc-word:link"}
+  call ext-doc-read {}
+  assert reply.hover_count is 1
+  assert reply.link_hand is true
+  # Onto another link.
+  call pointer-move {"to":"ext-doc-link:1"}
+  call ext-doc-read {}
+  assert reply.hover_count is 2
+  assert reply.hover_calls.1.url is https://example.com/indented
+  assert reply.hover_calls.1.text is Indented link
+  assert reply.link_hand is true
+  # The blank indent beside that row is off every link.
+  call pointer-move {"to":"ext-doc-link:1:left"}
+  call ext-doc-read {}
+  assert reply.hover_count is 3
+  assert reply.hover_calls.2 is null
+  assert reply.hovered is null
+  assert reply.link_hand is false
+  # Leaving the window from a link reports none.
+  call pointer-move {"to":"ext-doc-word:docxy"}
+  call pointer-leave {}
+  call ext-doc-read {}
+  assert reply.hover_count is 5
+  assert reply.hover_calls.3.url is https://example.com/docxy
+  assert reply.hover_calls.4 is null
+  assert reply.hovered is null
+  assert reply.link_hand is false
+  # gpui keeps the pointer's last place: frames drawn now, with no pointer
+  # event, find no link under it again.
+  call ext-doc-set {"content_dark":true}
+  shot window
+  call ext-doc-set {"content_dark":false}
+  shot window
+  call ext-doc-read {}
+  assert reply.hover_count is 5
+  assert reply.hovered is null
+  # Set to follow on a plain click, the hand is the same.
+  call ext-doc-set {"link_click":"click"}
+  call pointer-move {"to":"ext-doc-link:0"}
+  call ext-doc-read {}
+  assert reply.hover_count is 6
+  assert reply.link_hand is true
+  # A followed link reaches on_link_with_text too, with its text.
+  call pointer-click {"region":"ext-doc-link:0","ctrl":true}
+  call ext-doc-read {}
+  assert reply.links_followed is 1
+  assert reply.link_calls.0 is https://example.com/docxy
+  assert reply.link_texts.0.url is https://example.com/docxy
+  assert reply.link_texts.0.text is docxy link
+  # Content scrolled from under a still pointer: the next frame finds the
+  # lines below there, off every link. A wheel is no pointer move.
+  call pointer-move {"to":"ext-doc-word:docxy"}
+  call ext-doc-read {}
+  assert reply.hovered.url is https://example.com/docxy
+  call pointer-wheel {"region":"ext-doc-word:docxy","dy":-2000}
+  shot window
+  call ext-doc-read {}
+  assert reply.scroll_y is not 0
+  assert reply.hovered is null
+  assert reply.hover_calls.6 is null
+  assert reply.link_hand is false
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1916 editable, the link under the pointer is still reported but no hand, and a key alone changes nothing
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call ext-doc-set {"editable":true}
+  assert reply.editable is true
+  call pointer-click {"region":"ext-doc-word:Alpha"}
+  call ext-doc-read {}
+  assert reply.hovered is null
+  # Where the pointer was when the tab opened may have reported a link
+  # already: the counts below are against the snapshot (ext-doc-set's
+  # reply carries hover_count too).
+  call pointer-move {"to":"ext-doc-word:docxy"}
+  call ext-doc-set {"link_click":"ctrl-click"}
+  assert reply.hover_count is not {ext-doc-read.hover_count}
+  assert reply.hovered.url is https://example.com/docxy
+  assert reply.hovered.text is docxy link
+  assert reply.link_hand is false
+  # Keys move the caret and redraw; the pointer has not moved, so the link
+  # is still under it and nothing is reported.
+  call real-key {"key":"right"}
+  call real-key {"key":"right"}
+  shot window
+  call ext-doc-read {}
+  assert reply.caret.offset is not {ext-doc-set.caret.offset}
+  assert reply.hover_count is {ext-doc-set.hover_count}
+  assert reply.hovered.url is https://example.com/docxy
   call real-key {"key":"ctrl+w"}
   call tab-list {}
   assert reply.count is 1

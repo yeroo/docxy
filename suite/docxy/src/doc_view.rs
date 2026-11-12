@@ -11,7 +11,9 @@
 //! formatting commands ([`DocView::format`]) and its Insert, Copy and Cut
 //! ([`DocView::insert_text`], [`DocView::copy`], [`DocView::cut`], #1977);
 //! its decisions are [`edit`]'s. A hyperlink press goes to the extension's callback
-//! ([`DocView::on_link`]), never opened here. The chrome (scroll bar, selection) follows the suite's
+//! ([`DocView::on_link`], [`DocView::on_link_with_text`]), never opened here; the
+//! link under the pointer goes to [`DocView::on_link_hover`] and, read-only,
+//! the pointer is a hand over it (#1916). The chrome (scroll bar, selection) follows the suite's
 //! theme; the document is a white page in its authored colours unless the
 //! extension turns on dark mode for content ([`DocView::set_content_dark`]),
 //! whose dark page the host may paint in its own colour
@@ -35,6 +37,7 @@ use super::*;
 use docxcore::editor::{Caret, Clip, Editor};
 use docxcore::package::Package;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -85,6 +88,24 @@ pub enum LinkClick {
     Click,
 }
 
+/// A hyperlink as the view tells a host about it (#1916): under the pointer
+/// ([`DocView::on_link_hover`]) or followed ([`DocView::on_link_with_text`]).
+/// A host compares the two to warn about a link whose text looks like a
+/// different target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LinkHover {
+    /// Its target as [`DocView::on_link`] gives it: the URL, `#name` for a
+    /// bookmark link, or `target#anchor` for a link with both (a URL and its
+    /// fragment, as Word stores it).
+    pub url: String,
+    /// The whole link's visible text, every run of it (not just the word
+    /// under the pointer), read as [`CaretFormat`]'s `link` reads it: a
+    /// field's result in place of the field, and a tab or line break in the
+    /// link kept as `\t` / `\u{0B}`.
+    pub text: String,
+}
+
 /// How the view lays the document out (#1888).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -113,6 +134,81 @@ pub(crate) struct SheetProbe {
 type Sheets = Rc<RefCell<Vec<SheetProbe>>>;
 
 type LinkFn = Rc<dyn Fn(&str, &mut Window, &mut App)>;
+type LinkTextFn = Rc<dyn Fn(&LinkHover, &mut Window, &mut App)>;
+type HoverFn = Rc<dyn Fn(Option<&LinkHover>, &mut Window, &mut App)>;
+
+/// A hovered link's identity (#1916): its paragraph's path and its index in
+/// that paragraph's content. Two links to one target are two hovers.
+type HoverKey = (Vec<usize>, usize);
+
+/// The link under the pointer (#1916), shared by the view, its overlay
+/// canvas and the window's mouse listeners that canvas registers (they run
+/// outside the view's update, and the view may be mid-render).
+struct LinkHoverState {
+    /// The last frame's link pieces: a hitbox per painted piece of a link,
+    /// clipped to the view clear of the bars and the Find box.
+    boxes: RefCell<Vec<(Hitbox, HoverKey, LinkHover)>>,
+    /// The link the host was last told about.
+    current: RefCell<Option<(HoverKey, LinkHover)>>,
+    /// The pointer is out of the window as far as this view knows: it left
+    /// (`MouseExited`) and has not moved in since, or no move has reached
+    /// the view yet. gpui keeps its last position after the pointer leaves,
+    /// so without this every repaint would find the link it left hovered
+    /// again. A new view starts out, as #1869's `pointer_in_window` does: it
+    /// cannot know whether the pointer left while it did not exist or was
+    /// hidden (r1).
+    pointer_out: Cell<bool>,
+    on_hover: RefCell<Option<HoverFn>>,
+}
+
+impl Default for LinkHoverState {
+    fn default() -> Self {
+        LinkHoverState {
+            boxes: RefCell::default(),
+            current: RefCell::default(),
+            pointer_out: Cell::new(true),
+            on_hover: RefCell::default(),
+        }
+    }
+}
+
+impl LinkHoverState {
+    /// The link under the pointer in the last frame's pieces. Not
+    /// `Hitbox::is_hovered`, which is false after any keyboard input: a key
+    /// would report no link under a still pointer. `should_handle_scroll` is
+    /// gpui's hit test without that: it still stops at a `BlockMouse`
+    /// overlay (a menu, a dialog), and the one `BlockMouseExceptScroll` over
+    /// the view, the Find box, is clipped out of the pieces already.
+    fn under_pointer(&self, window: &Window) -> Option<(HoverKey, LinkHover)> {
+        if self.pointer_out.get() {
+            return None;
+        }
+        // gpui on Windows sends no `MouseExited` (as `help_pointer`, #1869).
+        if cfg!(target_os = "windows") && !harness() && !window.is_window_hovered() {
+            return None;
+        }
+        self.boxes
+            .borrow()
+            .iter()
+            .find(|(b, ..)| b.should_handle_scroll(window))
+            .map(|(_, key, link)| (key.clone(), link.clone()))
+    }
+
+    /// Look again and tell the host when the link under the pointer changed,
+    /// deferred, outside any update.
+    fn update(&self, window: &mut Window, cx: &mut App) {
+        let now = self.under_pointer(window);
+        if *self.current.borrow() == now {
+            return;
+        }
+        self.current.replace(now.clone());
+        if let Some(f) = self.on_hover.borrow().clone() {
+            window.defer(cx, move |window, cx| {
+                f(now.as_ref().map(|(_, link)| link), window, cx)
+            });
+        }
+    }
+}
 type ChangeFn = Rc<dyn Fn(&mut App)>;
 
 /// An embeddable view of a document, read-only unless made editable. Make
@@ -132,9 +228,12 @@ pub struct DocView {
     selecting: bool,
     /// The hyperlink a plain press landed on (followed on its release in
     /// [`LinkClick::Click`] mode when nothing was dragged).
-    press_link: Option<String>,
+    press_link: Option<LinkHover>,
     link_click: LinkClick,
     on_link: Option<LinkFn>,
+    on_link_with_text: Option<LinkTextFn>,
+    /// The link under the pointer and the last frame's link pieces (#1916).
+    hover: Rc<LinkHoverState>,
     content_dark: bool,
     /// The host's padding around the document (#2003); `None`:
     /// [`DEFAULT_PAGE_INSET`].
@@ -216,6 +315,8 @@ impl DocView {
             press_link: None,
             link_click: LinkClick::default(),
             on_link: None,
+            on_link_with_text: None,
+            hover: Rc::default(),
             content_dark: false,
             page_inset: None,
             page_bg: None,
@@ -461,11 +562,44 @@ impl DocView {
         cx.notify();
     }
 
-    /// Called with a hyperlink's target (its URL, or `#name` for a bookmark
-    /// link) when the person follows it. It runs after the press is handled,
+    /// Called with a hyperlink's target (its URL, `#name` for a bookmark
+    /// link, or `target#anchor` for a link with both, #1916) when the person
+    /// follows it. It runs after the press is handled,
     /// outside the view's update, so it may update the view.
     pub fn on_link(&mut self, f: impl Fn(&str, &mut Window, &mut App) + 'static) {
         self.on_link = Some(Rc::new(f));
+    }
+
+    /// Called with a followed hyperlink's target and whole visible text
+    /// (#1916), after [`DocView::on_link`] when both are set: a host may warn
+    /// when the text looks like a different URL from the target.
+    pub fn on_link_with_text(&mut self, f: impl Fn(&LinkHover, &mut Window, &mut App) + 'static) {
+        self.on_link_with_text = Some(Rc::new(f));
+    }
+
+    /// Called when the hyperlink under the pointer changes (#1916): entering
+    /// a link or moving onto another one (two links to one target are two),
+    /// with the link; leaving every link, the view or the window, with
+    /// `None`. Moving between words of one link calls nothing. Content that
+    /// moves under a still pointer (a scroll, a zoom, a new document) is
+    /// looked at again after its next frame; a key alone changes nothing.
+    /// It runs outside the view's update, as `on_link` does. The view only
+    /// reports: it draws no tooltip or status of its own. A view that stops
+    /// being drawn while a link is under the pointer (taken out of the tree,
+    /// or its tab hidden) is not told anything more, so a host clears its
+    /// own status when it hides the view. A view reports nothing until the
+    /// pointer first moves over the window after it is shown the first time,
+    /// so a view that first appears under a still pointer reports that link
+    /// at the first move. A view hidden, then shown again with no move in
+    /// between, cannot tell whether the pointer left the window meanwhile,
+    /// and may report a link at the pointer's last place. On Windows gpui
+    /// sends no event when the pointer leaves the window, so leaving it
+    /// straight from a link reports `None` at the next mouse event or frame.
+    pub fn on_link_hover(
+        &mut self,
+        f: impl Fn(Option<&LinkHover>, &mut Window, &mut App) + 'static,
+    ) {
+        self.hover.on_hover.replace(Some(Rc::new(f)));
     }
 
     /// Dark mode for content: on a dark theme the document draws in the
@@ -585,14 +719,15 @@ impl DocView {
         let link = on_piece
             .then(|| docxcore::editor::resolve_para(&self.editor.doc.body, &path))
             .flatten()
-            .and_then(|p| link_at(p, off));
+            .and_then(|p| link_hover_at(p, off))
+            .map(|(_, link)| link);
         // Ctrl+click (⌘ on macOS) follows a link at once, in either mode, and
         // selects nothing.
         if mods.secondary() && !mods.shift {
-            if let Some(url) = link {
+            if let Some(link) = link {
                 self.selecting = false;
                 self.press_link = None;
-                self.follow(url, window, cx);
+                self.follow(link, window, cx);
                 return;
             }
         }
@@ -636,9 +771,17 @@ impl DocView {
         cx.notify();
     }
 
-    fn follow(&self, url: String, window: &mut Window, cx: &mut App) {
-        if let Some(f) = self.on_link.clone() {
-            window.defer(cx, move |window, cx| f(&url, window, cx));
+    fn follow(&self, link: LinkHover, window: &mut Window, cx: &mut App) {
+        let (on_link, with_text) = (self.on_link.clone(), self.on_link_with_text.clone());
+        if on_link.is_some() || with_text.is_some() {
+            window.defer(cx, move |window, cx| {
+                if let Some(f) = on_link {
+                    f(&link.url, window, cx);
+                }
+                if let Some(f) = with_text {
+                    f(&link, window, cx);
+                }
+            });
         }
     }
 
@@ -646,12 +789,12 @@ impl DocView {
     /// press on a link that dragged nothing follows it.
     fn release(&mut self, mods: Modifiers, window: &mut Window, cx: &mut Context<Self>) {
         self.selecting = false;
-        if let Some(url) = self.press_link.take() {
+        if let Some(link) = self.press_link.take() {
             if self.link_click == LinkClick::Click
                 && !mods.modified()
                 && !self.editor.has_selection()
             {
-                self.follow(url, window, cx);
+                self.follow(link, window, cx);
             }
         }
     }
@@ -1098,6 +1241,22 @@ impl DocView {
                     }
                     .into(),
                 ),
+            ),
+            // The link under the pointer as the host was last told (#1916),
+            // and whether the view asks for the hand there: gpui gives no
+            // way to read the platform's cursor back, so this is the view's
+            // own request (read-only, a link piece under the pointer).
+            (
+                "hovered",
+                self.hover
+                    .current
+                    .borrow()
+                    .as_ref()
+                    .map_or(Json::Null, |(_, link)| link_hover_json(link)),
+            ),
+            (
+                "link_hand",
+                Json::Bool(!self.editable && self.hover.under_pointer(window).is_some()),
             ),
             ("content_dark", Json::Bool(self.content_dark)),
             ("page_inset", {
@@ -1552,6 +1711,25 @@ impl Render for DocView {
         let viewport = self.viewport.clone();
         let (words, scroll) = (self.words.clone(), self.scroll.clone());
         let (hbar, vbar) = (self.hbar.clone(), self.vbar.clone());
+        // The links of each paragraph this frame draws (#1916): the overlay
+        // canvas gives each painted piece of one a hitbox, for the hand and
+        // the link under the pointer.
+        let mut links: HashMap<Vec<usize>, ParaLinks> = HashMap::new();
+        for (path, _) in self.words.borrow().iter() {
+            if links.contains_key(path) {
+                continue;
+            }
+            if let Some(p) = docxcore::editor::resolve_para(body, path) {
+                let found = para_links(p);
+                if !found.is_empty() {
+                    links.insert(path.clone(), found);
+                }
+            }
+        }
+        let (hover, hover_boxes) = (self.hover.clone(), self.hover.clone());
+        let words_p = self.words.clone();
+        let (hbar_p, vbar_p) = (self.hbar.clone(), self.vbar.clone());
+        let hand = !self.editable;
         div()
             .id("ext-doc-view")
             .font_family(ui_font)
@@ -1599,11 +1777,33 @@ impl Render for DocView {
             .child(scroll_area)
             .child(
                 canvas(
-                    move |b: Bounds<Pixels>, _w: &mut Window, _a: &mut App| viewport.set(Some(b)),
+                    move |b: Bounds<Pixels>, window: &mut Window, _a: &mut App| {
+                        viewport.set(Some(b));
+                        // `ext-doc-scroll` has prepainted, so every piece
+                        // has its bounds (#1916).
+                        let clip = find::find_view(b, hbar_p.shown(), vbar_p.shown(), box_open);
+                        hover_boxes
+                            .boxes
+                            .replace(link_hitboxes(&words_p, &links, clip, window));
+                    },
                     // It paints after `ext-doc-scroll`, whose pieces this
                     // frame has drawn by then: a paragraph an Enter just
                     // made among them.
-                    move |b, _s, window, _a| {
+                    move |b, _s, window, cx| {
+                        // Read-only, the pointer is a hand over a link: asked
+                        // after the words' I-beam and before the bars and the
+                        // Find box, so it wins over the one and not the
+                        // others (#1916). Editable, a press there places the
+                        // caret, so no hand.
+                        if hand {
+                            for (hitbox, ..) in hover.boxes.borrow().iter() {
+                                window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+                            }
+                        }
+                        link_hover_listeners(&hover, window);
+                        // Content moved under a still pointer (a scroll, a
+                        // zoom, a new document) shows here.
+                        hover.update(window, cx);
                         // Clear of the scroll bars (#2080) and the open Find
                         // box (#1887).
                         let view = find::find_view(b, hbar.shown(), vbar.shown(), box_open);
@@ -2376,22 +2576,113 @@ pub(crate) fn step_zoom(zoom: f32, dir: i32) -> f32 {
 }
 
 /// The target of the hyperlink holding caret offset `off` of `p`: its URL,
-/// else `#` and its bookmark; `None` outside a link (or a link with neither).
+/// `#` and its bookmark, or `target#anchor` for a link with both (#1916);
+/// `None` outside a link (or a link with neither).
 pub(crate) fn link_at(p: &Paragraph, off: usize) -> Option<String> {
+    link_hover_at(p, off).map(|(_, link)| link.url)
+}
+
+/// The top-level hyperlink holding caret offset `off` of `p` (#1916): its
+/// index in `p.content` and what a host is told about it. `None` outside a
+/// link, or for a link with neither a target nor a bookmark.
+pub(crate) fn link_hover_at(p: &Paragraph, off: usize) -> Option<(usize, LinkHover)> {
+    para_links(p)
+        .into_iter()
+        .find(|(range, ..)| range.contains(&off))
+        .map(|(_, i, link)| (i, link))
+}
+
+/// A link as the harness reads it (#1916): `{url, text}`.
+pub(crate) fn link_hover_json(link: &LinkHover) -> ctlcore::json::Json {
+    use ctlcore::json::Json;
+    Json::obj(vec![
+        ("url", Json::Str(link.url.clone())),
+        ("text", Json::Str(link.text.clone())),
+    ])
+}
+
+/// A painted paragraph's links: caret offsets, index in its content, and
+/// what a host is told.
+type ParaLinks = Vec<(std::ops::Range<usize>, usize, LinkHover)>;
+
+/// A hitbox for each painted piece (word or unit) of a link (#1916), clipped
+/// to `clip` (the view clear of the bars and the Find box); a piece out of
+/// view gets none. Per piece, not the link's merged span: a wrapped link's
+/// union would cover the blank beside its rows. `Normal` hitboxes block
+/// nothing, so the words' own press and move handling is unchanged. Only
+/// in prepaint.
+fn link_hitboxes(
+    words: &Words,
+    links: &HashMap<Vec<usize>, ParaLinks>,
+    clip: Bounds<Pixels>,
+    window: &mut Window,
+) -> Vec<(Hitbox, HoverKey, LinkHover)> {
+    let mut out = Vec::new();
+    if links.is_empty() {
+        return out;
+    }
+    for (path, spans) in words.borrow().iter() {
+        let Some(found) = links.get(path) else {
+            continue;
+        };
+        for w in spans.borrow().iter().filter(|w| w.len > 0) {
+            let Some((_, i, link)) = found.iter().find(|(range, ..)| range.contains(&w.off)) else {
+                continue;
+            };
+            let piece = w.bounds().intersect(&clip);
+            if piece.size.width > px(0.) && piece.size.height > px(0.) {
+                let hitbox = window.insert_hitbox(piece, HitboxBehavior::Normal);
+                out.push((hitbox, (path.clone(), *i), link.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// The window's mouse listeners that keep the link under the pointer
+/// (#1916), registered each frame in paint. Capture phase: a word's own move
+/// handler may stop a move's bubble during a drag. They never stop an event
+/// themselves; `main.rs`'s gesture canvas registers earlier, so its capture
+/// listeners run first and a table pen's could stop a move before it gets
+/// here, which only delays the report to the next frame.
+fn link_hover_listeners(hover: &Rc<LinkHoverState>, window: &mut Window) {
+    let moved = hover.clone();
+    window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+        if phase == DispatchPhase::Capture {
+            moved.pointer_out.set(false);
+            moved.update(window, cx);
+        }
+    });
+    let left = hover.clone();
+    window.on_mouse_event(move |_: &MouseExitEvent, phase, window, cx| {
+        if phase == DispatchPhase::Capture {
+            left.pointer_out.set(true);
+            left.update(window, cx);
+        }
+    });
+}
+
+/// Each top-level hyperlink of `p` with a target or a bookmark: its caret
+/// offsets, its index in `p.content` and what a host is told about it
+/// (docxcore's [`docxcore::editor::hyperlink_shown`], as the caret's link
+/// reads, #1916).
+fn para_links(p: &Paragraph) -> ParaLinks {
     let mut at = 0;
-    for inline in &p.content {
+    let mut out = Vec::new();
+    for (i, inline) in p.content.iter().enumerate() {
         let len = docxcore::editor::inline_len(inline);
-        if let Inline::Hyperlink(h) = inline {
-            if (at..at + len).contains(&off) {
-                return h
-                    .target
-                    .clone()
-                    .or_else(|| h.anchor.as_ref().map(|a| format!("#{a}")));
+        if let Some(shown) = docxcore::editor::hyperlink_shown(&p.content, i) {
+            if !shown.url.is_empty() {
+                let link = LinkHover {
+                    url: shown.url,
+                    text: shown.text,
+                };
+                out.push((at..at + len, i, link));
             }
         }
         at += len;
     }
-    None
+    out
 }
 
 /// A paragraph's characters by caret offset: run text as it is, every other
@@ -2583,6 +2874,79 @@ mod tests {
             ..Paragraph::default()
         };
         assert_eq!(link_at(&bare, 0), None);
+    }
+
+    fn hover(url: &str, text: &str) -> LinkHover {
+        LinkHover {
+            url: url.into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn link_hover_at_gives_the_whole_link_text_1916() {
+        // One link of three runs: "do", bold "cx", "y link".
+        let mut runs = Vec::new();
+        for (text, bold) in [("do", false), ("cx", true), ("y link", false)] {
+            let mut r = Run {
+                text: text.into(),
+                ..Run::default()
+            };
+            r.props.bold = bold;
+            runs.push(r);
+        }
+        let p = Paragraph {
+            content: vec![
+                run("see "),
+                Inline::Hyperlink(Hyperlink {
+                    target: Some("https://example.com/d".into()),
+                    runs,
+                    ..Hyperlink::default()
+                }),
+                run(" or "),
+                link("top", None, Some("top")),
+            ],
+            ..Paragraph::default()
+        };
+        let whole = hover("https://example.com/d", "docxy link");
+        // Every offset in the link, each run's, is the same link.
+        for off in 4..14 {
+            assert_eq!(link_hover_at(&p, off), Some((1, whole.clone())), "at {off}");
+        }
+        assert_eq!(link_hover_at(&p, 3), None);
+        assert_eq!(link_hover_at(&p, 14), None);
+        assert_eq!(link_hover_at(&p, 18), Some((3, hover("#top", "top"))));
+    }
+
+    #[test]
+    fn two_links_to_one_target_split_by_a_break_are_two_hovers_1916() {
+        let p = Paragraph {
+            content: vec![
+                link("a b", Some("https://u.example/"), None),
+                Inline::Break(docxcore::model::BreakKind::Line, Default::default()),
+                link("c", Some("https://u.example/"), None),
+            ],
+            ..Paragraph::default()
+        };
+        let first = link_hover_at(&p, 1).expect("the first link");
+        let second = link_hover_at(&p, 4).expect("the second link");
+        assert_eq!(first, (0, hover("https://u.example/", "a b")));
+        assert_eq!(second, (2, hover("https://u.example/", "c")));
+        // Its own key: the hover changes from one to the other.
+        assert_ne!(first.0, second.0);
+        // The break between them is neither.
+        assert_eq!(link_hover_at(&p, 3), None);
+    }
+
+    #[test]
+    fn a_link_with_target_and_anchor_keeps_its_fragment_1916() {
+        let p = Paragraph {
+            content: vec![link("page", Some("https://x.example/page"), Some("frag"))],
+            ..Paragraph::default()
+        };
+        let url = "https://x.example/page#frag";
+        assert_eq!(link_at(&p, 1).as_deref(), Some(url));
+        assert_eq!(link_hover_at(&p, 1), Some((0, hover(url, "page"))));
     }
 
     #[test]

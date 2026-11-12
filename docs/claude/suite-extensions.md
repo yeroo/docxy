@@ -68,7 +68,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   does too. Only a press on a painted word or unit is on a link
   (`DocTarget::begin_select`'s `on_piece`): a press beside a row lands on
   the row's nearest stop, never a link. The callback runs deferred (`window.defer`), outside the view's
-  update. The view never opens a link.
+  update. The view never opens a link. The target is docxcore's
+  `link_url` (`target#anchor` for a link with both, #1916). The link
+  under the pointer and the hand cursor: "Link hover and the hand cursor (#1916)" below.
 - Colours: the chrome (scroll bar, selection) is the theme's; the document
   is a white page in Print Layout's palette (`content_look`, `page_pal`) unless
   `set_content_dark(true)` on a dark theme, which draws on the host's page
@@ -316,6 +318,69 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
 - Not done: a Ctrl+K key or a dialog in the view (Ctrl+K bubbles), the
   document tab's own Insert > Link (it could call the same methods), a
   ScreenTip.
+
+## Link hover and the hand cursor (#1916)
+
+- `DocView::on_link_hover(Fn(Option<&LinkHover>, &mut Window, &mut App))`:
+  called, deferred (`window.defer`), only when the link under the pointer
+  changes (entering one, moving onto another `Inline::Hyperlink` even with
+  the same target, `None` off every link, out of the view or the window).
+  `DocView::on_link_with_text(Fn(&LinkHover, ..))` is called on every
+  follow after `on_link`. `ext::LinkHover { url, text }`
+  (`#[non_exhaustive]`): `url` as `on_link` gives it, `text` the whole
+  link's, both from docxcore's `hyperlink_shown` (what
+  `Editor::caret_link` reads too), so a tab or line break in the link
+  stays `\t` / `\u{0B}`. `link_at` is now `link_hover_at` over `para_links`, and
+  a link with a target and an anchor gives `target#anchor` everywhere
+  (#1873 dropped the fragment).
+- Read-only, the pointer is `CursorStyle::PointingHand` over each painted
+  piece of a link, in both `LinkClick` modes; editable, no hand (a press
+  places the caret) but the hover is still reported. The shared renderer
+  is untouched: the view's overlay canvas (after `ext-doc-scroll`, before
+  the bars and the Find box) inserts a `Normal` hitbox per painted link
+  piece in its prepaint (`link_hitboxes`: the pieces' bounds are set in
+  `ext-doc-scroll`'s prepaint, which runs first), clipped by `find_view`,
+  and in paint asks for the hand on each. The hand comes after the words'
+  I-beam, and the bars and the Find box come after the hand.
+- The link under the pointer (`LinkHoverState::under_pointer`) is the
+  first piece hitbox passing `should_handle_scroll`, not `is_hovered`,
+  which is false after any key. That would report `None` under a still
+  pointer on every key. `BlockMouse` overlays still hide it, and the Find
+  box (`BlockMouseExceptScroll`) is clipped out. gpui keeps its last mouse
+  position on `MouseExited`, so a `pointer_out` latch (set by the exit,
+  cleared by a move) keeps a later frame from finding the link again. Each
+  view has its own latch, and it starts out, as #1869's
+  `pointer_in_window` starts false (r1). A new view (a tab opened or
+  switched to by keyboard after the pointer left the window) never finds a
+  link at the stale position. The cost: a view first shown under a still
+  pointer reports its link only at the first move. A view hidden and shown
+  again with no move in between never saw an exit that came while it was
+  hidden, so it may still read the stale position. The harness's
+  `pointer-click` and `pointer-wheel` send a move first, as the platforms
+  do. On Windows outside the harness
+  `window.is_window_hovered()` must hold too (no `MouseExited` there).
+- It is looked at again from Capture-phase `MouseMoveEvent` /
+  `MouseExitEvent` window listeners registered in the canvas's paint
+  (never stopping an event), and at the end of every paint, so content
+  moving under a still pointer (wheel, keys, zoom, a new document) is
+  reported after its frame.
+- Not reported: a view that stops being drawn while hovered (out of the
+  tree, its tab hidden). The host clears its own status then. On Windows,
+  leaving the window straight from a link reports `None` at the next
+  event or frame. Not done: a hand while Ctrl is held in editable mode,
+  links in Print Layout's headers and footers (not in `Words`), the
+  document tabs' own link hover.
+- Harness: the fixture records `on_link_hover` and `on_link_with_text`.
+  `ext-doc-read` (and `ext-doc-set`, as a snapshot) add `hover_count`,
+  `hover_calls` (`null` / `{url, text}`), `link_texts`, `hovered` (the
+  view's current one) and `link_hand` (read-only and a link piece under
+  the pointer: the view's own request, since gpui cannot read the cursor
+  back). The `issue 1916` tests in `uiharness/cases/ext-doc-view.uit`
+  cover pointer moves, `pointer-leave` and frames after it, a wheel under a
+  still pointer, a new tab opened after `pointer-leave` over a link
+  (nothing found there), and editable mode with arrow keys. Each test sets
+  its own pointer first (gpui keeps the pointer where the previous test
+  left it) and the editable one counts against `ext-doc-set`'s snapshot.
 
 ## Page inset and page background (#2003)
 
