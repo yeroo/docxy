@@ -450,6 +450,9 @@ struct Look {
     /// Inside a table cell (inherited): a fixed-width block's centring
     /// needs the body width, unknown there (#1922).
     in_cell: bool,
+    /// Inside a fixed-width block centred in the body (inherited, #2114):
+    /// an outermost table is laid out in the room its indents leave.
+    centred_box: bool,
     line: Option<Line>,
     line_exact: bool,
     /// `text-indent`, in twips (inherited).
@@ -882,6 +885,23 @@ fn table_spec(attrs: &Attrs, look: &Look) -> TableSpec {
                 _ => None,
             },
         },
+        // In a centred fixed-width block, outside any cell (#2114): the
+        // room left between its indents.
+        room: (look.centred_box && !look.in_cell).then(|| {
+            let body = html_table::BODY_TWIPS;
+            let indent = u32::try_from(look.indent.max(0)).unwrap_or(0).min(body);
+            let right = u32::try_from(look.indent_right.max(0))
+                .unwrap_or(0)
+                .min(body);
+            html_table::Room {
+                indent,
+                width: body
+                    .saturating_sub(indent)
+                    .saturating_sub(right)
+                    .clamp(html_table::MIN_COL, body),
+                centred: indent == right,
+            }
+        }),
     }
 }
 
@@ -1430,6 +1450,7 @@ impl Cascade {
                         let extra = (room / 2).max(0);
                         look.indent = clamp_twips(i64::from(look.indent) + extra);
                         look.indent_right = clamp_twips(i64::from(look.indent_right) + extra);
+                        look.centred_box = true;
                     }
                 }
                 if let Some(fill) = self.background {
@@ -2519,6 +2540,7 @@ impl<'a> Html<'a> {
             border: 0,
             cellpadding: Some(0),
             cellspacing: None,
+            room: None,
             jc: match look.own_place {
                 Some(Align::Center) => Some("center"),
                 Some(Align::Right) => Some("right"),
@@ -7595,6 +7617,20 @@ mod batch_2114_tests {
             .count()
     }
 
+    fn tables(d: &Document) -> Vec<&crate::model::Table> {
+        d.body
+            .iter()
+            .filter_map(|b| match b {
+                DocBlock::Table(t) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tblpr(t: &crate::model::Table) -> &str {
+        t.raw_tblpr.as_deref().unwrap_or("")
+    }
+
     #[test]
     fn plan_list_margins_a_dl_is_a_block_of_its_own() {
         // A `dl` ends the line in progress at its start and its end, as
@@ -7672,5 +7708,101 @@ mod batch_2114_tests {
         let items: String = (1..=10).map(|n| format!("<li>u{n}</li>")).collect();
         let d = doc(&format!("<ul style='font-size:12pt'>{items}</ul>"));
         assert_eq!(para_of(&d, "u10").props.first_line, -330);
+    }
+
+    const WRAP: &str = "<div style='width:600px;margin:0 auto'>";
+
+    #[test]
+    fn plan_2_a_full_width_table_fills_its_centred_wrapper() {
+        for table in [
+            "<table width='100%'>",
+            "<table width='100%' align='right'>",
+            "<table>",
+        ] {
+            let d = doc(&format!("{WRAP}{table}<tr><td>x</td></tr></table></div>"));
+            let t = tables(&d)[0];
+            assert_eq!(t.grid.iter().sum::<u32>(), 9000, "{table}");
+            assert!(tblpr(t).contains("<w:jc w:val=\"center\"/>"), "{table}");
+            assert!(!tblpr(t).contains("w:tblInd"), "{table}");
+        }
+        let d = doc(&format!(
+            "{WRAP}<table width='100%'><tr><td>x</td></tr></table></div>"
+        ));
+        let pr = tblpr(tables(&d)[0]);
+        assert!(pr.contains("<w:tblW w:w=\"9000\" w:type=\"dxa\"/>"), "{pr}");
+    }
+
+    #[test]
+    fn plan_2_a_narrower_table_sits_where_the_wrapper_puts_it() {
+        let ind = |table: &str| {
+            let d = doc(&format!("{WRAP}{table}<tr><td>x</td></tr></table></div>"));
+            let t = tables(&d)[0];
+            assert_eq!(t.grid.iter().sum::<u32>(), 4500, "{table}");
+            let pr = tblpr(t).to_string();
+            (pr.contains("<w:jc "), pr)
+        };
+        // Word measures the indent to the first cell's text (no
+        // compatibilityMode): its left cell margin is added.
+        let (jc, pr) = ind("<table width='300'>");
+        assert!(
+            !jc && pr.contains("<w:tblInd w:w=\"1503\" w:type=\"dxa\"/>"),
+            "{pr}"
+        );
+        let (jc, pr) = ind("<table width='300' align='right'>");
+        assert!(!jc, "{pr}");
+        assert!(
+            pr.contains(&format!("<w:tblInd w:w=\"{}\"", 1395 + 4500 + 108)),
+            "{pr}"
+        );
+        let (jc, pr) = ind("<table width='300' cellpadding='0'>");
+        assert!(!jc && pr.contains("<w:tblInd w:w=\"1395\""), "{pr}");
+        let (_, pr) = ind("<table width='300' style='margin:0 auto'>");
+        assert!(
+            pr.contains("<w:jc w:val=\"center\"/>") && !pr.contains("w:tblInd"),
+            "{pr}"
+        );
+    }
+
+    #[test]
+    fn plan_2_an_off_centre_wrapper_gets_an_indent() {
+        let d = doc(&format!(
+            "<div style='margin-left:40px'>{WRAP}<table width='100%'><tr><td>x</td></tr></table></div></div>"
+        ));
+        let t = tables(&d)[0];
+        let pr = tblpr(t);
+        // The wrapper is centred in what the div leaves: 600 + (11190 - 9000) / 2.
+        assert_eq!(t.grid.iter().sum::<u32>(), 9000);
+        assert!(!pr.contains("<w:jc "), "{pr}");
+        assert!(
+            pr.contains(&format!("<w:tblInd w:w=\"{}\"", 600 + 1095 + 108)),
+            "{pr}"
+        );
+    }
+
+    #[test]
+    fn plan_2_other_tables_are_unchanged() {
+        for page in [
+            "<table width='100%'><tr><td>x</td></tr></table>",
+            "<div><table width='100%'><tr><td>x</td></tr></table></div>",
+            "<div style='margin-left:40px'><table width='100%'><tr><td>x</td></tr></table></div>",
+        ] {
+            let d = doc(page);
+            let t = tables(&d)[0];
+            assert_eq!(t.grid.iter().sum::<u32>(), 11790, "{page}");
+            assert!(!tblpr(t).contains("<w:jc "), "{page}");
+            assert!(!tblpr(t).contains("w:tblInd"), "{page}");
+            assert!(tblpr(t).contains("w:type=\"pct\""), "{page}");
+        }
+        // In a cell, a nested table takes its cell's width as before.
+        let d = doc(&format!(
+            "<table width='600'><tr><td>{WRAP}<table width='100%'><tr><td>x</td></tr></table></div></td></tr></table>"
+        ));
+        let outer = tables(&d)[0];
+        let DocBlock::Table(inner) = &outer.rows[0].cells[0].blocks[0] else {
+            panic!("no nested table");
+        };
+        assert_eq!(inner.grid.iter().sum::<u32>(), 9000);
+        assert!(tblpr(inner).contains("w:type=\"pct\""));
+        assert!(!tblpr(inner).contains("w:tblInd"));
     }
 }

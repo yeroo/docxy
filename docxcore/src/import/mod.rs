@@ -963,7 +963,8 @@ impl<'b> Builder<'b> {
 
     /// The end of HTML table `t`: what is pending is its last cell and row;
     /// nested, it waits in its enclosing cell as a [`html_table::RawTable`]
-    /// at a placeholder; outermost, it is laid out in the body's width.
+    /// at a placeholder; outermost, it is laid out in the body's width, or
+    /// in the room of the centred block it is in (#2114).
     fn end_html_table(&mut self, mut t: TableAcc, mut h: HtmlAcc) {
         if !t.blocks.is_empty() || h.cell.is_some() {
             let cell = html_table::RawCell {

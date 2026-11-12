@@ -88,9 +88,26 @@ pub(crate) struct TableSpec {
     /// `w:jc`, `center` or `right`; `None` is the left default (#1922):
     /// a float `align=right` (`align=left` is none), else the table's auto
     /// side margins (`<table align=center>` is that hint), else its
-    /// container's `-webkit-` alignment.
+    /// container's `-webkit-` alignment. With a [`Room`], its place in
+    /// the room, settled once it is laid out ([`layout`]).
     pub jc: Option<&'static str>,
+    /// An outermost table in a centred fixed-width block (#2114): the room
+    /// it is laid out in, instead of the body.
+    pub room: Option<Room>,
 }
+
+/// The content box of the centred fixed-width block an outermost table is
+/// in (#2114, #1930 plan-2), in twips from the body's left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Room {
+    pub indent: u32,
+    pub width: u32,
+    /// The room is centred in the body (equal indents on both sides).
+    pub centred: bool,
+}
+
+/// Word's left cell margin when a table names none (Normal Table's 0.075").
+const WORD_CELL_MARGIN: u32 = 108;
 
 /// What a `<td>` / `<th>` says about itself, its row and its table.
 #[derive(Clone, Debug, PartialEq)]
@@ -188,8 +205,15 @@ enum Slot {
 
 /// Lay `t` out in `avail` twips, its nested tables in their cells' widths.
 pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
-    let avail = avail.clamp(MIN_COL, MAX_TWIPS);
-    let RawTable { spec, rows, groups } = t;
+    let RawTable {
+        mut spec,
+        rows,
+        groups,
+    } = t;
+    let avail = spec
+        .room
+        .map_or(avail, |r| r.width)
+        .clamp(MIN_COL, MAX_TWIPS);
     let nrows = rows.len();
     let (placed, slots) = place(rows, nrows, &groups);
     let ncols = slots
@@ -289,12 +313,46 @@ pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
         out_rows.push(row);
     }
 
+    let indent = spec
+        .room
+        .and_then(|room| place_in_room(&mut spec, room, &grid, avail));
     Table {
         grid,
         rows: out_rows,
-        raw_tblpr: Some(tblpr(&spec)),
+        raw_tblpr: Some(tblpr(&spec, indent)),
         ..Table::default()
     }
+}
+
+/// Place a table laid out in `room` (#2114, #1930 plan-2) on the body: its
+/// percentage width as the twips it is in the room (Word resolves `pct`
+/// against the body and would stretch it back), and `jc center` when it
+/// fills the room or is centred in it and the room is centred in the body
+/// (its own `align` then moves nothing). Otherwise no `jc` and the
+/// `w:tblInd` (returned) that puts its left edge where the browser does:
+/// at the room's left, right or middle. A package with no
+/// `compatibilityMode` (the Markdown one) is laid out by Word in an older
+/// mode, where `tblInd` is measured to the first cell's text: its left
+/// cell margin is added.
+fn place_in_room(spec: &mut TableSpec, room: Room, grid: &[u32], avail: u32) -> Option<u32> {
+    if let Some(w @ Width::Pct(_)) = spec.width {
+        spec.width = Some(Width::Twips(resolve(w, avail)));
+    }
+    let width: u32 = grid.iter().fold(0u32, |a, &w| a.saturating_add(w));
+    let place = spec.jc.take();
+    if room.centred && (width >= room.width || place == Some("center")) {
+        spec.jc = Some("center");
+        return None;
+    }
+    let free = room.width.saturating_sub(width);
+    let offset = room.indent
+        + match place {
+            Some("center") => free / 2,
+            Some("right") => free,
+            _ => 0,
+        };
+    let cell_margin = spec.cellpadding.map_or(WORD_CELL_MARGIN, px_twips);
+    Some(offset.saturating_add(cell_margin).min(MAX_TWIPS))
 }
 
 /// Place every cell in the first free slot of its row from the last one
@@ -552,8 +610,8 @@ fn margins(sides: &[(&str, Option<i32>)]) -> String {
 }
 
 /// `w:tblPr`, its children in schema order: tblW, jc, tblCellSpacing,
-/// tblBorders, tblCellMar.
-fn tblpr(spec: &TableSpec) -> String {
+/// tblInd (`indent`), tblBorders, tblCellMar.
+fn tblpr(spec: &TableSpec, indent: Option<u32>) -> String {
     let mut s = String::from("<w:tblPr>");
     match spec.width {
         Some(Width::Twips(t)) => s.push_str(&format!(
@@ -576,6 +634,9 @@ fn tblpr(spec: &TableSpec) -> String {
             "<w:tblCellSpacing w:w=\"{}\" w:type=\"dxa\"/>",
             px_twips(n) / 2
         ));
+    }
+    if let Some(ind) = indent {
+        s.push_str(&format!("<w:tblInd w:w=\"{ind}\" w:type=\"dxa\"/>"));
     }
     if spec.border > 0 {
         let sz = (u64::from(spec.border) * 6).clamp(2, 96);
@@ -835,6 +896,57 @@ mod tests {
         );
     }
 
+    /// A table in a centred block's room (#2114): laid out in the room, a
+    /// narrower one placed by `w:tblInd` after `tblCellSpacing` and before
+    /// `tblBorders`, a full one centred.
+    #[test]
+    fn a_table_in_a_room_is_laid_out_and_placed_there() {
+        let room = Room {
+            indent: 1395,
+            width: 9000,
+            centred: true,
+        };
+        let table = |width, jc| {
+            layout(
+                RawTable {
+                    spec: TableSpec {
+                        width: Some(width),
+                        border: 1,
+                        cellpadding: Some(0),
+                        cellspacing: Some(4),
+                        jc,
+                        room: Some(room),
+                    },
+                    rows: vec![vec![text_cell("a", spec(1, 1))]],
+                    groups: Vec::new(),
+                },
+                BODY_TWIPS,
+                &Budget::standard(),
+            )
+        };
+        let t = table(Width::Twips(4500), Some("right"));
+        assert_eq!(t.grid, [4500]);
+        let pr = t.raw_tblpr.unwrap();
+        assert!(
+            pr.starts_with(
+                "<w:tblPr><w:tblW w:w=\"4500\" w:type=\"dxa\"/>\
+                 <w:tblCellSpacing w:w=\"30\" w:type=\"dxa\"/>\
+                 <w:tblInd w:w=\"5895\" w:type=\"dxa\"/><w:tblBorders>"
+            ),
+            "{pr}"
+        );
+        let t = table(Width::Pct(100.0), None);
+        assert_eq!(t.grid, [9000]);
+        let pr = t.raw_tblpr.unwrap();
+        assert!(
+            pr.starts_with(
+                "<w:tblPr><w:tblW w:w=\"9000\" w:type=\"dxa\"/><w:jc w:val=\"center\"/>"
+            ),
+            "{pr}"
+        );
+        assert!(!pr.contains("tblInd"), "{pr}");
+    }
+
     #[test]
     fn table_and_cell_properties_are_written_in_schema_order() {
         let t = layout(
@@ -845,6 +957,7 @@ mod tests {
                     cellpadding: Some(0),
                     cellspacing: Some(4),
                     jc: Some("center"),
+                    room: None,
                 },
                 rows: vec![vec![text_cell(
                     "a",
