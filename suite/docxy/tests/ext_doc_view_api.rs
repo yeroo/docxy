@@ -11,7 +11,7 @@ use docxcore::model::Align;
 use docxcore::model::Document;
 use docxcore::package::Package;
 use docxy_suite::ext::{
-    self, CaretFormat, DocFormat, DocLink, DocView, Extensions, LinkClick, TabSurface,
+    self, CaretFormat, DocFormat, DocLink, DocView, Extensions, LinkClick, LinkHover, TabSurface,
 };
 use gpui::{
     AnyView, App, AppContext as _, Edges, Entity, FocusHandle, Hsla, Pixels, Window, px, rgb,
@@ -48,6 +48,15 @@ fn embed(doc: Document, pkg: Package, cx: &mut App) -> Reader {
         let followed = followed.clone();
         v.on_link(move |url: &str, _window: &mut Window, _cx: &mut App| {
             followed.borrow_mut().push(url.to_string())
+        });
+        // The link under the pointer and a followed link's text (#1916).
+        v.on_link_hover(
+            |link: Option<&LinkHover>, _window: &mut Window, _cx: &mut App| {
+                let _shown: Option<(&str, &str)> = link.map(|l| (l.url.as_str(), l.text.as_str()));
+            },
+        );
+        v.on_link_with_text(|link: &LinkHover, _window: &mut Window, _cx: &mut App| {
+            let _warn: bool = link.text != link.url;
         });
         v.set_link_click(LinkClick::Click, cx);
         v.set_link_click(LinkClick::CtrlClick, cx);

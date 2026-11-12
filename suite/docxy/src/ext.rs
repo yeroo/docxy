@@ -31,7 +31,9 @@ use std::sync::Arc;
 /// Find (#1887) and hyperlinks handed to the extension; read-only unless made
 /// editable ([`DocView::set_editable`], #1947), when it types and edits and
 /// takes the host ribbon's [`DocFormat`] commands. See [`DocView::new`].
-pub use crate::doc_view::{CaretFormat, DocFormat, DocLayout, DocLink, DocView, LinkClick};
+pub use crate::doc_view::{
+    CaretFormat, DocFormat, DocLayout, DocLink, DocView, LinkClick, LinkHover,
+};
 
 actions!(
     docxy_ext,

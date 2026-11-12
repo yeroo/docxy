@@ -60,6 +60,11 @@ pub(crate) struct FixtureView {
     pub(crate) link_calls: Rc<RefCell<Vec<String>>>,
     /// How many change events the view sent (#1947).
     pub(crate) change_calls: Rc<Cell<usize>>,
+    /// Each link-under-the-pointer report, in order: `None` off every link
+    /// (#1916).
+    pub(crate) hover_calls: Rc<RefCell<Vec<Option<ext::LinkHover>>>>,
+    /// Each followed link with its text, from `on_link_with_text` (#1916).
+    pub(crate) link_texts: Rc<RefCell<Vec<ext::LinkHover>>>,
     /// The header line's own focus, as a host's chrome beside the view may
     /// have (a press on it takes the keys from the view, #2003).
     header_focus: FocusHandle,
@@ -390,17 +395,25 @@ pub(crate) fn factory(ribbon: bool) -> ext::Factory {
         let (doc, pkg) = fixture_document();
         let calls: Rc<RefCell<Vec<String>>> = Rc::default();
         let changes: Rc<Cell<usize>> = Rc::default();
+        let hovers: Rc<RefCell<Vec<Option<ext::LinkHover>>>> = Rc::default();
+        let texts: Rc<RefCell<Vec<ext::LinkHover>>> = Rc::default();
         let view = cx.new(|cx| DocView::new(doc, Some(pkg), cx));
         view.update(cx, |v, _| {
             let calls = calls.clone();
             v.on_link(move |url, _window, _cx| calls.borrow_mut().push(url.to_string()));
             let changes = changes.clone();
             v.on_change(move |_cx| changes.set(changes.get() + 1));
+            let hovers = hovers.clone();
+            v.on_link_hover(move |link, _window, _cx| hovers.borrow_mut().push(link.cloned()));
+            let texts = texts.clone();
+            v.on_link_with_text(move |link, _window, _cx| texts.borrow_mut().push(link.clone()));
         });
         let root = cx.new(|cx| FixtureView {
             doc: view,
             link_calls: calls,
             change_calls: changes,
+            hover_calls: hovers,
+            link_texts: texts,
             header_focus: cx.focus_handle(),
             ribbon: ribbon.then(Rc::default),
             themes: Rc::default(),
