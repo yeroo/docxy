@@ -331,10 +331,22 @@ struct Block {
     /// continuations. Per item, so a nested list's items leave their
     /// parent's alone.
     item_numbered: bool,
+    /// On an `li`'s own entry and below it (#2114): the item's number in
+    /// its own list as a browser counts it (each list from 1), what its
+    /// hang is as wide as.
+    item_ordinal: u32,
     /// On an `li`'s own entry (FIX r2 m1): the empty paragraph that holds
     /// the item's number until one with a line takes it, as its flow's
     /// `table_depth` and index there.
     item_held: Option<(usize, usize)>,
+}
+
+/// An open `ul` / `ol` / `dir` / `menu`.
+#[derive(Clone, Copy, Debug, Default)]
+struct OpenList {
+    ordered: bool,
+    /// The `li`s opened in it so far (#2114).
+    items: u32,
 }
 
 /// How an element takes part in the page, for its look.
@@ -438,6 +450,9 @@ struct Look {
     /// Inside a table cell (inherited): a fixed-width block's centring
     /// needs the body width, unknown there (#1922).
     in_cell: bool,
+    /// Inside a fixed-width block centred in the body (inherited, #2114):
+    /// an outermost table is laid out in the room its indents leave.
+    centred_box: bool,
     line: Option<Line>,
     line_exact: bool,
     /// `text-indent`, in twips (inherited).
@@ -447,19 +462,23 @@ struct Look {
     indent_right: i32,
     /// Paragraph shading (`RRGGBB`) of the nearest shaded block.
     shade: Option<String>,
-    /// The element's own bottom box, in twips (not inherited); its top is
-    /// `margin_before` and `pad_before`, which collapse apart.
-    after: Option<i32>,
-    /// What of `before` and `after` is the user agent's margin, in twips
+    /// Inside a list (inherited, #2114): a list in it is nested, with no
+    /// user-agent vertical margins (a browser's
+    /// `:is(dir,dl,menu,ol,ul) :is(dir,dl,menu,ol,ul)`, across tables too).
+    in_list: bool,
+    /// What of its top and bottom margins is the user agent's, in twips
     /// (not inherited, #1979): what quirks mode drops at a body's or
     /// cell's edge.
     ua_before: i32,
     ua_after: i32,
-    /// The margin and top padding parts of `before` / `after`, in twips,
-    /// signed (not inherited, #1979): only margins collapse.
+    /// A block's or list's own vertical box, in twips, signed (not
+    /// inherited, #1979, #2114): only margins collapse, padding separates.
+    /// The top goes to the first paragraph ended in it, the bottom to the
+    /// last ([`Html::top_spacing`], [`Html::apply_bottom`]).
     margin_before: i32,
     margin_after: i32,
     pad_before: i32,
+    pad_after: i32,
     /// A cell's or table part's own background (`RRGGBB`, not inherited):
     /// the cell shading (#1878).
     own_fill: Option<String>,
@@ -508,6 +527,14 @@ struct Elem {
     /// Whether it may be, is, or was a card (#1927): `Yes` while its
     /// table is open in the builder, ended once by [`Html::end_cards_from`].
     card: CardMode,
+    /// A block or list (#2114): its flow's `table_depth` and how many blocks
+    /// that flow held when it opened, the paragraph in progress ended.
+    /// While the flow still holds that many, nothing has ended in it yet,
+    /// so its top goes to the next paragraph; one ended at an index past
+    /// it is inside it, so its bottom goes to the last such. `None` once
+    /// its bottom is applied at the end of that flow (not of another,
+    /// such as a card's inside it).
+    flow_at: Option<(usize, usize)>,
 }
 
 /// Whether an element may be a card (#1927), decided once, when it opens.
@@ -689,6 +716,16 @@ const ZERO_IND: &str = "<w:ind w:left=\"0\" w:hanging=\"0\"/>";
 /// hanging indent.
 const DECIMAL_HANG: f64 = 1.1125;
 const BULLET_HANG: f64 = 1.375;
+/// What each digit past the first adds to [`DECIMAL_HANG`] (#2114):
+/// Chrome right-aligns a wider number in its marker box, `"10. "` 1.668 em.
+const DIGIT_HANG: f64 = 0.5555;
+
+/// The hang of a numbered HTML item numbered `n`, in em (#2114): wide
+/// enough for its own number, so 10 and up do not tab past the text.
+fn decimal_hang(n: u32) -> f64 {
+    let digits = n.max(1).ilog10() + 1;
+    DECIMAL_HANG + f64::from(digits - 1) * DIGIT_HANG
+}
 
 /// The paragraph-mark `w:rPr` of a run's look (#1979): its font, size,
 /// colour, bold and italic, what Word and LibreOffice draw a list marker
@@ -706,17 +743,24 @@ fn mark_rpr(run: &RunProps) -> Option<String> {
     (mark != RunProps::default()).then(|| crate::serialize::rpr_xml(&mark))
 }
 
-/// A paragraph's user-agent margins, and whether its block sits straight
-/// in the body or a cell, where quirks mode drops them at the edge (#1979).
-#[derive(Clone, Copy, Default)]
-struct Edges {
-    ua_before: i32,
-    ua_after: i32,
-    /// Its top margin and padding, its bottom margin (signed twips).
-    margin_before: i32,
-    pad_before: i32,
-    margin_after: i32,
-    straight: bool,
+/// A bottom box folded onto a paragraph's [`FlowTail`] (#2114): padding
+/// closes the margin group open below it (its margins already paid) and
+/// starts a new one; with none, a positive margin collapses into the open
+/// group, adding only what it exceeds it by. A negative margin is summed.
+fn fold_bottom(after: i32, open: i32, margin: i32, pad: i32) -> (i32, i32) {
+    let (mut after, mut open) = (i64::from(after), i64::from(open));
+    let margin = i64::from(margin);
+    if pad != 0 {
+        after += i64::from(pad);
+        open = 0;
+    }
+    if margin > 0 {
+        after += (margin - open).max(0);
+        open = open.max(margin);
+    } else {
+        after += margin;
+    }
+    (clamp_twips(after), clamp_twips(open))
 }
 
 /// Whether a `text-align` value is a vendor one (`-webkit-center`,
@@ -860,18 +904,35 @@ fn table_spec(attrs: &Attrs, look: &Look) -> TableSpec {
                 _ => None,
             },
         },
+        // In a centred fixed-width block, outside any cell (#2114): the
+        // room left between its indents.
+        room: (look.centred_box && !look.in_cell).then(|| {
+            let body = html_table::BODY_TWIPS;
+            let indent = u32::try_from(look.indent.max(0)).unwrap_or(0).min(body);
+            let right = u32::try_from(look.indent_right.max(0))
+                .unwrap_or(0)
+                .min(body);
+            html_table::Room {
+                indent,
+                width: body
+                    .saturating_sub(indent)
+                    .saturating_sub(right)
+                    .clamp(html_table::MIN_COL, body),
+                centred: indent == right,
+            }
+        }),
     }
 }
 
 impl Cascade {
     fn new(parent: Option<&Look>, kind: Kind, card: CardMode) -> Self {
         let mut look = parent.cloned().unwrap_or_default();
-        look.after = None;
         look.ua_before = 0;
         look.ua_after = 0;
         look.margin_before = 0;
         look.margin_after = 0;
         look.pad_before = 0;
+        look.pad_after = 0;
         look.own_fill = None;
         look.own_width = None;
         look.own_height = None;
@@ -974,9 +1035,11 @@ impl Cascade {
         }
         // The user agent's vertical margins (#1979), as a browser's sheet:
         // `p`, `blockquote` and `pre` 1em, a heading its own in its own
-        // font size; every other block (`div`, `li`) none.
+        // font size, a list 1em unless nested in another (#2114); every
+        // other block (`div`, `li`) none.
         let (margin, font) = match tag {
             "p" | "blockquote" | "pre" => (1.0, 1.0),
+            "ul" | "ol" | "dir" | "menu" | "dl" if !self.look.in_list => (1.0, 1.0),
             "h1" => (0.67, 2.0),
             "h2" => (0.83, 1.5),
             "h3" => (1.0, 1.17),
@@ -1300,6 +1363,37 @@ impl Cascade {
         }
     }
 
+    /// A block's or list's top and bottom box (#1979, #2114): the user
+    /// agent's margin where a side is not declared, in the element's own
+    /// font size or a heading's user-agent one, and the margins and
+    /// paddings in twips.
+    fn vertical_box(&mut self, pt: f64) {
+        if let Some(em) = self.ua_vmargin {
+            let font = if self.own_size {
+                pt
+            } else {
+                self.parent_pt * self.ua_font
+            };
+            let ua = Len {
+                v: em * font,
+                unit: css::Unit::Pt,
+            };
+            for side in [0, 2] {
+                if !self.margin_declared[side] {
+                    self.margin[side] = Some(ua);
+                }
+            }
+            let twips = ua.twips(pt).unwrap_or(0).max(0);
+            self.look.ua_before = if self.margin_declared[0] { 0 } else { twips };
+            self.look.ua_after = if self.margin_declared[2] { 0 } else { twips };
+        }
+        let tw = |l: Option<Len>| l.and_then(|l| l.twips(pt)).unwrap_or(0);
+        self.look.margin_before = tw(self.margin[0]);
+        self.look.margin_after = tw(self.margin[2]);
+        self.look.pad_before = tw(self.padding[0]);
+        self.look.pad_after = tw(self.padding[2]);
+    }
+
     /// The look, the lengths resolved against the element's own font size.
     fn finish(mut self) -> Look {
         let pt = font_pt(&self.look.run);
@@ -1311,6 +1405,9 @@ impl Cascade {
                 }
                 CardMode::No | CardMode::Declined => false,
             };
+        if (self.kind == Kind::Block && !card) || self.kind == Kind::List {
+            self.vertical_box(pt);
+        }
         let look = &mut self.look;
         if card {
             // A card is a cell (#1927): a fresh block look, as a `td`
@@ -1358,33 +1455,6 @@ impl Cascade {
                 look.own_place = block_position(self.margin_auto, self.parent_block_align);
             }
             Kind::Block => {
-                // The user agent's top and bottom margin where none is
-                // declared (#1979), in the element's own font size, or a
-                // heading's user-agent one.
-                if let Some(em) = self.ua_vmargin {
-                    let font = if self.own_size {
-                        pt
-                    } else {
-                        self.parent_pt * self.ua_font
-                    };
-                    let ua = Len {
-                        v: em * font,
-                        unit: css::Unit::Pt,
-                    };
-                    for side in [0, 2] {
-                        if !self.margin_declared[side] {
-                            self.margin[side] = Some(ua);
-                        }
-                    }
-                    let twips = ua.twips(pt).unwrap_or(0).max(0);
-                    look.ua_before = if self.margin_declared[0] { 0 } else { twips };
-                    look.ua_after = if self.margin_declared[2] { 0 } else { twips };
-                }
-                look.margin_before = tw(self.margin[0]).unwrap_or(0);
-                look.margin_after = tw(self.margin[2]).unwrap_or(0);
-                look.pad_before = tw(self.padding[0]).unwrap_or(0);
-                // Spacing is unsigned (ST_TwipsMeasure): a negative margin is 0.
-                look.after = sum(self.margin[2], self.padding[2]).map(|t| t.max(0));
                 if let Some(l) = sum(self.margin[3], self.padding[3]) {
                     look.indent = clamp_twips(i64::from(look.indent) + i64::from(l));
                 }
@@ -1408,6 +1478,7 @@ impl Cascade {
                         let extra = (room / 2).max(0);
                         look.indent = clamp_twips(i64::from(look.indent) + extra);
                         look.indent_right = clamp_twips(i64::from(look.indent_right) + extra);
+                        look.centred_box = true;
                     }
                 }
                 if let Some(fill) = self.background {
@@ -1432,6 +1503,7 @@ impl Cascade {
                 }
             }
             Kind::List => {
+                look.in_list = true;
                 // Its left and right box indent its items (#1979: the user
                 // agent's 40 px left padding).
                 if let Some(l) = sum(self.margin[3], self.padding[3]) {
@@ -1678,8 +1750,8 @@ struct Html<'a> {
     /// Every open element (but void and skipped ones) and its look.
     elems: Vec<Elem>,
     blocks: Vec<(String, Block)>,
-    /// Open `ul` / `ol`: whether each is ordered.
-    lists: Vec<bool>,
+    /// Open `ul` / `ol` / `dir` / `menu`.
+    lists: Vec<OpenList>,
     table_depth: usize,
     /// Open `pre` elements on `blocks`.
     pre: usize,
@@ -1981,9 +2053,13 @@ impl<'a> Html<'a> {
                     block.mso_list = false;
                     block.item_numbered = false;
                     block.item_held = None;
-                    let numbered = self.lists.last().copied().unwrap_or(false);
+                    let numbered = self.lists.last().is_some_and(|l| l.ordered);
                     let level = self.lists.len().saturating_sub(1) as i32;
                     block.item = Some((numbered, level));
+                    block.item_ordinal = self.lists.last_mut().map_or(1, |l| {
+                        l.items = l.items.saturating_add(1);
+                        l.items
+                    });
                 }
                 if name == "td" || name == "th" {
                     // A cell starts with nothing structural inherited from
@@ -2000,9 +2076,15 @@ impl<'a> Html<'a> {
             "ul" | "ol" | "dir" | "menu" => {
                 self.end_para_if_any();
                 if self.lists.len() < MAX_DEPTH {
-                    self.lists.push(name == "ol");
+                    self.lists.push(OpenList {
+                        ordered: name == "ol",
+                        items: 0,
+                    });
                 }
             }
+            // A `dl` is a block too (#2114): the line in progress ends at
+            // its start, so its box goes to the paragraphs inside it.
+            "dl" => self.end_para_if_any(),
             "table" => {
                 self.end_para_if_any();
                 self.table_depth += 1;
@@ -2039,6 +2121,12 @@ impl<'a> Html<'a> {
                 CardMode::Maybe => CardMode::Declined,
                 m => m,
             };
+            // The paragraph in progress has ended above (every block and
+            // list ends it): where its flow is now.
+            let flow_at = matches!(kind, Kind::Block | Kind::List)
+                .then(|| self.out.flow_len(self.table_depth > 0))
+                .flatten()
+                .map(|n| (self.table_depth, n));
             self.elems.push(Elem {
                 key,
                 kind,
@@ -2047,6 +2135,7 @@ impl<'a> Html<'a> {
                 blocks_at,
                 lists_at,
                 card,
+                flow_at,
             });
             if matches!(card, CardMode::Yes(_)) {
                 self.begin_card();
@@ -2171,6 +2260,14 @@ impl<'a> Html<'a> {
         // `implicit_close` cuts them after this, `close_elem` has already
         // ended its own (before its cut), so here it finds none.
         self.end_cards_from(i);
+        // The blocks and lists closing give their bottoms to the last
+        // paragraph ended in them, innermost first (#2114), while their
+        // stack is whole.
+        if self.budget.work((self.elems.len() - i) / 16 + 1) {
+            for j in (i..self.elems.len()).rev() {
+                self.apply_bottom(j);
+            }
+        }
         let mut reopen: Vec<Elem> = Vec::new();
         if !self.elems[i].kind.table() {
             let s = self.s;
@@ -2204,6 +2301,7 @@ impl<'a> Html<'a> {
                         blocks_at: 0,
                         lists_at: 0,
                         card: CardMode::No,
+                        flow_at: None,
                     });
                 }
             }
@@ -2372,7 +2470,7 @@ impl<'a> Html<'a> {
                     self.table_closed();
                 }
             }
-            "ul" | "ol" | "dir" | "menu" => {
+            "ul" | "ol" | "dir" | "menu" | "dl" => {
                 // `close_elem` cuts `lists` and `blocks` back to where the
                 // list element opened: an `li` left open in it ends, and so
                 // does a list opened in it and left open (`</ol>` over an
@@ -2487,6 +2585,7 @@ impl<'a> Html<'a> {
             border: 0,
             cellpadding: Some(0),
             cellspacing: None,
+            room: None,
             jc: match look.own_place {
                 Some(Align::Center) => Some("center"),
                 Some(Align::Right) => Some("right"),
@@ -2804,25 +2903,142 @@ impl<'a> Html<'a> {
             .find(|e| e.key.tag == "li")
     }
 
-    /// The paragraph's user-agent margins and whether quirks mode may drop
-    /// them (#1979): its block sits straight in the body or a cell.
-    fn para_edges(&self) -> Edges {
-        let Some(i) = self.para_elem() else {
-            return Edges::default();
-        };
-        let e = &self.elems[i];
-        let straight = e.kind == Kind::Block
-            && self.elems[..i]
-                .last()
-                .is_none_or(|p| matches!(p.key.tag.as_str(), "html" | "body" | "td" | "th"));
-        Edges {
-            ua_before: e.look.ua_before,
-            ua_after: e.look.ua_after,
-            margin_before: e.look.margin_before,
-            pad_before: e.look.pad_before,
-            margin_after: e.look.margin_after,
-            straight,
+    /// Whether the elements below `elems[i]` reach a quirky container (the
+    /// body, or a `td` / `th`, not a card) with no bottom padding between
+    /// (#1979, #2114 r2 m3): in quirks mode a block's user-agent bottom is
+    /// then dropped if its paragraph ends that flow, as Chrome drops it at
+    /// a cell's end through a `div` too.
+    fn bottom_unseparated(&self, i: usize, in_table: bool) -> bool {
+        if !self.budget.work(i / 16 + 1) {
+            return false;
         }
+        for e in self.elems[..i].iter().rev() {
+            if matches!(e.card, CardMode::Yes(_)) {
+                return false;
+            }
+            if e.kind.table() {
+                return matches!(e.key.tag.as_str(), "td" | "th");
+            }
+            if matches!(e.kind, Kind::Block | Kind::List) && e.look.pad_after != 0 {
+                return false;
+            }
+        }
+        !in_table
+    }
+
+    /// Whether nothing has ended in `e`'s flow since it opened (#2114).
+    fn fresh(&self, e: &Elem) -> bool {
+        e.flow_at.is_some_and(|(depth, at)| {
+            depth == self.table_depth && self.out.flow_len(depth > 0) == Some(at)
+        })
+    }
+
+    /// The top spacing of a paragraph ended now (#1979, #2114). Every block
+    /// and list still fresh, from the innermost table, cell or card out
+    /// (inline elements, containers and the rest are see-through), gives
+    /// it its top box, folded outermost first onto the margin group open
+    /// at the bottom of the paragraph above in its flow ([`Builder::tail`]):
+    /// positive margins collapse (the largest counts, less what is already
+    /// paid), padding closes the group, negative margins are summed.
+    /// Freshness is monotonic (an element is stale once one inside it is),
+    /// so the walk stops at the first stale one.
+    ///
+    /// In quirks mode, at the start of the body or a cell (not a card), the
+    /// members drop their user-agent tops from the outermost in, up to and
+    /// including the first with top padding (#1979; #2114 r2 m2, measured
+    /// in Chrome: `<div dir=ltr><ol><li>` and `<td><div><p>` start at 0,
+    /// `<div style="padding-top:1px"><ol>` keeps the list's 1em).
+    fn top_spacing(&self, in_table: bool) -> i32 {
+        let mut chain = Vec::new();
+        // The walk reached the body (`Some(true)`), a cell or another
+        // boundary, or stopped at a stale member (`None`).
+        let mut quirky_container = None;
+        if self.budget.work(self.elems.len() / 16 + 1) {
+            quirky_container = Some(!in_table);
+            for (i, e) in self.elems.iter().enumerate().rev() {
+                if matches!(e.card, CardMode::Yes(_)) {
+                    quirky_container = Some(false);
+                    break;
+                }
+                if e.kind.table() {
+                    quirky_container = Some(matches!(e.key.tag.as_str(), "td" | "th"));
+                    break;
+                }
+                if matches!(e.kind, Kind::Block | Kind::List) {
+                    if !self.fresh(e) {
+                        quirky_container = None;
+                        break;
+                    }
+                    chain.push(i);
+                }
+            }
+        }
+        let mut dropping =
+            self.quirks && quirky_container == Some(true) && self.out.flow_is_empty(in_table);
+        let above = self.out.tail(in_table).map_or(0, |t| t.open.max(0));
+        let (mut group, mut paid) = (i64::from(above), i64::from(above));
+        let mut before = 0i64;
+        for &i in chain.iter().rev() {
+            let look = &self.elems[i].look;
+            let mut margin = i64::from(look.margin_before);
+            if dropping {
+                margin -= i64::from(look.ua_before);
+                // Its padding is inside its margin: the members within
+                // are no longer at the container's start.
+                dropping = look.pad_before == 0;
+            }
+            if margin > 0 {
+                group = group.max(margin);
+            } else {
+                before += margin;
+            }
+            if look.pad_before != 0 {
+                before += group - paid + i64::from(look.pad_before);
+                group = 0;
+                paid = 0;
+            }
+        }
+        before += group - paid;
+        clamp_twips(before).max(0)
+    }
+
+    /// `elems[j]`, a block or list closing or its flow ending, gives its
+    /// bottom box to the flow's last paragraph if that ended inside it
+    /// (#2114), collapsing as [`fold_bottom`] does. In quirks mode the fold
+    /// is kept twice: with and without the quirky user-agent bottoms, a
+    /// block's that no bottom padding separates from the body or its cell
+    /// ([`Self::bottom_unseparated`]); the paragraph takes the bare one if
+    /// it turns out its flow's last ([`Self::flow_end_props`]). A list's is
+    /// never quirky (#2114 r2 m3, measured in Chrome: `<td><ol><li>` keeps
+    /// the list's 1em below, `<td><div><p>` drops the p's).
+    fn apply_bottom(&mut self, j: usize) {
+        let e = &self.elems[j];
+        if !matches!(e.kind, Kind::Block | Kind::List) {
+            return;
+        }
+        let Some((depth, at)) = e.flow_at else {
+            return;
+        };
+        let in_table = depth > 0;
+        if depth != self.table_depth || self.out.flow_len(in_table).is_none_or(|n| n <= at) {
+            return;
+        }
+        let Some(tail) = self.out.tail(in_table) else {
+            return;
+        };
+        let (margin, pad, ua) = (e.look.margin_after, e.look.pad_after, e.look.ua_after);
+        let quirky =
+            self.quirks && ua > 0 && e.kind == Kind::Block && self.bottom_unseparated(j, in_table);
+        let (after, open) = fold_bottom(tail.after, tail.open, margin, pad);
+        let bare = match tail.bare {
+            Some((a, o)) => Some(fold_bottom(a, o, margin - if quirky { ua } else { 0 }, pad)),
+            None if quirky => Some(fold_bottom(tail.after, tail.open, margin - ua, pad)),
+            None => None,
+        };
+        if let Some(p) = self.out.flow_last_mut(in_table) {
+            p.spacing.after = Some(after.max(0));
+        }
+        self.out.set_tail(in_table, FlowTail { after, open, bare });
     }
 
     fn par_props(&self) -> ParProps {
@@ -2845,9 +3061,9 @@ impl<'a> Html<'a> {
             return p;
         };
         p.align = look.align.unwrap_or_default();
-        // `before` stays 0 here: `flow_spacing` sets it in the paragraph's
-        // flow.
-        p.spacing.after = Some(look.after.unwrap_or(0));
+        // `before` and `after` stay 0 here: the paragraph's flow sets them
+        // from the boxes it is the first and the last paragraph of
+        // ([`Self::top_spacing`], [`Self::apply_bottom`], #2114).
         match look.line {
             Some(Line::Auto(n)) => {
                 p.spacing.line = Some(n);
@@ -2869,7 +3085,13 @@ impl<'a> Html<'a> {
                     .item_elem()
                     .map_or(css::BASE_PT, |e| font_pt(&e.look.run))
                     * 20.0;
-                let hang = (em * if numbered { DECIMAL_HANG } else { BULLET_HANG }).round();
+                let hang = (em
+                    * if numbered {
+                        decimal_hang(block.item_ordinal)
+                    } else {
+                        BULLET_HANG
+                    })
+                .round();
                 p.first_line = -(hang.clamp(0.0, 31_680.0) as i32).min(p.indent);
             }
             _ => {
@@ -2912,6 +3134,7 @@ impl<'a> Html<'a> {
             .map(|(_, b)| b.clone())
             .unwrap_or_default();
         self.after_block_object = false;
+        self.out.drop_trailing_break();
         let mut props = self.par_props();
         if let Some(a) = align {
             props.align = a;
@@ -2967,14 +3190,9 @@ impl<'a> Html<'a> {
         if !self.out.has_object() && self.out.para_text().chars().all(|c| c.is_whitespace()) {
             self.out.clear_para();
         }
-        let edges = self.para_edges();
-        self.flow_spacing(&mut props, edges, in_table);
+        props.spacing.before = Some(self.top_spacing(in_table));
         self.out.end_para(props, in_table);
-        let tail = FlowTail {
-            margin_after: edges.margin_after,
-            quirk_bottom: self.quirk_bottom(edges),
-        };
-        self.out.set_tail(in_table, tail);
+        self.out.set_tail(in_table, FlowTail::default());
         if holds_number {
             let at = self.out.flow_len(in_table).and_then(|n| n.checked_sub(1));
             let depth = self.table_depth;
@@ -3018,64 +3236,50 @@ impl<'a> Html<'a> {
         }
     }
 
-    /// A paragraph's top spacing in its flow (#1979): in quirks mode a
-    /// block straight in the body or a cell loses its user-agent top margin
-    /// when nothing comes before it there, and its top collapses with the
-    /// bottom of the paragraph before it, as a browser's adjacent margins
-    /// do (Word and LibreOffice add the two).
-    ///
-    /// Only margins collapse (FIX r1 M1): the top is its padding plus what
-    /// of its margin the bottom margin above does not cover, that of the
-    /// flow's last paragraph ([`Builder::tail`], FIX r2 m5). A negative
-    /// margin is not collapsed, only summed with the padding.
-    fn flow_spacing(&self, p: &mut ParProps, edges: Edges, in_table: bool) {
-        let mut margin = i64::from(edges.margin_before);
-        if self.quirks && edges.straight && self.out.flow_is_empty(in_table) {
-            margin -= i64::from(edges.ua_before);
-        }
-        let above = self
-            .out
-            .tail(in_table)
-            .map_or(0, |t| i64::from(t.margin_after.max(0)));
-        let pad = i64::from(edges.pad_before);
-        let before = if margin > 0 {
-            pad + (margin - above).max(0)
-        } else {
-            pad + margin
-        };
-        p.spacing.before = Some(clamp_twips(before).max(0));
-    }
-
-    /// The user-agent bottom margin quirks mode drops from a paragraph of
-    /// these `edges` when it turns out to be its body's or cell's last.
-    fn quirk_bottom(&self, edges: Edges) -> Option<i32> {
-        (self.quirks && edges.straight && edges.ua_after > 0).then_some(edges.ua_after)
-    }
-
     /// A flow's end (a cell's, a card's, the page's, #1979): the text in
     /// progress is ended first, as any paragraph (FIX r1 m2: an item's
-    /// number); then the flow's last paragraph, in quirks mode, loses its
-    /// user-agent bottom margin in place. The properties returned are only
-    /// for the paragraph an empty cell still gets.
+    /// number); the blocks and lists still open in the flow give their
+    /// bottoms to its last paragraph, innermost first, once (#2114); then
+    /// that paragraph, in quirks mode, loses its user-agent bottom margin
+    /// in place. The properties returned are only for the paragraph an
+    /// empty cell still gets.
     fn flow_end_props(&mut self) -> ParProps {
         self.end_para_if_any();
         let in_table = self.table_depth > 0;
-        if let Some(tail) = self.out.tail(in_table) {
-            if let Some(ua) = tail.quirk_bottom {
-                if let Some(p) = self.out.flow_last_mut(in_table) {
-                    let after = p.spacing.after.unwrap_or(0);
-                    p.spacing.after = Some((after - ua).max(0));
+        if self.budget.work(self.elems.len() / 16 + 1) {
+            for j in (0..self.elems.len()).rev() {
+                let e = &self.elems[j];
+                if e.kind.table() || matches!(e.card, CardMode::Yes(_)) {
+                    break;
                 }
-                let tail = FlowTail {
-                    quirk_bottom: None,
-                    ..tail
-                };
-                self.out.set_tail(in_table, tail);
+                // Only this flow's own (r1 M1): a card has been declined
+                // before its flow ends, so the walk may pass it into the
+                // blocks of the flow around it, which stay as they are.
+                if e.flow_at
+                    .is_some_and(|(depth, _)| depth == self.table_depth)
+                {
+                    self.apply_bottom(j);
+                    self.elems[j].flow_at = None;
+                }
             }
         }
-        let edges = self.para_edges();
+        if let Some(tail) = self.out.tail(in_table) {
+            if let Some((after, open)) = tail.bare {
+                if let Some(p) = self.out.flow_last_mut(in_table) {
+                    p.spacing.after = Some(after.max(0));
+                }
+                self.out.set_tail(
+                    in_table,
+                    FlowTail {
+                        after,
+                        open,
+                        bare: None,
+                    },
+                );
+            }
+        }
         let mut props = self.par_props();
-        self.flow_spacing(&mut props, edges, in_table);
+        props.spacing.before = Some(self.top_spacing(in_table));
         props
     }
 }
@@ -7233,8 +7437,9 @@ mod outlook_tests {
         assert_eq!(gaps(&para_of(&d, "mid")), (Some(0), Some(240)));
         assert_eq!(gaps(&para_of(&d, "a")), (Some(0), Some(240)));
         assert_eq!(gaps(&para_of(&d, "b")), (Some(0), Some(0)));
-        // Not straight in the cell: the quirk is for its children only.
-        assert_eq!(gaps(&para_of(&d, "inner")), (Some(240), Some(240)));
+        // Through a `div` with no padding too (#2114 r2, measured in
+        // Chrome: `<td><div><p>` starts and ends at the cell's edges).
+        assert_eq!(gaps(&para_of(&d, "inner")), (Some(0), Some(0)));
         // A declared top stays; text after the block makes it no last.
         assert_eq!(gaps(&para_of(&d, "declared")), (Some(150), Some(240)));
         assert_eq!(gaps(&para_of(&d, "last")), (Some(240), Some(0)));
@@ -7497,5 +7702,471 @@ mod outlook_tests {
              <p>b</p></td></tr></table>",
         );
         assert_eq!(para_of(&d, "b").props.spacing.before, Some(240));
+    }
+}
+
+#[cfg(test)]
+mod batch_2114_tests {
+    //! #2114: a block's trailing `<br>`, hangs for numbers of 10 and up,
+    //! lists' own vertical margins, an enclosing block's margins collapsing
+    //! with its first and last child's, and a table in a centred
+    //! fixed-width wrapper, each laid out as a browser does.
+    use super::*;
+    use crate::model::{Block as DocBlock, Paragraph};
+
+    fn doc(html: &str) -> Document {
+        import_html(html.as_bytes()).unwrap()
+    }
+
+    /// The same page in standards mode.
+    fn standards(html: &str) -> Document {
+        doc(&format!("<!DOCTYPE html>{html}"))
+    }
+
+    fn all_paras(d: &Document) -> Vec<Paragraph> {
+        fn walk(blocks: &[DocBlock], out: &mut Vec<Paragraph>) {
+            for b in blocks {
+                match b {
+                    DocBlock::Paragraph(p) => out.push(p.clone()),
+                    DocBlock::Table(t) => {
+                        for c in t.rows.iter().flat_map(|r| &r.cells) {
+                            walk(&c.blocks, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&d.body, &mut out);
+        out
+    }
+
+    fn texts(d: &Document) -> Vec<String> {
+        all_paras(d).iter().map(|p| p.plain_text()).collect()
+    }
+
+    fn para_of(d: &Document, text: &str) -> Paragraph {
+        all_paras(d)
+            .into_iter()
+            .find(|p| p.plain_text() == text)
+            .unwrap_or_else(|| panic!("no paragraph is {text:?} in {:?}", texts(d)))
+    }
+
+    /// Before and after spacing.
+    fn gaps(d: &Document, text: &str) -> (Option<i32>, Option<i32>) {
+        let p = para_of(d, text);
+        (p.props.spacing.before, p.props.spacing.after)
+    }
+
+    /// The line breaks in a paragraph.
+    fn breaks(p: &Paragraph) -> usize {
+        p.content
+            .iter()
+            .filter(|i| matches!(i, Inline::Break(crate::model::BreakKind::Line, _)))
+            .count()
+    }
+
+    fn tables(d: &Document) -> Vec<&crate::model::Table> {
+        d.body
+            .iter()
+            .filter_map(|b| match b {
+                DocBlock::Table(t) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tblpr(t: &crate::model::Table) -> &str {
+        t.raw_tblpr.as_deref().unwrap_or("")
+    }
+
+    #[test]
+    fn plan_list_margins_a_dl_is_a_block_of_its_own() {
+        // A `dl` ends the line in progress at its start and its end, as
+        // any block does: three lines, not one.
+        let d = standards("a<dl>b</dl>c");
+        assert_eq!(texts(&d), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn plan_trailing_br_a_block_s_last_break_adds_no_line() {
+        for html in [
+            "<div>text<br></div>",
+            "<p>text<br>\n</p>",
+            "<div>text<br> </div>",
+            "<table><tr><td>text<br></td></tr></table>",
+            "<div><b>text<br></b></div>",
+        ] {
+            let d = doc(html);
+            assert_eq!(texts(&d), ["text"], "{html}");
+            assert_eq!(breaks(&para_of(&d, "text")), 0, "{html}");
+        }
+        // Two: one stays, an empty line after the text.
+        let d = doc("<div>a<br><br></div>");
+        assert_eq!(all_paras(&d).len(), 1);
+        assert_eq!(breaks(&all_paras(&d)[0]), 1);
+        // Alone, it is the block's one empty line, as before.
+        // (an empty paragraph: a break alone is white space, cleared).
+        let d = doc("<div><br></div><div>b</div>");
+        assert_eq!(texts(&d), ["", "b"]);
+        // Content after it keeps it.
+        let d = doc("<div>a<br>&nbsp;</div>");
+        assert_eq!(breaks(&all_paras(&d)[0]), 1);
+        // A block's start ends the line too.
+        let d = doc("<div>a<br><div>b</div></div>");
+        assert_eq!(texts(&d), ["a", "b"]);
+        // An item stays numbered.
+        let d = doc("<ol><li>a<br></li></ol>");
+        let a = para_of(&d, "a");
+        assert_eq!((a.props.num_id, breaks(&a)), (Some(2), 0));
+        // `pre`'s newline before its end is the same break.
+        let d = doc("<pre>a\n</pre>");
+        assert_eq!(texts(&d), ["a"]);
+    }
+
+    #[test]
+    fn plan_wide_hang_fits_the_item_s_own_number() {
+        let items: String = (1..=12).map(|n| format!("<li>i{n}</li>")).collect();
+        let d = doc(&format!("<ol style='font-size:12pt'>{items}</ol>"));
+        for n in 1..=9 {
+            assert_eq!(para_of(&d, &format!("i{n}")).props.first_line, -267, "{n}");
+        }
+        let two = -(240.0f64 * (1.1125 + 0.5555)).round() as i32;
+        assert_eq!(two, -400);
+        for n in 10..=12 {
+            assert_eq!(para_of(&d, &format!("i{n}")).props.first_line, two, "{n}");
+        }
+        let items: String = (1..=100).map(|n| format!("<li>i{n}</li>")).collect();
+        let d = doc(&format!("<ol style='font-size:12pt'>{items}</ol>"));
+        let three = -(240.0f64 * (1.1125 + 2.0 * 0.5555)).round() as i32;
+        assert_eq!(para_of(&d, "i100").props.first_line, three);
+        assert_eq!(para_of(&d, "i99").props.first_line, two);
+        // A nested list counts its own items.
+        let items: String = (1..=9).map(|n| format!("<li>i{n}</li>")).collect();
+        let d = doc(&format!(
+            "<ol style='font-size:12pt'>{items}<li>i10<ol><li>inner</li></ol></li><li>i11</li></ol>"
+        ));
+        assert_eq!(para_of(&d, "inner").props.first_line, -267);
+        assert_eq!(para_of(&d, "i11").props.first_line, two);
+        // Clamped to the indent; bullets unchanged.
+        let items: String = (1..=10).map(|n| format!("<li>i{n}</li>")).collect();
+        let d = doc(&format!(
+            "<ol style='font-size:12pt;padding-left:0'>{items}</ol>"
+        ));
+        assert_eq!(para_of(&d, "i10").props.first_line, 0);
+        let items: String = (1..=10).map(|n| format!("<li>u{n}</li>")).collect();
+        let d = doc(&format!("<ul style='font-size:12pt'>{items}</ul>"));
+        assert_eq!(para_of(&d, "u10").props.first_line, -330);
+    }
+
+    #[test]
+    fn plan_list_margins_an_outermost_list_has_1em() {
+        let d = standards("<div>a</div><ul><li>x</li><li>y</li></ul><div>b</div>");
+        assert_eq!(gaps(&d, "x"), (Some(240), Some(0)));
+        assert_eq!(gaps(&d, "y"), (Some(0), Some(240)));
+        assert_eq!(gaps(&d, "a"), (Some(0), Some(0)));
+        assert_eq!(gaps(&d, "b"), (Some(0), Some(0)));
+        // Collapsing with the paragraphs' own 1em.
+        let d = standards("<p>a</p><ol><li>x</li></ol><p>b</p>");
+        assert_eq!(gaps(&d, "a"), (Some(240), Some(240)));
+        assert_eq!(gaps(&d, "x"), (Some(0), Some(240)));
+        assert_eq!(gaps(&d, "b"), (Some(0), Some(240)));
+        // `dl` too, and its start ends the line in progress.
+        let d = standards("a<dl><dt>x</dt><dd>y</dd></dl>b");
+        assert_eq!(texts(&d), ["a", "x", "y", "b"]);
+        assert_eq!(gaps(&d, "a"), (Some(0), Some(0)));
+        assert_eq!(gaps(&d, "x"), (Some(240), Some(0)));
+        assert_eq!(gaps(&d, "y"), (Some(0), Some(240)));
+        assert_eq!(gaps(&d, "b"), (Some(0), Some(0)));
+    }
+
+    #[test]
+    fn plan_list_margins_a_nested_list_has_none() {
+        let d = standards("<ul><li>x<ul><li>y</li></ul>z</li></ul>");
+        assert_eq!(gaps(&d, "x"), (Some(240), Some(0)));
+        assert_eq!(gaps(&d, "y"), (Some(0), Some(0)));
+        assert_eq!(gaps(&d, "z"), (Some(0), Some(240)));
+        // Text after the nested list in the outer item keeps the outer
+        // list's bottom off `y`.
+        for html in [
+            "<ol><li>x<ul><li>y</li></ul>z</li></ol>",
+            "<ul><li>x<dl><dt>y</dt></dl>z</li></ul>",
+            "<dl><dd>x<ol><li>y</li></ol>z</dd></dl>",
+            "<ul><li>x<div><div><ol><li>y</li></ol></div></div>z</li></ul>",
+            "<ul><li>x<table><tr><td><ul><li>y</li></ul></td></tr></table>z</li></ul>",
+        ] {
+            let d = standards(html);
+            assert_eq!(gaps(&d, "y"), (Some(0), Some(0)), "{html}");
+        }
+    }
+
+    #[test]
+    fn plan_list_margins_declared_ones_win_per_side() {
+        let d = standards(
+            "<div>a</div><ol style='margin-top:0;margin-bottom:0'><li>x</li></ol><div>b</div>",
+        );
+        assert_eq!(gaps(&d, "x"), (Some(0), Some(0)));
+        let d = standards("<div>a</div><ol style='margin-top:0'><li>x</li></ol><div>b</div>");
+        assert_eq!(gaps(&d, "x"), (Some(0), Some(240)));
+    }
+
+    /// Measured in Chrome (#2114 r2 m2, m3): a list's user-agent top is
+    /// dropped at the start of the body or a cell, through `div`s with no
+    /// top padding too; its bottom is not quirky, kept at a cell's end.
+    #[test]
+    fn plan_list_margins_quirks_drops_them_at_the_body_s_and_a_cell_s_edges() {
+        let d = doc("<ul><li>x</li></ul>");
+        assert_eq!(gaps(&d, "x"), (Some(0), Some(240)));
+        let d = doc("<div dir=ltr><ol><li>x</li></ol></div>");
+        assert_eq!(gaps(&d, "x").0, Some(0));
+        let d = doc("<div><div><ul><li>x</li></ul></div></div>");
+        assert_eq!(gaps(&d, "x").0, Some(0));
+        let d = doc("<div style='padding-top:1px'><ol><li>x</li></ol></div>");
+        assert_eq!(gaps(&d, "x").0, Some(15 + 240));
+        for cell in [
+            "<td><ol><li>x</li></ol></td>",
+            "<td><div dir=ltr><ol><li>x</li></ol></div></td>",
+            "<td><div><ol><li>x</li></ol></div></td>",
+        ] {
+            let d = doc(&format!("<table><tr>{cell}</tr></table>"));
+            assert_eq!(gaps(&d, "x"), (Some(0), Some(240)), "{cell}");
+        }
+        // A `p`'s bottom is quirky at a cell's end, through a `div` too,
+        // not through bottom padding.
+        for cell in ["<td><p>x</p></td>", "<td><div><p>x</p></div></td>"] {
+            let d = doc(&format!("<table><tr>{cell}</tr></table>"));
+            assert_eq!(gaps(&d, "x"), (Some(0), Some(0)), "{cell}");
+        }
+        let d =
+            doc("<table><tr><td><div style='padding-bottom:1px'><p>x</p></div></td></tr></table>");
+        assert_eq!(gaps(&d, "x").1, Some(240 + 15));
+        // A list around the `p` keeps its own 1em below.
+        let d = doc("<table><tr><td><ul><li><p>x</p></li></ul></td></tr></table>");
+        assert_eq!(gaps(&d, "x").1, Some(240));
+        // A card is no quirky container.
+        let d = doc("<table><tr><td><div style='background:#eee'><p>x</p></div></td></tr></table>");
+        assert_eq!(gaps(&d, "x"), (Some(240), Some(240)));
+        // Between paragraphs they stay.
+        let d = doc("<div>a</div><ul><li>x</li></ul><div>b</div>");
+        assert_eq!(gaps(&d, "x"), (Some(240), Some(240)));
+    }
+
+    #[test]
+    fn plan_parent_collapse_a_block_s_margins_reach_its_first_and_last_child() {
+        let d = standards("<div style='margin-bottom:20px'><p>x</p></div><div>y</div>");
+        assert_eq!(gaps(&d, "x"), (Some(240), Some(300)));
+        assert_eq!(gaps(&d, "y"), (Some(0), Some(0)));
+        let d = standards("<div>a</div><div style='margin-top:30px'><p>x</p></div>");
+        assert_eq!(gaps(&d, "x"), (Some(450), Some(240)));
+        // The larger of the two, either way round.
+        let d = standards("<div>a</div><div style='margin-top:5px'><p>x</p></div>");
+        assert_eq!(gaps(&d, "x").0, Some(240));
+    }
+
+    #[test]
+    fn plan_parent_collapse_padding_separates() {
+        let d =
+            standards("<div>a</div><div style='margin-top:30px;padding-top:10px'><p>x</p></div>");
+        assert_eq!(gaps(&d, "x").0, Some(450 + 150 + 240));
+        let d = standards(
+            "<div style='margin-bottom:30px;padding-bottom:10px'><p>x</p></div><div>b</div>",
+        );
+        assert_eq!(gaps(&d, "x").1, Some(240 + 150 + 450));
+        assert_eq!(gaps(&d, "b").0, Some(0));
+    }
+
+    #[test]
+    fn plan_parent_collapse_content_separates() {
+        let d = standards("<div style='margin:30px 0'>a<p>b</p>c</div>");
+        assert_eq!(gaps(&d, "a"), (Some(450), Some(0)));
+        assert_eq!(gaps(&d, "b"), (Some(240), Some(240)));
+        assert_eq!(gaps(&d, "c"), (Some(0), Some(450)));
+        // Anonymous lines around a block with no box: the outer top on
+        // the first only, its bottom on the last only.
+        let d = standards("<div style='margin:30px 0'>a<div>b</div>c</div>");
+        assert_eq!(gaps(&d, "a"), (Some(450), Some(0)));
+        assert_eq!(gaps(&d, "b"), (Some(0), Some(0)));
+        assert_eq!(gaps(&d, "c"), (Some(0), Some(450)));
+    }
+
+    #[test]
+    fn plan_parent_collapse_at_a_flow_s_end_and_through_a_restyle() {
+        let d = standards("<table><tr><td><div style='margin-bottom:20px'>x</td></tr></table>");
+        assert_eq!(gaps(&d, "x").1, Some(300));
+        let d = standards("<div style='margin-bottom:20px'><p>x</div>");
+        assert_eq!(gaps(&d, "x").1, Some(300));
+        let d = standards("<b><div style='margin-bottom:20px'><p>x</b>y</p></div><div>z</div>");
+        assert_eq!(gaps(&d, "xy").1, Some(300));
+        assert_eq!(gaps(&d, "z").0, Some(0));
+    }
+
+    /// A card ending in a cell (#2114 r1 M1) leaves the blocks around it
+    /// alone: their bottom still reaches their last paragraph, and an
+    /// empty card, dropped, leaves their top fresh.
+    #[test]
+    fn plan_parent_collapse_a_card_s_end_keeps_the_blocks_around_it() {
+        let d = standards(
+            "<table><tr><td><div style='margin-bottom:20px'>\
+             <div style='background:#eee'>c</div><p>x</p></div><p>y</p></td></tr></table>",
+        );
+        assert_eq!(gaps(&d, "x").1, Some(300));
+        assert_eq!(gaps(&d, "y").0, Some(0));
+        let d = standards(
+            "<table><tr><td><p>a</p><div style='margin-top:30px'>\
+             <div style='background:#eee'></div><p>x</p></div></td></tr></table>",
+        );
+        // 450, collapsed with a's 240.
+        assert_eq!(gaps(&d, "x").0, Some(450 - 240));
+        // Inside an outer card, an inner card's end.
+        let d = standards(
+            "<table><tr><td><div style='background:#ddd'><div style='margin-bottom:20px'>\
+             <div style='background:#eee'>c</div><p>x</p></div><p>y</p></div></td></tr></table>",
+        );
+        assert_eq!(gaps(&d, "x").1, Some(300));
+    }
+
+    #[test]
+    fn plan_parent_collapse_is_bounded() {
+        let page = format!(
+            "{}{}<table>{}</table>",
+            "<div>".repeat(MAX_DEPTH),
+            "<p>x</p>".repeat(20_000),
+            "<tr><td>c</td></tr>".repeat(20_000)
+        );
+        let small = Budget::new(1 << 22, 2_000_000);
+        match import_html_within(page.as_bytes(), &small, None) {
+            Ok(_) => {}
+            Err(e) => assert_eq!(e, TOO_BIG),
+        }
+        let page = format!(
+            "{}{}",
+            "<span>".repeat(MAX_DEPTH),
+            "<p>x</p>".repeat(20_000)
+        );
+        match import_html_within(page.as_bytes(), &small, None) {
+            Ok(_) => {}
+            Err(e) => assert_eq!(e, TOO_BIG),
+        }
+    }
+
+    const WRAP: &str = "<div style='width:600px;margin:0 auto'>";
+
+    #[test]
+    fn plan_2_a_full_width_table_fills_its_centred_wrapper() {
+        for table in [
+            "<table width='100%'>",
+            "<table width='100%' align='right'>",
+            "<table>",
+        ] {
+            let d = doc(&format!("{WRAP}{table}<tr><td>x</td></tr></table></div>"));
+            let t = tables(&d)[0];
+            assert_eq!(t.grid.iter().sum::<u32>(), 9000, "{table}");
+            assert!(tblpr(t).contains("<w:jc w:val=\"center\"/>"), "{table}");
+            assert!(!tblpr(t).contains("w:tblInd"), "{table}");
+        }
+        let d = doc(&format!(
+            "{WRAP}<table width='100%'><tr><td>x</td></tr></table></div>"
+        ));
+        let pr = tblpr(tables(&d)[0]);
+        assert!(pr.contains("<w:tblW w:w=\"9000\" w:type=\"dxa\"/>"), "{pr}");
+    }
+
+    #[test]
+    fn plan_2_a_narrower_table_sits_where_the_wrapper_puts_it() {
+        let ind = |table: &str| {
+            let d = doc(&format!("{WRAP}{table}<tr><td>x</td></tr></table></div>"));
+            let t = tables(&d)[0];
+            assert_eq!(t.grid.iter().sum::<u32>(), 4500, "{table}");
+            let pr = tblpr(t).to_string();
+            (pr.contains("<w:jc "), pr)
+        };
+        // Word measures the indent to the first cell's text (no
+        // compatibilityMode): its left cell margin is added.
+        let (jc, pr) = ind("<table width='300'>");
+        assert!(
+            !jc && pr.contains("<w:tblInd w:w=\"1503\" w:type=\"dxa\"/>"),
+            "{pr}"
+        );
+        let (jc, pr) = ind("<table width='300' align='right'>");
+        assert!(!jc, "{pr}");
+        assert!(
+            pr.contains(&format!("<w:tblInd w:w=\"{}\"", 1395 + 4500 + 108)),
+            "{pr}"
+        );
+        let (jc, pr) = ind("<table width='300' cellpadding='0'>");
+        assert!(!jc && pr.contains("<w:tblInd w:w=\"1395\""), "{pr}");
+        let (_, pr) = ind("<table width='300' style='margin:0 auto'>");
+        assert!(
+            pr.contains("<w:jc w:val=\"center\"/>") && !pr.contains("w:tblInd"),
+            "{pr}"
+        );
+    }
+
+    /// A table wider than its room is over-constrained (r2 m1): it starts
+    /// at the room's left and overflows to the right, never centred.
+    #[test]
+    fn plan_2_a_wider_table_starts_at_the_wrapper_s_left() {
+        let d = doc(&format!(
+            "{WRAP}<table width='660'><tr><td>x</td></tr></table></div>"
+        ));
+        let t = tables(&d)[0];
+        let pr = tblpr(t);
+        assert_eq!(t.grid.iter().sum::<u32>(), 9900);
+        assert!(!pr.contains("<w:jc "), "{pr}");
+        assert!(pr.contains("<w:tblInd w:w=\"1503\""), "{pr}");
+        // A wrapper as wide as the body (no extra indent) leaves its table
+        // as before: no `jc`.
+        let d = doc(
+            "<div style='width:820px;margin:0 auto'><table width='820'><tr><td>x</td></tr></table></div>",
+        );
+        assert!(!tblpr(tables(&d)[0]).contains("<w:jc "));
+        let d = doc(&format!(
+            "{WRAP}<table width='660' align='center'><tr><td>x</td></tr></table></div>"
+        ));
+        assert!(!tblpr(tables(&d)[0]).contains("<w:jc "));
+    }
+
+    #[test]
+    fn plan_2_an_off_centre_wrapper_gets_an_indent() {
+        let d = doc(&format!(
+            "<div style='margin-left:40px'>{WRAP}<table width='100%'><tr><td>x</td></tr></table></div></div>"
+        ));
+        let t = tables(&d)[0];
+        let pr = tblpr(t);
+        // The wrapper is centred in what the div leaves: 600 + (11190 - 9000) / 2.
+        assert_eq!(t.grid.iter().sum::<u32>(), 9000);
+        assert!(!pr.contains("<w:jc "), "{pr}");
+        assert!(
+            pr.contains(&format!("<w:tblInd w:w=\"{}\"", 600 + 1095 + 108)),
+            "{pr}"
+        );
+    }
+
+    #[test]
+    fn plan_2_other_tables_are_unchanged() {
+        for page in [
+            "<table width='100%'><tr><td>x</td></tr></table>",
+            "<div><table width='100%'><tr><td>x</td></tr></table></div>",
+            "<div style='margin-left:40px'><table width='100%'><tr><td>x</td></tr></table></div>",
+        ] {
+            let d = doc(page);
+            let t = tables(&d)[0];
+            assert_eq!(t.grid.iter().sum::<u32>(), 11790, "{page}");
+            assert!(!tblpr(t).contains("<w:jc "), "{page}");
+            assert!(!tblpr(t).contains("w:tblInd"), "{page}");
+            assert!(tblpr(t).contains("w:type=\"pct\""), "{page}");
+        }
+        // In a cell, a nested table takes its cell's width as before.
+        let d = doc(&format!(
+            "<table width='600'><tr><td>{WRAP}<table width='100%'><tr><td>x</td></tr></table></div></td></tr></table>"
+        ));
+        let outer = tables(&d)[0];
+        let DocBlock::Table(inner) = &outer.rows[0].cells[0].blocks[0] else {
+            panic!("no nested table");
+        };
+        assert_eq!(inner.grid.iter().sum::<u32>(), 9000);
+        assert!(tblpr(inner).contains("w:type=\"pct\""));
+        assert!(!tblpr(inner).contains("w:tblInd"));
     }
 }

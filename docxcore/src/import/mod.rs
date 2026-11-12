@@ -451,12 +451,20 @@ type Tail = Option<(usize, FlowTail)>;
 /// a nested table never lends it to another (#1979 r2).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FlowTail {
-    /// Its bottom margin, in twips: what the next paragraph's top margin
-    /// collapses with.
-    pub(crate) margin_after: i32,
-    /// The user-agent bottom margin quirks mode drops from it if it ends
-    /// its flow.
-    pub(crate) quirk_bottom: Option<i32>,
+    /// Its bottom spacing so far, in twips, signed (its written `after` is
+    /// this, at least 0): the bottom boxes of the elements it was the last
+    /// paragraph of, applied as each closed (#2114).
+    pub(crate) after: i32,
+    /// The largest positive margin of the margin group open at its bottom,
+    /// in twips, already in `after`: what the next paragraph's top margins
+    /// collapse with, and what a closing element's bottom margin collapses
+    /// into when no padding separates them.
+    pub(crate) open: i32,
+    /// In quirks mode, `after` and `open` as they would be without the
+    /// quirky user-agent bottom margins folded in (#1979, #2114 r2): what
+    /// `after` becomes if the paragraph turns out its flow's last. `None`
+    /// while no quirky margin has been folded.
+    pub(crate) bare: Option<(i32, i32)>,
 }
 
 /// An HTML table being read: its spec, its rows of raw cells, the cell
@@ -568,6 +576,18 @@ impl<'b> Builder<'b> {
         if self.budget.keep::<Inline>(props_heap(props)) {
             self.para
                 .push(Inline::Break(BreakKind::Page, props.clone()));
+        }
+    }
+
+    /// Drop the line break that ends the paragraph in progress, when
+    /// something comes before it (#2114): a browser's `<br>` that ends a
+    /// block adds no line, while a lone one (`<div><br></div>`) is the
+    /// block's one empty line.
+    pub(crate) fn drop_trailing_break(&mut self) {
+        if self.para.len() > 1
+            && matches!(self.para.last(), Some(Inline::Break(BreakKind::Line, _)))
+        {
+            self.para.pop();
         }
     }
 
@@ -951,7 +971,8 @@ impl<'b> Builder<'b> {
 
     /// The end of HTML table `t`: what is pending is its last cell and row;
     /// nested, it waits in its enclosing cell as a [`html_table::RawTable`]
-    /// at a placeholder; outermost, it is laid out in the body's width.
+    /// at a placeholder; outermost, it is laid out in the body's width, or
+    /// in the room of the centred block it is in (#2114).
     fn end_html_table(&mut self, mut t: TableAcc, mut h: HtmlAcc) {
         if !t.blocks.is_empty() || h.cell.is_some() {
             let cell = html_table::RawCell {
@@ -973,7 +994,7 @@ impl<'b> Builder<'b> {
         if h.rows.is_empty() {
             return;
         }
-        let raw = html_table::RawTable {
+        let mut raw = html_table::RawTable {
             spec: h.spec,
             rows: h.rows,
             groups: h.groups,
@@ -987,6 +1008,11 @@ impl<'b> Builder<'b> {
                 {
                     outer.blocks.push(Block::Paragraph(Paragraph::default()));
                 }
+                // A nested table takes its cell's width: a room (#2114),
+                // which only a table outside every cell gets, can still
+                // come with one a malformed page leaves in an open table
+                // but outside its cells, and does not apply there.
+                raw.spec.room = None;
                 let at = outer.blocks.len();
                 outer.blocks.push(html_table::placeholder());
                 outer.cell_has_para = true;
@@ -995,7 +1021,8 @@ impl<'b> Builder<'b> {
                 }
             }
             _ => {
-                let table = html_table::layout(raw, html_table::BODY_TWIPS, self.budget);
+                let avail = raw.spec.room.map_or(html_table::BODY_TWIPS, |r| r.width);
+                let table = html_table::layout(raw, avail, self.budget);
                 self.body.push(Block::Table(table));
             }
         }

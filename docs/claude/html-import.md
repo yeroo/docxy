@@ -105,11 +105,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   (`Look::in_cell`): a cell's width is known only at layout.
 - Drawing: the suite draws a `w:jc` table where it sits (#1922,
   `docs/claude/suite-document.md`).
-- Known limits: a block's auto margins inside a cell; an outermost
-  `width=100%` table inside a centred fixed-width block is still laid out
-  in `BODY_TWIPS` with no `tblInd`, so it spans the body while the block's
-  text is indented; PDF export does not place a table by `w:jc`; `max-width`;
-  CSS `float`; `<img align>`; `box-sizing`; right-to-left.
+- An outermost table inside a centred fixed-width block is laid out in
+  that block's width and placed in it (#2114: see "HTML import margins,
+  breaks, hangs and wrapper tables").
+- Known limits: a block's auto margins inside a cell; a table in a merely
+  indented block keeps the body's width; PDF export does not place a table
+  by `w:jc`; `max-width`; CSS `float`; `<img align>`; `box-sizing`;
+  right-to-left.
 
 ## HTML import CSS (#1872)
 
@@ -430,7 +432,9 @@ suite's flow view drawing it (marker look, spacing, line height) is
 is #1987.
 
 - Spacing comes from CSS only. Every HTML paragraph writes `w:spacing`:
-  - `before`/`after` from its innermost block's top/bottom box, else 0.
+  - `before`/`after` from the top/bottom boxes of the blocks and lists it
+    is the first/last paragraph of, else 0 (#2114: see "HTML import
+    margins, breaks, hangs and wrapper tables").
   - `line 240 auto` unless `line-height` says otherwise (`normal` and an
     unreadable or non-positive value are single).
   - So no Normal style's space after or 1.08 lines shows. The suite's
@@ -449,12 +453,11 @@ is #1987.
   - `Look::ua_before`/`ua_after` keep the UA part, for the quirk below.
 - Adjacent margins collapse as a browser's do (Word and LibreOffice add
   them; the suite adds them too):
-  - Only margins collapse, not padding (#1979 r1). A paragraph's written
-    `before` is `pad_top + max(0, margin_top − the margin_bottom of the
-    paragraph before it in its flow)` (`Html::flow_spacing`, `Look`'s
-    `margin_before`/`pad_before`/`margin_after`). The paragraph above
-    keeps its whole `after`. A negative top margin is only summed with
-    the padding.
+  - Only margins collapse, not padding (#1979 r1). A paragraph's
+    written `before` adds what of its top margins the margin group open
+    below the paragraph above does not cover (`Html::top_spacing`,
+    `FlowTail::open`). The paragraph above keeps its whole `after`. A
+    negative margin is only summed.
   - The margin above is the flow's own (`Builder::tail`, a `FlowTail` set
     with `set_tail` after each paragraph, #1979 r2). The flow is the open
     cell's blocks or the body. A tail counts only while its paragraph is
@@ -465,14 +468,23 @@ is #1987.
   Standard's old public ids, its common entries; `<!DOCTYPE html>` and
   XHTML are standards). Mail, Word and Outlook pages have none, and so do
   clipboard fragments.
-  - The margin quirk: a block straight in `body` or a `td`/`th` (its
-    parent element is `html`, `body`, `td` or `th`: `Html::para_edges`;
-    not in a `div` or a card) loses its UA top margin when it is its
-    flow's first, and its UA bottom margin when it is its flow's last.
+  - The margin quirk, at the body's or a `td`/`th`'s edges (not a
+    card's), measured in Chrome (#2114 r2):
+    - The top: when its paragraph is its flow's first, every block and
+      list from the outermost in loses its UA top margin, up to and
+      including the first with top padding (`Html::top_spacing`). So
+      `<div dir=ltr><ol><li>` and `<td><div><p>` start at 0, while
+      `<div style="padding-top:1px"><ol>` keeps the list's 1em.
+    - The bottom: a block's UA bottom margin is dropped when its paragraph
+      is its flow's last and no bottom padding separates it from the body
+      or cell (`Html::bottom_unseparated`), through a `div` too. A list's
+      is never dropped (`<td><ol><li>` keeps its 1em below; at the body's
+      end, unmeasured, it is kept too).
   - The last is settled at the flow's end (`Html::flow_end_props`, at
     `</td>`, `</tr>`, `</table>`, a card's end and the page's end). The
     text in progress is ended first, as any paragraph, and then the flow's
-    last paragraph (`FlowTail::quirk_bottom`) is patched in place. The
+    last paragraph takes the bottom it would have without the quirky
+    margins (`FlowTail::bare`, folded beside the real one), in place. The
     props it returns are only for the paragraph an empty cell gets.
   - A declared margin and padding stay.
 - List geometry, through the cascade:
@@ -487,8 +499,9 @@ is #1987.
     draws an item with a left of its own (600 per list, or that pin) with
     no level step, so a nested list sits at its own indent (#1986).
   - A numbered paragraph hangs a browser's outside marker with its space:
-    `DECIMAL_HANG` 1.1125em for an `ol`, `BULLET_HANG` 1.375em for a
-    `ul`, measured in Chrome. The em is the `li`'s own font (`item_elem`),
+    `DECIMAL_HANG` 1.1125em for an `ol` (one digit; #2114 adds
+    `DIGIT_HANG` per digit past it), `BULLET_HANG` 1.375em for a `ul`,
+    measured in Chrome. The em is the `li`'s own font (`item_elem`),
     not a `div`'s in it: 267 / 330 twips at 12pt.
   - The hang is clamped to the indent: `padding-left: 0` hangs nothing.
     Word draws the number at `left − hang` and tabs to `left`.
@@ -533,13 +546,96 @@ is #1987.
 - Tests: `outlook_tests` in `import/html.rs`; the issue's mail is
   `outlook_simple_mail_imports_as_a_browser_lays_it_out`.
 - Known limits:
-  - The lists' own vertical margins (1em when not nested).
-  - Parent-child margin collapse (a `div`'s bottom with its last `p`'s,
-    through a card's top).
+  - Margins through a card's top.
   - An empty `<p></p>`'s margins collapsing through it.
-  - `<div>text<br></div>`'s trailing break.
-  - A number wider than its hang (10 and up).
-  - `list-style-type`; `<ol start>` and separate `<ol>`s sharing numId 2.
+  - `list-style-type`; `<ol start>` and separate `<ol>`s sharing numId 2
+    (#1989 `plan-ol-start`: the suite's `list_markers` draws only numId 2
+    as numbers, so per-list `w:num`s need it to read `numbering.xml`).
   - A page's `em` margin on a heading resolves at the parent's size, as
     before.
   - The HTML Standard's rarer quirks public ids and the IBM system id.
+
+## HTML import margins, breaks, hangs and wrapper tables (#2114)
+
+A batch from #1989 and #1930 (plan-2), import only.
+
+- Trailing `<br>` (`Builder::drop_trailing_break`, from `end_para_with`):
+  a paragraph's last line break goes when something comes before it, as
+  a browser's `<br>` that ends a block adds no line.
+  - Covers `<div>a<br></div>`, `<p>a<br>\n</p>`, `<td>a<br></td>`, a
+    `<br>` before a nested block, and `pre`'s last newline.
+  - `<div><br></div>` stays one empty paragraph: its lone break is white
+    space, cleared as before. Content after a break keeps it; of two, one
+    stays.
+- Wide hangs: each open list counts its `li`s (`OpenList::items`), and an
+  item keeps its number (`Block::item_ordinal`, each list from 1, as a
+  browser counts).
+  - `decimal_hang(n)` is `DECIMAL_HANG + (digits − 1) × DIGIT_HANG`
+    (0.5555em; Chrome's "10. " is 1.668em), still clamped to the indent.
+  - Word continues numId 2 across `<ol>`s, so a later list may show a
+    wider number than its hang (#1989 `plan-ol-start`).
+- A `dl` ends the paragraph in progress at its start and its end, as any
+  block (`a<dl>b</dl>c` is three lines).
+- Vertical boxes of blocks and lists, one mechanism:
+  - Each block and list's `Elem::flow_at` is its flow's depth and length
+    when it opened (the paragraph in progress already ended). It is
+    fresh while that flow still has that length.
+  - Top (`Html::top_spacing`): the fresh blocks and lists from the
+    innermost table, cell or card out (inline elements, containers and
+    `body` are see-through) fold their top boxes outermost first. Positive
+    margins collapse into the group open below the paragraph above
+    (`FlowTail::open`), padding closes the group, negative margins are
+    summed, and the result clamps at 0.
+    - Freshness is monotonic, so the walk stops at the first stale one.
+    - A block's second anonymous paragraph gets no top: in
+      `<div style="margin:30px 0">a<p>b</p>c</div>`, a has 450 before and c
+      450 after.
+  - Bottom (`Html::apply_bottom`, `fold_bottom`): each paragraph ends with
+    `after` 0. When a block or list leaves the stack (`truncate_elems`,
+    innermost first, before reopening), and the flow's last paragraph
+    ended inside it, its bottom box is added to that paragraph in place.
+    - Padding closes the open group, then its margin opens a new one. With
+      no padding, the margin collapses into the open group.
+    - `FlowTail::after` keeps the signed running value; the written
+      `after` is at least 0.
+  - Flow ends (`flow_end_props`: cell, row, table, card, page) apply the
+    bottoms of the blocks and lists still open in that flow first, once
+    (`flow_at` taken), then quirks mode's bottom patch. Only that flow's:
+    a card is declined before its flow ends, so the walk can pass it into
+    the enclosing flow's blocks, which keep their `flow_at` (#2114 r1).
+  - Quirks: see the margin quirk above. The bottom fold is kept twice,
+    with and without the quirky UA bottoms (`FlowTail::bare`).
+  - Both walks charge the import's work budget.
+- Lists' user-agent margins: `ul ol dir menu dl` have 1em top and bottom
+  in their own font, none when nested in another list at any depth, across
+  tables too (`Look::in_list`, inherited). Declared sides win per side.
+- Wrapper tables (#1930 plan-2):
+  - A block centred by its fixed width and auto margins marks its look
+    `centred_box` (inherited, not in a cell). An outermost table in it
+    gets an `html_table::Room`: the box between its indents, and whether
+    that room is centred in the body (equal indents).
+  - `end_html_table` passes the room's width to `layout` as its `avail`
+    (a nested table drops a room: it takes its cell's width).
+    `place_in_room` writes a
+    percentage `tblW` as twips, since Word resolves `pct` against the body
+    and would stretch it back.
+  - A table that fills the room exactly, or fits and is centred in it, in
+    a centred room gets `jc center`, whatever its `align`.
+  - Otherwise it gets no `jc` and a `w:tblInd` of its left edge: the
+    room's left, right or middle. A table wider than its room is
+    over-constrained in a browser and starts at the room's left (r2).
+  - The Markdown package has no `compatibilityMode`, so Word lays it out
+    in an older mode, which measures `tblInd` to the first cell's text.
+    The left cell margin is therefore added: `cellpadding`, else 108.
+  - The suite does not draw `tblInd`, so such a table stays at the body's
+    left there, as before.
+- Tests: `batch_2114_tests` in `import/html.rs`;
+  `a_table_in_a_room_is_laid_out_and_placed_there` in `html_table.rs`.
+- Known limits:
+  - A block's bottom box is lost when it ends in a table (it used to sit
+    on the paragraph above the table), and a block whose first child is a
+    table gives no top.
+  - A table in an indented block that is not a centred fixed-width box
+    keeps the body's width.
+  - The suite's `list_markers` restarts its count at an item's unnumbered
+    continuation (a follow-up).
