@@ -4235,13 +4235,17 @@ impl App {
     /// an undo step and keeps the history, so the history follows it: the
     /// cells, rules and snapshots it holds name the sheet by its new name, or
     /// an undo or redo would bring back references to a sheet that is gone.
-    /// A name another sheet has (in any case) is refused, since there is no
-    /// step to undo it: `Err` with the reason, nothing changed.
+    /// A name Excel refuses ([`gridcore::sheet::sheet_name_error`]) or one
+    /// another sheet has (in any case) is refused, since there is no step to
+    /// undo it: `Err` with the reason, nothing changed.
     fn rename_sheet(&mut self, idx: usize, name: &str) -> Result<(), String> {
         let wb = &self.pkg.workbook;
         let Some(old) = wb.sheets.get(idx).map(|s| s.name.clone()) else {
             return Err("no such sheet".into());
         };
+        if let Some(why) = gridcore::sheet::sheet_name_error(name) {
+            return Err(why.into());
+        }
         let taken = (wb.sheets.iter().enumerate())
             .any(|(i, s)| i != idx && s.name.eq_ignore_ascii_case(name));
         if taken {
@@ -10868,14 +10872,10 @@ impl App {
                 }
             }
             PromptKind::RenameSheet => {
-                if !text.is_empty() && !text.contains(['[', ']', '*', '?', ':', '/', '\\']) {
-                    self.status = Some(match self.rename_sheet(self.sheet, &text) {
-                        Ok(()) => format!("Renamed sheet to {text}"),
-                        Err(why) => why,
-                    });
-                } else {
-                    self.status = Some("Invalid sheet name".to_string());
-                }
+                self.status = Some(match self.rename_sheet(self.sheet, &text) {
+                    Ok(()) => format!("Renamed sheet to {text}"),
+                    Err(why) => why,
+                });
             }
             PromptKind::RenameTable => {
                 if let Some(old) = self.table_here() {
@@ -22655,6 +22655,35 @@ mod tests {
         // The last one refuses to go.
         app.delete_current_sheet();
         assert_eq!(app.pkg.workbook.sheets.len(), 1);
+    }
+
+    /// #2115 (r1-p1): the Rename sheet prompt refuses a name Excel refuses
+    /// and says why; the sheet keeps its name.
+    #[test]
+    fn rename_sheet_prompt_refuses_excels_forbidden_names_with_the_reason() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        let long = "x".repeat(32);
+        for (name, why) in [
+            (long.as_str(), "Sheet name is longer than 31 characters"),
+            ("Q1/Q2", "Sheet name cannot contain [ ] : * ? / \\"),
+            ("'Data", "Sheet name cannot start or end with an apostrophe"),
+        ] {
+            app.open_prompt(PromptKind::RenameSheet);
+            app.prompt.as_mut().unwrap().text = name.to_string();
+            app.commit_prompt();
+            assert_eq!(app.status.as_deref(), Some(why), "{name}");
+            assert_eq!(app.pkg.workbook.sheets[0].name, "Sheet1", "{name}");
+        }
+        // The rule is App::rename_sheet's, whoever calls it.
+        assert_eq!(
+            app.rename_sheet(0, &long),
+            Err("Sheet name is longer than 31 characters".to_string())
+        );
+        app.open_prompt(PromptKind::RenameSheet);
+        app.prompt.as_mut().unwrap().text = "Bob's Data".to_string();
+        app.commit_prompt();
+        assert_eq!(app.pkg.workbook.sheets[0].name, "Bob's Data");
     }
 
     #[test]
