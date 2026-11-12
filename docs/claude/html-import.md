@@ -592,8 +592,10 @@ A batch from #1989 and #1930 (plan-2), import only.
     - `FlowTail::after` keeps the signed running value; the written
       `after` is at least 0.
   - Flow ends (`flow_end_props`: cell, row, table, card, page) apply the
-    bottoms of the blocks and lists still open in the flow first, once
-    (`flow_at` taken), then quirks mode's bottom patch.
+    bottoms of the blocks and lists still open in that flow first, once
+    (`flow_at` taken), then quirks mode's bottom patch. Only that flow's:
+    a card is declined before its flow ends, so the walk can pass it into
+    the enclosing flow's blocks, which keep their `flow_at` (#2114 r1).
   - Quirks: a member straight in the body or a cell drops its UA top when
     its flow is empty, and records its UA bottom as
     `FlowTail::quirk_bottom` (how much `after` drops without it).
@@ -606,7 +608,9 @@ A batch from #1989 and #1930 (plan-2), import only.
     `centred_box` (inherited, not in a cell). An outermost table in it
     gets an `html_table::Room`: the box between its indents, and whether
     that room is centred in the body (equal indents).
-  - `layout` lays the table out in the room. `place_in_room` writes a
+  - `end_html_table` passes the room's width to `layout` as its `avail`
+    (a nested table drops a room: it takes its cell's width).
+    `place_in_room` writes a
     percentage `tblW` as twips, since Word resolves `pct` against the body
     and would stretch it back.
   - A table that fills the room, or is centred in it, in a centred room

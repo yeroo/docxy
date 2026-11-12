@@ -204,16 +204,15 @@ enum Slot {
 }
 
 /// Lay `t` out in `avail` twips, its nested tables in their cells' widths.
+/// A table with a [`Room`] (whose width its caller passes as `avail`) is
+/// then placed in it ([`place_in_room`]).
 pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
     let RawTable {
         mut spec,
         rows,
         groups,
     } = t;
-    let avail = spec
-        .room
-        .map_or(avail, |r| r.width)
-        .clamp(MIN_COL, MAX_TWIPS);
+    let avail = avail.clamp(MIN_COL, MAX_TWIPS);
     let nrows = rows.len();
     let (placed, slots) = place(rows, nrows, &groups);
     let ncols = slots
@@ -920,7 +919,7 @@ mod tests {
                     rows: vec![vec![text_cell("a", spec(1, 1))]],
                     groups: Vec::new(),
                 },
-                BODY_TWIPS,
+                room.width,
                 &Budget::standard(),
             )
         };

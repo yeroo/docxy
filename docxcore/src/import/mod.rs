@@ -992,7 +992,7 @@ impl<'b> Builder<'b> {
         if h.rows.is_empty() {
             return;
         }
-        let raw = html_table::RawTable {
+        let mut raw = html_table::RawTable {
             spec: h.spec,
             rows: h.rows,
             groups: h.groups,
@@ -1006,6 +1006,11 @@ impl<'b> Builder<'b> {
                 {
                     outer.blocks.push(Block::Paragraph(Paragraph::default()));
                 }
+                // A nested table takes its cell's width: a room (#2114),
+                // which only a table outside every cell gets, can still
+                // come with one a malformed page leaves in an open table
+                // but outside its cells, and does not apply there.
+                raw.spec.room = None;
                 let at = outer.blocks.len();
                 outer.blocks.push(html_table::placeholder());
                 outer.cell_has_para = true;
@@ -1014,7 +1019,8 @@ impl<'b> Builder<'b> {
                 }
             }
             _ => {
-                let table = html_table::layout(raw, html_table::BODY_TWIPS, self.budget);
+                let avail = raw.spec.room.map_or(html_table::BODY_TWIPS, |r| r.width);
+                let table = html_table::layout(raw, avail, self.budget);
                 self.body.push(Block::Table(table));
             }
         }

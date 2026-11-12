@@ -532,7 +532,8 @@ struct Elem {
     /// While the flow still holds that many, nothing has ended in it yet,
     /// so its top goes to the next paragraph; one ended at an index past
     /// it is inside it, so its bottom goes to the last such. `None` once
-    /// its bottom is applied at its flow's end.
+    /// its bottom is applied at the end of that flow (not of another,
+    /// such as a card's inside it).
     flow_at: Option<(usize, usize)>,
 }
 
@@ -3222,8 +3223,15 @@ impl<'a> Html<'a> {
                 if e.kind.table() || matches!(e.card, CardMode::Yes(_)) {
                     break;
                 }
-                self.apply_bottom(j);
-                self.elems[j].flow_at = None;
+                // Only this flow's own (r1 M1): a card has been declined
+                // before its flow ends, so the walk may pass it into the
+                // blocks of the flow around it, which stay as they are.
+                if e.flow_at
+                    .is_some_and(|(depth, _)| depth == self.table_depth)
+                {
+                    self.apply_bottom(j);
+                    self.elems[j].flow_at = None;
+                }
             }
         }
         if let Some(tail) = self.out.tail(in_table) {
@@ -7929,6 +7937,31 @@ mod batch_2114_tests {
         let d = standards("<b><div style='margin-bottom:20px'><p>x</b>y</p></div><div>z</div>");
         assert_eq!(gaps(&d, "xy").1, Some(300));
         assert_eq!(gaps(&d, "z").0, Some(0));
+    }
+
+    /// A card ending in a cell (#2114 r1 M1) leaves the blocks around it
+    /// alone: their bottom still reaches their last paragraph, and an
+    /// empty card, dropped, leaves their top fresh.
+    #[test]
+    fn plan_parent_collapse_a_card_s_end_keeps_the_blocks_around_it() {
+        let d = standards(
+            "<table><tr><td><div style='margin-bottom:20px'>\
+             <div style='background:#eee'>c</div><p>x</p></div><p>y</p></td></tr></table>",
+        );
+        assert_eq!(gaps(&d, "x").1, Some(300));
+        assert_eq!(gaps(&d, "y").0, Some(0));
+        let d = standards(
+            "<table><tr><td><p>a</p><div style='margin-top:30px'>\
+             <div style='background:#eee'></div><p>x</p></div></td></tr></table>",
+        );
+        // 450, collapsed with a's 240.
+        assert_eq!(gaps(&d, "x").0, Some(450 - 240));
+        // Inside an outer card, an inner card's end.
+        let d = standards(
+            "<table><tr><td><div style='background:#ddd'><div style='margin-bottom:20px'>\
+             <div style='background:#eee'>c</div><p>x</p></div><p>y</p></div></td></tr></table>",
+        );
+        assert_eq!(gaps(&d, "x").1, Some(300));
     }
 
     #[test]
