@@ -341,18 +341,21 @@ fn embed_ids(xml: &str) -> Vec<String> {
 /// replacing the selection, as Insert Picture inserts one (#1953): a new
 /// `word/media/imageN.<ext>` part related from the body, the picture its
 /// pixels at 96 dpi scaled to the text width ([`caret_text_width_emu`]),
-/// one undo step "Insert Picture". A view with no package is given one
+/// one undo step (`step`). A view with no package is given one
 /// ([`fresh_package`]). The media part is added outside the step, as a
 /// document tab's Insert Picture and paste add theirs: an undo leaves it
 /// unreferenced. Its relationship id is none a picture of the body
 /// already names, so a picture whose id the package never defined does
 /// not start to draw this one. Not run when the package cannot take the
-/// part (one without a body part).
+/// part (one without a body part). `step` names the undo step: "Insert
+/// Picture" for a host's insert, "Paste" for a clipboard image, as Word's
+/// undo names it.
 pub(crate) fn insert_picture(
     ed: &mut Editor,
     pkg: &mut Option<Package>,
     bytes: &[u8],
     info: &docxcore::image::ImageInfo,
+    step: &str,
 ) -> Formatted {
     let max_cx = caret_text_width_emu(ed, pkg.as_ref());
     let (cx, cy) = docxcore::image::extent_emu(info, Some(max_cx));
@@ -372,9 +375,7 @@ pub(crate) fn insert_picture(
     };
     let run = docxcore::image::inline_picture_run(&rid, cx, cy, id, &format!("Picture {id}"));
     let out = edit(ed, |ed| {
-        ed.one_step("Insert Picture", |e| {
-            e.insert_object(vec![Inline::Raw(run)])
-        })
+        ed.one_step(step, |e| e.insert_object(vec![Inline::Raw(run)]))
     });
     Formatted {
         ran: true,
@@ -387,9 +388,9 @@ pub(crate) fn insert_picture(
 pub(crate) enum Pasted {
     /// A clip, as a document tab's paste takes it ([`doc_paste_from`]).
     Clip(PasteFrom, Clip),
-    /// Another app's picture: its bytes, a kind [`docxcore::image::sniff`]
-    /// reads.
-    Picture(Vec<u8>),
+    /// Another app's picture: its bytes and what [`docxcore::image::sniff`]
+    /// read of them.
+    Picture(Vec<u8>, docxcore::image::ImageInfo),
 }
 
 /// What Ctrl+V pastes in the view (#1953): a document tab's choice
@@ -411,12 +412,12 @@ pub(crate) fn paste_source(
     image: Option<Vec<u8>>,
     html: impl FnOnce() -> Option<String>,
 ) -> Option<Pasted> {
-    let image = image.filter(|b| docxcore::image::sniff(b).is_some());
-    if let Some(image) = image.filter(|_| now.text().is_none()) {
+    let image = image.and_then(|b| Some((docxcore::image::sniff(&b)?, b)));
+    if let Some((info, image)) = image.filter(|_| now.text().is_none()) {
         let rtf = rtf.and_then(|rtf| Clip::from_rtf(rtf, None));
         return Some(match rtf {
             Some(clip) => Pasted::Clip(PasteFrom::Rtf, clip),
-            None => Pasted::Picture(image),
+            None => Pasted::Picture(image, info),
         });
     }
     doc_paste_from(ours, now, rtf, html).map(|(from, clip)| Pasted::Clip(from, clip))
@@ -427,7 +428,8 @@ pub(crate) fn paste_source(
 /// pictures' media, read where it was copied) brings its pictures into the
 /// view's package ([`pictures::carry`], which reuses a part with the same
 /// bytes), giving a view with none a package first when a picture needs
-/// it.
+/// it; a relationship it adds is none a body picture already names, as
+/// for [`insert_picture`].
 pub(crate) fn paste_clip(
     ed: &mut Editor,
     pkg: &mut Option<Package>,
@@ -436,8 +438,9 @@ pub(crate) fn paste_clip(
 ) -> Formatted {
     if let Some(media) = media.filter(|m| !m.is_empty()) {
         if clip.inline_embeds().iter().any(|r| media.contains_key(r)) {
+            let taken = embed_ids(&docxcore::serialize::blocks_to_xml(&ed.doc.body));
             let pkg = pkg.get_or_insert_with(fresh_package);
-            pictures::carry(pkg, BODY_PART, media, &mut clip);
+            pictures::carry_avoiding(pkg, BODY_PART, media, &mut clip, &taken);
         }
     }
     let out = edit(ed, |ed| ed.one_step("Paste", |e| e.paste(&clip)));
@@ -1579,7 +1582,7 @@ mod tests {
 
     fn put(ed: &mut Editor, pkg: &mut Option<Package>, bytes: &[u8]) -> Formatted {
         let info = picture_kind(bytes, PNG_INFO).expect("a PNG");
-        insert_picture(ed, pkg, bytes, &info)
+        insert_picture(ed, pkg, bytes, &info, "Insert Picture")
     }
 
     #[test]
@@ -1785,7 +1788,7 @@ mod tests {
             Pasted::Clip(PasteFrom::Rtf, _) => "rtf",
             Pasted::Clip(PasteFrom::Html, _) => "html",
             Pasted::Clip(PasteFrom::Text, _) => "text",
-            Pasted::Picture(_) => "picture",
+            Pasted::Picture(..) => "picture",
         })
     }
 
@@ -1823,12 +1826,18 @@ mod tests {
             Some("text")
         );
         // An image alone pastes as a picture, its bytes as read.
-        let Some(Pasted::Picture(bytes)) =
+        let Some(Pasted::Picture(bytes, info)) =
             paste_source(None, &ClipRead::NotText, None, img(), none)
         else {
             panic!("a picture")
         };
         assert_eq!(bytes, png(3, 2));
+        assert_eq!((info.ext, info.width, info.height), ("png", 3, 2));
+        // Pasted, it is one undo step "Paste", as Word names it.
+        let mut ed = editor(&["x"]);
+        let mut pkg = None;
+        assert!(insert_picture(&mut ed, &mut pkg, &bytes, &info, "Paste").changed);
+        assert_eq!(ed.undo_names().first().map(String::as_str), Some("Paste"));
         // A browser's Copy Image: the picture beside its <img> HTML.
         assert_eq!(
             from(paste_source(None, &ClipRead::NotText, None, img(), html)),
@@ -1971,5 +1980,33 @@ mod tests {
         let rids = picture_rids(&dst, 0);
         assert_eq!(rids.len(), 2);
         assert_eq!(rids[0], rids[1]);
+    }
+
+    #[test]
+    fn a_pasted_picture_takes_no_id_an_orphan_picture_names_1953() {
+        // Our clip, copied from a document with a picture.
+        let mut src = editor(&["ab"]);
+        let mut src_pkg = None;
+        src.caret = Caret::at(vec![0], 1);
+        put(&mut src, &mut src_pkg, &png(3, 2));
+        select(&mut src, 0, 3);
+        let clip = src.copy().expect("a selection");
+        let media = pictures::capture(src_pkg.as_ref().unwrap(), BODY_PART, &clip);
+        // The host shows another document, without its package: its
+        // picture names rId2, which no package defines.
+        let mut dst = editor(&["x"]);
+        let orphan = docxcore::image::inline_picture_run("rId2", 9525, 9525, 7, "Old");
+        dst.caret = Caret::at(vec![0], 1);
+        dst.insert_object(vec![Inline::Raw(orphan)]);
+        let mut dst_pkg = None;
+        assert!(paste_clip(&mut dst, &mut dst_pkg, clip, Some(&media)).changed);
+        let rids = picture_rids(&dst, 0);
+        assert_eq!(rids.len(), 2);
+        assert_eq!(rids[0], "rId2", "the orphan keeps its id");
+        assert_ne!(rids[1], "rId2");
+        let pkg = dst_pkg.unwrap();
+        assert!(pkg.part_rel_target(BODY_PART, "rId2").is_none());
+        let target = pkg.part_rel_target(BODY_PART, &rids[1]).unwrap();
+        assert_eq!(pkg.part(&target), Some(&png(3, 2)[..]));
     }
 }

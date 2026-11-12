@@ -261,7 +261,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   unreferenced), its pixels at 96 dpi scaled to the caret's section's text
   width, the last section's through `print_sheet::last_sect` (so a
   document with no sectPr is capped at Letter's), a `docPr` id past every
-  story's, one undo step "Insert Picture". Its rId is none a body picture
+  story's, one undo step "Insert Picture" (a pasted image's is "Paste"). Its rId is none a body picture
   already names (`Package::add_part_image_avoiding`): a document handed
   over without its package keeps its pictures' `r:embed`s, which must not
   start drawing the new one. A view given no package is given
@@ -278,9 +278,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   pastes the picture. The view never writes an image, so an image proves
   another copy and only the RTF goes before it. An image `sniff` cannot
   read counts as none, so the HTML or text after it still pastes. Ours
-  brings its pictures' media into the view's package (`pictures::carry`,
-  which reuses a part with the same bytes; a package is made first when a
-  picture needs one). A document tab's copy reaches the view through its
+  brings its pictures' media into the view's package
+  (`pictures::carry_avoiding`, which reuses a part with the same bytes and
+  adds none under an id a body picture already names,
+  `Package::add_part_media_avoiding`; a package is made first when a
+  picture needs one). The clip outlives `set_document`: a copy from one
+  document pastes into the next. A document tab's copy reaches the view through its
   RTF (formatting kept, pictures not: the view cannot read its window's
   `Docxy`, whose update a host call may be inside), and a view copy
   reaches a document tab the same way.
@@ -293,8 +296,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   on X11 every read transfers the image again, and two reads need not see
   the same copy.
 - Ctrl+V is taken in the editing mode even with nothing to paste, as a
-  document tab takes it. Each paste is one undo step "Paste", and
-  `on_change` fires only on a change.
+  document tab takes it. Each paste is one undo step named "Paste", a
+  clipboard image's too (`insert_picture`'s `step`, as Word's undo names
+  it; the host's `insert_picture` is "Insert Picture"), and `on_change`
+  fires only on a change.
 - Harness: `ext-doc-call` takes `{"insert_picture": {"hex": <bytes>,
   "content_type": <type>}}` and `{"paste": true}`; `clipboard write` takes
   `image_hex` (the private clipboard's image, dropped by any later text

@@ -505,7 +505,13 @@ impl DocView {
             return false;
         };
         self.seed_styles();
-        let done = edit::insert_picture(&mut self.editor, &mut self.pkg, bytes, &info);
+        let done = edit::insert_picture(
+            &mut self.editor,
+            &mut self.pkg,
+            bytes,
+            &info,
+            "Insert Picture",
+        );
         if done.ran {
             self.after_edit(done.changed, cx);
         }
@@ -542,10 +548,10 @@ impl DocView {
         });
         match source {
             None => edit::Formatted::default(),
-            Some(edit::Pasted::Picture(bytes)) => match docxcore::image::sniff(&bytes) {
-                Some(info) => edit::insert_picture(&mut self.editor, &mut self.pkg, &bytes, &info),
-                None => edit::Formatted::default(),
-            },
+            // Word's undo names a pasted picture "Paste".
+            Some(edit::Pasted::Picture(bytes, info)) => {
+                edit::insert_picture(&mut self.editor, &mut self.pkg, &bytes, &info, "Paste")
+            }
             Some(edit::Pasted::Clip(from, clip)) => {
                 // Only the view's own clip carries its pictures' media.
                 let media = self
@@ -2334,17 +2340,6 @@ fn painted_hits(words: &Words, hits: &[(Vec<usize>, usize, usize)]) -> Vec<Bound
         ));
     }
     out
-}
-
-/// The text and RTF a copy of `editor`'s selection writes (the RTF resolves
-/// styles through `pkg`, as a document copy's does); `None` with no selection.
-/// The view's copy writes [`clip_payload`] of the clip it keeps (#1953).
-#[cfg(test)]
-pub(crate) fn copy_payload(
-    editor: &Editor,
-    pkg: Option<&Package>,
-) -> Option<(String, Option<String>)> {
-    Some(clip_payload(&editor.copy()?, pkg))
 }
 
 /// A colour as `rrggbb`, with no `#`: a case's `#` starts a comment.

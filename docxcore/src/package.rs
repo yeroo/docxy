@@ -2667,6 +2667,21 @@ impl Package {
         self.add_media_rel(part, bytes, ext, content_type, &[])
     }
 
+    /// [`Package::add_part_media`] whose new relationship id is none of
+    /// `taken`, as [`Package::add_part_image_avoiding`] (#1953): for media a
+    /// paste carries into a story whose pictures may name ids its rels do
+    /// not define.
+    pub fn add_part_media_avoiding(
+        &mut self,
+        part: &str,
+        bytes: &[u8],
+        ext: &str,
+        content_type: &str,
+        taken: &[String],
+    ) -> Option<String> {
+        self.add_media_rel(part, bytes, ext, content_type, taken)
+    }
+
     /// [`Package::add_part_media`], its relationship id none of `taken`.
     fn add_media_rel(
         &mut self,
