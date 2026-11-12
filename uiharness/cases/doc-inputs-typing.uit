@@ -29,8 +29,10 @@ test document doc-find: focus by click
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -50,8 +52,10 @@ test document doc-find: types
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -69,8 +73,10 @@ test document doc-find: edits
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -102,8 +108,10 @@ test document doc-find: select-all replaces
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -124,8 +132,10 @@ test document doc-find: copies
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -144,8 +154,10 @@ test document doc-find: pastes
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -164,8 +176,10 @@ test document doc-find: focus by Tab
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -183,8 +197,10 @@ test document doc-find: Enter selects the next match
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -205,8 +221,10 @@ test document doc-find: Escape closes the bar
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -230,8 +248,10 @@ test document doc-replace: focus by click
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -251,8 +271,10 @@ test document doc-replace: types
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -270,8 +292,10 @@ test document doc-replace: edits
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -303,8 +327,10 @@ test document doc-replace: select-all replaces
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -325,8 +351,10 @@ test document doc-replace: copies
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -345,8 +373,10 @@ test document doc-replace: pastes
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -365,8 +395,10 @@ test document doc-replace: focus by Tab
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -384,8 +416,10 @@ test document doc-replace: Enter replaces the current match
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -406,8 +440,10 @@ test document doc-replace: Replace rewrites one match
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -428,8 +464,10 @@ test document doc-replace: All rewrites every match
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
@@ -450,8 +488,10 @@ test document doc-replace: Escape closes the bar
   call real-key {"key":"ctrl+f"}
   assert find_open is true
   call pointer-click {"input":"doc-find"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call pointer-click {"input":"doc-replace"}
+  call real-key {"key":"end"}
   call real-key {"key":"backspace","times":60}
   call selection-set {"start":0,"end":0}
   assert find_open is true
