@@ -1,0 +1,43 @@
+# The sheet tab's inline rename refuses a name Excel refuses (#2115): over
+# 31 characters, any of [ ] : * ? / \, or an apostrophe first or last. Enter
+# keeps the sheet's name, closes the bar and says why on the status line
+# (Excel keeps the bar open behind a message box). Every key after the
+# bar opens is real (`real-key`, `real-type`, a real click). Run with:
+#
+#   cargo run -p uiharness -- run uiharness/cases/sheet-tab-rename-refused.uit
+#
+# basic.xlsx's one sheet is Sheet1 (six characters to clear).
+
+test enter refuses a name with a slash and says why
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-tab-rename"}
+  call real-key {"key":"backspace","times":6}
+  call real-type {"text":"Bad/Name"}
+  call real-key {"key":"enter"}
+  call field-read {"input":"sheet-tab-rename"}
+  assert reply.focused is false
+  assert sheet is Sheet1
+  assert status is Sheet name cannot contain [ ] : * ? / \
+
+test enter refuses a name longer than 31 characters and says why
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-tab-rename"}
+  call real-key {"key":"backspace","times":6}
+  call real-type {"text":"abcdefghijklmnopqrstuvwxyz012345"}
+  call real-key {"key":"enter"}
+  assert sheet is Sheet1
+  assert status is Sheet name is longer than 31 characters
+
+test enter takes 31 characters and an apostrophe inside
+  open copy:../fixtures/basic.xlsx
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-tab-rename"}
+  call real-key {"key":"backspace","times":6}
+  call real-type {"text":"Bob's abcdefghijklmnopqrstuvwxy"}
+  call real-key {"key":"enter"}
+  assert sheet is Bob's abcdefghijklmnopqrstuvwxy
