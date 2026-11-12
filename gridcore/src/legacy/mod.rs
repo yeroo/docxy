@@ -721,7 +721,8 @@ pub(crate) fn valid_sheet_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec
                 }
             })
             .collect();
-        let mut name = cut(clean.trim_matches('\''), SHEET_NAME_MAX);
+        // Cut, then trim: a cut may end on an apostrophe Excel refuses there.
+        let mut name = cut(&clean, SHEET_NAME_MAX).trim_matches('\'').to_string();
         if name.trim().is_empty() {
             name = format!("Sheet{}", i + 1);
         }
@@ -1190,6 +1191,33 @@ mod tests {
         // A long repeat stays within 31 characters.
         let two = valid_sheet_names([long.as_str(), long.as_str()].into_iter());
         assert_eq!(two[1], format!("{} (2)", "x".repeat(27)));
+    }
+
+    /// #2115: a name cut to 31 characters ending on an apostrophe loses it,
+    /// so every cleaned name is one a rename would take.
+    #[test]
+    fn cleaned_sheet_names_pass_the_rename_rule() {
+        let cut_on_quote = format!("{}'b", "a".repeat(30));
+        let long = "y".repeat(40);
+        let quoted_long = format!("'{}'", "z".repeat(35));
+        let raw = [
+            cut_on_quote.as_str(),
+            "'x'",
+            long.as_str(),
+            long.as_str(),
+            quoted_long.as_str(),
+            "''",
+            "a:b",
+            "A:B",
+        ];
+        let got = valid_sheet_names(raw.into_iter());
+        assert_eq!(got[0], "a".repeat(30));
+        assert_eq!(got[1], "x");
+        assert_eq!(got[3], format!("{} (2)", "y".repeat(27)));
+        assert_eq!(got[5], "Sheet6");
+        for n in &got {
+            assert_eq!(crate::sheet::sheet_name_error(n), None, "{n:?}");
+        }
     }
 
     /// Each external link becomes a part, numbered in order and named from

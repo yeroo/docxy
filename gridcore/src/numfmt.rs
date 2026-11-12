@@ -832,7 +832,9 @@ fn render_section(
         return render_date(sect, x, date1904);
     }
     if let Some(f) = sect.fraction {
-        return render_fraction(f, x, original);
+        // A section that owns the sign (`# ?/8;# ?/4`) prints none of its own.
+        let sign_of = if explicit_sign { x } else { original };
+        return render_fraction(f, x, sign_of);
     }
     render_number(sect, x, explicit_sign)
 }
@@ -1642,6 +1644,9 @@ mod tests {
         assert_eq!(fmt("# ?/?", 2.0), "2    ");
         assert_eq!(fmt("# ??/??", 0.3125), "  5/16");
         assert_eq!(fmt("?/?", 1.5), "3/2");
+        // #2115: a negative section owns the sign: none is printed.
+        assert_eq!(fmt("# ?/?;# ?/?", -1.5), "1 1/2");
+        assert_eq!(fmt("# ?/?;# ?/?", 1.5), "1 1/2");
     }
 
     /// #2115 (plan-fraction): a fixed denominator (`# ?/4`, `# ??/100`)
@@ -1663,8 +1668,9 @@ mod tests {
         assert_eq!(fmt("# ??/100", 0.37), " 37/100");
         assert_eq!(fmt("# ??/100", 1.999), "2       ");
         assert_eq!(fmt("# ?/10", 0.25), " 3/10");
-        // Its own section among others.
+        // Its own section among others; the negative section owns the sign.
         assert_eq!(fmt("# ?/8;# ?/4", 0.5), " 4/8");
+        assert_eq!(fmt("# ?/8;# ?/4", -0.5), " 2/4");
     }
 
     /// #2115 (plan-fraction): a digit 1-9 is a fixed denominator only right
