@@ -28,7 +28,7 @@
 mod edit;
 mod find;
 
-pub use edit::{CaretFormat, DocFormat};
+pub use edit::{CaretFormat, DocFormat, DocLink};
 pub(crate) use find::FindState;
 
 use super::*;
@@ -306,7 +306,9 @@ impl DocView {
     /// the document tab's ribbon applies it: one undo step. True when it ran;
     /// false, changing nothing, on a read-only view or for a command it
     /// cannot run (an empty font name, a size outside 1..1638 pt, a colour
-    /// that is not `RRGGBB`, a highlight that is not Word's). Pressing the
+    /// that is not `RRGGBB`, a highlight that is not Word's, a link's URL
+    /// that is empty or holds a control character, Edit Link or Remove Link
+    /// with no link at the caret: [`DocFormat::InsertLink`]). Pressing the
     /// host's button may have taken the focus: give it back
     /// ([`DocView::focus_handle`]), as the caret draws only while the view
     /// is focused.
@@ -415,7 +417,9 @@ impl DocView {
     }
 
     /// The formatting at the caret, for the host ribbon's pressed states:
-    /// see [`CaretFormat`].
+    /// see [`CaretFormat`]. Its `link` reads in either mode, as the
+    /// read-only view places a caret and selects too; only an editable view
+    /// runs the link commands.
     pub fn caret_format(&self) -> CaretFormat {
         edit::caret_format(&self.editor)
     }
@@ -2213,6 +2217,15 @@ fn caret_format_json(f: &CaretFormat) -> ctlcore::json::Json {
         ("bullets", Json::Bool(f.bullets)),
         ("numbering", Json::Bool(f.numbering)),
         ("align", Json::Str(align_name(f.align).into())),
+        (
+            "link",
+            f.link.as_ref().map_or(Json::Null, |l| {
+                Json::obj(vec![
+                    ("text", Json::Str(l.text.clone())),
+                    ("url", Json::Str(l.url.clone())),
+                ])
+            }),
+        ),
     ])
 }
 

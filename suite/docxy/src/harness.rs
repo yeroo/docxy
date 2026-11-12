@@ -1829,11 +1829,13 @@ enum ExtDocCall {
 /// align-center, align-right, align-justify), `{"font": <name>}`,
 /// `{"size": <points>}`, `{"color": <RRGGBB or null>}`, `{"highlight":
 /// <name or null>}`, `{"undo": true}`, `{"redo": true}`, `{"insert_text":
-/// <text>}`, `{"copy": true}` or `{"cut": true}` (#1977).
+/// <text>}`, `{"copy": true}` or `{"cut": true}` (#1977), `{"insert_link":
+/// {"text": <text>, "url": <url>}}`, `{"edit_link": {"text": <text>, "url":
+/// <url>}}` or `{"remove_link": true}` (#1952).
 fn ext_doc_call(args: &Json) -> Result<ExtDocCall, String> {
     use crate::ext::DocFormat as F;
     use docxcore::model::Align;
-    const USAGE: &str = "ext-doc-call takes one of 'format', 'font', 'size', 'color', 'highlight', 'undo', 'redo', 'insert_text', 'copy' or 'cut'";
+    const USAGE: &str = "ext-doc-call takes one of 'format', 'font', 'size', 'color', 'highlight', 'undo', 'redo', 'insert_text', 'copy', 'cut', 'insert_link', 'edit_link' or 'remove_link'";
     let keys = [
         "format",
         "font",
@@ -1845,6 +1847,9 @@ fn ext_doc_call(args: &Json) -> Result<ExtDocCall, String> {
         "insert_text",
         "copy",
         "cut",
+        "insert_link",
+        "edit_link",
+        "remove_link",
     ];
     let given: Vec<&str> = keys
         .iter()
@@ -1897,25 +1902,49 @@ fn ext_doc_call(args: &Json) -> Result<ExtDocCall, String> {
             let text = value.as_str().ok_or("'insert_text' must be a string")?;
             return Ok(ExtDocCall::InsertText(text.to_string()));
         }
+        "insert_link" | "edit_link" => {
+            let field = |name: &str| {
+                value
+                    .get(name)
+                    .and_then(Json::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("'{key}' takes {{\"text\": <text>, \"url\": <url>}}"))
+            };
+            let (text, url) = (field("text")?, field("url")?);
+            if key == "insert_link" {
+                F::InsertLink { text, url }
+            } else {
+                F::EditLink { text, url }
+            }
+        }
+        "remove_link" => {
+            if *value != Json::Bool(true) {
+                return Err("'remove_link' must be true".into());
+            }
+            F::RemoveLink
+        }
         _ => unreachable!("a listed key"),
     }))
 }
 
 /// `ext-doc-document`'s reply: the document's top-level paragraphs (a table
 /// is `{"table": true}`), each with its text, list (`num_id`, `ilvl`),
-/// alignment and runs (text, bold, italic, underline; a link's runs among
-/// them), and whether the package has a numbering part.
+/// alignment and runs (text, bold, italic, underline, colour; a link's runs
+/// among them, with its URL or `#` and bookmark as `link`, #1952), and
+/// whether the package has a numbering part.
 fn ext_doc_document_json(
     doc: &docxcore::model::Document,
     pkg: Option<&docxcore::package::Package>,
 ) -> Json {
     use docxcore::model::{Block, Inline, Run};
-    fn run_json(r: &Run) -> Json {
+    fn run_json(r: &Run, link: Option<String>) -> Json {
         Json::obj(vec![
             ("text", Json::Str(r.text.clone())),
             ("bold", Json::Bool(r.props.bold)),
             ("italic", Json::Bool(r.props.italic)),
             ("underline", Json::Bool(r.props.underline)),
+            ("color", r.props.color.clone().map_or(Json::Null, Json::Str)),
+            ("link", link.map_or(Json::Null, Json::Str)),
         ])
     }
     let blocks = doc
@@ -1927,8 +1956,23 @@ fn ext_doc_document_json(
                     .content
                     .iter()
                     .flat_map(|c| match c {
-                        Inline::Run(r) => vec![run_json(r)],
-                        Inline::Hyperlink(h) => h.runs.iter().map(run_json).collect(),
+                        Inline::Run(r) => vec![run_json(r, None)],
+                        Inline::Hyperlink(h) => {
+                            let url = h
+                                .target
+                                .clone()
+                                .or_else(|| h.anchor.as_ref().map(|a| format!("#{a}")))
+                                .unwrap_or_default();
+                            let content = h.content.iter().filter_map(|c| match c {
+                                Inline::Run(r) => Some(r),
+                                _ => None,
+                            });
+                            h.runs
+                                .iter()
+                                .chain(content)
+                                .map(|r| run_json(r, Some(url.clone())))
+                                .collect()
+                        }
                         _ => Vec::new(),
                     })
                     .collect();
@@ -9478,7 +9522,31 @@ mod tests {
         );
         assert_eq!(call(r#"{"copy":true}"#), Ok(ExtDocCall::Copy));
         assert_eq!(call(r#"{"cut":true}"#), Ok(ExtDocCall::Cut));
+        // #1952: the host's link dialog.
+        assert_eq!(
+            call(r#"{"insert_link":{"text":"Beta","url":"https://b.example/"}}"#),
+            Ok(ExtDocCall::Format(F::InsertLink {
+                text: "Beta".into(),
+                url: "https://b.example/".into()
+            }))
+        );
+        assert_eq!(
+            call(r##"{"edit_link":{"text":"","url":"#top"}}"##),
+            Ok(ExtDocCall::Format(F::EditLink {
+                text: String::new(),
+                url: "#top".into()
+            }))
+        );
+        assert_eq!(
+            call(r#"{"remove_link":true}"#),
+            Ok(ExtDocCall::Format(F::RemoveLink))
+        );
         for bad in [
+            r#"{"insert_link":"https://b.example/"}"#,
+            r#"{"insert_link":{"url":"https://b.example/"}}"#,
+            r#"{"edit_link":{"text":"a","url":3}}"#,
+            r#"{"remove_link":false}"#,
+            r#"{"remove_link":true,"cut":true}"#,
             r#"{"insert_text":3}"#,
             r#"{"insert_text":null}"#,
             r#"{"cut":false}"#,

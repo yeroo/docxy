@@ -71,6 +71,46 @@ pub enum DocFormat {
     Outdent,
     /// The selected paragraphs' alignment.
     Align(Align),
+    /// Make the selection a hyperlink to `url` showing `text` (#1952), as a
+    /// host's Insert Link dialog does; at a collapsed caret, insert one.
+    /// `url` is trimmed; `#name` links to the bookmark `name`. When `text`
+    /// is the selection's own text ([`DocView::selected_text`], which the
+    /// host's dialog prefills) and the selection is text of one paragraph,
+    /// the selected text keeps its formatting; otherwise the selection is
+    /// replaced by `text` (one line: line ends and tabs become spaces). An
+    /// empty `text` shows the URL. The link is underlined and coloured
+    /// `0563C1` (unless the text has a colour). Inside a link the new one
+    /// splits it: links never nest. The caret ends after it. Not run for an
+    /// empty URL, a bare `#` or one holding a control character.
+    InsertLink {
+        text: String,
+        url: String,
+    },
+    /// Edit the link at the caret ([`CaretFormat::link`]): link it to `url`
+    /// and, when `text` is not empty and differs from the link's text, show
+    /// `text` in the formatting of the link's first character. The caret
+    /// ends after the link. Not run off a link or for a URL
+    /// [`DocFormat::InsertLink`] refuses; run with no change (no undo step,
+    /// no [`DocView::on_change`]) for the link's own URL and text.
+    EditLink {
+        text: String,
+        url: String,
+    },
+    /// Remove the link at the caret ([`CaretFormat::link`]): its text stays,
+    /// without the link's underline and colour. Not run off a link.
+    RemoveLink,
+}
+
+/// A hyperlink as a host's link dialog shows it ([`CaretFormat::link`]).
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct DocLink {
+    /// The link's text.
+    pub text: String,
+    /// Its target URL, `#` and its bookmark for a link inside the
+    /// document, or `target#anchor` for a link with both (a URL's fragment
+    /// as Word stores it).
+    pub url: String,
 }
 
 /// The formatting at the caret, for a host ribbon's pressed states
@@ -102,6 +142,13 @@ pub struct CaretFormat {
     pub numbering: bool,
     /// The caret paragraph's alignment.
     pub align: Align,
+    /// The link at the caret (#1952), for a host's Edit Link and Remove Link
+    /// and to prefill its dialog: the one typing at the caret goes into, so
+    /// a caret just after a link is on it, and one at its start after other
+    /// text is not (a link that opens the paragraph holds a caret at 0);
+    /// over a selection, the link holding the whole selection. `None` off a
+    /// link.
+    pub link: Option<DocLink>,
 }
 
 /// The top-level blocks an edit at `ed`'s caret and selection can change:
@@ -482,9 +529,28 @@ pub(crate) fn apply_format(ed: &mut Editor, pkg: Option<&mut Package>, f: &DocFo
             let a = *a;
             Box::new(move |ed| ed.set_align(a))
         }
+        DocFormat::InsertLink { text, url } => {
+            return link_step(ed, |ed| ed.insert_hyperlink(text, url));
+        }
+        DocFormat::EditLink { text, url } => {
+            return link_step(ed, |ed| ed.edit_hyperlink(text, url));
+        }
+        DocFormat::RemoveLink => return link_step(ed, Editor::remove_hyperlink),
     };
     ed.break_undo_group();
     ran(edit(ed, op))
+}
+
+/// A link command, which may not run (a refused URL, no link at the caret):
+/// a step of its own, as every host command is, run when `f` says so.
+fn link_step(ed: &mut Editor, f: impl FnOnce(&mut Editor) -> bool) -> Formatted {
+    ed.break_undo_group();
+    let mut ran = false;
+    let out = edit(ed, |ed| ran = f(ed));
+    Formatted {
+        ran,
+        changed: ran && out.changed(),
+    }
 }
 
 /// The formatting at `ed`'s caret.
@@ -502,6 +568,10 @@ pub(crate) fn caret_format(ed: &Editor) -> CaretFormat {
         bullets: ed.all_in_list(NUM_BULLET),
         numbering: ed.all_in_list(NUM_DECIMAL),
         align: ed.caret_para_props().align,
+        link: ed.caret_link().map(|l| DocLink {
+            text: l.text,
+            url: l.url,
+        }),
     }
 }
 
@@ -1206,5 +1276,96 @@ mod tests {
         assert!(matches!(out, KeyOutcome::Cut(_, false)), "{out:?}");
         assert!(!out.changed());
         assert_eq!(keyed.doc.body, before);
+    }
+
+    /// #1952: the host's link commands report whether they ran and whether
+    /// the document changed, each one undo step, and the caret's link reads
+    /// back.
+    #[test]
+    fn link_commands_run_change_and_read_back_1952() {
+        let insert = |text: &str, url: &str| DocFormat::InsertLink {
+            text: text.into(),
+            url: url.into(),
+        };
+        let mut ed = editor(&["Say Beta now"]);
+        select(&mut ed, 4, 8);
+        assert_eq!(caret_format(&ed).link, None);
+        // A URL it refuses: not run, the selection kept.
+        let out = apply_format(&mut ed, None, &insert("Beta", " "));
+        assert_eq!((out.ran, out.changed), (false, false));
+        assert!(ed.has_selection());
+        let out = apply_format(&mut ed, None, &insert("Beta", "https://b.example/"));
+        assert_eq!((out.ran, out.changed), (true, true));
+        let link = caret_format(&ed)
+            .link
+            .expect("the caret is at the link's end");
+        assert_eq!(
+            (link.text.as_str(), link.url.as_str()),
+            ("Beta", "https://b.example/")
+        );
+        assert!(caret_format(&ed).underline);
+        // The same text and URL: run, nothing changed, no step.
+        let steps = ed.undo_names().len();
+        let edit_to = |text: &str, url: &str| DocFormat::EditLink {
+            text: text.into(),
+            url: url.into(),
+        };
+        let out = apply_format(&mut ed, None, &edit_to("Beta", "https://b.example/"));
+        assert_eq!((out.ran, out.changed), (true, false));
+        assert_eq!(ed.undo_names().len(), steps);
+        let out = apply_format(&mut ed, None, &edit_to("Gamma", "#top"));
+        assert_eq!((out.ran, out.changed), (true, true));
+        assert_eq!(text(&ed, 0), "Say Gamma now");
+        assert_eq!(
+            caret_format(&ed).link.map(|l| l.url).as_deref(),
+            Some("#top")
+        );
+        let out = apply_format(&mut ed, None, &DocFormat::RemoveLink);
+        assert_eq!((out.ran, out.changed), (true, true));
+        assert_eq!(caret_format(&ed).link, None);
+        assert_eq!(text(&ed, 0), "Say Gamma now");
+        // Off a link Edit and Remove do not run.
+        let out = apply_format(&mut ed, None, &DocFormat::RemoveLink);
+        assert_eq!((out.ran, out.changed), (false, false));
+        let out = apply_format(&mut ed, None, &edit_to("x", "https://x.example/"));
+        assert_eq!((out.ran, out.changed), (false, false));
+        // Three steps, taken back one at a time.
+        assert_eq!(
+            ed.undo_names(),
+            ["Remove Hyperlink", "Edit Hyperlink", "Hyperlink"]
+        );
+        assert!(history(&mut ed, false).changed);
+        assert_eq!(
+            caret_format(&ed).link.map(|l| l.text).as_deref(),
+            Some("Gamma")
+        );
+        assert!(history(&mut ed, false).changed);
+        assert_eq!(text(&ed, 0), "Say Beta now");
+        assert!(history(&mut ed, false).changed);
+        assert!(ed.doc.body[0] == para("Say Beta now"));
+    }
+
+    /// #1952: typed text right after a new link goes into it, so the caret
+    /// there is on the link; the next undo step takes the typing alone.
+    #[test]
+    fn typing_after_a_new_link_extends_it_1952() {
+        let mut ed = editor(&["Hi "]);
+        ed.caret = Caret::at(vec![0], 3);
+        let out = apply_format(
+            &mut ed,
+            None,
+            &DocFormat::InsertLink {
+                text: String::new(),
+                url: "https://u.example/".into(),
+            },
+        );
+        assert!(out.ran && out.changed);
+        type_text(&mut ed, "x");
+        assert_eq!(
+            caret_format(&ed).link.map(|l| l.text).as_deref(),
+            Some("https://u.example/x")
+        );
+        assert!(history(&mut ed, false).changed);
+        assert_eq!(text(&ed, 0), "Hi https://u.example/");
     }
 }

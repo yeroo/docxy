@@ -10,7 +10,9 @@
 use docxcore::model::Align;
 use docxcore::model::Document;
 use docxcore::package::Package;
-use docxy_suite::ext::{self, CaretFormat, DocFormat, DocView, Extensions, LinkClick, TabSurface};
+use docxy_suite::ext::{
+    self, CaretFormat, DocFormat, DocLink, DocView, Extensions, LinkClick, TabSurface,
+};
 use gpui::{
     AnyView, App, AppContext as _, Edges, Entity, FocusHandle, Hsla, Pixels, Window, px, rgb,
 };
@@ -86,8 +88,8 @@ fn embed(doc: Document, pkg: Package, cx: &mut App) -> Reader {
 }
 
 /// A mail body: the view made editable, the host ribbon's commands, its
-/// pressed states, its Insert, Copy and Cut (#1977), the change event and
-/// what is exported (#1947).
+/// pressed states, its Insert, Copy and Cut (#1977), its link dialog
+/// (#1952), the change event and what is exported (#1947).
 fn compose(doc: Document, pkg: Package, cx: &mut App) -> Rc<Cell<usize>> {
     let changes: Rc<Cell<usize>> = Rc::default();
     let view = cx.new(|cx| DocView::new(doc, Some(pkg), cx));
@@ -111,6 +113,16 @@ fn compose(doc: Document, pkg: Package, cx: &mut App) -> Rc<Cell<usize>> {
             DocFormat::Indent,
             DocFormat::Outdent,
             DocFormat::Align(Align::Center),
+            // The host's link dialog (#1952).
+            DocFormat::InsertLink {
+                text: "docs".into(),
+                url: "https://example.com/".into(),
+            },
+            DocFormat::EditLink {
+                text: String::new(),
+                url: "#top".into(),
+            },
+            DocFormat::RemoveLink,
         ] {
             let _ran: bool = v.format(f, cx);
         }
@@ -120,6 +132,9 @@ fn compose(doc: Document, pkg: Package, cx: &mut App) -> Rc<Cell<usize>> {
         let _boxes: (Option<String>, Option<f32>) = (shown.font, shown.size);
         let _colours: (Option<String>, Option<String>) = (shown.color, shown.highlight);
         let _lists: (bool, bool, Align) = (shown.bullets, shown.numbering, shown.align);
+        // The link at the caret prefills the host's Edit Link dialog.
+        let link: Option<DocLink> = shown.link;
+        let _dialog: Option<(String, String)> = link.map(|l| (l.text, l.url));
         let _undone: bool = v.can_undo() && v.undo(cx);
         let _redone: bool = v.can_redo() && v.redo(cx);
         // The host's Insert, Copy and Cut buttons (#1977).

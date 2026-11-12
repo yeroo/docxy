@@ -136,7 +136,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   `on_change(Fn(&mut App))`, `document()` (`export_doc`), `package()` (a
   clone, with the numbering part a first list added). Host calls on a
   read-only view return false and change nothing. `DocFormat` and
-  `CaretFormat` are `#[non_exhaustive]` (#1952 adds links).
+  `CaretFormat` are `#[non_exhaustive]` (#1952 added links).
 - The decisions are `doc_view/edit.rs`, over a plain `Editor` and
   `Option<&mut Package>` (unit-tested without a window): `edit_key` (the
   document tab's `on_key` editing map: navigation with Shift extending,
@@ -196,7 +196,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   replies `document()`'s top-level paragraphs (`text`, `num_id`, `ilvl`,
   `align`, `runs` with `text`/`bold`/`italic`/`underline`) and
   `package_has_numbering`. `uiharness/cases/ext-doc-edit.uit` drives it.
-- Not done here: hyperlinks (#1952); pictures from bytes and paste of
+- Not done here: pictures from bytes and paste of
   pictures or the suite's formatted clipboard (#1953), so Ctrl+V bubbles
   as before; line-wise Up/Down (paragraph-wise, `move_vert`, as a document
   tab); AutoCorrect, Repeat; IME, dead keys and Windows' WM_CHAR packet
@@ -243,6 +243,79 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   `ext-doc-call`) add `can_copy`. The `issue 1977` test in
   `uiharness/cases/ext-doc-edit.uit` copies "Beta", then cuts the whole
   paragraph, so the second clipboard read can only be the cut's.
+
+## Host hyperlinks (#1952)
+
+- `DocFormat::InsertLink { text, url }`, `EditLink { text, url }`,
+  `RemoveLink` through `DocView::format`, and `CaretFormat::link:
+  Option<DocLink>` (`DocLink { text, url }`, `#[non_exhaustive]`, `url` the
+  target, `#bookmark`, or `target#anchor` for a link with both, which is how
+  Word stores a URL's fragment): a host's link dialog prefills from
+  `selected_text()` or `caret_format().link`. Each runs as one undo step
+  ("Hyperlink", "Edit Hyperlink", "Remove Hyperlink") through
+  `edit.rs`'s `link_step`, whose `ran` is the editor method's own answer
+  (a refused URL, or Edit/Remove off a link, do not run); `changed` is the
+  usual body comparison. Read-only refuses all three; `link` still reads
+  (the read-only view places a caret).
+- The decisions are docxcore's (`editor/links.rs`, unit-tested there):
+  `Editor::insert_hyperlink`, `edit_hyperlink`, `remove_hyperlink`,
+  `caret_link`, `link_text`, `LINK_COLOR`. A URL is trimmed; `#name` is the
+  bookmark `name`; empty, a bare `#` or one with a control character or
+  U+FFFE/U+FFFF is refused. `link_text` makes the text one line: line ends,
+  tabs and `LINE_BREAK` a space, other controls and `FIELD_CHAR` dropped
+  (`selected_text()` across paragraphs joins them with `\n`); blank text is
+  the URL, as in Word.
+- The link at the caret is the top-level link typing there goes into
+  (`locate`: a caret between two inlines is the one before's), so a caret
+  just after a link is on it and one at its start after other text is not
+  (a link opening the paragraph holds a caret at 0);
+  a selection is on a link only inside it (its whole text too). This
+  differs on purpose from `doc_view::link_at` (`[start, end)`), which names
+  painted words and follows links. Links inside tracked changes or content
+  controls are not found.
+- Insert wraps when the text is the selection's own and the selection is
+  one paragraph's runs (whole bookmark, comment-range, proofing and
+  permission markers strictly inside allowed; a link holding one is a
+  complex link, `content`): the runs keep their formatting. Decided before
+  anything is split; zero-width inlines at either edge stay outside. Else,
+  and always while tracking (a paste records it), the selection is
+  replaced by one run of the text in the typing props (pending toggles
+  included) through `paste`, so inside a link it lands between the link's
+  halves: old half, new link, old half, never nested (Word would edit the
+  old link instead). A paste at an empty content control inside a link
+  goes into the link, so insert refuses (false, no step) when the caret or
+  either selection end is at a top-level link holding a content control
+  (`pastes_into_a_link`, asked before anything is deleted; #1952 r2). The link look is direct formatting, underline plus
+  `0563C1` unless the run has a colour, not a `Hyperlink` style, which the
+  package may lack. Remove takes off a `0563C1` colour with its underline
+  and a `Hyperlink` character style, nothing else.
+- Edit keeps a loaded link's `raw`: its opener is rewritten
+  (`package::with_opener_attr`: `r:id` removed, `w:anchor` set or removed)
+  and `content_changed` set, so its tooltip, target frame and namespace
+  declarations stay; `rel_id` is `None` and `save_package` now writes the id
+  it mints into a kept opener (`with_opener_rel_id`), as
+  `link_part_hyperlinks` (now over `with_opener_attr` too) does. Both mint
+  for the links in text boxes, tracked changes and target-less links'
+  content too (`collect_inline_links`), and a text box loads with its
+  part's relationships (`load::textbox_blocks`), so a link inserted in a
+  text box keeps its URL (#1952 r2). The link's
+  own URL and text as `caret_link` reads them are no change (true, no
+  step): the URL is compared with `link_url` (so `target#anchor` keeps its
+  fragment), the text after `link_text` on both sides (a TOC-style link's
+  `\t` and field stay; #1952 r1). New text replaces the link's text (runs,
+  tabs, breaks, fields) with one run in the first run's props and keeps its
+  zero-width inlines in place (`retexted_content`: a bookmark the wrap put
+  inside stays). Edit and remove are not recorded while tracking.
+- Harness: `ext-doc-call` takes `{"insert_link": {"text", "url"}}`,
+  `{"edit_link": {"text", "url"}}`, `{"remove_link": true}`;
+  `caret_format` adds `link` (`null` or `{text, url}`); `ext-doc-document`'s
+  runs add `color` and `link` (a complex link's runs in `content` too). The
+  `issue 1952` test in `uiharness/cases/ext-doc-edit.uit` links bold
+  "Beta", edits and removes the fixture's link, undoes each in turn and
+  checks read-only.
+- Not done: a Ctrl+K key or a dialog in the view (Ctrl+K bubbles), the
+  document tab's own Insert > Link (it could call the same methods), a
+  ScreenTip.
 
 ## Page inset and page background (#2003)
 

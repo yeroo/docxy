@@ -6,7 +6,8 @@
 # Line 1..Line 80; see ext-doc-view.uit). The extension calls only the
 # view's public API: `ext-doc-set {"editable":...}` is `set_editable`,
 # `ext-doc-call` is `format` / `undo` / `redo` / `insert_text` / `copy` /
-# `cut` (#1977), `ext-doc-document` reads
+# `cut` (#1977) and the link commands `insert_link` / `edit_link` /
+# `remove_link` (#1952), `ext-doc-document` reads
 # `document()` and `package()`, and `ext-doc-read` adds the caret, its
 # formatting (`caret_format`), whether the caret's painted piece is inside
 # the view (`caret_in_view`), `can_undo` / `can_redo` / `can_copy` and how many change
@@ -325,6 +326,106 @@ test issue 1977 the host inserts text at the caret, and copies and cuts the sele
   assert reply.done is true
   call clipboard {"action":"read"}
   assert reply.text is Alpha
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1952 the host links the selection, edits and removes the link at the caret, each one undo step
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-set {"editable":true}
+  call pointer-drag {"from":"ext-doc-word:Beta:start","to":"ext-doc-word:Beta:end"}
+  call ext-doc-read {}
+  assert reply.selection is Beta
+  assert reply.caret_format.link is nothing
+  assert reply.change_calls is 0
+  # Insert Link with the selection's own text: bold Beta stays bold and
+  # becomes the link; the caret ends at its end, on it.
+  call ext-doc-call {"insert_link":{"text":"Beta","url":"https://example.com/beta"}}
+  assert reply.done is true
+  assert reply.selection is empty
+  assert reply.caret_format.link.url is https://example.com/beta
+  assert reply.caret_format.link.text is Beta
+  assert reply.caret_format.underline is true
+  call ext-doc-read {}
+  assert reply.change_calls is 1
+  assert reply.links.0.url is https://example.com/beta
+  assert reply.links.1.url is https://example.com/docxy
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma
+  assert reply.paragraphs.1.runs.0.link is nothing
+  assert reply.paragraphs.1.runs.1.text is Beta
+  assert reply.paragraphs.1.runs.1.bold is true
+  assert reply.paragraphs.1.runs.1.underline is true
+  assert reply.paragraphs.1.runs.1.color is 0563C1
+  assert reply.paragraphs.1.runs.1.link is https://example.com/beta
+  shot window
+  # The fixture's link under the caret, edited: its URL and its text.
+  call pointer-click {"region":"ext-doc-word:docxy"}
+  call ext-doc-read {}
+  assert reply.caret_format.link.url is https://example.com/docxy
+  assert reply.caret_format.link.text is docxy link
+  call ext-doc-call {"edit_link":{"text":"the docs","url":"https://example.com/docs"}}
+  assert reply.done is true
+  assert reply.caret_format.link.url is https://example.com/docs
+  call ext-doc-read {}
+  assert reply.change_calls is 2
+  assert reply.links.1.url is https://example.com/docs
+  call ext-doc-document {}
+  assert reply.paragraphs.2.text is Follow the the docs here.
+  assert reply.paragraphs.2.runs.1.text is the docs
+  assert reply.paragraphs.2.runs.1.link is https://example.com/docs
+  # Remove Link: the text stays, as plain text.
+  call ext-doc-call {"remove_link":true}
+  assert reply.done is true
+  assert reply.caret_format.link is nothing
+  call ext-doc-read {}
+  assert reply.change_calls is 3
+  assert reply.links.1.url is https://example.com/indented
+  call ext-doc-document {}
+  assert reply.paragraphs.2.text is Follow the the docs here.
+  assert reply.paragraphs.2.runs.1.text is the docs
+  assert reply.paragraphs.2.runs.1.link is nothing
+  shot window
+  # Off a link Edit and Remove do not run, and no change is heard of.
+  call ext-doc-call {"remove_link":true}
+  assert reply.done is false
+  call ext-doc-call {"edit_link":{"text":"x","url":"https://example.com/x"}}
+  assert reply.done is false
+  call ext-doc-read {}
+  assert reply.change_calls is 3
+  # Three undos take each back, one at a time.
+  call ext-doc-call {"undo":true}
+  call ext-doc-document {}
+  assert reply.paragraphs.2.runs.1.link is https://example.com/docs
+  call ext-doc-call {"undo":true}
+  call ext-doc-document {}
+  assert reply.paragraphs.2.text is Follow the docxy link here.
+  assert reply.paragraphs.2.runs.1.link is https://example.com/docxy
+  assert reply.paragraphs.1.runs.1.link is https://example.com/beta
+  call ext-doc-call {"undo":true}
+  assert reply.can_undo is false
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma
+  assert reply.paragraphs.1.runs.1.link is nothing
+  assert reply.paragraphs.1.runs.1.bold is true
+  # Read-only: the caret's link still reads, the three calls do nothing.
+  call ext-doc-set {"editable":false}
+  call pointer-click {"region":"ext-doc-word:docxy"}
+  call ext-doc-read {}
+  assert reply.caret_format.link.url is https://example.com/docxy
+  call ext-doc-call {"insert_link":{"text":"No","url":"https://example.com/no"}}
+  assert reply.done is false
+  call ext-doc-call {"edit_link":{"text":"No","url":"https://example.com/no"}}
+  assert reply.done is false
+  call ext-doc-call {"remove_link":true}
+  assert reply.done is false
+  call ext-doc-read {}
+  assert reply.change_calls is {ext-doc-set.change_calls}
+  assert reply.links.0.url is https://example.com/docxy
+  call ext-doc-document {}
+  assert reply.paragraphs.2.runs.1.link is https://example.com/docxy
   call real-key {"key":"ctrl+w"}
   call tab-list {}
   assert reply.count is 1
