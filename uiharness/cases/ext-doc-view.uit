@@ -173,11 +173,30 @@ test issue 1873 a hyperlink press reaches the extension's callback, by Ctrl+clic
   assert reply.count is 1
 
 test issue 1916 the link under the pointer reaches the extension with its whole text, and the pointer is a hand over it
+  # The pointer's place is this test's own, whatever the test before left:
+  # it leaves the window from the link of a first tab, which then closes.
   call backstage {"action":"open"}
   call backstage-page {"page":"new"}
   call new-card {"card":"new-mail-card"}
   shot window
-  # Plain text: no link, no hand, nothing reported.
+  call pointer-move {"to":"ext-doc-word:docxy"}
+  call pointer-leave {}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+  # A new tab opened with no move since: gpui's last pointer place is on
+  # its link too, but the pointer is out of the window, so the new view
+  # finds no link there and reports nothing (r1).
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call ext-doc-read {}
+  assert reply.hover_count is 0
+  assert reply.hovered is null
+  assert reply.link_hand is false
+  # Plain text: no link, no hand, nothing reported. Every count below
+  # starts from this tab's zero.
   call pointer-move {"to":"ext-doc-word:Alpha"}
   call ext-doc-read {}
   assert reply.hover_count is 0

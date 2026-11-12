@@ -348,8 +348,16 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   pointer on every key. `BlockMouse` overlays still hide it, and the Find
   box (`BlockMouseExceptScroll`) is clipped out. gpui keeps its last mouse
   position on `MouseExited`, so a `pointer_out` latch (set by the exit,
-  cleared by a move, as #1869's `pointer_in_window`) keeps a later frame
-  from finding the link again. On Windows outside the harness
+  cleared by a move) keeps a later frame from finding the link again. Each
+  view has its own latch, and it starts out, as #1869's
+  `pointer_in_window` starts false (r1). A new view (a tab opened or
+  switched to by keyboard after the pointer left the window) never finds a
+  link at the stale position. The cost: a view first shown under a still
+  pointer reports its link only at the first move. A view hidden and shown
+  again with no move in between never saw an exit that came while it was
+  hidden, so it may still read the stale position. The harness's
+  `pointer-click` and `pointer-wheel` send a move first, as the platforms
+  do. On Windows outside the harness
   `window.is_window_hovered()` must hold too (no `MouseExited` there).
 - It is looked at again from Capture-phase `MouseMoveEvent` /
   `MouseExitEvent` window listeners registered in the canvas's paint
@@ -369,9 +377,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   the pointer: the view's own request, since gpui cannot read the cursor
   back). The `issue 1916` tests in `uiharness/cases/ext-doc-view.uit`
   cover pointer moves, `pointer-leave` and frames after it, a wheel under a
-  still pointer, and editable mode with arrow keys. gpui keeps the pointer
-  where the previous test left it, so a new tab may report a link at its
-  first frame: compare against a snapshot.
+  still pointer, a new tab opened after `pointer-leave` over a link
+  (nothing found there), and editable mode with arrow keys. Each test sets
+  its own pointer first (gpui keeps the pointer where the previous test
+  left it) and the editable one counts against `ext-doc-set`'s snapshot.
 
 ## Page inset and page background (#2003)
 

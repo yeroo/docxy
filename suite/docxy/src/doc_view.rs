@@ -144,18 +144,32 @@ type HoverKey = (Vec<usize>, usize);
 /// The link under the pointer (#1916), shared by the view, its overlay
 /// canvas and the window's mouse listeners that canvas registers (they run
 /// outside the view's update, and the view may be mid-render).
-#[derive(Default)]
 struct LinkHoverState {
     /// The last frame's link pieces: a hitbox per painted piece of a link,
     /// clipped to the view clear of the bars and the Find box.
     boxes: RefCell<Vec<(Hitbox, HoverKey, LinkHover)>>,
     /// The link the host was last told about.
     current: RefCell<Option<(HoverKey, LinkHover)>>,
-    /// The pointer left the window (`MouseExited`) and has not moved in
-    /// since: gpui keeps its last position, so without this every repaint
-    /// would find the link it left hovered again.
+    /// The pointer is out of the window as far as this view knows: it left
+    /// (`MouseExited`) and has not moved in since, or no move has reached
+    /// the view yet. gpui keeps its last position after the pointer leaves,
+    /// so without this every repaint would find the link it left hovered
+    /// again. A new view starts out, as #1869's `pointer_in_window` does: it
+    /// cannot know whether the pointer left while it did not exist or was
+    /// hidden (r1).
     pointer_out: Cell<bool>,
     on_hover: RefCell<Option<HoverFn>>,
+}
+
+impl Default for LinkHoverState {
+    fn default() -> Self {
+        LinkHoverState {
+            boxes: RefCell::default(),
+            current: RefCell::default(),
+            pointer_out: Cell::new(true),
+            on_hover: RefCell::default(),
+        }
+    }
 }
 
 impl LinkHoverState {
@@ -548,8 +562,9 @@ impl DocView {
         cx.notify();
     }
 
-    /// Called with a hyperlink's target (its URL, or `#name` for a bookmark
-    /// link) when the person follows it. It runs after the press is handled,
+    /// Called with a hyperlink's target (its URL, `#name` for a bookmark
+    /// link, or `target#anchor` for a link with both, #1916) when the person
+    /// follows it. It runs after the press is handled,
     /// outside the view's update, so it may update the view.
     pub fn on_link(&mut self, f: impl Fn(&str, &mut Window, &mut App) + 'static) {
         self.on_link = Some(Rc::new(f));
@@ -572,9 +587,14 @@ impl DocView {
     /// reports: it draws no tooltip or status of its own. A view that stops
     /// being drawn while a link is under the pointer (taken out of the tree,
     /// or its tab hidden) is not told anything more, so a host clears its
-    /// own status when it hides the view. On Windows gpui sends no event
-    /// when the pointer leaves the window, so leaving it straight from a
-    /// link reports `None` at the next mouse event or frame.
+    /// own status when it hides the view. A view reports nothing until the
+    /// pointer first moves over the window after it is shown the first time,
+    /// so a view that first appears under a still pointer reports that link
+    /// at the first move. A view hidden, then shown again with no move in
+    /// between, cannot tell whether the pointer left the window meanwhile,
+    /// and may report a link at the pointer's last place. On Windows gpui
+    /// sends no event when the pointer leaves the window, so leaving it
+    /// straight from a link reports `None` at the next mouse event or frame.
     pub fn on_link_hover(
         &mut self,
         f: impl Fn(Option<&LinkHover>, &mut Window, &mut App) + 'static,
