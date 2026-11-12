@@ -21,6 +21,7 @@ mod cell_sdt_tests;
 mod cover;
 mod fields;
 mod flat;
+mod links;
 mod loose_fields;
 #[cfg(test)]
 mod object_unit_tests;
@@ -33,6 +34,7 @@ mod tables;
 mod track;
 mod visible;
 pub use flat::{FlatDocument, FlatStory, StoryOffset};
+pub use links::{CaretLink, LINK_COLOR, link_text};
 pub use table_design::BorderCmd;
 pub use table_draw::{DRAW_MIN_HEIGHT, DRAW_MIN_WIDTH, DrawnLine, TableEdge};
 pub use table_layout::{AutoFitKind, CellSep, DeleteShift, SortKey, SortKind, SortSpec};

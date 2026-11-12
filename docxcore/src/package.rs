@@ -4511,6 +4511,12 @@ pub fn save_package(pkg: &Package) -> Vec<u8> {
                 "<Relationship Id=\"{rid}\" Type=\"{HYPERLINK_REL}\" Target=\"{}\" TargetMode=\"External\"/>",
                 esc_xml_attr(target)
             ));
+            // A link that keeps its loaded opener (one edited to a new
+            // target, #1952) writes the id there, as `link_part_hyperlinks`
+            // does: save writes that opener as it is.
+            if let Some(raw) = &mut h.raw {
+                *raw = with_opener_rel_id(raw, &rid);
+            }
             h.rel_id = Some(rid);
         }
         if !new_rels.is_empty() {
@@ -4755,6 +4761,58 @@ fn with_opener_rel_id(raw: &str, rid: &str) -> String {
         return raw.to_string();
     }
     format!("{}{rid}{}", &raw[..start], &raw[end..])
+}
+
+/// A preserved `<w:hyperlink …>` element with its opening tag's attribute
+/// `name` set to `value` (added after the element name when it had none), or
+/// removed with the whitespace before it when `value` is `None`; its children
+/// and other attributes are untouched. An edited link's opener (#1952): the
+/// tooltip, target frame and namespace declarations stay, its `r:id` and
+/// `w:anchor` follow the new target. Anything else than a `w:hyperlink`
+/// start tag comes back unchanged.
+pub(crate) fn with_opener_attr(raw: &str, name: &str, value: Option<&str>) -> String {
+    let mut parser = XmlParser::new(raw);
+    if parser.next() != Event::Start || parser.name() != "w:hyperlink" {
+        return raw.to_string();
+    }
+    let at = |s: &str| (s.as_ptr() as usize).wrapping_sub(raw.as_ptr() as usize);
+    let Some(attr) = parser.attrs().iter().find(|attr| attr.name == name) else {
+        return match value {
+            Some(v) => raw.replacen(
+                "<w:hyperlink",
+                &format!("<w:hyperlink {name}=\"{}\"", esc_opener_value(v)),
+                1,
+            ),
+            None => raw.to_string(),
+        };
+    };
+    // The parser's names and values are slices of `raw`; the closing quote
+    // follows the value.
+    let (name_at, value_at) = (at(attr.name), at(attr.value));
+    let value_end = value_at.wrapping_add(attr.value.len());
+    let opener_end = parser.pos();
+    if value_end >= opener_end || name_at >= value_at || !raw.is_char_boundary(value_end) {
+        return raw.to_string();
+    }
+    match value {
+        Some(v) => format!(
+            "{}{}{}",
+            &raw[..value_at],
+            esc_opener_value(v),
+            &raw[value_end..]
+        ),
+        None => {
+            let start = raw[..name_at]
+                .trim_end_matches([' ', '\t', '\r', '\n'])
+                .len();
+            format!("{}{}", &raw[..start], &raw[value_end + 1..])
+        }
+    }
+}
+
+/// An attribute value for [`with_opener_attr`], escaped for either quote.
+fn esc_opener_value(v: &str) -> String {
+    esc_xml_attr(v).replace('\'', "&apos;")
 }
 
 /// Collect `&mut` references to every external hyperlink (`target` set),
@@ -8380,6 +8438,73 @@ mod tests {
             !xml.contains("rId5") && xml.contains(r#"r:id="rId9""#),
             "{xml}"
         );
+    }
+
+    #[test]
+    fn with_opener_attr_sets_adds_and_removes_1952() {
+        let raw = "<w:hyperlink r:id=\"rId5\"\n  w:tooltip='t' w:anchor=\"old\"><w:r w:anchor=\"x\"/></w:hyperlink>";
+        assert_eq!(
+            with_opener_attr(raw, "w:anchor", Some("a'b")),
+            "<w:hyperlink r:id=\"rId5\"\n  w:tooltip='t' w:anchor=\"a&apos;b\"><w:r w:anchor=\"x\"/></w:hyperlink>"
+        );
+        assert_eq!(
+            with_opener_attr(raw, "r:id", None),
+            "<w:hyperlink\n  w:tooltip='t' w:anchor=\"old\"><w:r w:anchor=\"x\"/></w:hyperlink>"
+        );
+        assert_eq!(
+            with_opener_attr(raw, "w:anchor", None),
+            "<w:hyperlink r:id=\"rId5\"\n  w:tooltip='t'><w:r w:anchor=\"x\"/></w:hyperlink>"
+        );
+        assert_eq!(
+            with_opener_attr("<w:hyperlink w:tooltip=\"t\"/>", "w:anchor", Some("<a>")),
+            "<w:hyperlink w:anchor=\"&lt;a&gt;\" w:tooltip=\"t\"/>"
+        );
+        // Nothing to remove, or not a link: unchanged.
+        assert_eq!(with_opener_attr(raw, "w:history", None), raw);
+        assert_eq!(with_opener_attr("<w:r/>", "r:id", None), "<w:r/>");
+    }
+
+    /// A body link that keeps its loaded opener but lost its id (an edited
+    /// target, #1952) gets the id save mints written into that opener, so
+    /// the new target is the one that reloads, and the opener's other
+    /// attributes stay.
+    #[test]
+    fn save_writes_a_minted_id_into_a_kept_opener_1952() {
+        use crate::model::{Document, Hyperlink, Paragraph, Run};
+        let link = Inline::Hyperlink(Hyperlink {
+            target: Some("https://new.example/".to_string()),
+            rel_id: None,
+            runs: vec![Run {
+                text: "docs".to_string(),
+                ..Run::default()
+            }],
+            raw: Some(
+                "<w:hyperlink w:tooltip=\"tip\"><w:r><w:t>docs</w:t></w:r></w:hyperlink>"
+                    .to_string(),
+            ),
+            content_changed: true,
+            ..Hyperlink::default()
+        });
+        let pkg = new_package(Document {
+            body: vec![Block::Paragraph(Paragraph {
+                content: vec![link],
+                ..Paragraph::default()
+            })],
+        });
+        let saved = save_package(&pkg);
+        let xml = load_package(&saved)
+            .unwrap()
+            .part_text("word/document.xml")
+            .unwrap();
+        assert!(xml.contains("w:tooltip=\"tip\""), "{xml}");
+        let re = load_package(&saved).unwrap();
+        let Block::Paragraph(p) = &re.document.body[0] else {
+            panic!("a paragraph");
+        };
+        let Inline::Hyperlink(h) = &p.content[0] else {
+            panic!("a link: {:?}", p.content);
+        };
+        assert_eq!(h.target.as_deref(), Some("https://new.example/"));
     }
 
     #[test]
