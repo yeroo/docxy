@@ -961,6 +961,13 @@ fn coalesce(mut ranges: Vec<Rect>) -> Vec<Rect> {
     out
 }
 
+/// Is `f`, a formula of a rule of kind `kind`, a list's inline items
+/// (`"a,b"`), text that never shifts? Only a list's: a custom `"Y"=A2`
+/// starts with a quote too, and has references like any other formula.
+fn inline_list(f: &str, kind: &str) -> bool {
+    kind == "list" && f.starts_with('"')
+}
+
 /// `dv`'s formulas moved by (`dr`, `dc`): the meaning a relative reference
 /// has from a rule's anchor, kept when the anchor moves. An inline list and a
 /// formula that won't translate stay as they are.
@@ -968,8 +975,9 @@ fn shift_formulas(dv: &mut DataValidation, dr: i64, dc: i64) {
     if (dr, dc) == (0, 0) {
         return;
     }
+    let kind = dv.kind.as_str();
     for f in [&mut dv.formula1, &mut dv.formula2] {
-        if !f.is_empty() && !f.starts_with('"') {
+        if !f.is_empty() && !inline_list(f, kind) {
             if let Some(t) = translate_formula(f, dr, dc) {
                 *f = t;
             }
@@ -1015,10 +1023,11 @@ pub fn as_seen_from(dv: &DataValidation, row: u32, col: u32) -> DataValidation {
     out
 }
 
-/// Does shifting `f` by (`dr`, `dc`) lose nothing: no reference falls off the
-/// grid (`#REF!`), and shifting back gives the formula again?
-fn lossless_shift(f: &str, dr: i64, dc: i64) -> bool {
-    if f.is_empty() || f.starts_with('"') || (dr, dc) == (0, 0) {
+/// Does shifting `f`, a formula of a rule of kind `kind`, by (`dr`, `dc`)
+/// lose nothing: no reference falls off the grid (`#REF!`), and shifting back
+/// gives the formula again?
+fn lossless_shift(f: &str, kind: &str, dr: i64, dc: i64) -> bool {
+    if f.is_empty() || inline_list(f, kind) || (dr, dc) == (0, 0) {
         return true;
     }
     let Some(there) = translate_formula(f, dr, dc) else {
@@ -1041,7 +1050,9 @@ fn lossless_shift(f: &str, dr: i64, dc: i64) -> bool {
 
 /// `dv` shifted by (`dr`, `dc`) when that loses nothing ([`lossless_shift`]).
 fn shifted(dv: &DataValidation, dr: i64, dc: i64) -> Option<DataValidation> {
-    if !lossless_shift(&dv.formula1, dr, dc) || !lossless_shift(&dv.formula2, dr, dc) {
+    if !lossless_shift(&dv.formula1, &dv.kind, dr, dc)
+        || !lossless_shift(&dv.formula2, &dv.kind, dr, dc)
+    {
         return None;
     }
     let mut out = dv.clone();
@@ -1410,7 +1421,8 @@ pub fn paste_rules(
         for ti in 0..tiles.0 {
             for tj in 0..tiles.1 {
                 let (dr, dc) = (first.0 + i64::from(ti * h), first.1 + i64::from(tj * w));
-                if lossless_shift(&rule.formula1, dr, dc) && lossless_shift(&rule.formula2, dr, dc)
+                if lossless_shift(&rule.formula1, &rule.kind, dr, dc)
+                    && lossless_shift(&rule.formula2, &rule.kind, dr, dc)
                 {
                     joined.extend(rule.ranges.iter().filter_map(|r| shift_rect(r, dr, dc)));
                     tiles_in.push((dr, dc));
@@ -1456,7 +1468,7 @@ impl RuleFormula {
     /// A formula of a rule of kind `kind`: only a list's `"a,b"` is inline
     /// text; a custom `"Y"=A2` has references like any other.
     fn of(f: &str, kind: &str) -> Self {
-        if f.is_empty() || (kind == "list" && f.starts_with('"')) {
+        if f.is_empty() || inline_list(f, kind) {
             return RuleFormula::Text(f.to_string());
         }
         match crate::formula::parse(f) {
@@ -1632,13 +1644,6 @@ enum CutOutcome {
     Rewrite(String, String),
     /// It is taken apart into these parts.
     Split(CutParts),
-}
-
-/// Does a rule start a formula with `"` without being a list's inline
-/// items? [`shift_formulas`] takes such a formula for an inline list and
-/// leaves it, so [`add_ranges`] can't tell its parts apart by corner.
-fn quote_led(dv: &DataValidation) -> bool {
-    dv.kind != "list" && (dv.formula1.starts_with('"') || dv.formula2.starts_with('"'))
 }
 
 /// The cut [`cut_rules`] applies: `mv` from sheet `src` to `dst`, landing on
@@ -1854,17 +1859,7 @@ pub fn cut_rules(wb: &mut Workbook, src: usize, dst: usize, mv: &CellMove, land:
     }
     for (h, rule, p) in parts {
         let sheet = &mut wb.sheets[h];
-        if quote_led(&rule) {
-            // A rule of its own, joined to none (see `quote_led`).
-            if rule.is_meaningful() {
-                sheet.validations.push(DataValidation {
-                    ranges: vec![p],
-                    ..rule
-                });
-            }
-        } else {
-            add_ranges(sheet, &rule, &[p]);
-        }
+        add_ranges(sheet, &rule, &[p]);
     }
     // The landing cells lose their Excel 2010 (`extLst`) validations too, as
     // a plain paste takes them off.
@@ -3521,6 +3516,68 @@ mod tests {
         assert!(!refuses(&mut wb, "B6"));
         assert!(refuses(&mut wb, "B7"));
         assert_seen(&wb, 0, &[("D5", Some("\"Y\"=A5")), ("B5", None)]);
+    }
+
+    /// #2115 (r2-quote-led): a custom rule led by a quote is a formula: the
+    /// dialog shows it written for the cell it stands on.
+    #[test]
+    fn r2_quote_led_custom_rule_is_seen_shifted() {
+        let dv = custom("B2:B5", "\"Y\"=A2");
+        let (r, c) = at("B4");
+        assert_eq!(as_seen_from(&dv, r, c).formula1, "\"Y\"=A4");
+    }
+
+    /// #2115 (r2-quote-led): a paste of such a rule reads the cells beside
+    /// its new place, one rule over the tiles.
+    #[test]
+    fn r2_quote_led_paste_shifts_a_custom_rule() {
+        let mut src = Sheet::default();
+        src.validations.push(custom("B2", "\"Y\"=A2"));
+        let rules = copy_rules(&src, area("B2"));
+        let mut dst = Sheet::default();
+        paste_rules(&mut dst, &rules, area("B2"), at("D4"), (2, 1)); // D4, D5
+        assert_eq!(dst.validations.len(), 1);
+        assert_eq!(dst.validations[0].formula1, "\"Y\"=C4");
+        assert_eq!(dst.validations[0].ranges, vec![area("D4:D5")]);
+    }
+
+    /// #2115 (r2-quote-led): equal text written from different corners reads
+    /// different cells, so `add_ranges` keeps such parts apart, and joins a
+    /// part that reads the same cells.
+    #[test]
+    fn r2_quote_led_add_ranges_keeps_different_cells_apart() {
+        let mut s = Sheet::default();
+        s.validations.push(custom("B2", "\"Y\"=A2"));
+        // Written for B3, it reads A2: not B2's rule, which reads A3 there.
+        let mut b3 = custom("B3", "\"Y\"=A2");
+        b3.ranges.clear();
+        add_ranges(&mut s, &b3, &[area("B3")]);
+        assert_eq!(s.validations.len(), 2);
+        // Written for B4, it reads A4: B2's rule.
+        let mut b4 = custom("B4", "\"Y\"=A4");
+        b4.ranges.clear();
+        add_ranges(&mut s, &b4, &[area("B4")]);
+        assert_eq!(s.validations.len(), 2);
+        assert_eq!(s.validations[0].ranges, vec![area("B2"), area("B4")]);
+        assert_eq!(s.validations[0].formula1, "\"Y\"=A2");
+    }
+
+    /// #2115: a list's inline items stay as written wherever they are seen,
+    /// pasted or joined.
+    #[test]
+    fn an_inline_list_still_never_shifts() {
+        let mut list = custom("B2:B5", "\"A2,B2\"");
+        list.kind = "list".into();
+        let (r, c) = at("B4");
+        assert_eq!(as_seen_from(&list, r, c).formula1, "\"A2,B2\"");
+        let mut src = Sheet::default();
+        src.validations.push(list);
+        let rules = copy_rules(&src, area("B2"));
+        let mut dst = Sheet::default();
+        paste_rules(&mut dst, &rules, area("B2"), at("D4"), (2, 1));
+        assert_eq!(dst.validations.len(), 1);
+        assert_eq!(dst.validations[0].formula1, "\"A2,B2\"");
+        assert_eq!(dst.validations[0].ranges, vec![area("D4:D5")]);
     }
 
     #[test]
