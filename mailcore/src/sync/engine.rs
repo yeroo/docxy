@@ -27701,6 +27701,707 @@ mod tests {
 
     // --- Each message's meeting message type on its row (#2081) ----------
 
+    mod meeting_type_fill {
+        //! A meeting message's type when the class `$expand` is refused
+        //! (#2168): the delta stores which rows are meeting messages, and
+        //! the idle type fill asks Graph for their type, a few a `$batch`,
+        //! never for an ordinary message; an old store's rows are listed
+        //! once by `@odata.type` first.
+        use super::*;
+        use crate::json::Value;
+        use MeetingMessageType as T;
+
+        const INBOX: &[(&str, &str, Option<&str>)] = &[("F1", "Inbox", Some("inbox"))];
+        const LINK: &str = "/me/mailFolders/F1/messages/delta?token=D-F1";
+        /// The prefix of every first page of F1's kind listing.
+        const KINDS: &str = "/me/mailFolders/F1/messages?$filter=receivedDateTime";
+
+        /// `message_json` received at `at`, with `@odata.type` `odata`
+        /// (`#microsoft.graph.` and the name) when given: an item of a
+        /// delta whose class expand was refused.
+        fn typed_json(id: &str, odata: Option<&str>, at: &str) -> String {
+            let plain = message_json(id, false, false, &[]).replace(
+                "\"receivedDateTime\":\"2026-07-16T10:00:00Z\"",
+                &format!("\"receivedDateTime\":\"{at}\""),
+            );
+            match odata {
+                Some(t) => format!(
+                    r##"{{"@odata.type":"#microsoft.graph.{t}",{}"##,
+                    plain.strip_prefix('{').unwrap()
+                ),
+                None => plain,
+            }
+        }
+
+        /// A `Class` answer: the message's class.
+        fn class(id: &str, c: &str) -> String {
+            format!(
+                r#"{{"id":"{id}","singleValueExtendedProperties":[{{"id":"String 0x1a","value":"{c}"}}]}}"#
+            )
+        }
+
+        /// A `$batch` answer: sub-request `i + 1` gets `answers[i]` (its
+        /// status, its `Retry-After`, its body), listed in reverse order.
+        fn batch_answer(answers: &[(u16, Option<u64>, &str)]) -> String {
+            let items: Vec<String> = answers
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(i, (status, retry, body))| {
+                    let headers =
+                        retry.map_or("{}".to_string(), |r| format!(r#"{{"Retry-After":"{r}"}}"#));
+                    let body = if body.is_empty() {
+                        String::new()
+                    } else {
+                        format!(r#","body":{body}"#)
+                    };
+                    format!(
+                        r#"{{"id":"{}","status":{status},"headers":{headers}{body}}}"#,
+                        i + 1
+                    )
+                })
+                .collect();
+            format!(r#"{{"responses":[{}]}}"#, items.join(","))
+        }
+
+        fn batch_route(
+            answers: &[(u16, Option<u64>, &str)],
+            times: Option<usize>,
+        ) -> (Route, Option<usize>) {
+            (
+                any_route("POST", "/$batch", 200, &batch_answer(answers)),
+                times,
+            )
+        }
+
+        /// Each `$batch` the fill sent, as `(id, tier)` per sub-request,
+        /// checking each URL's shape.
+        fn batches(srv: &FakeServer) -> Vec<Vec<(String, TypeTier)>> {
+            srv.requests()
+                .into_iter()
+                .filter(|r| r.method == "POST" && r.path == "/$batch")
+                .map(|r| {
+                    let v = crate::json::parse(&r.body).unwrap();
+                    v.get("requests")
+                        .and_then(Value::as_array)
+                        .unwrap()
+                        .iter()
+                        .map(|q| {
+                            assert_eq!(q.get("method").and_then(Value::as_str), Some("GET"));
+                            let url = q.get("url").and_then(Value::as_str).unwrap();
+                            let rest = url.strip_prefix("/me/messages/").unwrap();
+                            match rest.split_once('?') {
+                                Some((id, query)) => {
+                                    assert_eq!(
+                                        query,
+                                        "$select=id&$expand=singleValueExtendedProperties\
+                                         ($filter=id%20eq%20%27String%200x001A%27)"
+                                    );
+                                    (id.to_string(), TypeTier::Class)
+                                }
+                                None => (rest.to_string(), TypeTier::Plain),
+                            }
+                        })
+                        .collect()
+                })
+                .collect()
+        }
+
+        fn ids(batch: &[(String, TypeTier)]) -> Vec<&str> {
+            batch.iter().map(|(id, _)| id.as_str()).collect()
+        }
+
+        fn listings(srv: &FakeServer) -> Vec<String> {
+            srv.requests()
+                .into_iter()
+                .map(|r| r.path)
+                .filter(|p| p.starts_with("/me/mailFolders/F1/messages?"))
+                .collect()
+        }
+
+        fn type_of(store: &Store, id: &str) -> Option<MeetingMessageType> {
+            store.message_row(id).unwrap().unwrap().meeting_message_type
+        }
+
+        fn pending(store: &Store, id: &str) -> bool {
+            store.message_row(id).unwrap().unwrap().meeting_type_pending
+        }
+
+        fn inbox(s: &Store) {
+            s.upsert_folder(&crate::graph::model::MailFolder {
+                id: "F1".into(),
+                display_name: "Inbox".into(),
+                parent_id: None,
+                total_count: 1,
+                unread_count: 0,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+        }
+
+        /// Merges `json` into F1 as a delta item, with what it carried.
+        fn merge(s: &Store, json: &str) {
+            let v = crate::json::parse(json).unwrap();
+            s.merge_message(
+                "F1",
+                &Message::from_json(&v).unwrap(),
+                &MessageFields::of(&v),
+            )
+            .unwrap();
+        }
+
+        fn options() -> EngineOptions {
+            EngineOptions {
+                meeting_type_fill: true,
+                ..EngineOptions::without_prefetch()
+            }
+        }
+
+        /// The engine over an in-memory `store` on `srv`, signed in, its
+        /// folder list done: what a test drives step by step.
+        fn engine_on(
+            srv: &FakeServer,
+            store: Store,
+            options: EngineOptions,
+        ) -> (Engine, Receiver<SyncEvent>, mpsc::Sender<SyncCommand>) {
+            let (cmd_tx, cmd_rx) = mpsc::channel();
+            let (evt_tx, evt_rx) = mpsc::channel();
+            let config = EngineConfig {
+                store_path: PathBuf::from("unused.db"),
+                token_path: PathBuf::from("unused-token.json"),
+                cfg: test_cfg(),
+                backfill_days: 3650,
+                graph_base: srv.base_url.clone(),
+                auth_base: srv.base_url.clone(),
+                tick: HOUR,
+                options,
+                token_store: None,
+            };
+            let mut engine = Engine::new(config, store, cmd_rx, evt_tx);
+            engine.token = Some(TokenSet {
+                access_token: "AT".into(),
+                refresh_token: "RT".into(),
+                expires_at_unix: u64::MAX / 2,
+                account: String::new(),
+                scopes: None,
+            });
+            engine.mailbox_unchecked = false;
+            engine.backfill_done = true;
+            (engine, evt_rx, cmd_tx)
+        }
+
+        /// The `MessagesUpdated` and `Error` events waiting.
+        fn told(evt_rx: &Receiver<SyncEvent>) -> Vec<SyncEvent> {
+            evt_rx
+                .try_iter()
+                .filter(|e| matches!(e, SyncEvent::MessagesUpdated { .. } | SyncEvent::Error(_)))
+                .collect()
+        }
+
+        fn updated_f1() -> SyncEvent {
+            SyncEvent::MessagesUpdated {
+                folder_id: "F1".into(),
+            }
+        }
+
+        /// The engine on `srv` with the type fill on; `sql` runs on the
+        /// seeded store before the engine opens it.
+        fn spawn_typed(
+            srv: &FakeServer,
+            tag: &str,
+            seed: impl FnOnce(&Store),
+            sql: &str,
+        ) -> (SyncHandle, Store, PathBuf) {
+            let dir = unique_dir(tag);
+            let store_path = dir.join("mail.db");
+            let token_path = dir.join("token.bin");
+            seed_token(&token_path);
+            seed(&Store::open(&store_path).unwrap());
+            if !sql.is_empty() {
+                rusqlite::Connection::open(&store_path)
+                    .unwrap()
+                    .execute_batch(sql)
+                    .unwrap();
+            }
+            let handle = spawn_with_bases_and_options(
+                store_path.clone(),
+                token_path,
+                test_cfg(),
+                3650,
+                srv.base_url.clone(),
+                srv.base_url.clone(),
+                TICK,
+                options(),
+            );
+            (handle, Store::open(&store_path).unwrap(), dir)
+        }
+
+        fn stop(handle: SyncHandle, dir: PathBuf) {
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Acceptance 4: F1's first delta call is refused (400, then the
+        /// plain call), so its items carry `@odata.type` and no class. The
+        /// fill asks for the five meeting messages, four a batch, oldest
+        /// first, and never for the plain one. The stored tentative type is
+        /// Graph v1.0's own spelling, `meetingTenativelyAccepted`
+        /// (`MeetingMessageType::as_graph`), which the issue writes
+        /// `meetingTentativelyAccepted`: both read `TentativelyAccepted`.
+        #[test]
+        fn a_refused_delta_still_stores_every_meeting_message_type() {
+            let startup = [
+                typed_json("R", Some("eventMessageRequest"), "2026-07-16T10:00:01Z"),
+                typed_json("X", Some("eventMessage"), "2026-07-16T10:00:02Z"),
+                typed_json("A", Some("eventMessageResponse"), "2026-07-16T10:00:03Z"),
+                typed_json("T", Some("eventMessageResponse"), "2026-07-16T10:00:04Z"),
+                typed_json("D", Some("eventMessageResponse"), "2026-07-16T10:00:05Z"),
+                typed_json("N", None, "2026-07-16T10:00:06Z"),
+            ];
+            // The next round on the refused link brings X again, without
+            // its class: its filled type is kept.
+            let later = [
+                typed_json("X", Some("eventMessage"), "2026-07-16T10:00:02Z")
+                    .replace("\"isRead\":false", "\"isRead\":true"),
+            ];
+            let mut routes = vec![
+                (
+                    any_route(
+                        "GET",
+                        "/me/mailFolders/F1/messages/delta?$",
+                        400,
+                        r#"{"error":{"code":"BadRequest","message":"no expand"}}"#,
+                    ),
+                    Some(1),
+                ),
+                (
+                    get_route(
+                        "/me/mailFolders/F1/messages/delta?$",
+                        200,
+                        &delta_page(&startup, LINK),
+                    ),
+                    None,
+                ),
+                (get_route(LINK, 200, &delta_page(&later, LINK)), Some(1)),
+                (get_route(LINK, 200, &delta_page(&[], LINK)), None),
+                batch_route(
+                    &[
+                        (200, None, &class("R", "IPM.Schedule.Meeting.Request")),
+                        (200, None, &class("X", "IPM.Schedule.Meeting.Canceled")),
+                        (200, None, &class("A", "IPM.Schedule.Meeting.Resp.Pos")),
+                        (200, None, &class("T", "IPM.Schedule.Meeting.Resp.Tent")),
+                    ],
+                    Some(1),
+                ),
+                batch_route(
+                    &[(200, None, &class("D", "IPM.Schedule.Meeting.Resp.Neg"))],
+                    None,
+                ),
+            ];
+            routes.extend(folder_routes(INBOX, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store, dir) = spawn_typed(&srv, "type-fill-refused", |_| {}, "");
+            let want = [
+                ("R", Some(T::Request)),
+                ("X", Some(T::Cancelled)),
+                ("A", Some(T::Accepted)),
+                ("T", Some(T::TentativelyAccepted)),
+                ("D", Some(T::Declined)),
+                ("N", None),
+            ];
+            let done = || {
+                store.type_fill_folders().unwrap().is_empty()
+                    && want
+                        .iter()
+                        .all(|(id, _)| store.message_row(id).unwrap().is_some())
+            };
+            assert!(wait_until(TICK_WAIT, done), "{:?}", batches(&srv));
+            assert!(store.reminder_expand_refused("F1").unwrap());
+            for (id, t) in want {
+                assert_eq!(type_of(&store, id), t, "{id}");
+                assert!(!pending(&store, id), "{id}");
+            }
+            let raw: Option<String> = rusqlite::Connection::open(dir.join("mail.db"))
+                .unwrap()
+                .query_row(
+                    "SELECT meeting_message_type FROM messages WHERE id = 'T'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(raw.as_deref(), Some("meetingTenativelyAccepted"));
+            let row = |id: &str| store.message_row(id).unwrap().unwrap();
+            assert!(row("X").is_event_message && !row("X").is_meeting_request);
+            assert!(row("R").is_event_message && row("R").is_meeting_request);
+            assert!(!row("N").is_event_message);
+            // The later round landed (X read), its type kept.
+            assert!(wait_until(TICK_WAIT, || row("X").is_read));
+            assert_eq!(type_of(&store, "X"), Some(T::Cancelled));
+            // Two batches, the class form, oldest first; N never asked, and
+            // nothing listed (every row's kind came with the delta).
+            let sent = batches(&srv);
+            assert_eq!(sent.len(), 2, "{sent:?}");
+            assert_eq!(ids(&sent[0]), ["R", "X", "A", "T"]);
+            assert_eq!(ids(&sent[1]), ["D"]);
+            assert!(sent.iter().flatten().all(|(_, t)| *t == TypeTier::Class));
+            assert!(listings(&srv).is_empty());
+            // Nothing more over passes and idle steps.
+            handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+            std::thread::sleep(TICK * 5);
+            assert_eq!(batches(&srv).len(), 2);
+            stop(handle, dir);
+        }
+
+        /// Acceptance 6: a store from before #2168 migrates without any
+        /// delta reset; its folder is listed once (`$select=id`) for the
+        /// rows whose kind is not known, and only the meeting messages are
+        /// asked per item.
+        #[test]
+        fn an_old_store_is_listed_once_and_asks_only_for_its_meeting_messages() {
+            let seed = |s: &Store| {
+                inbox(s);
+                // An old request (its kind known from is_meeting_request),
+                // a cancellation stored as plain mail, an ordinary message
+                // and a response whose type a delta carried.
+                merge(
+                    s,
+                    &typed_json("R", Some("eventMessageRequest"), "2026-03-01T00:00:00Z"),
+                );
+                merge(s, &typed_json("P1", None, "2026-04-01T00:00:00Z"));
+                merge(s, &typed_json("P2", None, "2026-02-01T00:00:00Z"));
+                let mut h = Message::from_json(
+                    &crate::json::parse(&typed_json(
+                        "H",
+                        Some("eventMessageResponse"),
+                        "2026-01-01T00:00:00Z",
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+                h.meeting_message_type = Some(T::Accepted);
+                s.upsert_message("F1", &h).unwrap();
+                s.complete_backfill("F1", LINK, crate::store::SCOPE_ALL, 4, Some(true))
+                    .unwrap();
+            };
+            let sql = "DROP INDEX idx_messages_untyped;
+                       ALTER TABLE messages DROP COLUMN is_event_message;
+                       ALTER TABLE messages DROP COLUMN meeting_type_known;";
+            let listing = r##"{"value":[
+                {"@odata.type":"#microsoft.graph.eventMessageResponse","id":"H"},
+                {"id":"P2"},
+                {"@odata.type":"#microsoft.graph.eventMessageRequest","id":"R"},
+                {"@odata.type":"#microsoft.graph.eventMessage","id":"P1"}]}"##;
+            let mut routes = vec![
+                (get_route(KINDS, 200, listing), None),
+                batch_route(
+                    &[
+                        (200, None, &class("R", "IPM.Schedule.Meeting.Request")),
+                        (200, None, &class("P1", "IPM.Schedule.Meeting.Canceled")),
+                    ],
+                    None,
+                ),
+            ];
+            routes.extend(folder_routes(INBOX, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store, dir) = spawn_typed(&srv, "type-fill-old", seed, sql);
+            assert!(
+                wait_until(TICK_WAIT, || store.type_fill_folders().unwrap().is_empty()
+                    && type_of(&store, "P1").is_some()),
+                "{:?} {:?}",
+                listings(&srv),
+                batches(&srv)
+            );
+            assert_eq!(type_of(&store, "R"), Some(T::Request));
+            assert_eq!(type_of(&store, "P1"), Some(T::Cancelled));
+            assert_eq!(type_of(&store, "P2"), None);
+            assert_eq!(type_of(&store, "H"), Some(T::Accepted));
+            assert!(!store.message_row("P2").unwrap().unwrap().is_event_message);
+            assert!(store.message_row("P1").unwrap().unwrap().is_event_message);
+            // One listing, from the oldest row whose kind was not known
+            // (P2; R and H were known), and one batch of R and P1 alone.
+            assert_eq!(
+                listings(&srv),
+                [GraphClient::message_kinds_target(
+                    "F1",
+                    "2026-02-01T00:00:00Z"
+                )]
+            );
+            let sent = batches(&srv);
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert_eq!(ids(&sent[0]), ["R", "P1"]);
+            // No delta or expand-refused state was reset: only the stored
+            // link was read, never a first call.
+            assert_eq!(store.get_delta_link("F1").unwrap().as_deref(), Some(LINK));
+            assert!(store.reminder_expand_refused("F1").unwrap());
+            assert!(
+                !srv.requests()
+                    .iter()
+                    .any(|r| r.path.starts_with("/me/mailFolders/F1/messages/delta?$"))
+            );
+            // Nothing more over passes and idle steps.
+            handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+            std::thread::sleep(TICK * 5);
+            assert_eq!(listings(&srv).len(), 1);
+            assert_eq!(batches(&srv).len(), 1);
+            stop(handle, dir);
+        }
+
+        /// Four meeting messages through a refused delta, `X` the oldest.
+        fn four(s: &Store, ids: [&str; 4]) {
+            inbox(s);
+            for (i, id) in ids.iter().enumerate() {
+                merge(
+                    s,
+                    &typed_json(id, Some("eventMessage"), &format!("2026-07-16T10:00:0{i}Z")),
+                );
+            }
+        }
+
+        /// Acceptance 5 and 7: a `Class` sub-response refused (400) or
+        /// carrying no class (a dropped expand) leaves the row for the
+        /// plain GET in the next step, which writes its top-level type
+        /// (`None` when it has none) or, refused too, marks it known with
+        /// one `Error`. No row is asked a third time.
+        #[test]
+        fn a_refused_or_dropped_class_expand_falls_back_to_the_plain_get() {
+            let srv = FakeServer::start_limited(vec![
+                batch_route(
+                    &[
+                        (400, None, r#"{"error":{"code":"BadRequest"}}"#),
+                        (200, None, r#"{"id":"A"}"#),
+                        (400, None, r#"{"error":{"code":"BadRequest"}}"#),
+                        (400, None, r#"{"error":{"code":"BadRequest"}}"#),
+                    ],
+                    Some(1),
+                ),
+                batch_route(
+                    &[
+                        (
+                            200,
+                            None,
+                            r#"{"id":"X","meetingMessageType":"meetingCancelled"}"#,
+                        ),
+                        (
+                            200,
+                            None,
+                            r#"{"id":"A","meetingMessageType":"meetingAccepted"}"#,
+                        ),
+                        (403, None, r#"{"error":{"code":"ErrorAccessDenied"}}"#),
+                        (200, None, r#"{"id":"W"}"#),
+                    ],
+                    None,
+                ),
+            ]);
+            let store = Store::open_in_memory().unwrap();
+            four(&store, ["X", "A", "E", "W"]);
+            let (mut engine, evt_rx, _cmd_tx) = engine_on(&srv, store, options());
+            assert_eq!(engine.next_type_fill().as_deref(), Some("F1"));
+            engine.type_fill_step("F1".into());
+            // Nothing written yet: no list update, no error.
+            assert!(engine.meeting_class_refused);
+            assert!(told(&evt_rx).is_empty());
+            for id in ["X", "A", "E", "W"] {
+                assert!(pending(&engine.store, id), "{id}");
+            }
+            engine.type_fill_step("F1".into());
+            assert_eq!(type_of(&engine.store, "X"), Some(T::Cancelled));
+            assert_eq!(type_of(&engine.store, "A"), Some(T::Accepted));
+            assert_eq!(type_of(&engine.store, "E"), None);
+            assert_eq!(type_of(&engine.store, "W"), None);
+            for id in ["X", "A", "E", "W"] {
+                assert!(!pending(&engine.store, id), "{id}");
+            }
+            let seen = told(&evt_rx);
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert_eq!(seen[0], updated_f1());
+            assert!(
+                matches!(&seen[1], SyncEvent::Error(e) if e.contains("HTTP 403")),
+                "{seen:?}"
+            );
+            // Done: the next step asks nothing and parks F1.
+            engine.type_fill_step("F1".into());
+            assert!(engine.next_type_fill().is_none());
+            let sent = batches(&srv);
+            assert_eq!(sent.len(), 2, "{sent:?}");
+            assert!(sent[0].iter().all(|(_, t)| *t == TypeTier::Class));
+            assert!(sent[1].iter().all(|(_, t)| *t == TypeTier::Plain));
+            assert_eq!(ids(&sent[0]), ["X", "A", "E", "W"]);
+            assert_eq!(ids(&sent[1]), ["X", "A", "E", "W"]);
+            // A sign-in (or sign-out) forgets the refusal.
+            engine.drop_type_fill();
+            assert!(!engine.meeting_class_refused);
+        }
+
+        /// A 404 marks the row known (gone), a 429 marks nothing and backs
+        /// off, another 5xx parks the folder; the written rows are told.
+        #[test]
+        fn a_404_a_throttle_and_a_5xx_each_keep_or_mark_their_row() {
+            let srv = FakeServer::start_limited(vec![batch_route(
+                &[
+                    (404, None, r#"{"error":{"code":"ErrorItemNotFound"}}"#),
+                    (429, Some(7), ""),
+                    (200, None, &class("K", "IPM.Schedule.Meeting.Canceled")),
+                    (500, None, ""),
+                ],
+                None,
+            )]);
+            let store = Store::open_in_memory().unwrap();
+            four(&store, ["G", "Q", "K", "V"]);
+            let (mut engine, evt_rx, _cmd_tx) = engine_on(&srv, store, options());
+            engine.type_fill_step("F1".into());
+            assert!(!pending(&engine.store, "G"));
+            assert_eq!(type_of(&engine.store, "G"), None);
+            assert_eq!(type_of(&engine.store, "K"), Some(T::Cancelled));
+            assert!(pending(&engine.store, "Q"));
+            assert!(pending(&engine.store, "V"));
+            assert!(!engine.meeting_class_refused);
+            assert_eq!(told(&evt_rx), [updated_f1()]);
+            // Backed off, and F1 parked until the next pass.
+            assert!(engine.next_retry.is_some());
+            assert!(engine.type_parked.contains(&"F1".to_string()));
+            engine.next_retry = None;
+            assert!(engine.next_type_fill().is_none());
+        }
+
+        /// A write that only flips `meeting_type_pending` (a 404, no type
+        /// changed) still tells the folder's list.
+        #[test]
+        fn a_404_alone_still_tells_the_list() {
+            let srv = FakeServer::start_limited(vec![batch_route(
+                &[(404, None, r#"{"error":{"code":"ErrorItemNotFound"}}"#)],
+                None,
+            )]);
+            let store = Store::open_in_memory().unwrap();
+            inbox(&store);
+            merge(
+                &store,
+                &typed_json("G", Some("eventMessage"), "2026-07-16T10:00:00Z"),
+            );
+            let (mut engine, evt_rx, _cmd_tx) = engine_on(&srv, store, options());
+            engine.type_fill_step("F1".into());
+            assert!(!pending(&engine.store, "G"));
+            assert_eq!(told(&evt_rx), [updated_f1()]);
+        }
+
+        /// The old rows' kind listing, step by step: one page a step, the
+        /// unlisted candidates marked at the end, each write told; a
+        /// refused listing gives up on its candidates with one `Error`.
+        #[test]
+        fn the_kind_listing_pages_marks_the_unlisted_and_gives_up_once() {
+            let page2 = "/me/mailFolders/F1/messages?$skiptoken=K2";
+            let srv = FakeServer::start_limited(vec![
+                (
+                    get_route(
+                        page2,
+                        200,
+                        r##"{"value":[{"@odata.type":"#microsoft.graph.eventMessage","id":"B"}]}"##,
+                    ),
+                    None,
+                ),
+                (
+                    get_route(
+                        KINDS,
+                        200,
+                        &format!(r#"{{"value":[{{"id":"A"}}],"@odata.nextLink":"{page2}"}}"#),
+                    ),
+                    Some(1),
+                ),
+                (
+                    get_route(KINDS, 400, r#"{"error":{"code":"BadRequest"}}"#),
+                    None,
+                ),
+            ]);
+            let store = Store::open_in_memory().unwrap();
+            inbox(&store);
+            for (id, at) in [
+                ("A", "2026-01-01T00:00:00Z"),
+                ("B", "2026-02-01T00:00:00Z"),
+                ("C", "2026-03-01T00:00:00Z"),
+            ] {
+                merge(&store, &typed_json(id, None, at));
+            }
+            store.execute_for_test(
+                "UPDATE messages SET is_event_message = NULL, meeting_type_known = 0",
+            );
+            let (mut engine, evt_rx, _cmd_tx) = engine_on(&srv, store, options());
+            // Page 1: A is plain.
+            engine.type_fill_step("F1".into());
+            assert!(!pending(&engine.store, "A"));
+            assert!(pending(&engine.store, "B") && pending(&engine.store, "C"));
+            assert_eq!(told(&evt_rx), [updated_f1()]);
+            // Page 2, the last: B is a meeting message, C (unlisted) plain.
+            engine.type_fill_step("F1".into());
+            let row = |e: &Engine, id: &str| e.store.message_row(id).unwrap().unwrap();
+            assert!(row(&engine, "B").is_event_message && pending(&engine.store, "B"));
+            assert!(!row(&engine, "C").is_event_message && !pending(&engine.store, "C"));
+            assert_eq!(told(&evt_rx), [updated_f1()]);
+            assert_eq!(
+                listings(&srv),
+                [
+                    GraphClient::message_kinds_target("F1", "2026-01-01T00:00:00Z"),
+                    page2.to_string()
+                ]
+            );
+            assert_eq!(
+                engine.store.meeting_type_candidates("F1", 4).unwrap(),
+                ["B"]
+            );
+            // A second old row whose listing Graph refuses: given up, told,
+            // one `Error`, and F1 parked.
+            engine
+                .store
+                .execute_for_test("UPDATE messages SET is_event_message = NULL WHERE id = 'C'");
+            engine.type_fill_step("F1".into());
+            assert!(!pending(&engine.store, "C"));
+            let seen = told(&evt_rx);
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert!(matches!(&seen[0], SyncEvent::Error(e) if e.contains("Inbox")));
+            assert_eq!(seen[1], updated_f1());
+            assert!(engine.next_type_fill().is_none());
+            assert_eq!(listings(&srv).len(), 3);
+        }
+
+        /// The fill runs only with its option on, signed in, after the
+        /// folder list; a sign-out drops what it holds.
+        #[test]
+        fn next_type_fill_is_gated_and_a_sign_out_drops_it() {
+            let srv = FakeServer::start_limited(vec![]);
+            let store = Store::open_in_memory().unwrap();
+            inbox(&store);
+            merge(
+                &store,
+                &typed_json("G", Some("eventMessage"), "2026-07-16T10:00:00Z"),
+            );
+            let off = EngineOptions::without_prefetch();
+            assert!(!off.meeting_type_fill);
+            assert!(EngineOptions::default().meeting_type_fill);
+            let (engine, _evt_rx, _cmd_tx) = engine_on(&srv, store, off);
+            assert!(engine.next_type_fill().is_none());
+            let store = engine.store;
+            let (mut engine, _evt_rx, _cmd_tx) = engine_on(&srv, store, options());
+            assert_eq!(engine.next_type_fill().as_deref(), Some("F1"));
+            engine.backfill_done = false;
+            assert!(engine.next_type_fill().is_none());
+            engine.backfill_done = true;
+            engine.token = None;
+            assert!(engine.next_type_fill().is_none());
+            // A sign-out forgets the listing, the parked folders and a
+            // refusal.
+            engine.type_fill = Some(KindListing {
+                folder: "F1".into(),
+                candidates: vec!["G".into()],
+                target: "x".into(),
+            });
+            engine.type_parked.push("F1".into());
+            engine.meeting_class_refused = true;
+            engine.handle_command(SyncCommand::SignOut);
+            assert!(engine.type_fill.is_none());
+            assert!(engine.type_parked.is_empty());
+            assert!(!engine.meeting_class_refused);
+            assert!(srv.requests().is_empty());
+        }
+    }
+
     mod meeting_message_types {
         use super::*;
 

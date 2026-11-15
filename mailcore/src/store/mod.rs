@@ -2279,6 +2279,13 @@ impl Store {
     /// starts fresh leaves them alone
     /// ([`Store::merge_message_unless_edited`]). Tests read it; the engine
     /// checks the marker in the statement that writes.
+    /// Runs `sql` on the store's connection: what an engine test uses to
+    /// put a row back as an older store held it (#2168).
+    #[cfg(test)]
+    pub(crate) fn execute_for_test(&self, sql: &str) {
+        self.conn.execute_batch(sql).unwrap();
+    }
+
     #[cfg(test)]
     pub fn locally_edited_ids(&self) -> Result<Vec<String>, StoreError> {
         let mut stmt = self
