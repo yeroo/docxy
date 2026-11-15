@@ -136,6 +136,13 @@ pub struct App {
     /// `State(Idle)` right after a failed send's `SendFailed`): only the
     /// next key press does (see `main::run`).
     pub send_failure: Option<String>,
+    /// The notice of a different mailbox signing in (#1946,
+    /// `SyncEvent::MailboxChanged`): the store was emptied for it, with the
+    /// count of unsent changes dropped. Drawn in the status bar ahead of
+    /// the counts. No sync event clears it (the pass that lists the new mailbox
+    /// settles to `State(Idle)` right after): only the next key press does
+    /// (see `main::run`).
+    pub mailbox_notice: Option<String>,
     /// The attachment a queued send is uploading (#2117), from the last
     /// `SyncEvent::AttachmentProgress`, for the status bar's `Uploading
     /// <name>: <sent>/<total>`. Cleared by that draft's `Sent`/`SendFailed`,
@@ -582,6 +589,7 @@ impl App {
             attachment_notice: None,
             error_notice: None,
             send_failure: None,
+            mailbox_notice: None,
             upload_progress: None,
             backfill: None,
             folders_up_to_date: std::collections::HashSet::new(),
@@ -786,6 +794,7 @@ impl App {
                 self.attachment_notice = Some("Automatic replies updated".to_string());
             }
             SyncEvent::CategoriesUpdated => self.reload_master_categories(),
+            SyncEvent::MailboxChanged { dropped_ops } => self.on_mailbox_changed(dropped_ops),
             SyncEvent::ScheduleFetched { entries } => {
                 if let Some(v) = self.free_busy.as_mut() {
                     v.entries = entries;
@@ -1107,6 +1116,36 @@ impl App {
         if matches!(self.signin_modal, Some(SignInModal::Required)) {
             let _ = self.sync.cmd_tx.send(SyncCommand::SignIn);
         }
+    }
+
+    /// A different mailbox signed in and the engine emptied the store for it
+    /// (#1946): drops everything held from the old mailbox (the open
+    /// message, the folder selection, a search, a filter, the popups over
+    /// them, progress lines), re-reads the now empty store, and tells the
+    /// user. The new mailbox's Inbox is expanded once it arrives, as on a
+    /// first run. An open compose window keeps its text; its draft id is
+    /// the old mailbox's.
+    fn on_mailbox_changed(&mut self, dropped_ops: usize) {
+        self.selected_folder = None;
+        self.folder_index = 0;
+        self.selected_msg = None;
+        self.msg_index = 0;
+        self.row_index = 0;
+        self.search = None;
+        self.category_filter = None;
+        self.move_picker = None;
+        self.attachments = None;
+        self.inline_images.clear();
+        self.upload_progress = None;
+        self.backfill = None;
+        self.folders_up_to_date.clear();
+        self.folder_tree_initialized = false;
+        self.reload_body();
+        self.reload_account();
+        self.reload_folders();
+        self.reload_master_categories();
+        self.reload_agenda();
+        self.mailbox_notice = Some(mailbox_changed_notice(dropped_ops));
     }
 
     /// Re-reads the folder list from the store (well-known folders already
@@ -4470,6 +4509,16 @@ fn signature_body_html(sig: &str) -> String {
         ));
     }
     html
+}
+
+/// The status bar's line for `SyncEvent::MailboxChanged` (#1946).
+fn mailbox_changed_notice(dropped_ops: usize) -> String {
+    let lead = "Signed in to another mailbox: local mail cleared";
+    match dropped_ops {
+        0 => lead.to_string(),
+        1 => format!("{lead}, 1 unsent change dropped"),
+        n => format!("{lead}, {n} unsent changes dropped"),
+    }
 }
 
 #[cfg(test)]

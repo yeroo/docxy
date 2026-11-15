@@ -77,7 +77,13 @@ fn status_line(app: &App, width: usize) -> (String, Style) {
     // Otherwise the normal dark-gray bar shows what is going on: an upload,
     // a folder's backfill or that the selected folder is up to date, and
     // the last attachment save/open outcome, if any.
-    let mut parts = vec![head, counts];
+    // A different mailbox signed in (#1946): ahead of the counts, so a
+    // narrow bar cuts them, and no progress line, before the notice.
+    let mut parts = vec![head];
+    if let Some(notice) = &app.mailbox_notice {
+        parts.push(notice.clone());
+    }
+    parts.push(counts);
     if let Some(p) = &app.upload_progress {
         parts.push(format!(
             "Uploading {}: {}/{}",
@@ -226,6 +232,71 @@ mod tests {
         assert!(text.contains("save failed"));
         // The success notice is suppressed while an error is showing.
         assert!(!text.contains("Saved: ok.txt"));
+    }
+
+    /// #1946: a different mailbox emptied the store. lookxy drops what it
+    /// held of the old mailbox, re-reads the empty store, and shows the
+    /// notice past the pass's `State(Idle)`; the new Inbox is selected and
+    /// expanded when it arrives.
+    #[test]
+    fn mailbox_changed_reloads_and_tells_the_user() {
+        use mailcore::graph::model::MailFolder;
+        use mailcore::sync::engine::SyncState;
+        let mut app = App::for_test_with_seeded_store();
+        app.reload_folders();
+        app.open_message("m1");
+        app.folder_tree_initialized = true;
+        assert_eq!(app.selected_folder.as_deref(), Some("inbox"));
+        assert_eq!(app.selected_msg.as_deref(), Some("m1"));
+        // What the engine did before it sent the event.
+        app.store.reset_mailbox("ROOT_B").unwrap();
+        app.on_sync_event(SyncEvent::MailboxChanged { dropped_ops: 3 });
+        app.on_sync_event(SyncEvent::FoldersUpdated);
+        app.on_sync_event(SyncEvent::State(SyncState::Idle));
+        assert!(app.folders.is_empty());
+        assert!(app.messages.is_empty());
+        assert_eq!(app.selected_folder, None);
+        assert_eq!(app.selected_msg, None);
+        assert!(app.body.is_none() && !app.body_loading);
+        let text = render(&app);
+        assert!(
+            text.contains(
+                "Signed in to another mailbox: local mail cleared, 3 unsent changes dropped"
+            ),
+            "{text}"
+        );
+        // The new mailbox's Inbox arrives: selected and expanded, as on a
+        // first run; the notice stays until a key press.
+        app.store
+            .upsert_folder(&MailFolder {
+                id: "FB".into(),
+                display_name: "Inbox".into(),
+                parent_id: Some("ROOT_B".into()),
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+        app.on_sync_event(SyncEvent::FoldersUpdated);
+        assert_eq!(app.selected_folder.as_deref(), Some("FB"));
+        assert!(app.folder_tree_initialized);
+        assert!(app.mailbox_notice.is_some());
+    }
+
+    #[test]
+    fn a_mailbox_change_with_nothing_queued_says_only_that_mail_was_cleared() {
+        let mut app = App::for_test_with_seeded_store();
+        app.on_sync_event(SyncEvent::MailboxChanged { dropped_ops: 0 });
+        assert_eq!(
+            app.mailbox_notice.as_deref(),
+            Some("Signed in to another mailbox: local mail cleared")
+        );
+        app.on_sync_event(SyncEvent::MailboxChanged { dropped_ops: 1 });
+        assert!(
+            app.mailbox_notice
+                .as_deref()
+                .is_some_and(|n| n.ends_with(", 1 unsent change dropped"))
+        );
     }
 
     #[test]
