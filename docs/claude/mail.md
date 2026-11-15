@@ -1974,8 +1974,9 @@ so the user's other devices follow.
 - `SyncEvent::TokenStoredUnencrypted`: sent at most once per engine run (`warned_unencrypted`,
   kept over sign-out), the first time the startup load, a refresh's save or the sign-in's save
   ends in `PlainFile`; never on Windows. At startup it comes right after the load, before the
-  near-expiry refresh. lookxy ignores it. A startup load that fails with `NotConnected` emits
-  `Error("secret store unavailable: …")` before `SignInRequired`; any other load error stays silent.
+  near-expiry refresh. lookxy ignores it. A startup load that fails with `NotConnected` keeps the sign-in since
+  #2167 (`SavedSignInUnavailable`, see "Keeping the sign-in" below); any other load error stays
+  silent and signs out.
 - macOS ties a Keychain item's access to the code identity that created it: an unsigned rebuild
   asks once whether it may read the item. That prompt blocks the engine thread, not the UI.
 - `zbus` 5 pulls `uuid`, whose 1.27+ needs rustc 1.89: `Cargo.lock` pins `uuid` 1.26.1 for MSRV
@@ -4409,3 +4410,115 @@ literally would break.
   `with_probe`, `with_probe_limited`): the fake server matches by prefix. lookxy:
   `ui::status_bar::tests::mailbox_changed_reloads_and_tells_the_user`,
   `a_mailbox_change_with_nothing_queued_says_only_that_mail_was_cleared`.
+
+## Keeping the sign-in (#2167)
+
+Only a refused grant signs out. A transient token-endpoint failure and a saved sign-in whose
+keyring cannot be read now both keep it.
+
+- **Refusal or transient** (`auth.rs`). `AuthError::Denied { error, description }` keeps the
+  OAuth `error` code (empty when the body has only a description). `Display` is unchanged:
+  `authorization denied: <description, else error>`. `AuthError::needs_sign_in()` is true only
+  for a `Denied` whose code is one of `REFUSAL_CODES` (`invalid_grant`, `interaction_required`,
+  `consent_required`, `login_required`, `invalid_client`, `unauthorized_client`,
+  `invalid_scope`), any case and any status. Everything else is transient: `Http` (transport,
+  or a body that cannot be read), `Status` (a 5xx/429/408 or HTML page with no OAuth body),
+  `Parse`, and any other code (`temporarily_unavailable`, `server_error`, `invalid_request`).
+  When unsure, transient. #2164 changes what `refresh` asks for; a refusal of a newly added
+  scope is a `needs_sign_in` answer there too.
+- **Three-way refresh** (`engine.rs`). `try_refresh` returns `Refresh::{Done, SignIn,
+  Transient(text)}`. No token or an empty `refresh_token` is `SignIn`, with no request: the
+  server's `invalid_request` would otherwise read as transient. After a 401, `with_auth` and
+  `apply_op_with_retry` turn `Transient` into `GraphError::Transport("token refresh failed:
+  …")` (`refresh_transport`). Every caller already answers `Transport` by going offline and
+  keeping the work (`react`, `react_quietly`, the drain, `engine_op_call_failed`; a `/send`'s
+  `send_posted` is cleared by its 401 before the refresh). The text has no token and shows in a
+  command's failure event (`SearchFailed` and the like). No `Error` is sent for it: `Offline`
+  is the signal.
+- `refresh_if_near_expiry` returns whether the session can go on. `SignIn` calls
+  `enter_signin`. `Transient` calls `go_offline`, and `startup` (`start_session`) then skips the
+  startup pass: it would fail again and double the back-off. The tick at the back-off's end
+  runs the pass, whose 401 refreshes again; nothing refreshes a near-expiry token
+  proactively after startup. A transient failure that never clears (a token endpoint that
+  always answers HTML) keeps the engine `Offline` at the 300 s back-off, with no `Error`.
+  That is intended.
+- **A saved sign-in whose store cannot be reached.** At `startup` a `NotConnected` load (no
+  bus, no service, a dismissed or unanswered prompt, or no store at all on this system) calls
+  `saved_signin_unavailable`. It emits `SyncEvent::SavedSignInUnavailable(reason)` (the io
+  error's `secret store unavailable: …`), then `go_offline`, so the event comes right before
+  `State(Offline)`. There is no `Error` and no `SignInRequired`, and the reference stays
+  byte-identical. `saved_unavailable` holds the last reason sent; the event is repeated only
+  when the reason changes, or in answer to `RetrySavedSignIn`. While it is set the token is
+  `None`, and `settle_state` gives `Offline`, not `SignInRequired`. Commands answer "not signed
+  in" as when signed out.
+- **Retries.** While `saved_unavailable` is set, a timed wake (`on_timer`) runs no tick or
+  deadline. At the back-off's end it calls `retry_saved_signin`, but only with a store that has
+  not latched a refusal (`SecretStore::refused`). With no store at all (`token_store == None`:
+  Windows, `MAILCORE_TOKEN_STORE=file`, `cfg(test)`) nothing is retried automatically. Then
+  `next_tick` moves on, and a passed `next_retry` is dropped as usual, so the wait falls back to
+  the tick. With a fast tick, `follow_saved_signin_backoff` (after such a wake, and once after
+  the start in `main_loop`) makes `next_fast` and `next_full` follow the store's retry.
+  `recv_timeout` is their minimum, but at least `next_retry`. A future `next_retry` (the store
+  asked and still unreachable) becomes both deadlines, so the next ask comes at the back-off
+  (5, 10, 20 s …), not at the later of it and the fast interval (r2). With none (no store, a
+  latched refusal) they move a fast interval and a tick on: with stale deadlines and the retry
+  dropped, the wait would be zero for good, a busy spin (r1). Tests:
+  `a_waiting_saved_sign_in_does_not_spin_with_a_fast_tick` (no store, and a latched one),
+  `an_unreachable_store_is_asked_again_at_the_back_off_with_a_fast_tick`,
+  `a_fast_tick_does_not_delay_the_saved_sign_in_retries` (end to end, a 60 s fast tick: asked
+  at 5 s and 15 s). `retry_saved_signin` loads again. `Ok(Some)` clears the state and the back-off,
+  `start_session`, then the startup pass and `after_pass_if_fast`: one pass for that wake. A
+  `NotConnected` waits again (the back-off doubles). `Ok(None)` (the item is gone) or another
+  error signs out, as at startup.
+- **The latch and `RetrySavedSignIn`** (`tokencache.rs`). `SecretStore` has `refused()` and
+  `ask_again()`, no-ops by default. `Latched` overrides both: its refusal is a
+  `Mutex<Option<String>>` (`const`-constructible, so the `platform_store` statics stay), and
+  `ask_again` clears it for the next call. `SyncCommand::RetrySavedSignIn` (not persisted at a
+  shutdown) does nothing unless a saved sign-in waits. Otherwise it calls `ask_again`, then
+  `retry_saved_signin`, and a store still unreachable always sends the event again. The
+  engine's store comes in `EngineConfig::token_store` (`Option<&'static (dyn SecretStore +
+  Sync)>`: `platform_store()`, or a test's fake through `spawn_with_store`). Its token calls go
+  through `load_token`, `save_token` and `clear_token` (`load_in`, `save_in`, `clear_in` with
+  `tokencache::plain`). `SecretStore` has no `Sync` supertrait, as the tokencache test fake is
+  `Cell`-based.
+- **`SignIn` and `SignOut` meanwhile.** `SignIn` runs the interactive sign-in. Success clears
+  `saved_unavailable`. A failure (listener, redirect, redeem) sends its `Error`, then
+  `SavedSignInUnavailable` with the last reason again (`saved_signin_still_waits`, from
+  `sign_in_not_started` and `sign_in_failed`: the state stayed `Offline`, so a client showing
+  the sign-in under way has nothing else to go back by), and settles `Offline`. The back-off is
+  untouched: the store is retried by itself only while merely unavailable; a latched refusal or
+  no store waits for `RetrySavedSignIn` or another `SignIn`. While the store
+  is still unavailable, `save_in`'s fallback writes the new token to the plaintext file over the
+  reference (`TokenStoredUnencrypted` fires). The old keyring item stays orphaned until a later
+  sign-out's `clear_in` reaches the store under this path's key. That is #1877's `save_in`,
+  unchanged. `SignOut` clears the file and item as before; `enter_signin` clears
+  `saved_unavailable`.
+- **The test server** (`testserver.rs`): a `Route` with `status: 0` reads and records the whole
+  request, then closes the connection unanswered, which is a transport failure on every OS.
+  ureq 2 does not retry a POST, so a limit of 1 fails exactly one refresh.
+- **lookxy**: `SignInModal::SavedUnavailable { reason }` opens on the event and shows the
+  reason. The `State(Offline)` after it keeps it open; any other state but `SignInRequired`, or
+  `FoldersUpdated`, closes it. In `ui::handle_signin_key`, Enter sends `SignIn`, `r` sends
+  `RetrySavedSignIn` (`App::retry_saved_signin`). Esc does nothing, as in `Required`: the
+  engine retries by itself only while the store is merely unavailable, so a closed modal could
+  leave no key to sign in with. Its text says so ("Unlock the keyring and press r …, or press
+  Enter …", plus the qualified "if the keyring was only not running yet"). A `SignInStarted`
+  replaces it, and the `SavedSignInUnavailable` after a failed sign-in brings it back.
+- Tests: `auth::tests::needs_sign_in_for_refusals`, `transient_failures_do_not_need_sign_in`;
+  `testserver::tests::a_status_zero_route_closes_without_answering`;
+  `tokencache::tests::latched_store_asks_again_once`; `sync::engine::tests`:
+  `transient_refresh_failure_on_401_{dropped_connection,html_503,429,temporarily_unavailable}_keeps_the_token`,
+  `transient_refresh_failure_at_startup_keeps_the_token` (an expired token and a 401 after the
+  back-off, so two token requests), `folder_writes::transient_refresh_failure_on_an_outbox_op_keeps_it_queued`,
+  `refused_refresh_still_signs_out` (`invalid_grant` at startup, `interaction_required` on a
+  401, no refresh token), `unavailable_store_at_start_waits_for_it` (one folder list after the
+  store answers), `refused_store_is_not_asked_again_until_retry_command`,
+  `sign_in_while_saved_sign_in_unavailable_completes` (the keyring opens as the person signs
+  in, so the sign-in saves there; a later offline back-off then runs a tick, with no ask of the
+  store), `failed_sign_in_while_saved_sign_in_unavailable_announces_it_again` (r1; a failed
+  listener is not reachable cheaply in a test), `missing_item_still_means_signed_out`,
+  and `a_reference_without_its_store_is_kept_and_announced` (which replaces #1877's
+  `a_reference_without_its_store_says_why_sign_in_is_needed`). Their keyring is `TestKeyring`
+  behind `Latched`, leaked for `'static`. lookxy:
+  `app::tests::saved_sign_in_unavailable_opens_its_modal_and_offline_keeps_it`,
+  `ui::tests::enter_and_r_in_the_saved_sign_in_modal_send_sign_in_and_retry`.

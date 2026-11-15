@@ -2,9 +2,14 @@
 //! is `Some` — the same overlay shape as the move-folder/attachments popups
 //! (`ui::centered_rect`), drawn last so it sits on top of everything else.
 //!
-//! Two states (`app::SignInModal`):
+//! Three states (`app::SignInModal`):
 //! - `Required` — no valid token; prompts "press Enter to sign in with your
 //!   browser" (`App::on_key_enter` sends `SyncCommand::SignIn`).
+//! - `SavedUnavailable` — a saved sign-in whose keyring cannot be read now
+//!   (#2167): the keyring's reason, and the keys (Enter signs in again, `r`
+//!   asks the keyring again). The sync picks the keyring up by itself only
+//!   while it is merely not running yet; after a dismissed unlock prompt,
+//!   or with no keyring, only those keys move it.
 //! - `Started` — the engine's `begin_auth` succeeded and the browser has
 //!   already been opened (`App::on_sync_event`'s `SignInStarted` handler);
 //!   nothing left to press, just "finish it over there". Also shows the
@@ -39,6 +44,14 @@ pub fn draw(f: &mut Frame, app: &App) {
         SignInModal::Required => {
             "Not signed in.\n\nPress Enter to sign in with your browser.".to_string()
         }
+        SignInModal::SavedUnavailable { reason } => format!(
+            "Your saved sign-in is in the keyring, which is locked or not \
+             available:\n{reason}\n\n\
+             Unlock the keyring and press r to try it again, or press Enter \
+             to sign in again with your browser.\n\n\
+             (If the keyring was only not running yet, lookxy also picks the \
+             sign-in up once it is.)"
+        ),
         SignInModal::Started { authorize_url } => format!(
             "Signing in via your browser…\n\ncomplete it in the window that opened.\n\n\
              If your browser didn't open, visit:\n{authorize_url}"

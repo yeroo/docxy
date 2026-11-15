@@ -9,8 +9,11 @@
 //! - **The file itself** otherwise: DPAPI-encrypted on Windows (which has no
 //!   store here), and elsewhere plaintext JSON protected by 0600 permissions
 //!   alone, the fallback when no store is reachable (headless, a session
-//!   without a keyring). [`save_reporting`] / [`load_reporting`] say which,
-//!   so the engine can warn once ([`Storage::PlainFile`]).
+//!   without a keyring). `save_in` / `load_in` say which, so the engine can
+//!   warn once ([`Storage::PlainFile`]); it calls them with its own store
+//!   (`EngineConfig::token_store`, #2167). The public [`save_reporting`] /
+//!   [`load_reporting`] (and `save`, `load`, `clear`) are the same on
+//!   `platform_store()`, for embedders.
 //!
 //! A token file found while a store is reachable is migrated into it on
 //! load: the file is replaced by a reference (an atomic rename over it; the
@@ -33,7 +36,7 @@ use crate::json::{self, Value};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 #[cfg(target_os = "macos")]
 mod keychain;
@@ -93,6 +96,16 @@ pub(crate) trait SecretStore {
     fn set(&self, key: &str, label: &str, secret: &[u8]) -> Result<(), SecretStoreError>;
     /// Deletes the secret under `key`. A missing one is `Ok`.
     fn delete(&self, key: &str) -> Result<(), SecretStoreError>;
+    /// Whether this store stopped asking: the user refused its prompt
+    /// earlier in this run ([`Latched`]). The engine's automatic retries
+    /// of a saved sign-in leave such a store alone (#2167).
+    fn refused(&self) -> bool {
+        false
+    }
+    /// The person asked to try the store again (#2167): forget a refusal,
+    /// so the next call reaches the store and may raise its prompt once
+    /// more. A refusal then latches again.
+    fn ask_again(&self) {}
 }
 
 /// Where a token set ended up after a save or a load.
@@ -128,7 +141,7 @@ const FILE_STORAGE: Storage = if cfg!(windows) {
 )]
 pub(crate) struct Latched<S> {
     inner: S,
-    refused: OnceLock<String>,
+    refused: Mutex<Option<String>>,
 }
 
 // No secret store off Linux and macOS: only the tests build these there.
@@ -140,22 +153,28 @@ impl<S> Latched<S> {
     pub(crate) const fn new(inner: S) -> Self {
         Latched {
             inner,
-            refused: OnceLock::new(),
+            refused: Mutex::new(None),
         }
+    }
+
+    /// The latched refusal's reason, if any. A poisoned lock (a panic
+    /// while it was held) still holds a valid `Option`.
+    fn latched(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.refused.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn call<T>(
         &self,
         f: impl FnOnce(&S) -> Result<T, SecretStoreError>,
     ) -> Result<T, SecretStoreError> {
-        if let Some(reason) = self.refused.get() {
+        if let Some(reason) = self.latched().as_deref() {
             return Err(SecretStoreError::Unavailable(format!(
                 "{reason} (earlier in this run)"
             )));
         }
         let r = f(&self.inner);
         if let Err(SecretStoreError::Refused(reason)) = &r {
-            let _ = self.refused.set(reason.clone());
+            self.latched().get_or_insert_with(|| reason.clone());
         }
         r
     }
@@ -174,6 +193,12 @@ impl<S: SecretStore> SecretStore for Latched<S> {
     fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
         self.inner.delete(key)
     }
+    fn refused(&self) -> bool {
+        self.latched().is_some()
+    }
+    fn ask_again(&self) {
+        *self.latched() = None;
+    }
 }
 
 /// The platform's secret store, or `None`: on Windows (DPAPI keeps the
@@ -181,23 +206,29 @@ impl<S: SecretStore> SecretStore for Latched<S> {
 /// and when `MAILCORE_TOKEN_STORE=file` (a host's own tests set it). One
 /// process-wide [`Latched`] store, so a refusal outlives an engine restart.
 #[cfg(all(not(test), target_os = "linux"))]
-pub(crate) fn platform_store() -> Option<&'static dyn SecretStore> {
+pub(crate) fn platform_store() -> Option<&'static (dyn SecretStore + Sync)> {
     static STORE: Latched<secret_service::SecretService> =
         Latched::new(secret_service::SecretService);
-    (!file_only()).then_some(&STORE as &dyn SecretStore)
+    (!file_only()).then_some(&STORE as &(dyn SecretStore + Sync))
 }
 
 /// See the Linux `platform_store`.
 #[cfg(all(not(test), target_os = "macos"))]
-pub(crate) fn platform_store() -> Option<&'static dyn SecretStore> {
+pub(crate) fn platform_store() -> Option<&'static (dyn SecretStore + Sync)> {
     static STORE: Latched<keychain::Keychain> = Latched::new(keychain::Keychain);
-    (!file_only()).then_some(&STORE as &dyn SecretStore)
+    (!file_only()).then_some(&STORE as &(dyn SecretStore + Sync))
 }
 
 /// See the Linux `platform_store`.
 #[cfg(any(test, not(any(target_os = "linux", target_os = "macos"))))]
-pub(crate) fn platform_store() -> Option<&'static dyn SecretStore> {
+pub(crate) fn platform_store() -> Option<&'static (dyn SecretStore + Sync)> {
     None
+}
+
+/// A `Sync` store (the platform's, an engine's) as the store-generic
+/// functions take it.
+pub(crate) fn plain(store: Option<&(dyn SecretStore + Sync)>) -> Option<&dyn SecretStore> {
+    store.map(|s| s as &dyn SecretStore)
 }
 
 /// `MAILCORE_TOKEN_STORE=file`: keep the token in the file.
@@ -214,7 +245,7 @@ pub fn save(path: &Path, t: &TokenSet) -> io::Result<()> {
 
 /// [`save`], saying where the token set went.
 pub fn save_reporting(path: &Path, t: &TokenSet) -> io::Result<Storage> {
-    save_in(path, t, platform_store())
+    save_in(path, t, plain(platform_store()))
 }
 
 /// Loads the token set saved at `path`, from the store its reference names
@@ -226,13 +257,13 @@ pub fn load(path: &Path) -> io::Result<Option<TokenSet>> {
 
 /// [`load`], saying where the token set now lives.
 pub fn load_reporting(path: &Path) -> io::Result<Option<(TokenSet, Storage)>> {
-    load_in(path, platform_store())
+    load_in(path, plain(platform_store()))
 }
 
 /// Signs out: deletes the store's item and the file at `path`. See
 /// [`clear_in`].
 pub fn clear(path: &Path) -> io::Result<()> {
-    clear_in(path, platform_store())
+    clear_in(path, plain(platform_store()))
 }
 
 /// The account saved at `path` (a reference or a token file), with no
@@ -1254,6 +1285,38 @@ mod tests {
         ));
         assert_eq!(store.inner.gets.get(), 0);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #2167: a latched refusal says so (`refused`) and keeps every call
+    /// off the store; `ask_again` lets exactly the next call through, and a
+    /// second refusal latches again.
+    #[test]
+    fn latched_store_asks_again_once() {
+        let store = Latched::new(FakeStore::with_mode(Mode::Refused));
+        assert!(!store.refused());
+        assert!(matches!(store.get("k"), Err(SecretStoreError::Refused(_))));
+        assert!(store.refused());
+        assert!(matches!(
+            store.get("k"),
+            Err(SecretStoreError::Unavailable(_))
+        ));
+        assert_eq!(store.inner.gets.get(), 1, "the latch kept it off the store");
+        store.ask_again();
+        assert!(!store.refused());
+        assert!(matches!(store.get("k"), Err(SecretStoreError::Refused(_))));
+        assert_eq!(store.inner.gets.get(), 2, "asked exactly once more");
+        assert!(store.refused());
+        assert!(matches!(
+            store.get("k"),
+            Err(SecretStoreError::Unavailable(_))
+        ));
+        assert_eq!(store.inner.gets.get(), 2);
+        // Asked again once the keyring answers: it is used.
+        store.ask_again();
+        store.inner.mode.set(Mode::Works);
+        assert!(matches!(store.get("k"), Ok(None)));
+        assert!(!store.refused());
+        assert_eq!(store.inner.gets.get(), 3);
     }
 
     #[test]

@@ -61,8 +61,13 @@ pub struct AuthRequest {
 #[derive(Debug, Clone)]
 pub enum AuthError {
     /// The server rejected the request (non-2xx with a parseable OAuth
-    /// error body): `error`/`error_description`.
-    Denied(String),
+    /// error body): its `error` code (empty when the body has only an
+    /// `error_description`) and `error_description`. Whether it means the
+    /// grant itself was refused is [`AuthError::needs_sign_in`] (#2167).
+    Denied {
+        error: String,
+        description: Option<String>,
+    },
     /// Transport-level failure, or a response body that could not be read.
     Http(String),
     /// A non-2xx response with no parseable OAuth error body (#2113,
@@ -77,7 +82,11 @@ pub enum AuthError {
 impl fmt::Display for AuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AuthError::Denied(m) => write!(f, "authorization denied: {m}"),
+            AuthError::Denied { error, description } => write!(
+                f,
+                "authorization denied: {}",
+                description.as_deref().unwrap_or(error)
+            ),
             AuthError::Http(m) => write!(f, "HTTP error: {m}"),
             AuthError::Status { status, body } => {
                 write!(f, "HTTP error: {}", http_error_text(*status, body))
@@ -88,6 +97,39 @@ impl fmt::Display for AuthError {
 }
 
 impl std::error::Error for AuthError {}
+
+/// The OAuth `error` codes that refuse the grant itself (#2167): the
+/// refresh token, the consent or the client is no good, and only an
+/// interactive sign-in helps.
+const REFUSAL_CODES: [&str; 7] = [
+    "invalid_grant",
+    "interaction_required",
+    "consent_required",
+    "login_required",
+    "invalid_client",
+    "unauthorized_client",
+    "invalid_scope",
+];
+
+impl AuthError {
+    /// Whether this failure refuses the grant, so the person has to sign
+    /// in again (#2167): an OAuth error body whose `error` is one of
+    /// [`REFUSAL_CODES`] (any case), whatever the HTTP status. Everything
+    /// else is transient: a transport failure or a body that could not be
+    /// read (`Http`), a non-2xx with no OAuth body (`Status`: a 5xx, 429 or
+    /// 408, a front end's HTML page), a 2xx that does not parse (`Parse`),
+    /// and any other OAuth code (`temporarily_unavailable`,
+    /// `server_error`, ...). When unsure, transient: being offline for a
+    /// while is recoverable, a thrown-away sign-in is not.
+    pub fn needs_sign_in(&self) -> bool {
+        match self {
+            AuthError::Denied { error, .. } => REFUSAL_CODES
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(error.trim())),
+            AuthError::Http(_) | AuthError::Status { .. } | AuthError::Parse(_) => false,
+        }
+    }
+}
 
 /// The tenant segment for the `/oauth2/v2.0/...` endpoints: the last path
 /// segment of `authority` (e.g. `.../organizations` -> `organizations`).
@@ -201,16 +243,19 @@ fn post_token(
 
 /// Interprets a non-2xx token-endpoint response. Entra ID error bodies are
 /// JSON (`{"error":"...","error_description":"..."}`); when we can parse
-/// one out, surface it as `Denied` (the description is diagnostic text
-/// from the server, never a token or the code verifier). Anything else
-/// becomes a `Status` error, which keeps the body but displays one line.
+/// one out, surface it as `Denied` with its code (#2167) and description
+/// (diagnostic text from the server, never a token or the code verifier).
+/// Anything else becomes a `Status` error, which keeps the body but
+/// displays one line.
 fn classify_error(status: u16, body: &str) -> AuthError {
     if let Ok(v) = json::parse(body) {
-        if let Some(desc) = v.get("error_description").and_then(|d| d.as_str()) {
-            return AuthError::Denied(desc.to_string());
-        }
-        if let Some(err) = v.get("error").and_then(|d| d.as_str()) {
-            return AuthError::Denied(err.to_string());
+        let error = v.get("error").and_then(|d| d.as_str());
+        let description = v.get("error_description").and_then(|d| d.as_str());
+        if error.is_some() || description.is_some() {
+            return AuthError::Denied {
+                error: error.unwrap_or_default().to_string(),
+                description: description.map(str::to_string),
+            };
         }
     }
     AuthError::Status {
@@ -541,6 +586,75 @@ mod tests {
             r#"{"error":"invalid_grant","error_description":"AADSTS70008: expired"}"#,
         );
         assert_eq!(e.to_string(), "authorization denied: AADSTS70008: expired");
+    }
+
+    /// #2167: each code that refuses the grant needs a sign-in, whatever
+    /// its case and status; the description is still what `Display` shows.
+    #[test]
+    fn needs_sign_in_for_refusals() {
+        for code in REFUSAL_CODES {
+            let e = classify_error(400, &format!(r#"{{"error":"{code}"}}"#));
+            assert!(e.needs_sign_in(), "{code}: {e:?}");
+            assert_eq!(e.to_string(), format!("authorization denied: {code}"));
+        }
+        let e = token_error(
+            401,
+            r#"{"error":"Interaction_Required","error_description":"AADSTS50076: MFA"}"#,
+        );
+        assert!(e.needs_sign_in(), "{e:?}");
+        assert_eq!(e.to_string(), "authorization denied: AADSTS50076: MFA");
+        // A refusal served with a 5xx is still a refusal.
+        assert!(classify_error(500, r#"{"error":"invalid_grant"}"#).needs_sign_in());
+    }
+
+    /// #2167: a dropped connection, a 5xx/429/408 with no OAuth body, a
+    /// transient OAuth code and a 2xx that does not parse are all
+    /// transient.
+    #[test]
+    fn transient_failures_do_not_need_sign_in() {
+        let fail = |base: &str| match refresh(&cfg(), base, "RT1") {
+            Ok(_) => panic!("{base} answered with a token"),
+            Err(e) => e,
+        };
+        let refused_port = fail("http://127.0.0.1:9");
+        assert!(
+            matches!(refused_port, AuthError::Http(_)),
+            "{refused_port:?}"
+        );
+        let closed = {
+            let srv = FakeServer::start(vec![Route {
+                method: "POST".into(),
+                path_prefix: "/organizations/oauth2/v2.0/token".into(),
+                status: 0,
+                headers: vec![],
+                body: String::new(),
+            }]);
+            fail(&srv.base_url)
+        };
+        assert!(matches!(closed, AuthError::Http(_)), "{closed:?}");
+        let unparsed = {
+            let srv = FakeServer::start(vec![token_route("<html>ok</html>")]);
+            fail(&srv.base_url)
+        };
+        assert!(matches!(unparsed, AuthError::Parse(_)), "{unparsed:?}");
+        let errors = [
+            refused_port,
+            closed,
+            unparsed,
+            token_error(503, "<html><body>Service Unavailable</body></html>"),
+            token_error(429, ""),
+            token_error(408, ""),
+            token_error(400, r#"{"error":"temporarily_unavailable"}"#),
+            token_error(
+                500,
+                r#"{"error":"server_error","error_description":"AADSTS50000"}"#,
+            ),
+            token_error(400, r#"{"error":"invalid_request"}"#),
+            token_error(400, r#"{"error_description":"no code"}"#),
+        ];
+        for e in errors {
+            assert!(!e.needs_sign_in(), "{e:?}");
+        }
     }
 
     #[test]

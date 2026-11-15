@@ -435,11 +435,18 @@ pub struct ReminderBanner {
 /// the modal can also show it as a fallback (`ui::signin::draw`) — the
 /// browser-open is a best-effort, fire-and-forget shell-out, so if it
 /// silently fails to launch anything, the user still has something to copy
-/// into a browser by hand.
+/// into a browser by hand. `SavedUnavailable` after
+/// `SyncEvent::SavedSignInUnavailable` (#2167): a saved sign-in whose
+/// keyring cannot be read now, with the keyring's reason; Enter signs in
+/// again, `r` asks the keyring once more (`SyncCommand::RetrySavedSignIn`).
+/// It cannot be closed, as `Required` cannot: the sync retries by itself
+/// only while the keyring is merely not running yet, and after a dismissed
+/// unlock prompt (or with no keyring at all) only those two keys move it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignInModal {
     Required,
     Started { authorize_url: String },
+    SavedUnavailable { reason: String },
 }
 
 /// State for the move-folder popup opened by `v`: the candidate folders (as
@@ -697,7 +704,11 @@ impl App {
                 // `Offline`, never `Idle`/`FoldersUpdated`): the modal would
                 // otherwise stay stuck blocking all keys forever. A resting
                 // `Idle` additionally clears any error notice.
-                if !matches!(s, SyncState::SignInRequired) {
+                // The `Offline` that follows `SavedSignInUnavailable`
+                // (#2167) is that modal's own state: it stays.
+                let waits_for_keyring = s == SyncState::Offline
+                    && matches!(self.signin_modal, Some(SignInModal::SavedUnavailable { .. }));
+                if !matches!(s, SyncState::SignInRequired) && !waits_for_keyring {
                     self.signin_modal = None;
                 }
                 if matches!(s, SyncState::Idle) {
@@ -778,6 +789,9 @@ impl App {
             // is not compared.
             SyncEvent::DraftReady { id, .. } => self.open_draft(&id),
             SyncEvent::SignInRequired => self.signin_modal = Some(SignInModal::Required),
+            SyncEvent::SavedSignInUnavailable(reason) => {
+                self.signin_modal = Some(SignInModal::SavedUnavailable { reason });
+            }
             SyncEvent::SignInStarted { authorize_url } => {
                 self.open_url_with_os_handler(&authorize_url);
                 self.signin_modal = Some(SignInModal::Started { authorize_url });
@@ -1113,8 +1127,23 @@ impl App {
     /// (`ui::handle_key`) only reach this while it is, but tests call it
     /// directly.
     pub fn on_key_enter(&mut self) {
-        if matches!(self.signin_modal, Some(SignInModal::Required)) {
+        if matches!(
+            self.signin_modal,
+            Some(SignInModal::Required | SignInModal::SavedUnavailable { .. })
+        ) {
             let _ = self.sync.cmd_tx.send(SyncCommand::SignIn);
+        }
+    }
+
+    /// `r` in the saved-sign-in modal (#2167): ask the keyring once more
+    /// (`SyncCommand::RetrySavedSignIn`), its unlock prompt included. The
+    /// modal stays until the sync answers. A no-op in the other modals.
+    pub fn retry_saved_signin(&mut self) {
+        if matches!(
+            self.signin_modal,
+            Some(SignInModal::SavedUnavailable { .. })
+        ) {
+            let _ = self.sync.cmd_tx.send(SyncCommand::RetrySavedSignIn);
         }
     }
 
@@ -4081,6 +4110,18 @@ impl App {
         matches!(last, Some(SyncCommand::SignIn))
     }
 
+    /// Test-only: drains `test_cmd_rx` and returns the last command sent.
+    #[cfg(test)]
+    pub fn last_sent_command(&self) -> Option<SyncCommand> {
+        let mut last = None;
+        if let Some(rx) = &self.test_cmd_rx {
+            while let Ok(cmd) = rx.try_recv() {
+                last = Some(cmd);
+            }
+        }
+        last
+    }
+
     /// Test-only: renders the whole UI (`ui::draw`) to an off-screen buffer
     /// and reports whether `needle` appears anywhere in it, case-insensitively
     /// (so a test doesn't have to match the exact capitalization the UI
@@ -6933,6 +6974,52 @@ pub(crate) mod tests {
         assert!(app.signin_modal.is_some());
 
         app.on_sync_event(SyncEvent::State(SyncState::Syncing));
+        assert!(app.signin_modal.is_none());
+    }
+
+    /// #2167: a saved sign-in the keyring cannot give opens its own modal
+    /// with the reason, not the sign-in prompt; the engine's `Offline`
+    /// right after keeps it, a successful sync closes it.
+    #[test]
+    fn saved_sign_in_unavailable_opens_its_modal_and_offline_keeps_it() {
+        let mut app = App::for_test_with_seeded_store();
+        let reason = "secret store unavailable: the unlock prompt was dismissed";
+        app.on_sync_event(SyncEvent::SavedSignInUnavailable(reason.into()));
+        app.on_sync_event(SyncEvent::State(SyncState::Offline));
+        assert_eq!(
+            app.signin_modal,
+            Some(SignInModal::SavedUnavailable {
+                reason: reason.into()
+            })
+        );
+        assert!(app.render_contains("unlock prompt was dismissed"));
+        assert!(!app.render_contains("Press Enter to sign in"));
+        assert!(app.render_contains("Unlock the keyring"));
+        app.on_sync_event(SyncEvent::FoldersUpdated);
+        assert!(app.signin_modal.is_none());
+        // Another state than `Offline` closes it too (a sign-in began).
+        app.on_sync_event(SyncEvent::SavedSignInUnavailable(reason.into()));
+        app.on_sync_event(SyncEvent::State(SyncState::Syncing));
+        assert!(app.signin_modal.is_none());
+        // A browser sign-in that failed while the saved one waits: the
+        // engine says so again, and the modal comes back from `Started`.
+        app.on_sync_event(SyncEvent::SignInStarted {
+            authorize_url: "https://login.microsoftonline.com/x?y=1".into(),
+        });
+        app.on_sync_event(SyncEvent::Error("sign-in failed: timed out".into()));
+        app.on_sync_event(SyncEvent::SavedSignInUnavailable(reason.into()));
+        assert_eq!(
+            app.signin_modal,
+            Some(SignInModal::SavedUnavailable {
+                reason: reason.into()
+            })
+        );
+        app.on_sync_event(SyncEvent::FoldersUpdated);
+        // `Offline` alone never opens or keeps another modal.
+        app.on_sync_event(SyncEvent::SignInStarted {
+            authorize_url: "https://login.microsoftonline.com/x?y=1".into(),
+        });
+        app.on_sync_event(SyncEvent::State(SyncState::Offline));
         assert!(app.signin_modal.is_none());
     }
 
