@@ -438,8 +438,10 @@ pub struct ReminderBanner {
 /// into a browser by hand. `SavedUnavailable` after
 /// `SyncEvent::SavedSignInUnavailable` (#2167): a saved sign-in whose
 /// keyring cannot be read now, with the keyring's reason; Enter signs in
-/// again, `r` asks the keyring once more (`SyncCommand::RetrySavedSignIn`),
-/// Esc closes it while the engine keeps trying by itself.
+/// again, `r` asks the keyring once more (`SyncCommand::RetrySavedSignIn`).
+/// It cannot be closed, as `Required` cannot: the sync retries by itself
+/// only while the keyring is merely not running yet, and after a dismissed
+/// unlock prompt (or with no keyring at all) only those two keys move it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignInModal {
     Required,
@@ -1142,18 +1144,6 @@ impl App {
             Some(SignInModal::SavedUnavailable { .. })
         ) {
             let _ = self.sync.cmd_tx.send(SyncCommand::RetrySavedSignIn);
-        }
-    }
-
-    /// Esc in the saved-sign-in modal (#2167): close it; the sync keeps
-    /// trying the keyring and signs in when it answers. The other modals
-    /// cannot be closed.
-    pub fn dismiss_saved_signin(&mut self) {
-        if matches!(
-            self.signin_modal,
-            Some(SignInModal::SavedUnavailable { .. })
-        ) {
-            self.signin_modal = None;
         }
     }
 
@@ -7004,13 +6994,27 @@ pub(crate) mod tests {
         );
         assert!(app.render_contains("unlock prompt was dismissed"));
         assert!(!app.render_contains("Press Enter to sign in"));
-        assert!(app.render_contains("try the keyring again"));
+        assert!(app.render_contains("Unlock the keyring"));
         app.on_sync_event(SyncEvent::FoldersUpdated);
         assert!(app.signin_modal.is_none());
         // Another state than `Offline` closes it too (a sign-in began).
         app.on_sync_event(SyncEvent::SavedSignInUnavailable(reason.into()));
         app.on_sync_event(SyncEvent::State(SyncState::Syncing));
         assert!(app.signin_modal.is_none());
+        // A browser sign-in that failed while the saved one waits: the
+        // engine says so again, and the modal comes back from `Started`.
+        app.on_sync_event(SyncEvent::SignInStarted {
+            authorize_url: "https://login.microsoftonline.com/x?y=1".into(),
+        });
+        app.on_sync_event(SyncEvent::Error("sign-in failed: timed out".into()));
+        app.on_sync_event(SyncEvent::SavedSignInUnavailable(reason.into()));
+        assert_eq!(
+            app.signin_modal,
+            Some(SignInModal::SavedUnavailable {
+                reason: reason.into()
+            })
+        );
+        app.on_sync_event(SyncEvent::FoldersUpdated);
         // `Offline` alone never opens or keeps another modal.
         app.on_sync_event(SyncEvent::SignInStarted {
             authorize_url: "https://login.microsoftonline.com/x?y=1".into(),

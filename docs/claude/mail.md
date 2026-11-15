@@ -4456,7 +4456,10 @@ keyring cannot be read now both keep it.
   not latched a refusal (`SecretStore::refused`). With no store at all (`token_store == None`:
   Windows, `MAILCORE_TOKEN_STORE=file`, `cfg(test)`) nothing is retried automatically. Then
   `next_tick` moves on, and a passed `next_retry` is dropped as usual, so the wait falls back to
-  the tick. `retry_saved_signin` loads again. `Ok(Some)` clears the state and the back-off,
+  the tick. With a fast tick, a wake that leaves the sign-in waiting also moves `next_fast` and
+  `next_full` on (r1): `recv_timeout` is their minimum, at least `next_retry`, and with stale
+  deadlines and the retry dropped it would be zero for good, a busy spin. Test:
+  `a_waiting_saved_sign_in_does_not_spin_with_a_fast_tick` (no store, and a latched one). `retry_saved_signin` loads again. `Ok(Some)` clears the state and the back-off,
   `start_session`, then the startup pass and `after_pass_if_fast`: one pass for that wake. A
   `NotConnected` waits again (the back-off doubles). `Ok(None)` (the item is gone) or another
   error signs out, as at startup.
@@ -4472,8 +4475,12 @@ keyring cannot be read now both keep it.
   `tokencache::plain`). `SecretStore` has no `Sync` supertrait, as the tokencache test fake is
   `Cell`-based.
 - **`SignIn` and `SignOut` meanwhile.** `SignIn` runs the interactive sign-in. Success clears
-  `saved_unavailable`. A failure (listener, redirect, redeem) sends its `Error` and settles back
-  to `Offline` (`sign_in_not_started`, `sign_in_failed`), and the retries go on. While the store
+  `saved_unavailable`. A failure (listener, redirect, redeem) sends its `Error`, then
+  `SavedSignInUnavailable` with the last reason again (`saved_signin_still_waits`, from
+  `sign_in_not_started` and `sign_in_failed`: the state stayed `Offline`, so a client showing
+  the sign-in under way has nothing else to go back by), and settles `Offline`. The back-off is
+  untouched: the store is retried by itself only while merely unavailable; a latched refusal or
+  no store waits for `RetrySavedSignIn` or another `SignIn`. While the store
   is still unavailable, `save_in`'s fallback writes the new token to the plaintext file over the
   reference (`TokenStoredUnencrypted` fires). The old keyring item stays orphaned until a later
   sign-out's `clear_in` reaches the store under this path's key. That is #1877's `save_in`,
@@ -4485,8 +4492,11 @@ keyring cannot be read now both keep it.
 - **lookxy**: `SignInModal::SavedUnavailable { reason }` opens on the event and shows the
   reason. The `State(Offline)` after it keeps it open; any other state but `SignInRequired`, or
   `FoldersUpdated`, closes it. In `ui::handle_signin_key`, Enter sends `SignIn`, `r` sends
-  `RetrySavedSignIn` (`App::retry_saved_signin`), and Esc closes it
-  (`App::dismiss_saved_signin`) while the engine keeps trying.
+  `RetrySavedSignIn` (`App::retry_saved_signin`). Esc does nothing, as in `Required`: the
+  engine retries by itself only while the store is merely unavailable, so a closed modal could
+  leave no key to sign in with. Its text says so ("Unlock the keyring and press r …, or press
+  Enter …", plus the qualified "if the keyring was only not running yet"). A `SignInStarted`
+  replaces it, and the `SavedSignInUnavailable` after a failed sign-in brings it back.
 - Tests: `auth::tests::needs_sign_in_for_refusals`, `transient_failures_do_not_need_sign_in`;
   `testserver::tests::a_status_zero_route_closes_without_answering`;
   `tokencache::tests::latched_store_asks_again_once`; `sync::engine::tests`:
@@ -4496,7 +4506,10 @@ keyring cannot be read now both keep it.
   `refused_refresh_still_signs_out` (`invalid_grant` at startup, `interaction_required` on a
   401, no refresh token), `unavailable_store_at_start_waits_for_it` (one folder list after the
   store answers), `refused_store_is_not_asked_again_until_retry_command`,
-  `sign_in_while_saved_sign_in_unavailable_completes`, `missing_item_still_means_signed_out`,
+  `sign_in_while_saved_sign_in_unavailable_completes` (the keyring opens as the person signs
+  in, so the sign-in saves there; a later offline back-off then runs a tick, with no ask of the
+  store), `failed_sign_in_while_saved_sign_in_unavailable_announces_it_again` (r1; a failed
+  listener is not reachable cheaply in a test), `missing_item_still_means_signed_out`,
   and `a_reference_without_its_store_is_kept_and_announced` (which replaces #1877's
   `a_reference_without_its_store_says_why_sign_in_is_needed`). Their keyring is `TestKeyring`
   behind `Latched`, leaked for `'static`. lookxy:

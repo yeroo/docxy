@@ -506,15 +506,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 /// Keys while the sign-in modal is open: Enter drives `App::on_key_enter`
 /// (sends `SyncCommand::SignIn` from the `Required` and `SavedUnavailable`
 /// states; a no-op once `Started`, since the browser is already open). In
-/// the saved-sign-in modal (#2167) `r` asks the keyring again and Esc
-/// closes it (the sync keeps trying by itself). Nothing else is handled —
+/// the saved-sign-in modal (#2167) `r` asks the keyring again. Nothing
+/// else is handled, Esc neither (the sync retries the keyring by itself
+/// only while it is merely not running yet, so a closed modal could leave
+/// no key to sign in with) —
 /// there's no folder tree or message list to navigate without a token yet,
 /// and no way to cancel out of a mandatory sign-in.
 fn handle_signin_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Enter => app.on_key_enter(),
         KeyCode::Char('r') => app.retry_saved_signin(),
-        KeyCode::Esc => app.dismiss_saved_signin(),
         _ => {}
     }
 }
@@ -713,7 +714,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     /// #2167: in the saved-sign-in modal Enter signs in again, `r` asks
-    /// the keyring again, other keys do nothing, and Esc closes it. In the
+    /// the keyring again, and other keys, Esc included, do nothing. In the
     /// `Required` modal `r` and Esc do nothing.
     #[test]
     fn enter_and_r_in_the_saved_sign_in_modal_send_sign_in_and_retry() {
@@ -731,9 +732,15 @@ mod tests {
         assert!(matches!(app.last_sent_command(), Some(SyncCommand::SignIn)));
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('m')));
         assert!(app.last_sent_command().is_none());
-        assert!(app.signin_modal.is_some());
         handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
-        assert!(app.signin_modal.is_none());
+        assert!(app.last_sent_command().is_none());
+        assert!(
+            matches!(
+                app.signin_modal,
+                Some(crate::app::SignInModal::SavedUnavailable { .. })
+            ),
+            "Esc does not strand the person without a key"
+        );
 
         app.on_sync_event(SyncEvent::SignInRequired);
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('r')));
