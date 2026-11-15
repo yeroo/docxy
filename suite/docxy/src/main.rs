@@ -37598,7 +37598,7 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
             let cell = &row.cells[cb.cell];
             // The cell's text: over its style's run formatting, and in ink
             // that reads on its fill (#765).
-            let text_w = tw_px(cb.width as i32 - 216, zoom).max(0.0);
+            let text_w = tw_px(cb.width as i32 - table_view::CELL_MARGIN_TW as i32, zoom).max(0.0);
             let cell_ctx = RenderCtx {
                 line_width: Some(text_w),
                 gap_below: false,

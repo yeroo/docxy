@@ -5,7 +5,7 @@
 //! `table_el` in main.rs turns it into elements.
 
 use docxcore::border_style::BorderStyle;
-use docxcore::model::{Table, VMerge};
+use docxcore::model::{Block, Table, VMerge};
 use docxcore::table::{GridMap, cell_props, usable_grid};
 use docxcore::table_props::{BorderLine, VAlign};
 use docxcore::table_styles::{CellLook, RunLook, TableStyle, resolve};
@@ -245,9 +245,23 @@ fn wants(t: &Table) -> Wants {
 /// last), then any that was at least [`MIN_FIT_COL_TW`] wide and fell below
 /// it is lifted back to it, so a table that cannot shrink comes out wider
 /// than `fit`. The target is at most [`MAX_FIT_TW`], so no sum overflows.
+///
+/// Then each column is lifted to what its cells' content cannot shrink below
+/// (#1963, [`column_mins`]): a nested table wider than its cell widens the
+/// cell, as a browser's auto layout does, so the table holds it and the view
+/// scrolls to it. The other columns give up their slack above their own
+/// minimum first; what that cannot cover widens the table.
 pub fn fitted_grid(t: &Table, fit: Option<u32>) -> Vec<u32> {
     let grid = usable_grid(t);
     let Some(fit) = fit else { return grid };
+    let mut out = scaled_grid(t, grid, fit);
+    lift_to(&mut out, &column_mins(t, 0));
+    out
+}
+
+/// [`fitted_grid`]'s #1895 steps: `grid` scaled to `t`'s target in `fit`,
+/// then floored.
+fn scaled_grid(t: &Table, grid: Vec<u32>, fit: u32) -> Vec<u32> {
     let sum: u64 = grid.iter().map(|&w| u64::from(w)).sum();
     if sum == 0 {
         return grid;
@@ -278,6 +292,144 @@ pub fn fitted_grid(t: &Table, fit: Option<u32>) -> Vec<u32> {
         }
     }
     out
+}
+
+/// The left and right padding the view gives a cell's text, in twips: the
+/// 7.2 px each side `table_el` draws (#1963). The view does not read
+/// `w:tcMar` or `w:tblCellMar`, so a cell's content need is measured
+/// against this, not the model's margins.
+pub const CELL_MARGIN_TW: u32 = 216;
+
+/// How deep [`column_mins`] follows tables nested in cells (#1963); deeper
+/// ones need nothing, so a hostile mail's nest costs at most this.
+const MAX_NEST: usize = 64;
+
+/// The narrowest each of `t`'s grid columns is drawn in a flow view (#1963):
+/// a `dxa` table's column its grid width, a `pct` or `auto` one's its #1895
+/// floor ([`MIN_FIT_COL_TW`], 0 for a spacer), each lifted to what its cells
+/// need ([`content_need`] and [`CELL_MARGIN_TW`]). A cell spanning several
+/// columns spreads what they lack after the single-column cells, in
+/// proportion to their grid widths (equal shares when those are 0), the
+/// remainder to the last. A continued vertical merge needs nothing. Each
+/// column is at most [`MAX_FIT_TW`], and when they sum past it they are
+/// scaled down to it, so a lift never widens a table past the cap.
+fn column_mins(t: &Table, depth: usize) -> Vec<u64> {
+    let grid = usable_grid(t);
+    let fixed = wants(t) == Wants::Fixed;
+    let mut mins: Vec<u64> = grid
+        .iter()
+        .map(|&g| match (fixed, g >= MIN_FIT_COL_TW) {
+            (true, _) => u64::from(g).min(MAX_FIT_TW),
+            (false, true) => u64::from(MIN_FIT_COL_TW),
+            (false, false) => 0,
+        })
+        .collect();
+    if depth < MAX_NEST {
+        let map = GridMap::of(t);
+        let mut spans: Vec<(usize, usize, u64)> = Vec::new();
+        for (rm, row) in map.rows.iter().zip(&t.rows) {
+            for (&(s, n), cell) in rm.cells.iter().zip(&row.cells) {
+                if cell.v_merge == VMerge::Continue || n == 0 || s >= mins.len() {
+                    continue;
+                }
+                let need = content_need(&cell.blocks, depth + 1);
+                if need == 0 {
+                    continue;
+                }
+                let need = (need + u64::from(CELL_MARGIN_TW)).min(MAX_FIT_TW);
+                if n == 1 {
+                    mins[s] = mins[s].max(need);
+                } else {
+                    spans.push((s, n.min(mins.len() - s), need));
+                }
+            }
+        }
+        for (s, n, need) in spans {
+            let have: u64 = mins[s..s + n].iter().sum();
+            let Some(lack) = need.checked_sub(have).filter(|&l| l > 0) else {
+                continue;
+            };
+            let weights: Vec<u64> = grid[s..s + n].iter().map(|&g| u64::from(g)).collect();
+            let total: u64 = weights.iter().sum();
+            let mut given = 0;
+            for (k, m) in mins[s..s + n].iter_mut().enumerate() {
+                let share = if k + 1 == n {
+                    lack - given
+                } else if total == 0 {
+                    lack / n as u64
+                } else {
+                    lack * weights[k] / total
+                };
+                given += share;
+                *m = (*m + share).min(MAX_FIT_TW);
+            }
+        }
+    }
+    let sum: u64 = mins.iter().sum();
+    if sum > MAX_FIT_TW {
+        for m in &mut mins {
+            *m = *m * MAX_FIT_TW / sum;
+        }
+    }
+    mins
+}
+
+/// The narrowest `blocks` (a cell's) can be drawn, in twips (#1963): the
+/// widest nested table's [`column_mins`] summed. A paragraph needs nothing:
+/// its text wraps and a picture scales to its room.
+fn content_need(blocks: &[Block], depth: usize) -> u64 {
+    blocks
+        .iter()
+        .map(|b| match b {
+            Block::Table(t) => column_mins(t, depth).iter().sum(),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Lift each of `out`'s columns below its minimum in `mins` to it (#1963),
+/// taking what that adds from the other columns' slack above their own
+/// minimum, in proportion to it (the remainder from the last ones that have
+/// any); what the slack cannot cover widens the table.
+fn lift_to(out: &mut [u32], mins: &[u64]) {
+    let min_of = |i: usize| mins.get(i).copied().unwrap_or(0);
+    let lack: u64 = out
+        .iter()
+        .enumerate()
+        .map(|(i, &w)| min_of(i).saturating_sub(u64::from(w)))
+        .sum();
+    if lack == 0 {
+        return;
+    }
+    let slack: Vec<u64> = out
+        .iter()
+        .enumerate()
+        .map(|(i, &w)| u64::from(w).saturating_sub(min_of(i)))
+        .collect();
+    let spare: u64 = slack.iter().sum();
+    let take = lack.min(spare);
+    if take > 0 {
+        let mut taken = 0;
+        let mut cut: Vec<u64> = slack.iter().map(|&s| s * take / spare).collect();
+        taken += cut.iter().sum::<u64>();
+        // The rounding left over, from the last columns with slack.
+        for (c, &s) in cut.iter_mut().zip(&slack).rev() {
+            if taken == take {
+                break;
+            }
+            let more = (s - *c).min(take - taken);
+            *c += more;
+            taken += more;
+        }
+        for (w, c) in out.iter_mut().zip(cut) {
+            *w -= c as u32;
+        }
+    }
+    for (i, w) in out.iter_mut().enumerate() {
+        // Each minimum is at most MAX_FIT_TW, so it fits a u32.
+        *w = (*w).max(min_of(i) as u32);
+    }
 }
 
 /// Where a table sits across the room its block is drawn in (#1922).
@@ -983,6 +1135,139 @@ mod tests {
         let w = widths(&t, Some(u32::MAX));
         assert_eq!(w.iter().map(|&c| u64::from(c)).sum::<u64>(), MAX_FIT_TW);
         assert_eq!(w, [500_000, 500_000]);
+    }
+
+    const DXA: fn(u32) -> String = |w| format!("<w:tblW w:w=\"{w}\" w:type=\"dxa\"/>");
+
+    /// `outer` with `inner` put in its row 0's cell `cell`, after its text.
+    fn holding(mut outer: Table, cell: usize, inner: Table) -> Table {
+        outer.rows[0].cells[cell].blocks.push(Block::Table(inner));
+        outer
+    }
+
+    /// A one-column `dxa` table `w` wide.
+    fn card(w: u32) -> Table {
+        sized(&[w], Some(&DXA(w)))
+    }
+
+    #[test]
+    fn a_fitted_column_holds_a_nested_dxa_table_with_its_margins_1963() {
+        let t = holding(sized(&[9360], Some(PCT_100)), 0, card(9000));
+        // Narrower than the card: the column holds it and its 216 twips.
+        assert_eq!(widths(&t, Some(6000)), [9000 + CELL_MARGIN_TW]);
+        // Wide enough: the #1895 target, no lift.
+        assert_eq!(widths(&t, Some(12000)), [12000]);
+        assert_eq!(widths(&t, Some(9216)), [9216]);
+        // An auto table too; a dxa one holding a wider card grows.
+        let t = holding(sized(&[9360], None), 0, card(9000));
+        assert_eq!(widths(&t, Some(6000)), [9216]);
+        let t = holding(card(3000), 0, card(6000));
+        assert_eq!(widths(&t, Some(20000)), [6216]);
+        // A dxa table whose content fits keeps its grid.
+        let t = holding(card(9000), 0, card(3000));
+        assert_eq!(widths(&t, Some(6000)), [9000]);
+    }
+
+    #[test]
+    fn a_lift_takes_the_other_columns_slack_first_1963() {
+        let t = holding(sized(&[4680, 4680], Some(PCT_100)), 0, card(4000));
+        // [3000, 3000] fitted: 1216 more for the card comes out of the
+        // other column, so the table keeps its 6000.
+        assert_eq!(widths(&t, Some(6000)), [4216, 1784]);
+        // More than the slack above the other column's floor: it stops at
+        // the floor and the table widens.
+        let t = holding(sized(&[4680, 4680], Some(PCT_100)), 0, card(6000));
+        assert_eq!(widths(&t, Some(6000)), [6216, MIN_FIT_COL_TW]);
+        // A spacer (no floor) gives up all it has.
+        let t = holding(sized(&[4680, 300], Some(PCT_100)), 0, card(6000));
+        let w = widths(&t, Some(5000));
+        assert_eq!(w, [6216, 0], "{w:?}");
+    }
+
+    #[test]
+    fn a_need_recurses_through_nested_fitted_tables_1963() {
+        let inner = holding(sized(&[9360], Some(PCT_100)), 0, card(9000));
+        let middle = holding(sized(&[9360], Some(PCT_100)), 0, inner);
+        let t = holding(sized(&[9360], Some(PCT_100)), 0, middle);
+        assert_eq!(widths(&t, Some(6000)), [9000 + 3 * CELL_MARGIN_TW]);
+        // The middle table, fitted to that cell's text, holds the rest.
+        let Block::Table(middle) = &t.rows[0].cells[0].blocks[1] else {
+            panic!("no nested table");
+        };
+        assert_eq!(widths(middle, Some(9000 + 2 * CELL_MARGIN_TW)), [9432]);
+        // A nested pct table needs only its floors: 432 for each column,
+        // none for a spacer.
+        let floors = sized(&[1000, 300, 1000], Some(PCT_100));
+        let t = holding(sized(&[9360], Some(PCT_100)), 0, floors);
+        assert_eq!(
+            widths(&t, Some(1000)),
+            [2 * MIN_FIT_COL_TW + CELL_MARGIN_TW]
+        );
+        // A cell whose content needs nothing keeps the #1895 floor.
+        let t = sized(&[9360], Some(PCT_100));
+        assert_eq!(widths(&t, Some(100)), [MIN_FIT_COL_TW]);
+    }
+
+    #[test]
+    fn a_spanning_cell_spreads_its_need_by_the_grid_1963() {
+        let mut t = sized(&[300, 900], Some(PCT_100));
+        t.rows[0].cells.remove(1);
+        t.rows[0].cells[0].grid_span = 2;
+        let t = holding(t, 0, card(3000));
+        // Floors [0, 432]; the 2784 the span still lacks goes over the
+        // grid widths 300 : 900.
+        assert_eq!(widths(&t, Some(1200)), [3216]);
+        assert_eq!(fitted_grid(&t, Some(1200)), [696, 2520]);
+        // A single-column cell's need comes first; the span adds only what
+        // it still lacks.
+        let mut t = new_table(2, 2, 2000, AutoFit::Default);
+        t.grid = vec![1000, 1000];
+        edit_table_props(&mut t, |p| p.set(PCT_100));
+        t.rows[0].cells.remove(1);
+        t.rows[0].cells[0].grid_span = 2;
+        t.rows[0].cells[0].blocks.push(Block::Table(card(3000)));
+        t.rows[1].cells[0].blocks.push(Block::Table(card(2000)));
+        // Column 0 holds 2216; the span's 3216 lacks 1000 - 432 = 568 over
+        // [2216, 432], split 1:1 by the grid: [2216 + 284, 432 + 284].
+        assert_eq!(fitted_grid(&t, Some(1000)), [2500, 716]);
+    }
+
+    #[test]
+    fn without_a_fit_nested_content_changes_nothing_1963() {
+        let t = holding(sized(&[4680, 4680], Some(PCT_100)), 0, card(9000));
+        assert_eq!(widths(&t, None), [4680, 4680]);
+        assert_eq!(fitted_grid(&t, None), usable_grid(&t));
+    }
+
+    #[test]
+    fn a_hostile_nest_is_capped_and_never_overflows_1963() {
+        // dxa tables of 4e9 twips nested three deep, three side by side:
+        // every sum stays at most MAX_FIT_TW (a debug build would panic).
+        let deep = |d: usize| {
+            let mut t = card(4_000_000_000);
+            for _ in 0..d {
+                t = holding(card(4_000_000_000), 0, t);
+            }
+            t
+        };
+        let t = holding(sized(&[9360], Some(PCT_100)), 0, deep(3));
+        assert_eq!(widths(&t, Some(6000)), [MAX_FIT_TW as u32]);
+        let mut t = sized(&[1000, 1000, 1000], Some(PCT_100));
+        for c in 0..3 {
+            t = holding(t, c, deep(2));
+        }
+        let w = widths(&t, Some(6000));
+        assert!(
+            w.iter().map(|&c| u64::from(c)).sum::<u64>() <= MAX_FIT_TW,
+            "{w:?}"
+        );
+        // Nested past the depth cap: the deepest tables need nothing.
+        let mut t = card(9000);
+        for _ in 0..(MAX_NEST + 8) {
+            t = holding(sized(&[9360], Some(PCT_100)), 0, t);
+        }
+        let w = widths(&t, Some(6000));
+        assert!(w[0] >= MIN_FIT_COL_TW, "{w:?}");
     }
 
     #[test]
