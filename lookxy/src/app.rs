@@ -4195,6 +4195,7 @@ impl App {
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
                     size: None,
+                    is_event_message: false,
                 },
             )
             .expect("seed message");
@@ -4616,6 +4617,7 @@ pub(crate) mod tests {
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
                     size: None,
+                    is_event_message: false,
                 },
             )
             .expect("seed invite");
@@ -5101,6 +5103,7 @@ pub(crate) mod tests {
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
                     size: None,
+                    is_event_message: false,
                 },
             )
             .unwrap();
@@ -5344,6 +5347,7 @@ pub(crate) mod tests {
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
                     size: None,
+                    is_event_message: false,
                 },
             )
             .expect("seed m2");
@@ -5385,6 +5389,7 @@ pub(crate) mod tests {
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
                     size: None,
+                    is_event_message: false,
                 },
             )
             .expect("seed m3");
@@ -6081,6 +6086,7 @@ pub(crate) mod tests {
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
                     size: None,
+                    is_event_message: false,
                 },
             )
             .expect("update message to has_attachments=true");
@@ -6127,6 +6133,7 @@ pub(crate) mod tests {
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
                     size: None,
+                    is_event_message: false,
                 },
             )
             .expect("seed message");
@@ -7243,6 +7250,7 @@ pub(crate) mod tests {
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
                     size: None,
+                    is_event_message: false,
                 },
             )
             .expect("mark m1 has_attachments");
@@ -7279,6 +7287,7 @@ pub(crate) mod tests {
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
                     size: None,
+                    is_event_message: false,
                 },
             )
             .expect("mark m2 has_attachments");
@@ -7440,6 +7449,7 @@ pub(crate) mod tests {
                     internet_message_id: "<d1@x>".into(),
                     in_reply_to: "<m1@x>".into(),
                     size: None,
+                    is_event_message: false,
                 },
             )
             .unwrap();
@@ -7630,6 +7640,7 @@ pub(crate) mod tests {
             internet_message_id: String::new(),
             in_reply_to: String::new(),
             size: None,
+            is_event_message: false,
         };
         app.store
             .upsert_message("inbox", &a("a1", "2026-07-17T10:00:00Z"))

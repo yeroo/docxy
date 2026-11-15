@@ -50,14 +50,14 @@
 use crate::auth::{self, AuthConfig, TokenSet};
 use crate::graph::client::{
     BATCH_MAX, BatchRequest, CalendarDeltaCursor, ContactFieldSet, DeltaCursor, EventInput,
-    GraphClient, GraphError, RsvpKind, automatic_replies_body, event_body_json, event_zone_error,
-    is_expired_sync_state, moved_message_id, rsvp_proposal,
+    GraphClient, GraphError, RsvpKind, TypeTier, automatic_replies_body, event_body_json,
+    event_zone_error, is_expired_sync_state, moved_message_id, rsvp_proposal,
 };
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
     AutomaticReplies, DeltaItem, DirectoryUser, Event, EventDeltaItem, FolderContact, MailFolder,
-    Me, MeetingMessage, Message, MessageFields, Recipient, ScheduleEntry, SearchHit,
-    parse_folder_size,
+    Me, MeetingMessage, MeetingMessageType, Message, MessageFields, Recipient, ScheduleEntry,
+    SearchHit, parse_folder_size, parse_meeting_message_type,
 };
 pub use crate::store::ClearOfflineRefusal;
 use crate::store::{
@@ -2032,6 +2032,14 @@ pub struct EngineOptions {
     /// before then brings. Off, a row's size comes only with its delta,
     /// fetch or search hit.
     pub size_fill: bool,
+    /// Whether the engine fills, in idle time, the meeting message type
+    /// of the stored meeting messages whose type is not known (#2168, the
+    /// type fill; default on): rows a delta stored after Graph refused its
+    /// class `$expand` (their `@odata.type` says they are meeting
+    /// messages), and the rows stored before #2168, whose kind it lists
+    /// first. Off, a type comes only with a delta that carried the class,
+    /// a search hit or `FetchMeetingMessage`.
+    pub meeting_type_fill: bool,
 }
 
 impl Default for EngineOptions {
@@ -2043,6 +2051,7 @@ impl Default for EngineOptions {
             calendar_range_fresh_for: CALENDAR_RANGE_FRESH_FOR,
             calendar_window: CalendarWindow::default(),
             size_fill: true,
+            meeting_type_fill: true,
         }
     }
 }
@@ -2056,11 +2065,13 @@ impl EngineOptions {
     /// The #1978 tests turn bodies on with now-relative dates. The size
     /// fill (#2123) is off too: their fake servers send no sizes and know
     /// no size listing, so it would add requests they do not expect; the
-    /// #2123 tests turn it on.
+    /// #2123 tests turn it on. So is the meeting type fill (#2168), for the
+    /// same reason; the #2168 tests turn it on.
     fn without_prefetch() -> Self {
         EngineOptions {
             prefetch_body_days: 0,
             size_fill: false,
+            meeting_type_fill: false,
             ..Default::default()
         }
     }
@@ -2416,6 +2427,19 @@ struct Engine {
     /// unsized rows all wait on a queued op) or one being deleted or
     /// emptied. One try a pass, never a loop.
     size_parked: Vec<String>,
+    /// The meeting type fill's kind listing in progress (#2168), one page
+    /// per idle step, as the size fill's. In memory only; dropped on
+    /// sign-out and sign-in.
+    type_fill: Option<KindListing>,
+    /// Folders the meeting type fill stopped until the next sync pass
+    /// (#2168), as `size_parked`.
+    type_parked: Vec<String>,
+    /// Graph refused or dropped the class `$expand` of a type fill request
+    /// (#2168, [`TypeTier::Class`]): the fill sends the plain GET
+    /// ([`TypeTier::Plain`]) from then on. In memory only and cleared on
+    /// sign-in and sign-out, so each start of the engine costs at most one
+    /// refused `Class` batch.
+    meeting_class_refused: bool,
     /// An interactive sign-in's mailbox check is owed (#1946,
     /// `check_mailbox`): until it is made, nothing is drained or synced,
     /// and no backfill, prefetch or size fill runs. Mirrors
@@ -2458,6 +2482,24 @@ struct SizeFill {
     /// each `@odata.nextLink`.
     target: String,
 }
+
+/// One folder's kind listing (#2168, `Engine::type_fill_step`): the rows
+/// stored before #2168, whose kind (`is_event_message`) is not known.
+struct KindListing {
+    folder: String,
+    /// `Store::event_kind_candidates` at the listing's start: those still
+    /// not known at its end are marked not meeting messages
+    /// (`Store::mark_event_kinds_unlisted`).
+    candidates: Vec<String>,
+    /// The page to GET next: `GraphClient::message_kinds_target`, then
+    /// each `@odata.nextLink`.
+    target: String,
+}
+
+/// How many meeting messages one type fill step asks Graph about, in one
+/// `$batch` (#2168): [`FOLDER_SIZE_BATCH`]'s reasoning (Exchange's 4
+/// concurrent requests per app per mailbox).
+pub const TYPE_FILL_BATCH: usize = 4;
 
 /// How many folders one `$batch` of [`SyncCommand::FetchFolderSizes`] asks
 /// about (#2123): Exchange's 4 concurrent requests per app per mailbox,
@@ -2518,6 +2560,9 @@ impl Engine {
             contact_rereads_paused: false,
             size_fill: None,
             size_parked: Vec::new(),
+            type_fill: None,
+            type_parked: Vec::new(),
+            meeting_class_refused: false,
             mailbox_unchecked,
             check_retry: None,
             check_backoff: BACKOFF_MIN,
@@ -2705,12 +2750,21 @@ impl Engine {
             } else {
                 None
             };
-            let size_fill = if prefetch.is_none() && backfill.is_none() {
+            let type_fill = if prefetch.is_none() && backfill.is_none() {
+                self.next_type_fill()
+            } else {
+                None
+            };
+            let size_fill = if prefetch.is_none() && backfill.is_none() && type_fill.is_none() {
                 self.next_size_fill()
             } else {
                 None
             };
-            let wait = if prefetch.is_some() || backfill.is_some() || size_fill.is_some() {
+            let wait = if prefetch.is_some()
+                || backfill.is_some()
+                || type_fill.is_some()
+                || size_fill.is_some()
+            {
                 Duration::ZERO
             } else {
                 self.recv_timeout()
@@ -2722,12 +2776,17 @@ impl Engine {
                     // Without a fast tick the wait restarts on every command.
                     self.next_tick = Instant::now() + self.config.tick;
                 }
-                Err(RecvTimeoutError::Timeout) => match (prefetch, backfill, size_fill) {
-                    (Some((since, ids)), _, _) if !self.due() => self.prefetch_step(&since, &ids),
-                    (None, Some(h), _) if !self.due() => self.backfill_step(h),
-                    (None, None, Some(f)) if !self.due() => self.size_fill_step(f),
-                    _ => self.on_timer(),
-                },
+                Err(RecvTimeoutError::Timeout) => {
+                    match (prefetch, backfill, type_fill, size_fill) {
+                        (Some((since, ids)), _, _, _) if !self.due() => {
+                            self.prefetch_step(&since, &ids)
+                        }
+                        (None, Some(h), _, _) if !self.due() => self.backfill_step(h),
+                        (None, None, Some(f), _) if !self.due() => self.type_fill_step(f),
+                        (None, None, None, Some(f)) if !self.due() => self.size_fill_step(f),
+                        _ => self.on_timer(),
+                    }
+                }
                 // The UI dropped its `SyncHandle`: no one is listening anymore.
                 Err(RecvTimeoutError::Disconnected) => return,
             }
@@ -3387,6 +3446,7 @@ impl Engine {
         self.expired.clear();
         self.body_parked = false;
         self.size_parked.clear();
+        self.type_parked.clear();
 
         if !self.sync_folders(full) {
             return;
@@ -3632,6 +3692,10 @@ impl Engine {
         self.size_parked.retain(|f| *f != id);
         if self.size_fill.as_ref().is_some_and(|f| f.folder == id) {
             self.size_fill = None;
+        }
+        self.type_parked.retain(|f| *f != id);
+        if self.type_fill.as_ref().is_some_and(|f| f.folder == id) {
+            self.type_fill = None;
         }
         if carry_on && self.refresh_if_calendar_reset_owed() && self.refresh_folder(&id) {
             self.clear_backoff();
@@ -4608,6 +4672,307 @@ impl Engine {
                     self.size_fill_store_error(&fill.folder, e);
                 }
             }
+        }
+    }
+
+    /// The folder whose meeting type fill step runs next (#2168), if one
+    /// may run now: gated as [`Engine::next_size_fill`]
+    /// (`EngineOptions::meeting_type_fill`), the kind listing in progress,
+    /// else the first folder in `Store::folders` order holding a row the
+    /// fill still has to look at (`Store::type_fill_folders`, a probe of
+    /// `idx_messages_untyped` that costs nothing once every type is known)
+    /// and not parked. The main loop asks after the prefetch and the
+    /// backfill and before the size fill: it is bounded by the meeting
+    /// messages, while an old store's size fill may take many pages.
+    fn next_type_fill(&self) -> Option<String> {
+        if !self.config.options.meeting_type_fill
+            || self.token.is_none()
+            || self.mailbox_unchecked
+            || !self.backfill_done
+            || self.next_retry.is_some_and(|t| Instant::now() < t)
+        {
+            return None;
+        }
+        if let Some(fill) = &self.type_fill {
+            return Some(fill.folder.clone());
+        }
+        self.store
+            .type_fill_folders()
+            .ok()?
+            .into_iter()
+            .find(|f| !self.type_parked.contains(f))
+    }
+
+    /// Stops the meeting type fill of `folder_id` until the next pass
+    /// (#2168).
+    fn park_type_fill(&mut self, folder_id: &str) {
+        if !self.type_parked.iter().any(|f| f == folder_id) {
+            self.type_parked.push(folder_id.to_string());
+        }
+    }
+
+    /// Forgets the meeting type fill's listing in progress, its parked
+    /// folders and a class refusal (#2168): on sign-out and sign-in, as
+    /// `drop_size_fill`.
+    fn drop_type_fill(&mut self) {
+        self.type_fill = None;
+        self.type_parked.clear();
+        self.meeting_class_refused = false;
+    }
+
+    /// Emits `MessagesUpdated` for each folder a type fill write changed
+    /// (#2168).
+    fn emit_type_fill_updates(&self, folders: &BTreeSet<String>) {
+        for folder_id in folders {
+            self.emit(SyncEvent::MessagesUpdated {
+                folder_id: folder_id.clone(),
+            });
+        }
+    }
+
+    /// Reports a store failure of a type fill step and parks the folder
+    /// (#2168), so it is not tried again before the next pass.
+    fn type_fill_store_error(&mut self, folder_id: &str, e: StoreError) {
+        self.emit(SyncEvent::Error(format!(
+            "mail sync: cannot record the meeting message types of folder {}: {e}",
+            self.folder_label(folder_id)
+        )));
+        self.park_type_fill(folder_id);
+    }
+
+    /// One step of `folder_id`'s meeting type fill (#2168): one request.
+    /// Every step first checks the folder, as the size fill's: gone from
+    /// the store, being deleted or being emptied drops the listing and
+    /// parks it, with no request.
+    ///
+    /// The rows stored before #2168 come first: a kind listing (one page a
+    /// step, `type_kinds_step`) reads which of them are meeting messages
+    /// from `@odata.type`. Then the meeting messages whose type is not
+    /// known go [`TYPE_FILL_BATCH`] a `$batch` (`type_batch_step`). None
+    /// left parks the folder until the next pass.
+    fn type_fill_step(&mut self, folder_id: String) {
+        if !self.store.folder_exists(&folder_id).unwrap_or(false)
+            || self.store.folder_being_deleted(&folder_id).unwrap_or(true)
+            || self.store.folder_being_emptied(&folder_id).unwrap_or(true)
+        {
+            if self
+                .type_fill
+                .as_ref()
+                .is_some_and(|f| f.folder == folder_id)
+            {
+                self.type_fill = None;
+            }
+            self.park_type_fill(&folder_id);
+            return;
+        }
+        let listing = match self.type_fill.take() {
+            Some(fill) if fill.folder == folder_id => Some(fill),
+            _ => match self.store.event_kind_candidates(&folder_id) {
+                Ok(Some((candidates, since))) => Some(KindListing {
+                    target: GraphClient::message_kinds_target(&folder_id, &since),
+                    folder: folder_id.clone(),
+                    candidates,
+                }),
+                Ok(None) => None,
+                Err(e) => {
+                    self.type_fill_store_error(&folder_id, e);
+                    return;
+                }
+            },
+        };
+        match listing {
+            Some(listing) => self.type_kinds_step(listing),
+            None => self.type_batch_step(folder_id),
+        }
+    }
+
+    /// One page of a kind listing (#2168): each item's kind is written
+    /// (`Store::set_event_kinds`: only on a row whose kind is not known);
+    /// the last page marks the candidates still not known as not meeting
+    /// messages (`Store::mark_event_kinds_unlisted`), so none is listed
+    /// twice. `MessagesUpdated` for every folder a write changed. Failures
+    /// are the size fill's: auth, throttle and transport through `react`,
+    /// the page asked again after; a 5xx parks the folder and the listing
+    /// starts over at the next pass; any other failure gives up on the
+    /// candidates (marked as the last page marks them) with one `Error`
+    /// and parks the folder.
+    fn type_kinds_step(&mut self, listing: KindListing) {
+        let (items, next) = match self.with_auth(|c| c.message_kinds_page(&listing.target)) {
+            Ok(page) => page,
+            Err(
+                e @ (GraphError::Unauthorized
+                | GraphError::Throttled { .. }
+                | GraphError::Transport(_)),
+            ) => {
+                self.type_fill = Some(listing);
+                self.react(e);
+                return;
+            }
+            Err(GraphError::Http { status, .. }) if status >= 500 => {
+                self.park_type_fill(&listing.folder);
+                return;
+            }
+            Err(e) => {
+                let marked = self
+                    .store
+                    .mark_event_kinds_unlisted(&listing.folder, &listing.candidates);
+                self.emit(SyncEvent::Error(format!(
+                    "mail sync: cannot list the meeting messages of folder {}: {e}",
+                    self.folder_label(&listing.folder)
+                )));
+                match marked {
+                    Ok(folders) => {
+                        self.emit_type_fill_updates(&folders.into_iter().collect());
+                        self.park_type_fill(&listing.folder);
+                    }
+                    Err(se) => self.type_fill_store_error(&listing.folder, se),
+                }
+                return;
+            }
+        };
+        let mut updated: BTreeSet<String> = match self.store.set_event_kinds(&items) {
+            Ok(folders) => folders.into_iter().collect(),
+            Err(e) => {
+                self.type_fill_store_error(&listing.folder, e);
+                return;
+            }
+        };
+        match next {
+            Some(target) => self.type_fill = Some(KindListing { target, ..listing }),
+            None => match self
+                .store
+                .mark_event_kinds_unlisted(&listing.folder, &listing.candidates)
+            {
+                Ok(folders) => updated.extend(folders),
+                Err(e) => {
+                    self.emit_type_fill_updates(&updated);
+                    self.type_fill_store_error(&listing.folder, e);
+                    return;
+                }
+            },
+        }
+        self.emit_type_fill_updates(&updated);
+    }
+
+    /// One `$batch` of the meeting messages of `folder_id` whose type is
+    /// not known (#2168, `Store::meeting_type_candidates`, at most
+    /// [`TYPE_FILL_BATCH`], oldest first): [`TypeTier::Class`] requests, or
+    /// [`TypeTier::Plain`] once Graph refused the class. Per sub-response:
+    ///
+    /// - a 2xx `Class` answer carrying the class writes its type; one
+    ///   without it (a dropped expand), or any 4xx but 404 and 429, sets
+    ///   `meeting_class_refused` and leaves the row for a `Plain` request
+    ///   in the next step;
+    /// - a 2xx `Plain` answer writes its top-level type, `None` when it has
+    ///   none (an `eventMessage` that is none of the five);
+    /// - a 404 marks the type known (the message is gone; the delta removes
+    ///   the row);
+    /// - a 429 or 503 marks nothing and backs off (`react_quietly` of
+    ///   `Throttled`, its `Retry-After` or 30 s);
+    /// - another 5xx parks the folder until the next pass;
+    /// - any other `Plain` 4xx marks the type known, with one `Error` for
+    ///   the batch.
+    ///
+    /// So no row is asked more than twice. A whole-call failure: auth,
+    /// throttle and transport through `react`; anything else is one
+    /// `Error` and parks the folder. `MessagesUpdated` for every folder a
+    /// write changed.
+    fn type_batch_step(&mut self, folder_id: String) {
+        let ids = match self
+            .store
+            .meeting_type_candidates(&folder_id, TYPE_FILL_BATCH)
+        {
+            Ok(ids) if ids.is_empty() => {
+                self.park_type_fill(&folder_id);
+                return;
+            }
+            Ok(ids) => ids,
+            Err(e) => {
+                self.type_fill_store_error(&folder_id, e);
+                return;
+            }
+        };
+        let tier = if self.meeting_class_refused {
+            TypeTier::Plain
+        } else {
+            TypeTier::Class
+        };
+        let reqs: Vec<BatchRequest> = ids
+            .iter()
+            .map(|id| GraphClient::meeting_type_request(id, tier))
+            .collect();
+        let answers = match self.with_auth(|c| c.batch(&reqs)) {
+            Ok(a) => a,
+            Err(
+                e @ (GraphError::Unauthorized
+                | GraphError::Throttled { .. }
+                | GraphError::Transport(_)),
+            ) => {
+                self.react(e);
+                return;
+            }
+            Err(e) => {
+                self.emit(SyncEvent::Error(format!(
+                    "mail sync: cannot read the meeting message types of folder {}: {e}",
+                    self.folder_label(&folder_id)
+                )));
+                self.park_type_fill(&folder_id);
+                return;
+            }
+        };
+        let mut types: Vec<(String, Option<MeetingMessageType>)> = Vec::new();
+        let mut known: Vec<String> = Vec::new();
+        let mut throttled: Option<u64> = None;
+        let mut server_error = false;
+        let mut refused: Option<String> = None;
+        for (id, answer) in ids.into_iter().zip(answers) {
+            match (answer.status, tier) {
+                (200..=299, _) => {
+                    let (carried, t) = crate::json::parse(&answer.body)
+                        .map(|v| parse_meeting_message_type(&v))
+                        .unwrap_or((false, None));
+                    match tier {
+                        TypeTier::Class if !carried => self.meeting_class_refused = true,
+                        _ => types.push((id, t)),
+                    }
+                }
+                (404, _) => known.push(id),
+                (429 | 503, _) => {
+                    throttled.get_or_insert(answer.retry_after_secs.unwrap_or(30));
+                }
+                (500.., _) => server_error = true,
+                (_, TypeTier::Class) => self.meeting_class_refused = true,
+                (status, TypeTier::Plain) => {
+                    refused.get_or_insert(format!("HTTP {status}"));
+                    known.push(id);
+                }
+            }
+        }
+        let mut updated: BTreeSet<String> = BTreeSet::new();
+        let written = self
+            .store
+            .set_meeting_types(&types)
+            .and_then(|f| {
+                updated.extend(f);
+                self.store.mark_meeting_type_known(&known)
+            })
+            .map(|f| updated.extend(f));
+        self.emit_type_fill_updates(&updated);
+        if let Err(e) = written {
+            self.type_fill_store_error(&folder_id, e);
+            return;
+        }
+        if let Some(why) = refused {
+            self.emit(SyncEvent::Error(format!(
+                "mail sync: cannot read the meeting message type of a message in folder {}: {why}",
+                self.folder_label(&folder_id)
+            )));
+        }
+        if server_error {
+            self.park_type_fill(&folder_id);
+        }
+        if let Some(retry_after_secs) = throttled {
+            self.react_quietly(GraphError::Throttled { retry_after_secs });
         }
     }
 
@@ -9068,6 +9433,7 @@ impl Engine {
                 // replaced by this one.
                 self.saved_unavailable = None;
                 self.drop_size_fill();
+                self.drop_type_fill();
                 self.announce_scopes();
                 self.clear_backoff();
                 // Emit an explicit past-sign-in signal BEFORE the first sync
@@ -9232,6 +9598,7 @@ impl Engine {
         self.body_parked = false;
         self.contact_rereads_paused = false;
         self.drop_size_fill();
+        self.drop_type_fill();
         let now = Instant::now();
         self.next_full = now;
         self.next_fast = now;
@@ -9321,6 +9688,7 @@ impl Engine {
         self.saved_unavailable = None;
         self.clear_backoff();
         self.drop_size_fill();
+        self.drop_type_fill();
         // A check owed stays owed (#1946); its hold-off ends with the
         // session.
         self.check_retry = None;
@@ -10221,6 +10589,7 @@ mod tests {
                             internet_message_id: String::new(),
                             in_reply_to: String::new(),
                             size: None,
+                            is_event_message: false,
                         },
                         &crate::graph::model::MessageFields::default(),
                     )
@@ -25090,6 +25459,7 @@ mod tests {
                 internet_message_id: String::new(),
                 in_reply_to: String::new(),
                 size: None,
+                is_event_message: false,
             },
         )
         .unwrap();
@@ -27640,6 +28010,7 @@ mod tests {
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
                     size: None,
+                    is_event_message: false,
                 },
             )
             .unwrap();
@@ -28366,6 +28737,7 @@ mod tests {
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
                     size: None,
+                    is_event_message: false,
                 },
             )
             .unwrap();
