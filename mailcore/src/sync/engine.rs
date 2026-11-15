@@ -346,7 +346,9 @@ pub enum SyncCommand {
     /// only when the state changes: a SignOut while already signed out still
     /// clears the file and emits `SignInRequired`, but no `State`, so a
     /// client confirms a sign-out by `SignInRequired`. The mail store and the
-    /// outbox are kept: queued ops drain after the next sign-in.
+    /// outbox are kept: queued ops drain after the next sign-in if the same
+    /// mailbox signs in; another mailbox empties the store, outbox included
+    /// ([`SyncEvent::MailboxChanged`], #1946).
     SignOut,
     /// Fetch an inline image's bytes (`GraphClient::get_attachment_bytes`)
     /// into memory for rendering in the reading pane — distinct from
@@ -1198,6 +1200,17 @@ pub enum SyncEvent {
     /// or save ends there; never on Windows, whose file DPAPI encrypts. A
     /// client may tell the user once.
     TokenStoredUnencrypted,
+    /// The account that signed in has another mailbox than the one that
+    /// filled the store (#1946): the store was emptied (folders, messages,
+    /// the calendar, contacts, the outbox) before anything was drained or
+    /// synced, and the sync lists the new mailbox from nothing. `dropped_ops`
+    /// queued changes of the old mailbox were dropped, unsent (with any made
+    /// between the sign-in and its check). Sent before any `FoldersUpdated`
+    /// of the new mailbox; `FoldersUpdated`, `CalendarsUpdated`,
+    /// `CalendarUpdated`, `ContactsUpdated` and `CategoriesUpdated` follow
+    /// at once, for the emptied store. A host drops whatever it holds from
+    /// the old mailbox (an open message, a folder selection).
+    MailboxChanged { dropped_ops: usize },
     /// A folder's backfill of older mail moved on (#1871): after every page
     /// of its full delta, and once when it completed (`complete: true`).
     /// `synced` is the persisted count of items that delta has walked past:
@@ -1622,7 +1635,9 @@ enum Drain {
     /// sent. The caller's sync carries on.
     Deferred,
     /// Auth, throttle or transport, or the post-send sync stopping: the
-    /// caller stops too and keeps the back-off.
+    /// caller stops too and keeps the back-off. Or an owed mailbox check
+    /// (#1946) that could not be made, or that emptied the store for another
+    /// mailbox: the caller stops, as the ids it holds are gone.
     Aborted,
 }
 
@@ -2252,6 +2267,36 @@ struct Engine {
     /// unsized rows all wait on a queued op) or one being deleted or
     /// emptied. One try a pass, never a loop.
     size_parked: Vec<String>,
+    /// An interactive sign-in's mailbox check is owed (#1946,
+    /// `check_mailbox`): until it is made, nothing is drained or synced,
+    /// and no backfill, prefetch or size fill runs. Mirrors
+    /// `meta.mailbox_check_owed`, which `sign_in` writes before it saves
+    /// the token, so it survives a restart; a startup with a cached token
+    /// and no owed check probes nothing.
+    mailbox_unchecked: bool,
+    /// A probe that failed for a reason `react` does not handle (a 5xx, a
+    /// 4xx, a parse error, a store error) holds the next one off until this
+    /// instant (#1946), so a fast tick does not probe every few seconds.
+    /// `Refresh` and a sign-in clear it.
+    check_retry: Option<Instant>,
+    /// The next `check_retry` delay: doubles from `BACKOFF_MIN` to
+    /// `BACKOFF_MAX` and starts over after a check that went through.
+    check_backoff: Duration,
+}
+
+/// What [`Engine::check_mailbox`] found (#1946).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MailboxCheck {
+    /// No check is owed, or the probe found the store's mailbox (or
+    /// adopted a store without one): go on.
+    Ready,
+    /// The probe found another mailbox and the store was emptied for it:
+    /// a pass goes on as a full one; any other caller stops, as the ids it
+    /// holds are gone, and the full pass runs next.
+    Reset,
+    /// The check could not be made (the state is set: by `react`, or
+    /// settled after an `Error`): nothing is drained or synced.
+    Blocked,
 }
 
 /// One folder's size fill (#2123, `Engine::size_fill_step`).
@@ -2282,6 +2327,9 @@ impl Engine {
     ) -> Engine {
         // A quarantine reconverge an earlier run left unfinished (#1871).
         let reconverge_pending = store.reconverge_pending().unwrap_or(false);
+        // A sign-in whose mailbox check never finished (#1946); a store that
+        // cannot say counts as owed.
+        let mailbox_unchecked = store.mailbox_check_owed().unwrap_or(true);
         Engine {
             store,
             token: None,
@@ -2319,6 +2367,9 @@ impl Engine {
             contact_rereads_paused: false,
             size_fill: None,
             size_parked: Vec::new(),
+            mailbox_unchecked,
+            check_retry: None,
+            check_backoff: BACKOFF_MIN,
         }
     }
 
@@ -2664,7 +2715,13 @@ impl Engine {
         // call in the same tick — which, on a transport error, would call
         // `go_offline` a second time and double the exponential back-off in
         // one offline tick instead of advancing it by one step.
-        if self.token.is_some() && self.next_retry.is_none() && self.checkpoint() {
+        // Nor while the mailbox check is owed (#1946): the calendar would
+        // be written into another mailbox's store.
+        if self.token.is_some()
+            && self.next_retry.is_none()
+            && !self.mailbox_unchecked
+            && self.checkpoint()
+        {
             self.refresh_calendar();
         }
     }
@@ -2676,6 +2733,8 @@ impl Engine {
                 // F9 resends a deferred op now; its back-off keeps growing
                 // if it fails again.
                 self.op_retry = None;
+                // And probes a held-off mailbox check at once (#1946).
+                self.check_retry = None;
                 self.sync_pass(true);
                 self.refresh_if_calendar_reset_owed();
                 self.after_pass_if_fast();
@@ -3011,6 +3070,14 @@ impl Engine {
         if self.token.is_none() {
             return;
         }
+        // An interactive sign-in's mailbox check comes first (#1946): a
+        // blocked one runs nothing; a reset one makes this pass list the
+        // new mailbox from nothing.
+        let full = match self.check_mailbox() {
+            MailboxCheck::Ready => full,
+            MailboxCheck::Reset => true,
+            MailboxCheck::Blocked => return,
+        };
         self.set_state(SyncState::Syncing);
         // A pass gives every parked backfill another try (#1871), and the
         // engine's own body fetches after a store failure or a Graph 5xx
@@ -4073,6 +4140,7 @@ impl Engine {
     /// next pass reads it again.
     fn next_backfill(&self) -> Option<FolderHistory> {
         if self.token.is_none()
+            || self.mailbox_unchecked
             || !self.backfill_done
             || self.next_retry.is_some_and(|t| Instant::now() < t)
         {
@@ -4104,6 +4172,7 @@ impl Engine {
     fn next_size_fill(&self) -> Option<String> {
         if !self.config.options.size_fill
             || self.token.is_none()
+            || self.mailbox_unchecked
             || !self.backfill_done
             || self.next_retry.is_some_and(|t| Instant::now() < t)
         {
@@ -4884,7 +4953,14 @@ impl Engine {
         if self.shutting_down {
             return false;
         }
-        if !self.calendar_reset_owed || self.token.is_none() || waiting(self) {
+        // Not while the mailbox check is owed (#1946): a reset owed from the
+        // last session would write this account's calendar into another
+        // mailbox's store.
+        if !self.calendar_reset_owed
+            || self.token.is_none()
+            || self.mailbox_unchecked
+            || waiting(self)
+        {
             return true;
         }
         if !self.checkpoint() {
@@ -4957,11 +5033,26 @@ impl Engine {
     /// before the drain, ends it at once ([`Drain::Aborted`]) with nothing
     /// more sent, ahead of the post-drain syncs (`sync_after_send`, the
     /// relist, a copy's contents), which the next start's pass covers.
+    ///
+    /// Nothing is sent before an interactive sign-in's mailbox check
+    /// (`check_mailbox`, #1946): one that could not be made, or that emptied
+    /// the store for another mailbox, is [`Drain::Aborted`] with no op sent.
     fn drain_outbox(&mut self) -> Drain {
         // At shutdown the queue is only persisted (#2127): the next start
         // drains it.
         if self.shutting_down {
             return Drain::Aborted;
+        }
+        // No op is sent before an interactive sign-in's mailbox check
+        // (#1946). One that emptied the store stops the caller, whose ids
+        // are gone: the full pass that lists the new mailbox runs next.
+        match self.check_mailbox() {
+            MailboxCheck::Ready => {}
+            MailboxCheck::Reset => {
+                self.settle_state();
+                return Drain::Aborted;
+            }
+            MailboxCheck::Blocked => return Drain::Aborted,
         }
         self.contact_rereads_paused = false;
         let ops = match self.store.pending_ops() {
@@ -7265,6 +7356,7 @@ impl Engine {
     /// stops the prefetch until the next step reads it again.
     fn next_prefetch(&self) -> Option<(String, Vec<String>)> {
         if self.token.is_none()
+            || self.mailbox_unchecked
             || !self.backfill_done
             || self.body_parked
             || self.next_retry.is_some_and(|t| Instant::now() < t)
@@ -8618,6 +8710,21 @@ impl Engine {
         };
         match auth::redeem_code(&self.config.cfg, &self.config.auth_base, &req, &code) {
             Ok(t) => {
+                // The account may have another mailbox than the one that
+                // filled the store (#1946: `prompt=select_account`): its
+                // check is owed before anything is drained or synced, and
+                // owed in the store before the token is saved, so a check
+                // that fails, or a process that exits first, is made at
+                // the next start. A store that cannot record it still holds
+                // the check in memory for this run.
+                if let Err(e) = self.store.set_mailbox_check_owed() {
+                    self.emit(SyncEvent::Error(format!(
+                        "cannot record the mailbox check: {e}"
+                    )));
+                }
+                self.mailbox_unchecked = true;
+                self.check_retry = None;
+                self.check_backoff = BACKOFF_MIN;
                 if let Ok(storage) = tokencache::save_reporting(&self.config.token_path, &t) {
                     self.note_storage(storage);
                 }
@@ -8641,6 +8748,131 @@ impl Engine {
                 self.enter_signin();
             }
         }
+    }
+
+    // --- The mailbox check (#1946) ---------------------------------------
+
+    /// Makes an owed mailbox check (`mailbox_unchecked`, #1946): which
+    /// mailbox did the interactive sign-in open? `GET
+    /// /me/mailFolders/msgfolderroot` names it by its root folder's id
+    /// (Graph ids are mailbox-scoped), compared with the store's
+    /// `meta.mailbox_root`; a store without one (from before #1946) is
+    /// judged by its top-level folders' parents (`top_level_parents`): one
+    /// of them is the root, or none are stored (adopted). Another mailbox
+    /// empties the store (`reset_for_new_mailbox`).
+    ///
+    /// Not owed: `Ready` with no request. Held off (`check_retry`):
+    /// `Blocked` with no request. An auth, throttle or transport failure
+    /// goes through `react`; any other, or a store error, is one `Error`
+    /// and holds the next probe off (`check_retry`, doubling). Either way
+    /// `Blocked`, with the state set.
+    fn check_mailbox(&mut self) -> MailboxCheck {
+        if !self.mailbox_unchecked {
+            return MailboxCheck::Ready;
+        }
+        if self.token.is_none() {
+            return MailboxCheck::Blocked;
+        }
+        if self.check_retry.is_some_and(|t| Instant::now() < t) {
+            self.settle_state();
+            return MailboxCheck::Blocked;
+        }
+        let root = match self.with_auth(|c| c.mailbox_root_id()) {
+            Ok(root) => root,
+            Err(
+                e @ (GraphError::Unauthorized
+                | GraphError::Throttled { .. }
+                | GraphError::Transport(_)),
+            ) => {
+                self.react(e);
+                return MailboxCheck::Blocked;
+            }
+            Err(e) => return self.check_failed(&e.to_string()),
+        };
+        let same = match self.store.mailbox_root() {
+            Ok(Some(recorded)) => Ok(recorded == root),
+            Ok(None) => self
+                .store
+                .top_level_parents()
+                .map(|parents| parents.is_empty() || parents.contains(&root)),
+            Err(e) => Err(e),
+        };
+        let outcome = match same {
+            Ok(true) => self
+                .store
+                .set_mailbox_root(&root)
+                .map(|()| MailboxCheck::Ready),
+            Ok(false) => self.reset_for_new_mailbox(&root),
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok(outcome) => {
+                self.mailbox_unchecked = false;
+                self.check_retry = None;
+                self.check_backoff = BACKOFF_MIN;
+                outcome
+            }
+            Err(e) => self.check_failed(&e.to_string()),
+        }
+    }
+
+    /// A mailbox check that failed for a reason `react` does not handle
+    /// (#1946): one `Error`, the next probe held off, the state settled.
+    fn check_failed(&mut self, reason: &str) -> MailboxCheck {
+        self.emit(SyncEvent::Error(format!(
+            "cannot check which mailbox signed in: {reason}"
+        )));
+        self.check_retry = Some(Instant::now() + self.check_backoff);
+        self.check_backoff = (self.check_backoff * 2).min(BACKOFF_MAX);
+        self.settle_state();
+        MailboxCheck::Blocked
+    }
+
+    /// Empties the store for the mailbox `root` (#1946,
+    /// `Store::reset_mailbox`) and forgets what this run held of the old
+    /// one: its backfill and reconverge, the outbox's runs and back-off,
+    /// the engine's own body and size fetches, and the fast folders (a
+    /// host names them again). Commands kept for later (`deferred`) stay:
+    /// they are the user's, and an old id 404s. Then tells the host
+    /// (`MailboxChanged`, and the reload events of what was emptied), and
+    /// makes the next deadline a full pass, which lists the new mailbox.
+    fn reset_for_new_mailbox(&mut self, root: &str) -> Result<MailboxCheck, StoreError> {
+        let dropped_ops = self.store.reset_mailbox(root)?;
+        self.backfill_done = false;
+        self.reconverge_pending = false;
+        self.relist_after_drain = false;
+        self.copied_after_drain.clear();
+        self.calendar_reset_owed = false;
+        self.masters_not_found.clear();
+        self.masters_skipped.clear();
+        self.parked.clear();
+        self.expired.clear();
+        self.backfill_first.clear();
+        self.fast_folders.clear();
+        self.hold_full = false;
+        self.clear_op_backoff();
+        self.bulk = None;
+        self.parked_bulk.clear();
+        self.body_skip.clear();
+        self.body_parked = false;
+        self.contact_rereads_paused = false;
+        self.drop_size_fill();
+        let now = Instant::now();
+        self.next_full = now;
+        self.next_fast = now;
+        // Without a fast tick, a passed back-off wakes the main loop for a
+        // pass at once (`due`, `recv_timeout`); a passed instant holds
+        // nothing off.
+        if self.next_retry.is_none_or(|t| t <= now) {
+            self.next_retry = Some(now);
+        }
+        self.emit(SyncEvent::MailboxChanged { dropped_ops });
+        self.emit(SyncEvent::FoldersUpdated);
+        self.emit(SyncEvent::CalendarsUpdated);
+        self.emit(SyncEvent::CalendarUpdated);
+        self.emit(SyncEvent::ContactsUpdated);
+        self.emit(SyncEvent::CategoriesUpdated);
+        Ok(MailboxCheck::Reset)
     }
 
     // --- State transitions ----------------------------------------------
@@ -8699,6 +8931,10 @@ impl Engine {
         self.token = None;
         self.clear_backoff();
         self.drop_size_fill();
+        // A check owed stays owed (#1946); its hold-off ends with the
+        // session.
+        self.check_retry = None;
+        self.check_backoff = BACKOFF_MIN;
         self.announced_scopes = None;
         self.masters_not_found.clear();
         self.masters_skipped.clear();
@@ -13426,6 +13662,36 @@ mod tests {
         }
     }
 
+    /// The mailbox check's probe (#1946), answering `root`. Listed before
+    /// any `/me/mailFolders` route: the fake server matches by prefix.
+    fn probe_route(root: &str) -> Route {
+        Route {
+            method: "GET".into(),
+            path_prefix: "/me/mailFolders/msgfolderroot".into(),
+            status: 200,
+            headers: vec![],
+            body: format!(r#"{{"id":"{root}"}}"#),
+        }
+    }
+
+    /// `routes` behind the mailbox check's probe answering `root` (#1946),
+    /// for a test that signs in through the loopback.
+    fn with_probe(routes: Vec<Route>, root: &str) -> Vec<Route> {
+        let mut all = vec![probe_route(root)];
+        all.extend(routes);
+        all
+    }
+
+    /// [`with_probe`] for `FakeServer::start_limited`'s routes.
+    fn with_probe_limited(
+        routes: Vec<(Route, Option<usize>)>,
+        root: &str,
+    ) -> Vec<(Route, Option<usize>)> {
+        let mut all = vec![(probe_route(root), None)];
+        all.extend(routes);
+        all
+    }
+
     fn empty_folders_route(status: u16) -> Route {
         Route {
             method: "GET".into(),
@@ -13647,10 +13913,13 @@ mod tests {
     #[test]
     fn a_sign_in_saved_to_the_file_warns() {
         // The redeem's save ends in the token file: warned, once.
-        let srv = FakeServer::start(vec![
-            token_route(r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#),
-            empty_folders_route(200),
-        ]);
+        let srv = FakeServer::start(with_probe(
+            vec![
+                token_route(r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#),
+                empty_folders_route(200),
+            ],
+            "ROOT",
+        ));
         let base = srv.base_url.clone();
         let dir = unique_dir("unencrypted-signin");
         let token_path = dir.join("token.bin");
@@ -13764,12 +14033,15 @@ mod tests {
     #[test]
     fn sign_in_announces_and_caches_granted_scopes() {
         let granted = "https://graph.microsoft.com/Mail.ReadWrite openid profile offline_access";
-        let srv = FakeServer::start(vec![
-            token_route(&format!(
-                r#"{{"access_token":"AT","refresh_token":"RT","expires_in":3600,"scope":"{granted}"}}"#
-            )),
-            empty_folders_route(200),
-        ]);
+        let srv = FakeServer::start(with_probe(
+            vec![
+                token_route(&format!(
+                    r#"{{"access_token":"AT","refresh_token":"RT","expires_in":3600,"scope":"{granted}"}}"#
+                )),
+                empty_folders_route(200),
+            ],
+            "ROOT",
+        ));
         let base = srv.base_url.clone();
         let dir = unique_dir("scopes-signin");
         let token_path = dir.join("token.bin");
@@ -13804,6 +14076,7 @@ mod tests {
         let (events, dir, handle, _srv) = startup_events(
             "scopes-new-session",
             vec![
+                (probe_route("ROOT"), None),
                 (
                     token_route(&format!(
                         r#"{{"access_token":"AT2","refresh_token":"RT2","expires_in":3600,"scope":"{granted}"}}"#
@@ -14085,7 +14358,7 @@ mod tests {
                 body: r#"{"value":[]}"#.into(),
             },
         ];
-        let srv = FakeServer::start(routes);
+        let srv = FakeServer::start(with_probe(routes, "ROOT"));
         let base = srv.base_url.clone();
 
         let dir = unique_dir("signin-loopback");
@@ -20357,7 +20630,7 @@ mod tests {
             vec![("CAL-A", 200, events_body(&[event_from_now("E1", 3600)]))],
         ));
         routes.extend(backfill_routes());
-        let srv = FakeServer::start(routes);
+        let srv = FakeServer::start(with_probe(routes, "ROOT"));
         let base = srv.base_url.clone();
         let dir = unique_dir("respond-event-refused-signed-out");
         let store_path = dir.join("mail.db");
@@ -22123,7 +22396,7 @@ mod tests {
             None,
         )];
         routes.extend(f2_initial_delta_throttled_routes());
-        let srv = FakeServer::start_limited(routes);
+        let srv = FakeServer::start_limited(with_probe_limited(routes, "ROOT"));
         let dir = unique_dir("fast-signin-retry");
         let store_path = dir.join("mail.db");
         let handle = spawn_with_bases_and_options(
@@ -25026,7 +25299,7 @@ mod tests {
                 (get_route(FILL, 200, &page(&[], Some(old))), Some(1)),
                 (get_route(FILL, 200, &page(&[sized("O1", "7")], None)), None),
             ];
-            let srv = FakeServer::start_limited(world(extra, &[], &[]));
+            let srv = FakeServer::start_limited(with_probe_limited(world(extra, &[], &[]), "ROOT"));
             let (handle, store, dir) = spawn_sized(&srv, "size-signout", true, |s| {
                 synced_with(s, &[("O1", "2026-01-01T00:00:00Z")])
             });
@@ -38987,6 +39260,587 @@ mod tests {
             assert!(crate::store::iso8601_to_unix_secs(&t).is_some(), "{t}");
             drop(store);
             let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// #1946: a different mailbox signing in. The interactive sign-in owes
+    /// a check (`GET /me/mailFolders/msgfolderroot`) before anything is
+    /// drained or synced; another mailbox empties the store, outbox
+    /// included.
+    mod mailbox_change {
+        use super::*;
+        use crate::graph::model::MailFolder;
+
+        const PROBE: &str = "/me/mailFolders/msgfolderroot";
+
+        /// A store filled by mailbox `ROOT_A`: its Inbox `FA` (under
+        /// `parent`) with the message `MA1`.
+        fn mailbox_a(s: &Store, parent: Option<&str>) {
+            s.upsert_folder(&MailFolder {
+                id: "FA".into(),
+                display_name: "Inbox".into(),
+                parent_id: parent.map(str::to_string),
+                total_count: 1,
+                unread_count: 1,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+            let v = crate::json::parse(&message_json("MA1", false, false, &[])).unwrap();
+            s.upsert_message("FA", &Message::from_json(&v).unwrap())
+                .unwrap();
+        }
+
+        /// The ops the old mailbox queued: a mark-read of its message, the
+        /// send of a draft never pushed, a folder never created.
+        fn queue_a(s: &Store) {
+            for op in [
+                OutboxOp::MarkRead {
+                    id: "MA1".into(),
+                    read: true,
+                },
+                OutboxOp::SendDraft {
+                    id: "local:draft".into(),
+                },
+                OutboxOp::CreateFolder {
+                    id: "local:folder".into(),
+                    parent: None,
+                    name: "Projects".into(),
+                },
+            ] {
+                s.enqueue_op(&op).unwrap();
+            }
+        }
+
+        /// The probe's answers in order (`(status, root)`, each once, the
+        /// last one for good), the write routes an op would reach, and the
+        /// mailbox listing one Inbox `folder` under `root`.
+        fn routes(probes: &[(u16, &str)], folder: &str, root: &str) -> Vec<(Route, Option<usize>)> {
+            let mut routes: Vec<(Route, Option<usize>)> = probes
+                .iter()
+                .enumerate()
+                .map(|(i, (status, answer))| {
+                    let body = if *status == 200 {
+                        format!(r#"{{"id":"{answer}"}}"#)
+                    } else {
+                        "{}".to_string()
+                    };
+                    let left = (i + 1 < probes.len()).then_some(1);
+                    (get_route(PROBE, *status, &body), left)
+                })
+                .collect();
+            routes.push((
+                token_route(r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#),
+                None,
+            ));
+            routes.push((any_route("PATCH", "/me/messages/", 200, "{}"), None));
+            routes.push((
+                any_route("POST", "/me/messages", 201, r#"{"id":"SENT"}"#),
+                None,
+            ));
+            let delta = format!("/me/mailFolders/{folder}/messages/delta");
+            let link = format!("{delta}?token=D-{folder}");
+            routes.push((
+                get_route(
+                    &format!("/me/mailFolders/{folder}/childFolders"),
+                    200,
+                    r#"{"value":[]}"#,
+                ),
+                None,
+            ));
+            routes.push((get_route(&delta, 200, &delta_page(&[], &link)), None));
+            routes.push((
+                get_route(
+                    &format!("/me/mailFolders/{folder}?"),
+                    200,
+                    r#"{"totalItemCount":0,"unreadItemCount":0}"#,
+                ),
+                None,
+            ));
+            routes.push((
+                get_route(
+                    "/me/mailFolders?",
+                    200,
+                    &format!(
+                        r#"{{"value":[{{"id":"{folder}","displayName":"Inbox","parentFolderId":"{root}","totalItemCount":0,"unreadItemCount":0,"wellKnownName":"inbox","childFolderCount":0}}]}}"#
+                    ),
+                ),
+                None,
+            ));
+            routes.push((
+                any_route("POST", "/me/mailFolders", 201, r#"{"id":"NEW"}"#),
+                None,
+            ));
+            routes
+        }
+
+        /// Every request other than a GET or the token redeem: an op sent.
+        fn writes(srv: &FakeServer) -> Vec<(String, String)> {
+            srv.requests()
+                .into_iter()
+                .filter(|r| r.method != "GET" && !r.path.contains("/oauth2/"))
+                .map(|r| (r.method, r.path))
+                .collect()
+        }
+
+        fn probes(srv: &FakeServer) -> usize {
+            srv.requests()
+                .iter()
+                .filter(|r| r.path.starts_with(PROBE))
+                .count()
+        }
+
+        fn folder_ids(s: &Store) -> Vec<String> {
+            s.folders().unwrap().into_iter().map(|f| f.id).collect()
+        }
+
+        fn errors(events: &[SyncEvent]) -> Vec<String> {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    SyncEvent::Error(m) => Some(m.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Events until none comes for a moment: what the engine sent.
+        fn drain_events(rx: &Receiver<SyncEvent>) -> Vec<SyncEvent> {
+            let mut seen = Vec::new();
+            while let Ok(e) = rx.recv_timeout(Duration::from_millis(300)) {
+                seen.push(e);
+            }
+            seen
+        }
+
+        /// A spawned engine over a seeded store at `dir`, signed out unless
+        /// `token`.
+        fn spawn_on(
+            srv: &FakeServer,
+            tag: &str,
+            token: bool,
+            seed: impl FnOnce(&Store),
+        ) -> (SyncHandle, PathBuf, PathBuf) {
+            let dir = unique_dir(tag);
+            let store_path = dir.join("mail.db");
+            seed(&Store::open(&store_path).unwrap());
+            let token_path = dir.join("token.bin");
+            if token {
+                seed_token(&token_path);
+            }
+            let handle = spawn_with_bases(
+                store_path.clone(),
+                token_path,
+                test_cfg(),
+                3650,
+                srv.base_url.clone(),
+                srv.base_url.clone(),
+                HOUR,
+            );
+            (handle, store_path, dir)
+        }
+
+        /// An engine built in the test (no thread), signed in to `srv` with
+        /// the sign-in's check owed, as `sign_in` leaves it before its pass.
+        /// The test holds the command sender: a dropped one is a shutdown,
+        /// which stops every drain.
+        fn engine_on(
+            srv: &FakeServer,
+            store: Store,
+        ) -> (Engine, Receiver<SyncEvent>, mpsc::Sender<SyncCommand>) {
+            engine_with(srv, store, EngineOptions::without_prefetch())
+        }
+
+        /// [`engine_on`] with the engine's `options`.
+        fn engine_with(
+            srv: &FakeServer,
+            store: Store,
+            options: EngineOptions,
+        ) -> (Engine, Receiver<SyncEvent>, mpsc::Sender<SyncCommand>) {
+            let (cmd_tx, cmd_rx) = mpsc::channel();
+            let (evt_tx, evt_rx) = mpsc::channel();
+            let config = EngineConfig {
+                store_path: PathBuf::from("unused.db"),
+                token_path: PathBuf::from("unused-token.json"),
+                cfg: test_cfg(),
+                backfill_days: 3650,
+                graph_base: srv.base_url.clone(),
+                auth_base: srv.base_url.clone(),
+                tick: HOUR,
+                options,
+            };
+            let mut engine = Engine::new(config, store, cmd_rx, evt_tx);
+            engine.token = Some(TokenSet {
+                access_token: "AT".into(),
+                refresh_token: "RT".into(),
+                expires_at_unix: u64::MAX / 2,
+                account: String::new(),
+                scopes: None,
+            });
+            engine.mailbox_unchecked = true;
+            (engine, evt_rx, cmd_tx)
+        }
+
+        /// AC 1: another mailbox signing in empties the store before any op
+        /// is sent, tells the host before any `FoldersUpdated`, and the
+        /// pass lists the new mailbox from nothing.
+        #[test]
+        fn a_different_mailbox_resets_the_store_before_any_op_is_sent() {
+            let srv = FakeServer::start_limited(routes(&[(200, "ROOT_B")], "FB", "ROOT_B"));
+            let (handle, store_path, dir) = spawn_on(&srv, "mbx-reset", false, |s| {
+                mailbox_a(s, Some("ROOT_A"));
+                s.set_mailbox_root("ROOT_A").unwrap();
+                queue_a(s);
+            });
+            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+            sign_in_through_loopback(&handle);
+            let mut events = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::MailboxChanged { .. })
+            });
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, SyncEvent::FoldersUpdated)),
+                "MailboxChanged comes before any FoldersUpdated: {events:?}"
+            );
+            assert_eq!(
+                events.last(),
+                Some(&SyncEvent::MailboxChanged { dropped_ops: 3 })
+            );
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || folder_ids(&store) == ["FB"]));
+            events.extend(drain_events(&handle.evt_rx));
+            assert_eq!(writes(&srv), Vec::<(String, String)>::new());
+            assert!(store.pending_ops().unwrap().is_empty());
+            assert!(store.message_row("MA1").unwrap().is_none());
+            assert_eq!(store.mailbox_root().unwrap().as_deref(), Some("ROOT_B"));
+            assert!(!store.mailbox_check_owed().unwrap());
+            // The probe was the first Graph request after the redeem.
+            let first = srv
+                .requests()
+                .into_iter()
+                .find(|r| !r.path.contains("/oauth2/"))
+                .unwrap();
+            assert!(first.path.starts_with(PROBE), "{first:?}");
+            assert_eq!(probes(&srv), 1);
+            finish(handle, dir);
+        }
+
+        /// AC 2: the same mailbox keeps the store; the queued op is sent
+        /// after the check, and no `MailboxChanged` comes.
+        #[test]
+        fn the_same_mailbox_keeps_the_store_and_drains_after_the_check() {
+            let srv = FakeServer::start_limited(routes(&[(200, "ROOT_A")], "FA", "ROOT_A"));
+            let (handle, store_path, dir) = spawn_on(&srv, "mbx-same", false, |s| {
+                mailbox_a(s, Some("ROOT_A"));
+                s.set_mailbox_root("ROOT_A").unwrap();
+                s.enqueue_op(&OutboxOp::MarkRead {
+                    id: "MA1".into(),
+                    read: true,
+                })
+                .unwrap();
+            });
+            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+            sign_in_through_loopback(&handle);
+            assert!(wait_until(ENGINE_WAIT, || !writes(&srv).is_empty()));
+            let events = drain_events(&handle.evt_rx);
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, SyncEvent::MailboxChanged { .. })),
+                "{events:?}"
+            );
+            let paths: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
+            let probe = paths.iter().position(|p| p.starts_with(PROBE)).unwrap();
+            let patch = paths
+                .iter()
+                .position(|p| p.starts_with("/me/messages/MA1"))
+                .unwrap();
+            assert!(probe < patch, "{paths:?}");
+            let store = Store::open(&store_path).unwrap();
+            assert!(store.message_row("MA1").unwrap().is_some());
+            assert_eq!(store.mailbox_root().unwrap().as_deref(), Some("ROOT_A"));
+            assert!(!store.mailbox_check_owed().unwrap());
+            finish(handle, dir);
+        }
+
+        /// AC 3: a store from before #1946 (no record) is judged by its
+        /// top-level folders' parents; an empty one is adopted.
+        #[test]
+        fn a_store_without_a_record_is_judged_by_its_top_level_folders() {
+            for (probe, seeded, reset) in [
+                ("ROOT_A", true, false),
+                ("ROOT_B", true, true),
+                ("ROOT_B", false, false),
+            ] {
+                let srv = FakeServer::start_limited(routes(&[(200, probe)], "FB", probe));
+                let store = Store::open_in_memory().unwrap();
+                if seeded {
+                    mailbox_a(&store, Some("ROOT_A"));
+                }
+                let (mut engine, evt_rx, _cmd_tx) = engine_on(&srv, store);
+                let expected = if reset {
+                    MailboxCheck::Reset
+                } else {
+                    MailboxCheck::Ready
+                };
+                assert_eq!(engine.check_mailbox(), expected, "{probe} {seeded}");
+                assert!(!engine.mailbox_unchecked);
+                assert_eq!(engine.store.mailbox_root().unwrap().as_deref(), Some(probe));
+                let changed = evt_rx
+                    .try_iter()
+                    .any(|e| matches!(e, SyncEvent::MailboxChanged { .. }));
+                assert_eq!(changed, reset, "{probe} {seeded}");
+                let kept = engine.store.message_row("MA1").unwrap().is_some();
+                assert_eq!(kept, seeded && !reset, "{probe} {seeded}");
+                // Checked: no second probe.
+                assert_eq!(engine.check_mailbox(), MailboxCheck::Ready);
+                assert_eq!(probes(&srv), 1);
+            }
+        }
+
+        /// AC 4: a probe that fails sends nothing; it is said once and
+        /// made again by `Refresh`, after which the op drains.
+        #[test]
+        fn a_failed_check_sends_nothing_and_is_retried() {
+            let srv =
+                FakeServer::start_limited(routes(&[(500, ""), (200, "ROOT_A")], "FA", "ROOT_A"));
+            let (handle, _store_path, dir) = spawn_on(&srv, "mbx-failed", false, |s| {
+                mailbox_a(s, Some("ROOT_A"));
+                s.set_mailbox_root("ROOT_A").unwrap();
+                s.enqueue_op(&OutboxOp::MarkRead {
+                    id: "MA1".into(),
+                    read: true,
+                })
+                .unwrap();
+            });
+            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+            sign_in_through_loopback(&handle);
+            let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+            let errs = errors(&events);
+            assert!(
+                errs[0].starts_with("cannot check which mailbox signed in:"),
+                "{errs:?}"
+            );
+            let events = drain_events(&handle.evt_rx);
+            assert!(errors(&events).is_empty(), "said once: {events:?}");
+            assert_eq!(writes(&srv), Vec::<(String, String)>::new());
+            assert_eq!(probes(&srv), 1);
+            // Only the probe and the redeem: no listing, no delta.
+            assert!(
+                srv.requests()
+                    .iter()
+                    .all(|r| r.path.starts_with(PROBE) || r.path.contains("/oauth2/")),
+                "{:?}",
+                srv.requests()
+            );
+            handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || !writes(&srv).is_empty()));
+            assert_eq!(probes(&srv), 2);
+            finish(handle, dir);
+        }
+
+        /// AC 4: a throttled probe goes through `react` (a back-off, no
+        /// `Error`), and nothing is drained.
+        #[test]
+        fn a_throttled_check_backs_off_and_sends_nothing() {
+            let srv = FakeServer::start_limited(routes(&[(429, "")], "FA", "ROOT_A"));
+            let store = Store::open_in_memory().unwrap();
+            mailbox_a(&store, Some("ROOT_A"));
+            queue_a(&store);
+            let (mut engine, evt_rx, _cmd_tx) = engine_on(&srv, store);
+            assert!(matches!(engine.drain_outbox(), Drain::Aborted));
+            assert!(engine.next_retry.is_some());
+            assert!(engine.mailbox_unchecked);
+            assert!(errors(&evt_rx.try_iter().collect::<Vec<_>>()).is_empty());
+            assert_eq!(writes(&srv), Vec::<(String, String)>::new());
+            assert_eq!(engine.store.pending_ops().unwrap().len(), 3);
+        }
+
+        /// AC 4: the idle work (a body prefetch, a backfill page, a size
+        /// fill page) waits for an owed check: each has work, which it
+        /// takes once the check is made.
+        #[test]
+        fn the_idle_work_waits_for_the_check() {
+            let srv = FakeServer::start_limited(routes(&[(500, "")], "FA", "ROOT_A"));
+            let store = Store::open_in_memory().unwrap();
+            mailbox_a(&store, Some("ROOT_A"));
+            // A recent message with no body and no size: a prefetch and a
+            // size fill candidate; `FA`'s head is synced and its history
+            // walk is not, so a backfill page is ready.
+            let v = crate::json::parse(&message_json("MA2", false, false, &[])).unwrap();
+            let mut recent = Message::from_json(&v).unwrap();
+            recent.received = unix_to_iso8601(now_unix() - 3600);
+            store.upsert_message("FA", &recent).unwrap();
+            store
+                .set_head_link("FA", "/me/mailFolders/FA/messages/delta?token=D-FA", false)
+                .unwrap();
+            let options = EngineOptions {
+                prefetch_body_days: 30,
+                size_fill: true,
+                ..EngineOptions::without_prefetch()
+            };
+            let (mut engine, _evt_rx, _cmd_tx) = engine_with(&srv, store, options);
+            engine.backfill_done = true;
+            assert!(engine.next_prefetch().is_none());
+            assert!(engine.next_backfill().is_none());
+            assert!(engine.next_size_fill().is_none());
+            engine.mailbox_unchecked = false;
+            assert!(engine.next_prefetch().is_some());
+            assert!(engine.next_backfill().is_some());
+            assert!(engine.next_size_fill().is_some());
+            assert_eq!(probes(&srv), 0);
+        }
+
+        /// AC 4: a failing probe is held off (`check_retry`, doubling), so
+        /// a drain every fast tick sends one probe and one `Error`, not one
+        /// each.
+        #[test]
+        fn a_failing_probe_backs_off() {
+            let srv = FakeServer::start_limited(routes(&[(500, "")], "FA", "ROOT_A"));
+            let store = Store::open_in_memory().unwrap();
+            mailbox_a(&store, Some("ROOT_A"));
+            let (mut engine, evt_rx, _cmd_tx) = engine_on(&srv, store);
+            for _ in 0..3 {
+                assert!(matches!(engine.drain_outbox(), Drain::Aborted));
+            }
+            assert_eq!(probes(&srv), 1);
+            assert_eq!(errors(&evt_rx.try_iter().collect::<Vec<_>>()).len(), 1);
+            assert_eq!(engine.check_backoff, BACKOFF_MIN * 2);
+            // The hold-off over, the next drain probes again.
+            engine.check_retry = Some(Instant::now() - Duration::from_millis(1));
+            assert!(matches!(engine.drain_outbox(), Drain::Aborted));
+            assert_eq!(probes(&srv), 2);
+            assert_eq!(engine.check_backoff, BACKOFF_MIN * 4);
+        }
+
+        /// r1 m1: a calendar reset owed from the last session does not run
+        /// after a sign-in whose check could not be made: this account's
+        /// calendar would land in another mailbox's store.
+        #[test]
+        fn an_owed_calendar_reset_waits_for_the_check() {
+            let srv = FakeServer::start_limited(routes(&[(500, "")], "FA", "ROOT_A"));
+            let store = Store::open_in_memory().unwrap();
+            mailbox_a(&store, Some("ROOT_A"));
+            let (mut engine, _evt_rx, _cmd_tx) = engine_on(&srv, store);
+            engine.calendar_reset_owed = true;
+            engine.handle_command(SyncCommand::Refresh);
+            let paths: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
+            assert!(
+                paths.iter().all(|p| p.starts_with(PROBE)),
+                "the probe alone: {paths:?}"
+            );
+            assert!(engine.calendar_reset_owed, "still owed");
+        }
+
+        /// AC 4: a command's drain waits for the check: the op is queued,
+        /// nothing is sent.
+        #[test]
+        fn a_command_drain_waits_for_the_check() {
+            let srv = FakeServer::start_limited(routes(&[(500, "")], "FA", "ROOT_A"));
+            let store = Store::open_in_memory().unwrap();
+            mailbox_a(&store, Some("ROOT_A"));
+            store.set_mailbox_root("ROOT_A").unwrap();
+            let (mut engine, _evt_rx, _cmd_tx) = engine_on(&srv, store);
+            engine.handle_command(SyncCommand::MarkRead {
+                id: "MA1".into(),
+                read: true,
+            });
+            assert_eq!(engine.store.pending_ops().unwrap().len(), 1);
+            assert_eq!(writes(&srv), Vec::<(String, String)>::new());
+            assert_eq!(probes(&srv), 1);
+        }
+
+        /// AC 4: a reset found by a drain's check stops that drain's
+        /// caller: `SyncFolder` of an old folder reads nothing of it, and
+        /// the full pass is due at once.
+        #[test]
+        fn a_reset_found_by_a_drain_stops_its_caller() {
+            let srv = FakeServer::start_limited(routes(&[(200, "ROOT_B")], "FB", "ROOT_B"));
+            let store = Store::open_in_memory().unwrap();
+            mailbox_a(&store, Some("ROOT_A"));
+            store.set_mailbox_root("ROOT_A").unwrap();
+            queue_a(&store);
+            let (mut engine, evt_rx, _cmd_tx) = engine_on(&srv, store);
+            engine.next_tick = Instant::now() + HOUR;
+            engine.handle_command(SyncCommand::SyncFolder { id: "FA".into() });
+            let paths: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
+            assert_eq!(paths.len(), 1, "the probe alone: {paths:?}");
+            assert!(paths[0].starts_with(PROBE));
+            let events: Vec<SyncEvent> = evt_rx.try_iter().collect();
+            assert!(
+                events.contains(&SyncEvent::MailboxChanged { dropped_ops: 3 }),
+                "{events:?}"
+            );
+            assert!(folder_ids(&engine.store).is_empty());
+            assert!(engine.due(), "the full pass runs next");
+            engine.on_timer();
+            assert_eq!(folder_ids(&engine.store), ["FB"]);
+        }
+
+        /// AC 5: a startup with a cached token and no owed check probes
+        /// nothing; the queued op drains as before.
+        #[test]
+        fn a_startup_with_a_cached_token_does_not_probe() {
+            let srv = FakeServer::start_limited(routes(&[(200, "ROOT_B")], "FA", "ROOT_A"));
+            let (handle, _store_path, dir) = spawn_on(&srv, "mbx-startup", true, |s| {
+                mailbox_a(s, Some("ROOT_A"));
+                s.set_mailbox_root("ROOT_A").unwrap();
+                s.enqueue_op(&OutboxOp::MarkRead {
+                    id: "MA1".into(),
+                    read: true,
+                })
+                .unwrap();
+            });
+            assert!(wait_until(ENGINE_WAIT, || !writes(&srv).is_empty()));
+            assert_eq!(probes(&srv), 0);
+            finish(handle, dir);
+        }
+
+        /// AC 5: a sign-in whose check never finished (the store owes it)
+        /// is checked at the next start, before anything is drained.
+        #[test]
+        fn a_check_owed_at_exit_is_made_at_the_next_start() {
+            let srv = FakeServer::start_limited(routes(&[(200, "ROOT_B")], "FB", "ROOT_B"));
+            let (handle, store_path, dir) = spawn_on(&srv, "mbx-owed", true, |s| {
+                mailbox_a(s, Some("ROOT_A"));
+                s.set_mailbox_root("ROOT_A").unwrap();
+                s.set_mailbox_check_owed().unwrap();
+                queue_a(s);
+            });
+            let events = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::MailboxChanged { .. })
+            });
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, SyncEvent::FoldersUpdated)),
+                "{events:?}"
+            );
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || folder_ids(&store) == ["FB"]));
+            assert_eq!(writes(&srv), Vec::<(String, String)>::new());
+            assert!(store.pending_ops().unwrap().is_empty());
+            assert!(!store.mailbox_check_owed().unwrap());
+            finish(handle, dir);
+        }
+
+        /// AC 5: `sign_in` owes the check in the store before it saves the
+        /// token, so a process that exits before the check makes it at the
+        /// next start.
+        #[test]
+        fn a_sign_in_owes_the_check_in_the_store() {
+            // The probe never answers 200: the check stays owed.
+            let srv = FakeServer::start_limited(routes(&[(500, "")], "FA", "ROOT_A"));
+            let (handle, store_path, dir) = spawn_on(&srv, "mbx-owes", false, |s| {
+                mailbox_a(s, Some("ROOT_A"));
+                s.set_mailbox_root("ROOT_A").unwrap();
+            });
+            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+            sign_in_through_loopback(&handle);
+            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+            let store = Store::open(&store_path).unwrap();
+            assert!(store.mailbox_check_owed().unwrap());
+            finish(handle, dir);
         }
     }
 }
