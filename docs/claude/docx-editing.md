@@ -278,7 +278,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   pictures imported, each src refused, so a sized `<img>` is #1880's
   placeholder, in the import's own package). The doc tab's `flow.pictures`
   (#1926) already reads drawn sizes. `uiharness/cases/ext-doc-newsletter.uit`
-  drives a 560 px picture and a `width="600"` card in a 504 px view.
+  drives a 560 px picture and a `width="600"` card in a 504 px DocView, and
+  the same page (`uiharness/fixtures/newsletter.html`) in a document tab's
+  Web Layout. It asserts layout only (grid widths, scroll ranges, edges in
+  view, a drag over the card's last word once scrolled), never a word's x,
+  which follows the installed fonts (#1963 ci1: 3 px apart on CI).
 
 ## The flow view draws an imported mail as a browser does (#1986)
 
