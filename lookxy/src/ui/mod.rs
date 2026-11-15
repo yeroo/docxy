@@ -742,11 +742,17 @@ mod tests {
             "Esc does not strand the person without a key"
         );
 
-        app.on_sync_event(SyncEvent::SignInRequired);
+        let reason = mailcore::sync::engine::SignInReason::NotSignedIn;
+        app.on_sync_event(SyncEvent::SignInRequired {
+            reason: reason.clone(),
+        });
         handle_key(&mut app, KeyEvent::from(KeyCode::Char('r')));
         handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
         assert!(app.last_sent_command().is_none());
-        assert_eq!(app.signin_modal, Some(crate::app::SignInModal::Required));
+        assert_eq!(
+            app.signin_modal,
+            Some(crate::app::SignInModal::Required { reason })
+        );
     }
 
     #[test]

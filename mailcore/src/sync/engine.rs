@@ -358,8 +358,8 @@ pub enum SyncCommand {
     FetchPhoto,
     /// Sign out: drop the in-memory token and delete the saved one, in the
     /// file and in the engine's secret store (`tokencache::clear_in`), then
-    /// emit [`SyncEvent::SignInRequired`], so the
-    /// next `SignIn` starts a fresh sign-in. `State(SignInRequired)` comes
+    /// emit [`SyncEvent::SignInRequired`] (reason
+    /// [`SignInReason::SignedOut`]), so the next `SignIn` starts a fresh sign-in. `State(SignInRequired)` comes
     /// only when the state changes: a SignOut while already signed out still
     /// clears the file and emits `SignInRequired`, but no `State`, so a
     /// client confirms a sign-out by `SignInRequired`. The mail store and the
@@ -884,6 +884,42 @@ pub enum DraftKind {
     Forward,
 }
 
+/// Why the engine asks for a sign-in: the payload of
+/// [`SyncEvent::SignInRequired`] (#2169). Only facts that are no secret:
+/// never an access or refresh token, and never the token endpoint's
+/// `error_description` text, which may name the user or the tenant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SignInReason {
+    /// No saved sign-in at start: no token file (a first run, or a
+    /// sign-out before).
+    NotSignedIn,
+    /// A saved sign-in that is there but cannot be used: a token file that
+    /// fails to read, decrypt or parse, a secret store reference without a
+    /// key or whose item is gone, or a store that failed (other than being
+    /// unreachable, which is [`SyncEvent::SavedSignInUnavailable`]). The
+    /// text is the reader's or the store's reason, never a secret.
+    SavedSignInUnreadable(String),
+    /// The token endpoint refused the refresh as a refusal of the grant
+    /// (`AuthError::needs_sign_in`, #2167): `code` is its OAuth `error`,
+    /// trimmed and ASCII-lowercased (`invalid_grant`,
+    /// `interaction_required`, …), and `aadsts` the Entra number its
+    /// description starts with (`AADSTS70008:` is `70008`,
+    /// `AuthError::aadsts`), so a client can tell an expiry from a
+    /// revocation or a required interaction (MFA, consent) without the
+    /// text. Also a token that is near expiry or was refused with no
+    /// refresh token to renew it: `code` empty, `aadsts` `None`.
+    Expired { code: String, aadsts: Option<u32> },
+    /// Graph answered 401 to a token that was fresh or freshly refreshed.
+    Rejected,
+    /// After [`SyncCommand::SignOut`].
+    SignedOut,
+    /// An interactive sign-in failed (the redirect reported an error or
+    /// never came, or the code could not be redeemed); the
+    /// `Error("sign-in failed: …")` before it says how.
+    SignInFailed,
+}
+
 /// An event sent from the sync thread up to the UI.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SyncEvent {
@@ -1190,8 +1226,10 @@ pub enum SyncEvent {
     /// the notice that a folder holds messages stored without headers,
     /// which the sync is fetching (#1899).
     Error(String),
-    /// No valid token; the UI must trigger `SyncCommand::SignIn`.
-    SignInRequired,
+    /// No valid token; the UI must trigger `SyncCommand::SignIn`. `reason`
+    /// says why (#2169): part of this one event, so a client never sees a
+    /// sign-in asked for without it. No secret and no description text.
+    SignInRequired { reason: SignInReason },
     /// A saved sign-in is on disk but its secret store cannot be reached
     /// now (#2167): no Secret Service or keychain yet, its unlock prompt
     /// dismissed or not answered, or no store at all on this system. Sent
@@ -2320,6 +2358,14 @@ struct Engine {
     /// the store again instead of running a tick. Cleared once the store
     /// answers, by a sign-in and by `enter_signin`.
     saved_unavailable: Option<String>,
+    /// Why the last refresh after a 401 was refused (#2169): set by
+    /// `with_auth` and `apply_op_with_retry`, which answer such a refusal
+    /// with `GraphError::Unauthorized` like any 401, and taken by
+    /// `signin_after_401`, so the sign-in that 401 leads to says why
+    /// (`None` there is [`SignInReason::Rejected`]). Cleared when
+    /// `try_refresh` starts, so a refusal whose caller dropped the error
+    /// never names a later, unrelated 401, and by `enter_signin`.
+    refused_refresh: Option<SignInReason>,
     /// The commands from the UI. The main loop waits on it; long work
     /// drains it at each `checkpoint` (#1978).
     cmd_rx: Receiver<SyncCommand>,
@@ -2461,6 +2507,7 @@ impl Engine {
             announced_scopes: None,
             warned_unencrypted: false,
             saved_unavailable: None,
+            refused_refresh: None,
             cmd_rx,
             deferred: VecDeque::new(),
             bulk: None,
@@ -2500,8 +2547,24 @@ impl Engine {
             }
             // No cache yet, or a cache that failed to decrypt/parse, or a
             // reference whose item is gone: either way the user has to
-            // (re-)sign in.
-            Ok(None) | Err(_) => self.enter_signin(),
+            // (re-)sign in, told which (#2169).
+            Ok(None) => self.enter_signin(self.no_saved_token_reason()),
+            Err(e) => self.enter_signin(SignInReason::SavedSignInUnreadable(e.to_string())),
+        }
+    }
+
+    /// Why a load that found no token asks for a sign-in (#2169):
+    /// `tokencache::load_in` answers `Ok(None)` both for no file and for a
+    /// reference whose store item is gone, and `read_file` is `Ok(None)`
+    /// only when the file is not found, so a file still there is the
+    /// missing item.
+    fn no_saved_token_reason(&self) -> SignInReason {
+        if self.config.token_path.exists() {
+            SignInReason::SavedSignInUnreadable(
+                "the secret store no longer holds the saved sign-in".to_string(),
+            )
+        } else {
+            SignInReason::NotSignedIn
         }
     }
 
@@ -2553,7 +2616,8 @@ impl Engine {
             Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {
                 self.saved_signin_unavailable(e.to_string(), always);
             }
-            Ok(None) | Err(_) => self.enter_signin(),
+            Ok(None) => self.enter_signin(self.no_saved_token_reason()),
+            Err(e) => self.enter_signin(SignInReason::SavedSignInUnreadable(e.to_string())),
         }
     }
 
@@ -5484,7 +5548,7 @@ impl Engine {
                     }
                 }
                 Err(GraphError::Unauthorized) => {
-                    self.enter_signin();
+                    self.signin_after_401();
                     return Drain::Aborted;
                 }
                 Err(GraphError::Throttled { retry_after_secs }) => {
@@ -6253,7 +6317,7 @@ impl Engine {
     fn engine_op_call_failed(&mut self, seq: i64, e: GraphError) -> Result<BulkStep, GraphError> {
         match e {
             GraphError::Unauthorized => {
-                self.enter_signin();
+                self.signin_after_401();
                 Ok(BulkStep::Stopped)
             }
             GraphError::Throttled { retry_after_secs } => {
@@ -7124,7 +7188,10 @@ impl Engine {
                     let client = self.client();
                     apply(&client, &self.store)
                 }
-                Refresh::SignIn => Err(GraphError::Unauthorized),
+                Refresh::SignIn(reason) => {
+                    self.refused_refresh = Some(reason);
+                    Err(GraphError::Unauthorized)
+                }
                 Refresh::Transient(m) => Err(refresh_transport(&m)),
             },
             other => other,
@@ -8129,7 +8196,7 @@ impl Engine {
             self.emit(SyncEvent::Error(message));
         }
         self.clear_backoff();
-        self.enter_signin();
+        self.enter_signin(SignInReason::SignedOut);
     }
 
     /// Write the mailbox's automatic-replies config and emit
@@ -8818,7 +8885,10 @@ impl Engine {
                     let client = self.client();
                     f(&client)
                 }
-                Refresh::SignIn => Err(GraphError::Unauthorized),
+                Refresh::SignIn(reason) => {
+                    self.refused_refresh = Some(reason);
+                    Err(GraphError::Unauthorized)
+                }
                 Refresh::Transient(m) => Err(refresh_transport(&m)),
             },
             other => other,
@@ -8853,8 +8923,8 @@ impl Engine {
         }
         match self.try_refresh() {
             Refresh::Done => true,
-            Refresh::SignIn => {
-                self.enter_signin();
+            Refresh::SignIn(reason) => {
+                self.enter_signin(reason);
                 false
             }
             Refresh::Transient(_) => {
@@ -8887,14 +8957,17 @@ impl Engine {
     /// which is not taken: claiming scopes the server never named would hide
     /// a missing one until a 403.
     fn try_refresh(&mut self) -> Refresh {
-        let Some((refresh_token, previous_scopes)) = self
-            .token
-            .as_ref()
-            .filter(|t| !t.refresh_token.is_empty())
-            .map(|t| (t.refresh_token.clone(), t.scopes.clone()))
-        else {
-            return Refresh::SignIn;
+        self.refused_refresh = None;
+        let Some(token) = self.token.as_ref() else {
+            return Refresh::SignIn(SignInReason::NotSignedIn);
         };
+        if token.refresh_token.is_empty() {
+            return Refresh::SignIn(SignInReason::Expired {
+                code: String::new(),
+                aadsts: None,
+            });
+        }
+        let (refresh_token, previous_scopes) = (token.refresh_token.clone(), token.scopes.clone());
         match auth::refresh(&self.config.cfg, &self.config.auth_base, &refresh_token) {
             Ok(mut t) => {
                 if t.scopes.is_none() {
@@ -8907,7 +8980,7 @@ impl Engine {
                 self.announce_scopes();
                 Refresh::Done
             }
-            Err(e) if e.needs_sign_in() => Refresh::SignIn,
+            Err(e) if e.needs_sign_in() => Refresh::SignIn(expired(&e)),
             Err(e) => Refresh::Transient(e.to_string()),
         }
     }
@@ -9035,7 +9108,7 @@ impl Engine {
         if self.saved_unavailable.is_some() {
             self.saved_signin_still_waits();
         } else {
-            self.enter_signin();
+            self.enter_signin(SignInReason::SignInFailed);
         }
     }
 
@@ -9186,7 +9259,7 @@ impl Engine {
     fn react(&mut self, e: GraphError) -> bool {
         match e {
             GraphError::Unauthorized => {
-                self.enter_signin();
+                self.signin_after_401();
                 true
             }
             GraphError::Throttled { retry_after_secs } => {
@@ -9222,15 +9295,28 @@ impl Engine {
         self.emit(SyncEvent::Scopes { granted, missing });
     }
 
-    /// Drop to signed-out: clear the token and announce `SignInRequired`.
-    /// The announced grant is forgotten, so the next session announces it.
+    /// A 401 that the refresh did not help (#2169): signed out, with the
+    /// refusal `with_auth` / `apply_op_with_retry` kept (`refused_refresh`)
+    /// or, when the refresh went through and Graph still refused, or there
+    /// was none, [`SignInReason::Rejected`].
+    fn signin_after_401(&mut self) {
+        let reason = self
+            .refused_refresh
+            .take()
+            .unwrap_or(SignInReason::Rejected);
+        self.enter_signin(reason);
+    }
+
+    /// Drop to signed-out: clear the token and announce `SignInRequired`
+    /// with `reason` (#2169). The announced grant is forgotten, so the next session announces it.
     /// A throttle or offline back-off is over too (#2113, #1918): signed
     /// out, no pass runs, so a passed `next_retry` would only make
     /// `recv_timeout` zero (and a sign-in clears it anyway); the wait is
     /// the tick again, and the next session's back-off starts at
     /// `BACKOFF_MIN`.
-    fn enter_signin(&mut self) {
+    fn enter_signin(&mut self, reason: SignInReason) {
         self.token = None;
+        self.refused_refresh = None;
         // No saved sign-in waits for its store any more (#2167).
         self.saved_unavailable = None;
         self.clear_backoff();
@@ -9242,7 +9328,7 @@ impl Engine {
         self.announced_scopes = None;
         self.masters_not_found.clear();
         self.masters_skipped.clear();
-        self.emit(SyncEvent::SignInRequired);
+        self.emit(SyncEvent::SignInRequired { reason });
         self.set_state(SyncState::SignInRequired);
     }
 
@@ -9698,11 +9784,25 @@ fn looks_like_icalendar(bytes: &[u8]) -> bool {
 enum Refresh {
     /// A fresh token is in place (and saved).
     Done,
-    /// Nothing to refresh, or the endpoint refused the grant: sign in again.
-    SignIn,
+    /// Nothing to refresh, or the endpoint refused the grant: sign in
+    /// again, for this reason (#2169).
+    SignIn(SignInReason),
     /// The endpoint could not be reached or did not answer usefully; the
     /// token is kept. The error's text, which never holds a token.
     Transient(String),
+}
+
+/// A refresh the token endpoint refused (`AuthError::needs_sign_in`) as a
+/// [`SignInReason::Expired`] (#2169): the OAuth code
+/// (`AuthError::refusal_code`) and the AADSTS number; never the
+/// description text. `needs_sign_in` admits only `Denied`, so the code is
+/// always there; the empty `code` of a token with no refresh token comes
+/// from `try_refresh`, not from here.
+fn expired(e: &auth::AuthError) -> SignInReason {
+    SignInReason::Expired {
+        code: e.refusal_code().unwrap_or_default(),
+        aadsts: e.aadsts(),
+    }
 }
 
 /// A refresh that failed transiently after a 401 (#2167), as the Graph
@@ -12615,7 +12715,14 @@ mod tests {
             base,
             Duration::from_secs(3600),
         );
-        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        wait_for(&handle.evt_rx, |e| {
+            matches!(
+                e,
+                SyncEvent::SignInRequired {
+                    reason: SignInReason::NotSignedIn
+                }
+            )
+        });
         for cmd in [SyncCommand::FetchProfile, SyncCommand::FetchPhoto] {
             handle.cmd_tx.send(cmd).unwrap();
             wait_for(
@@ -12647,7 +12754,12 @@ mod tests {
             matches!(e, SyncEvent::State(SyncState::SignInRequired))
         });
         assert!(
-            seen.iter().any(|e| matches!(e, SyncEvent::SignInRequired)),
+            seen.iter().any(|e| matches!(
+                e,
+                SyncEvent::SignInRequired {
+                    reason: SignInReason::SignedOut
+                }
+            )),
             "{seen:?}"
         );
         assert!(!token_path.exists());
@@ -12677,7 +12789,12 @@ mod tests {
             |e| matches!(e, SyncEvent::Error(m) if m == "not signed in"),
         );
         assert!(
-            seen.iter().any(|e| matches!(e, SyncEvent::SignInRequired)),
+            seen.iter().any(|e| matches!(
+                e,
+                SyncEvent::SignInRequired {
+                    reason: SignInReason::SignedOut
+                }
+            )),
             "{seen:?}"
         );
         assert!(
@@ -12698,7 +12815,14 @@ mod tests {
             base,
             Duration::from_secs(3600),
         );
-        let seen = wait_for(&again.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        let seen = wait_for(&again.evt_rx, |e| {
+            matches!(
+                e,
+                SyncEvent::SignInRequired {
+                    reason: SignInReason::NotSignedIn
+                }
+            )
+        });
         assert!(
             !seen.iter().any(|e| matches!(e, SyncEvent::FoldersUpdated)),
             "{seen:?}"
@@ -14259,7 +14383,9 @@ mod tests {
             base,
             Duration::from_secs(3600),
         );
-        let mut events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        let mut events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
         assert_eq!(unencrypted_warnings(&events), 0, "no token yet: {events:?}");
         sign_in_through_loopback(&handle);
         events.extend(wait_for(&handle.evt_rx, |e| {
@@ -14445,9 +14571,20 @@ mod tests {
         events.iter().any(|e| {
             matches!(
                 e,
-                SyncEvent::SignInRequired | SyncEvent::State(SyncState::SignInRequired)
+                SyncEvent::SignInRequired { .. } | SyncEvent::State(SyncState::SignInRequired)
             )
         })
+    }
+
+    /// The reasons of the `SignInRequired` events in `events` (#2169).
+    fn signin_reasons(events: &[SyncEvent]) -> Vec<SignInReason> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SyncEvent::SignInRequired { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The `SavedSignInUnavailable` reasons in `events`.
@@ -14709,8 +14846,19 @@ mod tests {
             Duration::from_secs(3600),
             store,
         );
-        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
         assert!(unavailable_reasons(&events).is_empty(), "{events:?}");
+        // #2169: the file is there, its item is not: an unreadable saved
+        // sign-in, not "never signed in".
+        assert_eq!(
+            signin_reasons(&events),
+            vec![SignInReason::SavedSignInUnreadable(
+                "the secret store no longer holds the saved sign-in".into()
+            )],
+            "{events:?}"
+        );
         assert_eq!(state.gets(), 1);
         finish(handle, dir);
     }
@@ -14905,11 +15053,22 @@ mod tests {
                 srv.base_url.clone(),
                 Duration::from_secs(3600),
             );
-            let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+            let events = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::SignInRequired { .. })
+            });
             assert!(
                 !events
                     .iter()
                     .any(|e| matches!(e, SyncEvent::State(SyncState::Offline))),
+                "{code}: {events:?}"
+            );
+            // #2169: the refusal's code, at startup and through the 401.
+            assert_eq!(
+                signin_reasons(&events),
+                vec![SignInReason::Expired {
+                    code: code.into(),
+                    aadsts: None,
+                }],
                 "{code}: {events:?}"
             );
             assert_eq!(token_requests(&srv), 1, "{code}");
@@ -14939,8 +15098,184 @@ mod tests {
             srv.base_url.clone(),
             Duration::from_secs(3600),
         );
-        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        assert_eq!(signin_reasons(&events), vec![no_code()], "{events:?}");
         assert_eq!(token_requests(&srv), 0);
+        finish(handle, dir);
+    }
+
+    /// [`SignInReason::Expired`] with no code: a token with no refresh
+    /// token to renew it (#2169).
+    fn no_code() -> SignInReason {
+        SignInReason::Expired {
+            code: String::new(),
+            aadsts: None,
+        }
+    }
+
+    const AT_SECRET: &str = "AT-SECRET-2169";
+    const RT_SECRET: &str = "RT-SECRET-2169";
+
+    /// A token with recognisable secrets, expiring in `expires_in`
+    /// seconds (0: already expired), with `refresh_token` (#2169).
+    fn seed_secret_token(path: &std::path::Path, expires_in: u64, refresh_token: &str) {
+        let t = TokenSet {
+            access_token: AT_SECRET.into(),
+            refresh_token: refresh_token.into(),
+            expires_at_unix: if expires_in == 0 {
+                0
+            } else {
+                now_unix() + expires_in
+            },
+            account: "me@x".into(),
+            scopes: Some(SEEDED.iter().map(|s| s.to_string()).collect()),
+        };
+        tokencache::save(path, &t).unwrap();
+    }
+
+    /// AC 4 (#2169): no reason in `events` carries a token or any of
+    /// `texts` (the OAuth description's words).
+    fn assert_no_secret_in_reasons(events: &[SyncEvent], texts: &[&str]) {
+        for reason in signin_reasons(events) {
+            let shown = format!("{reason:?}");
+            for secret in [AT_SECRET, RT_SECRET].iter().chain(texts) {
+                assert!(!shown.contains(secret), "{secret} in {shown}");
+            }
+        }
+    }
+
+    /// Starts an engine on `srv` over a token file `seed` writes, and
+    /// returns the events up to the first `SignInRequired` (#2169).
+    fn signin_events(
+        tag: &str,
+        srv: &FakeServer,
+        seed: impl FnOnce(&std::path::Path),
+    ) -> (Vec<SyncEvent>, SyncHandle, PathBuf) {
+        let dir = unique_dir(tag);
+        let token_path = dir.join("token.bin");
+        seed(&token_path);
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            token_path,
+            test_cfg(),
+            3650,
+            srv.base_url.clone(),
+            srv.base_url.clone(),
+            Duration::from_secs(3600),
+        );
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        (events, handle, dir)
+    }
+
+    /// #2169: a token file that does not parse is an unreadable saved
+    /// sign-in, with the parser's reason, which holds neither token.
+    #[test]
+    fn a_corrupt_token_file_is_an_unreadable_saved_sign_in() {
+        let srv = FakeServer::start(vec![]);
+        let (events, handle, dir) = signin_events("reason-corrupt", &srv, |p| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            let cut = format!(r#"{{"access_token":"{AT_SECRET}","refresh_token":"{RT_SECRET}""#);
+            std::fs::write(p, cut).unwrap();
+        });
+        let reasons = signin_reasons(&events);
+        let [SignInReason::SavedSignInUnreadable(why)] = reasons.as_slice() else {
+            panic!("{events:?}");
+        };
+        assert!(!why.is_empty());
+        assert_no_secret_in_reasons(&events, &[]);
+        assert!(srv.requests().is_empty(), "{:?}", srv.requests());
+        finish(handle, dir);
+    }
+
+    /// #2169: a refresh refused at start keeps the OAuth code and the
+    /// AADSTS number, and none of the description, which names the user.
+    #[test]
+    fn a_refused_refresh_at_start_keeps_the_code_and_the_aadsts_number() {
+        let srv = FakeServer::start(vec![token_failure(
+            400,
+            r#"{"error":" Invalid_Grant ","error_description":"AADSTS70008: The provided authorization code or refresh token has expired due to inactivity for user@contoso.com in tenant Contoso."}"#,
+        )]);
+        let (events, handle, dir) = signin_events("reason-refused-start", &srv, |p| {
+            seed_secret_token(p, 0, RT_SECRET)
+        });
+        assert_eq!(
+            signin_reasons(&events),
+            vec![SignInReason::Expired {
+                code: "invalid_grant".into(),
+                aadsts: Some(70008),
+            }],
+            "{events:?}"
+        );
+        assert_no_secret_in_reasons(&events, &["user@contoso.com", "Contoso", "inactivity"]);
+        assert_eq!(token_requests(&srv), 1);
+        finish(handle, dir);
+    }
+
+    /// #2169: a fresh-looking token that Graph refuses, whose refresh then
+    /// needs an interaction, says so through `with_auth`'s hand-off.
+    #[test]
+    fn interaction_required_after_a_401_is_expired_with_its_code() {
+        let srv = FakeServer::start(vec![
+            token_failure(
+                400,
+                r#"{"error":"interaction_required","error_description":"AADSTS50076: Due to a configuration change made by your administrator, you must use multi-factor authentication to access user@contoso.com."}"#,
+            ),
+            empty_folders_route(401),
+        ]);
+        let (events, handle, dir) = signin_events("reason-interaction", &srv, |p| {
+            seed_secret_token(p, 3600, RT_SECRET)
+        });
+        assert_eq!(
+            signin_reasons(&events),
+            vec![SignInReason::Expired {
+                code: "interaction_required".into(),
+                aadsts: Some(50076),
+            }],
+            "{events:?}"
+        );
+        assert_no_secret_in_reasons(&events, &["user@contoso.com", "multi-factor"]);
+        assert_eq!(token_requests(&srv), 1);
+        finish(handle, dir);
+    }
+
+    /// #2169 (plan critique B): an expired token with no refresh token
+    /// asks the token endpoint nothing and is `Expired` with no code.
+    #[test]
+    fn an_expired_token_without_a_refresh_token_is_expired_without_a_code() {
+        let srv = FakeServer::start(vec![token_route(AT2), empty_folders_route(200)]);
+        let (events, handle, dir) =
+            signin_events("reason-no-refresh", &srv, |p| seed_secret_token(p, 0, ""));
+        assert_eq!(signin_reasons(&events), vec![no_code()], "{events:?}");
+        assert_no_secret_in_reasons(&events, &[]);
+        assert_eq!(token_requests(&srv), 0);
+        assert!(srv.requests().is_empty(), "{:?}", srv.requests());
+        finish(handle, dir);
+    }
+
+    /// #2169: Graph refusing the token the refresh just gave is
+    /// `Rejected`, not an expiry.
+    #[test]
+    fn a_401_after_a_successful_refresh_is_rejected() {
+        let srv = FakeServer::start(vec![token_route(AT2), empty_folders_route(401)]);
+        let (events, handle, dir) = signin_events("reason-rejected", &srv, |p| {
+            seed_secret_token(p, 3600, RT_SECRET)
+        });
+        assert_eq!(
+            signin_reasons(&events),
+            vec![SignInReason::Rejected],
+            "{events:?}"
+        );
+        assert_eq!(token_requests(&srv), 1);
+        let folder_calls = srv
+            .requests()
+            .iter()
+            .filter(|r| r.path.starts_with("/me/mailFolders"))
+            .count();
+        assert_eq!(folder_calls, 2, "the call, then its retry with AT2");
         finish(handle, dir);
     }
 
@@ -15006,7 +15341,9 @@ mod tests {
             base,
             Duration::from_secs(3600),
         );
-        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
         sign_in_through_loopback(&handle);
         let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
         let expected: Vec<String> = granted.split(' ').map(str::to_string).collect();
@@ -15042,7 +15379,9 @@ mod tests {
         );
         assert_eq!(scopes_events(&events).len(), 1, "{events:?}");
         handle.cmd_tx.send(SyncCommand::SignOut).unwrap();
-        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
         sign_in_through_loopback(&handle);
         let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
         assert_eq!(
@@ -15070,14 +15409,23 @@ mod tests {
             base,
             Duration::from_secs(3600),
         );
-        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        assert_eq!(
+            signin_reasons(&events),
+            vec![SignInReason::NotSignedIn],
+            "{events:?}"
+        );
         let (_, response) = sign_in_through_loopback_with(&handle, |state| {
             format!(
                 "error=consent_required&error_description=AADSTS65001%3A+The+user+or+administrator+has+not+consented%0D%0ATrace+ID%3A+abc&state={state}"
             )
         });
         assert!(response.to_lowercase().contains("failed"));
-        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
         assert!(
             events.contains(&SyncEvent::Error(
                 "sign-in failed: authorization denied: consent_required: AADSTS65001: The user or administrator has not consented Trace ID: abc"
@@ -15085,7 +15433,43 @@ mod tests {
             )),
             "{events:?}"
         );
+        // #2169: the failed sign-in says so; the `Error` keeps its words.
+        assert_eq!(
+            signin_reasons(&events),
+            vec![SignInReason::SignInFailed],
+            "{events:?}"
+        );
         assert!(tokencache::load(&token_path).unwrap().is_none());
+        finish(handle, dir);
+    }
+
+    /// #2169: a code the token endpoint will not redeem is a failed
+    /// sign-in: the `Error` first, then `SignInRequired(SignInFailed)`.
+    #[test]
+    fn a_failed_redeem_says_sign_in_failed() {
+        let srv = FakeServer::start(vec![token_failure(
+            400,
+            r#"{"error":"invalid_grant","error_description":"AADSTS54005: OAuth2 Authorization code was already redeemed"}"#,
+        )]);
+        let (_, handle, dir) = signin_events("reason-redeem", &srv, |_| {});
+        sign_in_through_loopback(&handle);
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        let error = events
+            .iter()
+            .position(|e| matches!(e, SyncEvent::Error(m) if m.starts_with("sign-in failed: ")))
+            .unwrap_or_else(|| panic!("{events:?}"));
+        let asked = events
+            .iter()
+            .position(|e| {
+                *e == SyncEvent::SignInRequired {
+                    reason: SignInReason::SignInFailed,
+                }
+            })
+            .unwrap_or_else(|| panic!("{events:?}"));
+        assert!(error < asked, "{events:?}");
+        assert_eq!(token_requests(&srv), 1);
         finish(handle, dir);
     }
 
@@ -15327,7 +15711,9 @@ mod tests {
             Duration::from_secs(3600),
         );
 
-        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
 
         let (redirect_uri, response) = sign_in_through_loopback(&handle);
         // Entra matches the loopback redirect host literally and the Graph CLI
@@ -15380,7 +15766,9 @@ mod tests {
             Duration::from_secs(3600),
         );
 
-        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
         handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
 
         let events = wait_for(&handle.evt_rx, |e| {
@@ -15412,7 +15800,9 @@ mod tests {
 
         // No token was ever cached, and the engine falls back to
         // sign-in-required rather than getting stuck.
-        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
         assert!(tokencache::load(&token_path).unwrap().is_none());
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
@@ -18817,7 +19207,9 @@ mod tests {
             base,
             Duration::from_secs(3600),
         );
-        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
         for cmd in [
             SyncCommand::FetchMeetingMessage {
                 message_id: "M1".into(),
@@ -19064,7 +19456,9 @@ mod tests {
             base,
             Duration::from_secs(3600),
         );
-        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
         for cmd in [
             SyncCommand::FetchEventSeries { id: "M1".into() },
             SyncCommand::FetchEventInstances {
@@ -20238,13 +20632,16 @@ mod tests {
         engine.next_retry = Some(Instant::now() - Duration::from_secs(1));
         engine.backoff = BACKOFF_MAX;
         assert_eq!(engine.recv_timeout(), Duration::ZERO, "the spin's cause");
-        engine.enter_signin();
+        engine.enter_signin(SignInReason::NotSignedIn);
         assert!(engine.token.is_none());
         assert_eq!(engine.next_retry, None);
         assert_eq!(engine.backoff, BACKOFF_MIN);
         assert!(engine.recv_timeout() > Duration::ZERO);
         assert!(!engine.due(), "no wake is due");
-        assert!(matches!(evt_rx.try_recv(), Ok(SyncEvent::SignInRequired)));
+        assert!(matches!(
+            evt_rx.try_recv(),
+            Ok(SyncEvent::SignInRequired { .. })
+        ));
         drop(cmd_tx);
     }
 
@@ -21730,7 +22127,9 @@ mod tests {
             base,
             Duration::from_secs(3600),
         );
-        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
         handle
             .cmd_tx
             .send(respond(
@@ -23490,7 +23889,9 @@ mod tests {
                 ..EngineOptions::without_prefetch()
             },
         );
-        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
         let (_, response) = sign_in_through_loopback(&handle);
         assert!(response.starts_with("HTTP/1.1 200"));
         assert!(
@@ -26385,7 +26786,9 @@ mod tests {
                 .iter()
                 .any(|p| p == old)));
             handle.cmd_tx.send(SyncCommand::SignOut).unwrap();
-            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+            wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::SignInRequired { .. })
+            });
             let n = listings(&srv).len();
             sign_in_through_loopback(&handle);
             assert!(wait_until(TICK_WAIT, || no_fill_left(&store)));
@@ -26624,7 +27027,9 @@ mod tests {
                 TICK,
                 EngineOptions::without_prefetch(),
             );
-            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+            wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::SignInRequired { .. })
+            });
             ask(&handle, &["A"]);
             let seen = wait_for(&handle.evt_rx, is_answer);
             assert_eq!(
@@ -31996,7 +32401,9 @@ mod tests {
                     // No token: the engine waits for a sign-in.
                     let dir = unique_dir("search-signed-out");
                     let handle = spawn_with(&srv, &dir, EngineOptions::without_prefetch());
-                    wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+                    wait_for(&handle.evt_rx, |e| {
+                        matches!(e, SyncEvent::SignInRequired { .. })
+                    });
                     search(&handle, "budget", Some("F1"), 10);
                     let (reason, events) = search_failure(&handle);
                     assert_eq!(reason, "not signed in");
@@ -32664,7 +33071,9 @@ mod tests {
                         // No token: the engine waits for a sign-in.
                         let dir = unique_dir("dir-signed-out");
                         let handle = spawn_with(&srv, &dir, EngineOptions::without_prefetch());
-                        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+                        wait_for(&handle.evt_rx, |e| {
+                            matches!(e, SyncEvent::SignInRequired { .. })
+                        });
                         search_dir(&handle, "jo", 10);
                         let (query, forbidden, reason, events) = unavailable(&handle);
                         assert_eq!(
@@ -33111,6 +33520,52 @@ mod tests {
             assert!(!signs_out(&seen), "{seen:?}");
             wait_drained(&store);
             assert_eq!(row(&store, "G1").unwrap().display_name, "Kid");
+            stop(handle, dir);
+        }
+
+        /// #2169 in the outbox: an op whose 401's refresh is refused signs
+        /// out with the refusal's code and AADSTS number (through
+        /// `apply_op_with_retry`'s `refused_refresh`), not as `Rejected`.
+        #[test]
+        fn a_refused_refresh_in_the_outbox_drain_is_expired() {
+            let token = "/organizations/oauth2/v2.0/token";
+            let (srv, handle, store, dir) = engine(
+                "folder-create-refused",
+                world(
+                    vec![
+                        once("POST", "/me/mailFolders/INBOX/childFolders", 401, ""),
+                        once(
+                            "POST",
+                            token,
+                            400,
+                            r#"{"error":"invalid_grant","error_description":"AADSTS50173: The provided grant has expired due to it being revoked"}"#,
+                        ),
+                    ],
+                    TREE,
+                    &[],
+                ),
+                None,
+            );
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some("INBOX".into()),
+                    name: "Kid".into(),
+                },
+            );
+            let seen = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::SignInRequired { .. })
+            });
+            assert_eq!(
+                signin_reasons(&seen),
+                vec![SignInReason::Expired {
+                    code: "invalid_grant".into(),
+                    aadsts: Some(50173),
+                }],
+                "{seen:?}"
+            );
+            assert_eq!(hits(&srv, "POST", token), 1);
+            assert_eq!(store.pending_ops().unwrap().len(), 1, "kept for later");
             stop(handle, dir);
         }
 
@@ -40616,7 +41071,9 @@ mod tests {
                 s.set_mailbox_root("ROOT_A").unwrap();
                 queue_a(s);
             });
-            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+            wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::SignInRequired { .. })
+            });
             sign_in_through_loopback(&handle);
             let mut events = wait_for(&handle.evt_rx, |e| {
                 matches!(e, SyncEvent::MailboxChanged { .. })
@@ -40664,7 +41121,9 @@ mod tests {
                 })
                 .unwrap();
             });
-            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+            wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::SignInRequired { .. })
+            });
             sign_in_through_loopback(&handle);
             assert!(wait_until(ENGINE_WAIT, || !writes(&srv).is_empty()));
             let events = drain_events(&handle.evt_rx);
@@ -40738,7 +41197,9 @@ mod tests {
                 })
                 .unwrap();
             });
-            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+            wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::SignInRequired { .. })
+            });
             sign_in_through_loopback(&handle);
             let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
             let errs = errors(&events);
@@ -40960,7 +41421,9 @@ mod tests {
                 mailbox_a(s, Some("ROOT_A"));
                 s.set_mailbox_root("ROOT_A").unwrap();
             });
-            wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::SignInRequired));
+            wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::SignInRequired { .. })
+            });
             sign_in_through_loopback(&handle);
             wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
             let store = Store::open(&store_path).unwrap();

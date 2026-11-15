@@ -16,7 +16,7 @@ use mailcore::graph::model::{
     RecurrenceKind,
 };
 use mailcore::store::{EventRow, FolderRow, MessageRow, Store};
-use mailcore::sync::engine::{SyncCommand, SyncEvent, SyncHandle, SyncState};
+use mailcore::sync::engine::{SignInReason, SyncCommand, SyncEvent, SyncHandle, SyncState};
 use ratatui::crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Color;
@@ -428,7 +428,8 @@ pub struct ReminderBanner {
 }
 
 /// Which sign-in modal is currently showing (see `App::signin_modal`):
-/// `Required` right after `SyncEvent::SignInRequired` (Enter sends
+/// `Required` right after `SyncEvent::SignInRequired`, with its reason
+/// (#2169), which the modal says in plain words (Enter sends
 /// `SyncCommand::SignIn`); `Started` once `SyncEvent::SignInStarted` has
 /// opened the browser (nothing left for the user to press — just a "go
 /// finish it over there" message). `Started` carries the `authorize_url` so
@@ -444,7 +445,7 @@ pub struct ReminderBanner {
 /// unlock prompt (or with no keyring at all) only those two keys move it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignInModal {
-    Required,
+    Required { reason: SignInReason },
     Started { authorize_url: String },
     SavedUnavailable { reason: String },
 }
@@ -788,7 +789,9 @@ impl App {
             // handed, so the request it answers (`original`, `kind`, #2085)
             // is not compared.
             SyncEvent::DraftReady { id, .. } => self.open_draft(&id),
-            SyncEvent::SignInRequired => self.signin_modal = Some(SignInModal::Required),
+            SyncEvent::SignInRequired { reason } => {
+                self.signin_modal = Some(SignInModal::Required { reason });
+            }
             SyncEvent::SavedSignInUnavailable(reason) => {
                 self.signin_modal = Some(SignInModal::SavedUnavailable { reason });
             }
@@ -1129,7 +1132,7 @@ impl App {
     pub fn on_key_enter(&mut self) {
         if matches!(
             self.signin_modal,
-            Some(SignInModal::Required | SignInModal::SavedUnavailable { .. })
+            Some(SignInModal::Required { .. } | SignInModal::SavedUnavailable { .. })
         ) {
             let _ = self.sync.cmd_tx.send(SyncCommand::SignIn);
         }
@@ -6375,7 +6378,9 @@ pub(crate) mod tests {
     #[test]
     fn signin_required_shows_prompt_and_enter_sends_signin() {
         let mut app = App::for_test_with_seeded_store();
-        app.on_sync_event(SyncEvent::SignInRequired);
+        app.on_sync_event(SyncEvent::SignInRequired {
+            reason: SignInReason::NotSignedIn,
+        });
         assert!(app.render_contains("sign in"));
         app.on_key_enter();
         assert!(app.last_sent_command_is_signin());
@@ -6916,7 +6921,9 @@ pub(crate) mod tests {
     #[test]
     fn folders_updated_clears_the_signin_modal() {
         let mut app = App::for_test_with_seeded_store();
-        app.on_sync_event(SyncEvent::SignInRequired);
+        app.on_sync_event(SyncEvent::SignInRequired {
+            reason: SignInReason::NotSignedIn,
+        });
         assert!(app.signin_modal.is_some());
 
         app.on_sync_event(SyncEvent::FoldersUpdated);
@@ -7026,7 +7033,9 @@ pub(crate) mod tests {
     #[test]
     fn state_signin_required_keeps_the_modal_showing() {
         let mut app = App::for_test_with_seeded_store();
-        app.on_sync_event(SyncEvent::SignInRequired);
+        app.on_sync_event(SyncEvent::SignInRequired {
+            reason: SignInReason::NotSignedIn,
+        });
         assert!(app.signin_modal.is_some());
 
         // The `State(SignInRequired)` that `enter_signin` emits alongside the

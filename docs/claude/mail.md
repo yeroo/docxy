@@ -272,7 +272,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   also removes the `.tmp` sibling `save` writes, through the shared
   `tmp_path`, and since #1877 the secret store's item), clears the throttle/offline back-off (not the outbox's
   `op_retry`), and goes through `enter_signin`: it always emits
-  `SignInRequired`, but `State(SignInRequired)` only when the state changes
+  `SignInRequired { reason: SignedOut }` (#2169), but `State(SignInRequired)` only when the state changes
   (`set_state`), so a repeated SignOut emits just `SignInRequired`, and
   clients key on that. A file it cannot delete is reported as an
   `Error`, but the engine still signs out in memory. The store and the outbox
@@ -1975,8 +1975,8 @@ so the user's other devices follow.
   kept over sign-out), the first time the startup load, a refresh's save or the sign-in's save
   ends in `PlainFile`; never on Windows. At startup it comes right after the load, before the
   near-expiry refresh. lookxy ignores it. A startup load that fails with `NotConnected` keeps the sign-in since
-  #2167 (`SavedSignInUnavailable`, see "Keeping the sign-in" below); any other load error stays
-  silent and signs out.
+  #2167 (`SavedSignInUnavailable`, see "Keeping the sign-in" below); any other load error
+  signs out with no `Error`, its text in `SignInReason::SavedSignInUnreadable` (#2169).
 - macOS ties a Keychain item's access to the code identity that created it: an unsigned rebuild
   asks once whether it may read the item. That prompt blocks the engine thread, not the UI.
 - `zbus` 5 pulls `uuid`, whose 1.27+ needs rustc 1.89: `Cargo.lock` pins `uuid` 1.26.1 for MSRV
@@ -4522,3 +4522,76 @@ keyring cannot be read now both keep it.
   behind `Latched`, leaked for `'static`. lookxy:
   `app::tests::saved_sign_in_unavailable_opens_its_modal_and_offline_keeps_it`,
   `ui::tests::enter_and_r_in_the_saved_sign_in_modal_send_sign_in_and_retry`.
+
+## Why the engine asks for a sign-in (#2169)
+
+`SyncEvent::SignInRequired { reason: SignInReason }` says why. The reason is part of the one
+event (not a separate event before it), so a client never sees the request without it.
+`State(SignInRequired)` is unchanged. `SignInReason` (`engine.rs`, next to `SyncEvent`) is
+`#[non_exhaustive]`, and holds no secret: no token, no refresh token, and no OAuth
+`error_description` text (which may name the user or the tenant).
+
+| where (`enter_signin(reason)`) | reason |
+|---|---|
+| `startup` / `retry_saved_signin`, `Ok(None)`, no token file | `NotSignedIn` |
+| same, `Ok(None)` with the file there (a reference whose item is gone) | `SavedSignInUnreadable("the secret store no longer holds the saved sign-in")` |
+| same, `Err(e)` other than `NotConnected` | `SavedSignInUnreadable(e.to_string())` |
+| `refresh_if_near_expiry`, refused | `Expired { code, aadsts }` |
+| `react`, the drain's `Err(Unauthorized)`, `engine_op_call_failed`: a 401 whose refresh was refused | `Expired { code, aadsts }` |
+| same, a 401 after a refresh that went through | `Rejected` |
+| `sign_out` | `SignedOut` |
+| `sign_in_failed` (no saved sign-in waits) | `SignInFailed` |
+
+`NotConnected` is still #2167's `SavedSignInUnavailable`, with no `SignInRequired`.
+`sign_in_not_started` (no loopback listener) is not an `enter_signin` site: it sets
+`State(SignInRequired)` with no event, as before.
+
+- **`Expired`**: the token endpoint refused the grant (`AuthError::needs_sign_in`). `code` is
+  `AuthError::refusal_code()`, the OAuth `error` trimmed and ASCII-lowercased. `aadsts` is `AuthError::aadsts()`: `Some(n)`
+  only for a `Denied` whose description, with leading whitespace trimmed, starts
+  `AADSTS<digits>:` and whose digits fit a `u32`. A token with no refresh token
+  (`try_refresh` asks nothing) is `Expired` with an empty `code` and no number.
+- **Through a 401.** `Refresh::SignIn(reason)` carries the reason. `refresh_if_near_expiry`
+  passes it straight to `enter_signin`. `with_auth` and `apply_op_with_retry` cannot: their
+  callers clean up after the `Err(Unauthorized)` first. So they keep the reason in
+  `Engine::refused_refresh` and return `Unauthorized` as before, and `signin_after_401` (from
+  `react`, the drain and `engine_op_call_failed`) takes it, with `Rejected` when there is none.
+  `try_refresh` clears the field when it starts, and so does `enter_signin`. Every Graph call
+  goes through one of the two wrappers (the engine builds a `GraphClient` only there), so every
+  401 has had its refresh before it reaches `react`. A refusal whose caller dropped the error
+  therefore never names a later 401. A new `GraphError` variant was rejected: every
+  `GraphError` match would need its arm, and a missed one would skip the sign-in.
+- **A missing item.** `tokencache::load_in` returns `Ok(None)` both for no file and for a
+  reference whose item is gone. `read_file` returns `Ok(None)` only for `NotFound`, so
+  `no_saved_token_reason` tells the two apart with `token_path.exists()`. `load_in`'s contract
+  is unchanged.
+- **lookxy**: `SignInModal::Required { reason }`. `ui::signin::signin_reason_text` gives the
+  sentence, and "Press Enter to sign in with your browser." follows it:
+  - `NotSignedIn`, or a variant lookxy does not know: "Not signed in."
+  - `SavedSignInUnreadable(r)`: "Couldn't read your saved sign-in:" and `r` on the next line.
+  - `Expired` with `interaction_required`, `consent_required` or `login_required`: "Microsoft
+    365 needs you to sign in again, for example to confirm with MFA or to give consent."
+  - any other `Expired`: "Your sign-in expired. Sign in again."
+  - any `Expired` with a number: a line "(AADSTS<n>)" after its sentence.
+  - `Rejected`: "Microsoft 365 refused your sign-in. Sign in again."
+  - `SignedOut`: "You signed out."
+  - `SignInFailed`: "The sign-in didn't finish. Try again."
+
+  The `Required` modal is 50% high, not 30%, so a long reason still leaves the prompt in view
+  at 80x24. Enter, Esc and `r` are unchanged.
+- Tests: `auth::tests::{aadsts_is_the_number_before_the_colon,
+  refusal_code_is_the_trimmed_lowercased_error}`. In `sync::engine::tests`:
+  - `a_corrupt_token_file_is_an_unreadable_saved_sign_in`;
+  - `a_refused_refresh_at_start_keeps_the_code_and_the_aadsts_number` and
+    `interaction_required_after_a_401_is_expired_with_its_code`, each of which checks that the
+    reason's `Debug` has no token and none of the description;
+  - `an_expired_token_without_a_refresh_token_is_expired_without_a_code`;
+  - `a_401_after_a_successful_refresh_is_rejected`, `a_failed_redeem_says_sign_in_failed`,
+    `folder_writes::a_refused_refresh_in_the_outbox_drain_is_expired`;
+  - tightened to the exact reason: `fetch_profile_and_photo_signed_out_report_not_signed_in`,
+    `sign_out_removes_token_keeps_store`, `missing_item_still_means_signed_out`,
+    `refused_refresh_still_signs_out`, `sign_in_refused_reports_error_description`.
+
+  lookxy: `ui::signin::tests::{signin_reason_text_says_each_reason,
+  required_modal_renders_the_reason, required_modal_shows_enter_at_80x24}` (the last fails at
+  30% high).

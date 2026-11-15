@@ -129,6 +129,41 @@ impl AuthError {
             AuthError::Http(_) | AuthError::Status { .. } | AuthError::Parse(_) => false,
         }
     }
+
+    /// The OAuth `error` code of a refusal, trimmed and ASCII-lowercased
+    /// (#2169), as [`AuthError::needs_sign_in`] compares it: `Some` for
+    /// [`AuthError::Denied`] (its code may be empty), `None` for any other
+    /// error.
+    pub fn refusal_code(&self) -> Option<String> {
+        match self {
+            AuthError::Denied { error, .. } => Some(error.trim().to_ascii_lowercase()),
+            AuthError::Http(_) | AuthError::Status { .. } | AuthError::Parse(_) => None,
+        }
+    }
+
+    /// The Entra error number of a refusal (#2169): `Some(n)` when this is
+    /// [`AuthError::Denied`] whose `error_description`, leading whitespace
+    /// trimmed, starts `AADSTS<n>:` with `n` fitting a `u32`
+    /// (`"AADSTS70008: The refresh token has expired …"` is `70008`).
+    /// `None` otherwise: no description, no colon after the digits, no
+    /// digits, a number too large, or any other error. The number names
+    /// the cause (inactivity, a password change, MFA) without the
+    /// description's text, which may name the user or the tenant.
+    pub fn aadsts(&self) -> Option<u32> {
+        let AuthError::Denied {
+            description: Some(d),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let rest = d.trim_start().strip_prefix("AADSTS")?;
+        let (digits, _) = rest.split_once(':')?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok()
+    }
 }
 
 /// The tenant segment for the `/oauth2/v2.0/...` endpoints: the last path
@@ -605,6 +640,74 @@ mod tests {
         assert_eq!(e.to_string(), "authorization denied: AADSTS50076: MFA");
         // A refusal served with a 5xx is still a refusal.
         assert!(classify_error(500, r#"{"error":"invalid_grant"}"#).needs_sign_in());
+    }
+
+    /// #2169: a refusal's code is trimmed and lowercased; only `Denied`
+    /// has one.
+    #[test]
+    fn refusal_code_is_the_trimmed_lowercased_error() {
+        let denied = |error: &str| AuthError::Denied {
+            error: error.into(),
+            description: Some("AADSTS70008: x".into()),
+        };
+        assert_eq!(
+            denied(" Invalid_Grant\t").refusal_code().as_deref(),
+            Some("invalid_grant")
+        );
+        assert_eq!(denied("").refusal_code().as_deref(), Some(""));
+        for other in [
+            AuthError::Http("invalid_grant".into()),
+            AuthError::Status {
+                status: 400,
+                body: "invalid_grant".into(),
+            },
+            AuthError::Parse("invalid_grant".into()),
+        ] {
+            assert_eq!(other.refusal_code(), None, "{other:?}");
+        }
+    }
+
+    /// #2169: the AADSTS number is the digits between `AADSTS` and the
+    /// first colon at the description's start, and nothing else is.
+    #[test]
+    fn aadsts_is_the_number_before_the_colon() {
+        let denied = |d: Option<&str>| AuthError::Denied {
+            error: "invalid_grant".into(),
+            description: d.map(str::to_string),
+        };
+        let cases: [(Option<&str>, Option<u32>); 10] = [
+            (
+                Some("AADSTS70008: The refresh token has expired"),
+                Some(70008),
+            ),
+            (Some("  AADSTS50076: MFA required"), Some(50076)),
+            (Some("AADSTS0:"), Some(0)),
+            (Some("AADSTS50000"), None),
+            (Some("xAADSTS1: no"), None),
+            (Some("AADSTS: no number"), None),
+            (Some("AADSTS99999999999: too large"), None),
+            (Some("AADSTS+5: signed"), None),
+            (Some("aadsts70008: lower case"), None),
+            (None, None),
+        ];
+        for (d, want) in cases {
+            assert_eq!(denied(d).aadsts(), want, "{d:?}");
+        }
+        let from_body = token_error(
+            400,
+            r#"{"error":"invalid_grant","error_description":"AADSTS70008: expired"}"#,
+        );
+        assert_eq!(from_body.aadsts(), Some(70008));
+        for other in [
+            AuthError::Http("AADSTS1: x".into()),
+            AuthError::Status {
+                status: 400,
+                body: "AADSTS1: x".into(),
+            },
+            AuthError::Parse("AADSTS1: x".into()),
+        ] {
+            assert_eq!(other.aadsts(), None, "{other:?}");
+        }
     }
 
     /// #2167: a dropped connection, a 5xx/429/408 with no OAuth body, a
