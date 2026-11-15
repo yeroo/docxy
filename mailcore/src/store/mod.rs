@@ -16,10 +16,10 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use crate::graph::client::{AttendeeInput, ContactFieldSet, EventFieldSet, event_zone_error};
 use crate::graph::model::{
-    AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Calendar, ContactFields, Event,
-    EventRecurrence, FolderContact, MailFolder, MasterCategory, MeetingMessageType, Message,
-    MessageFields, MessageHeader, MessageProtection, PhysicalAddress, Recipient, Recurrence,
-    Sensitivity, is_stored_header, meeting_link_in,
+    AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Calendar, ContactFields,
+    DraftOptions, Event, EventRecurrence, FolderContact, MailFolder, MasterCategory,
+    MeetingMessageType, Message, MessageFields, MessageHeader, MessageProtection, PhysicalAddress,
+    Recipient, Recurrence, Sensitivity, is_stored_header, meeting_link_in, reminder_time,
 };
 use crate::json::{self, Value};
 
@@ -3851,6 +3851,41 @@ impl Store {
             params![id, body_html],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Sets a draft's importance and follow-up flag (#1955), which the next
+    /// `SaveDraft` / `SendDraft` sends in its create or PATCH; a host calls
+    /// it alongside `update_draft_fields`. `id` is the draft's `local:` id
+    /// (still after `reconcile_id`, #1884) or its Graph id.
+    ///
+    /// An unflagged draft keeps no due time and no reminder; a due time
+    /// that cannot be read (`model::reminder_time`) is stored as `""`, the
+    /// flag kept. The row's unsaved-edit generation goes up (`local_edit`,
+    /// #1871), so a fresh delta does not overwrite the options until a push
+    /// clears it.
+    ///
+    /// Only a draft row (`is_draft = 1`) is written: a gone id, a received
+    /// message or a draft already sent changes nothing and is no error, as
+    /// its bumped `local_edit`, which only a draft's push clears, would keep
+    /// its deltas out for good.
+    pub fn set_draft_options(&self, id: &str, opts: &DraftOptions) -> Result<(), StoreError> {
+        self.conn.execute(
+            concat!(
+                "UPDATE messages SET importance = ?2, is_flagged = ?3,
+                                     flag_due_at = CASE WHEN ?3 THEN ?4 ELSE '' END,
+                                     is_reminder_on = is_reminder_on AND ?3,
+                                     local_edit = local_edit + 1
+                 WHERE is_draft = 1 AND ",
+                draft_row_sql!()
+            ),
+            params![
+                id,
+                opts.importance.as_graph(),
+                opts.flagged,
+                reminder_time(&opts.flag_due_utc)
+            ],
+        )?;
         Ok(())
     }
 
@@ -17738,6 +17773,152 @@ mod draft_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// High importance, flagged, due 2026-12-01 17:00 UTC (#1955).
+    fn high_flagged() -> DraftOptions {
+        DraftOptions {
+            importance: crate::graph::model::Importance::High,
+            flagged: true,
+            flag_due_utc: "2026-12-01T17:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn set_draft_options_stores_importance_and_flag() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("Sub", "a@x", "", "body").unwrap();
+        assert_eq!(s.local_edit_generation(&id).unwrap(), 0);
+        s.set_draft_options(&id, &high_flagged()).unwrap();
+        let (row, body) = s.draft(&id).unwrap().unwrap();
+        assert_eq!(row.importance, "high");
+        assert!(row.is_flagged);
+        assert_eq!(row.flag_due_at, "2026-12-01T17:00:00Z");
+        // The other fields are left as they were.
+        assert_eq!(
+            (row.subject.as_str(), body.content.as_str()),
+            ("Sub", "body")
+        );
+        assert_eq!(s.local_edit_generation(&id).unwrap(), 1);
+    }
+
+    #[test]
+    fn set_draft_options_reaches_a_reconciled_local_id() {
+        let s = Store::open_in_memory().unwrap();
+        let local = s.create_local_draft("Sub", "", "", "body").unwrap();
+        s.reconcile_id(&local, "G1").unwrap();
+        let low = DraftOptions {
+            importance: crate::graph::model::Importance::Low,
+            ..DraftOptions::default()
+        };
+        s.set_draft_options(&local, &low).unwrap();
+        let row = s.message_row("G1").unwrap().unwrap();
+        assert_eq!(row.importance, "low");
+        assert!(!row.is_flagged);
+        assert_eq!(s.local_edit_generation("G1").unwrap(), 1);
+        // The Graph id reaches it too.
+        s.set_draft_options("G1", &high_flagged()).unwrap();
+        assert_eq!(s.message_row("G1").unwrap().unwrap().importance, "high");
+    }
+
+    #[test]
+    fn set_draft_options_unflagged_clears_the_due_and_a_bad_due_is_empty() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s.create_local_draft("Sub", "", "", "body").unwrap();
+        s.set_draft_options(&id, &high_flagged()).unwrap();
+        // A reminder on the flagged row (as a delta of a flagged draft
+        // would leave it) goes with the flag.
+        s.conn
+            .execute(
+                "UPDATE messages SET is_reminder_on = 1 WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        let unflagged = DraftOptions {
+            flagged: false,
+            ..high_flagged()
+        };
+        s.set_draft_options(&id, &unflagged).unwrap();
+        let (row, _) = s.draft(&id).unwrap().unwrap();
+        assert!(!row.is_flagged);
+        assert_eq!(row.flag_due_at, "");
+        assert!(!row.is_reminder_on);
+        assert_eq!(row.importance, "high");
+        // A due time with an offset cannot be read: no due, the flag kept.
+        let bad_due = DraftOptions {
+            flag_due_utc: "2026-12-01T17:00:00+02:00".into(),
+            ..high_flagged()
+        };
+        s.set_draft_options(&id, &bad_due).unwrap();
+        let (row, _) = s.draft(&id).unwrap().unwrap();
+        assert!(row.is_flagged);
+        assert_eq!(row.flag_due_at, "");
+        // A due time without its `Z` is read as UTC and stored with one.
+        let bare = DraftOptions {
+            flag_due_utc: "2026-12-01T17:00:00".into(),
+            ..high_flagged()
+        };
+        s.set_draft_options(&id, &bare).unwrap();
+        assert_eq!(
+            s.draft(&id).unwrap().unwrap().0.flag_due_at,
+            "2026-12-01T17:00:00Z"
+        );
+    }
+
+    #[test]
+    fn set_draft_options_leaves_a_non_draft_alone() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&MailFolder {
+            id: "F1".into(),
+            display_name: "Inbox".into(),
+            parent_id: None,
+            total_count: 1,
+            unread_count: 0,
+            well_known_name: Some("inbox".into()),
+        })
+        .unwrap();
+        let received = Message::from_json(
+            &json::parse(
+                r#"{"id":"R1","subject":"s","importance":"normal",
+                    "receivedDateTime":"2026-11-01T00:00:00Z","isDraft":false,
+                    "flag":{"flagStatus":"notFlagged"}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        s.upsert_message("F1", &received).unwrap();
+        let before = s.message_row("R1").unwrap().unwrap();
+        s.set_draft_options("R1", &high_flagged()).unwrap();
+        assert_eq!(s.message_row("R1").unwrap().unwrap(), before);
+        assert_eq!(s.local_edit_generation("R1").unwrap(), 0);
+        // A gone id is no error either.
+        s.set_draft_options("local:gone", &high_flagged()).unwrap();
+    }
+
+    #[test]
+    fn a_fresh_delta_keeps_a_draft_s_set_importance() {
+        let s = Store::open_in_memory().unwrap();
+        let local = s.create_local_draft("Sub", "", "", "body").unwrap();
+        s.reconcile_id(&local, "G1").unwrap();
+        s.set_draft_options(&local, &high_flagged()).unwrap();
+        let folder_id = s.message_row("G1").unwrap().unwrap().folder_id;
+        let server = Message::from_json(
+            &json::parse(
+                r#"{"id":"G1","subject":"Sub","importance":"normal","isDraft":true,
+                    "receivedDateTime":"2026-11-01T00:00:00Z",
+                    "flag":{"flagStatus":"notFlagged"}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !s.merge_message_unless_edited(&folder_id, &server, &MessageFields::all())
+                .unwrap()
+        );
+        let row = s.message_row("G1").unwrap().unwrap();
+        assert_eq!(row.importance, "high");
+        assert!(row.is_flagged);
+        assert_eq!(row.flag_due_at, "2026-12-01T17:00:00Z");
     }
 }
 
