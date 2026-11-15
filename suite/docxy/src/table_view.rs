@@ -349,16 +349,15 @@ fn column_mins(t: &Table, depth: usize) -> Vec<u64> {
             let Some(lack) = need.checked_sub(have).filter(|&l| l > 0) else {
                 continue;
             };
-            let weights: Vec<u64> = grid[s..s + n].iter().map(|&g| u64::from(g)).collect();
-            let total: u64 = weights.iter().sum();
+            let total: u64 = grid[s..s + n].iter().map(|&g| u64::from(g)).sum();
             let mut given = 0;
             for (k, m) in mins[s..s + n].iter_mut().enumerate() {
                 let share = if k + 1 == n {
                     lack - given
-                } else if total == 0 {
-                    lack / n as u64
                 } else {
-                    lack * weights[k] / total
+                    (lack * u64::from(grid[s + k]))
+                        .checked_div(total)
+                        .unwrap_or(lack / n as u64)
                 };
                 given += share;
                 *m = (*m + share).min(MAX_FIT_TW);
