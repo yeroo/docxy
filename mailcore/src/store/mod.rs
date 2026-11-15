@@ -2968,13 +2968,6 @@ impl Store {
         Ok(())
     }
 
-    /// The mailbox check is made (#1946): see [`Store::mailbox_check_owed`].
-    pub fn clear_mailbox_check_owed(&self) -> Result<(), StoreError> {
-        self.conn
-            .execute("DELETE FROM meta WHERE key = 'mailbox_check_owed'", [])?;
-        Ok(())
-    }
-
     /// The parents of the stored top-level folders (#1946): the distinct
     /// `parent_id`s that are not themselves stored folders, the rule
     /// `root_folder_id_on` uses. In a synced store that is the id of the
@@ -26121,10 +26114,7 @@ mod mailbox_reset_tests {
         s.set_mailbox_check_owed().unwrap();
         s.set_mailbox_check_owed().unwrap();
         assert!(s.mailbox_check_owed().unwrap());
-        s.clear_mailbox_check_owed().unwrap();
-        assert!(!s.mailbox_check_owed().unwrap());
         // Recording the root is the check: it clears an owed one.
-        s.set_mailbox_check_owed().unwrap();
         s.set_mailbox_root("ROOT_A").unwrap();
         assert!(!s.mailbox_check_owed().unwrap());
     }

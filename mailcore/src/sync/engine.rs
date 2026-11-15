@@ -346,7 +346,9 @@ pub enum SyncCommand {
     /// only when the state changes: a SignOut while already signed out still
     /// clears the file and emits `SignInRequired`, but no `State`, so a
     /// client confirms a sign-out by `SignInRequired`. The mail store and the
-    /// outbox are kept: queued ops drain after the next sign-in.
+    /// outbox are kept: queued ops drain after the next sign-in if the same
+    /// mailbox signs in; another mailbox empties the store, outbox included
+    /// ([`SyncEvent::MailboxChanged`], #1946).
     SignOut,
     /// Fetch an inline image's bytes (`GraphClient::get_attachment_bytes`)
     /// into memory for rendering in the reading pane — distinct from
@@ -1633,7 +1635,9 @@ enum Drain {
     /// sent. The caller's sync carries on.
     Deferred,
     /// Auth, throttle or transport, or the post-send sync stopping: the
-    /// caller stops too and keeps the back-off.
+    /// caller stops too and keeps the back-off. Or an owed mailbox check
+    /// (#1946) that could not be made, or that emptied the store for another
+    /// mailbox: the caller stops, as the ids it holds are gone.
     Aborted,
 }
 
@@ -4949,7 +4953,14 @@ impl Engine {
         if self.shutting_down {
             return false;
         }
-        if !self.calendar_reset_owed || self.token.is_none() || waiting(self) {
+        // Not while the mailbox check is owed (#1946): a reset owed from the
+        // last session would write this account's calendar into another
+        // mailbox's store.
+        if !self.calendar_reset_owed
+            || self.token.is_none()
+            || self.mailbox_unchecked
+            || waiting(self)
+        {
             return true;
         }
         if !self.checkpoint() {
@@ -5022,6 +5033,10 @@ impl Engine {
     /// before the drain, ends it at once ([`Drain::Aborted`]) with nothing
     /// more sent, ahead of the post-drain syncs (`sync_after_send`, the
     /// relist, a copy's contents), which the next start's pass covers.
+    ///
+    /// Nothing is sent before an interactive sign-in's mailbox check
+    /// (`check_mailbox`, #1946): one that could not be made, or that emptied
+    /// the store for another mailbox, is [`Drain::Aborted`] with no op sent.
     fn drain_outbox(&mut self) -> Drain {
         // At shutdown the queue is only persisted (#2127): the next start
         // drains it.
@@ -39358,16 +39373,6 @@ mod tests {
             routes
         }
 
-        fn any_route(method: &str, prefix: &str, status: u16, body: &str) -> Route {
-            Route {
-                method: method.into(),
-                path_prefix: prefix.into(),
-                status,
-                headers: vec![],
-                body: body.into(),
-            }
-        }
-
         /// Every request other than a GET or the token redeem: an op sent.
         fn writes(srv: &FakeServer) -> Vec<(String, String)> {
             srv.requests()
@@ -39442,6 +39447,15 @@ mod tests {
             srv: &FakeServer,
             store: Store,
         ) -> (Engine, Receiver<SyncEvent>, mpsc::Sender<SyncCommand>) {
+            engine_with(srv, store, EngineOptions::without_prefetch())
+        }
+
+        /// [`engine_on`] with the engine's `options`.
+        fn engine_with(
+            srv: &FakeServer,
+            store: Store,
+            options: EngineOptions,
+        ) -> (Engine, Receiver<SyncEvent>, mpsc::Sender<SyncCommand>) {
             let (cmd_tx, cmd_rx) = mpsc::channel();
             let (evt_tx, evt_rx) = mpsc::channel();
             let config = EngineConfig {
@@ -39452,7 +39466,7 @@ mod tests {
                 graph_base: srv.base_url.clone(),
                 auth_base: srv.base_url.clone(),
                 tick: HOUR,
-                options: EngineOptions::without_prefetch(),
+                options,
             };
             let mut engine = Engine::new(config, store, cmd_rx, evt_tx);
             engine.token = Some(TokenSet {
@@ -39642,19 +39656,50 @@ mod tests {
             assert_eq!(engine.store.pending_ops().unwrap().len(), 3);
         }
 
+        /// AC 4: the idle work (a body prefetch, a backfill page, a size
+        /// fill page) waits for an owed check: each has work, which it
+        /// takes once the check is made.
+        #[test]
+        fn the_idle_work_waits_for_the_check() {
+            let srv = FakeServer::start_limited(routes(&[(500, "")], "FA", "ROOT_A"));
+            let store = Store::open_in_memory().unwrap();
+            mailbox_a(&store, Some("ROOT_A"));
+            // A recent message with no body and no size: a prefetch and a
+            // size fill candidate; `FA`'s head is synced and its history
+            // walk is not, so a backfill page is ready.
+            let v = crate::json::parse(&message_json("MA2", false, false, &[])).unwrap();
+            let mut recent = Message::from_json(&v).unwrap();
+            recent.received = unix_to_iso8601(now_unix() - 3600);
+            store.upsert_message("FA", &recent).unwrap();
+            store
+                .set_head_link("FA", "/me/mailFolders/FA/messages/delta?token=D-FA", false)
+                .unwrap();
+            let options = EngineOptions {
+                prefetch_body_days: 30,
+                size_fill: true,
+                ..EngineOptions::without_prefetch()
+            };
+            let (mut engine, _evt_rx, _cmd_tx) = engine_with(&srv, store, options);
+            engine.backfill_done = true;
+            assert!(engine.next_prefetch().is_none());
+            assert!(engine.next_backfill().is_none());
+            assert!(engine.next_size_fill().is_none());
+            engine.mailbox_unchecked = false;
+            assert!(engine.next_prefetch().is_some());
+            assert!(engine.next_backfill().is_some());
+            assert!(engine.next_size_fill().is_some());
+            assert_eq!(probes(&srv), 0);
+        }
+
         /// AC 4: a failing probe is held off (`check_retry`, doubling), so
         /// a drain every fast tick sends one probe and one `Error`, not one
-        /// each; the idle work waits for the check too.
+        /// each.
         #[test]
         fn a_failing_probe_backs_off() {
             let srv = FakeServer::start_limited(routes(&[(500, "")], "FA", "ROOT_A"));
             let store = Store::open_in_memory().unwrap();
             mailbox_a(&store, Some("ROOT_A"));
             let (mut engine, evt_rx, _cmd_tx) = engine_on(&srv, store);
-            engine.backfill_done = true;
-            assert!(engine.next_prefetch().is_none());
-            assert!(engine.next_backfill().is_none());
-            assert!(engine.next_size_fill().is_none());
             for _ in 0..3 {
                 assert!(matches!(engine.drain_outbox(), Drain::Aborted));
             }
@@ -39666,6 +39711,25 @@ mod tests {
             assert!(matches!(engine.drain_outbox(), Drain::Aborted));
             assert_eq!(probes(&srv), 2);
             assert_eq!(engine.check_backoff, BACKOFF_MIN * 4);
+        }
+
+        /// r1 m1: a calendar reset owed from the last session does not run
+        /// after a sign-in whose check could not be made: this account's
+        /// calendar would land in another mailbox's store.
+        #[test]
+        fn an_owed_calendar_reset_waits_for_the_check() {
+            let srv = FakeServer::start_limited(routes(&[(500, "")], "FA", "ROOT_A"));
+            let store = Store::open_in_memory().unwrap();
+            mailbox_a(&store, Some("ROOT_A"));
+            let (mut engine, _evt_rx, _cmd_tx) = engine_on(&srv, store);
+            engine.calendar_reset_owed = true;
+            engine.handle_command(SyncCommand::Refresh);
+            let paths: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
+            assert!(
+                paths.iter().all(|p| p.starts_with(PROBE)),
+                "the probe alone: {paths:?}"
+            );
+            assert!(engine.calendar_reset_owed, "still owed");
         }
 
         /// AC 4: a command's drain waits for the check: the op is queued,

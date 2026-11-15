@@ -4327,7 +4327,7 @@ literally would break.
   no `openid`, so Entra sends no `id_token` and `account` is `""` (a refresh replaces it too).
 - The record: `meta.mailbox_root` (`Store::mailbox_root`, `set_mailbox_root`, which also
   clears an owed check). `meta.mailbox_check_owed` (`set_mailbox_check_owed`,
-  `mailbox_check_owed`, `clear_mailbox_check_owed`): `sign_in` writes it after the redeem and
+  `mailbox_check_owed`; cleared by recording the root or by a reset): `sign_in` writes it after the redeem and
   **before** it saves the token, and `Engine::new` reads it into `mailbox_unchecked` (a read
   error counts as owed). So a check that failed, or a process that exited before it, is made at
   the next start; a startup with a cached token and no owed check probes nothing (the token was
@@ -4348,7 +4348,9 @@ literally would break.
   `Reset` are `Drain::Aborted`, a reset after `settle_state`, so `sync_one_folder`,
   `on_fast_tick`, `clear_offline_items` and `drain_queued` stop before touching an old id), and
   `next_prefetch`, `next_backfill`, `next_size_fill` (`None` while owed). `on_tick` runs no
-  calendar refresh while owed (it would write into the other mailbox's store). Every op is
+  calendar refresh while owed, nor does `refresh_if_calendar_reset_owed` (a reset owed from the
+  last session, run after `sign_in`'s and `Refresh`'s pass): either would write this account's
+  calendar into the other mailbox's store. Every op is
   sent from inside `drain_outbox` (`apply_op_with_retry`, the bulk runs, `run_delete_folder`,
   `sync_after_send`). Not gated: the direct commands (`FetchBody`, `SearchMessages`,
   `RespondMeeting`, `SetAutomaticReplies`, `RefreshCalendar`, …) act for the account signed in
@@ -4398,7 +4400,8 @@ literally would break.
   `graph::client::tests::mailbox_root_id_*`; `sync::engine::tests::mailbox_change` (a
   different mailbox resets before any op, the same one drains after the probe, the legacy
   rule, a failed check said once and retried by `Refresh`, a throttled one through `react`,
-  the probe's hold-off and the idle gates, a command's drain waits, a reset found by a drain
+  the probe's hold-off, the idle work waiting with work to take
+  (`the_idle_work_waits_for_the_check`), an owed calendar reset waiting, a command's drain waits, a reset found by a drain
   stops its caller, no probe at a startup, an owed check made at the next start, `sign_in`
   owes it in the store). The loopback sign-in tests list the probe first (`probe_route`,
   `with_probe`, `with_probe_limited`): the fake server matches by prefix. lookxy:

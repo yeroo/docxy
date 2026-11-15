@@ -982,16 +982,18 @@ impl GraphClient {
         }
     }
 
-    /// The path of [`GraphClient::mailbox_root_id`]'s request (#1946).
-    pub const MAILBOX_ROOT_PATH: &'static str = "/me/mailFolders/msgfolderroot?$select=id";
-
     /// GET `/me/mailFolders/msgfolderroot?$select=id` (#1946): the id of the
     /// signed-in mailbox's root folder, which names the mailbox (Graph ids
     /// are mailbox-scoped) and is the `parentFolderId` of every top-level
     /// folder `list_folders` stores. An answer without a string `id` is a
     /// `Parse` error.
     pub fn mailbox_root_id(&self) -> Result<String, GraphError> {
-        let resp = self.send(Method::Get, Self::MAILBOX_ROOT_PATH, None, &[])?;
+        let resp = self.send(
+            Method::Get,
+            "/me/mailFolders/msgfolderroot?$select=id",
+            None,
+            &[],
+        )?;
         parse_body(resp)?
             .get("id")
             .and_then(Value::as_str)
