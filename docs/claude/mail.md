@@ -4547,7 +4547,7 @@ event (not a separate event before it), so a client never sees the request witho
 `State(SignInRequired)` with no event, as before.
 
 - **`Expired`**: the token endpoint refused the grant (`AuthError::needs_sign_in`). `code` is
-  the OAuth `error`, trimmed and ASCII-lowercased. `aadsts` is `AuthError::aadsts()`: `Some(n)`
+  `AuthError::refusal_code()`, the OAuth `error` trimmed and ASCII-lowercased. `aadsts` is `AuthError::aadsts()`: `Some(n)`
   only for a `Denied` whose description, with leading whitespace trimmed, starts
   `AADSTS<digits>:` and whose digits fit a `u32`. A token with no refresh token
   (`try_refresh` asks nothing) is `Expired` with an empty `code` and no number.
@@ -4579,7 +4579,8 @@ event (not a separate event before it), so a client never sees the request witho
 
   The `Required` modal is 50% high, not 30%, so a long reason still leaves the prompt in view
   at 80x24. Enter, Esc and `r` are unchanged.
-- Tests: `auth::tests::aadsts_is_the_number_before_the_colon`. In `sync::engine::tests`:
+- Tests: `auth::tests::{aadsts_is_the_number_before_the_colon,
+  refusal_code_is_the_trimmed_lowercased_error}`. In `sync::engine::tests`:
   - `a_corrupt_token_file_is_an_unreadable_saved_sign_in`;
   - `a_refused_refresh_at_start_keeps_the_code_and_the_aadsts_number` and
     `interaction_required_after_a_401_is_expired_with_its_code`, each of which checks that the

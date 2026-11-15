@@ -41,8 +41,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     };
 
     // `Required` says why before its prompt (#2169): at 80x24 the 30%
-    // rect leaves 5 text rows, which an AADSTS line pushes the prompt out
-    // of, so it gets half the height.
+    // rect leaves 6 text rows, too few for a long reason and the prompt,
+    // so it gets half the height.
     let height = match modal {
         SignInModal::Required { .. } => 50,
         _ => 30,

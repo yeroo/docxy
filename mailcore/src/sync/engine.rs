@@ -9793,15 +9793,14 @@ enum Refresh {
 }
 
 /// A refresh the token endpoint refused (`AuthError::needs_sign_in`) as a
-/// [`SignInReason::Expired`] (#2169): the OAuth code, trimmed and
-/// lowercased, and the AADSTS number; never the description text.
+/// [`SignInReason::Expired`] (#2169): the OAuth code
+/// (`AuthError::refusal_code`) and the AADSTS number; never the
+/// description text. `needs_sign_in` admits only `Denied`, so the code is
+/// always there; the empty `code` of a token with no refresh token comes
+/// from `try_refresh`, not from here.
 fn expired(e: &auth::AuthError) -> SignInReason {
-    let code = match e {
-        auth::AuthError::Denied { error, .. } => error.trim().to_ascii_lowercase(),
-        _ => String::new(),
-    };
     SignInReason::Expired {
-        code,
+        code: e.refusal_code().unwrap_or_default(),
         aadsts: e.aadsts(),
     }
 }

@@ -130,6 +130,17 @@ impl AuthError {
         }
     }
 
+    /// The OAuth `error` code of a refusal, trimmed and ASCII-lowercased
+    /// (#2169), as [`AuthError::needs_sign_in`] compares it: `Some` for
+    /// [`AuthError::Denied`] (its code may be empty), `None` for any other
+    /// error.
+    pub fn refusal_code(&self) -> Option<String> {
+        match self {
+            AuthError::Denied { error, .. } => Some(error.trim().to_ascii_lowercase()),
+            AuthError::Http(_) | AuthError::Status { .. } | AuthError::Parse(_) => None,
+        }
+    }
+
     /// The Entra error number of a refusal (#2169): `Some(n)` when this is
     /// [`AuthError::Denied`] whose `error_description`, leading whitespace
     /// trimmed, starts `AADSTS<n>:` with `n` fitting a `u32`
@@ -629,6 +640,31 @@ mod tests {
         assert_eq!(e.to_string(), "authorization denied: AADSTS50076: MFA");
         // A refusal served with a 5xx is still a refusal.
         assert!(classify_error(500, r#"{"error":"invalid_grant"}"#).needs_sign_in());
+    }
+
+    /// #2169: a refusal's code is trimmed and lowercased; only `Denied`
+    /// has one.
+    #[test]
+    fn refusal_code_is_the_trimmed_lowercased_error() {
+        let denied = |error: &str| AuthError::Denied {
+            error: error.into(),
+            description: Some("AADSTS70008: x".into()),
+        };
+        assert_eq!(
+            denied(" Invalid_Grant\t").refusal_code().as_deref(),
+            Some("invalid_grant")
+        );
+        assert_eq!(denied("").refusal_code().as_deref(), Some(""));
+        for other in [
+            AuthError::Http("invalid_grant".into()),
+            AuthError::Status {
+                status: 400,
+                body: "invalid_grant".into(),
+            },
+            AuthError::Parse("invalid_grant".into()),
+        ] {
+            assert_eq!(other.refusal_code(), None, "{other:?}");
+        }
     }
 
     /// #2169: the AADSTS number is the digits between `AADSTS` and the
