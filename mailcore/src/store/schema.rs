@@ -77,6 +77,13 @@ CREATE TABLE IF NOT EXISTS messages (
     -- since. Non-zero: the row holds fields Graph has not seen, which a
     -- fresh delta must not overwrite.
     local_edit      INTEGER NOT NULL DEFAULT 0,
+    -- A draft's importance and flag were set here since its last push
+    -- (#1955): `set_draft_options` sets it, the push's `clear_local_edit`
+    -- clears it with `local_edit`. A PATCH sends the draft's `flag` only
+    -- while it is set, so a flag the row cannot hold (`complete`, a start
+    -- date other than the due) survives a plain save. An old file gets it
+    -- in `Store::init`, with no delta reset.
+    draft_options_set INTEGER NOT NULL DEFAULT 0,
     -- A flagged message's Outlook reminder (#2054): on (never on an
     -- unflagged row), the time it was set for and when it fires next, and
     -- the flag's due time, all `YYYY-MM-DDTHH:MM:SSZ` or ''. An old file

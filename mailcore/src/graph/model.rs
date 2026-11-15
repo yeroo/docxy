@@ -71,6 +71,53 @@ impl Recipient {
     }
 }
 
+/// A message's importance (Graph `importance`, #1955).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Importance {
+    Low,
+    #[default]
+    Normal,
+    High,
+}
+
+impl Importance {
+    /// A stored or Graph value read leniently: `low`, `normal` or `high` in
+    /// any case; anything else (`""`, an unknown word) is `Normal`, never an
+    /// error (#1955).
+    pub fn from_stored(s: &str) -> Self {
+        let s = s.trim();
+        if s.eq_ignore_ascii_case("low") {
+            Importance::Low
+        } else if s.eq_ignore_ascii_case("high") {
+            Importance::High
+        } else {
+            Importance::Normal
+        }
+    }
+
+    /// Graph's word for it, which is also what the store keeps.
+    pub fn as_graph(self) -> &'static str {
+        match self {
+            Importance::Low => "low",
+            Importance::Normal => "normal",
+            Importance::High => "high",
+        }
+    }
+}
+
+/// What a draft carries besides its subject, recipients and body (#1955):
+/// what `Store::set_draft_options` stores on the draft's row and
+/// `GraphClient::create_draft` / `update_draft` send with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DraftOptions {
+    pub importance: Importance,
+    /// The draft's follow-up flag (`flag.flagStatus` `flagged`).
+    pub flagged: bool,
+    /// The flag's due time, UTC `YYYY-MM-DDTHH:MM:SSZ`, or `""` for none.
+    /// Ignored when not flagged; a time that cannot be read is no due time.
+    pub flag_due_utc: String,
+}
+
 /// One entry from Graph `/me/people`: a display name, the person's primary
 /// email address, and their 0-based rank in the relevance-ordered response
 /// (0 = most relevant).
@@ -2720,6 +2767,20 @@ mod tests {
 
     fn user(raw: &str) -> Option<DirectoryUser> {
         DirectoryUser::from_json(&parse(raw).unwrap())
+    }
+
+    #[test]
+    fn importance_from_stored_is_lenient() {
+        assert_eq!(Importance::from_stored("low"), Importance::Low);
+        assert_eq!(Importance::from_stored("HIGH"), Importance::High);
+        assert_eq!(Importance::from_stored(" High "), Importance::High);
+        assert_eq!(Importance::from_stored("normal"), Importance::Normal);
+        assert_eq!(Importance::from_stored(""), Importance::Normal);
+        assert_eq!(Importance::from_stored("urgent"), Importance::Normal);
+        for i in [Importance::Low, Importance::Normal, Importance::High] {
+            assert_eq!(Importance::from_stored(i.as_graph()), i);
+        }
+        assert_eq!(Importance::default(), Importance::Normal);
     }
 
     #[test]

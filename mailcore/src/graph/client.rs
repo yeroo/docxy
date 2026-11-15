@@ -10,11 +10,11 @@
 
 use crate::graph::model::{
     AttachmentMeta, AutomaticReplies, Body, Calendar, ContactFields, DeltaPage, DirectoryUser,
-    Event, EventDeltaItem, EventDeltaPage, EventRecurrence, FolderContact, FolderListing,
-    MailFolder, MasterCategory, Me, MeetingMessage, Message, MessageFields, MessageHeader,
-    OofStatus, Person, PhysicalAddress, REMINDER_SET_PROP, REMINDER_SIGNAL_TIME_PROP, Recipient,
-    Recurrence, ScheduleEntry, SearchHit, SubtreeItems, is_event_message_type, parse_message_size,
-    plain_to_html, to_utc,
+    DraftOptions, Event, EventDeltaItem, EventDeltaPage, EventRecurrence, FolderContact,
+    FolderListing, MailFolder, MasterCategory, Me, MeetingMessage, Message, MessageFields,
+    MessageHeader, OofStatus, Person, PhysicalAddress, REMINDER_SET_PROP,
+    REMINDER_SIGNAL_TIME_PROP, Recipient, Recurrence, ScheduleEntry, SearchHit, SubtreeItems,
+    is_event_message_type, parse_message_size, plain_to_html, reminder_time, to_utc,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -1905,7 +1905,8 @@ impl GraphClient {
             .ok_or_else(|| GraphError::Parse("malformed forward draft".to_string()))
     }
 
-    /// POST `/me/messages` with a new draft's subject/body/recipients;
+    /// POST `/me/messages` with a new draft's subject/body/recipients and
+    /// its importance and follow-up flag (`opts`, #1955);
     /// Graph creates it (implicitly as a draft — no `isDraft` field needed,
     /// that's the default for a message created this way) and returns it
     /// with its minted id, which callers need for later `update_draft` /
@@ -1917,15 +1918,21 @@ impl GraphClient {
         to: &[Recipient],
         cc: &[Recipient],
         bcc: &[Recipient],
+        opts: &DraftOptions,
     ) -> Result<Message, GraphError> {
-        let body = draft_body_json(body_html, subject, to, cc, bcc);
+        let body = draft_body_json(body_html, subject, to, cc, bcc, opts, true);
         let resp = self.send(Method::Post, "/me/messages", Some(body), &[])?;
         let v = parse_body(resp)?;
         Message::from_json(&v).ok_or_else(|| GraphError::Parse("malformed draft".to_string()))
     }
 
-    /// PATCH `/me/messages/{id}` with the same subject/body/recipients
-    /// shape as `create_draft`, overwriting an existing draft in place.
+    /// PATCH `/me/messages/{id}` with the same subject/body/recipients,
+    /// importance and flag shape as `create_draft`, overwriting an existing
+    /// draft in place. The `flag` goes only with `send_flag` (#1955): the
+    /// draft's options were set here since its last push. Without it the
+    /// server's flag is left as it is, as the store cannot hold every flag
+    /// (`complete`, a start date other than the due).
+    #[allow(clippy::too_many_arguments)]
     pub fn update_draft(
         &self,
         id: &str,
@@ -1934,10 +1941,12 @@ impl GraphClient {
         to: &[Recipient],
         cc: &[Recipient],
         bcc: &[Recipient],
+        opts: &DraftOptions,
+        send_flag: bool,
     ) -> Result<(), GraphError> {
         let id = encode_path_segment(id);
         let path = format!("/me/messages/{id}");
-        let body = draft_body_json(body_html, subject, to, cc, bcc);
+        let body = draft_body_json(body_html, subject, to, cc, bcc, opts, send_flag);
         self.send(Method::Patch, &path, Some(body), &[])?;
         Ok(())
     }
@@ -3132,15 +3141,28 @@ fn utc_datetime_obj(utc: &str) -> Value {
 
 /// Builds the JSON body shared by `create_draft` and `update_draft`:
 /// `{"subject":…, "body":{"contentType":"HTML","content":…},
-/// "toRecipients":[…], "ccRecipients":[…], "bccRecipients":[…]}`.
+/// "toRecipients":[…], "ccRecipients":[…], "bccRecipients":[…],
+/// "importance":…, "flag":{…}}`.
+///
+/// `importance` always goes (#1955), as the store keeps Graph's value as
+/// it came; `flag` goes with `send_flag` (always on a create, on a PATCH
+/// only when the host set the options since the last push). A draft given
+/// no options sends `normal` and `notFlagged`, Graph's own defaults. The
+/// flag is `{"flagStatus":"notFlagged"}`, or
+/// `{"flagStatus":"flagged"}` with, when its due time can be read,
+/// `startDateTime` and `dueDateTime` both at that time
+/// (`graph_utc_wall_clock`): Graph refuses a due date without a start, and
+/// a draft keeps no start date of its own.
 fn draft_body_json(
     body_html: &str,
     subject: &str,
     to: &[Recipient],
     cc: &[Recipient],
     bcc: &[Recipient],
+    opts: &DraftOptions,
+    send_flag: bool,
 ) -> String {
-    Value::Object(vec![
+    let mut obj = vec![
         ("subject".to_string(), Value::Str(subject.to_string())),
         (
             "body".to_string(),
@@ -3152,8 +3174,31 @@ fn draft_body_json(
         ("toRecipients".to_string(), recipients_json(to)),
         ("ccRecipients".to_string(), recipients_json(cc)),
         ("bccRecipients".to_string(), recipients_json(bcc)),
-    ])
-    .to_string()
+        (
+            "importance".to_string(),
+            Value::Str(opts.importance.as_graph().to_string()),
+        ),
+    ];
+    if send_flag {
+        obj.push(("flag".to_string(), draft_flag_json(opts)));
+    }
+    Value::Object(obj).to_string()
+}
+
+/// A draft's Graph `flag` (#1955); see `draft_body_json`.
+fn draft_flag_json(opts: &DraftOptions) -> Value {
+    let status = if opts.flagged {
+        "flagged"
+    } else {
+        "notFlagged"
+    };
+    let mut flag = vec![("flagStatus".to_string(), Value::Str(status.to_string()))];
+    let due = reminder_time(&opts.flag_due_utc);
+    if opts.flagged && !due.is_empty() {
+        flag.push(("startDateTime".to_string(), graph_utc_wall_clock(&due)));
+        flag.push(("dueDateTime".to_string(), graph_utc_wall_clock(&due)));
+    }
+    Value::Object(flag)
 }
 
 /// The `$select` of `contacts` and `contact` (#2063): the id, the change
@@ -3591,7 +3636,7 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::model::MeetingMessageType;
+    use crate::graph::model::{Importance, MeetingMessageType};
     use crate::testserver::{FakeServer, Route};
 
     #[test]
@@ -5391,7 +5436,16 @@ mod tests {
             name: "Cara".to_string(),
             address: "cara@x".to_string(),
         }];
-        let draft = c.create_draft("<p>hi</p>", "Hello", &to, &cc, &[]).unwrap();
+        let draft = c
+            .create_draft(
+                "<p>hi</p>",
+                "Hello",
+                &to,
+                &cc,
+                &[],
+                &DraftOptions::default(),
+            )
+            .unwrap();
         assert_eq!(draft.id, "NEWDRAFT");
         let reqs = srv.requests();
         assert_eq!(reqs[0].method, "POST");
@@ -5446,7 +5500,7 @@ mod tests {
             name: "S".into(),
             address: "secret@x".into(),
         }];
-        let _ = c.create_draft("<p>hi</p>", "Sub", &to, &[], &bcc);
+        let _ = c.create_draft("<p>hi</p>", "Sub", &to, &[], &bcc, &DraftOptions::default());
         let reqs = srv.requests();
         let sent = json::parse(&reqs[0].body).unwrap();
         let bccs = sent.get("bccRecipients").and_then(Value::as_array).unwrap();
@@ -5470,8 +5524,17 @@ mod tests {
             body: "{}".into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
-        c.update_draft("M1", "<p>edit</p>", "Subj", &[], &[], &[])
-            .unwrap();
+        c.update_draft(
+            "M1",
+            "<p>edit</p>",
+            "Subj",
+            &[],
+            &[],
+            &[],
+            &DraftOptions::default(),
+            false,
+        )
+        .unwrap();
         let reqs = srv.requests();
         assert_eq!(reqs[0].method, "PATCH");
         let sent = json::parse(&reqs[0].body).unwrap();
@@ -5482,6 +5545,123 @@ mod tests {
                 .and_then(Value::as_str),
             Some("HTML")
         );
+    }
+
+    /// High importance, flagged, due 2026-12-01 17:00 UTC (#1955).
+    fn flagged_high() -> DraftOptions {
+        DraftOptions {
+            importance: Importance::High,
+            flagged: true,
+            flag_due_utc: "2026-12-01T17:00:00Z".into(),
+        }
+    }
+
+    /// The tail `draft_body_json` puts after `bccRecipients` for
+    /// `flagged_high` (#1955).
+    const FLAGGED_HIGH_TAIL: &str = r#""bccRecipients":[],"importance":"high","flag":{"flagStatus":"flagged","startDateTime":{"dateTime":"2026-12-01T17:00:00","timeZone":"UTC"},"dueDateTime":{"dateTime":"2026-12-01T17:00:00","timeZone":"UTC"}}}"#;
+
+    #[test]
+    fn create_draft_sends_importance_and_flag() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/messages".into(),
+            status: 201,
+            headers: vec![],
+            body: sample_message_json("NEWDRAFT"),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.create_draft("<p>hi</p>", "Hello", &[], &[], &[], &flagged_high())
+            .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "POST");
+        assert!(
+            reqs[0].body.ends_with(FLAGGED_HIGH_TAIL),
+            "body: {}",
+            reqs[0].body
+        );
+    }
+
+    #[test]
+    fn update_draft_sends_importance_and_flag() {
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/messages/M1".into(),
+            status: 200,
+            headers: vec![],
+            body: "{}".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let opts = flagged_high();
+        c.update_draft("M1", "<p>e</p>", "S", &[], &[], &[], &opts, true)
+            .unwrap();
+        // Without `send_flag` the server's flag is left alone; the
+        // importance still goes.
+        c.update_draft("M1", "<p>e</p>", "S", &[], &[], &[], &opts, false)
+            .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "PATCH");
+        assert!(
+            reqs[0].body.ends_with(FLAGGED_HIGH_TAIL),
+            "body: {}",
+            reqs[0].body
+        );
+        assert!(
+            reqs[1]
+                .body
+                .ends_with(r#""bccRecipients":[],"importance":"high"}"#),
+            "body: {}",
+            reqs[1].body
+        );
+    }
+
+    #[test]
+    fn draft_body_defaults_to_normal_and_not_flagged() {
+        let tail =
+            r#""bccRecipients":[],"importance":"normal","flag":{"flagStatus":"notFlagged"}}"#;
+        let body = draft_body_json(
+            "<p>x</p>",
+            "S",
+            &[],
+            &[],
+            &[],
+            &DraftOptions::default(),
+            true,
+        );
+        assert!(body.ends_with(tail), "body: {body}");
+        // Not flagged: a due time is not sent.
+        let unflagged = DraftOptions {
+            importance: Importance::Low,
+            flagged: false,
+            flag_due_utc: "2026-12-01T17:00:00Z".into(),
+        };
+        let body = draft_body_json("<p>x</p>", "S", &[], &[], &[], &unflagged, true);
+        assert!(
+            body.ends_with(r#""importance":"low","flag":{"flagStatus":"notFlagged"}}"#),
+            "body: {body}"
+        );
+        // Flagged with a due time that cannot be read: a bare flag.
+        let bad_due = DraftOptions {
+            importance: Importance::Normal,
+            flagged: true,
+            flag_due_utc: "2026-12-01T17:00:00+02:00".into(),
+        };
+        let body = draft_body_json("<p>x</p>", "S", &[], &[], &[], &bad_due, true);
+        assert!(
+            body.ends_with(r#""importance":"normal","flag":{"flagStatus":"flagged"}}"#),
+            "body: {body}"
+        );
+        // What is sent is what a delta reads back.
+        let sent = json::parse(&draft_body_json(
+            "<p>x</p>",
+            "S",
+            &[],
+            &[],
+            &[],
+            &flagged_high(),
+            true,
+        ))
+        .unwrap();
+        assert!(crate::graph::model::parse_flag(&sent));
     }
 
     #[test]
@@ -5536,7 +5716,7 @@ mod tests {
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
         assert!(matches!(
-            c.create_draft("x", "y", &[], &[], &[]),
+            c.create_draft("x", "y", &[], &[], &[], &DraftOptions::default()),
             Err(GraphError::Unauthorized)
         ));
     }
