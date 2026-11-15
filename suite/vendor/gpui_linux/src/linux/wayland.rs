@@ -1,3 +1,5 @@
+// Modified for docxy (#1966): `rich_clipboard` made public.
+
 mod client;
 mod clipboard;
 mod cursor;
@@ -10,6 +12,8 @@ mod window;
 pub mod layer_shell;
 
 pub(crate) use client::*;
+// The clipboard's extra formats, public for an app on top of gpui (#1966).
+pub use client::rich_clipboard;
 
 use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape;
 

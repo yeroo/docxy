@@ -1,3 +1,5 @@
+// Modified for docxy (#1966): a copy's extra formats (RTF/HTML) beside its text.
+
 use std::{
     fs::File,
     io::{ErrorKind, Write},
@@ -7,7 +9,10 @@ use std::{
 use calloop::{LoopHandle, PostAction};
 use filedescriptor::Pipe;
 use strum::IntoEnumIterator;
-use wayland_client::{Connection, protocol::wl_data_offer::WlDataOffer};
+use wayland_client::{
+    Connection,
+    protocol::{wl_data_offer::WlDataOffer, wl_data_source::WlDataSource},
+};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
 
 use crate::linux::{
@@ -15,6 +20,9 @@ use crate::linux::{
     platform::{PIPE_READ_TIMEOUT, read_fd_with_timeout},
 };
 use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
+
+mod formats;
+pub(crate) use formats::{OwnCopy, Whose, same_text, whose};
 
 /// Text mime types that we'll offer to other programs.
 pub(crate) const TEXT_MIME_TYPES: [&str; 3] =
@@ -38,6 +46,10 @@ pub(crate) struct Clipboard {
     current_offer: Option<DataOffer<WlDataOffer>>,
     cached_primary_read: Option<ClipboardItem>,
     current_primary_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>,
+
+    // gpui's latest copy as the selection, and its formats beside the text
+    // (#1966).
+    own: OwnCopy<WlDataSource>,
 }
 
 pub(crate) trait ReceiveData {
@@ -91,6 +103,29 @@ impl<T: ReceiveData> DataOffer<T> {
 
         match read_fd_with_timeout(fd, PIPE_READ_TIMEOUT) {
             Ok(bytes) => Some(bytes),
+            Err(err) => {
+                log::error!("error reading clipboard pipe: {err:?}");
+                None
+            }
+        }
+    }
+
+    /// `mime` read, `None` past `max` bytes, empty, or on error (#1966).
+    fn read_bytes_bounded(
+        &self,
+        connection: &Connection,
+        mime_type: &str,
+        max: usize,
+    ) -> Option<Vec<u8>> {
+        let pipe = Pipe::new().ok()?;
+        self.inner.receive_data(mime_type.to_string(), unsafe {
+            BorrowedFd::borrow_raw(pipe.write.as_raw_fd())
+        });
+        let fd = pipe.read;
+        drop(pipe.write);
+        connection.flush().ok()?;
+        match formats::read_fd_bounded(fd, PIPE_READ_TIMEOUT, max) {
+            Ok(bytes) => bytes.filter(|bytes| !bytes.is_empty()),
             Err(err) => {
                 log::error!("error reading clipboard pipe: {err:?}");
                 None
@@ -155,11 +190,92 @@ impl Clipboard {
             current_offer: None,
             cached_primary_read: None,
             current_primary_offer: None,
+
+            own: OwnCopy::new(),
         }
     }
 
     pub fn set(&mut self, item: ClipboardItem) {
         self.contents = Some(item);
+        self.own.copied();
+    }
+
+    /// `source` was just set as the selection for `contents` (#1966).
+    pub fn set_source(&mut self, source: WlDataSource) {
+        self.own.set_source(source);
+    }
+
+    /// The compositor cancelled `source` (#1966).
+    pub fn source_cancelled(&mut self, source: &WlDataSource) {
+        self.own.cancelled(source);
+    }
+
+    /// Whether gpui's latest copy is still the selection and its text is
+    /// `text`: the copy the suite adds formats to (#1966).
+    pub fn own_copy_is(&self, text: &str) -> bool {
+        self.own.alive()
+            && self
+                .contents
+                .as_ref()
+                .and_then(|contents| contents.text())
+                .is_some_and(|held| same_text(&held, text))
+    }
+
+    /// Add `formats` beside the text of gpui's copy (#1966).
+    pub fn merge_formats(&mut self, formats: Vec<(String, Vec<u8>)>) {
+        self.own.merge(formats);
+    }
+
+    /// What a source for gpui's copy offers: text, formats, `pid/<pid>` (#1966).
+    pub fn own_mime_types(&self) -> Vec<String> {
+        self.own.mime_types(&TEXT_MIME_TYPES, &self.self_mime)
+    }
+
+    /// Send what is queued to the compositor (#1966).
+    pub fn flush(&self) -> Result<(), wayland_client::backend::WaylandError> {
+        self.connection.flush()
+    }
+
+    fn whose(&self) -> Whose {
+        whose(
+            self.own.alive(),
+            self.current_offer
+                .as_ref()
+                .map(|offer| offer.has_mime_type(&self.self_mime)),
+        )
+    }
+
+    /// The selection's mime types (#1966).
+    pub fn mime_types(&self) -> Option<Vec<String>> {
+        match self.whose() {
+            Whose::Own => Some(self.own_mime_types()),
+            Whose::Offer => self
+                .current_offer
+                .as_ref()
+                .map(|offer| offer.mime_types.clone()),
+            Whose::Nothing => None,
+        }
+    }
+
+    /// The selection's `mime` read, `None` past `max` bytes, empty, or on
+    /// error (#1966). gpui's own copy from memory; another app's through
+    /// the pipe, waiting up to `PIPE_READ_TIMEOUT` as a text paste does.
+    pub fn read_format(&self, mime: &str, max: usize) -> Option<Vec<u8>> {
+        match self.whose() {
+            Whose::Own => self
+                .own
+                .bytes(mime)
+                .filter(|bytes| !bytes.is_empty() && bytes.len() <= max)
+                .map(<[u8]>::to_vec),
+            Whose::Offer => {
+                let offer = self.current_offer.as_ref()?;
+                if !offer.has_mime_type(mime) {
+                    return None;
+                }
+                offer.read_bytes_bounded(&self.connection, mime, max)
+            }
+            Whose::Nothing => None,
+        }
     }
 
     pub fn set_primary(&mut self, item: ClipboardItem) {
@@ -180,9 +296,10 @@ impl Clipboard {
         self.self_mime.clone()
     }
 
-    pub fn send(&self, _mime_type: String, fd: OwnedFd) {
-        if let Some(text) = self.contents.as_ref().and_then(|contents| contents.text()) {
-            self.send_internal(fd, text.as_bytes().to_owned());
+    pub fn send(&self, mime_type: String, fd: OwnedFd) {
+        let text = self.contents.as_ref().and_then(|contents| contents.text());
+        if let Some(bytes) = self.own.send_bytes(&mime_type, text.as_deref()) {
+            self.send_internal(fd, bytes);
         }
     }
 
@@ -197,6 +314,12 @@ impl Clipboard {
     }
 
     pub fn read(&mut self) -> Option<ClipboardItem> {
+        // gpui's own copy while its source is alive: right after a write the
+        // compositor's `selection` echo is not dispatched yet, and the offer
+        // is still the previous owner's (#1966).
+        if self.own.alive() {
+            return self.contents.clone();
+        }
         let offer = self.current_offer.as_ref()?;
         if let Some(cached) = self.cached_read.clone() {
             return Some(cached);

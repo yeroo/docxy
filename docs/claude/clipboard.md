@@ -7,8 +7,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
 - A document copy puts RTF beside its plain text (`Clip::to_rtf` in
   `docxcore/src/clip_rtf.rs`, the Save As writer with the tab's styles), added
   after gpui's text write by `suite/docxy/src/rich_clip.rs`: macOS
-  `public.rtf`, Windows "Rich Text Format", X11 `text/rtf` (#1950), nothing
-  on Wayland. It is written
+  `public.rtf`, Windows "Rich Text Format", X11 `text/rtf` (#1950), Wayland
+  `text/rtf` (#1966). It is written
   only when the text write took (`rtf_follows`). A document paste takes the
   window's own clip while the clipboard still holds its text, else the
   clipboard's RTF, else its HTML (#1950), else its text (`doc_paste_from`). A
@@ -26,7 +26,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
 - A sheet copy or cut puts an HTML table (`gridcore::clip_html::html_table`:
   display text and inline cell styles, never formulas) beside its TSV, through
   `rich_clip::write_html` (macOS `public.html`, Windows "HTML Format" as CF_HTML,
-  X11 `text/html` (#1950), nothing on Wayland), under the same `rtf_follows` read-back gate as the RTF. On
+  X11 `text/html` (#1950), Wayland `text/html` (#1966)), under the same `rtf_follows` read-back gate as the RTF. On
   a Windows OS clipboard the text ends records with CRLF (`os_text`); the
   recorded text and the harness's private clipboard stay LF.
 - A sheet paste takes the live grid clip, else another app's HTML table, else
@@ -63,7 +63,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
   never one display for two tests); with no Xvfb they skip with a note,
   except under `CI`, where they fail. The app's global clipboard is never
   opened by a test.
-- Wayland (#1966) and headless do nothing, as before.
+- Wayland is #1966's (below); headless does nothing.
 - A document paste takes our clip, else the RTF, else the HTML, else the text
   (`doc_paste_from`, on every platform): a browser's copy has HTML and no
   RTF. `Clip::from_html` (`docxcore/src/clip_html.rs`) maps the HTML import
@@ -90,3 +90,45 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
   ends on a `DestroyNotify` it waits for, and a `Reader` read that succeeds
   on a reply; one it gives up on leaves only requests on its own window,
   which nobody waits for.
+
+## HTML and RTF on Wayland: the patched gpui_linux (#1966)
+
+- Under Wayland (`gpui::guess_compositor() == "Wayland"`) `rich_clip`'s Linux
+  `imp` goes through `gpui_linux::wayland_clipboard`, which the suite's own
+  copy of gpui_linux adds (`suite/vendor/gpui_linux`: upstream at the zed rev
+  the lock pins plus `suite/vendor/gpui_linux.patch`; `suite/vendor/README.md`
+  says why and how to bump). Nothing outside gpui can do it: mutter keeps one
+  data device per client (a second one on gpui's connection takes gpui's
+  selection and drag-and-drop events), a second connection gets no selection
+  events and no serial, and GNOME has no data-control.
+- A copy: gpui writes its text as before; `add_formats(text, formats)` then
+  sets the selection again, with gpui's serial, to a source offering the text
+  mimes, `text/rtf` (or `text/html`, `html_page`) and gpui's `pid/<pid>`, but
+  only while gpui's own source is still the selection (not `cancelled`) and
+  holds `text`. gpui serves the new source (a format's bytes for its mime, the
+  text for anything else); its next copy drops the formats. Nothing flushes
+  between the two `set_selection`s, so the compositor (and a data-control
+  clipboard manager) never sees the text-only source alive.
+- gpui's `read_from_clipboard` now returns its own copy while that source is
+  alive. Before, a read right after a write saw the previous offer (the
+  compositor's `selection` echo is not dispatched yet): after another app's
+  copy, `rtf_follows` failed and `recorded_after_write` recorded the other
+  app's text. `Clipboard::set` forgets the source (a write skipped for want of
+  a serial leaves none), `set_source` follows `set_selection`, and a
+  `cancelled` forgets it only when it is the tracked one.
+- A paste: `mime_types()` (gpui's own copy's while alive, else the offer's),
+  `pick_mime` (`RTF_TYPES` in order; `text/html`, else a `text/html;…` by
+  `is_html_type`, both shared with X11), then `read(mime, MAX_RTF)`: gpui's
+  own copy from memory (never a pipe: gpui serves pipes on the waiting
+  thread), another app's through the offer's pipe, bounded, waiting up to
+  gpui's 4 s as its text paste does. HTML through `utf8_page`. `hand_over`
+  does nothing on Wayland.
+- All three calls do nothing (`false` / `None`) off the main thread, on X11
+  or headless, or while gpui's state is borrowed.
+- Tests: the patch's logic (`clipboard/formats.rs`: formats, source
+  tracking, who answers a read, the bounded pipe read) and `pick_mime`; no
+  end-to-end Wayland test (a headless compositor gives no keyboard focus, so
+  `set_selection` is refused). CI runs `scripts/vendor-gpui-linux.py --check`
+  and `cargo test -p gpui_linux --lib wayland::` (a path dependency outside
+  the suite's workspace, which `exclude`s it; the vendored manifest has an
+  empty `[workspace]`, so `cargo fmt --all` does not climb to the root one).

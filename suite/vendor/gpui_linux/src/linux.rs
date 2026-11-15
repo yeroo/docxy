@@ -1,3 +1,5 @@
+// Modified for docxy (#1966): `wayland_clipboard` made public.
+
 mod dispatcher;
 mod headless;
 mod keyboard;
@@ -19,6 +21,8 @@ pub(crate) use keyboard::*;
 pub(crate) use platform::*;
 #[cfg(any(feature = "wayland", feature = "x11"))]
 pub(crate) use text_system::*;
+#[cfg(feature = "wayland")]
+pub use wayland::rich_clipboard as wayland_clipboard;
 #[cfg(feature = "wayland")]
 pub(crate) use wayland::*;
 #[cfg(feature = "x11")]

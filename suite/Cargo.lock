@@ -1583,6 +1583,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "gpui-component-assets",
+ "gpui_linux",
  "gpui_platform",
  "gridcore",
  "helpdocs",
@@ -2520,7 +2521,6 @@ dependencies = [
 [[package]]
 name = "gpui_linux"
 version = "0.1.0"
-source = "git+https://github.com/zed-industries/zed#82766871481bfc126f8fd42a3b9f51afc9b2decd"
 dependencies = [
  "accesskit",
  "accesskit_unix",

@@ -1,0 +1,840 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 9d7360c..026da82 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,12 +1,33 @@
++# Modified for docxy (#1966): the zed workspace keys (`workspace = true`) made
++# explicit, from zed's root Cargo.toml at the same rev, so the crate builds as a
++# path dependency of the suite, its own workspace root (an empty `[workspace]`)
++# so a `cargo fmt --all` from the suite does not look for one above it.
++
++[workspace]
++
+ [package]
+ name = "gpui_linux"
+ version = "0.1.0"
+-edition.workspace = true
+-publish.workspace = true
++edition = "2024"
++publish = false
+ license = "Apache-2.0"
+ 
+-[lints]
+-workspace = true
++[lints.rust]
++unexpected_cfgs = { level = "allow" }
++
++[lints.clippy]
++dbg_macro = "deny"
++todo = "deny"
++declare_interior_mutable_const = "deny"
++redundant_clone = "deny"
++disallowed_methods = "deny"
++style = { level = "allow", priority = -1 }
++type_complexity = "allow"
++let_underscore_future = "allow"
++single_range_in_vec_init = "allow"
++too_many_arguments = "allow"
++large_enum_variant = "allow"
++nonminimal_bool = "allow"
+ 
+ [lib]
+ path = "src/gpui_linux.rs"
+@@ -51,29 +72,45 @@ screen-capture = [
+ 
+ 
+ [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+-accesskit.workspace = true
+-accesskit_unix.workspace = true
+-anyhow.workspace = true
++accesskit = { version = "0.24.0", features = ["enumn"] }
++accesskit_unix = "0.21.0"
++anyhow = "1.0.86"
+ bytemuck = "1"
+-collections.workspace = true
+-image.workspace = true
+-futures.workspace = true
+-gpui.workspace = true
+-gpui_util.workspace = true
+-gpui_wgpu = { workspace = true, optional = true, features = ["font-kit"] }
+-http_client.workspace = true
+-itertools.workspace = true
+-libc.workspace = true
+-log.workspace = true
+-parking_lot.workspace = true
+-pathfinder_geometry.workspace = true
+-pollster.workspace = true
+-profiling.workspace = true
+-smallvec.workspace = true
+-smol.workspace = true
+-strum.workspace = true
+-url.workspace = true
+-uuid.workspace = true
++collections = { git = "https://github.com/zed-industries/zed" }
++image = { version = "0.25.1", default-features = false, features = [
++    "bmp",
++    "dds",
++    "exr",
++    "ff",
++    "gif",
++    "hdr",
++    "ico",
++    "jpeg",
++    "png",
++    "pnm",
++    "qoi",
++    "rayon",
++    "tga",
++    "tiff",
++    "webp",
++] }
++futures = "0.3.32"
++gpui = { git = "https://github.com/zed-industries/zed", default-features = false }
++gpui_util = { git = "https://github.com/zed-industries/zed" }
++gpui_wgpu = { git = "https://github.com/zed-industries/zed", optional = true, features = ["font-kit"] }
++http_client = { git = "https://github.com/zed-industries/zed" }
++itertools = "0.14.0"
++libc = "0.2"
++log = { version = "0.4.16", features = ["kv_unstable_serde", "serde"] }
++parking_lot = "0.12.1"
++pathfinder_geometry = "0.5"
++pollster = "0.4.0"
++profiling = "1"
++smallvec = { version = "1.6", features = ["union", "const_new"] }
++smol = "2.0"
++strum = { version = "0.27.2", features = ["derive"] }
++url = "2.2"
++uuid = { version = "1.1.2", features = ["v4", "v5", "v7", "serde"] }
+ 
+ # Always used
+ oo7 = { version = "0.6", default-features = false, features = [
+@@ -81,19 +118,26 @@ oo7 = { version = "0.6", default-features = false, features = [
+     "native_crypto",
+ ] }
+ calloop = "0.14.3"
+-notify-rust.workspace = true
+-raw-window-handle.workspace = true
++notify-rust = "4"
++raw-window-handle = "0.6"
+ 
+ # Used in both windowing options
+-ashpd = { workspace = true, optional = true }
+-swash.workspace = true
+-bitflags = { workspace = true, optional = true }
++ashpd = { version = "0.13", default-features = false, optional = true, features = [
++    "async-io",
++    "notification",
++    "open_uri",
++    "file_chooser",
++    "settings",
++    "trash",
++] }
++swash = "0.2.6"
++bitflags = { version = "2.6.0", optional = true }
+ filedescriptor = { version = "0.8.2", optional = true }
+ open = { version = "5.2.0", optional = true }
+ xkbcommon = { version = "0.8.0", default-features = false, optional = true }
+ 
+ # Screen capture
+-scap = { workspace = true, optional = true }
++scap = { git = "https://github.com/zed-industries/scap", rev = "4afea48c3b002197176fb19cd0f9b180dd36eaac", default-features = false, package = "zed-scap", version = "0.0.8-zed", optional = true }
+ 
+ # Wayland
+ calloop-wayland-source = { version = "0.4.1", optional = true }
+diff --git a/src/gpui_linux.rs b/src/gpui_linux.rs
+index 62d972d..41909a9 100644
+--- a/src/gpui_linux.rs
++++ b/src/gpui_linux.rs
+@@ -1,4 +1,9 @@
++// Modified for docxy (#1966): `wayland_clipboard` made public.
++
+ #![cfg(any(target_os = "linux", target_os = "freebsd"))]
+ mod linux;
+ 
+ pub use linux::current_platform;
++/// RTF/HTML beside a copy's text on the Wayland selection (#1966).
++#[cfg(feature = "wayland")]
++pub use linux::wayland_clipboard;
+diff --git b/src/linux/wayland/client/rich_clipboard.rs b/src/linux/wayland/client/rich_clipboard.rs
+new file mode 100644
+index 0000000..bdb1be7
+--- /dev/null
++++ b/src/linux/wayland/client/rich_clipboard.rs
+@@ -0,0 +1,89 @@
++// Added for docxy (#1966): RTF/HTML beside a copy's text on the Wayland
++// selection, through gpui's own data device.
++
++//! The Wayland selection's extra formats, for an app on top of gpui.
++//!
++//! gpui offers and reads text (and images) only. A compositor keeps one data
++//! device per client (mutter replaces an older one), and a second connection
++//! has neither the selection's events nor an input serial, so the formats go
++//! through gpui's own device, serial and event loop: [`add_formats`] sets the
++//! selection again right after gpui's copy, with a source that offers its
++//! text, the formats and gpui's `pid/<pid>` mime (so gpui still reads the
++//! copy as its own), and gpui serves it. [`mime_types`] and [`read`] look at
++//! the selection as gpui's clipboard sees it.
++//!
++//! Every call is on gpui's main thread, outside gpui's own event handling;
++//! off it, on X11 or headless, or while gpui's state is borrowed, they do
++//! nothing (`false` / `None`). None panics.
++
++use std::cell::RefCell;
++
++use super::{WaylandClientState, WaylandClientStatePtr};
++
++thread_local! {
++    /// gpui's Wayland client on this (the main) thread, never kept alive
++    /// by this.
++    static CLIENT: RefCell<Option<WaylandClientStatePtr>> = const { RefCell::new(None) };
++}
++
++/// Called once gpui's Wayland client exists.
++pub(super) fn set_client(client: WaylandClientStatePtr) {
++    CLIENT.with(|held| *held.borrow_mut() = Some(client));
++}
++
++/// `f` over gpui's client state, if it is on this thread and not borrowed.
++fn with_state<T>(f: impl FnOnce(&mut WaylandClientState) -> T) -> Option<T> {
++    let client = CLIENT.with(|held| held.borrow().as_ref()?.0.upgrade())?;
++    let mut state = client.try_borrow_mut().ok()?;
++    Some(f(&mut state))
++}
++
++/// Add `formats` (mime, bytes) beside gpui's latest copy, when it is still
++/// the selection and its text is `text` (line ends compared loosely): the
++/// selection is set again, to a source offering the text, every format and
++/// gpui's own mime. Whether it was. Call it right after gpui's copy, before
++/// anything flushes the connection, so the compositor gets both in one write
++/// and a clipboard manager never sees the text-only source alive.
++pub fn add_formats(text: &str, formats: Vec<(String, Vec<u8>)>) -> bool {
++    with_state(|state| {
++        if !state.clipboard.own_copy_is(text) {
++            return false;
++        }
++        let (Some(manager), Some(device)) = (
++            state.globals.data_device_manager.clone(),
++            state.data_device.clone(),
++        ) else {
++            return false;
++        };
++        let Some(serial) = state.serial_tracker.selection_serial() else {
++            return false;
++        };
++        state.clipboard.merge_formats(formats);
++        let source = manager.create_data_source(&state.globals.qh, ());
++        for mime in state.clipboard.own_mime_types() {
++            source.offer(mime);
++        }
++        device.set_selection(Some(&source), serial.as_raw());
++        state.clipboard.set_source(source);
++        // The read-back between gpui's write and this one never flushes, so
++        // both reach the compositor here.
++        if let Err(err) = state.clipboard.flush() {
++            log::warn!("Wayland clipboard flush failed: {err}");
++        }
++        true
++    })
++    .unwrap_or(false)
++}
++
++/// The selection's mime types: gpui's own copy's while it is the selection,
++/// else the current offer's. `None` with no selection.
++pub fn mime_types() -> Option<Vec<String>> {
++    with_state(|state| state.clipboard.mime_types()).flatten()
++}
++
++/// The selection's `mime`: gpui's own copy's formats from memory, another
++/// app's through a pipe (waiting as long as gpui's text paste does). `None`
++/// when it is not offered, is empty, is past `max` bytes, or on an error.
++pub fn read(mime: &str, max: usize) -> Option<Vec<u8>> {
++    with_state(|state| state.clipboard.read_format(mime, max)).flatten()
++}
+diff --git a/src/linux/wayland/client.rs b/src/linux/wayland/client.rs
+index 81ed5b7..3b2fc69 100644
+--- a/src/linux/wayland/client.rs
++++ b/src/linux/wayland/client.rs
+@@ -1,3 +1,5 @@
++// Modified for docxy (#1966): the clipboard's extra formats (`rich_clipboard`).
++
+ use std::{
+     cell::{RefCell, RefMut},
+     hash::Hash,
+@@ -399,6 +401,9 @@ impl WaylandClientState {
+     }
+ }
+ 
++/// The clipboard's extra formats, for an app on top of gpui (#1966).
++pub mod rich_clipboard;
++
+ /// This struct is required to conform to Rust's orphan rules, so we can dispatch on the state but hand the
+ /// window to GPUI.
+ #[derive(Clone)]
+@@ -850,6 +855,8 @@ impl WaylandClient {
+             .insert(handle)
+             .unwrap();
+ 
++        rich_clipboard::set_client(WaylandClientStatePtr(Rc::downgrade(&state)));
++
+         Self(state)
+     }
+ }
+@@ -1129,6 +1136,7 @@ impl LinuxClient for WaylandClient {
+             }
+             data_source.offer(state.clipboard.self_mime());
+             data_device.set_selection(Some(&data_source), serial.as_raw());
++            state.clipboard.set_source(data_source);
+         }
+     }
+ 
+@@ -2624,13 +2632,14 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for WaylandClientStatePtr {
+         _: &QueueHandle<Self>,
+     ) {
+         let client = this.get_client();
+-        let state = client.borrow_mut();
++        let mut state = client.borrow_mut();
+ 
+         match event {
+             wl_data_source::Event::Send { mime_type, fd } => {
+                 state.clipboard.send(mime_type, fd);
+             }
+             wl_data_source::Event::Cancelled => {
++                state.clipboard.source_cancelled(data_source);
+                 data_source.destroy();
+             }
+             _ => {}
+diff --git b/src/linux/wayland/clipboard/formats.rs b/src/linux/wayland/clipboard/formats.rs
+new file mode 100644
+index 0000000..2969f5f
+--- /dev/null
++++ b/src/linux/wayland/clipboard/formats.rs
+@@ -0,0 +1,298 @@
++// Added for docxy (#1966): the formats a copy offers beside gpui's text.
++
++//! What gpui's own latest copy is on the Wayland selection, beside its text.
++//!
++//! gpui's clipboard offers text only. The suite adds RTF or HTML to a copy by
++//! setting the selection again, with a source that offers the text, those
++//! formats and gpui's `pid/<pid>` mime ([`super::super::client::rich_clipboard`]).
++//! This keeps, without a connection (so it is testable), which source is
++//! gpui's live copy and which bytes each extra mime serves.
++
++use std::{
++    io::{ErrorKind, Read},
++    os::fd::AsRawFd,
++    time::Duration,
++};
++
++/// gpui's own latest copy: the `wl_data_source` that is the selection (until
++/// the compositor cancels it), and the formats it serves beside the text.
++pub(crate) struct OwnCopy<S> {
++    source: Option<S>,
++    formats: Vec<(String, Vec<u8>)>,
++}
++
++impl<S: PartialEq> OwnCopy<S> {
++    pub(crate) fn new() -> Self {
++        Self {
++            source: None,
++            formats: Vec::new(),
++        }
++    }
++
++    /// gpui copied something new: no source is known to carry it yet (the
++    /// write can still be skipped for want of a serial), and the old formats
++    /// belong to the old copy.
++    pub(crate) fn copied(&mut self) {
++        self.source = None;
++        self.formats.clear();
++    }
++
++    /// `source` was just set as the selection.
++    pub(crate) fn set_source(&mut self, source: S) {
++        self.source = Some(source);
++    }
++
++    /// The compositor cancelled `source`: forgotten when it is the tracked
++    /// one. Replacing gpui's source with the suite's cancels the old one,
++    /// which must not forget the new.
++    pub(crate) fn cancelled(&mut self, source: &S) {
++        if self.source.as_ref() == Some(source) {
++            self.source = None;
++        }
++    }
++
++    /// Whether gpui's latest copy is still the selection, as far as any
++    /// event so far says.
++    pub(crate) fn alive(&self) -> bool {
++        self.source.is_some()
++    }
++
++    /// Add `formats`, a mime already held replaced.
++    pub(crate) fn merge(&mut self, formats: Vec<(String, Vec<u8>)>) {
++        for (mime, bytes) in formats {
++            match self.formats.iter_mut().find(|(held, _)| *held == mime) {
++                Some(held) => held.1 = bytes,
++                None => self.formats.push((mime, bytes)),
++            }
++        }
++    }
++
++    /// The bytes a format `mime` serves, if the copy has it.
++    pub(crate) fn bytes(&self, mime: &str) -> Option<&[u8]> {
++        self.formats
++            .iter()
++            .find(|(held, _)| held == mime)
++            .map(|(_, bytes)| bytes.as_slice())
++    }
++
++    /// What a source for this copy offers: the text mimes, each format's
++    /// mime, and gpui's own `self_mime`.
++    pub(crate) fn mime_types(&self, text: &[&str], self_mime: &str) -> Vec<String> {
++        text.iter()
++            .map(|mime| mime.to_string())
++            .chain(self.formats.iter().map(|(mime, _)| mime.clone()))
++            .chain(std::iter::once(self_mime.to_string()))
++            .collect()
++    }
++
++    /// What a `send` of `mime` writes: a format's bytes, else `text` (gpui's
++    /// own answer to every mime, as before).
++    pub(crate) fn send_bytes(&self, mime: &str, text: Option<&str>) -> Option<Vec<u8>> {
++        self.bytes(mime)
++            .map(<[u8]>::to_vec)
++            .or_else(|| text.map(|text| text.as_bytes().to_vec()))
++    }
++}
++
++/// Who answers a read of the selection.
++#[derive(Debug, PartialEq, Eq)]
++pub(crate) enum Whose {
++    /// gpui's own copy, from memory: its source is alive, or the offer is
++    /// its own (`pid/<pid>`). Never through a pipe: gpui serves its pipes on
++    /// the thread that would be waiting on it.
++    Own,
++    /// Another app's, through the offer.
++    Offer,
++    /// No selection.
++    Nothing,
++}
++
++/// Who answers a read, given whether gpui's own copy is `alive` and, when
++/// there is an offer, whether it carries gpui's `pid/<pid>` mime.
++pub(crate) fn whose(alive: bool, offer_is_ours: Option<bool>) -> Whose {
++    match (alive, offer_is_ours) {
++        (true, _) | (false, Some(true)) => Whose::Own,
++        (false, Some(false)) => Whose::Offer,
++        (false, None) => Whose::Nothing,
++    }
++}
++
++/// Whether gpui's copy of `held` is the suite's copy of `text`, line ends
++/// compared loosely.
++pub(crate) fn same_text(held: &str, text: &str) -> bool {
++    held.replace("\r\n", "\n") == text.replace("\r\n", "\n")
++}
++
++/// Read `fd` to its end, as `read_fd_with_timeout` does, but stop with
++/// `Ok(None)` once more than `max` bytes came: a paste of a huge rich copy
++/// takes its text rather than copying it all to find out.
++pub(crate) fn read_fd_bounded(
++    mut fd: filedescriptor::FileDescriptor,
++    timeout: Duration,
++    max: usize,
++) -> anyhow::Result<Option<Vec<u8>>> {
++    fd.set_non_blocking(true)?;
++    let mut buffer = Vec::new();
++    let mut chunk = [0u8; 8192];
++    loop {
++        let mut poll_fds = [filedescriptor::pollfd {
++            fd: fd.as_raw_fd(),
++            events: filedescriptor::POLLIN,
++            revents: 0,
++        }];
++        let ready = match filedescriptor::poll(&mut poll_fds, Some(timeout)) {
++            Ok(ready) => ready,
++            Err(filedescriptor::Error::Poll(err)) if err.kind() == ErrorKind::Interrupted => {
++                continue;
++            }
++            Err(err) => return Err(err.into()),
++        };
++        if ready == 0 {
++            anyhow::bail!("timed out waiting for data on pipe after {timeout:?}");
++        }
++        match fd.read(&mut chunk) {
++            Ok(0) => return Ok(Some(buffer)),
++            Ok(len) => {
++                if buffer.len() + len > max {
++                    return Ok(None);
++                }
++                buffer.extend_from_slice(&chunk[..len]);
++            }
++            Err(err)
++                if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::Interrupted => {}
++            Err(err) => return Err(err.into()),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::Write;
++
++    fn copy_with(formats: &[(&str, &str)]) -> OwnCopy<u32> {
++        let mut copy = OwnCopy::new();
++        copy.merge(
++            formats
++                .iter()
++                .map(|(mime, bytes)| (mime.to_string(), bytes.as_bytes().to_vec()))
++                .collect(),
++        );
++        copy
++    }
++
++    #[test]
++    fn merging_replaces_a_mime_and_keeps_the_others() {
++        let mut copy = copy_with(&[("text/rtf", "{\\rtf1 a}"), ("text/html", "<b>a</b>")]);
++        copy.merge(vec![("text/rtf".into(), b"{\\rtf1 b}".to_vec())]);
++        assert_eq!(copy.bytes("text/rtf"), Some(&b"{\\rtf1 b}"[..]));
++        assert_eq!(copy.bytes("text/html"), Some(&b"<b>a</b>"[..]));
++        assert_eq!(copy.bytes("image/png"), None);
++    }
++
++    #[test]
++    fn a_new_copy_forgets_the_source_and_the_formats() {
++        let mut copy = copy_with(&[("text/rtf", "{\\rtf1 a}")]);
++        copy.set_source(1);
++        assert!(copy.alive());
++        copy.copied();
++        assert!(!copy.alive());
++        assert_eq!(copy.bytes("text/rtf"), None);
++    }
++
++    #[test]
++    fn cancelling_the_replaced_source_keeps_the_new_one() {
++        let mut copy = OwnCopy::new();
++        copy.set_source(1);
++        // The suite's source replaces gpui's; the compositor then cancels 1.
++        copy.set_source(2);
++        copy.cancelled(&1);
++        assert!(copy.alive());
++        copy.cancelled(&2);
++        assert!(!copy.alive());
++    }
++
++    #[test]
++    fn a_source_offers_text_formats_and_gpuis_own_mime() {
++        let copy = copy_with(&[("text/rtf", "{\\rtf1 a}")]);
++        assert_eq!(
++            copy.mime_types(&["text/plain;charset=utf-8", "UTF8_STRING"], "pid/7"),
++            [
++                "text/plain;charset=utf-8",
++                "UTF8_STRING",
++                "text/rtf",
++                "pid/7"
++            ]
++        );
++    }
++
++    #[test]
++    fn a_send_serves_a_formats_bytes_and_else_the_text() {
++        let copy = copy_with(&[("text/rtf", "{\\rtf1 a}")]);
++        assert_eq!(
++            copy.send_bytes("text/rtf", Some("a")).as_deref(),
++            Some(&b"{\\rtf1 a}"[..])
++        );
++        assert_eq!(
++            copy.send_bytes("UTF8_STRING", Some("a")).as_deref(),
++            Some(&b"a"[..])
++        );
++        // gpui's old answer to any mime: its text.
++        assert_eq!(
++            copy.send_bytes("text/html", Some("a")).as_deref(),
++            Some(&b"a"[..])
++        );
++        assert_eq!(copy.send_bytes("UTF8_STRING", None), None);
++    }
++
++    /// The live source answers before any offer: right after gpui's write the
++    /// compositor's `selection` echo has not been dispatched, and the offer
++    /// is still the previous owner's.
++    #[test]
++    fn a_live_own_copy_answers_before_a_stale_offer() {
++        assert_eq!(whose(true, Some(false)), Whose::Own);
++        assert_eq!(whose(true, None), Whose::Own);
++        assert_eq!(whose(false, Some(true)), Whose::Own);
++        assert_eq!(whose(false, Some(false)), Whose::Offer);
++        assert_eq!(whose(false, None), Whose::Nothing);
++    }
++
++    /// A write skipped for want of a serial leaves no live source behind:
++    /// the offer answers again, as before.
++    #[test]
++    fn a_copy_without_a_source_leaves_the_offer_to_answer() {
++        let mut copy = OwnCopy::new();
++        copy.set_source(1);
++        copy.copied();
++        assert_eq!(whose(copy.alive(), Some(false)), Whose::Offer);
++        copy.set_source(2);
++        assert_eq!(whose(copy.alive(), Some(false)), Whose::Own);
++    }
++
++    #[test]
++    fn text_compares_loosely_over_line_ends() {
++        assert!(same_text("a\r\nb", "a\nb"));
++        assert!(!same_text("a", "b"));
++    }
++
++    fn piped(bytes: &[u8]) -> filedescriptor::FileDescriptor {
++        let mut pipe = filedescriptor::Pipe::new().unwrap();
++        pipe.write.write_all(bytes).unwrap();
++        drop(pipe.write);
++        pipe.read
++    }
++
++    #[test]
++    fn a_bounded_read_stops_past_max() {
++        let timeout = Duration::from_secs(1);
++        assert_eq!(
++            read_fd_bounded(piped(b"12345"), timeout, 5).unwrap(),
++            Some(b"12345".to_vec())
++        );
++        assert_eq!(read_fd_bounded(piped(b"123456"), timeout, 5).unwrap(), None);
++        assert_eq!(
++            read_fd_bounded(piped(b""), timeout, 5).unwrap(),
++            Some(Vec::new())
++        );
++    }
++}
+diff --git a/src/linux/wayland/clipboard.rs b/src/linux/wayland/clipboard.rs
+index dfedf53..a624899 100644
+--- a/src/linux/wayland/clipboard.rs
++++ b/src/linux/wayland/clipboard.rs
+@@ -1,3 +1,5 @@
++// Modified for docxy (#1966): a copy's extra formats (RTF/HTML) beside its text.
++
+ use std::{
+     fs::File,
+     io::{ErrorKind, Write},
+@@ -7,7 +9,10 @@ use std::{
+ use calloop::{LoopHandle, PostAction};
+ use filedescriptor::Pipe;
+ use strum::IntoEnumIterator;
+-use wayland_client::{Connection, protocol::wl_data_offer::WlDataOffer};
++use wayland_client::{
++    Connection,
++    protocol::{wl_data_offer::WlDataOffer, wl_data_source::WlDataSource},
++};
+ use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
+ 
+ use crate::linux::{
+@@ -16,6 +21,9 @@ use crate::linux::{
+ };
+ use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
+ 
++mod formats;
++pub(crate) use formats::{OwnCopy, Whose, same_text, whose};
++
+ /// Text mime types that we'll offer to other programs.
+ pub(crate) const TEXT_MIME_TYPES: [&str; 3] =
+     ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
+@@ -38,6 +46,10 @@ pub(crate) struct Clipboard {
+     current_offer: Option<DataOffer<WlDataOffer>>,
+     cached_primary_read: Option<ClipboardItem>,
+     current_primary_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>,
++
++    // gpui's latest copy as the selection, and its formats beside the text
++    // (#1966).
++    own: OwnCopy<WlDataSource>,
+ }
+ 
+ pub(crate) trait ReceiveData {
+@@ -98,6 +110,29 @@ impl<T: ReceiveData> DataOffer<T> {
+         }
+     }
+ 
++    /// `mime` read, `None` past `max` bytes, empty, or on error (#1966).
++    fn read_bytes_bounded(
++        &self,
++        connection: &Connection,
++        mime_type: &str,
++        max: usize,
++    ) -> Option<Vec<u8>> {
++        let pipe = Pipe::new().ok()?;
++        self.inner.receive_data(mime_type.to_string(), unsafe {
++            BorrowedFd::borrow_raw(pipe.write.as_raw_fd())
++        });
++        let fd = pipe.read;
++        drop(pipe.write);
++        connection.flush().ok()?;
++        match formats::read_fd_bounded(fd, PIPE_READ_TIMEOUT, max) {
++            Ok(bytes) => bytes.filter(|bytes| !bytes.is_empty()),
++            Err(err) => {
++                log::error!("error reading clipboard pipe: {err:?}");
++                None
++            }
++        }
++    }
++
+     fn read_text(&self, connection: &Connection) -> Option<ClipboardItem> {
+         let mime_type = self.mime_types.iter().find(|&mime_type| {
+             ALLOWED_TEXT_MIME_TYPES
+@@ -155,11 +190,92 @@ impl Clipboard {
+             current_offer: None,
+             cached_primary_read: None,
+             current_primary_offer: None,
++
++            own: OwnCopy::new(),
+         }
+     }
+ 
+     pub fn set(&mut self, item: ClipboardItem) {
+         self.contents = Some(item);
++        self.own.copied();
++    }
++
++    /// `source` was just set as the selection for `contents` (#1966).
++    pub fn set_source(&mut self, source: WlDataSource) {
++        self.own.set_source(source);
++    }
++
++    /// The compositor cancelled `source` (#1966).
++    pub fn source_cancelled(&mut self, source: &WlDataSource) {
++        self.own.cancelled(source);
++    }
++
++    /// Whether gpui's latest copy is still the selection and its text is
++    /// `text`: the copy the suite adds formats to (#1966).
++    pub fn own_copy_is(&self, text: &str) -> bool {
++        self.own.alive()
++            && self
++                .contents
++                .as_ref()
++                .and_then(|contents| contents.text())
++                .is_some_and(|held| same_text(&held, text))
++    }
++
++    /// Add `formats` beside the text of gpui's copy (#1966).
++    pub fn merge_formats(&mut self, formats: Vec<(String, Vec<u8>)>) {
++        self.own.merge(formats);
++    }
++
++    /// What a source for gpui's copy offers: text, formats, `pid/<pid>` (#1966).
++    pub fn own_mime_types(&self) -> Vec<String> {
++        self.own.mime_types(&TEXT_MIME_TYPES, &self.self_mime)
++    }
++
++    /// Send what is queued to the compositor (#1966).
++    pub fn flush(&self) -> Result<(), wayland_client::backend::WaylandError> {
++        self.connection.flush()
++    }
++
++    fn whose(&self) -> Whose {
++        whose(
++            self.own.alive(),
++            self.current_offer
++                .as_ref()
++                .map(|offer| offer.has_mime_type(&self.self_mime)),
++        )
++    }
++
++    /// The selection's mime types (#1966).
++    pub fn mime_types(&self) -> Option<Vec<String>> {
++        match self.whose() {
++            Whose::Own => Some(self.own_mime_types()),
++            Whose::Offer => self
++                .current_offer
++                .as_ref()
++                .map(|offer| offer.mime_types.clone()),
++            Whose::Nothing => None,
++        }
++    }
++
++    /// The selection's `mime` read, `None` past `max` bytes, empty, or on
++    /// error (#1966). gpui's own copy from memory; another app's through
++    /// the pipe, waiting up to `PIPE_READ_TIMEOUT` as a text paste does.
++    pub fn read_format(&self, mime: &str, max: usize) -> Option<Vec<u8>> {
++        match self.whose() {
++            Whose::Own => self
++                .own
++                .bytes(mime)
++                .filter(|bytes| !bytes.is_empty() && bytes.len() <= max)
++                .map(<[u8]>::to_vec),
++            Whose::Offer => {
++                let offer = self.current_offer.as_ref()?;
++                if !offer.has_mime_type(mime) {
++                    return None;
++                }
++                offer.read_bytes_bounded(&self.connection, mime, max)
++            }
++            Whose::Nothing => None,
++        }
+     }
+ 
+     pub fn set_primary(&mut self, item: ClipboardItem) {
+@@ -180,9 +296,10 @@ impl Clipboard {
+         self.self_mime.clone()
+     }
+ 
+-    pub fn send(&self, _mime_type: String, fd: OwnedFd) {
+-        if let Some(text) = self.contents.as_ref().and_then(|contents| contents.text()) {
+-            self.send_internal(fd, text.as_bytes().to_owned());
++    pub fn send(&self, mime_type: String, fd: OwnedFd) {
++        let text = self.contents.as_ref().and_then(|contents| contents.text());
++        if let Some(bytes) = self.own.send_bytes(&mime_type, text.as_deref()) {
++            self.send_internal(fd, bytes);
+         }
+     }
+ 
+@@ -197,6 +314,12 @@ impl Clipboard {
+     }
+ 
+     pub fn read(&mut self) -> Option<ClipboardItem> {
++        // gpui's own copy while its source is alive: right after a write the
++        // compositor's `selection` echo is not dispatched yet, and the offer
++        // is still the previous owner's (#1966).
++        if self.own.alive() {
++            return self.contents.clone();
++        }
+         let offer = self.current_offer.as_ref()?;
+         if let Some(cached) = self.cached_read.clone() {
+             return Some(cached);
+diff --git a/src/linux/wayland.rs b/src/linux/wayland.rs
+index cbc962b..3c99149 100644
+--- a/src/linux/wayland.rs
++++ b/src/linux/wayland.rs
+@@ -1,3 +1,5 @@
++// Modified for docxy (#1966): `rich_clipboard` made public.
++
+ mod client;
+ mod clipboard;
+ mod cursor;
+@@ -10,6 +12,8 @@ mod window;
+ pub mod layer_shell;
+ 
+ pub(crate) use client::*;
++// The clipboard's extra formats, public for an app on top of gpui (#1966).
++pub use client::rich_clipboard;
+ 
+ use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape;
+ 
+diff --git a/src/linux.rs b/src/linux.rs
+index 33393f7..3e80300 100644
+--- a/src/linux.rs
++++ b/src/linux.rs
+@@ -1,3 +1,5 @@
++// Modified for docxy (#1966): `wayland_clipboard` made public.
++
+ mod dispatcher;
+ mod headless;
+ mod keyboard;
+@@ -20,6 +22,8 @@ pub(crate) use platform::*;
+ #[cfg(any(feature = "wayland", feature = "x11"))]
+ pub(crate) use text_system::*;
+ #[cfg(feature = "wayland")]
++pub use wayland::rich_clipboard as wayland_clipboard;
++#[cfg(feature = "wayland")]
+ pub(crate) use wayland::*;
+ #[cfg(feature = "x11")]
+ pub(crate) use x11::*;

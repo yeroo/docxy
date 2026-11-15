@@ -216,6 +216,14 @@ jobs:
         run: cargo clippy --manifest-path suite/Cargo.toml --all-targets --locked -- -D warnings
       - name: Test
         run: xvfb-run -a cargo test --manifest-path suite/Cargo.toml --locked
+      # The suite's patched gpui_linux (#1966): the vendored tree is upstream (cargo's
+      # zed checkout, which the steps above made) plus suite/vendor/gpui_linux.patch,
+      # and the patch's Wayland clipboard tests pass. A path dependency outside the
+      # workspace, so the Test step above does not run them.
+      - name: Vendored gpui_linux
+        run: |
+          python3 scripts/vendor-gpui-linux.py --check
+          cargo test --manifest-path suite/Cargo.toml --locked -p gpui_linux --lib wayland::
       # window_close (#1226) closes the suite's window through X11 and drives the
       # debug suite the Test step left in suite/target/debug (docxy's integration
       # tests build the binary).

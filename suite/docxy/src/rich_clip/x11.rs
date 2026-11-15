@@ -43,6 +43,8 @@ use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{CURRENT_TIME, NONE};
 
+use super::utf8_page;
+
 x11rb::atom_manager! {
     pub(super) Atoms: AtomCookies {
         CLIPBOARD,
@@ -246,11 +248,7 @@ impl X11Clip {
     /// `text/html;…`, any case). A UTF-16 page (an older Firefox's) comes
     /// back as UTF-8.
     pub(crate) fn read_html(&self) -> Option<Vec<u8>> {
-        let html = |name: &str| {
-            let name = name.to_ascii_lowercase();
-            name == "text/html" || name.starts_with("text/html;")
-        };
-        let bytes = self.read(&[self.owner.atoms.HTML], Some(&html))?;
+        let bytes = self.read(&[self.owner.atoms.HTML], Some(&super::is_html_type))?;
         Some(utf8_page(bytes))
     }
 
@@ -483,31 +481,6 @@ fn latin1(text: &str) -> Vec<u8> {
     text.chars()
         .map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?'))
         .collect()
-}
-
-/// An HTML payload as UTF-8: a UTF-16 one (with its BOM) decoded, anything
-/// else as it is.
-fn utf8_page(bytes: Vec<u8>) -> Vec<u8> {
-    let utf16 = |rest: &[u8], big: bool| {
-        let units: Vec<u16> = rest
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&p| {
-                if big {
-                    u16::from_be_bytes(p)
-                } else {
-                    u16::from_le_bytes(p)
-                }
-            })
-            .collect();
-        String::from_utf16_lossy(&units).into_bytes()
-    };
-    match bytes.as_slice() {
-        [0xFF, 0xFE, rest @ ..] => utf16(rest, false),
-        [0xFE, 0xFF, rest @ ..] => utf16(rest, true),
-        _ => bytes,
-    }
 }
 
 /// An unmapped 1×1 window under `root` that hears `events`.

@@ -1,3 +1,5 @@
+// Modified for docxy (#1966): the clipboard's extra formats (`rich_clipboard`).
+
 use std::{
     cell::{RefCell, RefMut},
     hash::Hash,
@@ -398,6 +400,9 @@ impl WaylandClientState {
         activation.activate(startup_activation_token, surface);
     }
 }
+
+/// The clipboard's extra formats, for an app on top of gpui (#1966).
+pub mod rich_clipboard;
 
 /// This struct is required to conform to Rust's orphan rules, so we can dispatch on the state but hand the
 /// window to GPUI.
@@ -850,6 +855,8 @@ impl WaylandClient {
             .insert(handle)
             .unwrap();
 
+        rich_clipboard::set_client(WaylandClientStatePtr(Rc::downgrade(&state)));
+
         Self(state)
     }
 }
@@ -1129,6 +1136,7 @@ impl LinuxClient for WaylandClient {
             }
             data_source.offer(state.clipboard.self_mime());
             data_device.set_selection(Some(&data_source), serial.as_raw());
+            state.clipboard.set_source(data_source);
         }
     }
 
@@ -2624,13 +2632,14 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for WaylandClientStatePtr {
         _: &QueueHandle<Self>,
     ) {
         let client = this.get_client();
-        let state = client.borrow_mut();
+        let mut state = client.borrow_mut();
 
         match event {
             wl_data_source::Event::Send { mime_type, fd } => {
                 state.clipboard.send(mime_type, fd);
             }
             wl_data_source::Event::Cancelled => {
+                state.clipboard.source_cancelled(data_source);
                 data_source.destroy();
             }
             _ => {}
