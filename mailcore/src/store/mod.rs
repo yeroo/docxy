@@ -20950,6 +20950,9 @@ mod meeting_message_type_tests {
                     "DROP INDEX idx_messages_reminder;
                      DROP INDEX idx_messages_reply_drafts;
                      DROP INDEX idx_messages_unsized;
+                     DROP INDEX idx_messages_untyped;
+                     ALTER TABLE messages DROP COLUMN is_event_message;
+                     ALTER TABLE messages DROP COLUMN meeting_type_known;
                      ALTER TABLE messages DROP COLUMN size;
                      ALTER TABLE messages DROP COLUMN size_asked;
                      DROP TRIGGER forgotten_messages_ad;
@@ -20995,6 +20998,8 @@ mod meeting_message_type_tests {
         );
         assert_eq!(row.subject, "budget M1");
         assert_eq!(row.size, None);
+        // #2168: a request is a meeting message whose type the fill asks.
+        assert!(row.is_event_message && row.meeting_type_pending);
         // Every folder's delta and backfill state is reset.
         for f in ["F", "G"] {
             assert_eq!(s.get_delta_link(f).unwrap(), None, "{f}");
@@ -21028,6 +21033,7 @@ mod meeting_message_type_tests {
         assert!(!migrate_meeting_reminder(&s.conn).unwrap());
         assert!(!migrate_reply_links(&s.conn).unwrap());
         assert!(!migrate_message_size(&s.conn).unwrap());
+        assert!(!migrate_meeting_type_fill(&s.conn).unwrap());
         s.set_head_link("F", "https://graph/F?$deltatoken=new", false)
             .unwrap();
         drop(s);
@@ -26584,6 +26590,510 @@ mod mailbox_reset_tests {
         assert_eq!(
             created_trigger_names(schema::FORGOTTEN_TRIGGERS_SQL).len(),
             6
+        );
+    }
+}
+
+#[cfg(test)]
+mod meeting_type_fill_tests {
+    //! A meeting message's type when the class `$expand` is refused
+    //! (#2168): the kind and known columns through every row read, the
+    //! merge rule, the fill's queries and writes, and the migration.
+    use super::*;
+    use MeetingMessageType as T;
+
+    fn folder(s: &Store, id: &str) {
+        s.upsert_folder(&MailFolder {
+            id: id.into(),
+            display_name: id.into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: None,
+        })
+        .unwrap();
+    }
+
+    fn msg(id: &str, received: &str, event: bool) -> Message {
+        Message {
+            id: id.into(),
+            conversation_id: format!("C{id}"),
+            subject: format!("agenda {id}"),
+            from: Recipient {
+                name: "A".into(),
+                address: "a@x".into(),
+            },
+            to: vec![],
+            cc: vec![],
+            received: received.into(),
+            sent: String::new(),
+            is_read: false,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: String::new(),
+            is_draft: false,
+            is_meeting_request: false,
+            categories: vec![],
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
+            meeting_message_type: None,
+            protection: Default::default(),
+            meeting_reminder_on: false,
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
+            size: None,
+            is_event_message: event,
+        }
+    }
+
+    /// What a delta through a refused expand carries: every base property
+    /// and `@odata.type`, no class (so no type).
+    fn refused() -> MessageFields {
+        MessageFields {
+            meeting_type: false,
+            protection: false,
+            meeting_reminder: false,
+            reminder: false,
+            reminder_unasked: true,
+            in_reply_to: false,
+            ..MessageFields::all()
+        }
+    }
+
+    /// `(is_event_message, meeting_type_known, meeting_message_type)` as
+    /// stored.
+    fn cols(s: &Store, id: &str) -> (Option<i64>, i64, Option<String>) {
+        s.conn
+            .query_row(
+                "SELECT is_event_message, meeting_type_known, meeting_message_type
+                 FROM messages WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    fn pending(s: &Store, id: &str) -> bool {
+        s.message_row(id).unwrap().unwrap().meeting_type_pending
+    }
+
+    #[test]
+    fn merge_writes_the_kind_and_known_by_what_the_item_carried() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        // A cancellation through a refused expand: a meeting message whose
+        // type is not known.
+        s.merge_message("F", &msg("X", "2026-11-01T00:00:00Z", true), &refused())
+            .unwrap();
+        assert_eq!(cols(&s, "X"), (Some(1), 0, None));
+        assert!(pending(&s, "X"));
+        // An ordinary message through the same delta: not a candidate.
+        s.merge_message("F", &msg("N", "2026-11-01T00:00:00Z", false), &refused())
+            .unwrap();
+        assert_eq!(cols(&s, "N"), (Some(0), 0, None));
+        assert!(!pending(&s, "N"));
+        // A carried class writes the type and makes it known.
+        let mut carried = msg("X", "2026-11-01T00:00:00Z", true);
+        carried.meeting_message_type = Some(T::Cancelled);
+        s.merge_message("F", &carried, &MessageFields::all())
+            .unwrap();
+        assert_eq!(cols(&s, "X"), (Some(1), 1, Some("meetingCancelled".into())));
+        assert!(!pending(&s, "X"));
+        // A later round without the class keeps both.
+        s.merge_message("F", &msg("X", "2026-11-01T00:00:00Z", true), &refused())
+            .unwrap();
+        assert_eq!(cols(&s, "X"), (Some(1), 1, Some("meetingCancelled".into())));
+        // A partial item without `@odata.type` keeps the kind.
+        let partial = MessageFields {
+            odata_type: false,
+            received: false,
+            subject: false,
+            from: false,
+            ..refused()
+        };
+        s.merge_message("F", &msg("X", "", false), &partial)
+            .unwrap();
+        assert_eq!(cols(&s, "X").0, Some(1));
+        // A composed draft (`upsert_message`) writes its kind and a known
+        // (absent) type.
+        s.upsert_message("F", &msg("D", "2026-11-01T00:00:00Z", false))
+            .unwrap();
+        assert_eq!(cols(&s, "D"), (Some(0), 1, None));
+    }
+
+    #[test]
+    fn an_insert_that_does_not_name_the_column_is_no_candidate() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.conn
+            .execute(
+                "INSERT INTO messages (id, folder_id, received_at, is_read)
+                 VALUES ('R', 'F', '2026-11-01T00:00:00Z', 0)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(cols(&s, "R"), (Some(0), 0, None));
+        assert!(!pending(&s, "R"));
+        assert!(s.type_fill_folders().unwrap().is_empty());
+        // A local draft neither.
+        let local = s.create_local_draft("d", "", "", "").unwrap();
+        assert!(!pending(&s, &local));
+        assert!(s.type_fill_folders().unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_row_read_carries_the_kind_and_pending() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.merge_message("F", &msg("E1", "2026-11-01T00:00:01Z", true), &refused())
+            .unwrap();
+        s.merge_message("F", &msg("N1", "2026-11-01T00:00:02Z", false), &refused())
+            .unwrap();
+        let mut typed = msg("T1", "2026-11-01T00:00:03Z", true);
+        typed.meeting_message_type = Some(T::Declined);
+        s.upsert_message("F", &typed).unwrap();
+        // A row stored before #2168: not known, pending; reads false.
+        s.upsert_message("F", &msg("O1", "2026-11-01T00:00:04Z", false))
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE messages SET is_event_message = NULL, meeting_type_known = 0
+                 WHERE id = 'O1'",
+                [],
+            )
+            .unwrap();
+        let want = vec![
+            ("E1".to_string(), true, true),
+            ("N1".to_string(), false, false),
+            ("O1".to_string(), false, true),
+            ("T1".to_string(), true, false),
+        ];
+        let sorted = |rows: Vec<MessageRow>| {
+            let mut got: Vec<_> = rows
+                .into_iter()
+                .map(|r| (r.id, r.is_event_message, r.meeting_type_pending))
+                .collect();
+            got.sort();
+            got
+        };
+        let ids = ["E1", "N1", "O1", "T1"];
+        let one: Vec<MessageRow> = ids
+            .iter()
+            .map(|id| s.message_row(id).unwrap().unwrap())
+            .collect();
+        assert_eq!(sorted(one), want);
+        assert_eq!(sorted(s.message_rows(&ids).unwrap()), want);
+        assert_eq!(sorted(s.messages_in_folder("F", 50, 0).unwrap()), want);
+        assert_eq!(sorted(s.conversations_in_folder("F", 50, 0).unwrap()), want);
+        assert_eq!(sorted(s.search("agenda", 50).unwrap()), want);
+        // `draft`, whose body columns follow the row's.
+        let mut d = msg("D1", "2026-11-01T00:00:05Z", true);
+        d.is_draft = true;
+        s.merge_message("F", &d, &refused()).unwrap();
+        s.put_body(
+            "D1",
+            &Body {
+                content_type: "html".into(),
+                content: "<p>hi</p>".into(),
+            },
+        )
+        .unwrap();
+        let (row, body) = s.draft("D1").unwrap().unwrap();
+        assert!(row.is_event_message && row.meeting_type_pending);
+        assert_eq!(
+            (body.content_type.as_str(), body.content.as_str()),
+            ("html", "<p>hi</p>")
+        );
+        // `due_message_reminders`.
+        s.conn
+            .execute(
+                "UPDATE messages SET is_flagged = 1, is_reminder_on = 1,
+                     reminder_at = '2026-11-01T00:00:00Z' WHERE id = 'E1'",
+                [],
+            )
+            .unwrap();
+        let due = s.due_message_reminders("2026-11-02T00:00:00Z").unwrap();
+        assert_eq!(sorted(due), [("E1".to_string(), true, true)]);
+    }
+
+    #[test]
+    fn kind_candidates_leave_out_what_graph_cannot_answer() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        folder(&s, "G");
+        let old = |s: &Store, f: &str, id: &str, at: &str| {
+            s.upsert_message(f, &msg(id, at, false)).unwrap();
+            s.conn
+                .execute(
+                    "UPDATE messages SET is_event_message = NULL, meeting_type_known = 0
+                     WHERE id = ?1",
+                    [id],
+                )
+                .unwrap();
+        };
+        old(&s, "F", "b", "2026-03-01T00:00:00Z");
+        old(&s, "F", "a", "2026-01-01T00:00:00Z");
+        old(&s, "F", "headerless", "");
+        old(&s, "F", "local:x", "2025-01-01T00:00:00Z");
+        // A row moved here locally, its move still queued.
+        old(&s, "G", "moved", "2025-01-01T00:00:00Z");
+        s.move_message("moved", "F").unwrap();
+        s.enqueue_op(&OutboxOp::Move {
+            id: "moved".into(),
+            dest: "F".into(),
+        })
+        .unwrap();
+        // A known meeting message is not a kind candidate, but a type one.
+        s.merge_message("F", &msg("e", "2024-01-01T00:00:00Z", true), &refused())
+            .unwrap();
+        let (ids, since) = s.event_kind_candidates("F").unwrap().unwrap();
+        assert_eq!(ids, ["a", "b"]);
+        assert_eq!(since, "2026-01-01T00:00:00Z");
+        assert_eq!(s.event_kind_candidates("G").unwrap(), None);
+        assert_eq!(s.meeting_type_candidates("F", 4).unwrap(), ["e"]);
+        assert_eq!(s.type_fill_folders().unwrap(), ["F"]);
+
+        // The listing's answer: a known kind is never overwritten, an
+        // unstored id is skipped, and the folders written come back.
+        s.merge_message("F", &msg("k", "2026-01-01T00:00:00Z", false), &refused())
+            .unwrap();
+        let written = s
+            .set_event_kinds(&[
+                ("a".into(), true),
+                ("k".into(), true),
+                ("nope".into(), true),
+            ])
+            .unwrap();
+        assert_eq!(written, ["F"]);
+        assert_eq!(cols(&s, "a").0, Some(1));
+        assert_eq!(cols(&s, "k").0, Some(0));
+        assert!(
+            s.set_event_kinds(&[("a".into(), false)])
+                .unwrap()
+                .is_empty()
+        );
+        // `a` is now a type candidate, oldest first.
+        assert_eq!(s.meeting_type_candidates("F", 4).unwrap(), ["e", "a"]);
+        assert_eq!(s.meeting_type_candidates("F", 1).unwrap(), ["e"]);
+
+        // Unlisted: `b` becomes 0; a row owned by a queued op and a row in
+        // another folder are left.
+        let written = s
+            .mark_event_kinds_unlisted("F", &["b".into(), "moved".into(), "a".into()])
+            .unwrap();
+        assert_eq!(written, ["F"]);
+        assert_eq!(cols(&s, "b").0, Some(0));
+        assert_eq!(cols(&s, "moved").0, None);
+        assert!(
+            s.mark_event_kinds_unlisted("G", &["moved".into()])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(s.event_kind_candidates("F").unwrap().is_none());
+    }
+
+    #[test]
+    fn set_meeting_types_and_mark_known_report_their_folders() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        folder(&s, "G");
+        for (f, id) in [("F", "1"), ("F", "2"), ("G", "3"), ("G", "4")] {
+            s.merge_message(f, &msg(id, "2026-11-01T00:00:00Z", true), &refused())
+                .unwrap();
+        }
+        let written = s
+            .set_meeting_types(&[
+                ("1".into(), Some(T::Accepted)),
+                ("3".into(), None),
+                ("nope".into(), Some(T::Request)),
+            ])
+            .unwrap();
+        assert_eq!(written, ["F", "G"]);
+        assert_eq!(cols(&s, "1"), (Some(1), 1, Some("meetingAccepted".into())));
+        // A `None` answer is known too: no longer pending.
+        assert_eq!(cols(&s, "3"), (Some(1), 1, None));
+        assert!(!pending(&s, "3"));
+        // A known type (a delta carried it meanwhile) is kept.
+        assert!(
+            s.set_meeting_types(&[("1".into(), Some(T::Declined))])
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(cols(&s, "1").2.as_deref(), Some("meetingAccepted"));
+        // Known without a type.
+        assert_eq!(
+            s.mark_meeting_type_known(&["2".into(), "1".into()])
+                .unwrap(),
+            ["F"]
+        );
+        assert_eq!(cols(&s, "2"), (Some(1), 1, None));
+        assert!(s.mark_meeting_type_known(&["2".into()]).unwrap().is_empty());
+        assert!(s.mark_meeting_type_known(&[]).unwrap().is_empty());
+        assert_eq!(s.meeting_type_candidates("G", 4).unwrap(), ["4"]);
+        assert_eq!(s.type_fill_folders().unwrap(), ["G"]);
+    }
+
+    #[test]
+    fn fetch_meeting_message_marks_the_type_known() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        // An old row (kind not known) FetchMeetingMessage answers.
+        s.upsert_message("F", &msg("O", "2026-11-01T00:00:00Z", false))
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE messages SET is_event_message = NULL, meeting_type_known = 0",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            s.set_meeting_message_type("O", Some(T::Cancelled)).unwrap(),
+            Some("F".into())
+        );
+        assert_eq!(cols(&s, "O"), (Some(1), 1, Some("meetingCancelled".into())));
+        assert!(!pending(&s, "O"));
+        assert_eq!(
+            s.set_meeting_message_type("O", Some(T::Cancelled)).unwrap(),
+            None
+        );
+        // The right type stored, but not marked known: the flip is a change.
+        s.conn
+            .execute("UPDATE messages SET meeting_type_known = 0", [])
+            .unwrap();
+        assert_eq!(
+            s.set_meeting_message_type("O", Some(T::Cancelled)).unwrap(),
+            Some("F".into())
+        );
+        assert_eq!(cols(&s, "O").1, 1);
+    }
+
+    #[test]
+    fn a_store_from_before_2168_migrates_once_and_keeps_its_links() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-pre-2168-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        {
+            let s = Store::open(&path).unwrap();
+            folder(&s, "F");
+            folder(&s, "G");
+            // A request (is_meeting_request), a typed response, a plain row
+            // (perhaps a cancellation through a refused expand).
+            let mut req = msg("R", "2026-11-01T00:00:00Z", true);
+            req.is_meeting_request = true;
+            s.merge_message("F", &req, &refused()).unwrap();
+            let mut typed = msg("T", "2026-11-01T00:00:00Z", true);
+            typed.meeting_message_type = Some(T::Accepted);
+            s.upsert_message("F", &typed).unwrap();
+            s.merge_message("G", &msg("P", "2026-11-01T00:00:00Z", false), &refused())
+                .unwrap();
+            s.complete_backfill(
+                "F",
+                "https://graph/F?$deltatoken=1",
+                SCOPE_ALL,
+                7,
+                Some(true),
+            )
+            .unwrap();
+            s.set_head_link("G", "https://graph/G?$deltatoken=2", true)
+                .unwrap();
+            s.set_backfill_progress("G", "https://graph/G?$skiptoken=3", 4, SCOPE_ALL)
+                .unwrap();
+            // Back to a store from before #2168.
+            s.conn
+                .execute_batch(
+                    "DROP INDEX idx_messages_untyped;
+                     ALTER TABLE messages DROP COLUMN is_event_message;
+                     ALTER TABLE messages DROP COLUMN meeting_type_known;",
+                )
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(cols(&s, "R"), (Some(1), 0, None));
+        assert_eq!(cols(&s, "T"), (Some(1), 1, Some("meetingAccepted".into())));
+        assert_eq!(cols(&s, "P"), (None, 0, None));
+        assert!(pending(&s, "R") && pending(&s, "P") && !pending(&s, "T"));
+        assert!(!s.message_row("P").unwrap().unwrap().is_event_message);
+        assert_eq!(s.message_row("P").unwrap().unwrap().subject, "agenda P");
+        // No delta, backfill or expand-refused state is touched.
+        assert_eq!(
+            s.get_delta_link("F").unwrap().as_deref(),
+            Some("https://graph/F?$deltatoken=1")
+        );
+        assert_eq!(
+            s.get_delta_link("G").unwrap().as_deref(),
+            Some("https://graph/G?$deltatoken=2")
+        );
+        assert!(s.reminder_expand_refused("F").unwrap());
+        assert!(s.reminder_expand_refused("G").unwrap());
+        let (link, synced): (Option<String>, i64) = s
+            .conn
+            .query_row(
+                "SELECT backfill_link, backfill_synced FROM folders WHERE id = 'G'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (link.as_deref(), synced),
+            (Some("https://graph/G?$skiptoken=3"), 4)
+        );
+        // The index is back: F has a type candidate, G a kind one.
+        assert_eq!(s.type_fill_folders().unwrap(), ["F", "G"]);
+        assert_eq!(s.meeting_type_candidates("F", 4).unwrap(), ["R"]);
+        assert_eq!(s.event_kind_candidates("G").unwrap().unwrap().0, ["P"]);
+        // Idempotent: a second open migrates nothing and keeps the fill's
+        // writes.
+        assert!(!migrate_meeting_type_fill(&s.conn).unwrap());
+        s.set_event_kinds(&[("P".into(), false)]).unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(cols(&s, "P"), (Some(0), 0, None));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_store_has_the_columns_and_the_index() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(!migrate_meeting_type_fill(&s.conn).unwrap());
+        let n: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_messages_untyped'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn the_type_fill_probe_reads_the_partial_index() {
+        let s = Store::open_in_memory().unwrap();
+        let plan: Vec<String> = s
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", type_fill_folders_sql()))
+            .unwrap()
+            .query_map([LOCAL_DRAFTS_SENTINEL_FOLDER_ID], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|p| p.contains("idx_messages_untyped")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .filter(|p| p.contains("messages"))
+                .all(|p| p.contains("idx_messages_untyped")),
+            "{plan:?}"
         );
     }
 }

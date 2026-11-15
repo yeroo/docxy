@@ -9367,6 +9367,88 @@ mod tests {
         assert_eq!(reqs[1].path, "/me/mailFolders/F%201/messages?$skiptoken=P2");
     }
 
+    /// #2168: the kind listing asks for ids alone and reads each item's
+    /// `@odata.type` (an `eventMessage` or a subtype is a meeting message,
+    /// none or another type is not), skips an item without an id and
+    /// follows `@odata.nextLink`.
+    #[test]
+    fn message_kinds_page_reads_odata_type_and_follows_next_link() {
+        let srv = FakeServer::start(vec![
+            // The second page's route first: both share the prefix.
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F%201/messages?$skiptoken=P2".into(),
+                status: 200,
+                headers: vec![],
+                body: r##"{"value":[{"@odata.type":"#microsoft.graph.eventMessageResponse",
+                    "id":"D"}]}"##
+                    .into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F%201/messages".into(),
+                status: 200,
+                headers: vec![],
+                body: r##"{"value":[
+                    {"@odata.type":"#microsoft.graph.eventMessage","id":"A"},
+                    {"id":"B"},
+                    {"@odata.type":"#microsoft.graph.eventMessageRequest","id":"C"},
+                    {"@odata.type":"#microsoft.graph.message","id":"E"},
+                    {"@odata.type":"#microsoft.graph.eventMessage"}],
+                    "@odata.nextLink":"/me/mailFolders/F%201/messages?$skiptoken=P2"}"##
+                    .into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let first = GraphClient::message_kinds_target("F 1", "2026-01-02T03:04:05Z");
+        assert_eq!(
+            first,
+            "/me/mailFolders/F%201/messages\
+             ?$filter=receivedDateTime%20ge%202026-01-02T03:04:05Z\
+             &$select=id&$top=1000"
+        );
+        let (items, next) = c.message_kinds_page(&first).unwrap();
+        let s = |id: &str, e: bool| (id.to_string(), e);
+        assert_eq!(
+            items,
+            [s("A", true), s("B", false), s("C", true), s("E", false)]
+        );
+        let next = next.unwrap();
+        let (items, next) = c.message_kinds_page(&next).unwrap();
+        assert_eq!(items, [s("D", true)]);
+        assert_eq!(next, None);
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].path, first);
+        assert_eq!(reqs[1].path, "/me/mailFolders/F%201/messages?$skiptoken=P2");
+    }
+
+    /// #2168: the type fill's per-item GET: the class expand alone, or the
+    /// plain GET, the id percent-encoded.
+    #[test]
+    fn meeting_type_request_urls() {
+        let r = GraphClient::meeting_type_request("A/B+C=", TypeTier::Class);
+        assert_eq!(r.method, "GET");
+        assert_eq!(
+            r.url,
+            "/me/messages/A%2FB%2BC%3D?$select=id\
+             &$expand=singleValueExtendedProperties($filter=id%20eq%20%27String%200x001A%27)"
+        );
+        assert!(r.headers.is_empty() && r.body.is_none());
+        let decoded = MESSAGE_CLASS_EXPAND.replace("%20", " ").replace("%27", "'");
+        assert_eq!(
+            decoded,
+            format!(
+                "singleValueExtendedProperties($filter=id eq '{}')",
+                crate::graph::model::MESSAGE_CLASS_PROP
+            )
+        );
+        let r = GraphClient::meeting_type_request("A/B+C=", TypeTier::Plain);
+        assert_eq!(r.method, "GET");
+        assert_eq!(r.url, "/me/messages/A%2FB%2BC%3D");
+        assert!(r.headers.is_empty() && r.body.is_none());
+    }
+
     /// #2123: a folder's size is a GET of the folder with its
     /// `PidTagMessageSizeExtended` alone, the id percent-encoded.
     #[test]

@@ -4760,6 +4760,36 @@ mod tests {
     }
 
     #[test]
+    fn is_event_message_reads_every_event_message_type() {
+        // #2168: an `eventMessage` and every subtype is one, whatever its
+        // meeting type, and the flag needs no class (a refused expand).
+        for t in [
+            "#microsoft.graph.eventMessage",
+            "#microsoft.graph.eventMessageRequest",
+            "#microsoft.graph.eventMessageResponse",
+            "#microsoft.graph.eventMessageFuture",
+        ] {
+            let m = Message::from_json(&delta_item(Some(t), None)).unwrap();
+            assert!(m.is_event_message, "{t}");
+            assert!(is_event_message_type(t), "{t}");
+            assert_eq!(m.meeting_message_type, None, "{t}: no class, no type");
+        }
+        // Only a request is a meeting request.
+        let cancel = Message::from_json(&delta_item(Some("#microsoft.graph.eventMessage"), None));
+        assert!(!cancel.unwrap().is_meeting_request);
+        // No annotation (a plain message) or another type is none.
+        for t in [None, Some("#microsoft.graph.message"), Some("eventMessage")] {
+            let m = Message::from_json(&delta_item(t, None)).unwrap();
+            assert!(!m.is_event_message, "{t:?}");
+        }
+        // The kind is written under `is_meeting_request`'s rule: a carried
+        // annotation or a complete item.
+        let v = delta_item(Some("#microsoft.graph.eventMessage"), None);
+        assert!(MessageFields::of(&v).writes_meeting_request());
+        assert!(!MessageFields::of(&v).writes_meeting_type());
+    }
+
+    #[test]
     fn meeting_reminder_is_false_on_a_plain_message() {
         // An unflagged IPM.Note with the bit and readable times: no meeting
         // reminder, and no flag reminder either, as before.
