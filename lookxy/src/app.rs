@@ -1121,8 +1121,10 @@ impl App {
     /// A different mailbox signed in and the engine emptied the store for it
     /// (#1946): drops everything held from the old mailbox (the open
     /// message, the folder selection, a search, a filter, the popups over
-    /// them, progress lines), re-reads the now empty store, and tells the
-    /// user. The new mailbox's Inbox is expanded once it arrives, as on a
+    /// them, progress lines; the selected event, an RSVP prompt, an event
+    /// form and a pending confirm, which name its ids; its reminder banners
+    /// and alerted reminders, whose Esc would dismiss an old event), re-reads
+    /// the now empty store, and tells the user. The new mailbox's Inbox is expanded once it arrives, as on a
     /// first run. An open compose window keeps its text; its draft id is
     /// the old mailbox's.
     fn on_mailbox_changed(&mut self, dropped_ops: usize) {
@@ -1139,6 +1141,12 @@ impl App {
         self.upload_progress = None;
         self.backfill = None;
         self.folders_up_to_date.clear();
+        self.selected_event = None;
+        self.rsvp_prompt = None;
+        self.event_form = None;
+        self.confirm = None;
+        self.reminder_queue.clear();
+        self.alerted_reminders.clear();
         self.folder_tree_initialized = false;
         self.reload_body();
         self.reload_account();

@@ -246,11 +246,31 @@ mod tests {
         app.reload_folders();
         app.open_message("m1");
         app.folder_tree_initialized = true;
+        // What the old mailbox left on screen: a reminder banner, a
+        // selected event, a pending confirm naming its event.
+        app.reminder_queue.push_back(crate::app::ReminderBanner {
+            event_id: "EA".into(),
+            text: "Standup".into(),
+        });
+        app.alerted_reminders.insert("EA".into());
+        app.selected_event = Some("EA".into());
+        app.confirm = Some(backstagecore::Confirm::new(
+            "Delete event 'Standup'?",
+            crate::app::ConfirmAction::DeleteEvent("EA".into()),
+            ratatui::style::Color::Cyan,
+        ));
         assert_eq!(app.selected_folder.as_deref(), Some("inbox"));
         assert_eq!(app.selected_msg.as_deref(), Some("m1"));
         // What the engine did before it sent the event.
         app.store.reset_mailbox("ROOT_B").unwrap();
         app.on_sync_event(SyncEvent::MailboxChanged { dropped_ops: 3 });
+        // The first run's Inbox expansion is owed again.
+        assert!(!app.folder_tree_initialized);
+        assert!(app.reminder_queue.is_empty());
+        assert!(app.alerted_reminders.is_empty());
+        assert_eq!(app.selected_event, None);
+        assert!(app.rsvp_prompt.is_none() && app.event_form.is_none());
+        assert!(app.confirm.is_none());
         app.on_sync_event(SyncEvent::FoldersUpdated);
         app.on_sync_event(SyncEvent::State(SyncState::Idle));
         assert!(app.folders.is_empty());
@@ -280,6 +300,7 @@ mod tests {
         app.on_sync_event(SyncEvent::FoldersUpdated);
         assert_eq!(app.selected_folder.as_deref(), Some("FB"));
         assert!(app.folder_tree_initialized);
+        assert!(app.folders.iter().any(|f| f.id == "FB" && f.is_expanded));
         assert!(app.mailbox_notice.is_some());
     }
 

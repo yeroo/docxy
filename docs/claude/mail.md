@@ -4388,7 +4388,9 @@ literally would break.
   answers.
 - lookxy (`App::on_mailbox_changed`): drops the selection, open message and body, search,
   category filter, move picker and attachments popup, inline images, upload and backfill lines
-  and `folders_up_to_date`, sets `folder_tree_initialized` false (the new Inbox expands as on
+  and `folders_up_to_date`, the selected event, an RSVP prompt, an event form and a pending
+  confirm (they name old ids), the reminder banners and alerted reminders (Esc would dismiss an
+  old event on the server), sets `folder_tree_initialized` false (the new Inbox expands as on
   a first run), re-reads account, folders, categories and agenda, and sets
   `App::mailbox_notice` ("Signed in to another mailbox: local mail cleared[, N unsent
   change(s) dropped]"), drawn ahead of the counts. The pass's `State(Idle)` clears
