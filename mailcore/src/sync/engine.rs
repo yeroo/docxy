@@ -4532,7 +4532,8 @@ impl Engine {
     /// order holding a row it may ask about (`Store::size_fill_folders`,
     /// a probe of `idx_messages_unsized` that costs nothing once every row
     /// is sized) and not parked. The main loop asks only when neither the
-    /// prefetch nor the backfill has work, so both go first. A store error
+    /// prefetch, the backfill nor the meeting type fill (#2168) has work,
+    /// so all three go first. A store error
     /// stops the fill until the next step reads it again.
     fn next_size_fill(&self) -> Option<String> {
         if !self.config.options.size_fill
@@ -4873,7 +4874,13 @@ impl Engine {
     /// - any other `Plain` 4xx marks the type known, with one `Error` for
     ///   the batch.
     ///
-    /// So no row is asked more than twice. A whole-call failure: auth,
+    /// So a row that gets an answer is asked at most once with `Class` and
+    /// once with `Plain`. A row answered 429, 503 or another 5xx is marked
+    /// nothing and is asked again on a later pass (the parked set clears
+    /// each pass), so an item Graph always answers with a 5xx is asked once
+    /// a pass and holds one of the batch's slots; and since
+    /// `meeting_class_refused` lives in memory, a restart after a `Class`
+    /// refusal costs one more `Class` batch. A whole-call failure: auth,
     /// throttle and transport through `react`; anything else is one
     /// `Error` and parks the folder. `MessagesUpdated` for every folder a
     /// write changed.
@@ -28161,7 +28168,8 @@ mod tests {
         /// carrying no class (a dropped expand) leaves the row for the
         /// plain GET in the next step, which writes its top-level type
         /// (`None` when it has none) or, refused too, marks it known with
-        /// one `Error`. No row is asked a third time.
+        /// one `Error`. A row so answered is asked once with each tier,
+        /// never a third time.
         #[test]
         fn a_refused_or_dropped_class_expand_falls_back_to_the_plain_get() {
             let srv = FakeServer::start_limited(vec![

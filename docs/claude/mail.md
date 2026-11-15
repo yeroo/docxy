@@ -3665,9 +3665,9 @@ A host can draw classic Outlook's Folder Size dialog. The Local Data tab comes f
     request). Before **every** page, not only the first, a folder gone from the store, being
     deleted (#2107) or being emptied (#2110) drops the fill and parks the folder quietly: no
     request and no `Error`.
-  - Order in `main_loop`: the prefetch, then the backfill, then the size fill. A ready fill
-    makes the wait zero, and its step runs only when `!self.due()`, so a queued command and a
-    due wake go first.
+  - Order in `main_loop`: the prefetch, then the backfill, then the meeting type fill (#2168),
+    then the size fill. A ready fill makes the wait zero, and its step runs only when
+    `!self.due()`, so a queued command and a due wake go first.
   - One page per idle step: `GraphClient::message_sizes_target(folder, oldest)` is
     `GET /me/mailFolders/{id}/messages?$filter=receivedDateTime ge {oldest}&$select=id&$top=1000
     &$expand=` its size alone. `message_sizes_page` then follows each `@odata.nextLink`. Graph
@@ -4350,7 +4350,8 @@ literally would break.
   makes it a full one), the top of `drain_outbox` after its shutdown return (`Blocked` and
   `Reset` are `Drain::Aborted`, a reset after `settle_state`, so `sync_one_folder`,
   `on_fast_tick`, `clear_offline_items` and `drain_queued` stop before touching an old id), and
-  `next_prefetch`, `next_backfill`, `next_size_fill` (`None` while owed). `on_tick` runs no
+  `next_prefetch`, `next_backfill`, `next_type_fill` (#2168), `next_size_fill` (`None` while
+  owed). `on_tick` runs no
   calendar refresh while owed, nor does `refresh_if_calendar_reset_owed` (a reset owed from the
   last session, run after `sign_in`'s and `Refresh`'s pass): either would write this account's
   calendar into the other mailbox's store. Every op is
@@ -4679,13 +4680,18 @@ mail, and every request kept only `is_meeting_request`.
       - a 429 or 503 marks nothing and backs off (`react_quietly(Throttled)`);
       - another 5xx parks the folder;
       - a `Plain` 4xx marks the row known, with one `Error` for the batch.
-    - So a row is asked at most twice. `meeting_class_refused` lives in memory and is cleared
-      by `drop_type_fill`, so each start of the engine costs at most one refused `Class`
-      batch.
+    - So a row that gets an answer is asked at most once with `Class` and once with `Plain`.
+      A row answered 429, 503 or another 5xx is marked nothing and asked again on a later
+      pass (the pass clears the parked set): an item Graph always answers with a 5xx is asked
+      once a pass and holds one of the batch's four slots. `meeting_class_refused` lives in
+      memory and is cleared by `drop_type_fill`, so a restart after a `Class` refusal costs
+      one more `Class` batch.
   - Every fill write (`set_event_kinds`, `mark_event_kinds_unlisted`, `set_meeting_types`,
     `mark_meeting_type_known`) returns the folders of the rows it actually wrote. The engine
-    emits one `MessagesUpdated` per folder per step, so a write that only flips
-    `meeting_type_pending` (a `None` answer, a 404, a kind) is told too.
+    emits one `MessagesUpdated` per folder per step, so a write that changes no type is told
+    too: a `None` answer or a 404 flips `meeting_type_pending`, and a kind write changes the
+    row's `is_event_message` (and, for a plain message, its `meeting_type_pending`; a meeting
+    message stays pending until its type is known).
 - `FetchMeetingMessage`'s `set_meeting_message_type` also sets `meeting_type_known` and
   `is_event_message`. "Changed" now counts any of the three, so its `MessagesUpdated` follows
   a pending flag that flipped.
