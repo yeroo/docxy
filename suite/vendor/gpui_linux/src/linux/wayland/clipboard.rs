@@ -285,6 +285,13 @@ impl Clipboard {
     pub fn set_offer(&mut self, data_offer: Option<DataOffer<WlDataOffer>>) {
         self.cached_read = None;
         self.current_offer = data_offer;
+        // A selection that is not gpui's ends its copy, also when the
+        // compositor refused the write without a `cancelled` (#1966).
+        let offer_is_ours = self
+            .current_offer
+            .as_ref()
+            .map(|offer| offer.has_mime_type(&self.self_mime));
+        self.own.selection_changed(offer_is_ours);
     }
 
     pub fn set_primary_offer(&mut self, data_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>) {
@@ -317,8 +324,9 @@ impl Clipboard {
         // gpui's own copy while its source is alive: right after a write the
         // compositor's `selection` echo is not dispatched yet, and the offer
         // is still the previous owner's (#1966).
-        if self.own.alive() {
-            return self.contents.clone();
+        match self.whose() {
+            Whose::Own => return self.contents.clone(),
+            Whose::Offer | Whose::Nothing => {}
         }
         let offer = self.current_offer.as_ref()?;
         if let Some(cached) = self.cached_read.clone() {

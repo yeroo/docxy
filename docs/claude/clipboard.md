@@ -114,11 +114,16 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
   compositor's `selection` echo is not dispatched yet): after another app's
   copy, `rtf_follows` failed and `recorded_after_write` recorded the other
   app's text. `Clipboard::set` forgets the source (a write skipped for want of
-  a serial leaves none), `set_source` follows `set_selection`, and a
-  `cancelled` forgets it only when it is the tracked one.
+  a serial leaves none), `set_source` follows `set_selection`, a `cancelled`
+  forgets it only when it is the tracked one, and so does a `selection` that
+  is not gpui's own (none, or no `pid/<pid>`): mutter refuses an older serial
+  without a `cancelled`. Such a refused write answers as gpui's own until the
+  next `selection` event. The formats stay until gpui's next copy, for an own
+  offer (`pid/`) that follows.
 - A paste: `mime_types()` (gpui's own copy's while alive, else the offer's),
-  `pick_mime` (`RTF_TYPES` in order; `text/html`, else a `text/html;…` by
-  `is_html_type`, both shared with X11), then `read(mime, MAX_RTF)`: gpui's
+  `pick_mime` (`RTF_TYPES` in order, the same names X11's `read_rtf` lists
+  as its own atoms; `text/html`, else a `text/html;…` by `is_html_type`,
+  which X11 shares, as it does `utf8_page`), then `read(mime, MAX_RTF)`: gpui's
   own copy from memory (never a pipe: gpui serves pipes on the waiting
   thread), another app's through the offer's pipe, bounded, waiting up to
   gpui's 4 s as its text paste does. HTML through `utf8_page`. `hand_over`

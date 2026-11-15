@@ -115,8 +115,9 @@ pub(crate) fn cf_html(fragment: &str) -> String {
     )
 }
 
-/// The RTF mimes a Linux paste reads, in its order of preference (X11's
-/// targets by these names, #1950; Wayland's offer, #1966).
+/// The RTF mimes a Wayland paste reads off the offer, in its order of
+/// preference (#1966). X11 lists the same names, in the same order, as its
+/// own interned atoms (`x11.rs` `read_rtf`, #1950).
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 const RTF_TYPES: [&str; 3] = ["text/rtf", "application/rtf", "text/richtext"];
 

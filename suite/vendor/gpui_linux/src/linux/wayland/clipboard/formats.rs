@@ -51,6 +51,18 @@ impl<S: PartialEq> OwnCopy<S> {
         }
     }
 
+    /// The selection changed to an offer that is gpui's own (`Some(true)`,
+    /// it carries `pid/<pid>`), another app's, or none. Anything but gpui's
+    /// own ends the copy, also when the compositor refused gpui's write and
+    /// sent no `cancelled` (mutter refuses an older serial so). The formats
+    /// stay: an own offer that comes after (the echo of the suite's source,
+    /// behind a stale one) serves them through the `pid/` path.
+    pub(crate) fn selection_changed(&mut self, offer_is_ours: Option<bool>) {
+        if offer_is_ours != Some(true) {
+            self.source = None;
+        }
+    }
+
     /// Whether gpui's latest copy is still the selection, as far as any
     /// event so far says.
     pub(crate) fn alive(&self) -> bool {
@@ -267,6 +279,26 @@ mod tests {
         assert_eq!(whose(copy.alive(), Some(false)), Whose::Offer);
         copy.set_source(2);
         assert_eq!(whose(copy.alive(), Some(false)), Whose::Own);
+    }
+
+    /// A selection that is not gpui's own ends its copy (a refused write
+    /// gets no `cancelled`); its own echo keeps it, and the formats stay for
+    /// the `pid/` path either way.
+    #[test]
+    fn a_selection_not_ours_ends_the_copy() {
+        let mut copy = copy_with(&[("text/rtf", "{\\rtf1 a}")]);
+        copy.set_source(1);
+        copy.selection_changed(Some(true));
+        assert!(copy.alive());
+        copy.selection_changed(Some(false));
+        assert!(!copy.alive());
+        assert_eq!(whose(copy.alive(), Some(false)), Whose::Offer);
+        assert_eq!(whose(copy.alive(), Some(true)), Whose::Own);
+        assert_eq!(copy.bytes("text/rtf"), Some(&b"{\\rtf1 a}"[..]));
+        copy.set_source(2);
+        copy.selection_changed(None);
+        assert!(!copy.alive());
+        assert_eq!(whose(copy.alive(), None), Whose::Nothing);
     }
 
     #[test]

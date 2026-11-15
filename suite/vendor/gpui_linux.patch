@@ -305,10 +305,10 @@ index 81ed5b7..3b2fc69 100644
              _ => {}
 diff --git b/src/linux/wayland/clipboard/formats.rs b/src/linux/wayland/clipboard/formats.rs
 new file mode 100644
-index 0000000..2969f5f
+index 0000000..a809c19
 --- /dev/null
 +++ b/src/linux/wayland/clipboard/formats.rs
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,330 @@
 +// Added for docxy (#1966): the formats a copy offers beside gpui's text.
 +
 +//! What gpui's own latest copy is on the Wayland selection, beside its text.
@@ -358,6 +358,18 @@ index 0000000..2969f5f
 +    /// which must not forget the new.
 +    pub(crate) fn cancelled(&mut self, source: &S) {
 +        if self.source.as_ref() == Some(source) {
++            self.source = None;
++        }
++    }
++
++    /// The selection changed to an offer that is gpui's own (`Some(true)`,
++    /// it carries `pid/<pid>`), another app's, or none. Anything but gpui's
++    /// own ends the copy, also when the compositor refused gpui's write and
++    /// sent no `cancelled` (mutter refuses an older serial so). The formats
++    /// stay: an own offer that comes after (the echo of the suite's source,
++    /// behind a stale one) serves them through the `pid/` path.
++    pub(crate) fn selection_changed(&mut self, offer_is_ours: Option<bool>) {
++        if offer_is_ours != Some(true) {
 +            self.source = None;
 +        }
 +    }
@@ -580,6 +592,26 @@ index 0000000..2969f5f
 +        assert_eq!(whose(copy.alive(), Some(false)), Whose::Own);
 +    }
 +
++    /// A selection that is not gpui's own ends its copy (a refused write
++    /// gets no `cancelled`); its own echo keeps it, and the formats stay for
++    /// the `pid/` path either way.
++    #[test]
++    fn a_selection_not_ours_ends_the_copy() {
++        let mut copy = copy_with(&[("text/rtf", "{\\rtf1 a}")]);
++        copy.set_source(1);
++        copy.selection_changed(Some(true));
++        assert!(copy.alive());
++        copy.selection_changed(Some(false));
++        assert!(!copy.alive());
++        assert_eq!(whose(copy.alive(), Some(false)), Whose::Offer);
++        assert_eq!(whose(copy.alive(), Some(true)), Whose::Own);
++        assert_eq!(copy.bytes("text/rtf"), Some(&b"{\\rtf1 a}"[..]));
++        copy.set_source(2);
++        copy.selection_changed(None);
++        assert!(!copy.alive());
++        assert_eq!(whose(copy.alive(), None), Whose::Nothing);
++    }
++
 +    #[test]
 +    fn text_compares_loosely_over_line_ends() {
 +        assert!(same_text("a\r\nb", "a\nb"));
@@ -608,7 +640,7 @@ index 0000000..2969f5f
 +    }
 +}
 diff --git a/src/linux/wayland/clipboard.rs b/src/linux/wayland/clipboard.rs
-index dfedf53..a624899 100644
+index dfedf53..57fa893 100644
 --- a/src/linux/wayland/clipboard.rs
 +++ b/src/linux/wayland/clipboard.rs
 @@ -1,3 +1,5 @@
@@ -773,7 +805,21 @@ index dfedf53..a624899 100644
      }
  
      pub fn set_primary(&mut self, item: ClipboardItem) {
-@@ -180,9 +296,10 @@ impl Clipboard {
+@@ -169,6 +285,13 @@ impl Clipboard {
+     pub fn set_offer(&mut self, data_offer: Option<DataOffer<WlDataOffer>>) {
+         self.cached_read = None;
+         self.current_offer = data_offer;
++        // A selection that is not gpui's ends its copy, also when the
++        // compositor refused the write without a `cancelled` (#1966).
++        let offer_is_ours = self
++            .current_offer
++            .as_ref()
++            .map(|offer| offer.has_mime_type(&self.self_mime));
++        self.own.selection_changed(offer_is_ours);
+     }
+ 
+     pub fn set_primary_offer(&mut self, data_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>) {
+@@ -180,9 +303,10 @@ impl Clipboard {
          self.self_mime.clone()
      }
  
@@ -787,15 +833,16 @@ index dfedf53..a624899 100644
          }
      }
  
-@@ -197,6 +314,12 @@ impl Clipboard {
+@@ -197,6 +321,13 @@ impl Clipboard {
      }
  
      pub fn read(&mut self) -> Option<ClipboardItem> {
 +        // gpui's own copy while its source is alive: right after a write the
 +        // compositor's `selection` echo is not dispatched yet, and the offer
 +        // is still the previous owner's (#1966).
-+        if self.own.alive() {
-+            return self.contents.clone();
++        match self.whose() {
++            Whose::Own => return self.contents.clone(),
++            Whose::Offer | Whose::Nothing => {}
 +        }
          let offer = self.current_offer.as_ref()?;
          if let Some(cached) = self.cached_read.clone() {
