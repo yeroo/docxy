@@ -44,8 +44,10 @@ use crate::graph::client::{
     EventFieldSet, EventInput, GraphClient, GraphError, HTTP_ERROR_TEXT_MAX, RsvpKind,
     UploadObserver, graph_error_message, one_line,
 };
-use crate::graph::model::{MeetingMessage, MeetingMessageType, Recipient};
-use crate::store::{OutboundAttachment, OutboxOp, Store};
+use crate::graph::model::{
+    DraftOptions, Importance, MeetingMessage, MeetingMessageType, Recipient,
+};
+use crate::store::{MessageRow, OutboundAttachment, OutboxOp, Store};
 
 /// What an applied op left for the caller to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -956,7 +958,8 @@ fn content_type_for(name: &str) -> String {
 /// already reconciled to its Graph id (#1884, #1881), and create vs update is
 /// decided by the id it is stored under now (`row.id`), not by `id`. Still
 /// `local:` (never yet pushed): `create_draft`s it with its stored
-/// subject/recipients/body and reconciles the store (`Store::reconcile_id`)
+/// subject/recipients/body, importance and flag (`draft_options`, #1955)
+/// and reconciles the store (`Store::reconcile_id`)
 /// to the Graph-minted id, which the rest of Graph (and the next `SendDraft`,
 /// if this was a `SaveDraft`) now knows it by. Otherwise `update_draft`s the
 /// Graph id in place with whatever is currently stored and returns it, so a
@@ -983,18 +986,31 @@ fn ensure_draft_on_graph(
     let to = parse_recipients(&row.to_recipients);
     let cc = parse_recipients(&row.cc_recipients);
     let bcc = parse_recipients(&row.bcc_recipients);
+    let opts = draft_options(&row);
 
     if row.id.starts_with("local:") {
-        let created = client.create_draft(&body.content, &row.subject, &to, &cc, &bcc)?;
+        let created = client.create_draft(&body.content, &row.subject, &to, &cc, &bcc, &opts)?;
         store
             .reconcile_id(&row.id, &created.id)
             .map_err(|e| GraphError::Parse(e.to_string()))?;
         mark_pushed(store, &created.id, generation);
         Ok(created.id)
     } else {
-        client.update_draft(&row.id, &body.content, &row.subject, &to, &cc, &bcc)?;
+        client.update_draft(&row.id, &body.content, &row.subject, &to, &cc, &bcc, &opts)?;
         mark_pushed(store, &row.id, generation);
         Ok(row.id)
+    }
+}
+
+/// The importance and follow-up flag a draft's row holds, as
+/// `create_draft` / `update_draft` send them (#1955): an empty or unknown
+/// stored importance is `Normal`, and a due time that cannot be read goes
+/// out as a flag with no dates (`draft_body_json`).
+fn draft_options(row: &MessageRow) -> DraftOptions {
+    DraftOptions {
+        importance: Importance::from_stored(&row.importance),
+        flagged: row.is_flagged,
+        flag_due_utc: row.flag_due_at.clone(),
     }
 }
 
@@ -4947,5 +4963,184 @@ mod tests {
             }
         );
         assert_eq!(srv.requests()[0].path, "/me/mailFolders/INBOX/copy");
+    }
+
+    /// High importance, flagged, due 2026-12-01 17:00 UTC (#1955).
+    fn high_flagged() -> DraftOptions {
+        DraftOptions {
+            importance: Importance::High,
+            flagged: true,
+            flag_due_utc: "2026-12-01T17:00:00Z".into(),
+        }
+    }
+
+    /// The `flag` `high_flagged` goes out as (#1955).
+    const HIGH_FLAGGED_FLAG: &str = r#"{"flagStatus":"flagged","startDateTime":{"dateTime":"2026-12-01T17:00:00","timeZone":"UTC"},"dueDateTime":{"dateTime":"2026-12-01T17:00:00","timeZone":"UTC"}}"#;
+
+    /// A draft request body's `importance` and `flag` (#1955).
+    fn importance_and_flag(body: &str) -> (String, String) {
+        let sent = json::parse(body).unwrap();
+        (
+            sent.get("importance")
+                .and_then(Value::as_str)
+                .unwrap_or("<none>")
+                .to_string(),
+            sent.get("flag")
+                .map(Value::to_string)
+                .unwrap_or_else(|| "<none>".to_string()),
+        )
+    }
+
+    #[test]
+    fn save_draft_sends_importance_and_flag_on_create_and_patch() {
+        let srv = FakeServer::start(vec![
+            route("PATCH", "/me/messages/GRAPH-1", 200, "{}"),
+            route("POST", "/me/messages", 201, &draft_json("GRAPH-1", "Hi")),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store
+            .create_local_draft("Hi", "bob@x", "", "<p>hello</p>")
+            .unwrap();
+        store.set_draft_options(&local_id, &high_flagged()).unwrap();
+        let save = OutboxOp::SaveDraft {
+            id: local_id.clone(),
+        };
+
+        apply_op(&c, &store, &save).unwrap();
+        // The next save PATCHes the same options; a change in between is sent.
+        apply_op(&c, &store, &save).unwrap();
+        let low = DraftOptions {
+            importance: Importance::Low,
+            ..DraftOptions::default()
+        };
+        store.set_draft_options(&local_id, &low).unwrap();
+        apply_op(&c, &store, &save).unwrap();
+
+        let reqs = srv.requests();
+        let seen: Vec<(&str, &str)> = reqs
+            .iter()
+            .map(|r| (r.method.as_str(), r.path.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("POST", "/me/messages"),
+                ("PATCH", "/me/messages/GRAPH-1"),
+                ("PATCH", "/me/messages/GRAPH-1"),
+            ]
+        );
+        let high = ("high".to_string(), HIGH_FLAGGED_FLAG.to_string());
+        assert_eq!(importance_and_flag(&reqs[0].body), high);
+        assert_eq!(importance_and_flag(&reqs[1].body), high);
+        assert_eq!(
+            importance_and_flag(&reqs[2].body),
+            (
+                "low".to_string(),
+                r#"{"flagStatus":"notFlagged"}"#.to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn send_draft_creates_with_importance_and_flag() {
+        let srv = FakeServer::start(vec![
+            route("POST", "/me/messages/GRAPH-9/send", 202, ""),
+            route("POST", "/me/messages", 201, &draft_json("GRAPH-9", "Hi")),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store
+            .create_local_draft("Hi", "bob@x", "", "<p>hello</p>")
+            .unwrap();
+        store.set_draft_options(&local_id, &high_flagged()).unwrap();
+
+        apply_op(&c, &store, &OutboxOp::SendDraft { id: local_id }).unwrap();
+
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].path, "/me/messages");
+        assert_eq!(
+            importance_and_flag(&reqs[0].body),
+            ("high".to_string(), HIGH_FLAGGED_FLAG.to_string())
+        );
+        assert!(reqs[1].path.starts_with("/me/messages/GRAPH-9/send"));
+    }
+
+    #[test]
+    fn a_draft_without_options_sends_normal_and_not_flagged() {
+        let srv = FakeServer::start(vec![
+            route("PATCH", "/me/messages/GRAPH-1", 200, "{}"),
+            route("POST", "/me/messages", 201, &draft_json("GRAPH-1", "Hi")),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store.create_local_draft("Hi", "b@x", "", "body").unwrap();
+        let save = OutboxOp::SaveDraft { id: local_id };
+
+        apply_op(&c, &store, &save).unwrap();
+        apply_op(&c, &store, &save).unwrap();
+
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        let normal = (
+            "normal".to_string(),
+            r#"{"flagStatus":"notFlagged"}"#.to_string(),
+        );
+        assert_eq!(importance_and_flag(&reqs[0].body), normal);
+        assert_eq!(importance_and_flag(&reqs[1].body), normal);
+    }
+
+    #[test]
+    fn a_junk_stored_importance_sends_normal() {
+        // Rows stored from Graph (a reply draft, a draft made elsewhere)
+        // hold whatever importance Graph gave, or "" when it gave none.
+        let srv = FakeServer::start(vec![route("PATCH", "/me/messages/D", 200, "{}")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_folder(&MailFolder {
+                id: "DRAFTS".into(),
+                display_name: "Drafts".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: Some("drafts".into()),
+            })
+            .unwrap();
+        for (id, importance) in [("D1", r#","importance":"URGENT""#), ("D2", "")] {
+            let draft = Message::from_json(
+                &json::parse(&format!(
+                    r#"{{"id":"{id}","subject":"s","isDraft":true,
+                        "flag":{{"flagStatus":"flagged","dueDateTime":
+                            {{"dateTime":"not a time","timeZone":"UTC"}}}}{importance}}}"#
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            store.upsert_message("DRAFTS", &draft).unwrap();
+            store
+                .put_body(
+                    id,
+                    &Body {
+                        content_type: "html".into(),
+                        content: "<p>b</p>".into(),
+                    },
+                )
+                .unwrap();
+            apply_op(&c, &store, &OutboxOp::SaveDraft { id: id.into() }).unwrap();
+        }
+
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].path, "/me/messages/D1");
+        assert_eq!(reqs[1].path, "/me/messages/D2");
+        // A flag whose due time could not be read goes as a bare flag.
+        let bare = (
+            "normal".to_string(),
+            r#"{"flagStatus":"flagged"}"#.to_string(),
+        );
+        assert_eq!(importance_and_flag(&reqs[0].body), bare);
+        assert_eq!(importance_and_flag(&reqs[1].body), bare);
     }
 }
