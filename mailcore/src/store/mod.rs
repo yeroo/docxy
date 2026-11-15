@@ -2915,6 +2915,126 @@ impl Store {
         Ok(())
     }
 
+    /// The id of the root folder (`msgfolderroot`) of the mailbox that
+    /// filled this store (#1946, `meta.mailbox_root`), or `None` for a store
+    /// no sign-in has checked yet (every store from before #1946).
+    pub fn mailbox_root(&self) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'mailbox_root'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Records `root` as the mailbox that fills this store (#1946), and
+    /// clears an owed check ([`Store::mailbox_check_owed`]) with it: the
+    /// check that records it is that check.
+    pub fn set_mailbox_root(&self, root: &str) -> Result<(), StoreError> {
+        let tx = self.write_tx()?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('mailbox_root', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![root],
+        )?;
+        tx.execute("DELETE FROM meta WHERE key = 'mailbox_check_owed'", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether an interactive sign-in's mailbox check is still owed (#1946,
+    /// `meta.mailbox_check_owed`): set before the new token is saved, so a
+    /// check that failed, or a process that exited before it, is made at
+    /// the next start before anything is drained or synced.
+    pub fn mailbox_check_owed(&self) -> Result<bool, StoreError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM meta WHERE key = 'mailbox_check_owed'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Marks the mailbox check owed (#1946): see
+    /// [`Store::mailbox_check_owed`].
+    pub fn set_mailbox_check_owed(&self) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('mailbox_check_owed', '1')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// The mailbox check is made (#1946): see [`Store::mailbox_check_owed`].
+    pub fn clear_mailbox_check_owed(&self) -> Result<(), StoreError> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key = 'mailbox_check_owed'", [])?;
+        Ok(())
+    }
+
+    /// The parents of the stored top-level folders (#1946): the distinct
+    /// `parent_id`s that are not themselves stored folders, the rule
+    /// `root_folder_id_on` uses. In a synced store that is the id of the
+    /// mailbox's root folder (`msgfolderroot`), which is never listed; so it
+    /// tells which mailbox filled a store from before `meta.mailbox_root`.
+    /// Empty before any folder listing.
+    pub fn top_level_parents(&self) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT parent_id FROM folders
+             WHERE parent_id IS NOT NULL
+               AND parent_id NOT IN (SELECT id FROM folders)
+             ORDER BY parent_id",
+        )?;
+        let parents = stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(parents)
+    }
+
+    /// Empties the store for another mailbox (#1946): every table but
+    /// `meta` (folders, messages, bodies, the FTS index, the outbox, the
+    /// calendar, contacts, and any table added later: they are enumerated
+    /// from `pragma_table_list`, whose FTS5 shadow tables are of type
+    /// `shadow` and drop out), and of `meta` every key but `schema_version`;
+    /// then records `root` as the mailbox (`meta.mailbox_root`). Returns how
+    /// many outbox rows (queued changes of the old mailbox, unsent) it
+    /// dropped.
+    ///
+    /// One transaction, with `defer_foreign_keys` (tables are emptied in any
+    /// order) and without the delete triggers: `messages_fts_ad` and
+    /// `bodies_fts_ad` scan the whole FTS table per row (#2110), and the
+    /// `forgotten_*_ad` ones would fill `forgotten_ids` with the old
+    /// mailbox's ids. The triggers are created again before the commit (DDL
+    /// is transactional: a failure rolls the drop back too).
+    pub fn reset_mailbox(&self, root: &str) -> Result<usize, StoreError> {
+        let tx = self.write_tx()?;
+        let dropped: i64 = tx.query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0))?;
+        tx.pragma_update(None, "defer_foreign_keys", "ON")?;
+        for sql in [
+            schema::FTS_DELETE_TRIGGERS_SQL,
+            schema::FORGOTTEN_TRIGGERS_SQL,
+        ] {
+            for name in created_trigger_names(sql) {
+                tx.execute_batch(&format!("DROP TRIGGER IF EXISTS {name};"))?;
+            }
+        }
+        for table in mailbox_tables_on(&tx)? {
+            tx.execute(&format!("DELETE FROM \"{table}\""), [])?;
+        }
+        tx.execute_batch(schema::FTS_DELETE_TRIGGERS_SQL)?;
+        tx.execute_batch(schema::FORGOTTEN_TRIGGERS_SQL)?;
+        tx.execute("DELETE FROM meta WHERE key <> 'schema_version'", [])?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('mailbox_root', ?1)",
+            params![root],
+        )?;
+        tx.commit()?;
+        Ok(dropped as usize)
+    }
+
     /// Stores a folder's head delta link (#1871: its recent mail, run in
     /// the sync pass), marking what it covers as [`SCOPE_HEAD`], and
     /// whether its walk's first call was refused the reminder `$expand`
@@ -7580,6 +7700,33 @@ fn root_folder_id_on(conn: &Connection) -> Result<Option<String>, StoreError> {
             |r| r.get(0),
         )
         .optional()?)
+}
+
+/// The names of the triggers `sql` creates (`CREATE TRIGGER IF NOT EXISTS
+/// <name>`), for `Store::reset_mailbox` to drop them from the same text it
+/// creates them again with.
+fn created_trigger_names(sql: &str) -> Vec<&str> {
+    sql.split("CREATE TRIGGER IF NOT EXISTS ")
+        .skip(1)
+        .filter_map(|rest| rest.split_whitespace().next())
+        .collect()
+}
+
+/// Every table `Store::reset_mailbox` empties (#1946): the main schema's
+/// tables and virtual tables (the FTS index), not SQLite's own, not the
+/// FTS5 shadow tables (type `shadow`: written only through their virtual
+/// table), and not `meta`.
+fn mailbox_tables_on(conn: &Connection) -> Result<Vec<String>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT name FROM pragma_table_list
+         WHERE schema = 'main' AND type IN ('table', 'virtual')
+           AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name <> 'meta'
+         ORDER BY name",
+    )?;
+    let names = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(names)
 }
 
 /// Whether a folder whose parent is `parent` is at the top: no parent, or
@@ -25886,5 +26033,243 @@ mod folder_stats_tests {
         assert!(stats(&s, "F1").synced_at.is_some());
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A different mailbox signing in (#1946): the recorded root, the owed
+/// check, the stored top-level parents and the reset.
+#[cfg(test)]
+mod mailbox_reset_tests {
+    use super::*;
+
+    fn folder_under(s: &Store, id: &str, parent: Option<&str>) {
+        s.upsert_folder(&MailFolder {
+            id: id.into(),
+            display_name: id.into(),
+            parent_id: parent.map(str::to_string),
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: None,
+        })
+        .unwrap();
+    }
+
+    fn msg(id: &str, subject: &str) -> Message {
+        Message {
+            id: id.into(),
+            conversation_id: "C".into(),
+            subject: subject.into(),
+            from: Recipient {
+                name: "A".into(),
+                address: "a@x".into(),
+            },
+            to: vec![],
+            cc: vec![],
+            received: "2026-07-01T00:00:00Z".into(),
+            sent: "".into(),
+            is_read: false,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: "p".into(),
+            is_draft: false,
+            is_meeting_request: false,
+            meeting_message_type: None,
+            protection: Default::default(),
+            meeting_reminder_on: false,
+            categories: Vec::new(),
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
+            size: None,
+        }
+    }
+
+    fn count(s: &Store, table: &str) -> i64 {
+        s.conn
+            .query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    fn meta_keys(s: &Store) -> Vec<String> {
+        let mut stmt = s.conn.prepare("SELECT key FROM meta ORDER BY key").unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn mailbox_root_round_trips() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.mailbox_root().unwrap(), None);
+        s.set_mailbox_root("ROOT_A").unwrap();
+        assert_eq!(s.mailbox_root().unwrap().as_deref(), Some("ROOT_A"));
+        s.set_mailbox_root("ROOT_B").unwrap();
+        assert_eq!(s.mailbox_root().unwrap().as_deref(), Some("ROOT_B"));
+    }
+
+    #[test]
+    fn mailbox_check_owed_round_trips() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(!s.mailbox_check_owed().unwrap());
+        s.set_mailbox_check_owed().unwrap();
+        s.set_mailbox_check_owed().unwrap();
+        assert!(s.mailbox_check_owed().unwrap());
+        s.clear_mailbox_check_owed().unwrap();
+        assert!(!s.mailbox_check_owed().unwrap());
+        // Recording the root is the check: it clears an owed one.
+        s.set_mailbox_check_owed().unwrap();
+        s.set_mailbox_root("ROOT_A").unwrap();
+        assert!(!s.mailbox_check_owed().unwrap());
+    }
+
+    #[test]
+    fn top_level_parents_are_parents_not_stored_as_folders() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.top_level_parents().unwrap().is_empty());
+        folder_under(&s, "INBOX", Some("ROOT_A"));
+        folder_under(&s, "SENT", Some("ROOT_A"));
+        folder_under(&s, "SUB", Some("INBOX"));
+        folder_under(&s, "LOOSE", None);
+        folder_under(&s, "local:new", Some("ROOT_A"));
+        folder_under(&s, "local:child", Some("local:new"));
+        assert_eq!(s.top_level_parents().unwrap(), ["ROOT_A"]);
+        folder_under(&s, "ODD", Some("ROOT_X"));
+        assert_eq!(s.top_level_parents().unwrap(), ["ROOT_A", "ROOT_X"]);
+    }
+
+    /// AC 6: every table `pragma_table_list` names but `meta` ends empty,
+    /// `meta` keeps only `schema_version` and the new root, and the store
+    /// still works after: the triggers came back and the FTS index is sound.
+    #[test]
+    fn reset_mailbox_empties_every_table_but_schema_meta() {
+        let s = Store::open_in_memory().unwrap();
+        folder_under(&s, "INBOX", Some("ROOT_A"));
+        folder_under(&s, "SUB", Some("INBOX"));
+        for i in 0..20 {
+            s.upsert_message("INBOX", &msg(&format!("M{i}"), "budget"))
+                .unwrap();
+            s.put_body(
+                &format!("M{i}"),
+                &Body {
+                    content_type: "text".into(),
+                    content: "quarterly figures".into(),
+                },
+            )
+            .unwrap();
+        }
+        s.upsert_message("SUB", &msg("GONE", "old")).unwrap();
+        s.delete_message("GONE").unwrap();
+        s.enqueue_op(&OutboxOp::MarkRead {
+            id: "M1".into(),
+            read: true,
+        })
+        .unwrap();
+        s.enqueue_op(&OutboxOp::MarkRead {
+            id: "M2".into(),
+            read: true,
+        })
+        .unwrap();
+        s.upsert_event(&NewEvent {
+            id: "E1".into(),
+            subject: "Standup".into(),
+            start_utc: "2026-07-20T09:00:00Z".into(),
+            end_utc: "2026-07-20T10:00:00Z".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        s.replace_calendars(&[Calendar {
+            id: "CAL".into(),
+            name: "Calendar".into(),
+            is_default: true,
+            ..Default::default()
+        }])
+        .unwrap();
+        s.set_calendar_selection(Some(&["CAL".to_string()]))
+            .unwrap();
+        s.upsert_contact(&Contact {
+            name: "Ann".into(),
+            address: "ann@x".into(),
+            source: "local".into(),
+            last_seen: "2026-07-01T00:00:00Z".into(),
+            frequency: 1,
+            relevance: None,
+        })
+        .unwrap();
+        s.clear_delta_links().unwrap();
+        s.set_mailbox_check_owed().unwrap();
+        s.set_mailbox_root("ROOT_A").unwrap();
+        s.set_mailbox_check_owed().unwrap();
+        for table in [
+            "folders",
+            "messages",
+            "bodies",
+            "messages_fts",
+            "outbox",
+            "events",
+            "calendars",
+            "contacts",
+            "forgotten_ids",
+        ] {
+            assert!(count(&s, table) > 0, "{table} was filled");
+        }
+
+        let dropped = s.reset_mailbox("ROOT_B").unwrap();
+
+        assert_eq!(dropped, 2);
+        let tables = mailbox_tables_on(&s.conn).unwrap();
+        assert!(tables.iter().any(|t| t == "messages_fts"));
+        assert!(!tables.iter().any(|t| t.starts_with("messages_fts_")));
+        for table in &tables {
+            assert_eq!(count(&s, table), 0, "{table} is empty");
+        }
+        assert!(s.search("budget", 10).unwrap().is_empty());
+        assert_eq!(meta_keys(&s), ["mailbox_root", "schema_version"]);
+        assert_eq!(s.mailbox_root().unwrap().as_deref(), Some("ROOT_B"));
+        assert!(!s.mailbox_check_owed().unwrap());
+        assert!(!s.reconverge_pending().unwrap());
+        assert_eq!(s.calendar_selection().unwrap(), None);
+
+        // The store goes on working: the FTS triggers index a new message
+        // and its body, a delete records the id it forgot, and the index
+        // passes its own check.
+        folder_under(&s, "INBOX_B", Some("ROOT_B"));
+        s.upsert_message("INBOX_B", &msg("N1", "invoice")).unwrap();
+        s.put_body(
+            "N1",
+            &Body {
+                content_type: "text".into(),
+                content: "payable".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(s.search("payable", 10).unwrap().len(), 1);
+        s.delete_message("N1").unwrap();
+        assert!(s.search("invoice", 10).unwrap().is_empty());
+        assert_eq!(count(&s, "forgotten_ids"), 1);
+        s.conn
+            .execute(
+                "INSERT INTO messages_fts(messages_fts) VALUES ('integrity-check')",
+                [],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn created_trigger_names_reads_both_trigger_texts() {
+        assert_eq!(
+            created_trigger_names(schema::FTS_DELETE_TRIGGERS_SQL),
+            ["messages_fts_ad", "bodies_fts_ad"]
+        );
+        assert_eq!(
+            created_trigger_names(schema::FORGOTTEN_TRIGGERS_SQL).len(),
+            6
+        );
     }
 }
