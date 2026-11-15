@@ -277,9 +277,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   clients key on that. A file it cannot delete is reported as an
   `Error`, but the engine still signs out in memory. The store and the outbox
   are kept: queued ops drain after the next `SignIn`, whose `prompt=select_account`
-  lets another account sign in. That account would then get the old
-  account's store and queued ops; this is a known gap, recorded as a
-  follow-up.
+  lets another account sign in. Whether that account's mailbox is the one
+  that filled the store is checked before anything drains: see "A different
+  mailbox signing in (#1946)".
 - lookxy ignores `ProfileFetched` / `PhotoFetched` (it never asks for them).
 
 ## Granted scopes and a refused sign-in's error_description (#1875)
@@ -4312,3 +4312,95 @@ literally would break.
   `esc_closes_a_popup_before_it_dismisses_the_reminder`; `store::backfill_tests`
   `folder_history_is_complete_needs_a_delta_link_and_the_mode_s_scope`,
   `history_complete_by_mode`.
+
+## A different mailbox signing in (#1946)
+
+- After a `SignOut` (or a `SignIn` while signed in) `prompt=select_account` lets another
+  Microsoft account sign in on the same `mail.db`. Its queued ops would drain under the new
+  token (a `SendDraft` of a `local:` draft, a `CreateEvent`, a `CreateFolder` are tied to no
+  mailbox id and land in the new mailbox), and its deltas would run on the old mailbox's links.
+- Identity: the mailbox's root folder id, `GraphClient::mailbox_root_id` (`GET
+  /me/mailFolders/msgfolderroot?$select=id`; an answer without a non-empty string `id` is
+  `Parse`). Graph ids are mailbox-scoped, and the root is the `parentFolderId` of every
+  top-level folder the listing stores, so a store from before #1946 already carries it. Not
+  `TokenSet::account`: it is the `id_token`'s `preferred_username`, and the default scope has
+  no `openid`, so Entra sends no `id_token` and `account` is `""` (a refresh replaces it too).
+- The record: `meta.mailbox_root` (`Store::mailbox_root`, `set_mailbox_root`, which also
+  clears an owed check). `meta.mailbox_check_owed` (`set_mailbox_check_owed`,
+  `mailbox_check_owed`, `clear_mailbox_check_owed`): `sign_in` writes it after the redeem and
+  **before** it saves the token, and `Engine::new` reads it into `mailbox_unchecked` (a read
+  error counts as owed). So a check that failed, or a process that exited before it, is made at
+  the next start; a startup with a cached token and no owed check probes nothing (the token was
+  checked when it signed in). A store that cannot write the key emits `Error` and keeps the
+  check in memory for the run.
+- `Engine::check_mailbox` (`MailboxCheck::Ready | Reset | Blocked`): not owed is `Ready` with
+  no request. Otherwise the probe through `with_auth`, then: a recorded root equal to it is the
+  same mailbox; another is a reset; no record (a store from before #1946) is judged by
+  `Store::top_level_parents` (distinct `parent_id`s not themselves stored folders, the rule
+  `root_folder_id_on` uses): none (no folder listed yet) or one equal to the probe records it
+  (adopted), else a reset. A failure `react` handles (401, 429/503, transport) goes through it;
+  any other (another 4xx or 5xx, a parse error, a store error) is one `Error("cannot check which
+  mailbox signed in: …")`, settles the state and holds the next probe off (`check_retry`,
+  `check_backoff` doubling from `BACKOFF_MIN` to `BACKOFF_MAX`). `Refresh` and a sign-in clear
+  the hold-off; `enter_signin` ends it, and keeps the owed check.
+- Gates: the top of `sync_pass` (after its signed-out return: `Blocked` ends the pass, `Reset`
+  makes it a full one), the top of `drain_outbox` after its shutdown return (`Blocked` and
+  `Reset` are `Drain::Aborted`, a reset after `settle_state`, so `sync_one_folder`,
+  `on_fast_tick`, `clear_offline_items` and `drain_queued` stop before touching an old id), and
+  `next_prefetch`, `next_backfill`, `next_size_fill` (`None` while owed). `on_tick` runs no
+  calendar refresh while owed (it would write into the other mailbox's store). Every op is
+  sent from inside `drain_outbox` (`apply_op_with_retry`, the bulk runs, `run_delete_folder`,
+  `sync_after_send`). Not gated: the direct commands (`FetchBody`, `SearchMessages`,
+  `RespondMeeting`, `SetAutomaticReplies`, `RefreshCalendar`, …) act for the account signed in
+  now; an old id 404s, and what they store before a reset goes with it.
+- The reset, `Store::reset_mailbox(root)`: one IMMEDIATE transaction with
+  `defer_foreign_keys`. It counts the outbox rows (returned as `dropped_ops`), drops the
+  triggers `FTS_DELETE_TRIGGERS_SQL` and `FORGOTTEN_TRIGGERS_SQL` create (named by
+  `created_trigger_names` from the same text): the FTS `*_ad` ones scan the whole FTS table per
+  row (#2110), the `forgotten_*` ones would fill `forgotten_ids` with the old ids. It empties
+  every table `pragma_table_list` names in `main` of type `table` or `virtual` but `sqlite_%`
+  and `meta` (`mailbox_tables_on`): a table added later is covered without touching it, and
+  the FTS5 shadow tables are type `shadow` and drop out (written only through `messages_fts`,
+  a content-ful FTS5 table, so a plain `DELETE`). It creates both trigger texts again, keeps
+  only `schema_version` in `meta` and writes `mailbox_root`. Deleting `mail.db` is not an
+  option: lookxy holds its own connection, and Windows cannot delete an open file.
+- `Engine::reset_for_new_mailbox` then forgets what the run held of the old mailbox:
+  `backfill_done`, `reconverge_pending`, `relist_after_drain`, `copied_after_drain`,
+  `calendar_reset_owed`, `masters_not_found`/`masters_skipped`, `parked`, `expired`,
+  `backfill_first`, `fast_folders` (a host names them again), `hold_full`, the outbox back-off,
+  `bulk`/`parked_bulk`, `body_skip`/`body_parked`, `contact_rereads_paused`, the size fill.
+  `deferred` stays: those commands are the user's, and an old id 404s. `next_full`/`next_fast`
+  are now, and a passed `next_retry` wakes the main loop without a fast tick, so the full pass
+  that lists the new mailbox runs next. It sends `MailboxChanged { dropped_ops }`, then
+  `FoldersUpdated`, `CalendarsUpdated`, `CalendarUpdated`, `ContactsUpdated`,
+  `CategoriesUpdated` for the emptied store: `MailboxChanged` comes before any `FoldersUpdated`
+  of the new mailbox. A host that matches `SyncEvent` exhaustively has to add the arm.
+- What a reset drops: everything of the old mailbox, its unsent `local:` drafts and queued
+  changes included (counted in `dropped_ops`), and changes the user made between the sign-in
+  and its check, as they were queued against the old store. It resets, it does not switch: a
+  store per account is out of scope.
+- Residual risk: a store without a record compares the probe's `id` with the listing's
+  `parentFolderId`. Both come from the same client and headers, and "parentFolderId equals
+  msgfolderroot's id" is how Graph tells top-level folders, but the fake server cannot rule out
+  a mismatch, which would reset the user's own store. A recorded store compares two probe
+  answers.
+- lookxy (`App::on_mailbox_changed`): drops the selection, open message and body, search,
+  category filter, move picker and attachments popup, inline images, upload and backfill lines
+  and `folders_up_to_date`, sets `folder_tree_initialized` false (the new Inbox expands as on
+  a first run), re-reads account, folders, categories and agenda, and sets
+  `App::mailbox_notice` ("Signed in to another mailbox: local mail cleared[, N unsent
+  change(s) dropped]"), drawn ahead of the counts. The pass's `State(Idle)` clears
+  `error_notice`, not it; the next key press does (`main::run`). An open compose window keeps
+  its text and the old draft id.
+- Tests: `store::mailbox_reset_tests` (`reset_mailbox_empties_every_table_but_schema_meta`:
+  every enumerated table empty, then FTS, the forgotten trigger and `integrity-check` work;
+  the root and owed round trips; `top_level_parents_*`; `created_trigger_names_*`);
+  `graph::client::tests::mailbox_root_id_*`; `sync::engine::tests::mailbox_change` (a
+  different mailbox resets before any op, the same one drains after the probe, the legacy
+  rule, a failed check said once and retried by `Refresh`, a throttled one through `react`,
+  the probe's hold-off and the idle gates, a command's drain waits, a reset found by a drain
+  stops its caller, no probe at a startup, an owed check made at the next start, `sign_in`
+  owes it in the store). The loopback sign-in tests list the probe first (`probe_route`,
+  `with_probe`, `with_probe_limited`): the fake server matches by prefix. lookxy:
+  `ui::status_bar::tests::mailbox_changed_reloads_and_tells_the_user`,
+  `a_mailbox_change_with_nothing_queued_says_only_that_mail_was_cleared`.
