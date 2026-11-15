@@ -247,9 +247,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   columns spreads what they still lack after the single-column cells by
   their grid widths (equal shares when those are 0), the remainder to the
   last; a continued vertical merge needs nothing. The lift
-  (`table_view::lift_to`) takes from the other columns' slack above their
-  own minimum first, in proportion, then widens the table, whose root
-  widens the scroll extent (#1895). `dxa` tables are lifted too (a card
+  (`table_view::lift_to`) lets an `auto` table narrower than its fit grow
+  into that room first (r1, as a browser's does; a `pct` table's width is
+  its share, a `dxa` one has no slack), then takes from the other columns'
+  slack above their own minimum, in proportion, then widens the table,
+  whose root widens the scroll extent (#1895). `dxa` tables are lifted too (a card
   holding a wider table grows, as `width="600"` is a minimum in a
   browser); one whose content fits keeps its grid. Recursion stops at
   `MAX_NEST` (64) levels, each minimum is at most `MAX_FIT_TW` and the

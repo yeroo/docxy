@@ -10380,8 +10380,10 @@ struct RenderCtx<'a> {
     /// SECTIONPAGES fields show these (#1437); `None` draws the cached text.
     page_vals: Option<&'a page_fields::PageVals>,
     /// The text width (px) a table here is fitted to (#1895): the flow
-    /// view's text column, then each fitted cell's own; `None` (Print
-    /// Layout, headers and footers) draws tables at their grid.
+    /// view's text column, then each fitted cell's own. It is also the room
+    /// a paragraph's inline pictures are scaled down to (#1963,
+    /// `FlowPara::room`). `None` (Print Layout, headers and footers) draws
+    /// tables at their grid and pictures at their size.
     fit_width: Option<f32>,
     /// Where each top-level body table's painted bounds go, by block, for
     /// the harness (#1895); `None` records none.

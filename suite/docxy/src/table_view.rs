@@ -249,13 +249,22 @@ fn wants(t: &Table) -> Wants {
 /// Then each column is lifted to what its cells' content cannot shrink below
 /// (#1963, [`column_mins`]): a nested table wider than its cell widens the
 /// cell, as a browser's auto layout does, so the table holds it and the view
-/// scrolls to it. The other columns give up their slack above their own
-/// minimum first; what that cannot cover widens the table.
+/// scrolls to it. An `auto` table narrower than `fit` grows into that room
+/// first, as a browser's does (#1963 r1); then the other columns give up
+/// their slack above their own minimum; what that cannot cover widens the
+/// table. A `pct` table's width is its share and a `dxa` one's columns have
+/// no slack, so neither takes room.
 pub fn fitted_grid(t: &Table, fit: Option<u32>) -> Vec<u32> {
     let grid = usable_grid(t);
     let Some(fit) = fit else { return grid };
+    let auto = wants(t) == Wants::Auto;
     let mut out = scaled_grid(t, grid, fit);
-    lift_to(&mut out, &column_mins(t, 0));
+    let room = if auto {
+        u64::from(fit).saturating_sub(out.iter().map(|&w| u64::from(w)).sum())
+    } else {
+        0
+    };
+    lift_to(&mut out, &column_mins(t, 0), room);
     out
 }
 
@@ -387,11 +396,13 @@ fn content_need(blocks: &[Block], depth: usize) -> u64 {
         .unwrap_or(0)
 }
 
-/// Lift each of `out`'s columns below its minimum in `mins` to it (#1963),
-/// taking what that adds from the other columns' slack above their own
-/// minimum, in proportion to it (the remainder from the last ones that have
-/// any); what the slack cannot cover widens the table.
-fn lift_to(out: &mut [u32], mins: &[u64]) {
+/// Lift each of `out`'s columns below its minimum in `mins` to it (#1963):
+/// up to `room` twips of what that adds widen the table (an `auto` table's
+/// room left in its fit, r1), the rest is taken from the other columns'
+/// slack above their own minimum, in proportion to it (the remainder from
+/// the last ones that have any); what the slack cannot cover widens the
+/// table too.
+fn lift_to(out: &mut [u32], mins: &[u64], room: u64) {
     let min_of = |i: usize| mins.get(i).copied().unwrap_or(0);
     let lack: u64 = out
         .iter()
@@ -407,7 +418,7 @@ fn lift_to(out: &mut [u32], mins: &[u64]) {
         .map(|(i, &w)| u64::from(w).saturating_sub(min_of(i)))
         .collect();
     let spare: u64 = slack.iter().sum();
-    let take = lack.min(spare);
+    let take = lack.saturating_sub(room).min(spare);
     if take > 0 {
         let mut taken = 0;
         let mut cut: Vec<u64> = slack.iter().map(|&s| s * take / spare).collect();
@@ -1184,6 +1195,25 @@ mod tests {
     }
 
     #[test]
+    fn an_auto_table_grows_into_its_room_before_taking_slack_1963() {
+        // Auto [1500, 1500] in 9360: the card's 4716 more fits in the 6360
+        // of room, so column 1 keeps its 1500.
+        let t = holding(sized(&[1500, 1500], None), 0, card(6000));
+        assert_eq!(widths(&t, Some(9360)), [6216, 1500]);
+        // 4000 of room: the other 716 comes out of column 1's slack, and
+        // the table fills its fit.
+        assert_eq!(widths(&t, Some(7000)), [6216, 784]);
+        // A pct table takes no room: its width is its share.
+        let t = holding(
+            sized(&[1500, 1500], Some("<w:tblW w:w=\"2500\" w:type=\"pct\"/>")),
+            0,
+            card(3000),
+        );
+        // 50% of 9360: [2340, 2340]; the card's 876 more from column 1.
+        assert_eq!(widths(&t, Some(9360)), [3216, 1464]);
+    }
+
+    #[test]
     fn a_need_recurses_through_nested_fitted_tables_1963() {
         let inner = holding(sized(&[9360], Some(PCT_100)), 0, card(9000));
         let middle = holding(sized(&[9360], Some(PCT_100)), 0, inner);
@@ -1260,13 +1290,17 @@ mod tests {
             w.iter().map(|&c| u64::from(c)).sum::<u64>() <= MAX_FIT_TW,
             "{w:?}"
         );
-        // Nested past the depth cap: the deepest tables need nothing.
+        // Nested past the depth cap: the tables at depths 0..MAX_NEST read
+        // their cells (216 each), the one at MAX_NEST gives its floor only,
+        // and the card below it (at MAX_NEST + 8) counts for nothing.
         let mut t = card(9000);
         for _ in 0..(MAX_NEST + 8) {
             t = holding(sized(&[9360], Some(PCT_100)), 0, t);
         }
-        let w = widths(&t, Some(6000));
-        assert!(w[0] >= MIN_FIT_COL_TW, "{w:?}");
+        assert_eq!(
+            widths(&t, Some(6000)),
+            [MIN_FIT_COL_TW + MAX_NEST as u32 * CELL_MARGIN_TW]
+        );
     }
 
     #[test]
