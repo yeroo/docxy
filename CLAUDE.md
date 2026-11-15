@@ -174,7 +174,8 @@ issue number to find its notes.
   warning (#1877), contact search folded in Rust, word-prefix rank, `all_contacts`
   (#1890), a sign-out's back-off, an expired delta link re-running phase 1, a 404
   `DeleteEvent`, `local:` ids in message ops, the store's busy timeout, one-line
-  token-endpoint errors (#2113).
+  token-endpoint errors (#2113), a transient token-endpoint failure kept as offline, a saved
+  sign-in in a store that cannot be reached (#2167).
 
 ## Build and test
 
