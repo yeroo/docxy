@@ -53,7 +53,8 @@ issue number to find its notes.
   their media, the import round trip (#1948).
 - `docs/claude/clipboard.md`: before changing copy and paste with other apps: rich (RTF)
   document copy (#1074), sheet HTML tables (#1248), the X11 clipboard and a document
-  paste of HTML (#1950), a test X client's last request (#2008).
+  paste of HTML (#1950), a test X client's last request (#2008), HTML and RTF on
+  Wayland through the suite's patched gpui_linux (#1966).
 - `docs/claude/macos.md`: before changing macOS-only behaviour: the menu bar (#1071), ⌘/⌥
   text navigation (#1073).
 - `docs/claude/suite-shell.md`: before changing the suite's window chrome: the start
@@ -201,6 +202,10 @@ What CI runs (`.github/workflows/ci.yml`):
   `python3 scripts/ui-linux-sweep.py`. The scripts' unit tests:
   `python3 -m unittest discover -s scripts -p 'test_*.py' -v`.
 - `python3 scripts/check-claude-md.py`: this file's budget and the area-note index.
+- `suite/vendor/gpui_linux` is gpui_linux plus `suite/vendor/gpui_linux.patch` (#1966):
+  `python3 scripts/vendor-gpui-linux.py --check`, then `cargo test --manifest-path
+  suite/Cargo.toml --locked -p gpui_linux --lib wayland::`. A gpui bump re-vendors
+  (`--update`; `suite/vendor/README.md`).
 
 ## Cross-crate invariants
 

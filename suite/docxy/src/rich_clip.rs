@@ -1,5 +1,5 @@
 //! The RTF (and HTML) beside a copy's text on the OS clipboard (#1074, #1248,
-//! #1950).
+//! #1950, #1966).
 //!
 //! gpui's clipboard carries text (and images) only, so a document copy adds
 //! its RTF here, right after gpui wrote the text: macOS as `public.rtf` on
@@ -7,9 +7,12 @@
 //! Neither write clears the clipboard, so the text stays; gpui's next write
 //! of anything clears both. On X11 the suite takes the `CLIPBOARD` selection
 //! over from gpui and serves the text beside `text/rtf` (or `text/html`) on
-//! its own connection ([`x11`], #1950); gpui's next copy takes it back.
-//! Elsewhere (Wayland, #1966, and headless) the calls do nothing and copy
-//! and paste stay plain text.
+//! its own connection ([`x11`], #1950); gpui's next copy takes it back. On
+//! Wayland the suite's patched gpui_linux sets the selection again, through
+//! gpui's own data device, to a source offering the text beside `text/rtf`
+//! (or `text/html`) (`gpui_linux::wayland_clipboard`, #1966); gpui's next
+//! copy drops it. Headless, the calls do nothing and copy and paste stay
+//! plain text.
 //!
 //! The RTF goes on only while the clipboard still holds the copy's own
 //! text, checked again just before the write: another app may have copied
@@ -112,7 +115,62 @@ pub(crate) fn cf_html(fragment: &str) -> String {
     )
 }
 
-/// `fragment` as the macOS `public.html` page, and the X11 `text/html` one.
+/// The RTF mimes a Wayland paste reads off the offer, in its order of
+/// preference (#1966). X11 lists the same names, in the same order, as its
+/// own interned atoms (`x11.rs` `read_rtf`, #1950).
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+const RTF_TYPES: [&str; 3] = ["text/rtf", "application/rtf", "text/richtext"];
+
+/// Whether `name` is an HTML mime: `text/html`, or `text/html;…` (a
+/// charset), any case.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn is_html_type(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "text/html" || name.starts_with("text/html;")
+}
+
+/// The first of `order` that `offered` has, else the first offered name
+/// that `named` takes (#1966).
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn pick_mime<'a>(
+    offered: &'a [String],
+    order: &[&str],
+    named: Option<&dyn Fn(&str) -> bool>,
+) -> Option<&'a str> {
+    order
+        .iter()
+        .find_map(|want| offered.iter().find(|mime| mime == want))
+        .or_else(|| named.and_then(|named| offered.iter().find(|mime| named(mime))))
+        .map(String::as_str)
+}
+
+/// An HTML payload as UTF-8: a UTF-16 one (with its BOM) decoded, anything
+/// else as it is.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn utf8_page(bytes: Vec<u8>) -> Vec<u8> {
+    let utf16 = |rest: &[u8], big: bool| {
+        let units: Vec<u16> = rest
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&p| {
+                if big {
+                    u16::from_be_bytes(p)
+                } else {
+                    u16::from_le_bytes(p)
+                }
+            })
+            .collect();
+        String::from_utf16_lossy(&units).into_bytes()
+    };
+    match bytes.as_slice() {
+        [0xFF, 0xFE, rest @ ..] => utf16(rest, false),
+        [0xFE, 0xFF, rest @ ..] => utf16(rest, true),
+        _ => bytes,
+    }
+}
+
+/// `fragment` as the macOS `public.html` page, and the Linux `text/html` one.
 #[cfg_attr(
     not(any(target_os = "macos", target_os = "linux", test)),
     allow(dead_code)
@@ -373,7 +431,10 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_RTF, bounded_copy, cf_html, html_fragment, html_page, same_text};
+    use super::{
+        MAX_RTF, RTF_TYPES, bounded_copy, cf_html, html_fragment, html_page, is_html_type,
+        pick_mime, same_text, utf8_page,
+    };
 
     #[test]
     fn the_rtf_goes_only_beside_its_own_text() {
@@ -480,6 +541,69 @@ mod tests {
         ));
     }
 
+    fn mimes(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// A Wayland paste's RTF: `text/rtf`, else `application/rtf`, else
+    /// `text/richtext`, whatever order the offer lists them in (#1966).
+    #[test]
+    fn the_rtf_mime_follows_our_order() {
+        let pick = |names: &[&str]| pick_mime(&mimes(names), &RTF_TYPES, None).map(str::to_owned);
+        assert_eq!(
+            pick(&["UTF8_STRING", "application/rtf"]).as_deref(),
+            Some("application/rtf")
+        );
+        assert_eq!(
+            pick(&["text/richtext", "text/rtf"]).as_deref(),
+            Some("text/rtf")
+        );
+        assert_eq!(pick(&["text/richtext"]).as_deref(), Some("text/richtext"));
+        assert_eq!(pick(&["text/plain", "text/html", "pid/7"]), None);
+        assert_eq!(pick(&[]), None);
+    }
+
+    /// A Wayland paste's HTML: `text/html` before a `text/html;…`, which is
+    /// taken in any case (#1966).
+    #[test]
+    fn the_html_mime_is_exact_first_then_by_name() {
+        let pick = |names: &[&str]| {
+            pick_mime(&mimes(names), &["text/html"], Some(&is_html_type)).map(str::to_owned)
+        };
+        assert_eq!(
+            pick(&["TEXT/HTML;charset=utf-8"]).as_deref(),
+            Some("TEXT/HTML;charset=utf-8")
+        );
+        assert_eq!(
+            pick(&["text/html;charset=utf-8", "text/html"]).as_deref(),
+            Some("text/html")
+        );
+        assert_eq!(pick(&["text/htmlx", "text/plain"]), None);
+        assert!(is_html_type("text/html") && !is_html_type("text/rtf"));
+    }
+
+    /// A Linux paste's HTML as UTF-8 (X11 #1950, Wayland #1966): a UTF-16
+    /// page with its BOM, either byte order, decoded; UTF-8 as it is. On
+    /// every platform, so the shared helper is tested where it is built.
+    #[test]
+    fn a_utf16_page_reads_as_utf8() {
+        let page = "<b>caf\u{e9} \u{4e2d}</b>";
+        let utf16 = |bom: [u8; 2], big: bool| -> Vec<u8> {
+            bom.into_iter()
+                .chain(page.encode_utf16().flat_map(move |unit| {
+                    if big {
+                        unit.to_be_bytes()
+                    } else {
+                        unit.to_le_bytes()
+                    }
+                }))
+                .collect()
+        };
+        assert_eq!(utf8_page(utf16([0xFF, 0xFE], false)), page.as_bytes());
+        assert_eq!(utf8_page(utf16([0xFE, 0xFF], true)), page.as_bytes());
+        assert_eq!(utf8_page(page.as_bytes().to_vec()), page.as_bytes());
+    }
+
     #[test]
     fn a_read_is_bounded() {
         assert_eq!(
@@ -491,12 +615,28 @@ mod tests {
     }
 }
 
-/// X11 through the suite's own connection ([`x11`]); Wayland and headless
-/// (any other compositor gpui picks) do nothing, as before (#1966).
+/// X11 through the suite's own connection ([`x11`], #1950); Wayland through
+/// gpui's own data device, in the suite's patched gpui_linux (#1966);
+/// headless does nothing.
 #[cfg(target_os = "linux")]
 mod imp {
     use super::x11::{Extra, X11Clip};
+    use gpui_linux::wayland_clipboard;
     use std::sync::OnceLock;
+
+    /// Whether gpui runs on Wayland.
+    fn wayland() -> bool {
+        static WAYLAND: OnceLock<bool> = OnceLock::new();
+        *WAYLAND.get_or_init(|| gpui::guess_compositor() == "Wayland")
+    }
+
+    /// The first of the selection's mimes `order` (else `named`) picks, read
+    /// off the Wayland selection.
+    fn wayland_read(order: &[&str], named: Option<&dyn Fn(&str) -> bool>) -> Option<Vec<u8>> {
+        let offered = wayland_clipboard::mime_types()?;
+        let mime = super::pick_mime(&offered, order, named)?;
+        wayland_clipboard::read(mime, super::MAX_RTF)
+    }
 
     /// The app's one X11 clipboard on `DISPLAY` ([`clip`]).
     static CLIP: OnceLock<Option<X11Clip>> = OnceLock::new();
@@ -514,25 +654,40 @@ mod imp {
     }
 
     pub(super) fn write_rtf(rtf: &str, text: &str) {
-        if let Some(clip) = clip() {
+        if wayland() {
+            let formats = vec![("text/rtf".to_string(), rtf.as_bytes().to_vec())];
+            wayland_clipboard::add_formats(text, formats);
+        } else if let Some(clip) = clip() {
             clip.offer(text, Extra::Rtf, rtf.as_bytes().to_vec());
         }
     }
 
     pub(super) fn read_rtf() -> Option<Vec<u8>> {
+        if wayland() {
+            return wayland_read(&super::RTF_TYPES, None);
+        }
         clip()?.read_rtf()
     }
 
     pub(super) fn write_html(html: &str, text: &str) {
-        if let Some(clip) = clip() {
+        if wayland() {
+            let page = super::html_page(html).into_bytes();
+            wayland_clipboard::add_formats(text, vec![("text/html".to_string(), page)]);
+        } else if let Some(clip) = clip() {
             clip.offer(text, Extra::Html, super::html_page(html).into_bytes());
         }
     }
 
     pub(super) fn read_html() -> Option<Vec<u8>> {
+        if wayland() {
+            let bytes = wayland_read(&["text/html"], Some(&super::is_html_type))?;
+            return Some(super::utf8_page(bytes));
+        }
         clip()?.read_html()
     }
 
+    /// Nothing on Wayland: there is no handover to a clipboard manager, and
+    /// the copy goes with the app, as gpui's own text does there.
     pub(super) fn hand_over() {
         // Only a clipboard a copy or paste opened can own anything.
         if let Some(clip) = CLIP.get().and_then(Option::as_ref) {

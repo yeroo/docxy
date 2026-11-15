@@ -84,6 +84,10 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 # through gpui_linux.
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = "0.13"
+# The Wayland clipboard's RTF and HTML (#1966, rich_clip.rs): gpui's own data
+# device, through the suite's patched copy (the `[patch]` in ../Cargo.toml
+# points gpui_platform at the same crate).
+gpui_linux = { path = "../vendor/gpui_linux" }
 
 [build-dependencies]
 htmlbundle = { path = "../../htmlbundle" }
