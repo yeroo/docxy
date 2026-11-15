@@ -9,8 +9,11 @@
 //! - **The file itself** otherwise: DPAPI-encrypted on Windows (which has no
 //!   store here), and elsewhere plaintext JSON protected by 0600 permissions
 //!   alone, the fallback when no store is reachable (headless, a session
-//!   without a keyring). [`save_reporting`] / [`load_reporting`] say which,
-//!   so the engine can warn once ([`Storage::PlainFile`]).
+//!   without a keyring). `save_in` / `load_in` say which, so the engine can
+//!   warn once ([`Storage::PlainFile`]); it calls them with its own store
+//!   (`EngineConfig::token_store`, #2167). The public [`save_reporting`] /
+//!   [`load_reporting`] (and `save`, `load`, `clear`) are the same on
+//!   `platform_store()`, for embedders.
 //!
 //! A token file found while a store is reachable is migrated into it on
 //! load: the file is replaced by a reference (an atomic rename over it; the

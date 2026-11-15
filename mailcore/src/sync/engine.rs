@@ -356,8 +356,9 @@ pub enum SyncCommand {
     /// [`SyncEvent::PhotoFetched`] (`None` when the user has none). Direct
     /// call, no outbox.
     FetchPhoto,
-    /// Sign out: drop the in-memory token and delete the saved one
-    /// (`tokencache::clear`), then emit [`SyncEvent::SignInRequired`], so the
+    /// Sign out: drop the in-memory token and delete the saved one, in the
+    /// file and in the engine's secret store (`tokencache::clear_in`), then
+    /// emit [`SyncEvent::SignInRequired`], so the
     /// next `SignIn` starts a fresh sign-in. `State(SignInRequired)` comes
     /// only when the state changes: a SignOut while already signed out still
     /// clears the file and emits `SignInRequired`, but no `State`, so a
@@ -2118,6 +2119,31 @@ pub(crate) fn spawn_with_store(
     tick: Duration,
     token_store: &'static (dyn tokencache::SecretStore + Sync),
 ) -> SyncHandle {
+    spawn_with_store_and_options(
+        store_path,
+        token_path,
+        cfg,
+        graph_base,
+        auth_base,
+        tick,
+        token_store,
+        EngineOptions::without_prefetch(),
+    )
+}
+
+/// [`spawn_with_store`] with the engine's [`EngineOptions`] (a fast tick).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_with_store_and_options(
+    store_path: PathBuf,
+    token_path: PathBuf,
+    cfg: AuthConfig,
+    graph_base: String,
+    auth_base: String,
+    tick: Duration,
+    token_store: &'static (dyn tokencache::SecretStore + Sync),
+    options: EngineOptions,
+) -> SyncHandle {
     spawn_engine(EngineConfig {
         store_path,
         token_path,
@@ -2126,7 +2152,7 @@ pub(crate) fn spawn_with_store(
         graph_base,
         auth_base,
         tick,
-        options: EngineOptions::without_prefetch(),
+        options,
         token_store: Some(token_store),
     })
 }
@@ -2592,6 +2618,9 @@ impl Engine {
     fn main_loop(&mut self) {
         // The startup pass schedules the deadlines like any other.
         self.after_pass_if_fast();
+        // A start that found the saved sign-in's store unreachable (#2167)
+        // asks it again at the back-off, not a fast deadline later.
+        self.follow_saved_signin_backoff();
         self.next_tick = Instant::now() + self.config.tick;
         loop {
             if let Some(cmd) = self.deferred.pop_front() {
@@ -2725,17 +2754,7 @@ impl Engine {
                 self.retry_saved_signin(false);
             }
             self.next_tick = Instant::now() + self.config.tick;
-            // Still waiting (no store, a latched refusal, or the store
-            // still unreachable): with a fast tick, move its deadlines on,
-            // or `recv_timeout` would be zero for good once `next_retry`
-            // passes. A recovery's pass already scheduled them.
-            if self.saved_unavailable.is_some()
-                && let Some(fast) = self.fast_tick()
-            {
-                let now = Instant::now();
-                self.next_fast = now + fast;
-                self.next_full = now + self.config.tick;
-            }
+            self.follow_saved_signin_backoff();
         } else {
             match self.fast_tick() {
                 None => {
@@ -2800,6 +2819,35 @@ impl Engine {
         match self.op_retry {
             Some(t) if self.token.is_some() && t > now => wait.min(t - now),
             _ => wait,
+        }
+    }
+
+    /// With a fast tick, while the saved sign-in waits for its store
+    /// (#2167): the deadlines follow the store's retry. A future
+    /// `next_retry` (the store was asked and is still unreachable) is both
+    /// deadlines, so the next ask comes at the back-off (5, 10, 20 s …) and
+    /// not at the later of it and the fast interval. With none (no store,
+    /// or a latched refusal: nothing is asked by itself) they move a fast
+    /// interval and a tick on, or `recv_timeout`, their minimum, would stay
+    /// zero for good, a busy spin (r1). A no-op otherwise: a recovery's pass
+    /// scheduled them already.
+    fn follow_saved_signin_backoff(&mut self) {
+        let Some(fast) = self.fast_tick() else {
+            return;
+        };
+        if self.saved_unavailable.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        match self.next_retry {
+            Some(t) if t > now => {
+                self.next_fast = t;
+                self.next_full = t;
+            }
+            _ => {
+                self.next_fast = now + fast;
+                self.next_full = now + self.config.tick;
+            }
         }
     }
 
@@ -9663,7 +9711,8 @@ fn refresh_transport(reason: &str) -> GraphError {
     GraphError::Transport(format!("token refresh failed: {reason}"))
 }
 
-/// What a sign-out reports when `tokencache::clear` failed with `e`
+/// What a sign-out reports when `clear_token` (`tokencache::clear_in`)
+/// failed with `e`
 /// (#1877): `file_left` when the token file is still there.
 fn sign_out_error(e: &std::io::Error, file_left: bool) -> String {
     if file_left {
@@ -20238,6 +20287,90 @@ mod tests {
             assert!(engine.saved_unavailable.is_some());
             drop(cmd_tx);
         }
+    }
+
+    /// #2167 r2: with a fast tick, a store that was asked and is still
+    /// unreachable is asked again at the back-off (10 s here), not at the
+    /// fast interval (60 s).
+    #[test]
+    fn an_unreachable_store_is_asked_again_at_the_back_off_with_a_fast_tick() {
+        let dir = unique_dir("store-fast-backoff");
+        let token_path = dir.join("token.bin");
+        let (state, store) = saved_in_keyring(&token_path, Keyring::Unavailable);
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let config = EngineConfig {
+            store_path: PathBuf::from("unused.db"),
+            token_path,
+            cfg: test_cfg(),
+            backfill_days: 30,
+            graph_base: "http://127.0.0.1:9".into(),
+            auth_base: "http://127.0.0.1:9".into(),
+            tick: HOUR,
+            options: EngineOptions {
+                fast_tick: Some(Duration::from_secs(60)),
+                ..EngineOptions::without_prefetch()
+            },
+            token_store: Some(store),
+        };
+        let mut engine = Engine::new(config, Store::open_in_memory().unwrap(), cmd_rx, evt_tx);
+        engine.saved_unavailable = Some("secret store unavailable: no keyring yet".into());
+        let past = Instant::now() - Duration::from_secs(1);
+        engine.next_retry = Some(past);
+        engine.next_fast = past;
+        engine.next_full = past;
+        engine.backoff = BACKOFF_MIN * 2;
+        engine.on_timer();
+        assert_eq!(state.gets(), 1, "the wake asked the store");
+        let wait = engine.recv_timeout();
+        assert!(
+            wait > Duration::from_secs(8) && wait <= Duration::from_secs(10),
+            "{wait:?}"
+        );
+        drop(cmd_tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2167 r2, end to end with a fast tick of a minute: the start's
+    /// unreachable store is asked at BACKOFF_MIN and again at twice it,
+    /// not a fast interval later each time, and signs in once it answers.
+    #[test]
+    fn a_fast_tick_does_not_delay_the_saved_sign_in_retries() {
+        let srv = FakeServer::start(vec![empty_folders_route(200)]);
+        let dir = unique_dir("store-fast-e2e");
+        let token_path = dir.join("token.bin");
+        let (state, store) = saved_in_keyring(&token_path, Keyring::Unavailable);
+        let started = Instant::now();
+        let handle = spawn_with_store_and_options(
+            dir.join("mail.db"),
+            token_path,
+            test_cfg(),
+            srv.base_url.clone(),
+            srv.base_url.clone(),
+            HOUR,
+            store,
+            EngineOptions {
+                fast_tick: Some(Duration::from_secs(60)),
+                ..EngineOptions::without_prefetch()
+            },
+        );
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SavedSignInUnavailable(_))
+        });
+        assert!(
+            wait_until(ENGINE_WAIT, || state.gets() >= 2),
+            "asked again at BACKOFF_MIN"
+        );
+        state.set(Keyring::Works);
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert_eq!(state.gets(), 3);
+        // 5 s, then 10 s more: well inside one 60 s fast interval.
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            started.elapsed()
+        );
+        finish(handle, dir);
     }
 
     /// #2113 (#2038 plan-del404): a DELETE answered 404 (a retry after a

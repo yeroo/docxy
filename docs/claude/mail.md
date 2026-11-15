@@ -4456,10 +4456,17 @@ keyring cannot be read now both keep it.
   not latched a refusal (`SecretStore::refused`). With no store at all (`token_store == None`:
   Windows, `MAILCORE_TOKEN_STORE=file`, `cfg(test)`) nothing is retried automatically. Then
   `next_tick` moves on, and a passed `next_retry` is dropped as usual, so the wait falls back to
-  the tick. With a fast tick, a wake that leaves the sign-in waiting also moves `next_fast` and
-  `next_full` on (r1): `recv_timeout` is their minimum, at least `next_retry`, and with stale
-  deadlines and the retry dropped it would be zero for good, a busy spin. Test:
-  `a_waiting_saved_sign_in_does_not_spin_with_a_fast_tick` (no store, and a latched one). `retry_saved_signin` loads again. `Ok(Some)` clears the state and the back-off,
+  the tick. With a fast tick, `follow_saved_signin_backoff` (after such a wake, and once after
+  the start in `main_loop`) makes `next_fast` and `next_full` follow the store's retry.
+  `recv_timeout` is their minimum, but at least `next_retry`. A future `next_retry` (the store
+  asked and still unreachable) becomes both deadlines, so the next ask comes at the back-off
+  (5, 10, 20 s …), not at the later of it and the fast interval (r2). With none (no store, a
+  latched refusal) they move a fast interval and a tick on: with stale deadlines and the retry
+  dropped, the wait would be zero for good, a busy spin (r1). Tests:
+  `a_waiting_saved_sign_in_does_not_spin_with_a_fast_tick` (no store, and a latched one),
+  `an_unreachable_store_is_asked_again_at_the_back_off_with_a_fast_tick`,
+  `a_fast_tick_does_not_delay_the_saved_sign_in_retries` (end to end, a 60 s fast tick: asked
+  at 5 s and 15 s). `retry_saved_signin` loads again. `Ok(Some)` clears the state and the back-off,
   `start_session`, then the startup pass and `after_pass_if_fast`: one pass for that wake. A
   `NotConnected` waits again (the back-off doubles). `Ok(None)` (the item is gone) or another
   error signs out, as at startup.
