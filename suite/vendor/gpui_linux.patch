@@ -866,6 +866,22 @@ index cbc962b..3c99149 100644
  
  use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape;
  
+diff --git a/src/linux/x11/clipboard.rs b/src/linux/x11/clipboard.rs
+index 706e7b0..56d60b4 100644
+--- a/src/linux/x11/clipboard.rs
++++ b/src/linux/x11/clipboard.rs
+@@ -12,7 +12,10 @@
+  * The project to which this file belongs is licensed under either of
+  * the Apache 2.0 or the MIT license at the licensee's choice. The terms
+  * and conditions of the chosen license apply to this file.
+-*/
++ */
++
++// Modified for docxy (#1966): the header's closing `*/` indented one space, as
++// rustfmt on Windows wants it (Linux rustfmt takes either).
+ 
+ // More info about using the clipboard on X11:
+ // https://tronche.com/gui/x/icccm/sec-2.html#s-2.6
 diff --git a/src/linux.rs b/src/linux.rs
 index 33393f7..3e80300 100644
 --- a/src/linux.rs

@@ -12,7 +12,10 @@
  * The project to which this file belongs is licensed under either of
  * the Apache 2.0 or the MIT license at the licensee's choice. The terms
  * and conditions of the chosen license apply to this file.
-*/
+ */
+
+// Modified for docxy (#1966): the header's closing `*/` indented one space, as
+// rustfmt on Windows wants it (Linux rustfmt takes either).
 
 // More info about using the clipboard on X11:
 // https://tronche.com/gui/x/icccm/sec-2.html#s-2.6

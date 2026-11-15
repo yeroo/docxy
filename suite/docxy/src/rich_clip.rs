@@ -433,7 +433,7 @@ mod imp {
 mod tests {
     use super::{
         MAX_RTF, RTF_TYPES, bounded_copy, cf_html, html_fragment, html_page, is_html_type,
-        pick_mime, same_text,
+        pick_mime, same_text, utf8_page,
     };
 
     #[test]
@@ -580,6 +580,28 @@ mod tests {
         );
         assert_eq!(pick(&["text/htmlx", "text/plain"]), None);
         assert!(is_html_type("text/html") && !is_html_type("text/rtf"));
+    }
+
+    /// A Linux paste's HTML as UTF-8 (X11 #1950, Wayland #1966): a UTF-16
+    /// page with its BOM, either byte order, decoded; UTF-8 as it is. On
+    /// every platform, so the shared helper is tested where it is built.
+    #[test]
+    fn a_utf16_page_reads_as_utf8() {
+        let page = "<b>caf\u{e9} \u{4e2d}</b>";
+        let utf16 = |bom: [u8; 2], big: bool| -> Vec<u8> {
+            bom.into_iter()
+                .chain(page.encode_utf16().flat_map(move |unit| {
+                    if big {
+                        unit.to_be_bytes()
+                    } else {
+                        unit.to_le_bytes()
+                    }
+                }))
+                .collect()
+        };
+        assert_eq!(utf8_page(utf16([0xFF, 0xFE], false)), page.as_bytes());
+        assert_eq!(utf8_page(utf16([0xFE, 0xFF], true)), page.as_bytes());
+        assert_eq!(utf8_page(page.as_bytes().to_vec()), page.as_bytes());
     }
 
     #[test]
