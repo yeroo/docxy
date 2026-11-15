@@ -6023,10 +6023,27 @@ fn dispatch_verb(
         // Show a document imported from `html` in the view (#1986), as a
         // host shows a mail, or a named `fixture` with its package
         // (`sections` or `header-inherit`, #1888); the reply is
-        // `ext-doc-read`'s fields.
+        // `ext-doc-read`'s fields. With `"images": true` the page's
+        // pictures are imported too (#1963), each src refused, so a sized
+        // `<img>` is the #1880 placeholder, in the import's own package.
         "ext-doc-load" => {
             let fixture = ext_fixture_view(app)?;
+            let images = match args.get("images") {
+                None => false,
+                Some(Json::Bool(on)) => *on,
+                Some(_) => return Err("'images' must be true or false".into()),
+            };
             let (doc, pkg) = match (args.get("html"), args.get("fixture")) {
+                (Some(html), None) if images => {
+                    let html = html.as_str().ok_or("'html' must be a string")?;
+                    let pkg =
+                        docxcore::import::html::import_html_with(html.as_bytes(), &mut |_, _| None)
+                            .map_err(|e| format!("ext-doc-load: {e}"))?
+                            .package();
+                    // The package renamed its pictures' rids: the view
+                    // shows its document.
+                    (pkg.document.clone(), Some(pkg))
+                }
                 (Some(html), None) => {
                     let html = html.as_str().ok_or("'html' must be a string")?;
                     let doc = docxcore::import::html::import_html(html.as_bytes())
