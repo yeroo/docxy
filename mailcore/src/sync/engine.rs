@@ -139,8 +139,11 @@ pub enum SyncCommand {
     /// Start the interactive browser sign-in flow (see [`Engine::sign_in`]).
     /// Also while the saved sign-in is unavailable
     /// ([`SyncEvent::SavedSignInUnavailable`], #2167): the person may choose
-    /// to sign in again. A sign-in that fails then leaves the engine
-    /// `Offline`, still retrying the saved one.
+    /// to sign in again. A sign-in that fails then sends
+    /// `SavedSignInUnavailable` again and leaves the engine `Offline`, the
+    /// saved sign-in still waiting (retried by itself only while its store
+    /// is merely unavailable; a latched refusal or no store waits for
+    /// `RetrySavedSignIn` or another `SignIn`).
     SignIn,
     /// Ask the secret store for the saved sign-in once more, on the
     /// person's request (#2167), while it is unavailable
@@ -1202,8 +1205,10 @@ pub enum SyncEvent {
     /// send [`SyncCommand::RetrySavedSignIn`] (ask the store once more,
     /// prompt included) or [`SyncCommand::SignIn`] (sign in again, which
     /// saves the new token over the reference: in the plain file while the
-    /// store is still unavailable). Sent again only when the reason
-    /// changes, or in answer to `RetrySavedSignIn`.
+    /// store is still unavailable). Sent again when the reason changes, in
+    /// answer to `RetrySavedSignIn`, and after a `SignIn` that failed or
+    /// could not start while the saved sign-in waits (its last reason), so
+    /// a client that showed the sign-in under way shows this again.
     SavedSignInUnavailable(String),
     /// Sign-in began; the UI opens `authorize_url` in the system browser.
     SignInStarted { authorize_url: String },
@@ -2720,6 +2725,17 @@ impl Engine {
                 self.retry_saved_signin(false);
             }
             self.next_tick = Instant::now() + self.config.tick;
+            // Still waiting (no store, a latched refusal, or the store
+            // still unreachable): with a fast tick, move its deadlines on,
+            // or `recv_timeout` would be zero for good once `next_retry`
+            // passes. A recovery's pass already scheduled them.
+            if self.saved_unavailable.is_some()
+                && let Some(fast) = self.fast_tick()
+            {
+                let now = Instant::now();
+                self.next_fast = now + fast;
+                self.next_full = now + self.config.tick;
+            }
         } else {
             match self.fast_tick() {
                 None => {
@@ -8897,8 +8913,10 @@ impl Engine {
                 // A timeout, a malformed redirect, a state mismatch, or the
                 // provider reporting `?error=...` all land here. None of
                 // them are secrets, so the message is safe to surface as-is.
-                // Re-entering sign-in-required lets the UI offer another
-                // attempt rather than leaving the engine silently stuck.
+                // `sign_in_failed` lets the UI offer another attempt rather
+                // than leaving the engine silently stuck: sign-in-required
+                // again, or, while a saved sign-in waits for its store
+                // (#2167), that wait announced again.
                 self.emit(SyncEvent::Error(format!("sign-in failed: {e}")));
                 self.sign_in_failed();
                 return;
@@ -8951,10 +8969,11 @@ impl Engine {
 
     /// The sign-in could not start (no loopback listener). Signed out:
     /// `SignInRequired` again, as before. A saved sign-in waiting for its
-    /// store (#2167) is still there: back to `Offline`, still retrying.
+    /// store (#2167) is still there: announced again
+    /// (`saved_signin_still_waits`).
     fn sign_in_not_started(&mut self) {
         if self.saved_unavailable.is_some() {
-            self.settle_state();
+            self.saved_signin_still_waits();
         } else {
             self.set_state(SyncState::SignInRequired);
         }
@@ -8962,13 +8981,27 @@ impl Engine {
 
     /// The sign-in failed (redirect, redeem). Signed out: `enter_signin`,
     /// so the UI offers another attempt. A saved sign-in waiting for its
-    /// store (#2167) is still there: back to `Offline`, still retrying.
+    /// store (#2167) is still there: announced again
+    /// (`saved_signin_still_waits`).
     fn sign_in_failed(&mut self) {
         if self.saved_unavailable.is_some() {
-            self.settle_state();
+            self.saved_signin_still_waits();
         } else {
             self.enter_signin();
         }
+    }
+
+    /// A `SignIn` while the saved sign-in waits for its store (#2167)
+    /// ended without a token: `SavedSignInUnavailable` with the last
+    /// reason again (a client showing the sign-in under way, whose state
+    /// stayed `Offline`, has nothing else to go back by), then `Offline`.
+    /// The back-off and its retry are as they were: by themselves only
+    /// while the store is merely unavailable.
+    fn saved_signin_still_waits(&mut self) {
+        if let Some(reason) = self.saved_unavailable.clone() {
+            self.emit(SyncEvent::SavedSignInUnavailable(reason));
+        }
+        self.settle_state();
     }
 
     // --- The mailbox check (#1946) ---------------------------------------
@@ -14314,6 +14347,22 @@ mod tests {
         (state, store)
     }
 
+    /// A process-lived keyring that has latched a refusal, so
+    /// `refused()` is true.
+    fn refused_keyring() -> &'static (dyn tokencache::SecretStore + Sync) {
+        let state = std::sync::Arc::new(KeyringState {
+            mode: std::sync::Mutex::new(Keyring::Refused),
+            items: std::sync::Mutex::new(HashMap::new()),
+            gets: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let store: &'static tokencache::Latched<TestKeyring> =
+            Box::leak(Box::new(tokencache::Latched::new(TestKeyring(state))));
+        use tokencache::SecretStore as _;
+        assert!(store.get("k").is_err());
+        assert!(store.refused());
+        store
+    }
+
     /// An engine whose saved sign-in is in a [`TestKeyring`] answering
     /// `mode`, on `routes` (Graph and auth).
     fn saved_signin_engine(
@@ -14482,7 +14531,8 @@ mod tests {
     }
 
     /// AC 6 (#2167): `SignIn` while the saved sign-in waits for its store
-    /// completes; the store is not asked again after it.
+    /// completes, and ends the wait: the next back-off (a pass that went
+    /// offline) is a normal tick's, not another ask of the store.
     #[test]
     fn sign_in_while_saved_sign_in_unavailable_completes() {
         let routes = vec![
@@ -14490,9 +14540,17 @@ mod tests {
                 token_route(r#"{"access_token":"AT-NEW","refresh_token":"RT2","expires_in":3600}"#),
                 None,
             ),
+            (empty_folders_route(200), Some(1)),
+            (
+                Route {
+                    status: 0,
+                    ..empty_folders_route(200)
+                },
+                Some(1),
+            ),
             (empty_folders_route(200), None),
         ];
-        let (_srv, handle, dir, token_path, state) = saved_signin_engine(
+        let (srv, handle, dir, token_path, state) = saved_signin_engine(
             "store-signin",
             Keyring::Unavailable,
             with_probe_limited(routes, "ROOT"),
@@ -14500,18 +14558,82 @@ mod tests {
         let mut events = wait_for(&handle.evt_rx, |e| {
             matches!(e, SyncEvent::State(SyncState::Offline))
         });
+        // The keyring opens just as the person signs in, before the
+        // back-off's ask: the sign-in saves there, behind a reference that
+        // a later ask of the store would read.
+        state.set(Keyring::Works);
         let (_, response) = sign_in_through_loopback(&handle);
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         events.extend(wait_for(&handle.evt_rx, |e| {
             matches!(e, SyncEvent::FoldersUpdated)
         }));
         assert!(!signs_out(&events), "{events:?}");
-        // The store still cannot take it: the new token is in the file.
-        let saved = tokencache::load_in(&token_path, None).unwrap().unwrap();
-        assert_eq!(saved.0.access_token, "AT-NEW");
+        let in_store = |needle: &str| {
+            state
+                .items
+                .lock()
+                .unwrap()
+                .values()
+                .any(|v| String::from_utf8_lossy(v).contains(needle))
+        };
+        assert!(in_store("AT-NEW"), "the new token is in the keyring");
+        assert!(tokencache::account(&token_path).is_some());
         let gets = state.gets();
-        std::thread::sleep(BACKOFF_MIN + Duration::from_millis(1500));
+        assert_eq!(gets, 1, "only the start's ask");
+
+        // A pass that loses the connection goes offline; the back-off's
+        // wake runs the tick (a folder list), not a load of the store.
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::State(SyncState::Offline))
+        });
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(unavailable_reasons(&events).is_empty(), "{events:?}");
+        assert!(!signs_out(&events), "{events:?}");
         assert_eq!(state.gets(), gets, "no saved sign-in waits any more");
+        let lists = srv
+            .requests()
+            .iter()
+            .filter(|r| r.path.starts_with("/me/mailFolders?"))
+            .count();
+        assert_eq!(lists, 3, "{:?}", srv.requests());
+        finish(handle, dir);
+    }
+
+    /// #2167 r1: a `SignIn` that fails while the saved sign-in waits
+    /// announces the wait again (a client showing the sign-in under way
+    /// has nothing else to go back by), signs nothing out, and the store
+    /// is still asked at the back-off's end.
+    #[test]
+    fn failed_sign_in_while_saved_sign_in_unavailable_announces_it_again() {
+        let (_srv, handle, dir, _token_path, state) = saved_signin_engine(
+            "store-signin-failed",
+            Keyring::Unavailable,
+            with_probe_limited(vec![(empty_folders_route(200), None)], "ROOT"),
+        );
+        let mut events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::State(SyncState::Offline))
+        });
+        sign_in_through_loopback_with(&handle, |_| "code=THECODE&state=WRONG".to_string());
+        let after = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SavedSignInUnavailable(_))
+        });
+        let failed = after
+            .iter()
+            .position(|e| matches!(e, SyncEvent::Error(m) if m.starts_with("sign-in failed: ")));
+        assert!(failed.is_some(), "{after:?}");
+        assert_eq!(
+            unavailable_reasons(&after),
+            vec!["secret store unavailable: no keyring yet".to_string()]
+        );
+        events.extend(after);
+        assert!(!signs_out(&events), "{events:?}");
+        assert_eq!(state.gets(), 1);
+
+        state.set(Keyring::Works);
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(!signs_out(&events), "{events:?}");
+        assert_eq!(state.gets(), 2, "asked again at the back-off's end");
         finish(handle, dir);
     }
 
@@ -20075,6 +20197,47 @@ mod tests {
         assert!(!engine.due(), "no wake is due");
         assert!(matches!(evt_rx.try_recv(), Ok(SyncEvent::SignInRequired)));
         drop(cmd_tx);
+    }
+
+    /// #2167 r1: a saved sign-in that waits for a store the wake does not
+    /// ask (none at all, or one that latched a refusal) does not spin with
+    /// a fast tick: the wake moves the fast deadlines on.
+    #[test]
+    fn a_waiting_saved_sign_in_does_not_spin_with_a_fast_tick() {
+        for latched in [false, true] {
+            let (cmd_tx, cmd_rx) = mpsc::channel();
+            let (evt_tx, _evt_rx) = mpsc::channel();
+            let config = EngineConfig {
+                store_path: PathBuf::from("unused.db"),
+                token_path: PathBuf::from("unused-token.json"),
+                cfg: AuthConfig::default(),
+                backfill_days: 30,
+                graph_base: "http://127.0.0.1:9".into(),
+                auth_base: "http://127.0.0.1:9".into(),
+                tick: HOUR,
+                options: EngineOptions {
+                    fast_tick: Some(Duration::from_secs(60)),
+                    ..EngineOptions::without_prefetch()
+                },
+                token_store: latched.then(refused_keyring),
+            };
+            let mut engine = Engine::new(config, Store::open_in_memory().unwrap(), cmd_rx, evt_tx);
+            engine.saved_unavailable = Some("secret store unavailable: x".into());
+            let past = Instant::now() - Duration::from_secs(1);
+            engine.next_retry = Some(past);
+            engine.next_fast = past;
+            engine.next_full = past;
+            engine.on_timer();
+            assert!(
+                engine.recv_timeout() > Duration::from_secs(30),
+                "latched {latched}: {:?}",
+                engine.recv_timeout()
+            );
+            assert!(!engine.due(), "latched {latched}");
+            assert!(engine.token.is_none());
+            assert!(engine.saved_unavailable.is_some());
+            drop(cmd_tx);
+        }
     }
 
     /// #2113 (#2038 plan-del404): a DELETE answered 404 (a retry after a
