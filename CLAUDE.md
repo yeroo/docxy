@@ -31,7 +31,8 @@ issue number to find its notes.
   fields (#1437), Web Layout and DocView fitting tables to the view width, horizontal
   scroll (#1895), Print Layout's y-only caret follow (#2080), the flow view drawing an
   imported mail: exact spacing and line height, list numbers in the mark's look, the
-  layout dump (#1986).
+  layout dump (#1986), nested tables widening their fitted cells and wide pictures
+  scaled to the room (#1963).
 - `docs/claude/suite-document.md`: before changing the suite's document tab: save-as
   names (#807), Home Font / Font Size boxes (#1361), File > Info Properties (#1364), the
   comment editor (#1362), inline pictures (#1432), run styles (#1427), font substitution

@@ -186,7 +186,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   spacer) scales freely, so a table that cannot shrink comes out wider and
   scrolls. It is a drawing-time decision: the model, Print Layout, headers
   and footers (`fit_width: None`) are untouched, and a resize keeps the
-  scroll and selection. Min-content widths (a long word) are not measured.
+  scroll and selection. Min-content widths (a long word) are not measured;
+  a nested table's are since #1963 (below), which lifts `dxa` tables too.
 - `RenderCtx::fit_width` (px) carries the width; `table_el` turns it into
   twips at the zoom and gives each cell its own text width, so a nested
   table fits its cell. While a table pen is on nothing fits (`TableGeom` is
@@ -231,6 +232,57 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   the view's left, `fits_text`, `right_in_view`, Print Layout's too) and
   `pointer-wheel`'s `"shift": true`; `uiharness/cases/web-layout-table-fit.uit`
   and `ext-doc-view.uit` drive them.
+
+## Nested content and wide pictures in the flow view (#1963)
+
+- Nothing an imported mail draws is cut off out of reach. Tables:
+  `fitted_grid` lifts each column, after #1895's scale and floors, to what
+  its cells cannot shrink below (`table_view::column_mins`), as a browser's
+  auto layout does: a `dxa` table's column its grid width, a `pct`/`auto`
+  one's its #1895 floor (`MIN_FIT_COL_TW`, 0 for a spacer), each raised to
+  a cell's nested tables' summed minimums plus `CELL_MARGIN_TW` (216, the
+  7.2 px each side `table_el` pads a cell with; `w:tcMar`/`w:tblCellMar`
+  are not drawn, so the need follows the view, not the model). A
+  paragraph needs nothing (text wraps, pictures scale). A cell spanning
+  columns spreads what they still lack after the single-column cells by
+  their grid widths (equal shares when those are 0), the remainder to the
+  last; a continued vertical merge needs nothing. The lift
+  (`table_view::lift_to`) lets an `auto` table narrower than its fit grow
+  into that room first (r1, as a browser's does; a `pct` table's width is
+  its share, a `dxa` one has no slack), then takes from the other columns'
+  slack above their own minimum, in proportion, then widens the table,
+  whose root widens the scroll extent (#1895). `dxa` tables are lifted too (a card
+  holding a wider table grows, as `width="600"` is a minimum in a
+  browser); one whose content fits keeps its grid. Recursion stops at
+  `MAX_NEST` (64) levels, each minimum is at most `MAX_FIT_TW` and the
+  minimums are scaled down to it when they sum past it, so a hostile nest
+  overflows nothing. Recomputed per frame per nested table: O(tables ×
+  depth). A nested `pct` above 100% depends on its fit, so it counts its
+  floors only and may still spill; long unbreakable words are not
+  measured.
+- Pictures: an inline picture wider than its room is drawn scaled down
+  to it, its aspect kept (`shown_picture_px`, a mail client's
+  `max-width: 100%`); the model keeps its size. The room
+  (`picture_room`) is `FlowPara::room` (`RenderCtx::fit_width`: the text
+  column, or a fitted cell's text width) less the left indent (or the
+  first line's when further in) and the right one, at least 1 px. Draft
+  and Web Layout both scale (both set `fit_width`); Print Layout, headers,
+  footers and a cell while a table pen is on (`fit_width: None`) draw the
+  picture's own size. `inline_width` takes the same room, so tab segments
+  measure the drawn width; a text frame's width ignores it.
+- Harness: DocView's `ext-doc-read` `picture_widths` (each top-level
+  paragraph's inline picture as painted: `block`, `width`, `height`,
+  `left` / `right` from the view's left, `fits_text`, `right_in_view`;
+  `RenderCtx::pictures`, recorded only in a harness instance, whatever
+  the picture's media) and `ext-doc-load`'s `"images": true` (the page's
+  pictures imported, each src refused, so a sized `<img>` is #1880's
+  placeholder, in the import's own package). The doc tab's `flow.pictures`
+  (#1926) already reads drawn sizes. `uiharness/cases/ext-doc-newsletter.uit`
+  drives a 560 px picture and a `width="600"` card in a 504 px DocView, and
+  the same page (`uiharness/fixtures/newsletter.html`) in a document tab's
+  Web Layout. It asserts layout only (grid widths, scroll ranges, edges in
+  view, a drag over the card's last word once scrolled), never a word's x,
+  which follows the installed fonts (#1963 ci1: 3 px apart on CI).
 
 ## The flow view draws an imported mail as a browser does (#1986)
 

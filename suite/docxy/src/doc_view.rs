@@ -250,6 +250,9 @@ pub struct DocView {
     text_w: Rc<Cell<Option<f32>>>,
     /// Each top-level table's painted bounds in the last frame (#1895).
     tables: PaintedTables,
+    /// Each top-level paragraph's inline pictures as last painted, in a
+    /// harness instance (#1963).
+    pictures_painted: PaintedPictures,
     /// Each top-level paragraph's painted layout in the last frame, in a
     /// harness instance (#1986).
     paras: PaintedParas,
@@ -330,6 +333,7 @@ impl DocView {
             viewport: Rc::default(),
             text_w: Rc::default(),
             tables: PaintedTables::default(),
+            pictures_painted: PaintedPictures::default(),
             paras: PaintedParas::default(),
             column: Rc::default(),
             doc_gen: 0,
@@ -1339,6 +1343,18 @@ impl DocView {
                     None,
                 ),
             ),
+            // Each top-level paragraph's inline picture as last painted
+            // (#1963): drawn size, edges, `fits_text`, `right_in_view`.
+            (
+                "picture_widths",
+                painted_pictures_json(
+                    &self.pictures_painted,
+                    text_w,
+                    self.viewport
+                        .get()
+                        .map(|v| (f32::from(v.origin.x), f32::from(v.size.width))),
+                ),
+            ),
             (
                 "link_click",
                 Json::Str(
@@ -1644,6 +1660,7 @@ impl Render for DocView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.words.borrow_mut().clear();
         self.tables.borrow_mut().clear();
+        self.pictures_painted.borrow_mut().clear();
         self.paras.borrow_mut().clear();
         self.held_scroll = self.scroll.offset();
         let theme_dark = cx.theme().mode.is_dark();
@@ -1733,6 +1750,8 @@ impl Render for DocView {
             gap_below: false,
             paras: harness().then_some(&self.paras),
             inks: None,
+            // Its pictures' painted bounds, for the harness (#1963).
+            pictures: harness().then_some(&self.pictures_painted),
         };
         let scroll_area = match self.layout {
             DocLayout::Print => {
@@ -2104,6 +2123,7 @@ fn print_sheets(
     // document tab's Print Layout does: no flow spacing, no fitted width.
     let band_ctx = RenderCtx {
         fit_width: None,
+        pictures: None,
         flow: false,
         gap_below: false,
         paras: None,

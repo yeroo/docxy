@@ -119,7 +119,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   Ctrl+wheel's put-back restores both axes. `ext-doc-read` adds `scroll_x`
   / `max_scroll_x` (clamped as the next paint will), `text_width` and
   `table_widths` (each top-level table: `block`, `width`, `left` / `right`
-  from the view's left, `fits_text`, `right_in_view`); `pointer-wheel`
+  from the view's left, `fits_text`, `right_in_view`) and `picture_widths`
+  (#1963: each top-level paragraph's inline picture as painted, `height`
+  too; see `docs/claude/docx-editing.md`'s "Nested content and wide
+  pictures"); `ext-doc-load {"html", "images": true}` imports the page's
+  pictures as placeholders; `pointer-wheel`
   takes `"shift": true` (a horizontal delta, as the platforms deliver it).
   The fixture adds, after the 2x2 table, a 100% table imported from HTML
   (`fitted_html`, with a link to `CELL_URL`; in the model only) and a fixed

@@ -10380,8 +10380,10 @@ struct RenderCtx<'a> {
     /// SECTIONPAGES fields show these (#1437); `None` draws the cached text.
     page_vals: Option<&'a page_fields::PageVals>,
     /// The text width (px) a table here is fitted to (#1895): the flow
-    /// view's text column, then each fitted cell's own; `None` (Print
-    /// Layout, headers and footers) draws tables at their grid.
+    /// view's text column, then each fitted cell's own. It is also the room
+    /// a paragraph's inline pictures are scaled down to (#1963,
+    /// `FlowPara::room`). `None` (Print Layout, headers and footers) draws
+    /// tables at their grid and pictures at their size.
     fit_width: Option<f32>,
     /// Where each top-level body table's painted bounds go, by block, for
     /// the harness (#1895); `None` records none.
@@ -10399,6 +10401,62 @@ struct RenderCtx<'a> {
     /// Where each body run's ink and ground go, for the harness (#2079);
     /// `None` records none.
     inks: Option<&'a PaintedInks>,
+    /// Where each top-level paragraph's inline pictures are painted, for
+    /// the harness (#1963); `None` records none.
+    pictures: Option<&'a PaintedPictures>,
+}
+
+/// An inline picture of a top-level paragraph as last painted (#1963): its
+/// block, its drawn size (px) and its painted bounds.
+#[derive(Clone)]
+struct PaintedPicture {
+    block: usize,
+    width: f32,
+    height: f32,
+    at: UnitCell,
+}
+
+/// The [`PaintedPicture`]s of the frame last drawn.
+type PaintedPictures = std::rc::Rc<std::cell::RefCell<Vec<PaintedPicture>>>;
+
+/// The harness's view of [`PaintedPictures`] (#1963), as
+/// [`painted_tables_json`] reads tables: each picture's `block`, drawn
+/// `width` and `height`, its `left` / `right` edges from the viewport's left
+/// (`view`: its x and width), rounded to a pixel, `fits_text` (at most the
+/// text width `text_w`, +1 px for rounding) and `right_in_view`.
+fn painted_pictures_json(
+    pictures: &PaintedPictures,
+    text_w: Option<f32>,
+    view: Option<(f32, f32)>,
+) -> ctlcore::json::Json {
+    use ctlcore::json::Json;
+    let (x0, view_w) = view.unwrap_or((0., 0.));
+    let round = |v: f32| Json::Num(f64::from(v.round()));
+    Json::Arr(
+        pictures
+            .borrow()
+            .iter()
+            .map(|p| {
+                let left = f32::from(p.at.get().origin.x) - x0;
+                let right = left + p.width;
+                Json::obj(vec![
+                    ("block", Json::Num(p.block as f64)),
+                    ("width", round(p.width)),
+                    ("height", round(p.height)),
+                    ("left", round(left)),
+                    ("right", round(right)),
+                    (
+                        "fits_text",
+                        Json::Bool(text_w.is_some_and(|t| p.width <= t + 1.)),
+                    ),
+                    (
+                        "right_in_view",
+                        Json::Bool(view.is_some() && right > 0. && right <= view_w + 1.),
+                    ),
+                ])
+            })
+            .collect(),
+    )
 }
 
 /// Each top-level table's block and painted bounds in the frame last drawn.
@@ -10499,6 +10557,14 @@ struct FlowPara<'a> {
     record: Option<(&'a PaintedParas, usize)>,
     /// Where its runs' inks go (#2079).
     inks: Option<&'a PaintedInks>,
+    /// The width (px) its text is fitted to in a flow view (#1963): the
+    /// view's text column or a fitted cell's text; an inline picture wider
+    /// than that, less the indents, is drawn scaled down to it. `None`
+    /// (Print Layout, headers and footers) draws pictures at their size.
+    room: Option<f32>,
+    /// Where its inline pictures' painted bounds go, under its block
+    /// (#1963).
+    pictures: Option<(&'a PaintedPictures, usize)>,
 }
 
 /// A canvas filling its (relative) parent that takes its bounds at prepaint.
@@ -36238,7 +36304,7 @@ fn frame_content_w(
         .for_paragraph(p.props.style_id.as_deref());
         let items: f32 = flat_inlines(&p.content)
             .iter()
-            .map(|(i, _)| inline_width(i, base, zoom, meas, styler, false, page_vals))
+            .map(|(i, _)| inline_width(i, base, zoom, meas, styler, false, page_vals, None))
             .sum();
         items + meas.width(" ", base, false, false)
     };
@@ -36472,10 +36538,105 @@ fn picture_frame_px(cx: i64, cy: i64, zoom: f32) -> (f32, f32) {
     (px_of(cx), px_of(cy))
 }
 
+/// An inline picture's drawn size in px (#1963): its frame
+/// ([`picture_frame_px`]), scaled down with its aspect kept to `room` (a
+/// flow view's width for it) when wider; `None` draws its frame's size.
+/// At least 1 px each way.
+fn shown_picture_px(cx: i64, cy: i64, zoom: f32, room: Option<f32>) -> (f32, f32) {
+    let (w, h) = picture_frame_px(cx, cy, zoom);
+    match room {
+        Some(r) if w > r => {
+            let r = r.max(1.0);
+            (r, (h * r / w).max(1.0))
+        }
+        _ => (w, h),
+    }
+}
+
+/// The room (px) a paragraph's inline picture is fitted to in a flow view
+/// (#1963): `room` less its left indent (or its first line's, when that is
+/// further in) and its right one, at least 1 px.
+fn picture_room(room: Option<f32>, indent: EffIndent, zoom: f32) -> Option<f32> {
+    room.map(|r| {
+        let left = indent
+            .left
+            .max(indent.left.saturating_add(indent.first))
+            .max(0);
+        (r - tw_px(left, zoom) - tw_px(indent.right.max(0), zoom)).max(1.0)
+    })
+}
+
+#[cfg(test)]
+mod picture_fit_tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    /// EMUs of `px` px at 96 dpi.
+    fn emu(px: i64) -> i64 {
+        px * docxcore::image::EMU_PER_PX
+    }
+
+    #[test]
+    fn a_picture_wider_than_its_room_is_scaled_to_it_1963() {
+        let (cx, cy) = (emu(560), emu(220));
+        // No room known (Print Layout, headers, footers): its own size.
+        assert_eq!(shown_picture_px(cx, cy, 1.0, None), (560.0, 220.0));
+        // Room enough: its own size.
+        assert_eq!(shown_picture_px(cx, cy, 1.0, Some(600.0)), (560.0, 220.0));
+        assert_eq!(shown_picture_px(cx, cy, 1.0, Some(560.0)), (560.0, 220.0));
+        // Wider: the room's width, the aspect kept.
+        assert_eq!(
+            shown_picture_px(cx, cy, 1.0, Some(480.0)),
+            (480.0, 220.0 * 480.0 / 560.0)
+        );
+        // At a zoom: the zoomed size against the room.
+        assert_eq!(
+            shown_picture_px(cx, cy, 2.0, Some(800.0)),
+            (800.0, 440.0 * 800.0 / 1120.0)
+        );
+        // Never below 1 px either way.
+        assert_eq!(shown_picture_px(cx, emu(1), 1.0, Some(100.0)), (100.0, 1.0));
+        assert_eq!(shown_picture_px(cx, cy, 1.0, Some(0.0)), (1.0, 1.0));
+    }
+
+    #[test]
+    fn a_pictures_room_is_its_paragraphs_text_width_1963() {
+        let indent = |left, first, right| EffIndent {
+            left,
+            first,
+            right,
+            ..EffIndent::default()
+        };
+        assert_eq!(picture_room(None, indent(720, 0, 0), 1.0), None);
+        assert_eq!(picture_room(Some(480.0), indent(0, 0, 0), 1.0), Some(480.0));
+        // Left and right indents (720 twips = 48 px).
+        assert_eq!(
+            picture_room(Some(480.0), indent(720, 0, 720), 1.0),
+            Some(384.0)
+        );
+        // A first line further in counts; a hanging one does not.
+        assert_eq!(
+            picture_room(Some(480.0), indent(0, 720, 0), 1.0),
+            Some(432.0)
+        );
+        assert_eq!(
+            picture_room(Some(480.0), indent(720, -720, 0), 1.0),
+            Some(432.0)
+        );
+        // At a zoom, and never below 1 px.
+        assert_eq!(
+            picture_room(Some(960.0), indent(720, 0, 0), 2.0),
+            Some(864.0)
+        );
+        assert_eq!(picture_room(Some(40.0), indent(720, 0, 0), 1.0), Some(1.0));
+    }
+}
+
 /// The drawn width (px) of one inline of a paragraph whose base size is
 /// `base`, as `paragraph_el` draws it; an inline picture counts its frame's
-/// width, and other inlines with no measured text are 0. Tab segments and
-/// frames with no `w` both use it.
+/// width (scaled to `room`, [`shown_picture_px`]), and other inlines with
+/// no measured text are 0. Tab segments and frames with no `w` both use it.
+#[allow(clippy::too_many_arguments)]
 fn inline_width(
     it: &Inline,
     base: f32,
@@ -36484,6 +36645,7 @@ fn inline_width(
     styler: run_look::RunStyler,
     field_codes: bool,
     live: Option<&page_fields::PageVals>,
+    room: Option<f32>,
 ) -> f32 {
     match it {
         Inline::Run(r) => {
@@ -36503,7 +36665,7 @@ fn inline_width(
         }
         Inline::FootnoteRef { id, .. } => m.width(&id.to_string(), base * 0.72, false, false),
         Inline::Raw(raw) => docxcore::image::inline_extent(raw)
-            .map_or(0.0, |(cx, cy)| picture_frame_px(cx, cy, zoom).0),
+            .map_or(0.0, |(cx, cy)| shown_picture_px(cx, cy, zoom, room).0),
         _ => 0.0,
     }
 }
@@ -36917,6 +37079,8 @@ fn paragraph_el(
     // edge; a tab advances it to the next stop measured from the text margin. The
     // row's left edge sits `pad_l` px in from the margin (the paragraph indent).
     let indent = eff_indent(&p.props);
+    // A flow view draws a picture wider than its room scaled to it (#1963).
+    let pic_room = picture_room(flow.room, indent, zoom);
     let indent_layout = paragraph_indent_layout(indent, zoom);
     let pad_l = indent_layout.continuation_x;
     let interval = zoom * 720.0 / 15.0; // Word's default tab stop: every 1/2"
@@ -36967,7 +37131,7 @@ fn paragraph_el(
     // other inlines with no measurable text contribute 0.
     let inline_w = |it: &Inline| -> f32 {
         m.map_or(0.0, |m| {
-            inline_width(it, base, zoom, m, styler, field_codes, page_vals)
+            inline_width(it, base, zoom, m, styler, field_codes, page_vals, pic_room)
         })
     };
     // Total width of content from index `from` up to the next tab, alignment
@@ -37150,9 +37314,10 @@ fn paragraph_el(
                 // one offset (#1242). Cropped to an oval or rounded
                 // rectangle (Word's Crop to Shape, an HTML `border-radius`,
                 // #1926), the picture and the frame's border are clipped to
-                // its corners.
+                // its corners. A flow view draws one wider than its room
+                // scaled down to it, its aspect kept (#1963).
                 if let Some((cx_emu, cy_emu)) = docxcore::image::inline_extent(xml) {
-                    let (w, h) = picture_frame_px(cx_emu, cy_emu, zoom);
+                    let (w, h) = shown_picture_px(cx_emu, cy_emu, zoom, pic_room);
                     let shape = docxcore::image::inline_shape(xml);
                     let radius = pictures::picture_radius(shape, w, h);
                     let frame = div().flex_none().w(px(w)).h(px(h));
@@ -37167,6 +37332,19 @@ fn paragraph_el(
                         None => frame.border_1().border_color(pal.dim),
                     };
                     let frame = frame.rounded(px(radius));
+                    let frame = match flow.pictures {
+                        Some((painted, block)) => {
+                            let at = UnitCell::default();
+                            painted.borrow_mut().push(PaintedPicture {
+                                block,
+                                width: w,
+                                height: h,
+                                at: at.clone(),
+                            });
+                            frame.relative().child(bounds_probe(at))
+                        }
+                        None => frame,
+                    };
                     if let Some(p) = pics {
                         p.record(pictures::DrawnPicture {
                             width: w,
@@ -37598,7 +37776,7 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
             let cell = &row.cells[cb.cell];
             // The cell's text: over its style's run formatting, and in ink
             // that reads on its fill (#765).
-            let text_w = tw_px(cb.width as i32 - 216, zoom).max(0.0);
+            let text_w = tw_px(cb.width as i32 - table_view::CELL_MARGIN_TW as i32, zoom).max(0.0);
             let cell_ctx = RenderCtx {
                 line_width: Some(text_w),
                 gap_below: false,
@@ -38008,6 +38186,13 @@ fn block_el_numbered(
                     // A body's runs, and an open header's or footer's
                     // (its live context alone sets `inks` there).
                     inks: ctx.inks,
+                    // A flow view's (#1963): the column's or a fitted
+                    // cell's text width.
+                    room: ctx.fit_width,
+                    pictures: ctx
+                        .pictures
+                        .filter(|_| ctx.hf_width.is_none())
+                        .zip(top.then(|| path[0])),
                 },
             )
         }
@@ -43968,6 +44153,7 @@ impl Render for Docxy {
                         gap_below: false,
                         paras: None,
                         inks: doc_view::harness().then_some(&painted_inks),
+                        pictures: None,
                     };
                     let body = &shown.body;
                     if self.page_view {
@@ -44197,6 +44383,7 @@ impl Render for Docxy {
                                     // The open part's runs, against its tint
                                     // (#2079).
                                     inks: doc_view::harness().then_some(&painted_inks),
+                                    pictures: None,
                                 });
                                 // One region's margin content for this page: the live
                                 // editor blocks (editable on the edit page, read-only on
