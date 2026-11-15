@@ -25,7 +25,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// A canned response served for requests whose method matches exactly and
-/// whose path starts with `path_prefix`.
+/// whose path starts with `path_prefix`. A `status` of 0 answers nothing
+/// (#2167): the request is read whole and recorded, then the connection is
+/// closed, so the client sees a transport failure (ureq 2 does not retry a
+/// POST, so a route limited to one use fails exactly one request).
 pub struct Route {
     pub method: String,
     pub path_prefix: String,
@@ -197,6 +200,10 @@ fn handle_connection(
 
     let mut stream = stream;
     match route {
+        Some((route, _)) if route.status == 0 => {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        }
         Some((route, delay)) => {
             if !delay.is_zero() {
                 std::thread::sleep(delay);
@@ -291,6 +298,21 @@ mod tests {
             assert_eq!(resp.into_string().unwrap(), "ok");
         }
         assert_eq!(srv.requests().len(), 3);
+    }
+
+    /// #2167: a status-0 route records the request and closes the
+    /// connection unanswered, once; the next match answers.
+    #[test]
+    fn a_status_zero_route_closes_without_answering() {
+        let srv =
+            FakeServer::start_limited(vec![(route(0, ""), Some(1)), (route(202, "ok"), None)]);
+        let url = format!("{}/send", srv.base_url);
+        let first = ureq::post(&url).send_string("a=1");
+        assert!(matches!(first, Err(ureq::Error::Transport(_))), "{first:?}");
+        assert_eq!(ureq::post(&url).call().unwrap().status(), 202);
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].body, "a=1");
     }
 
     #[test]
