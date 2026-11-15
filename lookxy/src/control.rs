@@ -812,6 +812,7 @@ mod tests {
                     internet_message_id: String::new(),
                     in_reply_to: String::new(),
                     size: None,
+                    is_event_message: false,
                 },
             )
             .unwrap();

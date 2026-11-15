@@ -176,7 +176,8 @@ issue number to find its notes.
   `DeleteEvent`, `local:` ids in message ops, the store's busy timeout, one-line
   token-endpoint errors (#2113), a transient token-endpoint failure kept as offline, a saved
   sign-in in a store that cannot be reached (#2167), the reason a sign-in is asked for, in
-  lookxy's prompt (#2169).
+  lookxy's prompt (#2169), a meeting message's type filled when the class expand is refused
+  (#2168).
 
 ## Build and test
 

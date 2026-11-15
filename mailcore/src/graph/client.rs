@@ -13,7 +13,8 @@ use crate::graph::model::{
     Event, EventDeltaItem, EventDeltaPage, EventRecurrence, FolderContact, FolderListing,
     MailFolder, MasterCategory, Me, MeetingMessage, Message, MessageFields, MessageHeader,
     OofStatus, Person, PhysicalAddress, REMINDER_SET_PROP, REMINDER_SIGNAL_TIME_PROP, Recipient,
-    Recurrence, ScheduleEntry, SearchHit, SubtreeItems, parse_message_size, plain_to_html, to_utc,
+    Recurrence, ScheduleEntry, SearchHit, SubtreeItems, is_event_message_type, parse_message_size,
+    plain_to_html, to_utc,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -738,6 +739,26 @@ const SIZE_FILL_TOP: usize = 1000;
 /// alone (`MESSAGE_SIZE_PROP`), percent-encoded as `MESSAGE_EXPAND` is.
 const MESSAGE_SIZE_EXPAND: &str =
     "singleValueExtendedProperties($filter=id%20eq%20%27Integer%200x0E08%27)";
+
+/// The `$expand` of the meeting type fill's first per-item request
+/// (#2168, [`TypeTier::Class`]): `PidTagMessageClass` alone
+/// (`model::MESSAGE_CLASS_PROP`), percent-encoded as `MESSAGE_EXPAND` is.
+const MESSAGE_CLASS_EXPAND: &str =
+    "singleValueExtendedProperties($filter=id%20eq%20%27String%200x001A%27)";
+
+/// Which request the meeting type fill sends for one meeting message
+/// (#2168, [`GraphClient::meeting_type_request`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeTier {
+    /// `GET /me/messages/{id}?$select=id&$expand=` its class alone: a few
+    /// bytes, read by `model::parse_meeting_message_type` from the class.
+    Class,
+    /// A plain `GET /me/messages/{id}`, after Graph refused or dropped the
+    /// class expand: the whole message, body included, whose top-level
+    /// `meetingMessageType` (a derived-type property a plain GET returns)
+    /// the same function reads.
+    Plain,
+}
 
 /// The `$expand` of [`GraphClient::folder_size_request`] (#2123):
 /// `PidTagMessageSizeExtended` alone (`FOLDER_SIZE_PROP`).
@@ -1522,6 +1543,77 @@ impl GraphClient {
             .and_then(Value::as_str)
             .map(str::to_string);
         Ok((items, next))
+    }
+
+    /// The first page of the meeting type fill's kind listing of
+    /// `folder_id` (#2168): the messages received at or after `since` (an
+    /// ISO-8601 UTC instant, the oldest candidate's), their `id` alone,
+    /// [`SIZE_FILL_TOP`] a page. Graph puts `@odata.type` on an item of a
+    /// derived type (an `eventMessage`) whatever the `$select`, as the
+    /// delta's `is_meeting_request` relies on.
+    /// [`GraphClient::message_kinds_page`] reads it and each
+    /// `@odata.nextLink` after it.
+    pub fn message_kinds_target(folder_id: &str, since: &str) -> String {
+        format!(
+            "/me/mailFolders/{}/messages\
+             ?$filter=receivedDateTime%20ge%20{since}\
+             &$select=id&$top={SIZE_FILL_TOP}",
+            encode_path_segment(folder_id)
+        )
+    }
+
+    /// One page of the meeting type fill's kind listing (#2168): GET
+    /// `target` (a [`GraphClient::message_kinds_target`] or a `nextLink`
+    /// Graph gave), each item as `(id, is an event message)`
+    /// (`model::is_event_message_type` of its `@odata.type`; none is a
+    /// plain message), an item without an id skipped, and the page's
+    /// `@odata.nextLink`, `None` on the last page.
+    #[allow(clippy::type_complexity)]
+    pub fn message_kinds_page(
+        &self,
+        target: &str,
+    ) -> Result<(Vec<(String, bool)>, Option<String>), GraphError> {
+        let resp = self.send(Method::Get, target, None, &[])?;
+        let v = parse_body(resp)?;
+        let items = value_array(&v, "value")?
+            .iter()
+            .filter_map(|item| {
+                let id = item.get("id").and_then(Value::as_str)?;
+                let event = item
+                    .get("@odata.type")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_event_message_type);
+                (!id.is_empty()).then(|| (id.to_string(), event))
+            })
+            .collect();
+        let next = v
+            .get("@odata.nextLink")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        Ok((items, next))
+    }
+
+    /// GET one meeting message's type as a [`GraphClient::batch`]
+    /// sub-request (#2168), the id percent-encoded:
+    /// [`TypeTier::Class`] is `/me/messages/{id}?$select=id&$expand=` its
+    /// `PidTagMessageClass` (Graph's documented single-message
+    /// extended-property GET), [`TypeTier::Plain`] the plain
+    /// `/me/messages/{id}` ("get eventMessage": `meetingMessageType` at the
+    /// top level). `model::parse_meeting_message_type` reads either answer.
+    pub fn meeting_type_request(id: &str, tier: TypeTier) -> BatchRequest {
+        let id = encode_path_segment(id);
+        let url = match tier {
+            TypeTier::Class => {
+                format!("/me/messages/{id}?$select=id&$expand={MESSAGE_CLASS_EXPAND}")
+            }
+            TypeTier::Plain => format!("/me/messages/{id}"),
+        };
+        BatchRequest {
+            method: "GET",
+            url,
+            headers: Vec::new(),
+            body: None,
+        }
     }
 
     /// DELETE `/me/messages/{id}` as a [`GraphClient::batch`] sub-request
@@ -9273,6 +9365,88 @@ mod tests {
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[0].path, first);
         assert_eq!(reqs[1].path, "/me/mailFolders/F%201/messages?$skiptoken=P2");
+    }
+
+    /// #2168: the kind listing asks for ids alone and reads each item's
+    /// `@odata.type` (an `eventMessage` or a subtype is a meeting message,
+    /// none or another type is not), skips an item without an id and
+    /// follows `@odata.nextLink`.
+    #[test]
+    fn message_kinds_page_reads_odata_type_and_follows_next_link() {
+        let srv = FakeServer::start(vec![
+            // The second page's route first: both share the prefix.
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F%201/messages?$skiptoken=P2".into(),
+                status: 200,
+                headers: vec![],
+                body: r##"{"value":[{"@odata.type":"#microsoft.graph.eventMessageResponse",
+                    "id":"D"}]}"##
+                    .into(),
+            },
+            Route {
+                method: "GET".into(),
+                path_prefix: "/me/mailFolders/F%201/messages".into(),
+                status: 200,
+                headers: vec![],
+                body: r##"{"value":[
+                    {"@odata.type":"#microsoft.graph.eventMessage","id":"A"},
+                    {"id":"B"},
+                    {"@odata.type":"#microsoft.graph.eventMessageRequest","id":"C"},
+                    {"@odata.type":"#microsoft.graph.message","id":"E"},
+                    {"@odata.type":"#microsoft.graph.eventMessage"}],
+                    "@odata.nextLink":"/me/mailFolders/F%201/messages?$skiptoken=P2"}"##
+                    .into(),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let first = GraphClient::message_kinds_target("F 1", "2026-01-02T03:04:05Z");
+        assert_eq!(
+            first,
+            "/me/mailFolders/F%201/messages\
+             ?$filter=receivedDateTime%20ge%202026-01-02T03:04:05Z\
+             &$select=id&$top=1000"
+        );
+        let (items, next) = c.message_kinds_page(&first).unwrap();
+        let s = |id: &str, e: bool| (id.to_string(), e);
+        assert_eq!(
+            items,
+            [s("A", true), s("B", false), s("C", true), s("E", false)]
+        );
+        let next = next.unwrap();
+        let (items, next) = c.message_kinds_page(&next).unwrap();
+        assert_eq!(items, [s("D", true)]);
+        assert_eq!(next, None);
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].path, first);
+        assert_eq!(reqs[1].path, "/me/mailFolders/F%201/messages?$skiptoken=P2");
+    }
+
+    /// #2168: the type fill's per-item GET: the class expand alone, or the
+    /// plain GET, the id percent-encoded.
+    #[test]
+    fn meeting_type_request_urls() {
+        let r = GraphClient::meeting_type_request("A/B+C=", TypeTier::Class);
+        assert_eq!(r.method, "GET");
+        assert_eq!(
+            r.url,
+            "/me/messages/A%2FB%2BC%3D?$select=id\
+             &$expand=singleValueExtendedProperties($filter=id%20eq%20%27String%200x001A%27)"
+        );
+        assert!(r.headers.is_empty() && r.body.is_none());
+        let decoded = MESSAGE_CLASS_EXPAND.replace("%20", " ").replace("%27", "'");
+        assert_eq!(
+            decoded,
+            format!(
+                "singleValueExtendedProperties($filter=id eq '{}')",
+                crate::graph::model::MESSAGE_CLASS_PROP
+            )
+        );
+        let r = GraphClient::meeting_type_request("A/B+C=", TypeTier::Plain);
+        assert_eq!(r.method, "GET");
+        assert_eq!(r.url, "/me/messages/A%2FB%2BC%3D");
+        assert!(r.headers.is_empty() && r.body.is_none());
     }
 
     /// #2123: a folder's size is a GET of the folder with its

@@ -117,7 +117,19 @@ CREATE TABLE IF NOT EXISTS messages (
     -- delta reset; the partial index over unsized rows is made there too,
     -- after that migration.
     size                   INTEGER,
-    size_asked             INTEGER NOT NULL DEFAULT 0
+    size_asked             INTEGER NOT NULL DEFAULT 0,
+    -- The message is a meeting message (#2168): its `@odata.type` is an
+    -- `eventMessage` or a subtype, written as `is_meeting_request` is. NULL
+    -- only on a row stored before #2168 (`migrate_meeting_type_fill`), which
+    -- the engine's type fill lists once; an insert that does not name the
+    -- column writes 0. `meeting_type_known` is 1 once the row's
+    -- `meeting_message_type` is known (a carried class or top-level type,
+    -- the fill's answer or `FetchMeetingMessage`'s); a merge that does not
+    -- carry the type never sets it back. The partial index over the rows
+    -- the fill still has to look at is made in `Store::init`, after the
+    -- migration.
+    is_event_message       INTEGER DEFAULT 0,
+    meeting_type_known     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received

@@ -300,6 +300,15 @@ pub struct Message {
     /// OData control annotation auto-emitted for derived resource types, so it
     /// arrives with the normal delta response — no `$select` change needed.
     pub is_meeting_request: bool,
+    /// Graph's `@odata.type` starts with `#microsoft.graph.eventMessage`
+    /// (#2168): a meeting message (a request, a cancellation, a response,
+    /// any `eventMessage` subtype), whatever its `meeting_message_type`.
+    /// Read from the annotation every delta page carries, so it is known
+    /// even when the class `$expand` was refused and the type was not
+    /// (`Store::merge_message` writes it as it writes `is_meeting_request`);
+    /// the engine's type fill asks Graph for the type of these rows only.
+    /// See [`is_event_message_type`].
+    pub is_event_message: bool,
     /// Graph `categories`: the message's assigned category names (color labels).
     /// Colors live separately in the master category list (`MasterCategory`).
     pub categories: Vec<String>,
@@ -386,6 +395,10 @@ impl Message {
             is_draft: v.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
             is_meeting_request: v.get("@odata.type").and_then(Value::as_str)
                 == Some("#microsoft.graph.eventMessageRequest"),
+            is_event_message: v
+                .get("@odata.type")
+                .and_then(Value::as_str)
+                .is_some_and(is_event_message_type),
             categories: string_list(v, "categories"),
             is_reminder_on,
             reminder_at,
@@ -732,6 +745,15 @@ pub fn parse_meeting_message_type(v: &Value) -> (bool, Option<MeetingMessageType
     }
 }
 
+/// Whether an `@odata.type` names an `eventMessage` (#2168):
+/// `#microsoft.graph.eventMessage` or any type whose name continues it
+/// (`eventMessageRequest`, `eventMessageResponse`, a later subtype). Graph
+/// emits the annotation for a derived type in a base-typed collection
+/// whatever the `$select`, so a plain message has none.
+pub fn is_event_message_type(odata_type: &str) -> bool {
+    odata_type.starts_with("#microsoft.graph.eventMessage")
+}
+
 /// `PidLidReminderSet` (PSETID_Common LID `0x8503`, PT_BOOLEAN) as a Graph
 /// extended property id (#2054): a message's reminder is on.
 pub const REMINDER_SET_PROP: &str = "Boolean {00062008-0000-0000-C000-000000000046} Id 0x8503";
@@ -858,7 +880,7 @@ pub fn parse_meeting_reminder(v: &Value) -> (bool, bool) {
     let meeting = meeting_class
         || v.get("@odata.type")
             .and_then(Value::as_str)
-            .is_some_and(|t| t.starts_with("#microsoft.graph.eventMessage"));
+            .is_some_and(is_event_message_type);
     (true, meeting && set)
 }
 
@@ -4735,6 +4757,36 @@ mod tests {
             assert_eq!(parse_meeting_reminder(&v), (true, true), "{c}");
             assert!(Message::from_json(&v).unwrap().meeting_reminder_on, "{c}");
         }
+    }
+
+    #[test]
+    fn is_event_message_reads_every_event_message_type() {
+        // #2168: an `eventMessage` and every subtype is one, whatever its
+        // meeting type, and the flag needs no class (a refused expand).
+        for t in [
+            "#microsoft.graph.eventMessage",
+            "#microsoft.graph.eventMessageRequest",
+            "#microsoft.graph.eventMessageResponse",
+            "#microsoft.graph.eventMessageFuture",
+        ] {
+            let m = Message::from_json(&delta_item(Some(t), None)).unwrap();
+            assert!(m.is_event_message, "{t}");
+            assert!(is_event_message_type(t), "{t}");
+            assert_eq!(m.meeting_message_type, None, "{t}: no class, no type");
+        }
+        // Only a request is a meeting request.
+        let cancel = Message::from_json(&delta_item(Some("#microsoft.graph.eventMessage"), None));
+        assert!(!cancel.unwrap().is_meeting_request);
+        // No annotation (a plain message) or another type is none.
+        for t in [None, Some("#microsoft.graph.message"), Some("eventMessage")] {
+            let m = Message::from_json(&delta_item(t, None)).unwrap();
+            assert!(!m.is_event_message, "{t:?}");
+        }
+        // The kind is written under `is_meeting_request`'s rule: a carried
+        // annotation or a complete item.
+        let v = delta_item(Some("#microsoft.graph.eventMessage"), None);
+        assert!(MessageFields::of(&v).writes_meeting_request());
+        assert!(!MessageFields::of(&v).writes_meeting_type());
     }
 
     #[test]
