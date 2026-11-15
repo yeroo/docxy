@@ -1,0 +1,69 @@
+# The embedded view shows a newsletter-shaped mail in a view narrower than
+# its content (#1963): a 560 px picture is drawn scaled down to the text
+# width, its aspect kept (a mail client's `max-width: 100%`), and a 600 px
+# (`dxa`) card in a `width="100%"` page table widens that table's column to
+# hold it with the cell's margins (614 px), as a browser's auto layout does,
+# so the view scrolls sideways to the card's right edge. Nothing is cut on
+# the left. `ext-doc-load {"html", "images": true}` imports the page's
+# pictures, each src refused, so the `<img>` is a sized placeholder;
+# `ext-doc-read`'s `picture_widths` reads each top-level picture as
+# painted, `table_widths` each top-level table.
+ext fixture
+
+test issue 1963 a wide picture scales to a narrow view and a nested fixed card scrolls into reach
+  call window-size {"w":600,"h":700}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-load {"html": "<body><p><img src='cid:hero' width='560' height='220' alt='Hero'></p><table width='100%' cellpadding='0' cellspacing='0'><tr><td align='center'><table width='600' cellpadding='0' cellspacing='0'><tr><td width='500'>Cardstart</td><td width='100'>Cardend</td></tr></table></td></tr></table><p>After</p></body>", "images": true}
+  shot window
+  call ext-doc-read {}
+  # The view's text is 504 px wide: narrower than the picture and the card.
+  assert reply.text_width is 504
+  assert reply.column_left is 48
+  # The picture is drawn at the text width, its aspect kept (220 x 504/560),
+  # whole and in view.
+  assert reply.picture_widths.0.block is 0
+  assert reply.picture_widths.0.width is {ext-doc-read.text_width}
+  assert reply.picture_widths.0.height is 198
+  assert reply.picture_widths.0.left is 48
+  assert reply.picture_widths.0.fits_text is true
+  assert reply.picture_widths.0.right_in_view is true
+  # The page table holds the card and its cell's 14.4 px of margins, wider
+  # than the view, starting at the text's left: nothing is cut on the left
+  # and the view scrolls sideways by what is past its right edge.
+  assert reply.table_widths.0.block is 1
+  assert reply.table_widths.0.width is 614
+  assert reply.table_widths.0.left is 48
+  assert reply.table_widths.0.fits_text is false
+  assert reply.table_widths.0.right_in_view is false
+  assert reply.scroll_x is 0
+  assert reply.max_scroll_x is 110
+  # The card's right column's word starts 23 px before the view's right
+  # edge (600 px): the rest of it is past it.
+  call ext-doc-word {"text":"Cardend"}
+  assert reply.x is 577
+  # A shifted wheel scrolls to the table's right edge: the card's word is
+  # in view, 110 px further left.
+  call pointer-wheel {"region":"ext-doc-view","dy":-1000,"shift":true}
+  shot window
+  call ext-doc-read {}
+  assert reply.scroll_x is {ext-doc-read.max_scroll_x}
+  assert reply.table_widths.0.right_in_view is true
+  call ext-doc-word {"text":"Cardend"}
+  assert reply.x is 467
+  call pointer-wheel {"region":"ext-doc-view","dy":1000,"shift":true}
+  call ext-doc-read {}
+  assert reply.scroll_x is 0
+  # Wide: the picture is its own 560 x 220, the page table takes the text
+  # width again and nothing scrolls sideways.
+  call window-size {"w":1100,"h":700}
+  shot window
+  call ext-doc-read {}
+  assert reply.picture_widths.0.width is 560
+  assert reply.picture_widths.0.height is 220
+  assert reply.table_widths.0.width is {ext-doc-read.text_width}
+  assert reply.max_scroll_x is 0
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
