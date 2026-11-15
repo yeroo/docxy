@@ -4749,6 +4749,10 @@ mail, and every request kept only `is_meeting_request`.
   `is_flagged` and `flag_due_at` on the draft's row and bumps `local_edit` (#1871), so a
   fresh delta does not overwrite the options until a push clears it. Like
   `update_draft_fields`, it reaches a reconciled `local:` id through `draft_row_sql!`.
+  - It also sets `messages.draft_options_set` (read by `Store::draft_options_pending`),
+    which `clear_local_edit` clears with `local_edit`, under the same generation match:
+    options set after a push read the generation stay marked for the next push. An old
+    file gets the column in `Store::init`, unset, with no delta reset.
   - The due time is normalised with `model::reminder_time`, so one that cannot be read
     (an offset, junk) is stored as `""` and the flag is kept.
   - Unflagging clears the due time and the reminder (`is_reminder_on`, as `set_flag`).
@@ -4756,10 +4760,17 @@ mail, and every request kept only `is_meeting_request`.
     already flipped to `is_draft = 0`, the bumped `local_edit` would never be cleared
     (only a draft's push clears it) and would keep the row's deltas out for good. A gone
     id or a non-draft row changes nothing and is no error.
-- `create_draft` and `update_draft` take a trailing `&DraftOptions`. `draft_body_json`
-  always appends `importance` and `flag` after `bccRecipients`, so a PATCH sends the
-  stored state whole. A draft never given options sends `normal`/`notFlagged`, Graph's
-  own defaults, so it ends where it did before.
+- `create_draft` and `update_draft` take a trailing `&DraftOptions`, and `update_draft`
+  also a `send_flag`. `draft_body_json` appends `importance` after `bccRecipients`, always,
+  and then `flag`:
+  - on a create, always; a draft never given options sends `normal`/`notFlagged`, Graph's
+    own defaults.
+  - on a PATCH, only while `draft_options_set` is set, i.e. after `set_draft_options`
+    and before its push (review r1). The row cannot hold every server flag: `complete`
+    reads as not flagged (`parse_flag`), and a start date other than the due is not kept.
+    Sending the row's flag on every save would overwrite those, so a plain save leaves
+    the server's flag alone.
+  - `importance` always goes, as the row keeps Graph's value as it came.
   - The flag is `{"flagStatus":"notFlagged"}` (any due ignored), or
     `{"flagStatus":"flagged"}` with, when the due reads, `startDateTime` and
     `dueDateTime` both at the due time, as `graph_utc_wall_clock` gives it (no `Z`,
@@ -4769,12 +4780,16 @@ mail, and every request kept only `is_meeting_request`.
   - `parse_flag`/`parse_flag_due` read what is sent back unchanged.
 - `ensure_draft_on_graph` builds the options from the row (`outbox::draft_options`), so
   `SaveDraft`'s create or PATCH and `SendDraft`'s create or PATCH before `/send` carry
-  them. A reply/forward draft's row holds the importance and flag Graph returned from
-  `createReply`/`createForward` (no `$select`), so sending both on every PATCH round-trips
-  them.
-- Last writer wins. While our row has `local_edit > 0`, a flag another client sets on the
-  draft is kept out of the row by the delta guard, and our next PATCH writes our flag
-  back. Subject and body already behave this way.
+  them. A PATCH reads `draft_options_pending` after the draft. Options set in between are
+  sent now or, since they moved the generation past the one read, by the next push.
+- `Store::set_flag` (`SyncCommand::SetFlag`'s local write) clears a draft's
+  `flag_due_at` on unflag (review r1). A draft's create sends its stored flag, so a flag
+  set again must not bring back a due the user removed. A received message keeps its
+  times, as #2054 has it.
+- Last writer wins once the host has set the options. While our row has
+  `local_edit > 0`, a flag another client sets on the draft is kept out of the row by
+  the delta guard, and a PATCH after `set_draft_options` writes our flag back. Subject
+  and body already behave this way.
 - Not done, by design: a reminder on a draft's flag (`PidLidReminderSet`), a start date
   other than the due, and `flagStatus: complete` on a draft. The store has no column for
   the first two, and #2054 only reads reminders.
@@ -4786,8 +4801,13 @@ mail, and every request kept only `is_meeting_request`.
     `set_draft_options_reaches_a_reconciled_local_id`,
     `set_draft_options_unflagged_clears_the_due_and_a_bad_due_is_empty`,
     `set_draft_options_leaves_a_non_draft_alone`,
-    `a_fresh_delta_keeps_a_draft_s_set_importance`.
+    `a_fresh_delta_keeps_a_draft_s_set_importance`,
+    `clear_local_edit_clears_the_draft_options_mark_only_at_its_generation`,
+    `a_database_from_before_draft_options_set_reads_not_set`,
+    `set_flag_drops_a_draft_s_due_on_unflag_and_keeps_a_message_s`; the column in
+    `upsert_writes_every_column`.
   - `outbox.rs`: `save_draft_sends_importance_and_flag_on_create_and_patch`,
     `send_draft_creates_with_importance_and_flag`,
     `a_draft_without_options_sends_normal_and_not_flagged`,
-    `a_junk_stored_importance_sends_normal`.
+    `a_junk_stored_importance_sends_normal`,
+    `a_plain_save_of_a_synced_draft_leaves_its_server_flag_alone`.
