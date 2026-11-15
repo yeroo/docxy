@@ -2709,6 +2709,8 @@ message's `MeetingMessageType` (#2024's enum) is stored on its row.
   the order in `Store::init` matters), `set_meeting_message_type` through a move); `engine.rs` `meeting_message_types::` (a delta page of each type and a
   plain message, a later round without the class keeping it, `FetchMeetingMessage`
   writing an old row and its events, an answer without a type keeping the row).
+- A folder whose delta refused the expand gets its types from the idle type fill: see "A
+  meeting message's type when the expand is refused (#2168)".
 
 ## A message's protection on its row (#2088)
 
@@ -4595,3 +4597,137 @@ event (not a separate event before it), so a client never sees the request witho
   lookxy: `ui::signin::tests::{signin_reason_text_says_each_reason,
   required_modal_renders_the_reason, required_modal_shows_enter_at_80x24}` (the last fails at
   30% high).
+
+## A meeting message's type when the expand is refused (#2168)
+
+The stored `meeting_message_type` (#2081) is right for every meeting message, also when Graph
+refuses the delta's `MESSAGE_EXPAND`. On a real mailbox it refused 18 of 23 folders
+(`reminder_expand_refused = 1`): every cancellation and response there was stored as ordinary
+mail, and every request kept only `is_meeting_request`.
+
+- Kind: `Message::is_event_message` is `@odata.type` starting `#microsoft.graph.eventMessage`
+  (`model::is_event_message_type`: `eventMessage`, `eventMessageRequest`,
+  `eventMessageResponse`, any later subtype). Graph puts the annotation on a derived-type
+  item in a base-typed collection whatever the `$select` (OData minimal metadata), so every
+  delta page carries it, refused expand or not. The delta's `is_meeting_request` has relied
+  on this since before #2024. `parse_meeting_reminder` (#2089) now uses the same predicate.
+- Store: two columns.
+  - `messages.is_event_message`, `INTEGER DEFAULT 0`, nullable. NULL is only on a row stored
+    before #2168 and means "not known". Any INSERT that does not name the column (a test
+    fixture, `create_local_draft`) writes 0, so nothing new is ever a fill candidate by
+    accident.
+  - `meeting_type_known`, `INTEGER NOT NULL DEFAULT 0`.
+
+  `merge_message` writes `is_event_message` under `is_meeting_request`'s rule
+  (`writes_meeting_request`: a carried `@odata.type` or a complete item). It sets
+  `meeting_type_known = 1` when `writes_meeting_type`, and never back to 0. A composed draft
+  (`upsert_message`, `MessageFields::all()`) is known.
+- `untyped_where!` holds the rows the fill still has to look at: a `received_at`, a Graph id,
+  and either `is_event_message IS NULL` or `is_event_message = 1 AND meeting_type_known = 0`.
+  It is spelled the same in three places:
+  - the partial index `idx_messages_untyped ON messages(folder_id)`, made in `Store::init`
+    after the migration, never in `schema.rs`;
+  - the fill's queries (a test checks that `type_fill_folders` reads only the index);
+  - `MessageRow::meeting_type_pending` (`meeting_type_pending_sql!`), which is last in
+    `MESSAGE_ROW_COLUMNS`, after `is_event_message`. `BODY_AFTER_ROW_COLUMNS` is now 34, and
+    `conversations_in_folder`'s `keyed` CTE carries the column under its own name.
+
+  `MessageRow::is_event_message` reads NULL as false. While `meeting_type_pending` is true, a
+  `None` type says nothing.
+- Migration `migrate_meeting_type_fill` (after `migrate_folder_synced_at`) runs as one
+  IMMEDIATE transaction that probes for `is_event_message`, adds both columns, then sets the
+  old rows apart:
+  - a row with `is_meeting_request = 1` or a stored type gets `is_event_message = 1`;
+  - every other row gets NULL;
+  - a stored type is known.
+
+  A cancellation stored through a refused expand looks like plain mail here, which is why
+  those rows are NULL and not 0. No trigger fires on the UPDATE (`messages_fts_au` is `AFTER
+  UPDATE OF id, subject, from_name, from_addr`), and the migration resets no delta, backfill
+  or expand-refused state.
+- The fill (`EngineOptions::meeting_type_fill`, on by default, off in `without_prefetch`):
+  - Gates: `next_type_fill` is gated as `next_size_fill` is. In `main_loop` it runs after the
+    prefetch and the backfill and before the size fill, which on an old store may take many
+    pages; this fill is bounded by the number of meeting messages. One request per idle step.
+    Before each step, a folder that is gone, being deleted or being emptied parks quietly. A
+    pass clears the parked set; sign-in, sign-out and the mailbox reset call
+    `drop_type_fill`; clearing a folder's offline items drops its listing.
+  - Kind listing, first, for rows whose kind is not known:
+    - `GraphClient::message_kinds_target` is `GET /me/mailFolders/{id}/messages?$filter=
+      receivedDateTime ge {oldest}&$select=id&$top=1000`, read by `message_kinds_page` with
+      `(id, is an event message)` per item; it follows `@odata.nextLink`.
+    - Each page goes to `set_event_kinds`, which writes only rows still NULL.
+    - On the last page, `mark_event_kinds_unlisted` sets the candidates that are still NULL,
+      still in the folder and not pending to 0. These are gone or moved on the server, and a
+      delta brings any new copy with its `@odata.type`.
+    - Failures are the size fill's. A 4xx other than auth and throttle, or a parse error,
+      marks the candidates 0 with one `Error`, so the refused listing is not sent again.
+  - Per item, then:
+    - `meeting_type_candidates` takes at most `TYPE_FILL_BATCH` (4, `FOLDER_SIZE_BATCH`'s
+      reasoning), oldest first, without `pending_message_ids`.
+    - Each goes as `GraphClient::meeting_type_request(id, tier)` in one `$batch`.
+      `TypeTier::Class` is `GET /me/messages/{id}?$select=id&$expand=` the class alone
+      (`MESSAGE_CLASS_EXPAND`; Graph's documented single-message extended-property GET).
+      `TypeTier::Plain` is the plain `GET /me/messages/{id}` ("get eventMessage":
+      `meetingMessageType` at top level). Both are read by `parse_meeting_message_type`.
+    - Sub-responses:
+      - a `Class` 2xx with the class writes its type;
+      - a `Class` 2xx without it (a dropped expand), or any `Class` 4xx but 404 and 429,
+        sets `meeting_class_refused` and leaves the row for `Plain` in the next step;
+      - a `Plain` 2xx writes its top-level type, `None` when absent;
+      - a 404 marks the row known (`mark_meeting_type_known`);
+      - a 429 or 503 marks nothing and backs off (`react_quietly(Throttled)`);
+      - another 5xx parks the folder;
+      - a `Plain` 4xx marks the row known, with one `Error` for the batch.
+    - So a row is asked at most twice. `meeting_class_refused` lives in memory and is cleared
+      by `drop_type_fill`, so each start of the engine costs at most one refused `Class`
+      batch.
+  - Every fill write (`set_event_kinds`, `mark_event_kinds_unlisted`, `set_meeting_types`,
+    `mark_meeting_type_known`) returns the folders of the rows it actually wrote. The engine
+    emits one `MessagesUpdated` per folder per step, so a write that only flips
+    `meeting_type_pending` (a `None` answer, a 404, a kind) is told too.
+- `FetchMeetingMessage`'s `set_meeting_message_type` also sets `meeting_type_known` and
+  `is_event_message`. "Changed" now counts any of the three, so its `MessagesUpdated` follows
+  a pending flag that flipped.
+- Costs:
+  - One listing request per 1000 messages, once, for an old store's folders.
+  - One `$batch` per 4 meeting messages a refused delta brings: on the real mailbox about 38
+    batches once, for 149 meeting messages.
+  - Never a request per ordinary message.
+  - A `Plain` answer is the whole message, body included (tens of KB for an invite). That is
+    acceptable only because it runs after a `Class` refusal and only for meeting messages.
+- Rejected:
+  - A derived-type `$select` on the delta, as in #2081.
+  - Resetting the refused folders' delta: a re-enumeration per folder.
+  - The class expand on the kind listing: a second fallback path, for about 38 batches saved
+    once.
+- Residual risk: if a mailbox ever answered the `$select=id` listing without `@odata.type`,
+  its old meeting messages would be marked 0 silently. This rests on OData's rule and the
+  delta's long reliance on it, not on a run against Graph.
+- Not done: any lookxy UI (a cancellation icon), and re-listing a folder once its kinds are
+  known.
+- Tests:
+  - `model.rs`: `is_event_message_reads_every_event_message_type`.
+  - `client.rs`: `message_kinds_page_reads_odata_type_and_follows_next_link`,
+    `meeting_type_request_urls`.
+  - `store` `meeting_type_fill_tests`:
+    - the merge rule, and that a fixture insert is no candidate;
+    - every row read, including `draft`'s shifted body and `due_message_reminders`;
+    - the kind and type candidates and writes, and the folders they return;
+    - `set_meeting_message_type`;
+    - the migration, with no link touched, and its idempotence;
+    - the fresh index and the index-only plan.
+
+    Also `a_store_from_before_2054_runs_every_migration_in_order` and
+    `upsert_writes_every_column`.
+  - `engine.rs` `meeting_type_fill::`:
+    - a refused delta's six items, two batches, the plain one never asked, a later round
+      keeping the type, and the stored `meetingTenativelyAccepted` (Graph v1.0's spelling,
+      which the issue writes `meetingTentativelyAccepted`);
+    - an old store listed once, without a delta reset, with one batch for its meeting
+      messages;
+    - the `Class` 400 and dropped-expand fallback to `Plain`, with `Plain`'s `None` and 403;
+    - 404, 429 and 5xx sub-responses;
+    - a lone 404 telling the list;
+    - the kind listing's pages, unlisted rows and give-up;
+    - the gate and a sign-out.
