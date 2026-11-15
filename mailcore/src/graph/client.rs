@@ -1920,7 +1920,7 @@ impl GraphClient {
         bcc: &[Recipient],
         opts: &DraftOptions,
     ) -> Result<Message, GraphError> {
-        let body = draft_body_json(body_html, subject, to, cc, bcc, opts);
+        let body = draft_body_json(body_html, subject, to, cc, bcc, opts, true);
         let resp = self.send(Method::Post, "/me/messages", Some(body), &[])?;
         let v = parse_body(resp)?;
         Message::from_json(&v).ok_or_else(|| GraphError::Parse("malformed draft".to_string()))
@@ -1928,7 +1928,10 @@ impl GraphClient {
 
     /// PATCH `/me/messages/{id}` with the same subject/body/recipients,
     /// importance and flag shape as `create_draft`, overwriting an existing
-    /// draft in place.
+    /// draft in place. The `flag` goes only with `send_flag` (#1955): the
+    /// draft's options were set here since its last push. Without it the
+    /// server's flag is left as it is, as the store cannot hold every flag
+    /// (`complete`, a start date other than the due).
     #[allow(clippy::too_many_arguments)]
     pub fn update_draft(
         &self,
@@ -1939,10 +1942,11 @@ impl GraphClient {
         cc: &[Recipient],
         bcc: &[Recipient],
         opts: &DraftOptions,
+        send_flag: bool,
     ) -> Result<(), GraphError> {
         let id = encode_path_segment(id);
         let path = format!("/me/messages/{id}");
-        let body = draft_body_json(body_html, subject, to, cc, bcc, opts);
+        let body = draft_body_json(body_html, subject, to, cc, bcc, opts, send_flag);
         self.send(Method::Patch, &path, Some(body), &[])?;
         Ok(())
     }
@@ -3140,9 +3144,11 @@ fn utc_datetime_obj(utc: &str) -> Value {
 /// "toRecipients":[…], "ccRecipients":[…], "bccRecipients":[…],
 /// "importance":…, "flag":{…}}`.
 ///
-/// `importance` and `flag` always go (#1955), so a PATCH sends the stored
-/// state whole; a draft given no options sends `normal` and `notFlagged`,
-/// Graph's own defaults. The flag is `{"flagStatus":"notFlagged"}`, or
+/// `importance` always goes (#1955), as the store keeps Graph's value as
+/// it came; `flag` goes with `send_flag` (always on a create, on a PATCH
+/// only when the host set the options since the last push). A draft given
+/// no options sends `normal` and `notFlagged`, Graph's own defaults. The
+/// flag is `{"flagStatus":"notFlagged"}`, or
 /// `{"flagStatus":"flagged"}` with, when its due time can be read,
 /// `startDateTime` and `dueDateTime` both at that time
 /// (`graph_utc_wall_clock`): Graph refuses a due date without a start, and
@@ -3154,8 +3160,9 @@ fn draft_body_json(
     cc: &[Recipient],
     bcc: &[Recipient],
     opts: &DraftOptions,
+    send_flag: bool,
 ) -> String {
-    Value::Object(vec![
+    let mut obj = vec![
         ("subject".to_string(), Value::Str(subject.to_string())),
         (
             "body".to_string(),
@@ -3171,9 +3178,11 @@ fn draft_body_json(
             "importance".to_string(),
             Value::Str(opts.importance.as_graph().to_string()),
         ),
-        ("flag".to_string(), draft_flag_json(opts)),
-    ])
-    .to_string()
+    ];
+    if send_flag {
+        obj.push(("flag".to_string(), draft_flag_json(opts)));
+    }
+    Value::Object(obj).to_string()
 }
 
 /// A draft's Graph `flag` (#1955); see `draft_body_json`.
@@ -5523,6 +5532,7 @@ mod tests {
             &[],
             &[],
             &DraftOptions::default(),
+            false,
         )
         .unwrap();
         let reqs = srv.requests();
@@ -5581,7 +5591,12 @@ mod tests {
             body: "{}".into(),
         }]);
         let c = GraphClient::new(&srv.base_url, "AT");
-        c.update_draft("M1", "<p>e</p>", "S", &[], &[], &[], &flagged_high())
+        let opts = flagged_high();
+        c.update_draft("M1", "<p>e</p>", "S", &[], &[], &[], &opts, true)
+            .unwrap();
+        // Without `send_flag` the server's flag is left alone; the
+        // importance still goes.
+        c.update_draft("M1", "<p>e</p>", "S", &[], &[], &[], &opts, false)
             .unwrap();
         let reqs = srv.requests();
         assert_eq!(reqs[0].method, "PATCH");
@@ -5590,13 +5605,28 @@ mod tests {
             "body: {}",
             reqs[0].body
         );
+        assert!(
+            reqs[1]
+                .body
+                .ends_with(r#""bccRecipients":[],"importance":"high"}"#),
+            "body: {}",
+            reqs[1].body
+        );
     }
 
     #[test]
     fn draft_body_defaults_to_normal_and_not_flagged() {
         let tail =
             r#""bccRecipients":[],"importance":"normal","flag":{"flagStatus":"notFlagged"}}"#;
-        let body = draft_body_json("<p>x</p>", "S", &[], &[], &[], &DraftOptions::default());
+        let body = draft_body_json(
+            "<p>x</p>",
+            "S",
+            &[],
+            &[],
+            &[],
+            &DraftOptions::default(),
+            true,
+        );
         assert!(body.ends_with(tail), "body: {body}");
         // Not flagged: a due time is not sent.
         let unflagged = DraftOptions {
@@ -5604,7 +5634,7 @@ mod tests {
             flagged: false,
             flag_due_utc: "2026-12-01T17:00:00Z".into(),
         };
-        let body = draft_body_json("<p>x</p>", "S", &[], &[], &[], &unflagged);
+        let body = draft_body_json("<p>x</p>", "S", &[], &[], &[], &unflagged, true);
         assert!(
             body.ends_with(r#""importance":"low","flag":{"flagStatus":"notFlagged"}}"#),
             "body: {body}"
@@ -5615,7 +5645,7 @@ mod tests {
             flagged: true,
             flag_due_utc: "2026-12-01T17:00:00+02:00".into(),
         };
-        let body = draft_body_json("<p>x</p>", "S", &[], &[], &[], &bad_due);
+        let body = draft_body_json("<p>x</p>", "S", &[], &[], &[], &bad_due, true);
         assert!(
             body.ends_with(r#""importance":"normal","flag":{"flagStatus":"flagged"}}"#),
             "body: {body}"
@@ -5628,6 +5658,7 @@ mod tests {
             &[],
             &[],
             &flagged_high(),
+            true,
         ))
         .unwrap();
         assert!(crate::graph::model::parse_flag(&sent));

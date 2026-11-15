@@ -1890,6 +1890,14 @@ impl Store {
             "ALTER TABLE messages ADD COLUMN local_edit INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        // Same idempotent-migration pattern, for
+        // `messages.draft_options_set` (#1955: a draft's importance and flag
+        // set since its last push). A row from before reads as not set, so
+        // its next PATCH leaves the server's flag alone.
+        let _ = conn.execute(
+            "ALTER TABLE messages ADD COLUMN draft_options_set INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         // Same idempotent-migration pattern, for `bodies.fetched_as` (#1901:
         // the format `FetchBody` asked for). Rows from before it stay NULL,
         // which `get_body_for` reads as "asked for text" for a text body,
@@ -2315,16 +2323,44 @@ impl Store {
     /// Marks the draft `id` addresses clean after a push that sent
     /// generation `generation` of its fields (#1871), only if no edit came
     /// since (the generation is still that one), in one statement. Returns
-    /// whether it did.
+    /// whether it did. Its importance and flag count as pushed then too
+    /// (`draft_options_set`, #1955); an options edit after the push read
+    /// the generation bumped it past, so both stay for the next push.
     pub fn clear_local_edit(&self, id: &str, generation: i64) -> Result<bool, StoreError> {
         let n = self.conn.execute(
             concat!(
-                "UPDATE messages SET local_edit = 0 WHERE local_edit = ?2 AND ",
+                "UPDATE messages SET local_edit = 0, draft_options_set = 0
+                 WHERE local_edit = ?2 AND ",
                 draft_row_sql!()
             ),
             params![id, generation],
         )?;
         Ok(n > 0)
+    }
+
+    /// Whether the draft `id` addresses (a reconciled `local:` id still
+    /// reaches it) had its importance and flag set by `set_draft_options`
+    /// since its last push (#1955), so its next PATCH sends its `flag`.
+    /// False for an unknown row.
+    pub fn draft_options_pending(&self, id: &str) -> Result<bool, StoreError> {
+        let pending = self
+            .conn
+            .query_row(
+                concat!(
+                    "SELECT draft_options_set FROM messages WHERE ",
+                    draft_row_sql!()
+                ),
+                params![id],
+                |r| r.get::<_, bool>(0),
+            )
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(false)
+                } else {
+                    Err(e)
+                }
+            })?;
+        Ok(pending)
     }
 
     /// The message ids queued outbox ops name (#1871): every delta that
@@ -2827,11 +2863,15 @@ impl Store {
     /// for why this doesn't return a `Result`.
     ///
     /// Clearing the flag turns its reminder off too, as Outlook does
-    /// (#2054); its times are kept. Setting it leaves the reminder as it
-    /// is (off, until Graph reports one).
+    /// (#2054); its times are kept, except a draft's due time (#1955): a
+    /// draft's create sends its stored flag, and a flag set again must not
+    /// bring back the due the user removed with it. Setting it leaves the
+    /// reminder as it is (off, until Graph reports one).
     pub fn set_flag(&self, id: &str, flagged: bool) {
         let _ = self.conn.execute(
-            "UPDATE messages SET is_flagged = ?1, is_reminder_on = is_reminder_on AND ?1
+            "UPDATE messages SET is_flagged = ?1, is_reminder_on = is_reminder_on AND ?1,
+                                 flag_due_at = CASE WHEN NOT ?1 AND is_draft = 1 THEN ''
+                                                    ELSE flag_due_at END
              WHERE id = ?2",
             params![flagged, id],
         );
@@ -3863,7 +3903,9 @@ impl Store {
     /// that cannot be read (`model::reminder_time`) is stored as `""`, the
     /// flag kept. The row's unsaved-edit generation goes up (`local_edit`,
     /// #1871), so a fresh delta does not overwrite the options until a push
-    /// clears it.
+    /// clears it, and `draft_options_set` marks them for that push: a PATCH
+    /// sends the draft's `flag` only then (`draft_options_pending`), as the
+    /// row cannot hold every server flag (`complete`, a start date).
     ///
     /// Only a draft row (`is_draft = 1`) is written: a gone id, a received
     /// message or a draft already sent changes nothing and is no error, as
@@ -3875,7 +3917,7 @@ impl Store {
                 "UPDATE messages SET importance = ?2, is_flagged = ?3,
                                      flag_due_at = CASE WHEN ?3 THEN ?4 ELSE '' END,
                                      is_reminder_on = is_reminder_on AND ?3,
-                                     local_edit = local_edit + 1
+                                     local_edit = local_edit + 1, draft_options_set = 1
                  WHERE is_draft = 1 AND ",
                 draft_row_sql!()
             ),
@@ -10958,6 +11000,7 @@ mod tests {
             ("categories", t(&encode_categories(&m.categories))),
             ("local_id", V::Null),
             ("local_edit", V::Integer(0)),
+            ("draft_options_set", V::Integer(0)),
             ("is_reminder_on", V::Integer(1)),
             ("reminder_at", t("2026-07-13T08:00:00Z")),
             ("reminder_signal_at", t("2026-07-13T09:00:00Z")),
@@ -11042,6 +11085,7 @@ mod tests {
                 ("categories", t(&encode_categories(&[]))),
                 ("local_id", V::Null),
                 ("local_edit", V::Integer(0)),
+                ("draft_options_set", V::Integer(0)),
                 ("is_reminder_on", V::Integer(0)),
                 ("reminder_at", t("")),
                 ("reminder_signal_at", t("")),
@@ -17789,7 +17833,9 @@ mod draft_tests {
         let s = Store::open_in_memory().unwrap();
         let id = s.create_local_draft("Sub", "a@x", "", "body").unwrap();
         assert_eq!(s.local_edit_generation(&id).unwrap(), 0);
+        assert!(!s.draft_options_pending(&id).unwrap());
         s.set_draft_options(&id, &high_flagged()).unwrap();
+        assert!(s.draft_options_pending(&id).unwrap());
         let (row, body) = s.draft(&id).unwrap().unwrap();
         assert_eq!(row.importance, "high");
         assert!(row.is_flagged);
@@ -17891,8 +17937,95 @@ mod draft_tests {
         s.set_draft_options("R1", &high_flagged()).unwrap();
         assert_eq!(s.message_row("R1").unwrap().unwrap(), before);
         assert_eq!(s.local_edit_generation("R1").unwrap(), 0);
+        assert!(!s.draft_options_pending("R1").unwrap());
         // A gone id is no error either.
         s.set_draft_options("local:gone", &high_flagged()).unwrap();
+        assert!(!s.draft_options_pending("local:gone").unwrap());
+    }
+
+    #[test]
+    fn clear_local_edit_clears_the_draft_options_mark_only_at_its_generation() {
+        let s = Store::open_in_memory().unwrap();
+        let local = s.create_local_draft("Sub", "", "", "body").unwrap();
+        s.set_draft_options(&local, &high_flagged()).unwrap();
+        let read = s.local_edit_generation(&local).unwrap();
+        s.reconcile_id(&local, "G1").unwrap();
+        // Options set again after the push read the generation: the stale
+        // clear keeps them marked, so the next push sends them.
+        s.set_draft_options(&local, &DraftOptions::default())
+            .unwrap();
+        assert!(!s.clear_local_edit(&local, read).unwrap());
+        assert!(s.draft_options_pending("G1").unwrap());
+        // A clear at the current generation pushes them too.
+        let now = s.local_edit_generation("G1").unwrap();
+        assert!(s.clear_local_edit("G1", now).unwrap());
+        assert!(!s.draft_options_pending(&local).unwrap());
+        // A compose edit alone does not mark them.
+        s.update_draft_fields(&local, "b", "", "", "", "b").unwrap();
+        assert!(!s.draft_options_pending(&local).unwrap());
+    }
+
+    #[test]
+    fn a_database_from_before_draft_options_set_reads_not_set() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-draft-options-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        let local = {
+            let s = Store::open(&path).unwrap();
+            let local = s.create_local_draft("Old", "", "", "body").unwrap();
+            s.conn
+                .execute_batch("ALTER TABLE messages DROP COLUMN draft_options_set;")
+                .unwrap();
+            local
+        };
+        let s = Store::open(&path).unwrap();
+        assert!(!s.draft_options_pending(&local).unwrap());
+        s.set_draft_options(&local, &high_flagged()).unwrap();
+        assert!(s.draft_options_pending(&local).unwrap());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_flag_drops_a_draft_s_due_on_unflag_and_keeps_a_message_s() {
+        // Review r1 m2: a draft unflagged and flagged again must not send
+        // the due the user removed.
+        let s = Store::open_in_memory().unwrap();
+        let draft = s.create_local_draft("Sub", "", "", "body").unwrap();
+        s.set_draft_options(&draft, &high_flagged()).unwrap();
+        s.upsert_folder(&MailFolder {
+            id: "F1".into(),
+            display_name: "Inbox".into(),
+            parent_id: None,
+            total_count: 1,
+            unread_count: 0,
+            well_known_name: Some("inbox".into()),
+        })
+        .unwrap();
+        let received = Message::from_json(
+            &json::parse(
+                r#"{"id":"R1","subject":"s","isDraft":false,
+                    "flag":{"flagStatus":"flagged","dueDateTime":
+                        {"dateTime":"2026-12-01T17:00:00","timeZone":"UTC"}}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        s.upsert_message("F1", &received).unwrap();
+        for id in [draft.as_str(), "R1"] {
+            s.set_flag(id, false);
+            s.set_flag(id, true);
+        }
+        let row = s.draft(&draft).unwrap().unwrap().0;
+        assert!(row.is_flagged);
+        assert_eq!(row.flag_due_at, "");
+        let row = s.message_row("R1").unwrap().unwrap();
+        assert!(row.is_flagged);
+        assert_eq!(row.flag_due_at, "2026-12-01T17:00:00Z");
     }
 
     #[test]

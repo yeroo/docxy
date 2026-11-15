@@ -962,7 +962,8 @@ fn content_type_for(name: &str) -> String {
 /// and reconciles the store (`Store::reconcile_id`)
 /// to the Graph-minted id, which the rest of Graph (and the next `SendDraft`,
 /// if this was a `SaveDraft`) now knows it by. Otherwise `update_draft`s the
-/// Graph id in place with whatever is currently stored and returns it, so a
+/// Graph id in place with whatever is currently stored (its flag only when
+/// `set_draft_options` set it since the last push, #1955) and returns it, so a
 /// second `SaveDraft`/`SendDraft` with the same `local:` id patches the draft
 /// rather than creating it twice.
 ///
@@ -996,7 +997,22 @@ fn ensure_draft_on_graph(
         mark_pushed(store, &created.id, generation);
         Ok(created.id)
     } else {
-        client.update_draft(&row.id, &body.content, &row.subject, &to, &cc, &bcc, &opts)?;
+        // The flag goes only when the host set it since the last push
+        // (#1955), read after the draft: options set in between are sent
+        // now or, as they bumped the generation past, by the next push.
+        let send_flag = store
+            .draft_options_pending(&row.id)
+            .map_err(|e| GraphError::Parse(e.to_string()))?;
+        client.update_draft(
+            &row.id,
+            &body.content,
+            &row.subject,
+            &to,
+            &cc,
+            &bcc,
+            &opts,
+            send_flag,
+        )?;
         mark_pushed(store, &row.id, generation);
         Ok(row.id)
     }
@@ -5008,13 +5024,16 @@ mod tests {
         };
 
         apply_op(&c, &store, &save).unwrap();
-        // The next save PATCHes the same options; a change in between is sent.
+        // The create pushed the options: the next save leaves the server's
+        // flag alone, a change in between is sent, and the save after that
+        // leaves it alone again.
         apply_op(&c, &store, &save).unwrap();
         let low = DraftOptions {
             importance: Importance::Low,
             ..DraftOptions::default()
         };
         store.set_draft_options(&local_id, &low).unwrap();
+        apply_op(&c, &store, &save).unwrap();
         apply_op(&c, &store, &save).unwrap();
 
         let reqs = srv.requests();
@@ -5028,18 +5047,27 @@ mod tests {
                 ("POST", "/me/messages"),
                 ("PATCH", "/me/messages/GRAPH-1"),
                 ("PATCH", "/me/messages/GRAPH-1"),
+                ("PATCH", "/me/messages/GRAPH-1"),
             ]
         );
-        let high = ("high".to_string(), HIGH_FLAGGED_FLAG.to_string());
-        assert_eq!(importance_and_flag(&reqs[0].body), high);
-        assert_eq!(importance_and_flag(&reqs[1].body), high);
+        let flag = |f: &str| f.to_string();
+        assert_eq!(
+            importance_and_flag(&reqs[0].body),
+            (flag("high"), flag(HIGH_FLAGGED_FLAG))
+        );
+        assert_eq!(
+            importance_and_flag(&reqs[1].body),
+            (flag("high"), flag("<none>"))
+        );
         assert_eq!(
             importance_and_flag(&reqs[2].body),
-            (
-                "low".to_string(),
-                r#"{"flagStatus":"notFlagged"}"#.to_string()
-            )
+            (flag("low"), flag(r#"{"flagStatus":"notFlagged"}"#))
         );
+        assert_eq!(
+            importance_and_flag(&reqs[3].body),
+            (flag("low"), flag("<none>"))
+        );
+        assert!(!store.draft_options_pending(&local_id).unwrap());
     }
 
     #[test]
@@ -5083,12 +5111,18 @@ mod tests {
 
         let reqs = srv.requests();
         assert_eq!(reqs.len(), 2);
-        let normal = (
-            "normal".to_string(),
-            r#"{"flagStatus":"notFlagged"}"#.to_string(),
+        // The create sends Graph's defaults; the PATCH leaves the flag alone.
+        assert_eq!(
+            importance_and_flag(&reqs[0].body),
+            (
+                "normal".to_string(),
+                r#"{"flagStatus":"notFlagged"}"#.to_string()
+            )
         );
-        assert_eq!(importance_and_flag(&reqs[0].body), normal);
-        assert_eq!(importance_and_flag(&reqs[1].body), normal);
+        assert_eq!(
+            importance_and_flag(&reqs[1].body),
+            ("normal".to_string(), "<none>".to_string())
+        );
     }
 
     #[test]
@@ -5135,12 +5169,67 @@ mod tests {
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[0].path, "/me/messages/D1");
         assert_eq!(reqs[1].path, "/me/messages/D2");
-        // A flag whose due time could not be read goes as a bare flag.
-        let bare = (
-            "normal".to_string(),
-            r#"{"flagStatus":"flagged"}"#.to_string(),
+        // No options were set here: the server's flag is left alone.
+        let normal = ("normal".to_string(), "<none>".to_string());
+        assert_eq!(importance_and_flag(&reqs[0].body), normal);
+        assert_eq!(importance_and_flag(&reqs[1].body), normal);
+    }
+
+    #[test]
+    fn a_plain_save_of_a_synced_draft_leaves_its_server_flag_alone() {
+        // Review r1 m1: the row cannot hold a `complete` flag (it reads as
+        // not flagged) or a start date, so a PATCH sends `flag` only after
+        // `set_draft_options`, not on every save.
+        let srv = FakeServer::start(vec![route("PATCH", "/me/messages/D1", 200, "{}")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_folder(&MailFolder {
+                id: "DRAFTS".into(),
+                display_name: "Drafts".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: Some("drafts".into()),
+            })
+            .unwrap();
+        let draft = Message::from_json(
+            &json::parse(
+                r#"{"id":"D1","subject":"s","isDraft":true,"importance":"high",
+                    "flag":{"flagStatus":"complete"}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        store.upsert_message("DRAFTS", &draft).unwrap();
+        store
+            .update_draft_fields("D1", "edited", "b@x", "", "", "<p>b</p>")
+            .unwrap();
+        let save = OutboxOp::SaveDraft { id: "D1".into() };
+
+        apply_op(&c, &store, &save).unwrap();
+        store.set_draft_options("D1", &high_flagged()).unwrap();
+        apply_op(&c, &store, &save).unwrap();
+        store
+            .update_draft_fields("D1", "again", "b@x", "", "", "<p>b</p>")
+            .unwrap();
+        apply_op(&c, &store, &save).unwrap();
+
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 3);
+        let sent = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(sent.get("subject").and_then(Value::as_str), Some("edited"));
+        assert_eq!(
+            importance_and_flag(&reqs[0].body),
+            ("high".to_string(), "<none>".to_string())
         );
-        assert_eq!(importance_and_flag(&reqs[0].body), bare);
-        assert_eq!(importance_and_flag(&reqs[1].body), bare);
+        assert_eq!(
+            importance_and_flag(&reqs[1].body),
+            ("high".to_string(), HIGH_FLAGGED_FLAG.to_string())
+        );
+        assert_eq!(
+            importance_and_flag(&reqs[2].body),
+            ("high".to_string(), "<none>".to_string())
+        );
     }
 }
