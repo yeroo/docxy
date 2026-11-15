@@ -175,7 +175,8 @@ issue number to find its notes.
   (#1890), a sign-out's back-off, an expired delta link re-running phase 1, a 404
   `DeleteEvent`, `local:` ids in message ops, the store's busy timeout, one-line
   token-endpoint errors (#2113), a transient token-endpoint failure kept as offline, a saved
-  sign-in in a store that cannot be reached (#2167).
+  sign-in in a store that cannot be reached (#2167), the reason a sign-in is asked for, in
+  lookxy's prompt (#2169).
 
 ## Build and test
 
