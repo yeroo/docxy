@@ -2338,9 +2338,7 @@ impl App {
             Hyphenation => self.open_layout_picker(PickerKind::Hyphenation),
             PageNumber => {
                 let inl = self.build_field(FieldKind::Page);
-                self.editor.paste(&Clip {
-                    paras: vec![vec![inl]],
-                });
+                self.editor.paste(&Clip::new(vec![vec![inl]]));
                 self.after_edit();
                 self.status = Some("Inserted page number".to_string());
             }
@@ -4980,9 +4978,7 @@ impl App {
                     }],
                     ..Hyperlink::default()
                 });
-                self.editor.paste(&Clip {
-                    paras: vec![vec![link]],
-                });
+                self.editor.paste(&Clip::new(vec![vec![link]]));
             }
         }
         self.after_edit();
@@ -5055,9 +5051,7 @@ impl App {
             return;
         };
         let inl = self.build_field(kind);
-        self.editor.paste(&Clip {
-            paras: vec![vec![inl]],
-        });
+        self.editor.paste(&Clip::new(vec![vec![inl]]));
         self.after_edit();
         self.status = Some(format!("Inserted field: {}", kind.label()));
     }
@@ -11945,9 +11939,7 @@ mod tests {
             },
         };
         let mut charwise = vim_app(&["dest"]);
-        charwise.clipboard = Some(Clip {
-            paras: vec![vec![Inline::Run(bold_run.clone())]],
-        });
+        charwise.clipboard = Some(Clip::new(vec![vec![Inline::Run(bold_run.clone())]]));
         protect(&mut charwise, ProtectionEditMode::Unrestricted, true);
         let charwise_doc = charwise.editor.doc.clone();
         let charwise_caret = charwise.editor.caret.clone();
@@ -11963,15 +11955,13 @@ mod tests {
         );
 
         let mut linewise = vim_app(&["dest"]);
-        linewise.clipboard = Some(Clip {
-            paras: vec![vec![Inline::TextBox {
-                raw: String::new(),
-                blocks: vec![Block::Paragraph(docxcore::model::Paragraph {
-                    props: Default::default(),
-                    content: vec![Inline::Run(bold_run)],
-                })],
-            }]],
-        });
+        linewise.clipboard = Some(Clip::new(vec![vec![Inline::TextBox {
+            raw: String::new(),
+            blocks: vec![Block::Paragraph(docxcore::model::Paragraph {
+                props: Default::default(),
+                content: vec![Inline::Run(bold_run)],
+            })],
+        }]]));
         linewise.vim.as_mut().unwrap().linewise_clip = true;
         protect(&mut linewise, ProtectionEditMode::Unrestricted, true);
         let linewise_doc = linewise.editor.doc.clone();
@@ -15578,15 +15568,13 @@ mod tests {
         let mut app = app_with(&["dest"]);
         protect(&mut app, ProtectionEditMode::Unrestricted, true);
         app.os_clip = None;
-        app.clipboard = Some(Clip {
-            paras: vec![vec![Inline::Run(Run {
-                text: "rich".to_string(),
-                props: RunProps {
-                    bold: true,
-                    ..RunProps::default()
-                },
-            })]],
-        });
+        app.clipboard = Some(Clip::new(vec![vec![Inline::Run(Run {
+            text: "rich".to_string(),
+            props: RunProps {
+                bold: true,
+                ..RunProps::default()
+            },
+        })]]));
         let before = app.editor.doc.clone();
 
         app.do_paste();
@@ -15674,12 +15662,8 @@ mod tests {
                 ..Hyperlink::default()
             })
         };
-        assert!(clip_has_formatting(&Clip {
-            paras: vec![vec![link(true)]],
-        }));
-        assert!(!clip_has_formatting(&Clip {
-            paras: vec![vec![link(false)]],
-        }));
+        assert!(clip_has_formatting(&Clip::new(vec![vec![link(true)]])));
+        assert!(!clip_has_formatting(&Clip::new(vec![vec![link(false)]])));
     }
 
     /// A break carries its run's formatting (#279), so a clip holding only a
@@ -15696,12 +15680,8 @@ mod tests {
                 },
             )
         };
-        assert!(clip_has_formatting(&Clip {
-            paras: vec![vec![brk(true)]],
-        }));
-        assert!(!clip_has_formatting(&Clip {
-            paras: vec![vec![brk(false)]],
-        }));
+        assert!(clip_has_formatting(&Clip::new(vec![vec![brk(true)]])));
+        assert!(!clip_has_formatting(&Clip::new(vec![vec![brk(false)]])));
     }
 
     /// Text copied from a run with hyphen elements is not formatted

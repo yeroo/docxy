@@ -561,9 +561,7 @@ impl Editor {
         let props = resolve_para(&self.doc.body, &self.caret.path)
             .map(|p| tab_props_at(&p.content, self.caret.offset))
             .unwrap_or_default();
-        self.paste(&Clip {
-            paras: vec![vec![Inline::Break(kind, props)]],
-        });
+        self.paste(&Clip::new(vec![vec![Inline::Break(kind, props)]]));
     }
 
     /// Whether the caret's paragraph suppresses line numbers
@@ -1502,9 +1500,7 @@ mod tests {
             let mut e = three_with_a_sect_change();
             let saved = saved_sect_prs(&e);
             let brk = props_of(&e, 0).section_break.clone();
-            let clip = Clip {
-                paras: ["A", "B", "C"][..n].iter().map(|t| run(t)).collect(),
-            };
+            let clip = Clip::new(["A", "B", "C"][..n].iter().map(|t| run(t)).collect());
             e.caret = Caret::top(0, 2);
             e.paste(&clip);
             assert_eq!(e.sections().len(), 3, "{n} paragraphs");
@@ -1797,9 +1793,7 @@ mod tests {
         for n in [2, 3] {
             let mut e = ppr_change_editor();
             let raw = ppr_change_raw(&e, 0);
-            let clip = Clip {
-                paras: ["A", "B", "C"][..n].iter().map(|t| run(t)).collect(),
-            };
+            let clip = Clip::new(["A", "B", "C"][..n].iter().map(|t| run(t)).collect());
             e.caret = Caret::top(0, 2);
             e.paste(&clip);
             let at: Vec<usize> = (0..n).collect();

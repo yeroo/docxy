@@ -304,9 +304,7 @@ impl Editor {
                 runs: vec![Run { text, props }],
                 ..link
             };
-            ed.paste(&Clip {
-                paras: vec![vec![Inline::Hyperlink(link)]],
-            });
+            ed.paste(&Clip::new(vec![vec![Inline::Hyperlink(link)]]));
         });
         self.anchor = None;
         true

@@ -745,9 +745,7 @@ pub(crate) fn insert_inline(
 ) -> Result<(), String> {
     let ed = typing_editor(tab)?;
     let field = build(&ed.caret_props());
-    ed.paste(&docxcore::editor::Clip {
-        paras: vec![vec![field]],
-    });
+    ed.paste(&docxcore::editor::Clip::new(vec![vec![field]]));
     // Only the body previews (a header or footer editor never does).
     if let Surface::Doc(body) = &mut tab.surface {
         body.refresh_merge_preview();

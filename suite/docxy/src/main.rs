@@ -27510,9 +27510,7 @@ impl Docxy {
             docxcore::field::eval_field_ctx(instr, &ctx).unwrap_or_else(|| fallback.to_string());
         self.with_editor(window, cx, |e| {
             let field = docxcore::field::fld_simple(instr, &val, &e.caret_props());
-            e.paste(&Clip {
-                paras: vec![vec![field]],
-            })
+            e.paste(&Clip::new(vec![vec![field]]))
         });
     }
 
@@ -31086,9 +31084,7 @@ mod clipboard_tests {
              </w:drawing></w:r>"
                 .into(),
         );
-        let clip = Clip {
-            paras: vec![vec![picture.clone(), picture.clone()]],
-        };
+        let clip = Clip::new(vec![vec![picture.clone(), picture.clone()]]);
         assert_eq!(clip.to_text(), "");
         let text = doc_copy_text(&clip);
         assert_eq!(text, "\u{FFFC}\u{FFFC}");
@@ -31134,9 +31130,10 @@ mod clipboard_tests {
         );
         assert_eq!(doc_copy_text(&linked), "\u{FFFC}");
         // A clip with text writes its text.
-        let mixed = Clip {
-            paras: vec![vec![picture, Clip::from_text("ab").paras[0][0].clone()]],
-        };
+        let mixed = Clip::new(vec![vec![
+            picture,
+            Clip::from_text("ab").paras[0][0].clone(),
+        ]]);
         assert_eq!(doc_copy_text(&mixed), "ab");
     }
 

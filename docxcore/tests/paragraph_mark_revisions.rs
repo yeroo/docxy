@@ -546,9 +546,7 @@ fn pasting_paragraphs_into_a_marked_paragraph_keeps_the_record_on_the_last() {
     };
     let mut editor = editor_with(&format!("{}{}", marked("AB", "ins", "1", "S"), para("Z")));
     editor.caret = Caret::at(vec![0], 1);
-    editor.paste(&Clip {
-        paras: vec![run("x"), run("y"), run("z")],
-    });
+    editor.paste(&Clip::new(vec![run("x"), run("y"), run("z")]));
     assert_eq!(texts(&editor.doc), ["Ax", "y", "zB", "Z"]);
     let holders: Vec<usize> = editor
         .doc

@@ -6,7 +6,8 @@
 //! is mapped from its document as the RTF's is ([`crate::clip_rtf`]): its
 //! paragraphs, a table row as tab-joined cells, the trailing mark from the
 //! plain text copied beside it. Pictures are not read (a clip holds no
-//! media), and paragraph formatting, lists included, is not in a clip.
+//! media). Of a paragraph's formatting only its list membership is kept
+//! (#1967): an item's list and level, which the paste gives its paragraph.
 
 use crate::editor::Clip;
 use crate::import::Budget;
@@ -108,6 +109,36 @@ mod tests {
             "<table><tr><td>a</td><td>M\u{fc}ller</td></tr><tr><td>1</td><td>2</td></tr></table>";
         let clip = Clip::from_html(html, None).unwrap();
         assert_eq!(clip.to_text(), "a\tM\u{fc}ller\n1\t2");
+    }
+
+    /// A browser's lists keep each item's list and level (#1967), nested
+    /// ones included, to the nine levels the numbering defines; Outlook's
+    /// `MsoListParagraph` items by their markers; a paragraph beside them
+    /// has none.
+    #[test]
+    fn an_html_list_keeps_each_items_list() {
+        use crate::editor::ClipList;
+        let item = |num_id, ilvl| Some(ClipList { num_id, ilvl });
+        let html =
+            "<p>intro</p><ul><li>a<ul><li>b</li></ul></li></ul><ol><li>c</li></ol><p>after</p>";
+        let clip = Clip::from_html(html, Some("intro\na\nb\nc\nafter")).unwrap();
+        assert_eq!(clip.to_text(), "intro\na\nb\nc\nafter");
+        assert_eq!(
+            (0..5).map(|i| clip.list(i)).collect::<Vec<_>>(),
+            [None, item(1, 0), item(1, 1), item(2, 0), None]
+        );
+        let outlook = "<p class=MsoListParagraphCxSpFirst><![if !supportLists]><span style='font-family:Symbol'>\u{b7}<span>&nbsp;&nbsp; </span></span><![endif]>Apples</p><p class=MsoListParagraphCxSpLast><![if !supportLists]>1.<span>&nbsp; </span><![endif]>First</p><p class=MsoNormal>Plain</p>";
+        let clip = Clip::from_html(outlook, None).unwrap();
+        assert_eq!(clip.to_text(), "Apples\nFirst\nPlain");
+        assert_eq!(
+            (0..3).map(|i| clip.list(i)).collect::<Vec<_>>(),
+            [item(1, 0), item(2, 0), None]
+        );
+        // Ten nested lists: the deepest item is at the ninth level.
+        let deep = format!("{}deep{}", "<ul><li>".repeat(10), "</li></ul>".repeat(10));
+        let clip = Clip::from_html(&deep, None).unwrap();
+        assert_eq!(clip.to_text(), "deep");
+        assert_eq!(clip.list(0), item(1, 8));
     }
 
     #[test]

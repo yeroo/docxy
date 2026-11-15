@@ -252,12 +252,10 @@ fn inserts() -> [(&'static str, Insert); 4] {
         ("tab", |ed| ed.insert_tab()),
         ("break", |ed| ed.insert_line_break()),
         ("run x", |ed| {
-            ed.paste(&Clip {
-                paras: vec![vec![Inline::Run(Run {
-                    text: "x".into(),
-                    props: RunProps::default(),
-                })]],
-            })
+            ed.paste(&Clip::new(vec![vec![Inline::Run(Run {
+                text: "x".into(),
+                props: RunProps::default(),
+            })]]))
         }),
     ]
 }

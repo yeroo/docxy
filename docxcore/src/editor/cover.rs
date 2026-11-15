@@ -104,13 +104,11 @@ impl Editor {
         let props = resolve_para(&self.doc.body, &self.caret.path)
             .map(|p| tab_props_at(&p.content, self.caret.offset))
             .unwrap_or_default();
-        self.paste(&Clip {
-            paras: vec![
-                vec![Inline::Break(BreakKind::Page, props.clone())],
-                vec![Inline::Break(BreakKind::Page, props)],
-                Vec::new(),
-            ],
-        });
+        self.paste(&Clip::new(vec![
+            vec![Inline::Break(BreakKind::Page, props.clone())],
+            vec![Inline::Break(BreakKind::Page, props)],
+            Vec::new(),
+        ]));
     }
 
     /// Keep the caret and the selection on the same text after the top-level

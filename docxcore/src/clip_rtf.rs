@@ -15,8 +15,11 @@
 //! that text ends with more newlines than the clip read from the RTF does,
 //! the clip gains the mark it lost (an empty last paragraph). A trailing line
 //! break is a newline in both, so it gains nothing.
+//!
+//! A paste also takes each paragraph's list membership from another app's
+//! copy (#1967, [`Clip::list`]); a copy writes none.
 
-use crate::editor::Clip;
+use crate::editor::{Clip, ClipList};
 use crate::export_context::ExportContext;
 use crate::export_rtf::to_rtf;
 use crate::import::Budget;
@@ -26,7 +29,8 @@ use crate::model::{Block, BreakKind, Document, Inline, ParProps, Paragraph, RunP
 impl Clip {
     /// The RTF for this clip, its runs' styles resolved as `ctx` (the
     /// source document's styles and numbering) defines them. Paragraph
-    /// formatting is not in a clip, so none is written.
+    /// formatting is not in a clip, so none is written: not even the lists
+    /// of another app's clip (#1967), which only a paste reads.
     pub fn to_rtf(&self, ctx: &ExportContext) -> String {
         let mut paras: &[Vec<Inline>] = &self.paras;
         // A copy through the last paragraph's mark: that paragraph's `\par`
@@ -77,12 +81,18 @@ fn from_rtf_within(bytes: &[u8], plain: Option<&str>, budget: &Budget) -> Option
 /// The clip an imported `doc` pastes as (the RTF's here, the HTML's in
 /// [`crate::clip_html`]): its paragraphs, a table row as one paragraph of
 /// tab-joined cells, and the mark `plain` says the copy ends with (see the
-/// module). `None` when it holds no paragraph.
+/// module). A body paragraph the importer read as a list item keeps its
+/// list (#1967), its level within the nine the numbering defines; a table
+/// row's line has none. `None` when it holds no paragraph.
 pub(crate) fn clip_of(doc: &Document, plain: Option<&str>) -> Option<Clip> {
     let mut paras = Vec::new();
+    let mut lists = Vec::new();
     for block in &doc.body {
         match block {
-            Block::Paragraph(p) => paras.push(p.content.clone()),
+            Block::Paragraph(p) => {
+                paras.push(p.content.clone());
+                lists.push(clip_list(&p.props));
+            }
             Block::Table(t) => {
                 for row in &t.rows {
                     let mut line = Vec::new();
@@ -93,6 +103,7 @@ pub(crate) fn clip_of(doc: &Document, plain: Option<&str>) -> Option<Clip> {
                         cell_inlines(&cell.blocks, &mut line, &mut true);
                     }
                     paras.push(line);
+                    lists.push(None);
                 }
             }
             Block::Raw(_) | Block::SectionProperties(_) => {}
@@ -101,11 +112,21 @@ pub(crate) fn clip_of(doc: &Document, plain: Option<&str>) -> Option<Clip> {
     if paras.is_empty() {
         return None;
     }
-    let mut clip = Clip { paras };
+    let mut clip = Clip::new(paras);
+    clip.set_lists(lists);
     if plain.is_some_and(|t| trailing_newlines(t) > trailing_newlines(&clip.to_text())) {
         clip.paras.push(Vec::new());
     }
     Some(clip)
+}
+
+/// An imported paragraph's list membership: none for `w:numId` 0 (#1653).
+fn clip_list(props: &ParProps) -> Option<ClipList> {
+    let num_id = props.num_id.filter(|&id| id != 0)?;
+    Some(ClipList {
+        num_id,
+        ilvl: props.ilvl.clamp(0, 8),
+    })
 }
 
 /// How many newlines `text` ends with, a CRLF counting as one.
@@ -217,12 +238,10 @@ mod tests {
             strike: true,
             ..bold()
         };
-        let clip = Clip {
-            paras: vec![
-                vec![plain("Plain "), run("bold", bold()), plain(" end")],
-                vec![run("all four", all)],
-            ],
-        };
+        let clip = Clip::new(vec![
+            vec![plain("Plain "), run("bold", bold()), plain(" end")],
+            vec![run("all four", all)],
+        ]);
         assert_eq!(shape(&round_trip(&clip)), shape(&clip));
     }
 
@@ -233,15 +252,13 @@ mod tests {
             highlight: highlight.map(Into::into),
             ..RunProps::default()
         };
-        let clip = Clip {
-            paras: vec![vec![
-                plain("Plain "),
-                run("red", props(Some("FF0000"), None)),
-                run("marked", props(None, Some("yellow"))),
-                run("both", props(Some("0070C0"), Some("darkGreen"))),
-                plain(" end"),
-            ]],
-        };
+        let clip = Clip::new(vec![vec![
+            plain("Plain "),
+            run("red", props(Some("FF0000"), None)),
+            run("marked", props(None, Some("yellow"))),
+            run("both", props(Some("0070C0"), Some("darkGreen"))),
+            plain(" end"),
+        ]]);
         let colours = |clip: &Clip| -> Vec<(String, Option<String>, Option<String>)> {
             clip.paras[0]
                 .iter()
@@ -282,22 +299,18 @@ mod tests {
             vec![a_break()],
             vec![a_break(), vec![]],
         ] {
-            let clip = Clip { paras };
+            let clip = Clip::new(paras);
             assert_eq!(shape(&round_trip(&clip)), shape(&clip), "{clip:?}");
         }
     }
 
     #[test]
     fn a_partial_copy_ends_without_a_paragraph_mark() {
-        let clip = Clip {
-            paras: vec![vec![run("abc", bold())]],
-        };
+        let clip = Clip::new(vec![vec![run("abc", bold())]]);
         let rtf = clip.to_rtf(&ExportContext::default());
         assert_eq!(par_marks(&rtf), 0, "{rtf}");
         assert!(rtf.ends_with('}'), "{rtf}");
-        let through = Clip {
-            paras: vec![vec![plain("abc")], vec![]],
-        };
+        let through = Clip::new(vec![vec![plain("abc")], vec![]]);
         let rtf = through.to_rtf(&ExportContext::default());
         assert_eq!(par_marks(&rtf), 1, "{rtf}");
     }
@@ -319,9 +332,7 @@ mod tests {
             style_id: Some("Strong".into()),
             ..RunProps::default()
         };
-        let clip = Clip {
-            paras: vec![vec![run("strong", strong)]],
-        };
+        let clip = Clip::new(vec![vec![run("strong", strong)]]);
         let rtf = clip.to_rtf(&ctx);
         assert!(rtf.contains("\\b"), "{rtf}");
         let back = Clip::from_rtf(rtf.as_bytes(), Some("strong")).unwrap();
@@ -391,6 +402,35 @@ mod tests {
         let rtf = br"{\rtf1\ansi\trowd\cellx1000\cellx2000\intbl\par\intbl b\cell\intbl a\tab\par\intbl b\cell\row}";
         let clip = Clip::from_rtf(rtf, None).unwrap();
         assert_eq!(clip.to_text(), "\nb\ta\t\nb");
+    }
+
+    /// Another app's list items keep their list and level (#1967), whether
+    /// the list table, a Word 95 `\pn` or only the marker says which; a
+    /// plain paragraph and a table row's line have none.
+    #[test]
+    fn an_rtf_list_keeps_each_paragraphs_list() {
+        use crate::editor::ClipList;
+        let item = |num_id, ilvl| Some(ClipList { num_id, ilvl });
+        // As Word writes one: the list table says ls1 is bullets, ls2
+        // numbered at its second level.
+        let rtf = br"{\rtf1\ansi{\*\listtable{\list{\listlevel\levelnfc23}{\listlevel\levelnfc23}\listid10}{\list{\listlevel\levelnfc0}{\listlevel\levelnfc0}\listid20}}{\*\listoverridetable{\listoverride\listid10\ls1}{\listoverride\listid20\ls2}}\pard\ls1\ilvl0{\listtext\'b7\tab}Bullet\par\pard\ls2\ilvl1{\listtext 1.\tab}Number\par\pard Plain\par\trowd\cellx1000\intbl cell\cell\row\pard\ls1\ilvl0{\listtext\'b7\tab}Last\par}";
+        let clip = Clip::from_rtf(rtf, Some("Bullet\nNumber\nPlain\ncell\nLast")).unwrap();
+        assert_eq!(clip.to_text(), "Bullet\nNumber\nPlain\ncell\nLast");
+        assert_eq!(
+            (0..6).map(|i| clip.list(i)).collect::<Vec<_>>(),
+            [item(1, 0), item(2, 1), None, None, item(1, 0), None]
+        );
+        // A Word 95 kind, and a list no table defines (its marker says).
+        let pn = br"{\rtf1\ansi\pard\pnlvlbody{\pntext 1.\tab}One\par\pard\pnlvlblt{\pntext\'b7\tab}Dot\par\pard\ls3{\listtext 2)\tab}Marked\par\pard Plain\par}";
+        let clip = Clip::from_rtf(pn, None).unwrap();
+        assert_eq!(clip.to_text(), "One\nDot\nMarked\nPlain");
+        assert_eq!(
+            (0..4).map(|i| clip.list(i)).collect::<Vec<_>>(),
+            [item(2, 0), item(1, 0), item(2, 0), None]
+        );
+        // No list at all: none, and the clip is the paragraphs' alone.
+        let plain = Clip::from_rtf(br"{\rtf1\ansi a\par b\par}", None).unwrap();
+        assert_eq!(plain, Clip::new(plain.paras.clone()));
     }
 
     #[test]
