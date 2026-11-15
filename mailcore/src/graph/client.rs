@@ -982,6 +982,24 @@ impl GraphClient {
         }
     }
 
+    /// The path of [`GraphClient::mailbox_root_id`]'s request (#1946).
+    pub const MAILBOX_ROOT_PATH: &'static str = "/me/mailFolders/msgfolderroot?$select=id";
+
+    /// GET `/me/mailFolders/msgfolderroot?$select=id` (#1946): the id of the
+    /// signed-in mailbox's root folder, which names the mailbox (Graph ids
+    /// are mailbox-scoped) and is the `parentFolderId` of every top-level
+    /// folder `list_folders` stores. An answer without a string `id` is a
+    /// `Parse` error.
+    pub fn mailbox_root_id(&self) -> Result<String, GraphError> {
+        let resp = self.send(Method::Get, Self::MAILBOX_ROOT_PATH, None, &[])?;
+        parse_body(resp)?
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| GraphError::Parse("the mailbox root folder has no id".into()))
+    }
+
     /// GET `/me/mailFolders/{id}?$select=totalItemCount,unreadItemCount`:
     /// one folder's `(total, unread)` counts, which the sync engine re-reads
     /// after syncing just that folder (#1885). A missing count is 0, as in
@@ -7143,6 +7161,38 @@ mod tests {
             sent.get("displayName").and_then(Value::as_str),
             Some("Kid \"2\"")
         );
+    }
+
+    #[test]
+    fn mailbox_root_id_reads_the_root_folder_id() {
+        let srv = FakeServer::start(vec![folder_route(
+            "GET",
+            "/me/mailFolders/msgfolderroot",
+            200,
+            r#"{"id":"ROOT_A"}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.mailbox_root_id().unwrap(), "ROOT_A");
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(reqs[0].path, "/me/mailFolders/msgfolderroot?$select=id");
+    }
+
+    #[test]
+    fn mailbox_root_id_without_an_id_is_a_parse_error() {
+        for body in [r#"{"displayName":"Top"}"#, r#"{"id":""}"#, r#"{"id":7}"#] {
+            let srv = FakeServer::start(vec![folder_route(
+                "GET",
+                "/me/mailFolders/msgfolderroot",
+                200,
+                body,
+            )]);
+            let c = GraphClient::new(&srv.base_url, "AT");
+            assert!(
+                matches!(c.mailbox_root_id(), Err(GraphError::Parse(_))),
+                "{body}"
+            );
+        }
     }
 
     #[test]
