@@ -504,13 +504,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 }
 
 /// Keys while the sign-in modal is open: Enter drives `App::on_key_enter`
-/// (sends `SyncCommand::SignIn` from the `Required` state; a no-op once
-/// `Started`, since the browser is already open). Nothing else is handled —
+/// (sends `SyncCommand::SignIn` from the `Required` and `SavedUnavailable`
+/// states; a no-op once `Started`, since the browser is already open). In
+/// the saved-sign-in modal (#2167) `r` asks the keyring again and Esc
+/// closes it (the sync keeps trying by itself). Nothing else is handled —
 /// there's no folder tree or message list to navigate without a token yet,
 /// and no way to cancel out of a mandatory sign-in.
 fn handle_signin_key(app: &mut App, key: KeyEvent) {
-    if key.code == KeyCode::Enter {
-        app.on_key_enter();
+    match key.code {
+        KeyCode::Enter => app.on_key_enter(),
+        KeyCode::Char('r') => app.retry_saved_signin(),
+        KeyCode::Esc => app.dismiss_saved_signin(),
+        _ => {}
     }
 }
 
@@ -706,6 +711,36 @@ mod tests {
     use mailcore::sync::engine::SyncCommand;
     use ratatui::crossterm::event::KeyModifiers;
     use ratatui::{Terminal, backend::TestBackend};
+
+    /// #2167: in the saved-sign-in modal Enter signs in again, `r` asks
+    /// the keyring again, other keys do nothing, and Esc closes it. In the
+    /// `Required` modal `r` and Esc do nothing.
+    #[test]
+    fn enter_and_r_in_the_saved_sign_in_modal_send_sign_in_and_retry() {
+        use mailcore::sync::engine::SyncEvent;
+        let mut app = App::for_test_with_seeded_store();
+        app.on_sync_event(SyncEvent::SavedSignInUnavailable(
+            "secret store unavailable: no D-Bus session bus".into(),
+        ));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('r')));
+        assert!(matches!(
+            app.last_sent_command(),
+            Some(SyncCommand::RetrySavedSignIn)
+        ));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.last_sent_command(), Some(SyncCommand::SignIn)));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('m')));
+        assert!(app.last_sent_command().is_none());
+        assert!(app.signin_modal.is_some());
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.signin_modal.is_none());
+
+        app.on_sync_event(SyncEvent::SignInRequired);
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('r')));
+        handle_key(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert!(app.last_sent_command().is_none());
+        assert_eq!(app.signin_modal, Some(crate::app::SignInModal::Required));
+    }
 
     #[test]
     fn f9_focuses_the_ribbon_arrows_move_tabs_esc_leaves() {
