@@ -84,6 +84,7 @@ mod mailings_dialogs;
 mod mailings_tab;
 mod manual_hyphen;
 mod menu;
+mod native_dialog;
 mod open_mode;
 #[cfg(test)]
 mod open_mode_tests;
@@ -21438,9 +21439,24 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let after = self.save_project_then(explicit_save_as, no_after(), window, cx);
+        self.run_after(after, window, cx);
+    }
+
+    /// [`save_project`](Self::save_project), then `after` once the save is
+    /// over (#2194): returned when it is over now, or run by the Save As
+    /// dialog's answer, last.
+    #[must_use = "run the returned AfterSave: the save is over"]
+    fn save_project_then(
+        &mut self,
+        explicit_save_as: bool,
+        after: AfterSave,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AfterSave> {
         if !self.commit_active_project_cell() {
             self.refocus(window, cx);
-            return;
+            return Some(after);
         }
         // A command acts on the cursor, so the range does not survive it.
         // Backstage Save and Save As reach this method directly, not through
@@ -21453,7 +21469,7 @@ impl Docxy {
             v.anchor = None;
         }
         let Some(tab) = self.tabs.get(self.active) else {
-            return;
+            return Some(after);
         };
         let prev = tab.path.clone();
         let decision = save_decision(tab, self.harness, explicit_save_as);
@@ -21467,18 +21483,31 @@ impl Docxy {
                 // first (the dialog opens on the first filter), then the
                 // built-ins and any a format plugin writes, in its order.
                 let types = project_formats::global().save_types(tab.path.as_deref());
-                let target = macos_menu::native_modal(|| {
-                    let mut dialog = rfd::FileDialog::new();
-                    for (label, ext) in types {
-                        dialog = dialog.add_filter(label, &[ext]);
-                    }
-                    let mut dialog = dialog.set_file_name(suggested);
-                    if let Some(dir) = start {
-                        dialog = dialog.set_directory(dir);
-                    }
-                    dialog.save_file()
-                });
-                finish_project_save(&mut self.tabs[self.active], target.as_deref());
+                let mut dialog = rfd::FileDialog::new();
+                for (label, ext) in types {
+                    dialog = dialog.add_filter(label, &[ext]);
+                }
+                let mut dialog = dialog.set_file_name(suggested);
+                if let Some(dir) = start {
+                    dialog = dialog.set_directory(dir);
+                }
+                let id = self.active_tab_id();
+                self.native_dialog(
+                    dialog,
+                    |d| d.save_file(),
+                    move |this, target, window, cx| {
+                        if this.active_tab_is(&id) {
+                            finish_project_save(&mut this.tabs[this.active], target.as_deref());
+                            this.project_save_tail(prev, window, cx);
+                        } else {
+                            this.refocus(window, cx);
+                        }
+                        after(this, window, cx);
+                    },
+                    window,
+                    cx,
+                );
+                return None;
             }
             SaveDecision::RefuseHarness(message) => self.tabs[self.active].status = message.into(),
             SaveDecision::Unsaveable => {
@@ -21486,6 +21515,17 @@ impl Docxy {
                     "This project could not be loaded and cannot be saved".into()
             }
         }
+        self.project_save_tail(prev, window, cx);
+        Some(after)
+    }
+
+    /// What every Project Save ends with, its dialog answered or not.
+    fn project_save_tail(
+        &mut self,
+        prev: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.note_recent_if_moved(prev);
         self.backstage = false;
         self.bs_new = false;
@@ -26476,23 +26516,63 @@ impl Docxy {
     }
 
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_active_then(no_after(), window, cx);
+    }
+
+    /// Save the active tab, then run `after` once the save is over (#2194):
+    /// written, failed, refused or cancelled. A save that asks first (a Save
+    /// As dialog, the macro-free question) is over only once the dialog is
+    /// answered, which on Windows is after this returns. The close prompt's
+    /// Save closes the tab from `after`.
+    pub(crate) fn save_active_then(
+        &mut self,
+        after: AfterSave,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let after = self.save_active_inner(after, window, cx);
+        self.run_after(after, window, cx);
+    }
+
+    #[must_use = "run the returned AfterSave: the save is over"]
+    fn save_active_inner(
+        &mut self,
+        after: AfterSave,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AfterSave> {
         self.info_edit_apply(cx);
         // Nothing to save on the Start screen (#806).
         if self.tabs.is_empty() {
-            return self.refocus(window, cx);
+            self.refocus(window, cx);
+            return Some(after);
         }
         // Nor on a Help tab (#1855).
         if self.active_is_help() {
             self.set_status(help_view::host::HELP_NO_SAVE);
-            return self.refocus(window, cx);
+            self.refocus(window, cx);
+            return Some(after);
         }
         if self.active_is_project() {
-            return self.save_project(false, window, cx);
+            return self.save_project_then(false, after, window, cx);
         }
         if self.active_is_sheet() {
-            return self.save_sheet(false, window, cx);
+            return self.save_sheet_then(false, after, window, cx);
         }
-        self.save_doc(None, window, cx);
+        self.save_doc_then(None, after, window, cx).1
+    }
+
+    /// Run `after` if the save handed it back (it is over now); `None` means
+    /// a dialog's answer runs it (#2194).
+    pub(crate) fn run_after(
+        &mut self,
+        after: Option<AfterSave>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(after) = after {
+            after(self, window, cx);
+        }
     }
 
     /// Save the active document tab to `target` (Save As, or the first save of
@@ -26503,19 +26583,37 @@ impl Docxy {
 
     /// [`save_doc`](Self::save_doc), reporting whether the file was written:
     /// the harness's `save-as` passes the dialog's answer here and judges the
-    /// save by this rather than by the tab afterwards.
+    /// save by this rather than by the tab afterwards. `false` also when the
+    /// save asked where to go: the dialog's answer saves later (#2194). A
+    /// caller with a `target` never gets there.
     fn save_doc_to(
         &mut self,
         target: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let (saved, after) = self.save_doc_then(target, no_after(), window, cx);
+        self.run_after(after, window, cx);
+        saved
+    }
+
+    /// [`save_doc_to`](Self::save_doc_to), then `after` once the save is over
+    /// (#2194): handed back when it is over now, or run last by the Save As
+    /// dialog's answer.
+    #[must_use = "run the returned AfterSave: the save is over"]
+    fn save_doc_then(
+        &mut self,
+        target: Option<PathBuf>,
+        after: AfterSave,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (bool, Option<AfterSave>) {
         self.flush_hf(); // commit any open header/footer edits into the package first
         let Some(tab) = self.tabs.get(self.active) else {
-            return false;
+            return (false, Some(after));
         };
         if !matches!(tab.surface, Surface::Doc(_)) {
-            return false;
+            return (false, Some(after));
         }
         // A never-saved document asks where to go, like a never-saved
         // workbook, instead of writing `<cwd>/<title>` over whatever is there.
@@ -26531,7 +26629,7 @@ impl Docxy {
             None if tab.path.is_some() && path.is_none() && self.harness => {
                 self.tabs[self.active].status = DOC_CONVERTED_HARNESS.into();
                 self.refocus(window, cx);
-                return false;
+                return (false, Some(after));
             }
             None => match doc_save_target(path, tab.import.binary_source, self.harness) {
                 DocSaveTarget::InPlace => None,
@@ -26540,16 +26638,34 @@ impl Docxy {
                 DocSaveTarget::RefuseHarness => {
                     self.tabs[self.active].status = doc_import::harness_save_refusal(tab).into();
                     self.refocus(window, cx);
-                    return false;
+                    return (false, Some(after));
                 }
-                DocSaveTarget::NeedsDialog => match self.pick_doc_save_target(None) {
-                    Some(picked) => Some(picked),
-                    None => {
-                        self.tabs[self.active].status = "save cancelled".into();
-                        self.refocus(window, cx);
-                        return false;
-                    }
-                },
+                DocSaveTarget::NeedsDialog => {
+                    let id = self.active_tab_id();
+                    self.pick_doc_save_target(
+                        None,
+                        move |this, picked, window, cx| {
+                            let after = match picked {
+                                _ if !this.active_tab_is(&id) => {
+                                    this.refocus(window, cx);
+                                    Some(after)
+                                }
+                                Some(picked) => {
+                                    this.save_doc_then(Some(picked), after, window, cx).1
+                                }
+                                None => {
+                                    this.tabs[this.active].status = "save cancelled".into();
+                                    this.refocus(window, cx);
+                                    Some(after)
+                                }
+                            };
+                            this.run_after(after, window, cx);
+                        },
+                        window,
+                        cx,
+                    );
+                    return (false, None);
+                }
             },
         };
         let prev = self.tabs[self.active].path.clone();
@@ -26562,51 +26678,136 @@ impl Docxy {
         self.bs_info_status = None;
         self.persist(cx);
         self.refocus(window, cx);
-        saved
+        (saved, Some(after))
     }
 
     /// Serialize the active spreadsheet back to `.xlsx` (lossless — save_xlsx
     /// re-writes into the loaded package), preserving styles and formulas.
     /// `explicit_save_as` always asks where to go, even for a saved workbook.
     fn save_sheet(&mut self, explicit_save_as: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let after = self.save_sheet_then(explicit_save_as, no_after(), window, cx);
+        self.run_after(after, window, cx);
+    }
+
+    /// [`save_sheet`](Self::save_sheet), then `after` once the save is over
+    /// (#2194). It drives the same steps as [`save_sheet_tab`]
+    /// ([`sheet_save_begin`], [`sheet_save_answer`]), each question through
+    /// [`Docxy::native_dialog`].
+    #[must_use = "run the returned AfterSave: the save is over"]
+    fn save_sheet_then(
+        &mut self,
+        explicit_save_as: bool,
+        after: AfterSave,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AfterSave> {
         let harness = self.harness;
+        let id = self.active_tab_id();
         let Some(tab) = self.tabs.get_mut(self.active) else {
-            return;
+            return Some(after);
         };
-        let prev = tab.path.clone();
-        let start = doc_import::save_start_dir_of(tab);
-        let pick = |suggested| {
-            macos_menu::native_modal(|| {
+        let saving = SheetSaving {
+            id,
+            prev: tab.path.clone(),
+            start: doc_import::save_start_dir_of(tab),
+            // The entry Save commits may make a circle: its warning follows
+            // Save's own status (#759). Ended once, when the save is over.
+            begun: tab.circle_cmd_begin(),
+            after,
+        };
+        let step = sheet_save_begin(tab, harness, explicit_save_as);
+        self.sheet_save_drive(saving, step, window, cx)
+    }
+
+    /// Take a workbook save one step on: ask the step's question, or end the
+    /// save. Returns the save's `after` once it is over now; `None` while a
+    /// dialog's answer carries it on.
+    #[must_use = "run the returned AfterSave: the save is over"]
+    fn sheet_save_drive(
+        &mut self,
+        saving: SheetSaving,
+        step: SheetSaveStep,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AfterSave> {
+        match step {
+            SheetSaveStep::Done(saved) => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.circle_cmd_end(saving.begun);
+                }
+                if saved {
+                    self.note_recent_if_moved(saving.prev);
+                    self.backstage = false;
+                    self.bs_new = false;
+                    self.bs_export = false;
+                    self.bs_info = false;
+                    self.bs_info_status = None;
+                    self.persist(cx);
+                }
+                self.refocus(window, cx);
+                Some(saving.after)
+            }
+            SheetSaveStep::Pick { ref suggested } => {
                 let mut dialog = rfd::FileDialog::new()
                     .add_filter(SHEET_SAVE_FILTER, &SHEET_EXTENSIONS)
                     .set_file_name(suggested);
-                if let Some(dir) = &start {
+                if let Some(dir) = &saving.start {
                     dialog = dialog.set_directory(dir);
                 }
-                dialog.save_file()
-            })
-        };
-        if !save_sheet_tab(tab, harness, explicit_save_as, pick, |features| {
-            matches!(
-                macos_menu::native_modal(|| rfd::MessageDialog::new()
+                self.native_dialog(
+                    dialog,
+                    |d| d.save_file(),
+                    move |this, target, window, cx| {
+                        let answer = SheetSaveAnswer::Picked(target);
+                        this.sheet_save_answered(saving, step, answer, window, cx);
+                    },
+                    window,
+                    cx,
+                );
+                None
+            }
+            SheetSaveStep::Confirm { ref losses, .. } => {
+                let dialog = rfd::MessageDialog::new()
                     .set_title("docxy")
                     .set_level(rfd::MessageLevel::Warning)
-                    .set_description(macro_free_question(features))
-                    .set_buttons(rfd::MessageButtons::YesNo)
-                    .show()),
-                rfd::MessageDialogResult::Yes
-            )
-        }) {
-            return self.refocus(window, cx);
+                    .set_description(macro_free_question(losses))
+                    .set_buttons(rfd::MessageButtons::YesNo);
+                self.native_dialog(
+                    dialog,
+                    |d| matches!(d.show(), rfd::MessageDialogResult::Yes),
+                    move |this, yes, window, cx| {
+                        let answer = SheetSaveAnswer::Confirmed(yes);
+                        this.sheet_save_answered(saving, step, answer, window, cx);
+                    },
+                    window,
+                    cx,
+                );
+                None
+            }
         }
-        self.note_recent_if_moved(prev);
-        self.backstage = false;
-        self.bs_new = false;
-        self.bs_export = false;
-        self.bs_info = false;
-        self.bs_info_status = None;
-        self.persist(cx);
-        self.refocus(window, cx);
+    }
+
+    /// A workbook save's question was answered: the next step, and the
+    /// save's `after`, last, once it is over.
+    fn sheet_save_answered(
+        &mut self,
+        saving: SheetSaving,
+        step: SheetSaveStep,
+        answer: SheetSaveAnswer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let after = if self.active_tab_is(&saving.id) {
+            let harness = self.harness;
+            let next = sheet_save_answer(&mut self.tabs[self.active], step, answer, harness);
+            self.sheet_save_drive(saving, next, window, cx)
+        } else {
+            // Not the tab that asked (the window is disabled while a dialog
+            // is up, so this is defence): nothing to save.
+            self.refocus(window, cx);
+            Some(saving.after)
+        };
+        self.run_after(after, window, cx);
     }
 
     /// Save the active workbook as `target`, as the Save As dialog's answer
@@ -26690,10 +26891,7 @@ impl Docxy {
             self.set_status(DOC_SAVE_AS_HARNESS);
             return self.refocus(window, cx);
         }
-        match self.pick_doc_save_target(None) {
-            Some(target) => self.save_doc(Some(target), window, cx),
-            None => self.refocus(window, cx),
-        }
+        self.pick_doc_save_as(None, window, cx);
     }
 
     fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -26735,21 +26933,15 @@ impl Docxy {
                 })
                 .detach();
             }
-            open_mode::PickRoute::Deferred => {
-                // ⚠️ Never call `pick_file` before the spawn: here the App is
-                // borrowed, and the dialog's modal loop runs gpui's tasks.
-                let dialog = dialog.set_parent(window);
-                cx.spawn_in(window, async move |this, cx| {
-                    let path = macos_menu::native_modal(|| dialog.pick_file());
-                    let _ = this.update_in(cx, |this, window, cx| {
-                        this.finish_open_file(path, mode, window, cx);
-                    });
-                })
-                .detach();
-            }
-            open_mode::PickRoute::Inline => self.finish_open_file(
-                macos_menu::native_modal(|| dialog.pick_file()),
-                mode,
+            // Windows and macOS: as every other native dialog (#2194), and
+            // `native_dialog::tests` checks the two routes agree there.
+            // ⚠️ On Windows never call `pick_file` before `native_dialog`'s
+            // spawn: here the App is borrowed, and the dialog's modal loop
+            // runs gpui's tasks (#2192).
+            open_mode::PickRoute::Deferred | open_mode::PickRoute::Inline => self.native_dialog(
+                dialog,
+                |d| d.pick_file(),
+                move |this, path, window, cx| this.finish_open_file(path, mode, window, cx),
                 window,
                 cx,
             ),
@@ -30106,12 +30298,80 @@ fn sheet_save_decision(
     }
 }
 
+/// What runs once a save is over (#2194): written, failed, refused or
+/// cancelled. A save that asks first (a Save As dialog, the macro-free
+/// question) is over only once the dialog is answered, which on Windows
+/// ([`native_dialog::DialogRoute::Deferred`]) is after the listener returns.
+///
+/// ⚠️ It runs **last**: after the save's whole tail (the workbook's
+/// `circle_cmd_end`, `note_recent_if_moved`, the backstage resets, `persist`,
+/// `refocus`) and after any nested save has returned, since it may close the
+/// tab (the close prompt's Save) and shift every index. An inner save
+/// function (`save_active_inner`, `save_doc_then`, `save_sheet_then`,
+/// `save_project_then`, all `#[must_use]`) hands it back (`Some`) when it is
+/// over now, and moves it into a dialog's answer (`None`) otherwise, so no
+/// path of the save drops it. `save_active_then` runs what comes back.
+///
+/// On the Deferred route it is dropped with the answer, never run, when the
+/// window goes before the dialog shows or while it is up
+/// ([`Docxy::native_dialog`]).
+pub(crate) type AfterSave = Box<dyn FnOnce(&mut Docxy, &mut Window, &mut Context<Docxy>)>;
+
+/// An [`AfterSave`] that does nothing more.
+pub(crate) fn no_after() -> AfterSave {
+    Box::new(|_, _, _| {})
+}
+
+/// A workbook save in progress in `Docxy::save_sheet_then` (#2194): what it
+/// carries from step to step across the dialogs' answers.
+struct SheetSaving {
+    /// The tab saved, which an answer checks is still the active one.
+    id: Option<close::TabId>,
+    /// Its path before the save, for the recent list.
+    prev: Option<PathBuf>,
+    /// Where the Save As dialog opens.
+    start: Option<PathBuf>,
+    /// The circle-warning bracket, ended once the save is over (#759).
+    begun: Option<(u64, SharedString)>,
+    after: AfterSave,
+}
+
+/// Where a workbook Save stands (#2194). The one copy of the sequence:
+/// [`save_sheet_tab`] and `Docxy::save_sheet_then` both start with
+/// [`sheet_save_begin`] and answer each question with [`sheet_save_answer`].
+#[derive(Debug, PartialEq)]
+enum SheetSaveStep {
+    /// Ask where to go (the Save As dialog), `suggested` as the name.
+    Pick { suggested: String },
+    /// Ask before saving to `target` drops `losses` ([`macro_free_question`]).
+    Confirm {
+        target: PathBuf,
+        losses: Vec<&'static str>,
+    },
+    /// Over: `false` when the cell editor holds an entry the sheet refuses,
+    /// in Protected View, or when a harness cannot open the dialog needed to
+    /// choose a target; `true` otherwise, a cancelled, refused or failed
+    /// write included (the status says which, and Backstage closes).
+    Done(bool),
+}
+
+/// The answer to a [`SheetSaveStep`]'s question.
+#[derive(Debug)]
+enum SheetSaveAnswer {
+    /// The Save As dialog's file; `None` is Cancel.
+    Picked(Option<PathBuf>),
+    /// Yes (`true`) or No to the macro-free question.
+    Confirmed(bool),
+}
+
 /// Run the complete workbook Save sequence without a GPUI window. Returns
 /// false when the cell editor holds an entry the sheet refuses (nothing is
 /// written; the status says why) or a harness cannot open the dialog needed
 /// to choose a target. `pick` is the Save As dialog, and `confirm` the
 /// question before a macro-free type drops macros
-/// ([`finish_sheet_save_asking`]).
+/// ([`sheet_save_answer`]). The tests' driver: `Docxy::save_sheet_then`
+/// drives the same steps through the native dialogs (#2194).
+#[cfg(test)]
 fn save_sheet_tab(
     tab: &mut DocTab,
     harness: bool,
@@ -30122,26 +30382,38 @@ fn save_sheet_tab(
     // The entry Save commits may make a circle: its warning follows Save's
     // own status (#759).
     let begun = tab.circle_cmd_begin();
-    let saved = save_sheet_tab_now(tab, harness, explicit_save_as, pick, confirm);
+    let (mut pick, mut confirm) = (Some(pick), Some(confirm));
+    let mut step = sheet_save_begin(tab, harness, explicit_save_as);
+    let saved = loop {
+        let answer = match &step {
+            SheetSaveStep::Done(saved) => break *saved,
+            SheetSaveStep::Pick { suggested } => {
+                let pick = pick.take().expect("a workbook save picks once");
+                SheetSaveAnswer::Picked(pick(suggested.clone()))
+            }
+            SheetSaveStep::Confirm { losses, .. } => {
+                let confirm = confirm.take().expect("a workbook save asks once");
+                SheetSaveAnswer::Confirmed(confirm(losses))
+            }
+        };
+        step = sheet_save_answer(tab, step, answer, harness);
+    };
     tab.circle_cmd_end(begun);
     saved
 }
 
-fn save_sheet_tab_now(
-    tab: &mut DocTab,
-    harness: bool,
-    explicit_save_as: bool,
-    pick: impl FnOnce(String) -> Option<PathBuf>,
-    confirm: impl FnOnce(&[&'static str]) -> bool,
-) -> bool {
+/// A workbook Save's first step: Protected View and a refused entry stop it,
+/// a saved workbook goes on to its own file ([`sheet_save_at`]), and a
+/// never-saved one or Save As asks where to go.
+fn sheet_save_begin(tab: &mut DocTab, harness: bool, explicit_save_as: bool) -> SheetSaveStep {
     // Protected View writes nothing, Save As included (#610).
     if tab.access.protected {
         tab.status = open_mode::PROTECTED_STATUS.into();
-        return false;
+        return SheetSaveStep::Done(false);
     }
     // Commit before choosing a target so the decision and write see the edit.
     if close::prepare_sheet_save(tab).is_err() {
-        return false;
+        return SheetSaveStep::Done(false);
     }
     match sheet_save_decision(
         tab.path.as_deref(),
@@ -30150,24 +30422,9 @@ fn save_sheet_tab_now(
         explicit_save_as,
         tab.access.save_needs_dialog(),
     ) {
-        SheetSaveDecision::InPlace(path) => {
-            finish_sheet_save_asking(tab, Some(&path), harness, confirm);
-        }
+        SheetSaveDecision::InPlace(path) => sheet_save_at(tab, Some(&path), harness),
         // A never-saved workbook or Save As asks where to go, Excel-style.
-        SheetSaveDecision::Dialog { suggested } => {
-            let target = pick(suggested);
-            // A name Excel refuses is refused like a failed write: the arm
-            // still answers true, so Backstage closes and the status shows.
-            if let Some(Err(e)) = target
-                .as_deref()
-                .and_then(|t| sheet_save_target(t).ok())
-                .map(|p| sheet_save_as_name(&p))
-            {
-                tab.status = e.into();
-            } else {
-                finish_sheet_save_asking(tab, target.as_deref(), harness, confirm);
-            }
-        }
+        SheetSaveDecision::Dialog { suggested } => SheetSaveStep::Pick { suggested },
         // Never in a harness instance: rfd runs its own modal loop on this
         // thread and stops the control pump dead (see the "No modal dialog
         // may sit on a path a verb can reach" note in
@@ -30176,10 +30433,96 @@ fn save_sheet_tab_now(
         // is the only answer a test can read.
         SheetSaveDecision::RefuseHarness(message) => {
             tab.status = message.into();
-            return false;
+            SheetSaveStep::Done(false)
         }
     }
-    true
+}
+
+/// The step after `step` once `answer` came. An answer that does not fit
+/// the step (never, from either driver) ends the save writing nothing.
+fn sheet_save_answer(
+    tab: &mut DocTab,
+    step: SheetSaveStep,
+    answer: SheetSaveAnswer,
+    harness: bool,
+) -> SheetSaveStep {
+    match (step, answer) {
+        (SheetSaveStep::Pick { .. }, SheetSaveAnswer::Picked(target)) => {
+            // A name Excel refuses is refused like a failed write: the arm
+            // still answers true, so Backstage closes and the status shows.
+            if let Some(Err(e)) = target
+                .as_deref()
+                .and_then(|t| sheet_save_target(t).ok())
+                .map(|p| sheet_save_as_name(&p))
+            {
+                tab.status = e.into();
+                SheetSaveStep::Done(true)
+            } else {
+                sheet_save_at(tab, target.as_deref(), harness)
+            }
+        }
+        (SheetSaveStep::Confirm { target, .. }, SheetSaveAnswer::Confirmed(yes)) => {
+            sheet_save_confirmed(tab, &target, yes);
+            SheetSaveStep::Done(true)
+        }
+        (step, answer) => {
+            debug_assert!(false, "{answer:?} does not answer {step:?}");
+            SheetSaveStep::Done(false)
+        }
+    }
+}
+
+/// [`finish_sheet_save`] to `target` (`None` is a cancelled dialog), unless
+/// a macro-free type (`.xlsx`, `.xltx`) would drop the workbook's macros:
+/// then Excel asks first ([`SheetSaveStep::Confirm`], answered by
+/// [`sheet_save_confirmed`]).
+///
+/// Excel 4.0 macro sheets stay in the open workbook (removing them would
+/// shift every sheet index), so each later macro-free save asks again, an
+/// in-place one included, as in Excel; xlsxy asks only on Save As. So does
+/// one after undoing
+/// past a structural step taken before this save: that step restores a
+/// package that still has the VB project.
+///
+/// A harness instance never asks: rfd's modal loop would stop the control
+/// pump (see `save_sheet_tab`). It writes as before, and the status says what
+/// was left out.
+fn sheet_save_at(
+    tab: &mut DocTab,
+    target: Option<&std::path::Path>,
+    harness: bool,
+) -> SheetSaveStep {
+    let losses = match (&tab.surface, target.map(sheet_save_target)) {
+        (Surface::Sheet(v), Some(Ok(path))) if !harness => sheet_macro_losses(v, &path),
+        _ => Vec::new(),
+    };
+    match target {
+        Some(target) if !losses.is_empty() => SheetSaveStep::Confirm {
+            target: target.to_path_buf(),
+            losses,
+        },
+        _ => {
+            finish_sheet_save(tab, target);
+            SheetSaveStep::Done(true)
+        }
+    }
+}
+
+/// The macro-free question's answer: No writes nothing and says `save
+/// cancelled`; the tab stays dirty, so a close that asked to save keeps it.
+/// Yes writes the file without them, and once it is written the open
+/// workbook drops its VB project too, so a later Save As `.xlsm` cannot write
+/// it back (xlsxy's `save_as_without_macros`); a failed write keeps it.
+fn sheet_save_confirmed(tab: &mut DocTab, target: &std::path::Path, yes: bool) {
+    if !yes {
+        tab.status = "save cancelled".into();
+        return;
+    }
+    if finish_sheet_save(tab, Some(target))
+        && let Surface::Sheet(v) = &mut tab.surface
+    {
+        v.pkg.remove_vba_project();
+    }
 }
 
 /// The file a workbook is written to for a picked `path`: `.xlsx` is added
@@ -30255,48 +30598,6 @@ fn sheet_macro_losses(v: &SheetView, path: &std::path::Path) -> Vec<&'static str
         Some(kind) if !kind.allows_macros() => v.pkg.macro_features(),
         _ => Vec::new(),
     }
-}
-
-/// [`finish_sheet_save`], first asking, as Excel does, before a macro-free
-/// type (`.xlsx`, `.xltx`) drops the workbook's macros: `confirm` gets what
-/// would be lost and answers Yes (`true`) or No. No writes nothing and says
-/// `save cancelled`; the tab stays dirty, so a close that asked to save keeps
-/// it. Yes writes the file without them, and once it is written the open
-/// workbook drops its VB project too, so a later Save As `.xlsm` cannot write
-/// it back (xlsxy's `save_as_without_macros`); a failed write keeps it.
-///
-/// Excel 4.0 macro sheets stay in the open workbook (removing them would
-/// shift every sheet index), so each later macro-free save asks again, an
-/// in-place one included, as in Excel; xlsxy asks only on Save As. So does
-/// one after undoing
-/// past a structural step taken before this save: that step restores a
-/// package that still has the VB project.
-///
-/// A harness instance never asks: rfd's modal loop would stop the control
-/// pump (see `save_sheet_tab`). It writes as before, and the status says what
-/// was left out.
-fn finish_sheet_save_asking(
-    tab: &mut DocTab,
-    target: Option<&std::path::Path>,
-    harness: bool,
-    confirm: impl FnOnce(&[&'static str]) -> bool,
-) -> bool {
-    let losses = match (&tab.surface, target.map(sheet_save_target)) {
-        (Surface::Sheet(v), Some(Ok(path))) if !harness => sheet_macro_losses(v, &path),
-        _ => Vec::new(),
-    };
-    let asked = !losses.is_empty();
-    if asked && !confirm(&losses) {
-        tab.status = "save cancelled".into();
-        return false;
-    }
-    let saved = finish_sheet_save(tab, target);
-    if saved && asked {
-        if let Surface::Sheet(v) = &mut tab.surface {
-            v.pkg.remove_vba_project();
-        }
-    }
-    saved
 }
 
 /// Write the workbook tab to `target` (`None` is a cancelled dialog). The tab
@@ -31638,9 +31939,11 @@ mod load_failed_save_tests {
 mod sheet_save_tests {
     use super::{
         DocTab, Kind, PivotDef, SHEET_BAD_NAME, SHEET_MAX_PATH, SHEET_NEVER_SAVED_HARNESS,
-        SHEET_SAVE_AS_HARNESS, SHEET_SAVE_FORMATS, SheetSaveDecision, SheetView, Surface,
-        finish_sheet_save, macro_free_question, new_sheet_surface, save_sheet_tab, save_sheet_to,
-        sheet_bytes, sheet_save_as_name, sheet_save_decision, sheet_save_target, tab_from_path,
+        SHEET_SAVE_AS_HARNESS, SHEET_SAVE_FORMATS, SheetSaveAnswer, SheetSaveDecision,
+        SheetSaveStep, SheetView, Surface, finish_sheet_save, macro_free_question,
+        new_sheet_surface, save_sheet_tab, save_sheet_to, sheet_bytes, sheet_save_answer,
+        sheet_save_as_name, sheet_save_begin, sheet_save_decision, sheet_save_target,
+        tab_from_path,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32214,6 +32517,132 @@ mod sheet_save_tests {
             unreachable!()
         };
         &v.pkg
+    }
+
+    /// The files in `dir`.
+    fn files_in(dir: &Scratch) -> Vec<PathBuf> {
+        std::fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect()
+    }
+
+    /// #2194: an untitled workbook's Save stops at its question, writing
+    /// nothing, as the Save As dialog's answer comes later on Windows; the
+    /// answer then writes.
+    #[test]
+    fn an_untitled_workbook_save_asks_first_and_writes_nothing() {
+        let dir = Scratch::new();
+        let mut tab = sheet_tab(None, "Book1");
+        let step = sheet_save_begin(&mut tab, false, false);
+        assert_eq!(
+            step,
+            SheetSaveStep::Pick {
+                suggested: "Book1.xlsx".into()
+            }
+        );
+        assert!(files_in(&dir).is_empty());
+        assert!(tab.dirty);
+        assert_eq!(tab.path, None);
+        assert_eq!(tab.status.as_ref(), "new");
+
+        let out = dir.path("out.xlsx");
+        let answer = SheetSaveAnswer::Picked(Some(out.clone()));
+        let step = sheet_save_answer(&mut tab, step, answer, false);
+        assert_eq!(step, SheetSaveStep::Done(true));
+        assert!(out.is_file());
+        assert_eq!(tab.path.as_deref(), Some(out.as_path()));
+        assert!(!tab.dirty, "{}", tab.status);
+    }
+
+    /// #2194: Cancel on the Save As dialog ends the save as before: true
+    /// (Backstage closes), "save cancelled", nothing written.
+    #[test]
+    fn a_cancelled_workbook_pick_answers_like_before() {
+        let dir = Scratch::new();
+        let mut tab = sheet_tab(None, "Book1");
+        let step = sheet_save_begin(&mut tab, false, false);
+        let step = sheet_save_answer(&mut tab, step, SheetSaveAnswer::Picked(None), false);
+        assert_eq!(step, SheetSaveStep::Done(true));
+        assert_eq!(tab.status.as_ref(), "save cancelled");
+        assert!(files_in(&dir).is_empty());
+        assert!(tab.dirty);
+    }
+
+    /// #2194: a picked macro-free name for a workbook with macros asks the
+    /// macro question before anything is written; No then writes nothing.
+    #[test]
+    fn a_macro_losing_pick_asks_before_writing_and_no_writes_nothing() {
+        let dir = Scratch::new();
+        let mut tab = loaded_sheet_tab(&dir, "in.xlsm", &vba_book());
+        tab.set_dirty();
+        let step = sheet_save_begin(&mut tab, false, true);
+        assert_eq!(
+            step,
+            SheetSaveStep::Pick {
+                suggested: "in.xlsm".into()
+            }
+        );
+        let out = dir.path("out.xlsx");
+        let answer = SheetSaveAnswer::Picked(Some(out.clone()));
+        let step = sheet_save_answer(&mut tab, step, answer, false);
+        assert_eq!(
+            step,
+            SheetSaveStep::Confirm {
+                target: out.clone(),
+                losses: vec!["VB project"],
+            }
+        );
+        assert!(!out.exists());
+
+        let step = sheet_save_answer(&mut tab, step, SheetSaveAnswer::Confirmed(false), false);
+        assert_eq!(step, SheetSaveStep::Done(true));
+        assert!(!out.exists());
+        assert_eq!(tab.status.as_ref(), "save cancelled");
+        assert!(tab.dirty);
+        assert!(open_pkg(&tab).has_vba_project());
+    }
+
+    /// #2194: Yes to the macro question writes the file without them, and
+    /// the open workbook drops its VB project.
+    #[test]
+    fn yes_to_the_macro_question_writes_without_macros() {
+        let dir = Scratch::new();
+        let mut tab = loaded_sheet_tab(&dir, "in.xlsm", &vba_book());
+        let out = dir.path("out.xlsx");
+        let step = sheet_save_begin(&mut tab, false, true);
+        let step = sheet_save_answer(
+            &mut tab,
+            step,
+            SheetSaveAnswer::Picked(Some(out.clone())),
+            false,
+        );
+        let step = sheet_save_answer(&mut tab, step, SheetSaveAnswer::Confirmed(true), false);
+        assert_eq!(step, SheetSaveStep::Done(true));
+        let saved = gridcore::xlsx::load_xlsx(&std::fs::read(&out).unwrap()).unwrap();
+        assert!(!saved.has_vba_project());
+        assert_eq!(tab.path.as_deref(), Some(out.as_path()));
+        assert!(!open_pkg(&tab).has_vba_project());
+    }
+
+    /// #2194: an in-place Save that would drop Excel 4.0 macro sheets asks
+    /// from its first step, before writing.
+    #[test]
+    fn an_in_place_macro_losing_save_asks_from_the_first_step() {
+        let dir = Scratch::new();
+        let book = dir.path("book.xlsx");
+        let mut tab = sheet_tab(Some(book.clone()), "book.xlsx");
+        if let Surface::Sheet(v) = &mut tab.surface {
+            v.pkg = xlm_book(gridcore::xlsx::SpreadsheetKind::MacroWorkbook);
+        }
+        assert_eq!(
+            sheet_save_begin(&mut tab, false, false),
+            SheetSaveStep::Confirm {
+                target: book.clone(),
+                losses: vec!["Excel 4.0 macro sheets"],
+            }
+        );
+        assert!(!book.exists());
     }
 
     /// #789: Save or Save As to a macro-free type asks first, in xlsxy's

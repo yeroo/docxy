@@ -831,7 +831,8 @@ mod tests {
             (main, "fn add_tab("),
             (include_str!("doc_export.rs"), "fn open_export("),
             (close, "fn backstage_close("),
-            (main, "fn save_active("),
+            // Save, and the close prompt's Save, go through it (#2194).
+            (main, "fn save_active_inner("),
             (main, "fn save_as("),
             (main, "fn backstage_rail_action("),
             (close, "fn commit_dialog_buffers_for_exit("),

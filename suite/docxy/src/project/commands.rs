@@ -2699,8 +2699,8 @@ impl Docxy {
             ProjectAct::Copy | ProjectAct::Cut | ProjectAct::Paste => {
                 self.project_clipboard(act, cx)
             }
-            ProjectAct::ExportGantt => self.project_export(ExportKind::Gantt),
-            ProjectAct::Report(kind) => self.project_export(ExportKind::Report(kind)),
+            ProjectAct::ExportGantt => self.project_export(ExportKind::Gantt, window, cx),
+            ProjectAct::Report(kind) => self.project_export(ExportKind::Report(kind), window, cx),
             _ => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     apply_project_act(tab, act);
@@ -2711,7 +2711,7 @@ impl Docxy {
     }
     /// Export the plan beside its file (Export's Gantt chart or a View
     /// Report); an unsaved plan asks for a name, which a harness cannot.
-    fn project_export(&mut self, kind: ExportKind) {
+    fn project_export(&mut self, kind: ExportKind, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
@@ -2720,13 +2720,28 @@ impl Docxy {
                 finish_project_export(&mut self.tabs[self.active], Some(&p), kind)
             }
             ExportDecision::Dialog { suggested } => {
-                let target = crate::macos_menu::native_modal(|| {
-                    rfd::FileDialog::new()
-                        .add_filter("Markdown", &["md"])
-                        .set_file_name(suggested)
-                        .save_file()
-                });
-                finish_project_export(&mut self.tabs[self.active], target.as_deref(), kind);
+                let dialog = rfd::FileDialog::new()
+                    .add_filter("Markdown", &["md"])
+                    .set_file_name(suggested);
+                let id = self.active_tab_id();
+                self.native_dialog(
+                    dialog,
+                    |d| d.save_file(),
+                    move |this, target, window, cx| {
+                        if this.active_tab_is(&id) {
+                            finish_project_export(
+                                &mut this.tabs[this.active],
+                                target.as_deref(),
+                                kind,
+                            );
+                        }
+                        this.backstage = false;
+                        this.refocus(window, cx);
+                    },
+                    window,
+                    cx,
+                );
+                return;
             }
             ExportDecision::RefuseHarness => self.tabs[self.active].status = "This project needs an export filename, and a harness instance cannot open the export dialog".into(),
             ExportDecision::Unsaveable => self.tabs[self.active].status = "This project could not be loaded and cannot be exported".into(),

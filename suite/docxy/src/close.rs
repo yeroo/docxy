@@ -11,7 +11,9 @@ use crate::dialog::DialogId;
 use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use ctlcore::json::Json;
+use std::cell::Cell;
 use std::path::Path;
+use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CloseAnswer {
@@ -867,7 +869,13 @@ impl Docxy {
                 false
             }
             CloseStep::Save => {
-                self.save_active(window, cx);
+                // Only a harness `close-tab save` reaches here with the tab
+                // still dirty: the prompt's own Save saves first and closes
+                // a clean tab (`close_prompt_save`). A harness never opens a
+                // native dialog, so the save is over when this returns
+                // (#2194); the prompt's Save is the one that waits for it.
+                debug_assert!(self.harness, "a close's Save outside a harness");
+                self.save_active_then(crate::no_after(), window, cx);
                 !self.tabs[i].dirty
             }
         };
@@ -889,14 +897,13 @@ impl Docxy {
             match draft_error_to(!self.tabs.is_empty(), harness) {
                 DraftErrorTo::Status => self.set_status(e.clone()),
                 DraftErrorTo::Dialog => {
-                    crate::macos_menu::native_modal(|| {
-                        rfd::MessageDialog::new()
-                            .set_title("docxy")
-                            .set_level(rfd::MessageLevel::Warning)
-                            .set_description(e)
-                            .set_buttons(rfd::MessageButtons::Ok)
-                            .show()
-                    });
+                    // The tab is gone: the message only informs.
+                    let dialog = rfd::MessageDialog::new()
+                        .set_title("docxy")
+                        .set_level(rfd::MessageLevel::Warning)
+                        .set_description(e)
+                        .set_buttons(rfd::MessageButtons::Ok);
+                    self.native_dialog(dialog, |d| d.show(), |_, _, _, _| {}, window, cx);
                 }
                 DraftErrorTo::Reply => {}
             }
@@ -965,11 +972,30 @@ impl Docxy {
                 target.and_then(|t| self.close_prompt_save(i, t, quit, window, cx))
             }
             _ if self.harness => Err(MORE_OPTIONS_HARNESS.into()),
-            _ => match self.pick_doc_save_target(None) {
-                Some(path) => self.close_prompt_save(i, PromptSave::To(path), quit, window, cx),
-                // Cancelled: back to the prompt.
-                None => Ok(()),
-            },
+            _ => {
+                // Like the prompt's Save, the answer's save closes the tab;
+                // on Windows that is after this returns (#2194).
+                let result = Rc::new(Cell::new(None));
+                let answer = result.clone();
+                let id = self.active_tab_id();
+                self.pick_doc_save_target(
+                    None,
+                    move |this, picked, window, cx| {
+                        // Cancelled: back to the prompt.
+                        if let Some(path) = picked
+                            && this.active == i
+                            && this.active_tab_is(&id)
+                        {
+                            let saved =
+                                this.close_prompt_save(i, PromptSave::To(path), quit, window, cx);
+                            answer.set(Some(saved));
+                        }
+                    },
+                    window,
+                    cx,
+                );
+                result.take().unwrap_or(Ok(()))
+            }
         };
         cx.notify();
         Some(done)
@@ -978,6 +1004,12 @@ impl Docxy {
     /// The close prompt's Save on tab `i` (the active one): save to
     /// `target`, then close as answered. A save that does not leave the tab
     /// clean keeps the prompt open and says why.
+    ///
+    /// The close waits for the save to be over (#2194): it runs from the
+    /// save's [`AfterSave`](crate::AfterSave), which on Windows comes after
+    /// a Save As dialog is answered, after this returns. The result is the
+    /// close's when it ran before this returns (always on Linux and macOS,
+    /// and whenever no dialog asked), else `Ok(())`: still asking.
     fn close_prompt_save(
         &mut self,
         i: usize,
@@ -986,15 +1018,41 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        let result = Rc::new(Cell::new(None));
+        let answer = result.clone();
+        let after: crate::AfterSave = Box::new(move |this, window, cx| {
+            answer.set(Some(this.close_prompt_saved(i, quit, window, cx)));
+        });
         match target {
-            PromptSave::InPlace => self.save_active(window, cx),
+            PromptSave::InPlace => self.save_active_then(after, window, cx),
             PromptSave::To(path) => {
-                self.save_doc_to(Some(path), window, cx);
+                let (_, after) = self.save_doc_then(Some(path), after, window, cx);
+                self.run_after(after, window, cx);
             }
         }
-        let tab = &mut self.tabs[i];
+        result.take().unwrap_or(Ok(()))
+    }
+
+    /// The close prompt's Save on tab `i` is over: close the tab as
+    /// answered if it is clean, else keep the prompt open and say why.
+    /// Nothing when the prompt is no longer on top of tab `i` (the window
+    /// is disabled while a dialog is up, so this is defence).
+    fn close_prompt_saved(
+        &mut self,
+        i: usize,
+        quit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(tab) = self.tabs.get_mut(i) else {
+            return Ok(());
+        };
         if tab.dirty {
             return Err(tab.status.to_string());
+        }
+        let prompt = DialogOwner::SaveOnClose { quit };
+        if tab.dialogs.top().is_none_or(|d| d.owner != prompt) {
+            return Ok(());
         }
         tab.dialogs.pop();
         self.close_prompt_answered(i, CloseAnswer::Save, quit, window, cx);
