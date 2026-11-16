@@ -415,6 +415,26 @@ impl FolderContact {
     }
 }
 
+/// A user's presence (#2158), as `POST /communications/getPresencesByUserId`
+/// answers it: Graph's own strings, as sent (`Available`, `Busy`, `Away`,
+/// `Offline`, `PresenceUnknown`, ... and `Available`, `InACall`,
+/// `InAMeeting`, `Presenting`, ...), `""` for a field Graph left out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Presence {
+    pub availability: String,
+    pub activity: String,
+}
+
+impl Presence {
+    /// One item of the answer's `value`; its `id` is the caller's to read.
+    pub fn from_json(v: &Value) -> Self {
+        Presence {
+            availability: str_field(v, "availability"),
+            activity: str_field(v, "activity"),
+        }
+    }
+}
+
 /// A Contacts-folder contact's photo (#2065): what
 /// `GET /me/contacts/{id}/photo/$value` returns, and what a set PUTs.
 #[derive(Debug, Clone, PartialEq, Eq)]

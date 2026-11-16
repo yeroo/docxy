@@ -346,6 +346,70 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   pass), `persists_at_shutdown` false, no outbox op, nothing stored. lookxy
   lists the two events as ignored: it shows no sender photo.
 
+## Presence of users by address (#2158)
+
+- `GraphClient::presences(addresses)` → one `(address, Option<Presence>)`
+  per address, in order, each as given (untrimmed, duplicates kept).
+  `model::Presence { availability, activity }` holds Graph's strings as
+  sent, `""` for a missing one. `None`: a blank address (no request), an
+  address that resolves to no one, or an id Graph leaves out of its answer.
+- Each distinct address (trimmed, ASCII-lowercased key) is resolved as
+  #2157's `user_photo` resolves it (`user_id_by_address`: the `mail`
+  filter, then the UPN for an `@` address), through `cached_user_id`. Then
+  every distinct id, in first-asked order, goes in
+  `POST /communications/getPresencesByUserId` as `{"ids":[...]}` (built as
+  a `Value`), `PRESENCE_IDS_MAX` (650) ids a request. With no id, nothing
+  is posted. The answer's `value` items match the ids in any ASCII case
+  (GUIDs); an item without a string `id` is skipped; an answer with no
+  `value` array is a `Parse` error. Any error on any request is returned at
+  once, as it is, with no further request.
+- `graph::client::UserIds` is the address → id map (`Arc<Mutex<..>>`;
+  cloning shares it): `Some(id)`, or `None` for a definite "no such user"
+  (the filter empty and the UPN request a 404, or not sent). That is kept
+  because external senders, the common case, never resolve, and each
+  poll would otherwise re-send their one or two GETs. An error is never
+  kept. The lock is never held across a request. `GraphClient::new` makes
+  its own empty map; `with_user_ids` shares one. `user_photo` reads and
+  fills it too.
+- The engine keeps one `UserIds` for the session: `client()` hands it to
+  every client it builds. `enter_signin` clears it (a sign-out and a
+  refused refresh both reach it, and the next account may be another
+  tenant's), and so does `reset_for_new_mailbox`. A user created during
+  the session stays "no one" until then.
+- 403: `User.ReadBasic.All` is needed for the resolve and
+  `Presence.Read.All` (admin consent in some tenants) for the POST.
+  `AuthConfig::default()` asks for neither, so a default sign-in gets its
+  403 at the resolve. Either is `forbidden`.
+- A 401 still a 401 after a refresh that went through is `forbidden` too, and
+  nothing is `react`ed. The presence service is reported to answer a valid
+  token with `401 {"error":{"code":"Unauthorized","message":"User not found"}}`
+  for a user without Teams, and `react` would sign mail out
+  (`signin_after_401`). A refused refresh (`refused_refresh`, which
+  `try_refresh` resets first, so it is this command's) is a dead token: not
+  `forbidden`, through `react_quietly` to the sign-in, as for any command.
+- `SyncCommand::FetchPresences { addresses }` → `PresencesFetched
+  { presences }`, or `PresencesFailed { addresses, forbidden, error }`
+  (`forbidden` for a 403 on any request: stop asking). Never a
+  `SyncEvent::Error` for a Graph failure. A refused refresh and transport
+  then go through `react_quietly`; a `Throttled` does not, nor does a 401
+  after a refresh that went through (above). Presence and the
+  directory are throttled apart from mail, and `react` would hold off
+  the next mail pass until the `Retry-After` (`schedule_retry`).
+  `FetchUserPhoto`'s 429 and 401 still go through `react_quietly`. Signed out:
+  `Error("not signed in")`, then `PresencesFailed { error: "not signed in" }`,
+  no request. Addresses echoed as sent.
+- A read: `served_at_checkpoint`, `persists_at_shutdown` false, no outbox
+  op, nothing stored. lookxy lists the two events as ignored: it shows no
+  presence.
+- Tests: a fake-server route matches by prefix, so an address with no route
+  of its own gets a 404 (`NotFound`), which is an error and not "no one".
+  Give each unknown address its empty filter and its UPN 404. A plain
+  `Refresh` runs a pass whatever `next_retry` holds, so the throttle test
+  (`fetch_presences_throttled_does_not_delay_mail`) drives an engine
+  directly and checks that `next_retry` is left as it was; so do the 401
+  tests (`direct_engine_at`, its token saved in a test directory, as a
+  refresh writes it).
+
 ## Granted scopes and a refused sign-in's error_description (#1875)
 
 - `auth::TokenSet::scopes` (`Option<Vec<String>>`, `None` = unknown) is the
@@ -4220,7 +4284,8 @@ quarantine re-listed the mailbox and brought the lost writes back.
 - `Engine::checkpoint` is built on `take_waiting`: it reads the channel up to a waiting
   `Shutdown` first, then serves the kept commands of a served kind (`served_at_checkpoint`:
   `FetchBody`, `SearchMessages`, `FetchMessage`, `FetchFolderSizes`, `SearchDirectory`,
-  `SearchGroups` and `FetchGroupMembers` (#2058), `FetchUserPhoto` (#2157)) out of
+  `SearchGroups` and `FetchGroupMembers` (#2058), `FetchUserPhoto` (#2157),
+  `FetchPresences` (#2158)) out of
   `deferred`, one at a time, taking again after each. A read sent before a `Shutdown` is therefore never served,
   in the bulk runs' checkpoints inside a drain too. Outside a shutdown the order is unchanged:
   a served kind in `deferred` is one the drain took early, which the old `checkpoint` would have

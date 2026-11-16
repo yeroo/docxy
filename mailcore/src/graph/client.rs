@@ -13,18 +13,89 @@ use crate::graph::model::{
     DirectoryGroup, DirectoryUser, DraftOptions, Event, EventDeltaItem, EventDeltaPage,
     EventRecurrence, FolderContact, FolderListing, GroupMember, GroupMemberList, MailFolder,
     MasterCategory, Me, MeetingMessage, Message, MessageFields, MessageHeader, OofStatus, Person,
-    PhysicalAddress, REMINDER_SET_PROP, REMINDER_SIGNAL_TIME_PROP, Recipient, Recurrence,
+    PhysicalAddress, Presence, REMINDER_SET_PROP, REMINDER_SIGNAL_TIME_PROP, Recipient, Recurrence,
     ScheduleEntry, SearchHit, SubtreeItems, is_event_message_type, parse_message_size,
     plain_to_html, reminder_time, to_utc,
 };
 use crate::json::{self, Value};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// A Microsoft Graph REST client bound to one base URL and access token.
 pub struct GraphClient {
     base: String,
     token: String,
+    /// The user ids found by address (#2158), shared by every client built
+    /// with the same [`UserIds`] (`with_user_ids`).
+    user_ids: UserIds,
 }
+
+/// The user ids found for e-mail addresses (#2158), kept so an address is
+/// resolved once (`/users?$filter=mail eq ...`, then the UPN) and not again
+/// on each presence poll or sender photo. Cloning shares the one map: the
+/// sync engine keeps one for its run and hands it to every client it builds,
+/// and clears it when the session ends (another account, maybe another
+/// tenant, would have other ids).
+///
+/// The key is the address trimmed and ASCII-lowercased (Exchange matches an
+/// address in any case); the value is the id, or `None` for a definite "no
+/// such user" (the filter found no one, and the UPN request was a 404 or not
+/// sent). An error is never kept, so the address is asked again next time.
+#[derive(Debug, Clone, Default)]
+pub struct UserIds(Arc<Mutex<HashMap<String, Option<String>>>>);
+
+impl UserIds {
+    /// Forgets every address.
+    pub fn clear(&self) {
+        self.map().clear();
+    }
+
+    /// The number of addresses kept, found or not.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.map().len()
+    }
+
+    /// Whether no address is kept.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.map().is_empty()
+    }
+
+    /// The kept answer for `address` (`Some(None)`: no such user), or
+    /// `None` when it was never resolved.
+    fn get(&self, address: &str) -> Option<Option<String>> {
+        self.map().get(&user_ids_key(address)).cloned()
+    }
+
+    /// Keeps `id` (`None`: no such user) as `address`'s answer.
+    fn keep(&self, address: &str, id: Option<String>) {
+        self.map().insert(user_ids_key(address), id);
+    }
+
+    /// [`UserIds::keep`], for tests that fill the map without resolving.
+    #[cfg(test)]
+    pub(crate) fn insert(&self, address: &str, id: Option<String>) {
+        self.keep(address, id);
+    }
+
+    /// The map, a poisoned lock taken over: a panic elsewhere while it was
+    /// held left at worst one entry half-written, never a wrong one, and a
+    /// read path must not panic.
+    fn map(&self) -> MutexGuard<'_, HashMap<String, Option<String>>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// [`UserIds`]'s key for `address`: trimmed, ASCII-lowercased.
+fn user_ids_key(address: &str) -> String {
+    address.trim().to_ascii_lowercase()
+}
+
+/// The most ids one `POST /communications/getPresencesByUserId` takes
+/// (#2158): Graph refuses more than 650.
+pub const PRESENCE_IDS_MAX: usize = 650;
 
 /// Errors from a Graph request: transport/HTTP failures mapped to the
 /// shapes callers (the sync engine, triage commands) need to act on.
@@ -861,7 +932,16 @@ impl GraphClient {
         GraphClient {
             base: base.trim_end_matches('/').to_string(),
             token: access_token.to_string(),
+            user_ids: UserIds::default(),
         }
+    }
+
+    /// This client with `ids` as its [`UserIds`] (#2158), shared with every
+    /// other client given the same map: an address one of them resolved is
+    /// not resolved again by the others.
+    pub fn with_user_ids(mut self, ids: UserIds) -> Self {
+        self.user_ids = ids;
+        self
     }
 
     /// GET `/me/mailFolders?$top=100` — the top-level mail folders — then
@@ -2368,6 +2448,9 @@ impl GraphClient {
     /// Any other error, on any request, is returned as it is, with no
     /// further request.
     ///
+    /// The id comes from this client's [`UserIds`] when the address was
+    /// resolved before (#2158), with no request.
+    ///
     /// Requires `User.ReadBasic.All`, which `AuthConfig::default()` does not
     /// ask for: a token or tenant without it answers 403
     /// (`GraphError::Http`).
@@ -2376,7 +2459,7 @@ impl GraphClient {
         if address.is_empty() {
             return Ok(None);
         }
-        let Some(id) = self.user_id_by_address(address)? else {
+        let Some(id) = self.cached_user_id(address)? else {
             return Ok(None);
         };
         let id = encode_path_segment(&id);
@@ -2389,6 +2472,96 @@ impl GraphClient {
             Err(e) if is_photo_not_found(&e) => Ok(None),
             other => other.map(pair),
         }
+    }
+
+    /// The presence of each of `addresses` (#2158): a message's sender and
+    /// recipients, for the dot a mail client draws by their names. One entry
+    /// per address, in order, each address as given (untrimmed, duplicates
+    /// kept); `None` for a blank address, one that resolves to no one, and
+    /// one whose id Graph leaves out of its answer.
+    ///
+    /// Each distinct address (trimmed, any case) is resolved to a user id as
+    /// [`GraphClient::user_photo`] does (`user_id_by_address`: the `mail`
+    /// filter, then the UPN), unless this client's [`UserIds`] already has
+    /// it; a blank address sends nothing. Then every distinct id, in the
+    /// order first asked, goes to `POST /communications/getPresencesByUserId`
+    /// as `{"ids":[...]}`, [`PRESENCE_IDS_MAX`] ids a request; with no id,
+    /// nothing is posted. The answer's `value` items are matched to the ids
+    /// in any ASCII case (they are GUIDs); an item without a string `id` is
+    /// skipped, and a missing `availability` or `activity` is `""`. An
+    /// answer that is not JSON or has no `value` array is a `Parse` error.
+    ///
+    /// Any error, on any request, is returned at once, as it is, with no
+    /// further request. A 403 (`GraphError::Http`) is the token without a
+    /// scope it needs: `User.ReadBasic.All` for the resolve,
+    /// `Presence.Read.All` for the POST. `AuthConfig::default()` asks for
+    /// neither, so a default sign-in gets it at the resolve.
+    pub fn presences(
+        &self,
+        addresses: &[String],
+    ) -> Result<Vec<(String, Option<Presence>)>, GraphError> {
+        // Each address's id, by key; the distinct ids in first-asked order.
+        let mut id_of: HashMap<String, Option<String>> = HashMap::new();
+        let mut ids: Vec<String> = Vec::new();
+        let mut seen_ids: HashSet<String> = HashSet::new();
+        for address in addresses {
+            let key = user_ids_key(address);
+            if key.is_empty() || id_of.contains_key(&key) {
+                continue;
+            }
+            let id = self.cached_user_id(address.trim())?;
+            if let Some(id) = &id
+                && seen_ids.insert(id.to_ascii_lowercase())
+            {
+                ids.push(id.clone());
+            }
+            id_of.insert(key, id);
+        }
+        let mut found: HashMap<String, Presence> = HashMap::new();
+        for chunk in ids.chunks(PRESENCE_IDS_MAX) {
+            let body = Value::Object(vec![(
+                "ids".to_string(),
+                Value::Array(chunk.iter().map(|id| Value::Str(id.clone())).collect()),
+            )]);
+            let resp = self.send(
+                Method::Post,
+                "/communications/getPresencesByUserId",
+                Some(body.to_string()),
+                &[],
+            )?;
+            let v = parse_body(resp)?;
+            for item in value_array(&v, "value")? {
+                let Some(id) = item.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                found.insert(id.to_ascii_lowercase(), Presence::from_json(item));
+            }
+        }
+        Ok(addresses
+            .iter()
+            .map(|address| {
+                let presence = id_of
+                    .get(&user_ids_key(address))
+                    .and_then(Option::as_ref)
+                    .and_then(|id| found.get(&id.to_ascii_lowercase()))
+                    .cloned();
+                (address.clone(), presence)
+            })
+            .collect())
+    }
+
+    /// `user_id_by_address` through this client's [`UserIds`] (#2158): a
+    /// kept answer (an id, or no such user) sends nothing; otherwise the
+    /// address is resolved and an `Ok` answer kept. An error is returned and
+    /// not kept. The lock is never held across the request: it is taken to
+    /// look up, let go, and taken again to keep the answer.
+    fn cached_user_id(&self, address: &str) -> Result<Option<String>, GraphError> {
+        if let Some(kept) = self.user_ids.get(address) {
+            return Ok(kept);
+        }
+        let id = self.user_id_by_address(address)?;
+        self.user_ids.keep(address, id.clone());
+        Ok(id)
     }
 
     /// The id of the user whose `mail` is `address` (the first one Graph
@@ -7198,6 +7371,388 @@ mod tests {
         assert!(!is_photo_not_found(&GraphError::Unauthorized));
         assert!(!is_photo_not_found(&GraphError::Parse("x".into())));
         assert_eq!(odata_string("o'brien''s"), "o''brien''''s");
+    }
+
+    // --- Presence of users by address (#2158) -------------------------------
+
+    const PRESENCE: &str = "/communications/getPresencesByUserId";
+
+    /// The `mail` filter request for `address`, as `user_id_by_address`
+    /// sends it.
+    fn mail_filter(address: &str) -> String {
+        let filter = encode_path_segment(&format!("mail eq '{}'", odata_string(address)));
+        format!("/users?$filter={filter}&$select=id")
+    }
+
+    /// The UPN request for `address`.
+    fn upn(address: &str) -> String {
+        format!("/users/{}?$select=id", encode_path_segment(address))
+    }
+
+    fn presence_route(status: u16, body: &str) -> Route {
+        Route {
+            method: "POST".into(),
+            path_prefix: PRESENCE.into(),
+            status,
+            headers: vec![],
+            body: body.into(),
+        }
+    }
+
+    fn found(id: &str) -> String {
+        format!(r#"{{"value":[{{"id":"{id}"}}]}}"#)
+    }
+
+    const NO_ONE: &str = r#"{"value":[]}"#;
+
+    fn presence(availability: &str, activity: &str) -> Option<Presence> {
+        Some(Presence {
+            availability: availability.into(),
+            activity: activity.into(),
+        })
+    }
+
+    fn strings(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The `ids` of each presence POST the server received, in order.
+    fn posted_ids(srv: &FakeServer) -> Vec<Vec<String>> {
+        srv.requests()
+            .into_iter()
+            .filter(|r| r.method == "POST" && r.path == PRESENCE)
+            .map(|r| {
+                let v = json::parse(&r.body).unwrap();
+                v.get("ids")
+                    .and_then(Value::as_array)
+                    .unwrap()
+                    .iter()
+                    .map(|id| id.as_str().unwrap().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn presences_maps_resolved_unknown_and_left_out() {
+        let (bob, nobody, carl) = ("bob@contoso.com", "nobody@x.com", "carl@contoso.com");
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 200, &found("U1"), &[]),
+            photo_route(&mail_filter(bob), 200, NO_ONE, &[]),
+            photo_route(&upn(bob), 200, r#"{"id":"U2"}"#, &[]),
+            photo_route(&mail_filter(nobody), 200, NO_ONE, &[]),
+            photo_route(&upn(nobody), 404, "{}", &[]),
+            photo_route(&mail_filter(carl), 200, &found("U3"), &[]),
+            // Graph leaves U3 out of its answer.
+            presence_route(
+                200,
+                r#"{"value":[{"id":"U1","availability":"Busy","activity":"InAMeeting"},{"id":"U2","availability":"Available","activity":"Available"}]}"#,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let asked = strings(&[ADA, bob, nobody, carl]);
+        assert_eq!(
+            c.presences(&asked),
+            Ok(vec![
+                (ADA.to_string(), presence("Busy", "InAMeeting")),
+                (bob.to_string(), presence("Available", "Available")),
+                (nobody.to_string(), None),
+                (carl.to_string(), None),
+            ])
+        );
+        assert_eq!(
+            request_paths(&srv),
+            [
+                ADA_FILTER.to_string(),
+                mail_filter(bob),
+                upn(bob),
+                mail_filter(nobody),
+                upn(nobody),
+                mail_filter(carl),
+                PRESENCE.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn presences_sends_resolved_ids_in_body() {
+        let (bob, carl) = ("bob@contoso.com", "carl@contoso.com");
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 200, &found("U1"), &[]),
+            photo_route(&mail_filter(bob), 200, &found("U2"), &[]),
+            photo_route(&mail_filter(carl), 200, &found("U3"), &[]),
+            presence_route(200, NO_ONE),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let asked = strings(&[ADA, bob, ADA, carl, bob]);
+        assert!(c.presences(&asked).is_ok());
+        // Each address resolved once; the ids deduped, in first-asked order.
+        assert_eq!(
+            request_paths(&srv),
+            [
+                ADA_FILTER.to_string(),
+                mail_filter(bob),
+                mail_filter(carl),
+                PRESENCE.to_string(),
+            ]
+        );
+        let post = srv.requests().pop().unwrap();
+        assert_eq!(post.method, "POST");
+        assert_eq!(post.body, r#"{"ids":["U1","U2","U3"]}"#);
+        assert_eq!(posted_ids(&srv), [strings(&["U1", "U2", "U3"])]);
+        let types: Vec<&str> = post
+            .headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(types, ["application/json"]);
+    }
+
+    #[test]
+    fn presences_maps_each_address_back_from_its_id() {
+        let (bob, ada_upn) = ("bob@contoso.com", "ada.l@contoso.com");
+        let srv = FakeServer::start(vec![
+            // Ada as first asked: trimmed, her case kept.
+            photo_route(&mail_filter("Ada@Contoso.com"), 200, &found("U1"), &[]),
+            photo_route(&mail_filter(bob), 200, &found("U2"), &[]),
+            // Ada's UPN: the same user, so the same id.
+            photo_route(&mail_filter(ada_upn), 200, NO_ONE, &[]),
+            photo_route(&upn(ada_upn), 200, r#"{"id":"U1"}"#, &[]),
+            // Another order than asked, the ids in another case.
+            presence_route(
+                200,
+                r#"{"value":[{"id":"u2","availability":"Away","activity":"Away"},{"id":"u1","availability":"Busy","activity":"Presenting"}]}"#,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let asked = strings(&[bob, " Ada@Contoso.com ", ADA, ada_upn, bob]);
+        assert_eq!(
+            c.presences(&asked),
+            Ok(vec![
+                (bob.to_string(), presence("Away", "Away")),
+                (
+                    " Ada@Contoso.com ".to_string(),
+                    presence("Busy", "Presenting")
+                ),
+                (ADA.to_string(), presence("Busy", "Presenting")),
+                (ada_upn.to_string(), presence("Busy", "Presenting")),
+                (bob.to_string(), presence("Away", "Away")),
+            ])
+        );
+        // Ada is resolved once, trimmed, as first asked: the lower-case
+        // address is the same one. Her two addresses send one id.
+        assert_eq!(
+            request_paths(&srv),
+            [
+                mail_filter(bob),
+                mail_filter("Ada@Contoso.com"),
+                mail_filter(ada_upn),
+                upn(ada_upn),
+                PRESENCE.to_string(),
+            ]
+        );
+        assert_eq!(posted_ids(&srv), [strings(&["U2", "U1"])]);
+    }
+
+    #[test]
+    fn presences_reuses_resolved_ids() {
+        let (nobody, eve) = ("nobody@x.com", "eve@contoso.com");
+        let srv = FakeServer::start_limited(vec![
+            (photo_route(ADA_FILTER, 200, &found("U1"), &[]), None),
+            (photo_route(&mail_filter(nobody), 200, NO_ONE, &[]), None),
+            (photo_route(&upn(nobody), 404, "{}", &[]), None),
+            // Eve's first resolve fails, the next one finds her.
+            (photo_route(&mail_filter(eve), 500, "boom", &[]), Some(1)),
+            (photo_route(&mail_filter(eve), 200, &found("U5"), &[]), None),
+            (presence_route(200, NO_ONE), None),
+        ]);
+        let ids = UserIds::default();
+        let first = GraphClient::new(&srv.base_url, "AT").with_user_ids(ids.clone());
+        let asked = strings(&[ADA, nobody]);
+        assert!(first.presences(&asked).is_ok());
+        assert_eq!(
+            request_paths(&srv),
+            [
+                ADA_FILTER.to_string(),
+                mail_filter(nobody),
+                upn(nobody),
+                PRESENCE.to_string(),
+            ]
+        );
+        assert_eq!(ids.len(), 2);
+        // Another client sharing the ids, and the same client again: only
+        // the POST, the "no one" kept too.
+        let second = GraphClient::new(&srv.base_url, "AT2").with_user_ids(ids.clone());
+        assert!(second.presences(&asked).is_ok());
+        assert!(first.presences(&asked).is_ok());
+        assert_eq!(request_paths(&srv).len(), 6);
+        assert_eq!(request_paths(&srv)[4..], [PRESENCE, PRESENCE]);
+        // A failed resolve is not kept: Eve is asked again.
+        let asked = strings(&[ADA, eve]);
+        assert_eq!(
+            first.presences(&asked),
+            Err(GraphError::Http {
+                status: 500,
+                body: "boom".into()
+            })
+        );
+        assert!(first.presences(&asked).is_ok());
+        assert_eq!(
+            request_paths(&srv)[6..],
+            [mail_filter(eve), mail_filter(eve), PRESENCE.to_string()]
+        );
+        assert_eq!(posted_ids(&srv).last().unwrap(), &strings(&["U1", "U5"]));
+        // A client of its own resolves again.
+        let fresh = GraphClient::new(&srv.base_url, "AT");
+        assert!(fresh.presences(&strings(&[ADA])).is_ok());
+        assert_eq!(request_paths(&srv)[9], ADA_FILTER);
+        ids.clear();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn presences_forbidden_is_http_403() {
+        let denied = r#"{"error":{"code":"Authorization_RequestDenied"}}"#;
+        // A 403 on the POST (no `Presence.Read.All`).
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 200, &found("U1"), &[]),
+            presence_route(403, denied),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.presences(&strings(&[ADA])),
+            Err(GraphError::Http {
+                status: 403,
+                body: denied.into()
+            })
+        );
+        // A 403 on a resolve (no `User.ReadBasic.All`): no further request.
+        let bob = "bob@contoso.com";
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 403, denied, &[]),
+            photo_route(&mail_filter(bob), 200, &found("U2"), &[]),
+            presence_route(200, NO_ONE),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.presences(&strings(&[ADA, bob])),
+            Err(GraphError::Http { status: 403, .. })
+        ));
+        assert_eq!(request_paths(&srv), [ADA_FILTER]);
+        // Any other status is that status.
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 200, &found("U1"), &[]),
+            presence_route(500, "boom"),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.presences(&strings(&[ADA])),
+            Err(GraphError::Http {
+                status: 500,
+                body: "boom".into()
+            })
+        );
+    }
+
+    #[test]
+    fn presences_blank_and_unresolved_send_no_post() {
+        let srv = FakeServer::start(vec![
+            photo_route(&mail_filter("nobody@x.com"), 200, NO_ONE, &[]),
+            photo_route(&upn("nobody@x.com"), 404, "{}", &[]),
+            presence_route(200, NO_ONE),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.presences(&strings(&["", "  "])),
+            Ok(vec![("".to_string(), None), ("  ".to_string(), None)])
+        );
+        assert_eq!(c.presences(&[]), Ok(vec![]));
+        assert!(srv.requests().is_empty());
+        assert_eq!(
+            c.presences(&strings(&["nobody@x.com", ""])),
+            Ok(vec![
+                ("nobody@x.com".to_string(), None),
+                ("".to_string(), None)
+            ])
+        );
+        assert_eq!(
+            request_paths(&srv),
+            [mail_filter("nobody@x.com"), upn("nobody@x.com")]
+        );
+    }
+
+    #[test]
+    fn presences_chunks_at_650_ids() {
+        let srv = FakeServer::start(vec![presence_route(
+            200,
+            r#"{"value":[{"id":"U650","availability":"Offline","activity":"Offline"}]}"#,
+        )]);
+        let ids = UserIds::default();
+        let asked: Vec<String> = (0..=PRESENCE_IDS_MAX)
+            .map(|i| format!("u{i}@contoso.com"))
+            .collect();
+        for (i, address) in asked.iter().enumerate() {
+            ids.insert(address, Some(format!("U{i}")));
+        }
+        let c = GraphClient::new(&srv.base_url, "AT").with_user_ids(ids);
+        let got = c.presences(&asked).unwrap();
+        assert_eq!(got.len(), PRESENCE_IDS_MAX + 1);
+        assert!(got[..PRESENCE_IDS_MAX].iter().all(|(_, p)| p.is_none()));
+        assert_eq!(got[PRESENCE_IDS_MAX].1, presence("Offline", "Offline"));
+        let posts = posted_ids(&srv);
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[0].len(), PRESENCE_IDS_MAX);
+        assert_eq!(posts[0][0], "U0");
+        assert_eq!(posts[0][649], "U649");
+        assert_eq!(posts[1], ["U650"]);
+        assert_eq!(request_paths(&srv), [PRESENCE, PRESENCE]);
+    }
+
+    #[test]
+    fn presences_parse_errors() {
+        for body in ["{}", "not json", r#"{"value":{}}"#] {
+            let srv = FakeServer::start(vec![
+                photo_route(ADA_FILTER, 200, &found("U1"), &[]),
+                presence_route(200, body),
+            ]);
+            let c = GraphClient::new(&srv.base_url, "AT");
+            assert!(
+                matches!(c.presences(&strings(&[ADA])), Err(GraphError::Parse(_))),
+                "{body}"
+            );
+        }
+        // An item without a string id is skipped; a missing field is "".
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 200, &found("U1"), &[]),
+            presence_route(
+                200,
+                r#"{"value":[{"availability":"Busy","activity":"Busy"},{"id":7,"availability":"Busy"},{"id":"U1","availability":"Away"}]}"#,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.presences(&strings(&[ADA])),
+            Ok(vec![(ADA.to_string(), presence("Away", ""))])
+        );
+    }
+
+    #[test]
+    fn user_photo_reuses_resolved_id() {
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 200, &found("U1"), &[]),
+            photo_route(U1_PHOTO, 200, "P", &[("Content-Type", "image/png")]),
+            presence_route(200, NO_ONE),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(c.user_photo(ADA).unwrap().is_some());
+        assert!(c.user_photo(" ADA@contoso.com").unwrap().is_some());
+        // The photo's resolve serves a presence too.
+        assert!(c.presences(&strings(&[ADA])).is_ok());
+        assert_eq!(
+            request_paths(&srv),
+            [ADA_FILTER, U1_PHOTO, U1_PHOTO, PRESENCE]
+        );
     }
 
     #[test]

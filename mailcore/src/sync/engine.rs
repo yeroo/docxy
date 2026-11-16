@@ -39,8 +39,9 @@
 //! the server, `SyncCommand::FetchFolderSizes`, #2123, a search of the
 //! organisation's directory, `SyncCommand::SearchDirectory`, #1942, and of
 //! its groups and a group's members, `SyncCommand::SearchGroups` and
-//! `SyncCommand::FetchGroupMembers`, #2058, and another user's photo,
-//! `SyncCommand::FetchUserPhoto`, #2157) never waits for a whole pass: long
+//! `SyncCommand::FetchGroupMembers`, #2058, another user's photo,
+//! `SyncCommand::FetchUserPhoto`, #2157, and users' presence,
+//! `SyncCommand::FetchPresences`, #2158) never waits for a whole pass: long
 //! work calls `Engine::checkpoint` between folders, delta pages and body
 //! fetches, which serves it at once and keeps every other command for after
 //! the work, in order.
@@ -52,14 +53,14 @@
 use crate::auth::{self, AuthConfig, TokenSet};
 use crate::graph::client::{
     BATCH_MAX, BatchRequest, CalendarDeltaCursor, ContactFieldSet, DeltaCursor, EventInput,
-    GraphClient, GraphError, RsvpKind, TypeTier, automatic_replies_body, event_body_json,
+    GraphClient, GraphError, RsvpKind, TypeTier, UserIds, automatic_replies_body, event_body_json,
     event_zone_error, is_expired_sync_state, moved_message_id, rsvp_proposal,
 };
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
     AutomaticReplies, ContactPhoto, DeltaItem, DirectoryGroup, DirectoryUser, Event,
     EventDeltaItem, FolderContact, GroupMember, MailFolder, Me, MeetingMessage, MeetingMessageType,
-    Message, MessageFields, Recipient, ScheduleEntry, SearchHit, parse_folder_size,
+    Message, MessageFields, Presence, Recipient, ScheduleEntry, SearchHit, parse_folder_size,
     parse_meeting_message_type,
 };
 pub use crate::store::ClearOfflineRefusal;
@@ -396,6 +397,24 @@ pub enum SyncCommand {
     /// `checkpoint`, dropped at shutdown. `address` comes back exactly as
     /// sent.
     FetchUserPhoto { address: String },
+    /// Fetch the presence of users by e-mail address (#2158,
+    /// `GraphClient::presences`): a message's sender and recipients, for a
+    /// presence dot by their names. Emits [`SyncEvent::PresencesFetched`],
+    /// one entry per address (`None` when no such user, or Graph has no
+    /// presence for it), or [`SyncEvent::PresencesFailed`] on a Graph
+    /// failure (`forbidden` for a 403: the token lacks `Presence.Read.All`
+    /// or `User.ReadBasic.All`, so stop asking; and for a 401 after a
+    /// refresh that went through: presence refuses a valid token for a user
+    /// without Teams), never a `SyncEvent::Error`. A refused refresh and
+    /// transport failures still go through `react_quietly`; a throttle does
+    /// not: presence and the directory are throttled apart from mail, so
+    /// their 429 holds off no mail pass, and their 401 signs no one out. The ids an address
+    /// resolves to are kept for the session (`Engine::user_ids`), so a
+    /// repeated poll costs one POST. Signed out: an `Error("not signed in")`
+    /// then the addresses' `PresencesFailed`, with no request. A read: no
+    /// outbox, served at a `checkpoint`, dropped at shutdown. `addresses`
+    /// come back exactly as sent.
+    FetchPresences { addresses: Vec<String> },
     /// Sign out: drop the in-memory token and delete the saved one, in the
     /// file and in the engine's secret store (`tokencache::clear_in`), then
     /// emit [`SyncEvent::SignInRequired`] (reason
@@ -1058,6 +1077,25 @@ pub enum SyncEvent {
     /// exactly as the command sent it.
     UserPhotoFailed {
         address: String,
+        forbidden: bool,
+        error: String,
+    },
+    /// Users' presence (#2158, from [`SyncCommand::FetchPresences`]): one
+    /// entry per address asked, in order, each address exactly as sent;
+    /// `None` when the address finds no user (by `mail`, then by UPN), is
+    /// blank, or Graph's answer leaves the user out.
+    PresencesFetched {
+        presences: Vec<(String, Option<Presence>)>,
+    },
+    /// [`SyncCommand::FetchPresences`] could not fetch presence (#2158):
+    /// `forbidden` is true for a Graph 403 on any of its requests (the
+    /// token lacks `Presence.Read.All`, or `User.ReadBasic.All` for finding
+    /// the users), or a 401 after a refresh that went through (presence
+    /// refusing a user without Teams): a caller stops asking. `error` is
+    /// the failure's one line, `"not signed in"` when signed out.
+    /// `addresses` exactly as the command sent them.
+    PresencesFailed {
+        addresses: Vec<String>,
         forbidden: bool,
         error: String,
     },
@@ -1983,7 +2021,7 @@ fn command_writes_event_locally(cmd: &SyncCommand) -> bool {
 }
 
 /// The commands a `checkpoint` serves at once, between two requests of
-/// long work (#1978, #2006, #2123, #1942, #2058, #2157), instead of keeping
+/// long work (#1978, #2006, #2123, #1942, #2058, #2157, #2158), instead of keeping
 /// them for the main loop: a click costs its own round trips plus the
 /// request in flight.
 fn served_at_checkpoint(cmd: &SyncCommand) -> bool {
@@ -1997,6 +2035,7 @@ fn served_at_checkpoint(cmd: &SyncCommand) -> bool {
             | SyncCommand::SearchGroups { .. }
             | SyncCommand::FetchGroupMembers { .. }
             | SyncCommand::FetchUserPhoto { .. }
+            | SyncCommand::FetchPresences { .. }
     )
 }
 
@@ -2081,6 +2120,7 @@ fn persists_at_shutdown(cmd: &SyncCommand) -> bool {
         | SyncCommand::FetchProfile
         | SyncCommand::FetchPhoto
         | SyncCommand::FetchUserPhoto { .. }
+        | SyncCommand::FetchPresences { .. }
         | SyncCommand::FetchContactPhoto { .. }
         | SyncCommand::FetchInlineImage { .. }
         | SyncCommand::RefreshCalendar
@@ -2466,6 +2506,12 @@ struct Engine {
     /// owner's) costs one request, not one a pass. Cleared on sign-out
     /// (`enter_signin`) and by a restart.
     masters_not_found: HashSet<String>,
+    /// The user ids found for e-mail addresses (#2158), shared by every
+    /// client `client()` builds, so an address a presence poll or a sender
+    /// photo resolved is not resolved again. Cleared when the session ends
+    /// (`enter_signin`: the next account may be another tenant's) and for
+    /// another mailbox (`reset_for_new_mailbox`).
+    user_ids: UserIds,
     /// Removed stored masters whose failed refetch (an HTTP or parse error)
     /// already left their calendar out of a pass (#2064 r2,
     /// `fetch_missing_masters`): the next failure writes the round. An id
@@ -2689,6 +2735,7 @@ impl Engine {
             copied_after_drain: Vec::new(),
             calendar_reset_owed: false,
             masters_not_found: HashSet::new(),
+            user_ids: UserIds::default(),
             masters_skipped: HashSet::new(),
             parked: Vec::new(),
             expired: Vec::new(),
@@ -2952,7 +2999,8 @@ impl Engine {
     /// two requests of long work (#1978): a `FetchBody`, a `SearchMessages`
     /// or a `FetchMessage` (#2006), a `FetchFolderSizes` (#2123), a
     /// `SearchDirectory` (#1942), a `SearchGroups` or a `FetchGroupMembers`
-    /// (#2058), or a `FetchUserPhoto` (#2157) is served at once, so a click
+    /// (#2058), a `FetchUserPhoto` (#2157) or a `FetchPresences` (#2158) is
+    /// served at once, so a click
     /// costs its own round trips plus the request in flight, not a whole
     /// pass; every other command is kept (`deferred`)
     /// for the main loop, in order. A `Shutdown` or a dropped handle sets
@@ -2990,6 +3038,7 @@ impl Engine {
                     self.fetch_group_members(group_id, top)
                 }
                 Some(SyncCommand::FetchUserPhoto { address }) => self.fetch_user_photo(address),
+                Some(SyncCommand::FetchPresences { addresses }) => self.fetch_presences(addresses),
                 _ => false,
             };
             if served {
@@ -3398,6 +3447,9 @@ impl Engine {
             SyncCommand::FetchPhoto => self.fetch_photo(),
             SyncCommand::FetchUserPhoto { address } => {
                 self.fetch_user_photo(address);
+            }
+            SyncCommand::FetchPresences { addresses } => {
+                self.fetch_presences(addresses);
             }
             SyncCommand::FetchContactPhoto { id } => self.fetch_contact_photo(id),
             SyncCommand::SignOut => self.sign_out(),
@@ -8890,6 +8942,58 @@ impl Engine {
         }
     }
 
+    /// Serves [`SyncCommand::FetchPresences`] (#2158): `PresencesFetched`,
+    /// or `PresencesFailed` (`forbidden` for a 403), never a
+    /// `SyncEvent::Error` for a Graph failure. Then a refused refresh and
+    /// transport go through `react_quietly`; a throttle does not, as a 429
+    /// from presence or the directory says nothing of mail, and `react`
+    /// would hold off the next mail pass until its `Retry-After`. Nor does
+    /// a 401 that is still a 401 after a refresh that went through: the
+    /// presence service answers a valid token with a 401 ("User not found")
+    /// for a user without Teams, and `react` would sign mail out. It is
+    /// `forbidden`, as a 403 is: stop asking. Signed out it sends no
+    /// request and reports as `fetch_user_photo` does. The addresses go to
+    /// the client as asked (it trims), and come back as sent. Returns
+    /// `react_quietly`'s answer (false for a throttle), for `checkpoint`.
+    fn fetch_presences(&mut self, addresses: Vec<String>) -> bool {
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            self.emit(SyncEvent::PresencesFailed {
+                addresses,
+                forbidden: false,
+                error: "not signed in".to_string(),
+            });
+            return false;
+        }
+        match self.with_auth(|c| c.presences(&addresses)) {
+            Ok(presences) => {
+                self.emit(SyncEvent::PresencesFetched { presences });
+                false
+            }
+            Err(e) => {
+                // A 401 that `with_auth` refreshed for, the fresh token
+                // taken: presence or the directory refused this user (no
+                // Teams, say), and the token is fine for mail. Only a
+                // refused refresh (`refused_refresh`, which `try_refresh`
+                // resets first, so it is this command's) is a dead token.
+                let refused_by_service =
+                    matches!(e, GraphError::Unauthorized) && self.refused_refresh.is_none();
+                let forbidden =
+                    matches!(e, GraphError::Http { status: 403, .. }) || refused_by_service;
+                self.emit(SyncEvent::PresencesFailed {
+                    addresses,
+                    forbidden,
+                    error: e.to_string(),
+                });
+                match e {
+                    GraphError::Throttled { .. } => false,
+                    GraphError::Unauthorized if refused_by_service => false,
+                    e => self.react_quietly(e),
+                }
+            }
+        }
+    }
+
     /// Fetch a Contacts-folder contact's photo (#2065), record it and emit
     /// `ContactPhotoFetched` (`None`: no photo). A pending local set, or an
     /// id still `local:` (Graph has no such contact), answers from the store
@@ -9650,7 +9754,7 @@ impl Engine {
             .as_ref()
             .map(|t| t.access_token.as_str())
             .unwrap_or("");
-        GraphClient::new(&self.config.graph_base, token)
+        GraphClient::new(&self.config.graph_base, token).with_user_ids(self.user_ids.clone())
     }
 
     /// Refreshes the access token if it's missing or within the expiry skew.
@@ -9968,6 +10072,7 @@ impl Engine {
         self.calendar_reset_owed = false;
         self.masters_not_found.clear();
         self.masters_skipped.clear();
+        self.user_ids.clear();
         self.parked.clear();
         self.expired.clear();
         self.backfill_first.clear();
@@ -10078,6 +10183,7 @@ impl Engine {
         self.announced_scopes = None;
         self.masters_not_found.clear();
         self.masters_skipped.clear();
+        self.user_ids.clear();
         self.emit(SyncEvent::SignInRequired { reason });
         self.set_state(SyncState::SignInRequired);
     }
@@ -35759,6 +35865,600 @@ mod tests {
                     }
                 }
 
+                // --- Presence of users by address (#2158) --------------
+
+                mod presences {
+                    use super::*;
+
+                    const ADA: &str = "ada@contoso.com";
+                    const BOB: &str = "bob@contoso.com";
+                    const ADA_FILTER: &str =
+                        "/users?$filter=mail%20eq%20%27ada%40contoso.com%27&$select=id";
+                    const BOB_FILTER: &str =
+                        "/users?$filter=mail%20eq%20%27bob%40contoso.com%27&$select=id";
+                    const BOB_UPN: &str = "/users/bob%40contoso.com?$select=id";
+                    const U1_PHOTO: &str = "/users/U1/photo/$value";
+                    const PRESENCE: &str = "/communications/getPresencesByUserId";
+                    const ADA_BUSY: &str =
+                        r#"{"value":[{"id":"U1","availability":"Busy","activity":"InAMeeting"}]}"#;
+                    const DENIED: &str = r#"{"error":{"code":"Authorization_RequestDenied","message":"Insufficient privileges"}}"#;
+
+                    fn found_u1() -> (Route, Option<usize>) {
+                        search_route(ADA_FILTER, 200, r#"{"value":[{"id":"U1"}]}"#)
+                    }
+
+                    fn presence_route(
+                        status: u16,
+                        body: &str,
+                        headers: &[(&str, &str)],
+                    ) -> (Route, Option<usize>) {
+                        (
+                            Route {
+                                method: "POST".into(),
+                                path_prefix: PRESENCE.into(),
+                                status,
+                                headers: headers
+                                    .iter()
+                                    .map(|(n, v)| (n.to_string(), v.to_string()))
+                                    .collect(),
+                                body: body.into(),
+                            },
+                            None,
+                        )
+                    }
+
+                    fn ada_busy() -> Option<Presence> {
+                        Some(Presence {
+                            availability: "Busy".into(),
+                            activity: "InAMeeting".into(),
+                        })
+                    }
+
+                    fn fetch_presences(handle: &SyncHandle, addresses: &[&str]) {
+                        handle
+                            .cmd_tx
+                            .send(SyncCommand::FetchPresences {
+                                addresses: addresses.iter().map(|a| a.to_string()).collect(),
+                            })
+                            .unwrap();
+                    }
+
+                    fn is_presence_answer(e: &SyncEvent) -> bool {
+                        matches!(
+                            e,
+                            SyncEvent::PresencesFetched { .. } | SyncEvent::PresencesFailed { .. }
+                        )
+                    }
+
+                    /// Events until the presence answer, which must be
+                    /// `PresencesFailed`: its addresses, `forbidden`, error,
+                    /// and every event seen.
+                    fn presences_failed(
+                        handle: &SyncHandle,
+                    ) -> (Vec<String>, bool, String, Vec<SyncEvent>) {
+                        let events = wait_for(&handle.evt_rx, is_presence_answer);
+                        match events.last() {
+                            Some(SyncEvent::PresencesFailed {
+                                addresses,
+                                forbidden,
+                                error,
+                            }) => (addresses.clone(), *forbidden, error.clone(), events),
+                            other => panic!("expected PresencesFailed, got {other:?}"),
+                        }
+                    }
+
+                    /// The directory and presence requests, in order.
+                    fn user_requests(srv: &FakeServer) -> Vec<String> {
+                        srv.requests()
+                            .into_iter()
+                            .map(|r| r.path)
+                            .filter(|p| p.starts_with("/users") || p.starts_with("/communications"))
+                            .collect()
+                    }
+
+                    /// The engine over an in-memory store on `srv`, signed
+                    /// in, driven step by step (no thread).
+                    fn direct_engine(srv: &FakeServer) -> (Engine, Receiver<SyncEvent>) {
+                        direct_engine_at(srv, PathBuf::from("unused-token.json"))
+                    }
+
+                    /// [`direct_engine`] saving its token at `token_path`
+                    /// (a refresh writes it).
+                    fn direct_engine_at(
+                        srv: &FakeServer,
+                        token_path: PathBuf,
+                    ) -> (Engine, Receiver<SyncEvent>) {
+                        let (_cmd_tx, cmd_rx) = mpsc::channel();
+                        let (evt_tx, evt_rx) = mpsc::channel();
+                        let config = EngineConfig {
+                            store_path: PathBuf::from("unused.db"),
+                            token_path,
+                            cfg: test_cfg(),
+                            backfill_days: 3650,
+                            graph_base: srv.base_url.clone(),
+                            auth_base: srv.base_url.clone(),
+                            tick: HOUR,
+                            options: EngineOptions::without_prefetch(),
+                            token_store: None,
+                        };
+                        let store = Store::open_in_memory().unwrap();
+                        let mut engine = Engine::new(config, store, cmd_rx, evt_tx);
+                        engine.token = Some(TokenSet {
+                            access_token: "AT".into(),
+                            refresh_token: "RT".into(),
+                            expires_at_unix: u64::MAX / 2,
+                            account: String::new(),
+                            scopes: None,
+                        });
+                        (engine, evt_rx)
+                    }
+
+                    #[test]
+                    fn fetch_presences_emits_presences_fetched() {
+                        let srv = two_folders(
+                            vec![],
+                            vec![
+                                found_u1(),
+                                search_route(BOB_FILTER, 200, r#"{"value":[]}"#),
+                                search_route(BOB_UPN, 404, "{}"),
+                                presence_route(200, ADA_BUSY, &[]),
+                            ],
+                        );
+                        let (handle, dir) = started(&srv, "presences");
+                        // Ada sent with spaces: looked up trimmed, echoed as
+                        // sent. Bob is no one; a blank address asks nothing.
+                        fetch_presences(&handle, &[" ada@contoso.com ", BOB, ""]);
+                        let events = wait_for(&handle.evt_rx, is_presence_answer);
+                        no_error(&events);
+                        assert_eq!(
+                            events.last().unwrap(),
+                            &SyncEvent::PresencesFetched {
+                                presences: vec![
+                                    (" ada@contoso.com ".into(), ada_busy()),
+                                    (BOB.into(), None),
+                                    ("".into(), None),
+                                ],
+                            }
+                        );
+                        assert_eq!(
+                            user_requests(&srv),
+                            [ADA_FILTER, BOB_FILTER, BOB_UPN, PRESENCE]
+                        );
+                        let post = srv.requests().into_iter().find(|r| r.path == PRESENCE);
+                        assert_eq!(post.unwrap().body, r#"{"ids":["U1"]}"#);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn fetch_presences_reuses_resolved_ids() {
+                        let srv = two_folders(
+                            vec![],
+                            vec![
+                                found_u1(),
+                                search_route(BOB_FILTER, 200, r#"{"value":[]}"#),
+                                search_route(BOB_UPN, 404, "{}"),
+                                presence_route(200, ADA_BUSY, &[]),
+                            ],
+                        );
+                        let (handle, dir) = started(&srv, "presences-reuse");
+                        for _ in 0..2 {
+                            fetch_presences(&handle, &[ADA, BOB]);
+                            let events = wait_for(&handle.evt_rx, is_presence_answer);
+                            no_error(&events);
+                            assert_eq!(
+                                events.last().unwrap(),
+                                &SyncEvent::PresencesFetched {
+                                    presences: vec![(ADA.into(), ada_busy()), (BOB.into(), None)],
+                                }
+                            );
+                        }
+                        // The second poll is the POST alone: Ada's id and
+                        // Bob's "no one" were kept.
+                        assert_eq!(
+                            user_requests(&srv),
+                            [ADA_FILTER, BOB_FILTER, BOB_UPN, PRESENCE, PRESENCE]
+                        );
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn user_photo_and_presences_share_resolved_ids() {
+                        let mut photo = route(U1_PHOTO, 200, "P");
+                        photo.headers = vec![("Content-Type".into(), "image/png".into())];
+                        let srv = two_folders(
+                            vec![],
+                            vec![
+                                found_u1(),
+                                (photo, None),
+                                presence_route(200, ADA_BUSY, &[]),
+                            ],
+                        );
+                        let (handle, dir) = started(&srv, "presences-photo");
+                        handle
+                            .cmd_tx
+                            .send(SyncCommand::FetchUserPhoto {
+                                address: ADA.into(),
+                            })
+                            .unwrap();
+                        wait_for(&handle.evt_rx, |e| {
+                            matches!(e, SyncEvent::UserPhotoFetched { photo: Some(_), .. })
+                        });
+                        fetch_presences(&handle, &["ADA@contoso.com"]);
+                        let events = wait_for(&handle.evt_rx, is_presence_answer);
+                        assert_eq!(
+                            events.last().unwrap(),
+                            &SyncEvent::PresencesFetched {
+                                presences: vec![("ADA@contoso.com".into(), ada_busy())],
+                            }
+                        );
+                        assert_eq!(user_requests(&srv), [ADA_FILTER, U1_PHOTO, PRESENCE]);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    /// `FetchPresences` failing with `status` on the POST
+                    /// (`on_post`) or on the filter: the answer's
+                    /// `forbidden`, after checking the rest of the answer and
+                    /// that the engine carries on without a sync error.
+                    fn presences_failing_with(status: u16, on_post: bool, tag: &str) -> bool {
+                        let routes = if on_post {
+                            vec![
+                                found_u1(),
+                                search_route(BOB_FILTER, 200, r#"{"value":[]}"#),
+                                search_route(BOB_UPN, 404, "{}"),
+                                presence_route(status, DENIED, &[]),
+                            ]
+                        } else {
+                            vec![
+                                search_route(ADA_FILTER, status, DENIED),
+                                presence_route(200, ADA_BUSY, &[]),
+                            ]
+                        };
+                        let srv = two_folders(vec![], routes);
+                        let (handle, dir) = started(&srv, tag);
+                        fetch_presences(&handle, &[ADA, BOB]);
+                        let (addresses, forbidden, error, events) = presences_failed(&handle);
+                        assert_eq!(addresses, [ADA, BOB]);
+                        assert!(error.contains(&status.to_string()), "{error}");
+                        assert!(!error.contains('\n'), "one line: {error:?}");
+                        let want: &[&str] = if on_post {
+                            // Bob is no one: only Ada's id is posted.
+                            &[ADA_FILTER, BOB_FILTER, BOB_UPN, PRESENCE]
+                        } else {
+                            &[ADA_FILTER]
+                        };
+                        assert_eq!(user_requests(&srv), want);
+                        // The engine carries on: the next command is answered.
+                        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+                        let more = wait_for(&handle.evt_rx, is_idle);
+                        no_error(&events);
+                        no_error(&more);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                        forbidden
+                    }
+
+                    #[test]
+                    fn fetch_presences_forbidden() {
+                        assert!(presences_failing_with(403, true, "presences-403"));
+                        assert!(presences_failing_with(403, false, "presences-403-resolve"));
+                    }
+
+                    #[test]
+                    fn fetch_presences_other_failure_not_forbidden() {
+                        assert!(!presences_failing_with(500, true, "presences-500"));
+                        assert!(!presences_failing_with(400, false, "presences-400-resolve"));
+                    }
+
+                    /// A presence 429 (and a directory one) answers the
+                    /// command and holds off no mail pass: `next_retry` is
+                    /// left as it was, where `react` would set it to the
+                    /// `Retry-After`.
+                    #[test]
+                    fn fetch_presences_throttled_does_not_delay_mail() {
+                        for on_post in [true, false] {
+                            let routes = if on_post {
+                                vec![
+                                    found_u1(),
+                                    presence_route(429, "{}", &[("Retry-After", "600")]),
+                                ]
+                            } else {
+                                let mut r = route(ADA_FILTER, 429, "{}");
+                                r.headers = vec![("Retry-After".into(), "600".into())];
+                                vec![(r, None)]
+                            };
+                            let srv = FakeServer::start_limited(routes);
+                            let (mut engine, evt_rx) = direct_engine(&srv);
+                            let before = engine.next_retry;
+                            let stop_work = engine.fetch_presences(vec![ADA.into()]);
+                            assert!(!stop_work, "a throttle stops no work");
+                            assert_eq!(engine.next_retry, before, "no mail back-off");
+                            let events: Vec<SyncEvent> = evt_rx.try_iter().collect();
+                            no_error(&events);
+                            match events.last() {
+                                Some(SyncEvent::PresencesFailed {
+                                    addresses,
+                                    forbidden: false,
+                                    error,
+                                }) => {
+                                    assert_eq!(addresses, &[ADA]);
+                                    assert!(!error.is_empty());
+                                }
+                                other => panic!("expected PresencesFailed, got {other:?}"),
+                            }
+                            assert!(
+                                !events.iter().any(|e| matches!(e, SyncEvent::State(_))),
+                                "no state change: {events:?}"
+                            );
+                        }
+                    }
+
+                    /// `FetchPresences` meeting a 401 on the POST
+                    /// (`on_post`) or on the resolve, with the token
+                    /// endpoint answering `token`: the engine after it,
+                    /// every event, and the requests.
+                    fn presences_after_401(
+                        on_post: bool,
+                        token: Route,
+                        tag: &str,
+                    ) -> (Engine, Vec<SyncEvent>, FakeServer, PathBuf) {
+                        // What the presence service answers a valid token
+                        // for a user without Teams.
+                        let not_found =
+                            r#"{"error":{"code":"Unauthorized","message":"User not found"}}"#;
+                        let mut routes = vec![token];
+                        if on_post {
+                            routes.push(found_u1().0);
+                            routes.push(presence_route(401, not_found, &[]).0);
+                        } else {
+                            routes.push(route(ADA_FILTER, 401, not_found));
+                        }
+                        let srv = FakeServer::start(routes);
+                        let dir = unique_dir(tag);
+                        let (mut engine, evt_rx) = direct_engine_at(&srv, dir.join("token.bin"));
+                        let stop_work = engine.fetch_presences(vec![ADA.into()]);
+                        let events: Vec<SyncEvent> = evt_rx.try_iter().collect();
+                        // Stops work exactly when it signs out.
+                        assert_eq!(stop_work, engine.token.is_none(), "{events:?}");
+                        (engine, events, srv, dir)
+                    }
+
+                    /// A 401 still a 401 after a refresh that went through
+                    /// is presence (or the directory) refusing this user,
+                    /// not a dead token: `forbidden`, and the session, its
+                    /// fresh token and its mail pass schedule are kept.
+                    #[test]
+                    fn fetch_presences_401_after_a_refresh_keeps_the_session() {
+                        let refreshed =
+                            r#"{"access_token":"AT2","refresh_token":"RT2","expires_in":3600}"#;
+                        for on_post in [true, false] {
+                            let (engine, events, srv, dir) = presences_after_401(
+                                on_post,
+                                token_route(refreshed),
+                                &format!("presences-401-{on_post}"),
+                            );
+                            no_error(&events);
+                            assert!(
+                                !events
+                                    .iter()
+                                    .any(|e| matches!(e, SyncEvent::SignInRequired { .. })),
+                                "{events:?}"
+                            );
+                            match events.last() {
+                                Some(SyncEvent::PresencesFailed {
+                                    addresses,
+                                    forbidden: true,
+                                    error,
+                                }) => {
+                                    assert_eq!(addresses, &[ADA]);
+                                    assert!(!error.contains('\n'), "{error:?}");
+                                }
+                                other => {
+                                    panic!("expected forbidden PresencesFailed, got {other:?}")
+                                }
+                            }
+                            let token = engine.token.as_ref().expect("still signed in");
+                            assert_eq!(token.access_token, "AT2");
+                            assert_eq!(token_requests(&srv), 1);
+                            assert_eq!(engine.next_retry, None, "no mail back-off");
+                            // Asked once with each token; the retry finds
+                            // Ada's id kept.
+                            let want: &[&str] = if on_post {
+                                &[ADA_FILTER, PRESENCE, PRESENCE]
+                            } else {
+                                &[ADA_FILTER, ADA_FILTER]
+                            };
+                            assert_eq!(user_requests(&srv), want);
+                            let _ = std::fs::remove_dir_all(&dir);
+                        }
+                    }
+
+                    /// A refused refresh is a dead token, whoever answered
+                    /// the 401: the sign-in it asks for, as for any command.
+                    #[test]
+                    fn fetch_presences_401_with_a_refused_refresh_signs_in() {
+                        for on_post in [true, false] {
+                            let (engine, events, srv, dir) = presences_after_401(
+                                on_post,
+                                token_failure(400, r#"{"error":"invalid_grant"}"#),
+                                &format!("presences-401-refused-{on_post}"),
+                            );
+                            assert!(engine.token.is_none());
+                            assert_eq!(token_requests(&srv), 1);
+                            assert!(
+                                events.iter().any(|e| matches!(
+                                    e,
+                                    SyncEvent::PresencesFailed {
+                                        forbidden: false,
+                                        ..
+                                    }
+                                )),
+                                "{events:?}"
+                            );
+                            assert_eq!(
+                                signin_reasons(&events),
+                                vec![SignInReason::Expired {
+                                    code: "invalid_grant".into(),
+                                    aadsts: None,
+                                }],
+                                "{events:?}"
+                            );
+                            let _ = std::fs::remove_dir_all(&dir);
+                        }
+                    }
+
+                    #[test]
+                    fn fetch_presences_transport_failure_goes_offline_without_error() {
+                        let srv = two_folders(vec![], vec![]);
+                        let (handle, dir) = started(&srv, "presences-transport");
+                        drop(srv);
+                        fetch_presences(&handle, &[ADA]);
+                        let (addresses, forbidden, _error, events) = presences_failed(&handle);
+                        assert_eq!((addresses, forbidden), (vec![ADA.to_string()], false));
+                        no_error(&events);
+                        let more = wait_for(&handle.evt_rx, |e| {
+                            matches!(e, SyncEvent::State(SyncState::Offline))
+                        });
+                        no_error(&more);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn fetch_presences_signed_out_reports_not_signed_in() {
+                        let srv = two_folders(
+                            vec![],
+                            vec![found_u1(), presence_route(200, ADA_BUSY, &[])],
+                        );
+                        // No token: the engine waits for a sign-in.
+                        let dir = unique_dir("presences-signed-out");
+                        let handle = spawn_with(&srv, &dir, EngineOptions::without_prefetch());
+                        wait_for(&handle.evt_rx, |e| {
+                            matches!(e, SyncEvent::SignInRequired { .. })
+                        });
+                        fetch_presences(&handle, &[ADA, BOB]);
+                        let events = wait_for(&handle.evt_rx, is_presence_answer);
+                        let at_error = events
+                            .iter()
+                            .position(|e| matches!(e, SyncEvent::Error(m) if m == "not signed in"))
+                            .unwrap_or_else(|| panic!("no not-signed-in error: {events:?}"));
+                        assert_eq!(at_error, events.len() - 2, "{events:?}");
+                        assert_eq!(
+                            events.last().unwrap(),
+                            &SyncEvent::PresencesFailed {
+                                addresses: vec![ADA.into(), BOB.into()],
+                                forbidden: false,
+                                error: "not signed in".into(),
+                            }
+                        );
+                        assert!(user_requests(&srv).is_empty());
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn fetch_presences_is_served_during_a_slow_pass() {
+                        let folders: Vec<Fold> =
+                            [("F1", "Inbox"), ("F2", "B"), ("F3", "C"), ("F4", "D")]
+                                .into_iter()
+                                .map(|(id, name)| {
+                                    small(Fold {
+                                        pages: vec![vec![msg(
+                                            &format!("M-{id}"),
+                                            "2020-01-01T00:00:00Z",
+                                        )]],
+                                        ..fold(
+                                            id,
+                                            name,
+                                            if id == "F1" { Some("inbox") } else { None },
+                                        )
+                                    })
+                                })
+                                .collect();
+                        let srv = FakeServer::start_paced(mailbox(
+                            &folders,
+                            vec![found_u1(), presence_route(200, ADA_BUSY, &[])],
+                            Duration::from_millis(300),
+                        ));
+                        let dir = new_dir("presences-in-pass");
+                        let handle = spawn_with(&srv, &dir, EngineOptions::without_prefetch());
+                        // The startup pass is under way: some folder's delta is out.
+                        assert!(wait_until(ENGINE_WAIT, || {
+                            paths_from(&srv, 0)
+                                .iter()
+                                .any(|p| p.contains("/messages/delta?$orderby"))
+                        }));
+                        fetch_presences(&handle, &[ADA]);
+                        let events = wait_for(&handle.evt_rx, is_idle);
+                        assert!(
+                            events.iter().any(|e| matches!(
+                                e,
+                                SyncEvent::PresencesFetched { presences }
+                                    if presences == &[(ADA.to_string(), ada_busy())]
+                            )),
+                            "answered before the pass ended: {events:?}"
+                        );
+                        let reqs = srv.requests();
+                        let last_delta = reqs
+                            .iter()
+                            .filter(|r| r.path.contains("/messages/delta?$orderby"))
+                            .map(|r| r.at)
+                            .max()
+                            .unwrap();
+                        let post_at: Vec<_> = reqs
+                            .iter()
+                            .filter(|r| r.path == PRESENCE)
+                            .map(|r| r.at)
+                            .collect();
+                        assert_eq!(post_at.len(), 1);
+                        assert!(
+                            post_at[0] < last_delta,
+                            "the presence request came before the last delta"
+                        );
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    /// The ids found are the session's: a sign-out (and any
+                    /// other way back to sign-in) and another mailbox forget
+                    /// them, with no request.
+                    #[test]
+                    fn sign_out_clears_resolved_ids() {
+                        let srv = FakeServer::start(vec![]);
+                        let (mut engine, _evt_rx) = direct_engine(&srv);
+                        engine.user_ids.insert(ADA, Some("U1".into()));
+                        engine.user_ids.insert(BOB, None);
+                        // `client()` shares the engine's map.
+                        assert_eq!(engine.client().presences(&[]), Ok(vec![]));
+                        assert_eq!(engine.user_ids.len(), 2);
+                        engine.handle_command(SyncCommand::SignOut);
+                        assert!(engine.user_ids.is_empty());
+                        // Another mailbox forgets them too.
+                        engine.user_ids.insert(ADA, Some("U1".into()));
+                        engine.reset_for_new_mailbox("ROOT_B").unwrap();
+                        assert!(engine.user_ids.is_empty());
+                        assert!(srv.requests().is_empty());
+                    }
+
+                    /// The engine's `client()` reads and fills the engine's
+                    /// own map.
+                    #[test]
+                    fn engine_clients_share_the_resolved_ids() {
+                        let srv = FakeServer::start(vec![
+                            found_u1().0,
+                            presence_route(200, ADA_BUSY, &[]).0,
+                        ]);
+                        let (engine, _evt_rx) = direct_engine(&srv);
+                        let asked = [ADA.to_string()];
+                        assert!(engine.client().presences(&asked).is_ok());
+                        assert_eq!(engine.user_ids.len(), 1);
+                        assert!(engine.client().presences(&asked).is_ok());
+                        assert_eq!(user_requests(&srv), [ADA_FILTER, PRESENCE, PRESENCE]);
+                    }
+                }
+
                 // --- Directory groups and members (#2058) ---------------
 
                 mod groups {
@@ -43181,6 +43881,12 @@ mod tests {
             };
             assert!(!persists_at_shutdown(&user_photo));
             assert!(served_at_checkpoint(&user_photo));
+            // So is users' presence (#2158).
+            let presences = SyncCommand::FetchPresences {
+                addresses: vec!["ada@contoso.com".into()],
+            };
+            assert!(!persists_at_shutdown(&presences));
+            assert!(served_at_checkpoint(&presences));
             assert!(!persists_at_shutdown(&SyncCommand::ComposeForward {
                 id: "x".into()
             }));
