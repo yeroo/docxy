@@ -5,9 +5,12 @@
 # after Account, before Close). Each page counts its renders and records
 # where it and its "Close tab" button painted (`ext-page-read`,
 # `ext-page-close:<id>`); the button dispatches `ext::CloseTab`.
-# `ext-close-tab` dispatches it from the focused element, which on a Mail
-# tab must be inside the extension's view; gpui runs a dispatched action
-# after the verb's reply, so a `shot window` follows it. The instance
+# Each page also has a "Show <other page>" button (`ext-page-show:<id>`)
+# that dispatches `ext::ShowBackstagePage` with the other page's id (#2204).
+# `ext-close-tab` and `ext-show-page` dispatch their actions from the
+# focused element, which on a Mail tab with File down must be inside the
+# extension's view; gpui runs a dispatched action after the verb's reply,
+# so a `shot window` follows it. The instance
 # starts with one document tab (the first test also opens basic.docx and
 # closes it); each test leaves only that one open.
 ext fixture
@@ -168,3 +171,132 @@ test issue 1923 CloseTab on a document tab does nothing
   assert reply.count is 1
   assert reply.tabs.0.kind is docx
   call-error ext-page-read {"page":"fx.account"} => the active tab is not an extension's
+
+test issue 2204 ShowBackstagePage from the extension's view opens File on that page
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call ext-doc-read {}
+  assert reply.focused is true
+  call backstage {"action":"read"}
+  assert reply.open is false
+  call ext-page-read {"page":"fx.options"}
+  assert reply.renders is 0
+  call ext-show-page {"id":"fx.options"}
+  assert reply.dispatched is true
+  assert reply.from is view
+  shot window
+  call backstage {"action":"read"}
+  assert reply.open is true
+  assert reply.ext_page is fx.options
+  call backstage-layout {}
+  assert reply.page is ext
+  assert reply.ext_page is fx.options
+  call ext-page-read {"page":"fx.options"}
+  assert reply.renders is not 0
+  assert reply.bounds is not null
+  assert reply.show_bounds is not null
+  call ext-page-read {"page":"fx.account"}
+  assert reply.renders is 0
+  assert reply.bounds is null
+  call backstage {"action":"close"}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 2204 an id the tab does not list opens File on its default page
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call ext-doc-read {}
+  assert reply.focused is true
+  call ext-show-page {"id":"fx.nope"}
+  assert reply.from is view
+  shot window
+  call backstage {"action":"read"}
+  assert reply.open is true
+  assert reply.ext_page is null
+  call backstage-layout {}
+  assert reply.page is open
+  assert reply.ext_page is null
+  # File up on one of the tab's pages: an empty id leaves it for the
+  # default page, never a blank content column.
+  call pointer-click {"region":"bs-ext:fx.account"}
+  shot window
+  call backstage {"action":"read"}
+  assert reply.ext_page is fx.account
+  call ext-show-page {"id":""}
+  shot window
+  call backstage {"action":"read"}
+  assert reply.open is true
+  assert reply.ext_page is null
+  call backstage-layout {}
+  assert reply.page is open
+  assert reply.ext_page is null
+  call backstage {"action":"close"}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 2204 File already up switches to the page, and a page's own button to the other
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call backstage {"action":"open"}
+  call account {"action":"open"}
+  assert reply.open is true
+  shot window
+  call ext-show-page {"id":"fx.account"}
+  shot window
+  call account {"action":"read"}
+  assert reply.open is false
+  call backstage {"action":"read"}
+  assert reply.open is true
+  assert reply.ext_page is fx.account
+  call backstage-layout {}
+  assert reply.page is ext
+  call ext-page-read {"page":"fx.account"}
+  assert reply.renders is not 0
+  assert reply.show_bounds is not null
+  # The page's Show button dispatches the action from inside File.
+  call pointer-click {"region":"ext-page-show:fx.account"}
+  shot window
+  call backstage {"action":"read"}
+  assert reply.open is true
+  assert reply.ext_page is fx.options
+  call ext-page-read {"page":"fx.options"}
+  assert reply.renders is not 0
+  assert reply.bounds is not null
+  call pointer-click {"region":"ext-page-show:fx.options"}
+  shot window
+  call backstage {"action":"read"}
+  assert reply.ext_page is fx.account
+  call backstage-layout {}
+  assert reply.page is ext
+  assert reply.ext_page is fx.account
+  call backstage {"action":"close"}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 2204 ShowBackstagePage on a document tab opens File on its default page
+  call tab-list {}
+  assert reply.count is 1
+  assert reply.tabs.0.kind is docx
+  call backstage {"action":"read"}
+  assert reply.open is false
+  call ext-show-page {"id":"fx.account"}
+  assert reply.from is suite
+  shot window
+  call backstage {"action":"read"}
+  assert reply.open is true
+  assert reply.ext_page is null
+  call backstage-layout {}
+  assert reply.page is open
+  assert reply.ext_page is null
+  call backstage {"action":"close"}
+  call tab-list {}
+  assert reply.count is 1
