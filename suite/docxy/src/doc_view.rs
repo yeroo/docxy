@@ -13,7 +13,8 @@
 //! its decisions are [`edit`]'s. A hyperlink press goes to the extension's callback
 //! ([`DocView::on_link`], [`DocView::on_link_with_text`]), never opened here; the
 //! link under the pointer goes to [`DocView::on_link_hover`] and, read-only,
-//! the pointer is a hand over it (#1916). The chrome (scroll bar, selection) follows the suite's
+//! the pointer is a hand over it (#1916). A picture's Alt Text shows as
+//! its tooltip on hover ([`picture_tip_el`], #1998). The chrome (scroll bar, selection) follows the suite's
 //! theme; the document is a white page in its authored colours unless the
 //! extension turns on dark mode for content ([`DocView::set_content_dark`]),
 //! whose dark page the host may paint in its own colour
