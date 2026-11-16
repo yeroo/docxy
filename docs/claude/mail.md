@@ -1454,7 +1454,9 @@ Builds on the records and contact writes above (#2063).
 - Store: `contact_photos`, one row per contact whose photo state is known:
   `has_photo` (0 for Graph's 404), the bytes and type, the etag, the contact's
   `change_key` when the state was learnt, `pending` (a local set Graph has not
-  accepted yet), and `revision` (a count of local sets). A foreign key to
+  accepted yet), `revision` (a count of local sets) and `sent_revision` (the
+  revision the last PUT read, noted by the outbox just before the request, r2).
+  A foreign key to
   `contact_records` with `ON DELETE CASCADE ON UPDATE CASCADE` makes the row
   follow a re-key (`reconcile_created_contact`) and go with a deleted
   contact. Rows also go through `discard_contact_row`, a refused delete's
@@ -1484,28 +1486,38 @@ Builds on the records and contact writes above (#2063).
   `ContactsUpdated`; the next drain sends the op without it.
 - The op carries no bytes: a 4 MiB photo base64'd into the payload would be
   decoded by every `pending_ops_on` (each full pass and drain). The PUT
-  sends `pending_contact_photo` as stored at send time, then
-  `confirm_contact_photo(id, revision)`. A set written while the PUT was in
+  sends `pending_contact_photo` as stored at send time, noting its revision
+  (`note_contact_photo_sent`), then `confirm_contact_photo(id, revision)`. A set written while the PUT was in
   flight has a later revision and stays pending for its own op, so the
   first op to run sends the latest photo and later ones find nothing
   pending. An id still `local:` sends nothing: its create was refused, and a
   create not sent yet runs first in `seq` order. Nothing pending (sent,
   reverted, the contact deleted) also sends nothing. A 404 is a refusal,
   not done.
-- `QueuedContacts.photo` holds the contacts a `SetContactPhoto` names. It
-  is never in `any`: the photo op holds no re-read, since it never reads or
-  writes the fields. It is used in three places, each to keep a row so that
-  the PUT's 404 reports the photo, instead of a cascade dropping it
-  silently:
+- `QueuedContacts.photo` holds the contacts a queued `SetContactPhoto` names
+  **while their photo is still pending** (r2). A queued op whose photo an
+  earlier op already sent, or that a refusal reverted, has nothing to protect,
+  so it keeps no row: a contact deleted elsewhere does not linger (and
+  `is_contact` stays true) until the next full pass. The set is never in
+  `any`: the photo op holds no re-read, since it never reads or writes the
+  fields. It is used in three places, each to keep a row so that the PUT's
+  404 reports the photo, instead of a cascade dropping it silently:
   - `replace_contacts`' removal guard: an unlisted contact with a pending set
     stays. A listed one is still written (the op sends no field).
   - `revert_folder_contact`'s 404 branch (r1): another write's re-read that
-    finds the contact gone keeps the row while a photo set names it. The owed
-    re-read is cleared: the photo's PUT then 404s, reports the photo and owes
-    a new one, which deletes the row once no photo set is left. If that PUT
-    is refused for another reason, the row stays until the next full pass.
-  - `revert_contact_photo`: a refused set keeps the row for a later queued
-    set.
+    finds the contact gone keeps the row while a pending photo's op is
+    queued. The owed re-read is cleared: the photo's PUT then 404s, reports
+    the photo and owes a new one, which deletes the row once nothing is
+    pending. If that PUT is refused for another reason, the row stays until
+    the next full pass.
+  - `revert_contact_photo` (r2): a refused set forgets the photo whatever
+    the queue holds, unless the row's revision moved past `sent_revision` (a
+    set written while the refused PUT was in flight, which Graph has not
+    refused yet) and that set's op is queued. A later op of the refused photo
+    would only upload the same bytes and be refused again: one upload, one
+    report. The noted revision, not the one read at the refusal, decides,
+    because the host can write the store from its own connection during the
+    PUT.
   Without the second guard, an `UpdateContact` refused 404 with a
   `SetContactPhoto` behind it would delete the contact and its pending photo,
   and only the update would be reported. The photo is never put into an
@@ -1515,13 +1527,15 @@ Builds on the records and contact writes above (#2063).
   attempted: None, attempted_photo: Some(..) }`, then `Error("set the photo
   of contact {id}: {error}")`, then `ContactsUpdated`.
   `revert_contact_photo` deletes the row (unknown, so the client fetches
-  Graph's) unless a later queued set names the contact. A `NotFound` also
-  owes the contact a re-read, so its 404 deletes the contact at once rather
-  than at the next full pass. While a later set is queued, the re-read keeps
-  the row: that set's PUT 404s too and is reported, and its own re-read
+  Graph's) unless a set was written during the refused PUT (above). A
+  `NotFound` also owes the contact a re-read, so its 404 deletes the contact
+  at once rather than at the next full pass. Two sets queued before the drain
+  are therefore one PUT, one report and one GET: the first PUT sent the
+  latest photo, so nothing is left pending. Only a set written during the
+  PUT keeps the row: its own PUT 404s and is reported, and its re-read
   deletes the contact. `attempted_photo` is read before the revert, so it
-  holds the row as the user left it: each such report carries the latest
-  photo. A 5xx keeps the op queued.
+  holds the row as the user left it, the latest photo. A 5xx keeps the op
+  queued.
 - A refused **create** also reports the photo set on its `local:` row
   (`attempted_photo`), since `discard_contact_row` takes it with the row. The
   orphaned `SetContactPhoto` stays queued and sends nothing, as an orphaned
@@ -1564,6 +1578,8 @@ Builds on the records and contact writes above (#2063).
   `full_pass_keeps_a_contact_with_a_pending_photo_set`,
   `photo_op_holds_no_contact_reread`,
   `reread_404_keeps_a_contact_a_photo_set_names`,
+  `revert_contact_photo_forgets_the_sent_revision_whatever_is_queued`,
+  `photo_guards_need_a_pending_photo`,
   `revert_contact_photo_waits_for_a_later_set`,
   `set_contact_photo_op_round_trips_json`,
   `contact_photos_on_a_database_from_before_the_table`; `outbox.rs`
@@ -1583,7 +1599,9 @@ Builds on the records and contact writes above (#2063).
   `contact_photo_set_on_a_contact_deleted_elsewhere_reports_404`,
   `refused_create_reports_its_pending_photo`,
   `contact_photo_set_with_a_bad_type_is_refused_and_the_queue_moves_on`,
-  `refused_update_404_keeps_the_contact_for_a_queued_photo_set`.
+  `refused_update_404_keeps_the_contact_for_a_queued_photo_set`,
+  `contact_photo_sets_refused_403_upload_and_report_once`,
+  `refused_update_404_deletes_a_contact_whose_photo_was_sent`.
 - Not done: removing the photo (Graph has no call). Prefetching photos, or
   fetching them in a pass. Sized photos (`/photos/{size}`). The metadata
   form and its `@odata.mediaEtag`. Image conversion: a non-JPEG is sent as

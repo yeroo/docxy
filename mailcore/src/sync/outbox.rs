@@ -668,8 +668,9 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
             };
             client.update_contact(&target, &row.fields, *fields)
         }
-        // The photo as stored at send time (#2065), then confirmed at the
-        // revision it sent: a set written while the PUT was in flight stays
+        // The photo as stored at send time (#2065), its revision noted as
+        // sent (a refusal forgets only what Graph refused), then confirmed at
+        // the revision it sent: a set written while the PUT was in flight stays
         // pending for its own op. An id still `local:` has no Graph contact
         // (its create was refused, and the row went with it; a create not
         // sent yet runs first, in `seq` order). Nothing pending (an earlier
@@ -686,6 +687,9 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
             else {
                 return Ok(());
             };
+            store
+                .note_contact_photo_sent(&target, revision)
+                .map_err(store_err)?;
             client.set_contact_photo(&target, &photo.bytes, &photo.content_type)?;
             store
                 .confirm_contact_photo(&target, revision)

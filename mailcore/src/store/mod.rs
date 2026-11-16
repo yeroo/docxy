@@ -5902,9 +5902,10 @@ impl Store {
     ///   `contact_aliases`) keeps its stored row: the server's version would
     ///   undo the edit before the PATCH sends it;
     /// - a contact a queued `DeleteContact` names is not written back;
-    /// - a contact a queued `SetContactPhoto` names (#2065) is not removed,
-    ///   so its photo row stays for the PUT, whose 404 then reports the
-    ///   photo; a listed one is still written (the photo op sends no field).
+    /// - a contact a queued `SetContactPhoto` names while its photo is still
+    ///   pending (#2065) is not removed, so its photo row stays for the PUT,
+    ///   whose 404 then reports the photo; a listed one is still written (the
+    ///   photo op sends no field).
     ///
     /// The queue is read inside the same transaction. A repeated id keeps its
     /// first record. The legacy #1934 address table is emptied. Never touches
@@ -6064,8 +6065,8 @@ impl Store {
     /// began), nothing is written and `false` is returned, the re-read still
     /// owed; otherwise the owed re-read (`owe_contact_reread`) is cleared and
     /// `true` returned. A queued `SetContactPhoto` (#2065) does not hold the
-    /// re-read, but on a 404 it keeps the row: deleting it would take the
-    /// pending photo with it unreported. The re-read is still cleared; the
+    /// re-read, but on a 404 it keeps the row while its photo is still
+    /// pending: deleting it would take that photo with it unreported. The re-read is still cleared; the
     /// photo's own PUT then 404s, reports the photo and owes a new re-read,
     /// which deletes the row once no photo set names it. (Should that PUT be
     /// refused otherwise, the row stays until the next full pass.)
@@ -6371,14 +6372,42 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Records that a PUT of the contact `id`'s photo is about to send
+    /// `revision` (#2065, the outbox, just before the request), so a refusal
+    /// knows what Graph refused (`revert_contact_photo`), whatever the host
+    /// writes meanwhile.
+    pub(crate) fn note_contact_photo_sent(
+        &self,
+        id: &str,
+        revision: i64,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE contact_photos SET sent_revision = ?2 WHERE contact_id = ?1",
+            params![id, revision],
+        )?;
+        Ok(())
+    }
+
     /// Forgets the photo of the contact `id` (as stored) after Graph refused
     /// its set (#2065), so the photo is unknown again and a client fetches
-    /// Graph's. In one transaction it first checks the queue: while a later
-    /// `SetContactPhoto` names the contact, the row (that set's photo) is
-    /// left and `false` returned. Queues nothing.
+    /// Graph's. The row is kept (`false`) only for a photo Graph has not
+    /// refused yet: one set since the refused PUT read the row (its revision
+    /// moved past `sent_revision`) whose own op is still queued. A later
+    /// queued op of the same photo would only send the refused bytes again,
+    /// so the row goes and that op sends nothing. In one transaction; queues
+    /// nothing.
     pub(crate) fn revert_contact_photo(&self, id: &str) -> Result<bool, StoreError> {
         let tx = self.write_tx()?;
-        if queued_contacts_on(&tx)?.photo.contains(id) {
+        let newer: bool = tx
+            .query_row(
+                "SELECT pending <> 0 AND revision <> sent_revision FROM contact_photos
+                 WHERE contact_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if newer && queued_contacts_on(&tx)?.photo.contains(id) {
             return Ok(false);
         }
         tx.execute(
@@ -8512,9 +8541,11 @@ struct QueuedContacts {
     /// Named by a create, update or delete: the ops that read or write the
     /// contact's fields, which a refused write's re-read waits for.
     any: HashSet<String>,
-    /// Named by a `SetContactPhoto` (#2065). Not in `any`: the photo op never
-    /// reads or writes the fields, so it holds no re-read and no write of a
-    /// listed contact, only the removal of an unlisted one.
+    /// Named by a `SetContactPhoto` (#2065) with a photo still pending (an
+    /// op whose photo an earlier op already sent, or that was reverted, has
+    /// nothing to protect). Not in `any`: the photo op never reads or writes
+    /// the fields, so it holds no re-read and no write of a listed contact,
+    /// only the removal of an unlisted one.
     photo: HashSet<String>,
 }
 
@@ -8530,6 +8561,19 @@ fn contact_change_key_on(conn: &Connection, id: &str) -> Result<Option<String>, 
         .optional()?)
 }
 
+/// Whether the contact `id` (as stored) has a photo set locally that Graph
+/// has not accepted yet (#2065).
+fn contact_photo_pending_on(conn: &Connection, id: &str) -> Result<bool, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT pending <> 0 FROM contact_photos WHERE contact_id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
 /// `QueuedContacts` as the outbox on `conn` holds them now.
 fn queued_contacts_on(conn: &Connection) -> Result<QueuedContacts, StoreError> {
     let mut q = QueuedContacts::default();
@@ -8539,7 +8583,10 @@ fn queued_contacts_on(conn: &Connection) -> Result<QueuedContacts, StoreError> {
             OutboxOp::DeleteContact { id } => (id, Some(&mut q.deleted)),
             OutboxOp::CreateContact { id } => (id, None),
             OutboxOp::SetContactPhoto { id } => {
-                q.photo.insert(resolve_contact_id_on(conn, &id)?);
+                let id = resolve_contact_id_on(conn, &id)?;
+                if contact_photo_pending_on(conn, &id)? {
+                    q.photo.insert(id);
+                }
                 continue;
             }
             _ => continue,
@@ -13114,16 +13161,21 @@ mod tests {
         s.replace_contacts(&[contact_record("G1", "Ann", &[])])
             .unwrap();
         s.set_contact_photo("G1", b"ONE", "image/jpeg").unwrap();
+        let (_, sent) = s.pending_contact_photo("G1").unwrap().unwrap();
+        s.note_contact_photo_sent("G1", sent).unwrap();
+        // A set written while that PUT was in flight.
         s.set_contact_photo("G1", b"TWO", "image/jpeg").unwrap();
         let ops = s.pending_ops().unwrap();
-        // The first op refused and dropped: the second still names it.
+        // The first op refused and dropped: the second still has its own
+        // photo to send.
         s.drop_op(ops[0].seq);
         assert!(!s.revert_contact_photo("G1").unwrap());
         assert_eq!(
             s.pending_contact_photo("G1").unwrap().unwrap().0.bytes,
             b"TWO"
         );
-        // The second refused too: the photo is unknown again.
+        // The second sent and refused too: the photo is unknown again.
+        s.note_contact_photo_sent("G1", sent + 1).unwrap();
         s.drop_op(ops[1].seq);
         assert!(s.revert_contact_photo("G1").unwrap());
         assert_eq!(s.contact_photo("G1").unwrap(), None);
@@ -13131,6 +13183,72 @@ mod tests {
             s.folder_contact("G1").unwrap().is_some(),
             "the contact stays"
         );
+    }
+
+    /// #2065 r2: a refusal of the revision the PUT sent forgets the photo,
+    /// even with a later op of that same photo queued: it would only send
+    /// the refused bytes again.
+    #[test]
+    fn revert_contact_photo_forgets_the_sent_revision_whatever_is_queued() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[contact_record("G1", "Ann", &[])])
+            .unwrap();
+        s.set_contact_photo("G1", b"ONE", "image/jpeg").unwrap();
+        s.set_contact_photo("G1", b"TWO", "image/jpeg").unwrap();
+        let (_, sent) = s.pending_contact_photo("G1").unwrap().unwrap();
+        s.note_contact_photo_sent("G1", sent).unwrap();
+        let ops = s.pending_ops().unwrap();
+        s.drop_op(ops[0].seq);
+        assert!(s.revert_contact_photo("G1").unwrap());
+        assert_eq!(s.contact_photo("G1").unwrap(), None);
+        assert_eq!(
+            s.pending_contact_photo("G1").unwrap(),
+            None,
+            "op 2 sends nothing"
+        );
+        // Nothing pending: the queued op protects no row either.
+        s.owe_contact_reread("G1").unwrap();
+        assert!(s.revert_folder_contact("G1", None).unwrap());
+        assert!(s.folder_contact("G1").unwrap().is_none());
+    }
+
+    /// #2065 r2: the guards keep a row only for a photo still pending, not
+    /// for a queued op whose photo an earlier op already sent.
+    #[test]
+    fn photo_guards_need_a_pending_photo() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[
+            contact_record("G1", "Ann", &[]),
+            contact_record("G2", "Bob", &[]),
+        ])
+        .unwrap();
+        for id in ["G1", "G2"] {
+            s.set_contact_photo(id, b"ONE", "image/jpeg").unwrap();
+            s.set_contact_photo(id, b"TWO", "image/jpeg").unwrap();
+            // The first op sent the latest photo and Graph took it.
+            let (_, rev) = s.pending_contact_photo(id).unwrap().unwrap();
+            assert!(s.confirm_contact_photo(id, rev).unwrap());
+        }
+        let first: Vec<i64> = s
+            .pending_ops()
+            .unwrap()
+            .iter()
+            .step_by(2)
+            .map(|r| r.seq)
+            .collect();
+        for seq in first {
+            s.drop_op(seq);
+        }
+        assert_eq!(
+            photo_ops(&s).len(),
+            2,
+            "each contact's second op still queued"
+        );
+        // A re-read's 404 deletes G1; a full pass no longer listing G2 drops it.
+        assert!(s.revert_folder_contact("G1", None).unwrap());
+        assert!(s.folder_contact("G1").unwrap().is_none());
+        s.replace_contacts(&[]).unwrap();
+        assert!(s.folder_contact("G2").unwrap().is_none());
     }
 
     #[test]

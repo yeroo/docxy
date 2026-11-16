@@ -295,7 +295,9 @@ CREATE TABLE IF NOT EXISTS contact_reread_owed (
 -- contact: a re-key moves it, a delete takes it. `change_key` is the
 -- contact's `changeKey` when the state was learnt: once the stored contact's
 -- moves on, the photo is not current and a client fetches it again.
--- `revision` counts local sets, so a PUT in flight confirms only its own.
+-- `revision` counts local sets, so a PUT in flight confirms only its own;
+-- `sent_revision` is the revision the last PUT read (written just before it),
+-- so a refusal forgets only the photo it refused.
 CREATE TABLE IF NOT EXISTS contact_photos (
     contact_id   TEXT PRIMARY KEY
                  REFERENCES contact_records(id) ON DELETE CASCADE ON UPDATE CASCADE,
@@ -305,7 +307,8 @@ CREATE TABLE IF NOT EXISTS contact_photos (
     etag         TEXT NOT NULL DEFAULT '',
     change_key   TEXT NOT NULL DEFAULT '',
     pending      INTEGER NOT NULL DEFAULT 0,
-    revision     INTEGER NOT NULL DEFAULT 0
+    revision     INTEGER NOT NULL DEFAULT 0,
+    sent_revision INTEGER NOT NULL DEFAULT 0
 );
 
 -- `fetched_as` is the format `FetchBody` asked Graph for (`text`/`html`,

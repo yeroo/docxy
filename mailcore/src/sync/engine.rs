@@ -6157,8 +6157,9 @@ impl Engine {
     /// refused update or delete owes a re-read from Graph
     /// (`Store::owe_contact_reread`, persisted), done now unless another
     /// queued create, update or delete names the contact. A refused photo
-    /// set (#2065) forgets the stored photo unless a later set is queued
-    /// (`Store::revert_contact_photo`), and owes a re-read only on a 404
+    /// set (#2065) forgets the stored photo unless one was set since the
+    /// refused PUT read it (`Store::revert_contact_photo`: its own op sends
+    /// it), and owes a re-read only on a 404
     /// (the contact gone). Before the op is dropped, the contact as the user
     /// left it is read into `attempted` (create, update) and the pending
     /// photo into `attempted_photo` (create, photo set).
@@ -6198,10 +6199,12 @@ impl Engine {
             ContactWrite::SetPhoto => {
                 let _ = self.store.revert_contact_photo(&id);
                 // The contact is gone from Graph: read it again, so its 404
-                // deletes the row now rather than at the next full pass. A
-                // later queued set keeps the row (`revert_folder_contact`'s
-                // photo guard): its own PUT 404s and reports its photo, and
-                // its re-read deletes the contact.
+                // deletes the row now rather than at the next full pass. The
+                // revert above forgot the refused photo, so only a set
+                // written during the PUT (still pending, its op queued)
+                // keeps the row (`revert_folder_contact`'s photo guard): its
+                // own PUT 404s and reports it, and its re-read deletes the
+                // contact.
                 if matches!(err, GraphError::NotFound) {
                     let _ = self.store.owe_contact_reread(&id);
                     self.settle_contact_rereads();
@@ -12393,38 +12396,153 @@ mod tests {
                 id: "C-dave".into(),
             })
             .unwrap();
-        // Each op's refusal (`wait_refused` takes the first's and the
-        // second's `ContactsUpdated`), then the command's own.
-        let mut seen = wait_refused(&handle.evt_rx);
-        seen.extend(wait_for(&handle.evt_rx, |e| {
-            matches!(e, SyncEvent::ContactsUpdated)
-        }));
-        let failure = SyncEvent::ContactWriteFailed {
-            id: "C-dave".into(),
-            write: ContactWrite::SetPhoto,
-            status: Some(404),
-            error: "not found (404)".into(),
-            attempted: None,
-            // The row as the user left it: the later set's photo.
-            attempted_photo: Some(jpeg(b"TWO")),
-        };
+        // One refusal (#2065 r2): the first PUT sent the latest photo, so
+        // its revert forgets it, the re-read's 404 deletes the contact, and
+        // the later op has nothing to send.
+        let seen = wait_refused(&handle.evt_rx);
         let failures: Vec<&SyncEvent> = seen
             .iter()
             .filter(|e| matches!(e, SyncEvent::ContactWriteFailed { .. }))
             .collect();
-        // The first refusal's re-read 404 keeps the row while the later set
-        // is queued (#2065 r1): that set's PUT goes out and is refused too,
-        // and its re-read then deletes the contact.
-        assert_eq!(failures, [&failure, &failure], "{seen:?}");
-        assert_eq!(requests_of(&srv, "GET", "/me/contacts/C-dave").len(), 2);
+        assert_eq!(
+            failures,
+            [&SyncEvent::ContactWriteFailed {
+                id: "C-dave".into(),
+                write: ContactWrite::SetPhoto,
+                status: Some(404),
+                error: "not found (404)".into(),
+                attempted: None,
+                // The row as the user left it: the later set's photo.
+                attempted_photo: Some(jpeg(b"TWO")),
+            }],
+            "{seen:?}"
+        );
+        assert_eq!(requests_of(&srv, "GET", "/me/contacts/C-dave").len(), 1);
         assert!(store.folder_contact("C-dave").unwrap().is_none());
         assert_eq!(store.contact_photo("C-dave").unwrap(), None);
         assert!(!store.is_contact("dave@x.com").unwrap());
         assert!(store.pending_ops().unwrap().is_empty());
         assert_eq!(
             srv.requests().iter().filter(|r| r.method == "PUT").count(),
-            2
+            1
         );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2065 r2: two sets queued and the first PUT, which sent the latest
+    /// photo, refused 403: one upload, one report; the later op sends
+    /// nothing.
+    #[test]
+    fn contact_photo_sets_refused_403_upload_and_report_once() {
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-photo-403-twice",
+            vec![(any_route("PUT", DAVE_PHOTO, 403, DENIED), None)],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        store
+            .set_contact_photo("C-dave", b"ONE", "image/jpeg")
+            .unwrap();
+        store
+            .set_contact_photo("C-dave", b"TWO", "image/jpeg")
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetContactPhoto {
+                id: "C-dave".into(),
+            })
+            .unwrap();
+        let seen = wait_refused(&handle.evt_rx);
+        let failures: Vec<&SyncEvent> = seen
+            .iter()
+            .filter(|e| matches!(e, SyncEvent::ContactWriteFailed { .. }))
+            .collect();
+        assert_eq!(failures.len(), 1, "{seen:?}");
+        assert!(matches!(
+            failures[0],
+            SyncEvent::ContactWriteFailed {
+                write: ContactWrite::SetPhoto,
+                status: Some(403),
+                attempted_photo: Some(p),
+                ..
+            } if p.bytes == b"TWO"
+        ));
+        assert_eq!(
+            srv.requests().iter().filter(|r| r.method == "PUT").count(),
+            1
+        );
+        assert!(store.pending_ops().unwrap().is_empty());
+        assert_eq!(store.contact_photo("C-dave").unwrap(), None);
+        assert!(store.folder_contact("C-dave").unwrap().is_some());
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2065 r2: an update refused 404 whose re-read finds the contact gone
+    /// deletes it at once when the queued photo op behind it has nothing
+    /// left to send (an earlier op sent and Graph took the photo).
+    #[test]
+    fn refused_update_404_deletes_a_contact_whose_photo_was_sent() {
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-photo-sent-then-update-404",
+            vec![
+                (any_route("PUT", DAVE_PHOTO, 200, ""), None),
+                (any_route("PATCH", "/me/contacts/C-dave", 404, "{}"), None),
+                (any_route("GET", "/me/contacts/C-dave", 404, "{}"), None),
+            ],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        // Queue: SetPhoto, UpdateContact, SetPhoto.
+        store
+            .set_contact_photo("C-dave", b"ONE", "image/jpeg")
+            .unwrap();
+        let mut f = store.folder_contact("C-dave").unwrap().unwrap().fields;
+        f.job_title = "Lead".into();
+        let fields = store.update_contact_fields("C-dave", &f).unwrap();
+        store
+            .set_contact_photo("C-dave", b"TWO", "image/jpeg")
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateContact {
+                id: "C-dave".into(),
+                fields,
+            })
+            .unwrap();
+        let seen = wait_refused(&handle.evt_rx);
+        let failures: Vec<&SyncEvent> = seen
+            .iter()
+            .filter(|e| matches!(e, SyncEvent::ContactWriteFailed { .. }))
+            .collect();
+        assert_eq!(failures.len(), 1, "{seen:?}");
+        assert!(matches!(
+            failures[0],
+            SyncEvent::ContactWriteFailed {
+                write: ContactWrite::Update,
+                status: Some(404),
+                ..
+            }
+        ));
+        let puts: Vec<_> = srv
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PUT")
+            .collect();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].body_bytes, b"TWO", "the first op sent the latest");
+        assert_eq!(requests_of(&srv, "GET", "/me/contacts/C-dave").len(), 1);
+        assert!(
+            store.folder_contact("C-dave").unwrap().is_none(),
+            "not lingering"
+        );
+        assert!(!store.is_contact("dave@x.com").unwrap());
+        assert!(store.pending_ops().unwrap().is_empty());
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
