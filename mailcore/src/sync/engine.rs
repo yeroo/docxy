@@ -349,8 +349,9 @@ pub enum SyncCommand {
     /// body is queued as [`crate::store::OutboxOp::SetAutomaticReplies`]
     /// for the next start.
     SetAutomaticReplies { replies: AutomaticReplies },
-    /// Fetch who is signed in (`GraphClient::me`) and emit
-    /// [`SyncEvent::ProfileFetched`]. Direct call, no outbox.
+    /// Fetch who is signed in (`GraphClient::me`) and their organisation's
+    /// name (`GraphClient::organization_name`, best-effort, #1997), and emit
+    /// one [`SyncEvent::ProfileFetched`]. Direct call, no outbox.
     FetchProfile,
     /// Fetch the signed-in user's photo (`GraphClient::my_photo`) and emit
     /// [`SyncEvent::PhotoFetched`] (`None` when the user has none). Direct
@@ -969,7 +970,8 @@ pub enum SyncEvent {
     /// [`SyncCommand::SetAutomaticReplies`]); the UI closes its OOF form.
     AutomaticRepliesUpdated,
     /// Who is signed in (from [`SyncCommand::FetchProfile`]); the UI shows
-    /// `me.display_name` and `me.address()`.
+    /// `me.display_name`, `me.address()` and, when not `""`,
+    /// `me.organization` or `me.company_name` (#1997).
     ProfileFetched { me: Me },
     /// The signed-in user's photo as `(bytes, content type)`, or `None` when
     /// the user has none (from [`SyncCommand::FetchPhoto`]); the UI then
@@ -8522,15 +8524,29 @@ impl Engine {
         }
     }
 
-    /// Fetch the signed-in user's profile and emit `ProfileFetched`; a Graph
+    /// Fetch the signed-in user's profile and emit `ProfileFetched`; a `/me`
     /// failure goes through `react`. Same signed-in guard as `fetch_body`.
+    /// After `/me` answered, the organisation's name is asked best-effort
+    /// (#1997): any failure leaves `me.organization` `""` and the profile is
+    /// still emitted.
     fn fetch_profile(&mut self) {
         if self.token.is_none() {
             self.emit(SyncEvent::Error("not signed in".to_string()));
             return;
         }
         match self.with_auth(|c| c.me()) {
-            Ok(me) => self.emit(SyncEvent::ProfileFetched { me }),
+            Ok(mut me) => {
+                // Outside `with_auth`, on the token `/me` just used: a 401
+                // here refreshes nothing and signs nobody out, and no error
+                // reaches `react` (no `Error`, back-off or Offline).
+                me.organization = self
+                    .client()
+                    .organization_name()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                self.emit(SyncEvent::ProfileFetched { me });
+            }
             Err(e) => {
                 self.react(e);
             }
@@ -13003,21 +13019,162 @@ mod tests {
     fn fetch_profile_emits_profile_fetched() {
         let (srv, handle, dir) = spawn_signed_in(
             "fetch-profile",
-            vec![get_route(
-                "/me?$select",
-                200,
-                r#"{"displayName":"Ada Lovelace","mail":null,"userPrincipalName":"ada@outlook.com"}"#,
-            )],
+            vec![
+                get_route(
+                    "/me?$select",
+                    200,
+                    r#"{"displayName":"Ada Lovelace","mail":null,"userPrincipalName":"ada@outlook.com","companyName":"Contoso Ltd"}"#,
+                ),
+                get_route(
+                    ORGANIZATION,
+                    200,
+                    r#"{"value":[{"displayName":"Contoso"}]}"#,
+                ),
+            ],
         );
         handle.cmd_tx.send(SyncCommand::FetchProfile).unwrap();
-        wait_for(&handle.evt_rx, |e| {
-            matches!(e, SyncEvent::ProfileFetched { me }
-                if me.display_name == "Ada Lovelace" && me.address() == "ada@outlook.com")
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::ProfileFetched { .. })
         });
+        let profiles: Vec<&Me> = seen
+            .iter()
+            .filter_map(|e| match e {
+                SyncEvent::ProfileFetched { me } => Some(me),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(profiles.len(), 1, "{seen:?}");
+        let me = profiles[0];
+        assert_eq!(me.display_name, "Ada Lovelace");
+        assert_eq!(me.address(), "ada@outlook.com");
+        assert_eq!(me.company_name, "Contoso Ltd");
+        assert_eq!(me.organization, "Contoso");
+        let paths: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
         assert!(
-            srv.requests()
+            paths
                 .iter()
-                .any(|r| r.path == "/me?$select=displayName,mail,userPrincipalName")
+                .any(|p| p == "/me?$select=displayName,mail,userPrincipalName,companyName"),
+            "{paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|p| p == "/organization?$select=displayName"),
+            "{paths:?}"
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `/organization` route's prefix: never a bare `/organization`,
+    /// which would also catch the token endpoint
+    /// `/organizations/oauth2/v2.0/token` on the same fake server.
+    const ORGANIZATION: &str = "/organization?$select";
+
+    fn token_request_count(srv: &FakeServer) -> usize {
+        srv.requests()
+            .iter()
+            .filter(|r| r.path.starts_with("/organizations/oauth2/v2.0/token"))
+            .count()
+    }
+
+    /// #1997: whatever `/organization` answers (a 403 for a guest or a
+    /// personal account, a 500, a 401, a 429, a dropped connection, or an
+    /// empty `value`), the profile is still emitted with the organisation
+    /// blank, and nothing goes through `react`: no `Error`, no sign-in, no
+    /// Offline, no token refresh. A second `FetchProfile` still answers.
+    #[test]
+    fn fetch_profile_keeps_profile_when_organization_fails() {
+        for (status, body) in [
+            (403, r#"{"error":{"code":"Authorization_RequestDenied"}}"#),
+            (500, "{}"),
+            (401, "{}"),
+            (429, "{}"),
+            (0, ""),
+            (200, r#"{"value":[]}"#),
+        ] {
+            let (srv, handle, dir) = spawn_signed_in(
+                &format!("fetch-profile-org-{status}"),
+                vec![
+                    get_route(
+                        "/me?$select",
+                        200,
+                        r#"{"displayName":"Ada Lovelace","mail":"ada@contoso.com","userPrincipalName":"ada@contoso.com","companyName":"Contoso Ltd"}"#,
+                    ),
+                    get_route(ORGANIZATION, status, body),
+                ],
+            );
+            let tokens_before = token_request_count(&srv);
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                handle.cmd_tx.send(SyncCommand::FetchProfile).unwrap();
+                let got = wait_for(&handle.evt_rx, |e| {
+                    matches!(e, SyncEvent::ProfileFetched { .. })
+                });
+                let Some(SyncEvent::ProfileFetched { me }) = got.last() else {
+                    unreachable!()
+                };
+                assert_eq!(me.organization, "", "{status}");
+                assert_eq!(me.display_name, "Ada Lovelace", "{status}");
+                assert_eq!(me.address(), "ada@contoso.com", "{status}");
+                assert_eq!(me.company_name, "Contoso Ltd", "{status}");
+                seen.extend(got);
+            }
+            assert!(
+                !seen.iter().any(|e| matches!(
+                    e,
+                    SyncEvent::Error(_)
+                        | SyncEvent::SignInRequired { .. }
+                        | SyncEvent::State(SyncState::Offline | SyncState::SignInRequired)
+                )),
+                "{status}: {seen:?}"
+            );
+            assert_eq!(token_request_count(&srv), tokens_before, "{status}");
+            assert_eq!(
+                srv.requests()
+                    .iter()
+                    .filter(|r| r.path.starts_with(ORGANIZATION))
+                    .count(),
+                2,
+                "{status}: {:?}",
+                srv.requests()
+            );
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// #1997: a failing `/me` goes through `react` as before (a 500 is an
+    /// `Error`), emits no profile, and asks no `/organization`.
+    #[test]
+    fn fetch_profile_me_failure_skips_organization() {
+        let (srv, handle, dir) = spawn_signed_in(
+            "fetch-profile-me-500",
+            vec![
+                get_route("/me?$select", 500, "{}"),
+                get_route(
+                    ORGANIZATION,
+                    200,
+                    r#"{"value":[{"displayName":"Contoso"}]}"#,
+                ),
+            ],
+        );
+        handle.cmd_tx.send(SyncCommand::FetchProfile).unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::Error(_)));
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::ProfileFetched { .. })),
+            "{seen:?}"
+        );
+        let paths: Vec<String> = srv.requests().into_iter().map(|r| r.path).collect();
+        assert!(
+            paths.iter().any(|p| p.starts_with("/me?$select")),
+            "{paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with(ORGANIZATION)),
+            "{paths:?}"
         );
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

@@ -2269,16 +2269,34 @@ impl GraphClient {
         Ok(())
     }
 
-    /// GET `/me?$select=displayName,mail,userPrincipalName`: who is signed in.
-    /// Needs only `User.Read`.
+    /// GET `/me?$select=displayName,mail,userPrincipalName,companyName`: who
+    /// is signed in, and their company (#1997). Needs only `User.Read`.
+    /// `Me::organization` is `""`: it comes from [`Self::organization_name`].
     pub fn me(&self) -> Result<Me, GraphError> {
         let resp = self.send(
             Method::Get,
-            "/me?$select=displayName,mail,userPrincipalName",
+            "/me?$select=displayName,mail,userPrincipalName,companyName",
             None,
             &[],
         )?;
         Ok(Me::from_json(&parse_body(resp)?))
+    }
+
+    /// GET `/organization?$select=displayName`: the signed-in user's tenant's
+    /// name, trimmed (#1997). `User.Read` may read `displayName`; a guest or
+    /// a personal account gets a 403. `Ok(None)` for an empty `value`, or a
+    /// first item whose `displayName` is null, missing or blank. A body with
+    /// no `value` array is a `Parse` error.
+    pub fn organization_name(&self) -> Result<Option<String>, GraphError> {
+        let resp = self.send(Method::Get, "/organization?$select=displayName", None, &[])?;
+        let v = parse_body(resp)?;
+        let name = value_array(&v, "value")?
+            .first()
+            .and_then(|o| o.get("displayName"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        Ok((!name.is_empty()).then(|| name.to_string()))
     }
 
     /// The signed-in user's photo as `(bytes, content type)`: GET
@@ -6091,7 +6109,7 @@ mod tests {
         let srv = FakeServer::start(vec![photo_route(
             "/me?$select",
             200,
-            r#"{"displayName":"Ada Lovelace","mail":"ada@contoso.com","userPrincipalName":"ada@contoso.onmicrosoft.com"}"#,
+            r#"{"displayName":"Ada Lovelace","mail":"ada@contoso.com","userPrincipalName":"ada@contoso.onmicrosoft.com","companyName":"Contoso Ltd"}"#,
             &[],
         )]);
         let c = GraphClient::new(&srv.base_url, "AT");
@@ -6099,12 +6117,65 @@ mod tests {
         assert_eq!(me.display_name, "Ada Lovelace");
         assert_eq!(me.address(), "ada@contoso.com");
         assert_eq!(me.user_principal_name, "ada@contoso.onmicrosoft.com");
+        assert_eq!(me.company_name, "Contoso Ltd");
+        assert_eq!(me.organization, "");
         let reqs = srv.requests();
         assert_eq!(reqs.len(), 1);
         assert_eq!(
             reqs[0].path,
-            "/me?$select=displayName,mail,userPrincipalName"
+            "/me?$select=displayName,mail,userPrincipalName,companyName"
         );
+    }
+
+    const ORGANIZATION: &str = "/organization?$select";
+
+    #[test]
+    fn organization_name_reads_display_name() {
+        let srv = FakeServer::start(vec![photo_route(
+            ORGANIZATION,
+            200,
+            r#"{"value":[{"displayName":"  Contoso  "}]}"#,
+            &[],
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.organization_name().unwrap().as_deref(), Some("Contoso"));
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].path, "/organization?$select=displayName");
+    }
+
+    #[test]
+    fn organization_name_blank_is_none() {
+        for body in [
+            r#"{"value":[]}"#,
+            r#"{"value":[{"displayName":null}]}"#,
+            r#"{"value":[{}]}"#,
+            r#"{"value":[{"displayName":"  "}]}"#,
+        ] {
+            let srv = FakeServer::start(vec![photo_route(ORGANIZATION, 200, body, &[])]);
+            let c = GraphClient::new(&srv.base_url, "AT");
+            assert_eq!(c.organization_name().unwrap(), None, "{body}");
+        }
+    }
+
+    #[test]
+    fn organization_name_without_value_is_parse_error() {
+        let srv = FakeServer::start(vec![photo_route(ORGANIZATION, 200, "{}", &[])]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        match c.organization_name() {
+            Err(GraphError::Parse(_)) => {}
+            other => panic!("expected a Parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn organization_name_forbidden_is_err() {
+        let srv = FakeServer::start(vec![photo_route(ORGANIZATION, 403, "{}", &[])]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        match c.organization_name() {
+            Err(GraphError::Http { status: 403, .. }) => {}
+            other => panic!("expected a 403, got {other:?}"),
+        }
     }
 
     #[test]
