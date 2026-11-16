@@ -200,7 +200,20 @@ test issue 2204 ShowBackstagePage from the extension's view opens File on that p
   call ext-page-read {"page":"fx.account"}
   assert reply.renders is 0
   assert reply.bounds is null
+  # The action took the focus off the view File hides: with no click, a
+  # second dispatch comes from the suite and lands.
+  call ext-show-page {"id":"fx.account"}
+  assert reply.from is suite
+  shot window
+  call backstage {"action":"read"}
+  assert reply.ext_page is fx.account
+  call ext-page-read {"page":"fx.account"}
+  assert reply.renders is not 0
+  # File closed, the view has the focus back.
   call backstage {"action":"close"}
+  shot window
+  call ext-doc-read {}
+  assert reply.focused is true
   call real-key {"key":"ctrl+w"}
   call tab-list {}
   assert reply.count is 1
@@ -247,8 +260,9 @@ test issue 2204 File already up switches to the page, and a page's own button to
   shot window
   call backstage {"action":"open"}
   shot window
-  # The harness's open moved no focus: it is still in the view File hides,
-  # where gpui would drop the action, so the verb refuses.
+  # The harness's own open, unlike the actions, moves no focus: it is
+  # still in the view File hides, where gpui would drop the action, so the
+  # verb refuses.
   call-error ext-show-page {"id":"fx.account"} => File is up but the focus is still in the test extension's view, which File hides: click in File first
   # A real click in File, as a person's, moves the focus off the hidden
   # view to the suite; then the suite's Account page.

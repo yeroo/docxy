@@ -17825,6 +17825,23 @@ impl Docxy {
         }
     }
 
+    /// After File opened from an extension's action (`ext::ShowBackstage`,
+    /// `ext::ShowBackstagePage`; #2204): the suite root takes the focus, as
+    /// a click in File gives it. Else the focus stays in the view File hides,
+    /// and gpui sends a key or an action dispatched from a focus it did not
+    /// draw to the window's root node, above the suite's listeners: dropped.
+    /// What had it (the view, or a field of the extension's beside it) gets
+    /// it back when File closes (`focus_ext_surface`, `ext_focus_back`).
+    fn focus_suite_for_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.backstage || self.focus.is_focused(window) {
+            return;
+        }
+        if let (Some(view), Some(had)) = (self.active_ext_view(), window.focused(cx)) {
+            self.ext_focus_back = Some((view, had));
+        }
+        window.focus(&self.focus, cx);
+    }
+
     /// The active tab's extension view, by entity, when it is an extension's.
     fn active_ext_view(&self) -> Option<EntityId> {
         match self.tabs.get(self.active).map(|t| &t.surface) {
@@ -46138,15 +46155,15 @@ impl KeyRouting for Div {
         .size_full();
         self.child(input)
             .on_key_down(cx.listener(Docxy::route_key))
-            .on_action(cx.listener(|this, _: &ext::ShowBackstage, _window, cx| {
+            .on_action(cx.listener(|this, _: &ext::ShowBackstage, window, cx| {
                 this.open_backstage(cx);
+                this.focus_suite_for_file(window, cx);
             }))
             // File straight on one of an extension tab's own pages (#2204).
-            .on_action(
-                cx.listener(|this, a: &ext::ShowBackstagePage, _window, cx| {
-                    this.show_ext_backstage_page(a.id.clone(), cx);
-                }),
-            )
+            .on_action(cx.listener(|this, a: &ext::ShowBackstagePage, window, cx| {
+                this.show_ext_backstage_page(a.id.clone(), cx);
+                this.focus_suite_for_file(window, cx);
+            }))
             // An extension's view, File page or ribbon command closes its tab
             // (#1923); the root takes it whatever had the focus.
             .on_action(cx.listener(|this, _: &ext::CloseTab, window, cx| {

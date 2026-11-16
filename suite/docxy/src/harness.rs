@@ -5975,9 +5975,10 @@ fn dispatch_verb(
         // focused element. On the test extension's tab with File down that
         // must be inside its view; with File up it must not be, since File
         // hides the view and gpui sends an action from a focus it did not
-        // draw to the window's root, above the suite's listener (a real
-        // click in File focuses the suite). Either is refused. On any other
-        // tab it is whatever has the focus. `from` is `view` or `suite`.
+        // draw to the window's root, above the suite's listener. Either is
+        // refused. Only the harness's own `backstage open` leaves that
+        // state: the actions and a click in File focus the suite. On any
+        // other tab it is whatever has the focus. `from` is `view` or `suite`.
         // gpui runs it after this reply: the case draws a frame (`shot
         // window`) before reading File.
         "ext-show-page" => {
