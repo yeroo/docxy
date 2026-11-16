@@ -862,6 +862,49 @@ pub enum TypeTier {
 const FOLDER_SIZE_EXPAND: &str =
     "singleValueExtendedProperties($filter=id%20eq%20%27Long%200x0E08%27)";
 
+/// The `$expand` [`GraphClient::meeting_message`] sends first (#2024):
+/// the event's id and `isOrganizer` alone.
+const MEETING_MESSAGE_SELECTED: &str =
+    "$expand=microsoft.graph.eventMessage/event($select=id,isOrganizer)";
+
+/// [`GraphClient::meeting_message`]'s second try after a 400 (#2208):
+/// Graph's documented form ("Get eventMessage", example 2), the whole
+/// event with no inner `$select`.
+const MEETING_MESSAGE_DOCUMENTED: &str = "$expand=microsoft.graph.eventMessage/event";
+
+/// [`GraphClient::meeting_message`]'s last try (#2208): a plain GET, no
+/// query, whose answer carries the message's `meetingMessageType` and no
+/// `event`.
+const MEETING_MESSAGE_PLAIN: &str = "";
+
+/// The request forms [`GraphClient::meeting_message`] sends (#2208).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeetingMessageForm {
+    /// [`MEETING_MESSAGE_SELECTED`].
+    Selected,
+    /// [`MEETING_MESSAGE_DOCUMENTED`].
+    Documented,
+    /// [`MEETING_MESSAGE_PLAIN`].
+    Plain,
+}
+
+impl MeetingMessageForm {
+    /// `/me/messages/{id}`, with this form's query when it has one.
+    fn path(self, message_id: &str) -> String {
+        let id = encode_path_segment(message_id);
+        let query = match self {
+            MeetingMessageForm::Selected => MEETING_MESSAGE_SELECTED,
+            MeetingMessageForm::Documented => MEETING_MESSAGE_DOCUMENTED,
+            MeetingMessageForm::Plain => MEETING_MESSAGE_PLAIN,
+        };
+        if query.is_empty() {
+            format!("/me/messages/{id}")
+        } else {
+            format!("/me/messages/{id}?{query}")
+        }
+    }
+}
+
 /// One sub-request of a [`GraphClient::batch`] (#1913). `url` is relative
 /// to the API version (`/me/messages/{id}`); `body` is its JSON body.
 #[derive(Debug, Clone, PartialEq)]
@@ -2342,14 +2385,42 @@ impl GraphClient {
     /// in `meeting_event_id`: `meetingMessageType` is a derived-type
     /// property, which a plain GET returns. `RespondMeeting` keeps
     /// `meeting_event_id`'s narrower `eventMessageRequest` cast.
+    ///
+    /// When the expand fails (#2208), the message may still be there:
+    /// - a 404 (Graph's answer, by community reports and not documented,
+    ///   when the event the message points at is gone: `ErrorItemNotFound`
+    ///   for the whole request) is followed by a plain `GET
+    ///   /me/messages/{id}` ([`MEETING_MESSAGE_PLAIN`]): its answer is the
+    ///   message's type with `event_id: None` ("the event is gone"), and
+    ///   its own 404 is `NotFound` (the message is gone);
+    /// - a 400 (perhaps Graph refusing the inner `$select`; not observed)
+    ///   is followed by Graph's documented form,
+    ///   `$expand=microsoft.graph.eventMessage/event`
+    ///   ([`MEETING_MESSAGE_DOCUMENTED`]), read the same way, so an event
+    ///   that still exists is still found; that one's 400 or 404 is
+    ///   followed by the plain GET.
+    ///
+    /// Any other failure (auth, throttle, transport, another status, a
+    /// body that does not parse) is returned as is, with no fallback. A
+    /// 2xx expand is the only request.
     pub fn meeting_message(&self, message_id: &str) -> Result<MeetingMessage, GraphError> {
-        let id = encode_path_segment(message_id);
-        let path = format!(
-            "/me/messages/{id}?$expand=microsoft.graph.eventMessage/event($select=id,isOrganizer)"
-        );
-        let resp = self.send(Method::Get, &path, None, &[])?;
-        let v = parse_body(resp)?;
-        Ok(MeetingMessage::from_json(&v))
+        let get = |form: MeetingMessageForm| -> Result<MeetingMessage, GraphError> {
+            let resp = self.send(Method::Get, &form.path(message_id), None, &[])?;
+            Ok(MeetingMessage::from_json(&parse_body(resp)?))
+        };
+        let fallback = match get(MeetingMessageForm::Selected) {
+            Err(GraphError::NotFound) => MeetingMessageForm::Plain,
+            Err(GraphError::Http { status: 400, .. }) => {
+                match get(MeetingMessageForm::Documented) {
+                    Err(GraphError::NotFound | GraphError::Http { status: 400, .. }) => {
+                        MeetingMessageForm::Plain
+                    }
+                    other => return other,
+                }
+            }
+            other => return other,
+        };
+        get(fallback)
     }
 
     /// GET `/me/outlook/masterCategories` — the mailbox's master category list.
@@ -8221,6 +8292,7 @@ mod tests {
         assert_eq!(m.message_type, Some(MeetingMessageType::Accepted));
         assert_eq!(m.event_id.as_deref(), Some("E3"));
         assert!(m.is_organizer);
+        assert_eq!(srv.requests().len(), 1);
     }
 
     #[test]
@@ -8237,6 +8309,7 @@ mod tests {
         assert_eq!(m.message_type, None);
         assert_eq!(m.event_id, None);
         assert!(!m.is_organizer);
+        assert_eq!(srv.requests().len(), 1);
     }
 
     #[test]
@@ -8254,20 +8327,174 @@ mod tests {
         assert_eq!(srv.requests().len(), 1);
     }
 
+    // --- A meeting message whose event is gone (#2208) --------------------
+
+    /// The expand with its inner `$select`, as a route prefix: the
+    /// documented form is a prefix of it, so a route for that form goes
+    /// after this one.
+    const SELECTED_PREFIX: &str = "/me/messages/M1?$expand=microsoft.graph.eventMessage/event(";
+    const DOCUMENTED_PATH: &str = "/me/messages/M1?$expand=microsoft.graph.eventMessage/event";
+    const SELECTED_PATH: &str =
+        "/me/messages/M1?$expand=microsoft.graph.eventMessage/event($select=id,isOrganizer)";
+    const CANCELLATION: &str = r##"{"id":"M1","@odata.type":"#microsoft.graph.eventMessage",
+        "meetingMessageType":"meetingCancelled","subject":"Canceled: Sync"}"##;
+    const ITEM_NOT_FOUND: &str = r#"{"error":{"code":"ErrorItemNotFound","message":"The specified object was not found in the store."}}"#;
+    const BAD_REQUEST: &str = r#"{"error":{"code":"BadRequest","message":"Invalid expand."}}"#;
+
+    /// The paths of the requests `srv` received, each a GET.
+    fn get_paths(srv: &FakeServer) -> Vec<String> {
+        srv.requests()
+            .into_iter()
+            .map(|r| {
+                assert_eq!(r.method, "GET");
+                r.path
+            })
+            .collect()
+    }
+
+    fn event_gone() -> MeetingMessage {
+        MeetingMessage {
+            message_type: Some(MeetingMessageType::Cancelled),
+            event_id: None,
+            is_organizer: false,
+        }
+    }
+
     #[test]
-    fn meeting_message_missing_is_not_found() {
-        let srv = FakeServer::start(vec![Route {
-            method: "GET".into(),
-            path_prefix: "/me/messages/GONE".into(),
-            status: 404,
-            headers: vec![],
-            body: r#"{"error":{"code":"ErrorItemNotFound"}}"#.into(),
-        }]);
+    fn meeting_message_falls_back_to_a_plain_get_on_404() {
+        let srv = FakeServer::start(vec![
+            get_route("/me/messages/AAMk%2Fid%2Bx%3D?", 404, ITEM_NOT_FOUND),
+            get_route("/me/messages/AAMk%2Fid%2Bx%3D", 200, CANCELLATION),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.meeting_message("AAMk/id+x=").unwrap(), event_gone());
+        assert_eq!(
+            get_paths(&srv),
+            [
+                "/me/messages/AAMk%2Fid%2Bx%3D?$expand=microsoft.graph.eventMessage/event($select=id,isOrganizer)",
+                "/me/messages/AAMk%2Fid%2Bx%3D",
+            ]
+        );
+    }
+
+    #[test]
+    fn meeting_message_retries_the_documented_expand_on_400() {
+        let srv = FakeServer::start(vec![
+            get_route(SELECTED_PREFIX, 400, BAD_REQUEST),
+            get_route(
+                DOCUMENTED_PATH,
+                200,
+                r#"{"id":"M1","meetingMessageType":"meetingCancelled",
+                    "event":{"id":"E9","isOrganizer":true,"subject":"Sync"}}"#,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.meeting_message("M1").unwrap(),
+            MeetingMessage {
+                message_type: Some(MeetingMessageType::Cancelled),
+                event_id: Some("E9".into()),
+                is_organizer: true,
+            }
+        );
+        assert_eq!(get_paths(&srv), [SELECTED_PATH, DOCUMENTED_PATH]);
+    }
+
+    #[test]
+    fn meeting_message_falls_back_to_plain_after_two_refused_expands() {
+        let srv = FakeServer::start(vec![
+            get_route(SELECTED_PREFIX, 400, BAD_REQUEST),
+            get_route(DOCUMENTED_PATH, 400, BAD_REQUEST),
+            get_route("/me/messages/M1", 200, CANCELLATION),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.meeting_message("M1").unwrap(), event_gone());
+        assert_eq!(
+            get_paths(&srv),
+            [SELECTED_PATH, DOCUMENTED_PATH, "/me/messages/M1"]
+        );
+    }
+
+    #[test]
+    fn meeting_message_falls_back_to_plain_when_the_documented_expand_404s() {
+        let srv = FakeServer::start(vec![
+            get_route(SELECTED_PREFIX, 400, BAD_REQUEST),
+            get_route(DOCUMENTED_PATH, 404, ITEM_NOT_FOUND),
+            get_route("/me/messages/M1", 200, CANCELLATION),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.meeting_message("M1").unwrap(), event_gone());
+        assert_eq!(
+            get_paths(&srv),
+            [SELECTED_PATH, DOCUMENTED_PATH, "/me/messages/M1"]
+        );
+    }
+
+    #[test]
+    fn meeting_message_of_a_gone_message_is_not_found() {
+        let srv = FakeServer::start(vec![get_route("/me/messages/M1", 404, ITEM_NOT_FOUND)]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(c.meeting_message("M1"), Err(GraphError::NotFound)));
+        assert_eq!(get_paths(&srv), [SELECTED_PATH, "/me/messages/M1"]);
+    }
+
+    #[test]
+    fn meeting_message_documented_expand_failing_otherwise_is_returned() {
+        // Only a 400 or 404 of the documented form goes on to the plain
+        // GET; a throttle is returned as is.
+        let srv = FakeServer::start(vec![
+            get_route(SELECTED_PREFIX, 400, BAD_REQUEST),
+            get_route(DOCUMENTED_PATH, 429, ""),
+            get_route("/me/messages/M1", 200, CANCELLATION),
+        ]);
         let c = GraphClient::new(&srv.base_url, "AT");
         assert!(matches!(
-            c.meeting_message("GONE"),
-            Err(GraphError::NotFound)
+            c.meeting_message("M1"),
+            Err(GraphError::Throttled { .. })
         ));
+        assert_eq!(get_paths(&srv), [SELECTED_PATH, DOCUMENTED_PATH]);
+    }
+
+    #[test]
+    fn meeting_message_does_not_fall_back_on_other_failures() {
+        for (status, body) in [(401, ""), (403, "{}"), (429, ""), (500, "{}"), (503, "")] {
+            let srv = FakeServer::start(vec![
+                get_route(SELECTED_PREFIX, status, body),
+                get_route("/me/messages/M1", 200, CANCELLATION),
+            ]);
+            let c = GraphClient::new(&srv.base_url, "AT");
+            let got = c.meeting_message("M1");
+            let expected = match status {
+                401 => matches!(got, Err(GraphError::Unauthorized)),
+                429 | 503 => matches!(got, Err(GraphError::Throttled { .. })),
+                s => matches!(got, Err(GraphError::Http { status, .. }) if status == s),
+            };
+            assert!(expected, "{status}: {got:?}");
+            assert_eq!(get_paths(&srv), [SELECTED_PATH], "{status}");
+        }
+        // A 2xx expand whose body is not JSON is a parse error, not a
+        // reason to ask again.
+        let srv = FakeServer::start(vec![
+            get_route(SELECTED_PREFIX, 200, "not json"),
+            get_route("/me/messages/M1", 200, CANCELLATION),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(c.meeting_message("M1"), Err(GraphError::Parse(_))));
+        assert_eq!(get_paths(&srv), [SELECTED_PATH]);
+    }
+
+    #[test]
+    fn meeting_message_does_not_fall_back_on_a_transport_failure() {
+        let srv = FakeServer::start(vec![
+            get_route(SELECTED_PREFIX, 0, ""),
+            get_route("/me/messages/M1", 200, CANCELLATION),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.meeting_message("M1"),
+            Err(GraphError::Transport(_))
+        ));
+        assert_eq!(get_paths(&srv), [SELECTED_PATH]);
     }
 
     #[test]

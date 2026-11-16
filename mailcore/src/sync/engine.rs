@@ -330,8 +330,12 @@ pub enum SyncCommand {
     /// the event it refers to and whether the user organizes that event,
     /// for the reader's meeting banner. Emits
     /// [`SyncEvent::MeetingMessageFetched`]; a plain message is an all-`None`
-    /// [`MeetingMessage`], not an error. Signed out it is a
-    /// [`SyncEvent::Error`]; a failed GET goes through `react`. Direct call.
+    /// [`MeetingMessage`], not an error, and so is a meeting message whose
+    /// event is gone (#2208: `event_id: None`, read with a plain GET when
+    /// Graph refuses the expand). Every failure, signed out included, is
+    /// [`SyncEvent::MeetingMessageFailed`], never a `SyncEvent::Error`; an
+    /// auth, throttle or transport failure also gets `react`'s sign-in,
+    /// back-off or offline (#2208). Direct call.
     /// A type in the answer is also written to the stored row (#2081,
     /// `Store::set_meeting_message_type`, through `current_id`), with a
     /// `MessagesUpdated` for its folder first when that changed it; a store
@@ -345,9 +349,12 @@ pub enum SyncCommand {
     /// `meetingCancelled`, or whose event the user organizes (the
     /// organizer's delete would send cancellations), is a
     /// [`SyncEvent::Error`] and nothing else happens; so is a signed-out
-    /// remove, and a failed GET goes through `react`. A cancellation whose
-    /// event is gone (removed already, here or elsewhere) sends nothing and
-    /// emits [`SyncEvent::RemovedFromCalendar`] with no `event_id`.
+    /// remove, and so is a failed GET (#2208: `"remove from calendar {id}:
+    /// {error}"`, plus `react`'s sign-in, back-off or offline for an auth,
+    /// throttle or transport failure). A cancellation whose event is gone
+    /// (removed already, here or elsewhere, or a message Graph will not
+    /// expand an event for, #2208) sends nothing and emits
+    /// [`SyncEvent::RemovedFromCalendar`] with no `event_id`.
     /// Otherwise the engine queues [`crate::store::OutboxOp::DeleteEvent`]
     /// on the event **first**, as `CancelEvent` does, then deletes the row
     /// locally (`Store::delete_event_series`: the event, or a cancelled
@@ -1040,6 +1047,12 @@ pub enum SyncEvent {
         message_id: String,
         meeting: MeetingMessage,
     },
+    /// [`SyncCommand::FetchMeetingMessage`] could not read `message_id`
+    /// (#2208): signed out, the message gone, throttled, offline, a refused
+    /// token or another failure. Not a sync error, as
+    /// [`SyncEvent::MessageFetchFailed`]: a client stops waiting for the
+    /// banner's facts. `reason` is one line.
+    MeetingMessageFailed { message_id: String, reason: String },
     /// A cancelled meeting was removed from the calendar (from
     /// [`SyncCommand::RemoveFromCalendar`], #2024). `event_id` is the
     /// removed event's, whose `DELETE` is queued; `None` when the event was
@@ -8727,10 +8740,14 @@ impl Engine {
         }
     }
 
-    /// [`SyncCommand::FetchMeetingMessage`] (#2024).
+    /// [`SyncCommand::FetchMeetingMessage`] (#2024). Every failure is
+    /// `MeetingMessageFailed` (#2208).
     fn fetch_meeting_message(&mut self, message_id: String) {
         if self.token.is_none() {
-            self.emit(SyncEvent::Error("not signed in".to_string()));
+            self.emit(SyncEvent::MeetingMessageFailed {
+                message_id,
+                reason: "not signed in".to_string(),
+            });
             return;
         }
         match self.with_auth(|c| c.meeting_message(&message_id)) {
@@ -8753,7 +8770,9 @@ impl Engine {
                 });
             }
             Err(e) => {
-                self.react(e);
+                let reason = e.to_string();
+                self.react_quietly(e);
+                self.emit(SyncEvent::MeetingMessageFailed { message_id, reason });
             }
         }
     }
@@ -8778,10 +8797,16 @@ impl Engine {
             }
             return;
         }
+        // A failed GET names the message (#2208), as the refusals below
+        // do, so a client can stop waiting.
         let meeting = match self.with_auth(|c| c.meeting_message(&message_id)) {
             Ok(m) => m,
             Err(e) => {
-                self.react(e);
+                let reason = e.to_string();
+                self.react_quietly(e);
+                self.emit(SyncEvent::Error(format!(
+                    "remove from calendar {message_id}: {reason}"
+                )));
                 return;
             }
         };
@@ -20941,25 +20966,309 @@ mod tests {
         wait_for(&handle.evt_rx, |e| {
             matches!(e, SyncEvent::SignInRequired { .. })
         });
-        for cmd in [
-            SyncCommand::FetchMeetingMessage {
+        // The fetch answers its own failure (#2208); the remove keeps the
+        // refusals' `Error`.
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchMeetingMessage {
                 message_id: "M1".into(),
-            },
-            SyncCommand::RemoveFromCalendar {
+            })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(
+                e,
+                SyncEvent::MeetingMessageFailed { .. } | SyncEvent::Error(_)
+            )
+        });
+        assert_eq!(
+            seen.last(),
+            Some(&SyncEvent::MeetingMessageFailed {
                 message_id: "M1".into(),
-            },
-        ] {
-            handle.cmd_tx.send(cmd).unwrap();
-            wait_for(
-                &handle.evt_rx,
-                |e| matches!(e, SyncEvent::Error(m) if m == "not signed in"),
-            );
-        }
+                reason: "not signed in".into(),
+            })
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::RemoveFromCalendar {
+                message_id: "M1".into(),
+            })
+            .unwrap();
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m == "not signed in"),
+        );
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         assert!(srv.requests().is_empty(), "{:?}", srv.requests());
         let store = Store::open(&dir.join("mail.db")).unwrap();
         assert!(store.pending_ops().unwrap().is_empty(), "nothing queued");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- A meeting message whose event is gone, and its failures (#2208) -
+
+    const M1_ITEM_NOT_FOUND: &str = r#"{"error":{"code":"ErrorItemNotFound","message":"The specified object was not found in the store."}}"#;
+    const M1_CANCELLED: &str =
+        r#"{"id":"M1","meetingMessageType":"meetingCancelled","subject":"Canceled: Sync"}"#;
+    const M1_SELECTED: &str =
+        "/me/messages/M1?$expand=microsoft.graph.eventMessage/event($select=id,isOrganizer)";
+    const M1_DOCUMENTED: &str = "/me/messages/M1?$expand=microsoft.graph.eventMessage/event";
+
+    /// M1's GETs when the event its cancellation points at is gone, as the
+    /// test server models Graph's answer (#2208: a 404 `ErrorItemNotFound`
+    /// by community reports, not documented; a 400 only suspected): every
+    /// expand answers `expand_status`, the plain GET the cancellation.
+    fn event_gone_routes(expand_status: u16) -> Vec<Route> {
+        let refusal = if expand_status == 404 {
+            M1_ITEM_NOT_FOUND
+        } else {
+            r#"{"error":{"code":"BadRequest","message":"Invalid expand."}}"#
+        };
+        vec![
+            get_route("/me/messages/M1?", expand_status, refusal),
+            get_route("/me/messages/M1", 200, M1_CANCELLED),
+        ]
+    }
+
+    /// The GETs `event_gone_routes(expand_status)` answers, in order.
+    fn event_gone_gets(expand_status: u16) -> Vec<&'static str> {
+        if expand_status == 404 {
+            vec![M1_SELECTED, "/me/messages/M1"]
+        } else {
+            vec![M1_SELECTED, M1_DOCUMENTED, "/me/messages/M1"]
+        }
+    }
+
+    /// The paths of the requests for M1, in order.
+    fn m1_requests(srv: &FakeServer) -> Vec<String> {
+        srv.requests()
+            .into_iter()
+            .filter(|r| r.path.starts_with("/me/messages/M1"))
+            .map(|r| r.path)
+            .collect()
+    }
+
+    /// The meeting a cancellation whose event is gone reads as.
+    fn cancelled_without_event() -> MeetingMessage {
+        MeetingMessage {
+            message_type: Some(MeetingMessageType::Cancelled),
+            event_id: None,
+            is_organizer: false,
+        }
+    }
+
+    #[test]
+    fn fetch_meeting_message_of_a_deleted_event_answers_no_event() {
+        for status in [404, 400] {
+            let (srv, handle, _store_path, dir) = spawn_meeting_engine(
+                &format!("fetch-meeting-message-event-gone-{status}"),
+                event_gone_routes(status),
+                vec![meeting("E2", false)],
+            );
+            handle
+                .cmd_tx
+                .send(SyncCommand::FetchMeetingMessage {
+                    message_id: "M1".into(),
+                })
+                .unwrap();
+            let seen = wait_for(&handle.evt_rx, |e| {
+                matches!(
+                    e,
+                    SyncEvent::MeetingMessageFetched { .. }
+                        | SyncEvent::MeetingMessageFailed { .. }
+                        | SyncEvent::Error(_)
+                )
+            });
+            assert_eq!(
+                seen.last(),
+                Some(&SyncEvent::MeetingMessageFetched {
+                    message_id: "M1".into(),
+                    meeting: cancelled_without_event(),
+                }),
+                "{status}"
+            );
+            assert_eq!(m1_requests(&srv), event_gone_gets(status), "{status}");
+            assert!(non_gets(&srv).is_empty(), "{:?}", srv.requests());
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn remove_from_calendar_of_a_deleted_event_answers_removed() {
+        for status in [404, 400] {
+            let mut routes = event_gone_routes(status);
+            routes.push(delete_route("/me/events/"));
+            let (srv, handle, store_path, dir) = spawn_meeting_engine(
+                &format!("remove-from-calendar-event-gone-{status}"),
+                routes,
+                vec![meeting("E2", false)],
+            );
+            handle
+                .cmd_tx
+                .send(SyncCommand::RemoveFromCalendar {
+                    message_id: "M1".into(),
+                })
+                .unwrap();
+            let seen = wait_for(&handle.evt_rx, |e| {
+                matches!(
+                    e,
+                    SyncEvent::RemovedFromCalendar { .. } | SyncEvent::Error(_)
+                )
+            });
+            assert_eq!(
+                seen.last(),
+                Some(&SyncEvent::RemovedFromCalendar {
+                    message_id: "M1".into(),
+                    event_id: None,
+                }),
+                "{status}"
+            );
+            assert!(!seen.contains(&SyncEvent::CalendarUpdated), "{seen:?}");
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let store = Store::open(&store_path).unwrap();
+            assert_eq!(ids_in(&store, "CAL-A"), ["E2"]);
+            assert!(store.pending_ops().unwrap().is_empty(), "nothing queued");
+            assert_eq!(m1_requests(&srv), event_gone_gets(status), "{status}");
+            assert!(non_gets(&srv).is_empty(), "{:?}", srv.requests());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// How M1's GET fails in [`meeting_message_failures_are_answered`].
+    #[derive(Debug, Clone, Copy)]
+    enum M1Failure {
+        /// The message itself is gone: the expand and the plain GET 404.
+        Gone,
+        /// A 429 with an hour's `Retry-After`.
+        Throttled,
+        /// The connection closes with no answer.
+        Offline,
+        /// A 401 whose refresh the token endpoint refuses.
+        RefusedToken,
+    }
+
+    impl M1Failure {
+        fn routes(self) -> Vec<Route> {
+            match self {
+                M1Failure::Gone => vec![get_route("/me/messages/M1", 404, M1_ITEM_NOT_FOUND)],
+                M1Failure::Throttled => vec![Route {
+                    headers: vec![("Retry-After".into(), "3600".into())],
+                    ..get_route("/me/messages/M1", 429, "")
+                }],
+                M1Failure::Offline => vec![get_route("/me/messages/M1", 0, "")],
+                M1Failure::RefusedToken => vec![
+                    get_route("/me/messages/M1", 401, ""),
+                    token_failure(400, r#"{"error":"invalid_grant"}"#),
+                ],
+            }
+        }
+
+        /// The one-line reason the failure is reported with.
+        fn reason_ok(self, reason: &str) -> bool {
+            match self {
+                M1Failure::Gone => reason == "not found (404)",
+                M1Failure::Throttled => reason == "throttled, retry after 3600s",
+                M1Failure::Offline => reason.starts_with("transport error: "),
+                M1Failure::RefusedToken => reason == "unauthorized (401)",
+            }
+        }
+
+        /// `react`'s side effect is in `seen` (none to see for a throttle,
+        /// whose back-off is only a later retry time).
+        fn side_effect_seen(self, seen: &[SyncEvent]) -> bool {
+            match self {
+                M1Failure::Gone | M1Failure::Throttled => true,
+                M1Failure::Offline => seen.contains(&SyncEvent::State(SyncState::Offline)),
+                M1Failure::RefusedToken => seen
+                    .iter()
+                    .any(|e| matches!(e, SyncEvent::SignInRequired { .. })),
+            }
+        }
+
+        /// The M1 requests it lets through: no plain GET follows a
+        /// failure other than the 404 (a transport failure may be sent
+        /// twice, as ureq retries an idempotent GET on a stale pooled
+        /// connection).
+        fn requests_ok(self, paths: &[String]) -> bool {
+            match self {
+                M1Failure::Gone => paths == [M1_SELECTED, "/me/messages/M1"],
+                M1Failure::Offline => !paths.is_empty() && paths.iter().all(|p| p == M1_SELECTED),
+                M1Failure::Throttled | M1Failure::RefusedToken => paths == [M1_SELECTED],
+            }
+        }
+    }
+
+    /// Every failure of the meeting message's GET answers the command
+    /// (#2208): `MeetingMessageFailed` for the fetch, never an `Error`; an
+    /// `Error` naming the message for the remove. `react`'s side effects
+    /// still happen; nothing is queued or sent.
+    #[test]
+    fn meeting_message_failures_are_answered() {
+        for failure in [
+            M1Failure::Gone,
+            M1Failure::Throttled,
+            M1Failure::Offline,
+            M1Failure::RefusedToken,
+        ] {
+            for remove in [false, true] {
+                let (srv, handle, store_path, dir) = spawn_meeting_engine(
+                    &format!("meeting-message-failure-{failure:?}-{remove}"),
+                    failure.routes(),
+                    vec![meeting("E2", false)],
+                );
+                let message_id = "M1".to_string();
+                handle
+                    .cmd_tx
+                    .send(if remove {
+                        SyncCommand::RemoveFromCalendar { message_id }
+                    } else {
+                        SyncCommand::FetchMeetingMessage { message_id }
+                    })
+                    .unwrap();
+                let seen = wait_for(&handle.evt_rx, |e| match e {
+                    SyncEvent::Error(m) => !remove || m.starts_with("remove from calendar M1"),
+                    SyncEvent::MeetingMessageFailed { .. }
+                    | SyncEvent::MeetingMessageFetched { .. }
+                    | SyncEvent::RemovedFromCalendar { .. } => true,
+                    _ => false,
+                });
+                let what = format!("{failure:?} remove={remove}: {seen:?}");
+                let reason = match (remove, seen.last()) {
+                    (false, Some(SyncEvent::MeetingMessageFailed { message_id, reason })) => {
+                        assert_eq!(message_id, "M1", "{what}");
+                        reason.clone()
+                    }
+                    (true, Some(SyncEvent::Error(m))) => m
+                        .strip_prefix("remove from calendar M1: ")
+                        .unwrap_or_else(|| panic!("{what}"))
+                        .to_string(),
+                    _ => panic!("{what}"),
+                };
+                assert!(failure.reason_ok(&reason), "{what}");
+                if !remove {
+                    assert!(
+                        !seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+                        "{what}"
+                    );
+                }
+                assert!(failure.side_effect_seen(&seen), "{what}");
+                assert!(
+                    failure.requests_ok(&m1_requests(&srv)),
+                    "{what} {:?}",
+                    srv.requests()
+                );
+                let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+                let store = Store::open(&store_path).unwrap();
+                assert!(store.pending_ops().unwrap().is_empty(), "{what}");
+                assert_eq!(ids_in(&store, "CAL-A"), ["E2"], "{what}");
+                let sent: Vec<_> = non_gets(&srv)
+                    .into_iter()
+                    .filter(|(_, path)| !path.starts_with("/organizations/oauth2/v2.0/token"))
+                    .collect();
+                assert!(sent.is_empty(), "{what} {sent:?}");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
     }
 
     // --- Recurring series and occurrences (#2022) ------------------------
@@ -24224,6 +24533,46 @@ mod tests {
     #[test]
     fn a_queued_remove_from_calendar_takes_a_404_as_done() {
         queued_remove_from_calendar("queued-remove-from-calendar-404", 404);
+    }
+
+    /// #2208: a queued `RemoveFromCalendar` whose cancellation's event is
+    /// gone (the expand 404s, the plain GET answers) is done with no
+    /// DELETE: `RemovedFromCalendar` with no event, the op dropped.
+    #[test]
+    fn a_queued_remove_from_calendar_of_a_deleted_event_sends_nothing() {
+        let op = OutboxOp::RemoveFromCalendar {
+            message_id: "M1".into(),
+        };
+        let mut routes = event_gone_routes(404);
+        routes.push(delete_route("/me/events/"));
+        let (srv, handle, store_path, dir) =
+            spawn_calendar_engine("queued-remove-from-calendar-event-gone", routes, |s| {
+                s.upsert_event(&meeting("E2", false)).unwrap();
+                s.enqueue_op(&op).unwrap();
+            });
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::RemovedFromCalendar { .. })
+        });
+        assert_eq!(
+            seen.last(),
+            Some(&SyncEvent::RemovedFromCalendar {
+                message_id: "M1".into(),
+                event_id: None,
+            })
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::Error(m) if m.contains("M1"))),
+            "{seen:?}"
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-A"), ["E2"]);
+        assert!(store.pending_ops().unwrap().is_empty());
+        assert_eq!(m1_requests(&srv), event_gone_gets(404));
+        assert!(non_gets(&srv).is_empty(), "{:?}", srv.requests());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The organizer's view: a calendar sync stores each attendee's

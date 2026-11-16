@@ -191,7 +191,9 @@ issue number to find its notes.
   token-endpoint errors (#2113), a transient token-endpoint failure kept as offline, a saved
   sign-in in a store that cannot be reached (#2167), the reason a sign-in is asked for, in
   lookxy's prompt (#2169), a meeting message's type filled when the class expand is refused
-  (#2168), a draft's importance and follow-up flag, its flag on a PATCH only once set (#1955).
+  (#2168), a draft's importance and follow-up flag, its flag on a PATCH only once set (#1955),
+  Remove from Calendar and a meeting message's read when its event is gone, every failure
+  answered (#2208).
 
 ## Build and test
 
