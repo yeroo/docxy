@@ -229,6 +229,94 @@ pub fn inline_extent(raw: &str) -> Option<(i64, i64)> {
     Some((cx, cy))
 }
 
+/// An inline picture run's Alt Text (#1998): its `wp:inline`'s
+/// `wp:docPr` `descr`, else its `title`, under [`inline_extent`]'s guards
+/// (inline only, never `wp:anchor`; `pic:cNvPr`'s copy is not read). The
+/// value is XML-unescaped (an entity it does not know is kept as written),
+/// each run of white space (the `&#10;` / `&#9;` the writer keeps included)
+/// is one space, and it is trimmed; empty or unreadable is `None`.
+pub fn inline_alt_text(raw: &str) -> Option<String> {
+    inline_extent(raw)?;
+    let inline = raw.find("<wp:inline")?;
+    let at = inline + start_tag(&raw[inline..], "<wp:docPr")?;
+    let end = at + raw[at..].find('>')?;
+    let el = &raw[at..end];
+    ["descr", "title"]
+        .into_iter()
+        .filter_map(|name| attr_at_boundary(el, name))
+        .map(|v| collapse_space(&xml_unescape(&v)))
+        .find(|v| !v.is_empty())
+}
+
+/// `name`'s value in the start tag `el`, matched only where the name
+/// starts an attribute (after white space), so `title` is not read out of
+/// `foo:title` or `subtitle`.
+fn attr_at_boundary(el: &str, name: &str) -> Option<String> {
+    let b = el.as_bytes();
+    let mut from = 0;
+    while let Some(i) = el[from..].find(name) {
+        let at = from + i;
+        from = at + name.len();
+        if at == 0 || !b[at - 1].is_ascii_whitespace() {
+            continue;
+        }
+        let rest = el[from..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let q = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+        let body = &rest[1..];
+        return body.find(q).map(|e| body[..e].to_string());
+    }
+    None
+}
+
+/// An attribute value with its entity and character references resolved,
+/// in one pass; a reference it cannot read is kept as written.
+fn xml_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let decoded = rest.find(';').filter(|&e| e <= 12).and_then(|e| {
+            let c = match &rest[1..e] {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                n => n
+                    .strip_prefix("#x")
+                    .or_else(|| n.strip_prefix("#X"))
+                    .map(|h| u32::from_str_radix(h, 16))
+                    .or_else(|| n.strip_prefix('#').map(str::parse::<u32>))
+                    .and_then(Result::ok)
+                    .and_then(char::from_u32),
+            }?;
+            Some((c, e))
+        });
+        match decoded {
+            Some((c, e)) => {
+                out.push(c);
+                rest = &rest[e + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `s` with each run of white space one space, trimmed.
+fn collapse_space(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// An inline picture run's `r:embed` relationship id, from its `a:blip`,
 /// under the guards of [`inline_extent`] (inline only, never `wp:anchor`).
 /// Only a drawing whose `a:graphicData` is a picture has one: a group, canvas
@@ -894,5 +982,84 @@ mod tests {
         let elsewhere =
             word_picture("").replace("</pic:pic>", r#"</pic:pic><a:prstGeom prst="ellipse"/>"#);
         assert_eq!(inline_shape(&elsewhere), PictureShape::Rect);
+    }
+
+    /// `word_picture`'s run with its `wp:docPr` attributes replaced.
+    fn with_doc_pr(attrs: &str) -> String {
+        word_picture("").replace(
+            r#"<wp:docPr id="1" name="Picture 1"/>"#,
+            &format!(r#"<wp:docPr id="1" name="Picture 1"{attrs}/>"#),
+        )
+    }
+
+    #[test]
+    fn inline_alt_text_reads_descr_else_title() {
+        let read = |attrs: &str| inline_alt_text(&with_doc_pr(attrs));
+        assert_eq!(
+            read(r#" descr="Floor plan""#).as_deref(),
+            Some("Floor plan")
+        );
+        assert_eq!(
+            read(r#" title="Plan" descr="Floor plan""#).as_deref(),
+            Some("Floor plan")
+        );
+        // Title when there is no description, or only white space.
+        assert_eq!(read(r#" title="Plan""#).as_deref(), Some("Plan"));
+        assert_eq!(
+            read(r#" descr=" &#10; " title='Plan'"#).as_deref(),
+            Some("Plan")
+        );
+        assert_eq!(read(""), None);
+        assert_eq!(read(r#" descr="" title="""#), None);
+        // Only whole attribute names: `foo:title` and `subtitle` are not it.
+        assert_eq!(read(r#" foo:title="No" subtitle="No""#), None);
+        assert_eq!(
+            read(r#" foo:title="No" title = "Yes""#).as_deref(),
+            Some("Yes")
+        );
+        // `pic:cNvPr`'s copy is not read.
+        let cnv = word_picture("").replace(
+            r#"<pic:cNvPr id="1" name="a.png"/>"#,
+            r#"<pic:cNvPr id="1" name="a.png" descr="Inner"/>"#,
+        );
+        assert_eq!(inline_alt_text(&cnv), None);
+    }
+
+    #[test]
+    fn inline_alt_text_unescapes_and_collapses_white_space() {
+        let read = |attrs: &str| inline_alt_text(&with_doc_pr(attrs));
+        assert_eq!(
+            read(r#" descr="  A &amp; B &lt;x&gt; &quot;q&quot; &apos;s&apos;&#10;two&#9;tab &#x41;&#66; ""#)
+                .as_deref(),
+            Some("A & B <x> \"q\" 's' two tab AB")
+        );
+        // A reference it cannot read is kept as written.
+        assert_eq!(
+            read(r#" descr="a &bogus; &#xZZ; &amp b""#).as_deref(),
+            Some("a &bogus; &#xZZ; &amp b")
+        );
+        // What the writer escapes reads back, its line breaks as spaces.
+        let run = inline_picture_run_described(
+            "rId5",
+            10,
+            20,
+            3,
+            "a.png",
+            "Logo \"A&B\" <x>\nline\ttab",
+            None,
+        );
+        assert_eq!(
+            inline_alt_text(&run).as_deref(),
+            Some("Logo \"A&B\" <x> line tab")
+        );
+    }
+
+    #[test]
+    fn inline_alt_text_is_inline_pictures_only() {
+        assert_eq!(inline_alt_text(r#"<w:r><wp:docPr descr="x"/></w:r>"#), None);
+        let anchored =
+            with_doc_pr(r#" descr="x""#).replace("<w:drawing>", "<w:drawing><wp:anchor/>");
+        assert_eq!(inline_alt_text(&anchored), None);
+        assert_eq!(inline_alt_text("<w:r><w:t>x</w:t></w:r>"), None);
     }
 }

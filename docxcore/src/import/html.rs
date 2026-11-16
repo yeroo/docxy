@@ -5505,6 +5505,28 @@ mod image_tests {
     }
 
     #[test]
+    fn a_placeholder_reads_its_alt_text_back_and_an_unsized_one_is_text() {
+        // #1998: the placeholder of a picture that did not load keeps its
+        // alt as Alt Text, which the view shows on hover.
+        let mut none = |_: &str, _: usize| None;
+        let import = import_html_with(
+            br#"<p><img src="cid:x" alt="Floor &amp; plan" width=40 height=30></p>"#,
+            &mut none,
+        )
+        .unwrap();
+        let pics = all_pictures(&import.document);
+        assert_eq!(pics.len(), 1);
+        assert_eq!(
+            crate::image::inline_alt_text(pics[0]).as_deref(),
+            Some("Floor & plan")
+        );
+        // With no size it has no box: the alt is text, no picture, no tip.
+        let (d, _, _) = with_images("<p><img src=missing.png alt='Floor plan'></p>");
+        assert!(all_pictures(&d).is_empty());
+        assert_eq!(paras(&d)[0].plain_text(), "Floor plan");
+    }
+
+    #[test]
     fn a_data_image_over_the_room_is_a_placeholder_and_the_import_goes_on() {
         let png = png(4, 2);
         let page = format!(
