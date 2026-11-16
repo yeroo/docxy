@@ -20,7 +20,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   (#1870, below), its root focus goes on to the view
   (`focus_ext_surface`), keys the view does not stop bubble to `route_key`,
   and `ext::ShowBackstage` opens File (where the tab may add its own pages,
-  and `ext::CloseTab` closes it: #1923, below). The theme's light/dark reaches it in
+  and `ext::CloseTab` closes it: #1923, below; `ext::ShowBackstagePage` opens
+  File on one of those pages: #2204, below). The theme's light/dark reaches it in
   `apply_theme`.
 - Tearing a tab off (`tab_tear.rs`): a chip's drag (#545) noted by
   `on_drag_move` and let go away from the strip (more than `MARGIN` above or
@@ -866,6 +867,38 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   (`Region::BackstageExt`, the entry's probe) and `ext-page-close:<id>`
   (the page's button, from the fixture). `uiharness/cases/ext-backstage.uit`
   drives it, and `ext-ribbon.uit`'s `issue 1923` test the ribbon's Exit.
-- Not done: opening File straight on an extension's page, a selected state
-  drawn in the rail (the suite's items draw none), colour icons, macOS
-  menu-bar entries, extension entries on the Start screen (no tab).
+- Not done: a selected state drawn in the rail (the suite's items draw
+  none), colour icons, macOS menu-bar entries, extension entries on the
+  Start screen (no tab). Opening File straight on an extension's page is
+  #2204, below.
+
+## Opening File on an extension's page (#2204)
+
+- `ext::ShowBackstagePage { id }` is a public action with a field, so it is
+  derived (`gpui::Action`, `#[action(namespace = docxy_ext, no_json)]`)
+  rather than listed in `actions!`: `no_json` needs only `Clone` and
+  `PartialEq`, no serde or schemars, and it is never bound from a keymap.
+- The root takes it in `key_routing` beside `ShowBackstage` and `CloseTab`
+  (`show_ext_backstage_page`): `open_backstage` first (a typed Info
+  property applied, every page flag and `bs_ext` cleared, the scroll reset,
+  the recent files and drafts re-read, even when File is already up), then
+  `select_ext_backstage_page`, the rail click's own setter, only when
+  `active_ext_page` finds the id. That lookup is the rail's filter (the
+  first page with a non-empty id equal to it), shared with
+  `shown_ext_page`. So an unknown or empty id, or a tab that is not an
+  extension's, leaves `bs_ext` `None` and File on its default page, as
+  `ShowBackstage`; a late dispatch acts on whichever tab is active then, as
+  `CloseTab` does. `select_ext_backstage_page` stays unvalidated: the rail
+  offers only listed ids.
+- Fixture: each `FixturePage` has a "Show <other page>" button
+  (`FixturePage::show`; Account shows Options and Options Account) that
+  dispatches the action from inside File, recording `show_bounds`.
+- Harness: `ext-show-page {"id"}` dispatches the action from the focused
+  element, as `ext-close-tab` does: refused under a dialog, and on the
+  fixture's tab with File down unless the focus is in its view; with File
+  up, or on another tab, any focus. `from` is `view` when the focus is in
+  the fixture's view, else `suite`. `ext-page-read` adds `show_bounds`, and
+  the region `ext-page-show:<id>` is that page's Show button.
+  `ext-backstage.uit`'s `issue 2204` tests drive it: from the view, an
+  unknown and an empty id, File already up (from Account and from a page's
+  own button, both ways), and a document tab.

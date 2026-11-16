@@ -1706,7 +1706,7 @@ clipped as the heading is; #1533), `project-hbar-table`, `project-hbar-chart`,
 `project-timeline-box-right`, `project-timeline-grip`, `project-split`, `gallery`, `ribbon`,
 `ribbon-flyout`, `ribbon-group:<index>`, `ribbon-launch:<group title>`,
 `gallery-more:<gallery id>`, `ext-ribbon-cmd:<command id>`, `ribbon-cmd:<command id>`, `bs-ext:<page id>`,
-`ext-page-close:<page id>`, `title-tabs`,
+`ext-page-close:<page id>`, `ext-page-show:<page id>`, `title-tabs`,
 `tab-prev`, `tab-next`, `tab-more`, `tab-more-item:<index>` (the last exists while
 the more-tabs list is open), `tab-chip:<index>` — a visible title-bar chip by
 absolute tab index; absent while the chip is scrolled out of the strip. `gantt`
@@ -1750,7 +1750,9 @@ there and a real F1 open the command's page (`docs/claude/help.md`).
 `bs-ext:<page id>` (for example `bs-ext:fx.account`) is an extension tab's
 File rail entry (#1923), an error while File is not up on that tab;
 `ext-page-close:<page id>` is the test extension's File page's Close tab
-button, where it last painted (`docs/claude/suite-extensions.md`).
+button, where it last painted, and `ext-page-show:<page id>` its Show button,
+which opens the other page through `ext::ShowBackstagePage` (#2204;
+`docs/claude/suite-extensions.md`).
 `filter-button:<column>` (for example
 `filter-button:B`) is the AutoFilter button on that column's header cell
 (#690), an error while the sheet has no filter there or the button is
