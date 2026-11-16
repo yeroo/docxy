@@ -1406,13 +1406,161 @@ wider window fresh without downloading it again.
   (`wait_refused`), a create for `ContactCreated` and then the command's
   (`wait_created`): a wait for a single `ContactsUpdated` would catch the
   leftover one.
-- Not done: the contact photo (#2065). A periodic refresh of the set (a
+- Not done: a periodic refresh of the set (a
   normal tick, or `/me/contacts/delta`). Contacts in other contact folders
   (`/me/contactFolders/{id}/contacts`), contact groups. A directory (GAL)
   contact's X500 DN address is not matched: resolving it needs `/users`.
   Feeding the folder into autocomplete. Clearing the set on sign-out (the
   store is kept across sign-out, #1920). Dedup of a create retried after a
   lost POST answer (as events: Graph has nothing to ask). `If-Match`.
+  The contact photo is the next section (#2065).
+
+## A Contacts-folder contact's photo (#2065)
+
+Builds on the records and contact writes above (#2063).
+
+- Graph (checked 2026-11-16 on learn.microsoft.com): `GET
+  /me/contacts/{id}/photo/$value` returns the bytes, or 404 when there is no
+  photo (`Contacts.Read`). `PUT` there, with `Content-Type: image/jpeg` and the
+  raw bytes, sets it (4 MB limit). It needs `Contacts.ReadWrite`, and is
+  delegated for **work or school accounts only** ("Delegated (personal
+  Microsoft account): Not supported"), so a personal account's set is refused
+  and reported like a 403. **No remove**: Graph's photo DELETE "supports only
+  user or group photos, but not Outlook contact nor Teams photos", so there is
+  no client call, op or command for it.
+- `GraphClient::contact_photo(id)` → `Ok(Some(ContactPhoto { bytes,
+  content_type, etag }))`, `Ok(None)` on a 404 (no photo, or the contact
+  gone). Other errors are returned unchanged (403 → `Http { status: 403, .. }`).
+  It shares `get_photo` with `my_photo`: `Accept: image/*`, the
+  `Content-Type` without its parameters, at most `PHOTO_MAX` (a `Parse` error
+  over it). `etag` is the answer's `ETag` header, `""` when Graph sends none.
+  It is informational only: nothing depends on it.
+  `set_contact_photo(id, bytes, content_type)` PUTs through `put_binary`,
+  which uses `send_bytes`, never a string body. An empty type sends
+  `image/jpeg`. Empty bytes, or bytes over `PHOTO_MAX`, are a `Parse` error
+  with no request. There is no type allow-list: Graph refuses what it does not
+  take, with a 4xx.
+- Store: `contact_photos`, one row per contact whose photo state is known:
+  `has_photo` (0 for Graph's 404), the bytes and type, the etag, the contact's
+  `change_key` when the state was learnt, `pending` (a local set Graph has not
+  accepted yet), and `revision` (a count of local sets). A foreign key to
+  `contact_records` with `ON DELETE CASCADE ON UPDATE CASCADE` makes the row
+  follow a re-key (`reconcile_created_contact`) and go with a deleted
+  contact. Rows also go through `discard_contact_row`, a refused delete's
+  re-read 404, and `replace_contacts` dropping an unlisted contact.
+  `write_contact_on` is an upsert, so a listed contact keeps its photo.
+  `CREATE TABLE IF NOT EXISTS`, so an older database gets it empty.
+- `Store::contact_photo(id)` (a Graph id or the `local:` id, resolved) →
+  `None` when the state is unknown (never fetched, a refused set reverted),
+  else `StoredContactPhoto { photo, pending, current }`. `current` means
+  pending, or learnt against the `changeKey` the stored contact has now. A
+  client fetches again when the state is unknown or not current.
+- Why `changeKey`, and an **assumption**: a contact's photo is an attachment
+  of the Exchange contact item, so setting it (here or in Outlook) should
+  move the item's `changeKey`, which every full pass stores. This is not
+  verified against a live tenant. Asking for each contact's
+  `@odata.mediaEtag` instead would cost one request per contact per pass.
+  Consequences: a photo changed elsewhere reads `current` until the next full
+  pass (as `is_contact`, full passes only); a field edit, or the user's own
+  confirmed set (whose PUT moves the key), costs one needless refetch.
+- `Store::set_contact_photo(id, bytes, type)` stores the row (pending, a new
+  revision, the type `image/jpeg` when empty) and queues
+  `OutboxOp::SetContactPhoto { id }` (`setContactPhoto`, `{id}`) under the
+  stored id, **in the same transaction**, as the #2063 writes do. `false`
+  when no such contact is stored; empty or oversized bytes are
+  `StoreError::Invalid`. Every set queues its own op.
+  `SyncCommand::SetContactPhoto { id }` only drains and emits
+  `ContactsUpdated`; the next drain sends the op without it.
+- The op carries no bytes: a 4 MiB photo base64'd into the payload would be
+  decoded by every `pending_ops_on` (each full pass and drain). The PUT
+  sends `pending_contact_photo` as stored at send time, then
+  `confirm_contact_photo(id, revision)`. A set written while the PUT was in
+  flight has a later revision and stays pending for its own op, so the
+  first op to run sends the latest photo and later ones find nothing
+  pending. An id still `local:` sends nothing: its create was refused, and a
+  create not sent yet runs first in `seq` order. Nothing pending (sent,
+  reverted, the contact deleted) also sends nothing. A 404 is a refusal,
+  not done.
+- `QueuedContacts.photo` holds the contacts a `SetContactPhoto` names. It
+  is used only in `replace_contacts`' removal guard: an unlisted contact with
+  a pending set stays for the PUT, whose 404 then reports the photo instead
+  of a cascade dropping it silently. A listed one is still written (the op
+  sends no field). It is not in `any`: the photo op holds no re-read, since
+  it never reads or writes the fields.
+- A refused set (any failure but 401, throttle, transport, 5xx, as #2063) is
+  final at once. `ContactWriteFailed { write: ContactWrite::SetPhoto,
+  attempted: None, attempted_photo: Some(..) }`, then `Error("set the photo
+  of contact {id}: {error}")`, then `ContactsUpdated`.
+  `revert_contact_photo` deletes the row (unknown, so the client fetches
+  Graph's) unless a later queued set names the contact. A `NotFound` also
+  owes the contact a re-read, so its 404 deletes the contact at once rather
+  than at the next full pass. Because the photo op is not in `any`, that
+  re-read does not wait for a later queued set: the contact and the later
+  set's photo go too. That is not silent: `attempted_photo` is read before
+  the revert, so it holds the row as the user left it, the later set's photo
+  included. A 5xx keeps the op queued.
+- A refused **create** also reports the photo set on its `local:` row
+  (`attempted_photo`), since `discard_contact_row` takes it with the row. The
+  orphaned `SetContactPhoto` stays queued and sends nothing, as an orphaned
+  `UpdateContact` does. `attempted_photo` is `None` for an update and a
+  delete.
+- `SyncCommand::FetchContactPhoto { id }` → `SyncEvent::ContactPhotoFetched
+  { id, photo }` (`id` as the command named it). A pending set, or an id
+  still `local:`, sends no request and answers from the store, signed in or
+  not. Otherwise not signed in is `Error("not signed in")`, and a Graph
+  failure goes through `react`, as `FetchPhoto`. No event names the failed
+  id, so a host fetching many photos cannot tell which one failed. On
+  success `record_contact_photo` stores the answer against the contact's
+  stored `changeKey`. It writes nothing while a set is pending (a set written
+  during the GET: the event then carries that photo) or when the contact is
+  not stored (checked first, not left to the foreign key). Fetches happen on
+  demand only: no pass fetches photos. `FetchContactPhoto` is with
+  `FetchPhoto` among the commands a shutdown drops; `SetContactPhoto` is with
+  `UpdateContact` among the kept ones.
+- `RecordedRequest::body_bytes` (`testserver`) is the request body exactly as
+  received; `body` is its lossy text. A binary PUT's test asserts
+  `body_bytes`.
+- lookxy ignores `ContactPhotoFetched`, as it does the other contact events.
+- Tests: `client.rs` `contact_photo_gets_bytes_type_and_etag`,
+  `contact_photo_without_etag_is_empty`, `contact_photo_404_is_none`,
+  `contact_photo_403_is_http_403`, `contact_photo_refuses_oversize`,
+  `set_contact_photo_puts_the_bytes_with_their_type` (non-UTF-8 bytes),
+  `set_contact_photo_without_a_type_sends_jpeg`,
+  `set_contact_photo_403_is_http_403`,
+  `set_contact_photo_refuses_empty_and_oversized_without_a_request`;
+  `testserver` `records_binary_body_bytes`; `store`
+  `contact_photo_unknown_none_and_present`,
+  `contact_photo_is_not_current_after_change_key_moves`,
+  `set_contact_photo_queues_its_op_in_the_same_transaction`,
+  `record_contact_photo_keeps_a_pending_set`,
+  `confirm_contact_photo_keeps_a_set_written_during_the_put`,
+  `contact_photo_follows_a_rekeyed_contact_and_goes_with_a_deleted_one`,
+  `replace_contacts_keeps_a_listed_contacts_photo`,
+  `full_pass_keeps_a_contact_with_a_pending_photo_set`,
+  `photo_op_holds_no_contact_reread`,
+  `revert_contact_photo_waits_for_a_later_set`,
+  `set_contact_photo_op_round_trips_json`,
+  `contact_photos_on_a_database_from_before_the_table`; `outbox.rs`
+  `set_contact_photo_puts_the_pending_row_and_confirms_it`,
+  `set_contact_photo_sends_the_latest_photo_once`,
+  `set_contact_photo_of_a_local_id_sends_nothing`,
+  `set_contact_photo_without_pending_row_sends_nothing`,
+  `set_contact_photo_after_create_puts_to_the_graph_id`,
+  `set_contact_photo_404_is_an_error`; `engine.rs`
+  `fetch_contact_photo_records_and_reports_it`,
+  `fetch_contact_photo_404_records_no_photo`,
+  `fetch_contact_photo_with_a_pending_set_sends_nothing`,
+  `fetch_contact_photo_signed_out_reports_not_signed_in`,
+  `contact_photo_set_puts_and_reports_contacts_updated`,
+  `contact_photo_set_403_reports_and_reverts`,
+  `contact_photo_set_5xx_stays_queued`,
+  `contact_photo_set_on_a_contact_deleted_elsewhere_reports_404`,
+  `refused_create_reports_its_pending_photo`.
+- Not done: removing the photo (Graph has no call). Prefetching photos, or
+  fetching them in a pass. Sized photos (`/photos/{size}`). The metadata
+  form and its `@odata.mediaEtag`. Image conversion: a non-JPEG is sent as
+  given, and Graph's refusal is reported. Other contact folders, contact
+  groups.
 
 ## Cancel and forward a meeting (#1985)
 
