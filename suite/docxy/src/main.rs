@@ -37384,6 +37384,19 @@ fn paragraph_el(
                             shape,
                         });
                     }
+                    // Its Alt Text as a tooltip on hover, in the embedded
+                    // view only (#1998), where it takes presses.
+                    let tip = click
+                        .and_then(|c| Some((c, doc_view::picture_tip(!c.ent.is_suite(), xml)?)));
+                    let frame = match tip {
+                        Some((c, tip)) => match c.ent {
+                            DocTarget::Embed(view, _) => {
+                                frame.child(doc_view::picture_tip_el(view, c.path, idx, tip))
+                            }
+                            DocTarget::Suite(_) => frame,
+                        },
+                        None => frame,
+                    };
                     emit_object_unit(
                         &mut spans, frame, &mut idx, &mut caret, sel, click, pal, caret_h,
                     );

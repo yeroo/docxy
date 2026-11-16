@@ -2159,6 +2159,18 @@ fn ext_doc_point(app: &crate::Docxy, part: &str, cx: &App) -> Result<Point<Pixel
         };
         return Ok(point(b.left() + left / 2., y));
     }
+    if let Some(n) = part.strip_prefix("picture:") {
+        // The middle of the n-th painted inline picture (#1998).
+        let n: usize = n
+            .trim()
+            .parse()
+            .map_err(|_| "'ext-doc-picture' needs a numeric index".to_string())?;
+        let pictures = view.picture_bounds();
+        return pictures
+            .get(n)
+            .map(|b| b.center())
+            .ok_or_else(|| format!("no picture {n}; {} drawn", pictures.len()));
+    }
     if let Some(n) = part.strip_prefix("link:") {
         // `:left`: 8 px left of the span, at mid-height (the blank beside a
         // row that starts with the link).
@@ -2198,7 +2210,24 @@ fn ext_doc_point(app: &crate::Docxy, part: &str, cx: &App) -> Result<Point<Pixel
             None => b.center(),
         });
     }
-    Err("the test extension's regions are ext-doc-view, ext-doc-header, ext-doc-inset:left[:<word>], ext-doc-find:<field|prev|next|close>, ext-doc-link:<n>[:left] and ext-doc-word:<text>[:start|:end]".into())
+    Err("the test extension's regions are ext-doc-view, ext-doc-header, ext-doc-inset:left[:<word>], ext-doc-find:<field|prev|next|close>, ext-doc-link:<n>[:left], ext-doc-picture:<n> and ext-doc-word:<text>[:start|:end]".into())
+}
+
+/// How long `ext-doc-read` asks again for (#1998): `None` once the view
+/// has built `until_alt_tips` tooltips (`built`), or with no
+/// `until_alt_tips`.
+fn ext_doc_read_retry(args: &Json, built: usize) -> Result<Option<std::time::Duration>, String> {
+    let until = match args.get("until_alt_tips") {
+        None => return Ok(None),
+        Some(Json::Num(n)) if *n >= 0. && n.fract() == 0. => *n as usize,
+        Some(_) => return Err("'until_alt_tips' must be a whole number".into()),
+    };
+    let within = match args.get("within_ms") {
+        None => 2000.,
+        Some(Json::Num(ms)) if *ms >= 0. => *ms,
+        Some(_) => return Err("'within_ms' must be a number of milliseconds".into()),
+    };
+    Ok((built < until).then(|| std::time::Duration::from_millis(within as u64)))
 }
 
 /// The active sheet's fill-handle point: the bottom-right corner of its
@@ -5960,7 +5989,14 @@ fn dispatch_verb(
                 Json::Num(f.change_calls.get() as f64),
             ));
             reply.extend(ext_link_reports(f));
-            Done::ok(Json::Obj(reply))
+            // `until_alt_tips` (#1998): ask again until the view has built
+            // that many picture tooltips, for up to `within_ms` (default
+            // 2000, at most the pump's `RETRY_MAX`); a timeout is no error,
+            // the reply then says how many there were.
+            let retry = ext_doc_read_retry(args, f.doc.read(cx).alt_tip_count())?;
+            let mut done = Done::ok(Json::Obj(reply))?;
+            done.retry = retry;
+            Ok(done)
         }
         // The test extension's side of the suite's ribbon (#1870): the
         // commands the suite ran, its toggle and Archive state, and the
@@ -8279,6 +8315,7 @@ fn dispatch_verb(
                 draw: false,
                 input: Vec::new(),
                 wm_char: WmChar::Off,
+                retry: None,
             })
         }
 
@@ -8463,6 +8500,35 @@ mod tests {
             "M\u{fc}ller \u{20ac}\n\u{4e2d}"
         );
         assert_eq!(super::html_bold_text("<p>\u{e9}</p>"), "");
+    }
+
+    /// #1998: `ext-doc-read` asks again only while fewer tooltips than
+    /// `until_alt_tips` were built, for `within_ms` (default 2 s).
+    #[test]
+    fn ext_doc_read_asks_again_until_enough_tooltips() {
+        use super::ext_doc_read_retry;
+        use ctlcore::json::Json;
+        use std::time::Duration;
+        let j = |s: &str| Json::parse(s).unwrap();
+        assert_eq!(ext_doc_read_retry(&j("{}"), 0), Ok(None));
+        assert_eq!(
+            ext_doc_read_retry(&j(r#"{"until_alt_tips":1}"#), 0),
+            Ok(Some(Duration::from_millis(2000)))
+        );
+        assert_eq!(
+            ext_doc_read_retry(&j(r#"{"until_alt_tips":1,"within_ms":700}"#), 0),
+            Ok(Some(Duration::from_millis(700)))
+        );
+        assert_eq!(
+            ext_doc_read_retry(&j(r#"{"until_alt_tips":1}"#), 1),
+            Ok(None)
+        );
+        assert_eq!(
+            ext_doc_read_retry(&j(r#"{"until_alt_tips":2}"#), 3),
+            Ok(None)
+        );
+        assert!(ext_doc_read_retry(&j(r#"{"until_alt_tips":1.5}"#), 0).is_err());
+        assert!(ext_doc_read_retry(&j(r#"{"until_alt_tips":1,"within_ms":"x"}"#), 0).is_err());
     }
 
     use super::*;

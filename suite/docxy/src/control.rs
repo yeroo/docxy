@@ -311,7 +311,21 @@ pub(crate) struct Done {
     /// this input never passes through the window procedure. Set by
     /// `real-type`'s `wm_char`, so the dedupe runs on every platform.
     pub wm_char: WmChar,
+    /// Ask again (#1998): the verb's answer is not there yet, so the pump
+    /// dispatches the same request again every [`RETRY_STEP`], with the UI
+    /// thread free in between (timers, frames, input), until the verb stops
+    /// asking or this long has passed since the first dispatch; then it
+    /// replies with the last answer, its `waited_ms` added. Only for reads:
+    /// an asking answer's `input` is dropped.
+    pub retry: Option<Duration>,
 }
+
+/// How long the pump waits between the dispatches of a verb that asks again
+/// ([`Done::retry`]).
+pub(crate) const RETRY_STEP: Duration = Duration::from_millis(25);
+
+/// The longest a verb may ask again for ([`Done::retry`]).
+pub(crate) const RETRY_MAX: Duration = Duration::from_secs(5);
 
 impl Done {
     pub(crate) fn ok(result: Json) -> Result<Self, String> {
@@ -321,6 +335,7 @@ impl Done {
             draw: false,
             input: Vec::new(),
             wm_char: WmChar::Off,
+            retry: None,
         })
     }
 
@@ -355,6 +370,7 @@ impl Done {
             draw: cfg!(target_os = "macos"),
             input: Vec::new(),
             wm_char: WmChar::Off,
+            retry: None,
         })
     }
 }
@@ -461,11 +477,39 @@ pub(crate) fn attach_with_dispatch(
             if hit_tests(&req.verb) {
                 let _ = cx.update_window(target.handle, |_, window, cx| window.draw(cx).clear(cx));
             }
-            match cx.update_window(target.handle, |_, window, cx| {
-                target.view.update(cx, |this, cx| {
-                    dispatch(this, &req.verb, &req.args, window, cx)
-                })
-            }) {
+            // A verb that asks again ([`Done::retry`]) is dispatched again
+            // after a timer, which leaves the UI thread free meanwhile.
+            let started = std::time::Instant::now();
+            let mut asked = false;
+            let outcome = loop {
+                let outcome = cx.update_window(target.handle, |_, window, cx| {
+                    target.view.update(cx, |this, cx| {
+                        dispatch(this, &req.verb, &req.args, window, cx)
+                    })
+                });
+                let within = match &outcome {
+                    Ok(Ok(Ok(done))) => done.retry.map(|d| d.min(RETRY_MAX)),
+                    _ => None,
+                };
+                match within {
+                    Some(within) if started.elapsed() < within => {
+                        asked = true;
+                        cx.background_executor().timer(RETRY_STEP).await;
+                    }
+                    _ => break outcome,
+                }
+            };
+            let outcome = match outcome {
+                Ok(Ok(Ok(mut done))) if asked || done.retry.is_some() => {
+                    if let Json::Obj(fields) = &mut done.result {
+                        let waited = started.elapsed().as_millis() as f64;
+                        fields.push(("waited_ms".into(), Json::Num(waited)));
+                    }
+                    Ok(Ok(Ok(done)))
+                }
+                other => other,
+            };
+            match outcome {
                 // update_window's Result around the weak entity's upgrade
                 // Result around the verb's own Result.
                 Ok(Ok(Ok(mut done))) => {
