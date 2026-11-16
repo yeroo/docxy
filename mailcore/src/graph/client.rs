@@ -10,11 +10,12 @@
 
 use crate::graph::model::{
     AttachmentMeta, AutomaticReplies, Body, Calendar, ContactFields, ContactPhoto, DeltaPage,
-    DirectoryUser, DraftOptions, Event, EventDeltaItem, EventDeltaPage, EventRecurrence,
-    FolderContact, FolderListing, MailFolder, MasterCategory, Me, MeetingMessage, Message,
-    MessageFields, MessageHeader, OofStatus, Person, PhysicalAddress, REMINDER_SET_PROP,
-    REMINDER_SIGNAL_TIME_PROP, Recipient, Recurrence, ScheduleEntry, SearchHit, SubtreeItems,
-    is_event_message_type, parse_message_size, plain_to_html, reminder_time, to_utc,
+    DirectoryGroup, DirectoryUser, DraftOptions, Event, EventDeltaItem, EventDeltaPage,
+    EventRecurrence, FolderContact, FolderListing, GroupMember, GroupMemberList, MailFolder,
+    MasterCategory, Me, MeetingMessage, Message, MessageFields, MessageHeader, OofStatus, Person,
+    PhysicalAddress, REMINDER_SET_PROP, REMINDER_SIGNAL_TIME_PROP, Recipient, Recurrence,
+    ScheduleEntry, SearchHit, SubtreeItems, is_event_message_type, parse_message_size,
+    plain_to_html, reminder_time, to_utc,
 };
 use crate::json::{self, Value};
 use std::fmt;
@@ -2616,6 +2617,105 @@ impl GraphClient {
             .collect())
     }
 
+    /// GET `/groups?$search="displayName:<q>" OR "mail:<q>"&$filter=mailEnabled
+    /// eq true&$count=true&$select=GROUP_SELECT&$top=…` with
+    /// `ConsistencyLevel: eventual` (#2058): the organisation's mail-enabled
+    /// groups (distribution lists, mail-enabled security groups, Microsoft
+    /// 365 groups) for an address book. On `/groups` `$search` tokenises
+    /// `displayName` (and `description`); `mail:` is a prefix match. `$search`
+    /// with `$filter` is an advanced query, so `$count=true` goes with the
+    /// header. `query` is escaped as [`GraphClient::search_users`]'s
+    /// (`directory_search_value`); `top` is clamped to
+    /// `1..=`[`DIRECTORY_TOP_MAX`], one page only, no `@odata.nextLink` is
+    /// followed. A group without `id` or `mail` is skipped
+    /// (`DirectoryGroup::from_json`). Requires a directory read scope (for
+    /// example `GroupMember.Read.All`), which `AuthConfig::default()` does
+    /// not ask for: without it Graph answers 403 (`GraphError::Http`).
+    pub fn search_groups(
+        &self,
+        query: &str,
+        top: usize,
+    ) -> Result<Vec<DirectoryGroup>, GraphError> {
+        let top = top.clamp(1, DIRECTORY_TOP_MAX);
+        let path = format!(
+            "/groups?$search={}&$filter=mailEnabled%20eq%20true&$count=true\
+             &$select={GROUP_SELECT}&$top={top}",
+            directory_search_value(query)
+        );
+        let resp = self.send(
+            Method::Get,
+            &path,
+            None,
+            &[("ConsistencyLevel", "eventual")],
+        )?;
+        let v = parse_body(resp)?;
+        Ok(value_array(&v, "value")?
+            .iter()
+            .filter_map(DirectoryGroup::from_json)
+            .collect())
+    }
+
+    /// GET `/groups/{id}/members?$count=true&$select=GROUP_MEMBER_SELECT
+    /// &$top=…` (#2058): a group's direct members, users, nested groups and
+    /// org contacts, each with its kind (`GroupMember::from_json`, which
+    /// skips devices, service principals and members without an address).
+    /// Query parameters on `/members` are advanced queries, so every page,
+    /// the `@odata.nextLink` ones too (a relative path or a full URL), sends
+    /// `ConsistencyLevel: eventual`. `top` is the most members returned,
+    /// clamped to `1..=`[`GROUP_MEMBERS_MAX`], asked `min(top, 999)` a page;
+    /// pages are followed until none is left, `top` members are kept, or
+    /// [`GROUP_MEMBER_PAGES_MAX`] pages were read. `truncated` says members
+    /// were left unread (`GroupMemberList`). Any page's failure is an `Err`,
+    /// never a partial list; a group that is gone is `NotFound`. Requires
+    /// `GroupMember.ReadBasic.All` or a wider directory scope.
+    pub fn group_members(&self, group_id: &str, top: usize) -> Result<GroupMemberList, GraphError> {
+        let top = top.clamp(1, GROUP_MEMBERS_MAX);
+        let mut target = format!(
+            "/groups/{}/members?$count=true&$select={GROUP_MEMBER_SELECT}&$top={}",
+            encode_path_segment(group_id),
+            top.min(DIRECTORY_TOP_MAX)
+        );
+        let mut members = Vec::new();
+        let mut pages = 0;
+        loop {
+            let resp = self.send(
+                Method::Get,
+                &target,
+                None,
+                &[("ConsistencyLevel", "eventual")],
+            )?;
+            let v = parse_body(resp)?;
+            pages += 1;
+            members.extend(
+                value_array(&v, "value")?
+                    .iter()
+                    .filter_map(GroupMember::from_json),
+            );
+            if members.len() > top {
+                members.truncate(top);
+                return Ok(GroupMemberList {
+                    members,
+                    truncated: true,
+                });
+            }
+            match v.get("@odata.nextLink").and_then(Value::as_str) {
+                None => {
+                    return Ok(GroupMemberList {
+                        members,
+                        truncated: false,
+                    });
+                }
+                Some(_) if members.len() == top || pages >= GROUP_MEMBER_PAGES_MAX => {
+                    return Ok(GroupMemberList {
+                        members,
+                        truncated: true,
+                    });
+                }
+                Some(next) => target = next.to_string(),
+            }
+        }
+    }
+
     /// GET `/me/contacts` (the default Contacts folder, #1934, #2063), 200 a
     /// page, following `@odata.nextLink` (a relative path or a full URL, as
     /// `calendar_view` does) until Graph stops sending one. Returns every
@@ -3629,6 +3729,21 @@ pub const DIRECTORY_TOP_MAX: usize = 999;
 /// The `$select` of [`GraphClient::search_users`] (#1942).
 const DIRECTORY_SELECT: &str = "displayName,mail,userPrincipalName,jobTitle,department";
 
+/// The `$select` of [`GraphClient::search_groups`] (#2058).
+const GROUP_SELECT: &str = "id,displayName,mail,description";
+
+/// The `$select` of [`GraphClient::group_members`] (#2058): a user's fields
+/// as [`DIRECTORY_SELECT`]'s, plus the `id` a nested group is expanded by.
+const GROUP_MEMBER_SELECT: &str = "id,displayName,mail,userPrincipalName,jobTitle,department";
+
+/// The most pages [`GraphClient::group_members`] reads (#2058): it bounds
+/// the round trips when many members are skipped, and a link that loops.
+pub const GROUP_MEMBER_PAGES_MAX: usize = 10;
+
+/// The most members [`GraphClient::group_members`] returns (#2058):
+/// [`GROUP_MEMBER_PAGES_MAX`] full pages of [`DIRECTORY_TOP_MAX`].
+pub const GROUP_MEMBERS_MAX: usize = GROUP_MEMBER_PAGES_MAX * DIRECTORY_TOP_MAX;
+
 /// A directory `$search` value (#1942): `"displayName:<q>" OR "mail:<q>"`,
 /// `<q>` escaped as a message search's ([`escape_search_text`]) so it
 /// cannot end either clause, the whole value percent-encoded
@@ -3756,8 +3871,8 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::model::{Importance, MeetingMessageType};
-    use crate::testserver::{FakeServer, Route};
+    use crate::graph::model::{Importance, MeetingMessageType, MemberKind};
+    use crate::testserver::{FakeServer, RecordedRequest, Route};
 
     #[test]
     fn list_folders_parses() {
@@ -4158,6 +4273,391 @@ mod tests {
                 other => panic!("expected a {status}, got {other:?}"),
             }
         }
+    }
+
+    fn groups_page(items: &str) -> Route {
+        Route {
+            method: "GET".into(),
+            path_prefix: "/groups?".into(),
+            status: 200,
+            headers: vec![],
+            body: format!(r#"{{"value":[{items}]}}"#),
+        }
+    }
+
+    /// A members page at `prefix`, with a `nextLink` when `next` is given.
+    fn members_page(prefix: &str, items: &str, next: Option<&str>) -> Route {
+        let next = next
+            .map(|n| format!(r#","@odata.nextLink":"{n}""#))
+            .unwrap_or_default();
+        Route {
+            method: "GET".into(),
+            path_prefix: prefix.into(),
+            status: 200,
+            headers: vec![],
+            body: format!(r#"{{"value":[{items}]{next}}}"#),
+        }
+    }
+
+    fn has_consistency_level(r: &RecordedRequest) -> bool {
+        r.headers
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("ConsistencyLevel") && v == "eventual")
+    }
+
+    /// A user member `U<n>` with an address.
+    fn user_member(n: usize) -> String {
+        format!(
+            r##"{{"@odata.type":"#microsoft.graph.user","id":"U{n}","displayName":"User {n}","mail":"u{n}@contoso.com"}}"##
+        )
+    }
+
+    fn user_members(range: std::ops::Range<usize>) -> String {
+        range.map(user_member).collect::<Vec<_>>().join(",")
+    }
+
+    fn member_ids(list: &GroupMemberList) -> Vec<&str> {
+        list.members.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    #[test]
+    fn search_groups_sends_search_filter_count_select_top_and_consistency_level() {
+        let srv = FakeServer::start(vec![groups_page("")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.search_groups("jo", 10).unwrap(), vec![]);
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(
+            reqs[0].path,
+            "/groups?$search=%22displayName%3Ajo%22%20OR%20%22mail%3Ajo%22\
+             &$filter=mailEnabled%20eq%20true&$count=true\
+             &$select=id,displayName,mail,description&$top=10"
+        );
+        assert!(has_consistency_level(&reqs[0]), "{:?}", reqs[0].headers);
+    }
+
+    #[test]
+    fn search_groups_escapes_the_query_as_search_users_does() {
+        let srv = FakeServer::start(vec![groups_page("")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.search_groups(r#"x" OR "y"#, 5).unwrap();
+        let path = &srv.requests()[0].path;
+        assert!(
+            path.starts_with(&format!(
+                "/groups?$search={}&",
+                directory_search_value(r#"x" OR "y"#)
+            )),
+            "{path}"
+        );
+    }
+
+    #[test]
+    fn search_groups_reads_mail_enabled_groups_and_skips_ones_without_mail() {
+        let srv = FakeServer::start(vec![groups_page(
+            r#"{"id":"G1","displayName":"Sales","mail":"sales@contoso.com","description":"The sales team"},
+               {"id":"G2","displayName":"Team","mail":"team@contoso.com","description":null},
+               {"id":"G3","displayName":"No mail","mail":null},
+               {"displayName":"No id","mail":"noid@contoso.com"}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.search_groups("s", 10).unwrap(),
+            vec![
+                DirectoryGroup {
+                    id: "G1".into(),
+                    name: "Sales".into(),
+                    address: "sales@contoso.com".into(),
+                    description: Some("The sales team".into()),
+                },
+                DirectoryGroup {
+                    id: "G2".into(),
+                    name: "Team".into(),
+                    address: "team@contoso.com".into(),
+                    description: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn search_groups_clamps_top_and_sends_one_request() {
+        let srv = FakeServer::start(vec![Route {
+            body: r#"{"value":[],"@odata.nextLink":"/groups?$skiptoken=X"}"#.into(),
+            ..groups_page("")
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.search_groups("a", 0).unwrap();
+        c.search_groups("a", 5000).unwrap();
+        c.search_groups("a", DIRECTORY_TOP_MAX).unwrap();
+        let reqs = srv.requests();
+        // One request each: no `nextLink` is followed.
+        assert_eq!(reqs.len(), 3);
+        let tops: Vec<&str> = reqs
+            .iter()
+            .map(|r| r.path.rsplit("$top=").next().unwrap())
+            .collect();
+        assert_eq!(tops, ["1", "999", "999"]);
+    }
+
+    #[test]
+    fn search_groups_maps_403_and_500() {
+        for status in [403, 500] {
+            let srv = FakeServer::start(vec![Route {
+                status,
+                body: r#"{"error":{"code":"Authorization_RequestDenied"}}"#.into(),
+                ..groups_page("")
+            }]);
+            let c = GraphClient::new(&srv.base_url, "AT");
+            match c.search_groups("jo", 5) {
+                Err(GraphError::Http { status: s, .. }) if s == status => {}
+                other => panic!("expected a {status}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn group_members_sends_count_select_top_and_consistency_level() {
+        let srv = FakeServer::start(vec![members_page("/groups/", "", None)]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.group_members("G1", 50).unwrap(),
+            GroupMemberList::default()
+        );
+        // A base64-ish id is percent-encoded into its path segment.
+        c.group_members("a/b+c=", 5000).unwrap();
+        c.group_members("G1", 0).unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(
+            reqs[0].path,
+            "/groups/G1/members?$count=true\
+             &$select=id,displayName,mail,userPrincipalName,jobTitle,department&$top=50"
+        );
+        assert!(
+            reqs[1].path.starts_with("/groups/a%2Fb%2Bc%3D/members?"),
+            "{}",
+            reqs[1].path
+        );
+        // A page asks at most Graph's 999; `top` 0 asks one.
+        assert!(reqs[1].path.ends_with("&$top=999"), "{}", reqs[1].path);
+        assert!(reqs[2].path.ends_with("&$top=1"), "{}", reqs[2].path);
+        for r in &reqs {
+            assert!(has_consistency_level(r), "{:?}", r.headers);
+        }
+    }
+
+    #[test]
+    fn group_members_reads_kinds_and_skips_addressless_and_devices() {
+        let srv = FakeServer::start(vec![members_page(
+            "/groups/G1/members?",
+            r##"{"@odata.type":"#microsoft.graph.user","id":"U1","displayName":"Jo","mail":"jo@contoso.com","jobTitle":"Engineer","department":"R&D"},
+                {"@odata.type":"#microsoft.graph.user","id":"U2","displayName":"Ann","mail":null,"userPrincipalName":"ann@contoso.com"},
+                {"@odata.type":"#microsoft.graph.group","id":"G2","displayName":"Team","mail":"team@contoso.com"},
+                {"@odata.type":"#microsoft.graph.orgContact","id":"C1","displayName":"Ext","mail":"ext@fabrikam.com"},
+                {"@odata.type":"#microsoft.graph.user","id":"U3","displayName":"No address","mail":null,"userPrincipalName":"room"},
+                {"@odata.type":"#microsoft.graph.user","id":"x","mail":null},
+                {"@odata.type":"#microsoft.graph.group","id":"G3","displayName":"Security","mail":null},
+                {"@odata.type":"#microsoft.graph.orgContact","id":"C2","displayName":"No mail"},
+                {"@odata.type":"#microsoft.graph.device","id":"D1","displayName":"Laptop"}"##,
+            None,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let got = c.group_members("G1", 100).unwrap();
+        assert!(!got.truncated);
+        assert_eq!(
+            got.members,
+            vec![
+                GroupMember {
+                    kind: MemberKind::User,
+                    id: "U1".into(),
+                    name: "Jo".into(),
+                    address: "jo@contoso.com".into(),
+                    job_title: Some("Engineer".into()),
+                    department: Some("R&D".into()),
+                },
+                GroupMember {
+                    kind: MemberKind::User,
+                    id: "U2".into(),
+                    name: "Ann".into(),
+                    address: "ann@contoso.com".into(),
+                    job_title: None,
+                    department: None,
+                },
+                GroupMember {
+                    kind: MemberKind::Group,
+                    id: "G2".into(),
+                    name: "Team".into(),
+                    address: "team@contoso.com".into(),
+                    job_title: None,
+                    department: None,
+                },
+                GroupMember {
+                    kind: MemberKind::Contact,
+                    id: "C1".into(),
+                    name: "Ext".into(),
+                    address: "ext@fabrikam.com".into(),
+                    job_title: None,
+                    department: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn group_members_follows_next_link() {
+        // Page 3 is on another server, reached by a full-URL nextLink as
+        // Graph sends one (used verbatim); page 2 by a relative one. Page 2
+        // is listed first: the fake server answers the first route whose
+        // prefix matches.
+        let other = FakeServer::start(vec![members_page(
+            "/v1.0/groups/G1/members?$skiptoken=P3",
+            &user_members(4..5),
+            None,
+        )]);
+        let srv = FakeServer::start(vec![
+            members_page(
+                "/groups/G1/members?$skiptoken=P2",
+                &user_members(2..4),
+                Some(&format!(
+                    "{}/v1.0/groups/G1/members?$skiptoken=P3",
+                    other.base_url
+                )),
+            ),
+            members_page(
+                "/groups/G1/members?",
+                &user_members(0..2),
+                Some("/groups/G1/members?$skiptoken=P2"),
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let got = c.group_members("G1", 100).unwrap();
+        assert_eq!(member_ids(&got), ["U0", "U1", "U2", "U3", "U4"]);
+        assert!(!got.truncated);
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[1].path, "/groups/G1/members?$skiptoken=P2");
+        let far = other.requests();
+        assert_eq!(far.len(), 1);
+        assert_eq!(far[0].path, "/v1.0/groups/G1/members?$skiptoken=P3");
+        // Every page, the nextLink ones too, carries the header.
+        for r in reqs.iter().chain(&far) {
+            assert!(has_consistency_level(r), "{} {:?}", r.path, r.headers);
+        }
+    }
+
+    #[test]
+    fn group_members_stops_at_top_and_reports_truncated() {
+        // A page that runs past `top`: cut to `top`, truncated, its nextLink
+        // not followed.
+        let srv = FakeServer::start(vec![members_page(
+            "/groups/G1/members?",
+            &user_members(0..5),
+            Some("/groups/G1/members?$skiptoken=P2"),
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let got = c.group_members("G1", 3).unwrap();
+        assert_eq!(member_ids(&got), ["U0", "U1", "U2"]);
+        assert!(got.truncated);
+        assert_eq!(srv.requests().len(), 1);
+
+        // Past `top` on the last page: truncated though no nextLink is left.
+        let srv = FakeServer::start(vec![members_page(
+            "/groups/G1/members?",
+            &user_members(0..5),
+            None,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let got = c.group_members("G1", 4).unwrap();
+        assert_eq!(got.members.len(), 4);
+        assert!(got.truncated);
+
+        // Exactly `top` with a nextLink left: truncated, not followed.
+        let srv = FakeServer::start(vec![members_page(
+            "/groups/G1/members?",
+            &user_members(0..3),
+            Some("/groups/G1/members?$skiptoken=P2"),
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let got = c.group_members("G1", 3).unwrap();
+        assert_eq!(got.members.len(), 3);
+        assert!(got.truncated);
+        assert_eq!(srv.requests().len(), 1);
+    }
+
+    #[test]
+    fn group_members_exactly_top_on_the_last_page_is_not_truncated() {
+        let srv = FakeServer::start(vec![members_page(
+            "/groups/G1/members?",
+            &user_members(0..3),
+            None,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let got = c.group_members("G1", 3).unwrap();
+        assert_eq!(member_ids(&got), ["U0", "U1", "U2"]);
+        assert!(!got.truncated);
+    }
+
+    #[test]
+    fn group_members_stops_at_page_cap() {
+        // Every page's members are skipped and each links on (a link that
+        // loops): the read stops after the cap, truncated.
+        let srv = FakeServer::start(vec![members_page(
+            "/groups/G1/members?",
+            r##"{"@odata.type":"#microsoft.graph.device","id":"D1"}"##,
+            Some("/groups/G1/members?$skiptoken=again"),
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let got = c.group_members("G1", 100).unwrap();
+        assert!(got.members.is_empty());
+        assert!(got.truncated);
+        assert_eq!(srv.requests().len(), GROUP_MEMBER_PAGES_MAX);
+        assert_eq!(GROUP_MEMBERS_MAX, 9_990);
+    }
+
+    #[test]
+    fn group_members_page_failure_is_err_not_partial() {
+        let srv = FakeServer::start(vec![
+            Route {
+                status: 500,
+                body: r#"{"error":{"code":"InternalServerError"}}"#.into(),
+                ..members_page("/groups/G1/members?$skiptoken=P2", "", None)
+            },
+            members_page(
+                "/groups/G1/members?",
+                &user_members(0..2),
+                Some("/groups/G1/members?$skiptoken=P2"),
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        match c.group_members("G1", 100) {
+            Err(GraphError::Http { status: 500, .. }) => {}
+            other => panic!("expected a 500, got {other:?}"),
+        }
+        assert_eq!(srv.requests().len(), 2);
+    }
+
+    #[test]
+    fn group_members_maps_403_500_and_404() {
+        for status in [403, 500] {
+            let srv = FakeServer::start(vec![Route {
+                status,
+                body: r#"{"error":{"code":"Authorization_RequestDenied"}}"#.into(),
+                ..members_page("/groups/", "", None)
+            }]);
+            let c = GraphClient::new(&srv.base_url, "AT");
+            match c.group_members("G1", 5) {
+                Err(GraphError::Http { status: s, .. }) if s == status => {}
+                other => panic!("expected a {status}, got {other:?}"),
+            }
+        }
+        let srv = FakeServer::start(vec![Route {
+            status: 404,
+            body: r#"{"error":{"code":"Request_ResourceNotFound"}}"#.into(),
+            ..members_page("/groups/", "", None)
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.group_members("gone", 5), Err(GraphError::NotFound));
     }
 
     #[test]
