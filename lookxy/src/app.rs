@@ -933,6 +933,9 @@ impl App {
             // another user's photo (#2157).
             | SyncEvent::UserPhotoFetched { .. }
             | SyncEvent::UserPhotoFailed { .. }
+            // Nor anyone's presence, so it never asks for it (#2158).
+            | SyncEvent::PresencesFetched { .. }
+            | SyncEvent::PresencesFailed { .. }
             // lookxy has no folder management, so it never creates,
             // renames or moves a folder (#1910).
             | SyncEvent::FolderCreated { .. }
