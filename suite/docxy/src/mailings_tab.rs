@@ -995,6 +995,10 @@ impl Docxy {
     /// never in a harness instance (its modal loop stops the control pump):
     /// there the `mail-attach` verb hands the path in instead.
     fn pick_recipients(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // No tab to attach to: nothing to ask, as `mail_dispatch` does.
+        if self.tabs.get(self.active).is_none() {
+            return self.refocus(window, cx);
+        }
         if self.harness {
             self.set_status(MAIL_ATTACH_HARNESS);
             return self.refocus(window, cx);
