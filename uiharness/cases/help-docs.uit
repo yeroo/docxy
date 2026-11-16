@@ -388,18 +388,19 @@ test F1 with the keyboard in a pane opens that pane's page
   assert reply.page is navigation
   assert reply.via is exact
   call real-key {"key":"ctrl+w"}
-  # A press in the document: Home's area page, as before.
+  # A press in the document (the window's centre; basic.docx is empty):
+  # Home's area page, as before.
   call ribbon-layout {"tab":"Home"}
-  call pointer-click {"region":"doc-line-start:0"}
+  call pointer-click {"region":"window"}
   call real-key {"key":"f1"}
   call help-read {}
   assert reply.page is home
   assert reply.via is area
   call real-key {"key":"ctrl+w"}
   # A key that reaches the document: the area page. A bare modifier is not
-  # one.
+  # one (Alt, which raises the KeyTips; F1 lowers them).
   call pointer-click {"region":"pane:navigation"}
-  call real-key {"key":"shift"}
+  call real-key {"key":"alt"}
   call real-key {"key":"f1"}
   call help-read {}
   assert reply.page is navigation
