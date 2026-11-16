@@ -29634,6 +29634,9 @@ impl Docxy {
             cx.notify();
             return;
         }
+        // Past the overlays, Tab goes to the surface (or the KeyTips): the
+        // keyboard leaves the focused pane, as for `on_key`'s keys (#2077).
+        self.pane_focus = None;
         if self.project_prompt_open() {
             return;
         }
@@ -29772,6 +29775,9 @@ impl Docxy {
             cx.notify();
             return;
         }
+        // Past the overlays, Tab goes to the surface (or the KeyTips): the
+        // keyboard leaves the focused pane, as for `on_key`'s keys (#2077).
+        self.pane_focus = None;
         if self.project_prompt_open() {
             return;
         }

@@ -412,6 +412,21 @@ test F1 with the keyboard in a pane opens that pane's page
   assert reply.page is home
   assert reply.via is area
   call real-key {"key":"ctrl+w"}
+  # Tab and Shift+Tab are actions, not `on_key`'s keys: they clear it too.
+  call pointer-click {"region":"pane:navigation"}
+  call real-key {"key":"tab"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is home
+  assert reply.via is area
+  call real-key {"key":"ctrl+w"}
+  call pointer-click {"region":"pane:navigation"}
+  call real-key {"key":"shift+tab"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is home
+  assert reply.via is area
+  call real-key {"key":"ctrl+w"}
   # A pane no page keys, on a tab with no area page: Review > Comments pane,
   # the root.
   call ribbon-click {"tab":"Review","command":"togglecomments"}
@@ -421,17 +436,10 @@ test F1 with the keyboard in a pane opens that pane's page
   assert reply.page is welcome
   assert reply.via is root
   call real-key {"key":"ctrl+w"}
-  # A pane closed since the press: the area page.
-  call pointer-click {"region":"pane:comments"}
   call ribbon-click {"tab":"Review","command":"togglecomments"}
   call-error pointer-move {"to":"pane:comments"} => the comments pane is not drawn
-  call ribbon-layout {"tab":"Home"}
-  call real-key {"key":"f1"}
-  call help-read {}
-  assert reply.page is home
-  assert reply.via is area
-  call real-key {"key":"ctrl+w"}
   # A hovered ribbon command still wins over the pane the keyboard is in.
+  call ribbon-layout {"tab":"Home"}
   call pointer-click {"region":"pane:navigation"}
   call pointer-move {"to":"ribbon-cmd:b"}
   call real-key {"key":"f1"}
@@ -439,8 +447,18 @@ test F1 with the keyboard in a pane opens that pane's page
   assert reply.page is home-font
   assert reply.via is exact
   call real-key {"key":"ctrl+w"}
+  # A pane closed since the press (a ribbon-click is no press, so the
+  # keyboard is still in it): the area page, not the pane's.
+  call pointer-click {"region":"pane:navigation"}
   call ribbon-click {"tab":"View","command":"nav"}
-  call-error pointer-click {"region":"pane:navigation"} => the navigation pane is not drawn
+  call-error pointer-move {"to":"pane:navigation"} => the navigation pane is not drawn
+  call ribbon-layout {"tab":"Home"}
+  call pointer-move {"to":"window"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is home
+  assert reply.via is area
+  call real-key {"key":"ctrl+w"}
 
 test without a manual for the editor, Help and F1 still say it is coming
   open ../fixtures/basic.xlsx
