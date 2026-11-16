@@ -127,7 +127,8 @@ issue number to find its notes.
   Items after a send (#1885), folders and counts on every tick, deleted folders (#1886),
   a failed send back to Drafts (#1874), the signed-in user's profile, photo and Sign
   out (#1920), their company and organisation name (#1997), another user's
-  photo by address, a 403 told apart (#2157), a different mailbox
+  photo by address, a 403 told apart (#2157), presence of users by
+  address, a 403 told apart (#2158), a different mailbox
   signing in resets the store, its outbox dropped (#1946), granted scopes and a
   refused sign-in's `error_description` (#1875),
   `Content-Length` on bodiless POSTs and one-line HTTP error text (#1954), inline outbound
