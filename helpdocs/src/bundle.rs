@@ -431,6 +431,7 @@ pub(crate) mod tests {
                 ("images", 1),
                 ("keyboard", 0),
                 ("help", 0),
+                ("navigation", 0),
             ]
         );
         let ids: Vec<&str> = word.pages.iter().map(|p| p.id.as_str()).collect();
