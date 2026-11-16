@@ -39,7 +39,8 @@
 //! the server, `SyncCommand::FetchFolderSizes`, #2123, a search of the
 //! organisation's directory, `SyncCommand::SearchDirectory`, #1942, and of
 //! its groups and a group's members, `SyncCommand::SearchGroups` and
-//! `SyncCommand::FetchGroupMembers`, #2058) never waits for a whole pass: long
+//! `SyncCommand::FetchGroupMembers`, #2058, and another user's photo,
+//! `SyncCommand::FetchUserPhoto`, #2157) never waits for a whole pass: long
 //! work calls `Engine::checkpoint` between folders, delta pages and body
 //! fetches, which serves it at once and keeps every other command for after
 //! the work, in order.
@@ -1982,8 +1983,9 @@ fn command_writes_event_locally(cmd: &SyncCommand) -> bool {
 }
 
 /// The commands a `checkpoint` serves at once, between two requests of
-/// long work (#1978, #2006, #2123), instead of keeping them for the main
-/// loop: a click costs its own round trips plus the request in flight.
+/// long work (#1978, #2006, #2123, #1942, #2058, #2157), instead of keeping
+/// them for the main loop: a click costs its own round trips plus the
+/// request in flight.
 fn served_at_checkpoint(cmd: &SyncCommand) -> bool {
     matches!(
         cmd,
@@ -2950,8 +2952,9 @@ impl Engine {
     /// two requests of long work (#1978): a `FetchBody`, a `SearchMessages`
     /// or a `FetchMessage` (#2006), a `FetchFolderSizes` (#2123), a
     /// `SearchDirectory` (#1942), a `SearchGroups` or a `FetchGroupMembers`
-    /// (#2058) is served at once, so a click costs its own round trips plus the request
-    /// in flight, not a whole pass; every other command is kept (`deferred`)
+    /// (#2058), or a `FetchUserPhoto` (#2157) is served at once, so a click
+    /// costs its own round trips plus the request in flight, not a whole
+    /// pass; every other command is kept (`deferred`)
     /// for the main loop, in order. A `Shutdown` or a dropped handle sets
     /// `shutting_down`, and as the channel is read up to it before anything
     /// is served, a read sent before a `Shutdown` is never served (#2127).

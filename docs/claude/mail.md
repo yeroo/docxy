@@ -4219,7 +4219,8 @@ quarantine re-listed the mailbox and brought the lost writes back.
   first command.
 - `Engine::checkpoint` is built on `take_waiting`: it reads the channel up to a waiting
   `Shutdown` first, then serves the kept commands of a served kind (`served_at_checkpoint`:
-  `FetchBody`, `SearchMessages`, `FetchMessage`, `FetchFolderSizes`, `SearchDirectory`) out of
+  `FetchBody`, `SearchMessages`, `FetchMessage`, `FetchFolderSizes`, `SearchDirectory`,
+  `SearchGroups` and `FetchGroupMembers` (#2058), `FetchUserPhoto` (#2157)) out of
   `deferred`, one at a time, taking again after each. A read sent before a `Shutdown` is therefore never served,
   in the bulk runs' checkpoints inside a drain too. Outside a shutdown the order is unchanged:
   a served kind in `deferred` is one the drain took early, which the old `checkpoint` would have
