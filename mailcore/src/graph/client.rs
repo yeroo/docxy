@@ -2335,8 +2335,11 @@ impl GraphClient {
     /// Sets a Contacts-folder contact's photo (#2065): PUT the raw `bytes`
     /// to `/me/contacts/{id}/photo/$value` with `Content-Type: content_type`
     /// (`image/jpeg` when empty, the type Graph documents). Graph's answer
-    /// body is not read. Empty bytes, or more than [`PHOTO_MAX`] (Graph's
-    /// own limit is 4 MB), are refused as a `Parse` error before any request.
+    /// body is not read. Empty bytes, more than [`PHOTO_MAX`] (Graph's own
+    /// limit is 4 MB), or a type that is no valid header value
+    /// ([`photo_content_type`]) are refused as a `Parse` error before any
+    /// request: never the `Transport` error ureq would give a bad header,
+    /// which would stop the outbox at the op for ever.
     /// No allow-list of types: Graph refuses what it does not take, as an
     /// `Http` 4xx.
     ///
@@ -2358,9 +2361,10 @@ impl GraphClient {
         if bytes.len() > PHOTO_MAX {
             return Err(photo_too_large(PHOTO_MAX));
         }
-        let content_type = match content_type.trim() {
-            "" => "image/jpeg",
-            t => t,
+        let Some(content_type) = photo_content_type(content_type) else {
+            return Err(GraphError::Parse(format!(
+                "contact photo type {content_type:?} is not a valid Content-Type"
+            )));
         };
         let path = format!("/me/contacts/{}/photo/$value", encode_path_segment(id));
         self.put_binary(&path, content_type, bytes)?;
@@ -3142,6 +3146,24 @@ fn response_too_large(max: usize) -> GraphError {
 /// sends (#2065). Graph's photos are a few kilobytes; anything near this is
 /// not a photo.
 pub const PHOTO_MAX: usize = 4 * 1024 * 1024;
+
+/// The `Content-Type` a contact photo is sent with (#2065): `type_` trimmed,
+/// `image/jpeg` (the type Graph documents) when that is empty, `None` when
+/// it is not a header value ureq sends. ureq refuses a header byte other
+/// than a space, a tab or 0x21-0x7E as a transport error (`BadHeader`),
+/// which the drain would take for offline and retry for ever; so both the
+/// store and the client refuse such a type up front. A type must also hold
+/// a `/` (`type/subtype`).
+pub(crate) fn photo_content_type(type_: &str) -> Option<&str> {
+    let t = type_.trim();
+    if t.is_empty() {
+        return Some("image/jpeg");
+    }
+    let header_safe = t
+        .bytes()
+        .all(|b| b == b' ' || b == b'\t' || (0x21..=0x7E).contains(&b));
+    (header_safe && t.contains('/')).then_some(t)
+}
 
 fn photo_too_large(max: usize) -> GraphError {
     GraphError::Parse(format!("photo is larger than {max} bytes"))
@@ -8009,6 +8031,46 @@ mod tests {
             c.set_contact_photo("G1", b"P", "image/jpeg"),
             Err(GraphError::Http { status: 403, .. })
         ));
+    }
+
+    #[test]
+    fn set_contact_photo_refuses_a_bad_type_without_a_request() {
+        let srv = FakeServer::start(vec![contact_photo_route(
+            "PUT",
+            "/me/contacts/G1/photo/$value",
+            200,
+            "",
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        for bad in ["image/jpég", "image/jpeg\r\nX: y", "image/\u{7f}", "jpeg"] {
+            assert!(
+                matches!(
+                    c.set_contact_photo("G1", b"P", bad),
+                    Err(GraphError::Parse(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        assert!(srv.requests().is_empty());
+        // A parameter with its space is a valid header value.
+        c.set_contact_photo("G1", b"P", " image/png; q=1 ").unwrap();
+        let reqs = srv.requests();
+        assert_eq!(header_values(&reqs[0], "content-type"), ["image/png; q=1"]);
+    }
+
+    #[test]
+    fn photo_content_type_defaults_and_refuses() {
+        assert_eq!(photo_content_type(""), Some("image/jpeg"));
+        assert_eq!(photo_content_type("  "), Some("image/jpeg"));
+        assert_eq!(photo_content_type(" image/png "), Some("image/png"));
+        assert_eq!(photo_content_type("image/jpég"), None);
+        assert_eq!(
+            photo_content_type("image/png\n"),
+            Some("image/png"),
+            "trimmed"
+        );
+        assert_eq!(photo_content_type("image/\npng"), None);
+        assert_eq!(photo_content_type("png"), None);
     }
 
     #[test]

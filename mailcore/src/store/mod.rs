@@ -15,7 +15,7 @@ use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use crate::graph::client::{
-    AttendeeInput, ContactFieldSet, EventFieldSet, PHOTO_MAX, event_zone_error,
+    AttendeeInput, ContactFieldSet, EventFieldSet, PHOTO_MAX, event_zone_error, photo_content_type,
 };
 use crate::graph::model::{
     AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Calendar, ContactFields,
@@ -6059,21 +6059,29 @@ impl Store {
     /// (#2063): `server` is the record `GET /me/contacts/{id}` returned
     /// (written over the row, or added back after a refused delete), `None`
     /// when Graph answered 404 (the row is deleted). Queues nothing. In one
-    /// transaction it first checks the queue: while any contact op names the
-    /// contact (an edit written since the re-read began), nothing is written
-    /// and `false` is returned, the re-read still owed; otherwise the owed
-    /// re-read (`owe_contact_reread`) is cleared and `true` returned.
+    /// transaction it first checks the queue: while a queued create, update
+    /// or delete names the contact (an edit written since the re-read
+    /// began), nothing is written and `false` is returned, the re-read still
+    /// owed; otherwise the owed re-read (`owe_contact_reread`) is cleared and
+    /// `true` returned. A queued `SetContactPhoto` (#2065) does not hold the
+    /// re-read, but on a 404 it keeps the row: deleting it would take the
+    /// pending photo with it unreported. The re-read is still cleared; the
+    /// photo's own PUT then 404s, reports the photo and owes a new re-read,
+    /// which deletes the row once no photo set names it. (Should that PUT be
+    /// refused otherwise, the row stays until the next full pass.)
     pub(crate) fn revert_folder_contact(
         &self,
         id: &str,
         server: Option<&FolderContact>,
     ) -> Result<bool, StoreError> {
         let tx = self.write_tx()?;
-        if queued_contacts_on(&tx)?.any.contains(id) {
+        let queued = queued_contacts_on(&tx)?;
+        if queued.any.contains(id) {
             return Ok(false);
         }
         match server {
             Some(c) => write_contact_on(&tx, id, &c.change_key, &c.fields)?,
+            None if queued.photo.contains(id) => {}
             None => {
                 tx.execute("DELETE FROM contact_records WHERE id = ?1", params![id])?;
             }
@@ -6095,7 +6103,9 @@ impl Store {
     }
 
     /// The owed re-reads (`owe_contact_reread`), each with whether a queued
-    /// contact op still names it. A plain read, no write lock: it runs on
+    /// create, update or delete still names it (not a `SetContactPhoto`,
+    /// #2065, which never reads or writes the fields; see
+    /// `revert_folder_contact` for its 404 guard). A plain read, no write lock: it runs on
     /// every drain, and `revert_folder_contact` checks the queue again
     /// inside its own write transaction.
     pub(crate) fn owed_contact_rereads(&self) -> Result<Vec<(String, bool)>, StoreError> {
@@ -6222,7 +6232,9 @@ impl Store {
     /// the PUT; a fetch meanwhile answers from it and records nothing. An
     /// empty `content_type` is stored as `image/jpeg`, the type Graph takes.
     /// `false` when no such contact is stored (nothing written or queued);
-    /// empty bytes, or more than `PHOTO_MAX`, are `StoreError::Invalid`.
+    /// empty bytes, more than `PHOTO_MAX`, or a type that is no valid header
+    /// value (`photo_content_type`: a non-ASCII or control byte, no `/`) are
+    /// `StoreError::Invalid`, nothing written or queued.
     /// Each set queues its own op; the first to run sends the latest photo.
     pub fn set_contact_photo(
         &self,
@@ -6238,9 +6250,10 @@ impl Store {
                 "a contact photo is larger than {PHOTO_MAX} bytes"
             )));
         }
-        let content_type = match content_type.trim() {
-            "" => "image/jpeg",
-            t => t,
+        let Some(content_type) = photo_content_type(content_type) else {
+            return Err(StoreError::Invalid(format!(
+                "a contact photo type {content_type:?} is not a valid Content-Type"
+            )));
         };
         let tx = self.write_tx()?;
         let id = resolve_contact_id_on(&tx, id)?;
@@ -12902,6 +12915,16 @@ mod tests {
             s.set_contact_photo("G1", &vec![0; PHOTO_MAX + 1], "image/jpeg"),
             Err(StoreError::Invalid(_))
         ));
+        // A type ureq could not send as a header (#2065 r1).
+        for bad in ["image/jpég", "image/\u{1}png", "jpeg"] {
+            assert!(
+                matches!(
+                    s.set_contact_photo("G1", &[1], bad),
+                    Err(StoreError::Invalid(_))
+                ),
+                "{bad:?}"
+            );
+        }
         assert_eq!(photo_ops(&s).len(), 2);
         assert_eq!(s.pending_contact_photo("G1").unwrap().unwrap().1, 2);
 
@@ -13063,6 +13086,26 @@ mod tests {
             s.pending_contact_photo("G1").unwrap().is_some(),
             "upsert keeps it"
         );
+    }
+
+    #[test]
+    fn reread_404_keeps_a_contact_a_photo_set_names() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[contact_record("G1", "Ann", &[])])
+            .unwrap();
+        s.set_contact_photo("G1", b"P", "image/jpeg").unwrap();
+        s.owe_contact_reread("G1").unwrap();
+        // Graph answered 404: the photo set keeps the row, the owe is cleared.
+        assert!(s.revert_folder_contact("G1", None).unwrap());
+        assert!(s.folder_contact("G1").unwrap().is_some());
+        assert!(s.pending_contact_photo("G1").unwrap().is_some());
+        assert!(s.owed_contact_rereads().unwrap().is_empty());
+        // Once the photo op is gone, a 404 deletes it.
+        for r in s.pending_ops().unwrap() {
+            s.drop_op(r.seq);
+        }
+        assert!(s.revert_folder_contact("G1", None).unwrap());
+        assert!(s.folder_contact("G1").unwrap().is_none());
     }
 
     #[test]
