@@ -894,10 +894,15 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   (`FixturePage::show`; Account shows Options and Options Account) that
   dispatches the action from inside File, recording `show_bounds`.
 - Harness: `ext-show-page {"id"}` dispatches the action from the focused
-  element, as `ext-close-tab` does: refused under a dialog, and on the
-  fixture's tab with File down unless the focus is in its view; with File
-  up, or on another tab, any focus. `from` is `view` when the focus is in
-  the fixture's view, else `suite`. `ext-page-read` adds `show_bounds`, and
+  element, as `ext-close-tab` does: refused under a dialog, on the
+  fixture's tab with File down unless the focus is in its view, and with
+  File up while it still is. File hides the view, and gpui sends an action
+  dispatched from a focus it did not draw to the window's root node (the
+  gpui-component `Root`), above the suite's listener, so it would be
+  dropped. A person's click in File focuses the suite root first, so a
+  case clicks in File (a rail entry) before it dispatches; a harness
+  `backstage open` or `account open` moves no focus. On another tab any
+  focus. `from` is `view` or `suite`. `ext-page-read` adds `show_bounds`, and
   the region `ext-page-show:<id>` is that page's Show button.
   `ext-backstage.uit`'s `issue 2204` tests drive it: from the view, an
   unknown and an empty id, File already up (from Account and from a page's

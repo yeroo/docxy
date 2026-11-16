@@ -246,10 +246,21 @@ test issue 2204 File already up switches to the page, and a page's own button to
   call new-card {"card":"new-mail-card"}
   shot window
   call backstage {"action":"open"}
+  shot window
+  # The harness's open moved no focus: it is still in the view File hides,
+  # where gpui would drop the action, so the verb refuses.
+  call-error ext-show-page {"id":"fx.account"} => File is up but the focus is still in the test extension's view, which File hides: click in File first
+  # A real click in File, as a person's, moves the focus off the hidden
+  # view to the suite; then the suite's Account page.
+  call pointer-click {"region":"bs-ext:fx.options"}
+  shot window
   call account {"action":"open"}
   assert reply.open is true
+  call backstage {"action":"read"}
+  assert reply.ext_page is null
   shot window
   call ext-show-page {"id":"fx.account"}
+  assert reply.from is suite
   shot window
   call account {"action":"read"}
   assert reply.open is false

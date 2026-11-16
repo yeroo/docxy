@@ -5973,11 +5973,13 @@ fn dispatch_verb(
         // `ext::ShowBackstagePage { id }` dispatched as an extension's view
         // or File page does (#2204): `window.dispatch_action` from the
         // focused element. On the test extension's tab with File down that
-        // must be inside its view (else it is refused); with File up, or on
-        // any other tab, it is whatever has the focus. `from` is `view` when
-        // the focus is in the test extension's view, else `suite`. gpui runs
-        // it after this reply: the case draws a frame (`shot window`) before
-        // reading File.
+        // must be inside its view; with File up it must not be, since File
+        // hides the view and gpui sends an action from a focus it did not
+        // draw to the window's root, above the suite's listener (a real
+        // click in File focuses the suite). Either is refused. On any other
+        // tab it is whatever has the focus. `from` is `view` or `suite`.
+        // gpui runs it after this reply: the case draws a frame (`shot
+        // window`) before reading File.
         "ext-show-page" => {
             app.refuse_under_dialog()?;
             let id = arg_str(args, "id")?.to_string();
@@ -5986,10 +5988,16 @@ fn dispatch_verb(
                     let f = fixture.read(cx);
                     let view = f.doc.read(cx).focus_handle();
                     let in_view = view.contains_focused(window, cx) || f.header_focused(window);
-                    if !in_view && !app.backstage {
-                        return Err("the test extension's view does not have the focus".into());
+                    match (app.backstage, in_view) {
+                        (false, false) => {
+                            return Err("the test extension's view does not have the focus".into());
+                        }
+                        (true, true) => {
+                            return Err("File is up but the focus is still in the test extension's view, which File hides: click in File first".into());
+                        }
+                        (false, true) => "view",
+                        (true, false) => "suite",
                     }
-                    if in_view { "view" } else { "suite" }
                 }
                 Err(_) => "suite",
             };
