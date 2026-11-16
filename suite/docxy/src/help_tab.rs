@@ -6,8 +6,9 @@
 //! `help_view`) when one is installed (`help_manual`), else say the
 //! documentation is coming: Help on its own page (the `help` key), F1 on the
 //! page of the ribbon command under the pointer (#1869, its id, else its
-//! area's), else on the active ribbon tab's area page, or on the page of the
-//! open dialog (`dialog:<id>`). Contact
+//! area's), else on the focused pane's (#2077, `pane:<id>`), else on the
+//! active ribbon tab's area page, or on the page of the open dialog
+//! (`dialog:<id>`). Contact
 //! Support and Feedback open the docxy GitHub new-issue page with the build
 //! pre-filled ([`buildinfo::BuildInfo::feedback_url`]); under the harness the
 //! URL is recorded, not opened, and `last-url` reads it. About docxy suite opens
@@ -204,6 +205,163 @@ pub(crate) fn f1_command_ask(kind: Option<Kind>, id: &str, area: &str) -> HelpAs
     }
 }
 
+/// A side pane F1 can open the page of (#2077), keyed `pane:<id>` in the
+/// manuals (`docs/manual/README.md`, Context help).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pane {
+    /// The document's Navigation pane (`nav_panel`).
+    Navigation,
+    /// The document's Comments pane (`comments_panel`).
+    Comments,
+    /// The document's footnotes and endnotes pane (`notes_panel`).
+    Notes,
+    /// The sheet's Office Clipboard (`office_clip_panel`).
+    OfficeClipboard,
+    /// The sheet's PivotTable Fields (`pivot_panel`).
+    PivotFields,
+    /// The sheet's Chart panel (`chart_panel`).
+    Chart,
+    /// Project's Timeline (`project::timeline_el`).
+    Timeline,
+}
+
+impl Pane {
+    pub(crate) const ALL: [Pane; 7] = [
+        Pane::Navigation,
+        Pane::Comments,
+        Pane::Notes,
+        Pane::OfficeClipboard,
+        Pane::PivotFields,
+        Pane::Chart,
+        Pane::Timeline,
+    ];
+
+    /// The id after `pane:` in a manual's `keys` and the harness region.
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Pane::Navigation => "navigation",
+            Pane::Comments => "comments",
+            Pane::Notes => "notes",
+            Pane::OfficeClipboard => "office-clipboard",
+            Pane::PivotFields => "pivottable-fields",
+            Pane::Chart => "chart",
+            Pane::Timeline => "timeline",
+        }
+    }
+
+    /// The pane `id` names (`navigation`), or `None`.
+    pub(crate) fn from_id(id: &str) -> Option<Pane> {
+        Pane::ALL.into_iter().find(|p| p.id() == id)
+    }
+
+    /// The manual the pane's page is in: the editor of the surface that
+    /// draws it.
+    #[cfg(test)]
+    pub(crate) fn editor(self) -> HelpEditor {
+        match self {
+            Pane::Navigation | Pane::Comments | Pane::Notes => HelpEditor::Word,
+            Pane::OfficeClipboard | Pane::PivotFields | Pane::Chart => HelpEditor::Excel,
+            Pane::Timeline => HelpEditor::Project,
+        }
+    }
+
+    /// The context id F1 asks the manual for: `pane:<id>`.
+    pub(crate) fn key(self) -> String {
+        pane_probe(self)
+    }
+}
+
+/// The prefix of the probe every pane draws over its whole area (#2077):
+/// a press in it focuses the pane ([`pane_at`]), F1 reads the focus only
+/// while it is drawn ([`pane_on_screen`]), and the harness aims at it
+/// (`pane:<id>`). The same text as the manuals' key.
+pub(crate) const PANE_PROBE: &str = "pane:";
+
+/// The probe name of `pane`, which is also its manual key.
+pub(crate) fn pane_probe(pane: Pane) -> String {
+    format!("{PANE_PROBE}{}", pane.id())
+}
+
+/// The pane whose probe in `frame` (the frame on screen, in drawn order)
+/// contains the press `at`, or `None` off every pane. The last drawn wins.
+pub(crate) fn pane_at(frame: &[(String, Bounds<Pixels>)], at: Point<Pixels>) -> Option<Pane> {
+    frame.iter().rev().find_map(|(name, b)| {
+        name.strip_prefix(PANE_PROBE)
+            .filter(|_| b.contains(&at))
+            .and_then(Pane::from_id)
+    })
+}
+
+/// `pane` while `frame` (the frame on screen) still draws it, else `None`:
+/// a pane closed since the press, or one the active tab does not show.
+pub(crate) fn pane_on_screen(
+    frame: &[(String, Bounds<Pixels>)],
+    pane: Option<Pane>,
+) -> Option<Pane> {
+    let pane = pane?;
+    let name = pane_probe(pane);
+    frame.iter().any(|(n, _)| *n == name).then_some(pane)
+}
+
+/// Whether a key that reaches the surface leaves the focused pane as it is:
+/// only a bare modifier (it is half of a chord, or the KeyTips' Alt) and F1
+/// itself. Any other key went to the document, grid or plan, or to the
+/// KeyTips, so the keyboard is no longer in the pane.
+pub(crate) fn keeps_pane_focus(key: &str) -> bool {
+    matches!(
+        key,
+        "shift" | "control" | "alt" | "platform" | "function" | "f1"
+    )
+}
+
+/// What is up over the window when a press lands, for
+/// [`press_sets_pane_focus`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PressOver {
+    /// A context or split menu.
+    pub menu: bool,
+    /// A ribbon flyout (a folded group, a gallery's More).
+    pub ribbon_flyout: bool,
+    /// File (the backstage), over the whole window.
+    pub backstage: bool,
+    /// The tab strip's More list, whose backdrop covers the window.
+    pub tab_more: bool,
+    /// A dialog of the active tab.
+    pub tab_dialog: bool,
+    /// An app dialog.
+    pub app_dialog: bool,
+}
+
+/// Whether a press sets the focused pane (#2077): not while an overlay is
+/// up, which may be drawn over a pane, and a press on it is not a press in
+/// the pane. Then the focus stays as it was.
+pub(crate) fn press_sets_pane_focus(over: PressOver) -> bool {
+    over == PressOver::default()
+}
+
+/// F1 while an entry owns the keys (#2077): the Chart pane when the entry is
+/// one of its fields (`chart_field`) and no other (`other_entry`: the Find
+/// bar, the Name Box, a cell editor, ...) and the pane is drawn
+/// (`chart_drawn`). `None` leaves F1 to the entry, as before.
+pub(crate) fn entry_pane_help(
+    chart_field: bool,
+    other_entry: bool,
+    chart_drawn: bool,
+) -> Option<Pane> {
+    (chart_field && !other_entry && chart_drawn).then_some(Pane::Chart)
+}
+
+/// F1 with the focused pane `pane` (on screen): its page, else the area
+/// page of the ribbon tab shown (`area`), else the root, in the manual of
+/// the tab's kind.
+pub(crate) fn f1_pane_ask(kind: Option<Kind>, pane: Pane, area: &str) -> HelpAsk {
+    HelpAsk {
+        editor: help_view::host::editor_for(kind),
+        id: Some(pane.key()),
+        area: Some(area.to_string()),
+    }
+}
+
 /// Help › Help (the ribbon's, the sheet's, the macOS menu's): the `help`
 /// command's page, in the manual of the tab's kind, or on a Help tab
 /// (`help_tab`: the macOS menu bar reaches one) in that tab's manual.
@@ -301,7 +459,8 @@ impl Docxy {
     }
 
     /// F1 with no dialog and no entry owning the keys: the page of the
-    /// ribbon command under the pointer (#1869), else the area page of the
+    /// ribbon command under the pointer (#1869), else of the focused pane
+    /// while it is drawn (#2077, `pane_focus`), else the area page of the
     /// ribbon tab shown, or the root of the Help tab's manual; with no manual
     /// installed the status line says the documentation is coming.
     ///
@@ -322,13 +481,34 @@ impl Docxy {
                     .map(str::to_string)
             })
             .flatten();
-        let ask = match hovered {
-            Some(id) => f1_command_ask(kind, &id, area),
-            None => f1_ask(kind, area, help_tab),
+        // Else the focused pane (#2077), only while it is still drawn.
+        let pane = help_tab
+            .is_none()
+            .then(|| pane_on_screen(self.probes.borrow().on_screen_frame(), self.pane_focus))
+            .flatten();
+        let ask = match (hovered, pane) {
+            (Some(id), _) => f1_command_ask(kind, &id, area),
+            (None, Some(pane)) => f1_pane_ask(kind, pane, area),
+            (None, None) => f1_ask(kind, area, help_tab),
         };
         if !self.open_help(ask, window, cx) {
             self.set_status(DOCS_COMING);
             self.refocus(window, cx);
+        }
+    }
+
+    /// F1 in a Chart panel field (#2077, [`entry_pane_help`]): the pane's
+    /// page in a Help tab, which, as any tab switch, drops the field and
+    /// closes the panel (`drop_grid_state`); with no manual installed the
+    /// status line says the documentation is coming and the field keeps the
+    /// keys.
+    pub(crate) fn pane_f1(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
+        self.keytips = KeyTip::Off;
+        let kind = self.tabs.get(self.active).map(|t| t.kind);
+        let area = crate::ribbon_tab_name(self.ribbon_tab);
+        if !self.open_help(f1_pane_ask(kind, pane, area), window, cx) {
+            self.set_status(DOCS_COMING);
+            cx.notify();
         }
     }
 

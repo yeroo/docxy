@@ -1013,6 +1013,9 @@ pub enum Region {
     /// (a swatch gallery in place and in its More flyout) is the first one
     /// on screen.
     RibbonCmd(&'static str),
+    /// A side pane F1 opens the page of (#2077), by its id: `pane:navigation`,
+    /// over the whole pane, while it is drawn.
+    Pane(crate::help_tab::Pane),
     /// An extension page's File rail entry, by the page's id (#1923).
     BackstageExt(&'static str),
     /// The AutoFilter button on column `.0`'s header cell (#690).
@@ -1063,7 +1066,7 @@ const DOC_BAR_REGIONS: [&str; 8] = [
 /// `project-hbar-chart`, `project-vbar`, `project-timeline`, `project-split`,
 /// `gallery`, `tab-chip:0`, `filter-button:B`, `backstage-content`,
 /// `backstage-rail`, `ribbon-launch:Number`, `qat-undo`, `qat-redo`,
-/// `qat-undo-arrow`, `qat-redo-arrow`.
+/// `qat-undo-arrow`, `qat-redo-arrow`, `pane:navigation` (#2077).
 ///
 /// `cell:` takes a range as readily as a single cell, so an assertion about a
 /// selection border names the selection rather than its two corners.
@@ -1158,6 +1161,16 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
                 .filter(|a| !a.is_empty())
                 .ok_or("'ribbon-cmd' needs a command id, e.g. ribbon-cmd:bold")?;
             Ok(Region::RibbonCmd(crate::plugin_ui::intern(a)))
+        }
+        "pane" => {
+            let a = arg.unwrap_or("");
+            crate::help_tab::Pane::from_id(a)
+                .map(Region::Pane)
+                .ok_or_else(|| {
+                    let ids: Vec<&str> =
+                        crate::help_tab::Pane::ALL.iter().map(|p| p.id()).collect();
+                    format!("no pane '{a}' (pane:{})", ids.join(", pane:"))
+                })
         }
         "bs-ext" => {
             let a = arg
@@ -1319,6 +1332,7 @@ pub fn region_name(region: Region) -> String {
         Region::GalleryMore(id) => format!("gallery-more:{id}"),
         Region::ExtRibbonCmd(id) => format!("ext-ribbon-cmd:{id}"),
         Region::RibbonCmd(id) => crate::help_tab::ribbon_cmd_probe(id),
+        Region::Pane(p) => crate::help_tab::pane_probe(p),
         Region::BackstageExt(id) => format!("bs-ext:{id}"),
         Region::BackstageContent => "backstage-content".into(),
         Region::BackstageRail => "backstage-rail".into(),
@@ -11508,6 +11522,8 @@ mod tests {
             Region::GalleryMore("fixture.wide"),
             Region::ExtRibbonCmd("fx.reply"),
             Region::RibbonCmd("bold"),
+            Region::Pane(crate::help_tab::Pane::Navigation),
+            Region::Pane(crate::help_tab::Pane::OfficeClipboard),
             Region::BackstageExt("fx.account"),
             Region::BackstageContent,
             Region::BackstageRail,
@@ -11556,6 +11572,17 @@ mod tests {
         assert!(parse_region("project-heading").is_err());
         assert!(parse_region("project-vbar:1").is_err());
         assert!(parse_region("project-timeline:1").is_err());
+        // #2077: a pane by its id; an unknown one names the ids.
+        assert_eq!(
+            parse_region("pane:office-clipboard"),
+            Ok(Region::Pane(crate::help_tab::Pane::OfficeClipboard))
+        );
+        let e = parse_region("pane:outline").unwrap_err();
+        assert!(
+            e.contains("no pane 'outline'") && e.contains("pane:navigation"),
+            "{e}"
+        );
+        assert!(parse_region("pane").is_err());
         assert!(parse_region("project-split:1").is_err());
         assert!(parse_region("bar:abc").is_err());
         assert!(parse_region("bar:").is_err());
