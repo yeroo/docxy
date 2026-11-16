@@ -5255,3 +5255,35 @@ document it). The engine handed that error, or a throttle, offline or refused to
     a refused refresh; each for both commands),
     `meeting_message_commands_signed_out_send_nothing`,
     `a_queued_remove_from_calendar_of_a_deleted_event_sends_nothing`.
+
+## Optimistic message writes return their store error (#2209)
+
+- `Store::set_read`, `set_flag`, `set_categories`, `dismiss_message_reminder` and
+  `snooze_message_reminder` return `Result<(), StoreError>`, as `move_message` does. An id
+  that is not there changes zero rows and is `Ok`. A failed statement is an `Err`, above all
+  `SQLITE_BUSY` once another connection held the write lock past `BUSY_TIMEOUT` (#2113): its
+  text says `database is locked` or `database is busy` (rusqlite's, kept by `StoreError`).
+  No `Busy` variant. Nothing retries inside the store, as that would block the calling
+  thread (lookxy's UI) for several timeouts; retrying is the caller's choice.
+- The engine's `MarkRead`, `SetFlag`, `SetCategories`, `DismissMessageReminder` and
+  `SnoozeMessageReminder` tell a failed write as `Move` does
+  (`Error("local mark-read of {id} ({read}) failed: {e}")`, `local flag of {id}
+  ({flagged})`, `local categories of {id}`, `local reminder dismiss of {id}`,
+  `local reminder snooze of {id} to {utc}`), and still queue the op: Graph is the source
+  of truth, and the next delta brings its value. The enqueue runs on the same connection,
+  so a lock held through both waits refuses it too: `enqueue_and_drain` then tells a
+  second `Error` and the change is lost. A lock held a little past `BUSY_TIMEOUT` (the
+  5.6 s backfill page) is usually gone by the end of the enqueue's own wait.
+- lookxy drops the error (`let _ =`): the engine repeats the write on its own connection
+  when it handles the command lookxy sends next, so the row is only late, unless the
+  engine's store is refused too (told as above). `control.rs`
+  `mark`/`flag` differ from `move_msg`, which fails the call and sends nothing: failing
+  them would lose a change the engine still makes.
+- Not changed: `mark_sent`, `set_event_response`, `drop_op` and `bump_op_attempts` still
+  drop a failed statement. Their docs give their own reason now, not a pointer to
+  `set_read`.
+- Tests: `store/mod.rs` `optimistic_write_tests` (each write against a second connection's
+  `BEGIN IMMEDIATE` with a 50 ms busy timeout, then unlocked, then an unknown id);
+  `engine.rs` `mark_read_reports_a_failed_local_write_and_still_enqueues_2209`. That test
+  refuses the write with a trigger, not a held lock: `enqueue_op` shares the connection,
+  so a held lock would refuse the op too.

@@ -299,7 +299,11 @@ fn mark(app: &mut App, args: &Json) -> Result<Json, String> {
         .get("read")
         .and_then(Json::as_bool)
         .ok_or("mail.mark needs a boolean 'read'")?;
-    app.store.set_read(&id, read);
+    // Unlike `move_msg`, a failed store write (a busy store, #2209) does not
+    // fail the call: the engine repeats it when it handles the command sent
+    // below (and tells an error if its own store is refused too), so failing
+    // here would only lose the change.
+    let _ = app.store.set_read(&id, read);
     app.reload_messages();
     let _ = app.sync.cmd_tx.send(SyncCommand::MarkRead {
         id: id.clone(),
@@ -320,7 +324,8 @@ fn flag(app: &mut App, args: &Json) -> Result<Json, String> {
         .get("flagged")
         .and_then(Json::as_bool)
         .ok_or("mail.flag needs a boolean 'flagged'")?;
-    app.store.set_flag(&id, flagged);
+    // A failed store write is dropped, as in `mark` (#2209).
+    let _ = app.store.set_flag(&id, flagged);
     app.reload_messages();
     let _ = app.sync.cmd_tx.send(SyncCommand::SetFlag {
         id: id.clone(),

@@ -2880,60 +2880,71 @@ impl Store {
     }
 
     /// Locally marks a message read/unread. This is a local-only mutation
-    /// of the row (the sync engine's outbox is what tells Graph); it's
-    /// deliberately infallible-looking (no `Result`) since a mismatched or
-    /// already-gone `id` just means zero rows change, not an error worth
-    /// propagating to callers.
-    pub fn set_read(&self, id: &str, read: bool) {
-        let _ = self.conn.execute(
+    /// of the row (the sync engine's outbox is what tells Graph).
+    ///
+    /// A mismatched or already-gone `id` changes zero rows and is `Ok`: a
+    /// row that raced with something else is not an error. A failed
+    /// statement is an `Err` (#2209), above all `SQLITE_BUSY` once another
+    /// connection held the write lock past [`BUSY_TIMEOUT`], whose text
+    /// says `database is locked` or `database is busy`; whether to retry
+    /// is the caller's choice. The other optimistic message writes
+    /// (`set_flag`, `set_categories`, `dismiss_message_reminder`,
+    /// `snooze_message_reminder`) answer the same way.
+    pub fn set_read(&self, id: &str, read: bool) -> Result<(), StoreError> {
+        self.conn.execute(
             "UPDATE messages SET is_read = ?1 WHERE id = ?2",
             params![read, id],
-        );
+        )?;
+        Ok(())
     }
 
-    /// Locally sets/clears the flagged state of a message. See `set_read`
-    /// for why this doesn't return a `Result`.
+    /// Locally sets/clears the flagged state of a message. Zero rows is
+    /// `Ok`, a failed statement (busy) an `Err`, as `set_read` (#2209).
     ///
     /// Clearing the flag turns its reminder off too, as Outlook does
     /// (#2054); its times are kept, except a draft's due time (#1955): a
     /// draft's create sends its stored flag, and a flag set again must not
     /// bring back the due the user removed with it. Setting it leaves the
     /// reminder as it is (off, until Graph reports one).
-    pub fn set_flag(&self, id: &str, flagged: bool) {
-        let _ = self.conn.execute(
+    pub fn set_flag(&self, id: &str, flagged: bool) -> Result<(), StoreError> {
+        self.conn.execute(
             "UPDATE messages SET is_flagged = ?1, is_reminder_on = is_reminder_on AND ?1,
                                  flag_due_at = CASE WHEN NOT ?1 AND is_draft = 1 THEN ''
                                                     ELSE flag_due_at END
              WHERE id = ?2",
             params![flagged, id],
-        );
+        )?;
+        Ok(())
     }
 
     /// Locally turns a message's reminder off (the optimistic half of
     /// `SyncCommand::DismissMessageReminder`, #2054), under exactly `id`
-    /// (the engine resolves a moved id first). See `set_read` for why this
-    /// doesn't return a `Result`.
+    /// (the engine resolves a moved id first). Zero rows is `Ok`, a failed
+    /// statement (busy) an `Err`, as `set_read` (#2209).
     ///
     /// `meeting_reminder_on` goes off too (#2089): the dismiss PATCHes
     /// `PidLidReminderSet` false, the bit it is read from, so this matches
     /// what the next sync reports; a refused PATCH's reread restores it.
-    pub fn dismiss_message_reminder(&self, id: &str) {
-        let _ = self.conn.execute(
+    pub fn dismiss_message_reminder(&self, id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
             "UPDATE messages SET is_reminder_on = 0, meeting_reminder_on = 0 WHERE id = ?1",
             params![id],
-        );
+        )?;
+        Ok(())
     }
 
     /// Locally moves a message reminder's next signal to `utc` (the
     /// optimistic half of `SyncCommand::SnoozeMessageReminder`, #2054), a
     /// store-shaped UTC time, under exactly `id`. The reminder stays as it
-    /// is otherwise: snoozing one that is off does not turn it on. See
-    /// `set_read` for why this doesn't return a `Result`.
-    pub fn snooze_message_reminder(&self, id: &str, utc: &str) {
-        let _ = self.conn.execute(
+    /// is otherwise: snoozing one that is off does not turn it on. Zero
+    /// rows is `Ok`, a failed statement (busy) an `Err`, as `set_read`
+    /// (#2209).
+    pub fn snooze_message_reminder(&self, id: &str, utc: &str) -> Result<(), StoreError> {
+        self.conn.execute(
             "UPDATE messages SET reminder_signal_at = ?2 WHERE id = ?1",
             params![id, utc],
-        );
+        )?;
+        Ok(())
     }
 
     /// The flagged messages, in any folder, whose reminder is on and due at
@@ -2978,13 +2989,14 @@ impl Store {
     }
 
     /// Locally sets a message's category names (the optimistic half of
-    /// `SyncCommand::SetCategories`). See `set_read` for why this doesn't
-    /// return a `Result`.
-    pub fn set_categories(&self, id: &str, categories: &[String]) {
-        let _ = self.conn.execute(
+    /// `SyncCommand::SetCategories`). Zero rows is `Ok`, a failed statement
+    /// (busy) an `Err`, as `set_read` (#2209).
+    pub fn set_categories(&self, id: &str, categories: &[String]) -> Result<(), StoreError> {
+        self.conn.execute(
             "UPDATE messages SET categories = ?1 WHERE id = ?2",
             params![encode_categories(categories), id],
-        );
+        )?;
+        Ok(())
     }
 
     /// Replaces the whole master category list in one transaction (Graph's
@@ -3022,9 +3034,10 @@ impl Store {
     /// Locally marks a draft as sent (`is_draft = 0`) — the optimistic half
     /// of `SyncCommand::SendDraft` (the sync engine's outbox, via
     /// `OutboxOp::SendDraft`, is what actually hands the draft to Graph for
-    /// delivery). See `set_read` for why this doesn't return a `Result`: a
-    /// mismatched/already-gone `id` just changes zero rows. A reconciled
-    /// draft's `local:` id still reaches it (#1884).
+    /// delivery). A mismatched/already-gone `id` just changes zero rows,
+    /// which is not an error. Unlike `set_read` (#2209) it still drops a
+    /// failed statement: no caller acts on one yet. A reconciled draft's
+    /// `local:` id still reaches it (#1884).
     pub fn mark_sent(&self, id: &str) {
         let _ = self.conn.execute(
             concat!("UPDATE messages SET is_draft = 0 WHERE ", draft_row_sql!()),
@@ -3051,10 +3064,10 @@ impl Store {
 
     /// Locally re-files a message under `dest_folder_id` — the optimistic
     /// half of a triage move (the sync engine's outbox is what tells Graph).
-    /// Unlike `set_read`/`set_flag` this returns a `Result`: the sync engine
-    /// applies it in the same spot it enqueues the outbox op, where a store
-    /// failure is worth surfacing. A mismatched/already-gone `id` just changes
-    /// zero rows (not an error). Graph mints a *new* id on move, which the
+    /// Like `set_read`/`set_flag` (#2209) this returns a `Result`: the sync
+    /// engine applies it in the same spot it enqueues the outbox op, where a
+    /// store failure is worth surfacing. A mismatched/already-gone `id` just
+    /// changes zero rows (not an error). Graph mints a *new* id on move, which the
     /// sync engine's drain applies with `follow_move` (#1896) once the op
     /// succeeds, so the local id is left as-is here. A reconciled draft's
     /// `local:` id still reaches it (#1884; `SendDraft`'s optimistic re-file
@@ -3877,9 +3890,8 @@ impl Store {
     /// draft has synced, or the reconciled Graph id after). A mismatched/
     /// already-gone `id` changes zero rows rather than erroring, matching
     /// `set_read`/`set_flag`'s convention for local mutations of a row that
-    /// might have raced with something else — except here the body write
-    /// is real work worth reporting failure on, so this does return a
-    /// `Result`.
+    /// might have raced with something else; a failed write is an `Err`,
+    /// as theirs is (#2209).
     ///
     /// A reconciled draft's `local:` id still reaches it (#1884): the row is
     /// matched by `draft_row_sql!` and the body keyed by `current_id_sql!`,
@@ -4651,8 +4663,10 @@ impl Store {
     }
 
     /// Removes a queued op by `seq` — called once it's been applied
-    /// successfully. See `set_read` for why this doesn't return a `Result`
-    /// (a `seq` that's already gone just means zero rows change).
+    /// successfully. A `seq` that's already gone just means zero rows
+    /// change, not an error. A failed statement is dropped too (not changed
+    /// by #2209): the op then stays queued and the next drain applies it
+    /// again.
     pub fn drop_op(&self, seq: i64) {
         let _ = self
             .conn
@@ -4661,7 +4675,9 @@ impl Store {
 
     /// Records a failed attempt to apply a queued op: increments
     /// `attempts` and stores `err` as `last_error`, for retry backoff and
-    /// diagnostics. See `set_read` for why this doesn't return a `Result`.
+    /// diagnostics. A `seq` that's already gone changes zero rows, not an
+    /// error. A failed statement is dropped too (not changed by #2209): the
+    /// attempt is then not counted.
     pub fn bump_op_attempts(&self, seq: i64, err: &str) {
         let _ = self.conn.execute(
             "UPDATE outbox SET attempts = attempts + 1, last_error = ?1 WHERE seq = ?2",
@@ -5382,8 +5398,9 @@ impl Store {
     /// of the response) — the optimistic half of an RSVP the outbox pushes to
     /// Graph. Status and time are written together, so the row never shows an
     /// answer with another answer's time. The caller passes the time, which
-    /// keeps the store clock-free. See `set_read` for why this doesn't return
-    /// a `Result`.
+    /// keeps the store clock-free. A mismatched/already-gone `id` changes
+    /// zero rows, which is not an error. Unlike `set_read` (#2209) it still
+    /// drops a failed statement: no caller acts on one yet.
     pub fn set_event_response(&self, id: &str, status: &str, at: &str) {
         let _ = self.conn.execute(
             "UPDATE events SET response_status = ?1, response_time = ?3 WHERE id = ?2",
@@ -10741,7 +10758,7 @@ mod tests {
         .unwrap();
         let m = msg("01", true);
         s.upsert_message("F", &m).unwrap();
-        s.set_categories("01", &["Urgent".to_string()]);
+        s.set_categories("01", &["Urgent".to_string()]).unwrap();
         let rows = s.messages_in_folder("F", 10, 0).unwrap();
         assert_eq!(rows[0].categories, vec!["Urgent".to_string()]);
         assert!(rows[0].is_read); // untouched
@@ -10915,7 +10932,7 @@ mod tests {
         })
         .unwrap();
         s.upsert_message("F", &msg("10", false)).unwrap();
-        s.set_read("10", true);
+        s.set_read("10", true).unwrap();
         let rows = s.messages_in_folder("F", 50, 0).unwrap();
         assert!(rows[0].is_read);
     }
@@ -18784,8 +18801,8 @@ mod draft_tests {
         .unwrap();
         s.upsert_message("F1", &received).unwrap();
         for id in [draft.as_str(), "R1"] {
-            s.set_flag(id, false);
-            s.set_flag(id, true);
+            s.set_flag(id, false).unwrap();
+            s.set_flag(id, true).unwrap();
         }
         let row = s.draft(&draft).unwrap().unwrap().0;
         assert!(row.is_flagged);
@@ -21248,13 +21265,13 @@ mod message_reminder_tests {
             &reminded("M1", "2026-11-08T10:00:00Z", "2026-11-08T10:15:00Z"),
         )
         .unwrap();
-        s.set_flag("M1", true);
+        s.set_flag("M1", true).unwrap();
         assert_eq!(
             reminder(&row(&s, "M1")),
             ON,
             "flagging again changes nothing"
         );
-        s.set_flag("M1", false);
+        s.set_flag("M1", false).unwrap();
         let r = row(&s, "M1");
         assert!(!r.is_flagged);
         assert_eq!(
@@ -21267,7 +21284,7 @@ mod message_reminder_tests {
             ),
             "off, its times kept"
         );
-        s.set_flag("M1", true);
+        s.set_flag("M1", true).unwrap();
         assert!(
             !row(&s, "M1").is_reminder_on,
             "a re-flag does not turn it on"
@@ -21283,7 +21300,8 @@ mod message_reminder_tests {
             &reminded("M1", "2026-11-08T10:00:00Z", "2026-11-08T10:15:00Z"),
         )
         .unwrap();
-        s.snooze_message_reminder("M1", "2026-11-08T11:00:00Z");
+        s.snooze_message_reminder("M1", "2026-11-08T11:00:00Z")
+            .unwrap();
         let r = row(&s, "M1");
         assert_eq!(
             (
@@ -21294,11 +21312,12 @@ mod message_reminder_tests {
             (true, "2026-11-08T10:00:00Z", "2026-11-08T11:00:00Z"),
             "the snooze moves the signal only"
         );
-        s.dismiss_message_reminder("M1");
+        s.dismiss_message_reminder("M1").unwrap();
         assert!(!row(&s, "M1").is_reminder_on);
         // An unknown id is no error.
-        s.dismiss_message_reminder("NOPE");
-        s.snooze_message_reminder("NOPE", "2026-11-08T11:00:00Z");
+        s.dismiss_message_reminder("NOPE").unwrap();
+        s.snooze_message_reminder("NOPE", "2026-11-08T11:00:00Z")
+            .unwrap();
     }
 
     #[test]
@@ -22657,9 +22676,10 @@ mod meeting_reminder_tests {
                 .is_empty()
         );
         // Clearing the flag leaves it alone (`set_flag`), as a snooze does.
-        s.set_flag("M1", true);
-        s.set_flag("M1", false);
-        s.snooze_message_reminder("M1", "2026-11-09T10:00:00Z");
+        s.set_flag("M1", true).unwrap();
+        s.set_flag("M1", false).unwrap();
+        s.snooze_message_reminder("M1", "2026-11-09T10:00:00Z")
+            .unwrap();
         assert!(on(&s, "M1"));
         // A flagged one with a due flag reminder is due exactly as before.
         let mut f = msg("M2", false);
@@ -22682,7 +22702,7 @@ mod meeting_reminder_tests {
         folder(&s, "F");
         s.upsert_message("F", &msg("M1", true)).unwrap();
         s.upsert_message("F", &msg("M2", true)).unwrap();
-        s.dismiss_message_reminder("M1");
+        s.dismiss_message_reminder("M1").unwrap();
         assert!(!on(&s, "M1"));
         assert!(on(&s, "M2"));
     }
@@ -25045,7 +25065,7 @@ mod mark_folder_read_tests {
         folder(&s, "F", 1);
         unread(&s, "M", "F", "2026-11-01T00:00:00Z");
         s.mark_folder_read("F", NOW).unwrap();
-        s.set_read("M", false);
+        s.set_read("M", false).unwrap();
         s.enqueue_op(&OutboxOp::MarkRead {
             id: "M".into(),
             read: false,
@@ -25161,8 +25181,8 @@ mod mark_folder_read_tests {
         s.conn
             .execute("DELETE FROM messages_fts WHERE message_id = 'M'", [])
             .unwrap();
-        s.set_read("M", true);
-        s.set_flag("M", true);
+        s.set_read("M", true).unwrap();
+        s.set_flag("M", true).unwrap();
         s.mark_folder_read("F", NOW).unwrap();
         assert_eq!(fts_rows(&s, "M"), 0);
         // A subject, a sender and a re-key still rewrite it.
@@ -28184,6 +28204,187 @@ mod meeting_type_fill_tests {
                 .filter(|p| p.contains("messages"))
                 .all(|p| p.contains("idx_messages_untyped")),
             "{plan:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod optimistic_write_tests {
+    //! #2209: the optimistic message writes (`set_read`, `set_flag`,
+    //! `set_categories`, `dismiss_message_reminder`,
+    //! `snooze_message_reminder`) return a failed statement, above all a
+    //! busy store, and stay `Ok` for an id that is not there.
+    use super::*;
+
+    /// A store on a file (WAL, as `Store::open` sets it) with one flagged,
+    /// reminded message `M1`, and a second plain connection to the same
+    /// file that can hold the write lock. The store's busy timeout is short,
+    /// so a write under that lock fails at once instead of after
+    /// `BUSY_TIMEOUT`.
+    struct Fixture {
+        a: Store,
+        b: Connection,
+        // Declared last: fields drop in order, so both connections are
+        // closed before the directory goes (Windows refuses to delete an
+        // open database file).
+        _dir: TempDir,
+    }
+
+    /// Removes its directory when dropped.
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "mailcore-optimistic-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("mail.db");
+            let a = Store::open(&path).unwrap();
+            a.conn.busy_timeout(Duration::from_millis(50)).unwrap();
+            a.upsert_folder(&MailFolder {
+                id: "F".into(),
+                display_name: "F".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: None,
+            })
+            .unwrap();
+            a.upsert_message("F", &message("M1")).unwrap();
+            let b = Connection::open(&path).unwrap();
+            Fixture {
+                a,
+                b,
+                _dir: TempDir(dir),
+            }
+        }
+
+        fn row(&self) -> MessageRow {
+            self.a.message_row("M1").unwrap().unwrap()
+        }
+
+        /// Runs `write` while `b` holds the write lock, and returns what it
+        /// answered; the lock is released after.
+        fn while_locked(
+            &self,
+            write: impl FnOnce(&Store) -> Result<(), StoreError>,
+        ) -> Result<(), StoreError> {
+            self.b.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let answer = write(&self.a);
+            self.b.execute_batch("ROLLBACK").unwrap();
+            answer
+        }
+
+        /// The whole contract for one write: busy is an `Err` that says so
+        /// and leaves the row as it was; unlocked it is `Ok` and `changed`
+        /// holds of the row; for an unknown id it is `Ok` and changes
+        /// nothing. `write` takes the id.
+        fn check(
+            &self,
+            write: impl Fn(&Store, &str) -> Result<(), StoreError>,
+            changed: impl Fn(&MessageRow) -> bool,
+        ) {
+            let before = self.row();
+            assert!(!changed(&before), "the fixture starts unchanged");
+            let err = self
+                .while_locked(|a| write(a, "M1"))
+                .expect_err("a write under another connection's lock fails");
+            assert!(is_busy_text(&err.to_string()), "{err}");
+            // B never wrote, so this checks A's failed UPDATE left nothing.
+            assert_eq!(self.row(), before, "a failed write changes nothing");
+
+            write(&self.a, "NOPE").expect("an unknown id is no error");
+            assert_eq!(self.row(), before, "an unknown id changes nothing");
+
+            write(&self.a, "M1").expect("unlocked, the write succeeds");
+            assert!(changed(&self.row()), "{:?}", self.row());
+        }
+    }
+
+    /// The text a caller recognises a busy store by (rusqlite's, kept by
+    /// `StoreError`'s `Display`).
+    fn is_busy_text(text: &str) -> bool {
+        text.contains("database is locked") || text.contains("database is busy")
+    }
+
+    fn message(id: &str) -> Message {
+        Message {
+            id: id.into(),
+            conversation_id: format!("C{id}"),
+            subject: format!("subject {id}"),
+            from: Recipient {
+                name: "A".into(),
+                address: "a@x".into(),
+            },
+            to: vec![],
+            cc: vec![],
+            received: "2026-11-01T00:00:00Z".into(),
+            sent: String::new(),
+            is_read: false,
+            is_flagged: true,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: "p".into(),
+            is_draft: false,
+            is_meeting_request: false,
+            meeting_message_type: None,
+            protection: Default::default(),
+            meeting_reminder_on: false,
+            categories: vec![],
+            is_reminder_on: true,
+            reminder_at: "2026-11-08T10:00:00Z".into(),
+            reminder_signal_at: "2026-11-08T10:15:00Z".into(),
+            flag_due_at: "2026-11-09T17:00:00Z".into(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
+            size: None,
+            is_event_message: false,
+        }
+    }
+
+    #[test]
+    fn set_read_reports_a_busy_store_2209() {
+        Fixture::new("read").check(|s, id| s.set_read(id, true), |r| r.is_read);
+    }
+
+    #[test]
+    fn set_flag_reports_a_busy_store_2209() {
+        Fixture::new("flag").check(|s, id| s.set_flag(id, false), |r| !r.is_flagged);
+    }
+
+    #[test]
+    fn set_categories_reports_a_busy_store_2209() {
+        Fixture::new("categories").check(
+            |s, id| s.set_categories(id, &["Urgent".to_string()]),
+            |r| r.categories == ["Urgent"],
+        );
+    }
+
+    #[test]
+    fn dismiss_message_reminder_reports_a_busy_store_2209() {
+        Fixture::new("dismiss").check(
+            |s, id| s.dismiss_message_reminder(id),
+            |r| !r.is_reminder_on,
+        );
+    }
+
+    #[test]
+    fn snooze_message_reminder_reports_a_busy_store_2209() {
+        Fixture::new("snooze").check(
+            |s, id| s.snooze_message_reminder(id, "2026-11-08T11:00:00Z"),
+            |r| r.reminder_signal_at == "2026-11-08T11:00:00Z",
         );
     }
 }
