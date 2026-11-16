@@ -2771,14 +2771,12 @@ pub(crate) fn alt_tip_text(alt: &str) -> String {
     format!("{}\u{2026}", cut.trim_end())
 }
 
-/// The tooltip a picture run `xml` draws with (#1998): its Alt Text
-/// ([`docxcore::image::inline_alt_text`]) as [`alt_tip_text`] shows it, in
-/// the embedded view (`embed`) only; a document tab's pictures have none.
-pub(crate) fn picture_tip(embed: bool, xml: &str) -> Option<String> {
-    embed
-        .then(|| docxcore::image::inline_alt_text(xml))
-        .flatten()
-        .map(|alt| alt_tip_text(&alt))
+/// The tooltip of a picture run `xml` (#1998): its Alt Text
+/// ([`docxcore::image::inline_alt_text`]) as [`alt_tip_text`] shows it.
+/// Only the renderer's `DocTarget::Embed` arm draws it, so a document
+/// tab's pictures have none.
+pub(crate) fn picture_tip(xml: &str) -> Option<String> {
+    docxcore::image::inline_alt_text(xml).map(|alt| alt_tip_text(&alt))
 }
 
 /// The tooltip of the inline picture at caret offset `off` of `p`
@@ -2790,7 +2788,7 @@ pub(crate) fn picture_alt_at(p: &Paragraph, off: usize) -> Option<String> {
         let len = docxcore::editor::inline_len(&inline);
         if len > 0 && (at..at + len).contains(&off) {
             return match &*inline {
-                Inline::Raw(xml) => picture_tip(true, xml),
+                Inline::Raw(xml) => picture_tip(xml),
                 _ => None,
             };
         }
@@ -3555,24 +3553,22 @@ mod tests {
         );
     }
 
-    /// #1998 criterion 5: only the embedded view's pictures have a tooltip;
-    /// a document tab's draw none.
+    /// #1998: a picture's tooltip is its Alt Text, capped; none without.
     #[test]
-    fn picture_tip_is_the_embedded_views_only() {
+    fn picture_tip_reads_and_caps_the_alt_text() {
         let Inline::Raw(xml) = picture("Floor plan") else {
             unreachable!()
         };
-        assert_eq!(picture_tip(true, &xml).as_deref(), Some("Floor plan"));
-        assert_eq!(picture_tip(false, &xml), None);
+        assert_eq!(picture_tip(&xml).as_deref(), Some("Floor plan"));
         let Inline::Raw(bare) = picture("") else {
             unreachable!()
         };
-        assert_eq!(picture_tip(true, &bare), None);
+        assert_eq!(picture_tip(&bare), None);
         let long = "x".repeat(300);
         let Inline::Raw(xml) = picture(&long) else {
             unreachable!()
         };
-        assert_eq!(picture_tip(true, &xml), Some(alt_tip_text(&long)));
+        assert_eq!(picture_tip(&xml), Some(alt_tip_text(&long)));
     }
 
     #[test]

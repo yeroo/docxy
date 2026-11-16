@@ -458,19 +458,23 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   only: a document tab's pictures have none. Alt Text is
   `docxcore::image::inline_alt_text`: the `wp:inline`'s `wp:docPr`
   `descr`, else its `title` (never `pic:cNvPr`'s copy, never a
-  `wp:anchor` drawing), unescaped in one pass, white space collapsed,
-  empty is none. The HTML importer writes an `<img alt>` there, the #1880
+  `wp:anchor` drawing), decoded as the loader decodes an attribute
+  (`load::decode_attr`), white space collapsed, empty is none. The e-mail
+  export (`export_email::alt_text`) reads `descr` only, so a picture with
+  only a `title` has a tooltip here but `alt=""` in an e-mail. The HTML importer writes an `<img alt>` there, the #1880
   placeholder of a picture that did not load included; an `<img>` with no
   size is its alt as text, so no picture and no tooltip.
 - The tooltip shows `doc_view::alt_tip_text`: at most `ALT_TIP_MAX` (200)
   characters, a longer one cut to 199 plus `…`, in gpui-component's
   `Tooltip` look (the theme's, light and dark), wrapped at
   `ALT_TIP_MAX_W` (360 px; `Tooltip` has no width limit of its own).
-- The shared renderer draws it: in the picture branch, when the
-  paragraph's `Click` target is `DocTarget::Embed`
-  (`doc_view::picture_tip(!c.ent.is_suite(), xml)`), the frame gets
+- The shared renderer draws it: in the picture branch, only when the
+  paragraph's `Click` target is `DocTarget::Embed` and
+  `doc_view::picture_tip(xml)` has text does the frame get
   `doc_view::picture_tip_el`, a full-size absolute stateful child with
-  gpui's `.tooltip`. Its hitbox is `Normal`, so the unit's press and drag,
+  gpui's `.tooltip`. That arm is the only one that attaches it, which is
+  why a document tab's pictures (`DocTarget::Suite`) show none. No test
+  covers that: the suite's harness cannot see a document tab's tooltips. Its hitbox is `Normal`, so the unit's press and drag,
   the I-beam and #1916's link hand are unchanged; a press or a wheel hides
   the tooltip (gpui). Its id is `ext-pic-alt:<path>:<offset>`. It must be
   unique in the frame: two elements with one id share one tooltip state,

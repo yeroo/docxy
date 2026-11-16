@@ -232,9 +232,12 @@ pub fn inline_extent(raw: &str) -> Option<(i64, i64)> {
 /// An inline picture run's Alt Text (#1998): its `wp:inline`'s
 /// `wp:docPr` `descr`, else its `title`, under [`inline_extent`]'s guards
 /// (inline only, never `wp:anchor`; `pic:cNvPr`'s copy is not read). The
-/// value is XML-unescaped (an entity it does not know is kept as written),
-/// each run of white space (the `&#10;` / `&#9;` the writer keeps included)
-/// is one space, and it is trimmed; empty or unreadable is `None`.
+/// value is decoded as the loader decodes an attribute
+/// ([`crate::load::decode_attr`]), each run of white space (the `&#10;` /
+/// `&#9;` the writer keeps included) is one space, and it is trimmed; empty
+/// or unreadable is `None`. The e-mail export (`export_email::alt_text`)
+/// reads `descr` only, so a picture with only a `title` has a tooltip in
+/// the view but `alt=""` in an e-mail.
 pub fn inline_alt_text(raw: &str) -> Option<String> {
     inline_extent(raw)?;
     let inline = raw.find("<wp:inline")?;
@@ -244,7 +247,7 @@ pub fn inline_alt_text(raw: &str) -> Option<String> {
     ["descr", "title"]
         .into_iter()
         .filter_map(|name| attr_at_boundary(el, name))
-        .map(|v| collapse_space(&xml_unescape(&v)))
+        .map(|v| collapse_space(&crate::load::decode_attr(&v)))
         .find(|v| !v.is_empty())
 }
 
@@ -270,46 +273,6 @@ fn attr_at_boundary(el: &str, name: &str) -> Option<String> {
         return body.find(q).map(|e| body[..e].to_string());
     }
     None
-}
-
-/// An attribute value with its entity and character references resolved,
-/// in one pass; a reference it cannot read is kept as written.
-fn xml_unescape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(i) = rest.find('&') {
-        out.push_str(&rest[..i]);
-        rest = &rest[i..];
-        let decoded = rest.find(';').filter(|&e| e <= 12).and_then(|e| {
-            let c = match &rest[1..e] {
-                "amp" => Some('&'),
-                "lt" => Some('<'),
-                "gt" => Some('>'),
-                "quot" => Some('"'),
-                "apos" => Some('\''),
-                n => n
-                    .strip_prefix("#x")
-                    .or_else(|| n.strip_prefix("#X"))
-                    .map(|h| u32::from_str_radix(h, 16))
-                    .or_else(|| n.strip_prefix('#').map(str::parse::<u32>))
-                    .and_then(Result::ok)
-                    .and_then(char::from_u32),
-            }?;
-            Some((c, e))
-        });
-        match decoded {
-            Some((c, e)) => {
-                out.push(c);
-                rest = &rest[e + 1..];
-            }
-            None => {
-                out.push('&');
-                rest = &rest[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 /// `s` with each run of white space one space, trimmed.
@@ -1033,10 +996,11 @@ mod tests {
                 .as_deref(),
             Some("A & B <x> \"q\" 's' two tab AB")
         );
-        // A reference it cannot read is kept as written.
+        // As the loader decodes: an unknown entity and a bare `&` are kept
+        // as written, a malformed character reference is dropped.
         assert_eq!(
             read(r#" descr="a &bogus; &#xZZ; &amp b""#).as_deref(),
-            Some("a &bogus; &#xZZ; &amp b")
+            Some("a &bogus; &amp b")
         );
         // What the writer escapes reads back, its line breaks as spaces.
         let run = inline_picture_run_described(
