@@ -17814,6 +17814,17 @@ impl Docxy {
         cx.notify();
     }
 
+    /// `ext::ShowBackstagePage` (#2204): File opens (or, already up, goes
+    /// back through the same reset) and shows the active extension tab's
+    /// page `id`. An id it does not list, or another tab, gets File's
+    /// default page, as `ext::ShowBackstage` does: `bs_ext` stays `None`.
+    fn show_ext_backstage_page(&mut self, id: String, cx: &mut Context<Self>) {
+        self.open_backstage(cx);
+        if self.active_ext_page(&id, cx).is_some() {
+            self.select_ext_backstage_page(id, cx);
+        }
+    }
+
     /// The active tab's extension view, by entity, when it is an extension's.
     fn active_ext_view(&self) -> Option<EntityId> {
         match self.tabs.get(self.active).map(|t| &t.surface) {
@@ -17853,10 +17864,15 @@ impl Docxy {
         if self.active_ext_view() != Some(*view) {
             return None;
         }
-        // The rail's filter: the first page with the id, a non-empty one.
+        self.active_ext_page(id, cx)
+    }
+
+    /// The active extension tab's page `id` as the rail lists it: the first
+    /// page with that id, a non-empty one (#1923, #2204).
+    fn active_ext_page(&self, id: &str, cx: &App) -> Option<ext::BackstagePage> {
         self.active_ext_pages(cx)
             .into_iter()
-            .find(|p| !p.id.is_empty() && &p.id == id)
+            .find(|p| !p.id.is_empty() && p.id == id)
     }
 
     fn backstage_rail_action(
@@ -46125,6 +46141,12 @@ impl KeyRouting for Div {
             .on_action(cx.listener(|this, _: &ext::ShowBackstage, _window, cx| {
                 this.open_backstage(cx);
             }))
+            // File straight on one of an extension tab's own pages (#2204).
+            .on_action(
+                cx.listener(|this, a: &ext::ShowBackstagePage, _window, cx| {
+                    this.show_ext_backstage_page(a.id.clone(), cx);
+                }),
+            )
             // An extension's view, File page or ribbon command closes its tab
             // (#1923); the root takes it whatever had the focus.
             .on_action(cx.listener(|this, _: &ext::CloseTab, window, cx| {

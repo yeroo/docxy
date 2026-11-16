@@ -277,14 +277,19 @@ struct FixtureMail {
 pub(crate) const ACCOUNT_PAGE: (&str, &str) = ("fx.account", "Fixture Account");
 pub(crate) const OPTIONS_PAGE: (&str, &str) = ("fx.options", "Fixture Options");
 
-/// A File page of the fixture's (#1923): its title, a Close tab button, how
-/// many times it rendered and where it and the button last painted (the
-/// harness's `ext-page-read` and `ext-page-close:<id>` region).
+/// A File page of the fixture's (#1923): its title, a Close tab button, a
+/// button showing the other page (#2204), how many times it rendered and
+/// where it and the buttons last painted (the harness's `ext-page-read` and
+/// `ext-page-close:<id>` / `ext-page-show:<id>` regions).
 pub(crate) struct FixturePage {
     title: &'static str,
+    /// The other page, which this page's Show button opens through
+    /// `ext::ShowBackstagePage`: its id and title.
+    show: (&'static str, &'static str),
     pub(crate) renders: Rc<Cell<usize>>,
     pub(crate) bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     pub(crate) close_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    pub(crate) show_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 /// A canvas recording its bounds at paint into `cell`, filling its parent.
@@ -329,24 +334,45 @@ impl Render for FixturePage {
                         window.dispatch_action(Box::new(ext::CloseTab), cx);
                     }),
             )
+            .child({
+                let (id, title) = self.show;
+                div()
+                    .id("ext-page-show")
+                    .relative()
+                    .px_3()
+                    .py_1()
+                    .border_1()
+                    .border_color(rgb(0x808080))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .child(record_bounds(&self.show_bounds))
+                    .child(format!("Show {title}"))
+                    .on_click(move |_, window, cx| {
+                        let id = id.to_string();
+                        window.dispatch_action(Box::new(ext::ShowBackstagePage { id }), cx);
+                    })
+            })
     }
 }
 
 /// The fixture's File pages (#1923): Fixture Account at the top (with the
 /// Reply icon), Fixture Options at the bottom.
 fn fixture_pages(cx: &mut App) -> Vec<BackstagePage> {
-    let mut page = |(id, title): (&'static str, &'static str)| {
+    let mut page = |(id, title): (&'static str, &'static str), show| {
         let view = cx.new(|_| FixturePage {
             title,
+            show,
             renders: Rc::default(),
             bounds: Rc::default(),
             close_bounds: Rc::default(),
+            show_bounds: Rc::default(),
         });
         BackstagePage::new(id, title, view)
     };
+    // Each page's Show button opens the other one (#2204).
     vec![
-        page(ACCOUNT_PAGE).icon(RibbonIcon::svg(REPLY_SVG.as_bytes())),
-        page(OPTIONS_PAGE).group(BackstageGroup::Bottom),
+        page(ACCOUNT_PAGE, OPTIONS_PAGE).icon(RibbonIcon::svg(REPLY_SVG.as_bytes())),
+        page(OPTIONS_PAGE, ACCOUNT_PAGE).group(BackstageGroup::Bottom),
     ]
 }
 

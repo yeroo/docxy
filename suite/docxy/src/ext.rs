@@ -19,7 +19,8 @@
 //!
 //! A surface may add pages to the suite's File backstage while its tab is
 //! active ([`TabSurface::backstage_pages`], #1923), and its view may close
-//! its own tab by dispatching [`CloseTab`].
+//! its own tab by dispatching [`CloseTab`] or open File straight on one of
+//! those pages by dispatching [`ShowBackstagePage`] (#2204).
 
 use gpui::{AnyView, App, FocusHandle, Global, Hsla, Window, actions};
 use std::rc::Rc;
@@ -53,6 +54,26 @@ actions!(
         CloseTab
     ]
 );
+
+/// Opens the suite's File backstage on one of the active extension tab's
+/// own pages ([`TabSurface::backstage_pages`]) by its [`BackstagePage`] id
+/// (#2204), as a click on the page's rail entry does: an account flyout's
+/// "Office Account" or "Options", say. File already up switches to that
+/// page. An id the active tab does not list right now (an empty one among
+/// them), or a tab that is not an extension's, opens File on its default
+/// page, as [`ShowBackstage`] does. Dispatch it with
+/// `window.dispatch_action(Box::new(ext::ShowBackstagePage { id }), cx)`
+/// from the view, from a [`BackstagePage`]'s view or from
+/// [`TabSurface::ribbon_action`], in response to the user's own input: it
+/// acts on whichever tab is active when it runs, so a late dispatch (from a
+/// spawned task, after the user moved to another tab) acts on that one.
+/// It is never bound from a keymap, so it is not built from JSON.
+#[derive(Clone, Debug, PartialEq, Eq, gpui::Action)]
+#[action(namespace = docxy_ext, no_json)]
+pub struct ShowBackstagePage {
+    /// The page's [`BackstagePage`] id.
+    pub id: String,
+}
 
 /// A tab body an extension draws.
 pub trait TabSurface: 'static {
