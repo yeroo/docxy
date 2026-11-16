@@ -1700,6 +1700,17 @@ fn region_point(
             .map(|b| b.center())
             .ok_or_else(|| format!("{name}: the page's Close tab button is not drawn yet"));
     }
+    // The Show button of a test extension's File page (#2204), which opens
+    // the other page through `ext::ShowBackstagePage`.
+    if let Some(id) = name.trim().strip_prefix("ext-page-show:") {
+        let page = ext_fixture_page(app, id, cx).map_err(|e| format!("{name}: {e}"))?;
+        return page
+            .read(cx)
+            .show_bounds
+            .get()
+            .map(|b| b.center())
+            .ok_or_else(|| format!("{name}: the page's Show button is not drawn yet"));
+    }
     let region = parse_region(name)?;
     let bounds = app
         .region_bounds_live(region, window)
@@ -5956,6 +5967,45 @@ fn dispatch_verb(
                 ("renders", Json::Num(p.renders.get() as f64)),
                 ("bounds", rect(p.bounds.get())),
                 ("close_bounds", rect(p.close_bounds.get())),
+                ("show_bounds", rect(p.show_bounds.get())),
+            ]))
+        }
+        // `ext::ShowBackstagePage { id }` dispatched as an extension's view
+        // or File page does (#2204): `window.dispatch_action` from the
+        // focused element. On the test extension's tab with File down that
+        // must be inside its view; with File up it must not be, since File
+        // hides the view and gpui sends an action from a focus it did not
+        // draw to the window's root, above the suite's listener. Either is
+        // refused. Only the harness's own `backstage open` leaves that
+        // state: the actions and a click in File focus the suite. On any
+        // other tab it is whatever has the focus. `from` is `view` or `suite`.
+        // gpui runs it after this reply: the case draws a frame (`shot
+        // window`) before reading File.
+        "ext-show-page" => {
+            app.refuse_under_dialog()?;
+            let id = arg_str(args, "id")?.to_string();
+            let from = match ext_fixture_view(app) {
+                Ok(fixture) => {
+                    let f = fixture.read(cx);
+                    let view = f.doc.read(cx).focus_handle();
+                    let in_view = view.contains_focused(window, cx) || f.header_focused(window);
+                    match (app.backstage, in_view) {
+                        (false, false) => {
+                            return Err("the test extension's view does not have the focus".into());
+                        }
+                        (true, true) => {
+                            return Err("File is up but the focus is still in the test extension's view, which File hides: click in File first".into());
+                        }
+                        (false, true) => "view",
+                        (true, false) => "suite",
+                    }
+                }
+                Err(_) => "suite",
+            };
+            window.dispatch_action(Box::new(crate::ext::ShowBackstagePage { id }), cx);
+            Done::ok(Json::obj(vec![
+                ("dispatched", Json::Bool(true)),
+                ("from", Json::Str(from.into())),
             ]))
         }
         // `ext::CloseTab` dispatched as an extension's view does (#1923):

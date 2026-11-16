@@ -5622,8 +5622,10 @@ struct Docxy {
     tab_layout: tabstrip::StripLayout,
     tab_more_open: bool,
     /// What had the keys on an extension's tab when its ribbon's KeyTips, a
-    /// menu or a flyout took them (#1870): its view's entity and the
-    /// handle, given back when they close.
+    /// menu or a flyout took them (#1870), or when File, opened over the
+    /// tab by an extension's action, did (#2204: only a focus File hid,
+    /// never one in a File page): its view's entity and the handle, given
+    /// back when they close.
     ext_focus_back: Option<(gpui::EntityId, FocusHandle)>,
     focus: FocusHandle,
     focused: bool,
@@ -17814,6 +17816,40 @@ impl Docxy {
         cx.notify();
     }
 
+    /// `ext::ShowBackstagePage` (#2204): File opens (or, already up, goes
+    /// back through the same reset) and shows the active extension tab's
+    /// page `id`. An id it does not list, or another tab, gets File's
+    /// default page, as `ext::ShowBackstage` does: `bs_ext` stays `None`.
+    fn show_ext_backstage_page(&mut self, id: String, cx: &mut Context<Self>) {
+        self.open_backstage(cx);
+        if self.active_ext_page(&id, cx).is_some() {
+            self.select_ext_backstage_page(id, cx);
+        }
+    }
+
+    /// After File opened from an extension's action (`ext::ShowBackstage`,
+    /// `ext::ShowBackstagePage`; #2204): the suite root takes the focus, as
+    /// a click in File gives it. Else the focus stays in the view File hides,
+    /// and gpui sends a key or an action dispatched from a focus it did not
+    /// draw to the window's root node, above the suite's listeners: dropped.
+    /// When File was down (`was_up` false), what had the focus (the view,
+    /// or a field of the extension's beside it) gets it back when File
+    /// closes (`focus_ext_surface`, `ext_focus_back`). When File was up
+    /// the focus is the suite's or in a File page, which File's next page
+    /// or its close stops drawing: it is not kept, and an earlier
+    /// `ext_focus_back` (from when File opened) stays.
+    fn focus_suite_for_file(&mut self, was_up: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.backstage || self.focus.is_focused(window) {
+            return;
+        }
+        if !was_up {
+            if let (Some(view), Some(had)) = (self.active_ext_view(), window.focused(cx)) {
+                self.ext_focus_back = Some((view, had));
+            }
+        }
+        window.focus(&self.focus, cx);
+    }
+
     /// The active tab's extension view, by entity, when it is an extension's.
     fn active_ext_view(&self) -> Option<EntityId> {
         match self.tabs.get(self.active).map(|t| &t.surface) {
@@ -17853,10 +17889,15 @@ impl Docxy {
         if self.active_ext_view() != Some(*view) {
             return None;
         }
-        // The rail's filter: the first page with the id, a non-empty one.
+        self.active_ext_page(id, cx)
+    }
+
+    /// The active extension tab's page `id` as the rail lists it: the first
+    /// page with that id, a non-empty one (#1923, #2204).
+    fn active_ext_page(&self, id: &str, cx: &App) -> Option<ext::BackstagePage> {
         self.active_ext_pages(cx)
             .into_iter()
-            .find(|p| !p.id.is_empty() && &p.id == id)
+            .find(|p| !p.id.is_empty() && p.id == id)
     }
 
     fn backstage_rail_action(
@@ -46122,8 +46163,16 @@ impl KeyRouting for Div {
         .size_full();
         self.child(input)
             .on_key_down(cx.listener(Docxy::route_key))
-            .on_action(cx.listener(|this, _: &ext::ShowBackstage, _window, cx| {
+            .on_action(cx.listener(|this, _: &ext::ShowBackstage, window, cx| {
+                let was_up = this.backstage;
                 this.open_backstage(cx);
+                this.focus_suite_for_file(was_up, window, cx);
+            }))
+            // File straight on one of an extension tab's own pages (#2204).
+            .on_action(cx.listener(|this, a: &ext::ShowBackstagePage, window, cx| {
+                let was_up = this.backstage;
+                this.show_ext_backstage_page(a.id.clone(), cx);
+                this.focus_suite_for_file(was_up, window, cx);
             }))
             // An extension's view, File page or ribbon command closes its tab
             // (#1923); the root takes it whatever had the focus.

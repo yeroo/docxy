@@ -74,7 +74,7 @@ issue number to find its notes.
   inset (#1987), its scrollbars (#2080), its Find
   box (#1887), its Print Layout (#1888), an extension's ribbon
   drawn by the suite and the suite's theme (#1870), File backstage pages and CloseTab
-  (#1923).
+  (#1923), File opened on an extension's own page (#2204).
 - `docs/claude/ribbon.md`: before changing the ribbon: contributed group launchers
   (#1669), ribbon fit per ribbon (#1020, #1608, #1685, #1763), swatch galleries, their
   sections, More button and KeyTips (#1761, #1762, #1823). A new ribbon command also needs
