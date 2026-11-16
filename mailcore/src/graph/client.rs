@@ -70,8 +70,14 @@ impl UserIds {
     }
 
     /// Keeps `id` (`None`: no such user) as `address`'s answer.
-    pub(crate) fn insert(&self, address: &str, id: Option<String>) {
+    fn keep(&self, address: &str, id: Option<String>) {
         self.map().insert(user_ids_key(address), id);
+    }
+
+    /// [`UserIds::keep`], for tests that fill the map without resolving.
+    #[cfg(test)]
+    pub(crate) fn insert(&self, address: &str, id: Option<String>) {
+        self.keep(address, id);
     }
 
     /// The map, a poisoned lock taken over: a panic elsewhere while it was
@@ -2554,7 +2560,7 @@ impl GraphClient {
             return Ok(kept);
         }
         let id = self.user_id_by_address(address)?;
-        self.user_ids.insert(address, id.clone());
+        self.user_ids.keep(address, id.clone());
         Ok(id)
     }
 
