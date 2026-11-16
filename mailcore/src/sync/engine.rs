@@ -3341,20 +3341,34 @@ impl Engine {
             // The message commands address the message under the id it is
             // stored as now (`current_id`: a draft's reconciled `local:` id,
             // an id from before a move, #1896); the store writes match the
-            // id only.
+            // id only. A failed optimistic write (a busy store, #2209) is
+            // told, as `Move`'s is, and the op is queued regardless: Graph
+            // is the source of truth, and the next delta brings its value.
             SyncCommand::MarkRead { id, read } => {
                 let id = self.store.current_id(&id).unwrap_or(id);
-                self.store.set_read(&id, read);
+                if let Err(e) = self.store.set_read(&id, read) {
+                    self.emit(SyncEvent::Error(format!(
+                        "local mark-read of {id} ({read}) failed: {e}"
+                    )));
+                }
                 self.enqueue_and_drain(OutboxOp::MarkRead { id, read });
             }
             SyncCommand::SetFlag { id, flagged } => {
                 let id = self.store.current_id(&id).unwrap_or(id);
-                self.store.set_flag(&id, flagged);
+                if let Err(e) = self.store.set_flag(&id, flagged) {
+                    self.emit(SyncEvent::Error(format!(
+                        "local flag of {id} ({flagged}) failed: {e}"
+                    )));
+                }
                 self.enqueue_and_drain(OutboxOp::SetFlag { id, flagged });
             }
             SyncCommand::SetCategories { id, categories } => {
                 let id = self.store.current_id(&id).unwrap_or(id);
-                self.store.set_categories(&id, &categories);
+                if let Err(e) = self.store.set_categories(&id, &categories) {
+                    self.emit(SyncEvent::Error(format!(
+                        "local categories of {id} failed: {e}"
+                    )));
+                }
                 self.enqueue_and_drain(OutboxOp::SetCategories { id, categories });
             }
             SyncCommand::RefreshCategories => self.refresh_master_categories(),
@@ -5609,7 +5623,13 @@ impl Engine {
             )));
             return;
         }
-        self.store.dismiss_message_reminder(&id);
+        // A failed local write is told and the op queued regardless, as
+        // `MarkRead`'s (#2209).
+        if let Err(e) = self.store.dismiss_message_reminder(&id) {
+            self.emit(SyncEvent::Error(format!(
+                "local reminder dismiss of {id} failed: {e}"
+            )));
+        }
         self.enqueue_reminder_op(OutboxOp::DismissMessageReminder { id });
     }
 
@@ -5632,7 +5652,13 @@ impl Engine {
             )));
             return;
         }
-        self.store.snooze_message_reminder(&id, &utc);
+        // A failed local write is told and the op queued regardless, as
+        // `MarkRead`'s (#2209).
+        if let Err(e) = self.store.snooze_message_reminder(&id, &utc) {
+            self.emit(SyncEvent::Error(format!(
+                "local reminder snooze of {id} to {utc} failed: {e}"
+            )));
+        }
         self.enqueue_reminder_op(OutboxOp::SnoozeMessageReminder {
             id,
             new_reminder_utc: utc,
@@ -30642,8 +30668,8 @@ mod tests {
             let (handle, store_path, dir) =
                 spawn_fast(&srv, "msg-reminder-reread-owned", HOUR, None, |s| {
                     seed_m1(s);
-                    s.dismiss_message_reminder("M1");
-                    s.set_flag("M1", false);
+                    s.dismiss_message_reminder("M1").unwrap();
+                    s.set_flag("M1", false).unwrap();
                     s.enqueue_op(&OutboxOp::DismissMessageReminder { id: "M1".into() })
                         .unwrap();
                     s.enqueue_op(&OutboxOp::SetFlag {
@@ -33069,7 +33095,7 @@ mod tests {
                 .unwrap();
                 s.set_delta_link("F3", &legacy_link("F3")).unwrap();
                 seed_row(&s, "F1", &msg("R1", "2026-01-02T00:00:00Z"));
-                s.set_read("R1", true);
+                s.set_read("R1", true).unwrap();
                 s.enqueue_op(&OutboxOp::MarkRead {
                     id: "R1".into(),
                     read: true,
@@ -33467,7 +33493,7 @@ mod tests {
             {
                 let s = store_in(&dir);
                 seed_row(&s, "F1", &msg("R1", &recent));
-                s.set_read("R1", true);
+                s.set_read("R1", true).unwrap();
                 s.enqueue_op(&OutboxOp::MarkRead {
                     id: "R1".into(),
                     read: true,
@@ -33807,7 +33833,7 @@ mod tests {
                 &handle.evt_rx,
                 |e| matches!(e, SyncEvent::Error(m) if m.contains("quarantined")),
             );
-            store_in(&dir).set_read("MID", true);
+            store_in(&dir).set_read("MID", true).unwrap();
             handle
                 .cmd_tx
                 .send(SyncCommand::MarkRead {
@@ -44352,7 +44378,7 @@ mod tests {
         /// The queued `MarkRead` of M1, written as a host's store write
         /// does, on its own connection.
         fn queue_mark_read(store: &Store) {
-            store.set_read("M1", true);
+            store.set_read("M1", true).unwrap();
             store
                 .enqueue_op(&OutboxOp::MarkRead {
                     id: "M1".into(),
@@ -45460,6 +45486,60 @@ mod tests {
             assert_eq!(engine.store.pending_ops().unwrap().len(), 1);
             assert_eq!(writes(&srv), Vec::<(String, String)>::new());
             assert_eq!(probes(&srv), 1);
+        }
+
+        /// #2209: a `MarkRead` whose optimistic store write fails is told
+        /// (`local mark-read of {id} ... failed`, as `Move`'s is), and its op
+        /// is queued and sent regardless. The write is refused by a trigger,
+        /// not a held lock: the op is queued on the same connection, which a
+        /// held lock would refuse too.
+        #[test]
+        fn mark_read_reports_a_failed_local_write_and_still_enqueues_2209() {
+            let srv = FakeServer::start_limited(routes(&[(200, "ROOT_A")], "FA", "ROOT_A"));
+            let dir = unique_dir("mark-read-refused");
+            let path = dir.join("mail.db");
+            let store = Store::open(&path).unwrap();
+            mailbox_a(&store, Some("ROOT_A"));
+            store.set_mailbox_root("ROOT_A").unwrap();
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute_batch(
+                    "CREATE TRIGGER refuse_read BEFORE UPDATE OF is_read ON messages
+                     BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+                )
+                .unwrap();
+            let (mut engine, evt_rx, _cmd_tx) = engine_on(&srv, store);
+            engine.handle_command(SyncCommand::MarkRead {
+                id: "MA1".into(),
+                read: true,
+            });
+            let errors: Vec<String> = evt_rx
+                .try_iter()
+                .filter_map(|e| match e {
+                    SyncEvent::Error(m) => Some(m),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(
+                errors[0].starts_with("local mark-read of MA1 (true) failed: ")
+                    && errors[0].contains("refused"),
+                "{errors:?}"
+            );
+            assert!(
+                !engine.store.message_row("MA1").unwrap().unwrap().is_read,
+                "the refused write left the row"
+            );
+            assert!(
+                writes(&srv)
+                    .iter()
+                    .any(|(m, p)| m == "PATCH" && p.starts_with("/me/messages/MA1")),
+                "the op was queued and sent: {:?}",
+                writes(&srv)
+            );
+            assert_eq!(engine.store.pending_ops().unwrap().len(), 0, "and dropped");
+            drop(engine);
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// AC 4: a reset found by a drain's check stops that drain's

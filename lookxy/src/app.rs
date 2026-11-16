@@ -776,7 +776,7 @@ impl App {
                 }
                 // Mark the invite read locally (a small courtesy) and push the
                 // change to Graph via the existing read path.
-                self.store.set_read(&message_id, true);
+                let _ = self.store.set_read(&message_id, true);
                 self.reload_messages();
                 let _ = self.sync.cmd_tx.send(SyncCommand::MarkRead {
                     id: message_id,
@@ -1463,7 +1463,7 @@ impl App {
     /// from `mark_read`, which is cursor-based and reads a whole thread when the
     /// cursor sits on a header.
     fn mark_message_read(&mut self, id: &str) {
-        self.store.set_read(id, true);
+        let _ = self.store.set_read(id, true);
         let _ = self.sync.cmd_tx.send(SyncCommand::MarkRead {
             id: id.to_string(),
             read: true,
@@ -3080,10 +3080,15 @@ impl App {
     /// enqueues the matching outbox op and pushes it to Graph. In threaded
     /// mode, when the cursor is on a conversation header, this acts on every
     /// message of the conversation instead of just the highlighted one.
+    ///
+    /// A failed store write (a busy store, #2209) is dropped here and in the
+    /// other optimistic writes (`toggle_flag`, categories): the engine
+    /// repeats it on its own connection when it handles the command, so the
+    /// row is only late.
     pub fn mark_read(&mut self, read: bool) {
         if let Some(ids) = self.threaded_target_ids() {
             for id in &ids {
-                self.store.set_read(id, read);
+                let _ = self.store.set_read(id, read);
                 let _ = self.sync.cmd_tx.send(SyncCommand::MarkRead {
                     id: id.clone(),
                     read,
@@ -3095,7 +3100,7 @@ impl App {
         let Some(id) = self.highlighted_message_id() else {
             return;
         };
-        self.store.set_read(&id, read);
+        let _ = self.store.set_read(&id, read);
         self.reload_messages();
         let _ = self.sync.cmd_tx.send(SyncCommand::MarkRead { id, read });
     }
@@ -3118,7 +3123,7 @@ impl App {
                 None => return,
             };
             for id in &ids {
-                self.store.set_flag(id, want);
+                let _ = self.store.set_flag(id, want);
                 let _ = self.sync.cmd_tx.send(SyncCommand::SetFlag {
                     id: id.clone(),
                     flagged: want,
@@ -3132,7 +3137,7 @@ impl App {
         };
         let id = row.id.clone();
         let flagged = !row.is_flagged;
-        self.store.set_flag(&id, flagged);
+        let _ = self.store.set_flag(&id, flagged);
         self.reload_messages();
         let _ = self.sync.cmd_tx.send(SyncCommand::SetFlag { id, flagged });
     }
@@ -3741,7 +3746,7 @@ impl App {
                     .filter(|it| it.selected)
                     .map(|it| it.name.clone())
                     .collect();
-                self.store.set_categories(&id, &names);
+                let _ = self.store.set_categories(&id, &names);
                 self.reload_messages();
                 let _ = self.sync.cmd_tx.send(SyncCommand::SetCategories {
                     id,
@@ -5554,7 +5559,7 @@ pub(crate) mod tests {
         let mut app = App::for_test_with_seeded_store();
         app.threaded = true;
         seed_second_in_c1(&app); // c1 = m1 + m2, both start unflagged
-        app.store.set_flag("m1", true); // now MIXED: m1 flagged, m2 not
+        app.store.set_flag("m1", true).unwrap(); // now MIXED: m1 flagged, m2 not
         app.reload_messages();
         let pos = app
             .visible_rows
