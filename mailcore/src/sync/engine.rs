@@ -57,6 +57,9 @@ use crate::graph::client::{
     event_zone_error, is_expired_sync_state, moved_message_id, rsvp_proposal,
 };
 pub use crate::graph::model::BodyFormat;
+/// The answer a [`SyncEvent::DraftReady`] draft was made as (#2085); it
+/// lives in `graph::model`, as a local answer draft's row stores it (#2212).
+pub use crate::graph::model::DraftKind;
 use crate::graph::model::{
     AutomaticReplies, ContactPhoto, DeltaItem, DirectoryGroup, DirectoryUser, Event,
     EventDeltaItem, FolderContact, GroupMember, MailFolder, Me, MeetingMessage, MeetingMessageType,
@@ -963,18 +966,6 @@ pub enum SyncState {
     Offline,
     PendingOps(usize),
     SignInRequired,
-}
-
-/// The answer a [`SyncEvent::DraftReady`] draft was made as (#2085).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DraftKind {
-    /// A reply to the sender: `ComposeReply { all: false }` (`createReply`).
-    Reply,
-    /// A reply to the sender and every recipient: `ComposeReply { all: true }`
-    /// (`createReplyAll`).
-    ReplyAll,
-    /// A forward: `ComposeForward` (`createForward`).
-    Forward,
 }
 
 /// Why the engine asks for a sign-in: the payload of
@@ -26106,6 +26097,267 @@ mod tests {
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- A local answer draft threads (#2212) ---------------------------
+
+    /// A Graph answer draft `id` as `createReply` / `createForward` return it.
+    fn answer_json(id: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","conversationId":"C9","subject":"RE: Hi","from":{{"emailAddress":{{"name":"","address":""}}}},"toRecipients":[{{"emailAddress":{{"name":"Alice","address":"alice@x"}}}}],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":true,"hasAttachments":false,"importance":"normal","bodyPreview":"","isDraft":true}}"#
+        )
+    }
+
+    /// A host's compose falls back to a local answer draft while the
+    /// engine's `createReply` for `ComposeReply` is slow, and the person
+    /// sends it: the send waits behind the compose, then creates its own
+    /// draft through `createReply` and sends that, never a plain
+    /// `POST /me/messages`.
+    #[test]
+    fn a_send_of_a_local_reply_draft_behind_a_slow_compose_reply_threads() {
+        let mut routes: Vec<(Route, Option<usize>, Duration)> = vec![
+            (
+                post_route("/me/messages/M1/createReply", 201, &answer_json("R1")),
+                Some(1),
+                Duration::from_millis(400),
+            ),
+            (
+                post_route("/me/messages/M1/createReply", 201, &answer_json("R2")),
+                None,
+                Duration::ZERO,
+            ),
+            (
+                get_route(
+                    "/me/messages/R1",
+                    200,
+                    r#"{"body":{"contentType":"html","content":"<p>quoted</p>"}}"#,
+                ),
+                None,
+                Duration::ZERO,
+            ),
+            (
+                post_route("/me/messages/R2/send", 202, ""),
+                None,
+                Duration::ZERO,
+            ),
+            (
+                patch_route("/me/messages/R2", 200, "{}"),
+                None,
+                Duration::ZERO,
+            ),
+        ];
+        routes.extend(
+            folder_routes(DRAFTS_SENT, &[], &[])
+                .into_iter()
+                .map(|(r, n)| (r, n, Duration::ZERO)),
+        );
+        let srv = FakeServer::start_paced(routes);
+        let (handle, store_path, store_dir) =
+            spawn_fast(&srv, "answer-behind-compose", HOUR, None, |_| {});
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+        let startup = seen.len();
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::ComposeReply {
+                id: "M1".into(),
+                all: false,
+            })
+            .unwrap();
+        // The host's fallback, made on its own connection while the
+        // compose is still waiting for Graph.
+        let local = Store::open(&store_path)
+            .unwrap()
+            .create_local_answer_draft(
+                "M1",
+                DraftKind::Reply,
+                "Re: Hi",
+                "alice@x",
+                "",
+                "<p>mine</p>",
+            )
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SendDraft { id: local.clone() })
+            .unwrap();
+        seen.extend(wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::Sent { .. } | SyncEvent::SendFailed { .. })
+        }));
+        let after = &seen[startup..];
+
+        let ready = SyncEvent::DraftReady {
+            id: "R1".into(),
+            original: "M1".into(),
+            kind: DraftKind::Reply,
+        };
+        let at_ready = position(after, |e| e == &ready).expect("DraftReady");
+        let at_sent =
+            position(after, |e| e == &SyncEvent::Sent { id: local.clone() }).expect("Sent");
+        assert!(at_ready < at_sent, "{after:?}");
+        assert_eq!(hits(&srv, "POST", "/me/messages/M1/createReply"), 2);
+        assert_eq!(hits(&srv, "POST", "/me/messages"), 0, "no plain create");
+        assert_eq!(hits(&srv, "PATCH", "/me/messages/R2"), 1);
+        assert_eq!(hits(&srv, "POST", "/me/messages/R2/send"), 1);
+        assert_eq!(hits(&srv, "POST", "/me/messages/R1/send"), 0);
+        let patch = srv
+            .requests()
+            .into_iter()
+            .find(|r| r.method == "PATCH" && r.path == "/me/messages/R2")
+            .unwrap();
+        assert!(patch.body.contains("<p>mine</p>"), "{}", patch.body);
+
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(store.draft(&local).unwrap().unwrap().0.id, "R2");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// The routes an answer draft's send needs when its `createReply` on
+    /// `M1` answers `status` with `body`: no plain create and no send route.
+    fn refused_answer_routes(status: u16, body: &str) -> Vec<(Route, Option<usize>)> {
+        let mut routes = vec![(
+            post_route("/me/messages/M1/createReply", status, body),
+            None,
+        )];
+        routes.extend(folder_routes(DRAFTS_SENT, &[], &[]));
+        routes
+    }
+
+    fn seed_answer_draft(local: &mut String) -> impl FnOnce(&Store) + '_ {
+        move |s: &Store| {
+            *local = s
+                .create_local_answer_draft(
+                    "M1",
+                    DraftKind::Reply,
+                    "Re: Hi",
+                    "alice@x",
+                    "",
+                    "<p>mine</p>",
+                )
+                .unwrap();
+        }
+    }
+
+    /// A `createReply` Graph refuses (a 403, as on a rights-protected
+    /// original) fails the send as any refused send does: `SendFailed`
+    /// with Graph's message, the draft back in Drafts and still local.
+    /// It never falls back to a plain create.
+    #[test]
+    fn a_refused_create_reply_fails_the_send_back_to_drafts() {
+        let srv = FakeServer::start_limited(refused_answer_routes(403, &access_denied_body()));
+        let mut local = String::new();
+        let (handle, store_path, store_dir) = spawn_fast(
+            &srv,
+            "answer-403",
+            HOUR,
+            None,
+            seed_answer_draft(&mut local),
+        );
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+        let startup = seen.len();
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::SendDraft { id: local.clone() })
+            .unwrap();
+        wait_idle(&handle, &mut seen);
+        let send = &seen[startup..];
+
+        let failed = SyncEvent::SendFailed {
+            id: local.clone(),
+            error: ACCESS_DENIED.into(),
+        };
+        assert!(send.contains(&failed), "{send:?}");
+        assert!(
+            !send.iter().any(|e| matches!(e, SyncEvent::Sent { .. })),
+            "{send:?}"
+        );
+        no_quarantine(&seen);
+        assert_eq!(hits(&srv, "POST", "/me/messages/M1/createReply"), 1);
+        assert_eq!(hits(&srv, "POST", "/me/messages"), 0, "no plain create");
+        assert!(
+            !srv.requests().iter().any(|r| r.path.ends_with("/send")),
+            "nothing sent"
+        );
+
+        let store = Store::open(&store_path).unwrap();
+        let (row, _) = store.draft(&local).unwrap().expect("the draft");
+        assert_eq!(row.id, local, "still local");
+        assert_eq!(row.folder_id, "DRAFTS1", "back in Drafts");
+        assert!(row.is_draft);
+        assert!(
+            store.pending_ops().unwrap().is_empty(),
+            "the send is dropped"
+        );
+        assert_eq!(
+            store.draft_answers(&local).unwrap(),
+            Some(("M1".to_string(), DraftKind::Reply)),
+            "a resend still answers M1"
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// A `createReply` that fails on Graph's side (a 500, or a 503
+    /// throttle) keeps the send queued for a later drain: no `SendFailed`,
+    /// no plain create, the draft still local.
+    #[test]
+    fn a_create_reply_5xx_keeps_the_send_queued() {
+        for status in [500, 503] {
+            let srv = FakeServer::start_limited(refused_answer_routes(status, r#"{"error":{}}"#));
+            let mut local = String::new();
+            let (handle, store_path, store_dir) = spawn_fast(
+                &srv,
+                &format!("answer-{status}"),
+                HOUR,
+                None,
+                seed_answer_draft(&mut local),
+            );
+            let mut seen = Vec::new();
+            wait_idle(&handle, &mut seen);
+            let startup = seen.len();
+
+            handle
+                .cmd_tx
+                .send(SyncCommand::SendDraft { id: local.clone() })
+                .unwrap();
+            barrier(&handle, &mut seen);
+            let send = &seen[startup..];
+
+            assert!(
+                !send
+                    .iter()
+                    .any(|e| matches!(e, SyncEvent::SendFailed { .. } | SyncEvent::Sent { .. })),
+                "{status}: {send:?}"
+            );
+            assert_eq!(
+                hits(&srv, "POST", "/me/messages/M1/createReply"),
+                1,
+                "{status}"
+            );
+            assert_eq!(hits(&srv, "POST", "/me/messages"), 0, "{status}");
+
+            let store = Store::open(&store_path).unwrap();
+            assert_eq!(
+                store.draft(&local).unwrap().unwrap().0.id,
+                local,
+                "{status}"
+            );
+            let queued = store.pending_ops().unwrap();
+            assert_eq!(queued.len(), 1, "{status}");
+            assert!(
+                matches!(&queued[0].op, OutboxOp::SendDraft { id } if id == &local),
+                "{status}"
+            );
+
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&store_dir);
+        }
     }
 
     // --- A send that fails goes back to Drafts (#1874) --------------------

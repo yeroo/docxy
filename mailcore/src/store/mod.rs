@@ -19,9 +19,10 @@ use crate::graph::client::{
 };
 use crate::graph::model::{
     AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Calendar, ContactFields,
-    ContactPhoto, DraftOptions, Event, EventRecurrence, FolderContact, MailFolder, MasterCategory,
-    MeetingMessageType, Message, MessageFields, MessageHeader, MessageProtection, PhysicalAddress,
-    Recipient, Recurrence, Sensitivity, is_stored_header, meeting_link_in, reminder_time,
+    ContactPhoto, DraftKind, DraftOptions, Event, EventRecurrence, FolderContact, MailFolder,
+    MasterCategory, MeetingMessageType, Message, MessageFields, MessageHeader, MessageProtection,
+    PhysicalAddress, Recipient, Recurrence, Sensitivity, is_stored_header, meeting_link_in,
+    reminder_time,
 };
 use crate::json::{self, Value};
 
@@ -1928,6 +1929,18 @@ impl Store {
         // its next PATCH leaves the server's flag alone.
         let _ = conn.execute(
             "ALTER TABLE messages ADD COLUMN draft_options_set INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        // Same idempotent-migration pattern, for `messages.answers_id` and
+        // `answers_kind` (#2212: the message a local answer draft answers).
+        // A row from before answers nothing, so its create stays a plain
+        // `POST /me/messages`.
+        let _ = conn.execute(
+            "ALTER TABLE messages ADD COLUMN answers_id TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE messages ADD COLUMN answers_kind TEXT NOT NULL DEFAULT ''",
             [],
         );
         // Same idempotent-migration pattern, for `bodies.fetched_as` (#1901:
@@ -3860,6 +3873,53 @@ impl Store {
         cc: &str,
         body_html: &str,
     ) -> Result<String, StoreError> {
+        self.insert_local_draft(None, subject, to, cc, body_html)
+    }
+
+    /// [`Store::create_local_draft`] for a reply or forward a host made
+    /// locally (#2212), as when Graph's `createReply` / `createReplyAll` /
+    /// `createForward` behind `ComposeReply` / `ComposeForward` is slow:
+    /// the draft also records that it answers `original` (the message id
+    /// as the host holds it; the outbox resolves it with
+    /// [`Store::current_id`] when it creates the draft) as `kind`, so its
+    /// `SaveDraft` / `SendDraft` creates it on Graph through that endpoint
+    /// on the original, threaded and, for a forward, with the original's
+    /// attachments, then PATCHes the fields stored here over Graph's
+    /// pre-filled ones. The link is stored on the row and survives a
+    /// restart ([`Store::draft_answers`]).
+    ///
+    /// In the same transaction the row gets what the server draft would
+    /// have (#2096): the original's `conversation_id` and, for a reply, its
+    /// `internet_message_id` as `in_reply_to`, so
+    /// [`Store::reply_draft_links`] names the original at once. A missing
+    /// original row leaves both `""`.
+    ///
+    /// The row starts with an unsaved edit (`local_edit = 1`, #1871): until
+    /// the PATCH lands, Graph's copy holds its pre-filled recipients and
+    /// quoted body, which a fresh delta or a body fetch must not write over
+    /// the person's fields. The draft's first successful push clears it.
+    pub fn create_local_answer_draft(
+        &self,
+        original: &str,
+        kind: DraftKind,
+        subject: &str,
+        to: &str,
+        cc: &str,
+        body_html: &str,
+    ) -> Result<String, StoreError> {
+        self.insert_local_draft(Some((original, kind)), subject, to, cc, body_html)
+    }
+
+    /// The one insert behind `create_local_draft` and
+    /// `create_local_answer_draft`.
+    fn insert_local_draft(
+        &self,
+        answers: Option<(&str, DraftKind)>,
+        subject: &str,
+        to: &str,
+        cc: &str,
+        body_html: &str,
+    ) -> Result<String, StoreError> {
         let id = local_draft_id();
         // The folder is resolved inside the write (IMMEDIATE), so the sync
         // thread's `retain_folders` runs wholly before it (the sentinel is
@@ -3868,13 +3928,51 @@ impl Store {
         // draft's (#1886).
         let tx = self.write_tx()?;
         let folder_id = drafts_folder_id_on(&tx)?;
+        let (answers_id, answers_kind, conversation_id, in_reply_to, local_edit) = match answers {
+            None => (String::new(), "", String::new(), String::new(), 0),
+            Some((original, kind)) => {
+                let current = current_id_on(&tx, original)?;
+                let (conversation, message_id): (String, String) = tx
+                    .query_row(
+                        "SELECT conversation_id, internet_message_id FROM messages WHERE id = ?1",
+                        params![current],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?
+                    .unwrap_or_default();
+                let in_reply_to = match kind {
+                    DraftKind::Reply | DraftKind::ReplyAll => message_id,
+                    DraftKind::Forward => String::new(),
+                };
+                (
+                    original.to_string(),
+                    kind.as_stored(),
+                    conversation,
+                    in_reply_to,
+                    1,
+                )
+            }
+        };
         tx.execute(
             "INSERT INTO messages (
                  id, folder_id, conversation_id, subject, from_name, from_addr,
                  to_recipients, cc_recipients, received_at, sent_at,
-                 is_read, is_flagged, has_attachments, importance, preview, is_draft
-             ) VALUES (?1, ?2, '', ?3, '', '', ?4, ?5, '', '', 1, 0, 0, 'normal', '', 1)",
-            params![id, folder_id, subject, to, cc],
+                 is_read, is_flagged, has_attachments, importance, preview, is_draft,
+                 in_reply_to, local_edit, answers_id, answers_kind
+             ) VALUES (?1, ?2, ?3, ?4, '', '', ?5, ?6, '', '', 1, 0, 0, 'normal', '', 1,
+                       ?7, ?8, ?9, ?10)",
+            params![
+                id,
+                folder_id,
+                conversation_id,
+                subject,
+                to,
+                cc,
+                in_reply_to,
+                local_edit,
+                answers_id,
+                answers_kind
+            ],
         )?;
         tx.execute(
             "INSERT INTO bodies (message_id, content_type, content) VALUES (?1, 'html', ?2)",
@@ -3882,6 +3980,29 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(id)
+    }
+
+    /// The message the draft `id` addresses (its `local:` id, still after
+    /// `reconcile_id`, or its Graph id) answers, and how (#2212): the
+    /// original's id as [`Store::create_local_answer_draft`] stored it
+    /// (unresolved) and the kind. `None` for no such row, a draft made any
+    /// other way, or a stored kind this build does not read.
+    pub fn draft_answers(&self, id: &str) -> Result<Option<(String, DraftKind)>, StoreError> {
+        let found: Option<(String, String)> = self
+            .conn
+            .query_row(
+                concat!(
+                    "SELECT answers_id, answers_kind FROM messages WHERE ",
+                    draft_row_sql!()
+                ),
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(found.and_then(|(original, kind)| {
+            let kind = DraftKind::from_stored(&kind)?;
+            (!original.is_empty()).then_some((original, kind))
+        }))
     }
 
     /// Updates a draft's editable fields in place (subject, recipients, and
@@ -11337,6 +11458,8 @@ mod tests {
             ("local_id", V::Null),
             ("local_edit", V::Integer(0)),
             ("draft_options_set", V::Integer(0)),
+            ("answers_id", t("")),
+            ("answers_kind", t("")),
             ("is_reminder_on", V::Integer(1)),
             ("reminder_at", t("2026-07-13T08:00:00Z")),
             ("reminder_signal_at", t("2026-07-13T09:00:00Z")),
@@ -11422,6 +11545,8 @@ mod tests {
                 ("local_id", V::Null),
                 ("local_edit", V::Integer(0)),
                 ("draft_options_set", V::Integer(0)),
+                ("answers_id", t("")),
+                ("answers_kind", t("")),
                 ("is_reminder_on", V::Integer(0)),
                 ("reminder_at", t("")),
                 ("reminder_signal_at", t("")),
@@ -18836,6 +18961,146 @@ mod draft_tests {
         assert_eq!(row.importance, "high");
         assert!(row.is_flagged);
         assert_eq!(row.flag_due_at, "2026-12-01T17:00:00Z");
+    }
+
+    /// A store holding the received message `M1` (conversation `C9`,
+    /// Internet message id `<m1@x>`) in folder `INBOX` (#2212).
+    fn store_with_original() -> Store {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_folder(&MailFolder {
+            id: "INBOX".into(),
+            display_name: "Inbox".into(),
+            parent_id: None,
+            total_count: 1,
+            unread_count: 0,
+            well_known_name: Some("inbox".into()),
+        })
+        .unwrap();
+        let m = Message::from_json(
+            &json::parse(
+                r#"{"id":"M1","conversationId":"C9","internetMessageId":"<m1@x>",
+                    "subject":"Hi","isRead":true}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        s.upsert_message("INBOX", &m).unwrap();
+        s
+    }
+
+    #[test]
+    fn create_local_answer_draft_stores_its_link() {
+        for kind in [DraftKind::Reply, DraftKind::ReplyAll, DraftKind::Forward] {
+            let s = store_with_original();
+            let id = s
+                .create_local_answer_draft("M1", kind, "Re: Hi", "alice@x", "", "<p>q</p>")
+                .unwrap();
+            assert!(id.starts_with("local:"));
+            assert_eq!(
+                s.draft_answers(&id).unwrap(),
+                Some(("M1".to_string(), kind)),
+                "{kind:?}"
+            );
+            let (row, body) = s.draft(&id).unwrap().unwrap();
+            assert!(row.is_draft);
+            assert_eq!(row.subject, "Re: Hi");
+            assert_eq!(row.to_recipients, "alice@x");
+            assert_eq!(body.content, "<p>q</p>");
+            assert_eq!(row.conversation_id, "C9", "{kind:?}");
+            // Unsaved until its first push (#2212, #1871).
+            assert_eq!(s.local_edit_generation(&id).unwrap(), 1);
+            let links = s.reply_draft_links().unwrap();
+            if kind == DraftKind::Forward {
+                assert_eq!(row.in_reply_to, "");
+                assert!(links.is_empty());
+            } else {
+                assert_eq!(row.in_reply_to, "<m1@x>", "{kind:?}");
+                assert_eq!(links, vec![("C9".to_string(), "<m1@x>".to_string())]);
+            }
+        }
+    }
+
+    #[test]
+    fn create_local_answer_draft_of_a_missing_original_still_stores_the_link() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s
+            .create_local_answer_draft("GONE", DraftKind::Reply, "Re:", "", "", "x")
+            .unwrap();
+        let (row, _) = s.draft(&id).unwrap().unwrap();
+        assert_eq!(row.conversation_id, "");
+        assert_eq!(row.in_reply_to, "");
+        assert_eq!(
+            s.draft_answers(&id).unwrap(),
+            Some(("GONE".to_string(), DraftKind::Reply))
+        );
+    }
+
+    #[test]
+    fn draft_answers_reaches_a_reconciled_local_id() {
+        let s = store_with_original();
+        let id = s
+            .create_local_answer_draft("M1", DraftKind::Forward, "Fw: Hi", "", "", "x")
+            .unwrap();
+        s.reconcile_id(&id, "F1").unwrap();
+        let want = Some(("M1".to_string(), DraftKind::Forward));
+        assert_eq!(s.draft_answers(&id).unwrap(), want);
+        assert_eq!(s.draft_answers("F1").unwrap(), want);
+    }
+
+    #[test]
+    fn draft_answers_reads_none_for_a_plain_draft_and_an_unknown_kind() {
+        let s = store_with_original();
+        let plain = s.create_local_draft("Hi", "", "", "x").unwrap();
+        assert_eq!(s.draft_answers(&plain).unwrap(), None);
+        assert_eq!(s.local_edit_generation(&plain).unwrap(), 0);
+        assert_eq!(s.draft_answers("M1").unwrap(), None);
+        assert_eq!(s.draft_answers("local:nothing").unwrap(), None);
+        let odd = s
+            .create_local_answer_draft("M1", DraftKind::Reply, "Re:", "", "", "x")
+            .unwrap();
+        s.conn
+            .execute(
+                "UPDATE messages SET answers_kind = 'redirect' WHERE id = ?1",
+                params![odd],
+            )
+            .unwrap();
+        assert_eq!(s.draft_answers(&odd).unwrap(), None);
+    }
+
+    #[test]
+    fn a_database_from_before_draft_answers_reads_no_link() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-draft-answers-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        let local = {
+            let s = Store::open(&path).unwrap();
+            let local = s.create_local_draft("Old", "", "", "body").unwrap();
+            s.conn
+                .execute_batch(
+                    "ALTER TABLE messages DROP COLUMN answers_id;
+                     ALTER TABLE messages DROP COLUMN answers_kind;",
+                )
+                .unwrap();
+            local
+        };
+        let s = Store::open(&path).unwrap();
+        let has: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('messages')
+                 WHERE name IN ('answers_id', 'answers_kind')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has, 2);
+        assert_eq!(s.draft_answers(&local).unwrap(), None);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
