@@ -154,6 +154,7 @@ issue number to find its notes.
   a moved message followed to its new id, its old ids still resolving (#1896),
   server message search and opening a hit not in the store (#2006),
   the organisation's directory searched on demand, a 403 told apart (#1942),
+  its mail-enabled groups and a group's members, nested groups among them (#2058),
   a message's list row by id, batched, without its body (#2053),
   a flagged message's reminder, read, stored, snoozed and dismissed (#2054),
   an event's own response time and created time (#2068),

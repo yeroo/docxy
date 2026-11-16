@@ -151,17 +151,129 @@ impl DirectoryUser {
     /// an address ([`looks_like_address`]: a guest's `#EXT#` UPN does not).
     /// A UPN that does is kept, though its user may have no mailbox.
     pub fn from_json(v: &Value) -> Option<Self> {
-        let address = match non_blank_str(v, "mail") {
-            Some(mail) => mail,
-            None => non_blank_str(v, "userPrincipalName").filter(|u| looks_like_address(u))?,
-        };
         Some(DirectoryUser {
+            name: non_blank_str(v, "displayName").unwrap_or_default(),
+            address: user_address(v)?,
+            job_title: non_blank_str(v, "jobTitle"),
+            department: non_blank_str(v, "department"),
+        })
+    }
+}
+
+/// A directory user's address (#1942, shared by #2058's group members):
+/// the trimmed `mail`, or with no (or a blank) `mail` the
+/// `userPrincipalName` when it [`looks_like_address`]; `None` otherwise.
+fn user_address(v: &Value) -> Option<String> {
+    match non_blank_str(v, "mail") {
+        Some(mail) => Some(mail),
+        None => non_blank_str(v, "userPrincipalName").filter(|u| looks_like_address(u)),
+    }
+}
+
+/// One mail-enabled group of the organisation's directory, from Graph
+/// `/groups?$search` (`GraphClient::search_groups`, #2058): a distribution
+/// list, a mail-enabled security group or a Microsoft 365 group.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectoryGroup {
+    /// The directory object id, for `GraphClient::group_members`.
+    pub id: String,
+    /// `displayName`, trimmed; `""` when the directory has none.
+    pub name: String,
+    /// `mail`, trimmed.
+    pub address: String,
+    /// `description`; `None` when absent, not a string or blank.
+    pub description: Option<String>,
+}
+
+impl DirectoryGroup {
+    /// A group, or `None` without an `id` or without a (non-blank) `mail`:
+    /// a group without an address is not one to write to.
+    pub fn from_json(v: &Value) -> Option<Self> {
+        Some(DirectoryGroup {
+            id: non_blank_str(v, "id")?,
+            name: non_blank_str(v, "displayName").unwrap_or_default(),
+            address: non_blank_str(v, "mail")?,
+            description: non_blank_str(v, "description"),
+        })
+    }
+}
+
+/// What a group member is (#2058), from its `@odata.type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberKind {
+    /// `#microsoft.graph.user`.
+    User,
+    /// `#microsoft.graph.group`: a nested group, whose own members a client
+    /// asks for in turn.
+    Group,
+    /// `#microsoft.graph.orgContact`: an external address in the directory.
+    Contact,
+}
+
+/// One member of a group, from Graph `/groups/{id}/members`
+/// (`GraphClient::group_members`, #2058).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupMember {
+    pub kind: MemberKind,
+    /// The directory object id; a `MemberKind::Group`'s is the id to expand.
+    pub id: String,
+    /// `displayName`, trimmed; `""` when the directory has none.
+    pub name: String,
+    /// A user's address as [`DirectoryUser`]'s (`mail`, else an address-like
+    /// UPN); a group's or a contact's `mail` only.
+    pub address: String,
+    /// `jobTitle`; `None` when absent, not a string or blank.
+    pub job_title: Option<String>,
+    /// `department`; `None` when absent, not a string or blank.
+    pub department: Option<String>,
+}
+
+impl GroupMember {
+    /// A member, or `None` when it is of another type (a device, a service
+    /// principal, an unknown or missing `@odata.type`), has no `id`, or has
+    /// no address. That skips a nested group without `mail` too: mail to
+    /// the list never reaches it, so it is not expanded. A member the token
+    /// may not read comes back with only its type and id, so it is skipped
+    /// as address-less.
+    pub fn from_json(v: &Value) -> Option<Self> {
+        let kind = match v.get("@odata.type").and_then(Value::as_str)? {
+            "#microsoft.graph.user" => MemberKind::User,
+            "#microsoft.graph.group" => MemberKind::Group,
+            "#microsoft.graph.orgContact" => MemberKind::Contact,
+            _ => return None,
+        };
+        let address = match kind {
+            MemberKind::User => user_address(v)?,
+            MemberKind::Group | MemberKind::Contact => non_blank_str(v, "mail")?,
+        };
+        Some(GroupMember {
+            kind,
+            id: non_blank_str(v, "id")?,
             name: non_blank_str(v, "displayName").unwrap_or_default(),
             address,
             job_title: non_blank_str(v, "jobTitle"),
             department: non_blank_str(v, "department"),
         })
     }
+}
+
+/// One answer of `GraphClient::group_members` (#2058).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GroupMemberList {
+    /// The members read, in Graph's order, at most the `top` asked.
+    pub members: Vec<GroupMember>,
+    /// Whether members were left unread: a page's kept members ran past
+    /// `top`, or an `@odata.nextLink` was left unfollowed (at `top` or at
+    /// the page cap).
+    pub truncated: bool,
+    /// How many members Graph returned on the pages read that were not
+    /// kept, for any reason: another type, no `id`, no address. A member
+    /// the token may not read (no `User.ReadBasic.All` for users) comes back
+    /// with its type and `id` only, so a group whose members are all
+    /// unreadable is an empty `members` with a non-zero `skipped`, not an
+    /// empty group. The member that ran past `top` and the rest of its page
+    /// are not counted: that is `truncated`.
+    pub skipped: usize,
 }
 
 /// Whether a directory `userPrincipalName` can stand in for a missing `mail`
@@ -2867,6 +2979,125 @@ mod tests {
     #[test]
     fn directory_user_from_json_without_a_name_keeps_an_empty_one() {
         assert_eq!(user(r#"{"mail":"jo@contoso.com"}"#).unwrap().name, "");
+    }
+
+    fn group(raw: &str) -> Option<DirectoryGroup> {
+        DirectoryGroup::from_json(&parse(raw).unwrap())
+    }
+
+    fn member(raw: &str) -> Option<GroupMember> {
+        GroupMember::from_json(&parse(raw).unwrap())
+    }
+
+    #[test]
+    fn directory_group_from_json_reads_id_name_address_description() {
+        assert_eq!(
+            group(
+                r#"{"id":"G1","displayName":" Sales ","mail":" sales@contoso.com ","description":"The sales team"}"#
+            ),
+            Some(DirectoryGroup {
+                id: "G1".into(),
+                name: "Sales".into(),
+                address: "sales@contoso.com".into(),
+                description: Some("The sales team".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn directory_group_from_json_edge_cases() {
+        // No, a null or a blank description is `None`, as is a non-string.
+        for d in [
+            "",
+            r#","description":null"#,
+            r#","description":"  ""#,
+            r#","description":3"#,
+        ] {
+            let raw = format!(r#"{{"id":"G1","mail":"g@contoso.com"{d}}}"#);
+            let g = group(&raw).unwrap();
+            assert_eq!(g.description, None, "{raw}");
+            assert_eq!(g.name, "", "{raw}");
+        }
+        // No address, or no id: skipped.
+        for raw in [
+            r#"{"id":"G1","displayName":"Security"}"#,
+            r#"{"id":"G1","displayName":"Security","mail":null}"#,
+            r#"{"id":"G1","displayName":"Security","mail":" "}"#,
+            r#"{"displayName":"Sales","mail":"sales@contoso.com"}"#,
+            r#"{"id":"","displayName":"Sales","mail":"sales@contoso.com"}"#,
+        ] {
+            assert_eq!(group(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn group_member_from_json_reads_each_kind() {
+        assert_eq!(
+            member(
+                r##"{"@odata.type":"#microsoft.graph.user","id":"U1","displayName":"Jo","mail":"jo@contoso.com","jobTitle":"Engineer","department":"R&D"}"##
+            ),
+            Some(GroupMember {
+                kind: MemberKind::User,
+                id: "U1".into(),
+                name: "Jo".into(),
+                address: "jo@contoso.com".into(),
+                job_title: Some("Engineer".into()),
+                department: Some("R&D".into()),
+            })
+        );
+        let g = member(
+            r##"{"@odata.type":"#microsoft.graph.group","id":"G2","displayName":"Team","mail":"team@contoso.com"}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            (g.kind, g.id.as_str(), g.address.as_str()),
+            (MemberKind::Group, "G2", "team@contoso.com")
+        );
+        let c = member(
+            r##"{"@odata.type":"#microsoft.graph.orgContact","id":"C1","displayName":"Ext","mail":"ext@fabrikam.com"}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            (c.kind, c.address.as_str()),
+            (MemberKind::Contact, "ext@fabrikam.com")
+        );
+    }
+
+    #[test]
+    fn group_member_from_json_user_falls_back_to_an_address_like_upn_others_do_not() {
+        assert_eq!(
+            member(r##"{"@odata.type":"#microsoft.graph.user","id":"U1","userPrincipalName":"jo@contoso.com"}"##)
+                .unwrap()
+                .address,
+            "jo@contoso.com"
+        );
+        for t in ["group", "orgContact"] {
+            let raw = format!(
+                r##"{{"@odata.type":"#microsoft.graph.{t}","id":"X","userPrincipalName":"x@contoso.com"}}"##
+            );
+            assert_eq!(member(&raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn group_member_from_json_skips_other_types_and_address_less_members() {
+        for raw in [
+            r##"{"@odata.type":"#microsoft.graph.device","id":"D1","displayName":"Laptop"}"##,
+            r##"{"@odata.type":"#microsoft.graph.servicePrincipal","id":"S1","mail":"app@contoso.com"}"##,
+            r##"{"@odata.type":"#microsoft.graph.somethingNew","id":"N1","mail":"n@contoso.com"}"##,
+            r#"{"id":"U1","mail":"jo@contoso.com"}"#,
+            // Without an id.
+            r##"{"@odata.type":"#microsoft.graph.user","mail":"jo@contoso.com"}"##,
+            // A member the token may not read: only its type and id.
+            r##"{"@odata.type":"#microsoft.graph.user","id":"x","mail":null}"##,
+            // A guest's UPN without `mail`.
+            r##"{"@odata.type":"#microsoft.graph.user","id":"U2","userPrincipalName":"g_f.com#EXT#@contoso.onmicrosoft.com"}"##,
+            // A nested group without an address, a contact without one.
+            r##"{"@odata.type":"#microsoft.graph.group","id":"G3","displayName":"Security"}"##,
+            r##"{"@odata.type":"#microsoft.graph.orgContact","id":"C2","displayName":"Ext","mail":""}"##,
+        ] {
+            assert_eq!(member(raw), None, "{raw}");
+        }
     }
 
     #[test]

@@ -36,9 +36,10 @@
 //! small batch per step, before any backfill page. A `SyncCommand::FetchBody`
 //! (and a server search or the opening of a hit, `SyncCommand::SearchMessages`
 //! and `SyncCommand::FetchMessage`, #2006, a read of folders' sizes on
-//! the server, `SyncCommand::FetchFolderSizes`, #2123, and a search of the
-//! organisation's directory, `SyncCommand::SearchDirectory`, #1942) never
-//! waits for a whole pass: long
+//! the server, `SyncCommand::FetchFolderSizes`, #2123, a search of the
+//! organisation's directory, `SyncCommand::SearchDirectory`, #1942, and of
+//! its groups and a group's members, `SyncCommand::SearchGroups` and
+//! `SyncCommand::FetchGroupMembers`, #2058) never waits for a whole pass: long
 //! work calls `Engine::checkpoint` between folders, delta pages and body
 //! fetches, which serves it at once and keeps every other command for after
 //! the work, in order.
@@ -55,9 +56,10 @@ use crate::graph::client::{
 };
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
-    AutomaticReplies, ContactPhoto, DeltaItem, DirectoryUser, Event, EventDeltaItem, FolderContact,
-    MailFolder, Me, MeetingMessage, MeetingMessageType, Message, MessageFields, Recipient,
-    ScheduleEntry, SearchHit, parse_folder_size, parse_meeting_message_type,
+    AutomaticReplies, ContactPhoto, DeltaItem, DirectoryGroup, DirectoryUser, Event,
+    EventDeltaItem, FolderContact, GroupMember, MailFolder, Me, MeetingMessage, MeetingMessageType,
+    Message, MessageFields, Recipient, ScheduleEntry, SearchHit, parse_folder_size,
+    parse_meeting_message_type,
 };
 pub use crate::store::ClearOfflineRefusal;
 use crate::store::{
@@ -242,6 +244,30 @@ pub enum SyncCommand {
     /// [`SyncEvent::Error`]. Nothing is stored. Served ahead of a running
     /// pass, as `SearchMessages` is, and tried even during a back-off.
     SearchDirectory { query: String, top: usize },
+    /// Search the organisation's mail-enabled groups (Graph `/groups`,
+    /// #2058, `GraphClient::search_groups`), for an address book: groups
+    /// whose display name or address matches `query` (as the client typed
+    /// it), at most `top` (`1..=DIRECTORY_TOP_MAX`). Answers with
+    /// [`SyncEvent::GroupResults`], or [`SyncEvent::GroupsUnavailable`] (its
+    /// `forbidden` set for a 403: the token or tenant does not allow reading
+    /// groups), never a [`SyncEvent::Error`]. Nothing is stored. Served ahead
+    /// of a running pass, as `SearchDirectory` is, and tried even during a
+    /// back-off.
+    SearchGroups { query: String, top: usize },
+    /// Read a group's direct members (Graph `/groups/{id}/members`, #2058,
+    /// `GraphClient::group_members`): users, nested groups (which a client
+    /// expands with another `FetchGroupMembers`) and org contacts that have
+    /// an address, at most `top` (`1..=GROUP_MEMBERS_MAX`). Answers with
+    /// [`SyncEvent::GroupMembers`], or [`SyncEvent::GroupMembersUnavailable`]
+    /// (its `forbidden` set for a 403: no `GroupMember.Read*` for this token
+    /// or tenant), never a [`SyncEvent::Error`]. Members' names and
+    /// addresses also need read access to their types (`User.ReadBasic.All`
+    /// for users, `OrgContact.Read.All` for org contacts, or
+    /// `Directory.Read.All`): without it they come back unreadable and are
+    /// counted in `skipped`, not kept. Nothing is stored. Served
+    /// ahead of a running pass, as `SearchDirectory` is, and tried even
+    /// during a back-off.
+    FetchGroupMembers { group_id: String, top: usize },
     /// Fetch attachment metadata (`GraphClient::list_attachments`) for a
     /// message and store it, then emit [`SyncEvent::AttachmentsUpdated`].
     /// `Store::put_attachments` is otherwise never populated in production
@@ -1163,6 +1189,45 @@ pub enum SyncEvent {
         forbidden: bool,
         reason: String,
     },
+    /// The directory's answer to [`SyncCommand::SearchGroups`] (#2058), with
+    /// the query it was asked, so a client can drop a stale answer. No
+    /// matches is an empty `groups`.
+    GroupResults {
+        query: String,
+        groups: Vec<DirectoryGroup>,
+    },
+    /// [`SyncCommand::SearchGroups`] could not search the groups (#2058):
+    /// `forbidden` for a 403 (asking again will not help), otherwise signed
+    /// out, a blank query, offline, throttled, a 401 a refresh did not cure,
+    /// or another 4xx or 5xx. Not a sync error. `reason` is one line.
+    GroupsUnavailable {
+        query: String,
+        forbidden: bool,
+        reason: String,
+    },
+    /// A group's members, the answer to [`SyncCommand::FetchGroupMembers`]
+    /// (#2058), with the group id it was asked. No members is an empty
+    /// `members`; `truncated` says members were left unread (past `top`, or
+    /// at the page cap); `skipped` counts the members read but not kept
+    /// (another type, or no address: an unreadable member is one), so an
+    /// empty `members` with a non-zero `skipped` is not an empty group
+    /// (`GroupMemberList::skipped`).
+    GroupMembers {
+        group_id: String,
+        members: Vec<GroupMember>,
+        truncated: bool,
+        skipped: usize,
+    },
+    /// [`SyncCommand::FetchGroupMembers`] could not read the members
+    /// (#2058): `forbidden` for a 403 (asking again will not help),
+    /// otherwise signed out, a blank group id, a group that is gone (404),
+    /// offline, throttled, a 401 a refresh did not cure, or another 4xx or
+    /// 5xx. Not a sync error. `reason` is one line.
+    GroupMembersUnavailable {
+        group_id: String,
+        forbidden: bool,
+        reason: String,
+    },
     /// An inline image's bytes were fetched (from
     /// [`SyncCommand::FetchInlineImage`]); the UI caches them by `content_id`.
     InlineImageReady {
@@ -1897,6 +1962,8 @@ fn served_at_checkpoint(cmd: &SyncCommand) -> bool {
             | SyncCommand::FetchMessage { .. }
             | SyncCommand::FetchFolderSizes { .. }
             | SyncCommand::SearchDirectory { .. }
+            | SyncCommand::SearchGroups { .. }
+            | SyncCommand::FetchGroupMembers { .. }
     )
 }
 
@@ -1973,6 +2040,8 @@ fn persists_at_shutdown(cmd: &SyncCommand) -> bool {
         | SyncCommand::FetchMessage { .. }
         | SyncCommand::FetchFolderSizes { .. }
         | SyncCommand::SearchDirectory { .. }
+        | SyncCommand::SearchGroups { .. }
+        | SyncCommand::FetchGroupMembers { .. }
         | SyncCommand::FetchAttachments { .. }
         | SyncCommand::FetchMeetingMessage { .. }
         | SyncCommand::FetchAutomaticReplies
@@ -2847,8 +2916,9 @@ impl Engine {
     /// Takes every command waiting on the channel (`take_waiting`), then
     /// serves the kept ones of a served kind (`served_at_checkpoint`), between
     /// two requests of long work (#1978): a `FetchBody`, a `SearchMessages`
-    /// or a `FetchMessage` (#2006), a `FetchFolderSizes` (#2123) or a
-    /// `SearchDirectory` (#1942) is served at once, so a click costs its own round trips plus the request
+    /// or a `FetchMessage` (#2006), a `FetchFolderSizes` (#2123), a
+    /// `SearchDirectory` (#1942), a `SearchGroups` or a `FetchGroupMembers`
+    /// (#2058) is served at once, so a click costs its own round trips plus the request
     /// in flight, not a whole pass; every other command is kept (`deferred`)
     /// for the main loop, in order. A `Shutdown` or a dropped handle sets
     /// `shutting_down`, and as the channel is read up to it before anything
@@ -2879,6 +2949,10 @@ impl Engine {
                 }
                 Some(SyncCommand::SearchDirectory { query, top }) => {
                     self.search_directory(query, top)
+                }
+                Some(SyncCommand::SearchGroups { query, top }) => self.search_groups(query, top),
+                Some(SyncCommand::FetchGroupMembers { group_id, top }) => {
+                    self.fetch_group_members(group_id, top)
                 }
                 _ => false,
             };
@@ -3246,6 +3320,12 @@ impl Engine {
             }
             SyncCommand::SearchDirectory { query, top } => {
                 self.search_directory(query, top);
+            }
+            SyncCommand::SearchGroups { query, top } => {
+                self.search_groups(query, top);
+            }
+            SyncCommand::FetchGroupMembers { group_id, top } => {
+                self.fetch_group_members(group_id, top);
             }
             SyncCommand::FetchAttachments { message_id } => self.fetch_attachments(&message_id),
             SyncCommand::SaveAttachment {
@@ -7829,6 +7909,88 @@ impl Engine {
                 let forbidden = matches!(e, GraphError::Http { status: 403, .. });
                 self.emit(SyncEvent::DirectoryUnavailable {
                     query,
+                    forbidden,
+                    reason: e.to_string(),
+                });
+                self.react_quietly(e)
+            }
+        }
+    }
+
+    // --- Directory groups and members (#2058) ------------------------------
+
+    /// Serves [`SyncCommand::SearchGroups`] as `search_directory` serves
+    /// users: `GroupResults`, or `GroupsUnavailable` (`forbidden` for a
+    /// 403), never a `SyncEvent::Error`; signed out or with a blank query no
+    /// request. Returns `react_quietly`'s answer, for `checkpoint`.
+    fn search_groups(&mut self, query: String, top: usize) -> bool {
+        let refused = if self.token.is_none() {
+            Some("not signed in")
+        } else if query.trim().is_empty() {
+            Some("empty query")
+        } else {
+            None
+        };
+        if let Some(reason) = refused {
+            self.emit(SyncEvent::GroupsUnavailable {
+                query,
+                forbidden: false,
+                reason: reason.to_string(),
+            });
+            return false;
+        }
+        match self.with_auth(|c| c.search_groups(&query, top)) {
+            Ok(groups) => {
+                self.emit(SyncEvent::GroupResults { query, groups });
+                false
+            }
+            Err(e) => {
+                let forbidden = matches!(e, GraphError::Http { status: 403, .. });
+                self.emit(SyncEvent::GroupsUnavailable {
+                    query,
+                    forbidden,
+                    reason: e.to_string(),
+                });
+                self.react_quietly(e)
+            }
+        }
+    }
+
+    /// Serves [`SyncCommand::FetchGroupMembers`]: `GroupMembers`, or
+    /// `GroupMembersUnavailable` (`forbidden` for a 403; a 404, the group
+    /// gone, is not), never a `SyncEvent::Error`; signed out or with a blank
+    /// group id no request. The id goes to Graph as asked. Returns
+    /// `react_quietly`'s answer, for `checkpoint`.
+    fn fetch_group_members(&mut self, group_id: String, top: usize) -> bool {
+        let refused = if self.token.is_none() {
+            Some("not signed in")
+        } else if group_id.trim().is_empty() {
+            Some("empty group id")
+        } else {
+            None
+        };
+        if let Some(reason) = refused {
+            self.emit(SyncEvent::GroupMembersUnavailable {
+                group_id,
+                forbidden: false,
+                reason: reason.to_string(),
+            });
+            return false;
+        }
+        match self.with_auth(|c| c.group_members(&group_id, top)) {
+            Ok(list) => {
+                self.emit(SyncEvent::GroupMembers {
+                    group_id,
+                    members: list.members,
+                    truncated: list.truncated,
+                    skipped: list.skipped,
+                });
+                false
+            }
+            Err(e) => {
+                let forbidden = matches!(e, GraphError::Http { status: 403, .. });
+                self.emit(SyncEvent::GroupMembersUnavailable {
+                    group_id,
                     forbidden,
                     reason: e.to_string(),
                 });
@@ -35253,6 +35415,474 @@ mod tests {
                         );
                         stop(handle);
                         let _ = std::fs::remove_dir_all(&dir);
+                    }
+                }
+
+                // --- Directory groups and members (#2058) ---------------
+
+                mod groups {
+                    use super::*;
+                    use crate::graph::model::MemberKind;
+
+                    const GROUPS: &str = r#"{"value":[
+                        {"id":"G1","displayName":"Sales","mail":"sales@contoso.com","description":"The sales team"},
+                        {"id":"G9","displayName":"No mail","mail":null}
+                    ]}"#;
+
+                    const MEMBERS: &str = r##"{"value":[
+                        {"@odata.type":"#microsoft.graph.user","id":"U1","displayName":"Jo","mail":"jo@contoso.com"},
+                        {"@odata.type":"#microsoft.graph.group","id":"G2","displayName":"Team","mail":"team@contoso.com"},
+                        {"@odata.type":"#microsoft.graph.device","id":"D1","displayName":"Laptop"}
+                    ]}"##;
+
+                    const DENIED: &str = r#"{"error":{"code":"Authorization_RequestDenied","message":"Insufficient privileges"}}"#;
+
+                    fn groups_route(status: u16, body: &str) -> (Route, Option<usize>) {
+                        search_route("/groups?$search", status, body)
+                    }
+
+                    fn members_route(status: u16, body: &str) -> (Route, Option<usize>) {
+                        search_route("/groups/G1/members?", status, body)
+                    }
+
+                    fn search_groups(handle: &SyncHandle, query: &str) {
+                        handle
+                            .cmd_tx
+                            .send(SyncCommand::SearchGroups {
+                                query: query.into(),
+                                top: 10,
+                            })
+                            .unwrap();
+                    }
+
+                    fn fetch_members(handle: &SyncHandle, group_id: &str) {
+                        handle
+                            .cmd_tx
+                            .send(SyncCommand::FetchGroupMembers {
+                                group_id: group_id.into(),
+                                top: 100,
+                            })
+                            .unwrap();
+                    }
+
+                    fn is_groups_answer(e: &SyncEvent) -> bool {
+                        matches!(
+                            e,
+                            SyncEvent::GroupResults { .. } | SyncEvent::GroupsUnavailable { .. }
+                        )
+                    }
+
+                    fn is_members_answer(e: &SyncEvent) -> bool {
+                        matches!(
+                            e,
+                            SyncEvent::GroupMembers { .. }
+                                | SyncEvent::GroupMembersUnavailable { .. }
+                        )
+                    }
+
+                    /// Events until the group search's answer, which must be
+                    /// `GroupsUnavailable`: its query, `forbidden`, reason,
+                    /// and every event seen.
+                    fn groups_unavailable(
+                        handle: &SyncHandle,
+                    ) -> (String, bool, String, Vec<SyncEvent>) {
+                        let events = wait_for(&handle.evt_rx, is_groups_answer);
+                        match events.last() {
+                            Some(SyncEvent::GroupsUnavailable {
+                                query,
+                                forbidden,
+                                reason,
+                            }) => (query.clone(), *forbidden, reason.clone(), events),
+                            other => panic!("expected GroupsUnavailable, got {other:?}"),
+                        }
+                    }
+
+                    /// As `groups_unavailable`, for `GroupMembersUnavailable`.
+                    fn members_unavailable(
+                        handle: &SyncHandle,
+                    ) -> (String, bool, String, Vec<SyncEvent>) {
+                        let events = wait_for(&handle.evt_rx, is_members_answer);
+                        match events.last() {
+                            Some(SyncEvent::GroupMembersUnavailable {
+                                group_id,
+                                forbidden,
+                                reason,
+                            }) => (group_id.clone(), *forbidden, reason.clone(), events),
+                            other => panic!("expected GroupMembersUnavailable, got {other:?}"),
+                        }
+                    }
+
+                    fn group_requests(srv: &FakeServer) -> usize {
+                        srv.requests()
+                            .iter()
+                            .filter(|r| r.path.starts_with("/groups"))
+                            .count()
+                    }
+
+                    #[test]
+                    fn search_groups_answers_with_its_query() {
+                        let srv = two_folders(vec![], vec![groups_route(200, GROUPS)]);
+                        let (handle, dir) = started(&srv, "groups-answers");
+                        search_groups(&handle, "sa");
+                        let events = wait_for(&handle.evt_rx, is_groups_answer);
+                        no_error(&events);
+                        assert_eq!(
+                            events.last().unwrap(),
+                            &SyncEvent::GroupResults {
+                                query: "sa".into(),
+                                groups: vec![DirectoryGroup {
+                                    id: "G1".into(),
+                                    name: "Sales".into(),
+                                    address: "sales@contoso.com".into(),
+                                    description: Some("The sales team".into()),
+                                }],
+                            }
+                        );
+                        let reqs: Vec<_> = srv
+                            .requests()
+                            .into_iter()
+                            .filter(|r| r.path.starts_with("/groups?"))
+                            .collect();
+                        assert_eq!(reqs.len(), 1);
+                        assert!(
+                            reqs[0].path.contains("&$filter=mailEnabled%20eq%20true&"),
+                            "{}",
+                            reqs[0].path
+                        );
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn search_groups_with_no_matches_answers_empty_groups() {
+                        let srv = two_folders(vec![], vec![groups_route(200, r#"{"value":[]}"#)]);
+                        let (handle, dir) = started(&srv, "groups-empty");
+                        search_groups(&handle, "zz");
+                        let events = wait_for(&handle.evt_rx, is_groups_answer);
+                        no_error(&events);
+                        assert_eq!(
+                            events.last().unwrap(),
+                            &SyncEvent::GroupResults {
+                                query: "zz".into(),
+                                groups: vec![],
+                            }
+                        );
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn fetch_group_members_answers_with_its_group_id() {
+                        let srv = two_folders(vec![], vec![members_route(200, MEMBERS)]);
+                        let (handle, dir) = started(&srv, "members-answers");
+                        fetch_members(&handle, "G1");
+                        let events = wait_for(&handle.evt_rx, is_members_answer);
+                        no_error(&events);
+                        assert_eq!(
+                            events.last().unwrap(),
+                            &SyncEvent::GroupMembers {
+                                group_id: "G1".into(),
+                                members: vec![
+                                    GroupMember {
+                                        kind: MemberKind::User,
+                                        id: "U1".into(),
+                                        name: "Jo".into(),
+                                        address: "jo@contoso.com".into(),
+                                        job_title: None,
+                                        department: None,
+                                    },
+                                    GroupMember {
+                                        kind: MemberKind::Group,
+                                        id: "G2".into(),
+                                        name: "Team".into(),
+                                        address: "team@contoso.com".into(),
+                                        job_title: None,
+                                        department: None,
+                                    },
+                                ],
+                                truncated: false,
+                                // The device.
+                                skipped: 1,
+                            }
+                        );
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn fetch_group_members_with_none_answers_empty_members() {
+                        let srv = two_folders(vec![], vec![members_route(200, r#"{"value":[]}"#)]);
+                        let (handle, dir) = started(&srv, "members-empty");
+                        fetch_members(&handle, "G1");
+                        let events = wait_for(&handle.evt_rx, is_members_answer);
+                        no_error(&events);
+                        assert_eq!(
+                            events.last().unwrap(),
+                            &SyncEvent::GroupMembers {
+                                group_id: "G1".into(),
+                                members: vec![],
+                                truncated: false,
+                                skipped: 0,
+                            }
+                        );
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    /// A group search answered `status`: its `forbidden`.
+                    fn groups_failing_with(status: u16, tag: &str) -> bool {
+                        let srv = two_folders(vec![], vec![groups_route(status, DENIED)]);
+                        let (handle, dir) = started(&srv, tag);
+                        search_groups(&handle, "sa");
+                        let (query, forbidden, reason, events) = groups_unavailable(&handle);
+                        assert_eq!(query, "sa");
+                        assert!(reason.contains(&status.to_string()), "{reason}");
+                        assert!(!reason.contains('\n'), "one line: {reason:?}");
+                        // The engine carries on: the next command is answered.
+                        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+                        let more = wait_for(&handle.evt_rx, is_idle);
+                        no_error(&events);
+                        no_error(&more);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                        forbidden
+                    }
+
+                    /// A members read answered `status`: its `forbidden` and
+                    /// reason.
+                    fn members_failing_with(status: u16, tag: &str) -> (bool, String) {
+                        let srv = two_folders(vec![], vec![members_route(status, DENIED)]);
+                        let (handle, dir) = started(&srv, tag);
+                        fetch_members(&handle, "G1");
+                        let (group_id, forbidden, reason, events) = members_unavailable(&handle);
+                        assert_eq!(group_id, "G1");
+                        assert!(!reason.contains('\n'), "one line: {reason:?}");
+                        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+                        let more = wait_for(&handle.evt_rx, is_idle);
+                        no_error(&events);
+                        no_error(&more);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                        (forbidden, reason)
+                    }
+
+                    #[test]
+                    fn search_groups_403_is_forbidden_not_error() {
+                        assert!(groups_failing_with(403, "groups-403"));
+                    }
+
+                    #[test]
+                    fn search_groups_500_is_unavailable_not_error() {
+                        assert!(!groups_failing_with(500, "groups-500"));
+                    }
+
+                    #[test]
+                    fn fetch_group_members_403_is_forbidden_not_error() {
+                        let (forbidden, reason) = members_failing_with(403, "members-403");
+                        assert!(forbidden);
+                        assert!(reason.contains("403"), "{reason}");
+                    }
+
+                    #[test]
+                    fn fetch_group_members_500_is_unavailable_not_error() {
+                        let (forbidden, reason) = members_failing_with(500, "members-500");
+                        assert!(!forbidden);
+                        assert!(reason.contains("500"), "{reason}");
+                    }
+
+                    #[test]
+                    fn fetch_group_members_404_is_unavailable_not_forbidden() {
+                        let (forbidden, reason) = members_failing_with(404, "members-404");
+                        assert!(!forbidden);
+                        assert_eq!(reason, GraphError::NotFound.to_string());
+                    }
+
+                    #[test]
+                    fn search_groups_transport_failure_is_unavailable_not_error() {
+                        let srv = two_folders(vec![], vec![]);
+                        let (handle, dir) = started(&srv, "groups-transport");
+                        drop(srv);
+                        search_groups(&handle, "sa");
+                        let (query, forbidden, _reason, events) = groups_unavailable(&handle);
+                        assert_eq!((query.as_str(), forbidden), ("sa", false));
+                        no_error(&events);
+                        let more = wait_for(&handle.evt_rx, |e| {
+                            matches!(e, SyncEvent::State(SyncState::Offline))
+                        });
+                        no_error(&more);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn fetch_group_members_transport_failure_is_unavailable_not_error() {
+                        let srv = two_folders(vec![], vec![]);
+                        let (handle, dir) = started(&srv, "members-transport");
+                        drop(srv);
+                        fetch_members(&handle, "G1");
+                        let (group_id, forbidden, _reason, events) = members_unavailable(&handle);
+                        assert_eq!((group_id.as_str(), forbidden), ("G1", false));
+                        no_error(&events);
+                        let more = wait_for(&handle.evt_rx, |e| {
+                            matches!(e, SyncEvent::State(SyncState::Offline))
+                        });
+                        no_error(&more);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn groups_and_members_signed_out_send_no_request() {
+                        let srv = two_folders(
+                            vec![],
+                            vec![groups_route(200, GROUPS), members_route(200, MEMBERS)],
+                        );
+                        let dir = unique_dir("groups-signed-out");
+                        let handle = spawn_with(&srv, &dir, EngineOptions::without_prefetch());
+                        wait_for(&handle.evt_rx, |e| {
+                            matches!(e, SyncEvent::SignInRequired { .. })
+                        });
+                        search_groups(&handle, "sa");
+                        let (query, forbidden, reason, events) = groups_unavailable(&handle);
+                        assert_eq!(
+                            (query.as_str(), forbidden, reason.as_str()),
+                            ("sa", false, "not signed in")
+                        );
+                        no_error(&events);
+                        fetch_members(&handle, "G1");
+                        let (group_id, forbidden, reason, events) = members_unavailable(&handle);
+                        assert_eq!(
+                            (group_id.as_str(), forbidden, reason.as_str()),
+                            ("G1", false, "not signed in")
+                        );
+                        no_error(&events);
+                        assert_eq!(group_requests(&srv), 0);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn blank_query_or_group_id_sends_no_request() {
+                        let srv = two_folders(
+                            vec![],
+                            vec![groups_route(200, GROUPS), members_route(200, MEMBERS)],
+                        );
+                        let (handle, dir) = started(&srv, "groups-blank");
+                        search_groups(&handle, " \t ");
+                        let (query, forbidden, reason, events) = groups_unavailable(&handle);
+                        assert_eq!(
+                            (query.as_str(), forbidden, reason.as_str()),
+                            (" \t ", false, "empty query")
+                        );
+                        no_error(&events);
+                        fetch_members(&handle, "  ");
+                        let (group_id, forbidden, reason, events) = members_unavailable(&handle);
+                        assert_eq!(
+                            (group_id.as_str(), forbidden, reason.as_str()),
+                            ("  ", false, "empty group id")
+                        );
+                        no_error(&events);
+                        assert_eq!(group_requests(&srv), 0);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    /// Sends `ask` while a slow startup pass is under way and
+                    /// checks that its request (at `prefix`) came before the
+                    /// pass's last delta, and that `answered` saw its answer
+                    /// before the pass went idle.
+                    fn served_during_a_slow_pass(
+                        tag: &str,
+                        extra: Vec<(Route, Option<usize>)>,
+                        ask: impl FnOnce(&SyncHandle),
+                        prefix: &str,
+                        answered: impl Fn(&SyncEvent) -> bool,
+                    ) {
+                        let folders: Vec<Fold> =
+                            [("F1", "Inbox"), ("F2", "B"), ("F3", "C"), ("F4", "D")]
+                                .into_iter()
+                                .map(|(id, name)| {
+                                    small(Fold {
+                                        pages: vec![vec![msg(
+                                            &format!("M-{id}"),
+                                            "2020-01-01T00:00:00Z",
+                                        )]],
+                                        ..fold(
+                                            id,
+                                            name,
+                                            if id == "F1" { Some("inbox") } else { None },
+                                        )
+                                    })
+                                })
+                                .collect();
+                        let srv = FakeServer::start_paced(mailbox(
+                            &folders,
+                            extra,
+                            Duration::from_millis(300),
+                        ));
+                        let dir = new_dir(tag);
+                        let handle = spawn_with(&srv, &dir, EngineOptions::without_prefetch());
+                        assert!(wait_until(ENGINE_WAIT, || {
+                            paths_from(&srv, 0)
+                                .iter()
+                                .any(|p| p.contains("/messages/delta?$orderby"))
+                        }));
+                        ask(&handle);
+                        let events = wait_for(&handle.evt_rx, is_idle);
+                        assert!(
+                            events.iter().any(&answered),
+                            "answered before the pass ended: {events:?}"
+                        );
+                        let reqs = srv.requests();
+                        let last_delta = reqs
+                            .iter()
+                            .filter(|r| r.path.contains("/messages/delta?$orderby"))
+                            .map(|r| r.at)
+                            .max()
+                            .unwrap();
+                        let asked_at: Vec<_> = reqs
+                            .iter()
+                            .filter(|r| r.path.starts_with(prefix))
+                            .map(|r| r.at)
+                            .collect();
+                        assert_eq!(asked_at.len(), 1);
+                        assert!(asked_at[0] < last_delta, "asked before the last delta");
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn search_groups_is_served_during_a_slow_pass() {
+                        served_during_a_slow_pass(
+                            "groups-in-pass",
+                            vec![groups_route(200, GROUPS)],
+                            |h| search_groups(h, "sa"),
+                            "/groups?",
+                            |e| {
+                                matches!(
+                                    e,
+                                    SyncEvent::GroupResults { query, groups }
+                                        if query == "sa" && groups.len() == 1
+                                )
+                            },
+                        );
+                    }
+
+                    #[test]
+                    fn fetch_group_members_is_served_during_a_slow_pass() {
+                        served_during_a_slow_pass(
+                            "members-in-pass",
+                            vec![members_route(200, MEMBERS)],
+                            |h| fetch_members(h, "G1"),
+                            "/groups/G1/members?",
+                            |e| {
+                                matches!(
+                                    e,
+                                    SyncEvent::GroupMembers { group_id, members, .. }
+                                        if group_id == "G1" && members.len() == 2
+                                )
+                            },
+                        );
                     }
                 }
             }

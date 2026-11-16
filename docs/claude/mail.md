@@ -2437,6 +2437,57 @@ so the user's other devices follow.
   list.
 - lookxy never sends `SearchDirectory`; its `on_sync_event` ignores the two events.
 
+## Directory groups and members (#2058)
+
+- `GraphClient::search_groups(query, top)`: `GET /groups?$search="displayName:<q>" OR
+  "mail:<q>"&$filter=mailEnabled%20eq%20true&$count=true&$select=id,displayName,mail,description
+  &$top=…` with `ConsistencyLevel: eventual`: distribution lists, mail-enabled security groups and
+  Microsoft 365 groups. On `/groups` `$search` tokenises `displayName` and `description`; any other
+  property, `mail` here, is a prefix match. `$search` with `$filter` is an advanced query, hence
+  `$count=true`. The query is escaped as #1942's (`directory_search_value`); `top` is clamped to
+  `1..=DIRECTORY_TOP_MAX`, one page, no `nextLink` followed.
+- `DirectoryGroup { id, name, address, description }`: `address` is the trimmed `mail`; a group
+  without `id` or `mail` is skipped (`mailEnabled` should exclude the second; the check stays).
+- `GraphClient::group_members(group_id, top)`: `GET /groups/{id}/members?$count=true&$select=id,
+  displayName,mail,userPrincipalName,jobTitle,department&$top=min(top,999)`, the id through
+  `encode_path_segment`. Every query parameter on `/members` but `$expand` is an advanced query,
+  so **every page**, each `@odata.nextLink` (relative or full URL) too, sends `ConsistencyLevel:
+  eventual` (`group_members_follows_next_link` checks page 2 and 3). Direct members only: a client
+  expands a nested group with another call (no `/transitiveMembers`).
+- `top` is the most members returned, `1..=GROUP_MEMBERS_MAX` (9,990: `GROUP_MEMBER_PAGES_MAX` (10)
+  pages of 999). Pages are read until none is left, `top` are kept, or the page cap (which also
+  stops a link that loops). `GroupMemberList::truncated` is true when members were left unread:
+  a page's kept members ran past `top` (cut to `top`), or a `nextLink` was left (at `top` or the
+  cap). Exactly `top` on a last page without a `nextLink` is not truncated. Any page's failure is
+  an `Err`, never a partial list; a 404 (the group gone) is `NotFound`.
+- `GroupMemberList::skipped` (and `SyncEvent::GroupMembers`'s) counts the members Graph returned on
+  the pages read that were not kept, for any reason; the member that ran past `top` and the rest
+  of its page are `truncated`, not skipped. It tells a client "N members it could not read" from
+  an empty group (r1-m1).
+- `GroupMember { kind, id, name, address, job_title, department }`, `MemberKind` from
+  `@odata.type`: `#microsoft.graph.user` → `User`, its address `DirectoryUser`'s rule (`mail`, else
+  an address-like UPN; one helper, `user_address`); `#microsoft.graph.group` → `Group` and
+  `#microsoft.graph.orgContact` → `Contact`, `mail` only. Skipped: any other type (device, service
+  principal, unknown, none), no `id`, no address. A member the token may not read comes back with
+  its type and `id` only, so it is skipped as address-less. A nested group without `mail` is
+  skipped on purpose: mail to the list never reaches it, so there is nothing to expand for a
+  recipient. An org contact is a kind of its own: an external address is a common list member.
+- `SyncCommand::SearchGroups { query, top }` answers `SyncEvent::GroupResults { query, groups }` or
+  `GroupsUnavailable { query, forbidden, reason }`; `SyncCommand::FetchGroupMembers { group_id,
+  top }` answers `GroupMembers { group_id, members, truncated, skipped }` or `GroupMembersUnavailable {
+  group_id, forbidden, reason }`. Each echoes what was asked; no match is an empty list; never
+  `SyncEvent::Error`. `forbidden` is a 403 only. Signed out ("not signed in"), a blank query
+  ("empty query") or group id ("empty group id") sends no request. Otherwise as #1942: auth,
+  throttle and transport through `react_quietly`, served at `Engine::checkpoint`, tried during a
+  back-off, not kept at a shutdown. Nothing is stored.
+- Scopes are the client's: `GroupMember.Read.All` (or `GroupMember.ReadBasic.All` for members,
+  or `Group.Read.All`, `Directory.Read.All`); `AuthConfig::default()` asks for none of them.
+  A group scope lists the members, but their names and addresses need read access to each
+  member's type too: `User.ReadBasic.All` for users, `OrgContact.Read.All` for org contacts, or
+  `Directory.Read.All` for all. Without it Graph still answers 200, each such member with only its
+  `@odata.type` and `id`: every one is skipped and counted in `skipped`.
+- lookxy never sends either command; its `on_sync_event` ignores the four events.
+
 ## Message rows by id (#2053)
 
 - `Store::message_row(id)` is a stored message's `MessageRow`, the row
