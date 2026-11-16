@@ -670,6 +670,11 @@ pub(crate) fn timeline_el(
             probes,
             harness::region_name(harness::Region::ProjectTimeline),
         ))
+        // F1's pane (#2077), over the same area.
+        .child(probe(
+            probes,
+            crate::help_tab::pane_probe(crate::help_tab::Pane::Timeline),
+        ))
         // GPUI draws no rotated text; stacked letters read down the edge instead.
         .child(
             v_flex()

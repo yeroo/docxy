@@ -480,3 +480,177 @@ fn a_help_tab_keeps_the_ribbon_tab_shown_behind_it() {
             == RibbonTab::Home
     );
 }
+
+// ---- F1 on a focused pane (#2077) -------------------------------------------
+
+#[test]
+fn pane_ids_are_unique_and_manual_keys() {
+    let ids: Vec<&str> = Pane::ALL.iter().map(|p| p.id()).collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), ids.len(), "{ids:?}");
+    for p in Pane::ALL {
+        let id = p.id();
+        assert!(
+            !id.is_empty()
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "{id}"
+        );
+        assert_eq!(Pane::from_id(id), Some(p));
+        assert_eq!(p.key(), format!("pane:{id}"));
+        assert_eq!(pane_probe(p), p.key());
+    }
+    assert_eq!(Pane::from_id("outline"), None);
+}
+
+#[test]
+fn pane_at_finds_the_pane_under_a_press() {
+    let frame = vec![
+        ("ribbon".to_string(), rect(0., 0., 1000., 120.)),
+        (ribbon_cmd_probe("b"), rect(10., 10., 22., 22.)),
+        (pane_probe(Pane::Navigation), rect(0., 120., 240., 600.)),
+        (pane_probe(Pane::Comments), rect(720., 120., 280., 600.)),
+        ("pane:outline".to_string(), rect(300., 120., 50., 50.)),
+    ];
+    let at = |x: f32, y: f32| point(px(x), px(y));
+    assert_eq!(pane_at(&frame, at(100., 300.)), Some(Pane::Navigation));
+    assert_eq!(pane_at(&frame, at(800., 300.)), Some(Pane::Comments));
+    // The document between them, a ribbon command, outside everything.
+    assert_eq!(pane_at(&frame, at(500., 300.)), None);
+    assert_eq!(pane_at(&frame, at(20., 20.)), None);
+    assert_eq!(pane_at(&frame, at(5000., 5000.)), None);
+    // A `pane:` probe naming no pane is none.
+    assert_eq!(pane_at(&frame, at(310., 130.)), None);
+    // Two under the press: the last drawn, on top.
+    let mut over = frame.clone();
+    over.push((pane_probe(Pane::Notes), rect(0., 120., 100., 100.)));
+    assert_eq!(pane_at(&over, at(50., 150.)), Some(Pane::Notes));
+}
+
+#[test]
+fn a_focused_pane_counts_only_while_drawn() {
+    let frame = vec![(pane_probe(Pane::Navigation), rect(0., 0., 240., 600.))];
+    assert_eq!(
+        pane_on_screen(&frame, Some(Pane::Navigation)),
+        Some(Pane::Navigation)
+    );
+    // Closed since the press, or not shown by the active tab.
+    assert_eq!(pane_on_screen(&frame, Some(Pane::Comments)), None);
+    assert_eq!(pane_on_screen(&[], Some(Pane::Navigation)), None);
+    assert_eq!(pane_on_screen(&frame, None), None);
+}
+
+#[test]
+fn only_a_bare_modifier_keeps_pane_focus() {
+    for key in ["shift", "control", "alt", "platform", "function", "f1"] {
+        assert!(keeps_pane_focus(key), "{key}");
+    }
+    for key in ["a", "right", "escape", "enter", "tab", "f10", "space", "f2"] {
+        assert!(!keeps_pane_focus(key), "{key}");
+    }
+}
+
+#[test]
+fn an_overlay_keeps_pane_focus_from_a_press() {
+    assert!(press_sets_pane_focus(PressOver::default()));
+    let each: [fn(&mut PressOver); 6] = [
+        |o| o.menu = true,
+        |o| o.ribbon_flyout = true,
+        |o| o.backstage = true,
+        |o| o.tab_more = true,
+        |o| o.tab_dialog = true,
+        |o| o.app_dialog = true,
+    ];
+    for (i, set) in each.into_iter().enumerate() {
+        let mut over = PressOver::default();
+        set(&mut over);
+        assert!(!press_sets_pane_focus(over), "flag {i}: {over:?}");
+    }
+}
+
+#[test]
+fn f1_in_a_chart_field_opens_the_chart_pane_only() {
+    assert_eq!(entry_pane_help(true, false, true), Some(Pane::Chart));
+    // Another entry owns the keys too (a Name Box, a cell editor).
+    assert_eq!(entry_pane_help(true, true, true), None);
+    // The panel is not drawn, or no Chart field is being typed into.
+    assert_eq!(entry_pane_help(true, false, false), None);
+    assert_eq!(entry_pane_help(false, false, true), None);
+    assert_eq!(entry_pane_help(false, true, true), None);
+}
+
+#[test]
+fn f1_pane_ask_falls_back_to_the_area_then_the_root() {
+    use helpdocs::Via;
+    let m = word();
+    let ask = f1_pane_ask(Some(Kind::Docx), Pane::Navigation, "Home");
+    assert_eq!(ask.editor, HelpEditor::Word);
+    assert_eq!(ask.id.as_deref(), Some("pane:navigation"));
+    assert_eq!(page_of(&ask, &m), ("navigation".into(), Via::Exact));
+    // A pane no page keys: the area page of the ribbon tab shown, else the root.
+    let ask = f1_pane_ask(Some(Kind::Docx), Pane::Comments, "Home");
+    assert_eq!(page_of(&ask, &m), ("home".into(), Via::Area));
+    let ask = f1_pane_ask(Some(Kind::Docx), Pane::Comments, "View");
+    assert_eq!(page_of(&ask, &m), ("welcome".into(), Via::Root));
+    assert_eq!(
+        f1_pane_ask(Some(Kind::Xlsx), Pane::Chart, "Home").editor,
+        HelpEditor::Excel
+    );
+    assert_eq!(
+        f1_pane_ask(Some(Kind::Project), Pane::Timeline, "View").editor,
+        HelpEditor::Project
+    );
+}
+
+/// Every pane resolves to a page in its editor's manual (#2077). A report,
+/// like the commands' and the dialogs', with two checks that bite: every
+/// `pane:` key a fixture page lists names a pane, and the panes the fixtures
+/// key resolve to their own page.
+#[test]
+fn every_pane_has_a_help_target() {
+    use helpdocs::Via;
+    let kind_of = |e: HelpEditor| match e {
+        HelpEditor::Word => Kind::Docx,
+        HelpEditor::Excel => Kind::Xlsx,
+        HelpEditor::Project => Kind::Project,
+    };
+    for p in Pane::ALL {
+        let kind = kind_of(p.editor());
+        let manual = fixture_manual(kind);
+        let ask = f1_pane_ask(Some(kind), p, "Home");
+        assert_eq!(ask.editor, p.editor(), "{p:?}");
+        let (page, via) = page_of(&ask, &manual);
+        println!("{}: {page} ({via:?})", p.key());
+    }
+    let mut keyed = Vec::new();
+    for (kind, name) in KINDS {
+        for page in &fixture_manual(kind).pages {
+            for key in page.keys.iter().filter_map(|k| k.strip_prefix(PANE_PROBE)) {
+                let pane = Pane::from_id(key)
+                    .unwrap_or_else(|| panic!("{name}: page {} keys pane:{key}, no pane", page.id));
+                assert!(kind_of(pane.editor()) == kind, "{name}: pane:{key}");
+                keyed.push((pane, page.id.clone()));
+            }
+        }
+    }
+    let want = [
+        (Pane::Navigation, "navigation"),
+        (Pane::OfficeClipboard, "clipboard"),
+        (Pane::Chart, "chart-pane"),
+        (Pane::Timeline, "timeline"),
+    ];
+    let got: Vec<(Pane, &str)> = keyed.iter().map(|(p, id)| (*p, id.as_str())).collect();
+    assert_eq!(got, want);
+    for (p, page) in want {
+        let kind = kind_of(p.editor());
+        let ask = f1_pane_ask(Some(kind), p, "Home");
+        assert_eq!(
+            page_of(&ask, &fixture_manual(kind)),
+            (page.to_string(), Via::Exact),
+            "{p:?}"
+        );
+    }
+}

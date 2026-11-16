@@ -5955,6 +5955,14 @@ struct Docxy {
     // listeners in `render`). F1 asks for the ribbon command under the
     // pointer only while it is set (`help_tab::help_pointer`).
     pointer_in_window: bool,
+    // The pane the keyboard is in, for F1 (#2077): set by a press that lands
+    // in a pane's `pane:<id>` probe and cleared by a press anywhere else (the
+    // capture listener in `render`; a press under an overlay leaves it, see
+    // `help_tab::press_sets_pane_focus`), and cleared by any key but a bare
+    // modifier that gets past F1 in `on_key`. F1 reads it only while the
+    // frame on screen still draws the pane (`help_tab::pane_on_screen`).
+    // Never saved, never shown.
+    pane_focus: Option<help_tab::Pane>,
     // What Ctrl+Y / F4 repeat when there is nothing to redo (#618); see
     // `RepeatRecord` for when it is still valid.
     repeat: Option<RepeatRecord>,
@@ -17439,6 +17447,7 @@ impl Docxy {
             ribbon_flyout: None,
             flyout_closed_at: None,
             pointer_in_window: false,
+            pane_focus: None,
             repeat: None,
             mini_bar: None,
             zoom: 1.0,
@@ -20191,6 +20200,8 @@ impl Docxy {
                 .ok_or_else(|| {
                     format!("the ribbon command {id} is not drawn (another tab, a collapsed group or a closed flyout)")
                 }),
+            Region::Pane(p) => lookup(&self.probes.borrow(), &help_tab::pane_probe(p))
+                .ok_or_else(|| format!("the {} pane is not drawn", p.id())),
             Region::BackstageExt(id) => lookup(&self.probes.borrow(), &backstage_ext_probe(id))
                 .ok_or_else(|| {
                     format!("the File rail draws no extension page {id} (backstage open on its tab)")
@@ -21536,11 +21547,65 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// Commit the Chart panel field being typed into as Enter does (#2077:
+    /// F1 there, before the tab switch to Help drops it). `false` when the
+    /// commit refuses the text: the field stays open, its text and caret as
+    /// they were, with the commit's message under it.
+    fn commit_chart_field(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(f) = self.range_edit.clone() else {
+            return true;
+        };
+        // A message left by an earlier commit must not read as this one's.
+        if matches!(&self.ref_msg, Some((t, _, _)) if *t == f.target) {
+            self.ref_msg = None;
+        }
+        self.range_edit = None;
+        self.ref_commit(f.target, &f.buf, cx);
+        let refused = matches!(&self.ref_msg, Some((t, false, _)) if *t == f.target);
+        if refused {
+            self.range_edit = Some(f);
+        }
+        cx.notify();
+        !refused
+    }
+
+    /// A press at `at` (#2077): the focused pane becomes the one under it,
+    /// or none, unless an overlay is up (`help_tab::press_sets_pane_focus`).
+    fn pane_press(&mut self, at: Point<Pixels>) {
+        let over = help_tab::PressOver {
+            menu: self.menu.is_some(),
+            ribbon_flyout: self.ribbon_flyout.is_some(),
+            backstage: self.backstage,
+            tab_more: self.tab_more_open,
+            tab_dialog: self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| t.dialogs.top().is_some()),
+            app_dialog: self.app_dialogs.is_open(),
+        };
+        if help_tab::press_sets_pane_focus(over) {
+            self.pane_focus = help_tab::pane_at(self.probes.borrow().on_screen_frame(), at);
+        }
+    }
+
     /// Whether a text entry the active surface draws takes the keyboard: the
     /// find or comment bar or a document's font box where shown, a Project
     /// entry, or a sheet's cell, Name Box, font box, rename, comment, range,
-    /// rule or row-height entry. F1 leaves these alone (#1021).
+    /// rule or row-height entry. F1 leaves these alone (#1021), but for a
+    /// Chart panel field alone, where F1 opens the Chart pane's page (#2077).
     fn entry_owns_keys(&self) -> bool {
+        self.other_entry_owns_keys() || self.chart_field_live()
+    }
+
+    /// A Chart panel field being typed into (#2077): a sheet's `range_edit`
+    /// outside the entry bars (a conditional-formatting rule's range is in
+    /// its bar, which is [`Self::other_entry_owns_keys`]'s).
+    fn chart_field_live(&self) -> bool {
+        self.active_is_sheet() && self.range_edit.as_ref().is_some_and(|r| !r.target.is_bar())
+    }
+
+    /// [`Self::entry_owns_keys`] but for a Chart panel field.
+    fn other_entry_owns_keys(&self) -> bool {
         let doc = self.active_is_doc();
         let sheet = self.active_is_sheet();
         (self.find_open && (doc || sheet))
@@ -21551,7 +21616,7 @@ impl Docxy {
                 && (self.sheet_rename.is_some()
                     || self.sheet_field_live()
                     || self.sheet_comment_edit.is_some()
-                    || self.range_edit.is_some()
+                    || self.range_edit.as_ref().is_some_and(|r| r.target.is_bar())
                     || self.sheet_cf_edit.is_some()
                     || self.sheet_rowh_edit.is_some()
                     || self.active_sheet().is_some_and(|v| v.editing.is_some())))
@@ -24178,6 +24243,7 @@ impl Docxy {
             fields = fields.child(row);
         }
         v_flex()
+            .relative()
             .w(px(SIDE_PANEL_W))
             .h_full()
             .flex_none()
@@ -24186,6 +24252,10 @@ impl Docxy {
             .border_color(pal.border)
             .child(div().px_3().py_2().text_size(px(13.)).font_weight(FontWeight::BOLD).text_color(pal.fg).child("PivotTable Fields"))
             .child(div().px_3().pb_1().text_size(px(10.)).text_color(pal.dim).child("Field: Rows \u{2192} Columns \u{2192} \u{03A3} Values \u{2192} off. On a Values field, click the chip to change Sum/Count/Avg/Max/Min."))
+            .child(probe(
+                &self.probes,
+                help_tab::pane_probe(help_tab::Pane::PivotFields),
+            ))
             .child(div().id("pivot-fields").flex_1().min_h(px(0.)).overflow_y_scroll().px_2().child(fields))
             .into_any_element()
     }
@@ -24623,9 +24693,15 @@ impl Docxy {
             .bg(pal.panel)
             .border_l_1()
             .border_color(pal.border)
+            .relative()
             // Where the harness's `chart-panel` region is measured. Out of flow,
             // so it cannot shift a control.
             .child(probe(&self.probes, "chart-panel"))
+            // F1's pane (#2077), over the same area.
+            .child(probe(
+                &self.probes,
+                help_tab::pane_probe(help_tab::Pane::Chart),
+            ))
             // The panel is opaque to the mouse: a press that lands on it (or on
             // the gaps between its controls) must not reach the grid behind and
             // move the cell selection out from under the chart being edited.
@@ -28907,6 +28983,7 @@ impl Docxy {
             );
         }
         v_flex()
+            .relative()
             .w(px(SIDE_PANEL_W))
             .h_full()
             .flex_none()
@@ -28968,6 +29045,10 @@ impl Docxy {
                         "Click an item to paste it as values:"
                     }),
             )
+            .child(probe(
+                &self.probes,
+                help_tab::pane_probe(help_tab::Pane::OfficeClipboard),
+            ))
             .child(list)
             .into_any_element()
     }
@@ -29120,6 +29201,7 @@ impl Docxy {
             );
         }
         v_flex()
+            .relative()
             .w(px(280.))
             .h_full()
             .border_l_1()
@@ -29136,6 +29218,10 @@ impl Docxy {
                     .border_color(pal.border)
                     .child(SharedString::from(format!("Comments ({})", comments.len()))),
             )
+            .child(probe(
+                &self.probes,
+                help_tab::pane_probe(help_tab::Pane::Comments),
+            ))
             .child(list)
             .into_any_element()
     }
@@ -29208,6 +29294,7 @@ impl Docxy {
             );
         }
         v_flex()
+            .relative()
             .w(px(240.))
             .h_full()
             .border_r_1()
@@ -29224,6 +29311,10 @@ impl Docxy {
                     .border_color(pal.border)
                     .child("Navigation"),
             )
+            .child(probe(
+                &self.probes,
+                help_tab::pane_probe(help_tab::Pane::Navigation),
+            ))
             .child(list)
             .into_any_element()
     }
@@ -29276,6 +29367,7 @@ impl Docxy {
             );
         }
         v_flex()
+            .relative()
             .w(px(280.))
             .h_full()
             .border_l_1()
@@ -29292,6 +29384,10 @@ impl Docxy {
                     .border_color(pal.border)
                     .child(SharedString::from(format!("Notes ({})", notes.len()))),
             )
+            .child(probe(
+                &self.probes,
+                help_tab::pane_probe(help_tab::Pane::Notes),
+            ))
             .child(list)
             .into_any_element()
     }
@@ -29560,6 +29656,9 @@ impl Docxy {
             cx.notify();
             return;
         }
+        // Past the overlays, Tab goes to the surface (or the KeyTips): the
+        // keyboard leaves the focused pane, as for `on_key`'s keys (#2077).
+        self.pane_focus = None;
         if self.project_prompt_open() {
             return;
         }
@@ -29698,6 +29797,9 @@ impl Docxy {
             cx.notify();
             return;
         }
+        // Past the overlays, Tab goes to the surface (or the KeyTips): the
+        // keyboard leaves the focused pane, as for `on_key`'s keys (#2077).
+        self.pane_focus = None;
         if self.project_prompt_open() {
             return;
         }
@@ -29827,10 +29929,34 @@ impl Docxy {
         // the manual's page for the ribbon tab shown, or its root on a Help
         // tab (#1855); with no manual installed, the status line says the
         // documentation is coming.
-        if help_tab::is_help_key(&ev.keystroke) && !self.entry_owns_keys() {
-            self.close_menu();
-            self.ribbon_flyout = None;
-            return self.help_f1(window, cx);
+        // A Chart panel field owns the keys, but the keyboard is in the
+        // pane there: F1 opens the Chart pane's page (#2077). Any other entry
+        // still takes F1 as before.
+        if help_tab::is_help_key(&ev.keystroke) {
+            let chart_drawn = self
+                .probes
+                .borrow()
+                .on_screen(&help_tab::pane_probe(help_tab::Pane::Chart))
+                .is_some();
+            if let Some(pane) = help_tab::entry_pane_help(
+                self.chart_field_live(),
+                self.other_entry_owns_keys(),
+                chart_drawn,
+            ) {
+                self.close_menu();
+                self.ribbon_flyout = None;
+                return self.pane_f1(pane, window, cx);
+            }
+            if !self.entry_owns_keys() {
+                self.close_menu();
+                self.ribbon_flyout = None;
+                return self.help_f1(window, cx);
+            }
+        }
+        // Past F1, a key that reaches the surface takes the keyboard out of
+        // the focused pane (#2077); a bare modifier does not.
+        if !help_tab::keeps_pane_focus(&ev.keystroke.key) {
+            self.pane_focus = None;
         }
         // A Help tab (#1855) has no ribbon and no KeyTips: its own keys.
         if self.active_is_help() {
@@ -45699,6 +45825,16 @@ impl Render for Docxy {
                 window.on_mouse_event(move |_ev: &MouseExitEvent, phase, _window, cx| {
                     if phase == DispatchPhase::Capture {
                         left.update(cx, |this, _cx| this.pointer_in_window = false);
+                    }
+                });
+                // The pane the keyboard is in, for F1 (#2077): a press in a
+                // pane's probe focuses it, any other press unfocuses it,
+                // unless an overlay is up. As the two above: never stops the
+                // event, never notifies.
+                let focus = pointer.clone();
+                window.on_mouse_event(move |ev: &MouseDownEvent, phase, _window, cx| {
+                    if phase == DispatchPhase::Capture {
+                        focus.update(cx, |this, _cx| this.pane_press(ev.position));
                     }
                 });
                 // A tab dragged off the strip (or out of the window) and let
