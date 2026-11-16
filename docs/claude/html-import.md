@@ -365,8 +365,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   joins. The owed space keeps the link it was owed in. A break (`br`, a
   `pre` line), tab (`pre` or Word's `mso-tab-count` span) or picture inside
   a link is written outside it: the link goes on after it as another link
-  to the same place, so every imported link is a runs-only one. An
-  unresolved, unsized image's `alt` text is the link's text.
+  to the same place, so every imported link is a runs-only one. A picture
+  in a URL link carries the link itself, as its click link (#1999, below).
+  An unresolved, unsized image's `alt` text is the link's text.
 - A link has the user-agent look (`underline`, `LINK_COLOR` `0563C1`, Word's
   Hyperlink colour) as direct formatting, set before the page's rules, which
   override it (Word's own `a:link` rule is a pseudo-class `css.rs` drops; a
@@ -386,8 +387,45 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   span's text loses it. No bookmarks for `<a name>`/`id` (an anchor link
   has nowhere to jump yet), no `Hyperlink` character style (`w:rStyle`; the
   Markdown package defines none), no `<base href>` or relative links, no
-  hyperlinked pictures, no `title` (`w:tooltip`) or `target`
-  (`w:tgtFrame`).
+  `title` (`w:tooltip`) or `target` (`w:tgtFrame`).
+
+## HTML import picture links (#1999)
+
+- With images on, an `<img>` whose look has a URL link (`Link::Url`, the
+  enclosing `<a href>`) keeps it as Word keeps a picture's hyperlink: an
+  `a:hlinkClick r:id` as the first child of the run's `wp:inline`'s
+  `wp:docPr` (`image::with_click_link`, which takes only the self-closing
+  docPr this crate writes, and declares `xmlns:a` on the `hlinkClick`
+  itself: `a:graphic`, which declares it, is a later sibling). The
+  picture from bytes and the sized placeholder alike; the unsized,
+  unresolved one is still its alt as the link's text. The picture stays an
+  ordinary picture run between the link's text, which stays two
+  `Inline::Hyperlink`s: wrapping the drawing in `w:hyperlink` would put a
+  picture in `Hyperlink.runs`, which every link consumer reads as text.
+- The `r:id` is import-local, `rIdHtmlLink{n}`, one per distinct URL
+  (`Images::link_rid`, charged to the budget), at most
+  `MAX_PICTURE_LINKS` (1000) URLs: a picture linked to a later one is a
+  plain picture (sized placeholders never reach the resolver, so
+  `MAX_IMAGES` does not bound them). `HtmlImport::links`
+  (`ImportedLink { rid, url }`) lists them. `HtmlImport::package` adds an
+  external hyperlink relationship to `word/document.xml` for each, in one
+  pass over the rels (`Package::add_part_hyperlinks`: one call a link
+  would re-read the growing part each time, quadratic, r1) and renames the pictures' `r:id`s with
+  the media's in one map (`rename_rids`: `image::replace_click_link` beside
+  `replace_inline_embeds`). A caller that builds its own package from
+  `media` must map `links` too, or its pictures name relationships it
+  does not have. `save_package` copies the rels as they are, so the link
+  survives a save; `image::inline_click_link` reads it (the docPr's first
+  child only; `pic:cNvPr`'s copy and an anchored drawing are not read).
+- An anchor link (`#name`) on a picture stays as before (the picture
+  outside the link): DrawingML's `hlinkClick` has no bookmark form, and
+  Word wraps the run in `w:hyperlink w:anchor` instead. Not done: `<a
+  title>` as the `hlinkClick`'s `tooltip`, `a:hlinkHover`, the e-mail
+  export writing such a picture back as `<a href><img></a>`, and a paste
+  carrying the link's relationship (`docs/claude/suite-document.md`).
+- Tests: `link_tests` in `import/html.rs` (`…_1999`), the `with_click_link`
+  / `inline_click_link` / `replace_click_link` tests in `image.rs`,
+  `add_part_hyperlinks_…` in `package.rs`.
 
 ## HTML import page margins (#1928)
 

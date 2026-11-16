@@ -85,6 +85,15 @@ impl Relationships {
     pub fn target(&self, id: &str) -> Option<&str> {
         self.map.get(id).map(|(t, _)| t.as_str())
     }
+    /// The target of relationship `id` when it is external
+    /// (`TargetMode="External"`: a hyperlink's URL, #1999); `None` for an
+    /// internal one (a part) or an unknown id.
+    pub fn external_target(&self, id: &str) -> Option<&str> {
+        self.map
+            .get(id)
+            .filter(|(_, external)| *external)
+            .map(|(t, _)| t.as_str())
+    }
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -3671,6 +3680,17 @@ mod tests {
 
     fn doc(xml: &str) -> Document {
         parse_document_xml(xml, &Relationships::default())
+    }
+
+    #[test]
+    fn external_target_is_only_an_external_relationship_1999() {
+        let rels = parse_rels_xml(
+            r#"<Relationships><Relationship Id="rId1" Type="h" Target="https://a.example/" TargetMode="External"/><Relationship Id="rId2" Type="i" Target="media/image1.png"/></Relationships>"#,
+        );
+        assert_eq!(rels.external_target("rId1"), Some("https://a.example/"));
+        assert_eq!(rels.target("rId2"), Some("media/image1.png"));
+        assert_eq!(rels.external_target("rId2"), None);
+        assert_eq!(rels.external_target("rId3"), None);
     }
 
     /// What content kept as raw XML hides (#1948): a tracked deletion or

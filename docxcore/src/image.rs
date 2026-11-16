@@ -251,6 +251,99 @@ pub fn inline_alt_text(raw: &str) -> Option<String> {
         .find(|v| !v.is_empty())
 }
 
+/// The DrawingML main namespace, which an `a:hlinkClick` declares itself:
+/// `a:graphic`, which declares it in a picture run, comes after `wp:docPr`.
+const DRAWINGML_NS: &str = "http://schemas.openxmlformats.org/drawingml/2006/main";
+
+/// Where an inline picture run's `wp:inline`'s `wp:docPr` start tag sits
+/// (`raw[at..end]`, `end` at its `>`), under [`inline_extent`]'s guards.
+fn inline_doc_pr(raw: &str) -> Option<(usize, usize)> {
+    inline_extent(raw)?;
+    let inline = raw.find("<wp:inline")?;
+    let at = inline + start_tag(&raw[inline..], "<wp:docPr")?;
+    Some((at, at + raw[at..].find('>')?))
+}
+
+/// An inline picture run linked to the external relationship `rid` (#1999),
+/// as Word keeps a picture's hyperlink: an `a:hlinkClick` as the first child
+/// of its `wp:inline`'s `wp:docPr`. Only a self-closing `wp:docPr` (what
+/// this crate's picture runs write) takes one: a docPr with children (an
+/// `hlinkClick` among them, maybe), an anchored drawing or anything that is
+/// not an inline picture is `None`. Its `r:` prefix is the part root's, as
+/// the blip's `r:embed` is.
+pub fn with_click_link(raw: &str, rid: &str) -> Option<String> {
+    let (at, end) = inline_doc_pr(raw)?;
+    let open = raw[at..end].strip_suffix('/')?;
+    Some(format!(
+        "{}{open}><a:hlinkClick xmlns:a=\"{DRAWINGML_NS}\" r:id=\"{}\"/></wp:docPr>{}",
+        &raw[..at],
+        crate::mermaid::xml_escape_attr(rid),
+        &raw[end + 1..]
+    ))
+}
+
+/// Where the `a:hlinkClick` start tag of an inline picture run sits
+/// (`raw[at..end]`, `end` at its `>`): the first child of its `wp:inline`'s
+/// `wp:docPr` (where the schema puts it), under [`inline_extent`]'s guards.
+/// `pic:cNvPr`'s copy is not read.
+fn click_link_tag(raw: &str) -> Option<(usize, usize)> {
+    let (at, end) = inline_doc_pr(raw)?;
+    if raw[at..end].ends_with('/') {
+        return None;
+    }
+    let body = end + 1;
+    let child = body + (raw[body..].len() - raw[body..].trim_start().len());
+    if start_tag(&raw[child..], "<a:hlinkClick")? != 0 {
+        return None;
+    }
+    Some((child, child + raw[child..].find('>')?))
+}
+
+/// The relationship id of an inline picture run's click link (#1999): its
+/// `wp:docPr`'s `a:hlinkClick` `r:id` ([`with_click_link`]), decoded as the
+/// loader decodes an attribute. `None` for a picture with none, an empty
+/// one, an anchored drawing or anything that is not an inline picture.
+pub fn inline_click_link(raw: &str) -> Option<String> {
+    let (at, end) = click_link_tag(raw)?;
+    let rid = crate::load::decode_attr(&attr_at_boundary(&raw[at..end], "r:id")?);
+    (!rid.is_empty()).then_some(rid)
+}
+
+/// `raw` with its click link's `r:id` ([`inline_click_link`]) renamed by
+/// `map`; `None` when it has none or `map` does not name it.
+pub fn replace_click_link(
+    raw: &str,
+    map: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let new = map.get(&inline_click_link(raw)?)?;
+    let (at, end) = click_link_tag(raw)?;
+    let tag = &raw[at..end];
+    let b = tag.as_bytes();
+    for (i, _) in tag.match_indices("r:id") {
+        if i == 0 || !b[i - 1].is_ascii_whitespace() {
+            continue;
+        }
+        let rest = &tag[i + "r:id".len()..];
+        let Some(eq) = rest.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let value = eq.trim_start();
+        let Some(q) = value.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+            continue;
+        };
+        // `value` is a suffix of `tag`: past its opening quote.
+        let start = end - value.len() + 1;
+        let close = start + raw[start..end].find(q)?;
+        return Some(format!(
+            "{}{}{}",
+            &raw[..start],
+            crate::mermaid::xml_escape_attr(new),
+            &raw[close..]
+        ));
+    }
+    None
+}
+
 /// `name`'s value in the start tag `el`, matched only where the name
 /// starts an attribute (after white space), so `title` is not read out of
 /// `foo:title` or `subtitle`.
@@ -1025,5 +1118,98 @@ mod tests {
             with_doc_pr(r#" descr="x""#).replace("<w:drawing>", "<w:drawing><wp:anchor/>");
         assert_eq!(inline_alt_text(&anchored), None);
         assert_eq!(inline_alt_text("<w:r><w:t>x</w:t></w:r>"), None);
+    }
+
+    /// The importer's picture run (#1999's input to `with_click_link`).
+    fn picture() -> String {
+        inline_picture_run_described("rIdImg", 10, 20, 3, "logo.png", "Logo", None)
+    }
+
+    #[test]
+    fn with_click_link_puts_hlink_click_first_in_a_self_closing_doc_pr_1999() {
+        let raw = picture();
+        let linked = with_click_link(&raw, "rIdL&1").expect("an inline picture");
+        let want = format!(
+            "<wp:docPr id=\"3\" name=\"Picture 3\" descr=\"Logo\"><a:hlinkClick xmlns:a=\"{DRAWINGML_NS}\" r:id=\"rIdL&amp;1\"/></wp:docPr>"
+        );
+        assert!(linked.contains(&want), "{linked}");
+        // Everything else as it was.
+        assert_eq!(
+            linked.replace(
+                &want,
+                "<wp:docPr id=\"3\" name=\"Picture 3\" descr=\"Logo\"/>"
+            ),
+            raw
+        );
+        assert_eq!(inline_click_link(&linked).as_deref(), Some("rIdL&1"));
+        assert_eq!(inline_alt_text(&linked).as_deref(), Some("Logo"));
+        assert_eq!(inline_extent(&linked), Some((10, 20)));
+        assert_eq!(inline_embed(&linked).as_deref(), Some("rIdImg"));
+        assert_eq!(inline_click_link(&raw), None);
+    }
+
+    #[test]
+    fn with_click_link_refuses_all_but_a_self_closing_inline_doc_pr_1999() {
+        let linked = with_click_link(&picture(), "rId1").unwrap();
+        // An `hlinkClick` already there, or any other docPr with children.
+        assert_eq!(with_click_link(&linked, "rId2"), None);
+        let children =
+            picture().replace("descr=\"Logo\"/>", "descr=\"Logo\"><a:extLst/></wp:docPr>");
+        assert_eq!(with_click_link(&children, "rId2"), None);
+        let anchored = picture().replace("<w:drawing>", "<w:drawing><wp:anchor/>");
+        assert_eq!(with_click_link(&anchored, "rId2"), None);
+        assert_eq!(with_click_link("<w:r><w:t>x</w:t></w:r>", "rId2"), None);
+    }
+
+    #[test]
+    fn inline_click_link_reads_only_the_doc_pr_first_child_1999() {
+        let with_body = |body: &str| {
+            picture().replace(
+                "descr=\"Logo\"/>",
+                &format!("descr=\"Logo\">{body}</wp:docPr>"),
+            )
+        };
+        let read = |body: &str| inline_click_link(&with_body(body));
+        assert_eq!(
+            read(" <a:hlinkClick xmlns:a='x' r:id='rId7'/>").as_deref(),
+            Some("rId7")
+        );
+        assert_eq!(read("<a:hlinkClick r:id=\"\"/>"), None);
+        assert_eq!(read("<a:hlinkClick/>"), None);
+        // `hlinkHover` is not a click link, nor one past another child.
+        assert_eq!(read("<a:hlinkHover r:id=\"rId7\"/>"), None);
+        assert_eq!(read("<a:extLst/><a:hlinkClick r:id=\"rId7\"/>"), None);
+        // `pic:cNvPr`'s copy is not read.
+        let cnv = picture().replace(
+            "<pic:cNvPr id=\"0\" name=\"logo.png\"/>",
+            "<pic:cNvPr id=\"0\" name=\"logo.png\"><a:hlinkClick r:id=\"rId7\"/></pic:cNvPr>",
+        );
+        assert_ne!(cnv, picture());
+        assert_eq!(inline_click_link(&cnv), None);
+        let anchored = with_body("<a:hlinkClick r:id=\"rId7\"/>")
+            .replace("<w:drawing>", "<w:drawing><wp:anchor/>");
+        assert_eq!(inline_click_link(&anchored), None);
+    }
+
+    #[test]
+    fn replace_click_link_renames_only_a_mapped_r_id_1999() {
+        let map: std::collections::HashMap<String, String> =
+            [("rIdHtmlLink1".to_string(), "rId9".to_string())].into();
+        let linked = with_click_link(&picture(), "rIdHtmlLink1").unwrap();
+        let renamed = replace_click_link(&linked, &map).expect("a mapped link");
+        assert_eq!(renamed, with_click_link(&picture(), "rId9").unwrap());
+        // The blip's `r:embed` is not touched, even when the map names it.
+        let both: std::collections::HashMap<String, String> =
+            [("rIdImg".to_string(), "rId9".to_string())].into();
+        assert_eq!(replace_click_link(&linked, &both), None);
+        let other = with_click_link(&picture(), "rIdOther").unwrap();
+        assert_eq!(replace_click_link(&other, &map), None);
+        assert_eq!(replace_click_link(&picture(), &map), None);
+        // Single quotes and spaces round `=` are kept.
+        let quoted = linked.replace("r:id=\"rIdHtmlLink1\"", "r:id = 'rIdHtmlLink1'");
+        assert_eq!(
+            replace_click_link(&quoted, &map),
+            Some(quoted.replace("'rIdHtmlLink1'", "'rId9'"))
+        );
     }
 }

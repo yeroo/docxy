@@ -47,7 +47,8 @@ issue number to find its notes.
   images (#1880), links (#1879), centring (#1922), rounded images (#1926),
   nested cards (#1927), page margins (#1928), Outlook mail: CSS-only spacing,
   quirks-mode edges, list indents, item continuations, marker look (#1979),
-  list and parent margins, trailing `<br>`, wide hangs, wrapper tables (#2114).
+  list and parent margins, trailing `<br>`, wide hangs, wrapper tables (#2114),
+  a picture in a link keeping it as its click link (#1999).
 - `docs/claude/email-html.md`: before changing `docxcore::export_email` (a `Document` as an
   e-mail body): inline styles only, lists and their `start`, safe links, `cid:` pictures and
   their media, the import round trip (#1948).
@@ -67,7 +68,7 @@ issue number to find its notes.
   pictures from bytes and paste (#1953),
   host hyperlinks (#1952), link hover and the hand cursor (#1916),
   page inset and page background (#2003), picture Alt Text tooltips
-  (#1998), an imported mail's Outlook-like
+  (#1998), linked pictures followed as links (#1999), an imported mail's Outlook-like
   inset (#1987), its scrollbars (#2080), its Find
   box (#1887), its Print Layout (#1888), an extension's ribbon
   drawn by the suite and the suite's theme (#1870), File backstage pages and CloseTab

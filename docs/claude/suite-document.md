@@ -151,6 +151,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   one (`carry_into_tab`, `ensure_package`); a tab whose save writes none
   (`saves_as_word`: Markdown, text, RTF) pastes the rids as they were. An
   `a:hlinkClick` `r:id` on a picture is not carried (a hyperlink, not media).
+  Every linked picture of an imported HTML page has one since #1999
+  (`docs/claude/html-import.md`), so a paste of one into another story or
+  document leaves its `r:id` naming no relationship there (a follow-up).
 - A crop to a shape (#1926: Word's Crop to Shape, or an HTML `img`'s
   `border-radius` from the import, `docs/claude/html-import.md`) is read by
   `docxcore::image::inline_shape` from the picture's `pic:spPr/a:prstGeom`

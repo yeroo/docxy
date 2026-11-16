@@ -24,6 +24,9 @@ pub type ImageResolver<'r> = dyn FnMut(&str, usize) -> Option<Vec<u8>> + 'r;
 /// The most distinct srcs an import asks its resolver for; later ones are
 /// placeholders.
 pub const MAX_IMAGES: usize = 1000;
+/// The most distinct URLs an import's pictures link to (#1999); a picture
+/// linked to a later one is a plain picture.
+pub const MAX_PICTURE_LINKS: usize = 1000;
 /// The most bytes one image may hold.
 pub const MAX_IMAGE_BYTES: usize = 64 << 20;
 /// The most media bytes one import keeps (each distinct image once).
@@ -60,6 +63,16 @@ fn local_rid(index: usize) -> String {
     format!("rIdHtmlImage{}", index + 1)
 }
 
+/// One picture link an import made (#1999): the import-local rid a linked
+/// picture's `a:hlinkClick` names (see
+/// [`crate::import::HtmlImport::package`]) and the URL it goes to. One per
+/// distinct URL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportedLink {
+    pub rid: String,
+    pub url: String,
+}
+
 /// What one `<img>` came to.
 pub(crate) enum Source {
     /// A medium of the import: its rid and pixel size.
@@ -83,6 +96,9 @@ pub(crate) struct Images<'a> {
     placeholder: Option<usize>,
     /// The last `wp:docPr` id given.
     last_id: u32,
+    /// The pictures' click links (#1999), each URL once.
+    links: Vec<ImportedLink>,
+    link_index: HashMap<String, usize>,
 }
 
 impl<'a> Images<'a> {
@@ -95,11 +111,36 @@ impl<'a> Images<'a> {
             media_bytes: 0,
             placeholder: None,
             last_id: 0,
+            links: Vec::new(),
+            link_index: HashMap::new(),
         }
     }
 
-    pub(crate) fn into_media(self) -> Vec<ImportedMedia> {
-        self.media
+    /// The media and the picture links the import made.
+    pub(crate) fn into_parts(self) -> (Vec<ImportedMedia>, Vec<ImportedLink>) {
+        (self.media, self.links)
+    }
+
+    /// The import-local rid of a picture link to `url` (#1999): one per
+    /// distinct URL, made on first use (kept twice: the list and its
+    /// index). `None` past [`MAX_PICTURE_LINKS`] URLs or when the budget has
+    /// no room.
+    pub(crate) fn link_rid(&mut self, url: &str, budget: &Budget) -> Option<String> {
+        if let Some(&i) = self.link_index.get(url) {
+            return Some(self.links[i].rid.clone());
+        }
+        if self.links.len() >= MAX_PICTURE_LINKS || !budget.keep::<ImportedLink>(2 * url.len() + 32)
+        {
+            return None;
+        }
+        let index = self.links.len();
+        let rid = format!("rIdHtmlLink{}", index + 1);
+        self.links.push(ImportedLink {
+            rid: rid.clone(),
+            url: url.to_string(),
+        });
+        self.link_index.insert(url.to_string(), index);
+        Some(rid)
     }
 
     /// The next drawing object id (1, 2, …).
@@ -673,7 +714,7 @@ mod tests {
         // Other bytes alike: one medium.
         assert!(matches!(images.source("b", &b), Source::Media { .. }));
         assert!(matches!(images.source("", &b), Source::Unresolved));
-        let media = images.into_media();
+        let (media, _) = images.into_parts();
         assert_eq!(media.len(), 1);
         assert_eq!(asked.len(), 3);
         assert_eq!(asked[0], ("a".to_string(), MAX_IMAGE_BYTES));
@@ -713,7 +754,7 @@ mod tests {
         let mut svg = |_: &str, _: usize| Some(b"<svg/>".to_vec());
         let mut images = Images::new(&mut svg);
         assert!(matches!(images.source("x.svg", &b), Source::Unresolved));
-        assert!(images.into_media().is_empty());
+        assert!(images.into_parts().0.is_empty());
     }
 
     #[test]
@@ -724,6 +765,6 @@ mod tests {
         let a = images.placeholder_rid(&b).unwrap();
         let c = images.placeholder_rid(&b).unwrap();
         assert_eq!(a, c);
-        assert_eq!(images.into_media().len(), 1);
+        assert_eq!(images.into_parts().0.len(), 1);
     }
 }
