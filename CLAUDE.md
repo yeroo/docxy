@@ -54,7 +54,8 @@ issue number to find its notes.
 - `docs/claude/clipboard.md`: before changing copy and paste with other apps: rich (RTF)
   document copy (#1074), sheet HTML tables (#1248), the X11 clipboard and a document
   paste of HTML (#1950), a test X client's last request (#2008), HTML and RTF on
-  Wayland through the suite's patched gpui_linux (#1966).
+  Wayland through the suite's patched gpui_linux (#1966), another app's lists
+  kept by a document paste (#1967).
 - `docs/claude/macos.md`: before changing macOS-only behaviour: the menu bar (#1071), ⌘/⌥
   text navigation (#1073).
 - `docs/claude/suite-shell.md`: before changing the suite's window chrome: the start

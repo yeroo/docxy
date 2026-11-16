@@ -27211,6 +27211,12 @@ impl Docxy {
             if let (Some(ours), Some(tab)) = (ours, self.tabs.get_mut(self.active)) {
                 carry_into_tab(tab, &ours.media, &mut clip);
             }
+            // Another app's list items name lists the package must define.
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                if tab.saves_as_word() {
+                    doc_paste::numbering_for_paste(tab.pkg.as_mut(), &clip);
+                }
+            }
             self.with_editor(window, cx, |e| e.one_step("Paste", |e| e.paste(&clip)));
         } else {
             self.refocus(window, cx);
@@ -30992,6 +30998,34 @@ mod clipboard_tests {
         // An HTML-only copy, with no text beside it, still pastes.
         let got = doc_paste_clip(None, &ClipRead::Nothing, None, || Some(html.into())).unwrap();
         assert_eq!(got.to_text(), "Plain BOLD link");
+    }
+
+    /// #1967: another app's RTF or HTML list pastes with its items' lists;
+    /// our own clip and the text have none.
+    #[test]
+    fn a_document_paste_keeps_another_apps_lists_1967() {
+        use docxcore::editor::{Clip, ClipList};
+        let text = |t: &str| ClipRead::Text(t.into());
+        let lists = |c: &Clip| (0..c.paras.len()).map(|i| c.list(i)).collect::<Vec<_>>();
+        let item = |num_id, ilvl| Some(ClipList { num_id, ilvl });
+        let rtf: &[u8] = br"{\rtf1\ansi\pard\ls1\ilvl0{\listtext\'b7\tab}Dot\par\pard\ls2\ilvl1{\listtext 1.\tab}One\par\pard Plain\par}";
+        let got = doc_paste_clip(None, &text("Dot\nOne\nPlain"), Some(rtf), || None).unwrap();
+        assert_eq!(lists(&got), [item(1, 0), item(2, 1), None]);
+        let html = "<ul><li>a<ol><li>b</li></ol></li></ul><p>c</p>";
+        let got = doc_paste_clip(None, &text("a\nb\nc"), None, || Some(html.into())).unwrap();
+        assert_eq!(lists(&got), [item(1, 0), item(2, 1), None]);
+        let ours = DocClip {
+            media: Default::default(),
+            clip: Clip::from_text("mine"),
+            text: "mine".into(),
+        };
+        let got = doc_paste_clip(Some(&ours), &text("mine"), Some(rtf), || None).unwrap();
+        assert!(!got.has_lists());
+        assert!(
+            !doc_paste_clip(None, &text("a\nb"), None, || None)
+                .unwrap()
+                .has_lists()
+        );
     }
 
     /// #1950 r1: another app's HTML with no text beside it is never our
