@@ -493,6 +493,14 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   The `issue 2003` test in `uiharness/cases/ext-doc-view.uit` (a 1000 px
   window) checks 904 → 956 px of text, column at 48 → 22 and the page
   `262626` dark / `ffffff` light, and shoots each.
+- An imported mail's Outlook-like margin (#1987) is a host inset: Outlook's
+  reading pane has about 20 px from the pane edge to the text, and no extra
+  band. The view does not read the HTML import's 15 px section margins
+  (`docs/claude/html-import.md`) in the flow: they are not Outlook's
+  number, and a host's inset must win. The `issue 1987` test in
+  `uiharness/cases/ext-doc-outlook-mail.uit` loads the #1979 mail with a
+  20 / 12 px inset: `column_left` 20, the first line at x 0 from it, the
+  list's numbers at 22 and text at 40, then 48 again once unset.
 
 ## Find in the embedded view (#1887)
 

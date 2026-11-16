@@ -407,9 +407,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   6.5" grid (`import/mod.rs`) and, like PDF and recovered text, no section
   of its own: the package's default page.
 - Where it shows: Print Layout (`final_page_geom`). A Web Page still opens
-  in Web Layout (`page_view` is off by default), which, like
-  `ext::DocView`, keeps its fixed 48 / 28 px padding and never reads page
-  margins (#1895, `docs/claude/docx-editing.md`).
+  in Web Layout (`page_view` is off by default), which keeps its fixed
+  48 / 28 px padding and never reads page margins (#1895,
+  `docs/claude/docx-editing.md`). `ext::DocView` defaults to the same
+  padding, which its host can set (`DocView::set_page_inset`, #2003), and
+  it never reads page margins either.
   `uiharness/cases/html-page-margins.uit` reads the ruler's insets after
   View > Print Layout.
 - A later margin change (Page Setup > Margins via `apply_page_setup`,
@@ -428,8 +430,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
 A simple mail from Outlook on the web, new Outlook or classic Outlook
 imports as a browser lays it out. Slice 1 of #1979: the model. The
 suite's flow view drawing it (marker look, spacing, line height) is
-#1986 (`docs/claude/docx-editing.md`), and `ext::DocView`'s page margin
-is #1987.
+#1986 (`docs/claude/docx-editing.md`). `ext::DocView`'s page margin is
+the host's, `DocView::set_page_inset` (#2003); #1987 checks an
+Outlook-like 20 px inset on this mail (`docs/claude/suite-extensions.md`).
 
 - Spacing comes from CSS only. Every HTML paragraph writes `w:spacing`:
   - `before`/`after` from the top/bottom boxes of the blocks and lists it

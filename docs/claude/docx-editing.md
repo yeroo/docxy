@@ -351,4 +351,6 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   its numbers stayed black on a dark page until #2079, which maps them as
   Word's dark mode does (`docs/claude/suite-document.md`). Style
   spacing (docDefaults, Normal, the style chain) is still not resolved, so
-  Word paragraphs keep the stand-ins. `ext::DocView`'s page margin is #1987.
+  Word paragraphs keep the stand-ins. `ext::DocView`'s page margin is the
+  host's, `DocView::set_page_inset` (#2003): #1987 checks an Outlook-like
+  20 px inset on this mail (`docs/claude/suite-extensions.md`).
