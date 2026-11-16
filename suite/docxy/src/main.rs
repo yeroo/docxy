@@ -30306,9 +30306,15 @@ fn sheet_save_decision(
 /// ⚠️ It runs **last**: after the save's whole tail (the workbook's
 /// `circle_cmd_end`, `note_recent_if_moved`, the backstage resets, `persist`,
 /// `refocus`) and after any nested save has returned, since it may close the
-/// tab (the close prompt's Save) and shift every index. A save function hands
-/// it back (`Some`) when it is over now, and moves it into a dialog's answer
-/// (`None`) otherwise, so no path can drop it.
+/// tab (the close prompt's Save) and shift every index. An inner save
+/// function (`save_active_inner`, `save_doc_then`, `save_sheet_then`,
+/// `save_project_then`, all `#[must_use]`) hands it back (`Some`) when it is
+/// over now, and moves it into a dialog's answer (`None`) otherwise, so no
+/// path of the save drops it. `save_active_then` runs what comes back.
+///
+/// On the Deferred route it is dropped with the answer, never run, when the
+/// window goes before the dialog shows or while it is up
+/// ([`Docxy::native_dialog`]).
 pub(crate) type AfterSave = Box<dyn FnOnce(&mut Docxy, &mut Window, &mut Context<Docxy>)>;
 
 /// An [`AfterSave`] that does nothing more.

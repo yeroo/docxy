@@ -113,16 +113,19 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   `mail_act`, which has the window) and the close warning about a draft that
   was not kept. `native_dialog::tests::no_native_dialog_outside_the_helper`
   fails on any `native_modal(` left elsewhere (Open's Linux Background arm is
-  the one exception), and the macOS scan counts a `native_dialog(` call as
-  wrapped.
-- **A save is over when its dialogs are answered.** `save_active_then`,
+  the one exception). The macOS scan counts a dialog as wrapped only inside
+  `native_dialog(`'s `show` argument (the second), not in `dialog` or `then`.
+- **A save is over when its dialogs are answered.** `save_active_inner`,
   `save_doc_then`, `save_sheet_then` and `save_project_then` take an
   `AfterSave` and hand it back (`Some`) when the save is over now. When a
   dialog's answer carries the save on, they move it into that answer
-  (`None`); `#[must_use]` keeps a caller from dropping it. ⚠️ It runs
-  **last**, after the save's whole tail (the workbook's `circle_cmd_end`,
-  `note_recent_if_moved`, the backstage resets, `persist`, `refocus`),
-  since it may close the tab and shift every index.
+  (`None`); `#[must_use]` keeps a caller from dropping it.
+  `save_active_then` returns nothing: it runs what `save_active_inner`
+  hands back. ⚠️ It runs **last**, after the save's whole tail (the
+  workbook's `circle_cmd_end`, `note_recent_if_moved`, the backstage
+  resets, `persist`, `refocus`), since it may close the tab and shift every
+  index. On the Deferred route it is dropped with the answer, never run,
+  when the window goes before the dialog shows or while it is up.
 - **The close prompt's Save and More options…** close the tab from that
   `AfterSave` (`close_prompt_saved`). It closes only when the tab is clean
   and its top dialog is still the prompt. Its `Result` (which the harness
