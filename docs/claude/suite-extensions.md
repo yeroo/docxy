@@ -490,8 +490,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   `RETRY_STEP` (25 ms) behind a timer, with the UI thread free, for up to
   `RETRY_MAX` (5 s). A timeout is no error, and the reply adds
   `waited_ms`. The region `ext-doc-picture:<n>` is the middle of the n-th
-  painted inline picture. `uiharness/cases/ext-doc-alt-text.uit` drives
-  it.
+  painted inline picture. The `issue 1998`
+  tests in `uiharness/cases/ext-doc-view.uit` drive it.
 
 ## Page inset and page background (#2003)
 
