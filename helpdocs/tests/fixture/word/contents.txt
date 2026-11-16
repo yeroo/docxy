@@ -8,3 +8,4 @@ insert
   images
 keyboard
 help
+navigation
