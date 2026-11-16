@@ -2126,7 +2126,9 @@ from the calendar without sending anything.
   cast covers `eventMessageRequest` and `eventMessageResponse`, which derive from it.
   There is no top-level `$select`, as in `meeting_event_id`: `meetingMessageType` is a
   derived-type property, which a plain GET returns. `RespondMeeting` keeps
-  `meeting_event_id`'s narrower `eventMessageRequest` cast on purpose.
+  `meeting_event_id`'s narrower `eventMessageRequest` cast on purpose. When the expand
+  fails with a 404 or 400, it falls back to Graph's documented expand and a plain GET:
+  see "Remove from Calendar when the event is gone (#2208)".
 - `MeetingMessageType::from_graph` reads `meetingRequest`, `meetingCancelled`,
   `meetingAccepted`, `meetingDeclined` and `meetingTenativelyAccepted` (Graph v1.0's own
   spelling), plus the corrected `meetingTentativelyAccepted`. Graph's `none`, an unknown
@@ -2159,8 +2161,10 @@ from the calendar without sending anything.
   and the second DELETE would 404 after the first went out, which `DeleteEvent`'s drain
   retries into a quarantine. A queue that cannot be read is queued to. The host must not
   delete the row first. The command is in `command_writes_event_locally`, next to
-  `CancelEvent`. Both commands start with the signed-in guard (`Error("not signed in")`,
-  nothing sent), and a failed GET goes through `react`.
+  `CancelEvent`. Both commands start with the signed-in guard, nothing sent. Since #2208
+  every failure answers the command: the fetch's is `MeetingMessageFailed` (signed out
+  too), the remove's an `Error` naming the message (signed out: `Error("not signed
+  in")`); see "Remove from Calendar when the event is gone (#2208)".
 - Not done: lookxy shows no list icon for the stored type (#2081 stores it). The cancellation message
   stays in mail after a remove (Outlook moves it to Deleted Items; the host may delete
   it). A `DELETE` answered 404 (the event removed between the GET and the drain) keeps
@@ -2170,7 +2174,7 @@ from the calendar without sending anything.
   `meeting_message_reads_type_and_event`; `client.rs`
   `meeting_message_reads_cancellation_and_event`, `meeting_message_reads_a_response`,
   `meeting_message_of_a_plain_message_is_none`, `meeting_message_id_is_percent_encoded`,
-  `meeting_message_missing_is_not_found`; `engine.rs`
+  `meeting_message_of_a_gone_message_is_not_found` (#2208); `engine.rs`
   `fetch_meeting_message_emits_type_and_event`,
   `remove_from_calendar_deletes_the_event_without_sending`,
   `remove_from_calendar_removes_a_cancelled_series`,
@@ -5186,3 +5190,68 @@ mail, and every request kept only `is_meeting_request`.
     `a_draft_without_options_sends_normal_and_not_flagged`,
     `a_junk_stored_importance_sends_normal`,
     `a_plain_save_of_a_synced_draft_leaves_its_server_flag_alone`.
+
+## Remove from Calendar when the event is gone (#2208)
+
+On a real mailbox, Remove from Calendar on a cancellation did nothing, and the
+`FetchMeetingMessage` for its banner never answered. The cancelled meetings were already
+gone from the calendar (Exchange or another client removed them). For such a message
+Graph answers `meeting_message`'s expanded GET with a 404 `ErrorItemNotFound` for the
+whole request instead of the message without `event` (community reports; Graph does not
+document it). The engine handed that error, or a throttle, offline or refused token, to
+`react`, which emits nothing naming the command.
+
+- `GraphClient::meeting_message` sends up to three GETs (`MeetingMessageForm`):
+  1. `?$expand=microsoft.graph.eventMessage/event($select=id,isOrganizer)` as before
+     (`MEETING_MESSAGE_SELECTED`). A 2xx is the only request.
+  2. On a **400** only: Graph's documented form, `?$expand=microsoft.graph.eventMessage/
+     event` with no inner `$select` ("Get eventMessage", example 2;
+     `MEETING_MESSAGE_DOCUMENTED`), read the same way. This step is ours, not the
+     issue's: if Graph refused the inner `$select`, jumping straight to the plain GET would
+     tell "event gone" for a meeting whose event still exists, and Remove would report a
+     removal it never made.
+  3. On a 404 of the first, or a 400 or 404 of the second: a plain `GET
+     /me/messages/{id}` with no query (`MEETING_MESSAGE_PLAIN`; `meetingMessageType` is a
+     derived-type property a plain GET returns, as #2168's `TypeTier::Plain` relies on).
+     Its answer is the type with `event_id: None` and `is_organizer: false`, "the event is
+     gone"; its 404 is `NotFound`, the message gone.
+  Any other failure of any step (401, 403, 429/503, 5xx, transport, a body that does not
+  parse) is returned as is, with no further request. `with_auth` re-runs the whole chain
+  after a refreshed 401.
+- The commands need no change for the gone event: a cancellation with `event_id: None`
+  already answered `RemovedFromCalendar { event_id: None }` with nothing sent, the fetch
+  `MeetingMessageFetched` with the type (written to the row, #2081). The kept
+  `OutboxOp::RemoveFromCalendar` (#2132) goes through `meeting_message` too.
+- Every failure answers the command, with `react_quietly`'s side effects for auth,
+  throttle and transport (sign-in, back-off, offline):
+  - `FetchMeetingMessage`: `SyncEvent::MeetingMessageFailed { message_id, reason }`,
+    signed out too (`"not signed in"`, before #2208 an `Error`). Never a
+    `SyncEvent::Error`: a background read for the reader's banner, as
+    `MessageFetchFailed` (#2006). `reason` is `GraphError`'s one-line `Display`.
+  - `RemoveFromCalendar`: `Error("remove from calendar {message_id}: {reason}")`, the
+    vocabulary of its refusals and of the kept op's `direct_op_refusal`, so a client has
+    one rule for a user action. Signed out stays `Error("not signed in")`.
+  lookxy never sends either command and takes `MeetingMessageFailed` as a no-op.
+- Not done: `meeting_event_id` (`RespondMeeting`) keeps its single expanded GET. An invite's
+  event exists by definition, and there is no report. A cancellation is not linked to a
+  stored event by iCalUId when Graph will not expand one. The plain GET returns the whole
+  message, capped at `JSON_MAX` (10 MiB); a cancellation with a larger body fails with a
+  `Parse` error, which is still answered. Nothing remembers a refused inner `$select`
+  between calls, so on such a server each read costs two requests.
+- Tests:
+  - `client.rs`: `meeting_message_falls_back_to_a_plain_get_on_404` (an encoded id),
+    `meeting_message_retries_the_documented_expand_on_400`,
+    `meeting_message_falls_back_to_plain_after_two_refused_expands`,
+    `meeting_message_falls_back_to_plain_when_the_documented_expand_404s`,
+    `meeting_message_of_a_gone_message_is_not_found`,
+    `meeting_message_documented_expand_failing_otherwise_is_returned`,
+    `meeting_message_does_not_fall_back_on_other_failures`,
+    `meeting_message_does_not_fall_back_on_a_transport_failure`; one request asserted in
+    `meeting_message_reads_cancellation_and_event`, `meeting_message_reads_a_response`
+    and `meeting_message_of_a_plain_message_is_none`.
+  - `engine.rs`: `fetch_meeting_message_of_a_deleted_event_answers_no_event` and
+    `remove_from_calendar_of_a_deleted_event_answers_removed` (each with a 404 and with
+    two 400s), `meeting_message_failures_are_answered` (message gone, throttled, offline,
+    a refused refresh; each for both commands),
+    `meeting_message_commands_signed_out_send_nothing`,
+    `a_queued_remove_from_calendar_of_a_deleted_event_sends_nothing`.
