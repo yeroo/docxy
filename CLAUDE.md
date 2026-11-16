@@ -66,7 +66,8 @@ issue number to find its notes.
   `ext::DocView` (#1873), its editing mode (#1947), host insert, copy and cut (#1977),
   pictures from bytes and paste (#1953),
   host hyperlinks (#1952), link hover and the hand cursor (#1916),
-  page inset and page background (#2003), an imported mail's Outlook-like
+  page inset and page background (#2003), picture Alt Text tooltips
+  (#1998), an imported mail's Outlook-like
   inset (#1987), its scrollbars (#2080), its Find
   box (#1887), its Print Layout (#1888), an extension's ribbon
   drawn by the suite and the suite's theme (#1870), File backstage pages and CloseTab

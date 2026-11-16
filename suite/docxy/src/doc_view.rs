@@ -13,7 +13,8 @@
 //! its decisions are [`edit`]'s. A hyperlink press goes to the extension's callback
 //! ([`DocView::on_link`], [`DocView::on_link_with_text`]), never opened here; the
 //! link under the pointer goes to [`DocView::on_link_hover`] and, read-only,
-//! the pointer is a hand over it (#1916). The chrome (scroll bar, selection) follows the suite's
+//! the pointer is a hand over it (#1916). A picture's Alt Text shows as
+//! its tooltip on hover ([`picture_tip_el`], #1998). The chrome (scroll bar, selection) follows the suite's
 //! theme; the document is a white page in its authored colours unless the
 //! extension turns on dark mode for content ([`DocView::set_content_dark`]),
 //! whose dark page the host may paint in its own colour
@@ -297,6 +298,10 @@ pub struct DocView {
     /// The canvas colour the last Print Layout frame painted, for the
     /// harness; `None` in Web Layout.
     painted_canvas: Option<Hsla>,
+    /// The picture Alt Text tooltips gpui built for this view (#1998), in a
+    /// harness instance: how many since the document was set, and the
+    /// last one's text. gpui cannot be asked whether a tooltip is up.
+    alt_tips: (usize, Option<String>),
 }
 
 impl DocView {
@@ -353,6 +358,7 @@ impl DocView {
             layout: DocLayout::default(),
             sheets: Sheets::default(),
             painted_canvas: None,
+            alt_tips: (0, None),
         }
     }
 
@@ -366,6 +372,7 @@ impl DocView {
         self.editor = Editor::new(doc);
         self.pkg = pkg;
         self.doc_gen += 1;
+        self.alt_tips = (0, None);
         self.run_styles = RefCell::default();
         self.selecting = false;
         self.press_link = None;
@@ -1306,6 +1313,18 @@ impl DocView {
                 Json::Num(self.pictures.borrow().live_ids().count() as f64),
             ),
             ("links", Json::Arr(links)),
+            // The Alt Text of the picture under the pointer, as its tooltip
+            // shows it (#1998), and the tooltips gpui built.
+            (
+                "picture_alt",
+                picture_alt_at_point(body, &self.words.borrow(), window.mouse_position())
+                    .map_or(Json::Null, Json::Str),
+            ),
+            (
+                "alt_tip",
+                self.alt_tips.1.clone().map_or(Json::Null, Json::Str),
+            ),
+            ("alt_tip_count", Json::Num(self.alt_tips.0 as f64)),
             ("selection", Json::Str(self.selected_text())),
             (
                 "selected_paragraphs",
@@ -1611,6 +1630,20 @@ impl DocView {
                 .collect::<Vec<_>>()
         });
         merge_link_spans(pieces)
+    }
+
+    /// How many picture Alt Text tooltips gpui built for the view since its
+    /// document was set (#1998; counted in a harness instance only).
+    pub(crate) fn alt_tip_count(&self) -> usize {
+        self.alt_tips.0
+    }
+
+    /// Each painted inline picture's bounds, in painted order (#1998).
+    pub(crate) fn picture_bounds(&self) -> Vec<Bounds<Pixels>> {
+        picture_pieces(&self.editor.doc.body, &self.words.borrow())
+            .into_iter()
+            .map(|(b, _)| b)
+            .collect()
     }
 
     /// The first painted word whose text, trimmed, is `text`: its bounds,
@@ -2719,6 +2752,136 @@ pub(crate) fn link_hover_json(link: &LinkHover) -> ctlcore::json::Json {
     ])
 }
 
+/// The most characters a picture's Alt Text tooltip shows (#1998); a
+/// longer one is cut, with an ellipsis.
+pub(crate) const ALT_TIP_MAX: usize = 200;
+
+/// The widest a picture's Alt Text tooltip draws (px, #1998): a longer
+/// text wraps.
+pub(crate) const ALT_TIP_MAX_W: f32 = 360.;
+
+/// A picture's Alt Text as its tooltip shows it (#1998): at most
+/// [`ALT_TIP_MAX`] characters, a longer one its first `ALT_TIP_MAX - 1`
+/// (trailing white space trimmed) and `…`.
+pub(crate) fn alt_tip_text(alt: &str) -> String {
+    if alt.chars().count() <= ALT_TIP_MAX {
+        return alt.to_string();
+    }
+    let cut: String = alt.chars().take(ALT_TIP_MAX - 1).collect();
+    format!("{}\u{2026}", cut.trim_end())
+}
+
+/// The tooltip of a picture run `xml` (#1998): its Alt Text
+/// ([`docxcore::image::inline_alt_text`]) as [`alt_tip_text`] shows it.
+/// Only the renderer's `DocTarget::Embed` arm draws it, so a document
+/// tab's pictures have none.
+pub(crate) fn picture_tip(xml: &str) -> Option<String> {
+    docxcore::image::inline_alt_text(xml).map(|alt| alt_tip_text(&alt))
+}
+
+/// The tooltip of the inline picture at caret offset `off` of `p`
+/// (#1998), as the view draws it; `None` for text, a picture without Alt
+/// Text, or anything else.
+pub(crate) fn picture_alt_at(p: &Paragraph, off: usize) -> Option<String> {
+    let mut at = 0;
+    for (inline, _) in flat_inlines(&p.content) {
+        let len = docxcore::editor::inline_len(&inline);
+        if len > 0 && (at..at + len).contains(&off) {
+            return match &*inline {
+                Inline::Raw(xml) => picture_tip(xml),
+                _ => None,
+            };
+        }
+        at += len;
+    }
+    None
+}
+
+/// The painted inline pictures of `words` in painted order (#1998): each
+/// one's bounds and its tooltip ([`picture_alt_at`]).
+pub(crate) fn picture_pieces(
+    body: &[Block],
+    words: &[(Vec<usize>, WordSpans)],
+) -> Vec<(Bounds<Pixels>, Option<String>)> {
+    let mut out = Vec::new();
+    for (path, spans) in words {
+        let Some(p) = docxcore::editor::resolve_para(body, path) else {
+            continue;
+        };
+        for w in spans.borrow().iter() {
+            if w.len == 0 || !matches!(w.shape, SpanShape::Unit(_)) || !picture_at(p, w.off) {
+                continue;
+            }
+            out.push((w.bounds(), picture_alt_at(p, w.off)));
+        }
+    }
+    out
+}
+
+/// Whether caret offset `off` of `p` is an inline picture.
+fn picture_at(p: &Paragraph, off: usize) -> bool {
+    let mut at = 0;
+    flat_inlines(&p.content).iter().any(|(inline, _)| {
+        let len = docxcore::editor::inline_len(inline);
+        let here = len > 0 && (at..at + len).contains(&off);
+        at += len;
+        here && matches!(&**inline, Inline::Raw(xml) if docxcore::image::inline_extent(xml).is_some())
+    })
+}
+
+/// The hit test (#1998): the tooltip of the painted inline picture under
+/// `point` (window coordinates), `None` off every picture or over one
+/// without Alt Text.
+pub(crate) fn picture_alt_at_point(
+    body: &[Block],
+    words: &[(Vec<usize>, WordSpans)],
+    point: Point<Pixels>,
+) -> Option<String> {
+    picture_pieces(body, words)
+        .into_iter()
+        .find(|(b, _)| b.contains(&point))
+        .and_then(|(_, tip)| tip)
+}
+
+/// The picture's tooltip layer (#1998): a stateful element over the whole
+/// picture frame showing gpui's tooltip, after its hover delay, with `tip`
+/// in the theme's tooltip look, wrapped at [`ALT_TIP_MAX_W`]. Its id is
+/// the paragraph's `path` and the picture's caret offset `off`, unique in
+/// the view's frame: two elements sharing one would share one tooltip
+/// state and cancel each other's. Its hitbox blocks nothing, so presses,
+/// drags and the links' hand are unchanged. In a harness each tooltip
+/// built is counted on the view.
+pub(crate) fn picture_tip_el(
+    view: &WeakEntity<DocView>,
+    path: &[usize],
+    off: usize,
+    tip: String,
+) -> AnyElement {
+    let path: Vec<String> = path.iter().map(|i| i.to_string()).collect();
+    let id = format!("ext-pic-alt:{}:{off}", path.join("."));
+    let (view, tip) = (view.clone(), SharedString::from(tip));
+    div()
+        .id(ElementId::Name(id.into()))
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .tooltip(move |window, cx| {
+            if harness() {
+                let shown = tip.to_string();
+                let _ = view.update(cx, |v, _| {
+                    v.alt_tips = (v.alt_tips.0 + 1, Some(shown));
+                });
+            }
+            let text = tip.clone();
+            gpui_component::tooltip::Tooltip::element(move |_, _| {
+                div().max_w(px(ALT_TIP_MAX_W)).child(text.clone())
+            })
+            .build(window, cx)
+        })
+        .into_any_element()
+}
+
 /// A painted paragraph's links: caret offsets, index in its content, and
 /// what a host is told.
 type ParaLinks = Vec<(std::ops::Range<usize>, usize, LinkHover)>;
@@ -3364,5 +3527,101 @@ mod tests {
         let chars = caret_chars(&p);
         assert_eq!(chars.len(), docxcore::editor::para_text_len(&p));
         assert_eq!(chars[4], 'd');
+    }
+
+    /// An inline picture run with Alt Text `descr` (none when empty).
+    fn picture(descr: &str) -> Inline {
+        Inline::Raw(docxcore::image::inline_picture_run_described(
+            "rId1", 914_400, 457_200, 1, "a.png", descr, None,
+        ))
+    }
+
+    #[test]
+    fn alt_tip_text_caps_at_a_char_boundary_with_an_ellipsis() {
+        assert_eq!(alt_tip_text("Floor plan"), "Floor plan");
+        let exact = "é".repeat(ALT_TIP_MAX);
+        assert_eq!(alt_tip_text(&exact), exact);
+        let long = "é".repeat(ALT_TIP_MAX + 1);
+        let cut = alt_tip_text(&long);
+        assert_eq!(cut.chars().count(), ALT_TIP_MAX);
+        assert_eq!(cut, format!("{}\u{2026}", "é".repeat(ALT_TIP_MAX - 1)));
+        // The white space before the cut goes.
+        let spaced = format!("{} {}", "a".repeat(ALT_TIP_MAX - 2), "b".repeat(10));
+        assert_eq!(
+            alt_tip_text(&spaced),
+            format!("{}\u{2026}", "a".repeat(ALT_TIP_MAX - 2))
+        );
+    }
+
+    /// #1998: a picture's tooltip is its Alt Text, capped; none without.
+    #[test]
+    fn picture_tip_reads_and_caps_the_alt_text() {
+        let Inline::Raw(xml) = picture("Floor plan") else {
+            unreachable!()
+        };
+        assert_eq!(picture_tip(&xml).as_deref(), Some("Floor plan"));
+        let Inline::Raw(bare) = picture("") else {
+            unreachable!()
+        };
+        assert_eq!(picture_tip(&bare), None);
+        let long = "x".repeat(300);
+        let Inline::Raw(xml) = picture(&long) else {
+            unreachable!()
+        };
+        assert_eq!(picture_tip(&xml), Some(alt_tip_text(&long)));
+    }
+
+    #[test]
+    fn picture_alt_at_reads_the_picture_at_an_offset() {
+        let p = Paragraph {
+            content: vec![
+                run("ab"),
+                picture("Floor plan"),
+                link("cd", Some("u"), None),
+                picture(""),
+                Inline::Raw("<w:bookmarkStart w:id=\"0\"/>".into()),
+            ],
+            ..Paragraph::default()
+        };
+        assert_eq!(picture_alt_at(&p, 1), None);
+        assert_eq!(picture_alt_at(&p, 2).as_deref(), Some("Floor plan"));
+        assert_eq!(picture_alt_at(&p, 3), None);
+        assert_eq!(picture_alt_at(&p, 5), None);
+        assert!(picture_at(&p, 2) && picture_at(&p, 5));
+        assert!(!picture_at(&p, 0) && !picture_at(&p, 3));
+    }
+
+    /// #1998: the hit test maps a point on a painted picture to its Alt
+    /// Text, and a point beside it, on text or on a picture without any to
+    /// none.
+    #[test]
+    fn picture_alt_at_point_hits_the_painted_picture() {
+        let body = vec![Block::Paragraph(Paragraph {
+            content: vec![run("ab "), picture("Floor plan"), picture("")],
+            ..Paragraph::default()
+        })];
+        let words = WordSpans::default();
+        words.borrow_mut().extend([
+            piece(0, 3, 100., 100., 20.),
+            piece(3, 1, 120., 100., 96.),
+            piece(4, 1, 216., 100., 96.),
+        ]);
+        let words = vec![(vec![0], words)];
+        let at = |x: f32, y: f32| picture_alt_at_point(&body, &words, point(px(x), px(y)));
+        assert_eq!(at(150., 110.).as_deref(), Some("Floor plan"));
+        assert_eq!(at(110., 110.), None, "on text");
+        assert_eq!(at(150., 130.), None, "below the picture");
+        assert_eq!(at(250., 110.), None, "a picture without Alt Text");
+        // Both pictures are painted pieces, in order, whatever their alt.
+        let pieces = picture_pieces(&body, &words);
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(pieces[0].1.as_deref(), Some("Floor plan"));
+        assert_eq!(pieces[1].1, None);
+        // A path the document does not hold has none.
+        let stale = vec![(vec![7], words[0].1.clone())];
+        assert_eq!(
+            picture_alt_at_point(&body, &stale, point(px(150.), px(110.))),
+            None
+        );
     }
 }

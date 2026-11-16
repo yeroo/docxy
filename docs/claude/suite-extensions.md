@@ -100,8 +100,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   content_dark, focused, links_followed, link_calls; the page fields are
   #2003's, below), `ext-doc-set
   {link_click, content_dark}`, the regions `ext-doc-view`,
-  `ext-doc-link:<n>[:left]` (`:left` 8 px left of the span, at mid-height)
-  and `ext-doc-word:<text>[:start|:end]` (`:end` a pixel
+  `ext-doc-link:<n>[:left]` (`:left` 8 px left of the span, at mid-height),
+  `ext-doc-picture:<n>` (#1998) and `ext-doc-word:<text>[:start|:end]` (`:end` a pixel
   past the last character), and `pointer-click`'s `ctrl`.
   `uiharness/cases/ext-doc-view.uit` drives it (run on Linux under
   `scripts/ui-linux.py`). `suite/docxy/tests/ext_doc_view_api.rs` holds the
@@ -450,6 +450,52 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   (nothing found there), and editable mode with arrow keys. Each test sets
   its own pointer first (gpui keeps the pointer where the previous test
   left it) and the editable one counts against `ext-doc-set`'s snapshot.
+
+## Picture Alt Text tooltips (#1998)
+
+- An inline picture with Alt Text shows it as a tooltip when the pointer
+  rests on it, after gpui's hover delay (500 ms), in the embedded view
+  only: a document tab's pictures have none. Alt Text is
+  `docxcore::image::inline_alt_text`: the `wp:inline`'s `wp:docPr`
+  `descr`, else its `title` (never `pic:cNvPr`'s copy, never a
+  `wp:anchor` drawing), decoded as the loader decodes an attribute
+  (`load::decode_attr`), white space collapsed, empty is none. The e-mail
+  export (`export_email::alt_text`) reads `descr` only, so a picture with
+  only a `title` has a tooltip here but `alt=""` in an e-mail. The HTML importer writes an `<img alt>` there, the #1880
+  placeholder of a picture that did not load included; an `<img>` with no
+  size is its alt as text, so no picture and no tooltip.
+- The tooltip shows `doc_view::alt_tip_text`: at most `ALT_TIP_MAX` (200)
+  characters, a longer one cut to 199 plus `…`, in gpui-component's
+  `Tooltip` look (the theme's, light and dark), wrapped at
+  `ALT_TIP_MAX_W` (360 px; `Tooltip` has no width limit of its own).
+- The shared renderer draws it: in the picture branch, only when the
+  paragraph's `Click` target is `DocTarget::Embed` and
+  `doc_view::picture_tip(xml)` has text does the frame get
+  `doc_view::picture_tip_el`, a full-size absolute stateful child with
+  gpui's `.tooltip`. That arm is the only one that attaches it, which is
+  why a document tab's pictures (`DocTarget::Suite`) show none. No test
+  covers that: the suite's harness cannot see a document tab's tooltips. Its hitbox is `Normal`, so the unit's press and drag,
+  the I-beam and #1916's link hand are unchanged; a press or a wheel hides
+  the tooltip (gpui). Its id is `ext-pic-alt:<path>:<offset>`. It must be
+  unique in the frame: two elements with one id share one tooltip state,
+  and each one's move handler cancels the other's pending show. Only a
+  paragraph with a `Click` gets one. Print Layout draws each body block
+  once, in one band, and its headers and footers (`hf_para_el`) have no
+  `Click`, so they show none.
+- Harness: `ext-doc-read` adds `picture_alt` (the hit test
+  `picture_alt_at_point` at the window's mouse position, through the
+  painted `Words` unit pieces that `picture_pieces` finds, or null),
+  `alt_tip_count` and `alt_tip`. Those two are how many tooltips gpui
+  built for the view since `set_document` and the last one's text,
+  counted by the tooltip's builder in a harness instance (gpui cannot be
+  asked whether one is up). `ext-doc-read {"until_alt_tips": N,
+  "within_ms": M}` asks again until N were built, for up to M ms (default
+  2000). The pump's `Done::retry` dispatches the same request again every
+  `RETRY_STEP` (25 ms) behind a timer, with the UI thread free, for up to
+  `RETRY_MAX` (5 s). A timeout is no error, and the reply adds
+  `waited_ms`. The region `ext-doc-picture:<n>` is the middle of the n-th
+  painted inline picture. The `issue 1998`
+  tests in `uiharness/cases/ext-doc-view.uit` drive it.
 
 ## Page inset and page background (#2003)
 
