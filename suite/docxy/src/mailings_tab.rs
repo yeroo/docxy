@@ -927,6 +927,11 @@ pub(crate) fn label_spec(
 impl Docxy {
     /// Dispatch a Mailings command.
     pub(crate) fn mail_act(&mut self, act: MailAct, window: &mut Window, cx: &mut Context<Self>) {
+        // Its native picker needs the window (#2194). It needs no list, so
+        // `mail_dispatch`'s pending-source question never comes first.
+        if act == MailAct::UseExistingList {
+            return self.pick_recipients(window, cx);
+        }
         if let Some(menu) = self.mail_dispatch(act) {
             let id = menu_id(menu);
             let at = split_menu_anchor(&self.probes.borrow(), id)
@@ -957,7 +962,11 @@ impl Docxy {
         }
         match act {
             MailAct::Menu(menu) => return Some(menu),
-            MailAct::UseExistingList => self.pick_recipients(),
+            // `mail_act` takes it first; `take_mail_outputs`' command after
+            // an attach needs a list, so it is never this one.
+            MailAct::UseExistingList => {
+                debug_assert!(false, "Use an Existing List goes through mail_act")
+            }
             MailAct::Unavailable => {}
             MailAct::Envelopes
             | MailAct::Labels
@@ -985,23 +994,30 @@ impl Docxy {
     /// Select Recipients ▸ Use an Existing List…: the native file picker,
     /// never in a harness instance (its modal loop stops the control pump):
     /// there the `mail-attach` verb hands the path in instead.
-    fn pick_recipients(&mut self) {
+    fn pick_recipients(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.harness {
             self.set_status(MAIL_ATTACH_HARNESS);
-            return;
+            return self.refocus(window, cx);
         }
-        let Some(path) = crate::macos_menu::native_modal(|| {
-            rfd::FileDialog::new()
-                .add_filter("Recipient list (*.csv, *.txt)", &["csv", "txt"])
-                .pick_file()
-        }) else {
-            return;
-        };
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            if let Err(e) = attach(tab, &path) {
-                tab.status = e.into();
-            }
-        }
+        let dialog =
+            rfd::FileDialog::new().add_filter("Recipient list (*.csv, *.txt)", &["csv", "txt"]);
+        let id = self.active_tab_id();
+        self.native_dialog(
+            dialog,
+            |d| d.pick_file(),
+            move |this, picked, window, cx| {
+                if let Some(path) = picked
+                    && this.active_tab_is(&id)
+                    && let Some(tab) = this.tabs.get_mut(this.active)
+                    && let Err(e) = attach(tab, &path)
+                {
+                    tab.status = e.into();
+                }
+                this.refocus(window, cx);
+            },
+            window,
+            cx,
+        );
     }
 
     /// Open what a mail-merge dialog left for the app: a merged or labels

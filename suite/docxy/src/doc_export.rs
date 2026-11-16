@@ -203,10 +203,28 @@ impl Docxy {
             self.set_status(DOC_SAVE_AS_HARNESS);
             return self.refocus(window, cx);
         }
-        match self.pick_doc_save_target(Some(format)) {
-            Some(target) => self.save_doc(Some(target), window, cx),
-            None => self.refocus(window, cx),
-        }
+        self.pick_doc_save_as(Some(format), window, cx);
+    }
+
+    /// Save As for the active document: ask for a file
+    /// ([`Self::pick_doc_save_target`]), then save there, or just refocus
+    /// on Cancel.
+    pub(crate) fn pick_doc_save_as(
+        &mut self,
+        preset: Option<SaveFormat>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.active_tab_id();
+        self.pick_doc_save_target(
+            preset,
+            move |this, picked, window, cx| match picked {
+                Some(target) if this.active_tab_is(&id) => this.save_doc(Some(target), window, cx),
+                _ => this.refocus(window, cx),
+            },
+            window,
+            cx,
+        );
     }
 
     /// Ask for a document Save As destination, `preset` (an Export page
@@ -214,7 +232,15 @@ impl Docxy {
     /// the personal templates folder, made if it is not there yet. The caller
     /// saves to it (the tab is rebound only once that save succeeds) and owns
     /// the cancellation status and any harness guard against native dialogs.
-    pub(crate) fn pick_doc_save_target(&self, preset: Option<SaveFormat>) -> Option<PathBuf> {
+    /// `then` gets the answer, `None` on Cancel, on Windows after this returns
+    /// ([`Docxy::native_dialog`], #2194).
+    pub(crate) fn pick_doc_save_target(
+        &mut self,
+        preset: Option<SaveFormat>,
+        then: impl FnOnce(&mut Self, Option<PathBuf>, &mut Window, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let tab = self.tabs.get(self.active);
         let name = tab
             .map(doc_save_as_name)
@@ -243,7 +269,13 @@ impl Docxy {
         // The name is written as picked (the dialog already asked about
         // overwriting it): any .html name saves a bundle, found by its content
         // when opened again.
-        crate::macos_menu::native_modal(|| dialog.set_file_name(name).save_file())
+        self.native_dialog(
+            dialog,
+            move |d| d.set_file_name(name).save_file(),
+            then,
+            window,
+            cx,
+        );
     }
 
     /// The Export page. `None` unless it is selected and the active tab is a

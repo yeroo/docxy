@@ -378,19 +378,27 @@ impl Docxy {
             self.set_status(PICTURES_HARNESS);
             return self.refocus(window, cx);
         }
-        let picked = crate::macos_menu::native_modal(|| {
-            rfd::FileDialog::new()
-                .set_title("Insert Picture")
-                .add_filter(
-                    "All Pictures (*.png, *.jpg, *.jpeg, *.gif, *.bmp)",
-                    &["png", "jpg", "jpeg", "gif", "bmp"],
-                )
-                .pick_file()
-        });
-        if let Some(path) = picked {
-            self.insert_hf_picture(&path, window, cx);
-        }
-        self.refocus(window, cx);
+        let dialog = rfd::FileDialog::new()
+            .set_title("Insert Picture")
+            .add_filter(
+                "All Pictures (*.png, *.jpg, *.jpeg, *.gif, *.bmp)",
+                &["png", "jpg", "jpeg", "gif", "bmp"],
+            );
+        let id = self.active_tab_id();
+        self.native_dialog(
+            dialog,
+            |d| d.pick_file(),
+            move |this, picked, window, cx| {
+                if let Some(path) = picked
+                    && this.active_tab_is(&id)
+                {
+                    this.insert_hf_picture(&path, window, cx);
+                }
+                this.refocus(window, cx);
+            },
+            window,
+            cx,
+        );
     }
 
     /// The picture at `path` into the open header or footer, refused in

@@ -1145,15 +1145,20 @@ mod tests {
     }
 
     /// Whether the text ending at `at` is inside the open parentheses of a
-    /// `native_modal(` call: walking back, every `(` that is not closed
-    /// again before `at` encloses it.
+    /// `native_modal(` call, or of a `native_dialog(` call, which runs its
+    /// `show` under `native_modal` (#2194): walking back, every `(` that is
+    /// not closed again before `at` encloses it.
     fn inside_native_modal(text: &str, at: usize) -> bool {
         let mut depth = 0usize;
         for (i, c) in text[..at].char_indices().rev() {
             match c {
                 ')' => depth += 1,
                 '(' if depth > 0 => depth -= 1,
-                '(' if text[..i].ends_with("native_modal") => return true,
+                '(' if text[..i].ends_with("native_modal")
+                    || text[..i].ends_with("native_dialog") =>
+                {
+                    return true;
+                }
                 _ => {}
             }
         }
@@ -1205,6 +1210,9 @@ mod tests {
             dialog_calls(branches),
             [(2, ".save_file()", true), (4, ".save_file()", false)]
         );
+        // The helper's `show` closure (#2194).
+        let helper = "self.native_dialog(\n    dialog,\n    |d| d.save_file(),\n    move |this, p, w, cx| this.done(p, w, cx),\n    window,\n    cx,\n);";
+        assert_eq!(dialog_calls(helper), [(3, ".save_file()", true)]);
         let message = "rfd::MessageDialog::new().show();";
         assert_eq!(dialog_calls(message), [(1, ".show()", false)]);
         assert!(dialog_calls("menu.show();").is_empty());
