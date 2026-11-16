@@ -5269,10 +5269,14 @@ document it). The engine handed that error, or a throttle, offline or refused to
   `SnoozeMessageReminder` tell a failed write as `Move` does
   (`Error("local mark-read of {id} ({read}) failed: {e}")`, `local flag of {id}
   ({flagged})`, `local categories of {id}`, `local reminder dismiss of {id}`,
-  `local reminder snooze of {id} to {utc}`), and queue the op regardless: Graph is the
-  source of truth, and the next delta brings its value.
+  `local reminder snooze of {id} to {utc}`), and still queue the op: Graph is the source
+  of truth, and the next delta brings its value. The enqueue runs on the same connection,
+  so a lock held through both waits refuses it too: `enqueue_and_drain` then tells a
+  second `Error` and the change is lost. A lock held a little past `BUSY_TIMEOUT` (the
+  5.6 s backfill page) is usually gone by the end of the enqueue's own wait.
 - lookxy drops the error (`let _ =`): the engine repeats the write on its own connection
-  when it handles the command lookxy sends next, so the row is only late. `control.rs`
+  when it handles the command lookxy sends next, so the row is only late, unless the
+  engine's store is refused too (told as above). `control.rs`
   `mark`/`flag` differ from `move_msg`, which fails the call and sends nothing: failing
   them would lose a change the engine still makes.
 - Not changed: `mark_sent`, `set_event_response`, `drop_op` and `bump_op_attempts` still

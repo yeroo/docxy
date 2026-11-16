@@ -3342,8 +3342,11 @@ impl Engine {
             // stored as now (`current_id`: a draft's reconciled `local:` id,
             // an id from before a move, #1896); the store writes match the
             // id only. A failed optimistic write (a busy store, #2209) is
-            // told, as `Move`'s is, and the op is queued regardless: Graph
-            // is the source of truth, and the next delta brings its value.
+            // told, as `Move`'s is, and the op is still queued: Graph is the
+            // source of truth, and the next delta brings its value. Unless
+            // the enqueue on this same connection fails too (a lock held
+            // through both waits): `enqueue_and_drain` then tells that as a
+            // second error and the change is lost.
             SyncCommand::MarkRead { id, read } => {
                 let id = self.store.current_id(&id).unwrap_or(id);
                 if let Err(e) = self.store.set_read(&id, read) {
@@ -5623,8 +5626,8 @@ impl Engine {
             )));
             return;
         }
-        // A failed local write is told and the op queued regardless, as
-        // `MarkRead`'s (#2209).
+        // A failed local write is told and the op still queued, unless the
+        // enqueue fails too, as `MarkRead`'s (#2209).
         if let Err(e) = self.store.dismiss_message_reminder(&id) {
             self.emit(SyncEvent::Error(format!(
                 "local reminder dismiss of {id} failed: {e}"
@@ -5652,8 +5655,8 @@ impl Engine {
             )));
             return;
         }
-        // A failed local write is told and the op queued regardless, as
-        // `MarkRead`'s (#2209).
+        // A failed local write is told and the op still queued, unless the
+        // enqueue fails too, as `MarkRead`'s (#2209).
         if let Err(e) = self.store.snooze_message_reminder(&id, &utc) {
             self.emit(SyncEvent::Error(format!(
                 "local reminder snooze of {id} to {utc} failed: {e}"

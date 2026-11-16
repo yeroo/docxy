@@ -301,7 +301,8 @@ fn mark(app: &mut App, args: &Json) -> Result<Json, String> {
         .ok_or("mail.mark needs a boolean 'read'")?;
     // Unlike `move_msg`, a failed store write (a busy store, #2209) does not
     // fail the call: the engine repeats it when it handles the command sent
-    // below, so failing here would only lose the change.
+    // below (and tells an error if its own store is refused too), so failing
+    // here would only lose the change.
     let _ = app.store.set_read(&id, read);
     app.reload_messages();
     let _ = app.sync.cmd_tx.send(SyncCommand::MarkRead {

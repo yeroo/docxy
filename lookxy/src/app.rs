@@ -3084,7 +3084,8 @@ impl App {
     /// A failed store write (a busy store, #2209) is dropped here and in the
     /// other optimistic writes (`toggle_flag`, categories): the engine
     /// repeats it on its own connection when it handles the command, so the
-    /// row is only late.
+    /// row is only late, unless the engine's store is refused too (it then
+    /// tells that as a `SyncEvent::Error`).
     pub fn mark_read(&mut self, read: bool) {
         if let Some(ids) = self.threaded_target_ids() {
             for id in &ids {
