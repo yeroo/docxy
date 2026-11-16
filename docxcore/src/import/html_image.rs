@@ -24,6 +24,9 @@ pub type ImageResolver<'r> = dyn FnMut(&str, usize) -> Option<Vec<u8>> + 'r;
 /// The most distinct srcs an import asks its resolver for; later ones are
 /// placeholders.
 pub const MAX_IMAGES: usize = 1000;
+/// The most distinct URLs an import's pictures link to (#1999); a picture
+/// linked to a later one is a plain picture.
+pub const MAX_PICTURE_LINKS: usize = 1000;
 /// The most bytes one image may hold.
 pub const MAX_IMAGE_BYTES: usize = 64 << 20;
 /// The most media bytes one import keeps (each distinct image once).
@@ -120,12 +123,14 @@ impl<'a> Images<'a> {
 
     /// The import-local rid of a picture link to `url` (#1999): one per
     /// distinct URL, made on first use (kept twice: the list and its
-    /// index). `None` when the budget has no room.
+    /// index). `None` past [`MAX_PICTURE_LINKS`] URLs or when the budget has
+    /// no room.
     pub(crate) fn link_rid(&mut self, url: &str, budget: &Budget) -> Option<String> {
         if let Some(&i) = self.link_index.get(url) {
             return Some(self.links[i].rid.clone());
         }
-        if !budget.keep::<ImportedLink>(2 * url.len() + 32) {
+        if self.links.len() >= MAX_PICTURE_LINKS || !budget.keep::<ImportedLink>(2 * url.len() + 32)
+        {
             return None;
         }
         let index = self.links.len();

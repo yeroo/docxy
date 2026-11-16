@@ -66,7 +66,7 @@
 //! | html attributes | one scan a tag | the nineteen read (`style class id align color face size width bgcolor border cellpadding cellspacing colspan rowspan valign src alt height href`) copied, first of a name only |
 //! | html `link_of` (#1879) | an `a`'s `href`, once per look computed | O(href), refused unread past 2 × `MAX_HREF`; within the attribute scan's cost |
 //! | html `<img>` (#1880) | its look; the picture run | as an element's look, without being pushed; the run's XML built (alt ≤ `MAX_ALT` 1024 chars) |
-//! | html `<img>` in a link (#1999) | its URL, once per distinct URL | built (twice the URL: the list and its index) |
+//! | html `<img>` in a link (#1999) | its URL, once per distinct URL | ≤ `MAX_PICTURE_LINKS` (1000) URLs, a later one's picture unlinked; each built (twice the URL: the list and its index); their relationships added in one pass |
 //! | `html_image::decode_data_uri` | a `data:` src: counted, then percent- and base64-decoded | work (src/16), up front; refused unless its counted size fits the image's limit; the bytes decoded |
 //! | `ImageResolver` answer | the bytes another src resolves to | the resolver is told the limit (room, `MAX_IMAGE_BYTES` 64 MiB, what `MAX_MEDIA_BYTES` 128 MiB leaves); a longer answer dropped; decoded |
 //! | resolver calls, src cache | one call per distinct src | ≤ `MAX_IMAGES` (1000) calls; each cached src built (its length) |

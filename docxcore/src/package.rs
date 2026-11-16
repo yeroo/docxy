@@ -2770,12 +2770,24 @@ impl Package {
     }
 
     /// Add an external hyperlink relationship to `url` to `part`'s
-    /// relationships (#1999: a picture's `a:hlinkClick` names it), making the
-    /// relationships part, and `[Content_Types].xml`'s `rels` Default, when
-    /// missing. Its id is a fresh `rIdN`. `None`, with nothing changed, when
-    /// `part` is missing or its relationships cannot be read or extended.
+    /// relationships (#1999: a picture's `a:hlinkClick` names it), as
+    /// [`Package::add_part_hyperlinks`] does for one.
     pub fn add_part_hyperlink(&mut self, part: &str, url: &str) -> Option<String> {
+        self.add_part_hyperlinks(part, &[url])?.pop()
+    }
+
+    /// Add an external hyperlink relationship to each of `urls`, in order, to
+    /// `part`'s relationships (#1999), making the relationships part, and
+    /// `[Content_Types].xml`'s `rels` Default, when missing. Each id is a
+    /// fresh `rIdN`, given back in `urls`' order. The relationships are read
+    /// and written once, whatever the count. `None`, with nothing changed,
+    /// when `part` is missing or its relationships cannot be read or
+    /// extended.
+    pub fn add_part_hyperlinks(&mut self, part: &str, urls: &[&str]) -> Option<Vec<String>> {
         self.part(part)?;
+        if urls.is_empty() {
+            return Some(Vec::new());
+        }
         let rels_name = part_rels_name(part)?;
         let existing = self.part(&rels_name);
         let rels_text = match existing {
@@ -2786,16 +2798,22 @@ impl Package {
         };
         let rels = parse_rels_xml(&rels_text);
         let mut num = next_rid_num(&rels_text);
-        // `next_rid_num` only sees `Id="rIdN"`; skip ids spelled otherwise.
-        while rels.target(&format!("rId{num}")).is_some() {
+        let mut rids = Vec::with_capacity(urls.len());
+        let mut added = String::new();
+        for url in urls {
+            // `next_rid_num` only sees `Id="rIdN"`; skip ids spelled otherwise.
+            while rels.target(&format!("rId{num}")).is_some() {
+                num += 1;
+            }
+            let rid = format!("rId{num}");
             num += 1;
+            added.push_str(&format!(
+                "<Relationship Id=\"{rid}\" Type=\"{HYPERLINK_REL}\" Target=\"{}\" TargetMode=\"External\"/>",
+                esc_xml_attr(url)
+            ));
+            rids.push(rid);
         }
-        let rid = format!("rId{num}");
-        let rel = format!(
-            "<Relationship Id=\"{rid}\" Type=\"{HYPERLINK_REL}\" Target=\"{}\" TargetMode=\"External\"/>",
-            esc_xml_attr(url)
-        );
-        let updated = append_relationships(&rels_text, &rel)?;
+        let updated = append_relationships(&rels_text, &added)?;
         let (rels, content_types) = match existing {
             Some(bytes) => (encode_like(bytes, &updated), None),
             None => (updated.into_bytes(), self.content_types_with_rels_default()),
@@ -2805,7 +2823,7 @@ impl Package {
             rels,
             content_types,
         });
-        Some(rid)
+        Some(rids)
     }
 
     /// N for a new `word/media/imageN.*` part: one past the largest in use,
@@ -8527,6 +8545,41 @@ mod tests {
             pkg.document_rels().target(&rid),
             Some("https://a.example/?x=1&y=2")
         );
+    }
+
+    #[test]
+    fn add_part_hyperlinks_mints_every_id_in_one_pass_1999() {
+        let urls: Vec<String> = (0..50).map(|i| format!("https://x.test/{i}")).collect();
+        let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+        // With the document's rels, whose ids it skips.
+        let mut pkg = new_package(Document::default());
+        let before = pkg.document_rels();
+        let rids = pkg.add_part_hyperlinks("word/document.xml", &refs).unwrap();
+        assert_eq!(rids.len(), 50);
+        let distinct: std::collections::HashSet<_> = rids.iter().collect();
+        assert_eq!(distinct.len(), 50);
+        let rels = pkg.document_rels();
+        assert_eq!(rels.len(), before.len() + 50);
+        for (rid, url) in rids.iter().zip(&urls) {
+            assert!(before.target(rid).is_none(), "{rid} is fresh");
+            assert_eq!(rels.external_target(rid), Some(url.as_str()));
+        }
+        // Without rels: made once, holding them all.
+        pkg.parts
+            .push(("word/header1.xml".to_string(), b"<w:hdr/>".to_vec()));
+        let rids = pkg.add_part_hyperlinks("word/header1.xml", &refs).unwrap();
+        assert_eq!(rids.first().map(String::as_str), Some("rId1"));
+        assert_eq!(rids.last().map(String::as_str), Some("rId50"));
+        let rels = parse_rels_xml(&pkg.part_text("word/_rels/header1.xml.rels").unwrap());
+        assert_eq!(rels.len(), 50);
+        assert_eq!(rels.external_target("rId50"), Some("https://x.test/49"));
+        // None asked: nothing changed.
+        let before = pkg.clone();
+        assert_eq!(
+            pkg.add_part_hyperlinks("word/header1.xml", &[]),
+            Some(vec![])
+        );
+        assert_eq!(pkg.parts, before.parts);
     }
 
     #[test]

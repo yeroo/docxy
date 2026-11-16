@@ -146,9 +146,11 @@ impl HtmlImport {
                 rids.insert(m.rid, rid);
             }
         }
-        for l in links {
-            if let Some(rid) = pkg.add_part_hyperlink("word/document.xml", &l.url) {
-                rids.insert(l.rid, rid);
+        // Every link's relationship in one pass over the rels (r1).
+        let urls: Vec<&str> = links.iter().map(|l| l.url.as_str()).collect();
+        if let Some(new) = pkg.add_part_hyperlinks("word/document.xml", &urls) {
+            for (l, rid) in links.iter().zip(new) {
+                rids.insert(l.rid.clone(), rid);
             }
         }
         rename_rids(&mut document.body, &rids);
@@ -6114,6 +6116,34 @@ mod link_tests {
                 std::slice::from_ref(&raw),
                 "{href}"
             );
+        }
+    }
+
+    #[test]
+    fn picture_links_past_the_cap_leave_plain_pictures_1999() {
+        use crate::import::html_image::MAX_PICTURE_LINKS;
+        let n = MAX_PICTURE_LINKS + 5;
+        let mut page = String::new();
+        for i in 0..n {
+            page.push_str(&format!(
+                "<p><a href=https://x.test/{i}><img src=missing.png width=1 height=1></a></p>"
+            ));
+        }
+        let mut none = |_: &str, _: usize| None;
+        let got = import_html_with(page.as_bytes(), &mut none).unwrap();
+        assert_eq!(got.links.len(), MAX_PICTURE_LINKS);
+        let pkg = got.package();
+        let rels = pkg.document_rels();
+        let pics = all_pictures(&pkg.document);
+        assert_eq!(pics.len(), n, "every picture imports");
+        for (i, r) in pics.iter().enumerate() {
+            let url = crate::image::inline_click_link(r).and_then(|rid| rels.external_target(&rid));
+            if i < MAX_PICTURE_LINKS {
+                assert_eq!(url.map(str::to_string), Some(format!("https://x.test/{i}")));
+            } else {
+                assert_eq!(url, None, "past the cap a plain picture");
+                assert!(!r.contains("hlinkClick"));
+            }
         }
     }
 

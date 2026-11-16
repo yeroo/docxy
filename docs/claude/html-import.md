@@ -403,10 +403,14 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   `Inline::Hyperlink`s: wrapping the drawing in `w:hyperlink` would put a
   picture in `Hyperlink.runs`, which every link consumer reads as text.
 - The `r:id` is import-local, `rIdHtmlLink{n}`, one per distinct URL
-  (`Images::link_rid`, charged to the budget), and `HtmlImport::links`
+  (`Images::link_rid`, charged to the budget), at most
+  `MAX_PICTURE_LINKS` (1000) URLs: a picture linked to a later one is a
+  plain picture (sized placeholders never reach the resolver, so
+  `MAX_IMAGES` does not bound them). `HtmlImport::links`
   (`ImportedLink { rid, url }`) lists them. `HtmlImport::package` adds an
-  external hyperlink relationship to `word/document.xml` for each
-  (`Package::add_part_hyperlink`) and renames the pictures' `r:id`s with
+  external hyperlink relationship to `word/document.xml` for each, in one
+  pass over the rels (`Package::add_part_hyperlinks`: one call a link
+  would re-read the growing part each time, quadratic, r1) and renames the pictures' `r:id`s with
   the media's in one map (`rename_rids`: `image::replace_click_link` beside
   `replace_inline_embeds`). A caller that builds its own package from
   `media` must map `links` too, or its pictures name relationships it
@@ -421,7 +425,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   carrying the link's relationship (`docs/claude/suite-document.md`).
 - Tests: `link_tests` in `import/html.rs` (`…_1999`), the `with_click_link`
   / `inline_click_link` / `replace_click_link` tests in `image.rs`,
-  `add_part_hyperlink_…` in `package.rs`.
+  `add_part_hyperlink…` in `package.rs`.
 
 ## HTML import page margins (#1928)
 
