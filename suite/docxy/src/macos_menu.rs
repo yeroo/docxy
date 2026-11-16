@@ -1145,17 +1145,20 @@ mod tests {
     }
 
     /// Whether the text ending at `at` is inside the open parentheses of a
-    /// `native_modal(` call, or of a `native_dialog(` call, which runs its
-    /// `show` under `native_modal` (#2194): walking back, every `(` that is
-    /// not closed again before `at` encloses it.
+    /// `native_modal(` call, or in the `show` argument (the second) of a
+    /// `native_dialog(` call, which runs it under `native_modal` (#2194):
+    /// walking back, every `(` that is not closed again before `at` encloses
+    /// it. A dialog shown from `native_dialog`'s `dialog` or `then` argument
+    /// runs inside the listener or the answer, so it is not wrapped.
     fn inside_native_modal(text: &str, at: usize) -> bool {
         let mut depth = 0usize;
         for (i, c) in text[..at].char_indices().rev() {
             match c {
                 ')' => depth += 1,
                 '(' if depth > 0 => depth -= 1,
-                '(' if text[..i].ends_with("native_modal")
-                    || text[..i].ends_with("native_dialog") =>
+                '(' if called(text, i, "native_modal") => return true,
+                '(' if called(text, i, "native_dialog")
+                    && argument_index(&text[i + 1..at]) == 1 =>
                 {
                     return true;
                 }
@@ -1163,6 +1166,33 @@ mod tests {
             }
         }
         false
+    }
+
+    /// Whether the `(` at `open` follows a call of `name`, as a whole
+    /// identifier (`x.name(`, `a::name(`), not one that only ends in it.
+    fn called(text: &str, open: usize, name: &str) -> bool {
+        text[..open].strip_suffix(name).is_some_and(|before| {
+            !before
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+    }
+
+    /// Which argument `args` (a call's text from just after its `(`) ends
+    /// in: the commas outside any nested `()`, `[]` or `{}` before its end.
+    fn argument_index(args: &str) -> usize {
+        let mut depth = 0usize;
+        let mut commas = 0;
+        for c in args.chars() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => commas += 1,
+                _ => {}
+            }
+        }
+        commas
     }
 
     /// The synchronous rfd dialog calls in `text`, as (line, call, whether
@@ -1210,9 +1240,24 @@ mod tests {
             dialog_calls(branches),
             [(2, ".save_file()", true), (4, ".save_file()", false)]
         );
-        // The helper's `show` closure (#2194).
+        // The helper's `show` closure (#2194), and only that argument: a
+        // dialog shown from its `then` or `dialog` argument runs inside the
+        // answer or the listener.
         let helper = "self.native_dialog(\n    dialog,\n    |d| d.save_file(),\n    move |this, p, w, cx| this.done(p, w, cx),\n    window,\n    cx,\n);";
         assert_eq!(dialog_calls(helper), [(3, ".save_file()", true)]);
+        let in_then = "self.native_dialog(\n    dialog,\n    |d| d.save_file(),\n    move |this, p, w, cx| {\n        rfd::FileDialog::new().pick_file();\n    },\n    window,\n    cx,\n);";
+        assert_eq!(
+            dialog_calls(in_then),
+            [(3, ".save_file()", true), (5, ".pick_file()", false)]
+        );
+        let in_dialog = "self.native_dialog(rfd::FileDialog::new().pick_file(), |d| d, |_, _, _, _| {}, w, cx);";
+        assert_eq!(dialog_calls(in_dialog), [(1, ".pick_file()", false)]);
+        let nested = "let d = rfd::MessageDialog::new();\nself.native_dialog(d, |d| matches!(d.show(), Yes), |_, _, _, _| {}, w, cx);";
+        assert_eq!(dialog_calls(nested), [(2, ".show()", true)]);
+        let other_name = "my_native_dialog(d, |d| d.save_file());";
+        assert_eq!(dialog_calls(other_name), [(1, ".save_file()", false)]);
+        let other_modal = "not_native_modal(|| d.save_file());";
+        assert_eq!(dialog_calls(other_modal), [(1, ".save_file()", false)]);
         let message = "rfd::MessageDialog::new().show();";
         assert_eq!(dialog_calls(message), [(1, ".show()", false)]);
         assert!(dialog_calls("menu.show();").is_empty());

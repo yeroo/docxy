@@ -977,12 +977,14 @@ impl Docxy {
                 // on Windows that is after this returns (#2194).
                 let result = Rc::new(Cell::new(None));
                 let answer = result.clone();
+                let id = self.active_tab_id();
                 self.pick_doc_save_target(
                     None,
                     move |this, picked, window, cx| {
                         // Cancelled: back to the prompt.
                         if let Some(path) = picked
                             && this.active == i
+                            && this.active_tab_is(&id)
                         {
                             let saved =
                                 this.close_prompt_save(i, PromptSave::To(path), quit, window, cx);
