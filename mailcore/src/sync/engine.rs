@@ -260,7 +260,11 @@ pub enum SyncCommand {
     /// an address, at most `top` (`1..=GROUP_MEMBERS_MAX`). Answers with
     /// [`SyncEvent::GroupMembers`], or [`SyncEvent::GroupMembersUnavailable`]
     /// (its `forbidden` set for a 403: no `GroupMember.Read*` for this token
-    /// or tenant), never a [`SyncEvent::Error`]. Nothing is stored. Served
+    /// or tenant), never a [`SyncEvent::Error`]. Members' names and
+    /// addresses also need read access to their types (`User.ReadBasic.All`
+    /// for users, `OrgContact.Read.All` for org contacts, or
+    /// `Directory.Read.All`): without it they come back unreadable and are
+    /// counted in `skipped`, not kept. Nothing is stored. Served
     /// ahead of a running pass, as `SearchDirectory` is, and tried even
     /// during a back-off.
     FetchGroupMembers { group_id: String, top: usize },
@@ -1204,11 +1208,15 @@ pub enum SyncEvent {
     /// A group's members, the answer to [`SyncCommand::FetchGroupMembers`]
     /// (#2058), with the group id it was asked. No members is an empty
     /// `members`; `truncated` says members were left unread (past `top`, or
-    /// at the page cap).
+    /// at the page cap); `skipped` counts the members read but not kept
+    /// (another type, or no address: an unreadable member is one), so an
+    /// empty `members` with a non-zero `skipped` is not an empty group
+    /// (`GroupMemberList::skipped`).
     GroupMembers {
         group_id: String,
         members: Vec<GroupMember>,
         truncated: bool,
+        skipped: usize,
     },
     /// [`SyncCommand::FetchGroupMembers`] could not read the members
     /// (#2058): `forbidden` for a 403 (asking again will not help),
@@ -7975,6 +7983,7 @@ impl Engine {
                     group_id,
                     members: list.members,
                     truncated: list.truncated,
+                    skipped: list.skipped,
                 });
                 false
             }
@@ -35592,6 +35601,8 @@ mod tests {
                                     },
                                 ],
                                 truncated: false,
+                                // The device.
+                                skipped: 1,
                             }
                         );
                         stop(handle);
@@ -35611,6 +35622,7 @@ mod tests {
                                 group_id: "G1".into(),
                                 members: vec![],
                                 truncated: false,
+                                skipped: 0,
                             }
                         );
                         stop(handle);

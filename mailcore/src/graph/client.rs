@@ -2665,9 +2665,15 @@ impl GraphClient {
     /// clamped to `1..=`[`GROUP_MEMBERS_MAX`], asked `min(top, 999)` a page;
     /// pages are followed until none is left, `top` members are kept, or
     /// [`GROUP_MEMBER_PAGES_MAX`] pages were read. `truncated` says members
-    /// were left unread (`GroupMemberList`). Any page's failure is an `Err`,
-    /// never a partial list; a group that is gone is `NotFound`. Requires
-    /// `GroupMember.ReadBasic.All` or a wider directory scope.
+    /// were left unread, `skipped` how many read were not kept
+    /// (`GroupMemberList`). Any page's failure is an `Err`, never a partial
+    /// list; a group that is gone is `NotFound`. Requires
+    /// `GroupMember.ReadBasic.All` (or a wider group scope) to list the
+    /// members, and read access to each member's type for its name and
+    /// address: `User.ReadBasic.All` for users, `OrgContact.Read.All` for
+    /// org contacts, or `Directory.Read.All` for all. Without it Graph still
+    /// answers 200, each such member with its type and `id` only, and they
+    /// are all `skipped`.
     pub fn group_members(&self, group_id: &str, top: usize) -> Result<GroupMemberList, GraphError> {
         let top = top.clamp(1, GROUP_MEMBERS_MAX);
         let mut target = format!(
@@ -2675,7 +2681,7 @@ impl GraphClient {
             encode_path_segment(group_id),
             top.min(DIRECTORY_TOP_MAX)
         );
-        let mut members = Vec::new();
+        let mut list = GroupMemberList::default();
         let mut pages = 0;
         loop {
             let resp = self.send(
@@ -2686,30 +2692,23 @@ impl GraphClient {
             )?;
             let v = parse_body(resp)?;
             pages += 1;
-            members.extend(
-                value_array(&v, "value")?
-                    .iter()
-                    .filter_map(GroupMember::from_json),
-            );
-            if members.len() > top {
-                members.truncate(top);
-                return Ok(GroupMemberList {
-                    members,
-                    truncated: true,
-                });
+            for item in value_array(&v, "value")? {
+                match GroupMember::from_json(item) {
+                    // One past `top`: it and the rest of the page are left
+                    // unread, not skipped.
+                    Some(_) if list.members.len() == top => {
+                        list.truncated = true;
+                        return Ok(list);
+                    }
+                    Some(m) => list.members.push(m),
+                    None => list.skipped += 1,
+                }
             }
             match v.get("@odata.nextLink").and_then(Value::as_str) {
-                None => {
-                    return Ok(GroupMemberList {
-                        members,
-                        truncated: false,
-                    });
-                }
-                Some(_) if members.len() == top || pages >= GROUP_MEMBER_PAGES_MAX => {
-                    return Ok(GroupMemberList {
-                        members,
-                        truncated: true,
-                    });
+                None => return Ok(list),
+                Some(_) if list.members.len() == top || pages >= GROUP_MEMBER_PAGES_MAX => {
+                    list.truncated = true;
+                    return Ok(list);
                 }
                 Some(next) => target = next.to_string(),
             }
@@ -4465,6 +4464,8 @@ mod tests {
         let c = GraphClient::new(&srv.base_url, "AT");
         let got = c.group_members("G1", 100).unwrap();
         assert!(!got.truncated);
+        // U3 (no address), x (unreadable), G3 and C2 (no mail), D1 (a device).
+        assert_eq!(got.skipped, 5);
         assert_eq!(
             got.members,
             vec![
@@ -4501,6 +4502,35 @@ mod tests {
                     department: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn group_members_unreadable_members_are_counted_as_skipped() {
+        // Without `User.ReadBasic.All` Graph answers 200 with each user member
+        // as its type and id only: no member kept, every one counted, so a
+        // client can tell it from an empty group. Counted across pages.
+        let unreadable = |id: &str| {
+            format!(
+                r##"{{"@odata.type":"#microsoft.graph.user","id":"{id}","displayName":null,"mail":null}}"##
+            )
+        };
+        let srv = FakeServer::start(vec![
+            members_page("/groups/G1/members?$skiptoken=P2", &unreadable("U3"), None),
+            members_page(
+                "/groups/G1/members?",
+                &[unreadable("U1"), unreadable("U2")].join(","),
+                Some("/groups/G1/members?$skiptoken=P2"),
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.group_members("G1", 100).unwrap(),
+            GroupMemberList {
+                members: vec![],
+                truncated: false,
+                skipped: 3,
+            }
         );
     }
 
@@ -4559,7 +4589,26 @@ mod tests {
         let got = c.group_members("G1", 3).unwrap();
         assert_eq!(member_ids(&got), ["U0", "U1", "U2"]);
         assert!(got.truncated);
+        assert_eq!(got.skipped, 0, "the overflow is truncated, not skipped");
         assert_eq!(srv.requests().len(), 1);
+
+        // A skipped member before `top` counts; the members past `top`, kept
+        // or not, do not.
+        let device = r##"{"@odata.type":"#microsoft.graph.device","id":"D1"}"##;
+        let page = [
+            user_member(0),
+            device.to_string(),
+            user_member(1),
+            user_member(2),
+            device.to_string(),
+            user_member(3),
+        ]
+        .join(",");
+        let srv = FakeServer::start(vec![members_page("/groups/G1/members?", &page, None)]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let got = c.group_members("G1", 2).unwrap();
+        assert_eq!(member_ids(&got), ["U0", "U1"]);
+        assert_eq!((got.truncated, got.skipped), (true, 1));
 
         // Past `top` on the last page: truncated though no nextLink is left.
         let srv = FakeServer::start(vec![members_page(
@@ -4596,6 +4645,18 @@ mod tests {
         let got = c.group_members("G1", 3).unwrap();
         assert_eq!(member_ids(&got), ["U0", "U1", "U2"]);
         assert!(!got.truncated);
+
+        // A skipped member after the `top`-th is read, not left: counted,
+        // still not truncated.
+        let page = format!(
+            r##"{},{{"@odata.type":"#microsoft.graph.device","id":"D1"}}"##,
+            user_members(0..3)
+        );
+        let srv = FakeServer::start(vec![members_page("/groups/G1/members?", &page, None)]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let got = c.group_members("G1", 3).unwrap();
+        assert_eq!(member_ids(&got), ["U0", "U1", "U2"]);
+        assert_eq!((got.truncated, got.skipped), (false, 1));
     }
 
     #[test]
@@ -4611,6 +4672,8 @@ mod tests {
         let got = c.group_members("G1", 100).unwrap();
         assert!(got.members.is_empty());
         assert!(got.truncated);
+        // One device a page, over the pages read only.
+        assert_eq!(got.skipped, GROUP_MEMBER_PAGES_MAX);
         assert_eq!(srv.requests().len(), GROUP_MEMBER_PAGES_MAX);
         assert_eq!(GROUP_MEMBERS_MAX, 9_990);
     }

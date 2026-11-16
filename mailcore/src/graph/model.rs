@@ -266,6 +266,14 @@ pub struct GroupMemberList {
     /// `top`, or an `@odata.nextLink` was left unfollowed (at `top` or at
     /// the page cap).
     pub truncated: bool,
+    /// How many members Graph returned on the pages read that were not
+    /// kept, for any reason: another type, no `id`, no address. A member
+    /// the token may not read (no `User.ReadBasic.All` for users) comes back
+    /// with its type and `id` only, so a group whose members are all
+    /// unreadable is an empty `members` with a non-zero `skipped`, not an
+    /// empty group. The member that ran past `top` and the rest of its page
+    /// are not counted: that is `truncated`.
+    pub skipped: usize,
 }
 
 /// Whether a directory `userPrincipalName` can stand in for a missing `mail`

@@ -2460,6 +2460,10 @@ so the user's other devices follow.
   a page's kept members ran past `top` (cut to `top`), or a `nextLink` was left (at `top` or the
   cap). Exactly `top` on a last page without a `nextLink` is not truncated. Any page's failure is
   an `Err`, never a partial list; a 404 (the group gone) is `NotFound`.
+- `GroupMemberList::skipped` (and `SyncEvent::GroupMembers`'s) counts the members Graph returned on
+  the pages read that were not kept, for any reason; the member that ran past `top` and the rest
+  of its page are `truncated`, not skipped. It tells a client "N members it could not read" from
+  an empty group (r1-m1).
 - `GroupMember { kind, id, name, address, job_title, department }`, `MemberKind` from
   `@odata.type`: `#microsoft.graph.user` → `User`, its address `DirectoryUser`'s rule (`mail`, else
   an address-like UPN; one helper, `user_address`); `#microsoft.graph.group` → `Group` and
@@ -2470,7 +2474,7 @@ so the user's other devices follow.
   recipient. An org contact is a kind of its own: an external address is a common list member.
 - `SyncCommand::SearchGroups { query, top }` answers `SyncEvent::GroupResults { query, groups }` or
   `GroupsUnavailable { query, forbidden, reason }`; `SyncCommand::FetchGroupMembers { group_id,
-  top }` answers `GroupMembers { group_id, members, truncated }` or `GroupMembersUnavailable {
+  top }` answers `GroupMembers { group_id, members, truncated, skipped }` or `GroupMembersUnavailable {
   group_id, forbidden, reason }`. Each echoes what was asked; no match is an empty list; never
   `SyncEvent::Error`. `forbidden` is a 403 only. Signed out ("not signed in"), a blank query
   ("empty query") or group id ("empty group id") sends no request. Otherwise as #1942: auth,
@@ -2478,6 +2482,10 @@ so the user's other devices follow.
   back-off, not kept at a shutdown. Nothing is stored.
 - Scopes are the client's: `GroupMember.Read.All` (or `GroupMember.ReadBasic.All` for members,
   or `Group.Read.All`, `Directory.Read.All`); `AuthConfig::default()` asks for none of them.
+  A group scope lists the members, but their names and addresses need read access to each
+  member's type too: `User.ReadBasic.All` for users, `OrgContact.Read.All` for org contacts, or
+  `Directory.Read.All` for all. Without it Graph still answers 200, each such member with only its
+  `@odata.type` and `id`: every one is skipped and counted in `skipped`.
 - lookxy never sends either command; its `on_sync_event` ignores the four events.
 
 ## Message rows by id (#2053)
