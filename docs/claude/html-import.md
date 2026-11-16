@@ -395,11 +395,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   (`html_table::page_section`, set in `import_html_within` after
   `Builder::finish`, so every caller gets it: `import_html`,
   `import_html_with`, the converting child): US Letter written out
-  (`w:pgSz` 12240 x 15840, so no reader's locale makes it A4) and
-  Outlook-like margins, 15 px (`PAGE_MARGIN_TWIPS`, 225 twips) on every
-  side instead of Word's 1": `w:pgMar` with all seven attributes, header and
-  footer 225, gutter 0. A browser's body margin is 8 px; Outlook's reading
-  pane is about 10-15.
+  (`w:pgSz` 12240 x 15840, so no reader's locale makes it A4) and a narrow
+  page margin, 15 px (`PAGE_MARGIN_TWIPS`, 225 twips) on every side
+  instead of Word's 1": `w:pgMar` with all seven attributes, header and
+  footer 225, gutter 0. That is the printed page's margin, shown in Print
+  Layout. A browser's body margin is 8 px. The embedded view's
+  Outlook-like flow margin is the host's inset instead, about 20 px from
+  the pane edge as measured in #1979 (#1987, `docs/claude/suite-extensions.md`).
 - `BODY_TWIPS` is that page's body, `PAGE_W_TWIPS - 2 * PAGE_MARGIN_TWIPS`
   (11790, 786 px): outermost tables, wide pictures and fixed-width
   centring are laid out in exactly the body the section gives, so a 600 px
@@ -409,9 +411,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
 - Where it shows: Print Layout (`final_page_geom`). A Web Page still opens
   in Web Layout (`page_view` is off by default), which keeps its fixed
   48 / 28 px padding and never reads page margins (#1895,
-  `docs/claude/docx-editing.md`). `ext::DocView` defaults to the same
-  padding, which its host can set (`DocView::set_page_inset`, #2003), and
-  it never reads page margins either.
+  `docs/claude/docx-editing.md`). `ext::DocView`'s Web Layout defaults to
+  the same padding, which its host can set (`DocView::set_page_inset`,
+  #2003), and never reads page margins either; its Print Layout (#1888)
+  draws each section's own.
   `uiharness/cases/html-page-margins.uit` reads the ruler's insets after
   View > Print Layout.
 - A later margin change (Page Setup > Margins via `apply_page_setup`,
