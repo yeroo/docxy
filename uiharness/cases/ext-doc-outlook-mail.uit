@@ -8,9 +8,11 @@
 # view; `ext-doc-layout` reads what the last frame painted: positions in
 # px from the text column's left and the first paragraph's top. Font
 # independent: positions come from indents and line heights, colours from
-# the model. The last test opens the same mail (`fixtures/outlook-mail.html`)
+# the model. The third test opens the same mail (`fixtures/outlook-mail.html`)
 # in a document tab, whose Web Layout draws it the same way (`doc`'s
-# `flow.layout` reads it as `ext-doc-layout` does).
+# `flow.layout` reads it as `ext-doc-layout` does). The last (#1987) sets
+# the host's Outlook-like 20 px page inset and finds the text 20 px from
+# the pane edge.
 ext fixture
 
 test issue 1986 an imported Outlook mail draws its lines, empty lines and list numbers as a browser does, light and dark
@@ -173,3 +175,45 @@ test issue 1986 the same mail opened as a web page draws in a document tab's web
   assert reply.flow.layout.paragraphs.9.top is 162
   call theme-set {"theme":"auto"}
   call real-key {"key":"ctrl+w"}
+
+test issue 1987 the host's Outlook-like 20 px inset puts the mail's text 20 px from the pane edge, its list at the same browser indents
+  # The margin is the host's (`DocView::set_page_inset`, #2003): the
+  # view never reads the import's 15 px section margins. `column_left` is
+  # the text column's left in the view, and the layout's x values are
+  # relative to it, so text at x 0 sits 20 px from the pane edge.
+  call theme-set {"theme":"light"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-load {"html": "<body><div style='direction:ltr; font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0)'>Hi</div><div style='direction:ltr; font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0)'>Line two</div><ol start='1' style='direction:ltr; margin-top:0px; margin-bottom:0px; list-style-type:decimal'><li style='font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0); margin-top:0px; margin-bottom:0px'><div role='presentation'>Item one</div></li><li style='font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0); margin-top:0px; margin-bottom:0px'><div role='presentation'>Item two</div></li><li style='font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0); margin-top:0px; margin-bottom:0px'><div role='presentation'>Item three</div><div role='presentation'>More text that belongs to item three</div></li></ol><div style='margin-top:0px; margin-bottom:0px; direction:ltr; font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0)'><br></div><div style='margin-top:0px; margin-bottom:0px; direction:ltr; font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0)'>Closing line</div><div style='direction:ltr; font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0)'><br></div><div style='direction:ltr; font-family:Aptos,Arial,Helvetica,sans-serif; font-size:12pt; color:rgb(0,0,0)'>Name</div></body>"}
+  assert reply.blocks is 11
+  call ext-doc-set {"page_inset":{"top":12,"right":20,"bottom":12,"left":20}}
+  assert reply.page_inset.left is 20
+  shot window
+  call ext-doc-read {}
+  assert reply.page_inset.top is 12
+  assert reply.page_inset.right is 20
+  assert reply.page_inset.left is 20
+  assert reply.column_left is 20
+  call ext-doc-layout {}
+  assert reply.painted is true
+  assert reply.paragraphs.0.top is 0
+  assert reply.paragraphs.0.lines.0.text is Hi
+  assert reply.paragraphs.0.lines.0.x is 0
+  assert reply.paragraphs.2.marker.text is 1.
+  assert reply.paragraphs.2.marker.x is 22
+  assert reply.paragraphs.2.text_x is 40
+  assert reply.paragraphs.5.text_x is 40
+  # Unset, the view's default 48 px comes back for the same mail.
+  call ext-doc-set {"page_inset":null}
+  shot window
+  call ext-doc-read {}
+  assert reply.page_inset.left is 48
+  assert reply.column_left is 48
+  call ext-doc-layout {}
+  assert reply.paragraphs.0.lines.0.x is 0
+  assert reply.paragraphs.2.marker.x is 22
+  call theme-set {"theme":"auto"}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
