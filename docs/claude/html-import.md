@@ -425,7 +425,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   carrying the link's relationship (`docs/claude/suite-document.md`).
 - Tests: `link_tests` in `import/html.rs` (`…_1999`), the `with_click_link`
   / `inline_click_link` / `replace_click_link` tests in `image.rs`,
-  `add_part_hyperlink…` in `package.rs`.
+  `add_part_hyperlinks_…` in `package.rs`.
 
 ## HTML import page margins (#1928)
 

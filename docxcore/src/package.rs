@@ -2769,15 +2769,9 @@ impl Package {
         Some(rid)
     }
 
-    /// Add an external hyperlink relationship to `url` to `part`'s
-    /// relationships (#1999: a picture's `a:hlinkClick` names it), as
-    /// [`Package::add_part_hyperlinks`] does for one.
-    pub fn add_part_hyperlink(&mut self, part: &str, url: &str) -> Option<String> {
-        self.add_part_hyperlinks(part, &[url])?.pop()
-    }
-
     /// Add an external hyperlink relationship to each of `urls`, in order, to
-    /// `part`'s relationships (#1999), making the relationships part, and
+    /// `part`'s relationships (#1999: a linked picture's `a:hlinkClick`
+    /// names one), making the relationships part, and
     /// `[Content_Types].xml`'s `rels` Default, when missing. Each id is a
     /// fresh `rIdN`, given back in `urls`' order. The relationships are read
     /// and written once, whatever the count. `None`, with nothing changed,
@@ -8520,12 +8514,13 @@ mod tests {
     }
 
     #[test]
-    fn add_part_hyperlink_adds_an_external_relationship_1999() {
+    fn add_part_hyperlinks_adds_an_external_relationship_1999() {
         let mut pkg = new_package(Document::default());
         let before = pkg.document_rels();
         let rid = pkg
-            .add_part_hyperlink("word/document.xml", "https://a.example/?x=1&y=2")
-            .expect("a document part");
+            .add_part_hyperlinks("word/document.xml", &["https://a.example/?x=1&y=2"])
+            .expect("a document part")
+            .remove(0);
         assert!(before.target(&rid).is_none(), "{rid} is a fresh id");
         let rels = pkg.document_rels();
         assert_eq!(rels.len(), before.len() + 1);
@@ -8538,8 +8533,9 @@ mod tests {
         assert!(text.contains("Target=\"https://a.example/?x=1&amp;y=2\" TargetMode=\"External\""));
         // A second one takes the next id.
         let next = pkg
-            .add_part_hyperlink("word/document.xml", "https://b.example/")
-            .unwrap();
+            .add_part_hyperlinks("word/document.xml", &["https://b.example/"])
+            .unwrap()
+            .remove(0);
         assert_ne!(next, rid);
         assert_eq!(
             pkg.document_rels().target(&rid),
@@ -8583,7 +8579,7 @@ mod tests {
     }
 
     #[test]
-    fn add_part_hyperlink_makes_missing_rels_and_refuses_a_missing_part_1999() {
+    fn add_part_hyperlinks_makes_missing_rels_and_refuses_a_missing_part_1999() {
         let mut pkg = new_package(Document::default());
         // A package whose content types lack the rels Default.
         let ct = pkg.part_text("[Content_Types].xml").unwrap();
@@ -8597,8 +8593,9 @@ mod tests {
         pkg.parts
             .push(("word/header1.xml".to_string(), b"<w:hdr/>".to_vec()));
         let rid = pkg
-            .add_part_hyperlink("word/header1.xml", "mailto:a@example.com")
-            .unwrap();
+            .add_part_hyperlinks("word/header1.xml", &["mailto:a@example.com"])
+            .unwrap()
+            .remove(0);
         assert_eq!(rid, "rId1");
         let rels = parse_rels_xml(&pkg.part_text("word/_rels/header1.xml.rels").unwrap());
         assert_eq!(rels.external_target("rId1"), Some("mailto:a@example.com"));
@@ -8609,7 +8606,7 @@ mod tests {
         );
         let before = pkg.clone();
         assert_eq!(
-            pkg.add_part_hyperlink("word/missing.xml", "https://a.example/"),
+            pkg.add_part_hyperlinks("word/missing.xml", &["https://a.example/"]),
             None
         );
         assert_eq!(pkg.parts, before.parts);
