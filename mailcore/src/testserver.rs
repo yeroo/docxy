@@ -43,7 +43,11 @@ pub struct RecordedRequest {
     pub method: String,
     pub path: String,
     pub headers: Vec<(String, String)>,
+    /// The body as text, bytes that are not UTF-8 replaced.
     pub body: String,
+    /// The body exactly as received (#2065): a binary upload, such as a
+    /// contact photo's PUT, that `body` would mangle.
+    pub body_bytes: Vec<u8>,
     /// When the request arrived (its headers and body read), before any
     /// route delay: the gap between two requests (#1871's `Retry-After`).
     pub at: Instant,
@@ -183,6 +187,7 @@ fn handle_connection(
             path: path.clone(),
             headers,
             body,
+            body_bytes,
             at: Instant::now(),
         });
 
@@ -313,6 +318,19 @@ mod tests {
         let reqs = srv.requests();
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[0].body, "a=1");
+    }
+
+    /// #2065: a binary body is recorded byte for byte, apart from the
+    /// lossy text `body`.
+    #[test]
+    fn records_binary_body_bytes() {
+        let srv = FakeServer::start(vec![route(202, "ok")]);
+        let bytes = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x80, 0x7F];
+        let url = format!("{}/send", srv.base_url);
+        ureq::post(&url).send_bytes(&bytes).unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].body_bytes, bytes);
+        assert_ne!(reqs[0].body.as_bytes(), bytes);
     }
 
     #[test]

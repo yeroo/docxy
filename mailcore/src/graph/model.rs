@@ -303,6 +303,19 @@ impl FolderContact {
     }
 }
 
+/// A Contacts-folder contact's photo (#2065): what
+/// `GET /me/contacts/{id}/photo/$value` returns, and what a set PUTs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContactPhoto {
+    pub bytes: Vec<u8>,
+    /// The `Content-Type` without its parameters (`image/jpeg`).
+    pub content_type: String,
+    /// The `$value` answer's `ETag` header as Graph sent it, `""` when it
+    /// sent none (and for a photo set locally). Informational: the store's
+    /// freshness test is the contact's `changeKey`, not this.
+    pub etag: String,
+}
+
 /// The `YYYY-MM-DD` date part of Graph's `birthday` DateTimeOffset
 /// (`1980-05-17T11:59:00Z`), `""` when it does not start with one.
 fn birthday_date(s: &str) -> String {
