@@ -28222,9 +28222,21 @@ mod optimistic_write_tests {
     /// so a write under that lock fails at once instead of after
     /// `BUSY_TIMEOUT`.
     struct Fixture {
-        dir: std::path::PathBuf,
         a: Store,
         b: Connection,
+        // Declared last: fields drop in order, so both connections are
+        // closed before the directory goes (Windows refuses to delete an
+        // open database file).
+        _dir: TempDir,
+    }
+
+    /// Removes its directory when dropped.
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     impl Fixture {
@@ -28252,7 +28264,11 @@ mod optimistic_write_tests {
             .unwrap();
             a.upsert_message("F", &message("M1")).unwrap();
             let b = Connection::open(&path).unwrap();
-            Fixture { dir, a, b }
+            Fixture {
+                a,
+                b,
+                _dir: TempDir(dir),
+            }
         }
 
         fn row(&self) -> MessageRow {
@@ -28294,12 +28310,6 @@ mod optimistic_write_tests {
 
             write(&self.a, "M1").expect("unlocked, the write succeeds");
             assert!(changed(&self.row()), "{:?}", self.row());
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
