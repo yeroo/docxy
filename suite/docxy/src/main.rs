@@ -5622,8 +5622,10 @@ struct Docxy {
     tab_layout: tabstrip::StripLayout,
     tab_more_open: bool,
     /// What had the keys on an extension's tab when its ribbon's KeyTips, a
-    /// menu or a flyout took them (#1870): its view's entity and the
-    /// handle, given back when they close.
+    /// menu or a flyout took them (#1870), or when File, opened over the
+    /// tab by an extension's action, did (#2204: only a focus File hid,
+    /// never one in a File page): its view's entity and the handle, given
+    /// back when they close.
     ext_focus_back: Option<(gpui::EntityId, FocusHandle)>,
     focus: FocusHandle,
     focused: bool,
@@ -17830,14 +17832,20 @@ impl Docxy {
     /// a click in File gives it. Else the focus stays in the view File hides,
     /// and gpui sends a key or an action dispatched from a focus it did not
     /// draw to the window's root node, above the suite's listeners: dropped.
-    /// What had it (the view, or a field of the extension's beside it) gets
-    /// it back when File closes (`focus_ext_surface`, `ext_focus_back`).
-    fn focus_suite_for_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// When File was down (`was_up` false), what had the focus (the view,
+    /// or a field of the extension's beside it) gets it back when File
+    /// closes (`focus_ext_surface`, `ext_focus_back`). When File was up
+    /// the focus is the suite's or in a File page, which File's next page
+    /// or its close stops drawing: it is not kept, and an earlier
+    /// `ext_focus_back` (from when File opened) stays.
+    fn focus_suite_for_file(&mut self, was_up: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !self.backstage || self.focus.is_focused(window) {
             return;
         }
-        if let (Some(view), Some(had)) = (self.active_ext_view(), window.focused(cx)) {
-            self.ext_focus_back = Some((view, had));
+        if !was_up {
+            if let (Some(view), Some(had)) = (self.active_ext_view(), window.focused(cx)) {
+                self.ext_focus_back = Some((view, had));
+            }
         }
         window.focus(&self.focus, cx);
     }
@@ -46156,13 +46164,15 @@ impl KeyRouting for Div {
         self.child(input)
             .on_key_down(cx.listener(Docxy::route_key))
             .on_action(cx.listener(|this, _: &ext::ShowBackstage, window, cx| {
+                let was_up = this.backstage;
                 this.open_backstage(cx);
-                this.focus_suite_for_file(window, cx);
+                this.focus_suite_for_file(was_up, window, cx);
             }))
             // File straight on one of an extension tab's own pages (#2204).
             .on_action(cx.listener(|this, a: &ext::ShowBackstagePage, window, cx| {
+                let was_up = this.backstage;
                 this.show_ext_backstage_page(a.id.clone(), cx);
-                this.focus_suite_for_file(window, cx);
+                this.focus_suite_for_file(was_up, window, cx);
             }))
             // An extension's view, File page or ribbon command closes its tab
             // (#1923); the root takes it whatever had the focus.

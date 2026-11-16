@@ -896,9 +896,15 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   focus it did not draw (`focus_node_id_in_rendered_frame`) to the
   window's root node, gpui-component's `Root`, above the suite's
   listeners: every key under File, a page's late `CloseTab` or a second
-  `ShowBackstagePage` would be dropped. What had the focus (the view or a
-  field of the extension's) is kept in `ext_focus_back` and gets it back
-  when File closes (`focus_ext_surface`, owner-filtered). `open_backstage`
+  `ShowBackstagePage` would be dropped. When File was down before the
+  action (`was_up`, read by the listener before it opens File), what had
+  the focus (the view or a field of the extension's beside it) is kept in
+  `ext_focus_back` and gets it back when File closes (`focus_ext_surface`,
+  owner-filtered). When File was up, the focus is the suite's or in a File
+  page (a page control that takes its own focus on a click, as a
+  gpui-component Button does), which the next page or File's close stops
+  drawing, so it is not kept and an earlier `ext_focus_back` stays (r1).
+  The fixture's Show buttons track a focus of their own for this. `open_backstage`
   itself moves no focus (the File button and the harness keep their
   paths).
 - Fixture: each `FixturePage` has a "Show <other page>" button

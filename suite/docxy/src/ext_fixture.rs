@@ -286,6 +286,9 @@ pub(crate) struct FixturePage {
     /// The other page, which this page's Show button opens through
     /// `ext::ShowBackstagePage`: its id and title.
     show: (&'static str, &'static str),
+    /// The Show button's own focus, which a click on it takes, as a
+    /// gpui-component Button's does (#2204 r1).
+    show_focus: FocusHandle,
     pub(crate) renders: Rc<Cell<usize>>,
     pub(crate) bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     pub(crate) close_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -338,6 +341,7 @@ impl Render for FixturePage {
                 let (id, title) = self.show;
                 div()
                     .id("ext-page-show")
+                    .track_focus(&self.show_focus)
                     .relative()
                     .px_3()
                     .py_1()
@@ -359,9 +363,10 @@ impl Render for FixturePage {
 /// Reply icon), Fixture Options at the bottom.
 fn fixture_pages(cx: &mut App) -> Vec<BackstagePage> {
     let mut page = |(id, title): (&'static str, &'static str), show| {
-        let view = cx.new(|_| FixturePage {
+        let view = cx.new(|cx| FixturePage {
             title,
             show,
+            show_focus: cx.focus_handle(),
             renders: Rc::default(),
             bounds: Rc::default(),
             close_bounds: Rc::default(),

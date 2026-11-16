@@ -302,7 +302,12 @@ test issue 2204 File already up switches to the page, and a page's own button to
   call backstage-layout {}
   assert reply.page is ext
   assert reply.ext_page is fx.account
+  # The Show buttons took their own focus from the clicks, and the page
+  # that drew the last one is gone: File closed, the view gets the focus.
   call backstage {"action":"close"}
+  shot window
+  call ext-doc-read {}
+  assert reply.focused is true
   call real-key {"key":"ctrl+w"}
   call tab-list {}
   assert reply.count is 1
