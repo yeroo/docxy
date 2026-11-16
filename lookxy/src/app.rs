@@ -929,6 +929,10 @@ impl App {
             | SyncEvent::ContactWriteFailed { .. }
             // Nor does it show a contact's photo, so it never asks (#2065).
             | SyncEvent::ContactPhotoFetched { .. }
+            // Nor a sender's photo in its reading pane, so it never asks for
+            // another user's photo (#2157).
+            | SyncEvent::UserPhotoFetched { .. }
+            | SyncEvent::UserPhotoFailed { .. }
             // lookxy has no folder management, so it never creates,
             // renames or moves a folder (#1910).
             | SyncEvent::FolderCreated { .. }

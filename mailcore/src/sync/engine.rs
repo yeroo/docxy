@@ -383,6 +383,18 @@ pub enum SyncCommand {
     /// [`SyncEvent::PhotoFetched`] (`None` when the user has none). Direct
     /// call, no outbox.
     FetchPhoto,
+    /// Fetch another user's photo by e-mail address (#2157,
+    /// `GraphClient::user_photo`): a sender's photo for a reading pane.
+    /// Emits [`SyncEvent::UserPhotoFetched`] (`None` when no such user or no
+    /// photo), or [`SyncEvent::UserPhotoFailed`] on a Graph failure
+    /// (`forbidden` for a 403: the token lacks `User.ReadBasic.All`, so stop
+    /// asking), never a `SyncEvent::Error`; auth, throttle and transport
+    /// failures still go through `react_quietly`. Signed out: an
+    /// `Error("not signed in")`, as `FetchPhoto`, then the address's
+    /// `UserPhotoFailed`, with no request. A read: no outbox, served at a
+    /// `checkpoint`, dropped at shutdown. `address` comes back exactly as
+    /// sent.
+    FetchUserPhoto { address: String },
     /// Sign out: drop the in-memory token and delete the saved one, in the
     /// file and in the engine's secret store (`tokencache::clear_in`), then
     /// emit [`SyncEvent::SignInRequired`] (reason
@@ -1030,6 +1042,24 @@ pub enum SyncEvent {
     /// the user has none (from [`SyncCommand::FetchPhoto`]); the UI then
     /// draws initials.
     PhotoFetched { photo: Option<(Vec<u8>, String)> },
+    /// Another user's photo as `(bytes, content type)` (#2157, from
+    /// [`SyncCommand::FetchUserPhoto`]), `None` when the address finds no
+    /// user (by `mail`, then by UPN) or the user has no photo; `address`
+    /// exactly as the command sent it.
+    UserPhotoFetched {
+        address: String,
+        photo: Option<(Vec<u8>, String)>,
+    },
+    /// [`SyncCommand::FetchUserPhoto`] could not fetch the photo (#2157):
+    /// `forbidden` is true for a Graph 403 on any of its requests (the
+    /// token lacks `User.ReadBasic.All`: a caller stops asking), `error` the
+    /// failure's one line, `"not signed in"` when signed out. `address`
+    /// exactly as the command sent it.
+    UserPhotoFailed {
+        address: String,
+        forbidden: bool,
+        error: String,
+    },
     /// A Contacts-folder contact's photo (#2065, from
     /// [`SyncCommand::FetchContactPhoto`]), `None` when it has none; `id` as
     /// the command named it. Also recorded in the store
@@ -1964,6 +1994,7 @@ fn served_at_checkpoint(cmd: &SyncCommand) -> bool {
             | SyncCommand::SearchDirectory { .. }
             | SyncCommand::SearchGroups { .. }
             | SyncCommand::FetchGroupMembers { .. }
+            | SyncCommand::FetchUserPhoto { .. }
     )
 }
 
@@ -2047,6 +2078,7 @@ fn persists_at_shutdown(cmd: &SyncCommand) -> bool {
         | SyncCommand::FetchAutomaticReplies
         | SyncCommand::FetchProfile
         | SyncCommand::FetchPhoto
+        | SyncCommand::FetchUserPhoto { .. }
         | SyncCommand::FetchContactPhoto { .. }
         | SyncCommand::FetchInlineImage { .. }
         | SyncCommand::RefreshCalendar
@@ -2954,6 +2986,7 @@ impl Engine {
                 Some(SyncCommand::FetchGroupMembers { group_id, top }) => {
                     self.fetch_group_members(group_id, top)
                 }
+                Some(SyncCommand::FetchUserPhoto { address }) => self.fetch_user_photo(address),
                 _ => false,
             };
             if served {
@@ -3360,6 +3393,9 @@ impl Engine {
             SyncCommand::SetAutomaticReplies { replies } => self.set_automatic_replies(replies),
             SyncCommand::FetchProfile => self.fetch_profile(),
             SyncCommand::FetchPhoto => self.fetch_photo(),
+            SyncCommand::FetchUserPhoto { address } => {
+                self.fetch_user_photo(address);
+            }
             SyncCommand::FetchContactPhoto { id } => self.fetch_contact_photo(id),
             SyncCommand::SignOut => self.sign_out(),
             SyncCommand::FetchInlineImage {
@@ -8812,6 +8848,41 @@ impl Engine {
             Ok(photo) => self.emit(SyncEvent::PhotoFetched { photo }),
             Err(e) => {
                 self.react(e);
+            }
+        }
+    }
+
+    /// Serves [`SyncCommand::FetchUserPhoto`] (#2157): `UserPhotoFetched`,
+    /// or `UserPhotoFailed` (`forbidden` for a 403) and then
+    /// `react_quietly`, never a `SyncEvent::Error` for a Graph failure.
+    /// Signed out it sends no request and reports as `fetch_photo` does,
+    /// then answers the address too, so a caller that marks it in flight
+    /// hears back. The address goes to the client as asked (it trims), and
+    /// comes back untrimmed. Returns `react_quietly`'s answer, for
+    /// `checkpoint`.
+    fn fetch_user_photo(&mut self, address: String) -> bool {
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            self.emit(SyncEvent::UserPhotoFailed {
+                address,
+                forbidden: false,
+                error: "not signed in".to_string(),
+            });
+            return false;
+        }
+        match self.with_auth(|c| c.user_photo(&address)) {
+            Ok(photo) => {
+                self.emit(SyncEvent::UserPhotoFetched { address, photo });
+                false
+            }
+            Err(e) => {
+                let forbidden = matches!(e, GraphError::Http { status: 403, .. });
+                self.emit(SyncEvent::UserPhotoFailed {
+                    address,
+                    forbidden,
+                    error: e.to_string(),
+                });
+                self.react_quietly(e)
             }
         }
     }
@@ -35418,6 +35489,273 @@ mod tests {
                     }
                 }
 
+                // --- Another user's photo by address (#2157) -----------
+
+                mod user_photo {
+                    use super::*;
+
+                    const ADA_FILTER: &str =
+                        "/users?$filter=mail%20eq%20%27ada%40contoso.com%27&$select=id";
+                    const ADA_UPN: &str = "/users/ada%40contoso.com?$select=id";
+                    const U1_PHOTO: &str = "/users/U1/photo/$value";
+                    const U1_PHOTO_48: &str = "/users/U1/photos/48x48/$value";
+
+                    fn photo_route(status: u16, body: &str) -> (Route, Option<usize>) {
+                        let mut r = route(U1_PHOTO, status, body);
+                        r.headers = vec![("Content-Type".into(), "image/jpeg".into())];
+                        (r, None)
+                    }
+
+                    fn found_u1() -> (Route, Option<usize>) {
+                        search_route(ADA_FILTER, 200, r#"{"value":[{"id":"U1"}]}"#)
+                    }
+
+                    fn fetch_user_photo(handle: &SyncHandle, address: &str) {
+                        handle
+                            .cmd_tx
+                            .send(SyncCommand::FetchUserPhoto {
+                                address: address.into(),
+                            })
+                            .unwrap();
+                    }
+
+                    fn is_photo_answer(e: &SyncEvent) -> bool {
+                        matches!(
+                            e,
+                            SyncEvent::UserPhotoFetched { .. } | SyncEvent::UserPhotoFailed { .. }
+                        )
+                    }
+
+                    /// Events until the photo's answer, which must be
+                    /// `UserPhotoFailed`: its address, `forbidden`, error,
+                    /// and every event seen.
+                    fn photo_failed(handle: &SyncHandle) -> (String, bool, String, Vec<SyncEvent>) {
+                        let events = wait_for(&handle.evt_rx, is_photo_answer);
+                        match events.last() {
+                            Some(SyncEvent::UserPhotoFailed {
+                                address,
+                                forbidden,
+                                error,
+                            }) => (address.clone(), *forbidden, error.clone(), events),
+                            other => panic!("expected UserPhotoFailed, got {other:?}"),
+                        }
+                    }
+
+                    fn user_requests(srv: &FakeServer) -> Vec<String> {
+                        srv.requests()
+                            .into_iter()
+                            .map(|r| r.path)
+                            .filter(|p| p.starts_with("/users"))
+                            .collect()
+                    }
+
+                    #[test]
+                    fn fetch_user_photo_emits_user_photo_fetched() {
+                        let srv =
+                            two_folders(vec![], vec![found_u1(), photo_route(200, "JPEGDATA")]);
+                        let (handle, dir) = started(&srv, "user-photo");
+                        // Sent with spaces: looked up trimmed, echoed as sent.
+                        fetch_user_photo(&handle, " ada@contoso.com ");
+                        let events = wait_for(&handle.evt_rx, is_photo_answer);
+                        no_error(&events);
+                        assert_eq!(
+                            events.last().unwrap(),
+                            &SyncEvent::UserPhotoFetched {
+                                address: " ada@contoso.com ".into(),
+                                photo: Some((b"JPEGDATA".to_vec(), "image/jpeg".into())),
+                            }
+                        );
+                        assert_eq!(user_requests(&srv), [ADA_FILTER, U1_PHOTO]);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn fetch_user_photo_none_is_not_an_error() {
+                        let srv = two_folders(
+                            vec![],
+                            vec![
+                                search_route(ADA_FILTER, 200, r#"{"value":[]}"#),
+                                search_route(ADA_UPN, 404, "{}"),
+                            ],
+                        );
+                        let (handle, dir) = started(&srv, "user-photo-none");
+                        fetch_user_photo(&handle, "ada@contoso.com");
+                        let events = wait_for(&handle.evt_rx, is_photo_answer);
+                        no_error(&events);
+                        assert_eq!(
+                            events.last().unwrap(),
+                            &SyncEvent::UserPhotoFetched {
+                                address: "ada@contoso.com".into(),
+                                photo: None,
+                            }
+                        );
+                        assert_eq!(user_requests(&srv), [ADA_FILTER, ADA_UPN]);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    /// `FetchUserPhoto` failing with `status` on the photo
+                    /// request (`on_photo`) or on the filter: the answer's
+                    /// `forbidden`, after checking the rest of the answer and
+                    /// that the engine carries on without a sync error.
+                    fn user_photo_failing_with(status: u16, on_photo: bool, tag: &str) -> bool {
+                        let body = r#"{"error":{"code":"Authorization_RequestDenied","message":"Insufficient privileges"}}"#;
+                        let routes = if on_photo {
+                            vec![
+                                found_u1(),
+                                search_route(U1_PHOTO, status, body),
+                                photo_route(200, "SMALL"),
+                            ]
+                        } else {
+                            vec![search_route(ADA_FILTER, status, body)]
+                        };
+                        let srv = two_folders(vec![], routes);
+                        let (handle, dir) = started(&srv, tag);
+                        fetch_user_photo(&handle, "ada@contoso.com");
+                        let (address, forbidden, error, events) = photo_failed(&handle);
+                        assert_eq!(address, "ada@contoso.com");
+                        assert!(error.contains(&status.to_string()), "{error}");
+                        assert!(!error.contains('\n'), "one line: {error:?}");
+                        let want: &[&str] = if on_photo {
+                            &[ADA_FILTER, U1_PHOTO]
+                        } else {
+                            &[ADA_FILTER]
+                        };
+                        assert_eq!(user_requests(&srv), want);
+                        // The engine carries on: the next command is answered.
+                        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+                        let more = wait_for(&handle.evt_rx, is_idle);
+                        no_error(&events);
+                        no_error(&more);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                        forbidden
+                    }
+
+                    #[test]
+                    fn fetch_user_photo_forbidden() {
+                        assert!(user_photo_failing_with(403, false, "user-photo-403"));
+                        assert!(user_photo_failing_with(403, true, "user-photo-403-photo"));
+                    }
+
+                    #[test]
+                    fn fetch_user_photo_other_failure_not_forbidden() {
+                        assert!(!user_photo_failing_with(500, false, "user-photo-500"));
+                        assert!(!user_photo_failing_with(400, true, "user-photo-400-photo"));
+                    }
+
+                    #[test]
+                    fn fetch_user_photo_transport_failure_goes_offline_without_error() {
+                        let srv = two_folders(vec![], vec![]);
+                        let (handle, dir) = started(&srv, "user-photo-transport");
+                        drop(srv);
+                        fetch_user_photo(&handle, "ada@contoso.com");
+                        let (address, forbidden, _error, events) = photo_failed(&handle);
+                        assert_eq!((address.as_str(), forbidden), ("ada@contoso.com", false));
+                        no_error(&events);
+                        let more = wait_for(&handle.evt_rx, |e| {
+                            matches!(e, SyncEvent::State(SyncState::Offline))
+                        });
+                        no_error(&more);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn fetch_user_photo_signed_out_reports_not_signed_in() {
+                        let srv = two_folders(vec![], vec![found_u1(), photo_route(200, "P")]);
+                        // No token: the engine waits for a sign-in.
+                        let dir = unique_dir("user-photo-signed-out");
+                        let handle = spawn_with(&srv, &dir, EngineOptions::without_prefetch());
+                        wait_for(&handle.evt_rx, |e| {
+                            matches!(e, SyncEvent::SignInRequired { .. })
+                        });
+                        fetch_user_photo(&handle, "ada@contoso.com");
+                        let events = wait_for(&handle.evt_rx, is_photo_answer);
+                        let at_error = events
+                            .iter()
+                            .position(|e| matches!(e, SyncEvent::Error(m) if m == "not signed in"))
+                            .unwrap_or_else(|| panic!("no not-signed-in error: {events:?}"));
+                        assert_eq!(at_error, events.len() - 2, "{events:?}");
+                        assert_eq!(
+                            events.last().unwrap(),
+                            &SyncEvent::UserPhotoFailed {
+                                address: "ada@contoso.com".into(),
+                                forbidden: false,
+                                error: "not signed in".into(),
+                            }
+                        );
+                        assert!(user_requests(&srv).is_empty());
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn fetch_user_photo_is_served_during_a_slow_pass() {
+                        let folders: Vec<Fold> =
+                            [("F1", "Inbox"), ("F2", "B"), ("F3", "C"), ("F4", "D")]
+                                .into_iter()
+                                .map(|(id, name)| {
+                                    small(Fold {
+                                        pages: vec![vec![msg(
+                                            &format!("M-{id}"),
+                                            "2020-01-01T00:00:00Z",
+                                        )]],
+                                        ..fold(
+                                            id,
+                                            name,
+                                            if id == "F1" { Some("inbox") } else { None },
+                                        )
+                                    })
+                                })
+                                .collect();
+                        let srv = FakeServer::start_paced(mailbox(
+                            &folders,
+                            vec![found_u1(), photo_route(200, "P")],
+                            Duration::from_millis(300),
+                        ));
+                        let dir = new_dir("user-photo-in-pass");
+                        let handle = spawn_with(&srv, &dir, EngineOptions::without_prefetch());
+                        // The startup pass is under way: some folder's delta is out.
+                        assert!(wait_until(ENGINE_WAIT, || {
+                            paths_from(&srv, 0)
+                                .iter()
+                                .any(|p| p.contains("/messages/delta?$orderby"))
+                        }));
+                        fetch_user_photo(&handle, "ada@contoso.com");
+                        let events = wait_for(&handle.evt_rx, is_idle);
+                        assert!(
+                            events.iter().any(|e| matches!(
+                                e,
+                                SyncEvent::UserPhotoFetched { address, photo: Some(_) }
+                                    if address == "ada@contoso.com"
+                            )),
+                            "answered before the pass ended: {events:?}"
+                        );
+                        let reqs = srv.requests();
+                        let last_delta = reqs
+                            .iter()
+                            .filter(|r| r.path.contains("/messages/delta?$orderby"))
+                            .map(|r| r.at)
+                            .max()
+                            .unwrap();
+                        let photo_at: Vec<_> = reqs
+                            .iter()
+                            .filter(|r| r.path == U1_PHOTO)
+                            .map(|r| r.at)
+                            .collect();
+                        assert_eq!(photo_at.len(), 1);
+                        assert!(
+                            photo_at[0] < last_delta,
+                            "the photo request came before the last delta"
+                        );
+                        assert!(!reqs.iter().any(|r| r.path == U1_PHOTO_48));
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+                }
+
                 // --- Directory groups and members (#2058) ---------------
 
                 mod groups {
@@ -42834,6 +43172,12 @@ mod tests {
                 id: "x".into()
             }));
             assert!(!persists_at_shutdown(&SyncCommand::Refresh));
+            // A read (#2157): dropped at shutdown, served at a checkpoint.
+            let user_photo = SyncCommand::FetchUserPhoto {
+                address: "ada@contoso.com".into(),
+            };
+            assert!(!persists_at_shutdown(&user_photo));
+            assert!(served_at_checkpoint(&user_photo));
             assert!(!persists_at_shutdown(&SyncCommand::ComposeForward {
                 id: "x".into()
             }));
