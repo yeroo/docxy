@@ -61,7 +61,8 @@ issue number to find its notes.
   text navigation (#1073).
 - `docs/claude/suite-shell.md`: before changing the suite's window chrome: the start
   screen (#806), the title label and accent per tab type, and where the theme button
-  lives (#1473).
+  lives (#1473), Open File's native picker off the App borrow on Windows
+  (#2192).
 - `docs/claude/suite-extensions.md`: before changing the suite as a library
   (`run(ext::Extensions)`), extension surfaces (Mail tabs), tab tear-off or the embedded
   `ext::DocView` (#1873), its editing mode (#1947), host insert, copy and cut (#1977),
