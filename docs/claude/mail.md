@@ -310,6 +310,42 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   `/organization`. An engine test without that route gets the fake server's
   404, so `organization` is `""`.
 
+## Another user's photo by address (#2157)
+
+- `GraphClient::user_photo(address)` → `Ok(Some((bytes, content type)))`, or
+  `Ok(None)` when no user or no photo: a sender's photo for a reading pane.
+  The address is trimmed; a blank one sends nothing.
+- The address is resolved to an id first (`user_id_by_address`), since
+  `/users/{x}/photo/$value` finds only an id or a UPN, never `mail`:
+  `GET /users?$filter=mail eq '<address>'&$select=id` (each `'` doubled by
+  `odata_string`, the whole filter `encode_path_segment`ed), taking the
+  first item with a non-empty `id`. Only when that finds no one, and only for
+  an address with an `@`, `GET /users/<encoded address>?$select=id` (the UPN):
+  its 404 is `Ok(None)`. An `@`-less address never gets that request, as
+  `/users/{x}` would read an id-shaped `x` as an object id. A filter answer
+  with no `value` array is a `Parse` error; a 400 on the UPN request stays
+  an error.
+- An alias that is neither `mail` nor the UPN is not found, on purpose:
+  `proxyAddresses/any(...)` is an advanced query (`ConsistencyLevel:
+  eventual`, `$count=true`) and `proxyAddresses` needs `User.Read.All`.
+- Then `/users/{id}/photo/$value`, falling back to
+  `/users/{id}/photos/48x48/$value`, through `get_photo` as `my_photo`
+  (`Accept: image/*`, the type, `PHOTO_MAX`). Not found there is
+  `is_photo_not_found`: a 404, or any status whose `error.code` is
+  `ImageNotFound` (case-insensitive). `my_photo` still falls back on a 404
+  only. Any other error on any request is returned at once.
+- Needs `User.ReadBasic.All`, which `AuthConfig::default()` does not ask for.
+- `SyncCommand::FetchUserPhoto { address }` → `UserPhotoFetched { address,
+  photo }`, or `UserPhotoFailed { address, forbidden, error }` (`forbidden`
+  for a 403 on any request: stop asking), then `react_quietly`: never a
+  `SyncEvent::Error` for a Graph failure. `address` is echoed as sent,
+  untrimmed. Signed out: `Error("not signed in")` as `FetchPhoto`, then the
+  address's `UserPhotoFailed { error: "not signed in" }`, no request, so a
+  caller that marks the address in flight hears back.
+- A read: `served_at_checkpoint` (a reading-pane open does not wait for a
+  pass), `persists_at_shutdown` false, no outbox op, nothing stored. lookxy
+  lists the two events as ignored: it shows no sender photo.
+
 ## Granted scopes and a refused sign-in's error_description (#1875)
 
 - `auth::TokenSet::scopes` (`Option<Vec<String>>`, `None` = unknown) is the
