@@ -1,0 +1,33 @@
+# F1 in Project's Timeline (#2077): a press in the Timeline puts the
+# keyboard in it, and F1 opens its page (`pane:timeline`). The runner
+# installs the helpdocs project fixture as this instance's Project manual:
+# `project` (the root), `task` (area task) and `timeline` (keys
+# pane:timeline). Apart from help-docs.uit, which needs no Project manual
+# installed. Each step closes the Help tab it opened (Ctrl+W on it).
+# project-timeline-view.xml shows the Timeline.
+manual project ../../helpdocs/tests/fixture/project
+
+test project F1 with the keyboard in the Timeline opens its page
+  open ../fixtures/project-timeline-view.xml
+  # The chart and the Timeline are laid out by a drawn frame.
+  shot window
+  assert timeline_view_start is Mon 1/5/26
+  call pointer-click {"region":"pane:timeline"}
+  # The press moved nothing: the view box is where it was.
+  assert timeline_view_start is Mon 1/5/26
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.open is true
+  assert reply.editor is project
+  assert reply.page is timeline
+  assert reply.via is exact
+  call real-key {"key":"ctrl+w"}
+  # A press on the Gantt chart: the area page of the ribbon tab shown.
+  call ribbon-layout {"tab":"Task"}
+  call pointer-click {"region":"gantt"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is task
+  assert reply.via is area
+  call real-key {"key":"ctrl+w"}
+  assert dirty is false

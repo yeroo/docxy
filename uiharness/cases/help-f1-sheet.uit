@@ -1,7 +1,9 @@
 # F1 on a hovered sheet ribbon command (#1869): the command's page in the
 # Excel manual, by its `SheetCmd` id, else its ribbon tab's area page, else
 # the root. The runner installs the helpdocs excel fixture as this instance's
-# Excel manual: `excel` (the root) and `home` (area home, keys bold). Apart
+# Excel manual: `excel` (the root), `home` (area home, keys bold),
+# `clipboard` (keys pane:office-clipboard) and `chart-pane` (keys
+# pane:chart). Apart
 # from help-docs.uit, which needs no Excel manual installed. Each step closes
 # the Help tab it opened (Ctrl+W on it).
 manual excel ../../helpdocs/tests/fixture/excel
@@ -42,3 +44,48 @@ test F1 with focus on a sheet ribbon command opens that command's page
   assert reply.page is home
   assert reply.via is area
   call real-key {"key":"ctrl+w"}
+
+test F1 with the keyboard in a sheet pane opens that pane's page
+  # #2077: a press in the Office Clipboard, then F1. The clipboard is
+  # emptied first, so the press can land on no item (a click pastes one).
+  open ../fixtures/basic.xlsx
+  call office-clipboard {"action":"clear-all"}
+  call office-clipboard {"action":"open"}
+  assert office_clipboard is 0
+  call pointer-click {"region":"pane:office-clipboard"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.open is true
+  assert reply.editor is excel
+  assert reply.page is clipboard
+  assert reply.via is exact
+  call real-key {"key":"ctrl+w"}
+  # A press on the grid: Home's area page.
+  call ribbon-layout {"tab":"Home"}
+  call pointer-click {"region":"cell:B3"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is home
+  assert reply.via is area
+  call real-key {"key":"ctrl+w"}
+  call office-clipboard {"action":"close"}
+
+test F1 in a Chart panel field opens the Chart pane's page
+  # The one pane whose field takes the keys (`range_edit`): F1 there opens
+  # `pane:chart`'s page, where any other entry swallows F1. The Help tab is
+  # a tab switch, which drops the field and closes the panel as Ctrl+Tab
+  # does.
+  open ../fixtures/basic.xlsx
+  select chart 0
+  assert panel_chart is 0
+  focus categories
+  assert field is categories
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.open is true
+  assert reply.editor is excel
+  assert reply.page is chart-pane
+  assert reply.via is exact
+  call real-key {"key":"ctrl+w"}
+  assert field is nothing
+  assert panel_chart is nothing

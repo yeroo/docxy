@@ -3,8 +3,9 @@
 # Word manual (a harness instance reads a manual from its sandbox only, never
 # the one built into the binary), so the pages, keys and links here are the
 # fixture's: welcome, home, home-font (keys bold, b, dialog:font), insert,
-# tables (keys table, dialog:insert-table), images, keyboard, help. No Excel
-# or Project manual is installed. Each test closes the Help tab it opened
+# tables (keys table, dialog:insert-table), images, keyboard, help,
+# navigation (keys pane:navigation). No Excel or Project manual is
+# installed. Each test closes the Help tab it opened
 # (Ctrl+W on it), so the next one starts without it.
 manual word ../../helpdocs/tests/fixture/word
 
@@ -371,6 +372,74 @@ test F1 with focus on a ribbon command opens that command's page
   call real-key {"key":"ctrl+w"}
   # A command that is not drawn (Symbol is on Insert) cannot be aimed at.
   call-error pointer-move {"to":"ribbon-cmd:symbol"} => the ribbon command symbol is not drawn
+
+test F1 with the keyboard in a pane opens that pane's page
+  # #2077: a press in a pane puts the keyboard in it, and F1 then opens the
+  # pane's page (`pane:<id>`), else the area page of the ribbon tab shown,
+  # else the root. A press elsewhere or a key that reaches the document
+  # takes the keyboard out of the pane.
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"View","command":"nav"}
+  call pointer-click {"region":"pane:navigation"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.open is true
+  assert reply.editor is word
+  assert reply.page is navigation
+  assert reply.via is exact
+  call real-key {"key":"ctrl+w"}
+  # A press in the document: Home's area page, as before.
+  call ribbon-layout {"tab":"Home"}
+  call pointer-click {"region":"doc-line-start:0"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is home
+  assert reply.via is area
+  call real-key {"key":"ctrl+w"}
+  # A key that reaches the document: the area page. A bare modifier is not
+  # one.
+  call pointer-click {"region":"pane:navigation"}
+  call real-key {"key":"shift"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is navigation
+  call real-key {"key":"ctrl+w"}
+  call pointer-click {"region":"pane:navigation"}
+  call real-key {"key":"right"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is home
+  assert reply.via is area
+  call real-key {"key":"ctrl+w"}
+  # A pane no page keys, on a tab with no area page: Review > Comments pane,
+  # the root.
+  call ribbon-click {"tab":"Review","command":"togglecomments"}
+  call pointer-click {"region":"pane:comments"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is welcome
+  assert reply.via is root
+  call real-key {"key":"ctrl+w"}
+  # A pane closed since the press: the area page.
+  call pointer-click {"region":"pane:comments"}
+  call ribbon-click {"tab":"Review","command":"togglecomments"}
+  call-error pointer-move {"to":"pane:comments"} => the comments pane is not drawn
+  call ribbon-layout {"tab":"Home"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is home
+  assert reply.via is area
+  call real-key {"key":"ctrl+w"}
+  # A hovered ribbon command still wins over the pane the keyboard is in.
+  call pointer-click {"region":"pane:navigation"}
+  call pointer-move {"to":"ribbon-cmd:b"}
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.page is home-font
+  assert reply.via is exact
+  call real-key {"key":"ctrl+w"}
+  call ribbon-click {"tab":"View","command":"nav"}
+  call-error pointer-click {"region":"pane:navigation"} => the navigation pane is not drawn
 
 test without a manual for the editor, Help and F1 still say it is coming
   open ../fixtures/basic.xlsx
