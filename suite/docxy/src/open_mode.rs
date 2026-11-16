@@ -235,6 +235,37 @@ impl BackstagePage {
     }
 }
 
+/// Where Open's native picker runs (#2192). `Docxy::pick_open_file`
+/// dispatches on [`open_pick_route`], so every arm is compiled on every OS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PickRoute {
+    /// Linux: the portal answers over D-Bus. Pick on a background thread
+    /// and keep the window dispatching events, Wayland pings among them.
+    Background,
+    /// Windows: `IFileDialog::Show` runs a modal loop that pumps the main
+    /// thread's messages, and gpui runs its foreground tasks from those.
+    /// Shown inside a listener, the App stays borrowed while it is up, and
+    /// the first task that updates an entity panics and aborts the process.
+    /// So the dialog is shown from a spawned foreground task, which holds
+    /// no borrow, as gpui's own `prompt_for_paths` does, and is owned by
+    /// the suite window, which it disables while it is up.
+    Deferred,
+    /// macOS: synchronous, under `native_modal`'s menu-bar swap. Not
+    /// reported to crash, but not verified safe either.
+    Inline,
+}
+
+/// The route for this OS (#2192).
+pub(crate) const fn open_pick_route() -> PickRoute {
+    if cfg!(target_os = "linux") {
+        PickRoute::Background
+    } else if cfg!(target_os = "windows") {
+        PickRoute::Deferred
+    } else {
+        PickRoute::Inline
+    }
+}
+
 /// The caption a tab shows: its file name, then the access suffix.
 pub(crate) fn caption(title: &str, access: Access) -> String {
     match access.caption_suffix() {
@@ -442,6 +473,24 @@ pub(crate) fn protected_allows_doc_key(key: &str, ctrl: bool, alt: bool) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2192: on Windows the picker never runs inside the listener that
+    /// asked for it (a synchronous `IFileDialog::Show` there crashed the
+    /// suite); Linux keeps its background pick and macOS its inline one.
+    #[test]
+    fn open_picker_route_per_os() {
+        let route = open_pick_route();
+        if cfg!(target_os = "windows") {
+            assert_eq!(route, PickRoute::Deferred);
+        } else if cfg!(target_os = "linux") {
+            assert_eq!(route, PickRoute::Background);
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(route, PickRoute::Inline);
+        }
+        if !cfg!(target_os = "macos") {
+            assert_ne!(route, PickRoute::Inline, "a synchronous pick off macOS");
+        }
+    }
 
     #[test]
     fn protected_documents_take_only_keys_that_look_move_or_copy() {

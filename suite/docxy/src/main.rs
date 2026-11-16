@@ -26721,28 +26721,39 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // The Linux portal waits for a D-Bus response. Keep dispatching window
-        // events while it is open, including Wayland compositor pings.
-        #[cfg(target_os = "linux")]
-        {
-            let picked = cx
-                .background_executor()
-                .spawn(async move { macos_menu::native_modal(|| dialog.pick_file()) });
-            cx.spawn_in(window, async move |this, cx| {
-                let path = picked.await;
-                let _ = this.update_in(cx, |this, window, cx| {
-                    this.finish_open_file(path, mode, window, cx);
-                });
-            })
-            .detach();
+        // Where the picker runs per OS, and why, is `PickRoute`'s (#2192).
+        match open_mode::open_pick_route() {
+            open_mode::PickRoute::Background => {
+                let picked = cx
+                    .background_executor()
+                    .spawn(async move { macos_menu::native_modal(|| dialog.pick_file()) });
+                cx.spawn_in(window, async move |this, cx| {
+                    let path = picked.await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.finish_open_file(path, mode, window, cx);
+                    });
+                })
+                .detach();
+            }
+            open_mode::PickRoute::Deferred => {
+                // ⚠️ Never call `pick_file` before the spawn: here the App is
+                // borrowed, and the dialog's modal loop runs gpui's tasks.
+                let dialog = dialog.set_parent(window);
+                cx.spawn_in(window, async move |this, cx| {
+                    let path = macos_menu::native_modal(|| dialog.pick_file());
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.finish_open_file(path, mode, window, cx);
+                    });
+                })
+                .detach();
+            }
+            open_mode::PickRoute::Inline => self.finish_open_file(
+                macos_menu::native_modal(|| dialog.pick_file()),
+                mode,
+                window,
+                cx,
+            ),
         }
-        #[cfg(not(target_os = "linux"))]
-        self.finish_open_file(
-            macos_menu::native_modal(|| dialog.pick_file()),
-            mode,
-            window,
-            cx,
-        );
     }
 
     fn finish_open_file(

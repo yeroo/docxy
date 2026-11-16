@@ -46,3 +46,48 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   minimised ribbon, where `ribbon_body_hidden` draws no View tab) call
   `cycle_theme`, which says the new setting on the status line.
   `title_left_caps` no longer reserves a theme width.
+
+## Open File's native picker (#2192)
+
+- `Docxy::pick_open_file` (File > Open…, Ctrl+O, the Backstage Open rail, Open
+  Read-Only…, Open as Copy…, Open and Repair…, Recover Text…) dispatches on
+  `open_mode::open_pick_route()`. The arms have no `cfg`, so every OS compiles
+  all three, and the route is the one place that decides:
+  - **Linux, `Background`:** rfd's portal pick runs on the background executor,
+    so the window keeps dispatching (Wayland pings). The result comes back
+    through `update_in`.
+  - **Windows, `Deferred`:** `IFileDialog::Show` runs a modal loop on the main
+    thread, and gpui_windows runs foreground tasks from its messages. A
+    listener runs from a window message with no task wake pending
+    (`wake_posted` clear), so the first task dispatched while the picker is up
+    posts a wake, and the picker's loop runs it with the App `RefCell` still
+    borrowed. A task that updates an entity through `AsyncApp`
+    (gpui-component's timers, for one) then panics with "RefCell already
+    borrowed" and aborts in `window_procedure`. The dialog is therefore shown
+    from a task spawned with `spawn_in`, which holds no borrow, as gpui's own
+    `prompt_for_paths` does. It is owned by the suite window (`set_parent`),
+    which is disabled while it is up. Never call `pick_file` before the spawn.
+  - **macOS, `Inline`:** synchronous, under `native_modal`'s menu-bar swap.
+    Not reported to crash, but **not verified safe**: gpui_macos runs
+    foreground runnables on the main dispatch queue, which may drain in the
+    panel's modal run loop (follow-up).
+- While the Deferred picker is up, gpui's foreground tasks wait in every suite
+  window. `run_foreground_task` sets `wake_posted` before it runs the picker's
+  task, and `dispatch_on_main_thread` posts a wake only when that flag was
+  clear. So timers, async results and AutoRecover stall until the picker
+  closes. Painting goes on, since `WM_PAINT` is not a task.
+- `set_parent` disables only its owner. Another suite window, such as a
+  torn-off tab's (#1873), stays live, and an Open there queues its task. That
+  picker opens after the first one closes and its `finish_open_file` has run,
+  so pickers come one after another, in click order. The exception is
+  dragging or resizing another suite window: its size/move-loop timer
+  (`handle_timer_msg`) drains the queue, so queued tasks, a second picker
+  among them, can run nested in the first one's loop. That is safe, since no
+  borrow is held. If the owner closes first, `update_in` fails and the result
+  is dropped.
+- Every other rfd dialog (the Save As pickers, Export, header/footer Insert
+  Picture, Mailings, the close warning, the macro-free question) still runs
+  synchronously inside a listener, so on Windows it is open to the same crash
+  (follow-up). The unit test `open_picker_route_per_os` pins the route only:
+  no case runs the real Windows picker yet (`OPEN_HARNESS` still refuses Open
+  in a harness instance).
