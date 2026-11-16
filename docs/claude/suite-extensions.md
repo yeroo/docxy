@@ -497,6 +497,38 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   painted inline picture. The `issue 1998`
   tests in `uiharness/cases/ext-doc-view.uit` drive it.
 
+## Picture links in the embedded view (#1999)
+
+- An inline picture whose `wp:docPr` `a:hlinkClick` `r:id`
+  (`docxcore::image::inline_click_link`) names an external relationship
+  (`Relationships::external_target`, never a part) of the view's
+  `word/_rels/document.xml.rels` is a link, as the HTML import's
+  `<a href><img></a>` is (`docs/claude/html-import.md`). `para_links`
+  (`picture_link`) lists it beside the hyperlinks, over the picture's one
+  caret offset, so `link_at`, `link_hover_at`, `link_spans`, the hitboxes,
+  the hand, the hover reports, `LinkClick` and `follow` all take it as
+  they take link text. Its `LinkHover.text` is its Alt Text
+  (`inline_alt_text`) or empty: a host comparing text with the URL
+  compares that.
+- The view keeps its package's main-document relationships (`rels`), read
+  in `new` and `set_document`, not per frame. Editing adds only media
+  relationships, so they are not read again. A view with no package, an
+  unknown `r:id`, an internal relationship or an empty target is no link.
+  Only top-level picture runs of body paragraphs (cells included) are
+  links: Print Layout's headers and footers are drawn without `Click`s,
+  and their part's rels are not the document's.
+- A press follows the link of the piece it lands on: `begin_select` takes
+  `piece: Option<usize>`, a word's character under the press or a unit's
+  own offset (`unit_drag`), `None` for the blank beside a row. The caret
+  stop `off` is not used for it, as a unit's right half has the stop after
+  the unit, outside its link.
+- A document tab follows no picture link (its caret's harness `link`
+  passes no rels).
+- Tests: `a_picture_linked_to_a_url_is_a_link_…_1999` and
+  `a_picture_whose_link_names_no_url_…_1999` in `doc_view.rs`; the `issue
+  1999` test in `uiharness/cases/ext-doc-view.uit` (hover, Ctrl+click,
+  click mode, an unlinked picture).
+
 ## Page inset and page background (#2003)
 
 - `DocView::set_page_inset(Option<Edges<Pixels>>)` / `page_inset()`: the
