@@ -14,10 +14,12 @@ use std::time::Duration;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use crate::graph::client::{AttendeeInput, ContactFieldSet, EventFieldSet, event_zone_error};
+use crate::graph::client::{
+    AttendeeInput, ContactFieldSet, EventFieldSet, PHOTO_MAX, event_zone_error,
+};
 use crate::graph::model::{
     AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Calendar, ContactFields,
-    DraftOptions, Event, EventRecurrence, FolderContact, MailFolder, MasterCategory,
+    ContactPhoto, DraftOptions, Event, EventRecurrence, FolderContact, MailFolder, MasterCategory,
     MeetingMessageType, Message, MessageFields, MessageHeader, MessageProtection, PhysicalAddress,
     Recipient, Recurrence, Sensitivity, is_stored_header, meeting_link_in, reminder_time,
 };
@@ -377,6 +379,23 @@ pub struct OutboundAttachment {
     pub upload_digest: Option<String>,
 }
 
+/// What the store knows of a Contacts-folder contact's photo (#2065,
+/// `Store::contact_photo`); no row at all means unknown (never fetched, or a
+/// refused set reverted), and a client fetches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredContactPhoto {
+    /// The photo; `None` when Graph answered that the contact has none.
+    /// A photo set locally has an empty `etag`.
+    pub photo: Option<ContactPhoto>,
+    /// A local set whose PUT Graph has not accepted yet.
+    pub pending: bool,
+    /// Whether this is still the contact's photo as far as the store knows:
+    /// a pending set, or a state learnt against the `changeKey` the stored
+    /// contact has now. A full pass that brings a new `changeKey` makes it
+    /// not current, and a client fetches it again (`FetchContactPhoto`).
+    pub current: bool,
+}
+
 /// A `contacts` row — one per normalized (lowercased) email address, the
 /// autocomplete query surface. `source` is `local`/`graph`/`both`;
 /// `relevance` is the Graph `/me/people` rank (lower = more relevant),
@@ -547,6 +566,15 @@ pub enum OutboxOp {
     DeleteContact {
         id: String,
     },
+    /// PUT the photo set locally on a stored contact (#2065,
+    /// `Store::set_contact_photo`). The bytes are not in the op: they are
+    /// the `contact_photos` row, read at send time, so a later set's PUT
+    /// sends the latest photo and the next op finds nothing pending. The id
+    /// is resolved through `contact_aliases`; one still `local:`, or no
+    /// pending row, sends nothing.
+    SetContactPhoto {
+        id: String,
+    },
     /// Create a mail folder the host made locally (#1910,
     /// `Store::create_local_folder`): `POST /me/mailFolders` (or the
     /// parent's `childFolders`) with `name`, then re-key the `local:` row
@@ -711,6 +739,7 @@ impl OutboxOp {
             | OutboxOp::CreateContact { .. }
             | OutboxOp::UpdateContact { .. }
             | OutboxOp::DeleteContact { .. }
+            | OutboxOp::SetContactPhoto { .. }
             | OutboxOp::CreateFolder { .. }
             | OutboxOp::RenameFolder { .. }
             | OutboxOp::MoveFolder { .. }
@@ -754,6 +783,7 @@ impl OutboxOp {
             OutboxOp::CreateContact { .. } => "createContact",
             OutboxOp::UpdateContact { .. } => "updateContact",
             OutboxOp::DeleteContact { .. } => "deleteContact",
+            OutboxOp::SetContactPhoto { .. } => "setContactPhoto",
             OutboxOp::CreateFolder { .. } => "createFolder",
             OutboxOp::RenameFolder { .. } => "renameFolder",
             OutboxOp::MoveFolder { .. } => "moveFolder",
@@ -875,7 +905,8 @@ impl OutboxOp {
             | OutboxOp::DismissReminder { id }
             | OutboxOp::DismissMessageReminder { id }
             | OutboxOp::CreateContact { id }
-            | OutboxOp::DeleteContact { id } => Value::Object(vec![
+            | OutboxOp::DeleteContact { id }
+            | OutboxOp::SetContactPhoto { id } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("id".to_string(), Value::Str(id.clone())),
             ]),
@@ -1146,6 +1177,7 @@ impl OutboxOp {
                 ),
             }),
             "deleteContact" => Some(OutboxOp::DeleteContact { id: id()? }),
+            "setContactPhoto" => Some(OutboxOp::SetContactPhoto { id: id()? }),
             "createFolder" => Some(OutboxOp::CreateFolder {
                 id: id()?,
                 parent: v.get("parent").and_then(Value::as_str).map(str::to_string),
@@ -5869,7 +5901,10 @@ impl Store {
     /// - a contact a queued `UpdateContact` names (its id resolved through
     ///   `contact_aliases`) keeps its stored row: the server's version would
     ///   undo the edit before the PATCH sends it;
-    /// - a contact a queued `DeleteContact` names is not written back.
+    /// - a contact a queued `DeleteContact` names is not written back;
+    /// - a contact a queued `SetContactPhoto` names (#2065) is not removed,
+    ///   so its photo row stays for the PUT, whose 404 then reports the
+    ///   photo; a listed one is still written (the photo op sends no field).
     ///
     /// The queue is read inside the same transaction. A repeated id keeps its
     /// first record. The legacy #1934 address table is emptied. Never touches
@@ -5877,7 +5912,10 @@ impl Store {
     pub fn replace_contacts(&self, contacts: &[FolderContact]) -> Result<(), StoreError> {
         let tx = self.write_tx()?;
         let QueuedContacts {
-            edited, deleted, ..
+            edited,
+            deleted,
+            photo,
+            ..
         } = queued_contacts_on(&tx)?;
         let mut seen = HashSet::new();
         let listed: Vec<&FolderContact> = contacts
@@ -5890,7 +5928,11 @@ impl Store {
                 .collect::<Result<_, _>>()?
         };
         for id in &stored {
-            if !seen.contains(id.as_str()) && !id.starts_with("local:") && !edited.contains(id) {
+            if !seen.contains(id.as_str())
+                && !id.starts_with("local:")
+                && !edited.contains(id)
+                && !photo.contains(id)
+            {
                 tx.execute("DELETE FROM contact_records WHERE id = ?1", params![id])?;
             }
         }
@@ -6136,6 +6178,202 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// What the store knows of the photo of the contact `id` (#2065; a
+    /// Graph id, or the `local:` id it was created under): `None` when
+    /// unknown (never fetched, a refused set reverted, or no such contact),
+    /// else whether it has one, the photo, whether a local set is pending,
+    /// and whether it is current (see [`StoredContactPhoto::current`]).
+    pub fn contact_photo(&self, id: &str) -> Result<Option<StoredContactPhoto>, StoreError> {
+        let id = resolve_contact_id_on(&self.conn, id)?;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT p.has_photo, p.content_type, p.bytes, p.etag, p.pending,
+                        p.pending <> 0 OR p.change_key = r.change_key
+                 FROM contact_photos p JOIN contact_records r ON r.id = p.contact_id
+                 WHERE p.contact_id = ?1",
+                params![id],
+                |r| {
+                    let has_photo: bool = r.get(0)?;
+                    let photo = has_photo.then(|| -> rusqlite::Result<ContactPhoto> {
+                        Ok(ContactPhoto {
+                            content_type: r.get(1)?,
+                            bytes: r.get::<_, Option<Vec<u8>>>(2)?.unwrap_or_default(),
+                            etag: r.get(3)?,
+                        })
+                    });
+                    Ok(StoredContactPhoto {
+                        photo: photo.transpose()?,
+                        pending: r.get(4)?,
+                        current: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Sets the photo of a stored contact locally (#2065) and queues its
+    /// `OutboxOp::SetContactPhoto` in the same transaction (under the id
+    /// the contact is stored as), so the PUT sends it; `SyncCommand::
+    /// SetContactPhoto` then pushes it now, and without the command the next
+    /// drain sends it. The row is pending (and current) until Graph accepts
+    /// the PUT; a fetch meanwhile answers from it and records nothing. An
+    /// empty `content_type` is stored as `image/jpeg`, the type Graph takes.
+    /// `false` when no such contact is stored (nothing written or queued);
+    /// empty bytes, or more than `PHOTO_MAX`, are `StoreError::Invalid`.
+    /// Each set queues its own op; the first to run sends the latest photo.
+    pub fn set_contact_photo(
+        &self,
+        id: &str,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<bool, StoreError> {
+        if bytes.is_empty() {
+            return Err(StoreError::Invalid("a contact photo is empty".into()));
+        }
+        if bytes.len() > PHOTO_MAX {
+            return Err(StoreError::Invalid(format!(
+                "a contact photo is larger than {PHOTO_MAX} bytes"
+            )));
+        }
+        let content_type = match content_type.trim() {
+            "" => "image/jpeg",
+            t => t,
+        };
+        let tx = self.write_tx()?;
+        let id = resolve_contact_id_on(&tx, id)?;
+        let Some(change_key) = contact_change_key_on(&tx, &id)? else {
+            return Ok(false);
+        };
+        tx.execute(
+            "INSERT INTO contact_photos
+                 (contact_id, has_photo, content_type, bytes, etag, change_key, pending, revision)
+             VALUES (?1, 1, ?2, ?3, '', ?4, 1, 1)
+             ON CONFLICT(contact_id) DO UPDATE SET
+                 has_photo = 1, content_type = excluded.content_type,
+                 bytes = excluded.bytes, etag = '', change_key = excluded.change_key,
+                 pending = 1, revision = contact_photos.revision + 1",
+            params![id, content_type, bytes, change_key],
+        )?;
+        enqueue_op_on(&tx, &OutboxOp::SetContactPhoto { id })?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Records what Graph answered a photo fetch of the contact `id` (as
+    /// stored, #2065): `None` for no photo. Learnt against the contact's
+    /// stored `changeKey`. Writes nothing (`false`) while a local set is
+    /// pending, whose photo is the user's, or when the contact is not
+    /// stored.
+    pub(crate) fn record_contact_photo(
+        &self,
+        id: &str,
+        photo: Option<&ContactPhoto>,
+    ) -> Result<bool, StoreError> {
+        let tx = self.write_tx()?;
+        let Some(change_key) = contact_change_key_on(&tx, id)? else {
+            return Ok(false);
+        };
+        let pending: bool = tx
+            .query_row(
+                "SELECT pending <> 0 FROM contact_photos WHERE contact_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if pending {
+            return Ok(false);
+        }
+        let (has_photo, content_type, bytes, etag) = match photo {
+            Some(p) => (
+                true,
+                p.content_type.as_str(),
+                Some(&p.bytes),
+                p.etag.as_str(),
+            ),
+            None => (false, "", None, ""),
+        };
+        tx.execute(
+            "INSERT INTO contact_photos
+                 (contact_id, has_photo, content_type, bytes, etag, change_key, pending)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
+             ON CONFLICT(contact_id) DO UPDATE SET
+                 has_photo = excluded.has_photo, content_type = excluded.content_type,
+                 bytes = excluded.bytes, etag = excluded.etag,
+                 change_key = excluded.change_key, pending = 0",
+            params![id, has_photo, content_type, bytes, etag, change_key],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The photo a pending local set of the contact `id` (as stored) holds,
+    /// with its revision (#2065): what the PUT sends. `None` when nothing is
+    /// pending (sent by an earlier op, reverted, or the contact gone).
+    pub(crate) fn pending_contact_photo(
+        &self,
+        id: &str,
+    ) -> Result<Option<(ContactPhoto, i64)>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT content_type, bytes, revision FROM contact_photos
+                 WHERE contact_id = ?1 AND pending <> 0",
+                params![id],
+                |r| {
+                    Ok((
+                        ContactPhoto {
+                            content_type: r.get(0)?,
+                            bytes: r.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default(),
+                            etag: String::new(),
+                        },
+                        r.get(2)?,
+                    ))
+                },
+            )
+            .optional()?)
+    }
+
+    /// Graph accepted the PUT of the contact `id`'s photo at `revision`
+    /// (#2065): the row is no longer pending, learnt against the contact's
+    /// stored `changeKey`. A set written while the PUT was in flight has a
+    /// later revision and stays pending: its own op sends it. Whether the
+    /// row was confirmed.
+    pub(crate) fn confirm_contact_photo(
+        &self,
+        id: &str,
+        revision: i64,
+    ) -> Result<bool, StoreError> {
+        let n = self.conn.execute(
+            "UPDATE contact_photos SET
+                 pending = 0,
+                 change_key = COALESCE(
+                     (SELECT change_key FROM contact_records WHERE id = ?1), change_key)
+             WHERE contact_id = ?1 AND pending <> 0 AND revision = ?2",
+            params![id, revision],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Forgets the photo of the contact `id` (as stored) after Graph refused
+    /// its set (#2065), so the photo is unknown again and a client fetches
+    /// Graph's. In one transaction it first checks the queue: while a later
+    /// `SetContactPhoto` names the contact, the row (that set's photo) is
+    /// left and `false` returned. Queues nothing.
+    pub(crate) fn revert_contact_photo(&self, id: &str) -> Result<bool, StoreError> {
+        let tx = self.write_tx()?;
+        if queued_contacts_on(&tx)?.photo.contains(id) {
+            return Ok(false);
+        }
+        tx.execute(
+            "DELETE FROM contact_photos WHERE contact_id = ?1",
+            params![id],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// The id the contact `id` names is stored under now (#2063): the Graph
@@ -8258,8 +8496,25 @@ struct QueuedContacts {
     edited: HashSet<String>,
     /// Named by a `DeleteContact`.
     deleted: HashSet<String>,
-    /// Named by any contact op.
+    /// Named by a create, update or delete: the ops that read or write the
+    /// contact's fields, which a refused write's re-read waits for.
     any: HashSet<String>,
+    /// Named by a `SetContactPhoto` (#2065). Not in `any`: the photo op never
+    /// reads or writes the fields, so it holds no re-read and no write of a
+    /// listed contact, only the removal of an unlisted one.
+    photo: HashSet<String>,
+}
+
+/// The stored `change_key` of the contact `id` on `conn`, `None` when no
+/// such contact is stored (#2065).
+fn contact_change_key_on(conn: &Connection, id: &str) -> Result<Option<String>, StoreError> {
+    Ok(conn
+        .query_row(
+            "SELECT change_key FROM contact_records WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 /// `QueuedContacts` as the outbox on `conn` holds them now.
@@ -8270,6 +8525,10 @@ fn queued_contacts_on(conn: &Connection) -> Result<QueuedContacts, StoreError> {
             OutboxOp::UpdateContact { id, .. } => (id, Some(&mut q.edited)),
             OutboxOp::DeleteContact { id } => (id, Some(&mut q.deleted)),
             OutboxOp::CreateContact { id } => (id, None),
+            OutboxOp::SetContactPhoto { id } => {
+                q.photo.insert(resolve_contact_id_on(conn, &id)?);
+                continue;
+            }
             _ => continue,
         };
         let id = resolve_contact_id_on(conn, &id)?;
@@ -12516,6 +12775,353 @@ mod tests {
             s.owed_contact_rereads().unwrap(),
             [("C1".to_string(), false)]
         );
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn photo(bytes: &[u8], etag: &str) -> ContactPhoto {
+        ContactPhoto {
+            bytes: bytes.to_vec(),
+            content_type: "image/jpeg".into(),
+            etag: etag.into(),
+        }
+    }
+
+    fn photo_ops(s: &Store) -> Vec<OutboxOp> {
+        s.pending_ops()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.op)
+            .filter(|op| matches!(op, OutboxOp::SetContactPhoto { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn contact_photo_unknown_none_and_present() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[
+            contact_record("G1", "Ann", &[]),
+            contact_record("G2", "Bob", &[]),
+        ])
+        .unwrap();
+        assert_eq!(s.contact_photo("G1").unwrap(), None, "never fetched");
+        assert_eq!(s.contact_photo("NOPE").unwrap(), None);
+
+        assert!(s.record_contact_photo("G1", None).unwrap());
+        assert_eq!(
+            s.contact_photo("G1").unwrap(),
+            Some(StoredContactPhoto {
+                photo: None,
+                pending: false,
+                current: true,
+            })
+        );
+        let p = photo(&[0xFF, 0xD8, 0x00], "W/\"1\"");
+        assert!(s.record_contact_photo("G2", Some(&p)).unwrap());
+        assert_eq!(
+            s.contact_photo("G2").unwrap(),
+            Some(StoredContactPhoto {
+                photo: Some(p),
+                pending: false,
+                current: true,
+            })
+        );
+        // No such contact: nothing is recorded (and no FK error).
+        assert!(!s.record_contact_photo("NOPE", None).unwrap());
+        assert_eq!(s.contact_photo("NOPE").unwrap(), None);
+        assert!(
+            s.pending_ops().unwrap().is_empty(),
+            "a fetch queues nothing"
+        );
+    }
+
+    #[test]
+    fn contact_photo_is_not_current_after_change_key_moves() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[contact_record("G1", "Ann", &[])])
+            .unwrap();
+        s.record_contact_photo("G1", Some(&photo(b"P", "")))
+            .unwrap();
+        assert!(s.contact_photo("G1").unwrap().unwrap().current);
+        // The same changeKey again: still current.
+        s.replace_contacts(&[contact_record("G1", "Ann", &[])])
+            .unwrap();
+        assert!(s.contact_photo("G1").unwrap().unwrap().current);
+        // Graph's contact moved on (its photo set in Outlook, say).
+        let mut moved = contact_record("G1", "Ann", &[]);
+        moved.change_key = "ck-G1-2".into();
+        s.replace_contacts(&[moved]).unwrap();
+        let stored = s.contact_photo("G1").unwrap().unwrap();
+        assert!(!stored.current);
+        assert_eq!(stored.photo, Some(photo(b"P", "")), "kept until refetched");
+        // A fetch learns it against the new key.
+        s.record_contact_photo("G1", Some(&photo(b"Q", "")))
+            .unwrap();
+        assert!(s.contact_photo("G1").unwrap().unwrap().current);
+    }
+
+    #[test]
+    fn set_contact_photo_queues_its_op_in_the_same_transaction() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[contact_record("G1", "Ann", &[])])
+            .unwrap();
+        assert!(s.set_contact_photo("G1", &[1, 2, 3], "image/png").unwrap());
+        assert_eq!(
+            photo_ops(&s),
+            [OutboxOp::SetContactPhoto { id: "G1".into() }]
+        );
+        assert_eq!(
+            s.contact_photo("G1").unwrap(),
+            Some(StoredContactPhoto {
+                photo: Some(ContactPhoto {
+                    bytes: vec![1, 2, 3],
+                    content_type: "image/png".into(),
+                    etag: String::new(),
+                }),
+                pending: true,
+                current: true,
+            })
+        );
+        // Each set queues its own op; an empty type is stored as JPEG.
+        assert!(s.set_contact_photo("G1", &[4], "").unwrap());
+        assert_eq!(photo_ops(&s).len(), 2);
+        let (p, revision) = s.pending_contact_photo("G1").unwrap().unwrap();
+        assert_eq!(
+            (p.bytes, p.content_type.as_str(), revision),
+            (vec![4], "image/jpeg", 2)
+        );
+
+        // No such contact: nothing written or queued.
+        assert!(!s.set_contact_photo("NOPE", &[1], "image/jpeg").unwrap());
+        // Empty or oversized bytes are refused.
+        assert!(matches!(
+            s.set_contact_photo("G1", &[], "image/jpeg"),
+            Err(StoreError::Invalid(_))
+        ));
+        assert!(matches!(
+            s.set_contact_photo("G1", &vec![0; PHOTO_MAX + 1], "image/jpeg"),
+            Err(StoreError::Invalid(_))
+        ));
+        assert_eq!(photo_ops(&s).len(), 2);
+        assert_eq!(s.pending_contact_photo("G1").unwrap().unwrap().1, 2);
+
+        // A set by the `local:` id after the re-key queues the Graph id.
+        let local = s.create_local_contact(&full_fields()).unwrap();
+        s.reconcile_created_contact(&local, &contact_record("G9", "", &[]))
+            .unwrap();
+        assert!(s.set_contact_photo(&local, &[9], "image/jpeg").unwrap());
+        assert_eq!(
+            photo_ops(&s)[2],
+            OutboxOp::SetContactPhoto { id: "G9".into() }
+        );
+        assert!(s.contact_photo(&local).unwrap().unwrap().pending);
+    }
+
+    #[test]
+    fn record_contact_photo_keeps_a_pending_set() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[contact_record("G1", "Ann", &[])])
+            .unwrap();
+        s.set_contact_photo("G1", b"MINE", "image/jpeg").unwrap();
+        // A fetch that answered before the PUT went: Graph's old photo.
+        assert!(!s.record_contact_photo("G1", None).unwrap());
+        let stored = s.contact_photo("G1").unwrap().unwrap();
+        assert!(stored.pending);
+        assert_eq!(stored.photo.unwrap().bytes, b"MINE");
+    }
+
+    #[test]
+    fn confirm_contact_photo_keeps_a_set_written_during_the_put() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[contact_record("G1", "Ann", &[])])
+            .unwrap();
+        s.set_contact_photo("G1", b"ONE", "image/jpeg").unwrap();
+        let (_, sent) = s.pending_contact_photo("G1").unwrap().unwrap();
+        // A second set while the first PUT is in flight.
+        s.set_contact_photo("G1", b"TWO", "image/jpeg").unwrap();
+        assert!(!s.confirm_contact_photo("G1", sent).unwrap());
+        let (p, latest) = s.pending_contact_photo("G1").unwrap().unwrap();
+        assert_eq!(p.bytes, b"TWO");
+        // Its own PUT confirms it.
+        assert!(s.confirm_contact_photo("G1", latest).unwrap());
+        assert_eq!(s.pending_contact_photo("G1").unwrap(), None);
+        let stored = s.contact_photo("G1").unwrap().unwrap();
+        assert!(!stored.pending);
+        assert!(stored.current, "learnt against the stored changeKey");
+        assert_eq!(stored.photo.unwrap().bytes, b"TWO");
+        // The PUT moved Graph's changeKey: the next pass makes it stale.
+        let mut moved = contact_record("G1", "Ann", &[]);
+        moved.change_key = "ck-G1-2".into();
+        s.replace_contacts(&[moved]).unwrap();
+        assert!(!s.contact_photo("G1").unwrap().unwrap().current);
+    }
+
+    #[test]
+    fn contact_photo_follows_a_rekeyed_contact_and_goes_with_a_deleted_one() {
+        let s = Store::open_in_memory().unwrap();
+        let local = s.create_local_contact(&full_fields()).unwrap();
+        s.set_contact_photo(&local, b"P", "image/jpeg").unwrap();
+        s.reconcile_created_contact(&local, &contact_record("G1", "", &[]))
+            .unwrap();
+        let (p, _) = s.pending_contact_photo("G1").unwrap().unwrap();
+        assert_eq!(p.bytes, b"P", "the re-key moved it");
+        assert_eq!(s.contact_photo(&local).unwrap().unwrap().photo, Some(p));
+
+        // A local delete takes it.
+        s.delete_contact("G1").unwrap();
+        assert_eq!(s.contact_photo("G1").unwrap(), None);
+        assert_eq!(s.pending_contact_photo("G1").unwrap(), None);
+        let n: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM contact_photos", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+
+        // A contact Graph no longer lists, with nothing pending, goes with
+        // its photo.
+        s.replace_contacts(&[contact_record("G2", "Bob", &[])])
+            .unwrap();
+        s.record_contact_photo("G2", Some(&photo(b"B", "")))
+            .unwrap();
+        s.replace_contacts(&[]).unwrap();
+        assert_eq!(s.contact_photo("G2").unwrap(), None);
+        let n: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM contact_photos", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn replace_contacts_keeps_a_listed_contacts_photo() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[contact_record("G1", "Ann", &[])])
+            .unwrap();
+        s.record_contact_photo("G1", Some(&photo(b"P", "e1")))
+            .unwrap();
+        s.replace_contacts(&[contact_record("G1", "Ann Cole", &[])])
+            .unwrap();
+        assert_eq!(
+            s.contact_photo("G1").unwrap().unwrap().photo,
+            Some(photo(b"P", "e1"))
+        );
+        assert_eq!(
+            s.folder_contact("G1").unwrap().unwrap().fields.display_name,
+            "Ann Cole"
+        );
+    }
+
+    #[test]
+    fn full_pass_keeps_a_contact_with_a_pending_photo_set() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[
+            contact_record("G1", "Ann", &[]),
+            contact_record("G2", "Bob", &[]),
+        ])
+        .unwrap();
+        s.set_contact_photo("G1", b"P1", "image/jpeg").unwrap();
+        s.set_contact_photo("G2", b"P2", "image/jpeg").unwrap();
+        // Graph no longer lists G1 (deleted elsewhere); G2 is renamed.
+        s.replace_contacts(&[contact_record("G2", "Bob Day", &[])])
+            .unwrap();
+        // G1 stays, its photo with it, for the PUT to report.
+        assert!(s.folder_contact("G1").unwrap().is_some());
+        assert!(s.pending_contact_photo("G1").unwrap().is_some());
+        // A listed contact's fields are still written: the photo op sends
+        // no field.
+        assert_eq!(
+            s.folder_contact("G2").unwrap().unwrap().fields.display_name,
+            "Bob Day"
+        );
+        assert!(s.pending_contact_photo("G2").unwrap().is_some());
+        // Once its op is gone, the next pass removes it.
+        for r in s.pending_ops().unwrap() {
+            s.drop_op(r.seq);
+        }
+        s.replace_contacts(&[contact_record("G2", "Bob Day", &[])])
+            .unwrap();
+        assert!(s.folder_contact("G1").unwrap().is_none());
+    }
+
+    #[test]
+    fn photo_op_holds_no_contact_reread() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[contact_record("G1", "Ann", &[])])
+            .unwrap();
+        s.set_contact_photo("G1", b"P", "image/jpeg").unwrap();
+        s.owe_contact_reread("G1").unwrap();
+        assert_eq!(
+            s.owed_contact_rereads().unwrap(),
+            [("G1".to_string(), false)],
+            "the photo op names no field"
+        );
+        assert!(
+            s.revert_folder_contact("G1", Some(&contact_record("G1", "Ann (server)", &[])))
+                .unwrap()
+        );
+        assert!(
+            s.pending_contact_photo("G1").unwrap().is_some(),
+            "upsert keeps it"
+        );
+    }
+
+    #[test]
+    fn revert_contact_photo_waits_for_a_later_set() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[contact_record("G1", "Ann", &[])])
+            .unwrap();
+        s.set_contact_photo("G1", b"ONE", "image/jpeg").unwrap();
+        s.set_contact_photo("G1", b"TWO", "image/jpeg").unwrap();
+        let ops = s.pending_ops().unwrap();
+        // The first op refused and dropped: the second still names it.
+        s.drop_op(ops[0].seq);
+        assert!(!s.revert_contact_photo("G1").unwrap());
+        assert_eq!(
+            s.pending_contact_photo("G1").unwrap().unwrap().0.bytes,
+            b"TWO"
+        );
+        // The second refused too: the photo is unknown again.
+        s.drop_op(ops[1].seq);
+        assert!(s.revert_contact_photo("G1").unwrap());
+        assert_eq!(s.contact_photo("G1").unwrap(), None);
+        assert!(
+            s.folder_contact("G1").unwrap().is_some(),
+            "the contact stays"
+        );
+    }
+
+    #[test]
+    fn set_contact_photo_op_round_trips_json() {
+        let op = OutboxOp::SetContactPhoto { id: "G1".into() };
+        assert_eq!(
+            op.to_json().to_string(),
+            r#"{"kind":"setContactPhoto","id":"G1"}"#
+        );
+        let back = OutboxOp::from_json(&json::parse(&op.to_json().to_string()).unwrap());
+        assert_eq!(back, Some(op));
+        let v = json::parse(r#"{"kind":"setContactPhoto"}"#).unwrap();
+        assert_eq!(OutboxOp::from_json(&v), None, "no id is corrupt");
+    }
+
+    #[test]
+    fn contact_photos_on_a_database_from_before_the_table() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-contact-photos-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.replace_contacts(&[contact_record("G1", "Ann", &[])])
+                .unwrap();
+            s.conn.execute("DROP TABLE contact_photos", []).unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.contact_photo("G1").unwrap(), None);
+        assert!(s.set_contact_photo("G1", b"P", "image/jpeg").unwrap());
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
