@@ -31,7 +31,8 @@
 # set, and the last one's text); `{"until_alt_tips": N, "within_ms": M}`
 # asks again until N were built or M ms passed (gpui shows one 500 ms
 # after the hover) and adds `waited_ms`. `ext-doc-picture:<n>` is the
-# middle of the n-th painted inline picture.
+# middle of the n-th painted inline picture. A picture linked to a URL
+# (an imported `<a href><img></a>`, #1999) is a link like link text.
 # Each test opens its own Mail tab and closes it at the end.
 ext fixture
 
@@ -988,6 +989,53 @@ test issue 1998 an imported picture's alt shows as its tooltip on hover, light a
   assert reply.alt_tip is exactly Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Lon…
   shot window
   call theme-set {"theme":"auto"}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1999 a picture inside an imported link follows it as link text does, with the hand and its Alt Text
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-load {"images": true, "html": "<p>Before</p><p><a href='https://a.example.com/'><img src='cid:missing' alt='Shop now' width='60' height='40'></a></p><p><img src='cid:other' width='60' height='40'></p><p>After</p>"}
+  shot window
+  call ext-doc-read {}
+  assert reply.links_followed is 0
+  # The picture outside a link: no link, no hand.
+  call pointer-move {"to":"ext-doc-picture:1"}
+  call ext-doc-read {}
+  assert reply.hovered is null
+  assert reply.link_hand is false
+  # The linked one: its URL, its Alt Text as the link's text, the hand.
+  call pointer-move {"to":"ext-doc-picture:0"}
+  call ext-doc-read {}
+  assert reply.hovered.url is https://a.example.com/
+  assert reply.hovered.text is Shop now
+  assert reply.link_hand is true
+  # Ctrl+click (the default mode) follows it and selects nothing.
+  call pointer-click {"region":"ext-doc-picture:0","ctrl":true}
+  call ext-doc-read {}
+  assert reply.links_followed is 1
+  assert reply.link_calls.0 is https://a.example.com/
+  assert reply.link_texts.0.url is https://a.example.com/
+  assert reply.link_texts.0.text is Shop now
+  assert reply.selection is empty
+  # A plain click does not follow it in that mode.
+  call pointer-click {"region":"ext-doc-picture:0"}
+  call ext-doc-read {}
+  assert reply.links_followed is 1
+  # Set to follow on a plain click, it does.
+  call ext-doc-set {"link_click":"click"}
+  assert reply.link_click is click
+  call pointer-click {"region":"ext-doc-picture:0"}
+  call ext-doc-read {}
+  assert reply.links_followed is 2
+  assert reply.link_calls.1 is https://a.example.com/
+  # The picture outside a link follows nothing, by a click or Ctrl+click.
+  call pointer-click {"region":"ext-doc-picture:1"}
+  call pointer-click {"region":"ext-doc-picture:1","ctrl":true}
+  call ext-doc-read {}
+  assert reply.links_followed is 2
   call real-key {"key":"ctrl+w"}
   call tab-list {}
   assert reply.count is 1

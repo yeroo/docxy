@@ -818,7 +818,7 @@ impl DocView {
         path: Vec<usize>,
         off: usize,
         mods: Modifiers,
-        on_piece: bool,
+        piece: Option<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -826,11 +826,14 @@ impl DocView {
         self.find.field_focused = false;
         // Only a press on a painted piece is on a link: beside a row the
         // offset is the row's nearest stop, which may be a link's first or
-        // last character the person never pressed.
-        let link = on_piece
-            .then(|| docxcore::editor::resolve_para(&self.editor.doc.body, &path))
-            .flatten()
-            .and_then(|p| link_hover_at(p, off, &self.rels))
+        // last character the person never pressed. It is the piece's link:
+        // a unit's right half (a linked picture's, #1999) has the stop after
+        // it, outside the link.
+        let link = piece
+            .and_then(|at| {
+                docxcore::editor::resolve_para(&self.editor.doc.body, &path)
+                    .and_then(|p| link_hover_at(p, at, &self.rels))
+            })
             .map(|(_, link)| link);
         // Ctrl+click (⌘ on macOS) follows a link at once, in either mode, and
         // selects nothing.
