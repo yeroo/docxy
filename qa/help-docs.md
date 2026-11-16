@@ -64,6 +64,26 @@ that command's page, and the pointer leaving the window to end it.
 outside the window still opens the page of the command it last rested on (the
 Windows check: gpui sends no `MouseExited` there).
 
+## F1 in the pane you clicked
+
+**Guards:** #2077 requires F1 with the keyboard in a pane to open that pane's page,
+and a press or a key elsewhere to end it.
+
+**Steps:**
+1. On the document, View › **Navigation**. Click in the Navigation pane (on no
+   heading), move the pointer onto the document without clicking, and press **F1**.
+   Go back to the document tab.
+2. Click in the document, press **F1**. Go back.
+3. Click in the Navigation pane, press **→**, then **F1**. Go back.
+
+**Expect:**
+- Step 1 shows the Navigation pane page (`navigation`): the pane, not the
+  pointer, decides.
+- Steps 2 and 3 show the page of the ribbon tab shown.
+
+**Fails when:** F1 after a click in the pane opens the tab's page, or F1 after a
+click in the document or a key still opens the Navigation pane page.
+
 ## Search, links and history work with no network
 
 **Guards:** #1855 requires full-text search, links between pages, back/forward

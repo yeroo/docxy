@@ -94,7 +94,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the help manuals
   the search box is the registered input `help-search` (`inputs.rs`).
   `tab-list` reports `count`. `uiharness/cases/help-docs.uit` drives it;
   `qa/help-docs.md` is the offline manual case. F1 on a hovered ribbon
-  command is #1869 (below); on panes, #2077.
+  command is #1869 (below); on a focused pane, #2077 (below).
 
 ## Build-pinned manual revision (#1857)
 
@@ -177,3 +177,55 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the help manuals
   keys both, so a hovered document Bold is an exact hit; a real Word manual
   keys the document ribbon's ids (`every_ribbon_command_has_a_help_target`
   lists them).
+
+## F1 on a focused pane (#2077)
+
+- F1 with the keyboard in a pane opens its page, `pane:<id>`
+  (`help_tab::Pane`: `navigation`, `comments`, `notes`, `office-clipboard`,
+  `pivottable-fields`, `chart`, `timeline`; the table is in
+  `docs/manual/README.md`), with the ribbon tab shown as the area, so
+  `helpdocs::resolve` falls back to the area page, then the root. The order
+  in `help_f1`: a hovered ribbon command (#1869), the focused pane, the area
+  page. On a Help tab F1 is its root, as before.
+- No pane takes keys (every key still goes to the root's `on_key` and the
+  surface), so "the keyboard in a pane" is `Docxy::pane_focus`, a plain
+  field: set by a press in a pane, `None` after a press anywhere else (the
+  `MouseDownEvent` capture listener in the root's `gesture_listeners`
+  canvas, next to #1869's; it never stops the event or notifies), and `None`
+  after any key past the F1 branch but a bare modifier
+  (`keeps_pane_focus`). Keys spent before F1 (a dialog's, the backstage's, a
+  menu's, Escape closing a flyout, `document_key`'s Ctrl+S or Ctrl+Tab) keep
+  it, as Ctrl+S in Word's Navigation pane keeps the pane focused. A press
+  under an overlay keeps it too (`press_sets_pane_focus`: a menu, a ribbon
+  flyout, the backstage, the tab strip's More list and its window-wide
+  backdrop, a tab or app dialog): a press on an overlay drawn over a pane
+  is not a press in it. A harness `ribbon-click` dispatches the act, no press.
+- Every pane draws a `pane:<id>` probe over its root (each root `relative`):
+  `nav_panel`, `comments_panel`, `notes_panel`, `office_clip_panel`,
+  `pivot_panel`, `chart_panel` (beside its `chart-panel` probe) and
+  `project::timeline_el` (beside `project-timeline`). The press is
+  hit-tested against the frame on screen (`pane_at`, the last drawn wins),
+  and F1 reads `pane_focus` only while that frame still draws the pane
+  (`pane_on_screen`): a pane closed since the press, or a tab switch to a
+  surface without it, gives the area page.
+- A Chart panel field being typed into (`range_edit`, a target outside the
+  entry bars: `chart_field_live`) owns the keys, but the keyboard is in the
+  pane there: F1 opens `pane:chart` when no other entry owns the keys
+  (`other_entry_owns_keys`: the Name Box, a cell editor, a rule's range in
+  its bar, ...) and the pane is drawn (`entry_pane_help`, decided before
+  `entry_owns_keys`). The Help tab is a tab switch, so `drop_grid_state`
+  drops the field (its unsaved text) and closes the panel, as Ctrl+Tab does.
+  Every other entry still swallows F1.
+- Harness: the region `pane:<id>` (an unknown id lists the ids; `the <id>
+  pane is not drawn` off screen). Cases: the test "F1 with the keyboard in a
+  pane opens that pane's page" in `uiharness/cases/help-docs.uit` (word
+  fixture: Navigation, Comments), two in `help-f1-sheet.uit` (Office
+  Clipboard; a Chart panel field) and `help-f1-project.uit` (project
+  fixture, Timeline: help-docs.uit needs no Project manual installed).
+  `every_pane_has_a_help_target` reports every pane's page and fails on a
+  fixture `pane:` key that names no pane or a keyed pane that does not
+  resolve `exact`.
+- Out of scope: real keyboard focus in a pane (arrows in the Navigation
+  pane, F6 pane cycling), F1 in the comment bar (not part of the Comments
+  pane) and other entries, extension surfaces' panes, the Help tab's own
+  contents pane.

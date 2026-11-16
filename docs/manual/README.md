@@ -116,6 +116,20 @@ F1 resolves a context id to a page:
   pointer rests on the command (its ScreenTip need not be up), with the
   ribbon tab shown as the area.
 - A dialog id is `dialog:<id>` (`dialog:font`).
+- A pane id is `pane:<id>` (#2077). F1 asks for it while the keyboard is in
+  the pane (the last press landed in it and no key has gone to the document,
+  sheet or plan since), after a command under the pointer and ahead of the
+  area, with the ribbon tab shown as the area:
+
+  | Pane | Key | Editor |
+  |---|---|---|
+  | Navigation | `pane:navigation` | word |
+  | Comments | `pane:comments` | word |
+  | Footnotes and endnotes | `pane:notes` | word |
+  | Office Clipboard | `pane:office-clipboard` | excel |
+  | PivotTable Fields | `pane:pivottable-fields` | excel |
+  | Chart | `pane:chart` (also F1 in one of its fields) | excel |
+  | Timeline | `pane:timeline` | project |
 - An area is the ribbon tab's name, slugified by the heading rule
   (`Home` → `home`, `Page Layout` → `page-layout`,
   `Header & Footer` → `header--footer`).
