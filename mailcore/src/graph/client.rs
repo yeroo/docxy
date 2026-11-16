@@ -2387,13 +2387,15 @@ impl GraphClient {
     /// `meeting_event_id`'s narrower `eventMessageRequest` cast.
     ///
     /// When the expand fails (#2208), the message may still be there:
-    /// - a 404 (Graph answers `ErrorItemNotFound` for the whole request
-    ///   when the event the message points at is gone) is followed by a
-    ///   plain `GET /me/messages/{id}` ([`MEETING_MESSAGE_PLAIN`]): its
-    ///   answer is the message's type with `event_id: None` ("the event is
-    ///   gone"), and its own 404 is `NotFound` (the message is gone);
-    /// - a 400 (Graph refusing the inner `$select`) is followed by Graph's
-    ///   documented form, `$expand=microsoft.graph.eventMessage/event`
+    /// - a 404 (Graph's answer, by community reports and not documented,
+    ///   when the event the message points at is gone: `ErrorItemNotFound`
+    ///   for the whole request) is followed by a plain `GET
+    ///   /me/messages/{id}` ([`MEETING_MESSAGE_PLAIN`]): its answer is the
+    ///   message's type with `event_id: None` ("the event is gone"), and
+    ///   its own 404 is `NotFound` (the message is gone);
+    /// - a 400 (perhaps Graph refusing the inner `$select`; not observed)
+    ///   is followed by Graph's documented form,
+    ///   `$expand=microsoft.graph.eventMessage/event`
     ///   ([`MEETING_MESSAGE_DOCUMENTED`]), read the same way, so an event
     ///   that still exists is still found; that one's 400 or 404 is
     ///   followed by the plain GET.

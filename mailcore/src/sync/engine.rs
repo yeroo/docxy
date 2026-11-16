@@ -21013,9 +21013,10 @@ mod tests {
         "/me/messages/M1?$expand=microsoft.graph.eventMessage/event($select=id,isOrganizer)";
     const M1_DOCUMENTED: &str = "/me/messages/M1?$expand=microsoft.graph.eventMessage/event";
 
-    /// M1's GETs when the event its cancellation points at is gone: every
-    /// expand answers `expand_status` (404 `ErrorItemNotFound`, or a 400),
-    /// the plain GET the cancellation.
+    /// M1's GETs when the event its cancellation points at is gone, as the
+    /// test server models Graph's answer (#2208: a 404 `ErrorItemNotFound`
+    /// by community reports, not documented; a 400 only suspected): every
+    /// expand answers `expand_status`, the plain GET the cancellation.
     fn event_gone_routes(expand_status: u16) -> Vec<Route> {
         let refusal = if expand_status == 404 {
             M1_ITEM_NOT_FOUND
