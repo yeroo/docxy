@@ -13032,19 +13032,7 @@ mod tests {
                 ),
             ],
         );
-        handle.cmd_tx.send(SyncCommand::FetchProfile).unwrap();
-        let seen = wait_for(&handle.evt_rx, |e| {
-            matches!(e, SyncEvent::ProfileFetched { .. })
-        });
-        let profiles: Vec<&Me> = seen
-            .iter()
-            .filter_map(|e| match e {
-                SyncEvent::ProfileFetched { me } => Some(me),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(profiles.len(), 1, "{seen:?}");
-        let me = profiles[0];
+        let (me, _) = fetch_profile_once(&handle);
         assert_eq!(me.display_name, "Ada Lovelace");
         assert_eq!(me.address(), "ada@outlook.com");
         assert_eq!(me.company_name, "Contoso Ltd");
@@ -13070,6 +13058,33 @@ mod tests {
     /// which would also catch the token endpoint
     /// `/organizations/oauth2/v2.0/token` on the same fake server.
     const ORGANIZATION: &str = "/organization?$select";
+
+    /// Sends one `FetchProfile` and returns its `ProfileFetched`'s `me` and
+    /// the events up to it, checking it came exactly once (#1997): a
+    /// `FetchPhoto` marker follows (no photo route, so both photo requests
+    /// 404 and it answers `PhotoFetched { photo: None }`), and no second
+    /// `ProfileFetched` may come before that answer.
+    fn fetch_profile_once(handle: &SyncHandle) -> (Me, Vec<SyncEvent>) {
+        handle.cmd_tx.send(SyncCommand::FetchProfile).unwrap();
+        let mut seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::ProfileFetched { .. })
+        });
+        let Some(SyncEvent::ProfileFetched { me }) = seen.last().cloned() else {
+            unreachable!()
+        };
+        handle.cmd_tx.send(SyncCommand::FetchPhoto).unwrap();
+        let after = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::PhotoFetched { photo: None })
+        });
+        assert!(
+            !after
+                .iter()
+                .any(|e| matches!(e, SyncEvent::ProfileFetched { .. })),
+            "a second ProfileFetched: {after:?}"
+        );
+        seen.extend(after);
+        (me, seen)
+    }
 
     fn token_request_count(srv: &FakeServer) -> usize {
         srv.requests()
@@ -13107,13 +13122,7 @@ mod tests {
             let tokens_before = token_request_count(&srv);
             let mut seen = Vec::new();
             for _ in 0..2 {
-                handle.cmd_tx.send(SyncCommand::FetchProfile).unwrap();
-                let got = wait_for(&handle.evt_rx, |e| {
-                    matches!(e, SyncEvent::ProfileFetched { .. })
-                });
-                let Some(SyncEvent::ProfileFetched { me }) = got.last() else {
-                    unreachable!()
-                };
+                let (me, got) = fetch_profile_once(&handle);
                 assert_eq!(me.organization, "", "{status}");
                 assert_eq!(me.display_name, "Ada Lovelace", "{status}");
                 assert_eq!(me.address(), "ada@contoso.com", "{status}");
