@@ -121,8 +121,9 @@ issue number to find its notes.
   id (#1884, #1881), the body format (#1901), sync one folder, the fast cycle and Sent
   Items after a send (#1885), folders and counts on every tick, deleted folders (#1886),
   a failed send back to Drafts (#1874), the signed-in user's profile, photo and Sign
-  out (#1920), a different mailbox signing in resets the store, its outbox dropped
-  (#1946), granted scopes and a refused sign-in's `error_description` (#1875),
+  out (#1920), their company and organisation name (#1997), a different mailbox
+  signing in resets the store, its outbox dropped (#1946), granted scopes and a
+  refused sign-in's `error_description` (#1875),
   `Content-Length` on bodiless POSTs and one-line HTTP error text (#1954), inline outbound
   attachments (#1949), attachment upload progress and resumed upload sessions (#1941),
   the whole mailbox newest first, backfilled in idle time (#1871),

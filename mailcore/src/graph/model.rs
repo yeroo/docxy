@@ -1569,7 +1569,8 @@ impl AutomaticReplies {
     }
 }
 
-/// The signed-in user's profile (`GET /me?$select=displayName,mail,userPrincipalName`,
+/// The signed-in user's profile (`GET
+/// /me?$select=displayName,mail,userPrincipalName,companyName`,
 /// `GraphClient::me`). `mail` is `""` when Graph sends `null` or leaves it
 /// out, as it does for personal accounts and some tenants; [`Me::address`]
 /// then falls back to the user principal name.
@@ -1578,15 +1579,25 @@ pub struct Me {
     pub display_name: String,
     pub mail: String,
     pub user_principal_name: String,
+    /// The user's `companyName`, as sent; `""` when null or missing (#1997).
+    pub company_name: String,
+    /// The tenant's name, from `GET /organization?$select=displayName`
+    /// (`GraphClient::organization_name`), not from `/me`: the engine's
+    /// `FetchProfile` fills it. `""` when that request failed or named
+    /// nothing (#1997).
+    pub organization: String,
 }
 
 impl Me {
     /// Reads a `/me` response; a missing or non-string field is `""`.
+    /// `organization` is not in it, so it is `""` here.
     pub fn from_json(v: &Value) -> Me {
         Me {
             display_name: str_field(v, "displayName"),
             mail: str_field(v, "mail"),
             user_principal_name: str_field(v, "userPrincipalName"),
+            company_name: str_field(v, "companyName"),
+            organization: String::new(),
         }
     }
 
@@ -4033,7 +4044,7 @@ mod tests {
     #[test]
     fn me_from_json_prefers_mail() {
         let v = parse(
-            r#"{"displayName":"Ada Lovelace","mail":"ada@contoso.com","userPrincipalName":"ada@contoso.onmicrosoft.com"}"#,
+            r#"{"displayName":"Ada Lovelace","mail":"ada@contoso.com","userPrincipalName":"ada@contoso.onmicrosoft.com","companyName":"Contoso Ltd"}"#,
         )
         .unwrap();
         let me = Me::from_json(&v);
@@ -4041,6 +4052,21 @@ mod tests {
         assert_eq!(me.mail, "ada@contoso.com");
         assert_eq!(me.user_principal_name, "ada@contoso.onmicrosoft.com");
         assert_eq!(me.address(), "ada@contoso.com");
+        assert_eq!(me.company_name, "Contoso Ltd");
+        assert_eq!(me.organization, "");
+    }
+
+    #[test]
+    fn me_company_name_missing_or_null_is_blank() {
+        for body in [
+            r#"{"displayName":"Ada","companyName":null}"#,
+            r#"{"displayName":"Ada"}"#,
+            r#"{"displayName":"Ada","companyName":7}"#,
+        ] {
+            let me = Me::from_json(&parse(body).unwrap());
+            assert_eq!(me.company_name, "", "{body}");
+            assert_eq!(me.organization, "", "{body}");
+        }
     }
 
     #[test]
