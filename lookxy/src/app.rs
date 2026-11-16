@@ -952,8 +952,10 @@ impl App {
             | SyncEvent::OfflineItemsCleared { .. }
             | SyncEvent::ClearOfflineItemsRefused { .. }
             // lookxy has no meeting banner yet, so it never asks for a
-            // message's meeting type or a Remove from Calendar (#2024).
+            // message's meeting type or a Remove from Calendar (#2024), nor
+            // gets either's failure (#2208).
             | SyncEvent::MeetingMessageFetched { .. }
+            | SyncEvent::MeetingMessageFailed { .. }
             | SyncEvent::RemovedFromCalendar { .. } => {}
         }
     }
