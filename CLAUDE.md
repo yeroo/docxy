@@ -193,7 +193,7 @@ issue number to find its notes.
   lookxy's prompt (#2169), a meeting message's type filled when the class expand is refused
   (#2168), a draft's importance and follow-up flag, its flag on a PATCH only once set (#1955),
   Remove from Calendar and a meeting message's read when its event is gone, every failure
-  answered (#2208).
+  answered (#2208), the optimistic message writes returning a busy error (#2209).
 
 ## Build and test
 
