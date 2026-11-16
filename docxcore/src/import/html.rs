@@ -39,8 +39,11 @@
 //! so it follows the cascade, the reopened formatting elements and
 //! mis-nesting as formatting does; an `a` ends an open `a` first. A link
 //! has a browser's look (underline, Word's Hyperlink blue) under the page's
-//! CSS. A break, tab or picture inside a link is written outside it. The
-//! saved package gets the links' relationships.
+//! CSS. A break or tab inside a link is written outside it. A picture in a
+//! URL link keeps it as Word does, as its `wp:docPr`'s `a:hlinkClick`
+//! (#1999), the link's text either side of it staying two links; in an
+//! anchor link it is written outside the link. The saved package gets the
+//! links' relationships.
 //!
 //! Images (#1880) only through [`import_html_with`] ([`html_image`]): an
 //! `<img>` is an inline picture sized by its `width` / `height` (attributes,
@@ -70,7 +73,7 @@
 //! side margins auto is indented evenly.
 
 use super::css::{self, Color, Decl, ElemKey, Len, LineHeight, Path, StyleSheet};
-use super::html_image::{self, ImageResolver, Images, ImportedMedia, Source};
+use super::html_image::{self, ImageResolver, Images, ImportedLink, ImportedMedia, Source};
 use super::html_table::{self, CellSpec, MAX_TABLE_NESTING, TableSpec, VAlign, Width};
 use super::{
     Budget, Builder, FlowTail, Link, MAX_DEPTH, TOO_BIG, heading_props, marker_is_numbered,
@@ -100,15 +103,20 @@ use crate::editor::LINK_COLOR;
 /// Images are not converted: a [`Document`] alone cannot hold their media
 /// ([`import_html_with`] does).
 pub fn import_html(bytes: &[u8]) -> Result<Document, String> {
-    import_html_within(bytes, &Budget::standard(), None).map(|(doc, _)| doc)
+    import_html_within(bytes, &Budget::standard(), None).map(|h| h.document)
 }
 
 /// An HTML page read with its images (#1880): the document, whose pictures
-/// name import-local rids, and the media they name.
+/// name import-local rids, the media they name and the URLs of their click
+/// links (#1999). Both kinds of rid are the import's own: a caller that
+/// builds its package without [`HtmlImport::package`] maps both, or it saves
+/// pictures naming relationships the package does not have.
 #[derive(Debug)]
 pub struct HtmlImport {
     pub document: Document,
     pub media: Vec<ImportedMedia>,
+    /// The pictures' click links (`a:hlinkClick`), by import-local rid.
+    pub links: Vec<ImportedLink>,
 }
 
 impl HtmlImport {
@@ -117,10 +125,14 @@ impl HtmlImport {
     /// media: each medium a `word/media/imageN.<ext>` part of
     /// `word/document.xml`, its pictures renamed to the relationship's id.
     /// Each medium's bytes are dropped as soon as the package holds them.
+    /// Each click link is an external hyperlink relationship of
+    /// `word/document.xml` (#1999), its pictures' `a:hlinkClick` renamed to
+    /// it.
     pub fn package(self) -> Package {
         let HtmlImport {
             mut document,
             media,
+            links,
         } = self;
         let mut pkg = crate::package::new_markdown_package(Document::default());
         let mut rids = std::collections::HashMap::new();
@@ -134,15 +146,20 @@ impl HtmlImport {
                 rids.insert(m.rid, rid);
             }
         }
-        rename_embeds(&mut document.body, &rids);
+        for l in links {
+            if let Some(rid) = pkg.add_part_hyperlink("word/document.xml", &l.url) {
+                rids.insert(l.rid, rid);
+            }
+        }
+        rename_rids(&mut document.body, &rids);
         pkg.document = document;
         pkg
     }
 }
 
-/// Every picture run in `blocks` (table cells included) with its rid
-/// renamed by `map`.
-fn rename_embeds(blocks: &mut [DocBlock], map: &std::collections::HashMap<String, String>) {
+/// Every picture run in `blocks` (table cells included) with its media
+/// rid and its click link's (#1999) renamed by `map`.
+fn rename_rids(blocks: &mut [DocBlock], map: &std::collections::HashMap<String, String>) {
     for b in blocks {
         match b {
             DocBlock::Paragraph(p) => {
@@ -151,13 +168,16 @@ fn rename_embeds(blocks: &mut [DocBlock], map: &std::collections::HashMap<String
                         if let Some(new) = crate::image::replace_inline_embeds(raw, map) {
                             *raw = new;
                         }
+                        if let Some(new) = crate::image::replace_click_link(raw, map) {
+                            *raw = new;
+                        }
                     }
                 }
             }
             DocBlock::Table(t) => {
                 for row in &mut t.rows {
                     for cell in &mut row.cells {
-                        rename_embeds(&mut cell.blocks, map);
+                        rename_rids(&mut cell.blocks, map);
                     }
                 }
             }
@@ -173,8 +193,7 @@ pub fn import_html_with(
     bytes: &[u8],
     resolve: &mut ImageResolver<'_>,
 ) -> Result<HtmlImport, String> {
-    let (document, media) = import_html_within(bytes, &Budget::standard(), Some(resolve))?;
-    Ok(HtmlImport { document, media })
+    import_html_within(bytes, &Budget::standard(), Some(resolve))
 }
 
 /// [`import_html`] against `budget`, with images when `images` gives a
@@ -187,7 +206,7 @@ pub(crate) fn import_html_within(
     bytes: &[u8],
     budget: &Budget,
     images: Option<&mut ImageResolver<'_>>,
-) -> Result<(Document, Vec<ImportedMedia>), String> {
+) -> Result<HtmlImport, String> {
     // Three passes: decoding, the `<style>` scan, then the tokenizer.
     if !budget.work(3 * (bytes.len() / 16 + 1)) {
         return Err(TOO_BIG.into());
@@ -203,7 +222,7 @@ pub(crate) fn import_html_str_within(text: &str, budget: &Budget) -> Result<Docu
     if !budget.work(2 * (text.len() / 16 + 1)) {
         return Err(TOO_BIG.into());
     }
-    import_decoded(text, budget, None).map(|(doc, _)| doc)
+    import_decoded(text, budget, None).map(|h| h.document)
 }
 
 /// The import of the decoded page `text`, as [`import_html_within`] says.
@@ -211,7 +230,7 @@ fn import_decoded(
     text: &str,
     budget: &Budget,
     images: Option<&mut ImageResolver<'_>>,
-) -> Result<(Document, Vec<ImportedMedia>), String> {
+) -> Result<HtmlImport, String> {
     let sheet = StyleSheet::parse(&collect_styles(text), budget);
     let mut h = Html::new(text, budget, sheet);
     if let Some(resolve) = images {
@@ -227,7 +246,7 @@ fn import_decoded(
     if h.out.is_empty() {
         return Err("the HTML file holds no text".into());
     }
-    let media = h.images.take().map(Images::into_media).unwrap_or_default();
+    let (media, links) = h.images.take().map(Images::into_parts).unwrap_or_default();
     let props = h.flow_end_props();
     let mut doc = h.out.finish(props);
     // The page the layout above assumed (#1928): Outlook-like margins.
@@ -235,7 +254,11 @@ fn import_decoded(
     if budget.exhausted() {
         return Err(TOO_BIG.into());
     }
-    Ok((doc, media))
+    Ok(HtmlImport {
+        document: doc,
+        media,
+        links,
+    })
 }
 
 /// The page's text, in the encoding it declares.
@@ -2719,6 +2742,9 @@ impl<'a> Html<'a> {
         let src = attrs.src.as_deref().unwrap_or("").trim();
         let alt = html_image::alt_text(attrs.alt.as_deref().unwrap_or(""));
         let props = self.run_props();
+        // A picture in a URL link keeps it as its click link (#1999), as
+        // Word does; an anchor link's picture is outside the link.
+        let link = self.run_link();
         let budget = self.budget;
         let Some(images) = self.images.as_mut() else {
             return;
@@ -2738,7 +2764,6 @@ impl<'a> Html<'a> {
                 self.begin_block_object(block);
                 // Alt text in a link is the link's text, as a browser
                 // shows it (#1879).
-                let link = self.run_link();
                 self.pay_space();
                 self.out.link_text(&alt, &props, link.as_deref());
                 self.para_start = false;
@@ -2760,6 +2785,13 @@ impl<'a> Html<'a> {
         });
         let raw =
             crate::image::inline_picture_run_shaped(&rid, cx, cy, id, &name, &alt, outline, shape);
+        let raw = match link.as_deref() {
+            Some(Link::Url(url)) => images
+                .link_rid(url, budget)
+                .and_then(|lrid| crate::image::with_click_link(&raw, &lrid))
+                .unwrap_or(raw),
+            _ => raw,
+        };
         self.begin_block_object(block);
         self.pay_space();
         let heap = raw.len();
@@ -5121,8 +5153,11 @@ mod image_tests {
             asked.push(src.to_string());
             (!src.starts_with("missing")).then(|| png(40, 20))
         };
-        let (doc, media) =
-            import_html_within(html.as_bytes(), &Budget::standard(), Some(&mut resolve)).unwrap();
+        let HtmlImport {
+            document: doc,
+            media,
+            ..
+        } = import_html_within(html.as_bytes(), &Budget::standard(), Some(&mut resolve)).unwrap();
         (doc, media, asked)
     }
 
@@ -5443,8 +5478,9 @@ mod image_tests {
             b64(&png(1_000_000, 1))
         );
         let mut none = |_: &str, _: usize| None;
-        let (d, _) =
-            import_html_within(page.as_bytes(), &Budget::standard(), Some(&mut none)).unwrap();
+        let d = import_html_within(page.as_bytes(), &Budget::standard(), Some(&mut none))
+            .unwrap()
+            .document;
         let got = sizes(&d);
         assert_eq!(got.len(), 2);
         for (cx, cy) in got {
@@ -5535,12 +5571,16 @@ mod image_tests {
         );
         let mut none = |_: &str, _: usize| None;
         let roomy = Budget::standard();
-        let (d, media) = import_html_within(page.as_bytes(), &roomy, Some(&mut none)).unwrap();
+        let HtmlImport {
+            document: d, media, ..
+        } = import_html_within(page.as_bytes(), &roomy, Some(&mut none)).unwrap();
         assert_eq!(media[0].bytes, png);
         assert!(!all_pictures(&d)[0].contains("<a:ln"));
         // Room for less than the image: a placeholder, not a failure.
         let tight = Budget::new(png.len() - 1, crate::import::MAX_WORK);
-        let (d, media) = import_html_within(page.as_bytes(), &tight, Some(&mut none)).unwrap();
+        let HtmlImport {
+            document: d, media, ..
+        } = import_html_within(page.as_bytes(), &tight, Some(&mut none)).unwrap();
         assert_eq!(media[0].bytes, html_image::PLACEHOLDER_PNG);
         assert!(all_pictures(&d)[0].contains("descr=\"big\""));
         assert_eq!(paragraph_texts(&d), ["x"]);
@@ -5565,7 +5605,9 @@ mod image_tests {
             .collect();
         let mut none = |_: &str, _: usize| None;
         let full = Budget::standard();
-        let (_, media) = import_html_within(page.as_bytes(), &full, Some(&mut none)).unwrap();
+        let media = import_html_within(page.as_bytes(), &full, Some(&mut none))
+            .unwrap()
+            .media;
         assert_eq!(media.len(), 200);
         let upfront = 3 * (page.len() / 16 + 1);
         let spent = crate::import::MAX_WORK - full.work.get();
@@ -5954,9 +5996,21 @@ mod link_tests {
         assert_eq!(first(&d), split("Break"));
     }
 
-    #[test]
-    fn a_picture_in_a_link_stays_outside_it_and_its_alt_text_is_in_it() {
-        let mut resolve = |src: &str, _: usize| {
+    /// Every inline picture run of `d`, table cells' included.
+    fn all_pictures(d: &Document) -> Vec<String> {
+        all_paras(d)
+            .into_iter()
+            .flat_map(|p| p.content)
+            .filter_map(|i| match i {
+                Inline::Raw(r) if crate::image::inline_extent(&r).is_some() => Some(r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A resolver giving a 1 x 1 PNG for `logo.png` and nothing else.
+    fn logo_resolver() -> impl FnMut(&str, usize) -> Option<Vec<u8>> {
+        |src: &str, _: usize| {
             (src == "logo.png").then(|| {
                 // A 1 x 1 PNG's header is all `sniff` and the size read.
                 let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
@@ -5965,14 +6019,22 @@ mod link_tests {
                 png.extend([8, 2, 0, 0, 0, 0, 0, 0, 0]);
                 png
             })
-        };
+        }
+    }
+
+    #[test]
+    fn a_picture_in_a_link_keeps_it_as_its_click_link_1999() {
+        let mut resolve = logo_resolver();
         let page = format!(
             "<p><a href={U}>x<img src=logo.png width=10 height=10>y</a></p>\
-             <p><a href={U}><img src=missing.png alt=Logo></a></p>"
+             <p><a href={U}><img src=missing.png alt=Logo></a></p>\
+             <p><a href={U}><img src=missing.png width=20 height=20></a></p>\
+             <p><a href=https://b.test/><img src=logo.png width=10 height=10></a></p>"
         );
-        let (d, _) =
+        let got =
             import_html_within(page.as_bytes(), &Budget::standard(), Some(&mut resolve)).unwrap();
-        let ps = all_paras(&d);
+        let ps = all_paras(&got.document);
+        // The link's text either side of the picture stays two links.
         assert_eq!(
             sketch(&ps[0]),
             [
@@ -5981,7 +6043,114 @@ mod link_tests {
                 format!(r#"Link {U} ["y"]"#)
             ]
         );
+        // Unsized and unresolved: its alt is the link's text, as before.
         assert_eq!(sketch(&ps[1]), [format!(r#"Link {U} ["Logo"]"#)]);
+        assert_eq!(sketch(&ps[2]), ["Object"]);
+        assert_eq!(sketch(&ps[3]), ["Object"]);
+        let pics = all_pictures(&got.document);
+        assert_eq!(pics.len(), 3);
+        let clicks: Vec<_> = pics
+            .iter()
+            .map(|r| crate::image::inline_click_link(r))
+            .collect();
+        // One import-local rid per URL: the picture and the placeholder
+        // to one URL share it.
+        let one = Some("rIdHtmlLink1".to_string());
+        assert_eq!(clicks, [one.clone(), one, Some("rIdHtmlLink2".into())]);
+        assert_eq!(
+            got.links,
+            [
+                ImportedLink {
+                    rid: "rIdHtmlLink1".into(),
+                    url: U.into()
+                },
+                ImportedLink {
+                    rid: "rIdHtmlLink2".into(),
+                    url: "https://b.test/".into()
+                }
+            ]
+        );
+        // The placeholder's outline and the picture's media are as before.
+        assert!(pics[1].contains("<a:ln"));
+        assert_eq!(
+            crate::image::inline_embed(&pics[0]).as_deref(),
+            Some("rIdHtmlImage1")
+        );
+    }
+
+    #[test]
+    fn a_picture_outside_a_url_link_has_no_click_link_1999() {
+        let import = |page: &str| {
+            let mut resolve = logo_resolver();
+            import_html_within(page.as_bytes(), &Budget::standard(), Some(&mut resolve)).unwrap()
+        };
+        let plain = import("<p><img src=logo.png width=10 height=10></p>");
+        assert!(plain.links.is_empty());
+        let raw = all_pictures(&plain.document).remove(0);
+        assert!(!raw.contains("hlinkClick"), "{raw}");
+        assert_eq!(
+            raw,
+            crate::image::inline_picture_run_shaped(
+                "rIdHtmlImage1",
+                95250,
+                95250,
+                1,
+                "logo.png",
+                "",
+                None,
+                crate::image::PictureShape::Rect
+            ),
+            "a picture outside a link is the run it always was"
+        );
+        // Not a link (`javascript:`, relative) or an anchor link: the same
+        // run, outside the link.
+        for href in ["javascript:go()", "page.html", "#top"] {
+            let got = import(&format!(
+                "<p><a name=top></a><a href='{href}'><img src=logo.png width=10 height=10></a></p>"
+            ));
+            assert!(got.links.is_empty(), "{href}");
+            assert_eq!(
+                all_pictures(&got.document),
+                std::slice::from_ref(&raw),
+                "{href}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_linked_picture_s_package_and_save_keep_its_url_1999() {
+        let mut resolve = logo_resolver();
+        let page = format!(
+            "<p><a href='{U}?a=1&amp;b=2'><img src=logo.png width=10 height=10></a></p>\
+             <table><tr><td><a href={U}><img src=missing.png width=20 height=20></a></td></tr></table>"
+        );
+        let pkg = import_html_with(page.as_bytes(), &mut resolve)
+            .unwrap()
+            .package();
+        let check = |pkg: &Package| {
+            let rels = pkg.document_rels();
+            let pics = all_pictures(&pkg.document);
+            assert_eq!(pics.len(), 2);
+            let urls: Vec<_> = pics
+                .iter()
+                .map(|r| {
+                    let rid = crate::image::inline_click_link(r).expect("a click link");
+                    rels.external_target(&rid).map(str::to_string)
+                })
+                .collect();
+            assert_eq!(
+                urls,
+                [Some(format!("{U}?a=1&b=2")), Some(U.to_string())],
+                "each picture's rid names its URL, a table cell's included"
+            );
+            for r in &pics {
+                let embed = crate::image::inline_embed(r).unwrap();
+                assert!(rels.target(&embed).unwrap().starts_with("media/"));
+            }
+        };
+        check(&pkg);
+        let saved = crate::package::save_package(&pkg);
+        check(&crate::package::load_package(&saved).unwrap());
     }
 
     #[test]
@@ -6084,7 +6253,7 @@ mod centering_tests {
         let mut resolve = |_: &str, _: usize| Some(png.clone());
         import_html_within(html.as_bytes(), &Budget::standard(), Some(&mut resolve))
             .unwrap()
-            .0
+            .document
     }
 
     /// Every table of `d`, top-level and nested, in document order.

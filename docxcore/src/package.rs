@@ -2769,6 +2769,45 @@ impl Package {
         Some(rid)
     }
 
+    /// Add an external hyperlink relationship to `url` to `part`'s
+    /// relationships (#1999: a picture's `a:hlinkClick` names it), making the
+    /// relationships part, and `[Content_Types].xml`'s `rels` Default, when
+    /// missing. Its id is a fresh `rIdN`. `None`, with nothing changed, when
+    /// `part` is missing or its relationships cannot be read or extended.
+    pub fn add_part_hyperlink(&mut self, part: &str, url: &str) -> Option<String> {
+        self.part(part)?;
+        let rels_name = part_rels_name(part)?;
+        let existing = self.part(&rels_name);
+        let rels_text = match existing {
+            Some(bytes) => decode_xml_part(bytes)?.into_owned(),
+            None => format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"{PACKAGE_RELATIONSHIPS_NS}\"></Relationships>"
+            ),
+        };
+        let rels = parse_rels_xml(&rels_text);
+        let mut num = next_rid_num(&rels_text);
+        // `next_rid_num` only sees `Id="rIdN"`; skip ids spelled otherwise.
+        while rels.target(&format!("rId{num}")).is_some() {
+            num += 1;
+        }
+        let rid = format!("rId{num}");
+        let rel = format!(
+            "<Relationship Id=\"{rid}\" Type=\"{HYPERLINK_REL}\" Target=\"{}\" TargetMode=\"External\"/>",
+            esc_xml_attr(url)
+        );
+        let updated = append_relationships(&rels_text, &rel)?;
+        let (rels, content_types) = match existing {
+            Some(bytes) => (encode_like(bytes, &updated), None),
+            None => (updated.into_bytes(), self.content_types_with_rels_default()),
+        };
+        self.apply_part_rels(PartRelsUpdate {
+            rels_name,
+            rels,
+            content_types,
+        });
+        Some(rid)
+    }
+
     /// N for a new `word/media/imageN.*` part: one past the largest in use,
     /// whatever its extension; past `u32::MAX`, the smallest N not in use.
     fn unused_media_number(&self) -> u32 {
@@ -8460,6 +8499,67 @@ mod tests {
             pkg.link_part_hyperlinks("word/header1.xml", &mut blocks),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn add_part_hyperlink_adds_an_external_relationship_1999() {
+        let mut pkg = new_package(Document::default());
+        let before = pkg.document_rels();
+        let rid = pkg
+            .add_part_hyperlink("word/document.xml", "https://a.example/?x=1&y=2")
+            .expect("a document part");
+        assert!(before.target(&rid).is_none(), "{rid} is a fresh id");
+        let rels = pkg.document_rels();
+        assert_eq!(rels.len(), before.len() + 1);
+        assert_eq!(rels.target(&rid), Some("https://a.example/?x=1&y=2"));
+        assert_eq!(
+            rels.external_target(&rid),
+            Some("https://a.example/?x=1&y=2")
+        );
+        let text = pkg.part_text("word/_rels/document.xml.rels").unwrap();
+        assert!(text.contains("Target=\"https://a.example/?x=1&amp;y=2\" TargetMode=\"External\""));
+        // A second one takes the next id.
+        let next = pkg
+            .add_part_hyperlink("word/document.xml", "https://b.example/")
+            .unwrap();
+        assert_ne!(next, rid);
+        assert_eq!(
+            pkg.document_rels().target(&rid),
+            Some("https://a.example/?x=1&y=2")
+        );
+    }
+
+    #[test]
+    fn add_part_hyperlink_makes_missing_rels_and_refuses_a_missing_part_1999() {
+        let mut pkg = new_package(Document::default());
+        // A package whose content types lack the rels Default.
+        let ct = pkg.part_text("[Content_Types].xml").unwrap();
+        let rels_default = start_tags(&ct, "Default")
+            .into_iter()
+            .map(|(_, el)| el)
+            .find(|el| xml_attr_value(el, "Extension").as_deref() == Some("rels"))
+            .expect("new packages declare rels")
+            .to_string();
+        assert!(pkg.set_part_text("[Content_Types].xml", &ct.replace(&rels_default, "")));
+        pkg.parts
+            .push(("word/header1.xml".to_string(), b"<w:hdr/>".to_vec()));
+        let rid = pkg
+            .add_part_hyperlink("word/header1.xml", "mailto:a@example.com")
+            .unwrap();
+        assert_eq!(rid, "rId1");
+        let rels = parse_rels_xml(&pkg.part_text("word/_rels/header1.xml.rels").unwrap());
+        assert_eq!(rels.external_target("rId1"), Some("mailto:a@example.com"));
+        assert!(
+            pkg.part_text("[Content_Types].xml")
+                .unwrap()
+                .contains("Extension=\"rels\"")
+        );
+        let before = pkg.clone();
+        assert_eq!(
+            pkg.add_part_hyperlink("word/missing.xml", "https://a.example/"),
+            None
+        );
+        assert_eq!(pkg.parts, before.parts);
     }
 
     #[test]
