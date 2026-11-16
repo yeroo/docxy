@@ -52,12 +52,14 @@ impl UserIds {
     }
 
     /// The number of addresses kept, found or not.
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
         self.map().len()
     }
 
     /// Whether no address is kept.
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.map().is_empty()
     }
 
@@ -2526,19 +2528,7 @@ impl GraphClient {
                 let Some(id) = item.get("id").and_then(Value::as_str) else {
                     continue;
                 };
-                let text = |k: &str| {
-                    item.get(k)
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string()
-                };
-                found.insert(
-                    id.to_ascii_lowercase(),
-                    Presence {
-                        availability: text("availability"),
-                        activity: text("activity"),
-                    },
-                );
+                found.insert(id.to_ascii_lowercase(), Presence::from_json(item));
             }
         }
         Ok(addresses

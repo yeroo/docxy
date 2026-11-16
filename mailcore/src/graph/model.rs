@@ -425,6 +425,16 @@ pub struct Presence {
     pub activity: String,
 }
 
+impl Presence {
+    /// One item of the answer's `value`; its `id` is the caller's to read.
+    pub fn from_json(v: &Value) -> Self {
+        Presence {
+            availability: str_field(v, "availability"),
+            activity: str_field(v, "activity"),
+        }
+    }
+}
+
 /// A Contacts-folder contact's photo (#2065): what
 /// `GET /me/contacts/{id}/photo/$value` returns, and what a set PUTs.
 #[derive(Debug, Clone, PartialEq, Eq)]
