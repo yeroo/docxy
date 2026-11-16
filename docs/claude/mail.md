@@ -249,8 +249,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
 
 ## The signed-in user's profile, photo and Sign out (#1920)
 
-- `GraphClient::me()` is `GET /me?$select=displayName,mail,userPrincipalName`
-  (only `User.Read`), giving a `model::Me`. `mail` is `""` when Graph sends
+- `GraphClient::me()` is `GET
+  /me?$select=displayName,mail,userPrincipalName,companyName` (only
+  `User.Read`; `companyName` since #1997, see the next section), giving a
+  `model::Me`. `mail` is `""` when Graph sends
   `null` or leaves it out (personal accounts, some tenants), and
   `Me::address()` then falls back to `user_principal_name`.
 - `GraphClient::my_photo()` is `GET /me/photo/$value`, then on a 404
@@ -281,6 +283,32 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   that filled the store is checked before anything drains: see "A different
   mailbox signing in (#1946)".
 - lookxy ignores `ProfileFetched` / `PhotoFetched` (it never asks for them).
+
+## The user's company and organisation (#1997)
+
+- `Me::company_name` is `/me`'s `companyName`, as sent (not trimmed, like the
+  other `/me` fields); `""` when null, missing or not a string.
+- `Me::organization` is the tenant's name, from
+  `GraphClient::organization_name()`: `GET /organization?$select=displayName`
+  (`User.Read` may read `displayName`; a guest or a personal account gets a
+  403). It reads the first `value` item's `displayName`, trimmed: `Ok(None)`
+  for an empty `value` or a null, missing or blank name; a body with no
+  `value` array is a `Parse` error. `Me::from_json` leaves it `""`.
+- `FetchProfile` asks `/me` through `with_auth` as before, and only once it
+  answered asks `/organization`, on `self.client()` (the token `/me` used,
+  refreshed if it had to be), outside `with_auth`. That second request is
+  best-effort: any failure, a 401 included, leaves `organization` `""`, and
+  one `ProfileFetched { me }` is still emitted. Nothing of it reaches
+  `react`: no `Error`, no throttle back-off, no Offline, no token refresh and
+  no sign-in. Why not refresh on its 401: `/me` has just accepted the same
+  token, so a 401 here is not an expired token, and the issue allows leaving
+  the name blank. A failing `/me` goes through `react` as before and asks no
+  `/organization`.
+- Tests: the fake server matches routes by prefix, and engine tests serve the
+  token endpoint `/organizations/oauth2/v2.0/token` from the same server, so
+  an `/organization` route's prefix is `/organization?$select`, never a bare
+  `/organization`. An engine test without that route gets the fake server's
+  404, so `organization` is `""`.
 
 ## Granted scopes and a refused sign-in's error_description (#1875)
 
