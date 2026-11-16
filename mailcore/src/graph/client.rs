@@ -115,6 +115,31 @@ pub(crate) fn is_expired_sync_state(e: &GraphError) -> bool {
     }
 }
 
+/// Whether `e` says a user's photo is not there (#2157): a 404, or any
+/// status whose Graph `error.code` is `ImageNotFound` (compared
+/// case-insensitively), which Exchange can send with another status.
+fn is_photo_not_found(e: &GraphError) -> bool {
+    match e {
+        GraphError::NotFound => true,
+        GraphError::Http { body, .. } => json::parse(body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")?
+                    .get("code")?
+                    .as_str()
+                    .map(|c| c.trim().eq_ignore_ascii_case("ImageNotFound"))
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// `s` as an OData string literal's inside: each `'` doubled, so the
+/// literal cannot be ended early (#2157).
+fn odata_string(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 /// `s` as one line: every run of whitespace (newlines and tabs included)
 /// becomes one space, other control characters are dropped, the ends are
 /// trimmed, and past `max` characters it is cut (on a `char`) to end in `…`
@@ -2315,6 +2340,94 @@ impl GraphClient {
         match self.get_photo("/me/photos/48x48/$value") {
             Err(GraphError::NotFound) => Ok(None),
             other => other.map(pair),
+        }
+    }
+
+    /// Another user's photo, found by e-mail address (#2157), as
+    /// `(bytes, content type)`: the sender's photo a reading pane draws
+    /// instead of initials. `address` is trimmed; a blank one is `Ok(None)`
+    /// with no request.
+    ///
+    /// The address is resolved to a user id first (`user_id_by_address`):
+    /// `GET /users?$filter=mail eq '<address>'&$select=id`, then, when that
+    /// finds no one and the address has an `@`, `GET /users/<address>?$select=id`
+    /// (the UPN). `/users/{x}/photo/$value` alone would find only an id or
+    /// a UPN, never `mail`, which is what a sender's address usually is. An
+    /// alias that is neither `mail` nor the UPN is not found (`Ok(None)`):
+    /// matching `proxyAddresses/any(...)` is an advanced query
+    /// (`ConsistencyLevel: eventual` with `$count=true`), and `proxyAddresses`
+    /// is not a basic property, so it would need `User.Read.All`. Left out
+    /// on purpose.
+    ///
+    /// Then `GET /users/{id}/photo/$value`, falling back to
+    /// `/users/{id}/photos/48x48/$value` as [`GraphClient::my_photo`] does,
+    /// through the same `get_photo` (`Accept: image/*`, the content type,
+    /// [`PHOTO_MAX`] refused as a `Parse` error). Not found on a photo
+    /// request is a 404, or any status whose Graph `error.code` is
+    /// `ImageNotFound` (`is_photo_not_found`); both not found is `Ok(None)`.
+    /// Any other error, on any request, is returned as it is, with no
+    /// further request.
+    ///
+    /// Requires `User.ReadBasic.All`, which `AuthConfig::default()` does not
+    /// ask for: a token or tenant without it answers 403
+    /// (`GraphError::Http`).
+    pub fn user_photo(&self, address: &str) -> Result<Option<(Vec<u8>, String)>, GraphError> {
+        let address = address.trim();
+        if address.is_empty() {
+            return Ok(None);
+        }
+        let Some(id) = self.user_id_by_address(address)? else {
+            return Ok(None);
+        };
+        let id = encode_path_segment(&id);
+        let pair = |p: ContactPhoto| Some((p.bytes, p.content_type));
+        match self.get_photo(&format!("/users/{id}/photo/$value")) {
+            Err(e) if is_photo_not_found(&e) => {}
+            other => return other.map(pair),
+        }
+        match self.get_photo(&format!("/users/{id}/photos/48x48/$value")) {
+            Err(e) if is_photo_not_found(&e) => Ok(None),
+            other => other.map(pair),
+        }
+    }
+
+    /// The id of the user whose `mail` is `address` (the first one Graph
+    /// lists with a non-empty `id`), or else, for an address with an `@`,
+    /// of the user whose UPN it is (#2157). `Ok(None)` when the filter finds
+    /// no one and the UPN request is a 404, or is not sent: an `@`-less
+    /// address is never a UPN, and `/users/{x}` would read an id-shaped `x`
+    /// as an object id. The address goes in the filter with each `'`
+    /// doubled (`odata_string`), the whole filter percent-encoded, and in
+    /// the UPN path percent-encoded. A filter answer that is not JSON or has
+    /// no `value` array is a `Parse` error; a UPN answer without an `id` is
+    /// `Ok(None)`. Any other error is returned as it is: a 400 on the UPN
+    /// request (a malformed id) is not "no such user".
+    fn user_id_by_address(&self, address: &str) -> Result<Option<String>, GraphError> {
+        let id_of = |v: &Value| {
+            v.get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        };
+        let filter = encode_path_segment(&format!("mail eq '{}'", odata_string(address)));
+        let resp = self.send(
+            Method::Get,
+            &format!("/users?$filter={filter}&$select=id"),
+            None,
+            &[],
+        )?;
+        let v = parse_body(resp)?;
+        if let Some(id) = value_array(&v, "value")?.iter().find_map(id_of) {
+            return Ok(Some(id));
+        }
+        if !address.contains('@') {
+            return Ok(None);
+        }
+        let path = format!("/users/{}?$select=id", encode_path_segment(address));
+        match self.send(Method::Get, &path, None, &[]) {
+            Ok(resp) => Ok(id_of(&parse_body(resp)?)),
+            Err(GraphError::NotFound) => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -6768,6 +6881,324 @@ mod tests {
 
     const PHOTO: &str = "/me/photo/$value";
     const PHOTO_48: &str = "/me/photos/48x48/$value";
+
+    // --- Another user's photo by address (#2157) ---------------------------
+
+    const ADA: &str = "ada@contoso.com";
+    const ADA_FILTER: &str = "/users?$filter=mail%20eq%20%27ada%40contoso.com%27&$select=id";
+    const ADA_UPN: &str = "/users/ada%40contoso.com?$select=id";
+    const U1_PHOTO: &str = "/users/U1/photo/$value";
+    const U1_PHOTO_48: &str = "/users/U1/photos/48x48/$value";
+
+    fn request_paths(srv: &FakeServer) -> Vec<String> {
+        srv.requests().into_iter().map(|r| r.path).collect()
+    }
+
+    #[test]
+    fn user_photo_found_by_mail() {
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 200, r#"{"value":[{"id":"U1"}]}"#, &[]),
+            photo_route(
+                U1_PHOTO,
+                200,
+                "JPEGDATA",
+                &[("Content-Type", "image/jpeg; charset=binary")],
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.user_photo(ADA),
+            Ok(Some((b"JPEGDATA".to_vec(), "image/jpeg".to_string())))
+        );
+        assert_eq!(request_paths(&srv), [ADA_FILTER, U1_PHOTO]);
+        let reqs = srv.requests();
+        let accepts: Vec<&str> = reqs[1]
+            .headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("accept"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(accepts, ["image/*"]);
+    }
+
+    #[test]
+    fn user_photo_takes_the_first_listed_user_with_an_id() {
+        let srv = FakeServer::start(vec![
+            photo_route(
+                ADA_FILTER,
+                200,
+                r#"{"value":[{"id":""},{"id":null},{"id":"U1"},{"id":"U9"}]}"#,
+                &[],
+            ),
+            photo_route(U1_PHOTO, 200, "P", &[("Content-Type", "image/png")]),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.user_photo(ADA),
+            Ok(Some((b"P".to_vec(), "image/png".to_string())))
+        );
+        assert_eq!(request_paths(&srv), [ADA_FILTER, U1_PHOTO]);
+    }
+
+    #[test]
+    fn user_photo_found_by_upn_after_mail_misses() {
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 200, r#"{"value":[]}"#, &[]),
+            photo_route(ADA_UPN, 200, r#"{"id":"U2"}"#, &[]),
+            photo_route(
+                "/users/U2/photo/$value",
+                200,
+                "UPN",
+                &[("Content-Type", "image/jpeg")],
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.user_photo(ADA),
+            Ok(Some((b"UPN".to_vec(), "image/jpeg".to_string())))
+        );
+        assert_eq!(
+            request_paths(&srv),
+            [ADA_FILTER, ADA_UPN, "/users/U2/photo/$value"]
+        );
+    }
+
+    #[test]
+    fn user_photo_none_when_no_user() {
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 200, r#"{"value":[]}"#, &[]),
+            photo_route(
+                ADA_UPN,
+                404,
+                r#"{"error":{"code":"Request_ResourceNotFound"}}"#,
+                &[],
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.user_photo(ADA), Ok(None));
+        assert_eq!(request_paths(&srv), [ADA_FILTER, ADA_UPN]);
+    }
+
+    #[test]
+    fn user_photo_without_at_skips_upn() {
+        let filter = "/users?$filter=mail%20eq%20%27ada%27&$select=id";
+        let srv = FakeServer::start(vec![
+            photo_route(filter, 200, r#"{"value":[]}"#, &[]),
+            photo_route("/users/ada?$select=id", 200, r#"{"id":"U1"}"#, &[]),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.user_photo("ada"), Ok(None));
+        assert_eq!(request_paths(&srv), [filter]);
+    }
+
+    #[test]
+    fn user_photo_blank_address_sends_nothing() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.user_photo(""), Ok(None));
+        assert_eq!(c.user_photo(" \t "), Ok(None));
+        assert!(srv.requests().is_empty());
+    }
+
+    #[test]
+    fn user_photo_trims_the_address() {
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 200, r#"{"value":[]}"#, &[]),
+            photo_route(ADA_UPN, 404, "{}", &[]),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.user_photo("  ada@contoso.com\n"), Ok(None));
+        assert_eq!(request_paths(&srv), [ADA_FILTER, ADA_UPN]);
+    }
+
+    #[test]
+    fn user_photo_falls_back_to_48x48() {
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 200, r#"{"value":[{"id":"U1"}]}"#, &[]),
+            photo_route(U1_PHOTO, 404, r#"{"error":{"code":"ImageNotFound"}}"#, &[]),
+            photo_route(U1_PHOTO_48, 200, "SMALL", &[("Content-Type", "image/png")]),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.user_photo(ADA),
+            Ok(Some((b"SMALL".to_vec(), "image/png".to_string())))
+        );
+        assert_eq!(request_paths(&srv), [ADA_FILTER, U1_PHOTO, U1_PHOTO_48]);
+    }
+
+    #[test]
+    fn user_photo_none_when_both_photos_not_found() {
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 200, r#"{"value":[{"id":"U1"}]}"#, &[]),
+            photo_route(U1_PHOTO, 404, "{}", &[]),
+            photo_route(
+                U1_PHOTO_48,
+                400,
+                r#"{"error":{"code":"imagenotfound","message":"no photo"}}"#,
+                &[],
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.user_photo(ADA), Ok(None));
+        assert_eq!(request_paths(&srv), [ADA_FILTER, U1_PHOTO, U1_PHOTO_48]);
+    }
+
+    #[test]
+    fn user_photo_image_not_found_with_other_status_falls_back() {
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 200, r#"{"value":[{"id":"U1"}]}"#, &[]),
+            photo_route(
+                U1_PHOTO,
+                400,
+                r#"{"error":{"code":"ImageNotFound","message":"Exception of type ..."}}"#,
+                &[],
+            ),
+            photo_route(U1_PHOTO_48, 200, "SMALL", &[("Content-Type", "image/png")]),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.user_photo(ADA),
+            Ok(Some((b"SMALL".to_vec(), "image/png".to_string())))
+        );
+        assert_eq!(request_paths(&srv), [ADA_FILTER, U1_PHOTO, U1_PHOTO_48]);
+    }
+
+    #[test]
+    fn user_photo_refuses_oversize() {
+        let big = "x".repeat(PHOTO_MAX + 1);
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 200, r#"{"value":[{"id":"U1"}]}"#, &[]),
+            photo_route(U1_PHOTO, 200, &big, &[("Content-Type", "image/jpeg")]),
+            photo_route(U1_PHOTO_48, 200, "SMALL", &[("Content-Type", "image/png")]),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        match c.user_photo(ADA) {
+            Err(GraphError::Parse(m)) => assert!(m.contains("larger than"), "{m}"),
+            other => panic!(
+                "expected a Parse error, got {:?}",
+                other.map(|p| p.map(|(b, t)| (b.len(), t)))
+            ),
+        }
+        assert_eq!(request_paths(&srv), [ADA_FILTER, U1_PHOTO]);
+    }
+
+    #[test]
+    fn user_photo_escapes_address() {
+        let address = "o'brien+x&y#z@contoso.com";
+        let filter = "/users?$filter=mail%20eq%20%27o%27%27brien%2Bx%26y%23z%40contoso.com%27\
+                      &$select=id";
+        let upn = "/users/o%27brien%2Bx%26y%23z%40contoso.com?$select=id";
+        let srv = FakeServer::start(vec![
+            photo_route(filter, 200, r#"{"value":[]}"#, &[]),
+            photo_route(upn, 200, r#"{"id":"a/b+c"}"#, &[]),
+            photo_route(
+                "/users/a%2Fb%2Bc/photo/$value",
+                200,
+                "P",
+                &[("Content-Type", "image/jpeg")],
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.user_photo(address),
+            Ok(Some((b"P".to_vec(), "image/jpeg".to_string())))
+        );
+        assert_eq!(
+            request_paths(&srv),
+            [filter, upn, "/users/a%2Fb%2Bc/photo/$value"]
+        );
+    }
+
+    #[test]
+    fn user_photo_forbidden_is_http_403() {
+        // A 403 on the filter: no UPN request.
+        let srv = FakeServer::start(vec![
+            photo_route(
+                ADA_FILTER,
+                403,
+                r#"{"error":{"code":"Authorization_RequestDenied"}}"#,
+                &[],
+            ),
+            photo_route(ADA_UPN, 200, r#"{"id":"U1"}"#, &[]),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.user_photo(ADA),
+            Err(GraphError::Http { status: 403, .. })
+        ));
+        assert_eq!(request_paths(&srv), [ADA_FILTER]);
+        // A 403 on the photo whose code is not `ImageNotFound`: no 48x48.
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 200, r#"{"value":[{"id":"U1"}]}"#, &[]),
+            photo_route(
+                U1_PHOTO,
+                403,
+                r#"{"error":{"code":"ErrorAccessDenied"}}"#,
+                &[],
+            ),
+            photo_route(U1_PHOTO_48, 200, "SMALL", &[("Content-Type", "image/png")]),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.user_photo(ADA),
+            Err(GraphError::Http { status: 403, .. })
+        ));
+        assert_eq!(request_paths(&srv), [ADA_FILTER, U1_PHOTO]);
+    }
+
+    #[test]
+    fn user_photo_propagates_other_errors() {
+        // A 500 on the UPN request is that error, not `None`.
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 200, r#"{"value":[]}"#, &[]),
+            photo_route(ADA_UPN, 500, "boom", &[]),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.user_photo(ADA),
+            Err(GraphError::Http {
+                status: 500,
+                body: "boom".into()
+            })
+        );
+        // A filter answer with no `value` array is a Parse error.
+        let srv = FakeServer::start(vec![photo_route(ADA_FILTER, 200, "{}", &[])]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(c.user_photo(ADA), Err(GraphError::Parse(_))));
+        assert_eq!(request_paths(&srv), [ADA_FILTER]);
+        // A 404 on the photo, then a 500 on 48x48, is the 500.
+        let srv = FakeServer::start(vec![
+            photo_route(ADA_FILTER, 200, r#"{"value":[{"id":"U1"}]}"#, &[]),
+            photo_route(U1_PHOTO, 404, "{}", &[]),
+            photo_route(U1_PHOTO_48, 500, "boom", &[]),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            c.user_photo(ADA),
+            Err(GraphError::Http {
+                status: 500,
+                body: "boom".into()
+            })
+        );
+    }
+
+    #[test]
+    fn is_photo_not_found_reads_404_and_image_not_found() {
+        assert!(is_photo_not_found(&GraphError::NotFound));
+        for code in ["ImageNotFound", "imagenotfound", " IMAGENOTFOUND "] {
+            let body = format!(r#"{{"error":{{"code":"{code}"}}}}"#);
+            assert!(is_photo_not_found(&GraphError::Http { status: 400, body }));
+        }
+        for body in ["", "boom", r#"{"error":{"code":"ErrorAccessDenied"}}"#] {
+            assert!(!is_photo_not_found(&GraphError::Http {
+                status: 403,
+                body: body.into()
+            }));
+        }
+        assert!(!is_photo_not_found(&GraphError::Unauthorized));
+        assert!(!is_photo_not_found(&GraphError::Parse("x".into())));
+        assert_eq!(odata_string("o'brien''s"), "o''brien''''s");
+    }
 
     #[test]
     fn me_parses_profile() {
