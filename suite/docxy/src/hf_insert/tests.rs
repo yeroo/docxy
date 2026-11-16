@@ -289,13 +289,9 @@ fn a_document_property_control_goes_into_the_header_bound() {
     let mut t = with_core("property", "Ann", "Quarterly Report");
     open_header(&mut t);
     let control = property_control(&t, BoundProp::Title);
-    hf_ed(&mut t).paste(&Clip {
-        paras: vec![control],
-    });
+    hf_ed(&mut t).paste(&Clip::new(vec![control]));
     let control = property_control(&t, BoundProp::Status);
-    hf_ed(&mut t).paste(&Clip {
-        paras: vec![control],
-    });
+    hf_ed(&mut t).paste(&Clip::new(vec![control]));
     let (pkg, xml) = saved_header(&mut t);
     assert!(xml.contains("<w:alias w:val=\"Title\"/>"), "{xml}");
     assert!(
@@ -326,9 +322,7 @@ fn a_property_controls_id_is_unique_in_the_document() {
         let body_control =
             docxcore::sdt::core_property_control(BoundProp::Author, "", 41, &Default::default());
         ed.caret = docxcore::editor::Caret::at(vec![0], 0);
-        ed.paste(&Clip {
-            paras: vec![body_control],
-        });
+        ed.paste(&Clip::new(vec![body_control]));
     }
     let control = property_control(&t, BoundProp::Author);
     let Inline::Raw(open) = &control[0] else {
@@ -351,16 +345,12 @@ fn typing_in_a_property_control_writes_the_property_back_1433() {
         };
         ed.set_caret(docxcore::editor::Caret::at(vec![0], offset));
         ed.anchor = None;
-        ed.paste(&Clip {
-            paras: vec![control],
-        });
+        ed.paste(&Clip::new(vec![control]));
     }
     // The body's Title control; a second one in the header.
     open_header(&mut t);
     let control = property_control(&t, BoundProp::Title);
-    hf_ed(&mut t).paste(&Clip {
-        paras: vec![control],
-    });
+    hf_ed(&mut t).paste(&Clip::new(vec![control]));
     let part = |t: &DocTab, name: &str| t.pkg.as_ref().unwrap().part_text(name).unwrap();
     let body_text = |t: &DocTab| match &t.surface {
         Surface::Doc(ed) => ed.doc.body[0].plain_text(),
@@ -427,9 +417,7 @@ fn only_typing_in_a_control_writes_the_property_1433() {
     };
     ed.set_caret(docxcore::editor::Caret::at(vec![0], 0));
     ed.anchor = None;
-    ed.paste(&Clip {
-        paras: vec![control],
-    });
+    ed.paste(&Clip::new(vec![control]));
     // The caret stands in the control's text.
     ed.set_caret(docxcore::editor::Caret::at(vec![0], 4));
     t.set_dirty();
@@ -477,9 +465,7 @@ fn only_typing_in_a_control_writes_the_property_1433() {
     let Surface::Doc(ed) = &mut t.surface else {
         panic!()
     };
-    ed.paste(&Clip {
-        paras: vec![control],
-    });
+    ed.paste(&Clip::new(vec![control]));
     t.set_dirty();
     open_header(&mut t);
     let newer = core(&t).replace("Quarterly Report", "New");
@@ -506,15 +492,11 @@ fn a_property_copied_to_the_other_editor_is_an_undo_step_there_1433() {
     let Surface::Doc(ed) = &mut t.surface else {
         panic!()
     };
-    ed.paste(&Clip {
-        paras: vec![control],
-    });
+    ed.paste(&Clip::new(vec![control]));
     t.set_dirty();
     open_header(&mut t);
     let control = property_control(&t, BoundProp::Title);
-    hf_ed(&mut t).paste(&Clip {
-        paras: vec![control],
-    });
+    hf_ed(&mut t).paste(&Clip::new(vec![control]));
     t.set_dirty();
     let core = |t: &DocTab| {
         t.pkg
@@ -579,15 +561,11 @@ fn typing_in_a_header_control_is_one_step_in_each_editor_1433() {
     let Surface::Doc(ed) = &mut t.surface else {
         panic!()
     };
-    ed.paste(&Clip {
-        paras: vec![control],
-    });
+    ed.paste(&Clip::new(vec![control]));
     t.set_dirty();
     open_header(&mut t);
     let control = property_control(&t, BoundProp::Title);
-    hf_ed(&mut t).paste(&Clip {
-        paras: vec![control],
-    });
+    hf_ed(&mut t).paste(&Clip::new(vec![control]));
     t.set_dirty();
     let body_names = |t: &DocTab| match &t.surface {
         Surface::Doc(ed) => ed.undo_names(),
@@ -645,9 +623,7 @@ fn two_properties_changed_in_one_step_are_both_written_1433() {
         };
         ed.set_caret(docxcore::editor::Caret::at(vec![0], offset));
         ed.anchor = None;
-        ed.paste(&Clip {
-            paras: vec![control],
-        });
+        ed.paste(&Clip::new(vec![control]));
     }
     t.set_dirty();
     let Surface::Doc(ed) = &mut t.surface else {
@@ -738,9 +714,7 @@ fn a_wide_jpeg_is_scaled_and_its_id_is_unique() {
     if let Surface::Doc(ed) = &mut t.surface {
         ed.caret = docxcore::editor::Caret::at(vec![0], 0);
         let run = docxcore::image::inline_picture_run("rId99", 1, 1, 5, "body.png");
-        ed.paste(&Clip {
-            paras: vec![vec![Inline::Raw(run)]],
-        });
+        ed.paste(&Clip::new(vec![vec![Inline::Raw(run)]]));
     }
     insert_picture(&mut t, &jpg).unwrap();
     let (pkg, xml) = saved_header(&mut t);

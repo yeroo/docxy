@@ -410,9 +410,7 @@ pub fn insert_blocks(ed: &mut Editor, at: usize, blocks: Vec<Block>) -> Result<(
     let count = blocks.len();
     ed.anchor = None;
     ed.caret = Caret::top(at, 0);
-    ed.paste(&Clip {
-        paras: vec![Vec::new(); count + 1],
-    });
+    ed.paste(&Clip::new(vec![Vec::new(); count + 1]));
     overwrite_blocks(ed, at, blocks);
     Ok(())
 }
@@ -435,9 +433,7 @@ pub fn append_blocks(ed: &mut Editor, blocks: Vec<Block>) {
     let count = blocks.len();
     ed.anchor = None;
     ed.move_doc_end();
-    ed.paste(&Clip {
-        paras: vec![Vec::new(); count + 1],
-    });
+    ed.paste(&Clip::new(vec![Vec::new(); count + 1]));
     // Before `overwrite_blocks` replaces the placeholder holding it.
     restore_last_section_mark(ed, start);
     overwrite_blocks(ed, start, blocks);
@@ -502,9 +498,7 @@ pub fn replace_range_blocks(
     ed.anchor = Some(Caret::top(start, 0));
     let deleted = ed.has_selection();
     let last = start + blocks.len() - 1;
-    ed.paste(&Clip {
-        paras: vec![Vec::new(); blocks.len()],
-    });
+    ed.paste(&Clip::new(vec![Vec::new(); blocks.len()]));
     overwrite_blocks(ed, start, blocks);
     restore_end_section_mark(ed, last, mark);
 

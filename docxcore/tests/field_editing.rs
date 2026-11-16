@@ -110,13 +110,11 @@ fn a_page_number_inserted_between_text_and_field_goes_before_the_field() {
     let (pkg, mut ed) = open();
     ed.set_caret(Caret::at(vec![0], 4)); // between "Body" and the field
     // Insert > Page Number: the app pastes a simple PAGE field.
-    ed.paste(&Clip {
-        paras: vec![vec![Inline::Field {
+    ed.paste(&Clip::new(vec![vec![Inline::Field {
             raw: "<w:fldSimple w:instr=\"PAGE\"><w:r><w:t xml:space=\"preserve\">1</w:t></w:r></w:fldSimple>"
                 .to_string(),
             text: "1".to_string(),
-        }]],
-    });
+        }]]));
     let saved = save(pkg, &ed);
     let p = paragraph(&saved);
     let simple = p.find("<w:fldSimple").expect("the new field is saved");

@@ -429,7 +429,8 @@ pub(crate) fn paste_source(
 /// view's package ([`pictures::carry`], which reuses a part with the same
 /// bytes), giving a view with none a package first when a picture needs
 /// it; a relationship it adds is none a body picture already names, as
-/// for [`insert_picture`].
+/// for [`insert_picture`]. Another app's list items give a package without
+/// a numbering part the one that defines their lists (#1967).
 pub(crate) fn paste_clip(
     ed: &mut Editor,
     pkg: &mut Option<Package>,
@@ -443,6 +444,8 @@ pub(crate) fn paste_clip(
             pictures::carry_avoiding(pkg, BODY_PART, media, &mut clip, &taken);
         }
     }
+    // Another app's list items name lists the package must define (#1967).
+    crate::doc_paste::numbering_for_paste(pkg.as_mut(), &clip);
     let out = edit(ed, |ed| ed.one_step("Paste", |e| e.paste(&clip)));
     Formatted {
         ran: true,
@@ -1947,6 +1950,47 @@ mod tests {
         assert!(pkg.is_none(), "text needs no package");
         history(&mut ed, false);
         assert_eq!(texts(&ed), ["zAlpha"]);
+    }
+
+    /// Another app's list pastes as list items, and the view's package
+    /// gets the numbering part that defines them (#1967).
+    #[test]
+    fn a_pasted_html_list_keeps_its_items_and_numbering_1967() {
+        let mut ed = editor(&[""]);
+        let mut pkg = Some(fresh_package());
+        let clip = Clip::from_html("<ul><li>a</li><li>b</li></ul><ol><li>c</li></ol>", None)
+            .expect("an HTML clip");
+        let done = paste_clip(&mut ed, &mut pkg, clip, None);
+        assert!(done.ran && done.changed);
+        let nums: Vec<_> = ed
+            .doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                Block::Paragraph(p) => Some((p.plain_text(), p.props.num_id, p.props.ilvl)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            nums,
+            [
+                ("a".into(), Some(NUM_BULLET), 0),
+                ("b".into(), Some(NUM_BULLET), 0),
+                ("c".into(), Some(NUM_DECIMAL), 0)
+            ]
+        );
+        let pkg = pkg.expect("the package");
+        assert!(
+            pkg.part_text("word/numbering.xml")
+                .is_some_and(|x| x.contains("w:numId=\"2\"")),
+            "a numbering part"
+        );
+        // A view with no package is left without one, as Bullets leaves it.
+        let mut ed = editor(&[""]);
+        let mut none = None;
+        let clip = Clip::from_html("<ul><li>a</li></ul>", None).unwrap();
+        paste_clip(&mut ed, &mut none, clip, None);
+        assert!(none.is_none());
     }
 
     #[test]

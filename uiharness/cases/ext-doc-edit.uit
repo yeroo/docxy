@@ -581,6 +581,32 @@ test issue 1953 Ctrl+V pastes another copy's RTF with its bold, text, and an ima
   call tab-list {}
   assert reply.count is 1
 
+test issue 1967 Ctrl+V pastes another app's HTML list as list items and gives the package their numbering
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-set {"editable":true}
+  call ext-doc-document {}
+  assert reply.package_has_numbering is false
+  call pointer-click {"region":"ext-doc-word:Gamma:end"}
+  call real-key {"key":"enter"}
+  call clipboard {"action":"write","text":"Apples\nFirst","html":"<ul><li>Apples</li></ul><ol><li>First</li></ol>"}
+  call real-key {"key":"ctrl+v"}
+  call ext-doc-document {}
+  assert reply.paragraphs.1.text is Alpha Beta Gamma
+  assert reply.paragraphs.1.num_id is nothing
+  assert reply.paragraphs.2.text is Apples
+  assert reply.paragraphs.2.num_id is 1
+  assert reply.paragraphs.2.ilvl is 0
+  assert reply.paragraphs.3.text is First
+  assert reply.paragraphs.3.num_id is 2
+  assert reply.paragraphs.3.ilvl is 0
+  assert reply.package_has_numbering is true
+  shot window
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
 test issue 1947 Ctrl+X in the editable view takes the text away and pastes into a document with its bold
   # Last: the document it pastes into stays open (and edited).
   call backstage {"action":"open"}

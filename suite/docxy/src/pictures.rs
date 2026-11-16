@@ -558,11 +558,9 @@ mod tests {
     }
 
     fn pic(rid: &str) -> docxcore::editor::Clip {
-        docxcore::editor::Clip {
-            paras: vec![vec![docxcore::model::Inline::Raw(
-                docxcore::image::inline_picture_run(rid, 9525, 9525, 1, "a.png"),
-            )]],
-        }
+        docxcore::editor::Clip::new(vec![vec![docxcore::model::Inline::Raw(
+            docxcore::image::inline_picture_run(rid, 9525, 9525, 1, "a.png"),
+        )]])
     }
 
     fn media_parts(pkg: &docxcore::package::Package) -> usize {
@@ -735,9 +733,7 @@ mod tests {
             &format!("<a:blip r:embed=\"{png_rid}\"/>"),
             &format!("<a:blip r:embed=\"{png_rid}\"><a:extLst><a:ext uri=\"{{96DAC541-7B7A-43D3-8B79-37D633B846F1}}\"><asvg:svgBlip xmlns:asvg=\"http://schemas.microsoft.com/office/drawing/2016/SVG/main\" r:embed=\"{svg_rid}\"/></a:ext></a:extLst></a:blip>"),
         );
-        let copied = docxcore::editor::Clip {
-            paras: vec![vec![docxcore::model::Inline::Raw(run)]],
-        };
+        let copied = docxcore::editor::Clip::new(vec![vec![docxcore::model::Inline::Raw(run)]]);
         let media = capture(&src, "word/document.xml", &copied);
         assert_eq!(media.len(), 2);
         let (mut dst, header, _, _) = package();
@@ -815,9 +811,7 @@ mod tests {
             &format!("<a:blip r:embed=\"{png_rid}\"/>"),
             &format!("<a:blip r:embed=\"{png_rid}\"><a:extLst><a:ext uri=\"{{BEBA8EAE-BF5A-486C-A8C5-ECC9F3942E4B}}\"><a14:imgProps xmlns:a14=\"http://schemas.microsoft.com/office/drawing/2010/main\"><a14:imgLayer r:embed=\"{wdp_rid}\"/></a14:imgProps></a:ext></a:extLst></a:blip>"),
         );
-        let copied = docxcore::editor::Clip {
-            paras: vec![vec![docxcore::model::Inline::Raw(run)]],
-        };
+        let copied = docxcore::editor::Clip::new(vec![vec![docxcore::model::Inline::Raw(run)]]);
         let media = capture(&src, "word/document.xml", &copied);
         assert_eq!(media[&wdp_rid].content_type, "image/vnd.ms-photo");
         let (mut dst, header, _, _) = package();

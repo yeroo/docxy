@@ -18,6 +18,8 @@ use std::sync::Arc;
 mod autocorrect;
 #[cfg(test)]
 mod cell_sdt_tests;
+#[cfg(test)]
+mod clip_list_tests;
 mod cover;
 mod fields;
 mod flat;
@@ -154,13 +156,55 @@ fn picture_raw(inl: &Inline) -> Option<&str> {
     }
 }
 
-/// Clipboard contents: styled inline content, one entry per (partial) paragraph.
+/// Clipboard contents: styled inline content, one entry per (partial)
+/// paragraph, and the list membership another app's copy gave each (#1967).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Clip {
     pub paras: Vec<Vec<Inline>>,
+    /// `lists[i]` is `paras[i]`'s list membership; an entry past the end is
+    /// `None`. Kept canonical ([`Clip::set_lists`]: no trailing `None`), so
+    /// a clip with no list has none here and equals [`Clip::new`]'s.
+    lists: Vec<Option<ClipList>>,
+}
+
+/// A clip paragraph's list membership (#1967): the numbering id and level a
+/// paste gives its paragraph. Only another app's RTF or HTML has one, and
+/// its importers name 1 (bullets) and 2 (decimal), the lists
+/// [`crate::package::Package::add_markdown_numbering`] defines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipList {
+    pub num_id: i32,
+    pub ilvl: i32,
 }
 
 impl Clip {
+    /// A clip of `paras` with no lists.
+    pub fn new(paras: Vec<Vec<Inline>>) -> Clip {
+        Clip {
+            paras,
+            lists: Vec::new(),
+        }
+    }
+
+    /// Paragraph `i`'s list membership, if any.
+    pub fn list(&self, i: usize) -> Option<ClipList> {
+        self.lists.get(i).copied().flatten()
+    }
+
+    /// Whether any paragraph of the clip is a list item.
+    pub fn has_lists(&self) -> bool {
+        !self.lists.is_empty()
+    }
+
+    /// Set each paragraph's list membership (`lists[i]` is `paras[i]`'s),
+    /// trailing `None`s dropped, so a clip with no list has none.
+    pub fn set_lists(&mut self, mut lists: Vec<Option<ClipList>>) {
+        while lists.last().is_some_and(Option::is_none) {
+            lists.pop();
+        }
+        self.lists = lists;
+    }
+
     /// The media rids of the inline pictures among the clip's top-level
     /// runs and SmartArt drawings ([`crate::image::inline_embeds`]: blip and
     /// SVG blip), each once, in order (#1639).
@@ -235,7 +279,7 @@ impl Clip {
             }
             paras.push(inl);
         }
-        Clip { paras }
+        Clip::new(paras)
     }
 }
 
@@ -1611,9 +1655,10 @@ impl Editor {
             // A break is an inline of its own, formatted as typing here
             // would be (see `insert_break`), and part of the typing step.
             let props = self.typing_props_here(pending.as_ref());
-            self.paste_at_caret(&Clip {
-                paras: vec![vec![Inline::Break(BreakKind::Line, props)]],
-            });
+            self.paste_at_caret(&Clip::new(vec![vec![Inline::Break(
+                BreakKind::Line,
+                props,
+            )]]));
             self.settle_revisions();
             if self.caret.offset == off {
                 return;
@@ -1671,9 +1716,7 @@ impl Editor {
         let pending = self.pending_format().cloned();
         self.delete_selection_to_replace();
         let props = self.typing_props_here(pending.as_ref());
-        self.paste(&Clip {
-            paras: vec![vec![Inline::Tab(props)]],
-        });
+        self.paste(&Clip::new(vec![vec![Inline::Tab(props)]]));
     }
 
     /// What an inline inserted at the caret takes, as typing there would:
@@ -1840,12 +1883,7 @@ impl Editor {
         };
         // A new equation goes in while tracking too, unrecorded (a `w:ins`
         // cannot hold one whole), as it always has.
-        self.paste_clip(
-            &Clip {
-                paras: vec![vec![inl]],
-            },
-            false,
-        );
+        self.paste_clip(&Clip::new(vec![vec![inl]]), false);
     }
 
     /// If the character at editor offset `idx` of the caret's paragraph is a
@@ -2599,7 +2637,7 @@ impl Editor {
                 crate::merge::preview::unpreview_inlines(para);
             }
         }
-        Some(Clip { paras })
+        Some(Clip::new(paras))
     }
 
     /// Cut: copy the selection, then delete it. A loose field the selection
@@ -2699,11 +2737,17 @@ impl Editor {
 
         if n == 1 {
             if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
+                // A list item's text with no mark is a list item only alone
+                // in its paragraph (#1967): in a sentence it is text.
+                let alone = content_len(&p.content) == 0;
                 // Into an empty content control at the caret, or the end of a
                 // cover placeholder, as typing goes.
                 let ins_len =
                     insert_inlines(&mut p.content, off, clip.paras[0].clone(), false, in_cover);
                 self.caret.offset = off + ins_len;
+                if alone {
+                    give_clip_list(&mut p.props, clip.list(0));
+                }
             }
             self.doc.initialize_revision_targets();
             return;
@@ -2735,24 +2779,33 @@ impl Editor {
             let begins = loose_fields::take_field_begins_at(&mut p.content, off + first_len);
             let (mut tail, inside) = split_paragraph_at(&mut p.content, off + first_len, in_cover);
             tail.splice(inside..inside, begins);
+            // Another app's list items keep their lists (#1967), as a
+            // pasted paragraph's formatting rides on its mark: each piece
+            // but the last brings its mark, and the last, which joins the
+            // text after the caret, keeps its list only with none there.
+            give_clip_list(&mut p.props, clip.list(0));
+            let last_alone = content_len(&tail) == 0;
 
             // A middle piece pasted inside content controls is inside them
             // too: a copy of each opens and closes around it.
             let close = || Inline::Raw(crate::load::SDT_BLOCK_CLOSE.to_string());
             let mut news: Vec<Block> = Vec::new();
-            for mid in &clip.paras[1..n - 1] {
+            for (k, mid) in clip.paras.iter().enumerate().take(n - 1).skip(1) {
                 let mut content = tail[..inside].to_vec();
                 content.extend(mid.iter().cloned());
                 content.extend((0..inside).map(|_| close()));
-                news.push(Block::Paragraph(Paragraph {
-                    props: inner.clone(),
-                    content,
-                }));
+                let mut props = inner.clone();
+                give_clip_list(&mut props, clip.list(k));
+                news.push(Block::Paragraph(Paragraph { props, content }));
             }
             let last_pasted = clip.paras[n - 1].clone();
             let last_len: usize = last_pasted.iter().map(inline_len).sum();
             let mut last_content = tail;
             last_content.splice(inside..inside, last_pasted);
+            let mut props = props;
+            if last_alone {
+                give_clip_list(&mut props, clip.list(n - 1));
+            }
             news.push(Block::Paragraph(Paragraph {
                 props,
                 content: last_content,
@@ -2827,9 +2880,7 @@ impl Editor {
     /// is made, or a step other than a formatting toggle at the caret is
     /// pushed; undo and redo bring back the place each state had.
     pub fn insert_object(&mut self, inlines: Vec<Inline>) {
-        self.paste(&Clip {
-            paras: vec![inlines.clone()],
-        });
+        self.paste(&Clip::new(vec![inlines.clone()]));
         let n = inlines.len();
         let Some(p) = resolve_para(&self.doc.body, &self.caret.path) else {
             return;
@@ -3283,21 +3334,17 @@ impl Editor {
             path: epath,
             offset: eoff,
         };
-        self.paste_at_caret(&Clip {
-            paras: vec![vec![
-                Inline::Raw(format!("<w:commentRangeEnd w:id=\"{id}\"/>")),
-                Inline::Raw(format!("<w:r><w:commentReference w:id=\"{id}\"/></w:r>")),
-            ]],
-        });
+        self.paste_at_caret(&Clip::new(vec![vec![
+            Inline::Raw(format!("<w:commentRangeEnd w:id=\"{id}\"/>")),
+            Inline::Raw(format!("<w:r><w:commentReference w:id=\"{id}\"/></w:r>")),
+        ]]));
         self.caret = Caret {
             path: spath,
             offset: soff,
         };
-        self.paste_at_caret(&Clip {
-            paras: vec![vec![Inline::Raw(format!(
-                "<w:commentRangeStart w:id=\"{id}\"/>"
-            ))]],
-        });
+        self.paste_at_caret(&Clip::new(vec![vec![Inline::Raw(format!(
+            "<w:commentRangeStart w:id=\"{id}\"/>"
+        ))]]));
         // Markers inside a recorded insertion interrupt it.
         self.settle_revisions();
         true
@@ -3765,12 +3812,10 @@ impl Editor {
         self.one_step("Optional hyphen", |ed| {
             let mut props = ed.typing_props_here(None);
             props.hyphen_elements = true;
-            ed.paste(&Clip {
-                paras: vec![vec![Inline::Run(Run {
-                    text: "\u{ad}".into(),
-                    props,
-                })]],
-            });
+            ed.paste(&Clip::new(vec![vec![Inline::Run(Run {
+                text: "\u{ad}".into(),
+                props,
+            })]]));
         });
         para_text_len_at(&self.doc.body, path) > before
     }
@@ -5230,6 +5275,22 @@ pub(crate) fn kept_while_tracking(inline: &Inline) -> bool {
     }
 }
 
+/// Make a pasted paragraph the list item `list` says, if any (#1967); a
+/// piece with none leaves `props` as they are. Untracked, as
+/// [`Editor::set_list`] is.
+fn give_clip_list(props: &mut ParProps, list: Option<ClipList>) {
+    if let Some(list) = list {
+        props.num_id = Some(list.num_id);
+        props.ilvl = list.ilvl;
+    }
+}
+
+/// The editor length of `content`: 0 when it holds nothing a caret steps
+/// over (a content control's tags only, say).
+fn content_len(content: &[Inline]) -> usize {
+    content.iter().map(inline_len).sum()
+}
+
 /// `clip` without its equations, a hyperlink's included.
 fn without_equations(clip: &Clip) -> Clip {
     without(clip, |i| matches!(i, Inline::Equation { .. }))
@@ -6101,12 +6162,10 @@ mod tests {
     fn clip_lists_and_remaps_its_inline_picture_embeds() {
         let pic =
             |rid: &str| Inline::Raw(crate::image::inline_picture_run(rid, 10, 10, 1, "a.png"));
-        let mut clip = Clip {
-            paras: vec![
-                vec![pic("rId5"), Inline::Raw("<w:r><w:ptab/></w:r>".into())],
-                vec![pic("rId5"), pic("rId6")],
-            ],
-        };
+        let mut clip = Clip::new(vec![
+            vec![pic("rId5"), Inline::Raw("<w:r><w:ptab/></w:r>".into())],
+            vec![pic("rId5"), pic("rId6")],
+        ]);
         assert_eq!(
             clip.inline_embeds(),
             vec!["rId5".to_string(), "rId6".to_string()]
@@ -8210,9 +8269,7 @@ mod tests {
                 props: RunProps::default(),
             })
         };
-        let clip = Clip {
-            paras: vec![vec![r("Z")]],
-        };
+        let clip = Clip::new(vec![vec![r("Z")]]);
         let mut ed = Editor::new(table_doc());
         let before = ed.doc.clone();
         ed.caret = Caret::top(0, 4); // in "before"
@@ -10089,9 +10146,7 @@ mod tests {
         for xml in [SIMPLE_LINK_352, COMPLEX_LINK_352] {
             let mut ed = Editor::new(xml_doc(xml));
             ed.caret = Caret::at(vec![0], 5);
-            ed.paste(&Clip {
-                paras: vec![vec![run("X", RunProps::default())]],
-            });
+            ed.paste(&Clip::new(vec![vec![run("X", RunProps::default())]]));
             assert_eq!(etext(&ed), "a ConXtoso", "{xml}");
             assert_eq!(ed.caret, Caret::at(vec![0], 6));
             assert_eq!(
@@ -10966,9 +11021,7 @@ mod tests {
                 props: RunProps::default(),
             })
         };
-        let clip = Clip {
-            paras: vec![vec![r("A")], vec![r("B")]],
-        };
+        let clip = Clip::new(vec![vec![r("A")], vec![r("B")]]);
         ed.caret = Caret::top(0, 1); // between X and Y
         ed.paste(&clip);
         assert_eq!(top_text(&ed), vec!["XA", "BY"]);
@@ -11336,9 +11389,7 @@ mod tests {
             raw: SIMPLE_PAGE_642.into(),
             text: "1".into(),
         };
-        ed.paste(&Clip {
-            paras: vec![vec![new_field]],
-        });
+        ed.paste(&Clip::new(vec![vec![new_field]]));
         assert_eq!(inline_kinds(&ed), ["Run Body", "Field 1", "Field 1"]);
         assert_eq!(ed.caret.offset, 5);
         let xml_out = saved(&ed);

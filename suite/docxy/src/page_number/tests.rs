@@ -386,9 +386,7 @@ fn remove_page_numbers_removes_only_placed_numbers() {
         text: "1".into(),
     };
     caret_in(&mut t, 0);
-    ed_mut(&mut t).paste(&Clip {
-        paras: vec![vec![field()]],
-    });
+    ed_mut(&mut t).paste(&Clip::new(vec![vec![field()]]));
     caret_in(&mut t, 2);
     crate::hf_tab::hf_apply(
         &mut t,
@@ -396,9 +394,11 @@ fn remove_page_numbers_removes_only_placed_numbers() {
         crate::hf_tab::HfAct::Edit(true),
     )
     .unwrap();
-    t.hf_edit.as_mut().unwrap().editor.paste(&Clip {
-        paras: vec![vec![field()]],
-    });
+    t.hf_edit
+        .as_mut()
+        .unwrap()
+        .editor
+        .paste(&Clip::new(vec![vec![field()]]));
     exit_hf_tab(&mut t);
     // Placed numbers in section 1's footer and section 3's header.
     caret_in(&mut t, 0);

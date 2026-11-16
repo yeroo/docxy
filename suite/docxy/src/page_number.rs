@@ -687,14 +687,12 @@ impl Docxy {
             })
         };
         self.with_editor(window, cx, |e| {
-            e.paste(&Clip {
-                paras: vec![vec![
-                    text("Page "),
-                    field("PAGE"),
-                    text(" of "),
-                    field("NUMPAGES"),
-                ]],
-            })
+            e.paste(&Clip::new(vec![vec![
+                text("Page "),
+                field("PAGE"),
+                text(" of "),
+                field("NUMPAGES"),
+            ]]))
         });
     }
 }

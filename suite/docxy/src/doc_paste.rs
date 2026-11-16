@@ -7,6 +7,7 @@
 use crate::dialog::catalog;
 use crate::dialog::{Button, ButtonRole, Control, ControlKind, Dialog, DialogOwner, Value};
 use crate::{ClipRead, DocClip, Docxy, PasteFrom, doc_paste_clip, doc_paste_from};
+use docxcore::editor::Clip;
 use gpui::{Context, Window};
 
 /// The dialog's "As" choices, as Word names them.
@@ -17,6 +18,18 @@ pub(crate) const UNFORMATTED: &str = "Unformatted Text";
 
 /// Keep Text Only's status when the clipboard holds no text.
 const NO_TEXT: &str = "There is no text to paste";
+
+/// Give a package without a numbering part the one that defines the lists
+/// another app's pasted list items name (#1967: 1 bullets, 2 decimal,
+/// [`docxcore::package::Package::add_markdown_numbering`]), as Bullets and
+/// Numbering do, so a save defines them. A clip without lists, or a
+/// package that has a numbering part, changes nothing; a tab with no
+/// package gets the part when its save builds one with a list in it.
+pub(crate) fn numbering_for_paste(pkg: Option<&mut docxcore::package::Package>, clip: &Clip) {
+    if let Some(pkg) = pkg.filter(|_| clip.has_lists()) {
+        pkg.add_markdown_numbering();
+    }
+}
 
 /// The formatted source the clipboard holds, if any: the document's own
 /// copy while it is still what the clipboard holds, an RTF the importer
@@ -201,6 +214,53 @@ mod tests {
             clip: Clip::from_text(s),
             text: s.into(),
         }
+    }
+
+    /// Another app's list paste gives a package without a numbering part
+    /// the one that defines numIds 1 and 2 (#1967); a numbering part of its
+    /// own, a clip without lists or no package changes nothing.
+    #[test]
+    fn a_list_paste_gives_the_package_its_numbering_1967() {
+        use docxcore::package::{Package, new_package};
+        const NUMBERING: &str = "word/numbering.xml";
+        let blank = || new_package(docxcore::model::Document { body: vec![] });
+        let list = Clip::from_html("<ul><li>a</li></ul><ol><li>b</li></ol>", None).unwrap();
+        assert!(list.has_lists());
+        let mut pkg = blank();
+        assert!(pkg.part(NUMBERING).is_none());
+        numbering_for_paste(Some(&mut pkg), &list);
+        let xml = pkg.part_text(NUMBERING).expect("a numbering part");
+        assert!(
+            xml.contains("w:numId=\"1\"") && xml.contains("w:numId=\"2\""),
+            "{xml}"
+        );
+        assert!(
+            pkg.part_text("word/_rels/document.xml.rels")
+                .is_some_and(|r| r.contains("numbering.xml")),
+            "the document part names it"
+        );
+        // Once: a second paste, or a package with its own part, keeps it.
+        let parts = |p: &Package| {
+            (
+                p.part_text(NUMBERING),
+                p.part_text("word/_rels/document.xml.rels"),
+                p.part_text("[Content_Types].xml"),
+            )
+        };
+        let before = parts(&pkg);
+        numbering_for_paste(Some(&mut pkg), &list);
+        assert_eq!(parts(&pkg), before);
+        let mut own = blank();
+        own.add_markdown_numbering();
+        assert!(own.set_part(NUMBERING, b"<w:numbering/>".to_vec()));
+        let before = parts(&own);
+        numbering_for_paste(Some(&mut own), &list);
+        assert_eq!(parts(&own), before);
+        // No lists: no part.
+        let mut plain = blank();
+        numbering_for_paste(Some(&mut plain), &Clip::from_text("a\nb"));
+        assert!(plain.part(NUMBERING).is_none());
+        numbering_for_paste(None, &list);
     }
 
     /// Formatted Text is offered only for our live copy or a readable RTF.

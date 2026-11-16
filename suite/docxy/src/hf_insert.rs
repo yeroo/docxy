@@ -110,9 +110,7 @@ pub(crate) fn apply_date_time(ed: &mut Editor, d: &Dialog) -> Result<bool, Strin
     };
     // One step, a selection it replaces included.
     ed.one_step("Insert Date and Time", |e| {
-        e.paste(&Clip {
-            paras: vec![vec![inline]],
-        })
+        e.paste(&Clip::new(vec![vec![inline]]))
     });
     Ok(true)
 }
