@@ -668,6 +668,34 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
             };
             client.update_contact(&target, &row.fields, *fields)
         }
+        // The photo as stored at send time (#2065), its revision noted as
+        // sent (a refusal forgets only what Graph refused), then confirmed at
+        // the revision it sent: a set written while the PUT was in flight stays
+        // pending for its own op. An id still `local:` has no Graph contact
+        // (its create was refused, and the row went with it; a create not
+        // sent yet runs first, in `seq` order). Nothing pending (an earlier
+        // op sent the latest photo, a refusal reverted it, or the contact
+        // was deleted) sends nothing. A 404 is a refusal, not done: the
+        // contact is gone and the photo with it.
+        OutboxOp::SetContactPhoto { id } => {
+            let target = store.resolve_contact_id(id).map_err(store_err)?;
+            if target.starts_with("local:") {
+                return Ok(());
+            }
+            let Some((photo, revision)) =
+                store.pending_contact_photo(&target).map_err(store_err)?
+            else {
+                return Ok(());
+            };
+            store
+                .note_contact_photo_sent(&target, revision)
+                .map_err(store_err)?;
+            client.set_contact_photo(&target, &photo.bytes, &photo.content_type)?;
+            store
+                .confirm_contact_photo(&target, revision)
+                .map_err(store_err)?;
+            Ok(())
+        }
         // A 404 is done: the contact is already gone (#2063).
         OutboxOp::DeleteContact { id } => {
             let target = store.resolve_contact_id(id).map_err(store_err)?;
@@ -4688,6 +4716,150 @@ mod tests {
         let applied = apply_op(&c, &store, &OutboxOp::DeleteContact { id: "G1".into() }).unwrap();
         assert_eq!(applied, Applied::Done);
         assert_eq!(srv.requests()[0].method, "DELETE");
+    }
+
+    // --- Contact photos (#2065) ------------------------------------------
+
+    /// A store holding the Graph contact G1.
+    fn photo_store() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .replace_contacts(&[crate::graph::model::FolderContact {
+                id: "G1".into(),
+                change_key: "ck1".into(),
+                fields: ann_fields(),
+            }])
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn set_contact_photo_puts_the_pending_row_and_confirms_it() {
+        let srv = FakeServer::start(vec![contact_route(
+            "PUT",
+            "/me/contacts/G1/photo/$value",
+            200,
+            "",
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = photo_store();
+        let bytes = [0xFF, 0xD8, 0xFF, 0x00, 0x80];
+        store.set_contact_photo("G1", &bytes, "image/jpeg").unwrap();
+        let op = last_op(&store);
+        assert_eq!(apply_op(&c, &store, &op).unwrap(), Applied::Done);
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "PUT");
+        assert_eq!(reqs[0].body_bytes, bytes);
+        let stored = store.contact_photo("G1").unwrap().unwrap();
+        assert!(!stored.pending, "confirmed");
+        assert!(stored.current);
+        assert_eq!(stored.photo.unwrap().bytes, bytes);
+        // A second op for the same photo finds nothing pending.
+        apply_op(&c, &store, &op).unwrap();
+        assert_eq!(srv.requests().len(), 1);
+    }
+
+    #[test]
+    fn set_contact_photo_sends_the_latest_photo_once() {
+        let srv = FakeServer::start(vec![contact_route(
+            "PUT",
+            "/me/contacts/G1/photo/$value",
+            200,
+            "",
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = photo_store();
+        store.set_contact_photo("G1", b"ONE", "image/jpeg").unwrap();
+        store.set_contact_photo("G1", b"TWO", "image/jpeg").unwrap();
+        for r in store.pending_ops().unwrap() {
+            apply_op(&c, &store, &r.op).unwrap();
+        }
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1, "the first op sent the latest photo");
+        assert_eq!(reqs[0].body_bytes, b"TWO");
+    }
+
+    #[test]
+    fn set_contact_photo_of_a_local_id_sends_nothing() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local = store.create_local_contact(&ann_fields()).unwrap();
+        store.set_contact_photo(&local, b"P", "image/jpeg").unwrap();
+        let op = OutboxOp::SetContactPhoto { id: local.clone() };
+        assert_eq!(apply_op(&c, &store, &op).unwrap(), Applied::Done);
+        assert!(srv.requests().is_empty());
+        assert!(store.contact_photo(&local).unwrap().unwrap().pending);
+    }
+
+    #[test]
+    fn set_contact_photo_without_pending_row_sends_nothing() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = photo_store();
+        let op = OutboxOp::SetContactPhoto { id: "G1".into() };
+        // Never set, then set and its contact deleted locally.
+        apply_op(&c, &store, &op).unwrap();
+        store.set_contact_photo("G1", b"P", "image/jpeg").unwrap();
+        store.delete_contact("G1").unwrap();
+        apply_op(&c, &store, &op).unwrap();
+        assert!(srv.requests().is_empty());
+    }
+
+    #[test]
+    fn set_contact_photo_after_create_puts_to_the_graph_id() {
+        let srv = FakeServer::start(vec![
+            contact_route(
+                "POST",
+                "/me/contacts",
+                201,
+                r#"{"id":"G7","changeKey":"ck7"}"#,
+            ),
+            contact_route("PUT", "/me/contacts/G7/photo/$value", 200, ""),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let local = store.create_local_contact(&ann_fields()).unwrap();
+        store.set_contact_photo(&local, b"P", "image/png").unwrap();
+        // In queue order: the create, then the photo by its `local:` id.
+        let ops = store.pending_ops().unwrap();
+        assert_eq!(ops[1].op, OutboxOp::SetContactPhoto { id: local.clone() });
+        for r in ops {
+            apply_op(&c, &store, &r.op).unwrap();
+        }
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[1].method, "PUT");
+        assert_eq!(reqs[1].path, "/me/contacts/G7/photo/$value");
+        assert_eq!(reqs[1].body_bytes, b"P");
+        let ct: Vec<&str> = reqs[1]
+            .headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(ct, ["image/png"]);
+        assert!(!store.contact_photo("G7").unwrap().unwrap().pending);
+    }
+
+    #[test]
+    fn set_contact_photo_404_is_an_error() {
+        let srv = FakeServer::start(vec![contact_route(
+            "PUT",
+            "/me/contacts/G1/photo/$value",
+            404,
+            "{}",
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = photo_store();
+        store.set_contact_photo("G1", b"P", "image/jpeg").unwrap();
+        let op = last_op(&store);
+        assert!(matches!(
+            apply_op(&c, &store, &op),
+            Err(GraphError::NotFound)
+        ));
+        assert!(store.contact_photo("G1").unwrap().unwrap().pending);
     }
 
     // --- Folder writes (#1910) -------------------------------------------

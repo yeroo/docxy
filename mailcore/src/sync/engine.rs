@@ -55,9 +55,9 @@ use crate::graph::client::{
 };
 pub use crate::graph::model::BodyFormat;
 use crate::graph::model::{
-    AutomaticReplies, DeltaItem, DirectoryUser, Event, EventDeltaItem, FolderContact, MailFolder,
-    Me, MeetingMessage, MeetingMessageType, Message, MessageFields, Recipient, ScheduleEntry,
-    SearchHit, parse_folder_size, parse_meeting_message_type,
+    AutomaticReplies, ContactPhoto, DeltaItem, DirectoryUser, Event, EventDeltaItem, FolderContact,
+    MailFolder, Me, MeetingMessage, MeetingMessageType, Message, MessageFields, Recipient,
+    ScheduleEntry, SearchHit, parse_folder_size, parse_meeting_message_type,
 };
 pub use crate::store::ClearOfflineRefusal;
 use crate::store::{
@@ -660,6 +660,30 @@ pub enum SyncCommand {
     /// [`SyncEvent::ContactsUpdated`]. A 404 is success (already gone). As
     /// `CreateContact`, the next drain sends the op without the command. Needs `Contacts.ReadWrite`, as `CreateContact`.
     DeleteContact { id: String },
+    /// Push a contact's photo to Graph now (#2065): `Store::set_contact_photo`
+    /// stored it (pending) and queued
+    /// [`crate::store::OutboxOp::SetContactPhoto`] in one transaction; this
+    /// command only drains, then emits [`SyncEvent::ContactsUpdated`]. The
+    /// PUT sends the photo as stored when the op is sent. As
+    /// `CreateContact`, the next drain sends the op without the command.
+    /// Needs `Contacts.ReadWrite`, and Graph sets a contact's photo for work
+    /// or school accounts only: a refusal is
+    /// [`SyncEvent::ContactWriteFailed`] with the photo in `attempted_photo`.
+    /// Graph has no call to remove a contact's photo, so there is no command
+    /// for it.
+    SetContactPhoto { id: String },
+    /// Fetch the photo of a Contacts-folder contact (#2065,
+    /// `GraphClient::contact_photo`), record it in the store
+    /// (`Store::contact_photo`) and emit [`SyncEvent::ContactPhotoFetched`]
+    /// (`None`: Graph answered 404, no photo). Direct call, no outbox, on
+    /// demand only: no pass fetches photos. A pending local set, or a
+    /// contact still `local:`, sends no request (signed in or not) and
+    /// answers from the store. Otherwise not signed in is an `Error("not
+    /// signed in")`, and a Graph failure goes through the engine's usual
+    /// error handling (an `Error` line, offline, a sign-in), as `FetchPhoto`:
+    /// no event names the id, so a host fetching many photos cannot tell
+    /// which one failed. Needs `Contacts.Read`.
+    FetchContactPhoto { id: String },
     /// Create a mail folder named `name` under `parent` (#1910; `None`: the
     /// top of the mailbox). The store has it at once under a `local:` id
     /// ([`SyncEvent::FoldersUpdated`]); `POST /me/mailFolders` (or the
@@ -851,6 +875,8 @@ pub enum ContactWrite {
     Create,
     Update,
     Delete,
+    /// A photo set (#2065).
+    SetPhoto,
 }
 
 impl ContactWrite {
@@ -859,6 +885,7 @@ impl ContactWrite {
             ContactWrite::Create => "create",
             ContactWrite::Update => "update",
             ContactWrite::Delete => "delete",
+            ContactWrite::SetPhoto => "set the photo of",
         }
     }
 }
@@ -977,6 +1004,15 @@ pub enum SyncEvent {
     /// the user has none (from [`SyncCommand::FetchPhoto`]); the UI then
     /// draws initials.
     PhotoFetched { photo: Option<(Vec<u8>, String)> },
+    /// A Contacts-folder contact's photo (#2065, from
+    /// [`SyncCommand::FetchContactPhoto`]), `None` when it has none; `id` as
+    /// the command named it. Also recorded in the store
+    /// (`Store::contact_photo`) unless a local set is pending, whose photo
+    /// this then is.
+    ContactPhotoFetched {
+        id: String,
+        photo: Option<ContactPhoto>,
+    },
     /// The master category list changed; the UI re-reads `Store::master_categories`.
     CategoriesUpdated,
     /// The stored Contacts folder may have changed (#1934, #2063); a client
@@ -998,9 +1034,12 @@ pub enum SyncEvent {
     /// update's or delete's contact is read again from Graph
     /// (`GET /me/contacts/{id}`, after any later queued op for it has gone),
     /// or deleted when Graph answers 404. If that read fails too, the row is
-    /// left until the next full pass replaces it. A [`SyncEvent::Error`]
-    /// follows, `"{create|update|delete} contact {id}: {error}"`, then
-    /// [`SyncEvent::ContactsUpdated`].
+    /// left until the next full pass replaces it. A refused photo set
+    /// (#2065) forgets the stored photo (unknown again, so a client fetches
+    /// Graph's) unless a later set is queued; a 404 (the contact gone) also
+    /// reads the contact again, whose 404 deletes it. A [`SyncEvent::Error`]
+    /// follows, `"{create|update|delete|set the photo of} contact {id}:
+    /// {error}"`, then [`SyncEvent::ContactsUpdated`].
     ContactWriteFailed {
         /// The contact's id as stored when it failed: the Graph id once a
         /// create re-keyed it, the `local:` id for a refused create.
@@ -1015,9 +1054,16 @@ pub enum SyncEvent {
         /// The error, one line (`GraphError`'s `Display`, #1954).
         error: String,
         /// The contact as the user left it, read before the revert, so the
-        /// edit is not lost silently; `None` for a delete (and for a row
-        /// already gone).
+        /// edit is not lost silently; `None` for a delete and a photo set
+        /// (and for a row already gone).
         attempted: Option<FolderContact>,
+        /// The photo the user set and Graph does not have (#2065), read
+        /// before the revert: for a refused photo set, and for a refused
+        /// create whose contact had a photo set (the row, photo included,
+        /// is deleted). The row as the user left it: a later set's photo
+        /// when one was written while the refused PUT was in flight. `None`
+        /// for every other write.
+        attempted_photo: Option<ContactPhoto>,
     },
     /// A folder created (#1910) or copied (#2118) locally reached Graph: the
     /// row created as `local_id` is stored as `id` now, with its messages
@@ -1755,6 +1801,7 @@ fn contact_op(op: &OutboxOp) -> Option<(ContactWrite, &str)> {
         OutboxOp::CreateContact { id } => Some((ContactWrite::Create, id)),
         OutboxOp::UpdateContact { id, .. } => Some((ContactWrite::Update, id)),
         OutboxOp::DeleteContact { id } => Some((ContactWrite::Delete, id)),
+        OutboxOp::SetContactPhoto { id } => Some((ContactWrite::SetPhoto, id)),
         _ => None,
     }
 }
@@ -1888,6 +1935,7 @@ fn persists_at_shutdown(cmd: &SyncCommand) -> bool {
         | SyncCommand::CreateContact { .. }
         | SyncCommand::UpdateContact { .. }
         | SyncCommand::DeleteContact { .. }
+        | SyncCommand::SetContactPhoto { .. }
         | SyncCommand::CreateFolder { .. }
         | SyncCommand::RenameFolder { .. }
         | SyncCommand::MoveFolder { .. }
@@ -1930,6 +1978,7 @@ fn persists_at_shutdown(cmd: &SyncCommand) -> bool {
         | SyncCommand::FetchAutomaticReplies
         | SyncCommand::FetchProfile
         | SyncCommand::FetchPhoto
+        | SyncCommand::FetchContactPhoto { .. }
         | SyncCommand::FetchInlineImage { .. }
         | SyncCommand::RefreshCalendar
         | SyncCommand::FetchCalendarRange { .. }
@@ -3231,6 +3280,7 @@ impl Engine {
             SyncCommand::SetAutomaticReplies { replies } => self.set_automatic_replies(replies),
             SyncCommand::FetchProfile => self.fetch_profile(),
             SyncCommand::FetchPhoto => self.fetch_photo(),
+            SyncCommand::FetchContactPhoto { id } => self.fetch_contact_photo(id),
             SyncCommand::SignOut => self.sign_out(),
             SyncCommand::FetchInlineImage {
                 message_id,
@@ -3367,7 +3417,9 @@ impl Engine {
             SyncCommand::UpdateEventSeries { id, input } => self.update_event_series(id, input),
             // The store write queued the op (#2063): the command only
             // pushes it now.
-            SyncCommand::CreateContact { .. } | SyncCommand::DeleteContact { .. } => {
+            SyncCommand::CreateContact { .. }
+            | SyncCommand::DeleteContact { .. }
+            | SyncCommand::SetContactPhoto { .. } => {
                 self.drain_queued();
                 self.emit(SyncEvent::ContactsUpdated);
             }
@@ -6104,7 +6156,13 @@ impl Engine {
     /// `ContactsUpdated`). A refused create deletes its `local:` row; a
     /// refused update or delete owes a re-read from Graph
     /// (`Store::owe_contact_reread`, persisted), done now unless another
-    /// queued op names the contact.
+    /// queued create, update or delete names the contact. A refused photo
+    /// set (#2065) forgets the stored photo unless one was set since the
+    /// refused PUT read it (`Store::revert_contact_photo`: its own op sends
+    /// it), and owes a re-read only on a 404
+    /// (the contact gone). Before the op is dropped, the contact as the user
+    /// left it is read into `attempted` (create, update) and the pending
+    /// photo into `attempted_photo` (create, photo set).
     fn refuse_contact_write(&mut self, row: &OutboxRow, err: &GraphError) {
         let Some((write, queued_id)) = contact_op(&row.op) else {
             return;
@@ -6114,8 +6172,20 @@ impl Engine {
             .resolve_contact_id(queued_id)
             .unwrap_or_else(|_| queued_id.to_string());
         let attempted = match write {
-            ContactWrite::Delete => None,
-            _ => self.store.folder_contact(&id).ok().flatten(),
+            ContactWrite::Delete | ContactWrite::SetPhoto => None,
+            ContactWrite::Create | ContactWrite::Update => {
+                self.store.folder_contact(&id).ok().flatten()
+            }
+        };
+        // A create's row takes its photo with it (#2065): report it too.
+        let attempted_photo = match write {
+            ContactWrite::Create | ContactWrite::SetPhoto => self
+                .store
+                .pending_contact_photo(&id)
+                .ok()
+                .flatten()
+                .map(|(photo, _)| photo),
+            ContactWrite::Update | ContactWrite::Delete => None,
         };
         self.store.drop_op(row.seq);
         match write {
@@ -6126,6 +6196,20 @@ impl Engine {
                 let _ = self.store.owe_contact_reread(&id);
                 self.settle_contact_rereads();
             }
+            ContactWrite::SetPhoto => {
+                let _ = self.store.revert_contact_photo(&id);
+                // The contact is gone from Graph: read it again, so its 404
+                // deletes the row now rather than at the next full pass. The
+                // revert above forgot the refused photo, so only a set
+                // written during the PUT (still pending, its op queued)
+                // keeps the row (`revert_folder_contact`'s photo guard): its
+                // own PUT 404s and reports it, and its re-read deletes the
+                // contact.
+                if matches!(err, GraphError::NotFound) {
+                    let _ = self.store.owe_contact_reread(&id);
+                    self.settle_contact_rereads();
+                }
+            }
         }
         let error = err.to_string();
         self.emit(SyncEvent::ContactWriteFailed {
@@ -6134,6 +6218,7 @@ impl Engine {
             status: refused_write_status(err),
             error: error.clone(),
             attempted,
+            attempted_photo,
         });
         self.emit(SyncEvent::Error(format!(
             "{} contact {id}: {error}",
@@ -8563,6 +8648,44 @@ impl Engine {
         }
         match self.with_auth(|c| c.my_photo()) {
             Ok(photo) => self.emit(SyncEvent::PhotoFetched { photo }),
+            Err(e) => {
+                self.react(e);
+            }
+        }
+    }
+
+    /// Fetch a Contacts-folder contact's photo (#2065), record it and emit
+    /// `ContactPhotoFetched` (`None`: no photo). A pending local set, or an
+    /// id still `local:` (Graph has no such contact), answers from the store
+    /// with no request; otherwise the signed-in guard of `fetch_photo`, and
+    /// a Graph failure goes through `react`.
+    fn fetch_contact_photo(&mut self, id: String) {
+        let target = self
+            .store
+            .resolve_contact_id(&id)
+            .unwrap_or_else(|_| id.clone());
+        let stored = self.store.contact_photo(&target).ok().flatten();
+        if target.starts_with("local:") || stored.as_ref().is_some_and(|p| p.pending) {
+            let photo = stored.and_then(|p| p.photo);
+            self.emit(SyncEvent::ContactPhotoFetched { id, photo });
+            return;
+        }
+        if self.token.is_none() {
+            self.emit(SyncEvent::Error("not signed in".to_string()));
+            return;
+        }
+        match self.with_auth(|c| c.contact_photo(&target)) {
+            Ok(photo) => {
+                // Not stored (a contact unknown here) or a set written
+                // during the GET: recorded nothing, and a pending set's
+                // photo is the answer.
+                let _ = self.store.record_contact_photo(&target, photo.as_ref());
+                let photo = match self.store.contact_photo(&target) {
+                    Ok(Some(p)) if p.pending => p.photo,
+                    _ => photo,
+                };
+                self.emit(SyncEvent::ContactPhotoFetched { id, photo });
+            }
             Err(e) => {
                 self.react(e);
             }
@@ -11565,6 +11688,7 @@ mod tests {
                 status: Some(403),
                 error: "HTTP 403: Access is denied.".into(),
                 attempted: Some(attempted),
+                attempted_photo: None,
             }),
             "{seen:?}"
         );
@@ -11881,6 +12005,729 @@ mod tests {
         assert_eq!(row.fields.mobile_phone, "+1 555 0300");
         assert_eq!(row.fields.job_title, "", "the refused edit is reverted");
         assert_eq!(row.change_key, "ck-2");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Contact photos (#2065) -----------------------------------------
+
+    const DAVE_PHOTO: &str = "/me/contacts/C-dave/photo/$value";
+
+    fn jpeg(bytes: &[u8]) -> ContactPhoto {
+        ContactPhoto {
+            bytes: bytes.to_vec(),
+            content_type: "image/jpeg".into(),
+            etag: String::new(),
+        }
+    }
+
+    /// The `ContactPhotoFetched` in `seen`.
+    fn photo_fetched(seen: &[SyncEvent]) -> Option<SyncEvent> {
+        seen.iter()
+            .find(|e| matches!(e, SyncEvent::ContactPhotoFetched { .. }))
+            .cloned()
+    }
+
+    #[test]
+    fn fetch_contact_photo_records_and_reports_it() {
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-photo-fetch",
+            vec![(
+                Route {
+                    method: "GET".into(),
+                    path_prefix: DAVE_PHOTO.into(),
+                    status: 200,
+                    headers: vec![
+                        ("Content-Type".into(), "image/jpeg".into()),
+                        ("ETag".into(), "\"p1\"".into()),
+                    ],
+                    body: "JPEGDATA".into(),
+                },
+                None,
+            )],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        assert_eq!(store.contact_photo("C-dave").unwrap(), None, "unknown");
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchContactPhoto {
+                id: "C-dave".into(),
+            })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::ContactPhotoFetched { .. })
+        });
+        let photo = ContactPhoto {
+            bytes: b"JPEGDATA".to_vec(),
+            content_type: "image/jpeg".into(),
+            etag: "\"p1\"".into(),
+        };
+        assert_eq!(
+            photo_fetched(&seen),
+            Some(SyncEvent::ContactPhotoFetched {
+                id: "C-dave".into(),
+                photo: Some(photo.clone()),
+            })
+        );
+        assert_eq!(
+            store.contact_photo("C-dave").unwrap(),
+            Some(crate::store::StoredContactPhoto {
+                photo: Some(photo),
+                pending: false,
+                current: true,
+            })
+        );
+        assert_eq!(requests_of(&srv, "GET", DAVE_PHOTO).len(), 1);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_contact_photo_404_records_no_photo() {
+        let list = list_of(&[DAVE_JSON]);
+        let (_srv, handle, store, dir) = contact_engine(
+            "contact-photo-404",
+            vec![(any_route("GET", DAVE_PHOTO, 404, "{}"), None)],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchContactPhoto {
+                id: "C-dave".into(),
+            })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::ContactPhotoFetched { .. })
+        });
+        assert_eq!(
+            photo_fetched(&seen),
+            Some(SyncEvent::ContactPhotoFetched {
+                id: "C-dave".into(),
+                photo: None,
+            })
+        );
+        assert!(
+            !seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "no photo is not an error: {seen:?}"
+        );
+        assert_eq!(
+            store.contact_photo("C-dave").unwrap(),
+            Some(crate::store::StoredContactPhoto {
+                photo: None,
+                pending: false,
+                current: true,
+            })
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_contact_photo_with_a_pending_set_sends_nothing() {
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-photo-pending",
+            vec![(any_route("GET", DAVE_PHOTO, 200, "GRAPHS"), None)],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        // Set, not pushed yet: the fetch answers the user's photo.
+        store
+            .set_contact_photo("C-dave", b"MINE", "image/jpeg")
+            .unwrap();
+        let local = store.create_local_contact(&new_contact_fields()).unwrap();
+        for id in ["C-dave".to_string(), local.clone()] {
+            handle
+                .cmd_tx
+                .send(SyncCommand::FetchContactPhoto { id })
+                .unwrap();
+        }
+        let first = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::ContactPhotoFetched { .. })
+        });
+        let second = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::ContactPhotoFetched { .. })
+        });
+        assert_eq!(
+            photo_fetched(&first),
+            Some(SyncEvent::ContactPhotoFetched {
+                id: "C-dave".into(),
+                photo: Some(jpeg(b"MINE")),
+            })
+        );
+        // A contact Graph does not have yet: nothing known, nothing asked.
+        assert_eq!(
+            photo_fetched(&second),
+            Some(SyncEvent::ContactPhotoFetched {
+                id: local,
+                photo: None,
+            })
+        );
+        assert!(requests_of(&srv, "GET", "/me/contacts/").is_empty());
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_contact_photo_signed_out_reports_not_signed_in() {
+        let srv = FakeServer::start(vec![]);
+        let base = srv.base_url.clone();
+        let dir = unique_dir("contact-photo-signed-out");
+        // A pending set on a contact created locally, before the engine.
+        let local = {
+            let store = Store::open(&dir.join("mail.db")).unwrap();
+            let id = store.create_local_contact(&new_contact_fields()).unwrap();
+            store.set_contact_photo(&id, b"MINE", "image/jpeg").unwrap();
+            id
+        };
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            dir.join("token.bin"),
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| {
+            matches!(
+                e,
+                SyncEvent::SignInRequired {
+                    reason: SignInReason::NotSignedIn
+                }
+            )
+        });
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchContactPhoto { id: "G1".into() })
+            .unwrap();
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m == "not signed in"),
+        );
+        // The store answers a pending set, signed in or not.
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchContactPhoto { id: local.clone() })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::ContactPhotoFetched { .. })
+        });
+        assert_eq!(
+            photo_fetched(&seen),
+            Some(SyncEvent::ContactPhotoFetched {
+                id: local,
+                photo: Some(jpeg(b"MINE")),
+            })
+        );
+        assert!(srv.requests().is_empty(), "{:?}", srv.requests());
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contact_photo_set_puts_and_reports_contacts_updated() {
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-photo-set",
+            vec![(any_route("PUT", DAVE_PHOTO, 200, ""), None)],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        let bytes = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x80];
+        assert!(
+            store
+                .set_contact_photo("C-dave", &bytes, "image/jpeg")
+                .unwrap()
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetContactPhoto {
+                id: "C-dave".into(),
+            })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        assert!(contact_failure(&seen).is_none(), "{seen:?}");
+        let puts: Vec<_> = srv
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PUT")
+            .collect();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].path, DAVE_PHOTO);
+        assert_eq!(puts[0].body_bytes, bytes);
+        let stored = store.contact_photo("C-dave").unwrap().unwrap();
+        assert!(!stored.pending);
+        assert_eq!(stored.photo, Some(jpeg(&bytes)));
+        assert!(store.pending_ops().unwrap().is_empty());
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contact_photo_set_403_reports_and_reverts() {
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-photo-403",
+            vec![(any_route("PUT", DAVE_PHOTO, 403, DENIED), None)],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        store
+            .set_contact_photo("C-dave", b"MINE", "image/jpeg")
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetContactPhoto {
+                id: "C-dave".into(),
+            })
+            .unwrap();
+        let seen = wait_refused(&handle.evt_rx);
+        assert_eq!(
+            contact_failure(&seen),
+            Some(SyncEvent::ContactWriteFailed {
+                id: "C-dave".into(),
+                write: ContactWrite::SetPhoto,
+                status: Some(403),
+                error: "HTTP 403: Access is denied.".into(),
+                attempted: None,
+                attempted_photo: Some(jpeg(b"MINE")),
+            }),
+            "{seen:?}"
+        );
+        let errors: Vec<&SyncEvent> = seen
+            .iter()
+            .filter(|e| matches!(e, SyncEvent::Error(_)))
+            .collect();
+        assert_eq!(
+            errors,
+            [&SyncEvent::Error(
+                "set the photo of contact C-dave: HTTP 403: Access is denied.".into()
+            )]
+        );
+        assert_eq!(
+            store.contact_photo("C-dave").unwrap(),
+            None,
+            "unknown again"
+        );
+        assert!(store.folder_contact("C-dave").unwrap().is_some());
+        assert!(store.pending_ops().unwrap().is_empty(), "dropped at once");
+        assert!(
+            requests_of(&srv, "GET", "/me/contacts/C-dave").is_empty(),
+            "a 403 owes the contact no re-read"
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contact_photo_set_5xx_stays_queued() {
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-photo-5xx",
+            vec![(any_route("PUT", DAVE_PHOTO, 500, "{}"), None)],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        store
+            .set_contact_photo("C-dave", b"MINE", "image/jpeg")
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetContactPhoto {
+                id: "C-dave".into(),
+            })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        assert!(contact_failure(&seen).is_none(), "{seen:?}");
+        let ops: Vec<OutboxOp> = store
+            .pending_ops()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.op)
+            .collect();
+        assert_eq!(
+            ops,
+            [OutboxOp::SetContactPhoto {
+                id: "C-dave".into()
+            }]
+        );
+        assert!(store.contact_photo("C-dave").unwrap().unwrap().pending);
+        assert_eq!(
+            srv.requests().iter().filter(|r| r.method == "PUT").count(),
+            1
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contact_photo_set_on_a_contact_deleted_elsewhere_reports_404() {
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-photo-gone",
+            vec![
+                (any_route("PUT", DAVE_PHOTO, 404, "{}"), None),
+                (any_route("GET", "/me/contacts/C-dave", 404, "{}"), None),
+            ],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        // Two sets, the second written before the first op is sent.
+        store
+            .set_contact_photo("C-dave", b"ONE", "image/jpeg")
+            .unwrap();
+        store
+            .set_contact_photo("C-dave", b"TWO", "image/jpeg")
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetContactPhoto {
+                id: "C-dave".into(),
+            })
+            .unwrap();
+        // One refusal (#2065 r2): the first PUT sent the latest photo, so
+        // its revert forgets it, the re-read's 404 deletes the contact, and
+        // the later op has nothing to send.
+        let seen = wait_refused(&handle.evt_rx);
+        let failures: Vec<&SyncEvent> = seen
+            .iter()
+            .filter(|e| matches!(e, SyncEvent::ContactWriteFailed { .. }))
+            .collect();
+        assert_eq!(
+            failures,
+            [&SyncEvent::ContactWriteFailed {
+                id: "C-dave".into(),
+                write: ContactWrite::SetPhoto,
+                status: Some(404),
+                error: "not found (404)".into(),
+                attempted: None,
+                // The row as the user left it: the later set's photo.
+                attempted_photo: Some(jpeg(b"TWO")),
+            }],
+            "{seen:?}"
+        );
+        assert_eq!(requests_of(&srv, "GET", "/me/contacts/C-dave").len(), 1);
+        assert!(store.folder_contact("C-dave").unwrap().is_none());
+        assert_eq!(store.contact_photo("C-dave").unwrap(), None);
+        assert!(!store.is_contact("dave@x.com").unwrap());
+        assert!(store.pending_ops().unwrap().is_empty());
+        assert_eq!(
+            srv.requests().iter().filter(|r| r.method == "PUT").count(),
+            1
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2065 r2: two sets queued and the first PUT, which sent the latest
+    /// photo, refused 403: one upload, one report; the later op sends
+    /// nothing.
+    #[test]
+    fn contact_photo_sets_refused_403_upload_and_report_once() {
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-photo-403-twice",
+            vec![(any_route("PUT", DAVE_PHOTO, 403, DENIED), None)],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        store
+            .set_contact_photo("C-dave", b"ONE", "image/jpeg")
+            .unwrap();
+        store
+            .set_contact_photo("C-dave", b"TWO", "image/jpeg")
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetContactPhoto {
+                id: "C-dave".into(),
+            })
+            .unwrap();
+        let seen = wait_refused(&handle.evt_rx);
+        let failures: Vec<&SyncEvent> = seen
+            .iter()
+            .filter(|e| matches!(e, SyncEvent::ContactWriteFailed { .. }))
+            .collect();
+        assert_eq!(failures.len(), 1, "{seen:?}");
+        assert!(matches!(
+            failures[0],
+            SyncEvent::ContactWriteFailed {
+                write: ContactWrite::SetPhoto,
+                status: Some(403),
+                attempted_photo: Some(p),
+                ..
+            } if p.bytes == b"TWO"
+        ));
+        assert_eq!(
+            srv.requests().iter().filter(|r| r.method == "PUT").count(),
+            1
+        );
+        assert!(store.pending_ops().unwrap().is_empty());
+        assert_eq!(store.contact_photo("C-dave").unwrap(), None);
+        assert!(store.folder_contact("C-dave").unwrap().is_some());
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2065 r2: an update refused 404 whose re-read finds the contact gone
+    /// deletes it at once when the queued photo op behind it has nothing
+    /// left to send (an earlier op sent and Graph took the photo).
+    #[test]
+    fn refused_update_404_deletes_a_contact_whose_photo_was_sent() {
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-photo-sent-then-update-404",
+            vec![
+                (any_route("PUT", DAVE_PHOTO, 200, ""), None),
+                (any_route("PATCH", "/me/contacts/C-dave", 404, "{}"), None),
+                (any_route("GET", "/me/contacts/C-dave", 404, "{}"), None),
+            ],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        // Queue: SetPhoto, UpdateContact, SetPhoto.
+        store
+            .set_contact_photo("C-dave", b"ONE", "image/jpeg")
+            .unwrap();
+        let mut f = store.folder_contact("C-dave").unwrap().unwrap().fields;
+        f.job_title = "Lead".into();
+        let fields = store.update_contact_fields("C-dave", &f).unwrap();
+        store
+            .set_contact_photo("C-dave", b"TWO", "image/jpeg")
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateContact {
+                id: "C-dave".into(),
+                fields,
+            })
+            .unwrap();
+        let seen = wait_refused(&handle.evt_rx);
+        let failures: Vec<&SyncEvent> = seen
+            .iter()
+            .filter(|e| matches!(e, SyncEvent::ContactWriteFailed { .. }))
+            .collect();
+        assert_eq!(failures.len(), 1, "{seen:?}");
+        assert!(matches!(
+            failures[0],
+            SyncEvent::ContactWriteFailed {
+                write: ContactWrite::Update,
+                status: Some(404),
+                ..
+            }
+        ));
+        let puts: Vec<_> = srv
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PUT")
+            .collect();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].body_bytes, b"TWO", "the first op sent the latest");
+        assert_eq!(requests_of(&srv, "GET", "/me/contacts/C-dave").len(), 1);
+        assert!(
+            store.folder_contact("C-dave").unwrap().is_none(),
+            "not lingering"
+        );
+        assert!(!store.is_contact("dave@x.com").unwrap());
+        assert!(store.pending_ops().unwrap().is_empty());
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2065 r1: a photo type ureq cannot send as a header is refused as an
+    /// ordinary contact-write failure, never a transport stop: the op after
+    /// it still goes out.
+    #[test]
+    fn contact_photo_set_with_a_bad_type_is_refused_and_the_queue_moves_on() {
+        let list = list_of(&[DAVE_JSON, ERIN_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-photo-bad-type",
+            vec![
+                (any_route("PUT", DAVE_PHOTO, 200, ""), None),
+                (
+                    any_route("PATCH", "/me/contacts/C-erin", 200, ERIN_JSON),
+                    None,
+                ),
+            ],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        store
+            .set_contact_photo("C-dave", b"P", "image/jpeg")
+            .unwrap();
+        // A row no store write would leave (an older build, another path).
+        store.execute_for_test(
+            "UPDATE contact_photos SET content_type = 'image/jp\u{e9}g' WHERE contact_id = 'C-dave'",
+        );
+        let mut f = store.folder_contact("C-erin").unwrap().unwrap().fields;
+        f.job_title = "Lead".into();
+        store.update_contact_fields("C-erin", &f).unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetContactPhoto {
+                id: "C-dave".into(),
+            })
+            .unwrap();
+        let seen = wait_refused(&handle.evt_rx);
+        match contact_failure(&seen) {
+            Some(SyncEvent::ContactWriteFailed {
+                id,
+                write: ContactWrite::SetPhoto,
+                status: None,
+                attempted_photo: Some(p),
+                ..
+            }) => {
+                assert_eq!(id, "C-dave");
+                assert_eq!(p.bytes, b"P");
+            }
+            other => panic!("{other:?} in {seen:?}"),
+        }
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, SyncEvent::State(SyncState::Offline))),
+            "{seen:?}"
+        );
+        assert!(!srv.requests().iter().any(|r| r.method == "PUT"));
+        assert_eq!(requests_of(&srv, "PATCH", "/me/contacts/C-erin").len(), 1);
+        assert!(store.pending_ops().unwrap().is_empty());
+        assert_eq!(store.contact_photo("C-dave").unwrap(), None);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2065 r1: an update refused 404 re-reads the contact (404), but a
+    /// queued photo set keeps the row, so its own PUT 404s and reports the
+    /// photo; its re-read then deletes the contact.
+    #[test]
+    fn refused_update_404_keeps_the_contact_for_a_queued_photo_set() {
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-photo-after-update-404",
+            vec![
+                (any_route("PATCH", "/me/contacts/C-dave", 404, "{}"), None),
+                (any_route("PUT", DAVE_PHOTO, 404, "{}"), None),
+                (any_route("GET", "/me/contacts/C-dave", 404, "{}"), None),
+            ],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        let mut f = store.folder_contact("C-dave").unwrap().unwrap().fields;
+        f.job_title = "Lead".into();
+        let fields = store.update_contact_fields("C-dave", &f).unwrap();
+        store
+            .set_contact_photo("C-dave", b"MINE", "image/jpeg")
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateContact {
+                id: "C-dave".into(),
+                fields,
+            })
+            .unwrap();
+        // The update's refusal, then the photo's, then the command's own.
+        let mut seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::ContactWriteFailed { .. })
+        });
+        seen.extend(wait_refused(&handle.evt_rx));
+        let failures: Vec<&SyncEvent> = seen
+            .iter()
+            .filter(|e| matches!(e, SyncEvent::ContactWriteFailed { .. }))
+            .collect();
+        assert_eq!(failures.len(), 2, "{seen:?}");
+        assert!(
+            matches!(
+                failures[0],
+                SyncEvent::ContactWriteFailed {
+                    write: ContactWrite::Update,
+                    status: Some(404),
+                    attempted_photo: None,
+                    ..
+                }
+            ),
+            "{seen:?}"
+        );
+        assert_eq!(
+            failures[1],
+            &SyncEvent::ContactWriteFailed {
+                id: "C-dave".into(),
+                write: ContactWrite::SetPhoto,
+                status: Some(404),
+                error: "not found (404)".into(),
+                attempted: None,
+                attempted_photo: Some(jpeg(b"MINE")),
+            }
+        );
+        assert_eq!(
+            srv.requests().iter().filter(|r| r.method == "PUT").count(),
+            1
+        );
+        assert_eq!(requests_of(&srv, "GET", "/me/contacts/C-dave").len(), 2);
+        assert!(store.folder_contact("C-dave").unwrap().is_none());
+        assert!(store.pending_ops().unwrap().is_empty());
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refused_create_reports_its_pending_photo() {
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-photo-create-403",
+            vec![(any_route("POST", "/me/contacts", 403, DENIED), None)],
+            &[("/me/contacts", 200, r#"{"value":[]}"#, None)],
+            |_| {},
+        );
+        let local = store.create_local_contact(&new_contact_fields()).unwrap();
+        store
+            .set_contact_photo(&local, b"MINE", "image/png")
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::CreateContact { id: local.clone() })
+            .unwrap();
+        let seen = wait_refused(&handle.evt_rx);
+        match contact_failure(&seen) {
+            Some(SyncEvent::ContactWriteFailed {
+                id,
+                write: ContactWrite::Create,
+                attempted: Some(_),
+                attempted_photo,
+                ..
+            }) => {
+                assert_eq!(id, local);
+                assert_eq!(
+                    attempted_photo,
+                    Some(ContactPhoto {
+                        bytes: b"MINE".to_vec(),
+                        content_type: "image/png".into(),
+                        etag: String::new(),
+                    })
+                );
+            }
+            other => panic!("{other:?} in {seen:?}"),
+        }
+        assert!(store.folder_contact(&local).unwrap().is_none());
+        assert_eq!(store.contact_photo(&local).unwrap(), None);
+        // Its photo op sends nothing: Graph has no such contact.
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        assert!(!srv.requests().iter().any(|r| r.method == "PUT"));
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

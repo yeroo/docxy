@@ -141,6 +141,7 @@ issue number to find its notes.
   occurrences filled from their series master, masters off the grid (#2064),
   the Contacts folder as records, `is_contact`, contacts created, updated and
   deleted through the outbox, a refused write reported and reverted (#1934, #2063),
+  a contact's photo fetched, set through the outbox, no delete on Graph (#2065),
   cancelling a meeting with a message and forwarding it (#1985),
   a series' occurrences, its master and editing either (#2022),
   a series created with any Graph recurrence (#2034),

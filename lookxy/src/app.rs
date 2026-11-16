@@ -922,6 +922,8 @@ impl App {
             // (#2063) and has nothing to re-key or report.
             | SyncEvent::ContactCreated { .. }
             | SyncEvent::ContactWriteFailed { .. }
+            // Nor does it show a contact's photo, so it never asks (#2065).
+            | SyncEvent::ContactPhotoFetched { .. }
             // lookxy has no folder management, so it never creates,
             // renames or moves a folder (#1910).
             | SyncEvent::FolderCreated { .. }

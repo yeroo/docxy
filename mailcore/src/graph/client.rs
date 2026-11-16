@@ -9,10 +9,10 @@
 //! is never logged (it's not `Debug`-derived into any log line here).
 
 use crate::graph::model::{
-    AttachmentMeta, AutomaticReplies, Body, Calendar, ContactFields, DeltaPage, DirectoryUser,
-    DraftOptions, Event, EventDeltaItem, EventDeltaPage, EventRecurrence, FolderContact,
-    FolderListing, MailFolder, MasterCategory, Me, MeetingMessage, Message, MessageFields,
-    MessageHeader, OofStatus, Person, PhysicalAddress, REMINDER_SET_PROP,
+    AttachmentMeta, AutomaticReplies, Body, Calendar, ContactFields, ContactPhoto, DeltaPage,
+    DirectoryUser, DraftOptions, Event, EventDeltaItem, EventDeltaPage, EventRecurrence,
+    FolderContact, FolderListing, MailFolder, MasterCategory, Me, MeetingMessage, Message,
+    MessageFields, MessageHeader, OofStatus, Person, PhysicalAddress, REMINDER_SET_PROP,
     REMINDER_SIGNAL_TIME_PROP, Recipient, Recurrence, ScheduleEntry, SearchHit, SubtreeItems,
     is_event_message_type, parse_message_size, plain_to_html, reminder_time, to_utc,
 };
@@ -2306,22 +2306,78 @@ impl GraphClient {
     /// fallback. A photo over [`PHOTO_MAX`] bytes is refused as a `Parse`
     /// error.
     pub fn my_photo(&self) -> Result<Option<(Vec<u8>, String)>, GraphError> {
+        let pair = |p: ContactPhoto| Some((p.bytes, p.content_type));
         match self.get_photo("/me/photo/$value") {
             Err(GraphError::NotFound) => {}
-            other => return other.map(Some),
+            other => return other.map(pair),
         }
         match self.get_photo("/me/photos/48x48/$value") {
             Err(GraphError::NotFound) => Ok(None),
+            other => other.map(pair),
+        }
+    }
+
+    /// A Contacts-folder contact's photo (#2065): GET
+    /// `/me/contacts/{id}/photo/$value`. `Ok(None)` on a 404, which is
+    /// Graph's answer for a contact without a photo (and for a contact gone).
+    /// Any other error is returned as it is: a 403 (no `Contacts.Read`) is
+    /// `Http { status: 403, .. }`. A photo over [`PHOTO_MAX`] bytes is
+    /// refused as a `Parse` error, as [`GraphClient::my_photo`]'s. The
+    /// `ETag` header, when Graph sends one, is kept in the photo's `etag`.
+    pub fn contact_photo(&self, id: &str) -> Result<Option<ContactPhoto>, GraphError> {
+        let path = format!("/me/contacts/{}/photo/$value", encode_path_segment(id));
+        match self.get_photo(&path) {
+            Err(GraphError::NotFound) => Ok(None),
             other => other.map(Some),
         }
+    }
+
+    /// Sets a Contacts-folder contact's photo (#2065): PUT the raw `bytes`
+    /// to `/me/contacts/{id}/photo/$value` with `Content-Type: content_type`
+    /// (`image/jpeg` when empty, the type Graph documents). Graph's answer
+    /// body is not read. Empty bytes, more than [`PHOTO_MAX`] (Graph's own
+    /// limit is 4 MB), or a type that is no valid header value
+    /// ([`photo_content_type`]) are refused as a `Parse` error before any
+    /// request: never the `Transport` error ureq would give a bad header,
+    /// which would stop the outbox at the op for ever.
+    /// No allow-list of types: Graph refuses what it does not take, as an
+    /// `Http` 4xx.
+    ///
+    /// Requires `Contacts.ReadWrite`, and Graph supports it for work or
+    /// school accounts only ("Delegated (personal Microsoft account): Not
+    /// supported"): a token with only `Contacts.Read`, or a personal
+    /// account, is refused. There is no call to remove a contact's photo:
+    /// Graph's photo DELETE "supports only user or group photos, but not
+    /// Outlook contact nor Teams photos".
+    pub fn set_contact_photo(
+        &self,
+        id: &str,
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<(), GraphError> {
+        if bytes.is_empty() {
+            return Err(GraphError::Parse("contact photo is empty".to_string()));
+        }
+        if bytes.len() > PHOTO_MAX {
+            return Err(photo_too_large(PHOTO_MAX));
+        }
+        let Some(content_type) = photo_content_type(content_type) else {
+            return Err(GraphError::Parse(format!(
+                "contact photo type {content_type:?} is not a valid Content-Type"
+            )));
+        };
+        let path = format!("/me/contacts/{}/photo/$value", encode_path_segment(id));
+        self.put_binary(&path, content_type, bytes)?;
+        Ok(())
     }
 
     /// One photo `$value` request: binary, so it asks for `image/*` (the
     /// header replaces `send`'s JSON `Accept`), refuses a `Content-Length`
     /// over [`PHOTO_MAX`] before reading, and reads at most `PHOTO_MAX` bytes
     /// whatever the header said. The content type is the `Content-Type`
-    /// header without its parameters, `application/octet-stream` when absent.
-    fn get_photo(&self, path: &str) -> Result<(Vec<u8>, String), GraphError> {
+    /// header without its parameters, `application/octet-stream` when absent;
+    /// the etag the `ETag` header, `""` when absent.
+    fn get_photo(&self, path: &str) -> Result<ContactPhoto, GraphError> {
         let resp = self.send(Method::Get, path, None, &[("Accept", "image/*")])?;
         let content_type = resp
             .header("Content-Type")
@@ -2329,8 +2385,13 @@ impl GraphClient {
             .filter(|v| !v.is_empty())
             .unwrap_or("application/octet-stream")
             .to_string();
+        let etag = resp.header("ETag").unwrap_or("").to_string();
         let bytes = read_response_capped(resp, PHOTO_MAX, photo_too_large)?;
-        Ok((bytes, content_type))
+        Ok(ContactPhoto {
+            bytes,
+            content_type,
+            etag,
+        })
     }
 
     /// GET `/me/mailboxSettings` and parse its `automaticRepliesSetting` into
@@ -2946,6 +3007,27 @@ impl GraphClient {
         }
     }
 
+    /// A PUT of a binary body (#2065's contact photo): the bearer and JSON
+    /// `Accept` as `send`, `Content-Type` as given, the bytes as they are
+    /// (`send_bytes`, never a string). A non-2xx maps as `send`'s does.
+    fn put_binary(
+        &self,
+        path: &str,
+        content_type: &str,
+        bytes: &[u8],
+    ) -> Result<ureq::Response, GraphError> {
+        let result = ureq::put(&self.full_url(path))
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .set("Accept", "application/json")
+            .set("Content-Type", content_type)
+            .send_bytes(bytes);
+        match result {
+            Ok(resp) => Ok(resp),
+            Err(ureq::Error::Status(status, resp)) => Err(classify_status(status, resp)),
+            Err(ureq::Error::Transport(t)) => Err(GraphError::Transport(t.to_string())),
+        }
+    }
+
     /// `path` is used verbatim when it's already a complete URL (a delta
     /// link); otherwise it's joined onto `base`.
     fn full_url(&self, path: &str) -> String {
@@ -3059,12 +3141,32 @@ fn response_too_large(max: usize) -> GraphError {
     GraphError::Parse(format!("response is larger than {max} bytes"))
 }
 
-/// The largest profile photo `GraphClient::my_photo` accepts (4 MiB). Graph's
-/// photos are a few kilobytes; anything near this is not a photo.
+/// The largest profile photo `GraphClient::my_photo` accepts (4 MiB), and
+/// the largest contact photo `contact_photo` reads and `set_contact_photo`
+/// sends (#2065). Graph's photos are a few kilobytes; anything near this is
+/// not a photo.
 pub const PHOTO_MAX: usize = 4 * 1024 * 1024;
 
+/// The `Content-Type` a contact photo is sent with (#2065): `type_` trimmed,
+/// `image/jpeg` (the type Graph documents) when that is empty, `None` when
+/// it is not a header value ureq sends. ureq refuses a header byte other
+/// than a space, a tab or 0x21-0x7E as a transport error (`BadHeader`),
+/// which the drain would take for offline and retry for ever; so both the
+/// store and the client refuse such a type up front. A type must also hold
+/// a `/` (`type/subtype`).
+pub(crate) fn photo_content_type(type_: &str) -> Option<&str> {
+    let t = type_.trim();
+    if t.is_empty() {
+        return Some("image/jpeg");
+    }
+    let header_safe = t
+        .bytes()
+        .all(|b| b == b' ' || b == b'\t' || (0x21..=0x7E).contains(&b));
+    (header_safe && t.contains('/')).then_some(t)
+}
+
 fn photo_too_large(max: usize) -> GraphError {
-    GraphError::Parse(format!("profile photo is larger than {max} bytes"))
+    GraphError::Parse(format!("photo is larger than {max} bytes"))
 }
 
 /// Reads `r` to its end, refusing (`too_large(max)`) once it yields more
@@ -7777,6 +7879,219 @@ mod tests {
         ));
         // Its childFolders answers 404: the folder is gone.
         assert_eq!(c.folder_subtree_items("NOKIDS").unwrap(), None);
+    }
+
+    /// The values of the request header `name` (any case).
+    fn header_values<'a>(r: &'a crate::testserver::RecordedRequest, name: &str) -> Vec<&'a str> {
+        r.headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    fn contact_photo_route(method: &str, path: &str, status: u16, body: &str) -> Route {
+        Route {
+            method: method.into(),
+            path_prefix: path.into(),
+            status,
+            headers: vec![],
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn contact_photo_gets_bytes_type_and_etag() {
+        let srv = FakeServer::start(vec![photo_route(
+            "/me/contacts/A%2FB%3D/photo/$value",
+            200,
+            "JPEGDATA",
+            &[
+                ("Content-Type", "image/jpeg; charset=binary"),
+                ("ETag", "W/\"abc\""),
+            ],
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let photo = c.contact_photo("A/B=").unwrap();
+        assert_eq!(
+            photo,
+            Some(ContactPhoto {
+                bytes: b"JPEGDATA".to_vec(),
+                content_type: "image/jpeg".into(),
+                etag: "W/\"abc\"".into(),
+            })
+        );
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(reqs[0].path, "/me/contacts/A%2FB%3D/photo/$value");
+        assert_eq!(header_values(&reqs[0], "accept"), ["image/*"]);
+        assert_eq!(header_values(&reqs[0], "authorization"), ["Bearer AT"]);
+    }
+
+    #[test]
+    fn contact_photo_without_etag_is_empty() {
+        let srv = FakeServer::start(vec![photo_route(
+            "/me/contacts/G1/photo/$value",
+            200,
+            "PNG",
+            &[("Content-Type", "image/png")],
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let photo = c.contact_photo("G1").unwrap().unwrap();
+        assert_eq!(photo.content_type, "image/png");
+        assert_eq!(photo.etag, "");
+    }
+
+    #[test]
+    fn contact_photo_404_is_none() {
+        let srv = FakeServer::start(vec![photo_route(
+            "/me/contacts/G1/photo/$value",
+            404,
+            "{}",
+            &[],
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.contact_photo("G1").unwrap(), None);
+    }
+
+    #[test]
+    fn contact_photo_403_is_http_403() {
+        let srv = FakeServer::start(vec![photo_route(
+            "/me/contacts/G1/photo/$value",
+            403,
+            r#"{"error":{"code":"ErrorAccessDenied"}}"#,
+            &[],
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.contact_photo("G1"),
+            Err(GraphError::Http { status: 403, .. })
+        ));
+    }
+
+    #[test]
+    fn contact_photo_refuses_oversize() {
+        let big = "x".repeat(PHOTO_MAX + 1);
+        let srv = FakeServer::start(vec![photo_route(
+            "/me/contacts/G1/photo/$value",
+            200,
+            &big,
+            &[("Content-Type", "image/jpeg")],
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(c.contact_photo("G1"), Err(GraphError::Parse(_))));
+    }
+
+    #[test]
+    fn set_contact_photo_puts_the_bytes_with_their_type() {
+        let srv = FakeServer::start(vec![contact_photo_route(
+            "PUT",
+            "/me/contacts/A%2FB/photo/$value",
+            200,
+            "",
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        // Not UTF-8: a string body would mangle it.
+        let bytes = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x80, 0xFE, 0x01];
+        c.set_contact_photo("A/B", &bytes, "image/jpeg").unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "PUT");
+        assert_eq!(reqs[0].path, "/me/contacts/A%2FB/photo/$value");
+        assert_eq!(reqs[0].body_bytes, bytes);
+        assert_eq!(header_values(&reqs[0], "content-type"), ["image/jpeg"]);
+        assert_eq!(header_values(&reqs[0], "authorization"), ["Bearer AT"]);
+    }
+
+    #[test]
+    fn set_contact_photo_without_a_type_sends_jpeg() {
+        let srv = FakeServer::start(vec![contact_photo_route(
+            "PUT",
+            "/me/contacts/G1/photo/$value",
+            200,
+            "",
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.set_contact_photo("G1", b"P", " ").unwrap();
+        let reqs = srv.requests();
+        assert_eq!(header_values(&reqs[0], "content-type"), ["image/jpeg"]);
+    }
+
+    #[test]
+    fn set_contact_photo_403_is_http_403() {
+        let srv = FakeServer::start(vec![contact_photo_route(
+            "PUT",
+            "/me/contacts/G1/photo/$value",
+            403,
+            r#"{"error":{"code":"ErrorAccessDenied"}}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.set_contact_photo("G1", b"P", "image/jpeg"),
+            Err(GraphError::Http { status: 403, .. })
+        ));
+    }
+
+    #[test]
+    fn set_contact_photo_refuses_a_bad_type_without_a_request() {
+        let srv = FakeServer::start(vec![contact_photo_route(
+            "PUT",
+            "/me/contacts/G1/photo/$value",
+            200,
+            "",
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        for bad in ["image/jpég", "image/jpeg\r\nX: y", "image/\u{7f}", "jpeg"] {
+            assert!(
+                matches!(
+                    c.set_contact_photo("G1", b"P", bad),
+                    Err(GraphError::Parse(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        assert!(srv.requests().is_empty());
+        // A parameter with its space is a valid header value.
+        c.set_contact_photo("G1", b"P", " image/png; q=1 ").unwrap();
+        let reqs = srv.requests();
+        assert_eq!(header_values(&reqs[0], "content-type"), ["image/png; q=1"]);
+    }
+
+    #[test]
+    fn photo_content_type_defaults_and_refuses() {
+        assert_eq!(photo_content_type(""), Some("image/jpeg"));
+        assert_eq!(photo_content_type("  "), Some("image/jpeg"));
+        assert_eq!(photo_content_type(" image/png "), Some("image/png"));
+        assert_eq!(photo_content_type("image/jpég"), None);
+        assert_eq!(
+            photo_content_type("image/png\n"),
+            Some("image/png"),
+            "trimmed"
+        );
+        assert_eq!(photo_content_type("image/\npng"), None);
+        assert_eq!(photo_content_type("png"), None);
+    }
+
+    #[test]
+    fn set_contact_photo_refuses_empty_and_oversized_without_a_request() {
+        let srv = FakeServer::start(vec![contact_photo_route(
+            "PUT",
+            "/me/contacts/G1/photo/$value",
+            200,
+            "",
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.set_contact_photo("G1", b"", "image/jpeg"),
+            Err(GraphError::Parse(_))
+        ));
+        let big = vec![0u8; PHOTO_MAX + 1];
+        assert!(matches!(
+            c.set_contact_photo("G1", &big, "image/jpeg"),
+            Err(GraphError::Parse(_))
+        ));
+        assert!(srv.requests().is_empty());
     }
 
     #[test]
