@@ -303,10 +303,13 @@ pub(crate) fn pane_on_screen(
     frame.iter().any(|(n, _)| *n == name).then_some(pane)
 }
 
-/// Whether a key that reaches the surface leaves the focused pane as it is:
-/// only a bare modifier (it is half of a chord, or the KeyTips' Alt) and F1
-/// itself. Any other key went to the document, grid or plan, or to the
-/// KeyTips, so the keyboard is no longer in the pane.
+/// Whether a key past F1 in `on_key` (or Tab, Shift+Tab past the overlays)
+/// leaves the focused pane as it is: only a bare modifier (half of a chord,
+/// or the KeyTips' Alt) and F1 itself. Any other went to the editor: the
+/// document, grid or plan, an entry (the Find bar, the Name Box, a Project
+/// edit) or the KeyTips. The window's own keys (`document_key`: Save, Save
+/// As, the tab switch keys) and keys an overlay spends never get here, so
+/// they keep the pane, as Ctrl+S in Word's Navigation pane does.
 pub(crate) fn keeps_pane_focus(key: &str) -> bool {
     matches!(
         key,
@@ -355,11 +358,7 @@ pub(crate) fn entry_pane_help(
 /// page of the ribbon tab shown (`area`), else the root, in the manual of
 /// the tab's kind.
 pub(crate) fn f1_pane_ask(kind: Option<Kind>, pane: Pane, area: &str) -> HelpAsk {
-    HelpAsk {
-        editor: help_view::host::editor_for(kind),
-        id: Some(pane.key()),
-        area: Some(area.to_string()),
-    }
+    f1_command_ask(kind, &pane.key(), area)
 }
 
 /// Help › Help (the ribbon's, the sheet's, the macOS menu's): the `help`
@@ -498,15 +497,26 @@ impl Docxy {
     }
 
     /// F1 in a Chart panel field (#2077, [`entry_pane_help`]): the pane's
-    /// page in a Help tab, which, as any tab switch, drops the field and
-    /// closes the panel (`drop_grid_state`); with no manual installed the
-    /// status line says the documentation is coming and the field keeps the
-    /// keys.
+    /// page in a Help tab. The field is committed first, as Enter commits
+    /// it, so the tab switch (`drop_grid_state`, which drops the field and
+    /// closes the panel, as Ctrl+Tab does) loses no typed text. A commit the
+    /// field refuses keeps it open with its message, and no Help tab opens.
+    /// With no manual installed nothing is committed: the status line says
+    /// the documentation is coming and the field keeps the keys.
     pub(crate) fn pane_f1(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
         self.keytips = KeyTip::Off;
         let kind = self.tabs.get(self.active).map(|t| t.kind);
         let area = crate::ribbon_tab_name(self.ribbon_tab);
-        if !self.open_help(f1_pane_ask(kind, pane, area), window, cx) {
+        let ask = f1_pane_ask(kind, pane, area);
+        if self.help_bundle(ask.editor).is_none() {
+            self.set_status(DOCS_COMING);
+            cx.notify();
+            return;
+        }
+        if pane == Pane::Chart && !self.commit_chart_field(cx) {
+            return;
+        }
+        if !self.open_help(ask, window, cx) {
             self.set_status(DOCS_COMING);
             cx.notify();
         }

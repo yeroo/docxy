@@ -21547,6 +21547,28 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    /// Commit the Chart panel field being typed into as Enter does (#2077:
+    /// F1 there, before the tab switch to Help drops it). `false` when the
+    /// commit refuses the text: the field stays open, its text and caret as
+    /// they were, with the commit's message under it.
+    fn commit_chart_field(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(f) = self.range_edit.clone() else {
+            return true;
+        };
+        // A message left by an earlier commit must not read as this one's.
+        if matches!(&self.ref_msg, Some((t, _, _)) if *t == f.target) {
+            self.ref_msg = None;
+        }
+        self.range_edit = None;
+        self.ref_commit(f.target, &f.buf, cx);
+        let refused = matches!(&self.ref_msg, Some((t, false, _)) if *t == f.target);
+        if refused {
+            self.range_edit = Some(f);
+        }
+        cx.notify();
+        !refused
+    }
+
     /// A press at `at` (#2077): the focused pane becomes the one under it,
     /// or none, unless an overlay is up (`help_tab::press_sets_pane_focus`).
     fn pane_press(&mut self, at: Point<Pixels>) {

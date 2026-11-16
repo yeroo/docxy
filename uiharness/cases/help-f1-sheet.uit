@@ -74,12 +74,15 @@ test F1 in a Chart panel field opens the Chart pane's page
   # The one pane whose field takes the keys (`range_edit`): F1 there opens
   # `pane:chart`'s page, where any other entry swallows F1. The Help tab is
   # a tab switch, which drops the field and closes the panel as Ctrl+Tab
-  # does.
+  # does, so F1 commits the field first, as Enter does.
   open ../fixtures/basic.xlsx
   select chart 0
   assert panel_chart is 0
-  focus categories
-  assert field is categories
+  focus chart-title
+  assert field is chart-title
+  key ctrl+a
+  type Help Title
+  assert field_text is Help Title
   call real-key {"key":"f1"}
   call help-read {}
   assert reply.open is true
@@ -89,3 +92,20 @@ test F1 in a Chart panel field opens the Chart pane's page
   call real-key {"key":"ctrl+w"}
   assert field is nothing
   assert panel_chart is nothing
+  # The typed title was committed: the field opens on it.
+  select chart 0
+  focus chart-title
+  assert field_text is Help Title
+  key escape
+  # Text the field refuses: F1 commits nothing, opens no Help tab, and the
+  # field stays open with its text.
+  focus categories
+  key ctrl+a
+  type not a range
+  call real-key {"key":"f1"}
+  call help-read {}
+  assert reply.open is false
+  assert field is categories
+  assert field_text is not a range
+  assert panel_chart is 0
+  key escape
