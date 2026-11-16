@@ -117,8 +117,9 @@ F1 resolves a context id to a page:
   ribbon tab shown as the area.
 - A dialog id is `dialog:<id>` (`dialog:font`).
 - A pane id is `pane:<id>` (#2077). F1 asks for it while the keyboard is in
-  the pane (the last press landed in it and no key has gone to the document,
-  sheet or plan since), after a command under the pointer and ahead of the
+  the pane: the last press landed in it, and no key but a modifier has gone
+  to the editor since (window keys such as Save and the tab switch keys do
+  not count). It comes after a command under the pointer and ahead of the
   area, with the ribbon tab shown as the area:
 
   | Pane | Key | Editor |

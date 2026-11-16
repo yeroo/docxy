@@ -193,7 +193,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the help manuals
   `MouseDownEvent` capture listener in the root's `gesture_listeners`
   canvas, next to #1869's; it never stops the event or notifies), and `None`
   after any key past the F1 branch but a bare modifier
-  (`keeps_pane_focus`). Keys spent before F1 (a dialog's, the backstage's, a
+  (`keeps_pane_focus`), and after Tab or Shift+Tab, gpui actions that never
+  reach `on_key` (`tab_key`/`shift_tab_key` clear it past their overlay
+  checks). Keys spent before F1 (a dialog's, the backstage's, a
   menu's, Escape closing a flyout, `document_key`'s Ctrl+S or Ctrl+Tab) keep
   it, as Ctrl+S in Word's Navigation pane keeps the pane focused. A press
   under an overlay keeps it too (`press_sets_pane_focus`: a menu, a ribbon
@@ -214,7 +216,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the help manuals
   (`other_entry_owns_keys`: the Name Box, a cell editor, a rule's range in
   its bar, ...) and the pane is drawn (`entry_pane_help`, decided before
   `entry_owns_keys`). The Help tab is a tab switch, so `drop_grid_state`
-  drops the field (its unsaved text) and closes the panel, as Ctrl+Tab does.
+  drops the field and closes the panel, as Ctrl+Tab does: `pane_f1` first
+  commits the field as Enter does (`commit_chart_field`), and when the
+  commit refuses the text the field stays open with its message and no Help
+  tab opens. With no manual installed nothing is committed.
   Every other entry still swallows F1.
 - Harness: the region `pane:<id>` (an unknown id lists the ids; `the <id>
   pane is not drawn` off screen). Cases: the test "F1 with the keyboard in a
