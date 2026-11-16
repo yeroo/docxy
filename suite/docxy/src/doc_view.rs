@@ -13,7 +13,9 @@
 //! its decisions are [`edit`]'s. A hyperlink press goes to the extension's callback
 //! ([`DocView::on_link`], [`DocView::on_link_with_text`]), never opened here; the
 //! link under the pointer goes to [`DocView::on_link_hover`] and, read-only,
-//! the pointer is a hand over it (#1916). A picture's Alt Text shows as
+//! the pointer is a hand over it (#1916). A picture linked to a URL (its
+//! `a:hlinkClick`, as an HTML import keeps an `<a><img></a>`) is a link
+//! the same way, told by its Alt Text (#1999). A picture's Alt Text shows as
 //! its tooltip on hover ([`picture_tip_el`], #1998). The chrome (scroll bar, selection) follows the suite's
 //! theme; the document is a white page in its authored colours unless the
 //! extension turns on dark mode for content ([`DocView::set_content_dark`]),
@@ -36,6 +38,7 @@ pub(crate) use find::FindState;
 
 use super::*;
 use docxcore::editor::{Caret, Clip, Editor};
+use docxcore::load::Relationships;
 use docxcore::package::Package;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -104,7 +107,8 @@ pub struct LinkHover {
     /// The whole link's visible text, every run of it (not just the word
     /// under the pointer), read as [`CaretFormat`]'s `link` reads it: a
     /// field's result in place of the field, and a tab or line break in the
-    /// link kept as `\t` / `\u{0B}`.
+    /// link kept as `\t` / `\u{0B}`. A linked picture's (#1999) is its Alt
+    /// Text as [`docxcore::image::inline_alt_text`] reads it, or empty.
     pub text: String,
 }
 
@@ -221,6 +225,10 @@ type ChangeFn = Rc<dyn Fn(&mut App)>;
 pub struct DocView {
     editor: Editor,
     pkg: Option<Package>,
+    /// The package's main-document relationships, read when the document
+    /// is set: a picture's click link (#1999) names one. Editing adds only
+    /// media to them, never a hyperlink, so they are not read again.
+    rels: Relationships,
     pictures: Rc<RefCell<pictures::Cache>>,
     run_styles: RefCell<run_look::Cache>,
     zoom: f32,
@@ -318,6 +326,7 @@ impl DocView {
         .detach();
         DocView {
             editor: Editor::new(doc),
+            rels: document_rels(pkg.as_ref()),
             pkg,
             pictures,
             run_styles: RefCell::default(),
@@ -370,6 +379,7 @@ impl DocView {
         *cache = pictures::Cache::default();
         drop(cache);
         self.editor = Editor::new(doc);
+        self.rels = document_rels(pkg.as_ref());
         self.pkg = pkg;
         self.doc_gen += 1;
         self.alt_tips = (0, None);
@@ -664,7 +674,7 @@ impl DocView {
 
     /// Called with a hyperlink's target (its URL, `#name` for a bookmark
     /// link, or `target#anchor` for a link with both, #1916) when the person
-    /// follows it. It runs after the press is handled,
+    /// follows it, a linked picture's (#1999) included. It runs after the press is handled,
     /// outside the view's update, so it may update the view.
     pub fn on_link(&mut self, f: impl Fn(&str, &mut Window, &mut App) + 'static) {
         self.on_link = Some(Rc::new(f));
@@ -672,7 +682,8 @@ impl DocView {
 
     /// Called with a followed hyperlink's target and whole visible text
     /// (#1916), after [`DocView::on_link`] when both are set: a host may warn
-    /// when the text looks like a different URL from the target.
+    /// when the text looks like a different URL from the target. A linked
+    /// picture's text is its Alt Text, or empty (#1999).
     pub fn on_link_with_text(&mut self, f: impl Fn(&LinkHover, &mut Window, &mut App) + 'static) {
         self.on_link_with_text = Some(Rc::new(f));
     }
@@ -819,7 +830,7 @@ impl DocView {
         let link = on_piece
             .then(|| docxcore::editor::resolve_para(&self.editor.doc.body, &path))
             .flatten()
-            .and_then(|p| link_hover_at(p, off))
+            .and_then(|p| link_hover_at(p, off, &self.rels))
             .map(|(_, link)| link);
         // Ctrl+click (⌘ on macOS) follows a link at once, in either mode, and
         // selects nothing.
@@ -1623,7 +1634,7 @@ impl DocView {
                 .map(|w| {
                     (
                         path.clone(),
-                        para.and_then(|p| link_at(p, w.off)),
+                        para.and_then(|p| link_at(p, w.off, &self.rels)),
                         w.bounds(),
                     )
                 })
@@ -1879,7 +1890,7 @@ impl Render for DocView {
                 continue;
             }
             if let Some(p) = docxcore::editor::resolve_para(body, path) {
-                let found = para_links(p);
+                let found = para_links(p, &self.rels);
                 if !found.is_empty() {
                     links.insert(path.clone(), found);
                 }
@@ -2727,17 +2738,23 @@ pub(crate) fn step_zoom(zoom: f32, dir: i32) -> f32 {
 }
 
 /// The target of the hyperlink holding caret offset `off` of `p`: its URL,
-/// `#` and its bookmark, or `target#anchor` for a link with both (#1916);
+/// `#` and its bookmark, or `target#anchor` for a link with both (#1916),
+/// or a linked picture's URL (#1999: its click link, named in `rels`);
 /// `None` outside a link (or a link with neither).
-pub(crate) fn link_at(p: &Paragraph, off: usize) -> Option<String> {
-    link_hover_at(p, off).map(|(_, link)| link.url)
+pub(crate) fn link_at(p: &Paragraph, off: usize, rels: &Relationships) -> Option<String> {
+    link_hover_at(p, off, rels).map(|(_, link)| link.url)
 }
 
-/// The top-level hyperlink holding caret offset `off` of `p` (#1916): its
-/// index in `p.content` and what a host is told about it. `None` outside a
-/// link, or for a link with neither a target nor a bookmark.
-pub(crate) fn link_hover_at(p: &Paragraph, off: usize) -> Option<(usize, LinkHover)> {
-    para_links(p)
+/// The top-level hyperlink or linked picture (#1999) holding caret offset
+/// `off` of `p` (#1916): its index in `p.content` and what a host is told
+/// about it. `None` outside a link, or for a link with neither a target nor
+/// a bookmark.
+pub(crate) fn link_hover_at(
+    p: &Paragraph,
+    off: usize,
+    rels: &Relationships,
+) -> Option<(usize, LinkHover)> {
+    para_links(p, rels)
         .into_iter()
         .find(|(range, ..)| range.contains(&off))
         .map(|(_, i, link)| (i, link))
@@ -2946,8 +2963,10 @@ fn link_hover_listeners(hover: &Rc<LinkHoverState>, window: &mut Window) {
 /// Each top-level hyperlink of `p` with a target or a bookmark: its caret
 /// offsets, its index in `p.content` and what a host is told about it
 /// (docxcore's [`docxcore::editor::hyperlink_shown`], as the caret's link
-/// reads, #1916).
-fn para_links(p: &Paragraph) -> ParaLinks {
+/// reads, #1916). A top-level inline picture whose click link
+/// ([`docxcore::image::inline_click_link`]) names an external relationship
+/// in `rels` is one too (#1999), its text its Alt Text.
+fn para_links(p: &Paragraph, rels: &Relationships) -> ParaLinks {
     let mut at = 0;
     let mut out = Vec::new();
     for (i, inline) in p.content.iter().enumerate() {
@@ -2960,10 +2979,33 @@ fn para_links(p: &Paragraph) -> ParaLinks {
                 };
                 out.push((at..at + len, i, link));
             }
+        } else if let Some(link) = picture_link(inline, rels) {
+            out.push((at..at + len, i, link));
         }
         at += len;
     }
     out
+}
+
+/// What a host is told about an inline picture linked to a URL (#1999):
+/// its click link's external target in `rels`, and its Alt Text as
+/// [`docxcore::image::inline_alt_text`] reads it (empty without). `None`
+/// for anything else, or a link that names no external relationship.
+fn picture_link(inline: &Inline, rels: &Relationships) -> Option<LinkHover> {
+    let Inline::Raw(raw) = inline else {
+        return None;
+    };
+    let rid = docxcore::image::inline_click_link(raw)?;
+    let url = rels.external_target(&rid).filter(|u| !u.is_empty())?;
+    Some(LinkHover {
+        url: url.to_string(),
+        text: docxcore::image::inline_alt_text(raw).unwrap_or_default(),
+    })
+}
+
+/// The main-document relationships of `pkg` (none without one).
+fn document_rels(pkg: Option<&Package>) -> Relationships {
+    pkg.map(Package::document_rels).unwrap_or_default()
 }
 
 /// A paragraph's characters by caret offset: run text as it is, every other
@@ -3141,20 +3183,29 @@ mod tests {
             ],
             ..Paragraph::default()
         };
-        assert_eq!(link_at(&p, 0), None);
-        assert_eq!(link_at(&p, 3), None);
-        assert_eq!(link_at(&p, 4).as_deref(), Some("https://example.com/d"));
-        assert_eq!(link_at(&p, 8).as_deref(), Some("https://example.com/d"));
+        assert_eq!(link_at(&p, 0, &Relationships::default()), None);
+        assert_eq!(link_at(&p, 3, &Relationships::default()), None);
+        assert_eq!(
+            link_at(&p, 4, &Relationships::default()).as_deref(),
+            Some("https://example.com/d")
+        );
+        assert_eq!(
+            link_at(&p, 8, &Relationships::default()).as_deref(),
+            Some("https://example.com/d")
+        );
         // One past the link's last character is the text after it.
-        assert_eq!(link_at(&p, 9), None);
-        assert_eq!(link_at(&p, 14).as_deref(), Some("#top"));
-        assert_eq!(link_at(&p, 18), None);
+        assert_eq!(link_at(&p, 9, &Relationships::default()), None);
+        assert_eq!(
+            link_at(&p, 14, &Relationships::default()).as_deref(),
+            Some("#top")
+        );
+        assert_eq!(link_at(&p, 18, &Relationships::default()), None);
         // A link with neither a target nor a bookmark follows nowhere.
         let bare = Paragraph {
             content: vec![link("x", None, None)],
             ..Paragraph::default()
         };
-        assert_eq!(link_at(&bare, 0), None);
+        assert_eq!(link_at(&bare, 0, &Relationships::default()), None);
     }
 
     fn hover(url: &str, text: &str) -> LinkHover {
@@ -3192,11 +3243,88 @@ mod tests {
         let whole = hover("https://example.com/d", "docxy link");
         // Every offset in the link, each run's, is the same link.
         for off in 4..14 {
-            assert_eq!(link_hover_at(&p, off), Some((1, whole.clone())), "at {off}");
+            assert_eq!(
+                link_hover_at(&p, off, &Relationships::default()),
+                Some((1, whole.clone())),
+                "at {off}"
+            );
         }
-        assert_eq!(link_hover_at(&p, 3), None);
-        assert_eq!(link_hover_at(&p, 14), None);
-        assert_eq!(link_hover_at(&p, 18), Some((3, hover("#top", "top"))));
+        assert_eq!(link_hover_at(&p, 3, &Relationships::default()), None);
+        assert_eq!(link_hover_at(&p, 14, &Relationships::default()), None);
+        assert_eq!(
+            link_hover_at(&p, 18, &Relationships::default()),
+            Some((3, hover("#top", "top")))
+        );
+    }
+
+    /// An inline picture run with Alt Text `alt`, linked to `rid` when given
+    /// (#1999), as the HTML import writes one.
+    fn linked_picture(alt: &str, rid: Option<&str>) -> Inline {
+        let raw = docxcore::image::inline_picture_run_described(
+            "rIdImg", 9525, 9525, 1, "p.png", alt, None,
+        );
+        Inline::Raw(match rid {
+            Some(rid) => docxcore::image::with_click_link(&raw, rid).unwrap(),
+            None => raw,
+        })
+    }
+
+    fn picture_rels() -> Relationships {
+        docxcore::load::parse_rels_xml(
+            r#"<Relationships><Relationship Id="rId5" Type="h" Target="https://a.example.com/" TargetMode="External"/><Relationship Id="rId6" Type="i" Target="media/image1.png"/><Relationship Id="rId7" Type="h" Target="" TargetMode="External"/></Relationships>"#,
+        )
+    }
+
+    #[test]
+    fn a_picture_linked_to_a_url_is_a_link_told_by_its_alt_text_1999() {
+        let url = "https://a.example.com/";
+        let p = Paragraph {
+            content: vec![
+                run("see "),
+                linked_picture("Logo", Some("rId5")),
+                run(" x"),
+                linked_picture("", Some("rId5")),
+            ],
+            ..Paragraph::default()
+        };
+        let rels = picture_rels();
+        assert_eq!(link_at(&p, 3, &rels), None);
+        assert_eq!(link_at(&p, 4, &rels).as_deref(), Some(url));
+        assert_eq!(link_hover_at(&p, 4, &rels), Some((1, hover(url, "Logo"))));
+        assert_eq!(link_at(&p, 5, &rels), None);
+        // No Alt Text: an empty text.
+        assert_eq!(link_hover_at(&p, 7, &rels), Some((3, hover(url, ""))));
+        assert_eq!(
+            para_links(&p, &rels)
+                .into_iter()
+                .map(|(r, i, _)| (r, i))
+                .collect::<Vec<_>>(),
+            [(4..5, 1), (7..8, 3)]
+        );
+    }
+
+    #[test]
+    fn a_picture_whose_link_names_no_url_is_not_a_link_1999() {
+        let p = Paragraph {
+            content: vec![
+                // An internal relationship, one with no target, one not in
+                // the rels, and no link at all.
+                linked_picture("a", Some("rId6")),
+                linked_picture("b", Some("rId7")),
+                linked_picture("c", Some("rId9")),
+                linked_picture("d", None),
+            ],
+            ..Paragraph::default()
+        };
+        let rels = picture_rels();
+        assert!(para_links(&p, &rels).is_empty());
+        // A view with no package has no relationships.
+        let linked = Paragraph {
+            content: vec![linked_picture("Logo", Some("rId5"))],
+            ..Paragraph::default()
+        };
+        assert_eq!(link_at(&linked, 0, &document_rels(None)), None);
+        assert!(link_at(&linked, 0, &rels).is_some());
     }
 
     #[test]
@@ -3209,14 +3337,14 @@ mod tests {
             ],
             ..Paragraph::default()
         };
-        let first = link_hover_at(&p, 1).expect("the first link");
-        let second = link_hover_at(&p, 4).expect("the second link");
+        let first = link_hover_at(&p, 1, &Relationships::default()).expect("the first link");
+        let second = link_hover_at(&p, 4, &Relationships::default()).expect("the second link");
         assert_eq!(first, (0, hover("https://u.example/", "a b")));
         assert_eq!(second, (2, hover("https://u.example/", "c")));
         // Its own key: the hover changes from one to the other.
         assert_ne!(first.0, second.0);
         // The break between them is neither.
-        assert_eq!(link_hover_at(&p, 3), None);
+        assert_eq!(link_hover_at(&p, 3, &Relationships::default()), None);
     }
 
     #[test]
@@ -3226,8 +3354,14 @@ mod tests {
             ..Paragraph::default()
         };
         let url = "https://x.example/page#frag";
-        assert_eq!(link_at(&p, 1).as_deref(), Some(url));
-        assert_eq!(link_hover_at(&p, 1), Some((0, hover(url, "page"))));
+        assert_eq!(
+            link_at(&p, 1, &Relationships::default()).as_deref(),
+            Some(url)
+        );
+        assert_eq!(
+            link_hover_at(&p, 1, &Relationships::default()),
+            Some((0, hover(url, "page")))
+        );
     }
 
     #[test]

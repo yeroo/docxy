@@ -2609,12 +2609,14 @@ fn doc_state(editor: &Editor, flags: &ViewFlags) -> Json {
         ("color", str_or_null(r.color)),
         ("highlight", str_or_null(r.highlight)),
         ("vert_align", Json::Str(vert_align.into())),
-        // The target of the hyperlink holding the caret's character (#1950).
+        // The target of the hyperlink holding the caret's character (#1950);
+        // a document tab follows no picture links (#1999), so no rels.
         (
             "link",
             str_or_null(
-                docxcore::editor::resolve_para(&editor.doc.body, &editor.caret.path)
-                    .and_then(|p| crate::doc_view::link_at(p, editor.caret.offset)),
+                docxcore::editor::resolve_para(&editor.doc.body, &editor.caret.path).and_then(
+                    |p| crate::doc_view::link_at(p, editor.caret.offset, &Default::default()),
+                ),
             ),
         ),
     ]);

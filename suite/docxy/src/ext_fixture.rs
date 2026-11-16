@@ -655,7 +655,7 @@ mod tests {
         };
         let at = cell_link.plain_text().find("cell link").expect("the link");
         assert_eq!(
-            crate::doc_view::link_at(cell_link, at).as_deref(),
+            crate::doc_view::link_at(cell_link, at, &pkg.document_rels()).as_deref(),
             Some(CELL_URL)
         );
         let Block::Table(fixed) = &doc.body[7] else {
@@ -666,7 +666,7 @@ mod tests {
             panic!("a paragraph");
         };
         assert_eq!(
-            crate::doc_view::link_at(indented, 0).as_deref(),
+            crate::doc_view::link_at(indented, 0, &pkg.document_rels()).as_deref(),
             Some(INDENTED_URL)
         );
         assert_eq!(indented.props.indent, 1440);
@@ -674,7 +674,7 @@ mod tests {
             panic!("a paragraph");
         };
         assert_eq!(
-            crate::doc_view::link_at(link, "Follow the ".len()).as_deref(),
+            crate::doc_view::link_at(link, "Follow the ".len(), &pkg.document_rels()).as_deref(),
             Some(LINK_URL)
         );
         let Block::Paragraph(pic) = &doc.body[4] else {
