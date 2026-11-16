@@ -1,0 +1,73 @@
+# A picture's Alt Text as a tooltip in the embedded document view (#1998).
+# The script's `ext fixture` line has this instance draw Mail tabs with the
+# suite's test extension (see ext-doc-view.uit). `ext-doc-read` gives the
+# hit test at the pointer (`picture_alt`: the tooltip text of the painted
+# picture under it, or null) and the tooltips gpui built for the view
+# (`alt_tip_count`, `alt_tip`: the last one's text), counted from the
+# document's set; `{"until_alt_tips": N, "within_ms": M}` asks again until N
+# were built or M ms passed (gpui shows a tooltip 500 ms after the hover),
+# and says how long it waited (`waited_ms`). `ext-doc-picture:<n>` is the
+# middle of the n-th painted inline picture. Each test opens its own Mail
+# tab and closes it at the end.
+ext fixture
+
+test issue 1998 a picture without Alt Text shows no tooltip
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  # The fixture's logo.png has neither a descr nor a title.
+  call pointer-move {"to":"ext-doc-picture:0"}
+  call ext-doc-read {}
+  assert reply.picture_alt is null
+  call ext-doc-read {"until_alt_tips":1,"within_ms":1500}
+  assert reply.alt_tip_count is 0
+  assert reply.alt_tip is null
+  shot window
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+
+test issue 1998 an imported picture's alt shows as its tooltip on hover, light and dark, a long one cut
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call theme-set {"theme":"light"}
+  assert reply.applied is light
+  call ext-doc-load {"images": true, "html": "<p>Before</p><p><img src='cid:missing' alt='Floor plan' width='120' height='80'></p><p>After</p><p><img src='cid:long' alt='Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text' width='60' height='40'></p>"}
+  assert reply.alt_tip_count is 0
+  shot window
+  # Text: no picture, no tooltip text.
+  call pointer-move {"to":"ext-doc-word:Before"}
+  call ext-doc-read {}
+  assert reply.picture_alt is null
+  # The placeholder of a picture whose bytes did not load: its alt.
+  call pointer-move {"to":"ext-doc-picture:0"}
+  call ext-doc-read {}
+  assert reply.picture_alt is exactly Floor plan
+  call ext-doc-read {"until_alt_tips":1}
+  assert reply.alt_tip_count is 1
+  assert reply.alt_tip is exactly Floor plan
+  shot window
+  # Off the picture and back, in the dark theme.
+  call pointer-move {"to":"ext-doc-word:After"}
+  call theme-set {"theme":"dark"}
+  assert reply.applied is dark
+  shot window
+  call pointer-move {"to":"ext-doc-picture:0"}
+  call ext-doc-read {"until_alt_tips":2}
+  assert reply.alt_tip_count is 2
+  assert reply.alt_tip is exactly Floor plan
+  shot window
+  # A long alt: cut at 200 characters with an ellipsis, wrapped.
+  call pointer-move {"to":"ext-doc-word:After"}
+  call pointer-move {"to":"ext-doc-picture:1"}
+  call ext-doc-read {"until_alt_tips":3}
+  assert reply.alt_tip_count is 3
+  assert reply.picture_alt is exactly Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Lon…
+  assert reply.alt_tip is exactly Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Long alt text Lon…
+  shot window
+  call theme-set {"theme":"auto"}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
