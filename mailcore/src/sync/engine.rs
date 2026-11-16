@@ -403,10 +403,12 @@ pub enum SyncCommand {
     /// one entry per address (`None` when no such user, or Graph has no
     /// presence for it), or [`SyncEvent::PresencesFailed`] on a Graph
     /// failure (`forbidden` for a 403: the token lacks `Presence.Read.All`
-    /// or `User.ReadBasic.All`, so stop asking), never a `SyncEvent::Error`.
-    /// Auth and transport failures still go through `react_quietly`; a
-    /// throttle does not: presence and the directory are throttled apart
-    /// from mail, so their 429 holds off no mail pass. The ids an address
+    /// or `User.ReadBasic.All`, so stop asking; and for a 401 after a
+    /// refresh that went through: presence refuses a valid token for a user
+    /// without Teams), never a `SyncEvent::Error`. A refused refresh and
+    /// transport failures still go through `react_quietly`; a throttle does
+    /// not: presence and the directory are throttled apart from mail, so
+    /// their 429 holds off no mail pass, and their 401 signs no one out. The ids an address
     /// resolves to are kept for the session (`Engine::user_ids`), so a
     /// repeated poll costs one POST. Signed out: an `Error("not signed in")`
     /// then the addresses' `PresencesFailed`, with no request. A read: no
@@ -1088,9 +1090,10 @@ pub enum SyncEvent {
     /// [`SyncCommand::FetchPresences`] could not fetch presence (#2158):
     /// `forbidden` is true for a Graph 403 on any of its requests (the
     /// token lacks `Presence.Read.All`, or `User.ReadBasic.All` for finding
-    /// the users: a caller stops asking), `error` the failure's one line,
-    /// `"not signed in"` when signed out. `addresses` exactly as the
-    /// command sent them.
+    /// the users), or a 401 after a refresh that went through (presence
+    /// refusing a user without Teams): a caller stops asking. `error` is
+    /// the failure's one line, `"not signed in"` when signed out.
+    /// `addresses` exactly as the command sent them.
     PresencesFailed {
         addresses: Vec<String>,
         forbidden: bool,
@@ -8941,10 +8944,14 @@ impl Engine {
 
     /// Serves [`SyncCommand::FetchPresences`] (#2158): `PresencesFetched`,
     /// or `PresencesFailed` (`forbidden` for a 403), never a
-    /// `SyncEvent::Error` for a Graph failure. Then auth and transport go
-    /// through `react_quietly`; a throttle does not, as a 429 from presence
-    /// or the directory says nothing of mail, and `react` would hold off the
-    /// next mail pass until its `Retry-After`. Signed out it sends no
+    /// `SyncEvent::Error` for a Graph failure. Then a refused refresh and
+    /// transport go through `react_quietly`; a throttle does not, as a 429
+    /// from presence or the directory says nothing of mail, and `react`
+    /// would hold off the next mail pass until its `Retry-After`. Nor does
+    /// a 401 that is still a 401 after a refresh that went through: the
+    /// presence service answers a valid token with a 401 ("User not found")
+    /// for a user without Teams, and `react` would sign mail out. It is
+    /// `forbidden`, as a 403 is: stop asking. Signed out it sends no
     /// request and reports as `fetch_user_photo` does. The addresses go to
     /// the client as asked (it trims), and come back as sent. Returns
     /// `react_quietly`'s answer (false for a throttle), for `checkpoint`.
@@ -8964,7 +8971,15 @@ impl Engine {
                 false
             }
             Err(e) => {
-                let forbidden = matches!(e, GraphError::Http { status: 403, .. });
+                // A 401 that `with_auth` refreshed for, the fresh token
+                // taken: presence or the directory refused this user (no
+                // Teams, say), and the token is fine for mail. Only a
+                // refused refresh (`refused_refresh`, which `try_refresh`
+                // resets first, so it is this command's) is a dead token.
+                let refused_by_service =
+                    matches!(e, GraphError::Unauthorized) && self.refused_refresh.is_none();
+                let forbidden =
+                    matches!(e, GraphError::Http { status: 403, .. }) || refused_by_service;
                 self.emit(SyncEvent::PresencesFailed {
                     addresses,
                     forbidden,
@@ -8972,6 +8987,7 @@ impl Engine {
                 });
                 match e {
                     GraphError::Throttled { .. } => false,
+                    GraphError::Unauthorized if refused_by_service => false,
                     e => self.react_quietly(e),
                 }
             }
@@ -35943,11 +35959,20 @@ mod tests {
                     /// The engine over an in-memory store on `srv`, signed
                     /// in, driven step by step (no thread).
                     fn direct_engine(srv: &FakeServer) -> (Engine, Receiver<SyncEvent>) {
+                        direct_engine_at(srv, PathBuf::from("unused-token.json"))
+                    }
+
+                    /// [`direct_engine`] saving its token at `token_path`
+                    /// (a refresh writes it).
+                    fn direct_engine_at(
+                        srv: &FakeServer,
+                        token_path: PathBuf,
+                    ) -> (Engine, Receiver<SyncEvent>) {
                         let (_cmd_tx, cmd_rx) = mpsc::channel();
                         let (evt_tx, evt_rx) = mpsc::channel();
                         let config = EngineConfig {
                             store_path: PathBuf::from("unused.db"),
-                            token_path: PathBuf::from("unused-token.json"),
+                            token_path,
                             cfg: test_cfg(),
                             backfill_days: 3650,
                             graph_base: srv.base_url.clone(),
@@ -36167,6 +36192,120 @@ mod tests {
                                 !events.iter().any(|e| matches!(e, SyncEvent::State(_))),
                                 "no state change: {events:?}"
                             );
+                        }
+                    }
+
+                    /// `FetchPresences` meeting a 401 on the POST
+                    /// (`on_post`) or on the resolve, with the token
+                    /// endpoint answering `token`: the engine after it,
+                    /// every event, and the requests.
+                    fn presences_after_401(
+                        on_post: bool,
+                        token: Route,
+                        tag: &str,
+                    ) -> (Engine, Vec<SyncEvent>, FakeServer, PathBuf) {
+                        // What the presence service answers a valid token
+                        // for a user without Teams.
+                        let not_found =
+                            r#"{"error":{"code":"Unauthorized","message":"User not found"}}"#;
+                        let mut routes = vec![token];
+                        if on_post {
+                            routes.push(found_u1().0);
+                            routes.push(presence_route(401, not_found, &[]).0);
+                        } else {
+                            routes.push(route(ADA_FILTER, 401, not_found));
+                        }
+                        let srv = FakeServer::start(routes);
+                        let dir = unique_dir(tag);
+                        let (mut engine, evt_rx) = direct_engine_at(&srv, dir.join("token.bin"));
+                        let stop_work = engine.fetch_presences(vec![ADA.into()]);
+                        let events: Vec<SyncEvent> = evt_rx.try_iter().collect();
+                        // Stops work exactly when it signs out.
+                        assert_eq!(stop_work, engine.token.is_none(), "{events:?}");
+                        (engine, events, srv, dir)
+                    }
+
+                    /// A 401 still a 401 after a refresh that went through
+                    /// is presence (or the directory) refusing this user,
+                    /// not a dead token: `forbidden`, and the session, its
+                    /// fresh token and its mail pass schedule are kept.
+                    #[test]
+                    fn fetch_presences_401_after_a_refresh_keeps_the_session() {
+                        let refreshed =
+                            r#"{"access_token":"AT2","refresh_token":"RT2","expires_in":3600}"#;
+                        for on_post in [true, false] {
+                            let (engine, events, srv, dir) = presences_after_401(
+                                on_post,
+                                token_route(refreshed),
+                                &format!("presences-401-{on_post}"),
+                            );
+                            no_error(&events);
+                            assert!(
+                                !events
+                                    .iter()
+                                    .any(|e| matches!(e, SyncEvent::SignInRequired { .. })),
+                                "{events:?}"
+                            );
+                            match events.last() {
+                                Some(SyncEvent::PresencesFailed {
+                                    addresses,
+                                    forbidden: true,
+                                    error,
+                                }) => {
+                                    assert_eq!(addresses, &[ADA]);
+                                    assert!(!error.contains('\n'), "{error:?}");
+                                }
+                                other => {
+                                    panic!("expected forbidden PresencesFailed, got {other:?}")
+                                }
+                            }
+                            let token = engine.token.as_ref().expect("still signed in");
+                            assert_eq!(token.access_token, "AT2");
+                            assert_eq!(token_requests(&srv), 1);
+                            assert_eq!(engine.next_retry, None, "no mail back-off");
+                            // Asked once with each token; the retry finds
+                            // Ada's id kept.
+                            let want: &[&str] = if on_post {
+                                &[ADA_FILTER, PRESENCE, PRESENCE]
+                            } else {
+                                &[ADA_FILTER, ADA_FILTER]
+                            };
+                            assert_eq!(user_requests(&srv), want);
+                            let _ = std::fs::remove_dir_all(&dir);
+                        }
+                    }
+
+                    /// A refused refresh is a dead token, whoever answered
+                    /// the 401: the sign-in it asks for, as for any command.
+                    #[test]
+                    fn fetch_presences_401_with_a_refused_refresh_signs_in() {
+                        for on_post in [true, false] {
+                            let (engine, events, srv, dir) = presences_after_401(
+                                on_post,
+                                token_failure(400, r#"{"error":"invalid_grant"}"#),
+                                &format!("presences-401-refused-{on_post}"),
+                            );
+                            assert!(engine.token.is_none());
+                            assert_eq!(token_requests(&srv), 1);
+                            assert!(
+                                events.iter().any(|e| matches!(
+                                    e,
+                                    SyncEvent::PresencesFailed {
+                                        forbidden: false,
+                                        ..
+                                    }
+                                )),
+                                "{events:?}"
+                            );
+                            assert_eq!(
+                                signin_reasons(&events),
+                                vec![SignInReason::Expired {
+                                    code: "invalid_grant".into(),
+                                    aadsts: None,
+                                }],
+                                "{events:?}"
+                            );
+                            let _ = std::fs::remove_dir_all(&dir);
                         }
                     }
 

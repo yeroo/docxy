@@ -380,14 +380,22 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   `Presence.Read.All` (admin consent in some tenants) for the POST.
   `AuthConfig::default()` asks for neither, so a default sign-in gets its
   403 at the resolve. Either is `forbidden`.
+- A 401 still a 401 after a refresh that went through is `forbidden` too, and
+  nothing is `react`ed. The presence service is reported to answer a valid
+  token with `401 {"error":{"code":"Unauthorized","message":"User not found"}}`
+  for a user without Teams, and `react` would sign mail out
+  (`signin_after_401`). A refused refresh (`refused_refresh`, which
+  `try_refresh` resets first, so it is this command's) is a dead token: not
+  `forbidden`, through `react_quietly` to the sign-in, as for any command.
 - `SyncCommand::FetchPresences { addresses }` → `PresencesFetched
   { presences }`, or `PresencesFailed { addresses, forbidden, error }`
   (`forbidden` for a 403 on any request: stop asking). Never a
-  `SyncEvent::Error` for a Graph failure. Auth and transport then go
-  through `react_quietly`; a `Throttled` does not. Presence and the
+  `SyncEvent::Error` for a Graph failure. A refused refresh and transport
+  then go through `react_quietly`; a `Throttled` does not, nor does a 401
+  after a refresh that went through (above). Presence and the
   directory are throttled apart from mail, and `react` would hold off
   the next mail pass until the `Retry-After` (`schedule_retry`).
-  `FetchUserPhoto`'s 429 still goes through `react_quietly`. Signed out:
+  `FetchUserPhoto`'s 429 and 401 still go through `react_quietly`. Signed out:
   `Error("not signed in")`, then `PresencesFailed { error: "not signed in" }`,
   no request. Addresses echoed as sent.
 - A read: `served_at_checkpoint`, `persists_at_shutdown` false, no outbox
@@ -398,7 +406,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   Give each unknown address its empty filter and its UPN 404. A plain
   `Refresh` runs a pass whatever `next_retry` holds, so the throttle test
   (`fetch_presences_throttled_does_not_delay_mail`) drives an engine
-  directly and checks that `next_retry` is left as it was.
+  directly and checks that `next_retry` is left as it was; so do the 401
+  tests (`direct_engine_at`, its token saved in a test directory, as a
+  refresh writes it).
 
 ## Granted scopes and a refused sign-in's error_description (#1875)
 
