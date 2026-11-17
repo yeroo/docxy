@@ -1630,7 +1630,8 @@ fn multi_area_ok(act: SheetAct) -> bool {
 /// act), the Office Clipboard pane and Edit Custom Lists are the app's own
 /// state rather than the cells', and `Todo` does nothing at all. Group, Ungroup,
 /// Show/Hide Detail, Auto Outline and Subtotal read the selection, and
-/// Consolidate writes at the selected cell.
+/// Consolidate writes at the selected cell. Protect Sheet still commits an
+/// open entry ([`act_commits_editor`], #1054).
 fn act_targets_cells(act: SheetAct) -> bool {
     // Page Layout (#1019): Print Area and Breaks read the selection; page
     // setup, scaling and the print options are the sheet's.
@@ -1670,8 +1671,13 @@ fn act_takes_entry_text(act: SheetAct, v: &SheetView) -> bool {
 /// formatting and dialog/bar openers that neither read nor rewrite cell
 /// values, plus the pick list, which commits its own entry
 /// ([`SheetView::pick_value`]).
+///
+/// Protect Sheet targets no cells ([`act_targets_cells`]) but commits too
+/// (#1054): an entry left open across it could never be committed, since
+/// the commit refuses a protected sheet, so it lands first and the
+/// protection is the step after it.
 fn act_commits_editor(act: SheetAct) -> bool {
-    act_targets_cells(act)
+    (act_targets_cells(act) || act == SheetAct::ProtectSheet)
         && !matches!(
             act,
             SheetAct::Bold
@@ -3467,7 +3473,8 @@ impl SheetView {
     /// ([`gridcore::engine::PART_OF_ARRAY`]): the editor stays open with its
     /// text and [`SheetView::entry_error`] says why. An entry that breaks its
     /// cell's data-validation rule is refused the same way, and held in
-    /// [`SheetView::dv_pending`] for the alert the caller shows.
+    /// [`SheetView::dv_pending`] for the alert the caller shows. An entry
+    /// into a protected sheet is refused with Excel's message (#1054).
     fn commit_edit(&mut self) -> bool {
         self.entry_error = None;
         self.dv_pending = None;
@@ -3484,6 +3491,17 @@ impl SheetView {
     fn close_editor_for_act(&mut self) -> Option<bool> {
         self.editing.as_ref()?;
         Some(self.commit_edit())
+    }
+
+    /// Is sheet `s` protected? A commit into it is refused (#1054): it
+    /// sets [`SheetView::entry_error`] to Excel's message, writes nothing,
+    /// records no undo step and keeps its editor.
+    fn entry_sheet_protected(&self, s: usize) -> bool {
+        self.pkg
+            .workbook
+            .sheets
+            .get(s)
+            .is_some_and(|sh| sh.is_protected())
     }
 
     /// [`SheetView::commit_edit`] after the proposal was taken (`took`) and
@@ -3503,6 +3521,13 @@ impl SheetView {
         // A seeded editor left unchanged must not reparse text such as "007".
         if untouched {
             self.end_cell_edit();
+            return false;
+        }
+        // The sheet the buffer would be written to (#1054). No editor opens
+        // on a protected sheet, and Protect Sheet commits first, so this is
+        // the backstop: whatever leaves an editor open, nothing is written.
+        if self.entry_sheet_protected(origin.0) {
+            self.entry_error = Some(crate::sheet_goto::SHEET_PROTECTED.into());
             return false;
         }
         if let Err(e) = gridcore::entry::check_len(buf) {
@@ -4342,6 +4367,10 @@ impl SheetView {
             .any(|a| (a.0..=a.2).contains(&r) && (a.1..=a.3).contains(&c));
         if (!self.has_range() && areas.len() == 1) || s != self.active || !inside {
             return self.commit_edit_taken(took);
+        }
+        if self.entry_sheet_protected(s) {
+            self.entry_error = Some(crate::sheet_goto::SHEET_PROTECTED.into());
+            return false;
         }
         if let Err(e) = gridcore::entry::check_len(&buf) {
             self.entry_error = Some(e.to_string());

@@ -373,3 +373,52 @@ test a refused entry stops a ribbon act
   call menu-click {"label":"Clear Contents"}
   assert editing is true
   assert cells unchanged
+
+# #1054: Protect Sheet commits an open entry first, as the #510 cell acts do:
+# the entry lands as its own Typing step, then the sheet is protected, so no
+# editor is left open on a protected sheet. Fails if Protect Sheet leaves the
+# editor open (the commit would then be refused on the protected sheet).
+test protect sheet with an open editor commits first
+  open copy:../fixtures/basic.xlsx
+  click A7
+  type 99
+  assert editing is true
+  call ribbon-click {"tab":"Review","command":"Protect Sheet"}
+  assert editing is false
+  assert dirty is true
+  assert cell A7 is 99
+  call menu-open {"target":{"qat":"qat-undo"}}
+  assert reply.items.0.label is Protect Sheet
+  assert reply.items.1.label is Typing '99' in A7
+  key escape
+  click A8
+  type 1
+  assert editing is false
+
+# #1054: a refused entry stops Protect Sheet, as it stops a cell act (#510):
+# the editor stays open, the status says why, and the sheet is not protected.
+test a refused entry stops protect sheet
+  open copy:../fixtures/basic.xlsx
+  click A7
+  type =SUM(A1
+  call ribbon-click {"tab":"Review","command":"Protect Sheet"}
+  assert editing is true
+  assert status is formula error: expected , or ) in arguments
+  key escape
+  assert editing is false
+  type 5
+  assert editing is true
+
+# #1054: an untouched F2 editor closes without a Typing step before Protect
+# Sheet: the step under Protect Sheet is the Bold made before it.
+test protect sheet over an untouched editor records no typing step
+  open copy:../fixtures/basic.xlsx
+  click A1
+  key ctrl+b
+  key f2
+  assert editing is true
+  call ribbon-click {"tab":"Review","command":"Protect Sheet"}
+  assert editing is false
+  call menu-open {"target":{"qat":"qat-undo"}}
+  assert reply.items.0.label is Protect Sheet
+  assert reply.items.1.label is Bold

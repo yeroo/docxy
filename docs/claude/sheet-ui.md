@@ -78,3 +78,17 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   compatibility questions and before the binding moves. A folder may hold
   the characters. In-place Save never asks, so a workbook opened from such a
   name saves over itself. Documents and Projects are not checked.
+
+## The cell editor's commit and sheet protection (#1054)
+
+- No editor opens on a protected sheet (`sheet_begin_edit`, the typing gate,
+  the pick lists), and the commit is the backstop: `commit_edit_taken` and
+  Ctrl+Enter's `commit_edit_to_selection` refuse an entry whose sheet (the
+  editor's origin, `edit_origin.0`) is protected with `SHEET_PROTECTED` in
+  `entry_error`, the editor kept with its text, nothing written and no undo
+  step. An untouched seeded editor still just closes.
+- Review › Protect Sheet is in `act_commits_editor` though not in
+  `act_targets_cells` (it takes no selection back from a chart): an open
+  entry commits first, as for #510's cell acts, so its Typing step lands
+  under the Protect Sheet step; a refused entry stops it, the sheet left
+  unprotected. Undo, Redo and Repeat never act on the sheet while editing.
