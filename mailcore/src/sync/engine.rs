@@ -10884,7 +10884,9 @@ fn sign_out_error(e: &std::io::Error, file_left: bool) -> String {
 mod tests {
     use super::*;
     use crate::auth::{AuthConfig, TokenSet};
-    use crate::graph::model::{ContactFields, FolderContact, MeetingMessageType};
+    use crate::graph::model::{
+        ContactFields, FolderContact, MeetingMessageType, MeetingRequestType,
+    };
     use crate::store::Store;
     use crate::testserver::{FakeServer, Route};
     use crate::tokencache;
@@ -21413,6 +21415,7 @@ mod tests {
                     message_type: Some(MeetingMessageType::Cancelled),
                     event_id: Some("E1".into()),
                     is_organizer: false,
+                    ..Default::default()
                 },
             })
         );
@@ -21446,6 +21449,74 @@ mod tests {
                 "/me/messages/M1?$expand=microsoft.graph.eventMessage/event($select=id,isOrganizer)",
                 "/me/messages/M2?$expand=microsoft.graph.eventMessage/event($select=id,isOrganizer)",
             ]
+        );
+        assert!(non_gets(&srv).is_empty(), "{:?}", srv.requests());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_meeting_message_carries_update_facts() {
+        // #2185: a `fullUpdate`'s own and previous times and locations,
+        // read from the same GET, reach the host as Graph sent them.
+        let (srv, handle, _store_path, dir) = spawn_meeting_engine(
+            "fetch-meeting-update",
+            vec![message_route(
+                "M1",
+                r##"{"id":"M1","@odata.type":"#microsoft.graph.eventMessageRequest",
+                    "meetingMessageType":"meetingRequest","meetingRequestType":"fullUpdate",
+                    "isAllDay":true,
+                    "startDateTime":{"dateTime":"2026-07-21T00:00:00.0000000","timeZone":"UTC"},
+                    "endDateTime":{"dateTime":"2026-07-22T00:00:00.0000000","timeZone":"UTC"},
+                    "previousStartDateTime":{"dateTime":"2026-07-20T00:00:00.0000000","timeZone":"UTC"},
+                    "previousEndDateTime":{"dateTime":"2026-07-21T00:00:00.0000000","timeZone":"UTC"},
+                    "location":{"displayName":"Offsite"},
+                    "previousLocation":{"displayName":"Room 1"},
+                    "event":{"id":"E1","isOrganizer":false}}"##,
+            )],
+            vec![meeting("E1", false)],
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::FetchMeetingMessage {
+                message_id: "M1".into(),
+            })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::MeetingMessageFetched { .. })
+        });
+        assert_eq!(
+            seen.last(),
+            Some(&SyncEvent::MeetingMessageFetched {
+                message_id: "M1".into(),
+                meeting: MeetingMessage {
+                    message_type: Some(MeetingMessageType::Request),
+                    event_id: Some("E1".into()),
+                    is_organizer: false,
+                    request_type: Some(MeetingRequestType::FullUpdate),
+                    start_utc: Some("2026-07-21T00:00:00Z".into()),
+                    end_utc: Some("2026-07-22T00:00:00Z".into()),
+                    previous_start_utc: Some("2026-07-20T00:00:00Z".into()),
+                    previous_end_utc: Some("2026-07-21T00:00:00Z".into()),
+                    location: Some("Offsite".into()),
+                    previous_location: Some("Room 1".into()),
+                    is_all_day: Some(true),
+                },
+            })
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let gets: Vec<_> = srv
+            .requests()
+            .into_iter()
+            .filter(|r| r.path.starts_with("/me/messages/M"))
+            .collect();
+        assert_eq!(gets.len(), 1);
+        assert!(
+            gets[0]
+                .headers
+                .iter()
+                .any(|(n, v)| n.eq_ignore_ascii_case("Prefer") && v == "outlook.timezone=\"UTC\""),
+            "{:?}",
+            gets[0].headers
         );
         assert!(non_gets(&srv).is_empty(), "{:?}", srv.requests());
         let _ = std::fs::remove_dir_all(&dir);
@@ -21918,6 +21989,7 @@ mod tests {
             message_type: Some(MeetingMessageType::Cancelled),
             event_id: None,
             is_organizer: false,
+            ..Default::default()
         }
     }
 
@@ -31488,6 +31560,7 @@ mod tests {
                 message_type: Some(MeetingMessageType::Cancelled),
                 event_id: Some("E1".into()),
                 is_organizer: false,
+                ..Default::default()
             };
             // The row gets the type, and its folder's list is told first.
             assert_eq!(

@@ -1239,9 +1239,78 @@ impl MeetingMessageType {
     }
 }
 
+/// Graph `eventMessageRequest.meetingRequestType` (#2185): whether a
+/// meeting request is the first one or an update, and what kind. Graph's
+/// `none`, an absent or unknown value and `""` are no type: see
+/// [`MeetingRequestType::from_graph`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeetingRequestType {
+    /// `newMeetingRequest`: the first request for the meeting.
+    NewMeetingRequest,
+    /// `fullUpdate`: the organizer changed the meeting (its time or
+    /// location, say); a new response is usually asked for.
+    FullUpdate,
+    /// `informationalUpdate`: a change that needs no new response.
+    InformationalUpdate,
+    /// `silentUpdate`: an update the attendee is not told about.
+    SilentUpdate,
+    /// `outdated`: a later update has superseded this request.
+    Outdated,
+    /// `principalWantsCopy`: a copy of a delegate's request for the
+    /// principal.
+    PrincipalWantsCopy,
+}
+
+impl MeetingRequestType {
+    /// Maps Graph's value, case-sensitively as Graph sends it. `none`, an
+    /// unknown value and `""` are `None`: lenient, never an error.
+    pub fn from_graph(s: &str) -> Option<MeetingRequestType> {
+        match s {
+            "newMeetingRequest" => Some(MeetingRequestType::NewMeetingRequest),
+            "fullUpdate" => Some(MeetingRequestType::FullUpdate),
+            "informationalUpdate" => Some(MeetingRequestType::InformationalUpdate),
+            "silentUpdate" => Some(MeetingRequestType::SilentUpdate),
+            "outdated" => Some(MeetingRequestType::Outdated),
+            "principalWantsCopy" => Some(MeetingRequestType::PrincipalWantsCopy),
+            _ => None,
+        }
+    }
+
+    /// Graph's value for the type, as [`MeetingRequestType::from_graph`]
+    /// reads it back.
+    pub fn as_graph(self) -> &'static str {
+        match self {
+            MeetingRequestType::NewMeetingRequest => "newMeetingRequest",
+            MeetingRequestType::FullUpdate => "fullUpdate",
+            MeetingRequestType::InformationalUpdate => "informationalUpdate",
+            MeetingRequestType::SilentUpdate => "silentUpdate",
+            MeetingRequestType::Outdated => "outdated",
+            MeetingRequestType::PrincipalWantsCopy => "principalWantsCopy",
+        }
+    }
+}
+
 /// A message's meeting facts (#2024), from
 /// `GraphClient::meeting_message`: its `meetingMessageType` and the
 /// calendar event it refers to (the expanded `eventMessage/event`).
+///
+/// A meeting request's update facts (#2185: `request_type`, the times, the
+/// locations and `is_all_day`) are read from that same GET, and only from
+/// it: `SyncCommand::FetchMeetingMessage` answers them in
+/// `SyncEvent::MeetingMessageFetched`. Sync never reads them and the store
+/// keeps none of them. Each is `None` when Graph does not send it or sends
+/// it in a shape that cannot be read, never an error.
+///
+/// The times are the store's `YYYY-MM-DDTHH:MM:SSZ` shape
+/// (`EventRow::start_utc`'s). When `is_all_day` is `Some(true)`, a bound at
+/// midnight wall clock is that date's UTC midnight in any zone, as a stored
+/// all-day event's is (the end is the midnight after the last day). An
+/// all-day message's current bound not at midnight is `None` (no date can
+/// be told from it without a time zone database); a previous bound not at
+/// midnight is read as a timed one, since Graph does not say whether the
+/// previous slot was all-day. A timed bound is read only in UTC (`UTC`,
+/// `Etc/UTC`, `Z`, `tzone://Microsoft/Utc`, or no zone), which the client
+/// asks for with `Prefer: outlook.timezone="UTC"`; another zone is `None`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct MeetingMessage {
     /// `None` for a message that is not a meeting message (no
@@ -1254,6 +1323,36 @@ pub struct MeetingMessage {
     /// event. Remove from Calendar refuses the organizer's event, whose
     /// delete would send cancellations.
     pub is_organizer: bool,
+    /// `meetingRequestType` (#2185): a request's kind, update or not.
+    /// `None` for a cancellation, a response or a plain message. Only from
+    /// `FetchMeetingMessage`, never from sync; not stored.
+    pub request_type: Option<MeetingRequestType>,
+    /// `startDateTime` (#2185): the meeting's start as this message gives
+    /// it, by the rule on [`MeetingMessage`]. Only from
+    /// `FetchMeetingMessage`, never from sync; not stored.
+    pub start_utc: Option<String>,
+    /// `endDateTime` (#2185), as `start_utc`. Only from
+    /// `FetchMeetingMessage`, never from sync; not stored.
+    pub end_utc: Option<String>,
+    /// `previousStartDateTime` (#2185): an update's start before it
+    /// changed; `None` when the start did not change. Only from
+    /// `FetchMeetingMessage`, never from sync; not stored.
+    pub previous_start_utc: Option<String>,
+    /// `previousEndDateTime` (#2185), as `previous_start_utc`. Only from
+    /// `FetchMeetingMessage`, never from sync; not stored.
+    pub previous_end_utc: Option<String>,
+    /// `location.displayName` (#2185), trimmed: `None` when absent or
+    /// `null`, `Some("")` for an empty name. Only from
+    /// `FetchMeetingMessage`, never from sync; not stored.
+    pub location: Option<String>,
+    /// `previousLocation.displayName` (#2185), as `location`: an update's
+    /// location before it changed. Only from `FetchMeetingMessage`, never
+    /// from sync; not stored.
+    pub previous_location: Option<String>,
+    /// `isAllDay` (#2185): an all-day meeting's times are dates (UTC
+    /// midnights), compared as dates. Only from `FetchMeetingMessage`,
+    /// never from sync; not stored.
+    pub is_all_day: Option<bool>,
 }
 
 impl MeetingMessage {
@@ -1261,6 +1360,8 @@ impl MeetingMessage {
     /// fails: a plain message is all `None` / false.
     pub fn from_json(v: &Value) -> MeetingMessage {
         let event = v.get("event");
+        let is_all_day = v.get("isAllDay").and_then(Value::as_bool);
+        let all_day = is_all_day == Some(true);
         MeetingMessage {
             message_type: v
                 .get("meetingMessageType")
@@ -1275,7 +1376,150 @@ impl MeetingMessage {
                 .and_then(|e| e.get("isOrganizer"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            request_type: v
+                .get("meetingRequestType")
+                .and_then(Value::as_str)
+                .and_then(MeetingRequestType::from_graph),
+            start_utc: meeting_time(v.get("startDateTime"), all_day, MeetingBound::Current),
+            end_utc: meeting_time(v.get("endDateTime"), all_day, MeetingBound::Current),
+            previous_start_utc: meeting_time(
+                v.get("previousStartDateTime"),
+                all_day,
+                MeetingBound::Previous,
+            ),
+            previous_end_utc: meeting_time(
+                v.get("previousEndDateTime"),
+                all_day,
+                MeetingBound::Previous,
+            ),
+            location: location_name(v.get("location")),
+            previous_location: location_name(v.get("previousLocation")),
+            is_all_day,
         }
+    }
+}
+
+/// Which of a meeting message's times [`meeting_time`] reads (#2185).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MeetingBound {
+    /// `startDateTime` / `endDateTime`: `isAllDay` describes it.
+    Current,
+    /// `previousStartDateTime` / `previousEndDateTime`: perhaps a timed
+    /// slot the update made all-day (Graph has no `previousIsAllDay`).
+    Previous,
+}
+
+/// A meeting message's `dateTimeTimeZone` value (#2185) by the rule on
+/// [`MeetingMessage`]: `YYYY-MM-DDTHH:MM:SSZ`, or `None` when absent, not
+/// an object, unreadable, or not something the rule can turn into UTC.
+fn meeting_time(v: Option<&Value>, all_day: bool, bound: MeetingBound) -> Option<String> {
+    let v = v?;
+    let dt = v.get("dateTime")?.as_str()?;
+    let wall = WallClock::parse(dt)?;
+    let date = format!("{:04}-{:02}-{:02}", wall.year, wall.month, wall.day);
+    if all_day && wall.is_midnight() {
+        // An all-day bound is a date, whatever its zone.
+        return Some(format!("{date}T00:00:00Z"));
+    }
+    if all_day && bound == MeetingBound::Current {
+        return None;
+    }
+    let zone = match v.get("timeZone") {
+        None | Some(Value::Null) => "",
+        Some(z) => z.as_str()?,
+    };
+    if !(zone.is_empty() || is_utc_zone(zone) || zone.eq_ignore_ascii_case("tzone://Microsoft/Utc"))
+    {
+        return None;
+    }
+    Some(format!(
+        "{date}T{:02}:{:02}:{:02}Z",
+        wall.hour, wall.minute, wall.second
+    ))
+}
+
+/// A `location` / `previousLocation` object's `displayName`, trimmed
+/// (#2185): `None` when the object or the name is absent, `null` or not
+/// the right type; `Some("")` for an empty name.
+fn location_name(v: Option<&Value>) -> Option<String> {
+    let name = v?.get("displayName")?.as_str()?;
+    Some(name.trim().to_string())
+}
+
+/// A strictly read `YYYY-MM-DDTHH:MM:SS[.fraction][Z]` wall clock (#2185).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WallClock {
+    year: u32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    /// The fraction's digits were all zeros (or there was none).
+    whole_second: bool,
+}
+
+impl WallClock {
+    /// `None` for anything else: an offset, a missing or empty part, a
+    /// non-digit, a month, day or time out of range (the day by the
+    /// month's length), or Graph's "no date" (`0001-01-01…`).
+    fn parse(s: &str) -> Option<WallClock> {
+        if s.starts_with("0001-01-01") {
+            return None;
+        }
+        let s = s.strip_suffix('Z').unwrap_or(s);
+        let (main, fraction) = match s.split_once('.') {
+            Some((m, f)) => (m, Some(f)),
+            None => (s, None),
+        };
+        if let Some(f) = fraction {
+            if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+        }
+        let b = main.as_bytes();
+        if b.len() != 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
+            return None;
+        }
+        if b[13] != b':' || b[16] != b':' {
+            return None;
+        }
+        let num = |from: usize, to: usize| -> Option<u32> {
+            let part = &main[from..to];
+            if part.bytes().all(|c| c.is_ascii_digit()) {
+                part.parse().ok()
+            } else {
+                None
+            }
+        };
+        let wall = WallClock {
+            year: num(0, 4)?,
+            month: num(5, 7)?,
+            day: num(8, 10)?,
+            hour: num(11, 13)?,
+            minute: num(14, 16)?,
+            second: num(17, 19)?,
+            whole_second: fraction.is_none_or(|f| f.bytes().all(|c| c == b'0')),
+        };
+        let y = wall.year;
+        let leap = y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
+        let days = match wall.month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => return None,
+        };
+        let in_range = (1..=days).contains(&wall.day)
+            && wall.hour <= 23
+            && wall.minute <= 59
+            && wall.second <= 59;
+        in_range.then_some(wall)
+    }
+
+    /// `00:00:00` with no fraction other than zeros.
+    fn is_midnight(self) -> bool {
+        self.hour == 0 && self.minute == 0 && self.second == 0 && self.whole_second
     }
 }
 
@@ -3682,6 +3926,7 @@ mod tests {
                 message_type: Some(MeetingMessageType::Cancelled),
                 event_id: Some("E9".into()),
                 is_organizer: false,
+                ..Default::default()
             }
         );
         let v = parse(
@@ -3706,6 +3951,343 @@ mod tests {
             let v = parse(body).unwrap();
             assert_eq!(
                 MeetingMessage::from_json(&v),
+                MeetingMessage::default(),
+                "{body}"
+            );
+        }
+    }
+
+    // --- A meeting request's update facts (#2185) -------------------------
+
+    #[test]
+    fn meeting_request_type_maps_graph_values_and_is_lenient() {
+        use MeetingRequestType as T;
+        let cases = [
+            ("newMeetingRequest", Some(T::NewMeetingRequest)),
+            ("fullUpdate", Some(T::FullUpdate)),
+            ("informationalUpdate", Some(T::InformationalUpdate)),
+            ("silentUpdate", Some(T::SilentUpdate)),
+            ("outdated", Some(T::Outdated)),
+            ("principalWantsCopy", Some(T::PrincipalWantsCopy)),
+            ("none", None),
+            ("", None),
+            ("somethingNew", None),
+            ("FullUpdate", None),
+        ];
+        for (wire, want) in cases {
+            assert_eq!(MeetingRequestType::from_graph(wire), want, "{wire:?}");
+        }
+    }
+
+    #[test]
+    fn meeting_request_type_round_trips_its_graph_name() {
+        use MeetingRequestType as T;
+        for t in [
+            T::NewMeetingRequest,
+            T::FullUpdate,
+            T::InformationalUpdate,
+            T::SilentUpdate,
+            T::Outdated,
+            T::PrincipalWantsCopy,
+        ] {
+            assert_eq!(MeetingRequestType::from_graph(t.as_graph()), Some(t));
+        }
+    }
+
+    /// A Graph `dateTimeTimeZone` in its wire shape (seven fraction digits).
+    fn dtz(date_time: &str, zone: &str) -> String {
+        format!(r#"{{"dateTime":"{date_time}.0000000","timeZone":"{zone}"}}"#)
+    }
+
+    /// `MeetingMessage::from_json` of an `eventMessageRequest` with these
+    /// extra properties (a JSON object's members, without braces).
+    fn request(props: &str) -> MeetingMessage {
+        let body = format!(
+            r##"{{"id":"M1","@odata.type":"#microsoft.graph.eventMessageRequest",
+                "meetingMessageType":"meetingRequest","event":{{"id":"E1"}},{props}}}"##
+        );
+        MeetingMessage::from_json(&parse(&body).unwrap())
+    }
+
+    fn some(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    #[test]
+    fn meeting_message_reads_a_full_update_with_a_changed_time() {
+        let m = request(&format!(
+            r#""meetingRequestType":"fullUpdate","isAllDay":false,
+               "startDateTime":{},"endDateTime":{},
+               "previousStartDateTime":{},"previousEndDateTime":{},
+               "location":{{"displayName":"Room 1"}},"previousLocation":null"#,
+            dtz("2026-07-21T10:00:00", "UTC"),
+            dtz("2026-07-21T11:00:00", "UTC"),
+            dtz("2026-07-20T09:00:00", "UTC"),
+            dtz("2026-07-20T09:30:00", "UTC"),
+        ));
+        assert_eq!(
+            m,
+            MeetingMessage {
+                message_type: Some(MeetingMessageType::Request),
+                event_id: some("E1"),
+                is_organizer: false,
+                request_type: Some(MeetingRequestType::FullUpdate),
+                start_utc: some("2026-07-21T10:00:00Z"),
+                end_utc: some("2026-07-21T11:00:00Z"),
+                previous_start_utc: some("2026-07-20T09:00:00Z"),
+                previous_end_utc: some("2026-07-20T09:30:00Z"),
+                location: some("Room 1"),
+                previous_location: None,
+                is_all_day: Some(false),
+            }
+        );
+    }
+
+    #[test]
+    fn meeting_message_reads_a_full_update_with_a_changed_location() {
+        let m = request(&format!(
+            r#""meetingRequestType":"fullUpdate","isAllDay":false,
+               "startDateTime":{},"endDateTime":{},
+               "location":{{"displayName":"  Room 2 ","locationType":"default"}},
+               "previousLocation":{{"displayName":"Room 1"}}"#,
+            dtz("2026-07-21T10:00:00", "UTC"),
+            dtz("2026-07-21T11:00:00", "UTC"),
+        ));
+        assert_eq!(m.request_type, Some(MeetingRequestType::FullUpdate));
+        assert_eq!(m.location, some("Room 2"));
+        assert_eq!(m.previous_location, some("Room 1"));
+        assert_eq!(m.start_utc, some("2026-07-21T10:00:00Z"));
+        assert_eq!(m.end_utc, some("2026-07-21T11:00:00Z"));
+        // The time did not change: Graph sends no previous one.
+        assert_eq!(m.previous_start_utc, None);
+        assert_eq!(m.previous_end_utc, None);
+    }
+
+    #[test]
+    fn meeting_message_reads_a_full_update_with_a_changed_time_and_location() {
+        let m = request(&format!(
+            r#""meetingRequestType":"fullUpdate",
+               "startDateTime":{},"endDateTime":{},
+               "previousStartDateTime":{},"previousEndDateTime":{},
+               "location":{{"displayName":"Room 2"}},
+               "previousLocation":{{"displayName":"Room 1"}}"#,
+            dtz("2026-07-22T14:00:00", "UTC"),
+            dtz("2026-07-22T15:00:00", "UTC"),
+            dtz("2026-07-21T14:00:00", "UTC"),
+            dtz("2026-07-21T15:00:00", "UTC"),
+        ));
+        assert_eq!(m.request_type, Some(MeetingRequestType::FullUpdate));
+        assert_eq!(m.start_utc, some("2026-07-22T14:00:00Z"));
+        assert_eq!(m.end_utc, some("2026-07-22T15:00:00Z"));
+        assert_eq!(m.previous_start_utc, some("2026-07-21T14:00:00Z"));
+        assert_eq!(m.previous_end_utc, some("2026-07-21T15:00:00Z"));
+        assert_eq!(m.location, some("Room 2"));
+        assert_eq!(m.previous_location, some("Room 1"));
+        // No `isAllDay`: unknown, and the times are read as timed.
+        assert_eq!(m.is_all_day, None);
+    }
+
+    #[test]
+    fn meeting_message_reads_an_informational_update_and_a_new_request() {
+        let m = request(&format!(
+            r#""meetingRequestType":"informationalUpdate","isAllDay":false,
+               "startDateTime":{},"endDateTime":{},"location":{{"displayName":""}}"#,
+            dtz("2026-07-21T10:00:00", "UTC"),
+            dtz("2026-07-21T11:00:00", "UTC"),
+        ));
+        assert_eq!(
+            m.request_type,
+            Some(MeetingRequestType::InformationalUpdate)
+        );
+        assert_eq!(m.start_utc, some("2026-07-21T10:00:00Z"));
+        assert_eq!(m.end_utc, some("2026-07-21T11:00:00Z"));
+        assert_eq!((m.previous_start_utc, m.previous_end_utc), (None, None));
+        assert_eq!(m.previous_location, None);
+        // An empty name is a name: `Some("")`, as is an all-blank one.
+        assert_eq!(m.location, some(""));
+        let m =
+            request(r#""meetingRequestType":"newMeetingRequest","location":{"displayName":"   "}"#);
+        assert_eq!(m.request_type, Some(MeetingRequestType::NewMeetingRequest));
+        assert_eq!(m.location, some(""));
+        assert_eq!((m.start_utc, m.end_utc), (None, None));
+    }
+
+    #[test]
+    fn meeting_message_utc_zones_are_read_and_other_zones_are_not() {
+        for zone in ["UTC", "utc", "Etc/UTC", "Z", "tzone://Microsoft/Utc"] {
+            let m = request(&format!(
+                r#""startDateTime":{},"previousStartDateTime":{}"#,
+                dtz("2026-07-21T10:00:00", zone),
+                dtz("2026-07-20T10:00:00", zone),
+            ));
+            assert_eq!(m.start_utc, some("2026-07-21T10:00:00Z"), "{zone}");
+            assert_eq!(m.previous_start_utc, some("2026-07-20T10:00:00Z"), "{zone}");
+        }
+        // No zone (and a `null` one) is Graph's UTC; so is a trailing `Z`.
+        for start in [
+            r#"{"dateTime":"2026-07-21T10:00:00"}"#,
+            r#"{"dateTime":"2026-07-21T10:00:00Z","timeZone":null}"#,
+            r#"{"dateTime":"2026-07-21T10:00:00.5","timeZone":""}"#,
+        ] {
+            let m = request(&format!(r#""startDateTime":{start}"#));
+            assert_eq!(m.start_utc, some("2026-07-21T10:00:00Z"), "{start}");
+        }
+        // A named zone is not converted: no time zone database. A numeric
+        // zone is no zone that can be read.
+        for zone in [r#""Pacific Standard Time""#, r#""Europe/Berlin""#, "7"] {
+            let m = request(&format!(
+                r#""isAllDay":false,"startDateTime":{{"dateTime":"2026-07-21T10:00:00","timeZone":{zone}}},
+                   "previousEndDateTime":{{"dateTime":"2026-07-21T00:00:00","timeZone":{zone}}}"#
+            ));
+            assert_eq!(m.start_utc, None, "{zone}");
+            // A timed midnight is still an instant, so not read either.
+            assert_eq!(m.previous_end_utc, None, "{zone}");
+        }
+    }
+
+    #[test]
+    fn meeting_message_all_day_times_are_utc_dates_in_any_zone() {
+        // The owner's case: an all-day meeting moved by a day, read as
+        // `EventRow` stores an all-day event (the end the midnight after).
+        for zone in ["UTC", "W. Europe Standard Time", "Pacific/Auckland"] {
+            let m = request(&format!(
+                r#""meetingRequestType":"fullUpdate","isAllDay":true,
+                   "startDateTime":{},"endDateTime":{},
+                   "previousStartDateTime":{},"previousEndDateTime":{}"#,
+                dtz("2026-07-21T00:00:00", zone),
+                dtz("2026-07-22T00:00:00", zone),
+                dtz("2026-07-20T00:00:00", zone),
+                dtz("2026-07-21T00:00:00", zone),
+            ));
+            assert_eq!(m.is_all_day, Some(true));
+            assert_eq!(m.start_utc, some("2026-07-21T00:00:00Z"), "{zone}");
+            assert_eq!(m.end_utc, some("2026-07-22T00:00:00Z"), "{zone}");
+            assert_eq!(m.previous_start_utc, some("2026-07-20T00:00:00Z"), "{zone}");
+            assert_eq!(m.previous_end_utc, some("2026-07-21T00:00:00Z"), "{zone}");
+        }
+    }
+
+    #[test]
+    fn meeting_message_all_day_bounds_not_at_midnight() {
+        // A current bound not at midnight names no date this crate can
+        // tell (the organizer's midnight in UTC, say): `None`, even in UTC.
+        // A previous one may be the timed slot the update made all-day: an
+        // instant, by the timed rule.
+        let m = request(&format!(
+            r#""isAllDay":true,"startDateTime":{},"endDateTime":{},
+               "previousStartDateTime":{},"previousEndDateTime":{}"#,
+            dtz("2026-07-20T22:00:00", "UTC"),
+            dtz("2026-07-21T22:00:00", "UTC"),
+            dtz("2026-07-20T09:00:00", "UTC"),
+            dtz("2026-07-20T10:00:00", "Pacific Standard Time"),
+        ));
+        assert_eq!(m.start_utc, None);
+        assert_eq!(m.end_utc, None);
+        assert_eq!(m.previous_start_utc, some("2026-07-20T09:00:00Z"));
+        assert_eq!(m.previous_end_utc, None);
+        // A fraction that is not zeros is not midnight.
+        let m = request(
+            r#""isAllDay":true,"startDateTime":{"dateTime":"2026-07-21T00:00:00.0000001","timeZone":"UTC"}"#,
+        );
+        assert_eq!(m.start_utc, None);
+        // A string `isAllDay` is no answer: unknown, and the times timed.
+        let m = request(&format!(
+            r#""isAllDay":"true","startDateTime":{}"#,
+            dtz("2026-07-21T00:00:00", "W. Europe Standard Time"),
+        ));
+        assert_eq!(m.is_all_day, None);
+        assert_eq!(m.start_utc, None);
+    }
+
+    #[test]
+    fn meeting_message_unreadable_update_facts_are_none() {
+        let bad_times = [
+            "null",
+            r#""2026-07-21T10:00:00""#,
+            "[]",
+            "{}",
+            r#"{"dateTime":null,"timeZone":"UTC"}"#,
+            r#"{"dateTime":20260721,"timeZone":"UTC"}"#,
+            r#"{"dateTime":"","timeZone":"UTC"}"#,
+            r#"{"dateTime":"garbage","timeZone":"UTC"}"#,
+            r#"{"dateTime":"2026-13-01T00:00:00","timeZone":"UTC"}"#,
+            r#"{"dateTime":"2026-02-30T10:00:00","timeZone":"UTC"}"#,
+            r#"{"dateTime":"2025-02-29T10:00:00","timeZone":"UTC"}"#,
+            r#"{"dateTime":"2026-07-00T10:00:00","timeZone":"UTC"}"#,
+            r#"{"dateTime":"2026-07-21T24:00:00","timeZone":"UTC"}"#,
+            r#"{"dateTime":"2026-07-21T10:60:00","timeZone":"UTC"}"#,
+            r#"{"dateTime":"2026-07-21T10:00:60","timeZone":"UTC"}"#,
+            r#"{"dateTime":"2026-07-21T10:00","timeZone":"UTC"}"#,
+            r#"{"dateTime":"2026-7-21T10:00:00","timeZone":"UTC"}"#,
+            r#"{"dateTime":"2026-07-21 10:00:00","timeZone":"UTC"}"#,
+            r#"{"dateTime":"+026-07-21T10:00:00","timeZone":"UTC"}"#,
+            r#"{"dateTime":"2026-07-21T10:00:00.","timeZone":"UTC"}"#,
+            r#"{"dateTime":"2026-07-21T10:00:00.00x","timeZone":"UTC"}"#,
+            r#"{"dateTime":"2026-07-20T09:00:00+02:00","timeZone":"UTC"}"#,
+            r#"{"dateTime":"2026-07-20T09:00:00ZZ","timeZone":"UTC"}"#,
+            r#"{"dateTime":"0001-01-01T00:00:00","timeZone":"UTC"}"#,
+            r#"{"dateTime":"0001-01-01T00:00:00Z","timeZone":"UTC"}"#,
+        ];
+        for t in bad_times {
+            for all_day in ["false", "true"] {
+                let m = request(&format!(
+                    r#""isAllDay":{all_day},"startDateTime":{t},"endDateTime":{t},
+                       "previousStartDateTime":{t},"previousEndDateTime":{t}"#
+                ));
+                assert_eq!(
+                    (
+                        m.start_utc,
+                        m.end_utc,
+                        m.previous_start_utc,
+                        m.previous_end_utc
+                    ),
+                    (None, None, None, None),
+                    "{t} all day {all_day}"
+                );
+            }
+        }
+        for loc in [
+            "null",
+            r#""Room 1""#,
+            "{}",
+            r#"{"displayName":null}"#,
+            r#"{"displayName":7}"#,
+            r#"{"address":{"city":"Oslo"}}"#,
+        ] {
+            let m = request(&format!(r#""location":{loc},"previousLocation":{loc}"#));
+            assert_eq!((m.location, m.previous_location), (None, None), "{loc}");
+        }
+        for rt in ["7", "null", r#""none""#, r#""""#, r#"["fullUpdate"]"#] {
+            let m = request(&format!(r#""meetingRequestType":{rt}"#));
+            assert_eq!(m.request_type, None, "{rt}");
+        }
+        for all_day in ["null", r#""true""#, "1"] {
+            assert_eq!(
+                request(&format!(r#""isAllDay":{all_day}"#)).is_all_day,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn meeting_message_cancellation_and_response_have_no_update_facts() {
+        // What Graph sends for these: no request type, no previous values;
+        // and a plain message has none of the properties at all.
+        for body in [
+            r##"{"id":"M1","@odata.type":"#microsoft.graph.eventMessage",
+                "meetingMessageType":"meetingCancelled","event":{"id":"E9"}}"##,
+            r##"{"id":"M3","@odata.type":"#microsoft.graph.eventMessageResponse",
+                "meetingMessageType":"meetingAccepted","event":{"id":"E3"},
+                "responseType":"accepted"}"##,
+            r#"{"id":"M2","subject":"Lunch?"}"#,
+        ] {
+            let m = MeetingMessage::from_json(&parse(body).unwrap());
+            assert_eq!(
+                MeetingMessage {
+                    message_type: None,
+                    event_id: None,
+                    ..m
+                },
                 MeetingMessage::default(),
                 "{body}"
             );

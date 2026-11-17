@@ -877,6 +877,11 @@ const MEETING_MESSAGE_DOCUMENTED: &str = "$expand=microsoft.graph.eventMessage/e
 /// `event`.
 const MEETING_MESSAGE_PLAIN: &str = "";
 
+/// The `Prefer` header every [`GraphClient::meeting_message`] form sends
+/// (#2185): its `startDateTime`, `endDateTime` and previous times in UTC,
+/// as `calendar_view` asks for events' times.
+const MEETING_MESSAGE_PREFER: &str = "outlook.timezone=\"UTC\"";
+
 /// The request forms [`GraphClient::meeting_message`] sends (#2208).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MeetingMessageForm {
@@ -2403,9 +2408,20 @@ impl GraphClient {
     /// Any other failure (auth, throttle, transport, another status, a
     /// body that does not parse) is returned as is, with no fallback. A
     /// 2xx expand is the only request.
+    ///
+    /// The same answer carries a request's update facts (#2185:
+    /// `meetingRequestType`, its own and previous start, end and location,
+    /// `isAllDay`), which `MeetingMessage::from_json` reads. Every form
+    /// asks for its times in UTC ([`MEETING_MESSAGE_PREFER`]); a time Graph
+    /// still answers in another zone reads as `None`.
     pub fn meeting_message(&self, message_id: &str) -> Result<MeetingMessage, GraphError> {
         let get = |form: MeetingMessageForm| -> Result<MeetingMessage, GraphError> {
-            let resp = self.send(Method::Get, &form.path(message_id), None, &[])?;
+            let resp = self.send(
+                Method::Get,
+                &form.path(message_id),
+                None,
+                &[("Prefer", MEETING_MESSAGE_PREFER)],
+            )?;
             Ok(MeetingMessage::from_json(&parse_body(resp)?))
         };
         let fallback = match get(MeetingMessageForm::Selected) {
@@ -4227,7 +4243,7 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::model::{Importance, MeetingMessageType, MemberKind};
+    use crate::graph::model::{Importance, MeetingMessageType, MeetingRequestType, MemberKind};
     use crate::testserver::{FakeServer, RecordedRequest, Route};
 
     #[test]
@@ -8264,6 +8280,7 @@ mod tests {
                 message_type: Some(MeetingMessageType::Cancelled),
                 event_id: Some("E9".into()),
                 is_organizer: false,
+                ..Default::default()
             }
         );
         let reqs = srv.requests();
@@ -8357,6 +8374,7 @@ mod tests {
             message_type: Some(MeetingMessageType::Cancelled),
             event_id: None,
             is_organizer: false,
+            ..Default::default()
         }
     }
 
@@ -8395,9 +8413,79 @@ mod tests {
                 message_type: Some(MeetingMessageType::Cancelled),
                 event_id: Some("E9".into()),
                 is_organizer: true,
+                ..Default::default()
             }
         );
         assert_eq!(get_paths(&srv), [SELECTED_PATH, DOCUMENTED_PATH]);
+    }
+
+    // --- A meeting request's update facts (#2185) -------------------------
+
+    /// An `eventMessageRequest` for a `fullUpdate` as Graph sends it under
+    /// `Prefer: outlook.timezone="UTC"`, with the expanded event.
+    const FULL_UPDATE: &str = r##"{"id":"M1","@odata.type":"#microsoft.graph.eventMessageRequest",
+        "subject":"Updated: Sync","meetingMessageType":"meetingRequest",
+        "meetingRequestType":"fullUpdate","isAllDay":false,"isDelegated":false,
+        "responseRequested":true,"allowNewTimeProposals":true,
+        "startDateTime":{"dateTime":"2026-07-21T10:00:00.0000000","timeZone":"UTC"},
+        "endDateTime":{"dateTime":"2026-07-21T11:00:00.0000000","timeZone":"UTC"},
+        "previousStartDateTime":{"dateTime":"2026-07-20T09:00:00.0000000","timeZone":"UTC"},
+        "previousEndDateTime":{"dateTime":"2026-07-20T10:00:00.0000000","timeZone":"UTC"},
+        "location":{"displayName":"Room 2","locationType":"default","uniqueIdType":"unknown"},
+        "previousLocation":{"displayName":"Room 1","locationType":"default"},
+        "event":{"id":"E9","isOrganizer":false}}"##;
+
+    fn full_update() -> MeetingMessage {
+        MeetingMessage {
+            message_type: Some(MeetingMessageType::Request),
+            event_id: Some("E9".into()),
+            is_organizer: false,
+            request_type: Some(MeetingRequestType::FullUpdate),
+            start_utc: Some("2026-07-21T10:00:00Z".into()),
+            end_utc: Some("2026-07-21T11:00:00Z".into()),
+            previous_start_utc: Some("2026-07-20T09:00:00Z".into()),
+            previous_end_utc: Some("2026-07-20T10:00:00Z".into()),
+            location: Some("Room 2".into()),
+            previous_location: Some("Room 1".into()),
+            is_all_day: Some(false),
+        }
+    }
+
+    #[test]
+    fn meeting_message_reads_an_update_and_asks_for_utc() {
+        let srv = FakeServer::start(vec![get_route(SELECTED_PREFIX, 200, FULL_UPDATE)]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.meeting_message("M1").unwrap(), full_update());
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].path, SELECTED_PATH);
+        assert_eq!(
+            header_values(&reqs[0], "Prefer"),
+            ["outlook.timezone=\"UTC\""]
+        );
+    }
+
+    #[test]
+    fn meeting_message_fallbacks_ask_for_utc_too() {
+        let srv = FakeServer::start(vec![
+            get_route(SELECTED_PREFIX, 400, BAD_REQUEST),
+            get_route(DOCUMENTED_PATH, 400, BAD_REQUEST),
+            get_route("/me/messages/M1", 200, FULL_UPDATE),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        // The plain GET's answer carries the update facts as well.
+        assert_eq!(c.meeting_message("M1").unwrap(), full_update());
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 3);
+        for r in &reqs {
+            assert_eq!(
+                header_values(r, "Prefer"),
+                ["outlook.timezone=\"UTC\""],
+                "{}",
+                r.path
+            );
+        }
+        assert_eq!(reqs[2].path, "/me/messages/M1");
     }
 
     #[test]
