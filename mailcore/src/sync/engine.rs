@@ -1448,10 +1448,12 @@ pub enum SyncEvent {
     /// hourly) with the same grant sends none. A sign-in-required (a sign-out, a failed refresh) forgets
     /// the last one, so the next session sends it again. A token whose
     /// grant is unknown (a cache from before #1875 and a refresh that names
-    /// no scopes) sends nothing. A refresh never asks for a scope the grant
-    /// lacks (#2164), so a scope added to `AuthConfig::scope` is missing
-    /// until a token response names it, which an interactive sign-in
-    /// (asking `AuthConfig::scope` in full) does.
+    /// no scopes) sends nothing. A refresh never asks for a scope a known
+    /// grant lacks while the grant shares a scope with `AuthConfig::scope`
+    /// (otherwise it asks `AuthConfig::scope` in full:
+    /// [`crate::auth::refresh_scope`], #2164), so a scope added to
+    /// `AuthConfig::scope` is missing until a token response names it, which
+    /// an interactive sign-in (asking `AuthConfig::scope` in full) does.
     Scopes {
         granted: Vec<String>,
         missing: Vec<String>,
@@ -9848,10 +9850,12 @@ impl Engine {
     /// other failure (a dropped connection, a 5xx/429 page, a body that
     /// does not parse, `temporarily_unavailable`, #2167) is
     /// [`Refresh::Transient`], with the token kept in memory and on disk.
-    /// Token values are never logged. The refresh asks only for the
-    /// scopes of `AuthConfig::scope` the token was granted
-    /// ([`auth::refresh_scope`], #2164), so a scope the host has just added
-    /// does not sign the person out: it is announced missing instead.
+    /// Token values are never logged. While the token's grant is known and
+    /// shares a scope with `AuthConfig::scope`, the refresh asks only for the
+    /// scopes of `AuthConfig::scope` it was granted (otherwise
+    /// `AuthConfig::scope` in full: [`auth::refresh_scope`], #2164), so a
+    /// scope the host has just added does not sign the person out: it is
+    /// announced missing instead.
     /// A response that names
     /// no scopes (omitted, or empty) keeps the previous token's grant
     /// (#1875): Entra always names the granted scopes, so such an answer
@@ -10562,10 +10566,10 @@ fn drain_remaining_request(stream: &TcpStream) {
 }
 
 /// Parses an `application/x-www-form-urlencoded` query string into
-/// `(key, value)` pairs, percent-decoding each. A tiny local counterpart to
-/// `pkce::form_urlencode` (which only encodes) — kept here rather than
-/// shared, since this is the one place anything in `mailcore` decodes a
-/// query string.
+/// `(key, value)` pairs, percent-decoding each. A tiny counterpart to
+/// `pkce::form_urlencode` (which only encodes): the loopback redirect's
+/// decoder, also used by `testserver::RecordedRequest::form_value` to read
+/// token-request bodies in tests.
 pub(crate) fn parse_query(query: &str) -> Vec<(String, String)> {
     query
         .split('&')

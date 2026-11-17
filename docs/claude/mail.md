@@ -4829,7 +4829,8 @@ keyring cannot be read now both keep it.
   or a body that cannot be read), `Status` (a 5xx/429/408 or HTML page with no OAuth body),
   `Parse`, and any other code (`temporarily_unavailable`, `server_error`, `invalid_request`).
   When unsure, transient. A refusal of a refresh, which asks only the token's own grant
-  (#2164), is still a `needs_sign_in` answer and signs out.
+  while that grant is known and shares a scope with `cfg.scope` (otherwise `cfg.scope` in
+  full: `auth::refresh_scope`, #2164), is still a `needs_sign_in` answer and signs out.
 - **Three-way refresh** (`engine.rs`). `try_refresh` returns `Refresh::{Done, SignIn,
   Transient(text)}`. No token or an empty `refresh_token` is `SignIn`, with no request: the
   server's `invalid_request` would otherwise read as transient. After a 401, `with_auth` and
