@@ -51,3 +51,36 @@ test the wheel over a picture scrolls the grid
   assert sheet_scroll is 0
   call pointer-wheel {"region":"picture:1","dy":-600}
   assert sheet_scroll is not 0
+
+# The picture layer starts under the formula bar as it is drawn: expanded
+# (Ctrl+Shift+U) it is 54 px taller, and a layer pinned to the one-line bar
+# drew picture 1 two rows up, over K13.
+test with the formula bar expanded a picture stays on its cells
+  open ../fixtures/pictures.xlsx
+  call real-key {"key":"ctrl+shift+u"}
+  assert fx_expanded is true
+  call pointer-click {"region":"cell:K13"}
+  assert picture_sel is null
+  assert range is K13
+  # L15 lies under the picture's top: the press finds the picture there. (The
+  # shorter grid puts picture 1's own centre below the window.)
+  call pointer-click {"region":"cell:L15"}
+  assert picture_sel is 1
+  assert range is K13
+  shot grid
+  # The bar is the window's, not the case's: put it back for the next case.
+  call real-key {"key":"ctrl+shift+u"}
+  assert fx_expanded is false
+
+# A press on a picture held and moved over it does not sweep the cells it
+# covers, and a right-press selects it with no cell menu.
+test a press moved on a picture keeps it selected and the cells unswept
+  open ../fixtures/pictures.xlsx
+  assert range is A1
+  call pointer-drag {"from":"picture:1","to":"picture:1","offset":[40,30]}
+  assert picture_sel is 1
+  assert range is A1
+  call real-key {"key":"escape"}
+  call pointer-click {"region":"picture:1","button":"right"}
+  assert picture_sel is 1
+  assert menu is null

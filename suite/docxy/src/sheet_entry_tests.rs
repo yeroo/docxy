@@ -1839,6 +1839,16 @@ fn the_formula_bar_expands_to_about_four_lines() {
     assert!(fx_bar_height(true) >= 4. * 16.);
 }
 
+/// The overlays over the rows (pictures, chart cards, the vertical
+/// scrollbar) start under the formula bar as it is drawn, expanded or not,
+/// and the column header (#2228): they were pinned to the one-line bar.
+#[test]
+fn the_rows_start_under_the_formula_bar_as_drawn() {
+    assert_eq!(rows_viewport_top(false), 26. + SHEET_ROW_H);
+    assert_eq!(rows_viewport_top(true), fx_bar_height(true) + SHEET_ROW_H);
+    assert!(rows_viewport_top(true) > rows_viewport_top(false));
+}
+
 #[test]
 fn settings_direction_cycles_every_way() {
     let mut m = EnterMove::Down;
@@ -2511,4 +2521,31 @@ fn ctrl_v_after_ctrl_a_replaces_the_entry_and_a_copied_cells_line_break_is_dropp
     v.end_revert_for_key("v", true, false, false);
     v.edit_paste_text("XY\r\n");
     assert_eq!(v.editing.as_deref(), Some("XY"));
+}
+
+/// The row list and the horizontal scroll reach a sheet's drawings, not
+/// just its cells (#2228): a picture below the last note is still drawn and
+/// reachable, and a crafted anchor at the last row does not make the list a
+/// million rows long.
+#[test]
+fn the_view_reaches_the_drawings_past_the_used_range() {
+    use gridcore::sheet::{Drawing, DrawingKind};
+    let picture = |to: (u32, u32)| Drawing {
+        anchor_ix: 0,
+        from: (0, 0),
+        to,
+        kind: DrawingKind::Image {
+            part: "xl/media/image1.png".into(),
+            name: "Picture 1".into(),
+        },
+        anchor: Default::default(),
+    };
+    assert_eq!(drawings_reach((40, 3), &[]), (40, 3));
+    assert_eq!(drawings_reach((40, 3), &[picture((900, 20))]), (900, 20));
+    assert_eq!(drawings_reach((40, 30), &[picture((10, 2))]), (40, 30));
+    let far = picture((gridcore::sheet::MAX_ROWS - 1, gridcore::sheet::MAX_COLS - 1));
+    assert_eq!(
+        drawings_reach((0, 0), &[far]),
+        (DRAWING_REACH_ROWS, MAX_VISIBLE_COL)
+    );
 }

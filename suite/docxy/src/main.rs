@@ -2059,8 +2059,8 @@ enum HandleHidden {
     Editing,
     /// A reference field or a formula is pointing at cells.
     Pointing,
-    /// A chart holds the selection.
-    ChartSelected,
+    /// A chart or a floating picture (#2228) holds the selection.
+    ObjectSelected,
     /// File › Options turned the fill handle off (#672).
     Disabled,
     /// The selection has more than one area (#670): Excel draws no handle.
@@ -2072,17 +2072,17 @@ impl HandleHidden {
         match self {
             HandleHidden::Editing => "a cell is being edited",
             HandleHidden::Pointing => "a reference is being pointed at",
-            HandleHidden::ChartSelected => "a chart is selected",
+            HandleHidden::ObjectSelected => "a chart or picture is selected",
             HandleHidden::Disabled => "the fill handle is turned off in Settings",
             HandleHidden::MultiArea => "the selection has more than one area",
         }
     }
 
     /// Whether a plain click on a cell ends it. A click takes the selection
-    /// back from a chart; while a cell is being edited or a reference is being
+    /// back from a chart or a picture; while a cell is being edited or a reference is being
     /// pointed at, a click lands in that edit or reference instead.
     fn cleared_by_a_click(self) -> bool {
-        matches!(self, HandleHidden::ChartSelected)
+        matches!(self, HandleHidden::ObjectSelected)
     }
 }
 
@@ -2096,7 +2096,7 @@ fn fill_handle_hidden(
     editing: bool,
     range_field: bool,
     formula_pick: bool,
-    chart_sel: Option<usize>,
+    object_sel: Option<usize>,
 ) -> Option<HandleHidden> {
     if !enabled {
         Some(HandleHidden::Disabled)
@@ -2104,8 +2104,8 @@ fn fill_handle_hidden(
         Some(HandleHidden::Editing)
     } else if fill_handle_pointing(range_field, formula_pick) {
         Some(HandleHidden::Pointing)
-    } else if !cell_selection_shown(chart_sel) {
-        Some(HandleHidden::ChartSelected)
+    } else if !cell_selection_shown(object_sel) {
+        Some(HandleHidden::ObjectSelected)
     } else {
         None
     }
@@ -5308,7 +5308,34 @@ impl SheetView {
         }
         (r, c)
     }
+
+    /// The cells the view scrolls over: the used range ([`Self::extent`]),
+    /// and the cells the sheet's drawings reach (#2228). A sheet of
+    /// screenshots whose notes end early would otherwise end its row list
+    /// above its later pictures, which could then never be drawn or reached.
+    /// Only the scroll bounds take it; everything that acts on the used
+    /// range (find, Ctrl+A, a table, a pivot) keeps `extent`.
+    fn view_extent(&self) -> (u32, u32) {
+        drawings_reach(self.extent(), &self.sheet().drawings)
+    }
 }
+
+/// The furthest of `used` and the bottom-right cells `drawings` reach,
+/// `(row, col)`. A drawing's reach is capped (`DRAWING_REACH_ROWS` rows,
+/// `MAX_VISIBLE_COL` columns): the row list is rebuilt every frame over its
+/// length, and a crafted anchor at the sheet's last row must not make it a
+/// million rows long.
+fn drawings_reach(used: (u32, u32), drawings: &[gridcore::sheet::Drawing]) -> (u32, u32) {
+    drawings.iter().fold(used, |(r, c), d| {
+        (
+            r.max(d.to.0.min(DRAWING_REACH_ROWS)),
+            c.max(d.to.1.min(MAX_VISIBLE_COL)),
+        )
+    })
+}
+
+/// How far down a drawing may stretch the sheet's row list (#2228).
+const DRAWING_REACH_ROWS: u32 = 1 << 16;
 
 struct DocTab {
     kind: Kind,
@@ -5945,6 +5972,10 @@ struct Docxy {
     // owns the selection as a chart does (the cell ring hides), and is
     // dropped wherever a chart's selection is handed back or dropped.
     picture_sel: Option<usize>,
+    // A press on a picture is held (#2228): the cells it covers stay under
+    // the pointer and see its moves, which must not start a sweep, as a
+    // chart's own drag does not. `grid_release` ends it.
+    picture_held: bool,
     // The chart the Chart panel SHOWS, which outlives `chart_sel`: deselecting
     // a chart drops its handles and its source outlines but leaves the panel
     // open on it, so a range edit survives the click on the grid that was
@@ -12744,6 +12775,14 @@ fn fx_bar_height(expanded: bool) -> f32 {
     if expanded { 80. } else { 26. }
 }
 
+/// Where the sheet view's rows start, from the top of the view: under the
+/// formula bar, one line or expanded (#672), and the column header. The
+/// overlays over the rows (pictures, chart cards, the vertical scrollbar)
+/// start here, so they move with the bar (#2228).
+fn rows_viewport_top(fx_expanded: bool) -> f32 {
+    fx_bar_height(fx_expanded) + SHEET_ROW_H
+}
+
 /// How the editing cell is drawn (#672): the in-cell editor, or — editing
 /// directly in cells off — the buffer as plain text, the caret in the
 /// formula bar. `None` for a cell no editor is open on.
@@ -14540,9 +14579,10 @@ struct SelectionAfter {
 /// whether the chart was just pressed or has been selected all along. The
 /// render pass asks this every frame with no press in sight, and the answer has
 /// to be the same one a press produced. The cells keep their selection; they
-/// merely stop showing it until the chart is dismissed.
-fn cell_selection_shown(chart: Option<usize>) -> bool {
-    chart.is_none()
+/// merely stop showing it until the chart is dismissed. A selected floating
+/// picture hides it the same way (#2228): callers pass `chart_sel.or(picture_sel)`.
+fn cell_selection_shown(object: Option<usize>) -> bool {
+    object.is_none()
 }
 
 /// What just happened to the Chart panel, as the panel itself sees it.
@@ -17502,6 +17542,7 @@ impl Docxy {
             custom_lists: Vec::new(),
             chart_sel: None,
             picture_sel: None,
+            picture_held: false,
             panel_chart: None,
             chart_drag: None,
             range_edit: None,
@@ -19068,6 +19109,7 @@ impl Docxy {
     /// armed, and the NEXT drag anywhere would commit an auto-fill nobody asked
     /// for.
     fn grid_release(&mut self, cx: &mut Context<Self>) {
+        self.picture_held = false;
         self.col_resize_end(cx);
         self.sheet_dragging = false; // end any drag-select
         self.drag_anchor = None;
@@ -21233,6 +21275,9 @@ impl Docxy {
         if self.chart_drag.is_some() {
             return; // the pointer is carrying a chart, not sweeping cells
         }
+        if self.picture_held {
+            return; // a press on a picture, moving over the cells it covers
+        }
         if self.sheet_fill.is_some() {
             return; // an auto-fill drag owns the pointer too
         }
@@ -21374,7 +21419,7 @@ impl Docxy {
     /// Scroll horizontally by `delta` columns (Shift+wheel), clamped to the extent.
     fn sheet_hscroll(&mut self, delta: i32, cx: &mut Context<Self>) {
         if let Some(v) = self.active_sheet_mut() {
-            let (_, mc) = v.extent();
+            let (_, mc) = v.view_extent();
             let nv = (v.col0 as i32 + delta).clamp(0, mc as i32);
             if nv as u32 != v.col0 {
                 v.col0 = nv as u32;
@@ -25993,8 +26038,7 @@ impl Docxy {
         // A selected picture (#2228) takes the object keys too: Escape drops
         // it, and Delete and Backspace do nothing — deleting a picture is not
         // supported, and erasing the cell it hides would be a change nobody
-        // can see. The keys the grid acts on hand the selection back first,
-        // as for a chart below.
+        // can see. Its other keys hand the selection back below, as a chart's.
         if self.picture_sel.is_some() && !editing {
             match key {
                 "escape" => {
@@ -26003,22 +26047,13 @@ impl Docxy {
                     return;
                 }
                 "delete" | "backspace" => return,
-                "left" | "right" | "up" | "down" | "enter" | "f2" => self.chart_hand_back(cx),
-                _ if ev
-                    .keystroke
-                    .key_char
-                    .as_deref()
-                    .and_then(|c| c.chars().next())
-                    .is_some_and(|ch| !ch.is_control()) =>
-                {
-                    self.chart_hand_back(cx)
-                }
                 _ => {}
             }
         }
         // A selected chart takes the object keys (Escape drops it, Delete removes
-        // it) before they reach the grid.
-        if self.chart_sel.is_some() && !editing {
+        // it) before they reach the grid. A selected picture reaches here only
+        // with the keys the grid acts on, which hand it back the same way.
+        if (self.chart_sel.is_some() || self.picture_sel.is_some()) && !editing {
             match key {
                 "escape" => {
                     self.chart_sel = None;
@@ -49128,6 +49163,7 @@ fn sheet_picture(
         None => placeholder(),
     };
     let ent = ent.clone();
+    let ent_r = ent.clone();
     div()
         .id(ElementId::Name(format!("sheet-picture-{idx}").into()))
         .absolute()
@@ -49139,7 +49175,17 @@ fn sheet_picture(
         // also react. The wheel is not a press: it still scrolls the grid.
         .on_mouse_down(MouseButton::Left, move |_ev, _w, cx2| {
             cx2.stop_propagation();
-            ent.update(cx2, |this, cx2| this.picture_press(idx, cx2));
+            ent.update(cx2, |this, cx2| {
+                // Held until the left button comes up (`grid_release`).
+                this.picture_held = true;
+                this.picture_press(idx, cx2)
+            });
+        })
+        // A right-press selects it too, and the cell it covers opens no menu
+        // (a picture has no menu yet).
+        .on_mouse_down(MouseButton::Right, move |_ev, _w, cx2| {
+            cx2.stop_propagation();
+            ent_r.update(cx2, |this, cx2| this.picture_press(idx, cx2));
         })
         .child(content)
         .when_some(probes, |d, probes| {
@@ -49217,7 +49263,8 @@ fn sheet_el(
     cx: &mut Context<Docxy>,
 ) -> AnyElement {
     let sh = view.sheet();
-    let (max_r, max_c) = view.extent();
+    // The used range and the drawings: the list and the scrollbar reach both.
+    let (max_r, max_c) = view.view_extent();
     // Frozen columns (freeze panes, cols axis): pinned at the left, always shown.
     let (frz_r, frz_c) = sh.freeze;
     let fc = frz_c.min(64);
@@ -50269,7 +50316,7 @@ fn sheet_el(
             .absolute()
             .left_0()
             .right_0()
-            .top(px(26. + SHEET_ROW_H))
+            .top(px(rows_viewport_top(expanded)))
             .bottom(px(26.))
             .overflow_hidden()
             .child(l)
@@ -50280,7 +50327,7 @@ fn sheet_el(
         .absolute()
         .left_0()
         .right_0()
-        .top(px(26. + SHEET_ROW_H))
+        .top(px(rows_viewport_top(expanded)))
         .bottom(px(26.))
         .overflow_hidden()
         .children(cards)
@@ -50360,7 +50407,7 @@ fn sheet_el(
         .child(
             div()
                 .absolute()
-                .top(px(26. + SHEET_ROW_H))
+                .top(px(rows_viewport_top(expanded)))
                 .right_0()
                 .bottom(px(26.))
                 .w(px(12.))
@@ -51216,7 +51263,7 @@ mod grid_geom_tests {
         );
         assert_eq!(
             fill_handle_hidden(true, false, false, false, Some(0)),
-            Some(ChartSelected)
+            Some(ObjectSelected)
         );
         // An edit outranks the rest: it is what a click would land in.
         assert_eq!(
@@ -51225,8 +51272,8 @@ mod grid_geom_tests {
         );
         assert_eq!(Editing.why(), "a cell is being edited");
         assert_eq!(Pointing.why(), "a reference is being pointed at");
-        assert_eq!(ChartSelected.why(), "a chart is selected");
-        assert!(ChartSelected.cleared_by_a_click());
+        assert_eq!(ObjectSelected.why(), "a chart or picture is selected");
+        assert!(ObjectSelected.cleared_by_a_click());
         assert!(!Editing.cleared_by_a_click() && !Pointing.cleared_by_a_click());
     }
 

@@ -11127,12 +11127,12 @@ mod tests {
             );
         }
         assert_eq!(
-            fill_press_refusal(false, false, Some(ChartSelected), true),
+            fill_press_refusal(false, false, Some(ObjectSelected), true),
             Ok(())
         );
         assert_eq!(
-            fill_press_refusal(false, false, Some(ChartSelected), false),
-            Err("the fill handle is not shown: a chart is selected".into())
+            fill_press_refusal(false, false, Some(ObjectSelected), false),
+            Err("the fill handle is not shown: a chart or picture is selected".into())
         );
     }
 
