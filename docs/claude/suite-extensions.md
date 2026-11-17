@@ -689,9 +689,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   `canvas_color`; `ext-doc-word {"text"}` gives a painted word's box and,
   in Print, its `page` and `page_x`/`page_y` on the sheet (the sheet's
   1 px border counts: a 1" margin is `page_x` 97);
-  `ext-doc-load {"fixture":"sections"|"header-inherit"}`
+  `ext-doc-load {"fixture":"sections"|"header-inherit"|"theme-font"}`
   (`ext_fixture::named_document`; `header-inherit` is `include_bytes!` of
-  the fixture, loaded by `load_bytes`). `sections_document()`: Letter
+  the fixture, loaded by `load_bytes`; `theme-font` is
+  `ext_fixture::theme_font_docx()`, the #1972 owner's shape: see
+  `docs/claude/suite-document.md`, "Fonts of unnamed runs"). `ext-doc-word`
+  also replies `face` (the drawn face's `family`, the run's `bold` /
+  `italic`, and `bold_face` / `italic_face`: #1972). `sections_document()`: Letter
   with a header and a footer whose PAGE number is framed at the right
   margin, a landscape section with 0.5" margins, two 3" columns 0.5"
   apart with `w:sep`, then a continuous one-column section. The

@@ -36473,11 +36473,22 @@ struct Measurer {
 }
 
 impl Measurer {
+    /// A measurer of UI text (the ribbon, dialogs): in the inherited font,
+    /// the theme's, which an embedding host's may not load (#1900).
     fn new(window: &Window) -> Self {
-        // The inherited font is the theme's; an embedding host's may not
-        // load (#1900), and DocView's root draws in its resolved family.
         let mut base = window.text_style().font();
         base.family = font_subst::ui_family(&base.family);
+        Measurer {
+            ts: window.text_system().clone(),
+            base,
+        }
+    }
+
+    /// A measurer of a document's text, whose root draws in `family`
+    /// ([`doc_text_family`]), so measured = drawn (#1972).
+    fn for_document(window: &Window, family: SharedString) -> Self {
+        let mut base = window.text_style().font();
+        base.family = family;
         Measurer {
             ts: window.text_system().clone(),
             base,
@@ -36525,6 +36536,14 @@ impl Measurer {
                 .width(),
         )
     }
+}
+
+/// The family a document's text inherits under `window`'s inherited
+/// (theme or host) font: one gpui loads with a real bold face
+/// ([`font_subst::doc_base_family`], #1972). A run whose styles name no
+/// family and a family that does not load draw in it.
+fn doc_text_family(window: &Window) -> SharedString {
+    font_subst::doc_base_family(&window.text_style().font().family)
 }
 
 /// What `inline_width` and `frame_content_w` need of a [`Measurer`], so a test
@@ -44941,8 +44960,10 @@ impl Render for Docxy {
         let comment_bar = (is_doc && self.comment_open).then(|| self.comment_bar(pal, cx));
         let ruler = (is_doc && self.show_ruler).then(|| self.ruler(cx));
 
-        // Text measurer for tab-stop positioning (shared across the document).
-        let measurer = Measurer::new(window);
+        // Text measurer for tab-stop positioning (shared across the
+        // document), in the family the document's views draw in (#1972).
+        let doc_font = doc_text_family(window);
+        let measurer = Measurer::for_document(window, doc_font.clone());
         let content: AnyElement = match self.tabs.get(self.active) {
             Some(tab) => match &tab.surface {
                 Surface::Doc(editor) => {
@@ -45668,6 +45689,7 @@ impl Render for Docxy {
                         // each page's painted rect, not the area's children.
                         let scroll = v_flex()
                             .id("doc-scroll")
+                            .font_family(doc_font.clone())
                             .track_scroll(&self.doc_scroll)
                             .flex_1()
                             .h_full()
@@ -45753,6 +45775,7 @@ impl Render for Docxy {
                         let hbar = self.doc_hbar.clone();
                         let scroll = v_flex()
                             .id("doc-scroll")
+                            .font_family(doc_font.clone())
                             .relative()
                             .track_scroll(&self.doc_scroll)
                             .flex_1()

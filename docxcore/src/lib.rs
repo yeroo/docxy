@@ -77,4 +77,5 @@ pub mod styles;
 pub mod table;
 pub mod table_props;
 pub mod table_styles;
+pub mod theme;
 pub mod watermark;
