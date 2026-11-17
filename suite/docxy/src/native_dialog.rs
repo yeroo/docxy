@@ -36,11 +36,8 @@ pub(crate) enum DialogRoute {
 
 /// The route for this OS (#2194).
 pub(crate) const fn dialog_route() -> DialogRoute {
-    if cfg!(target_os = "windows") {
-        DialogRoute::Deferred
-    } else {
-        DialogRoute::Inline
-    }
+    // TEMP negative control for #2195 (revert before merge): Inline on Windows too, #2192's crash.
+    DialogRoute::Inline
 }
 
 /// An rfd dialog an owner window can be set on.

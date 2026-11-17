@@ -375,7 +375,7 @@ jobs:
           }
       - name: Sweep
         timeout-minutes: 90
-        run: python scripts/ui-linux-sweep.py --timeout 420 --expected uiharness/cases/expected-failures-windows.txt --suite suite/target/release/suite.exe --uiharness target/release/uiharness.exe --run "${{ github.workspace }}/uiharness-runs/sweep"
+        run: python scripts/ui-linux-sweep.py --timeout 420 --expected uiharness/cases/expected-failures-windows.txt --suite suite/target/release/suite.exe --uiharness target/release/uiharness.exe --run "${{ github.workspace }}/uiharness-runs/sweep" uiharness/cases/open-picker-windows.uit
       - name: Upload the sweep's transcripts and evidence
         if: always()
         uses: actions/upload-artifact@v7
