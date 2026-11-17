@@ -7,6 +7,7 @@
 //! touched. [`crate::package::Package::set_page_background`] wraps these with
 //! the `w:displayBackgroundShape` settings flag Word needs to show it.
 
+use crate::theme::hex_rgb as hex;
 use crate::xml::{Event, XmlParser};
 
 pub(crate) const VML_NS: &str = "urn:schemas-microsoft-com:vml";
@@ -100,13 +101,6 @@ fn background_span(doc: &str) -> Option<(usize, usize)> {
             Event::Text => {}
         }
     }
-}
-
-fn hex(value: &str) -> Option<u32> {
-    let v = value.trim().trim_start_matches('#');
-    (v.len() == 6)
-        .then(|| u32::from_str_radix(v, 16).ok())
-        .flatten()
 }
 
 /// The page colour in a document part's XML; `None` without a

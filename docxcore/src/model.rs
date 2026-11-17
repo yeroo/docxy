@@ -865,12 +865,21 @@ pub struct ParBorders {
     pub right: Option<ParBorder>,
     /// `w:between`: the line between grouped paragraphs.
     pub between: Option<ParBorder>,
+    /// The sides given as no line (`w:val="nil"` / `"none"`), one bit each in
+    /// [`Self::sides`]' order: such a side cancels the one a style below
+    /// gives (#2231 r1). A side with a line never has its bit set.
+    pub nil: u8,
 }
 
 impl ParBorders {
-    /// Whether any side is set.
+    /// Whether any side draws a line.
     pub fn any(&self) -> bool {
         self.sides().iter().any(|(_, s)| s.is_some())
+    }
+
+    /// Whether nothing is said of any side: no line and no cancel.
+    pub fn is_empty(&self) -> bool {
+        !self.any() && self.nil == 0
     }
 
     /// The sides in `w:pBdr`'s schema order (CT_PBdr), with their tags.
@@ -882,6 +891,50 @@ impl ParBorders {
             ("w:right", self.right),
             ("w:between", self.between),
         ]
+    }
+
+    /// Side `i` in [`Self::sides`]' order.
+    fn side_mut(&mut self, i: usize) -> &mut Option<ParBorder> {
+        match i {
+            0 => &mut self.top,
+            1 => &mut self.left,
+            2 => &mut self.bottom,
+            3 => &mut self.right,
+            _ => &mut self.between,
+        }
+    }
+
+    /// Whether side `i` (in [`Self::sides`]' order) is given as no line.
+    pub fn is_nil(&self, i: usize) -> bool {
+        self.nil & (1 << i) != 0
+    }
+
+    /// Set side `i` (in [`Self::sides`]' order): a line, or no line, which
+    /// cancels a style's.
+    pub fn set_side(&mut self, i: usize, side: Option<ParBorder>) {
+        *self.side_mut(i) = side;
+        if side.is_some() {
+            self.nil &= !(1 << i);
+        } else {
+            self.nil |= 1 << i;
+        }
+    }
+
+    /// `self`'s sides over `under`'s, each apart: a line, else a cancel
+    /// (which keeps the side off), else what `under` says.
+    pub fn over(self, under: ParBorders) -> ParBorders {
+        let mut out = ParBorders::default();
+        let (o, u) = (self.sides(), under.sides());
+        for i in 0..5 {
+            if o[i].1.is_some() {
+                out.set_side(i, o[i].1);
+            } else if self.is_nil(i) || (u[i].1.is_none() && under.is_nil(i)) {
+                out.set_side(i, None);
+            } else {
+                *out.side_mut(i) = u[i].1;
+            }
+        }
+        out
     }
 
     /// Borders with only a bottom rule of `kind`, as the editor writes one

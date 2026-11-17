@@ -231,9 +231,10 @@ fn colour_slot(name: &str) -> Option<usize> {
     })
 }
 
-/// `RRGGBB` hex, `None` unless exactly six hex digits.
-fn hex6(v: &str) -> Option<u32> {
-    let v = v.trim();
+/// An `RRGGBB` colour value (`w:color`, `a:srgbClr@val`, a `#` before it
+/// allowed), `None` unless exactly six hex digits (`auto` included).
+pub(crate) fn hex_rgb(value: &str) -> Option<u32> {
+    let v = value.trim().trim_start_matches('#');
     (v.len() == 6)
         .then(|| u32::from_str_radix(v, 16).ok())
         .flatten()
@@ -253,12 +254,12 @@ pub fn parse_theme_colors(xml: &str) -> ThemeColors {
                 name if in_scheme && slot.is_none() => slot = colour_slot(name),
                 "srgbClr" => {
                     if let Some(i) = slot {
-                        out.slots[i] = out.slots[i].or(hex6(p.attr("val")));
+                        out.slots[i] = out.slots[i].or(hex_rgb(p.attr("val")));
                     }
                 }
                 "sysClr" => {
                     if let Some(i) = slot {
-                        out.slots[i] = out.slots[i].or(hex6(p.attr("lastClr")));
+                        out.slots[i] = out.slots[i].or(hex_rgb(p.attr("lastClr")));
                     }
                 }
                 _ => {}

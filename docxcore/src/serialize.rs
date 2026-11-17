@@ -988,7 +988,7 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         || props.rtl
         || props.frame.is_some()
         || props.section_break.is_some()
-        || props.borders.any()
+        || !props.borders.is_empty()
         || props.indent != 0
         || props.indent_right != 0
         || props.first_line != 0
@@ -1072,11 +1072,14 @@ fn write_ppr(s: &mut String, props: &ParProps) {
             numpr_xml(props.ilvl, num, shadow.find("numPr")),
         ));
     }
-    if props.borders.any() && !kept(PprGroup::Borders) {
+    if !props.borders.is_empty() && !kept(PprGroup::Borders) {
         let mut x = String::from("<w:pBdr>");
-        for (tag, side) in props.borders.sides() {
+        for (i, (tag, side)) in props.borders.sides().into_iter().enumerate() {
             if let Some(b) = side {
                 x.push_str(&pbdr_side_xml(tag, &b));
+            } else if props.borders.is_nil(i) {
+                // No line, which cancels a style's (#2231 r1).
+                x.push_str(&format!("<{tag} w:val=\"nil\"/>"));
             }
         }
         x.push_str("</w:pBdr>");
@@ -2415,6 +2418,39 @@ mod tests {
         let mut zero = ParProps::default();
         zero.pin_first_line(0);
         assert!(zero.has_direct_first_line());
+    }
+
+    /// #2231 r1: a side given as no line saves as loaded when untouched and
+    /// as `w:val="nil"` when the borders are rewritten, so it still cancels
+    /// the style's on reload.
+    #[test]
+    fn a_cancelled_side_round_trips() {
+        let pbdr =
+            "<w:pBdr><w:bottom w:val=\"none\" w:sz=\"0\" w:space=\"0\" w:color=\"auto\"/></w:pBdr>";
+        let xml = format!(
+            "<w:document><w:body><w:p><w:pPr><w:pStyle w:val=\"Title\"/>{pbdr}</w:pPr><w:r><w:t>x</w:t></w:r></w:p></w:body></w:document>"
+        );
+        let mut d = parse_document_xml(&xml, &Relationships::default());
+        assert!(document_to_xml(&d).contains(pbdr), "untouched: as loaded");
+        let Block::Paragraph(p) = &mut d.body[0] else {
+            panic!("a paragraph")
+        };
+        p.props
+            .borders
+            .set_side(0, Some(crate::model::ParBorder::rule(BorderKind::Single)));
+        let want = p.props.borders;
+        let out = document_to_xml(&d);
+        assert!(
+            out.contains(
+                "<w:pBdr><w:top w:val=\"single\" w:sz=\"6\" w:space=\"1\" w:color=\"auto\"/><w:bottom w:val=\"nil\"/></w:pBdr>"
+            ),
+            "{out}"
+        );
+        let back = parse_document_xml(&out, &Relationships::default());
+        let Block::Paragraph(q) = &back.body[0] else {
+            panic!("a paragraph")
+        };
+        assert_eq!(q.props.borders, want);
     }
 
     /// The editor's own rule (Bottom Border, Insert > Horizontal Line) keeps

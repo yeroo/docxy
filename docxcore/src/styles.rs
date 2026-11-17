@@ -638,15 +638,10 @@ impl StyleSheet {
     }
 }
 
-/// `over`'s sides, each falling back to `under`'s apart.
+/// `over`'s sides, each falling back to `under`'s apart; a `nil` side in
+/// `over` cancels `under`'s (#2231 r1).
 fn fold_sides(over: ParBorders, under: ParBorders) -> ParBorders {
-    ParBorders {
-        top: over.top.or(under.top),
-        left: over.left.or(under.left),
-        bottom: over.bottom.or(under.bottom),
-        right: over.right.or(under.right),
-        between: over.between.or(under.between),
-    }
+    over.over(under)
 }
 
 /// An on/off attribute that is off when absent (`w:default`).
@@ -944,10 +939,7 @@ pub fn parse_pbdr(p: &mut XmlParser) -> ParBorders {
             Event::Start => {
                 let side = BorderKind::from_val(p.attr("w:val")).map(|kind| {
                     let num = |a: &str| p.attr(a).trim().parse::<u16>().ok();
-                    let color = p.attr("w:color").trim();
-                    let color = (color.len() == 6)
-                        .then(|| u32::from_str_radix(color, 16).ok())
-                        .flatten();
+                    let color = crate::theme::hex_rgb(p.attr("w:color"));
                     let byte = |a: &str| u8::from_str_radix(p.attr(a).trim(), 16).ok();
                     ParBorder {
                         kind,
@@ -963,13 +955,25 @@ pub fn parse_pbdr(p: &mut XmlParser) -> ParBorders {
                         }),
                     }
                 });
-                match p.name() {
-                    "w:top" => b.top = side,
-                    "w:left" | "w:start" => b.left = b.left.or(side),
-                    "w:bottom" => b.bottom = side,
-                    "w:right" | "w:end" => b.right = b.right.or(side),
-                    "w:between" => b.between = side,
-                    _ => {}
+                let i = match p.name() {
+                    "w:top" => Some(0),
+                    "w:left" | "w:start" => Some(1),
+                    "w:bottom" => Some(2),
+                    "w:right" | "w:end" => Some(3),
+                    "w:between" => Some(4),
+                    _ => None,
+                };
+                // A `nil`/`none` side is no line, which cancels a style's
+                // (#2231 r1); another value this model has no line for is
+                // left unsaid. `w:left` and `w:start` are one side: the first
+                // that draws wins.
+                let cancels = matches!(p.attr("w:val"), "nil" | "none");
+                if let Some(i) = i {
+                    let start_end = i == 1 || i == 3;
+                    let taken = start_end && b.sides()[i].1.is_some();
+                    if (side.is_some() || cancels) && !taken {
+                        b.set_side(i, side);
+                    }
                 }
                 p.skip_element();
             }
@@ -1425,6 +1429,45 @@ mod tests {
         );
     }
 
+    /// #2231 r1: a side given as `none` (Word's removed rule) or `nil`
+    /// cancels the style's below it, direct or in a derived style; another
+    /// side still comes through.
+    #[test]
+    fn a_none_side_cancels_the_styles_below() {
+        let xml = r#"<w:styles>
+            <w:style w:styleId="Title"><w:pPr><w:pBdr><w:top w:val="single"/><w:bottom w:val="single" w:sz="8" w:color="4F81BD"/></w:pBdr></w:pPr></w:style>
+            <w:style w:styleId="Plain"><w:basedOn w:val="Title"/><w:pPr><w:pBdr><w:bottom w:val="nil"/></w:pBdr></w:pPr></w:style>
+            <w:style w:styleId="Again"><w:basedOn w:val="Plain"/><w:pPr><w:pBdr><w:bottom w:val="double"/></w:pBdr></w:pPr></w:style>
+            </w:styles>"#;
+        let ss = parse_styles_xml(xml);
+        let direct = parse_document_borders(
+            r#"<w:pBdr><w:bottom w:val="none" w:sz="0" w:space="0" w:color="auto"/></w:pBdr>"#,
+        );
+        assert_eq!(direct.bottom, None);
+        assert!(direct.is_nil(2) && !direct.is_empty() && !direct.any());
+        let shown = ss.effective_borders(Some("Title"), direct);
+        assert_eq!(shown.bottom, None, "the direct none cancels Title's rule");
+        assert_eq!(shown.top.map(|b| b.kind), Some(BorderKind::Single));
+        let derived = ss.effective_borders(Some("Plain"), ParBorders::default());
+        assert_eq!(
+            derived.bottom, None,
+            "a derived style's nil cancels its base's"
+        );
+        assert!(derived.top.is_some());
+        // A line further up the chain draws again.
+        let again = ss.effective_borders(Some("Again"), ParBorders::default());
+        assert_eq!(again.bottom.map(|b| b.kind), Some(BorderKind::Double));
+        // With only cancels left, nothing draws.
+        let none_at_all = ParBorders::default().over(direct);
+        assert!(!none_at_all.any());
+    }
+
+    fn parse_document_borders(pbdr: &str) -> ParBorders {
+        let mut p = XmlParser::new(pbdr);
+        assert_eq!(p.next(), Event::Start);
+        parse_pbdr(&mut p)
+    }
+
     /// #2231: each side folds through the `basedOn` chain on its own, and
     /// a direct side wins only for that side.
     #[test]
@@ -1536,9 +1579,6 @@ mod tests {
         assert_eq!(ss.style_left_indent(None), None);
     }
 
-    /// #1815 r1: the twips and the character units are inherited apart, so
-    /// a derived `w:left` does not hide a base's character count, and a
-    /// derived zero count cancels it.
     /// #2231: the twips the page view draws a style's indent at, the first
     /// line too, each from the most-derived style that sets it; a nonzero
     /// character count is not a width.
@@ -1560,6 +1600,9 @@ mod tests {
         assert_eq!(both(None), (None, Some(100)));
     }
 
+    /// #1815 r1: the twips and the character units are inherited apart, so
+    /// a derived `w:left` does not hide a base's character count, and a
+    /// derived zero count cancels it.
     #[test]
     fn style_left_indent_inherits_twips_and_chars_apart() {
         let ss = parse_styles_xml(

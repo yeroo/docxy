@@ -3190,17 +3190,25 @@ impl Editor {
         });
     }
 
-    /// After an indent edit that wrote the first lines a host draws (the
-    /// suite's ruler, #2231): each selected list item whose first line is
-    /// now 0 has it pinned as an explicit `w:firstLine="0"`
-    /// ([`ParProps::pin_first_line`]), so its numbering level's hanging
-    /// indent does not come back, in session or after a reload. Rides on the
-    /// edit's own undo step (no checkpoint).
-    pub fn pin_zero_first_lines(&mut self) {
+    /// After an indent edit that wrote the indents a host draws (the suite's
+    /// ruler, #2231): each selected paragraph whose left (or first line) is
+    /// now 0 and not its own, where `inherits` says something below it (a
+    /// list level, docxy's own list levels, a style) would give it a nonzero
+    /// one, has the 0 pinned as an explicit `w:left="0"` (#1728's pin) or
+    /// `w:firstLine="0"` ([`ParProps::pin_first_line`]), so what it inherits
+    /// does not come back, in session or after a reload. `inherits` returns
+    /// (left, first line) for the paragraph's props. Rides on the edit's own
+    /// undo step (no checkpoint).
+    pub fn pin_zero_indents(&mut self, inherits: impl Fn(&ParProps) -> (bool, bool)) {
         for path in self.selected_para_paths() {
             if let Some(p) = para_mut(&mut self.doc.body, &path) {
-                if p.props.in_list() && p.props.first_line == 0 {
-                    p.props.pin_first_line(0);
+                let (left, first) = inherits(&p.props);
+                let pr = &mut p.props;
+                if left && pr.indent == 0 && !pr.has_direct_left_indent() {
+                    pr.pin_left_indent_zero();
+                }
+                if first && pr.first_line == 0 && !pr.has_direct_first_line() {
+                    pr.pin_first_line(0);
                 }
             }
         }
