@@ -45,7 +45,7 @@ use crate::graph::client::{
     UploadObserver, graph_error_message, one_line,
 };
 use crate::graph::model::{
-    DraftOptions, Importance, MeetingMessage, MeetingMessageType, Recipient,
+    DraftKind, DraftOptions, Importance, MeetingMessage, MeetingMessageType, Message, Recipient,
 };
 use crate::store::{MessageRow, OutboundAttachment, OutboxOp, Store};
 
@@ -995,6 +995,16 @@ fn content_type_for(name: &str) -> String {
 /// second `SaveDraft`/`SendDraft` with the same `local:` id patches the draft
 /// rather than creating it twice.
 ///
+/// A `local:` draft that answers a message (`Store::create_local_answer_draft`,
+/// #2212) is created instead with `createReply` / `createReplyAll` /
+/// `createForward` on the original as it is known now (`answer_target`),
+/// reconciled to that draft's id, then PATCHed with every stored field, so
+/// what the person wrote replaces Graph's pre-filled recipients and quoted
+/// body while the thread and, for a forward, the copied attachments stay.
+/// Only an original Graph no longer has (404) or one that never reached it
+/// (still `local:`) falls back to the plain create; any other failure of
+/// the create is returned with the draft still `local:`.
+///
 /// Shared by `SaveDraft` (which only needs this) and `SendDraft` (which
 /// needs it done first, then sends the result).
 fn ensure_draft_on_graph(
@@ -1018,6 +1028,44 @@ fn ensure_draft_on_graph(
     let opts = draft_options(&row);
 
     if row.id.starts_with("local:") {
+        // A local answer draft (#2212) is created through the answer's own
+        // endpoint on the original, so it threads (a reply) or carries the
+        // original's attachments (a forward). An original Graph no longer
+        // has (404) is the one failure that falls back to a plain create:
+        // any other refusal is the op's (a 403 on a rights-protected
+        // original must not be routed around with a fresh copy of it).
+        let answered = match answer_target(store, &row.id)? {
+            Some((original, kind)) => match create_answer(client, &original, kind) {
+                Ok(m) => Some(m),
+                Err(GraphError::NotFound) => None,
+                Err(e) => return Err(e),
+            },
+            None => None,
+        };
+        if let Some(created) = answered {
+            // Reconciled before the PATCH: a PATCH that fails is retried as
+            // a PATCH of this id, never as a second create. Until a PATCH
+            // lands, the row's link and its unsaved edit
+            // (`create_local_answer_draft` starts it at 1) keep every delta
+            // of Graph's pre-filled copy off it, fresh or on a stored link
+            // (`Store::merge_message`); `mark_pushed` clears both. The flag
+            // goes, as on any first push.
+            store
+                .reconcile_id(&row.id, &created.id)
+                .map_err(|e| GraphError::Parse(e.to_string()))?;
+            client.update_draft(
+                &created.id,
+                &body.content,
+                &row.subject,
+                &to,
+                &cc,
+                &bcc,
+                &opts,
+                true,
+            )?;
+            mark_pushed(store, &created.id, generation);
+            return Ok(created.id);
+        }
         let created = client.create_draft(&body.content, &row.subject, &to, &cc, &bcc, &opts)?;
         store
             .reconcile_id(&row.id, &created.id)
@@ -1046,6 +1094,36 @@ fn ensure_draft_on_graph(
     }
 }
 
+/// The original a local draft answers on Graph, and how (#2212): its
+/// stored link (`Store::draft_answers`) with the original's id resolved now
+/// (`Store::current_id`: a `local:` original reconciled since, or a moved
+/// one, #1896). `None` for a draft that answers nothing, or an original
+/// that never reached Graph (still `local:`): it is created plainly.
+fn answer_target(store: &Store, id: &str) -> Result<Option<(String, DraftKind)>, GraphError> {
+    let Some((original, kind)) = store.draft_answers(id).map_err(store_err)? else {
+        return Ok(None);
+    };
+    let current = store.current_id(&original).map_err(store_err)?;
+    if current.is_empty() || current.starts_with("local:") {
+        return Ok(None);
+    }
+    Ok(Some((current, kind)))
+}
+
+/// Creates the answer draft `kind` names on Graph's `original` (#2212):
+/// `createReply`, `createReplyAll` or `createForward`.
+fn create_answer(
+    client: &GraphClient,
+    original: &str,
+    kind: DraftKind,
+) -> Result<Message, GraphError> {
+    match kind {
+        DraftKind::Reply => client.create_reply(original, false),
+        DraftKind::ReplyAll => client.create_reply(original, true),
+        DraftKind::Forward => client.create_forward(original),
+    }
+}
+
 /// The importance and follow-up flag a draft's row holds, as
 /// `create_draft` / `update_draft` send them (#1955): an empty or unknown
 /// stored importance is `Normal`, and a due time that cannot be read goes
@@ -1059,10 +1137,13 @@ fn draft_options(row: &MessageRow) -> DraftOptions {
 }
 
 /// Graph now has generation `generation` of the draft stored under `id`'s
-/// fields (#1871): the row is clean unless compose edited it since. A store
-/// error is ignored: the draft stays protected from fresh deltas until its
-/// next push.
+/// fields (#1871): the row is clean unless compose edited it since. An
+/// answer draft's link goes too (#2212, `Store::clear_draft_answers`): the
+/// draft is on Graph with the person's fields, so deltas merge it as any
+/// draft. A store error is ignored: the draft stays protected (from fresh
+/// deltas, and an answer draft from every delta) until its next push.
 fn mark_pushed(store: &Store, id: &str, generation: i64) {
+    let _ = store.clear_draft_answers(id);
     if generation > 0 {
         let _ = store.clear_local_edit(id, generation);
     }
@@ -5403,5 +5484,560 @@ mod tests {
             importance_and_flag(&reqs[2].body),
             ("high".to_string(), "<none>".to_string())
         );
+    }
+
+    // --- A local answer draft (#2212) -----------------------------------
+
+    /// A received message `id` in folder `F`, in conversation `C9` with
+    /// Internet message id `<id@x>`.
+    fn original(id: &str) -> Message {
+        Message {
+            id: id.into(),
+            conversation_id: "C9".into(),
+            subject: "Hi".into(),
+            from: Recipient {
+                name: "Alice".into(),
+                address: "alice@x".into(),
+            },
+            to: vec![],
+            cc: vec![],
+            received: String::new(),
+            sent: String::new(),
+            is_read: true,
+            is_flagged: false,
+            has_attachments: false,
+            importance: String::new(),
+            preview: String::new(),
+            is_draft: false,
+            is_meeting_request: false,
+            meeting_message_type: None,
+            protection: Default::default(),
+            meeting_reminder_on: false,
+            categories: vec![],
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
+            internet_message_id: format!("<{id}@x>"),
+            in_reply_to: String::new(),
+            size: None,
+            is_event_message: false,
+        }
+    }
+
+    /// A store holding the received message `M1` in folder `F`.
+    fn store_with_m1() -> Store {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .upsert_folder(&MailFolder {
+                id: "F".into(),
+                display_name: "F".into(),
+                parent_id: None,
+                total_count: 0,
+                unread_count: 0,
+                well_known_name: None,
+            })
+            .unwrap();
+        store.upsert_message("F", &original("M1")).unwrap();
+        store
+    }
+
+    /// A local answer draft to `original` as `kind`, its fields set as a
+    /// host's compose would (Bcc too) and its options high and flagged.
+    fn answer_draft(store: &Store, original: &str, kind: DraftKind) -> String {
+        let local = store
+            .create_local_answer_draft(original, kind, "Re: Hi", "alice@x", "", "<p>q</p>")
+            .unwrap();
+        store
+            .update_draft_fields(
+                &local,
+                "Re: Hi",
+                "alice@x",
+                "carol@x",
+                "dan@x",
+                "<p>mine</p>",
+            )
+            .unwrap();
+        store.set_draft_options(&local, &high_flagged()).unwrap();
+        local
+    }
+
+    /// Every request `srv` received, as (method, path).
+    fn seen(srv: &FakeServer) -> Vec<(String, String)> {
+        srv.requests()
+            .into_iter()
+            .map(|r| (r.method, r.path))
+            .collect()
+    }
+
+    fn req(method: &str, path: &str) -> (String, String) {
+        (method.to_string(), path.to_string())
+    }
+
+    /// The addresses of a draft body's `field` recipients.
+    fn addresses(sent: &Value, field: &str) -> Vec<String> {
+        sent.get(field)
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|r| {
+                r.get("emailAddress")
+                    .and_then(|e| e.get("address"))
+                    .and_then(Value::as_str)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// `SendDraft` of a local answer draft of `kind` to `M1` makes
+    /// `action` on M1, PATCHes the stored fields over the draft it minted
+    /// (`minted`) and sends it, with no plain create; the local id
+    /// reconciles to `minted` and the row is clean after.
+    fn assert_answer_send(kind: DraftKind, action: &str, minted: &str) {
+        let srv = FakeServer::start(vec![
+            route("POST", &format!("/me/messages/{minted}/send"), 202, ""),
+            route(
+                "POST",
+                &format!("/me/messages/M1/{action}"),
+                201,
+                &draft_json(minted, "Re: Hi"),
+            ),
+            route("PATCH", &format!("/me/messages/{minted}"), 200, "{}"),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_with_m1();
+        let local = answer_draft(&store, "M1", kind);
+
+        apply_op(&c, &store, &OutboxOp::SendDraft { id: local.clone() }).unwrap();
+
+        assert_eq!(
+            seen(&srv),
+            vec![
+                req("POST", &format!("/me/messages/M1/{action}")),
+                req("PATCH", &format!("/me/messages/{minted}")),
+                req("POST", &format!("/me/messages/{minted}/send")),
+            ]
+        );
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].body, "", "createX carries no body");
+        let sent = json::parse(&reqs[1].body).unwrap();
+        assert_eq!(sent.get("subject").and_then(Value::as_str), Some("Re: Hi"));
+        assert_eq!(addresses(&sent, "toRecipients"), vec!["alice@x"]);
+        assert_eq!(addresses(&sent, "ccRecipients"), vec!["carol@x"]);
+        assert_eq!(addresses(&sent, "bccRecipients"), vec!["dan@x"]);
+        assert_eq!(
+            sent.get("body")
+                .and_then(|b| b.get("content"))
+                .and_then(Value::as_str),
+            Some("<p>mine</p>")
+        );
+        assert_eq!(
+            importance_and_flag(&reqs[1].body),
+            ("high".to_string(), HIGH_FLAGGED_FLAG.to_string())
+        );
+        let (row, _) = store.draft(&local).unwrap().unwrap();
+        assert_eq!(row.id, minted);
+        assert!(store.locally_edited_ids().unwrap().is_empty());
+        // Created: the link is gone with the first push.
+        assert_eq!(store.draft_answers(&local).unwrap(), None);
+    }
+
+    #[test]
+    fn send_of_a_local_reply_draft_creates_it_through_create_reply() {
+        assert_answer_send(DraftKind::Reply, "createReply", "R1");
+    }
+
+    #[test]
+    fn send_of_a_local_reply_all_draft_creates_it_through_create_reply_all() {
+        assert_answer_send(DraftKind::ReplyAll, "createReplyAll", "RA1");
+    }
+
+    #[test]
+    fn send_of_a_local_forward_draft_keeps_the_original_s_attachments() {
+        let srv = FakeServer::start(vec![
+            route("POST", "/me/messages/F1/send", 202, ""),
+            route("POST", "/me/messages/F1/attachments", 201, "{}"),
+            route(
+                "POST",
+                "/me/messages/M1/createForward",
+                201,
+                &draft_json("F1", "Fw: Hi"),
+            ),
+            route("PATCH", "/me/messages/F1", 200, "{}"),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_with_m1();
+        let local = answer_draft(&store, "M1", DraftKind::Forward);
+        store
+            .add_outbound_attachment_bytes(&local, "mine.png", "image/png", b"png", "img1")
+            .unwrap();
+
+        apply_op(&c, &store, &OutboxOp::SendDraft { id: local.clone() }).unwrap();
+
+        assert_eq!(
+            seen(&srv),
+            vec![
+                req("POST", "/me/messages/M1/createForward"),
+                req("PATCH", "/me/messages/F1"),
+                req("POST", "/me/messages/F1/attachments"),
+                req("POST", "/me/messages/F1/send"),
+            ]
+        );
+        // The PATCH leaves the attachments createForward copied alone: no
+        // DELETE, and the one attachment request is the draft's own upload.
+        let reqs = srv.requests();
+        assert!(reqs.iter().all(|r| r.method != "DELETE"));
+        let attachment_reqs: Vec<_> = reqs
+            .iter()
+            .filter(|r| r.path.starts_with("/me/messages/F1/attachments"))
+            .collect();
+        assert_eq!(attachment_reqs.len(), 1);
+        assert!(attachment_reqs[0].body.contains("mine.png"));
+        assert!(
+            json::parse(&reqs[1].body)
+                .unwrap()
+                .get("attachments")
+                .is_none()
+        );
+        assert_eq!(store.draft(&local).unwrap().unwrap().0.id, "F1");
+    }
+
+    #[test]
+    fn save_then_send_of_a_local_reply_draft_creates_it_once() {
+        let srv = FakeServer::start(vec![
+            route("POST", "/me/messages/R1/send", 202, ""),
+            route(
+                "POST",
+                "/me/messages/M1/createReply",
+                201,
+                &draft_json("R1", "Re: Hi"),
+            ),
+            route("PATCH", "/me/messages/R1", 200, "{}"),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_with_m1();
+        let local = answer_draft(&store, "M1", DraftKind::Reply);
+
+        apply_op(&c, &store, &OutboxOp::SaveDraft { id: local.clone() }).unwrap();
+        store
+            .update_draft_fields(&local, "Re: Hi", "alice@x", "", "", "<p>more</p>")
+            .unwrap();
+        apply_op(&c, &store, &OutboxOp::SendDraft { id: local.clone() }).unwrap();
+
+        assert_eq!(
+            seen(&srv),
+            vec![
+                req("POST", "/me/messages/M1/createReply"),
+                req("PATCH", "/me/messages/R1"),
+                req("PATCH", "/me/messages/R1"),
+                req("POST", "/me/messages/R1/send"),
+            ]
+        );
+        let reqs = srv.requests();
+        let second = json::parse(&reqs[2].body).unwrap();
+        assert_eq!(
+            second
+                .get("body")
+                .and_then(|b| b.get("content"))
+                .and_then(Value::as_str),
+            Some("<p>more</p>")
+        );
+        // The first push sent the flag; the second leaves the server's alone.
+        assert_eq!(
+            importance_and_flag(&reqs[2].body),
+            ("high".to_string(), "<none>".to_string())
+        );
+    }
+
+    #[test]
+    fn a_gone_original_falls_back_to_a_plain_create() {
+        let srv = FakeServer::start(vec![
+            route(
+                "POST",
+                "/me/messages/M1/createReply",
+                404,
+                r#"{"error":{}}"#,
+            ),
+            route("POST", "/me/messages/G1/send", 202, ""),
+            route("POST", "/me/messages", 201, &draft_json("G1", "Re: Hi")),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_with_m1();
+        let local = answer_draft(&store, "M1", DraftKind::Reply);
+
+        apply_op(&c, &store, &OutboxOp::SendDraft { id: local.clone() }).unwrap();
+
+        assert_eq!(
+            seen(&srv),
+            vec![
+                req("POST", "/me/messages/M1/createReply"),
+                req("POST", "/me/messages"),
+                req("POST", "/me/messages/G1/send"),
+            ]
+        );
+        let sent = json::parse(&srv.requests()[1].body).unwrap();
+        assert_eq!(addresses(&sent, "toRecipients"), vec!["alice@x"]);
+        assert_eq!(store.draft(&local).unwrap().unwrap().0.id, "G1");
+        // The plain create was the first push: the row's starting edit and
+        // its link are cleared with it.
+        assert!(store.locally_edited_ids().unwrap().is_empty());
+        assert_eq!(store.draft_answers(&local).unwrap(), None);
+    }
+
+    #[test]
+    fn an_original_still_local_falls_back_without_create_reply() {
+        let srv = FakeServer::start(vec![
+            route("POST", "/me/messages/G2/send", 202, ""),
+            route("POST", "/me/messages", 201, &draft_json("G2", "Re: Hi")),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let never_pushed = store.create_local_draft("Hi", "", "", "x").unwrap();
+        let local = answer_draft(&store, &never_pushed, DraftKind::Reply);
+
+        apply_op(&c, &store, &OutboxOp::SendDraft { id: local.clone() }).unwrap();
+
+        assert_eq!(
+            seen(&srv),
+            vec![
+                req("POST", "/me/messages"),
+                req("POST", "/me/messages/G2/send")
+            ]
+        );
+        assert!(store.locally_edited_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_original_reconciled_since_is_answered_under_its_graph_id() {
+        let srv = FakeServer::start(vec![
+            route("POST", "/me/messages/R3/send", 202, ""),
+            route(
+                "POST",
+                "/me/messages/GORIG/createReply",
+                201,
+                &draft_json("R3", "Re: Hi"),
+            ),
+            route("PATCH", "/me/messages/R3", 200, "{}"),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let first = store.create_local_draft("Hi", "", "", "x").unwrap();
+        let local = answer_draft(&store, &first, DraftKind::Reply);
+        store.reconcile_id(&first, "GORIG").unwrap();
+
+        apply_op(&c, &store, &OutboxOp::SendDraft { id: local }).unwrap();
+
+        assert_eq!(
+            seen(&srv),
+            vec![
+                req("POST", "/me/messages/GORIG/createReply"),
+                req("PATCH", "/me/messages/R3"),
+                req("POST", "/me/messages/R3/send"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_create_reply_leaves_the_draft_local() {
+        for status in [500, 403] {
+            let srv = FakeServer::start(vec![
+                route(
+                    "POST",
+                    "/me/messages/M1/createReply",
+                    status,
+                    r#"{"error":{}}"#,
+                ),
+                route("POST", "/me/messages", 201, &draft_json("G1", "Re: Hi")),
+            ]);
+            let c = GraphClient::new(&srv.base_url, "AT");
+            let store = store_with_m1();
+            let local = answer_draft(&store, "M1", DraftKind::Reply);
+            for op in [
+                OutboxOp::SaveDraft { id: local.clone() },
+                OutboxOp::SendDraft { id: local.clone() },
+            ] {
+                let err = apply_op(&c, &store, &op).unwrap_err();
+                assert!(
+                    matches!(err, GraphError::Http { status: s, .. } if s == status),
+                    "{status}: {err:?}"
+                );
+            }
+            assert_eq!(
+                seen(&srv),
+                vec![
+                    req("POST", "/me/messages/M1/createReply"),
+                    req("POST", "/me/messages/M1/createReply"),
+                ],
+                "{status}"
+            );
+            let (row, _) = store.draft(&local).unwrap().unwrap();
+            assert_eq!(row.id, local, "{status}");
+            assert_eq!(store.locally_edited_ids().unwrap(), vec![local.clone()]);
+        }
+    }
+
+    #[test]
+    fn a_failed_patch_after_create_reply_keeps_the_draft_guarded() {
+        let srv = FakeServer::start_limited(vec![
+            (
+                route(
+                    "POST",
+                    "/me/messages/M1/createReply",
+                    201,
+                    &draft_json("R1", "Re: Hi"),
+                ),
+                None,
+            ),
+            (route("PATCH", "/me/messages/R1", 500, "{}"), Some(1)),
+            (route("PATCH", "/me/messages/R1", 200, "{}"), None),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_with_m1();
+        // Created as a host's fallback does it: fields given once, never
+        // edited after, so only the starting edit guards the row.
+        let local = store
+            .create_local_answer_draft("M1", DraftKind::Reply, "Re: Hi", "bob@x", "", "<p>mine</p>")
+            .unwrap();
+        let save = OutboxOp::SaveDraft { id: local.clone() };
+
+        let err = apply_op(&c, &store, &save).unwrap_err();
+        assert!(
+            matches!(err, GraphError::Http { status: 500, .. }),
+            "{err:?}"
+        );
+        assert_eq!(store.draft(&local).unwrap().unwrap().0.id, "R1");
+        assert_eq!(store.locally_edited_ids().unwrap(), vec!["R1".to_string()]);
+
+        // A fresh delta of Graph's pre-filled copy leaves the row alone.
+        let folder = store.draft("R1").unwrap().unwrap().0.folder_id;
+        let mut server = original("R1");
+        server.subject = "RE: Hi".into();
+        server.is_draft = true;
+        assert!(
+            !store
+                .merge_message_unless_edited(
+                    &folder,
+                    &server,
+                    &crate::graph::model::MessageFields::all()
+                )
+                .unwrap()
+        );
+        // So does a delta on a stored link (#1871 leaves a plain draft's
+        // edit to those), and the link is still there.
+        let mut moved = server.clone();
+        moved.to = vec![Recipient {
+            name: "Eve".into(),
+            address: "eve@x".into(),
+        }];
+        store
+            .merge_message("F", &moved, &crate::graph::model::MessageFields::all())
+            .unwrap();
+        let (row, body) = store.draft("R1").unwrap().unwrap();
+        assert_eq!(row.subject, "Re: Hi");
+        assert_eq!(row.to_recipients, "bob@x");
+        assert_eq!(row.folder_id, folder);
+        assert_eq!(body.content, "<p>mine</p>");
+        assert!(store.draft_answers(&local).unwrap().is_some());
+
+        // The retry PATCHes the draft it has, never a second create.
+        apply_op(&c, &store, &save).unwrap();
+        assert_eq!(
+            seen(&srv),
+            vec![
+                req("POST", "/me/messages/M1/createReply"),
+                req("PATCH", "/me/messages/R1"),
+                req("PATCH", "/me/messages/R1"),
+            ]
+        );
+        let retry = json::parse(&srv.requests()[2].body).unwrap();
+        assert_eq!(addresses(&retry, "toRecipients"), vec!["bob@x"]);
+        assert_eq!(retry.get("subject").and_then(Value::as_str), Some("Re: Hi"));
+        assert!(store.locally_edited_ids().unwrap().is_empty());
+        assert_eq!(store.draft_answers(&local).unwrap(), None);
+    }
+
+    #[test]
+    fn a_moved_original_is_answered_under_its_new_id() {
+        let srv = FakeServer::start(vec![
+            route("POST", "/me/messages/R1/send", 202, ""),
+            route(
+                "POST",
+                "/me/messages/M1NEW/createReply",
+                201,
+                &draft_json("R1", "Re: Hi"),
+            ),
+            route("PATCH", "/me/messages/R1", 200, "{}"),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = store_with_m1();
+        let local = answer_draft(&store, "M1", DraftKind::Reply);
+        assert!(store.follow_move("M1", "M1NEW").unwrap());
+
+        apply_op(&c, &store, &OutboxOp::SendDraft { id: local }).unwrap();
+
+        assert_eq!(
+            seen(&srv),
+            vec![
+                req("POST", "/me/messages/M1NEW/createReply"),
+                req("PATCH", "/me/messages/R1"),
+                req("POST", "/me/messages/R1/send"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_queued_send_of_a_local_reply_draft_threads_after_a_reopen() {
+        let dir = temp_dir("answer-reopen");
+        let path = dir.join("mail.db");
+        let local = {
+            let store = Store::open(&path).unwrap();
+            store
+                .upsert_folder(&MailFolder {
+                    id: "F".into(),
+                    display_name: "F".into(),
+                    parent_id: None,
+                    total_count: 0,
+                    unread_count: 0,
+                    well_known_name: None,
+                })
+                .unwrap();
+            store.upsert_message("F", &original("M1")).unwrap();
+            let local = answer_draft(&store, "M1", DraftKind::Reply);
+            store
+                .enqueue_op(&OutboxOp::SendDraft { id: local.clone() })
+                .unwrap();
+            local
+        };
+        let srv = FakeServer::start(vec![
+            route("POST", "/me/messages/R1/send", 202, ""),
+            route(
+                "POST",
+                "/me/messages/M1/createReply",
+                201,
+                &draft_json("R1", "Re: Hi"),
+            ),
+            route("PATCH", "/me/messages/R1", 200, "{}"),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(
+                store.draft_answers(&local).unwrap(),
+                Some(("M1".to_string(), DraftKind::Reply))
+            );
+            let queued = store.pending_ops().unwrap();
+            assert_eq!(queued.len(), 1);
+            apply_op(&c, &store, &queued[0].op).unwrap();
+        }
+        assert_eq!(
+            seen(&srv),
+            vec![
+                req("POST", "/me/messages/M1/createReply"),
+                req("PATCH", "/me/messages/R1"),
+                req("POST", "/me/messages/R1/send"),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

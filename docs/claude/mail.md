@@ -5287,3 +5287,98 @@ document it). The engine handed that error, or a throttle, offline or refused to
   `engine.rs` `mark_read_reports_a_failed_local_write_and_still_enqueues_2209`. That test
   refuses the write with a trigger, not a held lock: `enqueue_op` shares the connection,
   so a held lock would refuse the op too.
+
+## A local reply or forward draft threads (#2212)
+
+A host waits a bounded time for `ComposeReply` / `ComposeForward`'s `DraftReady`. When
+Graph's `createReply` / `createReplyAll` / `createForward` is slow, it falls back to a
+local draft holding the recipients, subject and quoted body it built itself. Before #2212
+the `SaveDraft` or `SendDraft` of that draft created it with `POST /me/messages`, so a
+reply went out unthreaded and a forward without the original's attachments.
+
+- `Store::create_local_answer_draft(original, kind, subject, to, cc, body_html)` is
+  `create_local_draft` (one shared insert, `insert_local_draft`) that also records the
+  link: `messages.answers_id` (the original's id as the host holds it, unresolved) and
+  `answers_kind` (`DraftKind::as_stored`: `reply`, `replyAll`, `forward`). Both columns
+  are `TEXT NOT NULL DEFAULT ''`. An old file gets them in `Store::init` with no delta
+  reset, as only local drafts made here carry them. They are not in
+  `MESSAGE_ROW_COLUMNS`: `Store::draft_answers(id)` reads them, by a `local:` id still
+  after `reconcile_id`, and gives `None` for no link or a kind this build does not read.
+  The link survives a restart, so a queued send still threads. It only says how to create
+  the draft on Graph: the draft's first successful push forgets it
+  (`Store::clear_draft_answers`, from `mark_pushed`, after the answer's PATCH or the
+  fallback's plain create), and `draft_answers` is `None` from then on.
+- `DraftKind` moved to `graph::model`, as the store needs it.
+  `mailcore::sync::engine::DraftKind` re-exports it.
+- In the same transaction the row gets what the server draft would have (#2096): the
+  original's `conversation_id` and, for a reply, its `internet_message_id` as
+  `in_reply_to`, so `reply_draft_links` marks the original at once. The original is read
+  through `current_id_on`; a missing row leaves both `""`.
+- The row starts at `local_edit = 1`. It is reconciled to the answer draft's id before
+  the PATCH, and until the PATCH lands Graph's copy holds the pre-filled recipients,
+  subject, flag and quoted body. So until then **no delta merge writes the row**, on a
+  stored link as well as a fresh one (review r1). `merge_message_guarded`'s
+  `DO UPDATE … WHERE` leaves alone a row with `answers_id <> ''` and `local_edit > 0`,
+  whatever its `guard`. The starting edit also keeps a body fetch
+  (`fetched_body_is_kept_on`) off the person's body. The first successful push clears
+  both the edit and the link (`mark_pushed`), on the fallback create too, so from then on
+  the draft is merged as any draft is. #1871's policy is unchanged for every other row:
+  a delta on a stored link still writes a plain draft's unsaved edit. A plain
+  `create_local_draft` still starts at 0, as its create sends the same fields Graph then
+  holds. A skipped merge returns as a write does (`merge_message` is `Ok`), so a header
+  repair or a search hit only reads as changed.
+- `ensure_draft_on_graph` (`SaveDraft` and `SendDraft`): for a `local:` row,
+  `answer_target` reads the link and resolves the original with `Store::current_id`
+  (#1896: a moved original, or a `local:` one reconciled since). A link and a Graph id
+  lead to `create_answer` (`create_reply(_, false)`, `create_reply(_, true)` or
+  `create_forward`). It then runs `reconcile_id` to the minted id and `update_draft` with
+  every stored field and the flag (`send_flag = true`, as on any first push), then
+  `mark_pushed`. A PATCH that fails is retried as a PATCH of that id, never as a second
+  create. The PATCH touches no attachments, so a forward keeps what `createForward`
+  copied. `apply_send` then uploads the draft's own pending attachments and `/send`s, as
+  before.
+- Fallback to the plain `POST /me/messages`: only when the original never reached Graph
+  (it still resolves to `local:`, so no request) or `createX` answers **404** (the
+  original is gone). The mail still goes, unthreaded.
+- Any other failure of the create is returned with the draft still `local:`, and the
+  drain's policy applies: 401 re-auth, throttle, transport and 5xx keep the op queued.
+  Another 4xx is refused: a `SendDraft` goes to `fail_send`, `SendFailed` with Graph's
+  message and the draft back in Drafts, while a `SaveDraft` is retried until quarantine.
+  A 403 does not fall back on purpose. The usual permanent refusal is a rights-protected
+  ("Do Not Forward") original, and sending the client's quoted copy of it as a fresh
+  message would route around that protection. Such a draft cannot be sent until the host
+  makes a plain draft of it.
+- A draft that fell back keeps its local `in_reply_to`, because a merge never clears a
+  stored one (#2096). So `reply_draft_links` marks the original until the draft is sent
+  or discarded. That is harmless for a gone original and rare for a `local:` one.
+- Not done: no host change. lookxy waits for `DraftReady` with no timeout, so it never
+  makes a local answer draft; a host that does calls `create_local_answer_draft`. There is
+  no setter linking an existing local draft. A store error in `reconcile_id` after a
+  successful create leaves an orphan Graph draft, as the plain create already could. The
+  client deletes a server draft that arrives after its form was sent.
+- Tests:
+  - `graph/model.rs`: `draft_kind_stored_forms_round_trip_and_unknown_is_none`.
+  - `store/mod.rs`: `create_local_answer_draft_stores_its_link`,
+    `create_local_answer_draft_of_a_missing_original_still_stores_the_link`,
+    `draft_answers_reaches_a_reconciled_local_id`,
+    `draft_answers_reads_none_for_a_plain_draft_and_an_unknown_kind`,
+    `a_database_from_before_draft_answers_reads_no_link`,
+    `no_merge_writes_an_answer_draft_before_its_first_push`,
+    `a_link_round_merge_still_writes_an_edited_plain_draft`,
+    `clear_draft_answers_of_a_plain_draft_or_no_row_changes_nothing`;
+    `upsert_writes_every_column` covers the two columns.
+  - `outbox.rs`: `send_of_a_local_reply_draft_creates_it_through_create_reply`,
+    `send_of_a_local_reply_all_draft_creates_it_through_create_reply_all`,
+    `send_of_a_local_forward_draft_keeps_the_original_s_attachments`,
+    `save_then_send_of_a_local_reply_draft_creates_it_once`,
+    `a_gone_original_falls_back_to_a_plain_create`,
+    `an_original_still_local_falls_back_without_create_reply`,
+    `an_original_reconciled_since_is_answered_under_its_graph_id`,
+    `a_failed_create_reply_leaves_the_draft_local` (500 and 403),
+    `a_failed_patch_after_create_reply_keeps_the_draft_guarded`,
+    `a_moved_original_is_answered_under_its_new_id`,
+    `a_queued_send_of_a_local_reply_draft_threads_after_a_reopen`.
+  - `engine.rs`: `a_send_of_a_local_reply_draft_behind_a_slow_compose_reply_threads`,
+    `a_refused_create_reply_fails_the_send_back_to_drafts`,
+    `a_create_reply_5xx_keeps_the_send_queued` (500 and 503),
+    `a_link_round_during_a_failed_patch_keeps_the_answer_draft_s_fields`.

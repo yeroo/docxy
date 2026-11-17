@@ -84,6 +84,16 @@ CREATE TABLE IF NOT EXISTS messages (
     -- date other than the due) survives a plain save. An old file gets it
     -- in `Store::init`, with no delta reset.
     draft_options_set INTEGER NOT NULL DEFAULT 0,
+    -- The message a local answer draft answers and how (#2212): the
+    -- original's id as `Store::create_local_answer_draft` was given it
+    -- (resolved with `Store::current_id` when the outbox uses it) and
+    -- `DraftKind::as_stored` (`reply`, `replyAll`, `forward`); `''` for
+    -- every other row. The outbox creates such a draft through
+    -- `createReply` / `createReplyAll` / `createForward`. An old file gets
+    -- them in `Store::init`, with no delta reset: only local drafts made
+    -- here carry them.
+    answers_id        TEXT NOT NULL DEFAULT '',
+    answers_kind      TEXT NOT NULL DEFAULT '',
     -- A flagged message's Outlook reminder (#2054): on (never on an
     -- unflagged row), the time it was set for and when it fires next, and
     -- the flag's due time, all `YYYY-MM-DDTHH:MM:SSZ` or ''. An old file

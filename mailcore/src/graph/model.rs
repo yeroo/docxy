@@ -105,6 +105,43 @@ impl Importance {
     }
 }
 
+/// The answer a draft is made as (#2085): what
+/// `sync::engine::SyncEvent::DraftReady` names, and what a local answer
+/// draft's row stores (`Store::create_local_answer_draft`, #2212), so the
+/// outbox creates it on Graph through the answer's own endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftKind {
+    /// A reply to the sender: `ComposeReply { all: false }` (`createReply`).
+    Reply,
+    /// A reply to the sender and every recipient: `ComposeReply { all: true }`
+    /// (`createReplyAll`).
+    ReplyAll,
+    /// A forward: `ComposeForward` (`createForward`).
+    Forward,
+}
+
+impl DraftKind {
+    /// The word the store keeps for it (`messages.answers_kind`, #2212).
+    pub fn as_stored(self) -> &'static str {
+        match self {
+            DraftKind::Reply => "reply",
+            DraftKind::ReplyAll => "replyAll",
+            DraftKind::Forward => "forward",
+        }
+    }
+
+    /// A stored word read back (#2212): exactly one of `as_stored`'s, else
+    /// `None`, which reads as "answers nothing", never as an error.
+    pub fn from_stored(s: &str) -> Option<Self> {
+        match s {
+            "reply" => Some(DraftKind::Reply),
+            "replyAll" => Some(DraftKind::ReplyAll),
+            "forward" => Some(DraftKind::Forward),
+            _ => None,
+        }
+    }
+}
+
 /// What a draft carries besides its subject, recipients and body (#1955):
 /// what `Store::set_draft_options` stores on the draft's row and
 /// `GraphClient::create_draft` / `update_draft` send with it.
@@ -2937,6 +2974,19 @@ mod tests {
             assert_eq!(Importance::from_stored(i.as_graph()), i);
         }
         assert_eq!(Importance::default(), Importance::Normal);
+    }
+
+    #[test]
+    fn draft_kind_stored_forms_round_trip_and_unknown_is_none() {
+        for k in [DraftKind::Reply, DraftKind::ReplyAll, DraftKind::Forward] {
+            assert_eq!(DraftKind::from_stored(k.as_stored()), Some(k));
+        }
+        assert_eq!(DraftKind::Reply.as_stored(), "reply");
+        assert_eq!(DraftKind::ReplyAll.as_stored(), "replyAll");
+        assert_eq!(DraftKind::Forward.as_stored(), "forward");
+        for unknown in ["", "Reply", "replyall", " reply", "fwd"] {
+            assert_eq!(DraftKind::from_stored(unknown), None, "{unknown:?}");
+        }
     }
 
     #[test]
