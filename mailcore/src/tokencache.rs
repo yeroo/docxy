@@ -31,7 +31,7 @@
 //! which keeps the token in the file, or they get the developer's keyring
 //! (on Linux, the Secret Service over the session bus).
 
-use crate::auth::TokenSet;
+use crate::auth::{Cloud, TokenSet};
 use crate::json::{self, Value};
 use std::fs;
 use std::io;
@@ -355,10 +355,10 @@ pub(crate) fn load_in(
             return Ok(None);
         };
         let text = String::from_utf8(secret).map_err(invalid)?;
-        let t = token_from(&json::parse(&text).map_err(invalid)?);
+        let t = token_from(&json::parse(&text).map_err(invalid)?)?;
         return Ok(Some((t, Storage::SecretStore)));
     }
-    let t = token_from(&v);
+    let t = token_from(&v)?;
     if let Some(store) = store
         && let Ok(key) = store_key(path)
     {
@@ -462,6 +462,8 @@ fn token_json(t: &TokenSet) -> String {
             Value::Num(t.expires_at_unix as f64),
         ),
         ("account".to_string(), Value::Str(t.account.clone())),
+        // The cloud that issued it (#2225).
+        ("cloud".to_string(), Value::Str(t.cloud.name().to_string())),
     ];
     // Unknown scopes are saved by leaving the key out, so they load as
     // unknown again (#1875).
@@ -476,8 +478,11 @@ fn token_json(t: &TokenSet) -> String {
 
 /// The token set in token JSON. A cache without `scopes` (saved before
 /// #1875), or whose `scopes` is not an array of strings, loads with
-/// `scopes: None` (unknown), never an error.
-fn token_from(v: &Value) -> TokenSet {
+/// `scopes: None` (unknown), never an error. A cache without `cloud`
+/// (saved before #2225) is [`Cloud::Global`]'s; a `cloud` that is not a
+/// [`Cloud::name`] (another mailcore's cloud, or not a string) is an
+/// `InvalidData` error: the token is never used against a guessed cloud.
+fn token_from(v: &Value) -> io::Result<TokenSet> {
     let text = |k: &str| {
         v.get(k)
             .and_then(Value::as_str)
@@ -490,7 +495,14 @@ fn token_from(v: &Value) -> TokenSet {
             .map(|s| s.as_str().map(str::to_string))
             .collect::<Option<Vec<String>>>()
     });
-    TokenSet {
+    let cloud = match v.get("cloud") {
+        None => Cloud::Global,
+        Some(c) => c
+            .as_str()
+            .and_then(Cloud::from_name)
+            .ok_or_else(|| invalid("the saved sign-in names an unknown cloud"))?,
+    };
+    Ok(TokenSet {
         access_token: text("access_token"),
         refresh_token: text("refresh_token"),
         expires_at_unix: v
@@ -500,7 +512,8 @@ fn token_from(v: &Value) -> TokenSet {
             .max(0) as u64,
         account: text("account"),
         scopes,
-    }
+        cloud,
+    })
 }
 
 fn invalid(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
@@ -519,6 +532,13 @@ fn read_file(path: &Path) -> io::Result<Option<Value>> {
     let plaintext = unprotect(&ciphertext)?;
     let text = String::from_utf8(plaintext).map_err(invalid)?;
     json::parse(&text).map(Some).map_err(invalid)
+}
+
+/// [`write_file`] for another module's tests: a token cache exactly as
+/// `text` spells it, such as one an earlier mailcore wrote.
+#[cfg(test)]
+pub(crate) fn write_raw(path: &Path, text: &str) -> io::Result<()> {
+    write_file(path, text)
 }
 
 /// Encrypts `text` via [`protect`] and writes it atomically to `path`
@@ -728,6 +748,7 @@ mod tests {
             expires_at_unix: 123,
             account: "me@epam.com".into(),
             scopes: None,
+            cloud: Cloud::Global,
         };
         save(&p, &t).unwrap();
         let got = load(&p).unwrap().unwrap();
@@ -755,6 +776,7 @@ mod tests {
             expires_at_unix: 1,
             account: "".into(),
             scopes: None,
+            cloud: Cloud::Global,
         };
         save(&p, &t).unwrap();
         let raw = std::fs::read(&p).unwrap();
@@ -776,6 +798,7 @@ mod tests {
             expires_at_unix: 123,
             account: "me@x".into(),
             scopes: None,
+            cloud: Cloud::Global,
         }
     }
 
@@ -950,7 +973,7 @@ mod tests {
         }
     }
 
-    type Fields = (String, String, u64, String, Option<Vec<String>>);
+    type Fields = (String, String, u64, String, Option<Vec<String>>, Cloud);
 
     /// `t`'s fields, comparable (`TokenSet` has no `Debug`, so a token is
     /// never printed).
@@ -961,6 +984,7 @@ mod tests {
             t.expires_at_unix,
             t.account.clone(),
             t.scopes.clone(),
+            t.cloud,
         )
     }
 
@@ -971,6 +995,7 @@ mod tests {
             expires_at_unix: 77,
             account: "me@x".into(),
             scopes: Some(vec!["Mail.ReadWrite".into(), "openid".into()]),
+            cloud: Cloud::Global,
         }
     }
 
@@ -1141,7 +1166,7 @@ mod tests {
             assert!(store.items.borrow().is_empty());
             let v = file_json(&p);
             assert!(v.get("secret_store").is_none());
-            assert_eq!(fields(&token_from(&v)), fields(&t));
+            assert_eq!(fields(&token_from(&v).unwrap()), fields(&t));
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -1496,6 +1521,91 @@ mod tests {
             assert_eq!(fs::read(&p).unwrap(), before);
         }
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- A saved token's cloud (#2225) -----------------------------------
+
+    /// AC 6: the cloud is saved inside the token JSON, in the file and in
+    /// the store's item, and loads back.
+    #[test]
+    fn token_records_its_cloud() {
+        let dir = test_dir("cloud");
+        let p = dir.join("token.bin");
+        for cloud in Cloud::ALL {
+            let t = TokenSet { cloud, ..sample() };
+            // The token file.
+            save_in(&p, &t, None).unwrap();
+            assert_eq!(
+                file_json(&p).get("cloud").and_then(Value::as_str),
+                Some(cloud.name())
+            );
+            assert_eq!(load(&p).unwrap().unwrap().cloud, cloud);
+            // The store's item, behind a reference that names no cloud.
+            let store = FakeStore::new();
+            save_in(&p, &t, Some(&store)).unwrap();
+            assert!(file_json(&p).get("cloud").is_none());
+            let item = store.secret(&key_of(&p)).expect("an item");
+            assert!(
+                item.contains(&format!(r#""cloud":"{}""#, cloud.name())),
+                "{cloud:?}"
+            );
+            let (got, _) = load_in(&p, Some(&store)).unwrap().unwrap();
+            assert_eq!(got.cloud, cloud);
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// AC 6: a cache written before #2225 (no `cloud`) is the global
+    /// cloud's, as a file and as a store item.
+    #[test]
+    fn token_without_cloud_loads_as_global() {
+        let dir = test_dir("no-cloud");
+        let p = dir.join("token.bin");
+        let old = r#"{"access_token":"AT","refresh_token":"RT","expires_at_unix":123,"account":"me@x","scopes":["Mail.Read"]}"#;
+        std::fs::write(&p, protect(old.as_bytes()).unwrap()).unwrap();
+        let got = load(&p).unwrap().expect("loads");
+        assert_eq!(got.cloud, Cloud::Global);
+        assert_eq!(got.refresh_token, "RT");
+        let store = FakeStore::new();
+        store
+            .items
+            .borrow_mut()
+            .insert(key_of(&p), ("label".into(), old.as_bytes().to_vec()));
+        write_file(&p, &reference_json("fake", &key_of(&p), "me@x")).unwrap();
+        let (got, _) = load_in(&p, Some(&store)).unwrap().unwrap();
+        assert_eq!(got.cloud, Cloud::Global);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// AC 6: a `cloud` this mailcore does not know, or not a string, is an
+    /// unreadable cache, never a guess. A token file is not migrated into
+    /// the store then.
+    #[test]
+    fn token_with_unknown_cloud_is_unreadable() {
+        let dir = test_dir("bad-cloud");
+        let p = dir.join("token.bin");
+        for cloud in [r#""mars""#, r#""Global""#, "1", "null", r#"["usgov"]"#] {
+            let json = format!(
+                r#"{{"access_token":"AT","refresh_token":"RT","expires_at_unix":1,"account":"","cloud":{cloud}}}"#
+            );
+            std::fs::write(&p, protect(json.as_bytes()).unwrap()).unwrap();
+            let e = load(&p).err().expect("an error");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{cloud}");
+            assert!(!e.to_string().contains("RT"), "{e}");
+            let store = FakeStore::new();
+            let e = load_in(&p, Some(&store)).err().expect("an error");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{cloud}");
+            assert_eq!(store.sets.get(), 0, "{cloud}: not migrated");
+            // Nor as a store item.
+            store
+                .items
+                .borrow_mut()
+                .insert(key_of(&p), ("label".into(), json.as_bytes().to_vec()));
+            write_file(&p, &reference_json("fake", &key_of(&p), "")).unwrap();
+            let e = load_in(&p, Some(&store)).err().expect("an error");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{cloud}");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

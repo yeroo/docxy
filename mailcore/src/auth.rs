@@ -13,9 +13,74 @@ use crate::pkce::{self, Pkce};
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The Microsoft cloud a tenant lives in (#2225): where it signs in and
+/// where its Graph is. Tokens of one cloud are not accepted by another, so
+/// a saved sign-in records its cloud ([`TokenSet::cloud`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum Cloud {
+    /// Microsoft's global cloud (`login.microsoftonline.com`,
+    /// `graph.microsoft.com`).
+    #[default]
+    Global,
+    /// US Government L4 (GCC High).
+    UsGov,
+    /// US Government L5 (DoD). Shares its login host with [`Cloud::UsGov`],
+    /// so the cloud cannot be told from the authority.
+    UsGovDod,
+    /// China, operated by 21Vianet.
+    China,
+}
+
+impl Cloud {
+    /// Every cloud mailcore knows.
+    pub const ALL: [Cloud; 4] = [Cloud::Global, Cloud::UsGov, Cloud::UsGovDod, Cloud::China];
+
+    /// The cloud's Entra ID login host, the base of `/authorize` and the
+    /// token endpoint (no trailing slash).
+    pub fn login_host(self) -> &'static str {
+        match self {
+            Cloud::Global => "https://login.microsoftonline.com",
+            Cloud::UsGov | Cloud::UsGovDod => "https://login.microsoftonline.us",
+            Cloud::China => "https://login.chinacloudapi.cn",
+        }
+    }
+
+    /// The cloud's Microsoft Graph root (no trailing slash, no version):
+    /// the Graph base is this + `/v1.0`, and a Graph scope spelled with a
+    /// root carries this one.
+    pub fn graph_root(self) -> &'static str {
+        match self {
+            Cloud::Global => "https://graph.microsoft.com",
+            Cloud::UsGov => "https://graph.microsoft.us",
+            Cloud::UsGovDod => "https://dod-graph.microsoft.us",
+            Cloud::China => "https://microsoftgraph.chinacloudapi.cn",
+        }
+    }
+
+    /// The name a saved token records (`"global"`, `"usgov"`, `"usgovdod"`,
+    /// `"china"`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Cloud::Global => "global",
+            Cloud::UsGov => "usgov",
+            Cloud::UsGovDod => "usgovdod",
+            Cloud::China => "china",
+        }
+    }
+
+    /// The cloud [`Cloud::name`] names (exactly); `None` for any other text.
+    pub fn from_name(name: &str) -> Option<Cloud> {
+        Cloud::ALL.into_iter().find(|c| c.name() == name)
+    }
+}
+
 /// Which tenant/app registration/scopes to authenticate against.
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
+    /// Names the tenant: its last path segment (`…/organizations`,
+    /// `…/<tenant id>`). Its host is not used; the login host is
+    /// `cloud`'s.
     pub authority: String,
     pub client_id: String,
     /// The scopes the client needs (space-separated).
@@ -29,6 +94,9 @@ pub struct AuthConfig {
     /// refresh asks for an optional scope only once it was granted
     /// ([`refresh_scope_for`]).
     pub optional_scope: String,
+    /// The Microsoft cloud to sign in to and sync with (#2225): its login
+    /// host and Graph root. [`Cloud::Global`] by default.
+    pub cloud: Cloud,
 }
 
 impl Default for AuthConfig {
@@ -41,6 +109,7 @@ impl Default for AuthConfig {
             client_id: "14d82eec-204b-4c2f-b7e8-296a70dab67e".to_string(),
             scope: "Mail.ReadWrite People.Read offline_access".to_string(),
             optional_scope: String::new(),
+            cloud: Cloud::Global,
         }
     }
 }
@@ -52,11 +121,16 @@ pub struct TokenSet {
     pub expires_at_unix: u64,
     pub account: String,
     /// The scopes the token was granted, as the token response's `scope`
-    /// spelled them (Graph scopes usually carry the
-    /// `https://graph.microsoft.com/` prefix). `None` is unknown: a response
-    /// without `scope` (or an empty one), or a cache saved before #1875.
-    /// Compare them with [`missing_scopes`].
+    /// spelled them (Graph scopes usually carry the cloud's Graph root as a
+    /// prefix, `https://graph.microsoft.com/` in the global cloud). `None`
+    /// is unknown: a response without `scope` (or an empty one), or a cache
+    /// saved before #1875. Compare them with [`missing_scopes`].
     pub scopes: Option<Vec<String>>,
+    /// The cloud that issued the token (#2225): the `AuthConfig::cloud` of
+    /// the sign-in or refresh. A cache saved before #2225 loads as
+    /// [`Cloud::Global`]. The engine never uses a token of another cloud
+    /// than its own.
+    pub cloud: Cloud,
 }
 
 /// Everything needed to drive the browser through `/authorize` and match up
@@ -245,9 +319,13 @@ pub fn begin_auth(cfg: &AuthConfig, redirect_uri: &str) -> AuthRequest {
 }
 
 /// [`begin_auth`] asking `scope` (space-separated) instead (#2218): the
-/// engine's consent fallback asks `cfg.scope` alone.
+/// engine's consent fallback asks `cfg.scope` alone. The URL is on
+/// `cfg.cloud`'s login host (#2225), and the scopes asked are the wire
+/// scope of `scope` ([`wire_scope`]).
 pub fn begin_auth_with_scope(cfg: &AuthConfig, redirect_uri: &str, scope: &str) -> AuthRequest {
     let tenant = tenant_of(&cfg.authority);
+    let scope = wire_scope(cfg.cloud, scope);
+    let scope = scope.as_str();
     let pkce = Pkce::generate();
     // Reuse the same OS-randomness-backed generator for the anti-CSRF
     // `state` value; only its verifier (32 random bytes, base64url) is
@@ -265,8 +343,10 @@ pub fn begin_auth_with_scope(cfg: &AuthConfig, redirect_uri: &str, scope: &str) 
         ("code_challenge_method", "S256"),
         ("prompt", "select_account"),
     ]);
-    let authorize_url =
-        format!("https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize?{query}");
+    let authorize_url = format!(
+        "{}/{tenant}/oauth2/v2.0/authorize?{query}",
+        cfg.cloud.login_host()
+    );
 
     AuthRequest {
         authorize_url,
@@ -280,7 +360,8 @@ pub fn begin_auth_with_scope(cfg: &AuthConfig, redirect_uri: &str, scope: &str) 
 /// Redeems the authorization code returned on the loopback redirect for a
 /// token set, asking the scopes `req`'s `/authorize` asked
 /// ([`AuthRequest::scope`], #2218). `http_base` is normally
-/// `https://login.microsoftonline.com`; tests point it at a fake server.
+/// `cfg.cloud`'s login host ([`Cloud::login_host`]); tests point it at a
+/// fake server.
 pub fn redeem_code(
     cfg: &AuthConfig,
     http_base: &str,
@@ -314,14 +395,14 @@ pub fn redeem_code(
 /// its next refresh. Asked only for the grant, the token keeps working and
 /// the new scope is reported missing (`SyncEvent::Scopes`); the interactive
 /// sign-in ([`begin_auth`], [`redeem_code`]) still asks [`sign_in_scope`]
-/// in full.
+/// in full. The scopes are sent as their wire scope ([`wire_scope`]).
 pub fn refresh(
     cfg: &AuthConfig,
     http_base: &str,
     refresh_token: &str,
     granted: Option<&[String]>,
 ) -> Result<TokenSet, AuthError> {
-    let scope = refresh_scope_for(cfg, granted);
+    let scope = wire_scope(cfg.cloud, &refresh_scope_for(cfg, granted));
     let body = pkce::form_urlencode(&[
         ("grant_type", "refresh_token"),
         ("client_id", cfg.client_id.as_str()),
@@ -354,7 +435,7 @@ fn post_token(
         Err(ureq::Error::Transport(t)) => return Err(AuthError::Http(t.to_string())),
     };
 
-    parse_token_response(&response_body, fallback_refresh_token)
+    parse_token_response(&response_body, fallback_refresh_token, cfg.cloud)
 }
 
 /// Interprets a non-2xx token-endpoint response. Entra ID error bodies are
@@ -380,7 +461,11 @@ fn classify_error(status: u16, body: &str) -> AuthError {
     }
 }
 
-fn parse_token_response(body: &str, fallback_refresh_token: &str) -> Result<TokenSet, AuthError> {
+fn parse_token_response(
+    body: &str,
+    fallback_refresh_token: &str,
+    cloud: Cloud,
+) -> Result<TokenSet, AuthError> {
     let v = json::parse(body).map_err(|e| AuthError::Parse(e.to_string()))?;
 
     let access_token = v
@@ -422,6 +507,7 @@ fn parse_token_response(body: &str, fallback_refresh_token: &str) -> Result<Toke
         expires_at_unix,
         account,
         scopes,
+        cloud,
     })
 }
 
@@ -436,18 +522,59 @@ fn split_scopes(scope: &str) -> Option<Vec<String>> {
     (!scopes.is_empty()).then_some(scopes)
 }
 
-/// The prefix Microsoft puts on the Graph scopes it grants.
-const GRAPH_RESOURCE: &str = "https://graph.microsoft.com/";
+/// The length of the Graph root + `/` that `scope` starts with
+/// (case-insensitively), of any cloud ([`Cloud::graph_root`]), with that
+/// cloud; `None` when it starts with none.
+fn graph_root_of(scope: &str) -> Option<(Cloud, usize)> {
+    Cloud::ALL.into_iter().find_map(|cloud| {
+        // Bytes, so a scope with non-ASCII text is never cut inside a
+        // character; the root and `/` are ASCII, so `n` is a boundary.
+        let (root, bytes) = (cloud.graph_root().as_bytes(), scope.as_bytes());
+        (bytes.len() > root.len()
+            && bytes[..root.len()].eq_ignore_ascii_case(root)
+            && bytes[root.len()] == b'/')
+            .then_some((cloud, root.len() + 1))
+    })
+}
 
-/// A scope as compared: ASCII-lowercased, without a leading
-/// `https://graph.microsoft.com/` (matched case-insensitively), so
-/// `Mail.ReadWrite` and `https://graph.microsoft.com/Mail.ReadWrite` are
-/// the same scope.
+/// A scope as compared: ASCII-lowercased, without a leading Graph root +
+/// `/` of any cloud (matched case-insensitively; #2225), so
+/// `Mail.ReadWrite`, `https://graph.microsoft.com/Mail.ReadWrite` and
+/// `https://graph.microsoft.us/Mail.ReadWrite` are the same scope. A grant
+/// carries its own cloud's root only, so stripping every cloud's keeps
+/// [`missing_scopes`] free of the configured cloud.
 pub(crate) fn normalise_scope(scope: &str) -> String {
-    let lower = scope.to_ascii_lowercase();
-    match lower.strip_prefix(GRAPH_RESOURCE) {
-        Some(rest) => rest.to_string(),
-        None => lower,
+    let rest = match graph_root_of(scope) {
+        Some((_, n)) => &scope[n..],
+        None => scope,
+    };
+    rest.to_ascii_lowercase()
+}
+
+/// The scopes as sent to `cloud`'s `/authorize` and token endpoint
+/// (#2225). Microsoft's national-cloud docs: a scope spelled with a Graph
+/// root must use the cloud's own Graph root, and short names
+/// (`Mail.ReadWrite`) are valid as they are. So each space-separated
+/// scope that starts with another cloud's Graph root + `/` gets `cloud`'s
+/// root instead; every other scope is kept. When none is rewritten,
+/// `scope` comes back byte for byte (a global caller's requests are as
+/// before); otherwise the scopes are joined with single spaces.
+pub(crate) fn wire_scope(cloud: Cloud, scope: &str) -> String {
+    let mut rewritten = false;
+    let scopes: Vec<String> = scope
+        .split_ascii_whitespace()
+        .map(|s| match graph_root_of(s) {
+            Some((of, n)) if of != cloud => {
+                rewritten = true;
+                format!("{}/{}", cloud.graph_root(), &s[n..])
+            }
+            _ => s.to_string(),
+        })
+        .collect();
+    if rewritten {
+        scopes.join(" ")
+    } else {
+        scope.to_string()
     }
 }
 
@@ -464,9 +591,9 @@ fn is_meta_scope(normalised: &str) -> bool {
 
 /// The scopes of `requested` (space-separated, as in [`AuthConfig::scope`])
 /// that `granted` lacks, spelled as `requested` writes them, each once, in
-/// `requested`'s order. Compared case-insensitively and without the
-/// `https://graph.microsoft.com/` prefix Microsoft puts on granted Graph
-/// scopes; `offline_access`, `openid`, `profile`, `email` and any `.default`
+/// `requested`'s order. Compared case-insensitively and without the Graph
+/// root prefix (any cloud's, [`Cloud::graph_root`]) Microsoft puts on
+/// granted Graph scopes; `offline_access`, `openid`, `profile`, `email` and any `.default`
 /// scope are never missing.
 pub fn missing_scopes(requested: &str, granted: &[String]) -> Vec<String> {
     let granted: Vec<String> = granted.iter().map(|s| normalise_scope(s)).collect();
@@ -609,6 +736,7 @@ mod tests {
             client_id: "cid".into(),
             scope: "Mail.ReadWrite People.Read offline_access".into(),
             optional_scope: String::new(),
+            cloud: Cloud::Global,
         }
     }
 
@@ -731,7 +859,8 @@ mod tests {
         let t = redeem_code(&cfg(), &srv.base_url, &req, "THECODE").unwrap();
         assert_eq!(t.scopes, None);
         // Present but blank is unknown too.
-        let t = parse_token_response(r#"{"access_token":"AT","scope":"  "}"#, "").unwrap();
+        let t = parse_token_response(r#"{"access_token":"AT","scope":"  "}"#, "", Cloud::Global)
+            .unwrap();
         assert_eq!(t.scopes, None);
     }
 
@@ -1273,5 +1402,212 @@ mod tests {
             tenant_of("https://login.microsoftonline.com/organizations/"),
             "organizations"
         );
+    }
+
+    // --- National clouds (#2225) -----------------------------------------
+
+    /// AC 1: the issue's login host and Graph root per cloud, and the
+    /// name a saved token records.
+    #[test]
+    fn each_cloud_has_its_hosts_and_name() {
+        let want = [
+            (
+                Cloud::Global,
+                "https://login.microsoftonline.com",
+                "https://graph.microsoft.com",
+                "global",
+            ),
+            (
+                Cloud::UsGov,
+                "https://login.microsoftonline.us",
+                "https://graph.microsoft.us",
+                "usgov",
+            ),
+            (
+                Cloud::UsGovDod,
+                "https://login.microsoftonline.us",
+                "https://dod-graph.microsoft.us",
+                "usgovdod",
+            ),
+            (
+                Cloud::China,
+                "https://login.chinacloudapi.cn",
+                "https://microsoftgraph.chinacloudapi.cn",
+                "china",
+            ),
+        ];
+        assert_eq!(Cloud::ALL.to_vec(), want.map(|w| w.0).to_vec());
+        for (cloud, login, graph, name) in want {
+            assert_eq!(cloud.login_host(), login);
+            assert_eq!(cloud.graph_root(), graph);
+            assert_eq!(cloud.name(), name);
+            assert_eq!(Cloud::from_name(name), Some(cloud));
+        }
+        for other in ["", "Global", "USGOV", "mars", " china"] {
+            assert_eq!(Cloud::from_name(other), None, "{other:?}");
+        }
+    }
+
+    /// AC 1: the default config is today's, in the global cloud.
+    #[test]
+    fn auth_config_default_is_global() {
+        let c = AuthConfig::default();
+        assert_eq!(c.cloud, Cloud::Global);
+        assert_eq!(Cloud::default(), Cloud::Global);
+        assert_eq!(
+            c.authority,
+            "https://login.microsoftonline.com/organizations"
+        );
+        assert_eq!(c.client_id, "14d82eec-204b-4c2f-b7e8-296a70dab67e");
+        assert_eq!(c.scope, "Mail.ReadWrite People.Read offline_access");
+        assert_eq!(c.optional_scope, "");
+    }
+
+    /// AC 2: `/authorize` is on the cloud's login host, whatever host the
+    /// authority names; the tenant is its last segment.
+    #[test]
+    fn authorize_url_uses_each_clouds_login_host() {
+        for cloud in Cloud::ALL {
+            let c = AuthConfig {
+                authority: "https://login.microsoftonline.com/contoso".into(),
+                cloud,
+                ..cfg()
+            };
+            for req in [
+                begin_auth(&c, "http://localhost:8400"),
+                begin_auth_with_scope(&c, "http://localhost:8400", "Mail.ReadWrite"),
+            ] {
+                let want = format!("{}/contoso/oauth2/v2.0/authorize?", cloud.login_host());
+                assert!(
+                    req.authorize_url.starts_with(&want),
+                    "{cloud:?}: {}",
+                    req.authorize_url
+                );
+            }
+        }
+    }
+
+    /// AC 6: the token parsed from a token response is the configured
+    /// cloud's, from a redemption and a refresh alike.
+    #[test]
+    fn refresh_records_the_cloud() {
+        let srv = FakeServer::start(vec![token_route(
+            r#"{"access_token":"AT2","refresh_token":"RT2","expires_in":3600}"#,
+        )]);
+        for cloud in Cloud::ALL {
+            let c = AuthConfig { cloud, ..cfg() };
+            let t = refresh(&c, &srv.base_url, "RT1", None).unwrap();
+            assert_eq!(t.cloud, cloud);
+            let req = begin_auth(&c, "http://localhost:8400");
+            let t = redeem_code(&c, &srv.base_url, &req, "CODE").unwrap();
+            assert_eq!(t.cloud, cloud);
+        }
+    }
+
+    /// AC 4: every cloud's Graph root is stripped, whatever its case, so a
+    /// national cloud's grant is not missing a short-named scope.
+    #[test]
+    fn normalise_scope_strips_every_clouds_graph_root() {
+        for cloud in Cloud::ALL {
+            let root = cloud.graph_root();
+            assert_eq!(
+                normalise_scope(&format!("{root}/Mail.ReadWrite")),
+                "mail.readwrite"
+            );
+            assert_eq!(
+                normalise_scope(&format!("{}/Mail.ReadWrite", root.to_ascii_uppercase())),
+                "mail.readwrite"
+            );
+            assert_eq!(normalise_scope(&format!("{root}/.default")), ".default");
+        }
+        // Not a Graph root: kept, lowercased. A root without its `/` is no
+        // prefix, nor is a host that only starts like one.
+        assert_eq!(normalise_scope("api://x/Y.Read"), "api://x/y.read");
+        assert_eq!(
+            normalise_scope("https://graph.microsoft.usx/Mail.Read"),
+            "https://graph.microsoft.usx/mail.read"
+        );
+        assert_eq!(
+            normalise_scope("https://graph.microsoft.us"),
+            "https://graph.microsoft.us"
+        );
+        // Non-ASCII text is never cut inside a character.
+        assert_eq!(
+            normalise_scope("https://graph.microsoft.cömmon/x"),
+            "https://graph.microsoft.cömmon/x"
+        );
+        for cloud in Cloud::ALL {
+            let granted = vec![
+                format!("{}/Mail.ReadWrite", cloud.graph_root()),
+                format!("{}/People.Read", cloud.graph_root()),
+                "offline_access".to_string(),
+            ];
+            assert!(
+                missing_scopes("Mail.ReadWrite People.Read offline_access", &granted).is_empty(),
+                "{cloud:?}"
+            );
+            assert_eq!(
+                refresh_scope("Mail.ReadWrite Mail.Send offline_access", Some(&granted)),
+                "Mail.ReadWrite offline_access",
+                "{cloud:?}"
+            );
+        }
+    }
+
+    /// AC 5: a scope spelled with another cloud's Graph root is sent on
+    /// the configured cloud's; everything else byte for byte.
+    #[test]
+    fn wire_scope_moves_graph_roots_to_the_cloud() {
+        assert_eq!(
+            wire_scope(
+                Cloud::UsGov,
+                "https://graph.microsoft.com/.default Mail.ReadWrite offline_access"
+            ),
+            "https://graph.microsoft.us/.default Mail.ReadWrite offline_access"
+        );
+        assert_eq!(
+            wire_scope(
+                Cloud::China,
+                "HTTPS://GRAPH.MICROSOFT.COM/Mail.Read  https://dod-graph.microsoft.us/User.Read"
+            ),
+            "https://microsoftgraph.chinacloudapi.cn/Mail.Read \
+             https://microsoftgraph.chinacloudapi.cn/User.Read"
+        );
+        // Nothing to rewrite: byte for byte, whitespace and all.
+        for (cloud, scope) in [
+            (Cloud::Global, "Mail.ReadWrite People.Read offline_access"),
+            (
+                Cloud::Global,
+                "  https://graph.microsoft.com/Mail.Read   openid ",
+            ),
+            (Cloud::UsGovDod, "Mail.ReadWrite  api://x/y offline_access"),
+            (
+                Cloud::UsGovDod,
+                "https://dod-graph.microsoft.us/Mail.Read  openid",
+            ),
+        ] {
+            assert_eq!(wire_scope(cloud, scope), scope, "{cloud:?}");
+        }
+        // `/authorize`, the redemption and the refresh ask the wire scope.
+        let c = AuthConfig {
+            scope: "https://graph.microsoft.com/Mail.ReadWrite offline_access".into(),
+            cloud: Cloud::UsGovDod,
+            ..cfg()
+        };
+        let wire = "https://dod-graph.microsoft.us/Mail.ReadWrite offline_access";
+        let req = begin_auth(&c, "http://localhost:8400");
+        assert_eq!(req.scope(), wire);
+        assert_eq!(scope_param(&req.authorize_url).as_deref(), Some(wire));
+        let srv = FakeServer::start(vec![token_route(
+            r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#,
+        )]);
+        redeem_code(&c, &srv.base_url, &req, "CODE").unwrap();
+        refresh(&c, &srv.base_url, "RT1", None).unwrap();
+        let sent: Vec<Option<String>> = srv
+            .requests()
+            .iter()
+            .map(|r| r.form_value("scope"))
+            .collect();
+        assert_eq!(sent, vec![Some(wire.to_string()), Some(wire.to_string())]);
     }
 }

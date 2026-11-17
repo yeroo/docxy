@@ -50,7 +50,7 @@
 //! drive the whole engine against the in-process fake server with no network.
 //! Secrets (access/refresh tokens) are never logged.
 
-use crate::auth::{self, AuthConfig, TokenSet};
+use crate::auth::{self, AuthConfig, Cloud, TokenSet};
 use crate::graph::client::{
     BATCH_MAX, BatchRequest, CalendarDeltaCursor, ContactFieldSet, DeltaCursor, EventInput,
     GraphClient, GraphError, RsvpKind, TypeTier, UserIds, automatic_replies_body, event_body_json,
@@ -1002,6 +1002,12 @@ pub enum SignInReason {
     /// never came, or the code could not be redeemed); the
     /// `Error("sign-in failed: …")` before it says how.
     SignInFailed,
+    /// The saved sign-in is for the `saved` cloud, and the engine runs for
+    /// another (`AuthConfig::cloud`, #2225). Tokens of one cloud are not
+    /// accepted by another, so it is neither refreshed nor used: no request
+    /// is sent with it. It stays saved until a sign-in replaces it or a
+    /// `SignOut` clears it.
+    OtherCloud { saved: Cloud },
 }
 
 /// An event sent from the sync thread up to the UI.
@@ -1446,7 +1452,7 @@ pub enum SyncEvent {
     /// `AuthConfig::optional_scope` it lacks (#2218;
     /// [`crate::auth::sign_in_scope`] given to
     /// [`crate::auth::missing_scopes`]: case-insensitive, without the
-    /// `https://graph.microsoft.com/` prefix, never `offline_access`,
+    /// Graph root prefix (any cloud's, #2225), never `offline_access`,
     /// `openid`, `profile`, `email` or a `.default` scope). Sent after the
     /// token is loaded at startup, refreshed or redeemed at sign-in, only
     /// when the grant is known and is not the one last sent (compared as a
@@ -2297,15 +2303,25 @@ pub fn spawn_with_options(
     tick: Duration,
     options: EngineOptions,
 ) -> SyncHandle {
+    let (graph_base, auth_base) = production_bases(&cfg);
     spawn_with_bases_and_options(
         store_path,
         token_path,
         cfg,
         backfill_days,
-        "https://graph.microsoft.com/v1.0".to_string(),
-        "https://login.microsoftonline.com".to_string(),
+        graph_base,
+        auth_base,
         tick,
         options,
+    )
+}
+
+/// The Graph base and the auth base a host's engine uses (#2225):
+/// `cfg.cloud`'s Graph root + `/v1.0` and its login host.
+fn production_bases(cfg: &AuthConfig) -> (String, String) {
+    (
+        format!("{}/v1.0", cfg.cloud.graph_root()),
+        cfg.cloud.login_host().to_string(),
     )
 }
 
@@ -2339,7 +2355,11 @@ pub(crate) fn spawn_with_bases(
 /// hidden from the docs (#2054): the test seam for
 /// [`crate::testserver`], so a crate built on mailcore can point the whole
 /// engine (Graph and auth) at a `FakeServer`'s `base_url` in its own tests.
-/// Hosts use [`spawn`] or [`spawn_with_options`].
+/// Hosts use [`spawn`] or [`spawn_with_options`]. `graph_base` and
+/// `auth_base` win over `cfg.cloud`'s (#2225), so a non-global cloud runs
+/// against the fake server too; the `/authorize` URL a sign-in opens is
+/// still on `cfg.cloud`'s login host (the browser's half is played on the
+/// loopback).
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_with_bases_and_options(
@@ -2423,6 +2443,14 @@ fn spawn_engine(config: EngineConfig) -> SyncHandle {
     let (evt_tx, evt_rx) = mpsc::channel();
     thread::spawn(move || run(config, cmd_rx, evt_tx));
     SyncHandle { cmd_tx, evt_rx }
+}
+
+/// A saved sign-in as the engine loads it at a session's start (#2225).
+enum Saved {
+    /// A token of the engine's cloud, and where it is kept.
+    Token(TokenSet, tokencache::Storage),
+    /// A token of this other cloud: not used, and nothing is sent with it.
+    OtherCloud(Cloud),
 }
 
 /// Immutable configuration handed to the sync thread at spawn time.
@@ -2796,8 +2824,8 @@ impl Engine {
     /// "signed out": `SavedSignInUnavailable`, `Offline`, and the store is
     /// asked again later (`retry_saved_signin`).
     fn startup(&mut self) {
-        match self.load_token() {
-            Ok(Some((t, storage))) => {
+        match self.load_token_of_cloud() {
+            Ok(Some(Saved::Token(t, storage))) => {
                 if self.start_session(t, storage) {
                     self.sync_pass(true);
                     self.refresh_if_calendar_reset_owed();
@@ -2813,6 +2841,9 @@ impl Engine {
             // (re-)sign in, told which (#2169).
             Ok(None) => self.enter_signin(self.no_saved_token_reason()),
             Err(e) => self.enter_signin(SignInReason::SavedSignInUnreadable(e.to_string())),
+            Ok(Some(Saved::OtherCloud(saved))) => {
+                self.enter_signin(SignInReason::OtherCloud { saved })
+            }
         }
     }
 
@@ -2866,8 +2897,8 @@ impl Engine {
     /// (`saved_signin_unavailable`); an item that is gone, or a file now
     /// bad, is a sign-out, as at startup.
     fn retry_saved_signin(&mut self, always: bool) {
-        match self.load_token() {
-            Ok(Some((t, storage))) => {
+        match self.load_token_of_cloud() {
+            Ok(Some(Saved::Token(t, storage))) => {
                 self.saved_unavailable = None;
                 self.clear_backoff();
                 if self.start_session(t, storage) {
@@ -2881,6 +2912,9 @@ impl Engine {
             }
             Ok(None) => self.enter_signin(self.no_saved_token_reason()),
             Err(e) => self.enter_signin(SignInReason::SavedSignInUnreadable(e.to_string())),
+            Ok(Some(Saved::OtherCloud(saved))) => {
+                self.enter_signin(SignInReason::OtherCloud { saved })
+            }
         }
     }
 
@@ -2894,6 +2928,20 @@ impl Engine {
             store.ask_again();
         }
         self.retry_saved_signin(true);
+    }
+
+    /// [`Engine::load_token`] as a session may take it (#2225): a saved
+    /// token of another cloud than `AuthConfig::cloud` is
+    /// [`Saved::OtherCloud`], never a token to refresh or use. Startup and
+    /// `retry_saved_signin` both load through here.
+    fn load_token_of_cloud(&self) -> std::io::Result<Option<Saved>> {
+        Ok(self.load_token()?.map(|(t, storage)| {
+            if t.cloud == self.config.cfg.cloud {
+                Saved::Token(t, storage)
+            } else {
+                Saved::OtherCloud(t.cloud)
+            }
+        }))
     }
 
     /// The token cache in the engine's secret store (#2167):
@@ -10923,6 +10971,7 @@ mod tests {
             client_id: "cid".into(),
             scope: "Mail.ReadWrite offline_access".into(),
             optional_scope: String::new(),
+            cloud: Cloud::Global,
         }
     }
 
@@ -10937,6 +10986,7 @@ mod tests {
             expires_at_unix: now + 10 * 365 * 86400,
             account: "me@epam.com".into(),
             scopes: None,
+            cloud: Cloud::Global,
         };
         tokencache::save(path, &t).unwrap();
     }
@@ -10953,6 +11003,7 @@ mod tests {
             expires_at_unix: now + expires_in,
             account: "me@epam.com".into(),
             scopes: Some(scopes.iter().map(|s| s.to_string()).collect()),
+            cloud: Cloud::Global,
         };
         tokencache::save(path, &t).unwrap();
     }
@@ -16279,6 +16330,7 @@ mod tests {
                     expires_at_unix: now_unix() + 10,
                     account: "me@epam.com".into(),
                     scopes: None,
+                    cloud: Cloud::Global,
                 };
                 tokencache::save(p, &t).unwrap();
             },
@@ -16569,6 +16621,7 @@ mod tests {
             expires_at_unix: now_unix() + 10 * 365 * 86400,
             account: "me@x".into(),
             scopes: None,
+            cloud: Cloud::Global,
         };
         let saved = tokencache::save_in(token_path, &t, Some(store)).unwrap();
         assert_eq!(saved, tokencache::Storage::SecretStore);
@@ -17177,6 +17230,7 @@ mod tests {
             expires_at_unix: now_unix() + 3600,
             account: "me@x".into(),
             scopes: None,
+            cloud: Cloud::Global,
         };
         tokencache::save(&token_path, &t).unwrap();
         let handle = spawn_with_bases(
@@ -17221,6 +17275,7 @@ mod tests {
             },
             account: "me@x".into(),
             scopes: Some(SEEDED.iter().map(|s| s.to_string()).collect()),
+            cloud: Cloud::Global,
         };
         tokencache::save(path, &t).unwrap();
     }
@@ -17955,6 +18010,7 @@ mod tests {
                     expires_at_unix: now + 10,
                     account: "me@epam.com".into(),
                     scopes: None,
+                    cloud: Cloud::Global,
                 };
                 tokencache::save(p, &t).unwrap();
             },
@@ -18359,6 +18415,282 @@ mod tests {
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- National clouds (#2225) -----------------------------------------
+
+    /// The Graph-scope grant of `cloud`: `scopes` on its Graph root, plus
+    /// `offline_access`, as Entra spells a grant.
+    fn cloud_grant(cloud: Cloud, scopes: &[&str]) -> String {
+        let mut grant: Vec<String> = scopes
+            .iter()
+            .map(|s| format!("{}/{s}", cloud.graph_root()))
+            .collect();
+        grant.push("offline_access".into());
+        grant.join(" ")
+    }
+
+    /// AC 3: a host's engine talks to its cloud's Graph and login host.
+    #[test]
+    fn production_bases_follow_the_cloud() {
+        for cloud in Cloud::ALL {
+            let cfg = AuthConfig {
+                cloud,
+                ..AuthConfig::default()
+            };
+            assert_eq!(
+                production_bases(&cfg),
+                (
+                    format!("{}/v1.0", cloud.graph_root()),
+                    cloud.login_host().to_string()
+                ),
+                "{cloud:?}"
+            );
+        }
+        assert_eq!(
+            production_bases(&AuthConfig::default()),
+            (
+                "https://graph.microsoft.com/v1.0".to_string(),
+                "https://login.microsoftonline.com".to_string()
+            )
+        );
+    }
+
+    /// AC 2, 3, 4, 6, 8 (#2225), through the seam: an engine for the DoD
+    /// cloud opens `/authorize` on its login host, while the seam's bases
+    /// win, so the code redemption and the pass reach the fake server. The
+    /// grant on the cloud's Graph root misses nothing, the folder listing
+    /// follows an absolute `@odata.nextLink` to another host as it is, and
+    /// the cached token is the DoD cloud's.
+    #[test]
+    fn national_cloud_signs_in_and_syncs_through_the_seam() {
+        let cloud = Cloud::UsGovDod;
+        // The second page, on a host of its own: a link Graph sent is
+        // followed whatever its host.
+        let page2 = FakeServer::start(vec![get_route(
+            "/me/mailFolders?$skiptoken=2",
+            200,
+            r#"{"value":[{"id":"F2","displayName":"Archive","parentFolderId":"ROOT","childFolderCount":0,"totalItemCount":0,"unreadItemCount":0}]}"#,
+        )]);
+        let grant = cloud_grant(cloud, &["Mail.ReadWrite"]);
+        let srv = FakeServer::start(with_probe(
+            vec![
+                token_route(&format!(
+                    r#"{{"access_token":"AT","refresh_token":"RT","expires_in":3600,"scope":"{grant}"}}"#
+                )),
+                get_route(
+                    "/me/mailFolders/F1/messages/delta",
+                    200,
+                    r#"{"value":[],"@odata.deltaLink":"/me/mailFolders/F1/messages/delta?token=D1"}"#,
+                ),
+                get_route(
+                    "/me/mailFolders/F2/messages/delta",
+                    200,
+                    r#"{"value":[],"@odata.deltaLink":"/me/mailFolders/F2/messages/delta?token=D2"}"#,
+                ),
+                get_route(
+                    "/me/mailFolders",
+                    200,
+                    &format!(
+                        r#"{{"value":[{{"id":"F1","displayName":"Inbox","parentFolderId":"ROOT","childFolderCount":0,"totalItemCount":0,"unreadItemCount":0,"wellKnownName":"inbox"}}],"@odata.nextLink":"{}/me/mailFolders?$skiptoken=2"}}"#,
+                        page2.base_url
+                    ),
+                ),
+            ],
+            "ROOT",
+        ));
+        let dir = unique_dir("national-cloud");
+        let store_path = dir.join("mail.db");
+        let token_path = dir.join("token.bin");
+        let handle = spawn_with_bases(
+            store_path.clone(),
+            token_path.clone(),
+            AuthConfig {
+                cloud,
+                ..test_cfg()
+            },
+            3650,
+            srv.base_url.clone(),
+            srv.base_url.clone(),
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+        let played = play_sign_in_started(&handle, |state| format!("code=THECODE&state={state}"));
+        let Some(SyncEvent::SignInStarted { authorize_url }) = played.started.events.last() else {
+            panic!("{:?}", played.started.events);
+        };
+        assert!(
+            authorize_url.starts_with(
+                "https://login.microsoftonline.us/organizations/oauth2/v2.0/authorize?"
+            ),
+            "{authorize_url}"
+        );
+        // Short names are sent as they are.
+        assert_eq!(played.started.scope, test_cfg().scope);
+
+        let (mut scopes, mut folders) = (None, false);
+        wait_for(&handle.evt_rx, |e| {
+            match e {
+                SyncEvent::Scopes { missing, .. } => scopes = Some(missing.clone()),
+                SyncEvent::FoldersUpdated => folders = true,
+                _ => {}
+            }
+            scopes.is_some() && folders
+        });
+        assert_eq!(scopes, Some(Vec::new()), "the cloud's grant misses nothing");
+        let store = Store::open(&store_path).unwrap();
+        let mut ids: Vec<String> = store.folders().unwrap().into_iter().map(|f| f.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["F1".to_string(), "F2".to_string()]);
+        // The redemption reached the seam's auth base, asking the scopes
+        // `/authorize` asked.
+        let requests = srv.requests();
+        let token = requests
+            .iter()
+            .find(|r| r.path.starts_with("/organizations/oauth2/v2.0/token"))
+            .expect("the code redeemed on the seam's auth base");
+        assert_eq!(token.form_value("scope"), Some(test_cfg().scope));
+        // The second page went to the link's own host with the token.
+        let followed = page2.requests();
+        assert_eq!(followed.len(), 1, "{followed:?}");
+        assert_eq!(followed[0].path, "/me/mailFolders?$skiptoken=2");
+        assert!(
+            followed[0]
+                .headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && v == "Bearer AT"),
+            "{:?}",
+            followed[0].headers
+        );
+        let cached = tokencache::load(&token_path).unwrap().expect("cached");
+        assert_eq!(cached.cloud, cloud);
+        finish(handle, dir);
+    }
+
+    /// AC 7 (#2225): a saved global sign-in, near expiry with a refresh
+    /// token, and an engine for the US Government cloud: a sign-in is
+    /// asked for as `OtherCloud`, and nothing at all is sent (no refresh,
+    /// no Graph request). The cache stays as it was.
+    #[test]
+    fn global_cache_with_usgov_engine_asks_sign_in_without_refresh() {
+        let srv = FakeServer::start(vec![
+            token_route(r#"{"access_token":"AT2","refresh_token":"RT2","expires_in":3600}"#),
+            empty_folders_route(200),
+        ]);
+        let dir = unique_dir("other-cloud");
+        let token_path = dir.join("token.bin");
+        seed_token_with_scopes(&token_path, 10, SEEDED);
+        let before = std::fs::read(&token_path).unwrap();
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            token_path.clone(),
+            AuthConfig {
+                cloud: Cloud::UsGov,
+                ..test_cfg()
+            },
+            3650,
+            srv.base_url.clone(),
+            srv.base_url.clone(),
+            Duration::from_secs(3600),
+        );
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        assert_eq!(
+            signin_reasons(&events),
+            vec![SignInReason::OtherCloud {
+                saved: Cloud::Global
+            }]
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, SyncEvent::Scopes { .. })),
+            "{events:?}"
+        );
+        assert!(srv.requests().is_empty(), "{:?}", srv.requests());
+        assert_eq!(std::fs::read(&token_path).unwrap(), before);
+        finish(handle, dir);
+    }
+
+    /// AC 7 (#2225), on `retry_saved_signin`: a saved global sign-in whose
+    /// store refused at start, then answers a `RetrySavedSignIn` to an
+    /// engine for the China cloud: `OtherCloud`, the wait for the store
+    /// over, and nothing sent.
+    #[test]
+    fn retried_saved_sign_in_of_another_cloud_asks_sign_in() {
+        let srv = FakeServer::start(vec![
+            token_route(r#"{"access_token":"AT2","refresh_token":"RT2","expires_in":3600}"#),
+            empty_folders_route(200),
+        ]);
+        let dir = unique_dir("other-cloud-retry");
+        let token_path = dir.join("token.bin");
+        let (state, store) = saved_in_keyring(&token_path, Keyring::Refused);
+        let handle = spawn_with_store(
+            dir.join("mail.db"),
+            token_path.clone(),
+            AuthConfig {
+                cloud: Cloud::China,
+                ..test_cfg()
+            },
+            srv.base_url.clone(),
+            srv.base_url.clone(),
+            Duration::from_secs(3600),
+            store,
+        );
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::State(SyncState::Offline))
+        });
+        assert!(!signs_out(&events), "{events:?}");
+        state.set(Keyring::Works);
+        handle.cmd_tx.send(SyncCommand::RetrySavedSignIn).unwrap();
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        assert_eq!(
+            signin_reasons(&events),
+            vec![SignInReason::OtherCloud {
+                saved: Cloud::Global
+            }]
+        );
+        assert!(srv.requests().is_empty(), "{:?}", srv.requests());
+        // No longer waiting for the store: another retry asks it nothing.
+        let gets = state.gets();
+        handle.cmd_tx.send(SyncCommand::RetrySavedSignIn).unwrap();
+        handle.cmd_tx.send(SyncCommand::SignOut).unwrap();
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        assert_eq!(state.gets(), gets);
+        finish(handle, dir);
+    }
+
+    /// AC 6 (#2225): a cache written before #2225 (no `cloud`) is the
+    /// global cloud's, so a global engine takes it as before: no sign-in
+    /// asked, the pass runs.
+    #[test]
+    fn cache_without_cloud_field_still_starts_global() {
+        let srv = FakeServer::start(vec![empty_folders_route(200)]);
+        let dir = unique_dir("no-cloud-field");
+        let token_path = dir.join("token.bin");
+        let old = format!(
+            r#"{{"access_token":"AT","refresh_token":"RT","expires_at_unix":{},"account":"me@x"}}"#,
+            now_unix() + 10 * 365 * 86400
+        );
+        tokencache::write_raw(&token_path, &old).unwrap();
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            token_path,
+            test_cfg(),
+            3650,
+            srv.base_url.clone(),
+            srv.base_url.clone(),
+            Duration::from_secs(3600),
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(!signs_out(&events), "{events:?}");
+        finish(handle, dir);
     }
 
     #[test]
@@ -30876,6 +31208,7 @@ mod tests {
                 expires_at_unix: u64::MAX / 2,
                 account: String::new(),
                 scopes: None,
+                cloud: Cloud::Global,
             });
             engine.mailbox_unchecked = false;
             engine.backfill_done = true;
@@ -37620,6 +37953,7 @@ mod tests {
                             expires_at_unix: u64::MAX / 2,
                             account: String::new(),
                             scopes: None,
+                            cloud: Cloud::Global,
                         });
                         (engine, evt_rx)
                     }
@@ -46463,6 +46797,7 @@ mod tests {
                 expires_at_unix: u64::MAX / 2,
                 account: String::new(),
                 scopes: None,
+                cloud: Cloud::Global,
             });
             engine.mailbox_unchecked = true;
             (engine, evt_rx, cmd_tx)
