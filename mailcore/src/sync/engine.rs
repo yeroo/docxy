@@ -9915,18 +9915,29 @@ impl Engine {
     /// (#2218). A token from either runs the redeem + cache-save + resync
     /// path unchanged from Task 11; any other failure, or the second
     /// attempt's, is `Error("sign-in failed: …")` and
-    /// [`Engine::sign_in_failed`].
+    /// [`Engine::sign_in_failed`]. A first attempt that cannot open its
+    /// listener is [`Engine::sign_in_not_started`], as before; a second one
+    /// (its `Error` already sent) is [`Engine::sign_in_failed`], as a
+    /// `SignInStarted` went out and the client must hear the sign-in ended.
     fn sign_in(&mut self) {
         let full = auth::sign_in_scope(&self.config.cfg);
-        let mut attempt = self.sign_in_attempt(&full);
+        // Only a sign-in whose optional scopes add a scope can fall back.
+        let can_fall_back = full != self.config.cfg.scope;
+        let mut attempt = self.sign_in_attempt(&full, can_fall_back);
+        let mut fell_back = false;
         if let SignInAttempt::Failed { consent: true, .. } = attempt
-            && full != self.config.cfg.scope
+            && can_fall_back
         {
             let required = self.config.cfg.scope.clone();
-            attempt = self.sign_in_attempt(&required);
+            attempt = self.sign_in_attempt(&required, false);
+            fell_back = true;
         }
         let t = match attempt {
             SignInAttempt::Signed(t) => t,
+            SignInAttempt::NotStarted if fell_back => {
+                self.sign_in_failed();
+                return;
+            }
             SignInAttempt::NotStarted => {
                 self.sign_in_not_started();
                 return;
@@ -9996,8 +10007,10 @@ impl Engine {
     /// never uses, which a shared listener would take for the next
     /// attempt's redirect. A listener that cannot be opened emits its
     /// `Error` here and is [`SignInAttempt::NotStarted`]; a failure after
-    /// `SignInStarted` emits nothing.
-    fn sign_in_attempt(&mut self, scope: &str) -> SignInAttempt {
+    /// `SignInStarted` emits nothing. `fallback`: a consent refusal will be
+    /// followed by another attempt, so its browser tab says so
+    /// ([`handle_redirect`]).
+    fn sign_in_attempt(&mut self, scope: &str, fallback: bool) -> SignInAttempt {
         let listener = match TcpListener::bind("127.0.0.1:0") {
             Ok(l) => l,
             Err(e) => {
@@ -10029,7 +10042,7 @@ impl Engine {
         self.emit(SyncEvent::SignInStarted {
             authorize_url: req.authorize_url.clone(),
         });
-        let code = match listen_for_code(&listener, &req.state) {
+        let code = match listen_for_code(&listener, &req.state, fallback) {
             Ok(code) => code,
             Err(f) => {
                 return SignInAttempt::Failed {
@@ -10382,6 +10395,10 @@ const SIGNIN_SUCCESS_HTML: &str = "<!doctype html><html><head><meta charset=\"ut
 /// its `state` didn't match — so the browser tab tells the user something
 /// went wrong rather than just going blank.
 const SIGNIN_ERROR_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>lookxy</title></head><body><h3>lookxy: sign-in failed</h3><p>You can close this tab and try again from the terminal.</p></body></html>";
+/// Served instead for a refusal for consent that the engine follows with a
+/// sign-in without the optional scopes (#2218): the sign-in has not failed,
+/// a new tab carries it on.
+const SIGNIN_RETRY_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>lookxy</title></head><body><h3>lookxy: signing in again without the optional permissions</h3><p>Continue in the new browser tab; you can close this one.</p></body></html>";
 
 /// Blocks (with [`SIGNIN_TIMEOUT`]) for the browser to land on the loopback
 /// redirect `listener` is already bound to, accepts exactly one connection,
@@ -10396,10 +10413,12 @@ const SIGNIN_ERROR_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-
 ///
 /// Uses a non-blocking `accept` polled against a deadline rather than a
 /// dedicated timeout API (std's `TcpListener` has none) — simple, and the
-/// listener is only ever used for this one accept.
+/// listener is only ever used for this one accept. `fallback` is passed to
+/// [`handle_redirect`].
 fn listen_for_code(
     listener: &TcpListener,
     expected_state: &str,
+    fallback: bool,
 ) -> Result<String, RedirectFailure> {
     listener.set_nonblocking(true).map_err(|e| {
         RedirectFailure::other(format!("could not configure sign-in listener: {e}"))
@@ -10407,7 +10426,7 @@ fn listen_for_code(
     let deadline = Instant::now() + SIGNIN_TIMEOUT;
     loop {
         match listener.accept() {
-            Ok((stream, _addr)) => return handle_redirect(stream, expected_state),
+            Ok((stream, _addr)) => return handle_redirect(stream, expected_state, fallback),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
                     return Err(RedirectFailure::other(
@@ -10535,7 +10554,14 @@ fn read_request_line(
 /// Reads the HTTP request line off one accepted loopback connection, pulls
 /// `code`/`state` (or `error`) out of its query string, writes back a small
 /// HTML page, and returns the code (or an error — see [`listen_for_code`]).
-fn handle_redirect(stream: TcpStream, expected_state: &str) -> Result<String, RedirectFailure> {
+/// `fallback` (#2218): a refusal for consent will be followed by a sign-in
+/// without the optional scopes, so such a redirect gets
+/// [`SIGNIN_RETRY_HTML`] rather than the error page.
+fn handle_redirect(
+    stream: TcpStream,
+    expected_state: &str,
+    fallback: bool,
+) -> Result<String, RedirectFailure> {
     let request_line = read_request_line(
         &stream,
         SIGNIN_REQUEST_LINE_MAX,
@@ -10553,13 +10579,13 @@ fn handle_redirect(stream: TcpStream, expected_state: &str) -> Result<String, Re
     let state_matches = param("state").map(String::as_str) == Some(expected_state);
 
     if let Some(err) = param("error") {
-        write_html_response(stream, SIGNIN_ERROR_HTML);
         // Microsoft's `error_description` (`AADSTSnnnnn: …`) says what to do,
         // but anything can send the browser to this port during the sign-in
         // window, so free text (the description, or an `error` that is not a
         // bare code) is shown only from the redirect that carries our
         // `state` (Entra echoes it on an error, RFC 6749 §4.1.2.1).
         if !state_matches {
+            write_html_response(stream, SIGNIN_ERROR_HTML);
             return Err(RedirectFailure::other(if is_oauth_error_code(err) {
                 format!("authorization denied: {err}")
             } else {
@@ -10569,6 +10595,14 @@ fn handle_redirect(stream: TcpStream, expected_state: &str) -> Result<String, Re
         // A refusal for consent (#2218) is read from the raw values: the
         // engine may then sign in again without the optional scopes.
         let consent = auth::is_consent_refusal(err, param("error_description").map(String::as_str));
+        write_html_response(
+            stream,
+            if consent && fallback {
+                SIGNIN_RETRY_HTML
+            } else {
+                SIGNIN_ERROR_HTML
+            },
+        );
         let err = one_line(err);
         let desc = param("error_description")
             .map(|d| one_line(d))
@@ -17634,7 +17668,13 @@ mod tests {
             first.started.scope,
             "Mail.ReadWrite offline_access User.ReadBasic.All Presence.Read.All"
         );
-        assert!(first.response.to_lowercase().contains("failed"));
+        // The tab says a new one carries on, not that the sign-in failed.
+        assert!(
+            first.response.contains("signing in again"),
+            "{}",
+            first.response
+        );
+        assert!(!first.response.contains("failed"), "{}", first.response);
         let second = play_sign_in_started(&handle, code_redirect);
         assert_eq!(second.started.scope, cfg.scope);
         assert_ne!(second.started.state, first.started.state);
@@ -17711,6 +17751,17 @@ mod tests {
         handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
         let first = play_sign_in_started(&handle, consent_required);
         let second = play_sign_in_started(&handle, consent_declined);
+        // The fallback's own refusal is a failed sign-in: the error page.
+        assert!(
+            first.response.contains("signing in again"),
+            "{}",
+            first.response
+        );
+        assert!(
+            second.response.contains("sign-in failed"),
+            "{}",
+            second.response
+        );
         let events = wait_for(&handle.evt_rx, |e| {
             matches!(e, SyncEvent::SignInRequired { .. })
         });
@@ -17939,9 +17990,46 @@ mod tests {
             .write_all(format!("GET /?{query} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
             .unwrap();
         let (stream, _addr) = listener.accept().unwrap();
-        let result = handle_redirect(stream, expected_state);
+        let result = handle_redirect(stream, expected_state, false);
         drop(client);
         result.expect_err("no code")
+    }
+
+    /// The page `handle_redirect` serves for `GET /?<query>` (#2218).
+    fn redirect_page(query: &str, expected_state: &str, fallback: bool) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .write_all(format!("GET /?{query} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .unwrap();
+        let (stream, _addr) = listener.accept().unwrap();
+        let _ = handle_redirect(stream, expected_state, fallback);
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    #[test]
+    fn handle_redirect_serves_the_retry_page_only_before_a_fallback() {
+        let retry = "signing in again";
+        let failed = "sign-in failed";
+        for query in [consent_required("S"), consent_declined("S")] {
+            let page = redirect_page(&query, "S", true);
+            assert!(page.contains(retry) && !page.contains(failed), "{page}");
+            // No fallback follows: no optional scope, or the fallback itself.
+            let page = redirect_page(&query, "S", false);
+            assert!(page.contains(failed) && !page.contains(retry), "{page}");
+        }
+        // Not a consent refusal, or not our redirect: the error page.
+        for (query, state) in [
+            ("error=access_denied&state=S".to_string(), "S"),
+            (consent_required("S"), "other"),
+            ("state=S".to_string(), "S"),
+        ] {
+            let page = redirect_page(&query, state, true);
+            assert!(page.contains(failed) && !page.contains(retry), "{page}");
+        }
     }
 
     #[test]
@@ -17970,7 +18058,7 @@ mod tests {
             .write_all(format!("GET /?{query} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
             .unwrap();
         let (stream, _addr) = listener.accept().unwrap();
-        let result = handle_redirect(stream, expected_state).map_err(|f| f.message);
+        let result = handle_redirect(stream, expected_state, false).map_err(|f| f.message);
         drop(client);
         result
     }
@@ -18054,7 +18142,7 @@ mod tests {
         drop(client); // closes before writing anything
 
         let (stream, _addr) = listener.accept().unwrap();
-        let result = handle_redirect(stream, "expected-state");
+        let result = handle_redirect(stream, "expected-state", false);
         assert!(result.is_err());
     }
 

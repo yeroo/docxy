@@ -5445,13 +5445,24 @@ person declines the consent screen), so mail stopped until an administrator cons
   A second attempt, asking `cfg.scope`, runs exactly when the first is `Failed { consent: true }`
   and `full != cfg.scope`. It has a new port, PKCE and `state`, and no `Error` is sent for the
   first refusal: one `SignIn` then sends two `SignInStarted`. `Signed` from either attempt runs
-  the success block as before (the token saved, `announce_scopes`, a pass). `NotStarted` is
-  `sign_in_not_started()`. Any other `Failed`, and a failed second attempt, is
+  the success block as before (the token saved, `announce_scopes`, a pass). A first
+  `NotStarted` is `sign_in_not_started()`, as before. A second `NotStarted`, whose `Error` is
+  already sent, is `sign_in_failed()` (r1). A `SignInStarted` went out, and
+  `sign_in_not_started`'s `set_state(SignInRequired)` sends nothing to a signed-out engine, so
+  the client would stay on the refused URL. Any other `Failed`, and a failed second attempt, is
   `Error("sign-in failed: <text>")` then `sign_in_failed()`, as before. Each attempt has its own
   listener because, after the first error page, the browser may ask that port for
   `/favicon.ico` or open a connection it never uses. One listener shared by both attempts would
   take that for the second redirect and fail it ("redirect state did not match", or a 10 s read
   timeout). With the first listener dropped, such a request is refused, as before.
+- **The first tab** (r1). `sign_in_attempt(scope, fallback)` passes `fallback` (the first
+  attempt, when `full != cfg.scope`) through `listen_for_code` to `handle_redirect`. A
+  state-matching consent refusal with `fallback` gets `SIGNIN_RETRY_HTML` ("signing in again
+  without the optional permissions … Continue in the new browser tab"), not the "sign-in
+  failed … try again" page, which could make the person close the browser while the second
+  tab opens. Every other redirect error gets the error page as before, the fallback's own
+  refusal included. A redemption refused for consent has already served the success page,
+  before the second tab opens.
 - **Missing.** `announce_scopes`' `missing` is `missing_scopes(&sign_in_scope(cfg), &granted)` at
   every announcement (startup, refresh, sign-in). After a fallback the optional scopes are in it,
   and the client decides what to say.
@@ -5488,7 +5499,10 @@ person declines the consent screen), so mail stopped until an administrator cons
     `a_sign_in_without_refusal_makes_one_authorize`,
     `a_sign_in_without_the_optional_scopes_never_refreshes_asking_them`,
     `an_unknown_grant_refreshes_asking_scope_alone`, `startup_reports_missing_optional_scopes`,
-    `handle_redirect_marks_only_consent_refusals`.
+    `handle_redirect_marks_only_consent_refusals`,
+    `handle_redirect_serves_the_retry_page_only_before_a_fallback`; `falls_back_after` and
+    `a_refused_fallback_signs_in_failed` check each tab's page. A second attempt that cannot
+    bind (`sign_in_failed`) has no test: a failed bind is not reachable cheaply (as #2167's r1).
   - The test helpers `next_sign_in_started`, `land_on` and `play_sign_in_started` play the
     browser for one `SignInStarted` at a time. `sign_in_through_loopback_with` is `SignIn`
     plus `play_sign_in_started`.
