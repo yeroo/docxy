@@ -120,6 +120,7 @@ mod sheet_clip_tests;
 mod sheet_complete;
 mod sheet_consolidate;
 mod sheet_drag;
+mod sheet_pictures;
 mod tab_tear;
 /// The wall-clock bound of the tests that guard against a quadratic cost
 /// (#707): generous, since they run as debug builds on shared CI runners,
@@ -1393,6 +1394,8 @@ struct ChartDrag {
 #[derive(Clone, Copy, Default)]
 struct ChartUi {
     sel: Option<usize>,
+    /// The selected floating picture (#2228), drawn with a frame and grips.
+    picture_sel: Option<usize>,
     /// (index, dx, dy, edge) of the card the pointer is currently dragging.
     drag: Option<(usize, f32, f32, (i8, i8))>,
 }
@@ -5937,6 +5940,11 @@ struct Docxy {
     // The selected chart on the active sheet, as an index into that sheet's
     // chart list (UI-authored charts first, then the ones loaded from the file).
     chart_sel: Option<usize>,
+    // The selected floating picture on the active sheet (#2228), as an index
+    // among that sheet's pictures in drawing order. Selecting only looks: it
+    // owns the selection as a chart does (the cell ring hides), and is
+    // dropped wherever a chart's selection is handed back or dropped.
+    picture_sel: Option<usize>,
     // The chart the Chart panel SHOWS, which outlives `chart_sel`: deselecting
     // a chart drops its handles and its source outlines but leaves the panel
     // open on it, so a range edit survives the click on the grid that was
@@ -17493,6 +17501,7 @@ impl Docxy {
             last_pointer: point(px(0.), px(0.)),
             custom_lists: Vec::new(),
             chart_sel: None,
+            picture_sel: None,
             panel_chart: None,
             chart_drag: None,
             range_edit: None,
@@ -18778,6 +18787,7 @@ impl Docxy {
         // comes back out. The PANEL stays open on it — that is the sticky rule,
         // and the reason this click cannot interrupt a range edit.
         self.chart_sel = after.chart;
+        self.picture_sel = None;
         self.chart_panel_event(PanelEvent::Deselect);
         if after.drop_field {
             self.range_edit = None;
@@ -18796,9 +18806,9 @@ impl Docxy {
     /// selection so far stays and the cell starts a new area (#670), as a
     /// plain click's [`Self::select_cell`] would start the only one.
     fn add_area_at(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
-        if self.chart_sel.is_some() {
-            // A chart holds the selection: the grid's is not shown, so
-            // there is nothing to add to.
+        if self.chart_sel.is_some() || self.picture_sel.is_some() {
+            // A chart or a picture holds the selection: the grid's is not
+            // shown, so there is nothing to add to.
             return self.select_cell(row, col, cx);
         }
         if self.active_sheet().is_some_and(|v| v.editing.is_some())
@@ -18915,7 +18925,7 @@ impl Docxy {
             editing,
             self.range_field_active(),
             self.formula_pick_active(),
-            self.chart_sel,
+            self.chart_sel.or(self.picture_sel),
         )
         .or_else(|| {
             self.active_sheet()
@@ -18941,6 +18951,7 @@ impl Docxy {
     fn chart_ui(&self) -> ChartUi {
         ChartUi {
             sel: self.chart_sel,
+            picture_sel: self.picture_sel,
             drag: self
                 .chart_drag
                 .map(|d| (d.idx, d.delta.0, d.delta.1, d.edge)),
@@ -19000,6 +19011,7 @@ impl Docxy {
             return;
         }
         self.chart_sel = after.chart;
+        self.picture_sel = None;
         // The panel swaps to it, opening if it was shut.
         self.chart_panel_event(PanelEvent::Select(idx));
         // Selecting a chart only looks; moving or resizing it would edit.
@@ -19013,6 +19025,31 @@ impl Docxy {
             origin: at,
             delta: (0.0, 0.0),
         });
+        cx.notify();
+    }
+
+    /// Press on a floating picture (#2228): select it, on press as Excel
+    /// does, taking the selection from the cells and from any chart, as a
+    /// press on another chart would (so a field pointing at the grid lets
+    /// go). It only selects: a picture is not moved, resized or deleted.
+    fn picture_press(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if self.picture_sel == Some(idx) && self.chart_sel.is_none() {
+            return;
+        }
+        // A half-typed cell is committed first, as for a press on a chart.
+        if self.active_sheet().is_some_and(|v| v.editing.is_some())
+            && !self.sheet_commit_then(DvThen::Move(0, 0), cx)
+        {
+            return;
+        }
+        self.range_edit = None;
+        self.ref_msg = None;
+        self.range_pick = None;
+        self.chart_drag = None;
+        if self.chart_sel.take().is_some() {
+            self.chart_panel_event(PanelEvent::Deselect);
+        }
+        self.picture_sel = Some(idx);
         cx.notify();
     }
 
@@ -19055,6 +19092,8 @@ impl Docxy {
     /// that list changes underneath them (a sheet switch, a tab switch, an undo).
     fn chart_drop_selection(&mut self) {
         self.chart_sel = None;
+        // A picture's index is into the same sheet's pictures (#2228).
+        self.picture_sel = None;
         // The panel is sticky against DESELECTION, not against the list moving
         // under it: an index into a list that just changed names a different
         // chart, so the panel closes here rather than silently swapping to
@@ -19085,6 +19124,11 @@ impl Docxy {
     /// never call this; so are the ones aimed at the document or the window
     /// rather than the selection (Ctrl+S, Ctrl+F, Ctrl+F1).
     fn chart_hand_back(&mut self, cx: &mut Context<Self>) {
+        // A selected picture gives the selection back the same way (#2228):
+        // it only ever holds it, so there is nothing else to undo.
+        if self.picture_sel.take().is_some() {
+            cx.notify();
+        }
         if self.chart_sel.is_none() {
             return;
         }
@@ -20359,7 +20403,32 @@ impl Docxy {
                     )
                 })
             }
+            Region::Picture(i) => {
+                let n = self.picture_count();
+                if i >= n {
+                    return Err(match n {
+                        0 => "this sheet has no pictures".to_string(),
+                        _ => format!("no picture {i}; this sheet has {n} (0..{})", n - 1),
+                    });
+                }
+                lookup(&self.probes.borrow(), &format!("picture:{i}")).ok_or_else(|| {
+                    format!(
+                        "picture {i} is not in the grid's scrolled cells, so it has no rectangle"
+                    )
+                })
+            }
         }
+    }
+
+    /// How many floating pictures the active sheet has (#2228).
+    fn picture_count(&self) -> usize {
+        self.active_sheet().map_or(0, |v| {
+            v.sheet()
+                .drawings
+                .iter()
+                .filter(|d| matches!(d.kind, gridcore::sheet::DrawingKind::Image { .. }))
+                .count()
+        })
     }
 
     /// Where a named region is on the last finished frame — what `rect`
@@ -20951,7 +21020,7 @@ impl Docxy {
             ),
             area_ix: Default::default(),
             border_grips: self.edit_opts.fill_handle
-                && cell_selection_shown(self.chart_sel)
+                && cell_selection_shown(self.chart_sel.or(self.picture_sel))
                 && !self.grid_gesture_in_flight()
                 && self.sheet_fill.is_none()
                 && self.drops.border_drag.is_none()
@@ -20971,9 +21040,9 @@ impl Docxy {
             // has.
             border_rg: None,
             range_dashed: true,
-            // One selection at a time: a selected chart owns it, and the grid
-            // shows nothing of its own until that chart is dismissed.
-            sel_hidden: !cell_selection_shown(self.chart_sel),
+            // One selection at a time: a selected chart or picture owns it,
+            // and the grid shows nothing of its own until that is dismissed.
+            sel_hidden: !cell_selection_shown(self.chart_sel.or(self.picture_sel)),
         }
     }
 
@@ -21224,6 +21293,7 @@ impl Docxy {
             return;
         }
         self.chart_sel = after.chart;
+        self.picture_sel = None;
         self.chart_panel_event(PanelEvent::Deselect);
         if after.drop_field {
             self.range_edit = None;
@@ -25919,6 +25989,32 @@ impl Docxy {
         // A Chart-panel text field swallows typing until Enter/Esc.
         if self.range_edit.is_some() {
             return self.range_edit_key(ev, ctrl, shift, key, cx);
+        }
+        // A selected picture (#2228) takes the object keys too: Escape drops
+        // it, and Delete and Backspace do nothing — deleting a picture is not
+        // supported, and erasing the cell it hides would be a change nobody
+        // can see. The keys the grid acts on hand the selection back first,
+        // as for a chart below.
+        if self.picture_sel.is_some() && !editing {
+            match key {
+                "escape" => {
+                    self.picture_sel = None;
+                    cx.notify();
+                    return;
+                }
+                "delete" | "backspace" => return,
+                "left" | "right" | "up" | "down" | "enter" | "f2" => self.chart_hand_back(cx),
+                _ if ev
+                    .keystroke
+                    .key_char
+                    .as_deref()
+                    .and_then(|c| c.chars().next())
+                    .is_some_and(|ch| !ch.is_control()) =>
+                {
+                    self.chart_hand_back(cx)
+                }
+                _ => {}
+            }
         }
         // A selected chart takes the object keys (Escape drops it, Delete removes
         // it) before they reach the grid.
@@ -45674,6 +45770,7 @@ impl Render for Docxy {
                     sheet_grid_w,
                     self.grid_overlay(),
                     self.chart_ui(),
+                    &tab.pictures,
                     &self.probes,
                     cx,
                 )
@@ -48770,6 +48867,338 @@ fn chart_card(data: &gridcore::sheet::ChartData, chart_id: usize, w: f32, h: f32
     .into_any_element()
 }
 
+/// The grid's panes along one axis for the floating pictures (#2228): the
+/// frozen one, if any, and the scrolled one, each as where it starts (px from
+/// the layer's edge), its size (`None`: to the layer's far edge) and the
+/// cells it shows.
+type PicturePanes = Vec<(f32, Option<f32>, sheet_pictures::Pane)>;
+
+/// What [`sheet_picture_layer`] needs of the grid it lies over, as the grid
+/// itself settled it this frame.
+struct PictureGrid<'a> {
+    /// The visible rows (hidden ones collapse out of the list).
+    visible: &'a [u32],
+    /// How many of `visible` are frozen at the top.
+    fr: usize,
+    /// How many columns are frozen at the left, and their drawn width.
+    fc: u32,
+    frozen_w: f32,
+    /// The scrolled window's first and last column.
+    col0: u32,
+    cend: u32,
+    /// The row list's length (rows past it are never drawn).
+    total_rows: u32,
+    /// The scrolled rows' first list item and how far it is scrolled out.
+    top_item: usize,
+    top_offset: f32,
+    /// The row list, for the heights it measured.
+    vlist: &'a ListState,
+}
+
+/// How many measured rows the picture layer reads from the list: more than
+/// a screen holds.
+const MEASURED_ROWS: usize = 512;
+
+/// How much of a pane the picture layer looks for rows to fill: more than
+/// any screen is tall.
+const PICTURE_PANE_PX: f32 = 8192.0;
+
+/// The floating pictures of the active sheet (#2228): each `DrawingKind::Image`
+/// placed from its anchor ([`sheet_pictures`]), stretched to its box, in
+/// drawing-part order, in every pane of the grid its box reaches — the
+/// frozen corner, the frozen rows, the frozen columns and the scrolled
+/// cells, each clipped to itself and scrolling with its own axis, as Excel
+/// splits a picture over a freeze line. A press selects the picture; the
+/// selected one wears Excel's frame and grips. Media that is missing or
+/// that gpui can't draw is a labelled box instead. `None` when the sheet
+/// has no pictures.
+fn sheet_picture_layer(
+    view: &SheetView,
+    ent: &Entity<Docxy>,
+    grid: &PictureGrid,
+    selected: Option<usize>,
+    pics: &std::cell::RefCell<pictures::Cache>,
+    probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
+) -> Option<AnyElement> {
+    use sheet_pictures::{Axis, Pane};
+    let sh = view.sheet();
+    let images: Vec<(&gridcore::sheet::Drawing, &str, &str)> = sh
+        .drawings
+        .iter()
+        .filter_map(|d| match &d.kind {
+            gridcore::sheet::DrawingKind::Image { part, name } => {
+                Some((d, part.as_str(), name.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    if images.is_empty() {
+        return None;
+    }
+    let excel_row = |r: u32| {
+        sheet_pictures::excel_row_emu(
+            sh.row_height(r),
+            sh.format.default_row_height,
+            sh.row_hidden(r),
+        )
+    };
+    // A row's drawn height is what the list measured it at: a row grows past
+    // `row_height_px` (its min height, gridline included) with its text. The
+    // list knows the rows from its top item on; the rows above it and the
+    // frozen band are taken at their min height.
+    let mut measured: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+    for (ix, &r) in grid
+        .visible
+        .iter()
+        .skip(grid.fr + grid.top_item)
+        .enumerate()
+        .take(MEASURED_ROWS)
+    {
+        let Some(b) = grid.vlist.bounds_for_item(grid.top_item + ix) else {
+            break;
+        };
+        measured.insert(r, f32::from(b.size.height));
+    }
+    let drawn_row = |r: u32| {
+        if sh.row_hidden(r) {
+            0.0
+        } else {
+            measured
+                .get(&r)
+                .copied()
+                .unwrap_or_else(|| row_height_px(sh.row_height(r), SHEET_ROW_H))
+        }
+    };
+    let excel_col = |c: u32| sheet_pictures::excel_col_emu(sh.col_width(c), sh.col_hidden(c));
+    let drawn_col = |c: u32| col_px(sh.col_width(c));
+    let rows = Axis {
+        excel: &excel_row,
+        drawn: &drawn_row,
+        end: grid.total_rows,
+    };
+    let cols = Axis {
+        excel: &excel_col,
+        drawn: &drawn_col,
+        end: MAX_VISIBLE_COL + 1,
+    };
+
+    // The rows' panes: the frozen band is the first `fr` VISIBLE rows, as the
+    // grid draws it, and the scrolled one starts at the list's top item.
+    let mut row_panes: PicturePanes = Vec::new();
+    let band: f32 = grid.visible[..grid.fr].iter().map(|&r| drawn_row(r)).sum();
+    if grid.fr > 0 {
+        let last = grid.visible[grid.fr - 1];
+        row_panes.push((
+            0.0,
+            Some(band),
+            Pane {
+                first: 0,
+                shift: 0.0,
+                last,
+            },
+        ));
+    }
+    if let Some(&first) = grid.visible.get(grid.fr + grid.top_item) {
+        let mut acc = -grid.top_offset;
+        let mut last = first;
+        for &r in &grid.visible[grid.fr + grid.top_item..] {
+            last = r;
+            acc += drawn_row(r);
+            if acc >= PICTURE_PANE_PX {
+                break;
+            }
+        }
+        row_panes.push((
+            band,
+            None,
+            Pane {
+                first,
+                shift: grid.top_offset,
+                last,
+            },
+        ));
+    }
+    if row_panes.is_empty() {
+        // Every row hidden: no cell is drawn, so no picture is either.
+        return None;
+    }
+    // The columns' panes: `0..fc` frozen, then the window from `col0`.
+    let mut col_panes: PicturePanes = Vec::new();
+    if grid.fc > 0 {
+        col_panes.push((
+            SHEET_GUT,
+            Some(grid.frozen_w),
+            Pane {
+                first: 0,
+                shift: 0.0,
+                last: grid.fc - 1,
+            },
+        ));
+    }
+    col_panes.push((
+        SHEET_GUT + grid.frozen_w,
+        None,
+        Pane {
+            first: grid.col0,
+            shift: 0.0,
+            last: grid.cend,
+        },
+    ));
+
+    let spans: Vec<sheet_pictures::Span> = images
+        .iter()
+        .map(|(d, ..)| sheet_pictures::anchor_span(&d.anchor, d.from, d.to, &rows, &cols))
+        .collect();
+    let mut layer = div().absolute().left_0().top_0().size_full();
+    let (rp_last, cp_last) = (row_panes.len() - 1, col_panes.len() - 1);
+    for (ri, &(y0, h, row_pane)) in row_panes.iter().enumerate() {
+        for (ci, &(x0, w, col_pane)) in col_panes.iter().enumerate() {
+            let mut pane = div().absolute().left(px(x0)).top(px(y0)).overflow_hidden();
+            pane = match w {
+                Some(w) => pane.w(px(w)),
+                None => pane.right_0(),
+            };
+            pane = match h {
+                Some(h) => pane.h(px(h)),
+                None => pane.bottom_0(),
+            };
+            // The harness's `picture:N` is the piece in the scrolled cells.
+            let main = ri == rp_last && ci == cp_last;
+            for (i, ((_, part, name), span)) in images.iter().zip(&spans).enumerate() {
+                let Some((x, y, pw, ph)) =
+                    sheet_pictures::piece(&rows, &cols, row_pane, col_pane, *span, 1.0)
+                else {
+                    continue;
+                };
+                let image = view
+                    .pkg
+                    .part(part)
+                    .and_then(|b| pics.borrow_mut().sheet_image(part, b));
+                pane = pane.child(sheet_picture(
+                    i,
+                    (x, y, pw, ph),
+                    image,
+                    name,
+                    selected == Some(i),
+                    main.then_some(probes),
+                    ent,
+                ));
+            }
+            layer = layer.child(pane);
+        }
+    }
+    Some(layer.into_any_element())
+}
+
+/// One piece of a floating picture: the image stretched to `(w, h)` at
+/// `(x, y)` in its pane, or the labelled placeholder, with the selection
+/// frame and grips when selected. A press on it selects the picture, and
+/// the cell under it does not see the press.
+fn sheet_picture(
+    idx: usize,
+    (x, y, w, h): (f32, f32, f32, f32),
+    image: Option<std::sync::Arc<Image>>,
+    name: &str,
+    selected: bool,
+    probes: Option<&std::rc::Rc<std::cell::RefCell<Probes>>>,
+    ent: &Entity<Docxy>,
+) -> AnyElement {
+    let label = SharedString::from(format!("{name} (picture)"));
+    let placeholder = move || -> AnyElement {
+        div()
+            .size_full()
+            .border_1()
+            .border_color(hsla_u(0x9a9a9a))
+            .bg(hsla_u(0xf2f2f2))
+            .overflow_hidden()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(11.))
+            .text_color(hsla_u(0x555555))
+            .child(label.clone())
+            .into_any_element()
+    };
+    let content = match image {
+        Some(image) => img(image)
+            .size_full()
+            .object_fit(ObjectFit::Fill)
+            .with_fallback(placeholder)
+            .into_any_element(),
+        None => placeholder(),
+    };
+    let ent = ent.clone();
+    div()
+        .id(ElementId::Name(format!("sheet-picture-{idx}").into()))
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .w(px(w))
+        .h(px(h))
+        // Excel selects an object on press; the cell underneath must not
+        // also react. The wheel is not a press: it still scrolls the grid.
+        .on_mouse_down(MouseButton::Left, move |_ev, _w, cx2| {
+            cx2.stop_propagation();
+            ent.update(cx2, |this, cx2| this.picture_press(idx, cx2));
+        })
+        .child(content)
+        .when_some(probes, |d, probes| {
+            d.child(probe(probes, format!("picture:{idx}")))
+        })
+        .when(selected, |d| {
+            d.child(
+                div()
+                    .absolute()
+                    .left(px(-3.))
+                    .top(px(-3.))
+                    .right(px(-3.))
+                    .bottom(px(-3.))
+                    .border_1()
+                    .border_color(hsla_u(BRAND)),
+            )
+            .children(picture_grips(w, h))
+        })
+        .into_any_element()
+}
+
+/// A selected picture's eight grips, like a chart's but inert: a picture is
+/// only selected, never resized, here (#2228).
+fn picture_grips(w: f32, h: f32) -> Vec<AnyElement> {
+    let along = |e: i8, extent: f32| -> f32 {
+        let at = match e {
+            -1 => -3.0,
+            1 => extent + 3.0,
+            _ => extent / 2.0,
+        };
+        at - 4.0
+    };
+    [
+        (-1, -1),
+        (0, -1),
+        (1, -1),
+        (-1, 0),
+        (1, 0),
+        (-1, 1),
+        (0, 1),
+        (1, 1),
+    ]
+    .iter()
+    .map(|&(ex, ey)| {
+        div()
+            .absolute()
+            .left(px(along(ex, w)))
+            .top(px(along(ey, h)))
+            .w(px(8.))
+            .h(px(8.))
+            .bg(hsla_u(0xffffff))
+            .border_1()
+            .border_color(hsla_u(BRAND))
+            .rounded(px(1.))
+            .into_any_element()
+    })
+    .collect()
+}
+
 /// Render a spreadsheet tab: a formula/reference bar; a horizontally-scrolling
 /// grid whose column header (and any frozen rows) stay pinned while the rows
 /// virtualize vertically via `uniform_list`; and the sheet tabs.
@@ -48783,6 +49212,7 @@ fn sheet_el(
     grid_w: f32,
     mut ov: GridOverlay,
     chart_ui: ChartUi,
+    pics: &std::cell::RefCell<pictures::Cache>,
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
     cx: &mut Context<Docxy>,
 ) -> AnyElement {
@@ -48995,6 +49425,15 @@ fn sheet_el(
             br < rr && bc < cc
         })
     };
+    // A floating picture covers the handle too (#2228): the corner of a cell
+    // strictly inside its cell span (the cells it ends in may be covered only
+    // in part, so they keep the handle).
+    let corner_under_chart = corner_under_chart
+        || sh.drawings.iter().any(|d| {
+            matches!(d.kind, gridcore::sheet::DrawingKind::Image { .. })
+                && (d.from.0..d.to.0).contains(&r1)
+                && (d.from.1..d.to.1).contains(&c1)
+        });
     // Visible rows (filter/hide skips `hidden="1"` rows) — the list virtualizes
     // over these, so a filtered-out row collapses instead of showing blank.
     // Built before the overlay is finished because every outline is snapped
@@ -49426,6 +49865,27 @@ fn sheet_el(
             )
         })
         .collect();
+    // The floating pictures (#2228), under the chart cards: their own layer,
+    // the chart layer's size, drawn before it.
+    let picture_layer = sheet_picture_layer(
+        view,
+        ent,
+        &PictureGrid {
+            visible: &visible,
+            fr,
+            fc,
+            frozen_w,
+            col0,
+            cend,
+            total_rows: total_rows as u32,
+            top_item: top.item_ix,
+            top_offset: f32::from(top.offset_in_item),
+            vlist: &view.vlist,
+        },
+        chart_ui.picture_sel,
+        pics,
+        probes,
+    );
     // A yellow note box for the selected commented cell (hidden while its entry
     // bar is open), anchored just off the cell's top-right like Excel.
     //
@@ -49803,6 +50263,17 @@ fn sheet_el(
     // (The auto-fill handle is drawn inside its own cell — see sheet_row — where
     // its position is exact; it uses `deferred` to escape occlusion.)
 
+    // The pictures' clipping layer: the same viewport as the chart layer below.
+    let picture_layer = picture_layer.map(|l| {
+        div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .top(px(26. + SHEET_ROW_H))
+            .bottom(px(26.))
+            .overflow_hidden()
+            .child(l)
+    });
     // The clipping layer: spans the rows viewport (under the column header, above
     // the sheet-tab row). Non-interactive, so cell clicks pass through.
     let chart_layer = div()
@@ -49879,6 +50350,8 @@ fn sheet_el(
         })
         .child(bar)
         .child(grid_area)
+        // Pictures sit above the cells and under the charts, clipped the same.
+        .children(picture_layer)
         // Charts sit above the cells but CLIPPED to the rows viewport, so they
         // scroll under the column header rather than floating over the chrome.
         .child(chart_layer)
