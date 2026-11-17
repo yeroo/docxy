@@ -433,7 +433,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   `offline_access`, `openid`, `profile`, `email` and any `.default` scope
   are never missing.
 - `SyncEvent::Scopes { granted, missing }` (`missing` against
-  `AuthConfig::scope`) comes from `announce_scopes`, called after a startup
+  `AuthConfig::scope` and `optional_scope`, `auth::sign_in_scope`: #2218) comes from `announce_scopes`, called after a startup
   load, every `try_refresh` (startup near expiry, and the 401 retries in
   `with_auth` and the outbox's `apply_op_with_retry`) and a sign-in redeem. It is sent only for a known grant that
   differs from `announced_scopes`, a sorted, de-duplicated set of
@@ -457,7 +457,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   refresh after a host added a scope. Now the token keeps working and the
   new scope is in `Scopes { missing }`. It stays missing until a token response
   names it, which an interactive sign-in (`begin_auth`, `redeem_code`: still
-  `cfg.scope` in full) does. An administrator's later consent may make a
+  `cfg.scope` in full, with `optional_scope`: see #2218) does. An administrator's later consent may make a
   refresh response name it too, which is not claimed either way. A refusal
   of the grant itself still signs out (`needs_sign_in`); there is no retry
   with fewer scopes. Tests read a token request's `scope` with
@@ -5405,3 +5405,90 @@ reply went out unthreaded and a forward without the original's attachments.
     `a_refused_create_reply_fails_the_send_back_to_drafts`,
     `a_create_reply_5xx_keeps_the_send_queued` (500 and 503),
     `a_link_round_during_a_failed_patch_keeps_the_answer_draft_s_fields`.
+
+## Optional scopes and the consent fallback (#2218)
+
+A client may ask for scopes it can do without (other people's photos and presence:
+`User.ReadBasic.All`, `Presence.Read.All`). A tenant that never granted them refused every
+interactive sign-in (`consent_required` / AADSTS65001, or `access_denied` / AADSTS65004 when the
+person declines the consent screen), so mail stopped until an administrator consented.
+
+- **The scopes** (`auth.rs`). `AuthConfig::optional_scope` is space-separated like `scope`, and
+  empty by default (lookxy leaves it so). `sign_in_scope(cfg)` is `cfg.scope` followed by the
+  optional scopes it does not already name (compared as `missing_scopes` compares, each once, as
+  `optional_scope` spells them). When the optional list adds nothing (empty, blank, or only
+  scopes `scope` names) it is `cfg.scope` byte for byte, so such a caller's requests are as
+  before. `begin_auth` asks it; `begin_auth_with_scope(cfg, uri, scope)` asks `scope`.
+  `AuthRequest` keeps the scope it asked (`scope()`), and `redeem_code` posts that, not
+  `cfg.scope`: redemption asks what was authorized.
+- **A refusal for consent.** The rule is `auth::is_consent_refusal(error, description)`:
+  - `error` (trimmed, any ASCII case) is `consent_required`; or
+  - the description's leading `AADSTS<n>:` is 65001 or 65004. The parse is `aadsts_of`,
+    shared with `AuthError::aadsts`. Entra sends 65001 under `consent_required`,
+    `interaction_required` and `invalid_grant`.
+
+  A bare `access_denied`, which a person cancelling the account picker also gets, is not one.
+  It applies in two places:
+  - The token endpoint: `AuthError::consent_refused()`, for a `Denied` only.
+  - The redirect: `handle_redirect` and `listen_for_code` fail with `RedirectFailure { message,
+    consent }`, whose `message` is the text as before. `consent` is set only for a redirect
+    whose `state` matched and that carries an `error`; it is read from the raw percent-decoded
+    values. A state mismatch, a timeout, a malformed request or a missing code is never
+    `consent`.
+- **The fallback** (`Engine::sign_in`). `full = sign_in_scope(cfg)` is computed once.
+  `sign_in_attempt(scope)` binds its own `127.0.0.1:0` listener, emits `SignInStarted`, listens,
+  and redeems the code. Its result, `SignInAttempt`, is one of:
+  - `Signed(TokenSet)`;
+  - `NotStarted`: no listener; its `Error` is already sent;
+  - `Failed { text, consent }`.
+
+  A second attempt, asking `cfg.scope`, runs exactly when the first is `Failed { consent: true }`
+  and `full != cfg.scope`. It has a new port, PKCE and `state`, and no `Error` is sent for the
+  first refusal: one `SignIn` then sends two `SignInStarted`. `Signed` from either attempt runs
+  the success block as before (the token saved, `announce_scopes`, a pass). `NotStarted` is
+  `sign_in_not_started()`. Any other `Failed`, and a failed second attempt, is
+  `Error("sign-in failed: <text>")` then `sign_in_failed()`, as before. Each attempt has its own
+  listener because, after the first error page, the browser may ask that port for
+  `/favicon.ico` or open a connection it never uses. One listener shared by both attempts would
+  take that for the second redirect and fail it ("redirect state did not match", or a 10 s read
+  timeout). With the first listener dropped, such a request is refused, as before.
+- **Missing.** `announce_scopes`' `missing` is `missing_scopes(&sign_in_scope(cfg), &granted)` at
+  every announcement (startup, refresh, sign-in). After a fallback the optional scopes are in it,
+  and the client decides what to say.
+- **Refresh.** `auth::refresh` posts `refresh_scope_for(cfg, granted)`:
+  - with no optional scope to add: `refresh_scope(&cfg.scope, granted)` (#2164, unchanged);
+  - with optional scopes and an unknown grant (`None`): `cfg.scope` alone, so such a token goes
+    without them until the next interactive sign-in and is never refused over them;
+  - with a known grant: `refresh_scope(&cfg.scope, Some(g))`, followed by each optional scope
+    `g` holds (a meta optional scope only when `g` lists it).
+
+  So a sign-in that went without the optional scopes never refreshes asking for them, and a
+  granted optional scope is never dropped. Decided: a grant that shares no non-meta scope with
+  `cfg.scope` but holds an optional one asks `cfg.scope` in full (#2164's fallback, whose
+  "shares" test still counts `cfg.scope` alone) plus that optional scope.
+- **Not done.** A refused refresh still signs out, with no retry with fewer scopes (#2164,
+  #2167). Nothing remembers that a tenant refuses the optional scopes: every `SignIn` asks both
+  lists again, and falls back at most once. While the second attempt waits (up to
+  `SIGNIN_TIMEOUT`), commands queue, as during the first. A `SignIn` while signed in (the
+  re-consent case) whose fallback is refused too signs the working session out
+  (`sign_in_failed` then `enter_signin`): that is what any failed `SignIn` did before, not a
+  #2218 regression. lookxy opens the browser on each `SignInStarted`, so a second one works
+  there.
+- Tests:
+  - `auth::tests`: `sign_in_scope_appends_optional_once`,
+    `begin_auth_asks_both_lists_and_redeem_asks_what_was_authorized`, `consent_refusal_rule`,
+    `refresh_scope_for_cases`.
+  - `sync::engine::tests`: `consent_refusal_falls_back_to_the_required_scope`,
+    `declined_consent_falls_back_too`, `a_redeem_refused_for_consent_falls_back`,
+    `a_refused_fallback_signs_in_failed`,
+    `a_stray_request_after_the_consent_refusal_does_not_end_the_fallback` (it fails with a
+    shared listener), `no_fallback_without_optional_scope` (blank or duplicate optional scopes;
+    a refusal at the redirect and at the redemption), `no_fallback_for_other_refusals` (a bare
+    `access_denied`, a consent refusal with a wrong `state`, `invalid_client` at redemption),
+    `a_sign_in_without_refusal_makes_one_authorize`,
+    `a_sign_in_without_the_optional_scopes_never_refreshes_asking_them`,
+    `an_unknown_grant_refreshes_asking_scope_alone`, `startup_reports_missing_optional_scopes`,
+    `handle_redirect_marks_only_consent_refusals`.
+  - The test helpers `next_sign_in_started`, `land_on` and `play_sign_in_started` play the
+    browser for one `SignInStarted` at a time. `sign_in_through_loopback_with` is `SignIn`
+    plus `play_sign_in_started`.
