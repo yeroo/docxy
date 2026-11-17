@@ -3065,8 +3065,11 @@ impl Editor {
     /// not come back (#1728). So is a paragraph that is not a list item but
     /// whose paragraph style chain (or `w:pPrDefault`) gives a nonzero left
     /// indent, when its left was loaded: no `w:left` would bring the style's
-    /// back (#1815). The steps are not relative to that style indent: an
-    /// Increase from none writes 720 over it. A selection that this would leave as it is
+    /// back (#1815). With no left of its own, such a paragraph steps from the
+    /// style's indent where that is in twips, as it is drawn: an Increase
+    /// from a 720 style writes `w:left="1440"`, a Decrease `w:left="0"`, both
+    /// pinned (#2231 r3); over a character-unit style it steps from 0 as
+    /// before. A selection that this would leave as it is
     /// (level-stepping items at the limit, indents already at 0) changes
     /// nothing and records no undo step.
     pub fn change_indent(&mut self, delta: i32) {
@@ -3335,11 +3338,6 @@ impl Editor {
             && paths.iter().all(|path| {
                 resolve_para(&self.doc.body, path).map(|p| p.props.num_id) == Some(Some(num_id))
             })
-    }
-
-    /// Set the bottom border of the selected paragraphs (Word's Borders ▸ Bottom).
-    pub fn set_para_border(&mut self, borders: ParBorders) {
-        self.for_each_para(move |pr| pr.borders = borders);
     }
 
     /// `p`'s borders as shown: its own sides over its style chain's
@@ -4357,6 +4355,23 @@ fn step_indent(pr: &mut ParProps, step: i32, delta: i32, fallback: IndentFallbac
     } else {
         pr.has_loaded_left_indent()
     };
+    // A paragraph drawn at its style's left in twips, with none of its own,
+    // steps from where it is drawn (#2231 r3), and the result is pinned, so
+    // the next step reads it as its own and a Decrease to the margin stays
+    // there: Increase from a 720 style writes 1440, Decrease writes 0.
+    if let IndentFallback::StyleLeft {
+        twips: Some(from), ..
+    } = fallback
+    {
+        if !direct {
+            if delta == 0 {
+                return;
+            }
+            pr.indent = from.saturating_add(delta).max(0);
+            pin_left(pr, pr.indent, fallback);
+            return;
+        }
+    }
     pr.indent = (pr.indent + delta).max(0);
     if delta == 0 {
         return;
@@ -4401,15 +4416,17 @@ enum IndentFallback {
     /// A list item numbered through its paragraph style (#1792).
     StyleNum,
     /// Not a list item; its paragraph style chain (or `w:pPrDefault`) gives a
-    /// nonzero left indent (#1815), in character units when `chars`. Needs
-    /// the styles context.
-    StyleLeft { chars: bool },
+    /// nonzero left indent (#1815), in character units when `chars`; `twips`
+    /// is that indent where it is in twips (`StyleSheet::style_left_twips`),
+    /// which Increase/Decrease step from (#2231 r3). Needs the styles
+    /// context.
+    StyleLeft { chars: bool, twips: Option<i32> },
 }
 
 /// Pin the paragraph's left at `twips` as explicit, keeping a
 /// `w:leftChars="0"` beside it over a style's character-unit indent.
 fn pin_left(pr: &mut ParProps, twips: i32, fallback: IndentFallback) {
-    if fallback == (IndentFallback::StyleLeft { chars: true }) {
+    if matches!(fallback, IndentFallback::StyleLeft { chars: true, .. }) {
         pr.pin_left_indent_over_chars(twips);
     } else {
         pr.pin_left_indent(twips);
@@ -4427,6 +4444,7 @@ fn indent_fallback(styles: Option<&EditStyles>, p: &ParProps) -> IndentFallback 
             Some(sheet) if sheet.style_left_indent(style).is_some_and(|n| n != 0) => {
                 IndentFallback::StyleLeft {
                     chars: sheet.style_left_in_chars(style),
+                    twips: sheet.style_left_twips(style),
                 }
             }
             _ => IndentFallback::None,
@@ -7857,20 +7875,52 @@ mod tests {
         assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
     }
 
-    /// #1815: Increase then Decrease on a styled paragraph with no `w:ind`
-    /// leaves none (back to the style's indent), not `w:left="0"`.
+    /// #2231 r3 (was #1815's "an Increase from none writes 720 over it"): a
+    /// styled paragraph with no `w:ind` steps from the style's 720, where the
+    /// page view draws it, and each step is pinned: Increase writes 1440,
+    /// Decrease back writes 720, and a Decrease from the style writes and
+    /// keeps the margin, after a save and reload too.
     #[test]
-    fn increase_then_decrease_over_a_style_indent_leaves_no_indent() {
+    fn increase_and_decrease_step_from_a_style_indent() {
         let mut ed = loaded_ppr(QUOTE, true);
         ed.change_indent(720);
-        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"1440\"/>");
         ed.change_indent(-720);
-        assert_eq!(saved_ind(&ed), "");
-        // No direct left: nothing to move, no step.
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
+        assert_eq!(ed.undo_names().len(), 2);
+        // Decrease from the style's 720: the margin, pinned, one step.
         let mut ed = loaded_ppr(QUOTE, true);
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+        assert_eq!(ed.undo_names().len(), 1);
+        let back = crate::load::parse_document_xml(
+            &crate::serialize::document_to_xml(&ed.doc),
+            &crate::load::Relationships::default(),
+        );
+        let Block::Paragraph(p) = &back.body[0] else {
+            panic!("a paragraph")
+        };
+        assert!(p.props.has_direct_left_indent() && p.props.indent == 0);
+        // Again at the margin: no step.
+        ed.change_indent(-720);
+        assert_eq!(ed.undo_names().len(), 1);
+        // Through basedOn too.
+        let mut ed = loaded_ppr("<w:pStyle w:val=\"QuoteChild\"/>", true);
+        ed.change_indent(720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"1440\"/>");
+        // A character-unit style steps from 0 as before.
+        let mut ed = loaded_ppr(QUOTE_CHARS, true);
         ed.change_indent(-720);
         assert_eq!(saved_ind(&ed), "");
         assert!(ed.undo_names().is_empty());
+        // A list item still steps its level.
+        let mut ed = loaded_ppr(
+            "<w:pStyle w:val=\"Quote\"/><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"9990\"/></w:numPr>",
+            true,
+        );
+        ed.change_indent(720);
+        assert_eq!(first_props(&ed).ilvl, 1);
+        assert_eq!(saved_ind(&ed), "");
     }
 
     /// #1815: `set_indent(0, ..)` pins over a style indent when the paragraph
