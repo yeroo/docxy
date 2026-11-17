@@ -2185,8 +2185,6 @@ test t
         assert!(e.to_string().contains("before the first case"), "{e}");
     }
 
-    /// #2195: `native-dialog` cancels, or opens a path written as `open`
-    /// takes it; `window click` takes a region `shot` would.
     /// #2195: the file a step opens, for the fixture guard in
     /// `tests/cases.rs`, includes the one a `native-dialog open` types.
     #[test]
@@ -2213,6 +2211,8 @@ test t
         );
     }
 
+    /// #2195: `native-dialog` cancels, or opens a path written as `open`
+    /// takes it; `window click` takes a region `shot` would.
     #[test]
     fn native_dialog_and_window_click_steps() {
         let step = |line: &str| {
