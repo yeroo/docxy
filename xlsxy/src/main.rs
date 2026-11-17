@@ -23191,6 +23191,42 @@ mod tests {
         );
     }
 
+    /// The suite's pictures fixture (#2228) decodes here too: a protocol for
+    /// its PNG and its JPEG (half-blocks, the picker a terminal without a
+    /// graphics protocol gets), and none for bytes that are no picture, so
+    /// the caller draws the labelled box.
+    #[test]
+    fn the_pictures_fixture_decodes_and_a_corrupt_part_does_not() {
+        let bytes = include_bytes!("../../uiharness/fixtures/pictures.xlsx");
+        let pkg = gridcore::xlsx::load_xlsx(bytes).expect("the pictures fixture loads");
+        let parts: Vec<String> = pkg.workbook.sheets[0]
+            .drawings
+            .iter()
+            .filter_map(|d| match &d.kind {
+                gridcore::sheet::DrawingKind::Image { part, .. } => Some(part.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            parts,
+            [
+                "xl/media/image1.png",
+                "xl/media/image2.jpeg",
+                "xl/media/image3.png"
+            ]
+        );
+        let mut app = App::new(pkg, "pictures.xlsx");
+        app.picker = Some(Picker::from_fontsize((8, 16)));
+        for part in &parts {
+            assert!(app.image_proto(part, 12, 6).is_some(), "{part} decodes");
+        }
+        app.pkg.set_part(
+            "xl/media/broken.png",
+            b"\x89PNG\r\n\x1a\n not a picture".to_vec(),
+        );
+        assert!(app.image_proto("xl/media/broken.png", 12, 6).is_none());
+    }
+
     #[test]
     fn image_drawing_falls_back_to_box() {
         use gridcore::sheet::{Drawing, DrawingKind};

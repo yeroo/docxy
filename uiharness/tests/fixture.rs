@@ -617,3 +617,264 @@ fn the_typing_assistance_fixtures_are_what_their_cases_assume() {
         check_fixture(&bytes);
     }
 }
+
+// ---- #2228: floating pictures on a sheet -----------------------------------
+
+/// A picture workbook like the ones the issue came from (screenshots with
+/// notes), made of literals: one sheet, three floating pictures, custom row
+/// heights and a hidden column under the first one.
+///
+/// - Picture 0: a PNG, `twoCellAnchor editAs="oneCell"` over A2:G54, with
+///   offsets into both corners.
+/// - Picture 1: a JPEG, `twoCellAnchor` over J14:O28.
+/// - Picture 2: a PNG, `oneCellAnchor` from J31 with an extent, written the
+///   way Excel writes one (`noChangeAspect`, an `a:extLst/a:ext uri` in the
+///   blip, `a:stretch/a:fillRect`).
+fn pictures_fixture_path() -> PathBuf {
+    fixture("pictures.xlsx")
+}
+
+/// The JPEG of picture 1: 16×16, orange, its top-left quarter blue, so the
+/// way up shows in a screenshot. A baseline JPEG made once with Pillow
+/// (`quality=90, subsampling=0`); the harness has no JPEG encoder, and this
+/// is its whole content.
+const PICTURE_JPEG: [u8; 642] = [
+    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
+    0x00, 0x01, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43, 0x00, 0x03, 0x02, 0x02, 0x03, 0x02, 0x02, 0x03,
+    0x03, 0x03, 0x03, 0x04, 0x03, 0x03, 0x04, 0x05, 0x08, 0x05, 0x05, 0x04, 0x04, 0x05, 0x0a, 0x07,
+    0x07, 0x06, 0x08, 0x0c, 0x0a, 0x0c, 0x0c, 0x0b, 0x0a, 0x0b, 0x0b, 0x0d, 0x0e, 0x12, 0x10, 0x0d,
+    0x0e, 0x11, 0x0e, 0x0b, 0x0b, 0x10, 0x16, 0x10, 0x11, 0x13, 0x14, 0x15, 0x15, 0x15, 0x0c, 0x0f,
+    0x17, 0x18, 0x16, 0x14, 0x18, 0x12, 0x14, 0x15, 0x14, 0xff, 0xdb, 0x00, 0x43, 0x01, 0x03, 0x04,
+    0x04, 0x05, 0x04, 0x05, 0x09, 0x05, 0x05, 0x09, 0x14, 0x0d, 0x0b, 0x0d, 0x14, 0x14, 0x14, 0x14,
+    0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14,
+    0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14,
+    0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0xff, 0xc0,
+    0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, 0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11,
+    0x01, 0xff, 0xc4, 0x00, 0x1f, 0x00, 0x00, 0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+    0x0a, 0x0b, 0xff, 0xc4, 0x00, 0xb5, 0x10, 0x00, 0x02, 0x01, 0x03, 0x03, 0x02, 0x04, 0x03, 0x05,
+    0x05, 0x04, 0x04, 0x00, 0x00, 0x01, 0x7d, 0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21,
+    0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23,
+    0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17,
+    0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a,
+    0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a,
+    0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a,
+    0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99,
+    0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7,
+    0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5,
+    0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1,
+    0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xff, 0xc4, 0x00, 0x1f, 0x01, 0x00, 0x03,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0xff, 0xc4, 0x00, 0xb5, 0x11, 0x00,
+    0x02, 0x01, 0x02, 0x04, 0x04, 0x03, 0x04, 0x07, 0x05, 0x04, 0x04, 0x00, 0x01, 0x02, 0x77, 0x00,
+    0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71, 0x13,
+    0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52, 0xf0, 0x15,
+    0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26, 0x27,
+    0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+    0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88,
+    0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6,
+    0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4,
+    0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe2,
+    0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9,
+    0xfa, 0xff, 0xda, 0x00, 0x0c, 0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3f, 0x00, 0xf9,
+    0x1e, 0xbf, 0x78, 0x3e, 0x1c, 0xfb, 0x62, 0xbf, 0xce, 0x23, 0xfb, 0x2c, 0x28, 0x00, 0xa0, 0x0f,
+    0xff, 0xd9,
+];
+
+/// A `w`×`h` PNG of `body`, its top-left quarter `corner`.
+fn picture_png(w: u32, h: u32, body: [u8; 3], corner: [u8; 3]) -> Vec<u8> {
+    let mut px = Vec::with_capacity((w * h * 4) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let c = if x < w / 2 && y < h / 2 { corner } else { body };
+            px.extend_from_slice(&[c[0], c[1], c[2], 0xff]);
+        }
+    }
+    uiharness::png::encode(&uiharness::image::Image { w, h, px })
+}
+
+/// The rows given 30 pt under picture 0, and the column hidden under it (C).
+const PICTURE_TALL_ROWS: [u32; 3] = [5, 6, 7];
+const PICTURE_HIDDEN_COL: u32 = 2;
+
+const PICTURE_DRAWING: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:twoCellAnchor editAs="oneCell"><xdr:from><xdr:col>0</xdr:col><xdr:colOff>152400</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>47625</xdr:rowOff></xdr:from><xdr:to><xdr:col>6</xdr:col><xdr:colOff>304800</xdr:colOff><xdr:row>53</xdr:row><xdr:rowOff>95250</xdr:rowOff></xdr:to><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Picture 1"/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm><a:off x="152400" y="238125"/><a:ext cx="4419600" cy="10096500"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor><xdr:twoCellAnchor><xdr:from><xdr:col>9</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>13</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>14</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>27</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="3" name="Picture 2"/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId2"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm><a:off x="5486400" y="2476500"/><a:ext cx="3048000" cy="2667000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:twoCellAnchor><xdr:oneCellAnchor><xdr:from><xdr:col>9</xdr:col><xdr:colOff>95250</xdr:colOff><xdr:row>30</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:ext cx="2438400" cy="1143000"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="4" name="Picture 3"/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId3"><a:extLst><a:ext uri="{28A0092B-C50C-407E-A947-70E740481C1C}"/></a:extLst></a:blip><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm><a:off x="5581650" y="5715000"/><a:ext cx="2438400" cy="1143000"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>"#;
+
+const PICTURE_DRAWING_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image2.jpeg"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image3.png"/></Relationships>"#;
+
+const PICTURE_SHEET_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#;
+
+/// The media parts of the pictures fixture, by part name.
+fn picture_media() -> [(&'static str, Vec<u8>); 3] {
+    [
+        (
+            "xl/media/image1.png",
+            picture_png(48, 96, [0x9f, 0xc5, 0xe8], [0xc0, 0x30, 0x30]),
+        ),
+        ("xl/media/image2.jpeg", PICTURE_JPEG.to_vec()),
+        (
+            "xl/media/image3.png",
+            picture_png(64, 32, [0x8f, 0xd1, 0x8a], [0x40, 0x40, 0x40]),
+        ),
+    ]
+}
+
+fn build_pictures() -> Vec<u8> {
+    let mut pkg = typed_workbook(&[
+        (0, 0, "Pictures fixture (#2228)"),
+        (0, 9, "Beside it: a JPEG"),
+        (29, 9, "Below it: a one-cell picture"),
+        // Under picture 1, for the case's Delete with the picture selected.
+        (16, 10, "Under the JPEG"),
+    ]);
+    let sheet = &mut pkg.workbook.sheets[0];
+    for r in PICTURE_TALL_ROWS {
+        sheet.set_row_height(r, Some(30.0));
+    }
+    sheet.set_col_hidden(PICTURE_HIDDEN_COL, true);
+    // The drawing goes in as parts: the model reads pictures but has no way
+    // to make one, so the worksheet names the drawing part, which names the
+    // media, as Excel writes them.
+    let mut pkg = load_xlsx(&save_xlsx(&pkg)).expect("the base workbook");
+    let ws_name = "xl/worksheets/sheet1.xml";
+    let ws = String::from_utf8(pkg.part(ws_name).expect("the worksheet").to_vec()).unwrap();
+    assert!(
+        !ws.contains("<drawing"),
+        "the base sheet has no drawing yet"
+    );
+    // `<drawing>` is the last child this sheet has room for (after
+    // `sheetData`; it has no page setup or table parts), and its `r:` prefix
+    // needs declaring, which a sheet with no relationships did not.
+    let ws = ws.replacen("</worksheet>", "<drawing r:id=\"rId1\"/></worksheet>", 1);
+    let rel_ns = "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"";
+    let ws = if ws.contains("xmlns:r=") {
+        ws
+    } else {
+        ws.replacen("<worksheet ", &format!("<worksheet {rel_ns} "), 1)
+    };
+    pkg.set_part(ws_name, ws.into_bytes());
+    pkg.set_part(
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        PICTURE_SHEET_RELS.into(),
+    );
+    pkg.set_part("xl/drawings/drawing1.xml", PICTURE_DRAWING.into());
+    pkg.set_part(
+        "xl/drawings/_rels/drawing1.xml.rels",
+        PICTURE_DRAWING_RELS.into(),
+    );
+    for (name, bytes) in picture_media() {
+        pkg.set_part(name, bytes);
+    }
+    let types = String::from_utf8(pkg.part("[Content_Types].xml").unwrap().to_vec()).unwrap();
+    let types = types.replacen(
+        "</Types>",
+        "<Default Extension=\"png\" ContentType=\"image/png\"/>\
+         <Default Extension=\"jpeg\" ContentType=\"image/jpeg\"/>\
+         <Override PartName=\"/xl/drawings/drawing1.xml\" \
+         ContentType=\"application/vnd.openxmlformats-officedocument.drawing+xml\"/></Types>",
+        1,
+    );
+    pkg.set_part("[Content_Types].xml", types.into_bytes());
+    save_xlsx(&pkg)
+}
+
+fn check_pictures(bytes: &[u8]) {
+    use gridcore::sheet::AnchorKind;
+    let pkg = load_xlsx(bytes).expect("the pictures fixture is a readable xlsx");
+    let sheet = &pkg.workbook.sheets[0];
+    let pictures: Vec<_> = sheet
+        .drawings
+        .iter()
+        .filter_map(|d| match &d.kind {
+            DrawingKind::Image { part, name } => Some((d, part.as_str(), name.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(pictures.len(), 3, "three pictures");
+    let (p0, part0, name0) = pictures[0];
+    assert_eq!((part0, name0), ("xl/media/image1.png", "Picture 1"));
+    assert_eq!((p0.from, p0.to), ((1, 0), (53, 6)), "A2:G54");
+    assert_eq!(p0.anchor.from_off, (47625, 152400));
+    let (p1, part1, _) = pictures[1];
+    assert_eq!(part1, "xl/media/image2.jpeg");
+    assert_eq!((p1.from, p1.to), ((13, 9), (27, 14)), "J14:O28");
+    let (p2, part2, _) = pictures[2];
+    assert_eq!(part2, "xl/media/image3.png");
+    assert_eq!(p2.anchor.kind, AnchorKind::OneCell);
+    assert_eq!(p2.anchor.ext, Some((2438400, 1143000)));
+    for r in PICTURE_TALL_ROWS {
+        assert_eq!(sheet.row_height(r), Some(30.0), "row {}", r + 1);
+    }
+    assert!(sheet.col_hidden(PICTURE_HIDDEN_COL), "column C is hidden");
+    for (name, media) in picture_media() {
+        assert_eq!(pkg.part(name), Some(media.as_slice()), "{name}");
+    }
+}
+
+fn pictures_fixture_bytes() -> &'static [u8] {
+    static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+    BYTES.get_or_init(|| {
+        read_generated_fixture(
+            &pictures_fixture_path(),
+            std::env::var_os("UIHARNESS_REGEN_FIXTURE").is_some(),
+            build_pictures,
+            check_pictures,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    })
+}
+
+#[test]
+fn the_pictures_fixture_is_what_its_case_expects() {
+    check_pictures(pictures_fixture_bytes());
+}
+
+#[test]
+fn the_committed_pictures_fixture_matches_the_generator() {
+    // Through the loader, as for the other fixtures: the parts that hold the
+    // pictures, and what the model reads of them.
+    let generated = load_xlsx(&build_pictures()).unwrap();
+    let committed = load_xlsx(pictures_fixture_bytes()).unwrap();
+    let why = "regenerate with UIHARNESS_REGEN_FIXTURE=1 cargo test -p uiharness --test fixture";
+    for part in [
+        "xl/drawings/drawing1.xml",
+        "xl/drawings/_rels/drawing1.xml.rels",
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        "xl/media/image1.png",
+        "xl/media/image2.jpeg",
+        "xl/media/image3.png",
+    ] {
+        assert_eq!(generated.part(part), committed.part(part), "{part} — {why}");
+    }
+    let (g, c) = (&generated.workbook.sheets[0], &committed.workbook.sheets[0]);
+    assert_eq!(stable_fixture_cells(g), stable_fixture_cells(c), "{why}");
+    assert_eq!(g.drawings, c.drawings, "{why}");
+}
+
+/// Opening the pictures workbook and saving it, nothing edited, keeps every
+/// drawing part, its relationships and the media byte for byte (#2228).
+#[test]
+fn an_unedited_save_keeps_the_pictures_byte_for_byte() {
+    let loaded = load_xlsx(pictures_fixture_bytes()).unwrap();
+    let saved = load_xlsx(&save_xlsx(&loaded)).unwrap();
+    let parts: Vec<&str> = loaded
+        .part_names()
+        .into_iter()
+        .filter(|n| n.starts_with("xl/drawings/") || n.starts_with("xl/media/"))
+        .collect();
+    assert_eq!(parts.len(), 5, "{parts:?}");
+    for part in parts {
+        assert_eq!(
+            saved.part(part),
+            loaded.part(part),
+            "{part} changed on save"
+        );
+    }
+    assert_eq!(
+        saved.workbook.sheets[0].drawings,
+        loaded.workbook.sheets[0].drawings
+    );
+}
