@@ -345,7 +345,7 @@ fn failed(e: impl std::fmt::Display) -> SecretStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::TokenSet;
+    use crate::auth::{Cloud, TokenSet};
     use crate::tokencache::{Storage, clear_in, load_in, save_in};
 
     /// Against a real Secret Service, only with
@@ -373,6 +373,7 @@ mod tests {
             expires_at_unix: 42,
             account: "me@x".into(),
             scopes: Some(vec!["Mail.Read".into()]),
+            cloud: Cloud::Global,
         };
 
         assert_eq!(
@@ -505,7 +506,7 @@ mod tests {
         .unwrap();
     }
 
-    type Fields = (String, String, u64, String, Option<Vec<String>>);
+    type Fields = (String, String, u64, String, Option<Vec<String>>, Cloud);
 
     /// `t`'s fields, comparable (`TokenSet` has no `Debug`, so it is never
     /// printed).
@@ -516,6 +517,7 @@ mod tests {
             t.expires_at_unix,
             t.account.clone(),
             t.scopes.clone(),
+            t.cloud,
         )
     }
 
@@ -526,6 +528,7 @@ mod tests {
             expires_at_unix: t.expires_at_unix,
             account: t.account.clone(),
             scopes: t.scopes.clone(),
+            cloud: t.cloud,
         }
     }
 }

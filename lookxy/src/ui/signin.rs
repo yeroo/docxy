@@ -108,6 +108,9 @@ pub(crate) fn signin_reason_text(reason: &SignInReason) -> String {
         SignInReason::Rejected => "Microsoft 365 refused your sign-in. Sign in again.".to_string(),
         SignInReason::SignedOut => "You signed out.".to_string(),
         SignInReason::SignInFailed => "The sign-in didn't finish. Try again.".to_string(),
+        SignInReason::OtherCloud { .. } => {
+            "Your saved sign-in is for another Microsoft cloud. Sign in again.".to_string()
+        }
         _ => "Not signed in.".to_string(),
     }
 }
@@ -115,6 +118,7 @@ pub(crate) fn signin_reason_text(reason: &SignInReason) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mailcore::auth::Cloud;
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
@@ -170,6 +174,13 @@ mod tests {
             (
                 SignInReason::SignInFailed,
                 "The sign-in didn't finish. Try again.",
+            ),
+            // #2225: a saved sign-in of another Microsoft cloud.
+            (
+                SignInReason::OtherCloud {
+                    saved: Cloud::UsGov,
+                },
+                "Your saved sign-in is for another Microsoft cloud. Sign in again.",
             ),
         ];
         for (reason, want) in cases {

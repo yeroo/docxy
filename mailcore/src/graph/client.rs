@@ -1,7 +1,8 @@
 //! Blocking Microsoft Graph REST client, over `ureq`.
 //!
 //! `base` is injectable so tests point it at the in-process fake server
-//! (`crate::testserver`); production passes `https://graph.microsoft.com/v1.0`.
+//! (`crate::testserver`); production passes the cloud's Graph root + `/v1.0`
+//! (`https://graph.microsoft.com/v1.0` in the global cloud, #2225).
 //! Every request sends `Authorization: Bearer {token}` and
 //! `Accept: application/json`. Token refresh is not this client's job — on
 //! `GraphError::Unauthorized` it just returns the error; the sync engine

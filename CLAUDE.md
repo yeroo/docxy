@@ -199,7 +199,8 @@ issue number to find its notes.
   reply or forward draft created through createReply/createForward (#2212), a sign-in
   refused for consent to `optional_scope` retried with `scope` alone, the optional
   scopes in `missing` and in a refresh only once granted (#2218), a meeting request's
-  update facts in FetchMeetingMessage's answer (#2185).
+  update facts in FetchMeetingMessage's answer (#2185), national clouds: the login
+  host and Graph root per `AuthConfig::cloud`, a saved token's cloud (#2225).
 
 ## Build and test
 
