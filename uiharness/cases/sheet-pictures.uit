@@ -1,0 +1,86 @@
+# Floating pictures on the suite's sheet view (#2228). The fixture is the
+# harness's own (`uiharness/tests/fixture.rs`, `build_pictures`): three
+# pictures as Excel writes them, a PNG over A2:G54 with custom row heights and
+# hidden column C under it, a JPEG over J14:O28 and a one-cell PNG from J31.
+# Where each one lands is pinned by `sheet_pictures`' own tests; these cases
+# are the pixels, the press and the keys.
+#
+#   cargo run -p uiharness -- run uiharness/cases/sheet-pictures.uit
+
+test the sheet draws its pictures
+  open ../fixtures/pictures.xlsx
+  assert picture_sel is null
+  shot grid
+  shot picture:0
+  shot picture:1
+  # The one-cell picture (J31) is below the first screen.
+  call pointer-wheel {"region":"grid","dy":-300}
+  assert sheet_scroll is not 0
+  shot grid
+
+test a click selects a picture and Escape lets it go
+  open ../fixtures/pictures.xlsx
+  click K17
+  snapshot K17
+  call pointer-click {"region":"picture:1"}
+  assert picture_sel is 1
+  assert sel_hidden is true
+  shot grid
+  # Delete has no picture to delete yet, and must not erase the cell the
+  # picture covers, which the selection hides.
+  call real-key {"key":"delete"}
+  assert picture_sel is 1
+  assert cells unchanged
+  call real-key {"key":"escape"}
+  assert picture_sel is null
+  assert sel_hidden is false
+
+test a press on a cell takes the selection back from a picture
+  open ../fixtures/pictures.xlsx
+  # `picture:N` is the whole picture, which may run past the view: picture 0
+  # (A2:G54) centres below the window, so the press goes to picture 1.
+  call pointer-click {"region":"picture:1"}
+  assert picture_sel is 1
+  call pointer-click {"region":"cell:I5"}
+  assert picture_sel is null
+  assert sel_hidden is false
+  assert range is I5
+
+test the wheel over a picture scrolls the grid
+  open ../fixtures/pictures.xlsx
+  assert sheet_scroll is 0
+  call pointer-wheel {"region":"picture:1","dy":-600}
+  assert sheet_scroll is not 0
+
+# The picture layer starts under the formula bar as it is drawn: expanded
+# (Ctrl+Shift+U) it is 54 px taller, and a layer pinned to the one-line bar
+# drew picture 1 two rows up, over K13.
+test with the formula bar expanded a picture stays on its cells
+  open ../fixtures/pictures.xlsx
+  call real-key {"key":"ctrl+shift+u"}
+  assert fx_expanded is true
+  call pointer-click {"region":"cell:K13"}
+  assert picture_sel is null
+  assert range is K13
+  # L15 lies under the picture's top: the press finds the picture there. (The
+  # shorter grid puts picture 1's own centre below the window.)
+  call pointer-click {"region":"cell:L15"}
+  assert picture_sel is 1
+  assert range is K13
+  shot grid
+  # The bar is the window's, not the case's: put it back for the next case.
+  call real-key {"key":"ctrl+shift+u"}
+  assert fx_expanded is false
+
+# A press on a picture held and moved over it does not sweep the cells it
+# covers, and a right-press selects it with no cell menu.
+test a press moved on a picture keeps it selected and the cells unswept
+  open ../fixtures/pictures.xlsx
+  assert range is A1
+  call pointer-drag {"from":"picture:1","to":"picture:1","offset":[40,30]}
+  assert picture_sel is 1
+  assert range is A1
+  call real-key {"key":"escape"}
+  call pointer-click {"region":"picture:1","button":"right"}
+  assert picture_sel is 1
+  assert menu is null

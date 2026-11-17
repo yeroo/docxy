@@ -999,6 +999,9 @@ pub enum Region {
     Cells(u32, u32, u32, u32),
     /// A chart card on the sheet, by index — the same index `select-chart` uses.
     Chart(usize),
+    /// A floating picture on the sheet (#2228), by its index among the
+    /// sheet's pictures in drawing order: its piece in the scrolled cells.
+    Picture(usize),
     /// Visible Project Gantt chart body, excluding its date header.
     Gantt,
     /// Visible part of a task bar, addressed by displayed task ID.
@@ -1311,8 +1314,17 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
                 .map_err(|_| format!("'{a}' is not a chart index (they count from 0)"))?;
             Ok(Region::Chart(i))
         }
+        "picture" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or_else(|| "'picture' needs an index, e.g. picture:0".to_string())?;
+            let i: usize = a
+                .parse()
+                .map_err(|_| format!("'{a}' is not a picture index (they count from 0)"))?;
+            Ok(Region::Picture(i))
+        }
         other => Err(format!(
-            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-heading:Duration, project-heading-arrow:Duration, project-heading-edge:Duration, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, ribbon-launch:Number, filter-button:B)"
+            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, picture:0, gantt, bar:3, project-heading:Duration, project-heading-arrow:Duration, project-heading-edge:Duration, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, ribbon-launch:Number, filter-button:B)"
         )),
     }
 }
@@ -1355,6 +1367,7 @@ pub fn region_name(region: Region) -> String {
         Region::ChartPanel => "chart-panel".into(),
         Region::Cells(r0, c0, r1, c1) => format!("cell:{}", a1_range((r0, c0, r1, c1))),
         Region::Chart(i) => format!("chart:{i}"),
+        Region::Picture(i) => format!("picture:{i}"),
         Region::Gantt => "gantt".into(),
         Region::Bar(id) => format!("bar:{id}"),
         Region::ProjectHeading(c) => format!(
@@ -5178,6 +5191,13 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
             ),
             ("editing", Json::Bool(v.editing.is_some())),
             ("edit", str_or_null(v.editing.clone())),
+            // The row list's top item (the first scrolled row, counted past
+            // the frozen ones and the hidden ones): a wheel over the grid, a
+            // picture on it included (#2228), moves it.
+            (
+                "sheet_scroll",
+                Json::Num(v.vlist.logical_scroll_top().item_ix as f64),
+            ),
             // Flash Fill's greyed preview (#666): the range it covers and the
             // values Enter would write, or null.
             (
@@ -5255,6 +5275,8 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
     let ov = app.grid_overlay();
     out.extend([
         ("chart_sel", num_or_null(app.chart_sel)),
+        // The selected floating picture (#2228), by its index on the sheet.
+        ("picture_sel", num_or_null(app.picture_sel)),
         ("panel_chart", num_or_null(app.panel_chart_shown())),
         ("charts", Json::Num(app.chart_count() as f64)),
         (
@@ -11105,12 +11127,12 @@ mod tests {
             );
         }
         assert_eq!(
-            fill_press_refusal(false, false, Some(ChartSelected), true),
+            fill_press_refusal(false, false, Some(ObjectSelected), true),
             Ok(())
         );
         assert_eq!(
-            fill_press_refusal(false, false, Some(ChartSelected), false),
-            Err("the fill handle is not shown: a chart is selected".into())
+            fill_press_refusal(false, false, Some(ObjectSelected), false),
+            Err("the fill handle is not shown: a chart or picture is selected".into())
         );
     }
 
@@ -11456,6 +11478,8 @@ mod tests {
     fn a_chart_region_takes_an_index() {
         assert_eq!(parse_region("chart:0"), Ok(Region::Chart(0)));
         assert_eq!(parse_region("chart:12"), Ok(Region::Chart(12)));
+        assert_eq!(parse_region("picture:2"), Ok(Region::Picture(2)));
+        assert!(parse_region("picture:x").is_err());
     }
 
     /// #545 (FIX r1 M1): `offset` is optional, is a two-number array, and is
@@ -11668,6 +11692,7 @@ mod tests {
             Region::Cells(2, 1, 2, 1),
             Region::Cells(0, 0, 4, 2),
             Region::Chart(3),
+            Region::Picture(2),
             Region::Gantt,
             Region::Bar(3),
             Region::ProjectHeading(0),

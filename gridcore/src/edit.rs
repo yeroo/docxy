@@ -4119,6 +4119,7 @@ mod tests {
         let mut w = wb(&[("A1", Cell::number(1.0))]);
         w.sheets[0].name = "Data".into();
         w.sheets[0].drawings.push(Drawing {
+            anchor: Default::default(),
             anchor_ix: 0,
             from: (0, 0),
             to: (5, 5),
@@ -4167,6 +4168,7 @@ mod tests {
         let mut w = wb(&[("A1", Cell::number(1.0))]);
         w.sheets[0].name = "Data".into();
         w.sheets[0].drawings.push(Drawing {
+            anchor: Default::default(),
             anchor_ix: 0,
             from: (0, 0),
             to: (5, 5),
@@ -4274,6 +4276,7 @@ mod tests {
         let mut w = wb(&[("A1", Cell::number(1.0))]);
         w.sheets[0].name = "Data".into();
         w.sheets[0].drawings.push(Drawing {
+            anchor: Default::default(),
             anchor_ix: 0,
             from: (0, 0),
             to: (5, 5),
@@ -4434,6 +4437,7 @@ mod tests {
         w.sheets.push(crate::sheet::Sheet {
             name: "Report".into(),
             drawings: vec![Drawing {
+                anchor: Default::default(),
                 anchor_ix: 0,
                 from: (0, 0),
                 to: (5, 5),

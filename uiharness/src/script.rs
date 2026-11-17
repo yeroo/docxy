@@ -1098,7 +1098,7 @@ fn parse_is(rest: &str, line: usize, whole: &str) -> Result<(bool, bool, String)
 // ---------------------------------------------------------------------------
 
 /// The region names, for an error message. Mirrors `harness::parse_region`.
-pub const REGION_WORDS: &str = "window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, ribbon-launch:Number, gallery-more:fixture.wide, filter-button:B";
+pub const REGION_WORDS: &str = "window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, picture:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, ribbon-launch:Number, gallery-more:fixture.wide, filter-button:B";
 
 /// A region name a script may use, normalized to the form the app's `rect`
 /// verb takes (`A1:C5` becomes `cell:A1:C5`).
@@ -1151,6 +1151,15 @@ pub fn validate_region(name: &str) -> Result<String, String> {
                 .ok_or_else(|| "'chart' needs an index, e.g. chart:0".to_string())?;
             a.parse::<usize>()
                 .map_err(|_| format!("'{a}' is not a chart index (they count from 0)"))?;
+            Ok(full.clone())
+        }
+        // A floating picture on the sheet (#2228), by its index in drawing order.
+        "picture" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or_else(|| "'picture' needs an index, e.g. picture:0".to_string())?;
+            a.parse::<usize>()
+                .map_err(|_| format!("'{a}' is not a picture index (they count from 0)"))?;
             Ok(full.clone())
         }
         "tab-more-item" => {
@@ -1975,6 +1984,7 @@ test Smoke-Case
             ("A1:C5", "cell:A1:C5"),
             ("cell:A1:C5", "cell:A1:C5"),
             ("chart:0", "chart:0"),
+            ("picture:2", "picture:2"),
             ("gantt", "gantt"),
             ("bar:3", "bar:3"),
             ("project-hbar-table", "project-hbar-table"),
@@ -1995,6 +2005,11 @@ test Smoke-Case
         assert!(validate_region("project-timeline:1").is_err());
         assert!(validate_region("project-split:1").is_err());
         assert!(validate_region("bar:abc").is_err());
+        assert!(validate_region("picture:x").is_err());
+        assert!(
+            validate_region("picture").is_err(),
+            "a picture needs its index"
+        );
         assert!(validate_region("gantt:1").is_err());
         assert!(validate_region("grid:1").is_err(), "grid takes no argument");
         assert!(

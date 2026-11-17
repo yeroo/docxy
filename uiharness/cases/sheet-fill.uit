@@ -42,7 +42,7 @@ test fill-drag refuses while the handle is not drawn
   assert cell B6 is nothing
   key escape
   select chart 0
-  call-error fill-drag {"to":"D4"} => the fill handle is not shown: a chart is selected
+  call-error fill-drag {"to":"D4"} => the fill handle is not shown: a chart or picture is selected
   # A click on `from` takes the selection back from the chart, as the pointer's would.
   call fill-drag {"from":"B4:B5","to":"B6"}
   assert reply.filled is B4:B6

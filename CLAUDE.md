@@ -118,7 +118,9 @@ issue number to find its notes.
   Font Size boxes (#1344) or Save As names (#804, #1807), or the number-format runtime's
   fractions and seconds: sheet names Excel refuses on rename, fixed-denominator fractions,
   `mm:ss.0` tenths (#2115), or the cell editor's commit on a protected sheet and Protect
-  Sheet committing an open entry first (#1054).
+  Sheet committing an open entry first (#1054), or floating pictures: their anchors, an
+  unedited save keeping the drawing part, where the sheet view draws them, their
+  cache and selection (#2228).
 - `docs/claude/sheet-file.md`: before changing a sheet's notes, slicers, data validation
   or hyperlinks in `gridcore` (and the dialogs and Undo over them): notes that follow
   row/column insert and delete (#1335), table slicers on save and Undo of a table step

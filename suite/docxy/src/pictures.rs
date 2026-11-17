@@ -48,6 +48,17 @@ pub struct Cache {
     /// Images no map holds any more, still decoded in gpui's asset cache
     /// until a host with an `App` releases them ([`Cache::take_released`]).
     retired: Vec<Arc<Image>>,
+    /// A sheet tab's floating pictures (#2228), by media part. A sheet's
+    /// package has no parts stamp, so each entry remembers the bytes it was
+    /// made from ([`Cache::sheet_image`]).
+    sheet: HashMap<String, SheetPicture>,
+}
+
+/// One media part a sheet draws: the address and length of the bytes its
+/// image was made from, and the image (`None` when gpui can't draw them).
+struct SheetPicture {
+    from: (usize, usize),
+    image: Option<Arc<Image>>,
 }
 
 impl Cache {
@@ -69,8 +80,43 @@ impl Cache {
         if all {
             out.extend(self.images.drain().filter_map(|(_, img)| img));
             out.extend(self.stale.drain().filter_map(|(_, img)| img));
+            out.extend(self.sheet.drain().filter_map(|(_, p)| p.image));
         }
         out
+    }
+
+    /// The image of a sheet's media part `part` holding `bytes` (#2228),
+    /// made once and kept across frames. The same bytes (by address and
+    /// length) reuse it without a look; bytes that moved (an undo swaps the
+    /// whole package, a reload reads it again) are compared with the image's
+    /// own, and only different bytes make a new image, the old one retired.
+    /// `None` (kept too) when the bytes are no picture gpui draws: PNG,
+    /// JPEG, GIF and BMP are.
+    pub fn sheet_image(&mut self, part: &str, bytes: &[u8]) -> Option<Arc<Image>> {
+        let from = (bytes.as_ptr() as usize, bytes.len());
+        if let Some(hit) = self.sheet.get_mut(part) {
+            if hit.from == from {
+                return hit.image.clone();
+            }
+            if hit.image.as_ref().is_some_and(|img| img.bytes == bytes) {
+                hit.from = from;
+                return hit.image.clone();
+            }
+        }
+        let image = docxcore::image::sniff(bytes)
+            .and_then(|kind| format_of(kind.ext))
+            .map(|format| Arc::new(Image::from_bytes(format, bytes.to_vec())));
+        let old = self.sheet.insert(
+            part.to_string(),
+            SheetPicture {
+                from,
+                image: image.clone(),
+            },
+        );
+        if let Some(old) = old.and_then(|p| p.image) {
+            self.retired.push(old);
+        }
+        image
     }
 
     /// The image of a file that is not a package part: a help manual's
@@ -95,6 +141,7 @@ impl Cache {
             .values()
             .chain(self.stale.values())
             .flatten()
+            .chain(self.sheet.values().filter_map(|p| p.image.as_ref()))
             .map(|img| img.id)
     }
 }
@@ -638,6 +685,40 @@ mod tests {
         carry(&mut pkg, &header, &media, &mut clip);
         assert_eq!(clip, copied);
         assert_eq!(pkg.parts_stamp(), before);
+    }
+
+    /// A sheet's picture is made once (#2228): the same bytes give the same
+    /// image, bytes that moved but did not change keep it, changed bytes
+    /// retire it, and bytes gpui can't draw give none.
+    #[test]
+    fn a_sheet_picture_is_made_once_and_replaced_when_its_bytes_change() {
+        let mut cache = Cache::default();
+        let bytes = png(1);
+        let first = cache.sheet_image("xl/media/image1.png", &bytes).unwrap();
+        let again = cache.sheet_image("xl/media/image1.png", &bytes).unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        // An undo's package: the same bytes somewhere else.
+        let moved = bytes.clone();
+        let after_undo = cache.sheet_image("xl/media/image1.png", &moved).unwrap();
+        assert!(Arc::ptr_eq(&first, &after_undo));
+        assert!(cache.take_released(false).is_empty());
+        // Other bytes under the same part: a new image, the old one retired.
+        let changed = png(2);
+        let second = cache.sheet_image("xl/media/image1.png", &changed).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        let retired = cache.take_released(false);
+        assert_eq!(retired.len(), 1);
+        assert!(Arc::ptr_eq(&retired[0], &first));
+        assert!(cache.live_ids().any(|id| id == second.id));
+        // Not a picture: none, and nothing to release for it.
+        assert!(
+            cache
+                .sheet_image("xl/media/image2.emf", b"\x01\0\0\0 emf")
+                .is_none()
+        );
+        let all = cache.take_released(true);
+        assert_eq!(all.len(), 1);
+        assert!(Arc::ptr_eq(&all[0], &second));
     }
 
     #[test]
