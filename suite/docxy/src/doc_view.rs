@@ -1723,8 +1723,8 @@ impl Render for DocView {
         // measurer measures in, so measured = drawn.
         let doc_font = crate::doc_text_family(window);
         let measurer = Measurer::for_document(window, doc_font.clone());
-        let sheet = self.run_styles.borrow_mut().current(self.pkg.as_ref()).1;
-        let tbl = TableCtx::new(self.pkg.as_ref(), sheet, false);
+        let parts = self.run_styles.borrow_mut().parts(self.pkg.as_ref());
+        let tbl = TableCtx::new(self.pkg.as_ref(), parts, false);
         let pics = self
             .pkg
             .as_ref()
@@ -3155,6 +3155,7 @@ pub(crate) fn word_face_json(
             sheet,
             cell: None,
             pstyle: p.props.style_id.as_deref(),
+            ..Default::default()
         };
         let shown = styler.shown(r);
         Some((shown.bold, shown.italic))

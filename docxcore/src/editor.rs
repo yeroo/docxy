@@ -3190,6 +3190,22 @@ impl Editor {
         });
     }
 
+    /// After an indent edit that wrote the first lines a host draws (the
+    /// suite's ruler, #2231): each selected list item whose first line is
+    /// now 0 has it pinned as an explicit `w:firstLine="0"`
+    /// ([`ParProps::pin_first_line`]), so its numbering level's hanging
+    /// indent does not come back, in session or after a reload. Rides on the
+    /// edit's own undo step (no checkpoint).
+    pub fn pin_zero_first_lines(&mut self) {
+        for path in self.selected_para_paths() {
+            if let Some(p) = para_mut(&mut self.doc.body, &path) {
+                if p.props.in_list() && p.props.first_line == 0 {
+                    p.props.pin_first_line(0);
+                }
+            }
+        }
+    }
+
     /// Set the right indent (twips, clamped at 0) of the selected paragraphs.
     pub fn set_right_indent(&mut self, right: i32) {
         self.for_each_para(move |pr| {

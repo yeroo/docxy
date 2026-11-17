@@ -5,10 +5,11 @@
 //! fonts resolved: #1972).
 
 use docxcore::model::{Run, RunProps};
+use docxcore::numbering::{Numbering, parse_numbering_xml};
 use docxcore::package::Package;
 use docxcore::styles::{StyleSheet, parse_styles_xml};
 use docxcore::table_styles::RunLook;
-use docxcore::theme::parse_theme_fonts;
+use docxcore::theme::{ThemeColors, parse_theme_colors, parse_theme_fonts};
 use std::borrow::Cow;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -21,6 +22,10 @@ pub struct RunStyler<'a> {
     pub sheet: Option<&'a StyleSheet>,
     pub cell: Option<&'a RunLook>,
     pub pstyle: Option<&'a str>,
+    /// The package's numbering part, for a list level's indent (#2231).
+    pub numbering: Option<&'a Numbering>,
+    /// The theme's colours, for a border naming one (#2231).
+    pub colors: Option<&'a ThemeColors>,
 }
 
 impl<'a> RunStyler<'a> {
@@ -77,58 +82,109 @@ pub fn run_size_px(props: &RunProps, base: f32, zoom: f32) -> f32 {
 }
 
 /// A tab's parsed `word/styles.xml`, its theme fonts applied (#1972), kept
-/// across frames. It is read again only when the package's parts moved
-/// ([`Package::parts_stamp`]) and the styles or the theme part is not the
-/// text already held, so a body edit parses nothing.
+/// across frames, with its numbering part and theme colours (#2231). Each is
+/// read again only when the package's parts moved
+/// ([`Package::parts_stamp`]) and its part is not the text already held, so
+/// a body edit parses nothing.
 #[derive(Default)]
 pub struct Cache {
     stamp: Option<u64>,
     xml: Option<Arc<str>>,
     theme: Option<Arc<str>>,
     sheet: Option<Rc<StyleSheet>>,
+    numbering_xml: Option<Arc<str>>,
+    numbering: Option<Rc<Numbering>>,
+    colors: Option<Rc<ThemeColors>>,
     /// How often the part was parsed.
     #[cfg(test)]
     parses: usize,
 }
 
+/// What [`Cache::parts`] holds for a package: its styles, its numbering and
+/// its theme's colours, each `None` without the part.
+#[derive(Clone, Default)]
+pub struct DocParts {
+    pub sheet: Option<Rc<StyleSheet>>,
+    pub numbering: Option<Rc<Numbering>>,
+    pub colors: Option<Rc<ThemeColors>>,
+}
+
+impl DocParts {
+    /// A styler over these parts, for no table cell or paragraph style yet.
+    pub fn styler(&self) -> RunStyler<'_> {
+        RunStyler {
+            sheet: self.sheet.as_deref(),
+            numbering: self.numbering.as_deref(),
+            colors: self.colors.as_deref(),
+            ..Default::default()
+        }
+    }
+}
+
 impl Cache {
     /// The styles text and sheet of `pkg`; `None`s without a package or part.
     pub fn current(&mut self, pkg: Option<&Package>) -> (Option<Arc<str>>, Option<Rc<StyleSheet>>) {
+        self.refresh(pkg);
+        (self.xml.clone(), self.sheet.clone())
+    }
+
+    /// The sheet, numbering and theme colours of `pkg` (#2231).
+    pub fn parts(&mut self, pkg: Option<&Package>) -> DocParts {
+        self.refresh(pkg);
+        DocParts {
+            sheet: self.sheet.clone(),
+            numbering: self.numbering.clone(),
+            colors: self.colors.clone(),
+        }
+    }
+
+    fn refresh(&mut self, pkg: Option<&Package>) {
         let Some(pkg) = pkg else {
-            self.stamp = None;
-            self.xml = None;
-            self.theme = None;
-            self.sheet = None;
-            return (None, None);
+            *self = Cache {
+                #[cfg(test)]
+                parses: self.parses,
+                ..Cache::default()
+            };
+            return;
         };
         let stamp = pkg.parts_stamp();
-        if self.stamp != Some(stamp) {
-            self.stamp = Some(stamp);
-            let text = pkg
-                .part("word/styles.xml")
-                .and_then(|b| std::str::from_utf8(b).ok());
-            let theme_name = pkg.theme_part_name();
-            let theme = theme_name
-                .as_deref()
-                .and_then(|n| pkg.part(n))
-                .and_then(|b| std::str::from_utf8(b).ok());
-            if self.xml.as_deref() != text || self.theme.as_deref() != theme {
-                self.xml = text.map(Arc::from);
-                self.theme = theme.map(Arc::from);
-                #[cfg(test)]
-                if text.is_some() {
-                    self.parses += 1;
-                }
-                self.sheet = text.map(|t| {
-                    let mut sheet = parse_styles_xml(t);
-                    if let Some(theme) = theme {
-                        sheet.apply_theme_fonts(&parse_theme_fonts(theme));
-                    }
-                    Rc::new(sheet)
-                });
-            }
+        if self.stamp == Some(stamp) {
+            return;
         }
-        (self.xml.clone(), self.sheet.clone())
+        self.stamp = Some(stamp);
+        let text = pkg
+            .part("word/styles.xml")
+            .and_then(|b| std::str::from_utf8(b).ok());
+        let theme_name = pkg.theme_part_name();
+        let theme = theme_name
+            .as_deref()
+            .and_then(|n| pkg.part(n))
+            .and_then(|b| std::str::from_utf8(b).ok());
+        if self.xml.as_deref() != text || self.theme.as_deref() != theme {
+            if self.theme.as_deref() != theme {
+                self.colors = theme.map(|t| Rc::new(parse_theme_colors(t)));
+            }
+            self.xml = text.map(Arc::from);
+            self.theme = theme.map(Arc::from);
+            #[cfg(test)]
+            if text.is_some() {
+                self.parses += 1;
+            }
+            self.sheet = text.map(|t| {
+                let mut sheet = parse_styles_xml(t);
+                if let Some(theme) = theme {
+                    sheet.apply_theme_fonts(&parse_theme_fonts(theme));
+                }
+                Rc::new(sheet)
+            });
+        }
+        let numbering = pkg
+            .part("word/numbering.xml")
+            .and_then(|b| std::str::from_utf8(b).ok());
+        if self.numbering_xml.as_deref() != numbering {
+            self.numbering_xml = numbering.map(Arc::from);
+            self.numbering = numbering.map(|n| Rc::new(parse_numbering_xml(n)));
+        }
     }
 }
 
@@ -308,5 +364,41 @@ mod tests {
         };
         assert_eq!(styler.shown(&bold).font, None);
         assert!(matches!(styler.shown(&bold), Cow::Borrowed(_)));
+    }
+
+    /// #2231: the numbering part and the theme's colours ride on the same
+    /// stamp, each read again when its part changes.
+    #[test]
+    fn the_cache_keeps_the_numbering_and_theme_colours() {
+        use docxcore::theme::{ThemeColor, ThemeColorRef};
+        let mut pkg =
+            docxcore::package::load_package(&crate::ext_fixture::theme_font_docx()).expect("loads");
+        let mut cache = Cache::default();
+        assert!(cache.parts(Some(&pkg)).numbering.is_none());
+        pkg.add_markdown_numbering();
+        let parts = cache.parts(Some(&pkg));
+        let n = parts.numbering.expect("a numbering");
+        assert_eq!(
+            n.level_indent(1, 1).map(|i| (i.left, i.first)),
+            Some((Some(1440), Some(-360)))
+        );
+        let accent = ThemeColorRef {
+            name: ThemeColor::Accent1,
+            tint: None,
+            shade: None,
+        };
+        let theme = pkg.theme_part_name().expect("a theme");
+        assert!(pkg.set_part(
+            &theme,
+            br#"<a:theme xmlns:a="x"><a:themeElements><a:clrScheme name="t"><a:accent1><a:srgbClr val="4F81BD"/></a:accent1></a:clrScheme></a:themeElements></a:theme>"#.to_vec(),
+        ));
+        let parts = cache.parts(Some(&pkg));
+        let now = parts.colors.as_ref().and_then(|c| c.resolve(accent));
+        assert_eq!(now, Some(0x4F81BD));
+        assert!(
+            Rc::ptr_eq(&parts.numbering.expect("kept"), &n),
+            "numbering unchanged"
+        );
+        assert!(cache.parts(None).numbering.is_none());
     }
 }
