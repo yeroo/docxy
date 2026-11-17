@@ -8215,25 +8215,9 @@ mod level_indent_tests {
             page_right: 100.0 + tw_px(docxcore::model::PageGeom::default().w, 1.0),
             sect_checkpointed: false,
         };
-        match ruler_drag_result(d, 200.0 + tw_px(delta, 1.0)).change {
-            RulerChange::First(first) => {
-                ed.set_first_line(first);
-                ed.pin_zero_indents(|p| (false, inherits_nonzero(p, parts).1));
-            }
-            RulerChange::Left { indent, first } => {
-                let (paras, starts) = base.for_editor(false);
-                ed.set_indents_from(paras, |i, path| {
-                    ruler_left_for(
-                        indent,
-                        first,
-                        start.left,
-                        ruler_start_at(paras, starts, i, path),
-                    )
-                });
-                ed.pin_zero_indents(|p| inherits_nonzero(p, parts));
-            }
-            other => panic!("{other:?}"),
-        }
+        // The app's own edit, as `ruler_drag_move` makes it.
+        let change = ruler_drag_result(d, 200.0 + tw_px(delta, 1.0)).change;
+        apply_ruler_indent(ed, change, base.for_editor(false), start.left, parts);
     }
 
     /// The first paragraph once saved into docxy's own package and opened.
@@ -10082,6 +10066,38 @@ fn ruler_left_for(marker: i32, first: i32, caret_left: i32, start: RulerStart) -
             (left, own_first.max(-left))
         }
         None => (marker, first.max(-marker)),
+    }
+}
+
+/// A ruler move's indent edit on `e` (`ruler_drag_move`, and the tests that
+/// drive it): a First change sets the selected paragraphs' first line; a
+/// Left change moves each by the drag from where it was drawn (#1986), from
+/// `base` (`RulerIndentBase::for_editor`: the drag start's paths and
+/// starts) and the caret paragraph's drawn left at the start. Then a left or
+/// first line the move left at 0 over an inherited nonzero one is pinned
+/// (`inherits_nonzero` over `parts`, #2231): a First move writes the first
+/// line only, so only that. Other changes are not indent edits here.
+fn apply_ruler_indent(
+    e: &mut Editor,
+    change: RulerChange,
+    base: (&[(Vec<usize>, bool)], &[RulerStart]),
+    caret_left: i32,
+    parts: &run_look::DocParts,
+) {
+    match change {
+        RulerChange::First(first) => {
+            e.set_first_line(first);
+            e.pin_zero_indents(|p| (false, inherits_nonzero(p, parts).1));
+        }
+        RulerChange::Left { indent, first } => {
+            let (paras, starts) = base;
+            e.set_indents_from(paras, |i, path| {
+                let start = ruler_start_at(paras, starts, i, path);
+                ruler_left_for(indent, first, caret_left, start)
+            });
+            e.pin_zero_indents(|p| inherits_nonzero(p, parts));
+        }
+        RulerChange::Right(_) | RulerChange::Margins { .. } => {}
     }
 }
 
@@ -29338,14 +29354,10 @@ impl Docxy {
             .map(|t| t.run_styles.borrow_mut().parts(t.pkg.as_ref()))
             .unwrap_or_default();
         match result.change {
-            // A first line moved to 0 is pinned there where something below
-            // it would give it one, or that would come back (#2231).
-            // It writes the first line only, so only that is pinned.
-            RulerChange::First(first) => self.with_editor(window, cx, |e| {
-                e.set_first_line(first);
-                e.pin_zero_indents(|p| (false, inherits_nonzero(p, &parts).1));
+            RulerChange::First(_) => self.with_editor(window, cx, |e| {
+                apply_ruler_indent(e, result.change, (&[], &[]), d.indent.left, &parts)
             }),
-            RulerChange::Left { indent, first } => {
+            RulerChange::Left { .. } => {
                 // The pin is decided from the drag start, not an earlier move.
                 // A header or footer closed (or opened) mid-drag leaves
                 // `with_editor` editing another editor: no base there.
@@ -29354,18 +29366,15 @@ impl Docxy {
                     .tabs
                     .get(self.active)
                     .is_some_and(|t| t.hf_edit.is_some());
-                // Each paragraph moves by the drag from where it was
-                // drawn (#1986).
-                let (paras, starts) = base.for_editor(hf_now);
                 let caret_left = d.indent.left;
                 self.with_editor(window, cx, |e| {
-                    e.set_indents_from(paras, |i, path| {
-                        let start = ruler_start_at(paras, starts, i, path);
-                        ruler_left_for(indent, first, caret_left, start)
-                    });
-                    // A left (or first line) moved to 0 over an inherited
-                    // one stays 0 (#2231 r1).
-                    e.pin_zero_indents(|p| inherits_nonzero(p, &parts));
+                    apply_ruler_indent(
+                        e,
+                        result.change,
+                        base.for_editor(hf_now),
+                        caret_left,
+                        &parts,
+                    )
                 });
                 self.ruler_indent_base = base;
             }

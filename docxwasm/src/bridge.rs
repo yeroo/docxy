@@ -498,7 +498,8 @@ impl Session {
             "tab" => self.editor.insert_tab(),
             "sort" => self.editor.sort_paragraphs(),
             "hrule" => self.editor.insert_hrule(),
-            // On the rule the paragraph shows, its style's included (#2231).
+            // Its own bottom: this editor carries no styles context, so a
+            // style's rule is not seen here (#2231; the suite's is).
             "borders" => self.editor.toggle_bottom_border(),
             _ => mutated = false,
         }

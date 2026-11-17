@@ -36,8 +36,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   `w:leftChars="0"`, which a lone `w:left` would lose to): at 0 in Decrease when
   its left was loaded (it stays loaded as it moves), in `set_indent` when it
   was direct at the start, and any `set_indent` above 0 on it counts as
-  loaded. The steps are not relative to the style's indent (an Increase from
-  none writes 720 over a 720 style; a follow-up). Needs the styles context.
+  loaded. With no left of its own, Increase/Decrease step from the style's
+  indent where it is in twips (`IndentFallback::StyleLeft { twips }`, from
+  `style_left_twips`), as the page view draws it, and pin the result: from a
+  720 style, Increase writes `w:left="1440"` and Decrease `w:left="0"`
+  (#2231 r3); over a character-count style they step from 0 as before.
+  Needs the styles context.
 - `Package::repair_list_indents` gives docxy's lists (9990/9991) the level
   indents an older build left out, as `ensure_list` does. Every host's
   Increase/Decrease Indent runs it (terminal `docxy` and `docxwasm` before

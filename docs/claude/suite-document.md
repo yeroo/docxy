@@ -573,9 +573,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   the style's below it, direct or in a derived style, and saves back as
   loaded, or as `w:val="nil"` when the borders are rewritten. Bottom
   Border (`Editor::toggle_bottom_border`, its pressed state
-  `shown_bottom_border`; terminal docxy and docxwasm too) acts on the rule
-  shown, the style's included: off over a style's rule writes that cancel,
-  and the paragraph's other sides stay. Every paragraph a context draws
+  `shown_bottom_border`) acts on the rule shown, the style's included: off
+  over a style's rule writes that cancel, and the paragraph's other sides
+  stay. Terminal docxy and docxwasm call the same methods, but their
+  editors carry no styles context (`set_styles_xml`), so there it acts on
+  the paragraph's own bottom only (not wired: it would change their
+  Bold/Italic toggles, #1427). Every paragraph a context draws
   takes `TableCtx::styler()` (styles, numbering and theme colours), read-only
   headers and footers included. gpui
   draws one colour per div border, hence the strips. Word's grouping

@@ -5482,7 +5482,8 @@ impl App {
         if !self.mutation_allowed(protection::MutationKind::Formatting) {
             return;
         }
-        // On the rule the paragraph shows, its style's included (#2231).
+        // Its own bottom: this editor carries no styles context, so a
+        // style's rule is not seen here (#2231; the suite's is).
         let has = self.editor.shown_bottom_border();
         self.editor.toggle_bottom_border();
         self.after_edit();
