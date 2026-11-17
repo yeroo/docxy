@@ -35,12 +35,19 @@ test project a drag stops at the narrowest and widest a column may be
 
 test project double-clicking a heading edge is Best Fit
   open copy:../fixtures/project-filter.xml
+  # Narrowed first, so Best Fit is seen to change the width whatever face
+  # the table draws in: Segoe UI's Liberation Sans on Linux (#2231) fits
+  # Duration at exactly its default 90.
+  shot window
+  call pointer-drag {"from":"project-heading-edge:Duration","to":"project-heading-edge:Duration","offset":[-300,0]}
+  call rows {}
+  assert reply.widths.Duration is 24
   shot window
   call pointer-click {"region":"project-heading-edge:Duration","double":true}
   call rows {}
-  assert reply.widths.Duration is not 90
+  assert reply.widths.Duration is not 24
   assert reply.widths.Name is 140
   assert status is Duration column set to Best Fit
   key ctrl+z
   call rows {}
-  assert reply.widths.Duration is 90
+  assert reply.widths.Duration is 24
