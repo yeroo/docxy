@@ -16,20 +16,6 @@
 # case after it.
 os windows
 
-# Pump-dispatched (real-key): the key path and the kept state. It does NOT
-# reproduce #2192's frame; the next case does.
-test ctrl+f12 by real-key opens the real picker and cancel keeps the tab and the edit
-  open copy:../fixtures/basic.docx
-  type x
-  assert dirty is true
-  call selection {}
-  call real-key {"keys":["ctrl+f12"]}
-  native-dialog cancel
-  assert dirty is true
-  assert tabs is {selection.tabs}
-  assert tab is {selection.tab}
-  assert title is basic.docx
-
 # The regression case: Open… clicked by a real window message, a ticker due.
 test the rail's open clicked for real with a ticker due cancels and keeps the tab, the edit and File
   open copy:../fixtures/basic.docx
@@ -104,3 +90,17 @@ test six open and cancel rounds by the rail and ctrl+f12 leave the suite alive
   type x
   assert dirty is true
   call arm-task {"stop":true}
+
+# Pump-dispatched (real-key): the key path and the kept state. It does NOT
+# reproduce #2192's frame; the next case does.
+test ctrl+f12 by real-key opens the real picker and cancel keeps the tab and the edit
+  open copy:../fixtures/basic.docx
+  type x
+  assert dirty is true
+  call selection {}
+  call real-key {"keys":["ctrl+f12"]}
+  native-dialog cancel
+  assert dirty is true
+  assert tabs is {selection.tabs}
+  assert tab is {selection.tab}
+  assert title is basic.docx
