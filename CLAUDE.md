@@ -195,7 +195,9 @@ issue number to find its notes.
   (#2168), a draft's importance and follow-up flag, its flag on a PATCH only once set (#1955),
   Remove from Calendar and a meeting message's read when its event is gone, every failure
   answered (#2208), the optimistic message writes returning a busy error (#2209), a local
-  reply or forward draft created through createReply/createForward (#2212).
+  reply or forward draft created through createReply/createForward (#2212), a sign-in
+  refused for consent to `optional_scope` retried with `scope` alone, the optional
+  scopes in `missing` and in a refresh only once granted (#2218).
 
 ## Build and test
 

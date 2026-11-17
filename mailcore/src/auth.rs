@@ -18,7 +18,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct AuthConfig {
     pub authority: String,
     pub client_id: String,
+    /// The scopes the client needs (space-separated).
     pub scope: String,
+    /// The scopes the client can do without (space-separated, empty by
+    /// default; #2218), such as other people's photos and presence. An
+    /// interactive sign-in asks `scope` and these together
+    /// ([`sign_in_scope`]). When a tenant refuses that sign-in for consent,
+    /// the engine signs in again asking `scope` alone, and the missing
+    /// optional scopes are reported in `SyncEvent::Scopes { missing }`. A
+    /// refresh asks for an optional scope only once it was granted
+    /// ([`refresh_scope_for`]).
+    pub optional_scope: String,
 }
 
 impl Default for AuthConfig {
@@ -30,6 +40,7 @@ impl Default for AuthConfig {
             authority: "https://login.microsoftonline.com/organizations".to_string(),
             client_id: "14d82eec-204b-4c2f-b7e8-296a70dab67e".to_string(),
             scope: "Mail.ReadWrite People.Read offline_access".to_string(),
+            optional_scope: String::new(),
         }
     }
 }
@@ -54,7 +65,17 @@ pub struct AuthRequest {
     pub authorize_url: String,
     pub redirect_uri: String,
     pub state: String,
+    /// The scopes `/authorize` was asked for; [`redeem_code`] asks the same
+    /// (#2218).
+    scope: String,
     pkce: Pkce,
+}
+
+impl AuthRequest {
+    /// The scopes this request's `/authorize` asks for (space-separated).
+    pub fn scope(&self) -> &str {
+        &self.scope
+    }
 }
 
 /// Errors from the token endpoint or from parsing its response.
@@ -157,13 +178,53 @@ impl AuthError {
         else {
             return None;
         };
-        let rest = d.trim_start().strip_prefix("AADSTS")?;
-        let (digits, _) = rest.split_once(':')?;
-        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        digits.parse().ok()
+        aadsts_of(d)
     }
+
+    /// Whether the token endpoint refused for consent (#2218): a
+    /// [`AuthError::Denied`] that [`is_consent_refusal`] holds for. False
+    /// for every other error.
+    pub fn consent_refused(&self) -> bool {
+        match self {
+            AuthError::Denied { error, description } => {
+                is_consent_refusal(error, description.as_deref())
+            }
+            AuthError::Http(_) | AuthError::Status { .. } | AuthError::Parse(_) => false,
+        }
+    }
+}
+
+/// The Entra error number at the start of an `error_description`: `Some(n)`
+/// when `desc`, leading whitespace trimmed, starts `AADSTS<n>:` with `n`
+/// fitting a `u32`, else `None` (#2169, [`AuthError::aadsts`]).
+fn aadsts_of(desc: &str) -> Option<u32> {
+    let rest = desc.trim_start().strip_prefix("AADSTS")?;
+    let (digits, _) = rest.split_once(':')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// AADSTS65001: the user or administrator has not consented to a scope.
+const AADSTS_NO_CONSENT: u32 = 65001;
+/// AADSTS65004: the user declined to consent.
+const AADSTS_CONSENT_DECLINED: u32 = 65004;
+
+/// Whether an OAuth refusal (an `/authorize` redirect's or the token
+/// endpoint's `error` and `error_description`) is a refusal for consent
+/// (#2218): `error` (trimmed, any ASCII case) is `consent_required`, or the
+/// description's leading `AADSTS<n>:` is 65001 (not consented; Entra sends
+/// it under `consent_required`, `interaction_required` or `invalid_grant`)
+/// or 65004 (the person declined the consent screen; under
+/// `access_denied`). A bare `access_denied`, which a person cancelling the
+/// account picker also gets, is not.
+pub(crate) fn is_consent_refusal(error: &str, description: Option<&str>) -> bool {
+    error.trim().eq_ignore_ascii_case("consent_required")
+        || matches!(
+            description.and_then(aadsts_of),
+            Some(AADSTS_NO_CONSENT | AADSTS_CONSENT_DECLINED)
+        )
 }
 
 /// The tenant segment for the `/oauth2/v2.0/...` endpoints: the last path
@@ -178,8 +239,14 @@ fn tenant_of(authority: &str) -> &str {
 
 /// Builds the `/authorize` URL to open in the system browser, along with
 /// the PKCE verifier and state needed to redeem the code it redirects back
-/// with.
+/// with. It asks [`sign_in_scope`]: `cfg.scope` and `cfg.optional_scope`.
 pub fn begin_auth(cfg: &AuthConfig, redirect_uri: &str) -> AuthRequest {
+    begin_auth_with_scope(cfg, redirect_uri, &sign_in_scope(cfg))
+}
+
+/// [`begin_auth`] asking `scope` (space-separated) instead (#2218): the
+/// engine's consent fallback asks `cfg.scope` alone.
+pub fn begin_auth_with_scope(cfg: &AuthConfig, redirect_uri: &str, scope: &str) -> AuthRequest {
     let tenant = tenant_of(&cfg.authority);
     let pkce = Pkce::generate();
     // Reuse the same OS-randomness-backed generator for the anti-CSRF
@@ -192,7 +259,7 @@ pub fn begin_auth(cfg: &AuthConfig, redirect_uri: &str) -> AuthRequest {
         ("response_type", "code"),
         ("redirect_uri", redirect_uri),
         ("response_mode", "query"),
-        ("scope", cfg.scope.as_str()),
+        ("scope", scope),
         ("state", state.as_str()),
         ("code_challenge", pkce.challenge.as_str()),
         ("code_challenge_method", "S256"),
@@ -205,13 +272,15 @@ pub fn begin_auth(cfg: &AuthConfig, redirect_uri: &str) -> AuthRequest {
         authorize_url,
         redirect_uri: redirect_uri.to_string(),
         state,
+        scope: scope.to_string(),
         pkce,
     }
 }
 
 /// Redeems the authorization code returned on the loopback redirect for a
-/// token set. `http_base` is normally `https://login.microsoftonline.com`;
-/// tests point it at a fake server.
+/// token set, asking the scopes `req`'s `/authorize` asked
+/// ([`AuthRequest::scope`], #2218). `http_base` is normally
+/// `https://login.microsoftonline.com`; tests point it at a fake server.
 pub fn redeem_code(
     cfg: &AuthConfig,
     http_base: &str,
@@ -224,7 +293,7 @@ pub fn redeem_code(
         ("code", code),
         ("redirect_uri", req.redirect_uri.as_str()),
         ("code_verifier", req.pkce.verifier.as_str()),
-        ("scope", cfg.scope.as_str()),
+        ("scope", req.scope.as_str()),
     ]);
     // No prior refresh token exists yet on this path, so there's nothing
     // to fall back to if the server omits one.
@@ -238,20 +307,21 @@ pub fn redeem_code(
 /// an empty string.
 ///
 /// `granted` is the saved token's grant ([`TokenSet::scopes`]); the
-/// refresh asks for [`refresh_scope`] of it (#2164), not `cfg.scope` in
-/// full. Entra's refresh-token grant refuses a scope the person never
-/// consented to (`invalid_grant`, AADSTS65001), so a scope a host has just
-/// added to `cfg.scope` would sign every saved sign-in out at its next
-/// refresh. Asked only for the grant, the token keeps working and the new
-/// scope is reported missing (`SyncEvent::Scopes`); the interactive
-/// sign-in ([`begin_auth`], [`redeem_code`]) still asks `cfg.scope` in full.
+/// refresh asks for [`refresh_scope_for`] of it (#2164, #2218), not
+/// `cfg.scope` in full. Entra's refresh-token grant refuses a scope the
+/// person never consented to (`invalid_grant`, AADSTS65001), so a scope a
+/// host has just added to `cfg.scope` would sign every saved sign-in out at
+/// its next refresh. Asked only for the grant, the token keeps working and
+/// the new scope is reported missing (`SyncEvent::Scopes`); the interactive
+/// sign-in ([`begin_auth`], [`redeem_code`]) still asks [`sign_in_scope`]
+/// in full.
 pub fn refresh(
     cfg: &AuthConfig,
     http_base: &str,
     refresh_token: &str,
     granted: Option<&[String]>,
 ) -> Result<TokenSet, AuthError> {
-    let scope = refresh_scope(&cfg.scope, granted);
+    let scope = refresh_scope_for(cfg, granted);
     let body = pkce::form_urlencode(&[
         ("grant_type", "refresh_token"),
         ("client_id", cfg.client_id.as_str()),
@@ -441,6 +511,66 @@ pub fn refresh_scope(requested: &str, granted: Option<&[String]>) -> String {
     }
 }
 
+/// The scopes of `cfg.optional_scope` that `cfg.scope` does not already
+/// name, as `optional_scope` spells them, each once, in its order, compared
+/// as [`missing_scopes`] compares (#2218).
+fn extra_optional_scopes(cfg: &AuthConfig) -> Vec<(&str, String)> {
+    let required: Vec<String> = requested_scopes(&cfg.scope).map(|(_, n)| n).collect();
+    requested_scopes(&cfg.optional_scope)
+        .filter(|(_, n)| !required.contains(n))
+        .collect()
+}
+
+/// What an interactive sign-in asks for (#2218): `cfg.scope`, followed by
+/// the scopes of `cfg.optional_scope` it does not already name (each once,
+/// as `optional_scope` spells them, compared as [`missing_scopes`]
+/// compares). Exactly `cfg.scope` when `optional_scope` adds nothing
+/// (empty, blank, or only scopes `scope` names), so such a caller's
+/// requests are as before. [`missing_scopes`] of it is what
+/// `SyncEvent::Scopes { missing }` reports.
+pub fn sign_in_scope(cfg: &AuthConfig) -> String {
+    let extra = extra_optional_scopes(cfg);
+    if extra.is_empty() {
+        return cfg.scope.clone();
+    }
+    let mut asked: Vec<&str> = cfg.scope.split_ascii_whitespace().collect();
+    asked.extend(extra.iter().map(|(scope, _)| *scope));
+    asked.join(" ")
+}
+
+/// What a refresh asks for (#2164, #2218). With no optional scope to add
+/// (as [`sign_in_scope`] decides), [`refresh_scope`] of `cfg.scope`.
+/// Otherwise: with the grant unknown (`None`: a cache from before #1875, or
+/// a response without `scope`), `cfg.scope` alone, so such a token goes
+/// without the optional scopes until the next interactive sign-in and is
+/// never refused over them. With a known grant, [`refresh_scope`] of
+/// `cfg.scope`, followed by each optional scope the grant holds (each once,
+/// as `optional_scope` spells it; a meta optional scope only when the grant
+/// lists it), so a sign-in that went without the optional scopes never
+/// refreshes asking for them and a granted optional scope is never
+/// dropped. A grant that shares no non-meta scope with `cfg.scope` but
+/// holds an optional one asks `cfg.scope` in full (`refresh_scope`'s
+/// fallback, which counts `cfg.scope` alone) plus that optional scope.
+pub fn refresh_scope_for(cfg: &AuthConfig, granted: Option<&[String]>) -> String {
+    let extra = extra_optional_scopes(cfg);
+    if extra.is_empty() {
+        return refresh_scope(&cfg.scope, granted);
+    }
+    let Some(granted) = granted else {
+        return cfg.scope.clone();
+    };
+    let required = refresh_scope(&cfg.scope, Some(granted));
+    let held: Vec<String> = granted.iter().map(|s| normalise_scope(s)).collect();
+    let mut asked: Vec<&str> = required.split_ascii_whitespace().collect();
+    asked.extend(
+        extra
+            .iter()
+            .filter(|(_, n)| held.contains(n))
+            .map(|(scope, _)| *scope),
+    );
+    asked.join(" ")
+}
+
 /// The scopes of `requested` (space-separated), each with its
 /// [`normalise_scope`]d form, the first spelling of each only, in order.
 fn requested_scopes(requested: &str) -> impl Iterator<Item = (&str, String)> {
@@ -478,6 +608,7 @@ mod tests {
             authority: "x/organizations".into(),
             client_id: "cid".into(),
             scope: "Mail.ReadWrite People.Read offline_access".into(),
+            optional_scope: String::new(),
         }
     }
 
@@ -496,7 +627,8 @@ mod tests {
             req.authorize_url
                 .contains("redirect_uri=http%3A%2F%2Flocalhost%3A8400")
         );
-        // The interactive sign-in asks `cfg.scope` in full (#2164).
+        // With no optional scope, the interactive sign-in asks `cfg.scope`
+        // in full (#2164, #2218).
         assert!(req.authorize_url.contains(&format!(
             "&{}&",
             pkce::form_urlencode(&[("scope", cfg().scope.as_str())])
@@ -522,7 +654,8 @@ mod tests {
         let reqs = srv.requests();
         assert!(reqs[0].body.contains("code_verifier="));
         assert!(reqs[0].body.contains("grant_type=authorization_code"));
-        // The code redemption asks `cfg.scope` in full (#2164).
+        // The code redemption asks what `/authorize` asked: here
+        // `cfg.scope` in full (#2164, #2218).
         assert_eq!(reqs[0].form_value("scope"), Some(cfg().scope));
     }
 
@@ -914,6 +1047,224 @@ mod tests {
         for e in errors {
             assert!(!e.needs_sign_in(), "{e:?}");
         }
+    }
+
+    /// [`cfg`] with the people scopes as optional (#2218).
+    fn optional_cfg() -> AuthConfig {
+        AuthConfig {
+            optional_scope: "User.ReadBasic.All Presence.Read.All".into(),
+            ..cfg()
+        }
+    }
+
+    fn scope_param(url: &str) -> Option<String> {
+        let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
+        crate::sync::engine::parse_query(query)
+            .into_iter()
+            .find(|(k, _)| k == "scope")
+            .map(|(_, v)| v)
+    }
+
+    #[test]
+    fn sign_in_scope_appends_optional_once() {
+        // Nothing to add: `cfg.scope` byte for byte.
+        for optional in [
+            "",
+            "   ",
+            "mail.readwrite https://graph.microsoft.com/People.Read OFFLINE_ACCESS",
+        ] {
+            let c = AuthConfig {
+                scope: "Mail.ReadWrite  People.Read offline_access".into(),
+                optional_scope: optional.into(),
+                ..cfg()
+            };
+            assert_eq!(sign_in_scope(&c), c.scope, "{optional:?}");
+        }
+        let c = AuthConfig {
+            optional_scope: "User.ReadBasic.All mail.readwrite Presence.Read.All \
+                             user.readbasic.all"
+                .into(),
+            ..cfg()
+        };
+        assert_eq!(
+            sign_in_scope(&c),
+            "Mail.ReadWrite People.Read offline_access User.ReadBasic.All Presence.Read.All"
+        );
+    }
+
+    #[test]
+    fn begin_auth_asks_both_lists_and_redeem_asks_what_was_authorized() {
+        let c = optional_cfg();
+        let full = begin_auth(&c, "http://localhost:8400");
+        assert_eq!(full.scope(), sign_in_scope(&c));
+        assert_eq!(scope_param(&full.authorize_url), Some(sign_in_scope(&c)));
+        let small = begin_auth_with_scope(&c, "http://localhost:8400", &c.scope);
+        assert_eq!(small.scope(), c.scope);
+        assert_eq!(scope_param(&small.authorize_url), Some(c.scope.clone()));
+
+        let srv = FakeServer::start(vec![token_route(
+            r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#,
+        )]);
+        redeem_code(&c, &srv.base_url, &full, "CODE1").unwrap();
+        redeem_code(&c, &srv.base_url, &small, "CODE2").unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].form_value("scope"), Some(sign_in_scope(&c)));
+        assert_eq!(reqs[1].form_value("scope"), Some(c.scope.clone()));
+    }
+
+    fn denied(error: &str, description: Option<&str>) -> AuthError {
+        AuthError::Denied {
+            error: error.into(),
+            description: description.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn consent_refusal_rule() {
+        let yes = [
+            ("consent_required", None),
+            (" Consent_Required ", Some("AADSTS50076: MFA")),
+            (
+                "invalid_grant",
+                Some("AADSTS65001: The user or administrator has not consented"),
+            ),
+            (
+                "interaction_required",
+                Some("AADSTS65001: The user or administrator has not consented"),
+            ),
+            (
+                "access_denied",
+                Some("AADSTS65004: User declined to consent"),
+            ),
+            (
+                "access_denied",
+                Some("  AADSTS65004: User declined to consent"),
+            ),
+        ];
+        for (error, description) in yes {
+            assert!(
+                is_consent_refusal(error, description),
+                "{error} {description:?}"
+            );
+            assert!(denied(error, description).consent_refused(), "{error}");
+        }
+        let no = [
+            ("access_denied", None),
+            ("access_denied", Some("the user cancelled")),
+            ("access_denied", Some("AADSTS50058: no session")),
+            ("invalid_client", Some("AADSTS7000218: secret")),
+            ("interaction_required", Some("AADSTS50076: MFA")),
+            ("invalid_grant", Some("AADSTS650010: not a number we know")),
+            ("invalid_grant", Some("see AADSTS65001: later in the text")),
+        ];
+        for (error, description) in no {
+            assert!(
+                !is_consent_refusal(error, description),
+                "{error} {description:?}"
+            );
+            assert!(!denied(error, description).consent_refused(), "{error}");
+        }
+        for e in [
+            AuthError::Http("AADSTS65001: x".into()),
+            AuthError::Status {
+                status: 400,
+                body: "consent_required".into(),
+            },
+            AuthError::Parse("consent_required".into()),
+        ] {
+            assert!(!e.consent_refused(), "{e:?}");
+        }
+    }
+
+    fn refresh_scope_for_of(c: &AuthConfig, granted: Option<&[&str]>) -> String {
+        let granted: Option<Vec<String>> =
+            granted.map(|g| g.iter().map(|s| s.to_string()).collect());
+        refresh_scope_for(c, granted.as_deref())
+    }
+
+    #[test]
+    fn refresh_scope_for_cases() {
+        // No optional scope: #2164's `refresh_scope`, whatever the grant.
+        let plain = AuthConfig {
+            scope: "Mail.ReadWrite Mail.Send offline_access".into(),
+            optional_scope: " mail.send ".into(),
+            ..cfg()
+        };
+        let grants: [Option<&[&str]>; 4] = [
+            None,
+            Some(&[]),
+            Some(&["https://graph.microsoft.com/Mail.ReadWrite"]),
+            Some(&["Calendars.Read"]),
+        ];
+        for g in grants {
+            let owned: Option<Vec<String>> = g.map(|g| g.iter().map(|s| s.to_string()).collect());
+            assert_eq!(
+                refresh_scope_for_of(&plain, g),
+                refresh_scope(&plain.scope, owned.as_deref()),
+                "{g:?}"
+            );
+        }
+
+        let c = optional_cfg();
+        // Unknown grant: `scope` alone.
+        assert_eq!(refresh_scope_for_of(&c, None), c.scope);
+        // A sign-in that went without the optional scopes.
+        assert_eq!(
+            refresh_scope_for_of(
+                &c,
+                Some(&[
+                    "https://graph.microsoft.com/Mail.ReadWrite",
+                    "https://graph.microsoft.com/People.Read",
+                ])
+            ),
+            "Mail.ReadWrite People.Read offline_access"
+        );
+        // A granted optional scope is kept, as `optional_scope` spells it.
+        assert_eq!(
+            refresh_scope_for_of(
+                &c,
+                Some(&[
+                    "https://graph.microsoft.com/Mail.ReadWrite",
+                    "https://graph.microsoft.com/presence.read.all",
+                ])
+            ),
+            "Mail.ReadWrite offline_access Presence.Read.All"
+        );
+        // Only an optional scope granted: `cfg.scope` in full (#2164's
+        // fallback) plus that scope.
+        assert_eq!(
+            refresh_scope_for_of(
+                &c,
+                Some(&["https://graph.microsoft.com/User.ReadBasic.All"])
+            ),
+            "Mail.ReadWrite People.Read offline_access User.ReadBasic.All"
+        );
+        // A meta optional scope only when the grant lists it.
+        let meta = AuthConfig {
+            optional_scope: "openid Presence.Read.All".into(),
+            ..cfg()
+        };
+        assert_eq!(
+            refresh_scope_for_of(&meta, Some(&["Mail.ReadWrite", "Presence.Read.All"])),
+            "Mail.ReadWrite offline_access Presence.Read.All"
+        );
+        assert_eq!(
+            refresh_scope_for_of(&meta, Some(&["Mail.ReadWrite", "openid"])),
+            "Mail.ReadWrite offline_access openid"
+        );
+
+        let srv = FakeServer::start(vec![token_route(
+            r#"{"access_token":"AT2","expires_in":3600}"#,
+        )]);
+        let g = vec!["https://graph.microsoft.com/Mail.ReadWrite".to_string()];
+        refresh(&c, &srv.base_url, "RT1", Some(&g)).unwrap();
+        refresh(&c, &srv.base_url, "RT1", None).unwrap();
+        let reqs = srv.requests();
+        assert_eq!(
+            reqs[0].form_value("scope").as_deref(),
+            Some("Mail.ReadWrite offline_access")
+        );
+        assert_eq!(reqs[1].form_value("scope"), Some(c.scope.clone()));
     }
 
     #[test]
