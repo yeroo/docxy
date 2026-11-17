@@ -58,10 +58,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   or numbering) is the rule below. An inherited left takes no level step,
   so the ruler does not clamp at it. A ruler move that leaves a list item's
   first line 0 pins `w:firstLine="0"` (`Editor::pin_zero_first_lines`,
-  `ParProps::pin_first_line`), or the level's hang would come back. Every
-  importer (HTML, RTF, PDF: `import::pin_list_indents` in
-  `Builder::finish`) pins its list items' left and first line, so their 0
-  is a value and no level or style reaches them, in any package. Not done:
+  `ParProps::pin_first_line`), or the level's hang would come back. The
+  HTML importer (`import::pin_list_indents` after its `Builder::finish`)
+  pins its list items' left and first line, as it computes them (#1979,
+  #2114), so their 0 is a value and no level or style reaches them, in any
+  package. The RTF and PDF importers compute no list indents (every item
+  comes at 0, `\li`/`\fi` unread), so theirs stay unpinned and draw, save
+  and open in Word at their level's indent. Not done:
   numbering through a style's `numPr` only, the level's `w:rPr` (its
   Symbol bullet) and `lvlJc`.
 - With nothing inherited, `eff_indent` adds the level step `ilvl × 300` only to a list

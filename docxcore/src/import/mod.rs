@@ -1037,7 +1037,6 @@ impl<'b> Builder<'b> {
             self.end_para_if_any(props, false);
         }
         self.end_tables();
-        pin_list_indents(&mut self.body);
         Document { body: self.body }
     }
 
@@ -1070,13 +1069,15 @@ pub fn paragraph_texts(doc: &Document) -> Vec<String> {
     out
 }
 
-/// Pin the left and first-line indents of every list item an importer made
-/// (#2231): the importer already chose where the item draws (an HTML
-/// `<li>`'s padding, RTF's `\li`/`\fi`, which `\pard` resets to 0, a PDF's
-/// geometry), so a 0 is that value, not "inherit". Pinned, neither the
-/// numbering level's indent nor a style's reaches it, in the page view or
-/// in Word after a save. A nonzero value is direct already.
-fn pin_list_indents(blocks: &mut [Block]) {
+/// Pin the left and first-line indents of every list item the HTML importer
+/// made (#2231): it computes where each item draws (its `<li>`'s padding and
+/// margins, #1979, #2114), so a 0 is that value, not "inherit". Pinned,
+/// neither the numbering level's indent nor a style's reaches it, in the
+/// page view or in Word after a save. A nonzero value is direct already.
+/// The RTF and PDF importers do not compute list indents (every item comes
+/// at 0), so theirs stay unpinned and take their level's indent, as a save
+/// and Word give them.
+pub(crate) fn pin_list_indents(blocks: &mut [Block]) {
     for b in blocks {
         match b {
             Block::Paragraph(p) if p.props.in_list() => {
@@ -1103,11 +1104,13 @@ fn pin_list_indents(blocks: &mut [Block]) {
 mod tests {
     use super::*;
 
-    /// #2231: every list item an importer makes keeps the indents it was
-    /// given, a 0 included, as direct ones: neither a numbering level's
-    /// indent nor a style's reaches it.
+    /// #2231: the HTML importer's list items keep the indents it computed,
+    /// a 0 included, as direct ones, so neither a numbering level's indent
+    /// nor a style's reaches them. The RTF importer computes none (every
+    /// item comes at 0), so its items stay unpinned and save with no `w:ind`:
+    /// they take their level's indent, as Word gives a pasted bullet.
     #[test]
-    fn imported_list_items_pin_their_indents() {
+    fn html_list_items_pin_their_indents_and_rtf_items_do_not() {
         let items = |d: &Document| -> Vec<(i32, i32, bool, bool)> {
             d.body
                 .iter()
@@ -1130,13 +1133,20 @@ mod tests {
         assert_eq!(got.len(), 2, "{got:?}");
         assert!(got.iter().all(|&(_, _, l, f)| l && f), "{got:?}");
         assert_eq!((got[0].0, got[0].1), (0, 0));
+        assert!(got[1].0 > 0, "the padded item keeps its indent: {got:?}");
         let rtf = rtf::import_rtf(
             br"{\rtf1{\*\listtable{\list x}}\pard\ls1\ilvl0\li720\fi-360{\listtext\f3\'b7\tab}Apples\par\pard\ls1{\listtext\f3\'b7\tab}Bananas\par}",
         )
         .unwrap();
         let got = items(&rtf);
         assert_eq!(got.len(), 2, "{:?}", rtf.body);
-        assert!(got.iter().all(|&(_, _, l, f)| l && f), "{got:?}");
+        assert!(got.iter().all(|&(_, _, l, f)| !l && !f), "{got:?}");
+        let xml = crate::serialize::document_to_xml(&rtf);
+        assert!(xml.contains("<w:numId w:val=\"1\"/>"), "{xml}");
+        assert!(
+            !xml.contains("<w:ind"),
+            "an RTF bullet saves no w:ind: {xml}"
+        );
         // A table cell's item too, and a paragraph outside a list is untouched.
         let item = |num_id| {
             Block::Paragraph(Paragraph {
