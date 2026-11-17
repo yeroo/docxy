@@ -1314,6 +1314,32 @@ impl Package {
             .unwrap_or_default()
     }
 
+    /// The theme part the main document names (its `.../relationships/theme`
+    /// relationship), else `word/theme/theme1.xml` when the package holds
+    /// it; `None` without one (#1972).
+    pub fn theme_part_name(&self) -> Option<String> {
+        let rels = self
+            .part("word/_rels/document.xml.rels")
+            .and_then(decode_xml_part);
+        let named = rels.as_deref().and_then(|xml| {
+            crate::load::start_tags(xml, "Relationship")
+                .into_iter()
+                .find_map(|(_, el)| {
+                    let ty = crate::load::xml_attr_value(el, "Type")?;
+                    let external = crate::load::xml_attr_value(el, "TargetMode")
+                        .is_some_and(|m| m == "External");
+                    (ty.ends_with("/relationships/theme") && !external)
+                        .then(|| crate::load::xml_attr_value(el, "Target"))
+                        .flatten()
+                        .and_then(|t| resolve_relationship_target("word", &t))
+                })
+        });
+        named.filter(|n| self.part(n).is_some()).or_else(|| {
+            let fallback = "word/theme/theme1.xml";
+            self.part(fallback).is_some().then(|| fallback.to_string())
+        })
+    }
+
     /// Watermarks in headers that are actually applied by document section
     /// relationships. Each inherited header is associated with every section in
     /// which it remains effective rather than merely scanning orphan header parts.
@@ -9492,5 +9518,28 @@ mod tests {
         assert!(people.contains("Cy &amp; Co"), "{people}");
         assert!(!people.contains("Dee"), "{people}");
         assert!(people.contains("\"Bob\""), "{people}");
+    }
+
+    #[test]
+    fn theme_part_name_follows_the_document_relationship_1972() {
+        let mut pkg = new_package(Document { body: vec![] });
+        assert_eq!(pkg.theme_part_name(), None);
+        pkg.parts
+            .push(("word/theme/theme1.xml".to_string(), b"<a:theme/>".to_vec()));
+        assert_eq!(
+            pkg.theme_part_name().as_deref(),
+            Some("word/theme/theme1.xml"),
+            "no relationship: the usual name"
+        );
+        pkg.parts
+            .push(("word/theme/other.xml".to_string(), b"<a:theme/>".to_vec()));
+        assert!(pkg.set_part(
+            "word/_rels/document.xml.rels",
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/other.xml"/></Relationships>"#.to_vec(),
+        ));
+        assert_eq!(
+            pkg.theme_part_name().as_deref(),
+            Some("word/theme/other.xml")
+        );
     }
 }

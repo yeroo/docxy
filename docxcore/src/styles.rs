@@ -15,6 +15,7 @@ use crate::model::{
     Align, BorderKind, ParBorders, ParProps, RunProps, TabAlign, TabLeader, TabStop,
 };
 use crate::table_styles::RunLook;
+use crate::theme::ThemeFonts;
 use crate::xml::{Event, XmlParser};
 
 #[derive(Debug, Clone, Default)]
@@ -30,6 +31,10 @@ struct PartialRun {
     color: Option<String>,
     size: Option<u32>,
     font: Option<String>,
+    /// `w:rFonts w:asciiTheme` (else `w:hAnsiTheme`): a theme font such as
+    /// `minorHAnsi`, which [`StyleSheet::apply_theme_fonts`] turns into
+    /// `font` (#1972).
+    font_theme: Option<String>,
 }
 
 impl PartialRun {
@@ -60,6 +65,18 @@ impl PartialRun {
         }
         if o.font.is_some() {
             self.font = o.font.clone();
+        }
+        if o.font_theme.is_some() {
+            self.font_theme = o.font_theme.clone();
+        }
+    }
+
+    /// Its theme font reference resolved against `theme`: a reference the
+    /// theme names beats the explicit `w:ascii`, as in Word; any other
+    /// leaves `font` as it is.
+    fn apply_theme(&mut self, theme: &ThemeFonts) {
+        if let Some(family) = self.font_theme.as_deref().and_then(|t| theme.family(t)) {
+            self.font = Some(family.to_string());
         }
     }
 }
@@ -98,6 +115,8 @@ pub struct StyleSheet {
     /// The left indent of `w:docDefaults/w:pPrDefault/w:pPr/w:ind`, the last
     /// fallback of [`StyleSheet::style_left_indent`].
     default_left: LeftInd,
+    /// [`StyleSheet::doc_font`], kept as the sheet changes.
+    doc_font: Option<String>,
 }
 
 /// The left indent a `w:ind` sets, its twips (`w:left`, else `w:start`) and
@@ -147,6 +166,33 @@ impl PprFlag {
 impl StyleSheet {
     /// Every paragraph style as `(styleId, display name)`, sorted by name. Used
     /// by the Apply-Styles dialog to offer every style the document defines.
+    /// The family Word draws a run in when neither it nor its paragraph or
+    /// character style names one (#1972): the default paragraph style's
+    /// chain over the document defaults, theme fonts resolved once
+    /// [`StyleSheet::apply_theme_fonts`] has run. `None` when none names a
+    /// family (or only a theme font and no theme was applied).
+    pub fn doc_font(&self) -> Option<&str> {
+        self.doc_font.as_deref()
+    }
+
+    /// Resolves every theme font reference (`w:asciiTheme`, `w:hAnsiTheme`)
+    /// of the document defaults and of each style's own run properties
+    /// against `theme` (#1972), before any `basedOn` folding, so a style's
+    /// own theme reference beats its own `w:ascii` and a derived style's
+    /// `w:ascii` still beats the theme reference it inherits. A reference
+    /// the theme does not name changes nothing.
+    pub fn apply_theme_fonts(&mut self, theme: &ThemeFonts) {
+        self.default_run.apply_theme(theme);
+        for def in self.styles.values_mut() {
+            def.run.apply_theme(theme);
+        }
+        self.doc_font = self.compute_doc_font();
+    }
+
+    fn compute_doc_font(&self) -> Option<String> {
+        self.effective_run(None, None, &RunProps::default()).font
+    }
+
     pub fn paragraph_styles(&self) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = self
             .styles
@@ -618,6 +664,7 @@ pub fn parse_styles_xml(xml: &str) -> StyleSheet {
             _ => {}
         }
     }
+    ss.doc_font = ss.compute_doc_font();
     ss
 }
 
@@ -721,6 +768,12 @@ fn parse_partial_rpr(p: &mut XmlParser, run: &mut PartialRun) {
                         let a = p.attr("w:ascii");
                         if !a.is_empty() {
                             run.font = Some(a.to_string());
+                        }
+                        let t = [p.attr("w:asciiTheme"), p.attr("w:hAnsiTheme")]
+                            .into_iter()
+                            .find(|t| !t.is_empty());
+                        if let Some(t) = t {
+                            run.font_theme = Some(t.to_string());
                         }
                     }
                     _ => {}
@@ -1518,5 +1571,115 @@ mod tests {
         assert!(normal.effective_vanish(None, None, &plain));
         // Rendering still reads direct vanish only.
         assert!(!ss.effective_run(None, Some("Secret"), &plain).vanish);
+    }
+
+    /// The owner's file (#1972): `docDefaults` naming only the theme's minor
+    /// font, a default Normal with no run properties, a heading naming the
+    /// major font.
+    const THEMED_STYLES: &str = r#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+        <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:asciiTheme="minorHAnsi" w:eastAsiaTheme="minorHAnsi"
+        w:hAnsiTheme="minorHAnsi" w:cstheme="minorBidi"/><w:sz w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults>
+        <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+        <w:style w:type="paragraph" w:styleId="Heading1"><w:basedOn w:val="Normal"/>
+        <w:rPr><w:rFonts w:asciiTheme="majorHAnsi" w:hAnsiTheme="majorHAnsi"/></w:rPr></w:style>
+        <w:style w:type="paragraph" w:styleId="Both"><w:rPr><w:rFonts w:ascii="Georgia" w:asciiTheme="majorHAnsi"/></w:rPr></w:style>
+        <w:style w:type="paragraph" w:styleId="Explicit"><w:basedOn w:val="Heading1"/>
+        <w:rPr><w:rFonts w:ascii="Georgia"/></w:rPr></w:style>
+        <w:style w:type="paragraph" w:styleId="Unknown"><w:rPr><w:rFonts w:ascii="Georgia" w:asciiTheme="nothing"/></w:rPr></w:style>
+        </w:styles>"#;
+
+    fn office_theme() -> crate::theme::ThemeFonts {
+        crate::theme::parse_theme_fonts(
+            r#"<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:themeElements>
+            <a:fontScheme name="Office"><a:majorFont><a:latin typeface="Calibri Light"/></a:majorFont>
+            <a:minorFont><a:latin typeface="Calibri"/></a:minorFont></a:fontScheme></a:themeElements></a:theme>"#,
+        )
+    }
+
+    #[test]
+    fn theme_fonts_give_the_document_font_and_style_fonts_1972() {
+        let mut ss = parse_styles_xml(THEMED_STYLES);
+        assert_eq!(ss.doc_font(), None, "a theme reference with no theme");
+        ss.apply_theme_fonts(&office_theme());
+        // The owner's run: only `w:b`, in a paragraph with no pStyle.
+        assert_eq!(ss.doc_font(), Some("Calibri"));
+        let bold = RunProps {
+            bold: true,
+            ..RunProps::default()
+        };
+        let shown = ss.effective_run(None, None, &bold);
+        assert!(shown.bold);
+        assert_eq!(shown.font.as_deref(), Some("Calibri"));
+        // A style's majorHAnsi is the major latin font.
+        assert_eq!(
+            ss.effective_run(Some("Heading1"), None, &RunProps::default())
+                .font
+                .as_deref(),
+            Some("Calibri Light")
+        );
+        // A style's own theme reference beats its own w:ascii.
+        assert_eq!(
+            ss.effective_run(Some("Both"), None, &RunProps::default())
+                .font
+                .as_deref(),
+            Some("Calibri Light")
+        );
+        // A derived style's w:ascii beats the theme reference it inherits.
+        assert_eq!(
+            ss.effective_run(Some("Explicit"), None, &RunProps::default())
+                .font
+                .as_deref(),
+            Some("Georgia")
+        );
+        // A reference the theme does not name leaves w:ascii.
+        assert_eq!(
+            ss.effective_run(Some("Unknown"), None, &RunProps::default())
+                .font
+                .as_deref(),
+            Some("Georgia")
+        );
+        // A run's own family still wins.
+        let named = RunProps {
+            font: Some("Arial".into()),
+            ..RunProps::default()
+        };
+        assert_eq!(
+            ss.effective_run(None, None, &named).font.as_deref(),
+            Some("Arial")
+        );
+    }
+
+    #[test]
+    fn doc_font_is_normal_over_doc_defaults_1972() {
+        let ss = parse_styles_xml(
+            r#"<w:styles><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri"/></w:rPr>
+            </w:rPrDefault></w:docDefaults>
+            <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:rPr><w:rFonts w:ascii="Cambria"/></w:rPr></w:style></w:styles>"#,
+        );
+        assert_eq!(ss.doc_font(), Some("Cambria"));
+        let defaults_only = parse_styles_xml(
+            r#"<w:styles><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri"/></w:rPr>
+            </w:rPrDefault></w:docDefaults></w:styles>"#,
+        );
+        assert_eq!(defaults_only.doc_font(), Some("Calibri"));
+        assert_eq!(parse_styles_xml("<w:styles/>").doc_font(), None);
+        // Applying a theme to a sheet with no references changes nothing.
+        let mut plain = defaults_only.clone();
+        plain.apply_theme_fonts(&office_theme());
+        assert_eq!(plain.doc_font(), Some("Calibri"));
+    }
+
+    #[test]
+    fn shown_run_sees_resolved_theme_fonts_but_still_starts_from_nothing_1972() {
+        let mut ss = parse_styles_xml(THEMED_STYLES);
+        ss.apply_theme_fonts(&office_theme());
+        let plain = RunProps::default();
+        assert_eq!(ss.shown_run(None, None, None, &plain).font, None);
+        assert_eq!(
+            ss.shown_run(None, Some("Heading1"), None, &plain)
+                .font
+                .as_deref(),
+            Some("Calibri Light")
+        );
     }
 }
