@@ -21,8 +21,8 @@ use docxcore::editor::{Caret, Clip, Editor, RevisionLocation, para_text_len, res
 use docxcore::export::{PdfOptions, to_pdf};
 use docxcore::load::{Relationships, parse_rels_xml};
 use docxcore::model::{
-    Align, Block, BorderKind, Inline, ParBorders, PropertyScope, RevisionCategory, RevisionKind,
-    RevisionTarget, UnsupportedRevisionKind, VertAlign,
+    Align, Block, Inline, PropertyScope, RevisionCategory, RevisionKind, RevisionTarget,
+    UnsupportedRevisionKind, VertAlign,
 };
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{
@@ -498,14 +498,8 @@ impl Session {
             "tab" => self.editor.insert_tab(),
             "sort" => self.editor.sort_paragraphs(),
             "hrule" => self.editor.insert_hrule(),
-            "borders" => {
-                let has = self.editor.caret_para_props().borders.bottom.is_some();
-                self.editor.set_para_border(if has {
-                    ParBorders::default()
-                } else {
-                    ParBorders::bottom_rule(BorderKind::Single)
-                });
-            }
+            // On the rule the paragraph shows, its style's included (#2231).
+            "borders" => self.editor.toggle_bottom_border(),
             _ => mutated = false,
         }
 

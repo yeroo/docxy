@@ -48,7 +48,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   paragraph's left and first line from the first that gives it: its own
   (`has_direct_left_indent`, `has_direct_first_line`: nonzero, or loaded or
   pinned, a 0 included); for a list item, its level's `w:ind` where the
-  package's numbering part defines it (`Numbering::level_indent`), else for
+  package's numbering part defines it (`Numbering::level_indent`; a list
+  made from a list style, `w:numStyleLink`, takes the levels of the
+  abstract whose `w:styleLink` names that style, and one whose link
+  resolves to nothing is not defined, r2), else for
   docxy's own lists (numId 1 and 2, `add_markdown_numbering`/`blank_base`;
   9990/9991, `ensure_list`) that no part defines yet what saving writes
   (`package::own_list_level_indent`: 720·(ilvl+1), hanging 360), so a list

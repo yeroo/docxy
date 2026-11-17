@@ -180,9 +180,7 @@ use std::path::PathBuf;
 use docxcore::comments::Comment;
 use docxcore::editor::{Caret, Clip, Editor, FoundMatch, PropSource, step_found};
 use docxcore::markup::MarkupView;
-use docxcore::model::{
-    Align, Block, BorderKind, Document, Inline, ParBorders, Paragraph, RunProps, Table, VertAlign,
-};
+use docxcore::model::{Align, Block, Document, Inline, Paragraph, RunProps, Table, VertAlign};
 use docxcore::package::{HeaderVariant, Package};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -8258,6 +8256,40 @@ mod level_indent_tests {
         )
     }
 
+    /// r2 M1: a list made from a list style (`w:numStyleLink`) draws at the
+    /// linked style's levels, not flattened to its paragraph style's left;
+    /// a link that resolves to nothing keeps the old step.
+    #[test]
+    fn a_list_style_list_draws_at_its_linked_levels() {
+        let lvl = |i: i32| {
+            format!(
+                "<w:lvl w:ilvl=\"{i}\"><w:numFmt w:val=\"bullet\"/>\
+                 <w:pPr><w:ind w:left=\"{}\" w:hanging=\"360\"/></w:pPr></w:lvl>",
+                720 * (i + 1)
+            )
+        };
+        let numbering = docxcore::numbering::parse_numbering_xml(&format!(
+            "<w:numbering>\
+             <w:abstractNum w:abstractNumId=\"20\"><w:styleLink w:val=\"Corp\"/>{}{}{}</w:abstractNum>\
+             <w:abstractNum w:abstractNumId=\"21\"><w:numStyleLink w:val=\"Corp\"/></w:abstractNum>\
+             <w:abstractNum w:abstractNumId=\"22\"><w:numStyleLink w:val=\"Gone\"/></w:abstractNum>\
+             <w:num w:numId=\"8\"><w:abstractNumId w:val=\"21\"/></w:num>\
+             <w:num w:numId=\"9\"><w:abstractNumId w:val=\"22\"/></w:num></w:numbering>",
+            lvl(0),
+            lvl(1),
+            lvl(2)
+        ));
+        let sheet = docxcore::styles::parse_styles_xml(STYLES);
+        let left = |num: i32, ilvl: i32, style: Option<&str>| {
+            let p = item(Some(num), ilvl, style);
+            eff_indent(&p, Inherited::of(&p, Some(&sheet), Some(&numbering))).left
+        };
+        let linked: Vec<i32> = (0..3).map(|i| left(8, i, Some("ListParagraph"))).collect();
+        assert_eq!(linked, [720, 1440, 2160]);
+        let lost: Vec<i32> = (0..3).map(|i| left(9, i, None)).collect();
+        assert_eq!(lost, [0, 300, 600]);
+    }
+
     /// B5: a list item's hang dragged away on the ruler stays away, after
     /// the move and after a save and reload.
     #[test]
@@ -8317,6 +8349,34 @@ mod level_indent_tests {
         let mut ed = editor(item(Some(7), 1, None));
         ruler_move(&mut ed, &none, RulerHandle::FirstLine, 0);
         assert!(props_of(&ed).shadow.is_empty());
+    }
+}
+
+/// r2 m3: every paragraph drawn in a context, a read-only header's too,
+/// takes the package's numbering and theme colours with its styles.
+#[cfg(test)]
+mod table_ctx_styler_tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    #[test]
+    fn the_context_styler_carries_numbering_and_theme_colours() {
+        let loaded = crate::load_bytes(&crate::ext_fixture::word_compare_docx());
+        let pkg = loaded.pkg.expect("a package");
+        let parts = run_look::Cache::default().parts(Some(&pkg));
+        let tbl = TableCtx::new(Some(&pkg), parts, false);
+        let styler = tbl.styler();
+        assert!(styler.sheet.is_some());
+        assert!(styler.numbering.is_some_and(|n| n.defines(1)));
+        let accent = docxcore::theme::ThemeColorRef {
+            name: docxcore::theme::ThemeColor::Accent1,
+            tint: None,
+            shade: None,
+        };
+        assert_eq!(
+            styler.colors.and_then(|c| c.resolve(accent)),
+            Some(0x4F81BD)
+        );
     }
 }
 
@@ -11452,6 +11512,20 @@ impl<'a> TableCtx<'a> {
             cache: Default::default(),
             gridlines,
             draw: None,
+        }
+    }
+
+    /// A run styler over the package's styles, numbering and theme colours
+    /// (#2231): every paragraph drawn in this context takes all three, so a
+    /// list level's indent and a border's theme colour show wherever it is
+    /// drawn (a header read-only as much as open).
+    fn styler(&self) -> run_look::RunStyler<'_> {
+        run_look::RunStyler {
+            sheet: self.sheet.as_deref(),
+            numbering: self.numbering.as_deref(),
+            colors: self.colors.as_deref(),
+            cell: None,
+            pstyle: None,
         }
     }
 
@@ -34286,15 +34360,8 @@ fn apply_doc_act(e: &mut Editor, act: Act) {
         IndentInc => e.change_indent(720),
         IndentDec => e.change_indent(-720),
         Sort => e.sort_paragraphs(),
-        ParaBorders => {
-            let has = e.caret_para_props().borders.bottom.is_some();
-            let b = if has {
-                ParBorders::default()
-            } else {
-                ParBorders::bottom_rule(BorderKind::Single)
-            };
-            e.set_para_border(b);
-        }
+        // On the rule the page view shows, its style's included (#2231 r2).
+        ParaBorders => e.toggle_bottom_border(),
         Title => e.set_para_style(Some("Title")),
         Subtitle => e.set_para_style(Some("Subtitle")),
         ClearFmt => e.clear_run_formatting(),
@@ -37755,7 +37822,7 @@ fn hf_els(
     pal: Pal,
     meas: &Measurer,
     hf_width: f32,
-    sheet: Option<&docxcore::styles::StyleSheet>,
+    styler: run_look::RunStyler,
     pics: Option<pictures::Scope>,
     page_vals: Option<&page_fields::PageVals>,
 ) -> Vec<AnyElement> {
@@ -37764,7 +37831,7 @@ fn hf_els(
         .into_iter()
         .filter_map(|(_, b)| match b {
             Block::Paragraph(p) => Some(hf_para_el(
-                p, pal, meas, hf_width, 1.0, sheet, pics, page_vals,
+                p, pal, meas, hf_width, 1.0, styler, pics, page_vals,
             )),
             _ => None,
         })
@@ -38291,7 +38358,7 @@ fn hf_para_el(
     meas: &Measurer,
     width: f32,
     zoom: f32,
-    sheet: Option<&docxcore::styles::StyleSheet>,
+    styler: run_look::RunStyler,
     pics: Option<pictures::Scope>,
     page_vals: Option<&page_fields::PageVals>,
 ) -> AnyElement {
@@ -38312,10 +38379,7 @@ fn hf_para_el(
         // Header/footer text is never line-numbered (#746).
         None,
         None,
-        run_look::RunStyler {
-            sheet,
-            ..Default::default()
-        },
+        styler,
         pics,
         page_vals,
         FlowPara::default(),
@@ -39947,11 +40011,8 @@ fn block_el_numbered(
                 lines,
                 overlay,
                 run_look::RunStyler {
-                    sheet: ctx.tbl.sheet.as_deref(),
                     cell: ctx.cell_run,
-                    pstyle: None,
-                    numbering: ctx.tbl.numbering.as_deref(),
-                    colors: ctx.tbl.colors.as_deref(),
+                    ..ctx.tbl.styler()
                 },
                 ctx.pics,
                 ctx.page_vals,
@@ -44011,7 +44072,7 @@ impl Docxy {
             AlignJ => pp.is_some_and(|p| p.align == Align::Justify),
             Bullets => doc.is_some_and(|ed| ed.all_in_list(NUM_BULLET)),
             Numbers => doc.is_some_and(|ed| ed.all_in_list(NUM_DECIMAL)),
-            ParaBorders => pp.is_some_and(|p| p.borders.bottom.is_some()),
+            ParaBorders => doc.is_some_and(|ed| ed.shown_bottom_border()),
             ShowHide => self.show_marks,
             ToggleComments => self.show_comments,
             ResolveComment => self.selected_comment_resolved(),
@@ -46198,7 +46259,7 @@ impl Render for Docxy {
                                                     doc_pal,
                                                     &measurer,
                                                     hf_w,
-                                                    tbl.sheet.as_deref(),
+                                                    tbl.styler(),
                                                     pictures::scope(
                                                         pictures.as_ref(),
                                                         Some(h.part_name.as_str()),
@@ -46213,7 +46274,7 @@ impl Render for Docxy {
                                         doc_pal,
                                         &measurer,
                                         hf_w,
-                                        tbl.sheet.as_deref(),
+                                        tbl.styler(),
                                         pictures::scope(pictures.as_ref(), page_part(pi, is_h)),
                                         page_vals.get(pi),
                                     )
@@ -46476,7 +46537,7 @@ impl Render for Docxy {
                                                     &measurer,
                                                     width,
                                                     zoom,
-                                                    tbl.sheet.as_deref(),
+                                                    tbl.styler(),
                                                     pictures::scope(
                                                         pictures.as_ref(),
                                                         match edited {

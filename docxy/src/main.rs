@@ -5482,14 +5482,9 @@ impl App {
         if !self.mutation_allowed(protection::MutationKind::Formatting) {
             return;
         }
-        use docxcore::model::{BorderKind, ParBorders};
-        let has = self.editor.caret_para_props().borders.bottom.is_some();
-        let new = if has {
-            ParBorders::default()
-        } else {
-            ParBorders::bottom_rule(BorderKind::Single)
-        };
-        self.editor.set_para_border(new);
+        // On the rule the paragraph shows, its style's included (#2231).
+        let has = self.editor.shown_bottom_border();
+        self.editor.toggle_bottom_border();
         self.after_edit();
         self.status = Some(
             if has {

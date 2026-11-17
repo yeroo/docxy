@@ -2165,7 +2165,9 @@ fn print_sheets(
     let sections = editor.sections();
     let body = &editor.doc.body;
     let (zoom, pal, meas) = (ctx.zoom, ctx.pal, ctx.meas);
-    let sheet = ctx.tbl.sheet.as_deref();
+    // Headers and footers draw with the body's styles, numbering and theme
+    // colours (#2231).
+    let styler = ctx.tbl.styler();
     let tw = move |t: i32| px(zoom * (t.max(0) as f32) / 15.0);
     // A page's column fits its tables and lays its paragraphs out as a
     // document tab's Print Layout does: no flow spacing, no fitted width.
@@ -2208,7 +2210,7 @@ fn print_sheets(
                     pal,
                     meas,
                     hf_w,
-                    sheet,
+                    styler,
                     pictures::scope(pics, plan.part(pi, is_h)),
                     vals,
                 )
@@ -2284,7 +2286,7 @@ fn print_sheets(
                     let r = docxcore::frame::frame_rect(
                         g.frame,
                         &geom,
-                        frame_content_w(g, meas, zoom, sheet, vals),
+                        frame_content_w(g, meas, zoom, styler.sheet, vals),
                         g.content_h(),
                     );
                     let width = zoom * r.w.max(0) as f32 / 15.0;
@@ -2295,7 +2297,7 @@ fn print_sheets(
                             meas,
                             width,
                             zoom,
-                            sheet,
+                            styler,
                             pictures::scope(pics, plan.part(pi, is_h)),
                             vals,
                         )

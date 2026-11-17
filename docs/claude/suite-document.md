@@ -571,7 +571,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   `border_ink(shown_color)` (a theme colour first, then `w:color`). A side
   given as `none`/`nil` (`ParBorders::nil`, Word's removed rule) cancels
   the style's below it, direct or in a derived style, and saves back as
-  loaded, or as `w:val="nil"` when the borders are rewritten. gpui
+  loaded, or as `w:val="nil"` when the borders are rewritten. Bottom
+  Border (`Editor::toggle_bottom_border`, its pressed state
+  `shown_bottom_border`; terminal docxy and docxwasm too) acts on the rule
+  shown, the style's included: off over a style's rule writes that cancel,
+  and the paragraph's other sides stay. Every paragraph a context draws
+  takes `TableCtx::styler()` (styles, numbering and theme colours), read-only
+  headers and footers included. gpui
   draws one colour per div border, hence the strips. Word's grouping
   (`paragraph_border_group`, `border_group`, `drawn_sides`): consecutive
   paragraphs among `RenderCtx::siblings` (the blocks drawn together: the
