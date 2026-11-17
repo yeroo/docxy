@@ -270,6 +270,21 @@ pub enum Action {
     WindowClick(String),
 }
 
+impl Action {
+    /// The file a step opens, as written: an `open` step's path, or the one a
+    /// `native-dialog open` types into the dialog (#2195). `None` for any
+    /// other step.
+    pub fn opened_path(&self) -> Option<&str> {
+        match self {
+            Action::Open(path) | Action::OpenCopy(path) | Action::OpenCopyAs { path, .. } => {
+                Some(path)
+            }
+            Action::NativeDialog(Some(open)) => open.opened_path(),
+            _ => None,
+        }
+    }
+}
+
 /// What a step asserts.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Assertion {
@@ -2172,6 +2187,32 @@ test t
 
     /// #2195: `native-dialog` cancels, or opens a path written as `open`
     /// takes it; `window click` takes a region `shot` would.
+    /// #2195: the file a step opens, for the fixture guard in
+    /// `tests/cases.rs`, includes the one a `native-dialog open` types.
+    #[test]
+    fn a_steps_opened_path_includes_the_native_dialogs() {
+        let steps = parse_script(
+            "test t\n  open a.docx\n  open copy:b.xlsx\n  open copy:\"c.xml\" as d.xml\n  \
+             native-dialog open copy:e.xlsx\n  native-dialog cancel\n  type x\n",
+        )
+        .unwrap()
+        .cases
+        .remove(0)
+        .steps;
+        let paths: Vec<Option<&str>> = steps.iter().map(|s| s.action.opened_path()).collect();
+        assert_eq!(
+            paths,
+            [
+                Some("a.docx"),
+                Some("b.xlsx"),
+                Some("c.xml"),
+                Some("e.xlsx"),
+                None,
+                None
+            ]
+        );
+    }
+
     #[test]
     fn native_dialog_and_window_click_steps() {
         let step = |line: &str| {

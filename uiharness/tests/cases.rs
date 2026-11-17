@@ -6,7 +6,7 @@
 //! nothing in them reaches outside the harness's own directory for a fixture.
 
 use std::path::{Path, PathBuf};
-use uiharness::script::{Action, parse_script};
+use uiharness::script::parse_script;
 
 fn cases_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cases")
@@ -33,7 +33,8 @@ fn every_committed_case_parses() {
     }
 }
 
-/// Every `open` in a case resolves, and resolves to something under the
+/// Every `open` in a case (and every file a `native-dialog open` types into
+/// the picker) resolves, and resolves to something under the
 /// harness's own tree. A case that reached into the user's documents would
 /// pass on the machine it was written on and nowhere else — and would be
 /// reading files the harness has no business reading.
@@ -49,10 +50,10 @@ fn every_opened_file_is_the_harnesss_own_and_is_there() {
         let mut opened = 0;
         for case in &script.cases {
             for step in &case.steps {
-                let rel = match &step.action {
-                    Action::Open(rel) | Action::OpenCopy(rel) => rel,
-                    Action::OpenCopyAs { path, .. } => path,
-                    _ => continue,
+                // `native-dialog open` types a file into the picker (#2195):
+                // the same rule as an `open`.
+                let Some(rel) = step.action.opened_path() else {
+                    continue;
                 };
                 opened += 1;
                 let full = base.join(rel);

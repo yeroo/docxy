@@ -130,8 +130,9 @@ pub fn answer(_pid: u32, _path: Option<&std::path::Path>) -> Result<String, Stri
 }
 
 /// Post a left click at the desktop point (`x`, `y`) to `pid`'s window:
-/// a move there, `between()` (the caller waits a frame, so the hover is
-/// drawn), then the press and the release.
+/// a move there, `between()` (the caller's pacing: it waits for a frame,
+/// which the press does not need, as gpui hit-tests each mouse event), then
+/// the press and the release.
 #[cfg(windows)]
 pub fn post_click(
     pid: u32,

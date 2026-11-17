@@ -185,8 +185,12 @@ impl Target for Driver {
         // the region is now (`rect` is as last laid out).
         let r = self.settle(region)?;
         let (x, y) = crate::native_dialog::centre(r.rect.x, r.rect.y, r.rect.w, r.rect.h);
-        // Between the move and the press, a frame: the hover the move set
-        // is drawn, so the press hit-tests a frame that has it (#2195).
+        // The move goes first because a real pointer's does. The press does
+        // not need a drawn hover: gpui hit-tests every mouse event against
+        // the rendered frame at the event's own position, and `settle`
+        // already waited for a frame holding the region's hitbox. The wait
+        // for the frame count to move between them is only pacing, so the
+        // move and the press are not one burst of messages (#2195).
         let mut between = || {
             let now = self.frame()?;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

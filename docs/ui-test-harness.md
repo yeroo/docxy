@@ -1334,9 +1334,13 @@ harness answers it from its own process instead:
   `Edit`) by `WM_SETTEXT`, read it back and post `IDOK` (`BM_CLICK` on OK
   after 5 s), and wait up to 20 s for it to go. An error lists the
   process's top-level windows, or the dialog's controls.
-- `window click <region>` settles a frame, takes the region's centre, and
-  posts `WM_MOUSEMOVE`, a frame later `WM_LBUTTONDOWN` (`MK_LBUTTON`) and
-  `WM_LBUTTONUP` to the suite's window. Unlike `pointer-click` and
+- `window click <region>` settles a frame (so the drawn frame has the
+  region's hitbox), takes the region's centre, and posts `WM_MOUSEMOVE`, then
+  `WM_LBUTTONDOWN` (`MK_LBUTTON`) and `WM_LBUTTONUP` to the suite's window.
+  The move goes first as a real pointer's does; the press does not depend on
+  a drawn hover, since gpui hit-tests each mouse event at its own position.
+  The harness waits for the frame count to move between the move and the
+  press, as pacing only. Unlike `pointer-click` and
   `real-key`, whose input the control pump dispatches from inside a
   foreground task, its listener runs from a real window message, with the
   App borrowed and no task wake pending: #2192's frame. A posted key could
