@@ -2205,6 +2205,51 @@ from the calendar without sending anything.
   `remove_from_calendar_refuses_the_organizer`,
   `remove_from_calendar_of_a_removed_meeting_sends_nothing`,
   `meeting_message_commands_signed_out_send_nothing`.
+- A request's update facts (#2185): `MeetingMessage` also carries `request_type`
+  (`MeetingRequestType`, Graph's `meetingRequestType`: `newMeetingRequest`, `fullUpdate`,
+  `informationalUpdate`, `silentUpdate`, `outdated`, `principalWantsCopy`, with
+  `from_graph` / `as_graph` like `MeetingMessageType`'s; `none`, unknown, `""` and a wrong
+  case are `None`), `start_utc`, `end_utc`, `previous_start_utc`, `previous_end_utc`,
+  `location`, `previous_location` (`displayName`, trimmed: absent, `null` or not a string
+  is `None`, an empty or blank name `Some("")`) and `is_all_day` (a bool only). All are
+  `Option`, `None` in `Default`, read from the same GET (any of its three forms), never in
+  sync, never stored. `request_type` and the `previous_*` fields are `eventMessageRequest`
+  properties; the current times, `location` and `isAllDay` are `eventMessage` ones, read
+  for any meeting message that carries them (a cancellation too: `from_json` does not look
+  at the type). A message that carries none of them reads them `None`.
+- The times are the store's `YYYY-MM-DDTHH:MM:SSZ`, by one rule (`model.rs`
+  `meeting_time`). `dateTime` is read strictly (`WallClock::parse`): `YYYY-MM-DDTHH:MM:SS`,
+  an optional digits-only fraction and an optional `Z`, then the date and time are checked
+  by the store's own `iso8601_to_unix_secs` (so a day past its month's length is `None`
+  and a leap second `:60` is read, as for stored times); an offset, a sign, an empty
+  fraction or `0001-01-01…` (Graph's "no date") is `None`. Not
+  `to_utc` / `normalize_datetime`, which turn garbage into `0000-00-00T00:00:00Z`. With
+  `isAllDay: true`, a midnight wall clock is that date's `T00:00:00Z` in any zone, which is
+  `EventRow`'s all-day shape (the end the midnight after the last day); a current bound not
+  at midnight is `None` (no date can be told from it without a time zone database), a
+  previous one is read as timed, since Graph has no `previousIsAllDay` and it may be the
+  timed slot the update made all-day. A timed bound is read only in UTC (`UTC`, `Etc/UTC`,
+  `Z`, `tzone://Microsoft/Utc`, any case, or no zone: `is_utc_zone`, which now knows
+  `tzone://Microsoft/Utc`, so a flag's `dueDateTime` in it is read too); any other zone is
+  `None`.
+  `meeting_message` sends `Prefer: outlook.timezone="UTC"` (`MEETING_MESSAGE_PREFER`) on
+  every form, as `calendar_view` does; Graph documents it for events, so the UTC-only
+  reader is what guarantees the shape.
+- Tests (#2185): `model.rs` `meeting_request_type_maps_graph_values_and_is_lenient`,
+  `meeting_request_type_round_trips_its_graph_name`,
+  `meeting_message_reads_a_full_update_with_a_changed_time`,
+  `meeting_message_reads_a_full_update_with_a_changed_location`,
+  `meeting_message_reads_a_full_update_with_a_changed_time_and_location`,
+  `meeting_message_reads_an_informational_update_and_a_new_request`,
+  `meeting_message_utc_zones_are_read_and_other_zones_are_not`,
+  `meeting_message_all_day_times_are_utc_dates_in_any_zone` (an all-day update moved by a
+  day), `meeting_message_all_day_bounds_not_at_midnight`,
+  `meeting_message_unreadable_update_facts_are_none`,
+  `meeting_message_without_update_facts_reads_them_none`,
+  `meeting_message_cancellation_reads_its_eventmessage_facts`; `client.rs`
+  `meeting_message_reads_an_update_and_asks_for_utc`,
+  `meeting_message_fallbacks_ask_for_utc_too`; `engine.rs`
+  `fetch_meeting_message_carries_update_facts`.
 
 ## Dismiss and snooze reminders (#2025)
 
