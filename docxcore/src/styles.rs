@@ -117,6 +117,11 @@ pub struct StyleSheet {
     default_left: LeftInd,
     /// [`StyleSheet::doc_font`], kept as the sheet changes.
     doc_font: Option<String>,
+    /// [`StyleSheet::para_font`] of each style id, kept as the sheet changes.
+    para_fonts: HashMap<String, Option<String>>,
+    /// The document defaults' own family: [`StyleSheet::para_font`] of a
+    /// style id the sheet does not define.
+    defaults_font: Option<String>,
 }
 
 /// The left indent a `w:ind` sets, its twips (`w:left`, else `w:start`) and
@@ -164,8 +169,6 @@ impl PprFlag {
 }
 
 impl StyleSheet {
-    /// Every paragraph style as `(styleId, display name)`, sorted by name. Used
-    /// by the Apply-Styles dialog to offer every style the document defines.
     /// The family Word draws a run in when neither it nor its paragraph or
     /// character style names one (#1972): the default paragraph style's
     /// chain over the document defaults, theme fonts resolved once
@@ -173,6 +176,23 @@ impl StyleSheet {
     /// family (or only a theme font and no theme was applied).
     pub fn doc_font(&self) -> Option<&str> {
         self.doc_font.as_deref()
+    }
+
+    /// The family Word draws a run in, in a paragraph styled `pstyle`, when
+    /// neither the run nor its character style names one: the paragraph
+    /// style's own `basedOn` chain over the document defaults, as
+    /// [`StyleSheet::effective_run`] folds it, so a style that never reaches
+    /// the default paragraph style takes the defaults' family, not Normal's;
+    /// without a `pStyle`, [`StyleSheet::doc_font`]. Precomputed: a read is
+    /// one lookup.
+    pub fn para_font(&self, pstyle: Option<&str>) -> Option<&str> {
+        match pstyle {
+            None => self.doc_font(),
+            Some(id) => self
+                .para_fonts
+                .get(id)
+                .map_or(self.defaults_font.as_deref(), Option::as_deref),
+        }
     }
 
     /// Resolves every theme font reference (`w:asciiTheme`, `w:hAnsiTheme`)
@@ -186,13 +206,23 @@ impl StyleSheet {
         for def in self.styles.values_mut() {
             def.run.apply_theme(theme);
         }
-        self.doc_font = self.compute_doc_font();
+        self.compute_fonts();
     }
 
-    fn compute_doc_font(&self) -> Option<String> {
-        self.effective_run(None, None, &RunProps::default()).font
+    /// Fills [`StyleSheet::doc_font`] and [`StyleSheet::para_font`]'s table.
+    fn compute_fonts(&mut self) {
+        let plain = RunProps::default();
+        self.doc_font = self.effective_run(None, None, &plain).font;
+        self.defaults_font = self.default_run.font.clone();
+        self.para_fonts = self
+            .styles
+            .keys()
+            .map(|id| (id.clone(), self.effective_run(Some(id), None, &plain).font))
+            .collect();
     }
 
+    /// Every paragraph style as `(styleId, display name)`, sorted by name. Used
+    /// by the Apply-Styles dialog to offer every style the document defines.
     pub fn paragraph_styles(&self) -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = self
             .styles
@@ -664,7 +694,7 @@ pub fn parse_styles_xml(xml: &str) -> StyleSheet {
             _ => {}
         }
     }
-    ss.doc_font = ss.compute_doc_font();
+    ss.compute_fonts();
     ss
 }
 
@@ -1667,6 +1697,53 @@ mod tests {
         let mut plain = defaults_only.clone();
         plain.apply_theme_fonts(&office_theme());
         assert_eq!(plain.doc_font(), Some("Calibri"));
+    }
+
+    /// A paragraph style's own chain over the defaults (#1972 r1): one that
+    /// never reaches Normal takes the defaults' family, not Normal's.
+    #[test]
+    fn para_font_follows_the_paragraph_styles_own_chain_1972() {
+        let mut ss = parse_styles_xml(
+            r#"<w:styles><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:asciiTheme="minorHAnsi"/></w:rPr>
+            </w:rPrDefault></w:docDefaults>
+            <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:rPr><w:rFonts w:ascii="Times New Roman"/></w:rPr></w:style>
+            <w:style w:type="paragraph" w:styleId="Code"><w:name w:val="Code"/></w:style>
+            <w:style w:type="paragraph" w:styleId="Quote"><w:basedOn w:val="Normal"/></w:style>
+            <w:style w:type="paragraph" w:styleId="Heading1"><w:basedOn w:val="Normal"/>
+            <w:rPr><w:rFonts w:asciiTheme="majorHAnsi"/></w:rPr></w:style></w:styles>"#,
+        );
+        ss.apply_theme_fonts(&office_theme());
+        assert_eq!(
+            ss.para_font(None),
+            Some("Times New Roman"),
+            "no pStyle: Normal's"
+        );
+        assert_eq!(ss.para_font(Some("Normal")), Some("Times New Roman"));
+        assert_eq!(
+            ss.para_font(Some("Code")),
+            Some("Calibri"),
+            "standalone: defaults'"
+        );
+        assert_eq!(
+            ss.para_font(Some("Quote")),
+            Some("Times New Roman"),
+            "basedOn Normal"
+        );
+        assert_eq!(ss.para_font(Some("Heading1")), Some("Calibri Light"));
+        assert_eq!(
+            ss.para_font(Some("Missing")),
+            Some("Calibri"),
+            "as effective_run"
+        );
+        for id in ["Normal", "Code", "Quote", "Heading1", "Missing"] {
+            assert_eq!(
+                ss.para_font(Some(id)),
+                ss.effective_run(Some(id), None, &RunProps::default())
+                    .font
+                    .as_deref(),
+                "{id}"
+            );
+        }
     }
 
     #[test]

@@ -147,7 +147,8 @@ impl Resolver {
         self
     }
 
-    /// The faces of `family`, which gpui loads.
+    /// The faces of `family`, which gpui loads; without a faces probe,
+    /// both (so the theme's family is kept).
     fn faces_of(&mut self, family: &SharedString) -> Faces {
         let Some(probe) = self.faces.as_ref() else {
             return Faces {
@@ -174,27 +175,26 @@ impl Resolver {
             return hit.clone();
         }
         let ui = self.ui_family(theme);
-        let found =
-            if self.faces.is_none() || self.requested(&ui).is_none() || self.faces_of(&ui).bold {
-                ui
-            } else {
-                let mut bold_only = None;
-                let mut both = None;
-                for name in UI_SANS {
-                    let Some(family) = self.available(name) else {
-                        continue;
-                    };
-                    let faces = self.faces_of(&family);
-                    if faces.bold && faces.italic {
-                        both = Some(family);
-                        break;
-                    }
-                    if faces.bold && bold_only.is_none() {
-                        bold_only = Some(family);
-                    }
+        let found = if self.requested(&ui).is_none() || self.faces_of(&ui).bold {
+            ui
+        } else {
+            let mut bold_only = None;
+            let mut both = None;
+            for name in UI_SANS {
+                let Some(family) = self.available(name) else {
+                    continue;
+                };
+                let faces = self.faces_of(&family);
+                if faces.bold && faces.italic {
+                    both = Some(family);
+                    break;
                 }
-                both.or(bold_only).unwrap_or(ui)
-            };
+                if faces.bold && bold_only.is_none() {
+                    bold_only = Some(family);
+                }
+            }
+            both.or(bold_only).unwrap_or(ui)
+        };
         self.doc_base.insert(theme.to_string(), found.clone());
         found
     }

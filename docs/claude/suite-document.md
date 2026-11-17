@@ -279,7 +279,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   `docDefaults`. `Package::theme_part_name` follows the document's theme
   relationship, else `word/theme/theme1.xml`. `run_look::Cache` applies the
   theme (it parses again when the styles or the theme text changes), and
-  `RunStyler::shown` fills `font` with `doc_font` when no style names one.
+  `RunStyler::shown` fills `font` with `StyleSheet::para_font(pstyle)`
+  when no style names one. That is the paragraph style's own `basedOn`
+  chain over `docDefaults` (as `effective_run` folds it, precomputed per
+  style id), so a style that never reaches Normal takes the defaults'
+  family, not Normal's; with no `pStyle` it is `doc_font`.
   Every family consumer (`emit_words`, `width_in`, `shown_mark`) reads shown
   props, so measured = drawn. `shown_run` still starts from nothing (#1427).
   PDF export and terminal docxy never apply a theme and are unchanged.

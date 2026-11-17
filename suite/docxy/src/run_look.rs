@@ -29,11 +29,13 @@ impl<'a> RunStyler<'a> {
         RunStyler { pstyle, ..self }
     }
 
-    /// `r` as drawn: its styles below it, and the document's font
-    /// ([`StyleSheet::doc_font`]) when none of them names a family (#1972).
+    /// `r` as drawn: its styles below it, and the family of its
+    /// paragraph style's own chain over the document defaults
+    /// ([`StyleSheet::para_font`]) when none of them names one (#1972). A
+    /// character style naming a family is already in the styled props.
     pub fn shown<'r>(&self, r: &'r Run) -> Cow<'r, RunProps> {
         let shown = self.styled(r);
-        match self.sheet.and_then(StyleSheet::doc_font) {
+        match self.sheet.and_then(|s| s.para_font(self.pstyle)) {
             Some(family) if shown.font.is_none() => {
                 let mut props = shown.into_owned();
                 props.font = Some(family.to_string());
@@ -256,6 +258,30 @@ mod tests {
         // A paragraph style naming no font still draws the document's.
         let styled = styler.for_paragraph(Some("Normal"));
         assert_eq!(styled.shown(&bold).font.as_deref(), Some("Calibri"));
+        // A paragraph style that never reaches Normal takes the defaults'
+        // family, not Normal's (#1972 r1).
+        let mut split =
+            docxcore::package::load_package(&crate::ext_fixture::theme_font_docx()).expect("loads");
+        assert!(split.set_part(
+            "word/styles.xml",
+            crate::ext_fixture::THEME_FONT_STYLES
+                .replace(
+                    "<w:qFormat/></w:style>",
+                    "<w:qFormat/><w:rPr><w:rFonts w:ascii=\"Times New Roman\"/></w:rPr></w:style>\
+                     <w:style w:type=\"paragraph\" w:styleId=\"Code\"><w:name w:val=\"Code\"/></w:style>\
+                     <w:style w:type=\"paragraph\" w:styleId=\"Quote\"><w:basedOn w:val=\"Normal\"/></w:style>",
+                )
+                .into_bytes(),
+        ));
+        let sheet = Cache::default().current(Some(&split)).1.expect("a sheet");
+        let base = RunStyler {
+            sheet: Some(&sheet),
+            ..Default::default()
+        };
+        let font_in = |pstyle: Option<&str>| base.for_paragraph(pstyle).shown(&bold).font.clone();
+        assert_eq!(font_in(None).as_deref(), Some("Times New Roman"));
+        assert_eq!(font_in(Some("Code")).as_deref(), Some("Calibri"));
+        assert_eq!(font_in(Some("Quote")).as_deref(), Some("Times New Roman"));
         // Another theme is read again, the styles text unchanged.
         let parses = cache.parses;
         assert!(
