@@ -10,8 +10,9 @@ pub(crate) enum FileKey {
     Open,
 }
 
-/// The status line when Ctrl+F12 meets a harness instance: Open would raise
-/// the native dialog.
+/// The status line when Open meets a harness instance whose picker it could
+/// not answer (`open_mode::open_refused_in_harness`, #2195): Ctrl+F12, the
+/// rail's Open… and the open modes alike.
 pub(crate) const OPEN_HARNESS: &str =
     "A harness instance cannot open the Open dialog; use the harness open verb";
 
@@ -61,16 +62,9 @@ impl Docxy {
                 }
                 self.save_active(window, cx)
             }
-            FileKey::Open => {
-                // ⚠️ Never in a harness instance: `rfd` would stop the
-                // control pump (see `save_sheet_tab`).
-                if self.harness {
-                    self.set_status(OPEN_HARNESS);
-                    cx.notify();
-                    return self.refocus(window, cx);
-                }
-                self.open_file(window, cx)
-            }
+            // A harness instance refuses it off Windows: `pick_open_file`
+            // decides, for every Open path (#2195).
+            FileKey::Open => self.open_file(window, cx),
         }
     }
 }
