@@ -194,6 +194,9 @@ cold start, and every accepted and rejected form is a unit test.
 | `snapshot <range>` | remembers those cells, for a later `assert cells unchanged` |
 | `shot <region>` | files a PNG of the region |
 | `assert …` | see below |
+| `native-dialog cancel` | Windows only: the suite's native dialog, answered from outside the process (see [Open's real picker on Windows](#opens-real-picker-on-windows-2195)) |
+| `native-dialog open <path>` | Windows only: the same, typing the path (written as `open` takes it, `copy:` included) into its File name box and pressing OK |
+| `window click <region>` | Windows only: a left click on the region's centre, posted to the suite's window as window messages |
 
 ### Tab is the one key that is not a key press
 
@@ -357,6 +360,15 @@ starts without it instead (#806): no tab, the File > New page up, as a product
 launch with nothing to restore. The runner puts an empty marker file,
 `<config root>/docxy/start-screen`, in the sandbox before the launch; only a
 harness instance reads it. `start-screen.uit` drives it.
+
+### Operating systems
+
+A script whose first lines (before its first case) say `os <name>…`
+(`windows`, `linux`, `macos`, each once) runs only there (#2195). Elsewhere
+`uiharness run` prints `<path>: skipped (os …)` and launches nothing, and the
+sweep reports the script `SKIP`, which leaves its exit code at 0.
+`open-picker-windows.uit` is `os windows`; `file-keys-open-refused.uit` is
+`os linux macos`.
 
 ### Format plugins
 
@@ -1304,6 +1316,46 @@ file that is already open without asking unless `reopen` is `"ask"` (see
 
 `open-modes.uit` covers the rest.
 
+### Open's real picker on Windows (#2195)
+
+A harness instance refuses Open (Ctrl+F12, the rail's Open…, Open
+Read-Only… and the other open modes) with `A harness instance cannot open
+the Open dialog; use the harness open verb` on Linux and macOS, and opens
+the real `IFileDialog` on Windows (`open_mode::open_refused_in_harness`).
+There the picker is shown from a task (`PickRoute::Deferred`, #2192), so
+the verb that pressed Open replies first; but while it is up the suite runs
+no foreground task, so no later verb is answered until it closes. The
+harness answers it from its own process instead:
+
+- `native-dialog cancel` / `native-dialog open <path>` poll (every 50 ms, up
+  to 20 s) for a visible top-level `#32770` of the suite's process owned by
+  one of its windows, hold it 1.5 s, then post `IDCANCEL`, or set the File
+  name box (the `Edit` in `ComboBoxEx32` 0x47C, else the first visible
+  `Edit`) by `WM_SETTEXT`, read it back and post `IDOK` (`BM_CLICK` on OK
+  after 5 s), and wait up to 20 s for it to go. An error lists the
+  process's top-level windows, or the dialog's controls.
+- `window click <region>` settles a frame, takes the region's centre, and
+  posts `WM_MOUSEMOVE`, a frame later `WM_LBUTTONDOWN` (`MK_LBUTTON`) and
+  `WM_LBUTTONUP` to the suite's window. Unlike `pointer-click` and
+  `real-key`, whose input the control pump dispatches from inside a
+  foreground task, its listener runs from a real window message, with the
+  App borrowed and no task wake pending: #2192's frame. A posted key could
+  not carry Ctrl (gpui reads it with `GetKeyState`), and `SendInput` does
+  not reach the sweep's desktop, so Ctrl+F12 goes by `real-key`.
+- `call arm-task {"every_ms":50,"times":600}` keeps a foreground ticker
+  that updates the view through `AsyncApp` on each tick, as the
+  gpui-component timer that crashed #2192 did; `harness_task_runs` in the
+  state counts the ticks, and `call arm-task {"stop":true}` ends it
+  (`every_ms` 10 to 1000, `times` 1 to 2000). A tick due while a picker's
+  modal loop runs nested in a listener's borrow would abort the suite.
+- `bs-rail:<name>` is a suite File rail item by its id without `bs-`
+  (`bs-rail:open`, `bs-rail:saveas`).
+
+`open-picker-windows.uit` cancels the picker opened by Ctrl+F12 and by the
+rail, opens a workbook typed into it, and runs six rounds; File stays on
+its page after a cancel (#1078). `file-keys-open-refused.uit` covers the
+refusal on Linux.
+
 ### Dialogs
 
 A dialog is app state on its document tab, **never a native modal loop**, so the
@@ -2126,7 +2178,8 @@ Windows, `uiharness --desktop sweep-<stem> run <script>` with no Xvfb, so no
 `x11/` logs: each suite starts on a Win32 desktop of its own) with
 absolute `--suite`, script and `--run` paths, prints a line per script as it
 finishes and a table at the end, and exits non-zero unless every script is
-`PASS` or `XFAIL`. `--suite` and `--uiharness` default to the release builds;
+`PASS`, `XFAIL` or `SKIP` (a script whose `os` line leaves this system out,
+not run at all). `--suite` and `--uiharness` default to the release builds;
 it builds nothing itself. `--timeout` (default 600 s) stops a hung script.
 Everything lands under `--run` (default `uiharness-runs/sweep-<timestamp>`,
 which must be new or empty):

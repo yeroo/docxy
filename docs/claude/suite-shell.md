@@ -87,9 +87,37 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   among them, can run nested in the first one's loop. That is safe, since no
   borrow is held. If the owner closes first, `update_in` fails and the result
   is dropped.
-- The unit test `open_picker_route_per_os` pins the route only: no case runs
-  the real Windows picker yet (`OPEN_HARNESS` still refuses Open in a harness
-  instance).
+- The unit test `open_picker_route_per_os` pins the route;
+  `open-picker-windows.uit` runs the real Windows picker (#2195, below).
+
+## Open's real picker in the Windows sweep (#2195)
+
+- `pick_open_file` refuses Open in a harness with `OPEN_HARNESS` (moved there
+  from Ctrl+F12, so the rail's Open… and the open modes refuse too) unless
+  the route is `Deferred` (`open_mode::open_refused_in_harness`). macOS's
+  Inline picker would block the control pump inside the verb. Linux's
+  Background pick would not, but refusing there gives a deterministic
+  message and no stray portal call under xvfb.
+- While the Deferred picker is up no verb is answered (`wake_posted`,
+  above), so uiharness answers it from its own process by window messages
+  (`native-dialog`, `uiharness/src/native_dialog.rs`). It finds a visible
+  `#32770` of the suite's pid owned by a window of that pid (`set_parent`),
+  holds it 1.5 s, and cancels it or types a path and presses OK.
+- ⚠️ A harness verb's input never reproduces #2192: the pump dispatches
+  `real-key` and `pointer-click` from inside its own task, and
+  `run_foreground_task` keeps `wake_posted` set while any runnable runs, so
+  nothing nests even in an inline picker. The regression case clicks the
+  rail's Open… with `window click` (posted `WM_MOUSEMOVE`, `WM_LBUTTONDOWN`,
+  `WM_LBUTTONUP`), so its listener runs from a window message with the App
+  borrowed and no wake pending. Ctrl+F12 stays `real-key`: a posted key has
+  no Ctrl (`GetKeyState`) and `SendInput` cannot reach the sweep's desktop.
+- `arm-task` is the crashing task on demand: a foreground ticker updating
+  `Docxy` through `AsyncApp` (`harness_task_runs`). A ticker, not one shot:
+  a cold first `IFileDialog::Show` can take over a second, and a task due
+  before the picker shows runs harmlessly.
+- The suite's own rail items draw probes (`bs-rail:<id without bs->`).
+- The case order in `open-picker-windows.uit` matters: one suite runs the
+  file, so the crash case goes after the Ctrl+F12 one.
 
 ## Every other native dialog (#2194)
 
