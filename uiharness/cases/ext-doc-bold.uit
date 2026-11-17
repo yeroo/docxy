@@ -9,7 +9,11 @@
 # `ext-doc-word`'s `face` reports what the painted word asks for (`bold`,
 # `italic`) and whether gpui shaped it in its family's bold (`bold_face`) or
 # italic (`italic_face`) face; `family` is printed only, as CI may lack
-# Carlito.
+# Carlito. The last two tests check the same in a document tab, in Web and
+# Print Layout, with `doc-word` (the same `face`): the owner's file shape
+# (`theme-font.docx`: paragraphs in no style whose runs carry only `w:b` or
+# `w:i`, under `docDefaults` naming the theme's minor font, Calibri), and
+# bold typed into a new document.
 ext fixture
 
 test issue 1972 imported b and i draw in bold and italic faces
@@ -61,3 +65,39 @@ test issue 1972 bold typed into the editable view draws in a bold face
   assert reply.face.bold is true
   assert reply.face.bold_face is true
   key ctrl+w
+
+test issue 1972 the theme font document draws bold and italic faces in both layouts
+  open copy:../fixtures/theme-font.docx
+  assert view.layout is web
+  shot window
+  call doc-word {"text":"Strong"}
+  assert reply.face.bold is true
+  assert reply.face.bold_face is true
+  call doc-word {"text":"Slanted"}
+  assert reply.face.italic is true
+  assert reply.face.italic_face is true
+  call doc-word {"text":"Plain"}
+  assert reply.face.bold is false
+  assert reply.face.bold_face is false
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is print
+  shot window
+  call doc-word {"text":"Strong"}
+  assert reply.face.bold_face is true
+  call doc-word {"text":"Slanted"}
+  assert reply.face.italic_face is true
+
+test issue 1972 bold typed into a new document draws in a bold face
+  open copy:../fixtures/basic.docx
+  key ctrl+b
+  type Typed
+  key ctrl+b
+  key space
+  type Plain
+  shot window
+  call doc-word {"text":"Typed"}
+  assert reply.face.bold is true
+  assert reply.face.bold_face is true
+  call doc-word {"text":"Plain"}
+  assert reply.face.bold is false
+  assert reply.face.bold_face is false

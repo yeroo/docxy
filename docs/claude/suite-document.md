@@ -298,9 +298,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   (the run as its styles show it), `bold_face` / `italic_face` (whether the
   painted word's shaped `font_id` is its family's bold / italic face, compared
   over the drawn `Font` as gpui keyed it), and `family` (informative: gpui
-  maps several fonts to one id). Cases: `uiharness/cases/ext-doc-bold.uit`
-  and `doc-bold.uit`, which uses `uiharness/fixtures/theme-font.docx`, the
-  owner's shape. That file is `ext_fixture::theme_font_docx()`'s bytes
+  maps several fonts to one id). Case: `uiharness/cases/ext-doc-bold.uit`
+  (the view, then a document tab on `uiharness/fixtures/theme-font.docx`,
+  the owner's shape). That file is `ext_fixture::theme_font_docx()`'s bytes
   (`the_theme_font_fixture_file_is_current`; `UPDATE_THEME_FONT_FIXTURE=1`
   writes it).
 - Not done: a run naming a family with no bold face of its own (a
