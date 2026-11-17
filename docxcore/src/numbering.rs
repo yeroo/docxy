@@ -70,6 +70,11 @@ pub struct LevelIndent {
 #[derive(Debug, Clone, Default)]
 struct AbstractNum {
     levels: Vec<Level>,
+    /// `w:styleLink`: the list style this abstract defines.
+    style_link: Option<String>,
+    /// `w:numStyleLink`: the list style whose abstract (the one whose
+    /// `w:styleLink` names it) holds this list's levels (#2231 r2).
+    num_style_link: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,21 +95,41 @@ pub struct LevelDef {
 }
 
 impl Numbering {
+    /// The abstract that holds list `num_id`'s levels, and its id: the one
+    /// its `w:num` names, or, when that one only links to a list style
+    /// (`w:numStyleLink`), the abstract defining that style (`w:styleLink`),
+    /// as Word reads a list made from a list style (#2231 r2). `None` when
+    /// the list is not defined or its link resolves to nothing.
+    fn resolve(&self, num_id: i32) -> Option<(i32, &AbstractNum)> {
+        let id = *self.num_to_abstract.get(&num_id)?;
+        let abs = self.abstracts.get(&id)?;
+        let Some(style) = abs.num_style_link.as_deref() else {
+            return Some((id, abs));
+        };
+        // One hop: the defining abstract is the one whose own styleLink
+        // names the style (never itself, nor another link).
+        self.abstracts
+            .iter()
+            .filter(|&(&other, a)| {
+                other != id && a.num_style_link.is_none() && a.style_link.as_deref() == Some(style)
+            })
+            .min_by_key(|&(&other, _)| other)
+            .map(|(&other, a)| (other, a))
+    }
+
     /// The indent level `ilvl` of list `num_id` gives its items, when the
     /// numbering defines that level with a `w:ind`; `None` otherwise (#2231).
     pub fn level_indent(&self, num_id: i32, ilvl: i32) -> Option<LevelIndent> {
-        let abs = self.abstracts.get(self.num_to_abstract.get(&num_id)?)?;
+        let (_, abs) = self.resolve(num_id)?;
         let level = abs.levels.get(usize::try_from(ilvl).ok()?)?;
         let ind = level.indent;
         (ind.left.is_some() || ind.first.is_some()).then_some(ind)
     }
 
     /// Whether the numbering defines list `num_id` (a `w:num` naming an
-    /// abstract it has).
+    /// abstract it has, and a list-style link that resolves).
     pub fn defines(&self, num_id: i32) -> bool {
-        self.num_to_abstract
-            .get(&num_id)
-            .is_some_and(|a| self.abstracts.contains_key(a))
+        self.resolve(num_id).is_some()
     }
 
     /// Level `ilvl` of list `num_id`, or `None` when the list is not
@@ -112,7 +137,7 @@ impl Numbering {
     /// below the highest one comes back as the default decimal `%1.` level,
     /// as the markers number it.
     pub fn level(&self, num_id: i32, ilvl: i32) -> Option<LevelDef> {
-        let abs = self.abstracts.get(self.num_to_abstract.get(&num_id)?)?;
+        let (_, abs) = self.resolve(num_id)?;
         let level = abs.levels.get(usize::try_from(ilvl).ok()?)?;
         Some(LevelDef {
             format: level.fmt,
@@ -158,8 +183,7 @@ impl Numbering {
         ilvl: i32,
         counters: &'c mut HashMap<i32, Vec<i32>>,
     ) -> Option<(&AbstractNum, usize, &'c [i32])> {
-        let abs_id = *self.num_to_abstract.get(&num_id)?;
-        let absn = self.abstracts.get(&abs_id)?;
+        let (abs_id, absn) = self.resolve(num_id)?;
         // OOXML has nine levels: a larger `w:ilvl` must not grow the
         // counters to it.
         let ilvl = ilvl.clamp(0, 8) as usize;
@@ -178,7 +202,7 @@ impl Numbering {
 
     /// The level of list `num_id` whose `w:pStyle` names `style`.
     fn level_of_style(&self, num_id: i32, style: &str) -> Option<i32> {
-        let absn = self.abstracts.get(self.num_to_abstract.get(&num_id)?)?;
+        let (_, absn) = self.resolve(num_id)?;
         let at = absn
             .levels
             .iter()
@@ -337,18 +361,27 @@ fn parse_abstract(p: &mut XmlParser) -> AbstractNum {
     let mut an = AbstractNum::default();
     loop {
         match p.next() {
-            Event::Start => {
-                if p.name() == "w:lvl" {
+            Event::Start => match p.name() {
+                "w:lvl" => {
                     let ilvl = parse_int(p.attr("w:ilvl")).max(0) as usize;
                     let lvl = parse_level(p);
                     while an.levels.len() <= ilvl {
                         an.levels.push(Level::default());
                     }
                     an.levels[ilvl] = lvl;
-                } else {
+                }
+                name @ ("w:styleLink" | "w:numStyleLink") => {
+                    let v = p.attr("w:val").trim();
+                    let v = (!v.is_empty()).then(|| v.to_string());
+                    if name == "w:styleLink" {
+                        an.style_link = v;
+                    } else {
+                        an.num_style_link = v;
+                    }
                     p.skip_element();
                 }
-            }
+                _ => p.skip_element(),
+            },
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
@@ -398,9 +431,7 @@ fn parse_level_ind(p: &mut XmlParser) -> LevelIndent {
         match p.next() {
             Event::Start => {
                 if p.name() == "w:ind" {
-                    let num = |a: &str| p.attr(a).trim().parse::<i32>().ok();
-                    ind.left = num("w:left").or_else(|| num("w:start"));
-                    ind.first = num("w:hanging").map(|h| -h).or_else(|| num("w:firstLine"));
+                    (ind.left, ind.first) = crate::styles::ind_twips(p);
                 }
                 p.skip_element();
             }
@@ -566,6 +597,7 @@ pub fn heading_chapters(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Inline, ParProps, Paragraph, Run, RunProps};
 
     /// #2231: a level's `w:pPr/w:ind`, `w:hanging` as a negative first line;
     /// a level without one, or a list not defined, has none.
@@ -592,7 +624,42 @@ mod tests {
         assert_eq!(n.level(4, 2).map(|l| l.text), Some("%3)".to_string()));
         assert_eq!(n.level(4, 0).map(|l| l.format), Some(NumFmt::Bullet));
     }
-    use crate::model::{Inline, ParProps, Paragraph, Run, RunProps};
+
+    /// #2231 r2: a list made from a list style (`w:numStyleLink`) takes the
+    /// levels of the abstract whose `w:styleLink` defines that style; a link
+    /// that resolves to nothing defines nothing.
+    #[test]
+    fn a_num_style_link_takes_the_linked_styles_levels() {
+        let lvl = |i: i32| {
+            format!(
+                "<w:lvl w:ilvl=\"{i}\"><w:numFmt w:val=\"decimal\"/><w:lvlText w:val=\"%{}.\"/>\
+                 <w:pPr><w:ind w:left=\"{}\" w:hanging=\"360\"/></w:pPr></w:lvl>",
+                i + 1,
+                720 * (i + 1)
+            )
+        };
+        let n = parse_numbering_xml(&format!(
+            "<w:numbering>\
+             <w:abstractNum w:abstractNumId=\"10\"><w:styleLink w:val=\"CorpList\"/>{}{}{}</w:abstractNum>\
+             <w:abstractNum w:abstractNumId=\"11\"><w:numStyleLink w:val=\"CorpList\"/></w:abstractNum>\
+             <w:abstractNum w:abstractNumId=\"12\"><w:numStyleLink w:val=\"Nowhere\"/></w:abstractNum>\
+             <w:num w:numId=\"1\"><w:abstractNumId w:val=\"10\"/></w:num>\
+             <w:num w:numId=\"2\"><w:abstractNumId w:val=\"11\"/></w:num>\
+             <w:num w:numId=\"3\"><w:abstractNumId w:val=\"12\"/></w:num></w:numbering>",
+            lvl(0),
+            lvl(1),
+            lvl(2)
+        ));
+        let lefts: Vec<Option<i32>> = (0..3)
+            .map(|i| n.level_indent(2, i).and_then(|l| l.left))
+            .collect();
+        assert_eq!(lefts, [Some(720), Some(1440), Some(2160)]);
+        assert_eq!(n.level(2, 1).map(|l| l.text), Some("%2.".to_string()));
+        assert!(n.defines(2));
+        assert!(!n.defines(3), "an unresolved link defines nothing");
+        assert_eq!(n.level_indent(3, 0), None);
+        assert_eq!(n.level(3, 0), None);
+    }
 
     const NUM_XML: &str = r#"<w:numbering>
         <w:abstractNum w:abstractNumId="0">

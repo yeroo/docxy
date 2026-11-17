@@ -920,6 +920,13 @@ impl ParBorders {
         }
     }
 
+    /// Side `i` (in [`Self::sides`]' order) left unsaid: no line and no
+    /// cancel, so a style's shows.
+    pub fn clear_side(&mut self, i: usize) {
+        *self.side_mut(i) = None;
+        self.nil &= !(1 << i);
+    }
+
     /// `self`'s sides over `under`'s, each apart: a line, else a cancel
     /// (which keeps the side off), else what `under` says.
     pub fn over(self, under: ParBorders) -> ParBorders {

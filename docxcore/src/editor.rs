@@ -3342,6 +3342,50 @@ impl Editor {
         self.for_each_para(move |pr| pr.borders = borders);
     }
 
+    /// `p`'s borders as shown: its own sides over its style chain's
+    /// ([`crate::styles::StyleSheet::effective_borders`]), or its own alone
+    /// without a styles context.
+    fn shown_borders(&self, p: &ParProps) -> ParBorders {
+        match &self.styles {
+            Some(s) => s.sheet.effective_borders(p.style_id.as_deref(), p.borders),
+            None => p.borders,
+        }
+    }
+
+    /// Whether the caret's paragraph shows a bottom border, its style's
+    /// included: the Bottom Border button's pressed state (#2231 r2).
+    pub fn shown_bottom_border(&self) -> bool {
+        self.shown_borders(&self.caret_para_props())
+            .bottom
+            .is_some()
+    }
+
+    /// Bottom Border (#2231 r2), on what the caret's paragraph shows: off,
+    /// each selected paragraph gets a bottom rule; on, each loses the one it
+    /// shows: its own is removed, and where its style would still give one
+    /// that is cancelled (`w:val="nil"`). Its other sides are kept. One undo
+    /// step.
+    pub fn toggle_bottom_border(&mut self) {
+        let on = !self.shown_bottom_border();
+        let styles = self.styles.clone();
+        self.for_each_para(move |pr| {
+            if on {
+                pr.borders
+                    .set_side(2, Some(ParBorder::rule(BorderKind::Single)));
+                return;
+            }
+            let mut b = pr.borders;
+            b.clear_side(2);
+            let below = styles
+                .as_ref()
+                .and_then(|s| s.sheet.effective_borders(pr.style_id.as_deref(), b).bottom);
+            if below.is_some() {
+                b.set_side(2, None);
+            }
+            pr.borders = b;
+        });
+    }
+
     /// Wrap the current selection in comment markers for comment `id` (the
     /// reference run + range start/end go around the selected text), as one
     /// undo step. Returns false if there is no selection.
@@ -8447,6 +8491,63 @@ mod tests {
         // mark, and this key would replace them.
         ed.insert_char('z');
         assert_eq!(top_text(&ed), vec!["xy", "z"]);
+    }
+
+    /// #2231 r2: Bottom Border acts on the rule the paragraph shows, its
+    /// style's included: off over a style's rule writes a cancel (saved as
+    /// `w:val="nil"`), on again writes a rule, and the paragraph's other
+    /// sides stay; a paragraph with no style rule loses its own rule cleanly.
+    #[test]
+    fn bottom_border_toggles_the_rule_its_style_shows() {
+        let styles = r#"<w:styles><w:style w:type="paragraph" w:styleId="Title"><w:pPr><w:pBdr>
+            <w:bottom w:val="single" w:sz="8" w:space="4" w:color="4F81BD"/></w:pBdr></w:pPr></w:style></w:styles>"#;
+        let para = |style: Option<&str>| {
+            let mut props = ParProps {
+                style_id: style.map(String::from),
+                ..Default::default()
+            };
+            props
+                .borders
+                .set_side(1, Some(ParBorder::rule(BorderKind::Single)));
+            Block::Paragraph(Paragraph {
+                props,
+                content: vec![Inline::Run(Run {
+                    text: "x".into(),
+                    ..Default::default()
+                })],
+            })
+        };
+        let mut ed = Editor::new(Document {
+            body: vec![para(Some("Title"))],
+        });
+        ed.set_styles_xml(Some(styles.into()));
+        assert!(ed.shown_bottom_border(), "the style's rule shows");
+        ed.toggle_bottom_border();
+        assert!(!ed.shown_bottom_border());
+        let b = ed.caret_para_props().borders;
+        assert!(b.is_nil(2) && b.bottom.is_none());
+        assert!(b.left.is_some(), "its other sides stay");
+        assert!(crate::serialize::document_to_xml(&ed.doc).contains("<w:bottom w:val=\"nil\"/>"));
+        ed.toggle_bottom_border();
+        assert!(ed.shown_bottom_border());
+        let b = ed.caret_para_props().borders;
+        assert!(!b.is_nil(2) && b.bottom.is_some() && b.left.is_some());
+        // One undo step each.
+        ed.undo();
+        assert!(!ed.shown_bottom_border());
+        ed.undo();
+        assert!(ed.shown_bottom_border());
+        // No style rule: on, then off leaves nothing said of the bottom.
+        let mut plain = Editor::new(Document {
+            body: vec![para(None)],
+        });
+        plain.set_styles_xml(Some(styles.into()));
+        assert!(!plain.shown_bottom_border());
+        plain.toggle_bottom_border();
+        assert!(plain.shown_bottom_border());
+        plain.toggle_bottom_border();
+        let b = plain.caret_para_props().borders;
+        assert!(!b.is_nil(2) && b.bottom.is_none() && b.left.is_some());
     }
 
     /// #751: with a real selection, Insert ▸ Horizontal Line still borders

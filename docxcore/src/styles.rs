@@ -619,7 +619,7 @@ impl StyleSheet {
             .or(self.default_paragraph.as_deref())
             .map(|s| self.fold_borders(s, &mut HashSet::new()))
             .unwrap_or_default();
-        fold_sides(direct, style_b)
+        direct.over(style_b)
     }
 
     fn fold_borders(&self, id: &str, seen: &mut HashSet<String>) -> ParBorders {
@@ -634,14 +634,8 @@ impl StyleSheet {
             .as_ref()
             .map(|b| self.fold_borders(b, seen))
             .unwrap_or_default();
-        fold_sides(def.borders, base)
+        def.borders.over(base)
     }
-}
-
-/// `over`'s sides, each falling back to `under`'s apart; a `nil` side in
-/// `over` cancels `under`'s (#2231 r1).
-fn fold_sides(over: ParBorders, under: ParBorders) -> ParBorders {
-    over.over(under)
 }
 
 /// An on/off attribute that is off when absent (`w:default`).
@@ -895,13 +889,26 @@ fn parse_style_ppr(p: &mut XmlParser, def: &mut StyleDef) {
     }
 }
 
+/// A `w:ind`'s (at its start tag) left and first line in twips: `w:left`,
+/// else `w:start`; `w:hanging` as a negative first line, else
+/// `w:firstLine`. An attribute left out, or not a number, is `None`. Styles
+/// and list levels read it alike (#2231).
+pub(crate) fn ind_twips(p: &XmlParser) -> (Option<i32>, Option<i32>) {
+    let num = |name: &str| p.attr(name).trim().parse::<i32>().ok();
+    (
+        num("w:left").or_else(|| num("w:start")),
+        num("w:hanging").map(|h| -h).or_else(|| num("w:firstLine")),
+    )
+}
+
 /// The left indent attributes of a `w:ind` (at its start tag).
 fn parse_ind_left(p: &XmlParser) -> LeftInd {
     let num = |name: &str| p.attr(name).trim().parse::<i32>().ok();
+    let (twips, first) = ind_twips(p);
     LeftInd {
-        twips: num("w:left").or_else(|| num("w:start")),
+        twips,
         chars: num("w:leftChars").or_else(|| num("w:startChars")),
-        first: num("w:hanging").map(|h| -h).or_else(|| num("w:firstLine")),
+        first,
         first_chars: num("w:hangingChars")
             .map(|h| -h)
             .or_else(|| num("w:firstLineChars")),
@@ -930,8 +937,10 @@ fn parse_style_numpr(p: &mut XmlParser) -> (Option<i32>, Option<i32>) {
 }
 
 /// Parse a `<w:pBdr>` element's five sides into [`ParBorders`]. Lenient: a
-/// bad number takes Word's default (`w:sz` 4, `w:space` 0), a bad colour
-/// is automatic, and a `nil`/`none` side is unset.
+/// bad number takes Word's default (`w:sz` 4, `w:space` 0) and a bad colour
+/// is automatic. A `nil`/`none` side draws no line and is recorded as a
+/// cancel ([`ParBorders::nil`]), which hides a style's side below it; a
+/// value with no line in this model (an art border) is left unsaid.
 pub fn parse_pbdr(p: &mut XmlParser) -> ParBorders {
     let mut b = ParBorders::default();
     loop {
