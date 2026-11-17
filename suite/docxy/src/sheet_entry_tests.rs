@@ -2031,6 +2031,9 @@ fn acts_that_rewrite_cells_close_the_editor() {
         SheetAct::SortAsc,
         SheetAct::InsertRow,
         SheetAct::AutoSum,
+        // Targets no cells, but an entry left open across it could never be
+        // committed (#1054).
+        SheetAct::ProtectSheet,
     ] {
         assert!(act_commits_editor(act), "{act:?}");
     }
@@ -2039,7 +2042,6 @@ fn acts_that_rewrite_cells_close_the_editor() {
         SheetAct::Percent,
         SheetAct::FormatCells,
         SheetAct::Merge,
-        SheetAct::ProtectSheet,
         SheetAct::Menu(sheet_menus::SheetMenu::Clear),
         // The pick list commits its own entry (sheet_complete::pick_value),
         // so it must not find the buffer committed ahead of it.
@@ -2195,6 +2197,94 @@ fn autosum_on_a_protected_sheet_is_refused_and_writes_nothing() {
         assert!(v.sheet().cell(2, 0).is_none(), "{f:?}");
         assert_eq!(v.undo.len(), 0);
     }
+}
+
+// ---- #1054: the commit refuses a protected sheet ------------------------------
+
+fn protect(v: &mut SheetView, s: usize) {
+    v.pkg.workbook.sheets[s].set_protected(true);
+}
+
+/// #1054: an editor left open while its sheet was protected never writes:
+/// Excel's message, the editor kept with its text, no undo step, nothing
+/// held for a validation alert.
+#[test]
+fn commit_on_a_protected_origin_sheet_is_refused_and_keeps_the_editor() {
+    let mut v = view();
+    select(&mut v, 0, 0);
+    type_fresh(&mut v, "99");
+    let s = v.active;
+    protect(&mut v, s);
+    assert!(!v.commit_edit());
+    assert_eq!(
+        v.entry_error.as_deref(),
+        Some(crate::sheet_goto::SHEET_PROTECTED)
+    );
+    assert_eq!(v.editing.as_deref(), Some("99"));
+    assert_eq!(value(&v, 0, 0), CellValue::Empty);
+    assert!(v.undo.is_empty());
+    assert!(v.dv_pending.is_none());
+}
+
+/// #1054: an untouched F2 editor on a protected sheet just closes, as it
+/// does anywhere (#510): nothing to write, so nothing to refuse.
+#[test]
+fn an_untouched_editor_on_a_protected_sheet_still_closes() {
+    let mut v = view();
+    put(&mut v, 0, 0, Cell::text("007"));
+    select(&mut v, 0, 0);
+    v.begin_cell_edit(None);
+    let s = v.active;
+    protect(&mut v, s);
+    assert!(!v.commit_edit());
+    assert!(v.editing.is_none());
+    assert!(v.entry_error.is_none());
+    assert_eq!(value(&v, 0, 0), CellValue::Text("007".into()));
+    assert!(v.undo.is_empty());
+}
+
+/// #1054: Ctrl+Enter over a range on a protected sheet writes no cell.
+#[test]
+fn ctrl_enter_on_a_protected_sheet_is_refused() {
+    let mut v = view();
+    v.anchor = (0, 0);
+    v.sel = (1, 1);
+    type_fresh(&mut v, "5");
+    let s = v.active;
+    protect(&mut v, s);
+    assert!(!v.commit_edit_to_selection());
+    assert_eq!(
+        v.entry_error.as_deref(),
+        Some(crate::sheet_goto::SHEET_PROTECTED)
+    );
+    assert_eq!(v.editing.as_deref(), Some("5"));
+    for (r, c) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+        assert_eq!(value(&v, r, c), CellValue::Empty, "{r},{c}");
+    }
+    assert!(v.undo.is_empty());
+    assert!(v.dv_pending.is_none());
+}
+
+/// #1054: the check reads the sheet the buffer would be written to (the
+/// editor's origin), not whichever sheet is active.
+#[test]
+fn the_protection_check_reads_the_origin_sheet() {
+    let mut v = view();
+    v.pkg.workbook.sheets.push(gridcore::sheet::Sheet {
+        name: "Other".into(),
+        ..Default::default()
+    });
+    select(&mut v, 0, 0);
+    type_fresh(&mut v, "7");
+    let origin = v.edit_origin.expect("an origin").0;
+    protect(&mut v, origin);
+    v.active = 1 - origin;
+    assert!(!v.commit_edit());
+    assert_eq!(
+        v.entry_error.as_deref(),
+        Some(crate::sheet_goto::SHEET_PROTECTED)
+    );
+    assert!(v.pkg.workbook.sheets[origin].cell(0, 0).is_none());
 }
 
 // ---- #1079: Enter after a run of Tabs returns to the run's first column -----
