@@ -130,7 +130,8 @@ issue number to find its notes.
   photo by address, a 403 told apart (#2157), presence of users by
   address, a 403 told apart (#2158), a different mailbox
   signing in resets the store, its outbox dropped (#1946), granted scopes and a
-  refused sign-in's `error_description` (#1875),
+  refused sign-in's `error_description` (#1875), a refresh asking only for the granted
+  scopes (#2164),
   `Content-Length` on bodiless POSTs and one-line HTTP error text (#1954), inline outbound
   attachments (#1949), attachment upload progress and resumed upload sessions (#1941),
   the whole mailbox newest first, backfilled in idle time (#1871),
