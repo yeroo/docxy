@@ -2412,8 +2412,9 @@ impl GraphClient {
     /// The same answer carries a request's update facts (#2185:
     /// `meetingRequestType`, its own and previous start, end and location,
     /// `isAllDay`), which `MeetingMessage::from_json` reads. Every form
-    /// asks for its times in UTC ([`MEETING_MESSAGE_PREFER`]); a time Graph
-    /// still answers in another zone reads as `None`.
+    /// asks for its times in UTC ([`MEETING_MESSAGE_PREFER`]); a timed bound
+    /// Graph still answers in another zone reads as `None` (an all-day
+    /// midnight is a date in any zone).
     pub fn meeting_message(&self, message_id: &str) -> Result<MeetingMessage, GraphError> {
         let get = |form: MeetingMessageForm| -> Result<MeetingMessage, GraphError> {
             let resp = self.send(

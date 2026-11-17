@@ -1299,7 +1299,10 @@ impl MeetingRequestType {
 /// it: `SyncCommand::FetchMeetingMessage` answers them in
 /// `SyncEvent::MeetingMessageFetched`. Sync never reads them and the store
 /// keeps none of them. Each is `None` when Graph does not send it or sends
-/// it in a shape that cannot be read, never an error.
+/// it in a shape that cannot be read, never an error. `request_type` and
+/// the `previous_*` fields are `eventMessageRequest` properties; the
+/// current times, `location` and `is_all_day` are `eventMessage` ones,
+/// read for any meeting message that carries them (a cancellation too).
 ///
 /// The times are the store's `YYYY-MM-DDTHH:MM:SSZ` shape
 /// (`EventRow::start_utc`'s). When `is_all_day` is `Some(true)`, a bound at
@@ -1324,7 +1327,7 @@ pub struct MeetingMessage {
     /// delete would send cancellations.
     pub is_organizer: bool,
     /// `meetingRequestType` (#2185): a request's kind, update or not.
-    /// `None` for a cancellation, a response or a plain message. Only from
+    /// `None` unless the message is a request that carries it. Only from
     /// `FetchMeetingMessage`, never from sync; not stored.
     pub request_type: Option<MeetingRequestType>,
     /// `startDateTime` (#2185): the meeting's start as this message gives
@@ -1349,9 +1352,10 @@ pub struct MeetingMessage {
     /// location before it changed. Only from `FetchMeetingMessage`, never
     /// from sync; not stored.
     pub previous_location: Option<String>,
-    /// `isAllDay` (#2185): an all-day meeting's times are dates (UTC
-    /// midnights), compared as dates. Only from `FetchMeetingMessage`,
-    /// never from sync; not stored.
+    /// `isAllDay` (#2185): an all-day meeting's current times are dates
+    /// (UTC midnights), compared as dates; a previous one may be a timed
+    /// instant (the slot before the update made it all-day). Only from
+    /// `FetchMeetingMessage`, never from sync; not stored.
     pub is_all_day: Option<bool>,
 }
 
@@ -1416,10 +1420,9 @@ fn meeting_time(v: Option<&Value>, all_day: bool, bound: MeetingBound) -> Option
     let v = v?;
     let dt = v.get("dateTime")?.as_str()?;
     let wall = WallClock::parse(dt)?;
-    let date = format!("{:04}-{:02}-{:02}", wall.year, wall.month, wall.day);
     if all_day && wall.is_midnight() {
         // An all-day bound is a date, whatever its zone.
-        return Some(format!("{date}T00:00:00Z"));
+        return Some(format!("{}T00:00:00Z", wall.date()));
     }
     if all_day && bound == MeetingBound::Current {
         return None;
@@ -1428,14 +1431,7 @@ fn meeting_time(v: Option<&Value>, all_day: bool, bound: MeetingBound) -> Option
         None | Some(Value::Null) => "",
         Some(z) => z.as_str()?,
     };
-    if !(zone.is_empty() || is_utc_zone(zone) || zone.eq_ignore_ascii_case("tzone://Microsoft/Utc"))
-    {
-        return None;
-    }
-    Some(format!(
-        "{date}T{:02}:{:02}:{:02}Z",
-        wall.hour, wall.minute, wall.second
-    ))
+    (zone.is_empty() || is_utc_zone(zone)).then_some(wall.utc)
 }
 
 /// A `location` / `previousLocation` object's `displayName`, trimmed
@@ -1446,23 +1442,22 @@ fn location_name(v: Option<&Value>) -> Option<String> {
     Some(name.trim().to_string())
 }
 
-/// A strictly read `YYYY-MM-DDTHH:MM:SS[.fraction][Z]` wall clock (#2185).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A strictly read `YYYY-MM-DDTHH:MM:SS[.fraction][Z]` wall clock (#2185),
+/// kept as the store's `YYYY-MM-DDTHH:MM:SSZ` (its fraction dropped).
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct WallClock {
-    year: u32,
-    month: u32,
-    day: u32,
-    hour: u32,
-    minute: u32,
-    second: u32,
+    /// The wall clock in the store's shape, a real date and time by
+    /// `store::iso8601_to_unix_secs`.
+    utc: String,
     /// The fraction's digits were all zeros (or there was none).
     whole_second: bool,
 }
 
 impl WallClock {
     /// `None` for anything else: an offset, a missing or empty part, a
-    /// non-digit, a month, day or time out of range (the day by the
-    /// month's length), or Graph's "no date" (`0001-01-01…`).
+    /// non-digit, a date or time the store's reader refuses (a month, day
+    /// or hour out of range, the day by the month's length), or Graph's
+    /// "no date" (`0001-01-01…`).
     fn parse(s: &str) -> Option<WallClock> {
         if s.starts_with("0001-01-01") {
             return None;
@@ -1477,49 +1472,30 @@ impl WallClock {
                 return None;
             }
         }
-        let b = main.as_bytes();
-        if b.len() != 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
-            return None;
-        }
-        if b[13] != b':' || b[16] != b':' {
-            return None;
-        }
-        let num = |from: usize, to: usize| -> Option<u32> {
-            let part = &main[from..to];
-            if part.bytes().all(|c| c.is_ascii_digit()) {
-                part.parse().ok()
-            } else {
-                None
-            }
-        };
-        let wall = WallClock {
-            year: num(0, 4)?,
-            month: num(5, 7)?,
-            day: num(8, 10)?,
-            hour: num(11, 13)?,
-            minute: num(14, 16)?,
-            second: num(17, 19)?,
+        // The separators where the store's shape has them and digits
+        // everywhere else: the store's reader alone would take a `+` sign.
+        let shaped = main.len() == 19
+            && main.bytes().enumerate().all(|(i, b)| match i {
+                4 | 7 => b == b'-',
+                10 => b == b'T',
+                13 | 16 => b == b':',
+                _ => b.is_ascii_digit(),
+            });
+        let utc = format!("{main}Z");
+        (shaped && crate::store::iso8601_to_unix_secs(&utc).is_some()).then(|| WallClock {
+            utc,
             whole_second: fraction.is_none_or(|f| f.bytes().all(|c| c == b'0')),
-        };
-        let y = wall.year;
-        let leap = y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
-        let days = match wall.month {
-            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-            4 | 6 | 9 | 11 => 30,
-            2 if leap => 29,
-            2 => 28,
-            _ => return None,
-        };
-        let in_range = (1..=days).contains(&wall.day)
-            && wall.hour <= 23
-            && wall.minute <= 59
-            && wall.second <= 59;
-        in_range.then_some(wall)
+        })
+    }
+
+    /// `YYYY-MM-DD`.
+    fn date(&self) -> &str {
+        &self.utc[..10]
     }
 
     /// `00:00:00` with no fraction other than zeros.
-    fn is_midnight(self) -> bool {
-        self.hour == 0 && self.minute == 0 && self.second == 0 && self.whole_second
+    fn is_midnight(&self) -> bool {
+        &self.utc[11..19] == "00:00:00" && self.whole_second
     }
 }
 
@@ -3091,9 +3067,13 @@ pub fn to_utc(dt: &str, tz: &str) -> String {
 }
 
 /// `true` for the zone labels Graph is expected to send back when a
-/// request carries `Prefer: outlook.timezone="UTC"`.
+/// request carries `Prefer: outlook.timezone="UTC"`, in any case:
+/// `tzone://Microsoft/Utc` is Outlook's own name for it (#2185).
 fn is_utc_zone(tz: &str) -> bool {
-    matches!(tz.to_ascii_uppercase().as_str(), "UTC" | "ETC/UTC" | "Z")
+    matches!(
+        tz.to_ascii_uppercase().as_str(),
+        "UTC" | "ETC/UTC" | "Z" | "TZONE://MICROSOFT/UTC"
+    )
 }
 
 /// Reformats an ISO-8601-ish `YYYY-MM-DDTHH:MM:SS[.fraction][Z|±HH:MM]`
@@ -4132,6 +4112,9 @@ mod tests {
             let m = request(&format!(r#""startDateTime":{start}"#));
             assert_eq!(m.start_utc, some("2026-07-21T10:00:00Z"), "{start}");
         }
+        // A leap second is read as the store's reader takes it.
+        let m = request(r#""startDateTime":{"dateTime":"2026-06-30T23:59:60","timeZone":"UTC"}"#);
+        assert_eq!(m.start_utc, some("2026-06-30T23:59:60Z"));
         // A named zone is not converted: no time zone database. A numeric
         // zone is no zone that can be read.
         for zone in [r#""Pacific Standard Time""#, r#""Europe/Berlin""#, "7"] {
@@ -4216,7 +4199,7 @@ mod tests {
             r#"{"dateTime":"2026-07-00T10:00:00","timeZone":"UTC"}"#,
             r#"{"dateTime":"2026-07-21T24:00:00","timeZone":"UTC"}"#,
             r#"{"dateTime":"2026-07-21T10:60:00","timeZone":"UTC"}"#,
-            r#"{"dateTime":"2026-07-21T10:00:60","timeZone":"UTC"}"#,
+            r#"{"dateTime":"2026-07-21T10:00:61","timeZone":"UTC"}"#,
             r#"{"dateTime":"2026-07-21T10:00","timeZone":"UTC"}"#,
             r#"{"dateTime":"2026-7-21T10:00:00","timeZone":"UTC"}"#,
             r#"{"dateTime":"2026-07-21 10:00:00","timeZone":"UTC"}"#,
@@ -4270,9 +4253,8 @@ mod tests {
     }
 
     #[test]
-    fn meeting_message_cancellation_and_response_have_no_update_facts() {
-        // What Graph sends for these: no request type, no previous values;
-        // and a plain message has none of the properties at all.
+    fn meeting_message_without_update_facts_reads_them_none() {
+        // Bodies that carry none of the properties: all `None`.
         for body in [
             r##"{"id":"M1","@odata.type":"#microsoft.graph.eventMessage",
                 "meetingMessageType":"meetingCancelled","event":{"id":"E9"}}"##,
@@ -4292,6 +4274,35 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    #[test]
+    fn meeting_message_cancellation_reads_its_eventmessage_facts() {
+        // `from_json` does not look at the type: a cancellation's own
+        // `eventMessage` times, location and `isAllDay` are read; the
+        // request-only `meetingRequestType` and previous values it does not
+        // carry stay `None`.
+        let v = parse(&format!(
+            r##"{{"id":"M1","@odata.type":"#microsoft.graph.eventMessage",
+                "meetingMessageType":"meetingCancelled","event":{{"id":"E9"}},
+                "isAllDay":false,"startDateTime":{},"endDateTime":{},
+                "location":{{"displayName":"Room 1"}}}}"##,
+            dtz("2026-07-21T10:00:00", "UTC"),
+            dtz("2026-07-21T11:00:00", "UTC"),
+        ))
+        .unwrap();
+        assert_eq!(
+            MeetingMessage::from_json(&v),
+            MeetingMessage {
+                message_type: Some(MeetingMessageType::Cancelled),
+                event_id: some("E9"),
+                start_utc: some("2026-07-21T10:00:00Z"),
+                end_utc: some("2026-07-21T11:00:00Z"),
+                location: some("Room 1"),
+                is_all_day: Some(false),
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
@@ -5578,7 +5589,13 @@ mod tests {
 
     #[test]
     fn flag_due_date_time_is_normalised_utc() {
-        for zone in [r#""UTC""#, r#""utc""#, r#""Etc/UTC""#, r#""""#] {
+        for zone in [
+            r#""UTC""#,
+            r#""utc""#,
+            r#""Etc/UTC""#,
+            r#""tzone://Microsoft/Utc""#,
+            r#""""#,
+        ] {
             let v = parse(&format!(
                 r#"{{"id":"M1","flag":{{"flagStatus":"flagged",
                     "dueDateTime":{{"dateTime":"2026-11-09T17:00:00.0000000","timeZone":{zone}}}}}}}"#
