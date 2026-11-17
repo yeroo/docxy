@@ -20,7 +20,19 @@ pub fn substitutes(family: &str) -> &'static [&'static str] {
             &["Liberation Mono", "Cousine", "Menlo", "DejaVu Sans Mono"]
         }
         "georgia" | "garamond" | "book antiqua" => &["DejaVu Serif", "Liberation Serif"],
-        "verdana" | "tahoma" | "trebuchet ms" | "segoe ui" => &["DejaVu Sans", "Liberation Sans"],
+        "verdana" | "tahoma" | "trebuchet ms" => &["DejaVu Sans", "Liberation Sans"],
+        // Segoe UI sets about as wide as Arial: Selawik is its
+        // metric-compatible stand-in, then Arial's widths; Noto Sans and Open
+        // Sans set wider, and DejaVu Sans (Verdana-wide) breaks lines much
+        // earlier than Word does (#2231).
+        "segoe ui" | "segoe ui semibold" | "segoe ui light" | "segoe ui semilight" => &[
+            "Selawik",
+            "Liberation Sans",
+            "Arimo",
+            "Noto Sans",
+            "Open Sans",
+            "DejaVu Sans",
+        ],
         // Aptos is close to Arial's widths; DejaVu Sans (Verdana-wide) breaks
         // lines much earlier, so it comes second.
         "aptos" | "aptos display" | "aptos narrow" => &["Liberation Sans", "DejaVu Sans"],
@@ -46,7 +58,18 @@ mod tests {
         assert_eq!(substitutes("Aptos"), ["Liberation Sans", "DejaVu Sans"]);
         assert_eq!(substitutes("Aptos Display"), substitutes("Aptos"));
         assert_eq!(substitutes("Aptos Narrow"), substitutes("Aptos"));
-        assert_eq!(substitutes("Segoe UI")[0], "DejaVu Sans");
+    }
+
+    /// #2231: Segoe UI falls back to a face of its width, not Verdana-wide
+    /// DejaVu Sans.
+    #[test]
+    fn segoe_ui_takes_an_arial_width_face_before_dejavu() {
+        let s = substitutes("Segoe UI");
+        assert_eq!(&s[..2], ["Selawik", "Liberation Sans"]);
+        assert_eq!(s.last(), Some(&"DejaVu Sans"));
+        assert_eq!(substitutes("Segoe UI Semibold"), s);
+        assert_eq!(substitutes("Segoe UI Light"), s);
+        assert_eq!(substitutes("Verdana")[0], "DejaVu Sans");
     }
 
     #[test]
