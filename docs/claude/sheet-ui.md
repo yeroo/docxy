@@ -110,12 +110,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   always written. The media and the rels were never touched.
 - The suite draws every `DrawingKind::Image` in `sheet_picture_layer`
   (main.rs), placed by `sheet_pictures` in two steps: the anchor becomes
-  `(cell, fraction)` edges in Excel's cell sizes (`sheet_row_emu`: `ht`, the
-  sheet default or 15 pt; `sheet_col_emu`: the column's own `<col width>`
-  (`Sheet::col_own_width`), else `default_col_file_width`, both file widths
-  with the padding in, to px by ECMA-376 18.3.1.13 (`excel_col_px`, MDW 7:
-  9.140625 is 64 px); hidden cells 0; not `col_width`, which falls back to
-  8.43 whatever `defaultColWidth` says),
+  `(cell, fraction)` edges in Excel's cell sizes (`sheet_row_emu` and
+  `sheet_col_emu` over `print::paginate::row_points` / `col_points`, the
+  print layout's ECMA-376 measure: a column's own `<col width>` else the
+  sheet's default, 9.140625 is 64 px; hidden cells 0; a non-finite or
+  negative size is 0 and a huge one stops at `MAX_ANCHOR_EMU`, so the walks
+  cannot overflow),
   then drawn px over the grid's sizes: a row at the height the row list
   measured it (a row grows past `row_height_px`, its min height with the
   gridline inside, with its text), else at `row_height_px`, 0 when hidden; a

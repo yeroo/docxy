@@ -848,10 +848,13 @@ pub struct Drawing {
     /// a save needs this to rewrite the right element. A drawing `add_chart`
     /// spliced in gets the index it landed at, so it is addressable too.
     pub anchor_ix: usize,
-    /// Top-left anchor cell `(row, col)`, 0-based.
+    /// Top-left anchor cell `(row, col)`, 0-based. For an `absoluteAnchor`
+    /// it is estimated from `anchor.pos` at default cell sizes; the `pos` is
+    /// what places it.
     pub from: (u32, u32),
     /// Bottom-right extent `(row, col)`, 0-based, inclusive-ish. For a
-    /// `oneCellAnchor` it's estimated from the drawing's EMU size.
+    /// `oneCellAnchor` or an `absoluteAnchor` it is estimated from the
+    /// drawing's EMU extent at default cell sizes (`anchor.ext` places it).
     pub to: (u32, u32),
     pub kind: DrawingKind,
     /// The anchor as the part states it, beyond the cells above: its kind,
@@ -1875,14 +1878,6 @@ impl Sheet {
     /// The `<col>` definition covering `col`, if any.
     fn col_def(&self, col: u32) -> Option<&ColDef> {
         self.col_defs.iter().find(|d| col >= d.min && col <= d.max)
-    }
-
-    /// The column's own `<col width>` (a file width, in characters with the
-    /// padding included), or `None` when it takes the sheet's default
-    /// ([`Self::default_col_file_width`]). Unlike [`Self::col_width`], which
-    /// falls back to `DEFAULT_COL_WIDTH`, this tells the two apart (#2228).
-    pub fn col_own_width(&self, col: u32) -> Option<f64> {
-        self.col_def(col).and_then(|d| d.width)
     }
 
     /// Whether a column is hidden (its `<col>` definition carries `hidden="1"`).

@@ -18,7 +18,8 @@
 //! grid's scale. Both steps are pure, over closures for the sizes, so the
 //! tests pin them without a window.
 
-use gridcore::sheet::{AnchorKind, DrawingAnchor, Sheet};
+use gridcore::print::paginate::{col_points, row_points};
+use gridcore::sheet::{AnchorKind, DrawingAnchor, MAX_ANCHOR_EMU, Sheet};
 
 /// One axis of the sheet: rows or columns.
 pub struct Axis<'a> {
@@ -51,57 +52,31 @@ pub struct Span {
 /// sooner, and one that reaches this far is off screen where it is cut.
 pub const MAX_WALK: u32 = 1 << 16;
 
-/// EMU per point (a row's height) and per pixel (a column's width).
+/// EMU per point.
 pub const EMU_PER_PT: i64 = 12700;
-pub const EMU_PER_PX: i64 = 9525;
-
-/// Excel's pixel width of a column whose file width is `w` (`<col width>`
-/// or `defaultColWidth`: characters, the padding already in it), by
-/// ECMA-376 18.3.1.13 with Calibri 11's 7 px maximum digit width:
-/// `trunc(((256 w + trunc(128 / 7)) / 256) * 7)`, so 9.140625 is 64 px.
-/// Unclamped, unlike the grid's `col_px`.
-pub fn excel_col_px(w: f64) -> i64 {
-    const MDW: f64 = 7.0;
-    let px = ((256.0 * w + (128.0 / MDW).trunc()) / 256.0 * MDW).trunc();
-    px.max(0.0) as i64
-}
-
-/// A column of file width `w` as Excel lays it out, in EMU; 0 when hidden.
-pub fn excel_col_emu(w: f64, hidden: bool) -> i64 {
-    if hidden {
-        return 0;
-    }
-    excel_col_px(w) * EMU_PER_PX
-}
 
 /// Column `c` of `sh` as Excel lays it out, in EMU: its own `<col width>`,
-/// else the sheet's default (`defaultColWidth`, else the width
-/// `baseColWidth` gives), 0 when hidden. Not `Sheet::col_width`, which
-/// falls back to 8.43 whatever the sheet says.
+/// else the sheet's default, by ECMA-376 18.3.1.13 (`paginate::col_points`,
+/// the print layout's own measure: 9.140625 is 64 px, 48 pt); 0 when hidden.
 pub fn sheet_col_emu(sh: &Sheet, c: u32) -> i64 {
-    let w = sh
-        .col_own_width(c)
-        .unwrap_or_else(|| sh.default_col_file_width());
-    excel_col_emu(w, sh.col_hidden(c))
+    pt_emu(col_points(sh, c))
 }
 
-/// Row `r` of `sh` as Excel lays it out, in EMU ([`excel_row_emu`]).
+/// Row `r` of `sh` as Excel lays it out, in EMU: its own `ht`, else the
+/// sheet's default, else 15 pt (`paginate::row_points`); 0 when hidden.
 pub fn sheet_row_emu(sh: &Sheet, r: u32) -> i64 {
-    excel_row_emu(
-        sh.row_height(r),
-        sh.format.default_row_height,
-        sh.row_hidden(r),
-    )
+    pt_emu(row_points(sh, r))
 }
 
-/// A row's height in EMU: its own `ht`, else the sheet's default, else
-/// 15 pt; 0 for a hidden row.
-pub fn excel_row_emu(ht: Option<f64>, default_ht: Option<f64>, hidden: bool) -> i64 {
-    if hidden {
+/// A size in points as EMU, made safe: a width or height is the file's own
+/// number, so `inf`, `NaN` or a negative one is 0 and a huge one stops at
+/// `MAX_ANCHOR_EMU`. Every cell size the walks add is then bounded, and
+/// `MAX_WALK` of them fit an `i64` many times over.
+fn pt_emu(pt: f64) -> i64 {
+    if !pt.is_finite() || pt <= 0.0 {
         return 0;
     }
-    let pt = ht.or(default_ht).unwrap_or(15.0).max(0.0);
-    (pt * EMU_PER_PT as f64).round() as i64
+    (pt * EMU_PER_PT as f64).min(MAX_ANCHOR_EMU as f64) as i64
 }
 
 /// `off` EMU into `cell`, as a fraction of it (a zero-size cell is 0).
@@ -247,6 +222,8 @@ mod tests {
 
     /// A 15 pt row as the grid draws it (`row_height_px`, gridline inside),
     /// and a 30 pt one.
+    /// EMU per 96-dpi pixel, for Excel's column widths.
+    const EMU_PER_PX: i64 = 9525;
     const R: f32 = 21.0;
     const TALL: f32 = 42.0;
 
@@ -255,9 +232,9 @@ mod tests {
     /// drawn at 65 px (file width 9.140625), with column 2 hidden (Excel 0, the grid's 28 px).
     fn excel_row(r: u32) -> i64 {
         match r {
-            3 => excel_row_emu(Some(30.0), None, false),
-            5 => excel_row_emu(None, None, true),
-            _ => excel_row_emu(None, None, false),
+            3 => 30 * EMU_PER_PT,
+            5 => 0,
+            _ => ROW_EMU,
         }
     }
     fn drawn_row(r: u32) -> f32 {
@@ -268,7 +245,7 @@ mod tests {
         }
     }
     fn excel_col(c: u32) -> i64 {
-        excel_col_emu(9.140625, c == 2)
+        if c == 2 { 0 } else { COL_EMU }
     }
     fn drawn_col(c: u32) -> f32 {
         if c == 2 { 28.0 } else { 65.0 }
@@ -329,20 +306,24 @@ mod tests {
 
     #[test]
     fn excel_sizes_are_estimated_as_excel_lays_them_out() {
+        let mut sh = Sheet::default();
+        sh.set_col_width(1, 9.140625);
+        sh.set_col_width(2, 20.7109375);
+        sh.set_col_width(3, 0.0);
+        sh.set_col_width(5, 9.140625);
+        sh.set_col_hidden(5, true);
         // Excel's own default file width, and a wider one, as Excel shows them.
-        assert_eq!(excel_col_px(9.140625), 64);
-        assert_eq!(excel_col_px(20.7109375), 145);
-        assert_eq!(excel_col_px(14.43), 101);
-        assert_eq!(excel_col_px(0.0), 0);
-        assert_eq!(excel_col_emu(9.140625, false), COL_EMU);
-        assert_eq!(excel_col_emu(9.140625, true), 0);
-        assert_eq!(excel_row_emu(None, None, false), ROW_EMU);
-        assert_eq!(excel_row_emu(None, Some(20.0), false), 20 * EMU_PER_PT);
-        assert_eq!(
-            excel_row_emu(Some(30.0), Some(20.0), false),
-            30 * EMU_PER_PT
-        );
-        assert_eq!(excel_row_emu(Some(30.0), None, true), 0);
+        assert_eq!(sheet_col_emu(&sh, 1), COL_EMU);
+        assert_eq!(sheet_col_emu(&sh, 2), 145 * EMU_PER_PX);
+        assert_eq!(sheet_col_emu(&sh, 3), 0);
+        assert_eq!(sheet_col_emu(&sh, 5), 0, "hidden");
+        assert_eq!(sheet_row_emu(&sh, 0), ROW_EMU);
+        sh.format.default_row_height = Some(20.0);
+        assert_eq!(sheet_row_emu(&sh, 0), 20 * EMU_PER_PT);
+        sh.set_row_height(1, Some(30.0));
+        assert_eq!(sheet_row_emu(&sh, 1), 30 * EMU_PER_PT);
+        sh.set_row_hidden(1, true);
+        assert_eq!(sheet_row_emu(&sh, 1), 0);
     }
 
     /// Offsets are fractions of their cells: half a 15 pt row and a quarter
@@ -604,5 +585,85 @@ mod tests {
         };
         let span = anchor_span(&anchor, (0, 5), (0, 0), &rows(), &cols);
         assert_eq!(span.cols.1, CellPos { cell: 7, frac: 0.0 });
+    }
+
+    /// A width or a height is the file's own number: `inf`, `1e300`, `NaN`, a
+    /// negative one and a huge default all give a finite size in
+    /// `0..=MAX_ANCHOR_EMU`, and a picture over them is placed without an
+    /// overflow (a debug build panicked on the first frame).
+    #[test]
+    fn crafted_cell_sizes_stay_finite_and_place_a_picture() {
+        let mut sh = Sheet::default();
+        sh.set_col_width(0, f64::INFINITY);
+        sh.set_col_width(1, 1e300);
+        sh.set_col_width(2, f64::NAN);
+        sh.set_col_width(3, -5.0);
+        sh.set_row_height(0, Some(f64::INFINITY));
+        sh.set_row_height(1, Some(1e300));
+        sh.set_row_height(2, Some(f64::NAN));
+        sh.set_row_height(3, Some(-4.0));
+        let ok = |v: i64| (0..=gridcore::sheet::MAX_ANCHOR_EMU).contains(&v);
+        for i in 0..6 {
+            assert!(ok(sheet_col_emu(&sh, i)), "column {i}");
+            assert!(ok(sheet_row_emu(&sh, i)), "row {i}");
+        }
+        assert_eq!(sheet_col_emu(&sh, 1), gridcore::sheet::MAX_ANCHOR_EMU);
+        assert_eq!(sheet_col_emu(&sh, 0), 0);
+        let mut wide = Sheet::default();
+        wide.format.default_col_width = Some(1e20);
+        assert!(ok(sheet_col_emu(&wide, 7)));
+
+        let excel_r = |r: u32| sheet_row_emu(&sh, r);
+        let excel_c = |c: u32| sheet_col_emu(&sh, c);
+        let drawn = |_: u32| 21.0;
+        let rows = Axis {
+            excel: &excel_r,
+            drawn: &drawn,
+            end: 4 * MAX_WALK,
+        };
+        let cols = Axis {
+            excel: &excel_c,
+            drawn: &drawn,
+            end: 256,
+        };
+        let anchor = DrawingAnchor {
+            kind: AnchorKind::OneCell,
+            from_off: (
+                gridcore::sheet::MAX_ANCHOR_EMU,
+                gridcore::sheet::MAX_ANCHOR_EMU,
+            ),
+            ext: Some((
+                gridcore::sheet::MAX_ANCHOR_EMU,
+                gridcore::sheet::MAX_ANCHOR_EMU,
+            )),
+            ..DrawingAnchor::default()
+        };
+        let span = anchor_span(&anchor, (0, 0), (0, 0), &rows, &cols);
+        let top = Pane {
+            first: 0,
+            shift: 0.0,
+            last: 40,
+        };
+        let left = Pane {
+            first: 0,
+            shift: 0.0,
+            last: 40,
+        };
+        if let Some((x, y, w, h)) = piece(&rows, &cols, top, left, span) {
+            assert!([x, y, w, h].iter().all(|v| v.is_finite()));
+        }
+        let absolute = DrawingAnchor {
+            kind: AnchorKind::Absolute,
+            pos: Some((
+                gridcore::sheet::MAX_ANCHOR_EMU,
+                gridcore::sheet::MAX_ANCHOR_EMU,
+            )),
+            ext: Some((
+                gridcore::sheet::MAX_ANCHOR_EMU,
+                gridcore::sheet::MAX_ANCHOR_EMU,
+            )),
+            ..DrawingAnchor::default()
+        };
+        let _ = anchor_span(&absolute, (0, 0), (0, 0), &rows, &cols);
     }
 }
