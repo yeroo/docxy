@@ -422,6 +422,45 @@ pub fn arg_usize(args: &Json, key: &str) -> Result<usize, String> {
     }
 }
 
+/// What `arm-task` asks for (#2195): a ticker every `every_ms` ms, `times`
+/// times, or (`"stop": true`) none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickerArgs {
+    Arm { every_ms: u64, times: u32 },
+    Stop,
+}
+
+/// `arm-task`'s arguments: `{"every_ms": 10..=1000, "times": 1..=2000}` or
+/// `{"stop": true}`, nothing else.
+fn ticker_args(args: &Json) -> Result<TickerArgs, String> {
+    const SHAPE: &str = "arm-task takes {\"every_ms\": 10 to 1000, \"times\": 1 to 2000} \
+                         or {\"stop\": true}";
+    let Json::Obj(fields) = args else {
+        return Err(SHAPE.into());
+    };
+    if let Some((k, _)) = fields
+        .iter()
+        .find(|(k, _)| !matches!(k.as_str(), "every_ms" | "times" | "stop"))
+    {
+        return Err(format!("unknown argument '{k}': {SHAPE}"));
+    }
+    match args.get("stop") {
+        None => {}
+        Some(Json::Bool(true)) if fields.len() == 1 => return Ok(TickerArgs::Stop),
+        Some(_) => return Err(SHAPE.into()),
+    }
+    let whole = |key: &str, lo: f64, hi: f64| -> Result<f64, String> {
+        args.get(key)
+            .and_then(Json::as_f64)
+            .filter(|n| n.fract() == 0.0 && (lo..=hi).contains(n))
+            .ok_or_else(|| format!("'{key}' must be a whole number from {lo} to {hi}: {SHAPE}"))
+    };
+    Ok(TickerArgs::Arm {
+        every_ms: whole("every_ms", 10.0, 1000.0)? as u64,
+        times: whole("times", 1.0, 2000.0)? as u32,
+    })
+}
+
 /// `window-new`'s optional `tab` argument (#587): absent (or null) means
 /// the active tab moves; a present one names the tab and must be a whole
 /// number, not below zero.
@@ -1018,6 +1057,9 @@ pub enum Region {
     Pane(crate::help_tab::Pane),
     /// An extension page's File rail entry, by the page's id (#1923).
     BackstageExt(&'static str),
+    /// A suite File rail item (#2195), by its id (`bs-open`), named
+    /// `bs-rail:open`.
+    BackstageRailItem(&'static str),
     /// The AutoFilter button on column `.0`'s header cell (#690).
     FilterButton(u32),
     /// A part of the document tab's scrollbars (#2080), by name:
@@ -1178,6 +1220,17 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
                 .ok_or("'bs-ext' needs a File page id, e.g. bs-ext:fx.account")?;
             Ok(Region::BackstageExt(crate::plugin_ui::intern(a)))
         }
+        "bs-rail" => {
+            let a = arg.unwrap_or("");
+            crate::backstage_rail_item_id(a)
+                .map(Region::BackstageRailItem)
+                .ok_or_else(|| {
+                    format!(
+                        "no File rail item '{a}' (bs-rail:{})",
+                        crate::backstage_rail_names().join(", bs-rail:")
+                    )
+                })
+        }
         "backstage-content" if arg.is_none() => Ok(Region::BackstageContent),
         "backstage-rail" if arg.is_none() => Ok(Region::BackstageRail),
         "doc-line-start" | "doc-line-end" => {
@@ -1334,6 +1387,7 @@ pub fn region_name(region: Region) -> String {
         Region::RibbonCmd(id) => crate::help_tab::ribbon_cmd_probe(id),
         Region::Pane(p) => crate::help_tab::pane_probe(p),
         Region::BackstageExt(id) => format!("bs-ext:{id}"),
+        Region::BackstageRailItem(id) => crate::backstage_rail_probe(id),
         Region::BackstageContent => "backstage-content".into(),
         Region::BackstageRail => "backstage-rail".into(),
         Region::Qat(name) => name.into(),
@@ -5033,6 +5087,8 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
             "dirty",
             Json::Bool(app.tabs.get(app.active).is_some_and(|t| t.dirty)),
         ),
+        // `arm-task`'s ticks so far (#2195).
+        ("harness_task_runs", Json::Num(app.harness_task_runs as f64)),
         // The live preview (#764) the last frame drew in place of the
         // document, or null: settle a frame (`shot window`) after a hover.
         ("preview", preview_json(app.drawn_preview.borrow().as_ref())),
@@ -6894,6 +6950,38 @@ fn dispatch_verb(
             let wrote = app.autorecover_tick(cx);
             cx.notify();
             Done::ok(Json::obj(vec![("wrote", Json::Bool(wrote))]))
+        }
+        // A foreground ticker (#2195): `times` times, every `every_ms` ms,
+        // it updates this view through `AsyncApp`, infallibly, as the
+        // gpui-component timer that crashed #2192 did. A tick that comes due
+        // while a native dialog's modal loop runs nested in a listener's App
+        // borrow panics there, so a case that keeps one armed across Open
+        // fails if the picker is ever shown inside a listener again.
+        // `harness_task_runs` in the state counts the ticks.
+        "arm-task" => {
+            match ticker_args(args)? {
+                TickerArgs::Stop => app.harness_task = None,
+                TickerArgs::Arm { every_ms, times } => {
+                    let every = std::time::Duration::from_millis(every_ms);
+                    app.harness_task = Some(cx.spawn(async move |this, cx| {
+                        for _ in 0..times {
+                            cx.background_executor().timer(every).await;
+                            // ⚠️ Deliberately the infallible borrow
+                            // (`AsyncApp::update_entity`): what it tests.
+                            if this
+                                .update(cx, |this, _| this.harness_task_runs += 1)
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }));
+                }
+            }
+            Done::ok(Json::obj(vec![
+                ("armed", Json::Bool(app.harness_task.is_some())),
+                ("harness_task_runs", Json::Num(app.harness_task_runs as f64)),
+            ]))
         }
         "ping" => Done::ok(Json::obj(vec![
             ("instance", Json::Str(instance_name(true))),
@@ -10533,6 +10621,38 @@ mod tests {
         );
     }
 
+    /// #2195: `arm-task` arms a ticker within bounds, or stops it, and
+    /// refuses anything else.
+    #[test]
+    fn arm_task_takes_a_bounded_ticker_or_stop() {
+        let j = |s: &str| Json::parse(s).unwrap();
+        assert_eq!(
+            ticker_args(&j(r#"{"every_ms":50,"times":600}"#)),
+            Ok(TickerArgs::Arm {
+                every_ms: 50,
+                times: 600
+            })
+        );
+        assert_eq!(ticker_args(&j(r#"{"stop":true}"#)), Ok(TickerArgs::Stop));
+        for bad in [
+            r#"{}"#,
+            r#"{"every_ms":50}"#,
+            r#"{"times":5}"#,
+            r#"{"every_ms":9,"times":5}"#,
+            r#"{"every_ms":1001,"times":5}"#,
+            r#"{"every_ms":50,"times":0}"#,
+            r#"{"every_ms":50,"times":2001}"#,
+            r#"{"every_ms":50.5,"times":5}"#,
+            r#"{"every_ms":"50","times":5}"#,
+            r#"{"stop":false}"#,
+            r#"{"stop":true,"times":5}"#,
+            r#"{"every_ms":50,"times":5,"ms":1}"#,
+            r#"[]"#,
+        ] {
+            assert!(ticker_args(&j(bad)).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn arg_usize_and_flag_report_their_own_shapes() {
         let args = obj(&[
@@ -11575,6 +11695,8 @@ mod tests {
             Region::Pane(crate::help_tab::Pane::Navigation),
             Region::Pane(crate::help_tab::Pane::OfficeClipboard),
             Region::BackstageExt("fx.account"),
+            Region::BackstageRailItem("bs-open"),
+            Region::BackstageRailItem("bs-export-doc"),
             Region::BackstageContent,
             Region::BackstageRail,
             Region::FilterButton(1),
@@ -11633,6 +11755,18 @@ mod tests {
             "{e}"
         );
         assert!(parse_region("pane").is_err());
+        // #2195: a suite File rail item by its id without `bs-`; an unknown
+        // one names them.
+        assert_eq!(
+            parse_region("bs-rail:open"),
+            Ok(Region::BackstageRailItem("bs-open"))
+        );
+        let e = parse_region("bs-rail:opn").unwrap_err();
+        assert!(
+            e.contains("no File rail item 'opn'") && e.contains("bs-rail:open"),
+            "{e}"
+        );
+        assert!(parse_region("bs-rail").is_err());
         assert!(parse_region("project-split:1").is_err());
         assert!(parse_region("bar:abc").is_err());
         assert!(parse_region("bar:").is_err());

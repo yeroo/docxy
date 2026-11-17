@@ -79,6 +79,11 @@ fixture) is copied from beside uiharness into the sandbox's docxy/plugins
 before the suite starts. An `ext fixture` line has its Mail tabs drawn by
 the suite's test extension, an embedded document view (#1873); `ext fixture
 ribbon` has it describe its ribbon to the suite (#1870).
+An `os <windows|linux|macos>...` line runs the script only there; elsewhere
+`run` reports it skipped without launching anything (#2195). On Windows,
+`native-dialog cancel` and `native-dialog open PATH` answer the suite's
+native dialog from outside it, and `window click REGION` posts a left click
+to its window as window messages (#2195).
 
 regions:
   window  title-tabs  tab-prev  tab-next  tab-more  tab-more-item:0
@@ -356,6 +361,22 @@ fn run_scripts(a: &Args) -> Result<String, String> {
         scripts.push((path, base, script));
     }
 
+    // A script whose `os` line leaves this system out is skipped before
+    // anything is looked for or launched, and counts neither passed nor
+    // failed (#2195).
+    let mut skipped = String::new();
+    scripts.retain(|(path, _, script)| {
+        let here = script.runs_on(uiharness::script::this_os());
+        if !here {
+            let names = script.os.as_deref().unwrap_or_default().join(" ");
+            skipped.push_str(&format!("{}: skipped (os {names})\n", path.display()));
+        }
+        here
+    });
+    if scripts.is_empty() {
+        return Ok(skipped);
+    }
+
     if let Some(clash) = uiharness::script::duplicate_case(
         &scripts
             .iter()
@@ -444,6 +465,7 @@ fn run_scripts(a: &Args) -> Result<String, String> {
         Some(exe) => format!("suite:    {}\n", exe.display()),
         None => String::new(),
     };
+    out.push_str(&skipped);
     let mut all_passed = true;
     for (i, (path, base, script)) in scripts.iter().enumerate() {
         let sandbox = match &a.sandbox {

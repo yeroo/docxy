@@ -1,0 +1,106 @@
+# Open's real native picker on Windows (#2195), the regression test for the
+# #2192 crash: IFileDialog::Show shown inside a listener, with the App
+# borrowed, ran a foreground task nested in its modal loop, and a task that
+# updated an entity through AsyncApp panicked and aborted the suite.
+#
+# `arm-task` keeps such a task due every 50 ms while the picker is up.
+# `window click` posts the click to the suite's window as window messages, so
+# Open… runs from a real window message as in #2192; a `pointer-click` or
+# `real-key` is dispatched by the control pump from inside a task, where
+# gpui_windows runs no other task nested, and could not crash even an inline
+# picker. `native-dialog` answers the dialog from outside the process: while
+# it is up the suite's pump answers nothing.
+#
+# The order matters (one suite runs the whole file): the pump-dispatched
+# Ctrl+F12 case first, then the regression case, whose crash would end every
+# case after it.
+os windows
+
+# Pump-dispatched (real-key): the key path and the kept state. It does NOT
+# reproduce #2192's frame; the next case does.
+test ctrl+f12 by real-key opens the real picker and cancel keeps the tab and the edit
+  open copy:../fixtures/basic.docx
+  type x
+  assert dirty is true
+  call selection {}
+  call real-key {"keys":["ctrl+f12"]}
+  native-dialog cancel
+  assert dirty is true
+  assert tabs is {selection.tabs}
+  assert tab is {selection.tab}
+  assert title is basic.docx
+
+# The regression case: Open… clicked by a real window message, a ticker due.
+test the rail's open clicked for real with a ticker due cancels and keeps the tab, the edit and File
+  open copy:../fixtures/basic.docx
+  type x
+  assert dirty is true
+  call selection {}
+  call arm-task {"every_ms":50,"times":600}
+  call backstage {"action":"open"}
+  assert reply.open is true
+  window click bs-rail:open
+  native-dialog cancel
+  # The suite is alive and its ticker ran on.
+  assert harness_task_runs is not {arm-task.harness_task_runs}
+  call backstage {"action":"read"}
+  assert reply.open is true
+  assert dirty is true
+  assert tabs is {selection.tabs}
+  assert tab is {selection.tab}
+  assert title is basic.docx
+  call arm-task {"stop":true}
+  call backstage {"action":"close"}
+
+test a workbook typed into the real picker opens as the active tab
+  open copy:../fixtures/basic.docx
+  call selection {}
+  call arm-task {"every_ms":50,"times":600}
+  call backstage {"action":"open"}
+  window click bs-rail:open
+  native-dialog open copy:../fixtures/basic.xlsx
+  assert title is basic.xlsx
+  assert tabs is not {selection.tabs}
+  call backstage {"action":"read"}
+  assert reply.open is false
+  call arm-task {"stop":true}
+
+test six open and cancel rounds by the rail and ctrl+f12 leave the suite alive
+  open copy:../fixtures/basic.docx
+  call selection {}
+  call arm-task {"every_ms":50,"times":1200}
+  # 1: the rail
+  call backstage {"action":"open"}
+  window click bs-rail:open
+  native-dialog cancel
+  call backstage {"action":"read"}
+  assert reply.open is true
+  call backstage {"action":"close"}
+  # 2: ctrl+f12
+  call real-key {"keys":["ctrl+f12"]}
+  native-dialog cancel
+  # 3: the rail
+  call backstage {"action":"open"}
+  window click bs-rail:open
+  native-dialog cancel
+  call backstage {"action":"read"}
+  assert reply.open is true
+  call backstage {"action":"close"}
+  # 4: ctrl+f12
+  call real-key {"keys":["ctrl+f12"]}
+  native-dialog cancel
+  # 5: the rail
+  call backstage {"action":"open"}
+  window click bs-rail:open
+  native-dialog cancel
+  call backstage {"action":"read"}
+  assert reply.open is true
+  call backstage {"action":"close"}
+  # 6: ctrl+f12
+  call real-key {"keys":["ctrl+f12"]}
+  native-dialog cancel
+  assert harness_task_runs is not {arm-task.harness_task_runs}
+  assert tabs is {selection.tabs}
+  type x
+  assert dirty is true
+  call arm-task {"stop":true}

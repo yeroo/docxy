@@ -32,8 +32,10 @@ EXPECTED = CASES / 'expected-failures.txt'
 EXPECTED_WINDOWS = CASES / 'expected-failures-windows.txt'
 UI_LINUX = REPO / 'scripts' / 'ui-linux.py'
 
-# Statuses, best first. Only PASS and XFAIL leave the exit code at 0.
+# Statuses, best first. Only PASS, XFAIL and SKIP leave the exit code at 0.
 PASS, XFAIL, XPASS, FAIL, ERROR = 'PASS', 'XFAIL', 'XPASS', 'FAIL', 'ERROR'
+# A script whose `os` line leaves this system out (#2195): not run at all.
+SKIP = 'SKIP'
 KINDS = ('fail', 'error', 'flaky')
 
 
@@ -104,6 +106,43 @@ def script_plugins(text):
         if words[0].lower() == 'plugin' and len(words) == 2:
             names.append(words[1])
     return names
+
+
+def script_os(text):
+    """The systems a script runs on (its `os <name>...` line), or None for all.
+
+    uiharness's parser takes one `os` line before the first case, naming
+    windows, linux or macos (#2195).
+    """
+    for raw in text.splitlines():
+        words = strip_comment(raw).split()
+        if not words:
+            continue
+        if words[0].lower() == 'test':
+            break
+        if words[0].lower() == 'os':
+            return [w.lower() for w in words[1:]]
+    return None
+
+
+def platform_os(platform):
+    """The `os` line's name for a `sys.platform` value."""
+    if platform == 'win32':
+        return 'windows'
+    if platform == 'darwin':
+        return 'macos'
+    return 'linux'
+
+
+def runs_on(text, platform):
+    """Whether a script runs on `platform` (a `sys.platform` value)."""
+    names = script_os(text)
+    return names is None or platform_os(platform) in names
+
+
+def skipped(script_name, text):
+    """The result of a script skipped for its `os` line."""
+    return Result(script_name, SKIP, reason='os ' + ' '.join(script_os(text) or []))
 
 
 def built_plugin(directory, name):
@@ -323,11 +362,13 @@ def table(results):
         cells = [c.rjust(w) if 1 <= i <= 3 or i == 5 else c.ljust(w)
                  for i, (c, w) in enumerate(zip(row, widths))]
         lines.append('  '.join(cells + [row[-1]]).rstrip())
-    counts = {s: sum(r.status == s for r in results) for s in (PASS, XFAIL, FAIL, XPASS, ERROR)}
+    counts = {s: sum(r.status == s for r in results)
+              for s in (PASS, XFAIL, FAIL, XPASS, ERROR, SKIP)}
     lines.append('')
     lines.append(f'{len(results)} script{"" if len(results) == 1 else "s"}: '
                  f'{counts[PASS]} pass, {counts[XFAIL]} xfail, {counts[FAIL]} fail, '
-                 f'{counts[XPASS]} xpass, {counts[ERROR]} error')
+                 f'{counts[XPASS]} xpass, {counts[ERROR]} error'
+                 + (f', {counts[SKIP]} skipped' if counts[SKIP] else ''))
     return '\n'.join(lines) + '\n'
 
 
@@ -448,9 +489,14 @@ def main(argv=None):
             parser.error(f'two scripts are named {path.stem}; their run directories would clash')
         declared[path] = script_cases(path.read_text(encoding='utf-8'))
 
+    # A script whose `os` line leaves this system out is not run (#2195),
+    # and needs nothing built.
+    texts = {p: p.read_text(encoding='utf-8') for p in scripts}
+    here = [p for p in scripts if runs_on(texts[p], sys.platform)]
+
     # The suite is needed only by suite scripts, and each terminal editor only
     # by the scripts that drive it (#1204).
-    editors = {script_editor(p.read_text(encoding='utf-8')) for p in scripts}
+    editors = {script_editor(texts[p]) for p in here}
     needed = []
     if None in editors:
         needed.append((suite, 'cargo build --release --manifest-path suite/Cargo.toml'))
@@ -459,7 +505,7 @@ def main(argv=None):
         needed.append((term_bin / f'{app}{exe_suffix}',
                        'cargo build --release -p docxy -p xlsxy -p yppxy'))
     # A suite script's format plugins are built beside uiharness.
-    plugins = {n for p in scripts for n in script_plugins(p.read_text(encoding='utf-8'))}
+    plugins = {n for p in here for n in script_plugins(texts[p])}
     for name in sorted(plugins):
         needed.append((built_plugin(uiharness.parent, name),
                        'cargo build --release -p uiharness -p plugin_fixture'))
@@ -477,9 +523,14 @@ def main(argv=None):
     interrupted = False
     start = time.monotonic()
     for i, path in enumerate(scripts, 1):
+        print(f'[{i}/{len(scripts)}] {path.stem} ... ', end='', flush=True)
+        if path not in here:
+            r = skipped(path.name, texts[path])
+            results.append(r)
+            print(f'{r.status}  {r.note()}', flush=True)
+            continue
         out = run / path.stem
         out.mkdir()
-        print(f'[{i}/{len(scripts)}] {path.stem} ... ', end='', flush=True)
         cmd = script_command(sys.platform, path, uiharness, suite, term_bin, out)
         began = time.monotonic()
         try:
@@ -512,7 +563,7 @@ def main(argv=None):
     print(f'wall time {time.monotonic() - start:.0f}s; run directory: {run}')
     if interrupted:
         return 130
-    return 0 if all(r.status in (PASS, XFAIL) for r in results) else 1
+    return 0 if all(r.status in (PASS, XFAIL, SKIP) for r in results) else 1
 
 
 if __name__ == '__main__':

@@ -50,6 +50,14 @@
 //! | `snapshot <range>` | remembers those cells, for `assert cells unchanged` |
 //! | `shot <region>` | files a PNG of the region |
 //! | `assert …` | see below |
+//! | `native-dialog cancel` | (Windows) finds the suite's native dialog, holds it, cancels it |
+//! | `native-dialog open <path>` | (Windows) the same, typing the path (as `open` takes it) and pressing OK |
+//! | `window click <region>` | (Windows) a left click posted to the suite's window as window messages |
+//!
+//! `native-dialog` and `window click` act from outside the process
+//! ([`crate::native_dialog`], #2195): while Open's picker is up the control
+//! pump answers nothing, and a harness verb's pointer input runs inside the
+//! pump's task, never from a window message as a real click does.
 //!
 //! ## Terminal scripts (#1204)
 //!
@@ -95,6 +103,13 @@
 //! marker in the sandbox before it launches
 //! ([`crate::launch::request_ext_fixture`]).
 //!
+//! ## Operating systems
+//!
+//! A script may start with an `os <name> [name…]` line (before its first
+//! case; names `windows`, `linux`, `macos`): it runs only there. Elsewhere
+//! `uiharness run` reports it skipped without launching anything, and the
+//! sweep (`scripts/ui-linux-sweep.py`) skips it (#2195).
+//!
 //! ## Assertions
 //!
 //! | Assertion | Reads |
@@ -137,7 +152,33 @@ pub struct Script {
     /// `manual <editor> <dir>` lines: the help manuals the suite starts with
     /// (#1855), `dir` relative to the script ([`crate::launch::install_manuals`]).
     pub manuals: Vec<Manual>,
+    /// An `os <name>…` line: the only systems the script runs on (#2195);
+    /// `None` runs everywhere. Names from [`OS_NAMES`].
+    pub os: Option<Vec<String>>,
     pub cases: Vec<Case>,
+}
+
+/// The names an `os` line takes (#2195).
+pub const OS_NAMES: [&str; 3] = ["windows", "linux", "macos"];
+
+/// This system's name in an `os` line.
+pub const fn this_os() -> &'static str {
+    if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
+}
+
+impl Script {
+    /// Whether the script runs on `os` (one of [`OS_NAMES`]).
+    pub fn runs_on(&self, os: &str) -> bool {
+        self.os
+            .as_ref()
+            .is_none_or(|names| names.iter().any(|n| n == os))
+    }
 }
 
 /// A `manual <editor> <dir>` line.
@@ -220,6 +261,28 @@ pub enum Action {
     /// File a PNG of a region.
     Shot(String),
     Assert(Assertion),
+    /// Answer the suite's native dialog from outside the process (#2195):
+    /// cancel it (`None`), or type the file an `open` step would open (an
+    /// `Open`, `OpenCopy` or `OpenCopyAs`) and press OK.
+    NativeDialog(Option<Box<Action>>),
+    /// A left click on a region posted to the suite's window as window
+    /// messages (#2195).
+    WindowClick(String),
+}
+
+impl Action {
+    /// The file a step opens, as written: an `open` step's path, or the one a
+    /// `native-dialog open` types into the dialog (#2195). `None` for any
+    /// other step.
+    pub fn opened_path(&self) -> Option<&str> {
+        match self {
+            Action::Open(path) | Action::OpenCopy(path) | Action::OpenCopyAs { path, .. } => {
+                Some(path)
+            }
+            Action::NativeDialog(Some(open)) => open.opened_path(),
+            _ => None,
+        }
+    }
 }
 
 /// What a step asserts.
@@ -276,8 +339,8 @@ fn err(line: usize, message: impl Into<String>) -> ScriptError {
 }
 
 /// The steps a script may use, for an error message.
-const STEP_WORDS: &str =
-    "open, call, click, drag, type, key, select chart, focus, snapshot, shot, assert";
+const STEP_WORDS: &str = "open, call, click, drag, type, key, select chart, focus, snapshot, \
+                          shot, assert, native-dialog, window click";
 
 /// The first case name two of `scripts` share, as a message naming both files.
 ///
@@ -331,6 +394,7 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
     let mut ext_fixture = false;
     let mut ext_fixture_ribbon = false;
     let mut manuals: Vec<Manual> = Vec::new();
+    let mut os: Option<Vec<String>> = None;
     for (i, raw) in text.lines().enumerate() {
         let line = i + 1;
         let (head, rest) = split_word(raw.trim());
@@ -390,6 +454,17 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
                 return Err(err(line, format!("the {} manual is named twice", m.editor)));
             }
             manuals.push(m);
+            continue;
+        }
+
+        if head.eq_ignore_ascii_case("os") {
+            if !cases.is_empty() {
+                return Err(err(line, "'os' comes before the first case"));
+            }
+            if os.is_some() {
+                return Err(err(line, "there is one 'os' line"));
+            }
+            os = Some(parse_os(&rest, line)?);
             continue;
         }
 
@@ -524,8 +599,35 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
         ext_fixture,
         ext_fixture_ribbon,
         manuals,
+        os,
         cases,
     })
+}
+
+/// `os <name> [name…]`: one or more of [`OS_NAMES`], each once.
+fn parse_os(rest: &str, line: usize) -> Result<Vec<String>, ScriptError> {
+    let names = OS_NAMES.join(", ");
+    let mut out: Vec<String> = Vec::new();
+    for word in rest.split_whitespace() {
+        let w = word.to_ascii_lowercase();
+        if !OS_NAMES.contains(&w.as_str()) {
+            return Err(err(
+                line,
+                format!("'{word}' is not an operating system: they are {names}"),
+            ));
+        }
+        if out.contains(&w) {
+            return Err(err(line, format!("'{w}' is named twice")));
+        }
+        out.push(w);
+    }
+    if out.is_empty() {
+        return Err(err(
+            line,
+            format!("'os' needs one or more of {names}, e.g. 'os windows'"),
+        ));
+    }
+    Ok(out)
 }
 
 /// `manual <editor> <dir>`: one of [`MANUAL_EDITORS`] and a directory, which
@@ -868,6 +970,34 @@ fn parse_step(head: &str, rest: &str, line: usize) -> Result<Action, ScriptError
 
         "assert" => Ok(Action::Assert(parse_assertion(rest_trim, line)?)),
 
+        "native-dialog" => {
+            const USAGE: &str = "'native-dialog' is 'native-dialog cancel' or \
+                                 'native-dialog open <path>' (a path as 'open' takes it)";
+            let (word, path) = split_word(rest_trim);
+            if word.eq_ignore_ascii_case("cancel") && path.trim().is_empty() {
+                Ok(Action::NativeDialog(None))
+            } else if word.eq_ignore_ascii_case("open") && !path.trim().is_empty() {
+                Ok(Action::NativeDialog(Some(Box::new(parse_step(
+                    "open", path, line,
+                )?))))
+            } else {
+                Err(err(line, USAGE))
+            }
+        }
+
+        "window" => {
+            let (word, region) = split_word(rest_trim);
+            if !word.eq_ignore_ascii_case("click") || region.trim().is_empty() {
+                return Err(err(
+                    line,
+                    format!("the 'window' step is 'window click <region>' ({REGION_WORDS})"),
+                ));
+            }
+            Ok(Action::WindowClick(
+                validate_region(region.trim()).map_err(|e| err(line, e))?,
+            ))
+        }
+
         other => Err(err(line, format!("'{other}' is not a step ({STEP_WORDS})"))),
     }
 }
@@ -1045,6 +1175,13 @@ pub fn validate_region(name: &str) -> Result<String, String> {
                 .ok_or("'ribbon-group' needs a group index")?;
             a.parse::<usize>()
                 .map_err(|_| "'ribbon-group' needs a numeric index")?;
+            Ok(full.clone())
+        }
+        // A suite File rail item, by its id without `bs-` (#2195); the app
+        // names the items when one is wrong.
+        "bs-rail" => {
+            arg.filter(|a| !a.is_empty())
+                .ok_or("'bs-rail' needs a File rail item, e.g. bs-rail:open")?;
             Ok(full.clone())
         }
         "ribbon-launch" => {
@@ -2018,6 +2155,120 @@ test t
         }
         let e = parse_script(&format!("ext fixture\next fixture ribbon\n{VALID}")).unwrap_err();
         assert!(e.to_string().contains("twice"), "{e}");
+    }
+
+    /// #2195: `os` names the systems a script runs on; anywhere else it is
+    /// skipped. One line, before the first case, known names, each once.
+    #[test]
+    fn an_os_line_names_where_the_script_runs() {
+        let s = parse_script(&format!("os windows\n{VALID}")).unwrap();
+        assert_eq!(s.os, Some(vec!["windows".to_string()]));
+        assert!(s.runs_on("windows"));
+        assert!(!s.runs_on("linux") && !s.runs_on("macos"));
+        let s = parse_script(&format!("OS Linux macos  # not on Windows\n{VALID}")).unwrap();
+        assert_eq!(s.os, Some(vec!["linux".to_string(), "macos".to_string()]));
+        assert!(s.runs_on("linux") && s.runs_on("macos") && !s.runs_on("windows"));
+        let everywhere = parse_script(VALID).unwrap();
+        assert_eq!(everywhere.os, None);
+        assert!(OS_NAMES.iter().all(|os| everywhere.runs_on(os)));
+        assert!(OS_NAMES.contains(&this_os()));
+        for (bad, says) in [
+            ("os", "needs one or more of windows, linux, macos"),
+            ("os windows windows", "'windows' is named twice"),
+            ("os win32", "'win32' is not an operating system"),
+            ("os windows\nos linux", "one 'os' line"),
+        ] {
+            let e = parse_script(&format!("{bad}\n{VALID}")).unwrap_err();
+            assert!(e.to_string().contains(says), "{bad}: {e}");
+        }
+        let e = parse_script(&format!("{VALID}\nos windows")).unwrap_err();
+        assert!(e.to_string().contains("before the first case"), "{e}");
+    }
+
+    /// #2195: the file a step opens, for the fixture guard in
+    /// `tests/cases.rs`, includes the one a `native-dialog open` types.
+    #[test]
+    fn a_steps_opened_path_includes_the_native_dialogs() {
+        let steps = parse_script(
+            "test t\n  open a.docx\n  open copy:b.xlsx\n  open copy:\"c.xml\" as d.xml\n  \
+             native-dialog open copy:e.xlsx\n  native-dialog cancel\n  type x\n",
+        )
+        .unwrap()
+        .cases
+        .remove(0)
+        .steps;
+        let paths: Vec<Option<&str>> = steps.iter().map(|s| s.action.opened_path()).collect();
+        assert_eq!(
+            paths,
+            [
+                Some("a.docx"),
+                Some("b.xlsx"),
+                Some("c.xml"),
+                Some("e.xlsx"),
+                None,
+                None
+            ]
+        );
+    }
+
+    /// #2195: `native-dialog` cancels, or opens a path written as `open`
+    /// takes it; `window click` takes a region `shot` would.
+    #[test]
+    fn native_dialog_and_window_click_steps() {
+        let step = |line: &str| {
+            parse_script(&format!("test t\n  {line}\n")).map(|s| s.cases[0].steps[0].action.clone())
+        };
+        assert_eq!(step("native-dialog cancel"), Ok(Action::NativeDialog(None)));
+        assert_eq!(
+            step("native-dialog open copy:../fixtures/basic.xlsx"),
+            Ok(Action::NativeDialog(Some(Box::new(Action::OpenCopy(
+                "../fixtures/basic.xlsx".into()
+            )))))
+        );
+        assert_eq!(
+            step("native-dialog open fixtures/a.docx"),
+            Ok(Action::NativeDialog(Some(Box::new(Action::Open(
+                "fixtures/a.docx".into()
+            )))))
+        );
+        assert_eq!(
+            step(r#"native-dialog open copy:"../f/b.xlsx" as two.xlsx"#),
+            Ok(Action::NativeDialog(Some(Box::new(Action::OpenCopyAs {
+                path: "../f/b.xlsx".into(),
+                name: "two.xlsx".into()
+            }))))
+        );
+        for bad in [
+            "native-dialog",
+            "native-dialog ok",
+            "native-dialog cancel now",
+            "native-dialog open",
+        ] {
+            let e = step(bad).unwrap_err();
+            assert!(e.to_string().contains("native-dialog cancel"), "{bad}: {e}");
+        }
+        assert_eq!(
+            step("window click bs-rail:open"),
+            Ok(Action::WindowClick("bs-rail:open".into()))
+        );
+        assert_eq!(
+            step("window click B3"),
+            Ok(Action::WindowClick("cell:B3".into()))
+        );
+        for bad in ["window", "window click", "window press bs-rail:open"] {
+            let e = step(bad).unwrap_err();
+            assert!(
+                e.to_string().contains("window click <region>"),
+                "{bad}: {e}"
+            );
+        }
+        assert!(step("window click bs-rail").is_err());
+        assert!(step("window click nowhere").is_err());
+        // Both need the suite.
+        for line in ["native-dialog cancel", "window click bs-rail:open"] {
+            let e = parse_script(&format!("terminal docxy\ntest t\n  {line}\n")).unwrap_err();
+            assert!(e.to_string().contains("needs the suite"), "{line}: {e}");
+        }
     }
 
     #[test]

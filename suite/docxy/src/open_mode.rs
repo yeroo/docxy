@@ -266,6 +266,17 @@ pub(crate) const fn open_pick_route() -> PickRoute {
     }
 }
 
+/// Whether a harness instance refuses Open on `route` (#2195). Only the
+/// Deferred picker (Windows) can be answered by the harness: it is shown
+/// from a task, so the control pump replies first, and uiharness answers
+/// the dialog by window messages from its own process. The Inline picker
+/// (macOS) would block the pump inside the verb that asked for it. Linux's
+/// Background pick would not stall the pump, but refusing there gives a
+/// deterministic message and no stray portal call under xvfb.
+pub(crate) fn open_refused_in_harness(harness: bool, route: PickRoute) -> bool {
+    harness && route != PickRoute::Deferred
+}
+
 /// The caption a tab shows: its file name, then the access suffix.
 pub(crate) fn caption(title: &str, access: Access) -> String {
     match access.caption_suffix() {
@@ -490,6 +501,28 @@ mod tests {
         if !cfg!(target_os = "macos") {
             assert_ne!(route, PickRoute::Inline, "a synchronous pick off macOS");
         }
+    }
+
+    /// #2195: a harness instance opens the real picker only on the Deferred
+    /// route, where uiharness can answer it; elsewhere every Open path
+    /// refuses. A normal instance never refuses.
+    #[test]
+    fn open_is_refused_in_a_harness_only_off_the_deferred_route() {
+        assert!(!open_refused_in_harness(true, PickRoute::Deferred));
+        assert!(open_refused_in_harness(true, PickRoute::Inline));
+        assert!(open_refused_in_harness(true, PickRoute::Background));
+        for route in [
+            PickRoute::Deferred,
+            PickRoute::Inline,
+            PickRoute::Background,
+        ] {
+            assert!(!open_refused_in_harness(false, route), "{route:?}");
+        }
+        // This OS's own route: Windows opens it, Linux and macOS refuse.
+        assert_eq!(
+            open_refused_in_harness(true, open_pick_route()),
+            !cfg!(target_os = "windows")
+        );
     }
 
     #[test]

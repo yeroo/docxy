@@ -39,6 +39,8 @@
 //! - [`run`] — where a run's evidence is filed.
 //! - [`window`] — closing the instance's window through the OS, as its
 //!   close button does (#1226).
+//! - [`native_dialog`] — the suite's native dialog answered, and its window
+//!   clicked, by window messages from outside the process (#2195).
 //! - [`pty`], [`termkeys`], [`term`] — a terminal editor (docxy, xlsxy,
 //!   yppxy) run in a pseudo-terminal and typed into with real key bytes
 //!   (#1204).
@@ -50,6 +52,7 @@ pub mod driver;
 pub mod expect;
 pub mod image;
 pub mod launch;
+pub mod native_dialog;
 pub mod png;
 pub mod probe;
 pub mod pty;

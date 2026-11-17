@@ -6038,6 +6038,12 @@ struct Docxy {
     // targets. The link that keeps the harness server alive is owned by the
     // registry, for the whole run.
     harness: bool,
+    // The harness's armed ticker (`arm-task`, #2195): a foreground task
+    // that updates this view through `AsyncApp` on a timer, as the task that
+    // crashed #2192 did, and how many times it has. Arming again replaces it
+    // and dropping it stops it.
+    harness_task: Option<Task<()>>,
+    harness_task_runs: u64,
     // Measured bounds of the regions the harness's `rect` verb can name, written
     // by `probe` elements during layout. Costs one out-of-flow zero-paint element
     // per probed region per frame, harness or not — the alternative, gating them
@@ -6529,6 +6535,30 @@ fn probe(cell: &std::rc::Rc<std::cell::RefCell<Probes>>, name: impl Into<String>
 /// harness's `ext-ribbon-cmd:<id>` region.
 fn ext_cmd_probe(id: &str) -> String {
     format!("ext-ribbon-cmd:{id}")
+}
+
+/// The probe a suite File rail item draws (#2195), the harness's
+/// `bs-rail:<name>` region: the item's id without its `bs-` (`bs-open` is
+/// `bs-rail:open`).
+fn backstage_rail_probe(id: &str) -> String {
+    format!("bs-rail:{}", id.strip_prefix("bs-").unwrap_or(id))
+}
+
+/// The suite File rail item whose `bs-rail:<name>` region is `name`
+/// (#2195), as its id.
+fn backstage_rail_item_id(name: &str) -> Option<&'static str> {
+    BACKSTAGE_RAIL
+        .iter()
+        .map(|item| item.id)
+        .find(|id| id.strip_prefix("bs-") == Some(name))
+}
+
+/// Every suite File rail item's `bs-rail:` name, for an error.
+fn backstage_rail_names() -> Vec<&'static str> {
+    BACKSTAGE_RAIL
+        .iter()
+        .filter_map(|item| item.id.strip_prefix("bs-"))
+        .collect()
 }
 
 /// The probe an extension's File rail entry draws (#1923), the harness's
@@ -17475,6 +17505,8 @@ impl Docxy {
             bar_range: None,
             win_id: 0,
             harness: false,
+            harness_task: None,
+            harness_task_runs: 0,
             probes: Default::default(),
             frame: 0,
             last_window_title: None,
@@ -20243,6 +20275,14 @@ impl Docxy {
                 }),
             Region::Pane(p) => lookup(&self.probes.borrow(), &help_tab::pane_probe(p))
                 .ok_or_else(|| format!("the {} pane is not drawn", p.id())),
+            Region::BackstageRailItem(id) => {
+                lookup(&self.probes.borrow(), &backstage_rail_probe(id)).ok_or_else(|| {
+                    format!(
+                        "the File rail draws no {} (backstage open, on a tab that shows it)",
+                        backstage_rail_probe(id)
+                    )
+                })
+            }
             Region::BackstageExt(id) => lookup(&self.probes.borrow(), &backstage_ext_probe(id))
                 .ok_or_else(|| {
                     format!("the File rail draws no extension page {id} (backstage open on its tab)")
@@ -27037,7 +27077,16 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         // Where the picker runs per OS, and why, is `PickRoute`'s (#2192).
-        match open_mode::open_pick_route() {
+        let route = open_mode::open_pick_route();
+        // Every Open path meets here: Ctrl+F12, the rail's Open…, Open
+        // Read-Only… and the rest. A harness instance opens the real picker
+        // only where uiharness can answer it (#2195).
+        if open_mode::open_refused_in_harness(self.harness, route) {
+            self.set_status(file_keys::OPEN_HARNESS);
+            cx.notify();
+            return self.refocus(window, cx);
+        }
+        match route {
             open_mode::PickRoute::Background => {
                 let picked = cx
                     .background_executor()
@@ -43378,6 +43427,8 @@ impl Docxy {
                         d.hover(|d| d.bg(rgb(accent::brand())).text_color(rgb(FILE_FG)))
                     })
                     .child(item.display)
+                    // The harness's `bs-rail:<name>` (#2195).
+                    .child(probe(&self.probes, backstage_rail_probe(item.id)))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.backstage_rail_action(action, window, cx)
                     })),

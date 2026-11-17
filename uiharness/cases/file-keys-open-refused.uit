@@ -1,0 +1,31 @@
+# Open in a harness instance off Windows (#1141, #2195): its picker could not
+# be answered there (macOS shows it inside the verb that asked, which would
+# stop the control pump), so every Open path refuses in words. On Windows a
+# harness opens the real picker instead: open-picker-windows.uit.
+os linux macos
+
+test ctrl+f12 refuses Open in a harness and the app stays responsive
+  open copy:../fixtures/basic.docx
+  key ctrl+f12
+  assert status is A harness instance cannot open the Open dialog; use the harness open verb
+  type x
+  assert dirty is true
+
+test ctrl+f12 refuses Open on a workbook and a project
+  open copy:../fixtures/basic.xlsx
+  key ctrl+f12
+  assert status is A harness instance cannot open the Open dialog; use the harness open verb
+  open copy:../fixtures/schedule.xml
+  key ctrl+f12
+  assert status is A harness instance cannot open the Open dialog; use the harness open verb
+
+test the rail's open refuses in a harness and File stays open
+  open copy:../fixtures/basic.docx
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:open"}
+  assert status is A harness instance cannot open the Open dialog; use the harness open verb
+  call backstage {"action":"read"}
+  assert reply.open is true
+  call backstage {"action":"close"}
+  type x
+  assert dirty is true

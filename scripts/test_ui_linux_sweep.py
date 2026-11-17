@@ -2,7 +2,9 @@
 
     python3 -m unittest discover -s scripts -p 'test_*.py' -v
 """
+import contextlib
 import importlib.util
+import io
 from pathlib import Path
 import tempfile
 import unittest
@@ -92,6 +94,26 @@ class ScriptCases(unittest.TestCase):
         self.assertEqual(
             sweep.script_plugins((sweep.CASES / 'project-plugin.uit').read_text(encoding='utf-8')),
             ['yppx_fixture'])
+
+    def test_reads_the_os_line_a_script_starts_with(self):
+        self.assertEqual(sweep.script_os('# w\nos windows  # only\ntest t\n'), ['windows'])
+        self.assertEqual(sweep.script_os('OS Linux macos\ntest t\n'), ['linux', 'macos'])
+        self.assertIsNone(sweep.script_os('test t\n  open x.xlsx\n'))
+        self.assertIsNone(sweep.script_os('test t\nos windows\n'),
+                          'only a line before the first case names systems')
+        self.assertEqual(sweep.platform_os('win32'), 'windows')
+        self.assertEqual(sweep.platform_os('linux'), 'linux')
+        self.assertEqual(sweep.platform_os('darwin'), 'macos')
+        windows_only = 'os windows\ntest t\n  open x.xlsx\n'
+        self.assertTrue(sweep.runs_on(windows_only, 'win32'))
+        self.assertFalse(sweep.runs_on(windows_only, 'linux'))
+        self.assertFalse(sweep.runs_on(windows_only, 'darwin'))
+        self.assertTrue(sweep.runs_on('test t\n  open x.xlsx\n', 'linux'))
+        # The committed scripts that name systems (#2195).
+        picker = (sweep.CASES / 'open-picker-windows.uit').read_text(encoding='utf-8')
+        self.assertEqual(sweep.script_os(picker), ['windows'])
+        refused = (sweep.CASES / 'file-keys-open-refused.uit').read_text(encoding='utf-8')
+        self.assertEqual(sweep.script_os(refused), ['linux', 'macos'])
 
     def test_every_committed_script_declares_cases(self):
         for path in sorted(sweep.CASES.glob('*.uit')):
@@ -255,6 +277,39 @@ class Table(unittest.TestCase):
         text = sweep.table(rs)
         self.assertIn('timed out', text)
         self.assertTrue(text.endswith('3 scripts: 1 pass, 1 xfail, 0 fail, 0 xpass, 1 error\n'))
+
+    def test_skipped_scripts_are_counted_and_say_why(self):
+        rs = [sweep.Result('a.uit', sweep.PASS),
+              sweep.skipped('w.uit', 'os windows\ntest t\n  open x.xlsx\n')]
+        self.assertEqual(rs[1].status, sweep.SKIP)
+        text = sweep.table(rs)
+        self.assertIn('os windows', text)
+        self.assertTrue(text.endswith(
+            '2 scripts: 1 pass, 0 xfail, 0 fail, 0 xpass, 0 error, 1 skipped\n'))
+
+
+class SkipRun(unittest.TestCase):
+    """A script for another system is skipped before anything is launched or
+    looked for (#2195): no suite, no run directory of its own, exit 0."""
+
+    def test_a_script_for_another_system_is_skipped_and_passes_the_run(self):
+        other = 'linux' if sweep.platform_os(sweep.sys.platform) == 'windows' else 'windows'
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            script = d / 'elsewhere.uit'
+            script.write_text(f'os {other}\ntest t\n  open x.xlsx\n', encoding='utf-8')
+            fake = d / 'uiharness'
+            fake.write_text('', encoding='utf-8')
+            run = d / 'run'
+            with contextlib.redirect_stdout(io.StringIO()) as printed:
+                code = sweep.main([str(script), '--uiharness', str(fake),
+                                   '--suite', str(d / 'no-suite'), '--run', str(run)])
+            self.assertIn('SKIP  os ' + other, printed.getvalue())
+            self.assertEqual(code, 0)
+            summary = sweep.json.loads((run / 'summary.json').read_text(encoding='utf-8'))
+            self.assertEqual([(r['script'], r['status']) for r in summary],
+                             [('elsewhere.uit', sweep.SKIP)])
+            self.assertFalse((run / 'elsewhere').exists())
 
 
 class ScriptCommandTests(unittest.TestCase):
