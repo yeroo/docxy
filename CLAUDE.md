@@ -10,6 +10,11 @@ sections are exactly the `KEPT` list in that script.
 
 ## How work is done (every machine, every session)
 
+- **Wind-down (owner, 2026-11-17): file no new follow-up or leftovers issues.** The project is
+  finishing a short final list. Fix a minor finding in the same PR when it is small and in scope.
+  Otherwise list it under "Not done" in the PR body and drop it. No `Leftovers from` issue, no
+  `follow-up` issue, and no new issue for a split, unless the PR cannot merge without it. Issues
+  labelled `parked` are out of scope: never pick them up or reopen them.
 - Read `docs/WORKFLOW.md` before starting an issue. In short: one issue → one `issue-<n>-*` branch → one
   PR merged by `merge-check`, through agworkbench.
 - Before starting an issue, skip it if it has the `in-progress` label, a **Grabbed** comment, a PR or a
