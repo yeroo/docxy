@@ -1436,10 +1436,16 @@ pub enum SyncEvent {
     /// a client that showed the sign-in under way shows this again.
     SavedSignInUnavailable(String),
     /// Sign-in began; the UI opens `authorize_url` in the system browser.
+    /// One `SignIn` may send two (#2218): when the sign-in asking
+    /// `AuthConfig::scope` and `AuthConfig::optional_scope` is refused for
+    /// consent, a second follows, asking `AuthConfig::scope` alone, with no
+    /// `Error` for the first refusal.
     SignInStarted { authorize_url: String },
     /// The scopes the signed-in token was granted (#1875), as the token
-    /// response spelled them, and the scopes of `AuthConfig::scope` it lacks
-    /// ([`crate::auth::missing_scopes`]: case-insensitive, without the
+    /// response spelled them, and the scopes of `AuthConfig::scope` and
+    /// `AuthConfig::optional_scope` it lacks (#2218;
+    /// [`crate::auth::sign_in_scope`] given to
+    /// [`crate::auth::missing_scopes`]: case-insensitive, without the
     /// `https://graph.microsoft.com/` prefix, never `offline_access`,
     /// `openid`, `profile`, `email` or a `.default` scope). Sent after the
     /// token is loaded at startup, refreshed or redeemed at sign-in, only
@@ -1451,9 +1457,11 @@ pub enum SyncEvent {
     /// no scopes) sends nothing. A refresh never asks for a scope a known
     /// grant lacks while the grant shares a scope with `AuthConfig::scope`
     /// (otherwise it asks `AuthConfig::scope` in full:
-    /// [`crate::auth::refresh_scope`], #2164), so a scope added to
+    /// [`crate::auth::refresh_scope`], #2164), nor an optional scope the grant
+    /// lacks ([`crate::auth::refresh_scope_for`], #2218), so a scope added to
     /// `AuthConfig::scope` is missing until a token response names it, which
-    /// an interactive sign-in (asking `AuthConfig::scope` in full) does.
+    /// an interactive sign-in (asking [`crate::auth::sign_in_scope`] in full)
+    /// does unless it fell back for consent.
     Scopes {
         granted: Vec<String>,
         missing: Vec<String>,
@@ -9897,23 +9905,106 @@ impl Engine {
         }
     }
 
-    /// The interactive sign-in seam. Binds a loopback listener on
-    /// `127.0.0.1:0` FIRST so the OS-assigned port can be baked into the
-    /// `redirect_uri` handed to `begin_auth` — there's no race between
-    /// emitting `SignInStarted` (which the UI reacts to by opening the
-    /// browser) and the listener being ready to accept the redirect, because
-    /// the bind happens before either. `listen_for_code` then blocks (with a
-    /// timeout) for the browser to land on that port; once it returns a code,
-    /// the redeem + cache-save + resync path runs unchanged from Task 11.
+    /// The interactive sign-in seam: at most two attempts
+    /// ([`Engine::sign_in_attempt`]). The first asks
+    /// [`auth::sign_in_scope`] (`AuthConfig::scope` and
+    /// `AuthConfig::optional_scope`). When it is refused for consent (the
+    /// redirect's or the code redemption's, [`auth::is_consent_refusal`])
+    /// and the optional scopes add a scope, the second asks
+    /// `AuthConfig::scope` alone, with no `Error` for the first refusal
+    /// (#2218). A token from either runs the redeem + cache-save + resync
+    /// path unchanged from Task 11; any other failure, or the second
+    /// attempt's, is `Error("sign-in failed: …")` and
+    /// [`Engine::sign_in_failed`].
     fn sign_in(&mut self) {
+        let full = auth::sign_in_scope(&self.config.cfg);
+        let mut attempt = self.sign_in_attempt(&full);
+        if let SignInAttempt::Failed { consent: true, .. } = attempt
+            && full != self.config.cfg.scope
+        {
+            let required = self.config.cfg.scope.clone();
+            attempt = self.sign_in_attempt(&required);
+        }
+        let t = match attempt {
+            SignInAttempt::Signed(t) => t,
+            SignInAttempt::NotStarted => {
+                self.sign_in_not_started();
+                return;
+            }
+            SignInAttempt::Failed { text, .. } => {
+                // A timeout, a malformed redirect, a state mismatch, the
+                // provider reporting `?error=...`, or a refused redemption.
+                // None of them are secrets, so the message is safe to
+                // surface as-is. `sign_in_failed` lets the UI offer another
+                // attempt rather than leaving the engine silently stuck:
+                // sign-in-required again, or, while a saved sign-in waits
+                // for its store (#2167), that wait announced again.
+                self.emit(SyncEvent::Error(format!("sign-in failed: {text}")));
+                self.sign_in_failed();
+                return;
+            }
+        };
+
+        // The account may have another mailbox than the one that
+        // filled the store (#1946: `prompt=select_account`): its
+        // check is owed before anything is drained or synced, and
+        // owed in the store before the token is saved, so a check
+        // that fails, or a process that exits first, is made at
+        // the next start. A store that cannot record it still holds
+        // the check in memory for this run.
+        if let Err(e) = self.store.set_mailbox_check_owed() {
+            self.emit(SyncEvent::Error(format!(
+                "cannot record the mailbox check: {e}"
+            )));
+        }
+        self.mailbox_unchecked = true;
+        self.check_retry = None;
+        self.check_backoff = BACKOFF_MIN;
+        if let Ok(storage) = self.save_token(&t) {
+            self.note_storage(storage);
+        }
+        self.token = Some(t);
+        // The saved sign-in that waited for its store (#2167) is
+        // replaced by this one.
+        self.saved_unavailable = None;
+        self.drop_size_fill();
+        self.drop_type_fill();
+        self.announce_scopes();
+        self.clear_backoff();
+        // Emit an explicit past-sign-in signal BEFORE the first sync
+        // pass. If that pass fails transiently it only emits `Offline`
+        // (never `Idle`/`FoldersUpdated`), and the UI clears the
+        // sign-in modal on any non-`SignInRequired` state — so this
+        // `Syncing` guarantees the modal clears the moment auth
+        // succeeded, rather than staying stuck if the first sync fails.
+        self.set_state(SyncState::Syncing);
+        self.sync_pass(true);
+        self.refresh_if_calendar_reset_owed();
+        self.after_pass_if_fast();
+    }
+
+    /// One `/authorize` round trip asking `scope` (#2218). Binds a loopback
+    /// listener on `127.0.0.1:0` FIRST so the OS-assigned port can be baked
+    /// into the `redirect_uri` handed to `begin_auth_with_scope` — there's
+    /// no race between emitting `SignInStarted` (which the UI reacts to by
+    /// opening the browser) and the listener being ready to accept the
+    /// redirect, because the bind happens before either. `listen_for_code`
+    /// then blocks (with a timeout) for the browser to land on that port,
+    /// and the code is redeemed asking the same `scope`. Each attempt binds
+    /// its own listener, dropped when it returns: after an error page the
+    /// browser may ask the port for `/favicon.ico` or open a connection it
+    /// never uses, which a shared listener would take for the next
+    /// attempt's redirect. A listener that cannot be opened emits its
+    /// `Error` here and is [`SignInAttempt::NotStarted`]; a failure after
+    /// `SignInStarted` emits nothing.
+    fn sign_in_attempt(&mut self, scope: &str) -> SignInAttempt {
         let listener = match TcpListener::bind("127.0.0.1:0") {
             Ok(l) => l,
             Err(e) => {
                 self.emit(SyncEvent::Error(format!(
                     "could not open sign-in listener: {e}"
                 )));
-                self.sign_in_not_started();
-                return;
+                return SignInAttempt::NotStarted;
             }
         };
         let port = match listener.local_addr() {
@@ -9922,8 +10013,7 @@ impl Engine {
                 self.emit(SyncEvent::Error(format!(
                     "could not read sign-in listener port: {e}"
                 )));
-                self.sign_in_not_started();
-                return;
+                return SignInAttempt::NotStarted;
             }
         };
         // The redirect host must be `localhost`, NOT `127.0.0.1`: Entra matches
@@ -9935,69 +10025,25 @@ impl Engine {
         // `localhost` to the loopback address (falling back across ::1/127.0.0.1
         // as needed). This mirrors what the Azure CLI and `mgc` do.
         let redirect_uri = format!("http://localhost:{port}");
-        let req = auth::begin_auth(&self.config.cfg, &redirect_uri);
+        let req = auth::begin_auth_with_scope(&self.config.cfg, &redirect_uri, scope);
         self.emit(SyncEvent::SignInStarted {
             authorize_url: req.authorize_url.clone(),
         });
-
         let code = match listen_for_code(&listener, &req.state) {
             Ok(code) => code,
-            Err(e) => {
-                // A timeout, a malformed redirect, a state mismatch, or the
-                // provider reporting `?error=...` all land here. None of
-                // them are secrets, so the message is safe to surface as-is.
-                // `sign_in_failed` lets the UI offer another attempt rather
-                // than leaving the engine silently stuck: sign-in-required
-                // again, or, while a saved sign-in waits for its store
-                // (#2167), that wait announced again.
-                self.emit(SyncEvent::Error(format!("sign-in failed: {e}")));
-                self.sign_in_failed();
-                return;
+            Err(f) => {
+                return SignInAttempt::Failed {
+                    text: f.message,
+                    consent: f.consent,
+                };
             }
         };
         match auth::redeem_code(&self.config.cfg, &self.config.auth_base, &req, &code) {
-            Ok(t) => {
-                // The account may have another mailbox than the one that
-                // filled the store (#1946: `prompt=select_account`): its
-                // check is owed before anything is drained or synced, and
-                // owed in the store before the token is saved, so a check
-                // that fails, or a process that exits first, is made at
-                // the next start. A store that cannot record it still holds
-                // the check in memory for this run.
-                if let Err(e) = self.store.set_mailbox_check_owed() {
-                    self.emit(SyncEvent::Error(format!(
-                        "cannot record the mailbox check: {e}"
-                    )));
-                }
-                self.mailbox_unchecked = true;
-                self.check_retry = None;
-                self.check_backoff = BACKOFF_MIN;
-                if let Ok(storage) = self.save_token(&t) {
-                    self.note_storage(storage);
-                }
-                self.token = Some(t);
-                // The saved sign-in that waited for its store (#2167) is
-                // replaced by this one.
-                self.saved_unavailable = None;
-                self.drop_size_fill();
-                self.drop_type_fill();
-                self.announce_scopes();
-                self.clear_backoff();
-                // Emit an explicit past-sign-in signal BEFORE the first sync
-                // pass. If that pass fails transiently it only emits `Offline`
-                // (never `Idle`/`FoldersUpdated`), and the UI clears the
-                // sign-in modal on any non-`SignInRequired` state — so this
-                // `Syncing` guarantees the modal clears the moment auth
-                // succeeded, rather than staying stuck if the first sync fails.
-                self.set_state(SyncState::Syncing);
-                self.sync_pass(true);
-                self.refresh_if_calendar_reset_owed();
-                self.after_pass_if_fast();
-            }
-            Err(e) => {
-                self.emit(SyncEvent::Error(format!("sign-in failed: {e}")));
-                self.sign_in_failed();
-            }
+            Ok(t) => SignInAttempt::Signed(t),
+            Err(e) => SignInAttempt::Failed {
+                text: e.to_string(),
+                consent: e.consent_refused(),
+            },
         }
     }
 
@@ -10206,7 +10252,9 @@ impl Engine {
             return;
         }
         self.announced_scopes = Some(set);
-        let missing = auth::missing_scopes(&self.config.cfg.scope, &granted);
+        // Against everything a sign-in asks (#2218): `scope` and
+        // `optional_scope`.
+        let missing = auth::missing_scopes(&auth::sign_in_scope(&self.config.cfg), &granted);
         self.emit(SyncEvent::Scopes { granted, missing });
     }
 
@@ -10349,22 +10397,72 @@ const SIGNIN_ERROR_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-
 /// Uses a non-blocking `accept` polled against a deadline rather than a
 /// dedicated timeout API (std's `TcpListener` has none) — simple, and the
 /// listener is only ever used for this one accept.
-fn listen_for_code(listener: &TcpListener, expected_state: &str) -> Result<String, String> {
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| format!("could not configure sign-in listener: {e}"))?;
+fn listen_for_code(
+    listener: &TcpListener,
+    expected_state: &str,
+) -> Result<String, RedirectFailure> {
+    listener.set_nonblocking(true).map_err(|e| {
+        RedirectFailure::other(format!("could not configure sign-in listener: {e}"))
+    })?;
     let deadline = Instant::now() + SIGNIN_TIMEOUT;
     loop {
         match listener.accept() {
             Ok((stream, _addr)) => return handle_redirect(stream, expected_state),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if Instant::now() >= deadline {
-                    return Err("timed out waiting for the browser to complete sign-in".to_string());
+                    return Err(RedirectFailure::other(
+                        "timed out waiting for the browser to complete sign-in",
+                    ));
                 }
                 thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(format!("sign-in listener accept failed: {e}")),
+            Err(e) => {
+                return Err(RedirectFailure::other(format!(
+                    "sign-in listener accept failed: {e}"
+                )));
+            }
         }
+    }
+}
+
+/// One `/authorize` attempt's outcome ([`Engine::sign_in_attempt`], #2218).
+enum SignInAttempt {
+    /// The code was redeemed.
+    Signed(auth::TokenSet),
+    /// No loopback listener: its `Error` is already sent, and no
+    /// `SignInStarted`.
+    NotStarted,
+    /// The redirect or the redemption failed: the text for
+    /// `Error("sign-in failed: …")`, and whether it was a refusal for
+    /// consent ([`auth::is_consent_refusal`]).
+    Failed { text: String, consent: bool },
+}
+
+/// Why [`listen_for_code`] / [`handle_redirect`] returned no code: the
+/// diagnostic text (see [`listen_for_code`]), and whether the redirect was
+/// refused for consent (#2218): only a redirect whose `state` matched,
+/// carrying an `error` that [`auth::is_consent_refusal`] holds for. A
+/// timeout, a malformed request, a state mismatch or a missing code never
+/// is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RedirectFailure {
+    message: String,
+    consent: bool,
+}
+
+impl RedirectFailure {
+    /// A failure that is not a refusal for consent.
+    fn other(message: impl Into<String>) -> RedirectFailure {
+        RedirectFailure {
+            message: message.into(),
+            consent: false,
+        }
+    }
+}
+
+impl std::fmt::Display for RedirectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
     }
 }
 
@@ -10437,16 +10535,17 @@ fn read_request_line(
 /// Reads the HTTP request line off one accepted loopback connection, pulls
 /// `code`/`state` (or `error`) out of its query string, writes back a small
 /// HTML page, and returns the code (or an error — see [`listen_for_code`]).
-fn handle_redirect(stream: TcpStream, expected_state: &str) -> Result<String, String> {
+fn handle_redirect(stream: TcpStream, expected_state: &str) -> Result<String, RedirectFailure> {
     let request_line = read_request_line(
         &stream,
         SIGNIN_REQUEST_LINE_MAX,
         Instant::now() + SIGNIN_READ_TIMEOUT,
-    )?;
+    )
+    .map_err(RedirectFailure::other)?;
     let path = request_line
         .split_whitespace()
         .nth(1)
-        .ok_or_else(|| "malformed redirect request".to_string())?;
+        .ok_or_else(|| RedirectFailure::other("malformed redirect request"))?;
     let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
     let params = parse_query(query);
 
@@ -10461,26 +10560,30 @@ fn handle_redirect(stream: TcpStream, expected_state: &str) -> Result<String, St
         // bare code) is shown only from the redirect that carries our
         // `state` (Entra echoes it on an error, RFC 6749 §4.1.2.1).
         if !state_matches {
-            return Err(if is_oauth_error_code(err) {
+            return Err(RedirectFailure::other(if is_oauth_error_code(err) {
                 format!("authorization denied: {err}")
             } else {
                 "authorization denied (redirect state did not match)".to_string()
-            });
+            }));
         }
+        // A refusal for consent (#2218) is read from the raw values: the
+        // engine may then sign in again without the optional scopes.
+        let consent = auth::is_consent_refusal(err, param("error_description").map(String::as_str));
         let err = one_line(err);
         let desc = param("error_description")
             .map(|d| one_line(d))
             .filter(|d| !d.is_empty());
-        return Err(match (err.is_empty(), desc) {
+        let message = match (err.is_empty(), desc) {
             (true, None) => "authorization denied".to_string(),
             (true, Some(desc)) => format!("authorization denied: {desc}"),
             (false, Some(desc)) => format!("authorization denied: {err}: {desc}"),
             (false, None) => format!("authorization denied: {err}"),
-        });
+        };
+        return Err(RedirectFailure { message, consent });
     }
     if !state_matches {
         write_html_response(stream, SIGNIN_ERROR_HTML);
-        return Err("redirect state did not match".to_string());
+        return Err(RedirectFailure::other("redirect state did not match"));
     }
     let Some(code) = params
         .iter()
@@ -10488,7 +10591,7 @@ fn handle_redirect(stream: TcpStream, expected_state: &str) -> Result<String, St
         .map(|(_, v)| v.clone())
     else {
         write_html_response(stream, SIGNIN_ERROR_HTML);
-        return Err("redirect had no authorization code".to_string());
+        return Err(RedirectFailure::other("redirect had no authorization code"));
     };
     write_html_response(stream, SIGNIN_SUCCESS_HTML);
     Ok(code)
@@ -10783,6 +10886,7 @@ mod tests {
             authority: "x/organizations".into(),
             client_id: "cid".into(),
             scope: "Mail.ReadWrite offline_access".into(),
+            optional_scope: String::new(),
         }
     }
 
@@ -17423,6 +17527,439 @@ mod tests {
         finish(handle, dir);
     }
 
+    // #2218: optional scopes and the consent fallback.
+
+    /// [`test_cfg`] with the people scopes as optional.
+    fn optional_cfg() -> AuthConfig {
+        AuthConfig {
+            optional_scope: "User.ReadBasic.All Presence.Read.All".into(),
+            ..test_cfg()
+        }
+    }
+
+    /// The redirect of a sign-in refused because nobody consented.
+    fn consent_required(state: &str) -> String {
+        format!(
+            "error=consent_required&error_description=AADSTS65001%3A+The+user+or+administrator+has+not+consented%0D%0ATrace+ID%3A+abc&state={state}"
+        )
+    }
+
+    /// The redirect of a sign-in whose consent screen the person declined.
+    fn consent_declined(state: &str) -> String {
+        format!(
+            "error=access_denied&error_description=AADSTS65004%3A+User+declined+to+consent+to+access+the+app.&state={state}"
+        )
+    }
+
+    fn code_redirect(state: &str) -> String {
+        format!("code=THECODE&state={state}")
+    }
+
+    /// The grant of a sign-in that went without the optional scopes.
+    const REQUIRED_GRANT: &str = "https://graph.microsoft.com/Mail.ReadWrite offline_access";
+
+    fn granted_token(scope: &str) -> Route {
+        token_route(&format!(
+            r#"{{"access_token":"AT","refresh_token":"RT","expires_in":3600,"scope":"{scope}"}}"#
+        ))
+    }
+
+    const REDEEM_REFUSED_FOR_CONSENT: &str = r#"{"error":"invalid_grant","error_description":"AADSTS65001: The user or administrator has not consented to use the application."}"#;
+
+    /// An engine on `srv` with `cfg`, signed out, after its first
+    /// `SignInRequired`.
+    fn signed_out_engine(
+        tag: &str,
+        srv: &FakeServer,
+        cfg: AuthConfig,
+    ) -> (SyncHandle, PathBuf, PathBuf) {
+        let dir = unique_dir(tag);
+        let token_path = dir.join("token.bin");
+        let handle = spawn_with_bases(
+            dir.join("mail.db"),
+            token_path.clone(),
+            cfg,
+            3650,
+            srv.base_url.clone(),
+            srv.base_url.clone(),
+            Duration::from_secs(3600),
+        );
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        (handle, dir, token_path)
+    }
+
+    fn sign_in_errors(events: &[SyncEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                SyncEvent::Error(m) if m.starts_with("sign-in failed") => Some(m.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sign_ins_started(events: &[SyncEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, SyncEvent::SignInStarted { .. }))
+            .count()
+    }
+
+    /// The events that arrive within `budget`.
+    fn events_within(rx: &Receiver<SyncEvent>, budget: Duration) -> Vec<SyncEvent> {
+        let deadline = Instant::now() + budget;
+        let mut seen = Vec::new();
+        while let Ok(ev) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            seen.push(ev);
+        }
+        seen
+    }
+
+    /// The full sign-in refused with `refusal`: a second `/authorize`
+    /// asking `scope` alone, no `Error` for the first, signed in with the
+    /// optional scopes reported missing, and a pass.
+    fn falls_back_after(tag: &str, refusal: fn(&str) -> String) {
+        let srv = FakeServer::start(with_probe(
+            vec![granted_token(REQUIRED_GRANT), empty_folders_route(200)],
+            "ROOT",
+        ));
+        let cfg = optional_cfg();
+        let (handle, dir, token_path) = signed_out_engine(tag, &srv, cfg.clone());
+        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+        let first = play_sign_in_started(&handle, refusal);
+        assert_eq!(first.started.scope, auth::sign_in_scope(&cfg));
+        assert_eq!(
+            first.started.scope,
+            "Mail.ReadWrite offline_access User.ReadBasic.All Presence.Read.All"
+        );
+        assert!(first.response.to_lowercase().contains("failed"));
+        let second = play_sign_in_started(&handle, code_redirect);
+        assert_eq!(second.started.scope, cfg.scope);
+        assert_ne!(second.started.state, first.started.state);
+        assert!(
+            !second
+                .started
+                .events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::Error(_) | SyncEvent::SignInRequired { .. })),
+            "{:?}",
+            second.started.events
+        );
+        assert!(second.response.to_lowercase().contains("close this tab"));
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(sign_in_errors(&events).is_empty(), "{events:?}");
+        assert_eq!(
+            scopes_events(&events),
+            vec![(
+                strings(&REQUIRED_GRANT.split(' ').collect::<Vec<_>>()),
+                strings(&["User.ReadBasic.All", "Presence.Read.All"])
+            )],
+            "{events:?}"
+        );
+        // The redemption asked what the second `/authorize` asked.
+        assert_eq!(asked_scopes(&srv), vec![cfg.scope.clone()]);
+        assert_eq!(saved_access_token(&token_path), "AT");
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn consent_refusal_falls_back_to_the_required_scope() {
+        falls_back_after("optional-consent-required", consent_required);
+    }
+
+    #[test]
+    fn declined_consent_falls_back_too() {
+        falls_back_after("optional-consent-declined", consent_declined);
+    }
+
+    #[test]
+    fn a_redeem_refused_for_consent_falls_back() {
+        let srv = FakeServer::start_limited(with_probe_limited(
+            vec![
+                (token_failure(400, REDEEM_REFUSED_FOR_CONSENT), Some(1)),
+                (granted_token(REQUIRED_GRANT), None),
+                (empty_folders_route(200), None),
+            ],
+            "ROOT",
+        ));
+        let cfg = optional_cfg();
+        let (handle, dir, token_path) = signed_out_engine("optional-redeem", &srv, cfg.clone());
+        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+        let first = play_sign_in_started(&handle, code_redirect);
+        let second = play_sign_in_started(&handle, code_redirect);
+        assert_eq!(first.started.scope, auth::sign_in_scope(&cfg));
+        assert_eq!(second.started.scope, cfg.scope);
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        let all: Vec<SyncEvent> = second.started.events.into_iter().chain(events).collect();
+        assert!(sign_in_errors(&all).is_empty(), "{all:?}");
+        assert_eq!(token_requests(&srv), 2);
+        assert_eq!(
+            asked_scopes(&srv),
+            vec![auth::sign_in_scope(&cfg), cfg.scope.clone()]
+        );
+        assert_eq!(saved_access_token(&token_path), "AT");
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn a_refused_fallback_signs_in_failed() {
+        let srv = FakeServer::start(vec![granted_token(REQUIRED_GRANT)]);
+        let cfg = optional_cfg();
+        let (handle, dir, token_path) = signed_out_engine("optional-refused-twice", &srv, cfg);
+        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+        let first = play_sign_in_started(&handle, consent_required);
+        let second = play_sign_in_started(&handle, consent_declined);
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        let all: Vec<SyncEvent> = first
+            .started
+            .events
+            .into_iter()
+            .chain(second.started.events)
+            .chain(events.iter().cloned())
+            .collect();
+        assert_eq!(sign_ins_started(&all), 2, "{all:?}");
+        // One `Error`, the second refusal's, after the second `SignInStarted`.
+        assert_eq!(
+            sign_in_errors(&events),
+            vec![
+                "sign-in failed: authorization denied: access_denied: AADSTS65004: User declined to consent to access the app.".to_string()
+            ],
+            "{events:?}"
+        );
+        assert_eq!(signin_reasons(&events), vec![SignInReason::SignInFailed]);
+        assert_eq!(token_requests(&srv), 0);
+        assert!(tokencache::load(&token_path).unwrap().is_none());
+        let later = events_within(&handle.evt_rx, Duration::from_millis(300));
+        assert_eq!(sign_ins_started(&later), 0, "{later:?}");
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn a_stray_request_after_the_consent_refusal_does_not_end_the_fallback() {
+        let srv = FakeServer::start(with_probe(
+            vec![granted_token(REQUIRED_GRANT), empty_folders_route(200)],
+            "ROOT",
+        ));
+        let (handle, dir, token_path) = signed_out_engine("optional-stray", &srv, optional_cfg());
+        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+        let first = play_sign_in_started(&handle, consent_required);
+        let second = next_sign_in_started(&handle);
+        assert_ne!(second.port(), first.started.port());
+        // The browser asks the first port for its favicon after the error
+        // page: refused, as that listener is gone.
+        if let Ok(mut stray) = TcpStream::connect(("127.0.0.1", first.started.port())) {
+            let _ = stray.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n");
+        }
+        let response = land_on(&second, code_redirect);
+        assert!(response.to_lowercase().contains("close this tab"));
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(sign_in_errors(&events).is_empty(), "{events:?}");
+        assert_eq!(saved_access_token(&token_path), "AT");
+        finish(handle, dir);
+    }
+
+    /// Sends `SignIn`, lands on its one `SignInStarted` with `query`, and
+    /// checks it ends in `SignInFailed` with no second `SignInStarted`.
+    fn fails_without_fallback(handle: &SyncHandle, query: impl Fn(&str) -> String) -> String {
+        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+        play_sign_in_started(handle, query);
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        assert_eq!(sign_ins_started(&events), 0, "{events:?}");
+        assert_eq!(signin_reasons(&events), vec![SignInReason::SignInFailed]);
+        let errors = sign_in_errors(&events);
+        assert_eq!(errors.len(), 1, "{events:?}");
+        errors[0].clone()
+    }
+
+    #[test]
+    fn no_fallback_without_optional_scope() {
+        let srv = FakeServer::start(vec![token_failure(400, REDEEM_REFUSED_FOR_CONSENT)]);
+        let cfg = AuthConfig {
+            // Blank, or only scopes `scope` names: nothing to leave out.
+            optional_scope: "  MAIL.READWRITE https://graph.microsoft.com/Mail.ReadWrite ".into(),
+            ..test_cfg()
+        };
+        let (handle, dir, token_path) = signed_out_engine("optional-none", &srv, cfg);
+        // Refused for consent at the redirect, then at the redemption.
+        fails_without_fallback(&handle, consent_required);
+        assert_eq!(token_requests(&srv), 0);
+        fails_without_fallback(&handle, code_redirect);
+        assert_eq!(token_requests(&srv), 1);
+        assert_eq!(asked_scopes(&srv), vec![test_cfg().scope]);
+        assert!(tokencache::load(&token_path).unwrap().is_none());
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn no_fallback_for_other_refusals() {
+        let srv = FakeServer::start(vec![token_failure(
+            401,
+            r#"{"error":"invalid_client","error_description":"AADSTS7000218: The request body must contain client_assertion."}"#,
+        )]);
+        let (handle, dir, token_path) =
+            signed_out_engine("optional-other-refusals", &srv, optional_cfg());
+        // A person cancelling the account picker: a bare `access_denied`.
+        let e = fails_without_fallback(&handle, |state| {
+            format!("error=access_denied&error_description=the+user+cancelled&state={state}")
+        });
+        assert!(e.contains("access_denied"), "{e}");
+        // A consent refusal from a redirect that is not ours.
+        let e = fails_without_fallback(&handle, |_| consent_required("wrong-state"));
+        assert_eq!(e, "sign-in failed: authorization denied: consent_required");
+        // A refused client at the redemption.
+        let e = fails_without_fallback(&handle, code_redirect);
+        assert!(e.contains("AADSTS7000218"), "{e}");
+        assert_eq!(token_requests(&srv), 1);
+        assert!(tokencache::load(&token_path).unwrap().is_none());
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn a_sign_in_without_refusal_makes_one_authorize() {
+        let everything = "https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/User.ReadBasic.All https://graph.microsoft.com/Presence.Read.All offline_access";
+        let srv = FakeServer::start(with_probe(
+            vec![granted_token(everything), empty_folders_route(200)],
+            "ROOT",
+        ));
+        let cfg = optional_cfg();
+        let (handle, dir, _) = signed_out_engine("optional-granted", &srv, cfg.clone());
+        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+        let played = play_sign_in_started(&handle, code_redirect);
+        assert_eq!(played.started.scope, auth::sign_in_scope(&cfg));
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert_eq!(sign_ins_started(&events), 0, "{events:?}");
+        assert_eq!(
+            scopes_events(&events),
+            vec![(
+                strings(&everything.split(' ').collect::<Vec<_>>()),
+                Vec::new()
+            )]
+        );
+        assert_eq!(asked_scopes(&srv), vec![auth::sign_in_scope(&cfg)]);
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn a_sign_in_without_the_optional_scopes_never_refreshes_asking_them() {
+        // The first pass's folder list is refused once: the engine refreshes.
+        let srv = FakeServer::start_limited(with_probe_limited(
+            vec![
+                (empty_folders_route(401), Some(1)),
+                (granted_token(REQUIRED_GRANT), None),
+                (empty_folders_route(200), None),
+            ],
+            "ROOT",
+        ));
+        let cfg = optional_cfg();
+        let (handle, dir, _) = signed_out_engine("optional-refresh", &srv, cfg.clone());
+        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+        play_sign_in_started(&handle, consent_required);
+        play_sign_in_started(&handle, code_redirect);
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        let asked = asked_scopes(&srv);
+        assert_eq!(
+            asked,
+            vec![cfg.scope.clone(), cfg.scope.clone()],
+            "{asked:?}"
+        );
+        assert_eq!(
+            srv.requests()
+                .iter()
+                .filter_map(|r| r.form_value("grant_type"))
+                .collect::<Vec<_>>(),
+            vec!["authorization_code", "refresh_token"]
+        );
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn an_unknown_grant_refreshes_asking_scope_alone() {
+        let cfg = optional_cfg();
+        let (events, dir, handle, srv) = startup_events(
+            "optional-unknown-grant",
+            vec![
+                (
+                    token_route(r#"{"access_token":"AT2","expires_in":3600}"#),
+                    None,
+                ),
+                (empty_folders_route(200), None),
+            ],
+            cfg.clone(),
+            |p| {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                let t = TokenSet {
+                    access_token: "AT".into(),
+                    refresh_token: "RT".into(),
+                    expires_at_unix: now + 10,
+                    account: "me@epam.com".into(),
+                    scopes: None,
+                };
+                tokencache::save(p, &t).unwrap();
+            },
+        );
+        assert_eq!(asked_scopes(&srv), vec![cfg.scope.clone()]);
+        assert!(scopes_events(&events).is_empty(), "{events:?}");
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn startup_reports_missing_optional_scopes() {
+        let (events, dir, handle, _srv) = startup_events(
+            "optional-startup",
+            vec![(empty_folders_route(200), None)],
+            optional_cfg(),
+            |p| seed_token_with_scopes(p, 3600, SEEDED),
+        );
+        assert_eq!(
+            scopes_events(&events),
+            vec![(
+                strings(SEEDED),
+                strings(&["User.ReadBasic.All", "Presence.Read.All"])
+            )],
+            "{events:?}"
+        );
+        finish(handle, dir);
+    }
+
+    /// `handle_redirect`'s failure over a real loopback connection (#2218).
+    fn redirect_failure(query: &str, expected_state: &str) -> RedirectFailure {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .write_all(format!("GET /?{query} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .unwrap();
+        let (stream, _addr) = listener.accept().unwrap();
+        let result = handle_redirect(stream, expected_state);
+        drop(client);
+        result.expect_err("no code")
+    }
+
+    #[test]
+    fn handle_redirect_marks_only_consent_refusals() {
+        assert!(redirect_failure(&consent_required("S"), "S").consent);
+        let declined = redirect_failure(&consent_declined("S"), "S");
+        assert!(declined.consent);
+        assert_eq!(
+            declined.to_string(),
+            "authorization denied: access_denied: AADSTS65004: User declined to consent to access the app."
+        );
+        assert!(!redirect_failure(&consent_declined("S"), "other").consent);
+        assert!(!redirect_failure(&consent_required("S"), "other").consent);
+        assert!(!redirect_failure("error=access_denied&state=S", "S").consent);
+        assert!(!redirect_failure("state=S", "S").consent);
+        assert!(!redirect_failure("code=C&state=other", "S").consent);
+    }
+
     /// `handle_redirect` over a real loopback connection that sends
     /// `GET /?<query>`.
     fn redirect_result(query: &str, expected_state: &str) -> Result<String, String> {
@@ -17433,7 +17970,7 @@ mod tests {
             .write_all(format!("GET /?{query} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
             .unwrap();
         let (stream, _addr) = listener.accept().unwrap();
-        let result = handle_redirect(stream, expected_state);
+        let result = handle_redirect(stream, expected_state).map_err(|f| f.message);
         drop(client);
         result
     }
@@ -17587,16 +18124,39 @@ mod tests {
         redirect_query: impl Fn(&str) -> String,
     ) -> (String, String) {
         handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+        let played = play_sign_in_started(handle, redirect_query);
+        (played.started.redirect_uri, played.response)
+    }
+
+    /// One `SignInStarted`, its URL's query read (#2218).
+    struct Started {
+        /// The events up to and including the `SignInStarted`.
+        events: Vec<SyncEvent>,
+        /// What its `/authorize` asks (`scope`).
+        scope: String,
+        redirect_uri: String,
+        state: String,
+    }
+
+    impl Started {
+        /// The loopback port of its `redirect_uri`.
+        fn port(&self) -> u16 {
+            self.redirect_uri
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse().ok())
+                .expect("redirect_uri ends with the loopback port")
+        }
+    }
+
+    /// Waits for the next `SignInStarted` (sending nothing).
+    fn next_sign_in_started(handle: &SyncHandle) -> Started {
         let events = wait_for(&handle.evt_rx, |e| {
             matches!(e, SyncEvent::SignInStarted { .. })
         });
-        let authorize_url = events
-            .iter()
-            .find_map(|e| match e {
-                SyncEvent::SignInStarted { authorize_url } => Some(authorize_url.clone()),
-                _ => None,
-            })
-            .expect("SignInStarted carries the authorize_url");
+        let Some(SyncEvent::SignInStarted { authorize_url }) = events.last() else {
+            panic!("{events:?}");
+        };
         let query = authorize_url.split_once('?').map(|(_, q)| q).unwrap_or("");
         let params = parse_query(query);
         let param = |name: &str| {
@@ -17606,21 +18166,44 @@ mod tests {
                 .map(|(_, v)| v.clone())
                 .unwrap_or_else(|| panic!("authorize_url carries {name}"))
         };
-        let (redirect_uri, state) = (param("redirect_uri"), param("state"));
-        let port: u16 = redirect_uri
-            .rsplit(':')
-            .next()
-            .and_then(|p| p.parse().ok())
-            .expect("redirect_uri ends with the loopback port");
-        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connect to loopback");
+        Started {
+            scope: param("scope"),
+            redirect_uri: param("redirect_uri"),
+            state: param("state"),
+            events,
+        }
+    }
+
+    /// Plays the browser for `started`: lands on its `redirect_uri` at
+    /// `/?<query(state)>` and returns the listener's response.
+    fn land_on(started: &Started, redirect_query: impl Fn(&str) -> String) -> String {
+        let mut client =
+            TcpStream::connect(("127.0.0.1", started.port())).expect("connect to loopback");
         let request = format!(
             "GET /?{} HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            redirect_query(&state)
+            redirect_query(&started.state)
         );
         client.write_all(request.as_bytes()).unwrap();
         let mut response = String::new();
         client.read_to_string(&mut response).unwrap();
-        (redirect_uri, response)
+        response
+    }
+
+    /// A `SignInStarted` played as the browser ([`play_sign_in_started`]).
+    struct Played {
+        started: Started,
+        response: String,
+    }
+
+    /// Waits for the next `SignInStarted` (sending nothing) and lands on its
+    /// `redirect_uri` with `query(state)` (#2218).
+    fn play_sign_in_started(
+        handle: &SyncHandle,
+        redirect_query: impl Fn(&str) -> String,
+    ) -> Played {
+        let started = next_sign_in_started(handle);
+        let response = land_on(&started, redirect_query);
+        Played { started, response }
     }
 
     #[test]
