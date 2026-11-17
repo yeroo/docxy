@@ -1797,6 +1797,8 @@ impl Render for DocView {
             inks: None,
             // Its pictures' painted bounds, for the harness (#1963).
             pictures: harness().then_some(&self.pictures_painted),
+            siblings: None,
+            block_gap: 0.0,
         };
         let scroll_area = match self.layout {
             DocLayout::Print => {
@@ -1844,6 +1846,7 @@ impl Render for DocView {
                     .map(|(i, b)| {
                         let ctx = RenderCtx {
                             gap_below: flow_gap_below(body, i),
+                            siblings: Some(body),
                             ..ctx
                         };
                         block_el(b, vec![i], markers[i].as_deref(), ctx)
@@ -2512,11 +2515,65 @@ pub(crate) fn painted_layout_json(paras: &[PaintedPara], column_x: f32) -> ctlco
             let fits = marker.as_ref().map_or(Json::Null, |(_, _, right)| {
                 Json::Bool(text_x.is_some_and(|t| right.round() <= t.round()))
             });
+            // Its text row and border sides (#2231), from the paragraph's
+            // top, the text column's left; each border's `gap` is its space
+            // to the text (below it for `bottom`, above for `top`).
+            let text = para.text.get();
+            let (text_top, text_bottom) = (
+                f32::from(text.origin.y),
+                f32::from(text.origin.y + text.size.height),
+            );
+            let has_text = f32::from(text.size.height) > 0.0;
+            let borders = para
+                .borders
+                .iter()
+                .map(|b| {
+                    let at = b.at.get();
+                    let (x, y) = (f32::from(at.origin.x), f32::from(at.origin.y));
+                    let gap = match b.side {
+                        "bottom" => y - text_bottom,
+                        "top" => text_top - (y + b.width),
+                        _ => 0.0,
+                    };
+                    Json::obj(vec![
+                        ("side", Json::Str(b.side.into())),
+                        ("x", num(x - column_x)),
+                        ("y", num(y - f32::from(root.origin.y))),
+                        (
+                            "width",
+                            Json::Num((f64::from(b.width) * 100.).round() / 100.),
+                        ),
+                        ("gap", num(gap)),
+                        ("color", Json::Str(format!("{:06x}", b.color))),
+                    ])
+                })
+                .collect();
+            let highlights = para
+                .highlights
+                .iter()
+                .map(|(text, fill, ink)| {
+                    Json::obj(vec![
+                        ("text", Json::Str(text.clone())),
+                        ("fill", Json::Str(format!("{fill:06x}"))),
+                        ("ink", Json::Str(format!("{ink:06x}"))),
+                    ])
+                })
+                .collect();
             Json::obj(vec![
                 ("block", Json::Num(para.block as f64)),
                 ("top", num(top)),
                 ("height", num(f32::from(root.size.height))),
                 ("text_x", text_x.map_or(Json::Null, num)),
+                (
+                    "text_bottom",
+                    if has_text {
+                        num(text_bottom - f32::from(root.origin.y))
+                    } else {
+                        Json::Null
+                    },
+                ),
+                ("borders", Json::Arr(borders)),
+                ("highlights", Json::Arr(highlights)),
                 (
                     "marker",
                     marker.map_or(Json::Null, |(m, x, right)| {
@@ -2526,6 +2583,12 @@ pub(crate) fn painted_layout_json(paras: &[PaintedPara], column_x: f32) -> ctlco
                             ("right", num(right)),
                             ("size", num(m.size)),
                             ("color", Json::Str(ink_hex(m.ink))),
+                            (
+                                "family",
+                                m.family
+                                    .as_ref()
+                                    .map_or(Json::Null, |f| Json::Str(f.to_string())),
+                            ),
                         ])
                     }),
                 ),
@@ -3243,6 +3306,7 @@ mod tests {
                     size: 16.,
                     ink,
                     at: at(122., 128., 13., 18.),
+                    family: None,
                 }),
                 runs: vec![PaintedRun {
                     off: 0,
@@ -3252,6 +3316,9 @@ mod tests {
                     text: "Item one wraps".into(),
                 }],
                 words,
+                text: UnitCell::default(),
+                borders: Vec::new(),
+                highlights: Vec::new(),
             },
             PaintedPara {
                 block: 1,
@@ -3259,6 +3326,9 @@ mod tests {
                 marker: None,
                 runs: Vec::new(),
                 words: WordSpans::default(),
+                text: UnitCell::default(),
+                borders: Vec::new(),
+                highlights: Vec::new(),
             },
         ];
         let j = painted_layout_json(&paras, 100.);

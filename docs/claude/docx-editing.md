@@ -42,10 +42,29 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   indents an older build left out, as `ensure_list` does. Every host's
   Increase/Decrease Indent runs it (terminal `docxy` and `docxwasm` before
   the edit, re-parsing the numbering; the suite after an indent that made
-  a step: Shift+Tab, Ctrl+M, the ribbon/KeyTips act, Repeat; the suite
-  draws an item with no left of its own at its level from `ilvl`, so there
-  it is for the saved file). Not an undo step; nothing repairs at load.
-- The suite's `eff_indent` adds the level step `ilvl × 300` only to a list
+  a step: Shift+Tab, Ctrl+M, the ribbon/KeyTips act, Repeat). Not an undo
+  step; nothing repairs at load.
+- The suite's `eff_indent(p, Inherited)` (#2231) draws each of a
+  paragraph's left and first line from the first that gives it: its own
+  (`has_direct_left_indent`, `has_direct_first_line`: nonzero, or loaded or
+  pinned, a 0 included); for a list item, its level's `w:ind` where the
+  package's numbering part defines it (`Numbering::level_indent`), else for
+  docxy's own lists (numId 1 and 2, `add_markdown_numbering`/`blank_base`;
+  9990/9991, `ensure_list`) that no part defines yet what saving writes
+  (`package::own_list_level_indent`: 720·(ilvl+1), hanging 360), so a list
+  draws the same in session and after a reload; then the paragraph style
+  chain in twips (`style_left_twips`, `style_first_line`; a nonzero
+  character count is not drawn), list or not. `Inherited::NONE` (no styles
+  or numbering) is the rule below. An inherited left takes no level step,
+  so the ruler does not clamp at it. A ruler move that leaves a list item's
+  first line 0 pins `w:firstLine="0"` (`Editor::pin_zero_first_lines`,
+  `ParProps::pin_first_line`), or the level's hang would come back. Every
+  importer (HTML, RTF, PDF: `import::pin_list_indents` in
+  `Builder::finish`) pins its list items' left and first line, so their 0
+  is a value and no level or style reaches them, in any package. Not done:
+  numbering through a style's `numPr` only, the level's `w:rPr` (its
+  Symbol bullet) and `lvlJc`.
+- With nothing inherited, `eff_indent` adds the level step `ilvl × 300` only to a list
   item with no left indent of its own: an explicit numId 0 takes none, nor
   does an item with a direct left (`ParProps::has_direct_left_indent`:
   `indent > 0` or a loaded `w:left`, a `w:left="0"` pin included). A

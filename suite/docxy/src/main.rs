@@ -10817,6 +10817,13 @@ struct RenderCtx<'a> {
     /// Where each top-level paragraph's inline pictures are painted, for
     /// the harness (#1963); `None` records none.
     pictures: Option<&'a PaintedPictures>,
+    /// The blocks this block lies among (the body, a cell's), by its path's
+    /// last index: a bordered paragraph joins its neighbours' box (#2231).
+    /// `None` draws each paragraph's borders alone.
+    siblings: Option<&'a [Block]>,
+    /// The gap (px) the container puts between its blocks (Print Layout's
+    /// column), which a joined border box spans (#2231).
+    block_gap: f32,
 }
 
 /// An inline picture of a top-level paragraph as last painted (#1963): its
@@ -10886,6 +10893,22 @@ struct PaintedPara {
     marker: Option<PaintedMarker>,
     runs: Vec<PaintedRun>,
     words: WordSpans,
+    /// Its text row's bounds (#2231).
+    text: UnitCell,
+    /// Its border sides as drawn (#2231).
+    borders: Vec<PaintedBorder>,
+    /// Its highlighted runs: text, fill and ink, `0xRRGGBB` (#2231).
+    highlights: Vec<(String, u32, u32)>,
+}
+
+/// A paragraph border side as last painted (#2231): `top`, `left`,
+/// `bottom` or `right`, its line width (px), colour and painted bounds.
+#[derive(Clone)]
+struct PaintedBorder {
+    side: &'static str,
+    width: f32,
+    color: u32,
+    at: UnitCell,
 }
 
 #[derive(Clone)]
@@ -10894,6 +10917,8 @@ struct PaintedMarker {
     size: f32,
     ink: Hsla,
     at: UnitCell,
+    /// The family it is drawn in, when its mark names one (#2231).
+    family: Option<SharedString>,
 }
 
 #[derive(Clone)]
@@ -10978,6 +11003,135 @@ struct FlowPara<'a> {
     /// Where its inline pictures' painted bounds go, under its block
     /// (#1963).
     pictures: Option<(&'a PaintedPictures, usize)>,
+    /// Whether it shares a border box with the paragraph before or after it
+    /// (#2231).
+    group: BorderGroup,
+}
+
+/// A bordered paragraph's place in a run of paragraphs with the same
+/// borders and indents, which Word draws as one box (#2231): `prev` /
+/// `next`, whether the paragraph before / after it belongs to the same box;
+/// `gap`, the px the container puts between blocks, which the box spans.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct BorderGroup {
+    prev: bool,
+    next: bool,
+    gap: f32,
+}
+
+/// What decides whether two paragraphs share a border box: their borders
+/// as shown and their left and right indents as drawn. `None` for a
+/// paragraph without borders, which joins nothing.
+type BorderKey = Option<(docxcore::model::ParBorders, i32, i32)>;
+
+/// [`BorderGroup`] of a paragraph keyed `cur` between `prev` and `next`
+/// (`None` for no paragraph there): each joins when its key equals `cur`'s
+/// and `cur` has borders.
+fn border_group(prev: BorderKey, cur: BorderKey, next: BorderKey, gap: f32) -> BorderGroup {
+    let joins = |o: BorderKey| cur.is_some() && o == cur;
+    BorderGroup {
+        prev: joins(prev),
+        next: joins(next),
+        gap,
+    }
+}
+
+/// The sides a paragraph draws in its group (#2231): the box's top on its
+/// first paragraph and `w:between` above every later one, its bottom on its
+/// last only, its left and right on each.
+fn drawn_sides(
+    b: &docxcore::model::ParBorders,
+    g: BorderGroup,
+) -> [(&'static str, Option<docxcore::model::ParBorder>); 4] {
+    [
+        ("top", if g.prev { b.between } else { b.top }),
+        ("left", b.left),
+        ("bottom", if g.next { None } else { b.bottom }),
+        ("right", b.right),
+    ]
+}
+
+/// A border side's line width and its gap to the text, px at `zoom`:
+/// `w:sz` eighths of a point (at least 1 px) and `w:space` points.
+fn border_px(b: &docxcore::model::ParBorder, zoom: f32) -> (f32, f32) {
+    let pt = 96.0 / 72.0 * zoom;
+    (
+        (f32::from(b.sz) / 8.0 * pt).max(1.0),
+        f32::from(b.space) * pt,
+    )
+}
+
+#[cfg(test)]
+mod border_group_tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use docxcore::model::{BorderKind, ParBorder, ParBorders};
+
+    fn boxed() -> ParBorders {
+        ParBorders {
+            top: Some(ParBorder::rule(BorderKind::Single)),
+            left: Some(ParBorder::rule(BorderKind::Single)),
+            bottom: Some(ParBorder::rule(BorderKind::Double)),
+            right: Some(ParBorder::rule(BorderKind::Single)),
+            between: Some(ParBorder::rule(BorderKind::Dashed)),
+        }
+    }
+
+    #[test]
+    fn paragraphs_with_the_same_borders_and_indents_share_one_box() {
+        let k = Some((boxed(), 0, 0));
+        let other = Some((boxed(), 360, 0));
+        let g = border_group(None, k, k, 4.0);
+        assert_eq!((g.prev, g.next, g.gap), (false, true, 4.0));
+        assert_eq!(
+            border_group(k, k, k, 0.0),
+            BorderGroup {
+                prev: true,
+                next: true,
+                gap: 0.0
+            }
+        );
+        // Another indent, or no borders, is another box.
+        assert_eq!(border_group(other, k, None, 0.0), BorderGroup::default());
+        assert_eq!(border_group(None, None, None, 0.0), BorderGroup::default());
+        assert!(!border_group(None, None, None, 0.0).next);
+        let kinds = |g| drawn_sides(&boxed(), g).map(|(side, b)| (side, b.map(|b| b.kind)));
+        use BorderKind::*;
+        // First: top, sides, no bottom; middle: between, sides; last: bottom.
+        assert_eq!(
+            kinds(border_group(None, k, k, 0.0)),
+            [
+                ("top", Some(Single)),
+                ("left", Some(Single)),
+                ("bottom", None),
+                ("right", Some(Single))
+            ]
+        );
+        assert_eq!(kinds(border_group(k, k, k, 0.0))[0], ("top", Some(Dashed)));
+        assert_eq!(
+            kinds(border_group(k, k, None, 0.0))[2],
+            ("bottom", Some(Double))
+        );
+        // A lone paragraph draws all four.
+        assert_eq!(kinds(BorderGroup::default())[0], ("top", Some(Single)));
+    }
+
+    #[test]
+    fn a_borders_width_and_space_are_points() {
+        let title = ParBorder {
+            sz: 8,
+            space: 4,
+            ..ParBorder::rule(BorderKind::Single)
+        };
+        let (w, space) = border_px(&title, 1.0);
+        assert!((w - 1.3333).abs() < 1e-3 && (space - 5.3333).abs() < 1e-3);
+        let hair = ParBorder {
+            sz: 2,
+            ..ParBorder::rule(BorderKind::Single)
+        };
+        assert_eq!(border_px(&hair, 1.0).0, 1.0, "at least a pixel");
+        assert!((border_px(&title, 2.0).1 - 10.6667).abs() < 1e-3);
+    }
 }
 
 /// A canvas filling its (relative) parent that takes its bounds at prepaint.
@@ -38319,6 +38473,7 @@ fn paragraph_el(
     );
     let mut painted_runs: Vec<PaintedRun> = Vec::new();
     let mut painted_marker: Option<PaintedMarker> = None;
+    let mut painted_highlights: Vec<(String, u32, u32)> = Vec::new();
     let mut spans: Vec<AnyElement> = Vec::new();
     let mut idx = 0usize;
 
@@ -38454,6 +38609,7 @@ fn paragraph_el(
                         size: look.size,
                         ink: look.ink,
                         at: at.clone(),
+                        family: look.family.clone(),
                     });
                     bounds_probe(at)
                 });
@@ -38532,6 +38688,11 @@ fn paragraph_el(
                             ink,
                             ground,
                         });
+                    }
+                }
+                if flow.record.is_some() && !r.text.trim().is_empty() {
+                    if let Some((fill, ink)) = run_highlight(&shown, &pal) {
+                        painted_highlights.push((r.text.clone(), fill, ink));
                     }
                 }
                 if flow.record.is_some() {
@@ -38833,7 +38994,6 @@ fn paragraph_el(
                 .into_any_element(),
         );
     }
-    let has_border = p.props.borders.bottom.is_some();
     let mut row = h_flex()
         .w_full()
         .flex_wrap()
@@ -38859,6 +39019,92 @@ fn paragraph_el(
     // Space before / after the paragraph (`w:spacing` before/after, twips → px).
     let sp_before = zoom * (p.props.spacing.before.unwrap_or(0).max(0) as f32) / 15.0;
     let sp_after = zoom * (p.props.spacing.after.unwrap_or(0).max(0) as f32) / 15.0;
+    // A fully spaced paragraph in the flow view has only its own spacing
+    // (#1986); others keep 2 px where theirs gives none.
+    let space_top = if sp_before > 0.5 {
+        sp_before
+    } else {
+        pbox.pad_y
+    };
+    let space_bottom = if sp_after > 0.5 { sp_after } else { pbox.pad_y };
+    // Its borders (#2231): the style chain's under its own, each side drawn
+    // at its width, `w:space` from the text, in its colour (a theme colour
+    // resolved; mapped on a dark page as table borders are). A run of
+    // paragraphs with the same borders and indents is one box: the box's
+    // top on the first, `w:between` above each later one, its bottom on the
+    // last, the spacing between them inside it.
+    let group = flow.group;
+    let borders = styler.sheet.map_or(p.props.borders, |s| {
+        s.effective_borders(p.props.style_id.as_deref(), p.props.borders)
+    });
+    let sides = drawn_sides(&borders, group);
+    let boxed = sides.iter().any(|(_, b)| b.is_some()) || group.prev || group.next;
+    let mut painted_borders: Vec<PaintedBorder> = Vec::new();
+    let text_probe = flow.record.map(|_| UnitCell::default());
+    let row = match lines {
+        // Numbered (Print Layout): the canvas overlays the row, anchored
+        // to it, and paints the margin numbers in the same frame.
+        Some(slot) => row
+            .relative()
+            .children(spans)
+            .child(line_number_canvas(slot, base, line_h, pad, zoom, pal)),
+        None => row.relative().children(spans),
+    }
+    .when_some(text_probe.clone(), |d, cell| d.child(bounds_probe(cell)));
+    let body = if boxed {
+        let gap_below = if flow.gap_below { 4.0 } else { 0.0 };
+        let mut pad_side = [0.0f32; 4];
+        let mut strips: Vec<AnyElement> = Vec::new();
+        for (i, (side, b)) in sides.iter().enumerate() {
+            let Some(b) = b else { continue };
+            let (w, space) = border_px(b, zoom);
+            pad_side[i] = w + space;
+            let color = rgb_u(pal.border_ink(b.shown_color(styler.colors), pal.ground));
+            let at = flow.record.map(|_| UnitCell::default());
+            if let Some(at) = &at {
+                painted_borders.push(PaintedBorder {
+                    side,
+                    width: w,
+                    color,
+                    at: at.clone(),
+                });
+            }
+            let strip = div().absolute().bg(rgb(color));
+            let strip = match *side {
+                "top" => strip.top_0().left_0().right_0().h(px(w)),
+                "bottom" => strip.bottom_0().left_0().right_0().h(px(w)),
+                "left" => strip.top_0().bottom_0().left_0().w(px(w)),
+                _ => strip.top_0().bottom_0().right_0().w(px(w)),
+            };
+            strips.push(
+                strip
+                    .when_some(at, |d, cell| d.child(bounds_probe(cell)))
+                    .into_any_element(),
+            );
+        }
+        let [top, left, bottom, right] = pad_side;
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            // Left and right sit outside the text by their space.
+            .ml(px(-left))
+            .mr(px(-right))
+            .pl(px(left))
+            .pr(px(right))
+            .pt(px(top + if group.prev { space_top } else { 0.0 }))
+            .pb(px(bottom
+                + if group.next {
+                    space_bottom + gap_below + group.gap
+                } else {
+                    0.0
+                }))
+            .child(row)
+            .children(strips)
+            .into_any_element()
+    } else {
+        row.into_any_element()
+    };
     // The harness's record of this paragraph (#1986): its box's bounds.
     let root_probe = flow.record.map(|(paras, block)| {
         let root = UnitCell::default();
@@ -38868,30 +39114,24 @@ fn paragraph_el(
             marker: painted_marker.take(),
             runs: std::mem::take(&mut painted_runs),
             words: click.map(|c| c.words.clone()).unwrap_or_default(),
+            text: text_probe.clone().unwrap_or_default(),
+            borders: std::mem::take(&mut painted_borders),
+            highlights: std::mem::take(&mut painted_highlights),
         });
         bounds_probe(root)
     });
     v_flex()
         .w_full()
-        // A fully spaced paragraph in the flow view has only its own
-        // spacing (#1986); others keep 2 px where theirs gives none.
-        .pt(px(if sp_before > 0.5 {
-            sp_before
-        } else {
-            pbox.pad_y
-        }))
-        .pb(px(if sp_after > 0.5 { sp_after } else { pbox.pad_y }))
+        // Joined to the paragraph above or below (#2231), the spacing
+        // between them is inside the box.
+        .pt(px(if group.prev { 0.0 } else { space_top }))
+        .pb(px(if group.next { 0.0 } else { space_bottom }))
         .pl(px(pad))
         .pr(px(pad_r))
-        .when(pbox.heading_mt, |d| d.mt_2())
-        .when(flow.gap_below, |d| d.mb(px(4.)))
-        // The rule carries no colour of its own: an automatic border, the
-        // ink, or on a dark page the visible mid grey (#2079).
-        .when(has_border, |d| {
-            d.border_b_1()
-                .border_color(pal.border_ink(None, pal.ground))
-                .pb_1()
-        })
+        .when(pbox.heading_mt && !group.prev, |d| d.mt_2())
+        .when(flow.gap_below && !group.next, |d| d.mb(px(4.)))
+        // The container's gap, which the box spans, is taken back.
+        .when(group.next && group.gap > 0.0, |d| d.mb(px(-group.gap)))
         .when_some(click, |d, c| {
             let ent = c.ent.clone();
             let path = c.path.to_vec();
@@ -38929,15 +39169,7 @@ fn paragraph_el(
                     }
                 })
         })
-        .child(match lines {
-            // Numbered (Print Layout): the canvas overlays the row, anchored
-            // to it, and paints the margin numbers in the same frame.
-            Some(slot) => row
-                .relative()
-                .children(spans)
-                .child(line_number_canvas(slot, base, line_h, pad, zoom, pal)),
-            None => row.children(spans),
-        })
+        .child(body)
         .when_some(overlay, |d, o| d.relative().child(o))
         .when_some(root_probe, |d, probe| d.relative().child(probe))
         .into_any_element()
@@ -39078,6 +39310,8 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                 cell_run: Some(&cb.run),
                 // A nested table fits its cell when this one was fitted.
                 fit_width: fit.map(|_| text_w),
+                siblings: Some(&cell.blocks),
+                block_gap: 0.0,
                 ..ctx
             };
             let inner: Vec<AnyElement> = if cb.continues {
@@ -39377,6 +39611,38 @@ fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -
     block_el_numbered(b, path, marker, ctx, None)
 }
 
+/// [`BorderGroup`] of `p` at `path` among `ctx.siblings` (#2231).
+fn paragraph_border_group(p: &Paragraph, path: &[usize], ctx: RenderCtx) -> BorderGroup {
+    let sheet = ctx.tbl.sheet.as_deref();
+    let numbering = ctx.tbl.numbering.as_deref();
+    let key = |q: &Paragraph| -> BorderKey {
+        let b = sheet.map_or(q.props.borders, |s| {
+            s.effective_borders(q.props.style_id.as_deref(), q.props.borders)
+        });
+        b.any().then(|| {
+            let e = eff_indent(&q.props, Inherited::of(&q.props, sheet, numbering));
+            (b, e.left, e.right)
+        })
+    };
+    let cur = key(p);
+    let (Some(sib), Some(&k)) = (ctx.siblings, path.last()) else {
+        return BorderGroup::default();
+    };
+    if cur.is_none() {
+        return BorderGroup::default();
+    }
+    let at = |j: Option<usize>| match j.and_then(|j| sib.get(j)) {
+        Some(Block::Paragraph(q)) => key(q),
+        _ => None,
+    };
+    border_group(
+        at(k.checked_sub(1)),
+        cur,
+        at(k.checked_add(1)),
+        ctx.block_gap,
+    )
+}
+
 /// `block_el` for a Print Layout band, where a numbered top-level paragraph
 /// carries its line-number slot; tables, header/footer paragraphs and every
 /// other caller pass `None` and stay unnumbered (#746).
@@ -39473,6 +39739,7 @@ fn block_el_numbered(
                 ctx.pics,
                 ctx.page_vals,
                 FlowPara {
+                    group: paragraph_border_group(p, &path, ctx),
                     flow: ctx.flow,
                     gap_below: top && ctx.gap_below,
                     record: ctx
@@ -45448,12 +45715,15 @@ impl Render for Docxy {
                         // The flow branch below fits its tables (#1895).
                         fit_width: None,
                         tables: Some(&painted_tables),
-                        // The flow branch below sets these (#1986).
+                        // The flow branch below sets these (#1986); Print
+                        // Layout records its paragraphs too (#2231).
                         flow: false,
                         gap_below: false,
-                        paras: None,
+                        paras: doc_view::harness().then_some(&painted_paras),
                         inks: doc_view::harness().then_some(&painted_inks),
                         pictures: None,
+                        siblings: None,
+                        block_gap: 0.0,
                     };
                     let body = &shown.body;
                     if self.page_view {
@@ -45684,6 +45954,8 @@ impl Render for Docxy {
                                     // (#2079).
                                     inks: doc_view::harness().then_some(&painted_inks),
                                     pictures: None,
+                                    siblings: None,
+                                    block_gap: 0.0,
                                 });
                                 // One region's margin content for this page: the live
                                 // editor blocks (editable on the edit page, read-only on
@@ -46138,6 +46410,7 @@ impl Render for Docxy {
                             fit_width: used_w,
                             flow: true,
                             paras: doc_view::harness().then_some(&painted_paras),
+                            siblings: Some(body),
                             ..ctx
                         };
                         // The column puts 4 px between blocks as each

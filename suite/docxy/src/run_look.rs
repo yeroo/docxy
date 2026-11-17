@@ -109,18 +109,6 @@ pub struct DocParts {
     pub colors: Option<Rc<ThemeColors>>,
 }
 
-impl DocParts {
-    /// A styler over these parts, for no table cell or paragraph style yet.
-    pub fn styler(&self) -> RunStyler<'_> {
-        RunStyler {
-            sheet: self.sheet.as_deref(),
-            numbering: self.numbering.as_deref(),
-            colors: self.colors.as_deref(),
-            ..Default::default()
-        }
-    }
-}
-
 impl Cache {
     /// The styles text and sheet of `pkg`; `None`s without a package or part.
     pub fn current(&mut self, pkg: Option<&Package>) -> (Option<Arc<str>>, Option<Rc<StyleSheet>>) {

@@ -37,7 +37,8 @@ issue number to find its notes.
   scroll (#1895), Print Layout's y-only caret follow (#2080), the flow view drawing an
   imported mail: exact spacing and line height, list numbers in the mark's look, the
   layout dump (#1986), nested tables widening their fitted cells and wide pictures
-  scaled to the room (#1963).
+  scaled to the room (#1963), list level and style indents drawn, the
+  importers' pinned list indents (#2231).
 - `docs/claude/suite-document.md`: before changing the suite's document tab: save-as
   names (#807), Home Font / Font Size boxes (#1361), File > Info Properties (#1364), the
   comment editor (#1362), inline pictures (#1432), run styles (#1427), font substitution
@@ -46,7 +47,8 @@ issue number to find its notes.
   sideways scroll (#2080), Word's dark mode for the document and View >
   Switch Modes (#2079), the Find bar's keys, clicks and the one-line fields'
   shared key map (#2116), unnamed runs in the document's theme font and a
-  family with a real bold face (#1972).
+  family with a real bold face (#1972), dark-page highlights, paragraph
+  borders and their grouping, Segoe UI's substitutes (#2231).
 - `docs/claude/pdf-export.md`: before changing PDF export: embedded fonts (#1508),
   borders, picture watermarks and unequal columns (#797).
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),

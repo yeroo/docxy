@@ -3046,6 +3046,7 @@ fn live_doc_state(app: &crate::Docxy, _window: &Window) -> Result<Json, String> 
         fields.push(("ruler".into(), ruler_state(app)));
         fields.push(("line_numbers".into(), line_numbers_state(app)));
         fields.push(("flow".into(), flow_state(app)));
+        fields.push(("page".into(), page_state(app)));
         fields.push(("scroll".into(), scroll_state(app)));
         // The page the document last drew on (#2079): Word's dark mode
         // (`dark`) or not (`light`), its colour (Print Layout's sheet, Web
@@ -3217,6 +3218,21 @@ fn flow_state(app: &crate::Docxy) -> Json {
             },
         ),
     ])
+}
+
+/// Print Layout's paragraphs as last painted (#2231), as `flow.layout`
+/// reports the flow view's: x from the first page's text column, each
+/// paragraph's marker, lines, highlighted runs and border sides; `null`
+/// in a flow view or before Print Layout has drawn.
+fn page_state(app: &crate::Docxy) -> Json {
+    let probe = app.ruler_probe.borrow();
+    let layout = match (probe.draft, text_column(&probe)) {
+        (false, Some((x, _))) => {
+            crate::doc_view::painted_layout_json(&app.painted_paras.borrow(), x)
+        }
+        _ => Json::Null,
+    };
+    Json::obj(vec![("layout", layout)])
 }
 
 /// The text column a document tab drew its body in (#1922), its x and
