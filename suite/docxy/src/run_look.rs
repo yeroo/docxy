@@ -1,11 +1,14 @@
 //! How the document view draws a run (#1427): its direct formatting over the
 //! character style, the paragraph style and the table style around it, as
-//! Word lays them (`StyleSheet::shown_run`).
+//! Word lays them (`StyleSheet::shown_run`). A run that none of them gives a
+//! family is drawn in the document's own font (`StyleSheet::doc_font`, theme
+//! fonts resolved: #1972).
 
 use docxcore::model::{Run, RunProps};
 use docxcore::package::Package;
 use docxcore::styles::{StyleSheet, parse_styles_xml};
 use docxcore::table_styles::RunLook;
+use docxcore::theme::parse_theme_fonts;
 use std::borrow::Cow;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -26,8 +29,21 @@ impl<'a> RunStyler<'a> {
         RunStyler { pstyle, ..self }
     }
 
-    /// `r` as drawn.
+    /// `r` as drawn: its styles below it, and the document's font
+    /// ([`StyleSheet::doc_font`]) when none of them names a family (#1972).
     pub fn shown<'r>(&self, r: &'r Run) -> Cow<'r, RunProps> {
+        let shown = self.styled(r);
+        match self.sheet.and_then(StyleSheet::doc_font) {
+            Some(family) if shown.font.is_none() => {
+                let mut props = shown.into_owned();
+                props.font = Some(family.to_string());
+                Cow::Owned(props)
+            }
+            _ => shown,
+        }
+    }
+
+    fn styled<'r>(&self, r: &'r Run) -> Cow<'r, RunProps> {
         match self.sheet {
             // Nothing lies below it: the run is its own.
             Some(_)
@@ -58,13 +74,15 @@ pub fn run_size_px(props: &RunProps, base: f32, zoom: f32) -> f32 {
         .map_or(base, |h| zoom * h as f32 / 2.0 * 1.333)
 }
 
-/// A tab's parsed `word/styles.xml`, kept across frames. It is read again
-/// only when the package's parts moved ([`Package::parts_stamp`]) and the
-/// styles part is not the text already held, so a body edit parses nothing.
+/// A tab's parsed `word/styles.xml`, its theme fonts applied (#1972), kept
+/// across frames. It is read again only when the package's parts moved
+/// ([`Package::parts_stamp`]) and the styles or the theme part is not the
+/// text already held, so a body edit parses nothing.
 #[derive(Default)]
 pub struct Cache {
     stamp: Option<u64>,
     xml: Option<Arc<str>>,
+    theme: Option<Arc<str>>,
     sheet: Option<Rc<StyleSheet>>,
     /// How often the part was parsed.
     #[cfg(test)]
@@ -77,6 +95,7 @@ impl Cache {
         let Some(pkg) = pkg else {
             self.stamp = None;
             self.xml = None;
+            self.theme = None;
             self.sheet = None;
             return (None, None);
         };
@@ -86,13 +105,25 @@ impl Cache {
             let text = pkg
                 .part("word/styles.xml")
                 .and_then(|b| std::str::from_utf8(b).ok());
-            if self.xml.as_deref() != text {
+            let theme_name = pkg.theme_part_name();
+            let theme = theme_name
+                .as_deref()
+                .and_then(|n| pkg.part(n))
+                .and_then(|b| std::str::from_utf8(b).ok());
+            if self.xml.as_deref() != text || self.theme.as_deref() != theme {
                 self.xml = text.map(Arc::from);
+                self.theme = theme.map(Arc::from);
                 #[cfg(test)]
                 if text.is_some() {
                     self.parses += 1;
                 }
-                self.sheet = text.map(|t| Rc::new(parse_styles_xml(t)));
+                self.sheet = text.map(|t| {
+                    let mut sheet = parse_styles_xml(t);
+                    if let Some(theme) = theme {
+                        sheet.apply_theme_fonts(&parse_theme_fonts(theme));
+                    }
+                    Rc::new(sheet)
+                });
             }
         }
         (self.xml.clone(), self.sheet.clone())
@@ -188,5 +219,68 @@ mod tests {
         pkg.set_part("word/styles.xml", [STYLES, " "].concat().into_bytes());
         cache.current(Some(&pkg));
         assert_eq!(cache.parses, 2, "styles changed");
+    }
+
+    /// The owner's file (#1972): runs with only `w:b` in a paragraph with
+    /// no style, under `docDefaults` naming the theme's minor font.
+    #[test]
+    fn a_run_naming_no_font_is_drawn_in_the_documents_theme_font_1972() {
+        let mut pkg =
+            docxcore::package::load_package(&crate::ext_fixture::theme_font_docx()).expect("loads");
+        let mut cache = Cache::default();
+        let sheet = cache.current(Some(&pkg)).1.expect("a sheet");
+        let styler = RunStyler {
+            sheet: Some(&sheet),
+            ..Default::default()
+        };
+        let bold = Run {
+            text: "Strong".into(),
+            props: RunProps {
+                bold: true,
+                ..Default::default()
+            },
+        };
+        let shown = styler.shown(&bold);
+        assert!(shown.bold);
+        assert_eq!(shown.font.as_deref(), Some("Calibri"));
+        // A run's own family is kept.
+        let named = Run {
+            text: "x".into(),
+            props: RunProps {
+                font: Some("Georgia".into()),
+                ..Default::default()
+            },
+        };
+        assert!(matches!(styler.shown(&named), Cow::Borrowed(_)));
+        assert_eq!(styler.shown(&named).font.as_deref(), Some("Georgia"));
+        // A paragraph style naming no font still draws the document's.
+        let styled = styler.for_paragraph(Some("Normal"));
+        assert_eq!(styled.shown(&bold).font.as_deref(), Some("Calibri"));
+        // Another theme is read again, the styles text unchanged.
+        let parses = cache.parses;
+        assert!(
+            pkg.set_part(
+                "word/theme/theme1.xml",
+                crate::ext_fixture::THEME_FONT_THEME
+                    .replace("\"Calibri\"", "\"Cambria\"")
+                    .into_bytes(),
+            )
+        );
+        let sheet = cache.current(Some(&pkg)).1.expect("a sheet");
+        assert_eq!(cache.parses, parses + 1, "the theme changed");
+        assert_eq!(sheet.doc_font(), Some("Cambria"));
+        // Without the theme part the reference names nothing: today's look.
+        let mut bare = new_package(Document { body: vec![] });
+        bare.set_part(
+            "word/styles.xml",
+            crate::ext_fixture::THEME_FONT_STYLES.as_bytes().to_vec(),
+        );
+        let sheet = Cache::default().current(Some(&bare)).1.expect("a sheet");
+        let styler = RunStyler {
+            sheet: Some(&sheet),
+            ..Default::default()
+        };
+        assert_eq!(styler.shown(&bold).font, None);
+        assert!(matches!(styler.shown(&bold), Cow::Borrowed(_)));
     }
 }

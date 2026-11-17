@@ -197,12 +197,109 @@ fn layout_passes_after_the_first_make_no_gpui_lookups() {
     assert_eq!(after_first, r.probed.len() + r.probed_unlisted.len());
 }
 
+/// [`resolver`] asking `faces` for the styled faces of a family (#1972),
+/// counting faces probes in the returned counter.
+fn with_faces(
+    installed: &[&str],
+    broken: &[&str],
+    faces: &[(&str, bool, bool)],
+) -> (Resolver, Arc<AtomicUsize>) {
+    let (r, _) = resolver(installed, broken);
+    let asked = Arc::new(AtomicUsize::new(0));
+    let seen = asked.clone();
+    let faces: Vec<(String, Faces)> = faces
+        .iter()
+        .map(|&(n, bold, italic)| (n.to_string(), Faces { bold, italic }))
+        .collect();
+    let r = r.with_faces(move |name| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        faces
+            .iter()
+            .find(|(n, _)| n == name)
+            .map_or(Faces::default(), |(_, f)| *f)
+    });
+    (r, asked)
+}
+
+#[test]
+fn a_theme_font_with_no_bold_face_gives_the_document_a_ui_sans_with_one_1972() {
+    // Linux: the theme's `.SystemUIFont` resolves to Ubuntu, a variable font
+    // gpui loads as one regular face; Noto Sans has static bold and italic.
+    let (mut r, asked) = with_faces(
+        &[".SystemUIFont", "Ubuntu", "Noto Sans", "DejaVu Sans"],
+        &[".SystemUIFont"],
+        &[
+            ("Ubuntu", false, true),
+            ("Noto Sans", true, true),
+            ("DejaVu Sans", true, true),
+        ],
+    );
+    assert_eq!(
+        r.ui_family(".SystemUIFont"),
+        "Ubuntu",
+        "the UI keeps its font"
+    );
+    assert_eq!(r.doc_base_family(".SystemUIFont"), "Noto Sans");
+    // Asked once per family, then cached.
+    let after_first = asked.load(Ordering::SeqCst);
+    assert_eq!(after_first, 2, "Ubuntu, then Noto Sans");
+    for _ in 0..20 {
+        assert_eq!(r.doc_base_family(".SystemUIFont"), "Noto Sans");
+    }
+    assert_eq!(asked.load(Ordering::SeqCst), after_first);
+}
+
+#[test]
+fn a_ui_sans_with_bold_and_italic_beats_an_earlier_one_with_bold_only_1972() {
+    let (mut r, _) = with_faces(
+        &["Ubuntu", "Cantarell", "DejaVu Sans"],
+        &[],
+        &[
+            ("Ubuntu", false, false),
+            ("Cantarell", true, false),
+            ("DejaVu Sans", true, true),
+        ],
+    );
+    assert_eq!(r.doc_base_family("Ubuntu"), "DejaVu Sans");
+    let (mut r, _) = with_faces(
+        &["Ubuntu", "Cantarell"],
+        &[],
+        &[("Ubuntu", false, false), ("Cantarell", true, false)],
+    );
+    assert_eq!(r.doc_base_family("Ubuntu"), "Cantarell");
+}
+
+#[test]
+fn a_theme_font_with_a_bold_face_is_the_documents_too_1972() {
+    let (mut r, _) = with_faces(
+        &["Host Sans", "Noto Sans"],
+        &[],
+        &[("Host Sans", true, false), ("Noto Sans", true, true)],
+    );
+    assert_eq!(r.doc_base_family("Host Sans"), "Host Sans");
+}
+
+#[test]
+fn with_nothing_bold_to_load_the_document_keeps_the_theme_font_1972() {
+    let (mut r, asked) = with_faces(&["Ubuntu", "Noto Sans"], &[], &[]);
+    assert_eq!(r.doc_base_family("Ubuntu"), "Ubuntu");
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+    // A theme font nothing loads is never asked for its faces.
+    let (mut r, asked) = with_faces(&[".SystemUIFont"], &[".SystemUIFont"], &[]);
+    assert_eq!(r.doc_base_family(".SystemUIFont"), ".SystemUIFont");
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+    // Without a faces probe the document's font is the theme's.
+    let (mut r, _) = resolver(&["Ubuntu", "Noto Sans"], &[]);
+    assert_eq!(r.doc_base_family("Ubuntu"), "Ubuntu");
+}
+
 #[test]
 fn before_init_a_family_passes_through() {
     // No test builds an app, so the process-wide resolver is never set up.
     assert!(RESOLVER.get().is_none());
     assert_eq!(family("Segoe UI"), some("Segoe UI"));
     assert_eq!(ui_family(&".SystemUIFont".into()), ".SystemUIFont");
+    assert_eq!(doc_base_family(&".SystemUIFont".into()), ".SystemUIFont");
 }
 
 /// `line` without its `//` comment, trimmed.
@@ -361,11 +458,24 @@ fn every_family_reaching_gpui_is_resolved() {
             ".when_some(look.family.clone(), |d, f| d.font_family(f))",
             "family: mark.font.as_deref().and_then(font_subst::family),",
         ),
-        // DocView's root draws in the family its Measurer measures in.
+        // DocView's root and the main tab's views draw in the family their
+        // Measurer measures in (#1972).
         (
             "doc_view.rs",
-            ".font_family(ui_font)",
-            "let ui_font = crate::font_subst::ui_family(",
+            ".font_family(doc_font)",
+            "let doc_font = crate::doc_text_family(window);",
+        ),
+        (
+            "main.rs",
+            ".font_family(doc_font.clone())",
+            "let doc_font = doc_text_family(window);",
+        ),
+        // `Measurer::for_document` measures in the family it is handed,
+        // `doc_text_family`'s.
+        (
+            "main.rs",
+            "base.family = family;",
+            "font_subst::doc_base_family(&window.text_style().font().family)",
         ),
     ];
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

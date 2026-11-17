@@ -233,9 +233,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   drawn is unchanged, it just stops failing first. The mono family takes its
   substitutes or the mono list. macOS and Windows keep theirs.
 - The embedded `ext::DocView` (#1873) calls `font_subst::init` from
-  `DocView::new` and gives its root `.font_family(ui_family(inherited family))`
-  (whatever the host's ancestors set) without touching the host's theme;
-  `Measurer::new` resolves the same inherited family, so measured = drawn.
+  `DocView::new` and gives its root `.font_family(doc_text_family(window))`
+  (the inherited family, whatever the host's ancestors set, made loadable
+  and given a real bold face: #1972) without touching the host's theme;
+  `Measurer::for_document` measures in the same family, so measured = drawn.
 - Installed or not: one probe per name (`resolve_font` + `get_font_for_id`;
   gpui's `font_id` is private), since `TextSystem::all_font_names` lists
   gpui's own fallback stack whether installed or not. A substitute or generic
@@ -260,6 +261,53 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
 - Not done: a real platform-match tier (fontconfig `FcFontMatch`, CoreText,
   DirectWrite fallback) for unknown families; the generic serif/mono lists
   stand in.
+
+## Fonts of unnamed runs: the document font and real bold (#1972)
+
+- gpui's Linux text system (`gpui_wgpu`'s `CosmicTextSystem`) draws a run in
+  the nearest face of its family (`find_best_match`) and never synthesises
+  bold or italic. fontdb lists a variable font as one face, which gpui loads at
+  its default weight. The theme's sans here is Ubuntu (`Ubuntu[wdth,wght].ttf`),
+  so `w:b` on a run in it drew regular.
+- The document font: `docxcore::theme::parse_theme_fonts` reads the theme's
+  major and minor Latin typefaces, and `StyleSheet::apply_theme_fonts`
+  resolves `w:rFonts w:asciiTheme` (else `w:hAnsiTheme`) on the defaults and
+  on each style's own run properties before any `basedOn` folding. A
+  style's own theme reference beats its own `w:ascii`, a derived style's
+  `w:ascii` beats an inherited reference, and a reference the theme lacks
+  changes nothing. `StyleSheet::doc_font` is the default paragraph style over
+  `docDefaults`. `Package::theme_part_name` follows the document's theme
+  relationship, else `word/theme/theme1.xml`. `run_look::Cache` applies the
+  theme (it parses again when the styles or the theme text changes), and
+  `RunStyler::shown` fills `font` with `doc_font` when no style names one.
+  Every family consumer (`emit_words`, `width_in`, `shown_mark`) reads shown
+  props, so measured = drawn. `shown_run` still starts from nothing (#1427).
+  PDF export and terminal docxy never apply a theme and are unchanged.
+- Real bold for inherited text: `font_subst::doc_base_family` is the theme's
+  sans (`ui_family`) when it has a bold face of its own (the faces probe:
+  `resolve_font` at BOLD or Italic gives an id other than the regular one).
+  Otherwise it is the first `UI_SANS` family that loads with a bold and an
+  italic face, else one with a bold face. Here that is Noto Sans; on CI
+  (DejaVu Sans) nothing changes. `doc_text_family(window)` is the one value
+  for both a view's root `.font_family` and its `Measurer::for_document`:
+  the main tab's two `doc-scroll` roots (Web/Draft and Print Layout) and
+  `DocView`'s root. `Measurer::new` stays the UI measurer (ribbon fit,
+  dialogs, Project). Chrome keeps the theme font.
+- Harness: `ext-doc-word` and the main tab's `doc-word {"text"}` reply a
+  `face` (`doc_view::word_face_json`). Its fields are `bold` / `italic`
+  (the run as its styles show it), `bold_face` / `italic_face` (whether the
+  painted word's shaped `font_id` is its family's bold / italic face, compared
+  over the drawn `Font` as gpui keyed it), and `family` (informative: gpui
+  maps several fonts to one id). Cases: `uiharness/cases/ext-doc-bold.uit`
+  and `doc-bold.uit`, which uses `uiharness/fixtures/theme-font.docx`, the
+  owner's shape. That file is `ext_fixture::theme_font_docx()`'s bytes
+  (`the_theme_font_fixture_file_is_current`; `UPDATE_THEME_FONT_FIXTURE=1`
+  writes it).
+- Not done: a run naming a family with no bold face of its own (a
+  single-weight or variable family, e.g. `Ubuntu`) still draws regular; a
+  direct `w:asciiTheme` on a run (`load.rs` reads only `w:ascii`) falls to
+  the document font; `docDefaults` size and bold for unstyled runs; the
+  theme's East Asian and complex-script slots.
 
 ## Link colours (#1906)
 

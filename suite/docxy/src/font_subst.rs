@@ -16,11 +16,17 @@
 //! (metric-compatible first, shared with PDF export), then a generic serif or
 //! mono class, else `None`: draw in the inherited (theme) font. The theme's
 //! own families go through [`ui_family`] / [`ui_mono_family`].
+//!
+//! A document's inherited font ([`doc_base_family`], #1972) must also have a
+//! real bold face: gpui's Linux text system draws a run in the nearest face
+//! of its family and never synthesises bold, and loads a variable font (one
+//! face, such as Ubuntu's) at its default weight, so `w:b` on a run in such
+//! a family draws regular.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock, PoisonError};
 
-use gpui::{App, SharedString, font};
+use gpui::{App, FontStyle, FontWeight, SharedString, font};
 
 /// The UI sans families tried for an unloadable theme font: gpui's own
 /// fallback order, so the face drawn is the one `resolve_font` lands on
@@ -75,6 +81,16 @@ fn generic_class(lower: &str) -> &'static [&'static str] {
 
 type Probe = Box<dyn Fn(&str) -> bool + Send>;
 
+/// Which styled faces of its own a family has: whether a bold or an italic
+/// run is drawn in a face other than the regular one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Faces {
+    pub bold: bool,
+    pub italic: bool,
+}
+
+type FacesProbe = Box<dyn Fn(&str) -> Faces + Send>;
+
 /// Resolves family names against the installed fonts, each candidate probed
 /// at most once.
 pub(crate) struct Resolver {
@@ -96,6 +112,13 @@ pub(crate) struct Resolver {
     resolved: HashMap<String, Option<SharedString>>,
     /// Resolved theme families (sans and mono), by the exact name asked for.
     ui: HashMap<(bool, String), SharedString>,
+    /// Which faces a loadable family has (#1972); `None`: not asked, every
+    /// family is taken to have them.
+    faces: Option<FacesProbe>,
+    /// Faces probe results, by the family's drawn spelling.
+    faces_of: HashMap<SharedString, Faces>,
+    /// Resolved document base families, by the exact name asked for.
+    doc_base: HashMap<String, SharedString>,
 }
 
 impl Resolver {
@@ -111,7 +134,69 @@ impl Resolver {
             probed_unlisted: HashMap::new(),
             resolved: HashMap::new(),
             ui: HashMap::new(),
+            faces: None,
+            faces_of: HashMap::new(),
+            doc_base: HashMap::new(),
         }
+    }
+
+    /// This resolver, asking `faces` which styled faces a loadable family
+    /// has ([`Resolver::doc_base_family`]); asked at most once per family.
+    pub(crate) fn with_faces(mut self, faces: impl Fn(&str) -> Faces + Send + 'static) -> Self {
+        self.faces = Some(Box::new(faces));
+        self
+    }
+
+    /// The faces of `family`, which gpui loads.
+    fn faces_of(&mut self, family: &SharedString) -> Faces {
+        let Some(probe) = self.faces.as_ref() else {
+            return Faces {
+                bold: true,
+                italic: true,
+            };
+        };
+        if let Some(&hit) = self.faces_of.get(family) {
+            return hit;
+        }
+        let faces = probe(family);
+        self.faces_of.insert(family.clone(), faces);
+        faces
+    }
+
+    /// The family a document's text inherits (#1972): the theme's sans
+    /// family resolved as [`Resolver::ui_family`] does, when it has a bold
+    /// face of its own; else the first [`UI_SANS`] family that loads with a
+    /// bold and an italic face, else the first with a bold face, else the
+    /// theme's family as resolved. Only a family gpui loads is asked for its
+    /// faces.
+    pub(crate) fn doc_base_family(&mut self, theme: &str) -> SharedString {
+        if let Some(hit) = self.doc_base.get(theme) {
+            return hit.clone();
+        }
+        let ui = self.ui_family(theme);
+        let found =
+            if self.faces.is_none() || self.requested(&ui).is_none() || self.faces_of(&ui).bold {
+                ui
+            } else {
+                let mut bold_only = None;
+                let mut both = None;
+                for name in UI_SANS {
+                    let Some(family) = self.available(name) else {
+                        continue;
+                    };
+                    let faces = self.faces_of(&family);
+                    if faces.bold && faces.italic {
+                        both = Some(family);
+                        break;
+                    }
+                    if faces.bold && bold_only.is_none() {
+                        bold_only = Some(family);
+                    }
+                }
+                both.or(bold_only).unwrap_or(ui)
+            };
+        self.doc_base.insert(theme.to_string(), found.clone());
+        found
     }
 
     /// `name`'s installed spelling when gpui loads it; a candidate not
@@ -214,28 +299,48 @@ static RESOLVER: OnceLock<Mutex<Resolver>> = OnceLock::new();
 pub(crate) fn init(cx: &App) {
     RESOLVER.get_or_init(|| {
         let ts = cx.text_system().clone();
+        let faces_ts = ts.clone();
         let names = ts.all_font_names();
         // The id `resolve_font` gives a family no one has: the first working
         // fallback's. Asked once, on the first probe.
         let missing = OnceLock::new();
-        Mutex::new(Resolver::new(names, move |name| {
-            // gpui's `font_id` is private: `resolve_font` hands back a
-            // fallback's id for a family that fails. Every platform loads a
-            // family into fresh ids, so a family loaded is one whose id names
-            // it, or one whose id is not the fallback's.
-            let id = ts.resolve_font(&font(SharedString::from(name.to_string())));
-            let named = ts
-                .get_font_for_id(id)
-                .is_some_and(|f| f.family.eq_ignore_ascii_case(name));
-            if named {
-                // Not asking for the sentinel spares a walk of gpui's fallback
-                // stack, which panics when none of it loads.
-                return true;
-            }
-            let fallback =
-                *missing.get_or_init(|| ts.resolve_font(&font("\u{1}docxy no such font")));
-            id != fallback
-        }))
+        Mutex::new(
+            Resolver::new(names, move |name| {
+                // gpui's `font_id` is private: `resolve_font` hands back a
+                // fallback's id for a family that fails. Every platform loads a
+                // family into fresh ids, so a family loaded is one whose id names
+                // it, or one whose id is not the fallback's.
+                let id = ts.resolve_font(&font(SharedString::from(name.to_string())));
+                let named = ts
+                    .get_font_for_id(id)
+                    .is_some_and(|f| f.family.eq_ignore_ascii_case(name));
+                if named {
+                    // Not asking for the sentinel spares a walk of gpui's fallback
+                    // stack, which panics when none of it loads.
+                    return true;
+                }
+                let fallback =
+                    *missing.get_or_init(|| ts.resolve_font(&font("\u{1}docxy no such font")));
+                id != fallback
+            })
+            .with_faces(move |name| {
+                // gpui picks the nearest face of a family and never synthesises
+                // bold or italic: a styled run in a face of its own is one whose
+                // id is not the regular face's.
+                let regular = font(SharedString::from(name.to_string()));
+                let id = faces_ts.resolve_font(&regular);
+                let styled = |weight: FontWeight, style: FontStyle| {
+                    let mut f = regular.clone();
+                    f.weight = weight;
+                    f.style = style;
+                    faces_ts.resolve_font(&f) != id
+                };
+                Faces {
+                    bold: styled(FontWeight::BOLD, FontStyle::Normal),
+                    italic: styled(FontWeight::NORMAL, FontStyle::Italic),
+                }
+            }),
+        )
     });
 }
 
@@ -261,6 +366,13 @@ pub(crate) fn ui_family(theme: &SharedString) -> SharedString {
 /// [`init`], `theme` itself.
 pub(crate) fn ui_mono_family(theme: &SharedString) -> SharedString {
     with(|r| r.ui_mono_family(theme)).unwrap_or_else(|| theme.clone())
+}
+
+/// [`Resolver::doc_base_family`]: the family a document's text inherits
+/// under the theme's sans family `theme` (any spelling; resolved here);
+/// before [`init`], `theme` itself.
+pub(crate) fn doc_base_family(theme: &SharedString) -> SharedString {
+    with(|r| r.doc_base_family(theme)).unwrap_or_else(|| theme.clone())
 }
 
 /// Points the global theme's sans and mono families at loadable ones (run

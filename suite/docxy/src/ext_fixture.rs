@@ -569,12 +569,17 @@ pub(crate) fn fixture_document() -> (Document, Package) {
 }
 
 /// The fixtures `ext-doc-load {"fixture"}` shows in the view (#1888):
-/// `sections` ([`sections_document`]) and `header-inherit`
+/// `sections` ([`sections_document`]), `header-inherit`
 /// (`uiharness/fixtures/header-inherit.docx`, loaded as a document tab
-/// loads it).
+/// loads it) and `theme-font` ([`theme_font_docx`], #1972).
 pub(crate) fn named_document(name: &str) -> Result<(Document, Package), String> {
     match name {
         "sections" => Ok(sections_document()),
+        "theme-font" => {
+            let loaded = crate::load_bytes(&theme_font_docx());
+            let pkg = loaded.pkg.ok_or("theme-font did not load")?;
+            Ok((loaded.doc, pkg))
+        }
         "header-inherit" => {
             let loaded = crate::load_bytes(include_bytes!(
                 "../../../uiharness/fixtures/header-inherit.docx"
@@ -583,9 +588,68 @@ pub(crate) fn named_document(name: &str) -> Result<(Document, Package), String> 
             Ok((loaded.doc, pkg))
         }
         _ => Err(format!(
-            "unknown fixture '{name}': the fixtures are 'sections' and 'header-inherit'"
+            "unknown fixture '{name}': the fixtures are 'sections', 'header-inherit' and 'theme-font'"
         )),
     }
+}
+
+/// The `theme-font` styles (#1972), the shape of the owner's file:
+/// `docDefaults` naming only the theme's minor font, a default Normal with
+/// no run properties.
+pub(crate) const THEME_FONT_STYLES: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:asciiTheme=\"minorHAnsi\" w:eastAsiaTheme=\"minorHAnsi\" \
+w:hAnsiTheme=\"minorHAnsi\" w:cstheme=\"minorBidi\"/><w:sz w:val=\"22\"/><w:szCs w:val=\"22\"/></w:rPr></w:rPrDefault>\
+<w:pPrDefault><w:pPr><w:spacing w:after=\"160\" w:line=\"259\" w:lineRule=\"auto\"/></w:pPr></w:pPrDefault></w:docDefaults>\
+<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/><w:qFormat/></w:style>\
+</w:styles>";
+
+/// The `theme-font` theme: minor (body) Calibri, major Calibri Light.
+pub(crate) const THEME_FONT_THEME: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<a:theme xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" name=\"Office Theme\"><a:themeElements>\
+<a:fontScheme name=\"Office\"><a:majorFont><a:latin typeface=\"Calibri Light\"/><a:ea typeface=\"\"/><a:cs typeface=\"\"/></a:majorFont>\
+<a:minorFont><a:latin typeface=\"Calibri\"/><a:ea typeface=\"\"/><a:cs typeface=\"\"/></a:minorFont></a:fontScheme>\
+</a:themeElements></a:theme>";
+
+/// The `theme-font` document (#1972), as the bytes of a `.docx` (also
+/// `uiharness/fixtures/theme-font.docx`, which a test keeps equal to it):
+/// [`THEME_FONT_STYLES`] and [`THEME_FONT_THEME`], and one paragraph with
+/// no `w:pStyle` whose runs name no font: "Plain ", "Strong" with only
+/// `w:b`, " " and "Slanted" with only `w:i`.
+pub(crate) fn theme_font_docx() -> Vec<u8> {
+    let ct = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+<Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
+<Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>\
+<Override PartName=\"/word/theme/theme1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.theme+xml\"/></Types>";
+    let rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/></Relationships>";
+    let doc_rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>\
+<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme\" Target=\"theme/theme1.xml\"/></Relationships>";
+    let body = para(&format!(
+        "{}<w:r><w:rPr><w:b/></w:rPr><w:t>Strong</w:t></w:r>{}<w:r><w:rPr><w:i/></w:rPr><w:t>Slanted</w:t></w:r>",
+        run("Plain "),
+        run(" ")
+    ));
+    let document = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<w:document xmlns:w=\"{W}\" xmlns:r=\"{R}\"><w:body>{body}{}</w:body></w:document>",
+        sect_pr("", 12240, 15840, 1440, "")
+    );
+    let part = |n: &str, t: &str| (n.to_string(), t.as_bytes().to_vec());
+    docxcore::zipwrite::write_zip(&[
+        part("[Content_Types].xml", ct),
+        part("_rels/.rels", rels),
+        part("word/document.xml", &document),
+        part("word/_rels/document.xml.rels", doc_rels),
+        part("word/styles.xml", THEME_FONT_STYLES),
+        part("word/theme/theme1.xml", THEME_FONT_THEME),
+    ])
 }
 
 /// A sectPr: the page size, its margins (`margin` all round, the header and
@@ -725,6 +789,34 @@ mod tests {
         // A table cell's paragraph is reached by its path.
         let a2 = docxcore::editor::resolve_para(&doc.body, &[5, 1, 0, 0]).expect("A2");
         assert_eq!(a2.plain_text(), "A2");
+    }
+
+    /// `uiharness/fixtures/theme-font.docx` is [`theme_font_docx`]'s bytes,
+    /// so the main tab's case and the view's fixture cannot drift (#1972).
+    /// `UPDATE_THEME_FONT_FIXTURE=1` writes it.
+    #[test]
+    fn the_theme_font_fixture_file_is_current() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../uiharness/fixtures/theme-font.docx");
+        let bytes = theme_font_docx();
+        if std::env::var_os("UPDATE_THEME_FONT_FIXTURE").is_some() {
+            std::fs::write(&path, &bytes).expect("write the fixture");
+        }
+        let on_disk = std::fs::read(&path).expect("uiharness/fixtures/theme-font.docx");
+        assert!(
+            on_disk == bytes,
+            "theme-font.docx is stale: run with UPDATE_THEME_FONT_FIXTURE=1"
+        );
+        let (doc, pkg) = named_document("theme-font").expect("loads");
+        let Block::Paragraph(p) = &doc.body[0] else {
+            panic!("a paragraph");
+        };
+        assert_eq!(p.plain_text(), "Plain Strong Slanted");
+        assert_eq!(p.props.style_id, None);
+        assert_eq!(
+            pkg.theme_part_name().as_deref(),
+            Some("word/theme/theme1.xml")
+        );
     }
 
     #[test]

@@ -1,0 +1,63 @@
+# Bold and italic show on runs that name no font in the embedded document
+# view (#1972). gpui's Linux text system draws a run in the nearest face of
+# its family and never synthesises bold or italic, and it loads a variable
+# font (Ubuntu's) as one regular face, so the view draws a document's
+# unnamed text in a family with real bold and italic faces
+# (`font_subst::doc_base_family`), and a run its styles name no family for
+# in the document's own font (`docDefaults` and the default paragraph style,
+# theme fonts resolved: Calibri, drawn in Carlito where it is installed).
+# `ext-doc-word`'s `face` reports what the painted word asks for (`bold`,
+# `italic`) and whether gpui shaped it in its family's bold (`bold_face`) or
+# italic (`italic_face`) face; `family` is printed only, as CI may lack
+# Carlito.
+ext fixture
+
+test issue 1972 imported b and i draw in bold and italic faces
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-load {"html": "<p>Plain <b>Heavy</b> <i>Leaning</i></p>"}
+  shot window
+  call ext-doc-word {"text":"Plain"}
+  assert reply.face.bold is false
+  assert reply.face.bold_face is false
+  assert reply.face.italic_face is false
+  call ext-doc-word {"text":"Heavy"}
+  assert reply.face.bold is true
+  assert reply.face.bold_face is true
+  call ext-doc-word {"text":"Leaning"}
+  assert reply.face.italic is true
+  assert reply.face.italic_face is true
+  key ctrl+w
+
+test issue 1972 a theme font document draws its bold run in a bold face
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-load {"fixture":"theme-font"}
+  shot window
+  call ext-doc-word {"text":"Strong"}
+  assert reply.face.bold is true
+  assert reply.face.bold_face is true
+  call ext-doc-word {"text":"Slanted"}
+  assert reply.face.italic is true
+  assert reply.face.italic_face is true
+  call ext-doc-word {"text":"Plain"}
+  assert reply.face.bold_face is false
+  key ctrl+w
+
+test issue 1972 bold typed into the editable view draws in a bold face
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-load {"html": "<p>Start</p>"}
+  call ext-doc-set {"editable":true}
+  call pointer-click {"region":"ext-doc-word:Start:end"}
+  call real-type {"text":" "}
+  call real-key {"key":"ctrl+b"}
+  call real-type {"text":"Typed"}
+  shot window
+  call ext-doc-word {"text":"Typed"}
+  assert reply.face.bold is true
+  assert reply.face.bold_face is true
+  key ctrl+w

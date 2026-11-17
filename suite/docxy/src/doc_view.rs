@@ -1552,11 +1552,18 @@ impl DocView {
     /// box in view-relative px, and in Print Layout the sheet it is on
     /// (`page`, 1-based) and its box relative to that sheet (`page_x`,
     /// `page_y`); those are `null` in Web Layout.
-    pub(crate) fn word_json(&self, text: &str) -> Result<ctlcore::json::Json, String> {
+    /// `face` is the face it is drawn in ([`word_face_json`], #1972).
+    pub(crate) fn word_json(&self, text: &str, cx: &App) -> Result<ctlcore::json::Json, String> {
         use ctlcore::json::Json;
         let (b, _) = self
             .word_bounds(text)
             .ok_or_else(|| format!("no painted word '{text}'"))?;
+        let face = {
+            let found = find_word(&self.words.borrow(), &self.editor.doc.body, text)
+                .ok_or_else(|| format!("no painted word '{text}'"))?;
+            let sheet = self.run_styles.borrow_mut().current(self.pkg.as_ref()).1;
+            word_face_json(&self.editor.doc.body, &found, sheet.as_deref(), cx)
+        };
         let view = self.viewport.get().ok_or("the view is not drawn yet")?;
         let n = |v: Pixels| Json::Num(f64::from(f32::from(v).round()));
         let sheets = self.sheets.borrow();
@@ -1581,6 +1588,7 @@ impl DocView {
             ("page", page),
             ("page_x", page_x),
             ("page_y", page_y),
+            ("face", face),
         ]))
     }
 
@@ -1663,26 +1671,15 @@ impl DocView {
     /// The first painted word whose text, trimmed, is `text`: its bounds,
     /// and the x just after its last character (before any trailing space).
     pub(crate) fn word_bounds(&self, text: &str) -> Option<(Bounds<Pixels>, Pixels)> {
-        let words = self.words.borrow();
-        words.iter().find_map(|(path, spans)| {
-            let para = docxcore::editor::resolve_para(&self.editor.doc.body, path)?;
-            let chars = caret_chars(para);
-            spans.borrow().iter().find_map(|w| {
-                let end = (w.off + w.len).min(chars.len());
-                let word: String = chars.get(w.off..end)?.iter().collect();
-                if w.len == 0 || word.trim() != text {
-                    return None;
-                }
-                let bounds = w.bounds();
-                let text_end = match &w.shape {
-                    SpanShape::Text(layout) => layout
-                        .position_for_index(word.trim_end().len())
-                        .map_or(bounds.right(), |p| p.x),
-                    SpanShape::Unit(_) => bounds.right(),
-                };
-                Some((bounds, text_end))
-            })
-        })
+        let found = find_word(&self.words.borrow(), &self.editor.doc.body, text)?;
+        let bounds = found.span.bounds();
+        let text_end = match &found.span.shape {
+            SpanShape::Text(layout) => layout
+                .position_for_index(found.word.trim_end().len())
+                .map_or(bounds.right(), |p| p.x),
+            SpanShape::Unit(_) => bounds.right(),
+        };
+        Some((bounds, text_end))
     }
 
     /// A scrollbar region (#2080): `vbar`, `hbar-thumb`, `vbar-down`, ...
@@ -1721,10 +1718,11 @@ impl Render for DocView {
         self.painted_bg = Some(bg);
         let inset = resolve_page_inset(self.page_inset);
         // The document's inherited font: the host's (whatever its ancestors
-        // set), made loadable without touching the host's theme (#1900). The
-        // same family `Measurer::new` measures in, so measured = drawn.
-        let ui_font = crate::font_subst::ui_family(&window.text_style().font().family);
-        let measurer = Measurer::new(window);
+        // set), made loadable without touching the host's theme (#1900),
+        // and one with a real bold face (#1972). The same family the
+        // measurer measures in, so measured = drawn.
+        let doc_font = crate::doc_text_family(window);
+        let measurer = Measurer::for_document(window, doc_font.clone());
         let sheet = self.run_styles.borrow_mut().current(self.pkg.as_ref()).1;
         let tbl = TableCtx::new(self.pkg.as_ref(), sheet, false);
         let pics = self
@@ -1905,7 +1903,7 @@ impl Render for DocView {
         let hand = !self.editable;
         div()
             .id("ext-doc-view")
-            .font_family(ui_font)
+            .font_family(doc_font)
             .track_focus(&self.focus)
             .relative()
             .size_full()
@@ -3037,6 +3035,138 @@ fn caret_chars(p: &Paragraph) -> Vec<char> {
         push(inline, &mut out);
     }
     out
+}
+
+/// A painted word found by its text ([`find_word`]): its paragraph's path,
+/// its piece and its text as painted (a trailing space included).
+pub(crate) struct FoundWord {
+    pub path: Vec<usize>,
+    pub span: WordSpan,
+    pub word: String,
+}
+
+/// The first painted word among `words` (pieces of `body`'s paragraphs by
+/// path) whose text, trimmed, is `text`.
+pub(crate) fn find_word(
+    words: &[(Vec<usize>, WordSpans)],
+    body: &[docxcore::model::Block],
+    text: &str,
+) -> Option<FoundWord> {
+    words.iter().find_map(|(path, spans)| {
+        let para = docxcore::editor::resolve_para(body, path)?;
+        let chars = caret_chars(para);
+        spans.borrow().iter().find_map(|w| {
+            let end = (w.off + w.len).min(chars.len());
+            let word: String = chars.get(w.off..end)?.iter().collect();
+            (w.len != 0 && word.trim() == text).then(|| FoundWord {
+                path: path.clone(),
+                span: w.clone(),
+                word,
+            })
+        })
+    })
+}
+
+/// The run holding caret offset `off` of `p` (offsets as [`caret_chars`]
+/// counts them), a hyperlink's runs included.
+fn run_at(p: &Paragraph, off: usize) -> Option<&docxcore::model::Run> {
+    fn walk<'a>(
+        inline: &'a Inline,
+        off: usize,
+        at: &mut usize,
+    ) -> Option<&'a docxcore::model::Run> {
+        match inline {
+            Inline::Run(r) => {
+                let n = r.text.chars().count();
+                let hit = off < *at + n;
+                *at += n;
+                hit.then_some(r)
+            }
+            Inline::Hyperlink(h) => {
+                for r in &h.runs {
+                    let n = r.text.chars().count();
+                    if off < *at + n {
+                        return Some(r);
+                    }
+                    *at += n;
+                }
+                h.content.iter().find_map(|c| walk(c, off, at))
+            }
+            other => {
+                *at += docxcore::editor::inline_len(other);
+                None
+            }
+        }
+    }
+    let mut at = 0;
+    p.content.iter().find_map(|i| walk(i, off, &mut at))
+}
+
+/// The face a painted word is drawn in (#1972), for `ext-doc-word` and
+/// `doc-word`: `family` (the drawn face's, informative), `bold` / `italic`
+/// (what its run asks for, its paragraph and character styles applied; a
+/// table style's look is not), and `bold_face` / `italic_face`: whether
+/// gpui shaped it in a face of its family other than the regular one, its
+/// bold (italic) face. gpui's Linux text system never synthesises a weight
+/// or a slant, so a bold run drawn in a family with no bold face of its own
+/// (a variable font is loaded at its default weight) has `bold_face` false.
+/// `null` for a piece that is not text.
+pub(crate) fn word_face_json(
+    body: &[docxcore::model::Block],
+    found: &FoundWord,
+    sheet: Option<&docxcore::styles::StyleSheet>,
+    cx: &App,
+) -> ctlcore::json::Json {
+    use ctlcore::json::Json;
+    let SpanShape::Text(layout) = &found.span.shape else {
+        return Json::Null;
+    };
+    let lines = layout.line_layouts();
+    let Some(id) = lines
+        .first()
+        .and_then(|l| l.unwrapped_layout.runs.first())
+        .map(|r| r.font_id)
+    else {
+        return Json::Null;
+    };
+    let ts = cx.text_system();
+    // The drawn font as gpui keyed it (its features and fallbacks too, so
+    // the faces below are the same family load's); its weight and style may
+    // be any one that resolved to this face.
+    let Some(drawn) = ts.get_font_for_id(id) else {
+        return Json::Null;
+    };
+    let face = |weight: FontWeight, style: FontStyle| {
+        let mut f = drawn.clone();
+        f.weight = weight;
+        f.style = style;
+        ts.resolve_font(&f)
+    };
+    let regular = face(FontWeight::NORMAL, FontStyle::Normal);
+    let italic = face(FontWeight::NORMAL, FontStyle::Italic);
+    let bold = face(FontWeight::BOLD, FontStyle::Normal);
+    let bold_italic = face(FontWeight::BOLD, FontStyle::Italic);
+    let bold_face = (id == bold || id == bold_italic) && id != regular && id != italic;
+    let italic_face = (id == italic || id == bold_italic) && id != regular && id != bold;
+    let para = docxcore::editor::resolve_para(body, &found.path);
+    let asked = para.and_then(|p| {
+        let r = run_at(p, found.span.off)?;
+        let styler = crate::run_look::RunStyler {
+            sheet,
+            cell: None,
+            pstyle: p.props.style_id.as_deref(),
+        };
+        let shown = styler.shown(r);
+        Some((shown.bold, shown.italic))
+    });
+    let flag = |f: fn((bool, bool)) -> bool| asked.map_or(Json::Null, |a| Json::Bool(f(a)));
+    Json::obj(vec![
+        ("family", Json::Str(drawn.family.to_string())),
+        ("bold", flag(|a| a.0)),
+        ("italic", flag(|a| a.1)),
+        ("bold_face", Json::Bool(bold_face)),
+        ("italic_face", Json::Bool(italic_face)),
+    ])
 }
 
 /// Painted pieces (paragraph path, the link holding the piece, its bounds)

@@ -1,0 +1,45 @@
+# Bold and italic show on runs that name no font in the document tab
+# (#1972), in Web and Print Layout. The owner's file shape
+# (`theme-font.docx`: paragraphs in no style whose runs carry only `w:b` or
+# `w:i`, under `docDefaults` naming the theme's minor font, Calibri) draws
+# in the document's own font (Carlito where installed, else the document's
+# base family), and a new document's unnamed text in a family with real
+# bold and italic faces. `doc-word`'s `face` is `ext-doc-word`'s
+# (ext-doc-bold.uit): `bold_face` / `italic_face` say gpui shaped the word
+# in its family's bold / italic face; `family` is printed only.
+
+test issue 1972 the theme font document draws bold and italic faces in both layouts
+  open copy:../fixtures/theme-font.docx
+  assert view.layout is web
+  shot window
+  call doc-word {"text":"Strong"}
+  assert reply.face.bold is true
+  assert reply.face.bold_face is true
+  call doc-word {"text":"Slanted"}
+  assert reply.face.italic is true
+  assert reply.face.italic_face is true
+  call doc-word {"text":"Plain"}
+  assert reply.face.bold is false
+  assert reply.face.bold_face is false
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is print
+  shot window
+  call doc-word {"text":"Strong"}
+  assert reply.face.bold_face is true
+  call doc-word {"text":"Slanted"}
+  assert reply.face.italic_face is true
+
+test issue 1972 bold typed into a new document draws in a bold face
+  open copy:../fixtures/basic.docx
+  key ctrl+b
+  type Typed
+  key ctrl+b
+  key space
+  type Plain
+  shot window
+  call doc-word {"text":"Typed"}
+  assert reply.face.bold is true
+  assert reply.face.bold_face is true
+  call doc-word {"text":"Plain"}
+  assert reply.face.bold is false
+  assert reply.face.bold_face is false

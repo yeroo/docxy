@@ -5753,6 +5753,31 @@ fn dispatch_verb(
             Done::ok(state(app, window, cx))
         }
         "doc" => Done::ok(live_doc_state(app, window)?),
+        // A word the active document tab last painted (#1972), by its text
+        // trimmed: its box in the window and the face it is drawn in
+        // ([`crate::doc_view::word_face_json`]), as `ext-doc-word` reports.
+        "doc-word" => {
+            let text = arg_str(args, "text")?;
+            let text = text.trim();
+            let ed = active_doc(app)?;
+            let tab = app.tabs.get(app.active).ok_or(crate::dialog::NONE_OPEN)?;
+            let sheet = tab.run_styles.borrow_mut().current(tab.pkg.as_ref()).1;
+            let found = crate::DOC_WORDS
+                .with(|d| crate::doc_view::find_word(&d.borrow(), &ed.doc.body, text))
+                .ok_or_else(|| format!("no painted word '{text}'"))?;
+            let b = found.span.bounds();
+            let n = |v: Pixels| Json::Num(f64::from(f32::from(v).round()));
+            Done::ok(Json::obj(vec![
+                ("x", n(b.origin.x)),
+                ("y", n(b.origin.y)),
+                ("w", n(b.size.width)),
+                ("h", n(b.size.height)),
+                (
+                    "face",
+                    crate::doc_view::word_face_json(&ed.doc.body, &found, sheet.as_deref(), cx),
+                ),
+            ]))
+        }
         // The active document's comments, as a save would write them (#1027):
         // `{comments:[{id, author, initials, text}]}`, in the order the comments
         // part lists them (new ones last).
@@ -6252,7 +6277,7 @@ fn dispatch_verb(
         "ext-doc-word" => {
             let fixture = ext_fixture_view(app)?;
             let text = arg_str(args, "text")?;
-            Done::ok(fixture.read(cx).doc.read(cx).word_json(text.trim())?)
+            Done::ok(fixture.read(cx).doc.read(cx).word_json(text.trim(), cx)?)
         }
         // The view's painted layout (#1986): each top-level paragraph's
         // box, list number and lines, and the document's line pitch
