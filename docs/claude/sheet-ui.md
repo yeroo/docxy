@@ -92,3 +92,52 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   entry commits first, as for #510's cell acts, so its Typing step lands
   under the Protect Sheet step; a refused entry stops it, the sheet left
   unprotected. Undo, Redo and Repeat never act on the sheet while editing.
+
+## Floating pictures on the sheet view (#2228)
+
+- `gridcore::drawing::parse_drawings` keeps each anchor whole in
+  `Drawing::anchor` (`DrawingAnchor`): its kind, the `colOff`/`rowOff` EMU of
+  `from` and `to`, the anchor's own `<xdr:ext>` and `<xdr:pos>` (direct
+  children only: a picture's `a:xfrm/a:ext` and an `a:extLst/a:ext uri` are
+  not the extent), every EMU clamped to `0..=MAX_ANCHOR_EMU`. An
+  `absoluteAnchor` makes a drawing only for a picture (a cell estimate of its
+  `pos` for consumers that read cells); an absolute chart stays unread, as
+  before. A `blip` inside `xdr:grpSp` makes no picture (one member stretched
+  over the group's box); a chart in a group keeps its card.
+- Save rewrites only anchors whose `(from, to)` differ from
+  `DrawingAnchor::loaded`, so an unedited drawing part keeps its bytes (a
+  padded `<xdr:row>`, a clamped column); `loaded: None` (`add_chart`'s) is
+  always written. The media and the rels were never touched.
+- The suite draws every `DrawingKind::Image` in `sheet_picture_layer`
+  (main.rs), placed by `sheet_pictures` in two steps: the anchor becomes
+  `(cell, fraction)` edges in Excel's cell sizes (`excel_row_emu`: `ht`, the
+  sheet default or 15 pt; `excel_col_emu`: `units*7+5` px; hidden cells 0),
+  then drawn px over the grid's sizes: a row at the height the row list
+  measured it (a row grows past `row_height_px`, its min height with the
+  gridline inside, with its text), else at `row_height_px`, 0 when hidden; a
+  column at `col_px`, a hidden one at its width, as the grid draws it. The
+  chart cards' `+ 1` per row is not what the grid draws (it drifts a pixel a
+  row). The grid is not at Excel's scale (rows 1.4 px/pt, `col_px` clamped),
+  so a picture covers the cells it covers in Excel rather than Excel's pixels.
+  Walks stop at `MAX_WALK` cells and at the drawn rows/columns.
+- Panes follow the grid's own split: the frozen band is `visible[..fr]`, the
+  frozen columns `0..fc`, the scrolled pane starts at the list's top item and
+  `col0`; each pane clips its pieces, so a picture over a freeze line is drawn
+  in each pane it reaches. The layer starts past the row gutter and sits under
+  the chart layer. The rows above the list's top item and the frozen band
+  are not measured (`ListState::bounds_for_item` has none for them), so a
+  tall text row there is taken at its min height.
+- `pictures::Cache::sheet_image` keys a sheet's media by part: the same bytes
+  (address and length) reuse the image, moved bytes are compared with the
+  image's, changed bytes make a new one and retire the old. Media gpui can't
+  draw (EMF, SVG, TIFF, a corrupt part) is a bordered `<name> (picture)` box.
+- `Docxy::picture_sel` selects only (frame and inert grips; no move, resize,
+  delete). It holds the selection as a chart does (`sel_hidden`, no fill
+  handle); `chart_hand_back` and `chart_drop_selection` clear it, so every
+  key and press that hands a chart back, a sheet or tab switch and an undo do
+  too. Esc drops it; Delete and Backspace do nothing. The harness reports
+  `picture_sel` and `sheet_scroll` (the row list's top item), and
+  `picture:N` is the piece in the scrolled cells.
+- Fixture: `uiharness/fixtures/pictures.xlsx` (`build_pictures` in
+  `uiharness/tests/fixture.rs`), case `uiharness/cases/sheet-pictures.uit`.
+  xlsxy still draws pictures with `Resize::Fit` (aspect kept).
