@@ -1,7 +1,8 @@
 //! Where a sheet's floating pictures sit on the grid (#2228).
 //!
-//! The grid is not drawn at Excel's scale: a row is 1.4 px per point plus a
-//! 1 px gridline, and a column's width is clamped to 28..=320 px. A picture
+//! The grid is not drawn at Excel's scale: a row is `row_height_px`, 1.4 px
+//! per point with its gridline inside (21 px for 15 pt), and grows with its
+//! text; a column's width is `col_px`, clamped to 28..=320 px. A picture
 //! placed in Excel's pixels would drift off the cells it covers in Excel, so
 //! it is placed in two steps instead:
 //!
@@ -216,8 +217,13 @@ pub fn piece(
 mod tests {
     use super::*;
 
-    /// The sizes of a small sheet: rows of 15 pt drawn at 22 px, with row 3
-    /// 30 pt (43 px) and row 5 hidden; columns of 8.43 units (64 Excel px)
+    /// A 15 pt row as the grid draws it (`row_height_px`, gridline inside),
+    /// and a 30 pt one.
+    const R: f32 = 21.0;
+    const TALL: f32 = 42.0;
+
+    /// The sizes of a small sheet: rows of 15 pt drawn at 21 px, with row 3
+    /// 30 pt (42 px) and row 5 hidden; columns of 8.43 units (64 Excel px)
     /// drawn at 65 px, with column 2 hidden (Excel 0, the grid's 28 px).
     fn excel_row(r: u32) -> i64 {
         match r {
@@ -228,9 +234,9 @@ mod tests {
     }
     fn drawn_row(r: u32) -> f32 {
         match r {
-            3 => 30.0 * 1.4 + 1.0,
+            3 => TALL,
             5 => 0.0,
-            _ => 22.0,
+            _ => R,
         }
     }
     fn excel_col(c: u32) -> i64 {
@@ -320,10 +326,10 @@ mod tests {
         );
         let (x, y, w, h) = rect(&a, TOP, LEFT, 1.0).unwrap();
         assert_eq!(x, 65.0 / 4.0);
-        assert_eq!(y, 22.0 + 11.0);
+        assert_eq!(y, R + R / 2.0);
         assert_eq!(w, 65.0 - 65.0 / 4.0 + 32.5);
         // Rows 1 (half), 2, 3 (43 px) and all of row 4.
-        assert_eq!(h, 11.0 + 22.0 + 43.0 + 22.0);
+        assert_eq!(h, R / 2.0 + R + TALL + R);
     }
 
     /// An offset longer than its cell stops at the cell's end.
@@ -332,8 +338,8 @@ mod tests {
         let a = two_cell((1, 0), (ROW_EMU * 5, COL_EMU * 3), (3, 2), (0, 0));
         let (x, y, w, h) = rect(&a, TOP, LEFT, 1.0).unwrap();
         // It starts at the end of row 1 and of column 0.
-        assert_eq!((x, y), (65.0, 44.0));
-        assert_eq!((w, h), (65.0, 22.0));
+        assert_eq!((x, y), (65.0, 2.0 * R));
+        assert_eq!((w, h), (65.0, R));
         // A box that ends where it starts draws nothing.
         let flat = two_cell((1, 0), (ROW_EMU * 5, 0), (2, 1), (0, 0));
         assert_eq!(rect(&flat, TOP, LEFT, 1.0), None);
@@ -346,15 +352,15 @@ mod tests {
         let a = two_cell((4, 1), (0, 0), (7, 4), (0, 0));
         let (x, y, w, h) = rect(&a, TOP, LEFT, 1.0).unwrap();
         assert_eq!(x, 65.0);
-        assert_eq!(y, 22.0 * 3.0 + 43.0);
+        assert_eq!(y, R * 3.0 + TALL);
         // Rows 4, 5 (hidden, 0 px), 6.
-        assert_eq!(h, 22.0 + 0.0 + 22.0);
+        assert_eq!(h, R + 0.0 + R);
         // Columns 1, 2 (hidden, 28 px), 3.
         assert_eq!(w, 65.0 + 28.0 + 65.0);
         // An offset into a hidden cell has nothing to be a fraction of.
         let a = two_cell((5, 2), (ROW_EMU, COL_EMU), (7, 3), (0, 0));
         let (x, y, _, _) = rect(&a, TOP, LEFT, 1.0).unwrap();
-        assert_eq!((x, y), (130.0, 22.0 * 4.0 + 43.0));
+        assert_eq!((x, y), (130.0, R * 4.0 + TALL));
     }
 
     /// A one-cell anchor's extent walks Excel's sizes: exactly N default
@@ -381,8 +387,8 @@ mod tests {
         assert_eq!(span.cols.0, CellPos { cell: 1, frac: 0.5 });
         assert_eq!(span.cols.1, CellPos { cell: 4, frac: 0.5 });
         let (x, y, w, h) = piece(&rows(), &cols(), TOP, LEFT, span, 1.0).unwrap();
-        assert_eq!(y, 22.0 * 4.0 + 43.0 + 0.0);
-        assert_eq!(h, 22.0 * 4.0);
+        assert_eq!(y, R * 4.0 + TALL + 0.0);
+        assert_eq!(h, R * 4.0);
         assert_eq!(x, 65.0 * 1.5);
         assert_eq!(w, 32.5 + 28.0 + 65.0 + 32.5);
     }
@@ -400,7 +406,7 @@ mod tests {
         assert_eq!(span.rows.0, CellPos { cell: 1, frac: 0.5 });
         assert_eq!(span.rows.1, CellPos { cell: 2, frac: 0.5 });
         let (x, y, w, h) = piece(&rows(), &cols(), TOP, LEFT, span, 1.0).unwrap();
-        assert_eq!((x, y, w, h), (65.0, 33.0, 32.5, 22.0));
+        assert_eq!((x, y, w, h), (65.0, R * 1.5, 32.5, R));
     }
 
     /// Scrolled down and right, a picture is placed from the pane's first
@@ -421,7 +427,7 @@ mod tests {
             last: 20,
         };
         let (x, y, w, h) = rect(&a, rp, cp, 1.0).unwrap();
-        assert_eq!(y, -22.0 - 5.0);
+        assert_eq!(y, -R - 5.0);
         assert_eq!(x, -65.0);
         assert_eq!((w, h), (unscrolled.2, unscrolled.3));
         // Scrolled past it: no piece, and no walk over it either.
@@ -457,10 +463,10 @@ mod tests {
             last: 40,
         };
         let (_, fy, _, fh) = rect(&a, frozen, LEFT, 1.0).unwrap();
-        assert_eq!(fy, 22.0);
+        assert_eq!(fy, R);
         let (_, sy, _, sh) = rect(&a, scrolled, LEFT, 1.0).unwrap();
-        // Rows 1..10 above the pane: 1, 2, 4, 6..9 at 22, 3 at 43, 5 hidden.
-        assert_eq!(sy, -(22.0 * 7.0 + 43.0));
+        // Rows 1..10 above the pane: 1, 2, 4, 6..9 at 21, 3 at 42, 5 hidden.
+        assert_eq!(sy, -(R * 7.0 + TALL));
         assert_eq!(fh, sh, "one picture, one size");
         // The frozen columns' pane and the scrolled one split it the same way.
         let fcols = Pane {
@@ -509,6 +515,44 @@ mod tests {
                 cell: 256,
                 frac: 0.0
             }
+        );
+    }
+
+    /// On an axis longer than `MAX_WALK`, a walk stops after `MAX_WALK` cells
+    /// at the start of the cell it reached, and so does a pixel offset, either
+    /// way: a crafted extent costs at most that many cells a frame.
+    #[test]
+    fn a_walk_stops_after_max_walk_cells() {
+        let long = |c: u32| if c < 5 { 0 } else { ROW_EMU };
+        let flat = |_: u32| R;
+        let rows = Axis {
+            excel: &long,
+            drawn: &flat,
+            end: 4 * MAX_WALK,
+        };
+        let cols = cols();
+        let anchor = DrawingAnchor {
+            kind: AnchorKind::OneCell,
+            ext: Some((COL_EMU, gridcore::sheet::MAX_ANCHOR_EMU)),
+            ..DrawingAnchor::default()
+        };
+        let span = anchor_span(&anchor, (5, 0), (0, 0), &rows, &cols);
+        assert_eq!(
+            span.rows.1,
+            CellPos {
+                cell: 5 + MAX_WALK,
+                frac: 0.0
+            }
+        );
+        let far = CellPos {
+            cell: 3 * MAX_WALK,
+            frac: 0.0,
+        };
+        assert_eq!(offset_px(&rows, 0, far, 1.0), MAX_WALK as f32 * R);
+        let near = CellPos { cell: 0, frac: 0.0 };
+        assert_eq!(
+            offset_px(&rows, 3 * MAX_WALK, near, 1.0),
+            -(MAX_WALK as f32 * R)
         );
     }
 }

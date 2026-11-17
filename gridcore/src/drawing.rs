@@ -183,9 +183,10 @@ pub fn parse_drawings(
 }
 
 /// The drawing an anchor element makes, once it has closed: a two-cell or a
-/// one-cell anchor needs its `from`, an absolute one its `pos` and a picture
-/// (an absolute chart stays unread, as it always was, so the chart list and
-/// its moves are unchanged).
+/// one-cell anchor needs its `from`; an absolute one is read only for a
+/// picture (an absolute chart stays unread, as it always was, so the chart
+/// list and its moves are unchanged), and a missing `pos` reads as A1 (Excel
+/// always writes one).
 fn finish_anchor(
     anchor_ix: usize,
     from: Option<AnchorCell>,
