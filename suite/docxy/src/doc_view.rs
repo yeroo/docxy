@@ -1846,7 +1846,7 @@ impl Render for DocView {
                     .map(|(i, b)| {
                         let ctx = RenderCtx {
                             gap_below: flow_gap_below(body, i),
-                            siblings: Some(body),
+                            siblings: Some((body, 0)),
                             ..ctx
                         };
                         block_el(b, vec![i], markers[i].as_deref(), ctx)

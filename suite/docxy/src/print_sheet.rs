@@ -57,7 +57,7 @@ pub(crate) fn band_el(
         let col_ctx = RenderCtx {
             line_width: Some(zoom * sect.single_col_w().max(0) as f32 / 15.0),
             // The column's `gap_1` (#2231).
-            siblings: Some(body),
+            siblings: Some((body.get(s..e).unwrap_or(&[]), s)),
             block_gap: 4.0,
             ..ctx
         };
@@ -100,7 +100,7 @@ pub(crate) fn band_el(
         let (s, e) = band.cols.get(ci).copied().unwrap_or((0, 0));
         let col_ctx = RenderCtx {
             line_width: Some(zoom * sect.col_w[ci].max(0) as f32 / 15.0),
-            siblings: Some(body),
+            siblings: Some((body.get(s..e).unwrap_or(&[]), s)),
             block_gap: 4.0,
             ..ctx
         };

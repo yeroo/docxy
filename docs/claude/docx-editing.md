@@ -56,9 +56,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   chain in twips (`style_left_twips`, `style_first_line`; a nonzero
   character count is not drawn), list or not. `Inherited::NONE` (no styles
   or numbering) is the rule below. An inherited left takes no level step,
-  so the ruler does not clamp at it. A ruler move that leaves a list item's
-  first line 0 pins `w:firstLine="0"` (`Editor::pin_zero_first_lines`,
-  `ParProps::pin_first_line`), or the level's hang would come back. The
+  so the ruler does not clamp at it. A ruler move that leaves a left or
+  first line at 0 where the paragraph inherits a nonzero one pins it
+  (`Editor::pin_zero_indents` with the suite's `inherits_nonzero`:
+  `w:left="0"` as #1728 does, `w:firstLine="0"` through
+  `ParProps::pin_first_line`; a First move pins the first line only), or
+  what it inherits would come back, in session and after a reload (r1 M2).
+  docxwasm's and terminal docxy's `set_indent` are unchanged. The
   HTML importer (`import::pin_list_indents` after its `Builder::finish`)
   pins its list items' left and first line, as it computes them (#1979,
   #2114), so their 0 is a value and no level or style reaches them, in any

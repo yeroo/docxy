@@ -6851,6 +6851,17 @@ impl Inherited {
     }
 }
 
+/// Whether `p` inherits a nonzero left and first line from below its own
+/// (#2231, [`Inherited::of`] over `parts`): a 0 written over one is pinned
+/// ([`Editor::pin_zero_indents`]).
+fn inherits_nonzero(p: &docxcore::model::ParProps, parts: &run_look::DocParts) -> (bool, bool) {
+    let inh = Inherited::of(p, parts.sheet.as_deref(), parts.numbering.as_deref());
+    (
+        inh.left.is_some_and(|l| l != 0),
+        inh.first.is_some_and(|f| f != 0),
+    )
+}
+
 fn eff_indent(p: &docxcore::model::ParProps, inh: Inherited) -> EffIndent {
     // An explicit numId 0 is no list (#1728). No numId at all may still be
     // a level of the style's numbering, so it keeps its step. A left
@@ -8136,50 +8147,176 @@ mod level_indent_tests {
         assert_eq!(dragged_left_marker(start, -720), 0);
     }
 
-    /// B5: a list item's hang dragged away on the ruler stays away, after
-    /// the move and after a save and reload.
-    #[test]
-    fn a_first_line_dragged_to_zero_stays_zero() {
+    /// The styles and numbering above as a tab's parts, or none.
+    fn parts(with: bool) -> run_look::DocParts {
+        if !with {
+            return run_look::DocParts::default();
+        }
+        run_look::DocParts {
+            sheet: Some(std::rc::Rc::new(docxcore::styles::parse_styles_xml(STYLES))),
+            numbering: Some(std::rc::Rc::new(docxcore::numbering::parse_numbering_xml(
+                NUMBERING,
+            ))),
+            colors: None,
+        }
+    }
+
+    /// An editor over one paragraph of `props`, all selected.
+    fn editor(props: ParProps) -> docxcore::editor::Editor {
         let mut ed = docxcore::editor::Editor::new(Document {
             body: vec![Block::Paragraph(Paragraph {
-                props: item(Some(NUM_BULLET), 0, None),
+                props,
                 content: vec![Inline::Run(docxcore::model::Run {
                     text: "a".into(),
                     ..Default::default()
                 })],
             })],
         });
-        let props = |ed: &docxcore::editor::Editor| match &ed.doc.body[0] {
+        ed.select_all();
+        ed
+    }
+
+    fn props_of(ed: &docxcore::editor::Editor) -> ParProps {
+        match &ed.doc.body[0] {
             Block::Paragraph(p) => p.props.clone(),
             _ => panic!("a paragraph"),
+        }
+    }
+
+    /// (left, first) as drawn over `parts`.
+    fn drawn_in(p: &ParProps, parts: &run_look::DocParts) -> (i32, i32) {
+        let e = eff_indent(
+            p,
+            Inherited::of(p, parts.sheet.as_deref(), parts.numbering.as_deref()),
+        );
+        (e.left, e.first)
+    }
+
+    /// One ruler move of `handle` by `delta` twips, as `ruler_drag_move`
+    /// applies it: the change, then the zero pins.
+    fn ruler_move(
+        ed: &mut docxcore::editor::Editor,
+        parts: &run_look::DocParts,
+        handle: RulerHandle,
+        delta: i32,
+    ) {
+        let p = props_of(ed);
+        let start = eff_indent(
+            &p,
+            Inherited::of(&p, parts.sheet.as_deref(), parts.numbering.as_deref()),
+        );
+        let base = RulerIndentBase::of(ed, false, parts);
+        let d = RulerDrag {
+            handle,
+            start_x: 200.0,
+            zoom: 1.0,
+            indent: start,
+            page: docxcore::model::PageGeom::default(),
+            content_x: 300.0,
+            content_right: 900.0,
+            page_right: 100.0 + tw_px(docxcore::model::PageGeom::default().w, 1.0),
+            sect_checkpointed: false,
         };
-        let p = props(&ed);
-        assert_eq!(eff_indent(&p, Inherited::of(&p, None, None)).first, -360);
-        ed.select_all();
-        // RulerChange::First(0), as `ruler_drag_move` applies it.
-        ed.set_first_line(0);
-        ed.pin_zero_first_lines();
-        let p = props(&ed);
-        let e = eff_indent(&p, Inherited::of(&p, None, None));
-        assert_eq!((e.left, e.first), (720, 0));
+        match ruler_drag_result(d, 200.0 + tw_px(delta, 1.0)).change {
+            RulerChange::First(first) => {
+                ed.set_first_line(first);
+                ed.pin_zero_indents(|p| (false, inherits_nonzero(p, parts).1));
+            }
+            RulerChange::Left { indent, first } => {
+                let (paras, starts) = base.for_editor(false);
+                ed.set_indents_from(paras, |i, path| {
+                    ruler_left_for(
+                        indent,
+                        first,
+                        start.left,
+                        ruler_start_at(paras, starts, i, path),
+                    )
+                });
+                ed.pin_zero_indents(|p| inherits_nonzero(p, parts));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The first paragraph once saved into docxy's own package and opened.
+    fn reloaded(ed: &docxcore::editor::Editor) -> (ParProps, run_look::DocParts) {
         let pkg = docxcore::package::new_markdown_package(ed.doc.clone());
         let back =
             docxcore::package::load_package(&docxcore::package::save_package(&pkg)).expect("loads");
-        let numbering = docxcore::numbering::parse_numbering_xml(
-            &back.part_text("word/numbering.xml").expect("numbering"),
-        );
         let Some(Block::Paragraph(q)) = back.document.body.first() else {
             panic!("a paragraph")
         };
-        let e = eff_indent(&q.props, Inherited::of(&q.props, None, Some(&numbering)));
-        assert_eq!((e.left, e.first), (720, 0));
-        // Without the pin, the level's hang would come back.
-        let mut unpinned = props(&ed);
-        unpinned.shadow.clear();
-        assert_eq!(
-            eff_indent(&unpinned, Inherited::of(&unpinned, None, None)).first,
-            -360
+        let numbering = docxcore::numbering::parse_numbering_xml(
+            &back.part_text("word/numbering.xml").expect("numbering"),
         );
+        (
+            q.props.clone(),
+            run_look::DocParts {
+                numbering: Some(std::rc::Rc::new(numbering)),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// B5: a list item's hang dragged away on the ruler stays away, after
+    /// the move and after a save and reload.
+    #[test]
+    fn a_first_line_dragged_to_zero_stays_zero() {
+        let none = parts(false);
+        let mut ed = editor(item(Some(NUM_BULLET), 0, None));
+        assert_eq!(drawn_in(&props_of(&ed), &none), (720, -360));
+        // The first-line marker from 360 onto the left indent's 720.
+        ruler_move(&mut ed, &none, RulerHandle::FirstLine, 360);
+        assert_eq!(drawn_in(&props_of(&ed), &none), (720, 0));
+        let (q, saved) = reloaded(&ed);
+        assert_eq!(drawn_in(&q, &saved), (720, 0));
+        // Without the pin, the level's hang would come back.
+        let mut unpinned = props_of(&ed);
+        unpinned.shadow.clear();
+        assert_eq!(drawn_in(&unpinned, &none), (720, -360));
+    }
+
+    /// r1 M2: a Left drag to the margin of a paragraph drawn at an inherited
+    /// indent (a level's, docxy's own list's, a style's) stays at the
+    /// margin, in session and after a save and reload, as a style's first
+    /// line dragged to 0 does.
+    #[test]
+    fn an_inherited_indent_dragged_to_zero_stays_zero() {
+        let with = parts(true);
+        // A bullet at its level's 720/-360.
+        let mut ed = editor(item(Some(5), 0, None));
+        assert_eq!(drawn_in(&props_of(&ed), &with), (720, -360));
+        ruler_move(&mut ed, &with, RulerHandle::Left, -720);
+        assert_eq!(drawn_in(&props_of(&ed), &with), (0, 0));
+        let reparsed = docxcore::load::parse_document_xml(
+            &docxcore::serialize::document_to_xml(&ed.doc),
+            &docxcore::load::Relationships::default(),
+        );
+        let Some(Block::Paragraph(q)) = reparsed.body.first() else {
+            panic!("a paragraph")
+        };
+        assert_eq!(drawn_in(&q.props, &with), (0, 0), "after a reload");
+        // docxy's own bullet with no numbering part yet.
+        let none = parts(false);
+        let mut ed = editor(item(Some(NUM_BULLET), 0, None));
+        ruler_move(&mut ed, &none, RulerHandle::Left, -720);
+        assert_eq!(drawn_in(&props_of(&ed), &none), (0, 0));
+        let (q, saved) = reloaded(&ed);
+        assert_eq!(drawn_in(&q, &saved), (0, 0), "after a reload");
+        // A ListParagraph continuation (style left 720).
+        let mut ed = editor(item(None, 0, Some("ListParagraph")));
+        assert_eq!(drawn_in(&props_of(&ed), &with).0, 720);
+        ruler_move(&mut ed, &with, RulerHandle::Left, -720);
+        assert_eq!(drawn_in(&props_of(&ed), &with).0, 0);
+        // A style's first line (Wide: 1440, first line 100) dragged to 0.
+        let mut ed = editor(item(None, 0, Some("Wide")));
+        assert_eq!(drawn_in(&props_of(&ed), &with), (1440, 100));
+        ruler_move(&mut ed, &with, RulerHandle::FirstLine, -100);
+        assert_eq!(drawn_in(&props_of(&ed), &with), (1440, 0));
+        // A list with nothing inherited is not pinned (#1814 unchanged).
+        let mut ed = editor(item(Some(7), 1, None));
+        ruler_move(&mut ed, &none, RulerHandle::FirstLine, 0);
+        assert!(props_of(&ed).shadow.is_empty());
     }
 }
 
@@ -10817,10 +10954,11 @@ struct RenderCtx<'a> {
     /// Where each top-level paragraph's inline pictures are painted, for
     /// the harness (#1963); `None` records none.
     pictures: Option<&'a PaintedPictures>,
-    /// The blocks this block lies among (the body, a cell's), by its path's
-    /// last index: a bordered paragraph joins its neighbours' box (#2231).
-    /// `None` draws each paragraph's borders alone.
-    siblings: Option<&'a [Block]>,
+    /// The blocks drawn together with this one (the body, a cell's, a Print
+    /// Layout page's or column's range) and the index of the first of them:
+    /// a bordered paragraph joins its drawn neighbours' box (#2231). `None`
+    /// draws each paragraph's borders alone.
+    siblings: Option<(&'a [Block], usize)>,
     /// The gap (px) the container puts between its blocks (Print Layout's
     /// column), which a joined border box spans (#2231).
     block_gap: f32,
@@ -11074,6 +11212,7 @@ mod border_group_tests {
             bottom: Some(ParBorder::rule(BorderKind::Double)),
             right: Some(ParBorder::rule(BorderKind::Single)),
             between: Some(ParBorder::rule(BorderKind::Dashed)),
+            nil: 0,
         }
     }
 
@@ -11114,6 +11253,73 @@ mod border_group_tests {
         );
         // A lone paragraph draws all four.
         assert_eq!(kinds(BorderGroup::default())[0], ("top", Some(Single)));
+    }
+
+    fn para_with(borders: ParBorders, style: Option<&str>) -> Paragraph {
+        Paragraph {
+            props: docxcore::model::ParProps {
+                borders,
+                style_id: style.map(String::from),
+                ..Default::default()
+            },
+            content: Vec::new(),
+        }
+    }
+
+    /// r1 m4: a box split by a page or column break draws as two, each part
+    /// with its top and bottom: a neighbour outside the drawn range (the
+    /// slice starting at `from`) joins nothing.
+    #[test]
+    fn a_box_split_across_a_drawn_range_closes_at_its_edges() {
+        let body: Vec<Block> = (0..4)
+            .map(|_| Block::Paragraph(para_with(boxed(), None)))
+            .collect();
+        let page = &body[1..3];
+        let at = |k: usize| {
+            let Block::Paragraph(p) = &body[k] else {
+                panic!("a paragraph")
+            };
+            border_group_at(page, 1, k, p, None, None, 4.0)
+        };
+        assert_eq!((at(1).prev, at(1).next), (false, true));
+        assert_eq!((at(2).prev, at(2).next), (true, false));
+        // The whole body drawn together is one box.
+        let Block::Paragraph(p) = &body[1] else {
+            panic!("a paragraph")
+        };
+        let whole = border_group_at(&body, 0, 1, p, None, None, 4.0);
+        assert_eq!((whole.prev, whole.next), (true, true));
+    }
+
+    /// r1 M1: a paragraph whose `none` side cancels its style's rule draws
+    /// no rule and joins no box.
+    #[test]
+    fn a_cancelled_style_rule_draws_nothing_and_groups_nothing() {
+        let sheet = docxcore::styles::parse_styles_xml(
+            r#"<w:styles><w:style w:type="paragraph" w:styleId="Title"><w:pPr><w:pBdr>
+            <w:bottom w:val="single" w:sz="8" w:space="4" w:color="4F81BD"/></w:pBdr></w:pPr></w:style></w:styles>"#,
+        );
+        let mut none = ParBorders::default();
+        none.set_side(2, None);
+        let cancelled = para_with(none, Some("Title"));
+        let ruled = para_with(ParBorders::default(), Some("Title"));
+        let body = vec![
+            Block::Paragraph(cancelled.clone()),
+            Block::Paragraph(ruled.clone()),
+        ];
+        let shown = sheet.effective_borders(Some("Title"), cancelled.props.borders);
+        assert!(
+            drawn_sides(&shown, BorderGroup::default())
+                .iter()
+                .all(|(_, b)| b.is_none())
+        );
+        assert_eq!(
+            border_group_at(&body, 0, 0, &cancelled, Some(&sheet), None, 0.0),
+            BorderGroup::default()
+        );
+        // Its ruled neighbour does not join it either.
+        let g = border_group_at(&body, 0, 1, &ruled, Some(&sheet), None, 0.0);
+        assert!(!g.prev && !g.next);
     }
 
     #[test]
@@ -29051,12 +29257,19 @@ impl Docxy {
     fn ruler_drag_move(&mut self, x: f32, window: &mut Window, cx: &mut Context<Self>) {
         let Some(d) = self.ruler_drag else { return };
         let result = ruler_drag_result(d, x);
+        // What the paragraphs inherit below their own indents (#2231).
+        let parts = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.run_styles.borrow_mut().parts(t.pkg.as_ref()))
+            .unwrap_or_default();
         match result.change {
-            // A list item's first line moved to 0 is pinned there, or its
-            // level's hanging indent would come back (#2231).
+            // A first line moved to 0 is pinned there where something below
+            // it would give it one, or that would come back (#2231).
+            // It writes the first line only, so only that is pinned.
             RulerChange::First(first) => self.with_editor(window, cx, |e| {
                 e.set_first_line(first);
-                e.pin_zero_first_lines();
+                e.pin_zero_indents(|p| (false, inherits_nonzero(p, &parts).1));
             }),
             RulerChange::Left { indent, first } => {
                 // The pin is decided from the drag start, not an earlier move.
@@ -29076,7 +29289,9 @@ impl Docxy {
                         let start = ruler_start_at(paras, starts, i, path);
                         ruler_left_for(indent, first, caret_left, start)
                     });
-                    e.pin_zero_first_lines();
+                    // A left (or first line) moved to 0 over an inherited
+                    // one stays 0 (#2231 r1).
+                    e.pin_zero_indents(|p| inherits_nonzero(p, &parts));
                 });
                 self.ruler_indent_base = base;
             }
@@ -38463,14 +38678,8 @@ fn paragraph_el(
     let is_heading = p.props.heading_level.is_some();
     // The mark's look: the list number's (#1986), and an empty line's size.
     let mark = shown_mark(p, styler);
-    let pbox = para_box(
-        &p.props.spacing,
-        flow.flow,
-        is_heading,
-        base,
-        para_text_px(p, styler, &mark, base, zoom),
-        zoom,
-    );
+    let text_px = para_text_px(p, styler, &mark, base, zoom);
+    let pbox = para_box(&p.props.spacing, flow.flow, is_heading, base, text_px, zoom);
     let mut painted_runs: Vec<PaintedRun> = Vec::new();
     let mut painted_marker: Option<PaintedMarker> = None;
     let mut painted_highlights: Vec<(String, u32, u32)> = Vec::new();
@@ -38511,26 +38720,23 @@ fn paragraph_el(
     // `line_numbers::caret_height`).
     let line_h = pbox.line_h;
     let caret_h = line_numbers::caret_height(line_h);
-    // A highlight's band (#2231): the line's single-spaced height.
-    let band = {
+    // Hyperlinks opened up into their pieces, so text, tabs and breaks inside a
+    // link take caret offsets exactly as the editor counts them.
+    let items = flat_inlines(&p.content);
+    // A highlight's band (#2231): the line's single-spaced height, worked
+    // out only for a paragraph that has a highlighted run.
+    let highlighted = items
+        .iter()
+        .any(|(i, _)| matches!(&**i, Inline::Run(r) if styler.shown(r).highlight.is_some()));
+    let band = highlighted.then(|| {
         let single = docxcore::model::Spacing {
             line: Some(240),
             line_rule: Some("auto".into()),
             ..p.props.spacing.clone()
         };
-        let one = para_box(
-            &single,
-            flow.flow,
-            is_heading,
-            base,
-            para_text_px(p, styler, &mark, base, zoom),
-            zoom,
-        );
+        let one = para_box(&single, flow.flow, is_heading, base, text_px, zoom);
         highlight_band(line_h, one.line_h)
-    };
-    // Hyperlinks opened up into their pieces, so text, tabs and breaks inside a
-    // link take caret offsets exactly as the editor counts them.
-    let items = flat_inlines(&p.content);
+    });
     // Only paragraphs that actually contain a tab (or an alignment tab, #768)
     // need per-run width measurement.
     let has_tab = items
@@ -38662,19 +38868,8 @@ fn paragraph_el(
             Inline::Run(r) => {
                 let shown = styler.shown(r);
                 emit_run(
-                    &mut spans,
-                    &r.text,
-                    &shown,
-                    base,
-                    in_link,
-                    &mut idx,
-                    &mut caret,
-                    sel,
-                    click,
-                    pal,
-                    caret_h,
-                    zoom,
-                    Some(band),
+                    &mut spans, &r.text, &shown, base, in_link, &mut idx, &mut caret, sel, click,
+                    pal, caret_h, zoom, band,
                 );
                 if let Some(inks) = flow.inks {
                     if !r.text.trim().is_empty() {
@@ -39310,7 +39505,7 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                 cell_run: Some(&cb.run),
                 // A nested table fits its cell when this one was fitted.
                 fit_width: fit.map(|_| text_w),
-                siblings: Some(&cell.blocks),
+                siblings: Some((&cell.blocks, 0)),
                 block_gap: 0.0,
                 ..ctx
             };
@@ -39613,34 +39808,56 @@ fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -
 
 /// [`BorderGroup`] of `p` at `path` among `ctx.siblings` (#2231).
 fn paragraph_border_group(p: &Paragraph, path: &[usize], ctx: RenderCtx) -> BorderGroup {
-    let sheet = ctx.tbl.sheet.as_deref();
-    let numbering = ctx.tbl.numbering.as_deref();
+    match (ctx.siblings, path.last()) {
+        (Some((blocks, from)), Some(&k)) => border_group_at(
+            blocks,
+            from,
+            k,
+            p,
+            ctx.tbl.sheet.as_deref(),
+            ctx.tbl.numbering.as_deref(),
+            ctx.block_gap,
+        ),
+        _ => BorderGroup::default(),
+    }
+}
+
+/// [`BorderGroup`] of paragraph `p`, block `k`, among `blocks`, the blocks
+/// drawn together starting at block `from` (a page's or column's range in
+/// Print Layout, #2231 r1): a neighbour outside them (on another page or in
+/// another column) joins nothing, so each part of a box split there draws
+/// its own top and bottom.
+fn border_group_at(
+    blocks: &[Block],
+    from: usize,
+    k: usize,
+    p: &Paragraph,
+    sheet: Option<&docxcore::styles::StyleSheet>,
+    numbering: Option<&docxcore::numbering::Numbering>,
+    gap: f32,
+) -> BorderGroup {
     let key = |q: &Paragraph| -> BorderKey {
         let b = sheet.map_or(q.props.borders, |s| {
             s.effective_borders(q.props.style_id.as_deref(), q.props.borders)
         });
         b.any().then(|| {
             let e = eff_indent(&q.props, Inherited::of(&q.props, sheet, numbering));
-            (b, e.left, e.right)
+            // Compared by the sides drawn only: a cancel says nothing more.
+            (docxcore::model::ParBorders { nil: 0, ..b }, e.left, e.right)
         })
     };
     let cur = key(p);
-    let (Some(sib), Some(&k)) = (ctx.siblings, path.last()) else {
+    let Some(local) = k.checked_sub(from) else {
         return BorderGroup::default();
     };
     if cur.is_none() {
         return BorderGroup::default();
     }
-    let at = |j: Option<usize>| match j.and_then(|j| sib.get(j)) {
+    let at = |j: Option<usize>| match j.and_then(|j| blocks.get(j)) {
         Some(Block::Paragraph(q)) => key(q),
         _ => None,
     };
-    border_group(
-        at(k.checked_sub(1)),
-        cur,
-        at(k.checked_add(1)),
-        ctx.block_gap,
-    )
+    border_group(at(local.checked_sub(1)), cur, at(local.checked_add(1)), gap)
 }
 
 /// `block_el` for a Print Layout band, where a numbered top-level paragraph
@@ -46410,7 +46627,7 @@ impl Render for Docxy {
                             fit_width: used_w,
                             flow: true,
                             paras: doc_view::harness().then_some(&painted_paras),
-                            siblings: Some(body),
+                            siblings: Some((body, 0)),
                             ..ctx
                         };
                         // The column puts 4 px between blocks as each

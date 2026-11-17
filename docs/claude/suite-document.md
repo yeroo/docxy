@@ -568,10 +568,15 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   paragraph's own (`effective_borders`, each side apart), each an absolute
   strip on an inner box at the indents (outside the text by `w:space` pt,
   `w:sz/8` pt wide, at least 1 px), inside the paragraph's spacing, in
-  `border_ink(shown_color)` (a theme colour first, then `w:color`). gpui
+  `border_ink(shown_color)` (a theme colour first, then `w:color`). A side
+  given as `none`/`nil` (`ParBorders::nil`, Word's removed rule) cancels
+  the style's below it, direct or in a derived style, and saves back as
+  loaded, or as `w:val="nil"` when the borders are rewritten. gpui
   draws one colour per div border, hence the strips. Word's grouping
   (`paragraph_border_group`, `border_group`, `drawn_sides`): consecutive
-  paragraphs among `RenderCtx::siblings` (the body, a cell's blocks) with
+  paragraphs among `RenderCtx::siblings` (the blocks drawn together: the
+  body, a cell's, a Print Layout page's or column's range, so a box split
+  by a break closes on each side of it; `border_group_at`) with
   equal borders and drawn indents share a box: its top on the first,
   `w:between` above each later one, its bottom on the last, the spacing
   and the container's `block_gap` (Print Layout's column `gap_1`) inside
