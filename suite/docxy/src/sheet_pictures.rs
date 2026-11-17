@@ -156,6 +156,43 @@ pub fn anchor_span(
     }
 }
 
+/// The spans of `sh`'s pictures (`DrawingKind::Image`, in drawing order),
+/// over Excel's sizes, walks stopping at `rows_end` / `cols_end`. Computed
+/// once a frame and shared by the picture layer and the fill handle's check.
+pub fn sheet_spans(sh: &Sheet, rows_end: u32, cols_end: u32) -> Vec<Span> {
+    let excel_row = |r: u32| sheet_row_emu(sh, r);
+    let excel_col = |c: u32| sheet_col_emu(sh, c);
+    // Step 1 reads only Excel's sizes; the drawn ones are step 2's.
+    let unused = |_: u32| 0.0;
+    let rows = Axis {
+        excel: &excel_row,
+        drawn: &unused,
+        end: rows_end,
+    };
+    let cols = Axis {
+        excel: &excel_col,
+        drawn: &unused,
+        end: cols_end,
+    };
+    sh.drawings
+        .iter()
+        .filter(|d| matches!(d.kind, gridcore::sheet::DrawingKind::Image { .. }))
+        .map(|d| anchor_span(&d.anchor, d.from, d.to, &rows, &cols))
+        .collect()
+}
+
+/// Whether a picture over `span` covers the bottom-right corner of cell
+/// `(row, col)`, where the fill handle sits: the corner lies strictly
+/// inside the span on both axes.
+pub fn covers_corner(span: &Span, (row, col): (u32, u32)) -> bool {
+    let inside = |(a, b): (CellPos, CellPos), cell: u32| {
+        // The corner is the start of the next cell.
+        let corner = cell.saturating_add(1);
+        a.cell < corner && (corner < b.cell || (corner == b.cell && b.frac > 0.0))
+    };
+    inside(span.rows, row) && inside(span.cols, col)
+}
+
 /// Step 2: how far `p` lies from the start of cell `origin`, in drawn px —
 /// negative before it. It walks only the cells between the two,
 /// at most [`MAX_WALK`].
@@ -220,16 +257,16 @@ pub fn piece(
 mod tests {
     use super::*;
 
-    /// A 15 pt row as the grid draws it (`row_height_px`, gridline inside),
-    /// and a 30 pt one.
     /// EMU per 96-dpi pixel, for Excel's column widths.
     const EMU_PER_PX: i64 = 9525;
+    /// A 15 pt row as the grid draws it (`row_height_px`, gridline inside),
+    /// and a 30 pt one.
     const R: f32 = 21.0;
     const TALL: f32 = 42.0;
 
     /// The sizes of a small sheet: rows of 15 pt drawn at 21 px, with row 3
-    /// 30 pt (42 px) and row 5 hidden; columns of 8.43 units (64 Excel px)
-    /// drawn at 65 px (file width 9.140625), with column 2 hidden (Excel 0, the grid's 28 px).
+    /// 30 pt (42 px) and row 5 hidden; columns of file width 9.140625 (64 Excel
+    /// px) drawn at 65 px, with column 2 hidden (Excel 0, the grid's 28 px).
     fn excel_row(r: u32) -> i64 {
         match r {
             3 => 30 * EMU_PER_PT,
@@ -665,5 +702,59 @@ mod tests {
             ..DrawingAnchor::default()
         };
         let _ = anchor_span(&absolute, (0, 0), (0, 0), &rows, &cols);
+    }
+
+    /// The fill handle hides under a picture's span as the layer places it,
+    /// not under gridcore's cell estimate: a one-cell picture over 30 pt rows
+    /// and wide columns covers fewer cells than 20 px rows and 64 px columns
+    /// would say.
+    #[test]
+    fn a_picture_covers_the_handle_only_where_its_span_reaches() {
+        use gridcore::sheet::{Drawing, DrawingKind};
+        let mut sh = Sheet::default();
+        for r in 0..20 {
+            sh.set_row_height(r, Some(30.0));
+        }
+        for c in 0..10 {
+            sh.set_col_width(c, 20.7109375);
+        }
+        // 2 columns of 145 px and 3 rows of 30 pt, from B2.
+        let anchor = DrawingAnchor {
+            kind: AnchorKind::OneCell,
+            ext: Some((2 * 145 * EMU_PER_PX, 3 * 30 * EMU_PER_PT)),
+            ..DrawingAnchor::default()
+        };
+        sh.drawings.push(Drawing {
+            anchor_ix: 0,
+            from: (1, 1),
+            // gridcore's estimate at 20 px rows and 64 px columns.
+            to: (1 + 6, 1 + 4),
+            kind: DrawingKind::Image {
+                part: "xl/media/image1.png".into(),
+                name: "Picture 1".into(),
+            },
+            anchor,
+        });
+        let spans = sheet_spans(&sh, 1000, 256);
+        assert_eq!(spans.len(), 1);
+        let s = &spans[0];
+        assert_eq!(s.rows.1, CellPos { cell: 4, frac: 0.0 });
+        assert_eq!(s.cols.1, CellPos { cell: 3, frac: 0.0 });
+        // It covers B2:C4: the corners of B2 and B3 lie inside it; the
+        // corners of column C and row 4 lie on its edges.
+        assert!(covers_corner(s, (1, 1)));
+        assert!(covers_corner(s, (2, 1)));
+        assert!(
+            !covers_corner(s, (2, 2)),
+            "column C's corner is the right edge"
+        );
+        assert!(
+            !covers_corner(s, (3, 1)),
+            "row 4's corner is the bottom edge"
+        );
+        assert!(!covers_corner(s, (2, 3)), "column D is past it");
+        // Inside gridcore's estimate, outside the span: the handle shows.
+        assert!(!covers_corner(s, (5, 4)));
+        assert!(!covers_corner(s, (0, 1)), "above it");
     }
 }

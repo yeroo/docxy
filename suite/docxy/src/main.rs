@@ -1014,6 +1014,10 @@ struct SheetView {
     /// count each render; visible rows are re-measured every layout, so height
     /// changes take effect without an explicit reset.
     vlist: ListState,
+    /// The frozen rows' laid-out height as the last frame drew them, with
+    /// the frozen row count it was measured at (#2228): a wrapped frozen row
+    /// grows past its min height, which the picture layer's panes must follow.
+    frozen_band: std::rc::Rc<std::cell::Cell<(usize, f32)>>,
     /// Why the last commit or sort was refused (an entry over the cell
     /// limit, or a formula that does not parse: `formula_error`; a sort whose
     /// rows cut a spilled array: `SORT_CUTS_SPILL`); the host shows it in
@@ -15087,6 +15091,7 @@ fn new_sheet_surface() -> Surface {
         pivot_views: vec![],
         charts: vec![],
         vlist: ListState::new(0, ListAlignment::Top, px(400.)),
+        frozen_band: Default::default(),
         col0: 0,
         follow_sel: (0, 0),
         reveal_col: None,
@@ -15193,6 +15198,7 @@ fn sheet_load(path: &PathBuf, repair: bool, fresh_volatile: bool) -> (Surface, S
                     pivot_views: vec![],
                     charts: vec![],
                     vlist: ListState::new(0, ListAlignment::Top, px(400.)),
+                    frozen_band: Default::default(),
                     col0: 0,
                     follow_sel: (0, 0),
                     reveal_col: None,
@@ -48948,6 +48954,22 @@ struct PictureGrid<'a> {
     top_offset: f32,
     /// The row list, for the heights it measured.
     vlist: &'a ListState,
+    /// The pictures' spans, in drawing order ([`sheet_pictures::sheet_spans`]).
+    spans: &'a [sheet_pictures::Span],
+    /// The frozen band's height the last frame laid out, and its row count.
+    frozen_band: (usize, f32),
+}
+
+/// The frozen band's height for the picture layer's panes (#2228): the
+/// height the last frame laid it out at, when it was measured with the same
+/// `fr` frozen rows (a wrapped frozen row grows past its min height), else
+/// the rows' min heights summed (`min_sum`: before the first layout, or
+/// right after the freeze changed).
+fn frozen_band_px(measured: (usize, f32), fr: usize, min_sum: f32) -> f32 {
+    match measured {
+        (n, h) if fr > 0 && n == fr && h > 0.0 => h,
+        _ => min_sum,
+    }
 }
 
 /// How many measured rows the picture layer reads from the list: more than
@@ -49034,7 +49056,11 @@ fn sheet_picture_layer(
     // The rows' panes: the frozen band is the first `fr` VISIBLE rows, as the
     // grid draws it, and the scrolled one starts at the list's top item.
     let mut row_panes: PicturePanes = Vec::new();
-    let band: f32 = grid.visible[..grid.fr].iter().map(|&r| drawn_row(r)).sum();
+    let band = frozen_band_px(
+        grid.frozen_band,
+        grid.fr,
+        grid.visible[..grid.fr].iter().map(|&r| drawn_row(r)).sum(),
+    );
     if grid.fr > 0 {
         let last = grid.visible[grid.fr - 1];
         row_panes.push((
@@ -49094,10 +49120,7 @@ fn sheet_picture_layer(
         },
     ));
 
-    let spans: Vec<sheet_pictures::Span> = images
-        .iter()
-        .map(|(d, ..)| sheet_pictures::anchor_span(&d.anchor, d.from, d.to, &rows, &cols))
-        .collect();
+    let spans = grid.spans;
     let mut layer = div().absolute().left_0().top_0().size_full();
     let (rp_last, cp_last) = (row_panes.len() - 1, col_panes.len() - 1);
     for (ri, &(y0, h, row_pane)) in row_panes.iter().enumerate() {
@@ -49113,7 +49136,7 @@ fn sheet_picture_layer(
             };
             // The harness's `picture:N` is the piece in the scrolled cells.
             let main = ri == rp_last && ci == cp_last;
-            for (i, ((_, part, name), span)) in images.iter().zip(&spans).enumerate() {
+            for (i, ((_, part, name), span)) in images.iter().zip(spans.iter()).enumerate() {
                 let Some((x, y, pw, ph)) =
                     sheet_pictures::piece(&rows, &cols, row_pane, col_pane, *span)
                 else {
@@ -49483,15 +49506,14 @@ fn sheet_el(
             br < rr && bc < cc
         })
     };
-    // A floating picture covers the handle too (#2228): the corner of a cell
-    // strictly inside its cell span (the cells it ends in may be covered only
-    // in part, so they keep the handle).
+    // The pictures' spans (#2228), as the picture layer places them: computed
+    // once, for the layer and for the fill handle, which a picture covers
+    // when the selection's corner lies strictly inside its span.
+    let picture_spans = sheet_pictures::sheet_spans(sh, total_rows as u32, MAX_VISIBLE_COL + 1);
     let corner_under_chart = corner_under_chart
-        || sh.drawings.iter().any(|d| {
-            matches!(d.kind, gridcore::sheet::DrawingKind::Image { .. })
-                && (d.from.0..d.to.0).contains(&r1)
-                && (d.from.1..d.to.1).contains(&c1)
-        });
+        || picture_spans
+            .iter()
+            .any(|span| sheet_pictures::covers_corner(span, (r1, c1)));
     // Visible rows (filter/hide skips `hidden="1"` rows) — the list virtualizes
     // over these, so a filtered-out row collapses instead of showing blank.
     // Built before the overlay is finished because every outline is snapped
@@ -49581,7 +49603,22 @@ fn sheet_el(
     // Frozen top rows (Excel freeze panes, rows axis): pinned below the header,
     // outside the virtualized list, so they stay put while the rest scrolls.
     let fr = (frz_r as usize).min(visible.len()).min(30);
-    let mut frozen = v_flex().flex_none();
+    // The band's laid-out height, for the picture layer's panes next frame
+    // (`frozen_band_px`): an absolute canvas does not take part in the layout.
+    let band_cell = view.frozen_band.clone();
+    let mut frozen = v_flex().flex_none().relative().child(
+        canvas(
+            move |b: Bounds<Pixels>, _w: &mut Window, _a: &mut App| {
+                band_cell.set((fr, f32::from(b.size.height)));
+            },
+            |_b, _s, _w, _a| {},
+        )
+        .absolute()
+        .left_0()
+        .top_0()
+        .right_0()
+        .bottom_0(),
+    );
     for i in 0..fr {
         frozen = frozen.child(sheet_row(
             view,
@@ -49939,6 +49976,8 @@ fn sheet_el(
             top_item: top.item_ix,
             top_offset: f32::from(top.offset_in_item),
             vlist: &view.vlist,
+            spans: &picture_spans,
+            frozen_band: view.frozen_band.get(),
         },
         chart_ui.picture_sel,
         pics,

@@ -133,10 +133,17 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   list and the horizontal scroll reach the drawings too
   (`SheetView::list_rows` and `hscroll_max`, over `view_extent`, capped at
   `DRAWING_REACH_ROWS` rows); `extent` stays the used range for find, Ctrl+A
-  and the rest. There is no sheet zoom, so the geometry takes none. The rows
-  above the list's top item and the frozen band
-  are not measured (`ListState::bounds_for_item` has none for them), so a
-  tall text row there is taken at its min height.
+  and the rest. There is no sheet zoom, so the geometry takes none. The
+  frozen band's height is the one the last frame laid out (a canvas on the
+  frozen rows, `SheetView::frozen_band`, used while its `fr` matches:
+  `frozen_band_px`), so a wrapped frozen header moves the scrolled pane down.
+  The rows inside the band and above the list's top item are not measured
+  (`ListState::bounds_for_item` has none for them), so a tall text row there
+  is taken at its min height.
+- The spans are computed once a frame (`sheet_pictures::sheet_spans`) for the
+  layer and for the fill handle, which a picture hides when the selection's
+  corner lies strictly inside its span (`covers_corner`), over Excel's sizes
+  rather than gridcore's estimated `to` cells.
 - `pictures::Cache::sheet_image` keys a sheet's media by part: the same bytes
   (address and length) reuse the image, moved bytes are compared with the
   image's, changed bytes make a new one and retire the old. Media gpui can't

@@ -2574,3 +2574,15 @@ fn the_row_list_and_the_side_scroll_reach_a_far_picture() {
     assert_eq!(v.hscroll_max(), 40);
     assert_eq!(v.extent(), (2, 1), "the used range is the cells'");
 }
+
+/// The picture layer's frozen band follows the band as laid out (#2228): a
+/// wrapped frozen header grows past its rows' min heights, and the pictures'
+/// panes must start where the scrolled rows do. Before the first layout, or
+/// once the freeze has changed, the min heights stand in.
+#[test]
+fn the_frozen_band_is_the_laid_out_one_when_it_matches() {
+    assert_eq!(frozen_band_px((2, 63.0), 2, 42.0), 63.0, "measured");
+    assert_eq!(frozen_band_px((0, 0.0), 2, 42.0), 42.0, "not laid out yet");
+    assert_eq!(frozen_band_px((1, 40.0), 2, 42.0), 42.0, "another freeze");
+    assert_eq!(frozen_band_px((2, 63.0), 0, 0.0), 0.0, "no freeze");
+}

@@ -438,6 +438,8 @@ State keys, as the app reports them after every driving verb:
 | `comment_cell` | the cell the comment editor writes to (`null` when closed) |
 | `comment` | the selected cell's note text (`null` when it has none) |
 | `chart_sel`, `panel_chart`, `charts` | chart selection and the panel |
+| `picture_sel` | the selected floating picture's index among the sheet's pictures in drawing order (#2228), or null |
+| `sheet_scroll` | the row list's top item: how far the rows are scrolled, counted past the frozen rows and without the hidden ones (#2228) |
 | `field`, `field_text` | the focused reference field, and its buffer |
 | `filling`, `fill_preview`, `dragging` | the auto-fill and the sweep |
 | `picking`, `range_preview`, `sel_hidden` | point mode |
@@ -1161,7 +1163,7 @@ the state plus `filled`, the filled box (`B4:B8`), or `null` when released on
 the source. Refused:
 
 - while the handle is not drawn: `the fill handle is not shown: a cell is being
-  edited`, `… a reference is being pointed at`, `… a chart is selected`,
+  edited`, `… a reference is being pointed at`, `… a chart or picture is selected`,
   `… the fill handle is turned off in Settings` (#672)
   (`fill_handle_hidden`, the grid's own condition), or `… File (backstage) is
   open`; or while `the fill handle is covered: the more-tabs list is open`. An
@@ -1753,7 +1755,10 @@ have. `word-header-footer.uit` drives these over a three-section document.
 
 ### Regions
 
-`window`, `grid`, `chart-panel`, `cell:B3`, `cell:A1:C5`, `chart:0`, `gantt`,
+`window`, `grid`, `chart-panel`, `cell:B3`, `cell:A1:C5`, `chart:0`,
+`picture:<index>` (a floating picture's piece in the scrolled cells, by its
+index in drawing order, #2228; the whole piece, which may run past the view,
+and an error when that piece is not drawn), `gantt`,
 `bar:<id>` (for example `bar:3`), `project-heading:<heading>` (for example
 `project-heading:Duration`), `project-heading-arrow:<heading>` and
 `project-heading-edge:<heading>` (a heading's AutoFilter arrow and resize zone,
