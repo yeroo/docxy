@@ -41,6 +41,8 @@ struct Level {
     start: i32,
     /// `w:pStyle`: the paragraph style this level belongs to.
     p_style: Option<String>,
+    /// `w:pPr/w:ind`: the indent an item at this level takes (#2231).
+    indent: LevelIndent,
 }
 
 impl Default for Level {
@@ -50,8 +52,19 @@ impl Default for Level {
             text: "%1.".to_string(),
             start: 1,
             p_style: None,
+            indent: LevelIndent::default(),
         }
     }
+}
+
+/// A list level's own indent (`w:lvl/w:pPr/w:ind`), in twips: `left` from
+/// `w:left` (else `w:start`), `first` from `w:hanging` as a negative first
+/// line (else `w:firstLine`). An attribute the level leaves out, or one that
+/// is not a number, is `None` (#2231).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LevelIndent {
+    pub left: Option<i32>,
+    pub first: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -81,6 +94,23 @@ impl Numbering {
     /// defined or `ilvl` is past its highest defined level. A level skipped
     /// below the highest one comes back as the default decimal `%1.` level,
     /// as the markers number it.
+    /// The indent level `ilvl` of list `num_id` gives its items, when the
+    /// numbering defines that level with a `w:ind`; `None` otherwise (#2231).
+    pub fn level_indent(&self, num_id: i32, ilvl: i32) -> Option<LevelIndent> {
+        let abs = self.abstracts.get(self.num_to_abstract.get(&num_id)?)?;
+        let level = abs.levels.get(usize::try_from(ilvl).ok()?)?;
+        let ind = level.indent;
+        (ind.left.is_some() || ind.first.is_some()).then_some(ind)
+    }
+
+    /// Whether the numbering defines list `num_id` (a `w:num` naming an
+    /// abstract it has).
+    pub fn defines(&self, num_id: i32) -> bool {
+        self.num_to_abstract
+            .get(&num_id)
+            .is_some_and(|a| self.abstracts.contains_key(a))
+    }
+
     pub fn level(&self, num_id: i32, ilvl: i32) -> Option<LevelDef> {
         let abs = self.abstracts.get(self.num_to_abstract.get(&num_id)?)?;
         let level = abs.levels.get(usize::try_from(ilvl).ok()?)?;
@@ -345,6 +375,10 @@ fn parse_level(p: &mut XmlParser) -> Level {
                         XmlParser::append_decoded(p.attr("w:val"), &mut t);
                         lvl.text = t;
                     }
+                    "w:pPr" => {
+                        lvl.indent = parse_level_ind(p);
+                        continue;
+                    }
                     _ => {}
                 }
                 p.skip_element();
@@ -354,6 +388,27 @@ fn parse_level(p: &mut XmlParser) -> Level {
         }
     }
     lvl
+}
+
+/// A level's `w:pPr` (the parser just past its start tag), read to its end
+/// tag for the `w:ind`.
+fn parse_level_ind(p: &mut XmlParser) -> LevelIndent {
+    let mut ind = LevelIndent::default();
+    loop {
+        match p.next() {
+            Event::Start => {
+                if p.name() == "w:ind" {
+                    let num = |a: &str| p.attr(a).trim().parse::<i32>().ok();
+                    ind.left = num("w:left").or_else(|| num("w:start"));
+                    ind.first = num("w:hanging").map(|h| -h).or_else(|| num("w:firstLine"));
+                }
+                p.skip_element();
+            }
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    ind
 }
 
 fn parse_num(p: &mut XmlParser) -> Option<i32> {
@@ -511,6 +566,32 @@ pub fn heading_chapters(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2231: a level's `w:pPr/w:ind`, `w:hanging` as a negative first line;
+    /// a level without one, or a list not defined, has none.
+    #[test]
+    fn level_indent_reads_the_levels_ind() {
+        let n = parse_numbering_xml(
+            r#"<w:numbering><w:abstractNum w:abstractNumId="7">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="&#xF0B7;"/>
+              <w:pPr><w:tabs><w:tab w:val="num" w:pos="720"/></w:tabs><w:ind w:left="720" w:hanging="360"/></w:pPr>
+              <w:rPr><w:rFonts w:ascii="Symbol"/></w:rPr></w:lvl>
+            <w:lvl w:ilvl="1"><w:numFmt w:val="decimal"/><w:pPr><w:ind w:start="1440" w:firstLine="200"/></w:pPr></w:lvl>
+            <w:lvl w:ilvl="2"><w:numFmt w:val="decimal"/><w:lvlText w:val="%3)"/></w:lvl>
+            <w:lvl w:ilvl="3"><w:pPr><w:ind w:left="x" w:hanging="360"/></w:pPr></w:lvl>
+            </w:abstractNum><w:num w:numId="4"><w:abstractNumId w:val="7"/></w:num></w:numbering>"#,
+        );
+        let ind = |l, f| Some(LevelIndent { left: l, first: f });
+        assert_eq!(n.level_indent(4, 0), ind(Some(720), Some(-360)));
+        assert_eq!(n.level_indent(4, 1), ind(Some(1440), Some(200)));
+        assert_eq!(n.level_indent(4, 2), None);
+        assert_eq!(n.level_indent(4, 3), ind(None, Some(-360)));
+        assert_eq!(n.level_indent(5, 0), None);
+        assert!(n.defines(4) && !n.defines(5));
+        // The rest of the level still reads past its w:pPr.
+        assert_eq!(n.level(4, 2).map(|l| l.text), Some("%3)".to_string()));
+        assert_eq!(n.level(4, 0).map(|l| l.format), Some(NumFmt::Bullet));
+    }
     use crate::model::{Inline, ParProps, Paragraph, Run, RunProps};
 
     const NUM_XML: &str = r#"<w:numbering>

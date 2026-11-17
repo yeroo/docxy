@@ -128,10 +128,16 @@ pub struct StyleSheet {
 /// its character units (`w:leftChars`, else `w:startChars`, a zero
 /// included: it cancels an inherited count) apart, as Word inherits each
 /// from the most-derived style that sets it (#1815).
+///
+/// The first line rides along (#2231): its twips (`w:hanging` as a negative
+/// value, else `w:firstLine`) and its character units (`w:hangingChars`,
+/// else `w:firstLineChars`), each inherited the same way.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct LeftInd {
     twips: Option<i32>,
     chars: Option<i32>,
+    first: Option<i32>,
+    first_chars: Option<i32>,
 }
 
 impl LeftInd {
@@ -140,6 +146,8 @@ impl LeftInd {
         LeftInd {
             twips: self.twips.or(base.twips),
             chars: self.chars.or(base.chars),
+            first: self.first.or(base.first),
+            first_chars: self.first_chars.or(base.first_chars),
         }
     }
 }
@@ -546,6 +554,30 @@ impl StyleSheet {
         left.twips
     }
 
+    /// The left indent, in twips, a paragraph with no direct one draws at
+    /// from its styles (#2231): [`Self::style_left_indent`]'s chain, but
+    /// `None` where a nonzero character count wins, as the page view does
+    /// not draw character units.
+    pub fn style_left_twips(&self, para_style: Option<&str>) -> Option<i32> {
+        let left = self.inherited_left(para_style);
+        if left.chars.is_some_and(|c| c != 0) {
+            return None;
+        }
+        left.twips
+    }
+
+    /// The first-line indent, in twips (a hanging indent negative), a
+    /// paragraph with no direct one takes from its styles, over the same
+    /// chain as [`Self::style_left_twips`]; `None` where nothing sets one or
+    /// a nonzero character count wins (#2231).
+    pub fn style_first_line(&self, para_style: Option<&str>) -> Option<i32> {
+        let ind = self.inherited_left(para_style);
+        if ind.first_chars.is_some_and(|c| c != 0) {
+            return None;
+        }
+        ind.first
+    }
+
     /// Whether the left indent a paragraph inherits is a nonzero character
     /// count, which a direct `w:left` beats only beside a `w:leftChars="0"`.
     pub fn style_left_in_chars(&self, para_style: Option<&str>) -> bool {
@@ -874,6 +906,10 @@ fn parse_ind_left(p: &XmlParser) -> LeftInd {
     LeftInd {
         twips: num("w:left").or_else(|| num("w:start")),
         chars: num("w:leftChars").or_else(|| num("w:startChars")),
+        first: num("w:hanging").map(|h| -h).or_else(|| num("w:firstLine")),
+        first_chars: num("w:hangingChars")
+            .map(|h| -h)
+            .or_else(|| num("w:firstLineChars")),
     }
 }
 
@@ -1503,6 +1539,27 @@ mod tests {
     /// #1815 r1: the twips and the character units are inherited apart, so
     /// a derived `w:left` does not hide a base's character count, and a
     /// derived zero count cancels it.
+    /// #2231: the twips the page view draws a style's indent at, the first
+    /// line too, each from the most-derived style that sets it; a nonzero
+    /// character count is not a width.
+    #[test]
+    fn style_left_twips_and_first_line_follow_the_chain() {
+        let ss = parse_styles_xml(
+            r#"<w:styles>
+            <w:docDefaults><w:pPrDefault><w:pPr><w:ind w:firstLine="100"/></w:pPr></w:pPrDefault></w:docDefaults>
+            <w:style w:type="paragraph" w:styleId="ListParagraph"><w:pPr><w:ind w:left="720"/></w:pPr></w:style>
+            <w:style w:type="paragraph" w:styleId="Hang"><w:basedOn w:val="ListParagraph"/><w:pPr><w:ind w:hanging="360"/></w:pPr></w:style>
+            <w:style w:type="paragraph" w:styleId="Chars"><w:basedOn w:val="Hang"/><w:pPr><w:ind w:leftChars="200" w:hangingChars="100"/></w:pPr></w:style>
+            </w:styles>"#,
+        );
+        let both = |s: Option<&str>| (ss.style_left_twips(s), ss.style_first_line(s));
+        assert_eq!(both(Some("ListParagraph")), (Some(720), Some(100)));
+        assert_eq!(both(Some("Hang")), (Some(720), Some(-360)));
+        assert_eq!(both(Some("Chars")), (None, None));
+        assert_eq!(ss.style_left_indent(Some("Chars")), Some(1));
+        assert_eq!(both(None), (None, Some(100)));
+    }
+
     #[test]
     fn style_left_indent_inherits_twips_and_chars_apart() {
         let ss = parse_styles_xml(

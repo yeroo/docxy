@@ -709,6 +709,30 @@ impl ParProps {
         crate::serialize::shadow_has_attr(&self.shadow, "ind", crate::serialize::IND_LEFT)
     }
 
+    /// Whether a first-line attribute (`w:firstLine`, `w:hanging` or their
+    /// character units) was loaded and not since replaced, whatever its
+    /// value (#2231).
+    pub fn has_loaded_first_line(&self) -> bool {
+        crate::serialize::shadow_has_attr(&self.shadow, "ind", crate::serialize::IND_FIRST_LINE)
+    }
+
+    /// Whether the paragraph has a first-line indent of its own: a nonzero
+    /// one, or one loaded or pinned (a `w:firstLine="0"` included). It
+    /// replaces a list level's and a style's, as Word reads the file (#2231).
+    pub fn has_direct_first_line(&self) -> bool {
+        self.first_line != 0 || self.has_loaded_first_line()
+    }
+
+    /// Set the first line to `twips` and pin it as an explicit `w:firstLine`
+    /// (or `w:hanging`) in the loaded `w:ind` (see
+    /// `serialize::pin_shadow_first`): a list item whose hanging indent is
+    /// taken away keeps a first line of 0, where none would bring its
+    /// level's hanging indent back, in session and after a reload (#2231).
+    pub fn pin_first_line(&mut self, twips: i32) {
+        self.first_line = twips;
+        crate::serialize::pin_shadow_first(&mut self.shadow, twips);
+    }
+
     /// Whether the paragraph has a left indent of its own, set in session
     /// or loaded (a `w:left="0"` pin included): it replaces a list level's
     /// indent, as Word reads the file (#1986).

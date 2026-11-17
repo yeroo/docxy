@@ -589,6 +589,50 @@ pub(crate) fn pin_shadow_left(shadow: &mut Vec<String>, twips: i32, cancel_chars
     *raw = empty_element(&name, &out);
 }
 
+/// Make the loaded `w:ind` in `shadow` set the first line as an explicit
+/// `twips` (#2231), as [`pin_shadow_left`] does the left: its first-line
+/// attributes ([`IND_FIRST_LINE`]) become one `w:firstLine` (or `w:hanging`
+/// for a negative value) in the place of the first of them (else last); a
+/// shadow without a `w:ind` gets one. A `w:ind` already saying exactly that
+/// is left as it is, so pinning again changes nothing. A list item's first
+/// line of 0 then stays 0, where none would take its level's hanging indent.
+pub(crate) fn pin_shadow_first(shadow: &mut Vec<String>, twips: i32) {
+    let (name, value) = if twips < 0 {
+        ("w:hanging", (-i64::from(twips)).to_string())
+    } else {
+        ("w:firstLine", twips.to_string())
+    };
+    let Some(raw) = shadow.iter_mut().find(|raw| local_name(raw) == "ind") else {
+        shadow.push(format!("<w:ind {name}=\"{value}\"/>"));
+        return;
+    };
+    let attrs = element_attrs_of(raw);
+    let first: Vec<&(String, String)> = attrs
+        .iter()
+        .filter(|(n, _)| IND_FIRST_LINE.contains(&n.as_str()))
+        .collect();
+    if let [(n, v)] = first.as_slice() {
+        if n == name && v.trim().parse::<i64>().ok() == value.parse::<i64>().ok() {
+            return;
+        }
+    }
+    let mut out: Vec<(String, String)> = Vec::with_capacity(attrs.len() + 1);
+    let mut placed = false;
+    for (n, v) in &attrs {
+        if !IND_FIRST_LINE.contains(&n.as_str()) {
+            out.push((n.clone(), v.clone()));
+        } else if !placed {
+            out.push((name.to_string(), value.clone()));
+            placed = true;
+        }
+    }
+    if !placed {
+        out.push((name.to_string(), value));
+    }
+    let el = crate::table_props::element_name(raw);
+    *raw = empty_element(&el, &out);
+}
+
 /// The direct `w:jc`s of an editor-chosen alignment (#1752): a left keeps
 /// one already saying `left` or `start`, else takes `<w:jc w:val="left"/>`
 /// in place of any other (`thaiDistribute` loads as left too), so it beats a
@@ -2333,6 +2377,44 @@ mod tests {
             panic!("a paragraph")
         };
         assert_eq!(q.props.borders, want);
+    }
+
+    /// #2231: a pinned first line is written as an explicit `w:firstLine`
+    /// (or `w:hanging`) in place of the loaded one, loads back as direct,
+    /// and pinning again changes nothing.
+    #[test]
+    fn a_pinned_first_line_saves_and_loads_as_direct() {
+        let xml = "<w:document><w:body><w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr>\
+            <w:ind w:left=\"720\" w:hangingChars=\"50\" w:right=\"10\"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p></w:body></w:document>";
+        let mut d = parse_document_xml(xml, &Relationships::default());
+        let Block::Paragraph(p) = &mut d.body[0] else {
+            panic!("a paragraph")
+        };
+        p.props.pin_first_line(0);
+        let pinned = p.props.shadow.clone();
+        p.props.pin_first_line(0);
+        assert_eq!(p.props.shadow, pinned, "idempotent");
+        let out = document_to_xml(&d);
+        assert!(
+            out.contains("<w:ind w:left=\"720\" w:firstLine=\"0\" w:right=\"10\"/>"),
+            "{out}"
+        );
+        let back = parse_document_xml(&out, &Relationships::default());
+        let Block::Paragraph(q) = &back.body[0] else {
+            panic!("a paragraph")
+        };
+        assert_eq!(
+            (q.props.first_line, q.props.has_direct_first_line()),
+            (0, true)
+        );
+        // With no w:ind at all, the pin adds one; a hang is a w:hanging.
+        let mut fresh = ParProps::default();
+        assert!(!fresh.has_direct_first_line());
+        fresh.pin_first_line(-360);
+        assert_eq!(fresh.shadow, ["<w:ind w:hanging=\"360\"/>"]);
+        let mut zero = ParProps::default();
+        zero.pin_first_line(0);
+        assert!(zero.has_direct_first_line());
     }
 
     /// The editor's own rule (Bottom Border, Insert > Horizontal Line) keeps
