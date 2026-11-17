@@ -334,7 +334,13 @@ mod tests {
 
     #[test]
     fn theme_color_names_round_trip() {
-        for v in ["accent1", "text1", "background2", "followedHyperlink", "dark2"] {
+        for v in [
+            "accent1",
+            "text1",
+            "background2",
+            "followedHyperlink",
+            "dark2",
+        ] {
             assert_eq!(ThemeColor::from_val(v).map(ThemeColor::val), Some(v));
         }
         assert_eq!(ThemeColor::from_val("none"), None);

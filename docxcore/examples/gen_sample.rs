@@ -137,10 +137,7 @@ fn build() -> Document {
     ));
     body.push(para(
         ParProps {
-            borders: ParBorders {
-                bottom: Some(BorderKind::Single),
-                ..Default::default()
-            },
+            borders: ParBorders::bottom_rule(BorderKind::Single),
             ..Default::default()
         },
         vec![],

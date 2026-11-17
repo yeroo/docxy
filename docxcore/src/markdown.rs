@@ -879,10 +879,7 @@ fn heading_para(level: usize, text: &str) -> Block {
 fn hrule_para() -> Block {
     Paragraph {
         props: ParProps {
-            borders: crate::model::ParBorders {
-                top: None,
-                bottom: Some(BorderKind::Single),
-            },
+            borders: crate::model::ParBorders::bottom_rule(BorderKind::Single),
             ..ParProps::default()
         },
         content: Vec::new(),

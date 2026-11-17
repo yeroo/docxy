@@ -1842,7 +1842,7 @@ impl Editor {
         self.checkpoint(EditKind::Structural);
         if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
             p.content.clear();
-            p.props.borders.bottom = Some(kind);
+            p.props.borders.bottom = Some(crate::model::ParBorder::rule(kind));
         }
         self.caret.offset = 0;
         // A fresh paragraph below for the caret, without inheriting the rule.
@@ -1861,7 +1861,7 @@ impl Editor {
         self.clear_selection();
         self.checkpoint(EditKind::Structural);
         if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
-            p.props.borders.bottom = Some(BorderKind::Single);
+            p.props.borders.bottom = Some(crate::model::ParBorder::rule(BorderKind::Single));
         }
         self.move_end();
         self.insert_newline_collapsed();
@@ -7990,7 +7990,10 @@ mod tests {
         match &ed.doc.body[0] {
             Block::Paragraph(p) => {
                 assert!(p.content.is_empty());
-                assert_eq!(p.props.borders.bottom, Some(BorderKind::Single));
+                assert_eq!(
+                    p.props.borders.bottom.map(|b| b.kind),
+                    Some(BorderKind::Single)
+                );
             }
             _ => panic!(),
         }
@@ -8435,7 +8438,10 @@ mod tests {
         assert_eq!(ed.anchor, None, "the selection is collapsed, not deleted");
         assert!(!ed.has_selection());
         match &ed.doc.body[0] {
-            Block::Paragraph(p) => assert_eq!(p.props.borders.bottom, Some(BorderKind::Single)),
+            Block::Paragraph(p) => assert_eq!(
+                p.props.borders.bottom.map(|b| b.kind),
+                Some(BorderKind::Single)
+            ),
             _ => panic!(),
         }
         match &ed.doc.body[1] {

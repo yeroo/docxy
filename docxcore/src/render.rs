@@ -2377,7 +2377,7 @@ fn render_paragraph(
     };
 
     let mut out = Vec::new();
-    if let Some(k) = borders.top {
+    if let Some(k) = borders.top.map(|b| b.kind) {
         if !suppress_top {
             out.push(rule(k));
         }
@@ -2563,7 +2563,7 @@ fn render_paragraph(
             LineMap::default(),
         ));
     }
-    if let Some(k) = borders.bottom {
+    if let Some(k) = borders.bottom.map(|b| b.kind) {
         if !suppress_bottom {
             out.push(rule(k));
         }
@@ -4171,10 +4171,7 @@ mod tests {
         let o = opts(20);
         let p = Block::Paragraph(Paragraph {
             props: ParProps {
-                borders: ParBorders {
-                    top: None,
-                    bottom: Some(BorderKind::Single),
-                },
+                borders: ParBorders::bottom_rule(BorderKind::Single),
                 ..Default::default()
             },
             content: vec![run("hi", RunProps::default())],

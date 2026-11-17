@@ -320,6 +320,32 @@ fn write_inlines_tracking_inserts(s: &mut String, content: &[Inline]) {
     }
 }
 
+/// One `w:pBdr` side as written: its line, width, space and colour, and its
+/// theme colour when it names one (#2231). The editor's own rules are
+/// `w:sz="6" w:space="1" w:color="auto"`, as before.
+fn pbdr_side_xml(tag: &str, b: &crate::model::ParBorder) -> String {
+    let color = b
+        .color
+        .map_or_else(|| "auto".to_string(), |c| format!("{c:06X}"));
+    let mut x = format!(
+        "<{tag} w:val=\"{}\" w:sz=\"{}\" w:space=\"{}\" w:color=\"{color}\"",
+        b.kind.to_val(),
+        b.sz,
+        b.space
+    );
+    if let Some(t) = b.theme {
+        x.push_str(&format!(" w:themeColor=\"{}\"", t.name.val()));
+        if let Some(v) = t.tint {
+            x.push_str(&format!(" w:themeTint=\"{v:02X}\""));
+        }
+        if let Some(v) = t.shade {
+            x.push_str(&format!(" w:themeShade=\"{v:02X}\""));
+        }
+    }
+    x.push_str("/>");
+    x
+}
+
 /// Ordinal of a `CT_PPr` child element (local name, no `w:` prefix) in the
 /// WordprocessingML schema's fixed child order. Unknown elements sort last but
 /// keep their relative order. Word (and strict validators) reject `<w:pPr>`
@@ -918,8 +944,7 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         || props.rtl
         || props.frame.is_some()
         || props.section_break.is_some()
-        || props.borders.top.is_some()
-        || props.borders.bottom.is_some()
+        || props.borders.any()
         || props.indent != 0
         || props.indent_right != 0
         || props.first_line != 0
@@ -1003,17 +1028,11 @@ fn write_ppr(s: &mut String, props: &ParProps) {
             numpr_xml(props.ilvl, num, shadow.find("numPr")),
         ));
     }
-    if (props.borders.top.is_some() || props.borders.bottom.is_some()) && !kept(PprGroup::Borders) {
+    if props.borders.any() && !kept(PprGroup::Borders) {
         let mut x = String::from("<w:pBdr>");
-        for (tag, side) in [
-            ("w:top", props.borders.top),
-            ("w:bottom", props.borders.bottom),
-        ] {
-            if let Some(k) = side {
-                x.push_str(&format!(
-                    "<{tag} w:val=\"{}\" w:sz=\"6\" w:space=\"1\" w:color=\"auto\"/>",
-                    k.to_val()
-                ));
+        for (tag, side) in props.borders.sides() {
+            if let Some(b) = side {
+                x.push_str(&pbdr_side_xml(tag, &b));
             }
         }
         x.push_str("</w:pBdr>");
@@ -2271,6 +2290,69 @@ mod tests {
         doc
     }
 
+    /// #2231: a loaded five-side `w:pBdr` with theme colours saves byte for
+    /// byte when untouched; an edited one writes every side's own width,
+    /// space and colours, which load back as the same model.
+    #[test]
+    fn a_five_side_pbdr_round_trips() {
+        let pbdr = "<w:pBdr><w:top w:val=\"single\" w:sz=\"4\" w:space=\"1\" w:color=\"auto\"/>\
+            <w:left w:val=\"double\" w:sz=\"12\" w:space=\"4\" w:color=\"FF0000\"/>\
+            <w:bottom w:val=\"single\" w:sz=\"8\" w:space=\"4\" w:color=\"4F81BD\" w:themeColor=\"accent1\" w:themeShade=\"BF\"/>\
+            <w:right w:val=\"dashed\" w:color=\"00FF00\" w:sz=\"6\"/>\
+            <w:between w:val=\"single\" w:sz=\"2\" w:space=\"0\" w:color=\"auto\" w:themeColor=\"text1\" w:themeTint=\"80\"/></w:pBdr>";
+        let xml = format!(
+            "<w:document><w:body><w:p><w:pPr>{pbdr}</w:pPr><w:r><w:t>x</w:t></w:r></w:p></w:body></w:document>"
+        );
+        let d = parse_document_xml(&xml, &Relationships::default());
+        let out = document_to_xml(&d);
+        assert!(out.contains(pbdr), "untouched pBdr rewritten: {out}");
+        let mut edited = d.clone();
+        let Block::Paragraph(p) = &mut edited.body[0] else {
+            panic!("a paragraph")
+        };
+        let b = &mut p.props.borders;
+        let right = b.right.as_mut().unwrap();
+        right.sz = 16;
+        let want = *b;
+        let out = document_to_xml(&edited);
+        assert!(
+            out.contains(
+                "<w:bottom w:val=\"single\" w:sz=\"8\" w:space=\"4\" w:color=\"4F81BD\" \
+                 w:themeColor=\"accent1\" w:themeShade=\"BF\"/>"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "<w:right w:val=\"dashed\" w:sz=\"16\" w:space=\"0\" w:color=\"00FF00\"/>"
+            ),
+            "{out}"
+        );
+        let back = parse_document_xml(&out, &Relationships::default());
+        let Block::Paragraph(q) = &back.body[0] else {
+            panic!("a paragraph")
+        };
+        assert_eq!(q.props.borders, want);
+    }
+
+    /// The editor's own rule (Bottom Border, Insert > Horizontal Line) keeps
+    /// the attributes it always wrote.
+    #[test]
+    fn the_editors_rule_writes_what_it_always_did() {
+        let d = Document {
+            body: vec![para(
+                ParProps {
+                    borders: ParBorders::bottom_rule(BorderKind::Single),
+                    ..Default::default()
+                },
+                vec![run("x", RunProps::default())],
+            )],
+        };
+        assert!(document_to_xml(&d).contains(
+            "<w:pBdr><w:bottom w:val=\"single\" w:sz=\"6\" w:space=\"1\" w:color=\"auto\"/></w:pBdr>"
+        ));
+    }
+
     /// Review r2: malformed XML kept raw (attributes without a value) is left
     /// as it is by the paraId dedupe, which used to panic on it.
     #[test]
@@ -2803,10 +2885,7 @@ mod tests {
             frame: None,
             section_break: None,
             tabs: Vec::new(),
-            borders: ParBorders {
-                bottom: Some(BorderKind::Single),
-                top: None,
-            },
+            borders: ParBorders::bottom_rule(BorderKind::Single),
             indent: 720,
             first_line: -360,
             ..Default::default()

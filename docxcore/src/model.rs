@@ -830,12 +830,81 @@ impl Spacing {
     }
 }
 
-/// Paragraph borders (`w:pBdr`). Only the horizontal sides are modeled, since
-/// that's what reads as a rule in a terminal.
+/// Paragraph borders (`w:pBdr`): its five sides, each with its line, width,
+/// spacing and colour (#2231). The terminal draws only `top` and `bottom`
+/// as rules; the suite's page view draws every side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ParBorders {
-    pub top: Option<BorderKind>,
-    pub bottom: Option<BorderKind>,
+    pub top: Option<ParBorder>,
+    pub left: Option<ParBorder>,
+    pub bottom: Option<ParBorder>,
+    pub right: Option<ParBorder>,
+    /// `w:between`: the line between grouped paragraphs.
+    pub between: Option<ParBorder>,
+}
+
+impl ParBorders {
+    /// Whether any side is set.
+    pub fn any(&self) -> bool {
+        self.sides().iter().any(|(_, s)| s.is_some())
+    }
+
+    /// The sides in `w:pBdr`'s schema order (CT_PBdr), with their tags.
+    pub fn sides(&self) -> [(&'static str, Option<ParBorder>); 5] {
+        [
+            ("w:top", self.top),
+            ("w:left", self.left),
+            ("w:bottom", self.bottom),
+            ("w:right", self.right),
+            ("w:between", self.between),
+        ]
+    }
+
+    /// Borders with only a bottom rule of `kind`, as the editor writes one
+    /// (Bottom Border, an AutoFormat rule).
+    pub fn bottom_rule(kind: BorderKind) -> Self {
+        ParBorders {
+            bottom: Some(ParBorder::rule(kind)),
+            ..ParBorders::default()
+        }
+    }
+}
+
+/// One side of a paragraph's border (`w:top`, `w:bottom`, ...).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParBorder {
+    pub kind: BorderKind,
+    /// `w:sz`: the line's width in eighths of a point (Word's default 4).
+    pub sz: u16,
+    /// `w:space`: the gap between the text and the line, in points.
+    pub space: u16,
+    /// `w:color`; `None` is automatic.
+    pub color: Option<u32>,
+    /// `w:themeColor` (with `w:themeTint` / `w:themeShade`), which wins over
+    /// `color` where the theme defines it.
+    pub theme: Option<crate::theme::ThemeColorRef>,
+}
+
+impl ParBorder {
+    /// A side of `kind` as the editor writes one: 3/4 pt, 1 pt from the
+    /// text, automatic colour.
+    pub fn rule(kind: BorderKind) -> Self {
+        ParBorder {
+            kind,
+            sz: 6,
+            space: 1,
+            color: None,
+            theme: None,
+        }
+    }
+
+    /// The colour shown: the theme colour when `theme` resolves it, else
+    /// `w:color`, else `None` (automatic).
+    pub fn shown_color(&self, theme: Option<&crate::theme::ThemeColors>) -> Option<u32> {
+        self.theme
+            .and_then(|r| theme.and_then(|t| t.resolve(r)))
+            .or(self.color)
+    }
 }
 
 /// A border line style (`w:val` on a `w:pBdr` side).

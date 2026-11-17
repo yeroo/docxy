@@ -33626,10 +33626,7 @@ fn apply_doc_act(e: &mut Editor, act: Act) {
             let b = if has {
                 ParBorders::default()
             } else {
-                ParBorders {
-                    top: None,
-                    bottom: Some(BorderKind::Single),
-                }
+                ParBorders::bottom_rule(BorderKind::Single)
             };
             e.set_para_border(b);
         }

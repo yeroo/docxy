@@ -503,10 +503,7 @@ impl Session {
                 self.editor.set_para_border(if has {
                     ParBorders::default()
                 } else {
-                    ParBorders {
-                        top: None,
-                        bottom: Some(BorderKind::Single),
-                    }
+                    ParBorders::bottom_rule(BorderKind::Single)
                 });
             }
             _ => mutated = false,

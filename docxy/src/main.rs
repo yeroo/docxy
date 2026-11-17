@@ -5487,10 +5487,7 @@ impl App {
         let new = if has {
             ParBorders::default()
         } else {
-            ParBorders {
-                top: None,
-                bottom: Some(BorderKind::Single),
-            }
+            ParBorders::bottom_rule(BorderKind::Single)
         };
         self.editor.set_para_border(new);
         self.after_edit();
@@ -14054,7 +14051,7 @@ mod tests {
         app.run_act(ribbon::Act::HorizontalLine);
         match &app.editor.doc.body[0] {
             Block::Paragraph(p) => assert_eq!(
-                p.props.borders.bottom,
+                p.props.borders.bottom.map(|b| b.kind),
                 Some(docxcore::model::BorderKind::Single)
             ),
             _ => panic!("expected a paragraph"),
@@ -15529,7 +15526,7 @@ mod tests {
             Block::Paragraph(p) => {
                 assert!(p.content.is_empty(), "the rule paragraph is emptied");
                 assert_eq!(
-                    p.props.borders.bottom,
+                    p.props.borders.bottom.map(|b| b.kind),
                     Some(docxcore::model::BorderKind::Single),
                     "--- + Enter should set a bottom border"
                 );

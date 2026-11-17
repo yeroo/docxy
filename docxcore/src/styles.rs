@@ -12,10 +12,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::model::{
-    Align, BorderKind, ParBorders, ParProps, RunProps, TabAlign, TabLeader, TabStop,
+    Align, BorderKind, ParBorder, ParBorders, ParProps, RunProps, TabAlign, TabLeader, TabStop,
 };
 use crate::table_styles::RunLook;
-use crate::theme::ThemeFonts;
+use crate::theme::{ThemeColor, ThemeColorRef, ThemeFonts};
 use crate::xml::{Event, XmlParser};
 
 #[derive(Debug, Clone, Default)]
@@ -587,10 +587,7 @@ impl StyleSheet {
             .or(self.default_paragraph.as_deref())
             .map(|s| self.fold_borders(s, &mut HashSet::new()))
             .unwrap_or_default();
-        ParBorders {
-            top: direct.top.or(style_b.top),
-            bottom: direct.bottom.or(style_b.bottom),
-        }
+        fold_sides(direct, style_b)
     }
 
     fn fold_borders(&self, id: &str, seen: &mut HashSet<String>) -> ParBorders {
@@ -605,10 +602,18 @@ impl StyleSheet {
             .as_ref()
             .map(|b| self.fold_borders(b, seen))
             .unwrap_or_default();
-        ParBorders {
-            top: def.borders.top.or(base.top),
-            bottom: def.borders.bottom.or(base.bottom),
-        }
+        fold_sides(def.borders, base)
+    }
+}
+
+/// `over`'s sides, each falling back to `under`'s apart.
+fn fold_sides(over: ParBorders, under: ParBorders) -> ParBorders {
+    ParBorders {
+        top: over.top.or(under.top),
+        left: over.left.or(under.left),
+        bottom: over.bottom.or(under.bottom),
+        right: over.right.or(under.right),
+        between: over.between.or(under.between),
     }
 }
 
@@ -893,17 +898,41 @@ fn parse_style_numpr(p: &mut XmlParser) -> (Option<i32>, Option<i32>) {
     out
 }
 
-/// Parse a `<w:pBdr>` element's top/bottom sides into [`ParBorders`].
+/// Parse a `<w:pBdr>` element's five sides into [`ParBorders`]. Lenient: a
+/// bad number takes Word's default (`w:sz` 4, `w:space` 0), a bad colour
+/// is automatic, and a `nil`/`none` side is unset.
 pub fn parse_pbdr(p: &mut XmlParser) -> ParBorders {
     let mut b = ParBorders::default();
     loop {
         match p.next() {
             Event::Start => {
-                let side = p.name();
-                let kind = BorderKind::from_val(p.attr("w:val"));
-                match side {
-                    "w:top" => b.top = kind,
-                    "w:bottom" => b.bottom = kind,
+                let side = BorderKind::from_val(p.attr("w:val")).map(|kind| {
+                    let num = |a: &str| p.attr(a).trim().parse::<u16>().ok();
+                    let color = p.attr("w:color").trim();
+                    let color = (color.len() == 6)
+                        .then(|| u32::from_str_radix(color, 16).ok())
+                        .flatten();
+                    let byte = |a: &str| u8::from_str_radix(p.attr(a).trim(), 16).ok();
+                    ParBorder {
+                        kind,
+                        sz: num("w:sz").unwrap_or(4),
+                        space: num("w:space").unwrap_or(0),
+                        color,
+                        theme: ThemeColor::from_val(p.attr("w:themeColor")).map(|name| {
+                            ThemeColorRef {
+                                name,
+                                tint: byte("w:themeTint"),
+                                shade: byte("w:themeShade"),
+                            }
+                        }),
+                    }
+                });
+                match p.name() {
+                    "w:top" => b.top = side,
+                    "w:left" | "w:start" => b.left = b.left.or(side),
+                    "w:bottom" => b.bottom = side,
+                    "w:right" | "w:end" => b.right = b.right.or(side),
+                    "w:between" => b.between = side,
                     _ => {}
                 }
                 p.skip_element();
@@ -1306,16 +1335,83 @@ mod tests {
             <w:pBdr><w:bottom w:val="single" w:sz="6"/></w:pBdr></w:pPr></w:style></w:styles>"#;
         let ss = parse_styles_xml(xml);
         let b = ss.effective_borders(Some("Rule"), ParBorders::default());
-        assert_eq!(b.bottom, Some(BorderKind::Single));
+        assert_eq!(
+            b.bottom.map(|b| (b.kind, b.sz)),
+            Some((BorderKind::Single, 6))
+        );
         assert_eq!(b.top, None);
         // a direct border wins over the style's
+        let direct = ParBorders::bottom_rule(BorderKind::Double);
+        assert_eq!(
+            ss.effective_borders(Some("Rule"), direct)
+                .bottom
+                .map(|b| b.kind),
+            Some(BorderKind::Double)
+        );
+    }
+
+    /// #2231: every side with its width, space, colour and theme colour; a
+    /// bad number takes Word's default, `nil` is no side.
+    #[test]
+    fn pbdr_reads_all_five_sides_and_their_attributes() {
+        let xml = r#"<w:styles><w:style w:styleId="Title"><w:pPr><w:pBdr>
+            <w:top w:val="double" w:sz="12" w:space="2" w:color="FF0000"/>
+            <w:left w:val="single" w:sz="x" w:space="-1" w:color="zz"/>
+            <w:bottom w:val="single" w:sz="8" w:space="4" w:color="4F81BD" w:themeColor="accent1" w:themeShade="BF"/>
+            <w:right w:val="nil"/>
+            <w:between w:val="dashed" w:sz="4" w:space="1" w:color="auto"/>
+            </w:pBdr></w:pPr></w:style></w:styles>"#;
+        let b = parse_styles_xml(xml).effective_borders(Some("Title"), ParBorders::default());
+        let top = b.top.unwrap();
+        assert_eq!(
+            (top.kind, top.sz, top.space, top.color, top.theme),
+            (BorderKind::Double, 12, 2, Some(0xFF0000), None)
+        );
+        let left = b.left.unwrap();
+        assert_eq!((left.sz, left.space, left.color), (4, 0, None));
+        let bottom = b.bottom.unwrap();
+        assert_eq!(
+            (bottom.sz, bottom.space, bottom.color),
+            (8, 4, Some(0x4F81BD))
+        );
+        assert_eq!(
+            bottom.theme,
+            Some(ThemeColorRef {
+                name: ThemeColor::Accent1,
+                tint: None,
+                shade: Some(0xBF),
+            })
+        );
+        assert_eq!(b.right, None);
+        assert_eq!(
+            b.between.map(|b| (b.kind, b.color)),
+            Some((BorderKind::Dashed, None))
+        );
+    }
+
+    /// #2231: each side folds through the `basedOn` chain on its own, and
+    /// a direct side wins only for that side.
+    #[test]
+    fn pbdr_sides_fold_through_the_chain_apart() {
+        let xml = r#"<w:styles>
+            <w:style w:styleId="Base"><w:pPr><w:pBdr><w:top w:val="single"/><w:left w:val="single"/></w:pBdr></w:pPr></w:style>
+            <w:style w:styleId="Mid"><w:basedOn w:val="Base"/><w:pPr><w:pBdr><w:bottom w:val="double"/></w:pBdr></w:pPr></w:style>
+            <w:style w:styleId="Top"><w:basedOn w:val="Mid"/><w:pPr><w:pBdr><w:top w:val="dotted"/></w:pBdr></w:pPr></w:style>
+            </w:styles>"#;
+        let ss = parse_styles_xml(xml);
+        let kinds = |b: ParBorders| b.sides().map(|(_, s)| s.map(|s| s.kind));
+        use BorderKind::*;
+        assert_eq!(
+            kinds(ss.effective_borders(Some("Top"), ParBorders::default())),
+            [Some(Dotted), Some(Single), Some(Double), None, None]
+        );
         let direct = ParBorders {
-            bottom: Some(BorderKind::Double),
-            top: None,
+            right: Some(ParBorder::rule(Wavy)),
+            ..ParBorders::default()
         };
         assert_eq!(
-            ss.effective_borders(Some("Rule"), direct).bottom,
-            Some(BorderKind::Double)
+            kinds(ss.effective_borders(Some("Top"), direct)),
+            [Some(Dotted), Some(Single), Some(Double), Some(Wavy), None]
         );
     }
 
