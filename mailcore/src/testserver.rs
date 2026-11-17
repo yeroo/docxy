@@ -53,6 +53,18 @@ pub struct RecordedRequest {
     pub at: Instant,
 }
 
+impl RecordedRequest {
+    /// The percent-decoded value of `key` in a form-encoded body
+    /// (`application/x-www-form-urlencoded`, as a token request posts),
+    /// the first one when it repeats; `None` without it.
+    pub fn form_value(&self, key: &str) -> Option<String> {
+        crate::sync::engine::parse_query(&self.body)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+}
+
 /// An in-process HTTP server for tests. Bind address is ephemeral
 /// (`127.0.0.1:0`); point HTTP clients at `base_url`. Shuts its listener
 /// thread down on `Drop`.
