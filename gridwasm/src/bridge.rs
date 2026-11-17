@@ -6277,6 +6277,7 @@ mod tests {
         use gridcore::sheet::{ChartData, ChartSeries, Drawing, DrawingKind as DK};
         let mut s = Session::open(&sample_xlsx()).expect("open");
         s.pkg.workbook.sheets[0].drawings.push(Drawing {
+            anchor: Default::default(),
             anchor_ix: 0,
             from: (0, 0),
             to: (10, 5),
@@ -7944,6 +7945,7 @@ mod tests {
             ..Default::default()
         };
         s.pkg.workbook.sheets[0].drawings.push(Drawing {
+            anchor: Default::default(),
             anchor_ix: 0,
             from: (0, 5),
             to: (10, 10),

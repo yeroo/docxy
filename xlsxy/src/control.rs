@@ -3486,6 +3486,7 @@ mod tests {
         use gridcore::sheet::{ChartData, ChartSeries, Drawing, DrawingKind};
         let mut a = app();
         a.pkg.workbook.sheets[0].drawings.push(Drawing {
+            anchor: Default::default(),
             anchor_ix: 0,
             from: (0, 0),
             to: (10, 5),

@@ -4383,10 +4383,14 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
         if let Some(dpart) = sheet.drawing_part.as_deref() {
             // Every drawing here has a real index in this part, including one
             // `add_chart` spliced in, so moving or deleting any of them
-            // addresses the element it actually wrote.
+            // addresses the element it actually wrote. Only the anchors whose
+            // cells changed since the load are moves: rewriting the others
+            // would re-emit their `<col>`/`<row>` and lose a padded value or a
+            // clamped one, so an unedited part keeps its bytes (#2228).
             let moves: Vec<crate::drawing::AnchorMove> = sheet
                 .drawings
                 .iter()
+                .filter(|d| d.anchor.loaded != Some((d.from, d.to)))
                 .map(|d| (d.anchor_ix, d.from, d.to))
                 .collect();
             // Nothing to write means the part is left EXACTLY as it came in.
@@ -10997,6 +11001,7 @@ impl SheetPackage {
         self.workbook.sheets[sheet]
             .drawings
             .push(crate::sheet::Drawing {
+                anchor: Default::default(),
                 anchor_ix,
                 from,
                 to,
@@ -13039,6 +13044,78 @@ mod tests {
             }
             other => panic!("expected a chart, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_picture_round_trip_keeps_the_drawing_part_its_rels_and_the_media() {
+        // A loaded workbook whose sheet holds a picture, with a `<xdr:row>`
+        // padded by whitespace and a column clamped on load (#2228). Saving
+        // used to send every anchor through `rewrite_anchors`, which writes
+        // `<xdr:row>2</xdr:row>` back for ` 2 ` and the clamped column for the
+        // one in the part.
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].set_cell(0, 0, crate::sheet::Cell::text("Notes"));
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let dpart = "xl/drawings/drawing1.xml";
+        let drawing = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <xdr:twoCellAnchor editAs="oneCell">
+    <xdr:from><xdr:col>0</xdr:col><xdr:colOff>9525</xdr:colOff><xdr:row> 1 </xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+    <xdr:to><xdr:col>99999</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>53</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+    <xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Picture 1"/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>
+      <xdr:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>
+      <xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic>
+    <xdr:clientData/>
+  </xdr:twoCellAnchor>
+</xdr:wsDr>"#;
+        let drels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>"#;
+        let media: Vec<u8> = b"\x89PNG\r\n\x1a\n not decoded here".to_vec();
+        let wrels = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>"#;
+        let ws = String::from_utf8(pkg.part("xl/worksheets/sheet1.xml").unwrap().to_vec()).unwrap();
+        let ws = ws.replacen("</worksheet>", "<drawing r:id=\"rId1\"/></worksheet>", 1);
+        pkg.set_part("xl/worksheets/sheet1.xml", ws.into_bytes());
+        pkg.set_part("xl/worksheets/_rels/sheet1.xml.rels", wrels.into());
+        pkg.set_part(dpart, drawing.into());
+        pkg.set_part("xl/drawings/_rels/drawing1.xml.rels", drels.into());
+        pkg.set_part("xl/media/image1.png", media.clone());
+        add_content_type_override(
+            &mut pkg.parts,
+            "/xl/drawings/drawing1.xml",
+            "application/vnd.openxmlformats-officedocument.drawing+xml",
+        );
+        let loaded = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let d = &loaded.workbook.sheets[0].drawings;
+        assert_eq!(d.len(), 1, "the picture is read");
+        assert_eq!(d[0].from, (1, 0));
+        assert_eq!(
+            d[0].to.1,
+            crate::sheet::MAX_COLS - 1,
+            "the column is clamped"
+        );
+
+        let again = load_xlsx(&save_xlsx(&loaded)).unwrap();
+        for part in [
+            dpart,
+            "xl/drawings/_rels/drawing1.xml.rels",
+            "xl/media/image1.png",
+        ] {
+            assert_eq!(
+                again.part(part),
+                loaded.part(part),
+                "{part} must come back byte for byte"
+            );
+        }
+        assert_eq!(again.part(dpart), Some(drawing.as_bytes()));
+
+        // A picture whose cells changed is still written back.
+        let mut moved = loaded.clone();
+        moved.workbook.sheets[0].drawings[0].from = (4, 2);
+        let out = load_xlsx(&save_xlsx(&moved)).unwrap();
+        let xml = String::from_utf8(out.part(dpart).unwrap().to_vec()).unwrap();
+        assert!(xml.contains("<xdr:row>4</xdr:row>"), "{xml}");
+        assert_eq!(out.workbook.sheets[0].drawings[0].from, (4, 2));
     }
 
     #[test]

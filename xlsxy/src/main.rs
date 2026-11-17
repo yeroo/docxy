@@ -23159,6 +23159,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         let mut pkg = new_xlsx();
         pkg.workbook.sheets[0].drawings.push(Drawing {
+            anchor: Default::default(),
             anchor_ix: 0,
             from: (1, 1),
             to: (14, 8),
@@ -23197,6 +23198,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         let mut pkg = new_xlsx();
         pkg.workbook.sheets[0].drawings.push(Drawing {
+            anchor: Default::default(),
             anchor_ix: 0,
             from: (1, 1),
             to: (6, 5),

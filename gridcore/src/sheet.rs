@@ -854,6 +854,46 @@ pub struct Drawing {
     /// `oneCellAnchor` it's estimated from the drawing's EMU size.
     pub to: (u32, u32),
     pub kind: DrawingKind,
+    /// The anchor as the part states it, beyond the cells above: its kind,
+    /// the EMU offsets into those cells, an extent or a position (#2228).
+    pub anchor: DrawingAnchor,
+}
+
+/// Which anchor element a [`Drawing`] came from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AnchorKind {
+    /// `<xdr:twoCellAnchor>`: `from` and `to` cells, each with offsets.
+    #[default]
+    TwoCell,
+    /// `<xdr:oneCellAnchor>`: a `from` cell with offsets, and an `ext`.
+    OneCell,
+    /// `<xdr:absoluteAnchor>`: a `pos` from the sheet's top left, and an `ext`.
+    Absolute,
+}
+
+/// The largest EMU value an anchor keeps: about 20 M pixels. A crafted
+/// offset or extent is clamped to it, so a consumer's float math can't
+/// overflow.
+pub const MAX_ANCHOR_EMU: i64 = 20_000_000 * 9525;
+
+/// A drawing's anchor beyond its cells (#2228). Every EMU value is clamped
+/// to `0..=MAX_ANCHOR_EMU`; a negative or unreadable one reads as 0.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DrawingAnchor {
+    pub kind: AnchorKind,
+    /// `<from>`'s `(rowOff, colOff)` in EMU, in the order of [`Drawing::from`].
+    pub from_off: (i64, i64),
+    /// `<to>`'s `(rowOff, colOff)` in EMU (a `twoCellAnchor`'s only).
+    pub to_off: (i64, i64),
+    /// The anchor's own `<xdr:ext cx cy>`, `(width, height)` in EMU: a
+    /// `oneCellAnchor`'s or an `absoluteAnchor`'s.
+    pub ext: Option<(i64, i64)>,
+    /// An `absoluteAnchor`'s `<xdr:pos x y>`, in EMU.
+    pub pos: Option<(i64, i64)>,
+    /// The `(from, to)` cells as loaded. A save rewrites only the anchors
+    /// whose cells differ from these, so an unedited part keeps its bytes;
+    /// `None` (a drawing made in-session) is always written.
+    pub loaded: Option<((u32, u32), (u32, u32))>,
 }
 
 /// What a [`Drawing`] holds.

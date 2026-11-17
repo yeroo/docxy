@@ -4,7 +4,9 @@
 
 use opccore::xml::{Event, XmlParser};
 
-use crate::sheet::{ChartData, ChartSeries, Drawing, DrawingKind};
+use crate::sheet::{
+    AnchorKind, ChartData, ChartSeries, Drawing, DrawingAnchor, DrawingKind, MAX_ANCHOR_EMU,
+};
 
 /// The local (namespace-stripped) part of an XML name.
 fn local(name: &str) -> &str {
@@ -48,90 +50,129 @@ pub fn parse_drawings(
 ) -> Vec<Drawing> {
     let mut out = Vec::new();
     let mut p = XmlParser::new(xml);
-    let mut from: Option<(u32, u32)> = None;
-    let mut to: Option<(u32, u32)> = None;
-    let mut ext: Option<(i64, i64)> = None;
+    let mut from: Option<AnchorCell> = None;
+    let mut to: Option<AnchorCell> = None;
+    let mut anchor = DrawingAnchor::default();
     let mut name = String::new();
     let mut kind: Option<DrawingKind> = None;
     // Counts every anchor, including the ones we skip, so each Drawing can point
     // back at the element it came from.
     let mut anchor_ix = 0usize;
     let mut seen = 0usize;
+    // How deep inside the current anchor the parser is: 1 for its direct
+    // children. Only a direct `<xdr:ext>` / `<xdr:pos>` is the anchor's own;
+    // the picture's `<a:xfrm><a:ext>` and an `<a:extLst><a:ext uri>` are not
+    // (#2228). 0 outside any anchor.
+    let mut depth = 0usize;
+    // How many `<xdr:grpSp>` the parser is inside. A picture in a group is
+    // drawn in the group's own coordinates, which this model does not
+    // follow, so its blip makes no drawing: one member stretched over the
+    // whole group's anchor would be worse than none (#2228). A chart in a
+    // group keeps its card, as it always had.
+    let mut group = 0usize;
     loop {
         match p.next() {
-            Event::Start => match local(p.name()) {
-                "twoCellAnchor" | "oneCellAnchor" | "absoluteAnchor" => {
-                    anchor_ix = seen;
-                    seen += 1;
-                    from = None;
-                    to = None;
-                    ext = None;
-                    name.clear();
-                    kind = None;
-                }
-                "from" => from = Some(parse_anchor_cell(&mut p)),
-                "to" => to = Some(parse_anchor_cell(&mut p)),
-                "ext" => {
-                    let cx = p.attr("cx").trim().parse::<i64>().unwrap_or(0);
-                    let cy = p.attr("cy").trim().parse::<i64>().unwrap_or(0);
-                    ext = Some((cx, cy));
-                }
-                "cNvPr" => {
-                    let n = p.attr("name");
-                    if !n.is_empty() {
-                        name = n.to_string();
+            Event::Start => {
+                let l = local(p.name());
+                match l {
+                    "twoCellAnchor" | "oneCellAnchor" | "absoluteAnchor" => {
+                        anchor_ix = seen;
+                        seen += 1;
+                        from = None;
+                        to = None;
+                        anchor = DrawingAnchor {
+                            kind: match l {
+                                "oneCellAnchor" => AnchorKind::OneCell,
+                                "absoluteAnchor" => AnchorKind::Absolute,
+                                _ => AnchorKind::TwoCell,
+                            },
+                            ..DrawingAnchor::default()
+                        };
+                        name.clear();
+                        kind = None;
+                        depth = 0;
+                        group = 0;
                     }
-                }
-                // A picture: <a:blip r:embed="rId#"> points at the media part.
-                "blip" => {
-                    if let Some(rid) = rel_attr(&p, "embed") {
-                        if let Some((ty, part)) = resolve_rid(&rid) {
-                            if ty.contains("image") || kind.is_none() {
-                                kind = Some(DrawingKind::Image {
-                                    part,
-                                    name: if name.is_empty() {
-                                        "Picture".to_string()
-                                    } else {
-                                        name.clone()
-                                    },
-                                });
+                    // `parse_anchor_cell` reads through the block's own end,
+                    // so these leave `depth` as it was.
+                    "from" if depth == 1 => {
+                        from = Some(parse_anchor_cell(&mut p));
+                        continue;
+                    }
+                    "to" if depth == 1 => {
+                        to = Some(parse_anchor_cell(&mut p));
+                        continue;
+                    }
+                    "ext" if depth == 1 => {
+                        anchor.ext = Some((emu_attr(&p, "cx"), emu_attr(&p, "cy")));
+                    }
+                    "pos" if depth == 1 => {
+                        anchor.pos = Some((emu_attr(&p, "x"), emu_attr(&p, "y")));
+                    }
+                    "grpSp" => group += 1,
+                    "cNvPr" => {
+                        let n = p.attr("name");
+                        if !n.is_empty() {
+                            name = n.to_string();
+                        }
+                    }
+                    // A picture: <a:blip r:embed="rId#"> points at the media part.
+                    "blip" if group == 0 => {
+                        if let Some(rid) = rel_attr(&p, "embed") {
+                            if let Some((ty, part)) = resolve_rid(&rid) {
+                                if ty.contains("image") || kind.is_none() {
+                                    kind = Some(DrawingKind::Image {
+                                        part,
+                                        name: if name.is_empty() {
+                                            "Picture".to_string()
+                                        } else {
+                                            name.clone()
+                                        },
+                                    });
+                                }
                             }
                         }
                     }
-                }
-                // A chart: <c:chart r:id="rId#"> points at the chart part.
-                "chart" => {
-                    if let Some(rid) = rel_attr(&p, "id") {
-                        if let Some((_, part)) = resolve_rid(&rid) {
-                            if let Some(cxml) = get_part(&part) {
-                                let mut cd = parse_chart(&cxml);
-                                // Remember where it came from, so an edit can be
-                                // written back into that part.
-                                cd.part = Some(part);
-                                kind = Some(DrawingKind::Chart(cd));
+                    // A chart: <c:chart r:id="rId#"> points at the chart part.
+                    "chart" => {
+                        if let Some(rid) = rel_attr(&p, "id") {
+                            if let Some((_, part)) = resolve_rid(&rid) {
+                                if let Some(cxml) = get_part(&part) {
+                                    let mut cd = parse_chart(&cxml);
+                                    // Remember where it came from, so an edit can be
+                                    // written back into that part.
+                                    cd.part = Some(part);
+                                    kind = Some(DrawingKind::Chart(cd));
+                                }
                             }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
-            },
+                if matches!(l, "twoCellAnchor" | "oneCellAnchor" | "absoluteAnchor") {
+                    depth = 1;
+                } else if depth > 0 {
+                    depth += 1;
+                }
+            }
             Event::End => {
-                if matches!(
-                    local(p.name()),
-                    "twoCellAnchor" | "oneCellAnchor" | "absoluteAnchor"
-                ) {
-                    if let (Some(f), Some(k)) = (from, kind.take()) {
-                        let t = to.or_else(|| ext.map(|e| estimate_to(f, e))).unwrap_or(f);
-                        out.push(Drawing {
-                            anchor_ix,
-                            from: f,
-                            to: t,
-                            kind: k,
-                        });
+                let l = local(p.name());
+                if matches!(l, "twoCellAnchor" | "oneCellAnchor" | "absoluteAnchor") {
+                    if let Some(d) = finish_anchor(anchor_ix, from, to, &mut anchor, kind.take()) {
+                        out.push(d);
                     }
                     from = None;
                     to = None;
-                    ext = None;
+                    depth = 0;
+                    group = 0;
+                } else {
+                    if l == "grpSp" {
+                        group = group.saturating_sub(1);
+                    }
+                    // Never below 1 inside an anchor: only its own end leaves it.
+                    if depth > 1 {
+                        depth -= 1;
+                    }
                 }
             }
             Event::Eof => break,
@@ -139,6 +180,61 @@ pub fn parse_drawings(
         }
     }
     out
+}
+
+/// The drawing an anchor element makes, once it has closed: a two-cell or a
+/// one-cell anchor needs its `from`, an absolute one its `pos` and a picture
+/// (an absolute chart stays unread, as it always was, so the chart list and
+/// its moves are unchanged).
+fn finish_anchor(
+    anchor_ix: usize,
+    from: Option<AnchorCell>,
+    to: Option<AnchorCell>,
+    anchor: &mut DrawingAnchor,
+    kind: Option<DrawingKind>,
+) -> Option<Drawing> {
+    let kind = kind?;
+    let mut anchor = std::mem::take(anchor);
+    let from = match anchor.kind {
+        AnchorKind::Absolute => {
+            if !matches!(kind, DrawingKind::Image { .. }) {
+                return None;
+            }
+            let pos = anchor.pos.unwrap_or((0, 0));
+            AnchorCell {
+                cell: estimate_cell(pos),
+                off: (0, 0),
+            }
+        }
+        _ => from?,
+    };
+    // Only a two-cell anchor's `<to>` is its own; the other kinds have an
+    // extent instead.
+    let to = to.filter(|_| anchor.kind == AnchorKind::TwoCell);
+    let to_cell = match (to, anchor.ext) {
+        (Some(t), _) => t.cell,
+        (None, Some(e)) => estimate_to(from.cell, e),
+        (None, None) => from.cell,
+    };
+    anchor.from_off = from.off;
+    anchor.to_off = to.map_or((0, 0), |t| t.off);
+    anchor.loaded = Some((from.cell, to_cell));
+    Some(Drawing {
+        anchor_ix,
+        from: from.cell,
+        to: to_cell,
+        kind,
+        anchor,
+    })
+}
+
+/// An EMU attribute, clamped to `0..=MAX_ANCHOR_EMU` (unreadable is 0).
+fn emu_attr(p: &XmlParser, name: &str) -> i64 {
+    clamp_emu(p.attr(name).trim().parse::<i64>().unwrap_or(0))
+}
+
+fn clamp_emu(v: i64) -> i64 {
+    v.clamp(0, MAX_ANCHOR_EMU)
 }
 
 /// Read an `r:`-prefixed attribute (`r:embed`, `r:id`) by its local name.
@@ -149,21 +245,31 @@ fn rel_attr(p: &XmlParser, local_name: &str) -> Option<String> {
         .map(|a| a.value.to_string())
 }
 
-/// Parse a `<xdr:from>`/`<xdr:to>` block into a `(row, col)` cell.
-fn parse_anchor_cell(p: &mut XmlParser) -> (u32, u32) {
+/// A `<xdr:from>`/`<xdr:to>` block: its `(row, col)` cell and its
+/// `(rowOff, colOff)` EMU offsets into that cell.
+#[derive(Clone, Copy, Debug, Default)]
+struct AnchorCell {
+    cell: (u32, u32),
+    off: (i64, i64),
+}
+
+/// Parse a `<xdr:from>`/`<xdr:to>` block, through its end tag.
+fn parse_anchor_cell(p: &mut XmlParser) -> AnchorCell {
     let (mut row, mut col) = (0u32, 0u32);
+    let (mut row_off, mut col_off) = (0i64, 0i64);
     let mut field = String::new();
     loop {
         match p.next() {
             Event::Start => field = local(p.name()).to_string(),
             Event::Text => {
                 // Ignore inter-element whitespace (a failed parse keeps the value).
-                if let Ok(v) = p.text().trim().parse::<u32>() {
-                    match field.as_str() {
-                        "col" => col = v,
-                        "row" => row = v,
-                        _ => {}
-                    }
+                let t = p.text().trim();
+                match field.as_str() {
+                    "col" => col = t.parse::<u32>().unwrap_or(col),
+                    "row" => row = t.parse::<u32>().unwrap_or(row),
+                    "colOff" => col_off = t.parse::<i64>().map_or(col_off, clamp_emu),
+                    "rowOff" => row_off = t.parse::<i64>().map_or(row_off, clamp_emu),
+                    _ => {}
                 }
             }
             Event::End if matches!(local(p.name()), "from" | "to") => break,
@@ -175,10 +281,13 @@ fn parse_anchor_cell(p: &mut XmlParser) -> (u32, u32) {
     // it to bound a card's span (`from.1 + 1`, `ac + 256`): near u32::MAX that
     // panics a debug build and wraps a release one. `estimate_to` already
     // guards its own arithmetic; clamping here covers every consumer at once.
-    (
-        row.min(crate::sheet::MAX_ROWS - 1),
-        col.min(crate::sheet::MAX_COLS - 1),
-    )
+    AnchorCell {
+        cell: (
+            row.min(crate::sheet::MAX_ROWS - 1),
+            col.min(crate::sheet::MAX_COLS - 1),
+        ),
+        off: (row_off, col_off),
+    }
 }
 
 /// One drawing's new home: its anchor index in the part, and the `(row, col)`
@@ -358,6 +467,19 @@ fn set_cell_fields(block: &str, row: u32, col: u32) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Estimate the `(row, col)` cell an `absoluteAnchor`'s `pos` (`(x, y)` EMU)
+/// falls in, at the default cell sizes, like [`estimate_to`]. A renderer
+/// places the picture from `pos` itself; this cell is for the consumers that
+/// only read cells.
+fn estimate_cell(pos: (i64, i64)) -> (u32, u32) {
+    let col = (pos.0 / (DEFAULT_COL_PX * EMU_PER_PX)).max(0) as u32;
+    let row = (pos.1 / (DEFAULT_ROW_PX * EMU_PER_PX)).max(0) as u32;
+    (
+        row.min(crate::sheet::MAX_ROWS - 1),
+        col.min(crate::sheet::MAX_COLS - 1),
+    )
 }
 
 /// Estimate a bottom-right cell from a top-left anchor plus an EMU extent.
@@ -1089,6 +1211,133 @@ mod tests {
             }
             _ => panic!("expected image"),
         }
+    }
+
+    fn image_rid(rid: &str) -> Option<(String, String)> {
+        rid.strip_prefix("rId").map(|n| {
+            (
+                "http://schemas.openxmlformats.org/officedocument/2006/relationships/image"
+                    .to_string(),
+                format!("xl/media/image{n}.png"),
+            )
+        })
+    }
+
+    /// A two-cell anchor keeps the EMU offsets into both of its cells, and
+    /// remembers the cells it was loaded with (#2228).
+    #[test]
+    fn a_two_cell_anchor_keeps_its_offsets() {
+        let xml = r#"<xdr:wsDr xmlns:xdr="a" xmlns:a="m" xmlns:r="b">
+            <xdr:twoCellAnchor editAs="oneCell">
+              <xdr:from><xdr:col>0</xdr:col><xdr:colOff>95250</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>47625</xdr:rowOff></xdr:from>
+              <xdr:to><xdr:col>6</xdr:col><xdr:colOff>-5</xdr:colOff><xdr:row>53</xdr:row><xdr:rowOff>190500</xdr:rowOff></xdr:to>
+              <xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Picture 1"/></xdr:nvPicPr>
+                <xdr:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>
+                <xdr:spPr><a:xfrm><a:off x="1" y="2"/><a:ext cx="4400000" cy="10000000"/></a:xfrm></xdr:spPr></xdr:pic>
+              <xdr:clientData/>
+            </xdr:twoCellAnchor></xdr:wsDr>"#;
+        let ds = parse_drawings(xml, &image_rid, &|_| None);
+        assert_eq!(ds.len(), 1);
+        let a = &ds[0].anchor;
+        assert_eq!(a.kind, AnchorKind::TwoCell);
+        assert_eq!((ds[0].from, ds[0].to), ((1, 0), (53, 6)));
+        assert_eq!(a.from_off, (47625, 95250));
+        // A negative offset reads as 0.
+        assert_eq!(a.to_off, (190500, 0));
+        // The picture's own `<a:xfrm><a:ext>` is not the anchor's extent.
+        assert_eq!(a.ext, None);
+        assert_eq!(a.loaded, Some(((1, 0), (53, 6))));
+    }
+
+    /// The way Excel writes a one-cell picture: the anchor's `<xdr:ext>`
+    /// first, then the picture's `<a:xfrm><a:ext>` and an `<a:extLst><a:ext
+    /// uri>` (no `cx`) after the blip. Only the anchor's own counts; the last
+    /// `ext` used to win, reading a 0×0 extent and a 1×1-cell box (#2228).
+    #[test]
+    fn a_one_cell_anchor_takes_its_own_extent_not_the_pictures() {
+        let xml = r#"<xdr:wsDr xmlns:xdr="a" xmlns:a="m" xmlns:r="b">
+            <xdr:oneCellAnchor>
+              <xdr:from><xdr:col>9</xdr:col><xdr:colOff>19050</xdr:colOff><xdr:row>30</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+              <xdr:ext cx="2438400" cy="1905000"/>
+              <xdr:pic>
+                <xdr:nvPicPr><xdr:cNvPr id="4" name="Picture 3"/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>
+                <xdr:blipFill><a:blip r:embed="rId3"><a:extLst><a:ext uri="{28A0092B-C50C-407E-A947-70E740481C1C}"/></a:extLst></a:blip>
+                  <a:stretch><a:fillRect/></a:stretch></xdr:blipFill>
+                <xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="11" cy="22"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>
+              </xdr:pic>
+              <xdr:clientData/>
+            </xdr:oneCellAnchor></xdr:wsDr>"#;
+        let ds = parse_drawings(xml, &image_rid, &|_| None);
+        assert_eq!(ds.len(), 1);
+        let a = &ds[0].anchor;
+        assert_eq!(a.kind, AnchorKind::OneCell);
+        assert_eq!(a.ext, Some((2438400, 1905000)));
+        assert_eq!(a.from_off, (0, 19050));
+        assert_eq!(ds[0].from, (30, 9));
+        // 2438400 EMU = 256 px = 4 default columns; 1905000 = 200 px = 10 rows.
+        assert_eq!(ds[0].to, (40, 13));
+        assert!(
+            matches!(&ds[0].kind, DrawingKind::Image { part, .. } if part == "xl/media/image3.png")
+        );
+    }
+
+    /// An absolute picture is read now, from its `pos` and `ext`, with a cell
+    /// estimate for the consumers that read only cells. An absolute chart
+    /// stays unread, as before: a card made of it could be moved, and the
+    /// move would not persist (#2228).
+    #[test]
+    fn an_absolute_picture_is_read_and_an_absolute_chart_is_not() {
+        let xml = r#"<xdr:wsDr xmlns:xdr="a" xmlns:a="m" xmlns:r="b" xmlns:c="c">
+            <xdr:absoluteAnchor>
+              <xdr:pos x="1219200" y="381000"/>
+              <xdr:ext cx="609600" cy="-3"/>
+              <xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="Stamp"/></xdr:nvPicPr>
+                <xdr:blipFill><a:blip r:embed="rId2"/></xdr:blipFill></xdr:pic>
+              <xdr:clientData/>
+            </xdr:absoluteAnchor>
+            <xdr:absoluteAnchor>
+              <xdr:pos x="0" y="0"/><xdr:ext cx="609600" cy="609600"/>
+              <xdr:graphicFrame><a:graphic><a:graphicData><c:chart r:id="rId9"/></a:graphicData></a:graphic></xdr:graphicFrame>
+              <xdr:clientData/>
+            </xdr:absoluteAnchor></xdr:wsDr>"#;
+        let get = |_: &str| Some("<c:chartSpace/>".to_string());
+        let ds = parse_drawings(xml, &image_rid, &get);
+        assert_eq!(ds.len(), 1, "only the picture");
+        let a = &ds[0].anchor;
+        assert_eq!(a.kind, AnchorKind::Absolute);
+        assert_eq!(a.pos, Some((1219200, 381000)));
+        assert_eq!(a.ext, Some((609600, 0)));
+        // 1219200 EMU = 128 px = column 2; 381000 = 40 px = row 2.
+        assert_eq!(ds[0].from, (2, 2));
+        assert_eq!(ds[0].anchor_ix, 0);
+    }
+
+    /// A picture inside a group shape makes no drawing: the group's anchor
+    /// is the whole group's box, and one member stretched over it is wrong.
+    /// The anchor still takes its index, so the next one keeps its own.
+    #[test]
+    fn a_picture_in_a_group_makes_no_drawing() {
+        let xml = r#"<xdr:wsDr xmlns:xdr="a" xmlns:a="m" xmlns:r="b">
+            <xdr:twoCellAnchor>
+              <xdr:from><xdr:col>0</xdr:col><xdr:row>0</xdr:row></xdr:from>
+              <xdr:to><xdr:col>8</xdr:col><xdr:row>20</xdr:row></xdr:to>
+              <xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="5" name="Group 4"/></xdr:nvGrpSpPr>
+                <xdr:pic><xdr:nvPicPr><xdr:cNvPr id="6" name="Inner"/></xdr:nvPicPr>
+                  <xdr:blipFill><a:blip r:embed="rId1"/></xdr:blipFill></xdr:pic>
+              </xdr:grpSp>
+              <xdr:clientData/>
+            </xdr:twoCellAnchor>
+            <xdr:twoCellAnchor>
+              <xdr:from><xdr:col>9</xdr:col><xdr:row>0</xdr:row></xdr:from>
+              <xdr:to><xdr:col>12</xdr:col><xdr:row>4</xdr:row></xdr:to>
+              <xdr:pic><xdr:nvPicPr><xdr:cNvPr id="7" name="Alone"/></xdr:nvPicPr>
+                <xdr:blipFill><a:blip r:embed="rId2"/></xdr:blipFill></xdr:pic>
+              <xdr:clientData/>
+            </xdr:twoCellAnchor></xdr:wsDr>"#;
+        let ds = parse_drawings(xml, &image_rid, &|_| None);
+        assert_eq!(ds.len(), 1);
+        assert_eq!(ds[0].anchor_ix, 1);
+        assert!(matches!(&ds[0].kind, DrawingKind::Image { name, .. } if name == "Alone"));
     }
 
     /// A crafted anchor cell is clamped to the sheet's own limits. Consumers add
