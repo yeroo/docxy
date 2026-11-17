@@ -236,16 +236,27 @@ pub fn redeem_code(
 /// rotated); when it does, the caller's `refresh_token` is carried forward
 /// into the returned `TokenSet` rather than being silently replaced with
 /// an empty string.
+///
+/// `granted` is the saved token's grant ([`TokenSet::scopes`]); the
+/// refresh asks for [`refresh_scope`] of it (#2164), not `cfg.scope` in
+/// full. Entra's refresh-token grant refuses a scope the person never
+/// consented to (`invalid_grant`, AADSTS65001), so a scope a host has just
+/// added to `cfg.scope` would sign every saved sign-in out at its next
+/// refresh. Asked only for the grant, the token keeps working and the new
+/// scope is reported missing (`SyncEvent::Scopes`); the interactive
+/// sign-in ([`begin_auth`], [`redeem_code`]) still asks `cfg.scope` in full.
 pub fn refresh(
     cfg: &AuthConfig,
     http_base: &str,
     refresh_token: &str,
+    granted: Option<&[String]>,
 ) -> Result<TokenSet, AuthError> {
+    let scope = refresh_scope(&cfg.scope, granted);
     let body = pkce::form_urlencode(&[
         ("grant_type", "refresh_token"),
         ("client_id", cfg.client_id.as_str()),
         ("refresh_token", refresh_token),
-        ("scope", cfg.scope.as_str()),
+        ("scope", scope.as_str()),
     ]);
     post_token(cfg, http_base, &body, refresh_token)
 }
@@ -389,17 +400,59 @@ fn is_meta_scope(normalised: &str) -> bool {
 /// scope are never missing.
 pub fn missing_scopes(requested: &str, granted: &[String]) -> Vec<String> {
     let granted: Vec<String> = granted.iter().map(|s| normalise_scope(s)).collect();
-    let mut missing: Vec<String> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
-    for scope in requested.split_ascii_whitespace() {
-        let n = normalise_scope(scope);
-        if is_meta_scope(&n) || granted.contains(&n) || seen.contains(&n) {
-            continue;
+    requested_scopes(requested)
+        .filter(|(_, n)| !is_meta_scope(n) && !granted.contains(n))
+        .map(|(scope, _)| scope.to_string())
+        .collect()
+}
+
+/// What a refresh asks for (#2164): the scopes of `requested` (as in
+/// [`AuthConfig::scope`]) that `granted` holds, plus `requested`'s own meta
+/// scopes (`offline_access`, `openid`, `profile`, `email`, `.default`),
+/// spelled as `requested` writes them, each once, in its order, compared
+/// as [`missing_scopes`] compares. A scope the grant lacks (one a host has
+/// just added) is not asked for, nor is one the grant holds that
+/// `requested` no longer names. Nothing is added: not even
+/// `offline_access`, which is itself a consentable permission.
+///
+/// `requested` as it is when the grant is unknown (`None`), or when it
+/// shares no scope with `requested` but meta ones: a refresh of only
+/// `offline_access` would get a token for nothing the host uses, and asked
+/// in full the refresh works or is refused, which signs out as before.
+pub fn refresh_scope(requested: &str, granted: Option<&[String]>) -> String {
+    let Some(granted) = granted else {
+        return requested.to_string();
+    };
+    let granted: Vec<String> = granted.iter().map(|s| normalise_scope(s)).collect();
+    let mut shares = false;
+    let mut asked: Vec<&str> = Vec::new();
+    for (scope, n) in requested_scopes(requested) {
+        if is_meta_scope(&n) {
+            asked.push(scope);
+        } else if granted.contains(&n) {
+            shares = true;
+            asked.push(scope);
         }
-        seen.push(n);
-        missing.push(scope.to_string());
     }
-    missing
+    if shares {
+        asked.join(" ")
+    } else {
+        requested.to_string()
+    }
+}
+
+/// The scopes of `requested` (space-separated), each with its
+/// [`normalise_scope`]d form, the first spelling of each only, in order.
+fn requested_scopes(requested: &str) -> impl Iterator<Item = (&str, String)> {
+    let mut seen: Vec<String> = Vec::new();
+    requested.split_ascii_whitespace().filter_map(move |scope| {
+        let n = normalise_scope(scope);
+        if seen.contains(&n) {
+            return None;
+        }
+        seen.push(n.clone());
+        Some((scope, n))
+    })
 }
 
 /// Extracts the `preferred_username` claim from a JWT's (unverified)
@@ -443,6 +496,11 @@ mod tests {
             req.authorize_url
                 .contains("redirect_uri=http%3A%2F%2Flocalhost%3A8400")
         );
+        // The interactive sign-in asks `cfg.scope` in full (#2164).
+        assert!(req.authorize_url.contains(&format!(
+            "&{}&",
+            pkce::form_urlencode(&[("scope", cfg().scope.as_str())])
+        )));
     }
 
     #[test]
@@ -464,6 +522,8 @@ mod tests {
         let reqs = srv.requests();
         assert!(reqs[0].body.contains("code_verifier="));
         assert!(reqs[0].body.contains("grant_type=authorization_code"));
+        // The code redemption asks `cfg.scope` in full (#2164).
+        assert_eq!(reqs[0].form_value("scope"), Some(cfg().scope));
     }
 
     #[test]
@@ -475,7 +535,7 @@ mod tests {
             headers: vec![],
             body: r#"{"access_token":"AT2","refresh_token":"RT2","expires_in":3600}"#.into(),
         }]);
-        let t = refresh(&cfg(), &srv.base_url, "RT1").unwrap();
+        let t = refresh(&cfg(), &srv.base_url, "RT1", None).unwrap();
         assert_eq!(t.access_token, "AT2");
         assert_eq!(t.refresh_token, "RT2");
     }
@@ -489,7 +549,7 @@ mod tests {
             headers: vec![],
             body: r#"{"access_token":"AT2","expires_in":3600}"#.into(),
         }]);
-        let t = refresh(&cfg(), &srv.base_url, "RT1").unwrap();
+        let t = refresh(&cfg(), &srv.base_url, "RT1", None).unwrap();
         assert_eq!(t.access_token, "AT2");
         assert_eq!(t.refresh_token, "RT1");
     }
@@ -525,7 +585,7 @@ mod tests {
         let srv = FakeServer::start(vec![token_route(&format!(
             r#"{{"access_token":"AT2","expires_in":3600,"scope":"{GRANTED}"}}"#
         ))]);
-        let t = refresh(&cfg(), &srv.base_url, "RT1").unwrap();
+        let t = refresh(&cfg(), &srv.base_url, "RT1", None).unwrap();
         assert_eq!(t.scopes, Some(granted()));
     }
 
@@ -540,6 +600,102 @@ mod tests {
         // Present but blank is unknown too.
         let t = parse_token_response(r#"{"access_token":"AT","scope":"  "}"#, "").unwrap();
         assert_eq!(t.scopes, None);
+    }
+
+    fn refresh_scope_of(requested: &str, granted: &[&str]) -> String {
+        let granted: Vec<String> = granted.iter().map(|s| s.to_string()).collect();
+        refresh_scope(requested, Some(&granted))
+    }
+
+    #[test]
+    fn refresh_scope_asks_the_grant_still_requested() {
+        // Mail.Send is not granted (just added); People.Read is granted but
+        // no longer requested.
+        assert_eq!(
+            refresh_scope("Mail.ReadWrite Mail.Send offline_access", Some(&granted())),
+            "Mail.ReadWrite offline_access"
+        );
+    }
+
+    #[test]
+    fn refresh_scope_without_grant_is_requested() {
+        let requested = "Mail.ReadWrite Mail.Send offline_access";
+        assert_eq!(refresh_scope(requested, None), requested);
+    }
+
+    #[test]
+    fn refresh_scope_keeps_offline_access_only_from_the_request() {
+        let granted = ["https://graph.microsoft.com/Mail.ReadWrite"];
+        assert_eq!(
+            refresh_scope_of("offline_access Mail.ReadWrite Mail.Send", &granted),
+            "offline_access Mail.ReadWrite"
+        );
+        assert_eq!(
+            refresh_scope_of(
+                "Mail.ReadWrite Mail.Send",
+                &[
+                    "https://graph.microsoft.com/Mail.ReadWrite",
+                    "offline_access"
+                ]
+            ),
+            "Mail.ReadWrite"
+        );
+    }
+
+    #[test]
+    fn refresh_scope_of_meta_scopes_only_is_requested() {
+        let requested = "https://graph.microsoft.com/.default offline_access";
+        assert_eq!(refresh_scope(requested, Some(&granted())), requested);
+    }
+
+    #[test]
+    fn refresh_scope_keeps_meta_and_default_scopes_once() {
+        assert_eq!(
+            refresh_scope_of(
+                "openid MAIL.READWRITE profile email mail.readwrite Mail.Send \
+                 https://graph.microsoft.com/Mail.ReadWrite OFFLINE_ACCESS offline_access",
+                &["https://graph.microsoft.com/Mail.ReadWrite"]
+            ),
+            "openid MAIL.READWRITE profile email OFFLINE_ACCESS"
+        );
+        assert_eq!(
+            refresh_scope_of(
+                "https://graph.microsoft.com/Mail.ReadWrite api://app/.default",
+                &["Mail.ReadWrite"]
+            ),
+            "https://graph.microsoft.com/Mail.ReadWrite api://app/.default"
+        );
+    }
+
+    #[test]
+    fn refresh_scope_with_no_shared_scope_is_requested() {
+        let requested = "Mail.Send Calendars.ReadWrite offline_access";
+        assert_eq!(refresh_scope(requested, Some(&granted())), requested);
+        assert_eq!(refresh_scope(requested, Some(&[])), requested);
+    }
+
+    #[test]
+    fn refresh_posts_the_granted_scope() {
+        let cfg = AuthConfig {
+            scope: "Mail.ReadWrite Mail.Send People.Read offline_access".into(),
+            ..cfg()
+        };
+        let srv = FakeServer::start(vec![token_route(
+            r#"{"access_token":"AT2","expires_in":3600}"#,
+        )]);
+        refresh(&cfg, &srv.base_url, "RT1", Some(&granted())).unwrap();
+        refresh(&cfg, &srv.base_url, "RT1", None).unwrap();
+        let reqs = srv.requests();
+        assert_eq!(
+            reqs[0].form_value("scope").as_deref(),
+            Some("Mail.ReadWrite People.Read offline_access")
+        );
+        assert!(!reqs[0].body.contains("Mail.Send"), "{}", reqs[0].body);
+        assert_eq!(reqs[1].form_value("scope"), Some(cfg.scope));
+        assert_eq!(
+            reqs[0].form_value("grant_type").as_deref(),
+            Some("refresh_token")
+        );
     }
 
     #[test]
@@ -581,7 +737,7 @@ mod tests {
             headers: vec![],
             body: body.into(),
         }]);
-        match refresh(&cfg(), &srv.base_url, "RT1") {
+        match refresh(&cfg(), &srv.base_url, "RT1", None) {
             Ok(_) => panic!("the token endpoint answered {status}"),
             Err(e) => e,
         }
@@ -715,7 +871,7 @@ mod tests {
     /// transient.
     #[test]
     fn transient_failures_do_not_need_sign_in() {
-        let fail = |base: &str| match refresh(&cfg(), base, "RT1") {
+        let fail = |base: &str| match refresh(&cfg(), base, "RT1", None) {
             Ok(_) => panic!("{base} answered with a token"),
             Err(e) => e,
         };

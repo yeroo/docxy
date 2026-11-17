@@ -441,6 +441,28 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   one, and a later refresh (after a 401, about hourly) with the same grant,
   reordered or re-cased, sends none. `enter_signin` clears `announced_scopes`, so every new session
   (after a sign-out or a failed refresh) sends it again. lookxy ignores it.
+- A refresh asks only for the scopes already granted (#2164).
+  `auth::refresh(cfg, base, refresh_token, granted)` posts
+  `auth::refresh_scope(&cfg.scope, granted)`, and `try_refresh` passes the token's `scopes`.
+  `refresh_scope` keeps, in `cfg.scope`'s order and spelling and each once,
+  the scopes of `cfg.scope` the grant holds (compared as `missing_scopes`
+  compares) and `cfg.scope`'s own meta scopes. It adds nothing, not even
+  `offline_access`, itself a consentable permission. A scope the host has
+  just added is not asked for, nor is a granted one `cfg.scope` dropped.
+  With no known grant, or a grant that shares no non-meta scope with
+  `cfg.scope` (a refresh of only meta scopes would get a token for nothing
+  used), it is `cfg.scope` unchanged. Why: Entra's refresh-token grant
+  refuses a scope never consented (`invalid_grant`, AADSTS65001), so
+  asking `cfg.scope` in full signed every saved sign-in out at its next
+  refresh after a host added a scope. Now the token keeps working and the
+  new scope is in `Scopes { missing }`. It stays missing until a token response
+  names it, which an interactive sign-in (`begin_auth`, `redeem_code`: still
+  `cfg.scope` in full) does. An administrator's later consent may make a
+  refresh response name it too, which is not claimed either way. A refusal
+  of the grant itself still signs out (`needs_sign_in`); there is no retry
+  with fewer scopes. Tests read a token request's `scope` with
+  `RecordedRequest::form_value` (percent-decoded; `pkce::form_urlencode`
+  writes a space as `%20`).
 - `handle_redirect` reports a provider error as
   `authorization denied: <error>: <error_description>`, both
   percent-decoded and on one line (`one_line`: every run of control
@@ -4806,8 +4828,9 @@ keyring cannot be read now both keep it.
   `invalid_scope`), any case and any status. Everything else is transient: `Http` (transport,
   or a body that cannot be read), `Status` (a 5xx/429/408 or HTML page with no OAuth body),
   `Parse`, and any other code (`temporarily_unavailable`, `server_error`, `invalid_request`).
-  When unsure, transient. #2164 changes what `refresh` asks for; a refusal of a newly added
-  scope is a `needs_sign_in` answer there too.
+  When unsure, transient. A refusal of a refresh, which asks only the token's own grant
+  while that grant is known and shares a scope with `cfg.scope` (otherwise `cfg.scope` in
+  full: `auth::refresh_scope`, #2164), is still a `needs_sign_in` answer and signs out.
 - **Three-way refresh** (`engine.rs`). `try_refresh` returns `Refresh::{Done, SignIn,
   Transient(text)}`. No token or an empty `refresh_token` is `SignIn`, with no request: the
   server's `invalid_request` would otherwise read as transient. After a 401, `with_auth` and

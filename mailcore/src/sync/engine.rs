@@ -1448,7 +1448,12 @@ pub enum SyncEvent {
     /// hourly) with the same grant sends none. A sign-in-required (a sign-out, a failed refresh) forgets
     /// the last one, so the next session sends it again. A token whose
     /// grant is unknown (a cache from before #1875 and a refresh that names
-    /// no scopes) sends nothing.
+    /// no scopes) sends nothing. A refresh never asks for a scope a known
+    /// grant lacks while the grant shares a scope with `AuthConfig::scope`
+    /// (otherwise it asks `AuthConfig::scope` in full:
+    /// [`crate::auth::refresh_scope`], #2164), so a scope added to
+    /// `AuthConfig::scope` is missing until a token response names it, which
+    /// an interactive sign-in (asking `AuthConfig::scope` in full) does.
     Scopes {
         granted: Vec<String>,
         missing: Vec<String>,
@@ -9845,7 +9850,13 @@ impl Engine {
     /// other failure (a dropped connection, a 5xx/429 page, a body that
     /// does not parse, `temporarily_unavailable`, #2167) is
     /// [`Refresh::Transient`], with the token kept in memory and on disk.
-    /// Token values are never logged. A response that names
+    /// Token values are never logged. While the token's grant is known and
+    /// shares a scope with `AuthConfig::scope`, the refresh asks only for the
+    /// scopes of `AuthConfig::scope` it was granted (otherwise
+    /// `AuthConfig::scope` in full: [`auth::refresh_scope`], #2164), so a
+    /// scope the host has just added does not sign the person out: it is
+    /// announced missing instead.
+    /// A response that names
     /// no scopes (omitted, or empty) keeps the previous token's grant
     /// (#1875): Entra always names the granted scopes, so such an answer
     /// tells nothing new, and the last grant the server did name is kept.
@@ -9864,7 +9875,12 @@ impl Engine {
             });
         }
         let (refresh_token, previous_scopes) = (token.refresh_token.clone(), token.scopes.clone());
-        match auth::refresh(&self.config.cfg, &self.config.auth_base, &refresh_token) {
+        match auth::refresh(
+            &self.config.cfg,
+            &self.config.auth_base,
+            &refresh_token,
+            previous_scopes.as_deref(),
+        ) {
             Ok(mut t) => {
                 if t.scopes.is_none() {
                     t.scopes = previous_scopes;
@@ -10550,11 +10566,11 @@ fn drain_remaining_request(stream: &TcpStream) {
 }
 
 /// Parses an `application/x-www-form-urlencoded` query string into
-/// `(key, value)` pairs, percent-decoding each. A tiny local counterpart to
-/// `pkce::form_urlencode` (which only encodes) — kept here rather than
-/// shared, since this is the one place anything in `mailcore` decodes a
-/// query string.
-fn parse_query(query: &str) -> Vec<(String, String)> {
+/// `(key, value)` pairs, percent-decoding each. A tiny counterpart to
+/// `pkce::form_urlencode` (which only encodes): the loopback redirect's
+/// decoder, also used by `testserver::RecordedRequest::form_value` to read
+/// token-request bodies in tests.
+pub(crate) fn parse_query(query: &str) -> Vec<(String, String)> {
     query
         .split('&')
         .filter(|pair| !pair.is_empty())
@@ -16047,6 +16063,128 @@ mod tests {
         finish(handle, dir);
     }
 
+    /// #2164: a token granted `Mail.ReadWrite offline_access`, with
+    /// `Mail.Send` added to the config, refreshes asking only for its grant
+    /// (FakeServer answers whatever is asked, so the asked scope is what
+    /// shows the fix), stays signed in, and `Mail.Send` is reported missing.
+    #[test]
+    fn refresh_asks_only_the_granted_scopes_and_reports_a_new_one_missing() {
+        let cfg = AuthConfig {
+            scope: "Mail.ReadWrite Mail.Send offline_access".into(),
+            ..test_cfg()
+        };
+        let (events, dir, handle, srv) = startup_events(
+            "scopes-refresh-added",
+            vec![
+                (
+                    token_route(
+                        r#"{"access_token":"AT2","expires_in":3600,"scope":"https://graph.microsoft.com/Mail.ReadWrite offline_access"}"#,
+                    ),
+                    None,
+                ),
+                (empty_folders_route(200), None),
+            ],
+            cfg,
+            |p| seed_token_with_scopes(p, 10, SEEDED),
+        );
+        assert_eq!(
+            asked_scopes(&srv),
+            strings(&["Mail.ReadWrite offline_access"])
+        );
+        let token_bodies: Vec<String> = srv
+            .requests()
+            .iter()
+            .filter(|r| r.path.starts_with("/organizations/oauth2/v2.0/token"))
+            .map(|r| r.body.clone())
+            .collect();
+        assert!(
+            token_bodies.iter().all(|b| !b.contains("Mail.Send")),
+            "{token_bodies:?}"
+        );
+        assert!(!signs_out(&events), "{events:?}");
+        // Announced at load; the refresh answered the same grant.
+        assert_eq!(
+            scopes_events(&events),
+            vec![(strings(SEEDED), strings(&["Mail.Send"]))],
+            "{events:?}"
+        );
+        let cached = tokencache::load(&dir.join("token.bin")).unwrap().unwrap();
+        assert_eq!(cached.access_token, "AT2");
+        assert_eq!(cached.scopes, Some(strings(SEEDED)));
+        finish(handle, dir);
+    }
+
+    /// #2164: a token whose grant is unknown (a cache from before #1875)
+    /// refreshes asking `AuthConfig::scope` in full, as before.
+    #[test]
+    fn refresh_without_known_grant_asks_the_config_scope() {
+        let cfg = AuthConfig {
+            scope: "Mail.ReadWrite Mail.Send offline_access".into(),
+            ..test_cfg()
+        };
+        let (events, dir, handle, srv) = startup_events(
+            "scopes-refresh-unknown",
+            vec![
+                (
+                    token_route(r#"{"access_token":"AT2","expires_in":3600}"#),
+                    None,
+                ),
+                (empty_folders_route(200), None),
+            ],
+            cfg,
+            |p| {
+                let t = TokenSet {
+                    access_token: "AT".into(),
+                    refresh_token: "RT".into(),
+                    expires_at_unix: now_unix() + 10,
+                    account: "me@epam.com".into(),
+                    scopes: None,
+                };
+                tokencache::save(p, &t).unwrap();
+            },
+        );
+        assert_eq!(
+            asked_scopes(&srv),
+            strings(&["Mail.ReadWrite Mail.Send offline_access"])
+        );
+        assert!(!signs_out(&events), "{events:?}");
+        finish(handle, dir);
+    }
+
+    /// #2164: a scope the token was granted that the config no longer names
+    /// is not asked for on refresh.
+    #[test]
+    fn refresh_drops_a_scope_removed_from_the_config() {
+        let (events, dir, handle, srv) = startup_events(
+            "scopes-refresh-removed",
+            vec![
+                (
+                    token_route(r#"{"access_token":"AT2","expires_in":3600}"#),
+                    None,
+                ),
+                (empty_folders_route(200), None),
+            ],
+            test_cfg(),
+            |p| {
+                seed_token_with_scopes(
+                    p,
+                    10,
+                    &[
+                        "https://graph.microsoft.com/Mail.ReadWrite",
+                        "https://graph.microsoft.com/People.Read",
+                        "offline_access",
+                    ],
+                )
+            },
+        );
+        assert_eq!(
+            asked_scopes(&srv),
+            strings(&["Mail.ReadWrite offline_access"])
+        );
+        assert!(!signs_out(&events), "{events:?}");
+        finish(handle, dir);
+    }
+
     #[test]
     fn refresh_on_401_with_same_grant_announces_nothing_new() {
         // The folder list 401s once; the refresh answers the same grant,
@@ -16687,6 +16825,15 @@ mod tests {
             .count()
     }
 
+    /// The `scope` each token request asked for (#2164), percent-decoded.
+    fn asked_scopes(srv: &FakeServer) -> Vec<String> {
+        srv.requests()
+            .iter()
+            .filter(|r| r.path.starts_with("/organizations/oauth2/v2.0/token"))
+            .map(|r| r.form_value("scope").unwrap_or_default())
+            .collect()
+    }
+
     /// The access token saved at `path` (no store under `cfg(test)`).
     fn saved_access_token(path: &std::path::Path) -> String {
         tokencache::load(path).unwrap().unwrap().access_token
@@ -16810,20 +16957,41 @@ mod tests {
 
     /// AC 3 (#2167): a refused grant still signs out, at startup and on a
     /// 401; so does a token with no refresh token, which asks nothing.
+    /// #2164: so does a refusal of a refresh that asked only the token's
+    /// own grant, with a scope added to the config (AADSTS65001).
     #[test]
     fn refused_refresh_still_signs_out() {
-        for (code, expires_in) in [("invalid_grant", 0), ("interaction_required", 3600)] {
-            let srv = FakeServer::start(vec![
-                token_failure(400, &format!(r#"{{"error":"{code}"}}"#)),
-                empty_folders_route(401),
-            ]);
+        let added = AuthConfig {
+            scope: "Mail.ReadWrite Mail.Send offline_access".into(),
+            ..test_cfg()
+        };
+        let consent = r#"{"error":"invalid_grant","error_description":"AADSTS65001: The user or administrator has not consented"}"#;
+        for (body, code, aadsts, expires_in, cfg) in [
+            (
+                r#"{"error":"invalid_grant"}"#,
+                "invalid_grant",
+                None,
+                0,
+                test_cfg(),
+            ),
+            (
+                r#"{"error":"interaction_required"}"#,
+                "interaction_required",
+                None,
+                3600,
+                test_cfg(),
+            ),
+            (consent, "invalid_grant", Some(65001), 0, added.clone()),
+            (consent, "invalid_grant", Some(65001), 3600, added),
+        ] {
+            let srv = FakeServer::start(vec![token_failure(400, body), empty_folders_route(401)]);
             let dir = unique_dir("refresh-refused");
             let token_path = dir.join("token.bin");
             seed_token_with_scopes(&token_path, expires_in, SEEDED);
             let handle = spawn_with_bases(
                 dir.join("mail.db"),
                 token_path,
-                test_cfg(),
+                cfg,
                 3650,
                 srv.base_url.clone(),
                 srv.base_url.clone(),
@@ -16843,11 +17011,17 @@ mod tests {
                 signin_reasons(&events),
                 vec![SignInReason::Expired {
                     code: code.into(),
-                    aadsts: None,
+                    aadsts,
                 }],
                 "{code}: {events:?}"
             );
             assert_eq!(token_requests(&srv), 1, "{code}");
+            // The refresh asked the token's own grant, never `Mail.Send`.
+            assert_eq!(
+                asked_scopes(&srv),
+                strings(&["Mail.ReadWrite offline_access"]),
+                "{code}"
+            );
             // Signed out: the 401 path ran a Graph call, the startup one none.
             let graph = srv.requests().iter().any(|r| r.path.starts_with("/me"));
             assert_eq!(graph, expires_in > 0, "{code}");
