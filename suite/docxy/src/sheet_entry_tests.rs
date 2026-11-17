@@ -2549,3 +2549,28 @@ fn the_view_reaches_the_drawings_past_the_used_range() {
         (DRAWING_REACH_ROWS, MAX_VISIBLE_COL)
     );
 }
+
+/// The grid's row list and its sideways scroll are sized by `view_extent`
+/// (#2228): a picture far below and right of a sheet's few notes is inside
+/// both, while Ctrl+A's used range (`extent`) stays the notes.
+#[test]
+fn the_row_list_and_the_side_scroll_reach_a_far_picture() {
+    use gridcore::sheet::{Drawing, DrawingKind};
+    let mut v = view();
+    v.pkg.workbook.sheets[0].set_cell(2, 1, Cell::text("note"));
+    assert_eq!(v.list_rows(), 500, "the headroom alone");
+    assert_eq!(v.hscroll_max(), 1);
+    v.pkg.workbook.sheets[0].drawings.push(Drawing {
+        anchor_ix: 0,
+        from: (1500, 30),
+        to: (1600, 40),
+        kind: DrawingKind::Image {
+            part: "xl/media/image1.png".into(),
+            name: "Picture 1".into(),
+        },
+        anchor: Default::default(),
+    });
+    assert_eq!(v.list_rows(), 1600 + 100);
+    assert_eq!(v.hscroll_max(), 40);
+    assert_eq!(v.extent(), (2, 1), "the used range is the cells'");
+}

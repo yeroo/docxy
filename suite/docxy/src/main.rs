@@ -5318,6 +5318,17 @@ impl SheetView {
     fn view_extent(&self) -> (u32, u32) {
         drawings_reach(self.extent(), &self.sheet().drawings)
     }
+
+    /// How many rows the grid's row list virtualizes over: the view's extent
+    /// ([`Self::view_extent`], drawings included) plus generous headroom.
+    fn list_rows(&self) -> u32 {
+        (self.view_extent().0 + 100).max(500)
+    }
+
+    /// The furthest `col0` a sideways scroll reaches: the view's last column.
+    fn hscroll_max(&self) -> u32 {
+        self.view_extent().1
+    }
 }
 
 /// The furthest of `used` and the bottom-right cells `drawings` reach,
@@ -19073,8 +19084,13 @@ impl Docxy {
     /// does, taking the selection from the cells and from any chart, as a
     /// press on another chart would (so a field pointing at the grid lets
     /// go). It only selects: a picture is not moved, resized or deleted.
-    fn picture_press(&mut self, idx: usize, cx: &mut Context<Self>) {
+    ///
+    /// `hold`: a left press, held until `grid_release` (`picture_held`), set
+    /// only once the press is taken: one an alert refuses never sees its
+    /// release, which the alert's backdrop swallows.
+    fn picture_press(&mut self, idx: usize, hold: bool, cx: &mut Context<Self>) {
         if self.picture_sel == Some(idx) && self.chart_sel.is_none() {
+            self.picture_held = hold;
             return;
         }
         // A half-typed cell is committed first, as for a press on a chart.
@@ -19083,6 +19099,7 @@ impl Docxy {
         {
             return;
         }
+        self.picture_held = hold;
         self.range_edit = None;
         self.ref_msg = None;
         self.range_pick = None;
@@ -20113,6 +20130,9 @@ impl Docxy {
     /// reproduced this body instead of calling it would keep passing after this
     /// one changed.
     fn grid_press_cell(&mut self, cell: (u32, u32), ctrl: bool, _cx: &mut Context<Self>) {
+        // A press on the cells is no press on a picture, whatever release
+        // the grid did not see (#2228).
+        self.picture_held = false;
         self.sheet_comment_bar_leave();
         self.name_box = None;
         self.font_box = None;
@@ -21419,7 +21439,7 @@ impl Docxy {
     /// Scroll horizontally by `delta` columns (Shift+wheel), clamped to the extent.
     fn sheet_hscroll(&mut self, delta: i32, cx: &mut Context<Self>) {
         if let Some(v) = self.active_sheet_mut() {
-            let (_, mc) = v.view_extent();
+            let mc = v.hscroll_max();
             let nv = (v.col0 as i32 + delta).clamp(0, mc as i32);
             if nv as u32 != v.col0 {
                 v.col0 = nv as u32;
@@ -48970,13 +48990,7 @@ fn sheet_picture_layer(
     if images.is_empty() {
         return None;
     }
-    let excel_row = |r: u32| {
-        sheet_pictures::excel_row_emu(
-            sh.row_height(r),
-            sh.format.default_row_height,
-            sh.row_hidden(r),
-        )
-    };
+    let excel_row = |r: u32| sheet_pictures::sheet_row_emu(sh, r);
     // A row's drawn height is what the list measured it at: a row grows past
     // `row_height_px` (its min height, gridline included) with its text. The
     // list knows the rows from its top item on; the rows above it and the
@@ -49004,7 +49018,7 @@ fn sheet_picture_layer(
                 .unwrap_or_else(|| row_height_px(sh.row_height(r), SHEET_ROW_H))
         }
     };
-    let excel_col = |c: u32| sheet_pictures::excel_col_emu(sh.col_width(c), sh.col_hidden(c));
+    let excel_col = |c: u32| sheet_pictures::sheet_col_emu(sh, c);
     let drawn_col = |c: u32| col_px(sh.col_width(c));
     let rows = Axis {
         excel: &excel_row,
@@ -49101,7 +49115,7 @@ fn sheet_picture_layer(
             let main = ri == rp_last && ci == cp_last;
             for (i, ((_, part, name), span)) in images.iter().zip(&spans).enumerate() {
                 let Some((x, y, pw, ph)) =
-                    sheet_pictures::piece(&rows, &cols, row_pane, col_pane, *span, 1.0)
+                    sheet_pictures::piece(&rows, &cols, row_pane, col_pane, *span)
                 else {
                     continue;
                 };
@@ -49175,17 +49189,13 @@ fn sheet_picture(
         // also react. The wheel is not a press: it still scrolls the grid.
         .on_mouse_down(MouseButton::Left, move |_ev, _w, cx2| {
             cx2.stop_propagation();
-            ent.update(cx2, |this, cx2| {
-                // Held until the left button comes up (`grid_release`).
-                this.picture_held = true;
-                this.picture_press(idx, cx2)
-            });
+            ent.update(cx2, |this, cx2| this.picture_press(idx, true, cx2));
         })
         // A right-press selects it too, and the cell it covers opens no menu
         // (a picture has no menu yet).
         .on_mouse_down(MouseButton::Right, move |_ev, _w, cx2| {
             cx2.stop_propagation();
-            ent_r.update(cx2, |this, cx2| this.picture_press(idx, cx2));
+            ent_r.update(cx2, |this, cx2| this.picture_press(idx, false, cx2));
         })
         .child(content)
         .when_some(probes, |d, probes| {
@@ -49264,7 +49274,7 @@ fn sheet_el(
 ) -> AnyElement {
     let sh = view.sheet();
     // The used range and the drawings: the list and the scrollbar reach both.
-    let (max_r, max_c) = view.view_extent();
+    let max_c = view.hscroll_max();
     // Frozen columns (freeze panes, cols axis): pinned at the left, always shown.
     let (frz_r, frz_c) = sh.freeze;
     let fc = frz_c.min(64);
@@ -49284,8 +49294,9 @@ fn sheet_el(
     let col0 = view.col0.max(fc).min(MAX_VISIBLE_COL);
     let avail = (grid_w - SHEET_GUT - frozen_w).max(80.0);
     let cend = last_visible_col(|c| col_px(sh.col_width(c)), col0, avail, MAX_VISIBLE_COL);
-    // Total rows to virtualize over: the used range plus generous headroom.
-    let total_rows = ((max_r + 100).max(500)) as usize;
+    // Total rows to virtualize over: the used range and the drawings, plus
+    // generous headroom.
+    let total_rows = view.list_rows() as usize;
     let gridline = hsla_u(0xd9d9d9);
     let (r0, c0, r1, c1) = view.range();
     ov.selected_headers = selected_header_range((r0, c0, r1, c1), ov.range_preview, ov.sel_hidden);

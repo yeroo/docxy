@@ -13051,7 +13051,7 @@ mod tests {
         // A loaded workbook whose sheet holds a picture, with a `<xdr:row>`
         // padded by whitespace and a column clamped on load (#2228). Saving
         // used to send every anchor through `rewrite_anchors`, which writes
-        // `<xdr:row>2</xdr:row>` back for ` 2 ` and the clamped column for the
+        // `<xdr:row>1</xdr:row>` back for ` 1 ` and the clamped column for the
         // one in the part.
         let mut pkg = new_xlsx();
         pkg.workbook.sheets[0].set_cell(0, 0, crate::sheet::Cell::text("Notes"));

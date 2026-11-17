@@ -1877,6 +1877,14 @@ impl Sheet {
         self.col_defs.iter().find(|d| col >= d.min && col <= d.max)
     }
 
+    /// The column's own `<col width>` (a file width, in characters with the
+    /// padding included), or `None` when it takes the sheet's default
+    /// ([`Self::default_col_file_width`]). Unlike [`Self::col_width`], which
+    /// falls back to `DEFAULT_COL_WIDTH`, this tells the two apart (#2228).
+    pub fn col_own_width(&self, col: u32) -> Option<f64> {
+        self.col_def(col).and_then(|d| d.width)
+    }
+
     /// Whether a column is hidden (its `<col>` definition carries `hidden="1"`).
     pub fn col_hidden(&self, col: u32) -> bool {
         self.col_def(col).is_some_and(|d| attr_hidden(&d.attrs))

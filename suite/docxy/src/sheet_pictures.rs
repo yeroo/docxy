@@ -18,13 +18,13 @@
 //! grid's scale. Both steps are pure, over closures for the sizes, so the
 //! tests pin them without a window.
 
-use gridcore::sheet::{AnchorKind, DrawingAnchor};
+use gridcore::sheet::{AnchorKind, DrawingAnchor, Sheet};
 
 /// One axis of the sheet: rows or columns.
 pub struct Axis<'a> {
     /// A cell's size as Excel lays it out, in EMU; 0 for a hidden cell.
     pub excel: &'a dyn Fn(u32) -> i64,
-    /// A cell's size as the grid draws it, in px at scale 1; 0 for a cell
+    /// A cell's size as the grid draws it, in px; 0 for a cell
     /// the grid does not draw (a hidden row; a hidden column is drawn).
     pub drawn: &'a dyn Fn(u32) -> f32,
     /// The first cell the grid never draws: nothing at or past it is placed.
@@ -55,14 +55,43 @@ pub const MAX_WALK: u32 = 1 << 16;
 pub const EMU_PER_PT: i64 = 12700;
 pub const EMU_PER_PX: i64 = 9525;
 
-/// A column's width in Excel's pixels, as EMU: `units * 7 + 5` (Calibri 11's
-/// 7 px digit and its padding, so 8.43 is 64 px). An estimate, unclamped,
-/// unlike the grid's `col_px`; 0 for a hidden column.
-pub fn excel_col_emu(units: f64, hidden: bool) -> i64 {
+/// Excel's pixel width of a column whose file width is `w` (`<col width>`
+/// or `defaultColWidth`: characters, the padding already in it), by
+/// ECMA-376 18.3.1.13 with Calibri 11's 7 px maximum digit width:
+/// `trunc(((256 w + trunc(128 / 7)) / 256) * 7)`, so 9.140625 is 64 px.
+/// Unclamped, unlike the grid's `col_px`.
+pub fn excel_col_px(w: f64) -> i64 {
+    const MDW: f64 = 7.0;
+    let px = ((256.0 * w + (128.0 / MDW).trunc()) / 256.0 * MDW).trunc();
+    px.max(0.0) as i64
+}
+
+/// A column of file width `w` as Excel lays it out, in EMU; 0 when hidden.
+pub fn excel_col_emu(w: f64, hidden: bool) -> i64 {
     if hidden {
         return 0;
     }
-    ((units * 7.0 + 5.0).round().max(0.0) as i64) * EMU_PER_PX
+    excel_col_px(w) * EMU_PER_PX
+}
+
+/// Column `c` of `sh` as Excel lays it out, in EMU: its own `<col width>`,
+/// else the sheet's default (`defaultColWidth`, else the width
+/// `baseColWidth` gives), 0 when hidden. Not `Sheet::col_width`, which
+/// falls back to 8.43 whatever the sheet says.
+pub fn sheet_col_emu(sh: &Sheet, c: u32) -> i64 {
+    let w = sh
+        .col_own_width(c)
+        .unwrap_or_else(|| sh.default_col_file_width());
+    excel_col_emu(w, sh.col_hidden(c))
+}
+
+/// Row `r` of `sh` as Excel lays it out, in EMU ([`excel_row_emu`]).
+pub fn sheet_row_emu(sh: &Sheet, r: u32) -> i64 {
+    excel_row_emu(
+        sh.row_height(r),
+        sh.format.default_row_height,
+        sh.row_hidden(r),
+    )
 }
 
 /// A row's height in EMU: its own `ht`, else the sheet's default, else
@@ -152,10 +181,10 @@ pub fn anchor_span(
     }
 }
 
-/// Step 2: how far `p` lies from the start of cell `origin`, in drawn px at
-/// `scale` — negative before it. It walks only the cells between the two,
+/// Step 2: how far `p` lies from the start of cell `origin`, in drawn px —
+/// negative before it. It walks only the cells between the two,
 /// at most [`MAX_WALK`].
-pub fn offset_px(axis: &Axis, origin: u32, p: CellPos, scale: f32) -> f32 {
+pub fn offset_px(axis: &Axis, origin: u32, p: CellPos) -> f32 {
     let mut px = 0.0f32;
     if p.cell >= origin {
         let last = p.cell.min(origin.saturating_add(MAX_WALK));
@@ -173,7 +202,7 @@ pub fn offset_px(axis: &Axis, origin: u32, p: CellPos, scale: f32) -> f32 {
     } else {
         0.0
     };
-    (px + p.frac * cell) * scale
+    px + p.frac * cell
 }
 
 /// A pane of the grid along one axis: the first cell it shows, how far that
@@ -187,14 +216,14 @@ pub struct Pane {
 
 /// A picture's piece in one pane along one axis: its start and length in
 /// px from the pane's edge, or `None` when it misses the pane.
-pub fn place(axis: &Axis, pane: Pane, span: (CellPos, CellPos), scale: f32) -> Option<(f32, f32)> {
+pub fn place(axis: &Axis, pane: Pane, span: (CellPos, CellPos)) -> Option<(f32, f32)> {
     let (a, b) = span;
     // Wholly before the pane or wholly after it: nothing to walk.
     if b.cell < pane.first || a.cell > pane.last {
         return None;
     }
-    let start = offset_px(axis, pane.first, a, scale) - pane.shift;
-    let end = offset_px(axis, pane.first, b, scale) - pane.shift;
+    let start = offset_px(axis, pane.first, a) - pane.shift;
+    let end = offset_px(axis, pane.first, b) - pane.shift;
     (end > start).then_some((start, end - start))
 }
 
@@ -206,10 +235,9 @@ pub fn piece(
     row_pane: Pane,
     col_pane: Pane,
     span: Span,
-    scale: f32,
 ) -> Option<(f32, f32, f32, f32)> {
-    let (y, h) = place(rows, row_pane, span.rows, scale)?;
-    let (x, w) = place(cols, col_pane, span.cols, scale)?;
+    let (y, h) = place(rows, row_pane, span.rows)?;
+    let (x, w) = place(cols, col_pane, span.cols)?;
     Some((x, y, w, h))
 }
 
@@ -224,7 +252,7 @@ mod tests {
 
     /// The sizes of a small sheet: rows of 15 pt drawn at 21 px, with row 3
     /// 30 pt (42 px) and row 5 hidden; columns of 8.43 units (64 Excel px)
-    /// drawn at 65 px, with column 2 hidden (Excel 0, the grid's 28 px).
+    /// drawn at 65 px (file width 9.140625), with column 2 hidden (Excel 0, the grid's 28 px).
     fn excel_row(r: u32) -> i64 {
         match r {
             3 => excel_row_emu(Some(30.0), None, false),
@@ -240,7 +268,7 @@ mod tests {
         }
     }
     fn excel_col(c: u32) -> i64 {
-        excel_col_emu(8.43, c == 2)
+        excel_col_emu(9.140625, c == 2)
     }
     fn drawn_col(c: u32) -> f32 {
         if c == 2 { 28.0 } else { 65.0 }
@@ -294,16 +322,20 @@ mod tests {
         a: &(DrawingAnchor, (u32, u32), (u32, u32)),
         rp: Pane,
         cp: Pane,
-        scale: f32,
     ) -> Option<(f32, f32, f32, f32)> {
         let span = anchor_span(&a.0, a.1, a.2, &rows(), &cols());
-        piece(&rows(), &cols(), rp, cp, span, scale)
+        piece(&rows(), &cols(), rp, cp, span)
     }
 
     #[test]
     fn excel_sizes_are_estimated_as_excel_lays_them_out() {
-        assert_eq!(excel_col_emu(8.43, false), COL_EMU);
-        assert_eq!(excel_col_emu(8.43, true), 0);
+        // Excel's own default file width, and a wider one, as Excel shows them.
+        assert_eq!(excel_col_px(9.140625), 64);
+        assert_eq!(excel_col_px(20.7109375), 145);
+        assert_eq!(excel_col_px(14.43), 101);
+        assert_eq!(excel_col_px(0.0), 0);
+        assert_eq!(excel_col_emu(9.140625, false), COL_EMU);
+        assert_eq!(excel_col_emu(9.140625, true), 0);
         assert_eq!(excel_row_emu(None, None, false), ROW_EMU);
         assert_eq!(excel_row_emu(None, Some(20.0), false), 20 * EMU_PER_PT);
         assert_eq!(
@@ -324,11 +356,11 @@ mod tests {
             (4, 1),
             (ROW_EMU, COL_EMU / 2),
         );
-        let (x, y, w, h) = rect(&a, TOP, LEFT, 1.0).unwrap();
+        let (x, y, w, h) = rect(&a, TOP, LEFT).unwrap();
         assert_eq!(x, 65.0 / 4.0);
         assert_eq!(y, R + R / 2.0);
         assert_eq!(w, 65.0 - 65.0 / 4.0 + 32.5);
-        // Rows 1 (half), 2, 3 (43 px) and all of row 4.
+        // Rows 1 (half), 2, 3 (42 px) and all of row 4.
         assert_eq!(h, R / 2.0 + R + TALL + R);
     }
 
@@ -336,13 +368,13 @@ mod tests {
     #[test]
     fn offsets_larger_than_their_cell_are_clamped_to_it() {
         let a = two_cell((1, 0), (ROW_EMU * 5, COL_EMU * 3), (3, 2), (0, 0));
-        let (x, y, w, h) = rect(&a, TOP, LEFT, 1.0).unwrap();
+        let (x, y, w, h) = rect(&a, TOP, LEFT).unwrap();
         // It starts at the end of row 1 and of column 0.
         assert_eq!((x, y), (65.0, 2.0 * R));
         assert_eq!((w, h), (65.0, R));
         // A box that ends where it starts draws nothing.
         let flat = two_cell((1, 0), (ROW_EMU * 5, 0), (2, 1), (0, 0));
-        assert_eq!(rect(&flat, TOP, LEFT, 1.0), None);
+        assert_eq!(rect(&flat, TOP, LEFT), None);
     }
 
     /// A hidden row under a picture collapses (the grid does not draw it);
@@ -350,7 +382,7 @@ mod tests {
     #[test]
     fn a_hidden_row_collapses_and_a_hidden_column_is_spanned_as_drawn() {
         let a = two_cell((4, 1), (0, 0), (7, 4), (0, 0));
-        let (x, y, w, h) = rect(&a, TOP, LEFT, 1.0).unwrap();
+        let (x, y, w, h) = rect(&a, TOP, LEFT).unwrap();
         assert_eq!(x, 65.0);
         assert_eq!(y, R * 3.0 + TALL);
         // Rows 4, 5 (hidden, 0 px), 6.
@@ -359,7 +391,7 @@ mod tests {
         assert_eq!(w, 65.0 + 28.0 + 65.0);
         // An offset into a hidden cell has nothing to be a fraction of.
         let a = two_cell((5, 2), (ROW_EMU, COL_EMU), (7, 3), (0, 0));
-        let (x, y, _, _) = rect(&a, TOP, LEFT, 1.0).unwrap();
+        let (x, y, _, _) = rect(&a, TOP, LEFT).unwrap();
         assert_eq!((x, y), (130.0, R * 4.0 + TALL));
     }
 
@@ -386,7 +418,7 @@ mod tests {
         // (0 EMU), so it ends half into column 4.
         assert_eq!(span.cols.0, CellPos { cell: 1, frac: 0.5 });
         assert_eq!(span.cols.1, CellPos { cell: 4, frac: 0.5 });
-        let (x, y, w, h) = piece(&rows(), &cols(), TOP, LEFT, span, 1.0).unwrap();
+        let (x, y, w, h) = piece(&rows(), &cols(), TOP, LEFT, span).unwrap();
         assert_eq!(y, R * 4.0 + TALL + 0.0);
         assert_eq!(h, R * 4.0);
         assert_eq!(x, 65.0 * 1.5);
@@ -405,7 +437,7 @@ mod tests {
         let span = anchor_span(&anchor, (0, 0), (0, 0), &rows(), &cols());
         assert_eq!(span.rows.0, CellPos { cell: 1, frac: 0.5 });
         assert_eq!(span.rows.1, CellPos { cell: 2, frac: 0.5 });
-        let (x, y, w, h) = piece(&rows(), &cols(), TOP, LEFT, span, 1.0).unwrap();
+        let (x, y, w, h) = piece(&rows(), &cols(), TOP, LEFT, span).unwrap();
         assert_eq!((x, y, w, h), (65.0, R * 1.5, 32.5, R));
     }
 
@@ -415,7 +447,7 @@ mod tests {
     #[test]
     fn a_scrolled_view_moves_the_picture_and_keeps_its_size() {
         let a = two_cell((1, 0), (0, 0), (8, 3), (0, 0));
-        let unscrolled = rect(&a, TOP, LEFT, 1.0).unwrap();
+        let unscrolled = rect(&a, TOP, LEFT).unwrap();
         let rp = Pane {
             first: 2,
             shift: 5.0,
@@ -426,7 +458,7 @@ mod tests {
             shift: 0.0,
             last: 20,
         };
-        let (x, y, w, h) = rect(&a, rp, cp, 1.0).unwrap();
+        let (x, y, w, h) = rect(&a, rp, cp).unwrap();
         assert_eq!(y, -R - 5.0);
         assert_eq!(x, -65.0);
         assert_eq!((w, h), (unscrolled.2, unscrolled.3));
@@ -436,13 +468,13 @@ mod tests {
             shift: 0.0,
             last: 40,
         };
-        assert_eq!(rect(&a, past, LEFT, 1.0), None);
+        assert_eq!(rect(&a, past, LEFT), None);
         let before = Pane {
             first: 0,
             shift: 0.0,
             last: 0,
         };
-        assert_eq!(rect(&a, before, LEFT, 1.0), None);
+        assert_eq!(rect(&a, before, LEFT), None);
     }
 
     /// Frozen panes: a picture over the freeze line has a piece in each
@@ -462,9 +494,9 @@ mod tests {
             shift: 0.0,
             last: 40,
         };
-        let (_, fy, _, fh) = rect(&a, frozen, LEFT, 1.0).unwrap();
+        let (_, fy, _, fh) = rect(&a, frozen, LEFT).unwrap();
         assert_eq!(fy, R);
-        let (_, sy, _, sh) = rect(&a, scrolled, LEFT, 1.0).unwrap();
+        let (_, sy, _, sh) = rect(&a, scrolled, LEFT).unwrap();
         // Rows 1..10 above the pane: 1, 2, 4, 6..9 at 21, 3 at 42, 5 hidden.
         assert_eq!(sy, -(R * 7.0 + TALL));
         assert_eq!(fh, sh, "one picture, one size");
@@ -479,18 +511,9 @@ mod tests {
             shift: 0.0,
             last: 20,
         };
-        let (fx, ..) = rect(&a, frozen, fcols, 1.0).unwrap();
-        let (sx, ..) = rect(&a, frozen, scols, 1.0).unwrap();
+        let (fx, ..) = rect(&a, frozen, fcols).unwrap();
+        let (sx, ..) = rect(&a, frozen, scols).unwrap();
         assert_eq!((fx, sx), (0.0, -65.0));
-    }
-
-    /// The scale multiplies every drawn length.
-    #[test]
-    fn a_scale_of_two_doubles_the_box() {
-        let a = two_cell((1, 0), (ROW_EMU / 2, 0), (4, 1), (0, 0));
-        let one = rect(&a, TOP, LEFT, 1.0).unwrap();
-        let two = rect(&a, TOP, LEFT, 2.0).unwrap();
-        assert_eq!(two, (one.0 * 2.0, one.1 * 2.0, one.2 * 2.0, one.3 * 2.0));
     }
 
     /// A crafted extent stops at the axis's end, or after `MAX_WALK` cells.
@@ -548,11 +571,38 @@ mod tests {
             cell: 3 * MAX_WALK,
             frac: 0.0,
         };
-        assert_eq!(offset_px(&rows, 0, far, 1.0), MAX_WALK as f32 * R);
+        assert_eq!(offset_px(&rows, 0, far), MAX_WALK as f32 * R);
         let near = CellPos { cell: 0, frac: 0.0 };
-        assert_eq!(
-            offset_px(&rows, 3 * MAX_WALK, near, 1.0),
-            -(MAX_WALK as f32 * R)
-        );
+        assert_eq!(offset_px(&rows, 3 * MAX_WALK, near), -(MAX_WALK as f32 * R));
+    }
+
+    /// A sheet's columns take their own width, else the sheet's
+    /// `defaultColWidth` (not 8.43), with the padding counted once: a
+    /// one-cell picture exactly two default columns wide ends two columns on.
+    #[test]
+    fn a_sheets_columns_are_sized_from_its_own_widths_and_default() {
+        let mut sh = Sheet::default();
+        assert_eq!(sheet_col_emu(&sh, 0), 64 * EMU_PER_PX, "baseColWidth 8");
+        sh.format.default_col_width = Some(14.43);
+        sh.set_col_width(1, 20.7109375);
+        sh.set_col_hidden(4, true);
+        assert_eq!(sheet_col_emu(&sh, 0), 101 * EMU_PER_PX);
+        assert_eq!(sheet_col_emu(&sh, 1), 145 * EMU_PER_PX);
+        assert_eq!(sheet_col_emu(&sh, 4), 0);
+        assert_eq!(sheet_row_emu(&sh, 0), ROW_EMU);
+        let excel = |c: u32| sheet_col_emu(&sh, c);
+        let drawn = |_: u32| 65.0;
+        let cols = Axis {
+            excel: &excel,
+            drawn: &drawn,
+            end: 256,
+        };
+        let anchor = DrawingAnchor {
+            kind: AnchorKind::OneCell,
+            ext: Some((2 * 101 * EMU_PER_PX, ROW_EMU)),
+            ..DrawingAnchor::default()
+        };
+        let span = anchor_span(&anchor, (0, 5), (0, 0), &rows(), &cols);
+        assert_eq!(span.cols.1, CellPos { cell: 7, frac: 0.0 });
     }
 }

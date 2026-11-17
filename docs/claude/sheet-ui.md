@@ -110,8 +110,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   always written. The media and the rels were never touched.
 - The suite draws every `DrawingKind::Image` in `sheet_picture_layer`
   (main.rs), placed by `sheet_pictures` in two steps: the anchor becomes
-  `(cell, fraction)` edges in Excel's cell sizes (`excel_row_emu`: `ht`, the
-  sheet default or 15 pt; `excel_col_emu`: `units*7+5` px; hidden cells 0),
+  `(cell, fraction)` edges in Excel's cell sizes (`sheet_row_emu`: `ht`, the
+  sheet default or 15 pt; `sheet_col_emu`: the column's own `<col width>`
+  (`Sheet::col_own_width`), else `default_col_file_width`, both file widths
+  with the padding in, to px by ECMA-376 18.3.1.13 (`excel_col_px`, MDW 7:
+  9.140625 is 64 px); hidden cells 0; not `col_width`, which falls back to
+  8.43 whatever `defaultColWidth` says),
   then drawn px over the grid's sizes: a row at the height the row list
   measured it (a row grows past `row_height_px`, its min height with the
   gridline inside, with its text), else at `row_height_px`, 0 when hidden; a
@@ -127,8 +131,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   the chart layer; it, the chart layer and the vertical scrollbar start at
   `rows_viewport_top(fx_expanded)`, under the formula bar as drawn. The row
   list and the horizontal scroll reach the drawings too
-  (`SheetView::view_extent`, capped at `DRAWING_REACH_ROWS` rows); `extent`
-  stays the used range for find, Ctrl+A and the rest. The rows above the list's top item and the frozen band
+  (`SheetView::list_rows` and `hscroll_max`, over `view_extent`, capped at
+  `DRAWING_REACH_ROWS` rows); `extent` stays the used range for find, Ctrl+A
+  and the rest. There is no sheet zoom, so the geometry takes none. The rows
+  above the list's top item and the frozen band
   are not measured (`ListState::bounds_for_item` has none for them), so a
   tall text row there is taken at its min height.
 - `pictures::Cache::sheet_image` keys a sheet's media by part: the same bytes
@@ -139,8 +145,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   delete). It holds the selection as a chart does (`sel_hidden`, no fill
   handle); `chart_hand_back` and `chart_drop_selection` clear it, so every
   key and press that hands a chart back, a sheet or tab switch and an undo do
-  too. Esc drops it; Delete and Backspace do nothing. A left press is held
-  (`picture_held`, ended by `grid_release`) so the covered cells' moves do
+  too. Esc drops it; Delete and Backspace do nothing. A left press it takes
+  is held (`picture_held`, set only once the press is taken, ended by
+  `grid_release` and by any grid press) so the covered cells' moves do
   not sweep (`sheet_drag_over` stands down, as for a chart drag); a
   right-press selects it with no menu. The pieces keep the default hitbox,
   so the wheel and the root's move and release handlers still see the
