@@ -4986,6 +4986,7 @@ event (not a separate event before it), so a client never sees the request witho
 | `startup` / `retry_saved_signin`, `Ok(None)`, no token file | `NotSignedIn` |
 | same, `Ok(None)` with the file there (a reference whose item is gone) | `SavedSignInUnreadable("the secret store no longer holds the saved sign-in")` |
 | same, `Err(e)` other than `NotConnected` | `SavedSignInUnreadable(e.to_string())` |
+| same, a saved token of another cloud (#2225) | `OtherCloud { saved }` |
 | `refresh_if_near_expiry`, refused | `Expired { code, aadsts }` |
 | `react`, the drain's `Err(Unauthorized)`, `engine_op_call_failed`: a 401 whose refresh was refused | `Expired { code, aadsts }` |
 | same, a 401 after a refresh that went through | `Rejected` |
@@ -5026,6 +5027,7 @@ event (not a separate event before it), so a client never sees the request witho
   - `Rejected`: "Microsoft 365 refused your sign-in. Sign in again."
   - `SignedOut`: "You signed out."
   - `SignInFailed`: "The sign-in didn't finish. Try again."
+  - `OtherCloud` (#2225): "Your saved sign-in is for another Microsoft cloud. Sign in again."
 
   The `Required` modal is 50% high, not 30%, so a long reason still leaves the prompt in view
   at 80x24. Enter, Esc and `r` are unchanged.

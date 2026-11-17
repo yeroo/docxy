@@ -2893,9 +2893,10 @@ impl Engine {
 
     /// Asks the store for the saved sign-in again (#2167): answered, the
     /// session starts as at startup (refresh if near expiry, scopes, the
-    /// startup pass); still unreachable, it waits again
-    /// (`saved_signin_unavailable`); an item that is gone, or a file now
-    /// bad, is a sign-out, as at startup.
+    /// startup pass); answered with a token of another cloud, a sign-in is
+    /// asked as `OtherCloud`, nothing refreshed or sent (#2225); still
+    /// unreachable, it waits again (`saved_signin_unavailable`); an item
+    /// that is gone, or a file now bad, is a sign-out, as at startup.
     fn retry_saved_signin(&mut self, always: bool) {
         match self.load_token_of_cloud() {
             Ok(Some(Saved::Token(t, storage))) => {
