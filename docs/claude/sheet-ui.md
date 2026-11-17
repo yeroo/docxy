@@ -124,7 +124,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   frozen columns `0..fc`, the scrolled pane starts at the list's top item and
   `col0`; each pane clips its pieces, so a picture over a freeze line is drawn
   in each pane it reaches. The layer starts past the row gutter and sits under
-  the chart layer. The rows above the list's top item and the frozen band
+  the chart layer; it, the chart layer and the vertical scrollbar start at
+  `rows_viewport_top(fx_expanded)`, under the formula bar as drawn. The row
+  list and the horizontal scroll reach the drawings too
+  (`SheetView::view_extent`, capped at `DRAWING_REACH_ROWS` rows); `extent`
+  stays the used range for find, Ctrl+A and the rest. The rows above the list's top item and the frozen band
   are not measured (`ListState::bounds_for_item` has none for them), so a
   tall text row there is taken at its min height.
 - `pictures::Cache::sheet_image` keys a sheet's media by part: the same bytes
@@ -135,7 +139,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   delete). It holds the selection as a chart does (`sel_hidden`, no fill
   handle); `chart_hand_back` and `chart_drop_selection` clear it, so every
   key and press that hands a chart back, a sheet or tab switch and an undo do
-  too. Esc drops it; Delete and Backspace do nothing. The harness reports
+  too. Esc drops it; Delete and Backspace do nothing. A left press is held
+  (`picture_held`, ended by `grid_release`) so the covered cells' moves do
+  not sweep (`sheet_drag_over` stands down, as for a chart drag); a
+  right-press selects it with no menu. The pieces keep the default hitbox,
+  so the wheel and the root's move and release handlers still see the
+  pointer. The harness reports
   `picture_sel` and `sheet_scroll` (the row list's top item), and
   `picture:N` is the piece in the scrolled cells.
 - Fixture: `uiharness/fixtures/pictures.xlsx` (`build_pictures` in
