@@ -26215,6 +26215,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
+    /// A Drafts round on its stored link that carries Graph's pre-filled
+    /// copy of an answer draft whose PATCH failed (#2212 r1) leaves the
+    /// person's fields alone, so the PATCH the same pass retries after it
+    /// sends them.
+    #[test]
+    fn a_link_round_during_a_failed_patch_keeps_the_answer_draft_s_fields() {
+        let prefilled = r#"{"id":"R1","conversationId":"C9","subject":"RE: Hi","from":{"emailAddress":{"name":"","address":""}},"toRecipients":[{"emailAddress":{"name":"Alice","address":"alice@x"}},{"emailAddress":{"name":"Bob","address":"bob@x"}}],"ccRecipients":[{"emailAddress":{"name":"Dave","address":"dave@x"}}],"receivedDateTime":"","sentDateTime":"","isRead":true,"hasAttachments":false,"importance":"normal","bodyPreview":"","isDraft":true}"#;
+        let link = "/me/mailFolders/DRAFTS1/messages/delta?token=D-DRAFTS1";
+        let next = delta_page(&[prefilled.to_string()], link);
+        let mut routes = vec![
+            (
+                post_route("/me/messages/M1/createReplyAll", 201, &answer_json("R1")),
+                None,
+            ),
+            (
+                patch_route("/me/messages/R1", 500, r#"{"error":{}}"#),
+                Some(1),
+            ),
+            (patch_route("/me/messages/R1", 200, "{}"), None),
+        ];
+        routes.extend(folder_routes(DRAFTS_SENT, &[("DRAFTS1", &next)], &[]));
+        let srv = FakeServer::start_limited(routes);
+        let mut local = String::new();
+        let (handle, store_path, store_dir) =
+            spawn_fast(&srv, "answer-link-round", HOUR, None, |s: &Store| {
+                local = s
+                    .create_local_answer_draft(
+                        "M1",
+                        DraftKind::ReplyAll,
+                        "Re: Hi",
+                        "alice@x",
+                        "carol@x",
+                        "<p>mine</p>",
+                    )
+                    .unwrap();
+            });
+        let mut seen = Vec::new();
+        wait_idle(&handle, &mut seen);
+
+        // The save creates R1, and its PATCH fails: kept for a later drain.
+        handle
+            .cmd_tx
+            .send(SyncCommand::SaveDraft { id: local.clone() })
+            .unwrap();
+        barrier(&handle, &mut seen);
+        assert_eq!(hits(&srv, "PATCH", "/me/messages/R1"), 1);
+        // A Refresh (F9) runs the Drafts round on its stored link first,
+        // which carries Graph's pre-filled R1, then the drain retries the
+        // PATCH at once (it clears the op back-off).
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        wait_idle(&handle, &mut seen);
+        assert_eq!(hits(&srv, "GET", link), 1, "the link round ran");
+        let store = Store::open(&store_path).unwrap();
+        let row = store.draft(&local).unwrap().unwrap().0;
+        assert_eq!(row.id, "R1");
+        assert_eq!(row.subject, "Re: Hi");
+        assert_eq!(row.to_recipients, "alice@x");
+        assert_eq!(row.cc_recipients, "carol@x");
+        assert_eq!(row.folder_id, "DRAFTS1");
+
+        // The retried PATCH sends the person's fields, not Graph's.
+        let patches: Vec<_> = srv
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PATCH" && r.path == "/me/messages/R1")
+            .collect();
+        assert_eq!(patches.len(), 2, "{seen:?}");
+        let retry = crate::json::parse(&patches[1].body).unwrap();
+        assert_eq!(
+            retry.get("subject").and_then(crate::json::Value::as_str),
+            Some("Re: Hi")
+        );
+        assert!(patches[1].body.contains("carol@x"), "{}", patches[1].body);
+        assert!(!patches[1].body.contains("bob@x"), "{}", patches[1].body);
+        assert!(!patches[1].body.contains("dave@x"), "{}", patches[1].body);
+        assert_eq!(hits(&srv, "POST", "/me/messages"), 0);
+        assert!(store.pending_ops().unwrap().is_empty());
+        assert_eq!(store.draft_answers(&local).unwrap(), None);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
     /// The routes an answer draft's send needs when its `createReply` on
     /// `M1` answers `status` with `body`: no plain create and no send route.
     fn refused_answer_routes(status: u16, body: &str) -> Vec<(Route, Option<usize>)> {

@@ -1044,10 +1044,12 @@ fn ensure_draft_on_graph(
         };
         if let Some(created) = answered {
             // Reconciled before the PATCH: a PATCH that fails is retried as
-            // a PATCH of this id, never as a second create. The row's
-            // unsaved edit (`create_local_answer_draft` starts it at 1)
-            // keeps a fresh delta of Graph's pre-filled copy off it until
-            // then. The flag goes, as on any first push.
+            // a PATCH of this id, never as a second create. Until a PATCH
+            // lands, the row's link and its unsaved edit
+            // (`create_local_answer_draft` starts it at 1) keep every delta
+            // of Graph's pre-filled copy off it, fresh or on a stored link
+            // (`Store::merge_message`); `mark_pushed` clears both. The flag
+            // goes, as on any first push.
             store
                 .reconcile_id(&row.id, &created.id)
                 .map_err(|e| GraphError::Parse(e.to_string()))?;
@@ -1098,7 +1100,6 @@ fn ensure_draft_on_graph(
 /// one, #1896). `None` for a draft that answers nothing, or an original
 /// that never reached Graph (still `local:`): it is created plainly.
 fn answer_target(store: &Store, id: &str) -> Result<Option<(String, DraftKind)>, GraphError> {
-    let store_err = |e: crate::store::StoreError| GraphError::Parse(e.to_string());
     let Some((original, kind)) = store.draft_answers(id).map_err(store_err)? else {
         return Ok(None);
     };
@@ -1136,10 +1137,13 @@ fn draft_options(row: &MessageRow) -> DraftOptions {
 }
 
 /// Graph now has generation `generation` of the draft stored under `id`'s
-/// fields (#1871): the row is clean unless compose edited it since. A store
-/// error is ignored: the draft stays protected from fresh deltas until its
-/// next push.
+/// fields (#1871): the row is clean unless compose edited it since. An
+/// answer draft's link goes too (#2212, `Store::clear_draft_answers`): the
+/// draft is on Graph with the person's fields, so deltas merge it as any
+/// draft. A store error is ignored: the draft stays protected (from fresh
+/// deltas, and an answer draft from every delta) until its next push.
 fn mark_pushed(store: &Store, id: &str, generation: i64) {
+    let _ = store.clear_draft_answers(id);
     if generation > 0 {
         let _ = store.clear_local_edit(id, generation);
     }
@@ -5635,6 +5639,8 @@ mod tests {
         let (row, _) = store.draft(&local).unwrap().unwrap();
         assert_eq!(row.id, minted);
         assert!(store.locally_edited_ids().unwrap().is_empty());
+        // Created: the link is gone with the first push.
+        assert_eq!(store.draft_answers(&local).unwrap(), None);
     }
 
     #[test]
@@ -5773,9 +5779,10 @@ mod tests {
         let sent = json::parse(&srv.requests()[1].body).unwrap();
         assert_eq!(addresses(&sent, "toRecipients"), vec!["alice@x"]);
         assert_eq!(store.draft(&local).unwrap().unwrap().0.id, "G1");
-        // The plain create was the first push: the row's starting edit is
-        // cleared with it.
+        // The plain create was the first push: the row's starting edit and
+        // its link are cleared with it.
         assert!(store.locally_edited_ids().unwrap().is_empty());
+        assert_eq!(store.draft_answers(&local).unwrap(), None);
     }
 
     #[test]
@@ -5916,10 +5923,22 @@ mod tests {
                 )
                 .unwrap()
         );
+        // So does a delta on a stored link (#1871 leaves a plain draft's
+        // edit to those), and the link is still there.
+        let mut moved = server.clone();
+        moved.to = vec![Recipient {
+            name: "Eve".into(),
+            address: "eve@x".into(),
+        }];
+        store
+            .merge_message("F", &moved, &crate::graph::model::MessageFields::all())
+            .unwrap();
         let (row, body) = store.draft("R1").unwrap().unwrap();
         assert_eq!(row.subject, "Re: Hi");
         assert_eq!(row.to_recipients, "bob@x");
+        assert_eq!(row.folder_id, folder);
         assert_eq!(body.content, "<p>mine</p>");
+        assert!(store.draft_answers(&local).unwrap().is_some());
 
         // The retry PATCHes the draft it has, never a second create.
         apply_op(&c, &store, &save).unwrap();
@@ -5931,7 +5950,11 @@ mod tests {
                 req("PATCH", "/me/messages/R1"),
             ]
         );
+        let retry = json::parse(&srv.requests()[2].body).unwrap();
+        assert_eq!(addresses(&retry, "toRecipients"), vec!["bob@x"]);
+        assert_eq!(retry.get("subject").and_then(Value::as_str), Some("Re: Hi"));
         assert!(store.locally_edited_ids().unwrap().is_empty());
+        assert_eq!(store.draft_answers(&local).unwrap(), None);
     }
 
     #[test]

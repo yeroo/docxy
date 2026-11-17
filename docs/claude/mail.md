@@ -5304,7 +5304,10 @@ reply went out unthreaded and a forward without the original's attachments.
   reset, as only local drafts made here carry them. They are not in
   `MESSAGE_ROW_COLUMNS`: `Store::draft_answers(id)` reads them, by a `local:` id still
   after `reconcile_id`, and gives `None` for no link or a kind this build does not read.
-  The link survives a restart, so a queued send still threads.
+  The link survives a restart, so a queued send still threads. It only says how to create
+  the draft on Graph: the draft's first successful push forgets it
+  (`Store::clear_draft_answers`, from `mark_pushed`, after the answer's PATCH or the
+  fallback's plain create), and `draft_answers` is `None` from then on.
 - `DraftKind` moved to `graph::model`, as the store needs it.
   `mailcore::sync::engine::DraftKind` re-exports it.
 - In the same transaction the row gets what the server draft would have (#2096): the
@@ -5312,11 +5315,18 @@ reply went out unthreaded and a forward without the original's attachments.
   `in_reply_to`, so `reply_draft_links` marks the original at once. The original is read
   through `current_id_on`; a missing row leaves both `""`.
 - The row starts at `local_edit = 1`. It is reconciled to the answer draft's id before
-  the PATCH, and until the PATCH lands Graph's copy holds the pre-filled recipients and
-  quoted body. The starting edit keeps a fresh delta (`merge_message_unless_edited`) and a
-  body fetch (`fetched_body_is_kept_on`) off the person's fields. The first successful
-  push clears it (`mark_pushed`), on the fallback create too. A plain `create_local_draft`
-  still starts at 0, as its create sends the same fields Graph then holds.
+  the PATCH, and until the PATCH lands Graph's copy holds the pre-filled recipients,
+  subject, flag and quoted body. So until then **no delta merge writes the row**, on a
+  stored link as well as a fresh one (review r1). `merge_message_guarded`'s
+  `DO UPDATE … WHERE` leaves alone a row with `answers_id <> ''` and `local_edit > 0`,
+  whatever its `guard`. The starting edit also keeps a body fetch
+  (`fetched_body_is_kept_on`) off the person's body. The first successful push clears
+  both the edit and the link (`mark_pushed`), on the fallback create too, so from then on
+  the draft is merged as any draft is. #1871's policy is unchanged for every other row:
+  a delta on a stored link still writes a plain draft's unsaved edit. A plain
+  `create_local_draft` still starts at 0, as its create sends the same fields Graph then
+  holds. A skipped merge returns as a write does (`merge_message` is `Ok`), so a header
+  repair or a search hit only reads as changed.
 - `ensure_draft_on_graph` (`SaveDraft` and `SendDraft`): for a `local:` row,
   `answer_target` reads the link and resolves the original with `Store::current_id`
   (#1896: a moved original, or a `local:` one reconciled since). A link and a Graph id
@@ -5352,8 +5362,11 @@ reply went out unthreaded and a forward without the original's attachments.
     `create_local_answer_draft_of_a_missing_original_still_stores_the_link`,
     `draft_answers_reaches_a_reconciled_local_id`,
     `draft_answers_reads_none_for_a_plain_draft_and_an_unknown_kind`,
-    `a_database_from_before_draft_answers_reads_no_link`; `upsert_writes_every_column`
-    covers the two columns.
+    `a_database_from_before_draft_answers_reads_no_link`,
+    `no_merge_writes_an_answer_draft_before_its_first_push`,
+    `a_link_round_merge_still_writes_an_edited_plain_draft`,
+    `clear_draft_answers_of_a_plain_draft_or_no_row_changes_nothing`;
+    `upsert_writes_every_column` covers the two columns.
   - `outbox.rs`: `send_of_a_local_reply_draft_creates_it_through_create_reply`,
     `send_of_a_local_reply_all_draft_creates_it_through_create_reply_all`,
     `send_of_a_local_forward_draft_keeps_the_original_s_attachments`,
@@ -5367,4 +5380,5 @@ reply went out unthreaded and a forward without the original's attachments.
     `a_queued_send_of_a_local_reply_draft_threads_after_a_reopen`.
   - `engine.rs`: `a_send_of_a_local_reply_draft_behind_a_slow_compose_reply_threads`,
     `a_refused_create_reply_fails_the_send_back_to_drafts`,
-    `a_create_reply_5xx_keeps_the_send_queued` (500 and 503).
+    `a_create_reply_5xx_keeps_the_send_queued` (500 and 503),
+    `a_link_round_during_a_failed_patch_keeps_the_answer_draft_s_fields`.

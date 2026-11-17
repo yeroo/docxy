@@ -2172,6 +2172,15 @@ impl Store {
     /// flag Graph reports leaves it off even if Exchange kept
     /// `PidLidReminderSet`.
     ///
+    /// An answer draft before its first push (#2212: a row
+    /// `create_local_answer_draft` made, reconciled to the draft Graph's
+    /// `createReply` / `createForward` minted, whose PATCH has not landed)
+    /// is never written, by any delta: Graph's copy holds its pre-filled
+    /// recipients, subject and folder, never what the person wrote. That
+    /// is a row with a link (`answers_id`) and an unsaved edit; the first
+    /// successful push clears both ([`Store::clear_draft_answers`]), so it
+    /// is then merged as any draft is.
+    ///
     /// One static statement, so the FTS update trigger fires once.
     pub fn merge_message(
         &self,
@@ -2265,7 +2274,8 @@ impl Store {
                  in_reply_to = CASE WHEN ?52 AND excluded.in_reply_to <> ''
                                     THEN excluded.in_reply_to ELSE messages.in_reply_to END,
                  size = COALESCE(excluded.size, messages.size)
-             WHERE NOT ?34 OR messages.local_edit = 0",
+             WHERE (NOT ?34 OR messages.local_edit = 0)
+               AND NOT (messages.answers_id <> '' AND messages.local_edit > 0)",
             params![
                 m.id,
                 folder_id,
@@ -3986,7 +3996,9 @@ impl Store {
     /// `reconcile_id`, or its Graph id) answers, and how (#2212): the
     /// original's id as [`Store::create_local_answer_draft`] stored it
     /// (unresolved) and the kind. `None` for no such row, a draft made any
-    /// other way, or a stored kind this build does not read.
+    /// other way, a stored kind this build does not read, or a draft whose
+    /// first push succeeded ([`Store::clear_draft_answers`]): the link
+    /// only says how to create the draft on Graph.
     pub fn draft_answers(&self, id: &str) -> Result<Option<(String, DraftKind)>, StoreError> {
         let found: Option<(String, String)> = self
             .conn
@@ -4003,6 +4015,23 @@ impl Store {
             let kind = DraftKind::from_stored(&kind)?;
             (!original.is_empty()).then_some((original, kind))
         }))
+    }
+
+    /// Forgets the link of the draft `id` addresses (#2212), once Graph has
+    /// the draft with its stored fields (its first successful push): the
+    /// draft is then created, and a delta merges it as any draft
+    /// ([`Store::merge_message`]). A draft with no link, or no row, changes
+    /// nothing.
+    pub fn clear_draft_answers(&self, id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            concat!(
+                "UPDATE messages SET answers_id = '', answers_kind = ''
+                 WHERE answers_id <> '' AND ",
+                draft_row_sql!()
+            ),
+            params![id],
+        )?;
+        Ok(())
     }
 
     /// Updates a draft's editable fields in place (subject, recipients, and
@@ -19065,6 +19094,88 @@ mod draft_tests {
             )
             .unwrap();
         assert_eq!(s.draft_answers(&odd).unwrap(), None);
+    }
+
+    /// Graph's pre-filled copy of the answer draft `id`, as a delta on a
+    /// stored link carries it: other subject, recipients and folder.
+    fn prefilled(id: &str) -> Message {
+        Message::from_json(
+            &json::parse(&format!(
+                r#"{{"id":"{id}","conversationId":"C9","subject":"RE: Hi","isDraft":true,
+                    "toRecipients":[{{"emailAddress":{{"name":"Bob","address":"bob@x"}}}}],
+                    "ccRecipients":[{{"emailAddress":{{"name":"Dave","address":"dave@x"}}}}]}}"#
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn no_merge_writes_an_answer_draft_before_its_first_push() {
+        let s = store_with_original();
+        let local = s
+            .create_local_answer_draft(
+                "M1",
+                DraftKind::ReplyAll,
+                "Re: Hi",
+                "alice@x",
+                "carol@x",
+                "x",
+            )
+            .unwrap();
+        // Created on Graph and reconciled; its PATCH has not landed.
+        s.reconcile_id(&local, "R1").unwrap();
+        let folder = s.draft("R1").unwrap().unwrap().0.folder_id;
+        let all = MessageFields::all();
+        s.merge_message("INBOX", &prefilled("R1"), &all).unwrap();
+        assert!(
+            !s.merge_message_unless_edited("INBOX", &prefilled("R1"), &all)
+                .unwrap()
+        );
+        let row = s.draft("R1").unwrap().unwrap().0;
+        assert_eq!(row.subject, "Re: Hi");
+        assert_eq!(row.to_recipients, "alice@x");
+        assert_eq!(row.cc_recipients, "carol@x");
+        assert_eq!(row.folder_id, folder);
+
+        // Its first push succeeded (`mark_pushed`): merged as any draft.
+        s.clear_draft_answers(&local).unwrap();
+        assert!(s.clear_local_edit(&local, 1).unwrap());
+        assert_eq!(s.draft_answers(&local).unwrap(), None);
+        s.merge_message("INBOX", &prefilled("R1"), &all).unwrap();
+        let row = s.draft("R1").unwrap().unwrap().0;
+        assert_eq!(row.subject, "RE: Hi");
+        assert_eq!(row.folder_id, "INBOX");
+    }
+
+    #[test]
+    fn a_link_round_merge_still_writes_an_edited_plain_draft() {
+        // #1871's policy for a plain draft is unchanged: only a fresh delta
+        // leaves its unsaved edit alone.
+        let s = store_with_original();
+        let local = s.create_local_draft("Hi", "alice@x", "", "x").unwrap();
+        s.update_draft_fields(&local, "Mine", "alice@x", "carol@x", "", "y")
+            .unwrap();
+        s.reconcile_id(&local, "G1").unwrap();
+        let all = MessageFields::all();
+        assert!(
+            !s.merge_message_unless_edited("INBOX", &prefilled("G1"), &all)
+                .unwrap()
+        );
+        assert_eq!(s.draft("G1").unwrap().unwrap().0.subject, "Mine");
+        s.merge_message("INBOX", &prefilled("G1"), &all).unwrap();
+        let row = s.draft("G1").unwrap().unwrap().0;
+        assert_eq!(row.subject, "RE: Hi");
+        assert_eq!(row.folder_id, "INBOX");
+    }
+
+    #[test]
+    fn clear_draft_answers_of_a_plain_draft_or_no_row_changes_nothing() {
+        let s = store_with_original();
+        let plain = s.create_local_draft("Hi", "", "", "x").unwrap();
+        s.clear_draft_answers(&plain).unwrap();
+        s.clear_draft_answers("local:nothing").unwrap();
+        assert_eq!(s.draft(&plain).unwrap().unwrap().0.subject, "Hi");
     }
 
     #[test]
