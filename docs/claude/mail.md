@@ -5551,3 +5551,80 @@ person declines the consent screen), so mail stopped until an administrator cons
   - The test helpers `next_sign_in_started`, `land_on` and `play_sign_in_started` play the
     browser for one `SignInStarted` at a time. `sign_in_through_loopback_with` is `SignIn`
     plus `play_sign_in_started`.
+
+## National clouds (#2225)
+
+A tenant in a national cloud (US Government GCC High or DoD, China operated by 21Vianet) signs in
+on another login host and calls another Graph. mailcore takes the cloud from the host; it never
+infers it.
+
+- **`auth::Cloud`** (`#[non_exhaustive]`): `Global` (the `Default`), `UsGov` (L4), `UsGovDod`
+  (L5), `China`. `login_host()` and `graph_root()` have no trailing slash:
+  `login.microsoftonline.com` / `graph.microsoft.com`, `login.microsoftonline.us` /
+  `graph.microsoft.us`, `login.microsoftonline.us` / `dod-graph.microsoft.us`,
+  `login.chinacloudapi.cn` / `microsoftgraph.chinacloudapi.cn`. `name()` / `from_name()` give
+  the cache spelling (`global`, `usgov`, `usgovdod`, `china`; exact match). `Cloud::ALL` lists
+  the four.
+- **`AuthConfig::cloud`**, `Global` by default, so `AuthConfig::default()` and lookxy's
+  `..AuthConfig::default()` are unchanged. `authority` still names only the tenant (its last
+  segment, `tenant_of`). Its host is ignored: the two US clouds share a login host, so the cloud
+  cannot come from it.
+- **Hosts.** `begin_auth_with_scope` builds `/authorize` on `cfg.cloud.login_host()`.
+  `spawn_with_options` takes its bases from `production_bases(cfg)`: the Graph root + `/v1.0`
+  and the login host, which the token endpoint uses. The seam (`spawn_with_bases_and_options`)
+  keeps its explicit bases, which win over the cloud's, but its `/authorize` URL is still on the
+  cloud's login host. The browser's half is played on the loopback, so tests and crates on
+  `testserver` run any cloud.
+- **Scopes.** Microsoft's national-cloud docs (`learn.microsoft.com/graph/sdks/national-clouds`,
+  "Permission scopes"): a scope that names the Graph domain MUST use the cloud's Graph root, and
+  short names (`Mail.ReadWrite`) are valid as they are. So short names are never prefixed.
+  `auth::wire_scope(cloud, scope)` is what `/authorize`, the code redemption and the refresh
+  send. A scope that starts (case-insensitively) with another cloud's Graph root + `/` gets the
+  cloud's root; any other scope is kept. When nothing is rewritten the string is sent byte for
+  byte, so a global caller's requests are as before. `AuthRequest::scope()` holds the wire scope.
+  `normalise_scope` strips any cloud's Graph root + `/` (`graph_root_of`, compared as bytes so a
+  non-ASCII scope is never cut), so `missing_scopes`, `refresh_scope(_for)`, the consent
+  fallback and `Scopes { missing }` work in every cloud. A grant only ever carries its own
+  cloud's root.
+- **A saved token's cloud.** `TokenSet::cloud` is set from `cfg.cloud` by
+  `parse_token_response`. The token JSON (`token_json` / `token_from`, so the file, the Secret
+  Service item and the Windows encrypted file alike) carries `"cloud":"<name>"`; the reference
+  file does not. A cache without `cloud` (from before #2225) is `Global`. A `cloud` that is not
+  a known name, or not a string, is `InvalidData` ("the saved sign-in names an unknown cloud"),
+  so the engine asks for a sign-in (`SavedSignInUnreadable`). Such a token file is never
+  migrated into the store. A cache written by a newer mailcore with a cloud this one does not
+  know is unreadable here: the safe direction.
+- **Another cloud's token is not used.** Startup and `retry_saved_signin` load through
+  `Engine::load_token_of_cloud`: a token whose cloud is not `cfg.cloud` is `Saved::OtherCloud`,
+  and the engine calls `enter_signin(SignInReason::OtherCloud { saved })`. It sends nothing:
+  no refresh (tokens are not interchangeable between clouds, and a refresh would send one
+  cloud's refresh token to another) and no Graph request. The cache stays as it is until a
+  sign-in replaces it or `SignOut` clears it, so a host that switches back needs no new
+  sign-in. lookxy shows "Your saved sign-in is for another Microsoft cloud. Sign in again."
+- **Switching clouds over an existing `mail.db` is safe only through #1946.** The store keeps
+  absolute `deltaLink`/`nextLink` URLs on the old cloud's Graph host. An interactive sign-in
+  owes the mailbox check (`mailbox_check_owed` is set before the token is saved), and the check
+  gates every pass, drain and fill. It probes on the new Graph base, and another cloud's mailbox
+  has another root id, so the store is reset and the old links go with it. Relaxing that gate
+  would send the new cloud's token to the old cloud's Graph host.
+- **Links.** Nothing compares a `nextLink`/`deltaLink` with a host. `GraphClient` sends any
+  `http(s)://` link as it is (`graph/client.rs`), so a national cloud's absolute links are
+  followed like global ones.
+- Tests:
+  - `auth::tests`: `each_cloud_has_its_hosts_and_name`, `auth_config_default_is_global`,
+    `authorize_url_uses_each_clouds_login_host`, `refresh_records_the_cloud` (a refresh and a
+    redemption), `normalise_scope_strips_every_clouds_graph_root`,
+    `wire_scope_moves_graph_roots_to_the_cloud`.
+  - `tokencache::tests`: `token_records_its_cloud` (the file and a store item),
+    `token_without_cloud_loads_as_global`, `token_with_unknown_cloud_is_unreadable`. The
+    `fields` helpers of `tokencache` and `secret_service` compare `cloud` too, so every
+    round trip checks it.
+  - `sync::engine::tests`: `production_bases_follow_the_cloud`,
+    `national_cloud_signs_in_and_syncs_through_the_seam` (`UsGovDod`: `/authorize` on
+    `login.microsoftonline.us`, the redemption and the pass on the seam's bases, a dod-graph
+    grant missing nothing, page 2 of the folder listing behind an absolute `nextLink` on a
+    second fake server), `global_cache_with_usgov_engine_asks_sign_in_without_refresh`,
+    `retried_saved_sign_in_of_another_cloud_asks_sign_in` (a store that refused, then answers
+    `RetrySavedSignIn`), `cache_without_cloud_field_still_starts_global`
+    (`tokencache::write_raw` writes the old JSON).
+  - lookxy: `signin_reason_text_says_each_reason` covers `OtherCloud`.
