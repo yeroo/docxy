@@ -147,6 +147,15 @@ pub trait Target {
     fn shot(&mut self, region: &str) -> Result<Shot, String>;
     /// Open a file, already resolved and copied.
     fn open(&mut self, path: &Path) -> Result<(), String>;
+    /// Answer the app's native dialog from outside it (#2195): cancel it, or
+    /// type `path` and press OK. What happened, for the step's report.
+    fn native_dialog(&mut self, _path: Option<&Path>) -> Result<String, String> {
+        Err("native-dialog answers the suite's native dialog; this target has none".into())
+    }
+    /// Click a region by window messages posted to the app's window (#2195).
+    fn window_click(&mut self, _region: &str) -> Result<String, String> {
+        Err("window click posts to the suite's window; this target has none".into())
+    }
 }
 
 impl Target for Driver {
@@ -165,6 +174,34 @@ impl Target for Driver {
             Json::obj(vec![("path", Json::Str(path_arg(path)))]),
         )
         .map(|_| ())
+    }
+
+    fn native_dialog(&mut self, path: Option<&Path>) -> Result<String, String> {
+        crate::native_dialog::answer(self.pid(), path)
+    }
+
+    fn window_click(&mut self, region: &str) -> Result<String, String> {
+        // A frame drawn from the current state first, so the rect is where
+        // the region is now (`rect` is as last laid out).
+        let r = self.settle(region)?;
+        let (x, y) = crate::native_dialog::centre(r.rect.x, r.rect.y, r.rect.w, r.rect.h);
+        // Between the move and the press, a frame: the hover the move set
+        // is drawn, so the press hit-tests a frame that has it (#2195).
+        let mut between = || {
+            let now = self.frame()?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while self.frame()? <= now {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "the app drew no frame after the move (frame {now})"
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+            Ok(())
+        };
+        crate::native_dialog::post_click(self.pid(), x, y, &mut between)
+            .map(|done| format!("{region} at desktop ({x},{y}): {done}"))
     }
 }
 
@@ -289,35 +326,43 @@ impl<'a> Runner<'a> {
                     format!("expected '{verb}' to be refused with '{message}', but it succeeded"),
                 ),
             },
-            Action::Open(path) | Action::OpenCopy(path) | Action::OpenCopyAs { path, .. } => {
+            Action::Open(_) | Action::OpenCopy(_) | Action::OpenCopyAs { .. } => {
                 self.last_reply = None;
                 self.replies.clear();
-                let full = self.base.join(path);
-                if !full.is_file() {
-                    return err(out, format!("no such file: {}", full.display()));
-                }
-                let name = match &step.action {
-                    Action::OpenCopyAs { name, .. } => Some(name.as_str()),
-                    _ => None,
+                let full = match self.resolve_open(case, &step.action) {
+                    Ok(full) => full,
+                    Err(e) => return err(out, e),
                 };
-                let full = if matches!(step.action, Action::OpenCopy(_) | Action::OpenCopyAs { .. })
-                {
-                    match copy_fixture(&full, &self.sandbox, case, name) {
-                        Ok(copy) => copy,
-                        Err(e) => return err(out, e),
-                    }
-                } else {
-                    full
-                };
-                // Canonicalized, so the app resolves the same file this side
-                // checked rather than one relative to its own directory.
-                let full = full.canonicalize().unwrap_or(full);
-                let full = PathBuf::from(path_arg(&full));
                 match self.driver.open(&full) {
                     Ok(()) => out,
                     Err(e) => err(out, e),
                 }
             }
+
+            // From outside the app (#2195): its pump answers nothing while
+            // the dialog is up.
+            Action::NativeDialog(open) => {
+                let path = match open.as_deref().map(|a| self.resolve_open(case, a)) {
+                    None => None,
+                    Some(Ok(full)) => Some(full),
+                    Some(Err(e)) => return err(out, e),
+                };
+                match self.driver.native_dialog(path.as_deref()) {
+                    Ok(done) => {
+                        out.detail = done;
+                        out
+                    }
+                    Err(e) => err(out, e),
+                }
+            }
+
+            Action::WindowClick(region) => match self.driver.window_click(region) {
+                Ok(done) => {
+                    out.detail = done;
+                    out
+                }
+                Err(e) => err(out, e),
+            },
 
             Action::Click {
                 cell,
@@ -402,6 +447,30 @@ impl<'a> Runner<'a> {
 
             Action::Assert(a) => self.assert(case, out, a, snapshot, snapshot_range),
         }
+    }
+
+    /// The file an `open` step (`Open`, `OpenCopy` or `OpenCopyAs`) opens:
+    /// resolved against the script's directory, copied into the sandbox for
+    /// a `copy:` one, canonicalized so the app resolves the same file this
+    /// side checked rather than one relative to its own directory.
+    fn resolve_open(&self, case: &str, action: &Action) -> Result<PathBuf, String> {
+        let (path, copy, name) = match action {
+            Action::Open(path) => (path, false, None),
+            Action::OpenCopy(path) => (path, true, None),
+            Action::OpenCopyAs { path, name } => (path, true, Some(name.as_str())),
+            _ => return Err("not a file to open".to_string()),
+        };
+        let full = self.base.join(path);
+        if !full.is_file() {
+            return Err(format!("no such file: {}", full.display()));
+        }
+        let full = if copy {
+            copy_fixture(&full, &self.sandbox, case, name)?
+        } else {
+            full
+        };
+        let full = full.canonicalize().unwrap_or(full);
+        Ok(PathBuf::from(path_arg(&full)))
     }
 
     /// Send a driving verb; a refusal is an `Error`, not a failed expectation.
