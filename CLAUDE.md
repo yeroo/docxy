@@ -213,7 +213,8 @@ issue number to find its notes.
   scopes in `missing` and in a refresh only once granted (#2218), a meeting request's
   update facts in FetchMeetingMessage's answer (#2185), national clouds: the login
   host and Graph root per `AuthConfig::cloud`, a saved token's cloud (#2225), a failed
-  sign-in with a token held keeping it, no fallback then (#2213).
+  sign-in with a token held keeping it, no fallback while it holds the required scopes
+  (#2213).
 
 ## Build and test
 

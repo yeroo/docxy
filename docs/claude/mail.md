@@ -4991,11 +4991,12 @@ event (not a separate event before it), so a client never sees the request witho
 | `react`, the drain's `Err(Unauthorized)`, `engine_op_call_failed`: a 401 whose refresh was refused | `Expired { code, aadsts }` |
 | same, a 401 after a refresh that went through | `Rejected` |
 | `sign_out` | `SignedOut` |
-| `sign_in_failed` (no saved sign-in waits) | `SignInFailed` |
+| `sign_in_failed` (no saved sign-in waits, no token held, #2213) | `SignInFailed` |
 
 `NotConnected` is still #2167's `SavedSignInUnavailable`, with no `SignInRequired`.
-`sign_in_not_started` (no loopback listener) is not an `enter_signin` site: it sets
-`State(SignInRequired)` with no event, as before.
+`sign_in_not_started` (no loopback listener) is not an `enter_signin` site: signed out, it sets
+`State(SignInRequired)` with no event, as before; with a token held it re-sends the current
+`State` (#2213).
 
 - **`Expired`**: the token endpoint refused the grant (`AuthError::needs_sign_in`). `code` is
   `AuthError::refusal_code()`, the OAuth `error` trimmed and ASCII-lowercased. `aadsts` is `AuthError::aadsts()`: `Some(n)`
@@ -5490,9 +5491,10 @@ person declines the consent screen), so mail stopped until an administrator cons
   - `Failed { text, consent }`.
 
   A second attempt, asking `cfg.scope`, runs exactly when the first is `Failed { consent: true }`,
-  `full != cfg.scope` and no token is held (#2213: a re-consent's token already has `cfg.scope`). It has a new port, PKCE and `state`, and no `Error` is sent for the
-  first refusal: one `SignIn` then sends two `SignInStarted`. `Signed` from either attempt runs
-  the success block as before (the token saved, `announce_scopes`, a pass). A first
+  `full != cfg.scope`, and no token is held that is known to hold all of `cfg.scope` (#2213:
+  `token_holds_required_scope`). It has a new port, PKCE and `state`, and no `Error` is sent
+  for the first refusal: one `SignIn` then sends two `SignInStarted`. `Signed` from either
+  attempt runs the success block as before (the token saved, `announce_scopes`, a pass). A first
   `NotStarted` is `sign_in_not_started()`, as before. A second `NotStarted`, whose `Error` is
   already sent, is `sign_in_failed()` (r1). A `SignInStarted` went out, and
   `sign_in_not_started`'s `set_state(SignInRequired)` sends nothing to a signed-out engine, so
@@ -5528,7 +5530,8 @@ person declines the consent screen), so mail stopped until an administrator cons
   #2167). Nothing remembers that a tenant refuses the optional scopes: every `SignIn` asks both
   lists again, and falls back at most once. While the second attempt waits (up to
   `SIGNIN_TIMEOUT`), commands queue, as during the first. A `SignIn` while signed in (the
-  re-consent case) no longer falls back, and its failure keeps the session (#2213, below).
+  re-consent case) falls back only when the token lacks a required scope, and its failure
+  keeps the session (#2213, below).
   lookxy opens the browser on each `SignInStarted`, so a second one works there.
 - Tests:
   - `auth::tests`: `sign_in_scope_appends_optional_once`,
@@ -5646,10 +5649,15 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   (`masters_not_found`, `user_ids`) stay as they were. The `Error` ("sign-in failed: …", or
   "could not open sign-in listener: …" for one that never started) comes first, then the
   `State`.
-- **No fallback with a token held.** `can_fall_back` also needs `self.token.is_none()`. A second
-  tab asking `cfg.scope` alone, which the token already has, would help nobody: closing it waits
-  `SIGNIN_TIMEOUT`, and completing it replaces the token with one no wider and owes a mailbox
-  check (#1946). So the first tab of a token-held sign-in gets the plain error page.
+- **No fallback while the token holds the required scopes.** `can_fall_back` also needs
+  `!token_holds_required_scope()`: a token is held, its grant is known (`TokenSet::scopes`), and
+  `missing_scopes(cfg.scope, grant)` is empty. A second tab asking `cfg.scope` alone would then
+  ask for nothing the token lacks: closing it waits `SIGNIN_TIMEOUT`, and completing it
+  replaces the token with one no wider and owes a mailbox check (#1946). So that sign-in's first
+  tab gets the plain error page. A held token that lacks a required scope (a host added one to
+  `cfg.scope`; a refresh never asks for it, #2164) or whose grant is unknown falls back as
+  before (r1): `scope` alone is the only way the tenant may grant the new required scope while
+  it refuses an optional one. That fallback's own failure keeps the session too.
 - **Clients.** lookxy clears its error notice on `State(Idle)` (`App::on_sync_event`), so an
   `Error` followed by the re-sent `State(Idle)` would show nothing. That cannot happen today:
   lookxy sends `SignIn` only from its signed-out modals. A client that adds a re-consent must
@@ -5661,9 +5669,13 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   mailbox check is owed (#1946).
 - Tests (`sync::engine::tests`): `a_refused_sign_in_with_a_token_held_keeps_it`,
   `a_failed_redeem_with_a_token_held_keeps_it`, `a_timed_out_sign_in_with_a_token_held_keeps_it`
-  (a 300 ms `signin_timeout`), `a_refused_re_consent_with_a_token_held_does_not_fall_back`
-  (helpers `token_held_engine`, `keeps_the_token`: exactly `[Error, State(Idle)]`, then a
-  `Refresh` whose folder list carries `Bearer AT`, and `AT` still saved);
+  (a 300 ms `signin_timeout`), `a_refused_re_consent_with_a_token_held_does_not_fall_back`,
+  `a_refused_fallback_with_a_token_held_keeps_it` (helpers `token_held_engine`,
+  `keeps_the_token`: exactly `[Error, State(Idle)]`, then a `Refresh` whose folder list carries
+  `Bearer AT`, and `AT` still saved);
   `sign_in_not_started_with_a_token_held_keeps_the_session`,
   `sign_in_failed_with_a_token_held_keeps_the_session` (a direct `Engine`, `Offline` with a
-  back-off and filled caches: all kept, only `State(Offline)` sent).
+  back-off and filled caches: all kept, only `State(Offline)` sent);
+  `a_refused_re_consent_falls_back_when_the_token_lacks_a_required_scope` (`scope` gains
+  `Mail.Send`: the second tab asks `scope`, its token replaces the held one),
+  `token_holds_required_scope_only_for_a_known_full_grant`.
