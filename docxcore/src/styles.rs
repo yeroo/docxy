@@ -24,6 +24,11 @@ struct PartialRun {
     italic: Option<bool>,
     underline: Option<bool>,
     strike: Option<bool>,
+    /// `w:caps` / `w:smallCaps` (#2087): drawn by [`StyleSheet::shown_run`]
+    /// only; [`StyleSheet::effective_run`] keeps the run's direct ones, as
+    /// the exports diff against it.
+    caps: Option<bool>,
+    small_caps: Option<bool>,
     rtl: Option<bool>,
     /// `w:vanish`: hidden text. Resolved only by
     /// [`StyleSheet::effective_vanish`]; rendering keeps direct `vanish`.
@@ -50,6 +55,12 @@ impl PartialRun {
         }
         if o.strike.is_some() {
             self.strike = o.strike;
+        }
+        if o.caps.is_some() {
+            self.caps = o.caps;
+        }
+        if o.small_caps.is_some() {
+            self.small_caps = o.small_caps;
         }
         if o.rtl.is_some() {
             self.rtl = o.rtl;
@@ -323,6 +334,15 @@ impl StyleSheet {
         }
         out.underline = direct.underline || agg.underline.unwrap_or(false);
         out.strike = direct.strike || agg.strike.unwrap_or(false);
+        // All caps and small caps (#2087): a direct on wins, a direct
+        // explicit off (kept in `raw_props`) beats the styles.
+        if !direct.caps {
+            out.caps = !has_raw_child(&direct.raw_props, "caps") && agg.caps.unwrap_or(false);
+        }
+        if !direct.small_caps {
+            out.small_caps =
+                !has_raw_child(&direct.raw_props, "smallCaps") && agg.small_caps.unwrap_or(false);
+        }
         let explicit_auto = crate::table_styles::explicit_auto_color(direct);
         if direct.color.is_none() && !explicit_auto {
             out.color = agg.color.clone().or(table_color.flatten());
@@ -814,6 +834,8 @@ fn parse_partial_rpr(p: &mut XmlParser, run: &mut PartialRun) {
                 match name {
                     "w:u" => run.underline = Some(toggle(val)),
                     "w:rtl" => run.rtl = Some(toggle(val)),
+                    "w:caps" => run.caps = Some(toggle(val)),
+                    "w:smallCaps" => run.small_caps = Some(toggle(val)),
                     "w:vanish" => run.vanish = Some(toggle(val)),
                     "w:color" => {
                         if !val.is_empty() && val != "auto" {
@@ -1116,6 +1138,53 @@ mod tests {
         };
         let r = ss.shown_run(Some(&look), None, None, &off("i"));
         assert!(!r.italic);
+    }
+
+    /// All caps and small caps from a style are drawn (#2087): a paragraph
+    /// or character style's `w:caps` / `w:smallCaps` reaches the shown run,
+    /// through `basedOn`; a direct explicit off cancels it, a direct on needs
+    /// no style; `effective_run`, which the exports diff against, keeps the
+    /// direct ones only.
+    #[test]
+    fn shown_run_draws_style_caps_and_a_direct_off_cancels_them_2087() {
+        let ss = parse_styles_xml(
+            r#"<w:styles>
+            <w:style w:type="paragraph" w:styleId="Label"><w:rPr><w:caps/></w:rPr></w:style>
+            <w:style w:type="paragraph" w:styleId="SubLabel"><w:basedOn w:val="Label"/></w:style>
+            <w:style w:type="character" w:styleId="Small"><w:rPr><w:smallCaps/></w:rPr></w:style>
+            <w:style w:type="character" w:styleId="NoCaps"><w:rPr><w:caps w:val="0"/></w:rPr></w:style>
+            </w:styles>"#,
+        );
+        let plain = RunProps::default();
+        let r = ss.shown_run(None, Some("Label"), None, &plain);
+        assert!(r.caps && !r.small_caps);
+        assert!(ss.shown_run(None, Some("SubLabel"), None, &plain).caps);
+        let r = ss.shown_run(None, None, Some("Small"), &plain);
+        assert!(r.small_caps && !r.caps);
+        // The character style's off beats the paragraph style's on.
+        assert!(
+            !ss.shown_run(None, Some("Label"), Some("NoCaps"), &plain)
+                .caps
+        );
+        // A direct explicit off beats every style.
+        assert!(!ss.shown_run(None, Some("Label"), None, &off("caps")).caps);
+        assert!(
+            !ss.shown_run(None, None, Some("Small"), &off("smallCaps"))
+                .small_caps
+        );
+        // A direct on needs no style.
+        let direct = RunProps {
+            caps: true,
+            small_caps: true,
+            ..Default::default()
+        };
+        let r = ss.shown_run(None, None, None, &direct);
+        assert!(r.caps && r.small_caps);
+        // Unstyled: nothing.
+        let r = ss.shown_run(None, None, None, &plain);
+        assert!(!r.caps && !r.small_caps);
+        // The exports' run keeps the direct ones only.
+        assert!(!ss.effective_run(Some("Label"), None, &plain).caps);
     }
 
     #[test]
