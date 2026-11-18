@@ -3170,7 +3170,7 @@ impl Editor {
             } else {
                 match fallback {
                     // A style-numbered item that had a loaded left keeps it.
-                    IndentFallback::StyleNum => pr.has_loaded_left_indent().then_some(left),
+                    IndentFallback::StyleNum { .. } => pr.has_loaded_left_indent().then_some(left),
                     // A value the dialog or ruler set over a style's indent
                     // is explicit, as a reload would see it (#1815).
                     IndentFallback::StyleLeft { .. } => Some(left),
@@ -4350,35 +4350,38 @@ fn step_indent(pr: &mut ParProps, step: i32, delta: i32, fallback: IndentFallbac
         pr.ilvl = (pr.ilvl.clamp(0, 8) + step).clamp(0, 8);
         return;
     }
-    // A style-numbered item's or a character-count style's in-session
-    // indent cannot be told from nothing once Increase wrote it, so only a
-    // loaded (or pinned) left counts there. Over a style left in twips the
-    // page view draws a left set in session as the paragraph's own
-    // (`has_direct_left_indent`), so it counts as its own here too, and
-    // pins as it moves (#2231 r4).
-    let direct = match fallback {
-        IndentFallback::Level | IndentFallback::StyleLeft { twips: Some(_), .. } => {
-            pr.has_direct_left_indent()
-        }
-        _ => pr.has_loaded_left_indent(),
+    // The style's left in twips under a paragraph that takes one (a
+    // style-numbered item, a non-list paragraph), as the page view draws
+    // it: never left of the margin.
+    let style_left = match fallback {
+        IndentFallback::StyleLeft { twips: Some(t), .. }
+        | IndentFallback::StyleNum { twips: Some(t) } => Some(t.max(0)),
+        _ => None,
     };
-    // A paragraph with no left of its own as drawn, drawn at its style's
-    // left in twips, steps from there (#2231 r3), and the result is
-    // pinned, so the next step reads it as its own and a Decrease to the
-    // margin stays there: Increase from a 720 style writes 1440, Decrease
-    // writes 0.
-    if let IndentFallback::StyleLeft {
-        twips: Some(from), ..
-    } = fallback
-    {
-        if !direct {
-            if delta == 0 {
-                return;
-            }
-            pr.indent = from.saturating_add(delta).max(0);
-            pin_left(pr, pr.indent, fallback);
+    // Over such a style the page view draws a left set in session as the
+    // paragraph's own (`has_direct_left_indent`), so it counts as its own
+    // here too, and pins as it moves (#2231 r4, r5). Without one (a
+    // character-count style, a style-numbered item whose style gives no
+    // left) an in-session indent cannot be told from nothing once Increase
+    // wrote it, so only a loaded (or pinned) left counts.
+    let direct = if fallback == IndentFallback::Level || style_left.is_some() {
+        pr.has_direct_left_indent()
+    } else {
+        pr.has_loaded_left_indent()
+    };
+    // A paragraph with no left of its own as drawn steps from its style's
+    // (#2231 r3, r5), and the result is pinned, so the next step reads it as
+    // its own and a Decrease to the margin stays there: Increase from a 720
+    // style writes 1440, Decrease writes 0. A step that leaves it where it
+    // is drawn (Decrease at a style left of 0 or less) changes nothing.
+    if let Some(from) = style_left.filter(|_| !direct) {
+        let to = from.saturating_add(delta).max(0);
+        if delta == 0 || to == from {
             return;
         }
+        pr.indent = to;
+        pin_left(pr, to, fallback);
+        return;
     }
     pr.indent = (pr.indent + delta).max(0);
     if delta == 0 {
@@ -4390,7 +4393,7 @@ fn step_indent(pr: &mut ParProps, step: i32, delta: i32, fallback: IndentFallbac
         pin_left(pr, 0, fallback);
     } else if matches!(
         fallback,
-        IndentFallback::StyleNum | IndentFallback::StyleLeft { .. }
+        IndentFallback::StyleNum { .. } | IndentFallback::StyleLeft { .. }
     ) && direct
     {
         // A style item keeps a loaded left while it moves, so a later
@@ -4422,7 +4425,12 @@ enum IndentFallback {
     /// A list item with a direct `numId`: its level's indent (#1728).
     Level,
     /// A list item numbered through its paragraph style (#1792).
-    StyleNum,
+    StyleNum {
+        /// Its style chain's left in twips (`StyleSheet::style_left_twips`),
+        /// where the page view draws it and Increase/Decrease step from
+        /// (#2231 r5).
+        twips: Option<i32>,
+    },
     /// Not a list item; its paragraph style chain (or `w:pPrDefault`) gives a
     /// nonzero left indent (#1815), in character units when `chars`; `twips`
     /// is that indent where it is in twips (`StyleSheet::style_left_twips`),
@@ -4445,7 +4453,9 @@ fn indent_fallback(styles: Option<&EditStyles>, p: &ParProps) -> IndentFallback 
     if p.in_list() {
         IndentFallback::Level
     } else if list_item(styles, p) {
-        IndentFallback::StyleNum
+        IndentFallback::StyleNum {
+            twips: styles.and_then(|s| s.sheet.style_left_twips(p.style_id.as_deref())),
+        }
     } else {
         let style = p.style_id.as_deref();
         match styles.map(|s| &s.sheet) {
@@ -7881,6 +7891,68 @@ mod tests {
         assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
         ed.change_indent(-720);
         assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+    }
+
+    /// #2231 r5: a paragraph numbered through its style, whose style gives a
+    /// left in twips, steps from that left as the page view draws it and
+    /// pins; a left of its own (a session one too) steps from itself; a
+    /// style-numbered style with no left steps as before.
+    #[test]
+    fn a_style_numbered_paragraph_steps_from_its_styles_left() {
+        let styles = "<w:styles xmlns:w=\"w\">\
+            <w:style w:type=\"paragraph\" w:styleId=\"Head\"><w:pPr><w:numPr>\
+            <w:numId w:val=\"5\"/></w:numPr><w:ind w:left=\"432\" w:hanging=\"432\"/></w:pPr></w:style>\
+            <w:style w:type=\"paragraph\" w:styleId=\"ListBullet\"><w:pPr><w:numPr>\
+            <w:numId w:val=\"5\"/></w:numPr></w:pPr></w:style></w:styles>";
+        let head = || {
+            let xml = "<w:document xmlns:w=\"w\"><w:body><w:p><w:pPr><w:pStyle w:val=\"Head\"/></w:pPr>\
+                 <w:r><w:t>a</w:t></w:r></w:p></w:body></w:document>";
+            let mut ed = Editor::new(crate::load::parse_document_xml(
+                xml,
+                &crate::load::Relationships::default(),
+            ));
+            ed.set_styles_xml(Some(styles.into()));
+            ed.select_all();
+            ed
+        };
+        let mut ed = head();
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+        assert_eq!(ed.undo_names().len(), 1);
+        let mut ed = head();
+        ed.change_indent(720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"1152\"/>");
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"432\"/>");
+        // A left set in session steps from itself and pins.
+        let mut ed = head();
+        ed.set_para_style(None);
+        ed.change_indent(720);
+        ed.change_indent(720);
+        ed.set_para_style(Some("Head"));
+        assert_eq!(first_props(&ed).indent, 1440);
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
+        // A style-numbered style with no left: as before (#1792).
+        let mut ed = loaded_ppr(BULLET, true);
+        ed.change_indent(720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
+        assert!(!first_props(&ed).has_loaded_left_indent());
+    }
+
+    /// #2231 r5: a negative style left is drawn at the margin, so the steps
+    /// start there: Increase writes 720, and Decrease, which would leave it
+    /// where it is drawn, changes nothing and records no step.
+    #[test]
+    fn a_negative_style_left_steps_from_the_margin() {
+        let outdent = "<w:pStyle w:val=\"Outdent\"/>";
+        let mut ed = loaded_ppr(outdent, true);
+        ed.change_indent(720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
+        let mut ed = loaded_ppr(outdent, true);
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "");
+        assert!(ed.undo_names().is_empty());
     }
 
     /// #2231 r4: over a style left in twips, a left set in session is the
