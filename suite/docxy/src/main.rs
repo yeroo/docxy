@@ -49279,7 +49279,7 @@ fn sheet_row(
     };
     let frozen_w: f32 = (0..fc).map(|c| col_px(sh.col_width(c))).sum();
     let panes = (fc > 0)
-        .then_some((0, fc - 1, SHEET_GUT))
+        .then(|| (0, fc - 1, SHEET_GUT))
         .into_iter()
         .chain([(col0, cend, SHEET_GUT + frozen_w)]);
     let mut spill_text_off = std::collections::HashSet::new();
