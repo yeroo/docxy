@@ -556,6 +556,7 @@ mod tests {
             tracked_comment_ids: Default::default(),
             comment_undo: Default::default(),
             comments_removed_all: false,
+            balloons_hidden: false,
             used_comment_ids: Default::default(),
             pictures: Default::default(),
             run_styles: Default::default(),

@@ -22,6 +22,7 @@ compile_error!(
 
 mod about;
 mod accent;
+mod balloons;
 mod close;
 #[cfg(test)]
 mod comment_tests;
@@ -1479,6 +1480,7 @@ fn protected_view_allows_doc_act(act: Act) -> bool {
             | Act::Find
             | Act::ShowHide
             | Act::ToggleComments
+            | Act::ShowComments
             | Act::ToggleNav
             | Act::NewWindow
             | Act::ArrangeAll
@@ -5378,6 +5380,10 @@ struct DocTab {
     /// `03`, a comments.xml the parser can't read), unless an undo brought
     /// their markers back ([`save_base`], #971). A load clears it.
     comments_removed_all: bool,
+    /// Review > Show Comments is off for this document (#2232): its
+    /// markup area and balloons are hidden. Per tab, so per document
+    /// session; never saved.
+    balloons_hidden: bool,
     /// Every comment id this document has had since it loaded: those of
     /// its comments and body markers then ([`seed_used_comment_ids`]), and
     /// each one allocated since. It never shrinks, not on Delete Comment or
@@ -5911,6 +5917,9 @@ struct Docxy {
     ruler_tab: docxcore::model::TabAlign,
     // Screen bounds measured during prepaint and shared with the ruler paint and hit path.
     ruler_probe: std::rc::Rc<std::cell::RefCell<RulerProbe>>,
+    /// The comment balloons' markup area (#2232): where the last frame
+    /// painted anchors, balloons and page strips, and what it measured.
+    balloon_state: balloons::Shared,
     /// The document tab's top-level tables as last painted (#1895), for the
     /// harness's `doc` read.
     painted_tables: PaintedTables,
@@ -11039,6 +11048,9 @@ struct RenderCtx<'a> {
     /// The gap (px) the container puts between its blocks (Print Layout's
     /// column), which a joined border box spans (#2231).
     block_gap: f32,
+    /// The body's comment balloons (#2232): range shading, brackets and
+    /// anchor probes. `None` for headers, footers and the embedded view.
+    comments: Option<&'a balloons::CommentCtx>,
 }
 
 /// An inline picture of a top-level paragraph as last painted (#1963): its
@@ -11223,6 +11235,18 @@ struct FlowPara<'a> {
     /// Whether it shares a border box with the paragraph before or after it
     /// (#2231).
     group: BorderGroup,
+    /// The body's comment balloons (#2232) and the comment ranges open at
+    /// its start; `None` draws no shading, brackets or anchors.
+    comments: Option<(&'a balloons::CommentCtx, &'a [String])>,
+}
+
+/// A frame's comment balloons (#2232): each with its page (Print Layout)
+/// and its element, and the room (px) the content needs below its bottom
+/// for the last one to be scrolled to.
+#[derive(Default)]
+struct BalloonEls {
+    els: Vec<(usize, AnyElement)>,
+    room: f32,
 }
 
 /// A bordered paragraph's place in a run of paragraphs with the same
@@ -12370,6 +12394,7 @@ fn blank_docx_tab(title: &str) -> DocTab {
         tracked_comment_ids: Default::default(),
         comment_undo: Default::default(),
         comments_removed_all: false,
+        balloons_hidden: false,
         used_comment_ids: Default::default(),
         pictures: Default::default(),
         run_styles: Default::default(),
@@ -12448,6 +12473,7 @@ impl Loaded {
             tracked_comment_ids: Default::default(),
             comment_undo: Default::default(),
             comments_removed_all: false,
+            balloons_hidden: false,
             used_comment_ids: Default::default(),
             pictures: Default::default(),
             run_styles: Default::default(),
@@ -12953,6 +12979,7 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool, fresh_volatile: bool) -> Do
         tracked_comment_ids: Default::default(),
         comment_undo: Default::default(),
         comments_removed_all: false,
+        balloons_hidden: false,
         used_comment_ids: Default::default(),
         pictures: Default::default(),
         run_styles: Default::default(),
@@ -16859,6 +16886,36 @@ fn story_comment_ids(tab: &DocTab, doc: &Document) -> std::collections::BTreeSet
     ids
 }
 
+/// Whether `tab` may show comment balloons (#2232): in All Markup, not a
+/// live preview, with Show Comments on for the tab and an open comment
+/// listed. Which of them are anchored in the body decides the rest.
+fn balloons_on(tab: &DocTab, markup: MarkupView, previewing: bool) -> bool {
+    markup == MarkupView::All
+        && !previewing
+        && !tab.balloons_hidden
+        && tab.comments.iter().any(|c| !c.resolved)
+}
+
+/// Review > Show Comments on `tab` (#2232): its balloons hidden, or shown
+/// again. The tab's own, never saved.
+fn toggle_balloons(tab: &mut DocTab) {
+    tab.balloons_hidden = !tab.balloons_hidden;
+}
+
+/// The Comments pane's order (#2232): the open comments, then the resolved
+/// ones, each group in the order listed.
+fn pane_order(comments: &[Comment]) -> Vec<&Comment> {
+    let (open, resolved): (Vec<&Comment>, Vec<&Comment>) =
+        comments.iter().partition(|c| !c.resolved);
+    open.into_iter().chain(resolved).collect()
+}
+
+/// A pane card's quote (#2232): the anchored text on one line, its breaks
+/// as spaces (the card truncates it to its width).
+fn pane_quote(quoted: &str) -> String {
+    quoted.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Start `tab`'s used comment ids afresh from what it holds now: its
 /// comments' ids and the ids of the comment markers in its body, headers,
 /// footers and notes. Called wherever a document is loaded into the tab
@@ -17530,6 +17587,7 @@ fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 tracked_comment_ids: Default::default(),
                 comment_undo: Default::default(),
                 comments_removed_all: false,
+                balloons_hidden: false,
                 used_comment_ids: Default::default(),
                 pictures: Default::default(),
                 run_styles: Default::default(),
@@ -17579,6 +17637,7 @@ fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 tracked_comment_ids: Default::default(),
                 comment_undo: Default::default(),
                 comments_removed_all: false,
+                balloons_hidden: false,
                 used_comment_ids: Default::default(),
                 pictures: Default::default(),
                 run_styles: Default::default(),
@@ -18271,6 +18330,7 @@ impl Docxy {
             ruler_indent_base: RulerIndentBase::default(),
             ruler_tab: docxcore::model::TabAlign::Left,
             ruler_probe: std::rc::Rc::new(std::cell::RefCell::new(RulerProbe::default())),
+            balloon_state: Default::default(),
             painted_tables: PaintedTables::default(),
             painted_paras: PaintedParas::default(),
             painted_inks: PaintedInks::default(),
@@ -19322,6 +19382,7 @@ impl Docxy {
             tracked_comment_ids: Default::default(),
             comment_undo: Default::default(),
             comments_removed_all: false,
+            balloons_hidden: false,
             used_comment_ids: Default::default(),
             pictures: Default::default(),
             run_styles: Default::default(),
@@ -21106,6 +21167,29 @@ impl Docxy {
             .ok_or_else(|| "the File screen is not open".to_string()),
             Region::DocLine { block, row, end } => doc_line_point(block, row, end)
                 .ok_or_else(|| format!("body paragraph {block} row {row} is not on screen")),
+            // A comment balloon or one of its buttons as last painted (#2232).
+            Region::Balloon(id, part) => {
+                let st = self.balloon_state.borrow();
+                let found = match part {
+                    "body" => st.balloons.iter().find(|(b, _)| b == id).map(|(_, r)| {
+                        // Its lower half: the text, clear of the header's
+                        // buttons.
+                        balloons::Rect {
+                            y: r.y + r.h / 2.0,
+                            h: r.h / 2.0 - 2.0,
+                            ..*r
+                        }
+                    }),
+                    _ => st
+                        .buttons
+                        .iter()
+                        .find(|(b, p, _)| b == id && *p == part)
+                        .map(|(_, _, r)| *r),
+                };
+                found
+                    .map(|r| Bounds::new(point(px(r.x), px(r.y)), size(px(r.w), px(r.h))))
+                    .ok_or_else(|| format!("no balloon of comment {id} is painted"))
+            }
             // The document's scrollbars as last painted (#2080).
             Region::DocBar(name) => {
                 if !self.active_is_doc() {
@@ -30116,6 +30200,252 @@ impl Docxy {
         Ok(())
     }
 
+    /// The frame's comment balloon context (#2232), and the markup area's
+    /// state begun for it: `None`, with no markup area, unless the active
+    /// document is in All Markup, not a live preview, Show Comments is on
+    /// for its tab, and an open comment it lists has a marker in the body
+    /// drawn (`shown`). `doc` is the editor's own, which decides which
+    /// comments are listed ([`live_comments`]).
+    fn balloon_ctx(
+        &self,
+        tab: &DocTab,
+        doc: &Document,
+        shown: &Document,
+        doc_pal: Pal,
+        previewing: bool,
+    ) -> Option<balloons::CommentCtx> {
+        let state = self.balloon_state.clone();
+        let on = balloons_on(tab, self.markup, previewing);
+        let live = if on {
+            live_comments(tab, doc)
+        } else {
+            Vec::new()
+        };
+        let body = if on {
+            balloons::body_comments(&shown.body)
+        } else {
+            Default::default()
+        };
+        let margin = balloons::margin_comments(&live, &body.order);
+        if margin.is_empty() {
+            state.borrow_mut().begin(None);
+            return None;
+        }
+        let selected = selected_comment_id(&self.tabs, self.active, &self.selected_comment);
+        let offset = gridcore::clock::local_offset_minutes();
+        let mut looks = std::collections::HashMap::new();
+        let mut drawn = Vec::new();
+        for c in &margin {
+            let look = balloons::look(
+                balloons::author_index(&tab.comments, &c.author),
+                doc_pal.dark,
+                doc_pal.ground,
+            );
+            looks.insert(c.id.clone(), look);
+            drawn.push(balloons::Drawn {
+                id: c.id.clone(),
+                author: c.author.clone(),
+                date: balloons::balloon_date(&c.date, offset).unwrap_or_default(),
+                date_utc: balloons::balloon_date(&c.date, 0).unwrap_or_default(),
+                text: c.text.clone(),
+                look: Some(look),
+                selected: selected.as_deref() == Some(c.id.as_str()),
+                page: 0,
+            });
+        }
+        let view = if self.page_view {
+            balloons::View::Print
+        } else {
+            balloons::View::Web
+        };
+        {
+            let mut st = state.borrow_mut();
+            st.begin(Some(view));
+            st.drawn = drawn;
+            st.resolved_hidden = live.iter().filter(|c| c.resolved).count();
+            st.area_w = balloons::markup_w(self.zoom);
+            // The last frame's measure, when it was this tab in this view;
+            // else nothing yet, and the frame's probes ask for the next.
+            let key = Some((self.active, self.page_view));
+            st.used = if st.last.key == key {
+                st.last.clone()
+            } else {
+                balloons::Inputs {
+                    key,
+                    ..Default::default()
+                }
+            };
+        }
+        Some(balloons::CommentCtx {
+            open_at: body.open_at,
+            looks,
+            selected,
+            state,
+        })
+    }
+
+    /// The frame's balloons (#2232), placed from the last frame's measure:
+    /// each with its page (Print Layout) and its element, absolutely placed
+    /// in its page's strip (Print Layout) or the scroll content's balloon
+    /// layer (Web Layout); and the room the content needs below it so the
+    /// last one can be scrolled to.
+    fn balloon_els(&self, ctx: &balloons::CommentCtx, cx: &mut Context<Self>) -> BalloonEls {
+        let zoom = self.zoom;
+        let (placed, room, view) = {
+            let mut st = ctx.state.borrow_mut();
+            let ids: Vec<String> = st.drawn.iter().map(|d| d.id.clone()).collect();
+            let texts: std::collections::HashMap<String, String> = st
+                .drawn
+                .iter()
+                .map(|d| (d.id.clone(), d.text.clone()))
+                .collect();
+            let (placed, room) = balloons::place(&ids, &st.used, |id| {
+                balloons::estimate_height(texts.get(id).map_or("", String::as_str), zoom)
+            });
+            for p in &placed {
+                if let Some(d) = st.drawn.iter_mut().find(|d| d.id == p.id) {
+                    d.page = p.page;
+                }
+            }
+            (placed, room, st.view)
+        };
+        let st = ctx.state.borrow();
+        let web_column_w = self.ruler_probe.borrow().draft_text_w.unwrap_or(0.0);
+        let mut els = Vec::new();
+        for p in placed {
+            let Some(d) = st.drawn.iter().find(|d| d.id == p.id) else {
+                continue;
+            };
+            let Some(look) = d.look else {
+                continue;
+            };
+            let top = match view {
+                Some(balloons::View::Print) => {
+                    p.top - st.used.page_tops.get(p.page).copied().unwrap_or(0.0)
+                }
+                _ => p.top,
+            };
+            let n = p.id.parse::<usize>().unwrap_or(0);
+            let id = p.id.clone();
+            let btn = |key: &'static str, label: &'static str| {
+                div()
+                    .id((key, n))
+                    .px(px(4. * zoom))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_size(px(10. * zoom))
+                    .text_color(hsla_u(look.dim))
+                    .hover(|d| d.bg(hsla_u(look.shade_sel)))
+                    .child(label)
+            };
+            // The harness's `balloon-resolve:<id>` / `balloon-delete:<id>`.
+            let button_probe = |part: &'static str| {
+                let id = id.clone();
+                balloons::rect_probe(&ctx.state, move |s, r| {
+                    s.buttons.push((id.clone(), part, r))
+                })
+            };
+            let header = h_flex()
+                .w_full()
+                .items_center()
+                .gap(px(4. * zoom))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_size(px(11. * zoom))
+                        .font_weight(FontWeight::BOLD)
+                        .child(SharedString::from(d.author.clone())),
+                )
+                .child(
+                    btn("blnr", "Resolve")
+                        .relative()
+                        .child(button_probe("resolve"))
+                        .on_click(cx.listener({
+                            let id = id.clone();
+                            move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.resolve_comment(id.clone(), window, cx);
+                            }
+                        })),
+                )
+                .child(
+                    btn("blnx", "\u{00d7}")
+                        .relative()
+                        .child(button_probe("delete"))
+                        .on_click(cx.listener({
+                            let id = id.clone();
+                            move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.delete_comment(id.clone(), window, cx);
+                            }
+                        })),
+                );
+            let probe_id = id.clone();
+            let selected = d.selected;
+            let left = match view {
+                Some(balloons::View::Print) => balloons::STRIP_PAD,
+                // Right of the text column as last painted.
+                _ => web_column_w + balloons::STRIP_PAD,
+            };
+            let balloon = v_flex()
+                .w_full()
+                .px(px(6. * zoom))
+                .py(px(4. * zoom))
+                .gap(px(2. * zoom))
+                .rounded(px(4.))
+                .bg(hsla_u(look.fill))
+                .border_color(hsla_u(look.edge))
+                .map(|e| if selected { e.border_2() } else { e.border_1() })
+                .text_color(hsla_u(look.ink))
+                .cursor_pointer()
+                .child(header)
+                .child(
+                    div()
+                        .text_size(px(10. * zoom))
+                        .text_color(hsla_u(look.dim))
+                        .child(SharedString::from(d.date.clone())),
+                )
+                .child(
+                    div()
+                        .text_size(px(12. * zoom))
+                        .child(SharedString::from(d.text.clone())),
+                );
+            // The probe in a borderless wrapper, so it takes the balloon's
+            // border box.
+            let el = div()
+                .id(("balloon", n))
+                .absolute()
+                .top(px(top))
+                .left(px(left))
+                .w(px(balloons::balloon_w(zoom)))
+                .child(balloon)
+                .child(balloons::rect_probe(&ctx.state, move |s, r| {
+                    s.balloons.push((probe_id.clone(), r))
+                }))
+                // A press on a balloon selects its comment and never
+                // reaches the page under the markup area.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _window, cx| {
+                    this.select_comment(id.clone());
+                    cx.notify();
+                }))
+                .into_any_element();
+            els.push((p.page, el));
+        }
+        BalloonEls { els, room }
+    }
+
+    /// Select comment `id` of the active document, as a click on its card or
+    /// balloon does: Review > Resolve then acts on it.
+    fn select_comment(&mut self, id: String) {
+        self.selected_comment = close::tab_ids(&self.tabs)
+            .into_iter()
+            .nth(self.active)
+            .map(|tab| (tab, id));
+    }
+
     /// The comments review side panel (toggled from Review/View ▸ Comments pane).
     fn comments_panel(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let comments = self
@@ -30141,7 +30471,22 @@ impl Docxy {
                     .child("No comments. Select text, then Review \u{203A} New comment."),
             );
         }
-        for c in &comments {
+        // Open comments first, then the resolved ones under their own heading
+        // (#2232), as Word's pane files them.
+        let mut heading_done = false;
+        for c in pane_order(&comments) {
+            if c.resolved && !heading_done {
+                heading_done = true;
+                list = list.child(
+                    div()
+                        .id("cmt-resolved")
+                        .pt_1()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(pal.dim)
+                        .child("Resolved"),
+                );
+            }
             let id = c.id.clone();
             let quoted = c.quoted.clone();
             list = list.child(
@@ -30200,13 +30545,20 @@ impl Docxy {
                                     })),
                             ),
                     )
+                    // One line of the anchored text at most (#2232).
                     .when(!c.quoted.is_empty(), |d| {
                         d.child(
                             div()
+                                .w_full()
+                                .min_w(px(0.))
+                                .truncate()
                                 .text_size(px(11.))
                                 .italic()
                                 .text_color(pal.dim)
-                                .child(SharedString::from(format!("\u{201C}{}\u{201D}", c.quoted))),
+                                .child(SharedString::from(format!(
+                                    "\u{201C}{}\u{201D}",
+                                    pane_quote(&c.quoted)
+                                ))),
                         )
                     })
                     .child(
@@ -33140,6 +33492,7 @@ mod sheet_save_tests {
             tracked_comment_ids: Default::default(),
             comment_undo: Default::default(),
             comments_removed_all: false,
+            balloons_hidden: false,
             used_comment_ids: Default::default(),
             pictures: Default::default(),
             run_styles: Default::default(),
@@ -34379,7 +34732,7 @@ fn apply_doc_act(e: &mut Editor, act: Act) {
         ClearFmt => e.clear_run_formatting(),
         Project(_) | Ext(_) | Sheet(_) | Cut | Copy | Paste | PasteKeepSource | PasteTextOnly
         | PasteSpecial | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName
-        | FontSize | NewComment | ShowHide | ToggleComments | ResolveComment
+        | FontSize | NewComment | ShowHide | ToggleComments | ShowComments | ResolveComment
         | DeleteAllComments | Markup(_) | ToggleTrack | ToggleNav | NewWindow | ArrangeAll
         | DarkMode | SwitchModes | AutoHideRibbon | InsertField | PageBreak | BlankPage
         | Cover(_) | ToggleNotes | InsertTable | InsertSymbol | InsertEquation | LineSpacing
@@ -35656,6 +36009,9 @@ enum Act {
     Subtitle,
     ShowHide,
     ToggleComments,
+    /// Review > Show Comments (#2232): the active document's comment
+    /// balloons in All Markup, on by default, off per tab.
+    ShowComments,
     ToggleNav,
     /// View › Window › New Window (#587): move the active tab into a new
     /// window; a one-tab window opens the new window on a blank document.
@@ -36052,6 +36408,8 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
                             )
                             .key("P"),
                             cmdt("togglenotes", "comment", "Notes pane", ToggleNotes, "").key("O"),
+                            cmdt("showcomments", "comment", "Show Comments", ShowComments, "")
+                                .key("M"),
                         ]),
                         rs::column(vec![
                             cmdt("resolvecomment", "comment", "Resolve", ResolveComment, "")
@@ -37395,6 +37753,7 @@ fn emit_words(
     pal: Pal,
     zoom: f32,
     band: Option<(f32, f32)>,
+    shade: Option<u32>,
 ) {
     // Resolved once per run, not per word (#1900), as is its ink (#2079)
     // and its highlight (#2231). Selection wins over a run's highlight so
@@ -37447,6 +37806,10 @@ fn emit_words(
                 .when(props.underline || is_link, |d| d.underline())
                 .when(props.strike, |d| d.line_through())
                 .when_some(vshift, |d, dy| d.relative().top(px(dy)))
+                // An open comment's range shade (#2232), under the
+                // highlight and the selection: the later `bg` wins. No band,
+                // so a line's height never moves.
+                .when_some(shade, |d, s| d.bg(rgb(s)))
                 // The band is the text's single-spaced height, centred in
                 // the line (#2231): its outer box stays the line's height.
                 .when_some(highlight, |d, (fill, ink)| {
@@ -37530,6 +37893,7 @@ fn emit_run(
     caret_h: f32,
     zoom: f32,
     band: Option<(f32, f32)>,
+    shade: Option<u32>,
 ) {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
@@ -37572,6 +37936,7 @@ fn emit_run(
             pal,
             zoom,
             band,
+            shade,
         );
     }
     if *caret == Some(end) {
@@ -38627,6 +38992,7 @@ fn emit_revision_text(
             19.0,
             zoom,
             None,
+            None,
         );
     }
 }
@@ -38796,6 +39162,12 @@ fn paragraph_el(
     // `line_numbers::caret_height`).
     let line_h = pbox.line_h;
     let caret_h = line_numbers::caret_height(line_h);
+    // The comment ranges open here (#2232), innermost last: open at the
+    // paragraph's start, then as its markers open and close them.
+    let mut open_comments: Vec<String> = flow
+        .comments
+        .map(|(_, open)| open.to_vec())
+        .unwrap_or_default();
     // Hyperlinks opened up into their pieces, so text, tabs and breaks inside a
     // link take caret offsets exactly as the editor counts them.
     let items = flat_inlines(&p.content);
@@ -38943,16 +39315,22 @@ fn paragraph_el(
         match inline {
             Inline::Run(r) => {
                 let shown = styler.shown(r);
+                // Inside an open comment's range (#2232): its shade.
+                let shade = flow.comments.and_then(|(c, _)| c.shade(&open_comments));
                 emit_run(
                     &mut spans, &r.text, &shown, base, in_link, &mut idx, &mut caret, sel, click,
-                    pal, caret_h, zoom, band,
+                    pal, caret_h, zoom, band, shade,
                 );
                 if let Some(inks) = flow.inks {
                     if !r.text.trim().is_empty() {
-                        // A highlighted run reads on its highlight (#2231).
+                        // A highlighted run reads on its highlight (#2231),
+                        // a shaded one on its comment's shade (#2232).
                         let (ink, ground) = match run_highlight(&shown, &pal) {
                             Some((fill, ink)) => (ink, fill),
-                            None => (rgb_u(run_ink(&shown, in_link, &pal)), pal.ground),
+                            None => (
+                                rgb_u(run_ink(&shown, in_link, &pal)),
+                                shade.unwrap_or(pal.ground),
+                            ),
                         };
                         inks.borrow_mut().push(PaintedInk {
                             text: r.text.clone(),
@@ -39084,21 +39462,21 @@ fn paragraph_el(
                     );
                     x += w;
                 }
-                // Comment reference → a small badge; other raw XML (range markers,
-                // bookmarks, …) is invisible content and renders nothing.
-                if xml.contains("commentReference") {
-                    spans.push(
-                        div()
-                            .px(px(3.))
-                            .rounded(px(3.))
-                            .bg(hsla_u(0xF2C744))
-                            .text_size(px(9.))
-                            .text_color(rgb(0x1a1a1a))
-                            .relative()
-                            .top(px(-(base * 0.35)))
-                            .child("\u{1F4AC}")
-                            .into_any_element(),
-                    );
+                // Comment markers (#2232) take nothing in the text flow: a
+                // margin comment's draw a zero-width span that records its
+                // anchor (and a range's bracket); the rest of raw XML
+                // (bookmarks, …) is invisible content and renders nothing.
+                if let Some((comments, _)) = flow.comments {
+                    for (kind, id) in balloons::markers(xml) {
+                        match kind {
+                            balloons::Mark::Start if !open_comments.contains(&id) => {
+                                open_comments.push(id.clone())
+                            }
+                            balloons::Mark::End => open_comments.retain(|o| *o != id),
+                            _ => {}
+                        }
+                        spans.extend(comments.marker_el(kind, &id, caret_h, line_h));
+                    }
                 }
             }
             Inline::Field { raw, text } => {
@@ -39284,7 +39662,7 @@ fn paragraph_el(
     // at the paragraph end. Word, tab, field and picture presses fire first and
     // stop propagation, so this only runs on a press beside the text, or on a
     // piece that takes no offset or press of its own (a
-    // footnote number, a comment badge, an empty field), which stays a plain
+    // footnote number, a comment's bracket, an empty field), which stays a plain
     // caret at the paragraph end.
     let para_end = idx;
     // Space before / after the paragraph (`w:spacing` before/after, twips → px).
@@ -40046,6 +40424,10 @@ fn block_el_numbered(
                         .pictures
                         .filter(|_| ctx.hf_width.is_none())
                         .zip(top.then(|| path[0])),
+                    comments: ctx
+                        .comments
+                        .filter(|_| ctx.hf_width.is_none())
+                        .map(|c| (c, c.open_at.get(&path).map_or(&[][..], Vec::as_slice))),
                 },
             )
         }
@@ -41321,6 +41703,7 @@ impl Docxy {
                 | Act::AutoHideRibbon
                 | Act::ToggleRuler
                 | Act::ToggleComments
+                | Act::ShowComments
                 | Act::ToggleNotes
                 | Act::Markup(_)
                 | Act::PrintLayout
@@ -41395,6 +41778,12 @@ impl Docxy {
             }
             ToggleComments => {
                 self.show_comments = !self.show_comments;
+                self.refocus(window, cx);
+            }
+            ShowComments => {
+                if let Some(t) = self.tabs.get_mut(self.active) {
+                    toggle_balloons(t);
+                }
                 self.refocus(window, cx);
             }
             ToggleNav => {
@@ -44040,6 +44429,11 @@ impl Docxy {
         if matches!(act, Act::SwitchModes) {
             return self.applied == Some(ThemeMode::Dark);
         }
+        // Balloons are All Markup's (#2232), as Word greys Show Comments
+        // in the other views.
+        if matches!(act, Act::ShowComments) {
+            return self.markup == MarkupView::All;
+        }
         act_enabled(act)
             && match act {
                 Act::Table(a) => table_tab::table_enabled(self.edit_target_ref(), a),
@@ -44087,6 +44481,10 @@ impl Docxy {
             ParaBorders => doc.is_some_and(|ed| ed.shown_bottom_border()),
             ShowHide => self.show_marks,
             ToggleComments => self.show_comments,
+            ShowComments => self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| !t.balloons_hidden),
             ResolveComment => self.selected_comment_resolved(),
             Markup(view) => self.markup == view,
             ToggleTrack => self.active_track_changes(),
@@ -45982,6 +46380,15 @@ impl Render for Docxy {
                     // The body's pictures as drawn, for the harness (#1926).
                     let drawn_pictures = self.drawn_pictures.clone();
                     drawn_pictures.borrow_mut().clear();
+                    // Comment balloons (#2232), built once a frame: `None`
+                    // (no markup area) unless All Markup shows an open
+                    // comment anchored in the body.
+                    let comment_ctx =
+                        self.balloon_ctx(tab, &editor.doc, &shown, doc_pal, previewing);
+                    let balloon_els = comment_ctx
+                        .as_ref()
+                        .map(|c| self.balloon_els(c, cx))
+                        .unwrap_or_default();
                     let ctx = RenderCtx {
                         caret_path: &editor.caret.path,
                         caret_off: editor.caret.offset,
@@ -46014,6 +46421,7 @@ impl Render for Docxy {
                         pictures: None,
                         siblings: None,
                         block_gap: 0.0,
+                        comments: comment_ctx.as_ref(),
                     };
                     let body = &shown.body;
                     if self.page_view {
@@ -46197,6 +46605,13 @@ impl Render for Docxy {
                                 &slot_for,
                             )
                         };
+                        // Each balloon goes to its anchor's page's strip
+                        // (#2232).
+                        let mut page_balloons: Vec<(usize, Option<AnyElement>)> = balloon_els
+                            .els
+                            .into_iter()
+                            .map(|(p, el)| (p, Some(el)))
+                            .collect();
                         let sheets: Vec<AnyElement> = pf
                             .pages
                             .iter()
@@ -46246,6 +46661,7 @@ impl Render for Docxy {
                                     pictures: None,
                                     siblings: None,
                                     block_gap: 0.0,
+                                    comments: None,
                                 });
                                 // One region's margin content for this page: the live
                                 // editor blocks (editable on the edit page, read-only on
@@ -46602,7 +47018,7 @@ impl Render for Docxy {
                                         );
                                     }
                                 }
-                                div()
+                                let sheet = div()
                                     .relative()
                                     .w(tw(sb.w))
                                     .child(page)
@@ -46613,7 +47029,29 @@ impl Render for Docxy {
                                         }
                                     }))
                                     .child(page_follow_el(&self.page_follow, &self.doc_scroll, pi))
-                                    .into_any_element()
+                                    .into_any_element();
+                                // The markup area beside the page (#2232):
+                                // the row is centred, so the page moves left.
+                                if comment_ctx.is_some() {
+                                    let own: Vec<AnyElement> = page_balloons
+                                        .iter_mut()
+                                        .filter(|(p, _)| *p == pi)
+                                        .filter_map(|(_, el)| el.take())
+                                        .collect();
+                                    h_flex()
+                                        .flex_none()
+                                        .items_start()
+                                        .child(sheet)
+                                        .child(balloons::strip(
+                                            &self.balloon_state,
+                                            pi,
+                                            balloons::markup_w(zoom),
+                                            own,
+                                        ))
+                                        .into_any_element()
+                                } else {
+                                    sheet
+                                }
                             })
                             .collect();
                         // Every entry exists now (`build_band` ran in document
@@ -46650,7 +47088,25 @@ impl Render for Docxy {
                                     .min_w_full()
                                     .items_center()
                                     .gap(px(print_sheet::SHEET_GAP))
-                                    .children(sheets),
+                                    .children(sheets)
+                                    // The balloons' bottom room and the
+                                    // layer that measures them and draws
+                                    // the connectors (#2232).
+                                    .when(comment_ctx.is_some(), |d| {
+                                        d.relative()
+                                            .child(balloons::bottom_room(
+                                                &self.balloon_state,
+                                                balloon_els.room,
+                                            ))
+                                            .child(balloons::layer_at(
+                                                0.,
+                                                0.,
+                                                vec![balloons::end_layer(
+                                                    &self.balloon_state,
+                                                    None,
+                                                )],
+                                            ))
+                                    }),
                             )
                             .into_any_element();
                         let scroll_view = ruler_scroll_view(scroll, &self.ruler_probe);
@@ -46720,6 +47176,14 @@ impl Render for Docxy {
                         let probe = self.ruler_probe.clone();
                         let (follow, handle) = (self.doc_follow.clone(), self.doc_scroll.clone());
                         let hbar = self.doc_hbar.clone();
+                        let markup_w = if comment_ctx.is_some() {
+                            balloons::markup_w(self.zoom)
+                        } else {
+                            0.0
+                        };
+                        let balloon_room = balloon_els.room;
+                        let web_balloons: Vec<AnyElement> =
+                            balloon_els.els.into_iter().map(|(_, el)| el).collect();
                         let scroll = v_flex()
                             .id("doc-scroll")
                             .font_family(doc_font.clone())
@@ -46741,8 +47205,11 @@ impl Render for Docxy {
                                     d.bg(bg).text_color(fg)
                                 }
                             })
-                            .px(px(48.))
-                            .py(px(28.))
+                            // Right of the text column, the markup area
+                            // (#2232).
+                            .pl(px(balloons::FLOW_PAD))
+                            .pr(px(balloons::FLOW_PAD + markup_w))
+                            .py(px(balloons::FLOW_PAD_Y))
                             .children(blocks)
                             // An in-flow child sits inside the scroll area's 48px padding.
                             // Keep it last so the caret follow's bounds_for_item(b) still indexes block b.
@@ -46771,6 +47238,25 @@ impl Render for Docxy {
                                     }
                                 },
                             )))
+                            // The balloons, after every block so the caret
+                            // follow's indexes stay the blocks', their
+                            // bottom room and the layer that measures them
+                            // and draws the connectors (#2232).
+                            .when(comment_ctx.is_some(), |d| {
+                                // Zero-size layers at the content box's
+                                // origin, so they add no sideways scroll.
+                                d.child(balloons::layer_at(
+                                    balloons::FLOW_PAD,
+                                    balloons::FLOW_PAD_Y,
+                                    web_balloons,
+                                ))
+                                .child(balloons::bottom_room(&self.balloon_state, balloon_room))
+                                .child(balloons::layer_at(
+                                    balloons::FLOW_PAD,
+                                    balloons::FLOW_PAD_Y,
+                                    vec![balloons::end_layer(&self.balloon_state, used_w)],
+                                ))
+                            })
                             .into_any_element();
                         // The bars lie over the view's right and bottom
                         // edges (#2080), which keeps the text width; the
