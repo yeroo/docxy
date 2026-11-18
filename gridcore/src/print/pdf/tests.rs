@@ -257,6 +257,8 @@ fn an_empty_string_formula_result_stops_a_spill() {
 fn a_right_aligned_text_spills_left() {
     let long = "A heading much wider than one column";
     let mut wb = Workbook::default();
+    // Style 0, the unstyled cells', is the default xf.
+    wb.styles.intern(Xf::default());
     let right = wb.styles.intern(Xf {
         align: Align::Right,
         ..Xf::default()
@@ -287,6 +289,8 @@ fn a_merged_title_prints_across_its_merge_and_blocks_a_spill() {
     let title = "A centred title much wider than one column";
     let long = "Another heading much wider than one column";
     let mut wb = Workbook::default();
+    // Style 0, the unstyled cells', is the default xf.
+    wb.styles.intern(Xf::default());
     let center = wb.styles.intern(Xf {
         align: Align::Center,
         ..Xf::default()

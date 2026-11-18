@@ -341,6 +341,8 @@ mod tests {
     #[test]
     fn what_blocks_a_spill() {
         let mut wb = Workbook::default();
+        // Style 0, the unstyled cells', is the default xf.
+        wb.styles.intern(Xf::default());
         let fill = styled(
             &mut wb,
             Xf {
@@ -372,7 +374,7 @@ mod tests {
         s.merges.push((0, 5, 1, 6));
         assert!(blocks(&s, 0, 1));
         assert!(blocks(&s, 0, 2));
-        assert!(!blocks(&s, 0, 3));
+        assert!(s.cell(0, 3).is_some() && !blocks(&s, 0, 3));
         assert!(!blocks(&s, 0, 4));
         assert!(blocks(&s, 0, 5) && blocks(&s, 1, 6));
         assert!(!blocks(&s, 2, 5));

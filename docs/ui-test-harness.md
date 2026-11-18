@@ -440,6 +440,7 @@ State keys, as the app reports them after every driving verb:
 | `chart_sel`, `panel_chart`, `charts` | chart selection and the panel |
 | `picture_sel` | the selected floating picture's index among the sheet's pictures in drawing order (#2228), or null |
 | `sheet_scroll` | the row list's top item: how far the rows are scrolled, counted past the frozen rows and without the hidden ones (#2228) |
+| `spill` | the sheet's text spills as the last frame drew them (#2240): each run of a text wider than its cell over its empty neighbours, from its first to its last column in sheet columns (`A1:E1`; a right-aligned source is the run's last cell), runs separated by spaces, row by row; null when no text runs on. A run reaching into both panes of a frozen split is listed once. It trails a driving verb by a frame, so settle with a `shot` before asserting it |
 | `field`, `field_text` | the focused reference field, and its buffer |
 | `filling`, `fill_preview`, `dragging` | the auto-fill and the sweep |
 | `picking`, `range_preview`, `sel_hidden` | point mode |

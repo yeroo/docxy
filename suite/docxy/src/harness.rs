@@ -5409,6 +5409,21 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
                 "sheet_scroll",
                 Json::Num(v.vlist.logical_scroll_top().item_ix as f64),
             ),
+            // The text spills the last frame drew (#2240): each run from its
+            // first to its last column, in sheet columns, row by row; null
+            // when no text runs on. Settle a frame (`shot`) after a verb.
+            (
+                "spill",
+                str_or_null({
+                    let runs: Vec<String> = v
+                        .spills
+                        .borrow()
+                        .iter()
+                        .map(|&(r, lo, hi)| a1_range((r, lo, r, hi)))
+                        .collect();
+                    (!runs.is_empty()).then(|| runs.join(" "))
+                }),
+            ),
             // Flash Fill's greyed preview (#666): the range it covers and the
             // values Enter would write, or null.
             (
