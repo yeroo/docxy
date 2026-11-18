@@ -81,6 +81,63 @@ pub fn run_size_px(props: &RunProps, base: f32, zoom: f32) -> f32 {
         .map_or(base, |h| zoom * h as f32 / 2.0 * 1.333)
 }
 
+/// Small capitals' size, a fraction of the run's (#2087): LibreOffice's
+/// `SMALL_CAPS_PERCENTAGE`, close to Word's synthesized small caps.
+pub const SMALL_CAPS: f32 = 0.8;
+
+/// `c` in capitals when that is one character, else `c` as stored: the
+/// shown text keeps the stored text's character count (ß stays ß, not "SS").
+fn upper_one(c: char) -> char {
+    let mut up = c.to_uppercase();
+    match (up.next(), up.next()) {
+        (Some(u), None) => u,
+        _ => c,
+    }
+}
+
+/// A run's `text` as the view draws it (#2087): All caps (`w:caps`) in
+/// capitals; Small caps (`w:smallCaps`, unless All caps) its lowercase
+/// letters as capitals at [`SMALL_CAPS`] of the size, the rest at full
+/// size. `(shown text, small)` pieces in order, one per stretch of one size;
+/// a plain run is one piece, as stored. Display only: character for
+/// character with the stored text, so every caret, click and selection
+/// offset counts the stored text, and copy, Find and save keep its case.
+pub fn shown_case(text: &str, props: &RunProps) -> Vec<(String, bool)> {
+    if props.caps {
+        return vec![(text.chars().map(upper_one).collect(), false)];
+    }
+    if !props.small_caps {
+        return vec![(text.to_string(), false)];
+    }
+    let mut out: Vec<(String, bool)> = Vec::new();
+    for c in text.chars() {
+        let up = upper_one(c);
+        let small = up != c;
+        match out.last_mut() {
+            Some((s, was)) if *was == small => s.push(up),
+            _ => out.push((up.to_string(), small)),
+        }
+    }
+    if out.is_empty() {
+        out.push((String::new(), false));
+    }
+    out
+}
+
+/// The width of a run's `text` as [`shown_case`] draws it at `size` px:
+/// each piece measured in the size it is drawn at.
+pub fn shown_case_width(
+    text: &str,
+    props: &RunProps,
+    size: f32,
+    width: impl Fn(&str, f32) -> f32,
+) -> f32 {
+    shown_case(text, props)
+        .iter()
+        .map(|(s, small)| width(s, if *small { size * SMALL_CAPS } else { size }))
+        .sum()
+}
+
 /// A tab's parsed `word/styles.xml`, its theme fonts applied (#1972), kept
 /// across frames, with its numbering part and theme colours (#2231). Each is
 /// read again only when the package's parts moved
@@ -186,6 +243,63 @@ mod tests {
         <w:style w:type="paragraph" w:styleId="Heading1"><w:rPr><w:b/><w:sz w:val="32"/>
         <w:color w:val="1F3864"/><w:rFonts w:ascii="Georgia"/></w:rPr></w:style>
         <w:style w:type="character" w:styleId="Strong"><w:rPr><w:b/></w:rPr></w:style></w:styles>"#;
+
+    fn cased(caps: bool, small_caps: bool) -> RunProps {
+        RunProps {
+            caps,
+            small_caps,
+            ..Default::default()
+        }
+    }
+
+    /// All caps draws the text in capitals, character for character (#2087).
+    #[test]
+    fn all_caps_draws_capitals_keeping_the_char_count_2087() {
+        let shown = shown_case("Note: straße", &cased(true, false));
+        assert_eq!(shown, [("NOTE: STRAßE".to_string(), false)]);
+        assert_eq!(shown[0].0.chars().count(), "Note: straße".chars().count());
+        // All caps wins over small caps: one full-size piece.
+        assert_eq!(
+            shown_case("ab", &cased(true, true)),
+            [("AB".to_string(), false)]
+        );
+        // A plain run is as stored.
+        assert_eq!(
+            shown_case("Ab", &cased(false, false)),
+            [("Ab".to_string(), false)]
+        );
+    }
+
+    /// Small caps draws lowercase letters as capitals at 0.8 of the size,
+    /// capitals and everything else at full size, in pieces of one size,
+    /// character for character with the stored text (#2087).
+    #[test]
+    fn small_caps_draws_lowercase_as_smaller_capitals_2087() {
+        let shown = shown_case("Hello World 2ß", &cased(false, true));
+        let s = |t: &str, small| (t.to_string(), small);
+        assert_eq!(
+            shown,
+            [
+                s("H", false),
+                s("ELLO", true),
+                s(" W", false),
+                s("ORLD", true),
+                s(" 2ß", false),
+            ]
+        );
+        let total: usize = shown.iter().map(|(t, _)| t.chars().count()).sum();
+        assert_eq!(total, "Hello World 2ß".chars().count());
+        assert_eq!(shown_case("", &cased(false, true)), [s("", false)]);
+        // Measured piece by piece at the size it is drawn at.
+        let w = shown_case_width("Ab", &cased(false, true), 10.0, |t, size| {
+            t.chars().count() as f32 * size
+        });
+        assert_eq!(w, 10.0 + 10.0 * SMALL_CAPS);
+        let w = shown_case_width("Ab", &cased(true, false), 10.0, |t, size| {
+            t.chars().count() as f32 * size
+        });
+        assert_eq!(w, 20.0);
+    }
 
     fn run(style: Option<&str>) -> Run {
         Run {

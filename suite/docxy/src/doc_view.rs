@@ -1731,7 +1731,7 @@ impl Render for DocView {
             .map(|pkg| pictures::Pictures::new(pkg, &self.pictures));
         let spans = self.editor.selection_spans();
         let body = &self.editor.doc.body;
-        let markers = list_markers(body);
+        let markers = list_markers(body, tbl.numbering.as_deref());
         let target = DocTarget::Embed(cx.entity().downgrade(), self.words.clone());
         // Editable, the caret draws while the view has the keys (#1947),
         // not while the Find box's field has them (#1887).

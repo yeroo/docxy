@@ -24,6 +24,13 @@
 # is every run at 4.5:1 or more. Each read follows a `shot`, which waits
 # for the frame after the change.
 #
+# #2087: `inks.markers` is the list numbers drawn, in paint order: the
+# two-column table's numbered list (numId 1, decimal in the fixture's
+# numbering part) draws 1. 2. 3. in its cell, the hanging indent taking
+# each number's space. `inks.cased` is the runs drawn in another case than
+# stored: the figure labels and the callout label are `w:caps` runs typed
+# in mixed case, drawn in capitals.
+#
 # `theme-set` applies the theme to the window at once, not at its next
 # frame: its `applied` is the window's applied theme, which Switch Modes
 # reads, so a Switch Modes click right after it takes (#2095: the click
@@ -43,6 +50,9 @@ test issue 2079 a dark theme draws the document as Word's dark mode does, every 
   assert reply.page_color is 262626
   assert reply.inks.runs is not 0
   assert reply.inks.all_readable is true
+  # The cell's list numbers and the caps runs (#2087).
+  assert reply.inks.markers is 1. 2. 3.
+  assert reply.inks.cased is REVENUE | CUSTOMERS | MARGIN | NOTE
   # Print Layout: the same, on the sheet.
   call ribbon-click {"tab":"View","command":"Print Layout"}
   assert view.layout is print
@@ -52,6 +62,8 @@ test issue 2079 a dark theme draws the document as Word's dark mode does, every 
   assert reply.page_color is 262626
   assert reply.inks.runs is not 0
   assert reply.inks.all_readable is true
+  assert reply.inks.markers is 1. 2. 3.
+  assert reply.inks.cased is REVENUE | CUSTOMERS | MARGIN | NOTE
   # An open header: its runs read on the ground they were chosen for (the
   # palette's own, so this cannot see a tint painted under the wrong
   # palette: `an_open_header_on_a_dark_page_keeps_its_text_readable_2079`
@@ -98,6 +110,9 @@ test issue 2079 Switch Modes shows the light page on a dark theme, and a light t
   call doc {}
   assert reply.page_mode is light
   assert reply.page_color is ffffff
+  # The light page draws the cell's numbers and the capitals too (#2087).
+  assert reply.inks.markers is 1. 2. 3.
+  assert reply.inks.cased is REVENUE | CUSTOMERS | MARGIN | NOTE
   # Back to the dark page.
   call ribbon-click {"tab":"View","command":"Switch Modes"}
   shot window
@@ -125,6 +140,7 @@ test issue 2079 Switch Modes shows the light page on a dark theme, and a light t
   assert reply.inks.all_readable is false
   assert reply.inks.worst.ink is 7f7f7f
   assert reply.inks.worst.ground is ffffff
+  assert reply.inks.markers is 1. 2. 3.
   call ribbon-click {"tab":"View","command":"Print Layout"}
   assert view.layout is web
   call theme-set {"theme":"auto"}

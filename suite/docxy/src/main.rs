@@ -7945,6 +7945,7 @@ mod link_colour_tests {
             text: text.into(),
             ink,
             ground,
+            kind: InkKind::Run,
         };
         let j = painted_inks_json(&[]);
         assert_eq!(j.get("runs").and_then(|v| v.as_f64()), Some(0.));
@@ -7961,6 +7962,31 @@ mod link_colour_tests {
         assert_eq!(worst.get_str("ground"), Some("262626"));
         let j = painted_inks_json(&[ink("ok", 0xF2F2F2, 0x262626)]);
         assert_eq!(j.get("all_readable").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    /// The `inks` list the list numbers drawn and the runs drawn in another
+    /// case (#2087), each in paint order; both empty when there are none.
+    #[test]
+    fn painted_inks_list_the_markers_and_the_cased_runs_2087() {
+        let ink = |text: &str, kind| PaintedInk {
+            text: text.into(),
+            ink: 0xF2F2F2,
+            ground: 0x262626,
+            kind,
+        };
+        let j = painted_inks_json(&[ink("plain", InkKind::Run)]);
+        assert_eq!(j.get_str("markers"), Some(""));
+        assert_eq!(j.get_str("cased"), Some(""));
+        let j = painted_inks_json(&[
+            ink("1.", InkKind::Marker),
+            ink("Note", InkKind::Run),
+            ink("NOTE", InkKind::Cased),
+            ink("2.", InkKind::Marker),
+            ink("FIG", InkKind::Cased),
+        ]);
+        assert_eq!(j.get_str("markers"), Some("1. 2."));
+        assert_eq!(j.get_str("cased"), Some("NOTE | FIG"));
+        assert_eq!(j.get("runs").and_then(|v| v.as_f64()), Some(5.));
     }
 
     #[test]
@@ -11173,6 +11199,19 @@ struct PaintedInk {
     text: String,
     ink: u32,
     ground: u32,
+    kind: InkKind,
+}
+
+/// What a [`PaintedInk`] is (#2087).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum InkKind {
+    /// A run drawn as stored.
+    Run,
+    /// A run drawn in another case than stored (All caps or Small caps):
+    /// its `text` is as drawn.
+    Cased,
+    /// A list number or bullet.
+    Marker,
 }
 
 /// The [`PaintedInk`]s of the frame last drawn.
@@ -11183,9 +11222,19 @@ type PaintedInks = std::rc::Rc<std::cell::RefCell<Vec<PaintedInk>>>;
 /// on its ground, two decimals; `null` with none), `all_readable` (every run
 /// at [`dark_page::TEXT_FLOOR`] or more: a case asserts only `is`) and
 /// `worst` (that run's `text`, `ink` and `ground`, `rrggbb`; `null` with
-/// none).
+/// none). `markers` is the list numbers and bullets in paint order, joined
+/// by a space, and `cased` the text of the runs drawn in another case than
+/// stored (All caps, Small caps), as drawn, joined by ` | ` (#2087).
 fn painted_inks_json(inks: &[PaintedInk]) -> ctlcore::json::Json {
     use ctlcore::json::Json;
+    let joined = |kind: InkKind, sep: &str| {
+        let texts: Vec<&str> = inks
+            .iter()
+            .filter(|i| i.kind == kind)
+            .map(|i| i.text.as_str())
+            .collect();
+        Json::Str(texts.join(sep))
+    };
     let rated = |i: &PaintedInk| dark_page::contrast(i.ink, i.ground);
     let worst = inks.iter().min_by(|a, b| rated(a).total_cmp(&rated(b)));
     let hex = |c: u32| Json::Str(format!("{c:06x}"));
@@ -11201,6 +11250,8 @@ fn painted_inks_json(inks: &[PaintedInk]) -> ctlcore::json::Json {
             "all_readable",
             Json::Bool(worst.is_none_or(|w| rated(w) >= dark_page::TEXT_FLOOR)),
         ),
+        ("markers", joined(InkKind::Marker, " ")),
+        ("cased", joined(InkKind::Cased, " | ")),
         (
             "worst",
             worst.map_or(Json::Null, |w| {
@@ -35462,6 +35513,98 @@ mod repeat_tests {
         assert_ne!(ed.doc, tabbed, "the repeat outdented");
     }
 
+    /// A list the package's numbering defines draws as its level's format
+    /// says (#2087): a Word document's numId 1 decimal list is numbered, not
+    /// bulleted, a defined bullet level is a bullet whatever its numId, and
+    /// a list no part defines keeps docxy's own rule (2 numbered, 1 a bullet).
+    #[test]
+    fn list_markers_follow_the_numbering_part_2087() {
+        use docxcore::model::{Block, ParProps, Paragraph};
+        let p = |num_id, ilvl| {
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    num_id: Some(num_id),
+                    ilvl,
+                    ..ParProps::default()
+                },
+                content: Vec::new(),
+            })
+        };
+        let numbering = docxcore::numbering::parse_numbering_xml(
+            r#"<w:numbering>
+            <w:abstractNum w:abstractNumId="0">
+              <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+              <w:lvl w:ilvl="1"><w:numFmt w:val="bullet"/><w:lvlText w:val="o"/></w:lvl></w:abstractNum>
+            <w:abstractNum w:abstractNumId="1">
+              <w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="-"/></w:lvl></w:abstractNum>
+            <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+            <w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>
+            </w:numbering>"#,
+        );
+        let s = |m: &str| Some(m.to_string());
+        let body = [p(1, 0), p(1, 0), p(1, 1), p(1, 0)];
+        assert_eq!(
+            list_markers(&body, Some(&numbering)),
+            [s("1. "), s("2. "), s("\u{25E6} "), s("1. ")]
+        );
+        // numId 2 is a bullet list here, not docxy's own numbered one.
+        assert_eq!(
+            list_markers(&[p(2, 0), p(2, 0)], Some(&numbering)),
+            [s("\u{2022} "), s("\u{2022} ")]
+        );
+        // Undefined (numId 7, or no numbering part): docxy's own rule.
+        for numbering in [Some(&numbering), None] {
+            assert_eq!(list_markers(&[p(7, 0)], numbering), [s("\u{2022} ")]);
+        }
+        assert_eq!(
+            list_markers(&body[..2], None),
+            [s("\u{2022} "), s("\u{2022} ")]
+        );
+        assert_eq!(
+            list_markers(&[p(2, 0), p(2, 0)], None),
+            [s("1. "), s("2. ")]
+        );
+    }
+
+    /// A table's list counts on from cell to cell (#2087): an item per row
+    /// beside a cell of other text is 1., 2., 3., as Word draws it; a
+    /// paragraph after an item in the same cell restarts it.
+    #[test]
+    fn a_table_list_counts_on_across_its_cells_2087() {
+        use docxcore::model::{Block, ParProps, Paragraph};
+        let item = Block::Paragraph(Paragraph {
+            props: ParProps {
+                num_id: Some(NUM_DECIMAL),
+                ..ParProps::default()
+            },
+            content: Vec::new(),
+        });
+        let text = Block::Paragraph(Paragraph::default());
+        let s = |m: &str| Some(m.to_string());
+        let mut counts = TableListCounts::new();
+        let mut shown = Vec::new();
+        for _ in 0..3 {
+            shown.push(counts.cell(std::slice::from_ref(&item), None));
+            assert_eq!(counts.cell(std::slice::from_ref(&text), None), [None]);
+        }
+        assert_eq!(shown, [[s("1. ")], [s("2. ")], [s("3. ")]]);
+        // A cell of text before its item keeps the count going.
+        assert_eq!(
+            counts.cell(&[text.clone(), item.clone()], None),
+            [None, s("4. ")]
+        );
+        // Text after an item in its cell restarts it.
+        assert_eq!(
+            counts.cell(&[item.clone(), text.clone(), item.clone()], None),
+            [s("5. "), None, s("1. ")]
+        );
+        // The body restarts after any paragraph.
+        assert_eq!(
+            list_markers(&[item.clone(), text, item], None),
+            [s("1. "), None, s("1. ")]
+        );
+    }
+
     /// `w:numId="0"` is "no numbering" (#1728): no marker, a plain paragraph
     /// that ends the list, and no list package for a new document.
     #[test]
@@ -35483,7 +35626,7 @@ mod repeat_tests {
             p(Some(NUM_DECIMAL)),
         ];
         assert_eq!(
-            list_markers(&body),
+            list_markers(&body, None),
             [
                 Some("1. ".to_string()),
                 Some("2. ".to_string()),
@@ -37803,19 +37946,22 @@ fn emit_words(
         };
         // Render each word as a StyledText so its TextLayout gives pixel-exact
         // hit-testing (index_for_position), for a true click-anywhere caret.
-        let word_str = word.to_string();
+        // A piece of it as drawn (#2087: in capitals, a small-caps piece
+        // smaller), starting `word_off` chars into the paragraph: its text
+        // is the stored text's char for char, so the offsets are the
+        // stored text's.
         let probe = click.is_some_and(|c| c.probe_only);
-        let styled = StyledText::new(word_str.clone());
-        let layout = styled.layout().clone();
-        if let Some(c) = click {
-            c.words.borrow_mut().push(WordSpan {
-                shape: SpanShape::Text(layout.clone()),
-                off: if probe { seg_start } else { word_off },
-                len: if probe { 0 } else { word_str.chars().count() },
-                trailing_space: !probe && word_str.ends_with(' '),
-            });
-        }
-        out.push(
+        let piece = |word_str: String, word_off: usize, size: f32| -> AnyElement {
+            let styled = StyledText::new(word_str.clone());
+            let layout = styled.layout().clone();
+            if let Some(c) = click {
+                c.words.borrow_mut().push(WordSpan {
+                    shape: SpanShape::Text(layout.clone()),
+                    off: if probe { seg_start } else { word_off },
+                    len: if probe { 0 } else { word_str.chars().count() },
+                    trailing_space: !probe && word_str.ends_with(' '),
+                });
+            }
             div()
                 .child(styled)
                 .text_size(px(size))
@@ -37890,8 +38036,39 @@ fn emit_words(
                             }
                         })
                 })
-                .into_any_element(),
-        );
+                .into_any_element()
+        };
+        let pieces = run_look::shown_case(word, props);
+        if let [(shown, small)] = pieces.as_slice() {
+            let size = if *small {
+                size * run_look::SMALL_CAPS
+            } else {
+                size
+            };
+            out.push(piece(shown.clone(), word_off, size));
+        } else {
+            // A small-caps word of two sizes: one box, so it never wraps
+            // inside.
+            let mut at = word_off;
+            let row = pieces.into_iter().map(|(shown, small)| {
+                let len = shown.chars().count();
+                let size = if small {
+                    size * run_look::SMALL_CAPS
+                } else {
+                    size
+                };
+                let el = piece(shown, at, size);
+                at += len;
+                el
+            });
+            out.push(
+                div()
+                    .flex()
+                    .flex_none()
+                    .children(row.collect::<Vec<_>>())
+                    .into_any_element(),
+            );
+        }
     }
 }
 
@@ -38725,10 +38902,13 @@ fn inline_width(
     room: Option<f32>,
 ) -> f32 {
     match it {
+        // Its text as drawn (#2087: caps, small caps at their size).
         Inline::Run(r) => {
             let props = styler.shown(r);
             let sz = run_look::run_size_px(&props, base, zoom);
-            m.width_in(&r.text, sz, props.bold, props.italic, props.font.as_deref())
+            run_look::shown_case_width(&r.text, &props, sz, |t, size| {
+                m.width_in(t, size, props.bold, props.italic, props.font.as_deref())
+            })
         }
         // Its shown text ([`field_live`]: the result, or a header/footer page
         // field's live value, #1437) and its 2 px padding each side.
@@ -38887,15 +39067,66 @@ fn has_page_break(b: &Block) -> bool {
     matches!(b, Block::Paragraph(p) if p.content.iter().any(|i| matches!(i, Inline::Break(docxcore::model::BreakKind::Page, _))))
 }
 
-/// The list markers (`1.`, `•`) for a body's paragraphs, by block index.
-fn list_markers(body: &[Block]) -> Vec<Option<String>> {
+/// The list markers (`1.`, `•`) for a body's or a table cell's paragraphs,
+/// by block index. A list the package's numbering defines is numbered or
+/// bulleted as its level's format says (#2087: a Word document's numId 1 is
+/// often its decimal list); any other keeps docxy's own rule, numId 2
+/// (`NUM_DECIMAL`) numbered and the rest bulleted, for its lists before the
+/// first save writes their definitions. Numbers count within `body` and
+/// restart after any paragraph that is not a list item.
+fn list_markers(
+    body: &[Block],
+    numbering: Option<&docxcore::numbering::Numbering>,
+) -> Vec<Option<String>> {
+    list_markers_counting(body, numbering, &mut Vec::new(), true)
+}
+
+/// A table's list markers, cell by cell in reading order (#2087): each
+/// cell's [`list_markers`], counting on from the cells before it, as Word
+/// numbers a list with an item per row 1, 2, 3. Within a cell a paragraph
+/// that is not a list item restarts the count only after an item of that
+/// cell, so a cell of other text beside the items keeps the count going.
+struct TableListCounts(Vec<u32>);
+
+impl TableListCounts {
+    fn new() -> Self {
+        TableListCounts(Vec::new())
+    }
+
+    /// The markers of the next cell's `blocks`.
+    fn cell(
+        &mut self,
+        blocks: &[Block],
+        numbering: Option<&docxcore::numbering::Numbering>,
+    ) -> Vec<Option<String>> {
+        list_markers_counting(blocks, numbering, &mut self.0, false)
+    }
+}
+
+/// [`list_markers`] from `counts` on, left as the last block leaves them. A
+/// block that is not a list item restarts the count when `restart_any`, or
+/// else only after a list item of `blocks`.
+fn list_markers_counting(
+    body: &[Block],
+    numbering: Option<&docxcore::numbering::Numbering>,
+    counts: &mut Vec<u32>,
+    restart_any: bool,
+) -> Vec<Option<String>> {
+    use docxcore::numbering::NumFmt;
+    let numbered = |num_id: i32, ilvl: i32| match numbering.filter(|n| n.defines(num_id)) {
+        Some(n) => n
+            .level(num_id, ilvl)
+            .is_none_or(|l| l.format != NumFmt::Bullet),
+        None => num_id == NUM_DECIMAL,
+    };
     let mut out = Vec::with_capacity(body.len());
-    let mut counts: Vec<u32> = Vec::new();
+    let mut had_item = false;
     for b in body {
         let marker = match b {
             Block::Paragraph(p) if p.props.in_list() => {
+                had_item = true;
                 let ilvl = p.props.ilvl as usize;
-                if p.props.num_id == Some(NUM_DECIMAL) {
+                if p.props.num_id.is_some_and(|n| numbered(n, p.props.ilvl)) {
                     if counts.len() <= ilvl {
                         counts.resize(ilvl + 1, 0);
                     }
@@ -38912,7 +39143,9 @@ fn list_markers(body: &[Block]) -> Vec<Option<String>> {
                 }
             }
             _ => {
-                counts.clear();
+                if restart_any || had_item {
+                    counts.clear();
+                }
                 None
             }
         };
@@ -39217,7 +39450,9 @@ fn paragraph_el(
             Some(m) => {
                 let props = styler.shown(r);
                 let sz = run_look::run_size_px(&props, base, zoom);
-                m.width_in(&r.text, sz, props.bold, props.italic, props.font.as_deref())
+                run_look::shown_case_width(&r.text, &props, sz, |t, size| {
+                    m.width_in(t, size, props.bold, props.italic, props.font.as_deref())
+                })
             }
             None => 0.0,
         }
@@ -39273,6 +39508,7 @@ fn paragraph_el(
                         text: m.to_string(),
                         ink: rgb_u(look.ink),
                         ground: pal.ground,
+                        kind: InkKind::Marker,
                     });
                 }
                 // The marker isn't document content and must not map clicks to offsets.
@@ -39341,6 +39577,14 @@ fn paragraph_el(
                     &mut spans, &r.text, &shown, base, in_link, &mut idx, &mut caret, sel, click,
                     pal, caret_h, zoom, band, shade,
                 );
+                // Its text as drawn (#2087).
+                let drawn = (shown.caps || shown.small_caps).then(|| {
+                    run_look::shown_case(&r.text, &shown)
+                        .into_iter()
+                        .map(|(t, _)| t)
+                        .collect::<String>()
+                });
+                let drawn = drawn.unwrap_or_else(|| r.text.clone());
                 if let Some(inks) = flow.inks {
                     if !r.text.trim().is_empty() {
                         // A highlighted run reads on its highlight (#2231),
@@ -39352,10 +39596,16 @@ fn paragraph_el(
                                 shade.unwrap_or(pal.ground),
                             ),
                         };
+                        let kind = if drawn == r.text {
+                            InkKind::Run
+                        } else {
+                            InkKind::Cased
+                        };
                         inks.borrow_mut().push(PaintedInk {
-                            text: r.text.clone(),
+                            text: drawn.clone(),
                             ink,
                             ground,
+                            kind,
                         });
                     }
                 }
@@ -39370,7 +39620,7 @@ fn paragraph_el(
                         len: idx - idx_before,
                         size: run_look::run_size_px(&shown, base, zoom),
                         ink: run_ink(&shown, in_link, &pal),
-                        text: r.text.clone(),
+                        text: drawn,
                     });
                 }
                 x += run_w(r);
@@ -39972,6 +40222,8 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
     // (#1477).
     let margin_rows = ctx.active && !hf && path.len() == 1 && ctx.ent.is_suite();
     let mut rows = Vec::new();
+    // The cells' list numbers count on from cell to cell (#2087).
+    let mut list_counts = TableListCounts::new();
     for (ri, rb) in boxes.iter().enumerate() {
         let row = &t.rows[ri];
         let mut cells: Vec<AnyElement> = Vec::new();
@@ -40002,13 +40254,16 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
             let inner: Vec<AnyElement> = if cb.continues {
                 Vec::new()
             } else {
+                // A cell's list items take their numbers and bullets as the
+                // body's do, counting on from the cells before it (#2087).
+                let markers = list_counts.cell(&cell.blocks, ctx.tbl.numbering.as_deref());
                 cell.blocks
                     .iter()
                     .enumerate()
                     .map(|(k, b)| {
                         let mut cp = path.to_vec();
                         cp.extend_from_slice(&[ri, cb.cell, k]);
-                        block_el(b, cp, None, cell_ctx)
+                        block_el(b, cp, markers[k].as_deref(), cell_ctx)
                     })
                     .collect()
             };
@@ -46359,7 +46614,6 @@ impl Render for Docxy {
                     } else {
                         Vec::new()
                     };
-                    let markers = list_markers(&shown.body);
                     let doc_ent = cx.entity();
                     let ent = DocTarget::Suite(doc_ent.clone());
                     // In Print Layout the sheet is white, or the document's page
@@ -46398,6 +46652,7 @@ impl Render for Docxy {
                     if self.draw_tool().is_some() {
                         tbl.draw = Some(self.draw_geom.clone());
                     }
+                    let markers = list_markers(&shown.body, tbl.numbering.as_deref());
                     let body_range = editor.cell_range();
                     // Inline pictures (#1432), kept across frames in the tab.
                     let pictures = tab
