@@ -715,9 +715,11 @@ probes. `Docxy::balloon_ctx` / `balloon_els` build the frame's context.
   `w:date` as the author's local wall time with a `Z` it ignores on load
   ([MS-OI29500] 17.13.4.2), so it is shown as written. Word's true UTC date,
   `w16cex:dateUtc` in `word/commentsExtensible.xml`, keyed by durable id
-  through `word/commentsIds.xml`'s paraId (`utc_dates`), is shown in the
-  local zone when present (`shown_date`; the current offset, so a DST
-  difference to the comment's date is not applied). A new comment is
+  through `word/commentsIds.xml`'s paraId, is read by docxcore's
+  `parse_comments` into `Comment::date_utc` (`parse_utc_dates`; never
+  written) and shown in the local zone when present (`shown_date`; the
+  current offset, so a DST difference to the comment's date is not
+  applied). A new comment is
   stamped as Word does: local wall time plus `Z` (`word_comment_date`).
   Revision dates stay UTC (`utc_now_iso`).
 - **Balloon.** Author (bold) with Resolve and × (the pane's

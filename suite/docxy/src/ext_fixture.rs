@@ -937,8 +937,9 @@ const FIXTURE_COMMENTS: [FixtureComment; 5] = [
 /// the adjacent words "near" and "words" of block 2's one short line (two
 /// anchors on one line: the second balloon is pushed down); 3's range from
 /// "range", the last word of block 3 (which wraps in both views), to "ends"
-/// in block 4 (across two paragraphs), its text long; 4 (resolved) on
-/// "closing" in block 5.
+/// in block 4 (across two paragraphs), its text long, its reference run in
+/// a tracked insertion (`w:ins`, as Word writes it with Track Changes on);
+/// 4 (resolved) on "closing" in block 5.
 #[cfg(test)]
 pub(crate) fn comments_docx(with_comments: bool) -> Vec<u8> {
     let start = |id: u32| {
@@ -953,6 +954,19 @@ pub(crate) fn comments_docx(with_comments: bool) -> Vec<u8> {
             format!(
                 "<w:commentRangeEnd w:id=\"{id}\"/><w:r><w:rPr><w:rStyle w:val=\"CommentReference\"/>\
                  </w:rPr><w:commentReference w:id=\"{id}\"/></w:r>"
+            )
+        } else {
+            String::new()
+        }
+    };
+    // Comment 3's end as Word writes it with Track Changes on: its
+    // reference run inside a tracked insertion.
+    let end_tracked = |id: u32| {
+        if with_comments {
+            format!(
+                "<w:commentRangeEnd w:id=\"{id}\"/><w:ins w:id=\"90\" w:author=\"Robin Hale\" \
+                 w:date=\"2026-11-17T12:10:00Z\"><w:r><w:rPr><w:rStyle w:val=\"CommentReference\"/>\
+                 </w:rPr><w:commentReference w:id=\"{id}\"/></w:r></w:ins>"
             )
         } else {
             String::new()
@@ -989,7 +1003,7 @@ pub(crate) fn comments_docx(with_comments: bool) -> Vec<u8> {
         para(&format!(
             "{}{}",
             run("Delta ends"),
-            end(3) + &run(" it here.")
+            end_tracked(3) + &run(" it here.")
         )),
         para(&format!(
             "{}{}{}{}",
@@ -1133,6 +1147,20 @@ mod tests {
         // Comment 3's range is open at block 4's start.
         let body = crate::balloons::body_comments(&with.doc.body);
         assert_eq!(body.open_at.get(&vec![4]), Some(&vec!["3".to_string()]));
+        // Its reference is inside a tracked insertion.
+        let Block::Paragraph(p) = &with.doc.body[4] else {
+            panic!("block 4 is a paragraph");
+        };
+        let mut in_ins = Vec::new();
+        for inline in &p.content {
+            if let Inline::Revision { content, .. } = inline {
+                crate::balloons::inline_markers(content, &mut |k, id| in_ins.push((k, id)));
+            }
+        }
+        assert_eq!(
+            in_ins,
+            vec![(crate::balloons::Mark::Reference, "3".to_string())]
+        );
     }
 
     #[test]

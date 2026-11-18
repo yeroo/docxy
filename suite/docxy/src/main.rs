@@ -17115,12 +17115,33 @@ fn blank_base(doc: &Document) -> Package {
 
 /// Add a comment on `tab`'s selection: its markers go around the selection
 /// as one undo step, and the comment is stamped with `identity` (name,
-/// initials) and the UTC time (#620). Its id is one past every id the tab
+/// initials) and the time as Word stamps it, local wall time with a `Z`
+/// (#620, #2232: [`add_doc_comment_at`] now, in the local zone). Its id is
+/// one past every id the tab
 /// has used, an undone or deleted one included: one still in the base
 /// package would make the save keep that comment's text on the new markers,
 /// and one whose markers are in the body would keep the new comment live
 /// after its own undo. `None` with no selection.
 fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -> Option<i32> {
+    add_doc_comment_at(
+        tab,
+        text,
+        identity,
+        unix_now(),
+        gridcore::clock::local_offset_minutes(),
+    )
+}
+
+/// [`add_doc_comment`] at the moment `unix_secs`, in a zone `offset_min`
+/// ahead of UTC: the comment's `w:date` is that zone's wall time
+/// ([`balloons::word_comment_date`]).
+fn add_doc_comment_at(
+    tab: &mut DocTab,
+    text: String,
+    identity: (String, String),
+    unix_secs: i64,
+    offset_min: i64,
+) -> Option<i32> {
     let Surface::Doc(ed) = &tab.surface else {
         return None;
     };
@@ -17162,7 +17183,7 @@ fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -
         author,
         initials,
         // Word's comment stamp: local wall time with a `Z` (#2232).
-        date: balloons::word_comment_date(unix_now(), gridcore::clock::local_offset_minutes()),
+        date: balloons::word_comment_date(unix_secs, offset_min),
         text,
         quoted,
         ..Comment::default()
@@ -30233,14 +30254,8 @@ impl Docxy {
         }
         let selected = selected_comment_id(&self.tabs, self.active, &self.selected_comment);
         // `w:date` is shown as written; Word's true UTC date, where the
-        // package has one, in the local zone.
+        // package has one (`Comment::date_utc`), in the local zone.
         let offset = gridcore::clock::local_offset_minutes();
-        let utc = tab.pkg.as_ref().map_or_else(Default::default, |pkg| {
-            balloons::utc_dates(
-                pkg.part_text("word/commentsIds.xml").as_deref(),
-                pkg.part_text("word/commentsExtensible.xml").as_deref(),
-            )
-        });
         let mut looks = std::collections::HashMap::new();
         let mut drawn = Vec::new();
         for c in &margin {
@@ -30253,7 +30268,7 @@ impl Docxy {
             drawn.push(balloons::Drawn {
                 id: c.id.clone(),
                 author: c.author.clone(),
-                date: balloons::shown_date(c, &utc, offset),
+                date: balloons::shown_date(c, offset),
                 text: c.text.clone(),
                 look,
                 selected: selected.as_deref() == Some(c.id.as_str()),

@@ -336,8 +336,8 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 /// moved `offset_min` minutes (a zone that far ahead of UTC). A comment's
 /// `w:date` is the author's local wall time with a `Z` Word ignores
 /// ([MS-OI29500] 17.13.4.2), so it is shown as written (`offset_min` 0);
-/// only a true UTC date (`w16cex:dateUtc`, [`utc_dates`]) is moved to the
-/// local zone. `None` for a date that does not parse.
+/// only a true UTC date (`w16cex:dateUtc`, `Comment::date_utc`) is moved to
+/// the local zone. `None` for a date that does not parse.
 pub(crate) fn balloon_date(iso: &str, offset_min: i64) -> Option<String> {
     let t = docxcore::field::parse_iso(iso)?;
     if !(1..=12).contains(&t.month) || t.day == 0 || t.day > 31 || t.hour > 23 || t.min > 59 {
@@ -366,51 +366,13 @@ pub(crate) fn balloon_date(iso: &str, offset_min: i64) -> Option<String> {
     ))
 }
 
-/// Each comment's true UTC date, by the `w14:paraId` of its last paragraph
-/// (`Comment::para_id`): Word 2019 and later write `w16cex:dateUtc` in
-/// `word/commentsExtensible.xml` (`ext_xml`) keyed by a durable id, which
-/// `word/commentsIds.xml` (`ids_xml`) maps from the paraId. Empty when
-/// either part is missing.
-pub(crate) fn utc_dates(ids_xml: Option<&str>, ext_xml: Option<&str>) -> HashMap<String, String> {
-    let (Some(ids), Some(ext)) = (ids_xml, ext_xml) else {
-        return HashMap::new();
-    };
-    let tags = |xml: &str, name: &str| -> Vec<String> {
-        let open = format!("<{name}");
-        let mut out = Vec::new();
-        let mut from = 0;
-        while let Some(rel) = xml[from..].find(&open) {
-            let at = from + rel;
-            let end = xml[at..].find('>').map_or(xml.len(), |e| at + e);
-            // `<w16cid:commentIds` is the root, not an entry.
-            if xml[at + open.len()..].starts_with(|c: char| c.is_whitespace() || c == '/') {
-                out.push(xml[at..end].to_string());
-            }
-            from = end.max(at + 1);
-        }
-        out
-    };
-    let durable: HashMap<String, String> = tags(ext, "w16cex:commentExtensible")
-        .iter()
-        .filter_map(|t| Some((attr(t, "w16cex:durableId")?, attr(t, "w16cex:dateUtc")?)))
-        .collect();
-    tags(ids, "w16cid:commentId")
-        .iter()
-        .filter_map(|t| {
-            let para = attr(t, "w16cid:paraId")?;
-            let date = durable.get(&attr(t, "w16cid:durableId")?)?;
-            Some((para, date.clone()))
-        })
-        .collect()
-}
-
-/// The date a comment's balloon shows: its true UTC date in the local zone
-/// (`offset_min` ahead of UTC) when [`utc_dates`] has one, else its `w:date`
-/// as written. Empty when neither parses.
-pub(crate) fn shown_date(c: &Comment, utc: &HashMap<String, String>, offset_min: i64) -> String {
-    c.para_id
-        .as_ref()
-        .and_then(|p| utc.get(p))
+/// The date a comment's balloon shows: its true UTC date
+/// (`Comment::date_utc`, Word's `w16cex:dateUtc`) in the local zone
+/// (`offset_min` ahead of UTC) when it has one, else its `w:date` as
+/// written. Empty when neither parses.
+pub(crate) fn shown_date(c: &Comment, offset_min: i64) -> String {
+    c.date_utc
+        .as_deref()
         .and_then(|d| balloon_date(d, offset_min))
         .or_else(|| balloon_date(&c.date, 0))
         .unwrap_or_default()
@@ -1164,37 +1126,21 @@ mod tests {
 
     #[test]
     fn shown_date_prefers_words_utc_date_in_the_local_zone_2232() {
-        let ids = "<w16cid:commentsIds xmlns:w16cid=\"x\">\
-                   <w16cid:commentId w16cid:paraId=\"1A2B\" w16cid:durableId=\"7F00\"/>\
-                   <w16cid:commentId w16cid:paraId=\"3C4D\" w16cid:durableId=\"7F01\"/>\
-                   </w16cid:commentsIds>";
-        let ext = "<w16cex:commentsExtensible xmlns:w16cex=\"y\">\
-                   <w16cex:commentExtensible w16cex:durableId=\"7F00\" w16cex:dateUtc=\"2026-11-17T23:41:00Z\"/>\
-                   </w16cex:commentsExtensible>";
-        let utc = utc_dates(Some(ids), Some(ext));
-        assert_eq!(utc.len(), 1);
-        let c = |para: &str| Comment {
+        let c = |utc: Option<&str>| Comment {
             date: "2026-11-17T18:41:00Z".into(),
-            para_id: Some(para.into()),
+            date_utc: utc.map(Into::into),
             ..Comment::default()
         };
+        let utc = c(Some("2026-11-17T23:41:00Z"));
         // New York (UTC-5): the UTC date moved back to the author's 6:41 PM.
-        assert_eq!(
-            shown_date(&c("1A2B"), &utc, -300),
-            "November 17, 2026 at 6:41 PM"
-        );
+        assert_eq!(shown_date(&utc, -300), "November 17, 2026 at 6:41 PM");
         // In UTC+1 the same moment is past midnight.
-        assert_eq!(
-            shown_date(&c("1A2B"), &utc, 60),
-            "November 18, 2026 at 12:41 AM"
-        );
+        assert_eq!(shown_date(&utc, 60), "November 18, 2026 at 12:41 AM");
         // No UTC date: `w:date` as written, whatever the zone.
+        assert_eq!(shown_date(&c(None), 60), "November 17, 2026 at 6:41 PM");
+        // An unreadable UTC date falls back too.
         assert_eq!(
-            shown_date(&c("3C4D"), &utc, 60),
-            "November 17, 2026 at 6:41 PM"
-        );
-        assert_eq!(
-            shown_date(&c("1A2B"), &utc_dates(Some(ids), None), 60),
+            shown_date(&c(Some("?")), 60),
             "November 17, 2026 at 6:41 PM"
         );
     }

@@ -4,8 +4,9 @@
 # five comments by two made-up reviewers: three open (1 by Avery Lane on
 # "near", 2 by Robin Hale on "words", the next word on the same short line,
 # and 3 by Robin Hale from "range", block 3's last word, to "ends" in block
-# 4, its remark long) and two resolved (0 and 4). `comments-plain.docx` is
-# the same text with no comment.
+# 4, its remark long, its reference run in a tracked insertion) and two
+# resolved (0 and 4). `comments-plain.docx` is the same text with no
+# comment.
 #
 # `doc`'s `comments` is the markup area as last painted (window px): each
 # balloon's painted rect, its painted anchor (the reference mark's
@@ -51,6 +52,11 @@ test issue 2232 balloons show on open in Web Layout
   assert reply.comments.balloons.1.fill is ddebf7
   assert reply.comments.balloons.2.id is 3
   assert reply.comments.balloons.2.date is November 17, 2026 at 12:10 PM
+  # Comment 3's reference run is in a tracked insertion (Word's shape with
+  # Track Changes on): the painter draws it, so the balloon is anchored on
+  # the reference itself, not on the range's end.
+  assert reply.comments.balloons.2.anchor.kind is reference
+  assert reply.comments.balloons.0.anchor.kind is reference
   # The first is level with its line; the second, on the same line, is
   # pushed below it.
   assert reply.comments.balloons.0.pushed is false
@@ -95,6 +101,7 @@ test issue 2232 balloons show on open in Print Layout
   assert reply.comments.balloons.0.page is 1
   assert reply.comments.balloons.0.pushed is false
   assert reply.comments.balloons.1.pushed is true
+  assert reply.comments.balloons.2.anchor.kind is reference
   # The page moves left for the markup area: both are in view.
   assert reply.scroll.page_left_in_view is true
   assert reply.scroll.page_right_in_view is true

@@ -3098,8 +3098,9 @@ fn live_doc_state(app: &crate::Docxy, _window: &Window) -> Result<Json, String> 
 /// written, or Word's true UTC date in the local zone when the package has
 /// one: `balloons::shown_date`), `text`, `fill` / `ink` / `edge`
 /// (`rrggbb`), `selected`, `page` (1-based in Print Layout, else `null`),
-/// `rect` / `anchor` (`{x, y, line_top, line_h}`: the connector's start and
-/// its line) / `connector` (its three points), each `null` until painted,
+/// `rect` / `anchor` (`{kind, x, y, line_top, line_h}`: the connector's
+/// start, the marker it was painted by (`reference`, else the range's `end`
+/// or `start`) and its line) / `connector` (its three points), each `null` until painted,
 /// `pushed` (its top below its anchor's line top), `in_view` (wholly inside
 /// the view)), `count` (the balloons painted), `resolved_hidden` (the
 /// listed comments that are resolved, so have none), `stacked_ok` (the
@@ -3189,6 +3190,17 @@ fn comments_state(app: &crate::Docxy) -> Json {
                 "anchor",
                 anchor.map_or(Json::Null, |m| {
                     Json::obj(vec![
+                        (
+                            "kind",
+                            Json::Str(
+                                match m.kind {
+                                    crate::balloons::Mark::Reference => "reference",
+                                    crate::balloons::Mark::End => "end",
+                                    crate::balloons::Mark::Start => "start",
+                                }
+                                .into(),
+                            ),
+                        ),
                         ("x", num(m.x)),
                         ("y", num(m.mid)),
                         ("line_top", num(m.mid - m.line_h / 2.0)),

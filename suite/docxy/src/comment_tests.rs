@@ -76,13 +76,21 @@ fn is_word_date_time(s: &str) -> bool {
 
 /// The new comment's `w:date` is Word's stamp (#2232): the local wall time
 /// with a `Z`, as Word writes and reads it ([MS-OI29500] 17.13.4.2), not UTC.
+/// Stamped at 2026-11-17T18:41:00Z in a zone four hours ahead, it is
+/// written 22:41 (the UTC time would pass only at offset 0).
 #[test]
 fn new_comment_is_stamped_with_user_name_and_local_date() {
-    let before = crate::unix_now();
     let dir = Scratch::new();
     let (mut tab, path) = docx_tab(&dir, &fox_package());
     editor(&mut tab).select_all();
-    let id = add_doc_comment(&mut tab, "Colour?".into(), review_identity("Jane doe", "")).unwrap();
+    let id = crate::add_doc_comment_at(
+        &mut tab,
+        "Colour?".into(),
+        review_identity("Jane doe", ""),
+        1_794_940_860,
+        240,
+    )
+    .unwrap();
     assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
     let (_, comments) = saved(&path);
     let parsed = docxcore::comments::parse_comments_xml(&comments);
@@ -92,13 +100,19 @@ fn new_comment_is_stamped_with_user_name_and_local_date() {
     assert_eq!(c.author, "Jane doe");
     assert_eq!(c.initials, "JD");
     assert!(is_word_date_time(&c.date), "w:date {:?}", c.date);
+    assert_eq!(c.date, "2026-11-17T22:41:00Z", "UTC + 4 h");
+    // The app's own entry point stamps now, in the machine's zone.
+    let mut tab2 = docx_tab(&Scratch::new(), &fox_package()).0;
+    editor(&mut tab2).select_all();
+    let before = crate::unix_now();
+    add_doc_comment(&mut tab2, "Now?".into(), review_identity("Jane doe", "")).unwrap();
     let after = crate::unix_now();
+    let stamp = tab2.comments.last().unwrap().date.clone();
     let offset = gridcore::clock::local_offset_minutes();
     let minute = |secs: i64| crate::balloons::word_comment_date(secs, offset)[..16].to_string();
     assert!(
-        c.date[..16] == minute(before) || c.date[..16] == minute(after),
-        "w:date {:?} is not the local time between {} and {}",
-        c.date,
+        stamp[..16] == minute(before) || stamp[..16] == minute(after),
+        "w:date {stamp:?} is not the local time between {} and {}",
         minute(before),
         minute(after)
     );
