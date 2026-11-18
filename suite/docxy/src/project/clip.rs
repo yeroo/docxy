@@ -324,8 +324,8 @@ pub(crate) fn project_cut(tab: &mut DocTab) {
 /// `"\r\n"`) is one empty field, which pastes as an emptied cell. A lone CR
 /// breaks a line too, as the sheet's entry paste takes it. Control
 /// characters left in a field (from Word, say) are dropped, as the cell
-/// editor's paste and typed keys drop them (#1120); a field made only of
-/// them is an empty field.
+/// editor's paste (`LineEdit::paste` in `cell.rs`) and typed keys drop them
+/// (#1120); a field made only of them is an empty field.
 pub(crate) fn parse_tsv(text: &str) -> Vec<Vec<String>> {
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
     let text = text.strip_suffix('\n').unwrap_or(&text);

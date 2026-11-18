@@ -144,5 +144,6 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing Project file rea
   readers and the model setters do not filter.
 - The closed-editor paste (`suite/docxy/src/project/clip.rs` `parse_tsv`)
   takes a lone CR as a line break, as the sheet's entry paste does, and drops
-  `char::is_control` characters from each field, as `CellEditor::paste` does;
-  a field of only control characters is an empty field (it clears Name).
+  `char::is_control` characters from each field, as `LineEdit::paste`
+  (`suite/docxy/src/project/cell.rs`) does; a field of only control
+  characters is an empty field (it clears Name).
