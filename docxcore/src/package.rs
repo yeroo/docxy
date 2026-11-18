@@ -5053,7 +5053,7 @@ const COMMENT_EXTRAS: [(&str, &str, &str); 2] = [
 ];
 
 /// The part giving each comment its durable id, keyed by paragraph id.
-const COMMENTS_IDS: (&str, &str, &str) =
+pub(crate) const COMMENTS_IDS: (&str, &str, &str) =
     ("word/commentsIds.xml", "w16cid:commentId", "w16cid:paraId");
 
 /// The root start tag of one of the comment parts [`Package::comment_extras`]
@@ -5081,7 +5081,7 @@ pub struct CommentExtra {
 
 /// The part of per-comment entries keyed by the durable id (`commentsIds`)
 /// rather than the paragraph id: (part, entry element, its durableId attribute).
-const COMMENTS_EXTENSIBLE: (&str, &str, &str) = (
+pub(crate) const COMMENTS_EXTENSIBLE: (&str, &str, &str) = (
     "word/commentsExtensible.xml",
     "w16cex:commentExtensible",
     "w16cex:durableId",

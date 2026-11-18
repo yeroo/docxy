@@ -3236,6 +3236,18 @@
                     "body": "",
                     "shortcut": ""
                   }
+                },
+                {
+                  "id": "showcomments",
+                  "label": "Show Comments",
+                  "icon": "comment",
+                  "act": "ShowComments",
+                  "keyTip": "M",
+                  "tip": {
+                    "title": "Show Comments",
+                    "body": "",
+                    "shortcut": ""
+                  }
                 }
               ]
             },

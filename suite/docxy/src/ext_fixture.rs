@@ -872,12 +872,296 @@ pub(crate) fn sections_document() -> (Document, Package) {
     (doc, pkg)
 }
 
+/// One comment of the `comments` fixture (#2232; test-only: the UI case
+/// opens the files it wrote): its id, author, date,
+/// whether it is resolved and its text.
+#[cfg(test)]
+struct FixtureComment {
+    id: u32,
+    author: &'static str,
+    date: &'static str,
+    done: bool,
+    text: &'static str,
+}
+
+/// The `comments` fixture's comments (#2232): three open and two resolved,
+/// by two made-up reviewers. Their `w:date`s are local wall times, which a
+/// balloon shows as written (there is no `commentsExtensible.xml`), so the
+/// shown dates do not depend on the machine's zone.
+#[cfg(test)]
+const FIXTURE_COMMENTS: [FixtureComment; 5] = [
+    FixtureComment {
+        id: 0,
+        author: "Avery Lane",
+        date: "2026-11-16T09:00:00Z",
+        done: true,
+        text: "Settled: the title stays.",
+    },
+    FixtureComment {
+        id: 1,
+        author: "Avery Lane",
+        date: "2026-11-17T18:41:00Z",
+        done: false,
+        text: "Is this the right word?",
+    },
+    FixtureComment {
+        id: 2,
+        author: "Robin Hale",
+        date: "2026-11-17T12:05:00Z",
+        done: false,
+        text: "And this one, next to it?",
+    },
+    FixtureComment {
+        id: 3,
+        author: "Robin Hale",
+        date: "2026-11-17T12:10:00Z",
+        done: false,
+        text: "This range runs across two paragraphs, and this remark is long enough to \
+               wrap over several lines of its balloon, so the balloon reaches below the last \
+               line of the document and the view must make room under it to scroll it into \
+               sight.",
+    },
+    FixtureComment {
+        id: 4,
+        author: "Robin Hale",
+        date: "2026-11-16T10:30:00Z",
+        done: true,
+        text: "Done, thanks.",
+    },
+];
+
+/// The `comments` document (#2232) as `.docx` bytes, and with
+/// `with_comments` false the same text with no comment at all (the
+/// `comments-plain` twin the text layout is compared with). Six made-up
+/// paragraphs; comment 0 (resolved) on "Quarterly" in block 0; 1 and 2 on
+/// the adjacent words "near" and "words" of block 2's one short line (two
+/// anchors on one line: the second balloon is pushed down); 3's range from
+/// "range", the last word of block 3 (two lines by a `w:br`), to "ends"
+/// in block 4 (across two paragraphs), its text long, its reference run in
+/// a tracked insertion (`w:ins`, as Word writes it with Track Changes on);
+/// 4 (resolved) on "closing" in block 5.
+#[cfg(test)]
+pub(crate) fn comments_docx(with_comments: bool) -> Vec<u8> {
+    let start = |id: u32| {
+        if with_comments {
+            format!("<w:commentRangeStart w:id=\"{id}\"/>")
+        } else {
+            String::new()
+        }
+    };
+    let end = |id: u32| {
+        if with_comments {
+            format!(
+                "<w:commentRangeEnd w:id=\"{id}\"/><w:r><w:rPr><w:rStyle w:val=\"CommentReference\"/>\
+                 </w:rPr><w:commentReference w:id=\"{id}\"/></w:r>"
+            )
+        } else {
+            String::new()
+        }
+    };
+    // Comment 3's end as Word writes it with Track Changes on: its
+    // reference run inside a tracked insertion.
+    let end_tracked = |id: u32| {
+        if with_comments {
+            format!(
+                "<w:commentRangeEnd w:id=\"{id}\"/><w:ins w:id=\"90\" w:author=\"Robin Hale\" \
+                 w:date=\"2026-11-17T12:10:00Z\"><w:r><w:rPr><w:rStyle w:val=\"CommentReference\"/>\
+                 </w:rPr><w:commentReference w:id=\"{id}\"/></w:r></w:ins>"
+            )
+        } else {
+            String::new()
+        }
+    };
+    let body = [
+        para(&format!(
+            "{}{}{}{}",
+            start(0),
+            run("Quarterly"),
+            end(0),
+            run(" lorem notes")
+        )),
+        para(&run("Alpha lorem ipsum dolor sit amet.")),
+        para(&format!(
+            "{}{}{}{}{}{}{}",
+            run("Beta "),
+            start(1),
+            run("near"),
+            end(1),
+            run(" "),
+            start(2),
+            run("words") + &end(2) + &run(" here.")
+        )),
+        // Two short lines by an explicit break, so its line texts do not
+        // depend on the fonts' wrap.
+        para(&format!(
+            "{}<w:r><w:br/></w:r>{}{}{}",
+            run("Gamma lorem ipsum dolor sit amet."),
+            run("And then it starts a "),
+            start(3),
+            run("range")
+        )),
+        para(&format!(
+            "{}{}",
+            run("Delta ends"),
+            end_tracked(3) + &run(" it here.")
+        )),
+        para(&format!(
+            "{}{}{}{}",
+            run("Epsilon "),
+            start(4),
+            run("closing"),
+            end(4) + &run(" line.")
+        )),
+    ]
+    .concat();
+    let document = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<w:document xmlns:w=\"{W}\" xmlns:r=\"{R}\"><w:body>{body}{}</w:body></w:document>",
+        sect_pr("", 12240, 15840, 1440, "")
+    );
+    let comment_parts = if with_comments {
+        "<Override PartName=\"/word/comments.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml\"/>\
+<Override PartName=\"/word/commentsExtended.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.commentsExtended+xml\"/>"
+    } else {
+        ""
+    };
+    let ct = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+<Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
+{comment_parts}</Types>"
+    );
+    let rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/></Relationships>";
+    let doc_rels = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">{}</Relationships>",
+        if with_comments {
+            "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments\" Target=\"comments.xml\"/>\
+<Relationship Id=\"rId2\" Type=\"http://schemas.microsoft.com/office/2011/relationships/commentsExtended\" Target=\"commentsExtended.xml\"/>"
+        } else {
+            ""
+        }
+    );
+    let para_id = |id: u32| format!("1000000{id}");
+    let comments: String = FIXTURE_COMMENTS
+        .iter()
+        .map(|c| {
+            let initials = docxcore::comments::initials(c.author);
+            format!(
+                "<w:comment w:id=\"{}\" w:author=\"{}\" w:date=\"{}\" w:initials=\"{initials}\">\
+                 <w:p w14:paraId=\"{}\"><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p></w:comment>",
+                c.id,
+                c.author,
+                c.date,
+                para_id(c.id),
+                c.text
+            )
+        })
+        .collect();
+    let comments = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<w:comments xmlns:w=\"{W}\" xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\">{comments}</w:comments>"
+    );
+    let extended: String = FIXTURE_COMMENTS
+        .iter()
+        .map(|c| {
+            format!(
+                "<w15:commentEx w15:paraId=\"{}\" w15:done=\"{}\"/>",
+                para_id(c.id),
+                u8::from(c.done)
+            )
+        })
+        .collect();
+    let extended = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<w15:commentsEx xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\">{extended}</w15:commentsEx>"
+    );
+    let part = |n: &str, t: &str| (n.to_string(), t.as_bytes().to_vec());
+    let mut parts = vec![
+        part("[Content_Types].xml", &ct),
+        part("_rels/.rels", rels),
+        part("word/document.xml", &document),
+        part("word/_rels/document.xml.rels", &doc_rels),
+    ];
+    if with_comments {
+        parts.push(part("word/comments.xml", &comments));
+        parts.push(part("word/commentsExtended.xml", &extended));
+    }
+    docxcore::zipwrite::write_zip(&parts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use core::prelude::v1::test;
     use docxcore::editor::{Caret, Editor};
     use docxcore::model::{Block, Inline};
+
+    /// `uiharness/fixtures/comments.docx` and `comments-plain.docx` are
+    /// [`comments_docx`]'s bytes (#2232); `UPDATE_COMMENTS_FIXTURE=1` writes
+    /// them. The first loads with three open and two resolved comments, all
+    /// anchored in the body; the second with the same text and none.
+    #[test]
+    fn the_comments_fixture_files_are_current_2232() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures");
+        for (name, with) in [("comments.docx", true), ("comments-plain.docx", false)] {
+            let path = dir.join(name);
+            let bytes = comments_docx(with);
+            if std::env::var_os("UPDATE_COMMENTS_FIXTURE").is_some() {
+                std::fs::write(&path, &bytes).expect("write the fixture");
+            }
+            let on_disk = std::fs::read(&path).expect(name);
+            assert!(
+                on_disk == bytes,
+                "{name} is stale: run with UPDATE_COMMENTS_FIXTURE=1"
+            );
+        }
+        let with = crate::load_bytes(&comments_docx(true));
+        let plain = crate::load_bytes(&comments_docx(false));
+        let pkg = with.pkg.expect("a package");
+        let comments = docxcore::comments::parse_comments(&pkg);
+        let open: Vec<&str> = comments
+            .iter()
+            .filter(|c| !c.resolved)
+            .map(|c| c.id.as_str())
+            .collect();
+        assert_eq!(open, vec!["1", "2", "3"]);
+        assert_eq!(comments.iter().filter(|c| c.resolved).count(), 2);
+        let anchored = docxcore::inspect::comment_marker_ids(&with.doc);
+        assert_eq!(anchored.len(), 5);
+        let text = |d: &docxcore::model::Document| -> Vec<String> {
+            d.body
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Paragraph(p) => Some(p.plain_text()),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(text(&with.doc), text(&plain.doc));
+        assert_eq!(text(&with.doc)[2], "Beta near words here.");
+        // Comment 3's range is open at block 4's start.
+        let body = crate::balloons::body_comments(&with.doc.body);
+        assert_eq!(body.open_at.get(&vec![4]), Some(&vec!["3".to_string()]));
+        // Its reference is inside a tracked insertion.
+        let Block::Paragraph(p) = &with.doc.body[4] else {
+            panic!("block 4 is a paragraph");
+        };
+        let mut in_ins = Vec::new();
+        for inline in &p.content {
+            if let Inline::Revision { content, .. } = inline {
+                crate::balloons::inline_markers(content, &mut |k, id| in_ins.push((k, id)));
+            }
+        }
+        assert_eq!(
+            in_ins,
+            vec![(crate::balloons::Mark::Reference, "3".to_string())]
+        );
+    }
 
     #[test]
     fn the_fixture_document_has_a_link_a_table_and_a_resolving_picture() {

@@ -1087,6 +1087,10 @@ pub enum Region {
         row: usize,
         end: bool,
     },
+    /// A comment balloon of the document's markup area (#2232), as last
+    /// painted, by its comment id: `balloon:2` (its text, below its header
+    /// row), `balloon-resolve:2` or `balloon-delete:2` (its buttons).
+    Balloon(&'static str, &'static str),
 }
 
 /// The Quick Access Toolbar's probed parts [`Region::Qat`] names.
@@ -1236,6 +1240,17 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         }
         "backstage-content" if arg.is_none() => Ok(Region::BackstageContent),
         "backstage-rail" if arg.is_none() => Ok(Region::BackstageRail),
+        "balloon" | "balloon-resolve" | "balloon-delete" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or_else(|| format!("'{head}' needs a comment id, e.g. {head}:2"))?;
+            let part = match head.to_ascii_lowercase().as_str() {
+                "balloon-resolve" => "resolve",
+                "balloon-delete" => "delete",
+                _ => "body",
+            };
+            Ok(Region::Balloon(crate::plugin_ui::intern(a), part))
+        }
         "doc-line-start" | "doc-line-end" => {
             let a = arg.filter(|a| !a.is_empty()).ok_or_else(|| {
                 format!("'{head}' needs a block index, e.g. {head}:3 or {head}:3:1 for row 1")
@@ -1410,6 +1425,8 @@ pub fn region_name(region: Region) -> String {
         ),
         Region::FilterButton(c) => format!("filter-button:{}", gridcore::sheet::col_name(c)),
         Region::DocBar(name) => name.into(),
+        Region::Balloon(id, "body") => format!("balloon:{id}"),
+        Region::Balloon(id, part) => format!("balloon-{part}:{id}"),
     }
 }
 
@@ -3066,11 +3083,189 @@ fn live_doc_state(app: &crate::Docxy, _window: &Window) -> Result<Json, String> 
             "inks".into(),
             crate::painted_inks_json(&app.painted_inks.borrow()),
         ));
+        fields.push(("comments".into(), comments_state(app)));
         if let Some(tab) = app.tabs.get(app.active) {
             fields.push(("mail".into(), mail_state(tab)));
         }
     }
     Ok(doc)
+}
+
+/// The comment balloons' markup area as the last frame painted it (#2232),
+/// in window coordinates (px, rounded): `markup` (shown), `view` (`print`,
+/// `web` or `null`), `area` (`{x, w}`: the markup area's left and width),
+/// `balloons` (in body order: `id`, `author`, `date` as shown (`w:date` as
+/// written, or Word's true UTC date in the local zone when the package has
+/// one: `balloons::shown_date`), `text`, `fill` / `ink` / `edge`
+/// (`rrggbb`), `selected`, `page` (1-based in Print Layout, else `null`),
+/// `rect` / `anchor` (`{kind, x, y, line_top, line_h}`: the connector's
+/// start, the marker it was painted by (`reference`, else the range's `end`
+/// or `start`) and its line) / `connector` (its three points), each `null` until painted,
+/// `pushed` (its top below its anchor's line top), `in_view` (wholly inside
+/// the view)), `count` (the balloons painted), `resolved_hidden` (the
+/// listed comments that are resolved, so have none), `stacked_ok` (the
+/// painted balloons follow the stacking rule against their painted
+/// anchors: [`crate::balloons::stacked_ok`]), `connectors_ok` (each painted
+/// balloon has a painted anchor and a connector; the connector turns, within
+/// a pixel, on the page's (Print Layout) or the text column's (Web Layout)
+/// right edge as the ruler probe painted it, not as the markup area's own
+/// probes did; and the anchor lies left of that edge and the balloon right
+/// of it. The connector's ends are computed from the painted anchor and
+/// balloon, so they are not checked against them) and `all_readable` (every
+/// balloon's text reads on its fill at 4.5:1).
+fn comments_state(app: &crate::Docxy) -> Json {
+    use crate::balloons::{Rect, stacked_ok};
+    let st = app.balloon_state.borrow();
+    let probe = app.ruler_probe.borrow();
+    let num = |v: f32| Json::Num(f64::from(v.round()));
+    let hex = |c: u32| Json::Str(format!("{c:06x}"));
+    let rect_json = |r: &Rect| {
+        Json::obj(vec![
+            ("x", num(r.x)),
+            ("y", num(r.y)),
+            ("w", num(r.w)),
+            ("h", num(r.h)),
+        ])
+    };
+    let near = |a: f32, b: f32| (a - b).abs() <= 1.0;
+    let view_rect = probe.viewport;
+    let mut painted = Vec::new();
+    let mut connectors_ok = true;
+    let mut readable = true;
+    let mut balloons = Vec::new();
+    for d in &st.drawn {
+        let rect = st
+            .balloons
+            .iter()
+            .find(|(id, _)| *id == d.id)
+            .map(|(_, r)| *r);
+        let anchor = st.painted_anchor(&d.id);
+        let line_top = anchor.map(|m| m.mid - m.line_h / 2.0);
+        let conn = st
+            .connectors
+            .iter()
+            .find(|(id, _)| *id == d.id)
+            .map(|(_, c)| *c);
+        readable &= crate::dark_page::contrast(d.look.ink, d.look.fill) >= 4.5;
+        if let (Some(r), Some(top)) = (rect, line_top) {
+            painted.push((r, top));
+        }
+        if let Some(r) = rect {
+            // The right edge, from the ruler probe's painted page or column,
+            // not from the markup area's own probes.
+            let edge = match st.view {
+                Some(crate::balloons::View::Print) => probe
+                    .pages
+                    .get(d.page)
+                    .copied()
+                    .flatten()
+                    .map(|p| p.x + p.w),
+                _ => probe.draft_column.map(|c| c.x + c.w),
+            };
+            connectors_ok &= match (conn, anchor, edge) {
+                (Some(c), Some(m), Some(edge)) => {
+                    near(c[1].0, edge) && m.x < edge + 1.0 && r.x > edge - 1.0
+                }
+                _ => false,
+            };
+        }
+        balloons.push(Json::obj(vec![
+            ("id", Json::Str(d.id.clone())),
+            ("author", Json::Str(d.author.clone())),
+            ("date", Json::Str(d.date.clone())),
+            ("text", Json::Str(d.text.clone())),
+            ("fill", hex(d.look.fill)),
+            ("ink", hex(d.look.ink)),
+            ("edge", hex(d.look.edge)),
+            ("selected", Json::Bool(d.selected)),
+            (
+                "page",
+                match st.view {
+                    Some(crate::balloons::View::Print) => Json::Num(d.page as f64 + 1.0),
+                    _ => Json::Null,
+                },
+            ),
+            ("rect", rect.as_ref().map_or(Json::Null, rect_json)),
+            (
+                "anchor",
+                anchor.map_or(Json::Null, |m| {
+                    Json::obj(vec![
+                        (
+                            "kind",
+                            Json::Str(
+                                match m.kind {
+                                    crate::balloons::Mark::Reference => "reference",
+                                    crate::balloons::Mark::End => "end",
+                                    crate::balloons::Mark::Start => "start",
+                                }
+                                .into(),
+                            ),
+                        ),
+                        ("x", num(m.x)),
+                        ("y", num(m.mid)),
+                        ("line_top", num(m.mid - m.line_h / 2.0)),
+                        ("line_h", num(m.line_h)),
+                    ])
+                }),
+            ),
+            (
+                "connector",
+                conn.map_or(Json::Null, |c| {
+                    Json::Arr(
+                        c.iter()
+                            .map(|(x, y)| Json::Arr(vec![num(*x), num(*y)]))
+                            .collect(),
+                    )
+                }),
+            ),
+            (
+                "pushed",
+                Json::Bool(matches!((rect, line_top), (Some(r), Some(t)) if r.y > t + 1.0)),
+            ),
+            (
+                "in_view",
+                match (rect, view_rect) {
+                    (Some(r), Some(v)) => {
+                        Json::Bool(r.y >= v.y - 0.5 && r.bottom() <= v.y + v.h + 0.5)
+                    }
+                    _ => Json::Null,
+                },
+            ),
+        ]));
+    }
+    let area = match st.view {
+        Some(crate::balloons::View::Print) => st
+            .strips
+            .first()
+            .copied()
+            .flatten()
+            .map(|s| Json::obj(vec![("x", num(s.x)), ("w", num(st.area_w))])),
+        Some(crate::balloons::View::Web) => st
+            .column_right
+            .map(|x| Json::obj(vec![("x", num(x)), ("w", num(st.area_w))])),
+        None => None,
+    };
+    Json::obj(vec![
+        ("markup", Json::Bool(st.view.is_some())),
+        (
+            "view",
+            match st.view {
+                Some(crate::balloons::View::Print) => Json::Str("print".into()),
+                Some(crate::balloons::View::Web) => Json::Str("web".into()),
+                None => Json::Null,
+            },
+        ),
+        ("area", area.unwrap_or(Json::Null)),
+        ("count", Json::Num(st.balloons.len() as f64)),
+        ("resolved_hidden", Json::Num(st.resolved_hidden as f64)),
+        ("stacked_ok", Json::Bool(stacked_ok(&painted))),
+        (
+            "connectors_ok",
+            Json::Bool(connectors_ok && st.connectors.len() == st.balloons.len()),
+        ),
+        ("all_readable", Json::Bool(readable)),
+        ("balloons", Json::Arr(balloons)),
+    ])
 }
 
 /// The document view's scroll and scrollbars (#2080): `scroll_y` /
@@ -8945,6 +9140,7 @@ mod tests {
             tracked_comment_ids: Default::default(),
             comment_undo: Default::default(),
             comments_removed_all: false,
+            balloons_hidden: false,
             used_comment_ids: Default::default(),
             pictures: Default::default(),
             run_styles: Default::default(),

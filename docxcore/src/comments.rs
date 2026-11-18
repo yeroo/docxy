@@ -28,6 +28,11 @@ pub struct Comment {
     /// The `w14:paraId` of the comment's last paragraph, the key
     /// `commentsExtended.xml` and `commentsIds.xml` use for it.
     pub para_id: Option<String>,
+    /// Its true UTC date, `w16cex:dateUtc` (Word 2019 and later), where the
+    /// package has one ([`parse_utc_dates`]). `date` (`w:date`) is the
+    /// author's local wall time with a `Z` Word ignores ([MS-OI29500]
+    /// 17.13.4.2). Read only: a save never writes it.
+    pub date_utc: Option<String>,
 }
 
 /// The part holding each comment's `w15:done` (resolved) state.
@@ -51,6 +56,15 @@ pub fn parse_comments(pkg: &Package) -> Vec<Comment> {
     let mut comments = parse_comments_xml(xml);
     if comments.is_empty() {
         return comments;
+    }
+    if let (Some(ids), Some(ext)) = (
+        pkg.part_text(crate::package::COMMENTS_IDS.0),
+        pkg.part_text(crate::package::COMMENTS_EXTENSIBLE.0),
+    ) {
+        let utc = parse_utc_dates(&ids, &ext);
+        for c in &mut comments {
+            c.date_utc = c.para_id.as_ref().and_then(|id| utc.get(id)).cloned();
+        }
     }
     if let Some(ext) = pkg.part_text(COMMENTS_EXTENDED_PART) {
         let done = parse_comments_extended(&ext);
@@ -111,6 +125,32 @@ pub fn parse_comments_extended(xml: &str) -> HashMap<String, bool> {
             let done = crate::load::xml_attr_value(tag, "w15:done")
                 .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "on"));
             Some((id, done))
+        })
+        .collect()
+}
+
+/// Each comment's `w16cex:dateUtc`, by the `w14:paraId` of its last
+/// paragraph: `commentsExtensible.xml` (`ext_xml`) keys it by a durable id,
+/// which `commentsIds.xml` (`ids_xml`) maps from the paraId.
+pub fn parse_utc_dates(ids_xml: &str, ext_xml: &str) -> HashMap<String, String> {
+    use crate::load::{start_tags, xml_attr_value};
+    use crate::package::{COMMENTS_EXTENSIBLE, COMMENTS_IDS};
+    let (_, ext_tag, ext_key) = COMMENTS_EXTENSIBLE;
+    let by_durable: HashMap<String, String> = start_tags(ext_xml, ext_tag)
+        .into_iter()
+        .filter_map(|(_, t)| {
+            Some((
+                xml_attr_value(t, ext_key)?,
+                xml_attr_value(t, "w16cex:dateUtc")?,
+            ))
+        })
+        .collect();
+    let (_, ids_tag, ids_key) = COMMENTS_IDS;
+    start_tags(ids_xml, ids_tag)
+        .into_iter()
+        .filter_map(|(_, t)| {
+            let date = by_durable.get(&xml_attr_value(t, "w16cid:durableId")?)?;
+            Some((xml_attr_value(t, ids_key)?, date.clone()))
         })
         .collect()
 }
@@ -374,5 +414,48 @@ mod tests {
         assert_eq!(cs[0].quoted, "alpha");
         assert_eq!(cs[1].id, "2");
         assert_eq!(cs[1].quoted, "beta");
+        assert_eq!(cs[0].date_utc, None, "no commentsExtensible part");
+    }
+
+    /// #2232: Word 2019+'s true UTC date, `w16cex:dateUtc`, keyed by the
+    /// durable id `commentsIds.xml` gives the comment's last paragraph.
+    #[test]
+    fn parse_comments_reads_words_utc_date_through_the_durable_id() {
+        use crate::package::load_package;
+        use crate::zipwrite::write_zip;
+        let comments_xml = r#"<?xml version="1.0"?><w:comments xmlns:w="x" xmlns:w14="y">
+            <w:comment w:id="1" w:author="Ann" w:date="2026-11-17T18:41:00Z">
+              <w:p w14:paraId="1A2B"><w:r><w:t>one</w:t></w:r></w:p>
+            </w:comment>
+            <w:comment w:id="2" w:author="Bob" w:date="2026-11-17T09:00:00Z">
+              <w:p w14:paraId="3C4D"><w:r><w:t>two</w:t></w:r></w:p>
+            </w:comment>
+        </w:comments>"#;
+        let ids = r#"<?xml version="1.0"?><w16cid:commentsIds xmlns:w16cid="z">
+            <w16cid:commentId w16cid:paraId="1A2B" w16cid:durableId="7F00"/>
+            <w16cid:commentId w16cid:paraId="3C4D" w16cid:durableId="7F01"/>
+        </w16cid:commentsIds>"#;
+        let ext = r#"<?xml version="1.0"?><w16cex:commentsExtensible xmlns:w16cex="v">
+            <w16cex:commentExtensible w16cex:durableId="7F00" w16cex:dateUtc="2026-11-17T23:41:00Z"/>
+        </w16cex:commentsExtensible>"#;
+        let bytes = write_zip(&[
+            (
+                "[Content_Types].xml".into(),
+                r#"<?xml version="1.0"?><Types/>"#.into(),
+            ),
+            ("word/document.xml".into(), "<w:document/>".into()),
+            ("word/comments.xml".into(), comments_xml.into()),
+            ("word/commentsIds.xml".into(), ids.into()),
+            ("word/commentsExtensible.xml".into(), ext.into()),
+        ]);
+        let pkg = load_package(&bytes).expect("load");
+        let cs = parse_comments(&pkg);
+        let one = cs.iter().find(|c| c.id == "1").unwrap();
+        assert_eq!(one.date, "2026-11-17T18:41:00Z");
+        assert_eq!(one.date_utc.as_deref(), Some("2026-11-17T23:41:00Z"));
+        // No extensible entry for its durable id: none.
+        assert_eq!(cs.iter().find(|c| c.id == "2").unwrap().date_utc, None);
+        // The roots are not entries.
+        assert_eq!(parse_utc_dates(ids, ext).len(), 1);
     }
 }

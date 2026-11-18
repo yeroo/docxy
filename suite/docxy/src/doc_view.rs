@@ -1799,6 +1799,7 @@ impl Render for DocView {
             pictures: harness().then_some(&self.pictures_painted),
             siblings: None,
             block_gap: 0.0,
+            comments: None,
         };
         let scroll_area = match self.layout {
             DocLayout::Print => {
