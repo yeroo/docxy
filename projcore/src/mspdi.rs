@@ -2701,8 +2701,16 @@ fn tag(s: &mut String, depth: usize, name: &str, text: &str) {
     s.push_str(">\n");
 }
 
+/// Whether XML 1.0 allows `c` in a document (its `Char` production): tab,
+/// LF, CR and everything from U+0020 up but U+FFFE and U+FFFF (a `char` is
+/// never a surrogate). The Project writers drop any other character (#1120):
+/// a reference such as `&#11;` is not well-formed either.
+pub(crate) fn xml_char(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\r') || (c >= ' ' && !matches!(c, '\u{FFFE}' | '\u{FFFF}'))
+}
+
 fn esc_into(text: &str, out: &mut String) {
-    for c in text.chars() {
+    for c in text.chars().filter(|&c| xml_char(c)) {
         match c {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
@@ -4588,6 +4596,44 @@ mod tests {
         );
         let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(package.tasks, with_scheduled_dates(&proj).tasks);
+    }
+
+    /// Issue #1120: characters XML 1.0 forbids are dropped from the save,
+    /// raw and as references alike, so it reads back with the rest of the
+    /// text in order; tab, LF and CR are written as before.
+    #[test]
+    fn xml_invalid_characters_are_dropped_from_the_save() {
+        let mut proj = task_project("<Task><UID>1</UID><Name>x</Name></Task>");
+        proj.tasks[0].name = "a\x0bb\x1bc\0d\u{FFFF}e\u{FFFE}\x01\x0c".into();
+        proj.tasks[0].notes = Some("n\x0b1\t2\r\n3\x1b".into());
+        let xml = write_mspdi(&proj);
+        for bad in ['\0', '\x01', '\x0b', '\x0c', '\x1b', '\u{FFFE}', '\u{FFFF}'] {
+            assert!(!xml.contains(bad), "{bad:?} in {xml}");
+        }
+        for reference in ["&#0;", "&#1;", "&#11;", "&#12;", "&#27;", "&#x"] {
+            assert!(!xml.contains(reference), "{reference} in {xml}");
+        }
+        assert!(xml.contains("<Name>abcde</Name>"), "{xml}");
+        assert!(xml.contains("<Notes>n1\t2&#13;\n3</Notes>"), "{xml}");
+        let back = read_mspdi(&xml).unwrap();
+        assert_eq!(back.tasks[0].name, "abcde");
+        // The reader folds CR LF into LF, as it did before.
+        assert_eq!(back.tasks[0].notes.as_deref(), Some("n1\t2\n3"));
+    }
+
+    #[test]
+    fn xml_char_is_the_xml_1_0_char_production() {
+        for ok in [
+            '\t', '\n', '\r', ' ', '\u{7f}', '\u{85}', '\u{D7FF}', '\u{E000}', '\u{FFFD}',
+        ] {
+            assert!(xml_char(ok), "{ok:?}");
+        }
+        assert!(xml_char('\u{10000}') && xml_char('\u{10FFFF}'));
+        for bad in [
+            '\0', '\x08', '\x0b', '\x0c', '\x0e', '\x1f', '\u{FFFE}', '\u{FFFF}',
+        ] {
+            assert!(!xml_char(bad), "{bad:?}");
+        }
     }
 
     /// Issue #185: entity references inside a CDATA section are literal
