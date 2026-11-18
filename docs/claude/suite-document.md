@@ -556,7 +556,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   on from cell to cell in reading order (`TableListCounts`): a list with an
   item per row draws 1., 2., 3., as in Word. Within a cell a paragraph that
   is not a list item restarts the count only after an item of that cell.
-  Nested tables count on their own. Not done: Word's document-wide counters
+  Each list (numId) counts on its own, so two numbered columns, or a bullet
+  column beside a numbered one, do not disturb each other (r1). Nested
+  tables count on their own. Not done: Word's document-wide counters
   (a list continuing past a paragraph, or from the body into a table) and
   letter, roman and `lvlText` shapes (drawn "N.").
 - All caps (`w:caps`) and Small caps (`w:smallCaps`), direct or from a

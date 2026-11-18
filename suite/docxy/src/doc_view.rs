@@ -632,7 +632,8 @@ impl DocView {
     /// read-only view places a caret and selects too; only an editable view
     /// runs the link commands.
     pub fn caret_format(&self) -> CaretFormat {
-        edit::caret_format(&self.editor)
+        let parts = self.run_styles.borrow_mut().parts(self.pkg.as_ref());
+        edit::caret_format(&self.editor, ListIds::of(parts.numbering.as_deref()))
     }
 
     /// The document as it is now, edits included: what the host exports.

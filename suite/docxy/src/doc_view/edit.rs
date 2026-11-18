@@ -692,15 +692,19 @@ pub(crate) fn apply_format(ed: &mut Editor, pkg: Option<&mut Package>, f: &DocFo
             Box::new(move |ed| ed.set_highlight(h))
         }
         DocFormat::Bullets | DocFormat::Numbering => {
-            let num = if *f == DocFormat::Bullets {
-                NUM_BULLET
-            } else {
-                NUM_DECIMAL
-            };
+            // The document's list (#2087): docxy's own 1 and 2, or its
+            // reserved one where the package defines those otherwise.
+            let bullet = *f == DocFormat::Bullets;
+            let ids = list_ids(pkg.as_deref());
             if let Some(pkg) = pkg {
-                pkg.add_markdown_numbering();
+                if ids.id(bullet) == ListIds::OWN.id(bullet) {
+                    pkg.add_markdown_numbering();
+                } else {
+                    ids.define(Some(pkg), bullet);
+                }
             }
-            Box::new(move |ed| ed.set_list((!ed.all_in_list(num)).then_some(num)))
+            let num = ids.id(bullet);
+            Box::new(move |ed| toggle_list(ed, num))
         }
         DocFormat::Indent | DocFormat::Outdent => {
             ed.break_undo_group();
@@ -735,8 +739,18 @@ fn link_step(ed: &mut Editor, f: impl FnOnce(&mut Editor) -> bool) -> Formatted 
     }
 }
 
-/// The formatting at `ed`'s caret.
-pub(crate) fn caret_format(ed: &Editor) -> CaretFormat {
+/// The lists Bullets and Numbering apply in `pkg` (#2087): [`ListIds::of`]
+/// its numbering part.
+pub(crate) fn list_ids(pkg: Option<&Package>) -> ListIds {
+    let numbering = pkg
+        .and_then(|p| p.part_text("word/numbering.xml"))
+        .map(|xml| docxcore::numbering::parse_numbering_xml(&xml));
+    ListIds::of(numbering.as_ref())
+}
+
+/// The formatting at `ed`'s caret, its list buttons over `lists`, the
+/// document's (#2087).
+pub(crate) fn caret_format(ed: &Editor, lists: ListIds) -> CaretFormat {
     let r = ed.caret_props_shown();
     CaretFormat {
         bold: r.bold,
@@ -747,8 +761,8 @@ pub(crate) fn caret_format(ed: &Editor) -> CaretFormat {
         size: r.size_half_pts.map(|h| h as f32 / 2.),
         color: r.color,
         highlight: r.highlight,
-        bullets: ed.all_in_list(NUM_BULLET),
-        numbering: ed.all_in_list(NUM_DECIMAL),
+        bullets: ed.all_in_list(lists.bullet),
+        numbering: ed.all_in_list(lists.decimal),
         align: ed.caret_para_props().align,
         link: ed.caret_link().map(|l| DocLink {
             text: l.text,
@@ -976,7 +990,7 @@ mod tests {
         // At a collapsed caret Bold is for what is typed next: no change yet.
         let f = apply_format(&mut ed, None, &DocFormat::Bold);
         assert!(f.ran && !f.changed);
-        assert!(caret_format(&ed).bold);
+        assert!(caret_format(&ed, ListIds::OWN).bold);
         type_text(&mut ed, "Beta");
         assert_eq!(
             runs(&ed, 0),
@@ -984,13 +998,13 @@ mod tests {
         );
         // The bold run's caret reads bold, the plain one's does not.
         ed.set_caret(Caret::at(vec![0], 8));
-        assert!(caret_format(&ed).bold);
+        assert!(caret_format(&ed, ListIds::OWN).bold);
         ed.set_caret(Caret::at(vec![0], 2));
-        assert!(!caret_format(&ed).bold);
+        assert!(!caret_format(&ed, ListIds::OWN).bold);
         // Bullets, then one undo: the list goes, the bold typing stays.
         assert!(apply_format(&mut ed, None, &DocFormat::Bullets).changed);
         assert_eq!(num(&ed, 0), (Some(NUM_BULLET), 0));
-        assert!(caret_format(&ed).bullets);
+        assert!(caret_format(&ed, ListIds::OWN).bullets);
         assert!(press(&mut ed, "ctrl-z")[0].changed());
         assert_eq!(num(&ed, 0).0, None);
         assert_eq!(
@@ -1006,13 +1020,13 @@ mod tests {
         assert!(press(&mut ed, "ctrl-b")[0].changed());
         assert!(runs(&ed, 0)[0].1);
         press(&mut ed, "ctrl-i ctrl-u");
-        let f = caret_format(&ed);
+        let f = caret_format(&ed, ListIds::OWN);
         assert!(f.bold && f.italic && f.underline);
         press(&mut ed, "ctrl-b");
-        assert!(!caret_format(&ed).bold);
+        assert!(!caret_format(&ed, ListIds::OWN).bold);
         // Each toggle was its own step.
         press(&mut ed, "ctrl-z");
-        assert!(caret_format(&ed).bold);
+        assert!(caret_format(&ed, ListIds::OWN).bold);
     }
 
     #[test]
@@ -1024,7 +1038,7 @@ mod tests {
         assert!(apply_format(&mut ed, None, &DocFormat::Color(Some("#1f7a3d".into()))).changed);
         assert!(apply_format(&mut ed, None, &DocFormat::Highlight(Some("yellow".into()))).changed);
         assert!(apply_format(&mut ed, None, &DocFormat::Align(Align::Center)).changed);
-        let f = caret_format(&ed);
+        let f = caret_format(&ed, ListIds::OWN);
         assert_eq!(f.font.as_deref(), Some("Georgia"));
         assert_eq!(f.size, Some(14.5));
         assert_eq!(f.color.as_deref(), Some("1F7A3D"));
@@ -1032,7 +1046,7 @@ mod tests {
         assert_eq!(f.align, Align::Center);
         assert!(apply_format(&mut ed, None, &DocFormat::Color(None)).changed);
         assert!(apply_format(&mut ed, None, &DocFormat::Highlight(None)).changed);
-        let f = caret_format(&ed);
+        let f = caret_format(&ed, ListIds::OWN);
         assert_eq!((f.color, f.highlight), (None, None));
         // What the view cannot run is refused and changes nothing.
         for bad in [
@@ -1055,7 +1069,7 @@ mod tests {
             (num(&ed, 0).0, num(&ed, 1).0),
             (Some(NUM_DECIMAL), Some(NUM_DECIMAL))
         );
-        assert!(caret_format(&ed).numbering);
+        assert!(caret_format(&ed, ListIds::OWN).numbering);
         assert!(apply_format(&mut ed, None, &DocFormat::Numbering).changed);
         assert_eq!((num(&ed, 0).0, num(&ed, 1).0), (None, None));
     }
@@ -1477,21 +1491,21 @@ mod tests {
         };
         let mut ed = editor(&["Say Beta now"]);
         select(&mut ed, 4, 8);
-        assert_eq!(caret_format(&ed).link, None);
+        assert_eq!(caret_format(&ed, ListIds::OWN).link, None);
         // A URL it refuses: not run, the selection kept.
         let out = apply_format(&mut ed, None, &insert("Beta", " "));
         assert_eq!((out.ran, out.changed), (false, false));
         assert!(ed.has_selection());
         let out = apply_format(&mut ed, None, &insert("Beta", "https://b.example/"));
         assert_eq!((out.ran, out.changed), (true, true));
-        let link = caret_format(&ed)
+        let link = caret_format(&ed, ListIds::OWN)
             .link
             .expect("the caret is at the link's end");
         assert_eq!(
             (link.text.as_str(), link.url.as_str()),
             ("Beta", "https://b.example/")
         );
-        assert!(caret_format(&ed).underline);
+        assert!(caret_format(&ed, ListIds::OWN).underline);
         // The same text and URL: run, nothing changed, no step.
         let steps = ed.undo_names().len();
         let edit_to = |text: &str, url: &str| DocFormat::EditLink {
@@ -1505,12 +1519,15 @@ mod tests {
         assert_eq!((out.ran, out.changed), (true, true));
         assert_eq!(text(&ed, 0), "Say Gamma now");
         assert_eq!(
-            caret_format(&ed).link.map(|l| l.url).as_deref(),
+            caret_format(&ed, ListIds::OWN)
+                .link
+                .map(|l| l.url)
+                .as_deref(),
             Some("#top")
         );
         let out = apply_format(&mut ed, None, &DocFormat::RemoveLink);
         assert_eq!((out.ran, out.changed), (true, true));
-        assert_eq!(caret_format(&ed).link, None);
+        assert_eq!(caret_format(&ed, ListIds::OWN).link, None);
         assert_eq!(text(&ed, 0), "Say Gamma now");
         // Off a link Edit and Remove do not run.
         let out = apply_format(&mut ed, None, &DocFormat::RemoveLink);
@@ -1524,7 +1541,10 @@ mod tests {
         );
         assert!(history(&mut ed, false).changed);
         assert_eq!(
-            caret_format(&ed).link.map(|l| l.text).as_deref(),
+            caret_format(&ed, ListIds::OWN)
+                .link
+                .map(|l| l.text)
+                .as_deref(),
             Some("Gamma")
         );
         assert!(history(&mut ed, false).changed);
@@ -1550,7 +1570,10 @@ mod tests {
         assert!(out.ran && out.changed);
         type_text(&mut ed, "x");
         assert_eq!(
-            caret_format(&ed).link.map(|l| l.text).as_deref(),
+            caret_format(&ed, ListIds::OWN)
+                .link
+                .map(|l| l.text)
+                .as_deref(),
             Some("https://u.example/x")
         );
         assert!(history(&mut ed, false).changed);
@@ -1700,7 +1723,7 @@ mod tests {
         });
         ed.set_styles_xml(None);
         ed.caret = Caret::at(vec![1, 0, 0, 0], 2);
-        let before = caret_format(&ed);
+        let before = caret_format(&ed, ListIds::OWN);
         assert!(before.bold);
         let mut pkg: Option<Package> = None;
         ed.caret = Caret::at(vec![0], 3);
@@ -1718,7 +1741,7 @@ mod tests {
         assert!(styles.is_some());
         ed.set_styles_xml(styles);
         ed.caret = Caret::at(vec![1, 0, 0, 0], 2);
-        assert_eq!(caret_format(&ed), before);
+        assert_eq!(caret_format(&ed, ListIds::OWN), before);
     }
 
     #[test]
@@ -2052,5 +2075,37 @@ mod tests {
         assert!(pkg.part_rel_target(BODY_PART, "rId2").is_none());
         let target = pkg.part_rel_target(BODY_PART, &rids[1]).unwrap();
         assert_eq!(pkg.part(&target), Some(&png(3, 2)[..]));
+    }
+
+    /// The embedded view's Bullets in a document whose numId 1 is decimal
+    /// (#2087 r1): docxy's reserved bullet list, defined in the package,
+    /// drawn as bullets and pressed; again, off.
+    #[test]
+    fn host_bullets_in_a_document_whose_list_one_is_numbered_2087() {
+        use docxcore::model::{Block, Document, Paragraph};
+        use docxcore::package::BULLET_LIST_NUM_ID;
+        let doc = Document {
+            body: vec![Block::Paragraph(Paragraph::default())],
+        };
+        let mut pkg = docxcore::package::new_package(doc.clone());
+        pkg.add_markdown_numbering();
+        assert!(pkg.set_part(
+            "word/numbering.xml",
+            br#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+                .to_vec()
+        ));
+        let mut ed = Editor::new(doc);
+        assert!(apply_format(&mut ed, Some(&mut pkg), &DocFormat::Bullets).ran);
+        let lists = list_ids(Some(&pkg));
+        assert_eq!(lists.bullet, BULLET_LIST_NUM_ID);
+        assert!(caret_format(&ed, lists).bullets);
+        let numbering =
+            docxcore::numbering::parse_numbering_xml(&pkg.part_text("word/numbering.xml").unwrap());
+        assert_eq!(
+            crate::list_markers(&ed.doc.body, Some(&numbering)),
+            [Some("\u{2022} ".to_string())]
+        );
+        assert!(apply_format(&mut ed, Some(&mut pkg), &DocFormat::Bullets).ran);
+        assert!(!caret_format(&ed, list_ids(Some(&pkg))).bullets);
     }
 }

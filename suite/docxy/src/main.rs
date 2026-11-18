@@ -18232,6 +18232,22 @@ impl Docxy {
         self.applied == Some(ThemeMode::Dark) && !self.light_page
     }
 
+    /// The lists Bullets, Numbers and AutoCorrect apply in the active tab
+    /// (#2087): [`ListIds::of`] its numbering part.
+    fn list_ids(&self) -> ListIds {
+        self.tabs.get(self.active).map_or(ListIds::OWN, |tab| {
+            let parts = tab.run_styles.borrow_mut().parts(tab.pkg.as_ref());
+            ListIds::of(parts.numbering.as_deref())
+        })
+    }
+
+    /// [`ListIds::define`] in the active tab's package.
+    fn define_list(&mut self, ids: ListIds, bullet: bool) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            ids.define(tab.pkg.as_mut(), bullet);
+        }
+    }
+
     fn new(sample_fallback: bool, cx: &mut Context<Self>) -> Self {
         let root = config_root();
         let session = startup_session(&root, std::time::SystemTime::now());
@@ -31649,6 +31665,9 @@ impl Docxy {
         let redo_only = self.redo_only;
         let history = (ctrl && matches!(key.as_str(), "z" | "y")) || (!ctrl && key == "f4");
         let autocorrect = self.autocorrect.clone();
+        // AutoCorrect's lists are the document's (#2087).
+        let lists = self.list_ids();
+        let mut started_list = None;
         let repeats_indent = history && self.repeat_indents();
         let (Some(ed), repeat) = self.edit_target_and_repeat() else {
             return;
@@ -31732,7 +31751,14 @@ impl Docxy {
                 "down" => no(|| move_vert(ed, true)),
                 _ => match ev.keystroke.key_char.as_deref() {
                     Some(c) if !c.is_empty() && !c.chars().next().unwrap().is_control() => {
-                        noted = Some(type_key_text(ed, repeat, c, &autocorrect));
+                        noted = Some(type_key_text(
+                            ed,
+                            repeat,
+                            c,
+                            &autocorrect,
+                            lists,
+                            &mut started_list,
+                        ));
                         true
                     }
                     _ => false,
@@ -31749,6 +31775,9 @@ impl Docxy {
             if indents {
                 self.repair_list_indents_since(since);
             }
+        }
+        if let Some(bullet) = started_list {
+            self.define_list(lists, bullet);
         }
         self.keep_repeat_current(recorded || (history && untouched));
         self.scroll_to_caret();
@@ -34790,9 +34819,10 @@ fn apply_doc_act(e: &mut Editor, act: Act) {
         SelectAll => e.select_all(),
         Case => e.cycle_case(),
         // Toggle: if every selected paragraph is already in this list, drop
-        // it; otherwise apply it.
-        Bullets => e.set_list((!e.all_in_list(NUM_BULLET)).then_some(NUM_BULLET)),
-        Numbers => e.set_list((!e.all_in_list(NUM_DECIMAL)).then_some(NUM_DECIMAL)),
+        // it; otherwise apply it. docxy's own lists: `run_act` and Repeat
+        // apply the document's (`ListIds`, #2087).
+        Bullets => toggle_list(e, NUM_BULLET),
+        Numbers => toggle_list(e, NUM_DECIMAL),
         IndentInc => e.change_indent(720),
         IndentDec => e.change_indent(-720),
         Sort => e.sort_paragraphs(),
@@ -34864,6 +34894,12 @@ enum Repeat {
     Break(docxcore::model::BreakKind),
     /// A command [`repeatable_act`] allows.
     Act(Act),
+    /// Bullets (`bullet`) or Numbers, with the list it applied in its
+    /// document (`ListIds`, #2087).
+    List {
+        bullet: bool,
+        num: i32,
+    },
 }
 
 impl Repeat {
@@ -34876,6 +34912,9 @@ impl Repeat {
             Repeat::Break(docxcore::model::BreakKind::Column) => Some("Column Break"),
             Repeat::Break(_) => Some("Page Break"),
             Repeat::Act(act) => act_undo_name(act),
+            Repeat::List { bullet, .. } => {
+                act_undo_name(if bullet { Act::Bullets } else { Act::Numbers })
+            }
         }
     }
 }
@@ -34985,16 +35024,25 @@ fn break_typing_unless_continuing(ed: &mut Editor, rec: &Option<RepeatRecord>) {
 /// composed text arrives one key per character (`text_input::char_stroke`),
 /// so it is corrected too; only a key event whose `key_char` holds several
 /// characters goes in as typed.
+///
+/// AutoCorrect's lists are `lists`; `started` is set to the kind of one it
+/// started (`true`: bullets), for the caller to define (#2087).
 fn type_key_text(
     ed: &mut Editor,
     rec: &Option<RepeatRecord>,
     text: &str,
     ac: &gridcore::autocorrect::AutoCorrect,
+    lists: ListIds,
+    started: &mut Option<bool>,
 ) -> Repeat {
     break_typing_unless_continuing(ed, rec);
     let mut chars = text.chars();
     match (chars.next(), chars.next()) {
-        (Some(ch), None) => doc_autocorrect::type_key(ed, ac, ch),
+        (Some(ch), None) => {
+            if let Some(bullet) = doc_autocorrect::type_key(ed, ac, ch, lists) {
+                *started = Some(bullet);
+            }
+        }
         _ => ed.insert_str(text),
     }
     Repeat::Typing
@@ -35041,6 +35089,7 @@ fn redo_or_repeat(ed: &mut Editor, rec: &mut Option<RepeatRecord>) -> bool {
         Repeat::Tab => ed.insert_tab(),
         Repeat::Break(kind) => ed.insert_break(kind),
         Repeat::Act(act) => apply_doc_act(ed, act),
+        Repeat::List { num, .. } => toggle_list(ed, num),
     }
     if ed.undo_serial().is_none_or(|s| s <= since) {
         return false;
@@ -35262,7 +35311,14 @@ mod repeat_tests {
     fn type_keys(ed: &mut Editor, rec: &mut Option<RepeatRecord>, s: &str) {
         for ch in s.chars() {
             let since = docxcore::editor::undo_serial_counter();
-            let what = type_key_text(ed, rec, &ch.to_string(), &Default::default());
+            let what = type_key_text(
+                ed,
+                rec,
+                &ch.to_string(),
+                &Default::default(),
+                ListIds::OWN,
+                &mut None,
+            );
             note_edit(ed, rec, since, what);
         }
     }
@@ -35542,10 +35598,12 @@ mod repeat_tests {
             </w:numbering>"#,
         );
         let s = |m: &str| Some(m.to_string());
+        // A nested bullet level does not restart the numbered level above
+        // it (r1), as `Numbering::count` and Word count it.
         let body = [p(1, 0), p(1, 0), p(1, 1), p(1, 0)];
         assert_eq!(
             list_markers(&body, Some(&numbering)),
-            [s("1. "), s("2. "), s("\u{25E6} "), s("1. ")]
+            [s("1. "), s("2. "), s("\u{25E6} "), s("3. ")]
         );
         // numId 2 is a bullet list here, not docxy's own numbered one.
         assert_eq!(
@@ -35603,6 +35661,183 @@ mod repeat_tests {
             list_markers(&[item.clone(), text, item], None),
             [s("1. "), None, s("1. ")]
         );
+    }
+
+    /// A numbering part whose numId 1 is decimal, as many Word documents'
+    /// is (#2087 r1), and the package that holds it.
+    fn word_numbering_package() -> (Package, Editor) {
+        use docxcore::model::{Block, Document, Paragraph, Run};
+        let para = |t: &str| {
+            Block::Paragraph(Paragraph {
+                content: vec![Inline::Run(Run {
+                    text: t.into(),
+                    props: RunProps::default(),
+                })],
+                ..Paragraph::default()
+            })
+        };
+        let doc = Document {
+            body: vec![para("one"), para("two")],
+        };
+        let mut pkg = docxcore::package::new_package(doc.clone());
+        pkg.add_markdown_numbering();
+        assert!(pkg.set_part(
+            "word/numbering.xml",
+            br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+                .to_vec()
+        ));
+        let mut ed = Editor::new(doc);
+        ed.select_all();
+        (pkg, ed)
+    }
+
+    fn numbering_of(pkg: &Package) -> docxcore::numbering::Numbering {
+        docxcore::numbering::parse_numbering_xml(&pkg.part_text("word/numbering.xml").unwrap())
+    }
+
+    /// Bullets and Numbers apply docxy's own lists unless the document's
+    /// numbering part defines that id as the other kind (#2087 r1).
+    #[test]
+    fn list_ids_take_the_reserved_list_where_the_document_disagrees_2087() {
+        use docxcore::numbering::parse_numbering_xml;
+        use docxcore::package::{BULLET_LIST_NUM_ID, NUMBER_LIST_NUM_ID};
+        let part = |one: &str, two: &str| {
+            parse_numbering_xml(&format!(
+                r#"<w:numbering>
+                <w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="{one}"/></w:lvl></w:abstractNum>
+                <w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:numFmt w:val="{two}"/></w:lvl></w:abstractNum>
+                <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+                <w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>
+                </w:numbering>"#
+            ))
+        };
+        // No part, or one defining them as docxy does: 1 and 2.
+        assert_eq!(ListIds::of(None), ListIds::OWN);
+        assert_eq!(ListIds::of(Some(&part("bullet", "decimal"))), ListIds::OWN);
+        // A part that defines neither: 1 and 2.
+        let other = parse_numbering_xml(
+            r#"<w:numbering><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum>
+            <w:num w:numId="7"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
+        );
+        assert_eq!(ListIds::of(Some(&other)), ListIds::OWN);
+        // numId 1 decimal: the bullets take 9990.
+        assert_eq!(
+            ListIds::of(Some(&part("decimal", "decimal"))),
+            ListIds {
+                bullet: BULLET_LIST_NUM_ID,
+                decimal: NUM_DECIMAL
+            }
+        );
+        // numId 2 a bullet list: the numbers take 9991.
+        assert_eq!(
+            ListIds::of(Some(&part("bullet", "bullet"))),
+            ListIds {
+                bullet: NUM_BULLET,
+                decimal: NUMBER_LIST_NUM_ID
+            }
+        );
+        // Both the other way round.
+        assert_eq!(
+            ListIds::of(Some(&part("lowerRoman", "bullet"))),
+            ListIds {
+                bullet: BULLET_LIST_NUM_ID,
+                decimal: NUMBER_LIST_NUM_ID
+            }
+        );
+    }
+
+    /// Bullets in a document whose numId 1 is decimal (#2087 r1): the
+    /// paragraphs take docxy's reserved bullet list, which the package then
+    /// defines, so the view draws bullets and the button shows pressed;
+    /// pressing it again takes the list off.
+    #[test]
+    fn bullets_in_a_document_whose_list_one_is_numbered_draw_bullets_2087() {
+        let (mut pkg, mut ed) = word_numbering_package();
+        let ids = ListIds::of(Some(&numbering_of(&pkg)));
+        let stamp = pkg.parts_stamp();
+        ids.define(Some(&mut pkg), true);
+        assert_ne!(
+            pkg.parts_stamp(),
+            stamp,
+            "the style cache reads the part again"
+        );
+        toggle_list(&mut ed, ids.bullet);
+        let numbering = numbering_of(&pkg);
+        let shown = ListIds::of(Some(&numbering));
+        assert_eq!(shown, ids, "the pressed state asks for the list applied");
+        assert!(ed.all_in_list(shown.bullet));
+        assert!(!ed.all_in_list(NUM_BULLET));
+        let bullet = Some("\u{2022} ".to_string());
+        assert_eq!(
+            list_markers(&ed.doc.body, Some(&numbering)),
+            [bullet.clone(), bullet]
+        );
+        // Again: off.
+        toggle_list(&mut ed, shown.bullet);
+        assert!(!ed.all_in_list(shown.bullet));
+        assert_eq!(list_markers(&ed.doc.body, Some(&numbering)), [None, None]);
+        // Numbers there keep numId 1's neighbour, docxy's own 2: no part write.
+        let stamp = pkg.parts_stamp();
+        ids.define(Some(&mut pkg), false);
+        assert_eq!(pkg.parts_stamp(), stamp);
+    }
+
+    /// Each list counts on its own (#2087 r1): two numbered lists side by
+    /// side in the body, or in two columns of a table, an item per row, each
+    /// number 1, 2, 3; a bullet column beside a numbered one never restarts
+    /// it.
+    #[test]
+    fn each_list_counts_on_its_own_2087() {
+        use docxcore::model::{Block, ParProps, Paragraph};
+        let p = |num_id| {
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    num_id: Some(num_id),
+                    ..ParProps::default()
+                },
+                content: Vec::new(),
+            })
+        };
+        let numbering = docxcore::numbering::parse_numbering_xml(
+            r#"<w:numbering>
+            <w:abstractNum w:abstractNumId="0">
+              <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>
+            <w:abstractNum w:abstractNumId="1">
+              <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>
+            <w:abstractNum w:abstractNumId="2">
+              <w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="-"/></w:lvl></w:abstractNum>
+            <w:num w:numId="3"><w:abstractNumId w:val="0"/></w:num>
+            <w:num w:numId="4"><w:abstractNumId w:val="1"/></w:num>
+            <w:num w:numId="5"><w:abstractNumId w:val="2"/></w:num>
+            </w:numbering>"#,
+        );
+        let n = Some(&numbering);
+        let s = |m: &str| Some(m.to_string());
+        assert_eq!(
+            list_markers(&[p(3), p(3), p(4), p(4), p(3)], n),
+            [s("1. "), s("2. "), s("1. "), s("2. "), s("3. ")]
+        );
+        // Column A numId 3, column B numId 4, an item per row.
+        let mut counts = TableListCounts::new();
+        let mut rows = Vec::new();
+        for _ in 0..3 {
+            let a = counts.cell(&[p(3)], n);
+            let b = counts.cell(&[p(4)], n);
+            rows.push((a, b));
+        }
+        for (i, (a, b)) in rows.iter().enumerate() {
+            let want = s(&format!("{}. ", i + 1));
+            assert_eq!((&a[0], &b[0]), (&want, &want), "row {i}");
+        }
+        // Column A bullets, column B numbered: B is 1., 2., 3.
+        let mut counts = TableListCounts::new();
+        let mut b_col = Vec::new();
+        for _ in 0..3 {
+            assert_eq!(counts.cell(&[p(5)], n), [s("\u{2022} ")]);
+            b_col.extend(counts.cell(&[p(3)], n));
+        }
+        assert_eq!(b_col, [s("1. "), s("2. "), s("3. ")]);
     }
 
     /// `w:numId="0"` is "no numbering" (#1728): no marker, a plain paragraph
@@ -39072,13 +39307,81 @@ fn has_page_break(b: &Block) -> bool {
 /// bulleted as its level's format says (#2087: a Word document's numId 1 is
 /// often its decimal list); any other keeps docxy's own rule, numId 2
 /// (`NUM_DECIMAL`) numbered and the rest bulleted, for its lists before the
-/// first save writes their definitions. Numbers count within `body` and
-/// restart after any paragraph that is not a list item.
+/// first save writes their definitions. Numbers count per list (numId)
+/// within `body`, as Word and `docxcore::numbering` count them: a deeper
+/// level, a bullet one included, restarts only the levels below it, and
+/// every count restarts after a paragraph that is not a list item.
 fn list_markers(
     body: &[Block],
     numbering: Option<&docxcore::numbering::Numbering>,
 ) -> Vec<Option<String>> {
-    list_markers_counting(body, numbering, &mut Vec::new(), true)
+    list_markers_counting(body, numbering, &mut ListCounts::new(), true)
+}
+
+/// Each list's (numId's) count per level, for [`list_markers`].
+type ListCounts = std::collections::HashMap<i32, Vec<u32>>;
+
+/// The lists Bullets and Numbers apply in a document (#2087 r1), and
+/// AutoCorrect's `* ` and `1. `: docxy's own numId 1 (`NUM_BULLET`) and 2
+/// (`NUM_DECIMAL`), unless the document's numbering part defines that id as
+/// the other kind (at level 0, bullet or not: a Word document's numId 1 is
+/// often its decimal list); then [`Package::ensure_list`]'s own id
+/// (`BULLET_LIST_NUM_ID` 9990, `NUMBER_LIST_NUM_ID` 9991), which
+/// [`ListIds::define`] gives the part. A document with no numbering part,
+/// or one that leaves 1 and 2 undefined or defines them as docxy does,
+/// keeps 1 and 2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ListIds {
+    pub bullet: i32,
+    pub decimal: i32,
+}
+
+impl ListIds {
+    /// docxy's own ids.
+    pub(crate) const OWN: ListIds = ListIds {
+        bullet: NUM_BULLET,
+        decimal: NUM_DECIMAL,
+    };
+
+    /// The ids in a document whose numbering part is `numbering`.
+    pub(crate) fn of(numbering: Option<&docxcore::numbering::Numbering>) -> Self {
+        use docxcore::numbering::NumFmt;
+        use docxcore::package::{BULLET_LIST_NUM_ID, NUMBER_LIST_NUM_ID};
+        let pick = |own: i32, bullet: bool, reserved: i32| {
+            let other_kind = numbering.filter(|n| n.defines(own)).is_some_and(|n| {
+                let fmt = n.level(own, 0).map_or(NumFmt::Decimal, |l| l.format);
+                (fmt == NumFmt::Bullet) != bullet
+            });
+            if other_kind { reserved } else { own }
+        };
+        ListIds {
+            bullet: pick(NUM_BULLET, true, BULLET_LIST_NUM_ID),
+            decimal: pick(NUM_DECIMAL, false, NUMBER_LIST_NUM_ID),
+        }
+    }
+
+    /// The bullet list's id, or the numbered one's.
+    pub(crate) fn id(self, bullet: bool) -> i32 {
+        if bullet { self.bullet } else { self.decimal }
+    }
+
+    /// Give `pkg`'s numbering part the list `bullet` names when it is
+    /// [`Package::ensure_list`]'s, so the next frame's markers (`run_look`'s
+    /// cache reads the part again, its stamp moved) and a save show it.
+    /// docxy's own 1 and 2 are left to the save, as before.
+    pub(crate) fn define(self, pkg: Option<&mut Package>, bullet: bool) {
+        if self.id(bullet) != ListIds::OWN.id(bullet) {
+            if let Some(pkg) = pkg {
+                pkg.ensure_list(bullet);
+            }
+        }
+    }
+}
+
+/// Bullets or Numbers on the selected paragraphs: list `num` on them, or
+/// off when every one is already in it.
+fn toggle_list(e: &mut Editor, num: i32) {
+    e.set_list((!e.all_in_list(num)).then_some(num));
 }
 
 /// A table's list markers, cell by cell in reading order (#2087): each
@@ -39086,11 +39389,11 @@ fn list_markers(
 /// numbers a list with an item per row 1, 2, 3. Within a cell a paragraph
 /// that is not a list item restarts the count only after an item of that
 /// cell, so a cell of other text beside the items keeps the count going.
-struct TableListCounts(Vec<u32>);
+struct TableListCounts(ListCounts);
 
 impl TableListCounts {
     fn new() -> Self {
-        TableListCounts(Vec::new())
+        TableListCounts(ListCounts::new())
     }
 
     /// The markers of the next cell's `blocks`.
@@ -39104,12 +39407,12 @@ impl TableListCounts {
 }
 
 /// [`list_markers`] from `counts` on, left as the last block leaves them. A
-/// block that is not a list item restarts the count when `restart_any`, or
-/// else only after a list item of `blocks`.
+/// block that is not a list item restarts every count when `restart_any`,
+/// or else only after a list item of `blocks`.
 fn list_markers_counting(
     body: &[Block],
     numbering: Option<&docxcore::numbering::Numbering>,
-    counts: &mut Vec<u32>,
+    counts: &mut ListCounts,
     restart_any: bool,
 ) -> Vec<Option<String>> {
     use docxcore::numbering::NumFmt;
@@ -39126,15 +39429,19 @@ fn list_markers_counting(
             Block::Paragraph(p) if p.props.in_list() => {
                 had_item = true;
                 let ilvl = p.props.ilvl as usize;
-                if p.props.num_id.is_some_and(|n| numbered(n, p.props.ilvl)) {
-                    if counts.len() <= ilvl {
-                        counts.resize(ilvl + 1, 0);
+                let num_id = p.props.num_id.unwrap_or_default();
+                let list = counts.entry(num_id).or_default();
+                if numbered(num_id, p.props.ilvl) {
+                    if list.len() <= ilvl {
+                        list.resize(ilvl + 1, 0);
                     }
-                    counts.truncate(ilvl + 1); // returning to a shallower level restarts deeper ones
-                    counts[ilvl] += 1;
-                    Some(format!("{}. ", counts[ilvl]))
+                    list.truncate(ilvl + 1); // returning to a shallower level restarts deeper ones
+                    list[ilvl] += 1;
+                    Some(format!("{}. ", list[ilvl]))
                 } else {
-                    counts.clear();
+                    // A bullet level restarts the levels below it, not the
+                    // ones above (#2087 r1).
+                    list.truncate(ilvl);
                     Some(if ilvl % 2 == 1 {
                         "\u{25E6} ".to_string()
                     } else {
@@ -42013,8 +42320,19 @@ impl Docxy {
         }
         self.run_act(act, window, cx);
         if act_undo_name(act).is_some() {
+            // Bullets and Numbers repeat the list they applied (#2087).
+            let what = match act {
+                Act::Bullets | Act::Numbers => {
+                    let bullet = act == Act::Bullets;
+                    Repeat::List {
+                        bullet,
+                        num: self.list_ids().id(bullet),
+                    }
+                }
+                _ => Repeat::Act(act),
+            };
             if let (Some(ed), rec) = self.edit_target_and_repeat() {
-                note_edit(ed, rec, since, Repeat::Act(act));
+                note_edit(ed, rec, since, what);
             }
         }
         // The Undo drop-down only undoes (#619), a sheet's Redo drop-down
@@ -42146,6 +42464,14 @@ impl Docxy {
                 let since = docxcore::editor::undo_serial_counter();
                 self.with_editor(window, cx, |e| apply_doc_act(e, act));
                 self.repair_list_indents_since(since);
+            }
+            // The document's list, defined first where it is docxy's
+            // reserved one (#2087).
+            Bullets | Numbers => {
+                let bullet = act == Bullets;
+                let ids = self.list_ids();
+                self.define_list(ids, bullet);
+                self.with_editor(window, cx, |e| toggle_list(e, ids.id(bullet)));
             }
             _ => self.with_editor(window, cx, |e| apply_doc_act(e, act)),
         }
@@ -44767,8 +45093,9 @@ impl Docxy {
             AlignC => pp.is_some_and(|p| p.align == Align::Center),
             AlignR => pp.is_some_and(|p| p.align == Align::Right),
             AlignJ => pp.is_some_and(|p| p.align == Align::Justify),
-            Bullets => doc.is_some_and(|ed| ed.all_in_list(NUM_BULLET)),
-            Numbers => doc.is_some_and(|ed| ed.all_in_list(NUM_DECIMAL)),
+            // The document's lists, as the commands apply them (#2087).
+            Bullets => doc.is_some_and(|ed| ed.all_in_list(self.list_ids().bullet)),
+            Numbers => doc.is_some_and(|ed| ed.all_in_list(self.list_ids().decimal)),
             ParaBorders => doc.is_some_and(|ed| ed.shown_bottom_border()),
             ShowHide => self.show_marks,
             ToggleComments => self.show_comments,
