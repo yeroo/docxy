@@ -42,6 +42,8 @@
 //!   Ignore Error) and the formula-auditing sets behind the trace arrows.
 //! - [`evalsteps`] — Evaluate Formula: a formula calculated one step at a
 //!   time, in Excel's order.
+//! - [`overflow`] — which cells' text spills over their empty neighbours,
+//!   and how far: the sheet PDF and the suite's sheet view share it.
 //! - [`print`] — page setup, print areas and breaks, pagination, sheet PDF.
 
 pub mod audit;
@@ -71,6 +73,7 @@ pub mod names;
 pub mod numfmt;
 pub mod options;
 pub mod outline;
+pub mod overflow;
 pub mod pivot;
 pub mod pivotcalc;
 pub mod print;

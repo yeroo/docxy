@@ -232,6 +232,96 @@ fn text_overflows_into_empty_cells_and_stops_at_a_filled_one() {
 }
 
 #[test]
+fn an_empty_string_formula_result_stops_a_spill() {
+    let long = "A heading much wider than one column";
+    let mut wb = Workbook::default();
+    let mut s = sheet("S");
+    s.set_cell(0, 0, Cell::text(long));
+    // B1 shows nothing, but it holds a formula: Excel cuts A1's text there.
+    s.set_cell(
+        0,
+        1,
+        Cell {
+            value: CellValue::Text(String::new()),
+            formula: Some("\"\"".into()),
+            ..Cell::default()
+        },
+    );
+    wb.sheets.push(s);
+    let pdf = pdf_of(&wb, vec![0]).unwrap();
+    let (_, _, w, _) = clip_of(&pdf, long);
+    assert_eq!(w, 48.0);
+}
+
+#[test]
+fn a_right_aligned_text_spills_left() {
+    let long = "A heading much wider than one column";
+    let mut wb = Workbook::default();
+    let right = wb.styles.intern(Xf {
+        align: Align::Right,
+        ..Xf::default()
+    });
+    let mut s = sheet("S");
+    s.set_cell(
+        0,
+        5,
+        Cell {
+            style: right,
+            ..Cell::text(long)
+        },
+    );
+    // G1 is filled, so the text can only run left.
+    s.set_cell(0, 6, Cell::text("x"));
+    wb.sheets.push(s);
+    let pdf = pdf_of(&wb, vec![0]).unwrap();
+    let (x, _, w, _) = clip_of(&pdf, long);
+    let need = text_width(long, false, 11.0) + 4.0;
+    // The run ends at F's right edge and reaches left as far as it needs.
+    let f_right = 50.4 + 6.0 * 48.0;
+    assert!((x + w - f_right).abs() < 1e-6, "{x} + {w}");
+    assert!(w >= need && w < need + 48.0, "{w} for {need}");
+}
+
+#[test]
+fn a_merged_title_prints_across_its_merge_and_blocks_a_spill() {
+    let title = "A centred title much wider than one column";
+    let long = "Another heading much wider than one column";
+    let mut wb = Workbook::default();
+    let center = wb.styles.intern(Xf {
+        align: Align::Center,
+        ..Xf::default()
+    });
+    let mut s = sheet("S");
+    s.set_cell(
+        0,
+        0,
+        Cell {
+            style: center,
+            ..Cell::text(title)
+        },
+    );
+    s.merges.push((0, 0, 0, 4));
+    // A2's text would spill into B2, but B2 lies in a merge.
+    s.set_cell(1, 0, Cell::text(long));
+    s.merges.push((1, 1, 1, 3));
+    // The printed range is the used one: G3 widens it past the merges.
+    s.set_cell(2, 6, Cell::text("z"));
+    wb.sheets.push(s);
+    let pdf = pdf_of(&wb, vec![0]).unwrap();
+    // The title's box is the merge, A..E, and it is centred in it.
+    let (x, _, w, _) = clip_of(&pdf, title);
+    assert_eq!((x, w), (50.4, 5.0 * 48.0));
+    let tw = text_width(title, false, 11.0);
+    let all = streams(&pdf).join("\n");
+    assert!(
+        all.contains(&format!("{} ", num(50.4 + (5.0 * 48.0 - tw) / 2.0))),
+        "{all}"
+    );
+    let (_, _, w, _) = clip_of(&pdf, long);
+    assert_eq!(w, 48.0);
+}
+
+#[test]
 fn right_aligned_numbers_and_error_substitution() {
     let mut wb = Workbook::default();
     let mut s = sheet("S");
