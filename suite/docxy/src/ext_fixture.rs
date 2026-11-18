@@ -936,7 +936,7 @@ const FIXTURE_COMMENTS: [FixtureComment; 5] = [
 /// paragraphs; comment 0 (resolved) on "Quarterly" in block 0; 1 and 2 on
 /// the adjacent words "near" and "words" of block 2's one short line (two
 /// anchors on one line: the second balloon is pushed down); 3's range from
-/// "range", the last word of block 3 (which wraps in both views), to "ends"
+/// "range", the last word of block 3 (two lines by a `w:br`), to "ends"
 /// in block 4 (across two paragraphs), its text long, its reference run in
 /// a tracked insertion (`w:ins`, as Word writes it with Track Changes on);
 /// 4 (resolved) on "closing" in block 5.
@@ -991,12 +991,12 @@ pub(crate) fn comments_docx(with_comments: bool) -> Vec<u8> {
             start(2),
             run("words") + &end(2) + &run(" here.")
         )),
+        // Two short lines by an explicit break, so its line texts do not
+        // depend on the fonts' wrap.
         para(&format!(
-            "{}{}{}",
-            run(
-                "Gamma lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod \
-                 tempor incididunt ut labore et dolore magna aliqua, and then it starts a "
-            ),
+            "{}<w:r><w:br/></w:r>{}{}{}",
+            run("Gamma lorem ipsum dolor sit amet."),
+            run("And then it starts a "),
             start(3),
             run("range")
         )),
