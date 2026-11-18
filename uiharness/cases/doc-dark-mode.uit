@@ -26,8 +26,9 @@
 #
 # #2087: `inks.markers` is the list numbers drawn, in paint order: the
 # two-column table's numbered list (numId 1, decimal in the fixture's
-# numbering part) draws 1. 2. 3. in its cell, the hanging indent taking
-# each number's space. `inks.cased` is the runs drawn in another case than
+# numbering part) has one item per row, the count carried on from cell to
+# cell, so it draws 1. 2. 3., the hanging indent taking each number's
+# space. `inks.cased` is the runs drawn in another case than
 # stored: the figure labels and the callout label are `w:caps` runs typed
 # in mixed case, drawn in capitals.
 #
@@ -50,7 +51,8 @@ test issue 2079 a dark theme draws the document as Word's dark mode does, every 
   assert reply.page_color is 262626
   assert reply.inks.runs is not 0
   assert reply.inks.all_readable is true
-  # The cell's list numbers and the caps runs (#2087).
+  # The table's list numbers, counted across its cells, and the caps runs
+  # (#2087).
   assert reply.inks.markers is 1. 2. 3.
   assert reply.inks.cased is REVENUE | CUSTOMERS | MARGIN | NOTE
   # Print Layout: the same, on the sheet.

@@ -1627,6 +1627,9 @@ pub(crate) fn tile_line(color: Option<u32>, ground: u32, dark: bool) -> u32 {
 mod tests {
     use super::*;
     use core::prelude::v1::test;
+    use docxcore::editor::Caret;
+    use docxcore::model::Document;
+    use docxcore::table::{AutoFit, new_table};
 
     /// On a dark page the Table Styles tiles draw as the page draws the
     /// table (#2087): an unfilled cell is the dark page, a light fill is
@@ -1655,9 +1658,6 @@ mod tests {
         assert_eq!(tile_line(None, 0xFFFFFF, false), 0x404040);
         assert_eq!(tile_line(Some(0x5B9BD5), 0xFFFFFF, false), 0x5B9BD5);
     }
-    use docxcore::editor::Caret;
-    use docxcore::model::Document;
-    use docxcore::table::{AutoFit, new_table};
 
     fn ed_in_table() -> Editor {
         let mut ed = Editor::new(Document {
