@@ -3065,10 +3065,12 @@ impl Editor {
     /// not come back (#1728). So is a paragraph that is not a list item but
     /// whose paragraph style chain (or `w:pPrDefault`) gives a nonzero left
     /// indent, when its left was loaded: no `w:left` would bring the style's
-    /// back (#1815). With no left of its own, such a paragraph steps from the
-    /// style's indent where that is in twips, as it is drawn: an Increase
-    /// from a 720 style writes `w:left="1440"`, a Decrease `w:left="0"`, both
-    /// pinned (#2231 r3); over a character-unit style it steps from 0 as
+    /// back (#1815). With no left of its own as drawn (none loaded, pinned
+    /// or set in session), such a paragraph steps from the style's indent
+    /// where that is in twips: an Increase from a 720 style writes
+    /// `w:left="1440"`, a Decrease `w:left="0"`, both pinned (#2231 r3); a
+    /// left of its own, a session one included, steps from itself and pins
+    /// as it moves (r4); over a character-unit style it steps from 0 as
     /// before. A selection that this would leave as it is
     /// (level-stepping items at the limit, indents already at 0) changes
     /// nothing and records no undo step.
@@ -4348,17 +4350,23 @@ fn step_indent(pr: &mut ParProps, step: i32, delta: i32, fallback: IndentFallbac
         pr.ilvl = (pr.ilvl.clamp(0, 8) + step).clamp(0, 8);
         return;
     }
-    // A style item's in-session indent cannot be told from nothing once
-    // Increase wrote it, so only a loaded (or pinned) left counts there.
-    let direct = if fallback == IndentFallback::Level {
-        pr.has_direct_left_indent()
-    } else {
-        pr.has_loaded_left_indent()
+    // A style-numbered item's or a character-count style's in-session
+    // indent cannot be told from nothing once Increase wrote it, so only a
+    // loaded (or pinned) left counts there. Over a style left in twips the
+    // page view draws a left set in session as the paragraph's own
+    // (`has_direct_left_indent`), so it counts as its own here too, and
+    // pins as it moves (#2231 r4).
+    let direct = match fallback {
+        IndentFallback::Level | IndentFallback::StyleLeft { twips: Some(_), .. } => {
+            pr.has_direct_left_indent()
+        }
+        _ => pr.has_loaded_left_indent(),
     };
-    // A paragraph drawn at its style's left in twips, with none of its own,
-    // steps from where it is drawn (#2231 r3), and the result is pinned, so
-    // the next step reads it as its own and a Decrease to the margin stays
-    // there: Increase from a 720 style writes 1440, Decrease writes 0.
+    // A paragraph with no left of its own as drawn, drawn at its style's
+    // left in twips, steps from there (#2231 r3), and the result is
+    // pinned, so the next step reads it as its own and a Decrease to the
+    // margin stays there: Increase from a 720 style writes 1440, Decrease
+    // writes 0.
     if let IndentFallback::StyleLeft {
         twips: Some(from), ..
     } = fallback
@@ -7873,6 +7881,49 @@ mod tests {
         assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
         ed.change_indent(-720);
         assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+    }
+
+    /// #2231 r4: over a style left in twips, a left set in session is the
+    /// paragraph's own as the page view draws it, so it steps from itself
+    /// and pins as it moves, as after a reload.
+    #[test]
+    fn a_session_left_over_a_style_indent_steps_from_itself() {
+        // Increase twice with no style (1440, written in session), then Quote.
+        let session_1440 = || {
+            let mut ed = loaded_ppr("", true);
+            ed.change_indent(720);
+            ed.change_indent(720);
+            assert!(!first_props(&ed).has_loaded_left_indent());
+            ed.set_para_style(Some("Quote"));
+            assert_eq!(first_props(&ed).indent, 1440);
+            ed
+        };
+        let mut ed = session_1440();
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"720\"/>");
+        let mut ed = session_1440();
+        ed.change_indent(720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"2160\"/>");
+        // Down to the margin: pinned, and still 0 after a reload.
+        let mut ed = session_1440();
+        ed.change_indent(-720);
+        ed.change_indent(-720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"0\"/>");
+        let back = crate::load::parse_document_xml(
+            &crate::serialize::document_to_xml(&ed.doc),
+            &crate::load::Relationships::default(),
+        );
+        let Block::Paragraph(p) = &back.body[0] else {
+            panic!("a paragraph")
+        };
+        assert!(p.props.has_direct_left_indent() && p.props.indent == 0);
+        // Markdown's quote paragraph (Quote, indent 360 of its own).
+        let mut ed = Editor::new(crate::markdown::from_markdown("> quoted"));
+        ed.set_styles_xml(Some(LIST_STYLES.into()));
+        ed.select_all();
+        assert_eq!(first_props(&ed).indent, 360);
+        ed.change_indent(720);
+        assert_eq!(saved_ind(&ed), "<w:ind w:left=\"1080\"/>");
     }
 
     /// #2231 r3 (was #1815's "an Increase from none writes 720 over it"): a
