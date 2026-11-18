@@ -14,9 +14,9 @@ use crate::graph::model::{
     DirectoryGroup, DirectoryUser, DraftOptions, Event, EventDeltaItem, EventDeltaPage,
     EventRecurrence, FolderContact, FolderListing, GroupMember, GroupMemberList, MailFolder,
     MasterCategory, Me, MeetingMessage, Message, MessageFields, MessageHeader, OofStatus, Person,
-    PhysicalAddress, Presence, REMINDER_SET_PROP, REMINDER_SIGNAL_TIME_PROP, Recipient, Recurrence,
-    ScheduleEntry, SearchHit, SubtreeItems, is_event_message_type, parse_message_size,
-    plain_to_html, reminder_time, to_utc,
+    PersonDetails, PhysicalAddress, Presence, REMINDER_SET_PROP, REMINDER_SIGNAL_TIME_PROP,
+    Recipient, Recurrence, ScheduleEntry, SearchHit, SubtreeItems, is_event_message_type,
+    parse_message_size, plain_to_html, reminder_time, to_utc,
 };
 use crate::json::{self, Value};
 use std::collections::{HashMap, HashSet};
@@ -2958,6 +2958,28 @@ impl GraphClient {
         Ok(people)
     }
 
+    /// GET `/me/people?$search="<address>"&$select=PERSON_DETAILS_SELECT
+    /// &$top=10` (#2239): the details of one of the people the user works
+    /// with, for a contact card. `$search` on people is fuzzy (names and
+    /// addresses alike), so the answer is the first returned person whose
+    /// `scoredEmailAddresses` entry, or else `userPrincipalName`, equals
+    /// `address` ([`PersonDetails::from_json`]); `None` when none does. The
+    /// address goes quoted and escaped ([`person_search_value`]); no
+    /// `ConsistencyLevel` header (`/me/people` is not a directory query).
+    /// One page, no `@odata.nextLink` followed. Requires `People.Read`:
+    /// a token or tenant without it answers 403 (`GraphError::Http`).
+    pub fn person_details(&self, address: &str) -> Result<Option<PersonDetails>, GraphError> {
+        let path = format!(
+            "/me/people?$search={}&$select={PERSON_DETAILS_SELECT}&$top={PERSON_DETAILS_TOP}",
+            person_search_value(address)
+        );
+        let resp = self.send(Method::Get, &path, None, &[])?;
+        let v = parse_body(resp)?;
+        Ok(value_array(&v, "value")?
+            .iter()
+            .find_map(|p| PersonDetails::from_json(p, address)))
+    }
+
     /// GET `/users?$search="displayName:<q>" OR "mail:<q>"&$select=DIRECTORY_SELECT
     /// &$top=…` with `ConsistencyLevel: eventual`, which Graph requires for
     /// `$search` on directory objects (#1942): the tenant's user directory
@@ -4103,6 +4125,14 @@ pub const DIRECTORY_TOP_MAX: usize = 999;
 /// The `$select` of [`GraphClient::search_users`] (#1942).
 const DIRECTORY_SELECT: &str = "displayName,mail,userPrincipalName,jobTitle,department";
 
+/// The `$select` of [`GraphClient::person_details`] (#2239): what a contact
+/// card shows, and the two fields an address is matched on.
+pub const PERSON_DETAILS_SELECT: &str = "displayName,jobTitle,department,officeLocation,companyName,phones,scoredEmailAddresses,userPrincipalName";
+
+/// How many people [`GraphClient::person_details`] asks `/me/people` for
+/// (#2239): the exact match is looked for among them.
+const PERSON_DETAILS_TOP: usize = 10;
+
 /// The `$select` of [`GraphClient::search_groups`] (#2058).
 const GROUP_SELECT: &str = "id,displayName,mail,description";
 
@@ -4125,6 +4155,14 @@ pub const GROUP_MEMBERS_MAX: usize = GROUP_MEMBER_PAGES_MAX * DIRECTORY_TOP_MAX;
 fn directory_search_value(query: &str) -> String {
     let q = escape_search_text(query);
     encode_path_segment(&format!("\"displayName:{q}\" OR \"mail:{q}\""))
+}
+
+/// A `/me/people` `$search` value for one address (#2239): `"<address>"`,
+/// the address trimmed and escaped as a message search's
+/// ([`escape_search_text`]) so it cannot end the quotes, the whole value
+/// percent-encoded ([`encode_path_segment`]).
+fn person_search_value(address: &str) -> String {
+    encode_path_segment(&format!("\"{}\"", escape_search_text(address.trim())))
 }
 
 /// `text` with each `\` and `"` preceded by a backslash, for the inside of
@@ -4543,6 +4581,16 @@ mod tests {
             headers: vec![],
             body: format!(r#"{{"value":[{items}]}}"#),
         }
+    }
+
+    #[test]
+    fn person_search_value_quotes_and_escapes() {
+        assert_eq!(
+            person_search_value("Jo@Contoso.com"),
+            "%22Jo%40Contoso.com%22"
+        );
+        // Trimmed, and a quote or backslash cannot end the quotes.
+        assert_eq!(person_search_value("  a\"b\\c  "), "%22a%5C%22b%5C%5Cc%22");
     }
 
     #[test]

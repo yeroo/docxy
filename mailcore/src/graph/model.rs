@@ -207,6 +207,85 @@ fn user_address(v: &Value) -> Option<String> {
     }
 }
 
+/// A person's details for a contact card, from Graph `/me/people?$search`
+/// (`GraphClient::person_details`, #2239): one of the people the user works
+/// with, found by address. Not stored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersonDetails {
+    /// `displayName`, trimmed; `""` when there is none.
+    pub name: String,
+    /// The matched address as Graph has it, trimmed: the
+    /// `scoredEmailAddresses` entry or the `userPrincipalName` equal to the
+    /// address asked for (ASCII case aside), which may differ from it in
+    /// case.
+    pub address: String,
+    /// `jobTitle`; `None` when absent, not a string or blank.
+    pub job_title: Option<String>,
+    /// `department`; `None` when absent, not a string or blank.
+    pub department: Option<String>,
+    /// `officeLocation`; `None` when absent, not a string or blank.
+    pub office_location: Option<String>,
+    /// `companyName`; `None` when absent, not a string or blank.
+    pub company_name: Option<String>,
+    /// The `number` of each `phones[]` entry whose `type` is `business`
+    /// (ASCII case aside), trimmed, in order; blank numbers dropped.
+    pub business_phones: Vec<String>,
+    /// The `number` of the first `phones[]` entry whose `type` is `mobile`
+    /// and whose number is not blank.
+    pub mobile_phone: Option<String>,
+}
+
+impl PersonDetails {
+    /// `v` (a Graph `person`) when it is `address`'s, else `None`: one of
+    /// its `scoredEmailAddresses[].address`, or else its
+    /// `userPrincipalName`, equals `address`, both trimmed, ASCII case
+    /// ignored. A blank `address`, or a blank UPN (Graph sends `""` for a
+    /// group), never matches. Read leniently: any other shape problem is a
+    /// `None` field or an empty list, never a failure.
+    pub fn from_json(v: &Value, address: &str) -> Option<Self> {
+        let want = address.trim();
+        if want.is_empty() {
+            return None;
+        }
+        let scored = v
+            .get("scoredEmailAddresses")
+            .and_then(Value::as_array)
+            .unwrap_or(&[]);
+        let address = scored
+            .iter()
+            .filter_map(|e| non_blank_str(e, "address"))
+            .find(|a| a.eq_ignore_ascii_case(want))
+            .or_else(|| {
+                non_blank_str(v, "userPrincipalName").filter(|u| u.eq_ignore_ascii_case(want))
+            })?;
+        let mut business_phones = Vec::new();
+        let mut mobile_phone = None;
+        for phone in v.get("phones").and_then(Value::as_array).unwrap_or(&[]) {
+            let (Some(kind), Some(number)) = (
+                phone.get("type").and_then(Value::as_str).map(str::trim),
+                non_blank_str(phone, "number"),
+            ) else {
+                continue;
+            };
+            if kind.eq_ignore_ascii_case("business") {
+                business_phones.push(number);
+            } else if kind.eq_ignore_ascii_case("mobile") && mobile_phone.is_none() {
+                mobile_phone = Some(number);
+            }
+        }
+        Some(PersonDetails {
+            name: non_blank_str(v, "displayName").unwrap_or_default(),
+            address,
+            job_title: non_blank_str(v, "jobTitle"),
+            department: non_blank_str(v, "department"),
+            office_location: non_blank_str(v, "officeLocation"),
+            company_name: non_blank_str(v, "companyName"),
+            business_phones,
+            mobile_phone,
+        })
+    }
+}
+
 /// One mail-enabled group of the organisation's directory, from Graph
 /// `/groups?$search` (`GraphClient::search_groups`, #2058): a distribution
 /// list, a mail-enabled security group or a Microsoft 365 group.
@@ -3273,6 +3352,167 @@ mod tests {
     #[test]
     fn directory_user_from_json_without_a_name_keeps_an_empty_one() {
         assert_eq!(user(r#"{"mail":"jo@contoso.com"}"#).unwrap().name, "");
+    }
+
+    /// Graph's documented `/me/people` example response (v1.0, "List
+    /// people"): a Microsoft 365 group and a person.
+    const PEOPLE_EXAMPLE: &str = r#"{"value":[
+     {"id":"33b43a5b-87d6-41ec-91f8-a2610048105f","displayName":"Marketing","givenName":null,"surname":null,
+      "birthday":"","personNotes":"","isFavorite":false,"jobTitle":null,"companyName":null,"yomiCompany":"",
+      "department":null,"officeLocation":null,"profession":"","userPrincipalName":"","imAddress":null,
+      "scoredEmailAddresses":[{"address":"Marketing@contoso.com","relevanceScore":30.0}],
+      "phones":[],"postalAddresses":[],"websites":[],
+      "personType":{"class":"Group","subclass":"UnifiedGroup"}},
+     {"id":"e3d0513b-449e-4198-ba6f-bd97ae7cae85","displayName":"Isaiah Langer","givenName":"Isaiah",
+      "surname":"Langer","birthday":"","personNotes":"","isFavorite":false,"jobTitle":"Web Marketing Manager",
+      "companyName":null,"yomiCompany":"","department":"Sales & Marketing","officeLocation":"20/1101",
+      "profession":"","userPrincipalName":"IsaiahL@contoso.com","imAddress":"sip:isaiahl@contoso.com",
+      "scoredEmailAddresses":[{"address":"IsaiahL@contoso.com","relevanceScore":20.0}],
+      "phones":[{"type":"business","number":"+1 918 555 0101"}],"postalAddresses":[],"websites":[],
+      "personType":{"class":"Person","subclass":"OrganizationUser"}}
+    ]}"#;
+
+    /// The documented example's `(group, Isaiah)`.
+    fn people_example() -> (Value, Value) {
+        let v = parse(PEOPLE_EXAMPLE).unwrap();
+        let items = v.get("value").and_then(Value::as_array).unwrap();
+        (items[0].clone(), items[1].clone())
+    }
+
+    fn details(raw: &str, address: &str) -> Option<PersonDetails> {
+        PersonDetails::from_json(&parse(raw).unwrap(), address)
+    }
+
+    #[test]
+    fn person_details_reads_graphs_documented_example() {
+        let (group, isaiah) = people_example();
+        assert_eq!(
+            PersonDetails::from_json(&isaiah, " isaiahl@CONTOSO.com "),
+            Some(PersonDetails {
+                name: "Isaiah Langer".into(),
+                address: "IsaiahL@contoso.com".into(),
+                job_title: Some("Web Marketing Manager".into()),
+                department: Some("Sales & Marketing".into()),
+                office_location: Some("20/1101".into()),
+                company_name: None,
+                business_phones: vec!["+1 918 555 0101".into()],
+                mobile_phone: None,
+            })
+        );
+        assert_eq!(
+            PersonDetails::from_json(&group, "marketing@contoso.com"),
+            Some(PersonDetails {
+                name: "Marketing".into(),
+                address: "Marketing@contoso.com".into(),
+                job_title: None,
+                department: None,
+                office_location: None,
+                company_name: None,
+                business_phones: vec![],
+                mobile_phone: None,
+            })
+        );
+        assert_eq!(
+            PersonDetails::from_json(&isaiah, "marketing@contoso.com"),
+            None
+        );
+        assert_eq!(
+            PersonDetails::from_json(&group, "isaiahl@contoso.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn person_details_blank_upn_never_matches() {
+        let (group, isaiah) = people_example();
+        for blank in ["", "  ", "\t"] {
+            assert_eq!(PersonDetails::from_json(&group, blank), None, "{blank:?}");
+            assert_eq!(PersonDetails::from_json(&isaiah, blank), None, "{blank:?}");
+        }
+        // A blank-but-not-empty UPN, and a blank scored address, match no
+        // blank-ish ask either.
+        let raw = r#"{"displayName":"X","userPrincipalName":"  ","scoredEmailAddresses":[{"address":" "}]}"#;
+        assert_eq!(details(raw, " "), None);
+    }
+
+    #[test]
+    fn person_details_matches_by_upn() {
+        let raw = r#"{"displayName":"Jo","userPrincipalName":" Jo@Contoso.com ",
+            "scoredEmailAddresses":[{"address":"jo.smith@contoso.com"}]}"#;
+        let p = details(raw, "jo@contoso.COM").unwrap();
+        assert_eq!(p.address, "Jo@Contoso.com");
+        assert_eq!(p.name, "Jo");
+        // A scored address wins over the UPN when both match.
+        let raw = r#"{"userPrincipalName":"JO@contoso.com",
+            "scoredEmailAddresses":[{"address":"jo@CONTOSO.com"}]}"#;
+        assert_eq!(
+            details(raw, "jo@contoso.com").unwrap().address,
+            "jo@CONTOSO.com"
+        );
+        // Neither matches.
+        let raw = r#"{"userPrincipalName":"jo.smith@contoso.com",
+            "scoredEmailAddresses":[{"address":"joanne@contoso.com"}]}"#;
+        assert_eq!(details(raw, "jo@contoso.com"), None);
+    }
+
+    #[test]
+    fn person_details_nulls_non_strings_and_blanks_are_none() {
+        let raw = r#"{"displayName":null,"jobTitle":7,"department":"  ","officeLocation":null,
+            "companyName":[],"phones":{"type":"business","number":"1"},
+            "scoredEmailAddresses":["jo@contoso.com",{"address":42},{"address":null},
+                {"address":" jo@contoso.com "}]}"#;
+        assert_eq!(
+            details(raw, "jo@contoso.com"),
+            Some(PersonDetails {
+                name: String::new(),
+                address: "jo@contoso.com".into(),
+                job_title: None,
+                department: None,
+                office_location: None,
+                company_name: None,
+                business_phones: vec![],
+                mobile_phone: None,
+            })
+        );
+        // No `displayName` at all, and `scoredEmailAddresses` not an array:
+        // the UPN still matches.
+        let raw =
+            r#"{"scoredEmailAddresses":"jo@contoso.com","userPrincipalName":"jo@contoso.com"}"#;
+        assert_eq!(details(raw, "jo@contoso.com").unwrap().name, "");
+        // Nothing to match on.
+        assert_eq!(details(r#"{"displayName":"Jo"}"#, "jo@contoso.com"), None);
+        assert_eq!(details(r#""jo@contoso.com""#, "jo@contoso.com"), None);
+    }
+
+    #[test]
+    fn person_details_phone_kinds() {
+        let raw = r#"{"scoredEmailAddresses":[{"address":"jo@contoso.com"}],"phones":[
+            {"type":"business","number":"1"},
+            {"type":"home","number":"2"},
+            {"type":"mobile","number":" 3 "},
+            {"type":"business","number":"  "},
+            {"type":"business","number":null},
+            {"type":"mobile","number":"4"},
+            {"type":"Business","number":"5"},
+            {"number":"6"},
+            {"type":"businessFax","number":"7"},
+            {"type":"other","number":"8"},
+            {"type":7,"number":"9"},
+            "x"
+        ]}"#;
+        let p = details(raw, "jo@contoso.com").unwrap();
+        assert_eq!(p.business_phones, vec!["1".to_string(), "5".to_string()]);
+        assert_eq!(p.mobile_phone.as_deref(), Some("3"));
+        // A blank mobile before a real one is skipped.
+        let raw = r#"{"scoredEmailAddresses":[{"address":"jo@contoso.com"}],"phones":[
+            {"type":"mobile","number":""},{"type":"MOBILE","number":"4"}]}"#;
+        assert_eq!(
+            details(raw, "jo@contoso.com")
+                .unwrap()
+                .mobile_phone
+                .as_deref(),
+            Some("4")
+        );
     }
 
     fn group(raw: &str) -> Option<DirectoryGroup> {
