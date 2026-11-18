@@ -291,6 +291,45 @@ mod tests {
         assert_eq!(none, list);
     }
 
+    /// The document's own copy carries no list membership (#2087 r3
+    /// follow-up): `Editor::copy` makes a `Clip::new`, so a copied numId-1
+    /// decimal item pasted back into a package whose 1 is decimal is left to
+    /// the paste's own paragraph rules, its ids untouched, the package
+    /// unchanged. Only another app's RTF or HTML (`set_lists`) is remapped.
+    #[test]
+    fn the_documents_own_copy_is_never_remapped_2087() {
+        use docxcore::model::{Block, Document, Inline, ParProps, Paragraph, Run};
+        use docxcore::package::new_package;
+        const NUMBERING: &str = "word/numbering.xml";
+        let item = Block::Paragraph(Paragraph {
+            props: ParProps {
+                num_id: Some(1),
+                ..ParProps::default()
+            },
+            content: vec![Inline::Run(Run {
+                text: "Plan".into(),
+                props: Default::default(),
+            })],
+        });
+        let doc = Document {
+            body: vec![item.clone(), item],
+        };
+        let mut pkg = new_package(doc.clone());
+        pkg.add_markdown_numbering();
+        let decimal_one = r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#;
+        assert!(pkg.set_part(NUMBERING, decimal_one.as_bytes().to_vec()));
+        let mut ed = docxcore::editor::Editor::new(doc);
+        ed.select_all();
+        let own = ed.copy().expect("a clip");
+        assert!(!own.has_lists(), "an own copy names no lists");
+        let mut clip = own.clone();
+        let stamp = pkg.parts_stamp();
+        numbering_for_paste(Some(&mut pkg), &mut clip);
+        assert_eq!(clip, own);
+        assert_eq!(pkg.parts_stamp(), stamp, "the package is not touched");
+        assert_eq!(pkg.part_text(NUMBERING).as_deref(), Some(decimal_one));
+    }
+
     /// A list pasted into a package whose numbering part defines 1 as
     /// decimal, or leaves 1 and 2 undefined (#2087 r3): its items take the
     /// lists Bullets and Numbering apply there, docxy's reserved 9990 /
