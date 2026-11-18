@@ -8,6 +8,16 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   `w:numId="0"` is "no numbering" (render, PDF, Markdown, RTF, AutoFormat,
   the suite's markers and new-document base). The serializer still writes
   the 0 (it cancels a style's numbering) and compare's merge keeps it.
+- The suite's markers (`list_markers`, #2087): a list the package's
+  numbering part defines (`Numbering::defines`) is numbered or bulleted as
+  its level's `w:numFmt` says (bullet: "•"/"◦", any other: a counted
+  "N. "), so a Word document's numId 1 decimal list is numbered; a list no
+  part defines keeps docxy's own rule (numId 2, `NUM_DECIMAL`, numbered,
+  the rest bulleted), for its lists before the first save writes their
+  definitions (1 bullets, 2 decimals, so they draw the same after it).
+  Numbers count within the body and restart after any paragraph that is not
+  a list item; in a table they count on from cell to cell
+  (`TableListCounts`, `docs/claude/suite-document.md` §#2087).
 - `Editor::change_indent`: a list item with a direct left indent that
   reaches 0 writes `w:left="0"` (`ParProps::pin_left_indent_zero`,
   idempotent, attribute order kept), so the level's indent does not come

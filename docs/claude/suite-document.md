@@ -505,9 +505,14 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   `w:rPr`) are not painted at all, so a palette's `ground` is everything
   under a run; a later shading feature must set the ground it paints.
 - Highlights are mapped since #2231 (below).
-- Not mapped: pictures, shapes, text boxes, watermarks, View Gridlines' dashed
+- Not mapped: pictures (never, as in Word), View Gridlines' dashed
   `#9FB8E0` on borderless edges (a view aid: the issue's "dotted" rules),
-  the header/footer editing chrome, the style and table-style galleries.
+  the header/footer editing chrome. Floating shapes, text boxes' content,
+  charts and text watermarks are not drawn at all (text boxes and charts
+  are a `[textbox]`/`[chart]` stub and SmartArt a box, all in the palette's
+  own colours), so there is nothing to map until they are drawn (#2087).
+  The Styles gallery has its dark look (`style_gallery::sample_look`), and
+  the Table Styles gallery's tiles follow the page since #2087 (below).
 - The views: `Docxy::page_is_dark` (applied theme dark and not
   `light_page`). Print Layout's sheet is `doc_pal.ground`. Web Layout's
   ground is `#262626` dark; with Switch Modes it is the white page
@@ -517,7 +522,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   `page_bg` or the theme background (#2003).
 - View > Appearance > Switch Modes (`Act::SwitchModes`, id `switchmodes`,
   KeyTip `S`, the column's third row): toggles `Docxy::light_page`, per
-  window, not persisted. Enabled only when the applied theme is dark
+  window, not persisted: Word keeps it for the session, not as a saved
+  option, so it resets to the dark page on restart (decided in #2087).
+  Enabled only when the applied theme is dark
   (Auto resolving light counts as light); checked while the light page is
   shown. It reads the window's `applied`, which `set_theme_pref` (the
   theme cycle, `theme-set`) applies at once, not at the next frame, so a
@@ -539,9 +546,50 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   top-level paragraphs only. `uiharness/cases/doc-dark-mode.uit` runs
   `fixtures/dark-mode.docx` (the issue's shapes) dark, with Switch Modes
   and light.
-- Known limits: list numbers inside table cells are not drawn (the
-  fixture's numbered list in a two-column table shows none, dark or
-  light); `w:caps` is not drawn.
+- Known limits of #2079 closed by #2087: list numbers in table cells and
+  `w:caps` are drawn (next section).
+
+## Cell list numbers, All caps, Table Styles tiles (#2087)
+
+- A table cell's list items draw their markers (`table_el`), numbered by
+  `list_markers`' rule (`docs/claude/docx-editing.md` §Lists), counting
+  on from cell to cell in reading order (`TableListCounts`): a list with an
+  item per row draws 1., 2., 3., as in Word. Within a cell a paragraph that
+  is not a list item restarts the count only after an item of that cell.
+  Nested tables count on their own. Not done: Word's document-wide counters
+  (a list continuing past a paragraph, or from the body into a table) and
+  letter, roman and `lvlText` shapes (drawn "N.").
+- All caps (`w:caps`) and Small caps (`w:smallCaps`), direct or from a
+  paragraph or character style (`StyleSheet::shown_run`, a direct explicit
+  off beating the styles; `effective_run`, which the RTF and e-mail exports
+  diff against, keeps the direct ones only), are drawn: `emit_words` draws
+  `run_look::shown_case`, character for character with the stored text (a
+  character whose capital is more than one, ß, stays as stored), so every
+  caret, click and selection offset is the stored text's, and copy, Find,
+  save and export keep its case. All caps wins over small caps. Small caps
+  draws lowercase letters as capitals at `run_look::SMALL_CAPS` (0.8, as
+  LibreOffice) of the size, the rest at full size; a word of both sizes is
+  one box of pieces, so it never wraps inside, each piece its own
+  `WordSpan`. A small piece is centred in the row's one line box, about
+  1 px high at 100%, as runs of mixed sizes are. Tab widths
+  (`inline_width`, `paragraph_el`'s `run_w`) measure the shown text
+  (`shown_case_width`). Not done: terminal `docxy` and docxwasm.
+- The Table Styles gallery (`table_style_gallery`) draws its tiles as the
+  page draws a table on a dark page (`Docxy::page_is_dark`; Switch Modes
+  turns them light): fills through `table_tab::tile_fill`
+  (`dark_page::fill`, an unfilled cell the dark page), lines through
+  `tile_line` (`dark_page::border` on the cell as drawn), the well
+  `PAGE_DARK`, so a tile matches the live preview hovering it shows.
+- Paragraph border colours (`w:pBdr w:color`), a #2079 leftover, were done
+  by #2231 (`effective_borders`, `border_ink`).
+- Harness: `doc {}`'s `inks` (`PaintedInk::kind`, `InkKind`) also gives
+  `markers`, the list numbers and bullets drawn in paint order joined by a
+  space, and `cased`, the runs drawn in another case than stored, as drawn,
+  joined by ` | `. `doc-dark-mode.uit` asserts `markers` `1. 2. 3.` and
+  `cased` `REVENUE | CUSTOMERS | MARGIN | NOTE` on its fixture, dark and
+  light. Small caps have no harness case: the fixture has none and no
+  generator (it is a committed file), so it is not rewritten;
+  `run_look`'s unit tests cover them.
 
 ## Page view vs Word: highlights, list indents, paragraph borders (#2231)
 
