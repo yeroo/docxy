@@ -122,6 +122,7 @@ mod sheet_complete;
 mod sheet_consolidate;
 mod sheet_drag;
 mod sheet_pictures;
+mod sheet_spill;
 mod tab_tear;
 /// The wall-clock bound of the tests that guard against a quadratic cost
 /// (#707): generous, since they run as debug builds on shared CI runners,
@@ -1017,6 +1018,9 @@ struct SheetView {
     /// the frozen row count it was measured at (#2228): a wrapped frozen row
     /// grows past its min height, which the picture layer's panes must follow.
     frozen_band: std::rc::Rc<std::cell::Cell<(usize, f32)>>,
+    /// The text spills the last frame drew (#2240), as (row, first column,
+    /// last column) in sheet columns: the harness's `spill` key.
+    spills: std::rc::Rc<std::cell::RefCell<std::collections::BTreeSet<(u32, u32, u32)>>>,
     /// Why the last commit or sort was refused (an entry over the cell
     /// limit, or a formula that does not parse: `formula_error`; a sort whose
     /// rows cut a spilled array: `SORT_CUTS_SPILL`); the host shows it in
@@ -15912,6 +15916,7 @@ fn new_sheet_surface() -> Surface {
         charts: vec![],
         vlist: ListState::new(0, ListAlignment::Top, px(400.)),
         frozen_band: Default::default(),
+        spills: Default::default(),
         col0: 0,
         follow_sel: (0, 0),
         reveal_col: None,
@@ -16019,6 +16024,7 @@ fn sheet_load(path: &PathBuf, repair: bool, fresh_volatile: bool) -> (Surface, S
                     charts: vec![],
                     vlist: ListState::new(0, ListAlignment::Top, px(400.)),
                     frozen_band: Default::default(),
+                    spills: Default::default(),
                     col0: 0,
                     follow_sel: (0, 0),
                     reveal_col: None,
@@ -38092,6 +38098,7 @@ fn caret_bar_h(height: f32) -> AnyElement {
 /// Synchronous text-width measurement (via the window's text system + the ambient
 /// base font), so a tab can advance content to an absolute tab-stop column
 /// instead of a fixed gap.
+#[derive(Clone)]
 struct Measurer {
     ts: std::sync::Arc<WindowTextSystem>,
     base: Font,
@@ -48031,6 +48038,7 @@ impl Render for Docxy {
                     self.chart_ui(),
                     &tab.pictures,
                     &self.probes,
+                    Measurer::new(window),
                     cx,
                 )
                 .into_any_element(),
@@ -49225,6 +49233,7 @@ fn sheet_row(
     cend: u32,
     comment_cells: &std::collections::HashSet<(u32, u32)>,
     ov: GridOverlay,
+    meas: &Measurer,
 ) -> AnyElement {
     use gridcore::sheet::{Align, CellValue};
     let sh = view.sheet();
@@ -49256,25 +49265,135 @@ fn sheet_row(
     // field points at, else a selection spanning more than one cell — resolved
     // once for the whole grid in `sheet_el`, where the visible rows are known.
     let border_rg = ov.border_rg;
+    // Text wider than its cell runs on over its empty neighbours (#2240),
+    // pane by pane: the frozen columns, then the scrolled window. A source
+    // draws its text in the run's layer instead of in its cell, and the cells
+    // a run covers lose the gridlines between them.
+    let ring_ok = !ov.picking && !ov.sel_hidden;
+    let spill_ctx = sheet_spill::SpillCtx {
+        sheet: sh,
+        styles,
+        show_formulas,
+        d1904,
+        edited: (editing.is_some() && r == sr).then_some(sc),
+    };
+    let frozen_w: f32 = (0..fc).map(|c| col_px(sh.col_width(c))).sum();
+    let panes = (fc > 0)
+        .then(|| (0, fc - 1, SHEET_GUT))
+        .into_iter()
+        .chain([(col0, cend, SHEET_GUT + frozen_w)]);
+    let mut spill_text_off = std::collections::HashSet::new();
+    let mut spill_grid_off = std::collections::HashSet::new();
+    let mut spill_layers = Vec::new();
+    for (a, b, x0) in panes {
+        let runs = sheet_spill::pane_spills(
+            &spill_ctx,
+            r,
+            (a, b),
+            |c| col_px(sh.col_width(c)),
+            |c, xf, line| {
+                let (_, _, bold, italic) = cell_look(view, sidx, has_cf, r, c, Some(xf));
+                meas.width(line, 12., bold, italic)
+            },
+        );
+        for run in runs {
+            view.spills.borrow_mut().insert((r, run.lo, run.hi));
+            let (lo, hi) = (run.lo.max(a), run.hi.min(b));
+            if (a..=b).contains(&run.src) {
+                spill_text_off.insert(run.src);
+            }
+            spill_grid_off.extend(lo..hi);
+            // x of a column in this pane's coordinates, the row's origin at
+            // the gutter's left; a source off the pane measures through the
+            // columns not drawn.
+            let x_of = |c: u32| -> f32 {
+                if c >= a {
+                    x0 + (a..c).map(|cc| col_px(sh.col_width(cc))).sum::<f32>()
+                } else {
+                    x0 - (c..a).map(|cc| col_px(sh.col_width(cc))).sum::<f32>()
+                }
+            };
+            let (run_x, run_r) = (x_of(lo), x_of(hi) + col_px(sh.col_width(hi)));
+            let src_x = x_of(run.src) - run_x;
+            let src_w = col_px(sh.col_width(run.src));
+            let xf = sh.cell(r, run.src).map(|cl| styles.xf(cl.style));
+            let (_, color_rgb, bold, italic) =
+                cell_look(view, sidx, has_cf, r, run.src, xf.as_ref());
+            let is_link = sh.hyperlinks.contains_key(&(r, run.src));
+            // The text sits where the source cell would draw it unclipped:
+            // the source's own box and padding, aligned in it, overflowing
+            // to the side it runs to; the outer box clips it to the run.
+            let mut layer = div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(run_x))
+                .w(px(run_r - run_x))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(src_x))
+                        .w(px(src_w))
+                        .pl(px(4.))
+                        .pr(px(5.))
+                        .pt(px(2.))
+                        .pb(px(3.))
+                        .flex()
+                        .items_center()
+                        .map(|d| match run.dir {
+                            gridcore::overflow::Spill::Right => d.justify_start(),
+                            gridcore::overflow::Spill::Left => d.justify_end(),
+                            gridcore::overflow::Spill::Both => d.justify_center(),
+                        })
+                        .child(
+                            cell_text_el(run.text, color_rgb, is_link, bold, italic, false)
+                                .flex_none(),
+                        ),
+                );
+            // The selected cell's ring stays above the text that crosses it,
+            // as Excel draws it, but under the charts and pictures that come
+            // after the rows.
+            if r == sr && ring_ok && (lo..=hi).contains(&sc) {
+                layer = layer.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(x_of(sc) - run_x))
+                        .w(px(col_px(sh.col_width(sc))))
+                        .border_2()
+                        .border_color(hsla_u(BRAND)),
+                );
+            }
+            spill_layers.push(layer);
+        }
+    }
     // Variable row height: an explicit <row ht> sets a floor (points → px at the
     // app's 15pt≈21px scale); wrapped cells grow the row past it via their
     // natural (min-content) height. items_stretch makes every cell fill it.
     let min_row_h = row_height_px(sh.row_height(r), SHEET_ROW_H);
-    let mut row = h_flex().items_stretch().min_h(px(min_row_h)).child(
-        div()
-            .w(px(SHEET_GUT))
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(if hl_row { selected_header_bg } else { head_bg })
-            .border_r_1()
-            .border_b_1()
-            .border_color(gridline)
-            .text_size(px(11.))
-            .text_color(if hl_row { selected_header_fg } else { head_fg })
-            .child(SharedString::from((r + 1).to_string())),
-    );
+    let mut row = h_flex()
+        .relative()
+        .items_stretch()
+        .min_h(px(min_row_h))
+        .child(
+            div()
+                .w(px(SHEET_GUT))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(if hl_row { selected_header_bg } else { head_bg })
+                .border_r_1()
+                .border_b_1()
+                .border_color(gridline)
+                .text_size(px(11.))
+                .text_color(if hl_row { selected_header_fg } else { head_fg })
+                .child(SharedString::from((r + 1).to_string())),
+        );
     // Merged regions: the top-left cell spans its columns' combined width; cells
     // it covers in the same row are skipped; cells under a vertical merge render
     // blank (content lives only in the top-left).
@@ -49377,30 +49496,7 @@ fn sheet_row(
                 }
             }
         };
-        let mut fill = xf.as_ref().and_then(|x| x.fill);
-        let mut color_rgb = xf.as_ref().and_then(|x| x.color);
-        let mut bold = xf.as_ref().is_some_and(|x| x.bold);
-        let mut italic = xf.as_ref().is_some_and(|x| x.italic);
-        // Conditional formatting overlays the base style where a rule matches.
-        if has_cf {
-            if let Some(dxf) = gridcore::cf::cell_dxf(&view.pkg.workbook, sidx, r, c) {
-                if dxf.fill.is_some() {
-                    fill = dxf.fill;
-                }
-                if dxf.color.is_some() {
-                    color_rgb = dxf.color;
-                }
-                if let Some(b) = dxf.bold {
-                    bold = b;
-                }
-                if let Some(i) = dxf.italic {
-                    italic = i;
-                }
-            }
-        }
-        let color = color_rgb
-            .map(|(r, g, b)| rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32))
-            .unwrap_or(rgb(0x1a1a1a));
+        let (fill, color_rgb, bold, italic) = cell_look(view, sidx, has_cf, r, c, xf.as_ref());
         let bg = if let Some((r, g, b)) = fill {
             rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32).into()
         } else {
@@ -49437,6 +49533,8 @@ fn sheet_row(
             .border_r_1()
             .border_b_1()
             .border_color(if on_freeze { freeze_line } else { gridline })
+            // No gridline inside a text spill's run (#2240).
+            .when(spill_grid_off.contains(&c), |d| d.border_r_0())
             // A thin box border (xf border) darkens all four sides.
             .when(cell_border, |d| d.border_1().border_color(hsla_u(0x7a7a7a)))
             .when(in_range && !selected, |d| d.bg(range_tint))
@@ -49498,25 +49596,14 @@ fn sheet_row(
                 _ => cell.justify_start(),
             };
             if !text.is_empty() {
-                // Hyperlinked cells render as underlined blue and follow on click.
                 let is_link = sh.hyperlinks.contains_key(&(r, c));
+                // A spilling source's text is drawn by its run's layer
+                // (#2240); the cell keeps it, unpainted, so the row keeps the
+                // height the text gives it, line feeds included.
+                let spills = spill_text_off.contains(&c);
                 cell = cell.child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(if is_link { rgb(0x0563c1) } else { color })
-                        .when(is_link, |d| d.underline())
-                        .when(bold, |d| d.font_weight(FontWeight::BOLD))
-                        .when(italic, |d| d.italic())
-                        // Wrap onto multiple lines (bounded to the cell width so
-                        // it actually breaks), or clip to one line.
-                        .map(|d| {
-                            if wrap {
-                                d.whitespace_normal().w_full()
-                            } else {
-                                d.whitespace_nowrap()
-                            }
-                        })
-                        .child(SharedString::from(text)),
+                    cell_text_el(text, color_rgb, is_link, bold, italic, wrap)
+                        .when(spills, |d| d.invisible()),
                 );
             }
         }
@@ -49851,7 +49938,75 @@ fn sheet_row(
         }
         row = row.child(cell);
     }
-    row.into_any_element()
+    // Painted after the cells, over the covered cells' fills.
+    row.children(spill_layers).into_any_element()
+}
+
+/// A grid cell's look, conditional formatting over its style `xf`: fill,
+/// font colour, bold, italic.
+#[allow(clippy::type_complexity)]
+fn cell_look(
+    view: &SheetView,
+    sidx: usize,
+    has_cf: bool,
+    r: u32,
+    c: u32,
+    xf: Option<&gridcore::sheet::Xf>,
+) -> (Option<(u8, u8, u8)>, Option<(u8, u8, u8)>, bool, bool) {
+    let mut fill = xf.and_then(|x| x.fill);
+    let mut color_rgb = xf.and_then(|x| x.color);
+    let mut bold = xf.is_some_and(|x| x.bold);
+    let mut italic = xf.is_some_and(|x| x.italic);
+    // Conditional formatting overlays the base style where a rule matches.
+    if has_cf {
+        if let Some(dxf) = gridcore::cf::cell_dxf(&view.pkg.workbook, sidx, r, c) {
+            if dxf.fill.is_some() {
+                fill = dxf.fill;
+            }
+            if dxf.color.is_some() {
+                color_rgb = dxf.color;
+            }
+            if let Some(b) = dxf.bold {
+                bold = b;
+            }
+            if let Some(i) = dxf.italic {
+                italic = i;
+            }
+        }
+    }
+    (fill, color_rgb, bold, italic)
+}
+
+/// A grid cell's text as the cell draws it: 12 px, its colour (a hyperlink's
+/// underlined blue), bold and italic, wrapped or on one line.
+fn cell_text_el(
+    text: String,
+    color_rgb: Option<(u8, u8, u8)>,
+    is_link: bool,
+    bold: bool,
+    italic: bool,
+    wrap: bool,
+) -> Div {
+    let color = color_rgb
+        .map(|(r, g, b)| rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32))
+        .unwrap_or(rgb(0x1a1a1a));
+    div()
+        .text_size(px(12.))
+        // Hyperlinked cells render as underlined blue and follow on click.
+        .text_color(if is_link { rgb(0x0563c1) } else { color })
+        .when(is_link, |d| d.underline())
+        .when(bold, |d| d.font_weight(FontWeight::BOLD))
+        .when(italic, |d| d.italic())
+        // Wrap onto multiple lines (bounded to the cell width so it actually
+        // breaks), or stay on one line.
+        .map(|d| {
+            if wrap {
+                d.whitespace_normal().w_full()
+            } else {
+                d.whitespace_nowrap()
+            }
+        })
+        .child(SharedString::from(text))
 }
 
 /// The lightweight card deliberately keeps the preview's existing
@@ -51491,9 +51646,12 @@ fn sheet_el(
     chart_ui: ChartUi,
     pics: &std::cell::RefCell<pictures::Cache>,
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
+    meas: Measurer,
     cx: &mut Context<Docxy>,
 ) -> AnyElement {
     let sh = view.sheet();
+    // This frame's rows record their text spills afresh (#2240).
+    view.spills.borrow_mut().clear();
     // The used range and the drawings: the list and the scrollbar reach both.
     let max_c = view.hscroll_max();
     // Frozen columns (freeze panes, cols axis): pinned at the left, always shown.
@@ -51827,6 +51985,7 @@ fn sheet_el(
             cend,
             &cc_frozen,
             ov.clone(),
+            &meas,
         ));
     }
     let ent_list = ent.clone();
@@ -51844,7 +52003,17 @@ fn sheet_el(
             return div().into_any_element();
         };
         let row = vis_list.get(fr + ix).copied().unwrap_or(0);
-        sheet_row(v, &ent_list, row, fc, col0, cend, &cc_list, ov.clone())
+        sheet_row(
+            v,
+            &ent_list,
+            row,
+            fc,
+            col0,
+            cend,
+            &cc_list,
+            ov.clone(),
+            &meas,
+        )
     })
     .with_sizing_behavior(ListSizingBehavior::Auto)
     .flex_1()

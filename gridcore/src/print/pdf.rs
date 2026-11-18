@@ -15,6 +15,7 @@
 use super::hf::{Fields, Sections, render};
 use super::paginate::{Page, Pages, body_points, col_points, heading_points, row_points};
 use super::setup::PrintErrors;
+use crate::overflow;
 use crate::sheet::{Align, CellValue, Workbook, col_name, format_with};
 
 /// Why a job writes no PDF.
@@ -381,28 +382,20 @@ fn draw_page(wb: &Workbook, page: &Page, total: u32, opts: &PdfOptions) -> (f64,
     }
 
     for r in &rows {
-        // What each slot of this row shows, for overflow.
-        let texts: Vec<Option<(String, bool)>> = cols
-            .iter()
-            .map(|col| {
-                let cell = sheet.cell(r.line, col.line)?;
-                let xf = wb.styles.xf(cell.style);
-                let shown = cell_text(
-                    &cell.value,
-                    format_with(&xf, &cell.value, wb.date1904),
-                    ps.errors,
-                );
-                (!shown.is_empty()).then_some((shown, matches!(cell.value, CellValue::Number(_))))
-            })
-            .collect();
         for (i, col) in cols.iter().enumerate() {
-            let Some((text, is_num)) = &texts[i] else {
+            let Some(cell) = sheet.cell(r.line, col.line) else {
                 continue;
             };
-            let cell = sheet
-                .cell(r.line, col.line)
-                .expect("a slot with text has a cell");
             let xf = wb.styles.xf(cell.style);
+            let shown = cell_text(
+                &cell.value,
+                format_with(&xf, &cell.value, wb.date1904),
+                ps.errors,
+            );
+            if shown.is_empty() {
+                continue;
+            }
+            let is_num = matches!(cell.value, CellValue::Number(_));
             let size = xf.font_size.unwrap_or(FONT_PT) * k;
             let pad = PAD * k;
             let align = match xf.align {
@@ -413,49 +406,56 @@ fn draw_page(wb: &Workbook, page: &Page, total: u32, opts: &PdfOptions) -> (f64,
                 },
                 a => a,
             };
-            let mut text = text.clone();
+            // A merge's top-left cell draws across the merge's slots on this
+            // page, aligned in that box (#2240).
+            let merge = sheet.merge_at(r.line, col.line);
+            let merged_to = match merge {
+                Some((mr1, mc1, _, mc2)) if (r.line, col.line) == (mr1, mc1) => {
+                    let mut hi = i;
+                    while hi + 1 < cols.len()
+                        && cols[hi + 1].line > cols[hi].line
+                        && cols[hi + 1].line <= mc2
+                    {
+                        hi += 1;
+                    }
+                    Some(hi)
+                }
+                _ => None,
+            };
+            let own_w = |hi: usize| cols[hi].start + cols[hi].size - col.start;
+            let mut text = shown;
             let mut tw = text_width(&text, xf.bold, size);
-            let room = (col.size - 2.0 * pad).max(0.0);
+            let room = (own_w(merged_to.unwrap_or(i)) - 2.0 * pad).max(0.0);
             // A number never spills: too wide, it fills the cell with #s.
-            if *is_num && tw > room {
+            if is_num && tw > room {
                 let hash = text_width("#", xf.bold, size).max(0.1);
                 text = "#".repeat((room / hash).floor() as usize);
                 tw = text_width(&text, xf.bold, size);
             }
             // Text spills over empty neighbours on the side it runs to.
-            let (mut lo, mut hi) = (i, i);
-            if !*is_num && tw > room {
-                let span = |lo: usize, hi: usize| {
-                    cols[hi].start + cols[hi].size - cols[lo].start - 2.0 * pad
-                };
-                let grow_right = matches!(align, Align::Left | Align::Center);
-                let grow_left = matches!(align, Align::Right | Align::Center);
-                loop {
-                    let mut grew = false;
-                    if span(lo, hi) >= tw {
-                        break;
-                    }
-                    if grow_right && hi + 1 < cols.len() && texts[hi + 1].is_none() {
-                        hi += 1;
-                        grew = true;
-                    }
-                    if span(lo, hi) >= tw {
-                        break;
-                    }
-                    if grow_left && lo > 0 && texts[lo - 1].is_none() {
-                        lo -= 1;
-                        grew = true;
-                    }
-                    if !grew {
-                        break;
-                    }
-                }
-            }
+            let (lo, hi) = match (
+                merged_to,
+                overflow::spill_dir(sheet, &xf, cell, r.line, col.line, false),
+            ) {
+                (Some(hi), _) => (i, hi),
+                (None, Some(dir)) => overflow::spill_span(
+                    i,
+                    0,
+                    cols.len() - 1,
+                    |j| cols[j].size,
+                    |j| !overflow::blocks(sheet, r.line, cols[j].line),
+                    tw,
+                    pad,
+                    dir,
+                ),
+                (None, None) => (i, i),
+            };
             let box_l = cols[lo].start;
             let box_r = cols[hi].start + cols[hi].size;
             let x = match align {
                 Align::Right => box_r - pad - tw,
-                Align::Center => col.start + (col.size - tw) / 2.0,
+                // Centred on its own cell (or its merge), not on the run.
+                Align::Center => col.start + (own_w(merged_to.unwrap_or(i)) - tw) / 2.0,
                 _ => box_l + pad,
             };
             let y = r.start + (r.size * 0.2).max(1.0);

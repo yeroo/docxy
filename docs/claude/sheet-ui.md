@@ -164,3 +164,49 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
 - Fixture: `uiharness/fixtures/pictures.xlsx` (`build_pictures` in
   `uiharness/tests/fixture.rs`), case `uiharness/cases/sheet-pictures.uit`.
   xlsxy still draws pictures with `Resize::Fit` (aspect kept).
+
+## Text that spills over empty neighbours (#2240)
+
+- The rules are `gridcore::overflow`'s, shared by the sheet PDF
+  (`print/pdf.rs` `draw_page`) and the suite's view (`sheet_spill.rs`).
+  Spills: `CellValue::Text`, or a formula shown as text (#676, runs right).
+  Never a number (`####` as before), a boolean, an error, a wrapped cell or
+  a cell in a merge. General/Left run right, Right left, Center both ways,
+  half the excess per side, so a blocked side cuts the text without
+  re-centring it. Blockers: any non-blank cell (a `""` formula result
+  included) and any merged cell; a styled blank is crossed, and so is a
+  hidden column. `Xf` models no indent or shrink-to-fit, so neither counts.
+- `spill_span` grows a slot at a time over a width closure: its work is the
+  text's width, never the distance to the pane. The PDF passes page slots
+  (title columns chained with the page's). A merge's top-left cell prints
+  across the merge's slots on the page; the PDF draws no wrap, so a wrapped
+  long text is cut at its cell.
+- Freeze panes: each pane is its own window onto the sheet, as measured in
+  Excel by a third-party viewer
+  (yukiyokotani/office-open-xml-viewer#1973, PR #1978). `pane_spills` takes
+  the pane's cells plus `prev_blocker`/`next_blocker` around it, computes the
+  run in sheet columns and the row clips it to the pane. So a frozen text
+  joins the scrolled columns seamlessly unscrolled, a right-aligned text past
+  the split runs back into the frozen pane, and a source scrolled off still
+  shows its part. An ASCII source that surely fits, or is too far off to
+  reach, is not shaped (14.4 px a character bounds a 12 px ASCII glyph);
+  any other text is shaped first, since an emoji or U+FDFD has no such bound.
+- Drawing (`sheet_row`): the source keeps its text child, `invisible()`, so
+  its row keeps the line's height (24 px; a blank row is 21 px, and without
+  the child the row shrank and flipped as the editor opened); one absolute layer
+  per run, after the row's cells, holds the text in the source cell's own
+  box and padding (4 px left, 5 right, 2 top, 3 bottom), aligned in it and
+  overflowing to its side, clipped to the run. It has no listeners, so a
+  press reaches the covered cell. Cells inside a run drop their right
+  gridline. A selected cell in a run gets its ring again in the layer, above
+  the glyphs; the layer stays in the row's paint order, under charts,
+  pictures and the deferred editor. Not redrawn above the text: a covered
+  cell's comment corner and error triangle.
+- Widths: `Measurer::new(window)`, built in `render`, at 12 px with the
+  cell's bold/italic (conditional formatting included); a line feed in an
+  unwrapped text measures its widest line (gpui's `shape_line` refuses a
+  `\n`). The edited cell blocks every run and spills nothing, so the in-cell
+  editor (and edit-in-cell off's plain entry, #672) covers the text.
+- The harness's `spill` key lists the runs the last frame drew (`A8:E8`, a
+  run in both panes once) and `sel_row_px` the active row's laid-out
+  height; case `uiharness/cases/sheet-spill.uit`.
