@@ -10512,8 +10512,9 @@ impl Engine {
     }
 
     /// Drops the queued op `seq` (`Store::drop_op`), telling a failed
-    /// statement (#2215): the op then stays queued and the next drain runs
-    /// it again. The caller carries on as if it were dropped.
+    /// statement (#2215): the op then stays queued and every drain runs it
+    /// again while the drop keeps failing (what that repeats:
+    /// `Store::drop_op`). The caller carries on as if it were dropped.
     fn drop_op(&self, seq: i64) {
         if let Err(e) = self.store.drop_op(seq) {
             self.emit(SyncEvent::Error(format!(

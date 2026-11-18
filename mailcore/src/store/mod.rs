@@ -4818,10 +4818,15 @@ impl Store {
     /// given up). A `seq` that's already gone just means zero rows change,
     /// not an error. A failed statement (above all a busy store) is an
     /// `Err` (#2215), which the engine reports: the op then stays queued
-    /// and the next drain applies it again. That is harmless for most ops,
-    /// but a create Graph already made (`CreateEvent`, `CreateContact`,
-    /// `CreateFolder`, `CopyFolder`) is made twice. A send is not: its
-    /// re-run checks delivery first (`send_posted`, #1874).
+    /// and every drain applies it again while the drop keeps failing. Most
+    /// ops repeat harmlessly. A create is guarded by its re-key: a
+    /// `CreateContact`, `CreateFolder` or `CopyFolder` whose `local:` id
+    /// resolves sends nothing, and a `CreateEvent` finds no `local:` row
+    /// (`Parse` until quarantine). A send whose `/send` POST went out
+    /// checks delivery first (`send_posted`, #1874). What does repeat: a
+    /// `ForwardEvent` forwards again, an RSVP with a response sent may mail
+    /// the organiser again, and a send `fail_send` gave up on (its POST
+    /// refused, the draft returned and `SendFailed` told) is tried again.
     pub fn drop_op(&self, seq: i64) -> Result<(), StoreError> {
         self.conn
             .execute("DELETE FROM outbox WHERE seq = ?1", params![seq])?;

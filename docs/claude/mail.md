@@ -5378,11 +5378,16 @@ document it). The engine handed that error, or a throttle, offline or refused to
 - The outbox bookkeeping goes through the engine's `drop_op` / `bump_op_attempts`
   helpers, which tell `Error("outbox drop of op {seq} failed: {e}")` /
   `Error("outbox attempt count of op {seq} failed: {e}")` and change no control flow.
-  A lost drop leaves the op queued, and the next drain runs it again. That is harmless
-  for most ops, but a create Graph already made (`CreateEvent`, `CreateContact`,
-  `CreateFolder`, `CopyFolder`) is made twice, which the host should hear of. A send is
-  not: its re-run checks delivery first (`send_posted`, #1874). A lost attempt count
-  only leaves the attempt uncounted. A drain works from a snapshot of the queue, so a
+  A lost drop leaves the op queued, and every drain runs it again while the drop keeps
+  failing. Most ops repeat harmlessly. The creates are guarded by their re-key: a
+  `CreateContact`, `CreateFolder` or `CopyFolder` whose `local:` id resolves sends
+  nothing, and a `CreateEvent` finds no `local:` row (`Parse` until quarantine). A send
+  whose `/send` POST went out checks delivery first (`send_posted`, #1874). What does
+  repeat, and is why the host should hear of it: a `ForwardEvent` forwards again
+  (`outbox.rs`: a lost 202 does too), an RSVP with a response sent may mail the
+  organiser again, and a send `fail_send` gave up on (its POST refused, the draft back
+  in Drafts, `SendFailed` told) is tried again. A lost attempt count only leaves the
+  attempt uncounted. A drain works from a snapshot of the queue, so a
   refused drop never repeats an op within the same drain.
 - Tests: `optimistic_write_tests` `*_reports_a_busy_store_2215` (`Fixture::check_with`,
   `check` for any stored state). In `engine.rs` `mailbox_change`, a trigger refuses each
