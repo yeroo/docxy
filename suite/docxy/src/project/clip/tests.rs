@@ -373,6 +373,70 @@ fn tsv_keeps_all_but_one_trailing_line_break() {
     assert_eq!(parse_tsv("A\n\n"), [["A"], [""]]);
 }
 
+/// #1120: a lone CR breaks a line, as the sheet's entry paste takes it, and
+/// it is one trailing break like CR LF.
+#[test]
+fn tsv_takes_a_lone_cr_as_a_line_break() {
+    assert_eq!(parse_tsv("A\rB"), [["A"], ["B"]]);
+    assert_eq!(parse_tsv("A\r"), [["A"]]);
+    assert_eq!(
+        parse_tsv("A\tB\rC\r\nD\r"),
+        [vec!["A", "B"], vec!["C"], vec!["D"]]
+    );
+}
+
+/// #1120: control characters in a field are dropped, C1 and DEL too, as the
+/// cell editor's paste drops them; a field of only them is empty.
+#[test]
+fn tsv_drops_control_characters_from_each_field() {
+    assert_eq!(
+        parse_tsv("A\x0bB\x1b\tC\x0c\u{85}\u{7f}\n\x00D\t\x0b\x1b"),
+        [vec!["AB", "C"], vec!["D", ""]]
+    );
+}
+
+/// #1120: a closed-editor paste commits no control character: on an
+/// existing row and on the entry row, each one undo step.
+#[test]
+fn a_paste_drops_control_characters_from_the_fields() {
+    let mut t = tab();
+    at(&mut t, 0, COL_NAME);
+    paste_project_text(&mut t, "X\x0bY\x1b\t3\x0cd");
+    assert_eq!(tasks(&t)[0], (1, "XY".into(), 1440));
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    undo(&mut t);
+    assert_eq!(tasks(&t)[0], (1, "A".into(), 960));
+
+    at(&mut t, 2, COL_NAME);
+    paste_project_text(&mut t, "N\x1be\x00w\x0b\r\n");
+    assert_eq!(tasks(&t)[2].1, "New");
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    assert!(
+        !v(&t)
+            .ed
+            .project()
+            .tasks
+            .iter()
+            .any(|t| t.name.chars().any(char::is_control))
+    );
+}
+
+/// #1120: a field that is only control characters pastes as an empty
+/// field: it clears an existing task's Name and makes no task on the entry
+/// row.
+#[test]
+fn a_field_of_only_control_characters_pastes_as_an_empty_field() {
+    let mut t = tab();
+    at(&mut t, 0, COL_NAME);
+    paste_project_text(&mut t, "\x0b\x1b");
+    assert_eq!(tasks(&t)[0], (1, String::new(), 960));
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+
+    at(&mut t, 2, COL_NAME);
+    paste_project_text(&mut t, "\x0b\x1b\r\n");
+    assert_eq!((tasks(&t).len(), v(&t).ed.undo_depth()), (2, 1));
+}
+
 #[test]
 fn an_empty_copied_cell_pastes_as_an_emptied_cell() {
     for text in ["", "\r\n"] {

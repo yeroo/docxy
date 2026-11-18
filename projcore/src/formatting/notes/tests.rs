@@ -136,3 +136,20 @@ fn rich_notes_json_lists_the_formatted_tasks_only() {
     );
     assert_eq!(rich_notes_json(&stripped(&plan())), Json::Obj(Vec::new()));
 }
+
+/// Issue #1120: a note's markup drops the characters XML 1.0 forbids, so
+/// the part reads back with the rest of the markup in order.
+#[test]
+fn note_markup_drops_xml_invalid_characters() {
+    let proj = Project {
+        tasks: vec![task(1, Some("ab"), Some("<p>a\x0b\x1b\0b\u{FFFE}</p>"))],
+        ..Project::default()
+    };
+    let xml = part_xml(&proj).unwrap();
+    assert!(!xml.contains(['\x0b', '\x1b', '\0', '\u{FFFE}']), "{xml:?}");
+    assert!(xml.contains(" markup=\"&lt;p&gt;ab&lt;/p&gt;\""), "{xml}");
+    assert_eq!(
+        read_notes(&xml).unwrap(),
+        vec![(1, "<p>ab</p>".to_string())]
+    );
+}

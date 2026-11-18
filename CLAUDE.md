@@ -103,7 +103,8 @@ issue number to find its notes.
   UI plugins (#1532, #1553, #1572, #1609), dialog values that follow (#1670), overlay text
   style (#1668), the rich-text control (#1557), grid `cell` columns (#1558).
 - `docs/claude/project-formats.md`: before changing Project file reading or writing:
-  format plugins (#1702, #1801), MPX import (#309, #1805), `.mpp` custom fields (#292).
+  format plugins (#1702, #1801), MPX import (#309, #1805), `.mpp` custom fields (#292),
+  characters XML 1.0 forbids dropped from the save and the closed-editor paste (#1120).
 - `docs/claude/project-text-styles.md`: before changing Project's text styles or the
   task facts they style: strikethrough and pattern (#1664), categories the host computes
   (#1665), categories that need a model feature: Marked, Highlight, changed cells (#1667).

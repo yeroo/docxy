@@ -133,3 +133,17 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing Project file rea
   `custom_field_oracles` lists both FieldIDs as exclusions and asserts each is
   needed; `custom_fields_round_trip_through_mspdi` covers `.xml` and `.yppx`
   Save As (one `write_mspdi`).
+
+## XML-invalid characters (#1120)
+
+- The Project save writes no character XML 1.0 forbids (C0 controls but tab,
+  LF and CR; U+FFFE, U+FFFF): `mspdi::xml_char` filters `esc_into` (all MSPDI
+  text), `formatting::push_attr` (every `.yppx` part's attributes) and
+  `formatting/notes.rs` `push_markup`. They are dropped, not escaped: `&#11;`
+  is not well-formed either. C1 controls and DEL are legal and kept. The
+  readers and the model setters do not filter.
+- The closed-editor paste (`suite/docxy/src/project/clip.rs` `parse_tsv`)
+  takes a lone CR as a line break, as the sheet's entry paste does, and drops
+  `char::is_control` characters from each field, as `LineEdit::paste`
+  (`suite/docxy/src/project/cell.rs`) does; a field of only control
+  characters is an empty field (it clears Name).

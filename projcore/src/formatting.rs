@@ -530,7 +530,8 @@ pub(crate) fn push_attr(out: &mut String, name: &str, value: &str) {
     out.push(' ');
     out.push_str(name);
     out.push_str("=\"");
-    for c in value.chars() {
+    // A character XML 1.0 forbids is dropped (#1120).
+    for c in value.chars().filter(|&c| crate::mspdi::xml_char(c)) {
         match c {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
@@ -631,6 +632,30 @@ mod tests {
             },
         );
         f
+    }
+
+    /// Issue #1120: an attribute drops the characters XML 1.0 forbids and
+    /// keeps the rest, so the part still reads.
+    #[test]
+    fn attributes_drop_xml_invalid_characters() {
+        let mut out = String::new();
+        push_attr(&mut out, "font", "Se\x0bgoe\x1b <UI>\0\u{FFFF}");
+        assert_eq!(out, r#" font="Segoe &lt;UI&gt;""#);
+        let mut f = Formatting::default();
+        f.set_category(
+            "All",
+            TextStyle {
+                font: Some("A\x0cri\x01al".into()),
+                pattern: Some("zig\x1bzag".into()),
+                ..TextStyle::default()
+            },
+        );
+        let xml = f.to_xml();
+        assert!(!xml.contains(['\x0c', '\x01', '\x1b']), "{xml:?}");
+        let back = Formatting::from_xml(&xml).unwrap();
+        let style = back.category("All").unwrap();
+        assert_eq!(style.font.as_deref(), Some("Arial"));
+        assert_eq!(style.pattern.as_deref(), Some("zigzag"));
     }
 
     #[test]

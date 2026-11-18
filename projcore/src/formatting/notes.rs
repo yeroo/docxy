@@ -48,10 +48,11 @@ pub fn part_xml(proj: &Project) -> Option<String> {
 }
 
 /// ` markup="…"`, escaping what an attribute must keep: the markup's tags,
-/// quotes, and its newlines and tabs as character references.
+/// quotes, and its newlines and tabs as character references. A character
+/// XML 1.0 forbids is dropped (#1120).
 fn push_markup(out: &mut String, value: &str) {
     out.push_str(" markup=\"");
-    for c in value.chars() {
+    for c in value.chars().filter(|&c| crate::mspdi::xml_char(c)) {
         match c {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
