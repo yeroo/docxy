@@ -696,13 +696,7 @@ pub(crate) fn apply_format(ed: &mut Editor, pkg: Option<&mut Package>, f: &DocFo
             // reserved one where the package defines those otherwise.
             let bullet = *f == DocFormat::Bullets;
             let ids = list_ids(pkg.as_deref());
-            if let Some(pkg) = pkg {
-                if ids.id(bullet) == ListIds::OWN.id(bullet) {
-                    pkg.add_markdown_numbering();
-                } else {
-                    ids.define(Some(pkg), bullet);
-                }
-            }
+            ids.define(pkg, bullet);
             let num = ids.id(bullet);
             Box::new(move |ed| toggle_list(ed, num))
         }

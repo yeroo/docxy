@@ -34786,8 +34786,10 @@ fn no(mut f: impl FnMut()) -> bool {
 }
 
 /// The commands that are plain edits of the document editor (formatting,
-/// alignment, styles, lists, indent): what `dispatch` runs for them, and what
-/// Repeat (#618) replays. Every other command does nothing here.
+/// alignment, styles, indent): what `dispatch` runs for them, and what
+/// Repeat (#618) replays. Every other command does nothing here, Bullets
+/// and Numbers included: they take the document's list (`ListIds`, #2087),
+/// in `run_act` and as `Repeat::List`.
 fn apply_doc_act(e: &mut Editor, act: Act) {
     use Act::*;
     match act {
@@ -34818,11 +34820,6 @@ fn apply_doc_act(e: &mut Editor, act: Act) {
         HRule => e.insert_hrule(),
         SelectAll => e.select_all(),
         Case => e.cycle_case(),
-        // Toggle: if every selected paragraph is already in this list, drop
-        // it; otherwise apply it. docxy's own lists: `run_act` and Repeat
-        // apply the document's (`ListIds`, #2087).
-        Bullets => toggle_list(e, NUM_BULLET),
-        Numbers => toggle_list(e, NUM_DECIMAL),
         IndentInc => e.change_indent(720),
         IndentDec => e.change_indent(-720),
         Sort => e.sort_paragraphs(),
@@ -34831,6 +34828,9 @@ fn apply_doc_act(e: &mut Editor, act: Act) {
         Title => e.set_para_style(Some("Title")),
         Subtitle => e.set_para_style(Some("Subtitle")),
         ClearFmt => e.clear_run_formatting(),
+        // The document's list: `run_act` and `Repeat::List` (`ListIds`,
+        // #2087).
+        Bullets | Numbers => {}
         Project(_) | Ext(_) | Sheet(_) | Cut | Copy | Paste | PasteKeepSource | PasteTextOnly
         | PasteSpecial | LaunchFont | LaunchParagraph | Find | FontColor | Highlight | FontName
         | FontSize | NewComment | ShowHide | ToggleComments | ShowComments | ResolveComment
@@ -35715,13 +35715,33 @@ mod repeat_tests {
         // No part, or one defining them as docxy does: 1 and 2.
         assert_eq!(ListIds::of(None), ListIds::OWN);
         assert_eq!(ListIds::of(Some(&part("bullet", "decimal"))), ListIds::OWN);
-        // A part that defines neither: 1 and 2.
+        // A part that defines neither (r2): nothing would define 1 or 2,
+        // so the reserved lists, which `define` writes.
         let other = parse_numbering_xml(
             r#"<w:numbering><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum>
             <w:num w:numId="7"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
         );
-        assert_eq!(ListIds::of(Some(&other)), ListIds::OWN);
-        // numId 1 decimal: the bullets take 9990.
+        assert_eq!(
+            ListIds::of(Some(&other)),
+            ListIds {
+                bullet: BULLET_LIST_NUM_ID,
+                decimal: NUMBER_LIST_NUM_ID
+            }
+        );
+        // A part that defines 1 as bullets only: bullets keep 1, numbers
+        // take 9991.
+        let one = parse_numbering_xml(
+            r#"<w:numbering><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/></w:lvl></w:abstractNum>
+            <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
+        );
+        assert_eq!(
+            ListIds::of(Some(&one)),
+            ListIds {
+                bullet: NUM_BULLET,
+                decimal: NUMBER_LIST_NUM_ID
+            }
+        );
+        // numId 1 decimal: the bullets take 9990 (2 defined, decimal, stays).
         assert_eq!(
             ListIds::of(Some(&part("decimal", "decimal"))),
             ListIds {
@@ -35777,10 +35797,25 @@ mod repeat_tests {
         toggle_list(&mut ed, shown.bullet);
         assert!(!ed.all_in_list(shown.bullet));
         assert_eq!(list_markers(&ed.doc.body, Some(&numbering)), [None, None]);
-        // Numbers there keep numId 1's neighbour, docxy's own 2: no part write.
-        let stamp = pkg.parts_stamp();
+        // Numbers there (r2): the part leaves 2 undefined, so docxy's
+        // reserved numbered list, defined in the part.
+        assert_eq!(ids.decimal, docxcore::package::NUMBER_LIST_NUM_ID);
         ids.define(Some(&mut pkg), false);
-        assert_eq!(pkg.parts_stamp(), stamp);
+        let numbering = numbering_of(&pkg);
+        assert!(numbering.defines(ids.decimal));
+        toggle_list(&mut ed, ids.decimal);
+        assert_eq!(
+            list_markers(&ed.doc.body, Some(&numbering)),
+            [Some("1. ".to_string()), Some("2. ".to_string())]
+        );
+        // A package with no numbering part keeps docxy's own 1 and 2, and
+        // `define` gives it the part that defines them.
+        let mut bare = docxcore::package::new_package(ed.doc.clone());
+        assert!(bare.part("word/numbering.xml").is_none());
+        assert_eq!(ListIds::of(None), ListIds::OWN);
+        ListIds::OWN.define(Some(&mut bare), true);
+        let numbering = numbering_of(&bare);
+        assert!(numbering.defines(NUM_BULLET) && numbering.defines(NUM_DECIMAL));
     }
 
     /// Each list counts on its own (#2087 r1): two numbered lists side by
@@ -35817,6 +35852,20 @@ mod repeat_tests {
         assert_eq!(
             list_markers(&[p(3), p(3), p(4), p(4), p(3)], n),
             [s("1. "), s("2. "), s("1. "), s("2. "), s("3. ")]
+        );
+        // Two numIds on one abstract share a count (r2), as
+        // `compute_markers` and Word count them.
+        let shared = docxcore::numbering::parse_numbering_xml(
+            r#"<w:numbering>
+            <w:abstractNum w:abstractNumId="0">
+              <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>
+            <w:num w:numId="3"><w:abstractNumId w:val="0"/></w:num>
+            <w:num w:numId="4"><w:abstractNumId w:val="0"/></w:num>
+            </w:numbering>"#,
+        );
+        assert_eq!(
+            list_markers(&[p(3), p(4)], Some(&shared)),
+            [s("1. "), s("2. ")]
         );
         // Column A numId 3, column B numId 4, an item per row.
         let mut counts = TableListCounts::new();
@@ -39307,10 +39356,13 @@ fn has_page_break(b: &Block) -> bool {
 /// bulleted as its level's format says (#2087: a Word document's numId 1 is
 /// often its decimal list); any other keeps docxy's own rule, numId 2
 /// (`NUM_DECIMAL`) numbered and the rest bulleted, for its lists before the
-/// first save writes their definitions. Numbers count per list (numId)
-/// within `body`, as Word and `docxcore::numbering` count them: a deeper
-/// level, a bullet one included, restarts only the levels below it, and
-/// every count restarts after a paragraph that is not a list item.
+/// first save writes their definitions. Numbers count per list, lists on
+/// one abstract numbering sharing a count, as Word and
+/// `docxcore::numbering::compute_markers` count them, and a deeper level, a
+/// bullet one included, restarts only the levels below it. The view's own
+/// rule, not Word's: every count restarts after a paragraph that is not a
+/// list item (docxy's own lists share numId 1 and 2). Not done:
+/// `w:lvlOverride` / `w:startOverride` restarts.
 fn list_markers(
     body: &[Block],
     numbering: Option<&docxcore::numbering::Numbering>,
@@ -39318,18 +39370,37 @@ fn list_markers(
     list_markers_counting(body, numbering, &mut ListCounts::new(), true)
 }
 
-/// Each list's (numId's) count per level, for [`list_markers`].
-type ListCounts = std::collections::HashMap<i32, Vec<u32>>;
+/// Each list's count per level, for [`list_markers`], keyed by
+/// [`ListKey`].
+type ListCounts = std::collections::HashMap<ListKey, Vec<u32>>;
+
+/// What a list counts in (#2087 r2): its abstract numbering where the
+/// package defines it (`Numbering::abstract_of`), so two numIds on one
+/// abstract share a count; else its own numId.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ListKey {
+    Abstract(i32),
+    Num(i32),
+}
+
+impl ListKey {
+    fn of(num_id: i32, numbering: Option<&docxcore::numbering::Numbering>) -> Self {
+        numbering
+            .and_then(|n| n.abstract_of(num_id))
+            .map_or(ListKey::Num(num_id), ListKey::Abstract)
+    }
+}
 
 /// The lists Bullets and Numbers apply in a document (#2087 r1), and
 /// AutoCorrect's `* ` and `1. `: docxy's own numId 1 (`NUM_BULLET`) and 2
-/// (`NUM_DECIMAL`), unless the document's numbering part defines that id as
-/// the other kind (at level 0, bullet or not: a Word document's numId 1 is
-/// often its decimal list); then [`Package::ensure_list`]'s own id
-/// (`BULLET_LIST_NUM_ID` 9990, `NUMBER_LIST_NUM_ID` 9991), which
-/// [`ListIds::define`] gives the part. A document with no numbering part,
-/// or one that leaves 1 and 2 undefined or defines them as docxy does,
-/// keeps 1 and 2.
+/// (`NUM_DECIMAL`) in a document with no numbering part, or one whose part
+/// defines that id as the same kind (at level 0, bullet or not); else, a
+/// part that defines it as the other kind (a Word document's numId 1 is
+/// often its decimal list) or leaves it undefined (r2: nothing would ever
+/// define it, as `Package::add_markdown_numbering` leaves an existing part
+/// alone), [`Package::ensure_list`]'s own id (`BULLET_LIST_NUM_ID` 9990,
+/// `NUMBER_LIST_NUM_ID` 9991). [`ListIds::define`] gives the part the
+/// list either way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ListIds {
     pub bullet: i32,
@@ -39348,11 +39419,13 @@ impl ListIds {
         use docxcore::numbering::NumFmt;
         use docxcore::package::{BULLET_LIST_NUM_ID, NUMBER_LIST_NUM_ID};
         let pick = |own: i32, bullet: bool, reserved: i32| {
-            let other_kind = numbering.filter(|n| n.defines(own)).is_some_and(|n| {
-                let fmt = n.level(own, 0).map_or(NumFmt::Decimal, |l| l.format);
-                (fmt == NumFmt::Bullet) != bullet
+            let keeps_own = numbering.is_none_or(|n| {
+                n.defines(own) && {
+                    let fmt = n.level(own, 0).map_or(NumFmt::Decimal, |l| l.format);
+                    (fmt == NumFmt::Bullet) == bullet
+                }
             });
-            if other_kind { reserved } else { own }
+            if keeps_own { own } else { reserved }
         };
         ListIds {
             bullet: pick(NUM_BULLET, true, BULLET_LIST_NUM_ID),
@@ -39365,15 +39438,21 @@ impl ListIds {
         if bullet { self.bullet } else { self.decimal }
     }
 
-    /// Give `pkg`'s numbering part the list `bullet` names when it is
-    /// [`Package::ensure_list`]'s, so the next frame's markers (`run_look`'s
-    /// cache reads the part again, its stamp moved) and a save show it.
-    /// docxy's own 1 and 2 are left to the save, as before.
+    /// Give `pkg` the definition of the list `bullet` names, so the next
+    /// frame's markers (`run_look`'s cache reads the part again, its stamp
+    /// moved) and a save show it: [`Package::ensure_list`]'s for its own
+    /// id; for docxy's own 1 and 2, the numbering part
+    /// [`Package::add_markdown_numbering`] adds to a package that has none
+    /// (with a part, [`ListIds::of`] keeps 1 and 2 only where it defines
+    /// them). A tab with no package yet gets them when it is given one.
     pub(crate) fn define(self, pkg: Option<&mut Package>, bullet: bool) {
-        if self.id(bullet) != ListIds::OWN.id(bullet) {
-            if let Some(pkg) = pkg {
-                pkg.ensure_list(bullet);
-            }
+        let Some(pkg) = pkg else {
+            return;
+        };
+        if self.id(bullet) == ListIds::OWN.id(bullet) {
+            pkg.add_markdown_numbering();
+        } else {
+            pkg.ensure_list(bullet);
         }
     }
 }
@@ -39430,7 +39509,7 @@ fn list_markers_counting(
                 had_item = true;
                 let ilvl = p.props.ilvl as usize;
                 let num_id = p.props.num_id.unwrap_or_default();
-                let list = counts.entry(num_id).or_default();
+                let list = counts.entry(ListKey::of(num_id, numbering)).or_default();
                 if numbered(num_id, p.props.ilvl) {
                     if list.len() <= ilvl {
                         list.resize(ilvl + 1, 0);
