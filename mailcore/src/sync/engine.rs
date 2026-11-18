@@ -3585,10 +3585,20 @@ impl Engine {
                 // addresses this draft by (a `local:` id if it was never
                 // pushed, else its Graph id); `apply_op` resolves/reconciles
                 // the Graph side, this only touches the local row. A send
-                // that fails for good undoes it (`fail_send`).
-                self.store.mark_sent(&id);
-                if let Some(sent_id) = self.sent_items_folder_id() {
-                    let _ = self.store.move_message(&id, &sent_id);
+                // that fails for good undoes it (`fail_send`). A failed
+                // `mark_sent` is told (#2215) and skips the re-file: the row
+                // stays a draft where it is (a busy store would refuse the
+                // move too, after another wait), the queued op still sends,
+                // and the syncs after the send (`sync_after_send`) file it.
+                match self.store.mark_sent(&id) {
+                    Ok(()) => {
+                        if let Some(sent_id) = self.sent_items_folder_id() {
+                            let _ = self.store.move_message(&id, &sent_id);
+                        }
+                    }
+                    Err(e) => self.emit(SyncEvent::Error(format!(
+                        "local mark-sent of {id} failed: {e}"
+                    ))),
                 }
                 self.emit(SyncEvent::Sending { id });
                 self.drain_queued();
@@ -3645,8 +3655,16 @@ impl Engine {
                 // Move/Delete: reflect the RSVP immediately, before the
                 // outbox drain even reaches Graph.
                 // The response time is now, as Graph will stamp it (#2068).
-                self.store
-                    .set_event_response(&id, &kind, &unix_to_iso8601(now_unix()));
+                // A failed write is told and the RSVP still queued (#2215),
+                // as `MarkRead`'s (#2209).
+                if let Err(e) =
+                    self.store
+                        .set_event_response(&id, &kind, &unix_to_iso8601(now_unix()))
+                {
+                    self.emit(SyncEvent::Error(format!(
+                        "local response of {id} ({kind}) failed: {e}"
+                    )));
+                }
                 self.emit(SyncEvent::CalendarUpdated);
                 self.enqueue_and_drain(OutboxOp::RespondEvent {
                     id,
@@ -6209,7 +6227,7 @@ impl Engine {
             }
             match self.apply_op_with_retry(&row) {
                 Ok(applied) => {
-                    self.store.drop_op(row.seq);
+                    self.drop_op(row.seq);
                     self.clear_op_backoff();
                     // A copy's contents are synced once the drain ends.
                     if let (OutboxOp::CopyFolder { .. }, Applied::FolderCreated { id, .. }) =
@@ -6279,7 +6297,7 @@ impl Engine {
                     let retryable_5xx =
                         matches!(&other, GraphError::Http { status, .. } if *status >= 500);
                     if retryable_5xx {
-                        self.store.bump_op_attempts(row.seq, &other.to_string());
+                        self.bump_op_attempts(row.seq, &other.to_string());
                         self.op_retry = Some(Instant::now() + self.op_backoff);
                         self.op_backoff = (self.op_backoff * 2).min(BACKOFF_MAX);
                         deferred = true;
@@ -6304,7 +6322,7 @@ impl Engine {
                     // one `Error`, and no quarantine, whose reconverge
                     // would have nothing to bring back.
                     if let Some(e) = direct_op_refusal(&row.op, &other) {
-                        self.store.drop_op(row.seq);
+                        self.drop_op(row.seq);
                         self.emit(SyncEvent::Error(e));
                         continue;
                     }
@@ -6319,7 +6337,7 @@ impl Engine {
                     // other than a 404 the message is read again, as no
                     // delta re-reports a message Graph never changed.
                     if let Some(id) = message_reminder_op_id(&row.op) {
-                        self.store.drop_op(row.seq);
+                        self.drop_op(row.seq);
                         if !matches!(other, GraphError::NotFound) {
                             let action = match row.op {
                                 OutboxOp::DismissMessageReminder { .. } => {
@@ -6334,7 +6352,7 @@ impl Engine {
                         continue;
                     }
                     if let Some(event) = reminder_op_event(&row.op) {
-                        self.store.drop_op(row.seq);
+                        self.drop_op(row.seq);
                         if !matches!(other, GraphError::NotFound) {
                             let action = match row.op {
                                 OutboxOp::DismissReminder { .. } => "dismiss reminder",
@@ -6355,7 +6373,7 @@ impl Engine {
                     if matches!(row.op, OutboxOp::CancelEvent { .. })
                         && matches!(other, GraphError::NotFound)
                     {
-                        self.store.drop_op(row.seq);
+                        self.drop_op(row.seq);
                         self.reset_calendars();
                         continue;
                     }
@@ -6373,7 +6391,7 @@ impl Engine {
                     }
                     let attempts_after = row.attempts + 1;
                     if attempts_after >= MAX_OP_ATTEMPTS {
-                        self.store.drop_op(row.seq);
+                        self.drop_op(row.seq);
                         // Reconverge with server truth: the op's optimistic
                         // local write (e.g. a Delete that hid a message Graph
                         // still has) would otherwise linger, and an unchanged
@@ -6408,7 +6426,7 @@ impl Engine {
                             self.reset_calendars();
                         }
                     } else {
-                        self.store.bump_op_attempts(row.seq, &other.to_string());
+                        self.bump_op_attempts(row.seq, &other.to_string());
                     }
                     // Keep draining the rest of the queue.
                 }
@@ -6472,7 +6490,7 @@ impl Engine {
                 .map(|(photo, _)| photo),
             ContactWrite::Update | ContactWrite::Delete => None,
         };
-        self.store.drop_op(row.seq);
+        self.drop_op(row.seq);
         match write {
             ContactWrite::Create => {
                 let _ = self.store.discard_contact_row(&id);
@@ -6572,7 +6590,7 @@ impl Engine {
             .store
             .current_folder_id(queued_id)
             .unwrap_or_else(|_| queued_id.to_string());
-        self.store.drop_op(row.seq);
+        self.drop_op(row.seq);
         let mut also_discarded = Vec::new();
         let mut discarded_copies = Vec::new();
         match &row.op {
@@ -6837,7 +6855,7 @@ impl Engine {
         self.resume_bulk(seq);
         if self.bulk.is_none() {
             if folder.starts_with("local:") {
-                self.store.drop_op(seq);
+                self.drop_op(seq);
                 self.end_write_progress(seq, &folder, FolderWrite::MarkRead);
                 return BulkStep::Finished;
             }
@@ -7096,7 +7114,7 @@ impl Engine {
     /// (`MarkFolderRead`, #1913; `DeleteFolder`, #2107), as the drain gives
     /// any op: its attempts bumped, never quarantined.
     fn defer_op(&mut self, seq: i64, error: &str) {
-        self.store.bump_op_attempts(seq, error);
+        self.bump_op_attempts(seq, error);
         self.op_retry = Some(Instant::now() + self.op_backoff);
         self.op_backoff = (self.op_backoff * 2).min(BACKOFF_MAX);
     }
@@ -7116,7 +7134,7 @@ impl Engine {
             );
             (Some(*status), error)
         });
-        self.store.drop_op(seq);
+        self.drop_op(seq);
         self.clear_op_backoff();
         match failure {
             Some((status, error)) => self.refuse_mark_read(seq, folder, status, error),
@@ -7133,7 +7151,7 @@ impl Engine {
     /// not. The run's last `FolderWriteProgress` (#2128) follows, with the
     /// counts it reached.
     fn refuse_mark_read(&mut self, seq: i64, folder: &str, status: Option<u16>, error: String) {
-        self.store.drop_op(seq);
+        self.drop_op(seq);
         let _ = self.store.restart_folder_delta(folder);
         self.report_folder_failure(folder, FolderWrite::MarkRead, status, error);
         self.end_write_progress(seq, folder, FolderWrite::MarkRead);
@@ -7494,7 +7512,7 @@ impl Engine {
         }
         if self.bulk.is_none() {
             if target.folder.starts_with("local:") {
-                self.store.drop_op(seq);
+                self.drop_op(seq);
                 self.clear_op_backoff();
                 self.emit(SyncEvent::FolderMessagesMoved {
                     folder: target.folder,
@@ -7581,7 +7599,7 @@ impl Engine {
         let Some(run) = self.bulk.take() else {
             return BulkStep::Finished;
         };
-        self.store.drop_op(seq);
+        self.drop_op(seq);
         self.clear_op_backoff();
         self.read_moved_folder_counts(target);
         let result = match run.failed.first() {
@@ -7634,7 +7652,7 @@ impl Engine {
         status: Option<u16>,
         error: String,
     ) {
-        self.store.drop_op(seq);
+        self.drop_op(seq);
         let run = self.take_bulk(seq);
         self.read_moved_folder_counts(target);
         self.report_folder_failure(&target.folder, FolderWrite::MoveMail, status, error.clone());
@@ -7790,7 +7808,7 @@ impl Engine {
     /// reloads Drafts and Sent Items. The revert is exact, so unlike a
     /// quarantine there is no delta reconverge and no `Error`.
     fn fail_send(&mut self, seq: i64, id: &str, err: &GraphError) {
-        self.store.drop_op(seq);
+        self.drop_op(seq);
         // The sync thread resolves the sentinel itself, so `retain_folders`
         // cannot remove it in between (#1886).
         let drafts = self.store.drafts_folder_id().ok();
@@ -10491,6 +10509,29 @@ impl Engine {
     /// disconnect is what actually stops the thread).
     fn emit(&self, e: SyncEvent) {
         let _ = self.evt_tx.send(e);
+    }
+
+    /// Drops the queued op `seq` (`Store::drop_op`), telling a failed
+    /// statement (#2215): the op then stays queued and every drain runs it
+    /// again while the drop keeps failing (what that repeats:
+    /// `Store::drop_op`). The caller carries on as if it were dropped.
+    fn drop_op(&self, seq: i64) {
+        if let Err(e) = self.store.drop_op(seq) {
+            self.emit(SyncEvent::Error(format!(
+                "outbox drop of op {seq} failed: {e}"
+            )));
+        }
+    }
+
+    /// Counts a failed attempt of the queued op `seq`
+    /// (`Store::bump_op_attempts`), telling a failed statement (#2215):
+    /// the attempt is then not counted.
+    fn bump_op_attempts(&self, seq: i64, error: &str) {
+        if let Err(e) = self.store.bump_op_attempts(seq, error) {
+            self.emit(SyncEvent::Error(format!(
+                "outbox attempt count of op {seq} failed: {e}"
+            )));
+        }
     }
 
     /// Emits `State(s)` only on an actual change, so the UI isn't spammed with
@@ -13612,7 +13653,7 @@ mod tests {
                 s.update_contact_fields("C-dave", &f).unwrap();
                 // Its op was refused and dropped.
                 for row in s.pending_ops().unwrap() {
-                    s.drop_op(row.seq);
+                    s.drop_op(row.seq).unwrap();
                 }
                 s.owe_contact_reread("C-dave").unwrap();
                 f.mobile_phone = "+1 555 0300".into();
@@ -21130,7 +21171,8 @@ mod tests {
                     ..stored_minimal("O-FAR", "SM", "CAL-A", 200 * DAY)
                 })
                 .unwrap();
-                s.set_event_response("O-FAR", "tentative", "2026-08-13T19:19:00Z");
+                s.set_event_response("O-FAR", "tentative", "2026-08-13T19:19:00Z")
+                    .unwrap();
                 s.clear_calendar_deltas().unwrap();
             });
         handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
@@ -27279,7 +27321,7 @@ mod tests {
                     })
                     .unwrap();
                 for _ in 0..MAX_OP_ATTEMPTS - 1 {
-                    s.bump_op_attempts(seq, "bad");
+                    s.bump_op_attempts(seq, "bad").unwrap();
                 }
             });
         handle
@@ -29070,7 +29112,7 @@ mod tests {
                     .create_local_draft(subject, "bob@x", "", "<p>x</p>")
                     .unwrap();
                 s.reconcile_id(local, graph).unwrap();
-                s.mark_sent(local);
+                s.mark_sent(local).unwrap();
                 s.move_message(local, "SENT1").unwrap();
                 s.enqueue_op(&OutboxOp::SendDraft { id: local.clone() })
                     .unwrap();
@@ -40902,7 +40944,7 @@ mod tests {
                 assert_eq!(paths_from(&srv, mark), Vec::<String>::new());
                 for r in store.pending_ops().unwrap() {
                     if matches!(r.op, OutboxOp::MarkRead { .. }) {
-                        store.drop_op(r.seq);
+                        store.drop_op(r.seq).unwrap();
                     }
                 }
                 send(&handle, SyncCommand::Refresh);
@@ -46646,7 +46688,7 @@ mod tests {
             };
             assert!(local.starts_with("local:"), "{local}");
             for row in store.pending_ops().unwrap() {
-                store.drop_op(row.seq);
+                store.drop_op(row.seq).unwrap();
             }
             clear(&handle, &local);
             assert_eq!(
@@ -47569,6 +47611,222 @@ mod tests {
                 writes(&srv)
             );
             assert_eq!(engine.store.pending_ops().unwrap().len(), 0, "and dropped");
+            drop(engine);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// #2215: a store on a file in a fresh directory, filled by mailbox
+        /// `ROOT_A` (checked), whose `trigger` (SQL run on a second
+        /// connection) refuses one write. A trigger, not a held lock, for
+        /// the reason the #2209 test gives.
+        fn store_refusing(tag: &str, trigger: &str) -> (Store, PathBuf) {
+            let dir = unique_dir(tag);
+            let path = dir.join("mail.db");
+            let store = Store::open(&path).unwrap();
+            mailbox_a(&store, Some("ROOT_A"));
+            store.set_mailbox_root("ROOT_A").unwrap();
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute_batch(trigger)
+                .unwrap();
+            (store, dir)
+        }
+
+        /// #2215: a `SendDraft` whose `mark_sent` fails is told, keeps the
+        /// row a draft where it was (no optimistic re-file into Sent
+        /// Items), and still sends.
+        #[test]
+        fn send_draft_reports_a_failed_mark_sent_and_still_sends_2215() {
+            let srv = FakeServer::start_limited(routes(&[(200, "ROOT_A")], "FA", "ROOT_A"));
+            let (store, dir) = store_refusing(
+                "mark-sent-refused",
+                "CREATE TRIGGER refuse_sent BEFORE UPDATE OF is_draft ON messages
+                 WHEN NEW.is_draft = 0
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            );
+            store
+                .upsert_folder(&MailFolder {
+                    id: "FS".into(),
+                    display_name: "Sent Items".into(),
+                    parent_id: Some("ROOT_A".into()),
+                    total_count: 0,
+                    unread_count: 0,
+                    well_known_name: Some("sentitems".into()),
+                })
+                .unwrap();
+            let local = store
+                .create_local_draft("Hi", "bob@x", "", "<p>hello</p>")
+                .unwrap();
+            let draft_folder = store.draft(&local).unwrap().unwrap().0.folder_id;
+            let (mut engine, evt_rx, _cmd_tx) = engine_on(&srv, store);
+            engine.handle_command(SyncCommand::SendDraft { id: local.clone() });
+            let events: Vec<SyncEvent> = evt_rx.try_iter().collect();
+            let errors = errors(&events);
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(
+                errors[0].starts_with(&format!("local mark-sent of {local} failed: "))
+                    && errors[0].contains("refused"),
+                "{errors:?}"
+            );
+            assert!(
+                events.contains(&SyncEvent::Sending { id: local.clone() }),
+                "{events:?}"
+            );
+            assert!(
+                events.contains(&SyncEvent::Sent { id: local.clone() }),
+                "{events:?}"
+            );
+            let (row, _) = engine.store.draft(&local).unwrap().unwrap();
+            assert!(row.is_draft, "the refused write left the row");
+            assert_eq!(row.folder_id, draft_folder, "not re-filed into Sent Items");
+            assert!(
+                writes(&srv)
+                    .iter()
+                    .any(|(m, p)| m == "POST" && p.ends_with("/send")),
+                "the op was queued and sent: {:?}",
+                writes(&srv)
+            );
+            assert_eq!(engine.store.pending_ops().unwrap().len(), 0, "and dropped");
+            drop(engine);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// #2215: a `RespondEvent` whose `set_event_response` fails is told
+        /// (`local response of {id} ({kind}) failed`), and its op is queued
+        /// and sent regardless, `CalendarUpdated` as before.
+        #[test]
+        fn respond_event_reports_a_failed_local_response_and_still_enqueues_2215() {
+            let mut routes = routes(&[(200, "ROOT_A")], "FA", "ROOT_A");
+            routes.push((any_route("POST", "/me/events/", 202, ""), None));
+            let srv = FakeServer::start_limited(routes);
+            let (store, dir) = store_refusing(
+                "response-refused",
+                "CREATE TRIGGER refuse_response BEFORE UPDATE OF response_status ON events
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            );
+            store
+                .upsert_event(&NewEvent {
+                    id: "E1".into(),
+                    subject: "Standup".into(),
+                    start_utc: "2026-11-20T09:00:00Z".into(),
+                    end_utc: "2026-11-20T09:30:00Z".into(),
+                    response_status: "none".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            let (mut engine, evt_rx, _cmd_tx) = engine_on(&srv, store);
+            engine.handle_command(SyncCommand::RespondEvent {
+                id: "E1".into(),
+                kind: "accepted".into(),
+                comment: None,
+                send_response: true,
+                proposed_start_utc: None,
+                proposed_end_utc: None,
+            });
+            let events: Vec<SyncEvent> = evt_rx.try_iter().collect();
+            let errors = errors(&events);
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(
+                errors[0].starts_with("local response of E1 (accepted) failed: ")
+                    && errors[0].contains("refused"),
+                "{errors:?}"
+            );
+            assert!(events.contains(&SyncEvent::CalendarUpdated), "{events:?}");
+            let rows = engine
+                .store
+                .events_in_window("2000-01-01T00:00:00Z", "2100-01-01T00:00:00Z")
+                .unwrap();
+            assert_eq!(
+                rows[0].response_status, "none",
+                "the refused write left the row"
+            );
+            assert!(
+                writes(&srv)
+                    .iter()
+                    .any(|(m, p)| m == "POST" && p.starts_with("/me/events/E1/accept")),
+                "the op was queued and sent: {:?}",
+                writes(&srv)
+            );
+            assert_eq!(engine.store.pending_ops().unwrap().len(), 0, "and dropped");
+            drop(engine);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// #2215: an applied op whose drop the store refuses is told
+        /// (`outbox drop of op {seq} failed`) and stays queued, for the
+        /// next drain to run again.
+        #[test]
+        fn a_refused_outbox_drop_is_reported_and_the_op_stays_2215() {
+            let srv = FakeServer::start_limited(routes(&[(200, "ROOT_A")], "FA", "ROOT_A"));
+            let (store, dir) = store_refusing(
+                "drop-refused",
+                "CREATE TRIGGER refuse_drop BEFORE DELETE ON outbox
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            );
+            let (mut engine, evt_rx, _cmd_tx) = engine_on(&srv, store);
+            engine.handle_command(SyncCommand::MarkRead {
+                id: "MA1".into(),
+                read: true,
+            });
+            let errors = errors(&evt_rx.try_iter().collect::<Vec<_>>());
+            let ops = engine.store.pending_ops().unwrap();
+            assert_eq!(ops.len(), 1, "the op stays queued");
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(
+                errors[0].starts_with(&format!("outbox drop of op {} failed: ", ops[0].seq))
+                    && errors[0].contains("refused"),
+                "{errors:?}"
+            );
+            assert!(
+                writes(&srv)
+                    .iter()
+                    .any(|(m, p)| m == "PATCH" && p.starts_with("/me/messages/MA1")),
+                "the op was applied: {:?}",
+                writes(&srv)
+            );
+            assert_eq!(ops[0].attempts, 0, "an applied op is no failed attempt");
+            drop(engine);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// #2215: a refused op (a 400, below `MAX_OP_ATTEMPTS`) whose
+        /// attempt count the store refuses is told (`outbox attempt count
+        /// of op {seq} failed`); the op stays queued, its attempt not
+        /// counted.
+        #[test]
+        fn a_refused_outbox_attempt_count_is_reported_2215() {
+            let mut routes = routes(&[(200, "ROOT_A")], "FA", "ROOT_A");
+            routes.insert(1, (any_route("PATCH", "/me/messages/MA1", 400, "{}"), None));
+            let srv = FakeServer::start_limited(routes);
+            let (store, dir) = store_refusing(
+                "attempts-refused",
+                "CREATE TRIGGER refuse_attempts BEFORE UPDATE OF attempts ON outbox
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            );
+            let (mut engine, evt_rx, _cmd_tx) = engine_on(&srv, store);
+            engine.handle_command(SyncCommand::MarkRead {
+                id: "MA1".into(),
+                read: true,
+            });
+            let errors = errors(&evt_rx.try_iter().collect::<Vec<_>>());
+            let ops = engine.store.pending_ops().unwrap();
+            assert_eq!(ops.len(), 1, "the op stays queued");
+            assert_eq!(ops[0].attempts, 0, "the attempt is not counted");
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert!(
+                errors[0].starts_with(&format!(
+                    "outbox attempt count of op {} failed: ",
+                    ops[0].seq
+                )) && errors[0].contains("refused"),
+                "{errors:?}"
+            );
+            assert!(
+                writes(&srv)
+                    .iter()
+                    .any(|(m, p)| m == "PATCH" && p.starts_with("/me/messages/MA1")),
+                "the op was tried: {:?}",
+                writes(&srv)
+            );
             drop(engine);
             let _ = std::fs::remove_dir_all(&dir);
         }
