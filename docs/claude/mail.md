@@ -5350,14 +5350,47 @@ document it). The engine handed that error, or a throttle, offline or refused to
   engine's store is refused too (told as above). `control.rs`
   `mark`/`flag` differ from `move_msg`, which fails the call and sends nothing: failing
   them would lose a change the engine still makes.
-- Not changed: `mark_sent`, `set_event_response`, `drop_op` and `bump_op_attempts` still
-  drop a failed statement. Their docs give their own reason now, not a pointer to
-  `set_read`.
+- `mark_sent`, `set_event_response`, `drop_op` and `bump_op_attempts` followed in #2215
+  (next section).
 - Tests: `store/mod.rs` `optimistic_write_tests` (each write against a second connection's
   `BEGIN IMMEDIATE` with a 50 ms busy timeout, then unlocked, then an unknown id);
   `engine.rs` `mark_read_reports_a_failed_local_write_and_still_enqueues_2209`. That test
   refuses the write with a trigger, not a held lock: `enqueue_op` shares the connection,
   so a held lock would refuse the op too.
+
+## The remaining store writes return their error (#2215)
+
+- `Store::mark_sent`, `set_event_response`, `drop_op` and `bump_op_attempts` return
+  `Result<(), StoreError>` under #2209's contract: zero rows (an unknown id or `seq`) is
+  `Ok`, a failed statement (busy) an `Err` that leaves the row. No store write drops a
+  failed statement now, apart from `Store::init`'s idempotent `ALTER TABLE` migrations.
+- `SendDraft`: a failed `mark_sent` is `Error("local mark-sent of {id} failed: {e}")`.
+  The op is queued first (#1874), so it still sends, and `Sending` is still emitted.
+  `SendDraft`'s own optimistic re-file into Sent Items is skipped then: the row stays a
+  draft where it was, and a busy store would refuse the move too, after another
+  `BUSY_TIMEOUT`. The syncs after the send (`sync_after_send`) file it. The send is not
+  failed: it is queued and will go.
+- `RespondEvent`: a failed `set_event_response` is
+  `Error("local response of {id} ({kind}) failed: {e}")`. The RSVP is still queued, and
+  `CalendarUpdated` still emitted. lookxy's `dispatch_rsvp` drops the error (`let _ =`),
+  as it does `set_read`'s: the engine repeats the write when it handles the
+  `RespondEvent`.
+- The outbox bookkeeping goes through the engine's `drop_op` / `bump_op_attempts`
+  helpers, which tell `Error("outbox drop of op {seq} failed: {e}")` /
+  `Error("outbox attempt count of op {seq} failed: {e}")` and change no control flow.
+  A lost drop leaves the op queued, and the next drain runs it again. That is harmless
+  for most ops, but a create Graph already made (`CreateEvent`, `CreateContact`,
+  `CreateFolder`, `CopyFolder`) is made twice, which the host should hear of. A send is
+  not: its re-run checks delivery first (`send_posted`, #1874). A lost attempt count
+  only leaves the attempt uncounted. A drain works from a snapshot of the queue, so a
+  refused drop never repeats an op within the same drain.
+- Tests: `optimistic_write_tests` `*_reports_a_busy_store_2215` (`Fixture::check_with`,
+  `check` for any stored state). In `engine.rs` `mailbox_change`, a trigger refuses each
+  write: `send_draft_reports_a_failed_mark_sent_and_still_sends_2215` (only
+  `NEW.is_draft = 0`, so `return_to_drafts` and upserts pass),
+  `respond_event_reports_a_failed_local_response_and_still_enqueues_2215`,
+  `a_refused_outbox_drop_is_reported_and_the_op_stays_2215` and
+  `a_refused_outbox_attempt_count_is_reported_2215` (a 400 below `MAX_OP_ATTEMPTS`).
 
 ## A local reply or forward draft threads (#2212)
 

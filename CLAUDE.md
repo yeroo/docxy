@@ -214,7 +214,7 @@ issue number to find its notes.
   update facts in FetchMeetingMessage's answer (#2185), national clouds: the login
   host and Graph root per `AuthConfig::cloud`, a saved token's cloud (#2225), a failed
   sign-in with a token held keeping it, no fallback while it holds the required scopes
-  (#2213).
+  (#2213), a failed mark-sent, local RSVP, outbox drop or attempt count told (#2215).
 
 ## Build and test
 
