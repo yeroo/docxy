@@ -242,7 +242,15 @@ fn bar_lines(items: &[(String, f64)], width: usize) -> Vec<String> {
 }
 
 fn pie_lines(ser: &Series, width: usize) -> Vec<String> {
-    let total: f64 = ser.vals.iter().map(|v| v.abs()).sum::<f64>().max(1e-9);
+    // A cached NaN (or infinity) is no share of the pie: it would make the
+    // total NaN, and every finite slice a huge percentage (#1114).
+    let total: f64 = ser
+        .vals
+        .iter()
+        .filter(|v| v.is_finite())
+        .map(|v| v.abs())
+        .sum::<f64>()
+        .max(1e-9);
     let labelw = ser
         .cats
         .iter()
@@ -260,7 +268,7 @@ fn pie_lines(ser: &Series, width: usize) -> Vec<String> {
                 .get(i)
                 .cloned()
                 .unwrap_or_else(|| format!("{}", i + 1));
-            let pct = v.abs() / total;
+            let pct = if v.is_finite() { v.abs() / total } else { 0.0 };
             format!(
                 "{} {:<barw$} {:>5.1}%",
                 fit(&cat, labelw),
@@ -378,6 +386,32 @@ mod tests {
         let lines = render_chart(&c, 40);
         assert!(lines.iter().any(|l| l.contains("25.0%")));
         assert!(lines.iter().any(|l| l.contains("75.0%")));
+    }
+
+    /// A NaN slice shows as 0% and leaves the others their share of the
+    /// finite total (#1114).
+    #[test]
+    fn pie_with_a_nan_value_keeps_finite_percentages_1114() {
+        let xml = r#"<c:chartSpace xmlns:c="x"><c:chart><c:plotArea><c:pieChart><c:ser>
+          <c:cat><c:strCache><c:pt idx="0"><c:v>a</c:v></c:pt><c:pt idx="1"><c:v>b</c:v></c:pt><c:pt idx="2"><c:v>c</c:v></c:pt></c:strCache></c:cat>
+          <c:val><c:numCache><c:pt idx="0"><c:v>1</c:v></c:pt><c:pt idx="1"><c:v>NaN</c:v></c:pt><c:pt idx="2"><c:v>3</c:v></c:pt></c:numCache></c:val>
+        </c:ser></c:pieChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let c = parse_chart_xml(xml).unwrap();
+        let lines = render_chart(&c, 40);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(
+            lines[1].starts_with("a ") && lines[1].ends_with(" 25.0%"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2].starts_with("b ") && lines[2].ends_with("  0.0%"),
+            "{lines:?}"
+        );
+        assert!(!lines[2].contains('█'), "{lines:?}");
+        assert!(
+            lines[3].starts_with("c ") && lines[3].ends_with(" 75.0%"),
+            "{lines:?}"
+        );
     }
 
     #[test]
