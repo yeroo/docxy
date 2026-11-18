@@ -49595,10 +49595,16 @@ fn sheet_row(
                 2 => cell.justify_end(),
                 _ => cell.justify_start(),
             };
-            // A spilling source's text is drawn by its run's layer (#2240).
-            if !text.is_empty() && !spill_text_off.contains(&c) {
+            if !text.is_empty() {
                 let is_link = sh.hyperlinks.contains_key(&(r, c));
-                cell = cell.child(cell_text_el(text, color_rgb, is_link, bold, italic, wrap));
+                // A spilling source's text is drawn by its run's layer
+                // (#2240); the cell keeps it, unpainted, so the row keeps the
+                // height the text gives it, line feeds included.
+                let spills = spill_text_off.contains(&c);
+                cell = cell.child(
+                    cell_text_el(text, color_rgb, is_link, bold, italic, wrap)
+                        .when(spills, |d| d.invisible()),
+                );
             }
         }
         let ent2 = ent.clone();

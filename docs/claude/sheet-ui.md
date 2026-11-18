@@ -188,9 +188,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   run in sheet columns and the row clips it to the pane. So a frozen text
   joins the scrolled columns seamlessly unscrolled, a right-aligned text past
   the split runs back into the frozen pane, and a source scrolled off still
-  shows its part. A source too far off to reach (a cheap bound of its width)
-  is not shaped.
-- Drawing (`sheet_row`): the source draws no text child; one absolute layer
+  shows its part. An ASCII source that surely fits, or is too far off to
+  reach, is not shaped (14.4 px a character bounds a 12 px ASCII glyph);
+  any other text is shaped first, since an emoji or U+FDFD has no such bound.
+- Drawing (`sheet_row`): the source keeps its text child, `invisible()`, so
+  its row keeps the line's height (24 px; a blank row is 21 px, and without
+  the child the row shrank and flipped as the editor opened); one absolute layer
   per run, after the row's cells, holds the text in the source cell's own
   box and padding (4 px left, 5 right, 2 top, 3 bottom), aligned in it and
   overflowing to its side, clipped to the run. It has no listeners, so a
@@ -205,4 +208,5 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   `\n`). The edited cell blocks every run and spills nothing, so the in-cell
   editor (and edit-in-cell off's plain entry, #672) covers the text.
 - The harness's `spill` key lists the runs the last frame drew (`A8:E8`, a
-  run in both panes once); case `uiharness/cases/sheet-spill.uit`.
+  run in both panes once) and `sel_row_px` the active row's laid-out
+  height; case `uiharness/cases/sheet-spill.uit`.

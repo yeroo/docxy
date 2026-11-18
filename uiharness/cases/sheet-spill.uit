@@ -25,6 +25,34 @@ test a long text spills right over its empty neighbours
   shot cell:A8:F8
   assert spill is A8:E8
 
+# A text gives its row a line's height (12 px at gpui's line height, the
+# padding and the gridline: 24 px), and a spilling one keeps it: its cell
+# keeps the text, unpainted, while the layer draws it. A blank row is 21 px.
+test a spilling text keeps its row's height
+  open copy:../fixtures/basic.xlsx
+  click A2
+  shot grid
+  assert sel_row_px is 24
+  click A7
+  shot grid
+  assert sel_row_px is 21
+  click A8
+  call real-type {"text":"A note typed into one cell runs on across the row"}
+  call real-key {"key":"enter"}
+  click A8
+  shot grid
+  assert spill is A8:E8
+  assert sel_row_px is 24
+  # Its editor and back: the row never moves.
+  call real-key {"key":"f2"}
+  shot grid
+  assert spill is nothing
+  assert sel_row_px is 24
+  call real-key {"key":"escape"}
+  shot grid
+  assert spill is A8:E8
+  assert sel_row_px is 24
+
 test a text that fits draws no run
   open copy:../fixtures/basic.xlsx
   click A8

@@ -15,9 +15,11 @@ use gridcore::sheet::{MAX_COLS, Sheet, Styles, Xf};
 /// 4 px on the left, 4 px and the 1 px gridline on the right.
 pub(crate) const PAD: f32 = 4.5;
 
-/// A cheap upper bound of a 12 px glyph's width, so a text that surely fits,
-/// or a source too far off to reach a pane, is never shaped.
-const GLYPH_MAX: f32 = 12.0 * 1.2;
+/// An upper bound of a printable ASCII glyph's width at 12 px (the widest,
+/// a bold `W` or `@`, is about 1 em), so an ASCII text that surely fits, or
+/// a source too far off to reach a pane, is never shaped. Other text has no
+/// cheap bound (an emoji is about 1.25 em, U+FDFD several), so it is shaped.
+const ASCII_GLYPH_MAX: f32 = 12.0 * 1.2;
 
 /// One source's text running on over its empty neighbours.
 #[derive(Clone, Debug, PartialEq)]
@@ -86,9 +88,22 @@ pub(crate) fn pane_spills(
         // A line feed in an unwrapped cell: the widest line is what runs on
         // (gpui shapes one line at a time).
         let lines: Vec<&str> = text.split('\n').collect();
-        let chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
         let room = own - 2.0 * PAD;
-        let bound = chars as f32 * GLYPH_MAX;
+        let measure = || {
+            lines
+                .iter()
+                .map(|l| text_w(c, &xf, l))
+                .fold(0.0_f32, f32::max)
+        };
+        // ASCII has a cheap bound; any other text is shaped here, so its
+        // measured width decides both checks.
+        let (bound, measured) = if text.is_ascii() {
+            let chars = lines.iter().map(|l| l.len()).max().unwrap_or(0);
+            (chars as f32 * ASCII_GLYPH_MAX, None)
+        } else {
+            let w = measure();
+            (w, Some(w))
+        };
         if bound <= room {
             continue;
         }
@@ -100,10 +115,7 @@ pub(crate) fn pane_spills(
         if !reaches(c, (a, b), reach, &col_w) {
             continue;
         }
-        let tw = lines
-            .iter()
-            .map(|l| text_w(c, &xf, l))
-            .fold(0.0_f32, f32::max);
+        let tw = measured.unwrap_or_else(measure);
         let (lo, hi) = overflow::spill_span(
             c as usize,
             0,
@@ -408,6 +420,35 @@ mod tests {
         // Scrolled to F, neither reaches the window.
         assert_eq!(runs_in(&wb, 0, (5, 20), None), vec![]);
         assert_eq!(runs_in(&wb, 1, (5, 20), None), vec![]);
+    }
+
+    #[test]
+    fn non_ascii_text_is_measured_not_bounded() {
+        // Two U+FDFD, a few em wide each: a per-character bound of 14.4 px
+        // (28.8 px) would say a 64 px cell (room 55) holds them. Measured as
+        // drawn, they spill.
+        let mut wb = book();
+        wb.sheets[0].set_cell(0, 0, Cell::text("\u{FDFD}\u{FDFD}"));
+        wb.sheets[0].set_cell(1, 0, Cell::text("ab"));
+        let ctx = SpillCtx {
+            sheet: &wb.sheets[0],
+            styles: &wb.styles,
+            show_formulas: false,
+            d1904: false,
+            edited: None,
+        };
+        // Drawn 3 em (36 px) each.
+        let wide = |_: u32, _: &Xf, line: &str| line.chars().count() as f32 * 36.0;
+        let runs = pane_spills(&ctx, 0, (0, 20), w64, wide);
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].lo, runs[0].hi), (0, 1));
+        // The same two ASCII characters are never shaped: the bound says they fit.
+        let never = |_: u32, _: &Xf, _: &str| -> f32 { panic!("shaped") };
+        assert_eq!(pane_spills(&ctx, 1, (0, 20), w64, never), vec![]);
+        // Off the pane, a non-ASCII source is measured too: two columns off,
+        // its 72 px text reaches B only, not D.
+        assert_eq!(pane_spills(&ctx, 0, (3, 20), w64, wide), vec![]);
+        assert_eq!(pane_spills(&ctx, 0, (1, 20), w64, wide).len(), 1);
     }
 
     #[test]

@@ -5424,6 +5424,22 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
                     (!runs.is_empty()).then(|| runs.join(" "))
                 }),
             ),
+            // The active cell's row as the last frame laid it out, its height
+            // to the whole px (#2240): a text gives its row a line's height,
+            // spilling or not. Null for a frozen row (not in the row list)
+            // or a row off screen.
+            (
+                "sel_row_px",
+                if v.sel.0 < v.sheet().freeze.0 {
+                    Json::Null
+                } else {
+                    v.vlist
+                        .bounds_for_item(v.row_list_index(v.sel.0))
+                        .map_or(Json::Null, |b| {
+                            Json::Num(f32::from(b.size.height).round() as f64)
+                        })
+                },
+            ),
             // Flash Fill's greyed preview (#666): the range it covers and the
             // values Enter would write, or null.
             (
