@@ -40,8 +40,9 @@
 //! organisation's directory, `SyncCommand::SearchDirectory`, #1942, and of
 //! its groups and a group's members, `SyncCommand::SearchGroups` and
 //! `SyncCommand::FetchGroupMembers`, #2058, another user's photo,
-//! `SyncCommand::FetchUserPhoto`, #2157, and users' presence,
-//! `SyncCommand::FetchPresences`, #2158) never waits for a whole pass: long
+//! `SyncCommand::FetchUserPhoto`, #2157, users' presence,
+//! `SyncCommand::FetchPresences`, #2158, and a person's details by address,
+//! `SyncCommand::FetchPersonDetails`, #2239) never waits for a whole pass: long
 //! work calls `Engine::checkpoint` between folders, delta pages and body
 //! fetches, which serves it at once and keeps every other command for after
 //! the work, in order.
@@ -63,8 +64,8 @@ pub use crate::graph::model::DraftKind;
 use crate::graph::model::{
     AutomaticReplies, ContactPhoto, DeltaItem, DirectoryGroup, DirectoryUser, Event,
     EventDeltaItem, FolderContact, GroupMember, MailFolder, Me, MeetingMessage, MeetingMessageType,
-    Message, MessageFields, Presence, Recipient, ScheduleEntry, SearchHit, parse_folder_size,
-    parse_meeting_message_type,
+    Message, MessageFields, PersonDetails, Presence, Recipient, ScheduleEntry, SearchHit,
+    parse_folder_size, parse_meeting_message_type,
 };
 pub use crate::store::ClearOfflineRefusal;
 use crate::store::{
@@ -286,6 +287,20 @@ pub enum SyncCommand {
     /// ahead of a running pass, as `SearchDirectory` is, and tried even
     /// during a back-off.
     FetchGroupMembers { group_id: String, top: usize },
+    /// Read one person's details for a contact card (Graph `/me/people`,
+    /// #2239, `GraphClient::person_details`): job title, department,
+    /// office, company and phones of the person whose address (a
+    /// `scoredEmailAddresses` entry, or else the user principal name) is
+    /// `address`, ASCII case and surrounding whitespace aside. Only the
+    /// people the user works with are found. Answers with
+    /// [`SyncEvent::PersonDetails`] (`person: None` when no returned person
+    /// has that address), or [`SyncEvent::PersonDetailsUnavailable`] (its
+    /// `forbidden` set for a 403: no `People.Read` for this token or
+    /// tenant), never a [`SyncEvent::Error`]. Nothing is stored. Served
+    /// ahead of a running pass, as `SearchDirectory` is, and tried even
+    /// during a back-off; a throttle sets no back-off, and a 401 a refresh
+    /// went through for signs no one out, as for `FetchPresences`.
+    FetchPersonDetails { address: String },
     /// Fetch attachment metadata (`GraphClient::list_attachments`) for a
     /// message and store it, then emit [`SyncEvent::AttachmentsUpdated`].
     /// `Store::put_attachments` is otherwise never populated in production
@@ -1320,6 +1335,26 @@ pub enum SyncEvent {
         forbidden: bool,
         reason: String,
     },
+    /// The answer to [`SyncCommand::FetchPersonDetails`] (#2239), with the
+    /// address exactly as it was asked. `person` is `None` when no person
+    /// `/me/people` returned has that address (someone the user never
+    /// worked with, an outside sender): `$search`'s fuzzy hits are never
+    /// the answer.
+    PersonDetails {
+        address: String,
+        person: Option<PersonDetails>,
+    },
+    /// [`SyncCommand::FetchPersonDetails`] could not read the details
+    /// (#2239): `forbidden` for a 403 (no `People.Read` for this token or
+    /// tenant: asking again will not help), otherwise signed out, a blank
+    /// address (no request sent), offline, throttled, a 401 a refresh did
+    /// not cure, or another 4xx or 5xx. Not a sync error, and never a
+    /// sign-in prompt of its own. `reason` is one line.
+    PersonDetailsUnavailable {
+        address: String,
+        forbidden: bool,
+        reason: String,
+    },
     /// An inline image's bytes were fetched (from
     /// [`SyncCommand::FetchInlineImage`]); the UI caches them by `content_id`.
     InlineImageReady {
@@ -2057,7 +2092,7 @@ fn command_writes_event_locally(cmd: &SyncCommand) -> bool {
 }
 
 /// The commands a `checkpoint` serves at once, between two requests of
-/// long work (#1978, #2006, #2123, #1942, #2058, #2157, #2158), instead of keeping
+/// long work (#1978, #2006, #2123, #1942, #2058, #2157, #2158, #2239), instead of keeping
 /// them for the main loop: a click costs its own round trips plus the
 /// request in flight.
 fn served_at_checkpoint(cmd: &SyncCommand) -> bool {
@@ -2070,6 +2105,7 @@ fn served_at_checkpoint(cmd: &SyncCommand) -> bool {
             | SyncCommand::SearchDirectory { .. }
             | SyncCommand::SearchGroups { .. }
             | SyncCommand::FetchGroupMembers { .. }
+            | SyncCommand::FetchPersonDetails { .. }
             | SyncCommand::FetchUserPhoto { .. }
             | SyncCommand::FetchPresences { .. }
     )
@@ -2150,6 +2186,7 @@ fn persists_at_shutdown(cmd: &SyncCommand) -> bool {
         | SyncCommand::SearchDirectory { .. }
         | SyncCommand::SearchGroups { .. }
         | SyncCommand::FetchGroupMembers { .. }
+        | SyncCommand::FetchPersonDetails { .. }
         | SyncCommand::FetchAttachments { .. }
         | SyncCommand::FetchMeetingMessage { .. }
         | SyncCommand::FetchAutomaticReplies
@@ -3122,6 +3159,9 @@ impl Engine {
                 Some(SyncCommand::FetchGroupMembers { group_id, top }) => {
                     self.fetch_group_members(group_id, top)
                 }
+                Some(SyncCommand::FetchPersonDetails { address }) => {
+                    self.fetch_person_details(address)
+                }
                 Some(SyncCommand::FetchUserPhoto { address }) => self.fetch_user_photo(address),
                 Some(SyncCommand::FetchPresences { addresses }) => self.fetch_presences(addresses),
                 _ => false,
@@ -3513,6 +3553,9 @@ impl Engine {
             }
             SyncCommand::FetchGroupMembers { group_id, top } => {
                 self.fetch_group_members(group_id, top);
+            }
+            SyncCommand::FetchPersonDetails { address } => {
+                self.fetch_person_details(address);
             }
             SyncCommand::FetchAttachments { message_id } => self.fetch_attachments(&message_id),
             SyncCommand::SaveAttachment {
@@ -8218,6 +8261,59 @@ impl Engine {
                     reason: e.to_string(),
                 });
                 self.react_quietly(e)
+            }
+        }
+    }
+
+    // --- A person's details by address (#2239) ----------------------------
+
+    /// Serves [`SyncCommand::FetchPersonDetails`]: `PersonDetails` (`None`
+    /// when no returned person has the address), or
+    /// `PersonDetailsUnavailable` (`forbidden` for a 403), never a
+    /// `SyncEvent::Error`; signed out or with a blank address no request.
+    /// A contact card asks on hover, as presence is asked, so a failure is
+    /// handled as `fetch_presences` handles one: a throttle sets no
+    /// back-off (a mail pass is not held up, nor a running one stopped),
+    /// and a 401 still a 401 after a refresh that went through signs no
+    /// one out (the token is fine for mail), though unlike presence it is
+    /// not `forbidden`. A refused refresh is a dead token: it signs in, as
+    /// for any command. Transport goes offline (`react_quietly`). Returns
+    /// whether the work must stop, for `checkpoint`.
+    fn fetch_person_details(&mut self, address: String) -> bool {
+        let refused = if self.token.is_none() {
+            Some("not signed in")
+        } else if address.trim().is_empty() {
+            Some("empty address")
+        } else {
+            None
+        };
+        if let Some(reason) = refused {
+            self.emit(SyncEvent::PersonDetailsUnavailable {
+                address,
+                forbidden: false,
+                reason: reason.to_string(),
+            });
+            return false;
+        }
+        match self.with_auth(|c| c.person_details(&address)) {
+            Ok(person) => {
+                self.emit(SyncEvent::PersonDetails { address, person });
+                false
+            }
+            Err(e) => {
+                let forbidden = matches!(e, GraphError::Http { status: 403, .. });
+                self.emit(SyncEvent::PersonDetailsUnavailable {
+                    address,
+                    forbidden,
+                    reason: e.to_string(),
+                });
+                // `refused_refresh` is this command's: `try_refresh`
+                // resets it first.
+                match e {
+                    GraphError::Throttled { .. } => false,
+                    GraphError::Unauthorized if self.refused_refresh.is_none() => false,
+                    e => self.react_quietly(e),
+                }
             }
         }
     }
@@ -38044,6 +38140,462 @@ mod tests {
                     }
                 }
 
+                // --- A person's details by address (#2239) -------------
+
+                mod person_details {
+                    use super::presences::{direct_engine, direct_engine_at};
+                    use super::*;
+                    use crate::testserver::RecordedRequest;
+
+                    const ASKED: &str = "jo@Contoso.com";
+                    const PEOPLE_PATH: &str = "/me/people?$search=%22jo%40Contoso.com%22\
+                        &$select=displayName,jobTitle,department,officeLocation,companyName,\
+                        phones,scoredEmailAddresses,userPrincipalName&$top=10";
+                    /// Two fuzzy hits, the exact one (case aside), and a
+                    /// later one with the same address.
+                    const FUZZY_THEN_EXACT: &str = r#"{"value":[
+                        {"displayName":"Jo Smith","jobTitle":"Wrong",
+                         "scoredEmailAddresses":[{"address":"jo.smith@contoso.com"}],
+                         "userPrincipalName":"jo.smith@contoso.com"},
+                        {"displayName":"Joanne","scoredEmailAddresses":[{"address":"joanne@contoso.com"}],
+                         "userPrincipalName":"joanne@contoso.com"},
+                        {"displayName":"Jo","jobTitle":"Engineer","department":"R&D",
+                         "officeLocation":"B1","companyName":"Contoso",
+                         "scoredEmailAddresses":[{"address":"JO@contoso.com","relevanceScore":9.0}],
+                         "userPrincipalName":"jo@contoso.onmicrosoft.com",
+                         "phones":[{"type":"business","number":"+1 555 0100"},
+                                   {"type":"home","number":"+1 555 0111"},
+                                   {"type":"mobile","number":"+1 555 0199"}]},
+                        {"displayName":"Jo Again","scoredEmailAddresses":[{"address":"jo@contoso.com"}]}
+                    ]}"#;
+                    const FUZZY_ONLY: &str = r#"{"value":[
+                        {"displayName":"Jo Smith","scoredEmailAddresses":[{"address":"jo.smith@contoso.com"}],
+                         "userPrincipalName":"jo.smith@contoso.com"},
+                        {"displayName":"Joanne","scoredEmailAddresses":[{"address":"joanne@contoso.com"}],
+                         "userPrincipalName":""}
+                    ]}"#;
+                    const DENIED: &str =
+                        r#"{"error":{"code":"ErrorAccessDenied","message":"Access is denied."}}"#;
+
+                    fn people_route(status: u16, body: &str) -> (Route, Option<usize>) {
+                        search_route("/me/people?$search", status, body)
+                    }
+
+                    fn fetch(handle: &SyncHandle, address: &str) {
+                        handle
+                            .cmd_tx
+                            .send(SyncCommand::FetchPersonDetails {
+                                address: address.into(),
+                            })
+                            .unwrap();
+                    }
+
+                    fn is_person_answer(e: &SyncEvent) -> bool {
+                        matches!(
+                            e,
+                            SyncEvent::PersonDetails { .. }
+                                | SyncEvent::PersonDetailsUnavailable { .. }
+                        )
+                    }
+
+                    /// Events until the answer, which must be
+                    /// `PersonDetails`: its address, person, and every
+                    /// event seen.
+                    fn answered(
+                        handle: &SyncHandle,
+                    ) -> (String, Option<PersonDetails>, Vec<SyncEvent>) {
+                        let events = wait_for(&handle.evt_rx, is_person_answer);
+                        match events.last() {
+                            Some(SyncEvent::PersonDetails { address, person }) => {
+                                (address.clone(), person.clone(), events)
+                            }
+                            other => panic!("expected PersonDetails, got {other:?}"),
+                        }
+                    }
+
+                    /// Events until the answer, which must be
+                    /// `PersonDetailsUnavailable`: its address,
+                    /// `forbidden`, reason, and every event seen.
+                    fn unavailable(handle: &SyncHandle) -> (String, bool, String, Vec<SyncEvent>) {
+                        let events = wait_for(&handle.evt_rx, is_person_answer);
+                        match events.last() {
+                            Some(SyncEvent::PersonDetailsUnavailable {
+                                address,
+                                forbidden,
+                                reason,
+                            }) => (address.clone(), *forbidden, reason.clone(), events),
+                            other => panic!("expected PersonDetailsUnavailable, got {other:?}"),
+                        }
+                    }
+
+                    fn person_searches(srv: &FakeServer) -> Vec<RecordedRequest> {
+                        srv.requests()
+                            .into_iter()
+                            .filter(|r| r.path.starts_with("/me/people?$search"))
+                            .collect()
+                    }
+
+                    #[test]
+                    fn person_details_picks_the_exact_address_among_fuzzy_hits() {
+                        let srv = two_folders(vec![], vec![people_route(200, FUZZY_THEN_EXACT)]);
+                        let (handle, dir) = started(&srv, "person-exact");
+                        fetch(&handle, ASKED);
+                        let (address, person, events) = answered(&handle);
+                        no_error(&events);
+                        assert_eq!(address, ASKED);
+                        assert_eq!(
+                            person,
+                            Some(PersonDetails {
+                                name: "Jo".into(),
+                                address: "JO@contoso.com".into(),
+                                job_title: Some("Engineer".into()),
+                                department: Some("R&D".into()),
+                                office_location: Some("B1".into()),
+                                company_name: Some("Contoso".into()),
+                                business_phones: vec!["+1 555 0100".into()],
+                                mobile_phone: Some("+1 555 0199".into()),
+                            })
+                        );
+                        let reqs = person_searches(&srv);
+                        assert_eq!(reqs.len(), 1);
+                        assert_eq!(reqs[0].method, "GET");
+                        assert_eq!(reqs[0].path, PEOPLE_PATH);
+                        assert!(
+                            !reqs[0]
+                                .headers
+                                .iter()
+                                .any(|(n, _)| n.eq_ignore_ascii_case("ConsistencyLevel")),
+                            "{:?}",
+                            reqs[0].headers
+                        );
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn person_details_matches_a_upn() {
+                        let body = r#"{"value":[
+                            {"displayName":"Jo","department":"R&D",
+                             "scoredEmailAddresses":[{"address":"jo.smith@contoso.com"}],
+                             "userPrincipalName":" JO@contoso.com "}
+                        ]}"#;
+                        let srv = two_folders(vec![], vec![people_route(200, body)]);
+                        let (handle, dir) = started(&srv, "person-upn");
+                        fetch(&handle, " jo@contoso.com ");
+                        let (address, person, events) = answered(&handle);
+                        no_error(&events);
+                        assert_eq!(address, " jo@contoso.com ", "as asked");
+                        let person = person.expect("the UPN matches");
+                        assert_eq!(person.address, "JO@contoso.com");
+                        assert_eq!(person.department.as_deref(), Some("R&D"));
+                        // The search value is trimmed.
+                        assert_eq!(
+                            person_searches(&srv)[0].path,
+                            PEOPLE_PATH.replace("jo%40Contoso.com", "jo%40contoso.com")
+                        );
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn person_details_no_match_is_none() {
+                        for (tag, body) in [
+                            ("person-fuzzy", FUZZY_ONLY),
+                            ("person-empty", r#"{"value":[]}"#),
+                        ] {
+                            let srv = two_folders(vec![], vec![people_route(200, body)]);
+                            let (handle, dir) = started(&srv, tag);
+                            fetch(&handle, ASKED);
+                            let (address, person, events) = answered(&handle);
+                            no_error(&events);
+                            assert_eq!((address.as_str(), person), (ASKED, None), "{tag}");
+                            stop(handle);
+                            let _ = std::fs::remove_dir_all(&dir);
+                        }
+                    }
+
+                    /// The people route answers `status`: the answer's
+                    /// `forbidden` and reason, after checking it is one
+                    /// line, no `Error` came, and the engine still answers
+                    /// a `Refresh`.
+                    fn people_failing_with(status: u16, tag: &str) -> (bool, String) {
+                        let srv = two_folders(vec![], vec![people_route(status, DENIED)]);
+                        let (handle, dir) = started(&srv, tag);
+                        fetch(&handle, ASKED);
+                        let (address, forbidden, reason, events) = unavailable(&handle);
+                        assert_eq!(address, ASKED);
+                        assert!(!reason.is_empty());
+                        assert!(!reason.contains('\n'), "one line: {reason:?}");
+                        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+                        let more = wait_for(&handle.evt_rx, is_idle);
+                        no_error(&events);
+                        no_error(&more);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                        (forbidden, reason)
+                    }
+
+                    #[test]
+                    fn person_details_403_is_forbidden_not_error() {
+                        let (forbidden, reason) = people_failing_with(403, "person-403");
+                        assert!(forbidden);
+                        assert!(reason.contains("403"), "{reason}");
+                    }
+
+                    #[test]
+                    fn person_details_500_is_unavailable_not_error() {
+                        let (forbidden, reason) = people_failing_with(500, "person-500");
+                        assert!(!forbidden);
+                        assert!(reason.contains("500"), "{reason}");
+                    }
+
+                    #[test]
+                    fn person_details_503_is_not_forbidden() {
+                        let (forbidden, _reason) = people_failing_with(503, "person-503");
+                        assert!(!forbidden);
+                    }
+
+                    /// A 429 or a 503 from `/me/people` answers the command
+                    /// and holds off no mail pass: `next_retry` is left as
+                    /// it was, where `react` would set it.
+                    #[test]
+                    fn person_details_throttled_does_not_delay_mail() {
+                        for status in [429, 503] {
+                            let mut r = route("/me/people?$search", status, "{}");
+                            r.headers = vec![("Retry-After".into(), "600".into())];
+                            let srv = FakeServer::start_limited(vec![(r, None)]);
+                            let (mut engine, evt_rx) = direct_engine(&srv);
+                            let before = engine.next_retry;
+                            let stop_work = engine.fetch_person_details(ASKED.into());
+                            assert!(!stop_work, "a throttle stops no work ({status})");
+                            assert_eq!(engine.next_retry, before, "no mail back-off ({status})");
+                            let events: Vec<SyncEvent> = evt_rx.try_iter().collect();
+                            no_error(&events);
+                            match events.last() {
+                                Some(SyncEvent::PersonDetailsUnavailable {
+                                    address,
+                                    forbidden: false,
+                                    reason,
+                                }) => {
+                                    assert_eq!(address, ASKED);
+                                    assert!(!reason.contains('\n'), "{reason:?}");
+                                }
+                                other => panic!("expected PersonDetailsUnavailable, got {other:?}"),
+                            }
+                            assert!(
+                                !events.iter().any(|e| matches!(e, SyncEvent::State(_))),
+                                "no state change ({status}): {events:?}"
+                            );
+                            assert_eq!(person_searches(&srv).len(), 1);
+                        }
+                    }
+
+                    #[test]
+                    fn person_details_transport_failure_is_unavailable_not_error() {
+                        let srv = two_folders(vec![], vec![]);
+                        let (handle, dir) = started(&srv, "person-transport");
+                        // The server goes away: the lookup is a transport error.
+                        drop(srv);
+                        fetch(&handle, ASKED);
+                        let (address, forbidden, _reason, events) = unavailable(&handle);
+                        assert_eq!((address.as_str(), forbidden), (ASKED, false));
+                        no_error(&events);
+                        let more = wait_for(&handle.evt_rx, |e| {
+                            matches!(e, SyncEvent::State(SyncState::Offline))
+                        });
+                        no_error(&more);
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn person_details_signed_out_sends_no_request() {
+                        let srv = two_folders(vec![], vec![people_route(200, FUZZY_THEN_EXACT)]);
+                        let dir = unique_dir("person-signed-out");
+                        let handle = spawn_with(&srv, &dir, EngineOptions::without_prefetch());
+                        wait_for(&handle.evt_rx, |e| {
+                            matches!(e, SyncEvent::SignInRequired { .. })
+                        });
+                        fetch(&handle, ASKED);
+                        let (address, forbidden, reason, events) = unavailable(&handle);
+                        assert_eq!(
+                            (address.as_str(), forbidden, reason.as_str()),
+                            (ASKED, false, "not signed in")
+                        );
+                        no_error(&events);
+                        assert!(person_searches(&srv).is_empty());
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn person_details_blank_address_sends_no_request() {
+                        let srv = two_folders(vec![], vec![people_route(200, FUZZY_THEN_EXACT)]);
+                        let (handle, dir) = started(&srv, "person-blank");
+                        for blank in ["", " \t "] {
+                            fetch(&handle, blank);
+                            let (address, forbidden, reason, events) = unavailable(&handle);
+                            assert_eq!(
+                                (address.as_str(), forbidden, reason.as_str()),
+                                (blank, false, "empty address")
+                            );
+                            no_error(&events);
+                        }
+                        assert!(person_searches(&srv).is_empty());
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    /// `FetchPersonDetails` meeting a 401 from `/me/people`,
+                    /// the token endpoint answering `token`: the engine
+                    /// after it, every event, and the requests.
+                    fn person_after_401(
+                        token: Route,
+                        tag: &str,
+                    ) -> (Engine, Vec<SyncEvent>, FakeServer, PathBuf) {
+                        let unauthorized = r#"{"error":{"code":"InvalidAuthenticationToken","message":"Access token validation failure."}}"#;
+                        let srv = FakeServer::start(vec![
+                            token,
+                            route("/me/people?$search", 401, unauthorized),
+                        ]);
+                        let dir = unique_dir(tag);
+                        let (mut engine, evt_rx) = direct_engine_at(&srv, dir.join("token.bin"));
+                        let stop_work = engine.fetch_person_details(ASKED.into());
+                        let events: Vec<SyncEvent> = evt_rx.try_iter().collect();
+                        // Stops work exactly when it signs out.
+                        assert_eq!(stop_work, engine.token.is_none(), "{events:?}");
+                        (engine, events, srv, dir)
+                    }
+
+                    /// A 401 still a 401 after a refresh that went through
+                    /// is `/me/people` refusing, not a dead token: the
+                    /// session, its fresh token and its mail pass schedule
+                    /// are kept, and it is not `forbidden` (a 403 is).
+                    #[test]
+                    fn person_details_401_after_a_good_refresh_signs_no_one_out() {
+                        let refreshed =
+                            r#"{"access_token":"AT2","refresh_token":"RT2","expires_in":3600}"#;
+                        let (engine, events, srv, dir) =
+                            person_after_401(token_route(refreshed), "person-401");
+                        no_error(&events);
+                        assert!(
+                            !events
+                                .iter()
+                                .any(|e| matches!(e, SyncEvent::SignInRequired { .. })),
+                            "{events:?}"
+                        );
+                        match events.last() {
+                            Some(SyncEvent::PersonDetailsUnavailable {
+                                address,
+                                forbidden: false,
+                                reason,
+                            }) => {
+                                assert_eq!(address, ASKED);
+                                assert!(!reason.contains('\n'), "{reason:?}");
+                            }
+                            other => panic!("expected PersonDetailsUnavailable, got {other:?}"),
+                        }
+                        let token = engine.token.as_ref().expect("still signed in");
+                        assert_eq!(token.access_token, "AT2");
+                        assert_eq!(token_requests(&srv), 1);
+                        assert_eq!(engine.next_retry, None, "no mail back-off");
+                        // Asked once with each token.
+                        assert_eq!(person_searches(&srv).len(), 2);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    /// A refused refresh is a dead token, whoever answered
+                    /// the 401: the sign-in it asks for, as for any command.
+                    #[test]
+                    fn person_details_401_with_a_refused_refresh_signs_in() {
+                        let (engine, events, srv, dir) = person_after_401(
+                            token_failure(400, r#"{"error":"invalid_grant"}"#),
+                            "person-401-refused",
+                        );
+                        no_error(&events);
+                        assert!(engine.token.is_none());
+                        assert_eq!(token_requests(&srv), 1);
+                        assert!(
+                            events.iter().any(|e| matches!(
+                                e,
+                                SyncEvent::PersonDetailsUnavailable {
+                                    forbidden: false,
+                                    ..
+                                }
+                            )),
+                            "{events:?}"
+                        );
+                        assert_eq!(
+                            signin_reasons(&events),
+                            vec![SignInReason::Expired {
+                                code: "invalid_grant".into(),
+                                aadsts: None,
+                            }],
+                            "{events:?}"
+                        );
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+
+                    #[test]
+                    fn person_details_is_served_during_a_slow_pass() {
+                        let folders: Vec<Fold> =
+                            [("F1", "Inbox"), ("F2", "B"), ("F3", "C"), ("F4", "D")]
+                                .into_iter()
+                                .map(|(id, name)| {
+                                    small(Fold {
+                                        pages: vec![vec![msg(
+                                            &format!("M-{id}"),
+                                            "2020-01-01T00:00:00Z",
+                                        )]],
+                                        ..fold(
+                                            id,
+                                            name,
+                                            if id == "F1" { Some("inbox") } else { None },
+                                        )
+                                    })
+                                })
+                                .collect();
+                        let srv = FakeServer::start_paced(mailbox(
+                            &folders,
+                            vec![people_route(200, FUZZY_THEN_EXACT)],
+                            Duration::from_millis(300),
+                        ));
+                        let dir = new_dir("person-in-pass");
+                        let handle = spawn_with(&srv, &dir, EngineOptions::without_prefetch());
+                        // The startup pass is under way: some folder's delta is out.
+                        assert!(wait_until(ENGINE_WAIT, || {
+                            paths_from(&srv, 0)
+                                .iter()
+                                .any(|p| p.contains("/messages/delta?$orderby"))
+                        }));
+                        fetch(&handle, ASKED);
+                        let events = wait_for(&handle.evt_rx, is_idle);
+                        assert!(
+                            events.iter().any(|e| matches!(
+                                e,
+                                SyncEvent::PersonDetails { address, person: Some(p) }
+                                    if address == ASKED && p.name == "Jo"
+                            )),
+                            "answered before the pass ended: {events:?}"
+                        );
+                        let reqs = srv.requests();
+                        let last_delta = reqs
+                            .iter()
+                            .filter(|r| r.path.contains("/messages/delta?$orderby"))
+                            .map(|r| r.at)
+                            .max()
+                            .unwrap();
+                        let asked_at: Vec<_> = person_searches(&srv).iter().map(|r| r.at).collect();
+                        assert_eq!(asked_at.len(), 1);
+                        assert!(
+                            asked_at[0] < last_delta,
+                            "the person lookup came before the last delta"
+                        );
+                        stop(handle);
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
+                }
+
                 // --- Another user's photo by address (#2157) -----------
 
                 mod user_photo {
@@ -38404,13 +38956,13 @@ mod tests {
 
                     /// The engine over an in-memory store on `srv`, signed
                     /// in, driven step by step (no thread).
-                    fn direct_engine(srv: &FakeServer) -> (Engine, Receiver<SyncEvent>) {
+                    pub(super) fn direct_engine(srv: &FakeServer) -> (Engine, Receiver<SyncEvent>) {
                         direct_engine_at(srv, PathBuf::from("unused-token.json"))
                     }
 
                     /// [`direct_engine`] saving its token at `token_path`
                     /// (a refresh writes it).
-                    fn direct_engine_at(
+                    pub(super) fn direct_engine_at(
                         srv: &FakeServer,
                         token_path: PathBuf,
                     ) -> (Engine, Receiver<SyncEvent>) {
@@ -46334,6 +46886,12 @@ mod tests {
             };
             assert!(!persists_at_shutdown(&presences));
             assert!(served_at_checkpoint(&presences));
+            // And a person's details by address (#2239).
+            let person = SyncCommand::FetchPersonDetails {
+                address: "ada@contoso.com".into(),
+            };
+            assert!(!persists_at_shutdown(&person));
+            assert!(served_at_checkpoint(&person));
             assert!(!persists_at_shutdown(&SyncCommand::ComposeForward {
                 id: "x".into()
             }));
