@@ -3058,14 +3058,16 @@ impl Store {
     /// of `SyncCommand::SendDraft` (the sync engine's outbox, via
     /// `OutboxOp::SendDraft`, is what actually hands the draft to Graph for
     /// delivery). A mismatched/already-gone `id` just changes zero rows,
-    /// which is not an error. Unlike `set_read` (#2209) it still drops a
-    /// failed statement: no caller acts on one yet. A reconciled draft's
-    /// `local:` id still reaches it (#1884).
-    pub fn mark_sent(&self, id: &str) {
-        let _ = self.conn.execute(
+    /// which is not an error. A failed statement (above all a busy store) is
+    /// an `Err`, as `set_read`'s is (#2209, #2215): the engine reports it,
+    /// still sends, and skips its optimistic re-file into Sent Items. A
+    /// reconciled draft's `local:` id still reaches it (#1884).
+    pub fn mark_sent(&self, id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
             concat!("UPDATE messages SET is_draft = 0 WHERE ", draft_row_sql!()),
             params![id],
-        );
+        )?;
+        Ok(())
     }
 
     /// Undoes `mark_sent` and `SendDraft`'s optimistic re-file into Sent
@@ -4812,27 +4814,31 @@ impl Store {
         )?)
     }
 
-    /// Removes a queued op by `seq` — called once it's been applied
-    /// successfully. A `seq` that's already gone just means zero rows
-    /// change, not an error. A failed statement is dropped too (not changed
-    /// by #2209): the op then stays queued and the next drain applies it
-    /// again.
-    pub fn drop_op(&self, seq: i64) {
-        let _ = self
-            .conn
-            .execute("DELETE FROM outbox WHERE seq = ?1", params![seq]);
+    /// Removes a queued op by `seq` — called once it's been applied (or
+    /// given up). A `seq` that's already gone just means zero rows change,
+    /// not an error. A failed statement (above all a busy store) is an
+    /// `Err` (#2215), which the engine reports: the op then stays queued
+    /// and the next drain applies it again. That is harmless for most ops,
+    /// but a create Graph already made (`CreateEvent`, `CreateContact`,
+    /// `CreateFolder`, `CopyFolder`) is made twice. A send is not: its
+    /// re-run checks delivery first (`send_posted`, #1874).
+    pub fn drop_op(&self, seq: i64) -> Result<(), StoreError> {
+        self.conn
+            .execute("DELETE FROM outbox WHERE seq = ?1", params![seq])?;
+        Ok(())
     }
 
     /// Records a failed attempt to apply a queued op: increments
     /// `attempts` and stores `err` as `last_error`, for retry backoff and
     /// diagnostics. A `seq` that's already gone changes zero rows, not an
-    /// error. A failed statement is dropped too (not changed by #2209): the
-    /// attempt is then not counted.
-    pub fn bump_op_attempts(&self, seq: i64, err: &str) {
-        let _ = self.conn.execute(
+    /// error. A failed statement (above all a busy store) is an `Err`
+    /// (#2215), which the engine reports: the attempt is then not counted.
+    pub fn bump_op_attempts(&self, seq: i64, err: &str) -> Result<(), StoreError> {
+        self.conn.execute(
             "UPDATE outbox SET attempts = attempts + 1, last_error = ?1 WHERE seq = ?2",
             params![err, seq],
-        );
+        )?;
+        Ok(())
     }
 
     /// Inserts or updates an `events` row by `id`. See `NewEvent`'s doc
@@ -5549,13 +5555,15 @@ impl Store {
     /// Graph. Status and time are written together, so the row never shows an
     /// answer with another answer's time. The caller passes the time, which
     /// keeps the store clock-free. A mismatched/already-gone `id` changes
-    /// zero rows, which is not an error. Unlike `set_read` (#2209) it still
-    /// drops a failed statement: no caller acts on one yet.
-    pub fn set_event_response(&self, id: &str, status: &str, at: &str) {
-        let _ = self.conn.execute(
+    /// zero rows, which is not an error. A failed statement (above all a
+    /// busy store) is an `Err`, as `set_read`'s is (#2209, #2215): the
+    /// engine reports it and still queues the RSVP.
+    pub fn set_event_response(&self, id: &str, status: &str, at: &str) -> Result<(), StoreError> {
+        self.conn.execute(
             "UPDATE events SET response_status = ?1, response_time = ?3 WHERE id = ?2",
             params![status, id, at],
-        );
+        )?;
+        Ok(())
     }
 
     /// Writes the calendar list `GET /me/calendars` returned (#1984), in its
@@ -11696,7 +11704,7 @@ mod tests {
         // `local_id` set, `is_draft = 0`, `received_at = ''`, in Sent Items.
         let local = s.create_local_draft("Hi", "bob@x", "", "<p>x</p>").unwrap();
         s.reconcile_id(&local, "GRAPH-DRAFT").unwrap();
-        s.mark_sent("GRAPH-DRAFT");
+        s.mark_sent("GRAPH-DRAFT").unwrap();
         s.move_message("GRAPH-DRAFT", "SENT").unwrap();
         let (received, is_draft): (String, bool) = s
             .conn
@@ -12805,7 +12813,7 @@ mod tests {
             })
             .unwrap()
             .seq;
-        s.drop_op(create_seq);
+        s.drop_op(create_seq).unwrap();
         let mut e = contact_record("E1", "Edited here", &["e@x.com"]).fields;
         s.update_contact_fields("E1", &e).unwrap();
         e.job_title = "Lead".into();
@@ -12845,7 +12853,7 @@ mod tests {
 
         // With the queue empty, the server's version wins again.
         for row in s.pending_ops().unwrap() {
-            s.drop_op(row.seq);
+            s.drop_op(row.seq).unwrap();
         }
         s.replace_contacts(&[contact_record("E1", "Edited", &["e@x.com"])])
             .unwrap();
@@ -12973,7 +12981,7 @@ mod tests {
         );
         assert_eq!(s.owed_contact_rereads().unwrap().len(), 1, "still owed");
         for row in s.pending_ops().unwrap() {
-            s.drop_op(row.seq);
+            s.drop_op(row.seq).unwrap();
         }
         assert!(s.revert_folder_contact("C1", Some(&server)).unwrap());
         assert_eq!(s.folder_contact("C1").unwrap(), Some(server));
@@ -13277,7 +13285,7 @@ mod tests {
         assert!(s.pending_contact_photo("G2").unwrap().is_some());
         // Once its op is gone, the next pass removes it.
         for r in s.pending_ops().unwrap() {
-            s.drop_op(r.seq);
+            s.drop_op(r.seq).unwrap();
         }
         s.replace_contacts(&[contact_record("G2", "Bob Day", &[])])
             .unwrap();
@@ -13320,7 +13328,7 @@ mod tests {
         assert!(s.owed_contact_rereads().unwrap().is_empty());
         // Once the photo op is gone, a 404 deletes it.
         for r in s.pending_ops().unwrap() {
-            s.drop_op(r.seq);
+            s.drop_op(r.seq).unwrap();
         }
         assert!(s.revert_folder_contact("G1", None).unwrap());
         assert!(s.folder_contact("G1").unwrap().is_none());
@@ -13339,7 +13347,7 @@ mod tests {
         let ops = s.pending_ops().unwrap();
         // The first op refused and dropped: the second still has its own
         // photo to send.
-        s.drop_op(ops[0].seq);
+        s.drop_op(ops[0].seq).unwrap();
         assert!(!s.revert_contact_photo("G1").unwrap());
         assert_eq!(
             s.pending_contact_photo("G1").unwrap().unwrap().0.bytes,
@@ -13347,7 +13355,7 @@ mod tests {
         );
         // The second sent and refused too: the photo is unknown again.
         s.note_contact_photo_sent("G1", sent + 1).unwrap();
-        s.drop_op(ops[1].seq);
+        s.drop_op(ops[1].seq).unwrap();
         assert!(s.revert_contact_photo("G1").unwrap());
         assert_eq!(s.contact_photo("G1").unwrap(), None);
         assert!(
@@ -13369,7 +13377,7 @@ mod tests {
         let (_, sent) = s.pending_contact_photo("G1").unwrap().unwrap();
         s.note_contact_photo_sent("G1", sent).unwrap();
         let ops = s.pending_ops().unwrap();
-        s.drop_op(ops[0].seq);
+        s.drop_op(ops[0].seq).unwrap();
         assert!(s.revert_contact_photo("G1").unwrap());
         assert_eq!(s.contact_photo("G1").unwrap(), None);
         assert_eq!(
@@ -13408,7 +13416,7 @@ mod tests {
             .map(|r| r.seq)
             .collect();
         for seq in first {
-            s.drop_op(seq);
+            s.drop_op(seq).unwrap();
         }
         assert_eq!(
             photo_ops(&s).len(),
@@ -13757,14 +13765,16 @@ mod calendar_tests {
         let s = Store::open_in_memory().unwrap();
         s.upsert_event(&ev("1", "2026-07-17T10:00:00Z", "2026-07-17T11:00:00Z"))
             .unwrap();
-        s.set_event_response("1", "accepted", "2026-08-13T19:19:00Z");
+        s.set_event_response("1", "accepted", "2026-08-13T19:19:00Z")
+            .unwrap();
         let rows = s
             .events_in_window("2026-07-17T00:00:00Z", "2026-07-18T00:00:00Z")
             .unwrap();
         assert_eq!(rows[0].response_status, "accepted");
         // ...with the time it was given (#2068).
         assert_eq!(rows[0].response_time, "2026-08-13T19:19:00Z");
-        s.set_event_response("1", "declined", "2026-08-14T07:00:00Z");
+        s.set_event_response("1", "declined", "2026-08-14T07:00:00Z")
+            .unwrap();
         let row = s.event("1").unwrap().unwrap();
         assert_eq!(row.response_status, "declined");
         assert_eq!(row.response_time, "2026-08-14T07:00:00Z");
@@ -16971,7 +16981,8 @@ mod calendar_tests {
     fn apply_calendar_sync_fill_keeps_an_untouched_occurrences_local_write() {
         let s = series_store();
         // An optimistic RSVP on O1, its op not yet sent.
-        s.set_event_response("O1", "declined", "2026-08-13T19:19:00Z");
+        s.set_event_response("O1", "declined", "2026-08-13T19:19:00Z")
+            .unwrap();
         // A round that touches neither O1 nor M keeps it; O2, re-sent
         // minimal, is filled again.
         s.apply_calendar_sync(
@@ -17007,7 +17018,8 @@ mod calendar_tests {
     #[test]
     fn apply_calendar_sync_delta_master_change_refreshes_its_occurrences() {
         let s = series_store();
-        s.set_event_response("O1", "declined", "2026-08-13T19:19:00Z");
+        s.set_event_response("O1", "declined", "2026-08-13T19:19:00Z")
+            .unwrap();
         let changed = NewEvent {
             subject: "Renamed".into(),
             location: "Room 2".into(),
@@ -17571,7 +17583,8 @@ mod calendar_tests {
         // not yet sent.
         s.upsert_event(&minimal("O-FAR", "M", "A", far.0, far.1))
             .unwrap();
-        s.set_event_response("O-FAR", "tentative", "2026-08-13T19:19:00Z");
+        s.set_event_response("O-FAR", "tentative", "2026-08-13T19:19:00Z")
+            .unwrap();
         let next_day =
             |master: NewEvent| window("A", vec![master, minimal("O1", "M", "A", M_START, M_END)]);
         s.apply_calendar_sync(
@@ -17601,7 +17614,8 @@ mod calendar_tests {
             ("Renamed", "accepted")
         );
         // A master with no `last_modified` counts as changed.
-        s.set_event_response("O-FAR", "tentative", "2026-08-13T19:19:00Z");
+        s.set_event_response("O-FAR", "tentative", "2026-08-13T19:19:00Z")
+            .unwrap();
         s.apply_calendar_sync(FROM, TO, &[next_day(m("", "Renamed"))], STAMP)
             .unwrap();
         assert_eq!(row(&s, "O-FAR").response_status, "accepted");
@@ -17634,7 +17648,7 @@ mod outbox_tests {
                 flagged: true,
             })
             .unwrap();
-        s.drop_op(seq);
+        s.drop_op(seq).unwrap();
         assert!(s.pending_ops().unwrap().is_empty());
     }
 
@@ -17642,8 +17656,8 @@ mod outbox_tests {
     fn bump_op_attempts_increments_and_records_error() {
         let s = Store::open_in_memory().unwrap();
         let seq = s.enqueue_op(&OutboxOp::Delete { id: "1".into() }).unwrap();
-        s.bump_op_attempts(seq, "throttled");
-        s.bump_op_attempts(seq, "throttled again");
+        s.bump_op_attempts(seq, "throttled").unwrap();
+        s.bump_op_attempts(seq, "throttled again").unwrap();
         let ops = s.pending_ops().unwrap();
         assert_eq!(ops[0].attempts, 2);
     }
@@ -18346,7 +18360,7 @@ mod draft_tests {
         let local = s.create_local_draft("Hi", "b@x", "", "body").unwrap();
         s.reconcile_id(&local, "G").unwrap();
         for id in [local.as_str(), "G"] {
-            s.mark_sent(id);
+            s.mark_sent(id).unwrap();
             s.move_message(id, "SENT1").unwrap();
             s.return_to_drafts(id, "DRAFTS1").unwrap();
             let (row, body) = s.draft("G").unwrap().unwrap();
@@ -18359,7 +18373,7 @@ mod draft_tests {
         // Sent Items never synced: the row never left Drafts, only
         // `is_draft` flips back.
         let other = s.create_local_draft("Two", "c@x", "", "b2").unwrap();
-        s.mark_sent(&other);
+        s.mark_sent(&other).unwrap();
         s.return_to_drafts(&other, "DRAFTS1").unwrap();
         let (row, _) = s.draft(&other).unwrap().unwrap();
         assert_eq!(row.folder_id, "DRAFTS1");
@@ -18697,7 +18711,7 @@ mod draft_tests {
         let s = Store::open_in_memory().unwrap();
         let id = s.create_local_draft("Hi", "a@x", "", "body").unwrap();
         assert!(s.draft(&id).unwrap().unwrap().0.is_draft);
-        s.mark_sent(&id);
+        s.mark_sent(&id).unwrap();
         assert!(!s.draft(&id).unwrap().unwrap().0.is_draft);
     }
 
@@ -19295,7 +19309,7 @@ mod local_id_tests {
         s.clear_outbound_attachments(&local).unwrap();
         assert!(s.outbound_attachments("G").unwrap().is_empty());
 
-        s.mark_sent(&local);
+        s.mark_sent(&local).unwrap();
         assert!(!s.draft("G").unwrap().unwrap().0.is_draft);
 
         s.conn
@@ -20309,7 +20323,7 @@ mod kept_body_tests {
             );
             assert_eq!(body(&s, "D").as_deref(), Some("<p>mine</p>"), "{op:?}");
 
-            s.drop_op(seq);
+            s.drop_op(seq).unwrap();
             assert_eq!(
                 fetch_both(&s, "D", "<p>graph's</p>"),
                 (true, true),
@@ -23381,7 +23395,7 @@ mod reply_link_tests {
             .unwrap();
         s.upsert_message("Drafts", &draft("S1", "C5", "<m5@x>"))
             .unwrap();
-        s.mark_sent("S1");
+        s.mark_sent("S1").unwrap();
         assert_eq!(
             s.reply_draft_links().unwrap(),
             [
@@ -27338,7 +27352,7 @@ mod clear_offline_tests {
         // A draft written here, reconciled, sent, filed under Sent Items.
         let local = s.create_local_draft("Hi", "bob@x", "", "<p>x</p>").unwrap();
         s.reconcile_id(&local, "GRAPH-DRAFT").unwrap();
-        s.mark_sent("GRAPH-DRAFT");
+        s.mark_sent("GRAPH-DRAFT").unwrap();
         s.move_message("GRAPH-DRAFT", "SENT").unwrap();
         message(&s, "S1", "SENT", "");
 
@@ -28589,7 +28603,8 @@ mod optimistic_write_tests {
     //! #2209: the optimistic message writes (`set_read`, `set_flag`,
     //! `set_categories`, `dismiss_message_reminder`,
     //! `snooze_message_reminder`) return a failed statement, above all a
-    //! busy store, and stay `Ok` for an id that is not there.
+    //! busy store, and stay `Ok` for an id that is not there. #2215: so do
+    //! `mark_sent`, `set_event_response`, `drop_op` and `bump_op_attempts`.
     use super::*;
 
     /// A store on a file (WAL, as `Store::open` sets it) with one flagged,
@@ -28687,6 +28702,56 @@ mod optimistic_write_tests {
             write(&self.a, "M1").expect("unlocked, the write succeeds");
             assert!(changed(&self.row()), "{:?}", self.row());
         }
+
+        /// `check` for a write on any stored state (#2215): `read` reads
+        /// it, `write` takes the id (`known`, or `unknown`, which is not
+        /// stored).
+        fn check_with<T: PartialEq + std::fmt::Debug>(
+            &self,
+            known: &str,
+            unknown: &str,
+            read: impl Fn(&Store) -> T,
+            write: impl Fn(&Store, &str) -> Result<(), StoreError>,
+            changed: impl Fn(&T) -> bool,
+        ) {
+            let before = read(&self.a);
+            assert!(!changed(&before), "the fixture starts unchanged");
+            let err = self
+                .while_locked(|a| write(a, known))
+                .expect_err("a write under another connection's lock fails");
+            assert!(is_busy_text(&err.to_string()), "{err}");
+            assert_eq!(read(&self.a), before, "a failed write changes nothing");
+
+            write(&self.a, unknown).expect("an unknown id is no error");
+            assert_eq!(read(&self.a), before, "an unknown id changes nothing");
+
+            write(&self.a, known).expect("unlocked, the write succeeds");
+            let after = read(&self.a);
+            assert!(changed(&after), "{after:?}");
+        }
+
+        /// Queues one op and returns its `seq`, as text for `check_with`.
+        fn queue_op(&self) -> String {
+            self.a
+                .enqueue_op(&OutboxOp::MarkRead {
+                    id: "M1".into(),
+                    read: true,
+                })
+                .unwrap()
+                .to_string()
+        }
+    }
+
+    /// The outbox as `(seq, attempts, last_error)` rows.
+    fn outbox(s: &Store) -> Vec<(i64, i64, Option<String>)> {
+        let mut stmt = s
+            .conn
+            .prepare("SELECT seq, attempts, last_error FROM outbox ORDER BY seq")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
     }
 
     /// The text a caller recognises a busy store by (rusqlite's, kept by
@@ -28761,6 +28826,77 @@ mod optimistic_write_tests {
         Fixture::new("snooze").check(
             |s, id| s.snooze_message_reminder(id, "2026-11-08T11:00:00Z"),
             |r| r.reminder_signal_at == "2026-11-08T11:00:00Z",
+        );
+    }
+
+    #[test]
+    fn mark_sent_reports_a_busy_store_2215() {
+        let f = Fixture::new("sent");
+        let draft = Message {
+            is_draft: true,
+            ..message("D1")
+        };
+        f.a.upsert_message("F", &draft).unwrap();
+        f.check_with(
+            "D1",
+            "NOPE",
+            |s| s.message_row("D1").unwrap().unwrap(),
+            |s, id| s.mark_sent(id),
+            |r| !r.is_draft,
+        );
+    }
+
+    #[test]
+    fn set_event_response_reports_a_busy_store_2215() {
+        let f = Fixture::new("response");
+        f.a.upsert_event(&NewEvent {
+            id: "E1".into(),
+            start_utc: "2026-11-10T09:00:00Z".into(),
+            end_utc: "2026-11-10T10:00:00Z".into(),
+            response_status: "none".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        f.check_with(
+            "E1",
+            "NOPE",
+            |s| {
+                s.conn
+                    .query_row(
+                        "SELECT response_status, response_time FROM events WHERE id = 'E1'",
+                        [],
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                    )
+                    .unwrap()
+            },
+            |s, id| s.set_event_response(id, "accepted", "2026-11-09T08:00:00Z"),
+            |(status, at)| status == "accepted" && at == "2026-11-09T08:00:00Z",
+        );
+    }
+
+    #[test]
+    fn drop_op_reports_a_busy_store_2215() {
+        let f = Fixture::new("drop");
+        let seq = f.queue_op();
+        f.check_with(
+            &seq,
+            "999999",
+            outbox,
+            |s, seq| s.drop_op(seq.parse().unwrap()),
+            |rows| rows.is_empty(),
+        );
+    }
+
+    #[test]
+    fn bump_op_attempts_reports_a_busy_store_2215() {
+        let f = Fixture::new("bump");
+        let seq = f.queue_op();
+        f.check_with(
+            &seq,
+            "999999",
+            outbox,
+            |s, seq| s.bump_op_attempts(seq.parse().unwrap(), "503"),
+            |rows| rows.len() == 1 && rows[0].1 == 1 && rows[0].2.as_deref() == Some("503"),
         );
     }
 }

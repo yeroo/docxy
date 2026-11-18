@@ -2545,8 +2545,12 @@ impl App {
         };
         match target {
             RsvpTarget::Event(id) => {
-                // Stamped with now, as the engine and Graph do (#2068).
-                self.store
+                // Stamped with now, as the engine and Graph do (#2068). A
+                // failed write is dropped, as `set_read`'s is (#2209): the
+                // engine repeats it on its own connection when it handles
+                // the `RespondEvent` below, and tells a failure there (#2215).
+                let _ = self
+                    .store
                     .set_event_response(&id, &kind, &crate::ui::calendar::now_utc());
                 self.reload_agenda();
                 let _ = self.sync.cmd_tx.send(SyncCommand::RespondEvent {
