@@ -3121,8 +3121,8 @@ impl Engine {
     /// two requests of long work (#1978): a `FetchBody`, a `SearchMessages`
     /// or a `FetchMessage` (#2006), a `FetchFolderSizes` (#2123), a
     /// `SearchDirectory` (#1942), a `SearchGroups` or a `FetchGroupMembers`
-    /// (#2058), a `FetchUserPhoto` (#2157) or a `FetchPresences` (#2158) is
-    /// served at once, so a click
+    /// (#2058), a `FetchUserPhoto` (#2157), a `FetchPresences` (#2158) or a
+    /// `FetchPersonDetails` (#2239) is served at once, so a click
     /// costs its own round trips plus the request in flight, not a whole
     /// pass; every other command is kept (`deferred`)
     /// for the main loop, in order. A `Shutdown` or a dropped handle sets

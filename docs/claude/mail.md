@@ -4395,7 +4395,7 @@ quarantine re-listed the mailbox and brought the lost writes back.
   `Shutdown` first, then serves the kept commands of a served kind (`served_at_checkpoint`:
   `FetchBody`, `SearchMessages`, `FetchMessage`, `FetchFolderSizes`, `SearchDirectory`,
   `SearchGroups` and `FetchGroupMembers` (#2058), `FetchUserPhoto` (#2157),
-  `FetchPresences` (#2158)) out of
+  `FetchPresences` (#2158), `FetchPersonDetails` (#2239)) out of
   `deferred`, one at a time, taking again after each. A read sent before a `Shutdown` is therefore never served,
   in the bulk runs' checkpoints inside a drain too. Outside a shutdown the order is unchanged:
   a served kind in `deferred` is one the drain took early, which the old `checkpoint` would have
