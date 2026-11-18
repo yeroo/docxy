@@ -1069,9 +1069,108 @@ pub fn paragraph_texts(doc: &Document) -> Vec<String> {
     out
 }
 
+/// Pin the left and first-line indents of every list item the HTML importer
+/// made (#2231): it computes where each item draws (its `<li>`'s padding and
+/// margins, #1979, #2114), so a 0 is that value, not "inherit". Pinned,
+/// neither the numbering level's indent nor a style's reaches it, in the
+/// page view or in Word after a save. A nonzero value is direct already.
+/// The RTF and PDF importers do not compute list indents (every item comes
+/// at 0), so theirs stay unpinned and take their level's indent, as a save
+/// and Word give them.
+pub(crate) fn pin_list_indents(blocks: &mut [Block]) {
+    for b in blocks {
+        match b {
+            Block::Paragraph(p) if p.props.in_list() => {
+                if !p.props.has_direct_left_indent() {
+                    p.props.pin_left_indent_zero();
+                }
+                if !p.props.has_direct_first_line() {
+                    p.props.pin_first_line(0);
+                }
+            }
+            Block::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        pin_list_indents(&mut cell.blocks);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2231: the HTML importer's list items keep the indents it computed,
+    /// a 0 included, as direct ones, so neither a numbering level's indent
+    /// nor a style's reaches them. The RTF importer computes none (every
+    /// item comes at 0), so its items stay unpinned and save with no `w:ind`:
+    /// they take their level's indent, as Word gives a pasted bullet.
+    #[test]
+    fn html_list_items_pin_their_indents_and_rtf_items_do_not() {
+        let items = |d: &Document| -> Vec<(i32, i32, bool, bool)> {
+            d.body
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Paragraph(p) if p.props.in_list() => Some((
+                        p.props.indent,
+                        p.props.first_line,
+                        p.props.has_direct_left_indent(),
+                        p.props.has_direct_first_line(),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+        let html = html::import_html(
+            br#"<ul style="padding-left:0;margin:0"><li>flat</li></ul><ol><li>padded</li></ol>"#,
+        )
+        .unwrap();
+        let got = items(&html);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.iter().all(|&(_, _, l, f)| l && f), "{got:?}");
+        assert_eq!((got[0].0, got[0].1), (0, 0));
+        assert!(got[1].0 > 0, "the padded item keeps its indent: {got:?}");
+        let rtf = rtf::import_rtf(
+            br"{\rtf1{\*\listtable{\list x}}\pard\ls1\ilvl0\li720\fi-360{\listtext\f3\'b7\tab}Apples\par\pard\ls1{\listtext\f3\'b7\tab}Bananas\par}",
+        )
+        .unwrap();
+        let got = items(&rtf);
+        assert_eq!(got.len(), 2, "{:?}", rtf.body);
+        assert!(got.iter().all(|&(_, _, l, f)| !l && !f), "{got:?}");
+        let xml = crate::serialize::document_to_xml(&rtf);
+        assert!(xml.contains("<w:numId w:val=\"1\"/>"), "{xml}");
+        assert!(
+            !xml.contains("<w:ind"),
+            "an RTF bullet saves no w:ind: {xml}"
+        );
+        // A table cell's item too, and a paragraph outside a list is untouched.
+        let item = |num_id| {
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    num_id,
+                    ..ParProps::default()
+                },
+                content: Vec::new(),
+            })
+        };
+        let mut t = crate::table::new_table(1, 1, 9000, crate::table::AutoFit::Fixed(None));
+        t.rows[0].cells[0].blocks = vec![item(Some(1))];
+        let mut body = vec![Block::Table(t), item(None)];
+        pin_list_indents(&mut body);
+        let (Block::Table(t), Block::Paragraph(plain)) = (&body[0], &body[1]) else {
+            panic!("{body:?}")
+        };
+        let Block::Paragraph(cell_item) = &t.rows[0].cells[0].blocks[0] else {
+            panic!("a paragraph")
+        };
+        assert!(cell_item.props.has_direct_first_line());
+        assert!(cell_item.props.has_direct_left_indent());
+        assert!(plain.props.shadow.is_empty());
+    }
 
     #[test]
     fn sniff_reads_content_before_the_extension() {

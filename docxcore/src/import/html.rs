@@ -251,6 +251,8 @@ fn import_decoded(
     let (media, links) = h.images.take().map(Images::into_parts).unwrap_or_default();
     let props = h.flow_end_props();
     let mut doc = h.out.finish(props);
+    // The items' indents are the ones computed here (#2231).
+    super::pin_list_indents(&mut doc.body);
     // The page the layout above assumed (#1928): Outlook-like margins.
     doc.set_trailing_section_properties(html_table::page_section());
     if budget.exhausted() {

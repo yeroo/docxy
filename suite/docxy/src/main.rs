@@ -180,9 +180,7 @@ use std::path::PathBuf;
 use docxcore::comments::Comment;
 use docxcore::editor::{Caret, Clip, Editor, FoundMatch, PropSource, step_found};
 use docxcore::markup::MarkupView;
-use docxcore::model::{
-    Align, Block, BorderKind, Document, Inline, ParBorders, Paragraph, RunProps, Table, VertAlign,
-};
+use docxcore::model::{Align, Block, Document, Inline, Paragraph, RunProps, Table, VertAlign};
 use docxcore::package::{HeaderVariant, Package};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -5916,8 +5914,9 @@ struct Docxy {
     /// The document tab's top-level tables as last painted (#1895), for the
     /// harness's `doc` read.
     painted_tables: PaintedTables,
-    /// The document tab's top-level paragraphs as its flow view last painted
-    /// them, in a harness instance (#1986), for `doc`'s `flow.layout`.
+    /// The document tab's top-level paragraphs as the flow view or Print
+    /// Layout last painted them, in a harness instance, for `doc`'s
+    /// `flow.layout` and `page.layout` (#1986, #2231).
     painted_paras: PaintedParas,
     /// The body's runs' inks as last painted, both views (#2079): a
     /// harness instance only.
@@ -6788,21 +6787,106 @@ struct EffIndent {
     list_step: i32,
 }
 
-fn eff_indent(p: &docxcore::model::ParProps) -> EffIndent {
+/// The indents a paragraph takes from below its own (#2231), in twips: its
+/// list level's and its style's, resolved per attribute (`left` and `first`
+/// apart) by Word's precedence for a paragraph numbered directly. An
+/// inherited left takes no level step, so the ruler does not clamp at it.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Inherited {
+    left: Option<i32>,
+    first: Option<i32>,
+}
+
+impl Inherited {
+    /// Nothing inherited: today's `ilvl × 300` step for a list item, and a
+    /// paragraph's own indents only (no styles or numbering in reach).
+    #[cfg(test)]
+    const NONE: Inherited = Inherited {
+        left: None,
+        first: None,
+    };
+
+    /// What `p` inherits below its direct `w:ind` (which [`eff_indent`]
+    /// lets win), each attribute from the first that gives it:
+    /// - a list item's level `w:ind`, where the numbering part defines it;
+    /// - for docxy's own lists (numId 1 and 2, as `add_markdown_numbering`
+    ///   writes them, and 9990/9991, `ensure_list`'s) that no numbering part
+    ///   defines yet, what saving writes ([`own_list_level_indent`]), so a
+    ///   list draws the same in session and after a reload;
+    /// - the paragraph style chain, in twips (a character count is not
+    ///   drawn), list or not.
+    ///
+    /// [`own_list_level_indent`]: docxcore::package::own_list_level_indent
+    fn of(
+        p: &docxcore::model::ParProps,
+        sheet: Option<&docxcore::styles::StyleSheet>,
+        numbering: Option<&docxcore::numbering::Numbering>,
+    ) -> Inherited {
+        use docxcore::package::{BULLET_LIST_NUM_ID, NUMBER_LIST_NUM_ID, own_list_level_indent};
+        let level = p.num_id.filter(|_| p.in_list()).and_then(|num| {
+            match numbering.and_then(|n| n.level_indent(num, p.ilvl)) {
+                Some(l) => Some((l.left, l.first)),
+                None if numbering.is_some_and(|n| n.defines(num)) => None,
+                None if [
+                    NUM_BULLET,
+                    NUM_DECIMAL,
+                    BULLET_LIST_NUM_ID,
+                    NUMBER_LIST_NUM_ID,
+                ]
+                .contains(&num) =>
+                {
+                    let (left, first) = own_list_level_indent(p.ilvl);
+                    Some((Some(left), Some(first)))
+                }
+                None => None,
+            }
+        });
+        let (level_left, level_first) = level.unwrap_or((None, None));
+        let style = p.style_id.as_deref();
+        Inherited {
+            left: level_left.or_else(|| sheet.and_then(|s| s.style_left_twips(style))),
+            first: level_first.or_else(|| sheet.and_then(|s| s.style_first_line(style))),
+        }
+    }
+}
+
+/// Whether `p` inherits a nonzero left and first line from below its own
+/// (#2231, [`Inherited::of`] over `parts`): a 0 written over one is pinned
+/// ([`Editor::pin_zero_indents`]).
+fn inherits_nonzero(p: &docxcore::model::ParProps, parts: &run_look::DocParts) -> (bool, bool) {
+    let inh = Inherited::of(p, parts.sheet.as_deref(), parts.numbering.as_deref());
+    (
+        inh.left.is_some_and(|l| l != 0),
+        inh.first.is_some_and(|f| f != 0),
+    )
+}
+
+fn eff_indent(p: &docxcore::model::ParProps, inh: Inherited) -> EffIndent {
     // An explicit numId 0 is no list (#1728). No numId at all may still be
     // a level of the style's numbering, so it keeps its step. A left
     // indent of its own (set in session or loaded) replaces the level's,
     // as Word reads the file, so an item draws where a reload puts it: an
-    // HTML item's already holds its nesting (#1986).
-    let list_step = if p.num_id == Some(0) || p.has_direct_left_indent() {
+    // HTML item's already holds its nesting (#1986). Below its own, the
+    // level's or style's (#2231, [`Inherited`]); only with neither does a
+    // list item take the `ilvl × 300` step.
+    let direct_left = p.has_direct_left_indent();
+    let inh_left = inh.left.filter(|_| !direct_left);
+    let list_step = if p.num_id == Some(0) || direct_left || inh_left.is_some() {
         0
     } else {
         p.ilvl.max(0).saturating_mul(300)
     };
-    let left = p.indent.max(0).saturating_add(list_step);
+    let left = inh_left
+        .unwrap_or(p.indent)
+        .max(0)
+        .saturating_add(list_step);
+    let first = match inh.first {
+        Some(f) if !p.has_direct_first_line() => f,
+        _ => p.first_line,
+    };
     EffIndent {
         left,
-        first: p.first_line.max(-left),
+        first: first.max(-left),
         right: p.indent_right.max(0),
         list_step,
     }
@@ -7950,12 +8034,348 @@ mod link_colour_tests {
     }
 }
 
+/// #2231: a list level's indent and a style's, by Word's precedence.
+#[cfg(test)]
+mod level_indent_tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use docxcore::model::ParProps;
+
+    const STYLES: &str = r#"<w:styles>
+        <w:style w:type="paragraph" w:styleId="ListParagraph"><w:pPr><w:ind w:left="720"/></w:pPr></w:style>
+        <w:style w:type="paragraph" w:styleId="Wide"><w:pPr><w:ind w:left="1440" w:firstLine="100"/></w:pPr></w:style>
+        <w:style w:type="paragraph" w:styleId="Chars"><w:pPr><w:ind w:leftChars="200"/></w:pPr></w:style>
+        </w:styles>"#;
+    const NUMBERING: &str = r#"<w:numbering>
+        <w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/>
+          <w:pPr><w:ind w:left="1080" w:hanging="540"/></w:pPr></w:lvl></w:abstractNum>
+        <w:abstractNum w:abstractNumId="5"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/>
+          <w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl>
+          <w:lvl w:ilvl="1"><w:numFmt w:val="bullet"/></w:lvl></w:abstractNum>
+        <w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num>
+        <w:num w:numId="5"><w:abstractNumId w:val="5"/></w:num>
+        </w:numbering>"#;
+
+    fn item(num: Option<i32>, ilvl: i32, style: Option<&str>) -> ParProps {
+        ParProps {
+            num_id: num,
+            ilvl,
+            style_id: style.map(String::from),
+            ..ParProps::default()
+        }
+    }
+
+    /// (left, first) as the page view draws `p`.
+    fn drawn(p: &ParProps) -> (i32, i32) {
+        let sheet = docxcore::styles::parse_styles_xml(STYLES);
+        let numbering = docxcore::numbering::parse_numbering_xml(NUMBERING);
+        let e = eff_indent(p, Inherited::of(p, Some(&sheet), Some(&numbering)));
+        (e.left, e.first)
+    }
+
+    #[test]
+    fn a_direct_list_items_level_beats_its_style_and_its_own_ind_beats_both() {
+        // The level's 720/360 over the style's 1440 (and its first line).
+        assert_eq!(drawn(&item(Some(5), 0, Some("Wide"))), (720, -360));
+        // The bullet at 0.25", the text and wrapped lines at 0.5".
+        assert_eq!(drawn(&item(Some(5), 0, Some("ListParagraph"))), (720, -360));
+        // A direct left keeps the level's hang.
+        let own_left = ParProps {
+            indent: 1080,
+            ..item(Some(5), 0, Some("Wide"))
+        };
+        assert_eq!(drawn(&own_left), (1080, -360));
+        // A loaded w:firstLine="0" is a first line of its own.
+        let mut loaded = item(Some(5), 0, None);
+        loaded.pin_first_line(0);
+        assert_eq!(drawn(&loaded), (720, 0));
+        // A level without a w:ind: the style's indents.
+        assert_eq!(drawn(&item(Some(5), 1, Some("Wide"))), (1440, 100));
+        // A numbering part defining numId 1 wins over docxy's own levels.
+        assert_eq!(drawn(&item(Some(1), 0, None)), (1080, -540));
+        // A level with nothing: the implicit step.
+        assert_eq!(drawn(&item(Some(5), 1, None)), (300, 0));
+    }
+
+    #[test]
+    fn a_style_indent_draws_outside_a_list_and_a_character_count_does_not() {
+        // A ListParagraph continuation lines up with its bullets' text.
+        assert_eq!(drawn(&item(None, 0, Some("ListParagraph"))), (720, 0));
+        assert_eq!(drawn(&item(None, 0, Some("Chars"))), (0, 0));
+        assert_eq!(drawn(&item(None, 0, None)), (0, 0));
+        // Its own left wins.
+        let own = ParProps {
+            indent: 200,
+            ..item(None, 0, Some("ListParagraph"))
+        };
+        assert_eq!(drawn(&own), (200, 0));
+    }
+
+    #[test]
+    fn docxys_own_lists_draw_at_what_saving_writes() {
+        for num in [NUM_BULLET, NUM_DECIMAL, 9990, 9991] {
+            let p = item(Some(num), 1, None);
+            let e = eff_indent(&p, Inherited::of(&p, None, None));
+            assert_eq!((e.left, e.first, e.list_step), (1440, -360, 0), "{num}");
+        }
+        // What a reload of the saved list reads from its numbering part.
+        let p = item(Some(NUM_BULLET), 1, None);
+        let pkg = docxcore::package::new_markdown_package(Document::default());
+        let numbering = docxcore::numbering::parse_numbering_xml(
+            &pkg.part_text("word/numbering.xml").expect("numbering"),
+        );
+        let e = eff_indent(&p, Inherited::of(&p, None, Some(&numbering)));
+        assert_eq!((e.left, e.first), (1440, -360));
+        // An explicit numId 0 is no list; another list is the old step.
+        let none = item(Some(0), 1, None);
+        assert_eq!(eff_indent(&none, Inherited::of(&none, None, None)).left, 0);
+        let other = item(Some(7), 1, None);
+        assert_eq!(
+            eff_indent(&other, Inherited::of(&other, None, None)).left,
+            300
+        );
+    }
+
+    /// A bullet drawn at its level's 720 can be dragged left of it, as in
+    /// Word: an inherited left takes no level step.
+    #[test]
+    fn a_level_indent_is_no_ruler_clamp() {
+        let p = item(Some(NUM_BULLET), 0, None);
+        let start = eff_indent(&p, Inherited::of(&p, None, None));
+        assert_eq!((start.left, start.list_step), (720, 0));
+        assert_eq!(dragged_left_marker(start, -720), 0);
+    }
+
+    /// The styles and numbering above as a tab's parts, or none.
+    fn parts(with: bool) -> run_look::DocParts {
+        if !with {
+            return run_look::DocParts::default();
+        }
+        run_look::DocParts {
+            sheet: Some(std::rc::Rc::new(docxcore::styles::parse_styles_xml(STYLES))),
+            numbering: Some(std::rc::Rc::new(docxcore::numbering::parse_numbering_xml(
+                NUMBERING,
+            ))),
+            colors: None,
+        }
+    }
+
+    /// An editor over one paragraph of `props`, all selected.
+    fn editor(props: ParProps) -> docxcore::editor::Editor {
+        let mut ed = docxcore::editor::Editor::new(Document {
+            body: vec![Block::Paragraph(Paragraph {
+                props,
+                content: vec![Inline::Run(docxcore::model::Run {
+                    text: "a".into(),
+                    ..Default::default()
+                })],
+            })],
+        });
+        ed.select_all();
+        ed
+    }
+
+    fn props_of(ed: &docxcore::editor::Editor) -> ParProps {
+        match &ed.doc.body[0] {
+            Block::Paragraph(p) => p.props.clone(),
+            _ => panic!("a paragraph"),
+        }
+    }
+
+    /// (left, first) as drawn over `parts`.
+    fn drawn_in(p: &ParProps, parts: &run_look::DocParts) -> (i32, i32) {
+        let e = eff_indent(
+            p,
+            Inherited::of(p, parts.sheet.as_deref(), parts.numbering.as_deref()),
+        );
+        (e.left, e.first)
+    }
+
+    /// One ruler move of `handle` by `delta` twips, as `ruler_drag_move`
+    /// applies it: the change, then the zero pins.
+    fn ruler_move(
+        ed: &mut docxcore::editor::Editor,
+        parts: &run_look::DocParts,
+        handle: RulerHandle,
+        delta: i32,
+    ) {
+        let p = props_of(ed);
+        let start = eff_indent(
+            &p,
+            Inherited::of(&p, parts.sheet.as_deref(), parts.numbering.as_deref()),
+        );
+        let base = RulerIndentBase::of(ed, false, parts);
+        let d = RulerDrag {
+            handle,
+            start_x: 200.0,
+            zoom: 1.0,
+            indent: start,
+            page: docxcore::model::PageGeom::default(),
+            content_x: 300.0,
+            content_right: 900.0,
+            page_right: 100.0 + tw_px(docxcore::model::PageGeom::default().w, 1.0),
+            sect_checkpointed: false,
+        };
+        // The app's own edit, as `ruler_drag_move` makes it.
+        let change = ruler_drag_result(d, 200.0 + tw_px(delta, 1.0)).change;
+        apply_ruler_indent(ed, change, base.for_editor(false), start.left, parts);
+    }
+
+    /// The first paragraph once saved into docxy's own package and opened.
+    fn reloaded(ed: &docxcore::editor::Editor) -> (ParProps, run_look::DocParts) {
+        let pkg = docxcore::package::new_markdown_package(ed.doc.clone());
+        let back =
+            docxcore::package::load_package(&docxcore::package::save_package(&pkg)).expect("loads");
+        let Some(Block::Paragraph(q)) = back.document.body.first() else {
+            panic!("a paragraph")
+        };
+        let numbering = docxcore::numbering::parse_numbering_xml(
+            &back.part_text("word/numbering.xml").expect("numbering"),
+        );
+        (
+            q.props.clone(),
+            run_look::DocParts {
+                numbering: Some(std::rc::Rc::new(numbering)),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// r2 M1: a list made from a list style (`w:numStyleLink`) draws at the
+    /// linked style's levels, not flattened to its paragraph style's left;
+    /// a link that resolves to nothing keeps the old step.
+    #[test]
+    fn a_list_style_list_draws_at_its_linked_levels() {
+        let lvl = |i: i32| {
+            format!(
+                "<w:lvl w:ilvl=\"{i}\"><w:numFmt w:val=\"bullet\"/>\
+                 <w:pPr><w:ind w:left=\"{}\" w:hanging=\"360\"/></w:pPr></w:lvl>",
+                720 * (i + 1)
+            )
+        };
+        let numbering = docxcore::numbering::parse_numbering_xml(&format!(
+            "<w:numbering>\
+             <w:abstractNum w:abstractNumId=\"20\"><w:styleLink w:val=\"Corp\"/>{}{}{}</w:abstractNum>\
+             <w:abstractNum w:abstractNumId=\"21\"><w:numStyleLink w:val=\"Corp\"/></w:abstractNum>\
+             <w:abstractNum w:abstractNumId=\"22\"><w:numStyleLink w:val=\"Gone\"/></w:abstractNum>\
+             <w:num w:numId=\"8\"><w:abstractNumId w:val=\"21\"/></w:num>\
+             <w:num w:numId=\"9\"><w:abstractNumId w:val=\"22\"/></w:num></w:numbering>",
+            lvl(0),
+            lvl(1),
+            lvl(2)
+        ));
+        let sheet = docxcore::styles::parse_styles_xml(STYLES);
+        let left = |num: i32, ilvl: i32, style: Option<&str>| {
+            let p = item(Some(num), ilvl, style);
+            eff_indent(&p, Inherited::of(&p, Some(&sheet), Some(&numbering))).left
+        };
+        let linked: Vec<i32> = (0..3).map(|i| left(8, i, Some("ListParagraph"))).collect();
+        assert_eq!(linked, [720, 1440, 2160]);
+        let lost: Vec<i32> = (0..3).map(|i| left(9, i, None)).collect();
+        assert_eq!(lost, [0, 300, 600]);
+    }
+
+    /// B5: a list item's hang dragged away on the ruler stays away, after
+    /// the move and after a save and reload.
+    #[test]
+    fn a_first_line_dragged_to_zero_stays_zero() {
+        let none = parts(false);
+        let mut ed = editor(item(Some(NUM_BULLET), 0, None));
+        assert_eq!(drawn_in(&props_of(&ed), &none), (720, -360));
+        // The first-line marker from 360 onto the left indent's 720.
+        ruler_move(&mut ed, &none, RulerHandle::FirstLine, 360);
+        assert_eq!(drawn_in(&props_of(&ed), &none), (720, 0));
+        let (q, saved) = reloaded(&ed);
+        assert_eq!(drawn_in(&q, &saved), (720, 0));
+        // Without the pin, the level's hang would come back.
+        let mut unpinned = props_of(&ed);
+        unpinned.shadow.clear();
+        assert_eq!(drawn_in(&unpinned, &none), (720, -360));
+    }
+
+    /// r1 M2: a Left drag to the margin of a paragraph drawn at an inherited
+    /// indent (a level's, docxy's own list's, a style's) stays at the
+    /// margin, in session and after a save and reload, as a style's first
+    /// line dragged to 0 does.
+    #[test]
+    fn an_inherited_indent_dragged_to_zero_stays_zero() {
+        let with = parts(true);
+        // A bullet at its level's 720/-360.
+        let mut ed = editor(item(Some(5), 0, None));
+        assert_eq!(drawn_in(&props_of(&ed), &with), (720, -360));
+        ruler_move(&mut ed, &with, RulerHandle::Left, -720);
+        assert_eq!(drawn_in(&props_of(&ed), &with), (0, 0));
+        let reparsed = docxcore::load::parse_document_xml(
+            &docxcore::serialize::document_to_xml(&ed.doc),
+            &docxcore::load::Relationships::default(),
+        );
+        let Some(Block::Paragraph(q)) = reparsed.body.first() else {
+            panic!("a paragraph")
+        };
+        assert_eq!(drawn_in(&q.props, &with), (0, 0), "after a reload");
+        // docxy's own bullet with no numbering part yet.
+        let none = parts(false);
+        let mut ed = editor(item(Some(NUM_BULLET), 0, None));
+        ruler_move(&mut ed, &none, RulerHandle::Left, -720);
+        assert_eq!(drawn_in(&props_of(&ed), &none), (0, 0));
+        let (q, saved) = reloaded(&ed);
+        assert_eq!(drawn_in(&q, &saved), (0, 0), "after a reload");
+        // A ListParagraph continuation (style left 720).
+        let mut ed = editor(item(None, 0, Some("ListParagraph")));
+        assert_eq!(drawn_in(&props_of(&ed), &with).0, 720);
+        ruler_move(&mut ed, &with, RulerHandle::Left, -720);
+        assert_eq!(drawn_in(&props_of(&ed), &with).0, 0);
+        // A style's first line (Wide: 1440, first line 100) dragged to 0.
+        let mut ed = editor(item(None, 0, Some("Wide")));
+        assert_eq!(drawn_in(&props_of(&ed), &with), (1440, 100));
+        ruler_move(&mut ed, &with, RulerHandle::FirstLine, -100);
+        assert_eq!(drawn_in(&props_of(&ed), &with), (1440, 0));
+        // A list with nothing inherited is not pinned (#1814 unchanged).
+        let mut ed = editor(item(Some(7), 1, None));
+        ruler_move(&mut ed, &none, RulerHandle::FirstLine, 0);
+        assert!(props_of(&ed).shadow.is_empty());
+    }
+}
+
+/// r2 m3: every paragraph drawn in a context, a read-only header's too,
+/// takes the package's numbering and theme colours with its styles.
+#[cfg(test)]
+mod table_ctx_styler_tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    #[test]
+    fn the_context_styler_carries_numbering_and_theme_colours() {
+        let loaded = crate::load_bytes(&crate::ext_fixture::word_compare_docx());
+        let pkg = loaded.pkg.expect("a package");
+        let parts = run_look::Cache::default().parts(Some(&pkg));
+        let tbl = TableCtx::new(Some(&pkg), parts, false);
+        let styler = tbl.styler();
+        assert!(styler.sheet.is_some());
+        assert!(styler.numbering.is_some_and(|n| n.defines(1)));
+        let accent = docxcore::theme::ThemeColorRef {
+            name: docxcore::theme::ThemeColor::Accent1,
+            tint: None,
+            shade: None,
+        };
+        assert_eq!(
+            styler.colors.and_then(|c| c.resolve(accent)),
+            Some(0x4F81BD)
+        );
+    }
+}
+
 /// The flow view's drawing of an imported mail (#1986).
 #[cfg(test)]
 mod flow_view_tests {
     use super::*;
     use core::prelude::v1::test;
     use docxcore::model::ParProps;
+
+    /// A list no numbering part gives level indents (not one of docxy's own,
+    /// which draw at what saving writes, #2231): its items take the implicit
+    /// `ilvl × 300` step, which the #1986 ruler tests below are about.
+    const STEP_LIST: i32 = 7;
 
     /// #1986: a left indent of its own (set in session or loaded, a
     /// `w:left="0"` pin too) replaces the level's, as Word reads the file;
@@ -7968,7 +8388,10 @@ mod flow_view_tests {
             ..ParProps::default()
         };
         assert_eq!(
-            (eff_indent(&level).list_step, eff_indent(&level).left),
+            (
+                eff_indent(&level, Inherited::NONE).list_step,
+                eff_indent(&level, Inherited::NONE).left
+            ),
             (300, 300)
         );
         let own = ParProps {
@@ -7976,14 +8399,17 @@ mod flow_view_tests {
             first_line: -267,
             ..level.clone()
         };
-        let eff = eff_indent(&own);
+        let eff = eff_indent(&own, Inherited::NONE);
         assert_eq!((eff.list_step, eff.left, eff.first), (0, 1200, -267));
         let pinned = ParProps {
             shadow: vec![r#"<w:ind w:left="0"/>"#.to_string()],
             ..level
         };
         assert_eq!(
-            (eff_indent(&pinned).list_step, eff_indent(&pinned).left),
+            (
+                eff_indent(&pinned, Inherited::NONE).list_step,
+                eff_indent(&pinned, Inherited::NONE).left
+            ),
             (0, 0)
         );
         // An imported nested item, as the importer gives it.
@@ -7995,7 +8421,7 @@ mod flow_view_tests {
             .body
             .iter()
             .filter_map(|b| match b {
-                Block::Paragraph(p) => Some(eff_indent(&p.props).left),
+                Block::Paragraph(p) => Some(eff_indent(&p.props, Inherited::NONE).left),
                 _ => None,
             })
             .collect();
@@ -8017,7 +8443,7 @@ mod flow_view_tests {
             .unwrap()
             .document;
         match back.body.iter().find(|b| matches!(b, Block::Paragraph(_))) {
-            Some(Block::Paragraph(p)) => eff_indent(&p.props).left,
+            Some(Block::Paragraph(p)) => eff_indent(&p.props, Inherited::NONE).left,
             _ => panic!("no paragraph"),
         }
     }
@@ -8033,11 +8459,14 @@ mod flow_view_tests {
                 ..Default::default()
             })],
         });
-        ed.set_list(Some(NUM_DECIMAL));
+        ed.set_list(Some(STEP_LIST));
         ed.select_all();
         ed.change_indent(720);
         let p = first_props(&ed);
-        assert_eq!((p.ilvl, p.indent, eff_indent(&p).left), (1, 0, 300));
+        assert_eq!(
+            (p.ilvl, p.indent, eff_indent(&p, Inherited::NONE).left),
+            (1, 0, 300)
+        );
         ed
     }
 
@@ -8048,7 +8477,7 @@ mod flow_view_tests {
         let mut ed = session_item();
         assert_eq!(reloaded_left(&ed), 300);
         ed.set_indent(720, 0);
-        assert_eq!(eff_indent(&first_props(&ed)).left, 720);
+        assert_eq!(eff_indent(&first_props(&ed), Inherited::NONE).left, 720);
         assert_eq!(reloaded_left(&ed), 720);
     }
 
@@ -8057,7 +8486,7 @@ mod flow_view_tests {
     #[test]
     fn a_list_item_follows_the_ruler_drag() {
         let drag = |ed: &mut docxcore::editor::Editor, moves: &[i32]| {
-            let start = eff_indent(&first_props(ed));
+            let start = eff_indent(&first_props(ed), Inherited::NONE);
             let base = ed.indent_base();
             let d = RulerDrag {
                 handle: RulerHandle::Left,
@@ -8070,7 +8499,7 @@ mod flow_view_tests {
                 page_right: 100.0 + tw_px(docxcore::model::PageGeom::default().w, 1.0),
                 sect_checkpointed: false,
             };
-            let starts = RulerIndentBase::of(ed, false).starts;
+            let starts = RulerIndentBase::of(ed, false, &run_look::DocParts::default()).starts;
             for &delta in moves {
                 let marker = dragged_left_marker(start, delta);
                 let RulerChange::Left { indent, first } =
@@ -8083,7 +8512,11 @@ mod flow_view_tests {
                     ruler_left_for(indent, first, start.left, at)
                 });
                 let p = first_props(ed);
-                assert_eq!(eff_indent(&p).left, marker, "move {delta}: {p:?}");
+                assert_eq!(
+                    eff_indent(&p, Inherited::NONE).left,
+                    marker,
+                    "move {delta}: {p:?}"
+                );
                 assert_eq!(reloaded_left(ed), marker, "move {delta} reloaded");
             }
         };
@@ -8102,7 +8535,7 @@ mod flow_view_tests {
             .body
             .iter()
             .filter_map(|b| match b {
-                Block::Paragraph(p) => Some(eff_indent(&p.props).left),
+                Block::Paragraph(p) => Some(eff_indent(&p.props, Inherited::NONE).left),
                 _ => None,
             })
             .collect()
@@ -8117,7 +8550,7 @@ mod flow_view_tests {
         back.body
             .iter()
             .filter_map(|b| match b {
-                Block::Paragraph(p) => Some(eff_indent(&p.props).left),
+                Block::Paragraph(p) => Some(eff_indent(&p.props, Inherited::NONE).left),
                 _ => None,
             })
             .collect()
@@ -8130,7 +8563,7 @@ mod flow_view_tests {
             .map(|&(ilvl, indent)| {
                 Block::Paragraph(Paragraph {
                     props: ParProps {
-                        num_id: Some(NUM_DECIMAL),
+                        num_id: Some(STEP_LIST),
                         ilvl,
                         indent,
                         ..ParProps::default()
@@ -8153,8 +8586,8 @@ mod flow_view_tests {
         let Some(Block::Paragraph(p)) = ed.doc.body.get(caret) else {
             panic!("no paragraph {caret}");
         };
-        let start = eff_indent(&p.props);
-        let base = RulerIndentBase::of(ed, false);
+        let start = eff_indent(&p.props, Inherited::NONE);
+        let base = RulerIndentBase::of(ed, false, &run_look::DocParts::default());
         let d = RulerDrag {
             handle: RulerHandle::Left,
             start_x: 200.0,
@@ -8240,7 +8673,7 @@ mod flow_view_tests {
         };
         let body = vec![
             para(ParProps {
-                num_id: Some(NUM_DECIMAL),
+                num_id: Some(STEP_LIST),
                 indent: 720,
                 first_line: -330,
                 ..ParProps::default()
@@ -8325,12 +8758,16 @@ mod flow_view_tests {
     fn decrease_to_the_margin_then_increase_draws_as_reloaded() {
         let mut ed = session_item();
         ed.set_indent(360, 0);
-        assert_eq!(eff_indent(&first_props(&ed)).left, 360);
+        assert_eq!(eff_indent(&first_props(&ed), Inherited::NONE).left, 360);
         assert_eq!(reloaded_left(&ed), 360);
         for (delta, want) in [(-720, 0), (720, 720), (-360, 360)] {
             ed.change_indent(delta);
             let p = first_props(&ed);
-            assert_eq!((eff_indent(&p).left, p.ilvl), (want, 1), "{delta}: {p:?}");
+            assert_eq!(
+                (eff_indent(&p, Inherited::NONE).left, p.ilvl),
+                (want, 1),
+                "{delta}: {p:?}"
+            );
             assert_eq!(reloaded_left(&ed), want, "{delta} reloaded");
         }
     }
@@ -8354,11 +8791,11 @@ mod flow_view_tests {
             _ => panic!(),
         };
         ed.set_indent(1300, -267);
-        assert_eq!(eff_indent(&item(&ed)).left, 1300);
+        assert_eq!(eff_indent(&item(&ed), Inherited::NONE).left, 1300);
         ed.change_indent(720);
         let p = item(&ed);
         assert_eq!((p.indent, p.ilvl), (2020, 1));
-        assert_eq!(eff_indent(&p).left, 2020);
+        assert_eq!(eff_indent(&p, Inherited::NONE).left, 2020);
     }
 
     /// #1986 ci1: in a hanging indent the number and its gap are one box
@@ -8372,7 +8809,7 @@ mod flow_view_tests {
             num_id: Some(2),
             ..ParProps::default()
         };
-        let layout = paragraph_indent_layout(eff_indent(&p), 1.0);
+        let layout = paragraph_indent_layout(eff_indent(&p, Inherited::NONE), 1.0);
         for measured in [13.0, 13.4, 14.2] {
             let leading = leading_items(layout, Some(measured), 48.0, &[]);
             let k = leading
@@ -8386,11 +8823,14 @@ mod flow_view_tests {
             );
         }
         let flat = paragraph_indent_layout(
-            eff_indent(&ParProps {
-                indent: 600,
-                num_id: Some(2),
-                ..ParProps::default()
-            }),
+            eff_indent(
+                &ParProps {
+                    indent: 600,
+                    num_id: Some(2),
+                    ..ParProps::default()
+                },
+                Inherited::NONE,
+            ),
             1.0,
         );
         let leading = leading_items(flat, Some(13.0), 48.0, &[]);
@@ -8607,9 +9047,9 @@ mod flow_view_tests {
 #[cfg(test)]
 mod ruler_geom_tests {
     use super::{
-        BandProbe, Block, DocTab, Document, EffIndent, Inline, LeadingItem, MarkupView, Pal,
-        Paragraph, RulerChange, RulerDrag, RulerHandle, RulerIndentBase, RulerProbe, ScreenRect,
-        Surface, doc_to_docx, dragged_left_marker, eff_indent, hruler_geom, hruler_hit,
+        BandProbe, Block, DocTab, Document, EffIndent, Inherited, Inline, LeadingItem, MarkupView,
+        Pal, Paragraph, RulerChange, RulerDrag, RulerHandle, RulerIndentBase, RulerProbe,
+        ScreenRect, Surface, doc_to_docx, dragged_left_marker, eff_indent, hruler_geom, hruler_hit,
         leading_items, next_tab_stop, page_flow, page_needs_scroll, page_of_block,
         paragraph_indent_layout, pin_vertical_to_owner, print_caret_page, px_tw, ruler_band,
         ruler_colors, ruler_drag_result, ruler_text_rect, tab_from_path, tab_page_flow,
@@ -8665,7 +9105,7 @@ mod ruler_geom_tests {
                 text,
                 viewport,
                 zoom,
-                eff_indent(&props),
+                eff_indent(&props, Inherited::NONE),
                 &tabs,
                 false,
             );
@@ -8699,7 +9139,15 @@ mod ruler_geom_tests {
             indent: 720,
             ..ParProps::default()
         };
-        let g = hruler_geom(viewport, column, viewport, 2.0, eff_indent(&p), &[], true);
+        let g = hruler_geom(
+            viewport,
+            column,
+            viewport,
+            2.0,
+            eff_indent(&p, Inherited::NONE),
+            &[],
+            true,
+        );
         near(g.content_x, 151.0);
         near(g.content_right, 747.0);
         near(g.left_x, 151.0 + tw_px(720, 2.0));
@@ -8716,7 +9164,7 @@ mod ruler_geom_tests {
                 ilvl,
                 ..ParProps::default()
             };
-            let eff = eff_indent(&p);
+            let eff = eff_indent(&p, Inherited::NONE);
             let layout = paragraph_indent_layout(eff, 1.5);
             let viewport = ScreenRect {
                 x: 0.0,
@@ -8761,7 +9209,8 @@ mod ruler_geom_tests {
 
     #[test]
     fn zero_first_line_has_no_spacer_or_tab_shift() {
-        let layout = paragraph_indent_layout(eff_indent(&ParProps::default()), 1.0);
+        let layout =
+            paragraph_indent_layout(eff_indent(&ParProps::default(), Inherited::NONE), 1.0);
         assert_eq!(layout.first_line_spacer(), None);
         near(layout.first_line_tab_origin(), 0.0);
     }
@@ -8769,10 +9218,13 @@ mod ruler_geom_tests {
     #[test]
     fn first_line_items_put_the_spacer_before_list_marker() {
         let positive = paragraph_indent_layout(
-            eff_indent(&ParProps {
-                first_line: 720,
-                ..ParProps::default()
-            }),
+            eff_indent(
+                &ParProps {
+                    first_line: 720,
+                    ..ParProps::default()
+                },
+                Inherited::NONE,
+            ),
             1.5,
         );
         near(positive.first_line_tab_origin(), 72.0);
@@ -8788,11 +9240,14 @@ mod ruler_geom_tests {
         );
 
         let hanging = paragraph_indent_layout(
-            eff_indent(&ParProps {
-                indent: 720,
-                first_line: -360,
-                ..ParProps::default()
-            }),
+            eff_indent(
+                &ParProps {
+                    indent: 720,
+                    first_line: -360,
+                    ..ParProps::default()
+                },
+                Inherited::NONE,
+            ),
             1.5,
         );
         near(hanging.first_line_tab_origin(), -36.0);
@@ -8805,11 +9260,14 @@ mod ruler_geom_tests {
         );
 
         let list = paragraph_indent_layout(
-            eff_indent(&ParProps {
-                ilvl: 2,
-                first_line: -360,
-                ..ParProps::default()
-            }),
+            eff_indent(
+                &ParProps {
+                    ilvl: 2,
+                    first_line: -360,
+                    ..ParProps::default()
+                },
+                Inherited::NONE,
+            ),
             1.5,
         );
         assert_eq!(
@@ -8830,10 +9288,13 @@ mod ruler_geom_tests {
     fn plain_list_levels_keep_text_after_the_marker() {
         for ilvl in [0, 1] {
             let layout = paragraph_indent_layout(
-                eff_indent(&ParProps {
-                    ilvl,
-                    ..ParProps::default()
-                }),
+                eff_indent(
+                    &ParProps {
+                        ilvl,
+                        ..ParProps::default()
+                    },
+                    Inherited::NONE,
+                ),
                 1.0,
             );
             assert_eq!(
@@ -8946,7 +9407,7 @@ mod ruler_geom_tests {
             first_line: i32::MAX,
             ..ParProps::default()
         };
-        let eff = eff_indent(&p);
+        let eff = eff_indent(&p, Inherited::NONE);
         let layout = paragraph_indent_layout(eff, 2.0);
         assert!(layout.first_x.is_finite());
         let r = ScreenRect {
@@ -9045,20 +9506,26 @@ mod ruler_geom_tests {
             ilvl: 2,
             ..ParProps::default()
         };
-        let eff = eff_indent(&p);
+        let eff = eff_indent(&p, Inherited::NONE);
         assert_eq!((eff.list_step, eff.left), (0, 720));
         // Listed, the level's step stands only with no left of its own
         // (#1986).
-        let listed = eff_indent(&ParProps {
-            num_id: Some(1),
-            ..p.clone()
-        });
+        let listed = eff_indent(
+            &ParProps {
+                num_id: Some(1),
+                ..p.clone()
+            },
+            Inherited::NONE,
+        );
         assert_eq!((listed.list_step, listed.left), (0, 720));
-        let at_level = eff_indent(&ParProps {
-            num_id: Some(1),
-            indent: 0,
-            ..p
-        });
+        let at_level = eff_indent(
+            &ParProps {
+                num_id: Some(1),
+                indent: 0,
+                ..p
+            },
+            Inherited::NONE,
+        );
         assert_eq!((at_level.list_step, at_level.left), (600, 600));
     }
 
@@ -9071,7 +9538,7 @@ mod ruler_geom_tests {
             ilvl: 2,
             ..ParProps::default()
         };
-        let start = eff_indent(&p);
+        let start = eff_indent(&p, Inherited::NONE);
         assert_eq!((start.left, start.list_step), (600, 600));
         for zoom in [1.0, 2.0] {
             let marker = dragged_left_marker(start, px_tw(-400.0 * zoom, zoom));
@@ -9538,13 +10005,15 @@ struct RulerIndentBase {
 impl RulerIndentBase {
     /// The base of a Left drag in `ed`: [`Editor::indent_base`] and where
     /// each selected paragraph is drawn.
-    fn of(ed: &Editor, hf: bool) -> Self {
+    fn of(ed: &Editor, hf: bool, parts: &run_look::DocParts) -> Self {
         let paras = ed.indent_base();
         let starts = paras
             .iter()
             .map(|(path, _)| {
                 docxcore::editor::resolve_para(&ed.doc.body, path).map(|p| {
-                    let eff = eff_indent(&p.props);
+                    let inh =
+                        Inherited::of(&p.props, parts.sheet.as_deref(), parts.numbering.as_deref());
+                    let eff = eff_indent(&p.props, inh);
                     (eff.left, eff.list_step, eff.first)
                 })
             })
@@ -9598,6 +10067,38 @@ fn ruler_left_for(marker: i32, first: i32, caret_left: i32, start: RulerStart) -
             (left, own_first.max(-left))
         }
         None => (marker, first.max(-marker)),
+    }
+}
+
+/// A ruler move's indent edit on `e` (`ruler_drag_move`, and the tests that
+/// drive it): a First change sets the selected paragraphs' first line; a
+/// Left change moves each by the drag from where it was drawn (#1986), from
+/// `base` (`RulerIndentBase::for_editor`: the drag start's paths and
+/// starts) and the caret paragraph's drawn left at the start. Then a left or
+/// first line the move left at 0 over an inherited nonzero one is pinned
+/// (`inherits_nonzero` over `parts`, #2231): a First move writes the first
+/// line only, so only that. Other changes are not indent edits here.
+fn apply_ruler_indent(
+    e: &mut Editor,
+    change: RulerChange,
+    base: (&[(Vec<usize>, bool)], &[RulerStart]),
+    caret_left: i32,
+    parts: &run_look::DocParts,
+) {
+    match change {
+        RulerChange::First(first) => {
+            e.set_first_line(first);
+            e.pin_zero_indents(|p| (false, inherits_nonzero(p, parts).1));
+        }
+        RulerChange::Left { indent, first } => {
+            let (paras, starts) = base;
+            e.set_indents_from(paras, |i, path| {
+                let start = ruler_start_at(paras, starts, i, path);
+                ruler_left_for(indent, first, caret_left, start)
+            });
+            e.pin_zero_indents(|p| inherits_nonzero(p, parts));
+        }
+        RulerChange::Right(_) | RulerChange::Margins { .. } => {}
     }
 }
 
@@ -10530,6 +11031,14 @@ struct RenderCtx<'a> {
     /// Where each top-level paragraph's inline pictures are painted, for
     /// the harness (#1963); `None` records none.
     pictures: Option<&'a PaintedPictures>,
+    /// The blocks drawn together with this one (the body, a cell's, a Print
+    /// Layout page's or column's range) and the index of the first of them:
+    /// a bordered paragraph joins its drawn neighbours' box (#2231). `None`
+    /// draws each paragraph's borders alone.
+    siblings: Option<(&'a [Block], usize)>,
+    /// The gap (px) the container puts between its blocks (Print Layout's
+    /// column), which a joined border box spans (#2231).
+    block_gap: f32,
 }
 
 /// An inline picture of a top-level paragraph as last painted (#1963): its
@@ -10588,10 +11097,12 @@ fn painted_pictures_json(
 /// Each top-level table's block and painted bounds in the frame last drawn.
 type PaintedTables = std::rc::Rc<std::cell::RefCell<Vec<(usize, UnitCell)>>>;
 
-/// A top-level paragraph as the flow view last painted it, for the
-/// harness's `ext-doc-layout` (#1986): its block, its box, its list number
-/// and its runs (caret offset, length, text size and ink) to join with its
-/// painted words by offset.
+/// A top-level paragraph as the flow view or Print Layout last painted it,
+/// for the harness's `ext-doc-layout` and `doc`'s `flow.layout` and
+/// `page.layout` (#1986, #2231): its block, its box, its list number and
+/// its runs (caret offset, length, text size and ink) to join with its
+/// painted words by offset; its text row's box (`text`), its border sides
+/// as drawn (`borders`) and its highlighted runs (`highlights`, #2231).
 #[derive(Clone)]
 struct PaintedPara {
     block: usize,
@@ -10599,6 +11110,22 @@ struct PaintedPara {
     marker: Option<PaintedMarker>,
     runs: Vec<PaintedRun>,
     words: WordSpans,
+    /// Its text row's bounds (#2231).
+    text: UnitCell,
+    /// Its border sides as drawn (#2231).
+    borders: Vec<PaintedBorder>,
+    /// Its highlighted runs: text, fill and ink, `0xRRGGBB` (#2231).
+    highlights: Vec<(String, u32, u32)>,
+}
+
+/// A paragraph border side as last painted (#2231): `top`, `left`,
+/// `bottom` or `right`, its line width (px), colour and painted bounds.
+#[derive(Clone)]
+struct PaintedBorder {
+    side: &'static str,
+    width: f32,
+    color: u32,
+    at: UnitCell,
 }
 
 #[derive(Clone)]
@@ -10607,6 +11134,8 @@ struct PaintedMarker {
     size: f32,
     ink: Hsla,
     at: UnitCell,
+    /// The family it is drawn in, when its mark names one (#2231).
+    family: Option<SharedString>,
 }
 
 #[derive(Clone)]
@@ -10625,8 +11154,8 @@ type PaintedParas = std::rc::Rc<std::cell::RefCell<Vec<PaintedPara>>>;
 /// A run (or list number) of the body's text as last painted, top-level or
 /// in a table cell, for the harness's `doc` `inks` (#2079): its text, its
 /// ink and what it sits on (the palette's ground: the page or the cell's
-/// shown fill), `0xRRGGBB`. A highlighted run is not recorded: its
-/// highlight picks its own ink.
+/// shown fill, or a highlighted run's highlight as drawn, #2231),
+/// `0xRRGGBB`.
 #[derive(Clone, Debug, PartialEq)]
 struct PaintedInk {
     text: String,
@@ -10691,6 +11220,203 @@ struct FlowPara<'a> {
     /// Where its inline pictures' painted bounds go, under its block
     /// (#1963).
     pictures: Option<(&'a PaintedPictures, usize)>,
+    /// Whether it shares a border box with the paragraph before or after it
+    /// (#2231).
+    group: BorderGroup,
+}
+
+/// A bordered paragraph's place in a run of paragraphs with the same
+/// borders and indents, which Word draws as one box (#2231): `prev` /
+/// `next`, whether the paragraph before / after it belongs to the same box;
+/// `gap`, the px the container puts between blocks, which the box spans.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct BorderGroup {
+    prev: bool,
+    next: bool,
+    gap: f32,
+}
+
+/// What decides whether two paragraphs share a border box: their borders
+/// as shown and their left and right indents as drawn. `None` for a
+/// paragraph without borders, which joins nothing.
+type BorderKey = Option<(docxcore::model::ParBorders, i32, i32)>;
+
+/// [`BorderGroup`] of a paragraph keyed `cur` between `prev` and `next`
+/// (`None` for no paragraph there): each joins when its key equals `cur`'s
+/// and `cur` has borders.
+fn border_group(prev: BorderKey, cur: BorderKey, next: BorderKey, gap: f32) -> BorderGroup {
+    let joins = |o: BorderKey| cur.is_some() && o == cur;
+    BorderGroup {
+        prev: joins(prev),
+        next: joins(next),
+        gap,
+    }
+}
+
+/// The sides a paragraph draws in its group (#2231): the box's top on its
+/// first paragraph and `w:between` above every later one, its bottom on its
+/// last only, its left and right on each.
+fn drawn_sides(
+    b: &docxcore::model::ParBorders,
+    g: BorderGroup,
+) -> [(&'static str, Option<docxcore::model::ParBorder>); 4] {
+    [
+        ("top", if g.prev { b.between } else { b.top }),
+        ("left", b.left),
+        ("bottom", if g.next { None } else { b.bottom }),
+        ("right", b.right),
+    ]
+}
+
+/// A border side's line width and its gap to the text, px at `zoom`:
+/// `w:sz` eighths of a point (at least 1 px) and `w:space` points.
+fn border_px(b: &docxcore::model::ParBorder, zoom: f32) -> (f32, f32) {
+    let pt = 96.0 / 72.0 * zoom;
+    (
+        (f32::from(b.sz) / 8.0 * pt).max(1.0),
+        f32::from(b.space) * pt,
+    )
+}
+
+#[cfg(test)]
+mod border_group_tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use docxcore::model::{BorderKind, ParBorder, ParBorders};
+
+    fn boxed() -> ParBorders {
+        ParBorders {
+            top: Some(ParBorder::rule(BorderKind::Single)),
+            left: Some(ParBorder::rule(BorderKind::Single)),
+            bottom: Some(ParBorder::rule(BorderKind::Double)),
+            right: Some(ParBorder::rule(BorderKind::Single)),
+            between: Some(ParBorder::rule(BorderKind::Dashed)),
+            nil: 0,
+        }
+    }
+
+    #[test]
+    fn paragraphs_with_the_same_borders_and_indents_share_one_box() {
+        let k = Some((boxed(), 0, 0));
+        let other = Some((boxed(), 360, 0));
+        let g = border_group(None, k, k, 4.0);
+        assert_eq!((g.prev, g.next, g.gap), (false, true, 4.0));
+        assert_eq!(
+            border_group(k, k, k, 0.0),
+            BorderGroup {
+                prev: true,
+                next: true,
+                gap: 0.0
+            }
+        );
+        // Another indent, or no borders, is another box.
+        assert_eq!(border_group(other, k, None, 0.0), BorderGroup::default());
+        assert_eq!(border_group(None, None, None, 0.0), BorderGroup::default());
+        assert!(!border_group(None, None, None, 0.0).next);
+        let kinds = |g| drawn_sides(&boxed(), g).map(|(side, b)| (side, b.map(|b| b.kind)));
+        use BorderKind::*;
+        // First: top, sides, no bottom; middle: between, sides; last: bottom.
+        assert_eq!(
+            kinds(border_group(None, k, k, 0.0)),
+            [
+                ("top", Some(Single)),
+                ("left", Some(Single)),
+                ("bottom", None),
+                ("right", Some(Single))
+            ]
+        );
+        assert_eq!(kinds(border_group(k, k, k, 0.0))[0], ("top", Some(Dashed)));
+        assert_eq!(
+            kinds(border_group(k, k, None, 0.0))[2],
+            ("bottom", Some(Double))
+        );
+        // A lone paragraph draws all four.
+        assert_eq!(kinds(BorderGroup::default())[0], ("top", Some(Single)));
+    }
+
+    fn para_with(borders: ParBorders, style: Option<&str>) -> Paragraph {
+        Paragraph {
+            props: docxcore::model::ParProps {
+                borders,
+                style_id: style.map(String::from),
+                ..Default::default()
+            },
+            content: Vec::new(),
+        }
+    }
+
+    /// r1 m4: a box split by a page or column break draws as two, each part
+    /// with its top and bottom: a neighbour outside the drawn range (the
+    /// slice starting at `from`) joins nothing.
+    #[test]
+    fn a_box_split_across_a_drawn_range_closes_at_its_edges() {
+        let body: Vec<Block> = (0..4)
+            .map(|_| Block::Paragraph(para_with(boxed(), None)))
+            .collect();
+        let page = &body[1..3];
+        let at = |k: usize| {
+            let Block::Paragraph(p) = &body[k] else {
+                panic!("a paragraph")
+            };
+            border_group_at(page, 1, k, p, None, None, 4.0)
+        };
+        assert_eq!((at(1).prev, at(1).next), (false, true));
+        assert_eq!((at(2).prev, at(2).next), (true, false));
+        // The whole body drawn together is one box.
+        let Block::Paragraph(p) = &body[1] else {
+            panic!("a paragraph")
+        };
+        let whole = border_group_at(&body, 0, 1, p, None, None, 4.0);
+        assert_eq!((whole.prev, whole.next), (true, true));
+    }
+
+    /// r1 M1: a paragraph whose `none` side cancels its style's rule draws
+    /// no rule and joins no box.
+    #[test]
+    fn a_cancelled_style_rule_draws_nothing_and_groups_nothing() {
+        let sheet = docxcore::styles::parse_styles_xml(
+            r#"<w:styles><w:style w:type="paragraph" w:styleId="Title"><w:pPr><w:pBdr>
+            <w:bottom w:val="single" w:sz="8" w:space="4" w:color="4F81BD"/></w:pBdr></w:pPr></w:style></w:styles>"#,
+        );
+        let mut none = ParBorders::default();
+        none.set_side(2, None);
+        let cancelled = para_with(none, Some("Title"));
+        let ruled = para_with(ParBorders::default(), Some("Title"));
+        let body = vec![
+            Block::Paragraph(cancelled.clone()),
+            Block::Paragraph(ruled.clone()),
+        ];
+        let shown = sheet.effective_borders(Some("Title"), cancelled.props.borders);
+        assert!(
+            drawn_sides(&shown, BorderGroup::default())
+                .iter()
+                .all(|(_, b)| b.is_none())
+        );
+        assert_eq!(
+            border_group_at(&body, 0, 0, &cancelled, Some(&sheet), None, 0.0),
+            BorderGroup::default()
+        );
+        // Its ruled neighbour does not join it either.
+        let g = border_group_at(&body, 0, 1, &ruled, Some(&sheet), None, 0.0);
+        assert!(!g.prev && !g.next);
+    }
+
+    #[test]
+    fn a_borders_width_and_space_are_points() {
+        let title = ParBorder {
+            sz: 8,
+            space: 4,
+            ..ParBorder::rule(BorderKind::Single)
+        };
+        let (w, space) = border_px(&title, 1.0);
+        assert!((w - 1.3333).abs() < 1e-3 && (space - 5.3333).abs() < 1e-3);
+        let hair = ParBorder {
+            sz: 2,
+            ..ParBorder::rule(BorderKind::Single)
+        };
+        assert_eq!(border_px(&hair, 1.0).0, 1.0, "at least a pixel");
+        assert!((border_px(&title, 2.0).1 - 10.6667).abs() < 1e-3);
+    }
 }
 
 /// A canvas filling its (relative) parent that takes its bounds at prepaint.
@@ -10780,6 +11506,10 @@ struct TableCtx<'a> {
     /// The package's styles parsed, for the runs' paragraph and character
     /// styles (#1427).
     sheet: Option<std::rc::Rc<docxcore::styles::StyleSheet>>,
+    /// The package's numbering part and theme colours, for list level
+    /// indents and border colours (#2231).
+    numbering: Option<std::rc::Rc<docxcore::numbering::Numbering>>,
+    colors: Option<std::rc::Rc<docxcore::theme::ThemeColors>>,
     cache: std::cell::RefCell<
         std::collections::HashMap<String, Option<docxcore::table_styles::TableStyle>>,
     >,
@@ -10790,19 +11520,31 @@ struct TableCtx<'a> {
 }
 
 impl<'a> TableCtx<'a> {
-    fn new(
-        pkg: Option<&'a Package>,
-        sheet: Option<std::rc::Rc<docxcore::styles::StyleSheet>>,
-        gridlines: bool,
-    ) -> Self {
+    fn new(pkg: Option<&'a Package>, parts: run_look::DocParts, gridlines: bool) -> Self {
         TableCtx {
-            sheet,
+            sheet: parts.sheet,
+            numbering: parts.numbering,
+            colors: parts.colors,
             styles_xml: pkg
                 .and_then(|p| p.part("word/styles.xml"))
                 .and_then(|b| std::str::from_utf8(b).ok()),
             cache: Default::default(),
             gridlines,
             draw: None,
+        }
+    }
+
+    /// A run styler over the package's styles, numbering and theme colours
+    /// (#2231): every paragraph drawn in this context takes all three, so a
+    /// list level's indent and a border's theme colour show wherever it is
+    /// drawn (a header read-only as much as open).
+    fn styler(&self) -> run_look::RunStyler<'_> {
+        run_look::RunStyler {
+            sheet: self.sheet.as_deref(),
+            numbering: self.numbering.as_deref(),
+            colors: self.colors.as_deref(),
+            cell: None,
+            pstyle: None,
         }
     }
 
@@ -28575,12 +29317,13 @@ impl Docxy {
         self.ruler_indent_base = match (handle, self.tabs.get(self.active)) {
             (RulerHandle::Left, Some(tab)) => {
                 let hf = tab.hf_edit.is_some();
+                let parts = tab.run_styles.borrow_mut().parts(tab.pkg.as_ref());
                 tab_edit_target_ref(tab).map_or(
                     RulerIndentBase {
                         hf,
                         ..Default::default()
                     },
-                    |ed| RulerIndentBase::of(ed, hf),
+                    |ed| RulerIndentBase::of(ed, hf, &parts),
                 )
             }
             _ => RulerIndentBase::default(),
@@ -28607,9 +29350,17 @@ impl Docxy {
     fn ruler_drag_move(&mut self, x: f32, window: &mut Window, cx: &mut Context<Self>) {
         let Some(d) = self.ruler_drag else { return };
         let result = ruler_drag_result(d, x);
+        // What the paragraphs inherit below their own indents (#2231).
+        let parts = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.run_styles.borrow_mut().parts(t.pkg.as_ref()))
+            .unwrap_or_default();
         match result.change {
-            RulerChange::First(first) => self.with_editor(window, cx, |e| e.set_first_line(first)),
-            RulerChange::Left { indent, first } => {
+            RulerChange::First(_) => self.with_editor(window, cx, |e| {
+                apply_ruler_indent(e, result.change, (&[], &[]), d.indent.left, &parts)
+            }),
+            RulerChange::Left { .. } => {
                 // The pin is decided from the drag start, not an earlier move.
                 // A header or footer closed (or opened) mid-drag leaves
                 // `with_editor` editing another editor: no base there.
@@ -28618,15 +29369,15 @@ impl Docxy {
                     .tabs
                     .get(self.active)
                     .is_some_and(|t| t.hf_edit.is_some());
-                // Each paragraph moves by the drag from where it was
-                // drawn (#1986).
-                let (paras, starts) = base.for_editor(hf_now);
                 let caret_left = d.indent.left;
                 self.with_editor(window, cx, |e| {
-                    e.set_indents_from(paras, |i, path| {
-                        let start = ruler_start_at(paras, starts, i, path);
-                        ruler_left_for(indent, first, caret_left, start)
-                    })
+                    apply_ruler_indent(
+                        e,
+                        result.change,
+                        base.for_editor(hf_now),
+                        caret_left,
+                        &parts,
+                    )
                 });
                 self.ruler_indent_base = base;
             }
@@ -33621,18 +34372,8 @@ fn apply_doc_act(e: &mut Editor, act: Act) {
         IndentInc => e.change_indent(720),
         IndentDec => e.change_indent(-720),
         Sort => e.sort_paragraphs(),
-        ParaBorders => {
-            let has = e.caret_para_props().borders.bottom.is_some();
-            let b = if has {
-                ParBorders::default()
-            } else {
-                ParBorders {
-                    top: None,
-                    bottom: Some(BorderKind::Single),
-                }
-            };
-            e.set_para_border(b);
-        }
+        // On the rule the page view shows, its style's included (#2231 r2).
+        ParaBorders => e.toggle_bottom_border(),
         Title => e.set_para_style(Some("Title")),
         Subtitle => e.set_para_style(Some("Subtitle")),
         ClearFmt => e.clear_run_formatting(),
@@ -36361,6 +37102,51 @@ fn highlight_rgb(name: &str) -> (u32, bool) {
     }
 }
 
+/// The fill and ink a highlighted run draws in (#2231), `0xRRGGBB`: on a
+/// light page [`highlight_rgb`]'s colour with near-black or light text, as
+/// before; on a dark page Word's dark mode, [`dark_page::highlight`] with
+/// [`dark_page::highlight_ink`], told apart by whether the run's shown
+/// colour (its styles' included) is automatic. `None` without a highlight.
+fn run_highlight(props: &RunProps, pal: &Pal) -> Option<(u32, u32)> {
+    let name = props.highlight.as_deref()?;
+    let (c, dark) = highlight_rgb(name);
+    if pal.dark {
+        let own = props.color.as_deref().and_then(hex_rgb);
+        let fill = dark_page::highlight(c, own.is_none());
+        Some((fill, dark_page::highlight_ink(own, fill)))
+    } else {
+        Some((c, if dark { 0x1a1a1a } else { 0xf5f5f5 }))
+    }
+}
+
+/// Where a highlight's band sits in a line (#2231): Word fills the text's
+/// single-spaced height, centred on the glyphs, so wrapped lines' bands touch
+/// at single spacing and leave the extra spacing as a gap above multiple
+/// spacing. `(height, inset)` px in a line `line_h` tall whose single-spaced
+/// height is `single_h`: the band is the smaller of the two, with an equal
+/// inset above and below.
+fn highlight_band(line_h: f32, single_h: f32) -> (f32, f32) {
+    let h = single_h.min(line_h).max(0.0);
+    (h, ((line_h - h) / 2.0).max(0.0))
+}
+
+#[cfg(test)]
+mod highlight_band_tests {
+    use super::highlight_band;
+
+    #[test]
+    fn a_band_is_the_single_spaced_height_centred_in_its_line() {
+        // Single spacing: the band is the line, so wrapped lines touch.
+        assert_eq!(highlight_band(19.575, 19.575), (19.575, 0.0));
+        // 1.15 lines: the band keeps its single height, the gap split.
+        let (h, inset) = highlight_band(22.5, 19.5);
+        assert_eq!((h, inset), (19.5, 1.5));
+        assert_eq!(h + 2.0 * inset, 22.5);
+        // Exact spacing tighter than single: the band is the line.
+        assert_eq!(highlight_band(12.0, 19.5), (12.0, 0.0));
+    }
+}
+
 #[cfg(test)]
 mod highlight_rgb_tests {
     #[test]
@@ -36608,10 +37394,14 @@ fn emit_words(
     seg_start: usize,
     pal: Pal,
     zoom: f32,
+    band: Option<(f32, f32)>,
 ) {
-    // Resolved once per run, not per word (#1900), as is its ink (#2079).
+    // Resolved once per run, not per word (#1900), as is its ink (#2079)
+    // and its highlight (#2231). Selection wins over a run's highlight so
+    // the selected range reads as one contiguous band.
     let family = props.font.as_deref().and_then(font_subst::family);
     let color = run_ink(props, is_link, &pal);
+    let highlight = run_highlight(props, &pal).filter(|_| !selected);
     let mut off = seg_start;
     for word in text.split_inclusive(' ') {
         if word.is_empty() {
@@ -36657,16 +37447,15 @@ fn emit_words(
                 .when(props.underline || is_link, |d| d.underline())
                 .when(props.strike, |d| d.line_through())
                 .when_some(vshift, |d, dy| d.relative().top(px(dy)))
-                // Selection wins over any run highlight so the selected range reads
-                // as one contiguous band.
-                .when_some(
-                    props.highlight.as_deref().filter(|_| !selected),
-                    |d, name| {
-                        let (c, dark) = highlight_rgb(name);
-                        d.bg(rgb(c))
-                            .text_color(if dark { rgb(0x1a1a1a) } else { rgb(0xf5f5f5) })
-                    },
-                )
+                // The band is the text's single-spaced height, centred in
+                // the line (#2231): its outer box stays the line's height.
+                .when_some(highlight, |d, (fill, ink)| {
+                    let d = d.bg(rgb(fill)).text_color(rgb(ink));
+                    match band {
+                        Some((h, inset)) => d.line_height(px(h)).my(px(inset)),
+                        None => d,
+                    }
+                })
                 .when(selected, |d| d.bg(pal.sel))
                 // Click / drag-to-caret: place the caret at the exact character under
                 // the pointer (byte index from the layout → char count within the
@@ -36740,6 +37529,7 @@ fn emit_run(
     pal: Pal,
     caret_h: f32,
     zoom: f32,
+    band: Option<(f32, f32)>,
 ) {
     let chars: Vec<char> = text.chars().collect();
     let len = chars.len();
@@ -36781,6 +37571,7 @@ fn emit_run(
             start + a,
             pal,
             zoom,
+            band,
         );
     }
     if *caret == Some(end) {
@@ -37043,7 +37834,7 @@ fn hf_els(
     pal: Pal,
     meas: &Measurer,
     hf_width: f32,
-    sheet: Option<&docxcore::styles::StyleSheet>,
+    styler: run_look::RunStyler,
     pics: Option<pictures::Scope>,
     page_vals: Option<&page_fields::PageVals>,
 ) -> Vec<AnyElement> {
@@ -37052,7 +37843,7 @@ fn hf_els(
         .into_iter()
         .filter_map(|(_, b)| match b {
             Block::Paragraph(p) => Some(hf_para_el(
-                p, pal, meas, hf_width, 1.0, sheet, pics, page_vals,
+                p, pal, meas, hf_width, 1.0, styler, pics, page_vals,
             )),
             _ => None,
         })
@@ -37579,7 +38370,7 @@ fn hf_para_el(
     meas: &Measurer,
     width: f32,
     zoom: f32,
-    sheet: Option<&docxcore::styles::StyleSheet>,
+    styler: run_look::RunStyler,
     pics: Option<pictures::Scope>,
     page_vals: Option<&page_fields::PageVals>,
 ) -> AnyElement {
@@ -37600,10 +38391,7 @@ fn hf_para_el(
         // Header/footer text is never line-numbered (#746).
         None,
         None,
-        run_look::RunStyler {
-            sheet,
-            ..Default::default()
-        },
+        styler,
         pics,
         page_vals,
         FlowPara::default(),
@@ -37704,7 +38492,9 @@ fn ruler_para_of(tab: &DocTab) -> (EffIndent, Vec<docxcore::model::TabStop>) {
                 .effective_tabs(Some(style));
         }
     }
-    (eff_indent(&p), tabs)
+    let parts = tab.run_styles.borrow_mut().parts(tab.pkg.as_ref());
+    let inh = Inherited::of(&p, parts.sheet.as_deref(), parts.numbering.as_deref());
+    (eff_indent(&p, inh), tabs)
 }
 
 /// Does this block force a page break (a `w:br` of type page)?
@@ -37836,6 +38626,7 @@ fn emit_revision_text(
             pal,
             19.0,
             zoom,
+            None,
         );
     }
 }
@@ -37963,23 +38754,21 @@ fn paragraph_el(
     let is_heading = p.props.heading_level.is_some();
     // The mark's look: the list number's (#1986), and an empty line's size.
     let mark = shown_mark(p, styler);
-    let pbox = para_box(
-        &p.props.spacing,
-        flow.flow,
-        is_heading,
-        base,
-        para_text_px(p, styler, &mark, base, zoom),
-        zoom,
-    );
+    let text_px = para_text_px(p, styler, &mark, base, zoom);
+    let pbox = para_box(&p.props.spacing, flow.flow, is_heading, base, text_px, zoom);
     let mut painted_runs: Vec<PaintedRun> = Vec::new();
     let mut painted_marker: Option<PaintedMarker> = None;
+    let mut painted_highlights: Vec<(String, u32, u32)> = Vec::new();
     let mut spans: Vec<AnyElement> = Vec::new();
     let mut idx = 0usize;
 
     // Tab-stop geometry. `x` tracks the running pixel width from the row's left
     // edge; a tab advances it to the next stop measured from the text margin. The
     // row's left edge sits `pad_l` px in from the margin (the paragraph indent).
-    let indent = eff_indent(&p.props);
+    let indent = eff_indent(
+        &p.props,
+        Inherited::of(&p.props, styler.sheet, styler.numbering),
+    );
     // A flow view draws a picture wider than its room scaled to it (#1963).
     let pic_room = picture_room(flow.room, indent, zoom);
     let indent_layout = paragraph_indent_layout(indent, zoom);
@@ -38010,6 +38799,20 @@ fn paragraph_el(
     // Hyperlinks opened up into their pieces, so text, tabs and breaks inside a
     // link take caret offsets exactly as the editor counts them.
     let items = flat_inlines(&p.content);
+    // A highlight's band (#2231): the line's single-spaced height, worked
+    // out only for a paragraph that has a highlighted run.
+    let highlighted = items
+        .iter()
+        .any(|(i, _)| matches!(&**i, Inline::Run(r) if styler.shown(r).highlight.is_some()));
+    let band = highlighted.then(|| {
+        let single = docxcore::model::Spacing {
+            line: Some(240),
+            line_rule: Some("auto".into()),
+            ..p.props.spacing.clone()
+        };
+        let one = para_box(&single, flow.flow, is_heading, base, text_px, zoom);
+        highlight_band(line_h, one.line_h)
+    });
     // Only paragraphs that actually contain a tab (or an alignment tab, #768)
     // need per-run width measurement.
     let has_tab = items
@@ -38088,6 +38891,7 @@ fn paragraph_el(
                         size: look.size,
                         ink: look.ink,
                         at: at.clone(),
+                        family: look.family.clone(),
                     });
                     bounds_probe(at)
                 });
@@ -38141,15 +38945,25 @@ fn paragraph_el(
                 let shown = styler.shown(r);
                 emit_run(
                     &mut spans, &r.text, &shown, base, in_link, &mut idx, &mut caret, sel, click,
-                    pal, caret_h, zoom,
+                    pal, caret_h, zoom, band,
                 );
-                if let Some(inks) = flow.inks.filter(|_| shown.highlight.is_none()) {
+                if let Some(inks) = flow.inks {
                     if !r.text.trim().is_empty() {
+                        // A highlighted run reads on its highlight (#2231).
+                        let (ink, ground) = match run_highlight(&shown, &pal) {
+                            Some((fill, ink)) => (ink, fill),
+                            None => (rgb_u(run_ink(&shown, in_link, &pal)), pal.ground),
+                        };
                         inks.borrow_mut().push(PaintedInk {
                             text: r.text.clone(),
-                            ink: rgb_u(run_ink(&shown, in_link, &pal)),
-                            ground: pal.ground,
+                            ink,
+                            ground,
                         });
+                    }
+                }
+                if flow.record.is_some() && !r.text.trim().is_empty() {
+                    if let Some((fill, ink)) = run_highlight(&shown, &pal) {
+                        painted_highlights.push((r.text.clone(), fill, ink));
                     }
                 }
                 if flow.record.is_some() {
@@ -38451,7 +39265,6 @@ fn paragraph_el(
                 .into_any_element(),
         );
     }
-    let has_border = p.props.borders.bottom.is_some();
     let mut row = h_flex()
         .w_full()
         .flex_wrap()
@@ -38477,6 +39290,92 @@ fn paragraph_el(
     // Space before / after the paragraph (`w:spacing` before/after, twips → px).
     let sp_before = zoom * (p.props.spacing.before.unwrap_or(0).max(0) as f32) / 15.0;
     let sp_after = zoom * (p.props.spacing.after.unwrap_or(0).max(0) as f32) / 15.0;
+    // A fully spaced paragraph in the flow view has only its own spacing
+    // (#1986); others keep 2 px where theirs gives none.
+    let space_top = if sp_before > 0.5 {
+        sp_before
+    } else {
+        pbox.pad_y
+    };
+    let space_bottom = if sp_after > 0.5 { sp_after } else { pbox.pad_y };
+    // Its borders (#2231): the style chain's under its own, each side drawn
+    // at its width, `w:space` from the text, in its colour (a theme colour
+    // resolved; mapped on a dark page as table borders are). A run of
+    // paragraphs with the same borders and indents is one box: the box's
+    // top on the first, `w:between` above each later one, its bottom on the
+    // last, the spacing between them inside it.
+    let group = flow.group;
+    let borders = styler.sheet.map_or(p.props.borders, |s| {
+        s.effective_borders(p.props.style_id.as_deref(), p.props.borders)
+    });
+    let sides = drawn_sides(&borders, group);
+    let boxed = sides.iter().any(|(_, b)| b.is_some()) || group.prev || group.next;
+    let mut painted_borders: Vec<PaintedBorder> = Vec::new();
+    let text_probe = flow.record.map(|_| UnitCell::default());
+    let row = match lines {
+        // Numbered (Print Layout): the canvas overlays the row, anchored
+        // to it, and paints the margin numbers in the same frame.
+        Some(slot) => row
+            .relative()
+            .children(spans)
+            .child(line_number_canvas(slot, base, line_h, pad, zoom, pal)),
+        None => row.relative().children(spans),
+    }
+    .when_some(text_probe.clone(), |d, cell| d.child(bounds_probe(cell)));
+    let body = if boxed {
+        let gap_below = if flow.gap_below { 4.0 } else { 0.0 };
+        let mut pad_side = [0.0f32; 4];
+        let mut strips: Vec<AnyElement> = Vec::new();
+        for (i, (side, b)) in sides.iter().enumerate() {
+            let Some(b) = b else { continue };
+            let (w, space) = border_px(b, zoom);
+            pad_side[i] = w + space;
+            let color = rgb_u(pal.border_ink(b.shown_color(styler.colors), pal.ground));
+            let at = flow.record.map(|_| UnitCell::default());
+            if let Some(at) = &at {
+                painted_borders.push(PaintedBorder {
+                    side,
+                    width: w,
+                    color,
+                    at: at.clone(),
+                });
+            }
+            let strip = div().absolute().bg(rgb(color));
+            let strip = match *side {
+                "top" => strip.top_0().left_0().right_0().h(px(w)),
+                "bottom" => strip.bottom_0().left_0().right_0().h(px(w)),
+                "left" => strip.top_0().bottom_0().left_0().w(px(w)),
+                _ => strip.top_0().bottom_0().right_0().w(px(w)),
+            };
+            strips.push(
+                strip
+                    .when_some(at, |d, cell| d.child(bounds_probe(cell)))
+                    .into_any_element(),
+            );
+        }
+        let [top, left, bottom, right] = pad_side;
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            // Left and right sit outside the text by their space.
+            .ml(px(-left))
+            .mr(px(-right))
+            .pl(px(left))
+            .pr(px(right))
+            .pt(px(top + if group.prev { space_top } else { 0.0 }))
+            .pb(px(bottom
+                + if group.next {
+                    space_bottom + gap_below + group.gap
+                } else {
+                    0.0
+                }))
+            .child(row)
+            .children(strips)
+            .into_any_element()
+    } else {
+        row.into_any_element()
+    };
     // The harness's record of this paragraph (#1986): its box's bounds.
     let root_probe = flow.record.map(|(paras, block)| {
         let root = UnitCell::default();
@@ -38486,30 +39385,24 @@ fn paragraph_el(
             marker: painted_marker.take(),
             runs: std::mem::take(&mut painted_runs),
             words: click.map(|c| c.words.clone()).unwrap_or_default(),
+            text: text_probe.clone().unwrap_or_default(),
+            borders: std::mem::take(&mut painted_borders),
+            highlights: std::mem::take(&mut painted_highlights),
         });
         bounds_probe(root)
     });
     v_flex()
         .w_full()
-        // A fully spaced paragraph in the flow view has only its own
-        // spacing (#1986); others keep 2 px where theirs gives none.
-        .pt(px(if sp_before > 0.5 {
-            sp_before
-        } else {
-            pbox.pad_y
-        }))
-        .pb(px(if sp_after > 0.5 { sp_after } else { pbox.pad_y }))
+        // Joined to the paragraph above or below (#2231), the spacing
+        // between them is inside the box.
+        .pt(px(if group.prev { 0.0 } else { space_top }))
+        .pb(px(if group.next { 0.0 } else { space_bottom }))
         .pl(px(pad))
         .pr(px(pad_r))
-        .when(pbox.heading_mt, |d| d.mt_2())
-        .when(flow.gap_below, |d| d.mb(px(4.)))
-        // The rule carries no colour of its own: an automatic border, the
-        // ink, or on a dark page the visible mid grey (#2079).
-        .when(has_border, |d| {
-            d.border_b_1()
-                .border_color(pal.border_ink(None, pal.ground))
-                .pb_1()
-        })
+        .when(pbox.heading_mt && !group.prev, |d| d.mt_2())
+        .when(flow.gap_below && !group.next, |d| d.mb(px(4.)))
+        // The container's gap, which the box spans, is taken back.
+        .when(group.next && group.gap > 0.0, |d| d.mb(px(-group.gap)))
         .when_some(click, |d, c| {
             let ent = c.ent.clone();
             let path = c.path.to_vec();
@@ -38547,15 +39440,7 @@ fn paragraph_el(
                     }
                 })
         })
-        .child(match lines {
-            // Numbered (Print Layout): the canvas overlays the row, anchored
-            // to it, and paints the margin numbers in the same frame.
-            Some(slot) => row
-                .relative()
-                .children(spans)
-                .child(line_number_canvas(slot, base, line_h, pad, zoom, pal)),
-            None => row.children(spans),
-        })
+        .child(body)
         .when_some(overlay, |d, o| d.relative().child(o))
         .when_some(root_probe, |d, probe| d.relative().child(probe))
         .into_any_element()
@@ -38696,6 +39581,8 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
                 cell_run: Some(&cb.run),
                 // A nested table fits its cell when this one was fitted.
                 fit_width: fit.map(|_| text_w),
+                siblings: Some((&cell.blocks, 0)),
+                block_gap: 0.0,
                 ..ctx
             };
             let inner: Vec<AnyElement> = if cb.continues {
@@ -38995,6 +39882,60 @@ fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -
     block_el_numbered(b, path, marker, ctx, None)
 }
 
+/// [`BorderGroup`] of `p` at `path` among `ctx.siblings` (#2231).
+fn paragraph_border_group(p: &Paragraph, path: &[usize], ctx: RenderCtx) -> BorderGroup {
+    match (ctx.siblings, path.last()) {
+        (Some((blocks, from)), Some(&k)) => border_group_at(
+            blocks,
+            from,
+            k,
+            p,
+            ctx.tbl.sheet.as_deref(),
+            ctx.tbl.numbering.as_deref(),
+            ctx.block_gap,
+        ),
+        _ => BorderGroup::default(),
+    }
+}
+
+/// [`BorderGroup`] of paragraph `p`, block `k`, among `blocks`, the blocks
+/// drawn together starting at block `from` (a page's or column's range in
+/// Print Layout, #2231 r1): a neighbour outside them (on another page or in
+/// another column) joins nothing, so each part of a box split there draws
+/// its own top and bottom.
+fn border_group_at(
+    blocks: &[Block],
+    from: usize,
+    k: usize,
+    p: &Paragraph,
+    sheet: Option<&docxcore::styles::StyleSheet>,
+    numbering: Option<&docxcore::numbering::Numbering>,
+    gap: f32,
+) -> BorderGroup {
+    let key = |q: &Paragraph| -> BorderKey {
+        let b = sheet.map_or(q.props.borders, |s| {
+            s.effective_borders(q.props.style_id.as_deref(), q.props.borders)
+        });
+        b.any().then(|| {
+            let e = eff_indent(&q.props, Inherited::of(&q.props, sheet, numbering));
+            // Compared by the sides drawn only: a cancel says nothing more.
+            (docxcore::model::ParBorders { nil: 0, ..b }, e.left, e.right)
+        })
+    };
+    let cur = key(p);
+    let Some(local) = k.checked_sub(from) else {
+        return BorderGroup::default();
+    };
+    if cur.is_none() {
+        return BorderGroup::default();
+    }
+    let at = |j: Option<usize>| match j.and_then(|j| blocks.get(j)) {
+        Some(Block::Paragraph(q)) => key(q),
+        _ => None,
+    };
+    border_group(at(local.checked_sub(1)), cur, at(local.checked_add(1)), gap)
+}
+
 /// `block_el` for a Print Layout band, where a numbered top-level paragraph
 /// carries its line-number slot; tables, header/footer paragraphs and every
 /// other caller pass `None` and stay unnumbered (#746).
@@ -39082,13 +40023,13 @@ fn block_el_numbered(
                 lines,
                 overlay,
                 run_look::RunStyler {
-                    sheet: ctx.tbl.sheet.as_deref(),
                     cell: ctx.cell_run,
-                    pstyle: None,
+                    ..ctx.tbl.styler()
                 },
                 ctx.pics,
                 ctx.page_vals,
                 FlowPara {
+                    group: paragraph_border_group(p, &path, ctx),
                     flow: ctx.flow,
                     gap_below: top && ctx.gap_below,
                     record: ctx
@@ -43143,7 +44084,7 @@ impl Docxy {
             AlignJ => pp.is_some_and(|p| p.align == Align::Justify),
             Bullets => doc.is_some_and(|ed| ed.all_in_list(NUM_BULLET)),
             Numbers => doc.is_some_and(|ed| ed.all_in_list(NUM_DECIMAL)),
-            ParaBorders => pp.is_some_and(|p| p.borders.bottom.is_some()),
+            ParaBorders => doc.is_some_and(|ed| ed.shown_bottom_border()),
             ShowHide => self.show_marks,
             ToggleComments => self.show_comments,
             ResolveComment => self.selected_comment_resolved(),
@@ -45017,7 +45958,7 @@ impl Render for Docxy {
                     let hf = tab.hf_edit.as_ref();
                     let mut tbl = TableCtx::new(
                         tab.pkg.as_ref(),
-                        tab.run_styles.borrow_mut().current(tab.pkg.as_ref()).1,
+                        tab.run_styles.borrow_mut().parts(tab.pkg.as_ref()),
                         self.view_gridlines,
                     );
                     if self.draw_tool().is_some() {
@@ -45064,12 +46005,15 @@ impl Render for Docxy {
                         // The flow branch below fits its tables (#1895).
                         fit_width: None,
                         tables: Some(&painted_tables),
-                        // The flow branch below sets these (#1986).
+                        // The flow branch below sets these (#1986); Print
+                        // Layout records its paragraphs too (#2231).
                         flow: false,
                         gap_below: false,
-                        paras: None,
+                        paras: doc_view::harness().then_some(&painted_paras),
                         inks: doc_view::harness().then_some(&painted_inks),
                         pictures: None,
+                        siblings: None,
+                        block_gap: 0.0,
                     };
                     let body = &shown.body;
                     if self.page_view {
@@ -45300,6 +46244,8 @@ impl Render for Docxy {
                                     // (#2079).
                                     inks: doc_view::harness().then_some(&painted_inks),
                                     pictures: None,
+                                    siblings: None,
+                                    block_gap: 0.0,
                                 });
                                 // One region's margin content for this page: the live
                                 // editor blocks (editable on the edit page, read-only on
@@ -45325,7 +46271,7 @@ impl Render for Docxy {
                                                     doc_pal,
                                                     &measurer,
                                                     hf_w,
-                                                    tbl.sheet.as_deref(),
+                                                    tbl.styler(),
                                                     pictures::scope(
                                                         pictures.as_ref(),
                                                         Some(h.part_name.as_str()),
@@ -45340,7 +46286,7 @@ impl Render for Docxy {
                                         doc_pal,
                                         &measurer,
                                         hf_w,
-                                        tbl.sheet.as_deref(),
+                                        tbl.styler(),
                                         pictures::scope(pictures.as_ref(), page_part(pi, is_h)),
                                         page_vals.get(pi),
                                     )
@@ -45603,7 +46549,7 @@ impl Render for Docxy {
                                                     &measurer,
                                                     width,
                                                     zoom,
-                                                    tbl.sheet.as_deref(),
+                                                    tbl.styler(),
                                                     pictures::scope(
                                                         pictures.as_ref(),
                                                         match edited {
@@ -45754,6 +46700,7 @@ impl Render for Docxy {
                             fit_width: used_w,
                             flow: true,
                             paras: doc_view::harness().then_some(&painted_paras),
+                            siblings: Some((body, 0)),
                             ..ctx
                         };
                         // The column puts 4 px between blocks as each

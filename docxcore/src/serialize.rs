@@ -320,6 +320,32 @@ fn write_inlines_tracking_inserts(s: &mut String, content: &[Inline]) {
     }
 }
 
+/// One `w:pBdr` side as written: its line, width, space and colour, and its
+/// theme colour when it names one (#2231). The editor's own rules are
+/// `w:sz="6" w:space="1" w:color="auto"`, as before.
+fn pbdr_side_xml(tag: &str, b: &crate::model::ParBorder) -> String {
+    let color = b
+        .color
+        .map_or_else(|| "auto".to_string(), |c| format!("{c:06X}"));
+    let mut x = format!(
+        "<{tag} w:val=\"{}\" w:sz=\"{}\" w:space=\"{}\" w:color=\"{color}\"",
+        b.kind.to_val(),
+        b.sz,
+        b.space
+    );
+    if let Some(t) = b.theme {
+        x.push_str(&format!(" w:themeColor=\"{}\"", t.name.val()));
+        if let Some(v) = t.tint {
+            x.push_str(&format!(" w:themeTint=\"{v:02X}\""));
+        }
+        if let Some(v) = t.shade {
+            x.push_str(&format!(" w:themeShade=\"{v:02X}\""));
+        }
+    }
+    x.push_str("/>");
+    x
+}
+
 /// Ordinal of a `CT_PPr` child element (local name, no `w:` prefix) in the
 /// WordprocessingML schema's fixed child order. Unknown elements sort last but
 /// keep their relative order. Word (and strict validators) reject `<w:pPr>`
@@ -561,6 +587,50 @@ pub(crate) fn pin_shadow_left(shadow: &mut Vec<String>, twips: i32, cancel_chars
     }
     let name = crate::table_props::element_name(raw);
     *raw = empty_element(&name, &out);
+}
+
+/// Make the loaded `w:ind` in `shadow` set the first line as an explicit
+/// `twips` (#2231), as [`pin_shadow_left`] does the left: its first-line
+/// attributes ([`IND_FIRST_LINE`]) become one `w:firstLine` (or `w:hanging`
+/// for a negative value) in the place of the first of them (else last); a
+/// shadow without a `w:ind` gets one. A `w:ind` already saying exactly that
+/// is left as it is, so pinning again changes nothing. A list item's first
+/// line of 0 then stays 0, where none would take its level's hanging indent.
+pub(crate) fn pin_shadow_first(shadow: &mut Vec<String>, twips: i32) {
+    let (name, value) = if twips < 0 {
+        ("w:hanging", (-i64::from(twips)).to_string())
+    } else {
+        ("w:firstLine", twips.to_string())
+    };
+    let Some(raw) = shadow.iter_mut().find(|raw| local_name(raw) == "ind") else {
+        shadow.push(format!("<w:ind {name}=\"{value}\"/>"));
+        return;
+    };
+    let attrs = element_attrs_of(raw);
+    let first: Vec<&(String, String)> = attrs
+        .iter()
+        .filter(|(n, _)| IND_FIRST_LINE.contains(&n.as_str()))
+        .collect();
+    if let [(n, v)] = first.as_slice() {
+        if n == name && v.trim().parse::<i64>().ok() == value.parse::<i64>().ok() {
+            return;
+        }
+    }
+    let mut out: Vec<(String, String)> = Vec::with_capacity(attrs.len() + 1);
+    let mut placed = false;
+    for (n, v) in &attrs {
+        if !IND_FIRST_LINE.contains(&n.as_str()) {
+            out.push((n.clone(), v.clone()));
+        } else if !placed {
+            out.push((name.to_string(), value.clone()));
+            placed = true;
+        }
+    }
+    if !placed {
+        out.push((name.to_string(), value));
+    }
+    let el = crate::table_props::element_name(raw);
+    *raw = empty_element(&el, &out);
 }
 
 /// The direct `w:jc`s of an editor-chosen alignment (#1752): a left keeps
@@ -918,8 +988,7 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         || props.rtl
         || props.frame.is_some()
         || props.section_break.is_some()
-        || props.borders.top.is_some()
-        || props.borders.bottom.is_some()
+        || !props.borders.is_empty()
         || props.indent != 0
         || props.indent_right != 0
         || props.first_line != 0
@@ -1003,17 +1072,14 @@ fn write_ppr(s: &mut String, props: &ParProps) {
             numpr_xml(props.ilvl, num, shadow.find("numPr")),
         ));
     }
-    if (props.borders.top.is_some() || props.borders.bottom.is_some()) && !kept(PprGroup::Borders) {
+    if !props.borders.is_empty() && !kept(PprGroup::Borders) {
         let mut x = String::from("<w:pBdr>");
-        for (tag, side) in [
-            ("w:top", props.borders.top),
-            ("w:bottom", props.borders.bottom),
-        ] {
-            if let Some(k) = side {
-                x.push_str(&format!(
-                    "<{tag} w:val=\"{}\" w:sz=\"6\" w:space=\"1\" w:color=\"auto\"/>",
-                    k.to_val()
-                ));
+        for (i, (tag, side)) in props.borders.sides().into_iter().enumerate() {
+            if let Some(b) = side {
+                x.push_str(&pbdr_side_xml(tag, &b));
+            } else if props.borders.is_nil(i) {
+                // No line, which cancels a style's (#2231 r1).
+                x.push_str(&format!("<{tag} w:val=\"nil\"/>"));
             }
         }
         x.push_str("</w:pBdr>");
@@ -2271,6 +2337,140 @@ mod tests {
         doc
     }
 
+    /// #2231: a loaded five-side `w:pBdr` with theme colours saves byte for
+    /// byte when untouched; an edited one writes every side's own width,
+    /// space and colours, which load back as the same model.
+    #[test]
+    fn a_five_side_pbdr_round_trips() {
+        let pbdr = "<w:pBdr><w:top w:val=\"single\" w:sz=\"4\" w:space=\"1\" w:color=\"auto\"/>\
+            <w:left w:val=\"double\" w:sz=\"12\" w:space=\"4\" w:color=\"FF0000\"/>\
+            <w:bottom w:val=\"single\" w:sz=\"8\" w:space=\"4\" w:color=\"4F81BD\" w:themeColor=\"accent1\" w:themeShade=\"BF\"/>\
+            <w:right w:val=\"dashed\" w:color=\"00FF00\" w:sz=\"6\"/>\
+            <w:between w:val=\"single\" w:sz=\"2\" w:space=\"0\" w:color=\"auto\" w:themeColor=\"text1\" w:themeTint=\"80\"/></w:pBdr>";
+        let xml = format!(
+            "<w:document><w:body><w:p><w:pPr>{pbdr}</w:pPr><w:r><w:t>x</w:t></w:r></w:p></w:body></w:document>"
+        );
+        let d = parse_document_xml(&xml, &Relationships::default());
+        let out = document_to_xml(&d);
+        assert!(out.contains(pbdr), "untouched pBdr rewritten: {out}");
+        let mut edited = d.clone();
+        let Block::Paragraph(p) = &mut edited.body[0] else {
+            panic!("a paragraph")
+        };
+        let b = &mut p.props.borders;
+        let right = b.right.as_mut().unwrap();
+        right.sz = 16;
+        let want = *b;
+        let out = document_to_xml(&edited);
+        assert!(
+            out.contains(
+                "<w:bottom w:val=\"single\" w:sz=\"8\" w:space=\"4\" w:color=\"4F81BD\" \
+                 w:themeColor=\"accent1\" w:themeShade=\"BF\"/>"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "<w:right w:val=\"dashed\" w:sz=\"16\" w:space=\"0\" w:color=\"00FF00\"/>"
+            ),
+            "{out}"
+        );
+        let back = parse_document_xml(&out, &Relationships::default());
+        let Block::Paragraph(q) = &back.body[0] else {
+            panic!("a paragraph")
+        };
+        assert_eq!(q.props.borders, want);
+    }
+
+    /// #2231: a pinned first line is written as an explicit `w:firstLine`
+    /// (or `w:hanging`) in place of the loaded one, loads back as direct,
+    /// and pinning again changes nothing.
+    #[test]
+    fn a_pinned_first_line_saves_and_loads_as_direct() {
+        let xml = "<w:document><w:body><w:p><w:pPr><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr>\
+            <w:ind w:left=\"720\" w:hangingChars=\"50\" w:right=\"10\"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p></w:body></w:document>";
+        let mut d = parse_document_xml(xml, &Relationships::default());
+        let Block::Paragraph(p) = &mut d.body[0] else {
+            panic!("a paragraph")
+        };
+        p.props.pin_first_line(0);
+        let pinned = p.props.shadow.clone();
+        p.props.pin_first_line(0);
+        assert_eq!(p.props.shadow, pinned, "idempotent");
+        let out = document_to_xml(&d);
+        assert!(
+            out.contains("<w:ind w:left=\"720\" w:firstLine=\"0\" w:right=\"10\"/>"),
+            "{out}"
+        );
+        let back = parse_document_xml(&out, &Relationships::default());
+        let Block::Paragraph(q) = &back.body[0] else {
+            panic!("a paragraph")
+        };
+        assert_eq!(
+            (q.props.first_line, q.props.has_direct_first_line()),
+            (0, true)
+        );
+        // With no w:ind at all, the pin adds one; a hang is a w:hanging.
+        let mut fresh = ParProps::default();
+        assert!(!fresh.has_direct_first_line());
+        fresh.pin_first_line(-360);
+        assert_eq!(fresh.shadow, ["<w:ind w:hanging=\"360\"/>"]);
+        let mut zero = ParProps::default();
+        zero.pin_first_line(0);
+        assert!(zero.has_direct_first_line());
+    }
+
+    /// #2231 r1: a side given as no line saves as loaded when untouched and
+    /// as `w:val="nil"` when the borders are rewritten, so it still cancels
+    /// the style's on reload.
+    #[test]
+    fn a_cancelled_side_round_trips() {
+        let pbdr =
+            "<w:pBdr><w:bottom w:val=\"none\" w:sz=\"0\" w:space=\"0\" w:color=\"auto\"/></w:pBdr>";
+        let xml = format!(
+            "<w:document><w:body><w:p><w:pPr><w:pStyle w:val=\"Title\"/>{pbdr}</w:pPr><w:r><w:t>x</w:t></w:r></w:p></w:body></w:document>"
+        );
+        let mut d = parse_document_xml(&xml, &Relationships::default());
+        assert!(document_to_xml(&d).contains(pbdr), "untouched: as loaded");
+        let Block::Paragraph(p) = &mut d.body[0] else {
+            panic!("a paragraph")
+        };
+        p.props
+            .borders
+            .set_side(0, Some(crate::model::ParBorder::rule(BorderKind::Single)));
+        let want = p.props.borders;
+        let out = document_to_xml(&d);
+        assert!(
+            out.contains(
+                "<w:pBdr><w:top w:val=\"single\" w:sz=\"6\" w:space=\"1\" w:color=\"auto\"/><w:bottom w:val=\"nil\"/></w:pBdr>"
+            ),
+            "{out}"
+        );
+        let back = parse_document_xml(&out, &Relationships::default());
+        let Block::Paragraph(q) = &back.body[0] else {
+            panic!("a paragraph")
+        };
+        assert_eq!(q.props.borders, want);
+    }
+
+    /// The editor's own rule (Bottom Border, Insert > Horizontal Line) keeps
+    /// the attributes it always wrote.
+    #[test]
+    fn the_editors_rule_writes_what_it_always_did() {
+        let d = Document {
+            body: vec![para(
+                ParProps {
+                    borders: ParBorders::bottom_rule(BorderKind::Single),
+                    ..Default::default()
+                },
+                vec![run("x", RunProps::default())],
+            )],
+        };
+        assert!(document_to_xml(&d).contains(
+            "<w:pBdr><w:bottom w:val=\"single\" w:sz=\"6\" w:space=\"1\" w:color=\"auto\"/></w:pBdr>"
+        ));
+    }
+
     /// Review r2: malformed XML kept raw (attributes without a value) is left
     /// as it is by the paraId dedupe, which used to panic on it.
     #[test]
@@ -2803,10 +3003,7 @@ mod tests {
             frame: None,
             section_break: None,
             tabs: Vec::new(),
-            borders: ParBorders {
-                bottom: Some(BorderKind::Single),
-                top: None,
-            },
+            borders: ParBorders::bottom_rule(BorderKind::Single),
             indent: 720,
             first_line: -360,
             ..Default::default()

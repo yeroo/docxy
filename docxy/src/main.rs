@@ -5482,17 +5482,10 @@ impl App {
         if !self.mutation_allowed(protection::MutationKind::Formatting) {
             return;
         }
-        use docxcore::model::{BorderKind, ParBorders};
-        let has = self.editor.caret_para_props().borders.bottom.is_some();
-        let new = if has {
-            ParBorders::default()
-        } else {
-            ParBorders {
-                top: None,
-                bottom: Some(BorderKind::Single),
-            }
-        };
-        self.editor.set_para_border(new);
+        // Its own bottom: this editor carries no styles context, so a
+        // style's rule is not seen here (#2231; the suite's is).
+        let has = self.editor.shown_bottom_border();
+        self.editor.toggle_bottom_border();
         self.after_edit();
         self.status = Some(
             if has {
@@ -14054,7 +14047,7 @@ mod tests {
         app.run_act(ribbon::Act::HorizontalLine);
         match &app.editor.doc.body[0] {
             Block::Paragraph(p) => assert_eq!(
-                p.props.borders.bottom,
+                p.props.borders.bottom.map(|b| b.kind),
                 Some(docxcore::model::BorderKind::Single)
             ),
             _ => panic!("expected a paragraph"),
@@ -15529,7 +15522,7 @@ mod tests {
             Block::Paragraph(p) => {
                 assert!(p.content.is_empty(), "the rule paragraph is emptied");
                 assert_eq!(
-                    p.props.borders.bottom,
+                    p.props.borders.bottom.map(|b| b.kind),
                     Some(docxcore::model::BorderKind::Single),
                     "--- + Enter should set a bottom border"
                 );

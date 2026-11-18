@@ -3830,7 +3830,16 @@ fn open_attr(xml: &str, start: usize, attr: &str) -> Option<String> {
 /// `w:ind` of a list level; [`markdown_list_levels`] and the repair of an
 /// older build's levels both write it, so they cannot drift.
 fn level_ind(lvl: i32) -> String {
-    format!("<w:ind w:left=\"{}\" w:hanging=\"360\"/>", 720 * (lvl + 1))
+    let (left, first) = own_list_level_indent(lvl);
+    format!("<w:ind w:left=\"{left}\" w:hanging=\"{}\"/>", -first)
+}
+
+/// The indent docxy's own lists give level `lvl` (`(left, first line)` in
+/// twips, a hanging indent negative): what [`level_ind`] writes into every
+/// numbering part docxy makes. A host draws an item of those lists at it
+/// before the part exists, so it draws where the saved file puts it (#2231).
+pub fn own_list_level_indent(lvl: i32) -> (i32, i32) {
+    (720_i32.saturating_mul(lvl.max(0).saturating_add(1)), -360)
 }
 
 /// Put `abstract_xml` and `num_xml` into a `numbering.xml` in CT_Numbering

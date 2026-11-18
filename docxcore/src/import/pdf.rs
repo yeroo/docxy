@@ -2324,10 +2324,15 @@ mod tests {
             panic!()
         };
         assert_eq!(p.props.num_id, Some(1));
+        // #2231: no indent is computed here, so none is pinned: the item
+        // takes its level's, as a save and Word give it.
+        assert!(p.props.shadow.is_empty());
+        assert!(!p.props.has_direct_left_indent() && !p.props.has_direct_first_line());
         let Block::Paragraph(p) = &doc.body[1] else {
             panic!()
         };
         assert_eq!(p.props.num_id, Some(2));
+        assert!(p.props.shadow.is_empty());
     }
 
     #[test]

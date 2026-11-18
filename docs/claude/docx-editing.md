@@ -17,10 +17,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   `numId`, `style_num_pr` set, a styles context) and `Editor::set_indent(0, ..)`,
   both only when the item had a direct left indent when called (the Paragraph
   dialog passes 0 back for items it did not change) (#1792). In
-  Increase/Decrease a style item counts only a loaded (or pinned) left, and
-  it stays pinned as it moves (`ParProps::pin_left_indent`); the indent an
-  in-session Increase wrote on a style item with no loaded left is not pinned
-  at 0, as it cannot be told from none. `set_indent(0, ..)` is an explicit
+  Increase/Decrease a style item whose style gives no left in twips counts
+  only a loaded (or pinned) left, and it stays pinned as it moves
+  (`ParProps::pin_left_indent`); the indent an in-session Increase wrote on
+  such an item with no loaded left is not pinned at 0, as it cannot be told
+  from none. One whose style gives a left in twips steps as a style-left
+  paragraph does (below; `IndentFallback::StyleNum { twips }`, #2231 r5). `set_indent(0, ..)` is an explicit
   request for the margin, so on any list item it also counts an indent
   written in session. The suite's Left-marker ruler drag sets the indent on
   every move, so it takes `Editor::indent_base()` at the drag start (from the
@@ -36,16 +38,54 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   `w:leftChars="0"`, which a lone `w:left` would lose to): at 0 in Decrease when
   its left was loaded (it stays loaded as it moves), in `set_indent` when it
   was direct at the start, and any `set_indent` above 0 on it counts as
-  loaded. The steps are not relative to the style's indent (an Increase from
-  none writes 720 over a 720 style; a follow-up). Needs the styles context.
+  loaded. With no left of its own as drawn (none loaded, pinned or set in
+  session), Increase/Decrease step from the style's indent where it is in
+  twips (`IndentFallback::StyleLeft { twips }`, from `style_left_twips`),
+  as the page view draws it, and pin the result: from a 720 style, Increase
+  writes `w:left="1440"` and Decrease `w:left="0"` (#2231 r3). Over such a
+  style a left set in session counts as its own (`has_direct_left_indent`,
+  as `eff_indent` draws it): it steps from itself and pins as it moves
+  (r4). The style's left is taken as drawn, at least 0: over a negative
+  one Increase writes 720 and Decrease, which would not move it, makes no
+  step (r5). Over a character-count style they step from 0 as before.
+  Needs the styles context.
 - `Package::repair_list_indents` gives docxy's lists (9990/9991) the level
   indents an older build left out, as `ensure_list` does. Every host's
   Increase/Decrease Indent runs it (terminal `docxy` and `docxwasm` before
   the edit, re-parsing the numbering; the suite after an indent that made
-  a step: Shift+Tab, Ctrl+M, the ribbon/KeyTips act, Repeat; the suite
-  draws an item with no left of its own at its level from `ilvl`, so there
-  it is for the saved file). Not an undo step; nothing repairs at load.
-- The suite's `eff_indent` adds the level step `ilvl × 300` only to a list
+  a step: Shift+Tab, Ctrl+M, the ribbon/KeyTips act, Repeat). Not an undo
+  step; nothing repairs at load.
+- The suite's `eff_indent(p, Inherited)` (#2231) draws each of a
+  paragraph's left and first line from the first that gives it: its own
+  (`has_direct_left_indent`, `has_direct_first_line`: nonzero, or loaded or
+  pinned, a 0 included); for a list item, its level's `w:ind` where the
+  package's numbering part defines it (`Numbering::level_indent`; a list
+  made from a list style, `w:numStyleLink`, takes the levels of the
+  abstract whose `w:styleLink` names that style, and one whose link
+  resolves to nothing is not defined, r2), else for
+  docxy's own lists (numId 1 and 2, `add_markdown_numbering`/`blank_base`;
+  9990/9991, `ensure_list`) that no part defines yet what saving writes
+  (`package::own_list_level_indent`: 720·(ilvl+1), hanging 360), so a list
+  draws the same in session and after a reload; then the paragraph style
+  chain in twips (`style_left_twips`, `style_first_line`; a nonzero
+  character count is not drawn), list or not. `Inherited::NONE` (no styles
+  or numbering) is the rule below. An inherited left takes no level step,
+  so the ruler does not clamp at it. A ruler move that leaves a left or
+  first line at 0 where the paragraph inherits a nonzero one pins it
+  (`Editor::pin_zero_indents` with the suite's `inherits_nonzero`:
+  `w:left="0"` as #1728 does, `w:firstLine="0"` through
+  `ParProps::pin_first_line`; a First move pins the first line only), or
+  what it inherits would come back, in session and after a reload (r1 M2).
+  docxwasm's and terminal docxy's `set_indent` are unchanged. The
+  HTML importer (`import::pin_list_indents` after its `Builder::finish`)
+  pins its list items' left and first line, as it computes them (#1979,
+  #2114), so their 0 is a value and no level or style reaches them, in any
+  package. The RTF and PDF importers compute no list indents (every item
+  comes at 0, `\li`/`\fi` unread), so theirs stay unpinned and draw, save
+  and open in Word at their level's indent. Not done:
+  numbering through a style's `numPr` only, the level's `w:rPr` (its
+  Symbol bullet) and `lvlJc`.
+- With nothing inherited, `eff_indent` adds the level step `ilvl × 300` only to a list
   item with no left indent of its own: an explicit numId 0 takes none, nor
   does an item with a direct left (`ParProps::has_direct_left_indent`:
   `indent > 0` or a loaded `w:left`, a `w:left="0"` pin included). A
@@ -344,7 +384,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   says `painted: false` until a frame of the document last loaded has
   painted. The document tab's flow view records the same
   (`Docxy::painted_paras`, a harness instance only) for `doc`'s
-  `flow.layout` (`null` in Print Layout; x from `draft_column`).
+  `flow.layout` (`null` in Print Layout; x from `draft_column`), and Print
+  Layout for `doc`'s `page.layout` (#2231; `null` in a flow view; x from
+  the first page's text column), each paragraph with its `text_bottom`,
+  `borders` and `highlights` too.
   `uiharness/cases/ext-doc-outlook-mail.uit` drives both: the view, and the
   same mail (`fixtures/outlook-mail.html`) opened in a document tab.
 - Known limits: explicit black text (an Outlook mail's `rgb(0,0,0)`) and

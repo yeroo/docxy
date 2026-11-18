@@ -20,7 +20,7 @@
 #
 # `doc`'s `page_mode` (`dark` / `light`) and `page_color` are the page the
 # document last drew on, and `inks` rates every body run (cells included,
-# highlighted runs left out) against the ground under it: `all_readable`
+# a highlighted run on its highlight, #2231) against the ground under it: `all_readable`
 # is every run at 4.5:1 or more. Each read follows a `shot`, which waits
 # for the frame after the change.
 #

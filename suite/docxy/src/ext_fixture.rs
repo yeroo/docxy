@@ -571,13 +571,19 @@ pub(crate) fn fixture_document() -> (Document, Package) {
 /// The fixtures `ext-doc-load {"fixture"}` shows in the view (#1888):
 /// `sections` ([`sections_document`]), `header-inherit`
 /// (`uiharness/fixtures/header-inherit.docx`, loaded as a document tab
-/// loads it) and `theme-font` ([`theme_font_docx`], #1972).
+/// loads it), `theme-font` ([`theme_font_docx`], #1972) and `word-compare`
+/// ([`word_compare_docx`], #2231).
 pub(crate) fn named_document(name: &str) -> Result<(Document, Package), String> {
     match name {
         "sections" => Ok(sections_document()),
         "theme-font" => {
             let loaded = crate::load_bytes(&theme_font_docx());
             let pkg = loaded.pkg.ok_or("theme-font did not load")?;
+            Ok((loaded.doc, pkg))
+        }
+        "word-compare" => {
+            let loaded = crate::load_bytes(&word_compare_docx());
+            let pkg = loaded.pkg.ok_or("word-compare did not load")?;
             Ok((loaded.doc, pkg))
         }
         "header-inherit" => {
@@ -588,7 +594,7 @@ pub(crate) fn named_document(name: &str) -> Result<(Document, Package), String> 
             Ok((loaded.doc, pkg))
         }
         _ => Err(format!(
-            "unknown fixture '{name}': the fixtures are 'sections', 'header-inherit' and 'theme-font'"
+            "unknown fixture '{name}': the fixtures are 'sections', 'header-inherit', 'theme-font' and 'word-compare'"
         )),
     }
 }
@@ -649,6 +655,148 @@ pub(crate) fn theme_font_docx() -> Vec<u8> {
         part("word/_rels/document.xml.rels", doc_rels),
         part("word/styles.xml", THEME_FONT_STYLES),
         part("word/theme/theme1.xml", THEME_FONT_THEME),
+    ])
+}
+
+/// The `word-compare` styles (#2231): a Calibri Normal, a `Title` with the
+/// issue's bottom rule (`w:sz="8" w:space="4"`, `4F81BD` and
+/// `w:themeColor="accent1"`) and a `ListParagraph` indented 720.
+pub(crate) const WORD_COMPARE_STYLES: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:asciiTheme=\"minorHAnsi\" w:hAnsiTheme=\"minorHAnsi\"/>\
+<w:sz w:val=\"22\"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after=\"160\"/></w:pPr></w:pPrDefault></w:docDefaults>\
+<w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/><w:qFormat/></w:style>\
+<w:style w:type=\"paragraph\" w:styleId=\"Title\"><w:name w:val=\"Title\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/>\
+<w:qFormat/><w:pPr><w:pBdr><w:bottom w:val=\"single\" w:sz=\"8\" w:space=\"4\" w:color=\"4F81BD\" w:themeColor=\"accent1\"/></w:pBdr>\
+<w:spacing w:after=\"300\"/></w:pPr><w:rPr><w:rFonts w:asciiTheme=\"majorHAnsi\" w:hAnsiTheme=\"majorHAnsi\"/>\
+<w:color w:val=\"17365D\"/><w:sz w:val=\"52\"/></w:rPr></w:style>\
+<w:style w:type=\"paragraph\" w:styleId=\"ListParagraph\"><w:name w:val=\"List Paragraph\"/><w:basedOn w:val=\"Normal\"/>\
+<w:qFormat/><w:pPr><w:ind w:left=\"720\"/><w:contextualSpacing/></w:pPr></w:style>\
+</w:styles>";
+
+/// The `word-compare` theme: Calibri / Calibri Light, accent 1 `4F81BD`.
+pub(crate) const WORD_COMPARE_THEME: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<a:theme xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" name=\"Office Theme\"><a:themeElements>\
+<a:clrScheme name=\"Office\"><a:dk1><a:sysClr val=\"windowText\" lastClr=\"000000\"/></a:dk1>\
+<a:lt1><a:sysClr val=\"window\" lastClr=\"FFFFFF\"/></a:lt1><a:dk2><a:srgbClr val=\"1F497D\"/></a:dk2>\
+<a:lt2><a:srgbClr val=\"EEECE1\"/></a:lt2><a:accent1><a:srgbClr val=\"4F81BD\"/></a:accent1>\
+<a:accent2><a:srgbClr val=\"C0504D\"/></a:accent2><a:accent3><a:srgbClr val=\"9BBB59\"/></a:accent3>\
+<a:accent4><a:srgbClr val=\"8064A2\"/></a:accent4><a:accent5><a:srgbClr val=\"4BACC6\"/></a:accent5>\
+<a:accent6><a:srgbClr val=\"F79646\"/></a:accent6><a:hlink><a:srgbClr val=\"0000FF\"/></a:hlink>\
+<a:folHlink><a:srgbClr val=\"800080\"/></a:folHlink></a:clrScheme>\
+<a:fontScheme name=\"Office\"><a:majorFont><a:latin typeface=\"Calibri Light\"/><a:ea typeface=\"\"/><a:cs typeface=\"\"/></a:majorFont>\
+<a:minorFont><a:latin typeface=\"Calibri\"/><a:ea typeface=\"\"/><a:cs typeface=\"\"/></a:minorFont></a:fontScheme>\
+</a:themeElements></a:theme>";
+
+/// The `word-compare` numbering: list 1, a Symbol bullet whose level 0 is
+/// indented `w:left="720" w:hanging="360"`, as Word's own bullets are.
+pub(crate) const WORD_COMPARE_NUMBERING: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<w:numbering xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+<w:abstractNum w:abstractNumId=\"0\"><w:multiLevelType w:val=\"hybridMultilevel\"/>\
+<w:lvl w:ilvl=\"0\"><w:start w:val=\"1\"/><w:numFmt w:val=\"bullet\"/><w:lvlText w:val=\"&#xF0B7;\"/><w:lvlJc w:val=\"left\"/>\
+<w:pPr><w:ind w:left=\"720\" w:hanging=\"360\"/></w:pPr><w:rPr><w:rFonts w:ascii=\"Symbol\" w:hAnsi=\"Symbol\" w:hint=\"default\"/></w:rPr></w:lvl>\
+</w:abstractNum><w:num w:numId=\"1\"><w:abstractNumId w:val=\"0\"/></w:num></w:numbering>";
+
+/// The `word-compare` document (#2231), as the bytes of a `.docx` (also
+/// `uiharness/fixtures/word-compare.docx`, which a test keeps equal to it):
+/// the four shapes of the owner's comparison with Word, in made-up text.
+/// Block 0 is the `Title` (its style's accent rule); blocks 1 and 2 are
+/// `ListParagraph` bullets of list 1 (mark in Segoe UI, text in Arial; 2
+/// wraps); block 3 has an explicit `212121` yellow-highlighted run
+/// "Explicit" and an automatic one "Automatic"; block 4 is all highlighted
+/// at 1.15 lines and wraps; blocks 5 and 6 share a direct box border
+/// (top, left, bottom, right and between, `C0504D`).
+pub(crate) fn word_compare_docx() -> Vec<u8> {
+    let ct = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+<Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+<Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
+<Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>\
+<Override PartName=\"/word/numbering.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml\"/>\
+<Override PartName=\"/word/theme/theme1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.theme+xml\"/></Types>";
+    let rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/></Relationships>";
+    let doc_rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>\
+<Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering\" Target=\"numbering.xml\"/>\
+<Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme\" Target=\"theme/theme1.xml\"/></Relationships>";
+    let arial = |text: &str| {
+        format!(
+            "<w:r><w:rPr><w:rFonts w:ascii=\"Arial\" w:hAnsi=\"Arial\" w:cs=\"Arial\"/></w:rPr>\
+             <w:t xml:space=\"preserve\">{text}</w:t></w:r>"
+        )
+    };
+    let bullet = |text: &str| {
+        format!(
+            "<w:p><w:pPr><w:pStyle w:val=\"ListParagraph\"/><w:numPr><w:ilvl w:val=\"0\"/><w:numId w:val=\"1\"/></w:numPr>\
+             <w:rPr><w:rFonts w:ascii=\"Segoe UI\" w:hAnsi=\"Segoe UI\"/></w:rPr></w:pPr>{}</w:p>",
+            arial(text)
+        )
+    };
+    let hl = |color: Option<&str>, text: &str| {
+        let color = color.map_or(String::new(), |c| format!("<w:color w:val=\"{c}\"/>"));
+        format!(
+            "<w:r><w:rPr>{color}<w:highlight w:val=\"yellow\"/></w:rPr><w:t xml:space=\"preserve\">{text}</w:t></w:r>"
+        )
+    };
+    let boxed = |text: &str| {
+        let side = |tag: &str, space: u32| {
+            format!("<w:{tag} w:val=\"single\" w:sz=\"6\" w:space=\"{space}\" w:color=\"C0504D\"/>")
+        };
+        format!(
+            "<w:p><w:pPr><w:pBdr>{}{}{}{}{}</w:pBdr></w:pPr>{}</w:p>",
+            side("top", 1),
+            side("left", 4),
+            side("bottom", 1),
+            side("right", 4),
+            side("between", 1),
+            run(text)
+        )
+    };
+    let body = [
+        "<w:p><w:pPr><w:pStyle w:val=\"Title\"/></w:pPr><w:r><w:t>Quarterly Lorem Notes</w:t></w:r></w:p>".to_string(),
+        bullet("Alpha lorem ipsum dolor sit amet."),
+        bullet(
+            "Beta consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore \
+             magna aliqua, ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut \
+             aliquip ex ea commodo consequat.",
+        ),
+        format!(
+            "<w:p>{}{}{}</w:p>",
+            hl(Some("212121"), "Explicit"),
+            run(" and "),
+            hl(None, "Automatic")
+        ),
+        format!(
+            "<w:p><w:pPr><w:spacing w:line=\"276\" w:lineRule=\"auto\"/></w:pPr>{}</w:p>",
+            hl(
+                None,
+                "Gamma duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu \
+                 fugiat nulla pariatur, excepteur sint occaecat cupidatat non proident, sunt in culpa qui \
+                 officia deserunt mollit anim id est laborum, sed ut perspiciatis unde omnis iste natus."
+            )
+        ),
+        boxed("Delta boxed lorem one."),
+        boxed("Epsilon boxed lorem two."),
+    ]
+    .concat();
+    let document = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+<w:document xmlns:w=\"{W}\" xmlns:r=\"{R}\"><w:body>{body}{}</w:body></w:document>",
+        sect_pr("", 12240, 15840, 1440, "")
+    );
+    let part = |n: &str, t: &str| (n.to_string(), t.as_bytes().to_vec());
+    docxcore::zipwrite::write_zip(&[
+        part("[Content_Types].xml", ct),
+        part("_rels/.rels", rels),
+        part("word/document.xml", &document),
+        part("word/_rels/document.xml.rels", doc_rels),
+        part("word/styles.xml", WORD_COMPARE_STYLES),
+        part("word/numbering.xml", WORD_COMPARE_NUMBERING),
+        part("word/theme/theme1.xml", WORD_COMPARE_THEME),
     ])
 }
 
@@ -789,6 +937,48 @@ mod tests {
         // A table cell's paragraph is reached by its path.
         let a2 = docxcore::editor::resolve_para(&doc.body, &[5, 1, 0, 0]).expect("A2");
         assert_eq!(a2.plain_text(), "A2");
+    }
+
+    /// `uiharness/fixtures/word-compare.docx` is [`word_compare_docx`]'s
+    /// bytes (#2231). `UPDATE_WORD_COMPARE_FIXTURE=1` writes it. It loads
+    /// with its four shapes where the case reads them.
+    #[test]
+    fn the_word_compare_fixture_file_is_current() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../uiharness/fixtures/word-compare.docx");
+        let bytes = word_compare_docx();
+        if std::env::var_os("UPDATE_WORD_COMPARE_FIXTURE").is_some() {
+            std::fs::write(&path, &bytes).expect("write the fixture");
+        }
+        let on_disk = std::fs::read(&path).expect("uiharness/fixtures/word-compare.docx");
+        assert!(
+            on_disk == bytes,
+            "word-compare.docx is stale: run with UPDATE_WORD_COMPARE_FIXTURE=1"
+        );
+        let loaded = crate::load_bytes(&bytes);
+        let pkg = loaded.pkg.expect("a package");
+        let para = |i: usize| match &loaded.doc.body[i] {
+            Block::Paragraph(p) => p.clone(),
+            b => panic!("block {i}: {b:?}"),
+        };
+        let sheet = docxcore::styles::parse_styles_xml(&pkg.part_text("word/styles.xml").unwrap());
+        let title = sheet.effective_borders(Some("Title"), para(0).props.borders);
+        let rule = title.bottom.expect("the title's rule");
+        assert_eq!((rule.sz, rule.space, rule.color), (8, 4, Some(0x4F81BD)));
+        let colors =
+            docxcore::theme::parse_theme_colors(&pkg.part_text("word/theme/theme1.xml").unwrap());
+        assert_eq!(rule.shown_color(Some(&colors)), Some(0x4F81BD));
+        let numbering =
+            docxcore::numbering::parse_numbering_xml(&pkg.part_text("word/numbering.xml").unwrap());
+        let item = para(1).props;
+        let e = crate::eff_indent(
+            &item,
+            crate::Inherited::of(&item, Some(&sheet), Some(&numbering)),
+        );
+        assert_eq!((e.left, e.first), (720, -360));
+        assert_eq!(para(3).plain_text(), "Explicit and Automatic");
+        assert!(para(5).props.borders.between.is_some());
+        assert_eq!(para(5).props.borders, para(6).props.borders);
     }
 
     /// `uiharness/fixtures/theme-font.docx` is [`theme_font_docx`]'s bytes,

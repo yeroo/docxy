@@ -499,13 +499,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   sits (`#676767`: black is 4.56:1 on its tint, 3.71:1 on the sheet, so
   that sheet takes no tint). The
   part's other pages draw it in `doc_pal`.
-- The paragraph rule (`has_border`, a bottom `w:pBdr`) carries no colour in
-  the model: it draws `border(None, ground)` on a dark page, the ink as
-  before on a light one. Paragraph and run shading (`w:shd` in `w:pPr` /
+- Paragraph borders draw their own colour through `border_ink` (#2231,
+  below): an automatic one is `border(None, ground)` on a dark page, the
+  ink on a light one. Paragraph and run shading (`w:shd` in `w:pPr` /
   `w:rPr`) are not painted at all, so a palette's `ground` is everything
   under a run; a later shading feature must set the ground it paints.
-- Not mapped: highlights (their colour and their own ink, as before),
-  pictures, shapes, text boxes, watermarks, View Gridlines' dashed
+- Highlights are mapped since #2231 (below).
+- Not mapped: pictures, shapes, text boxes, watermarks, View Gridlines' dashed
   `#9FB8E0` on borderless edges (a view aid: the issue's "dotted" rules),
   the header/footer editing chrome, the style and table-style galleries.
 - The views: `Docxy::page_is_dark` (applied theme dark and not
@@ -530,7 +530,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   body run and list number as painted, top-level and in table cells, in
   both views, and an open header's or footer's runs against its tint
   (`Docxy::painted_inks`, `PaintedInk`, a harness instance only; closed
-  headers and footers and highlighted runs are left out). The ground is
+  headers and footers are left out, and a highlighted run is rated against
+  its highlight as drawn, #2231). The ground is
   the palette's, so it is true only while every painted ground has its own
   palette, as the header tint now does: `runs`,
   `min_contrast`, `all_readable` (every run at 4.5:1 or more) and `worst`
@@ -541,6 +542,67 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
 - Known limits: list numbers inside table cells are not drawn (the
   fixture's numbered list in a two-column table shows none, dark or
   light); `w:caps` is not drawn.
+
+## Page view vs Word: highlights, list indents, paragraph borders (#2231)
+
+- Highlights on a dark page (`dark_page::highlight`, `highlight_ink`,
+  `run_highlight` in main.rs): fitted to two pixels the owner measured in
+  Word for the web's dark mode, so the rule differs by the run's ink. Under
+  a run of its own colour (any colour its styles give counts) each channel
+  is `c × 0x3C/0xFF` (yellow `#3C3C00`); under automatic text it is the
+  affine `0x2B + c × 0x1E/0xFF` (yellow `#49492B`). The ink is `text()` of
+  the run's colour on the fill (`#212121` becomes `#DEDEDE`; Word's
+  `#DDDDDD`), or `#F5F5F5` for automatic text. The other 15 names are
+  derived by the same rule, not measured, and all automatic ones fall in
+  `#2B..#49` per channel. A light page is unchanged (`highlight_rgb`).
+  Selection still wins over a highlight.
+- The band (`highlight_band`): a highlighted word draws at the line's
+  single-spaced height (`para_box` with `line=240 auto`, so the flow view's
+  exact branch too), with the rest as equal margins, so its outer box is
+  the line's and wrapped bands touch at single spacing.
+- List and style indents (`Inherited::of`, `eff_indent(p, inh)`): see
+  `docs/claude/docx-editing.md` §Lists. `run_look::Cache::parts` keeps the
+  numbering part and the theme's colours (`theme::parse_theme_colors`) on
+  the styles' stamp; `RunStyler` and `TableCtx` carry them.
+- Paragraph borders (`paragraph_el`): the style chain's sides under the
+  paragraph's own (`effective_borders`, each side apart), each an absolute
+  strip on an inner box at the indents (outside the text by `w:space` pt,
+  `w:sz/8` pt wide, at least 1 px), inside the paragraph's spacing, in
+  `border_ink(shown_color)` (a theme colour first, then `w:color`). A side
+  given as `none`/`nil` (`ParBorders::nil`, Word's removed rule) cancels
+  the style's below it, direct or in a derived style, and saves back as
+  loaded, or as `w:val="nil"` when the borders are rewritten. Bottom
+  Border (`Editor::toggle_bottom_border`, its pressed state
+  `shown_bottom_border`) acts on the rule shown, the style's included: off
+  over a style's rule writes that cancel, and the paragraph's other sides
+  stay. Terminal docxy and docxwasm call the same methods, but their
+  editors carry no styles context (`set_styles_xml`), so there it acts on
+  the paragraph's own bottom only (not wired: it would change their
+  Bold/Italic toggles, #1427). Every paragraph a context draws
+  takes `TableCtx::styler()` (styles, numbering and theme colours), read-only
+  headers and footers included. gpui
+  draws one colour per div border, hence the strips. Word's grouping
+  (`paragraph_border_group`, `border_group`, `drawn_sides`): consecutive
+  paragraphs among `RenderCtx::siblings` (the blocks drawn together: the
+  body, a cell's, a Print Layout page's or column's range, so a box split
+  by a break closes on each side of it; `border_group_at`) with
+  equal borders and drawn indents share a box: its top on the first,
+  `w:between` above each later one, its bottom on the last, the spacing
+  and the container's `block_gap` (Print Layout's column `gap_1`) inside
+  it. Double, dotted, dashed and wave lines draw solid.
+- Fonts: Segoe UI tries Selawik, Liberation Sans, Arimo, Noto Sans, Open
+  Sans, then DejaVu Sans (`docxcore::fonts`).
+- Harness: `doc {}`'s `page.layout` is Print Layout's paragraphs as
+  painted (`painted_layout_json`, as `flow.layout` is the flow view's,
+  whose output gained the same fields): a paragraph's `marker` (`x`,
+  `family`), `text_x`, `lines[].x`, `text_bottom`, `highlights` (`text`,
+  `fill`, `ink`) and `borders` (`side`, `x`, `y`, `width`, `gap` to the
+  text, `color`). `uiharness/cases/doc-word-compare.uit` runs
+  `fixtures/word-compare.docx` (`ext_fixture::word_compare_docx`; the
+  `ext-doc-load` fixture `word-compare` too) light and dark, on every OS;
+  `doc-word-compare-fonts.uit` (`os linux`) holds what depends on Linux's
+  fonts and pixel grid: the Liberation Sans faces drawn for Arial and
+  Segoe UI, and the Title rule's 6 px (4 pt) gap.
 
 ## Document Find bar keys (#2116)
 

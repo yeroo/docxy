@@ -709,6 +709,30 @@ impl ParProps {
         crate::serialize::shadow_has_attr(&self.shadow, "ind", crate::serialize::IND_LEFT)
     }
 
+    /// Whether a first-line attribute (`w:firstLine`, `w:hanging` or their
+    /// character units) was loaded and not since replaced, whatever its
+    /// value (#2231).
+    pub fn has_loaded_first_line(&self) -> bool {
+        crate::serialize::shadow_has_attr(&self.shadow, "ind", crate::serialize::IND_FIRST_LINE)
+    }
+
+    /// Whether the paragraph has a first-line indent of its own: a nonzero
+    /// one, or one loaded or pinned (a `w:firstLine="0"` included). It
+    /// replaces a list level's and a style's, as Word reads the file (#2231).
+    pub fn has_direct_first_line(&self) -> bool {
+        self.first_line != 0 || self.has_loaded_first_line()
+    }
+
+    /// Set the first line to `twips` and pin it as an explicit `w:firstLine`
+    /// (or `w:hanging`) in the loaded `w:ind` (see
+    /// `serialize::pin_shadow_first`): a list item whose hanging indent is
+    /// taken away keeps a first line of 0, where none would bring its
+    /// level's hanging indent back, in session and after a reload (#2231).
+    pub fn pin_first_line(&mut self, twips: i32) {
+        self.first_line = twips;
+        crate::serialize::pin_shadow_first(&mut self.shadow, twips);
+    }
+
     /// Whether the paragraph has a left indent of its own, set in session
     /// or loaded (a `w:left="0"` pin included): it replaces a list level's
     /// indent, as Word reads the file (#1986).
@@ -830,12 +854,141 @@ impl Spacing {
     }
 }
 
-/// Paragraph borders (`w:pBdr`). Only the horizontal sides are modeled, since
-/// that's what reads as a rule in a terminal.
+/// Paragraph borders (`w:pBdr`): its five sides, each with its line, width,
+/// spacing and colour (#2231). The terminal draws only `top` and `bottom`
+/// as rules; the suite's page view draws every side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ParBorders {
-    pub top: Option<BorderKind>,
-    pub bottom: Option<BorderKind>,
+    pub top: Option<ParBorder>,
+    pub left: Option<ParBorder>,
+    pub bottom: Option<ParBorder>,
+    pub right: Option<ParBorder>,
+    /// `w:between`: the line between grouped paragraphs.
+    pub between: Option<ParBorder>,
+    /// The sides given as no line (`w:val="nil"` / `"none"`), one bit each in
+    /// [`Self::sides`]' order: such a side cancels the one a style below
+    /// gives (#2231 r1). A side with a line never has its bit set.
+    pub nil: u8,
+}
+
+impl ParBorders {
+    /// Whether any side draws a line.
+    pub fn any(&self) -> bool {
+        self.sides().iter().any(|(_, s)| s.is_some())
+    }
+
+    /// Whether nothing is said of any side: no line and no cancel.
+    pub fn is_empty(&self) -> bool {
+        !self.any() && self.nil == 0
+    }
+
+    /// The sides in `w:pBdr`'s schema order (CT_PBdr), with their tags.
+    pub fn sides(&self) -> [(&'static str, Option<ParBorder>); 5] {
+        [
+            ("w:top", self.top),
+            ("w:left", self.left),
+            ("w:bottom", self.bottom),
+            ("w:right", self.right),
+            ("w:between", self.between),
+        ]
+    }
+
+    /// Side `i` in [`Self::sides`]' order.
+    fn side_mut(&mut self, i: usize) -> &mut Option<ParBorder> {
+        match i {
+            0 => &mut self.top,
+            1 => &mut self.left,
+            2 => &mut self.bottom,
+            3 => &mut self.right,
+            _ => &mut self.between,
+        }
+    }
+
+    /// Whether side `i` (in [`Self::sides`]' order) is given as no line.
+    pub fn is_nil(&self, i: usize) -> bool {
+        self.nil & (1 << i) != 0
+    }
+
+    /// Set side `i` (in [`Self::sides`]' order): a line, or no line, which
+    /// cancels a style's.
+    pub fn set_side(&mut self, i: usize, side: Option<ParBorder>) {
+        *self.side_mut(i) = side;
+        if side.is_some() {
+            self.nil &= !(1 << i);
+        } else {
+            self.nil |= 1 << i;
+        }
+    }
+
+    /// Side `i` (in [`Self::sides`]' order) left unsaid: no line and no
+    /// cancel, so a style's shows.
+    pub fn clear_side(&mut self, i: usize) {
+        *self.side_mut(i) = None;
+        self.nil &= !(1 << i);
+    }
+
+    /// `self`'s sides over `under`'s, each apart: a line, else a cancel
+    /// (which keeps the side off), else what `under` says.
+    pub fn over(self, under: ParBorders) -> ParBorders {
+        let mut out = ParBorders::default();
+        let (o, u) = (self.sides(), under.sides());
+        for i in 0..5 {
+            if o[i].1.is_some() {
+                out.set_side(i, o[i].1);
+            } else if self.is_nil(i) || (u[i].1.is_none() && under.is_nil(i)) {
+                out.set_side(i, None);
+            } else {
+                *out.side_mut(i) = u[i].1;
+            }
+        }
+        out
+    }
+
+    /// Borders with only a bottom rule of `kind`, as the editor writes one
+    /// (Bottom Border, an AutoFormat rule).
+    pub fn bottom_rule(kind: BorderKind) -> Self {
+        ParBorders {
+            bottom: Some(ParBorder::rule(kind)),
+            ..ParBorders::default()
+        }
+    }
+}
+
+/// One side of a paragraph's border (`w:top`, `w:bottom`, ...).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParBorder {
+    pub kind: BorderKind,
+    /// `w:sz`: the line's width in eighths of a point (Word's default 4).
+    pub sz: u16,
+    /// `w:space`: the gap between the text and the line, in points.
+    pub space: u16,
+    /// `w:color`; `None` is automatic.
+    pub color: Option<u32>,
+    /// `w:themeColor` (with `w:themeTint` / `w:themeShade`), which wins over
+    /// `color` where the theme defines it.
+    pub theme: Option<crate::theme::ThemeColorRef>,
+}
+
+impl ParBorder {
+    /// A side of `kind` as the editor writes one: 3/4 pt, 1 pt from the
+    /// text, automatic colour.
+    pub fn rule(kind: BorderKind) -> Self {
+        ParBorder {
+            kind,
+            sz: 6,
+            space: 1,
+            color: None,
+            theme: None,
+        }
+    }
+
+    /// The colour shown: the theme colour when `theme` resolves it, else
+    /// `w:color`, else `None` (automatic).
+    pub fn shown_color(&self, theme: Option<&crate::theme::ThemeColors>) -> Option<u32> {
+        self.theme
+            .and_then(|r| theme.and_then(|t| t.resolve(r)))
+            .or(self.color)
+    }
 }
 
 /// A border line style (`w:val` on a `w:pBdr` side).

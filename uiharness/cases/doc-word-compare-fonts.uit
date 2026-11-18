@@ -1,0 +1,38 @@
+# The page view against Word for the web (#2231), its Linux-only half:
+# `doc-word-compare.uit` runs the same fixture (`fixtures/word-compare.docx`)
+# on every OS. Here are what depends on the OS's fonts and pixel grid:
+#
+# - the families drawn: the bullets' mark names Segoe UI and the text Arial.
+#   Linux has neither, so Arial draws in its metric-compatible Liberation
+#   Sans, and Segoe UI in an Arial-width face (Liberation Sans here, never
+#   Verdana-wide DejaVu Sans). Windows draws the named faces themselves.
+# - the Title rule's gap to its text: 4 pt is 5.33 px, which layout places on
+#   whole pixels, 6 px at Linux's 1x scale; another scale snaps differently.
+os linux
+
+test issue 2231 Arial and Segoe UI draw in Arial-width faces and the title rule sits 4 pt below its text
+  open copy:../fixtures/word-compare.docx
+  call window-size {"w":1100,"h":900}
+  call theme-set {"theme":"light"}
+  assert reply.applied is light
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is print
+  shot window
+  call doc {}
+  assert reply.page.layout.paragraphs.0.borders.0.side is bottom
+  assert reply.page.layout.paragraphs.0.borders.0.gap is 6
+  assert reply.page.layout.paragraphs.1.marker.family is Liberation Sans
+  assert reply.page.layout.paragraphs.2.marker.family is Liberation Sans
+  call doc-word {"text":"Alpha"}
+  assert reply.face.family is Liberation Sans
+  # The dark page draws the rule where the light one does.
+  call theme-set {"theme":"dark"}
+  assert reply.applied is dark
+  shot window
+  call doc {}
+  assert reply.page_mode is dark
+  assert reply.page.layout.paragraphs.0.borders.0.gap is 6
+  # The window keeps its view across tests: back to Web Layout.
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is web
+  call theme-set {"theme":"auto"}

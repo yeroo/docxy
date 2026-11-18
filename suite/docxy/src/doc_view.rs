@@ -1723,8 +1723,8 @@ impl Render for DocView {
         // measurer measures in, so measured = drawn.
         let doc_font = crate::doc_text_family(window);
         let measurer = Measurer::for_document(window, doc_font.clone());
-        let sheet = self.run_styles.borrow_mut().current(self.pkg.as_ref()).1;
-        let tbl = TableCtx::new(self.pkg.as_ref(), sheet, false);
+        let parts = self.run_styles.borrow_mut().parts(self.pkg.as_ref());
+        let tbl = TableCtx::new(self.pkg.as_ref(), parts, false);
         let pics = self
             .pkg
             .as_ref()
@@ -1797,6 +1797,8 @@ impl Render for DocView {
             inks: None,
             // Its pictures' painted bounds, for the harness (#1963).
             pictures: harness().then_some(&self.pictures_painted),
+            siblings: None,
+            block_gap: 0.0,
         };
         let scroll_area = match self.layout {
             DocLayout::Print => {
@@ -1844,6 +1846,7 @@ impl Render for DocView {
                     .map(|(i, b)| {
                         let ctx = RenderCtx {
                             gap_below: flow_gap_below(body, i),
+                            siblings: Some((body, 0)),
                             ..ctx
                         };
                         block_el(b, vec![i], markers[i].as_deref(), ctx)
@@ -2162,7 +2165,9 @@ fn print_sheets(
     let sections = editor.sections();
     let body = &editor.doc.body;
     let (zoom, pal, meas) = (ctx.zoom, ctx.pal, ctx.meas);
-    let sheet = ctx.tbl.sheet.as_deref();
+    // Headers and footers draw with the body's styles, numbering and theme
+    // colours (#2231).
+    let styler = ctx.tbl.styler();
     let tw = move |t: i32| px(zoom * (t.max(0) as f32) / 15.0);
     // A page's column fits its tables and lays its paragraphs out as a
     // document tab's Print Layout does: no flow spacing, no fitted width.
@@ -2205,7 +2210,7 @@ fn print_sheets(
                     pal,
                     meas,
                     hf_w,
-                    sheet,
+                    styler,
                     pictures::scope(pics, plan.part(pi, is_h)),
                     vals,
                 )
@@ -2281,7 +2286,7 @@ fn print_sheets(
                     let r = docxcore::frame::frame_rect(
                         g.frame,
                         &geom,
-                        frame_content_w(g, meas, zoom, sheet, vals),
+                        frame_content_w(g, meas, zoom, styler.sheet, vals),
                         g.content_h(),
                     );
                     let width = zoom * r.w.max(0) as f32 / 15.0;
@@ -2292,7 +2297,7 @@ fn print_sheets(
                             meas,
                             width,
                             zoom,
-                            sheet,
+                            styler,
                             pictures::scope(pics, plan.part(pi, is_h)),
                             vals,
                         )
@@ -2468,9 +2473,12 @@ fn painted_lines(para: &PaintedPara) -> Vec<LaidLine> {
     lines
 }
 
-/// The harness's `ext-doc-layout` and `doc`'s `flow.layout` (#1986) of
-/// the paragraphs a frame painted (`paras`): per paragraph its block, top and height,
-/// its text's left (`text_x`), its list number and its lines, px rounded,
+/// The harness's `ext-doc-layout` and `doc`'s `flow.layout` (#1986) and
+/// `page.layout` (#2231) of the paragraphs a frame painted (`paras`): per
+/// paragraph its block, top and height, its text's left (`text_x`) and its
+/// row's bottom (`text_bottom`), its border sides (`borders`: side, x, y,
+/// width, gap to the text, colour) and highlighted runs (`highlights`:
+/// text, fill, ink), its list number (with its `family`) and its lines, px rounded,
 /// x from the text column's left (`column_x`) and y from the first
 /// paragraph's top; `marker_matches_text` (the number's ink is its first
 /// line's) and `marker_fits` (it ends left of the text), null without a
@@ -2512,11 +2520,65 @@ pub(crate) fn painted_layout_json(paras: &[PaintedPara], column_x: f32) -> ctlco
             let fits = marker.as_ref().map_or(Json::Null, |(_, _, right)| {
                 Json::Bool(text_x.is_some_and(|t| right.round() <= t.round()))
             });
+            // Its text row and border sides (#2231), from the paragraph's
+            // top, the text column's left; each border's `gap` is its space
+            // to the text (below it for `bottom`, above for `top`).
+            let text = para.text.get();
+            let (text_top, text_bottom) = (
+                f32::from(text.origin.y),
+                f32::from(text.origin.y + text.size.height),
+            );
+            let has_text = f32::from(text.size.height) > 0.0;
+            let borders = para
+                .borders
+                .iter()
+                .map(|b| {
+                    let at = b.at.get();
+                    let (x, y) = (f32::from(at.origin.x), f32::from(at.origin.y));
+                    let gap = match b.side {
+                        "bottom" => y - text_bottom,
+                        "top" => text_top - (y + b.width),
+                        _ => 0.0,
+                    };
+                    Json::obj(vec![
+                        ("side", Json::Str(b.side.into())),
+                        ("x", num(x - column_x)),
+                        ("y", num(y - f32::from(root.origin.y))),
+                        (
+                            "width",
+                            Json::Num((f64::from(b.width) * 100.).round() / 100.),
+                        ),
+                        ("gap", num(gap)),
+                        ("color", Json::Str(format!("{:06x}", b.color))),
+                    ])
+                })
+                .collect();
+            let highlights = para
+                .highlights
+                .iter()
+                .map(|(text, fill, ink)| {
+                    Json::obj(vec![
+                        ("text", Json::Str(text.clone())),
+                        ("fill", Json::Str(format!("{fill:06x}"))),
+                        ("ink", Json::Str(format!("{ink:06x}"))),
+                    ])
+                })
+                .collect();
             Json::obj(vec![
                 ("block", Json::Num(para.block as f64)),
                 ("top", num(top)),
                 ("height", num(f32::from(root.size.height))),
                 ("text_x", text_x.map_or(Json::Null, num)),
+                (
+                    "text_bottom",
+                    if has_text {
+                        num(text_bottom - f32::from(root.origin.y))
+                    } else {
+                        Json::Null
+                    },
+                ),
+                ("borders", Json::Arr(borders)),
+                ("highlights", Json::Arr(highlights)),
                 (
                     "marker",
                     marker.map_or(Json::Null, |(m, x, right)| {
@@ -2526,6 +2588,12 @@ pub(crate) fn painted_layout_json(paras: &[PaintedPara], column_x: f32) -> ctlco
                             ("right", num(right)),
                             ("size", num(m.size)),
                             ("color", Json::Str(ink_hex(m.ink))),
+                            (
+                                "family",
+                                m.family
+                                    .as_ref()
+                                    .map_or(Json::Null, |f| Json::Str(f.to_string())),
+                            ),
                         ])
                     }),
                 ),
@@ -3155,6 +3223,7 @@ pub(crate) fn word_face_json(
             sheet,
             cell: None,
             pstyle: p.props.style_id.as_deref(),
+            ..Default::default()
         };
         let shown = styler.shown(r);
         Some((shown.bold, shown.italic))
@@ -3242,6 +3311,7 @@ mod tests {
                     size: 16.,
                     ink,
                     at: at(122., 128., 13., 18.),
+                    family: None,
                 }),
                 runs: vec![PaintedRun {
                     off: 0,
@@ -3251,6 +3321,9 @@ mod tests {
                     text: "Item one wraps".into(),
                 }],
                 words,
+                text: UnitCell::default(),
+                borders: Vec::new(),
+                highlights: Vec::new(),
             },
             PaintedPara {
                 block: 1,
@@ -3258,6 +3331,9 @@ mod tests {
                 marker: None,
                 runs: Vec::new(),
                 words: WordSpans::default(),
+                text: UnitCell::default(),
+                borders: Vec::new(),
+                highlights: Vec::new(),
             },
         ];
         let j = painted_layout_json(&paras, 100.);

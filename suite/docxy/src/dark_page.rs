@@ -150,6 +150,42 @@ pub(crate) fn fill(rgb: u32) -> u32 {
     }
 }
 
+/// A highlight's gain over black for a run of its own colour (#2231): Word's
+/// dark mode draws a yellow highlight under `#212121` text as `#3C3C00`.
+const HIGHLIGHT_GAIN: u32 = 0x3C;
+/// A highlight's base and gain for a run of automatic colour (#2231): Word's
+/// dark mode draws a yellow highlight under automatic text as `#49492B`.
+const HIGHLIGHT_AUTO_BASE: u32 = 0x2B;
+const HIGHLIGHT_AUTO_GAIN: u32 = 0x1E;
+/// Automatic text on a highlight on a dark page, as Word draws it (#2231).
+pub(crate) const HIGHLIGHT_AUTO_INK: u32 = 0xF5F5F5;
+
+/// The colour a highlight of colour `rgb` draws in on a dark page (#2231),
+/// fitted to two pixels measured in Word for the web's dark mode, so it
+/// differs by the run's ink: under a run of its own colour each channel is
+/// scaled toward black (`c × 0x3C/0xFF`: yellow `#3C3C00`); under automatic
+/// text (`auto`) it is the affine `0x2B + c × 0x1E/0xFF` (yellow `#49492B`).
+/// Both keep every highlight's hue and their order; the other 15 names are
+/// derived by the same rule, not measured.
+pub(crate) fn highlight(rgb: u32, auto: bool) -> u32 {
+    let (base, gain) = if auto {
+        (HIGHLIGHT_AUTO_BASE, HIGHLIGHT_AUTO_GAIN)
+    } else {
+        (0, HIGHLIGHT_GAIN)
+    };
+    let ch = |shift: u32| base + (((rgb >> shift) & 0xFF) * gain + 127) / 255;
+    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}
+
+/// The ink of a highlighted run on a dark page (#2231) on its mapped
+/// highlight `fill` ([`highlight`]): automatic text (`run` `None`) is
+/// [`HIGHLIGHT_AUTO_INK`] where it reads, and a run's own colour is moved as
+/// [`text`] moves it (`#212121` on `#3C3C00` becomes `#DEDEDE`; Word's
+/// `#DDDDDD`). Either way it reads at [`TEXT_FLOOR`].
+pub(crate) fn highlight_ink(run: Option<u32>, fill: u32) -> u32 {
+    text(run.unwrap_or(HIGHLIGHT_AUTO_INK), fill)
+}
+
 /// The colour a Print Layout sheet draws in on a dark page: [`PAGE_DARK`],
 /// or the document's page colour mapped as a fill (a gold page stays gold, a
 /// pastel one is darkened).
@@ -373,6 +409,63 @@ pub(crate) fn border(rgb: Option<u32>, ground: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2231: the measured pixels of Word for the web's dark mode, a yellow
+    /// highlight under explicit `#212121` text and under automatic text.
+    #[test]
+    fn a_yellow_highlight_maps_to_words_measured_dark_colours() {
+        assert_eq!(highlight(0xFFFF00, false), 0x3C3C00);
+        assert_eq!(highlight(0xFFFF00, true), 0x49492B);
+        assert_eq!(highlight_ink(None, 0x49492B), 0xF5F5F5);
+        let ink = highlight_ink(Some(0x212121), 0x3C3C00);
+        let word = 0xDDDDDD_u32;
+        for shift in [16, 8, 0] {
+            let (a, b) = ((ink >> shift) & 0xFF, (word >> shift) & 0xFF);
+            assert!(a.abs_diff(b) <= 1, "{ink:06X} vs Word's {word:06X}");
+        }
+    }
+
+    /// #2231: every highlight name, under explicit `#212121` and under
+    /// automatic text: fill and ink pinned, each ink at least 4.5:1 on its
+    /// fill, and each fill keeps its highlight's hue order (derived by the
+    /// measured rule, not measured).
+    #[test]
+    fn every_highlight_name_has_a_dark_fill_and_a_readable_ink() {
+        let table = [
+            ("yellow", 0x3C3C00, 0x49492B),
+            ("green", 0x003C00, 0x2B492B),
+            ("cyan", 0x003C3C, 0x2B4949),
+            ("magenta", 0x3C003C, 0x492B49),
+            ("blue", 0x00003C, 0x2B2B49),
+            ("red", 0x3C0000, 0x492B2B),
+            ("darkYellow", 0x1E1E00, 0x3A3A2B),
+            ("darkGreen", 0x001E00, 0x2B3A2B),
+            ("darkCyan", 0x001E1E, 0x2B3A3A),
+            ("darkMagenta", 0x1E001E, 0x3A2B3A),
+            ("darkBlue", 0x00001E, 0x2B2B3A),
+            ("darkRed", 0x1E0000, 0x3A2B2B),
+            ("lightGray", 0x2D2D2D, 0x424242),
+            ("darkGray", 0x1E1E1E, 0x3A3A3A),
+            ("black", 0x000000, 0x2B2B2B),
+            ("white", 0x3C3C3C, 0x494949),
+        ];
+        for (name, explicit, auto) in table {
+            let (r, g, b) = docxcore::highlight::highlight_rgb(name).expect(name);
+            let rgb = u32::from_be_bytes([0, r, g, b]);
+            assert_eq!(highlight(rgb, false), explicit, "{name} explicit");
+            assert_eq!(highlight(rgb, true), auto, "{name} automatic");
+            let ink = highlight_ink(Some(0x212121), explicit);
+            assert_eq!(ink, 0xDEDEDE, "{name} explicit ink");
+            assert_eq!(highlight_ink(None, auto), HIGHLIGHT_AUTO_INK, "{name}");
+            assert!(contrast(ink, explicit) >= TEXT_FLOOR, "{name}");
+            assert!(contrast(HIGHLIGHT_AUTO_INK, auto) >= TEXT_FLOOR, "{name}");
+            // Any run colour reads too.
+            for run in [0xFF0000, 0x0000FF, 0x00FF00, 0xFFFF00, 0x000000] {
+                let ink = highlight_ink(Some(run), explicit);
+                assert!(contrast(ink, explicit) >= TEXT_FLOOR, "{name} {run:06X}");
+            }
+        }
+    }
 
     fn hue_gap(a: f32, b: f32) -> f32 {
         let d = (a - b).rem_euclid(360.0);

@@ -573,8 +573,11 @@ fn the_rulers_indents_follow_the_open_header() {
     let mut t = three_sections("ruler-indent", true);
     edit_at(&mut t, 0, true);
     t.hf_edit.as_mut().unwrap().editor.set_indent(720, 0);
-    let header = eff_indent(&t.hf_edit.as_ref().unwrap().editor.caret_para_props());
-    let body = eff_indent(&ed(&t).caret_para_props());
+    let header = eff_indent(
+        &t.hf_edit.as_ref().unwrap().editor.caret_para_props(),
+        Inherited::NONE,
+    );
+    let body = eff_indent(&ed(&t).caret_para_props(), Inherited::NONE);
     assert_ne!(header, body);
     assert_eq!(ruler_para_of(&t).0, header);
     // The drag starts from the same indents.
