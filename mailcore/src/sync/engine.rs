@@ -159,9 +159,11 @@ pub enum SyncCommand {
     /// stay as they were, with no `SignInRequired`. Its `Error` comes
     /// first, then the current `State` again, even though unchanged, so a
     /// client knows the engine is back where it was. A client that clears
-    /// its error notice on a `State` should keep this one. With a token
-    /// held there is no #2218 fallback to `AuthConfig::scope` alone: the
-    /// token already has it.
+    /// its error notice on a `State` should keep this one. While the held
+    /// token is known to hold every scope of `AuthConfig::scope` there is
+    /// no #2218 fallback to `AuthConfig::scope` alone: it would ask for
+    /// nothing the token lacks. A token lacking one, or whose grant is not
+    /// known, falls back as a signed-out sign-in does.
     SignIn,
     /// Ask the secret store for the saved sign-in once more, on the
     /// person's request (#2167), while it is unavailable
@@ -9978,9 +9980,11 @@ impl Engine {
     /// redirect's or the code redemption's, [`auth::is_consent_refusal`])
     /// and the optional scopes add a scope, the second asks
     /// `AuthConfig::scope` alone, with no `Error` for the first refusal
-    /// (#2218). With a token held (a re-consent, #2213) there is no
-    /// second attempt: the token already has `AuthConfig::scope`, so a
-    /// refusal is a failure like any other. A token from either runs the
+    /// (#2218). With a token held that is known to hold every scope of
+    /// `AuthConfig::scope` (a re-consent for the optional ones, #2213,
+    /// [`Engine::token_holds_required_scope`]) there is no second
+    /// attempt: it would ask for nothing the token lacks, so a refusal is
+    /// a failure like any other. A token from either runs the
     /// redeem + cache-save + resync path unchanged from Task 11; any other
     /// failure, or the second attempt's, is `Error("sign-in failed: …")`
     /// and [`Engine::sign_in_failed`] (which keeps a held token, #2213). A
@@ -9990,9 +9994,10 @@ impl Engine {
     /// `SignInStarted` went out and the client must hear the sign-in ended.
     fn sign_in(&mut self) {
         let full = auth::sign_in_scope(&self.config.cfg);
-        // Only a signed-out sign-in whose optional scopes add a scope can
-        // fall back (#2213: a held token already has the required scope).
-        let can_fall_back = full != self.config.cfg.scope && self.token.is_none();
+        // Only a sign-in whose optional scopes add a scope can fall back,
+        // and not one whose held token already has every required scope
+        // (#2213): `scope` alone would ask for nothing it lacks.
+        let can_fall_back = full != self.config.cfg.scope && !self.token_holds_required_scope();
         let mut attempt = self.sign_in_attempt(&full, can_fall_back);
         let mut fell_back = false;
         if let SignInAttempt::Failed { consent: true, .. } = attempt
@@ -10019,7 +10024,9 @@ impl Engine {
                 // surface as-is. `sign_in_failed` lets the UI offer another
                 // attempt rather than leaving the engine silently stuck:
                 // sign-in-required again, or, while a saved sign-in waits
-                // for its store (#2167), that wait announced again.
+                // for its store (#2167), that wait announced again, or,
+                // with a token held, the current state again, the session
+                // kept (#2213).
                 self.emit(SyncEvent::Error(format!("sign-in failed: {text}")));
                 self.sign_in_failed();
                 return;
@@ -10160,6 +10167,17 @@ impl Engine {
         } else {
             self.enter_signin(SignInReason::SignInFailed);
         }
+    }
+
+    /// Whether a token is held whose grant is known (`TokenSet::scopes`) to
+    /// hold every scope of `AuthConfig::scope` (#2213): a sign-in asking
+    /// `scope` alone would ask it for nothing. No token, or an unknown
+    /// grant, is `false`.
+    fn token_holds_required_scope(&self) -> bool {
+        self.token
+            .as_ref()
+            .and_then(|t| t.scopes.as_ref())
+            .is_some_and(|g| auth::missing_scopes(&self.config.cfg.scope, g).is_empty())
     }
 
     /// Sends the current `State` even though unchanged (#2213): a failed
@@ -10503,11 +10521,12 @@ const SIGNIN_RETRY_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-
 /// to, accepts exactly one connection, and extracts the authorization
 /// `code` from its request line — or an error, on a timeout, a malformed
 /// request, a provider-reported `?error=...`, or a `state` that doesn't
-/// match `expected_state` (the anti-CSRF check `begin_auth` set up). Never logs the code or any secret;
-/// the returned `Err` messages are diagnostic text only (parse failures,
-/// the provider's `error` and `error_description` when the redirect's
-/// `state` matches, else only a bare OAuth error code, or "timed out"),
-/// safe to surface via `SyncEvent::Error`.
+/// match `expected_state` (the anti-CSRF check `begin_auth` set up).
+/// Never logs the code or any secret; the returned `Err` messages are
+/// diagnostic text only (parse failures, the provider's `error` and
+/// `error_description` when the redirect's `state` matches, else only a
+/// bare OAuth error code, or "timed out"), safe to surface via
+/// `SyncEvent::Error`.
 ///
 /// Uses a non-blocking `accept` polled against a deadline rather than a
 /// dedicated timeout API (std's `TcpListener` has none) — simple, and the
@@ -18349,6 +18368,113 @@ mod tests {
         assert_offline_session_kept(&engine, retry, check);
         let events: Vec<SyncEvent> = evt_rx.try_iter().collect();
         assert_eq!(events, vec![SyncEvent::State(SyncState::Offline)]);
+        drop(cmd_tx);
+    }
+
+    /// [`optional_cfg`] whose `scope` gained `Mail.Send`, which a token
+    /// granted [`SEEDED`] lacks (#2213 r1).
+    fn send_added_cfg() -> AuthConfig {
+        AuthConfig {
+            scope: "Mail.ReadWrite Mail.Send offline_access".into(),
+            ..optional_cfg()
+        }
+    }
+
+    /// r1: a held token that lacks a required scope still falls back, as
+    /// `scope` alone is what would get it; the fallback's token replaces
+    /// the one held.
+    #[test]
+    fn a_refused_re_consent_falls_back_when_the_token_lacks_a_required_scope() {
+        let cfg = send_added_cfg();
+        let grant = "https://graph.microsoft.com/Mail.ReadWrite https://graph.microsoft.com/Mail.Send offline_access";
+        let (handle, dir, token_path, srv) = token_held_engine(
+            "held-falls-back",
+            with_probe(
+                vec![
+                    token_route(&format!(
+                        r#"{{"access_token":"AT2","refresh_token":"RT2","expires_in":3600,"scope":"{grant}"}}"#
+                    )),
+                    empty_folders_route(200),
+                ],
+                "ROOT",
+            ),
+            cfg.clone(),
+            SIGNIN_TIMEOUT,
+        );
+        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+        let first = play_sign_in_started(&handle, consent_required);
+        assert_eq!(first.started.scope, auth::sign_in_scope(&cfg));
+        assert!(
+            first.response.contains("signing in again"),
+            "{}",
+            first.response
+        );
+        let second = play_sign_in_started(&handle, code_redirect);
+        assert_eq!(second.started.scope, cfg.scope);
+        assert!(
+            !second
+                .started
+                .events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::Error(_)) || signs_out(std::slice::from_ref(e))),
+            "{:?}",
+            second.started.events
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(sign_in_errors(&events).is_empty(), "{events:?}");
+        assert_eq!(asked_scopes(&srv), vec![cfg.scope.clone()]);
+        assert_eq!(saved_access_token(&token_path), "AT2");
+        finish(handle, dir);
+    }
+
+    /// r1: that fallback refused too keeps the session as well.
+    #[test]
+    fn a_refused_fallback_with_a_token_held_keeps_it() {
+        let (handle, dir, token_path, srv) = token_held_engine(
+            "held-fallback-refused",
+            vec![empty_folders_route(200)],
+            send_added_cfg(),
+            SIGNIN_TIMEOUT,
+        );
+        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+        let first = play_sign_in_started(&handle, consent_required);
+        assert!(
+            first.response.contains("signing in again"),
+            "{}",
+            first.response
+        );
+        let second = play_sign_in_started(&handle, consent_declined);
+        assert!(
+            second.response.contains("sign-in failed"),
+            "{}",
+            second.response
+        );
+        keeps_the_token(
+            &handle,
+            &srv,
+            &token_path,
+            &second.started,
+            Some(
+                "sign-in failed: authorization denied: access_denied: AADSTS65004: User declined to consent to access the app.",
+            ),
+        );
+        assert_eq!(token_requests(&srv), 0);
+        finish(handle, dir);
+    }
+
+    /// r1: only a token known to hold every required scope turns the
+    /// fallback off; no token, or an unknown grant, keeps it.
+    #[test]
+    fn token_holds_required_scope_only_for_a_known_full_grant() {
+        let (mut engine, _evt_rx, cmd_tx) = offline_session();
+        assert!(engine.token_holds_required_scope(), "SEEDED holds test_cfg");
+        engine.config.cfg = send_added_cfg();
+        assert!(!engine.token_holds_required_scope(), "Mail.Send missing");
+        engine.config.cfg = test_cfg();
+        engine.token.as_mut().unwrap().scopes = None;
+        assert!(!engine.token_holds_required_scope(), "an unknown grant");
+        engine.token = None;
+        assert!(!engine.token_holds_required_scope(), "no token");
         drop(cmd_tx);
     }
 
