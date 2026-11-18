@@ -5489,8 +5489,8 @@ person declines the consent screen), so mail stopped until an administrator cons
   - `NotStarted`: no listener; its `Error` is already sent;
   - `Failed { text, consent }`.
 
-  A second attempt, asking `cfg.scope`, runs exactly when the first is `Failed { consent: true }`
-  and `full != cfg.scope`. It has a new port, PKCE and `state`, and no `Error` is sent for the
+  A second attempt, asking `cfg.scope`, runs exactly when the first is `Failed { consent: true }`,
+  `full != cfg.scope` and no token is held (#2213: a re-consent's token already has `cfg.scope`). It has a new port, PKCE and `state`, and no `Error` is sent for the
   first refusal: one `SignIn` then sends two `SignInStarted`. `Signed` from either attempt runs
   the success block as before (the token saved, `announce_scopes`, a pass). A first
   `NotStarted` is `sign_in_not_started()`, as before. A second `NotStarted`, whose `Error` is
@@ -5528,10 +5528,8 @@ person declines the consent screen), so mail stopped until an administrator cons
   #2167). Nothing remembers that a tenant refuses the optional scopes: every `SignIn` asks both
   lists again, and falls back at most once. While the second attempt waits (up to
   `SIGNIN_TIMEOUT`), commands queue, as during the first. A `SignIn` while signed in (the
-  re-consent case) whose fallback is refused too signs the working session out
-  (`sign_in_failed` then `enter_signin`): that is what any failed `SignIn` did before, not a
-  #2218 regression. lookxy opens the browser on each `SignInStarted`, so a second one works
-  there.
+  re-consent case) no longer falls back, and its failure keeps the session (#2213, below).
+  lookxy opens the browser on each `SignInStarted`, so a second one works there.
 - Tests:
   - `auth::tests`: `sign_in_scope_appends_optional_once`,
     `begin_auth_asks_both_lists_and_redeem_asks_what_was_authorized`, `consent_refusal_rule`,
@@ -5630,3 +5628,42 @@ infers it.
     `RetrySavedSignIn`), `cache_without_cloud_field_still_starts_global`
     (`tokencache::write_raw` writes the old JSON).
   - lookxy: `signin_reason_text_says_each_reason` covers `OtherCloud`.
+
+## A failed sign-in with a token held (#2213)
+
+A client may send `SyncCommand::SignIn` while the engine holds a working token, to ask the
+person to consent to the scopes the token lacks (`missing` in `Scopes`). Before #2213 every
+failure of that sign-in signed the session out (`sign_in_failed` → `enter_signin`), and
+`sign_in_not_started` set `State(SignInRequired)` while keeping the token.
+
+- **Failure keeps the session** (`Engine::sign_in_failed`, `sign_in_not_started`). The checks
+  run in order: a saved sign-in waiting for its store (#2167, no token then) is announced again
+  as before; then a token held → `resend_state()`; else signed out as before (`enter_signin`, or
+  `set_state(SignInRequired)` when the sign-in never started). `resend_state` emits
+  `State(self.state)` even when unchanged (`set_state` only emits changes). Nothing on the
+  failure path touches `self.state` or the session, so the token, the announced scopes, the
+  back-off (`next_retry`, `backoff`), `refused_refresh`, `check_retry` and the per-session caches
+  (`masters_not_found`, `user_ids`) stay as they were. The `Error` ("sign-in failed: …", or
+  "could not open sign-in listener: …" for one that never started) comes first, then the
+  `State`.
+- **No fallback with a token held.** `can_fall_back` also needs `self.token.is_none()`. A second
+  tab asking `cfg.scope` alone, which the token already has, would help nobody: closing it waits
+  `SIGNIN_TIMEOUT`, and completing it replaces the token with one no wider and owes a mailbox
+  check (#1946). So the first tab of a token-held sign-in gets the plain error page.
+- **Clients.** lookxy clears its error notice on `State(Idle)` (`App::on_sync_event`), so an
+  `Error` followed by the re-sent `State(Idle)` would show nothing. That cannot happen today:
+  lookxy sends `SignIn` only from its signed-out modals. A client that adds a re-consent must
+  keep the error past that `State`. The `SyncCommand::SignIn` doc says so.
+- **The test timeout.** `EngineOptions::signin_timeout` is a `#[cfg(test)]` field (default
+  `SIGNIN_TIMEOUT`); `listen_for_code` takes the timeout, and `Engine::signin_timeout()` passes
+  the const outside tests. Dependent crates build mailcore without `cfg(test)` and never see it.
+- **Not done.** What a successful re-consent does is unchanged: the token is replaced and a
+  mailbox check is owed (#1946).
+- Tests (`sync::engine::tests`): `a_refused_sign_in_with_a_token_held_keeps_it`,
+  `a_failed_redeem_with_a_token_held_keeps_it`, `a_timed_out_sign_in_with_a_token_held_keeps_it`
+  (a 300 ms `signin_timeout`), `a_refused_re_consent_with_a_token_held_does_not_fall_back`
+  (helpers `token_held_engine`, `keeps_the_token`: exactly `[Error, State(Idle)]`, then a
+  `Refresh` whose folder list carries `Bearer AT`, and `AT` still saved);
+  `sign_in_not_started_with_a_token_held_keeps_the_session`,
+  `sign_in_failed_with_a_token_held_keeps_the_session` (a direct `Engine`, `Offline` with a
+  back-off and filled caches: all kept, only `State(Offline)` sent).
