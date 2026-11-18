@@ -632,7 +632,8 @@ impl DocView {
     /// read-only view places a caret and selects too; only an editable view
     /// runs the link commands.
     pub fn caret_format(&self) -> CaretFormat {
-        edit::caret_format(&self.editor)
+        let parts = self.run_styles.borrow_mut().parts(self.pkg.as_ref());
+        edit::caret_format(&self.editor, ListIds::of(parts.numbering.as_deref()))
     }
 
     /// The document as it is now, edits included: what the host exports.
@@ -1731,7 +1732,7 @@ impl Render for DocView {
             .map(|pkg| pictures::Pictures::new(pkg, &self.pictures));
         let spans = self.editor.selection_spans();
         let body = &self.editor.doc.body;
-        let markers = list_markers(body);
+        let markers = list_markers(body, tbl.numbering.as_deref());
         let target = DocTarget::Embed(cx.entity().downgrade(), self.words.clone());
         // Editable, the caret draws while the view has the keys (#1947),
         // not while the Find box's field has them (#1887).

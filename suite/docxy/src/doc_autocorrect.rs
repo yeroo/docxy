@@ -33,14 +33,23 @@ fn options(ac: &AutoCorrect) -> AutoCorrectOptions {
     }
 }
 
-/// Type one key into the Word editor with the app's AutoCorrect.
-pub(crate) fn type_key(ed: &mut Editor, ac: &AutoCorrect, ch: char) {
+/// Type one key into the Word editor with the app's AutoCorrect, its `* `
+/// and `1. ` lists the document's `lists` (#2087). The kind of a list it
+/// started (`true`: bullets), for the caller to define in the package
+/// (`ListIds::define`).
+pub(crate) fn type_key(
+    ed: &mut Editor,
+    ac: &AutoCorrect,
+    ch: char,
+    lists: crate::ListIds,
+) -> Option<bool> {
+    let mut started = None;
     ed.type_autocorrected(ch, &options(ac), &Shared(ac), &mut |kind| {
-        Some(match kind {
-            ListKind::Bullet => crate::NUM_BULLET,
-            ListKind::Decimal => crate::NUM_DECIMAL,
-        })
+        let bullet = kind == ListKind::Bullet;
+        started = Some(bullet);
+        Some(lists.id(bullet))
     });
+    started
 }
 
 #[cfg(test)]
@@ -65,7 +74,7 @@ mod tests {
     fn typed(ac: &AutoCorrect, s: &str) -> String {
         let mut ed = empty();
         for ch in s.chars() {
-            type_key(&mut ed, ac, ch);
+            type_key(&mut ed, ac, ch, crate::ListIds::OWN);
         }
         text(&ed)
     }
@@ -103,28 +112,28 @@ mod tests {
         let ac = AutoCorrect::default();
         let mut ed = empty();
         for ch in "* ".chars() {
-            type_key(&mut ed, &ac, ch);
+            type_key(&mut ed, &ac, ch, crate::ListIds::OWN);
         }
         assert!(ed.all_in_list(crate::NUM_BULLET));
         let mut ed = empty();
         for ch in "1. ".chars() {
-            type_key(&mut ed, &ac, ch);
+            type_key(&mut ed, &ac, ch, crate::ListIds::OWN);
         }
         assert!(ed.all_in_list(crate::NUM_DECIMAL));
         // Word also starts a list on a hyphen and on `1)` (#1080).
         let mut ed = empty();
         for ch in "- foo".chars() {
-            type_key(&mut ed, &ac, ch);
+            type_key(&mut ed, &ac, ch, crate::ListIds::OWN);
         }
         assert!(ed.all_in_list(crate::NUM_BULLET));
         let mut ed = empty();
         for ch in "1) ".chars() {
-            type_key(&mut ed, &ac, ch);
+            type_key(&mut ed, &ac, ch, crate::ListIds::OWN);
         }
         assert!(ed.all_in_list(crate::NUM_DECIMAL));
         let mut ed = empty();
         for ch in "x- ".chars() {
-            type_key(&mut ed, &ac, ch);
+            type_key(&mut ed, &ac, ch, crate::ListIds::OWN);
         }
         assert!(!ed.all_in_list(crate::NUM_BULLET));
     }

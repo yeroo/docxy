@@ -8,6 +8,35 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   `w:numId="0"` is "no numbering" (render, PDF, Markdown, RTF, AutoFormat,
   the suite's markers and new-document base). The serializer still writes
   the 0 (it cancels a style's numbering) and compare's merge keeps it.
+- The suite's markers (`list_markers`, #2087): a list the package's
+  numbering part defines (`Numbering::defines`) is numbered or bulleted as
+  its level's `w:numFmt` says (bullet: "•"/"◦", any other: a counted
+  "N. "), so a Word document's numId 1 decimal list is numbered; a list no
+  part defines keeps docxy's own rule (numId 2, `NUM_DECIMAL`, numbered,
+  the rest bulleted), for its lists before the first save writes their
+  definitions (1 bullets, 2 decimals, so they draw the same after it).
+  Numbers count per list within the body, numIds on one abstract sharing a
+  count (`ListKey`, `Numbering::abstract_of`, r2), as `compute_markers`
+  and Word count them, and a deeper level, a bullet one included, restarts
+  only the levels below it (r1). The view's own rule, not Word's: every
+  count restarts after a paragraph that is not a list item (docxy's own
+  lists share numId 1 and 2); in a table they count on from cell to cell
+  (`TableListCounts`, `docs/claude/suite-document.md` §#2087). Not done:
+  `w:lvlOverride` / `w:startOverride` restarts.
+- The lists Bullets, Numbers, AutoCorrect's `* ` / `1. ` and another app's
+  pasted list items (r3, `doc_paste::numbering_for_paste`) apply
+  (`ListIds`, #2087 r1): docxy's own 1 and 2 in a document with no
+  numbering part or one whose part defines that id as the same kind at
+  level 0; else (the part defines it as the other kind, or leaves it
+  undefined, r2: `add_markdown_numbering` never touches an existing part,
+  so nothing would define it) `Package::ensure_list`'s 9990 / 9991. The
+  command defines its list in the package first (`ListIds::define`:
+  `ensure_list`, or for 1 and 2 `add_markdown_numbering` on a package
+  with no part; AutoCorrect after the key that started the list), so the
+  next frame's `run_look` cache sees it. The pressed
+  states ask for the same ids (the suite's `act_active`, `ext::DocView`'s
+  `caret_format`), and F4 repeats the list applied (`Repeat::List`). The
+  definition is a part write, not an undo step: an Undo leaves it unused.
 - `Editor::change_indent`: a list item with a direct left indent that
   reaches 0 writes `w:left="0"` (`ParProps::pin_left_indent_zero`,
   idempotent, attribute order kept), so the level's indent does not come

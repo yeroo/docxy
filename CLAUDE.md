@@ -38,7 +38,8 @@ issue number to find its notes.
   imported mail: exact spacing and line height, list numbers in the mark's look, the
   layout dump (#1986), nested tables widening their fitted cells and wide pictures
   scaled to the room (#1963), list level and style indents drawn, HTML
-  import's pinned list indents (#2231).
+  import's pinned list indents (#2231), list markers from the numbering
+  part, counted across a table's cells (#2087).
 - `docs/claude/suite-document.md`: before changing the suite's document tab: save-as
   names (#807), Home Font / Font Size boxes (#1361), File > Info Properties (#1364), the
   comment editor (#1362), inline pictures (#1432), run styles (#1427), font substitution
@@ -49,7 +50,9 @@ issue number to find its notes.
   shared key map (#2116), unnamed runs in the document's theme font and a
   family with a real bold face (#1972), dark-page highlights, paragraph
   borders and their grouping, Segoe UI's substitutes (#2231), comment
-  balloons shown on open, resolved hidden, no inline glyph (#2232).
+  balloons shown on open, resolved hidden, no inline glyph (#2232), cell
+  list numbers, All caps and Small caps drawn, Table Styles tiles on a
+  dark page, Switch Modes not persisted (#2087).
 - `docs/claude/pdf-export.md`: before changing PDF export: embedded fonts (#1508),
   borders, picture watermarks and unequal columns (#797).
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),
@@ -65,7 +68,7 @@ issue number to find its notes.
   document copy (#1074), sheet HTML tables (#1248), the X11 clipboard and a document
   paste of HTML (#1950), a test X client's last request (#2008), HTML and RTF on
   Wayland through the suite's patched gpui_linux (#1966), another app's lists
-  kept by a document paste (#1967).
+  kept by a document paste (#1967), in the document's own lists (#2087).
 - `docs/claude/macos.md`: before changing macOS-only behaviour: the menu bar (#1071), ⌘/⌥
   text navigation (#1073).
 - `docs/claude/suite-shell.md`: before changing the suite's window chrome: the start
@@ -84,7 +87,8 @@ issue number to find its notes.
   inset (#1987), its scrollbars (#2080), its Find
   box (#1887), its Print Layout (#1888), an extension's ribbon
   drawn by the suite and the suite's theme (#1870), File backstage pages and CloseTab
-  (#1923), File opened on an extension's own page (#2204).
+  (#1923), File opened on an extension's own page (#2204), Bullets/Numbering
+  on the document's lists (#2087).
 - `docs/claude/ribbon.md`: before changing the ribbon: contributed group launchers
   (#1669), ribbon fit per ribbon (#1020, #1608, #1685, #1763), swatch galleries, their
   sections, More button and KeyTips (#1761, #1762, #1823). A new ribbon command also needs

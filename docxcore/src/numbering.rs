@@ -126,6 +126,14 @@ impl Numbering {
         (ind.left.is_some() || ind.first.is_some()).then_some(ind)
     }
 
+    /// The abstract numbering list `num_id` counts in, a list-style link
+    /// followed; `None` when the numbering does not define it (#2087). Lists
+    /// sharing one abstract share their counts, as [`compute_markers`]
+    /// counts them.
+    pub fn abstract_of(&self, num_id: i32) -> Option<i32> {
+        self.resolve(num_id).map(|(id, _)| id)
+    }
+
     /// Whether the numbering defines list `num_id` (a `w:num` naming an
     /// abstract it has, and a list-style link that resolves).
     pub fn defines(&self, num_id: i32) -> bool {
@@ -598,6 +606,26 @@ pub fn heading_chapters(
 mod tests {
     use super::*;
     use crate::model::{Inline, ParProps, Paragraph, Run, RunProps};
+
+    /// A list's abstract (#2087): the one its `w:num` names, the defining
+    /// one for a list-style link, and none for an undefined list.
+    #[test]
+    fn abstract_of_names_the_abstract_a_list_counts_in_2087() {
+        let num = parse_numbering_xml(
+            r#"<w:numbering>
+            <w:abstractNum w:abstractNumId="5"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum>
+            <w:abstractNum w:abstractNumId="6"><w:styleLink w:val="L"/><w:lvl w:ilvl="0"/></w:abstractNum>
+            <w:abstractNum w:abstractNumId="7"><w:numStyleLink w:val="L"/></w:abstractNum>
+            <w:num w:numId="3"><w:abstractNumId w:val="5"/></w:num>
+            <w:num w:numId="4"><w:abstractNumId w:val="5"/></w:num>
+            <w:num w:numId="8"><w:abstractNumId w:val="7"/></w:num>
+            </w:numbering>"#,
+        );
+        assert_eq!(num.abstract_of(3), Some(5));
+        assert_eq!(num.abstract_of(4), Some(5));
+        assert_eq!(num.abstract_of(8), Some(6));
+        assert_eq!(num.abstract_of(9), None);
+    }
 
     /// #2231: a level's `w:pPr/w:ind`, `w:hanging` as a negative first line;
     /// a level without one, or a list not defined, has none.

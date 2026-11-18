@@ -1240,6 +1240,9 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use docxcore::table::{AutoFit, edit_table_props, new_table};
+        // On a dark page the tiles show the styles as the page draws a table
+        // (#2087), so a tile matches the live preview hovering it shows.
+        let dark = self.page_is_dark();
         let tiles: Vec<AnyElement> = gal
             .items
             .iter()
@@ -1253,21 +1256,16 @@ impl Docxy {
                 });
                 let style = docxcore::table_styles::lookup_style(None, it.preview);
                 let boxes = crate::table_view::layout(&sample, style.as_ref(), None);
-                let ink = hsla_u(0x404040);
-                let side =
-                    |l: Option<crate::table_view::Line>| l.map(|l| l.color.map_or(ink, hsla_u));
                 let rows = boxes.iter().map(|rb| {
                     h_flex().children(rb.cells.iter().map(|cb| {
-                        let mut d = div()
-                            .relative()
-                            .w(px(12.))
-                            .h(px(8.))
-                            .bg(cb.fill.map_or(hsla_u(0xFFFFFF), hsla_u));
+                        let fill = tile_fill(cb.fill, dark);
+                        let mut d = div().relative().w(px(12.)).h(px(8.)).bg(hsla_u(fill));
                         for (k, l) in [cb.top, cb.bottom, cb.left, cb.right]
                             .into_iter()
                             .enumerate()
                         {
-                            if let Some(c) = side(l) {
+                            if let Some(l) = l {
+                                let c = hsla_u(tile_line(l.color, fill, dark));
                                 let line = div().absolute().bg(c);
                                 d = d.child(match k {
                                     0 => line.top_0().left_0().right_0().h(px(1.)),
@@ -1334,7 +1332,11 @@ impl Docxy {
             .rounded(px(3.))
             .border_1()
             .border_color(pal.border)
-            .bg(hsla_u(0xFAFAFA))
+            .bg(hsla_u(if dark {
+                crate::dark_page::PAGE_DARK
+            } else {
+                0xFAFAFA
+            }))
             .children(tiles)
             .child(crate::probe(
                 &self.probes,
@@ -1597,6 +1599,30 @@ impl Docxy {
 /// Builds a table dialog from the edited story's editor.
 pub(crate) type DialogBuilder = fn(&Editor) -> Result<crate::dialog::Dialog, String>;
 
+/// A Table Styles gallery tile's cell colour (#2087): the style's fill, or
+/// white; on a dark page mapped as the document view maps a cell's fill
+/// (`dark_page::fill`: white is the dark page).
+pub(crate) fn tile_fill(fill: Option<u32>, dark: bool) -> u32 {
+    let fill = fill.unwrap_or(0xFFFFFF);
+    if dark {
+        crate::dark_page::fill(fill)
+    } else {
+        fill
+    }
+}
+
+/// A Table Styles gallery tile's line colour (#2087): the style's line
+/// colour (`None`: automatic, a dark grey); on a dark page one that stays
+/// visible on the cell's `ground` as drawn (`dark_page::border`), as the
+/// document view draws a table's borders.
+pub(crate) fn tile_line(color: Option<u32>, ground: u32, dark: bool) -> u32 {
+    if dark {
+        crate::dark_page::border(color, ground)
+    } else {
+        color.unwrap_or(0x404040)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1604,6 +1630,34 @@ mod tests {
     use docxcore::editor::Caret;
     use docxcore::model::Document;
     use docxcore::table::{AutoFit, new_table};
+
+    /// On a dark page the Table Styles tiles draw as the page draws the
+    /// table (#2087): an unfilled cell is the dark page, a light fill is
+    /// darkened, an automatic line is the dark page's grey; a light page
+    /// keeps the authored colours.
+    #[test]
+    fn table_style_tiles_follow_a_dark_page_2087() {
+        use crate::dark_page::{BORDER_DARK, PAGE_DARK};
+        assert_eq!(tile_fill(None, true), PAGE_DARK);
+        assert_eq!(
+            tile_fill(Some(0xDEEAF6), true),
+            crate::dark_page::fill(0xDEEAF6)
+        );
+        assert_ne!(tile_fill(Some(0xDEEAF6), true), 0xDEEAF6);
+        // A vivid header fill is kept, as in the document.
+        assert_eq!(tile_fill(Some(0x4472C4), true), 0x4472C4);
+        assert_eq!(tile_line(None, PAGE_DARK, true), BORDER_DARK);
+        let ground = tile_fill(None, true);
+        assert_eq!(
+            tile_line(Some(0x000000), ground, true),
+            crate::dark_page::border(Some(0x000000), ground)
+        );
+        // A light page: as authored.
+        assert_eq!(tile_fill(None, false), 0xFFFFFF);
+        assert_eq!(tile_fill(Some(0xDEEAF6), false), 0xDEEAF6);
+        assert_eq!(tile_line(None, 0xFFFFFF, false), 0x404040);
+        assert_eq!(tile_line(Some(0x5B9BD5), 0xFFFFFF, false), 0x5B9BD5);
+    }
 
     fn ed_in_table() -> Editor {
         let mut ed = Editor::new(Document {

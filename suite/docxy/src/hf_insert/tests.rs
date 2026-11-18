@@ -577,7 +577,14 @@ fn typing_in_a_header_control_is_one_step_in_each_editor_1433() {
     for c in "2025".chars() {
         let since = docxcore::editor::undo_serial_counter();
         let ed = hf_ed(&mut t);
-        let noted = crate::type_key_text(ed, &repeat, &c.to_string(), &Default::default());
+        let noted = crate::type_key_text(
+            ed,
+            &repeat,
+            &c.to_string(),
+            &Default::default(),
+            crate::ListIds::OWN,
+            &mut None,
+        );
         let recorded = crate::note_edit(ed, &mut repeat, since, noted);
         t.set_dirty();
         crate::keep_current(&mut repeat, recorded);
