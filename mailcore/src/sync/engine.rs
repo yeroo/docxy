@@ -18260,9 +18260,10 @@ mod tests {
         finish(handle, dir);
     }
 
-    /// With a token held, a consent refusal is not followed by a sign-in
-    /// asking `AuthConfig::scope` alone (#2218's fallback): the token
-    /// already has it.
+    /// With a token known to hold every scope of `AuthConfig::scope`
+    /// ([`SEEDED`] here), a consent refusal is not followed by a sign-in
+    /// asking `AuthConfig::scope` alone (#2218's fallback): it would ask
+    /// for nothing the token lacks.
     #[test]
     fn a_refused_re_consent_with_a_token_held_does_not_fall_back() {
         let (handle, dir, token_path, srv) = token_held_engine(

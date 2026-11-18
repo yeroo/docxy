@@ -5530,8 +5530,8 @@ person declines the consent screen), so mail stopped until an administrator cons
   #2167). Nothing remembers that a tenant refuses the optional scopes: every `SignIn` asks both
   lists again, and falls back at most once. While the second attempt waits (up to
   `SIGNIN_TIMEOUT`), commands queue, as during the first. A `SignIn` while signed in (the
-  re-consent case) falls back only when the token lacks a required scope, and its failure
-  keeps the session (#2213, below).
+  re-consent case) falls back only when the token lacks a required scope or its grant is
+  unknown, and its failure keeps the session (#2213, below).
   lookxy opens the browser on each `SignInStarted`, so a second one works there.
 - Tests:
   - `auth::tests`: `sign_in_scope_appends_optional_once`,
