@@ -3053,8 +3053,10 @@ impl Editor {
 
     /// Increase/decrease the indent of the selected paragraphs by `delta`:
     /// the left indent in twips (clamped at 0), except for a list item with
-    /// no left indent attribute of its own (not even `w:left="0"`), which
-    /// steps its level (`ilvl`, clamped to 0..=8) by one.
+    /// a direct `numId` and no left indent attribute of its own (not even
+    /// `w:left="0"`), which steps its level (`ilvl`, clamped to 0..=8) by
+    /// one. An item numbered only through its paragraph style never steps
+    /// its level: it moves its left, as below.
     ///
     /// The level's indent (`left = 720 * (ilvl + 1)`) is what moves such an
     /// item: a direct left indent written here would beat the level's and
@@ -3066,12 +3068,16 @@ impl Editor {
     /// whose paragraph style chain (or `w:pPrDefault`) gives a nonzero left
     /// indent, when its left was loaded: no `w:left` would bring the style's
     /// back (#1815). With no left of its own as drawn (none loaded, pinned
-    /// or set in session), such a paragraph steps from the style's indent
-    /// where that is in twips: an Increase from a 720 style writes
-    /// `w:left="1440"`, a Decrease `w:left="0"`, both pinned (#2231 r3); a
-    /// left of its own, a session one included, steps from itself and pins
-    /// as it moves (r4); over a character-unit style it steps from 0 as
-    /// before. A selection that this would leave as it is
+    /// or set in session), such a paragraph, and a style-numbered item
+    /// whose style gives a left in twips, steps from the style's indent as
+    /// it is drawn (at least 0): an Increase from a 720 style writes
+    /// `w:left="1440"`, a Decrease `w:left="0"`, both pinned (#2231 r3, r5);
+    /// a Decrease over a style left of 0 or less, which would not move it,
+    /// is a no-op. A left of its own, a session one included, steps from
+    /// itself and pins as it moves (r4). Over a character-unit style, or a
+    /// style-numbered item whose style gives no left in twips, it steps
+    /// from its own (in-session) left as before, counting only a loaded one
+    /// as its own (#1792). A selection that this would leave as it is
     /// (level-stepping items at the limit, indents already at 0) changes
     /// nothing and records no undo step.
     pub fn change_indent(&mut self, delta: i32) {
@@ -3109,7 +3115,8 @@ impl Editor {
     /// with none is left to its level's indent, as the dialog passes 0 back
     /// for every item it did not change. An indent written in session counts
     /// as direct here (an explicit request for the margin), unlike for a
-    /// style-numbered item in Decrease Indent. A non-list paragraph whose
+    /// style-numbered item whose style gives no left in twips in Decrease
+    /// Indent. A non-list paragraph whose
     /// style gives a left indent is pinned the same way at 0, and any left
     /// above 0 set on it counts as loaded afterwards, so a later Decrease to
     /// the margin pins too (#1815).

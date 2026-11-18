@@ -599,7 +599,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   `fill`, `ink`) and `borders` (`side`, `x`, `y`, `width`, `gap` to the
   text, `color`). `uiharness/cases/doc-word-compare.uit` runs
   `fixtures/word-compare.docx` (`ext_fixture::word_compare_docx`; the
-  `ext-doc-load` fixture `word-compare` too) light and dark.
+  `ext-doc-load` fixture `word-compare` too) light and dark, on every OS;
+  `doc-word-compare-fonts.uit` (`os linux`) holds what depends on Linux's
+  fonts and pixel grid: the Liberation Sans faces drawn for Arial and
+  Segoe UI, and the Title rule's 6 px (4 pt) gap.
 
 ## Document Find bar keys (#2116)
 
