@@ -2659,6 +2659,45 @@ so the user's other devices follow.
   `@odata.type` and `id`: every one is skipped and counted in `skipped`.
 - lookxy never sends either command; its `on_sync_event` ignores the four events.
 
+## A person's details by address (#2239)
+
+- For a contact card (classic Outlook's card on a sender or recipient): job title, department,
+  office, company and phones of one person, from `/me/people` under `People.Read`, which
+  `AuthConfig::default()` asks for. Only the people the user works with are found; the directory
+  (#1942) needs `User.ReadBasic.All` and has no office, company or phones.
+- `GraphClient::person_details(address)`: `GET /me/people?$search=<v>&$select=
+  PERSON_DETAILS_SELECT&$top=10`, `<v>` = `person_search_value`: `"<address>"`, the address
+  trimmed and escaped as a message search's (`escape_search_text`), the whole value through
+  `encode_path_segment` (`jo@Contoso.com` → `%22jo%40Contoso.com%22`). No `ConsistencyLevel`
+  header: `/me/people` is not a directory query. One page, no `nextLink` followed. The sync
+  pass's own `/me/people?$top=200` (completion, stored in `contacts`) is a different request.
+- `$search` on people is fuzzy (names and addresses alike), so the answer is the **first**
+  returned person `PersonDetails::from_json(v, address)` accepts: one of its
+  `scoredEmailAddresses[].address`, or else its `userPrincipalName`, equals the address, both
+  trimmed, ASCII case ignored. A fuzzy hit is never the answer; none matching is `None`. A blank
+  UPN never matches (Graph sends `""` for a group), nor a blank address.
+- `PersonDetails { name, address, job_title, department, office_location, company_name,
+  business_phones, mobile_phone }`, read leniently (absent, null, not a string or blank is
+  `None`; never a hard error). `name` is `displayName` trimmed, `""` when none. `address` is the
+  matched value as Graph has it (it may differ in case from the asked one, which the event
+  carries). Phones: every `phones[]` entry whose `type` is `business` (ASCII case aside), in
+  order, and the first `mobile`; a blank or non-string number is dropped, every other type
+  (`home`, `businessFax`, `other`, ...) ignored.
+- `SyncCommand::FetchPersonDetails { address }` answers `SyncEvent::PersonDetails { address,
+  person }` (`address` exactly as asked) or `PersonDetailsUnavailable { address, forbidden,
+  reason }`, never `SyncEvent::Error`. `forbidden` is a 403 only. Signed out ("not signed in")
+  or a blank address ("empty address") sends no request. Served at `Engine::checkpoint`, tried
+  during a back-off, not kept at a shutdown, nothing stored, as #1942.
+- Failures are handled as presence's (#2158), not the directory's: a card asks on hover. A 429
+  or 503 sets no `next_retry` (no mail pass held up, a running one not stopped). A 401 still a
+  401 after a refresh that went through signs no one out (the token is fine for mail); unlike
+  presence it is not `forbidden`, which the issue keeps for a 403. A refused refresh is a dead
+  token and signs in, as for any command (`refused_refresh`, reset by `try_refresh`, so it is
+  this command's). Transport goes offline (`react_quietly`); any other status is the event only.
+- lookxy never sends the command; its `on_sync_event` ignores the two events.
+- Out of scope: storing the details, paging, caching, a person's manager (`/users/{id}/manager`
+  needs `User.Read.All`).
+
 ## Message rows by id (#2053)
 
 - `Store::message_row(id)` is a stored message's `MessageRow`, the row
