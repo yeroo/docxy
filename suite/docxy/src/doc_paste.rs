@@ -244,8 +244,8 @@ mod tests {
     }
 
     /// Another app's list paste gives a package without a numbering part
-    /// the one that defines numIds 1 and 2 (#1967); a numbering part of its
-    /// own, a clip without lists or no package changes nothing.
+    /// the one that defines numIds 1 and 2, keeping them (#1967); a second
+    /// paste, a clip without lists or no package changes nothing.
     #[test]
     fn a_list_paste_gives_the_package_its_numbering_1967() {
         use docxcore::package::{Package, new_package};

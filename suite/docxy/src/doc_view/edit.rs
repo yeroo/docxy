@@ -429,8 +429,9 @@ pub(crate) fn paste_source(
 /// view's package ([`pictures::carry`], which reuses a part with the same
 /// bytes), giving a view with none a package first when a picture needs
 /// it; a relationship it adds is none a body picture already names, as
-/// for [`insert_picture`]. Another app's list items give a package without
-/// a numbering part the one that defines their lists (#1967).
+/// for [`insert_picture`]. Another app's list items take the package's own
+/// lists, defined in the package (#1967, #2087:
+/// [`crate::doc_paste::numbering_for_paste`], [`ListIds`]).
 pub(crate) fn paste_clip(
     ed: &mut Editor,
     pkg: &mut Option<Package>,
@@ -646,9 +647,9 @@ fn hex_color(c: &str) -> Option<String> {
 
 /// A host's formatting command on the editor (and, for a list, its
 /// package): the document tab's ribbon command for it, one undo step.
-/// Bullets and Numbering give a package without a numbering part the one
-/// that defines their lists ([`Package::add_markdown_numbering`]), so the
-/// exported package shows them.
+/// Bullets and Numbering toggle the list [`ListIds::of_package`] names, which
+/// [`ListIds::define`] first defines in the package (#2087), so the view and
+/// the exported package show it.
 pub(crate) fn apply_format(ed: &mut Editor, pkg: Option<&mut Package>, f: &DocFormat) -> Formatted {
     // A host command is a step of its own: it never grows the typing run
     // before it (`Docxy::with_editor`).

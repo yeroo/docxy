@@ -155,9 +155,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   `tab_key` / `shift_tab_key`'s document rule, so cells move, Tab types a
   tab and Shift+Tab is Decrease Indent; Tab does not change a list's
   level, as in a document tab), `apply_format` (`apply_doc_act` and the
-  font boxes' calls; Bullets/Numbering toggle with `all_in_list` and give a
-  package without numbering `add_markdown_numbering`, whose ids 1 and 2
-  are `NUM_BULLET`/`NUM_DECIMAL`) and `caret_format` (`caret_props_shown`,
+  font boxes' calls; Bullets/Numbering toggle the document's lists with
+  `all_in_list`, `ListIds::of_package` and `ListIds::define`, #2087: 1 and
+  2, or 9990 / 9991 where the numbering part defines them otherwise or
+  leaves them undefined, `docs/claude/docx-editing.md` §Lists;
+  `apply_doc_act`'s Bullets/Numbers are a no-op) and `caret_format`
+  (`caret_format(ed, lists)`: its list buttons over the same ids;
+  `caret_props_shown`,
   pending toggles included, #854; the caret end's, no mixed state; font,
   size and colour over the seeded styles, `None` only when neither the run
   nor its styles set one).

@@ -82,7 +82,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
 - A `Clip` carries each paragraph's list membership beside its inlines
   (`Clip::list(i)`: `ClipList { num_id, ilvl }`), filled only by `clip_of`
   (`from_rtf`, `from_html`) from the importers' `num_id`/`ilvl`: 1 bullets,
-  2 decimal, the suite's `NUM_BULLET`/`NUM_DECIMAL`, so no remapping. The
+  2 decimal, the suite's `NUM_BULLET`/`NUM_DECIMAL`, which the paste maps
+  to the document's own lists (`numbering_for_paste`, below, #2087). The
   level is clamped to 0..=8 (the HTML importer's nesting is not). `lists`
   stays canonical (`set_lists` drops trailing `None`s), so a clip with no
   list equals `Clip::new`'s, which every other clip is built with: our own
