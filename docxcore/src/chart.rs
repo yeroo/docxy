@@ -35,7 +35,7 @@ impl ChartKind {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct Series {
     pub name: String,
     pub cats: Vec<String>,
@@ -49,8 +49,24 @@ pub struct Chart {
     pub series: Vec<Series>,
 }
 
-// `Inline` derives `Eq`; chart values are f64. Charts come from parsed cached
-// data (never NaN), so treating them as `Eq` is sound for our use.
+/// Values compare bitwise: a cached `<c:v>NaN</c:v>` parses to NaN, and a
+/// chart must still equal itself, or an unedited save never keeps its
+/// document part (#1114). A sign-of-zero difference only reads as a change.
+impl PartialEq for Series {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.cats == other.cats
+            && self.vals.len() == other.vals.len()
+            && self
+                .vals
+                .iter()
+                .zip(&other.vals)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+}
+
+// `Inline` derives `Eq`; chart values are f64, compared bitwise (above), so
+// equality is reflexive even for a NaN.
 impl Eq for Chart {}
 impl Eq for Series {}
 
@@ -226,7 +242,15 @@ fn bar_lines(items: &[(String, f64)], width: usize) -> Vec<String> {
 }
 
 fn pie_lines(ser: &Series, width: usize) -> Vec<String> {
-    let total: f64 = ser.vals.iter().map(|v| v.abs()).sum::<f64>().max(1e-9);
+    // A cached NaN (or infinity) is no share of the pie: it would make the
+    // total NaN, and every finite slice a huge percentage (#1114).
+    let total: f64 = ser
+        .vals
+        .iter()
+        .filter(|v| v.is_finite())
+        .map(|v| v.abs())
+        .sum::<f64>()
+        .max(1e-9);
     let labelw = ser
         .cats
         .iter()
@@ -244,7 +268,7 @@ fn pie_lines(ser: &Series, width: usize) -> Vec<String> {
                 .get(i)
                 .cloned()
                 .unwrap_or_else(|| format!("{}", i + 1));
-            let pct = v.abs() / total;
+            let pct = if v.is_finite() { v.abs() / total } else { 0.0 };
             format!(
                 "{} {:<barw$} {:>5.1}%",
                 fit(&cat, labelw),
@@ -326,6 +350,19 @@ mod tests {
         assert_eq!(c.series[0].vals, [4.6, 2.9, 3.9]);
     }
 
+    /// A cached NaN stays a value (the rendering is unchanged), and the
+    /// chart still equals itself (#1114).
+    #[test]
+    fn nan_cached_value_equals_itself_1114() {
+        let xml = COLUMN.replace("<c:v>2.9</c:v>", "<c:v>NaN</c:v>");
+        let c = parse_chart_xml(&xml).unwrap();
+        assert_eq!(c.series[0].vals.len(), 3);
+        assert!(c.series[0].vals[1].is_nan());
+        assert_eq!(c, c.clone());
+        let other = parse_chart_xml(&xml.replace("<c:v>3.9</c:v>", "<c:v>4</c:v>")).unwrap();
+        assert_ne!(c, other);
+    }
+
     #[test]
     fn renders_a_bar_per_category() {
         let c = parse_chart_xml(COLUMN).unwrap();
@@ -349,6 +386,32 @@ mod tests {
         let lines = render_chart(&c, 40);
         assert!(lines.iter().any(|l| l.contains("25.0%")));
         assert!(lines.iter().any(|l| l.contains("75.0%")));
+    }
+
+    /// A NaN slice shows as 0% and leaves the others their share of the
+    /// finite total (#1114).
+    #[test]
+    fn pie_with_a_nan_value_keeps_finite_percentages_1114() {
+        let xml = r#"<c:chartSpace xmlns:c="x"><c:chart><c:plotArea><c:pieChart><c:ser>
+          <c:cat><c:strCache><c:pt idx="0"><c:v>a</c:v></c:pt><c:pt idx="1"><c:v>b</c:v></c:pt><c:pt idx="2"><c:v>c</c:v></c:pt></c:strCache></c:cat>
+          <c:val><c:numCache><c:pt idx="0"><c:v>1</c:v></c:pt><c:pt idx="1"><c:v>NaN</c:v></c:pt><c:pt idx="2"><c:v>3</c:v></c:pt></c:numCache></c:val>
+        </c:ser></c:pieChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let c = parse_chart_xml(xml).unwrap();
+        let lines = render_chart(&c, 40);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert!(
+            lines[1].starts_with("a ") && lines[1].ends_with(" 25.0%"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2].starts_with("b ") && lines[2].ends_with("  0.0%"),
+            "{lines:?}"
+        );
+        assert!(!lines[2].contains('█'), "{lines:?}");
+        assert!(
+            lines[3].starts_with("c ") && lines[3].ends_with(" 75.0%"),
+            "{lines:?}"
+        );
     }
 
     #[test]

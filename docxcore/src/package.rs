@@ -7762,6 +7762,59 @@ mod tests {
         );
     }
 
+    /// A chart whose cache holds `NaN` still equals itself, so an unedited
+    /// body holding it is the stored one and a save may keep the part
+    /// (#1114). An edit is still a change.
+    #[test]
+    fn a_body_with_a_nan_chart_is_still_the_stored_one_1114() {
+        let ct = r#"<?xml version="1.0"?><Types/>"#;
+        let rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
+        let doc_rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="charts/chart1.xml"/></Relationships>"#;
+        let document = r#"<w:document xmlns:w="w" xmlns:wp="wp" xmlns:a="a" xmlns:c="c" xmlns:r="r"><w:body><w:p><w:r><w:drawing><wp:inline><wp:docPr id="1" name="Chart 1"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rId9"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p><w:p><w:r><w:t>after</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#;
+        let chart = r#"<c:chartSpace xmlns:c="c"><c:chart><c:plotArea><c:barChart><c:ser>
+            <c:cat><c:strRef><c:strCache><c:pt idx="0"><c:v>a</c:v></c:pt><c:pt idx="1"><c:v>b</c:v></c:pt></c:strCache></c:strRef></c:cat>
+            <c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>1</c:v></c:pt><c:pt idx="1"><c:v>NaN</c:v></c:pt></c:numCache></c:numRef></c:val>
+            </c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let zip = write_zip(&[
+            ("[Content_Types].xml".to_string(), ct.as_bytes().to_vec()),
+            ("_rels/.rels".to_string(), rels.as_bytes().to_vec()),
+            (
+                "word/document.xml".to_string(),
+                document.as_bytes().to_vec(),
+            ),
+            (
+                "word/_rels/document.xml.rels".to_string(),
+                doc_rels.as_bytes().to_vec(),
+            ),
+            (
+                "word/charts/chart1.xml".to_string(),
+                chart.as_bytes().to_vec(),
+            ),
+        ]);
+        let pkg = load_package(&zip).unwrap();
+        // What the suite holds after a load: the body with its final section.
+        let mut doc = pkg.document.clone();
+        if doc.trailing_section_properties().is_none() {
+            doc.set_trailing_section_properties(pkg.final_section());
+        }
+        let Block::Paragraph(p) = &doc.body[0] else {
+            panic!("{:?}", doc.body[0])
+        };
+        let Some(Inline::Chart { chart, .. }) = p.content.first() else {
+            panic!("no chart: {:?}", p.content)
+        };
+        assert!(chart.series[0].vals[1].is_nan());
+        assert!(pkg.stores_document(&doc));
+        let Block::Paragraph(p) = &mut doc.body[1] else {
+            panic!()
+        };
+        p.content.push(Inline::Run(crate::model::Run {
+            text: " edited".into(),
+            ..crate::model::Run::default()
+        }));
+        assert!(!pkg.stores_document(&doc));
+    }
+
     #[test]
     fn new_package_keeps_repeating_section_namespaces_on_save() {
         use crate::model::{Table, TableRowBoundary};
