@@ -5914,8 +5914,9 @@ struct Docxy {
     /// The document tab's top-level tables as last painted (#1895), for the
     /// harness's `doc` read.
     painted_tables: PaintedTables,
-    /// The document tab's top-level paragraphs as its flow view last painted
-    /// them, in a harness instance (#1986), for `doc`'s `flow.layout`.
+    /// The document tab's top-level paragraphs as the flow view or Print
+    /// Layout last painted them, in a harness instance, for `doc`'s
+    /// `flow.layout` and `page.layout` (#1986, #2231).
     painted_paras: PaintedParas,
     /// The body's runs' inks as last painted, both views (#2079): a
     /// harness instance only.
@@ -11096,10 +11097,12 @@ fn painted_pictures_json(
 /// Each top-level table's block and painted bounds in the frame last drawn.
 type PaintedTables = std::rc::Rc<std::cell::RefCell<Vec<(usize, UnitCell)>>>;
 
-/// A top-level paragraph as the flow view last painted it, for the
-/// harness's `ext-doc-layout` (#1986): its block, its box, its list number
-/// and its runs (caret offset, length, text size and ink) to join with its
-/// painted words by offset.
+/// A top-level paragraph as the flow view or Print Layout last painted it,
+/// for the harness's `ext-doc-layout` and `doc`'s `flow.layout` and
+/// `page.layout` (#1986, #2231): its block, its box, its list number and
+/// its runs (caret offset, length, text size and ink) to join with its
+/// painted words by offset; its text row's box (`text`), its border sides
+/// as drawn (`borders`) and its highlighted runs (`highlights`, #2231).
 #[derive(Clone)]
 struct PaintedPara {
     block: usize,

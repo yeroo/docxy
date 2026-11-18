@@ -2473,9 +2473,12 @@ fn painted_lines(para: &PaintedPara) -> Vec<LaidLine> {
     lines
 }
 
-/// The harness's `ext-doc-layout` and `doc`'s `flow.layout` (#1986) of
-/// the paragraphs a frame painted (`paras`): per paragraph its block, top and height,
-/// its text's left (`text_x`), its list number and its lines, px rounded,
+/// The harness's `ext-doc-layout` and `doc`'s `flow.layout` (#1986) and
+/// `page.layout` (#2231) of the paragraphs a frame painted (`paras`): per
+/// paragraph its block, top and height, its text's left (`text_x`) and its
+/// row's bottom (`text_bottom`), its border sides (`borders`: side, x, y,
+/// width, gap to the text, colour) and highlighted runs (`highlights`:
+/// text, fill, ink), its list number (with its `family`) and its lines, px rounded,
 /// x from the text column's left (`column_x`) and y from the first
 /// paragraph's top; `marker_matches_text` (the number's ink is its first
 /// line's) and `marker_fits` (it ends left of the text), null without a

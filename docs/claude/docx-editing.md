@@ -384,7 +384,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   says `painted: false` until a frame of the document last loaded has
   painted. The document tab's flow view records the same
   (`Docxy::painted_paras`, a harness instance only) for `doc`'s
-  `flow.layout` (`null` in Print Layout; x from `draft_column`).
+  `flow.layout` (`null` in Print Layout; x from `draft_column`), and Print
+  Layout for `doc`'s `page.layout` (#2231; `null` in a flow view; x from
+  the first page's text column), each paragraph with its `text_bottom`,
+  `borders` and `highlights` too.
   `uiharness/cases/ext-doc-outlook-mail.uit` drives both: the view, and the
   same mail (`fixtures/outlook-mail.html`) opened in a document tab.
 - Known limits: explicit black text (an Outlook mail's `rgb(0,0,0)`) and
