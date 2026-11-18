@@ -48,7 +48,8 @@ issue number to find its notes.
   Switch Modes (#2079), the Find bar's keys, clicks and the one-line fields'
   shared key map (#2116), unnamed runs in the document's theme font and a
   family with a real bold face (#1972), dark-page highlights, paragraph
-  borders and their grouping, Segoe UI's substitutes (#2231).
+  borders and their grouping, Segoe UI's substitutes (#2231), comment
+  balloons shown on open, resolved hidden, no inline glyph (#2232).
 - `docs/claude/pdf-export.md`: before changing PDF export: embedded fonts (#1508),
   borders, picture watermarks and unequal columns (#797).
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),

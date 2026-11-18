@@ -640,3 +640,89 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   `sf-q-text`, `sf-r-text`). A bare centre press can land in leftover text, so
   the typing cases' clear step presses End before its Backspaces. Tests:
   `uiharness/cases/doc-find-bar-keys.uit` and `field_edit`'s unit tests.
+
+## Comment balloons (#2232)
+
+Classic Word desktop's All Markup: a document with open comments shows them as
+soon as it opens, as balloons in a markup area right of the page.
+`suite/docxy/src/balloons.rs` holds the pure parts (unit tested) and the
+probes. `Docxy::balloon_ctx` / `balloon_els` build the frame's context.
+
+- **Which comments.** `balloons_on(tab, markup, previewing)`: All Markup only,
+  not a live preview, the tab's `balloons_hidden` off (Review > Show Comments,
+  `showcomments`, KeyTip M, greyed outside All Markup, per tab, never saved),
+  and an open comment listed. `margin_comments` keeps the open comments of
+  `live_comments` that have a marker in the body drawn, in body order
+  (`body_comments`' walk). Resolved comments get no balloon, connector or
+  shade. Comments in headers, footers and notes stay pane-only.
+- **No glyph in the text.** The old inline 💬 badge is gone. A margin
+  comment's `commentRangeStart` / `commentRangeEnd` / `commentReference` draw
+  a zero-width span `caret_h` tall (`CommentCtx::marker_el`). It records where
+  it was painted, and the range's ends draw an absolutely placed bracket.
+  Rows are `items_center`, so a line's top is the span's middle minus
+  `line_h / 2`. The span moves no word: `doc-comment-balloons-layout.uit`
+  compares Print Layout's `page.layout` with `comments-plain.docx`'s. Known
+  edge: after a word wider than its column, a zero-width item can wrap onto a
+  line of its own, as the caret bar can.
+- **Range shade.** `body_comments().open_at` names the ranges open at each
+  paragraph's start, by its render path, cell paragraphs included.
+  `paragraph_el` gets them through `FlowPara::comments`; `paragraph_el` takes
+  no `RenderCtx`, and `block_el` copies `RenderCtx::comments`. It keeps them
+  open or closed as its markers pass, and gives each run the innermost
+  comment's shade (`emit_words`' `shade`). The shade is set before the
+  highlight and selection `bg`, so they draw over it, and it gets no band.
+  `PaintedInks` records it as the run's ground. Tabs and fields in a range
+  are not shaded.
+- **Probes, next frame.** Anchors, balloons (a borderless wrapper, so the
+  probe takes the border box), Print Layout's page strips and the content's
+  bottom record where they were painted into `State`. `end_layer`, laid last
+  at the content box's origin, turns them into scroll-content coordinates
+  (`Inputs`, scroll-invariant, keyed by tab and view). It asks for another
+  frame when they differ from what the frame was laid out with (`close_to`,
+  half a pixel), and paints the connectors from this frame's rects. The
+  layers are zero-size (`layer_at`): gpui sizes a scroll area's content from
+  its direct children's bounds, so a full-width absolute layer added the
+  padding again as a sideways scroll.
+- **Layout.** `place` sorts the anchored balloons by their line, then x, and
+  `stack`s them: each at its anchor's line top, or 6 px below the one before.
+  Stacking is global across Print Layout's pages, so none overlaps. A balloon
+  pushed past its page's bottom runs on beside the next page; Word would
+  shrink or re-page it, and that is not done. `bottom_room` is an in-flow
+  spacer that lets the last balloon be scrolled to. The markup area is 3 in
+  zoomed (`markup_w`). In Print Layout each sheet is an `h_flex` of the sheet
+  and a strip that only reserves the width, so the centred row moves the page
+  left; the balloons sit in their anchor page's strip. In Web Layout the
+  scroll's right padding grows by the area, the text column narrows (as
+  Word's does), and balloons sit `draft_text_w + 12` right of the content
+  origin.
+- **Connector.** From the anchor (the reference mark, else the range's end,
+  else its start), along its line to the page's right edge (the strip's left)
+  or the text column's, then to the balloon's left edge 10 px below its top.
+  Dotted 1 px dots every 3 px, solid and 2 px for the selected comment.
+- **Look.** `AUTHOR_COLORS`: 8 Word-like (fill, edge, shade) triples, by the
+  author's first appearance among all comments, resolved ones included.
+  Word's exact values have no oracle here. On a dark page the fill goes
+  through `dark_page::fill`, the edge through `border`, and the ink through
+  `text`. The shade is `fill`-mapped, then darkened toward the page until
+  automatic ink reads (`under_light_ink`: a mapped green is too light). The
+  date is `November 17, 2026 at 6:41 PM`: `w:date` read as UTC, at the
+  current local offset (a DST difference to the comment's date is not
+  applied).
+- **Balloon.** Author (bold) with Resolve and × (the pane's
+  `resolve_comment` / `delete_comment`), then the date, then the text, with
+  no anchor quote. A click selects the comment (`select_comment`, so Review >
+  Resolve acts on it) without moving the caret; a press never reaches the
+  page. The Comments pane lists open comments first, then a "Resolved"
+  heading (`pane_order`), with a one-line truncated quote (`pane_quote`).
+  Replies are not modelled.
+- **Harness.** `doc {}`'s `comments`: `markup`, `view`, `area`, `count`,
+  `resolved_hidden`, `stacked_ok` / `connectors_ok`, `all_readable`, and per
+  balloon its look, `rect`, `anchor`, `connector`, `pushed`, `in_view`,
+  `date` and `date_utc`. The checks are computed from painted rects, and the
+  connector's edge from the ruler probe's page or column, not the markup
+  area's own numbers. Regions: `balloon:<id>` (its text),
+  `balloon-resolve:<id>`, `balloon-delete:<id>`. Cases:
+  `uiharness/cases/doc-comment-balloons.uit` (every OS; dates asserted at
+  UTC) and `doc-comment-balloons-layout.uit` (Linux, line breaks).
+  Fixtures: `ext_fixture::comments_docx` writes `comments.docx` and
+  `comments-plain.docx` (`UPDATE_COMMENTS_FIXTURE=1`).
