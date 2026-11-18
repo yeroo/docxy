@@ -35,7 +35,7 @@ impl ChartKind {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct Series {
     pub name: String,
     pub cats: Vec<String>,
@@ -49,8 +49,24 @@ pub struct Chart {
     pub series: Vec<Series>,
 }
 
-// `Inline` derives `Eq`; chart values are f64. Charts come from parsed cached
-// data (never NaN), so treating them as `Eq` is sound for our use.
+/// Values compare bitwise: a cached `<c:v>NaN</c:v>` parses to NaN, and a
+/// chart must still equal itself, or an unedited save never keeps its
+/// document part (#1114). A sign-of-zero difference only reads as a change.
+impl PartialEq for Series {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.cats == other.cats
+            && self.vals.len() == other.vals.len()
+            && self
+                .vals
+                .iter()
+                .zip(&other.vals)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+}
+
+// `Inline` derives `Eq`; chart values are f64, compared bitwise (above), so
+// equality is reflexive even for a NaN.
 impl Eq for Chart {}
 impl Eq for Series {}
 
@@ -324,6 +340,19 @@ mod tests {
         assert_eq!(c.series[0].name, "Series 1");
         assert_eq!(c.series[0].cats, ["apple", "banana", "pear"]);
         assert_eq!(c.series[0].vals, [4.6, 2.9, 3.9]);
+    }
+
+    /// A cached NaN stays a value (the rendering is unchanged), and the
+    /// chart still equals itself (#1114).
+    #[test]
+    fn nan_cached_value_equals_itself_1114() {
+        let xml = COLUMN.replace("<c:v>2.9</c:v>", "<c:v>NaN</c:v>");
+        let c = parse_chart_xml(&xml).unwrap();
+        assert_eq!(c.series[0].vals.len(), 3);
+        assert!(c.series[0].vals[1].is_nan());
+        assert_eq!(c, c.clone());
+        let other = parse_chart_xml(&xml.replace("<c:v>3.9</c:v>", "<c:v>4</c:v>")).unwrap();
+        assert_ne!(c, other);
     }
 
     #[test]
