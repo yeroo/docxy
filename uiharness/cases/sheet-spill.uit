@@ -1,0 +1,121 @@
+# Text wider than its column spills over the empty cells beside it, as Excel
+# draws it (#2240). `spill` is the runs the last frame drew, each from its
+# first to its last column; which columns a text needs is measured with the
+# window's font, so the runs are pinned here as this font draws them, and the
+# shots are for a person's eyes. The rules themselves are pinned by
+# `gridcore::overflow`'s and `sheet_spill`'s unit tests.
+#
+# basic.xlsx holds A1:C5 and a chart card over about B9:G21, so the texts go
+# in rows 6 to 8.
+#
+#   python3 scripts/ui-linux-sweep.py uiharness/cases/sheet-spill.uit
+
+test a long text spills right over its empty neighbours
+  open copy:../fixtures/basic.xlsx
+  assert spill is nothing
+  click A8
+  call real-type {"text":"A note typed into one cell runs on across the row"}
+  call real-key {"key":"enter"}
+  shot grid
+  assert spill is A8:E8
+  # The text layer takes no clicks: a press on a covered cell selects it,
+  # and its ring is drawn above the text.
+  call pointer-click {"region":"cell:C8"}
+  assert range is C8
+  shot cell:A8:F8
+  assert spill is A8:E8
+
+test a text that fits draws no run
+  open copy:../fixtures/basic.xlsx
+  click A8
+  call real-type {"text":"short"}
+  call real-key {"key":"enter"}
+  shot grid
+  assert spill is nothing
+
+test a run stops at the first filled cell
+  open copy:../fixtures/basic.xlsx
+  click A8
+  call real-type {"text":"A note typed into one cell runs on across the row"}
+  call real-key {"key":"enter"}
+  click D8
+  call real-type {"text":"x"}
+  call real-key {"key":"enter"}
+  shot cell:A8:F8
+  assert spill is A8:C8
+
+test the editor covers the text while typing
+  open copy:../fixtures/basic.xlsx
+  click A8
+  call real-type {"text":"A note typed into one cell runs on across the row"}
+  call real-key {"key":"enter"}
+  # Typing into C8 cuts A8's run at B8, as Excel does.
+  click C8
+  call real-type {"text":"y"}
+  assert editing is true
+  shot cell:A8:F8
+  assert spill is A8:B8
+  call real-key {"key":"escape"}
+  shot cell:A8:F8
+  assert spill is A8:E8
+  # A8's own editor: no run while it is open.
+  click A8
+  call real-key {"key":"f2"}
+  assert editing is true
+  shot cell:A8:F8
+  assert spill is nothing
+  call real-key {"key":"escape"}
+  shot cell:A8:F8
+  assert spill is A8:E8
+
+test right runs left and centre runs both ways
+  open copy:../fixtures/basic.xlsx
+  click L6
+  call real-type {"text":"Right-aligned text runs to the left"}
+  call real-key {"key":"enter"}
+  click L6
+  call ribbon-click {"tab":"Home","command":"Align Right"}
+  click L7
+  call real-type {"text":"A centred text runs both ways"}
+  call real-key {"key":"enter"}
+  click L7
+  call ribbon-click {"tab":"Home","command":"Center"}
+  click A1
+  shot grid
+  assert spill is J6:L6 K7:M7
+
+test a frozen column's text runs on into the scrolled columns
+  open copy:../fixtures/basic.xlsx
+  click A8
+  call real-type {"text":"A note typed into one cell runs on across the row"}
+  call real-key {"key":"enter"}
+  click B1
+  call ribbon-click {"tab":"View","command":"Freeze Panes"}
+  shot grid
+  # Drawn in both panes, listed once.
+  assert spill is A8:E8
+  # Scrolled far right, the frozen pane still draws its part, cut at the
+  # freeze line.
+  call pointer-click {"input":"name-box"}
+  call real-type {"text":"AZ8"}
+  call real-key {"key":"enter"}
+  shot grid
+  assert sel is AZ8
+  assert spill is A8:E8
+
+test a source scrolled far off draws nothing
+  open copy:../fixtures/basic.xlsx
+  click A8
+  call real-type {"text":"A note typed into one cell runs on across the row"}
+  call real-key {"key":"enter"}
+  call pointer-click {"input":"name-box"}
+  call real-type {"text":"AZ8"}
+  call real-key {"key":"enter"}
+  shot grid
+  assert sel is AZ8
+  assert spill is nothing
+  call pointer-click {"input":"name-box"}
+  call real-type {"text":"A8"}
+  call real-key {"key":"enter"}
+  shot grid
+  assert spill is A8:E8
