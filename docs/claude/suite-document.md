@@ -648,8 +648,9 @@ soon as it opens, as balloons in a markup area right of the page.
 `suite/docxy/src/balloons.rs` holds the pure parts (unit tested) and the
 probes. `Docxy::balloon_ctx` / `balloon_els` build the frame's context.
 
-- **Which comments.** `balloons_on(tab, markup, previewing)`: All Markup only,
-  not a live preview, the tab's `balloons_hidden` off (Review > Show Comments,
+- **Which comments.** `balloons_on(tab, markup)`: All Markup only (a live
+  preview keeps them, from the preview's editor, so the page does not
+  move), the tab's `balloons_hidden` off (Review > Show Comments,
   `showcomments`, KeyTip M, greyed outside All Markup, per tab, never saved),
   and an open comment listed. `margin_comments` keeps the open comments of
   `live_comments` that have a marker in the body drawn, in body order
@@ -664,6 +665,10 @@ probes. `Docxy::balloon_ctx` / `balloon_els` build the frame's context.
   compares Print Layout's `page.layout` with `comments-plain.docx`'s. Known
   edge: after a word wider than its column, a zero-width item can wrap onto a
   line of its own, as the caret bar can.
+- **Markers in a tracked change** (`Inline::Revision`) are walked by both
+  `body_comments` and `paragraph_el` (`inline_markers`, `apply_marker`): the
+  painter draws a change's range starts before its text and its ends and
+  references after it, unshaded.
 - **Range shade.** `body_comments().open_at` names the ranges open at each
   paragraph's start, by its render path, cell paragraphs included.
   `paragraph_el` gets them through `FlowPara::comments`; `paragraph_el` takes
@@ -677,7 +682,8 @@ probes. `Docxy::balloon_ctx` / `balloon_els` build the frame's context.
   probe takes the border box), Print Layout's page strips and the content's
   bottom record where they were painted into `State`. `end_layer`, laid last
   at the content box's origin, turns them into scroll-content coordinates
-  (`Inputs`, scroll-invariant, keyed by tab and view). It asks for another
+  (`Inputs`, scroll-invariant, keyed by `measure_key`: the tab's
+  `close::TabId` hashed, the view and the zoom). It asks for another
   frame when they differ from what the frame was laid out with (`close_to`,
   half a pixel), and paints the connectors from this frame's rects. The
   layers are zero-size (`layer_at`): gpui sizes a scroll area's content from
@@ -704,10 +710,16 @@ probes. `Docxy::balloon_ctx` / `balloon_els` build the frame's context.
   Word's exact values have no oracle here. On a dark page the fill goes
   through `dark_page::fill`, the edge through `border`, and the ink through
   `text`. The shade is `fill`-mapped, then darkened toward the page until
-  automatic ink reads (`under_light_ink`: a mapped green is too light). The
-  date is `November 17, 2026 at 6:41 PM`: `w:date` read as UTC, at the
-  current local offset (a DST difference to the comment's date is not
-  applied).
+  automatic ink reads (`under_light_ink`: a mapped green is too light).
+- **Date.** `November 17, 2026 at 6:41 PM` (`balloon_date`). Word writes
+  `w:date` as the author's local wall time with a `Z` it ignores on load
+  ([MS-OI29500] 17.13.4.2), so it is shown as written. Word's true UTC date,
+  `w16cex:dateUtc` in `word/commentsExtensible.xml`, keyed by durable id
+  through `word/commentsIds.xml`'s paraId (`utc_dates`), is shown in the
+  local zone when present (`shown_date`; the current offset, so a DST
+  difference to the comment's date is not applied). A new comment is
+  stamped as Word does: local wall time plus `Z` (`word_comment_date`).
+  Revision dates stay UTC (`utc_now_iso`).
 - **Balloon.** Author (bold) with Resolve and × (the pane's
   `resolve_comment` / `delete_comment`), then the date, then the text, with
   no anchor quote. A click selects the comment (`select_comment`, so Review >
@@ -717,12 +729,12 @@ probes. `Docxy::balloon_ctx` / `balloon_els` build the frame's context.
   Replies are not modelled.
 - **Harness.** `doc {}`'s `comments`: `markup`, `view`, `area`, `count`,
   `resolved_hidden`, `stacked_ok` / `connectors_ok`, `all_readable`, and per
-  balloon its look, `rect`, `anchor`, `connector`, `pushed`, `in_view`,
-  `date` and `date_utc`. The checks are computed from painted rects, and the
-  connector's edge from the ruler probe's page or column, not the markup
-  area's own numbers. Regions: `balloon:<id>` (its text),
+  balloon its look, `rect`, `anchor`, `connector`, `pushed`, `in_view` and
+  `date`. `stacked_ok` is computed from painted rects. `connectors_ok`
+  checks what does not come from the connector's own inputs: a painted
+  anchor and connector per balloon, the turn on the ruler probe's page or
+  column edge, the anchor left of it and the balloon right of it. Regions: `balloon:<id>` (its text),
   `balloon-resolve:<id>`, `balloon-delete:<id>`. Cases:
-  `uiharness/cases/doc-comment-balloons.uit` (every OS; dates asserted at
-  UTC) and `doc-comment-balloons-layout.uit` (Linux, line breaks).
+  `uiharness/cases/doc-comment-balloons.uit` (every OS; dates as written) and `doc-comment-balloons-layout.uit` (Linux, line breaks).
   Fixtures: `ext_fixture::comments_docx` writes `comments.docx` and
   `comments-plain.docx` (`UPDATE_COMMENTS_FIXTURE=1`).

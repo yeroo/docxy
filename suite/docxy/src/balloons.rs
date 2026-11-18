@@ -115,8 +115,9 @@ fn attr(tag: &str, name: &str) -> Option<String> {
 }
 
 /// The markers of a paragraph's content, hyperlinks and tracked changes
-/// opened up, in order.
-fn inline_markers(content: &[Inline], f: &mut impl FnMut(Mark, String)) {
+/// opened up, in order. `paragraph_el` reads a tracked change's with it too,
+/// so the painter and this walk open and close the same ranges.
+pub(crate) fn inline_markers(content: &[Inline], f: &mut impl FnMut(Mark, String)) {
     for inline in content {
         match inline {
             Inline::Raw(xml) => {
@@ -180,18 +181,25 @@ fn walk(blocks: &[Block], path: &mut Vec<usize>, open: &mut Vec<String>, out: &m
     }
 }
 
-/// One marker of the walk: a start opens its range, an end closes it.
+/// One marker of the walk: it is in the body order, and [`apply_marker`].
 fn step(kind: Mark, id: String, open: &mut Vec<String>, order: &mut Vec<String>) {
     if !order.contains(&id) {
         order.push(id.clone());
     }
+    apply_marker(kind, &id, open);
+}
+
+/// A marker's effect on the ranges `open` (innermost last): a start opens
+/// its range, an end closes it, a reference does neither. The body walk and
+/// `paragraph_el` share it.
+pub(crate) fn apply_marker(kind: Mark, id: &str, open: &mut Vec<String>) {
     match kind {
         Mark::Start => {
-            if !open.contains(&id) {
-                open.push(id);
+            if !open.iter().any(|o| o == id) {
+                open.push(id.to_string());
             }
         }
-        Mark::End => open.retain(|o| *o != id),
+        Mark::End => open.retain(|o| o != id),
         Mark::Reference => {}
     }
 }
@@ -324,9 +332,12 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// A comment's `w:date` as Word shows it on a balloon, `November 17, 2026 at
-/// 6:41 PM`, seen from a zone `offset_min` minutes ahead of UTC. The date is
-/// read as UTC. `None` for a date that does not parse.
+/// A date as Word shows it on a balloon, `November 17, 2026 at 6:41 PM`,
+/// moved `offset_min` minutes (a zone that far ahead of UTC). A comment's
+/// `w:date` is the author's local wall time with a `Z` Word ignores
+/// ([MS-OI29500] 17.13.4.2), so it is shown as written (`offset_min` 0);
+/// only a true UTC date (`w16cex:dateUtc`, [`utc_dates`]) is moved to the
+/// local zone. `None` for a date that does not parse.
 pub(crate) fn balloon_date(iso: &str, offset_min: i64) -> Option<String> {
     let t = docxcore::field::parse_iso(iso)?;
     if !(1..=12).contains(&t.month) || t.day == 0 || t.day > 31 || t.hour > 23 || t.min > 59 {
@@ -352,6 +363,64 @@ pub(crate) fn balloon_date(iso: &str, offset_min: i64) -> Option<String> {
         h12,
         l.min,
         ampm
+    ))
+}
+
+/// Each comment's true UTC date, by the `w14:paraId` of its last paragraph
+/// (`Comment::para_id`): Word 2019 and later write `w16cex:dateUtc` in
+/// `word/commentsExtensible.xml` (`ext_xml`) keyed by a durable id, which
+/// `word/commentsIds.xml` (`ids_xml`) maps from the paraId. Empty when
+/// either part is missing.
+pub(crate) fn utc_dates(ids_xml: Option<&str>, ext_xml: Option<&str>) -> HashMap<String, String> {
+    let (Some(ids), Some(ext)) = (ids_xml, ext_xml) else {
+        return HashMap::new();
+    };
+    let tags = |xml: &str, name: &str| -> Vec<String> {
+        let open = format!("<{name}");
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(rel) = xml[from..].find(&open) {
+            let at = from + rel;
+            let end = xml[at..].find('>').map_or(xml.len(), |e| at + e);
+            // `<w16cid:commentIds` is the root, not an entry.
+            if xml[at + open.len()..].starts_with(|c: char| c.is_whitespace() || c == '/') {
+                out.push(xml[at..end].to_string());
+            }
+            from = end.max(at + 1);
+        }
+        out
+    };
+    let durable: HashMap<String, String> = tags(ext, "w16cex:commentExtensible")
+        .iter()
+        .filter_map(|t| Some((attr(t, "w16cex:durableId")?, attr(t, "w16cex:dateUtc")?)))
+        .collect();
+    tags(ids, "w16cid:commentId")
+        .iter()
+        .filter_map(|t| {
+            let para = attr(t, "w16cid:paraId")?;
+            let date = durable.get(&attr(t, "w16cid:durableId")?)?;
+            Some((para, date.clone()))
+        })
+        .collect()
+}
+
+/// The date a comment's balloon shows: its true UTC date in the local zone
+/// (`offset_min` ahead of UTC) when [`utc_dates`] has one, else its `w:date`
+/// as written. Empty when neither parses.
+pub(crate) fn shown_date(c: &Comment, utc: &HashMap<String, String>, offset_min: i64) -> String {
+    c.para_id
+        .as_ref()
+        .and_then(|p| utc.get(p))
+        .and_then(|d| balloon_date(d, offset_min))
+        .or_else(|| balloon_date(&c.date, 0))
+        .unwrap_or_default()
+}
+
+/// A comment's `w:date` as Word stamps it, for the moment `unix_secs` in a
+/// zone `offset_min` ahead of UTC: the local wall time with a `Z`.
+pub(crate) fn word_comment_date(unix_secs: i64, offset_min: i64) -> String {
+    docxcore::field::format_iso(&docxcore::field::civil_from_unix(
+        unix_secs + offset_min * 60,
     ))
 }
 
@@ -413,8 +482,9 @@ impl Rect {
     }
 }
 
-/// An anchor marker as painted this frame: a zero-width span `line_h` tall
-/// in its line's middle at `mid` (window coordinates).
+/// An anchor marker as painted this frame: a zero-width span `caret_h`
+/// tall, centred in its line, so `mid` is the line's middle (window
+/// coordinates); `line_h` is its line's height.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PaintedMark {
     pub id: String,
@@ -437,10 +507,12 @@ pub(crate) struct Anchor {
 
 /// What a frame lays the balloons out from, in scroll-content coordinates:
 /// the last painted frame's anchors, balloon heights, page strip tops and the
-/// content's bottom. `key` names the tab and view it was measured in.
+/// content's bottom. `key` names what it was measured in: a hash of the
+/// tab's identity (`close::TabId`), Print Layout or not, and the zoom's
+/// bits ([`measure_key`]).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Inputs {
-    pub key: Option<(usize, bool)>,
+    pub key: Option<(u64, bool, u32)>,
     pub anchors: BTreeMap<String, Anchor>,
     pub heights: BTreeMap<String, f32>,
     pub page_tops: Vec<f32>,
@@ -481,15 +553,26 @@ impl Inputs {
     }
 }
 
+/// The [`Inputs::key`] of the tab `tab` (its `close::TabId`, hashed), in
+/// Print Layout or not (`print`), at `zoom`: a measure taken in another
+/// tab, view or zoom is not laid out from.
+pub(crate) fn measure_key(tab: &impl std::hash::Hash, print: bool, zoom: f32) -> (u64, bool, u32) {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    (
+        BuildHasherDefault::<DefaultHasher>::default().hash_one(tab),
+        print,
+        zoom.to_bits(),
+    )
+}
+
 /// A balloon as this frame drew it, for the connectors and the harness.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Drawn {
     pub id: String,
     pub author: String,
     pub date: String,
-    pub date_utc: String,
     pub text: String,
-    pub look: Option<Look>,
+    pub look: Look,
     pub selected: bool,
     pub page: usize,
 }
@@ -908,10 +991,7 @@ pub(crate) fn end_layer(state: &Shared, column_w: Option<f32>) -> AnyElement {
                 let Some(d) = s.drawn.iter().find(|d| d.id == *id) else {
                     continue;
                 };
-                let Some(look) = d.look else {
-                    continue;
-                };
-                let color = hsla(look.edge);
+                let color = hsla(d.look.edge);
                 let (step, dot) = if d.selected { (1.0, 2.0) } else { (3.0, 1.0) };
                 for seg in pts.windows(2) {
                     paint_segment(window, seg[0], seg[1], step, dot, color);
@@ -1048,37 +1128,88 @@ mod tests {
     }
 
     #[test]
-    fn balloon_date_is_words_format_in_local_time_2232() {
+    fn balloon_date_is_words_format_as_written_or_from_utc_2232() {
+        // `w:date` is local wall time: shown as written.
         let d = "2026-11-17T18:41:00Z";
         assert_eq!(
             balloon_date(d, 0).as_deref(),
             Some("November 17, 2026 at 6:41 PM")
         );
-        // Four hours ahead: past midnight, the next day.
-        assert_eq!(
-            balloon_date(d, 240).as_deref(),
-            Some("November 17, 2026 at 10:41 PM")
-        );
-        assert_eq!(
-            balloon_date(d, 360).as_deref(),
-            Some("November 18, 2026 at 12:41 AM")
-        );
-        // Behind UTC, and noon.
-        assert_eq!(
-            balloon_date("2026-11-17T12:00:00Z", -300).as_deref(),
-            Some("November 17, 2026 at 7:00 AM")
-        );
         assert_eq!(
             balloon_date("2026-11-17T12:05:00Z", 0).as_deref(),
             Some("November 17, 2026 at 12:05 PM")
         );
-        // Across a year's end.
+        assert_eq!(
+            balloon_date("2026-11-17T00:10:00Z", 0).as_deref(),
+            Some("November 17, 2026 at 12:10 AM")
+        );
+        // A true UTC date in a zone four hours ahead.
+        assert_eq!(
+            balloon_date(d, 240).as_deref(),
+            Some("November 17, 2026 at 10:41 PM")
+        );
+        // Six hours ahead: past midnight, the next day.
+        assert_eq!(
+            balloon_date(d, 360).as_deref(),
+            Some("November 18, 2026 at 12:41 AM")
+        );
+        // Three hours behind, across a year's end.
         assert_eq!(
             balloon_date("2026-01-01T02:00:00Z", -180).as_deref(),
             Some("December 31, 2025 at 11:00 PM")
         );
         assert_eq!(balloon_date("", 0), None);
         assert_eq!(balloon_date("not a date", 0), None);
+    }
+
+    #[test]
+    fn shown_date_prefers_words_utc_date_in_the_local_zone_2232() {
+        let ids = "<w16cid:commentsIds xmlns:w16cid=\"x\">\
+                   <w16cid:commentId w16cid:paraId=\"1A2B\" w16cid:durableId=\"7F00\"/>\
+                   <w16cid:commentId w16cid:paraId=\"3C4D\" w16cid:durableId=\"7F01\"/>\
+                   </w16cid:commentsIds>";
+        let ext = "<w16cex:commentsExtensible xmlns:w16cex=\"y\">\
+                   <w16cex:commentExtensible w16cex:durableId=\"7F00\" w16cex:dateUtc=\"2026-11-17T23:41:00Z\"/>\
+                   </w16cex:commentsExtensible>";
+        let utc = utc_dates(Some(ids), Some(ext));
+        assert_eq!(utc.len(), 1);
+        let c = |para: &str| Comment {
+            date: "2026-11-17T18:41:00Z".into(),
+            para_id: Some(para.into()),
+            ..Comment::default()
+        };
+        // New York (UTC-5): the UTC date moved back to the author's 6:41 PM.
+        assert_eq!(
+            shown_date(&c("1A2B"), &utc, -300),
+            "November 17, 2026 at 6:41 PM"
+        );
+        // In UTC+1 the same moment is past midnight.
+        assert_eq!(
+            shown_date(&c("1A2B"), &utc, 60),
+            "November 18, 2026 at 12:41 AM"
+        );
+        // No UTC date: `w:date` as written, whatever the zone.
+        assert_eq!(
+            shown_date(&c("3C4D"), &utc, 60),
+            "November 17, 2026 at 6:41 PM"
+        );
+        assert_eq!(
+            shown_date(&c("1A2B"), &utc_dates(Some(ids), None), 60),
+            "November 17, 2026 at 6:41 PM"
+        );
+    }
+
+    #[test]
+    fn a_new_comment_is_stamped_in_local_wall_time_2232() {
+        // 2026-11-17T18:41:00Z, in a zone four hours ahead.
+        let secs = 1_794_940_860;
+        assert_eq!(word_comment_date(secs, 0), "2026-11-17T18:41:00Z");
+        assert_eq!(word_comment_date(secs, 240), "2026-11-17T22:41:00Z");
+        // Shown as written: the author's wall time.
+        assert_eq!(
+            balloon_date(&word_comment_date(secs, 240), 0).as_deref(),
+            Some("November 17, 2026 at 10:41 PM")
+        );
     }
 
     #[test]
@@ -1166,6 +1297,38 @@ mod tests {
             Some(&vec!["1".to_string()])
         );
         assert_eq!(bc.open_at.get(&vec![3]), None, "closed in the cell");
+    }
+
+    #[test]
+    fn a_range_opened_inside_a_tracked_insertion_is_open_after_it_2232() {
+        use docxcore::model::RevisionKind;
+        let ins = Inline::Revision {
+            kind: RevisionKind::Insert,
+            metadata: Default::default(),
+            raw: String::new(),
+            content: vec![raw("<w:commentRangeStart w:id=\"5\"/>"), text("added")],
+            content_changed: false,
+        };
+        let body = vec![
+            para(vec![text("a "), ins]),
+            para(vec![text("b"), raw("<w:commentRangeEnd w:id=\"5\"/>")]),
+            para(vec![text("c")]),
+        ];
+        let bc = body_comments(&body);
+        assert_eq!(bc.order, vec!["5".to_string()]);
+        assert_eq!(bc.open_at.get(&vec![1]), Some(&vec!["5".to_string()]));
+        assert_eq!(bc.open_at.get(&vec![2]), None);
+        // The painter's marker step is the walk's.
+        let mut open = Vec::new();
+        let mut seen = Vec::new();
+        if let Block::Paragraph(p) = &body[0] {
+            inline_markers(&p.content, &mut |k, id| {
+                seen.push(k);
+                apply_marker(k, &id, &mut open)
+            });
+        }
+        assert_eq!(seen, vec![Mark::Start]);
+        assert_eq!(open, vec!["5".to_string()]);
     }
 
     #[test]

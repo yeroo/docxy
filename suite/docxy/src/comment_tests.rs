@@ -1,6 +1,7 @@
 //! New comments on a Word tab (#620), without a window: the reviewer name,
-//! initials and date they are stamped with, and Add Comment as one undo
-//! step that takes the comment out of the saved file and the pane.
+//! initials and date (local wall time, #2232) they are stamped with, and Add
+//! Comment as one undo step that takes the comment out of the saved file and
+//! the pane.
 
 use crate::open_mode_tests::Scratch;
 use crate::{
@@ -60,7 +61,8 @@ fn markers(document_xml: &str, id: i32) -> usize {
     document_xml.matches(&format!("w:id=\"{id}\"")).count()
 }
 
-fn is_utc_date_time(s: &str) -> bool {
+/// The shape of a `w:date`: `YYYY-MM-DDTHH:MM:SSZ`.
+fn is_word_date_time(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 20
         && b.iter().enumerate().all(|(i, c)| match i {
@@ -72,8 +74,11 @@ fn is_utc_date_time(s: &str) -> bool {
         })
 }
 
+/// The new comment's `w:date` is Word's stamp (#2232): the local wall time
+/// with a `Z`, as Word writes and reads it ([MS-OI29500] 17.13.4.2), not UTC.
 #[test]
-fn new_comment_is_stamped_with_user_name_and_utc_date() {
+fn new_comment_is_stamped_with_user_name_and_local_date() {
+    let before = crate::unix_now();
     let dir = Scratch::new();
     let (mut tab, path) = docx_tab(&dir, &fox_package());
     editor(&mut tab).select_all();
@@ -86,7 +91,17 @@ fn new_comment_is_stamped_with_user_name_and_utc_date() {
     assert_eq!(c.id, id.to_string());
     assert_eq!(c.author, "Jane doe");
     assert_eq!(c.initials, "JD");
-    assert!(is_utc_date_time(&c.date), "w:date {:?}", c.date);
+    assert!(is_word_date_time(&c.date), "w:date {:?}", c.date);
+    let after = crate::unix_now();
+    let offset = gridcore::clock::local_offset_minutes();
+    let minute = |secs: i64| crate::balloons::word_comment_date(secs, offset)[..16].to_string();
+    assert!(
+        c.date[..16] == minute(before) || c.date[..16] == minute(after),
+        "w:date {:?} is not the local time between {} and {}",
+        c.date,
+        minute(before),
+        minute(after)
+    );
 }
 
 #[test]
@@ -806,7 +821,8 @@ fn converted_tab_remove_all_save_undo_save_keeps_the_comments_xml() {
 
 /// #2232: a document with open comments shows its balloons on open (All
 /// Markup only); Show Comments hides them for its own tab, another tab of
-/// the same file keeps them, and nothing of it is saved.
+/// the same file keeps them, and nothing of it is saved. With every comment
+/// resolved, or none, there are none.
 #[test]
 fn balloons_hidden_is_per_tab_2232() {
     use crate::{balloons_on, toggle_balloons};
@@ -819,32 +835,34 @@ fn balloons_hidden_is_per_tab_2232() {
     );
     let mut a = tab_from_path(&path);
     let b = tab_from_path(&path);
-    assert!(balloons_on(&a, MarkupView::All, false), "on at open");
-    assert!(!balloons_on(&a, MarkupView::Simple, false));
-    assert!(!balloons_on(&a, MarkupView::NoMarkup, false));
-    assert!(!balloons_on(&a, MarkupView::Original, false));
-    assert!(
-        !balloons_on(&a, MarkupView::All, true),
-        "not in a live preview"
-    );
+    assert!(balloons_on(&a, MarkupView::All), "on at open");
+    assert!(!balloons_on(&a, MarkupView::Simple));
+    assert!(!balloons_on(&a, MarkupView::NoMarkup));
+    assert!(!balloons_on(&a, MarkupView::Original));
     toggle_balloons(&mut a);
-    assert!(!balloons_on(&a, MarkupView::All, false));
-    assert!(
-        balloons_on(&b, MarkupView::All, false),
-        "the other tab keeps them"
-    );
+    assert!(!balloons_on(&a, MarkupView::All));
+    assert!(balloons_on(&b, MarkupView::All), "the other tab keeps them");
     // Saved and opened again: on.
     assert!(save_doc_tab(&mut a, None), "{}", a.status);
-    assert!(balloons_on(&tab_from_path(&path), MarkupView::All, false));
+    assert!(balloons_on(&tab_from_path(&path), MarkupView::All));
     toggle_balloons(&mut a);
-    assert!(balloons_on(&a, MarkupView::All, false));
-    // A document whose comments are all resolved shows none.
+    assert!(balloons_on(&a, MarkupView::All));
+    // Every open comment resolved and saved: opened again, none shows.
+    for id in ["1", "2", "3"] {
+        assert_eq!(set_doc_comment_resolved(&mut a, id, None), Some(true));
+    }
+    assert!(save_doc_tab(&mut a, None), "{}", a.status);
+    let reopened = tab_from_path(&path);
+    assert_eq!(reopened.comments.len(), 5);
+    assert!(reopened.comments.iter().all(|c| c.resolved));
+    assert!(!balloons_on(&reopened, MarkupView::All));
+    // A document with no comment shows none.
     let plain = write(
         &dir,
         "plain.docx",
         &crate::ext_fixture::comments_docx(false),
     );
-    assert!(!balloons_on(&tab_from_path(&plain), MarkupView::All, false));
+    assert!(!balloons_on(&tab_from_path(&plain), MarkupView::All));
 }
 
 /// #2232: the Comments pane lists the open comments first, then the

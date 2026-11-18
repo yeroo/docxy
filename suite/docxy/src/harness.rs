@@ -3094,8 +3094,9 @@ fn live_doc_state(app: &crate::Docxy, _window: &Window) -> Result<Json, String> 
 /// The comment balloons' markup area as the last frame painted it (#2232),
 /// in window coordinates (px, rounded): `markup` (shown), `view` (`print`,
 /// `web` or `null`), `area` (`{x, w}`: the markup area's left and width),
-/// `balloons` (in body order: `id`, `author`, `date` as shown, in local
-/// time, `date_utc` (the same at UTC), `text`, `fill` / `ink` / `edge`
+/// `balloons` (in body order: `id`, `author`, `date` as shown (`w:date` as
+/// written, or Word's true UTC date in the local zone when the package has
+/// one: `balloons::shown_date`), `text`, `fill` / `ink` / `edge`
 /// (`rrggbb`), `selected`, `page` (1-based in Print Layout, else `null`),
 /// `rect` / `anchor` (`{x, y, line_top, line_h}`: the connector's start and
 /// its line) / `connector` (its three points), each `null` until painted,
@@ -3104,11 +3105,13 @@ fn live_doc_state(app: &crate::Docxy, _window: &Window) -> Result<Json, String> 
 /// listed comments that are resolved, so have none), `stacked_ok` (the
 /// painted balloons follow the stacking rule against their painted
 /// anchors: [`crate::balloons::stacked_ok`]), `connectors_ok` (each painted
-/// balloon's connector starts on its painted anchor, crosses the page's
-/// (Print Layout) or the text column's (Web Layout) right edge as the ruler
-/// probe painted it on the anchor's line, and ends on the balloon's left
-/// edge, all within a pixel) and `all_readable` (every balloon's text reads
-/// on its fill at 4.5:1).
+/// balloon has a painted anchor and a connector; the connector turns, within
+/// a pixel, on the page's (Print Layout) or the text column's (Web Layout)
+/// right edge as the ruler probe painted it, not as the markup area's own
+/// probes did; and the anchor lies left of that edge and the balloon right
+/// of it. The connector's ends are computed from the painted anchor and
+/// balloon, so they are not checked against them) and `all_readable` (every
+/// balloon's text reads on its fill at 4.5:1).
 fn comments_state(app: &crate::Docxy) -> Json {
     use crate::balloons::{Rect, stacked_ok};
     let st = app.balloon_state.borrow();
@@ -3142,9 +3145,7 @@ fn comments_state(app: &crate::Docxy) -> Json {
             .iter()
             .find(|(id, _)| *id == d.id)
             .map(|(_, c)| *c);
-        if let Some(look) = d.look {
-            readable &= crate::dark_page::contrast(look.ink, look.fill) >= 4.5;
-        }
+        readable &= crate::dark_page::contrast(d.look.ink, d.look.fill) >= 4.5;
         if let (Some(r), Some(top)) = (rect, line_top) {
             painted.push((r, top));
         }
@@ -3162,27 +3163,19 @@ fn comments_state(app: &crate::Docxy) -> Json {
             };
             connectors_ok &= match (conn, anchor, edge) {
                 (Some(c), Some(m), Some(edge)) => {
-                    near(c[0].0, m.x)
-                        && near(c[0].1, m.mid)
-                        && near(c[1].0, edge)
-                        && near(c[1].1, m.mid)
-                        && near(c[2].0, r.x)
-                        && c[2].1 >= r.y
-                        && c[2].1 <= r.bottom()
+                    near(c[1].0, edge) && m.x < edge + 1.0 && r.x > edge - 1.0
                 }
                 _ => false,
             };
         }
-        let look = d.look;
         balloons.push(Json::obj(vec![
             ("id", Json::Str(d.id.clone())),
             ("author", Json::Str(d.author.clone())),
             ("date", Json::Str(d.date.clone())),
-            ("date_utc", Json::Str(d.date_utc.clone())),
             ("text", Json::Str(d.text.clone())),
-            ("fill", look.map_or(Json::Null, |l| hex(l.fill))),
-            ("ink", look.map_or(Json::Null, |l| hex(l.ink))),
-            ("edge", look.map_or(Json::Null, |l| hex(l.edge))),
+            ("fill", hex(d.look.fill)),
+            ("ink", hex(d.look.ink)),
+            ("edge", hex(d.look.edge)),
             ("selected", Json::Bool(d.selected)),
             (
                 "page",

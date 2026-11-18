@@ -885,8 +885,9 @@ struct FixtureComment {
 }
 
 /// The `comments` fixture's comments (#2232): three open and two resolved,
-/// by two made-up reviewers. The open ones are dated at noon UTC, so their
-/// day is November 17 from 11 h behind UTC to 11 h ahead.
+/// by two made-up reviewers. Their `w:date`s are local wall times, which a
+/// balloon shows as written (there is no `commentsExtensible.xml`), so the
+/// shown dates do not depend on the machine's zone.
 #[cfg(test)]
 const FIXTURE_COMMENTS: [FixtureComment; 5] = [
     FixtureComment {
@@ -899,7 +900,7 @@ const FIXTURE_COMMENTS: [FixtureComment; 5] = [
     FixtureComment {
         id: 1,
         author: "Avery Lane",
-        date: "2026-11-17T12:00:00Z",
+        date: "2026-11-17T18:41:00Z",
         done: false,
         text: "Is this the right word?",
     },

@@ -16886,14 +16886,12 @@ fn story_comment_ids(tab: &DocTab, doc: &Document) -> std::collections::BTreeSet
     ids
 }
 
-/// Whether `tab` may show comment balloons (#2232): in All Markup, not a
-/// live preview, with Show Comments on for the tab and an open comment
-/// listed. Which of them are anchored in the body decides the rest.
-fn balloons_on(tab: &DocTab, markup: MarkupView, previewing: bool) -> bool {
-    markup == MarkupView::All
-        && !previewing
-        && !tab.balloons_hidden
-        && tab.comments.iter().any(|c| !c.resolved)
+/// Whether `tab` may show comment balloons (#2232): in All Markup, with
+/// Show Comments on for the tab and an open comment listed (a live preview
+/// keeps them, so the page does not move). Which of them are anchored in
+/// the body decides the rest.
+fn balloons_on(tab: &DocTab, markup: MarkupView) -> bool {
+    markup == MarkupView::All && !tab.balloons_hidden && tab.comments.iter().any(|c| !c.resolved)
 }
 
 /// Review > Show Comments on `tab` (#2232): its balloons hidden, or shown
@@ -17163,7 +17161,8 @@ fn add_doc_comment(tab: &mut DocTab, text: String, identity: (String, String)) -
         id: id.to_string(),
         author,
         initials,
-        date: utc_now_iso(),
+        // Word's comment stamp: local wall time with a `Z` (#2232).
+        date: balloons::word_comment_date(unix_now(), gridcore::clock::local_offset_minutes()),
         text,
         quoted,
         ..Comment::default()
@@ -17274,10 +17273,14 @@ pub(crate) fn tab_field_context(tab: Option<&DocTab>) -> docxcore::field::FieldC
 
 /// Now as a UTC ISO-8601 `w:date` (`YYYY-MM-DDTHH:MM:SSZ`).
 fn utc_now_iso() -> String {
-    let secs = std::time::SystemTime::now()
+    docxcore::field::format_iso(&docxcore::field::civil_from_unix(unix_now()))
+}
+
+/// Seconds since the Unix epoch, now.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    docxcore::field::format_iso(&docxcore::field::civil_from_unix(secs))
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// Serialize a document to `.docx` bytes, adding a numbering part when it uses
@@ -29969,10 +29972,7 @@ impl Docxy {
 
     /// The Resolve button of one comment card: select it and toggle it.
     fn resolve_comment(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected_comment = close::tab_ids(&self.tabs)
-            .into_iter()
-            .nth(self.active)
-            .map(|tab| (tab, id));
+        self.select_comment(id);
         self.resolve_selected_comment(window, cx);
     }
 
@@ -30202,20 +30202,20 @@ impl Docxy {
 
     /// The frame's comment balloon context (#2232), and the markup area's
     /// state begun for it: `None`, with no markup area, unless the active
-    /// document is in All Markup, not a live preview, Show Comments is on
-    /// for its tab, and an open comment it lists has a marker in the body
-    /// drawn (`shown`). `doc` is the editor's own, which decides which
-    /// comments are listed ([`live_comments`]).
+    /// document is in All Markup, Show Comments is on for its tab, and an
+    /// open comment it lists has a marker in the body drawn (`shown`). `doc`
+    /// is the drawn editor's own (a live preview's keeps the markers), which
+    /// decides which comments are listed ([`live_comments`]), so a preview
+    /// keeps the markup area and the page does not move.
     fn balloon_ctx(
         &self,
         tab: &DocTab,
         doc: &Document,
         shown: &Document,
         doc_pal: Pal,
-        previewing: bool,
     ) -> Option<balloons::CommentCtx> {
         let state = self.balloon_state.clone();
-        let on = balloons_on(tab, self.markup, previewing);
+        let on = balloons_on(tab, self.markup);
         let live = if on {
             live_comments(tab, doc)
         } else {
@@ -30232,7 +30232,15 @@ impl Docxy {
             return None;
         }
         let selected = selected_comment_id(&self.tabs, self.active, &self.selected_comment);
+        // `w:date` is shown as written; Word's true UTC date, where the
+        // package has one, in the local zone.
         let offset = gridcore::clock::local_offset_minutes();
+        let utc = tab.pkg.as_ref().map_or_else(Default::default, |pkg| {
+            balloons::utc_dates(
+                pkg.part_text("word/commentsIds.xml").as_deref(),
+                pkg.part_text("word/commentsExtensible.xml").as_deref(),
+            )
+        });
         let mut looks = std::collections::HashMap::new();
         let mut drawn = Vec::new();
         for c in &margin {
@@ -30245,10 +30253,9 @@ impl Docxy {
             drawn.push(balloons::Drawn {
                 id: c.id.clone(),
                 author: c.author.clone(),
-                date: balloons::balloon_date(&c.date, offset).unwrap_or_default(),
-                date_utc: balloons::balloon_date(&c.date, 0).unwrap_or_default(),
+                date: balloons::shown_date(c, &utc, offset),
                 text: c.text.clone(),
-                look: Some(look),
+                look,
                 selected: selected.as_deref() == Some(c.id.as_str()),
                 page: 0,
             });
@@ -30264,9 +30271,12 @@ impl Docxy {
             st.drawn = drawn;
             st.resolved_hidden = live.iter().filter(|c| c.resolved).count();
             st.area_w = balloons::markup_w(self.zoom);
-            // The last frame's measure, when it was this tab in this view;
-            // else nothing yet, and the frame's probes ask for the next.
-            let key = Some((self.active, self.page_view));
+            // The last frame's measure, when it was this tab (by its
+            // identity) in this view at this zoom; else nothing yet, and the
+            // frame's probes ask for the next.
+            let key = close::tab_ids(&self.tabs)
+                .get(self.active)
+                .map(|id| balloons::measure_key(id, self.page_view, self.zoom));
             st.used = if st.last.key == key {
                 st.last.clone()
             } else {
@@ -30316,9 +30326,7 @@ impl Docxy {
             let Some(d) = st.drawn.iter().find(|d| d.id == p.id) else {
                 continue;
             };
-            let Some(look) = d.look else {
-                continue;
-            };
+            let look = d.look;
             let top = match view {
                 Some(balloons::View::Print) => {
                     p.top - st.used.page_tops.get(p.page).copied().unwrap_or(0.0)
@@ -30570,10 +30578,7 @@ impl Docxy {
                     .on_click(cx.listener({
                         let id = id.clone();
                         move |this, _, window, cx| {
-                            this.selected_comment = close::tab_ids(&this.tabs)
-                                .into_iter()
-                                .nth(this.active)
-                                .map(|tab| (tab, id.clone()));
+                            this.select_comment(id.clone());
                             this.goto_comment(quoted.clone(), window, cx)
                         }
                     })),
@@ -39378,12 +39383,34 @@ fn paragraph_el(
                 x = 0.0; // a hard break restarts the line
             }
             Inline::Revision { content, .. } => {
+                // Comment markers inside the change (#2232) open and close
+                // their ranges as the body walk does: a range's start before
+                // the change's text, its end and reference after it.
+                let mut marks = Vec::new();
+                if flow.comments.is_some() {
+                    balloons::inline_markers(content, &mut |k, id| marks.push((k, id)));
+                }
+                let (before, after): (Vec<_>, Vec<_>) = marks
+                    .into_iter()
+                    .partition(|(k, _)| *k == balloons::Mark::Start);
+                if let Some((comments, _)) = flow.comments {
+                    for (kind, id) in &before {
+                        balloons::apply_marker(*kind, id, &mut open_comments);
+                        spans.extend(comments.marker_el(*kind, id, caret_h, line_h));
+                    }
+                }
                 // A tracked change is shown, not edited here: its text takes no
                 // caret offsets (the engine counts it as none), and carries the
                 // underline / strike cue the loader gave its runs.
                 emit_revision_text(
                     &mut spans, content, in_link, base, pal, styler, zoom, click, idx,
                 );
+                if let Some((comments, _)) = flow.comments {
+                    for (kind, id) in &after {
+                        balloons::apply_marker(*kind, id, &mut open_comments);
+                        spans.extend(comments.marker_el(*kind, id, caret_h, line_h));
+                    }
+                }
             }
             Inline::Raw(xml) => {
                 // An alignment tab (#768) places the text after it against the
@@ -39468,13 +39495,7 @@ fn paragraph_el(
                 // (bookmarks, …) is invisible content and renders nothing.
                 if let Some((comments, _)) = flow.comments {
                     for (kind, id) in balloons::markers(xml) {
-                        match kind {
-                            balloons::Mark::Start if !open_comments.contains(&id) => {
-                                open_comments.push(id.clone())
-                            }
-                            balloons::Mark::End => open_comments.retain(|o| *o != id),
-                            _ => {}
-                        }
+                        balloons::apply_marker(kind, &id, &mut open_comments);
                         spans.extend(comments.marker_el(kind, &id, caret_h, line_h));
                     }
                 }
@@ -46383,8 +46404,7 @@ impl Render for Docxy {
                     // Comment balloons (#2232), built once a frame: `None`
                     // (no markup area) unless All Markup shows an open
                     // comment anchored in the body.
-                    let comment_ctx =
-                        self.balloon_ctx(tab, &editor.doc, &shown, doc_pal, previewing);
+                    let comment_ctx = self.balloon_ctx(tab, &editor.doc, &shown, doc_pal);
                     let balloon_els = comment_ctx
                         .as_ref()
                         .map(|c| self.balloon_els(c, cx))
@@ -47212,7 +47232,7 @@ impl Render for Docxy {
                             .py(px(balloons::FLOW_PAD_Y))
                             .children(blocks)
                             // An in-flow child sits inside the scroll area's 48px padding.
-                            // Keep it last so the caret follow's bounds_for_item(b) still indexes block b.
+                            // Keep it after the blocks so the caret follow's bounds_for_item(b) still indexes block b.
                             // A percent width resolves against the scroll area,
                             // not its scrolled extent: it is the text width.
                             // Its prepaint comes after the scroll area has
