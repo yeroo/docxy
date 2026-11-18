@@ -1,0 +1,43 @@
+# Comment balloons (#2232), their Linux-only half: `doc-comment-balloons.uit`
+# runs the same fixture on every OS. Here the text layout of
+# `fixtures/comments.docx` in Print Layout is compared with that of
+# `fixtures/comments-plain.docx`, the same text with no comment: the
+# markers' zero-width spans and the range shading move no word. Block 3
+# wraps, so its line break is compared too. The line breaks depend on the
+# OS's fonts (Liberation Sans for Calibri's metrics here), so the literals
+# are Linux's.
+os linux
+
+test issue 2232 comments leave the text layout as it is
+  open copy:../fixtures/comments-plain.docx
+  call window-size {"w":1300,"h":900}
+  call theme-set {"theme":"light"}
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is print
+  shot window
+  call doc {}
+  assert reply.comments.markup is false
+  assert reply.page.layout.paragraphs.2.lines.0.text is Beta near words here.
+  assert reply.page.layout.paragraphs.3.height is 44
+  assert reply.page.layout.paragraphs.3.lines.0.x is 0
+  assert reply.page.layout.paragraphs.3.lines.1.x is 0
+  assert reply.page.layout.paragraphs.3.lines.1.text is incididunt ut labore et dolore magna aliqua, and then it starts a range
+  assert reply.page.layout.paragraphs.4.lines.0.text is Delta ends it here.
+  assert reply.page.layout.paragraphs.4.top is 132
+  assert reply.page.layout.paragraphs.5.top is 160
+  open copy:../fixtures/comments.docx
+  shot window
+  call doc {}
+  assert reply.comments.markup is true
+  assert reply.comments.count is 3
+  assert reply.page.layout.paragraphs.2.lines.0.text is Beta near words here.
+  assert reply.page.layout.paragraphs.3.height is 44
+  assert reply.page.layout.paragraphs.3.lines.0.x is 0
+  assert reply.page.layout.paragraphs.3.lines.1.x is 0
+  assert reply.page.layout.paragraphs.3.lines.1.text is incididunt ut labore et dolore magna aliqua, and then it starts a range
+  assert reply.page.layout.paragraphs.4.lines.0.text is Delta ends it here.
+  assert reply.page.layout.paragraphs.4.top is 132
+  assert reply.page.layout.paragraphs.5.top is 160
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  assert view.layout is web
+  call theme-set {"theme":"auto"}

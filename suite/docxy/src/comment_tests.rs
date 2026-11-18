@@ -803,3 +803,62 @@ fn converted_tab_remove_all_save_undo_save_keeps_the_comments_xml() {
     let (_, comments) = saved(&docx);
     assert!(comments.contains(RICH_COMMENT), "{comments}");
 }
+
+/// #2232: a document with open comments shows its balloons on open (All
+/// Markup only); Show Comments hides them for its own tab, another tab of
+/// the same file keeps them, and nothing of it is saved.
+#[test]
+fn balloons_hidden_is_per_tab_2232() {
+    use crate::{balloons_on, toggle_balloons};
+    use docxcore::markup::MarkupView;
+    let dir = Scratch::new();
+    let path = write(
+        &dir,
+        "comments.docx",
+        &crate::ext_fixture::comments_docx(true),
+    );
+    let mut a = tab_from_path(&path);
+    let b = tab_from_path(&path);
+    assert!(balloons_on(&a, MarkupView::All, false), "on at open");
+    assert!(!balloons_on(&a, MarkupView::Simple, false));
+    assert!(!balloons_on(&a, MarkupView::NoMarkup, false));
+    assert!(!balloons_on(&a, MarkupView::Original, false));
+    assert!(
+        !balloons_on(&a, MarkupView::All, true),
+        "not in a live preview"
+    );
+    toggle_balloons(&mut a);
+    assert!(!balloons_on(&a, MarkupView::All, false));
+    assert!(
+        balloons_on(&b, MarkupView::All, false),
+        "the other tab keeps them"
+    );
+    // Saved and opened again: on.
+    assert!(save_doc_tab(&mut a, None), "{}", a.status);
+    assert!(balloons_on(&tab_from_path(&path), MarkupView::All, false));
+    toggle_balloons(&mut a);
+    assert!(balloons_on(&a, MarkupView::All, false));
+    // A document whose comments are all resolved shows none.
+    let plain = write(
+        &dir,
+        "plain.docx",
+        &crate::ext_fixture::comments_docx(false),
+    );
+    assert!(!balloons_on(&tab_from_path(&plain), MarkupView::All, false));
+}
+
+/// #2232: the Comments pane lists the open comments first, then the
+/// resolved ones under their heading, and quotes the anchor on one line.
+#[test]
+fn comments_pane_lists_resolved_last_2232() {
+    use crate::{pane_order, pane_quote};
+    let c = |id: &str, resolved: bool| docxcore::comments::Comment {
+        id: id.into(),
+        resolved,
+        ..Default::default()
+    };
+    let all = vec![c("0", true), c("1", false), c("2", false), c("4", true)];
+    let ids: Vec<&str> = pane_order(&all).iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ids, vec!["1", "2", "0", "4"]);
+    assert_eq!(pane_quote("one\ntwo  three\n"), "one two three");
+}
