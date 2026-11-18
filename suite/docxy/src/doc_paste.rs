@@ -19,15 +19,42 @@ pub(crate) const UNFORMATTED: &str = "Unformatted Text";
 /// Keep Text Only's status when the clipboard holds no text.
 const NO_TEXT: &str = "There is no text to paste";
 
-/// Give a package without a numbering part the one that defines the lists
-/// another app's pasted list items name (#1967: 1 bullets, 2 decimal,
-/// [`docxcore::package::Package::add_markdown_numbering`]), as Bullets and
-/// Numbering do, so a save defines them. A clip without lists, or a
-/// package that has a numbering part, changes nothing; a tab with no
-/// package gets the part when its save builds one with a list in it.
-pub(crate) fn numbering_for_paste(pkg: Option<&mut docxcore::package::Package>, clip: &Clip) {
-    if let Some(pkg) = pkg.filter(|_| clip.has_lists()) {
-        pkg.add_markdown_numbering();
+/// Another app's pasted list items in the package's own lists (#1967,
+/// #2087 r3): its importers name 1 (bullets) and 2 (decimal), which become
+/// the lists Bullets and Numbering apply there ([`crate::ListIds`]: 1 and 2,
+/// or docxy's reserved 9990 / 9991 where the package's numbering part
+/// defines 1 or 2 as the other kind or leaves them undefined), and each kind
+/// pasted is defined in the package ([`crate::ListIds::define`]), so the
+/// view and a save show it. A clip without lists changes nothing; a tab
+/// with no package keeps 1 and 2 and gets the part when its save builds one
+/// with a list in it.
+pub(crate) fn numbering_for_paste(pkg: Option<&mut docxcore::package::Package>, clip: &mut Clip) {
+    let Some(pkg) = pkg.filter(|_| clip.has_lists()) else {
+        return;
+    };
+    let ids = crate::ListIds::of_package(Some(pkg));
+    let mut kinds = [false; 2];
+    let lists = (0..clip.paras.len())
+        .map(|i| {
+            clip.list(i).map(|l| {
+                let bullet = match l.num_id {
+                    crate::NUM_BULLET => true,
+                    crate::NUM_DECIMAL => false,
+                    _ => return l,
+                };
+                kinds[usize::from(bullet)] = true;
+                docxcore::editor::ClipList {
+                    num_id: ids.id(bullet),
+                    ..l
+                }
+            })
+        })
+        .collect();
+    clip.set_lists(lists);
+    for bullet in [false, true] {
+        if kinds[usize::from(bullet)] {
+            ids.define(Some(pkg), bullet);
+        }
     }
 }
 
@@ -228,7 +255,10 @@ mod tests {
         assert!(list.has_lists());
         let mut pkg = blank();
         assert!(pkg.part(NUMBERING).is_none());
-        numbering_for_paste(Some(&mut pkg), &list);
+        let mut first = list.clone();
+        numbering_for_paste(Some(&mut pkg), &mut first);
+        // No part: docxy's own 1 and 2, kept.
+        assert_eq!(first, list);
         let xml = pkg.part_text(NUMBERING).expect("a numbering part");
         assert!(
             xml.contains("w:numId=\"1\"") && xml.contains("w:numId=\"2\""),
@@ -248,19 +278,55 @@ mod tests {
             )
         };
         let before = parts(&pkg);
-        numbering_for_paste(Some(&mut pkg), &list);
+        let mut again = list.clone();
+        numbering_for_paste(Some(&mut pkg), &mut again);
         assert_eq!(parts(&pkg), before);
-        let mut own = blank();
-        own.add_markdown_numbering();
-        assert!(own.set_part(NUMBERING, b"<w:numbering/>".to_vec()));
-        let before = parts(&own);
-        numbering_for_paste(Some(&mut own), &list);
-        assert_eq!(parts(&own), before);
+        assert_eq!(again, list, "1 and 2 kept where the part defines them");
         // No lists: no part.
         let mut plain = blank();
-        numbering_for_paste(Some(&mut plain), &Clip::from_text("a\nb"));
+        numbering_for_paste(Some(&mut plain), &mut Clip::from_text("a\nb"));
         assert!(plain.part(NUMBERING).is_none());
-        numbering_for_paste(None, &list);
+        let mut none = list.clone();
+        numbering_for_paste(None, &mut none);
+        assert_eq!(none, list);
+    }
+
+    /// A list pasted into a package whose numbering part defines 1 as
+    /// decimal, or leaves 1 and 2 undefined (#2087 r3): its items take the
+    /// lists Bullets and Numbering apply there, docxy's reserved 9990 /
+    /// 9991, defined in the part, so the bullets draw as bullets.
+    #[test]
+    fn a_list_paste_takes_the_documents_lists_2087() {
+        use docxcore::package::{BULLET_LIST_NUM_ID, NUMBER_LIST_NUM_ID, new_package};
+        const NUMBERING: &str = "word/numbering.xml";
+        let list = Clip::from_html("<ul><li>a</li></ul><ol><li>b</li></ol>", None).unwrap();
+        let kinds = |c: &Clip| (c.list(0).map(|l| l.num_id), c.list(1).map(|l| l.num_id));
+        assert_eq!(kinds(&list), (Some(1), Some(2)));
+        for part in [
+            // numId 1 decimal, 2 undefined: the dark-mode fixture's shape.
+            r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
+            // Neither defined.
+            r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"></w:numbering>"#,
+        ] {
+            let mut pkg = new_package(docxcore::model::Document { body: vec![] });
+            pkg.add_markdown_numbering();
+            assert!(pkg.set_part(NUMBERING, part.as_bytes().to_vec()));
+            let mut clip = list.clone();
+            numbering_for_paste(Some(&mut pkg), &mut clip);
+            assert_eq!(
+                kinds(&clip),
+                (Some(BULLET_LIST_NUM_ID), Some(NUMBER_LIST_NUM_ID)),
+                "{part}"
+            );
+            let numbering =
+                docxcore::numbering::parse_numbering_xml(&pkg.part_text(NUMBERING).unwrap());
+            assert!(numbering.defines(BULLET_LIST_NUM_ID), "{part}");
+            assert!(numbering.defines(NUMBER_LIST_NUM_ID), "{part}");
+            assert_eq!(
+                crate::ListIds::of(Some(&numbering)).bullet,
+                BULLET_LIST_NUM_ID
+            );
+        }
     }
 
     /// Formatted Text is offered only for our live copy or a readable RTF.

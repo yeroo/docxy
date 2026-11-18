@@ -97,10 +97,14 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
   A piece with no list leaves the props as before (the target's, in the
   middle). The list is set untracked, as `set_list` is: while tracking, a
   Reject of the paste leaves the list on the caret's paragraph (a gap).
-- A paste with lists gives the package without a numbering part the one
-  that defines 1 and 2 (`doc_paste::numbering_for_paste`, i.e.
-  `add_markdown_numbering`): `Docxy::do_paste` for a tab that `saves_as_word`,
-  and the ext DocView's `paste_clip`. A tab with no package gets it from
+- A paste with lists puts its items in the package's own lists
+  (`doc_paste::numbering_for_paste`, #2087 r3): the importers' 1
+  (bullets) and 2 (decimal) become `ListIds`' (1 and 2, or docxy's
+  reserved 9990 / 9991 where the numbering part defines 1 or 2 as the other
+  kind or leaves them undefined, `docs/claude/docx-editing.md` §Lists), and
+  each kind pasted is defined (`ListIds::define`: a package without a
+  numbering part gets `add_markdown_numbering`'s): `Docxy::do_paste` for a
+  tab that `saves_as_word`, and the ext DocView's `paste_clip`. A tab with no package gets it from
   `blank_base` at its save, which sees body paragraphs only.
 - Only list membership crosses: an HTML item's indent and marker look, and
   other paragraph formatting, do not. The RTF importer reads `\pnlvlbody`

@@ -605,6 +605,7 @@ pub fn heading_chapters(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Inline, ParProps, Paragraph, Run, RunProps};
 
     /// A list's abstract (#2087): the one its `w:num` names, the defining
     /// one for a list-style link, and none for an undefined list.
@@ -625,7 +626,6 @@ mod tests {
         assert_eq!(num.abstract_of(8), Some(6));
         assert_eq!(num.abstract_of(9), None);
     }
-    use crate::model::{Inline, ParProps, Paragraph, Run, RunProps};
 
     /// #2231: a level's `w:pPr/w:ind`, `w:hanging` as a negative first line;
     /// a level without one, or a list not defined, has none.

@@ -445,7 +445,7 @@ pub(crate) fn paste_clip(
         }
     }
     // Another app's list items name lists the package must define (#1967).
-    crate::doc_paste::numbering_for_paste(pkg.as_mut(), &clip);
+    crate::doc_paste::numbering_for_paste(pkg.as_mut(), &mut clip);
     let out = edit(ed, |ed| ed.one_step("Paste", |e| e.paste(&clip)));
     Formatted {
         ran: true,
@@ -695,7 +695,7 @@ pub(crate) fn apply_format(ed: &mut Editor, pkg: Option<&mut Package>, f: &DocFo
             // The document's list (#2087): docxy's own 1 and 2, or its
             // reserved one where the package defines those otherwise.
             let bullet = *f == DocFormat::Bullets;
-            let ids = list_ids(pkg.as_deref());
+            let ids = ListIds::of_package(pkg.as_deref());
             ids.define(pkg, bullet);
             let num = ids.id(bullet);
             Box::new(move |ed| toggle_list(ed, num))
@@ -731,15 +731,6 @@ fn link_step(ed: &mut Editor, f: impl FnOnce(&mut Editor) -> bool) -> Formatted 
         ran,
         changed: ran && out.changed(),
     }
-}
-
-/// The lists Bullets and Numbering apply in `pkg` (#2087): [`ListIds::of`]
-/// its numbering part.
-pub(crate) fn list_ids(pkg: Option<&Package>) -> ListIds {
-    let numbering = pkg
-        .and_then(|p| p.part_text("word/numbering.xml"))
-        .map(|xml| docxcore::numbering::parse_numbering_xml(&xml));
-    ListIds::of(numbering.as_ref())
 }
 
 /// The formatting at `ed`'s caret, its list buttons over `lists`, the
@@ -2090,7 +2081,7 @@ mod tests {
         ));
         let mut ed = Editor::new(doc);
         assert!(apply_format(&mut ed, Some(&mut pkg), &DocFormat::Bullets).ran);
-        let lists = list_ids(Some(&pkg));
+        let lists = ListIds::of_package(Some(&pkg));
         assert_eq!(lists.bullet, BULLET_LIST_NUM_ID);
         assert!(caret_format(&ed, lists).bullets);
         let numbering =
@@ -2100,6 +2091,6 @@ mod tests {
             [Some("\u{2022} ".to_string())]
         );
         assert!(apply_format(&mut ed, Some(&mut pkg), &DocFormat::Bullets).ran);
-        assert!(!caret_format(&ed, list_ids(Some(&pkg))).bullets);
+        assert!(!caret_format(&ed, ListIds::of_package(Some(&pkg))).bullets);
     }
 }

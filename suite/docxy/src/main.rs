@@ -28688,7 +28688,7 @@ impl Docxy {
             // Another app's list items name lists the package must define.
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 if tab.saves_as_word() {
-                    doc_paste::numbering_for_paste(tab.pkg.as_mut(), &clip);
+                    doc_paste::numbering_for_paste(tab.pkg.as_mut(), &mut clip);
                 }
             }
             self.with_editor(window, cx, |e| e.one_step("Paste", |e| e.paste(&clip)));
@@ -35818,6 +35818,40 @@ mod repeat_tests {
         assert!(numbering.defines(NUM_BULLET) && numbering.defines(NUM_DECIMAL));
     }
 
+    /// A `w:ilvl` out of OOXML's nine levels draws as level 0 or 8, as
+    /// `Numbering::count` clamps it (#2087 r3): no panic, no huge count.
+    #[test]
+    fn a_list_level_out_of_range_is_clamped_2087() {
+        use docxcore::model::{Block, ParProps, Paragraph};
+        let p = |ilvl| {
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    num_id: Some(1),
+                    ilvl,
+                    ..ParProps::default()
+                },
+                content: Vec::new(),
+            })
+        };
+        let numbering = docxcore::numbering::parse_numbering_xml(
+            r#"<w:numbering><w:abstractNum w:abstractNumId="0">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum>
+            <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
+        );
+        let s = |m: &str| Some(m.to_string());
+        for numbering in [Some(&numbering), None] {
+            let shown = list_markers(&[p(-1), p(1_000_000_000), p(-5)], numbering);
+            assert_eq!(shown.len(), 3);
+            assert!(shown.iter().all(Option::is_some), "{shown:?}");
+        }
+        // Level 0, then level 8 (numbered, past the defined levels), then
+        // level 0 again: its count goes on.
+        assert_eq!(
+            list_markers(&[p(-1), p(1_000_000_000), p(-5)], Some(&numbering)),
+            [s("1. "), s("1. "), s("2. ")]
+        );
+    }
+
     /// Each list counts on its own (#2087 r1): two numbered lists side by
     /// side in the body, or in two columns of a table, an item per row, each
     /// number 1, 2, 3; a bullet column beside a numbered one never restarts
@@ -39433,6 +39467,14 @@ impl ListIds {
         }
     }
 
+    /// The ids in `pkg`, its numbering part parsed.
+    pub(crate) fn of_package(pkg: Option<&Package>) -> Self {
+        let numbering = pkg
+            .and_then(|p| p.part_text("word/numbering.xml"))
+            .map(|xml| docxcore::numbering::parse_numbering_xml(&xml));
+        ListIds::of(numbering.as_ref())
+    }
+
     /// The bullet list's id, or the numbered one's.
     pub(crate) fn id(self, bullet: bool) -> i32 {
         if bullet { self.bullet } else { self.decimal }
@@ -39507,10 +39549,14 @@ fn list_markers_counting(
         let marker = match b {
             Block::Paragraph(p) if p.props.in_list() => {
                 had_item = true;
-                let ilvl = p.props.ilvl as usize;
+                // OOXML's nine levels, as `Numbering::count` clamps them
+                // (#2087 r3): a negative or huge `w:ilvl` must not index or
+                // grow the counts.
+                let level = p.props.ilvl.clamp(0, 8);
+                let ilvl = level as usize;
                 let num_id = p.props.num_id.unwrap_or_default();
                 let list = counts.entry(ListKey::of(num_id, numbering)).or_default();
-                if numbered(num_id, p.props.ilvl) {
+                if numbered(num_id, level) {
                     if list.len() <= ilvl {
                         list.resize(ilvl + 1, 0);
                     }

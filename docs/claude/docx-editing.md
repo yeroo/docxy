@@ -23,7 +23,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   lists share numId 1 and 2); in a table they count on from cell to cell
   (`TableListCounts`, `docs/claude/suite-document.md` §#2087). Not done:
   `w:lvlOverride` / `w:startOverride` restarts.
-- The lists Bullets, Numbers and AutoCorrect's `* ` / `1. ` apply
+- The lists Bullets, Numbers, AutoCorrect's `* ` / `1. ` and another app's
+  pasted list items (r3, `doc_paste::numbering_for_paste`) apply
   (`ListIds`, #2087 r1): docxy's own 1 and 2 in a document with no
   numbering part or one whose part defines that id as the same kind at
   level 0; else (the part defines it as the other kind, or leaves it
