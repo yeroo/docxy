@@ -450,9 +450,15 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   empty in it): a cut carries exactly what its delete removes (a cell range:
   every one, as `clear_cells` does), a copy every one covered, any author.
   `tests/tracked_field_insert.rs` cross-checks every selection of a small
-  document. An untracked cut carries none. The terminal view keeps only the caret stop after one
-  (`render.rs` `keep_stops_after_pending_objects`); the suite's
-  `paragraph_el` holds a run-end caret past one (`pending_object_follows`).
+  document. An untracked cut carries none (an untracked delete across
+  paragraphs drops them: a known gap). Typing before a link whose text
+  starts after one goes into the link past it; past a link holding only
+  one, after the link (`link_opening_with_pending`). The terminal view
+  draws the caret after one: `projected_caret_stops` makes the stop on the
+  previous character's trailing side (either direction) a click-only
+  `LineSeg::hits` entry, so clicks on the object's text land at its offset
+  and arrows step over it in one press; the suite's `paragraph_el` holds a
+  run-end caret past one (`pending_object_follows`).
 - Compare: a field failing `is_run_level(run_level_field(..))` is never in a
   `w:ins`/`w:del`: deleted, it is skipped; inserted, `emit_wrapped` lifts it
   out like a marker. Both report `CompareSkip::Object`.

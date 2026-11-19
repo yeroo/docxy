@@ -327,22 +327,22 @@ impl Editor {
         let Some(paths) = self.tracked_delete_paths(lo, hi) else {
             return false;
         };
-        let (first, last) = (0, paths.len() - 1);
+        let last = paths.len() - 1;
         for (k, path) in paths.iter().enumerate() {
             let Some(para) = resolve_para(&self.doc.body, path) else {
                 continue;
             };
             let len: usize = para.content.iter().map(inline_len).sum();
-            let (from, to) = match (k == 0, first + k == last) {
+            let (from, to) = match (k == 0, k == last) {
                 (true, true) => (lo.offset, hi.offset),
                 (true, false) => (lo.offset, len),
                 (false, true) => (0, hi.offset.min(len)),
                 (false, false) => (0, len),
             };
             // Kept only where the selection starts and ends, as untracked.
-            let keep = keep_units && (k == 0 || first + k == last);
+            let keep = keep_units && (k == 0 || k == last);
             if drop_objects {
-                self.drop_or_record_objects(path, from, to, k > 0, first + k < last);
+                self.drop_or_record_objects(path, from, to, k > 0, k < last);
             }
             self.remove_own_pending_objects_in(path, from, to, k > 0);
             self.delete_chars(path, from, to, keep);
@@ -812,20 +812,50 @@ fn record_inserted_objects(
 /// Where text typed at the zero-width inlines from `content[from]` on goes
 /// (#1625): past the last pending object insertion ([`is_pending_object`])
 /// among them, so text typed right after an inserted field or picture follows
-/// it, as before tracking wrapped it. The scan stops at the first inline with
-/// a width and at a loose field's begin, whose result text must not take it.
-/// `None` when none is there.
+/// it, as before tracking wrapped it. A link with no text holding one (a
+/// pasted linked picture, #1999) counts as one: the text goes after the
+/// link, not into it. The scan stops at the first inline with a width and
+/// at a loose field's begin, whose result text must not take it. `None`
+/// when none is there.
 pub(super) fn past_pending_objects(content: &[Inline], from: usize) -> Option<usize> {
     let mut past = None;
     for (k, inline) in content.iter().enumerate().skip(from) {
         if inline_len(inline) > 0 || begins_a_loose_field(inline) {
             break;
         }
-        if is_pending_object(inline) {
+        let holds_one = matches!(inline, Inline::Hyperlink(h)
+            if h.content.iter().any(is_pending_object));
+        if is_pending_object(inline) || holds_one {
             past = Some(k + 1);
         }
     }
     past
+}
+
+/// The index of a link among the zero-width inlines from `content[from]`
+/// on, or the first inline with a width after them, whose text starts after
+/// a pending object insertion (#1625): text typed there goes after the
+/// object, so into the link, ahead of its text.
+pub(super) fn link_opening_with_pending(content: &[Inline], from: usize) -> Option<usize> {
+    for (k, inline) in content.iter().enumerate().skip(from) {
+        if begins_a_loose_field(inline) {
+            return None;
+        }
+        if let Inline::Hyperlink(h) = inline {
+            let opens_with_one = h.runs.is_empty()
+                && h.content
+                    .iter()
+                    .take_while(|i| inline_len(i) == 0)
+                    .any(is_pending_object);
+            if opens_with_one && inline_len(inline) > 0 {
+                return Some(k);
+            }
+        }
+        if inline_len(inline) > 0 {
+            return None;
+        }
+    }
+    None
 }
 
 /// Whether a selection covers a pending object insertion at offset `p` of a

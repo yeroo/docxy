@@ -175,6 +175,10 @@ pub struct LineSeg {
     /// are ordered by visual traversal, not by logical offset. Interior offsets
     /// inside a grapheme cluster or zero-width control are omitted.
     pub visual: Vec<LineCaretStop>,
+    /// Stops a click or a vertical move may land on but the caret is never
+    /// drawn at nor steps through: the side of a pending object insertion's
+    /// shown text before it, for the offset whose caret is after it (#1625).
+    pub hits: Vec<LineCaretStop>,
 }
 
 impl LineSeg {
@@ -230,9 +234,21 @@ impl LineSeg {
         self.start + best
     }
     pub fn hit_for_col(&self, col: usize) -> Option<LineCaret> {
-        self.visual_positions()
+        self.hit_positions()
             .into_iter()
             .min_by_key(|caret| caret.col.abs_diff(col))
+    }
+    /// [`LineSeg::visual_positions`] and the click-only [`LineSeg::hits`],
+    /// by column.
+    pub fn hit_positions(&self) -> Vec<LineCaret> {
+        let mut all = self.visual_positions();
+        all.extend(self.hits.iter().map(|stop| LineCaret {
+            path: self.path.clone(),
+            offset: stop.offset,
+            col: self.col0 + stop.col,
+        }));
+        all.sort_by_key(|caret| caret.col);
+        all
     }
     pub fn visual_positions(&self) -> Vec<LineCaret> {
         self.visual
@@ -316,9 +332,9 @@ impl LineMap {
         }
     }
     pub fn nearest_caret(&self, col: usize) -> Option<LineCaret> {
-        self.visual_positions()
-            .into_iter()
-            .min_by_key(|caret| caret.col.abs_diff(col))
+        let mut all: Vec<LineCaret> = self.segs.iter().flat_map(LineSeg::hit_positions).collect();
+        all.sort_by_key(|caret| caret.col);
+        all.into_iter().min_by_key(|caret| caret.col.abs_diff(col))
     }
     pub fn visual_neighbor(
         &self,
@@ -2041,13 +2057,16 @@ struct ProjectedLine {
     start: usize,
     cols: Vec<usize>,
     visual: Vec<LineCaretStop>,
+    hits: Vec<LineCaretStop>,
     glyph_cells: Vec<Option<std::ops::Range<usize>>>,
 }
 
+/// `pending`: the offsets where a pending object insertion sits (#1625).
 fn project_line(
     glyphs: &[Glyph],
     base: BidiBaseDirection,
     projector: Option<&dyn BidiProjector>,
+    pending: &[usize],
 ) -> ProjectedLine {
     let visual_line = if let Some(projector) = projector {
         let input: Vec<BidiInputGlyph> = glyphs
@@ -2069,13 +2088,14 @@ fn project_line(
     let spans = projected_spans(glyphs, &visual_line);
     let glyph_cells = projected_glyph_cells(glyphs, &visual_line);
     let (start, cols) = projected_extent(&visual_line);
-    let visual = projected_caret_stops(&visual_line);
+    let (visual, hits) = projected_caret_stops(&visual_line, pending);
     ProjectedLine {
         spans,
         width: visual_line.width,
         start,
         cols,
         visual,
+        hits,
         glyph_cells,
     }
 }
@@ -2221,27 +2241,45 @@ fn projected_extent(visual: &BidiVisualLine) -> (usize, Vec<usize>) {
     (start, cols)
 }
 
-fn projected_caret_stops(visual: &BidiVisualLine) -> Vec<LineCaretStop> {
+/// The caret stops of a projected line, and its click-only hits: at an
+/// offset in `pending` (a pending object insertion, #1625) the caret is
+/// after the object, so where the line has a stop on the next character's
+/// leading side, the stop on the previous character's trailing side (before
+/// the object's shown text, whichever way the text runs) is a hit only.
+fn projected_caret_stops(
+    visual: &BidiVisualLine,
+    pending: &[usize],
+) -> (Vec<LineCaretStop>, Vec<LineCaretStop>) {
     let mut stops = Vec::new();
+    let mut hits = Vec::new();
     let mut extents = projected_logical_extents(visual);
     extents.sort_by_key(|extent| extent.cells.start);
+    let leads = |offset: usize| {
+        extents
+            .iter()
+            .any(|e| e.start == offset && e.cells.start != e.cells.end)
+    };
     for extent in &extents {
         if extent.cells.start == extent.cells.end {
             continue;
         }
-        let (left_offset, right_offset) = if extent.level % 2 == 1 {
+        let rtl = extent.level % 2 == 1;
+        let (left_offset, right_offset) = if rtl {
             (extent.end, extent.start)
         } else {
             (extent.start, extent.end)
         };
-        stops.push(LineCaretStop {
-            offset: left_offset,
-            col: extent.cells.start,
-        });
-        stops.push(LineCaretStop {
-            offset: right_offset,
-            col: extent.cells.end,
-        });
+        for (offset, col, trailing) in [
+            (left_offset, extent.cells.start, rtl),
+            (right_offset, extent.cells.end, !rtl),
+        ] {
+            let stop = LineCaretStop { offset, col };
+            if trailing && pending.contains(&offset) && leads(offset) {
+                hits.push(stop);
+            } else {
+                stops.push(stop);
+            }
+        }
     }
 
     let mut compacted = Vec::new();
@@ -2287,7 +2325,7 @@ fn projected_caret_stops(visual: &BidiVisualLine) -> Vec<LineCaretStop> {
         });
         compacted.insert(at, LineCaretStop { offset, col });
     }
-    compacted
+    (compacted, hits)
 }
 
 fn prefix_glyphs(prefix: &str) -> Vec<Glyph> {
@@ -2318,24 +2356,6 @@ fn pending_object_offsets(content: &[Inline], base: usize, out: &mut Vec<usize>)
             pending_object_offsets(&h.content, at + runs, out);
         }
         at += crate::editor::inline_len(inline);
-    }
-}
-
-/// The caret is after a pending object insertion at its offset (typing there
-/// goes after it, #1625), so of the stops a line has for that offset, one on
-/// each side of the object's shown text, only the last in visual order stays.
-/// Other zero-width content (a deletion, a bookmark) keeps its stops.
-fn keep_stops_after_pending_objects(visual: &mut Vec<LineCaretStop>, offsets: &[usize]) {
-    for &offset in offsets {
-        let Some(last) = visual.iter().rposition(|stop| stop.offset == offset) else {
-            continue;
-        };
-        let mut k = 0;
-        visual.retain(|stop| {
-            let keep = stop.offset != offset || k == last;
-            k += 1;
-            keep
-        });
     }
 }
 
@@ -2458,6 +2478,7 @@ fn render_paragraph(
                         offset: k + 1,
                         col: 0,
                     }],
+                    hits: Vec::new(),
                 });
             }
             continue;
@@ -2489,7 +2510,12 @@ fn render_paragraph(
             let prefix_count = prefix.chars().count();
             let mut line_glyphs = prefix_glyphs(prefix);
             line_glyphs.extend(gl.iter().cloned());
-            let projected = project_line(&line_glyphs, base_direction, opts.bidi.as_deref());
+            let projected = project_line(
+                &line_glyphs,
+                base_direction,
+                opts.bidi.as_deref(),
+                &pending_offsets,
+            );
             let total = projected.width;
             let align = opts
                 .styles
@@ -2531,7 +2557,6 @@ fn render_paragraph(
                     col: stop.col.saturating_sub(line_start_col),
                 })
                 .collect();
-            keep_stops_after_pending_objects(&mut visual, &pending_offsets);
             // A line with no editable character (empty after a break, or a
             // lone `¶`) holds the offset its seg starts at.
             let start = if visual.is_empty() {
@@ -2545,12 +2570,21 @@ fn render_paragraph(
                     col: 0,
                 });
             }
+            let hits = projected
+                .hits
+                .iter()
+                .map(|stop| LineCaretStop {
+                    offset: stop.offset,
+                    col: stop.col.saturating_sub(line_start_col),
+                })
+                .collect();
             let lseg = LineSeg {
                 path: path.to_vec(),
                 start,
                 col0: prefix_cols,
                 cols,
                 visual,
+                hits,
             };
             // Place any inline images sitting on this line and reserve the rows
             // their pixels extend below the text baseline.
@@ -4123,6 +4157,7 @@ mod tests {
                     LineCaretStop { offset: 0, col: 0 },
                     LineCaretStop { offset: 1, col: 1 },
                 ],
+                hits: Vec::new(),
             });
             (line, map)
         };
@@ -4158,6 +4193,7 @@ mod tests {
                         LineCaretStop { offset: 0, col: 0 },
                         LineCaretStop { offset: 1, col: 1 },
                     ],
+                    hits: Vec::new(),
                 }),
             )
         };

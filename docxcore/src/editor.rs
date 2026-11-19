@@ -5272,6 +5272,15 @@ fn content_insert_with(content: &mut Vec<Inline>, o: usize, ch: char, typing: bo
     let width = inline_len(&content[i]);
     let after = if width == 0 { i } else { i + 1 };
     if typing && local == width {
+        // A link whose text starts after pending objects: typed after them,
+        // in the link (#1625).
+        if let Some(k) = track::link_opening_with_pending(content, after) {
+            if let Inline::Hyperlink(h) = &mut content[k] {
+                content_insert_with(&mut h.content, 0, ch, true);
+                h.content_changed = true;
+                return;
+            }
+        }
         let past = loose_fields::past_field_ends(content, after)
             .max(track::past_pending_objects(content, after));
         if let Some(at) = past {

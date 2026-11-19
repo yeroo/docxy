@@ -552,9 +552,28 @@ fn the_terminal_caret_is_drawn_after_a_pending_insertion() {
     );
     let (lines, maps) = render_mapped(&ed.doc, &RenderOptions::default());
     assert_eq!(lines[0].plain(), "ab777cd");
-    assert_eq!(maps[0].col_for_caret(&[0], 2, None), Some(5));
-    assert_eq!(maps[0].col_for_caret(&[0], 1, None), Some(1));
-    assert_eq!(maps[0].col_for_caret(&[0], 3, None), Some(6));
+    let map = &maps[0];
+    assert_eq!(map.col_for_caret(&[0], 2, None), Some(5));
+    assert_eq!(map.col_for_caret(&[0], 1, None), Some(1));
+    assert_eq!(map.col_for_caret(&[0], 3, None), Some(6));
+    // A click on or inside the object's text lands at its offset (r4).
+    for col in [2, 3, 4, 5] {
+        assert_eq!(
+            map.nearest_caret(col).map(|c| c.offset),
+            Some(2),
+            "col {col}"
+        );
+    }
+    assert_eq!(map.nearest_caret(1).map(|c| c.offset), Some(1));
+    // One arrow press steps over it, onto the caret after it.
+    for (from, right) in [(1, true), (3, false)] {
+        let to = map
+            .visual_neighbor(&[0], from, None, right)
+            .expect("a stop");
+        assert_eq!((to.offset, to.col), (2, 5), "from {from}");
+    }
+    let back = map.visual_neighbor(&[0], 2, None, false).expect("a stop");
+    assert_eq!(back.offset, 1);
 
     let deleted = Editor::new(parse(
         "<w:p><w:r><w:t>ab</w:t></w:r><w:del w:id=\"1\" w:author=\"Bo\"><w:r>\
@@ -816,4 +835,98 @@ fn a_copy_over_an_empty_middle_paragraph_is_unchanged() {
     let clip = ed.copy().expect("a clip");
     assert_eq!(clip.to_text(), "b\nc");
     assert_eq!(clip.paras.len(), 2);
+}
+
+/// Every glyph reversed, at an odd (right-to-left) level: a whole line of
+/// right-to-left text, as far as caret stops go.
+#[derive(Debug)]
+struct AllRtl;
+
+impl docxcore::render::BidiProjector for AllRtl {
+    fn project_line(
+        &self,
+        _: docxcore::render::BidiBaseDirection,
+        glyphs: &[docxcore::render::BidiInputGlyph],
+    ) -> docxcore::render::BidiVisualLine {
+        let n = glyphs.len();
+        docxcore::render::BidiVisualLine {
+            clusters: (0..n)
+                .rev()
+                .enumerate()
+                .map(|(k, i)| docxcore::render::BidiVisualCluster {
+                    glyphs: vec![i],
+                    logical: glyphs[i].logical_offset.map(|o| o..o + 1),
+                    level: 1,
+                    cells: k..k + 1,
+                })
+                .collect(),
+            width: n,
+        }
+    }
+}
+
+/// On a right-to-left line the caret after a pending insertion is on its
+/// left, so that is where it is drawn (r4 m3).
+#[test]
+fn the_terminal_caret_follows_a_pending_insertion_right_to_left() {
+    use docxcore::render::{RenderOptions, render_mapped};
+    let mut ed = editor();
+    insert_at(
+        &mut ed,
+        2,
+        docxcore::field::fld_simple(" PAGE ", "777", &RunProps::default()),
+    );
+    let opts = RenderOptions {
+        bidi: Some(std::rc::Rc::new(AllRtl)),
+        ..RenderOptions::default()
+    };
+    let (lines, maps) = render_mapped(&ed.doc, &opts);
+    let line = lines[0].plain();
+    let at = line.find("dc777ba").expect("reversed");
+    let map = &maps[0];
+    // `d c 7 7 7 b a`: offset 2 is between `c` and the field's text.
+    assert_eq!(map.col_for_caret(&[0], 2, None), Some(at + 2), "{line:?}");
+    for col in [at + 2, at + 3, at + 4, at + 5] {
+        assert_eq!(
+            map.nearest_caret(col).map(|c| c.offset),
+            Some(2),
+            "col {col}"
+        );
+    }
+}
+
+/// Typing right before a link that opens with a pending insertion goes after
+/// the object, as everywhere else the caret is after one (r4): past a link
+/// holding nothing else (outside it), into one with text (ahead of its text).
+#[test]
+fn text_typed_at_a_link_opening_with_a_pending_insertion_follows_it() {
+    let ins = format!("<w:ins w:id=\"1\" w:author=\"Ada\">{COMPLEX}</w:ins>");
+    for (link, inside) in [
+        (ins.clone(), false),
+        (format!("{ins}<w:r><w:t>L</w:t></w:r>"), true),
+    ] {
+        let mut ed = Editor::new(parse(&format!(
+            "<w:p><w:r><w:t>ab</w:t></w:r><w:hyperlink w:anchor=\"x\">{link}</w:hyperlink>\
+             <w:r><w:t>cd</w:t></w:r></w:p>"
+        )));
+        track(&mut ed, "Ada");
+        ed.set_caret(Caret::at(vec![0], 2));
+        ed.insert_char('x');
+        assert_eq!(ed.caret.offset, 3);
+        let x = xml(&ed);
+        let typed = x.find(">x<").expect("the typed text");
+        assert!(x.find("</w:ins>").unwrap() < typed, "after the field: {x}");
+        let link_end = x.find("</w:hyperlink>").unwrap();
+        assert_eq!(typed < link_end, inside, "{x}");
+        if inside {
+            assert!(
+                typed < x.find(">L<").unwrap(),
+                "ahead of the link's text: {x}"
+            );
+        }
+        assert_eq!(
+            text(&ed).replace('7', ""),
+            if inside { "abxLcd" } else { "abxcd" }
+        );
+    }
 }
