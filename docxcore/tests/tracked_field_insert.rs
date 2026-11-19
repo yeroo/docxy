@@ -752,3 +752,68 @@ fn copy_carries_a_pending_field_or_picture() {
     ed.caret = Caret::at(vec![0], 3);
     assert_eq!(objects_in(&ed.copy().unwrap().paras[0]), 0);
 }
+
+/// A table of one row whose cells hold `cells` (each a cell's paragraphs'
+/// XML), then a paragraph.
+fn table(cells: &[&str]) -> Editor {
+    let tcs: String = cells.iter().map(|c| format!("<w:tc>{c}</w:tc>")).collect();
+    Editor::new(parse(&format!(
+        "<w:tbl><w:tr>{tcs}</w:tr></w:tbl><w:p><w:r><w:t>after</w:t></w:r></w:p>"
+    )))
+}
+
+fn para(text: &str) -> String {
+    if text.is_empty() {
+        "<w:p/>".into()
+    } else {
+        format!("<w:p><w:r><w:t>{text}</w:t></w:r></w:p>")
+    }
+}
+
+/// #1625 r3: a cell-range copy keeps one clip paragraph per cell paragraph,
+/// empty ones included, as before #1625.
+#[test]
+fn a_cell_range_copy_keeps_empty_cell_paragraphs() {
+    let ed = |cells: &[&str], last: usize| {
+        let mut ed = table(cells);
+        ed.anchor = Some(Caret::at(vec![0, 0, 0, 0], 0));
+        ed.caret = Caret::at(vec![0, 0, last, 0], 0);
+        ed
+    };
+    let (a, empty, c) = (para("A"), para(""), para("C"));
+    let clip = ed(&[&a, &empty, &c], 2).copy().expect("a clip");
+    assert_eq!(clip.to_text(), "A\n\nC");
+    // A cell holding a blank paragraph between two.
+    let two = format!("{}{}{}", para("a"), para(""), para("b"));
+    let clip = ed(&[&two, &c], 1).copy().expect("a clip");
+    assert_eq!(clip.paras.len(), 4);
+    assert_eq!(clip.to_text(), "a\n\nb\nC");
+    // Only empty cells: a clip of empty paragraphs.
+    let clip = ed(&[&empty, &empty], 1).copy().expect("a clip");
+    assert_eq!(clip.paras.len(), 2);
+}
+
+#[test]
+fn a_cell_range_cut_over_empty_cells_still_clears_them() {
+    let marked = "<w:p><w:bookmarkStart w:id=\"0\" w:name=\"b\"/><w:bookmarkEnd w:id=\"0\"/></w:p>";
+    let mut ed = table(&[marked, &para(""), &para("x")]);
+    ed.anchor = Some(Caret::at(vec![0, 0, 0, 0], 0));
+    ed.caret = Caret::at(vec![0, 0, 1, 0], 0);
+    let clip = ed.cut().expect("a clip");
+    assert_eq!(clip.paras.len(), 2);
+    assert!(!xml(&ed).contains("w:bookmarkStart"), "{}", xml(&ed));
+    assert!(ed.undo(), "one step");
+    assert!(xml(&ed).contains("w:bookmarkStart"));
+}
+
+/// A plain copy over three paragraphs with an empty middle one gives the
+/// clip it gave before #1625: the empty paragraph holds no span.
+#[test]
+fn a_copy_over_an_empty_middle_paragraph_is_unchanged() {
+    let mut ed = Editor::new(parse(&format!("{}{}{}", para("ab"), para(""), para("cd"))));
+    ed.anchor = Some(Caret::at(vec![0], 1));
+    ed.caret = Caret::at(vec![2], 1);
+    let clip = ed.copy().expect("a clip");
+    assert_eq!(clip.to_text(), "b\nc");
+    assert_eq!(clip.paras.len(), 2);
+}

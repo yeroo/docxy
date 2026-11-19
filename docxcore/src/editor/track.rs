@@ -395,10 +395,13 @@ impl Editor {
         let Some(para) = resolve_para(&self.doc.body, &path) else {
             return false;
         };
+        // The ones at exactly the caret's offset.
+        let o = self.caret.offset;
         let mut found = Vec::new();
-        pending_at(
+        pending_in(
             &para.content,
-            self.caret.offset,
+            o.checked_sub(1),
+            o,
             &author,
             &mut Vec::new(),
             &mut found,
@@ -825,45 +828,6 @@ pub(super) fn past_pending_objects(content: &[Inline], from: usize) -> Option<us
     past
 }
 
-/// The index paths (into `content`, then into a link's `content`) of the
-/// pending object insertions by `author` at offset `o`, in document order.
-fn pending_at(
-    content: &[Inline],
-    o: usize,
-    author: &str,
-    prefix: &mut Vec<usize>,
-    out: &mut Vec<Vec<usize>>,
-) {
-    let mut acc = 0;
-    for (i, inline) in content.iter().enumerate() {
-        if acc > o {
-            break;
-        }
-        let len = inline_len(inline);
-        match inline {
-            Inline::Hyperlink(h) if o <= acc + len => {
-                let runs = super::link_runs_len(h);
-                if o - acc >= runs {
-                    prefix.push(i);
-                    pending_at(&h.content, o - acc - runs, author, prefix, out);
-                    prefix.pop();
-                }
-            }
-            Inline::Revision { metadata, .. }
-                if acc == o
-                    && is_pending_object(inline)
-                    && metadata.author.as_deref() == Some(author) =>
-            {
-                let mut path = prefix.clone();
-                path.push(i);
-                out.push(path);
-            }
-            _ => {}
-        }
-        acc += len;
-    }
-}
-
 /// Whether a selection covers a pending object insertion at offset `p` of a
 /// paragraph (#1625): `lo < p <= hi`, or `p <= hi` with `lo` `None` (the
 /// selection began in a paragraph before). The caret is after the pending
@@ -916,7 +880,7 @@ fn pending_in(
     }
 }
 
-/// Remove the inline at index path `path` (see [`pending_at`]); a link left
+/// Remove the inline at index path `path` (see [`pending_in`]); a link left
 /// with nothing to edit goes, as when its text is deleted.
 fn remove_at(content: &mut Vec<Inline>, path: &[usize]) {
     match path {

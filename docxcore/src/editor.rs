@@ -2633,10 +2633,11 @@ impl Editor {
     /// only from the paragraphs a tracked delete walks (a cut's, which must
     /// carry exactly what its delete removes, #1625).
     fn copy_taking(&self, take: &dyn Fn(&Inline) -> bool, deleted_only: bool) -> Option<Clip> {
-        let spans: Vec<(Vec<usize>, usize, usize, bool, bool)> = match self.cell_range() {
+        let cells = self.cell_range();
+        let spans: Vec<(Vec<usize>, usize, usize, bool, bool)> = match &cells {
             // A cleared cell loses all of it, from its start.
             Some(range) => self
-                .cell_range_spans(&range)
+                .cell_range_spans(range)
                 .into_iter()
                 .map(|(path, s, e)| (path, s, e, true, true))
                 .collect(),
@@ -2648,8 +2649,9 @@ impl Editor {
             if let Some(p) = resolve_para(&self.doc.body, &path) {
                 let take = if takes { take } else { &none };
                 let mut inlines = extract_range_taking(&p.content, s, e, from_before, take);
-                // A paragraph the range holds nothing of is not copied.
-                if e <= s && inlines.is_empty() {
+                // A paragraph the range holds nothing of is not copied; a
+                // cell's paragraph always is, empty or not.
+                if cells.is_none() && e <= s && inlines.is_empty() {
                     continue;
                 }
                 // A copy of a recorded insertion is plain text, not a second
@@ -2660,7 +2662,7 @@ impl Editor {
                 paras.push(inlines);
             }
         }
-        if paras.is_empty() {
+        if paras.is_empty() && cells.is_none() {
             return None;
         }
         // A previewed record is display only: copied merge fields carry
@@ -2718,7 +2720,9 @@ impl Editor {
         // exactly the ones its clip carries. A tracked delete removes the
         // author's own it covers, by the rule the clip is taken by
         // ([`track::covers_pending`], over the same paragraphs); clearing
-        // cells removes every one in them; an untracked delete none.
+        // cells removes every one in them. An untracked cut carries none,
+        // and its delete across paragraphs drops those in what it removes
+        // (a known gap).
         let author = self.track_author().map(str::to_owned);
         let cells = self.cell_range().is_some();
         let own = |inline: &Inline| {
