@@ -2029,7 +2029,7 @@ impl Engine {
                         for (j, v) in row.into_iter().enumerate() {
                             let (rr, cc) = (r + i as u32, c + j as u32);
                             let v = value_to_cell(v);
-                            let entry = sheet.cells.entry((rr, cc)).or_default();
+                            let entry = spill_slot(sheet, (r, c), (rr, cc));
                             if (rr, cc) != (r, c) {
                                 // Outside the previous extent the cell newly
                                 // belongs to this spill (report it, as on
@@ -2144,7 +2144,7 @@ impl Engine {
         for rr in r..r + h {
             for cc in c..c + w {
                 let v = value_to_cell(cse_at(&m, (rr - r) as usize, (cc - c) as usize));
-                let entry = sheet.cells.entry((rr, cc)).or_default();
+                let entry = spill_slot(sheet, (r, c), (rr, cc));
                 if (rr, cc) != (r, c) && entry.value != v {
                     changed.push((s, rr, cc));
                 }
@@ -2636,6 +2636,22 @@ pub(crate) fn clear_spill(
         }
     }
     out
+}
+
+/// The cell at `at` an array anchored at `anchor` writes into: an absent
+/// member is made with the style its row or column gives it, as Excel saves
+/// spill output in a formatted column with that column's format; a
+/// member's own style, and the anchor, are kept (#1660).
+fn spill_slot(sheet: &mut Sheet, anchor: (u32, u32), at: (u32, u32)) -> &mut Cell {
+    let style = if at != anchor && !sheet.cells.contains_key(&at) {
+        sheet.inherited_style(at.0, at.1)
+    } else {
+        0
+    };
+    sheet.cells.entry(at).or_insert_with(|| Cell {
+        style,
+        ..Cell::default()
+    })
 }
 
 /// Is (r, c) inside the spill of one of `anchors` (other than an anchor
@@ -5082,26 +5098,37 @@ mod tests {
     /// leaves no default-style pin, under manual calculation too.
     #[test]
     fn undo_of_typed_spill_member_leaves_no_pin() {
-        for manual in [false, true] {
+        let blank = |style| Cell {
+            style,
+            ..Cell::default()
+        };
+        // `s0`: B2 holds style 0, as a file saved before spill output took
+        // its column's style; otherwise the spill made B2 with column B's 7.
+        for (manual, s0) in [(false, false), (true, false), (false, true), (true, true)] {
             let mut wb = pinned_wb(&[]);
             let mut eng = Engine::new(&wb);
             set(&mut eng, &mut wb, "B1", array_formula("SEQUENCE(3)"));
             assert_eq!(value_at(&wb, "B2"), CellValue::Number(2.0));
+            assert_eq!(style_of(&wb, "B2"), 7);
+            if s0 {
+                wb.sheets[0].cells.get_mut(&(1, 1)).unwrap().style = 0;
+            }
             if manual {
                 wb.calc.mode = CalcMode::Manual;
             }
             let before = crate::sheet::snapshot_cells(&wb.sheets[0], &[(1, 1)], |_, _| false);
-            assert_eq!(before, vec![None]);
+            let want = if s0 { None } else { Some(blank(7)) };
+            assert_eq!(before, vec![want]);
             set(&mut eng, &mut wb, "B2", Cell::text("x"));
             let undo: Vec<_> = before.into_iter().map(|c| (1, 1, c)).collect();
             eng.restore_snapshot(&mut wb, 0, &undo);
             let b2 = wb.sheets[0].cell(1, 1);
-            assert!(
-                b2.is_none_or(|c| !c.is_blank()),
-                "manual {manual}: B2 is {b2:?}"
-            );
+            let when = format!("manual {manual}, s0 {s0}");
+            assert!(b2.is_none_or(|c| !c.is_blank()), "{when}: B2 is {b2:?}");
             if !manual {
-                assert_eq!(value_at(&wb, "B2"), CellValue::Number(2.0));
+                assert_eq!(value_at(&wb, "B2"), CellValue::Number(2.0), "{when}");
+                // B2 is back as it was: its own style, 0 or the column's.
+                assert_eq!(style_of(&wb, "B2"), if s0 { 0 } else { 7 }, "{when}");
             }
         }
         // A styled member still snapshots as its styled blank.
@@ -5117,6 +5144,45 @@ mod tests {
                 ..Cell::default()
             })]
         );
+    }
+
+    /// #1660 r1 M2: a spill shrunk and grown again in a styled column comes
+    /// back in the column's style: a member cleared to that style is absent,
+    /// and the re-spill makes it with the style, not as a default-style pin.
+    #[test]
+    fn a_respill_in_a_styled_column_keeps_the_columns_style() {
+        let mut wb = pinned_wb(&[("A1", Cell::number(3.0))]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "B1", array_formula("SEQUENCE(A1)"));
+        // B3 is in row 3, whose style 5 wins over column B's 7.
+        assert_eq!((style_of(&wb, "B2"), style_of(&wb, "B3")), (7, 5));
+        set(&mut eng, &mut wb, "A1", Cell::number(1.0));
+        assert!(!has(&wb, "B2") && !has(&wb, "B3"));
+        set(&mut eng, &mut wb, "A1", Cell::number(3.0));
+        assert_eq!(value_at(&wb, "B3"), CellValue::Number(3.0));
+        assert_eq!((style_of(&wb, "B2"), style_of(&wb, "B3")), (7, 5));
+        // Row 3's style wins over column B's; an unstyled column stays 0;
+        // a member's own style is kept through a recalc.
+        set(&mut eng, &mut wb, "C1", array_formula("SEQUENCE(3)"));
+        assert_eq!((style_of(&wb, "C2"), style_of(&wb, "C3")), (0, 5));
+        eng.set_styles(&mut wb, 0, &[(1, 1, 9)]);
+        set(&mut eng, &mut wb, "A1", Cell::number(2.0));
+        set(&mut eng, &mut wb, "A1", Cell::number(3.0));
+        assert_eq!(style_of(&wb, "B2"), 9);
+        // A legacy CSE block's absent cells take the style the same way.
+        let mut cse = Cell::formula("{1;2;3}");
+        cse.f_attrs = Some(r#"t="array" ref="D1:D3""#.to_string());
+        wb.sheets[0].col_defs.push(crate::sheet::ColDef {
+            min: 3,
+            max: 3,
+            width: None,
+            attrs: r#"style="7""#.to_string(),
+            default_width: false,
+            plain_width: false,
+        });
+        eng.restore_cell(&mut wb, (0, 0, 3), cse);
+        assert_eq!(value_at(&wb, "D2"), CellValue::Number(2.0));
+        assert_eq!(style_of(&wb, "D2"), 7);
     }
 
     #[test]

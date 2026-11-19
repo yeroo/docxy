@@ -14495,6 +14495,38 @@ mod tests {
         assert!(!xml.contains(r#"<c r="B2""#), "{xml}");
     }
 
+    /// #1660 r1 M2: a spill in a styled column, shrunk and grown again,
+    /// saves its members with the column's style, never a default-style pin.
+    #[test]
+    fn a_respill_in_a_styled_column_saves_the_columns_style() {
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].col_defs.push(crate::sheet::ColDef {
+            min: 1,
+            max: 1,
+            width: Some(9.0),
+            attrs: r#"style="1""#.to_string(),
+            default_width: false,
+            plain_width: false,
+        });
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        let wb = &mut pkg.workbook;
+        eng.set_cell(wb, (0, 0, 0), Cell::number(3.0));
+        let mut f = Cell::formula("SEQUENCE(A1)");
+        f.f_attrs = Some(r#"t="array""#.to_string());
+        eng.set_cell(wb, (0, 0, 1), f);
+        eng.set_cell(wb, (0, 0, 0), Cell::number(1.0));
+        eng.set_cell(wb, (0, 0, 0), Cell::number(3.0));
+        let back = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        let part = back.sheet_parts[0].clone();
+        let xml = String::from_utf8(back.part(&part).unwrap().to_vec()).unwrap();
+        for at in ["B2", "B3"] {
+            assert!(
+                xml.contains(&format!(r#"<c r="{at}" s="1""#)),
+                "{at}: {xml}"
+            );
+        }
+    }
+
     /// #1064: Excel 2013+ writes `<x15:workbookPr chartTrackingRefBase>` in
     /// extLst; it must not reset the date system the real workbookPr set.
     #[test]
