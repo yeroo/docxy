@@ -7741,6 +7741,14 @@ mod link_colour_tests {
         assert_eq!(run_highlight(&cyan, &light), Some((0x00ffff, 0x1a1a1a)));
         let navy = shaded("<w:shd w:val=\"clear\" w:fill=\"000080\"/>");
         assert_eq!(run_highlight(&navy, &light), Some((0x000080, 0xf5f5f5)));
+        // A run with its own colour keeps it on a light page (a mail
+        // button's white text on its fill).
+        let button = RunProps {
+            color: Some("FFFFFF".into()),
+            ..shaded("<w:shd w:val=\"clear\" w:fill=\"0078D4\"/>")
+        };
+        assert_eq!(run_highlight(&button, &light), Some((0x0078d4, 0xffffff)));
+        assert_eq!(hsla_rgb(hsla_u(0x0078d4)), 0x0078d4);
         assert_eq!(
             run_shading(&shaded("<w:shd w:val=\"clear\" w:fill=\"auto\"/>")),
             None
@@ -37957,6 +37965,13 @@ mod move_vert_tests {
 /// The size of the first window (and of the harness's), in px.
 const DEFAULT_WINDOW: (f32, f32) = (1180., 800.);
 
+/// An `Hsla` as `0xRRGGBB`, alpha dropped (#2249).
+fn hsla_rgb(c: Hsla) -> u32 {
+    let r = c.to_rgb();
+    let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (b(r.r) << 16) | (b(r.g) << 8) | b(r.b)
+}
+
 fn hsla_u(c: u32) -> Hsla {
     rgb(c).into()
 }
@@ -37995,14 +38010,22 @@ fn highlight_rgb(name: &str) -> (u32, bool) {
 /// light page [`highlight_rgb`]'s colour with near-black or light text, as
 /// before; on a dark page Word's dark mode, [`dark_page::highlight`] with
 /// [`dark_page::highlight_ink`], told apart by whether the run's shown
-/// colour (its styles' included) is automatic. `None` without a highlight.
+/// colour (its styles' included) is automatic. `None` without a highlight or
+/// run shading (`w:shd`, #2249); a highlight wins over shading.
 fn run_highlight(props: &RunProps, pal: &Pal) -> Option<(u32, u32)> {
     let (c, dark) = match props.highlight.as_deref() {
         Some(name) => highlight_rgb(name),
         // Run shading (`w:shd`, an imported `<span style="background:…">`)
         // fills the same band (#2249).
+        // On a light page the run keeps its own colour (a mail button's
+        // white text on its fill); only an automatic one takes the ink that
+        // reads on the fill.
         None => {
             let c = run_shading(props)?;
+            let own = props.color.as_deref().and_then(hex_rgb);
+            if let (false, Some(own)) = (pal.dark, own) {
+                return Some((c, own));
+            }
             (c, !dark_page::takes_light(c))
         }
     };
@@ -38317,7 +38340,21 @@ fn emit_words(
     // the selected range reads as one contiguous band.
     let family = props.font.as_deref().and_then(font_subst::family);
     let color = run_ink(props, is_link, &pal);
-    let highlight = run_highlight(props, &pal).filter(|_| !selected);
+    // A shaded link on a light page with no colour of its own keeps the
+    // link's blue (#2249); a highlight keeps its own ink rule.
+    let highlight = run_highlight(props, &pal)
+        .filter(|_| !selected)
+        .map(|(fill, ink)| {
+            let shaded_link = is_link && props.highlight.is_none() && props.color.is_none();
+            (
+                fill,
+                if shaded_link && !pal.dark {
+                    hsla_rgb(pal.link)
+                } else {
+                    ink
+                },
+            )
+        });
     let mut off = seg_start;
     for word in text.split_inclusive(' ') {
         if word.is_empty() {
@@ -39909,15 +39946,6 @@ fn paragraph_el(
     let is_heading = p.props.heading_level.is_some();
     // The mark's look: the list number's (#1986), and an empty line's size.
     let mark = shown_mark(p, styler);
-    // A paragraph hidden whole, its mark included (an imported mail's
-    // `display:none` preheader), takes no room while formatting marks are
-    // off, as in Word (#2249); the caret in it shows it.
-    let collapsed = !marks
-        && caret.is_none()
-        && mark.vanish
-        && p.content
-            .iter()
-            .all(|i| matches!(i, Inline::Run(r) if styler.shown(r).vanish));
     let text_px = para_text_px(p, styler, &mark, base, zoom);
     let pbox = para_box(&p.props.spacing, flow.flow, is_heading, base, text_px, zoom);
     let mut painted_runs: Vec<PaintedRun> = Vec::new();
@@ -39969,6 +39997,18 @@ fn paragraph_el(
     // Hyperlinks opened up into their pieces, so text, tabs and breaks inside a
     // link take caret offsets exactly as the editor counts them.
     let items = flat_inlines(&p.content);
+    // A paragraph hidden whole, its mark included (an imported mail's
+    // `display:none` preheader), takes no room while formatting marks are
+    // off, as in Word (#2249), the caret in it included: every piece is
+    // hidden text, a hidden tab or break, or takes no offset (a link's
+    // wrapper, a bookmark).
+    let collapsed = !marks
+        && mark.vanish
+        && items.iter().all(|(i, _)| match &**i {
+            Inline::Run(r) => styler.shown(r).vanish,
+            Inline::Tab(tp) | Inline::Break(_, tp) => tp.vanish,
+            other => caret_advance(other) == 0,
+        });
     // A highlight's band (#2231): the line's single-spaced height, worked
     // out only for a paragraph that has a highlighted run.
     let highlighted = items
@@ -40189,6 +40229,10 @@ fn paragraph_el(
             }
             // Opened up by `flat_inlines`.
             Inline::Hyperlink(_) => {}
+            // A hidden tab or break (#2249): no width, no wrap, one offset.
+            Inline::Tab(tp) | Inline::Break(_, tp) if !marks && tp.vanish => {
+                skip_hidden_run(&mut spans, "	", &mut idx, &mut caret, caret_h);
+            }
             Inline::Tab(_) => {
                 // Advance to the next stop; centre/right stops position the segment
                 // that follows (up to the next tab) so it centres on / ends at it.

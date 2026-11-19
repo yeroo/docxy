@@ -430,7 +430,9 @@ fn place(rows: Vec<Vec<RawCell>>, nrows: usize, groups: &[usize]) -> (Vec<Placed
 /// percentage of the table's width, percentages scaled down to 100 in all);
 /// a spanned cell's width spreads what its columns lack over its columns
 /// without one; the rest share what is left of the table's width, each at
-/// least [`MIN_COL`]. A table's width is its own, else the columns' when
+/// least [`MIN_COL`], except that a width-less column no colspan-1 cell sits
+/// in takes [`MIN_COL`] while another width-less column has a cell of its own
+/// (#2249). A table's width is its own, else the columns' when
 /// every one has a width, else `avail`; declared columns narrower than a
 /// declared table grow to it, and columns wider than the table widen it.
 fn column_widths(spec: &TableSpec, placed: &[Placed], ncols: usize, avail: u32) -> Vec<u32> {

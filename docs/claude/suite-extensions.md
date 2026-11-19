@@ -935,15 +935,20 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
 
 ## Imported mail as Word draws it (#2249)
 
-- `paragraph_el` draws a hidden run (`vanish`) only while formatting
-  marks are shown (`skip_hidden_run`: nothing drawn, its offsets counted,
-  the caret drawn where it falls), and `run_w` measures it as 0.
-- A paragraph whose runs and mark are all hidden collapses (no height,
-  spacing or margin) while marks are off and the caret is not in it, as
-  Word draws an imported preheader.
+- `paragraph_el` draws a hidden run, tab or break (`vanish`) only while
+  formatting marks are shown (`skip_hidden_run`: nothing drawn, no width
+  or wrap, its offsets counted, the caret drawn where it falls), and
+  `run_w` measures a hidden run as 0.
+- A paragraph whose flattened pieces (`flat_inlines`, so a link's runs
+  too) are all hidden or take no offset, and whose mark is hidden,
+  collapses (no height, spacing or margin) while marks are off, the caret
+  in it included, as Word draws an imported preheader.
 - Run shading (`w:shd` fill, `run_shading`) paints the highlight band
-  (`run_highlight`; a highlight wins), with a dark or light ink by the
-  fill's luminance; the layout dump lists it under `highlights`.
+  (`run_highlight`; a highlight wins). On a light page a run with its own
+  colour keeps it, a link without one keeps the link colour, and an
+  automatic one takes a dark or light ink by the fill's luminance; on a
+  dark page the highlight rule applies. The layout dump lists it under
+  `highlights`.
 - A link run with an explicit `<w:u w:val="none"/>` (`underline_off`)
   draws without the link underline.
 - Tests: `link_colour_tests::run_shading_paints_a_band_2249`,

@@ -9,7 +9,7 @@ test issue 2249 a hidden preheader draws nothing
   call backstage {"action":"open"}
   call backstage-page {"page":"new"}
   call new-card {"card":"new-mail-card"}
-  call ext-doc-load {"html": "<body><div style='display:none;max-height:0;overflow:hidden'>Preview text</div><p style='margin:0'>Hello</p></body>"}
+  call ext-doc-load {"html": "<body><div style='display:none;max-height:0;overflow:hidden'>Preview text <a href='https://example.com/'>View online</a><br>more</div><p style='margin:0'>Hello</p></body>"}
   shot window
   call ext-doc-layout {}
   assert reply.painted is true
@@ -31,12 +31,10 @@ test issue 2249 an inline background paints its band as a highlight does
 test issue 2249 a mail opened as a web page hides its preheader and paints its background in a document tab
   call theme-set {"theme":"light"}
   open copy:../fixtures/mail-fidelity.html
-  # The caret opens in the hidden paragraph, which shows it there; in the
-  # next one, the paragraph collapses.
-  call selection-set {"start":30,"end":30}
+  # The caret opens in the hidden paragraph (a link and a `<br>` in it),
+  # which stays collapsed around it.
   shot window
   call doc {}
-  assert reply.caret.offset is 30
   assert reply.view.layout is web
   assert reply.flow.layout.painted is true
   assert reply.flow.layout.paragraphs.0.height is 0
