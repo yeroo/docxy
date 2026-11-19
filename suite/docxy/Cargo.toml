@@ -63,6 +63,8 @@ unicode-segmentation = "1.13"
 # The PDF view (#2245): page rasters, text in reading order and the outline,
 # run only in the `--pdf-worker` child (pdf_view/worker.rs). Its patched
 # hayro/vello/lopdf copies are in ../Cargo.toml's `[patch.crates-io]`.
+# A drawn page's frame for gpui's `RenderImage` (the version gpui uses).
+image = { version = "0.25", default-features = false }
 pdfcraft-render = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
 
 # The plain AppKit menu bar a native dialog runs under (#1071, macos_menu.rs),
@@ -95,6 +97,11 @@ gpui_linux = { path = "../vendor/gpui_linux" }
 
 [build-dependencies]
 htmlbundle = { path = "../../htmlbundle" }
+
+[dev-dependencies]
+# Reads the PDF view corpus's reference renderings (#2245); in the lock
+# through gpui.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [features]
 # Embed the docxwasm engine so Save As "Editable HTML (*.docx.html)" can make
