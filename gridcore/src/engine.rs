@@ -7866,6 +7866,46 @@ mod tests {
         assert_eq!(cell.value, CellValue::Number(0.07));
     }
 
+    #[test]
+    fn a_sheet_qualified_local_name_evaluates_and_recalculates() {
+        // #1687: a cut moves `=Rate*2` off Sheet2 as `=Sheet2!Rate*2`; it
+        // reads Sheet2's own Rate from any sheet, not Sheet1's or the
+        // workbook's, and follows the cell that name points at.
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::formula("Sheet2!Rate*2")),
+            ("A2", Cell::formula("Rate*2")),
+            ("A3", Cell::formula("Sheet2!MyFn(4)")),
+            ("A4", Cell::formula("Sheet1!Nope")),
+        ]);
+        let mut sheet2 = Sheet {
+            name: "Sheet2".to_string(),
+            ..Sheet::default()
+        };
+        sheet2.set_cell(0, 1, Cell::number(5.0));
+        wb.sheets.push(sheet2);
+        let name = |name: &str, scope, formula: &str| crate::sheet::DefinedName {
+            name: name.into(),
+            scope,
+            formula: formula.into(),
+        };
+        wb.defined_names.extend([
+            name("Rate", Some(1), "Sheet2!$B$1"),
+            name("Rate", Some(0), "100"),
+            name("Rate", None, "1000"),
+            name("MyFn", Some(1), "LAMBDA(x,x*3)"),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(10.0));
+        assert_eq!(value_at(&wb, "A2"), CellValue::Number(200.0));
+        assert_eq!(value_at(&wb, "A3"), CellValue::Number(12.0));
+        // A qualified name the sheet doesn't define stays unknown (#1632).
+        assert!(eng.is_unsupported((0, 3, 0)));
+        assert!(!eng.is_unsupported((0, 0, 0)) && !eng.is_unsupported((0, 2, 0)));
+        eng.set_cell(&mut wb, (1, 0, 1), Cell::number(7.0));
+        assert_eq!(value_at(&wb, "A1"), CellValue::Number(14.0));
+    }
+
     /// A1 = 1 and a frozen array anchor E1 `PIVOTBY(A1,4)` (`ref="E1:E3"`)
     /// whose cached block E1:E3 is 7/8/9, as xlsxy opens it (on cached
     /// values, nothing evaluated yet).

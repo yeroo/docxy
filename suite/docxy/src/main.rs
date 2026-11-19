@@ -5182,9 +5182,12 @@ impl SheetView {
     /// A cut pasted in its own workbook: the cells move. Excel's paste area
     /// for a cut is one cell or the cut's own shape. The source is cleared
     /// (but for cells the paste overwrites), every reference to a moved cell
-    /// follows it ([`gridcore::edit::move_refs`]), and the moved cells' own
-    /// references to cells outside the cut keep reading them
-    /// ([`gridcore::formula::move_block_formula`]). Validation rules move
+    /// follows it ([`gridcore::edit::move_refs_rules_stay`]: a
+    /// conditional-format rule over the cut keeps its range, so only its
+    /// fully absolute references follow), and the moved cells' own
+    /// references to cells outside the cut keep reading them, their sheet's
+    /// local names and their table's bare references too
+    /// ([`gridcore::edit::moved_cell_formula`]). Validation rules move
     /// with the cells, and every other rule cell keeps checking what it
     /// checked ([`gridcore::validation::cut_rules`]); on a sheet that can't
     /// hold rules they stay on the cut cells, and the result says so. One
@@ -5240,11 +5243,16 @@ impl SheetView {
                 // A formula held verbatim (a shared one) keeps its text.
                 let verbatim = cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a));
                 if !verbatim {
-                    if let Some(moved) = cell
-                        .formula
-                        .as_deref()
-                        .and_then(|f| gridcore::formula::move_block_formula(f, &mv))
-                    {
+                    let to = (r0 + (r - fr0), c0 + (c - fc0));
+                    if let Some(moved) = cell.formula.as_deref().and_then(|f| {
+                        gridcore::edit::moved_cell_formula(
+                            &self.pkg.workbook,
+                            (src, (r, c)),
+                            (dst, to),
+                            f,
+                            &mv,
+                        )
+                    }) {
                         cell.formula = Some(moved);
                     }
                 }
@@ -5277,7 +5285,9 @@ impl SheetView {
         let kept = gridcore::validation::cut_rules(&mut self.pkg.workbook, src, dst, &mv, land);
         // References follow next, and the engine is rebuilt on them, so the
         // writes below recalculate what reads the moved cells where they land.
-        gridcore::edit::move_refs(&mut self.pkg.workbook, src, &mv);
+        // A rule over the cut keeps its range, so it keeps its formula but
+        // for the absolute references to the moved cells.
+        gridcore::edit::move_refs_rules_stay(&mut self.pkg.workbook, src, &mv);
         self.rebuild_engine();
         // A clear landing in a frozen array block goes last
         // (`Engine::split_frozen_blanks`): a no-op while the block is whole,

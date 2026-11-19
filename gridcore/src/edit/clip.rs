@@ -3,8 +3,11 @@
 //! translated to where they land; a cut is a move, and the references to
 //! the moved cells follow them ([`move_refs`]).
 
-use super::{Area, rewrite_workbook_formulas};
-use crate::formula::{CellMove, move_ref_expr, translate_formula};
+use super::{Area, FormulaSite, rewrite_workbook_formulas, walk_workbook_formulas};
+use crate::formula::{
+    CellMove, Expr, move_abs_ref_expr, move_block_expr, move_ref_expr, parse, qualify_bare_refs,
+    qualify_local_names, to_string, translate_formula,
+};
 use crate::sheet::{Cell, MAX_COLS, MAX_ROWS, Workbook};
 
 /// The most cells a tiled paste writes; a bigger one is refused whole (the
@@ -156,20 +159,45 @@ pub fn move_refs(wb: &mut Workbook, src: usize, mv: &CellMove) -> bool {
 }
 
 /// [`move_refs`] for a host whose cut leaves the conditional-format rules'
-/// ranges where they are: a rule over cells of `mv.rect` is left whole, so
-/// (its formula being relative to its range) it keeps checking what it
-/// checked, as the data form's Delete leaves such rules; every other rule is
-/// re-pointed. Limit: a fully absolute reference (`$F$1`) in a left rule to a
-/// moved cell does not follow it. Whether any formula was rewritten.
+/// ranges where they are: a rule over cells of `mv.rect` keeps its
+/// relative and mixed references, so (its formula being relative to its
+/// range) it keeps checking what it checked, as the data form's Delete
+/// leaves such rules; only its fully absolute references to moved cells
+/// outside its own ranges (`$F$1`) follow them ([`move_abs_ref_expr`]), as
+/// they name those cells themselves. Every other rule is re-pointed whole.
+/// Whether any formula was rewritten.
 pub fn move_refs_rules_stay(wb: &mut Workbook, src: usize, mv: &CellMove) -> bool {
+    walk_rules_stay(wb, src, mv, true)
+}
+
+/// Whether [`move_refs_rules_stay`] would rewrite any formula, leaving the
+/// workbook as it is: a host skips the whole-workbook undo snapshot for a cut
+/// that re-points nothing outside its own cells. It walks the formulas the
+/// rewrite walks, with the same rewrite, so the two always agree; it takes
+/// the workbook mutably only for that shared walk and writes nothing.
+pub fn cut_moves_refs(wb: &mut Workbook, src: usize, mv: &CellMove) -> bool {
+    walk_rules_stay(wb, src, mv, false)
+}
+
+/// [`move_refs_rules_stay`], or with `write` false its dry run.
+fn walk_rules_stay(wb: &mut Workbook, src: usize, mv: &CellMove, write: bool) -> bool {
     let (r0, c0, r1, c1) = mv.rect;
     let meets = |a: &Area| a.0 <= r1 && r0 <= a.2 && a.1 <= c1 && c0 <= a.3;
-    move_refs_with(
+    let names: Vec<String> = wb.sheets.iter().map(|s| s.name.clone()).collect();
+    walk_workbook_formulas(
         wb,
-        src,
-        mv,
-        |s, ranges| !(s == src && ranges.iter().any(meets)),
+        |_, _| true,
         false,
+        |e, site| {
+            if let Some(own) = site
+                .rule
+                .filter(|r| site.sheet == Some(src) && r.iter().any(meets))
+            {
+                return move_abs_ref_expr(e, Some(&names[src]), mv, own);
+            }
+            moved_ref_expr(e, &names, src, mv, site)
+        },
+        write,
     )
 }
 
@@ -187,16 +215,65 @@ pub(super) fn move_refs_with(
     validations: bool,
 ) -> bool {
     let names: Vec<String> = wb.sheets.iter().map(|s| s.name.clone()).collect();
-    let (r0, c0, r1, c1) = mv.rect;
     rewrite_workbook_formulas(wb, rules, validations, |e, site| {
-        let (sheet, cell) = (site.sheet, site.cell);
-        let moved = sheet == Some(src)
-            && cell.is_some_and(|(r, c)| (r0..=r1).contains(&r) && (c0..=c1).contains(&c));
-        if moved {
-            return e.clone();
-        }
-        move_ref_expr(e, sheet.map(|s| names[s].as_str()), mv)
+        moved_ref_expr(e, &names, src, mv, site)
     })
+}
+
+/// A formula at `site` rewritten for the move `mv` off sheet `src`
+/// ([`move_ref_expr`]); a moved cell's own formula is left to the caller
+/// ([`moved_cell_formula`]). `names` are the sheets' names.
+fn moved_ref_expr(
+    e: &Expr,
+    names: &[String],
+    src: usize,
+    mv: &CellMove,
+    site: FormulaSite<'_>,
+) -> Expr {
+    let (r0, c0, r1, c1) = mv.rect;
+    let (sheet, cell) = (site.sheet, site.cell);
+    let moved = sheet == Some(src)
+        && cell.is_some_and(|(r, c)| (r0..=r1).contains(&r) && (c0..=c1).contains(&c));
+    if moved {
+        return e.clone();
+    }
+    move_ref_expr(e, sheet.map(|s| names[s].as_str()), mv)
+}
+
+/// The formula `f` of a cell the cut `mv` moves from `from` on sheet `src` to
+/// `to` on sheet `dst`, as Excel writes it there: references to cells of the
+/// cut follow them and the rest keep reading what they read
+/// ([`move_block_expr`]); moved to another sheet, the names it read in
+/// `src`'s own scope are qualified with it (`Sheet2!Rate`,
+/// [`qualify_local_names`]); and moved out of the table it sat in, its bare
+/// structured references name that table (`Table1[@Qty]`,
+/// [`qualify_bare_refs`]). Read on the workbook as it was before the cut.
+/// `None` when it doesn't parse or nothing changes, so the text then stays
+/// byte-for-byte (#1687).
+pub fn moved_cell_formula(
+    wb: &Workbook,
+    (src, from): (usize, (u32, u32)),
+    (dst, to): (usize, (u32, u32)),
+    f: &str,
+    mv: &CellMove,
+) -> Option<String> {
+    let ast = parse(f).ok()?;
+    let mut out = move_block_expr(&ast, mv);
+    if src != dst {
+        if let Some(sheet) = wb.sheets.get(src) {
+            let local = |n: &str| wb.local_name(src, n).map(str::to_string);
+            out = qualify_local_names(&out, &sheet.name, &local);
+        }
+    }
+    if let Some(t) = wb.table_at(src, from.0, from.1) {
+        let stays = wb
+            .table_at(dst, to.0, to.1)
+            .is_some_and(|u| crate::names::name_eq(&u.name, &t.name));
+        if !stays {
+            out = qualify_bare_refs(&out, &t.name);
+        }
+    }
+    (out != ast).then(|| to_string(&out))
 }
 
 #[cfg(test)]

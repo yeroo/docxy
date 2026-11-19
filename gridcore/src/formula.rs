@@ -2849,7 +2849,42 @@ impl CellMove<'_> {
 /// Anything else is left alone, as are 3-D, whole-row and whole-column
 /// references.
 pub fn move_ref_expr(e: &Expr, home: Option<&str>, mv: &CellMove) -> Expr {
-    let recur = |x: &Expr| move_ref_expr(x, home, mv);
+    move_refs_in(e, home, mv, &|_, _| true)
+}
+
+/// [`move_ref_expr`] for a conditional-format rule left in place over a cut,
+/// on the cells `own` (its ranges, on the cut's sheet): its relative and
+/// mixed references (`F1`, `$F1`, `F$1`) read relative to its range, which
+/// stays, so they stay; a fully absolute one (`$F$1`, `$F$1#`, `$F$1:$G$1`
+/// with both corners moved) names the cells themselves and follows them,
+/// unless it reads the rule's own cells, which stay with it
+/// (`A1>AVERAGE($A$1:$A$10)` on A1:A10, #880).
+pub fn move_abs_ref_expr(
+    e: &Expr,
+    home: Option<&str>,
+    mv: &CellMove,
+    own: &[(u32, u32, u32, u32)],
+) -> Expr {
+    let meets_own = |p: &CellRef, q: &CellRef| {
+        let (r1, r2) = (p.row.min(q.row), p.row.max(q.row));
+        let (c1, c2) = (p.col.min(q.col), p.col.max(q.col));
+        own.iter().any(|&(a, b, c, d)| {
+            i64::from(a) <= r2 && r1 <= i64::from(c) && i64::from(b) <= c2 && c1 <= i64::from(d)
+        })
+    };
+    let abs = |r: &CellRef| r.abs_row && r.abs_col;
+    move_refs_in(e, home, mv, &|p, q| abs(p) && abs(q) && !meets_own(p, q))
+}
+
+/// [`move_ref_expr`], of only the references `takes` takes, given a
+/// reference's (or a range's) two corners.
+fn move_refs_in(
+    e: &Expr,
+    home: Option<&str>,
+    mv: &CellMove,
+    takes: &dyn Fn(&CellRef, &CellRef) -> bool,
+) -> Expr {
+    let recur = |x: &Expr| move_refs_in(x, home, mv, takes);
     let sheet_of = |r: &CellRef| {
         if mv.same_sheet() {
             r.sheet.clone()
@@ -2858,12 +2893,14 @@ pub fn move_ref_expr(e: &Expr, home: Option<&str>, mv: &CellMove) -> Expr {
         }
     };
     match e {
-        Expr::Ref(r) if mv.holds(r, home) => Expr::Ref(mv.shifted(r, sheet_of(r))),
-        Expr::SpillRef(r) if mv.holds(r, home) => Expr::SpillRef(mv.shifted(r, sheet_of(r))),
+        Expr::Ref(r) if mv.holds(r, home) && takes(r, r) => Expr::Ref(mv.shifted(r, sheet_of(r))),
+        Expr::SpillRef(r) if mv.holds(r, home) && takes(r, r) => {
+            Expr::SpillRef(mv.shifted(r, sheet_of(r)))
+        }
         Expr::Range(p, q) => {
             // The first corner's qualifier covers the range.
             let q_home = p.sheet.as_deref().or(home);
-            if mv.holds(p, home) && mv.holds(q, q_home) {
+            if mv.holds(p, home) && mv.holds(q, q_home) && takes(p, q) {
                 Expr::Range(mv.shifted(p, sheet_of(p)), mv.shifted(q, q.sheet.clone()))
             } else {
                 e.clone()
@@ -3214,7 +3251,7 @@ pub fn mask_sheet_qualifiers(src: &str) -> String {
 
 /// A sheet-scoped name's `(sheet, name)`, from the text the parser gave it
 /// (`sheet_prefix` + name; the name itself holds no `!`).
-fn scoped_name(n: &str) -> Option<(String, &str)> {
+pub(crate) fn scoped_name(n: &str) -> Option<(String, &str)> {
     let (sheet, id) = n.rsplit_once('!')?;
     let sheet = match sheet.strip_prefix('\'').and_then(|q| q.strip_suffix('\'')) {
         Some(q) => q.replace("''", "'"),
@@ -3319,6 +3356,113 @@ pub fn qualify_bare_refs(e: &Expr, table: &str) -> Expr {
         }),
         _ => None,
     })
+}
+
+/// `e`, the formula of a cell moved off sheet `sheet`, with the names it
+/// read in that sheet's scope qualified by it, as Excel writes them when the
+/// cell moves to another sheet: `Rate` becomes `Sheet2!Rate`, and a called
+/// lambda name `MyFn(3)` becomes `Sheet2!MyFn(3)` (a builtin function never
+/// is). `local` gives a name's spelling in the sheet's own definition, or
+/// `None` when the sheet has none (a workbook name stays bare). A name a
+/// `LET` or `LAMBDA` binds is the binding, never qualified; scoping follows
+/// [`collect_free_names`].
+pub fn qualify_local_names(e: &Expr, sheet: &str, local: &dyn Fn(&str) -> Option<String>) -> Expr {
+    fn walk(
+        e: &Expr,
+        bound: &mut Vec<String>,
+        sheet: &str,
+        local: &dyn Fn(&str) -> Option<String>,
+    ) -> Expr {
+        let is_bound =
+            |bound: &[String], n: &str| bound.iter().any(|b| b.eq_ignore_ascii_case(bare_param(n)));
+        let qualified = |n: &str| format!("{}{n}", sheet_prefix(sheet));
+        match e {
+            Expr::Name(n) if !n.contains('!') && !is_bound(bound, n) => match local(n) {
+                Some(spelling) => Expr::Name(qualified(&spelling)),
+                None => e.clone(),
+            },
+            Expr::Func(name, args) if name.eq_ignore_ascii_case("LET") => {
+                let (mark, last) = (bound.len(), args.len().saturating_sub(1));
+                let mut pending = None;
+                let mut out = Vec::with_capacity(args.len());
+                for (i, a) in args.iter().enumerate() {
+                    match a {
+                        Expr::Name(n) if i < last && i % 2 == 0 => {
+                            pending = Some(bare_param(n).to_string());
+                            out.push(a.clone());
+                        }
+                        _ => {
+                            out.push(walk(a, bound, sheet, local));
+                            bound.extend(pending.take());
+                        }
+                    }
+                }
+                bound.truncate(mark);
+                Expr::Func(name.clone(), out)
+            }
+            Expr::Func(name, args) if name.eq_ignore_ascii_case("LAMBDA") => {
+                let (mark, last) = (bound.len(), args.len().saturating_sub(1));
+                // Every parameter is in scope for the body, so bind them first.
+                for (i, a) in args.iter().enumerate() {
+                    if let Expr::Name(n)
+                    | Expr::Structured {
+                        table: None,
+                        item: TableItem::Data,
+                        col1: Some(n),
+                        col2: None,
+                    } = a
+                    {
+                        if i < last {
+                            bound.push(bare_param(n).to_string());
+                        }
+                    }
+                }
+                let out = (args.iter().enumerate())
+                    .map(|(i, a)| match a {
+                        Expr::Name(_)
+                        | Expr::Structured {
+                            table: None,
+                            item: TableItem::Data,
+                            col1: Some(_),
+                            col2: None,
+                        } if i < last => a.clone(),
+                        _ => walk(a, bound, sheet, local),
+                    })
+                    .collect();
+                bound.truncate(mark);
+                Expr::Func(name.clone(), out)
+            }
+            Expr::Func(name, args) => {
+                let args: Vec<Expr> = args.iter().map(|a| walk(a, bound, sheet, local)).collect();
+                // A called name the sheet defines (a lambda), unless a
+                // binding or a builtin of that name is what the call reaches.
+                let callee = (!is_bound(bound, name) && !is_builtin(name))
+                    .then(|| local(name))
+                    .flatten();
+                match callee {
+                    Some(spelling) => Expr::Call(Box::new(Expr::Name(qualified(&spelling))), args),
+                    None => Expr::Func(name.clone(), args),
+                }
+            }
+            Expr::Call(callee, args) => Expr::Call(
+                Box::new(walk(callee, bound, sheet, local)),
+                args.iter().map(|a| walk(a, bound, sheet, local)).collect(),
+            ),
+            Expr::ArrayLit(rows) => Expr::ArrayLit(
+                rows.iter()
+                    .map(|row| row.iter().map(|x| walk(x, bound, sheet, local)).collect())
+                    .collect(),
+            ),
+            Expr::Un(op, x) => Expr::Un(*op, Box::new(walk(x, bound, sheet, local))),
+            Expr::Bin(op, l, r) => Expr::Bin(
+                *op,
+                Box::new(walk(l, bound, sheet, local)),
+                Box::new(walk(r, bound, sheet, local)),
+            ),
+            other => other.clone(),
+        }
+    }
+    walk(e, &mut Vec::new(), sheet, local)
 }
 
 /// Rebuild `e`, letting `f` replace any node: where `f` returns `Some`, that

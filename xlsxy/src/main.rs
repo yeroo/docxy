@@ -49,7 +49,7 @@ use gridcore::edit::{FillDir, fill_changes, replace_all_in_sheet};
 use gridcore::engine::{Engine, PART_OF_ARRAY};
 use gridcore::entry::{EntryCtx, entry_cell_ctx, entry_ctx, seed_text};
 use gridcore::fcomplete::Completions;
-use gridcore::formula::{move_block_formula, qualify_sheet_in_formula, translate_formula};
+use gridcore::formula::{qualify_sheet_in_formula, translate_formula};
 use gridcore::frame::Agg;
 use gridcore::legacy::{SourceFormat, open_workbook_ex as open_any};
 use gridcore::model::{
@@ -3604,7 +3604,7 @@ impl App {
         keys: Vec<(usize, Vec<(u32, u32)>)>,
         write: impl FnOnce(&mut Self),
     ) {
-        self.record_groups_wide(keys, None, |app| {
+        self.record_groups_wide(keys, None, false, |app| {
             write(app);
             false
         });
@@ -3613,18 +3613,19 @@ impl App {
     /// [`Self::record_groups`] for a write that may rewrite formulas outside
     /// its cells. `cut_from` is a cut's source (sheet, rect) when `write`
     /// pastes one: a table lying wholly inside it was cut whole, so clearing
-    /// its headers renames none of its columns, and the workbook is
-    /// snapshotted before `write`, which says whether it rewrote any formula
-    /// (a cut re-pointing what read the moved cells): the step is then a
-    /// whole-workbook one, as a table header rename's is; else it stays the
-    /// cells' own.
+    /// its headers renames none of its columns. With `wide` (a cut that
+    /// re-points what reads the moved cells, [`gridcore::edit::cut_moves_refs`])
+    /// the workbook is snapshotted before `write`, which says whether it
+    /// rewrote any formula: the step is then a whole-workbook one, as a table
+    /// header rename's is; else it stays the cells' own, and no snapshot is
+    /// taken (#1687).
     fn record_groups_wide(
         &mut self,
         keys: Vec<(usize, Vec<(u32, u32)>)>,
         cut_from: Option<(usize, (u32, u32, u32, u32))>,
+        wide: bool,
         write: impl FnOnce(&mut Self) -> bool,
     ) {
-        let wide = cut_from.is_some();
         let explicit = self.undo_target.take();
         let keys: Vec<_> = keys.into_iter().filter(|(_, k)| !k.is_empty()).collect();
         if keys.is_empty() {
@@ -3633,19 +3634,7 @@ impl App {
         // An edit of the cells a cut was taken from ends the cut, as in
         // Excel; the clip then pastes as a copy. (A cut's own paste has
         // already ended it, `paste_from`.)
-        if let Some(clip) = self.clip.as_ref().filter(|c| c.cut) {
-            let (fr, fc) = clip.from;
-            let (lr, lc) = (fr + clip.span.0.max(1) - 1, fc + clip.span.1.max(1) - 1);
-            let hit = keys.iter().any(|(s, cells)| {
-                *s == clip.sheet
-                    && cells
-                        .iter()
-                        .any(|&(r, c)| (fr..=lr).contains(&r) && (fc..=lc).contains(&c))
-            });
-            if hit {
-                self.cancel_cut();
-            }
-        }
+        self.end_cut_on(&keys);
         // What each group selects on Undo and Redo: the cells asked for,
         // before the frozen spill keys widen them.
         let mut targets: Vec<Option<CellRect>> =
@@ -3757,6 +3746,25 @@ impl App {
         self.warn_new_circles(&circles_before);
     }
 
+    /// End a pending cut when `keys` (sheet, cells) write any cell it was
+    /// taken from, as an edit or a restyle there does in Excel: the clip then
+    /// pastes as a copy, and the source keeps what was written.
+    fn end_cut_on(&mut self, keys: &[(usize, Vec<(u32, u32)>)]) {
+        if let Some(clip) = self.clip.as_ref().filter(|c| c.cut) {
+            let (fr, fc) = clip.from;
+            let (lr, lc) = (fr + clip.span.0.max(1) - 1, fc + clip.span.1.max(1) - 1);
+            let hit = keys.iter().any(|(s, cells)| {
+                *s == clip.sheet
+                    && cells
+                        .iter()
+                        .any(|&(r, c)| (fr..=lr).contains(&r) && (fc..=lc).contains(&c))
+            });
+            if hit {
+                self.cancel_cut();
+            }
+        }
+    }
+
     /// Whether any of `cells` on sheet `sheet` is a header cell of a table.
     fn hits_table_header(&self, sheet: usize, cells: &[(u32, u32)]) -> bool {
         self.pkg.workbook.tables.iter().any(|t| {
@@ -3777,6 +3785,12 @@ impl App {
         if styles.is_empty() {
             return;
         }
+        // Restyling cells a cut was taken from ends the cut, as an edit does
+        // (#1687): a paste would clear the new format with them.
+        let cells: Vec<(u32, u32)> = styles.iter().map(|&(r, c, _)| (r, c)).collect();
+        let keys = [(sheet_idx, cells)];
+        self.end_cut_on(&keys);
+        let [(_, cells)] = keys;
         let circles_before = self.engine.circular_refs();
         self.engine.clock = now_serial();
         let before: Vec<Option<Cell>> = {
@@ -3794,7 +3808,6 @@ impl App {
             .zip(before)
             .map(|(&(r, c, _), before)| (r, c, before, sheet.cell(r, c).cloned()))
             .collect();
-        let cells: Vec<(u32, u32)> = styles.iter().map(|&(r, c, _)| (r, c)).collect();
         self.push_undo(UndoAction::Cells(vec![UndoGroup {
             sheet: sheet_idx,
             changes,
@@ -4295,6 +4308,8 @@ impl App {
 
     /// The workbook state a structural undo step restores.
     fn wb_snapshot(&self) -> WbSnapshot {
+        #[cfg(test)]
+        tests::WB_SNAPSHOTS.with(|n| n.set(n.get() + 1));
         let wb = &self.pkg.workbook;
         WbSnapshot {
             sheets: wb.sheets.clone(),
@@ -5273,9 +5288,11 @@ impl App {
                         // A cut's own formulas move with it: references to
                         // cells of the cut follow them, the rest keep reading
                         // what they read (qualified with the source sheet when
-                        // the cut changes sheets). An unparseable formula keeps
-                        // its text, and so does one held verbatim (shared),
-                        // which is only qualified, as before.
+                        // the cut changes sheets, its local names too), and a
+                        // bare structured reference moved out of its table
+                        // names it (`moved_cell_formula`). An unparseable
+                        // formula keeps its text, and so does one held
+                        // verbatim (shared), which is only qualified, as before.
                         if cut {
                             if let Some(f) = &new_cell.formula {
                                 let verbatim = new_cell
@@ -5283,7 +5300,13 @@ impl App {
                                     .as_deref()
                                     .is_some_and(|a| !gridcore::sheet::is_array_f(a));
                                 let moved = if !verbatim {
-                                    move_block_formula(f, &mv)
+                                    gridcore::edit::moved_cell_formula(
+                                        &self.pkg.workbook,
+                                        (src, (fr, fc)),
+                                        (here, (r, c)),
+                                        f,
+                                        &mv,
+                                    )
                                 } else if !same_sheet {
                                     qualify_sheet_in_formula(f, &names.0)
                                 } else {
@@ -5379,6 +5402,10 @@ impl App {
                     (src, (fr, fc, fr + h - 1, fc + w - 1))
                 });
                 let rules = clip.rules.clone();
+                // Whether the cut re-points any formula outside its own cells,
+                // asked before anything is written: only then is the step a
+                // whole-workbook one, snapshotted (#1687).
+                let wide = cut && gridcore::edit::cut_moves_refs(&mut self.pkg.workbook, src, &mv);
                 // A part that can't hold `<dataValidations>` would lose them
                 // on save: leave the rules where they are and say so.
                 let land = self.pkg.takes_validations(here);
@@ -5386,7 +5413,7 @@ impl App {
                 // A cut's rules stayed on its cells for want of a place.
                 let kept = std::cell::Cell::new(false);
                 let write = |app: &mut Self| {
-                    app.record_groups_wide(keys, cut_from, |app| {
+                    app.record_groups_wide(keys, cut_from, wide, |app| {
                         let mut rewrote = false;
                         if cut {
                             // Read before the cut: the cells only part of it
@@ -5396,12 +5423,15 @@ impl App {
                             // References to the moved cells follow them, in
                             // formulas, names and rules on every sheet (a
                             // rule over the cut cells keeps its range here,
-                            // so it keeps its formula, even an absolute ref
-                            // in it to a cell that moved); the
-                            // engine is rebuilt on them so the writes below
-                            // recalculate what reads the cells where they land.
-                            rewrote = gridcore::edit::move_refs_rules_stay(wb, src, &mv);
-                            if rewrote {
+                            // and its relative and mixed refs; only its fully
+                            // absolute refs to moved cells outside its own
+                            // ranges follow them). Run only when the dry run
+                            // (`wide`) found something to re-point; the
+                            // engine is then rebuilt on them so the writes
+                            // below recalculate what reads the cells where
+                            // they land.
+                            if wide {
+                                rewrote = gridcore::edit::move_refs_rules_stay(wb, src, &mv);
                                 app.rebuild_engine();
                             }
                         } else if land {
@@ -15553,6 +15583,8 @@ mod tests {
     thread_local! {
         /// Makes [`remove_converted`] fail.
         pub(super) static FAIL_REMOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// How many whole-workbook snapshots [`App::wb_snapshot`] took.
+        pub(super) static WB_SNAPSHOTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     /// A corpus `.xls` copied to `dir/name` and opened.
@@ -28287,6 +28319,166 @@ mod tests {
             app.undo.last(),
             Some(UndoAction::Structural { .. })
         ));
+    }
+
+    // ---- #1687: what #880 left ----
+
+    fn snapshots() -> usize {
+        WB_SNAPSHOTS.with(std::cell::Cell::get)
+    }
+
+    /// Sheet2 B1 = 7 and A1 `=Rate*2`, where Rate is Sheet2's own name for
+    /// B1; Sheet1 has a Rate of its own and the workbook another.
+    fn local_name_app() -> App {
+        let mut app = repoint_app();
+        let name = |scope, formula: &str| gridcore::sheet::DefinedName {
+            name: "Rate".into(),
+            scope,
+            formula: formula.into(),
+        };
+        app.pkg.workbook.defined_names.extend([
+            name(Some(1), "Sheet2!$B$1"),
+            name(Some(0), "100"),
+            name(None, "1000"),
+        ]);
+        app.rebuild_engine();
+        put_cells(&mut app, 1, &[(0, 1, "7"), (0, 0, "=Rate*2")]);
+        assert_eq!(number_at(&app, 1, 0, 0), Some(14.0));
+        app
+    }
+
+    #[test]
+    fn a_cut_to_another_sheet_qualifies_a_local_name() {
+        let mut app = local_name_app();
+        cut_across(&mut app, 1, ((0, 0), (0, 0)), 0, (0, 2));
+        assert_eq!(formula_at(&app, 0, 0, 2).as_deref(), Some("Sheet2!Rate*2"));
+        assert_eq!(number_at(&app, 0, 0, 2), Some(14.0));
+        // It follows Sheet2's B1.
+        put_cells(&mut app, 1, &[(0, 1, "8")]);
+        assert_eq!(number_at(&app, 0, 0, 2), Some(16.0));
+    }
+
+    #[test]
+    fn a_cross_sheet_cut_qualifying_only_its_own_names_is_a_cells_step() {
+        // The qualified name is in the moved cell itself: nothing outside
+        // the cut changes, so no workbook snapshot is taken.
+        let mut app = local_name_app();
+        let before = snapshots();
+        cut_across(&mut app, 1, ((0, 0), (0, 0)), 0, (0, 2));
+        assert_eq!(snapshots(), before);
+        assert!(matches!(app.undo.last(), Some(UndoAction::Cells(_))));
+        app.undo();
+        assert_eq!(formula_at(&app, 1, 0, 0).as_deref(), Some("Rate*2"));
+        assert!(app.pkg.workbook.sheets[0].cell(0, 2).is_none());
+    }
+
+    #[test]
+    fn a_cut_out_of_a_table_makes_bare_refs_explicit() {
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "Qty"), (0, 1, "Price"), (1, 0, "3")]);
+        app.pkg.workbook.tables.push(gridcore::sheet::Table {
+            name: "Table1".into(),
+            sheet: 0,
+            range: (0, 0, 2, 1),
+            header_rows: 1,
+            totals_rows: 0,
+            columns: vec!["Qty".into(), "Price".into()],
+            ..Default::default()
+        });
+        app.rebuild_engine();
+        put_cells(&mut app, 0, &[(1, 1, "=[@Qty]*2"), (2, 1, "=[@Qty]*2")]);
+        assert_eq!(number_at(&app, 0, 1, 1), Some(6.0));
+        // Out of the table, on its row: the explicit form reads the same.
+        cut_across(&mut app, 0, ((1, 1), (1, 1)), 0, (1, 4));
+        assert_eq!(formula_at(&app, 0, 1, 4).as_deref(), Some("Table1[@Qty]*2"));
+        assert_eq!(number_at(&app, 0, 1, 4), Some(6.0));
+        // Within the table: still bare.
+        cut_across(&mut app, 0, ((2, 1), (2, 1)), 0, (1, 1));
+        assert_eq!(formula_at(&app, 0, 1, 1).as_deref(), Some("[@Qty]*2"));
+    }
+
+    #[test]
+    fn a_cut_that_repoints_nothing_takes_no_workbook_snapshot() {
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "5"), (0, 1, "=C3")]);
+        let before = snapshots();
+        cut_across(&mut app, 0, ((0, 0), (0, 0)), 0, (0, 2));
+        assert_eq!(snapshots(), before);
+        assert!(matches!(app.undo.last(), Some(UndoAction::Cells(_))));
+        // A formula elsewhere reading the cut: snapshotted, a structural step.
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "5"), (0, 1, "=A1")]);
+        let before = snapshots();
+        cut_across(&mut app, 0, ((0, 0), (0, 0)), 0, (0, 2));
+        assert!(snapshots() > before);
+        assert!(matches!(
+            app.undo.last(),
+            Some(UndoAction::Structural { .. })
+        ));
+        assert_eq!(formula_at(&app, 0, 0, 1).as_deref(), Some("C1"));
+    }
+
+    #[test]
+    fn a_cut_keeps_absolute_refs_of_a_rule_left_in_place_following() {
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 5, "on")]);
+        app.pkg.workbook.sheets[0]
+            .cond_formats
+            .push(gridcore::sheet::CondFormat {
+                ranges: vec![(0, 0, 9, 3)], // A1:D10, which the cut meets
+                rules: vec![gridcore::sheet::CfRule {
+                    kind: gridcore::sheet::CfKind::Expression {
+                        formula: "$F$1=\"on\"".into(),
+                    },
+                    dxf_id: None,
+                    priority: 1,
+                }],
+                ix: None,
+            });
+        cut_across(&mut app, 0, ((0, 0), (0, 5)), 0, (19, 0));
+        assert_eq!(cf_formula(&app), "$F$20=\"on\"");
+        assert_eq!(
+            app.pkg.workbook.sheets[0].cond_formats[0].ranges,
+            [(0, 0, 9, 3)]
+        );
+        app.undo();
+        assert_eq!(cf_formula(&app), "$F$1=\"on\"");
+    }
+
+    #[test]
+    fn restyling_a_cut_cell_ends_the_cut() {
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "5")]);
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.copy(true);
+        app.toggle_bold();
+        assert!(!app.clip.as_ref().unwrap().cut);
+        app.cur = (0, 2);
+        app.paste_from(None);
+        // A copy now: the source keeps its value and its bold; the target
+        // has the cell as it was cut.
+        assert_eq!(number_at(&app, 0, 0, 0), Some(5.0));
+        assert!(xf_at(&app, 0, 0).bold);
+        assert_eq!(number_at(&app, 0, 0, 2), Some(5.0));
+        assert!(!xf_at(&app, 0, 2).bold);
+        assert!(matches!(app.undo.last(), Some(UndoAction::Cells(_))));
+    }
+
+    #[test]
+    fn restyling_outside_a_cut_keeps_it() {
+        let mut app = repoint_app();
+        put_cells(&mut app, 0, &[(0, 0, "5")]);
+        app.cur = (0, 0);
+        app.anchor = None;
+        app.copy(true);
+        app.cur = (0, 1);
+        app.toggle_bold();
+        assert!(app.clip.as_ref().unwrap().cut);
+        app.cur = (0, 2);
+        app.paste_from(None);
+        assert!(app.pkg.workbook.sheets[0].cell(0, 0).is_none());
+        assert_eq!(number_at(&app, 0, 0, 2), Some(5.0));
     }
 
     #[test]
