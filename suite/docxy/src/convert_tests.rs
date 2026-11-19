@@ -403,6 +403,66 @@ fn a_pdf_view_comes_back_from_the_session_and_an_old_converted_row_converts() {
     assert_eq!(texts(&back), ["Page text."]);
 }
 
+/// FIX r3: a second open of a PDF goes to its PDF tab (open, failed or
+/// not opened yet), whatever the order of a converted tab of it.
+#[test]
+fn reopening_a_pdf_goes_to_its_pdf_tab() {
+    let dir = Scratch::new();
+    let doc = docxcore::markdown::from_markdown("Words.\n");
+    let path = write(
+        &dir,
+        "paper.pdf",
+        &docxcore::export::to_pdf(&doc, &docxcore::export::PdfOptions::default()),
+    );
+    let converted = converted_pdf_tab(&path, &TrustStore::default()).unwrap();
+    let at = crate::pdf_view::host::PdfAt { page: 1, zoom: 2. };
+    let pending = crate::pdf_view::host::pending_pdf_tab(&path, "paper.pdf", at);
+    let other = tab_from_path(&write(&dir, "letter.rtf", RTF));
+    let tabs = vec![other, converted, pending];
+    assert_eq!(crate::open_tab_index(&tabs, &path), Some(2));
+    // With no PDF tab, the converted one.
+    assert_eq!(crate::open_tab_index(&tabs[..2], &path), Some(1));
+}
+
+/// FIX r3: a restored PDF tab whose file cannot be read keeps waiting where
+/// it was; one whose file is no PDF any more opens as a document.
+#[test]
+fn a_restored_pdf_tab_whose_file_is_gone_or_changed() {
+    let dir = Scratch::new();
+    let at = crate::pdf_view::host::PdfAt { page: 2, zoom: 1.5 };
+    let gone = dir.path("gone.pdf");
+    let mut tab = crate::pdf_view::host::pending_pdf_tab(&gone, "gone.pdf", at);
+    finish_pending_conversion(&mut tab);
+    assert!(tab.status.starts_with("read error"), "{}", tab.status);
+    assert!(tab.load_failed);
+    assert!(matches!(tab.surface, Surface::PdfPending(a) if a == at));
+    assert_eq!(
+        crate::pdf_view::host::pdf_at(&tab),
+        Some(at),
+        "the place is kept"
+    );
+    // Not retried every frame: only an activation clears the mark.
+    finish_pending_conversion(&mut tab);
+    assert!(matches!(tab.surface, Surface::PdfPending(_)));
+    // The file is back: the next activation opens it.
+    let slides = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pdf-view/slides.pdf");
+    std::fs::copy(slides, &gone).unwrap();
+    tab.load_failed = false;
+    finish_pending_conversion(&mut tab);
+    let Surface::Pdf(v) = &tab.surface else {
+        panic!("not opened: {}", tab.status)
+    };
+    assert_eq!((v.restore_page, v.zoom), (Some(2), 1.5));
+    // A file that is no PDF any more opens as a document would.
+    let changed = write(&dir, "changed.pdf", RTF);
+    let mut tab = crate::pdf_view::host::pending_pdf_tab(&changed, "changed.pdf", at);
+    finish_pending_conversion(&mut tab);
+    assert!(tab.kind == Kind::Docx);
+    assert!(matches!(tab.surface, Surface::Doc(_)));
+    assert_eq!(tab.access.converted, Some(Converted::Rtf));
+    assert_eq!(tab.title.as_ref(), "changed.pdf");
+}
+
 /// FIX r2: a PDF that fails to open is still a PDF tab: File only on its
 /// ribbon, and Save never writes it.
 #[test]

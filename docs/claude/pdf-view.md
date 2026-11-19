@@ -53,19 +53,24 @@ Notes for the suite's PDF view: opening a PDF as it looks, read-only.
   built (`doc_tab_from_path_mode`, `tab_from_path`, session restore), never
   in `load_doc_file`: a restored `Converted::Pdf` tab, Protected View's
   rollback and Recover Text keep converting. A file named `.pdf` that does
-  not sniff as one opens as before.
+  not sniff as one (or cannot be read) opens as a document would.
 - Read-only: Save and Save As refuse with `PDF_NO_SAVE` / `PDF_NO_SAVE_AS`;
   no key edits. Protected View is ignored (nothing to hold back);
   `converted_pdf_tab` (Convert to editable document) opens today's
   converted tab after the view, protected when the file's zone says so. A
-  second open of the PDF focuses the view, not its converted tab.
+  second open of the PDF focuses its PDF tab (open, failed or pending), not
+  its converted or recovered tab (`open_tab_index`).
 - Session: a document row (`kind: "Docx"`) with `pdf_view: {page, zoom}`, so
   an older build still reads `session.json` (and converts the PDF). A row
   without it (`converted: "pdf"`) restores converted.
   A restored PDF row is `Surface::PdfPending(PdfAt)` until it is first in
   front (`finish_pending_conversion`, also run by `pdf_tick`), as a pending
   conversion is (#633): a startup starts no worker for a tab behind, and a
-  pending tab persists its `PdfAt` unchanged. Every `Kind::Pdf` tab (open,
+  pending tab persists its `PdfAt` unchanged. When it comes in front a file
+  that cannot be read keeps it pending with `load_failed` and a `read
+  error` (the session keeps its place; the next activation, `select_tab`,
+  tries again, never each frame); a file that reads but is no PDF any more
+  opens as a document. Every `Kind::Pdf` tab (open,
   failed, pending) has the File-only ribbon (`ribbon_tab_set`), the PDF
   status hint and the Save refusals.
 - Find searches a page when its text comes in and splices its hits in page

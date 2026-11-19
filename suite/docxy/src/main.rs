@@ -12791,9 +12791,12 @@ fn reload_without_converting(path: &std::path::Path) -> Loaded {
 /// Convert a converted tab restored from the session (#633), now that it is
 /// in front: what its file converts to today.
 fn finish_pending_conversion(tab: &mut DocTab) {
-    // A restored PDF view opens now (#2245).
+    // A restored PDF view opens now (#2245); one whose file could not be
+    // read waits for its next activation (`select_tab` clears the mark).
     if let Surface::PdfPending(at) = tab.surface {
-        pdf_view::host::finish_pending_pdf(tab, at);
+        if !tab.load_failed {
+            pdf_view::host::finish_pending_pdf(tab, at);
+        }
         return;
     }
     if !tab.pending_conversion {
@@ -13176,6 +13179,17 @@ fn doc_tab_from_path_mode(
         doc_templates::untitle_template_tab(&mut tab, path);
     }
     tab
+}
+
+/// The tab already open on `path`, if any. A PDF's tab (#2245: its view,
+/// open, failed or not opened yet) before a document converted from it or
+/// its recovered text, whatever their order.
+fn open_tab_index(tabs: &[DocTab], path: &std::path::Path) -> Option<usize> {
+    let key = canonical(path);
+    let same = |t: &DocTab| t.path.as_deref().map(canonical) == Some(key.clone());
+    tabs.iter()
+        .position(|t| same(t) && t.kind == Kind::Pdf)
+        .or_else(|| tabs.iter().position(same))
 }
 
 /// [`tab_from_path`] in an open mode (#610). A workbook takes every mode but
@@ -17600,9 +17614,9 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
 }
 
 fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab, bool) {
-    // A PDF view (#2245), where it was. A file that is no PDF now opens as
-    // a document would.
-    // Not opened yet: it opens when it is first in front.
+    // A PDF view (#2245), where it was, not opened yet: it opens when it is
+    // first in front (`finish_pending_pdf`), as a document if it is no PDF
+    // by then.
     if let (Some(at), Some(path)) = (t.pdf_view, t.path.as_ref()) {
         let path = PathBuf::from(path);
         return (pdf_view::host::pending_pdf_tab(&path, &t.title, at), false);
@@ -27337,6 +27351,11 @@ impl Docxy {
             self.active = i;
             // A converted tab restored from the session converts as it comes
             // in front, before any input can reach its placeholder (#633).
+            // A restored PDF tab whose file could not be read tries again
+            // (#2245).
+            if matches!(self.tabs[i].surface, Surface::PdfPending(_)) {
+                self.tabs[i].load_failed = false;
+            }
             finish_pending_conversion(&mut self.tabs[i]);
             self.tab_more_open = false;
             self.bs_info_status = None;
@@ -28415,15 +28434,7 @@ impl Docxy {
         // A workbook takes Excel's modes, a document Recover Text (#633).
         let mode = effective_mode(&path, mode);
         let open = (mode != OpenMode::Copy)
-            .then(|| {
-                let key = canonical(&path);
-                let same = |t: &DocTab| t.path.as_deref().map(canonical) == Some(key.clone());
-                // A PDF's view before a document converted from it (#2245).
-                self.tabs
-                    .iter()
-                    .position(|t| same(t) && matches!(t.surface, Surface::Pdf(_)))
-                    .or_else(|| self.tabs.iter().position(same))
-            })
+            .then(|| open_tab_index(&self.tabs, &path))
             .flatten();
         let trusted = trusted::TrustStore::load(&config_root());
         let Some(i) = open else {

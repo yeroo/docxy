@@ -46,8 +46,9 @@ pub(crate) fn is_pdf_file(path: &Path) -> bool {
 }
 
 /// A PDF view's tab on `path`, at `page` and `zoom` when a session says so;
-/// `None` when `path` is no PDF (it opens as a document). A PDF whose pages
-/// the worker cannot read is a failed tab that says why.
+/// `None` when `path` is no PDF, or cannot be read (the caller opens it as a
+/// document, which says why). A PDF whose pages the worker cannot read is a
+/// failed tab that says why.
 pub(crate) fn pdf_view_tab(path: &Path, at: Option<PdfAt>) -> Option<DocTab> {
     if !is_pdf_file(path) {
         return None;
@@ -116,24 +117,32 @@ pub(crate) fn pending_pdf_tab(path: &Path, title: &str, at: PdfAt) -> DocTab {
 /// What a restored PDF tab says until it opens.
 pub(crate) const PENDING: &str = "not opened yet: it opens when you open its tab";
 
-/// Open a restored PDF tab now that it is in front, where it was. A file
-/// that is no PDF any more is a failed tab that says so.
+/// Open a restored PDF tab now that it is in front, where it was.
+///
+/// A file that cannot be read (gone, a drive not mounted) keeps the tab
+/// pending with `load_failed` and a `read error`: the session keeps where
+/// it was, and the next time the tab comes in front it tries again (a
+/// failed pending tab is not retried every frame). A file that reads but is
+/// no PDF any more opens as a document would.
 pub(crate) fn finish_pending_pdf(tab: &mut DocTab, at: PdfAt) {
     let Some(path) = tab.path.clone() else {
         return;
     };
-    let title = tab.title.clone();
-    match pdf_view_tab(&path, Some(at)) {
-        Some(mut fresh) => {
-            fresh.title = title;
-            tab.replace_in_place(fresh);
-        }
-        None => {
-            tab.surface = Surface::Placeholder;
-            tab.load_failed = true;
-            tab.status = "load error: the file is no longer a PDF".into();
-        }
+    if let Err(e) = std::fs::File::open(&path) {
+        tab.surface = Surface::PdfPending(at);
+        tab.load_failed = true;
+        tab.status = format!("read error: {e}").into();
+        return;
     }
+    let title = tab.title.clone();
+    let fresh = match pdf_view_tab(&path, Some(at)) {
+        Some(fresh) => fresh,
+        None => {
+            load_doc_for_tab(&path, None).into_tab(Kind::Docx, title.clone(), Some(path), false)
+        }
+    };
+    tab.replace_in_place(fresh);
+    tab.title = title;
 }
 
 // The images PDF views let go of, freed from the GPU's atlas by the next
@@ -203,9 +212,11 @@ impl Docxy {
         for img in take_released() {
             cx.drop_image(img, Some(window));
         }
-        // A restored PDF tab in front opens before this frame lays it out.
+        // A restored PDF tab in front opens before this frame lays it out
+        // (one whose file could not be read waits for its next activation).
         if let Some(t) = self.tabs.get_mut(self.active)
             && matches!(t.surface, Surface::PdfPending(_))
+            && !t.load_failed
         {
             finish_pending_conversion(t);
         }
