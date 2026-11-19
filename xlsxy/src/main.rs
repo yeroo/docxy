@@ -5423,10 +5423,13 @@ impl App {
                             // References to the moved cells follow them, in
                             // formulas, names and rules on every sheet (a
                             // rule over the cut cells keeps its range here,
-                            // so it keeps its formula, even an absolute ref
-                            // in it to a cell that moved); the
-                            // engine is rebuilt on them so the writes below
-                            // recalculate what reads the cells where they land.
+                            // and its relative and mixed refs; only its fully
+                            // absolute refs to moved cells outside its own
+                            // ranges follow them). Run only when the dry run
+                            // (`wide`) found something to re-point; the
+                            // engine is then rebuilt on them so the writes
+                            // below recalculate what reads the cells where
+                            // they land.
                             if wide {
                                 rewrote = gridcore::edit::move_refs_rules_stay(wb, src, &mv);
                                 app.rebuild_engine();
