@@ -127,9 +127,8 @@ impl SheetView {
         for (dr, line) in rows.iter().enumerate() {
             let mut row = Vec::new();
             for (dc, f) in line.iter().enumerate() {
-                let style = wb.sheets[s]
-                    .cell(at.0 + dr as u32, at.1 + dc as u32)
-                    .map_or(0, |cl| cl.style);
+                // An absent target's inherited style counts (#1660).
+                let style = wb.sheets[s].entry_style_at(at.0 + dr as u32, at.1 + dc as u32);
                 row.push(gridcore::entry::paste_cell(&mut wb.styles, style, f, &ctx));
             }
             block.push(row);

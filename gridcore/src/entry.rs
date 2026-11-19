@@ -411,15 +411,12 @@ pub fn typed_formula<'a>(
     typed_formula_styled(wb, base_style(wb, sheet, row, col), text)
 }
 
-/// The style an entry typed into (sheet, row, col) is read under: the
-/// cell's own, or for an absent cell the one it inherits from its row or
-/// column ([`crate::sheet::Sheet::inherited_style`]), as Excel gives a cell
-/// typed into a formatted column that column's format (#1660).
+/// The style an entry typed into (sheet, row, col) is read under
+/// ([`crate::sheet::Sheet::entry_style_at`]).
 fn base_style(wb: &Workbook, sheet: usize, row: u32, col: u32) -> u32 {
-    wb.sheets.get(sheet).map_or(0, |s| {
-        s.cell(row, col)
-            .map_or_else(|| s.inherited_style(row, col), |c| c.style)
-    })
+    wb.sheets
+        .get(sheet)
+        .map_or(0, |s| s.entry_style_at(row, col))
 }
 
 /// [`typed_formula`] for a cell of style `style` ([`entry_cell_styled`]).

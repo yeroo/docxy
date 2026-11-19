@@ -5471,7 +5471,8 @@ impl App {
                     if r >= MAX_ROWS || c >= MAX_COLS {
                         continue;
                     }
-                    let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
+                    // An absent target's inherited style counts (#1660).
+                    let style = self.sheet().entry_style_at(r, c);
                     // Read as typed into the target (a leading `'` is
                     // quote-prefixed text, a date brings its format).
                     let styles = &mut self.pkg.workbook.styles;
@@ -9062,7 +9063,8 @@ impl App {
             self.status = Some("AutoSum: no adjacent numbers".into());
             return;
         };
-        let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
+        // An absent cell's inherited style counts (#1660).
+        let style = self.sheet().entry_style_at(r, c);
         self.status = Some(format!("AutoSum: =SUM({range})"));
         self.structural_writing_cells(move |wb| {
             let cell = Cell {
@@ -9898,15 +9900,14 @@ impl App {
         for (c, text) in changes {
             let wb = &self.pkg.workbook;
             let sh = &wb.sheets[d.sheet];
-            // A record's own absent field is read under the style it
-            // inherits from its row or column (#1660).
+            // A record's own absent field, or a new record's field with none
+            // above it, is read under the style the cell inherits from its
+            // row or column (#1660).
             let base = match d.rec {
-                Rec::Row(r) => sh
-                    .cell(r, c)
-                    .map_or_else(|| sh.inherited_style(r, c), |cell| cell.style),
+                Rec::Row(r) => sh.entry_style_at(r, c),
                 Rec::New => style_row
                     .and_then(|r| sh.cell(r, c))
-                    .map_or(0, |cell| cell.style),
+                    .map_or_else(|| sh.inherited_style(row, c), |cell| cell.style),
             };
             let formula = gridcore::entry::typed_formula_styled(wb, base, &text);
             let checked =
@@ -25003,6 +25004,19 @@ mod tests {
         form_key(&mut app, KeyCode::Down);
         let b2 = app.sheet().cell(1, 1).unwrap();
         assert_eq!((&b2.value, b2.style), (&CellValue::Number(0.15), pct));
+        // A new record whose field above (B4) is absent: the new cell's own
+        // inherited style, not the default (r1 m3).
+        app.pkg.workbook.sheets[0].cells.remove(&(3, 1));
+        app.rebuild_engine();
+        form_button(&mut app, dataform::Button::New);
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!(form_rec(&app), dataform::Rec::New);
+        form_type(&mut app, "Dan");
+        form_key(&mut app, KeyCode::Tab);
+        form_type(&mut app, "20");
+        form_key(&mut app, KeyCode::Enter);
+        let b5 = app.sheet().cell(4, 1).unwrap();
+        assert_eq!((&b5.value, b5.style), (&CellValue::Number(0.2), pct));
     }
 
     #[test]

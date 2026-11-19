@@ -766,10 +766,9 @@ impl Session {
                             if r >= MAX_ROWS || c >= MAX_COLS {
                                 continue;
                             }
-                            let style = self.pkg.workbook.sheets[self.active]
-                                .cell(r, c)
-                                .map(|x| x.style)
-                                .unwrap_or(0);
+                            // An absent target's inherited style counts
+                            // (#1660).
+                            let style = self.pkg.workbook.sheets[self.active].entry_style_at(r, c);
                             // Read as typed into the target: a leading `'`
                             // is quote-prefixed text (what copy writes for
                             // one), a date brings its format.
@@ -4778,6 +4777,30 @@ mod tests {
             .map(|k| k.0)
             .collect();
         assert_eq!(d, vec![0, 1, 2], "D1:D3 only");
+    }
+
+    /// #1660 r1 m2: text pasted into an absent cell is read under the style
+    /// its column gives it, as typing is: `15` in a `0%` column is 15%.
+    #[test]
+    fn pasted_text_into_an_absent_cell_reads_under_its_columns_style() {
+        let mut s = Session::open(&save_xlsx(&new_xlsx())).expect("open");
+        let wb = &mut s.pkg.workbook;
+        let pct = wb.styles.intern(gridcore::sheet::Xf {
+            numfmt: gridcore::sheet::NumFmt::Percent { decimals: 0 },
+            code: Some("0%".into()),
+            ..gridcore::sheet::Xf::default()
+        });
+        wb.sheets[0].col_defs.push(gridcore::sheet::ColDef {
+            min: 4,
+            max: 4,
+            width: None,
+            attrs: format!(r#"style="{pct}""#),
+            default_width: false,
+            plain_width: false,
+        });
+        s.dispatch("paste\t0\t4\t15");
+        let e1 = s.pkg.workbook.sheets[0].cell(0, 4).cloned().unwrap();
+        assert_eq!((e1.value, e1.style), (CellValue::Number(0.15), pct));
     }
 
     #[test]

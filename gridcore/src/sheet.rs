@@ -1784,6 +1784,15 @@ impl Sheet {
         self.row_style(row).unwrap_or_else(|| self.col_style(col))
     }
 
+    /// The style an entry typed, pasted as text or put by a command (AutoSum)
+    /// at `(row, col)` is read under: the cell's own, or for an absent cell
+    /// the one it inherits from its row or column, as Excel gives a cell
+    /// typed into a formatted column that column's format (#1660).
+    pub fn entry_style_at(&self, row: u32, col: u32) -> u32 {
+        self.cell(row, col)
+            .map_or_else(|| self.inherited_style(row, col), |c| c.style)
+    }
+
     /// How a copy, fill or move reads this sheet's cells ([`CopyReader`]).
     pub fn copy_reader(&self) -> CopyReader<'_> {
         CopyReader {

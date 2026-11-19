@@ -3466,7 +3466,8 @@ impl SheetView {
         if sh.cell(r, c).and_then(|x| x.formula.as_deref()) == Some(formula.as_str()) {
             return Ok(false);
         }
-        let style = sh.cell(r, c).map(|x| x.style).unwrap_or(0);
+        // An absent cell's inherited style counts (#1660).
+        let style = sh.entry_style_at(r, c);
         let cell = Cell {
             style,
             ..Cell::formula(&formula)
