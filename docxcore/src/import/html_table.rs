@@ -489,12 +489,30 @@ fn column_widths(spec: &TableSpec, placed: &[Placed], ncols: usize, avail: u32) 
     // holds nothing of its own: a browser and Word give it next to no width,
     // so the columns with content share the rest (#2249). When every column
     // left is bare, they share it as before.
+    // A span made only of bare columns (`<td colspan=2>` beside a cell,
+    // never split by another row) is that cell's own room: its columns are
+    // not pinned.
     let has_own: Vec<bool> = (0..ncols)
         .map(|c| single.iter().any(|p| p.col == c))
         .collect();
     if (0..ncols).any(|c| col[c].is_none() && has_own[c]) {
-        for c in 0..ncols {
-            if col[c].is_none() && !has_own[c] {
+        let spans: Vec<std::ops::Range<usize>> = placed
+            .iter()
+            .filter(|p| p.span > 1)
+            .map(|p| p.col..(p.col + p.span).min(ncols))
+            .collect();
+        let pin: Vec<bool> = (0..ncols)
+            .map(|c| {
+                col[c].is_none()
+                    && !has_own[c]
+                    && spans
+                        .iter()
+                        .filter(|r| r.contains(&c))
+                        .all(|r| r.clone().any(|k| has_own[k] || col[k].is_some()))
+            })
+            .collect();
+        for (c, pinned) in pin.into_iter().enumerate() {
+            if pinned {
                 col[c] = Some(MIN_COL);
             }
         }

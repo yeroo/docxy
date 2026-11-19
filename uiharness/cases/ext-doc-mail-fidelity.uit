@@ -35,6 +35,13 @@ test issue 2249 a mail opened as a web page hides its preheader and paints its b
   # which shows it so typing there is seen; in the next one, it collapses.
   call doc {}
   assert reply.flow.layout.paragraphs.0.height is 17
+  # Typed there, it joins the hidden run but draws: the run holding the
+  # caret is shown whole.
+  type Typed
+  shot window
+  call doc {}
+  assert reply.flow.layout.paragraphs.0.lines.0.text is TypedPreview text nobody sees
+  key ctrl+z
   call selection-set {"start":60,"end":60}
   shot window
   call doc {}

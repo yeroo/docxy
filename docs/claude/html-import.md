@@ -698,7 +698,10 @@ A batch from #1989 and #1930 (plan-2), import only.
   now paints it.
 - Column widths: a column without a width that no colspan-1 cell sits in
   (only a span or an empty slot reaches it, e.g. a one-cell row over a
-  `colspan=2` footer) gets `MIN_COL`, and the content columns share the
+  `colspan=2` footer) gets `MIN_COL` when every span reaching it also
+  reaches a column with its own cell or width (a span of bare columns
+  only, such as `<td colspan=2>` beside a cell, is that cell's room and is
+  not pinned), and the content columns share the
   rest. When every unknown column is bare, they share it evenly as before.
 - Tests: `hidden_text_is_vanish`,
   `text_decoration_none_is_an_explicit_no_underline_2249` and

@@ -38034,8 +38034,8 @@ fn run_highlight(props: &RunProps, is_link: bool, pal: &Pal) -> Option<(u32, u32
         // Run shading (`w:shd`, an imported `<span style="background:…">`)
         // fills the same band (#2249).
         // On a light page the run keeps its own colour (a mail button's
-        // white text on its fill); only an automatic one takes the ink that
-        // reads on the fill.
+        // white text on its fill) and a link the link colour; only an
+        // automatic colour outside a link takes the ink that reads on the fill.
         None => {
             let c = run_shading(props)?;
             // A run's own colour, or a link's, as `run_ink` draws it.
@@ -38577,6 +38577,16 @@ fn emit_run(
         *caret = None;
     }
     *idx = end;
+}
+
+/// Whether an inline is hidden text (#2249): a run shown `vanish`, or a
+/// tab or break whose own props are.
+fn hidden_piece(it: &Inline, styler: run_look::RunStyler) -> bool {
+    match it {
+        Inline::Run(r) => styler.shown(r).vanish,
+        Inline::Tab(tp) | Inline::Break(_, tp) => tp.vanish,
+        _ => false,
+    }
 }
 
 /// A hidden run's place in the paragraph (#2249), or a hidden tab's or
@@ -40005,15 +40015,14 @@ fn paragraph_el(
     // `display:none` preheader), takes no room while formatting marks are
     // off, as in Word (#2249): every piece is hidden text, a hidden tab or
     // break, or takes no offset (a link's wrapper, a bookmark). The caret in
-    // it shows it, so what is typed there is seen.
+    // it shows it, and the hidden run holding the caret draws, so what is
+    // typed there is seen.
     let collapsed = !marks
         && caret.is_none()
         && mark.vanish
-        && items.iter().all(|(i, _)| match &**i {
-            Inline::Run(r) => styler.shown(r).vanish,
-            Inline::Tab(tp) | Inline::Break(_, tp) => tp.vanish,
-            other => caret_advance(other) == 0,
-        });
+        && items
+            .iter()
+            .all(|(i, _)| hidden_piece(i, styler) || caret_advance(i) == 0);
     // A highlight's band (#2231): the line's single-spaced height, worked
     // out only for a paragraph that has a highlighted run.
     let highlighted = items
@@ -40053,12 +40062,7 @@ fn paragraph_el(
     // other inlines with no measurable text contribute 0.
     let inline_w = |it: &Inline| -> f32 {
         // Hidden pieces take no width while marks are off (#2249).
-        let hidden = match it {
-            Inline::Run(r) => styler.shown(r).vanish,
-            Inline::Tab(tp) | Inline::Break(_, tp) => tp.vanish,
-            _ => false,
-        };
-        if !marks && hidden {
+        if !marks && hidden_piece(it, styler) {
             return 0.0;
         }
         m.map_or(0.0, |m| {
@@ -40072,7 +40076,10 @@ fn paragraph_el(
             .iter()
             .map(|(it, _)| &**it)
             .take_while(|it| {
-                !matches!(it, Inline::Tab(_) | Inline::Break(..)) && ptab_of(it).is_none()
+                // A hidden tab or break ends no segment while marks are off.
+                let shown_stop = matches!(it, Inline::Tab(_) | Inline::Break(..))
+                    && (marks || !hidden_piece(it, styler));
+                !shown_stop && ptab_of(it).is_none()
             })
             .map(&inline_w)
             .sum()
@@ -40172,7 +40179,13 @@ fn paragraph_el(
             // Hidden text (`w:vanish`, an imported mail's preheader) draws
             // only while formatting marks are shown, as in Word (#2249). Its
             // offsets still count, so the caret and selection stay in step.
-            Inline::Run(r) if !marks && styler.shown(r).vanish => {
+            // The run holding the caret draws, so what is typed there (in
+            // its hidden props) is seen.
+            Inline::Run(r)
+                if !marks
+                    && styler.shown(r).vanish
+                    && !caret.is_some_and(|c| c >= idx && c <= idx + r.text.chars().count()) =>
+            {
                 skip_hidden_run(&mut spans, &r.text, &mut idx, &mut caret, caret_h);
             }
             Inline::Run(r) => {

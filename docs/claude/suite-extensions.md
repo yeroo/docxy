@@ -943,11 +943,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   too) are all hidden or take no offset, and whose mark is hidden,
   collapses (no height, spacing or margin) while marks are off and the
   caret is not in it, as Word draws an imported preheader. The caret in it
-  shows it, so typing there (in the hidden run's props) is seen; a document
+  shows it, and the hidden run holding the caret draws, so typing there
+  (in the hidden run's props) is seen; a document
   tab that opens with its caret there shows the preheader until the caret
   moves.
-- Hidden pieces count 0 in `run_w` and in `inline_w` (a centre or right
-  tab's segment).
+- `hidden_piece` says what is hidden. Hidden pieces count 0 in `run_w`
+  and `inline_w`, and a hidden tab or break ends no centre or right tab's
+  segment (`seg_width`).
 - Run shading (`w:shd` fill, `run_shading`) paints the highlight band
   (`run_highlight(props, is_link, pal)`; a highlight wins). On a light
   page a run with its own colour keeps it, a link without one keeps the

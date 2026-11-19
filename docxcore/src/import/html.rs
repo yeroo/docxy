@@ -6882,6 +6882,12 @@ mod card_tests {
         // Bare columns alone still share the room, as before.
         let d = doc("<table width=600><tr><td colspan=2>Only a span</td></tr></table>");
         assert_eq!(first_table(&d.body).grid, [4500, 4500]);
+        // A span of bare columns beside a cell is that cell's room: not
+        // pinned, the three columns share the width as before.
+        let d = doc(
+            "<table width=600><tr><td>Name</td><td colspan=2>A value that needs                      room</td></tr></table>",
+        );
+        assert_eq!(first_table(&d.body).grid, [3000, 3000, 3000]);
     }
 
     fn cell(t: &Table, row: usize, col: usize) -> &[DocBlock] {
