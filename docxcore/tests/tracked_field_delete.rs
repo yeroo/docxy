@@ -159,22 +159,50 @@ fn the_deletion_survives_a_save_and_reload() {
         }
         let saved = xml(&ed);
         let body = &saved[saved.find("<w:body>").unwrap() + 8..saved.find("</w:body>").unwrap()];
-        let mut again = Editor::new(parse(body));
-        // The loader keeps a `w:del` holding field runs as loose runs (it
-        // collapses no field inside a tracked change), so this pins the XML.
+        let again = Editor::new(parse(body));
+        // The loader collapses the field inside the `w:del` into one unit
+        // (#1625) and a save writes the deletion as it was read.
         assert_eq!(xml(&again), saved);
         assert_eq!(again.doc.revisions().len(), 1);
-        again.reject_all_revisions();
-        let x = xml(&again);
-        assert!(
-            x.contains("<w:instrText") && !x.contains("delInstrText"),
-            "{x}"
-        );
-        assert!(
-            x.contains("fldCharType=\"end\"") && !x.contains("<w:del "),
-            "{x}"
-        );
+        assert_eq!(deletions(&again), 1, "one field in the w:del");
+        assert_reload_reject_and_accept(again);
     }
+}
+
+/// Reject on `ed` (one deleted field between `ab` and `cd`) restores one live
+/// field, not loose markers; Accept drops it.
+fn assert_reload_reject_and_accept(ed: Editor) {
+    let mut rejected = Editor::new(ed.doc.clone());
+    rejected.reject_all_revisions();
+    let x = xml(&rejected);
+    assert!(
+        x.contains("<w:instrText") && !x.contains("delInstrText"),
+        "{x}"
+    );
+    assert!(
+        x.contains("fldCharType=\"end\"") && !x.contains("<w:del "),
+        "{x}"
+    );
+    assert_eq!(fields(&rejected), 1, "one live field: {x}");
+    assert_eq!(text(&rejected), "ab7cd");
+
+    let mut accepted = ed;
+    accepted.accept_all_revisions();
+    assert_eq!(fields(&accepted), 0);
+    assert_eq!(text(&accepted), "abcd");
+}
+
+#[test]
+fn a_word_written_field_deletion_loads_as_one_field_1625() {
+    let deleted = "<w:del w:id=\"9\" w:author=\"Bo\" w:date=\"2026-01-01T00:00:00Z\">\
+        <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+        <w:r><w:delInstrText xml:space=\"preserve\"> PAGE </w:delInstrText></w:r>\
+        <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r><w:r><w:delText>7</w:delText></w:r>\
+        <w:r><w:fldChar w:fldCharType=\"end\"/></w:r></w:del>";
+    let ed = editor(deleted);
+    assert_eq!(deletions(&ed), 1, "{}", xml(&ed));
+    assert!(xml(&ed).contains(deleted), "saved as read: {}", xml(&ed));
+    assert_reload_reject_and_accept(ed);
 }
 
 #[test]

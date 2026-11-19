@@ -1513,10 +1513,13 @@ impl FieldCollapse {
 
 /// Whether a run the loop parsed directly (source `run`, which pushed
 /// `pushed`) is a field-code run: kept raw, with a `w:fldChar` or
-/// `w:instrText` of its own. A drawing, picture or object whose text box holds
-/// a field is not: those markers belong to the text box's own paragraphs.
+/// `w:instrText` of its own, or the `w:delInstrText` of a field inside a
+/// tracked deletion (#1625), so a deleted field collapses as a live one does.
+/// A drawing, picture or object whose text box holds a field is not: those
+/// markers belong to the text box's own paragraphs.
 fn is_field_code_run(run: &str, pushed: &[Inline]) -> bool {
-    matches!(pushed, [Inline::Raw(_)]) && is_field_code_raw(run)
+    matches!(pushed, [Inline::Raw(_)])
+        && (is_field_code_raw(run) || (run.contains("<w:delInstrText") && !in_container(run)))
 }
 
 /// Whether raw run XML holds field code of its own (a `w:fldChar` or
@@ -1524,6 +1527,12 @@ fn is_field_code_run(run: &str, pushed: &[Inline]) -> bool {
 /// drawing, picture or object. The editor pairs loose fields' markers by it
 /// (#1240).
 pub(crate) fn is_field_code_raw(run: &str) -> bool {
+    (run.contains("<w:fldChar") || run.contains("<w:instrText")) && !in_container(run)
+}
+
+/// Whether raw run XML holds a drawing, picture, object or text box, whose
+/// own paragraphs any field markers in it belong to.
+fn in_container(run: &str) -> bool {
     const CONTAINERS: [&str; 5] = [
         "<w:drawing",
         "<w:pict",
@@ -1531,8 +1540,7 @@ pub(crate) fn is_field_code_raw(run: &str) -> bool {
         "<mc:AlternateContent",
         "<w:txbxContent",
     ];
-    (run.contains("<w:fldChar") || run.contains("<w:instrText"))
-        && !CONTAINERS.iter().any(|c| run.contains(c))
+    CONTAINERS.iter().any(|c| run.contains(c))
 }
 
 /// Whether a field-code run holds only field code: nothing that shows (text, a
@@ -4827,6 +4835,99 @@ mod tests {
                 "{inner}"
             );
             assert!(!d.revisions().is_empty());
+        }
+    }
+
+    /// A complex PAGE field in its deleted form, as Word writes one inside a
+    /// `w:del`: `w:delInstrText` and `w:delText`.
+    const DELETED_PAGE_FIELD: &str = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+        <w:r><w:delInstrText xml:space=\"preserve\"> PAGE </w:delInstrText></w:r>\
+        <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+        <w:r><w:delText>7</w:delText></w:r>\
+        <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+
+    /// The content of the only revision in `content`.
+    fn revision_content(content: &[Inline]) -> &[Inline] {
+        let mut found = content.iter().filter_map(|i| match i {
+            Inline::Revision { content, .. } => Some(content.as_slice()),
+            _ => None,
+        });
+        let inner = found.next().expect("a revision");
+        assert!(found.next().is_none(), "one revision");
+        inner
+    }
+
+    #[test]
+    fn a_field_inside_a_tracked_deletion_collapses_1625() {
+        let del = format!("<w:del w:id=\"1\" w:author=\"A\">{DELETED_PAGE_FIELD}</w:del>");
+        let d = para_doc(&format!(
+            "<w:r><w:t>ab</w:t></w:r>{del}<w:r><w:t>cd</w:t></w:r>"
+        ));
+        let p = first_para(&d);
+        assert_eq!(kinds(&p.content), ["Run", "Revision", "Run"]);
+        match revision_content(&p.content) {
+            [Inline::Field { raw, text }] => {
+                assert_eq!(raw, DELETED_PAGE_FIELD);
+                // Not recomputed: a deleted field shows its cached result.
+                assert_eq!(text, "7");
+            }
+            other => panic!("expected one field, got {other:?}"),
+        }
+        let Inline::Revision {
+            kind,
+            content_changed,
+            ..
+        } = &p.content[1]
+        else {
+            unreachable!()
+        };
+        assert_eq!(*kind, RevisionKind::Delete);
+        assert!(!content_changed);
+        assert!(crate::serialize::document_to_xml(&d).contains(&del));
+    }
+
+    #[test]
+    fn a_field_inside_a_tracked_insertion_collapses_1625() {
+        let d = para_doc(&format!(
+            "<w:ins w:id=\"1\" w:author=\"A\">{PAGE_FIELD}</w:ins>"
+        ));
+        match revision_content(&first_para(&d).content) {
+            [Inline::Field { raw, .. }] => assert_eq!(raw, PAGE_FIELD),
+            other => panic!("expected one field, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn part_of_a_field_in_a_tracked_deletion_stays_loose_1625() {
+        let (begin_instr, rest) = DELETED_PAGE_FIELD.split_at(
+            DELETED_PAGE_FIELD
+                .find("<w:r><w:fldChar w:fldCharType=\"separate\"")
+                .unwrap(),
+        );
+        for inner in [
+            // The begin and instruction deleted, the rest live.
+            format!("<w:del w:id=\"1\" w:author=\"A\">{begin_instr}</w:del>{rest}"),
+            // A field interrupted by another revision inside the deletion.
+            format!(
+                "<w:del w:id=\"1\" w:author=\"A\">{begin_instr}\
+                 <w:del w:id=\"2\" w:author=\"B\"><w:r><w:delText>x</w:delText></w:r></w:del>\
+                 {rest}</w:del>"
+            ),
+        ] {
+            let d = para_doc(&inner);
+            let fields = |content: &[Inline]| {
+                content
+                    .iter()
+                    .filter(|i| matches!(i, Inline::Field { .. }))
+                    .count()
+            };
+            let p = first_para(&d);
+            assert_eq!(fields(&p.content), 0, "{inner}");
+            for i in &p.content {
+                if let Inline::Revision { content, .. } = i {
+                    assert_eq!(fields(content), 0, "{inner}");
+                }
+            }
         }
     }
 
