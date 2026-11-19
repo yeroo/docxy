@@ -38468,6 +38468,15 @@ fn emit_run(
     *idx = end;
 }
 
+/// Whether a pending object insertion ([`docxcore::editor::is_pending_object`])
+/// is among the zero-width pieces `rest` starts with (#1625).
+fn pending_object_follows(rest: &[(Cow<'_, Inline>, bool)]) -> bool {
+    rest.iter()
+        .map(|(inline, _)| &**inline)
+        .take_while(|inline| caret_advance(inline) == 0)
+        .any(docxcore::editor::is_pending_object)
+}
+
 /// How far one piece from `flat_inlines` advances `paragraph_el`'s caret offset
 /// (`idx`): a run's characters, one for a tab, a break, a field showing a
 /// result (#642), an equation or an inline picture (#1242), none for anything
@@ -40012,10 +40021,20 @@ fn paragraph_el(
                 let shown = styler.shown(r);
                 // Inside an open comment's range (#2232): its shade.
                 let shade = flow.comments.and_then(|(c, _)| c.shade(&open_comments));
+                // A caret at the run's end with a pending field or picture
+                // insertion after it is drawn after that, where typing goes
+                // (#1625): the next piece with a width, or the end, draws it.
+                let held = caret.filter(|&c| {
+                    c == idx + r.text.chars().count() && pending_object_follows(&items[i + 1..])
+                });
+                if held.is_some() {
+                    caret = None;
+                }
                 emit_run(
                     &mut spans, &r.text, &shown, base, in_link, &mut idx, &mut caret, sel, click,
                     pal, caret_h, zoom, band, shade,
                 );
+                caret = caret.or(held);
                 // Its text as drawn (#2087).
                 let drawn = (shown.caps || shown.small_caps).then(|| {
                     run_look::shown_case(&r.text, &shown)
@@ -58676,7 +58695,8 @@ mod config_root_tests {
 
 #[cfg(test)]
 mod flat_inlines_tests {
-    use super::{Inline, caret_advance, flat_inlines};
+    use super::{Inline, caret_advance, flat_inlines, pending_object_follows};
+    use docxcore::editor::Clip;
     use docxcore::model::{BreakKind, Hyperlink, Run, RunProps};
 
     fn run(text: &str) -> Inline {
@@ -58766,6 +58786,48 @@ mod flat_inlines_tests {
                 .sum::<usize>()
         );
         assert_eq!(offsets(&items), 7);
+    }
+
+    /// #1625: a caret at a run's end waits for the pending field or picture
+    /// insertion that follows among the zero-width pieces, so it is drawn
+    /// after it, where typing goes; other zero-width pieces do not hold it.
+    #[test]
+    fn a_pending_object_insertion_after_a_run_holds_its_end_caret_1625() {
+        let mut ed = docxcore::editor::Editor::new(docxcore::model::Document {
+            body: vec![docxcore::model::Block::Paragraph(
+                docxcore::model::Paragraph {
+                    content: vec![run("abcd")],
+                    ..Default::default()
+                },
+            )],
+        });
+        ed.set_track_changes(Some(docxcore::editor::TrackAuthor {
+            author: "Ada".into(),
+            clock: || "2026-03-04T05:06:07Z".into(),
+        }));
+        ed.set_caret(docxcore::editor::Caret::at(vec![0], 2));
+        let field = docxcore::field::fld_simple(" PAGE ", "7", &RunProps::default());
+        ed.paste(&Clip::new(vec![vec![field]]));
+        let docxcore::model::Block::Paragraph(p) = &ed.doc.body[0] else {
+            unreachable!()
+        };
+        let items = flat_inlines(&p.content);
+        assert_eq!(items.len(), 3, "{:?}", p.content);
+        assert!(pending_object_follows(&items[1..]));
+        assert!(!pending_object_follows(&items[2..]));
+
+        // A tracked deletion or a bookmark after the run does not hold it.
+        let deleted = Inline::Revision {
+            kind: docxcore::model::RevisionKind::Delete,
+            metadata: Default::default(),
+            raw: String::new(),
+            content: vec![run("x")],
+            content_changed: false,
+        };
+        let bookmark = Inline::Raw("<w:bookmarkStart w:id=\"0\" w:name=\"b\"/>".into());
+        let content = vec![run("ab"), deleted, bookmark, run("cd")];
+        let items = flat_inlines(&content);
+        assert!(!pending_object_follows(&items[1..]));
     }
 }
 

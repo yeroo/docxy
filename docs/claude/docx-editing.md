@@ -427,3 +427,48 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   margin is the host's, `DocView::set_page_inset` (#2003): #1987 checks
   an Outlook-like 20 px inset on this mail
   (`docs/claude/suite-extensions.md`).
+
+## Fields inside tracked changes (#1625)
+
+- Load: a field inside a `w:del` (`w:delInstrText`, `w:delText`) collapses to
+  one `Inline::Field` like a live one (`load.rs` `is_field_code_run`; the
+  editor's `is_field_code_raw` for #1240 loose fields is unchanged). Part of
+  a field in a `w:del`, or one interrupted by another revision, stays loose.
+- Tracked insertion: `clip_for_insertion` wraps each field (and picture,
+  #1242) in a `w:ins` of its own (`record_inserted_objects`), the field as
+  `compare::run_level_field`. Such a "pending object insertion"
+  (`editor::is_pending_object`) is zero-width, and the caret is after the
+  ones at its offset: typing goes after them (`past_pending_objects`, beside
+  `past_field_ends`; the typed run drops the insertion record it borrowed, so
+  it gets an id of its own), a paste already lands after them, the tracking
+  author's Backspace removes the last (`remove_own_pending_object`), Delete
+  acts on what follows. One rule, `track::covers_pending` (`lo < p <= hi`;
+  from the paragraph before, `p == 0` too), over one paragraph list
+  (`tracked_delete_paths`), decides coverage for the tracked delete
+  (`remove_own_pending_objects_in`) and the clip (`copy_taking` /
+  `extract_range_taking`, which walks into a link even where the range is
+  empty in it): a cut carries exactly what its delete removes (a cell range:
+  every one, as `clear_cells` does), a copy every one covered, any author.
+  `tests/tracked_field_insert.rs` cross-checks every selection of a small
+  document. An untracked cut carries none (an untracked delete across
+  paragraphs drops them: a known gap). Typing before a link whose text
+  starts after one goes into the link past it (`link_opening_with_pending`);
+  past a link with no text holding one, after the link
+  (`past_pending_objects`, which counts such a link as one). The terminal view
+  draws the caret after one where plain text would put it: its shown
+  text's glyphs carry `Glyph::pending` (the offset), and
+  `projected_caret_stops` works out the stops for a plain twin of the line
+  (the object's text taking offsets) and gives the offset the twin's first
+  stop after that text (the one `col_for_caret` takes); the twin's other
+  stops before, inside and after it are click-only `LineSeg::hits`, so
+  clicks on the object's text land at its offset and arrows step over it in
+  one press. Oracle tests render each case twice, with a pending field and
+  with its text plain (`tracked_field_insert.rs` with stub projectors,
+  docxy's `bidi_renderer_draws_the_caret_after_a_pending_field_as_after_plain_text`
+  with the real one). A line showing only an object's text holds its offset
+  (`ProjectedLine::characters`). The suite's `paragraph_el` holds a run-end caret past one
+  (`pending_object_follows`), so the next piece with a width, or the
+  paragraph's end, draws it.
+- Compare: a field failing `is_run_level(run_level_field(..))` is never in a
+  `w:ins`/`w:del`: deleted, it is skipped; inserted, `emit_wrapped` lifts it
+  out like a marker. Both report `CompareSkip::Object`.

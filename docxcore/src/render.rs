@@ -175,6 +175,10 @@ pub struct LineSeg {
     /// are ordered by visual traversal, not by logical offset. Interior offsets
     /// inside a grapheme cluster or zero-width control are omitted.
     pub visual: Vec<LineCaretStop>,
+    /// Stops a click or a vertical move may land on but the caret is never
+    /// drawn at nor steps through: the side of a pending object insertion's
+    /// shown text before it, for the offset whose caret is after it (#1625).
+    pub hits: Vec<LineCaretStop>,
 }
 
 impl LineSeg {
@@ -230,9 +234,21 @@ impl LineSeg {
         self.start + best
     }
     pub fn hit_for_col(&self, col: usize) -> Option<LineCaret> {
-        self.visual_positions()
+        self.hit_positions()
             .into_iter()
             .min_by_key(|caret| caret.col.abs_diff(col))
+    }
+    /// [`LineSeg::visual_positions`] and the click-only [`LineSeg::hits`],
+    /// by column.
+    pub fn hit_positions(&self) -> Vec<LineCaret> {
+        let mut all = self.visual_positions();
+        all.extend(self.hits.iter().map(|stop| LineCaret {
+            path: self.path.clone(),
+            offset: stop.offset,
+            col: self.col0 + stop.col,
+        }));
+        all.sort_by_key(|caret| caret.col);
+        all
     }
     pub fn visual_positions(&self) -> Vec<LineCaret> {
         self.visual
@@ -316,9 +332,9 @@ impl LineMap {
         }
     }
     pub fn nearest_caret(&self, col: usize) -> Option<LineCaret> {
-        self.visual_positions()
-            .into_iter()
-            .min_by_key(|caret| caret.col.abs_diff(col))
+        let mut all: Vec<LineCaret> = self.segs.iter().flat_map(LineSeg::hit_positions).collect();
+        all.sort_by_key(|caret| caret.col);
+        all.into_iter().min_by_key(|caret| caret.col.abs_diff(col))
     }
     pub fn visual_neighbor(
         &self,
@@ -1162,6 +1178,9 @@ struct Glyph {
     /// Set on the first cell of a small inline image (e.g. an equation) embedded
     /// in the text flow. The remaining cells are blank fillers reserving its width.
     img: Option<Rc<InlineImg>>,
+    /// The offset of the pending object insertion (#1625) whose shown text
+    /// this is: the caret at that offset is drawn after it.
+    pending: Option<usize>,
 }
 
 /// A small inline picture placed within a line of text (its width is reserved by
@@ -1481,6 +1500,7 @@ fn flatten_para(
                 src: Some(mc),
                 dir,
                 img: None,
+                pending: None,
             }
         } else {
             Glyph {
@@ -1491,6 +1511,7 @@ fn flatten_para(
                 src: Some(mc),
                 dir,
                 img: None,
+                pending: None,
             }
         };
         // Selection highlight ORs with the run's own highlight (so highlighted
@@ -1618,6 +1639,7 @@ fn flatten_para(
                         src: Some(mc),
                         dir: run_direction(rp),
                         img: None,
+                        pending: None,
                     });
                 }
                 mc += 1;
@@ -1634,6 +1656,7 @@ fn flatten_para(
                                 src: None,
                                 dir: BidiRunDirection::Natural,
                                 img: None,
+                                pending: None,
                             });
                         }
                         segs.push(Seg {
@@ -1685,6 +1708,7 @@ fn flatten_para(
                             src,
                             dir: BidiRunDirection::Natural,
                             img: (i == 0).then(|| rc.clone()),
+                            pending: None,
                         });
                     }
                 } else if !nested && raw_image_extent(raw).is_some() {
@@ -1732,6 +1756,7 @@ fn flatten_para(
                             src: None,
                             dir: BidiRunDirection::Natural,
                             img: None,
+                            pending: None,
                         });
                     }
                 }
@@ -1764,6 +1789,7 @@ fn flatten_para(
                         src: Some(mc),
                         dir: BidiRunDirection::Natural,
                         img: None,
+                        pending: None,
                     });
                 }
                 mc += 1;
@@ -1805,6 +1831,7 @@ fn flatten_para(
                         src: Some(mc),
                         dir: BidiRunDirection::Natural,
                         img: None,
+                        pending: None,
                     });
                 }
                 mc += crate::editor::inline_len(item);
@@ -1828,6 +1855,7 @@ fn flatten_para(
                             st.color = Some(Color::Cyan);
                         }
                         st.field = true;
+                        let pending = crate::editor::is_pending_object(item).then_some(mc);
                         for ch in text.chars() {
                             segs.last_mut().unwrap().glyphs.push(Glyph {
                                 ch,
@@ -1837,6 +1865,7 @@ fn flatten_para(
                                 src: None,
                                 dir: BidiRunDirection::Natural,
                                 img: None,
+                                pending,
                             });
                         }
                     }
@@ -1861,6 +1890,7 @@ fn flatten_para(
                                 src: None,
                                 dir,
                                 img: None,
+                                pending: None,
                             });
                         }
                     }
@@ -1878,6 +1908,7 @@ fn flatten_para(
                         src: None,
                         dir: BidiRunDirection::Natural,
                         img: None,
+                        pending: None,
                     });
                 }
             }
@@ -1926,6 +1957,7 @@ fn flatten_para(
             src: None,
             dir: BidiRunDirection::Natural,
             img: None,
+            pending: None,
         });
     }
     segs
@@ -2041,6 +2073,10 @@ struct ProjectedLine {
     start: usize,
     cols: Vec<usize>,
     visual: Vec<LineCaretStop>,
+    hits: Vec<LineCaretStop>,
+    /// Whether the line shows a character with an offset (else `start` and
+    /// `cols` are placeholders: its stops, if any, are a pending object's).
+    characters: bool,
     glyph_cells: Vec<Option<std::ops::Range<usize>>>,
 }
 
@@ -2069,13 +2105,16 @@ fn project_line(
     let spans = projected_spans(glyphs, &visual_line);
     let glyph_cells = projected_glyph_cells(glyphs, &visual_line);
     let (start, cols) = projected_extent(&visual_line);
-    let visual = projected_caret_stops(&visual_line);
+    let (visual, hits) = projected_caret_stops(glyphs, &visual_line);
+    let characters = !projected_logical_extents(&visual_line).is_empty();
     ProjectedLine {
         spans,
         width: visual_line.width,
         start,
         cols,
         visual,
+        hits,
+        characters,
         glyph_cells,
     }
 }
@@ -2221,7 +2260,104 @@ fn projected_extent(visual: &BidiVisualLine) -> (usize, Vec<usize>) {
     (start, cols)
 }
 
-fn projected_caret_stops(visual: &BidiVisualLine) -> Vec<LineCaretStop> {
+/// The caret stops of a projected line, and its click-only hits.
+///
+/// A pending object insertion (#1625) shows text that takes no offset, and
+/// the caret at its offset is after it (typing there goes after it). It is
+/// drawn where the caret after the same text would be if the text were plain
+/// (the text taking offsets): the stops are worked out for that plain twin,
+/// and the twin's first stop after the object's text (the one
+/// `col_for_caret` takes) is the offset's one stop. Its other stops before,
+/// inside and after the text are click-only hits, so a click on the text
+/// lands at the offset while an arrow press steps over it at once.
+fn projected_caret_stops(
+    glyphs: &[Glyph],
+    visual: &BidiVisualLine,
+) -> (Vec<LineCaretStop>, Vec<LineCaretStop>) {
+    // Each pending object shown on this line: its offset and glyph count,
+    // by offset.
+    let mut objects: Vec<(usize, usize)> = Vec::new();
+    for offset in glyphs.iter().filter_map(|g| g.pending) {
+        match objects.iter_mut().find(|(o, _)| *o == offset) {
+            Some((_, n)) => *n += 1,
+            None => objects.push((offset, 1)),
+        }
+    }
+    if objects.is_empty() {
+        return (plain_caret_stops(visual), Vec::new());
+    }
+    objects.sort_unstable();
+    // Where object `k`'s text starts in the plain twin.
+    let twin_start = |k: usize| objects[k].0 + objects[..k].iter().map(|(_, n)| n).sum::<usize>();
+    // A real offset in the twin: past every object at or before it.
+    let twin_of = |r: usize| {
+        r + objects
+            .iter()
+            .filter(|(o, _)| *o <= r)
+            .map(|(_, n)| n)
+            .sum::<usize>()
+    };
+    let mut twin = visual.clone();
+    for cluster in &mut twin.clusters {
+        if let Some(logical) = &cluster.logical {
+            let start = twin_of(logical.start);
+            cluster.logical = Some(start..start + logical.len());
+            continue;
+        }
+        // An object's glyphs take the twin's offsets in logical order.
+        let Some(&first) = cluster.glyphs.first() else {
+            continue;
+        };
+        let Some(offset) = glyphs.get(first).and_then(|g| g.pending) else {
+            continue;
+        };
+        let k = objects.iter().position(|(o, _)| *o == offset).unwrap_or(0);
+        let rank = glyphs[..first]
+            .iter()
+            .filter(|g| g.pending == Some(offset))
+            .count();
+        let start = twin_start(k) + rank;
+        cluster.logical = Some(start..start + cluster.glyphs.len());
+    }
+    let mut stops = Vec::new();
+    let mut hits = Vec::new();
+    let mut drawn: Vec<usize> = Vec::new();
+    for stop in plain_caret_stops(&twin) {
+        let v = stop.offset;
+        // The object whose text spans `v` (its edges included), if any.
+        let on = (0..objects.len())
+            .find(|&k| (twin_start(k)..=twin_start(k) + objects[k].1).contains(&v));
+        let Some(k) = on else {
+            let before: usize = objects
+                .iter()
+                .enumerate()
+                .filter(|(k, (_, n))| twin_start(*k) + n < v)
+                .map(|(_, (_, n))| n)
+                .sum();
+            stops.push(LineCaretStop {
+                offset: v - before,
+                col: stop.col,
+            });
+            continue;
+        };
+        let offset = objects[k].0;
+        let mapped = LineCaretStop {
+            offset,
+            col: stop.col,
+        };
+        if v == twin_start(k) + objects[k].1 && !drawn.contains(&offset) {
+            drawn.push(offset);
+            stops.push(mapped);
+        } else {
+            hits.push(mapped);
+        }
+    }
+    (stops, hits)
+}
+
+/// The caret stops of a projected line of plain text: each character's
+/// edges, in visual order.
+fn plain_caret_stops(visual: &BidiVisualLine) -> Vec<LineCaretStop> {
     let mut stops = Vec::new();
     let mut extents = projected_logical_extents(visual);
     extents.sort_by_key(|extent| extent.cells.start);
@@ -2301,6 +2437,7 @@ fn prefix_glyphs(prefix: &str) -> Vec<Glyph> {
             src: None,
             dir: BidiRunDirection::Natural,
             img: None,
+            pending: None,
         })
         .collect()
 }
@@ -2422,6 +2559,7 @@ fn render_paragraph(
                         offset: k + 1,
                         col: 0,
                     }],
+                    hits: Vec::new(),
                 });
             }
             continue;
@@ -2475,14 +2613,26 @@ fn render_paragraph(
             if lead > 0 {
                 line.spans.push(Line::text_span(" ".repeat(lead)));
             }
+            // The line's start column: its leftmost character column, or a
+            // stop left of all of them (#1625), which the columns alone
+            // would clamp onto the next cell: the stop after a pending
+            // object's text in right-to-left text, and the stop before a
+            // left-to-right run at the left of a right-to-left line (`שלום
+            // abc`: the one left of `a`, which was drawn right of it).
             let line_start_col = if projected.visual.is_empty() {
                 projected.width
             } else {
-                projected.cols.iter().copied().min().unwrap_or(0)
+                projected
+                    .cols
+                    .iter()
+                    .copied()
+                    .chain(projected.visual.iter().map(|stop| stop.col))
+                    .min()
+                    .unwrap_or(0)
             };
             line.spans.extend(projected.spans.clone());
             let prefix_cols = lead + line_start_col;
-            let cols = projected
+            let mut cols: Vec<usize> = projected
                 .cols
                 .iter()
                 .map(|col| col.saturating_sub(line_start_col))
@@ -2496,11 +2646,15 @@ fn render_paragraph(
                 })
                 .collect();
             // A line with no editable character (empty after a break, or a
-            // lone `¶`) holds the offset its seg starts at.
-            let start = if visual.is_empty() {
-                seg.at
-            } else {
+            // lone `¶`) holds the offset its seg starts at; one showing only
+            // a pending object's text, that object's offset (#1625).
+            let start = if projected.characters {
                 projected.start
+            } else if let Some(stop) = visual.first() {
+                cols = vec![stop.col];
+                stop.offset
+            } else {
+                seg.at
             };
             if visual.is_empty() {
                 visual.push(LineCaretStop {
@@ -2508,12 +2662,21 @@ fn render_paragraph(
                     col: 0,
                 });
             }
+            let hits = projected
+                .hits
+                .iter()
+                .map(|stop| LineCaretStop {
+                    offset: stop.offset,
+                    col: stop.col.saturating_sub(line_start_col),
+                })
+                .collect();
             let lseg = LineSeg {
                 path: path.to_vec(),
                 start,
                 col0: prefix_cols,
                 cols,
                 visual,
+                hits,
             };
             // Place any inline images sitting on this line and reserve the rows
             // their pixels extend below the text baseline.
@@ -2729,6 +2892,7 @@ fn push_unit_label(
             src: Some(mc),
             dir: BidiRunDirection::Natural,
             img: None,
+            pending: None,
         });
     }
 }
@@ -4086,6 +4250,7 @@ mod tests {
                     LineCaretStop { offset: 0, col: 0 },
                     LineCaretStop { offset: 1, col: 1 },
                 ],
+                hits: Vec::new(),
             });
             (line, map)
         };
@@ -4121,6 +4286,7 @@ mod tests {
                         LineCaretStop { offset: 0, col: 0 },
                         LineCaretStop { offset: 1, col: 1 },
                     ],
+                    hits: Vec::new(),
                 }),
             )
         };

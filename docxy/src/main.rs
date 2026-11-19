@@ -9795,6 +9795,82 @@ mod tests {
         assert_eq!(maps[0].edge_caret(true).map(|c| c.offset), Some(0));
     }
 
+    /// In a right-to-left paragraph a left-to-right run sits at the line's
+    /// left: the stop before its first letter is left of every other
+    /// character's column, and the line's start column takes it instead of
+    /// clamping it to the next (#1625 r5).
+    #[test]
+    fn bidi_renderer_keeps_a_stop_left_of_every_character_column() {
+        let mut rtl = ParProps::default();
+        rtl.rtl = true;
+        let doc = bidi_doc(vec![bidi_para_with(rtl, vec![bidi_run("שלום abc")])]);
+        let (lines, maps) = docxcore::render::render_mapped(&doc, &bidi_opts(20));
+        let line = lines[0].plain();
+        let a = line.chars().position(|c| c == 'a').expect("abc");
+        assert_eq!(maps[0].col_for_caret(&[0], 5, None), Some(a), "{line:?}");
+    }
+
+    /// The caret after a pending field (#1625) is drawn where the real
+    /// projector draws the caret after the same text when it is plain
+    /// (#1625 r6): `(rtl, before, line break, field, after)`.
+    #[test]
+    fn bidi_renderer_draws_the_caret_after_a_pending_field_as_after_plain_text() {
+        use docxcore::editor::{Caret, Clip, Editor, TrackAuthor};
+        let cases = [
+            (false, "ab", false, "777", "cd"),
+            (false, "ab", false, "777", ""),
+            (false, "abc", false, "777", "שלום"),
+            (false, "", false, "777", "שלום"),
+            (true, "אב", false, "777", "גד"),
+            (true, "אב", false, "777", ""),
+            (true, "abc", false, "12", " גד"),
+            (false, "שלום", false, "היום", "abc"),
+            (false, "abc", true, "777", ""),
+        ];
+        let para = |rtl: bool, before: &str, br: bool, middle: &str, after: &str| {
+            let mut props = ParProps::default();
+            props.rtl = rtl;
+            let mut content = Vec::new();
+            for (k, text) in [before, middle, after].into_iter().enumerate() {
+                if k == 1 && br {
+                    content.push(Inline::Break(
+                        docxcore::model::BreakKind::Line,
+                        RunProps::default(),
+                    ));
+                }
+                if !text.is_empty() {
+                    content.push(bidi_run(text));
+                }
+            }
+            bidi_doc(vec![bidi_para_with(props, content)])
+        };
+        let drawn_at = |doc: &Document, offset: usize| {
+            let (_, maps) = docxcore::render::render_mapped(doc, &bidi_opts(40));
+            maps.iter()
+                .rev()
+                .find_map(|m| m.col_for_caret(&[0], offset, None))
+        };
+        for (rtl, before, br, field, after) in cases {
+            let at = before.chars().count() + usize::from(br);
+            let mut ed = Editor::new(para(rtl, before, br, "", after));
+            ed.set_track_changes(Some(TrackAuthor {
+                author: "Ada".into(),
+                clock: || "2026-03-04T05:06:07Z".into(),
+            }));
+            ed.set_caret(Caret::at(vec![0], at));
+            let fld = docxcore::field::fld_simple(" PAGE ", field, &RunProps::default());
+            ed.paste(&Clip::new(vec![vec![fld]]));
+            let plain = para(rtl, before, br, field, after);
+            let twin = drawn_at(&plain, at + field.chars().count());
+            assert!(twin.is_some());
+            assert_eq!(
+                drawn_at(&ed.doc, at),
+                twin,
+                "rtl {rtl}: {before:?} [{field}] {after:?} br {br}"
+            );
+        }
+    }
+
     #[test]
     fn bidi_renderer_keeps_alignment_separate_from_reordering() {
         let mut right = ParProps::default();

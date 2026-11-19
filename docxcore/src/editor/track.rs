@@ -13,6 +13,15 @@
 //!   deletions by the same author merge into one wrapper.
 //! * Deleting text inside the author's own insertion removes it outright, as
 //!   Word does.
+//! * An inline picture (#1242) or a field (#1625) inserted while tracking
+//!   goes in a `w:ins` of its own, zero-width until accepted; a field whose
+//!   result a `w:ins` cannot hold (a link) goes in live and unrecorded. The
+//!   caret is after one at its offset: text typed there goes after it, the
+//!   author's own Backspace removes it outright, and Delete acts on what
+//!   follows. A deletion covering the author's own (one at the selection's
+//!   end included, one at its start not) removes it; a cut's clip carries
+//!   exactly the ones its delete removes, and a copy carries every one it
+//!   covers, whoever's (`covers_pending` decides for all three).
 //!
 //! * Deleting text inside a hyperlink records the deletion inside the link,
 //!   as Word does: a wrapper never straddles the link's boundary (#1462).
@@ -21,7 +30,7 @@
 //!
 //! Not recorded (they change the document as without tracking): paragraph
 //! marks (Enter, and a Backspace or Delete that joins paragraphs), an Update
-//! Field or Edit Field rewrite of a field's result and code (#1241), an
+//! Field or Edit Field rewrite of a field's result and code (#1241),
 //! inserting an equation (a tracked delete keeps one in place), formatting, and
 //! table structure. A deleted field or picture gets
 //! a `w:del` of its own that never merges with a neighbour (#1242, #1470); a
@@ -267,6 +276,36 @@ impl Editor {
         }
     }
 
+    /// The paragraphs a tracked delete of `lo..hi` walks, in document
+    /// order: `lo`'s alone when both are in it, else every paragraph from
+    /// `lo`'s to `hi`'s, the ones in a table between them included (the
+    /// table itself stays), a text box other than the one an endpoint is in
+    /// skipped. `None` when an endpoint is not a paragraph the walk reaches.
+    pub(super) fn tracked_delete_paths(
+        &self,
+        lo: &super::Caret,
+        hi: &super::Caret,
+    ) -> Option<Vec<Vec<usize>>> {
+        if lo.path == hi.path {
+            return Some(vec![lo.path.clone()]);
+        }
+        // A text box other than the one an endpoint is in is not between them.
+        let (lo_box, hi_box) = (
+            text_box_of(&self.doc.body, &lo.path),
+            text_box_of(&self.doc.body, &hi.path),
+        );
+        let paths: Vec<Vec<usize>> = super::all_paragraph_paths(&self.doc.body)
+            .into_iter()
+            .filter(|p| match text_box_of(&self.doc.body, p) {
+                None => true,
+                Some(b) => Some(&b) == lo_box.as_ref() || Some(&b) == hi_box.as_ref(),
+            })
+            .collect();
+        let first = paths.iter().position(|p| *p == lo.path)?;
+        let last = paths.iter().position(|p| *p == hi.path)?;
+        (first <= last).then(|| paths[first..=last].to_vec())
+    }
+
     /// Delete the text of the selection `lo..hi` as tracked deletions in every
     /// body or table-cell paragraph from `lo` to `hi` in document order (a
     /// table between them stays, its cells' text recorded), keeping the
@@ -285,42 +324,27 @@ impl Editor {
         if self.track.is_none() {
             return false;
         }
-        // Every paragraph from `lo` to `hi` in document order, the ones in a
-        // table between them included: the table itself stays.
-        // A text box other than the one an endpoint is in is not between them.
-        let (lo_box, hi_box) = (
-            text_box_of(&self.doc.body, &lo.path),
-            text_box_of(&self.doc.body, &hi.path),
-        );
-        let paths: Vec<Vec<usize>> = super::all_paragraph_paths(&self.doc.body)
-            .into_iter()
-            .filter(|p| match text_box_of(&self.doc.body, p) {
-                None => true,
-                Some(b) => Some(&b) == lo_box.as_ref() || Some(&b) == hi_box.as_ref(),
-            })
-            .collect();
-        let (Some(first), Some(last)) = (
-            paths.iter().position(|p| *p == lo.path),
-            paths.iter().position(|p| *p == hi.path),
-        ) else {
+        let Some(paths) = self.tracked_delete_paths(lo, hi) else {
             return false;
         };
-        for (k, path) in paths[first..=last].iter().enumerate() {
+        let last = paths.len() - 1;
+        for (k, path) in paths.iter().enumerate() {
             let Some(para) = resolve_para(&self.doc.body, path) else {
                 continue;
             };
             let len: usize = para.content.iter().map(inline_len).sum();
-            let (from, to) = match (k == 0, first + k == last) {
+            let (from, to) = match (k == 0, k == last) {
                 (true, true) => (lo.offset, hi.offset),
                 (true, false) => (lo.offset, len),
                 (false, true) => (0, hi.offset.min(len)),
                 (false, false) => (0, len),
             };
             // Kept only where the selection starts and ends, as untracked.
-            let keep = keep_units && (k == 0 || first + k == last);
+            let keep = keep_units && (k == 0 || k == last);
             if drop_objects {
-                self.drop_or_record_objects(path, from, to, k > 0, first + k < last);
+                self.drop_or_record_objects(path, from, to, k > 0, k < last);
             }
+            self.remove_own_pending_objects_in(path, from, to, k > 0);
             self.delete_chars(path, from, to, keep);
         }
         true
@@ -356,11 +380,84 @@ impl Editor {
         self.settle_inserted(path, start, n);
     }
 
+    /// Backspace after a pending object insertion ([`is_pending_object`]) by
+    /// the author recorded as, while tracking: remove it outright, as
+    /// deleting one's own insertion does (#1625). It takes no offset, so it
+    /// sits among the zero-width inlines at the caret, which is after them
+    /// (typing there goes after them): Backspace takes the last of them, and
+    /// Delete, acting on what follows, none. One undo step. False, and
+    /// nothing done, when there is none.
+    pub(super) fn remove_own_pending_object(&mut self) -> bool {
+        let Some(author) = self.track_author().map(str::to_owned) else {
+            return false;
+        };
+        let path = self.caret.path.clone();
+        let Some(para) = resolve_para(&self.doc.body, &path) else {
+            return false;
+        };
+        // The ones at exactly the caret's offset.
+        let o = self.caret.offset;
+        let mut found = Vec::new();
+        pending_in(
+            &para.content,
+            o.checked_sub(1),
+            o,
+            &author,
+            &mut Vec::new(),
+            &mut found,
+        );
+        let Some(target) = found.pop() else {
+            return false;
+        };
+        self.checkpoint(super::EditKind::Delete);
+        if let Some(p) = para_mut(&mut self.doc.body, &path) {
+            remove_at(&mut p.content, &target);
+        }
+        true
+    }
+
+    /// A tracked delete of offsets `lo..hi` of the paragraph at `path` (from
+    /// the paragraph before it when `from_before`) removes outright the
+    /// pending object insertions by the author recorded as that it covers,
+    /// as Word removes one's own insertion a deletion covers (#1625). The
+    /// caret is after the pending objects at its offset, so one at `lo`
+    /// stays (unless the range came from the paragraph before) and one at
+    /// `hi` goes. Another author's stays, as their loaded insertions do.
+    /// Offsets do not move. Nothing when not tracking.
+    pub(super) fn remove_own_pending_objects_in(
+        &mut self,
+        path: &[usize],
+        lo: usize,
+        hi: usize,
+        from_before: bool,
+    ) {
+        let Some(author) = self.track_author().map(str::to_owned) else {
+            return;
+        };
+        let Some(para) = resolve_para(&self.doc.body, path) else {
+            return;
+        };
+        let lo = if from_before { None } else { Some(lo) };
+        let mut found = Vec::new();
+        pending_in(&para.content, lo, hi, &author, &mut Vec::new(), &mut found);
+        if found.is_empty() {
+            return;
+        }
+        if let Some(p) = para_mut(&mut self.doc.body, path) {
+            // Last first, so each path still points where it did.
+            for target in found.iter().rev() {
+                remove_at(&mut p.content, target);
+            }
+        }
+    }
+
     /// `clip` as it should go in: its text recorded as one tracked insertion
     /// when tracking, or with any insertion records taken off when not (a
     /// pasted copy of recorded text is not itself recorded). While tracking
-    /// an inline picture goes in a `w:ins` of its own, as Word records one
-    /// (#1242): zero-width until accepted.
+    /// an inline picture (#1242) or a field (#1625) goes in a `w:ins` of its
+    /// own, as Word records one: zero-width until accepted. A field a `w:ins`
+    /// cannot hold ([`super::kept_while_tracking`]: a link in its result) goes
+    /// in live and unrecorded, as before.
     pub(super) fn clip_for_insertion(&self, clip: &super::Clip) -> super::Clip {
         let mut out = clip.clone();
         match self.fresh_revision_metadata() {
@@ -368,11 +465,11 @@ impl Editor {
                 for inline in out.paras.iter_mut().flatten() {
                     with_props_deep(inline, &|props| record_insert(props, &meta));
                 }
-                // Each picture's `w:ins` has an id of its own, after the
+                // Each object's `w:ins` has an id of its own, after the
                 // text's (which `unshare_insert_ids` then keeps clear of).
                 let mut next = meta.id.as_deref().and_then(|id| id.parse::<u64>().ok());
                 for para in out.paras.iter_mut() {
-                    record_inserted_pictures(para, &meta, &mut next);
+                    record_inserted_objects(para, &meta, &mut next);
                 }
             }
             None => {
@@ -669,29 +766,187 @@ fn deleted_props(props: &RunProps) -> RunProps {
     p
 }
 
-/// Wrap each inline picture in `content` (a hyperlink's too) in a tracked
-/// insertion with `meta`, each with the id after `last` (the last one used).
-fn record_inserted_pictures(
+/// Whether `inline` is an object a tracked insertion wraps on its own: an
+/// inline picture (#1242), or a field a `w:ins` can hold (#1625).
+fn is_insertable_object(inline: &Inline) -> bool {
+    match inline {
+        Inline::Raw(_) => super::is_object_unit(inline),
+        Inline::Field { .. } => !super::kept_while_tracking(inline),
+        _ => false,
+    }
+}
+
+/// Wrap each inline picture and field in `content` (a hyperlink's too) in a
+/// tracked insertion with `meta`, each with the id after `last` (the last one
+/// used). A field goes in as run-level XML, the form a `w:ins` holds (a
+/// `w:fldSimple` may not sit in one).
+fn record_inserted_objects(
     content: &mut [Inline],
     meta: &RevisionMetadata,
     last: &mut Option<u64>,
 ) {
     for inline in content.iter_mut() {
         if let Inline::Hyperlink(h) = inline {
-            if h.content.iter().any(super::is_object_unit) {
+            if h.content.iter().any(is_insertable_object) {
                 h.content_changed = true;
             }
-            record_inserted_pictures(&mut h.content, meta, last);
-        } else if matches!(inline, Inline::Raw(_)) && super::is_object_unit(inline) {
-            let picture = std::mem::replace(inline, Inline::Raw(String::new()));
+            record_inserted_objects(&mut h.content, meta, last);
+        } else if is_insertable_object(inline) {
+            let object = match std::mem::replace(inline, Inline::Raw(String::new())) {
+                Inline::Field { raw, text } => Inline::Field {
+                    raw: crate::compare::run_level_field(&raw),
+                    text,
+                },
+                picture => picture,
+            };
             let mut meta = meta.clone();
             if let Some(id) = last.as_mut() {
                 *id += 1;
                 meta.id = Some(id.to_string());
             }
-            *inline = revision_wrapper(RevisionKind::Insert, meta, picture);
+            *inline = revision_wrapper(RevisionKind::Insert, meta, object);
         }
     }
+}
+
+/// Where text typed at the zero-width inlines from `content[from]` on goes
+/// (#1625): past the last pending object insertion ([`is_pending_object`])
+/// among them, so text typed right after an inserted field or picture follows
+/// it, as before tracking wrapped it. A link with no text holding one (a
+/// pasted linked picture, #1999) counts as one: the text goes after the
+/// link, not into it. The scan stops at the first inline with a width and
+/// at a loose field's begin, whose result text must not take it. `None`
+/// when none is there.
+pub(super) fn past_pending_objects(content: &[Inline], from: usize) -> Option<usize> {
+    let mut past = None;
+    for (k, inline) in content.iter().enumerate().skip(from) {
+        if inline_len(inline) > 0 || begins_a_loose_field(inline) {
+            break;
+        }
+        let holds_one = matches!(inline, Inline::Hyperlink(h)
+            if h.content.iter().any(is_pending_object));
+        if is_pending_object(inline) || holds_one {
+            past = Some(k + 1);
+        }
+    }
+    past
+}
+
+/// The index of a link among the zero-width inlines from `content[from]`
+/// on, or the first inline with a width after them, whose text starts after
+/// a pending object insertion (#1625): text typed there goes after the
+/// object, so into the link, ahead of its text.
+pub(super) fn link_opening_with_pending(content: &[Inline], from: usize) -> Option<usize> {
+    for (k, inline) in content.iter().enumerate().skip(from) {
+        if begins_a_loose_field(inline) {
+            return None;
+        }
+        if let Inline::Hyperlink(h) = inline {
+            let opens_with_one = h.runs.is_empty()
+                && h.content
+                    .iter()
+                    .take_while(|i| inline_len(i) == 0)
+                    .any(is_pending_object);
+            if opens_with_one && inline_len(inline) > 0 {
+                return Some(k);
+            }
+        }
+        if inline_len(inline) > 0 {
+            return None;
+        }
+    }
+    None
+}
+
+/// Whether a selection covers a pending object insertion at offset `p` of a
+/// paragraph (#1625): `lo < p <= hi`, or `p <= hi` with `lo` `None` (the
+/// selection began in a paragraph before). The caret is after the pending
+/// objects at its offset, so one at the selection's start is before it and
+/// one at its end inside it. A cut's clip and a tracked delete both decide
+/// by this.
+pub(super) fn covers_pending(lo: Option<usize>, hi: usize, p: usize) -> bool {
+    lo.is_none_or(|lo| p > lo) && p <= hi
+}
+
+/// The index paths of the pending object insertions by `author` at offsets
+/// `p` with `lo < p <= hi` (`lo` `None`: from the start), in document order.
+fn pending_in(
+    content: &[Inline],
+    lo: Option<usize>,
+    hi: usize,
+    author: &str,
+    prefix: &mut Vec<usize>,
+    out: &mut Vec<Vec<usize>>,
+) {
+    let mut acc = 0;
+    for (i, inline) in content.iter().enumerate() {
+        if acc > hi {
+            break;
+        }
+        let len = inline_len(inline);
+        match inline {
+            Inline::Hyperlink(h) if lo.is_none_or(|lo| acc + len > lo) => {
+                let start = acc + super::link_runs_len(h);
+                if hi >= start {
+                    // A local `lo` before the content's start covers its start.
+                    let local_lo = lo.and_then(|lo| lo.checked_sub(start));
+                    prefix.push(i);
+                    pending_in(&h.content, local_lo, hi - start, author, prefix, out);
+                    prefix.pop();
+                }
+            }
+            Inline::Revision { metadata, .. }
+                if covers_pending(lo, hi, acc)
+                    && is_pending_object(inline)
+                    && metadata.author.as_deref() == Some(author) =>
+            {
+                let mut path = prefix.clone();
+                path.push(i);
+                out.push(path);
+            }
+            _ => {}
+        }
+        acc += len;
+    }
+}
+
+/// Remove the inline at index path `path` (see [`pending_in`]); a link left
+/// with nothing to edit goes, as when its text is deleted.
+fn remove_at(content: &mut Vec<Inline>, path: &[usize]) {
+    match path {
+        [] => {}
+        [i] => {
+            content.remove(*i);
+        }
+        [i, rest @ ..] => {
+            if let Some(Inline::Hyperlink(h)) = content.get_mut(*i) {
+                remove_at(&mut h.content, rest);
+                h.content_changed = true;
+                super::drop_emptied_link(content, *i);
+            }
+        }
+    }
+}
+
+fn begins_a_loose_field(inline: &Inline) -> bool {
+    matches!(inline, Inline::Raw(raw) if crate::load::is_field_code_raw(raw)
+        && crate::field::field_events(raw)
+            .iter()
+            .any(|e| matches!(e, crate::field::FieldEvent::Begin)))
+}
+
+/// Whether `inline` is a pending object insertion: a tracked insertion
+/// holding one picture or field alone, as [`record_inserted_objects`] makes
+/// and Word writes. It is zero-width until accepted, and the caret is after
+/// the ones at its offset: typing there goes after it, its own author's
+/// Backspace right after it removes it, and Delete acts on what follows.
+pub fn is_pending_object(inline: &Inline) -> bool {
+    matches!(
+        inline,
+        Inline::Revision { kind: RevisionKind::Insert, content, .. }
+            if matches!(content.as_slice(), [one]
+                if matches!(one, Inline::Field { .. }) || super::is_object_unit(one))
+    )
 }
 
 fn deletion_wrapper(meta: RevisionMetadata, inner: Inline) -> Inline {
