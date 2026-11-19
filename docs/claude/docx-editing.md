@@ -455,15 +455,17 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   starts after one goes into the link past it (`link_opening_with_pending`);
   past a link with no text holding one, after the link
   (`past_pending_objects`, which counts such a link as one). The terminal view
-  draws the caret after one: its shown text's glyphs carry `Glyph::pending`
-  (the offset), and `after_pending_objects` gives that offset one stop on
-  the text's far side in the direction of the text around it (the
-  character starting at the offset, else the one ending there, else the
-  line's base; not the object's own text, digits in Hebrew say), the line's
-  end included, and turns
-  the line's other stops for it into click-only `LineSeg::hits`, so clicks
-  on the object's text land at its offset and arrows step over it in one
-  press. A line showing only an object's text holds its offset
+  draws the caret after one where plain text would put it: its shown
+  text's glyphs carry `Glyph::pending` (the offset), and
+  `projected_caret_stops` works out the stops for a plain twin of the line
+  (the object's text taking offsets) and gives the offset the twin's first
+  stop after that text (the one `col_for_caret` takes); the twin's other
+  stops before, inside and after it are click-only `LineSeg::hits`, so
+  clicks on the object's text land at its offset and arrows step over it in
+  one press. Oracle tests render each case twice, with a pending field and
+  with its text plain (`tracked_field_insert.rs` with stub projectors,
+  docxy's `bidi_renderer_draws_the_caret_after_a_pending_field_as_after_plain_text`
+  with the real one). A line showing only an object's text holds its offset
   (`ProjectedLine::characters`). The suite's `paragraph_el` holds a run-end caret past one
   (`pending_object_follows`), so the next piece with a width, or the
   paragraph's end, draws it.

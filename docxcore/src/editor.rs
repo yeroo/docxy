@@ -2308,24 +2308,11 @@ impl Editor {
         if let Some(range) = self.cell_range() {
             return self.cell_range_spans(&range);
         }
-        let Some((lo, hi)) = self.selection_range() else {
-            return Vec::new();
-        };
-        let paths = all_paragraph_paths(&self.doc.body);
-        let lo_i = paths.iter().position(|p| *p == lo.path).unwrap_or(0);
-        let hi_i = paths.iter().position(|p| *p == hi.path).unwrap_or(0);
-        let mut out = Vec::new();
-        for path in paths.iter().take(hi_i + 1).skip(lo_i) {
-            let len = resolve_para(&self.doc.body, path)
-                .map(para_text_len)
-                .unwrap_or(0);
-            let s = if *path == lo.path { lo.offset } else { 0 };
-            let e = if *path == hi.path { hi.offset } else { len };
-            if e > s {
-                out.push((path.clone(), s, e));
-            }
-        }
-        out
+        self.selection_paragraph_spans(false)
+            .into_iter()
+            .filter(|(_, s, e, _, _)| e > s)
+            .map(|(path, s, e, _, _)| (path, s, e))
+            .collect()
     }
 
     /// The document properties whose controls' text was edited since the host
@@ -2675,9 +2662,9 @@ impl Editor {
         Some(Clip::new(paras))
     }
 
-    /// The paragraphs from the selection's start to its end, as
-    /// [`Editor::selection_spans`] walks them but keeping those the range
-    /// holds no text of: each with its range, whether the range began in a
+    /// The paragraphs from the selection's start to its end, those the range
+    /// holds no text of included ([`Editor::selection_spans`] is these
+    /// without them): each with its range, whether the range began in a
     /// paragraph before it, and whether pending object insertions may be
     /// taken there (with `deleted_only`, only where a tracked delete walks,
     /// [`Editor::tracked_delete_paths`]).

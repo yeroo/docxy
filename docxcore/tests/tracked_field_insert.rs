@@ -1087,28 +1087,159 @@ impl docxcore::render::BidiProjector for RtlWithLtrDigits {
     }
 }
 
-/// A pending field showing digits in right-to-left text: the caret after it
-/// is on its left, where the text around it goes on (r5 m2).
+/// One oracle case: a paragraph of `before`, a line break when `br`, then a
+/// pending field showing `field` (`[..]` in the names), then `after`.
+pub struct Twin<'a> {
+    pub rtl: bool,
+    pub before: &'a str,
+    pub br: bool,
+    pub field: &'a str,
+    pub after: &'a str,
+}
+
+/// The paragraph XML of a twin case, with the field's text as `middle`.
+fn twin_xml(t: &Twin, middle: &str) -> String {
+    let ppr = if t.rtl {
+        "<w:pPr><w:bidi/></w:pPr>"
+    } else {
+        ""
+    };
+    let run = |text: &str| {
+        if text.is_empty() {
+            String::new()
+        } else {
+            format!("<w:r><w:t xml:space=\"preserve\">{text}</w:t></w:r>")
+        }
+    };
+    let br = if t.br { "<w:r><w:br/></w:r>" } else { "" };
+    format!(
+        "<w:p>{ppr}{}{br}{}{}</w:p>",
+        run(t.before),
+        run(middle),
+        run(t.after)
+    )
+}
+
+/// Where the caret at `offset` is drawn: on the last line holding it.
+fn drawn_at(
+    doc: &Document,
+    offset: usize,
+    opts: &docxcore::render::RenderOptions,
+) -> Option<usize> {
+    let (_, maps) = docxcore::render::render_mapped(doc, opts);
+    maps.iter()
+        .rev()
+        .find_map(|m| m.col_for_caret(&[0], offset, None))
+}
+
+/// The caret after a pending field (at its offset) and the caret after the
+/// same text when it is plain (past its offsets), with `opts`.
+fn twin_carets(t: &Twin, opts: &docxcore::render::RenderOptions) -> (Option<usize>, Option<usize>) {
+    let at = t.before.chars().count() + usize::from(t.br);
+    let len = t.field.chars().count();
+    let mut ed = Editor::new(parse(&twin_xml(t, "")));
+    track(&mut ed, "Ada");
+    insert_at(
+        &mut ed,
+        at,
+        docxcore::field::fld_simple(" PAGE ", t.field, &RunProps::default()),
+    );
+    assert_eq!(insertions(&xml(&ed)).len(), 1, "{}", xml(&ed));
+    let plain = parse(&twin_xml(t, t.field));
+    (
+        drawn_at(&ed.doc, at, opts),
+        drawn_at(&plain, at + len, opts),
+    )
+}
+
+pub const TWIN_CASES: [Twin<'static>; 9] = [
+    Twin {
+        rtl: false,
+        before: "ab",
+        br: false,
+        field: "777",
+        after: "cd",
+    },
+    Twin {
+        rtl: false,
+        before: "ab",
+        br: false,
+        field: "777",
+        after: "",
+    },
+    Twin {
+        rtl: false,
+        before: "abc",
+        br: false,
+        field: "777",
+        after: "שלום",
+    },
+    Twin {
+        rtl: false,
+        before: "",
+        br: false,
+        field: "777",
+        after: "שלום",
+    },
+    Twin {
+        rtl: true,
+        before: "אב",
+        br: false,
+        field: "777",
+        after: "גד",
+    },
+    Twin {
+        rtl: true,
+        before: "אב",
+        br: false,
+        field: "777",
+        after: "",
+    },
+    Twin {
+        rtl: true,
+        before: "abc",
+        br: false,
+        field: "12",
+        after: " גד",
+    },
+    Twin {
+        rtl: false,
+        before: "שלום",
+        br: false,
+        field: "היום",
+        after: "abc",
+    },
+    Twin {
+        rtl: false,
+        before: "abc",
+        br: true,
+        field: "777",
+        after: "",
+    },
+];
+
+/// The caret after a pending field is drawn where the caret after the same
+/// text would be were the text plain (r6), with each stub projector.
 #[test]
-fn the_caret_after_a_pending_field_follows_the_text_around_it() {
-    use docxcore::render::{RenderOptions, render_mapped};
-    for (text, at) in [("אבגד", 2), ("אב", 2)] {
-        let mut ed = Editor::new(parse(&format!("<w:p><w:r><w:t>{text}</w:t></w:r></w:p>")));
-        track(&mut ed, "Ada");
-        insert_at(
-            &mut ed,
-            at,
-            docxcore::field::fld_simple(" PAGE ", "777", &RunProps::default()),
-        );
+fn the_caret_after_a_pending_field_is_where_plain_text_puts_it() {
+    use docxcore::render::RenderOptions;
+    let projectors: [(
+        &str,
+        Option<std::rc::Rc<dyn docxcore::render::BidiProjector>>,
+    ); 3] = [
+        ("identity", None),
+        ("AllRtl", Some(std::rc::Rc::new(AllRtl))),
+        ("RtlWithLtrDigits", Some(std::rc::Rc::new(RtlWithLtrDigits))),
+    ];
+    for (name, bidi) in projectors {
         let opts = RenderOptions {
-            bidi: Some(std::rc::Rc::new(RtlWithLtrDigits)),
+            bidi,
             ..RenderOptions::default()
         };
-        let (lines, maps) = render_mapped(&ed.doc, &opts);
-        let line = lines[0].plain();
-        // `ד ג 7 7 7 ב א` (or `7 7 7 ב א`): after the field is left of it.
-        let digits = line.find('7').expect("the field");
-        let col = line[..digits].chars().count();
-        assert_eq!(maps[0].col_for_caret(&[0], at, None), Some(col), "{line:?}");
+        for t in &TWIN_CASES {
+            let (field, plain) = twin_carets(t, &opts);
+            assert!(plain.is_some(), "{name} {:?}", twin_xml(t, t.field));
+            assert_eq!(field, plain, "{name}: {}", twin_xml(t, "[field]"));
+        }
     }
 }

@@ -2105,7 +2105,7 @@ fn project_line(
     let spans = projected_spans(glyphs, &visual_line);
     let glyph_cells = projected_glyph_cells(glyphs, &visual_line);
     let (start, cols) = projected_extent(&visual_line);
-    let (visual, hits) = projected_caret_stops(glyphs, &visual_line, base);
+    let (visual, hits) = projected_caret_stops(glyphs, &visual_line);
     let characters = !projected_logical_extents(&visual_line).is_empty();
     ProjectedLine {
         spans,
@@ -2261,11 +2261,103 @@ fn projected_extent(visual: &BidiVisualLine) -> (usize, Vec<usize>) {
 }
 
 /// The caret stops of a projected line, and its click-only hits.
+///
+/// A pending object insertion (#1625) shows text that takes no offset, and
+/// the caret at its offset is after it (typing there goes after it). It is
+/// drawn where the caret after the same text would be if the text were plain
+/// (the text taking offsets): the stops are worked out for that plain twin,
+/// and the twin's first stop after the object's text (the one
+/// `col_for_caret` takes) is the offset's one stop. Its other stops before,
+/// inside and after the text are click-only hits, so a click on the text
+/// lands at the offset while an arrow press steps over it at once.
 fn projected_caret_stops(
     glyphs: &[Glyph],
     visual: &BidiVisualLine,
-    base: BidiBaseDirection,
 ) -> (Vec<LineCaretStop>, Vec<LineCaretStop>) {
+    // Each pending object shown on this line: its offset and glyph count,
+    // by offset.
+    let mut objects: Vec<(usize, usize)> = Vec::new();
+    for offset in glyphs.iter().filter_map(|g| g.pending) {
+        match objects.iter_mut().find(|(o, _)| *o == offset) {
+            Some((_, n)) => *n += 1,
+            None => objects.push((offset, 1)),
+        }
+    }
+    if objects.is_empty() {
+        return (plain_caret_stops(visual), Vec::new());
+    }
+    objects.sort_unstable();
+    // Where object `k`'s text starts in the plain twin.
+    let twin_start = |k: usize| objects[k].0 + objects[..k].iter().map(|(_, n)| n).sum::<usize>();
+    // A real offset in the twin: past every object at or before it.
+    let twin_of = |r: usize| {
+        r + objects
+            .iter()
+            .filter(|(o, _)| *o <= r)
+            .map(|(_, n)| n)
+            .sum::<usize>()
+    };
+    let mut twin = visual.clone();
+    for cluster in &mut twin.clusters {
+        if let Some(logical) = &cluster.logical {
+            let start = twin_of(logical.start);
+            cluster.logical = Some(start..start + logical.len());
+            continue;
+        }
+        // An object's glyphs take the twin's offsets in logical order.
+        let Some(&first) = cluster.glyphs.first() else {
+            continue;
+        };
+        let Some(offset) = glyphs.get(first).and_then(|g| g.pending) else {
+            continue;
+        };
+        let k = objects.iter().position(|(o, _)| *o == offset).unwrap_or(0);
+        let rank = glyphs[..first]
+            .iter()
+            .filter(|g| g.pending == Some(offset))
+            .count();
+        let start = twin_start(k) + rank;
+        cluster.logical = Some(start..start + cluster.glyphs.len());
+    }
+    let mut stops = Vec::new();
+    let mut hits = Vec::new();
+    let mut drawn: Vec<usize> = Vec::new();
+    for stop in plain_caret_stops(&twin) {
+        let v = stop.offset;
+        // The object whose text spans `v` (its edges included), if any.
+        let on = (0..objects.len())
+            .find(|&k| (twin_start(k)..=twin_start(k) + objects[k].1).contains(&v));
+        let Some(k) = on else {
+            let before: usize = objects
+                .iter()
+                .enumerate()
+                .filter(|(k, (_, n))| twin_start(*k) + n < v)
+                .map(|(_, (_, n))| n)
+                .sum();
+            stops.push(LineCaretStop {
+                offset: v - before,
+                col: stop.col,
+            });
+            continue;
+        };
+        let offset = objects[k].0;
+        let mapped = LineCaretStop {
+            offset,
+            col: stop.col,
+        };
+        if v == twin_start(k) + objects[k].1 && !drawn.contains(&offset) {
+            drawn.push(offset);
+            stops.push(mapped);
+        } else {
+            hits.push(mapped);
+        }
+    }
+    (stops, hits)
+}
+
+/// The caret stops of a projected line of plain text: each character's
+/// edges, in visual order.
+fn plain_caret_stops(visual: &BidiVisualLine) -> Vec<LineCaretStop> {
     let mut stops = Vec::new();
     let mut extents = projected_logical_extents(visual);
     extents.sort_by_key(|extent| extent.cells.start);
@@ -2331,72 +2423,7 @@ fn projected_caret_stops(
         });
         compacted.insert(at, LineCaretStop { offset, col });
     }
-    let hits = after_pending_objects(glyphs, visual, &extents, base, &mut compacted);
-    (compacted, hits)
-}
-
-/// The caret at a pending object insertion's offset is after the object
-/// (typing there goes after it, #1625): where this line shows the object's
-/// text, its one stop for that offset is on the text's far side in the
-/// direction of the text around it (the right in left-to-right text, the
-/// left in right-to-left; the object's own text, digits in Hebrew say, may
-/// run the other way), at the line's end too, and the line's other stops
-/// for that offset become click-only hits, returned, so a click on the
-/// object's text lands at its offset while an arrow press steps over it at
-/// once.
-fn after_pending_objects(
-    glyphs: &[Glyph],
-    visual: &BidiVisualLine,
-    extents: &[LogicalExtent],
-    base: BidiBaseDirection,
-    stops: &mut Vec<LineCaretStop>,
-) -> Vec<LineCaretStop> {
-    // The direction around offset `o`: the character starting there, else
-    // the one ending there, else the line's.
-    let rtl_at = |o: usize| {
-        let shown = |e: &&LogicalExtent| e.cells.start != e.cells.end;
-        extents
-            .iter()
-            .filter(shown)
-            .find(|e| e.start == o)
-            .or_else(|| extents.iter().filter(shown).find(|e| e.end == o))
-            .map_or(base == BidiBaseDirection::Rtl, |e| e.level % 2 == 1)
-    };
-    // Each object's offset and the column after its text.
-    let mut after: Vec<(usize, usize)> = Vec::new();
-    for cluster in &visual.clusters {
-        for &idx in &cluster.glyphs {
-            let Some(offset) = glyphs.get(idx).and_then(|g| g.pending) else {
-                continue;
-            };
-            let rtl = rtl_at(offset);
-            let col = if rtl {
-                cluster.cells.start
-            } else {
-                cluster.cells.end
-            };
-            match after.iter_mut().find(|(o, _)| *o == offset) {
-                Some((_, c)) => *c = if rtl { (*c).min(col) } else { (*c).max(col) },
-                None => after.push((offset, col)),
-            }
-        }
-    }
-    let mut hits = Vec::new();
-    for (offset, col) in after {
-        let mut k = 0;
-        while k < stops.len() {
-            if stops[k].offset == offset && stops[k].col != col {
-                hits.push(stops.remove(k));
-            } else {
-                k += 1;
-            }
-        }
-        if !stops.iter().any(|stop| stop.offset == offset) {
-            let at = stops.partition_point(|stop| stop.col <= col);
-            stops.insert(at, LineCaretStop { offset, col });
-        }
-    }
-    hits
+    compacted
 }
 
 fn prefix_glyphs(prefix: &str) -> Vec<Glyph> {
