@@ -253,7 +253,8 @@ fn fixed_decimal(n: f64, places: i16) -> f64 {
 }
 
 /// Parse `text` typed into (sheet, row, col) and resolve its style: the cell
-/// ready for `Engine::set_cell`. Only the style table is touched here (a new
+/// ready for `Engine::set_cell`. An absent cell is read under the style it
+/// inherits from its row or column. Only the style table is touched here (a new
 /// xf may be interned); the cell itself is left to the caller. Never shifts a
 /// number: a host's typed commit uses [`entry_cell_ctx`].
 pub fn entry_cell(
@@ -278,12 +279,7 @@ pub fn entry_cell_ctx(
     text: &str,
     ctx: &EntryCtx,
 ) -> Result<Cell, EntryError> {
-    let base = wb
-        .sheets
-        .get(sheet)
-        .and_then(|s| s.cell(row, col))
-        .map(|c| c.style)
-        .unwrap_or(0);
+    let base = base_style(wb, sheet, row, col);
     entry_cell_styled(wb, base, text, ctx)
 }
 
@@ -412,12 +408,15 @@ pub fn typed_formula<'a>(
     col: u32,
     text: &'a str,
 ) -> Option<&'a str> {
-    let style = wb
-        .sheets
+    typed_formula_styled(wb, base_style(wb, sheet, row, col), text)
+}
+
+/// The style an entry typed into (sheet, row, col) is read under
+/// ([`crate::sheet::Sheet::entry_style_at`]).
+fn base_style(wb: &Workbook, sheet: usize, row: u32, col: u32) -> u32 {
+    wb.sheets
         .get(sheet)
-        .and_then(|s| s.cell(row, col))
-        .map_or(0, |c| c.style);
-    typed_formula_styled(wb, style, text)
+        .map_or(0, |s| s.entry_style_at(row, col))
 }
 
 /// [`typed_formula`] for a cell of style `style` ([`entry_cell_styled`]).
@@ -1687,6 +1686,66 @@ mod tests {
             paste_cell(&mut styles, text, &field, &ctx()).value,
             CellValue::Text("''abc".into())
         );
+    }
+
+    /// #1660: an absent cell is typed into under the style it inherits from
+    /// its column (or row), as Excel gives it the column's format.
+    #[test]
+    fn typed_entry_into_absent_cell_takes_the_column_style() {
+        let mut styles = Styles::default();
+        assert_eq!(styles.intern(Xf::default()), 0);
+        let pct = styles.intern(Xf {
+            numfmt: NumFmt::Percent { decimals: 0 },
+            code: Some("0%".into()),
+            ..Xf::default()
+        });
+        let text_fmt = styles.intern(Xf {
+            numfmt: NumFmt::Text,
+            code: Some("@".into()),
+            ..Xf::default()
+        });
+        let col = |c: u32, style: u32| crate::sheet::ColDef {
+            min: c,
+            max: c,
+            width: None,
+            attrs: format!(r#"style="{style}""#),
+            default_width: false,
+            plain_width: false,
+        };
+        let mut sheet = Sheet::default();
+        sheet.col_defs = vec![col(1, pct), col(2, text_fmt)];
+        // Row 5 is styled Text: it wins over column B's percent.
+        sheet
+            .row_attrs
+            .insert(4, format!(r#"s="{text_fmt}" customFormat="1""#));
+        let mut wb = Workbook {
+            sheets: vec![sheet],
+            styles,
+            ..Workbook::default()
+        };
+        let c = entry_cell_ctx(&mut wb, 0, 0, 1, "15", &ctx()).unwrap();
+        assert_eq!((c.value, c.style), (CellValue::Number(0.15), pct));
+        // Ctrl+Enter reads each absent cell the same way.
+        let cells = entry_range_ctx(&mut wb, 0, (0, 0, 0, 1), (0, 0), "15", &ctx()).unwrap();
+        assert_eq!(cells[0].2.value, CellValue::Number(15.0), "A1 unstyled");
+        assert_eq!(cells[1].2.value, CellValue::Number(0.15), "B1 percent");
+        // A Text column keeps `=1+1` as text, so there is no formula to check.
+        assert_eq!(typed_formula(&wb, 0, 0, 2, "=1+1"), None);
+        let c = entry_cell_ctx(&mut wb, 0, 0, 2, "=1+1", &ctx()).unwrap();
+        assert_eq!(c.value, CellValue::Text("=1+1".into()));
+        assert_eq!(c.style, text_fmt);
+        assert_eq!(typed_formula(&wb, 0, 0, 0, "=1+1"), Some("1+1"));
+        // The row's style wins over the column's.
+        let c = entry_cell_ctx(&mut wb, 0, 4, 1, "007", &ctx()).unwrap();
+        assert_eq!(c.value, CellValue::Text("007".into()));
+        // A present cell keeps its own style.
+        wb.sheets[0].set_cell(1, 1, Cell::number(1.0));
+        let c = entry_cell_ctx(&mut wb, 0, 1, 1, "15", &ctx()).unwrap();
+        assert_eq!((c.value, c.style), (CellValue::Number(15.0), 0));
+        // Empty text in an absent styled cell is the absence written out.
+        let c = entry_cell_ctx(&mut wb, 0, 2, 1, "", &ctx()).unwrap();
+        wb.sheets[0].set_cell(2, 1, c);
+        assert!(wb.sheets[0].cell(2, 1).is_none());
     }
 
     #[test]

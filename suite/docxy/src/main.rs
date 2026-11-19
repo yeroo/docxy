@@ -3466,7 +3466,8 @@ impl SheetView {
         if sh.cell(r, c).and_then(|x| x.formula.as_deref()) == Some(formula.as_str()) {
             return Ok(false);
         }
-        let style = sh.cell(r, c).map(|x| x.style).unwrap_or(0);
+        // An absent cell's inherited style counts (#1660).
+        let style = sh.entry_style_at(r, c);
         let cell = Cell {
             style,
             ..Cell::formula(&formula)
@@ -5113,13 +5114,16 @@ impl SheetView {
             )));
         }
         let at = (sel.0, sel.1);
-        let block = tiled_block(
+        let mut block = tiled_block(
             &clip.block.cells,
             &clip.block.rows,
             &clip.block.cols,
             at,
             tiles,
         );
+        // A copied absent cell from past its sheet's used extent lands as the
+        // target's absence (#1660).
+        clip.block.land_absent(self.sheet(), at, &mut block);
         self.write_block(at, &block, step)?;
         // The source cells' rules replace the target's (#688) — an ordinary
         // paste moves validation along with the cells, so a source with no
@@ -5165,10 +5169,13 @@ impl SheetView {
                 && a.style == b.style
                 && (a.formula.is_some() || a.value == b.value)
         };
+        // Read as the cut captured it ([`gridcore::edit::ClipBlock::capture`]):
+        // an absent cell with its inherited style (#1660).
+        let read = sheet.copy_reader();
         (r0..=r1).zip(&clip.block.cells).all(|(r, row)| {
             (c0..=c1)
                 .zip(row)
-                .all(|(c, was)| same(was, &sheet.cell(r, c).cloned().unwrap_or_default()))
+                .all(|(c, was)| same(was, &read.cell(r, c)))
         })
     }
 
@@ -5189,7 +5196,7 @@ impl SheetView {
         clip: &GridClip,
         step: &'static str,
     ) -> Result<GridPasted, GridPasteError> {
-        use gridcore::sheet::{Cell, MAX_COLS, MAX_ROWS, is_array_f};
+        use gridcore::sheet::{MAX_COLS, MAX_ROWS, is_array_f};
         let (fr0, fc0, fr1, fc1) = clip.rect;
         let (h, w) = (fr1 - fr0 + 1, fc1 - fc0 + 1);
         let (r0, c0, r1, c1) = self.range();
@@ -5216,12 +5223,20 @@ impl SheetView {
         };
         // The cells as the source holds them now, their formulas moved.
         let sheet = &self.pkg.workbook.sheets[src];
+        let read = sheet.copy_reader();
+        let landing = self.pkg.workbook.sheets[dst].copy_reader();
         let mut block = Vec::new();
         let mut clears = Vec::new();
         for r in fr0..=fr1 {
             let mut row = Vec::new();
             for c in fc0..=fc1 {
-                let mut cell = sheet.cell(r, c).cloned().unwrap_or_default();
+                // An absent cell moves as its inherited style, or from past
+                // the used extent as the target's absence (#1660).
+                let mut cell = if read.past_extent(r, c) {
+                    landing.absent_cell(r0 + (r - fr0), c0 + (c - fc0))
+                } else {
+                    read.cell(r, c)
+                };
                 // A formula held verbatim (a shared one) keeps its text.
                 let verbatim = cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a));
                 if !verbatim {
@@ -5236,7 +5251,8 @@ impl SheetView {
                 let overwritten =
                     src == dst && (r0..r0 + h).contains(&r) && (c0..c0 + w).contains(&c);
                 if sheet.cell(r, c).is_some() && !overwritten {
-                    clears.push((r, c, Cell::default()));
+                    // Cleared to its absence, not a default-style pin (#1660).
+                    clears.push((r, c, read.absent_cell(r, c)));
                 }
                 row.push(cell);
             }

@@ -2577,6 +2577,9 @@ struct ClipData {
     /// keeps it, a new copy of the same range has another, so undo and redo
     /// tell the two apart where their shown text is the same.
     serial: u64,
+    /// The source sheet's used extent when copied: a `None` cell past it
+    /// lands as its target's absence (#1660, [`gridcore::sheet::CopyReader`]).
+    used: (u32, u32),
 }
 
 /// What a commit that raised a data-validation alert goes on to do once the
@@ -5068,6 +5071,11 @@ impl App {
         let sheet = self.sheet();
         let mut rows = Vec::new();
         let mut tsv = String::new();
+        // An absent cell is copied as a blank with the style it inherits from
+        // its row or column, when that is not the default (#1660): pasted, it
+        // is the cell's absence, not a default-style pin.
+        let read = sheet.copy_reader();
+        let used = read.used();
         for r in r1..=r2 {
             let mut row = Vec::new();
             for c in c1..=c2 {
@@ -5081,7 +5089,7 @@ impl App {
                     let shown = format_with(&xf, &cl.value, self.pkg.workbook.date1904);
                     tsv.push_str(&gridcore::entry::copy_field(cl, &xf, shown));
                 }
-                row.push(cell);
+                row.push(read.cell_opt(r, c));
             }
             tsv.push('\n');
             rows.push(row);
@@ -5097,6 +5105,7 @@ impl App {
             span: (sr2 - sr1 + 1, sc2 - sc1 + 1),
             cut,
             serial: self.clip_serial,
+            used,
         });
         if let Some(cb) = &mut self.os_clip {
             let _ = cb.set_text(tsv.clone());
@@ -5178,13 +5187,17 @@ impl App {
                 let mut clears = Vec::new();
                 if cut {
                     let (fr, fc) = clip.from;
+                    let source = self.pkg.workbook.sheets[src].copy_reader();
                     for (dr, row) in clip.cells.iter().enumerate() {
                         for (dc, cell) in row.iter().enumerate() {
                             // A cell pushed off the grid's edge isn't
                             // written, so its source stays.
                             let (dr, dc) = (dr as u32, dc as u32);
                             if cell.is_some() && r0 + dr < MAX_ROWS && c0 + dc < MAX_COLS {
-                                clears.push((fr + dr, fc + dc, Cell::default()));
+                                // Cleared to its absence, not a default-style
+                                // pin (#1660).
+                                let (r, c) = (fr + dr, fc + dc);
+                                clears.push((r, c, source.absent_cell(r, c)));
                             }
                         }
                     }
@@ -5225,6 +5238,7 @@ impl App {
                 // the grid's edge are dropped, so rows may differ in length.
                 let mut block = Vec::new();
                 let mut writes = Vec::new();
+                let landing = self.pkg.workbook.sheets[here].copy_reader();
                 for (dr, row) in clip.cells.iter().enumerate() {
                     let r = r0 + dr as u32;
                     if r >= MAX_ROWS {
@@ -5236,7 +5250,16 @@ impl App {
                         if c >= MAX_COLS {
                             break;
                         }
-                        let mut new_cell = cell.clone().unwrap_or_default();
+                        // An absent source from past its sheet's used extent
+                        // lands as the target's absence (#1660).
+                        let (fr, fc) = (clip.from.0 + dr as u32, clip.from.1 + dc as u32);
+                        let mut new_cell = cell.clone().unwrap_or_else(|| {
+                            if gridcore::sheet::past_extent(clip.used, fr, fc) {
+                                landing.absent_cell(r, c)
+                            } else {
+                                Cell::default()
+                            }
+                        });
                         // Copies translate relative refs; cuts keep them, and
                         // so does a copy pasted where it came from (translating
                         // reprints the text, even by zero).
@@ -5297,12 +5320,17 @@ impl App {
                     };
                     let mut seen: std::collections::HashSet<(u32, u32)> =
                         clears.iter().map(|cell| (cell.0, cell.1)).collect();
-                    for &(r, c) in self.pkg.workbook.sheets[here].cells.keys() {
+                    let target = &self.pkg.workbook.sheets[here];
+                    let landing = target.copy_reader();
+                    for &(r, c) in target.cells.keys() {
                         if inside(r, c) && !written.contains(&(r, c)) {
+                            // Blanked to its absence, not a default-style pin
+                            // (#1660).
+                            let blank = landing.absent_cell(r, c);
                             if !same_sheet {
-                                blanks.push((r, c, Cell::default()));
+                                blanks.push((r, c, blank));
                             } else if seen.insert((r, c)) {
-                                clears.push((r, c, Cell::default()));
+                                clears.push((r, c, blank));
                             }
                         }
                     }
@@ -5447,7 +5475,8 @@ impl App {
                     if r >= MAX_ROWS || c >= MAX_COLS {
                         continue;
                     }
-                    let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
+                    // An absent target's inherited style counts (#1660).
+                    let style = self.sheet().entry_style_at(r, c);
                     // Read as typed into the target (a leading `'` is
                     // quote-prefixed text, a date brings its format).
                     let styles = &mut self.pkg.workbook.styles;
@@ -9038,7 +9067,8 @@ impl App {
             self.status = Some("AutoSum: no adjacent numbers".into());
             return;
         };
-        let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
+        // An absent cell's inherited style counts (#1660).
+        let style = self.sheet().entry_style_at(r, c);
         self.status = Some(format!("AutoSum: =SUM({range})"));
         self.structural_writing_cells(move |wb| {
             let cell = Cell {
@@ -9551,6 +9581,8 @@ impl App {
         let cols: Vec<u32> = (0..w).map(|j| clip.from.1 + j).collect();
         let mut block =
             gridcore::edit::ClipBlock::capture(&self.pkg.workbook, clip.sheet, rows, cols);
+        // Past the extent the copy had, not the sheet's now (#1660).
+        block.used = Some(clip.used);
         // The cells as they were copied.
         block.cells = clip
             .cells
@@ -9873,9 +9905,16 @@ impl App {
         let mut cells = Vec::new();
         for (c, text) in changes {
             let wb = &self.pkg.workbook;
-            let base = style_row
-                .and_then(|r| wb.sheets[d.sheet].cell(r, c))
-                .map_or(0, |cell| cell.style);
+            let sh = &wb.sheets[d.sheet];
+            // A record's own absent field, or a new record's field with none
+            // above it, is read under the style the cell inherits from its
+            // row or column (#1660).
+            let base = match d.rec {
+                Rec::Row(r) => sh.entry_style_at(r, c),
+                Rec::New => style_row
+                    .and_then(|r| sh.cell(r, c))
+                    .map_or_else(|| sh.inherited_style(row, c), |cell| cell.style),
+            };
             let formula = gridcore::entry::typed_formula_styled(wb, base, &text);
             let checked =
                 formula.map(|f| Engine::validate_in(&self.pkg.workbook, d.sheet, row, c, f));
@@ -17567,6 +17606,116 @@ mod tests {
         check(&app, true, "redo");
     }
 
+    /// A sheet whose column B has style 7: a blank default-style cell there
+    /// would pin the default (#1064).
+    fn app_with_styled_column_b() -> App {
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0]
+            .col_defs
+            .push(gridcore::sheet::ColDef {
+                min: 1,
+                max: 1,
+                width: None,
+                attrs: r#"style="7""#.to_string(),
+                default_width: false,
+                plain_width: false,
+            });
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        app.anchor = None;
+        app
+    }
+
+    /// #1660: copy an absent B1 and paste it on B2 (style 0), or cut B3:
+    /// neither leaves a blank default-style pin under column B's style.
+    #[test]
+    fn copy_or_cut_of_absent_and_typed_cells_leaves_no_pin_in_a_styled_column() {
+        let mut app = app_with_styled_column_b();
+        app.apply(vec![
+            (0, 0, Cell::number(1.0)),
+            (1, 1, Cell::number(2.0)),
+            (2, 1, Cell::number(3.0)),
+        ]);
+        app.cur = (0, 1);
+        app.copy(false);
+        let blank7 = Cell {
+            style: 7,
+            ..Cell::default()
+        };
+        assert_eq!(app.clip.as_ref().unwrap().cells, vec![vec![Some(blank7)]]);
+        assert_eq!(app.clip_text.as_deref(), Some("\n"), "an empty field");
+        app.cur = (1, 1);
+        app.paste();
+        assert_eq!(app.sheet().cell(1, 1), None, "B2 is as absent as B1");
+        // Cut B3 to A6: B3 is left absent, not a default-style pin.
+        app.cur = (2, 1);
+        app.copy(true);
+        app.cur = (5, 0);
+        app.paste();
+        assert_eq!(value_at(&app, 5, 0), CellValue::Number(3.0));
+        assert_eq!(app.sheet().cell(2, 1), None, "B3 after the cut");
+        // An absent A1 in an unstyled column is still copied as nothing.
+        app.cur = (3, 0);
+        app.copy(false);
+        assert_eq!(app.clip.as_ref().unwrap().cells, vec![vec![None]]);
+        // B20, past the used rows, pasted on a held B1: B1 ends absent, not
+        // a default-style pin (r2).
+        app.apply(vec![(0, 1, Cell::number(1.0))]);
+        app.cur = (19, 1);
+        app.copy(false);
+        assert_eq!(app.clip.as_ref().unwrap().cells, vec![vec![None]]);
+        app.cur = (0, 1);
+        app.paste();
+        assert_eq!(app.sheet().cell(0, 1), None, "B1 after a past-extent paste");
+    }
+
+    /// #1660 r1 p1: a cut from another sheet blanks the target cells its
+    /// selection covers past its used cells. In a styled column they end
+    /// absent, not as default-style pins. A whole styled column copied
+    /// writes only its used rows.
+    #[test]
+    fn a_cut_blanks_its_target_to_absence_in_a_styled_column() {
+        let mut app = app_with_styled_column_b();
+        app.apply(vec![(59, 1, Cell::number(6.0))]); // B60
+        app.open_prompt(PromptKind::AddSheet);
+        app.prompt.as_mut().unwrap().text = "Data".to_string();
+        app.commit_prompt();
+        app.goto_sheet(1);
+        app.apply(vec![(0, 0, Cell::number(1.0))]);
+        app.anchor = Some((0, 0));
+        app.cur = (99, 0);
+        app.copy(true); // A1:A100, used A1 only
+        app.goto_sheet(0);
+        app.anchor = None;
+        app.cur = (39, 1);
+        app.paste();
+        assert_eq!(value_at(&app, 39, 1), CellValue::Number(1.0));
+        assert_eq!(app.sheet().cell(59, 1), None, "B60 is absent, not a pin");
+        // Column B whole, copied to D: D1:D60 at most, never further.
+        app.anchor = Some((0, 1));
+        app.cur = (MAX_ROWS - 1, 1);
+        app.copy(false);
+        app.anchor = None;
+        app.cur = (0, 3);
+        app.paste();
+        let d = app.sheet().cells.keys().filter(|k| k.1 == 3);
+        assert!(d.clone().count() > 0 && d.clone().all(|k| k.0 < 60));
+    }
+
+    /// #1660: B1 spills B1:B3 in a styled column under manual calculation;
+    /// `x` typed in B2 and undone leaves no blank default-style pin there.
+    #[test]
+    fn undo_of_a_typed_spill_member_leaves_no_pin_under_manual_calc() {
+        let mut app = app_with_styled_column_b();
+        app.apply(vec![(0, 1, Cell::formula("SEQUENCE(3)"))]);
+        assert_eq!(app.sheet().cell(0, 1).unwrap().spill, Some((3, 1)));
+        app.pkg.workbook.calc.mode = gridcore::sheet::CalcMode::Manual;
+        app.apply(vec![(1, 1, Cell::text("x"))]);
+        app.undo();
+        let b2 = app.sheet().cell(1, 1);
+        assert!(b2.is_none_or(|c| !c.is_blank()), "B2 is {b2:?}");
+    }
+
     #[test]
     fn bold_on_a_randarray_spill_keeps_it_through_undo_redo() {
         // Volatile: every recalc redraws the values, so a restyle's undo must
@@ -17739,6 +17888,7 @@ mod tests {
             span: (1, 1),
             cut: false,
             serial: 0,
+            used: (1, 1),
         });
         app.paste_special(gridcore::edit::PasteSpec::default());
         assert!(app.status.as_deref().unwrap_or("").contains("gone"));
@@ -24838,6 +24988,51 @@ mod tests {
         assert_eq!(form_rec(&app), dataform::Rec::Row(1));
         assert!(app.status.as_deref().unwrap().starts_with("formula error"));
         assert_eq!(value_at(&app, 1, 1), CellValue::Number(5.0));
+    }
+
+    /// #1660: a record's own absent field is read under the style its
+    /// column gives it: `15` in a `0%` column is 15%.
+    #[test]
+    fn data_form_reads_an_absent_field_under_its_columns_style() {
+        let mut app = data_form_app();
+        let pct = app.pkg.workbook.styles.intern(gridcore::sheet::Xf {
+            numfmt: gridcore::sheet::NumFmt::Percent { decimals: 0 },
+            code: Some("0%".into()),
+            ..gridcore::sheet::Xf::default()
+        });
+        app.pkg.workbook.sheets[0]
+            .col_defs
+            .push(gridcore::sheet::ColDef {
+                min: 1,
+                max: 1,
+                width: None,
+                attrs: format!(r#"style="{pct}""#),
+                default_width: false,
+                plain_width: false,
+            });
+        app.pkg.workbook.sheets[0].cells.remove(&(1, 1));
+        app.rebuild_engine();
+        app.ribbon_act(ribbon::Act::DataForm);
+        assert_eq!(form_rec(&app), dataform::Rec::Row(1));
+        form_key(&mut app, KeyCode::Tab);
+        form_clear(&mut app);
+        form_type(&mut app, "15");
+        form_key(&mut app, KeyCode::Down);
+        let b2 = app.sheet().cell(1, 1).unwrap();
+        assert_eq!((&b2.value, b2.style), (&CellValue::Number(0.15), pct));
+        // A new record whose field above (B4) is absent: the new cell's own
+        // inherited style, not the default (r1 m3).
+        app.pkg.workbook.sheets[0].cells.remove(&(3, 1));
+        app.rebuild_engine();
+        form_button(&mut app, dataform::Button::New);
+        form_key(&mut app, KeyCode::Enter);
+        assert_eq!(form_rec(&app), dataform::Rec::New);
+        form_type(&mut app, "Dan");
+        form_key(&mut app, KeyCode::Tab);
+        form_type(&mut app, "20");
+        form_key(&mut app, KeyCode::Enter);
+        let b5 = app.sheet().cell(4, 1).unwrap();
+        assert_eq!((&b5.value, b5.style), (&CellValue::Number(0.2), pct));
     }
 
     #[test]

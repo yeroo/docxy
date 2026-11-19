@@ -222,8 +222,16 @@ pub fn fill_changes(
     dir: FillDir,
 ) -> Vec<(u32, u32, Cell)> {
     let mut changes = Vec::new();
+    // An absent source carries the style it inherits (#1660).
+    let read = sheet.copy_reader();
     let mut copy_from = |sr: u32, sc: u32, tr: u32, tc: u32| {
-        let mut cell = sheet.cell(sr, sc).cloned().unwrap_or_default();
+        // Past the used extent, an absent source lands as the target's
+        // absence ([`crate::sheet::CopyReader`]).
+        if read.past_extent(sr, sc) {
+            changes.push((tr, tc, read.absent_cell(tr, tc)));
+            return;
+        }
+        let mut cell = read.cell(sr, sc);
         copy_meta(&mut cell);
         if let Some(f) = &cell.formula {
             if let Some(t) = translate_formula(f, tr as i64 - sr as i64, tc as i64 - sc as i64) {
@@ -763,6 +771,7 @@ pub fn autofill(wb: &mut Workbook, sheet: usize, req: &FillReq) -> Option<Filled
         (sr0..=sr1).collect()
     };
     let mut writes = Vec::new();
+    let read = s.copy_reader();
     for line in lines {
         // The source line's cells, seed 0 nearest the fill.
         let mut pos: Vec<(u32, u32)> = if vertical {
@@ -785,8 +794,19 @@ pub fn autofill(wb: &mut Workbook, sheet: usize, req: &FillReq) -> Option<Filled
             };
             let (mut cell, from_style) = match out {
                 series::LineOut::Copy(j) => {
-                    let mut cell = srcvals[j].clone().unwrap_or_default();
                     let (fr, fc) = pos[j];
+                    // An absent source carries the style it inherits, or past
+                    // the used extent lands as the target's absence (#1660).
+                    let mut cell = srcvals[j].clone().unwrap_or_else(|| {
+                        if read.past_extent(fr, fc) {
+                            read.absent_cell(r, c)
+                        } else {
+                            Cell {
+                                style: read.absent_style(fr, fc),
+                                ..Cell::default()
+                            }
+                        }
+                    });
                     rebase(
                         &mut cell,
                         i64::from(r) - i64::from(fr),
@@ -810,13 +830,14 @@ pub fn autofill(wb: &mut Workbook, sheet: usize, req: &FillReq) -> Option<Filled
                 }
                 // The series' values in the destination's own style.
                 FillKind::WithoutFormatting => {
-                    cell.style = here.map_or(0, |h| h.style);
+                    cell.style = here.map_or_else(|| s.inherited_style(r, c), |h| h.style);
                 }
                 _ => {}
             }
             writes.push((r, c, cell));
         }
     }
+    drop(read);
     for (r, c, cell) in writes {
         s.set_cell(r, c, cell);
     }

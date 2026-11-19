@@ -264,6 +264,71 @@ fn a_cut_marks_its_cells_and_its_paste_moves_them_and_their_references() {
     assert_eq!(v.sheet().cell(9, 1), None);
 }
 
+/// #1660: a cut over an absent cell of a styled column captures it with
+/// the column's style, still moves, and clears its source to its absence,
+/// not a default-style pin.
+#[test]
+fn a_cut_over_an_absent_cell_in_a_styled_column_moves_and_leaves_no_pin() {
+    let mut v = view();
+    let s = v.active;
+    v.pkg.workbook.sheets[s]
+        .col_defs
+        .push(gridcore::sheet::ColDef {
+            min: 1,
+            max: 1,
+            width: None,
+            attrs: r#"style="7""#.to_string(),
+            default_width: false,
+            plain_width: false,
+        });
+    put(&mut v, "A1", Cell::number(1.0));
+    put(&mut v, "B2", Cell::number(2.0));
+    let clip = cut(&mut v, "A1", "B2");
+    select(&mut v, "A10", "A10");
+    assert_eq!(v.paste_grid_clip(&clip), Ok(GridPasted::Done));
+    assert_eq!(value(&v, "A10"), CellValue::Number(1.0));
+    assert_eq!(value(&v, "B11"), CellValue::Number(2.0));
+    assert_eq!(v.sheet().cell(0, 0), None, "A1 moved, not copied");
+    assert_eq!(v.sheet().cell(1, 1), None, "B2 is absent, not a pin");
+    assert_eq!(v.sheet().cell(0, 1), None, "B1 stays absent");
+}
+
+/// #1660 r2: cells copied or cut from past the sheet's used rows land on
+/// held cells of a styled column as their absence, not default-style pins.
+#[test]
+fn a_copy_or_cut_from_past_the_used_rows_leaves_its_targets_absent() {
+    let mut v = view();
+    let s = v.active;
+    v.pkg.workbook.sheets[s]
+        .col_defs
+        .push(gridcore::sheet::ColDef {
+            min: 1,
+            max: 1,
+            width: None,
+            attrs: r#"style="7""#.to_string(),
+            default_width: false,
+            plain_width: false,
+        });
+    for r in 1..=4 {
+        put(&mut v, &format!("B{r}"), Cell::number(f64::from(r)));
+    }
+    let clip = copy(&mut v, "B10", "B12");
+    select(&mut v, "B1", "B1");
+    assert_eq!(v.paste_grid_clip(&clip), Ok(GridPasted::Done));
+    for r in 0..3 {
+        assert_eq!(v.sheet().cell(r, 1), None, "B{}", r + 1);
+    }
+    assert_eq!(value(&v, "B4"), CellValue::Number(4.0));
+    // A cut of A4:A5 (A5 past the used rows) moved onto B3:B4: B4, held in
+    // the styled column, ends absent.
+    put(&mut v, "A4", Cell::number(9.0));
+    let clip = cut(&mut v, "A4", "A5");
+    select(&mut v, "B3", "B3");
+    assert_eq!(v.paste_grid_clip(&clip), Ok(GridPasted::Done));
+    assert_eq!(value(&v, "B3"), CellValue::Number(9.0));
+    assert_eq!(v.sheet().cell(3, 1), None, "B4 under A5's past-extent cell");
+}
+
 #[test]
 fn a_cut_over_its_own_cells_keeps_what_it_overwrites() {
     let mut v = issue_book();

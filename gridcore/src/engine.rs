@@ -2029,7 +2029,7 @@ impl Engine {
                         for (j, v) in row.into_iter().enumerate() {
                             let (rr, cc) = (r + i as u32, c + j as u32);
                             let v = value_to_cell(v);
-                            let entry = sheet.cells.entry((rr, cc)).or_default();
+                            let entry = spill_slot(sheet, (r, c), (rr, cc));
                             if (rr, cc) != (r, c) {
                                 // Outside the previous extent the cell newly
                                 // belongs to this spill (report it, as on
@@ -2144,7 +2144,7 @@ impl Engine {
         for rr in r..r + h {
             for cc in c..c + w {
                 let v = value_to_cell(cse_at(&m, (rr - r) as usize, (cc - c) as usize));
-                let entry = sheet.cells.entry((rr, cc)).or_default();
+                let entry = spill_slot(sheet, (r, c), (rr, cc));
                 if (rr, cc) != (r, c) && entry.value != v {
                     changed.push((s, rr, cc));
                 }
@@ -2636,6 +2636,22 @@ pub(crate) fn clear_spill(
         }
     }
     out
+}
+
+/// The cell at `at` an array anchored at `anchor` writes into: an absent
+/// member is made with the style its row or column gives it, as Excel saves
+/// spill output in a formatted column with that column's format; a
+/// member's own style, and the anchor, are kept (#1660).
+fn spill_slot(sheet: &mut Sheet, anchor: (u32, u32), at: (u32, u32)) -> &mut Cell {
+    let style = if at != anchor && !sheet.cells.contains_key(&at) {
+        sheet.inherited_style(at.0, at.1)
+    } else {
+        0
+    };
+    sheet.cells.entry(at).or_insert_with(|| Cell {
+        style,
+        ..Cell::default()
+    })
 }
 
 /// Is (r, c) inside the spill of one of `anchors` (other than an anchor
@@ -4913,6 +4929,541 @@ mod tests {
         set(&mut eng, &mut wb, "A1", array_formula("SEQUENCE(3)"));
         set(&mut eng, &mut wb, "A1", array_formula("SEQUENCE(1)"));
         assert!(!has(&wb, "A2") && !has(&wb, "A3"));
+    }
+
+    /// #1660: an absent cell inherits its row's style, else its column's.
+    #[test]
+    fn inherited_style_row_wins_over_column() {
+        let mut wb = pinned_wb(&[]);
+        let sh = &mut wb.sheets[0];
+        assert_eq!(sh.inherited_style(0, 1), 7, "column B");
+        assert_eq!(sh.inherited_style(2, 1), 5, "row 3 wins over column B");
+        assert_eq!(sh.inherited_style(2, 0), 5, "row 3");
+        assert_eq!(sh.inherited_style(0, 0), 0);
+        // A row without `customFormat`, or with `s="0"` or an unreadable
+        // `s`, styles nothing: the column's style shows through.
+        sh.row_attrs.insert(5, r#"s="5""#.to_string());
+        sh.row_attrs
+            .insert(6, r#"s="0" customFormat="1""#.to_string());
+        sh.row_attrs
+            .insert(7, r#"s="x" customFormat="true""#.to_string());
+        for r in 5..=7 {
+            assert_eq!(sh.inherited_style(r, 1), 7, "row {}", r + 1);
+            assert_eq!(sh.inherited_style(r, 0), 0, "row {}", r + 1);
+            assert!(!sh.pins_default(r, 0));
+        }
+        // A copy reads an absent B1 with column B's style once B2 puts it
+        // inside the used extent, and a held B1 as it is.
+        let blank7 = Cell {
+            style: 7,
+            ..Cell::default()
+        };
+        assert_eq!(sh.copy_reader().cell(0, 1), Cell::default(), "past it");
+        assert_eq!(sh.copy_reader().absent_cell(0, 1), blank7);
+        sh.set_cell(1, 1, Cell::number(2.0));
+        assert_eq!(sh.copy_reader().cell(0, 1), blank7);
+        sh.set_cell(0, 1, Cell::number(1.0));
+        assert_eq!(sh.copy_reader().cell(0, 1), Cell::number(1.0));
+    }
+
+    /// #1660: a blank of exactly the style a slot inherits is the absence
+    /// written out, present slot or absent; any other blank is kept.
+    #[test]
+    fn set_cell_does_not_write_out_an_inherited_blank() {
+        let mut wb = pinned_wb(&[]);
+        let sh = &mut wb.sheets[0];
+        let blank = |style| Cell {
+            style,
+            ..Cell::default()
+        };
+        sh.set_cell(8, 1, blank(7));
+        assert!(sh.cell(8, 1).is_none(), "B9: column B's style");
+        sh.set_cell(8, 0, blank(7));
+        assert!(sh.cell(8, 0).is_some(), "A9: an unstyled column");
+        sh.set_cell(2, 1, blank(7));
+        assert!(sh.cell(2, 1).is_some(), "B3: row 3's style is 5");
+        sh.set_cell(2, 1, blank(5));
+        assert!(sh.cell(2, 1).is_none(), "B3 cleared to row 3's style");
+        // Over a present cell too: a typed B10 cleared to the column's style.
+        sh.set_cell(9, 1, Cell::number(1.0));
+        sh.set_cell(9, 1, blank(7));
+        assert!(sh.cell(9, 1).is_none());
+        // A blank default cell still never invents a pin, and one already
+        // there stays pinned (#1097).
+        sh.set_cell(10, 1, blank(0));
+        assert!(sh.cell(10, 1).is_none());
+        sh.set_cell(10, 1, Cell::number(1.0));
+        sh.set_cell(10, 1, blank(0));
+        assert!(sh.cell(10, 1).is_some());
+    }
+
+    /// #1660: Fill Down from an absent B1 over a typed B2 (style 0) in a
+    /// styled column leaves B2 as B1 is, absent, not a default-style pin.
+    #[test]
+    fn fill_down_from_absent_source_leaves_no_default_pin() {
+        let mut wb = pinned_wb(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "B2", Cell::number(1.0));
+        set(&mut eng, &mut wb, "A2", Cell::number(1.0));
+        let changes =
+            crate::edit::fill_changes(&wb.sheets[0], (1, 0, 1, 1), crate::edit::FillDir::Down);
+        assert_eq!(
+            changes[1],
+            (
+                1,
+                1,
+                Cell {
+                    style: 7,
+                    ..Cell::default()
+                }
+            ),
+            "B1 carries column B's style"
+        );
+        for (r, c, cell) in changes {
+            eng.set_cell(&mut wb, (0, r, c), cell);
+        }
+        assert!(!has(&wb, "B2"), "{:?}", wb.sheets[0].cell(1, 1));
+        assert!(!has(&wb, "A2"));
+    }
+
+    /// #1660: the fill handle dragged from an absent B1 over typed B2:B3.
+    #[test]
+    fn autofill_from_absent_source_leaves_no_default_pin() {
+        use crate::edit::{FillKind, FillReq, autofill};
+        let mut wb = pinned_wb(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "B2", Cell::number(1.0));
+        set(&mut eng, &mut wb, "B4", Cell::number(1.0));
+        autofill(&mut wb, 0, &FillReq::new((0, 1, 0, 1), (3, 1)));
+        assert!(!has(&wb, "B2") && !has(&wb, "B4"));
+        // B3 inherits row 3's 5, so B1's copy (column B's 7) is kept there.
+        assert_eq!(style_of(&wb, "B3"), 7);
+        // Without formatting, the values land in the style each absent
+        // destination inherits.
+        wb.sheets[0].cells.remove(&(2, 1));
+        set(&mut eng, &mut wb, "B1", Cell::number(4.0));
+        let req = FillReq {
+            kind: FillKind::WithoutFormatting,
+            ..FillReq::new((0, 1, 0, 1), (2, 1))
+        };
+        autofill(&mut wb, 0, &req);
+        assert_eq!(
+            (value_at(&wb, "B2"), style_of(&wb, "B2")),
+            (CellValue::Number(4.0), 7)
+        );
+        assert_eq!(
+            (value_at(&wb, "B3"), style_of(&wb, "B3")),
+            (CellValue::Number(4.0), 5)
+        );
+    }
+
+    /// #1660: copy an absent B1, paste it on a typed B2: B2 ends absent.
+    /// Values pasted into an absent cell keep the style it inherits.
+    #[test]
+    fn paste_of_absent_source_leaves_no_default_pin() {
+        use crate::edit::{ClipBlock, PasteSpec, PasteWhat, paste_special_changes};
+        let paste = |eng: &mut Engine, wb: &mut Workbook, at, clip: &ClipBlock, spec| {
+            for (r, c, cell) in paste_special_changes(wb, 0, at, clip, &spec).unwrap() {
+                eng.set_cell(wb, (0, r, c), cell);
+            }
+        };
+        let mut wb = pinned_wb(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "B2", Cell::number(1.0));
+        let clip = ClipBlock::capture(&wb, 0, vec![0], vec![1]);
+        assert_eq!(
+            clip.cells[0][0],
+            Cell {
+                style: 7,
+                ..Cell::default()
+            }
+        );
+        paste(&mut eng, &mut wb, (1, 1), &clip, PasteSpec::default());
+        assert!(!has(&wb, "B2"), "{:?}", wb.sheets[0].cell(1, 1));
+        // A1 = 3, pasted as values onto the absent B5: column B's style.
+        set(&mut eng, &mut wb, "A1", Cell::number(3.0));
+        let clip = ClipBlock::capture(&wb, 0, vec![0], vec![0]);
+        paste(
+            &mut eng,
+            &mut wb,
+            (4, 1),
+            &clip,
+            PasteSpec::of(PasteWhat::Values),
+        );
+        assert_eq!(
+            (value_at(&wb, "B5"), style_of(&wb, "B5")),
+            (CellValue::Number(3.0), 7)
+        );
+    }
+
+    /// The keys sheet 0 holds in column `c`.
+    fn keys_in_col(wb: &Workbook, c: u32) -> Vec<(u32, u32)> {
+        let keys = wb.sheets[0].cells.keys();
+        keys.filter(|k| k.1 == c).copied().collect()
+    }
+
+    /// #1660 r1 M1: a copy of a whole styled column, pasted on an unstyled
+    /// one, writes the column's style only inside the sheet's used extent,
+    /// not a million styled blanks down to the last row.
+    #[test]
+    fn a_whole_styled_column_copied_writes_only_its_used_rows() {
+        use crate::edit::{ClipBlock, PasteSpec, paste_special_changes};
+        use crate::sheet::MAX_ROWS;
+        // Used extent A1:B5; B2 holds 1, row 3 has style 5.
+        let mut wb = pinned_wb(&[("B2", Cell::number(1.0)), ("A5", Cell::number(2.0))]);
+        let clip = ClipBlock::capture(&wb, 0, (0..MAX_ROWS).collect(), vec![1]);
+        let changes =
+            paste_special_changes(&mut wb, 0, (0, 3), &clip, &PasteSpec::default()).unwrap();
+        for (r, c, cell) in changes {
+            wb.sheets[0].set_cell(r, c, cell);
+        }
+        // D1, D4, D5 take column B's 7, D2 the value, D3 row 3's own 5
+        // (absent); nothing past row 5.
+        assert_eq!(keys_in_col(&wb, 3), vec![(0, 3), (1, 3), (3, 3), (4, 3)]);
+        assert_eq!(style_of(&wb, "D1"), 7);
+        // Ctrl+R over B:C, the whole column: the same bound.
+        let changes = crate::edit::fill_changes(
+            &wb.sheets[0],
+            (0, 1, MAX_ROWS - 1, 2),
+            crate::edit::FillDir::Right,
+        );
+        for (r, c, cell) in changes {
+            wb.sheets[0].set_cell(r, c, cell);
+        }
+        assert_eq!(keys_in_col(&wb, 2), vec![(0, 2), (1, 2), (3, 2), (4, 2)]);
+        // A fill handle dragged down column B from an absent B1 past the
+        // used rows writes nothing there.
+        let req = crate::edit::FillReq::new((0, 1, 0, 1), (MAX_ROWS - 1, 1));
+        crate::edit::autofill(&mut wb, 0, &req);
+        assert!(keys_in_col(&wb, 1).iter().all(|k| k.0 < 5));
+    }
+
+    /// A sheet with column B styled 7 (no row style) holding B1:B5 = 1..5,
+    /// so its used extent ends at row 5.
+    fn held_column_b() -> Workbook {
+        let cells: Vec<(String, Cell)> = (1..=5)
+            .map(|r| (format!("B{r}"), Cell::number(f64::from(r))))
+            .collect();
+        let refs: Vec<(&str, Cell)> = cells.iter().map(|(n, c)| (n.as_str(), c.clone())).collect();
+        let mut wb = pinned_wb(&refs);
+        wb.sheets[0].row_attrs.clear();
+        wb
+    }
+
+    /// #1660 r2 M1: an absent source past the used extent, filled or pasted
+    /// over held cells of a styled column, lands as their absence, never a
+    /// default-style pin.
+    #[test]
+    fn a_source_past_the_used_extent_lands_as_the_targets_absence() {
+        use crate::edit::{ClipBlock, FillDir, FillKind, FillReq, PasteSpec, autofill};
+        use crate::edit::{fill_changes, paste_special_changes};
+        // Fill Up on B5 from B6.
+        let mut wb = held_column_b();
+        for (r, c, cell) in fill_changes(&wb.sheets[0], (4, 1, 4, 1), FillDir::Up) {
+            wb.sheets[0].set_cell(r, c, cell);
+        }
+        assert!(!has(&wb, "B5"), "{:?}", wb.sheets[0].cell(4, 1));
+        // The fill handle dragged up from B6 over B4:B5, formats only: B5's
+        // value keeps the column's style, not 0.
+        let mut wb = held_column_b();
+        wb.sheets[0].cells.get_mut(&(4, 1)).unwrap().style = 9;
+        let req = FillReq {
+            kind: FillKind::FormatsOnly,
+            ..FillReq::new((5, 1, 5, 1), (3, 1))
+        };
+        autofill(&mut wb, 0, &req);
+        assert_eq!(
+            (value_at(&wb, "B5"), style_of(&wb, "B5")),
+            (CellValue::Number(5.0), 7)
+        );
+        assert_eq!(
+            (value_at(&wb, "B4"), style_of(&wb, "B4")),
+            (CellValue::Number(4.0), 7)
+        );
+        // Plain autofill up from B6: B4:B5 end absent.
+        let mut wb = held_column_b();
+        autofill(&mut wb, 0, &FillReq::new((5, 1, 5, 1), (3, 1)));
+        assert!(!has(&wb, "B4") && !has(&wb, "B5"));
+        // Copy B10:B12, paste on B1:B3.
+        let mut wb = held_column_b();
+        let clip = ClipBlock::capture(&wb, 0, vec![9, 10, 11], vec![1]);
+        let paste = paste_special_changes(&mut wb, 0, (0, 1), &clip, &PasteSpec::default());
+        for (r, c, cell) in paste.unwrap() {
+            wb.sheets[0].set_cell(r, c, cell);
+        }
+        assert_eq!(keys_in_col(&wb, 1), vec![(3, 1), (4, 1)], "B1:B3 absent");
+    }
+
+    /// #1660 r3 M1: Paste Special of cells from past the source's used rows
+    /// never mixes a style for them. No Borders and Values & Number Formats
+    /// onto a column whose style has a border write nothing past the used
+    /// rows, and an Add leaves held values as they were.
+    #[test]
+    fn paste_special_of_cells_past_the_used_rows_mixes_no_style() {
+        use crate::edit::{ClipBlock, PasteOp, PasteSpec, PasteWhat, paste_special_changes};
+        use crate::sheet::{MAX_ROWS, Xf};
+        let mut wb = held_column_b();
+        assert_eq!(wb.styles.intern(Xf::default()), 0);
+        // Column D's style: bordered and bold, so No Borders makes another
+        // (bold) style of it. The table holds it twice, D's the second, as a
+        // file may: re-interning it finds the first.
+        let bold_border = Xf {
+            border: true,
+            bold: true,
+            ..Xf::default()
+        };
+        wb.styles.xfs.push(bold_border.clone());
+        wb.styles.xfs.push(bold_border);
+        let bordered = wb.styles.xfs.len() as u32 - 1;
+        wb.sheets[0].col_defs.push(crate::sheet::ColDef {
+            min: 3,
+            max: 3,
+            width: None,
+            attrs: format!(r#"style="{bordered}""#),
+            default_width: false,
+            plain_width: false,
+        });
+        let paste = |wb: &mut Workbook, clip: &ClipBlock, spec: PasteSpec| {
+            for (r, c, cell) in paste_special_changes(wb, 0, (0, 3), clip, &spec).unwrap() {
+                wb.sheets[0].set_cell(r, c, cell);
+            }
+        };
+        let whole = ClipBlock::capture(&wb, 0, (0..MAX_ROWS).collect(), vec![1]);
+        let past = ClipBlock::capture(&wb, 0, (0..200).collect(), vec![1]);
+        for (clip, what) in [
+            (&whole, PasteWhat::AllExceptBorders),
+            (&past, PasteWhat::AllExceptBorders),
+            (&past, PasteWhat::ValuesAndNumberFormats),
+            (&past, PasteWhat::FormulasAndNumberFormats),
+        ] {
+            let mut wb = wb.clone();
+            paste(&mut wb, clip, PasteSpec::of(what));
+            let d: Vec<u32> = keys_in_col(&wb, 3).iter().map(|k| k.0).collect();
+            assert_eq!(d, vec![0, 1, 2, 3, 4], "{what:?}, {} rows", clip.rows.len());
+        }
+        // D1:D10 held: an All + Add of B1:B10 (B6:B10 past the used rows
+        // when copied) adds to D1:D5 and leaves D6:D10's values and styles
+        // alone; Formats gives D6:D10 the column's style, values kept.
+        let ten = ClipBlock::capture(&wb, 0, (0..10).collect(), vec![1]);
+        for r in 0..10 {
+            let cell = Cell {
+                style: 9,
+                ..Cell::number(10.0)
+            };
+            wb.sheets[0].set_cell(r, 3, cell);
+        }
+        let mut added = wb.clone();
+        let add = PasteSpec {
+            op: PasteOp::Add,
+            ..PasteSpec::default()
+        };
+        paste(&mut added, &ten, add);
+        assert_eq!(value_at(&added, "D1"), CellValue::Number(11.0));
+        for r in 6..=10 {
+            let at = format!("D{r}");
+            assert_eq!(value_at(&added, &at), CellValue::Number(10.0), "{at}");
+            assert_eq!(style_of(&added, &at), 9, "{at}");
+        }
+        paste(&mut wb, &ten, PasteSpec::of(PasteWhat::Formats));
+        for r in 6..=10 {
+            let at = format!("D{r}");
+            assert_eq!(value_at(&wb, &at), CellValue::Number(10.0), "{at}");
+            assert_eq!(style_of(&wb, &at), bordered, "{at}");
+        }
+    }
+
+    /// #1660 r4 M1: Values, Formulas and the Number Formats pastes of cells
+    /// from past the used rows clear a held cell's value and keep its own
+    /// format, as an empty source within them does: D6:D10 in style 9 stay
+    /// style 9 under an unstyled or a bordered column D, and end absent
+    /// where column D's own style is 9.
+    #[test]
+    fn values_from_past_the_used_rows_keep_a_held_cells_own_format() {
+        use crate::edit::{ClipBlock, PasteSpec, PasteWhat, paste_special_changes};
+        use crate::sheet::Xf;
+        for d_style in [None, Some(1), Some(9)] {
+            for what in [
+                PasteWhat::Values,
+                PasteWhat::Formulas,
+                PasteWhat::ValuesAndNumberFormats,
+                PasteWhat::FormulasAndNumberFormats,
+            ] {
+                let mut wb = held_column_b();
+                assert_eq!(wb.styles.intern(Xf::default()), 0);
+                let bordered = Xf {
+                    border: true,
+                    ..Xf::default()
+                };
+                assert_eq!(wb.styles.intern(bordered), 1);
+                if let Some(style) = d_style {
+                    wb.sheets[0].col_defs.push(crate::sheet::ColDef {
+                        min: 3,
+                        max: 3,
+                        width: None,
+                        attrs: format!(r#"style="{style}""#),
+                        default_width: false,
+                        plain_width: false,
+                    });
+                }
+                // B6:B10 are past the used rows when copied.
+                let ten = ClipBlock::capture(&wb, 0, (0..10).collect(), vec![1]);
+                for r in 0..10 {
+                    let cell = Cell {
+                        style: 9,
+                        ..Cell::number(10.0)
+                    };
+                    wb.sheets[0].set_cell(r, 3, cell);
+                }
+                let spec = PasteSpec::of(what);
+                for (r, c, cell) in paste_special_changes(&mut wb, 0, (0, 3), &ten, &spec).unwrap()
+                {
+                    wb.sheets[0].set_cell(r, c, cell);
+                }
+                let when = format!("{what:?}, column D style {d_style:?}");
+                assert_eq!(value_at(&wb, "D1"), CellValue::Number(1.0), "{when}");
+                for r in 6..=10 {
+                    let at = format!("D{r}");
+                    let d = wb.sheets[0].cell(r - 1, 3);
+                    if d_style == Some(9) {
+                        assert_eq!(d, None, "{when}: {at}");
+                    } else {
+                        let want = Cell {
+                            style: 9,
+                            ..Cell::default()
+                        };
+                        assert_eq!(d, Some(&want), "{when}: {at}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// #1660 r2 M1: Sheet2!B1:B100 (column B styled, rows 1-5 used) pasted on
+    /// Sheet1!D1:D100, held: a styled D keeps no pins past row 5, an
+    /// unstyled D is cleared there, as a paste of empty cells clears it.
+    #[test]
+    fn a_cross_sheet_copy_past_its_used_rows_clears_the_target() {
+        use crate::edit::{ClipBlock, PasteSpec, paste_special_changes};
+        for d_styled in [true, false] {
+            let mut wb = held_column_b();
+            let mut target = Sheet {
+                name: "Sheet1".into(),
+                ..Sheet::default()
+            };
+            for r in 0..100 {
+                target.set_cell(r, 3, Cell::number(1.0));
+            }
+            if d_styled {
+                target.col_defs.push(crate::sheet::ColDef {
+                    min: 3,
+                    max: 3,
+                    width: None,
+                    attrs: r#"style="8""#.to_string(),
+                    default_width: false,
+                    plain_width: false,
+                });
+            }
+            wb.sheets.insert(0, target);
+            let clip = ClipBlock::capture(&wb, 1, (0..100).collect(), vec![1]);
+            let paste = paste_special_changes(&mut wb, 0, (0, 3), &clip, &PasteSpec::default());
+            for (r, c, cell) in paste.unwrap() {
+                wb.sheets[0].set_cell(r, c, cell);
+            }
+            let d: Vec<u32> = wb.sheets[0].cells.keys().map(|k| k.0).collect();
+            assert_eq!(d, vec![0, 1, 2, 3, 4], "styled D {d_styled}");
+        }
+    }
+
+    /// #1660: B1 spills B1:B3 in a styled column; `x` typed in B2 blocks it
+    /// and is undone. The spill member's snapshot is absent, so the undo
+    /// leaves no default-style pin, under manual calculation too.
+    #[test]
+    fn undo_of_typed_spill_member_leaves_no_pin() {
+        let blank = |style| Cell {
+            style,
+            ..Cell::default()
+        };
+        // `s0`: B2 holds style 0, as a file saved before spill output took
+        // its column's style; otherwise the spill made B2 with column B's 7.
+        for (manual, s0) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut wb = pinned_wb(&[]);
+            let mut eng = Engine::new(&wb);
+            set(&mut eng, &mut wb, "B1", array_formula("SEQUENCE(3)"));
+            assert_eq!(value_at(&wb, "B2"), CellValue::Number(2.0));
+            assert_eq!(style_of(&wb, "B2"), 7);
+            if s0 {
+                wb.sheets[0].cells.get_mut(&(1, 1)).unwrap().style = 0;
+            }
+            if manual {
+                wb.calc.mode = CalcMode::Manual;
+            }
+            let before = crate::sheet::snapshot_cells(&wb.sheets[0], &[(1, 1)], |_, _| false);
+            let want = if s0 { None } else { Some(blank(7)) };
+            assert_eq!(before, vec![want]);
+            set(&mut eng, &mut wb, "B2", Cell::text("x"));
+            let undo: Vec<_> = before.into_iter().map(|c| (1, 1, c)).collect();
+            eng.restore_snapshot(&mut wb, 0, &undo);
+            let b2 = wb.sheets[0].cell(1, 1);
+            let when = format!("manual {manual}, s0 {s0}");
+            assert!(b2.is_none_or(|c| !c.is_blank()), "{when}: B2 is {b2:?}");
+            if !manual {
+                assert_eq!(value_at(&wb, "B2"), CellValue::Number(2.0), "{when}");
+                // B2 is back as it was: its own style, 0 or the column's.
+                assert_eq!(style_of(&wb, "B2"), if s0 { 0 } else { 7 }, "{when}");
+            }
+        }
+        // A styled member still snapshots as its styled blank.
+        let mut wb = pinned_wb(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "A1", array_formula("SEQUENCE(3)"));
+        eng.set_styles(&mut wb, 0, &[(1, 0, 9)]);
+        let snap = crate::sheet::snapshot_cells(&wb.sheets[0], &[(1, 0)], |_, _| false);
+        assert_eq!(
+            snap,
+            vec![Some(Cell {
+                style: 9,
+                ..Cell::default()
+            })]
+        );
+    }
+
+    /// #1660 r1 M2: a spill shrunk and grown again in a styled column comes
+    /// back in the column's style: a member cleared to that style is absent,
+    /// and the re-spill makes it with the style, not as a default-style pin.
+    #[test]
+    fn a_respill_in_a_styled_column_keeps_the_columns_style() {
+        let mut wb = pinned_wb(&[("A1", Cell::number(3.0))]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "B1", array_formula("SEQUENCE(A1)"));
+        // B3 is in row 3, whose style 5 wins over column B's 7.
+        assert_eq!((style_of(&wb, "B2"), style_of(&wb, "B3")), (7, 5));
+        set(&mut eng, &mut wb, "A1", Cell::number(1.0));
+        assert!(!has(&wb, "B2") && !has(&wb, "B3"));
+        set(&mut eng, &mut wb, "A1", Cell::number(3.0));
+        assert_eq!(value_at(&wb, "B3"), CellValue::Number(3.0));
+        assert_eq!((style_of(&wb, "B2"), style_of(&wb, "B3")), (7, 5));
+        // Row 3's style wins over column B's; an unstyled column stays 0;
+        // a member's own style is kept through a recalc.
+        set(&mut eng, &mut wb, "C1", array_formula("SEQUENCE(3)"));
+        assert_eq!((style_of(&wb, "C2"), style_of(&wb, "C3")), (0, 5));
+        eng.set_styles(&mut wb, 0, &[(1, 1, 9)]);
+        set(&mut eng, &mut wb, "A1", Cell::number(2.0));
+        set(&mut eng, &mut wb, "A1", Cell::number(3.0));
+        assert_eq!(style_of(&wb, "B2"), 9);
+        // A legacy CSE block's absent cells take the style the same way.
+        let mut cse = Cell::formula("{1;2;3}");
+        cse.f_attrs = Some(r#"t="array" ref="D1:D3""#.to_string());
+        wb.sheets[0].col_defs.push(crate::sheet::ColDef {
+            min: 3,
+            max: 3,
+            width: None,
+            attrs: r#"style="7""#.to_string(),
+            default_width: false,
+            plain_width: false,
+        });
+        eng.restore_cell(&mut wb, (0, 0, 3), cse);
+        assert_eq!(value_at(&wb, "D2"), CellValue::Number(2.0));
+        assert_eq!(style_of(&wb, "D2"), 7);
     }
 
     #[test]

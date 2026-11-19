@@ -138,3 +138,85 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   the model is no change and no new relationship. An `.xls` File moniker's path
   is native and read as it is; URL and string monikers go through
   `model_target`.
+
+## An absent cell's inherited row or column style (#1660)
+
+- In Excel, an absent cell under a row style (`<row s=.. customFormat="1">`)
+  or a column style (`<col style=..>`) shows that style, so an explicit blank
+  s0 cell there pins General (#1064, #1097).
+  - `Sheet::inherited_style(r, c)` is the row's style (`row_style`), else the
+    column's (`col_style`), else 0.
+  - "Row over column" is an assumption, taken from how Excel materialises a
+    new cell in a formatted row.
+  - `pins_default` is `inherited_style != 0`. An `s` or `style` of 0, or one
+    that cannot be read, gives 0.
+- **Copies, fills and moves** read through `Sheet::copy_reader()`
+  (`CopyReader`). A held cell is cloned. An absent cell inside the sheet's
+  used extent (`used_size`, taken once) reads as a blank of its inherited
+  style. Each row's and column's style is looked up once. Its users:
+  - `ClipBlock::capture`;
+  - `fill_changes`, and `autofill`'s absent Copy source (`absent_style`);
+  - xlsxy's `copy` and gridwasm's `record_clip`, through `cell_opt`: `None`
+    while the style is 0, and the TSV still comes from the real cell;
+  - the suite's `cut_still_live` and `paste_move`. They must read exactly what
+    `capture` stored, or every cut over such a cell is cancelled.
+- **Past the used extent** (`past_extent`), an absent source reads as a
+  default blank. Every writer lands it as the *destination's* absence,
+  `CopyReader::absent_cell` on a reader of the destination's sheet. That is
+  a blank of the destination's inherited style, which
+  `set_cell` drops, so a held target ends absent and nothing is made where
+  nothing was. A whole styled column copied elsewhere writes no million
+  styled blanks, and a held cell in a styled column gets no s0 pin. The
+  writers:
+  - `fill_changes` and `autofill` (also FormatsOnly);
+  - `paste_special_changes`, through `ClipBlock::used` and `lands_absent`.
+    It never mixes a style for such a cell (No Borders and the Number
+    Formats pastes would intern a new one). An absent destination gets
+    nothing. An operation (Add and the rest) leaves a held destination's
+    value and style alone: there is no operand. Otherwise, over a held
+    destination:
+    - All, No Borders, All and Column Widths, and Values and Source
+      Formatting land the destination's absence.
+    - Formats keeps the value with the inherited style.
+    - Values, Formulas and both Number Formats pastes keep the cell's own
+      style and clear its value, as an empty source inside the extent does.
+      The source brings no number format.
+  - the suite's tiled copy (`ClipBlock::land_absent`) and `paste_move`;
+  - xlsxy's paste and gridwasm's `paste_own_clip`, through the extent kept
+    in `ClipData` or `GridClip`. xlsxy's Paste Special sets `ClipBlock::used`
+    from it.
+  - This differs from Excel, which would carry the source's format there:
+    a whole-column copy in Excel copies the `<col>` style itself, and that
+    is out of scope.
+- **Paste Special's own destination** `d` is read through the destination's
+  reader: the held cell, or `absent_cell`, with no extent bound. So Values
+  keeps an absent cell's inherited format.
+- **Entries** are read under `Sheet::entry_style_at`: the cell's own style,
+  or an absent cell's inherited one. Its users:
+  - typing (`entry_cell_ctx`, `typed_formula`, so Ctrl+Enter too);
+  - text pasted from outside: xlsxy, gridwasm, and the suite's `fields_block`;
+  - AutoSum, in the suite and xlsxy;
+  - xlsxy's data form, for a record's own field. A new record reads the field
+    above it, or the new cell's inherited style when that field is absent.
+  - So `15` in a `0%` column is 15%, and a Text column keeps `=1+1` as text.
+- **`Sheet::set_cell`** never stores a blank of exactly the slot's non-zero
+  inherited style, whether or not the slot holds a cell. Such a blank is the
+  absence written out.
+  - Blank s0 keeps the #1097 rule: it is dropped over an absent slot and kept
+    over a present pinned one, so Del keeps a file pin.
+  - The loader inserts cells directly, so a file's blank `s=` cells
+    round-trip as they were.
+- **Cuts** clear their source to its inherited style, so it ends absent: the
+  suite's `paste_move` and xlsxy's paste. xlsxy's cut also blanks the
+  target cells it covers past its used cells to the target's inherited
+  style. gridwasm's cut clears contents only, as Del does.
+- **Spill output**: a dynamic array's or legacy CSE block's absent member is
+  made with its inherited style (`engine::spill_slot`), as Excel saves spill
+  output in a formatted column. A member's own style, and the anchor, are
+  kept. So a spill shrunk and grown again in a `0%` column stays `0%`.
+  - `snapshot_cells` records a live spill member of style 0 (a file's, from
+    before) as `None`.
+  - A member of its inherited style is `Some(blank)`, which `set_cell` drops
+    on restore.
+  - Either way, the undo of a value typed over a member leaves no pin, under
+    manual calculation too.
