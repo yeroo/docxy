@@ -442,6 +442,42 @@ fn find_counts_steps_and_wraps_over_pages() {
     assert_eq!(v.find_status(), "No matches");
 }
 
+/// FIX r2: a page's text coming in searches that page alone; the hits end
+/// in page order as a full search's, and the current hit stays the same.
+#[test]
+fn a_page_text_coming_in_searches_that_page_alone() {
+    let mut v = view(4);
+    v.find.field.text = "hello".into();
+    v.find_changed();
+    let texts = [
+        page_text(&["hello one", "hello two"]),
+        page_text(&["nothing"]),
+        page_text(&["hello three"]),
+        page_text(&["say hello", "hello again"]),
+    ];
+    let arrive = |v: &mut PdfView, page: usize| {
+        let before = v.find.searched;
+        v.absorb(Done {
+            op: Op::Text { page },
+            answer: Answer::Text(texts[page].clone()),
+        });
+        assert_eq!(v.find.searched, before + 1, "page {page} alone");
+    };
+    arrive(&mut v, 2);
+    v.find_step(true);
+    let current = v.find.hits[v.find.current.unwrap()].clone();
+    assert_eq!(current.page, 2);
+    for page in [3, 0, 1] {
+        arrive(&mut v, page);
+        assert_eq!(v.find.hits[v.find.current.unwrap()], current, "same hit");
+    }
+    let spliced = v.find.hits.clone();
+    v.refind();
+    assert_eq!(spliced, v.find.hits);
+    assert_eq!(v.find.hits.len(), 5);
+    assert_eq!(v.find.hits[v.find.current.unwrap()], current);
+}
+
 #[test]
 fn find_says_what_it_has_not_read_and_what_is_incomplete() {
     let mut v = view(3);

@@ -265,9 +265,10 @@ pub(crate) struct Find {
     pub whole: bool,
     pub hits: Vec<Hit>,
     pub current: Option<usize>,
-    /// The hits need finding again (the query, an option or a page's text
-    /// changed).
-    dirty: bool,
+    /// Pages searched so far (the tests' check that a page's text coming
+    /// in searches that page alone).
+    #[cfg(test)]
+    pub searched: usize,
 }
 
 /// One PDF, open in a tab.
@@ -495,9 +496,6 @@ impl PdfView {
                 self.fail(&op, worker::DIED.into());
             }
         }
-        if self.find.dirty {
-            self.refind();
-        }
     }
 
     /// An answer in.
@@ -526,7 +524,7 @@ impl PdfView {
             }
             (Op::Text { page }, Answer::Text(t)) if page < self.page_count() => {
                 self.texts[page] = Some(t);
-                self.find.dirty = true;
+                self.find_on_page(page);
             }
             (op, Answer::Failed(why)) => self.fail(&op, why),
             _ => {}
@@ -540,7 +538,6 @@ impl PdfView {
             }
             Op::Text { page } => {
                 self.text_failed.insert(page, why);
-                self.find.dirty = true;
             }
             Op::Info => {}
         }
@@ -867,14 +864,50 @@ impl PdfView {
         self.refind();
     }
 
-    /// Whether the hits wait to be found again (a page's text came in).
-    pub(crate) fn find_dirty(&self) -> bool {
-        self.find.dirty
+    /// The query's hits on `page`, whose text is in.
+    fn hits_on(&mut self, page: usize) -> Vec<Hit> {
+        let q = &self.find.field.text;
+        let Some(t) = self.texts.get(page).and_then(Option::as_ref) else {
+            return Vec::new();
+        };
+        if q.trim().is_empty() {
+            return Vec::new();
+        }
+        #[cfg(test)]
+        {
+            self.find.searched += 1;
+        }
+        t.find_opts(q, self.find.case, self.find.whole)
+            .into_iter()
+            .map(|glyphs| Hit { page, glyphs })
+            .collect()
+    }
+
+    /// A page's text came in: its hits join the others in page order, and
+    /// the current hit stays the same hit. Only that page is searched.
+    fn find_on_page(&mut self, page: usize) {
+        let new = self.hits_on(page);
+        if new.is_empty() {
+            return;
+        }
+        let at = self.find.hits.partition_point(|h| h.page < page);
+        let end = self.find.hits.partition_point(|h| h.page <= page);
+        let n = new.len();
+        let removed = end - at;
+        self.find.hits.splice(at..end, new);
+        if let Some(k) = self.find.current {
+            self.find.current = if k >= end {
+                Some(k - removed + n)
+            } else if k >= at {
+                None
+            } else {
+                Some(k)
+            };
+        }
     }
 
     /// Find again over every page whose text is in.
     pub(crate) fn refind(&mut self) {
-        self.find.dirty = false;
         let q = self.find.field.text.clone();
         let keep = self
             .find
@@ -885,12 +918,9 @@ impl PdfView {
             self.find.current = None;
             return;
         }
-        for (p, t) in self.texts.iter().enumerate() {
-            if let Some(t) = t {
-                for glyphs in t.find_opts(&q, self.find.case, self.find.whole) {
-                    self.find.hits.push(Hit { page: p, glyphs });
-                }
-            }
+        for p in 0..self.page_count() {
+            let hits = self.hits_on(p);
+            self.find.hits.extend(hits);
         }
         self.find.current = keep.and_then(|h| self.find.hits.iter().position(|x| *x == h));
     }
@@ -942,9 +972,6 @@ impl PdfView {
     /// Go to the next hit (`forward`) or the previous one, wrapping; with
     /// none current, the first one from the page shown on. It is selected.
     pub(crate) fn find_step(&mut self, forward: bool) {
-        if self.find.dirty {
-            self.refind();
-        }
         let m = self.find.hits.len();
         if m == 0 {
             return;

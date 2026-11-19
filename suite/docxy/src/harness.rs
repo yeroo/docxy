@@ -1914,7 +1914,6 @@ fn pdf_read(app: &crate::Docxy, args: &Json) -> Result<Done, String> {
             .all(|p| *p >= n || v.texts[*p].is_some() || v.text_failed.contains_key(p))
         && (!idle
             || (!v.busy()
-                && !v.find_dirty()
                 && !v.copy_waits()
                 && (v.find.field.text.is_empty() && !v.want_all_text || v.unread_pages() == 0)));
     let mut done = Done::ok(v.read_json())?;
