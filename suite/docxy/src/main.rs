@@ -5196,7 +5196,7 @@ impl SheetView {
         clip: &GridClip,
         step: &'static str,
     ) -> Result<GridPasted, GridPasteError> {
-        use gridcore::sheet::{Cell, MAX_COLS, MAX_ROWS, is_array_f};
+        use gridcore::sheet::{MAX_COLS, MAX_ROWS, is_array_f};
         let (fr0, fc0, fr1, fc1) = clip.rect;
         let (h, w) = (fr1 - fr0 + 1, fc1 - fc0 + 1);
         let (r0, c0, r1, c1) = self.range();
@@ -5251,17 +5251,8 @@ impl SheetView {
                 let overwritten =
                     src == dst && (r0..r0 + h).contains(&r) && (c0..c0 + w).contains(&c);
                 if sheet.cell(r, c).is_some() && !overwritten {
-                    // Cleared to its absence: the style its row or column
-                    // gives it, not a default-style pin (#1660).
-                    let style = sheet.inherited_style(r, c);
-                    clears.push((
-                        r,
-                        c,
-                        Cell {
-                            style,
-                            ..Cell::default()
-                        },
-                    ));
+                    // Cleared to its absence, not a default-style pin (#1660).
+                    clears.push((r, c, read.absent_cell(r, c)));
                 }
                 row.push(cell);
             }

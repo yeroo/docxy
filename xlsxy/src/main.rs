@@ -5187,26 +5187,17 @@ impl App {
                 let mut clears = Vec::new();
                 if cut {
                     let (fr, fc) = clip.from;
-                    let source = &self.pkg.workbook.sheets[src];
+                    let source = self.pkg.workbook.sheets[src].copy_reader();
                     for (dr, row) in clip.cells.iter().enumerate() {
                         for (dc, cell) in row.iter().enumerate() {
                             // A cell pushed off the grid's edge isn't
                             // written, so its source stays.
                             let (dr, dc) = (dr as u32, dc as u32);
                             if cell.is_some() && r0 + dr < MAX_ROWS && c0 + dc < MAX_COLS {
-                                // Cleared to its absence: the style its row or
-                                // column gives it, not a default-style pin
-                                // (#1660).
+                                // Cleared to its absence, not a default-style
+                                // pin (#1660).
                                 let (r, c) = (fr + dr, fc + dc);
-                                let style = source.inherited_style(r, c);
-                                clears.push((
-                                    r,
-                                    c,
-                                    Cell {
-                                        style,
-                                        ..Cell::default()
-                                    },
-                                ));
+                                clears.push((r, c, source.absent_cell(r, c)));
                             }
                         }
                     }
@@ -5330,14 +5321,12 @@ impl App {
                     let mut seen: std::collections::HashSet<(u32, u32)> =
                         clears.iter().map(|cell| (cell.0, cell.1)).collect();
                     let target = &self.pkg.workbook.sheets[here];
+                    let landing = target.copy_reader();
                     for &(r, c) in target.cells.keys() {
                         if inside(r, c) && !written.contains(&(r, c)) {
-                            // Blanked to its absence: the style its row or
-                            // column gives it, not a default-style pin (#1660).
-                            let blank = Cell {
-                                style: target.inherited_style(r, c),
-                                ..Cell::default()
-                            };
+                            // Blanked to its absence, not a default-style pin
+                            // (#1660).
+                            let blank = landing.absent_cell(r, c);
                             if !same_sheet {
                                 blanks.push((r, c, blank));
                             } else if seen.insert((r, c)) {

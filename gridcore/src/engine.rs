@@ -5272,6 +5272,72 @@ mod tests {
         }
     }
 
+    /// #1660 r4 M1: Values, Formulas and the Number Formats pastes of cells
+    /// from past the used rows clear a held cell's value and keep its own
+    /// format, as an empty source within them does: D6:D10 in style 9 stay
+    /// style 9 under an unstyled or a bordered column D, and end absent
+    /// where column D's own style is 9.
+    #[test]
+    fn values_from_past_the_used_rows_keep_a_held_cells_own_format() {
+        use crate::edit::{ClipBlock, PasteSpec, PasteWhat, paste_special_changes};
+        use crate::sheet::Xf;
+        for d_style in [None, Some(1), Some(9)] {
+            for what in [
+                PasteWhat::Values,
+                PasteWhat::Formulas,
+                PasteWhat::ValuesAndNumberFormats,
+                PasteWhat::FormulasAndNumberFormats,
+            ] {
+                let mut wb = held_column_b();
+                assert_eq!(wb.styles.intern(Xf::default()), 0);
+                let bordered = Xf {
+                    border: true,
+                    ..Xf::default()
+                };
+                assert_eq!(wb.styles.intern(bordered), 1);
+                if let Some(style) = d_style {
+                    wb.sheets[0].col_defs.push(crate::sheet::ColDef {
+                        min: 3,
+                        max: 3,
+                        width: None,
+                        attrs: format!(r#"style="{style}""#),
+                        default_width: false,
+                        plain_width: false,
+                    });
+                }
+                // B6:B10 are past the used rows when copied.
+                let ten = ClipBlock::capture(&wb, 0, (0..10).collect(), vec![1]);
+                for r in 0..10 {
+                    let cell = Cell {
+                        style: 9,
+                        ..Cell::number(10.0)
+                    };
+                    wb.sheets[0].set_cell(r, 3, cell);
+                }
+                let spec = PasteSpec::of(what);
+                for (r, c, cell) in paste_special_changes(&mut wb, 0, (0, 3), &ten, &spec).unwrap()
+                {
+                    wb.sheets[0].set_cell(r, c, cell);
+                }
+                let when = format!("{what:?}, column D style {d_style:?}");
+                assert_eq!(value_at(&wb, "D1"), CellValue::Number(1.0), "{when}");
+                for r in 6..=10 {
+                    let at = format!("D{r}");
+                    let d = wb.sheets[0].cell(r - 1, 3);
+                    if d_style == Some(9) {
+                        assert_eq!(d, None, "{when}: {at}");
+                    } else {
+                        let want = Cell {
+                            style: 9,
+                            ..Cell::default()
+                        };
+                        assert_eq!(d, Some(&want), "{when}: {at}");
+                    }
+                }
+            }
+        }
+    }
+
     /// #1660 r2 M1: Sheet2!B1:B100 (column B styled, rows 1-5 used) pasted on
     /// Sheet1!D1:D100, held: a styled D keeps no pins past row 5, an
     /// unstyled D is cleared there, as a paste of empty cells clears it.

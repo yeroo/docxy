@@ -171,10 +171,16 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   - `fill_changes` and `autofill` (also FormatsOnly);
   - `paste_special_changes`, through `ClipBlock::used` and `lands_absent`.
     It never mixes a style for such a cell (No Borders and the Number
-    Formats pastes would intern a new one). A held destination becomes its
-    absence, and Formats keeps the value with the inherited style. An
-    operation (Add and the rest) leaves the value and style alone: there is
-    no operand. An absent destination gets nothing.
+    Formats pastes would intern a new one). An absent destination gets
+    nothing. An operation (Add and the rest) leaves a held destination's
+    value and style alone: there is no operand. Otherwise, over a held
+    destination:
+    - All, No Borders, All and Column Widths, and Values and Source
+      Formatting land the destination's absence.
+    - Formats keeps the value with the inherited style.
+    - Values, Formulas and both Number Formats pastes keep the cell's own
+      style and clear its value, as an empty source inside the extent does.
+      The source brings no number format.
   - the suite's tiled copy (`ClipBlock::land_absent`) and `paste_move`;
   - xlsxy's paste and gridwasm's `paste_own_clip`, through the extent kept
     in `ClipData` or `GridClip`. xlsxy's Paste Special sets `ClipBlock::used`

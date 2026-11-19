@@ -394,13 +394,15 @@ pub fn frozen_spill_keys(
 /// up once.
 ///
 /// Past the used extent ([`CopyReader::past_extent`]) an absent cell reads as
-/// a default blank, and its writer lands it as the *destination's* absence
-/// ([`CopyReader::absent_cell`] on the destination), which [`Sheet::set_cell`]
-/// drops, whatever is pasted (Paste Special mixes no style for it): a held target
-/// ends absent, and nothing is made where nothing was, so a copy of a whole
-/// styled column makes no million styled blanks wherever it lands. Excel
-/// would carry the source's format there (a whole-column copy copies the
-/// `<col>` style itself); this model does not.
+/// a default blank. A copy, fill or move lands it as the *destination's*
+/// absence ([`CopyReader::absent_cell`] on the destination), which
+/// [`Sheet::set_cell`] drops: a held target ends absent, and nothing is made
+/// where nothing was, so a copy of a whole styled column makes no million
+/// styled blanks wherever it lands. Paste Special never mixes a style for it
+/// and lands it per kind of paste ([`crate::edit::paste_special_changes`]): a
+/// paste in the destination's own format (Values, Formulas) clears only a
+/// held cell's value. Excel would carry the source's format there (a
+/// whole-column copy copies the `<col>` style itself); this model does not.
 pub struct CopyReader<'a> {
     sheet: &'a Sheet,
     used: (u32, u32),

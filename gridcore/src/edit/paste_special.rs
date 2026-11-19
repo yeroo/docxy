@@ -652,24 +652,45 @@ pub fn paste_special_changes(
                 continue;
             }
             // An absent source from past its sheet's used extent is nothing
-            // at all: it lands as the destination's absence, whatever is
-            // pasted, and never mixes a style of its own (#1660 r3).
+            // at all: it never mixes a style of its own (#1660 r3). Over a
+            // held cell it lands as the destination's absence where its
+            // format is pasted too, and clears only the value where the
+            // destination's format is kept (r4).
             if clip.lands_absent((i, j)) {
                 // Nothing lands where nothing is.
                 let Some(held) = s.cell(dest.0, dest.1) else {
                     continue;
                 };
-                let absent = read.absent_cell(dest.0, dest.1);
-                let cell = if spec.op != PasteOp::None {
+                if spec.op != PasteOp::None {
                     // No operand: the destination's value and format stay.
                     continue;
-                } else if spec.what == PasteWhat::Formats {
-                    Cell {
+                }
+                let absent = read.absent_cell(dest.0, dest.1);
+                let cell = match spec.what {
+                    // Its format: the destination's inherited one, value kept.
+                    PasteWhat::Formats => Cell {
                         style: absent.style,
                         ..held.clone()
-                    }
-                } else {
-                    absent
+                    },
+                    // Pasted in the destination's own format, which stays: an
+                    // empty source clears the value. It brings no number
+                    // format of its own to mix in (#1660 r4).
+                    PasteWhat::Formulas
+                    | PasteWhat::Values
+                    | PasteWhat::FormulasAndNumberFormats
+                    | PasteWhat::ValuesAndNumberFormats => Cell {
+                        style: held.style,
+                        ..Cell::default()
+                    },
+                    // Contents and format: the destination's absence. (Notes,
+                    // validation and column widths return above.)
+                    PasteWhat::All
+                    | PasteWhat::AllExceptBorders
+                    | PasteWhat::AllAndColumnWidths
+                    | PasteWhat::ValuesAndSourceFormatting
+                    | PasteWhat::Comments
+                    | PasteWhat::Validation
+                    | PasteWhat::ColumnWidths => absent,
                 };
                 out.push((dest.0, dest.1, cell));
                 continue;
