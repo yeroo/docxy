@@ -5071,11 +5071,10 @@ impl App {
         // An absent cell is copied as a blank with the style it inherits from
         // its row or column, when that is not the default (#1660): pasted, it
         // is the cell's absence, not a default-style pin.
-        let col_styles: Vec<u32> = (c1..=c2).map(|c| sheet.col_style(c)).collect();
+        let read = sheet.copy_reader();
         for r in r1..=r2 {
             let mut row = Vec::new();
-            let row_style = sheet.row_style(r);
-            for (c, &col_style) in (c1..=c2).zip(&col_styles) {
+            for c in c1..=c2 {
                 if c > c1 {
                     tsv.push('\t');
                 }
@@ -5086,13 +5085,7 @@ impl App {
                     let shown = format_with(&xf, &cl.value, self.pkg.workbook.date1904);
                     tsv.push_str(&gridcore::entry::copy_field(cl, &xf, shown));
                 }
-                let inherited = row_style.unwrap_or(col_style);
-                row.push(cell.or_else(|| {
-                    (inherited != 0).then(|| Cell {
-                        style: inherited,
-                        ..Cell::default()
-                    })
-                }));
+                row.push(read.cell_opt(r, c));
             }
             tsv.push('\n');
             rows.push(row);
@@ -5321,12 +5314,19 @@ impl App {
                     };
                     let mut seen: std::collections::HashSet<(u32, u32)> =
                         clears.iter().map(|cell| (cell.0, cell.1)).collect();
-                    for &(r, c) in self.pkg.workbook.sheets[here].cells.keys() {
+                    let target = &self.pkg.workbook.sheets[here];
+                    for &(r, c) in target.cells.keys() {
                         if inside(r, c) && !written.contains(&(r, c)) {
+                            // Blanked to its absence: the style its row or
+                            // column gives it, not a default-style pin (#1660).
+                            let blank = Cell {
+                                style: target.inherited_style(r, c),
+                                ..Cell::default()
+                            };
                             if !same_sheet {
-                                blanks.push((r, c, Cell::default()));
+                                blanks.push((r, c, blank));
                             } else if seen.insert((r, c)) {
-                                clears.push((r, c, Cell::default()));
+                                clears.push((r, c, blank));
                             }
                         }
                     }
@@ -17651,6 +17651,39 @@ mod tests {
         app.cur = (3, 0);
         app.copy(false);
         assert_eq!(app.clip.as_ref().unwrap().cells, vec![vec![None]]);
+    }
+
+    /// #1660 r1 p1: a cut from another sheet blanks the target cells its
+    /// selection covers past its used cells. In a styled column they end
+    /// absent, not as default-style pins. A whole styled column copied
+    /// writes only its used rows.
+    #[test]
+    fn a_cut_blanks_its_target_to_absence_in_a_styled_column() {
+        let mut app = app_with_styled_column_b();
+        app.apply(vec![(59, 1, Cell::number(6.0))]); // B60
+        app.open_prompt(PromptKind::AddSheet);
+        app.prompt.as_mut().unwrap().text = "Data".to_string();
+        app.commit_prompt();
+        app.goto_sheet(1);
+        app.apply(vec![(0, 0, Cell::number(1.0))]);
+        app.anchor = Some((0, 0));
+        app.cur = (99, 0);
+        app.copy(true); // A1:A100, used A1 only
+        app.goto_sheet(0);
+        app.anchor = None;
+        app.cur = (39, 1);
+        app.paste();
+        assert_eq!(value_at(&app, 39, 1), CellValue::Number(1.0));
+        assert_eq!(app.sheet().cell(59, 1), None, "B60 is absent, not a pin");
+        // Column B whole, copied to D: D1:D60 at most, never further.
+        app.anchor = Some((0, 1));
+        app.cur = (MAX_ROWS - 1, 1);
+        app.copy(false);
+        app.anchor = None;
+        app.cur = (0, 3);
+        app.paste();
+        let d = app.sheet().cells.keys().filter(|k| k.1 == 3);
+        assert!(d.clone().count() > 0 && d.clone().all(|k| k.0 < 60));
     }
 
     /// #1660: B1 spills B1:B3 in a styled column under manual calculation;

@@ -6,6 +6,7 @@
 //! a sparse `BTreeMap` so memory is proportional to content, and iteration is
 //! naturally row-major (the order worksheet XML wants).
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::names::name_eq;
@@ -383,6 +384,64 @@ pub fn frozen_spill_keys(
         }
     }
     out
+}
+
+/// How a copy, fill or move reads a sheet's cells (#1660): a held cell as it
+/// is, and an absent one as a blank with the style it inherits from its row
+/// or column ([`Sheet::inherited_style`]), so writing the copy means "as if
+/// absent" rather than a default-style pin. Only inside the sheet's used
+/// extent ([`Sheet::used_size`], taken once): past it an absent cell reads as
+/// a default blank, which writes nothing, so a copy of a whole styled column
+/// does not make a million styled blanks wherever it lands. Each row's and
+/// column's style is looked up once.
+pub struct CopyReader<'a> {
+    sheet: &'a Sheet,
+    used: (u32, u32),
+    rows: RefCell<HashMap<u32, Option<u32>>>,
+    cols: RefCell<HashMap<u32, u32>>,
+}
+
+impl CopyReader<'_> {
+    /// The style an absent cell at `(row, col)` is copied with: the one it
+    /// inherits inside the used extent, 0 past it.
+    pub fn absent_style(&self, row: u32, col: u32) -> u32 {
+        if row >= self.used.0 || col >= self.used.1 {
+            return 0;
+        }
+        let row_style = *self
+            .rows
+            .borrow_mut()
+            .entry(row)
+            .or_insert_with(|| self.sheet.row_style(row));
+        row_style.unwrap_or_else(|| {
+            *self
+                .cols
+                .borrow_mut()
+                .entry(col)
+                .or_insert_with(|| self.sheet.col_style(col))
+        })
+    }
+
+    /// The cell at `(row, col)` as the copy reads it.
+    pub fn cell(&self, row: u32, col: u32) -> Cell {
+        self.sheet.cell(row, col).cloned().unwrap_or_else(|| Cell {
+            style: self.absent_style(row, col),
+            ..Cell::default()
+        })
+    }
+
+    /// [`CopyReader::cell`] for a clip that holds absent cells as `None`: an
+    /// absent cell copied with the default style stays `None`.
+    pub fn cell_opt(&self, row: u32, col: u32) -> Option<Cell> {
+        if let Some(cell) = self.sheet.cell(row, col) {
+            return Some(cell.clone());
+        }
+        let style = self.absent_style(row, col);
+        (style != 0).then(|| Cell {
+            style,
+            ..Cell::default()
+        })
+    }
 }
 
 impl Cell {
@@ -1725,10 +1784,20 @@ impl Sheet {
         self.row_style(row).unwrap_or_else(|| self.col_style(col))
     }
 
-    /// The cell at `(row, col)` as a copy or fill reads it: the cell held
-    /// there, or a blank with the style the absent cell inherits
-    /// ([`Sheet::inherited_style`]), so pasting it means "as if absent"
-    /// rather than a default-style pin (#1660).
+    /// How a copy, fill or move reads this sheet's cells ([`CopyReader`]).
+    pub fn copy_reader(&self) -> CopyReader<'_> {
+        CopyReader {
+            sheet: self,
+            used: self.used_size(),
+            rows: RefCell::new(HashMap::new()),
+            cols: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// The cell at `(row, col)` as one destination reads it (Paste Special's
+    /// own cell): the cell held there, or a blank with the style the absent
+    /// cell inherits ([`Sheet::inherited_style`]). A copy, fill or move of
+    /// many cells reads through [`Sheet::copy_reader`] instead (#1660).
     pub fn copied_cell(&self, row: u32, col: u32) -> Cell {
         self.cell(row, col).cloned().unwrap_or_else(|| Cell {
             style: self.inherited_style(row, col),

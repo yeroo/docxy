@@ -222,9 +222,10 @@ pub fn fill_changes(
     dir: FillDir,
 ) -> Vec<(u32, u32, Cell)> {
     let mut changes = Vec::new();
+    // An absent source carries the style it inherits (#1660).
+    let read = sheet.copy_reader();
     let mut copy_from = |sr: u32, sc: u32, tr: u32, tc: u32| {
-        // An absent source carries the style it inherits (#1660).
-        let mut cell = sheet.copied_cell(sr, sc);
+        let mut cell = read.cell(sr, sc);
         copy_meta(&mut cell);
         if let Some(f) = &cell.formula {
             if let Some(t) = translate_formula(f, tr as i64 - sr as i64, tc as i64 - sc as i64) {
@@ -764,6 +765,7 @@ pub fn autofill(wb: &mut Workbook, sheet: usize, req: &FillReq) -> Option<Filled
         (sr0..=sr1).collect()
     };
     let mut writes = Vec::new();
+    let read = s.copy_reader();
     for line in lines {
         // The source line's cells, seed 0 nearest the fill.
         let mut pos: Vec<(u32, u32)> = if vertical {
@@ -789,7 +791,7 @@ pub fn autofill(wb: &mut Workbook, sheet: usize, req: &FillReq) -> Option<Filled
                     let (fr, fc) = pos[j];
                     // An absent source carries the style it inherits (#1660).
                     let mut cell = srcvals[j].clone().unwrap_or_else(|| Cell {
-                        style: s.inherited_style(fr, fc),
+                        style: read.absent_style(fr, fc),
                         ..Cell::default()
                     });
                     rebase(
@@ -822,6 +824,7 @@ pub fn autofill(wb: &mut Workbook, sheet: usize, req: &FillReq) -> Option<Filled
             writes.push((r, c, cell));
         }
     }
+    drop(read);
     for (r, c, cell) in writes {
         s.set_cell(r, c, cell);
     }

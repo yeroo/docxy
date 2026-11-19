@@ -5093,6 +5093,48 @@ mod tests {
         );
     }
 
+    /// The keys sheet 0 holds in column `c`.
+    fn keys_in_col(wb: &Workbook, c: u32) -> Vec<(u32, u32)> {
+        let keys = wb.sheets[0].cells.keys();
+        keys.filter(|k| k.1 == c).copied().collect()
+    }
+
+    /// #1660 r1 M1: a copy of a whole styled column, pasted on an unstyled
+    /// one, writes the column's style only inside the sheet's used extent,
+    /// not a million styled blanks down to the last row.
+    #[test]
+    fn a_whole_styled_column_copied_writes_only_its_used_rows() {
+        use crate::edit::{ClipBlock, PasteSpec, paste_special_changes};
+        use crate::sheet::MAX_ROWS;
+        // Used extent A1:B5; B2 holds 1, row 3 has style 5.
+        let mut wb = pinned_wb(&[("B2", Cell::number(1.0)), ("A5", Cell::number(2.0))]);
+        let clip = ClipBlock::capture(&wb, 0, (0..MAX_ROWS).collect(), vec![1]);
+        let changes =
+            paste_special_changes(&mut wb, 0, (0, 3), &clip, &PasteSpec::default()).unwrap();
+        for (r, c, cell) in changes {
+            wb.sheets[0].set_cell(r, c, cell);
+        }
+        // D1, D4, D5 take column B's 7, D2 the value, D3 row 3's own 5
+        // (absent); nothing past row 5.
+        assert_eq!(keys_in_col(&wb, 3), vec![(0, 3), (1, 3), (3, 3), (4, 3)]);
+        assert_eq!(style_of(&wb, "D1"), 7);
+        // Ctrl+R over B:C, the whole column: the same bound.
+        let changes = crate::edit::fill_changes(
+            &wb.sheets[0],
+            (0, 1, MAX_ROWS - 1, 2),
+            crate::edit::FillDir::Right,
+        );
+        for (r, c, cell) in changes {
+            wb.sheets[0].set_cell(r, c, cell);
+        }
+        assert_eq!(keys_in_col(&wb, 2), vec![(0, 2), (1, 2), (3, 2), (4, 2)]);
+        // A fill handle dragged down column B from an absent B1 past the
+        // used rows writes nothing there.
+        let req = crate::edit::FillReq::new((0, 1, 0, 1), (MAX_ROWS - 1, 1));
+        crate::edit::autofill(&mut wb, 0, &req);
+        assert!(keys_in_col(&wb, 1).iter().all(|k| k.0 < 5));
+    }
+
     /// #1660: B1 spills B1:B3 in a styled column; `x` typed in B2 blocks it
     /// and is undone. The spill member's snapshot is absent, so the undo
     /// leaves no default-style pin, under manual calculation too.

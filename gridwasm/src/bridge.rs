@@ -1245,23 +1245,9 @@ impl Session {
         // An absent cell is copied as a blank with the style it inherits from
         // its row or column, when that is not the default (#1660): pasted, it
         // is the cell's absence, not a default-style pin.
-        let col_styles: Vec<u32> = (c1..=c2).map(|c| sheet.col_style(c)).collect();
+        let read = sheet.copy_reader();
         let cells = (r1..=r2)
-            .map(|r| {
-                let row_style = sheet.row_style(r);
-                (c1..=c2)
-                    .zip(&col_styles)
-                    .map(|(c, &col_style)| {
-                        let inherited = row_style.unwrap_or(col_style);
-                        sheet.cell(r, c).cloned().or_else(|| {
-                            (inherited != 0).then(|| Cell {
-                                style: inherited,
-                                ..Cell::default()
-                            })
-                        })
-                    })
-                    .collect()
-            })
+            .map(|r| (c1..=c2).map(|c| read.cell_opt(r, c)).collect())
             .collect();
         self.clip = Some(GridClip {
             cells,
@@ -4778,6 +4764,20 @@ mod tests {
         s.dispatch(&format!("paste\t1\t1\t{tsv}"));
         let b2 = s.pkg.workbook.sheets[0].cell(1, 1);
         assert_eq!(b2, None, "B2 is {b2:?}");
+        // #1660 r1 M1: column B far past its used rows pasted on D writes
+        // column B's style only inside the used rows (A1:B3 with B3 = 3).
+        // gridcore's whole-column test takes all MAX_ROWS rows; 20,000 keeps
+        // this one quick.
+        s.dispatch("set\t2\t1\t3");
+        let last = 20_000;
+        s.dispatch(&format!("select\t0\t1\t{last}\t1"));
+        let tsv = s.dispatch("copy").expect("copy returns tsv");
+        s.dispatch(&format!("paste\t0\t3\t{tsv}"));
+        let d: Vec<u32> = (s.pkg.workbook.sheets[0].cells.keys())
+            .filter(|k| k.1 == 3)
+            .map(|k| k.0)
+            .collect();
+        assert_eq!(d, vec![0, 1, 2], "D1:D3 only");
     }
 
     #[test]

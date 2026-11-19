@@ -270,23 +270,11 @@ impl ClipBlock {
         let Some(s) = wb.sheets.get(sheet) else {
             return ClipBlock::default();
         };
-        // An absent cell is read with the style it inherits from its row or
-        // column (#1660), each looked up once, not per cell.
-        let col_styles: Vec<u32> = cols.iter().map(|&c| s.col_style(c)).collect();
+        // An absent cell is read with the style it inherits (#1660).
+        let read = s.copy_reader();
         let cells = rows
             .iter()
-            .map(|&r| {
-                let row_style = s.row_style(r);
-                cols.iter()
-                    .zip(&col_styles)
-                    .map(|(&c, &cs)| {
-                        s.cell(r, c).cloned().unwrap_or_else(|| Cell {
-                            style: row_style.unwrap_or(cs),
-                            ..Cell::default()
-                        })
-                    })
-                    .collect()
-            })
+            .map(|&r| cols.iter().map(|&c| read.cell(r, c)).collect())
             .collect();
         let widths = cols.iter().map(|&c| s.col_width(c)).collect();
         let rules = s

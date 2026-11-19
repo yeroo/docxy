@@ -5165,11 +5165,13 @@ impl SheetView {
                 && a.style == b.style
                 && (a.formula.is_some() || a.value == b.value)
         };
+        // Read as the cut captured it ([`gridcore::edit::ClipBlock::capture`]):
+        // an absent cell with its inherited style (#1660).
+        let read = sheet.copy_reader();
         (r0..=r1).zip(&clip.block.cells).all(|(r, row)| {
             (c0..=c1)
                 .zip(row)
-                // An absent cell was captured with its inherited style (#1660).
-                .all(|(c, was)| same(was, &sheet.copied_cell(r, c)))
+                .all(|(c, was)| same(was, &read.cell(r, c)))
         })
     }
 
@@ -5217,13 +5219,14 @@ impl SheetView {
         };
         // The cells as the source holds them now, their formulas moved.
         let sheet = &self.pkg.workbook.sheets[src];
+        let read = sheet.copy_reader();
         let mut block = Vec::new();
         let mut clears = Vec::new();
         for r in fr0..=fr1 {
             let mut row = Vec::new();
             for c in fc0..=fc1 {
                 // An absent cell moves as its inherited style (#1660).
-                let mut cell = sheet.copied_cell(r, c);
+                let mut cell = read.cell(r, c);
                 // A formula held verbatim (a shared one) keeps its text.
                 let verbatim = cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a));
                 if !verbatim {
