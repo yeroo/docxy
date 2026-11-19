@@ -58800,7 +58800,6 @@ mod flat_inlines_tests {
                     ..Default::default()
                 },
             )],
-            ..Default::default()
         });
         ed.set_track_changes(Some(docxcore::editor::TrackAuthor {
             author: "Ada".into(),
