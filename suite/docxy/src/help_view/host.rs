@@ -30,7 +30,7 @@ pub(crate) fn editor_for(kind: Option<Kind>) -> Editor {
     match kind {
         Some(Kind::Xlsx) => Editor::Excel,
         Some(Kind::Project) => Editor::Project,
-        Some(Kind::Docx | Kind::Look | Kind::Help) | None => Editor::Word,
+        Some(Kind::Docx | Kind::Look | Kind::Help | Kind::Pdf) | None => Editor::Word,
     }
 }
 

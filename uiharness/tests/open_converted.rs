@@ -1,6 +1,7 @@
-//! Desktop-only check of #633 in the real app: an RTF, a Web Page and a PDF
-//! open converted, through the converting child process the suite spawns
-//! (`docxy --convert-import`), and Save never writes over them.
+//! Desktop-only check of #633 in the real app: an RTF and a Web Page open
+//! converted, and a PDF converts from its PDF view (#2245), through the
+//! converting child process the suite spawns (`docxy --convert-import`),
+//! and Save never writes over them.
 //! Run after building suite:
 //! cargo test -p uiharness --test open_converted -- --ignored --nocapture
 #![cfg(windows)]
@@ -21,7 +22,7 @@ fn s(text: &str) -> Json {
 
 #[test]
 #[ignore = "requires a built suite and an interactive desktop"]
-fn rtf_html_and_pdf_open_converted_in_a_child_process() {
+fn rtf_html_and_pdf_convert_in_a_child_process() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -53,6 +54,34 @@ fn rtf_html_and_pdf_open_converted_in_a_child_process() {
             "open",
             vec![("path", s(&path.display().to_string()))],
         );
+        // A PDF opens in its view (#2245), which never writes it; its
+        // toolbar's Convert to editable document makes the converted tab.
+        let st = if name.ends_with(".pdf") {
+            assert_eq!(
+                st.get("status").and_then(Json::as_str),
+                Some("loaded (PDF, 1 page)"),
+                "{name}: {st}"
+            );
+            let saved = ok(&driver, "key", vec![("keys", Json::Arr(vec![s("ctrl+s")]))]);
+            let said = saved
+                .get("status")
+                .and_then(Json::as_str)
+                .unwrap_or_default();
+            assert!(said.contains("read-only"), "{name}: {said}");
+            ok(&driver, "pointer-click", vec![("region", s("pdf-convert"))]);
+            // The status line's second item is the tab's status.
+            let items = ok(&driver, "status-read", vec![]);
+            let status = items
+                .get("items")
+                .and_then(Json::as_array)
+                .and_then(|i| i.get(1))
+                .and_then(|i| i.get("text"))
+                .cloned()
+                .unwrap_or(Json::Null);
+            Json::obj(vec![("status", status)])
+        } else {
+            st
+        };
         assert_eq!(
             st.get("status").and_then(Json::as_str),
             Some(status),

@@ -1,0 +1,195 @@
+# The PDF view (#2245): a PDF opens as it looks, read-only: its pages drawn
+# in one column, zoom, the page box, the bookmarks, selecting and copying
+# text in reading order, and Find. A worker child (`suite --pdf-worker`)
+# draws the pages and reads their text off the UI thread, so `pdf-read`
+# asks again (`until_drawn`, `until_text`, `until_idle`, up to 5 s) until
+# what a step needs is in. `pdf-<part>` presses the view's own parts
+# (`pdf-zoom-in`, `pdf-bookmark:<n>`, `pdf-convert`, ...) and
+# `pdf-text:<page>:<start|end>:<text>` the first or last glyph of a text.
+# The PDFs are uiharness/fixtures/pdf-view-*.pdf, byte-identical copies of
+# corpus/pdf-view/slides.pdf and text.pdf (a case opens only the harness's
+# own files); how they were made: corpus/pdf-view/README.md.
+# Each test closes the tabs it opened (Ctrl+W).
+
+test issue 2245 a PDF opens in its view, drawn, with its bookmarks, zoom and page box
+  open copy:"../fixtures/pdf-view-slides.pdf" as slides.pdf
+  assert status is loaded (PDF, 3 pages)
+  assert title is slides.pdf
+  call tab-list {}
+  assert reply.title_label is pdf
+  call pdf-read {"until_drawn":[1,2]}
+  assert reply.page_count is 3
+  assert reply.page is 1
+  assert reply.pages.0.state is drawn
+  assert reply.pages.0.width is 960
+  assert reply.pages.0.height is 540
+  assert reply.pages.1.state is drawn
+  # Page 3 is neither showing nor next: not drawn yet.
+  assert reply.pages.2.state is pending
+  assert reply.outline_shown is true
+  assert reply.outline.0.title is Review
+  assert reply.outline.1.title is Quarterly review
+  assert reply.outline.1.depth is 1
+  assert reply.outline.3.title is Next steps
+  assert reply.outline.3.page is 3
+  shot window
+  # A bookmark goes to its page, which is drawn then.
+  call pointer-click {"region":"pdf-bookmark:4"}
+  call pdf-read {"until_drawn":[3]}
+  assert reply.page is 3
+  assert reply.pages.2.state is drawn
+  # The page box takes a page number.
+  call pointer-click {"input":"pdf-page-box"}
+  call field-read {"input":"pdf-page-box"}
+  assert reply.focused is true
+  assert reply.value is 3 / 3
+  call real-type {"text":"2"}
+  call field-read {"input":"pdf-page-box"}
+  assert reply.value is 2
+  call real-key {"key":"enter"}
+  call pdf-read {}
+  assert reply.page is 2
+  assert reply.page_box is 2 / 3
+  # Zoom: Ctrl+= and Ctrl+- step, the toolbar too; the pages are drawn again.
+  call real-key {"key":"ctrl+="}
+  call pdf-read {}
+  assert reply.zoom is 125
+  call real-key {"key":"ctrl+-"}
+  call real-key {"key":"ctrl+-"}
+  call pdf-read {}
+  assert reply.zoom is 75
+  call pointer-click {"region":"pdf-zoom-in"}
+  call pdf-read {"until_idle":true}
+  assert reply.zoom is 100
+  assert reply.busy is false
+  # Ctrl+0 fits the page's width.
+  call real-key {"key":"ctrl+0"}
+  call pdf-read {"until_idle":true}
+  assert reply.zoom is not 100
+  # The bookmarks pane hides and shows.
+  call pointer-click {"region":"pdf-outline-toggle"}
+  call pdf-read {}
+  assert reply.outline_shown is false
+  call real-key {"key":"ctrl+w"}
+
+test issue 2245 text selects in reading order and copies as plain text
+  open copy:"../fixtures/pdf-view-text.pdf" as text.pdf
+  call pdf-read {"until_drawn":[1],"until_text":[1]}
+  call pointer-drag {"from":"pdf-text:1:start:Hello","to":"pdf-text:1:end:page."}
+  call pdf-read {}
+  assert reply.selection is Hello from the first page.
+  shot window
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is Hello from the first page.
+  # A double press takes a word, Cyrillic included.
+  call pointer-click {"region":"pdf-text:1:start:Привет","double":true}
+  call pdf-read {}
+  assert reply.selection is Привет,
+  # Ctrl+A takes every page's text, read as it comes in; Ctrl+C waits for it.
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call pdf-read {"until_idle":true}
+  assert reply.copy_pending is false
+  assert reply.pages.1.text is read
+  # The whole document, both pages: not the earlier copy of one sentence.
+  call clipboard {"action":"read"}
+  assert reply.text is {pdf-read.selection}
+  assert reply.text is not Hello from the first page.
+  # Esc lets the selection go.
+  call real-key {"key":"escape"}
+  call pdf-read {}
+  assert reply.selection is null
+  call real-key {"key":"ctrl+w"}
+
+test issue 2245 Find searches every page and steps through the hits
+  open copy:"../fixtures/pdf-view-text.pdf" as text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call real-key {"key":"ctrl+f"}
+  call pdf-read {}
+  assert reply.find_open is true
+  assert reply.find_focused is true
+  call pointer-click {"input":"pdf-find"}
+  call real-type {"text":"wizards"}
+  call field-read {"input":"pdf-find"}
+  assert reply.value is wizards
+  assert reply.focused is true
+  call pdf-read {"until_idle":true}
+  assert reply.find_status is 2 found
+  call real-key {"key":"enter"}
+  call pdf-read {}
+  assert reply.find_status is 1 of 2
+  assert reply.selection is wizards
+  assert reply.hits.0.page is 1
+  call real-key {"key":"enter"}
+  call pdf-read {"until_drawn":[2]}
+  assert reply.find_status is 2 of 2
+  assert reply.page is 2
+  shot window
+  call real-key {"key":"shift+enter"}
+  call pdf-read {}
+  assert reply.find_status is 1 of 2
+  # F3 from the pages too.
+  call real-key {"key":"f3"}
+  call pdf-read {}
+  assert reply.find_status is 2 of 2
+  # A pasted query: Cyrillic, found whatever its case unless Match case.
+  call real-key {"key":"ctrl+a"}
+  call clipboard {"action":"write","text":"ПРИВЕТ"}
+  call real-key {"key":"ctrl+v"}
+  call pdf-read {"until_idle":true}
+  assert reply.find_query is ПРИВЕТ
+  assert reply.find_status is 1 found
+  call pointer-click {"region":"pdf-find-case"}
+  call pdf-read {"until_idle":true}
+  assert reply.find_case is true
+  assert reply.find_status is No matches
+  call real-key {"key":"escape"}
+  call pdf-read {}
+  assert reply.find_open is false
+  call real-key {"key":"ctrl+w"}
+
+test issue 2245 the PDF view never writes the PDF, and converts on request
+  open copy:"../fixtures/pdf-view-text.pdf" as text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call real-key {"key":"ctrl+s"}
+  call status-read {}
+  assert reply.items.1.text is The PDF view is read-only and never writes the PDF; Convert to editable document makes a copy you can save
+  call real-key {"key":"f12"}
+  call status-read {}
+  assert reply.items.1.text is Save As is not available for a PDF view; Convert to editable document makes a copy you can save
+  # Typing changes nothing: there is nothing to edit.
+  call real-type {"text":"abc"}
+  call real-key {"key":"backspace"}
+  call pdf-read {}
+  assert reply.page_count is 2
+  # Every File page a PDF view has opens; Info and Export are a document's.
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call backstage-page {"page":"open"}
+  call backstage-page {"page":"account"}
+  call-error backstage-page {"page":"info"} => the Info page is for a document tab
+  call-error backstage-page {"page":"export"} => the Export page is for a document tab
+  call backstage {"action":"close"}
+  # Convert to editable document: the conversion a PDF opened as before.
+  call pointer-click {"region":"pdf-convert"}
+  assert status is loaded (converted from PDF)
+  assert title is text.pdf
+  call tab-list {}
+  assert reply.title_label is doc
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.title_label is pdf
+  call real-key {"key":"ctrl+w"}
+
+test issue 2245 a PDF view moved to a new window goes on drawing there
+  open ../fixtures/basic.docx
+  open copy:"../fixtures/pdf-view-slides.pdf" as slides.pdf
+  call pdf-read {"until_drawn":[1]}
+  call window-new {}
+  assert reply.window is 2
+  assert title is slides.pdf
+  call pointer-click {"region":"pdf-bookmark:4"}
+  call pdf-read {"until_drawn":[3]}
+  assert reply.pages.2.state is drawn
+  call real-key {"key":"ctrl+w"}

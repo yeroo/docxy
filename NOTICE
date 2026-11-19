@@ -1,0 +1,53 @@
+docxy
+Copyright (c) yeroo. Licensed under the MIT License (LICENSE).
+
+Third-party material
+
+The desktop suite's PDF view (#2245) draws, reads and searches PDF pages
+with the following crates and the data they embed. Each is used under its
+own licence; the crates' licence texts are in their sources, at the revisions
+suite/Cargo.toml and suite/Cargo.lock pin.
+
+- PdfCraft (pdfcraft-render, pdfcraft-cos, pdfcraft-fonts, pdfcraft-geom),
+  https://github.com/storytold/pdfcraft
+  Copyright (c) 2026 ArtCraft Team and the PdfCraft contributors.
+  MIT OR Apache-2.0.
+
+- craft-libs (craft-pdf, craft-stream-codecs, hayro-postscript, and its
+  own copy of hayro-jbig2 0.3.0 that craft-stream-codecs uses),
+  https://github.com/storytold/craft-libs
+  Copyright (c) 2026 ArtCraft Team and the craft-libs contributors;
+  hayro-jbig2 Copyright (c) The Hayro Authors.
+  MIT OR Apache-2.0.
+
+- hayro (hayro, hayro-interpret, hayro-syntax, hayro-cmap, hayro-jbig2),
+  https://github.com/LaurenzV/hayro, in PdfCraft's patched copies; and
+  hayro-ccitt 0.3.0 and hayro-jpeg2000 0.3.5, the crates.io releases.
+  Copyright (c) The Hayro Authors. MIT OR Apache-2.0.
+
+- Vello (vello_cpu, vello_common 0.0.8), https://github.com/linebender/vello,
+  in PdfCraft's patched copies; and vello_common 0.0.9, the crates.io
+  release. Copyright 2020 the Vello Authors.
+  MIT OR Apache-2.0.
+
+- lopdf, https://github.com/J-F-Liu/lopdf, in PdfCraft's patched copy.
+  MIT.
+
+Data embedded by those crates:
+
+- The PDF standard fonts hayro-interpret substitutes for the base-14 fonts
+  (vendor/hayro-interpret/assets/*.pfb), extracted from PDFium:
+  Copyright 2014 PDFium Authors. All rights reserved. Original code
+  copyright 2014 Foxit Software Inc. http://www.foxitsoftware.com
+  Use is governed by a BSD-style licence (PDFium's LICENSE file).
+
+- Adobe's character maps (hayro-cmap, assets/cmaps.brotli):
+  Copyright 1990-2023 Adobe. All rights reserved. BSD-3-Clause
+  (hayro-cmap's assets/LICENSE.txt).
+
+- The CMYK ICC profile CGATS001Compat-v2-micro.icc (hayro-interpret), from
+  https://github.com/saucecontrol/Compact-ICC-Profiles: CC0-1.0.
+
+pdfcraft-fonts also carries the Inter and Dancing Script typefaces (SIL Open
+Font License 1.1); the suite does not use the code that embeds them, and its
+release build does not contain them.

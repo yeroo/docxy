@@ -408,6 +408,7 @@ mod tests {
             converted: None,
             binary_source: false,
             compat: false,
+            pdf_view: None,
         }
     }
 

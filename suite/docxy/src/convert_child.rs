@@ -414,23 +414,13 @@ fn run_child(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(err_file));
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
+    // Bound whole, not destructured with `..`: the Windows job must live
+    // until the child is done (closing it kills the child).
+    let mut limited = match spawn_limited(cmd, memory) {
+        Ok(limited) => limited,
         Err(e) => return cannot_start(e),
     };
-    // ⚠️ The child is put in its job just after it starts, so it runs a
-    // moment unlimited; the import has not started by then (it reads its
-    // file first), and closing the job kills it either way.
-    #[cfg(windows)]
-    let _job = job::limit(&child, memory);
-    #[cfg(not(windows))]
-    let _ = memory;
+    let child = &mut limited.child;
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -457,6 +447,39 @@ fn run_child(
         // A panic, an abort, out of memory, killed by its job.
         _ => Outcome::Failed(DIED.into()),
     }
+}
+
+/// A child started under the suite's limits: no console window, and on
+/// Windows a Job object with a memory limit and kill-on-close. The PDF
+/// view's worker (#2245) starts its children the same way.
+pub(crate) struct Limited {
+    pub(crate) child: std::process::Child,
+    /// Closing it (on drop) kills the child if it still runs.
+    #[cfg(windows)]
+    pub(crate) _job: Option<job::Job>,
+}
+
+/// Start `cmd` as a [`Limited`] child, its stdio as the caller set it.
+pub(crate) fn spawn_limited(mut cmd: Command, memory: usize) -> std::io::Result<Limited> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let child = cmd.spawn()?;
+    // ⚠️ The child is put in its job just after it starts, so it runs a
+    // moment unlimited; the work has not started by then (it reads its
+    // file first), and closing the job kills it either way.
+    #[cfg(windows)]
+    let _job = job::limit(&child, memory);
+    #[cfg(not(windows))]
+    let _ = memory;
+    Ok(Limited {
+        child,
+        #[cfg(windows)]
+        _job,
+    })
 }
 
 /// A directory of its own under the system temp dir, removed when dropped.
@@ -490,7 +513,7 @@ impl Drop for TempDir {
 /// kill-on-close, so the child cannot outlive the job's handle. Hand-declared
 /// kernel32 calls, as gridcore's clock does, rather than a crate.
 #[cfg(windows)]
-mod job {
+pub(crate) mod job {
     use std::ffi::c_void;
     use std::os::windows::io::AsRawHandle;
 
@@ -545,7 +568,11 @@ mod job {
     }
 
     /// The job; closing it (on drop) kills the child if it still runs.
-    pub(super) struct Job(Handle);
+    pub(crate) struct Job(Handle);
+
+    // SAFETY: a job handle is a kernel handle, usable and closable from any
+    // thread; the PDF worker (#2245) keeps its child's job on a worker thread.
+    unsafe impl Send for Job {}
 
     impl Drop for Job {
         fn drop(&mut self) {

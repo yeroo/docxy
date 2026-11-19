@@ -645,7 +645,9 @@ fn save_as_target(
             .into_iter()
             .map(|(_, ext)| ext)
             .collect(),
-        Kind::Look | Kind::Help => return Err("this tab cannot be saved as a file".into()),
+        Kind::Look | Kind::Help | Kind::Pdf => {
+            return Err("this tab cannot be saved as a file".into());
+        }
     };
     if let Some(f) = format {
         if !kind_formats.contains(&f) {
@@ -743,7 +745,9 @@ fn save_types(
             .into_iter()
             .map(|(label, ext)| (label, vec![ext]))
             .collect(),
-        Kind::Look | Kind::Help => return Err("this tab cannot be saved as a file".into()),
+        Kind::Look | Kind::Help | Kind::Pdf => {
+            return Err("this tab cannot be saved as a file".into());
+        }
     })
 }
 
@@ -1795,11 +1799,124 @@ fn region_point(
             .map(|b| b.center())
             .ok_or_else(|| format!("{name}: the page's Show button is not drawn yet"));
     }
+    // A PDF view's part (#2245): `pdf-text:<page>:<start|end>:<text>` is
+    // the first or last glyph of `text` on that page; any other `pdf-<x>`
+    // is the view's `pdf-<x>` probe (`pdf-zoom-in`, `pdf-bookmark:2`, …).
+    if let Some(part) = name.trim().strip_prefix("pdf-") {
+        return pdf_point(app, part).map_err(|e| format!("{name}: {e}"));
+    }
     let region = parse_region(name)?;
     let bounds = app
         .region_bounds_live(region, window)
         .map_err(|e| format!("{name}: {e}"))?;
     Ok(bounds.center())
+}
+
+/// [`region_point`]'s `pdf-` names on the active PDF view (#2245).
+fn pdf_point(app: &crate::Docxy, part: &str) -> Result<Point<Pixels>, String> {
+    let v = app.active_pdf().ok_or("the active tab is not a PDF view")?;
+    let Some(spec) = part.strip_prefix("text:") else {
+        return app
+            .probes
+            .borrow()
+            .on_screen(&format!("pdf-{part}"))
+            .map(|b| b.center())
+            .ok_or_else(|| "the PDF view draws no such part now".to_string());
+    };
+    let mut it = spec.splitn(3, ':');
+    let (Some(page), Some(end), Some(text)) = (it.next(), it.next(), it.next()) else {
+        return Err("use pdf-text:<page>:<start|end>:<text>".into());
+    };
+    let page: usize = page
+        .parse::<usize>()
+        .ok()
+        .filter(|p| *p >= 1)
+        .ok_or("the page is a number from 1")?
+        - 1;
+    let t = v
+        .texts
+        .get(page)
+        .and_then(Option::as_ref)
+        .ok_or("that page's text is not read yet (pdf-read until_text)")?;
+    let hit = t
+        .find_opts(text, true, false)
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("'{text}' is not on page {}", page + 1))?;
+    let glyph = match end {
+        "start" => hit.start,
+        "end" => hit.end - 1,
+        _ => return Err("say start or end".into()),
+    };
+    let r = t.glyphs[glyph].rect;
+    let l = v.layout();
+    let pr = l.pages[page];
+    let k = v.zoom * crate::pdf_view::PX_PER_PT;
+    // Just inside the glyph, at its middle height: the start's left edge or
+    // the end's right edge.
+    let x = if end == "start" {
+        r[0] + (r[2] - r[0]) * 0.25
+    } else {
+        r[2] - (r[2] - r[0]) * 0.25
+    };
+    let y = (r[1] + r[3]) / 2.;
+    Ok(crate::pdf_view::render::window_point(
+        v,
+        pr.x + x * k,
+        pr.y + y * k,
+    ))
+}
+
+/// `pdf-read`: the active PDF view (`{"open": false}` on any other tab).
+/// `until_drawn` (page numbers) asks again until those pages are drawn or
+/// failed, `until_text` until their text is read or failed, `until_idle`
+/// until the worker has nothing out and nothing waits (a Copy, Find's
+/// pages), for up to `within_ms` (default and at most the pump's
+/// `RETRY_MAX`, 5 s); a timeout is no error, the reply says where it got.
+fn pdf_read(app: &crate::Docxy, args: &Json) -> Result<Done, String> {
+    let Some(v) = app.active_pdf() else {
+        let tab = app.tabs.get(app.active);
+        return Done::ok(Json::obj(vec![
+            ("open", Json::Bool(false)),
+            (
+                "pdf_tab",
+                Json::Bool(tab.is_some_and(|t| t.kind == crate::Kind::Pdf)),
+            ),
+        ]));
+    };
+    let pages = |key: &str| -> Result<Vec<usize>, String> {
+        match args.get(key) {
+            None => Ok(Vec::new()),
+            Some(Json::Arr(items)) => items
+                .iter()
+                .map(|n| match n {
+                    Json::Num(n) if *n >= 1. && n.fract() == 0. => Ok(*n as usize - 1),
+                    _ => Err(format!("'{key}' must be page numbers from 1")),
+                })
+                .collect(),
+            Some(_) => Err(format!("'{key}' must be a list of page numbers")),
+        }
+    };
+    let drawn = pages("until_drawn")?;
+    let text = pages("until_text")?;
+    let idle = arg_flag(args, "until_idle")?;
+    let within = match args.get("within_ms") {
+        None => 5_000.,
+        Some(Json::Num(ms)) if *ms >= 0. => *ms,
+        Some(_) => return Err("'within_ms' must be a number of milliseconds".into()),
+    };
+    let n = v.page_count();
+    let settled = drawn
+        .iter()
+        .all(|p| *p >= n || v.rasters[*p].is_some() || v.failed.contains_key(p))
+        && text.iter().all(|p| !v.text_owed(*p))
+        && (!idle
+            || (!v.busy()
+                && !v.copy_waits()
+                && (v.find.field.text.is_empty() && !v.want_all_text || v.unread_pages() == 0)));
+    let mut done = Done::ok(v.read_json())?;
+    done.retry = (!settled).then(|| std::time::Duration::from_millis(within as u64));
+    Ok(done)
 }
 
 /// The test extension's view on the active tab (#1873): refused unless the
@@ -5620,6 +5737,7 @@ fn kind_name(kind: crate::Kind) -> &'static str {
         crate::Kind::Project => "project",
         crate::Kind::Look => "mail",
         crate::Kind::Help => "help",
+        crate::Kind::Pdf => "pdf",
     }
 }
 
@@ -6291,6 +6409,7 @@ fn dispatch_verb(
             Done::ok(help_read_json(app))
         }
         "help-read" => Done::ok(help_read_json(app)),
+        "pdf-read" => pdf_read(app, args),
         // A File page of the test extension's (#1923): how many times it
         // rendered and where it last painted (null before it ever did).
         "ext-page-read" => {
@@ -10100,6 +10219,7 @@ mod tests {
             "status-read",
             "last-url",
             "help-read",
+            "pdf-read",
             "doc",
             "rows",
             "cell",

@@ -50,6 +50,23 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", 
 [patch.crates-io]
 psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
 
+# The PDF view's renderer (#2245): `pdfcraft-render` is built against PdfCraft's own
+# patched copies of these crates (its `vendor/`, each patch meant to go upstream;
+# lopdf's carries fuzz fixes: predictor row allocations, `/Length` lookup chains,
+# object-stream budgets). Cargo never applies a dependency's `[patch]`, so this
+# table repeats PdfCraft's root `[patch.crates-io]` at the same rev, minus its
+# egui/winit entries (not built here). A bump of the `pdfcraft-render` rev in
+# docxy/Cargo.toml moves every entry with it: compare the two tables.
+hayro = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+hayro-interpret = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+hayro-syntax = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+hayro-cmap = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+hayro-jbig2 = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+lopdf = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+vello_common = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+vello_cpu = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+hayro-postscript = { git = "https://github.com/storytold/craft-libs", rev = "e7873217287876f76a045550369c90a541693c33" }
+
 # gpui_linux with the suite's patch to its Wayland clipboard (#1966): a copy
 # offers RTF/HTML beside its text and a paste reads another app's. The vendored
 # crate is upstream at the zed rev this lock pins plus `vendor/gpui_linux.patch`
@@ -64,6 +81,29 @@ gpui_linux = { path = "vendor/gpui_linux" }
 opt-level = 1
 [profile.dev.package.gpui_platform]
 opt-level = 1
+
+# The PDF renderer (#2245) is 25-40x slower unoptimized, and the suite's tests
+# render the PDF corpus through it.
+[profile.dev.package.hayro]
+opt-level = 2
+[profile.dev.package.hayro-interpret]
+opt-level = 2
+[profile.dev.package.hayro-syntax]
+opt-level = 2
+[profile.dev.package.hayro-cmap]
+opt-level = 2
+[profile.dev.package.hayro-jbig2]
+opt-level = 2
+[profile.dev.package.vello_common]
+opt-level = 2
+[profile.dev.package.vello_cpu]
+opt-level = 2
+[profile.dev.package.lopdf]
+opt-level = 2
+[profile.dev.package.pdfcraft-render]
+opt-level = 2
+[profile.dev.package.craft-pdf]
+opt-level = 2
 
 # Line tables in release builds, so a backtrace in crash.log names the source
 # line of each frame (#795). On Windows they live in suite.pdb, which the

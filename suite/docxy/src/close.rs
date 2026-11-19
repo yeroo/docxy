@@ -887,6 +887,11 @@ impl Docxy {
             self.cancel_pointer_modes();
             self.active = previous_active;
             let removed = remove_tab(&mut self.tabs, &mut self.active, i);
+            // The tab left in front: a pending one opens or tries again
+            // (#633, #2245).
+            if let Some(t) = self.tabs.get_mut(self.active) {
+                crate::activate_pending(t);
+            }
             // Its pictures leave gpui's asset cache (#1639).
             self.release_pictures(Some(&removed), window, cx);
             // The Info page's result is keyed by tab index (#627).

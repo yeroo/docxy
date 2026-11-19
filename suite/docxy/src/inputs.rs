@@ -17,7 +17,9 @@
 //! `uiharness/cases/project-inputs-typing.uit`; Task > Information... is the
 //! catalogued Task Information dialog (#1368). So is the Help tab's search
 //! box (#1855), typed into by `uiharness/cases/help-docs.uit` with the
-//! fixture manual installed. So is the embedded document view's Find box
+//! fixture manual installed. So are the PDF view's Find box and page box
+//! (#2245), typed into by `uiharness/cases/pdf-view.uit`. So is the
+//! embedded document view's Find box
 //! on an extension's tab (#1887), typed into by
 //! `uiharness/cases/ext-doc-view.uit` on the test extension's Mail tab. The
 //! terminal editors' prompts (#1204)
@@ -48,6 +50,8 @@ pub(crate) enum Surface {
     Help,
     /// An extension's tab: the embedded document view (#1887).
     Ext,
+    /// A PDF view (#2245).
+    Pdf,
 }
 
 impl Surface {
@@ -60,6 +64,7 @@ impl Surface {
             Self::Terminal => "terminal",
             Self::Help => "Help tab",
             Self::Ext => "extension tab",
+            Self::Pdf => "PDF view",
         }
     }
 }
@@ -90,6 +95,8 @@ pub(crate) struct Input {
 const HELP: u32 = 1855;
 /// The embedded document view's Find box (#1887).
 const EXT: u32 = 1887;
+/// The PDF view's Find box and page box (#2245).
+const PDF: u32 = 2245;
 const SHEET: u32 = 1200;
 const DOC: u32 = 1201;
 const BACKSTAGE: u32 = 1202;
@@ -239,6 +246,8 @@ static REGISTRY: &[Input] = &[
         Surface::Help,
         HELP,
     ),
+    input("pdf-find", "the PDF view's Find box", Surface::Pdf, PDF),
+    input("pdf-page-box", "the PDF view's page box", Surface::Pdf, PDF),
     input(
         "ext-doc-find",
         "the embedded document view's Find box",
@@ -405,6 +414,7 @@ pub(crate) fn press(app: &crate::Docxy, id: &str, cx: &gpui::App) -> Result<Pres
         Surface::Backstage => return press_info(app, i),
         Surface::Help => return press_help(app, i),
         Surface::Ext => return press_ext(app, i, cx),
+        Surface::Pdf => return press_pdf(app, i),
     }
     let v = crate::harness::sheet(app)?;
     let Some(probe) = sheet_probe(id) else {
@@ -509,6 +519,53 @@ fn press_help(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
         at: b.center(),
         double: false,
     })
+}
+
+/// The PDF view's Find box (open, Ctrl+F) or page box, pressed where it is
+/// drawn (#2245).
+fn press_pdf(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
+    app.active_pdf()
+        .ok_or_else(|| format!("{} is not drawn: the active tab is not a PDF view", i.name))?;
+    let b = app
+        .probes
+        .borrow()
+        .on_screen(i.id)
+        .ok_or_else(|| format!("{} is not drawn (Find opens with Ctrl+F)", i.name))?;
+    Ok(Press {
+        at: b.center(),
+        double: false,
+    })
+}
+
+/// `field-read` of a PDF view's field: its text, its caret while it has the
+/// keys, and a whole-text selection.
+fn read_pdf(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
+    let v = app.active_pdf().ok_or("the active tab is not a PDF view")?;
+    let f = if i.id == "pdf-find" {
+        &v.find.field
+    } else {
+        &v.page_box
+    };
+    Ok(pdf_field_json(i.id, f))
+}
+
+fn pdf_field_json(id: &str, f: &crate::pdf_view::Field) -> Json {
+    let len = f.text.chars().count();
+    field_json(
+        id,
+        Json::Str(f.text.clone()),
+        f.focused,
+        if f.focused {
+            Json::Num(f.caret.min(len) as f64)
+        } else {
+            Json::Null
+        },
+        if f.sel && len > 0 {
+            Json::Arr(vec![Json::Num(0.0), Json::Num(len as f64)])
+        } else {
+            Json::Null
+        },
+    )
 }
 
 /// `field-read {"input":"help-search"}`: the query, its caret while the
@@ -636,6 +693,7 @@ pub(crate) fn read(app: &crate::Docxy, id: &str, cx: &gpui::App) -> Result<Json,
         Surface::Backstage => return read_info(app, i),
         Surface::Help => return read_help(app, i),
         Surface::Ext => return read_ext(app, i, cx),
+        Surface::Pdf => return read_pdf(app, i),
     }
     let v = crate::harness::sheet(app)?;
     let num = |n: usize| Json::Num(n as f64);
@@ -971,8 +1029,9 @@ mod tests {
         assert_eq!(ids.len(), registry().len(), "an input id repeats");
         for i in registry() {
             assert!(
-                (SHEET..=TERMINAL).contains(&i.covered_by) || [HELP, EXT].contains(&i.covered_by),
-                "{} is covered by #{}, not one of #1200-#1204, #1855 or #1887",
+                (SHEET..=TERMINAL).contains(&i.covered_by)
+                    || [HELP, EXT, PDF].contains(&i.covered_by),
+                "{} is covered by #{}, not one of #1200-#1204, #1855, #1887 or #2245",
                 i.id,
                 i.covered_by
             );
@@ -986,6 +1045,7 @@ mod tests {
                 Surface::Terminal => TERMINAL,
                 Surface::Help => HELP,
                 Surface::Ext => EXT,
+                Surface::Pdf => PDF,
             };
             assert_eq!(i.covered_by, want, "{}: its surface's slice", i.id);
         }
@@ -1149,6 +1209,50 @@ mod tests {
                 .unwrap_or_else(|| panic!("{}: never typed into", i.id));
             assert!(case[at + typed..].contains(&read), "{}: never read", i.id);
         }
+    }
+
+    /// #2245: the PDF view's fields are typed into with real keys by
+    /// pdf-view.uit, after a real click, and read back.
+    #[test]
+    fn the_pdf_views_fields_are_typed_into_by_its_case() {
+        let case = include_str!("../../../uiharness/cases/pdf-view.uit");
+        let pdf: Vec<&Input> = registry()
+            .iter()
+            .filter(|i| i.surface == Surface::Pdf)
+            .collect();
+        assert_eq!(pdf.len(), 2);
+        for i in pdf {
+            let click = format!("pointer-click {{\"input\":\"{}\"}}", i.id);
+            let read = format!("field-read {{\"input\":\"{}\"}}", i.id);
+            let at = case
+                .find(&click)
+                .unwrap_or_else(|| panic!("{}: never clicked", i.id));
+            let typed = case[at..]
+                .find("real-type ")
+                .unwrap_or_else(|| panic!("{}: never typed into", i.id));
+            assert!(case[at + typed..].contains(&read), "{}: never read", i.id);
+        }
+    }
+
+    #[test]
+    fn a_pdf_field_reads_its_text_caret_and_selection() {
+        use crate::field_edit::Op;
+        let mut f = crate::pdf_view::Field::default();
+        let j = pdf_field_json("pdf-find", &f);
+        assert_eq!(j.get_str("value"), Some(""));
+        assert_eq!(j.get("focused"), Some(&Json::Bool(false)));
+        f.focused = true;
+        f.edit(Op::Insert("мир"));
+        f.edit(Op::Left);
+        let j = pdf_field_json("pdf-find", &f);
+        assert_eq!(j.get_str("value"), Some("мир"));
+        assert_eq!(j.get_usize("caret"), Some(2));
+        f.focus_all();
+        let j = pdf_field_json("pdf-find", &f);
+        assert_eq!(
+            j.get("selection"),
+            Some(&Json::Arr(vec![Json::Num(0.0), Json::Num(3.0)]))
+        );
     }
 
     #[test]
