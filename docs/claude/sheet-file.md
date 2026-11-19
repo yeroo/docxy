@@ -161,15 +161,20 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   - the suite's `cut_still_live` and `paste_move`. They must read exactly what
     `capture` stored, or every cut over such a cell is cancelled.
 - **Past the used extent** (`past_extent`), an absent source reads as a
-  default blank. Every writer lands it as the *destination's* absence:
-  `Sheet::absent_cell`, or `CopyReader::absent_cell` on the destination's
-  reader. That is a blank of the destination's inherited style, which
+  default blank. Every writer lands it as the *destination's* absence,
+  `CopyReader::absent_cell` on a reader of the destination's sheet. That is
+  a blank of the destination's inherited style, which
   `set_cell` drops, so a held target ends absent and nothing is made where
   nothing was. A whole styled column copied elsewhere writes no million
   styled blanks, and a held cell in a styled column gets no s0 pin. The
   writers:
   - `fill_changes` and `autofill` (also FormatsOnly);
-  - `paste_special_changes`, through `ClipBlock::used` and `lands_absent`;
+  - `paste_special_changes`, through `ClipBlock::used` and `lands_absent`.
+    It never mixes a style for such a cell (No Borders and the Number
+    Formats pastes would intern a new one). A held destination becomes its
+    absence, and Formats keeps the value with the inherited style. An
+    operation (Add and the rest) leaves the value and style alone: there is
+    no operand. An absent destination gets nothing.
   - the suite's tiled copy (`ClipBlock::land_absent`) and `paste_move`;
   - xlsxy's paste and gridwasm's `paste_own_clip`, through the extent kept
     in `ClipData` or `GridClip`. xlsxy's Paste Special sets `ClipBlock::used`
@@ -177,9 +182,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   - This differs from Excel, which would carry the source's format there:
     a whole-column copy in Excel copies the `<col>` style itself, and that
     is out of scope.
-- **A single destination** uses `Sheet::copied_cell`, with no extent bound.
-  Paste Special's destination `d` uses it, so Values keeps an absent cell's
-  inherited format.
+- **Paste Special's own destination** `d` is read through the destination's
+  reader: the held cell, or `absent_cell`, with no extent bound. So Values
+  keeps an absent cell's inherited format.
 - **Entries** are read under `Sheet::entry_style_at`: the cell's own style,
   or an absent cell's inherited one. Its users:
   - typing (`entry_cell_ctx`, `typed_formula`, so Ctrl+Enter too);

@@ -651,17 +651,31 @@ pub fn paste_special_changes(
             if spec.skip_blanks && src.is_blank() {
                 continue;
             }
+            // An absent source from past its sheet's used extent is nothing
+            // at all: it lands as the destination's absence, whatever is
+            // pasted, and never mixes a style of its own (#1660 r3).
+            if clip.lands_absent((i, j)) {
+                // Nothing lands where nothing is.
+                let Some(held) = s.cell(dest.0, dest.1) else {
+                    continue;
+                };
+                let absent = read.absent_cell(dest.0, dest.1);
+                let cell = if spec.op != PasteOp::None {
+                    // No operand: the destination's value and format stay.
+                    continue;
+                } else if spec.what == PasteWhat::Formats {
+                    Cell {
+                        style: absent.style,
+                        ..held.clone()
+                    }
+                } else {
+                    absent
+                };
+                out.push((dest.0, dest.1, cell));
+                continue;
+            }
             let d = (s.cell(dest.0, dest.1).cloned())
                 .unwrap_or_else(|| read.absent_cell(dest.0, dest.1));
-            // An absent source from past its sheet's used extent is the
-            // destination's absence (#1660).
-            let landed;
-            let src = if clip.lands_absent((i, j)) {
-                landed = read.absent_cell(dest.0, dest.1);
-                &landed
-            } else {
-                src
-            };
             let style = match spec.what {
                 PasteWhat::All
                 | PasteWhat::AllAndColumnWidths

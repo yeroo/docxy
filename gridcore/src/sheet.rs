@@ -395,7 +395,8 @@ pub fn frozen_spill_keys(
 ///
 /// Past the used extent ([`CopyReader::past_extent`]) an absent cell reads as
 /// a default blank, and its writer lands it as the *destination's* absence
-/// ([`Sheet::absent_cell`]), which [`Sheet::set_cell`] drops: a held target
+/// ([`CopyReader::absent_cell`] on the destination), which [`Sheet::set_cell`]
+/// drops, whatever is pasted (Paste Special mixes no style for it): a held target
 /// ends absent, and nothing is made where nothing was, so a copy of a whole
 /// styled column makes no million styled blanks wherever it lands. Excel
 /// would carry the source's format there (a whole-column copy copies the
@@ -414,7 +415,7 @@ impl CopyReader<'_> {
     }
 
     /// Whether `(row, col)` is past the used extent: an absent cell there is
-    /// landed as its destination's absence ([`Sheet::absent_cell`]).
+    /// landed as its destination's absence ([`CopyReader::absent_cell`]).
     pub fn past_extent(&self, row: u32, col: u32) -> bool {
         past_extent(self.used, row, col)
     }
@@ -449,9 +450,11 @@ impl CopyReader<'_> {
         })
     }
 
-    /// [`Sheet::absent_cell`] through the cached styles: what a copied cell
-    /// from past its sheet's used extent lands as at `(row, col)` of this
-    /// reader's sheet.
+    /// The absence of the cell at `(row, col)` of this reader's sheet,
+    /// written out: a blank of the style it inherits, which
+    /// [`Sheet::set_cell`] drops, present slot or absent. What a copied cell
+    /// from past its sheet's used extent lands as, and what Paste Special
+    /// reads an absent destination as (#1660).
     pub fn absent_cell(&self, row: u32, col: u32) -> Cell {
         Cell {
             style: self.inherited_style(row, col),
@@ -1836,17 +1839,6 @@ impl Sheet {
             .map_or_else(|| self.inherited_style(row, col), |c| c.style)
     }
 
-    /// The absence of the cell at `(row, col)`, written out: a blank of the
-    /// style it inherits, which [`Sheet::set_cell`] drops, present slot or
-    /// absent. What a copied absent cell from past its sheet's used extent
-    /// lands as ([`CopyReader`], #1660).
-    pub fn absent_cell(&self, row: u32, col: u32) -> Cell {
-        Cell {
-            style: self.inherited_style(row, col),
-            ..Cell::default()
-        }
-    }
-
     /// How a copy, fill or move reads this sheet's cells ([`CopyReader`]).
     pub fn copy_reader(&self) -> CopyReader<'_> {
         CopyReader {
@@ -1855,17 +1847,6 @@ impl Sheet {
             rows: RefCell::new(HashMap::new()),
             cols: RefCell::new(HashMap::new()),
         }
-    }
-
-    /// The cell at `(row, col)` as one destination reads it (Paste Special's
-    /// own cell): the cell held there, or a blank with the style the absent
-    /// cell inherits ([`Sheet::inherited_style`]). A copy, fill or move of
-    /// many cells reads through [`Sheet::copy_reader`] instead (#1660).
-    pub fn copied_cell(&self, row: u32, col: u32) -> Cell {
-        self.cell(row, col).cloned().unwrap_or_else(|| Cell {
-            style: self.inherited_style(row, col),
-            ..Cell::default()
-        })
     }
 
     /// Does an explicit default-style cell at `(row, col)` matter? True when

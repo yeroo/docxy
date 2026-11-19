@@ -4952,15 +4952,18 @@ mod tests {
             assert_eq!(sh.inherited_style(r, 0), 0, "row {}", r + 1);
             assert!(!sh.pins_default(r, 0));
         }
-        assert_eq!(
-            sh.copied_cell(0, 1),
-            Cell {
-                style: 7,
-                ..Cell::default()
-            }
-        );
+        // A copy reads an absent B1 with column B's style once B2 puts it
+        // inside the used extent, and a held B1 as it is.
+        let blank7 = Cell {
+            style: 7,
+            ..Cell::default()
+        };
+        assert_eq!(sh.copy_reader().cell(0, 1), Cell::default(), "past it");
+        assert_eq!(sh.copy_reader().absent_cell(0, 1), blank7);
+        sh.set_cell(1, 1, Cell::number(2.0));
+        assert_eq!(sh.copy_reader().cell(0, 1), blank7);
         sh.set_cell(0, 1, Cell::number(1.0));
-        assert_eq!(sh.copied_cell(0, 1), Cell::number(1.0));
+        assert_eq!(sh.copy_reader().cell(0, 1), Cell::number(1.0));
     }
 
     /// #1660: a blank of exactly the style a slot inherits is the absence
@@ -5189,6 +5192,84 @@ mod tests {
             wb.sheets[0].set_cell(r, c, cell);
         }
         assert_eq!(keys_in_col(&wb, 1), vec![(3, 1), (4, 1)], "B1:B3 absent");
+    }
+
+    /// #1660 r3 M1: Paste Special of cells from past the source's used rows
+    /// never mixes a style for them. No Borders and Values & Number Formats
+    /// onto a column whose style has a border write nothing past the used
+    /// rows, and an Add leaves held values as they were.
+    #[test]
+    fn paste_special_of_cells_past_the_used_rows_mixes_no_style() {
+        use crate::edit::{ClipBlock, PasteOp, PasteSpec, PasteWhat, paste_special_changes};
+        use crate::sheet::{MAX_ROWS, Xf};
+        let mut wb = held_column_b();
+        assert_eq!(wb.styles.intern(Xf::default()), 0);
+        // Column D's style: bordered and bold, so No Borders makes another
+        // (bold) style of it. The table holds it twice, D's the second, as a
+        // file may: re-interning it finds the first.
+        let bold_border = Xf {
+            border: true,
+            bold: true,
+            ..Xf::default()
+        };
+        wb.styles.xfs.push(bold_border.clone());
+        wb.styles.xfs.push(bold_border);
+        let bordered = wb.styles.xfs.len() as u32 - 1;
+        wb.sheets[0].col_defs.push(crate::sheet::ColDef {
+            min: 3,
+            max: 3,
+            width: None,
+            attrs: format!(r#"style="{bordered}""#),
+            default_width: false,
+            plain_width: false,
+        });
+        let paste = |wb: &mut Workbook, clip: &ClipBlock, spec: PasteSpec| {
+            for (r, c, cell) in paste_special_changes(wb, 0, (0, 3), clip, &spec).unwrap() {
+                wb.sheets[0].set_cell(r, c, cell);
+            }
+        };
+        let whole = ClipBlock::capture(&wb, 0, (0..MAX_ROWS).collect(), vec![1]);
+        let past = ClipBlock::capture(&wb, 0, (0..200).collect(), vec![1]);
+        for (clip, what) in [
+            (&whole, PasteWhat::AllExceptBorders),
+            (&past, PasteWhat::AllExceptBorders),
+            (&past, PasteWhat::ValuesAndNumberFormats),
+            (&past, PasteWhat::FormulasAndNumberFormats),
+        ] {
+            let mut wb = wb.clone();
+            paste(&mut wb, clip, PasteSpec::of(what));
+            let d: Vec<u32> = keys_in_col(&wb, 3).iter().map(|k| k.0).collect();
+            assert_eq!(d, vec![0, 1, 2, 3, 4], "{what:?}, {} rows", clip.rows.len());
+        }
+        // D1:D10 held: an All + Add of B1:B10 (B6:B10 past the used rows
+        // when copied) adds to D1:D5 and leaves D6:D10's values and styles
+        // alone; Formats gives D6:D10 the column's style, values kept.
+        let ten = ClipBlock::capture(&wb, 0, (0..10).collect(), vec![1]);
+        for r in 0..10 {
+            let cell = Cell {
+                style: 9,
+                ..Cell::number(10.0)
+            };
+            wb.sheets[0].set_cell(r, 3, cell);
+        }
+        let mut added = wb.clone();
+        let add = PasteSpec {
+            op: PasteOp::Add,
+            ..PasteSpec::default()
+        };
+        paste(&mut added, &ten, add);
+        assert_eq!(value_at(&added, "D1"), CellValue::Number(11.0));
+        for r in 6..=10 {
+            let at = format!("D{r}");
+            assert_eq!(value_at(&added, &at), CellValue::Number(10.0), "{at}");
+            assert_eq!(style_of(&added, &at), 9, "{at}");
+        }
+        paste(&mut wb, &ten, PasteSpec::of(PasteWhat::Formats));
+        for r in 6..=10 {
+            let at = format!("D{r}");
+            assert_eq!(value_at(&wb, &at), CellValue::Number(10.0), "{at}");
+            assert_eq!(style_of(&wb, &at), bordered, "{at}");
+        }
     }
 
     /// #1660 r2 M1: Sheet2!B1:B100 (column B styled, rows 1-5 used) pasted on
