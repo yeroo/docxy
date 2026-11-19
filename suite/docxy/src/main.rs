@@ -46323,9 +46323,15 @@ impl Docxy {
             let card = |cx: &mut Context<Self>, c: NewCardNow| {
                 let kind = c.kind;
                 // A further kind's icon (#2253), as a mask in the card's ink;
-                // the built-ins' text glyph.
+                // the built-ins' text glyph. The zero-width space gives the
+                // icon's row the glyphs' line height, so every card's name
+                // sits at the same height.
                 let glyph = match c.icon {
-                    Some(icon) => icon_svg(icon, 40., fg).into_any_element(),
+                    Some(icon) => h_flex()
+                        .items_center()
+                        .child(icon_svg(icon, 40., fg))
+                        .child("\u{200B}")
+                        .into_any_element(),
                     None => kind.glyph().into_any_element(),
                 };
                 v_flex()
