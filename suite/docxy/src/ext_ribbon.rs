@@ -282,21 +282,46 @@ pub(crate) fn icon_asset(path: &str) -> Option<Arc<[u8]>> {
 /// The suite's theme now, as [`ext::suite_theme`] gives it: the colours
 /// `render` draws the window with, and the Mail tabs' accent.
 pub(crate) fn suite_theme(cx: &App) -> ext::SuiteTheme {
-    let t = cx.theme();
-    theme_of(t, t.mode.is_dark())
+    suite_theme_with(None, cx)
 }
 
-/// [`suite_theme`] of the theme colours `t`, dark or light.
-fn theme_of(t: &gpui_component::ThemeColor, dark: bool) -> ext::SuiteTheme {
+/// [`suite_theme`] with a tab kind's own `accent` (#2253), light and dark;
+/// `None` is Mail's.
+pub(crate) fn suite_theme_with(accent: Option<(u32, u32)>, cx: &App) -> ext::SuiteTheme {
+    let t = cx.theme();
+    theme_of(t, t.mode.is_dark(), accent)
+}
+
+/// The theme a tab of `kind` is told: its kind's accent (#2253).
+pub(crate) fn suite_theme_for_tab(kind: crate::Kind, cx: &App) -> ext::SuiteTheme {
+    match kind {
+        crate::Kind::Ext(id) => ext::suite_theme_for(id.as_str(), cx),
+        _ => suite_theme(cx),
+    }
+}
+
+/// [`suite_theme`] of the theme colours `t`, dark or light, with `accent`.
+fn theme_of(
+    t: &gpui_component::ThemeColor,
+    dark: bool,
+    accent: Option<(u32, u32)>,
+) -> ext::SuiteTheme {
+    let accent = match accent {
+        Some((light, dark_shade)) => {
+            if dark {
+                dark_shade
+            } else {
+                light
+            }
+        }
+        None => crate::accent::for_kind(Some(crate::Kind::Look), dark),
+    };
     ext::SuiteTheme {
         dark,
         background: t.background,
         panel: t.secondary,
         border: t.border,
-        accent: Hsla::from(gpui::rgb(crate::accent::for_kind(
-            Some(crate::Kind::Look),
-            dark,
-        ))),
+        accent: Hsla::from(gpui::rgb(accent)),
         text: t.foreground,
         muted_text: t.muted_foreground,
         selection: t.selection,
@@ -396,10 +421,11 @@ impl Docxy {
     }
 
     /// Tells every extension tab of this window the theme now.
+    /// Each is told its own kind's accent (#2253).
     pub(crate) fn tell_ext_theme(&self, cx: &mut App) {
-        let theme = suite_theme(cx);
         for t in &self.tabs {
             if let Surface::Ext(e) = &t.surface {
+                let theme = suite_theme_for_tab(t.kind, cx);
                 e.theme_changed(&theme, cx);
             }
         }
@@ -762,8 +788,8 @@ mod tests {
     #[test]
     fn the_suite_theme_differs_light_and_dark() {
         use gpui_component::ThemeColor;
-        let light = theme_of(&ThemeColor::light(), false);
-        let dark = theme_of(&ThemeColor::dark(), true);
+        let light = theme_of(&ThemeColor::light(), false, None);
+        let dark = theme_of(&ThemeColor::dark(), true, None);
         assert!(!light.dark && dark.dark);
         assert_ne!(light.background, dark.background);
         assert_ne!(light.text, dark.text);

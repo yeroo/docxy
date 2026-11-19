@@ -20,6 +20,9 @@
 //! Account (top, with an icon) and Fixture Options (bottom), each a
 //! [`FixturePage`] counting its renders and recording where it and its Close
 //! tab button painted; the button dispatches [`ext::CloseTab`].
+//!
+//! Every variant also registers the same surface as a further tab kind,
+//! `fixture` (#2253, [`kind`]): its own File > New card, icon and accent.
 
 use crate::ext::{
     self, BackstageGroup, BackstagePage, DocView, Ribbon, RibbonCommand, RibbonControl,
@@ -417,6 +420,31 @@ impl TabSurface for FixtureMail {
     fn backstage_pages(&self, _cx: &App) -> Vec<BackstagePage> {
         self.pages.clone()
     }
+}
+
+/// The id of the fixture's further tab kind (#2253).
+pub(crate) const KIND_ID: &str = "fixture";
+
+/// The fixture kind's accent, light and dark (#2253): a purple no built-in
+/// kind uses, holding white File text at 4.5:1 and reading on the theme.
+pub(crate) const KIND_ACCENT: (u32, u32) = (0x6B3FA0, 0x8250C4);
+
+/// The fixture kind's icon: a square, so a shot tells it from Mail's glyph.
+const KIND_SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 20 20\" fill=\"currentColor\"><rect x=\"3\" y=\"3\" width=\"14\" height=\"14\" rx=\"3\"/></svg>";
+
+/// The fixture as a further tab kind (#2253): `fixture`, its card "Fixture"
+/// / "Test tab kind", its tabs titled "Fixture" (the surface gives no title
+/// of its own), drawn by [`factory`] as the Mail fixture is.
+pub(crate) fn kind(ribbon: bool) -> ext::ExtKind {
+    ext::ExtKind::new(
+        KIND_ID,
+        "Fixture",
+        "Test tab kind",
+        "Fixture",
+        factory(ribbon),
+    )
+    .icon(RibbonIcon::svg(KIND_SVG.as_bytes()))
+    .accent(KIND_ACCENT.0, KIND_ACCENT.1)
 }
 
 /// The fixture's Mail factory; with `ribbon` its surface describes

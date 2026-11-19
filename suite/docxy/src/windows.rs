@@ -409,6 +409,7 @@ mod tests {
             binary_source: false,
             compat: false,
             pdf_view: None,
+            ext_kind: None,
         }
     }
 

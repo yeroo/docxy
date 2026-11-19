@@ -59,6 +59,7 @@ mod doc_templates_tests;
 mod doc_view;
 pub mod ext;
 mod ext_fixture;
+mod ext_kinds;
 mod ext_ribbon;
 mod field_edit;
 mod file_keys;
@@ -352,6 +353,12 @@ enum Kind {
     /// a document with `pdf_view` set, so an older build reads the session
     /// (and converts the PDF).
     Pdf,
+    /// A further extension tab kind (#2253), by its id: drawn by that kind's
+    /// factory when this build registers it, else a placeholder. Written to
+    /// the session as a Mail tab (`look`) with `ext_kind` set, so an older
+    /// build reads the session; never serialized itself.
+    #[serde(skip)]
+    Ext(ext_kinds::ExtId),
 }
 
 /// Whether the Open-page backstage offers Recover Unsaved Workbooks (#1077).
@@ -371,6 +378,8 @@ impl Kind {
             Kind::Look => "\u{2709}",
             Kind::Help => "\u{2753}",
             Kind::Pdf => "\u{1F4D1}",
+            // A kind with an icon draws it instead (`ext_kind_icon`).
+            Kind::Ext(_) => "\u{25A3}",
         }
     }
 }
@@ -459,6 +468,11 @@ struct PersistTab {
     /// build reads the session (and converts the PDF, as it opened PDFs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pdf_view: Option<pdf_view::host::PdfAt>,
+    /// A further extension tab kind's id (#2253): its `kind` is `look`, so
+    /// an older build reads the session (as a Mail tab). Read only with
+    /// `kind` `look`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ext_kind: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -16761,7 +16775,7 @@ fn reopens_from_file(t: &DocTab) -> bool {
         Kind::Project => path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("yppx")),
-        Kind::Look | Kind::Help | Kind::Pdf => false,
+        Kind::Look | Kind::Help | Kind::Pdf | Kind::Ext(_) => false,
     }
 }
 
@@ -16958,6 +16972,164 @@ mod session_union_tests {
         assert!(recovered.is_empty());
         assert!(matches!(startup_tabs(tabs, false), Startup::StartScreen));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #2253: a further extension kind's tab, one this build registers or
+    /// not, is a Mail row (`look`) with its `ext_kind`, so an older build
+    /// reads the session. It restores as its kind, a placeholder with its
+    /// title, the next write writes it back the same, and attaching asks a
+    /// registered kind's factory and tells an unregistered one's tab it is
+    /// not available. `ext_kind` on a row that is not Mail's is a hand
+    /// edit: the row restores by its `kind`, and the id is dropped.
+    #[test]
+    fn extension_kind_tabs_round_trip_by_their_id() {
+        use super::{AttachStep, Surface, attach_step, ext_kinds::ExtId};
+        let root = fresh_root("ext-kinds");
+        let session: Session = serde_json::from_str(
+            r#"{"active": 1, "tabs": [
+                {"kind": "Look", "title": "Inbox", "path": null},
+                {"kind": "Look", "title": "Fixture", "path": null, "ext_kind": "fixture"},
+                {"kind": "Look", "title": "Gone tab", "path": null, "ext_kind": "gone"},
+                {"kind": "Docx", "title": "Doc", "path": null, "ext_kind": "fixture"}
+            ]}"#,
+        )
+        .unwrap();
+        let restore = |session: &Session| {
+            restore_session_noting(
+                session,
+                false,
+                std::time::SystemTime::now(),
+                &trusted::TrustStore::default(),
+            )
+            .0
+        };
+        let (fixture, gone) = (ExtId::intern("fixture"), ExtId::intern("gone"));
+        let check = |tabs: &[DocTab]| {
+            assert!(tabs[0].kind == Kind::Look);
+            assert!(tabs[1].kind == Kind::Ext(fixture));
+            assert!(tabs[2].kind == Kind::Ext(gone));
+            assert!(tabs[3].kind == Kind::Docx);
+            let titles: Vec<&str> = tabs.iter().map(|t| t.title.as_ref()).collect();
+            assert_eq!(titles, ["Inbox", "Fixture", "Gone tab", "Doc"]);
+            for t in &tabs[..3] {
+                assert!(matches!(t.surface, Surface::Placeholder));
+            }
+            assert!(matches!(tabs[3].surface, Surface::Doc(_)));
+        };
+        let tabs = restore(&session);
+        check(&tabs);
+
+        // This build registers `fixture` (as "Fixture"), not `gone`.
+        let name_of = |id: ExtId| (id == fixture).then_some("Fixture");
+        assert_eq!(attach_step(&tabs[0], name_of), Some(AttachStep::Mail));
+        assert_eq!(
+            attach_step(&tabs[1], name_of),
+            Some(AttachStep::Kind(fixture))
+        );
+        assert_eq!(
+            attach_step(&tabs[2], name_of),
+            Some(AttachStep::Unavailable(gone))
+        );
+        assert_eq!(attach_step(&tabs[3], name_of), None);
+
+        write_session_with(&root, &tabs, 1, prefs(), SessionWrite::All, &[], 0);
+        let text = std::fs::read_to_string(session_path_in(&root)).unwrap();
+        let written = session_json(&root);
+        let rows: Vec<(bool, Option<&str>)> = written
+            .tabs
+            .iter()
+            .map(|t| (t.kind == Kind::Look, t.ext_kind.as_deref()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (true, None),
+                (true, Some("fixture")),
+                (true, Some("gone")),
+                (false, None)
+            ],
+            "{text}"
+        );
+        // A Mail row an older build reads; Mail's own row has no `ext_kind`.
+        assert_eq!(text.matches("\"ext_kind\"").count(), 2, "{text}");
+        check(&restore(&written));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #2253: attaching asks a tab once. A refused tab (its status starts
+    /// with its kind's name, or `Mail: `) is not asked again; an
+    /// unregistered kind's tab is told once, while its status is empty; a
+    /// tab drawn already, or failed, is left alone.
+    #[test]
+    fn attaching_asks_each_extension_tab_once() {
+        use super::{AttachStep, Surface, attach_step, ext_kinds::ExtId};
+        let fixture = ExtId::intern("fixture");
+        let name_of = |id: ExtId| (id == fixture).then_some("Fixture");
+        let mut t = doc_tab("Fixture", false);
+        t.surface = Surface::Placeholder;
+        t.status = "".into();
+        t.kind = Kind::Ext(fixture);
+        assert_eq!(attach_step(&t, name_of), Some(AttachStep::Kind(fixture)));
+        t.status = "Fixture: no account".into();
+        assert_eq!(attach_step(&t, name_of), None);
+        // Another kind's refusal is not this one's.
+        t.status = "Fixtures: no".into();
+        assert_eq!(attach_step(&t, name_of), Some(AttachStep::Kind(fixture)));
+        t.status = "Mail: no account".into();
+        t.kind = Kind::Look;
+        assert_eq!(attach_step(&t, name_of), None);
+        let gone = ExtId::intern("gone");
+        t.kind = Kind::Ext(gone);
+        t.status = "".into();
+        assert_eq!(
+            attach_step(&t, name_of),
+            Some(AttachStep::Unavailable(gone))
+        );
+        t.status = super::ext_kinds::unavailable_status(gone).into();
+        assert_eq!(t.status.as_ref(), "gone: not available in this build");
+        assert_eq!(attach_step(&t, name_of), None);
+        t.kind = Kind::Ext(fixture);
+        t.status = "".into();
+        t.load_failed = true;
+        assert_eq!(attach_step(&t, name_of), None);
+        t.load_failed = false;
+        t.surface = doc_tab("x", false).surface;
+        assert_eq!(attach_step(&t, name_of), None);
+    }
+
+    /// #2253: the public build's `Extensions::default()` gives File > New
+    /// the suite's four cards alone; a registered kind's card comes after
+    /// them, opening a tab of that kind.
+    #[test]
+    fn new_cards_are_the_four_then_each_registered_kind() {
+        use super::{ext, ext_fixture, ext_kinds, new_cards_of};
+        let (kinds, errors) = ext_kinds::validate(ext::Extensions::default().kinds);
+        assert!(errors.is_empty());
+        let ids: Vec<String> = new_cards_of(&kinds)
+            .iter()
+            .map(|c| c.id.to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "new-doc-card",
+                "new-xls-card",
+                "new-project-card",
+                "new-mail-card"
+            ]
+        );
+        let (kinds, _) = ext_kinds::validate(vec![ext_fixture::kind(false)]);
+        let cards = new_cards_of(&kinds);
+        assert_eq!(cards.len(), 5);
+        let c = &cards[4];
+        assert_eq!(c.id.as_ref(), "new-ext-card:fixture");
+        assert_eq!(
+            (c.name.as_ref(), c.sub.as_ref()),
+            ("Fixture", "Test tab kind")
+        );
+        assert!(c.kind == Kind::Ext(ext_kinds::ExtId::intern("fixture")));
+        assert!(c.icon.is_some_and(|i| i.starts_with("ext/")));
+        assert!(cards[..4].iter().all(|c| c.icon.is_none()));
     }
 
     /// The same tabs written twice write the same session but for the
@@ -17699,6 +17871,19 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
 }
 
 fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab, bool) {
+    // A further extension kind's tab (#2253): restored as a Mail tab is, a
+    // placeholder with its title, then of its own kind. `ext_kind` counts
+    // only on a Mail row: on any other it is a hand edit, and the row
+    // restores by its `kind`, so no document becomes a placeholder.
+    if let Some(id) = t.ext_kind.as_deref().filter(|_| t.kind == Kind::Look) {
+        let plain = PersistTab {
+            ext_kind: None,
+            ..t.clone()
+        };
+        let (mut tab, from_hot) = restore_tab_content(&plain, trusted);
+        tab.kind = Kind::Ext(ext_kinds::ExtId::intern(id));
+        return (tab, from_hot);
+    }
     // A PDF view (#2245), where it was, not opened yet: it opens when it is
     // first in front (`finish_pending_pdf`), as a document if it is no PDF
     // by then.
@@ -18125,12 +18310,15 @@ fn forgotten(p: PersistTab) -> PersistTab {
 fn persist_tab_meta(t: &DocTab) -> PersistTab {
     // A PDF view (#2245) is a document row an older build can read.
     let pdf_view = pdf_view::host::pdf_at(t);
+    // A further extension kind (#2253) is a Mail row with its id.
+    let (kind, ext_kind) = match t.kind {
+        Kind::Pdf => (Kind::Docx, None),
+        Kind::Ext(id) => (Kind::Look, Some(id.as_str().to_string())),
+        k => (k, None),
+    };
     PersistTab {
-        kind: if t.kind == Kind::Pdf {
-            Kind::Docx
-        } else {
-            t.kind
-        },
+        kind,
+        ext_kind,
         pdf_view,
         title: t.title.to_string(),
         path: t.path.as_ref().map(|p| p.display().to_string()),
@@ -18373,6 +18561,46 @@ const NEW_CARDS: [NewCard; 4] = [
         kind: Kind::Look,
     },
 ];
+
+/// A card of File > New as drawn now: a built-in one of [`NEW_CARDS`], or a
+/// further extension kind's (#2253), whose id is `new-ext-card:<kind id>`.
+#[derive(Clone)]
+struct NewCardNow {
+    id: SharedString,
+    name: SharedString,
+    sub: SharedString,
+    kind: Kind,
+    /// A further kind's icon asset (`ext/<hash>`); `None` draws the glyph.
+    icon: Option<&'static str>,
+}
+
+/// The New page's cards, in order: the suite's four, then one per further
+/// extension kind this App registers (#2253). `Extensions::default()` gives
+/// the four alone.
+fn new_cards(cx: &App) -> Vec<NewCardNow> {
+    new_cards_of(ext_kinds::registered(cx))
+}
+
+/// [`new_cards`] with `kinds` registered.
+fn new_cards_of(kinds: &[ext_kinds::Registered]) -> Vec<NewCardNow> {
+    NEW_CARDS
+        .iter()
+        .map(|c| NewCardNow {
+            id: c.id.into(),
+            name: c.name.into(),
+            sub: c.sub.into(),
+            kind: c.kind,
+            icon: None,
+        })
+        .chain(kinds.iter().map(|r| NewCardNow {
+            id: format!("new-ext-card:{}", r.id.as_str()).into(),
+            name: r.name.clone().into(),
+            sub: r.sub.clone().into(),
+            kind: Kind::Ext(r.id),
+            icon: r.icon,
+        }))
+        .collect()
+}
 
 /// Hand `pending` to the first tab's status (#806), once there is one, but
 /// only while that still shows the status it was made with: whatever its
@@ -19690,11 +19918,21 @@ impl Docxy {
             ),
             Kind::Xlsx => new_tab("Untitled.xlsx", new_sheet_surface()),
             Kind::Look => new_tab("Inbox", Surface::Placeholder),
+            // A further extension kind (#2253), by its card: only one this
+            // build registers has one.
+            Kind::Ext(id) => match ext_kinds::find(id, cx) {
+                Some(r) => {
+                    let title = r.title.clone();
+                    new_tab(&title, Surface::Placeholder)
+                }
+                None => return,
+            },
             // Not a File > New card: a Help tab opens from Help or F1, a PDF
             // view from a PDF (#2245).
             Kind::Help | Kind::Pdf => return,
         });
-        // A build with a Mail extension draws the new tab at once.
+        // A build with a Mail extension, or a kind's (#2253), draws the new
+        // tab at once.
         self.attach_ext_surfaces(cx);
         self.active = self.tabs.len() - 1;
         self.backstage = false;
@@ -22995,10 +23233,11 @@ impl Docxy {
     /// The dark flag comes from the preference, not `applied`: render sets
     /// the accent before `apply_theme` runs, and `applied` is still `None` on
     /// the first frame and stale after a theme switch.
-    pub(crate) fn accent_now(&self) -> u32 {
-        accent::for_kind(
+    pub(crate) fn accent_now(&self, cx: &App) -> u32 {
+        accent::for_tab(
             self.tabs.get(self.active).map(|t| t.kind),
             self.theme_pref.resolve(self.os_appearance) == ThemeMode::Dark,
+            cx,
         )
     }
 
@@ -46081,14 +46320,16 @@ impl Docxy {
         let pane = if ext_page.is_some() {
             div().into_any_element()
         } else if self.bs_new {
-            let card = |cx: &mut Context<Self>,
-                        id: &'static str,
-                        glyph: &'static str,
-                        name: &'static str,
-                        sub: &'static str,
-                        kind: Kind| {
+            let card = |cx: &mut Context<Self>, c: NewCardNow| {
+                let kind = c.kind;
+                // A further kind's icon (#2253), as a mask in the card's ink;
+                // the built-ins' text glyph.
+                let glyph = match c.icon {
+                    Some(icon) => icon_svg(icon, 40., fg).into_any_element(),
+                    None => kind.glyph().into_any_element(),
+                };
                 v_flex()
-                    .id(id)
+                    .id(ElementId::Name(c.id))
                     .w(px(150.))
                     .h(px(160.))
                     .p_3()
@@ -46103,13 +46344,14 @@ impl Docxy {
                         div()
                             .text_color(fg)
                             .font_weight(FontWeight::BOLD)
-                            .child(name),
+                            .child(c.name),
                     )
-                    .child(div().text_size(px(11.)).text_color(dim).child(sub))
+                    .child(div().text_size(px(11.)).text_color(dim).child(c.sub))
                     .on_click(
                         cx.listener(move |this, _, window, cx| this.add_tab(kind, window, cx)),
                     )
             };
+            let cards = new_cards(cx);
             v_flex()
                 .w_full()
                 .p_8()
@@ -46122,9 +46364,13 @@ impl Docxy {
                         .text_color(fg)
                         .child("New"),
                 )
-                .child(h_flex().gap_4().children(
-                    NEW_CARDS.map(|c| card(cx, c.id, c.kind.glyph(), c.name, c.sub, c.kind)),
-                ))
+                // Wraps once a build's further kinds fill the row (#2253).
+                .child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap_4()
+                        .children(cards.into_iter().map(|c| card(cx, c))),
+                )
                 .child(self.personal_templates_section(fg, dim, cx))
                 .into_any_element()
         } else if let Some(page) = self.account_page(bg, fg, dim, cx) {
@@ -46865,7 +47111,7 @@ impl Render for Docxy {
         self.pdf_tick(window, cx);
         // The ribbon, backstage and title bar draw the selected tab's accent
         // (#1473); set it before any of them is built.
-        self.drawn_accent = self.accent_now();
+        self.drawn_accent = self.accent_now(cx);
         accent::set(self.drawn_accent);
         self.drawn_galleries.borrow_mut().clear();
         // Pictures a package change replaced leave gpui's asset cache (#1639).
@@ -47027,6 +47273,12 @@ impl Render for Docxy {
             .take(strip.end - strip.first)
             .map(|(i, tb)| {
                 let active = i == self.active && !self.backstage;
+                // A further kind's icon (#2253), in the chip's ink, for the
+                // built-ins' text glyph.
+                let icon = match tb.kind {
+                    Kind::Ext(id) => ext_kinds::find(id, cx).and_then(|r| r.icon),
+                    _ => None,
+                };
                 let full_tip = SharedString::from(format!(
                     "{}{}{}",
                     tb.caption(),
@@ -47051,17 +47303,19 @@ impl Render for Docxy {
                     .when(i == self.active, |d| {
                         d.child(probe(&self.probes, "title-active-chip"))
                     })
+                    .when_some(icon, |d, icon| {
+                        d.child(icon_svg(icon, 14., if active { fg } else { dim }))
+                    })
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .child(SharedString::from(format!(
-                                "{} {}",
-                                tb.kind.glyph(),
-                                tb.caption()
-                            ))),
+                            .child(SharedString::from(match icon {
+                                Some(_) => tb.caption(),
+                                None => format!("{} {}", tb.kind.glyph(), tb.caption()),
+                            })),
                     )
                     // Keep status visible when the title is clipped. The full
                     // imported text appears on roomy chips; narrow ones still
@@ -47186,7 +47440,7 @@ impl Render for Docxy {
         // only when it changed, as the platform writes it on every call. The
         // title bar's own label names the tab's type instead (#1473), so the
         // document's name stays on its tab.
-        let title_label = accent::label(self.tabs.get(self.active).map(|t| t.kind));
+        let title_label = accent::label_for(self.tabs.get(self.active).map(|t| t.kind), cx);
         let window_title =
             doc_name::window_title(self.tabs.get(self.active).map(|t| t.title.as_ref()));
         if self.last_window_title.as_deref() != Some(window_title.as_str()) {
@@ -48393,7 +48647,7 @@ impl Render for Docxy {
                 Surface::Project(v) => {
                     project_el(v, self.active, pal, &self.probes, cx).into_any_element()
                 }
-                Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
+                Surface::Placeholder => placeholder(tab.kind, bg, dim, cx).into_any_element(),
                 Surface::Ext(e) => div()
                     .flex_1()
                     .min_h(px(0.))
@@ -48402,7 +48656,7 @@ impl Render for Docxy {
                     .into_any_element(),
                 Surface::Help(v) => self.help_body(tab, v, pal, bg, cx),
                 Surface::Pdf(v) => self.pdf_body(v, pal, bg, cx),
-                Surface::PdfPending(_) => placeholder(tab.kind, bg, dim).into_any_element(),
+                Surface::PdfPending(_) => placeholder(tab.kind, bg, dim, cx).into_any_element(),
             },
             None => v_flex()
                 .flex_1()
@@ -53257,18 +53511,19 @@ fn sheet_hbar(
         .into_any_element()
 }
 
-fn placeholder(kind: Kind, bg: Hsla, dim: Hsla) -> impl IntoElement {
-    let (name, blurb) = match kind {
-        Kind::Xlsx => ("xlsxy", "the spreadsheet grid (gridcore) lands here next"),
-        Kind::Look => (
-            "lookxy",
-            "mail list + reading pane (mailcore) lands here next",
-        ),
-        Kind::Docx | Kind::Help | Kind::Pdf => ("docxy", ""),
-        Kind::Project => (
-            "Project",
-            "The schedule could not be loaded; see the status below.",
-        ),
+fn placeholder(kind: Kind, bg: Hsla, dim: Hsla, cx: &App) -> impl IntoElement {
+    let (name, blurb): (SharedString, SharedString) = match kind {
+        // A further extension kind (#2253): its name, and why it is not
+        // drawn when this build does not register it (a refusal is on the
+        // status line).
+        Kind::Ext(id) => match ext_kinds::find(id, cx) {
+            Some(r) => (r.name.clone().into(), "".into()),
+            None => (id.as_str().into(), "not available in this build".into()),
+        },
+        k => {
+            let (name, blurb) = placeholder_text(k);
+            (name.into(), blurb.into())
+        }
     };
     v_flex()
         .flex_1()
@@ -53284,6 +53539,22 @@ fn placeholder(kind: Kind, bg: Hsla, dim: Hsla) -> impl IntoElement {
                 .child(name),
         )
         .child(div().text_color(dim).child(blurb))
+}
+
+/// A built-in kind's placeholder: its name and a line under it.
+fn placeholder_text(kind: Kind) -> (&'static str, &'static str) {
+    match kind {
+        Kind::Xlsx => ("xlsxy", "the spreadsheet grid (gridcore) lands here next"),
+        Kind::Look => (
+            "lookxy",
+            "mail list + reading pane (mailcore) lands here next",
+        ),
+        Kind::Docx | Kind::Help | Kind::Pdf | Kind::Ext(_) => ("docxy", ""),
+        Kind::Project => (
+            "Project",
+            "The schedule could not be loaded; see the status below.",
+        ),
+    }
 }
 
 /// The window the app opens, as a pure function of its bounds and whether this
@@ -53666,12 +53937,27 @@ pub fn run(extensions: ext::Extensions) {
         doc_view::set_harness(want_harness);
         if let Some(mut extensions) = extensions.take() {
             // A harness case that asks for the test extension (#1873) gets it
-            // as Mail, unless the build links a Mail of its own.
-            if want_harness && extensions.mail.is_none() && harness::ext_fixture_requested() {
-                extensions.mail =
-                    Some(ext_fixture::factory(harness::ext_fixture_ribbon_requested()));
+            // as Mail, unless the build links a Mail of its own, and as a
+            // further tab kind, `fixture` (#2253), unless the build has one.
+            if want_harness && harness::ext_fixture_requested() {
+                let ribbon = harness::ext_fixture_ribbon_requested();
+                if extensions.mail.is_none() {
+                    extensions.mail = Some(ext_fixture::factory(ribbon));
+                }
+                if !extensions
+                    .kinds
+                    .iter()
+                    .any(|k| k.id == ext_fixture::KIND_ID)
+                {
+                    extensions.kinds.push(ext_fixture::kind(ribbon));
+                }
             }
-            ext::install(cx, extensions);
+            // A kind left out is said as a plugin that does not load is.
+            for error in ext::install(cx, extensions) {
+                let msg = format!("docxy: {error}");
+                eprintln!("{msg}");
+                crashlog::startup(&config_root(), &msg);
+            }
         }
         // Tab / Shift-Tab are reserved by gpui's focus system; bind them to
         // actions so the document can insert a tab / outdent instead.
@@ -59223,24 +59509,80 @@ mod cycle_tab_key_tests {
 
 // ---- extension surfaces and torn-off tabs -----------------------------------
 
+/// The status prefix of a Mail tab whose extension refused it.
+const MAIL_REFUSED: &str = "Mail: ";
+
+/// What [`Docxy::attach_ext_surfaces`] does for one tab.
+#[derive(Debug, PartialEq)]
+enum AttachStep {
+    /// Ask the Mail factory.
+    Mail,
+    /// Ask kind `.0`'s factory (#2253); a refusal is said after its name
+    /// and `": "`.
+    Kind(ext_kinds::ExtId),
+    /// Say on the status line that this build has no such kind.
+    Unavailable(ext_kinds::ExtId),
+}
+
+/// What attaching does for tab `t` now, `None` for nothing: only a Mail or
+/// further-kind tab still drawn as the placeholder, not failed, is asked,
+/// and not again once it refused (its status starts with the refusal's
+/// prefix). `name_of` is a registered kind's name, `None` for an id this
+/// build does not register: such a tab is told so once, while its status is
+/// still empty.
+fn attach_step<'a>(
+    t: &DocTab,
+    name_of: impl Fn(ext_kinds::ExtId) -> Option<&'a str>,
+) -> Option<AttachStep> {
+    if !matches!(t.surface, Surface::Placeholder) || t.load_failed {
+        return None;
+    }
+    match t.kind {
+        Kind::Look => (!t.status.starts_with(MAIL_REFUSED)).then_some(AttachStep::Mail),
+        Kind::Ext(id) => match name_of(id) {
+            None => t.status.is_empty().then_some(AttachStep::Unavailable(id)),
+            Some(name) => {
+                // No string built: this runs on every render.
+                let refused = t
+                    .status
+                    .strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with(": "));
+                (!refused).then_some(AttachStep::Kind(id))
+            }
+        },
+        _ => None,
+    }
+}
+
 impl Docxy {
     /// Gives every Mail tab still drawn as the placeholder the extension's
-    /// surface, when a build links one. A tab the extension refused keeps the
-    /// placeholder, its reason on its status line, and is not asked again.
+    /// surface, when a build links one, and every tab of a further kind a
+    /// build registers (#2253) its kind's. A tab the extension refused keeps
+    /// the placeholder, its reason on its status line (`Mail: `, or the
+    /// kind's name), and is not asked again. A restored tab of a kind this
+    /// build does not register says so on its status line, once. Runs on
+    /// every render: a tab it has nothing to do for costs a lookup.
     fn attach_ext_surfaces(&mut self, cx: &mut Context<Self>) {
-        const REFUSED: &str = "Mail: ";
         let mut dark = None;
         for i in 0..self.tabs.len() {
-            let t = &self.tabs[i];
-            if t.kind != Kind::Look
-                || !matches!(t.surface, Surface::Placeholder)
-                || t.load_failed
-                || t.status.starts_with(REFUSED)
-            {
+            let name_of = |id| ext_kinds::find(id, cx).map(|r| r.name.as_str());
+            let Some(step) = attach_step(&self.tabs[i], name_of) else {
                 continue;
-            }
-            match ext::new_mail(cx) {
-                None => return,
+            };
+            let (refused, made) = match step {
+                AttachStep::Mail => (MAIL_REFUSED.to_string(), ext::new_mail(cx)),
+                AttachStep::Kind(id) => {
+                    let name = ext_kinds::find(id, cx).map_or("", |r| r.name.as_str());
+                    (format!("{name}: "), ext_kinds::new_surface(id, cx))
+                }
+                AttachStep::Unavailable(id) => {
+                    self.tabs[i].status = ext_kinds::unavailable_status(id).into();
+                    continue;
+                }
+            };
+            match made {
+                // No factory for this kind: the next tab may have one.
+                None => continue,
                 Some(Ok(surface)) => {
                     let dark = *dark.get_or_insert_with(|| {
                         self.applied
@@ -59249,16 +59591,18 @@ impl Docxy {
                     });
                     surface.set_dark(dark, cx);
                     // Its colours (#1870), once a theme is drawn: before
-                    // the first, `apply_theme` tells it right after.
+                    // the first, `apply_theme` tells it right after. A
+                    // further kind's carry its own accent (#2253).
                     if self.applied.is_some() {
-                        surface.theme_changed(&ext::suite_theme(cx), cx);
+                        let theme = ext_ribbon::suite_theme_for_tab(self.tabs[i].kind, cx);
+                        surface.theme_changed(&theme, cx);
                     }
                     if let Some(title) = surface.title(cx) {
                         self.tabs[i].title = title.into();
                     }
                     self.tabs[i].surface = Surface::Ext(ext_ribbon::ExtTab::new(surface));
                 }
-                Some(Err(e)) => self.tabs[i].status = format!("{REFUSED}{e}").into(),
+                Some(Err(e)) => self.tabs[i].status = format!("{refused}{e}").into(),
             }
         }
     }

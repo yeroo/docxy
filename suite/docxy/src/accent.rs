@@ -8,13 +8,14 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::{BRAND, Kind};
+use crate::{BRAND, Kind, ext_kinds};
 
 static CURRENT: AtomicU32 = AtomicU32::new(BRAND);
 
 /// The accent for `kind` (None: no tab) on the light or dark theme. Both
 /// shades hold white File-button text at 4.5:1, except doc, whose teal is the
-/// unchanged brand.
+/// unchanged brand. A further extension kind (#2253) is the brand here: its
+/// own accent is [`for_tab`]'s.
 pub(crate) fn for_kind(kind: Option<Kind>, dark: bool) -> u32 {
     match (kind, dark) {
         (Some(Kind::Xlsx), false) => 0x1E7B3A,
@@ -25,9 +26,38 @@ pub(crate) fn for_kind(kind: Option<Kind>, dark: bool) -> u32 {
     }
 }
 
-/// The one word the title bar shows for the selected tab.
+/// [`for_kind`], with a further extension kind's own accent (#2253) when
+/// this App registers it with one.
+pub(crate) fn for_tab(kind: Option<Kind>, dark: bool, cx: &gpui::App) -> u32 {
+    match kind {
+        Some(Kind::Ext(id)) => {
+            ext_kinds::find(id, cx)
+                .and_then(|r| r.accent)
+                .map_or(
+                    BRAND,
+                    |(light, dark_shade)| {
+                        if dark { dark_shade } else { light }
+                    },
+                )
+        }
+        k => for_kind(k, dark),
+    }
+}
+
+/// [`label`], with a registered extension kind's own word (#2253): its
+/// name, lowercased.
+pub(crate) fn label_for(kind: Option<Kind>, cx: &gpui::App) -> &'static str {
+    match kind {
+        Some(Kind::Ext(id)) => ext_kinds::find(id, cx).map_or(id.as_str(), |r| r.label),
+        k => label(k),
+    }
+}
+
+/// The one word the title bar shows for the selected tab. A further
+/// extension kind (#2253) shows its id here; [`label_for`] its name.
 pub(crate) fn label(kind: Option<Kind>) -> &'static str {
     match kind {
+        Some(Kind::Ext(id)) => id.as_str(),
         Some(Kind::Xlsx) => "sheet",
         Some(Kind::Project) => "project",
         Some(Kind::Look) => "mail",
@@ -103,6 +133,39 @@ mod tests {
             for_kind(Some(Kind::Project), false),
             for_kind(Some(Kind::Project), true)
         );
+    }
+
+    /// #2253: a further extension kind is the brand and its id until its
+    /// registration says otherwise (`for_tab`, `label_for`).
+    #[test]
+    fn an_extension_kind_without_its_registration_is_the_brand_and_its_id() {
+        let k = Some(Kind::Ext(ext_kinds::ExtId::intern("some.kind")));
+        assert_eq!(label(k), "some.kind");
+        for dark in [false, true] {
+            assert_eq!(for_kind(k, dark), BRAND);
+        }
+    }
+
+    /// The harness's test kind's accent (#2253) holds the same bar as the
+    /// built-in kinds', and is none of theirs.
+    #[test]
+    fn the_fixture_kinds_accent_reads_and_is_its_own() {
+        let (light, dark_shade) = crate::ext_fixture::KIND_ACCENT;
+        for (dark, a) in [(false, light), (true, dark_shade)] {
+            let bg = if dark {
+                ThemeColor::dark().background
+            } else {
+                ThemeColor::light().background
+            }
+            .to_rgb();
+            let on_bg = contrast(gpui::rgb(a), bg);
+            assert!(on_bg >= 3.0, "dark={dark} on background: {on_bg:.2}");
+            let w = contrast(gpui::rgb(crate::FILE_FG), gpui::rgb(a));
+            assert!(w >= 4.5, "dark={dark} under File text: {w:.2}");
+            for k in KINDS {
+                assert_ne!(a, for_kind(k, dark));
+            }
+        }
     }
 
     #[test]

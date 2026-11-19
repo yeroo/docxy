@@ -159,15 +159,27 @@ fn compose(doc: Document, pkg: Package, cx: &mut App) -> Rc<Cell<usize>> {
     changes
 }
 
-/// A build that links the extension: Mail tabs are its reader.
+/// A build that links the extension: Mail tabs are its reader, and a
+/// further tab kind (#2253) is too, with its own card, icon and accent.
 fn extensions() -> Extensions {
     let factory: ext::Factory = Rc::new(|cx: &mut App| {
         let pkg = docxcore::package::new_package(Document { body: vec![] });
         Ok(Box::new(embed(Document { body: vec![] }, pkg, cx)) as Box<dyn TabSurface>)
     });
+    let notes = ext::ExtKind::new("notes", "Notes", "A blank note", "Note", factory.clone())
+        .icon(ext::RibbonIcon::svg(
+            &b"<svg xmlns='http://www.w3.org/2000/svg'/>"[..],
+        ))
+        .accent(0x6B3FA0, 0x7A4BB0);
     Extensions {
         mail: Some(factory),
+        kinds: vec![notes],
     }
+}
+
+/// A tab of a further kind is told the suite's theme in its kind's accent.
+fn notes_theme(cx: &App) -> ext::SuiteTheme {
+    ext::suite_theme_for("notes", cx)
 }
 
 #[test]

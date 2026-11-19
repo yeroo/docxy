@@ -132,6 +132,7 @@ fn persisted(path: Option<&Path>, hot: Option<&Path>, dirty: bool) -> PersistTab
         binary_source: false,
         compat: false,
         pdf_view: None,
+        ext_kind: None,
     }
 }
 
