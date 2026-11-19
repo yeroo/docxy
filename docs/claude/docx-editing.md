@@ -454,11 +454,14 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   paragraphs drops them: a known gap). Typing before a link whose text
   starts after one goes into the link past it; past a link holding only
   one, after the link (`link_opening_with_pending`). The terminal view
-  draws the caret after one: `projected_caret_stops` makes the stop on the
-  previous character's trailing side (either direction) a click-only
-  `LineSeg::hits` entry, so clicks on the object's text land at its offset
-  and arrows step over it in one press; the suite's `paragraph_el` holds a
-  run-end caret past one (`pending_object_follows`).
+  draws the caret after one: its shown text's glyphs carry `Glyph::pending`
+  (the offset), and `after_pending_objects` gives that offset one stop on
+  the text's far side in its direction (the line's end included) and turns
+  the line's other stops for it into click-only `LineSeg::hits`, so clicks
+  on the object's text land at its offset and arrows step over it in one
+  press; the suite's `paragraph_el` holds a run-end caret past one
+  (`pending_object_follows`), so the next piece with a width, or the
+  paragraph's end, draws it.
 - Compare: a field failing `is_run_level(run_level_field(..))` is never in a
   `w:ins`/`w:del`: deleted, it is skipped; inserted, `emit_wrapped` lifts it
   out like a marker. Both report `CompareSkip::Object`.

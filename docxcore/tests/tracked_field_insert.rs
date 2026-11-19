@@ -930,3 +930,90 @@ fn text_typed_at_a_link_opening_with_a_pending_insertion_follows_it() {
         );
     }
 }
+
+/// `text`, then a pending field showing `777` at its end, tracking as Ada.
+fn ab_then_field(text: &str) -> Editor {
+    let mut ed = Editor::new(parse(&format!(
+        "<w:p><w:r><w:t xml:space=\"preserve\">{text}</w:t></w:r></w:p>"
+    )));
+    track(&mut ed, "Ada");
+    let at = text.chars().count();
+    insert_at(
+        &mut ed,
+        at,
+        docxcore::field::fld_simple(" PAGE ", "777", &RunProps::default()),
+    );
+    ed
+}
+
+/// At a paragraph's end the caret after a pending insertion is drawn after
+/// its text too, as typing goes there (r4 addendum).
+#[test]
+fn the_terminal_caret_after_a_pending_insertion_ending_a_paragraph() {
+    use docxcore::render::{RenderOptions, render_mapped};
+    let ed = ab_then_field("ab");
+    let (lines, maps) = render_mapped(&ed.doc, &RenderOptions::default());
+    assert_eq!(lines[0].plain().trim_end(), "ab777");
+    let map = &maps[0];
+    assert_eq!(map.col_for_caret(&[0], 2, None), Some(5));
+    for col in [2, 3, 4, 5] {
+        assert_eq!(
+            map.nearest_caret(col).map(|c| c.offset),
+            Some(2),
+            "col {col}"
+        );
+    }
+    let left = map.visual_neighbor(&[0], 2, None, false).expect("a stop");
+    assert_eq!((left.offset, left.col), (1, 1));
+    let right = map.visual_neighbor(&[0], 1, None, true).expect("a stop");
+    assert_eq!((right.offset, right.col), (2, 5));
+
+    // Right to left: after it is on its left.
+    let opts = RenderOptions {
+        bidi: Some(std::rc::Rc::new(AllRtl)),
+        ..RenderOptions::default()
+    };
+    let (lines, maps) = render_mapped(&ed.doc, &opts);
+    let line = lines[0].plain();
+    let at = line.find("777ba").expect("reversed");
+    assert_eq!(maps[0].col_for_caret(&[0], 2, None), Some(at), "{line:?}");
+    for col in [at, at + 1, at + 2, at + 3] {
+        assert_eq!(
+            maps[0].nearest_caret(col).map(|c| c.offset),
+            Some(2),
+            "col {col}"
+        );
+    }
+}
+
+/// A pending insertion that ends a wrapped line (`ab 777 ` | `cdefgh`: a
+/// line breaks at a space, so one follows it there): the caret at its
+/// offset is drawn after its text on that line.
+#[test]
+fn the_terminal_caret_after_a_pending_insertion_ending_a_wrapped_line() {
+    use docxcore::render::{RenderOptions, render_mapped};
+    let mut ed = ab_then_field("ab ");
+    ed.set_caret(Caret::at(vec![0], 3));
+    ed.insert_str(" cdefgh");
+    let opts = RenderOptions {
+        width: 8,
+        ..RenderOptions::default()
+    };
+    let (lines, maps) = render_mapped(&ed.doc, &opts);
+    let shown: Vec<String> = lines.iter().map(|l| l.plain()).collect();
+    let row = shown
+        .iter()
+        .position(|l| l.trim_end().ends_with("777"))
+        .unwrap_or_else(|| panic!("a line ending with the field: {shown:?}"));
+    let end = shown[row].trim_end().len();
+    assert_eq!(
+        maps[row].col_for_caret(&[0], 3, None),
+        Some(end),
+        "{shown:?}"
+    );
+    assert_eq!(
+        maps[row].nearest_caret(end - 2).map(|c| c.offset),
+        Some(3),
+        "{shown:?}"
+    );
+}
