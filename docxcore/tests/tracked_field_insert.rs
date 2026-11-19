@@ -1017,3 +1017,98 @@ fn the_terminal_caret_after_a_pending_insertion_ending_a_wrapped_line() {
         "{shown:?}"
     );
 }
+
+/// A line showing only a pending field (after a line break) holds the
+/// field's offset, not offset 0 (r5).
+#[test]
+fn a_line_showing_only_a_pending_insertion_holds_its_offset() {
+    use docxcore::render::{RenderOptions, render_mapped};
+    let mut ed = Editor::new(parse("<w:p><w:r><w:t>abc</w:t><w:br/></w:r></w:p>"));
+    track(&mut ed, "Ada");
+    insert_at(
+        &mut ed,
+        4,
+        docxcore::field::fld_simple(" PAGE ", "777", &RunProps::default()),
+    );
+    let (lines, maps) = render_mapped(&ed.doc, &RenderOptions::default());
+    let shown: Vec<String> = lines.iter().map(|l| l.plain()).collect();
+    let row = shown
+        .iter()
+        .position(|l| l.trim_end() == "777")
+        .unwrap_or_else(|| panic!("{shown:?}"));
+    let abc = shown.iter().position(|l| l.starts_with("abc")).unwrap();
+    assert_eq!(maps[row].col_for_caret(&[0], 4, None), Some(3), "{shown:?}");
+    assert_eq!(maps[row].col_for_caret(&[0], 0, None), None, "{shown:?}");
+    assert_eq!(maps[abc].col_for_caret(&[0], 0, None), Some(0), "{shown:?}");
+    assert_eq!(maps[row].nearest_caret(1).map(|c| c.offset), Some(4));
+}
+
+/// Right-to-left text with its digits at level 2, as a real projector puts
+/// them: the groups swap places, a letters group reads backwards and a
+/// digits group forwards.
+#[derive(Debug)]
+struct RtlWithLtrDigits;
+
+impl docxcore::render::BidiProjector for RtlWithLtrDigits {
+    fn project_line(
+        &self,
+        _: docxcore::render::BidiBaseDirection,
+        glyphs: &[docxcore::render::BidiInputGlyph],
+    ) -> docxcore::render::BidiVisualLine {
+        let digit = |i: usize| glyphs[i].ch.is_ascii_digit();
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for i in 0..glyphs.len() {
+            match groups.last_mut() {
+                Some(last) if digit(last[0]) == digit(i) => last.push(i),
+                _ => groups.push(vec![i]),
+            }
+        }
+        let mut order = Vec::new();
+        for g in groups.into_iter().rev() {
+            if digit(g[0]) {
+                order.extend(g);
+            } else {
+                order.extend(g.into_iter().rev());
+            }
+        }
+        docxcore::render::BidiVisualLine {
+            clusters: order
+                .iter()
+                .enumerate()
+                .map(|(k, &i)| docxcore::render::BidiVisualCluster {
+                    glyphs: vec![i],
+                    logical: glyphs[i].logical_offset.map(|o| o..o + 1),
+                    level: if digit(i) { 2 } else { 1 },
+                    cells: k..k + 1,
+                })
+                .collect(),
+            width: order.len(),
+        }
+    }
+}
+
+/// A pending field showing digits in right-to-left text: the caret after it
+/// is on its left, where the text around it goes on (r5 m2).
+#[test]
+fn the_caret_after_a_pending_field_follows_the_text_around_it() {
+    use docxcore::render::{RenderOptions, render_mapped};
+    for (text, at) in [("אבגד", 2), ("אב", 2)] {
+        let mut ed = Editor::new(parse(&format!("<w:p><w:r><w:t>{text}</w:t></w:r></w:p>")));
+        track(&mut ed, "Ada");
+        insert_at(
+            &mut ed,
+            at,
+            docxcore::field::fld_simple(" PAGE ", "777", &RunProps::default()),
+        );
+        let opts = RenderOptions {
+            bidi: Some(std::rc::Rc::new(RtlWithLtrDigits)),
+            ..RenderOptions::default()
+        };
+        let (lines, maps) = render_mapped(&ed.doc, &opts);
+        let line = lines[0].plain();
+        // `ד ג 7 7 7 ב א` (or `7 7 7 ב א`): after the field is left of it.
+        let digits = line.find('7').expect("the field");
+        let col = line[..digits].chars().count();
+        assert_eq!(maps[0].col_for_caret(&[0], at, None), Some(col), "{line:?}");
+    }
+}

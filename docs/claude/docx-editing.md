@@ -452,14 +452,19 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   `tests/tracked_field_insert.rs` cross-checks every selection of a small
   document. An untracked cut carries none (an untracked delete across
   paragraphs drops them: a known gap). Typing before a link whose text
-  starts after one goes into the link past it; past a link holding only
-  one, after the link (`link_opening_with_pending`). The terminal view
+  starts after one goes into the link past it (`link_opening_with_pending`);
+  past a link with no text holding one, after the link
+  (`past_pending_objects`, which counts such a link as one). The terminal view
   draws the caret after one: its shown text's glyphs carry `Glyph::pending`
   (the offset), and `after_pending_objects` gives that offset one stop on
-  the text's far side in its direction (the line's end included) and turns
+  the text's far side in the direction of the text around it (the
+  character starting at the offset, else the one ending there, else the
+  line's base; not the object's own text, digits in Hebrew say), the line's
+  end included, and turns
   the line's other stops for it into click-only `LineSeg::hits`, so clicks
   on the object's text land at its offset and arrows step over it in one
-  press; the suite's `paragraph_el` holds a run-end caret past one
+  press. A line showing only an object's text holds its offset
+  (`ProjectedLine::characters`). The suite's `paragraph_el` holds a run-end caret past one
   (`pending_object_follows`), so the next piece with a width, or the
   paragraph's end, draws it.
 - Compare: a field failing `is_run_level(run_level_field(..))` is never in a

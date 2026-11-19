@@ -9795,6 +9795,21 @@ mod tests {
         assert_eq!(maps[0].edge_caret(true).map(|c| c.offset), Some(0));
     }
 
+    /// In a right-to-left paragraph a left-to-right run sits at the line's
+    /// left: the stop before its first letter is left of every other
+    /// character's column, and the line's start column takes it instead of
+    /// clamping it to the next (#1625 r5).
+    #[test]
+    fn bidi_renderer_keeps_a_stop_left_of_every_character_column() {
+        let mut rtl = ParProps::default();
+        rtl.rtl = true;
+        let doc = bidi_doc(vec![bidi_para_with(rtl, vec![bidi_run("שלום abc")])]);
+        let (lines, maps) = docxcore::render::render_mapped(&doc, &bidi_opts(20));
+        let line = lines[0].plain();
+        let a = line.chars().position(|c| c == 'a').expect("abc");
+        assert_eq!(maps[0].col_for_caret(&[0], 5, None), Some(a), "{line:?}");
+    }
+
     #[test]
     fn bidi_renderer_keeps_alignment_separate_from_reordering() {
         let mut right = ParProps::default();

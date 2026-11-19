@@ -2074,6 +2074,9 @@ struct ProjectedLine {
     cols: Vec<usize>,
     visual: Vec<LineCaretStop>,
     hits: Vec<LineCaretStop>,
+    /// Whether the line shows a character with an offset (else `start` and
+    /// `cols` are placeholders: its stops, if any, are a pending object's).
+    characters: bool,
     glyph_cells: Vec<Option<std::ops::Range<usize>>>,
 }
 
@@ -2102,7 +2105,8 @@ fn project_line(
     let spans = projected_spans(glyphs, &visual_line);
     let glyph_cells = projected_glyph_cells(glyphs, &visual_line);
     let (start, cols) = projected_extent(&visual_line);
-    let (visual, hits) = projected_caret_stops(glyphs, &visual_line);
+    let (visual, hits) = projected_caret_stops(glyphs, &visual_line, base);
+    let characters = !projected_logical_extents(&visual_line).is_empty();
     ProjectedLine {
         spans,
         width: visual_line.width,
@@ -2110,6 +2114,7 @@ fn project_line(
         cols,
         visual,
         hits,
+        characters,
         glyph_cells,
     }
 }
@@ -2259,6 +2264,7 @@ fn projected_extent(visual: &BidiVisualLine) -> (usize, Vec<usize>) {
 fn projected_caret_stops(
     glyphs: &[Glyph],
     visual: &BidiVisualLine,
+    base: BidiBaseDirection,
 ) -> (Vec<LineCaretStop>, Vec<LineCaretStop>) {
     let mut stops = Vec::new();
     let mut extents = projected_logical_extents(visual);
@@ -2325,22 +2331,37 @@ fn projected_caret_stops(
         });
         compacted.insert(at, LineCaretStop { offset, col });
     }
-    let hits = after_pending_objects(glyphs, visual, &mut compacted);
+    let hits = after_pending_objects(glyphs, visual, &extents, base, &mut compacted);
     (compacted, hits)
 }
 
 /// The caret at a pending object insertion's offset is after the object
 /// (typing there goes after it, #1625): where this line shows the object's
-/// text, its one stop for that offset is on the text's far side in its
-/// direction (the right in left-to-right text, the left in right-to-left),
-/// at the line's end too, and the line's other stops for that offset become
-/// click-only hits, returned, so a click on the object's text lands at its
-/// offset while an arrow press steps over it at once.
+/// text, its one stop for that offset is on the text's far side in the
+/// direction of the text around it (the right in left-to-right text, the
+/// left in right-to-left; the object's own text, digits in Hebrew say, may
+/// run the other way), at the line's end too, and the line's other stops
+/// for that offset become click-only hits, returned, so a click on the
+/// object's text lands at its offset while an arrow press steps over it at
+/// once.
 fn after_pending_objects(
     glyphs: &[Glyph],
     visual: &BidiVisualLine,
+    extents: &[LogicalExtent],
+    base: BidiBaseDirection,
     stops: &mut Vec<LineCaretStop>,
 ) -> Vec<LineCaretStop> {
+    // The direction around offset `o`: the character starting there, else
+    // the one ending there, else the line's.
+    let rtl_at = |o: usize| {
+        let shown = |e: &&LogicalExtent| e.cells.start != e.cells.end;
+        extents
+            .iter()
+            .filter(shown)
+            .find(|e| e.start == o)
+            .or_else(|| extents.iter().filter(shown).find(|e| e.end == o))
+            .map_or(base == BidiBaseDirection::Rtl, |e| e.level % 2 == 1)
+    };
     // Each object's offset and the column after its text.
     let mut after: Vec<(usize, usize)> = Vec::new();
     for cluster in &visual.clusters {
@@ -2348,7 +2369,7 @@ fn after_pending_objects(
             let Some(offset) = glyphs.get(idx).and_then(|g| g.pending) else {
                 continue;
             };
-            let rtl = cluster.level % 2 == 1;
+            let rtl = rtl_at(offset);
             let col = if rtl {
                 cluster.cells.start
             } else {
@@ -2565,8 +2586,12 @@ fn render_paragraph(
             if lead > 0 {
                 line.spans.push(Line::text_span(" ".repeat(lead)));
             }
-            // A stop after a pending object's text may lie left of every
-            // character (right-to-left text, #1625).
+            // The line's start column: its leftmost character column, or a
+            // stop left of all of them (#1625), which the columns alone
+            // would clamp onto the next cell: the stop after a pending
+            // object's text in right-to-left text, and the stop before a
+            // left-to-right run at the left of a right-to-left line (`שלום
+            // abc`: the one left of `a`, which was drawn right of it).
             let line_start_col = if projected.visual.is_empty() {
                 projected.width
             } else {
@@ -2580,7 +2605,7 @@ fn render_paragraph(
             };
             line.spans.extend(projected.spans.clone());
             let prefix_cols = lead + line_start_col;
-            let cols = projected
+            let mut cols: Vec<usize> = projected
                 .cols
                 .iter()
                 .map(|col| col.saturating_sub(line_start_col))
@@ -2594,11 +2619,15 @@ fn render_paragraph(
                 })
                 .collect();
             // A line with no editable character (empty after a break, or a
-            // lone `¶`) holds the offset its seg starts at.
-            let start = if visual.is_empty() {
-                seg.at
-            } else {
+            // lone `¶`) holds the offset its seg starts at; one showing only
+            // a pending object's text, that object's offset (#1625).
+            let start = if projected.characters {
                 projected.start
+            } else if let Some(stop) = visual.first() {
+                cols = vec![stop.col];
+                stop.offset
+            } else {
+                seg.at
             };
             if visual.is_empty() {
                 visual.push(LineCaretStop {
