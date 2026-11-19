@@ -678,6 +678,85 @@ fn simple_fields_inside_revisions_become_run_level_complex_fields() {
     }
 }
 
+/// The text inside each `w:ins` and `w:del` of `xml`.
+fn revision_wrappers(xml: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for (tag, close) in [("<w:ins ", "</w:ins>"), ("<w:del ", "</w:del>")] {
+        let mut rest = xml;
+        while let Some(at) = rest.find(tag) {
+            // A self-closing one marks a paragraph mark and holds nothing.
+            let open_end = at + rest[at..].find('>').unwrap();
+            if rest[..open_end].ends_with('/') {
+                rest = &rest[open_end..];
+                continue;
+            }
+            let wrapper = &rest[at..at + rest[at..].find(close).unwrap()];
+            out.push(wrapper);
+            rest = &rest[at + wrapper.len()..];
+        }
+    }
+    out
+}
+
+#[test]
+fn a_field_whose_result_holds_a_link_is_never_inside_a_revision_1625() {
+    // An anchor link: no relationship, so only the run-level gate catches it.
+    let field = "<w:fldSimple w:instr=\" REF x \"><w:hyperlink w:anchor=\"x\">\
+        <w:r><w:t>7</w:t></w:r></w:hyperlink></w:fldSimple>";
+    let para =
+        |field: &str| format!("<w:p><w:r><w:t xml:space=\"preserve\">On </w:t></w:r>{field}</w:p>");
+    let keep = p("Keep");
+    for (original, revised) in [
+        // Deleted from a paragraph, inserted into one.
+        (para(field), para("")),
+        (para(""), para(field)),
+        // A whole paragraph inserted or deleted with it.
+        (keep.clone(), format!("{keep}{}", para(field))),
+        (format!("{keep}{}", para(field)), keep.clone()),
+    ] {
+        let result = compare(&pkg(&original), &pkg(&revised));
+        let xml = saved_document_xml(&result);
+        for wrapper in revision_wrappers(&xml) {
+            assert!(
+                !wrapper.contains("<w:hyperlink") && !wrapper.contains("<w:fldSimple"),
+                "{wrapper}\n{xml}"
+            );
+        }
+        assert!(
+            result.skipped.contains(&CompareSkip::Object),
+            "{:?}",
+            result.skipped
+        );
+    }
+
+    // An inserted one stays, unmarked: the text around it is still marked.
+    let result = compare(&pkg(&para("")), &pkg(&para(field)));
+    let xml = saved_document_xml(&result);
+    assert!(xml.contains("<w:hyperlink w:anchor=\"x\""), "{xml}");
+    assert_eq!(
+        resolved(&reloaded(&result), true).plain_text().trim_end(),
+        "On 7"
+    );
+}
+
+#[test]
+fn a_field_a_revision_can_hold_is_still_marked_1625() {
+    let field = "<w:fldSimple w:instr=\" PAGE \"><w:r><w:t>7</w:t></w:r></w:fldSimple>";
+    let para =
+        |field: &str| format!("<w:p><w:r><w:t xml:space=\"preserve\">On </w:t></w:r>{field}</w:p>");
+    for (original, revised) in [(para(field), para("")), (para(""), para(field))] {
+        let result = compare(&pkg(&original), &pkg(&revised));
+        assert!(result.skipped.is_empty(), "{:?}", result.skipped);
+        let xml = saved_document_xml(&result);
+        assert!(
+            revision_wrappers(&xml)
+                .iter()
+                .any(|w| w.contains("fldCharType=\"begin\"")),
+            "{xml}"
+        );
+    }
+}
+
 #[test]
 fn an_inserted_section_ending_paragraph_never_lends_or_borrows_a_break() {
     let sect = "<w:p><w:pPr><w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr></w:pPr>\

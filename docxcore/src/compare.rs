@@ -69,8 +69,10 @@ pub enum CompareSkip {
     /// A table whose shape changed (kept as revised), or a table present in
     /// only one document. `index` is the top-level block index in the result.
     Table { index: usize },
-    /// A deleted object that references the original package, or a block-level
-    /// element (such as a content control) present in only one document.
+    /// A deleted object that references the original package or that a
+    /// `w:del` cannot hold (a field whose result holds a link, #1625), a
+    /// block-level element (such as a content control) present in only one
+    /// document, or an inserted field a `w:ins` cannot hold, written unmarked.
     Object,
     /// Deleted original run/paragraph property children (formatting) dropped
     /// because they use a namespace prefix the revised package binds to
@@ -656,7 +658,9 @@ impl<'o> Compare<'o> {
             for step in &steps[k..end] {
                 match step {
                     Op::Equal(_, j) | Op::Insert(j) => {
-                        push_atom(&mut content, &revised[*j], kind.is_some(), &mut marks)
+                        if push_atom(&mut content, &revised[*j], kind.is_some(), &mut marks) {
+                            self.skipped.push(CompareSkip::Object);
+                        }
                     }
                     Op::Delete(i) => self.push_deleted_atom(&mut content, &original[*i]),
                 }
@@ -666,7 +670,8 @@ impl<'o> Compare<'o> {
                 Some(_) if content.is_empty() => {}
                 Some(kind) => {
                     // A marker stays outside the revision, as an anchor does:
-                    // rejecting the insertion must not drop half a pair.
+                    // rejecting the insertion must not drop half a pair. So
+                    // does a field the revision cannot hold.
                     let mut from = 0;
                     for at in marks {
                         if at > from {
@@ -1216,14 +1221,29 @@ fn tokenize(segments: &[Segment], link: Option<usize>, out: &mut Vec<Atom>) {
 /// Append a revised atom; `in_revision` when it goes inside a `w:ins`, where
 /// the index of each marker inside a word is noted in `marks`, for the caller
 /// to lift it out of the revision. The marker itself is in `content`, which
-/// keeps the text on either side in runs of their own.
-fn push_atom(content: &mut Vec<Inline>, atom: &Atom, in_revision: bool, marks: &mut Vec<usize>) {
+/// keeps the text on either side in runs of their own. A field a `w:ins`
+/// cannot hold (its result holds a link or other paragraph-level content,
+/// #1625) is noted and lifted out the same way, as it is: true then, as its
+/// insertion goes unmarked.
+fn push_atom(
+    content: &mut Vec<Inline>,
+    atom: &Atom,
+    in_revision: bool,
+    marks: &mut Vec<usize>,
+) -> bool {
     match &atom.kind {
-        AtomKind::Object(Inline::Field { raw, text }) if in_revision => {
-            content.push(Inline::Field {
-                raw: run_level_field(raw),
-                text: text.clone(),
-            })
+        AtomKind::Object(field @ Inline::Field { raw, text }) if in_revision => {
+            let runs = run_level_field(raw);
+            if is_run_level(&runs) {
+                content.push(Inline::Field {
+                    raw: runs,
+                    text: text.clone(),
+                });
+            } else {
+                marks.push(content.len());
+                content.push(field.clone());
+                return true;
+            }
         }
         AtomKind::Text(pieces) => {
             let mut inner = atom.marks.iter().peekable();
@@ -1265,6 +1285,7 @@ fn push_atom(content: &mut Vec<Inline>, atom: &Atom, in_revision: bool, marks: &
             content.push(inline.clone())
         }
     }
+    false
 }
 
 /// Append text, extending the previous run when it has the same formatting.
@@ -1283,12 +1304,13 @@ fn push_text(content: &mut Vec<Inline>, text: &str, props: RunProps) {
 
 /// A deleted original object that can live in the revised package, with its
 /// text elements turned into their deleted forms; `None` when it references
-/// a relationship of the original package or cannot be carried.
+/// a relationship of the original package or cannot be carried (a field a
+/// `w:del` cannot hold, its result holding a link, #1625).
 fn deletable_object(inline: &Inline) -> Option<Inline> {
     let carry = |raw: &str| (!has_relationship(raw)).then(|| deleted_text_xml(raw));
     match inline {
         Inline::Field { raw, text } => Some(Inline::Field {
-            raw: carry(&run_level_field(raw))?,
+            raw: carry(&Some(run_level_field(raw)).filter(|runs| is_run_level(runs))?)?,
             text: text.clone(),
         }),
         Inline::Equation { raw, .. } if !has_relationship(raw) => Some(inline.clone()),
