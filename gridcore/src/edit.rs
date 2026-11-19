@@ -34,7 +34,8 @@ pub use clear::{ClearPlan, ClearWhat, apply_clear_sheet, clear_plan};
 pub use goto_special::{GoSpecial, NO_CELLS, Types, go_to_special, resolve_reference};
 mod series;
 pub use clip::{
-    MAX_PASTE_CELLS, PASTE_SHAPE, move_refs, move_refs_rules_stay, paste_tiles, tiled_block,
+    MAX_PASTE_CELLS, PASTE_SHAPE, cut_moves_refs, move_refs, move_refs_rules_stay,
+    moved_cell_formula, paste_tiles, tiled_block,
 };
 pub use series::{
     FillDir, FillKind, FillTarget, JUSTIFY_NUMBERS, JUSTIFY_OVERFLOW, SeriesSpec, SeriesType,
@@ -2738,12 +2739,14 @@ pub fn table_range_conflict(
 
 /// Where a formula sits, for the table rewrites: its sheet (a defined name
 /// has none), its cell (a conditional-format or validation rule has none),
-/// and, for a table's calculated-column formula, that table's name.
+/// for a table's calculated-column formula that table's name, and for a
+/// rule's formula the rule's ranges.
 #[derive(Clone, Copy)]
 struct FormulaSite<'a> {
     sheet: Option<usize>,
     cell: Option<(u32, u32)>,
     table: Option<&'a str>,
+    rule: Option<&'a [Area]>,
 }
 
 impl FormulaSite<'_> {
@@ -2774,14 +2777,34 @@ fn rewrite_workbook_formulas(
     validations: bool,
     f: impl Fn(&Expr, FormulaSite<'_>) -> Expr,
 ) -> bool {
+    walk_workbook_formulas(wb, rules, validations, f, true)
+}
+
+/// [`rewrite_workbook_formulas`], or with `write` false its dry run: whether
+/// it would rewrite any formula, the workbook left untouched and the walk
+/// cut short at the first that would change. One walk for both, so the dry
+/// run cannot miss a place the rewrite reaches (#1687).
+fn walk_workbook_formulas(
+    wb: &mut Workbook,
+    rules: impl Fn(usize, &[Area]) -> bool,
+    validations: bool,
+    f: impl Fn(&Expr, FormulaSite<'_>) -> Expr,
+    write: bool,
+) -> bool {
     let mut changed = false;
+    // Whether to look at the next formula: a dry run stops at a change.
+    let go = |changed: bool| write || !changed;
     let at = |sheet, cell| FormulaSite {
         sheet,
         cell,
         table: None,
+        rule: None,
     };
     for (s, sheet) in wb.sheets.iter_mut().enumerate() {
         for (&(r, c), cell) in sheet.cells.iter_mut() {
+            if !go(changed) {
+                return true;
+            }
             let Some(src) = &cell.formula else {
                 continue;
             };
@@ -2789,25 +2812,38 @@ fn rewrite_workbook_formulas(
                 continue;
             }
             if let Some(updated) = rewrite_if_changed(src, |e| f(e, at(Some(s), Some((r, c))))) {
-                cell.formula = Some(updated);
+                if write {
+                    cell.formula = Some(updated);
+                }
                 changed = true;
             }
         }
         for_each_rule_formula(sheet, validations, |ranges, src| {
-            if !rules(s, ranges) {
+            if !go(changed) || !rules(s, ranges) {
                 return;
             }
-            if let Some(updated) = rewrite_if_changed(src, |e| f(e, at(Some(s), None))) {
-                *src = updated;
+            let site = FormulaSite {
+                rule: Some(ranges),
+                ..at(Some(s), None)
+            };
+            if let Some(updated) = rewrite_if_changed(src, |e| f(e, site)) {
+                if write {
+                    *src = updated;
+                }
                 changed = true;
             }
         });
     }
     for_each_name_text(wb, |text| {
+        if !go(changed) {
+            return;
+        }
         if let Some(updated) =
             crate::formula::rewrite_defined_name(text, |e| f(e, at(None, None)), None)
         {
-            *text = updated;
+            if write {
+                *text = updated;
+            }
             changed = true;
         }
     });
@@ -2821,13 +2857,19 @@ fn rewrite_workbook_formulas(
             let Some(src) = slot else {
                 continue;
             };
+            if !go(changed) {
+                return true;
+            }
             let site = FormulaSite {
                 sheet: Some(sheet),
                 cell: Some((row, c1 + j as u32)),
                 table: Some(&name),
+                rule: None,
             };
             if let Some(updated) = rewrite_if_changed(src, |e| f(e, site)) {
-                *slot = Some(updated);
+                if write {
+                    *slot = Some(updated);
+                }
                 changed = true;
             }
         }

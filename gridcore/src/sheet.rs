@@ -2502,15 +2502,29 @@ impl Workbook {
     }
 
     /// Resolve a defined name as seen from `current_sheet`: a name scoped to
-    /// that sheet shadows a global one (Excel's rule).
+    /// that sheet shadows a global one (Excel's rule). A sheet-qualified name
+    /// (`Sheet2!Rate`, `'My Data'!Rate`) is that sheet's own definition, from
+    /// any sheet, and nothing when the sheet has none (#1687).
     pub fn defined_name(&self, name: &str, current_sheet: usize) -> Option<&str> {
-        let find = |scope: Option<usize>| {
+        let find = |scope: Option<usize>, name: &str| {
             self.defined_names
                 .iter()
                 .find(|d| d.scope == scope && d.name.eq_ignore_ascii_case(name))
                 .map(|d| d.formula.as_str())
         };
-        find(Some(current_sheet)).or_else(|| find(None))
+        if let Some((sheet, id)) = crate::formula::scoped_name(name) {
+            return find(Some(self.sheet_index(&sheet)?), id);
+        }
+        find(Some(current_sheet), name).or_else(|| find(None, name))
+    }
+
+    /// The spelling of the name `name` defined in sheet `sheet`'s own scope,
+    /// if it has one (not a workbook name).
+    pub fn local_name(&self, sheet: usize, name: &str) -> Option<&str> {
+        self.defined_names
+            .iter()
+            .find(|d| d.scope == Some(sheet) && d.name.eq_ignore_ascii_case(name))
+            .map(|d| d.name.as_str())
     }
 }
 
@@ -3336,6 +3350,46 @@ pub fn sheet_to_csv(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defined_name_resolves_a_sheet_qualified_local_name() {
+        let sheet = |name: &str| Sheet {
+            name: name.into(),
+            ..Sheet::default()
+        };
+        let name = |name: &str, scope, formula: &str| DefinedName {
+            name: name.into(),
+            scope,
+            formula: formula.into(),
+        };
+        let wb = Workbook {
+            sheets: vec![sheet("Sheet1"), sheet("Sheet2"), sheet("My Data")],
+            defined_names: vec![
+                name("Rate", None, "1"),
+                name("Rate", Some(0), "10"),
+                name("Rate", Some(1), "20"),
+                name("Rate", Some(2), "30"),
+            ],
+            ..Workbook::default()
+        };
+        // Bare: the current sheet's own, else the workbook's.
+        assert_eq!(wb.defined_name("Rate", 0), Some("10"));
+        // Qualified: that sheet's own, from any sheet, the case of either
+        // part ignored, a quoted sheet name too.
+        assert_eq!(wb.defined_name("Sheet2!Rate", 0), Some("20"));
+        assert_eq!(wb.defined_name("sheet2!RATE", 2), Some("20"));
+        assert_eq!(wb.defined_name("'My Data'!Rate", 0), Some("30"));
+        assert_eq!(wb.local_name(1, "rate"), Some("Rate"));
+        // No such local name, or no such sheet: nothing, never the
+        // workbook's.
+        let wb = Workbook {
+            defined_names: vec![name("Rate", None, "1"), name("Rate", Some(0), "10")],
+            ..wb
+        };
+        assert_eq!(wb.defined_name("Sheet2!Rate", 0), None);
+        assert_eq!(wb.defined_name("Nowhere!Rate", 0), None);
+        assert_eq!(wb.local_name(1, "Rate"), None);
+    }
 
     /// #2115 (r1-p1): the sheet-name rule a rename applies, with its reason.
     #[test]
