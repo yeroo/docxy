@@ -263,8 +263,8 @@ pub struct ClipBlock {
     pub typed: bool,
     /// The source sheet's used extent when the block was captured
     /// ([`crate::sheet::Sheet::used_size`]): a block cell whose row or
-    /// column is past it is an absent cell, landed as its destination's
-    /// absence ([`ClipBlock::lands_absent`], #1660). `None`: no such cells.
+    /// column is past it is an absent cell with nothing of its own to paste
+    /// ([`ClipBlock::lands_absent`], #1660). `None`: no such cells.
     pub used: Option<(u32, u32)>,
 }
 
@@ -334,8 +334,11 @@ impl ClipBlock {
     }
 
     /// Whether block cell `(i, j)` is an absent cell from past its sheet's
-    /// used extent ([`ClipBlock::used`]): it lands as its destination's
-    /// absence ([`crate::sheet::CopyReader`]), not as a copy of itself.
+    /// used extent ([`ClipBlock::used`]): nothing of its own to paste, not
+    /// a copy of itself. A plain paste ([`ClipBlock::land_absent`]) lands it
+    /// as the destination's absence, as a copy, fill or move does
+    /// ([`crate::sheet::CopyReader`]); [`paste_special_changes`] lands it per
+    /// kind of paste.
     pub fn lands_absent(&self, (i, j): (usize, usize)) -> bool {
         let (Some(used), Some(&r), Some(&c)) = (self.used, self.rows.get(i), self.cols.get(j))
         else {
