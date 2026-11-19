@@ -2577,6 +2577,9 @@ struct ClipData {
     /// keeps it, a new copy of the same range has another, so undo and redo
     /// tell the two apart where their shown text is the same.
     serial: u64,
+    /// The source sheet's used extent when copied: a `None` cell past it
+    /// lands as its target's absence (#1660, [`gridcore::sheet::CopyReader`]).
+    used: (u32, u32),
 }
 
 /// What a commit that raised a data-validation alert goes on to do once the
@@ -5072,6 +5075,7 @@ impl App {
         // its row or column, when that is not the default (#1660): pasted, it
         // is the cell's absence, not a default-style pin.
         let read = sheet.copy_reader();
+        let used = read.used();
         for r in r1..=r2 {
             let mut row = Vec::new();
             for c in c1..=c2 {
@@ -5101,6 +5105,7 @@ impl App {
             span: (sr2 - sr1 + 1, sc2 - sc1 + 1),
             cut,
             serial: self.clip_serial,
+            used,
         });
         if let Some(cb) = &mut self.os_clip {
             let _ = cb.set_text(tsv.clone());
@@ -5242,6 +5247,7 @@ impl App {
                 // the grid's edge are dropped, so rows may differ in length.
                 let mut block = Vec::new();
                 let mut writes = Vec::new();
+                let landing = self.pkg.workbook.sheets[here].copy_reader();
                 for (dr, row) in clip.cells.iter().enumerate() {
                     let r = r0 + dr as u32;
                     if r >= MAX_ROWS {
@@ -5253,7 +5259,16 @@ impl App {
                         if c >= MAX_COLS {
                             break;
                         }
-                        let mut new_cell = cell.clone().unwrap_or_default();
+                        // An absent source from past its sheet's used extent
+                        // lands as the target's absence (#1660).
+                        let (fr, fc) = (clip.from.0 + dr as u32, clip.from.1 + dc as u32);
+                        let mut new_cell = cell.clone().unwrap_or_else(|| {
+                            if gridcore::sheet::past_extent(clip.used, fr, fc) {
+                                landing.absent_cell(r, c)
+                            } else {
+                                Cell::default()
+                            }
+                        });
                         // Copies translate relative refs; cuts keep them, and
                         // so does a copy pasted where it came from (translating
                         // reprints the text, even by zero).
@@ -9577,6 +9592,8 @@ impl App {
         let cols: Vec<u32> = (0..w).map(|j| clip.from.1 + j).collect();
         let mut block =
             gridcore::edit::ClipBlock::capture(&self.pkg.workbook, clip.sheet, rows, cols);
+        // Past the extent the copy had, not the sheet's now (#1660).
+        block.used = Some(clip.used);
         // The cells as they were copied.
         block.cells = clip
             .cells
@@ -17652,6 +17669,15 @@ mod tests {
         app.cur = (3, 0);
         app.copy(false);
         assert_eq!(app.clip.as_ref().unwrap().cells, vec![vec![None]]);
+        // B20, past the used rows, pasted on a held B1: B1 ends absent, not
+        // a default-style pin (r2).
+        app.apply(vec![(0, 1, Cell::number(1.0))]);
+        app.cur = (19, 1);
+        app.copy(false);
+        assert_eq!(app.clip.as_ref().unwrap().cells, vec![vec![None]]);
+        app.cur = (0, 1);
+        app.paste();
+        assert_eq!(app.sheet().cell(0, 1), None, "B1 after a past-extent paste");
     }
 
     /// #1660 r1 p1: a cut from another sheet blanks the target cells its
@@ -17873,6 +17899,7 @@ mod tests {
             span: (1, 1),
             cut: false,
             serial: 0,
+            used: (1, 1),
         });
         app.paste_special(gridcore::edit::PasteSpec::default());
         assert!(app.status.as_deref().unwrap_or("").contains("gone"));

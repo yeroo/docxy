@@ -261,6 +261,11 @@ pub struct ClipBlock {
     /// never moved, even transposed, but kept as typed at its destination,
     /// and Values evaluates it there (#707 r8 M2).
     pub typed: bool,
+    /// The source sheet's used extent when the block was captured
+    /// ([`crate::sheet::Sheet::used_size`]): a block cell whose row or
+    /// column is past it is an absent cell, landed as its destination's
+    /// absence ([`ClipBlock::lands_absent`], #1660). `None`: no such cells.
+    pub used: Option<(u32, u32)>,
 }
 
 impl ClipBlock {
@@ -272,6 +277,7 @@ impl ClipBlock {
         };
         // An absent cell is read with the style it inherits (#1660).
         let read = s.copy_reader();
+        let used = Some(read.used());
         let cells = rows
             .iter()
             .map(|&r| cols.iter().map(|&c| read.cell(r, c)).collect())
@@ -323,6 +329,39 @@ impl ClipBlock {
             notes: Vec::new(),
             rules,
             typed: false,
+            used,
+        }
+    }
+
+    /// Whether block cell `(i, j)` is an absent cell from past its sheet's
+    /// used extent ([`ClipBlock::used`]): it lands as its destination's
+    /// absence ([`crate::sheet::CopyReader`]), not as a copy of itself.
+    pub fn lands_absent(&self, (i, j): (usize, usize)) -> bool {
+        let (Some(used), Some(&r), Some(&c)) = (self.used, self.rows.get(i), self.cols.get(j))
+        else {
+            return false;
+        };
+        !self.typed && crate::sheet::past_extent(used, r, c)
+    }
+
+    /// `block`, the copy tiled at `at` on `dest` ([`super::tiled_block`]),
+    /// with each cell from past its sheet's used extent replaced by its
+    /// destination's absence ([`ClipBlock::lands_absent`], #1660). Rows and
+    /// columns of `block` repeat the copy's.
+    pub fn land_absent(&self, dest: &crate::sheet::Sheet, at: (u32, u32), block: &mut [Vec<Cell>]) {
+        // The tile size [`super::tiled_block`] uses.
+        let h = self.cells.len();
+        let w = self.cells.iter().map(Vec::len).max().unwrap_or(0);
+        if self.used.is_none() || h == 0 || w == 0 {
+            return;
+        }
+        let read = dest.copy_reader();
+        for (i, row) in block.iter_mut().enumerate() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                if self.lands_absent((i % h, j % w)) {
+                    *cell = read.absent_cell(at.0 + i as u32, at.1 + j as u32);
+                }
+            }
         }
     }
 
@@ -601,6 +640,8 @@ pub fn paste_special_changes(
     // The styles a paste mixes, each interned once per (source, destination)
     // pair: interning scans the style table (#707 r6).
     let mut mixed: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+    // An absent destination keeps the style it inherits (#1660).
+    let read = s.copy_reader();
     // Only the cells that know where they came from.
     for (i, row) in clip.cells.iter().enumerate().take(clip.rows.len()) {
         for (j, src) in row.iter().enumerate().take(clip.cols.len()) {
@@ -610,8 +651,17 @@ pub fn paste_special_changes(
             if spec.skip_blanks && src.is_blank() {
                 continue;
             }
-            // An absent destination keeps the style it inherits (#1660).
-            let d = s.copied_cell(dest.0, dest.1);
+            let d = (s.cell(dest.0, dest.1).cloned())
+                .unwrap_or_else(|| read.absent_cell(dest.0, dest.1));
+            // An absent source from past its sheet's used extent is the
+            // destination's absence (#1660).
+            let landed;
+            let src = if clip.lands_absent((i, j)) {
+                landed = read.absent_cell(dest.0, dest.1);
+                &landed
+            } else {
+                src
+            };
             let style = match spec.what {
                 PasteWhat::All
                 | PasteWhat::AllAndColumnWidths

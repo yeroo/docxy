@@ -225,6 +225,12 @@ pub fn fill_changes(
     // An absent source carries the style it inherits (#1660).
     let read = sheet.copy_reader();
     let mut copy_from = |sr: u32, sc: u32, tr: u32, tc: u32| {
+        // Past the used extent, an absent source lands as the target's
+        // absence ([`crate::sheet::CopyReader`]).
+        if read.past_extent(sr, sc) {
+            changes.push((tr, tc, read.absent_cell(tr, tc)));
+            return;
+        }
         let mut cell = read.cell(sr, sc);
         copy_meta(&mut cell);
         if let Some(f) = &cell.formula {
@@ -789,10 +795,17 @@ pub fn autofill(wb: &mut Workbook, sheet: usize, req: &FillReq) -> Option<Filled
             let (mut cell, from_style) = match out {
                 series::LineOut::Copy(j) => {
                     let (fr, fc) = pos[j];
-                    // An absent source carries the style it inherits (#1660).
-                    let mut cell = srcvals[j].clone().unwrap_or_else(|| Cell {
-                        style: read.absent_style(fr, fc),
-                        ..Cell::default()
+                    // An absent source carries the style it inherits, or past
+                    // the used extent lands as the target's absence (#1660).
+                    let mut cell = srcvals[j].clone().unwrap_or_else(|| {
+                        if read.past_extent(fr, fc) {
+                            read.absent_cell(r, c)
+                        } else {
+                            Cell {
+                                style: read.absent_style(fr, fc),
+                                ..Cell::default()
+                            }
+                        }
                     });
                     rebase(
                         &mut cell,

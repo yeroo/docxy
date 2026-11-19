@@ -151,17 +151,32 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   - `pins_default` is `inherited_style != 0`. An `s` or `style` of 0, or one
     that cannot be read, gives 0.
 - **Copies, fills and moves** read through `Sheet::copy_reader()`
-  (`CopyReader`). A held cell is cloned. An absent cell reads as a blank of
-  its inherited style only inside the sheet's used extent (`used_size`,
-  taken once). Past the extent it reads as a default blank, which writes
-  nothing, so a whole styled column copied elsewhere writes no million
-  styled blanks. Each row's and column's style is looked up once. Its users:
+  (`CopyReader`). A held cell is cloned. An absent cell inside the sheet's
+  used extent (`used_size`, taken once) reads as a blank of its inherited
+  style. Each row's and column's style is looked up once. Its users:
   - `ClipBlock::capture`;
   - `fill_changes`, and `autofill`'s absent Copy source (`absent_style`);
   - xlsxy's `copy` and gridwasm's `record_clip`, through `cell_opt`: `None`
     while the style is 0, and the TSV still comes from the real cell;
   - the suite's `cut_still_live` and `paste_move`. They must read exactly what
     `capture` stored, or every cut over such a cell is cancelled.
+- **Past the used extent** (`past_extent`), an absent source reads as a
+  default blank. Every writer lands it as the *destination's* absence:
+  `Sheet::absent_cell`, or `CopyReader::absent_cell` on the destination's
+  reader. That is a blank of the destination's inherited style, which
+  `set_cell` drops, so a held target ends absent and nothing is made where
+  nothing was. A whole styled column copied elsewhere writes no million
+  styled blanks, and a held cell in a styled column gets no s0 pin. The
+  writers:
+  - `fill_changes` and `autofill` (also FormatsOnly);
+  - `paste_special_changes`, through `ClipBlock::used` and `lands_absent`;
+  - the suite's tiled copy (`ClipBlock::land_absent`) and `paste_move`;
+  - xlsxy's paste and gridwasm's `paste_own_clip`, through the extent kept
+    in `ClipData` or `GridClip`. xlsxy's Paste Special sets `ClipBlock::used`
+    from it.
+  - This differs from Excel, which would carry the source's format there:
+    a whole-column copy in Excel copies the `<col>` style itself, and that
+    is out of scope.
 - **A single destination** uses `Sheet::copied_cell`, with no extent bound.
   Paste Special's destination `d` uses it, so Values keeps an absent cell's
   inherited format.

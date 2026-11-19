@@ -157,6 +157,7 @@ impl SheetView {
             cells,
             notes: Vec::new(),
             rules: Vec::new(),
+            used: None,
         }
     }
 

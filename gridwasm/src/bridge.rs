@@ -605,6 +605,9 @@ struct GridClip {
     /// references when pasted (once; later pastes are copies, as in xlsxy).
     cut: bool,
     text: String,
+    /// The source sheet's used extent when copied: a `None` cell past it
+    /// lands as its target's absence (#1660, [`gridcore::sheet::CopyReader`]).
+    used: (u32, u32),
 }
 
 impl Session {
@@ -1248,11 +1251,13 @@ impl Session {
         let cells = (r1..=r2)
             .map(|r| (c1..=c2).map(|c| read.cell_opt(r, c)).collect())
             .collect();
+        let used = read.used();
         self.clip = Some(GridClip {
             cells,
             from: (r1, c1),
             cut,
             text: clip_key(&text),
+            used,
         });
         text
     }
@@ -1274,6 +1279,7 @@ impl Session {
         // grid's edge are dropped, so rows may differ in length.
         let mut block = Vec::new();
         let mut keys = Vec::new();
+        let landing = self.pkg.workbook.sheets[self.active].copy_reader();
         for (dr, row) in clip.cells.iter().enumerate() {
             let r = r0 + dr as u32;
             if r >= MAX_ROWS {
@@ -1285,7 +1291,16 @@ impl Session {
                 if c >= MAX_COLS {
                     break;
                 }
-                let mut cell = cell.clone().unwrap_or_default();
+                // An absent source from past its sheet's used extent lands as
+                // the target's absence (#1660).
+                let (fr, fc) = (clip.from.0 + dr as u32, clip.from.1 + dc as u32);
+                let mut cell = cell.clone().unwrap_or_else(|| {
+                    if gridcore::sheet::past_extent(clip.used, fr, fc) {
+                        landing.absent_cell(r, c)
+                    } else {
+                        Cell::default()
+                    }
+                });
                 if !clip.cut && (dr_all, dc_all) != (0, 0) {
                     if let Some(f) = &cell.formula {
                         if let Some(t) = gridcore::formula::translate_formula(f, dr_all, dc_all) {
@@ -4777,6 +4792,33 @@ mod tests {
             .map(|k| k.0)
             .collect();
         assert_eq!(d, vec![0, 1, 2], "D1:D3 only");
+    }
+
+    /// #1660 r2 M1: an absent cell from past the sheet's used extent, copied
+    /// (`None` in the clip) and pasted on a held cell of a styled column,
+    /// lands as that cell's absence, not a default-style pin.
+    #[test]
+    fn paste_of_a_cell_past_the_used_rows_leaves_the_target_absent() {
+        let mut s = Session::open(&save_xlsx(&new_xlsx())).expect("open");
+        let sheet = &mut s.pkg.workbook.sheets[0];
+        sheet.col_defs.push(gridcore::sheet::ColDef {
+            min: 1,
+            max: 1,
+            width: None,
+            attrs: r#"style="7""#.to_string(),
+            default_width: false,
+            plain_width: false,
+        });
+        for r in 0..3 {
+            sheet.set_cell(r, 1, Cell::number(1.0));
+        }
+        s.engine = Engine::new(&s.pkg.workbook);
+        s.dispatch("select\t9\t1");
+        let tsv = s.dispatch("copy").expect("copy returns tsv");
+        assert_eq!(s.clip.as_ref().unwrap().cells, vec![vec![None]]);
+        s.dispatch(&format!("paste\t1\t1\t{tsv}"));
+        let b2 = s.pkg.workbook.sheets[0].cell(1, 1);
+        assert_eq!(b2, None, "B2 is {b2:?}");
     }
 
     /// #1660 r1 m2: text pasted into an absent cell is read under the style

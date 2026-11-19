@@ -5114,13 +5114,16 @@ impl SheetView {
             )));
         }
         let at = (sel.0, sel.1);
-        let block = tiled_block(
+        let mut block = tiled_block(
             &clip.block.cells,
             &clip.block.rows,
             &clip.block.cols,
             at,
             tiles,
         );
+        // A copied absent cell from past its sheet's used extent lands as the
+        // target's absence (#1660).
+        clip.block.land_absent(self.sheet(), at, &mut block);
         self.write_block(at, &block, step)?;
         // The source cells' rules replace the target's (#688) — an ordinary
         // paste moves validation along with the cells, so a source with no
@@ -5221,13 +5224,19 @@ impl SheetView {
         // The cells as the source holds them now, their formulas moved.
         let sheet = &self.pkg.workbook.sheets[src];
         let read = sheet.copy_reader();
+        let landing = self.pkg.workbook.sheets[dst].copy_reader();
         let mut block = Vec::new();
         let mut clears = Vec::new();
         for r in fr0..=fr1 {
             let mut row = Vec::new();
             for c in fc0..=fc1 {
-                // An absent cell moves as its inherited style (#1660).
-                let mut cell = read.cell(r, c);
+                // An absent cell moves as its inherited style, or from past
+                // the used extent as the target's absence (#1660).
+                let mut cell = if read.past_extent(r, c) {
+                    landing.absent_cell(r0 + (r - fr0), c0 + (c - fc0))
+                } else {
+                    read.cell(r, c)
+                };
                 // A formula held verbatim (a shared one) keeps its text.
                 let verbatim = cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a));
                 if !verbatim {
