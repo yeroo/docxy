@@ -38468,11 +38468,6 @@ fn emit_run(
     *idx = end;
 }
 
-/// How far one piece from `flat_inlines` advances `paragraph_el`'s caret offset
-/// (`idx`): a run's characters, one for a tab, a break, a field showing a
-/// result (#642), an equation or an inline picture (#1242), none for anything
-/// else (links are already opened up). This is the engine's `inline_len` for
-/// those pieces; `paragraph_el` asserts it.
 /// Whether a pending object insertion ([`docxcore::editor::is_pending_object`])
 /// is among the zero-width pieces `rest` starts with (#1625).
 fn pending_object_follows(rest: &[(Cow<'_, Inline>, bool)]) -> bool {
@@ -38482,6 +38477,11 @@ fn pending_object_follows(rest: &[(Cow<'_, Inline>, bool)]) -> bool {
         .any(docxcore::editor::is_pending_object)
 }
 
+/// How far one piece from `flat_inlines` advances `paragraph_el`'s caret offset
+/// (`idx`): a run's characters, one for a tab, a break, a field showing a
+/// result (#642), an equation or an inline picture (#1242), none for anything
+/// else (links are already opened up). This is the engine's `inline_len` for
+/// those pieces; `paragraph_el` asserts it.
 fn caret_advance(inline: &Inline) -> usize {
     match inline {
         Inline::Run(_) | Inline::Tab(_) | Inline::Break(..) | Inline::Field { .. } => {

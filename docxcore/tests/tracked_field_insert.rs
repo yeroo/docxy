@@ -1,8 +1,9 @@
 //! #1625: a field inserted while tracking (Insert Field, Date & Time, a
 //! paste) is recorded as a `w:ins` of its own, as a picture is (#1242):
-//! zero-width until accepted. Typing right after it goes after it, and its
-//! own author's Backspace or Delete next to it removes it outright, so a
-//! tracked delete never turns it into a `w:del` that Reject brings back.
+//! zero-width until accepted. The caret is after it at its offset: typing
+//! there goes after it, its own author's Backspace right after it removes it
+//! outright and Delete acts on what follows, so a tracked delete never turns
+//! it into a `w:del` that Reject brings back.
 
 use docxcore::editor::{Caret, Clip, Editor, TrackAuthor};
 use docxcore::load::{Relationships, parse_document_xml};
@@ -562,4 +563,192 @@ fn the_terminal_caret_is_drawn_after_a_pending_insertion() {
     let (lines, maps) = render_mapped(&deleted.doc, &RenderOptions::default());
     assert_eq!(lines[0].plain(), "ab777cd");
     assert_eq!(maps[0].col_for_caret(&[0], 2, None), Some(2));
+}
+
+/// The fields and pictures in `content`, wherever they sit (a link, a
+/// tracked change).
+fn objects_in(content: &[Inline]) -> usize {
+    content
+        .iter()
+        .map(|i| match i {
+            Inline::Field { .. } => 1,
+            Inline::Raw(raw) if raw.contains("<w:drawing") => 1,
+            Inline::Hyperlink(h) => objects_in(&h.content),
+            Inline::Revision { content, .. } => objects_in(content),
+            _ => 0,
+        })
+        .sum()
+}
+
+fn doc_objects(ed: &Editor) -> usize {
+    ed.doc
+        .body
+        .iter()
+        .map(|b| match b {
+            Block::Paragraph(p) => objects_in(&p.content),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// The pending object insertions by `author` in the document.
+fn pending_by(ed: &Editor, author: &str) -> usize {
+    fn walk(content: &[Inline], author: &str) -> usize {
+        content
+            .iter()
+            .map(|i| match i {
+                Inline::Hyperlink(h) => walk(&h.content, author),
+                Inline::Revision { metadata, .. }
+                    if docxcore::editor::is_pending_object(i)
+                        && metadata.author.as_deref() == Some(author) =>
+                {
+                    1
+                }
+                _ => 0,
+            })
+            .sum()
+    }
+    ed.doc
+        .body
+        .iter()
+        .map(|b| match b {
+            Block::Paragraph(p) => walk(&p.content, author),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Paragraphs with pending insertions at their edges, in a link, in an
+/// empty link, alone in a paragraph, and one by another author.
+fn cross_check_doc() -> Document {
+    let ins = |id: u32, author: &str, inner: &str| {
+        format!("<w:ins w:id=\"{id}\" w:author=\"{author}\">{inner}</w:ins>")
+    };
+    parse(&format!(
+        "<w:p>{}<w:r><w:t>ab</w:t></w:r>\
+         <w:hyperlink w:anchor=\"x\"><w:r><w:t>L</w:t></w:r>{}</w:hyperlink>\
+         <w:hyperlink w:anchor=\"y\">{}</w:hyperlink><w:r><w:t>cd</w:t></w:r>{}</w:p>\
+         <w:p>{}<w:r><w:t>ef</w:t></w:r>{}<w:r><w:t>g</w:t></w:r></w:p>\
+         <w:p>{}</w:p>\
+         <w:p><w:r><w:t>h</w:t></w:r></w:p>",
+        ins(1, "Ada", COMPLEX),
+        ins(2, "Ada", COMPLEX),
+        ins(3, "Ada", COMPLEX),
+        ins(4, "Ada", COMPLEX),
+        ins(5, "Ada", PIC),
+        ins(6, "Bo", COMPLEX),
+        ins(7, "Ada", COMPLEX),
+    ))
+}
+
+/// Every caret position of [`cross_check_doc`], in document order.
+fn positions() -> Vec<Caret> {
+    let ed = Editor::new(cross_check_doc());
+    let mut out = Vec::new();
+    for (k, block) in ed.doc.body.iter().enumerate() {
+        if let Block::Paragraph(p) = block {
+            let len: usize = p.content.iter().map(docxcore::editor::inline_len).sum();
+            out.extend((0..=len).map(|o| Caret::at(vec![k], o)));
+        }
+    }
+    out
+}
+
+fn selected(lo: &Caret, hi: &Caret, tracking: bool) -> Editor {
+    let mut ed = Editor::new(cross_check_doc());
+    if tracking {
+        track(&mut ed, "Ada");
+    }
+    ed.anchor = Some(lo.clone());
+    ed.caret = hi.clone();
+    ed
+}
+
+/// For every selection, a tracked cut removes exactly the pending objects
+/// its clip carries (never loses one, never doubles one), and a tracked
+/// delete removes the same ones.
+#[test]
+fn a_cut_removes_exactly_the_pending_objects_its_clip_carries() {
+    let pos = positions();
+    let mut checked = 0;
+    for (i, lo) in pos.iter().enumerate() {
+        for hi in &pos[i + 1..] {
+            let mut ed = selected(lo, hi, true);
+            let before = doc_objects(&ed);
+            let (ada, bo) = (pending_by(&ed, "Ada"), pending_by(&ed, "Bo"));
+            let carried = ed
+                .cut()
+                .map_or(0, |clip| clip.paras.iter().map(|p| objects_in(p)).sum());
+            let at = format!("{lo:?}..{hi:?}");
+            assert_eq!(doc_objects(&ed) + carried, before, "{at}");
+            assert_eq!(ada - pending_by(&ed, "Ada"), carried, "{at}");
+            assert_eq!(pending_by(&ed, "Bo"), bo, "{at}");
+            let mut deleted = selected(lo, hi, true);
+            deleted.delete_selection();
+            assert_eq!(xml(&deleted), xml(&ed), "{at}");
+            checked += 1;
+        }
+    }
+    assert!(checked > 50, "{checked}");
+}
+
+#[test]
+fn a_cell_range_cut_carries_a_pending_field_at_a_cells_start() {
+    let mut ed = Editor::new(parse(
+        "<w:tbl><w:tr><w:tc><w:p/></w:tc><w:tc><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc>\
+         </w:tr></w:tbl><w:p><w:r><w:t>after</w:t></w:r></w:p>",
+    ));
+    track(&mut ed, "Ada");
+    ed.set_caret(Caret::at(vec![0, 0, 0, 0], 0));
+    ed.paste(&Clip::new(vec![vec![simple_field()]]));
+    assert_eq!(insertions(&xml(&ed)).len(), 1, "{}", xml(&ed));
+    ed.anchor = Some(Caret::at(vec![0, 0, 0, 0], 0));
+    ed.caret = Caret::at(vec![0, 0, 1, 0], 1);
+    let clip = ed.cut().expect("a clip");
+    assert_eq!(
+        clip.paras.iter().map(|p| objects_in(p)).sum::<usize>(),
+        1,
+        "{clip:?}"
+    );
+    assert!(!xml(&ed).contains("instrText"), "{}", xml(&ed));
+    ed.anchor = None;
+    ed.set_caret(Caret::at(vec![1], 5));
+    ed.paste(&clip);
+    assert_eq!(xml(&ed).matches("<w:instrText").count(), 1, "{}", xml(&ed));
+}
+
+#[test]
+fn copy_carries_a_pending_field_or_picture() {
+    for object in [simple_field(), picture()] {
+        let mut ed = editor();
+        insert_at(&mut ed, 2, object);
+        let original = xml(&ed);
+        ed.anchor = Some(Caret::at(vec![0], 1));
+        ed.caret = Caret::at(vec![0], 3);
+        let clip = ed.copy().expect("a clip");
+        assert_eq!(objects_in(&clip.paras[0]), 1, "{clip:?}");
+        assert_eq!(xml(&ed), original, "a copy changes nothing");
+        // Pasted untracked, it is live.
+        let mut other = Editor::new(parse("<w:p><w:r><w:t>z</w:t></w:r></w:p>"));
+        other.set_caret(Caret::at(vec![0], 1));
+        other.paste(&clip);
+        assert_eq!(
+            shape(&other)
+                .iter()
+                .filter(|s| s.starts_with("ins"))
+                .count(),
+            0
+        );
+        assert_eq!(objects_in(content(&other)), 1, "{}", xml(&other));
+    }
+    // Whoever's it is; one at the selection's start is not covered.
+    let mut ed = editor();
+    insert_at(&mut ed, 2, simple_field());
+    track(&mut ed, "Bo");
+    ed.anchor = Some(Caret::at(vec![0], 1));
+    ed.caret = Caret::at(vec![0], 2);
+    assert_eq!(objects_in(&ed.copy().unwrap().paras[0]), 1);
+    ed.anchor = Some(Caret::at(vec![0], 2));
+    ed.caret = Caret::at(vec![0], 3);
+    assert_eq!(objects_in(&ed.copy().unwrap().paras[0]), 0);
 }

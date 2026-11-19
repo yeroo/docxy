@@ -19,7 +19,9 @@
 //!   caret is after one at its offset: text typed there goes after it, the
 //!   author's own Backspace removes it outright, and Delete acts on what
 //!   follows. A deletion covering the author's own (one at the selection's
-//!   end included, one at its start not) removes it; a cut carries it.
+//!   end included, one at its start not) removes it; a cut's clip carries
+//!   exactly the ones its delete removes, and a copy carries every one it
+//!   covers, whoever's (`covers_pending` decides for all three).
 //!
 //! * Deleting text inside a hyperlink records the deletion inside the link,
 //!   as Word does: a wrapper never straddles the link's boundary (#1462).
@@ -274,6 +276,36 @@ impl Editor {
         }
     }
 
+    /// The paragraphs a tracked delete of `lo..hi` walks, in document
+    /// order: `lo`'s alone when both are in it, else every paragraph from
+    /// `lo`'s to `hi`'s, the ones in a table between them included (the
+    /// table itself stays), a text box other than the one an endpoint is in
+    /// skipped. `None` when an endpoint is not a paragraph the walk reaches.
+    pub(super) fn tracked_delete_paths(
+        &self,
+        lo: &super::Caret,
+        hi: &super::Caret,
+    ) -> Option<Vec<Vec<usize>>> {
+        if lo.path == hi.path {
+            return Some(vec![lo.path.clone()]);
+        }
+        // A text box other than the one an endpoint is in is not between them.
+        let (lo_box, hi_box) = (
+            text_box_of(&self.doc.body, &lo.path),
+            text_box_of(&self.doc.body, &hi.path),
+        );
+        let paths: Vec<Vec<usize>> = super::all_paragraph_paths(&self.doc.body)
+            .into_iter()
+            .filter(|p| match text_box_of(&self.doc.body, p) {
+                None => true,
+                Some(b) => Some(&b) == lo_box.as_ref() || Some(&b) == hi_box.as_ref(),
+            })
+            .collect();
+        let first = paths.iter().position(|p| *p == lo.path)?;
+        let last = paths.iter().position(|p| *p == hi.path)?;
+        (first <= last).then(|| paths[first..=last].to_vec())
+    }
+
     /// Delete the text of the selection `lo..hi` as tracked deletions in every
     /// body or table-cell paragraph from `lo` to `hi` in document order (a
     /// table between them stays, its cells' text recorded), keeping the
@@ -292,27 +324,11 @@ impl Editor {
         if self.track.is_none() {
             return false;
         }
-        // Every paragraph from `lo` to `hi` in document order, the ones in a
-        // table between them included: the table itself stays.
-        // A text box other than the one an endpoint is in is not between them.
-        let (lo_box, hi_box) = (
-            text_box_of(&self.doc.body, &lo.path),
-            text_box_of(&self.doc.body, &hi.path),
-        );
-        let paths: Vec<Vec<usize>> = super::all_paragraph_paths(&self.doc.body)
-            .into_iter()
-            .filter(|p| match text_box_of(&self.doc.body, p) {
-                None => true,
-                Some(b) => Some(&b) == lo_box.as_ref() || Some(&b) == hi_box.as_ref(),
-            })
-            .collect();
-        let (Some(first), Some(last)) = (
-            paths.iter().position(|p| *p == lo.path),
-            paths.iter().position(|p| *p == hi.path),
-        ) else {
+        let Some(paths) = self.tracked_delete_paths(lo, hi) else {
             return false;
         };
-        for (k, path) in paths[first..=last].iter().enumerate() {
+        let (first, last) = (0, paths.len() - 1);
+        for (k, path) in paths.iter().enumerate() {
             let Some(para) = resolve_para(&self.doc.body, path) else {
                 continue;
             };
@@ -848,6 +864,16 @@ fn pending_at(
     }
 }
 
+/// Whether a selection covers a pending object insertion at offset `p` of a
+/// paragraph (#1625): `lo < p <= hi`, or `p <= hi` with `lo` `None` (the
+/// selection began in a paragraph before). The caret is after the pending
+/// objects at its offset, so one at the selection's start is before it and
+/// one at its end inside it. A cut's clip and a tracked delete both decide
+/// by this.
+pub(super) fn covers_pending(lo: Option<usize>, hi: usize, p: usize) -> bool {
+    lo.is_none_or(|lo| p > lo) && p <= hi
+}
+
 /// The index paths of the pending object insertions by `author` at offsets
 /// `p` with `lo < p <= hi` (`lo` `None`: from the start), in document order.
 fn pending_in(
@@ -876,7 +902,7 @@ fn pending_in(
                 }
             }
             Inline::Revision { metadata, .. }
-                if lo.is_none_or(|lo| acc > lo)
+                if covers_pending(lo, hi, acc)
                     && is_pending_object(inline)
                     && metadata.author.as_deref() == Some(author) =>
             {
@@ -917,8 +943,9 @@ fn begins_a_loose_field(inline: &Inline) -> bool {
 
 /// Whether `inline` is a pending object insertion: a tracked insertion
 /// holding one picture or field alone, as [`record_inserted_objects`] makes
-/// and Word writes. It is zero-width until accepted; typing at it goes after
-/// it, and its own author's Backspace or Delete next to it removes it.
+/// and Word writes. It is zero-width until accepted, and the caret is after
+/// the ones at its offset: typing there goes after it, its own author's
+/// Backspace right after it removes it, and Delete acts on what follows.
 pub fn is_pending_object(inline: &Inline) -> bool {
     matches!(
         inline,

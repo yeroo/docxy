@@ -442,10 +442,15 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   `past_field_ends`; the typed run drops the insertion record it borrowed, so
   it gets an id of its own), a paste already lands after them, the tracking
   author's Backspace removes the last (`remove_own_pending_object`), Delete
-  acts on what follows. A tracked selection delete removes the author's own
-  at offsets `lo < p <= hi` (`remove_own_pending_objects_in`; from the
-  paragraph before, `p == 0` too), and a cut's clip carries them
-  (`copy_taking`). The terminal view keeps only the caret stop after one
+  acts on what follows. One rule, `track::covers_pending` (`lo < p <= hi`;
+  from the paragraph before, `p == 0` too), over one paragraph list
+  (`tracked_delete_paths`), decides coverage for the tracked delete
+  (`remove_own_pending_objects_in`) and the clip (`copy_taking` /
+  `extract_range_taking`, which walks into a link even where the range is
+  empty in it): a cut carries exactly what its delete removes (a cell range:
+  every one, as `clear_cells` does), a copy every one covered, any author.
+  `tests/tracked_field_insert.rs` cross-checks every selection of a small
+  document. An untracked cut carries none. The terminal view keeps only the caret stop after one
   (`render.rs` `keep_stops_after_pending_objects`); the suite's
   `paragraph_el` holds a run-end caret past one (`pending_object_follows`).
 - Compare: a field failing `is_run_level(run_level_field(..))` is never in a

@@ -109,9 +109,11 @@ comment-marker id in the document.
   author's own Backspace removes it outright (one undo step, no `w:del`) and
   Delete acts on what follows. A tracked selection delete or cut covering the
   author's own (one at the selection's end included, one at its start not)
-  removes it, and a cut's clip carries it, so a paste moves it; another
-  author's stays. F9 and Edit Field do not reach a pending field until it is
-  accepted.
+  removes it, and a cut's clip carries exactly the ones its delete removes
+  (every one in the cells a cell-range cut clears), so a paste moves them;
+  another author's stays. A copy carries every one it covers, whoever's, as
+  its object: pasted while tracking it is a new pending insertion, else
+  live. F9 and Edit Field do not reach a pending field until it is accepted.
 - **Deletions** (Backspace, Delete, Cut, a selection) move the text into a
   `<w:del>` with `<w:delText>`; the editor counts it as zero-width, so the caret
   steps over it, and adjacent deletions by the author merge into one (a
