@@ -12,7 +12,7 @@
 
 use gpui::App;
 
-use crate::ext::{self, Factory, TabSurface};
+use crate::ext::{self, Factory};
 
 /// The id of an extension tab kind (#2253), interned: equal ids are equal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -109,12 +109,6 @@ pub(crate) fn accent_of(kind_id: &str, cx: &App) -> Option<(u32, u32)> {
         .iter()
         .find(|r| r.id.as_str() == kind_id)
         .and_then(|r| r.accent)
-}
-
-/// A new surface of kind `id`: `None` when this App registers no such kind.
-pub(crate) fn new_surface(id: ExtId, cx: &mut App) -> Option<Result<Box<dyn TabSurface>, String>> {
-    let factory = find(id, cx)?.factory.clone();
-    Some(factory(cx))
 }
 
 /// The status line of a restored tab of a kind this build does not register.

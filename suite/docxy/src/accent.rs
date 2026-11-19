@@ -29,17 +29,21 @@ pub(crate) fn for_kind(kind: Option<Kind>, dark: bool) -> u32 {
 /// [`for_kind`], with a further extension kind's own accent (#2253) when
 /// this App registers it with one.
 pub(crate) fn for_tab(kind: Option<Kind>, dark: bool, cx: &gpui::App) -> u32 {
+    for_tab_in(kind, dark, |id| ext_kinds::find(id, cx))
+}
+
+/// [`for_tab`] with `find` as the registry: an Ext kind it finds with an
+/// accent takes that accent's shade; one it does not, or one with none, is
+/// the brand.
+fn for_tab_in<'a>(
+    kind: Option<Kind>,
+    dark: bool,
+    find: impl Fn(ext_kinds::ExtId) -> Option<&'a ext_kinds::Registered>,
+) -> u32 {
     match kind {
-        Some(Kind::Ext(id)) => {
-            ext_kinds::find(id, cx)
-                .and_then(|r| r.accent)
-                .map_or(
-                    BRAND,
-                    |(light, dark_shade)| {
-                        if dark { dark_shade } else { light }
-                    },
-                )
-        }
+        Some(Kind::Ext(id)) => find(id)
+            .and_then(|r| r.accent)
+            .map_or(BRAND, |(light, shade)| if dark { shade } else { light }),
         k => for_kind(k, dark),
     }
 }
@@ -47,8 +51,17 @@ pub(crate) fn for_tab(kind: Option<Kind>, dark: bool, cx: &gpui::App) -> u32 {
 /// [`label`], with a registered extension kind's own word (#2253): its
 /// name, lowercased.
 pub(crate) fn label_for(kind: Option<Kind>, cx: &gpui::App) -> &'static str {
+    label_in(kind, |id| ext_kinds::find(id, cx))
+}
+
+/// [`label_for`] with `find` as the registry: an Ext kind it does not find
+/// is its id.
+fn label_in<'a>(
+    kind: Option<Kind>,
+    find: impl Fn(ext_kinds::ExtId) -> Option<&'a ext_kinds::Registered>,
+) -> &'static str {
     match kind {
-        Some(Kind::Ext(id)) => ext_kinds::find(id, cx).map_or(id.as_str(), |r| r.label),
+        Some(Kind::Ext(id)) => find(id).map_or(id.as_str(), |r| r.label),
         k => label(k),
     }
 }
@@ -135,15 +148,45 @@ mod tests {
         );
     }
 
-    /// #2253: a further extension kind is the brand and its id until its
-    /// registration says otherwise (`for_tab`, `label_for`).
+    /// #2253: a further extension kind this App does not register is the
+    /// brand and its id; one it registers is its own accent's shade and its
+    /// name lowercased; one registered with no accent is the brand.
     #[test]
-    fn an_extension_kind_without_its_registration_is_the_brand_and_its_id() {
-        let k = Some(Kind::Ext(ext_kinds::ExtId::intern("some.kind")));
-        assert_eq!(label(k), "some.kind");
+    fn an_extension_kind_is_its_registrations_accent_and_label() {
+        let (kinds, _) = ext_kinds::validate(vec![
+            crate::ext_fixture::kind(false),
+            crate::ext::ExtKind::new(
+                "plain",
+                "Plain Notes",
+                "",
+                "",
+                crate::ext_fixture::factory(false),
+            ),
+        ]);
+        let find = |id| kinds.iter().find(|r| r.id == id);
+        let nothing = |_| None;
+        let gone = Some(Kind::Ext(ext_kinds::ExtId::intern("some.kind")));
+        let fixture = Some(Kind::Ext(ext_kinds::ExtId::intern("fixture")));
+        let plain = Some(Kind::Ext(ext_kinds::ExtId::intern("plain")));
+        assert_eq!(label(gone), "some.kind");
+        assert_eq!(label_in(gone, find), "some.kind");
+        assert_eq!(label_in(fixture, nothing), "fixture");
+        assert_eq!(label_in(fixture, find), "fixture");
+        assert_eq!(label_in(plain, find), "plain notes");
+        assert_eq!(label_in(Some(Kind::Xlsx), find), "sheet");
+        let (light, dark_shade) = crate::ext_fixture::KIND_ACCENT;
         for dark in [false, true] {
-            assert_eq!(for_kind(k, dark), BRAND);
+            assert_eq!(for_kind(fixture, dark), BRAND);
+            assert_eq!(for_tab_in(gone, dark, find), BRAND);
+            assert_eq!(for_tab_in(fixture, dark, nothing), BRAND);
+            assert_eq!(for_tab_in(plain, dark, find), BRAND);
+            assert_eq!(
+                for_tab_in(Some(Kind::Project), dark, find),
+                for_kind(Some(Kind::Project), dark)
+            );
         }
+        assert_eq!(for_tab_in(fixture, false, find), light);
+        assert_eq!(for_tab_in(fixture, true, find), dark_shade);
     }
 
     /// The harness's test kind's accent (#2253) holds the same bar as the

@@ -378,7 +378,8 @@ impl Kind {
             Kind::Look => "\u{2709}",
             Kind::Help => "\u{2753}",
             Kind::Pdf => "\u{1F4D1}",
-            // A kind with an icon draws it instead (`ext_kind_icon`).
+            // A kind with an icon draws that instead: the tab chip and the
+            // New card draw `ext_kinds::Registered::icon` with `icon_svg`.
             Kind::Ext(_) => "\u{25A3}",
         }
     }
@@ -16983,7 +16984,7 @@ mod session_union_tests {
     /// edit: the row restores by its `kind`, and the id is dropped.
     #[test]
     fn extension_kind_tabs_round_trip_by_their_id() {
-        use super::{AttachStep, Surface, attach_step, ext_kinds::ExtId};
+        use super::{AttachStep, Surface, attach_step, ext_kinds::ExtId, mark_unavailable_kinds};
         let root = fresh_root("ext-kinds");
         let session: Session = serde_json::from_str(
             r#"{"active": 1, "tabs": [
@@ -17026,11 +17027,16 @@ mod session_union_tests {
             attach_step(&tabs[1], name_of),
             Some(AttachStep::Kind(fixture))
         );
-        assert_eq!(
-            attach_step(&tabs[2], name_of),
-            Some(AttachStep::Unavailable(gone))
-        );
+        assert_eq!(attach_step(&tabs[2], name_of), None);
         assert_eq!(attach_step(&tabs[3], name_of), None);
+        // Restored, a tab of a kind this build lacks says so; one it has,
+        // Mail's and a document's say nothing of it.
+        let mut tabs = tabs;
+        mark_unavailable_kinds(&mut tabs, |id| id == fixture);
+        let statuses: Vec<&str> = tabs.iter().map(|t| t.status.as_ref()).collect();
+        assert_eq!(statuses[..3], ["", "", "gone: not available in this build"]);
+        assert_ne!(statuses[3], "gone: not available in this build");
+        assert_eq!(attach_step(&tabs[2], name_of), None);
 
         write_session_with(&root, &tabs, 1, prefs(), SessionWrite::All, &[], 0);
         let text = std::fs::read_to_string(session_path_in(&root)).unwrap();
@@ -17058,8 +17064,8 @@ mod session_union_tests {
 
     /// #2253: attaching asks a tab once. A refused tab (its status starts
     /// with its kind's name, or `Mail: `) is not asked again; an
-    /// unregistered kind's tab is told once, while its status is empty; a
-    /// tab drawn already, or failed, is left alone.
+    /// unregistered kind's tab is never asked; a tab drawn already, or
+    /// failed, is left alone.
     #[test]
     fn attaching_asks_each_extension_tab_once() {
         use super::{AttachStep, Surface, attach_step, ext_kinds::ExtId};
@@ -17078,15 +17084,9 @@ mod session_union_tests {
         t.status = "Mail: no account".into();
         t.kind = Kind::Look;
         assert_eq!(attach_step(&t, name_of), None);
-        let gone = ExtId::intern("gone");
-        t.kind = Kind::Ext(gone);
+        // A kind this build lacks is never asked, whatever its status.
+        t.kind = Kind::Ext(ExtId::intern("gone"));
         t.status = "".into();
-        assert_eq!(
-            attach_step(&t, name_of),
-            Some(AttachStep::Unavailable(gone))
-        );
-        t.status = super::ext_kinds::unavailable_status(gone).into();
-        assert_eq!(t.status.as_ref(), "gone: not available in this build");
         assert_eq!(attach_step(&t, name_of), None);
         t.kind = Kind::Ext(fixture);
         t.status = "".into();
@@ -18682,6 +18682,9 @@ impl Docxy {
         };
         let active = session.active.min(tabs.len().saturating_sub(1));
         let mut this = Self::build(tabs, active, session.theme, session.ask_on_close, cx);
+        // A restored tab of an extension kind this build lacks (#2253) says
+        // so first; a later notice on the same tab replaces it.
+        mark_unavailable_kinds(&mut this.tabs, |id| ext_kinds::find(id, cx).is_some());
         if start_screen {
             this.show_start_screen(cx);
         }
@@ -59526,16 +59529,30 @@ enum AttachStep {
     /// Ask kind `.0`'s factory (#2253); a refusal is said after its name
     /// and `": "`.
     Kind(ext_kinds::ExtId),
-    /// Say on the status line that this build has no such kind.
-    Unavailable(ext_kinds::ExtId),
+}
+
+/// Puts `<id>: not available in this build` on the status line of each
+/// restored tab of a further extension kind (#2253) that `registered` says
+/// this build has none of. `Docxy::new` runs it right after the restore,
+/// before anything else speaks: a later status (the "Plugin not loaded"
+/// notice on the active tab) replaces it there, and the placeholder body
+/// still says it.
+fn mark_unavailable_kinds(tabs: &mut [DocTab], registered: impl Fn(ext_kinds::ExtId) -> bool) {
+    for t in tabs {
+        if let Kind::Ext(id) = t.kind
+            && !registered(id)
+        {
+            t.status = ext_kinds::unavailable_status(id).into();
+        }
+    }
 }
 
 /// What attaching does for tab `t` now, `None` for nothing: only a Mail or
 /// further-kind tab still drawn as the placeholder, not failed, is asked,
 /// and not again once it refused (its status starts with the refusal's
 /// prefix). `name_of` is a registered kind's name, `None` for an id this
-/// build does not register: such a tab is told so once, while its status is
-/// still empty.
+/// build does not register: such a tab is never asked (its status line said
+/// so at the start, [`mark_unavailable_kinds`]).
 fn attach_step<'a>(
     t: &DocTab,
     name_of: impl Fn(ext_kinds::ExtId) -> Option<&'a str>,
@@ -59546,7 +59563,7 @@ fn attach_step<'a>(
     match t.kind {
         Kind::Look => (!t.status.starts_with(MAIL_REFUSED)).then_some(AttachStep::Mail),
         Kind::Ext(id) => match name_of(id) {
-            None => t.status.is_empty().then_some(AttachStep::Unavailable(id)),
+            None => None,
             Some(name) => {
                 // No string built: this runs on every render.
                 let refused = t
@@ -59565,9 +59582,10 @@ impl Docxy {
     /// surface, when a build links one, and every tab of a further kind a
     /// build registers (#2253) its kind's. A tab the extension refused keeps
     /// the placeholder, its reason on its status line (`Mail: `, or the
-    /// kind's name), and is not asked again. A restored tab of a kind this
-    /// build does not register says so on its status line, once. Runs on
-    /// every render: a tab it has nothing to do for costs a lookup.
+    /// kind's name), and is not asked again. A tab of a kind this build does
+    /// not register is left as it is ([`mark_unavailable_kinds`] said so at
+    /// the start). Runs on every render: a tab it has nothing to do for
+    /// costs a lookup.
     fn attach_ext_surfaces(&mut self, cx: &mut Context<Self>) {
         let mut dark = None;
         for i in 0..self.tabs.len() {
@@ -59578,12 +59596,12 @@ impl Docxy {
             let (refused, made) = match step {
                 AttachStep::Mail => (MAIL_REFUSED.to_string(), ext::new_mail(cx)),
                 AttachStep::Kind(id) => {
-                    let name = ext_kinds::find(id, cx).map_or("", |r| r.name.as_str());
-                    (format!("{name}: "), ext_kinds::new_surface(id, cx))
-                }
-                AttachStep::Unavailable(id) => {
-                    self.tabs[i].status = ext_kinds::unavailable_status(id).into();
-                    continue;
+                    // `attach_step` just found it registered.
+                    let Some(r) = ext_kinds::find(id, cx) else {
+                        continue;
+                    };
+                    let (refused, factory) = (format!("{}: ", r.name), r.factory.clone());
+                    (refused, Some(factory(cx)))
                 }
             };
             match made {

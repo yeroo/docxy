@@ -985,7 +985,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   gpui global per App (`ext_kinds::registered`, `find`): parallel tests
   never see each other's kinds. Everything that names an Ext kind's look
   takes `cx`: `accent::for_tab` and `label_for` (the name lowercased; the
-  id when not registered), `Docxy::accent_now(cx)`, the chip and the card.
+  id when not registered; their cores `for_tab_in`/`label_in` take the
+  lookup, for tests), `Docxy::accent_now(cx)`, the chip and the card.
   `accent::for_kind` and `label` stay for the built-ins (Ext: brand, id).
 - An Ext tab behaves as a Mail tab everywhere but the places named here: no
   file, no content (`hot_bytes` none), no Save As, Word's manual, the same
@@ -1005,9 +1006,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
 - `attach_ext_surfaces` (every render) asks `attach_step`, a pure fn: a
   placeholder Look tab asks the Mail factory (refusal prefix `Mail: `), a
   registered Ext tab its kind's (prefix `<name>: `, matched without
-  building a string), an unregistered one gets `<id>: not available in this
-  build` on its status line once, while the status is empty. A missing
-  factory goes on to the next tab (it was a `return` with one kind). The
+  building a string), an unregistered one is never asked. A missing
+  factory goes on to the next tab (it was a `return` with one kind).
+  `Docxy::new` runs `mark_unavailable_kinds` right after the restore, where
+  the registry is readable: each restored tab of a kind the build lacks gets
+  `<id>: not available in this build` on its status line, before any other
+  start-up notice. A later one (the active tab's "Plugin not loaded")
+  replaces it there; the placeholder body still says it. The
   theme a surface is told is its tab's kind's
   (`ext_ribbon::suite_theme_for_tab`), at attach and in `tell_ext_theme`;
   `ext::suite_theme` stays Mail's, `ext::suite_theme_for(id, cx)` is a

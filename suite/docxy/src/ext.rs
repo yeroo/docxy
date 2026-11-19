@@ -537,7 +537,8 @@ pub(crate) struct Installed {
 
 impl Global for Installed {}
 
-/// Installs `extensions` for the whole process; what it left out (a tab
+/// Installs `extensions` in this App (a gpui global, so each App, a test's
+/// among them, has its own); what it left out (a tab
 /// kind with a bad or repeated id) comes back, one line each, for `run` to
 /// say.
 pub(crate) fn install(cx: &mut App, extensions: Extensions) -> Vec<String> {
