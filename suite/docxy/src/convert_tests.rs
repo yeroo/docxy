@@ -340,17 +340,15 @@ fn recover_text_and_a_false_pdf_do_not_open_a_pdf_view() {
 #[test]
 fn a_pdf_view_comes_back_from_the_session_and_an_old_converted_row_converts() {
     let dir = Scratch::new();
-    let doc = docxcore::markdown::from_markdown("Page text.\n");
-    let path = write(
-        &dir,
-        "paper.pdf",
-        &docxcore::export::to_pdf(&doc, &docxcore::export::PdfOptions::default()),
-    );
+    // A three-page PDF, so the page the view was on is not the first.
+    let slides = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pdf-view/slides.pdf");
+    let path = write(&dir, "slides.pdf", &std::fs::read(slides).unwrap());
     let hot = dir.path("hot");
     std::fs::create_dir_all(&hot).unwrap();
     let mut tab = tab_from_path(&path);
     if let Surface::Pdf(v) = &mut tab.surface {
         v.zoom = 1.5;
+        v.restore_page = Some(2);
     }
     let persisted = persist_tab(&hot, 0, 0, &tab);
     assert!(
@@ -360,20 +358,41 @@ fn a_pdf_view_comes_back_from_the_session_and_an_old_converted_row_converts() {
     assert_eq!(persisted.hot, None, "the PDF is never written");
     assert!(!persisted.dirty);
     let at = persisted.pdf_view.expect("where the view was");
-    assert_eq!((at.page, at.zoom), (0, 1.5));
+    assert_eq!((at.page, at.zoom), (2, 1.5));
     let json = serde_json::to_string(&persisted).unwrap();
     assert!(json.contains("\"kind\":\"Docx\""), "{json}");
-    let back = restore_tab(&serde_json::from_str(&json).unwrap());
-    assert!(back.kind == Kind::Pdf);
+    // FIX r2: restored, two PDF tabs wait: no worker starts for either
+    // until it is in front.
+    let row: crate::PersistTab = serde_json::from_str(&json).unwrap();
+    let mut back = restore_tab(&row);
+    let other = restore_tab(&row);
+    for t in [&back, &other] {
+        assert!(t.kind == Kind::Pdf);
+        assert!(matches!(t.surface, Surface::PdfPending(_)), "no worker yet");
+        assert_eq!(t.status.as_ref(), crate::pdf_view::host::PENDING);
+    }
+    // Persisted again before it opened: still where it was.
+    let again = persist_tab(&hot, 0, 1, &other).pdf_view.unwrap();
+    assert_eq!((again.page, again.zoom), (2, 1.5));
+    // In front, it opens there.
+    finish_pending_conversion(&mut back);
     let Surface::Pdf(v) = &back.surface else {
         panic!("not a PDF view")
     };
     assert_eq!(v.zoom, 1.5);
-    assert_eq!(v.restore_page, Some(0));
+    assert_eq!(v.restore_page, Some(2));
+    assert_eq!(v.page_count(), 3);
+    assert_eq!(back.status.as_ref(), "loaded (PDF, 3 pages)");
     // A row an older build wrote for the PDF it converted.
+    let doc = docxcore::markdown::from_markdown("Page text.\n");
+    let paper = write(
+        &dir,
+        "paper.pdf",
+        &docxcore::export::to_pdf(&doc, &docxcore::export::PdfOptions::default()),
+    );
     let old = format!(
         r#"{{"kind":"Docx","title":"paper.pdf","path":{},"converted":"pdf"}}"#,
-        serde_json::to_string(&path.display().to_string()).unwrap()
+        serde_json::to_string(&paper.display().to_string()).unwrap()
     );
     let mut back = restore_tab(&serde_json::from_str(&old).unwrap());
     assert_eq!(back.access.converted, Some(Converted::Pdf));
@@ -382,6 +401,24 @@ fn a_pdf_view_comes_back_from_the_session_and_an_old_converted_row_converts() {
     assert!(matches!(back.surface, Surface::Doc(_)));
     assert_eq!(back.status.as_ref(), "loaded (converted from PDF)");
     assert_eq!(texts(&back), ["Page text."]);
+}
+
+/// FIX r2: a PDF that fails to open is still a PDF tab: File only on its
+/// ribbon, and Save never writes it.
+#[test]
+fn a_pdf_that_fails_to_open_keeps_a_pdf_tabs_ribbon() {
+    let dir = Scratch::new();
+    let path = write(&dir, "broken.pdf", b"%PDF-1.4\nnot a PDF at all\n");
+    let tab = tab_from_path(&path);
+    assert!(tab.kind == Kind::Pdf);
+    assert!(matches!(tab.surface, Surface::Placeholder));
+    assert!(tab.load_failed, "{}", tab.status);
+    assert!(tab.status.starts_with("load error"), "{}", tab.status);
+    let names: Vec<&str> = crate::ribbon_tab_set(tab.kind)
+        .iter()
+        .map(|(_, name, _)| *name)
+        .collect();
+    assert_eq!(names, ["File"]);
 }
 
 #[test]

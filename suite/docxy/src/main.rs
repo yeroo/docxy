@@ -945,6 +945,10 @@ enum Surface {
     Help(Box<help_view::HelpView>),
     /// A PDF's pages (#2245). Saves as nothing: the file is never written.
     Pdf(Box<pdf_view::PdfView>),
+    /// A PDF view restored from the session, not opened yet (#2245): it
+    /// opens, where it was, when it is first in front, so a startup never
+    /// starts a worker for a tab behind (as `pending_conversion`, #633).
+    PdfPending(pdf_view::host::PdfAt),
 }
 
 /// The typing a revert set aside, with the editor state that went with it.
@@ -12787,6 +12791,11 @@ fn reload_without_converting(path: &std::path::Path) -> Loaded {
 /// Convert a converted tab restored from the session (#633), now that it is
 /// in front: what its file converts to today.
 fn finish_pending_conversion(tab: &mut DocTab) {
+    // A restored PDF view opens now (#2245).
+    if let Surface::PdfPending(at) = tab.surface {
+        pdf_view::host::finish_pending_pdf(tab, at);
+        return;
+    }
     if !tab.pending_conversion {
         return;
     }
@@ -17593,12 +17602,10 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
 fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab, bool) {
     // A PDF view (#2245), where it was. A file that is no PDF now opens as
     // a document would.
+    // Not opened yet: it opens when it is first in front.
     if let (Some(at), Some(path)) = (t.pdf_view, t.path.as_ref()) {
         let path = PathBuf::from(path);
-        if let Some(mut tab) = pdf_view::host::pdf_view_tab(&path, Some(at)) {
-            tab.title = t.title.clone().into();
-            return (tab, false);
-        }
+        return (pdf_view::host::pending_pdf_tab(&path, &t.title, at), false);
     }
     if t.kind == Kind::Project {
         // Every fallback in `restore_project_tab` (sidecar missing or
@@ -17761,9 +17768,10 @@ fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
             None => {
                 // A PDF with no view recorded (a row of a build before #2245
                 // has `converted`) opens as one now.
-                if let Some(mut tab) = pdf_view::host::pdf_view_tab(path.as_ref().unwrap(), None) {
-                    tab.title = t.title.clone().into();
-                    return (tab, false);
+                let p = path.as_ref().unwrap();
+                if pdf_view::host::is_pdf_file(p) {
+                    let at = pdf_view::host::PdfAt { page: 0, zoom: 1. };
+                    return (pdf_view::host::pending_pdf_tab(p, &t.title, at), false);
                 }
                 let l = load_doc_for_tab(path.as_ref().unwrap(), None);
                 l.into_tab(t.kind, t.title.clone().into(), path, t.dirty)
@@ -17995,7 +18003,11 @@ fn hot_bytes(t: &DocTab) -> Option<(&'static str, Vec<u8>)> {
                 .ok()
                 .map(|bytes| ("yppx", bytes))
         }
-        Surface::Placeholder | Surface::Ext(_) | Surface::Help(_) | Surface::Pdf(_) => None,
+        Surface::Placeholder
+        | Surface::Ext(_)
+        | Surface::Help(_)
+        | Surface::Pdf(_)
+        | Surface::PdfPending(_) => None,
     }
 }
 
@@ -27893,8 +27905,8 @@ impl Docxy {
             self.refocus(window, cx);
             return Some(after);
         }
-        // Nor on a PDF view (#2245): it never writes the PDF.
-        if self.active_is_pdf() {
+        // Nor on a PDF tab (#2245): it never writes the PDF.
+        if self.active_kind_is_pdf() {
             self.set_status(pdf_view::host::PDF_NO_SAVE);
             self.refocus(window, cx);
             return Some(after);
@@ -28220,8 +28232,8 @@ impl Docxy {
             self.set_status(help_view::host::HELP_NO_SAVE);
             return self.refocus(window, cx);
         }
-        // Nor Save As on a PDF view (#2245, a later slice).
-        if self.active_is_pdf() {
+        // Nor Save As on a PDF tab (#2245, a later slice).
+        if self.active_kind_is_pdf() {
             self.set_status(pdf_view::host::PDF_NO_SAVE_AS);
             return self.refocus(window, cx);
         }
@@ -37200,6 +37212,10 @@ fn ribbon_for(kind: Kind) -> rs::Ribbon<Act> {
 
 fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'static str)] {
     use RibbonTab::*;
+    // A PDF tab (#2245), open, failed or not opened yet: File only.
+    if kind == Kind::Pdf {
+        return &[(None, "File", "F")];
+    }
     if kind == Kind::Project {
         &[
             (None, "File", "F"),
@@ -41308,8 +41324,8 @@ impl Docxy {
         // Backstage's Settings (the Theme row) there.
         // An extension's tab with a ribbon lists its own tabs (#1870).
         let mut names = self.ribbon_tab_names();
-        // A PDF view (#2245) has File only, as a Help tab.
-        if self.active_is_help() || self.active_is_pdf() {
+        // A PDF tab (#2245) has File only by its kind (`ribbon_tab_set`).
+        if self.active_is_help() {
             names.truncate(1);
         }
         let mut strip = h_flex()
@@ -48177,6 +48193,7 @@ impl Render for Docxy {
                     .into_any_element(),
                 Surface::Help(v) => self.help_body(tab, v, pal, bg, cx),
                 Surface::Pdf(v) => self.pdf_body(v, pal, bg, cx),
+                Surface::PdfPending(_) => placeholder(tab.kind, bg, dim).into_any_element(),
             },
             None => v_flex()
                 .flex_1()
@@ -48208,7 +48225,7 @@ impl Render for Docxy {
         }
 
         // A PDF view (#2245) zooms with its own toolbar.
-        let help_active = self.active_is_help() || self.active_is_pdf();
+        let help_active = self.active_is_help() || self.active_kind_is_pdf();
         let zoom_btn =
             |cx: &mut Context<Self>, id: &'static str, glyph: &'static str, delta: f32| {
                 div()
@@ -48325,7 +48342,7 @@ impl Render for Docxy {
                 "Enter/F2 edit · Tab next cell · Insert blank row · Delete clear cell (ID: task) · Alt+Shift+←/→ outline · Ctrl+F find · Ctrl+Z/Y · Ctrl+S"
             } else if self.active_is_help() {
                 help_view::host::status_hint(text_input::MACOS)
-            } else if self.active_is_pdf() {
+            } else if self.active_kind_is_pdf() {
                 pdf_view::host::status_hint(text_input::MACOS)
             } else {
                 doc_status_hint(text_input::MACOS)

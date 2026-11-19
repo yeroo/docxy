@@ -95,8 +95,44 @@ pub(crate) fn pdf_at(tab: &DocTab) -> Option<PdfAt> {
             page: v.restore_page.unwrap_or_else(|| v.current()),
             zoom: v.zoom,
         }),
+        // Not opened since the session restored it: where it was then.
+        Surface::PdfPending(at) => Some(*at),
         _ if tab.kind == Kind::Pdf => Some(PdfAt { page: 0, zoom: 1. }),
         _ => None,
+    }
+}
+
+/// A PDF view's tab restored from the session, not opened yet: no worker
+/// starts until it is first in front ([`finish_pending_pdf`]).
+pub(crate) fn pending_pdf_tab(path: &Path, title: &str, at: PdfAt) -> DocTab {
+    let mut tab = blank_docx_tab(title);
+    tab.kind = Kind::Pdf;
+    tab.path = Some(path.to_path_buf());
+    tab.status = PENDING.into();
+    tab.surface = Surface::PdfPending(at);
+    tab
+}
+
+/// What a restored PDF tab says until it opens.
+pub(crate) const PENDING: &str = "not opened yet: it opens when you open its tab";
+
+/// Open a restored PDF tab now that it is in front, where it was. A file
+/// that is no PDF any more is a failed tab that says so.
+pub(crate) fn finish_pending_pdf(tab: &mut DocTab, at: PdfAt) {
+    let Some(path) = tab.path.clone() else {
+        return;
+    };
+    let title = tab.title.clone();
+    match pdf_view_tab(&path, Some(at)) {
+        Some(mut fresh) => {
+            fresh.title = title;
+            tab.replace_in_place(fresh);
+        }
+        None => {
+            tab.surface = Surface::Placeholder;
+            tab.load_failed = true;
+            tab.status = "load error: the file is no longer a PDF".into();
+        }
     }
 }
 
@@ -129,6 +165,13 @@ impl Docxy {
         )
     }
 
+    /// A PDF tab, whatever its state: open, failed or not opened yet.
+    pub(crate) fn active_kind_is_pdf(&self) -> bool {
+        self.tabs
+            .get(self.active)
+            .is_some_and(|t| t.kind == Kind::Pdf)
+    }
+
     pub(crate) fn active_pdf(&self) -> Option<&PdfView> {
         match self.tabs.get(self.active).map(|t| &t.surface) {
             Some(Surface::Pdf(v)) => Some(v),
@@ -159,6 +202,12 @@ impl Docxy {
     pub(crate) fn pdf_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for img in take_released() {
             cx.drop_image(img, Some(window));
+        }
+        // A restored PDF tab in front opens before this frame lays it out.
+        if let Some(t) = self.tabs.get_mut(self.active)
+            && matches!(t.surface, Surface::PdfPending(_))
+        {
+            finish_pending_conversion(t);
         }
         let scale_factor = window.scale_factor();
         let Some(v) = self.active_pdf_mut() else {
@@ -294,10 +343,11 @@ impl Docxy {
                 }
             });
         }
-        if !m.alt {
-            self.with_pdf(cx, |v| {
-                v.nav_key(key, ctrl);
-            });
+        if !m.alt
+            && let Some(v) = self.active_pdf_mut()
+            && v.nav_key(key, ctrl)
+        {
+            cx.notify();
         }
     }
 

@@ -62,6 +62,15 @@ Notes for the suite's PDF view: opening a PDF as it looks, read-only.
 - Session: a document row (`kind: "Docx"`) with `pdf_view: {page, zoom}`, so
   an older build still reads `session.json` (and converts the PDF). A row
   without it (`converted: "pdf"`) restores converted.
+  A restored PDF row is `Surface::PdfPending(PdfAt)` until it is first in
+  front (`finish_pending_conversion`, also run by `pdf_tick`), as a pending
+  conversion is (#633): a startup starts no worker for a tab behind, and a
+  pending tab persists its `PdfAt` unchanged. Every `Kind::Pdf` tab (open,
+  failed, pending) has the File-only ribbon (`ribbon_tab_set`), the PDF
+  status hint and the Save refusals.
+- Find searches a page when its text comes in and splices its hits in page
+  order (the current hit stays the same); only a query or option change
+  searches every page again.
 - Each frame (`Docxy::pdf_tick`, on whichever window holds the tab, so a
   torn-off tab goes on drawing) frees the GPU images views let go of
   (`cx.drop_image`; the raster cache's LRU budget and a dropped view queue
