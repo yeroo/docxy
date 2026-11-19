@@ -32,9 +32,13 @@ test issue 2249 a mail opened as a web page hides its preheader and paints its b
   call theme-set {"theme":"light"}
   open copy:../fixtures/mail-fidelity.html
   # The caret opens in the hidden paragraph (a link and a `<br>` in it),
-  # which stays collapsed around it.
+  # which shows it so typing there is seen; in the next one, it collapses.
+  call doc {}
+  assert reply.flow.layout.paragraphs.0.height is 17
+  call selection-set {"start":60,"end":60}
   shot window
   call doc {}
+  assert reply.caret.offset is 60
   assert reply.view.layout is web
   assert reply.flow.layout.painted is true
   assert reply.flow.layout.paragraphs.0.height is 0

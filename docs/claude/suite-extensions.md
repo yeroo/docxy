@@ -941,11 +941,17 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   `run_w` measures a hidden run as 0.
 - A paragraph whose flattened pieces (`flat_inlines`, so a link's runs
   too) are all hidden or take no offset, and whose mark is hidden,
-  collapses (no height, spacing or margin) while marks are off, the caret
-  in it included, as Word draws an imported preheader.
+  collapses (no height, spacing or margin) while marks are off and the
+  caret is not in it, as Word draws an imported preheader. The caret in it
+  shows it, so typing there (in the hidden run's props) is seen; a document
+  tab that opens with its caret there shows the preheader until the caret
+  moves.
+- Hidden pieces count 0 in `run_w` and in `inline_w` (a centre or right
+  tab's segment).
 - Run shading (`w:shd` fill, `run_shading`) paints the highlight band
-  (`run_highlight`; a highlight wins). On a light page a run with its own
-  colour keeps it, a link without one keeps the link colour, and an
+  (`run_highlight(props, is_link, pal)`; a highlight wins). On a light
+  page a run with its own colour keeps it, a link without one keeps the
+  link colour (`run_ink`, so the inks record and the dump agree), and an
   automatic one takes a dark or light ink by the fill's luminance; on a
   dark page the highlight rule applies. The layout dump lists it under
   `highlights`.

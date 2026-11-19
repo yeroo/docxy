@@ -7738,28 +7738,49 @@ mod link_colour_tests {
         let cyan = shaded("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"00FFFF\"/>");
         let light = page_pal(0xffffff, hsla_u(0x123456));
         assert_eq!(run_shading(&cyan), Some(0x00ffff));
-        assert_eq!(run_highlight(&cyan, &light), Some((0x00ffff, 0x1a1a1a)));
+        assert_eq!(
+            run_highlight(&cyan, false, &light),
+            Some((0x00ffff, 0x1a1a1a))
+        );
         let navy = shaded("<w:shd w:val=\"clear\" w:fill=\"000080\"/>");
-        assert_eq!(run_highlight(&navy, &light), Some((0x000080, 0xf5f5f5)));
+        assert_eq!(
+            run_highlight(&navy, false, &light),
+            Some((0x000080, 0xf5f5f5))
+        );
         // A run with its own colour keeps it on a light page (a mail
         // button's white text on its fill).
         let button = RunProps {
             color: Some("FFFFFF".into()),
             ..shaded("<w:shd w:val=\"clear\" w:fill=\"0078D4\"/>")
         };
-        assert_eq!(run_highlight(&button, &light), Some((0x0078d4, 0xffffff)));
-        assert_eq!(hsla_rgb(hsla_u(0x0078d4)), 0x0078d4);
+        assert_eq!(
+            run_highlight(&button, false, &light),
+            Some((0x0078d4, 0xffffff))
+        );
+        // A shaded link with no colour of its own keeps the link colour.
+        let link = shaded("<w:shd w:val=\"clear\" w:fill=\"00FFFF\"/>");
+        assert_eq!(
+            run_highlight(&link, true, &light),
+            Some((0x00ffff, rgb_u(light.link)))
+        );
+        assert_eq!(
+            run_highlight(&link, false, &light),
+            Some((0x00ffff, 0x1a1a1a))
+        );
         assert_eq!(
             run_shading(&shaded("<w:shd w:val=\"clear\" w:fill=\"auto\"/>")),
             None
         );
-        assert_eq!(run_highlight(&RunProps::default(), &light), None);
+        assert_eq!(run_highlight(&RunProps::default(), false, &light), None);
         // A highlight wins over shading, as in Word.
         let both = RunProps {
             highlight: Some("yellow".into()),
             ..cyan.clone()
         };
-        assert_eq!(run_highlight(&both, &light).map(|(f, _)| f), Some(0xffff00));
+        assert_eq!(
+            run_highlight(&both, false, &light).map(|(f, _)| f),
+            Some(0xffff00)
+        );
     }
 
     /// `text-decoration:none` on a link (`w:u none`) leaves it without the
@@ -37965,13 +37986,6 @@ mod move_vert_tests {
 /// The size of the first window (and of the harness's), in px.
 const DEFAULT_WINDOW: (f32, f32) = (1180., 800.);
 
-/// An `Hsla` as `0xRRGGBB`, alpha dropped (#2249).
-fn hsla_rgb(c: Hsla) -> u32 {
-    let r = c.to_rgb();
-    let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
-    (b(r.r) << 16) | (b(r.g) << 8) | b(r.b)
-}
-
 fn hsla_u(c: u32) -> Hsla {
     rgb(c).into()
 }
@@ -38010,9 +38024,11 @@ fn highlight_rgb(name: &str) -> (u32, bool) {
 /// light page [`highlight_rgb`]'s colour with near-black or light text, as
 /// before; on a dark page Word's dark mode, [`dark_page::highlight`] with
 /// [`dark_page::highlight_ink`], told apart by whether the run's shown
-/// colour (its styles' included) is automatic. `None` without a highlight or
-/// run shading (`w:shd`, #2249); a highlight wins over shading.
-fn run_highlight(props: &RunProps, pal: &Pal) -> Option<(u32, u32)> {
+/// colour (its styles' included) is automatic. Run shading (`w:shd`,
+/// #2249) fills the same band; on a light page its ink is the run's own
+/// colour or, in a link (`is_link`), the link's, else the one that reads on
+/// the fill. `None` without either; a highlight wins over shading.
+fn run_highlight(props: &RunProps, is_link: bool, pal: &Pal) -> Option<(u32, u32)> {
     let (c, dark) = match props.highlight.as_deref() {
         Some(name) => highlight_rgb(name),
         // Run shading (`w:shd`, an imported `<span style="background:…">`)
@@ -38022,9 +38038,10 @@ fn run_highlight(props: &RunProps, pal: &Pal) -> Option<(u32, u32)> {
         // reads on the fill.
         None => {
             let c = run_shading(props)?;
-            let own = props.color.as_deref().and_then(hex_rgb);
-            if let (false, Some(own)) = (pal.dark, own) {
-                return Some((c, own));
+            // A run's own colour, or a link's, as `run_ink` draws it.
+            let own = props.color.as_deref().and_then(hex_rgb).is_some();
+            if !pal.dark && (own || is_link) {
+                return Some((c, rgb_u(run_ink(props, is_link, pal))));
             }
             (c, !dark_page::takes_light(c))
         }
@@ -38340,21 +38357,7 @@ fn emit_words(
     // the selected range reads as one contiguous band.
     let family = props.font.as_deref().and_then(font_subst::family);
     let color = run_ink(props, is_link, &pal);
-    // A shaded link on a light page with no colour of its own keeps the
-    // link's blue (#2249); a highlight keeps its own ink rule.
-    let highlight = run_highlight(props, &pal)
-        .filter(|_| !selected)
-        .map(|(fill, ink)| {
-            let shaded_link = is_link && props.highlight.is_none() && props.color.is_none();
-            (
-                fill,
-                if shaded_link && !pal.dark {
-                    hsla_rgb(pal.link)
-                } else {
-                    ink
-                },
-            )
-        });
+    let highlight = run_highlight(props, is_link, &pal).filter(|_| !selected);
     let mut off = seg_start;
     for word in text.split_inclusive(' ') {
         if word.is_empty() {
@@ -38576,8 +38579,9 @@ fn emit_run(
     *idx = end;
 }
 
-/// A hidden run's place in the paragraph (#2249): nothing drawn, its
-/// characters counted, and the caret drawn where it falls inside them.
+/// A hidden run's place in the paragraph (#2249), or a hidden tab's or
+/// break's (`text` one stand-in character): nothing drawn, its characters
+/// counted, and the caret drawn where it falls inside them.
 fn skip_hidden_run(
     out: &mut Vec<AnyElement>,
     text: &str,
@@ -39999,10 +40003,11 @@ fn paragraph_el(
     let items = flat_inlines(&p.content);
     // A paragraph hidden whole, its mark included (an imported mail's
     // `display:none` preheader), takes no room while formatting marks are
-    // off, as in Word (#2249), the caret in it included: every piece is
-    // hidden text, a hidden tab or break, or takes no offset (a link's
-    // wrapper, a bookmark).
+    // off, as in Word (#2249): every piece is hidden text, a hidden tab or
+    // break, or takes no offset (a link's wrapper, a bookmark). The caret in
+    // it shows it, so what is typed there is seen.
     let collapsed = !marks
+        && caret.is_none()
         && mark.vanish
         && items.iter().all(|(i, _)| match &**i {
             Inline::Run(r) => styler.shown(r).vanish,
@@ -40047,6 +40052,15 @@ fn paragraph_el(
     // size centre/right tabs). An inline picture counts its frame's width;
     // other inlines with no measurable text contribute 0.
     let inline_w = |it: &Inline| -> f32 {
+        // Hidden pieces take no width while marks are off (#2249).
+        let hidden = match it {
+            Inline::Run(r) => styler.shown(r).vanish,
+            Inline::Tab(tp) | Inline::Break(_, tp) => tp.vanish,
+            _ => false,
+        };
+        if !marks && hidden {
+            return 0.0;
+        }
         m.map_or(0.0, |m| {
             inline_width(it, base, zoom, m, styler, field_codes, page_vals, pic_room)
         })
@@ -40191,7 +40205,7 @@ fn paragraph_el(
                     if !r.text.trim().is_empty() {
                         // A highlighted run reads on its highlight (#2231),
                         // a shaded one on its comment's shade (#2232).
-                        let (ink, ground) = match run_highlight(&shown, &pal) {
+                        let (ink, ground) = match run_highlight(&shown, in_link, &pal) {
                             Some((fill, ink)) => (ink, fill),
                             None => (
                                 rgb_u(run_ink(&shown, in_link, &pal)),
@@ -40212,7 +40226,7 @@ fn paragraph_el(
                     }
                 }
                 if flow.record.is_some() && !r.text.trim().is_empty() {
-                    if let Some((fill, ink)) = run_highlight(&shown, &pal) {
+                    if let Some((fill, ink)) = run_highlight(&shown, in_link, &pal) {
                         painted_highlights.push((r.text.clone(), fill, ink));
                     }
                 }
