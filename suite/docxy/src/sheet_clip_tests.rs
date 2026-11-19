@@ -386,6 +386,61 @@ fn a_cut_moved_to_another_sheet_keeps_reading_what_it_read() {
     );
 }
 
+/// #1687: a conditional-format rule over the cut keeps its range, so it
+/// keeps its relative references; a fully absolute one follows the cell.
+#[test]
+fn a_cut_leaves_a_rule_over_it_reading_what_it_read() {
+    let mut v = view();
+    put(&mut v, "A1", Cell::number(7.0));
+    let s = v.active;
+    let rule = |formula: &str| gridcore::sheet::CondFormat {
+        ranges: vec![(0, 0, 99, 0)], // A1:A100
+        rules: vec![gridcore::sheet::CfRule {
+            kind: gridcore::sheet::CfKind::Expression {
+                formula: formula.into(),
+            },
+            dxf_id: None,
+            priority: 1,
+        }],
+        ix: None,
+    };
+    let cfs = &mut v.pkg.workbook.sheets[s].cond_formats;
+    cfs.push(rule("A1>5"));
+    cfs.push(rule("$A$1>5"));
+    let clip = cut(&mut v, "A1", "A1");
+    select(&mut v, "C1", "C1");
+    assert_eq!(v.paste_grid_clip(&clip), Ok(GridPasted::Done));
+    let formulas: Vec<String> = (v.pkg.workbook.sheets[s].cond_formats.iter())
+        .map(|cf| cf.rules[0].formulas()[0].clone())
+        .collect();
+    assert_eq!(formulas, ["A1>5", "$C$1>5"]);
+}
+
+/// #1687: a formula cut to another sheet keeps reading its sheet's own
+/// names, written as Excel writes them there.
+#[test]
+fn a_cut_to_another_sheet_qualifies_its_sheets_local_names() {
+    let mut v = view();
+    let s2 = v.add_sheet("Sheet2");
+    let name = |scope, formula: &str| gridcore::sheet::DefinedName {
+        name: "Rate".into(),
+        scope,
+        formula: formula.into(),
+    };
+    (v.pkg.workbook.defined_names).extend([name(Some(0), "Sheet1!$B$1"), name(Some(s2), "100")]);
+    v.active = 0;
+    v.rebuild_engine();
+    put(&mut v, "B1", Cell::number(3.0));
+    put(&mut v, "A1", Cell::formula("Rate*2"));
+    assert_eq!(value(&v, "A1"), CellValue::Number(6.0));
+    let clip = cut(&mut v, "A1", "A1");
+    v.active = s2;
+    select(&mut v, "C1", "C1");
+    assert_eq!(v.paste_grid_clip(&clip), Ok(GridPasted::Done));
+    assert_eq!(formula(&v, "C1").as_deref(), Some("Sheet1!Rate*2"));
+    assert_eq!(value(&v, "C1"), CellValue::Number(6.0));
+}
+
 #[test]
 fn an_edit_after_a_cut_cancels_it() {
     let mut v = issue_book();
