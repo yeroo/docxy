@@ -935,10 +935,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
 
 ## Imported mail as Word draws it (#2249)
 
-- `paragraph_el` draws a hidden run, tab or break (`vanish`) only while
-  formatting marks are shown (`skip_hidden_run`: nothing drawn, no width
-  or wrap, its offsets counted, the caret drawn where it falls), and
-  `run_w` measures a hidden run as 0.
+- While formatting marks are off, `paragraph_el` draws no hidden run, tab
+  or break (`vanish`; `skip_hidden_run`: no width or wrap, its offsets
+  counted), except a hidden run the caret is in or at either edge of,
+  which draws, in any paragraph, so typing in hidden props is seen.
 - A paragraph whose flattened pieces (`flat_inlines`, so a link's runs
   too) are all hidden or take no offset, and whose mark is hidden,
   collapses (no height, spacing or margin) while marks are off and the

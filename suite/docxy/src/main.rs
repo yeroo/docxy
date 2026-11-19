@@ -38591,7 +38591,8 @@ fn hidden_piece(it: &Inline, styler: run_look::RunStyler) -> bool {
 
 /// A hidden run's place in the paragraph (#2249), or a hidden tab's or
 /// break's (`text` one stand-in character): nothing drawn, its characters
-/// counted, and the caret drawn where it falls inside them.
+/// counted. A run holding the caret never comes here (it draws), so the
+/// caret branch serves a hidden tab or break.
 fn skip_hidden_run(
     out: &mut Vec<AnyElement>,
     text: &str,
