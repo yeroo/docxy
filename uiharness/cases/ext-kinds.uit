@@ -7,10 +7,19 @@
 # active tab's surface was told (`theme.accent`) and how many times it was
 # told one (`theme_calls`). The session round trip and a kind this build
 # does not register are unit tests (`extension_kind_tabs_round_trip_by_their_id`).
-# The instance starts with one document tab; each test leaves only that one.
+# The instance starts with one document tab (the first test also opens
+# basic.docx and closes it, as every case opens a file of the harness's own);
+# each test leaves only that one.
 ext fixture
 
 test issue 2253 File New lists the kind's card after the suite's and opens its tab in its accent
+  open copy:../fixtures/basic.docx
+  call tab-list {}
+  assert reply.count is 2
+  assert reply.tabs.1.kind is docx
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
   call theme-set {"theme":"auto"}
   call appearance-set {"appearance":"light"}
   call backstage {"action":"open"}
