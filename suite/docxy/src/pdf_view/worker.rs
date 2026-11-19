@@ -443,8 +443,7 @@ fn flatten(items: &[pdfcraft_render::OutlineItem], depth: usize, out: &mut Vec<B
 /// a pixel with less is un-premultiplied too.
 pub(crate) fn straight_bgra(rgba: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgba.len());
-    for p in rgba.chunks_exact(4) {
-        let [r, g, b, a] = [p[0], p[1], p[2], p[3]];
+    for &[r, g, b, a] in rgba.as_chunks::<4>().0 {
         let un = |c: u8| match a {
             255 => c,
             0 => 0,

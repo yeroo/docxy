@@ -829,9 +829,16 @@ impl PdfView {
 
     // ---- Find -------------------------------------------------------------------
 
+    /// The query or an option changed: find again now, so what the box
+    /// says is never a step behind.
     pub(crate) fn find_changed(&mut self) {
-        self.find.dirty = true;
         self.find.current = None;
+        self.refind();
+    }
+
+    /// Whether the hits wait to be found again (a page's text came in).
+    pub(crate) fn find_dirty(&self) -> bool {
+        self.find.dirty
     }
 
     /// Find again over every page whose text is in.

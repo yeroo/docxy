@@ -5,6 +5,7 @@
 use crate::convert_child::{self, What};
 use crate::open_mode::{Access, Converted, OpenMode, converted_refusal};
 use crate::open_mode_tests::Scratch;
+use crate::pdf_view::host::converted_pdf_tab;
 use crate::trusted::TrustStore;
 use crate::{
     DocTab, Kind, Surface, convert_doc_with, doc_save_as_name, doc_target_allowed,
@@ -273,24 +274,114 @@ fn a_docxy_bundle_still_opens_as_a_bundle() {
     }
 }
 
+/// #2245: a PDF opens as it looks, in a PDF view; Convert to editable
+/// document gives the converted tab a PDF opened as before (#633).
 #[test]
-fn a_pdf_opens_converted_from_pdf() {
+fn a_pdf_opens_in_a_pdf_view_and_converts_on_request() {
     let dir = Scratch::new();
     let doc = docxcore::markdown::from_markdown("Hello from a PDF.\n\nSecond paragraph.\n");
     let pdf = docxcore::export::to_pdf(&doc, &docxcore::export::PdfOptions::default());
-    let tab = tab_from_path(&write(&dir, "report.pdf", &pdf));
-    assert_eq!(tab.status.as_ref(), "loaded (converted from PDF)");
-    assert_eq!(tab.access.converted, Some(Converted::Pdf));
-    let text = texts(&tab).join("\n");
+    let path = write(&dir, "report.pdf", &pdf);
+    let tab = tab_from_path(&path);
+    assert!(tab.kind == Kind::Pdf);
+    assert_eq!(tab.status.as_ref(), "loaded (PDF, 1 page)");
+    assert_eq!(tab.title.as_ref(), "report.pdf");
+    let Surface::Pdf(v) = &tab.surface else {
+        panic!("not a PDF view")
+    };
+    assert_eq!(v.page_count(), 1);
+    assert_eq!(tab.access.converted, None);
+    // Every way a document opens: Open's modes too.
+    let opened = tab_from_path_mode(&path, OpenMode::Normal, &TrustStore::default()).unwrap();
+    assert!(matches!(opened.surface, Surface::Pdf(_)));
+    // Convert to editable document: the conversion, as a document.
+    let converted = converted_pdf_tab(&path, &TrustStore::default()).unwrap();
+    assert_eq!(converted.status.as_ref(), "loaded (converted from PDF)");
+    assert_eq!(converted.access.converted, Some(Converted::Pdf));
+    assert!(converted.kind == Kind::Docx);
+    let text = texts(&converted).join("\n");
     assert!(text.contains("Hello from a PDF."), "{text}");
-    // A PDF with no text says so, and is a failed load.
+    // A PDF with no text opens as its (blank) page; its conversion says
+    // there is no text, a failed load.
     let empty = docxcore::export::to_pdf(
         &docxcore::markdown::from_markdown(""),
         &docxcore::export::PdfOptions::default(),
     );
-    let tab = tab_from_path(&write(&dir, "blank.pdf", &empty));
+    let blank = write(&dir, "blank.pdf", &empty);
+    assert!(matches!(tab_from_path(&blank).surface, Surface::Pdf(_)));
+    let tab = converted_pdf_tab(&blank, &TrustStore::default()).unwrap();
     assert!(tab.load_failed, "{}", tab.status);
     assert!(tab.status.starts_with("load error"), "{}", tab.status);
+}
+
+/// #2245: Recover Text from Any File still reads a PDF's text, and a file
+/// named .pdf that is no PDF opens as before.
+#[test]
+fn recover_text_and_a_false_pdf_do_not_open_a_pdf_view() {
+    let dir = Scratch::new();
+    let doc = docxcore::markdown::from_markdown("Readable words.\n");
+    let pdf = write(
+        &dir,
+        "words.pdf",
+        &docxcore::export::to_pdf(&doc, &docxcore::export::PdfOptions::default()),
+    );
+    let rt = tab_from_path_mode(&pdf, OpenMode::RecoverText, &TrustStore::default()).unwrap();
+    assert!(matches!(rt.surface, Surface::Doc(_)));
+    assert_eq!(rt.access.converted, Some(Converted::RecoveredText));
+    let fake = write(&dir, "notes.pdf", RTF);
+    let tab = tab_from_path(&fake);
+    assert!(matches!(tab.surface, Surface::Doc(_)));
+    assert_eq!(tab.access.converted, Some(Converted::Rtf));
+}
+
+/// #2245: a PDF view is a document row in the session, with where it was;
+/// it comes back a PDF view there. A row of an older build (a converted
+/// PDF tab) still restores converted.
+#[test]
+fn a_pdf_view_comes_back_from_the_session_and_an_old_converted_row_converts() {
+    let dir = Scratch::new();
+    let doc = docxcore::markdown::from_markdown("Page text.\n");
+    let path = write(
+        &dir,
+        "paper.pdf",
+        &docxcore::export::to_pdf(&doc, &docxcore::export::PdfOptions::default()),
+    );
+    let hot = dir.path("hot");
+    std::fs::create_dir_all(&hot).unwrap();
+    let mut tab = tab_from_path(&path);
+    if let Surface::Pdf(v) = &mut tab.surface {
+        v.zoom = 1.5;
+    }
+    let persisted = persist_tab(&hot, 0, 0, &tab);
+    assert!(
+        persisted.kind == Kind::Docx,
+        "an older build reads a document row"
+    );
+    assert_eq!(persisted.hot, None, "the PDF is never written");
+    assert!(!persisted.dirty);
+    let at = persisted.pdf_view.expect("where the view was");
+    assert_eq!((at.page, at.zoom), (0, 1.5));
+    let json = serde_json::to_string(&persisted).unwrap();
+    assert!(json.contains("\"kind\":\"Docx\""), "{json}");
+    let back = restore_tab(&serde_json::from_str(&json).unwrap());
+    assert!(back.kind == Kind::Pdf);
+    let Surface::Pdf(v) = &back.surface else {
+        panic!("not a PDF view")
+    };
+    assert_eq!(v.zoom, 1.5);
+    assert_eq!(v.restore_page, Some(0));
+    // A row an older build wrote for the PDF it converted.
+    let old = format!(
+        r#"{{"kind":"Docx","title":"paper.pdf","path":{},"converted":"pdf"}}"#,
+        serde_json::to_string(&path.display().to_string()).unwrap()
+    );
+    let mut back = restore_tab(&serde_json::from_str(&old).unwrap());
+    assert_eq!(back.access.converted, Some(Converted::Pdf));
+    assert!(back.pending_conversion);
+    finish_pending_conversion(&mut back);
+    assert!(matches!(back.surface, Surface::Doc(_)));
+    assert_eq!(back.status.as_ref(), "loaded (converted from PDF)");
+    assert_eq!(texts(&back), ["Page text."]);
 }
 
 #[test]

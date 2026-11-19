@@ -93,6 +93,7 @@ mod page_fields;
 mod page_flow;
 mod page_number;
 mod page_setup;
+mod pdf_view;
 mod pictures;
 mod plugin_ui;
 mod print_sheet;
@@ -347,6 +348,10 @@ enum Kind {
     /// An editor's manual (#1855). Never written to the session: a Help tab
     /// is gone after a restart.
     Help,
+    /// A PDF shown as it looks (#2245), read-only. Written to the session as
+    /// a document with `pdf_view` set, so an older build reads the session
+    /// (and converts the PDF).
+    Pdf,
 }
 
 /// Whether the Open-page backstage offers Recover Unsaved Workbooks (#1077).
@@ -365,6 +370,7 @@ impl Kind {
             Kind::Xlsx => "\u{1F4CA}",
             Kind::Look => "\u{2709}",
             Kind::Help => "\u{2753}",
+            Kind::Pdf => "\u{1F4D1}",
         }
     }
 }
@@ -449,6 +455,10 @@ struct PersistTab {
     binary_source: bool,
     #[serde(default)]
     compat: bool,
+    /// A PDF view (#2245): where it was. Its `kind` is `docx`, so an older
+    /// build reads the session (and converts the PDF, as it opened PDFs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pdf_view: Option<pdf_view::host::PdfAt>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -933,6 +943,8 @@ enum Surface {
     Ext(ext_ribbon::ExtTab),
     /// An editor's manual (#1855). Saves as nothing.
     Help(Box<help_view::HelpView>),
+    /// A PDF's pages (#2245). Saves as nothing: the file is never written.
+    Pdf(Box<pdf_view::PdfView>),
 }
 
 /// The typing a revert set aside, with the editor state that went with it.
@@ -6183,6 +6195,8 @@ struct Docxy {
     last_window_title: Option<String>,
     /// The accent this window's last render set (#1473), for the harness.
     drawn_accent: u32,
+    /// A poll for a PDF view's worker answers runs (#2245).
+    pdf_polling: std::rc::Rc<std::cell::Cell<bool>>,
     /// What the last render drew of each swatch gallery in place (#1823), for
     /// the harness's `ribbon-read`.
     drawn_galleries: std::cell::RefCell<DrawnGalleries>,
@@ -13024,6 +13038,9 @@ fn tab_from_path(path: &PathBuf) -> DocTab {
     }
     if is_sheet_path(path) {
         sheet_tab_from_path(path, false, false)
+    } else if let Some(tab) = pdf_view::host::pdf_view_tab(path, None) {
+        // A PDF opens as it looks (#2245).
+        tab
     } else {
         let title: SharedString = file_name(path).into();
         let mut tab = doc_from_path(path).into_tab(Kind::Docx, title, Some(path.clone()), false);
@@ -13123,6 +13140,13 @@ fn doc_tab_from_path_mode(
     mode: OpenMode,
     trusted: &trusted::TrustStore,
 ) -> DocTab {
+    // A PDF opens as it looks (#2245), read-only, so Protected View has
+    // nothing to hold back; Recover Text still reads its text.
+    if mode != OpenMode::RecoverText
+        && let Some(tab) = pdf_view::host::pdf_view_tab(path, None)
+    {
+        return tab;
+    }
     let protected = open_mode::is_protected_zone(open_mode::zone_id(path))
         && !trusted.is_trusted(path, trusted::Stamp::of(path));
     // Taken before the load, as for a workbook.
@@ -16629,7 +16653,7 @@ fn reopens_from_file(t: &DocTab) -> bool {
         Kind::Project => path
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("yppx")),
-        Kind::Look | Kind::Help => false,
+        Kind::Look | Kind::Help | Kind::Pdf => false,
     }
 }
 
@@ -17567,6 +17591,15 @@ fn restore_tab_sourced(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
 }
 
 fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab, bool) {
+    // A PDF view (#2245), where it was. A file that is no PDF now opens as
+    // a document would.
+    if let (Some(at), Some(path)) = (t.pdf_view, t.path.as_ref()) {
+        let path = PathBuf::from(path);
+        if let Some(mut tab) = pdf_view::host::pdf_view_tab(&path, Some(at)) {
+            tab.title = t.title.clone().into();
+            return (tab, false);
+        }
+    }
     if t.kind == Kind::Project {
         // Every fallback in `restore_project_tab` (sidecar missing or
         // unreadable) comes back clean, so dirty means the sidecar loaded.
@@ -17726,6 +17759,12 @@ fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 tab
             }
             None => {
+                // A PDF with no view recorded (a row of a build before #2245
+                // has `converted`) opens as one now.
+                if let Some(mut tab) = pdf_view::host::pdf_view_tab(path.as_ref().unwrap(), None) {
+                    tab.title = t.title.clone().into();
+                    return (tab, false);
+                }
                 let l = load_doc_for_tab(path.as_ref().unwrap(), None);
                 l.into_tab(t.kind, t.title.clone().into(), path, t.dirty)
             }
@@ -17956,7 +17995,7 @@ fn hot_bytes(t: &DocTab) -> Option<(&'static str, Vec<u8>)> {
                 .ok()
                 .map(|bytes| ("yppx", bytes))
         }
-        Surface::Placeholder | Surface::Ext(_) | Surface::Help(_) => None,
+        Surface::Placeholder | Surface::Ext(_) | Surface::Help(_) | Surface::Pdf(_) => None,
     }
 }
 
@@ -17973,8 +18012,15 @@ fn forgotten(p: PersistTab) -> PersistTab {
 /// What the session keeps of tab `t` besides its live content: everything
 /// [`persist_tab`] writes but the sidecar.
 fn persist_tab_meta(t: &DocTab) -> PersistTab {
+    // A PDF view (#2245) is a document row an older build can read.
+    let pdf_view = pdf_view::host::pdf_at(t);
     PersistTab {
-        kind: t.kind,
+        kind: if t.kind == Kind::Pdf {
+            Kind::Docx
+        } else {
+            t.kind
+        },
+        pdf_view,
         title: t.title.to_string(),
         path: t.path.as_ref().map(|p| p.display().to_string()),
         dirty: t.dirty,
@@ -18532,6 +18578,7 @@ impl Docxy {
             frame: 0,
             last_window_title: None,
             drawn_accent: BRAND,
+            pdf_polling: Default::default(),
             drawn_galleries: Default::default(),
         }
     }
@@ -19532,8 +19579,9 @@ impl Docxy {
             ),
             Kind::Xlsx => new_tab("Untitled.xlsx", new_sheet_surface()),
             Kind::Look => new_tab("Inbox", Surface::Placeholder),
-            // Not a File > New card: a Help tab opens from Help or F1.
-            Kind::Help => return,
+            // Not a File > New card: a Help tab opens from Help or F1, a PDF
+            // view from a PDF (#2245).
+            Kind::Help | Kind::Pdf => return,
         });
         // A build with a Mail extension draws the new tab at once.
         self.attach_ext_surfaces(cx);
@@ -27845,6 +27893,12 @@ impl Docxy {
             self.refocus(window, cx);
             return Some(after);
         }
+        // Nor on a PDF view (#2245): it never writes the PDF.
+        if self.active_is_pdf() {
+            self.set_status(pdf_view::host::PDF_NO_SAVE);
+            self.refocus(window, cx);
+            return Some(after);
+        }
         if self.active_is_project() {
             return self.save_project_then(false, after, window, cx);
         }
@@ -28166,6 +28220,11 @@ impl Docxy {
             self.set_status(help_view::host::HELP_NO_SAVE);
             return self.refocus(window, cx);
         }
+        // Nor Save As on a PDF view (#2245, a later slice).
+        if self.active_is_pdf() {
+            self.set_status(pdf_view::host::PDF_NO_SAVE_AS);
+            return self.refocus(window, cx);
+        }
         if self.active_is_project() {
             return self.save_project(true, window, cx);
         }
@@ -28346,9 +28405,12 @@ impl Docxy {
         let open = (mode != OpenMode::Copy)
             .then(|| {
                 let key = canonical(&path);
+                let same = |t: &DocTab| t.path.as_deref().map(canonical) == Some(key.clone());
+                // A PDF's view before a document converted from it (#2245).
                 self.tabs
                     .iter()
-                    .position(|t| t.path.as_deref().map(canonical) == Some(key.clone()))
+                    .position(|t| same(t) && matches!(t.surface, Surface::Pdf(_)))
+                    .or_else(|| self.tabs.iter().position(same))
             })
             .flatten();
         let trusted = trusted::TrustStore::load(&config_root());
@@ -31166,6 +31228,10 @@ impl Docxy {
         if self.active_is_help() {
             return self.help_search_release(cx);
         }
+        // A PDF view (#2245): Tab moves between its Find box and page box.
+        if self.active_is_pdf() {
+            return self.pdf_tab(false, cx);
+        }
         // An extension's tab (#1873): Tab is the extension's to use; the suite
         // edits nothing under it.
         if self.active_is_ext() {
@@ -31306,6 +31372,9 @@ impl Docxy {
         // open behind it and must not move.
         if self.active_is_help() {
             return self.help_search_release(cx);
+        }
+        if self.active_is_pdf() {
+            return self.pdf_tab(true, cx);
         }
         // An extension's tab (#1873): Tab is the extension's to use; the suite
         // edits nothing under it.
@@ -31460,6 +31529,11 @@ impl Docxy {
         if self.active_is_help() {
             self.keytips = KeyTip::Off;
             return self.help_key(ev, window, cx);
+        }
+        // Nor has a PDF view (#2245): its own keys, read-only.
+        if self.active_is_pdf() {
+            self.keytips = KeyTip::Off;
+            return self.pdf_key(ev, window, cx);
         }
         if self.project_edit_open() {
             return self.project_key(ev, window, cx);
@@ -37226,6 +37300,7 @@ fn valid_ribbon_tab(
     in_hf: bool,
 ) -> RibbonTab {
     if kind == Kind::Help
+        || kind == Kind::Pdf
         || ribbon_tab_set(kind).iter().any(|(t, _, _)| *t == Some(tab))
         || (kind == Kind::Docx
             && matches!(tab, RibbonTab::TableDesign | RibbonTab::TableLayout)
@@ -41233,7 +41308,8 @@ impl Docxy {
         // Backstage's Settings (the Theme row) there.
         // An extension's tab with a ribbon lists its own tabs (#1870).
         let mut names = self.ribbon_tab_names();
-        if self.active_is_help() {
+        // A PDF view (#2245) has File only, as a Help tab.
+        if self.active_is_help() || self.active_is_pdf() {
             names.truncate(1);
         }
         let mut strip = h_flex()
@@ -46560,6 +46636,8 @@ impl Render for Docxy {
         // An extension's ribbon read before `ext::ribbon_changed` (#1870).
         self.refresh_ext_ribbons(false, cx);
         self.focus_ext_surface(window, cx);
+        // A PDF view's answers, layout and next question (#2245).
+        self.pdf_tick(window, cx);
         // The ribbon, backstage and title bar draw the selected tab's accent
         // (#1473); set it before any of them is built.
         self.drawn_accent = self.accent_now();
@@ -48098,6 +48176,7 @@ impl Render for Docxy {
                     .child(e.view())
                     .into_any_element(),
                 Surface::Help(v) => self.help_body(tab, v, pal, bg, cx),
+                Surface::Pdf(v) => self.pdf_body(v, pal, bg, cx),
             },
             None => v_flex()
                 .flex_1()
@@ -48128,7 +48207,8 @@ impl Render for Docxy {
             }
         }
 
-        let help_active = self.active_is_help();
+        // A PDF view (#2245) zooms with its own toolbar.
+        let help_active = self.active_is_help() || self.active_is_pdf();
         let zoom_btn =
             |cx: &mut Context<Self>, id: &'static str, glyph: &'static str, delta: f32| {
                 div()
@@ -48245,6 +48325,8 @@ impl Render for Docxy {
                 "Enter/F2 edit · Tab next cell · Insert blank row · Delete clear cell (ID: task) · Alt+Shift+←/→ outline · Ctrl+F find · Ctrl+Z/Y · Ctrl+S"
             } else if self.active_is_help() {
                 help_view::host::status_hint(text_input::MACOS)
+            } else if self.active_is_pdf() {
+                pdf_view::host::status_hint(text_input::MACOS)
             } else {
                 doc_status_hint(text_input::MACOS)
             })
@@ -52956,7 +53038,7 @@ fn placeholder(kind: Kind, bg: Hsla, dim: Hsla) -> impl IntoElement {
             "lookxy",
             "mail list + reading pane (mailcore) lands here next",
         ),
-        Kind::Docx | Kind::Help => ("docxy", ""),
+        Kind::Docx | Kind::Help | Kind::Pdf => ("docxy", ""),
         Kind::Project => (
             "Project",
             "The schedule could not be loaded; see the status below.",
@@ -53264,6 +53346,10 @@ pub fn run(extensions: ext::Extensions) {
     let mut extensions = Some(extensions);
     // A converting child (#633): the importer and nothing else, no window.
     if let Some(code) = convert_child::child_main(&std::env::args_os().collect::<Vec<_>>()) {
+        std::process::exit(code);
+    }
+    // A PDF view's worker (#2245): parses, draws and reads a PDF, no window.
+    if let Some(code) = pdf_view::worker::child_main(&std::env::args_os().collect::<Vec<_>>()) {
         std::process::exit(code);
     }
     // `--version`: the build block, before the crash hook, the control server or

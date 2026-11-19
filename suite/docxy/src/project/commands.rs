@@ -2033,7 +2033,8 @@ pub(crate) fn tab_app_state(tab: &DocTab, app_dialog: bool) -> Option<AppState> 
     let state = match &tab.surface {
         Surface::Project(v) => project_app_state(v),
         Surface::Sheet(v) => crate::sheet_app_state(v),
-        Surface::Doc(_) => AppState::Ready,
+        // A PDF view (#2245) is read-only and always ready, as a document.
+        Surface::Doc(_) | Surface::Pdf(_) => AppState::Ready,
         Surface::Placeholder | Surface::Ext(_) | Surface::Help(_) => return None,
     };
     Some(match state {
