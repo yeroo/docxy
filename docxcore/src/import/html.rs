@@ -766,6 +766,9 @@ fn mark_rpr(run: &RunProps) -> Option<String> {
         color: run.color.clone(),
         size_half_pts: run.size_half_pts,
         font: run.font.clone(),
+        // A hidden block's mark is hidden with it, so the paragraph
+        // collapses as Word draws it (#2249).
+        vanish: run.vanish,
         ..RunProps::default()
     };
     (mark != RunProps::default()).then(|| crate::serialize::rpr_xml(&mark))
@@ -1036,7 +1039,11 @@ impl Cascade {
         match tag {
             "b" | "strong" => self.set_bold(true),
             "i" | "em" | "cite" | "dfn" | "var" => run.italic = true,
-            "u" | "ins" => run.underline = true,
+            "u" | "ins" => {
+                run.underline = true;
+                // An enclosing `text-decoration:none`'s explicit off (#2249).
+                run.raw_props.retain(|r| !r.starts_with("<w:u "));
+            }
             "s" | "strike" | "del" => run.strike = true,
             "sup" => run.vert_align = VertAlign::Superscript,
             "sub" => run.vert_align = VertAlign::Subscript,
@@ -1269,9 +1276,14 @@ impl Cascade {
                 if v.contains("none") {
                     run.underline = false;
                     run.strike = false;
+                    // Explicitly off, so a link drawn here keeps no
+                    // underline of its own (#2249), as in Word.
+                    run.raw_props.retain(|r| !r.starts_with("<w:u "));
+                    run.raw_props.push("<w:u w:val=\"none\"/>".into());
                 }
                 if v.contains("underline") {
                     run.underline = true;
+                    run.raw_props.retain(|r| !r.starts_with("<w:u "));
                 }
                 if v.contains("line-through") {
                     run.strike = true;
@@ -3906,8 +3918,10 @@ mod tests {
                 match b {
                     DocBlock::Paragraph(p) => {
                         for i in &p.content {
-                            if let Inline::Run(r) = i {
-                                out.push(r.clone());
+                            match i {
+                                Inline::Run(r) => out.push(r.clone()),
+                                Inline::Hyperlink(h) => out.extend(h.runs.iter().cloned()),
+                                _ => {}
                             }
                         }
                     }
@@ -4635,6 +4649,34 @@ mod tests {
         assert!(run_of(&d, "Preheader").props.vanish);
         assert!(run_of(&d, "outlook only").props.vanish);
         assert!(!run_of(&d, "shown").props.vanish);
+        // The hidden block's mark too, so it collapses (#2249).
+        let marks: Vec<bool> = all_paras(&d)
+            .iter()
+            .map(|p| p.props.mark_run_props().is_some_and(|m| m.vanish))
+            .collect();
+        assert_eq!(marks, [true, false]);
+    }
+
+    /// `text-decoration:none` is kept as an explicit `w:u none`, which a
+    /// link's own underline gives way to; `underline` drops it again (#2249).
+    #[test]
+    fn text_decoration_none_is_an_explicit_no_underline_2249() {
+        let d = doc(
+            "<p><a href='https://example.com/' style='text-decoration:none'><b>Ana Lee</b></a> \
+             <a href='https://example.com/'>plain link</a> \
+             <span style='text-decoration:none'><u>back on</u></span></p>",
+        );
+        let off = |r: crate::model::Run| {
+            r.props
+                .raw_props
+                .iter()
+                .any(|p| p == "<w:u w:val=\"none\"/>")
+        };
+        assert!(off(run_of(&d, "Ana Lee")));
+        assert!(!run_of(&d, "Ana Lee").props.underline);
+        assert!(!off(run_of(&d, "plain link")));
+        assert!(run_of(&d, "back on").props.underline);
+        assert!(!off(run_of(&d, "back on")));
     }
 
     #[test]
@@ -6822,6 +6864,30 @@ mod card_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A card's one-cell row over a `colspan=2` footer (#2249): the second
+    /// column holds nothing of its own, so the text column takes the width
+    /// and the bare one next to none, as a browser and Word lay it out.
+    #[test]
+    fn a_column_only_a_span_reaches_takes_next_to_no_width_2249() {
+        let d = doc(
+            "<table width=600><tr><td>The post's text, which a browser lays out \
+                     across the card.</td></tr><tr><td colspan=2>Show more</td></tr></table>",
+        );
+        let t = first_table(&d.body);
+        assert_eq!(t.grid.len(), 2);
+        assert_eq!(t.grid[1], crate::import::html_table::MIN_COL);
+        assert_eq!(t.grid[0] + t.grid[1], 9000);
+        // Bare columns alone still share the room, as before.
+        let d = doc("<table width=600><tr><td colspan=2>Only a span</td></tr></table>");
+        assert_eq!(first_table(&d.body).grid, [4500, 4500]);
+        // A span of bare columns beside a cell is that cell's room: not
+        // pinned, the three columns share the width as before.
+        let d = doc(
+            "<table width=600><tr><td>Name</td><td colspan=2>A value that needs                      room</td></tr></table>",
+        );
+        assert_eq!(first_table(&d.body).grid, [3000, 3000, 3000]);
     }
 
     fn cell(t: &Table, row: usize, col: usize) -> &[DocBlock] {

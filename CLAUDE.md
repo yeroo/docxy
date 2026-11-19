@@ -61,7 +61,8 @@ issue number to find its notes.
   nested cards (#1927), page margins (#1928), Outlook mail: CSS-only spacing,
   quirks-mode edges, list indents, item continuations, marker look (#1979),
   list and parent margins, trailing `<br>`, wide hangs, wrapper tables (#2114),
-  a picture in a link keeping it as its click link (#1999).
+  a picture in a link keeping it as its click link (#1999), hidden blocks,
+  `text-decoration:none` links and span-only columns as Word draws them (#2249).
 - `docs/claude/email-html.md`: before changing `docxcore::export_email` (a `Document` as an
   e-mail body): inline styles only, lists and their `start`, safe links, `cid:` pictures and
   their media, the import round trip (#1948).
@@ -89,7 +90,8 @@ issue number to find its notes.
   box (#1887), its Print Layout (#1888), an extension's ribbon
   drawn by the suite and the suite's theme (#1870), File backstage pages and CloseTab
   (#1923), File opened on an extension's own page (#2204), Bullets/Numbering
-  on the document's lists (#2087).
+  on the document's lists (#2087), hidden text, run shading and
+  plain-text links in an imported mail (#2249).
 - `docs/claude/ribbon.md`: before changing the ribbon: contributed group launchers
   (#1669), ribbon fit per ribbon (#1020, #1608, #1685, #1763), swatch galleries, their
   sections, More button and KeyTips (#1761, #1762, #1823). A new ribbon command also needs

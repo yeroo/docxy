@@ -932,3 +932,33 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   from a page's own button, both ways), and a document tab. No case types
   a key under File after the action: none has an effect a case can read
   on these pages (an extension's page skips File's scroll keys).
+
+## Imported mail as Word draws it (#2249)
+
+- While formatting marks are off, `paragraph_el` draws no hidden run, tab
+  or break (`vanish`; `skip_hidden_run`: no width or wrap, its offsets
+  counted), except a hidden run the caret is in or at either edge of,
+  which draws, in any paragraph, so typing in hidden props is seen.
+- A paragraph whose flattened pieces (`flat_inlines`, so a link's runs
+  too) are all hidden or take no offset, and whose mark is hidden,
+  collapses (no height, spacing or margin) while marks are off and the
+  caret is not in it, as Word draws an imported preheader. The caret in it
+  shows it, and the hidden run holding the caret draws, so typing there
+  (in the hidden run's props) is seen; a document
+  tab that opens with its caret there shows the preheader until the caret
+  moves.
+- `hidden_piece` says what is hidden. Hidden pieces count 0 in `run_w`
+  and `inline_w`, and a hidden tab or break ends no centre or right tab's
+  segment (`seg_width`).
+- Run shading (`w:shd` fill, `run_shading`) paints the highlight band
+  (`run_highlight(props, is_link, pal)`; a highlight wins). On a light
+  page a run with its own colour keeps it, a link without one keeps the
+  link colour (`run_ink`, so the inks record and the dump agree), and an
+  automatic one takes a dark or light ink by the fill's luminance; on a
+  dark page the highlight rule applies. The layout dump lists it under
+  `highlights`.
+- A link run with an explicit `<w:u w:val="none"/>` (`underline_off`)
+  draws without the link underline.
+- Tests: `link_colour_tests::run_shading_paints_a_band_2249`,
+  `an_explicit_no_underline_is_read_2249`, and
+  `uiharness/cases/ext-doc-mail-fidelity.uit`.

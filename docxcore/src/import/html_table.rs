@@ -430,7 +430,9 @@ fn place(rows: Vec<Vec<RawCell>>, nrows: usize, groups: &[usize]) -> (Vec<Placed
 /// percentage of the table's width, percentages scaled down to 100 in all);
 /// a spanned cell's width spreads what its columns lack over its columns
 /// without one; the rest share what is left of the table's width, each at
-/// least [`MIN_COL`]. A table's width is its own, else the columns' when
+/// least [`MIN_COL`], except that a width-less column no colspan-1 cell sits
+/// in takes [`MIN_COL`] while another width-less column has a cell of its own
+/// (#2249). A table's width is its own, else the columns' when
 /// every one has a width, else `avail`; declared columns narrower than a
 /// declared table grow to it, and columns wider than the table widen it.
 fn column_widths(spec: &TableSpec, placed: &[Placed], ncols: usize, avail: u32) -> Vec<u32> {
@@ -480,6 +482,39 @@ fn column_widths(spec: &TableSpec, placed: &[Placed], ncols: usize, avail: u32) 
         for (k, &c) in targets.iter().enumerate() {
             let add = share + u32::from((k as u32) < extra);
             col[c] = Some(col[c].unwrap_or(0) + add);
+        }
+    }
+    // A column no colspan-1 cell sits in (only a span or an empty slot
+    // reaches it, such as a card's `colspan=2` footer under a one-cell row)
+    // holds nothing of its own: a browser and Word give it next to no width,
+    // so the columns with content share the rest (#2249). When every column
+    // left is bare, they share it as before.
+    // A span made only of bare columns (`<td colspan=2>` beside a cell,
+    // never split by another row) is that cell's own room: its columns are
+    // not pinned.
+    let has_own: Vec<bool> = (0..ncols)
+        .map(|c| single.iter().any(|p| p.col == c))
+        .collect();
+    if (0..ncols).any(|c| col[c].is_none() && has_own[c]) {
+        let spans: Vec<std::ops::Range<usize>> = placed
+            .iter()
+            .filter(|p| p.span > 1)
+            .map(|p| p.col..(p.col + p.span).min(ncols))
+            .collect();
+        let pin: Vec<bool> = (0..ncols)
+            .map(|c| {
+                col[c].is_none()
+                    && !has_own[c]
+                    && spans
+                        .iter()
+                        .filter(|r| r.contains(&c))
+                        .all(|r| r.clone().any(|k| has_own[k] || col[k].is_some()))
+            })
+            .collect();
+        for (c, pinned) in pin.into_iter().enumerate() {
+            if pinned {
+                col[c] = Some(MIN_COL);
+            }
         }
     }
     let known: u32 = col.iter().flatten().sum();

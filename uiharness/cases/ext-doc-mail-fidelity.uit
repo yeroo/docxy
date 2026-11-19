@@ -1,0 +1,54 @@
+# Imported mail drawn as Word draws it (#2249): hidden text (a preheader's
+# `display:none`) takes no line and draws nothing, while formatting marks are
+# off. An inline `background` paints its band, as a highlight does. The last opens
+# `fixtures/mail-fidelity.html` (synthetic) in a document tab.
+ext fixture
+
+test issue 2249 a hidden preheader draws nothing
+  call theme-set {"theme":"light"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-load {"html": "<body><div style='display:none;max-height:0;overflow:hidden'>Preview text <a href='https://example.com/'>View online</a><br>more</div><p style='margin:0'>Hello</p></body>"}
+  shot window
+  call ext-doc-layout {}
+  assert reply.painted is true
+  assert reply.paragraphs.1.lines.0.text is Hello
+  assert reply.paragraphs.0.height is 0
+  assert reply.paragraphs.1.top is 0
+
+test issue 2249 an inline background paints its band as a highlight does
+  call theme-set {"theme":"light"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-load {"html": "<body><p style='margin:0'><span style='background:cyan'>Next step:</span> plain</p></body>"}
+  shot window
+  call ext-doc-layout {}
+  assert reply.paragraphs.0.highlights.0.text is Next step:
+  assert reply.paragraphs.0.highlights.0.fill is 00ffff
+
+test issue 2249 a mail opened as a web page hides its preheader and paints its background in a document tab
+  call theme-set {"theme":"light"}
+  open copy:../fixtures/mail-fidelity.html
+  # The caret opens in the hidden paragraph (a link and a `<br>` in it),
+  # which shows it so typing there is seen; in the next one, it collapses.
+  call doc {}
+  assert reply.flow.layout.paragraphs.0.height is 17
+  # Typed there, it joins the hidden run but draws: the run holding the
+  # caret is shown whole.
+  type Typed
+  shot window
+  call doc {}
+  assert reply.flow.layout.paragraphs.0.lines.0.text is TypedPreview text nobody sees
+  key ctrl+z
+  call selection-set {"start":60,"end":60}
+  shot window
+  call doc {}
+  assert reply.caret.offset is 60
+  assert reply.view.layout is web
+  assert reply.flow.layout.painted is true
+  assert reply.flow.layout.paragraphs.0.height is 0
+  assert reply.flow.layout.paragraphs.1.top is 0
+  assert reply.flow.layout.paragraphs.1.highlights.0.text is Next step:
+  assert reply.flow.layout.paragraphs.1.highlights.0.fill is 00ffff
