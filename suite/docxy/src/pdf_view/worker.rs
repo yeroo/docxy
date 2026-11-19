@@ -638,7 +638,7 @@ impl Worker {
                             |_| {},
                         )
                     })?;
-                Ok(Conn::new(Box::new(req_w), Box::new(rep_r)))
+                Conn::new(Box::new(req_w), Box::new(rep_r))
             }
             Spawn::Child => {
                 let mut cmd = Command::new(std::env::current_exe()?);
@@ -665,8 +665,16 @@ impl Worker {
             let _ = limited.child.kill();
             return Err(std::io::Error::other("no pipes to the child"));
         };
+        let conn = match Conn::new(Box::new(input), Box::new(output)) {
+            Ok(conn) => conn,
+            Err(e) => {
+                let _ = limited.child.kill();
+                let _ = limited.child.wait();
+                return Err(e);
+            }
+        };
         *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(limited);
-        Ok(Conn::new(Box::new(input), Box::new(output)))
+        Ok(conn)
     }
 }
 
@@ -684,13 +692,14 @@ fn kill(slot: &Slot) {
 }
 
 impl Conn {
-    fn new(input: Box<dyn Write + Send>, output: Box<dyn Read + Send>) -> Conn {
+    /// A connection over the child's pipes, its answers read on a thread of
+    /// their own. `Err` when that thread cannot start.
+    fn new(input: Box<dyn Write + Send>, output: Box<dyn Read + Send>) -> std::io::Result<Conn> {
         let (tx, replies) = mpsc::channel();
         std::thread::Builder::new()
             .name("pdf-replies".into())
-            .spawn(move || read_replies(BufReader::new(output), tx))
-            .expect("a thread for the PDF reader's answers");
-        Conn { input, replies }
+            .spawn(move || read_replies(BufReader::new(output), tx))?;
+        Ok(Conn { input, replies })
     }
 }
 

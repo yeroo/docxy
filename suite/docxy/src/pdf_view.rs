@@ -843,9 +843,18 @@ impl PdfView {
         Some(text)
     }
 
-    /// The pages a selection covers whose text is not in yet.
-    fn selection_waits(&self) -> bool {
-        self.sel.is_some() && self.selection_text().is_none()
+    /// Whether a selected page's text is not in yet (a page whose text
+    /// failed counts as read, as in [`Self::selection_text`]). Asked every
+    /// frame, so it builds no text.
+    pub(crate) fn selection_waits(&self) -> bool {
+        let Some(sel) = self.sel else {
+            return false;
+        };
+        let (a, b) = sel.ordered();
+        let n = self.page_count();
+        (a.page..=b.page.min(n.saturating_sub(1)))
+            .take_while(|p| *p < n)
+            .any(|p| self.texts[p].is_none() && !self.text_failed.contains_key(&p))
     }
 
     /// Text is still needed for a selection: ask for it.

@@ -406,6 +406,29 @@ fn a_waiting_copy_copies_its_own_selection_or_nothing() {
     assert_eq!(v.copy().as_deref(), Some("world"));
 }
 
+/// FIX r3: whether a selection waits for text is told without building it,
+/// and agrees with `selection_text`: a failed page counts as read in both.
+#[test]
+fn a_selection_waits_exactly_when_its_text_is_not_all_in() {
+    let mut v = two_pages();
+    assert!(!v.selection_waits(), "no selection");
+    v.select_all();
+    assert!(!v.selection_waits());
+    assert!(v.selection_text().is_some());
+    v.texts[1] = None;
+    assert!(v.selection_waits());
+    assert!(v.selection_text().is_none());
+    v.text_failed.insert(1, "bad".into());
+    assert!(!v.selection_waits());
+    assert!(v.selection_text().is_some());
+    // A selection on page 1 alone does not wait on page 2.
+    v.text_failed.clear();
+    let (x, y) = at(&v, 0, 73., 105.);
+    v.press(x, y, 2, false);
+    assert!(!v.selection_waits());
+    assert_eq!(v.selection_text().as_deref(), Some("hello"));
+}
+
 // ---- Find -------------------------------------------------------------------------
 
 #[test]
