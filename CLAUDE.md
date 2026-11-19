@@ -137,7 +137,9 @@ issue number to find its notes.
   row/column insert and delete (#1335), table slicers on save and Undo of a table step
   (#1694, #1741), x14 rules in the Data Validation dialog (#1817, #1734), pivot slicer and
   timeline caches on save (#1797), `.xls` hyperlinks and file URIs (#1726), a quote-led
-  custom validation formula shifts, inline list by kind (#2115).
+  custom validation formula shifts, inline list by kind (#2115), an absent
+  cell's inherited row/column style in typing, copy, fill, cut and
+  spill-member undo, `set_cell` never storing it (#1660).
 - `docs/claude/terminal-editors.md`: before changing terminal `docxy`, `xlsxy` or
   `yppxy`, or `backstagecore`'s Save As name field: docxy's Layout tab (#1274), prompts
   editing at a caret (#1372, #1373, #1374, #1375, #1379), Ctrl+C/X/V (#1377, #1378),

@@ -138,3 +138,40 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   the model is no change and no new relationship. An `.xls` File moniker's path
   is native and read as it is; URL and string monikers go through
   `model_target`.
+
+## An absent cell's inherited row or column style (#1660)
+
+- In Excel, an absent cell under a row style (`<row s=.. customFormat="1">`)
+  or a column style (`<col style=..>`) shows that style, so an explicit blank
+  s0 cell there pins General (#1064, #1097). `Sheet::inherited_style(r, c)` is
+  the row's style, else the column's, else 0: `row_style`, then `col_style`.
+  "Row over column" is an assumption, taken from how Excel materialises a new
+  cell in a formatted row. `pins_default` is `inherited_style != 0`; an `s`
+  or `style` of 0 or unreadable gives 0.
+- `Sheet::copied_cell` reads an absent cell as a blank of its inherited
+  style. Each of these uses it, so writing a copy of an absent source means
+  "as if absent", not an s0 pin:
+  - `fill_changes`, and `autofill`'s Copy outputs (`WithoutFormatting` takes
+    the destination's inherited style);
+  - `ClipBlock::capture`, which looks each style up once per row and column;
+  - Paste Special's absent destination;
+  - the suite's `cut_still_live` and `paste_move`;
+  - xlsxy's `copy` and gridwasm's `record_clip`, which store `Some(blank)`
+    only when the inherited style is not 0 (the TSV still comes from the
+    real cell).
+- `Sheet::set_cell` never stores a blank of exactly the slot's non-zero
+  inherited style, whether or not the slot holds a cell. Such a blank is the
+  absence written out. Blank s0 keeps the #1097 rule: it is dropped over an
+  absent slot and kept over a present pinned one, so Del keeps a file pin.
+  The loader inserts cells directly, so a file's blank `s=` cells round-trip
+  as they were.
+- Typed entry into an absent cell (`entry_cell_ctx`, `typed_formula`, and so
+  Ctrl+Enter) is read under its inherited style: `15` in a `0%` column is
+  15%, and a Text column keeps `=1+1` as text. xlsxy's data form does the
+  same for a record's own absent field; a new record still reads the field
+  above. A cut in the suite and in xlsxy clears its source to the inherited
+  style, so the source becomes absent. gridwasm's cut clears contents only,
+  as Del does.
+- `snapshot_cells` records a live spill member of style 0 as `None`, so the
+  undo of a value typed over it leaves the slot absent even under manual
+  calculation.
