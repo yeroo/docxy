@@ -220,3 +220,40 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
     on restore.
   - Either way, the undo of a value typed over a member leaves no pin, under
     manual calculation too.
+
+## A cut paste's formulas: local names, bare table refs, rules left in place (#1687)
+
+- A moved cell's own formula goes through `gridcore::edit::moved_cell_formula`
+  in both hosts (xlsxy `paste_from`, the suite's `paste_move`), read on the
+  workbook as it was before the cut. On top of `move_block_expr`:
+  - Moved to another sheet, a bare name with a definition in the source
+    sheet's own scope is qualified with it (`Rate` → `Sheet2!Rate`), and so is
+    a called local lambda (`MyFn(3)` → `Sheet2!MyFn(3)`, an `Expr::Call` on
+    the scoped name). A workbook name, a builtin and a LET/LAMBDA binding stay
+    bare (`formula::qualify_local_names`).
+  - Moved out of the table it sat in (to another sheet, outside it, or into
+    another table), its bare `[@Col]` / `[Col]` name that table
+    (`Table1[@Col]`). A shared formula held verbatim gets neither.
+- `Workbook::defined_name` resolves `Sheet2!Rate` to Sheet2's own definition
+  from any sheet, and to nothing when Sheet2 has none (still unsupported and
+  frozen, #1632). Every engine and evaluator name lookup goes through it;
+  `INDIRECT("Sheet2!Rate")` stays `#REF!`. A definition's body still reads
+  against the formula's sheet.
+- Not handled: a bare name whose source sheet has no local definition but the
+  destination has one switches to the destination's (Excel would write the
+  workbook form, `Book1.xlsx!Rate`, which the parser does not take); a `.xls`
+  save freezes a `Sheet2!Rate` cell to its value with a report.
+- `move_refs_rules_stay` (both hosts) leaves a conditional-format rule whose
+  ranges meet the cut in place with its relative and mixed references, but
+  re-points its fully absolute ones (`$F$1`, `$F$1#`, an all-`$` range with
+  both corners moved), which name the cells themselves. `FormulaSite::rule`
+  carries the rule's ranges to the per-formula rewrite.
+- xlsxy asks `cut_moves_refs` (the rewrite's dry run) before writing: only a
+  cut that re-points something outside its own cells takes the
+  whole-workbook snapshot and becomes a `Structural` step; the rest stay a
+  `Cells` step. The dry run and the rewrite are one walk
+  (`walk_workbook_formulas` with `write` off), so they cannot disagree; it
+  takes the workbook mutably for that and writes nothing.
+- A restyle (`apply_styles_on`, xlsxy's only style-only writer) of a cell a
+  pending cut was taken from ends the cut, as an edit does (`end_cut_on`): the
+  paste is then a copy of the cut-time cells, and the source keeps its format.
