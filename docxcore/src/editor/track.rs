@@ -15,9 +15,11 @@
 //!   Word does.
 //! * An inline picture (#1242) or a field (#1625) inserted while tracking
 //!   goes in a `w:ins` of its own, zero-width until accepted; a field whose
-//!   result a `w:ins` cannot hold (a link) goes in live and unrecorded. Text
-//!   typed right after one goes after it, and the author's own Backspace or
-//!   Delete next to it removes it outright.
+//!   result a `w:ins` cannot hold (a link) goes in live and unrecorded. The
+//!   caret is after one at its offset: text typed there goes after it, the
+//!   author's own Backspace removes it outright, and Delete acts on what
+//!   follows. A deletion covering the author's own (one at the selection's
+//!   end included, one at its start not) removes it; a cut carries it.
 //!
 //! * Deleting text inside a hyperlink records the deletion inside the link,
 //!   as Word does: a wrapper never straddles the link's boundary (#1462).
@@ -326,6 +328,7 @@ impl Editor {
             if drop_objects {
                 self.drop_or_record_objects(path, from, to, k > 0, first + k < last);
             }
+            self.remove_own_pending_objects_in(path, from, to, k > 0);
             self.delete_chars(path, from, to, keep);
         }
         true
@@ -361,13 +364,14 @@ impl Editor {
         self.settle_inserted(path, start, n);
     }
 
-    /// Backspace (`backward`) or Delete next to a pending object insertion
-    /// ([`is_pending_object`]) by the author recorded as, while tracking:
-    /// remove it outright, as deleting one's own insertion does (#1625). It
-    /// takes no offset, so it sits among the zero-width inlines at the caret;
-    /// Backspace takes the last of them, Delete the first. One undo step.
-    /// False, and nothing done, when there is none.
-    pub(super) fn remove_own_pending_object(&mut self, backward: bool) -> bool {
+    /// Backspace after a pending object insertion ([`is_pending_object`]) by
+    /// the author recorded as, while tracking: remove it outright, as
+    /// deleting one's own insertion does (#1625). It takes no offset, so it
+    /// sits among the zero-width inlines at the caret, which is after them
+    /// (typing there goes after them): Backspace takes the last of them, and
+    /// Delete, acting on what follows, none. One undo step. False, and
+    /// nothing done, when there is none.
+    pub(super) fn remove_own_pending_object(&mut self) -> bool {
         let Some(author) = self.track_author().map(str::to_owned) else {
             return false;
         };
@@ -383,12 +387,7 @@ impl Editor {
             &mut Vec::new(),
             &mut found,
         );
-        let target = if backward {
-            found.pop()
-        } else {
-            found.into_iter().next()
-        };
-        let Some(target) = target else {
+        let Some(target) = found.pop() else {
             return false;
         };
         self.checkpoint(super::EditKind::Delete);
@@ -396,6 +395,41 @@ impl Editor {
             remove_at(&mut p.content, &target);
         }
         true
+    }
+
+    /// A tracked delete of offsets `lo..hi` of the paragraph at `path` (from
+    /// the paragraph before it when `from_before`) removes outright the
+    /// pending object insertions by the author recorded as that it covers,
+    /// as Word removes one's own insertion a deletion covers (#1625). The
+    /// caret is after the pending objects at its offset, so one at `lo`
+    /// stays (unless the range came from the paragraph before) and one at
+    /// `hi` goes. Another author's stays, as their loaded insertions do.
+    /// Offsets do not move. Nothing when not tracking.
+    pub(super) fn remove_own_pending_objects_in(
+        &mut self,
+        path: &[usize],
+        lo: usize,
+        hi: usize,
+        from_before: bool,
+    ) {
+        let Some(author) = self.track_author().map(str::to_owned) else {
+            return;
+        };
+        let Some(para) = resolve_para(&self.doc.body, path) else {
+            return;
+        };
+        let lo = if from_before { None } else { Some(lo) };
+        let mut found = Vec::new();
+        pending_in(&para.content, lo, hi, &author, &mut Vec::new(), &mut found);
+        if found.is_empty() {
+            return;
+        }
+        if let Some(p) = para_mut(&mut self.doc.body, path) {
+            // Last first, so each path still points where it did.
+            for target in found.iter().rev() {
+                remove_at(&mut p.content, target);
+            }
+        }
     }
 
     /// `clip` as it should go in: its text recorded as one tracked insertion
@@ -814,6 +848,48 @@ fn pending_at(
     }
 }
 
+/// The index paths of the pending object insertions by `author` at offsets
+/// `p` with `lo < p <= hi` (`lo` `None`: from the start), in document order.
+fn pending_in(
+    content: &[Inline],
+    lo: Option<usize>,
+    hi: usize,
+    author: &str,
+    prefix: &mut Vec<usize>,
+    out: &mut Vec<Vec<usize>>,
+) {
+    let mut acc = 0;
+    for (i, inline) in content.iter().enumerate() {
+        if acc > hi {
+            break;
+        }
+        let len = inline_len(inline);
+        match inline {
+            Inline::Hyperlink(h) if lo.is_none_or(|lo| acc + len > lo) => {
+                let start = acc + super::link_runs_len(h);
+                if hi >= start {
+                    // A local `lo` before the content's start covers its start.
+                    let local_lo = lo.and_then(|lo| lo.checked_sub(start));
+                    prefix.push(i);
+                    pending_in(&h.content, local_lo, hi - start, author, prefix, out);
+                    prefix.pop();
+                }
+            }
+            Inline::Revision { metadata, .. }
+                if lo.is_none_or(|lo| acc > lo)
+                    && is_pending_object(inline)
+                    && metadata.author.as_deref() == Some(author) =>
+            {
+                let mut path = prefix.clone();
+                path.push(i);
+                out.push(path);
+            }
+            _ => {}
+        }
+        acc += len;
+    }
+}
+
 /// Remove the inline at index path `path` (see [`pending_at`]); a link left
 /// with nothing to edit goes, as when its text is deleted.
 fn remove_at(content: &mut Vec<Inline>, path: &[usize]) {
@@ -843,7 +919,7 @@ fn begins_a_loose_field(inline: &Inline) -> bool {
 /// holding one picture or field alone, as [`record_inserted_objects`] makes
 /// and Word writes. It is zero-width until accepted; typing at it goes after
 /// it, and its own author's Backspace or Delete next to it removes it.
-pub(super) fn is_pending_object(inline: &Inline) -> bool {
+pub fn is_pending_object(inline: &Inline) -> bool {
     matches!(
         inline,
         Inline::Revision { kind: RevisionKind::Insert, content, .. }

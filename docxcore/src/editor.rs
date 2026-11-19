@@ -42,6 +42,7 @@ pub use table_draw::{DRAW_MIN_HEIGHT, DRAW_MIN_WIDTH, DrawnLine, TableEdge};
 pub use table_layout::{AutoFitKind, CellSep, DeleteShift, SortKey, SortKind, SortSpec};
 pub use tables::{CellRange, TablePos};
 pub use track::TrackAuthor;
+pub use track::is_pending_object;
 pub use visible::{FoundMatch, step_found};
 
 /// A path into the document tree (to a paragraph) plus a character offset.
@@ -1939,8 +1940,9 @@ impl Editor {
         if self.select_loose_field(true) {
             return;
         }
-        // The author's own pending field or picture insertion (#1625).
-        if self.remove_own_pending_object(true) {
+        // The author's own pending field or picture insertion, which the
+        // caret is after (#1625).
+        if self.remove_own_pending_object() {
             return;
         }
         if self.caret.offset > 0 {
@@ -2008,10 +2010,6 @@ impl Editor {
         }
         // Before a loose field's begin, even at a paragraph end (#1240).
         if self.select_loose_field(false) {
-            return;
-        }
-        // The author's own pending field or picture insertion (#1625).
-        if self.remove_own_pending_object(false) {
             return;
         }
         let off = self.caret.offset;
@@ -2476,6 +2474,7 @@ impl Editor {
             if drop_objects {
                 self.drop_or_record_objects(&lo.path, lo.offset, hi.offset, false, false);
             }
+            self.remove_own_pending_objects_in(&lo.path, lo.offset, hi.offset, false);
             self.delete_chars(&lo.path, lo.offset, hi.offset, keep_units);
             self.caret = lo;
             return true;
@@ -2622,14 +2621,22 @@ impl Editor {
 
     /// Copy the current selection into a [`Clip`] (preserving run styling).
     pub fn copy(&self) -> Option<Clip> {
+        self.copy_taking(&|_| false)
+    }
+
+    /// [`Editor::copy`], with the objects of the pending object insertions
+    /// `take` accepts that the selection covers (a cut's own, which its
+    /// delete removes, #1625).
+    fn copy_taking(&self, take: &dyn Fn(&Inline) -> bool) -> Option<Clip> {
         let spans = self.selection_spans();
         if spans.is_empty() {
             return None;
         }
         let mut paras = Vec::new();
-        for (path, s, e) in spans {
+        for (k, (path, s, e)) in spans.into_iter().enumerate() {
             if let Some(p) = resolve_para(&self.doc.body, &path) {
-                let mut inlines = extract_range(&p.content, s, e);
+                let from_before = k > 0 && self.cell_range().is_none();
+                let mut inlines = extract_range_taking(&p.content, s, e, from_before, take);
                 // A copy of a recorded insertion is plain text, not a second
                 // record of it.
                 for inline in &mut inlines {
@@ -2652,7 +2659,14 @@ impl Editor {
     /// cuts is cut whole, as the delete takes it (#1240).
     pub fn cut(&mut self) -> Option<Clip> {
         self.widen_selection_over_loose_fields();
-        let mut clip = self.copy()?;
+        // The author's own pending field and picture insertions the delete
+        // removes go in the clip, so a paste moves them (#1625).
+        let author = self.track_author().map(str::to_owned);
+        let own = |inline: &Inline| {
+            matches!(inline, Inline::Revision { metadata, .. }
+                if author.is_some() && metadata.author == author)
+        };
+        let mut clip = self.copy_taking(&own)?;
         // A tracked delete keeps every equation and every field a `w:del`
         // cannot hold ([`kept_while_tracking`]; a cell range's aside), so the
         // clip leaves them out: a paste must not add a second (#1242).
@@ -4778,7 +4792,23 @@ fn replace_range_in_content(content: &mut Vec<Inline>, start: usize, end: usize,
 }
 
 /// Extract the inline content in `[start, end)` (char offsets), styling intact.
+#[cfg(test)]
 fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
+    extract_range_taking(content, start, end, false, &|_| false)
+}
+
+/// Extract the inline content in `[start, end)` (char offsets), styling
+/// intact, also taking the object of each pending object insertion `take`
+/// accepts that the range covers (#1625): one at `p` with
+/// `start < p <= end`, or `p == start` too when the range began in the
+/// paragraph before (`from_before`). A delete removes those it covers.
+fn extract_range_taking(
+    content: &[Inline],
+    start: usize,
+    end: usize,
+    from_before: bool,
+    take: &dyn Fn(&Inline) -> bool,
+) -> Vec<Inline> {
     let mut out = Vec::new();
     let mut pos = 0;
     for inline in content {
@@ -4787,6 +4817,12 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
         let (os, oe) = (start.clamp(a, b), end.clamp(a, b));
         pos = b;
         if oe <= os {
+            if let Inline::Revision { content: inner, .. } = inline {
+                let covered = (a > start || (from_before && a == start)) && a <= end;
+                if covered && track::is_pending_object(inline) && take(inline) {
+                    out.extend(inner.iter().cloned());
+                }
+            }
             continue;
         }
         match inline {
@@ -4821,7 +4857,8 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
                 let inner = if h.content.is_empty() || oe <= p {
                     Vec::new()
                 } else {
-                    extract_range(&h.content, os.max(p) - p, oe - p)
+                    let from_before = start < p || (from_before && start == p);
+                    extract_range_taking(&h.content, os.max(p) - p, oe - p, from_before, take)
                 };
                 let (runs, content) = if inner.iter().all(|i| matches!(i, Inline::Run(_))) {
                     runs.extend(inner.into_iter().filter_map(|i| match i {
@@ -5161,10 +5198,14 @@ fn content_insert_with(content: &mut Vec<Inline>, o: usize, ch: char, typing: bo
         let past = loose_fields::past_field_ends(content, after)
             .max(track::past_pending_objects(content, after));
         if let Some(at) = past {
-            let props = source_before(content, at)
+            let mut props = source_before(content, at)
                 .or_else(|| source_from(content, at))
                 .map(RunProps::continued)
                 .unwrap_or_default();
+            // Past a zero-width inline, so not in the insertion before it:
+            // the typed text is recorded as an insertion of its own, with an
+            // id of its own (#1625).
+            track::clear_insert_record(&mut props);
             if let Some(Inline::Run(r)) = content.get_mut(at) {
                 if r.props == props {
                     run_insert(r, 0, ch);

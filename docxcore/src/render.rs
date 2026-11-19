@@ -2305,6 +2305,40 @@ fn prefix_glyphs(prefix: &str) -> Vec<Glyph> {
         .collect()
 }
 
+/// The offsets of `content` (from `base`) where a pending object insertion
+/// sits (`editor::is_pending_object`, #1625), a link's content included.
+fn pending_object_offsets(content: &[Inline], base: usize, out: &mut Vec<usize>) {
+    let mut at = base;
+    for inline in content {
+        if crate::editor::is_pending_object(inline) {
+            out.push(at);
+        }
+        if let Inline::Hyperlink(h) = inline {
+            let runs: usize = h.runs.iter().map(|r| r.text.chars().count()).sum();
+            pending_object_offsets(&h.content, at + runs, out);
+        }
+        at += crate::editor::inline_len(inline);
+    }
+}
+
+/// The caret is after a pending object insertion at its offset (typing there
+/// goes after it, #1625), so of the stops a line has for that offset, one on
+/// each side of the object's shown text, only the last in visual order stays.
+/// Other zero-width content (a deletion, a bookmark) keeps its stops.
+fn keep_stops_after_pending_objects(visual: &mut Vec<LineCaretStop>, offsets: &[usize]) {
+    for &offset in offsets {
+        let Some(last) = visual.iter().rposition(|stop| stop.offset == offset) else {
+            continue;
+        };
+        let mut k = 0;
+        visual.retain(|stop| {
+            let keep = stop.offset != offset || k == last;
+            k += 1;
+            keep
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_paragraph(
     para: &Paragraph,
@@ -2322,6 +2356,8 @@ fn render_paragraph(
     // break's, else the trailing one): its `w:type` is how that section starts.
     next_sect: Option<&str>,
 ) -> Vec<(Line, LineMap)> {
+    let mut pending_offsets = Vec::new();
+    pending_object_offsets(&para.content, 0, &mut pending_offsets);
     let heading = para.props.heading_level;
     let is_list = para.props.in_list();
     // Left indent (`w:ind`) drawn as leading spaces: ~6 cells per half-inch.
@@ -2495,6 +2531,7 @@ fn render_paragraph(
                     col: stop.col.saturating_sub(line_start_col),
                 })
                 .collect();
+            keep_stops_after_pending_objects(&mut visual, &pending_offsets);
             // A line with no editable character (empty after a break, or a
             // lone `¶`) holds the offset its seg starts at.
             let start = if visual.is_empty() {

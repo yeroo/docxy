@@ -238,39 +238,53 @@ fn a_field_a_w_ins_cannot_hold_goes_in_live() {
 }
 
 #[test]
-fn backspace_or_delete_removes_ones_own_pending_insertion() {
+fn backspace_removes_ones_own_pending_insertion() {
     for object in [simple_field(), complex_field(), picture()] {
-        for forward in [false, true] {
-            let mut ed = editor();
-            insert_at(&mut ed, 2, object.clone());
-            if forward {
-                ed.delete_forward();
-            } else {
-                ed.backspace();
-            }
-            assert_eq!(shape(&ed).concat(), "abcd", "forward {forward}");
-            assert_eq!(ed.caret.offset, 2);
-            let x = xml(&ed);
-            assert!(!x.contains("<w:del ") && !x.contains("<w:ins "), "{x}");
-            assert!(ed.undo(), "one step");
-            assert_eq!(
-                shape(&ed),
-                ["ab", "ins(F)", "cd"].map(|s| match s {
-                    "ins(F)" if matches!(object, Inline::Raw(_)) => "ins(P)",
-                    s => s,
-                })
-            );
-            assert!(ed.redo());
+        let pending = if matches!(object, Inline::Raw(_)) {
+            "ins(P)"
+        } else {
+            "ins(F)"
+        };
+        let mut ed = editor();
+        insert_at(&mut ed, 2, object.clone());
+        ed.backspace();
+        assert_eq!(shape(&ed).concat(), "abcd");
+        assert_eq!(ed.caret.offset, 2);
+        let x = xml(&ed);
+        assert!(!x.contains("<w:del ") && !x.contains("<w:ins "), "{x}");
+        assert!(ed.undo(), "one step");
+        assert_eq!(shape(&ed), ["ab", pending, "cd"]);
+        assert!(ed.redo());
+        // The next press deletes text as before.
+        ed.backspace();
+        assert_eq!(shape(&ed), ["a", "del(b)", "cd"]);
+    }
+}
 
-            // The next press deletes text as before.
-            if forward {
-                ed.delete_forward();
-                assert_eq!(shape(&ed), ["ab", "del(c)", "d"]);
-            } else {
-                ed.backspace();
-                assert_eq!(shape(&ed), ["a", "del(b)", "cd"]);
-            }
-        }
+/// The caret is after a pending insertion at its offset (typing there goes
+/// after it), so Delete acts on what follows, as before #1625.
+#[test]
+fn delete_leaves_a_pending_insertion_and_acts_on_what_follows() {
+    for object in [simple_field(), picture()] {
+        let pending = if matches!(object, Inline::Raw(_)) {
+            "ins(P)"
+        } else {
+            "ins(F)"
+        };
+        let mut ed = editor();
+        insert_at(&mut ed, 2, object.clone());
+        ed.delete_forward();
+        assert_eq!(shape(&ed), ["ab", pending, "del(c)", "d"]);
+
+        // At a paragraph's end it joins the next paragraph.
+        let mut ed = Editor::new(parse(
+            "<w:p><w:r><w:t>abcd</w:t></w:r></w:p><w:p><w:r><w:t>ef</w:t></w:r></w:p>",
+        ));
+        track(&mut ed, "Ada");
+        insert_at(&mut ed, 4, object.clone());
+        ed.delete_forward();
+        assert_eq!(ed.doc.body.len(), 1, "{}", xml(&ed));
+        assert_eq!(shape(&ed), ["abcd", pending, "ef"]);
     }
 }
 
@@ -288,13 +302,13 @@ fn another_authors_pending_insertion_is_left_alone() {
     )));
     track(&mut ed, "Bo");
     ed.set_caret(Caret::at(vec![0], 2));
-    ed.delete_forward();
-    assert_eq!(shape(&ed), ["ab", "ins(F)", "del(c)", "d"]);
+    ed.backspace();
+    assert_eq!(shape(&ed), ["a", "del(b)", "ins(F)", "cd"]);
     // Ada's own Backspace removes it.
     track(&mut ed, "Ada");
-    ed.set_caret(Caret::at(vec![0], 2));
+    ed.set_caret(Caret::at(vec![0], 1));
     ed.backspace();
-    assert_eq!(shape(&ed), ["ab", "del(c)", "d"]);
+    assert_eq!(shape(&ed), ["a", "del(b)", "cd"]);
 }
 
 #[test]
@@ -364,22 +378,137 @@ fn text_typed_after_a_pending_insertion_follows_it() {
     }
 }
 
-#[test]
-fn reject_after_tracked_edits_around_it_never_brings_the_field_back() {
+/// Delete or cut over `b[F]c` (offsets 1..3).
+fn delete_over_it(cut: bool) -> Editor {
     let mut ed = editor();
     insert_at(&mut ed, 2, simple_field());
-    // A selection delete over the text on both sides of it.
     ed.anchor = Some(Caret::at(vec![0], 1));
     ed.caret = Caret::at(vec![0], 3);
-    assert!(ed.delete_selection());
-    assert_eq!(shape(&ed).iter().filter(|s| *s == "ins(F)").count(), 1);
+    if cut {
+        assert!(ed.cut().is_some());
+    } else {
+        assert!(ed.delete_selection());
+    }
+    ed
+}
+
+#[test]
+fn a_selection_delete_over_ones_own_pending_insertion_removes_it() {
+    for cut in [false, true] {
+        let ed = delete_over_it(cut);
+        assert_eq!(shape(&ed), ["a", "del(bc)", "d"], "cut {cut}");
+        let x = xml(&ed);
+        assert!(!x.contains("<w:ins ") && !x.contains("instrText"), "{x}");
+        let mut rejected = Editor::new(ed.doc.clone());
+        rejected.reject_all_revisions();
+        assert_eq!(text(&rejected), "abcd");
+        assert_eq!(live_fields(&rejected), 0);
+        let mut accepted = ed;
+        accepted.accept_all_revisions();
+        assert_eq!(text(&accepted), "ad");
+        assert_eq!(live_fields(&accepted), 0);
+    }
+}
+
+#[test]
+fn a_cut_over_ones_own_pending_insertion_moves_it_once() {
+    let mut ed = editor();
+    insert_at(&mut ed, 2, simple_field());
+    ed.anchor = Some(Caret::at(vec![0], 1));
+    ed.caret = Caret::at(vec![0], 3);
+    let clip = ed.cut().expect("a clip");
+    assert_eq!(clip.paras.len(), 1);
+    assert_eq!(
+        clip.paras[0]
+            .iter()
+            .filter(|i| matches!(i, Inline::Field { .. }))
+            .count(),
+        1,
+        "the clip carries the field"
+    );
+    ed.anchor = None;
+    ed.set_caret(Caret::at(vec![0], 4));
+    ed.paste(&clip);
+    let x = xml(&ed);
+    assert_eq!(
+        x.matches("<w:instrText").count(),
+        1,
+        "one field, not two: {x}"
+    );
+    let mut accepted = Editor::new(ed.doc.clone());
+    accepted.accept_all_revisions();
+    assert_eq!(live_fields(&accepted), 1, "{}", xml(&accepted));
     let mut rejected = Editor::new(ed.doc.clone());
     rejected.reject_all_revisions();
     assert_eq!(text(&rejected), "abcd");
     assert_eq!(live_fields(&rejected), 0);
-    ed.accept_all_revisions();
-    assert_eq!(text(&ed), "a7d");
-    assert_eq!(live_fields(&ed), 1);
+}
+
+#[test]
+fn a_pending_insertion_at_a_selections_edges() {
+    // At `hi` it is covered (the caret there is after it): removed.
+    let mut ed = editor();
+    insert_at(&mut ed, 2, simple_field());
+    ed.anchor = Some(Caret::at(vec![0], 1));
+    ed.caret = Caret::at(vec![0], 2);
+    assert!(ed.delete_selection());
+    assert_eq!(shape(&ed), ["a", "del(b)", "cd"]);
+    // At `lo` it is before the selection: kept.
+    let mut ed = editor();
+    insert_at(&mut ed, 2, simple_field());
+    ed.anchor = Some(Caret::at(vec![0], 2));
+    ed.caret = Caret::at(vec![0], 3);
+    assert!(ed.delete_selection());
+    assert_eq!(shape(&ed), ["ab", "ins(F)", "del(c)", "d"]);
+}
+
+#[test]
+fn a_selection_across_paragraphs_removes_ones_own_pending_insertions() {
+    let mut ed = Editor::new(parse(
+        "<w:p><w:r><w:t>abcd</w:t></w:r></w:p><w:p><w:r><w:t>ef</w:t></w:r></w:p>",
+    ));
+    track(&mut ed, "Ada");
+    // One at the first paragraph's end, one at the second's start.
+    insert_at(&mut ed, 4, simple_field());
+    ed.set_caret(Caret::at(vec![1], 0));
+    ed.paste(&Clip::new(vec![vec![simple_field()]]));
+    assert_eq!(insertions(&xml(&ed)).len(), 2, "{}", xml(&ed));
+    ed.anchor = Some(Caret::at(vec![0], 3));
+    ed.caret = Caret::at(vec![1], 1);
+    assert!(ed.delete_selection());
+    let x = xml(&ed);
+    assert!(!x.contains("instrText"), "{x}");
+}
+
+#[test]
+fn another_authors_pending_insertion_survives_a_selection_delete() {
+    let mut ed = editor();
+    insert_at(&mut ed, 2, simple_field());
+    track(&mut ed, "Bo");
+    ed.anchor = Some(Caret::at(vec![0], 1));
+    ed.caret = Caret::at(vec![0], 3);
+    assert!(ed.delete_selection());
+    assert_eq!(shape(&ed).iter().filter(|s| *s == "ins(F)").count(), 1);
+}
+
+/// Text typed after a pending insertion, right after the author's own typed
+/// text, is an insertion of its own: no `w:id` is shared by two stretches.
+#[test]
+fn text_typed_after_a_pending_insertion_takes_an_id_of_its_own() {
+    let mut ed = Editor::new(parse("<w:p/>"));
+    track(&mut ed, "Ada");
+    ed.set_caret(Caret::at(vec![0], 0));
+    ed.insert_str("ab");
+    ed.paste(&Clip::new(vec![vec![simple_field()]]));
+    ed.insert_char('x');
+    let x = xml(&ed);
+    let ids = ids(&x);
+    assert_eq!(ids.len(), 3, "{x}");
+    let mut unique = ids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), 3, "{x}");
+    assert_eq!(reloaded(&ed).doc.revisions().len(), 3, "{x}");
 }
 
 #[test]
@@ -407,4 +536,30 @@ fn a_merge_field_inserted_while_tracking_still_previews() {
         unreachable!()
     };
     assert_eq!(text, "Jane");
+}
+
+/// The terminal view draws the caret after a pending insertion at its
+/// offset, where typing goes; a deletion's text keeps the caret before it.
+#[test]
+fn the_terminal_caret_is_drawn_after_a_pending_insertion() {
+    use docxcore::render::{RenderOptions, render_mapped};
+    let mut ed = editor();
+    insert_at(
+        &mut ed,
+        2,
+        docxcore::field::fld_simple(" PAGE ", "777", &RunProps::default()),
+    );
+    let (lines, maps) = render_mapped(&ed.doc, &RenderOptions::default());
+    assert_eq!(lines[0].plain(), "ab777cd");
+    assert_eq!(maps[0].col_for_caret(&[0], 2, None), Some(5));
+    assert_eq!(maps[0].col_for_caret(&[0], 1, None), Some(1));
+    assert_eq!(maps[0].col_for_caret(&[0], 3, None), Some(6));
+
+    let deleted = Editor::new(parse(
+        "<w:p><w:r><w:t>ab</w:t></w:r><w:del w:id=\"1\" w:author=\"Bo\"><w:r>\
+         <w:delText>777</w:delText></w:r></w:del><w:r><w:t>cd</w:t></w:r></w:p>",
+    ));
+    let (lines, maps) = render_mapped(&deleted.doc, &RenderOptions::default());
+    assert_eq!(lines[0].plain(), "ab777cd");
+    assert_eq!(maps[0].col_for_caret(&[0], 2, None), Some(2));
 }

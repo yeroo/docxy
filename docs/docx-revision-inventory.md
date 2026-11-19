@@ -104,10 +104,14 @@ comment-marker id in the document.
   its own, zero-width until accepted: Reject removes it, Accept leaves it
   live. A field is written in it as run-level XML (a `w:fldSimple` becomes the
   complex field's runs); one whose result holds a link goes in live and
-  unrecorded. Text typed right after such a pending object insertion goes
-  after it, and the author's own Backspace or Delete next to it removes it
-  outright (one undo step, no `w:del`); another author's stays. F9 and Edit
-  Field do not reach a pending field until it is accepted.
+  unrecorded. The caret is after such a pending object insertion at its
+  offset: text typed there goes after it (an insertion of its own), the
+  author's own Backspace removes it outright (one undo step, no `w:del`) and
+  Delete acts on what follows. A tracked selection delete or cut covering the
+  author's own (one at the selection's end included, one at its start not)
+  removes it, and a cut's clip carries it, so a paste moves it; another
+  author's stays. F9 and Edit Field do not reach a pending field until it is
+  accepted.
 - **Deletions** (Backspace, Delete, Cut, a selection) move the text into a
   `<w:del>` with `<w:delText>`; the editor counts it as zero-width, so the caret
   steps over it, and adjacent deletions by the author merge into one (a

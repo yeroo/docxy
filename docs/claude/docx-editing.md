@@ -437,11 +437,17 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
 - Tracked insertion: `clip_for_insertion` wraps each field (and picture,
   #1242) in a `w:ins` of its own (`record_inserted_objects`), the field as
   `compare::run_level_field`. Such a "pending object insertion"
-  (`track::is_pending_object`) is zero-width: typing at it goes after it
-  (`past_pending_objects`, beside `past_field_ends`), a paste already lands
-  after it, and the tracking author's Backspace/Delete next to it removes it
-  (`remove_own_pending_object`). The terminal renderer still draws the caret
-  at that offset before the object (the first of its two visual stops).
+  (`editor::is_pending_object`) is zero-width, and the caret is after the
+  ones at its offset: typing goes after them (`past_pending_objects`, beside
+  `past_field_ends`; the typed run drops the insertion record it borrowed, so
+  it gets an id of its own), a paste already lands after them, the tracking
+  author's Backspace removes the last (`remove_own_pending_object`), Delete
+  acts on what follows. A tracked selection delete removes the author's own
+  at offsets `lo < p <= hi` (`remove_own_pending_objects_in`; from the
+  paragraph before, `p == 0` too), and a cut's clip carries them
+  (`copy_taking`). The terminal view keeps only the caret stop after one
+  (`render.rs` `keep_stops_after_pending_objects`); the suite's
+  `paragraph_el` holds a run-end caret past one (`pending_object_follows`).
 - Compare: a field failing `is_run_level(run_level_field(..))` is never in a
   `w:ins`/`w:del`: deleted, it is skipped; inserted, `emit_wrapped` lifts it
   out like a marker. Both report `CompareSkip::Object`.
