@@ -60,6 +60,10 @@ rust-embed = "8"
 # Grapheme-cluster boundaries for caret moves and deletion in dialog fields
 # (dialog.rs, dialog_host.rs); the terminal docxy crate uses it the same way.
 unicode-segmentation = "1.13"
+# The PDF view (#2245): page rasters, text in reading order and the outline,
+# run only in the `--pdf-worker` child (pdf_view/worker.rs). Its patched
+# hayro/vello/lopdf copies are in ../Cargo.toml's `[patch.crates-io]`.
+pdfcraft-render = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
 
 # The plain AppKit menu bar a native dialog runs under (#1071, macos_menu.rs),
 # and the RTF a copy adds to the pasteboard (#1074, rich_clip.rs).
