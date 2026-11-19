@@ -5068,9 +5068,14 @@ impl App {
         let sheet = self.sheet();
         let mut rows = Vec::new();
         let mut tsv = String::new();
+        // An absent cell is copied as a blank with the style it inherits from
+        // its row or column, when that is not the default (#1660): pasted, it
+        // is the cell's absence, not a default-style pin.
+        let col_styles: Vec<u32> = (c1..=c2).map(|c| sheet.col_style(c)).collect();
         for r in r1..=r2 {
             let mut row = Vec::new();
-            for c in c1..=c2 {
+            let row_style = sheet.row_style(r);
+            for (c, &col_style) in (c1..=c2).zip(&col_styles) {
                 if c > c1 {
                     tsv.push('\t');
                 }
@@ -5081,7 +5086,13 @@ impl App {
                     let shown = format_with(&xf, &cl.value, self.pkg.workbook.date1904);
                     tsv.push_str(&gridcore::entry::copy_field(cl, &xf, shown));
                 }
-                row.push(cell);
+                let inherited = row_style.unwrap_or(col_style);
+                row.push(cell.or_else(|| {
+                    (inherited != 0).then(|| Cell {
+                        style: inherited,
+                        ..Cell::default()
+                    })
+                }));
             }
             tsv.push('\n');
             rows.push(row);
@@ -5178,13 +5189,26 @@ impl App {
                 let mut clears = Vec::new();
                 if cut {
                     let (fr, fc) = clip.from;
+                    let source = &self.pkg.workbook.sheets[src];
                     for (dr, row) in clip.cells.iter().enumerate() {
                         for (dc, cell) in row.iter().enumerate() {
                             // A cell pushed off the grid's edge isn't
                             // written, so its source stays.
                             let (dr, dc) = (dr as u32, dc as u32);
                             if cell.is_some() && r0 + dr < MAX_ROWS && c0 + dc < MAX_COLS {
-                                clears.push((fr + dr, fc + dc, Cell::default()));
+                                // Cleared to its absence: the style its row or
+                                // column gives it, not a default-style pin
+                                // (#1660).
+                                let (r, c) = (fr + dr, fc + dc);
+                                let style = source.inherited_style(r, c);
+                                clears.push((
+                                    r,
+                                    c,
+                                    Cell {
+                                        style,
+                                        ..Cell::default()
+                                    },
+                                ));
                             }
                         }
                     }
@@ -9873,9 +9897,17 @@ impl App {
         let mut cells = Vec::new();
         for (c, text) in changes {
             let wb = &self.pkg.workbook;
-            let base = style_row
-                .and_then(|r| wb.sheets[d.sheet].cell(r, c))
-                .map_or(0, |cell| cell.style);
+            let sh = &wb.sheets[d.sheet];
+            // A record's own absent field is read under the style it
+            // inherits from its row or column (#1660).
+            let base = match d.rec {
+                Rec::Row(r) => sh
+                    .cell(r, c)
+                    .map_or_else(|| sh.inherited_style(r, c), |cell| cell.style),
+                Rec::New => style_row
+                    .and_then(|r| sh.cell(r, c))
+                    .map_or(0, |cell| cell.style),
+            };
             let formula = gridcore::entry::typed_formula_styled(wb, base, &text);
             let checked =
                 formula.map(|f| Engine::validate_in(&self.pkg.workbook, d.sheet, row, c, f));
@@ -17567,6 +17599,74 @@ mod tests {
         check(&app, true, "redo");
     }
 
+    /// A sheet whose column B has style 7: a blank default-style cell there
+    /// would pin the default (#1064).
+    fn app_with_styled_column_b() -> App {
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0]
+            .col_defs
+            .push(gridcore::sheet::ColDef {
+                min: 1,
+                max: 1,
+                width: None,
+                attrs: r#"style="7""#.to_string(),
+                default_width: false,
+                plain_width: false,
+            });
+        let mut app = App::new(pkg, "t.xlsx");
+        app.os_clip = None;
+        app.anchor = None;
+        app
+    }
+
+    /// #1660: copy an absent B1 and paste it on B2 (style 0), or cut B3:
+    /// neither leaves a blank default-style pin under column B's style.
+    #[test]
+    fn copy_or_cut_of_absent_and_typed_cells_leaves_no_pin_in_a_styled_column() {
+        let mut app = app_with_styled_column_b();
+        app.apply(vec![
+            (0, 0, Cell::number(1.0)),
+            (1, 1, Cell::number(2.0)),
+            (2, 1, Cell::number(3.0)),
+        ]);
+        app.cur = (0, 1);
+        app.copy(false);
+        let blank7 = Cell {
+            style: 7,
+            ..Cell::default()
+        };
+        assert_eq!(app.clip.as_ref().unwrap().cells, vec![vec![Some(blank7)]]);
+        assert_eq!(app.clip_text.as_deref(), Some("\n"), "an empty field");
+        app.cur = (1, 1);
+        app.paste();
+        assert_eq!(app.sheet().cell(1, 1), None, "B2 is as absent as B1");
+        // Cut B3 to A6: B3 is left absent, not a default-style pin.
+        app.cur = (2, 1);
+        app.copy(true);
+        app.cur = (5, 0);
+        app.paste();
+        assert_eq!(value_at(&app, 5, 0), CellValue::Number(3.0));
+        assert_eq!(app.sheet().cell(2, 1), None, "B3 after the cut");
+        // An absent A1 in an unstyled column is still copied as nothing.
+        app.cur = (3, 0);
+        app.copy(false);
+        assert_eq!(app.clip.as_ref().unwrap().cells, vec![vec![None]]);
+    }
+
+    /// #1660: B1 spills B1:B3 in a styled column under manual calculation;
+    /// `x` typed in B2 and undone leaves no blank default-style pin there.
+    #[test]
+    fn undo_of_a_typed_spill_member_leaves_no_pin_under_manual_calc() {
+        let mut app = app_with_styled_column_b();
+        app.apply(vec![(0, 1, Cell::formula("SEQUENCE(3)"))]);
+        assert_eq!(app.sheet().cell(0, 1).unwrap().spill, Some((3, 1)));
+        app.pkg.workbook.calc.mode = gridcore::sheet::CalcMode::Manual;
+        app.apply(vec![(1, 1, Cell::text("x"))]);
+        app.undo();
+        let b2 = app.sheet().cell(1, 1);
+        assert!(b2.is_none_or(|c| !c.is_blank()), "B2 is {b2:?}");
+    }
+
     #[test]
     fn bold_on_a_randarray_spill_keeps_it_through_undo_redo() {
         // Volatile: every recalc redraws the values, so a restyle's undo must
@@ -24838,6 +24938,38 @@ mod tests {
         assert_eq!(form_rec(&app), dataform::Rec::Row(1));
         assert!(app.status.as_deref().unwrap().starts_with("formula error"));
         assert_eq!(value_at(&app, 1, 1), CellValue::Number(5.0));
+    }
+
+    /// #1660: a record's own absent field is read under the style its
+    /// column gives it: `15` in a `0%` column is 15%.
+    #[test]
+    fn data_form_reads_an_absent_field_under_its_columns_style() {
+        let mut app = data_form_app();
+        let pct = app.pkg.workbook.styles.intern(gridcore::sheet::Xf {
+            numfmt: gridcore::sheet::NumFmt::Percent { decimals: 0 },
+            code: Some("0%".into()),
+            ..gridcore::sheet::Xf::default()
+        });
+        app.pkg.workbook.sheets[0]
+            .col_defs
+            .push(gridcore::sheet::ColDef {
+                min: 1,
+                max: 1,
+                width: None,
+                attrs: format!(r#"style="{pct}""#),
+                default_width: false,
+                plain_width: false,
+            });
+        app.pkg.workbook.sheets[0].cells.remove(&(1, 1));
+        app.rebuild_engine();
+        app.ribbon_act(ribbon::Act::DataForm);
+        assert_eq!(form_rec(&app), dataform::Rec::Row(1));
+        form_key(&mut app, KeyCode::Tab);
+        form_clear(&mut app);
+        form_type(&mut app, "15");
+        form_key(&mut app, KeyCode::Down);
+        let b2 = app.sheet().cell(1, 1).unwrap();
+        assert_eq!((&b2.value, b2.style), (&CellValue::Number(0.15), pct));
     }
 
     #[test]
