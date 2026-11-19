@@ -410,7 +410,8 @@ pub struct SuiteTheme {
     /// The ribbon's and the tab strip's panel.
     pub panel: Hsla,
     pub border: Hsla,
-    /// The tab's accent (the Mail tabs').
+    /// The tab's accent: the Mail tabs' from [`suite_theme`], a further
+    /// kind's own ([`ExtKind::accent`]) as its tabs are told it (#2253).
     pub accent: Hsla,
     pub text: Hsla,
     pub muted_text: Hsla,

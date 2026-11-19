@@ -802,5 +802,15 @@ mod tests {
             )))
         };
         assert_eq!((light.accent, dark.accent), (accent(false), accent(true)));
+        // A further kind's accent (#2253): its own shade per theme, the rest
+        // the suite's.
+        let kind = Some((0x6B3FA0, 0x8250C4));
+        let (kl, kd) = (
+            theme_of(&ThemeColor::light(), false, kind),
+            theme_of(&ThemeColor::dark(), true, kind),
+        );
+        assert_eq!(kl.accent, Hsla::from(gpui::rgb(0x6B3FA0)));
+        assert_eq!(kd.accent, Hsla::from(gpui::rgb(0x8250C4)));
+        assert_eq!((kl.background, kd.panel), (light.background, dark.panel));
     }
 }
