@@ -264,6 +264,35 @@ fn a_cut_marks_its_cells_and_its_paste_moves_them_and_their_references() {
     assert_eq!(v.sheet().cell(9, 1), None);
 }
 
+/// #1660: a cut over an absent cell of a styled column captures it with
+/// the column's style, still moves, and clears its source to its absence,
+/// not a default-style pin.
+#[test]
+fn a_cut_over_an_absent_cell_in_a_styled_column_moves_and_leaves_no_pin() {
+    let mut v = view();
+    let s = v.active;
+    v.pkg.workbook.sheets[s]
+        .col_defs
+        .push(gridcore::sheet::ColDef {
+            min: 1,
+            max: 1,
+            width: None,
+            attrs: r#"style="7""#.to_string(),
+            default_width: false,
+            plain_width: false,
+        });
+    put(&mut v, "A1", Cell::number(1.0));
+    put(&mut v, "B2", Cell::number(2.0));
+    let clip = cut(&mut v, "A1", "B2");
+    select(&mut v, "A10", "A10");
+    assert_eq!(v.paste_grid_clip(&clip), Ok(GridPasted::Done));
+    assert_eq!(value(&v, "A10"), CellValue::Number(1.0));
+    assert_eq!(value(&v, "B11"), CellValue::Number(2.0));
+    assert_eq!(v.sheet().cell(0, 0), None, "A1 moved, not copied");
+    assert_eq!(v.sheet().cell(1, 1), None, "B2 is absent, not a pin");
+    assert_eq!(v.sheet().cell(0, 1), None, "B1 stays absent");
+}
+
 #[test]
 fn a_cut_over_its_own_cells_keeps_what_it_overwrites() {
     let mut v = issue_book();

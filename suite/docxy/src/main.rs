@@ -5168,7 +5168,8 @@ impl SheetView {
         (r0..=r1).zip(&clip.block.cells).all(|(r, row)| {
             (c0..=c1)
                 .zip(row)
-                .all(|(c, was)| same(was, &sheet.cell(r, c).cloned().unwrap_or_default()))
+                // An absent cell was captured with its inherited style (#1660).
+                .all(|(c, was)| same(was, &sheet.copied_cell(r, c)))
         })
     }
 
@@ -5221,7 +5222,8 @@ impl SheetView {
         for r in fr0..=fr1 {
             let mut row = Vec::new();
             for c in fc0..=fc1 {
-                let mut cell = sheet.cell(r, c).cloned().unwrap_or_default();
+                // An absent cell moves as its inherited style (#1660).
+                let mut cell = sheet.copied_cell(r, c);
                 // A formula held verbatim (a shared one) keeps its text.
                 let verbatim = cell.f_attrs.as_deref().is_some_and(|a| !is_array_f(a));
                 if !verbatim {
@@ -5236,7 +5238,17 @@ impl SheetView {
                 let overwritten =
                     src == dst && (r0..r0 + h).contains(&r) && (c0..c0 + w).contains(&c);
                 if sheet.cell(r, c).is_some() && !overwritten {
-                    clears.push((r, c, Cell::default()));
+                    // Cleared to its absence: the style its row or column
+                    // gives it, not a default-style pin (#1660).
+                    let style = sheet.inherited_style(r, c);
+                    clears.push((
+                        r,
+                        c,
+                        Cell {
+                            style,
+                            ..Cell::default()
+                        },
+                    ));
                 }
                 row.push(cell);
             }
