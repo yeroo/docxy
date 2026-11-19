@@ -56,6 +56,11 @@ issue number to find its notes.
   dark page, Switch Modes not persisted (#2087).
 - `docs/claude/pdf-export.md`: before changing PDF export: embedded fonts (#1508),
   borders, picture watermarks and unequal columns (#797).
+- `docs/claude/pdf-view.md`: before changing the suite's PDF view (#2245): the
+  pdfcraft-render dependency and the patch table a rev bump moves, the
+  `--pdf-worker` child and its protocol, timeouts and watchdog, the tab's
+  routing, session row and read-only rules, the harness's `pdf-read`, the
+  corpus and its reference tolerance.
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),
   images (#1880), links (#1879), centring (#1922), rounded images (#1926),
   nested cards (#1927), page margins (#1928), Outlook mail: CSS-only spacing,

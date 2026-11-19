@@ -506,3 +506,7 @@ cargo run -p mppread  --example tasknames -- some.mpp  # decode a .mpp's tasks +
 ## License
 
 MIT © yeroo
+
+The desktop suite's PDF view uses PdfCraft, hayro, Vello and lopdf, and the
+fonts, character maps and colour profile they embed, under their own
+licences: see [NOTICE](NOTICE).
