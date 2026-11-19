@@ -148,7 +148,7 @@ fn a_raster_never_passes_the_view_caps() {
         rotation: 0,
         label: String::new(),
     };
-    // 800 % on a 2x display would be 9792 px wide.
+    // 800 % on a 2x display would be 13056 x 16896 px (8 x 96/72 x 2 a point).
     let s = raster_scale(&letter, 8., 2.);
     let (w, h) = (612. * s, 792. * s);
     assert!(w.max(h) <= MAX_SIDE + 0.5, "{w} x {h}");
@@ -359,6 +359,51 @@ fn select_all_waits_for_every_pages_text() {
         v.selection_text().as_deref(),
         Some("hello world\nsecond line here")
     );
+}
+
+/// FIX r1: a Ctrl+C that waits for text copies the selection it was pressed
+/// on once the text is in, and nothing when the selection changed first.
+#[test]
+fn a_waiting_copy_copies_its_own_selection_or_nothing() {
+    // It waits, then the text comes: the whole selection, once.
+    let mut v = two_pages();
+    v.texts[1] = None;
+    v.select_all();
+    assert_eq!(v.copy(), None);
+    assert!(v.copy_waits());
+    assert_eq!(v.take_pending_copy(), None, "page 2's text is not in yet");
+    assert!(v.copy_waits());
+    v.texts[1] = Some(page_text(&["next page"]));
+    assert_eq!(
+        v.take_pending_copy().as_deref(),
+        Some("hello world\nsecond line here\nnext page")
+    );
+    assert!(!v.copy_waits());
+    assert_eq!(v.take_pending_copy(), None);
+
+    // Escape lets the selection go: the copy goes with it.
+    let mut v = two_pages();
+    v.texts[1] = None;
+    v.select_all();
+    assert_eq!(v.copy(), None);
+    v.sel = None;
+    assert!(!v.copy_waits());
+    v.texts[1] = Some(page_text(&["next page"]));
+    assert_eq!(v.take_pending_copy(), None);
+    assert_eq!(v.copy_pending, None, "dropped, so no poll stays due");
+
+    // A new selection before the text comes: it is never copied unasked.
+    let mut v = two_pages();
+    v.texts[1] = None;
+    v.select_all();
+    assert_eq!(v.copy(), None);
+    let (x, y) = at(&v, 0, 72. + 6. * 7., 105.);
+    v.press(x, y, 2, false);
+    assert_eq!(v.selection_text().as_deref(), Some("world"));
+    assert!(!v.copy_waits());
+    assert_eq!(v.take_pending_copy(), None);
+    // Its own Ctrl+C copies at once.
+    assert_eq!(v.copy().as_deref(), Some("world"));
 }
 
 // ---- Find -------------------------------------------------------------------------

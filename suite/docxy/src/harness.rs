@@ -1915,7 +1915,7 @@ fn pdf_read(app: &crate::Docxy, args: &Json) -> Result<Done, String> {
         && (!idle
             || (!v.busy()
                 && !v.find_dirty()
-                && !v.copy_pending
+                && !v.copy_waits()
                 && (v.find.field.text.is_empty() && !v.want_all_text || v.unread_pages() == 0)));
     let mut done = Done::ok(v.read_json())?;
     done.retry = (!settled).then(|| std::time::Duration::from_millis(within as u64));

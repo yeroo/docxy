@@ -31,7 +31,8 @@ pub(crate) const ZOOM_STEPS: [f32; 13] =
     [0.1, 0.25, 0.5, 0.75, 1., 1.25, 1.5, 2., 3., 4., 5., 6., 8.];
 /// A raster's largest side and pixel count: past them a page is drawn at a
 /// lower scale and stretched (tiles are a later slice). 800 % on Letter at
-/// a 2× display would be 9792 px wide and 160 MB.
+/// a 2× display (8 × 96/72 × 2 px a point) would be 13056 × 16896 px, about
+/// 880 MB of BGRA.
 pub(crate) const MAX_SIDE: f32 = 4096.;
 pub(crate) const MAX_PIXELS: f32 = 16.0e6;
 /// The raster bytes one view keeps; past it the least recently shown page
@@ -307,8 +308,9 @@ pub(crate) struct PdfView {
     pub restore_page: Option<usize>,
     /// Ctrl+A or Find needs every page's text.
     pub want_all_text: bool,
-    /// A Ctrl+C waits for a selected page's text.
-    pub copy_pending: bool,
+    /// The selection a Ctrl+C waits on for a page's text. A change of the
+    /// selection (Escape, a press, Find, Ctrl+A) drops the copy.
+    pub copy_pending: Option<Sel>,
     /// The questions sent so far (the scheduler's tests).
     #[cfg(test)]
     pub sent: Vec<Op>,
@@ -342,7 +344,7 @@ impl PdfView {
             outline_shown: !meta.outline.is_empty(),
             restore_page: None,
             want_all_text: false,
-            copy_pending: false,
+            copy_pending: None,
             #[cfg(test)]
             sent: Vec::new(),
             meta,
@@ -473,13 +475,11 @@ impl PdfView {
     }
 
     /// Take the worker's answers in, then send the next question if none is
-    /// out. `true` when something changed.
-    pub(crate) fn pump(&mut self) -> bool {
-        let mut changed = false;
+    /// out. Called from the frame, which draws whatever changed.
+    pub(crate) fn pump(&mut self) {
         let done = self.engine.as_ref().map(Engine::take).unwrap_or_default();
         for d in done {
             self.absorb(d);
-            changed = true;
         }
         if self.in_flight.is_none()
             && let Some(op) = self.next_job()
@@ -493,14 +493,11 @@ impl PdfView {
                 // No worker (it could not start a thread): the page says so
                 // rather than wait for ever.
                 self.fail(&op, worker::DIED.into());
-                changed = true;
             }
         }
         if self.find.dirty {
             self.refind();
-            changed = true;
         }
-        changed
     }
 
     /// An answer in.
@@ -815,6 +812,40 @@ impl PdfView {
         Some(parts.join("\n"))
     }
 
+    /// Ctrl+C: the selection's text now, or `None` while a selected page's
+    /// text is still being read (the copy then waits on this selection).
+    pub(crate) fn copy(&mut self) -> Option<String> {
+        let sel = self.sel?;
+        match self.selection_text() {
+            Some(text) => {
+                self.copy_pending = None;
+                Some(text)
+            }
+            None => {
+                self.copy_pending = Some(sel);
+                self.want_all_text = true;
+                None
+            }
+        }
+    }
+
+    /// Whether a Ctrl+C still waits: on the selection it was pressed on.
+    pub(crate) fn copy_waits(&self) -> bool {
+        self.copy_pending.is_some() && self.copy_pending == self.sel
+    }
+
+    /// A copy that waited: its text once it is in. A selection changed
+    /// since drops it: nothing is copied that Ctrl+C was not pressed on.
+    pub(crate) fn take_pending_copy(&mut self) -> Option<String> {
+        if !self.copy_waits() {
+            self.copy_pending = None;
+            return None;
+        }
+        let text = self.selection_text()?;
+        self.copy_pending = None;
+        Some(text)
+    }
+
     /// The pages a selection covers whose text is not in yet.
     fn selection_waits(&self) -> bool {
         self.sel.is_some() && self.selection_text().is_none()
@@ -1068,7 +1099,7 @@ impl PdfView {
                 "current_hit",
                 self.find.current.map_or(Json::Null, |k| n(k + 1)),
             ),
-            ("copy_pending", Json::Bool(self.copy_pending)),
+            ("copy_pending", Json::Bool(self.copy_waits())),
             ("busy", Json::Bool(self.busy())),
             ("title", self.meta.title.as_deref().map_or(Json::Null, s)),
             ("author", self.meta.author.as_deref().map_or(Json::Null, s)),

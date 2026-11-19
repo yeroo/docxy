@@ -182,16 +182,13 @@ impl Docxy {
         for img in std::mem::take(&mut v.released) {
             cx.drop_image(img, Some(window));
         }
-        let copy = (v.copy_pending).then(|| v.selection_text()).flatten();
-        let due = v.busy() || v.copy_pending;
+        let copy = v.take_pending_copy();
+        let due = v.busy() || v.copy_waits();
         if let Some(text) = copy {
-            if let Some(v) = self.active_pdf_mut() {
-                v.copy_pending = false;
-            }
             self.pdf_copied(text, cx);
         }
-        if due && !self.pdf_polling.get() {
-            self.pdf_polling.set(true);
+        if due && !self.pdf_polling {
+            self.pdf_polling = true;
             cx.spawn_in(window, async move |this, cx| {
                 loop {
                     cx.background_executor().timer(POLL).await;
@@ -202,12 +199,12 @@ impl Docxy {
                         if v.has_answers() || !v.busy() {
                             cx.notify();
                         }
-                        v.busy() || v.copy_pending
+                        v.busy() || v.copy_waits()
                     });
                     // Gone, or nothing due: the next frame that sends a
                     // question starts a poll again.
                     if !more.unwrap_or(false) {
-                        let _ = this.update(cx, |this, _| this.pdf_polling.set(false));
+                        let _ = this.update(cx, |this, _| this.pdf_polling = false);
                         break;
                     }
                 }
@@ -231,13 +228,9 @@ impl Docxy {
         if v.sel.is_none() {
             return;
         }
-        match v.selection_text() {
+        match v.copy() {
             Some(text) => self.pdf_copied(text, cx),
-            None => {
-                v.copy_pending = true;
-                v.want_all_text = true;
-                self.set_status("Copying: reading the selected pages' text…");
-            }
+            None => self.set_status("Copying: reading the selected pages' text…"),
         }
         cx.notify();
     }
@@ -326,12 +319,12 @@ impl Docxy {
                     v.find_changed();
                 }
             }),
-            FieldKey::Copy | FieldKey::Cut => {
+            k @ (FieldKey::Copy | FieldKey::Cut) => {
                 let Some(v) = self.active_pdf() else { return };
                 let (text, sel) = (v.find.field.text.clone(), v.find.field.sel);
                 if sel && !text.is_empty() {
                     self.field_copy(text, cx);
-                    if matches!(field_key_of(ev), FieldKey::Cut) {
+                    if k == FieldKey::Cut {
                         self.with_pdf(cx, |v| {
                             v.find.field.edit(crate::field_edit::Op::Delete);
                             v.find_changed();
@@ -367,11 +360,14 @@ impl Docxy {
             }),
             FieldKey::Escape => self.with_pdf(cx, |v| v.page_box = Field::default()),
             FieldKey::Edit(op) => self.with_pdf(cx, |v| v.page_box.edit(op)),
-            FieldKey::Copy | FieldKey::Cut => {
+            k @ (FieldKey::Copy | FieldKey::Cut) => {
                 let Some(v) = self.active_pdf() else { return };
                 if v.page_box.sel && !v.page_box.text.is_empty() {
                     let text = v.page_box.text.clone();
                     self.field_copy(text, cx);
+                    if k == FieldKey::Cut {
+                        self.with_pdf(cx, |v| v.page_box.edit(crate::field_edit::Op::Delete));
+                    }
                 }
             }
             FieldKey::Paste => {

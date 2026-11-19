@@ -6196,7 +6196,7 @@ struct Docxy {
     /// The accent this window's last render set (#1473), for the harness.
     drawn_accent: u32,
     /// A poll for a PDF view's worker answers runs (#2245).
-    pdf_polling: std::rc::Rc<std::cell::Cell<bool>>,
+    pdf_polling: bool,
     /// What the last render drew of each swatch gallery in place (#1823), for
     /// the harness's `ribbon-read`.
     drawn_galleries: std::cell::RefCell<DrawnGalleries>,
@@ -18578,7 +18578,7 @@ impl Docxy {
             frame: 0,
             last_window_title: None,
             drawn_accent: BRAND,
-            pdf_polling: Default::default(),
+            pdf_polling: false,
             drawn_galleries: Default::default(),
         }
     }

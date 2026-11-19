@@ -90,8 +90,10 @@ test issue 2245 text selects in reading order and copies as plain text
   call pdf-read {"until_idle":true}
   assert reply.copy_pending is false
   assert reply.pages.1.text is read
+  # The whole document, both pages: not the earlier copy of one sentence.
   call clipboard {"action":"read"}
-  assert reply.text is not nothing
+  assert reply.text is {pdf-read.selection}
+  assert reply.text is not Hello from the first page.
   # Esc lets the selection go.
   call real-key {"key":"escape"}
   call pdf-read {}
