@@ -14,6 +14,11 @@ committed and never run the tools.
 | `slides.pdf` | 3 (960 x 540) | Landscape slides with nested bookmarks (Review › Quarterly review, Revenue by region; Next steps). |
 | `../word-import/source.pdf` | 1 | The Word import fixture: Word's own PDF of `source.docx` (Cyrillic and `€`). |
 
+`uiharness/fixtures/pdf-view-slides.pdf` and `pdf-view-text.pdf` are
+byte-identical copies of `slides.pdf` and `text.pdf` (the generator writes
+them too): `uiharness/cases/pdf-view.uit` may open only the harness's own
+files.
+
 `ref/<name>-<page>.png` is `pdftoppm -r 72 -png` of each page: one pixel per
 point, what the test draws at scale 1. The comparison and its tolerance are
 in `suite/docxy/src/pdf_view/tests.rs` (`differing`).

@@ -6,11 +6,13 @@
 # what a step needs is in. `pdf-<part>` presses the view's own parts
 # (`pdf-zoom-in`, `pdf-bookmark:<n>`, `pdf-convert`, ...) and
 # `pdf-text:<page>:<start|end>:<text>` the first or last glyph of a text.
-# The corpus files and how they were made: corpus/pdf-view/README.md.
+# The PDFs are uiharness/fixtures/pdf-view-*.pdf, byte-identical copies of
+# corpus/pdf-view/slides.pdf and text.pdf (a case opens only the harness's
+# own files); how they were made: corpus/pdf-view/README.md.
 # Each test closes the tabs it opened (Ctrl+W).
 
 test issue 2245 a PDF opens in its view, drawn, with its bookmarks, zoom and page box
-  open copy:../../corpus/pdf-view/slides.pdf
+  open copy:"../fixtures/pdf-view-slides.pdf" as slides.pdf
   assert status is loaded (PDF, 3 pages)
   assert title is slides.pdf
   call tab-list {}
@@ -71,7 +73,7 @@ test issue 2245 a PDF opens in its view, drawn, with its bookmarks, zoom and pag
   call real-key {"key":"ctrl+w"}
 
 test issue 2245 text selects in reading order and copies as plain text
-  open copy:../../corpus/pdf-view/text.pdf
+  open copy:"../fixtures/pdf-view-text.pdf" as text.pdf
   call pdf-read {"until_drawn":[1],"until_text":[1]}
   call pointer-drag {"from":"pdf-text:1:start:Hello","to":"pdf-text:1:end:page."}
   call pdf-read {}
@@ -101,7 +103,7 @@ test issue 2245 text selects in reading order and copies as plain text
   call real-key {"key":"ctrl+w"}
 
 test issue 2245 Find searches every page and steps through the hits
-  open copy:../../corpus/pdf-view/text.pdf
+  open copy:"../fixtures/pdf-view-text.pdf" as text.pdf
   call pdf-read {"until_drawn":[1]}
   call real-key {"key":"ctrl+f"}
   call pdf-read {}
@@ -148,7 +150,7 @@ test issue 2245 Find searches every page and steps through the hits
   call real-key {"key":"ctrl+w"}
 
 test issue 2245 the PDF view never writes the PDF, and converts on request
-  open copy:../../corpus/pdf-view/text.pdf
+  open copy:"../fixtures/pdf-view-text.pdf" as text.pdf
   call pdf-read {"until_drawn":[1]}
   call real-key {"key":"ctrl+s"}
   call status-read {}
@@ -182,7 +184,7 @@ test issue 2245 the PDF view never writes the PDF, and converts on request
 
 test issue 2245 a PDF view moved to a new window goes on drawing there
   open ../fixtures/basic.docx
-  open copy:../../corpus/pdf-view/slides.pdf
+  open copy:"../fixtures/pdf-view-slides.pdf" as slides.pdf
   call pdf-read {"until_drawn":[1]}
   call window-new {}
   assert reply.window is 2

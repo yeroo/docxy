@@ -332,6 +332,14 @@ def main():
     for name in [*made, "vector", "rotated"]:
         references(os.path.join(OUT, f"{name}.pdf"), name)
     references(SOURCE_PDF, "source")
+    # pdf-view.uit opens only the harness's own files (uiharness/tests/
+    # cases.rs): byte-identical copies of the two it uses.
+    fixtures = os.path.join(ROOT, "uiharness", "fixtures")
+    for name in ("slides", "text"):
+        shutil.copyfile(
+            os.path.join(OUT, f"{name}.pdf"),
+            os.path.join(fixtures, f"pdf-view-{name}.pdf"),
+        )
 
 
 if __name__ == "__main__":
