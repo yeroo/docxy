@@ -4915,6 +4915,210 @@ mod tests {
         assert!(!has(&wb, "A2") && !has(&wb, "A3"));
     }
 
+    /// #1660: an absent cell inherits its row's style, else its column's.
+    #[test]
+    fn inherited_style_row_wins_over_column() {
+        let mut wb = pinned_wb(&[]);
+        let sh = &mut wb.sheets[0];
+        assert_eq!(sh.inherited_style(0, 1), 7, "column B");
+        assert_eq!(sh.inherited_style(2, 1), 5, "row 3 wins over column B");
+        assert_eq!(sh.inherited_style(2, 0), 5, "row 3");
+        assert_eq!(sh.inherited_style(0, 0), 0);
+        // A row without `customFormat`, or with `s="0"` or an unreadable
+        // `s`, styles nothing: the column's style shows through.
+        sh.row_attrs.insert(5, r#"s="5""#.to_string());
+        sh.row_attrs
+            .insert(6, r#"s="0" customFormat="1""#.to_string());
+        sh.row_attrs
+            .insert(7, r#"s="x" customFormat="true""#.to_string());
+        for r in 5..=7 {
+            assert_eq!(sh.inherited_style(r, 1), 7, "row {}", r + 1);
+            assert_eq!(sh.inherited_style(r, 0), 0, "row {}", r + 1);
+            assert!(!sh.pins_default(r, 0));
+        }
+        assert_eq!(
+            sh.copied_cell(0, 1),
+            Cell {
+                style: 7,
+                ..Cell::default()
+            }
+        );
+        sh.set_cell(0, 1, Cell::number(1.0));
+        assert_eq!(sh.copied_cell(0, 1), Cell::number(1.0));
+    }
+
+    /// #1660: a blank of exactly the style a slot inherits is the absence
+    /// written out, present slot or absent; any other blank is kept.
+    #[test]
+    fn set_cell_does_not_write_out_an_inherited_blank() {
+        let mut wb = pinned_wb(&[]);
+        let sh = &mut wb.sheets[0];
+        let blank = |style| Cell {
+            style,
+            ..Cell::default()
+        };
+        sh.set_cell(8, 1, blank(7));
+        assert!(sh.cell(8, 1).is_none(), "B9: column B's style");
+        sh.set_cell(8, 0, blank(7));
+        assert!(sh.cell(8, 0).is_some(), "A9: an unstyled column");
+        sh.set_cell(2, 1, blank(7));
+        assert!(sh.cell(2, 1).is_some(), "B3: row 3's style is 5");
+        sh.set_cell(2, 1, blank(5));
+        assert!(sh.cell(2, 1).is_none(), "B3 cleared to row 3's style");
+        // Over a present cell too: a typed B10 cleared to the column's style.
+        sh.set_cell(9, 1, Cell::number(1.0));
+        sh.set_cell(9, 1, blank(7));
+        assert!(sh.cell(9, 1).is_none());
+        // A blank default cell still never invents a pin, and one already
+        // there stays pinned (#1097).
+        sh.set_cell(10, 1, blank(0));
+        assert!(sh.cell(10, 1).is_none());
+        sh.set_cell(10, 1, Cell::number(1.0));
+        sh.set_cell(10, 1, blank(0));
+        assert!(sh.cell(10, 1).is_some());
+    }
+
+    /// #1660: Fill Down from an absent B1 over a typed B2 (style 0) in a
+    /// styled column leaves B2 as B1 is, absent, not a default-style pin.
+    #[test]
+    fn fill_down_from_absent_source_leaves_no_default_pin() {
+        let mut wb = pinned_wb(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "B2", Cell::number(1.0));
+        set(&mut eng, &mut wb, "A2", Cell::number(1.0));
+        let changes =
+            crate::edit::fill_changes(&wb.sheets[0], (1, 0, 1, 1), crate::edit::FillDir::Down);
+        assert_eq!(
+            changes[1],
+            (
+                1,
+                1,
+                Cell {
+                    style: 7,
+                    ..Cell::default()
+                }
+            ),
+            "B1 carries column B's style"
+        );
+        for (r, c, cell) in changes {
+            eng.set_cell(&mut wb, (0, r, c), cell);
+        }
+        assert!(!has(&wb, "B2"), "{:?}", wb.sheets[0].cell(1, 1));
+        assert!(!has(&wb, "A2"));
+    }
+
+    /// #1660: the fill handle dragged from an absent B1 over typed B2:B3.
+    #[test]
+    fn autofill_from_absent_source_leaves_no_default_pin() {
+        use crate::edit::{FillKind, FillReq, autofill};
+        let mut wb = pinned_wb(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "B2", Cell::number(1.0));
+        set(&mut eng, &mut wb, "B4", Cell::number(1.0));
+        autofill(&mut wb, 0, &FillReq::new((0, 1, 0, 1), (3, 1)));
+        assert!(!has(&wb, "B2") && !has(&wb, "B4"));
+        // B3 inherits row 3's 5, so B1's copy (column B's 7) is kept there.
+        assert_eq!(style_of(&wb, "B3"), 7);
+        // Without formatting, the values land in the style each absent
+        // destination inherits.
+        wb.sheets[0].cells.remove(&(2, 1));
+        set(&mut eng, &mut wb, "B1", Cell::number(4.0));
+        let req = FillReq {
+            kind: FillKind::WithoutFormatting,
+            ..FillReq::new((0, 1, 0, 1), (2, 1))
+        };
+        autofill(&mut wb, 0, &req);
+        assert_eq!(
+            (value_at(&wb, "B2"), style_of(&wb, "B2")),
+            (CellValue::Number(4.0), 7)
+        );
+        assert_eq!(
+            (value_at(&wb, "B3"), style_of(&wb, "B3")),
+            (CellValue::Number(4.0), 5)
+        );
+    }
+
+    /// #1660: copy an absent B1, paste it on a typed B2: B2 ends absent.
+    /// Values pasted into an absent cell keep the style it inherits.
+    #[test]
+    fn paste_of_absent_source_leaves_no_default_pin() {
+        use crate::edit::{ClipBlock, PasteSpec, PasteWhat, paste_special_changes};
+        let paste = |eng: &mut Engine, wb: &mut Workbook, at, clip: &ClipBlock, spec| {
+            for (r, c, cell) in paste_special_changes(wb, 0, at, clip, &spec).unwrap() {
+                eng.set_cell(wb, (0, r, c), cell);
+            }
+        };
+        let mut wb = pinned_wb(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "B2", Cell::number(1.0));
+        let clip = ClipBlock::capture(&wb, 0, vec![0], vec![1]);
+        assert_eq!(
+            clip.cells[0][0],
+            Cell {
+                style: 7,
+                ..Cell::default()
+            }
+        );
+        paste(&mut eng, &mut wb, (1, 1), &clip, PasteSpec::default());
+        assert!(!has(&wb, "B2"), "{:?}", wb.sheets[0].cell(1, 1));
+        // A1 = 3, pasted as values onto the absent B5: column B's style.
+        set(&mut eng, &mut wb, "A1", Cell::number(3.0));
+        let clip = ClipBlock::capture(&wb, 0, vec![0], vec![0]);
+        paste(
+            &mut eng,
+            &mut wb,
+            (4, 1),
+            &clip,
+            PasteSpec::of(PasteWhat::Values),
+        );
+        assert_eq!(
+            (value_at(&wb, "B5"), style_of(&wb, "B5")),
+            (CellValue::Number(3.0), 7)
+        );
+    }
+
+    /// #1660: B1 spills B1:B3 in a styled column; `x` typed in B2 blocks it
+    /// and is undone. The spill member's snapshot is absent, so the undo
+    /// leaves no default-style pin, under manual calculation too.
+    #[test]
+    fn undo_of_typed_spill_member_leaves_no_pin() {
+        for manual in [false, true] {
+            let mut wb = pinned_wb(&[]);
+            let mut eng = Engine::new(&wb);
+            set(&mut eng, &mut wb, "B1", array_formula("SEQUENCE(3)"));
+            assert_eq!(value_at(&wb, "B2"), CellValue::Number(2.0));
+            if manual {
+                wb.calc.mode = CalcMode::Manual;
+            }
+            let before = crate::sheet::snapshot_cells(&wb.sheets[0], &[(1, 1)], |_, _| false);
+            assert_eq!(before, vec![None]);
+            set(&mut eng, &mut wb, "B2", Cell::text("x"));
+            let undo: Vec<_> = before.into_iter().map(|c| (1, 1, c)).collect();
+            eng.restore_snapshot(&mut wb, 0, &undo);
+            let b2 = wb.sheets[0].cell(1, 1);
+            assert!(
+                b2.is_none_or(|c| !c.is_blank()),
+                "manual {manual}: B2 is {b2:?}"
+            );
+            if !manual {
+                assert_eq!(value_at(&wb, "B2"), CellValue::Number(2.0));
+            }
+        }
+        // A styled member still snapshots as its styled blank.
+        let mut wb = pinned_wb(&[]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "A1", array_formula("SEQUENCE(3)"));
+        eng.set_styles(&mut wb, 0, &[(1, 0, 9)]);
+        let snap = crate::sheet::snapshot_cells(&wb.sheets[0], &[(1, 0)], |_, _| false);
+        assert_eq!(
+            snap,
+            vec![Some(Cell {
+                style: 9,
+                ..Cell::default()
+            })]
+        );
+    }
+
     #[test]
     fn set_styles_leaves_no_blank_cells() {
         let mut wb = wb_one_sheet(&[("A1", Cell::number(5.0))]);

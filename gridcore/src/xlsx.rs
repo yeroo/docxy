@@ -14468,6 +14468,33 @@ mod tests {
         assert!(xml.contains(r#"<c r="B1""#), "{xml}");
     }
 
+    /// #1660: Fill Down from an absent B1 over a typed B2 in a styled column
+    /// saves no `<c r="B2" s="0"/>` pin: B2 reloads absent, as B1 is.
+    #[test]
+    fn fill_down_from_an_absent_cell_saves_no_default_pin() {
+        let mut pkg = new_xlsx();
+        pkg.workbook.sheets[0].col_defs.push(crate::sheet::ColDef {
+            min: 1,
+            max: 1,
+            width: Some(9.0),
+            attrs: r#"style="7""#.to_string(),
+            default_width: false,
+            plain_width: false,
+        });
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 1, 1), Cell::number(1.0));
+        let sheet = &pkg.workbook.sheets[0];
+        let fill = crate::edit::fill_changes(sheet, (1, 1, 1, 1), crate::edit::FillDir::Down);
+        for (r, c, cell) in fill {
+            eng.set_cell(&mut pkg.workbook, (0, r, c), cell);
+        }
+        let back = load_xlsx(&save_xlsx(&pkg)).unwrap();
+        assert!(!back.workbook.sheets[0].cells.contains_key(&(1, 1)));
+        let part = back.sheet_parts[0].clone();
+        let xml = String::from_utf8(back.part(&part).unwrap().to_vec()).unwrap();
+        assert!(!xml.contains(r#"<c r="B2""#), "{xml}");
+    }
+
     /// #1064: Excel 2013+ writes `<x15:workbookPr chartTrackingRefBase>` in
     /// extLst; it must not reset the date system the real workbookPr set.
     #[test]

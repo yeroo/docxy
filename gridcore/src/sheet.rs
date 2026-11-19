@@ -257,7 +257,9 @@ pub fn array_block(cell: &Cell) -> Option<(u32, u32, u32, u32)> {
 
 /// Undo/redo snapshots of the cells at `keys` as the sheet holds them now: a
 /// plain cell inside the spill of a live anchor is spill output, and is
-/// snapshotted as a blank ([`Cell::blank_like`]) the anchor re-spills over.
+/// snapshotted as a blank ([`Cell::blank_like`]) the anchor re-spills over,
+/// or as absent (`None`) when it has the default style, so a restore under
+/// a row or column style leaves no default-style pin (#1660).
 /// Put back as a plain value it would block the anchor with `#SPILL!` (the
 /// engine drops a submitted extent and recomputes it). An anchor `frozen`
 /// reports as kept on its cached values (asked only of anchors over a key)
@@ -286,11 +288,13 @@ pub fn snapshot_cells(
                         && c < ac + w
                         && *live.entry((ar, ac)).or_insert_with(|| !frozen(ar, ac))
                 });
-            Some(if spilled {
-                cell.blank_like()
-            } else {
-                cell.clone()
-            })
+            match spilled {
+                // Spill output in an unstyled cell is absent to the user: put
+                // back blank, a row or column style would pin it (#1660).
+                true if cell.style == 0 => None,
+                true => Some(cell.blank_like()),
+                false => Some(cell.clone()),
+            }
         })
         .collect()
 }
@@ -516,6 +520,13 @@ pub(crate) fn xml_attr<'a>(s: &'a str, name: &str) -> Option<&'a str> {
         .into_iter()
         .find(|(n, _, _)| *n == name)
         .map(|(_, v, _)| v)
+}
+
+/// A row's `s` or a column's `style` as a style index: `None` when absent,
+/// 0 or unreadable, which is the default style.
+fn style_index(v: Option<&str>) -> Option<u32> {
+    v.and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|&s| s != 0)
 }
 
 /// `s` with attribute `name` set to `value` (in place when present, else
@@ -1686,27 +1697,67 @@ impl Sheet {
         self.cells.get(&(row, col))
     }
 
+    /// The style row `row` gives its absent cells: its `s` when the row has
+    /// `customFormat` and an `s` other than 0 (#1660).
+    pub fn row_style(&self, row: u32) -> Option<u32> {
+        let a = self.row_attrs.get(&row)?;
+        if !matches!(xml_attr(a, "customFormat"), Some("1" | "true")) {
+            return None;
+        }
+        style_index(xml_attr(a, "s"))
+    }
+
+    /// The style column `col` gives its absent cells: the `style` of a
+    /// `<col>` covering it, or 0 (#1660).
+    pub fn col_style(&self, col: u32) -> u32 {
+        self.col_defs
+            .iter()
+            .filter(|d| (d.min..=d.max).contains(&col))
+            .find_map(|d| style_index(xml_attr(&d.attrs, "style")))
+            .unwrap_or(0)
+    }
+
+    /// The style an absent cell at `(row, col)` shows and takes when typed
+    /// into: its row's ([`Sheet::row_style`]), else its column's
+    /// ([`Sheet::col_style`]), else 0. A row's style wins over a column's,
+    /// as where Excel makes a new cell in a formatted row (#1660).
+    pub fn inherited_style(&self, row: u32, col: u32) -> u32 {
+        self.row_style(row).unwrap_or_else(|| self.col_style(col))
+    }
+
+    /// The cell at `(row, col)` as a copy or fill reads it: the cell held
+    /// there, or a blank with the style the absent cell inherits
+    /// ([`Sheet::inherited_style`]), so pasting it means "as if absent"
+    /// rather than a default-style pin (#1660).
+    pub fn copied_cell(&self, row: u32, col: u32) -> Cell {
+        self.cell(row, col).cloned().unwrap_or_else(|| Cell {
+            style: self.inherited_style(row, col),
+            ..Cell::default()
+        })
+    }
+
     /// Does an explicit default-style cell at `(row, col)` matter? True when
     /// the row has a style (`customFormat` with an `s` other than 0) or a
     /// `<col>` covering the column does: the cell then overrides what it
     /// would inherit, so a save must keep it (#1064).
     pub fn pins_default(&self, row: u32, col: u32) -> bool {
-        let styled = |s: Option<&str>| s.is_some_and(|s| s.trim() != "0");
-        self.row_attrs.get(&row).is_some_and(|a| {
-            matches!(xml_attr(a, "customFormat"), Some("1" | "true")) && styled(xml_attr(a, "s"))
-        }) || self
-            .col_defs
-            .iter()
-            .any(|d| (d.min..=d.max).contains(&col) && styled(xml_attr(&d.attrs, "style")))
+        self.inherited_style(row, col) != 0
     }
 
     /// Set (or clear, when the cell is blank and unstyled) a cell. A blank
     /// default-style cell that is already there stays when its row or column
     /// has a style ([`Sheet::pins_default`]); one written over an absent cell
-    /// never invents a pin.
+    /// never invents a pin. A blank of exactly the style the slot inherits
+    /// from its row or column is the absence written out, and is never
+    /// stored (#1660).
     pub fn set_cell(&mut self, row: u32, col: u32, cell: Cell) {
-        if cell.is_blank() && cell.style == 0 {
-            if !(self.cells.contains_key(&(row, col)) && self.pins_default(row, col)) {
+        if cell.is_blank() {
+            let drop = if cell.style == 0 {
+                !(self.cells.contains_key(&(row, col)) && self.pins_default(row, col))
+            } else {
+                cell.style == self.inherited_style(row, col)
+            };
+            if drop {
                 self.cells.remove(&(row, col));
                 return;
             }
@@ -3257,7 +3308,8 @@ mod tests {
                 ..Cell::default()
             })
         );
-        assert_eq!(snap[2], Some(Cell::default()));
+        // Unstyled spill output is absent to the user (#1660).
+        assert_eq!(snap[2], None);
         assert_eq!(snap[3], Some(Cell::number(4.0)));
         assert_eq!(snap[4], Some(Cell::number(8.0))); // a frozen anchor's value
         assert_eq!(snap[5], None);

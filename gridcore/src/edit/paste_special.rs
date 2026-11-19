@@ -270,11 +270,21 @@ impl ClipBlock {
         let Some(s) = wb.sheets.get(sheet) else {
             return ClipBlock::default();
         };
+        // An absent cell is read with the style it inherits from its row or
+        // column (#1660), each looked up once, not per cell.
+        let col_styles: Vec<u32> = cols.iter().map(|&c| s.col_style(c)).collect();
         let cells = rows
             .iter()
             .map(|&r| {
+                let row_style = s.row_style(r);
                 cols.iter()
-                    .map(|&c| s.cell(r, c).cloned().unwrap_or_default())
+                    .zip(&col_styles)
+                    .map(|(&c, &cs)| {
+                        s.cell(r, c).cloned().unwrap_or_else(|| Cell {
+                            style: row_style.unwrap_or(cs),
+                            ..Cell::default()
+                        })
+                    })
                     .collect()
             })
             .collect();
@@ -612,7 +622,8 @@ pub fn paste_special_changes(
             if spec.skip_blanks && src.is_blank() {
                 continue;
             }
-            let d = s.cell(dest.0, dest.1).cloned().unwrap_or_default();
+            // An absent destination keeps the style it inherits (#1660).
+            let d = s.copied_cell(dest.0, dest.1);
             let style = match spec.what {
                 PasteWhat::All
                 | PasteWhat::AllAndColumnWidths

@@ -223,7 +223,8 @@ pub fn fill_changes(
 ) -> Vec<(u32, u32, Cell)> {
     let mut changes = Vec::new();
     let mut copy_from = |sr: u32, sc: u32, tr: u32, tc: u32| {
-        let mut cell = sheet.cell(sr, sc).cloned().unwrap_or_default();
+        // An absent source carries the style it inherits (#1660).
+        let mut cell = sheet.copied_cell(sr, sc);
         copy_meta(&mut cell);
         if let Some(f) = &cell.formula {
             if let Some(t) = translate_formula(f, tr as i64 - sr as i64, tc as i64 - sc as i64) {
@@ -785,8 +786,12 @@ pub fn autofill(wb: &mut Workbook, sheet: usize, req: &FillReq) -> Option<Filled
             };
             let (mut cell, from_style) = match out {
                 series::LineOut::Copy(j) => {
-                    let mut cell = srcvals[j].clone().unwrap_or_default();
                     let (fr, fc) = pos[j];
+                    // An absent source carries the style it inherits (#1660).
+                    let mut cell = srcvals[j].clone().unwrap_or_else(|| Cell {
+                        style: s.inherited_style(fr, fc),
+                        ..Cell::default()
+                    });
                     rebase(
                         &mut cell,
                         i64::from(r) - i64::from(fr),
@@ -810,7 +815,7 @@ pub fn autofill(wb: &mut Workbook, sheet: usize, req: &FillReq) -> Option<Filled
                 }
                 // The series' values in the destination's own style.
                 FillKind::WithoutFormatting => {
-                    cell.style = here.map_or(0, |h| h.style);
+                    cell.style = here.map_or_else(|| s.inherited_style(r, c), |h| h.style);
                 }
                 _ => {}
             }
