@@ -683,3 +683,24 @@ A batch from #1989 and #1930 (plan-2), import only.
     keeps the body's width.
   - The suite's `list_markers` restarts its count at an item's unnumbered
     continuation (a follow-up).
+
+## HTML mail as Word draws it (#2249)
+
+- Hidden text: `display:none` / `mso-hide:all` make the runs `vanish`
+  and now the paragraph mark too (`mark_rpr` copies `vanish`), so a
+  preheader block is hidden whole. The suite collapses such a paragraph
+  (see `docs/claude/suite-extensions.md`).
+- `text-decoration:none` keeps an explicit `<w:u w:val="none"/>` in the
+  run's `raw_props` (with `underline` false), so a link styled as plain
+  text loses the link's own underline in the view, as in Word.
+  `text-decoration:underline`, `<u>` and `<ins>` drop it again.
+- An inline `background` was already run shading (`w:shd`); the view
+  now paints it.
+- Column widths: a column without a width that no colspan-1 cell sits in
+  (only a span or an empty slot reaches it, e.g. a one-cell row over a
+  `colspan=2` footer) gets `MIN_COL`, and the content columns share the
+  rest. When every unknown column is bare, they share it evenly as before.
+- Tests: `hidden_text_is_vanish`,
+  `text_decoration_none_is_an_explicit_no_underline_2249` and
+  `card_tests::a_column_only_a_span_reaches_takes_next_to_no_width_2249`
+  in `import/html.rs`.

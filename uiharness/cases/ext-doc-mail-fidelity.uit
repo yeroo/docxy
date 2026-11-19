@@ -1,0 +1,28 @@
+# Imported mail drawn as Word draws it (#2249): hidden text (a preheader's
+# `display:none`) takes no line and draws nothing, while formatting marks are
+# off. An inline `background` paints its band, as a highlight does.
+ext fixture
+
+test issue 2249 a hidden preheader draws nothing
+  call theme-set {"theme":"light"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-load {"html": "<body><div style='display:none;max-height:0;overflow:hidden'>Preview text</div><p style='margin:0'>Hello</p></body>"}
+  shot window
+  call ext-doc-layout {}
+  assert reply.painted is true
+  assert reply.paragraphs.1.lines.0.text is Hello
+  assert reply.paragraphs.0.height is 0
+  assert reply.paragraphs.1.top is 0
+
+test issue 2249 an inline background paints its band as a highlight does
+  call theme-set {"theme":"light"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call ext-doc-load {"html": "<body><p style='margin:0'><span style='background:cyan'>Next step:</span> plain</p></body>"}
+  shot window
+  call ext-doc-layout {}
+  assert reply.paragraphs.0.highlights.0.text is Next step:
+  assert reply.paragraphs.0.highlights.0.fill is 00ffff

@@ -482,6 +482,21 @@ fn column_widths(spec: &TableSpec, placed: &[Placed], ncols: usize, avail: u32) 
             col[c] = Some(col[c].unwrap_or(0) + add);
         }
     }
+    // A column no colspan-1 cell sits in (only a span or an empty slot
+    // reaches it, such as a card's `colspan=2` footer under a one-cell row)
+    // holds nothing of its own: a browser and Word give it next to no width,
+    // so the columns with content share the rest (#2249). When every column
+    // left is bare, they share it as before.
+    let has_own: Vec<bool> = (0..ncols)
+        .map(|c| single.iter().any(|p| p.col == c))
+        .collect();
+    if (0..ncols).any(|c| col[c].is_none() && has_own[c]) {
+        for c in 0..ncols {
+            if col[c].is_none() && !has_own[c] {
+                col[c] = Some(MIN_COL);
+            }
+        }
+    }
     let known: u32 = col.iter().flatten().sum();
     let unknown = col.iter().filter(|c| c.is_none()).count() as u32;
     let width = match declared {

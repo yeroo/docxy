@@ -932,3 +932,20 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   from a page's own button, both ways), and a document tab. No case types
   a key under File after the action: none has an effect a case can read
   on these pages (an extension's page skips File's scroll keys).
+
+## Imported mail as Word draws it (#2249)
+
+- `paragraph_el` draws a hidden run (`vanish`) only while formatting
+  marks are shown (`skip_hidden_run`: nothing drawn, its offsets counted,
+  the caret drawn where it falls), and `run_w` measures it as 0.
+- A paragraph whose runs and mark are all hidden collapses (no height,
+  spacing or margin) while marks are off and the caret is not in it, as
+  Word draws an imported preheader.
+- Run shading (`w:shd` fill, `run_shading`) paints the highlight band
+  (`run_highlight`; a highlight wins), with a dark or light ink by the
+  fill's luminance; the layout dump lists it under `highlights`.
+- A link run with an explicit `<w:u w:val="none"/>` (`underline_off`)
+  draws without the link underline.
+- Tests: `link_colour_tests::run_shading_paints_a_band_2249`,
+  `an_explicit_no_underline_is_read_2249`, and
+  `uiharness/cases/ext-doc-mail-fidelity.uit`.
