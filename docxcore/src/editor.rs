@@ -1939,6 +1939,10 @@ impl Editor {
         if self.select_loose_field(true) {
             return;
         }
+        // The author's own pending field or picture insertion (#1625).
+        if self.remove_own_pending_object(true) {
+            return;
+        }
         if self.caret.offset > 0 {
             let off = self.caret.offset;
             if self.select_field_unit(off - 1) {
@@ -2004,6 +2008,10 @@ impl Editor {
         }
         // Before a loose field's begin, even at a paragraph end (#1240).
         if self.select_loose_field(false) {
+            return;
+        }
+        // The author's own pending field or picture insertion (#1625).
+        if self.remove_own_pending_object(false) {
             return;
         }
         let off = self.caret.offset;
@@ -5144,11 +5152,15 @@ fn content_insert_with(content: &mut Vec<Inline>, o: usize, ch: char, typing: bo
         return;
     };
     // Typed at a loose field's end: after its end run, not into its result
-    // (#1240). Replace's edits stay in the inline holding them.
+    // (#1240); and after a pending picture or field insertion, which takes no
+    // offset until accepted (#1625). Replace's edits stay in the inline
+    // holding them.
     let width = inline_len(&content[i]);
     let after = if width == 0 { i } else { i + 1 };
     if typing && local == width {
-        if let Some(at) = loose_fields::past_field_ends(content, after) {
+        let past = loose_fields::past_field_ends(content, after)
+            .max(track::past_pending_objects(content, after));
+        if let Some(at) = past {
             let props = source_before(content, at)
                 .or_else(|| source_from(content, at))
                 .map(RunProps::continued)

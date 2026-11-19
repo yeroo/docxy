@@ -99,6 +99,15 @@ comment-marker id in the document.
   becomes one insertion per stretch, each with its own `w:id`, so a reload
   lists the same revisions. Text loaded from a file keeps its `Inline::Revision` wrapper instead, so
   loaded `w:ins` text is still not addressable by the caret.
+  An inline picture (#1242) or a field (#1625; Insert Field, Date & Time, a
+  paste) inserted while tracking goes in a `<w:ins>` of its own, with an id of
+  its own, zero-width until accepted: Reject removes it, Accept leaves it
+  live. A field is written in it as run-level XML (a `w:fldSimple` becomes the
+  complex field's runs); one whose result holds a link goes in live and
+  unrecorded. Text typed right after such a pending object insertion goes
+  after it, and the author's own Backspace or Delete next to it removes it
+  outright (one undo step, no `w:del`); another author's stays. F9 and Edit
+  Field do not reach a pending field until it is accepted.
 - **Deletions** (Backspace, Delete, Cut, a selection) move the text into a
   `<w:del>` with `<w:delText>`; the editor counts it as zero-width, so the caret
   steps over it, and adjacent deletions by the author merge into one (a
@@ -106,7 +115,9 @@ comment-marker id in the document.
   #1470). A field is written as run-level XML in it (`w:delInstrText`,
   `w:delText`; a `w:fldSimple` becomes begin/instruction/separate/result/end
   runs) that Reject restores. A field with a link or other paragraph-level
-  content in its result stays, as an equation does.
+  content in its result stays, as an equation does. A field inside a loaded
+  `<w:del>` (`w:delInstrText`, `w:delText`, as Word writes one) loads as one
+  field, so a reload and Reject restore a live field (#1625).
   Deleting text inside the author's own insertion removes it outright, as Word
   does. Text deleted inside a hyperlink is recorded inside the link, each
   `<w:del>` on its own side of the link's boundary (#1462).
@@ -174,8 +185,11 @@ using a prefix the two documents bind differently is dropped (reported as skippe
 (`w:fldSimple`) inside an insertion or deletion is written as the equivalent
 complex field, since tracked-change wrappers hold only run-level content. What cannot be expressed is reported as skipped: a table
 whose shape changed (kept as revised), a deleted object or hyperlink target
-that references the original package, a deleted note reference, and input
-revisions that cannot be accepted (moves, custom-XML ranges, cell records).
+that references the original package, a field whose result holds a link or
+other paragraph-level content (deleted: dropped from the result; inserted:
+written outside the `w:ins`, unmarked; both `object`, #1625), a deleted note
+reference, and input revisions that cannot be accepted (moves, custom-XML
+ranges, cell records).
 
 ## Interoperability evidence
 

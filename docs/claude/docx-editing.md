@@ -427,3 +427,21 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   margin is the host's, `DocView::set_page_inset` (#2003): #1987 checks
   an Outlook-like 20 px inset on this mail
   (`docs/claude/suite-extensions.md`).
+
+## Fields inside tracked changes (#1625)
+
+- Load: a field inside a `w:del` (`w:delInstrText`, `w:delText`) collapses to
+  one `Inline::Field` like a live one (`load.rs` `is_field_code_run`; the
+  editor's `is_field_code_raw` for #1240 loose fields is unchanged). Part of
+  a field in a `w:del`, or one interrupted by another revision, stays loose.
+- Tracked insertion: `clip_for_insertion` wraps each field (and picture,
+  #1242) in a `w:ins` of its own (`record_inserted_objects`), the field as
+  `compare::run_level_field`. Such a "pending object insertion"
+  (`track::is_pending_object`) is zero-width: typing at it goes after it
+  (`past_pending_objects`, beside `past_field_ends`), a paste already lands
+  after it, and the tracking author's Backspace/Delete next to it removes it
+  (`remove_own_pending_object`). The terminal renderer still draws the caret
+  at that offset before the object (the first of its two visual stops).
+- Compare: a field failing `is_run_level(run_level_field(..))` is never in a
+  `w:ins`/`w:del`: deleted, it is skipped; inserted, `emit_wrapped` lifts it
+  out like a marker. Both report `CompareSkip::Object`.
