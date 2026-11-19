@@ -1909,9 +1909,7 @@ fn pdf_read(app: &crate::Docxy, args: &Json) -> Result<Done, String> {
     let settled = drawn
         .iter()
         .all(|p| *p >= n || v.rasters[*p].is_some() || v.failed.contains_key(p))
-        && text
-            .iter()
-            .all(|p| *p >= n || v.texts[*p].is_some() || v.text_failed.contains_key(p))
+        && text.iter().all(|p| !v.text_owed(*p))
         && (!idle
             || (!v.busy()
                 && !v.copy_waits()

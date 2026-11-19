@@ -50,13 +50,19 @@ pub(crate) fn is_pdf_file(path: &Path) -> bool {
 /// document, which says why). A PDF whose pages the worker cannot read is a
 /// failed tab that says why.
 pub(crate) fn pdf_view_tab(path: &Path, at: Option<PdfAt>) -> Option<DocTab> {
+    pdf_view_tab_with(path, at, Spawn::default_for_process())
+}
+
+/// [`pdf_view_tab`] with its worker started by `spawn` (the tests' failing
+/// one).
+pub(crate) fn pdf_view_tab_with(path: &Path, at: Option<PdfAt>, spawn: Spawn) -> Option<DocTab> {
     if !is_pdf_file(path) {
         return None;
     }
     let mut tab = blank_docx_tab(&file_name(path));
     tab.kind = Kind::Pdf;
     tab.path = Some(path.to_path_buf());
-    match PdfView::open(path, Spawn::default_for_process()) {
+    match PdfView::open(path, spawn) {
         Ok(mut v) => {
             tab.status = loaded_status(v.page_count()).into();
             if let Some(at) = at {
@@ -125,6 +131,14 @@ pub(crate) const PENDING: &str = "not opened yet: it opens when you open its tab
 /// failed pending tab is not retried every frame). A file that reads but is
 /// no PDF any more opens as a document would.
 pub(crate) fn finish_pending_pdf(tab: &mut DocTab, at: PdfAt) {
+    finish_pending_pdf_with(tab, at, Spawn::default_for_process());
+}
+
+/// [`finish_pending_pdf`] with its worker started by `spawn`. A worker that
+/// cannot read the file keeps the tab pending where it was, as an
+/// unreadable file does: the session keeps its place, and the next
+/// activation tries again.
+pub(crate) fn finish_pending_pdf_with(tab: &mut DocTab, at: PdfAt, spawn: Spawn) {
     let Some(path) = tab.path.clone() else {
         return;
     };
@@ -135,7 +149,13 @@ pub(crate) fn finish_pending_pdf(tab: &mut DocTab, at: PdfAt) {
         return;
     }
     let title = tab.title.clone();
-    let fresh = match pdf_view_tab(&path, Some(at)) {
+    let fresh = match pdf_view_tab_with(&path, Some(at), spawn) {
+        Some(fresh) if matches!(fresh.surface, Surface::Placeholder) => {
+            tab.surface = Surface::PdfPending(at);
+            tab.load_failed = true;
+            tab.status = fresh.status;
+            return;
+        }
         Some(fresh) => fresh,
         None => {
             load_doc_for_tab(&path, None).into_tab(Kind::Docx, title.clone(), Some(path), false)

@@ -68,9 +68,11 @@ Notes for the suite's PDF view: opening a PDF as it looks, read-only.
   conversion is (#633): a startup starts no worker for a tab behind, and a
   pending tab persists its `PdfAt` unchanged. When it comes in front a file
   that cannot be read keeps it pending with `load_failed` and a `read
-  error` (the session keeps its place; the next activation, `select_tab`,
-  tries again, never each frame); a file that reads but is no PDF any more
-  opens as a document. Every `Kind::Pdf` tab (open,
+  error` (the session keeps its place; the next activation tries again,
+  never each frame), and so does a worker that cannot read it; a file that
+  reads but is no PDF any more opens as a document. Every way a tab comes
+  in front (`select_tab`, a reopen's focus, a close, a failed New Window)
+  goes through `activate_pending`. Every `Kind::Pdf` tab (open,
   failed, pending) has the File-only ribbon (`ribbon_tab_set`), the PDF
   status hint and the Save refusals.
 - Find searches a page when its text comes in and splices its hits in page

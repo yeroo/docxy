@@ -437,10 +437,7 @@ impl PdfView {
                 .is_some_and(|c| same_scale(c.scale, scale));
             (!have).then_some(Op::Pixels { page: p, scale })
         };
-        let text = |p: usize| -> Option<Op> {
-            (p < self.page_count() && self.texts[p].is_none() && !self.text_failed.contains_key(&p))
-                .then_some(Op::Text { page: p })
-        };
+        let text = |p: usize| -> Option<Op> { self.text_owed(p).then_some(Op::Text { page: p }) };
         if let Some(op) = showing.clone().find_map(pixels) {
             return Some(op);
         }
@@ -802,8 +799,8 @@ impl PdfView {
                         parts.push(t.text_of(r));
                     }
                 }
-                None if self.text_failed.contains_key(&p) => {}
-                None => return None,
+                None if self.text_owed(p) => return None,
+                None => {}
             }
         }
         Some(parts.join("\n"))
@@ -854,7 +851,13 @@ impl PdfView {
         let n = self.page_count();
         (a.page..=b.page.min(n.saturating_sub(1)))
             .take_while(|p| *p < n)
-            .any(|p| self.texts[p].is_none() && !self.text_failed.contains_key(&p))
+            .any(|p| self.text_owed(p))
+    }
+
+    /// Whether page `p`'s text is still to come: not read, and not failed
+    /// (a failed page counts as read everywhere). `false` past the end.
+    pub(crate) fn text_owed(&self, p: usize) -> bool {
+        self.texts.get(p).is_some_and(Option::is_none) && !self.text_failed.contains_key(&p)
     }
 
     /// Text is still needed for a selection: ask for it.
@@ -937,7 +940,7 @@ impl PdfView {
     /// Pages Find has not read yet.
     pub(crate) fn unread_pages(&self) -> usize {
         (0..self.page_count())
-            .filter(|p| self.texts[*p].is_none() && !self.text_failed.contains_key(p))
+            .filter(|p| self.text_owed(*p))
             .count()
     }
 

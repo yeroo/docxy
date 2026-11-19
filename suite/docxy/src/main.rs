@@ -12826,6 +12826,18 @@ fn finish_pending_conversion(tab: &mut DocTab) {
     tab.access.converted = tab.access.converted.or(l.converted);
 }
 
+/// A tab comes in front (#633, #2245): a pending conversion converts, a
+/// restored PDF tab opens, and one whose file or worker failed at its last
+/// activation tries again. Every way a tab becomes the active one calls
+/// this: `select_tab`, a reopen that focuses an open tab, a close that
+/// leaves another in front, a New Window that could not open.
+fn activate_pending(tab: &mut DocTab) {
+    if matches!(tab.surface, Surface::PdfPending(_)) {
+        tab.load_failed = false;
+    }
+    finish_pending_conversion(tab);
+}
+
 /// A converted tab restored from the session, not converted yet (#633): a
 /// placeholder until it is first drawn as the active tab.
 fn pending_conversion(kind: open_mode::Converted) -> Loaded {
@@ -19769,6 +19781,9 @@ impl Docxy {
                         self.tabs.insert((at + k).min(self.tabs.len()), t);
                     }
                     self.active = previous_active.min(self.tabs.len().saturating_sub(1));
+                    if let Some(t) = self.tabs.get_mut(self.active) {
+                        activate_pending(t);
+                    }
                     self.drop_grid_state();
                     self.bs_info_status = None;
                 }
@@ -27350,13 +27365,9 @@ impl Docxy {
         if i < self.tabs.len() {
             self.active = i;
             // A converted tab restored from the session converts as it comes
-            // in front, before any input can reach its placeholder (#633).
-            // A restored PDF tab whose file could not be read tries again
-            // (#2245).
-            if matches!(self.tabs[i].surface, Surface::PdfPending(_)) {
-                self.tabs[i].load_failed = false;
-            }
-            finish_pending_conversion(&mut self.tabs[i]);
+            // in front, before any input can reach its placeholder (#633);
+            // a restored PDF tab opens, or tries again (#2245).
+            activate_pending(&mut self.tabs[i]);
             self.tab_more_open = false;
             self.bs_info_status = None;
             // Same reason as `select_sheet`: these all index the document we
@@ -28465,7 +28476,11 @@ impl Docxy {
                 self.tabs[i].dialogs.push(reopen_dialog(&path, mode));
                 return Ok(false);
             }
-            ReopenStep::Focus => false,
+            ReopenStep::Focus => {
+                // In front again: a pending tab opens or tries again (#2245).
+                activate_pending(&mut self.tabs[i]);
+                false
+            }
         };
         if let Some(p) = records_open(&self.tabs[i]).filter(|_| recent) {
             self.note_recent(&p);

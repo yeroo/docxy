@@ -447,12 +447,28 @@ fn a_restored_pdf_tab_whose_file_is_gone_or_changed() {
     // The file is back: the next activation opens it.
     let slides = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pdf-view/slides.pdf");
     std::fs::copy(slides, &gone).unwrap();
-    tab.load_failed = false;
-    finish_pending_conversion(&mut tab);
+    crate::activate_pending(&mut tab);
     let Surface::Pdf(v) = &tab.surface else {
         panic!("not opened: {}", tab.status)
     };
     assert_eq!((v.restore_page, v.zoom), (Some(2), 1.5));
+    // FIX r4: a worker that cannot start keeps it pending where it was too,
+    // and the next activation tries again.
+    let mut tab = crate::pdf_view::host::pending_pdf_tab(&gone, "gone.pdf", at);
+    let no_worker = crate::pdf_view::worker::Spawn::Command(std::sync::Arc::new(|| {
+        std::process::Command::new("/nonexistent/docxy-pdf-worker")
+    }));
+    crate::pdf_view::host::finish_pending_pdf_with(&mut tab, at, no_worker);
+    assert!(tab.load_failed);
+    assert!(tab.status.starts_with("load error"), "{}", tab.status);
+    assert!(matches!(tab.surface, Surface::PdfPending(a) if a == at));
+    assert_eq!(
+        crate::pdf_view::host::pdf_at(&tab),
+        Some(at),
+        "the place is kept"
+    );
+    crate::activate_pending(&mut tab);
+    assert!(matches!(tab.surface, Surface::Pdf(_)), "{}", tab.status);
     // A file that is no PDF any more opens as a document would.
     let changed = write(&dir, "changed.pdf", RTF);
     let mut tab = crate::pdf_view::host::pending_pdf_tab(&changed, "changed.pdf", at);

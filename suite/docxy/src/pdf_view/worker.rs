@@ -548,6 +548,7 @@ pub(crate) struct Worker {
     slot: Slot,
     next_id: u64,
     /// Children started so far (the tests' respawn check).
+    #[cfg(test)]
     pub(crate) started: usize,
 }
 
@@ -560,6 +561,7 @@ impl Worker {
             conn: None,
             slot: Arc::default(),
             next_id: 0,
+            #[cfg(test)]
             started: 0,
         }
     }
@@ -580,7 +582,10 @@ impl Worker {
                 .start()
                 .map_err(|e| format!("the PDF reader could not start: {e}"))?;
             self.conn = Some(conn);
-            self.started += 1;
+            #[cfg(test)]
+            {
+                self.started += 1;
+            }
         }
         self.next_id += 1;
         let id = self.next_id;
