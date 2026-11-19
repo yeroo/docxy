@@ -414,10 +414,13 @@ fn run_child(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(err_file));
-    let Limited { mut child, .. } = match spawn_limited(cmd, memory) {
+    // Bound whole, not destructured with `..`: the Windows job must live
+    // until the child is done (closing it kills the child).
+    let mut limited = match spawn_limited(cmd, memory) {
         Ok(limited) => limited,
         Err(e) => return cannot_start(e),
     };
+    let child = &mut limited.child;
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
