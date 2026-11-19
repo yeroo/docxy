@@ -1189,6 +1189,7 @@ fn a_restore_without_a_sidecar_takes_the_fresh_load_s_mark() {
         binary_source: false,
         compat: false,
         pdf_view: None,
+        ext_kind: None,
     };
     // Repaired since the session was saved: a normal, saveable document.
     let mut t = restore_tab(&persisted(&good));
@@ -1616,6 +1617,7 @@ fn persisted_tab(
         binary_source: false,
         compat: false,
         pdf_view: None,
+        ext_kind: None,
     }
 }
 

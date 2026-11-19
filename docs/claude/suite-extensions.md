@@ -962,3 +962,77 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
 - Tests: `link_colour_tests::run_shading_paints_a_band_2249`,
   `an_explicit_no_underline_is_read_2249`, and
   `uiharness/cases/ext-doc-mail-fidelity.uit`.
+
+## Further extension tab kinds (#2253)
+
+- `ext::Extensions::kinds` is a list of `ext::ExtKind` (`#[non_exhaustive]`,
+  built with `ExtKind::new(id, name, sub, title, factory)` and `.icon`,
+  `.accent(light, dark)`): a stable id, a File > New card (name, subtitle),
+  a tab title the surface's `title()` overrides, an icon (a `RibbonIcon`,
+  drawn as a mask, registered as `ext/<hash>` by `ext_ribbon::register_icon`)
+  and an accent (`0xRRGGBB` light and dark; `None` is the brand, as Mail).
+  `Extensions` gained a field without `#[non_exhaustive]`: an outside
+  struct literal names `kinds` or `..Default::default()`.
+- `ext::install` validates (`ext_kinds::validate`): an id that is empty,
+  not `[a-z0-9._-]+`, one of the suite's own (`docx`, `xlsx`, `project`,
+  `mail`, `look`, `help`, `pdf`) or a repeat is left out, said on stderr
+  and in the crash log (`crashlog::startup`), as a plugin that does not
+  load.
+- A tab of one is `Kind::Ext(ExtId)`: `ExtId` is the id interned
+  (`plugin_ui::intern`), so `Kind` stays `Copy` and compares with no lock.
+  The interner is the only process-wide state. Which kinds are registered
+  (name, label, sub, title, icon, accent, factory) is `ext::Installed`, a
+  gpui global per App (`ext_kinds::registered`, `find`): parallel tests
+  never see each other's kinds. Everything that names an Ext kind's look
+  takes `cx`: `accent::for_tab` and `label_for` (the name lowercased; the
+  id when not registered; their cores `for_tab_in`/`label_in` take the
+  lookup, for tests), `Docxy::accent_now(cx)`, the chip and the card.
+  `accent::for_kind` and `label` stay for the built-ins (Ext: brand, id).
+- An Ext tab behaves as a Mail tab everywhere but the places named here: no
+  file, no content (`hot_bytes` none), no Save As, Word's manual, the same
+  ribbon fallbacks. Every `kind ==`/`!=` comparison in the suite is against
+  a built-in other than Look, so Ext takes Look's branch with no change;
+  the explicit `Kind::Look` sites got an `Ext` arm.
+- Session: `PersistTab::ext_kind` (skipped when `None`). An Ext tab is
+  written as `kind: Look` with its id, never as a new enum variant
+  (`#[serde(skip)]` on `Kind::Ext`): an older build parses the session (an
+  unknown variant would set the whole session aside), and one with a Mail
+  extension turns the tab into a Mail tab and drops `ext_kind` on its next
+  save. `restore_tab_content` reads `ext_kind` only on a `Look` row; on any
+  other it is a hand edit, the row restores by its `kind` and the id is
+  dropped, so no document becomes a placeholder. A restored Ext tab is a
+  placeholder with its saved title, whatever the build registers; an
+  unregistered one stays so and is written back with its id.
+- `attach_ext_surfaces` (every render) asks `attach_step`, a pure fn: a
+  placeholder Look tab asks the Mail factory (refusal prefix `Mail: `), a
+  registered Ext tab its kind's (prefix `<name>: `, matched without
+  building a string), an unregistered one is never asked. A missing
+  factory goes on to the next tab (it was a `return` with one kind).
+  `Docxy::new` runs `mark_unavailable_kinds` right after the restore, where
+  the registry is readable: each restored tab of a kind the build lacks gets
+  `<id>: not available in this build` on its status line, before any other
+  start-up notice. A later one (the active tab's "Plugin not loaded")
+  replaces it there; the placeholder body still says it. The
+  theme a surface is told is its tab's kind's
+  (`ext_ribbon::suite_theme_for_tab`), at attach and in `tell_ext_theme`;
+  `ext::suite_theme` stays Mail's, `ext::suite_theme_for(id, cx)` is a
+  kind's.
+- File > New: `new_cards(cx)` (`new_cards_of(kinds)`, pure) is the four
+  `NEW_CARDS` then one card per registered kind, id `new-ext-card:<id>`;
+  the row wraps (`flex_wrap`). A kind's icon on the card sits in an
+  `h_flex` with a zero-width space so its row has the text glyphs' line
+  height and every card's name lines up; on the tab chip it replaces the
+  text glyph. The unregistered placeholder body names the id and "not
+  available in this build".
+- Harness: the `ext fixture` lines also register the fixture surface as
+  kind `fixture` (`ext_fixture::kind`: "Fixture", "Test tab kind", a square
+  icon, accent `KIND_ACCENT` #6b3fa0 / #8250c4, held by an `accent.rs`
+  contrast test) unless the build has one. `backstage read`'s `cards` add
+  `kind` and `icon`; `new-card` takes `new-ext-card:<id>`; `tab-list`'s
+  `kind` is the id. `ext-kinds.uit` drives the card, the tab's accent in
+  the chrome and in the theme its surface is told beside a Mail tab (and
+  after a theme switch), its File pages and `CloseTab`, and New Window
+  (the surface moved, `theme_calls` 2, not made again). The session round
+  trip, an unregistered kind and the four cards of `Extensions::default()`
+  are unit tests in `session_union_tests`. A new window follows the OS
+  appearance under Auto, so the New Window test sets Light.

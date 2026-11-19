@@ -645,7 +645,7 @@ fn save_as_target(
             .into_iter()
             .map(|(_, ext)| ext)
             .collect(),
-        Kind::Look | Kind::Help | Kind::Pdf => {
+        Kind::Look | Kind::Help | Kind::Pdf | Kind::Ext(_) => {
             return Err("this tab cannot be saved as a file".into());
         }
     };
@@ -745,7 +745,7 @@ fn save_types(
             .into_iter()
             .map(|(label, ext)| (label, vec![ext]))
             .collect(),
-        Kind::Look | Kind::Help | Kind::Pdf => {
+        Kind::Look | Kind::Help | Kind::Pdf | Kind::Ext(_) => {
             return Err("this tab cannot be saved as a file".into());
         }
     })
@@ -5738,6 +5738,8 @@ fn kind_name(kind: crate::Kind) -> &'static str {
         crate::Kind::Look => "mail",
         crate::Kind::Help => "help",
         crate::Kind::Pdf => "pdf",
+        // A further extension kind (#2253): its id.
+        crate::Kind::Ext(id) => id.as_str(),
     }
 }
 
@@ -5774,10 +5776,10 @@ fn tab_list(
     tabs: &[crate::DocTab],
     active: usize,
     os_title: Option<&str>,
+    title_label: &str,
     accent: u32,
     drawn_accent: u32,
 ) -> Json {
-    let kind = tabs.get(active).map(|t| t.kind);
     let count = tabs.len();
     let window_title = crate::doc_name::window_title(tabs.get(active).map(|t| t.title.as_ref()));
     let tabs = tabs
@@ -5811,7 +5813,7 @@ fn tab_list(
         // The title bar's one-word type label and the selected tab's accent
         // (#1473). `accent` is computed from the tab; `drawn_accent` is what
         // the last render set, so a render that stops following the tab shows.
-        ("title_label", Json::Str(crate::accent::label(kind).into())),
+        ("title_label", Json::Str(title_label.into())),
         ("accent", Json::Str(hex(accent))),
         ("drawn_accent", Json::Str(hex(drawn_accent))),
         // `last_window_title`, the cache render updates beside its
@@ -6014,7 +6016,8 @@ fn dispatch_verb(
             &app.tabs,
             app.active,
             app.last_window_title.as_deref(),
-            app.accent_now(),
+            crate::accent::label_for(app.tabs.get(app.active).map(|t| t.kind), cx),
+            app.accent_now(cx),
             app.drawn_accent,
         )),
         // The run's windows (#587). These go through the same handlers as
@@ -6779,17 +6782,21 @@ fn dispatch_verb(
                 ),
                 ("ext_items", Json::Arr(ext_items)),
                 ("ext_page", ext_page),
-                // The New page's cards (#806), in order.
+                // The New page's cards (#806), in order, a build's further
+                // extension kinds' after the suite's (#2253); `kind` is the
+                // tab kind it opens, as `tab-list` names it.
                 (
                     "cards",
                     Json::Arr(
-                        crate::NEW_CARDS
+                        crate::new_cards(cx)
                             .iter()
                             .map(|c| {
                                 Json::obj(vec![
-                                    ("id", Json::Str(c.id.into())),
-                                    ("name", Json::Str(c.name.into())),
-                                    ("sub", Json::Str(c.sub.into())),
+                                    ("id", Json::Str(c.id.to_string())),
+                                    ("name", Json::Str(c.name.to_string())),
+                                    ("sub", Json::Str(c.sub.to_string())),
+                                    ("kind", Json::Str(kind_name(c.kind).into())),
+                                    ("icon", Json::Bool(c.icon.is_some())),
                                 ])
                             })
                             .collect(),
@@ -6798,14 +6805,15 @@ fn dispatch_verb(
             ]))
         }
         // A click on a card of the New page (#806): `card` is its id
-        // (`new-xls-card`), the same handler as the real click.
+        // (`new-xls-card`; a further extension kind's `new-ext-card:<id>`,
+        // #2253), the same handler as the real click.
         "new-card" => {
             if !(app.backstage && app.bs_new) {
                 return Err("the New page is not open (backstage-page new)".into());
             }
             app.refuse_under_dialog()?;
             let id = arg_str(args, "card")?;
-            let Some(card) = crate::NEW_CARDS.iter().find(|c| c.id == id) else {
+            let Some(card) = crate::new_cards(cx).into_iter().find(|c| c.id == id) else {
                 return Err(format!("no New card '{id}'"));
             };
             app.add_tab(card.kind, window, cx);
@@ -9321,6 +9329,7 @@ mod tests {
             &[word, book, blank, mpp, inbox],
             2,
             Some("Project1  -  docxy"),
+            crate::accent::label(Some(crate::Kind::Project)),
             crate::BRAND,
             crate::BRAND,
         );

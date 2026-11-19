@@ -1,0 +1,138 @@
+# Further extension tab kinds besides Mail (#2253). The script's
+# `ext fixture` line has this instance draw Mail tabs with the suite's test
+# extension and also register that surface as a further tab kind, `fixture`:
+# its File > New card ("Fixture", "Test tab kind", with an icon) comes after
+# the suite's four, its tabs are titled "Fixture", and its accent is purple
+# (#6b3fa0 light, #8250c4 dark). `ext-ribbon-read` gives the last theme the
+# active tab's surface was told (`theme.accent`) and how many times it was
+# told one (`theme_calls`). The session round trip and a kind this build
+# does not register are unit tests (`extension_kind_tabs_round_trip_by_their_id`).
+# The instance starts with one document tab (the first test also opens
+# basic.docx and closes it, as every case opens a file of the harness's own);
+# each test leaves only that one.
+ext fixture
+
+test issue 2253 File New lists the kind's card after the suite's and opens its tab in its accent
+  open copy:../fixtures/basic.docx
+  call tab-list {}
+  assert reply.count is 2
+  assert reply.tabs.1.kind is docx
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+  call theme-set {"theme":"auto"}
+  call appearance-set {"appearance":"light"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call backstage {"action":"read"}
+  assert reply.cards.0.id is new-doc-card
+  assert reply.cards.3.id is new-mail-card
+  assert reply.cards.3.kind is mail
+  assert reply.cards.3.icon is false
+  assert reply.cards.4.id is new-ext-card:fixture
+  assert reply.cards.4.name is Fixture
+  assert reply.cards.4.sub is "Test tab kind"
+  assert reply.cards.4.kind is fixture
+  assert reply.cards.4.icon is true
+  shot window
+  call new-card {"card":"new-ext-card:fixture"}
+  shot window
+  call tab-list {}
+  assert reply.count is 2
+  assert reply.active is 1
+  assert reply.tabs.1.kind is fixture
+  assert reply.tabs.1.title is Fixture
+  assert reply.title_label is fixture
+  assert reply.accent is "#6b3fa0"
+  assert reply.drawn_accent is "#6b3fa0"
+  # The surface is the factory's, told the suite's theme in the kind's accent.
+  call ext-ribbon-read {}
+  assert reply.theme.dark is false
+  assert reply.theme.accent is 6b3fa0
+  # A Mail tab beside it keeps the brand, in the chrome and in its theme.
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  call tab-list {}
+  assert reply.tabs.2.kind is mail
+  assert reply.title_label is mail
+  assert reply.accent is "#2aa79b"
+  call ext-ribbon-read {}
+  assert reply.theme.accent is 2aa79b
+  # A theme switch tells each surface its own kind's accent.
+  call appearance-set {"appearance":"dark"}
+  assert reply.applied is dark
+  call ext-ribbon-read {}
+  assert reply.theme.dark is true
+  assert reply.theme.accent is 2aa79b
+  call tab-select {"tab":1}
+  shot window
+  call ext-ribbon-read {}
+  assert reply.theme.dark is true
+  assert reply.theme.accent is 8250c4
+  call tab-list {}
+  assert reply.title_label is fixture
+  assert reply.accent is "#8250c4"
+  assert reply.drawn_accent is "#8250c4"
+  call appearance-set {"appearance":"light"}
+  call ext-ribbon-read {}
+  assert reply.theme.accent is 6b3fa0
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 2
+  assert reply.tabs.1.kind is mail
+  call tab-select {"tab":1}
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+  assert reply.tabs.0.kind is docx
+
+test issue 2253 a kind's tab lists the extension's File pages and CloseTab closes it
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-ext-card:fixture"}
+  call tab-list {}
+  assert reply.tabs.1.kind is fixture
+  call backstage {"action":"open"}
+  assert reply.items is ["← Back","Fixture Account","New","Open…","Save","Save As…","Account","Fixture Options","Close"]
+  assert reply.ext_items.0.id is fx.account
+  shot window
+  # File down, the view takes the focus back on the next frame.
+  call backstage {"action":"close"}
+  shot window
+  call ext-doc-read {}
+  assert reply.focused is true
+  call ext-close-tab {}
+  assert reply.from is view
+  shot window
+  call tab-list {}
+  assert reply.count is 1
+  assert reply.tabs.0.kind is docx
+
+test issue 2253 New Window moves a kind's tab with its surface
+  # Light, not Auto: the new window's own appearance is the OS's.
+  call theme-set {"theme":"light"}
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-ext-card:fixture"}
+  call ext-ribbon-read {}
+  assert reply.theme_calls is 1
+  call window-new {}
+  assert reply.window is 2
+  assert windows is 2
+  call tab-list {}
+  assert reply.count is 1
+  assert reply.tabs.0.kind is fixture
+  assert reply.tabs.0.title is Fixture
+  assert reply.title_label is fixture
+  assert reply.accent is "#6b3fa0"
+  # The same surface, moved: the new window told it the theme once more. A
+  # surface made again in the new window would have been told it once.
+  call ext-ribbon-read {}
+  assert reply.theme.accent is 6b3fa0
+  assert reply.theme_calls is 2
+  call window-select {"window":1}
+  call tab-list {}
+  assert reply.count is 1
+  assert reply.tabs.0.kind is docx
+  call theme-set {"theme":"auto"}

@@ -1,7 +1,9 @@
 //! Extension surfaces: a build of the suite may link a crate that draws a
-//! tab kind the public suite leaves as a placeholder (today: Mail). The
-//! public `suite` binary passes [`Extensions::default`], so nothing here
-//! changes it; the seam names no particular extension.
+//! tab kind the public suite leaves as a placeholder (Mail), and register
+//! further tab kinds of its own ([`ExtKind`], #2253), each with a File > New
+//! card, an icon and an accent. The public `suite` binary passes
+//! [`Extensions::default`], so nothing here changes it; the seam names no
+//! particular extension.
 //!
 //! An extension's surface is a gpui view the tab hosts as its body
 //! (`Surface::Ext`). The tab owns it like any other surface, so View >
@@ -408,7 +410,8 @@ pub struct SuiteTheme {
     /// The ribbon's and the tab strip's panel.
     pub panel: Hsla,
     pub border: Hsla,
-    /// The tab's accent (the Mail tabs').
+    /// The tab's accent: the Mail tabs' from [`suite_theme`], a further
+    /// kind's own ([`ExtKind::accent`]) as its tabs are told it (#2253).
     pub accent: Hsla,
     pub text: Hsla,
     pub muted_text: Hsla,
@@ -444,23 +447,111 @@ pub(crate) fn ribbon_generation(cx: &App) -> u64 {
 /// status line and the tab keeps the placeholder.
 pub type Factory = Rc<dyn Fn(&mut App) -> Result<Box<dyn TabSurface>, String>>;
 
+/// A further extension tab kind (#2253), besides Mail: a File > New card
+/// that opens a tab drawn by `factory`'s surface, exactly as a Mail tab is
+/// (its ribbon, File pages, [`CloseTab`], [`ShowBackstagePage`], tearing off
+/// and View > Window > New Window). Its tabs are saved in the session by
+/// `id` and restored with it; a build that does not register `id` restores
+/// such a tab as a placeholder and keeps it in the session.
+///
+/// `id` is stable (the session holds it): lowercase ASCII letters, digits,
+/// `.`, `_` and `-`, and none of the suite's own kinds (`docx`, `xlsx`,
+/// `project`, `mail`, `look`, `help`, `pdf`). A kind whose id is not, or
+/// repeats an earlier kind's, is left out, said on stderr and in the crash
+/// log as a plugin that does not load is.
+#[non_exhaustive]
+#[derive(Clone)]
+pub struct ExtKind {
+    /// Stable, saved in the session.
+    pub id: String,
+    /// The File > New card's name.
+    pub name: String,
+    /// The File > New card's subtitle.
+    pub sub: String,
+    /// A new tab's title; the surface's [`TabSurface::title`] wins.
+    pub title: String,
+    /// The tab chip's and the card's icon, drawn as a mask in their ink,
+    /// as a ribbon icon is. `None` draws a generic glyph.
+    pub icon: Option<RibbonIcon>,
+    /// The accent of its tabs' chrome (the File button, the title label's
+    /// tab) and the [`SuiteTheme::accent`] its surfaces are told, as
+    /// `0xRRGGBB` on the light and on the dark theme. `None` keeps the
+    /// suite's brand, as Mail's tabs do.
+    pub accent: Option<(u32, u32)>,
+    /// Makes the surface of a new tab of this kind.
+    pub factory: Factory,
+}
+
+impl ExtKind {
+    /// A kind with no icon and the suite's brand accent.
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        sub: impl Into<String>,
+        title: impl Into<String>,
+        factory: Factory,
+    ) -> Self {
+        ExtKind {
+            id: id.into(),
+            name: name.into(),
+            sub: sub.into(),
+            title: title.into(),
+            icon: None,
+            accent: None,
+            factory,
+        }
+    }
+    pub fn icon(mut self, icon: RibbonIcon) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+    /// `light` and `dark` as `0xRRGGBB`. Pick shades that hold white text at
+    /// 4.5:1 (the File button's) and read on the theme's background at 3:1.
+    pub fn accent(mut self, light: u32, dark: u32) -> Self {
+        self.accent = Some((light, dark));
+        self
+    }
+}
+
 /// What a build links in. Every field is optional.
 #[derive(Default)]
 pub struct Extensions {
     /// Draws Mail tabs (File > New > Mail, a restored Mail tab).
     pub mail: Option<Factory>,
+    /// Further tab kinds (#2253), their File > New cards after the suite's
+    /// own, in this order.
+    pub kinds: Vec<ExtKind>,
 }
 
-struct Installed(Extensions);
+/// The suite's theme as a tab of the registered kind `kind_id` is told it
+/// (#2253): [`suite_theme`] with that kind's accent. An id no kind of this
+/// build has gives [`suite_theme`].
+pub fn suite_theme_for(kind_id: &str, cx: &App) -> SuiteTheme {
+    crate::ext_ribbon::suite_theme_with(crate::ext_kinds::accent_of(kind_id, cx), cx)
+}
+
+pub(crate) struct Installed {
+    pub(crate) mail: Option<Factory>,
+    pub(crate) kinds: Vec<crate::ext_kinds::Registered>,
+}
 
 impl Global for Installed {}
 
-pub(crate) fn install(cx: &mut App, extensions: Extensions) {
-    cx.set_global(Installed(extensions));
+/// Installs `extensions` in this App (a gpui global, so each App, a test's
+/// among them, has its own); what it left out (a tab
+/// kind with a bad or repeated id) comes back, one line each, for `run` to
+/// say.
+pub(crate) fn install(cx: &mut App, extensions: Extensions) -> Vec<String> {
+    let (kinds, errors) = crate::ext_kinds::validate(extensions.kinds);
+    cx.set_global(Installed {
+        mail: extensions.mail,
+        kinds,
+    });
+    errors
 }
 
 /// A new Mail surface, when an extension draws Mail: `None` without one.
 pub(crate) fn new_mail(cx: &mut App) -> Option<Result<Box<dyn TabSurface>, String>> {
-    let factory = cx.try_global::<Installed>()?.0.mail.clone()?;
+    let factory = cx.try_global::<Installed>()?.mail.clone()?;
     Some(factory(cx))
 }
