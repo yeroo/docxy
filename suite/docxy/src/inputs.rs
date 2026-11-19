@@ -521,8 +521,6 @@ fn press_help(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
     })
 }
 
-/// `field-read {"input":"help-search"}`: the query, its caret while the
-/// box has the keys, and a whole-query selection.
 /// The PDF view's Find box (open, Ctrl+F) or page box, pressed where it is
 /// drawn (#2245).
 fn press_pdf(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
@@ -570,6 +568,8 @@ fn pdf_field_json(id: &str, f: &crate::pdf_view::Field) -> Json {
     )
 }
 
+/// `field-read {"input":"help-search"}`: the query, its caret while the
+/// box has the keys, and a whole-query selection.
 fn read_help(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
     let v = app
         .active_help()

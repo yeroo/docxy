@@ -137,6 +137,9 @@ fn a_question_past_the_timeout_kills_the_child_and_the_next_starts_another() {
         other => panic!("{other:?}"),
     }
     assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+    // Only the hanging question is bounded short: the next one starts a new
+    // child and reads text, which a slow machine may take longer over.
+    w.timeout = LONG;
     assert!(matches!(w.ask(&Op::Text { page: 0 }), Answer::Text(_)));
     assert_eq!(w.started, 2);
 }
