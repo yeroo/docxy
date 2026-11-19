@@ -1242,8 +1242,26 @@ impl Session {
         let (r1, r2) = (self.cur.0.min(ar), self.cur.0.max(ar));
         let (c1, c2) = (self.cur.1.min(ac), self.cur.1.max(ac));
         let sheet = &self.pkg.workbook.sheets[self.active];
+        // An absent cell is copied as a blank with the style it inherits from
+        // its row or column, when that is not the default (#1660): pasted, it
+        // is the cell's absence, not a default-style pin.
+        let col_styles: Vec<u32> = (c1..=c2).map(|c| sheet.col_style(c)).collect();
         let cells = (r1..=r2)
-            .map(|r| (c1..=c2).map(|c| sheet.cell(r, c).cloned()).collect())
+            .map(|r| {
+                let row_style = sheet.row_style(r);
+                (c1..=c2)
+                    .zip(&col_styles)
+                    .map(|(c, &col_style)| {
+                        let inherited = row_style.unwrap_or(col_style);
+                        sheet.cell(r, c).cloned().or_else(|| {
+                            (inherited != 0).then(|| Cell {
+                                style: inherited,
+                                ..Cell::default()
+                            })
+                        })
+                    })
+                    .collect()
+            })
             .collect();
         self.clip = Some(GridClip {
             cells,
@@ -4731,6 +4749,35 @@ mod tests {
         s.dispatch("select\t6\t1");
         let v = s.view_json(None);
         assert!(v.contains("\"src\":\"\""), "paste is one undo group: {v}");
+    }
+
+    /// #1660: copy an absent B1 under column B's style and paste it on a
+    /// B2 holding a default-style value: B2 ends as absent as B1, not a
+    /// blank default-style pin.
+    #[test]
+    fn paste_of_an_absent_cell_in_a_styled_column_leaves_no_pin() {
+        let mut s = Session::open(&save_xlsx(&new_xlsx())).expect("open");
+        let sheet = &mut s.pkg.workbook.sheets[0];
+        sheet.col_defs.push(gridcore::sheet::ColDef {
+            min: 1,
+            max: 1,
+            width: None,
+            attrs: r#"style="7""#.to_string(),
+            default_width: false,
+            plain_width: false,
+        });
+        sheet.set_cell(1, 1, Cell::number(2.0));
+        s.engine = Engine::new(&s.pkg.workbook);
+        s.dispatch("select\t0\t1");
+        let tsv = s.dispatch("copy").expect("copy returns tsv");
+        let blank7 = Cell {
+            style: 7,
+            ..Cell::default()
+        };
+        assert_eq!(s.clip.as_ref().unwrap().cells, vec![vec![Some(blank7)]]);
+        s.dispatch(&format!("paste\t1\t1\t{tsv}"));
+        let b2 = s.pkg.workbook.sheets[0].cell(1, 1);
+        assert_eq!(b2, None, "B2 is {b2:?}");
     }
 
     #[test]
