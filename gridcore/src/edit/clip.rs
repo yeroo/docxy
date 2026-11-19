@@ -163,9 +163,9 @@ pub fn move_refs(wb: &mut Workbook, src: usize, mv: &CellMove) -> bool {
 /// relative and mixed references, so (its formula being relative to its
 /// range) it keeps checking what it checked, as the data form's Delete
 /// leaves such rules; only its fully absolute references to moved cells
-/// (`$F$1`) follow them ([`move_abs_ref_expr`]), as they name the cells
-/// themselves. Every other rule is re-pointed whole. Whether any formula
-/// was rewritten.
+/// outside its own ranges (`$F$1`) follow them ([`move_abs_ref_expr`]), as
+/// they name those cells themselves. Every other rule is re-pointed whole.
+/// Whether any formula was rewritten.
 pub fn move_refs_rules_stay(wb: &mut Workbook, src: usize, mv: &CellMove) -> bool {
     walk_rules_stay(wb, src, mv, true)
 }
@@ -189,9 +189,11 @@ fn walk_rules_stay(wb: &mut Workbook, src: usize, mv: &CellMove, write: bool) ->
         |_, _| true,
         false,
         |e, site| {
-            let left = site.sheet == Some(src) && site.rule.is_some_and(|r| r.iter().any(meets));
-            if left {
-                return move_abs_ref_expr(e, Some(&names[src]), mv);
+            if let Some(own) = site
+                .rule
+                .filter(|r| site.sheet == Some(src) && r.iter().any(meets))
+            {
+                return move_abs_ref_expr(e, Some(&names[src]), mv, own);
             }
             moved_ref_expr(e, &names, src, mv, site)
         },

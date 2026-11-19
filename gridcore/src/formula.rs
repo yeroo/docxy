@@ -2849,23 +2849,42 @@ impl CellMove<'_> {
 /// Anything else is left alone, as are 3-D, whole-row and whole-column
 /// references.
 pub fn move_ref_expr(e: &Expr, home: Option<&str>, mv: &CellMove) -> Expr {
-    move_refs_in(e, home, mv, false)
+    move_refs_in(e, home, mv, &|_, _| true)
 }
 
-/// [`move_ref_expr`] for only the fully absolute references: a `$F$1` (or
-/// `$F$1#`) to a moved cell, or a `$F$1:$G$1` whose corners both moved,
-/// follows it; a relative or mixed one (`F1`, `$F1`, `F$1`) is left alone.
-/// What a conditional-format rule left in place over a cut re-points: its
-/// relative references read relative to its range, which stays, while an
-/// absolute one names the cell itself.
-pub fn move_abs_ref_expr(e: &Expr, home: Option<&str>, mv: &CellMove) -> Expr {
-    move_refs_in(e, home, mv, true)
+/// [`move_ref_expr`] for a conditional-format rule left in place over a cut,
+/// on the cells `own` (its ranges, on the cut's sheet): its relative and
+/// mixed references (`F1`, `$F1`, `F$1`) read relative to its range, which
+/// stays, so they stay; a fully absolute one (`$F$1`, `$F$1#`, `$F$1:$G$1`
+/// with both corners moved) names the cells themselves and follows them,
+/// unless it reads the rule's own cells, which stay with it
+/// (`A1>AVERAGE($A$1:$A$10)` on A1:A10, #880).
+pub fn move_abs_ref_expr(
+    e: &Expr,
+    home: Option<&str>,
+    mv: &CellMove,
+    own: &[(u32, u32, u32, u32)],
+) -> Expr {
+    let meets_own = |p: &CellRef, q: &CellRef| {
+        let (r1, r2) = (p.row.min(q.row), p.row.max(q.row));
+        let (c1, c2) = (p.col.min(q.col), p.col.max(q.col));
+        own.iter().any(|&(a, b, c, d)| {
+            i64::from(a) <= r2 && r1 <= i64::from(c) && i64::from(b) <= c2 && c1 <= i64::from(d)
+        })
+    };
+    let abs = |r: &CellRef| r.abs_row && r.abs_col;
+    move_refs_in(e, home, mv, &|p, q| abs(p) && abs(q) && !meets_own(p, q))
 }
 
-/// [`move_ref_expr`], of only the fully absolute references when `abs_only`.
-fn move_refs_in(e: &Expr, home: Option<&str>, mv: &CellMove, abs_only: bool) -> Expr {
-    let recur = |x: &Expr| move_refs_in(x, home, mv, abs_only);
-    let takes = |r: &CellRef| !abs_only || (r.abs_row && r.abs_col);
+/// [`move_ref_expr`], of only the references `takes` takes, given a
+/// reference's (or a range's) two corners.
+fn move_refs_in(
+    e: &Expr,
+    home: Option<&str>,
+    mv: &CellMove,
+    takes: &dyn Fn(&CellRef, &CellRef) -> bool,
+) -> Expr {
+    let recur = |x: &Expr| move_refs_in(x, home, mv, takes);
     let sheet_of = |r: &CellRef| {
         if mv.same_sheet() {
             r.sheet.clone()
@@ -2874,14 +2893,14 @@ fn move_refs_in(e: &Expr, home: Option<&str>, mv: &CellMove, abs_only: bool) -> 
         }
     };
     match e {
-        Expr::Ref(r) if takes(r) && mv.holds(r, home) => Expr::Ref(mv.shifted(r, sheet_of(r))),
-        Expr::SpillRef(r) if takes(r) && mv.holds(r, home) => {
+        Expr::Ref(r) if mv.holds(r, home) && takes(r, r) => Expr::Ref(mv.shifted(r, sheet_of(r))),
+        Expr::SpillRef(r) if mv.holds(r, home) && takes(r, r) => {
             Expr::SpillRef(mv.shifted(r, sheet_of(r)))
         }
         Expr::Range(p, q) => {
             // The first corner's qualifier covers the range.
             let q_home = p.sheet.as_deref().or(home);
-            if takes(p) && takes(q) && mv.holds(p, home) && mv.holds(q, q_home) {
+            if mv.holds(p, home) && mv.holds(q, q_home) && takes(p, q) {
                 Expr::Range(mv.shifted(p, sheet_of(p)), mv.shifted(q, q.sheet.clone()))
             } else {
                 e.clone()

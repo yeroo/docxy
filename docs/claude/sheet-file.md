@@ -246,8 +246,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
 - `move_refs_rules_stay` (both hosts) leaves a conditional-format rule whose
   ranges meet the cut in place with its relative and mixed references, but
   re-points its fully absolute ones (`$F$1`, `$F$1#`, an all-`$` range with
-  both corners moved), which name the cells themselves. `FormulaSite::rule`
-  carries the rule's ranges to the per-formula rewrite.
+  both corners moved) to moved cells outside its own ranges, which name
+  those cells themselves. One into its own ranges reads the rule's own
+  cells, which stay with it (`A1>AVERAGE($A$1:$A$10)` on A1:A10, #880), so
+  it stays (`formula::move_abs_ref_expr`). `FormulaSite::rule` carries the
+  rule's ranges to the per-formula rewrite.
 - xlsxy asks `cut_moves_refs` (the rewrite's dry run) before writing: only a
   cut that re-points something outside its own cells takes the
   whole-workbook snapshot and becomes a `Structural` step; the rest stay a

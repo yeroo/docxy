@@ -360,6 +360,15 @@ fn move_refs_rules_stay_follows_absolute_refs_in_rules_left_in_place() {
     assert!(move_refs_rules_stay(&mut wb, 0, &cut_a1_f1_to_a20()));
     assert_eq!(rule_formula(&wb, 0, 0), "SUM($E$20:$F$20)>0");
 
+    // An absolute reference into the rule's own cells reads them, and they
+    // stay with the rule (#880): A1:F1 cut, a rule on A1:D10.
+    let mut wb = book(&[("Sheet1", &[])]);
+    wb.sheets[0]
+        .cond_formats
+        .push(cf(&[(0, 0, 9, 3)], expr("A1>$B$1+SUM($A$1:$B$1)+$F$1")));
+    assert!(move_refs_rules_stay(&mut wb, 0, &cut_a1_f1_to_a20()));
+    assert_eq!(rule_formula(&wb, 0, 0), "A1>$B$1+SUM($A$1:$B$1)+$F$20");
+
     // A rule left in place with only relative refs: nothing is rewritten.
     let mut wb = book(&[("Sheet1", &[])]);
     wb.sheets[0]

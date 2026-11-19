@@ -387,7 +387,8 @@ fn a_cut_moved_to_another_sheet_keeps_reading_what_it_read() {
 }
 
 /// #1687: a conditional-format rule over the cut keeps its range, so it
-/// keeps its relative references; a fully absolute one follows the cell.
+/// keeps its relative references; a fully absolute one to a moved cell
+/// outside its range follows the cell.
 #[test]
 fn a_cut_leaves_a_rule_over_it_reading_what_it_read() {
     let mut v = view();
@@ -406,14 +407,14 @@ fn a_cut_leaves_a_rule_over_it_reading_what_it_read() {
     };
     let cfs = &mut v.pkg.workbook.sheets[s].cond_formats;
     cfs.push(rule("A1>5"));
-    cfs.push(rule("$A$1>5"));
-    let clip = cut(&mut v, "A1", "A1");
+    cfs.push(rule("A1>$B$1"));
+    let clip = cut(&mut v, "A1", "B1");
     select(&mut v, "C1", "C1");
     assert_eq!(v.paste_grid_clip(&clip), Ok(GridPasted::Done));
     let formulas: Vec<String> = (v.pkg.workbook.sheets[s].cond_formats.iter())
         .map(|cf| cf.rules[0].formulas()[0].clone())
         .collect();
-    assert_eq!(formulas, ["A1>5", "$C$1>5"]);
+    assert_eq!(formulas, ["A1>5", "A1>$D$1"]);
 }
 
 /// #1687: a formula cut to another sheet keeps reading its sheet's own
