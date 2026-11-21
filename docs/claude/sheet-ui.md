@@ -79,14 +79,36 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   the characters. In-place Save never asks, so a workbook opened from such a
   name saves over itself. Documents and Projects are not checked.
 
-## The cell editor's commit and sheet protection (#1054)
+## The cell editor's commit and sheet protection (#1054, #2230)
 
-- No editor opens on a protected sheet (`sheet_begin_edit`, the typing gate,
-  the pick lists), and the commit is the backstop: `commit_edit_taken` and
-  Ctrl+Enter's `commit_edit_to_selection` refuse an entry whose sheet (the
-  editor's origin, `edit_origin.0`) is protected with `SHEET_PROTECTED` in
-  `entry_error`, the editor kept with its text, nothing written and no undo
-  step. An untouched seeded editor still just closes.
+- No editor opens on a locked cell of a protected sheet (`sheet_begin_edit`,
+  the typing gate, the pick lists, Error Checking's Edit), and the commit is
+  the backstop: `commit_edit_taken` refuses an entry whose cell (the
+  editor's origin, `edit_origin`) is locked on a protected sheet
+  (`SheetView::entry_locked`), with `SHEET_PROTECTED` in `entry_error`, the
+  editor kept with its text, nothing written and no undo step. An untouched
+  seeded editor still just closes.
+- Unlocked cells stay editable (#2230), as in Excel's form workbooks. A cell
+  is locked unless the xf it shows (`entry_style_at`: its own, or an absent
+  cell's row/column style, #1660) is `Xf::unlocked`; a missing xf is locked
+  (`gridcore` `Sheet::cell_locked`). What writes a value over a range
+  (Ctrl+Enter's `commit_edit_to_selection`, Delete's `sheet_clear`, Home ›
+  Clear › Clear Contents) needs every cell of every area unlocked
+  (`SheetView::areas_locked`, through `Sheet::any_locked`, which never visits
+  a whole-sheet area's absent cells one by one). The data-validation list
+  (Alt+Down, its arrow, a pick) refuses a locked cell with `SHEET_PROTECTED`
+  in the status (`sheet_dv_locked`); before #2230 it wrote into one. The
+  entry chords ask only with no editor open: while a formula points, the
+  active cell is not the one edited.
+- Every other command still refuses a protected sheet whole: paste, fill,
+  drag, Flash Fill, AutoSum, Convert to Number, Copy Formula from Above,
+  formats and the other Clear commands. The `<sheetProtection>` flags
+  (`formatCells`, `selectLockedCells`, ...) are kept but not read.
+- The suite cannot unlock a cell (no Format Cells › Protection tab): unlocked
+  xfs come from files. `uiharness/fixtures/protected-form.xlsx`, made by
+  `scripts/make-protected-form-fixture.py`, is the form the tests and
+  `uiharness/cases/sheet-protected-form.uit` use; the harness reads the
+  validation list through `dv-arrow`, `dv-item:N` and the `dv_open` state.
 - Review › Protect Sheet is in `act_commits_editor` though not in
   `act_targets_cells` (it takes no selection back from a chart): an open
   entry commits first, as for #510's cell acts, so its Typing step lands
