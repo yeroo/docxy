@@ -469,6 +469,8 @@ struct Look {
     /// The cascade said not bold in so many words (`font-weight: normal`):
     /// under a heading that is an explicit off (#1872 6b).
     bold_off: bool,
+    /// The same for italic (`font-style: normal`, #1883).
+    italic_off: bool,
     align: Option<Align>,
     /// Where a block-level child is placed when its own margins do not say
     /// (#1922): `Center` or `Right` from an inherited `-webkit-center` /
@@ -626,6 +628,8 @@ impl Path for Ancestry<'_> {
 
 /// The explicit bold off a run under a heading gets (#1427's form).
 const BOLD_OFF: &str = "<w:b w:val=\"0\"/>";
+/// The explicit italic off a run under a heading gets (#1883).
+const ITALIC_OFF: &str = "<w:i w:val=\"0\"/>";
 
 /// Shading of `fill` (`RRGGBB`), run or paragraph.
 fn shd(fill: &str) -> String {
@@ -1020,6 +1024,11 @@ impl Cascade {
         self.look.bold_off = !bold;
     }
 
+    fn set_italic(&mut self, italic: bool) {
+        self.look.run.italic = italic;
+        self.look.italic_off = !italic;
+    }
+
     /// The user agent's look of `key`: tag semantics (`b`, `i`, …), the
     /// `center` alignment, the blockquote margins. A heading starts with no
     /// explicit not-bold: only a declaration on it or inside it makes one
@@ -1027,6 +1036,7 @@ impl Cascade {
     fn user_agent(&mut self, key: &ElemKey, quirks: bool) {
         if starts_heading(key) {
             self.look.bold_off = false;
+            self.look.italic_off = false;
         }
         let tag = key.tag.as_str();
         if tag == "table" {
@@ -1043,13 +1053,14 @@ impl Cascade {
                 self.look.run.bold = false;
                 self.look.bold_off = false;
                 self.look.run.italic = false;
+                self.look.italic_off = false;
             }
         }
         self.is_img = tag == "img";
         let run = &mut self.look.run;
         match tag {
             "b" | "strong" => self.set_bold(true),
-            "i" | "em" | "cite" | "dfn" | "var" => run.italic = true,
+            "i" | "em" | "cite" | "dfn" | "var" => self.set_italic(true),
             "u" | "ins" => {
                 run.underline = true;
                 // An enclosing `text-decoration:none`'s explicit off (#2249).
@@ -1267,12 +1278,13 @@ impl Cascade {
             }
             "font-style" => {
                 if let Some(i) = css::italic(v) {
-                    run.italic = i;
+                    self.set_italic(i);
                 }
             }
             "font" => {
                 if let Some(f) = css::font_shorthand(v, self.parent_pt) {
-                    run.italic = f.italic;
+                    self.set_italic(f.italic);
+                    let run = &mut self.look.run;
                     run.size_half_pts = Some(css::half_points(f.size_pt));
                     self.own_size = true;
                     if let Some(family) = f.family {
@@ -2882,6 +2894,12 @@ impl<'a> Html<'a> {
             && self.blocks.last().is_some_and(|(_, b)| b.heading.is_some())
         {
             p.raw_props.push(BOLD_OFF.to_string());
+        }
+        if e.look.italic_off
+            && !p.italic
+            && self.blocks.last().is_some_and(|(_, b)| b.heading.is_some())
+        {
+            p.raw_props.push(ITALIC_OFF.to_string());
         }
         p
     }
@@ -4709,6 +4727,40 @@ mod tests {
         assert!(bold.props.raw_props.is_empty());
         assert!(run_of(&d, "body").props.raw_props.is_empty());
         assert!(run_of(&d, "default").props.raw_props.is_empty());
+    }
+
+    #[test]
+    fn italic_off_is_explicit_under_a_heading_only_1883() {
+        let d = doc(
+            "<style>h4 {font-style:normal}</style><h4>head <em>em</em></h4>\
+             <p><span style='font-style:normal'>body</span></p>\
+             <h3><span style='font:normal 10pt Arial'>short</span></h3>\
+             <div style='font:normal 10pt Arial'><h5>outer</h5></div>\
+             <h2>default</h2>",
+        );
+        let off = "<w:i w:val=\"0\"/>".to_string();
+        let head = run_of(&d, "head");
+        assert!(!head.props.italic);
+        assert_eq!(head.props.raw_props, [off.clone()]);
+        let em = run_of(&d, "em");
+        assert!(em.props.italic);
+        assert!(em.props.raw_props.is_empty(), "{:?}", em.props.raw_props);
+        assert!(run_of(&d, "body").props.raw_props.is_empty());
+        // A `font:` shorthand on or inside the heading is an off; an
+        // ancestor's is not (#1872 r1, as for bold).
+        assert!(run_of(&d, "short").props.raw_props.contains(&off));
+        let outer = run_of(&d, "outer");
+        assert!(
+            !outer.props.raw_props.contains(&off),
+            "{:?}",
+            outer.props.raw_props
+        );
+        assert!(run_of(&d, "default").props.raw_props.is_empty());
+        // Written in schema order beside the bold off.
+        let d = doc("<h1 style='font-weight:normal;font-style:normal'>both</h1>");
+        let x = crate::serialize::rpr_xml(&run_of(&d, "both").props);
+        let (b, i) = (x.find("<w:b ").unwrap(), x.find("<w:i ").unwrap());
+        assert!(b < i, "{x}");
     }
 
     #[test]
