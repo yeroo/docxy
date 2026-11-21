@@ -3,19 +3,23 @@
 //! and the values of the properties [`super::html`] maps onto runs and
 //! paragraphs.
 //!
-//! Selectors are type, `*`, `.class`, `#id`, their compounds, and the
-//! descendant (space) and child (`>`) combinators, in comma groups. A
-//! selector with anything else (`+`, `~`, `[attr]`, a pseudo-class or
-//! -element, an escape) is dropped alone; the rest of its group still
-//! applies. Every at-rule is skipped with its block, and `<!--`, `-->` and
-//! comments are ignored. Names compare ASCII case-insensitively (most email
-//! is quirks mode, where classes and ids do).
+//! Selectors are type, `*`, `.class`, `#id`, attribute selectors
+//! (`[a]`, `=`, `~=`, `|=`, `^=`, `$=`, `*=`, an `i`/`s` flag), the
+//! pseudo-classes `:first-child`, `:link`, `:any-link` and `:root`, their
+//! compounds, and the descendant (space), child (`>`) and next-sibling
+//! (`+`) combinators, in comma groups (#1883). A selector with anything
+//! else (`~`, another pseudo-class, a pseudo-element, an escape) is
+//! dropped alone; the rest of its group still applies. Every at-rule is
+//! skipped with its block, and `<!--`, `-->` and comments are ignored.
+//! Names compare ASCII case-insensitively (most email is quirks mode, where
+//! classes and ids do).
 //!
 //! Everything is one forward pass over its text with a depth counter for
 //! braces (no recursion). A sheet keeps at most [`MAX_RULES`] rules and a
 //! selector at most [`MAX_COMPOUNDS`] compounds; matching one rule against an
-//! element costs O(compounds × depth) (see [`Selector::matches`]), all
-//! charged to the import's [`Budget`].
+//! element costs O(compounds × depth) (see [`Selector::matches`]: a `+`
+//! chain looks at most [`MAX_COMPOUNDS`] siblings back), all charged to the
+//! import's [`Budget`].
 
 use super::Budget;
 use std::collections::HashMap;
