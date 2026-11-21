@@ -100,6 +100,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   in the status (`sheet_dv_locked`); before #2230 it wrote into one. The
   entry chords ask only with no editor open: while a formula points, the
   active cell is not the one edited.
+- An entry on a protected sheet writes only the cells checked: table
+  AutoCorrect (`table_autocorrect`: a table growing to take the entry, a
+  calculated column filling its other cells) never runs there, for the
+  typed commit and for a validation alert's accepted entry alike.
 - Every other command still refuses a protected sheet whole: paste, fill,
   drag, Flash Fill, AutoSum, Convert to Number, Copy Formula from Above,
   formats and the other Clear commands. The `<sheetProtection>` flags

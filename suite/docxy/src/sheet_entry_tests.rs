@@ -2017,6 +2017,41 @@ fn the_autocorrect_switches_turn_the_table_rules_off() {
     assert!(v.pkg.workbook.tables[0].calculated_formulas.is_empty());
 }
 
+/// #2230: on a protected sheet an entry into an unlocked cell writes that
+/// cell only: a formula typed into an empty table column fills no other
+/// cell, and an entry just below the table does not grow it.
+#[test]
+fn table_autocorrect_does_not_run_on_a_protected_sheet() {
+    let mut v = calc_view();
+    let open = v.pkg.workbook.styles.intern(Xf {
+        unlocked: true,
+        ..Xf::default()
+    });
+    for (r, c) in [(1, 2), (4, 0)] {
+        put(
+            &mut v,
+            r,
+            c,
+            Cell {
+                style: open,
+                ..Cell::default()
+            },
+        );
+    }
+    let s = v.active;
+    protect(&mut v, s);
+    type_at(&mut v, 1, 2, "=[@Qty]*[@Price]");
+    assert_eq!(value(&v, 1, 2), CellValue::Number(10.0));
+    assert_eq!(value(&v, 2, 2), CellValue::Empty, "C3 is locked");
+    assert_eq!(value(&v, 3, 2), CellValue::Empty, "C4 is locked");
+    assert!(v.pkg.workbook.tables[0].calculated_formulas.is_empty());
+    assert_eq!(v.undo_names(), ["Typing '=[@Qty]*[@Price]' in C2"]);
+    type_at(&mut v, 4, 0, "5");
+    assert_eq!(value(&v, 4, 0), CellValue::Number(5.0));
+    assert_eq!(v.pkg.workbook.tables[0].range, (0, 0, 3, 2), "not grown");
+    assert_eq!(v.undo.len(), 2);
+}
+
 // ---- #510: an act that reads or rewrites cell content commits the open editor
 
 /// #510: everything that reads or rewrites cell content or moves cells

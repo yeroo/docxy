@@ -3635,10 +3635,19 @@ impl SheetView {
     /// empty table column fills it ([`gridcore::edit::fill_calculated_column`]),
     /// each when its AutoCorrect switch is on. As in Excel, an undo step of
     /// its own after the entry's: Ctrl+Z puts the table back and keeps what
-    /// was typed.
+    /// was typed. Never on a protected sheet (#2230).
     fn table_autocorrect(&mut self, sheet: usize, at: (u32, u32)) {
         let opts = self.autocorrect.opts;
-        if !(opts.table_rows_cols || opts.table_formulas)
+        // On a protected sheet an entry goes only into its own unlocked
+        // cell (#2230): no table grows, no column fills other cells.
+        let protected = self
+            .pkg
+            .workbook
+            .sheets
+            .get(sheet)
+            .is_some_and(|sh| sh.is_protected());
+        if protected
+            || !(opts.table_rows_cols || opts.table_formulas)
             || !gridcore::edit::typed_entry_near_table(&self.pkg.workbook, sheet, at)
         {
             return;
