@@ -1912,9 +1912,12 @@ this occurrence or the whole series, as Outlook does.
   its master's id, was deleted). An `UpdateEvent` with no `fields` sends nothing,
   so it is none. The engine's `writes_event_locally` (the quarantine reset, the
   owed reset) is `event_local_write().is_some()`.
-- `apply_calendar_sync` and `apply_calendar_range` read those ops in the
-  round's own transaction (`queued_event_holds_on`) and keep their events as
-  stored (`EventHolds`): an initial round does not delete a `written` row, no
+- `apply_calendar_sync_holding` and `apply_calendar_range_holding` read those ops
+  in the round's own transaction (`queued_event_holds_on`; a row that does not
+  decode is skipped, as `fetched_body_is_kept_on` skips it) and keep their events
+  as stored (`EventHolds`), with the caller's `held` added. The plain
+  `apply_calendar_sync` / `apply_calendar_range` the older notes name are
+  `#[cfg(test)]` wrappers with no caller holds since #2031: an initial round does not delete a `written` row, no
   round upserts a held event or its attendees (a `removed` id's occurrences, by
   `series_master_id`, neither), and `fill_occurrences_on` never fills a `written`
   occurrence, even from a changed master. Before this, an initial round (a window
@@ -1926,8 +1929,7 @@ this occurrence or the whole series, as Outlook does.
   or `DeleteEvent`, and the engine may be fetching a refresh then. Right before it
   writes a refresh (`refresh_calendar`) or a fetched range (`fetch_range_gaps`),
   the engine takes the waiting commands (`take_waiting`; a shutdown writes
-  nothing) and passes their events as holds (`waiting_event_holds` into the
-  `_holding` variants): an `UpdateEvent` with `fields` as `Written`, a
+  nothing) and passes their events as `held` (`waiting_event_holds`): an `UpdateEvent` with `fields` as `Written`, a
   `DeleteEvent` as `Removed`. Not `RespondEvent`, `CancelEvent` or
   `RemoveFromCalendar`: the engine writes for those when it handles them, after
   the round, and `cancel_event` needs the row a held removal would drop. A host
@@ -1941,6 +1943,7 @@ this occurrence or the whole series, as Outlook does.
   link this round stored predates it).
 - Tests: `store/mod.rs` `event_local_write_names_the_ops_whose_command_wrote_the_row`,
   `initial_round_keeps_a_row_with_a_queued_update`,
+  `an_undecodable_outbox_row_does_not_stop_a_calendar_round`,
   `initial_round_keeps_a_queued_response`,
   `initial_round_does_not_bring_back_a_queued_delete`,
   `initial_round_does_not_bring_back_a_deleted_series`,

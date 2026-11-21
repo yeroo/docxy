@@ -1433,8 +1433,8 @@ pub struct CalendarRow {
 }
 
 /// One calendar's events as a fetch got them: a sync pass's round
-/// (`SyncedCalendar`, `Store::apply_calendar_sync`) or a range
-/// (`Store::apply_calendar_range`). Every event is stored under
+/// (`SyncedCalendar`, `Store::apply_calendar_sync_holding`) or a range
+/// (`Store::apply_calendar_range_holding`). Every event is stored under
 /// `calendar_id`, whatever its own `calendar_id` says.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FetchedCalendar {
@@ -1456,8 +1456,8 @@ pub enum EventWrite {
 }
 
 /// The events a calendar round leaves as stored (#2031): those a pending
-/// local write names. `Store::apply_calendar_sync` and
-/// `Store::apply_calendar_range` hold the events of every queued op with a
+/// local write names. `Store::apply_calendar_sync_holding` and
+/// `Store::apply_calendar_range_holding` hold the events of every queued op with a
 /// local write (`OutboxOp::event_local_write`), read in the round's own
 /// transaction, plus the ones their caller passes: the sync engine's
 /// commands not yet queued whose host wrote the store before sending them.
@@ -1511,7 +1511,7 @@ pub enum CalendarRound {
     },
 }
 
-/// One calendar of a sync pass (`Store::apply_calendar_sync`, #2013): what
+/// One calendar of a sync pass (`Store::apply_calendar_sync_holding`, #2013): what
 /// its round fetched, and the deltaLink the next pass starts from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SyncedCalendar {
@@ -1530,7 +1530,7 @@ pub struct CalendarDeltaState {
 }
 
 /// When a calendar range was fetched (#2014), for the `calendar_ranges`
-/// rows `apply_calendar_sync` and `apply_calendar_range` write: `at` is
+/// rows `apply_calendar_sync_holding` and `apply_calendar_range_holding` write: `at` is
 /// the fetch time (unix seconds), `fresh_since` the freshness cutoff
 /// (`at` minus how long a range stays fresh). A row is fresh while its
 /// `fetched_at > fresh_since` (`Store::calendar_range_gaps`), so recording
@@ -1663,7 +1663,7 @@ pub struct NewAttendee {
 
 /// Straight per-field copy: what the sync engine's `RefreshCalendar` runs for
 /// every event `GraphClient::calendar_view_in` returns, before
-/// `apply_calendar_sync`.
+/// `apply_calendar_sync_holding`.
 impl From<&Event> for NewEvent {
     fn from(e: &Event) -> Self {
         NewEvent {
@@ -4967,7 +4967,7 @@ impl Store {
     }
 
     /// Every calendar's window at once, the pre-#1984 writer: the engine now
-    /// writes a pass per calendar with `apply_calendar_sync`, which keeps
+    /// writes a pass per calendar with `apply_calendar_sync_holding`, which keeps
     /// this one's rules (the `local:` exclusion, one transaction).
     ///
     /// Replaces every event overlapping `[from_utc, to_utc)` (the same
@@ -5754,7 +5754,7 @@ impl Store {
     /// the synced (non-`local:`) events of every **stored** calendar that no
     /// longer syncs. Events of an id the list does not hold, and pre-#1984
     /// rows without a calendar id, are left to the next sync pass
-    /// (`apply_calendar_sync`), which runs only after a successful list: so
+    /// (`apply_calendar_sync_holding`), which runs only after a successful list: so
     /// a host restoring its choice at startup, before the first list,
     /// deletes nothing. Returns whether the synced set changed.
     pub fn set_calendar_selection(&self, ids: Option<&[String]>) -> Result<bool, StoreError> {
@@ -5821,25 +5821,14 @@ impl Store {
     ///
     /// No round undoes a pending local write (#2031, `EventHolds`): the
     /// events of the queued event ops with one, read in this transaction,
-    /// and `apply_calendar_sync_holding`'s `held`, keep their rows (or
+    /// and `held`, keep their rows (or
     /// their absence) until the op is gone. A kept row converges after:
     /// the op's PATCH, RSVP or DELETE changes the event on Graph, so a
     /// later delta round names it (this round's deltaLink predates it);
     /// an op that fails for good is quarantined, and its calendar reset's
-    /// initial rounds, the op gone, replace the row.
-    pub fn apply_calendar_sync(
-        &self,
-        from_utc: &str,
-        to_utc: &str,
-        fetched: &[SyncedCalendar],
-        stamp: RangeStamp,
-    ) -> Result<(), StoreError> {
-        self.apply_calendar_sync_holding(from_utc, to_utc, fetched, stamp, &EventHolds::default())
-    }
-
-    /// `apply_calendar_sync`, holding `held`'s events too (#2031): the
-    /// sync engine's waiting commands whose host wrote the store before
-    /// sending them, which have no op queued yet.
+    /// initial rounds, the op gone, replace the row. `held` adds the sync
+    /// engine's waiting commands whose host wrote the store before sending
+    /// them, which have no op queued yet.
     pub fn apply_calendar_sync_holding(
         &self,
         from_utc: &str,
@@ -5917,25 +5906,13 @@ impl Store {
 
     /// Writes one calendar's events fetched over `[from_utc, to_utc)` by a
     /// `FetchCalendarRange` (#2014), in one transaction: pre-#1984 rows
-    /// are adopted into the default calendar (`apply_calendar_sync`'s step
+    /// are adopted into the default calendar (`apply_calendar_sync_holding`'s step
     /// 1), then the calendar's synced (non-`local:`) events overlapping the
     /// range are replaced by `f`'s, and the range is recorded as fetched at
     /// `stamp`. Other calendars' rows, and rows of other calendars that no
     /// longer sync, are left to the sync pass. Rows with a pending local
-    /// write are kept as `apply_calendar_sync` keeps them (#2031,
-    /// `EventHolds`).
-    pub fn apply_calendar_range(
-        &self,
-        from_utc: &str,
-        to_utc: &str,
-        f: &FetchedCalendar,
-        stamp: RangeStamp,
-    ) -> Result<(), StoreError> {
-        self.apply_calendar_range_holding(from_utc, to_utc, f, stamp, &EventHolds::default())
-    }
-
-    /// `apply_calendar_range`, holding `held`'s events too (#2031), as
-    /// `apply_calendar_sync_holding`.
+    /// write are kept as `apply_calendar_sync_holding` keeps them, `held` too
+    /// (#2031, `EventHolds`).
     pub fn apply_calendar_range_holding(
         &self,
         from_utc: &str,
@@ -5950,6 +5927,33 @@ impl Store {
         replace_calendar_range_on(&tx, from_utc, to_utc, f, stamp, true, &holds)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// `apply_calendar_sync_holding` with no caller holds (the outbox's
+    /// still apply): the tests' writer. Test-only (#2031), so every other
+    /// caller passes its holds.
+    #[cfg(test)]
+    pub fn apply_calendar_sync(
+        &self,
+        from_utc: &str,
+        to_utc: &str,
+        fetched: &[SyncedCalendar],
+        stamp: RangeStamp,
+    ) -> Result<(), StoreError> {
+        self.apply_calendar_sync_holding(from_utc, to_utc, fetched, stamp, &EventHolds::default())
+    }
+
+    /// `apply_calendar_range_holding` with no caller holds, as
+    /// `apply_calendar_sync`. Test-only (#2031).
+    #[cfg(test)]
+    pub fn apply_calendar_range(
+        &self,
+        from_utc: &str,
+        to_utc: &str,
+        f: &FetchedCalendar,
+        stamp: RangeStamp,
+    ) -> Result<(), StoreError> {
+        self.apply_calendar_range_holding(from_utc, to_utc, f, stamp, &EventHolds::default())
     }
 
     /// The parts of `[from_utc, to_utc)` that `calendar_id`'s fetched
@@ -9556,7 +9560,7 @@ fn delete_calendar_events_on(conn: &Connection, calendar_id: &str) -> Result<(),
     Ok(())
 }
 
-/// `apply_calendar_sync`'s step 1: pre-#1984 rows (`calendar_id = ''`)
+/// `apply_calendar_sync_holding`'s step 1: pre-#1984 rows (`calendar_id = ''`)
 /// take the stored default calendar's id, when there is one.
 fn adopt_blank_calendar_rows_on(conn: &Connection) -> Result<(), StoreError> {
     if let Some(default) = default_calendar_id_on(conn)? {
@@ -9645,18 +9649,28 @@ fn upsert_fetched_events_on(
 /// `held` plus the events of every queued op with a local write
 /// (`OutboxOp::event_local_write`), as the outbox on `conn` holds them now
 /// (#2031). A `local:` id may be among them: no round replaces such a row
-/// anyway.
+/// anyway. A row that does not decode (an op from a newer build, a broken
+/// payload) is skipped, as `fetched_body_is_kept_on` skips it: it names no
+/// event this build knows, and failing here would stop every calendar
+/// round while it stays.
 fn queued_event_holds_on(conn: &Connection, held: &EventHolds) -> Result<EventHolds, StoreError> {
     let mut holds = held.clone();
-    for row in pending_ops_on(conn)? {
-        if let Some((id, write)) = row.op.event_local_write() {
+    let payloads: Vec<String> = conn
+        .prepare("SELECT payload FROM outbox ORDER BY seq ASC")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+    for payload in payloads {
+        let Ok(op) = decode_outbox_payload(&payload) else {
+            continue;
+        };
+        if let Some((id, write)) = op.event_local_write() {
             holds.hold(id, write);
         }
     }
     Ok(holds)
 }
 
-/// Applies one calendar's delta round (#2013, `apply_calendar_sync`'s
+/// Applies one calendar's delta round (#2013, `apply_calendar_sync_holding`'s
 /// step 2): `f`'s events are upserted under `f.calendar_id` with their
 /// attendees; each `removed` id deletes that calendar's non-`local:` row
 /// with that id and those whose `series_master_id` it is (a removed series
@@ -9753,7 +9767,7 @@ const SERIES_FIELDS: &str = "subject, location, organizer_name, organizer_addr,
     has_attachments, original_start_tz, original_end_tz";
 
 /// Fills `f.calendar_id`'s occurrences from their series masters (#2064),
-/// after a sync round's removals and upserts (`apply_calendar_sync`).
+/// after a sync round's removals and upserts (`apply_calendar_sync_holding`).
 ///
 /// An occurrence is filled when it is a non-`local:` `occurrence` of that
 /// calendar whose master is stored there as a `seriesMaster`, and either
@@ -10842,7 +10856,7 @@ fn sanitize_fts_query(query: &str) -> String {
 
 /// The one `INSERT ... ON CONFLICT(id) DO UPDATE` that writes an `events`
 /// row from a `NewEvent`, shared by `Store::upsert_event`,
-/// `Store::replace_events_in_window` and `Store::apply_calendar_sync` (on
+/// `Store::replace_events_in_window` and `Store::apply_calendar_sync_holding` (on
 /// their transactions, which deref to a `Connection`) so every column
 /// `NewEvent` carries is written by all three:
 /// the calendar sync once wrote its own copy without `reminder_minutes`/
@@ -17749,6 +17763,29 @@ mod calendar_tests {
             .unwrap();
         assert_edited(&s, "E1");
         assert!(s.event("E2").unwrap().is_none());
+    }
+
+    #[test]
+    fn an_undecodable_outbox_row_does_not_stop_a_calendar_round() {
+        // An op from a newer build, say: skipped, as
+        // `fetched_body_is_kept_on` skips it (#2082); the queued edit
+        // behind it is still held.
+        let s = synced_store();
+        s.conn
+            .execute(
+                "INSERT INTO outbox (op, payload) VALUES ('futureOp', 'not json')",
+                [],
+            )
+            .unwrap();
+        edit_locally(&s, "E1");
+        s.enqueue_op(&update_op("E1")).unwrap();
+        s.apply_calendar_sync(FROM, TO, &[ann_window(graph_events())], STAMP)
+            .unwrap();
+        assert_edited(&s, "E1");
+        let (a, b) = ("2026-07-20T00:00:00Z", "2026-07-22T00:00:00Z");
+        s.apply_calendar_range(a, b, &with_ann(fetched("A", graph_events())), STAMP)
+            .unwrap();
+        assert_edited(&s, "E1");
     }
 
     #[test]

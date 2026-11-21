@@ -512,7 +512,7 @@ pub enum SyncCommand {
     /// synced calendar (`Store::synced_calendar_ids`) up to date with its
     /// `calendarView/delta` (#2013): an initial round over the window, or
     /// a round from the deltaLink the last pass stored for that window,
-    /// store it (`Store::apply_calendar_sync`), and emit
+    /// store it (`Store::apply_calendar_sync_holding`), and emit
     /// [`SyncEvent::CalendarUpdated`] (#1984). Also run automatically on the
     /// periodic tick (see `Engine::on_tick`), interleaved with the mail sync
     /// pass.
@@ -534,7 +534,7 @@ pub enum SyncCommand {
     /// parts the store does not hold fresh (`Store::calendar_range_gaps`,
     /// fetched within [`EngineOptions::calendar_range_fresh_for`]) go to
     /// `calendarView`, one request per part; each is stored as it lands
-    /// (`Store::apply_calendar_range`: that calendar's synced events there
+    /// (`Store::apply_calendar_range_holding`: that calendar's synced events there
     /// replaced). Then [`SyncEvent::CalendarUpdated`] when anything was
     /// written, and [`SyncEvent::CalendarRangeFetched`]; a range wholly
     /// fresh is served from the store with no request. With no stored
@@ -9467,7 +9467,7 @@ impl Engine {
     /// `/me/calendars/{id}/calendarView/delta` round each
     /// (`calendar_delta_round`): from the calendar's stored deltaLink when
     /// it covers this window, else an initial round over it. It writes the
-    /// pass in one transaction (`Store::apply_calendar_sync`): an initial
+    /// pass in one transaction (`Store::apply_calendar_sync_holding`): an initial
     /// round replaces the calendar's window, which is what prunes an event
     /// Graph no longer returns; a delta round adds, changes and removes
     /// only what it names. Pre-#1984 rows move to the default calendar, the
@@ -9491,6 +9491,12 @@ impl Engine {
     /// calendar's delta state cleared first, so its rounds are initial),
     /// to reconverge the optimistic local write with server truth (see the
     /// quarantine branch there), and by `set_calendars`.
+    ///
+    /// Right before the write, the commands sent while the rounds fetched
+    /// are taken off the channel (`take_waiting`), and the events of those
+    /// whose host already wrote the store are held (`waiting_event_holds`,
+    /// #2031). A shutdown seen then ends the pass with nothing written or
+    /// reported: the next start runs it again.
     fn refresh_calendar(&mut self) {
         if self.token.is_none() {
             self.emit(SyncEvent::Error("not signed in".to_string()));
@@ -9874,8 +9880,10 @@ impl Engine {
     /// of `synced` over `[from, to)`, setting `wrote` once a gap is
     /// stored. `false` when the command ends early (signed out, a throttle
     /// or back-off wait, a 401, throttle or transport error, a store
-    /// error; each already reported), so no `CalendarRangeFetched` follows.
-    /// A 404, HTTP or parse error (reported by `react`) leaves that gap and
+    /// error; each already reported), so no `CalendarRangeFetched` follows;
+    /// or a shutdown seen before a gap is written (#2031: the commands
+    /// waiting are taken first, so a held edit or delete keeps its row),
+    /// which writes and reports nothing. A 404, HTTP or parse error (reported by `react`) leaves that gap and
     /// the calendar's later gaps unfetched and unrecorded, its earlier gaps
     /// stay written, and the next calendar carries on.
     fn fetch_range_gaps(
