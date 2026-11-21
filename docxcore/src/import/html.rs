@@ -4741,7 +4741,7 @@ mod tests {
         let off = "<w:i w:val=\"0\"/>".to_string();
         let head = run_of(&d, "head");
         assert!(!head.props.italic);
-        assert_eq!(head.props.raw_props, [off.clone()]);
+        assert_eq!(head.props.raw_props, std::slice::from_ref(&off));
         let em = run_of(&d, "em");
         assert!(em.props.italic);
         assert!(em.props.raw_props.is_empty(), "{:?}", em.props.raw_props);
