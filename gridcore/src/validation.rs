@@ -339,12 +339,15 @@ pub fn pick_cell(
     };
     // An absent cell takes the style its row or column gives it, as a typed
     // entry does (#1660): an unlocked column's cell stays unlocked (#2230).
-    let mut cell = wb.sheets.get(sheet).map_or_else(Cell::default, |s| {
-        s.cell(row, col).cloned().unwrap_or_else(|| Cell {
-            style: s.entry_style_at(row, col),
+    let mut cell = wb
+        .sheets
+        .get(sheet)
+        .and_then(|s| s.cell(row, col))
+        .cloned()
+        .unwrap_or_else(|| Cell {
+            style: crate::entry::base_style(wb, sheet, row, col),
             ..Cell::default()
-        })
-    });
+        });
     cell.value = value;
     cell.formula = None;
     cell.f_attrs = None;
@@ -510,11 +513,7 @@ fn breaks(
 
 /// The number format of the cell at (row, col) as typing into it reads it.
 fn target_xf(wb: &Workbook, sheet: usize, row: u32, col: u32) -> crate::sheet::Xf {
-    let style = wb
-        .sheets
-        .get(sheet)
-        .map_or(0, |s| s.entry_style_at(row, col));
-    wb.styles.xf(style)
+    wb.styles.xf(crate::entry::base_style(wb, sheet, row, col))
 }
 
 /// What typing the inline list item `item` into a cell formatted `xf` gives
