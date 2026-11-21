@@ -1024,7 +1024,7 @@ impl Cascade {
     /// `center` alignment, the blockquote margins. A heading starts with no
     /// explicit not-bold: only a declaration on it or inside it makes one
     /// (an ancestor's `font:` shorthand must not, #1872 r1).
-    fn user_agent(&mut self, key: &ElemKey) {
+    fn user_agent(&mut self, key: &ElemKey, quirks: bool) {
         if starts_heading(key) {
             self.look.bold_off = false;
         }
@@ -1033,6 +1033,17 @@ impl Cascade {
             // A table's cells align by their own rows (#1878).
             self.is_table = true;
             self.look.valign = None;
+            if quirks {
+                // A quirks-mode browser's `table { font-size: medium;
+                // font-weight: normal; font-style: normal }` (#1883): the
+                // body's font size, weight and style stop at a table; its
+                // family and colour still pass in. A reset, not a
+                // declared off: no explicit `w:b w:val="0"`.
+                self.look.run.size_half_pts = None;
+                self.look.run.bold = false;
+                self.look.bold_off = false;
+                self.look.run.italic = false;
+            }
         }
         self.is_img = tag == "img";
         let run = &mut self.look.run;
@@ -1600,6 +1611,8 @@ fn image_radius(corners: [Option<Len>; 4], font_pt: f64) -> Option<html_image::R
 struct Ctx<'c> {
     sheet: &'c StyleSheet,
     budget: &'c Budget,
+    /// The page is in quirks mode: a `table` resets the font (#1883).
+    quirks: bool,
 }
 
 /// The look of an element opening on top of `below`: its parent's, then the
@@ -1614,7 +1627,7 @@ fn look_of(
     card: CardMode,
 ) -> Look {
     let mut c = Cascade::new(below.last().map(|e| &e.look), kind, card);
-    c.user_agent(key);
+    c.user_agent(key, ctx.quirks);
     c.presentational(&key.tag, attrs);
     let hits = ctx.sheet.matching(
         &Ancestry {
@@ -2253,6 +2266,7 @@ impl<'a> Html<'a> {
         Ctx {
             sheet: &self.sheet,
             budget: self.budget,
+            quirks: self.quirks,
         }
     }
 
@@ -2274,6 +2288,7 @@ impl<'a> Html<'a> {
                 Ctx {
                     sheet: &self.sheet,
                     budget: self.budget,
+                    quirks: self.quirks,
                 },
                 below,
                 &e.key,
@@ -4694,6 +4709,42 @@ mod tests {
         assert!(bold.props.raw_props.is_empty());
         assert!(run_of(&d, "body").props.raw_props.is_empty());
         assert!(run_of(&d, "default").props.raw_props.is_empty());
+    }
+
+    #[test]
+    fn quirks_tables_reset_font_size_weight_and_style_1883() {
+        let body = "<body style='font-size:14px;font-weight:bold;font-style:italic;\
+                    font-family:Georgia;color:#336699'><p>out</p>\
+                    <table><tr><td>in</td></tr></table></body>";
+        // Quirks mode (no doctype): the table starts at medium, not bold,
+        // not italic; family and colour still inherit.
+        let d = doc(body);
+        let out = run_of(&d, "out").props;
+        assert_eq!(out.size_half_pts, Some(21));
+        assert!(out.bold && out.italic);
+        let inner = run_of(&d, "in").props;
+        assert_eq!(inner.size_half_pts, None);
+        assert!(!inner.bold && !inner.italic);
+        assert!(inner.raw_props.is_empty(), "{:?}", inner.raw_props);
+        assert_eq!(inner.font.as_deref(), Some("Georgia"));
+        assert_eq!(inner.color.as_deref(), Some("336699"));
+        // Standards mode inherits all of it.
+        let d = doc(&format!("<!DOCTYPE html>{body}"));
+        let inner = run_of(&d, "in").props;
+        assert_eq!(inner.size_half_pts, Some(21));
+        assert!(inner.bold && inner.italic);
+        // The table's own style and its cells' still apply over the reset.
+        let d = doc(
+            "<body style='font-size:20px'><table style='font-size:10px'><tr>\
+             <td style='font-weight:bold'>own</td><td><i>em</i></td></tr></table>\
+             <table><tr><td style='font-size:80%'>pct</td></tr></table></body>",
+        );
+        let own = run_of(&d, "own").props;
+        assert_eq!(own.size_half_pts, Some(15));
+        assert!(own.bold);
+        assert!(run_of(&d, "em").props.italic);
+        // A percentage on a cell is of the table's medium (12 pt).
+        assert_eq!(run_of(&d, "pct").props.size_half_pts, Some(19));
     }
 
     #[test]
