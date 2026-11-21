@@ -756,7 +756,11 @@ A batch from #1989 and #1930 (plan-2), import only.
   Word's `<br clear=all style='page-break-before:always'>` is a page break
   run (`br_breaks_page`, its look computed only with attributes or a sheet
   rule that could match a `br`); `Builder::has_page_break` keeps its
-  paragraph from being dropped as empty.
+  paragraph from being dropped as empty. A paragraph that shows nothing
+  (hidden) takes no break: it passes it on (`break_pending`) to the next
+  that shows (r4). A hidden block forces none (r3). A break before a block
+  whose first content is a table is lost (Word ignores one in a first
+  cell).
 - Paragraph borders (`css::border_shorthand`, `border_sides`,
   `Cascade::border_decl`, `own_borders`): `border`, `border-<side>` and
   the `-width`/`-style`/`-color` longhands, on a block only (cells, cards,
@@ -765,16 +769,21 @@ A batch from #1989 and #1930 (plan-2), import only.
   dotted and dashed their own; `sz` is the width in eighths of a point
   (2..96); the colour is the element's text colour unless given,
   `windowtext` automatic, `transparent` or a zero alpha no line, a partial
-  alpha blended over white (`rgba(0,0,0,0.1)` is `E6E6E6`; r3). A
+  alpha blended over white (`rgba(0,0,0,0.1)` is `E6E6E6`; r3; `hsl()` /
+  `hsla()` read since r4, for text colours too). A
   block's left and right lines go on every paragraph in it, an inner
   block's own over the outer's (`ParBorders::over`): Outlook's quote line
   goes on through its header, and Word's `<p style='border:none'>` in a
   bordered `div` keeps the box. Its top line goes only on the first
-  paragraph that starts in it (`Html::first_top`, the fresh walk of
-  `top_spacing`; the innermost block's wins) and its bottom line on the
-  last ended in it when it closes (`apply_bottom`, unless a block inside
-  closed first and gave that paragraph its own), so a box around a list
-  or a ruled title is still one box (r3). Geometry as a browser's box: a
+  paragraph in it that shows anything (`Html::take_top`,
+  `Elem::top_placed`: past a table, a card or a hidden paragraph before
+  it; the innermost block's wins, and the outer's is placed with it) and
+  its bottom line on the last such when it closes (`apply_bottom`,
+  `Builder::last_shown_para_mut`: past a table or a hidden paragraph
+  after it; unless a block inside closed first and gave that paragraph
+  its own), so a box around a list or a ruled title is still one box (r3,
+  r4). A paragraph shows anything (`import::shows`) when some content is
+  not `vanish`, or with none, when its mark is not. Geometry as a browser's box: a
   left/right line moves the text in by its width; each paragraph's
   left/right `w:space` is its indent less the line's place
   (`Look::border_left_x`) and width, in whole points up to 31, so an item
@@ -792,7 +801,9 @@ A batch from #1989 and #1930 (plan-2), import only.
   lines break across the spacing between them (the suite draws a group's
   strips inside its own spacing only); a margin inside a top/bottom line
   is spacing outside it in Word; nested boxes are one box; a transparent
-  line's width is not kept as room.
+  line's width is not kept as room; a box holding only a table (or card)
+  loses its lines (cell and table borders from a box are out of scope),
+  and one that starts with a table draws its top under it.
 - Selectors (`css.rs`): attribute selectors (`[a]`, `=`, `~=`, `|=`, `^=`,
   `$=`, `*=`, `i`/`s`; the HTML Standard's `CASELESS_ATTRS` compare values
   without case, so `td[align=center]` matches `align=Center`), `+`,
@@ -816,11 +827,13 @@ A batch from #1989 and #1930 (plan-2), import only.
   O(compounds × depth). Not done: `~` and `:first-of-type` (the whole
   sibling list, quadratic on long pages), `:last-child`, `:nth-*`,
   `:not()`, `:hover`/`:visited`, pseudo-elements, escapes.
-- An unclosed `<head>` ends at the first `<body` (`Html::skip_head`,
-  `find_tag_ci`: `</header` is no `</head`), which then opens; with
-  neither, the rest is the head's, as before. The `<style>` pre-pass
-  (`collect_styles`) reads a head's styles either way (r3, a fix to code
-  older than #1883).
+- A `head` ends as a browser ends it (`Html::skip_head`, r3, r4; a fix
+  to code older than #1883), in one forward scan charged as scanned:
+  white space, comments, `<!…>`, `HEAD_VOID` tags and raw-text elements
+  (skipped whole, so a `<body>` in a script is none) are passed over, a
+  stray end tag is ignored, `</head>` ends it, and any other start tag
+  (`<body`, a `<p>`) or text ends it and opens. The `<style>` pre-pass
+  (`collect_styles`) reads a head's styles either way.
 - Tests (`import/html.rs` unless named): `quirks_tables_reset_font_size_weight_and_style_1883`,
   `italic_off_is_explicit_under_a_heading_only_1883`,
   `dir_rtl_is_paragraph_bidi_and_swaps_alignment_1883`,
@@ -842,6 +855,8 @@ A batch from #1989 and #1930 (plan-2), import only.
   `sibling_bordered_blocks_group_as_word_draws_them_1883`,
   `a_box_s_top_and_bottom_are_on_its_first_and_last_paragraphs_1883`,
   `an_unclosed_head_ends_at_the_body_1883`,
+  `many_heads_are_skipped_in_linear_time_1883`,
+  `a_box_s_lines_pass_over_tables_cards_and_hidden_paragraphs_1883`,
   `many_elements_with_sibling_and_attribute_rules_import_1883`; `css.rs`:
   `a_value_past_the_cap_is_present_but_never_matches_a_test_1883`,
   `borders_shorthands_and_longhands_1883`,

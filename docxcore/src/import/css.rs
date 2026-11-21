@@ -1141,7 +1141,66 @@ fn rgb(lower: &str) -> Option<String> {
         }
         return Some(out);
     }
+    if let Some(args) = lower
+        .strip_prefix("hsla(")
+        .or_else(|| lower.strip_prefix("hsl("))
+    {
+        return hsl(args.strip_suffix(')')?);
+    }
     named_color(lower).map(str::to_string)
+}
+
+/// An `hsl()` / `hsla()` colour's arguments (#1883 r4): a hue (degrees,
+/// `deg`, `turn` or `rad`), saturation and lightness (percentages, or plain
+/// numbers as percentages), an optional alpha; a zero alpha is none, as
+/// in [`rgb`]. `RRGGBB`.
+fn hsl(args: &str) -> Option<String> {
+    let parts: Vec<&str> = args
+        .split([',', ' ', '/'])
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.len() != 3 && parts.len() != 4 {
+        return None;
+    }
+    if let Some(a) = parts.get(3) {
+        let alpha = match a.strip_suffix('%') {
+            Some(p) => p.parse::<f64>().ok()? / 100.0,
+            None => a.parse::<f64>().ok()?,
+        };
+        if alpha <= 0.0 {
+            return None;
+        }
+    }
+    let h = parts[0];
+    let degrees = if let Some(t) = h.strip_suffix("turn") {
+        t.parse::<f64>().ok()? * 360.0
+    } else if let Some(r) = h.strip_suffix("rad") {
+        r.parse::<f64>().ok()?.to_degrees()
+    } else {
+        h.strip_suffix("deg").unwrap_or(h).parse::<f64>().ok()?
+    };
+    let pct = |p: &str| -> Option<f64> {
+        let v = p.strip_suffix('%').unwrap_or(p).parse::<f64>().ok()?;
+        Some((v / 100.0).clamp(0.0, 1.0))
+    };
+    let (sat, light) = (pct(parts[1])?, pct(parts[2])?);
+    if !degrees.is_finite() {
+        return None;
+    }
+    let h = degrees.rem_euclid(360.0) / 60.0;
+    let c = (1.0 - (2.0 * light - 1.0).abs()) * sat;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = light - c / 2.0;
+    let byte = |v: f64| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    Some(format!("{:02X}{:02X}{:02X}", byte(r), byte(g), byte(b)))
 }
 
 fn hex_rgb(hex: &str) -> Option<String> {
@@ -1607,8 +1666,8 @@ impl Default for BorderSide {
 }
 
 impl BorderSide {
-    /// Whether it draws a line: a style other than `none` and a width
-    /// above 0.
+    /// Whether it draws a line: a style other than `none`, a width above 0
+    /// and a colour (not `transparent` or a zero alpha).
     pub(crate) fn drawn(&self) -> bool {
         self.style != BorderStyle::None && self.width.v > 0.0 && self.color != BorderColor::None
     }
@@ -2021,6 +2080,20 @@ mod tests {
         assert_eq!(c("rgb(300,-4,0)"), Some(Color::Rgb("FF0000".into())));
         assert_eq!(c("Navy"), Some(Color::Rgb("000080".into())));
         assert_eq!(c("rebeccapurple"), Some(Color::Rgb("663399".into())));
+        // `hsl()` / `hsla()` (#1883 r4).
+        assert_eq!(c("hsl(0, 100%, 50%)"), Some(Color::Rgb("FF0000".into())));
+        assert_eq!(c("hsl(120 100% 25%)"), Some(Color::Rgb("008000".into())));
+        assert_eq!(
+            c("HSL(0.5turn, 100%, 50%)"),
+            Some(Color::Rgb("00FFFF".into()))
+        );
+        assert_eq!(
+            c("hsla(300deg,100%,50%,0.4)"),
+            Some(Color::Rgb("FF00FF".into()))
+        );
+        assert_eq!(c("hsl(-120, 100%, 50%)"), Some(Color::Rgb("0000FF".into())));
+        assert_eq!(c("hsla(0,0%,0%,0)"), None);
+        assert_eq!(c("hsl(x, 1%, 1%)"), None);
         assert_eq!(c("windowtext"), Some(Color::Reset));
         assert_eq!(c("auto"), Some(Color::Reset));
         assert_eq!(c("inherit"), Some(Color::Keep));
@@ -2263,6 +2336,12 @@ mod tests {
         assert_eq!(c("rgba(0,0,0,0.1)"), BorderColor::Rgb("E6E6E6".into()));
         assert_eq!(c("rgb(0 0 255 / 50%)"), BorderColor::Rgb("8080FF".into()));
         assert_eq!(c("rgba(204,204,204,1)"), BorderColor::Rgb("CCCCCC".into()));
+        // `hsl()` too (r4): its colour, and a partial alpha blended.
+        assert_eq!(
+            c("hsla(240,100%,50%,0.5)"),
+            BorderColor::Rgb("8080FF".into())
+        );
+        assert_eq!(c("hsl(0 0% 80%)"), BorderColor::Rgb("CCCCCC".into()));
         assert!(!border_shorthand("1px solid transparent").unwrap().drawn());
         assert!(
             border_shorthand("1px solid rgba(0,0,0,0.1)")

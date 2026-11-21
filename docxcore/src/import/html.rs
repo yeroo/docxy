@@ -533,8 +533,8 @@ struct Look {
     border_before: bool,
     border_after: bool,
     /// Those lines (not inherited, #1883 r3): the top goes on the first
-    /// paragraph that starts in the block ([`Html::first_top`]), the bottom
-    /// on the last ended in it when it closes ([`Html::apply_bottom`]).
+    /// paragraph in the block that shows anything ([`Html::take_top`]), the
+    /// bottom on the last when it closes ([`Html::apply_bottom`]).
     own_top: Option<ParBorder>,
     own_bottom: Option<ParBorder>,
     /// Inside a list (inherited, #2114): a list in it is nested, with no
@@ -614,6 +614,10 @@ struct Elem {
     /// its parent's [`Kids`] can tell it apart from another child without
     /// comparing keys.
     serial: u64,
+    /// Its own top line ([`Look::own_top`]) has gone on a paragraph (#1883
+    /// r4): the first that shows anything, whatever came before it in the
+    /// block (a table, a card, a hidden paragraph).
+    top_placed: bool,
     /// Its own element children so far (#1883).
     kids: Kids,
     kind: Kind,
@@ -666,6 +670,9 @@ const RAW_TEXT: [&str; 11] = [
     "style", "script", "title", "xml", "noscript", "template", "object", "svg", "iframe", "select",
     "textarea",
 ];
+
+/// Void elements a `head` holds, passed over there ([`Html::skip_head`]).
+const HEAD_VOID: [&str; 5] = ["meta", "link", "base", "basefont", "bgsound"];
 
 /// Void elements: nothing opens, nothing is inside (`hr` ends an open `p`
 /// first).
@@ -2296,21 +2303,68 @@ impl<'a> Html<'a> {
         }
     }
 
-    /// Skip a `head`'s content (#1883 r3): to just after its `</head>`, or
-    /// to a `<body` that comes first (left to open), as a browser ends the
-    /// head when the body starts. `</header` is no `</head`. With neither,
-    /// the rest of the page is the head's.
+    /// Skip a `head`'s content (#1883 r3, r4), as a browser ends it, in one
+    /// forward scan charged as scanned: white space, comments, `<!…>` /
+    /// `<?…>`, head-only void tags (`meta`, `link`, …) and raw-text elements
+    /// (`title`, `style`, `script`, …, skipped whole, so a `<body>` in a
+    /// script is not one) are passed over; a stray end tag is ignored;
+    /// `</head>` ends it, its `>` passed; any other start tag (`<body`, a
+    /// `<p>`) or text ends it with `pos` left before it, so that opens.
     fn skip_head(&mut self) {
-        let rest = &self.s[self.pos..];
-        let close = find_tag_ci(rest, "</head");
-        let body = find_tag_ci(rest, "<body");
-        match (close, body) {
-            (Some(c), b) if b.is_none_or(|b| c < b) => {
-                self.pos += c;
-                self.skip_past(">");
+        let start = self.pos;
+        while self.pos < self.s.len() {
+            let rest = &self.s[self.pos..];
+            let trimmed = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+            self.pos += rest.len() - trimmed.len();
+            let rest = trimmed;
+            if rest.is_empty() {
+                break;
             }
-            (_, Some(b)) => self.pos += b,
-            _ => self.pos = self.s.len(),
+            if rest.starts_with("<!--") {
+                self.pos += 4;
+                self.skip_past("-->");
+                continue;
+            }
+            if rest.starts_with("<!") || rest.starts_with("<?") {
+                self.skip_past(">");
+                continue;
+            }
+            // Text ends the head.
+            let Some(after) = rest.strip_prefix('<') else {
+                break;
+            };
+            let close = after.starts_with('/');
+            let name_part = if close { &after[1..] } else { after };
+            let name_len = name_part
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == ':' || c == '-'))
+                .unwrap_or(name_part.len());
+            if name_len == 0 {
+                // A `<` that starts no tag is text.
+                break;
+            }
+            let name = name_part[..name_len].to_ascii_lowercase();
+            let end = tag_end(rest).unwrap_or(rest.len());
+            if close {
+                self.pos += end;
+                if name == "head" {
+                    break;
+                }
+                continue;
+            }
+            if RAW_TEXT.contains(&name.as_str()) {
+                self.pos += end;
+                self.skip_past(&format!("</{name}"));
+                self.skip_past(">");
+                continue;
+            }
+            if HEAD_VOID.contains(&name.as_str()) {
+                self.pos += end;
+                continue;
+            }
+            break;
+        }
+        if !self.budget.scanned(self.pos - start) {
+            self.pos = self.s.len();
         }
     }
 
@@ -2719,6 +2773,7 @@ impl<'a> Html<'a> {
             self.elems.push(Elem {
                 key,
                 serial,
+                top_placed: false,
                 kids: Kids::default(),
                 kind,
                 look,
@@ -2898,6 +2953,7 @@ impl<'a> Html<'a> {
                     reopen.push(Elem {
                         key: std::mem::take(&mut e.key),
                         serial: 0,
+                        top_placed: false,
                         kids: Kids::default(),
                         kind: e.kind,
                         look: Look::default(),
@@ -3560,27 +3616,25 @@ impl<'a> Html<'a> {
         !in_table
     }
 
-    /// The top line of the paragraph ended now (#1883 r3): the innermost
-    /// own top of the blocks it is the first paragraph of (the walk
-    /// [`Self::top_spacing`] makes), none once one is stale.
-    fn first_top(&self) -> Option<ParBorder> {
+    /// The top line of a paragraph ended now that shows anything (#1883
+    /// r3, r4): the innermost own top of the blocks of its flow it is in
+    /// whose top has not gone on a paragraph yet; every such block's is
+    /// placed now (Word draws one box, and its top is the innermost's).
+    fn take_top(&mut self) -> Option<ParBorder> {
         if !self.budget.work(self.elems.len() / 16 + 1) {
             return None;
         }
-        for e in self.elems.iter().rev() {
+        let mut top = None;
+        for e in self.elems.iter_mut().rev() {
             if e.kind.table() || matches!(e.card, CardMode::Yes(_)) {
                 break;
             }
-            if matches!(e.kind, Kind::Block | Kind::List) {
-                if !self.fresh(e) {
-                    break;
-                }
-                if e.look.own_top.is_some() {
-                    return e.look.own_top;
-                }
+            if e.kind == Kind::Block && e.look.own_top.is_some() && !e.top_placed {
+                top = top.or(e.look.own_top);
+                e.top_placed = true;
             }
         }
-        None
+        top
     }
 
     /// Whether the paragraph ended now starts a page (#1883): a block or
@@ -3725,10 +3779,12 @@ impl<'a> Html<'a> {
         if depth != self.table_depth || self.out.flow_len(in_table).is_none_or(|n| n <= at) {
             return;
         }
-        // Its bottom line goes on its last paragraph (#1883 r3), unless a
-        // block inside it, closed first, gave that paragraph its own.
+        // Its bottom line goes on the last paragraph in it that shows
+        // anything (#1883 r3, r4: a table or a hidden paragraph after it is
+        // passed over), unless a block inside it, closed first, gave that
+        // paragraph its own.
         if let Some(bottom) = e.look.own_bottom {
-            if let Some(p) = self.out.flow_last_mut(in_table) {
+            if let Some(p) = self.out.last_shown_para_mut(in_table, at) {
                 p.borders.bottom.get_or_insert(bottom);
             }
         }
@@ -3935,11 +3991,20 @@ impl<'a> Html<'a> {
         {
             self.out.clear_para();
         }
+        // A paragraph that shows nothing (hidden) takes neither a forced
+        // break nor a box's top: they wait for the next that shows (r4).
+        let shows = self.out.para_shows(crate::import::mark_vanish(&props));
         if self.page_break_before(in_table) {
-            props.raw_props.push(PAGE_BREAK_BEFORE.to_string());
+            if shows {
+                props.raw_props.push(PAGE_BREAK_BEFORE.to_string());
+            } else {
+                self.break_pending = true;
+            }
         }
-        if let Some(top) = self.first_top() {
-            props.borders.top = Some(top);
+        if shows {
+            if let Some(top) = self.take_top() {
+                props.borders.top = Some(top);
+            }
         }
         props.spacing.before = Some(self.top_spacing(in_table));
         self.out.end_para(props, in_table);
@@ -4047,22 +4112,6 @@ fn tag_end(s: &str) -> Option<usize> {
             None if b == b'>' => return Some(i + 1),
             None => {}
         }
-    }
-    None
-}
-
-/// Where `lower_tag` (`</head`, `<body`) first starts a tag in `hay`,
-/// ASCII case-insensitively: followed by `>`, `/`, white space or the end,
-/// so `</head` is not found in `</header`.
-fn find_tag_ci(hay: &str, lower_tag: &str) -> Option<usize> {
-    let mut from = 0;
-    while let Some(i) = find_ci(&hay[from..], lower_tag) {
-        let at = from + i;
-        let next = hay.as_bytes().get(at + lower_tag.len());
-        if next.is_none_or(|b| *b == b'>' || *b == b'/' || b.is_ascii_whitespace()) {
-            return Some(at);
-        }
-        from = at + 1;
     }
     None
 }
@@ -5580,6 +5629,49 @@ mod tests {
     }
 
     #[test]
+    fn a_box_s_lines_pass_over_tables_cards_and_hidden_paragraphs_1883() {
+        // r4 M1, m1: the top goes on the first paragraph in the box that
+        // shows anything, the bottom on the last, past a table, a card or
+        // a hidden paragraph at either end.
+        let boxed = |inner: &str| {
+            doc(&format!(
+                "<div style='border:1px solid #cccccc'>{inner}</div><p>outside</p>"
+            ))
+        };
+        let d = boxed("<table><tr><td>cell</td></tr></table><p>Note</p>");
+        assert_eq!(box_sides(&d, &["Note"]), [(true, true, true)]);
+        assert!(para_of(&d, "cell").props.borders.is_empty());
+        let d = boxed("<p>Order</p><table><tr><td>row</td></tr></table>");
+        assert_eq!(box_sides(&d, &["Order"]), [(true, true, true)]);
+        assert!(para_of(&d, "row").props.borders.is_empty());
+        assert!(para_of(&d, "outside").props.borders.is_empty());
+        // A hidden preheader first and an `mso-hide` block last.
+        let d = boxed(
+            "<div style='display:none'>preheader</div><p>First</p><p>Last</p>\
+             <div style='mso-hide:all'>hidden end</div>",
+        );
+        assert_eq!(
+            box_sides(&d, &["preheader", "First", "Last", "hidden end"]),
+            [
+                (false, false, true),
+                (true, false, true),
+                (false, true, true),
+                (false, false, true),
+            ]
+        );
+        // A card at a box's start, in a cell: its own flow takes nothing.
+        let d = doc("<table><tr><td><div style='border:1px solid #cccccc'>\
+             <div style='background:#eeeeee'>card</div><p>after card</p></div>\
+             </td></tr></table>");
+        assert_eq!(box_sides(&d, &["after card"]), [(true, true, true)]);
+        assert!(para_of(&d, "card").props.borders.is_empty());
+        // A box holding only a table loses its lines (a known limit).
+        let d = boxed("<table><tr><td>only</td></tr></table>");
+        assert!(para_of(&d, "only").props.borders.is_empty());
+        assert!(para_of(&d, "outside").props.borders.is_empty());
+    }
+
+    #[test]
     fn sibling_bordered_blocks_group_as_word_draws_them_1883() {
         // r2 (planner's decision): Word, and classic Outlook through it,
         // joins consecutive paragraphs with equal borders and indents into
@@ -5914,7 +6006,10 @@ mod tests {
              <table><tr><td><p style='page-break-after:always'>x</p></td></tr></table>\
              <p>nine</p>\
              <div style='display:none;page-break-after:always'>hidden</div><p>ten</p>\
-             <div style='display:none;page-break-before:always'></div><p>eleven</p>");
+             <div style='display:none;page-break-before:always'></div><p>eleven</p>\
+             <div style='break-before:page'><p style='display:none'>pre</p><p>twelve</p></div>\
+             <p style='page-break-after:always'>thirteen</p>\
+             <p style='mso-hide:all'>mso gone</p><p>fourteen</p>");
         let b = |t: &str| breaks_page(&para_of(&d, t));
         // None at the document's start, where a browser breaks no page.
         assert!(!b("first"));
@@ -5931,6 +6026,10 @@ mod tests {
         assert!(!b("nine"));
         // A hidden block breaks nothing (r3).
         assert!(!b("ten") && !b("eleven"));
+        // A hidden paragraph passes a break on to the next that shows
+        // (r4).
+        assert!(!b("pre") && b("twelve"));
+        assert!(!b("mso gone") && b("fourteen"));
         let back = reloaded(&d);
         assert!(breaks_page(&para_of(&back, "one")));
     }
@@ -6030,6 +6129,35 @@ mod tests {
         assert_eq!(paragraph_texts(&d), ["one"]);
         let d = doc("<head><meta charset=utf-8><BODY bgcolor=white><p>two</p>");
         assert_eq!(paragraph_texts(&d), ["two"]);
+        // r4: a `<body>` in a script is no body; a flow element or text
+        // ends the head too, as in a browser.
+        let d = doc("<head><script>var s=\"<body>\";</script></head><p>x</p>");
+        assert_eq!(paragraph_texts(&d), ["x"]);
+        let d = doc("<head><title>t</title><p>x");
+        assert_eq!(paragraph_texts(&d), ["x"]);
+        let d = doc("<head><title>t</title>loose text<p>y</p>");
+        assert_eq!(paragraph_texts(&d), ["loose text", "y"]);
+        // Word's head: meta, a conditional comment with XML, a style.
+        let d = doc(
+            "<html><head><meta http-equiv=Content-Type content='text/html'>\
+             <link rel=File-List href=x.xml><!--[if gte mso 9]><xml><o:x>junk</o:x></xml>\
+             <![endif]--><style><!-- p.MsoNormal {color:red} --></style></head>\
+             <body><p class=MsoNormal>w</p></body></html>",
+        );
+        assert_eq!(paragraph_texts(&d), ["w"]);
+        assert_eq!(run_of(&d, "w").props.color.as_deref(), Some("FF0000"));
+    }
+
+    #[test]
+    fn many_heads_are_skipped_in_linear_time_1883() {
+        // r4 M2: each `head` is one forward scan of its own content, not of
+        // the rest of the page.
+        let mut page = "<head></head>".repeat(200_000);
+        page.push_str("<p>end</p>");
+        let start = std::time::Instant::now();
+        let d = doc(&page);
+        assert!(start.elapsed().as_secs() < 20, "{:?}", start.elapsed());
+        assert_eq!(paragraph_texts(&d), ["end"]);
     }
 
     #[test]

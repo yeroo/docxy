@@ -369,6 +369,30 @@ pub(crate) fn marker_is_numbered(marker: &str) -> bool {
 
 /// An inline that is neither text nor a break nor a link: an object,
 /// content of its own. A link (#1879) counts by its text.
+/// Whether a paragraph of `content` shows anything (#1883 r4): some of it
+/// not hidden (`vanish`), or, with none, a mark not hidden. A picture or
+/// other object always shows.
+pub(crate) fn shows(content: &[Inline], mark_vanish: bool) -> bool {
+    if content.is_empty() {
+        return !mark_vanish;
+    }
+    content.iter().any(|i| match i {
+        Inline::Run(r) => !r.props.vanish,
+        Inline::Hyperlink(h) => h.runs.iter().any(|r| !r.props.vanish),
+        Inline::Break(_, p) | Inline::Tab(p) => !p.vanish,
+        _ => true,
+    })
+}
+
+/// Whether a paragraph's mark (its `w:rPr` in `raw_props`, as the HTML
+/// import writes it) is hidden.
+pub(crate) fn mark_vanish(props: &ParProps) -> bool {
+    props
+        .raw_props
+        .iter()
+        .any(|r| r.starts_with("<w:rPr") && r.contains("<w:vanish/>"))
+}
+
 fn is_object(inline: &Inline) -> bool {
     !matches!(
         inline,
@@ -590,6 +614,36 @@ impl<'b> Builder<'b> {
         {
             self.para.pop();
         }
+    }
+
+    /// Whether the paragraph in progress shows anything, its mark hidden
+    /// or not ([`shows`], #1883).
+    pub(crate) fn para_shows(&self, mark_vanish: bool) -> bool {
+        shows(&self.para, mark_vanish)
+    }
+
+    /// The properties of the last paragraph that shows anything among the
+    /// flow's blocks from `from` on (#1883 r4): a table or a hidden
+    /// paragraph after it is passed over. A unit of work per block looked
+    /// at.
+    pub(crate) fn last_shown_para_mut(
+        &mut self,
+        in_table: bool,
+        from: usize,
+    ) -> Option<&mut ParProps> {
+        let budget = self.budget;
+        let (blocks, _) = self.flow_mut(in_table)?;
+        for b in blocks.get_mut(from..)?.iter_mut().rev() {
+            if !budget.op() {
+                return None;
+            }
+            if let Block::Paragraph(p) = b {
+                if shows(&p.content, mark_vanish(&p.props)) {
+                    return Some(&mut p.props);
+                }
+            }
+        }
+        None
     }
 
     /// Whether the paragraph in progress holds a page break (#1883): kept
