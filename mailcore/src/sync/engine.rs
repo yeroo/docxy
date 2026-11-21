@@ -24704,6 +24704,112 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn queued_event_edit_survives_deselecting_its_calendar() {
+        // #2017. B1's PATCH gets a 500 and stays queued; the host then
+        // deselects CAL-B. B1's row must stay until F9 resends the edit,
+        // which reads it: deleted, the op fails on every attempt until it
+        // is quarantined, and the edit never reaches Graph.
+        let mut routes = vec![
+            (
+                patch_route("/me/events/B1", 500, ""),
+                Some(1),
+                Duration::ZERO,
+            ),
+            (
+                patch_route("/me/events/B1", 200, "{}"),
+                None,
+                Duration::ZERO,
+            ),
+        ];
+        routes.extend(
+            calendar_routes(
+                &[("CAL-A", true, "me@x"), ("CAL-B", false, "me@x")],
+                vec![
+                    ("CAL-A", 200, events_body(&[event_from_now("EA", 3600)])),
+                    ("CAL-B", 200, events_body(&[event_from_now("B1", 7200)])),
+                ],
+            )
+            .into_iter()
+            .map(|r| (r, None, Duration::ZERO)),
+        );
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_paced(
+            "queued-edit-survives-deselect",
+            routes,
+            |_| {},
+            EngineOptions::without_prefetch(),
+        );
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-B"), ["B1"]);
+        let row = store.event("B1").unwrap().unwrap();
+        let fields = store
+            .update_event_fields(
+                "B1",
+                &crate::store::LocalEventFields {
+                    subject: "Edited".into(),
+                    start_utc: row.start_utc,
+                    end_utc: row.end_utc,
+                    location: row.location,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEvent {
+                id: "B1".into(),
+                fields,
+            })
+            .unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || patch_bodies(&srv, "/me/events/B1").len()
+                == 1
+                && store.pending_ops().unwrap().len() == 1),
+            "B1's PATCH did not fail and stay queued: {:?}",
+            method_paths(&srv)
+        );
+
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetCalendars {
+                ids: Some(vec!["CAL-A".into()]),
+            })
+            .unwrap();
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::CalendarsUpdated));
+        let kept = store.event("B1").unwrap().expect("B1's row is kept");
+        assert_eq!(
+            (kept.subject.as_str(), kept.calendar_id.as_str()),
+            ("Edited", "CAL-B")
+        );
+
+        // F9 resends the edit, from the kept row.
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()),
+            "B1's edit never drained (its row deleted?): {:?}",
+            method_paths(&srv)
+        );
+        let bodies = patch_bodies(&srv, "/me/events/B1");
+        assert_eq!(bodies.len(), 2, "{:?}", method_paths(&srv));
+        assert!(
+            bodies[1].contains(r#""subject":"Edited""#),
+            "the resent PATCH lost the edit: {}",
+            bodies[1]
+        );
+
+        // The op gone, a pass deletes B1: CAL-B still does not sync.
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || store.event("B1").unwrap().is_none()),
+            "B1 outlived its op: {:?}",
+            method_paths(&srv)
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- Host writes a round began before, delta removals (#2262) ---
 
     /// Seeds CAL-A with X1 (subject "X1") and its delta state, so the next
