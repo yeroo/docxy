@@ -1042,7 +1042,8 @@ pub(crate) fn xml_unescape(s: &str) -> String {
 /// A complex field's markers (`w:fldChar` / `w:instrText`) in raw run XML.
 pub(crate) enum FieldEvent {
     Begin,
-    /// An instruction fragment, verbatim (not entity-decoded).
+    /// An instruction fragment, not entity-decoded, as Word reads it: without
+    /// `xml:space="preserve"` its edge XML whitespace is dropped (#1186).
     Instr(String),
     Separate,
     End,
@@ -1067,10 +1068,18 @@ pub(crate) fn field_events(raw: &str) -> Vec<FieldEvent> {
         let body_end = raw[body_start..]
             .find("</w:instrText>")
             .map_or(raw.len(), |e| body_start + e);
-        events.push((
-            start,
-            FieldEvent::Instr(raw[body_start..body_end].to_string()),
-        ));
+        // Word drops the XML whitespace at either end of each unpreserved
+        // fragment before it joins them, as it does for `w:t` (#1084): Word's
+        // own oracle reads `MERGEFIELD` + ` Name` as `MERGEFIELDName`, and an
+        // all-space fragment as nothing (#1186). The run itself stays raw.
+        let body = &raw[body_start..body_end];
+        let preserve = crate::load::xml_attr_value(el, "xml:space").as_deref() == Some("preserve");
+        let body = if preserve {
+            body
+        } else {
+            crate::xml::trim_xml_whitespace(body)
+        };
+        events.push((start, FieldEvent::Instr(body.to_string())));
     }
     events.sort_by_key(|(pos, _)| *pos);
     events.into_iter().map(|(_, e)| e).collect()
@@ -1209,6 +1218,70 @@ mod tests {
         assert_eq!(ev("= 27 \\* alphabetic").as_deref(), Some("AA"));
     }
 
+    /// Word's own reading of split, unpreserved `w:instrText` (#1186): each
+    /// case's fragments and the `Field.Code.Text` Word 16 reported for them
+    /// over COM (`Documents.Open`, then `Fields(i).Code.Text`).
+    #[test]
+    fn unpreserved_instr_text_reads_as_word_does_1186() {
+        const ORACLE: &[(&[(&str, bool)], &str)] = &[
+            (&[("MERGEFIELD", false), (" Name", false)], "MERGEFIELDName"),
+            (&[("MERGEFIELD ", false), ("Name", false)], "MERGEFIELDName"),
+            (&[("MERGEFIELD", false), ("Name", false)], "MERGEFIELDName"),
+            (
+                &[("MERGEFIELD", false), (" ", false), ("Name", false)],
+                "MERGEFIELDName",
+            ),
+            (&[("MERGEFIELD", false), (" Name", true)], "MERGEFIELD Name"),
+            (&[(" PAGE", false), ("\\* roman ", false)], "PAGE\\* roman"),
+            (&[(" PAGE", true), ("\\* roman ", true)], " PAGE\\* roman "),
+            (
+                &[
+                    (" IF 1 = 1 ", false),
+                    (" \"yes\" ", false),
+                    (" \"no\" ", false),
+                ],
+                "IF 1 = 1\"yes\"\"no\"",
+            ),
+            (
+                &[
+                    ("IF", false),
+                    (" 1 = 2", false),
+                    (" \"a\"", false),
+                    (" \"b\"", false),
+                ],
+                "IF1 = 2\"a\"\"b\"",
+            ),
+            (
+                &[("DATE", false), (" \\@ ", false), ("\"yyyy\"", false)],
+                "DATE\\@\"yyyy\"",
+            ),
+            (&[("  NUMPAGES  ", false)], "NUMPAGES"),
+            (
+                &[("IF 1 = 1 \"a ", false), (" b\" \"c\"", false)],
+                "IF 1 = 1 \"ab\" \"c\"",
+            ),
+        ];
+        for (frags, word) in ORACLE {
+            let mut raw = String::from("<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>");
+            for (text, preserve) in *frags {
+                let space = if *preserve {
+                    " xml:space=\"preserve\""
+                } else {
+                    ""
+                };
+                let text = text.replace('"', "&quot;");
+                raw.push_str(&format!(
+                    "<w:r><w:instrText{space}>{text}</w:instrText></w:r>"
+                ));
+            }
+            raw.push_str(
+                "<w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+                 <w:r><w:t>old</w:t></w:r><w:r><w:fldChar w:fldCharType=\"end\"/></w:r>",
+            );
+            assert_eq!(instr_of(&raw).as_deref(), Some(*word), "{frags:?}");
+        }
+    }
+
     #[test]
     fn instr_of_reads_simple_and_complex_fields_642() {
         assert_eq!(
@@ -1221,10 +1294,11 @@ mod tests {
             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
             <w:r><w:t>iv</w:t></w:r>\
             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
-        assert_eq!(instr_of(complex).as_deref(), Some(" PAGE \\* roman "));
+        // The unpreserved second fragment loses its trailing space (#1186).
+        assert_eq!(instr_of(complex).as_deref(), Some(" PAGE \\* roman"));
         // No separate (an index entry): the instruction runs to the end.
         let xe = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
-            <w:r><w:instrText> XE &quot;a&quot; </w:instrText></w:r>\
+            <w:r><w:instrText xml:space=\"preserve\"> XE &quot;a&quot; </w:instrText></w:r>\
             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
         assert_eq!(instr_of(xe).as_deref(), Some(" XE \"a\" "));
         // A field nested in the instruction makes it unevaluable.
