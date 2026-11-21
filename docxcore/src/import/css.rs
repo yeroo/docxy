@@ -1578,6 +1578,8 @@ pub(crate) enum BorderColor {
     Auto,
     /// `RRGGBB`, uppercase.
     Rgb(String),
+    /// `transparent`, or a colour with no alpha (#1883 r3): no line.
+    None,
 }
 
 /// One side of an element's border (#1883), every part set: what a
@@ -1608,7 +1610,7 @@ impl BorderSide {
     /// Whether it draws a line: a style other than `none` and a width
     /// above 0.
     pub(crate) fn drawn(&self) -> bool {
-        self.style != BorderStyle::None && self.width.v > 0.0
+        self.style != BorderStyle::None && self.width.v > 0.0 && self.color != BorderColor::None
     }
 }
 
@@ -1638,12 +1640,54 @@ pub(crate) fn border_width(value: &str) -> Option<Len> {
 }
 
 /// A `border-color` value.
+///
+/// `transparent` and a zero alpha are no line (r3); a partial alpha is the
+/// colour over white, as a line on a white page looks (`rgba(0,0,0,0.1)`
+/// is `E6E6E6`).
 pub(crate) fn border_color(value: &str) -> Option<BorderColor> {
+    let lower = value.trim().to_ascii_lowercase();
+    let alpha = match alpha_of(&lower) {
+        Some(a) if a <= 0.0 => return Some(BorderColor::None),
+        Some(a) => a.min(1.0),
+        None if lower == "transparent" => return Some(BorderColor::None),
+        None => 1.0,
+    };
     match color(value)? {
+        Color::Rgb(c) if alpha < 1.0 => Some(BorderColor::Rgb(over_white(&c, alpha)?)),
         Color::Rgb(c) => Some(BorderColor::Rgb(c)),
         Color::Reset => Some(BorderColor::Auto),
         Color::Keep => Some(BorderColor::Current),
     }
+}
+
+/// The alpha of an `rgba()` / `rgb()` / `hsla()` / `hsl()` value given with
+/// one (`0.5`, `50%`), else `None`.
+fn alpha_of(lower: &str) -> Option<f64> {
+    let args = ["rgba(", "rgb(", "hsla(", "hsl("]
+        .iter()
+        .find_map(|f| lower.strip_prefix(f))?
+        .strip_suffix(')')?;
+    let parts: Vec<&str> = args
+        .split([',', ' ', '/'])
+        .filter(|p| !p.is_empty())
+        .collect();
+    let a = parts.get(3)?;
+    let a = match a.strip_suffix('%') {
+        Some(p) => p.parse::<f64>().ok()? / 100.0,
+        None => a.parse::<f64>().ok()?,
+    };
+    a.is_finite().then_some(a)
+}
+
+/// `RRGGBB` at `alpha` over white.
+fn over_white(rgb: &str, alpha: f64) -> Option<String> {
+    let mut out = String::with_capacity(6);
+    for i in 0..3 {
+        let c = f64::from(u8::from_str_radix(rgb.get(2 * i..2 * i + 2)?, 16).ok()?);
+        let v = c * alpha + 255.0 * (1.0 - alpha);
+        out.push_str(&format!("{:02X}", v.round().clamp(0.0, 255.0) as u8));
+    }
+    Some(out)
 }
 
 /// A `border` / `border-<side>` shorthand: a width, a style and a colour
@@ -2208,6 +2252,23 @@ mod tests {
             ])
         );
         assert_eq!(border_sides("red bogus", border_color), None);
+    }
+
+    #[test]
+    fn transparent_and_alpha_border_colours_1883() {
+        let c = |v: &str| border_color(v).unwrap();
+        assert_eq!(c("transparent"), BorderColor::None);
+        assert_eq!(c("rgba(0,0,0,0)"), BorderColor::None);
+        assert_eq!(c("hsla(0, 0%, 0%, 0)"), BorderColor::None);
+        assert_eq!(c("rgba(0,0,0,0.1)"), BorderColor::Rgb("E6E6E6".into()));
+        assert_eq!(c("rgb(0 0 255 / 50%)"), BorderColor::Rgb("8080FF".into()));
+        assert_eq!(c("rgba(204,204,204,1)"), BorderColor::Rgb("CCCCCC".into()));
+        assert!(!border_shorthand("1px solid transparent").unwrap().drawn());
+        assert!(
+            border_shorthand("1px solid rgba(0,0,0,0.1)")
+                .unwrap()
+                .drawn()
+        );
     }
 
     #[test]

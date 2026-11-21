@@ -516,9 +516,11 @@ struct Look {
     indent_right: i32,
     /// Paragraph shading (`RRGGBB`) of the nearest shaded block.
     shade: Option<String>,
-    /// Paragraph borders (#1883): the sides blocks draw, an inner block's
-    /// own sides over its outer ones' (Word draws one box). Inherited, and
-    /// reset by a cell and a card.
+    /// Paragraph borders (#1883): the left and right sides blocks draw,
+    /// on every paragraph in them, an inner block's own over its outer
+    /// ones' (Word draws one box). Inherited, and reset by a cell and a
+    /// card. A block's top and bottom are its own (`own_top`,
+    /// `own_bottom`): only its first and last paragraphs take them (r3).
     borders: ParBorders,
     /// Where the left and right lines of `borders` are, in twips from the
     /// margins: a paragraph's `w:space` on that side is its indent less
@@ -530,6 +532,11 @@ struct Look {
     /// separates margins as padding does.
     border_before: bool,
     border_after: bool,
+    /// Those lines (not inherited, #1883 r3): the top goes on the first
+    /// paragraph that starts in the block ([`Html::first_top`]), the bottom
+    /// on the last ended in it when it closes ([`Html::apply_bottom`]).
+    own_top: Option<ParBorder>,
+    own_bottom: Option<ParBorder>,
     /// Inside a list (inherited, #2114): a list in it is nested, with no
     /// user-agent vertical margins (a browser's
     /// `:is(dir,dl,menu,ol,ul) :is(dir,dl,menu,ol,ul)`, across tables too).
@@ -1096,6 +1103,8 @@ impl Cascade {
         look.own_break_after = false;
         look.border_before = false;
         look.border_after = false;
+        look.own_top = None;
+        look.own_bottom = None;
         let parent_block_align = look.block_align;
         if kind == Kind::Cell {
             look.in_cell = true;
@@ -1714,7 +1723,7 @@ impl Cascade {
             let color = match &b.color {
                 css::BorderColor::Rgb(c) => Some(c.as_str()),
                 css::BorderColor::Current => self.look.run.color.as_deref(),
-                css::BorderColor::Auto => None,
+                css::BorderColor::Auto | css::BorderColor::None => None,
             }
             .and_then(|c| u32::from_str_radix(c, 16).ok());
             let space = if i % 2 == 0 {
@@ -1788,8 +1797,12 @@ impl Cascade {
         }
         // Forced page breaks: a block's or list's, or a `br`'s (Word's
         // `<br style='page-break-before:always'>`); never in a cell, where a
-        // browser does not break and Word ignores `pageBreakBefore`.
-        if !self.look.in_cell && (matches!(self.kind, Kind::Block | Kind::List) || self.is_br) {
+        // browser does not break and Word ignores `pageBreakBefore`; nor on
+        // a hidden one, which a browser does not lay out (r3).
+        if !self.look.in_cell
+            && !self.look.display_hidden
+            && (matches!(self.kind, Kind::Block | Kind::List) || self.is_br)
+        {
             self.look.own_break_before = self.break_before == Some(true);
             self.look.own_break_after = self.break_after == Some(true) && !self.is_br;
         }
@@ -1916,10 +1929,10 @@ impl Cascade {
                         look.pad_after = 0;
                         look.border_after = true;
                     }
+                    look.own_top = own[0];
+                    look.own_bottom = own[2];
                     let mine = ParBorders {
-                        top: own[0],
                         right: own[1],
-                        bottom: own[2],
                         left: own[3],
                         ..ParBorders::default()
                     };
@@ -2283,6 +2296,24 @@ impl<'a> Html<'a> {
         }
     }
 
+    /// Skip a `head`'s content (#1883 r3): to just after its `</head>`, or
+    /// to a `<body` that comes first (left to open), as a browser ends the
+    /// head when the body starts. `</header` is no `</head`. With neither,
+    /// the rest of the page is the head's.
+    fn skip_head(&mut self) {
+        let rest = &self.s[self.pos..];
+        let close = find_tag_ci(rest, "</head");
+        let body = find_tag_ci(rest, "<body");
+        match (close, body) {
+            (Some(c), b) if b.is_none_or(|b| c < b) => {
+                self.pos += c;
+                self.skip_past(">");
+            }
+            (_, Some(b)) => self.pos += b,
+            _ => self.pos = self.s.len(),
+        }
+    }
+
     /// Skip to just after `end` (case-insensitive), or to the end.
     fn skip_past(&mut self, end: &str) {
         let rest = &self.s[self.pos..];
@@ -2411,7 +2442,7 @@ impl<'a> Html<'a> {
     /// child (#1883), keeping its key when the sheet has a `+`: work, as an
     /// element's own key is, since a parent keeps at most
     /// [`css::MAX_COMPOUNDS`] of them.
-    fn add_child(&mut self, serial: u64, key: ElemKey) {
+    fn add_child(&mut self, serial: u64, key: &ElemKey) {
         let keep = self.sheet.uses_next() && self.budget.work(1 + key.heap() / 16);
         let kids = self.kids_mut();
         kids.count = kids.count.saturating_add(1);
@@ -2419,7 +2450,7 @@ impl<'a> Html<'a> {
             if kids.last.len() >= css::MAX_COMPOUNDS {
                 kids.last.pop_front();
             }
-            kids.last.push_back((serial, key));
+            kids.last.push_back((serial, key.clone()));
         } else {
             kids.last.clear();
         }
@@ -2433,7 +2464,8 @@ impl<'a> Html<'a> {
         let s = self.s;
         let text = &s[attrs_at.0..attrs_at.1];
         match name {
-            _ if name == "head" || RAW_TEXT.contains(&name) => {
+            "head" => self.skip_head(),
+            _ if RAW_TEXT.contains(&name) => {
                 let end = format!("</{name}");
                 self.skip_past(&end);
                 self.skip_past(">");
@@ -2475,7 +2507,8 @@ impl<'a> Html<'a> {
         }
         // An element child of what is open all the same (#1883).
         let serial = self.take_serial();
-        self.add_child(serial, read.map(|(_, key)| key).unwrap_or_default());
+        let key = read.map(|(_, key)| key).unwrap_or_default();
+        self.add_child(serial, &key);
     }
 
     /// Open an element that holds content.
@@ -2562,7 +2595,7 @@ impl<'a> Html<'a> {
                 self.para_start = false;
             }
             let serial = self.take_serial();
-            self.add_child(serial, key);
+            self.add_child(serial, &key);
             self.skip_past("</span");
             self.skip_past(">");
             return;
@@ -2570,7 +2603,7 @@ impl<'a> Html<'a> {
         // Its parent's next child (#1883), counted before it opens: its
         // own look matches with `key.index` already set.
         let serial = self.take_serial();
-        self.add_child(serial, key.clone());
+        self.add_child(serial, &key);
         // The stacks as they are below this element (#1872 r4: a list's own
         // entry is above its `lists_at`, so its close ends it).
         let (blocks_at, lists_at) = (self.blocks.len(), self.lists.len());
@@ -2891,7 +2924,7 @@ impl<'a> Html<'a> {
                 None => self.root_kids.count,
             };
             e.serial = self.take_serial();
-            self.add_child(e.serial, e.key.clone());
+            self.add_child(e.serial, &e.key);
             self.elems.push(e);
         }
         self.restyle(from);
@@ -3527,6 +3560,29 @@ impl<'a> Html<'a> {
         !in_table
     }
 
+    /// The top line of the paragraph ended now (#1883 r3): the innermost
+    /// own top of the blocks it is the first paragraph of (the walk
+    /// [`Self::top_spacing`] makes), none once one is stale.
+    fn first_top(&self) -> Option<ParBorder> {
+        if !self.budget.work(self.elems.len() / 16 + 1) {
+            return None;
+        }
+        for e in self.elems.iter().rev() {
+            if e.kind.table() || matches!(e.card, CardMode::Yes(_)) {
+                break;
+            }
+            if matches!(e.kind, Kind::Block | Kind::List) {
+                if !self.fresh(e) {
+                    break;
+                }
+                if e.look.own_top.is_some() {
+                    return e.look.own_top;
+                }
+            }
+        }
+        None
+    }
+
     /// Whether the paragraph ended now starts a page (#1883): a block or
     /// list it is the first paragraph of has a forced break before it, or
     /// one closed before it with a break after it. Only in the body, and
@@ -3669,6 +3725,14 @@ impl<'a> Html<'a> {
         if depth != self.table_depth || self.out.flow_len(in_table).is_none_or(|n| n <= at) {
             return;
         }
+        // Its bottom line goes on its last paragraph (#1883 r3), unless a
+        // block inside it, closed first, gave that paragraph its own.
+        if let Some(bottom) = e.look.own_bottom {
+            if let Some(p) = self.out.flow_last_mut(in_table) {
+                p.borders.bottom.get_or_insert(bottom);
+            }
+        }
+        let e = &self.elems[j];
         let Some(tail) = self.out.tail(in_table) else {
             return;
         };
@@ -3874,6 +3938,9 @@ impl<'a> Html<'a> {
         if self.page_break_before(in_table) {
             props.raw_props.push(PAGE_BREAK_BEFORE.to_string());
         }
+        if let Some(top) = self.first_top() {
+            props.borders.top = Some(top);
+        }
         props.spacing.before = Some(self.top_spacing(in_table));
         self.out.end_para(props, in_table);
         self.out.set_tail(in_table, FlowTail::default());
@@ -3980,6 +4047,22 @@ fn tag_end(s: &str) -> Option<usize> {
             None if b == b'>' => return Some(i + 1),
             None => {}
         }
+    }
+    None
+}
+
+/// Where `lower_tag` (`</head`, `<body`) first starts a tag in `hay`,
+/// ASCII case-insensitively: followed by `>`, `/`, white space or the end,
+/// so `</head` is not found in `</header`.
+fn find_tag_ci(hay: &str, lower_tag: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(i) = find_ci(&hay[from..], lower_tag) {
+        let at = from + i;
+        let next = hay.as_bytes().get(at + lower_tag.len());
+        if next.is_none_or(|b| *b == b'>' || *b == b'/' || b.is_ascii_whitespace()) {
+            return Some(at);
+        }
+        from = at + 1;
     }
     None
 }
@@ -5444,6 +5527,58 @@ mod tests {
         assert_eq!(p.color, None, "a value past the cap is never tested");
     }
 
+    /// Which of `texts`' paragraphs have a top line, a bottom line, and
+    /// left and right ones.
+    fn box_sides(d: &Document, texts: &[&str]) -> Vec<(bool, bool, bool)> {
+        texts
+            .iter()
+            .map(|t| {
+                let b = para_of(d, t).props.borders;
+                (
+                    b.top.is_some(),
+                    b.bottom.is_some(),
+                    b.left.is_some() && b.right.is_some(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_box_s_top_and_bottom_are_on_its_first_and_last_paragraphs_1883() {
+        // r3 M1: a box around paragraphs of different indents (a list) is
+        // one box: a top once, a bottom once, the sides on every line.
+        let d = doc(
+            "<div style='border:1px solid #cccccc;padding:6px'><p>Intro</p>\
+             <ul><li>one</li><li>two</li></ul><p>End</p></div><p>after</p>",
+        );
+        assert_eq!(
+            box_sides(&d, &["Intro", "one", "two", "End"]),
+            [
+                (true, false, true),
+                (false, false, true),
+                (false, false, true),
+                (false, true, true),
+            ]
+        );
+        assert!(para_of(&d, "after").props.borders.is_empty());
+        // A ruled title inside a box: its own bottom, and the box's top
+        // on it alone; the box's bottom on the last paragraph.
+        let d = doc("<div style='border:1px solid #cccccc'>\
+             <p style='border-bottom:2px solid #333333'>Title</p><p>Body</p></div>");
+        assert_eq!(
+            box_sides(&d, &["Title", "Body"]),
+            [(true, true, true), (false, true, true)]
+        );
+        let title = para_of(&d, "Title").props.borders;
+        assert_eq!(
+            title.bottom.map(|b| (b.sz, b.color)),
+            Some((12, Some(0x333333)))
+        );
+        assert_eq!(title.top.map(|b| b.color), Some(Some(0xCCCCCC)));
+        let body = para_of(&d, "Body").props.borders;
+        assert_eq!(body.bottom.map(|b| b.color), Some(Some(0xCCCCCC)));
+    }
+
     #[test]
     fn sibling_bordered_blocks_group_as_word_draws_them_1883() {
         // r2 (planner's decision): Word, and classic Outlook through it,
@@ -5456,7 +5591,12 @@ mod tests {
              <div style='border:1px solid #cccccc'><p>box one</p><p>box two</p></div>");
         let b = |t: &str| para_of(&d, t).props.borders;
         assert_eq!(b("A"), b("B"));
-        assert_eq!(b("box one"), b("box two"));
+        // A box's top is on its first paragraph only, its bottom on its
+        // last (r3); its sides on both.
+        let (one, two) = (b("box one"), b("box two"));
+        assert!(one.top.is_some() && one.bottom.is_none());
+        assert!(two.top.is_none() && two.bottom.is_some());
+        assert_eq!((one.left, one.right), (two.left, two.right));
         for t in ["A", "B", "box one", "box two"] {
             assert_eq!(b(t).nil, 0, "{t}");
         }
@@ -5542,7 +5682,10 @@ mod tests {
         assert_eq!(left.space, 6);
         // The 3 pt padding is the line's space, not spacing.
         assert_eq!(from.spacing.before, Some(0));
-        assert_eq!(para_of(&d, "Sent:").props.borders, from.borders);
+        // The header's top line is on its first paragraph only (r3).
+        let sent = para_of(&d, "Sent:").props.borders;
+        assert_eq!(sent.left, from.borders.left);
+        assert!(sent.top.is_none() && sent.bottom.is_none());
         let body = para_of(&d, "body").props;
         assert!(body.borders.top.is_none());
         assert_eq!(body.borders.left, from.borders.left);
@@ -5576,6 +5719,18 @@ mod tests {
         }
         let top = para_of(&d, "longs").props.borders.top.unwrap();
         assert_eq!((top.sz, top.color), (12, Some(0x0000FF)));
+        // A transparent colour hides a line the cascade gave earlier (r3).
+        let d = doc("<style>.box {border:1px solid #dddddd}</style>\
+             <div class=box style='border:1px solid transparent'>shorthand</div>\
+             <div style='border:2px solid #cccccc;border-bottom-color:transparent'>bottom</div>\
+             <div style='border-style:solid;border-color:transparent'>all</div>\
+             <div style='border-bottom:1px solid rgba(0,0,0,0.1)'>faint</div>");
+        assert!(para_of(&d, "shorthand").props.borders.is_empty());
+        let bottom = para_of(&d, "bottom").props.borders;
+        assert!(bottom.bottom.is_none() && bottom.top.is_some());
+        assert!(para_of(&d, "all").props.borders.is_empty());
+        let faint = para_of(&d, "faint").props.borders.bottom.unwrap();
+        assert_eq!(faint.color, Some(0xE6E6E6));
     }
 
     #[test]
@@ -5755,7 +5910,11 @@ mod tests {
              <div style='page-break-before:always'></div><p>six</p>\
              <table><tr><td><p style='page-break-before:always'>cell</p></td></tr></table>\
              <div style='break-after:page'>seven</div>\
-             <table><tr><td>table</td></tr></table><p>eight</p>             <table><tr><td><p style='page-break-after:always'>x</p></td></tr></table>             <p>nine</p>");
+             <table><tr><td>table</td></tr></table><p>eight</p>\
+             <table><tr><td><p style='page-break-after:always'>x</p></td></tr></table>\
+             <p>nine</p>\
+             <div style='display:none;page-break-after:always'>hidden</div><p>ten</p>\
+             <div style='display:none;page-break-before:always'></div><p>eleven</p>");
         let b = |t: &str| breaks_page(&para_of(&d, t));
         // None at the document's start, where a browser breaks no page.
         assert!(!b("first"));
@@ -5770,6 +5929,8 @@ mod tests {
         // A break after a block in a cell does not reach the paragraph
         // after the table either (r1 m2).
         assert!(!b("nine"));
+        // A hidden block breaks nothing (r3).
+        assert!(!b("ten") && !b("eleven"));
         let back = reloaded(&d);
         assert!(breaks_page(&para_of(&back, "one")));
     }
@@ -5845,6 +6006,30 @@ mod tests {
         let x = crate::serialize::rpr_xml(&run_of(&d, "both").props);
         let (b, i) = (x.find("<w:b ").unwrap(), x.find("<w:i ").unwrap());
         assert!(b < i, "{x}");
+    }
+
+    #[test]
+    fn an_unclosed_head_ends_at_the_body_1883() {
+        // r3 p1: a missing `</head>` no longer swallows the page; the
+        // `<style>` in it still applies.
+        let d = doc("<html><head><title>x</title><style>p{color:red}</style>\
+             <body><p>Hello</p></body></html>");
+        assert_eq!(paragraph_texts(&d), ["Hello"]);
+        assert_eq!(run_of(&d, "Hello").props.color.as_deref(), Some("FF0000"));
+        // A `<header>` in the body after a closed head is untouched, and
+        // `</header` in a head is no `</head`.
+        let d = doc(
+            "<html><head><title>t</title></head><body><header><p>top</p></header>\
+             <p>after</p></body></html>",
+        );
+        assert_eq!(paragraph_texts(&d), ["top", "after"]);
+        let d = doc("<head><title>a </header> b</title></head><p>body</p>");
+        assert_eq!(paragraph_texts(&d), ["body"]);
+        // `<BODY>` and `</HEAD >` in any case and spacing.
+        let d = doc("<HEAD><TITLE>t</TITLE></HEAD ><P>one</P>");
+        assert_eq!(paragraph_texts(&d), ["one"]);
+        let d = doc("<head><meta charset=utf-8><BODY bgcolor=white><p>two</p>");
+        assert_eq!(paragraph_texts(&d), ["two"]);
     }
 
     #[test]

@@ -370,8 +370,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   An unresolved, unsized image's `alt` text is the link's text.
 - A link has the user-agent look (`underline`, `LINK_COLOR` `0563C1`, Word's
   Hyperlink colour) as direct formatting, set before the page's rules, which
-  override it (Word's own `a:link` rule is a pseudo-class `css.rs` drops; a
-  page's plain `a` rule applies). `color: inherit` / `currentcolor`
+  override it (Word's own `a:link` rule applies since #1883, as a page's
+  plain `a` rule does). `color: inherit` / `currentcolor`
   (`Color::Keep`) now gives back the parent's colour
   (`Cascade::parent_color`) over a user-agent or presentational one.
 - For the empty-paragraph rule a link counts by its text (`is_object`
@@ -764,10 +764,17 @@ A batch from #1989 and #1930 (plan-2), import only.
   starts with none). solid/groove/ridge/inset/outset are single, double,
   dotted and dashed their own; `sz` is the width in eighths of a point
   (2..96); the colour is the element's text colour unless given,
-  `windowtext` automatic. An inner block's own drawn sides go over the
-  outer's per side (`ParBorders::over`): Outlook's quote line goes on
-  through its header's `border-top`, and Word's `<p style='border:none'>`
-  in a bordered `div` keeps the box. Geometry as a browser's box: a
+  `windowtext` automatic, `transparent` or a zero alpha no line, a partial
+  alpha blended over white (`rgba(0,0,0,0.1)` is `E6E6E6`; r3). A
+  block's left and right lines go on every paragraph in it, an inner
+  block's own over the outer's (`ParBorders::over`): Outlook's quote line
+  goes on through its header, and Word's `<p style='border:none'>` in a
+  bordered `div` keeps the box. Its top line goes only on the first
+  paragraph that starts in it (`Html::first_top`, the fresh walk of
+  `top_spacing`; the innermost block's wins) and its bottom line on the
+  last ended in it when it closes (`apply_bottom`, unless a block inside
+  closed first and gave that paragraph its own), so a box around a list
+  or a ruled title is still one box (r3). Geometry as a browser's box: a
   left/right line moves the text in by its width; each paragraph's
   left/right `w:space` is its indent less the line's place
   (`Look::border_left_x`) and width, in whole points up to 31, so an item
@@ -780,8 +787,12 @@ A batch from #1989 and #1930 (plan-2), import only.
   box, as Word (and classic Outlook, which draws mail through it) and the
   suite draw them, where a browser draws them apart (r2: no docx mark is
   read by both as "a separate box, drawing nothing", so none is written);
-  a margin inside a top/bottom line is spacing outside it in Word; nested
-  boxes are one box.
+  a box's first, middle and last paragraphs have different borders, so
+  they are separate border groups in the suite (and in Word): the side
+  lines break across the spacing between them (the suite draws a group's
+  strips inside its own spacing only); a margin inside a top/bottom line
+  is spacing outside it in Word; nested boxes are one box; a transparent
+  line's width is not kept as room.
 - Selectors (`css.rs`): attribute selectors (`[a]`, `=`, `~=`, `|=`, `^=`,
   `$=`, `*=`, `i`/`s`; the HTML Standard's `CASELESS_ATTRS` compare values
   without case, so `td[align=center]` matches `align=Center`), `+`,
@@ -805,6 +816,11 @@ A batch from #1989 and #1930 (plan-2), import only.
   O(compounds × depth). Not done: `~` and `:first-of-type` (the whole
   sibling list, quadratic on long pages), `:last-child`, `:nth-*`,
   `:not()`, `:hover`/`:visited`, pseudo-elements, escapes.
+- An unclosed `<head>` ends at the first `<body` (`Html::skip_head`,
+  `find_tag_ci`: `</header` is no `</head`), which then opens; with
+  neither, the rest is the head's, as before. The `<style>` pre-pass
+  (`collect_styles`) reads a head's styles either way (r3, a fix to code
+  older than #1883).
 - Tests (`import/html.rs` unless named): `quirks_tables_reset_font_size_weight_and_style_1883`,
   `italic_off_is_explicit_under_a_heading_only_1883`,
   `dir_rtl_is_paragraph_bidi_and_swaps_alignment_1883`,
@@ -824,9 +840,12 @@ A batch from #1989 and #1930 (plan-2), import only.
   `long_sibling_runs_stay_within_the_budget_1883`,
   `long_attribute_values_are_present_but_never_compared_1883`,
   `sibling_bordered_blocks_group_as_word_draws_them_1883`,
+  `a_box_s_top_and_bottom_are_on_its_first_and_last_paragraphs_1883`,
+  `an_unclosed_head_ends_at_the_body_1883`,
   `many_elements_with_sibling_and_attribute_rules_import_1883`; `css.rs`:
   `a_value_past_the_cap_is_present_but_never_matches_a_test_1883`,
-  `borders_shorthands_and_longhands_1883`, `attribute_selectors_1883`,
+  `borders_shorthands_and_longhands_1883`,
+  `transparent_and_alpha_border_colours_1883`, `attribute_selectors_1883`,
   `next_sibling_first_child_link_and_root_1883`,
   `next_sibling_chains_are_polynomial_1883`,
   `a_sheet_keeps_at_most_32_attribute_names_1883`; `export_email.rs`:
