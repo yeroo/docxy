@@ -10530,8 +10530,9 @@ fn event_for_send_on(conn: &Connection, id: &str) -> Result<Option<EventSendData
 }
 
 /// The groups an edit changed since a create read the row (#2005): `sent`
-/// is what the POST carried (`sync::outbox::event_input_for`), `now` the row
-/// as `event_for_send_on` reads it at the reconcile. Each group compares as
+/// is what the POST carried (`sync::outbox::create_event_input`: every group,
+/// less `REMINDER` when it is unset), `now` the row as `event_for_send_on`
+/// reads it at the reconcile. Each group compares as
 /// `Store::update_event_fields` marks it: `TIMES` by `start_utc`, `end_utc`
 /// and `is_all_day` only (a zone alone never marks it), `ATTENDEES` by
 /// name, address and type in order. Only the groups the create sent are

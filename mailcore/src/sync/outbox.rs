@@ -256,7 +256,7 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Ap
     }
 }
 
-/// `CreateEvent`: POST the `local:` row as stored now (`event_input_for`),
+/// `CreateEvent`: POST the `local:` row as stored now (`create_event_input`),
 /// then re-key it (`Store::reconcile_created_event`), which queues an
 /// `UpdateEvent` for an edit made during the POST (#2005).
 fn create_event(client: &GraphClient, store: &Store, id: &str) -> Result<Applied, GraphError> {
