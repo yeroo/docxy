@@ -1927,11 +1927,13 @@ this occurrence or the whole series, as Outlook does.
   move, `FetchCalendarRange`, an expired link, a reset) replaced the row, and a
   queued `UpdateEvent`, which reads its row at send time (`event_input_for`),
   sent Graph's old values: the edit was lost. Since #2262 no round deletes a
-  `written` row either: not a delta round's removal, its series cascade (the
-  held occurrences stay, the others go) nor a gone master. Graph lists as
-  `@removed` an event that only moved out of the window (an organizer moved
-  it), and the row gone, the queued `UpdateEvent` failed to read it and the
-  edit went through the attempts to the quarantine.
+  `written` row either: not a delta round's removal nor its series cascade (the
+  held occurrences stay, the others go). Graph lists as `@removed` an event
+  that only moved out of the window (an organizer moved it), and the row gone,
+  the queued `UpdateEvent` failed to read it and the edit went through the
+  attempts to the quarantine. A gone master (#2064: Graph answered 404 for its
+  `GET`) still goes whatever the holds: its op 404s too, and the reset's
+  initial rounds would not reach a master that starts before the window.
 - Commands not queued yet: a host writes the row before it sends `UpdateEvent`
   or `DeleteEvent`, and the engine may be fetching a refresh then. Right before it
   writes a refresh (`refresh_calendar`) or a fetched range (`fetch_range_gaps`),
@@ -1969,7 +1971,18 @@ this occurrence or the whole series, as Outlook does.
   `reset_calendars`), whose initial rounds, the op gone, replace it (and still keep
   other queued ops' rows). A skipped delta upsert comes back: the op's PATCH,
   RSVP or DELETE changes the event on Graph, so a later delta round names it (the
-  link this round stored predates it).
+  link this round stored predates it). A round that keeps a `written` row it
+  would otherwise have deleted (#2262 r1) drops its calendar's delta state, as a
+  series cascade does: a delta round's kept removal (and the window is not
+  recorded as fetched), or an initial round's held row Graph's window does not
+  list. The removal's `@removed` is behind the link the round would store, and
+  an event out of the window may never be named again, so the calendar's passes
+  stay initial while the hold lasts, and the first one after it (the op sent,
+  dropped or quarantined; an orphan write's record below the mark) deletes the
+  row as Graph's window says, without relying on Graph to list it again. A held
+  row Graph's round lists keeps the delta state: the ordinary edit costs no
+  extra initial rounds. A `FetchCalendarRange` stores no delta state and is
+  unchanged.
 - Tests: `store/mod.rs` `event_local_write_names_the_ops_whose_command_wrote_the_row`,
   `initial_round_keeps_a_row_with_a_queued_update`,
   `an_undecodable_outbox_row_does_not_stop_a_calendar_round`,
@@ -1989,7 +2002,9 @@ this occurrence or the whole series, as Outlook does.
   #2262: `store/mod.rs` `delta_removal_keeps_a_row_with_a_queued_update`,
   `delta_removal_keeps_a_row_with_a_queued_response`,
   `delta_removal_keeps_a_held_occurrence_of_a_removed_series`,
-  `gone_master_with_a_queued_response_is_kept`,
+  `gone_master_goes_despite_a_queued_response`,
+  `delta_removal_of_an_orphan_edit_keeps_it_once_then_converges`,
+  `initial_round_keeping_a_held_row_graph_does_not_list_stays_initial`,
   `round_keeps_a_host_edit_made_after_its_mark`,
   `round_does_not_bring_back_a_host_delete_made_after_its_mark`,
   `round_after_a_host_edit_with_no_command_replaces_the_row`,
@@ -2001,7 +2016,8 @@ this occurrence or the whole series, as Outlook does.
   `deferred_event_move_survives_an_initial_round_and_patches_the_new_times`
   (the PATCH's times compared as instants),
   `deferred_event_edit_survives_a_delta_round_naming_it`,
-  `deferred_event_edit_survives_a_delta_removal`,
+  `deferred_event_edit_survives_a_delta_removal` (then an initial round
+  deletes X1),
   `deferred_response_survives_an_initial_round`,
   `deferred_delete_and_cancel_rows_stay_gone_through_an_initial_round`,
   `quarantined_event_edit_releases_the_row`,

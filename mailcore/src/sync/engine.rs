@@ -25034,8 +25034,23 @@ mod tests {
 
     /// Path 1 through a round from the stored link that answers `items`:
     /// X1's subject edit, its PATCH deferred by a 500, survives the round
-    /// and its retry carries it.
-    fn deferred_edit_survives_a_link_round(tag: &str, items: &[String]) {
+    /// and its retry carries it. With `gone`, Graph's window no longer has
+    /// X1 (the link round lists it as removed): once the PATCH is sent, the
+    /// next refresh is an initial round, which deletes X1 (#2262 r1).
+    fn deferred_edit_survives_a_link_round(tag: &str, items: &[String], gone: bool) {
+        let (from, to) = today_window();
+        let mut first = Vec::new();
+        if gone {
+            first.push((
+                get_route(
+                    "/me/calendars/CAL-A/calendarView/delta?",
+                    200,
+                    &calendar_delta_page(&[], &delta_link_of("CAL-A")),
+                ),
+                None,
+                Duration::ZERO,
+            ));
+        }
         let routes = slow_x1_routes(
             Duration::ZERO,
             vec![
@@ -25052,6 +25067,8 @@ mod tests {
                 ),
             ],
         );
+        first.extend(routes);
+        let routes = first;
         let (srv, handle, store_path, dir) = spawn_calendar_engine_paced(
             tag,
             routes,
@@ -25088,7 +25105,6 @@ mod tests {
             "X1's edit never drained: {:?}",
             method_paths(&srv)
         );
-        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let bodies = patch_bodies(&srv, "/me/events/X1");
         assert_eq!(bodies.len(), 2, "{:?}", method_paths(&srv));
         assert!(
@@ -25096,6 +25112,22 @@ mod tests {
             "the resent PATCH lost the edit: {}",
             bodies[1]
         );
+        if gone {
+            handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+            cal_barrier(&handle);
+            let reqs = method_paths(&srv);
+            let resent = reqs
+                .iter()
+                .rposition(|(m, p)| m == "PATCH" && p == "/me/events/X1")
+                .unwrap();
+            let initial = initial_delta_path("CAL-A", &from, &to);
+            assert!(
+                reqs[resent..].iter().any(|(_, p)| *p == initial),
+                "no initial round after the PATCH: {reqs:?}"
+            );
+            assert!(store.event("X1").unwrap().is_none(), "X1 stayed");
+        }
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -25104,6 +25136,7 @@ mod tests {
         deferred_edit_survives_a_link_round(
             "deferred-edit-survives-delta-upsert",
             &[event_from_now("X1", 3600)],
+            false,
         );
     }
 
@@ -25114,6 +25147,7 @@ mod tests {
         deferred_edit_survives_a_link_round(
             "deferred-edit-survives-delta-removal",
             &[removed_json("X1")],
+            true,
         );
     }
 
