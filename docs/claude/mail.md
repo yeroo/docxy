@@ -1823,7 +1823,7 @@ this occurrence or the whole series, as Outlook does.
   queues `OutboxOp::UpdateEventSeries`. All three resolve `id` with
   `series_master_of`: a stored occurrence's `series_master_id`, else the id itself.
   A `local:` master is an `Error` with nothing sent or queued (a local series is
-  edited through its row). The two fetches are direct calls (signed out is
+  edited through its row, its recurrence too since #2036). The two fetches are direct calls (signed out is
   `Error("not signed in")`, a 401 or throttle goes through `react`) and store
   nothing. A kept window's occurrences come from the calendar sync, and other dates
   from `FetchCalendarRange`. A fetched event whose non-empty `event_type` is not
@@ -1835,7 +1835,8 @@ this occurrence or the whole series, as Outlook does.
   stored then (#2064 stores it, off the grid). `apply_op` sends it with `update_event_body`. An empty `input.fields`
   queues nothing. There is no optimistic local write, so the op is not an event op
   for the quarantine reset. Instead the calendars owe a reset once it went
-  through (`calendar_reset_owed`, in memory; a refused `RespondEvent` owes it too, #2023): a pattern change mints new occurrence
+  through (`calendar_reset_owed`, in memory; a refused `RespondEvent` owes it too, #2023,
+  and an `UpdateEvent` carrying `RECURRENCE`, #2036): a pattern change mints new occurrence
   ids, and how calendarView delta reports a series change is the uncertain part
   of #2013, so initial rounds take each window from Graph. The reset is decided
   where it is used: every `refresh_calendar`, on any path (the drain's own
@@ -2070,7 +2071,8 @@ this occurrence or the whole series, as Outlook does.
   `update_event_fields` marks it (`TIMES` by the instants and `isAllDay`, never
   a zone alone; attendees by name, address and type, in order), and the
   reminder of a create sent without one when `reminder_unset` has been cleared
-  since. `RECURRENCE` is never marked. A non-empty set is queued, in the same
+  since, and `RECURRENCE` by the decoded pair `(recurrence, series_recurrence)`
+  (#2036). A non-empty set is queued, in the same
   transaction, as `UpdateEvent { id: graph_id, fields }`, a `Written` hold
   (#2031) that keeps the row through a calendar round until it is sent. A
   host write after the commit addresses a `local:` id that is gone and is
@@ -2109,7 +2111,8 @@ this occurrence or the whole series, as Outlook does.
   `numbered` ranges, `firstDayOfWeek`, `index`, `month`, `recurrenceTimeZone`,
   as given. It wins over the create-side `recurrence` (kept: its callers
   compile and send as before) when both are set; the losing one is not
-  stored. Both are create-only: `update_event_fields` ignores them.
+  stored. `update_event_fields` writes them only on a pending `local:` row
+  (#2036, below); a synced row ignores them.
 - `create_local_event` stores it in `events.recurrence` as
   `{"graphRecurrence": <EventRecurrence::to_json>}` (`SEND_RECURRENCE_KEY`,
   `encode_send_recurrence`), and in `graph_recurrence` as the row's
@@ -2124,18 +2127,59 @@ this occurrence or the whole series, as Outlook does.
   object, an unknown create-side type) neither, without an error.
   `event_input_for` passes it as `EventInput::series_recurrence`, which
   `event_body_json` sends with `to_send_json` under the `recurrence` group.
-- Not done: a pending `local:` series' recurrence cannot be changed before its
-  `CreateEvent` runs (the row edit never writes recurrence, and
-  `UpdateEventSeries` sends nothing for a `local:` id).
+- A pending `local:` series' recurrence is edited through its row (#2036, below).
 - Tests: `store` `calendar_tests` `create_local_event_stores_a_lossless_recurrence`,
   `create_local_event_lossless_recurrence_wins`,
   `update_event_fields_never_changes_a_lossless_recurrence`,
   `event_for_send_reads_neither_shape_as_no_recurrence`,
-  `create_local_event_round_trips_recurrence`; `outbox.rs`
+  `create_local_event_round_trips_recurrence`,
+  `update_event_fields_never_changes_a_synced_series_recurrence` (renamed by
+  #2036, which moved it to a synced row); `outbox.rs`
   `create_event_sends_every_lossless_recurrence_unchanged` (6 pattern types × 3
   ranges), `create_event_sends_a_lossless_recurrence_as_given` (a JSON literal),
   `create_event_with_create_side_recurrence_sends_as_before`,
   `create_event_without_recurrence_sends_none`.
+
+## A pending local series' recurrence edit (#2036)
+
+Before #2036 a host that changed a pending `local:` series' pattern before its
+`CreateEvent` ran had the original pattern sent: `update_event_fields` ignored
+recurrence, and `UpdateEventSeries` sends nothing for a `local:` id. lookxy was
+not a repro (its edit form passes `recurrence: None`); any host editing a pending
+series through the mailcore API was.
+
+- `Store::update_event_fields` on a `local:` row: a `Some` `series_recurrence`,
+  else a `Some` `recurrence`, is the edit's recurrence, normalized as
+  `create_local_event` stores it (`(None, Some(s))` or `(Some(r), None)`). When it
+  differs from the stored pair (`event_for_send`'s decode) it writes
+  `events.recurrence` (`encode_send_recurrence`), `graph_recurrence` (Graph's
+  shape, for the agenda) and `event_type = 'seriesMaster'`, and marks
+  `RECURRENCE`, so the `Written` hold (#2031) is recorded. The pending
+  `CreateEvent` reads the row at send time and POSTs it. A create-side
+  `recurrence` over a stored lossless one is a change and replaces it. Both
+  `None` keeps: a pending series is not turned back into a single event here.
+  A pending single event given one becomes a series master, as if created
+  with it. A synced row still ignores both (`UpdateEventSeries` edits a series
+  on Graph).
+- In flight (#2005): `sent_event_changes` marks `RECURRENCE` by the same pair,
+  so the reconcile queues `UpdateEvent { id: graph_id, fields ⊇ RECURRENCE }`,
+  whose PATCH sends the row's recurrence (`event_body_json`, with the start's
+  named zone as `recurrenceTimeZone`, #2039). `upsert_event_on` never writes
+  `events.recurrence`, so a delta upsert before the PATCH keeps the edit. A
+  just-created single instance given a recurrence is PATCHed with one; Graph
+  documents `recurrence` as updatable, which the fake server cannot prove.
+- `drain_outbox`: an applied `UpdateEvent` carrying `RECURRENCE` owes the
+  calendars a reset (`calendar_reset_owed`), as `UpdateEventSeries` does (#2022).
+- Tests: `store` `calendar_tests` `update_event_fields_writes_a_local_series_recurrence`,
+  `update_event_fields_equal_or_unset_local_recurrence_marks_nothing`,
+  `update_event_fields_create_side_recurrence_on_a_local_row`,
+  `update_event_fields_gives_a_pending_single_event_a_recurrence`,
+  `reconcile_created_event_queues_a_recurrence_edit_made_during_the_create`,
+  `update_event_fields_never_changes_a_synced_series_recurrence`,
+  `sent_event_changes_marks_each_group`; `outbox.rs`
+  `create_event_sends_a_recurrence_edited_before_the_drain`,
+  `update_event_queued_by_the_reconcile_sends_the_edited_recurrence`;
+  `engine.rs` `a_recurrence_update_event_owes_a_calendar_reset`.
 
 ## Event times in a named time zone (#2039)
 
