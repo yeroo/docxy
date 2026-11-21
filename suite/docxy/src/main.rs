@@ -1715,9 +1715,9 @@ fn act_takes_entry_text(act: SheetAct, v: &SheetView) -> bool {
 /// ([`SheetView::pick_value`]).
 ///
 /// Protect Sheet targets no cells ([`act_targets_cells`]) but commits too
-/// (#1054): an entry left open across it could never be committed, since
-/// the commit refuses a protected sheet, so it lands first and the
-/// protection is the step after it.
+/// (#1054): an entry left open across it could never be committed into a
+/// locked cell, since the commit refuses a locked cell of a protected sheet
+/// (#2230), so it lands first and the protection is the step after it.
 fn act_commits_editor(act: SheetAct) -> bool {
     (act_targets_cells(act) || act == SheetAct::ProtectSheet)
         && !matches!(
@@ -3517,7 +3517,8 @@ impl SheetView {
     /// text and [`SheetView::entry_error`] says why. An entry that breaks its
     /// cell's data-validation rule is refused the same way, and held in
     /// [`SheetView::dv_pending`] for the alert the caller shows. An entry
-    /// into a protected sheet is refused with Excel's message (#1054).
+    /// into a locked cell of a protected sheet is refused with Excel's
+    /// message (#1054, #2230); an unlocked cell takes it.
     fn commit_edit(&mut self) -> bool {
         self.entry_error = None;
         self.dv_pending = None;

@@ -281,7 +281,7 @@ impl Docxy {
 
     /// Pick From Drop-down List's menu under the selected cell (the window's
     /// corner when the cell is off screen). An empty list opens nothing and
-    /// says so; a protected sheet is refused.
+    /// says so; a locked cell of a protected sheet is refused (#2230).
     pub(crate) fn open_pick_menu(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
         let refuse = |this: &mut Self, why: &str, cx: &mut Context<Self>| -> Result<(), String> {
             this.set_status(why.to_string());
