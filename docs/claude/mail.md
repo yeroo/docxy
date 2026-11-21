@@ -1981,8 +1981,15 @@ this occurrence or the whole series, as Outlook does.
   dropped or quarantined; an orphan write's record below the mark) deletes the
   row as Graph's window says, without relying on Graph to list it again. A held
   row Graph's round lists keeps the delta state: the ordinary edit costs no
-  extra initial rounds. A `FetchCalendarRange` stores no delta state and is
-  unchanged.
+  extra initial rounds. A `FetchCalendarRange` stores no delta state, and its
+  dates mostly lie outside the sync window, which no sync round touches: a
+  range round that keeps a held row its fetch does not list leaves the range
+  unrecorded instead (#2262 r2; `replace_calendar_range_on` returns it, and
+  the caller records), so the next `FetchCalendarRange` of those dates fetches
+  them again and the first after the hold deletes the row. A range whose held
+  rows Graph lists is recorded as before. The engine's `fetch_range_gaps`
+  computes the gaps once per calendar per command, so an unrecorded gap is no
+  loop: the command still ends with `CalendarRangeFetched`.
 - Tests: `store/mod.rs` `event_local_write_names_the_ops_whose_command_wrote_the_row`,
   `initial_round_keeps_a_row_with_a_queued_update`,
   `an_undecodable_outbox_row_does_not_stop_a_calendar_round`,
@@ -2005,6 +2012,7 @@ this occurrence or the whole series, as Outlook does.
   `gone_master_goes_despite_a_queued_response`,
   `delta_removal_of_an_orphan_edit_keeps_it_once_then_converges`,
   `initial_round_keeping_a_held_row_graph_does_not_list_stays_initial`,
+  `range_keeping_a_held_row_graph_does_not_list_stays_unrecorded`,
   `round_keeps_a_host_edit_made_after_its_mark`,
   `round_does_not_bring_back_a_host_delete_made_after_its_mark`,
   `round_after_a_host_edit_with_no_command_replaces_the_row`,

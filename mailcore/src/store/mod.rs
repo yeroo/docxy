@@ -1473,7 +1473,10 @@ pub enum EventWrite {
 /// it is (a series deleted locally), nor their attendees. A round that
 /// keeps a `written` row it would otherwise have deleted drops its
 /// calendar's delta state, so the next pass is initial and converges once
-/// the hold ends (#2262). A gone master (a 404) goes whatever the holds.
+/// the hold ends (#2262); a range round that keeps such a row leaves the
+/// range unrecorded, so the next `FetchCalendarRange` of those dates
+/// fetches them again (#2262 r2). A gone master (a 404) goes whatever the
+/// holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventHolds {
     pub written: HashSet<String>,
@@ -5909,9 +5912,13 @@ impl Store {
             // Read before the round's writes replace the masters.
             let changed = changed_masters_on(&tx, &c.fetched)?;
             let needs_initial = match &c.round {
-                CalendarRound::Window => replace_calendar_range_on(
-                    &tx, from_utc, to_utc, &c.fetched, stamp, false, &holds,
-                )?,
+                CalendarRound::Window => {
+                    let kept_absent = replace_calendar_range_on(
+                        &tx, from_utc, to_utc, &c.fetched, false, &holds,
+                    )?;
+                    record_calendar_range_on(&tx, &c.fetched.calendar_id, from_utc, to_utc, stamp)?;
+                    kept_absent
+                }
                 CalendarRound::Delta {
                     removed,
                     gone_masters,
@@ -5976,7 +5983,9 @@ impl Store {
     /// longer sync, are left to the sync pass. Rows with a pending local
     /// write are kept as `apply_calendar_sync_holding` keeps them, `held` and
     /// the host writes recorded after `since` too (#2031, #2262,
-    /// `EventHolds`).
+    /// `EventHolds`). A range that kept such a row Graph's range does not
+    /// list is not recorded as fetched (#2262 r2), so asking for it again
+    /// fetches it.
     pub fn apply_calendar_range_holding(
         &self,
         from_utc: &str,
@@ -5989,9 +5998,14 @@ impl Store {
         let tx = self.write_tx()?;
         adopt_blank_calendar_rows_on(&tx)?;
         let holds = round_holds_on(&tx, held, since)?;
-        // A range stores no delta state, so a kept absent row changes
-        // nothing here: the next sync pass's round meets it.
-        replace_calendar_range_on(&tx, from_utc, to_utc, f, stamp, true, &holds)?;
+        // A range kept with an absent held row is not recorded as fetched
+        // (#2262 r2): a range is mostly outside the sync window, which no
+        // sync round touches, so the next `FetchCalendarRange` of those
+        // dates must fetch them again; the first after the hold ends
+        // deletes the row as Graph says.
+        if !replace_calendar_range_on(&tx, from_utc, to_utc, f, true, &holds)? {
+            record_calendar_range_on(&tx, &f.calendar_id, from_utc, to_utc, stamp)?;
+        }
         prune_event_local_writes_on(&tx, since)?;
         tx.commit()?;
         Ok(())
@@ -9669,7 +9683,9 @@ fn adopt_blank_calendar_rows_on(conn: &Connection) -> Result<(), StoreError> {
 
 /// Replaces `f.calendar_id`'s synced (non-`local:`) events overlapping
 /// `[from_utc, to_utc)` with `f`'s, each stored under that id, with their
-/// attendees, and records the range as fetched at `stamp`.
+/// attendees. The caller records the range as fetched
+/// (`record_calendar_range_on`), or, a range round that kept an absent
+/// held row, does not (#2262 r2).
 ///
 /// With `keep_masters` (#2064) its stored `seriesMaster` rows stay: a
 /// `FetchCalendarRange`'s plain `calendarView` never returns a master, so
@@ -9685,13 +9701,14 @@ fn adopt_blank_calendar_rows_on(conn: &Connection) -> Result<(), StoreError> {
 /// then drops the calendar's delta state, so the calendar's passes stay
 /// initial while the hold lasts, and the first one after it deletes the
 /// row as Graph's window says; no later delta round would name an event
-/// Graph no longer has in the window.
+/// Graph no longer has in the window. A range round leaves the range
+/// unrecorded instead, so the next `FetchCalendarRange` of those dates
+/// fetches them again, and the first one after the hold deletes the row.
 fn replace_calendar_range_on(
     conn: &Connection,
     from_utc: &str,
     to_utc: &str,
     f: &FetchedCalendar,
-    stamp: RangeStamp,
     keep_masters: bool,
     holds: &EventHolds,
 ) -> Result<bool, StoreError> {
@@ -9720,7 +9737,6 @@ fn replace_calendar_range_on(
         }
     }
     upsert_fetched_events_on(conn, f, holds)?;
-    record_calendar_range_on(conn, &f.calendar_id, from_utc, to_utc, stamp)?;
     Ok(kept_absent)
 }
 
@@ -18650,6 +18666,39 @@ mod calendar_tests {
             .unwrap();
         assert!(s.event("E1").unwrap().is_none());
         assert!(s.calendar_delta("A").unwrap().is_some());
+    }
+
+    #[test]
+    fn range_keeping_a_held_row_graph_does_not_list_stays_unrecorded() {
+        // A `FetchCalendarRange`, mostly outside the sync window, which no
+        // sync round touches: the range must be fetched again to converge.
+        let (a, b) = ("2026-07-20T00:00:00Z", "2026-07-22T00:00:00Z");
+        let at = |at: i64| RangeStamp { at, fresh_since: 0 };
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x")]).unwrap();
+        s.apply_calendar_range(a, b, &with_ann(fetched("A", graph_events())), at(1000))
+            .unwrap();
+        edit_locally(&s, "E1");
+        let seq = s.enqueue_op(&update_op("E1")).unwrap();
+        // Graph's range lists E1: recorded as before.
+        s.apply_calendar_range(a, b, &with_ann(fetched("A", graph_events())), at(2000))
+            .unwrap();
+        assert_edited(&s, "E1");
+        assert!(s.calendar_range_gaps("A", a, b, 1500).unwrap().is_empty());
+        // Graph's range no longer lists E1: kept, and the range stays as
+        // fresh as it was.
+        let e2_only = || with_ann(fetched("A", vec![in_cal("E2", "A", E2_START, E2_END)]));
+        s.apply_calendar_range(a, b, &e2_only(), at(3000)).unwrap();
+        assert_edited(&s, "E1");
+        assert_eq!(
+            s.calendar_range_gaps("A", a, b, 2500).unwrap(),
+            [(a.to_string(), b.to_string())]
+        );
+        // Once the op is gone, the next range deletes E1 and is recorded.
+        s.drop_op(seq).unwrap();
+        s.apply_calendar_range(a, b, &e2_only(), at(4000)).unwrap();
+        assert!(s.event("E1").unwrap().is_none());
+        assert!(s.calendar_range_gaps("A", a, b, 3500).unwrap().is_empty());
     }
 
     #[test]
