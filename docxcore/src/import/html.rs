@@ -530,8 +530,6 @@ struct Look {
     /// separates margins as padding does.
     border_before: bool,
     border_after: bool,
-    /// It draws border sides of its own (not inherited, #1883 r1).
-    own_bordered: bool,
     /// Inside a list (inherited, #2114): a list in it is nested, with no
     /// user-agent vertical margins (a browser's
     /// `:is(dir,dl,menu,ol,ul) :is(dir,dl,menu,ol,ul)`, across tables too).
@@ -609,10 +607,6 @@ struct Elem {
     /// its parent's [`Kids`] can tell it apart from another child without
     /// comparing keys.
     serial: u64,
-    /// It draws borders of its own and is an odd one of those
-    /// ([`Html::bordered_blocks`]): its paragraphs' borders carry a
-    /// `w:between` cancel ([`mark_borders`]), decided once, when it opens.
-    border_mark: bool,
     /// Its own element children so far (#1883).
     kids: Kids,
     kind: Kind,
@@ -732,25 +726,6 @@ const PAGE_BREAK_BEFORE: &str = "<w:pageBreakBefore/>";
 
 /// The explicit italic off a run under a heading gets (#1883).
 const ITALIC_OFF: &str = "<w:i w:val=\"0\"/>";
-
-/// Keep two sibling blocks with borders of their own from being drawn as
-/// one box (#1883 r1). Word and the suite join consecutive paragraphs with
-/// equal borders and indents; a browser draws each block's box. Every
-/// other such block (`mark`) gives its paragraphs a `w:between` cancel
-/// (`ParBorders::nil`), which draws nothing but makes its borders differ
-/// from its neighbours', while one block's paragraphs stay equal. A
-/// block inside one keeps its own mark, not the outer's.
-fn mark_borders(look: &mut Look, mark: bool) {
-    const BETWEEN: usize = 4;
-    if !look.own_bordered {
-        return;
-    }
-    if mark {
-        look.borders.set_side(BETWEEN, None);
-    } else {
-        look.borders.clear_side(BETWEEN);
-    }
-}
 
 /// Shading of `fill` (`RRGGBB`), run or paragraph.
 fn shd(fill: &str) -> String {
@@ -1121,7 +1096,6 @@ impl Cascade {
         look.own_break_after = false;
         look.border_before = false;
         look.border_after = false;
-        look.own_bordered = false;
         let parent_block_align = look.block_align;
         if kind == Kind::Cell {
             look.in_cell = true;
@@ -1950,7 +1924,6 @@ impl Cascade {
                         ..ParBorders::default()
                     };
                     look.borders = mine.over(look.borders);
-                    look.own_bordered = true;
                 }
             }
             Kind::Inline => {
@@ -2261,10 +2234,6 @@ struct Html<'a> {
     root_kids: Kids,
     /// The serial the next element opened takes ([`Elem::serial`]).
     next_serial: u64,
-    /// How many blocks drawing borders of their own have opened (#1883
-    /// r1): every other one's paragraphs carry a `w:between` cancel, so
-    /// two such sibling blocks are never one box.
-    bordered_blocks: u64,
 }
 
 impl<'a> Html<'a> {
@@ -2293,7 +2262,6 @@ impl<'a> Html<'a> {
             break_pending: false,
             root_kids: Kids::default(),
             next_serial: 0,
-            bordered_blocks: 0,
         }
     }
 
@@ -2411,7 +2379,8 @@ impl<'a> Html<'a> {
     /// classes, its place among the open element's children, whether it is
     /// a link, and the attributes the sheet's selectors name (each value
     /// kept up to [`css::MAX_ATTR_VALUE`], lowercased too when a selector
-    /// compares it without case), their memory charged.
+    /// compares it without case): at most [`css::MAX_ATTR_NAMES`] of them,
+    /// held while the element is open or among the last children kept.
     fn key_of(&self, name: &str, attrs: &Attrs, attrs_at: (usize, usize)) -> ElemKey {
         let mut key = ElemKey::new(name, attrs.id.as_deref(), attrs.class.as_deref());
         key.index = match self.elems.last() {
@@ -2428,9 +2397,6 @@ impl<'a> Html<'a> {
                     key.keep_attr(&n, &attr_entities(value), self.sheet.caseless(&n));
                 }
             });
-            if !self.budget.alloc(key.heap()) {
-                key.attrs.clear();
-            }
         }
         key
     }
@@ -2442,10 +2408,11 @@ impl<'a> Html<'a> {
     }
 
     /// Count the element `serial` keyed `key` as the open element's next
-    /// child (#1883), keeping its key, charged as memory built, when the
-    /// sheet has a `+`.
+    /// child (#1883), keeping its key when the sheet has a `+`: work, as an
+    /// element's own key is, since a parent keeps at most
+    /// [`css::MAX_COMPOUNDS`] of them.
     fn add_child(&mut self, serial: u64, key: ElemKey) {
-        let keep = self.sheet.uses_next() && self.budget.keep::<(u64, ElemKey)>(key.heap());
+        let keep = self.sheet.uses_next() && self.budget.work(1 + key.heap() / 16);
         let kids = self.kids_mut();
         kids.count = kids.count.saturating_add(1);
         if keep {
@@ -2703,12 +2670,7 @@ impl<'a> Html<'a> {
             } else {
                 CardMode::No
             };
-            let mut look = look_of(self.ctx(), &self.elems, &key, kind, &attrs, mode);
-            let border_mark = look.own_bordered && {
-                self.bordered_blocks += 1;
-                self.bordered_blocks.is_multiple_of(2)
-            };
-            mark_borders(&mut look, border_mark);
+            let look = look_of(self.ctx(), &self.elems, &key, kind, &attrs, mode);
             // A card's table opens one level down (`begin_card`).
             let card = match mode {
                 CardMode::Maybe if look.own_card => CardMode::Yes(self.table_depth + 1),
@@ -2724,7 +2686,6 @@ impl<'a> Html<'a> {
             self.elems.push(Elem {
                 key,
                 serial,
-                border_mark,
                 kids: Kids::default(),
                 kind,
                 look,
@@ -2842,7 +2803,6 @@ impl<'a> Html<'a> {
                 &attrs,
                 e.card,
             );
-            mark_borders(&mut e.look, e.border_mark);
         }
     }
 
@@ -2905,7 +2865,6 @@ impl<'a> Html<'a> {
                     reopen.push(Elem {
                         key: std::mem::take(&mut e.key),
                         serial: 0,
-                        border_mark: false,
                         kids: Kids::default(),
                         kind: e.kind,
                         look: Look::default(),
@@ -5485,37 +5444,41 @@ mod tests {
         assert_eq!(p.color, None, "a value past the cap is never tested");
     }
 
-    /// Whether the paragraphs holding `a` and `b` share one border box, as
-    /// the suite and Word group them: equal borders (and indents).
-    fn one_box(d: &Document, a: &str, b: &str) -> bool {
-        let (a, b) = (para_of(d, a).props, para_of(d, b).props);
-        a.borders == b.borders && (a.indent, a.indent_right) == (b.indent, b.indent_right)
+    #[test]
+    fn sibling_bordered_blocks_group_as_word_draws_them_1883() {
+        // r2 (planner's decision): Word, and classic Outlook through it,
+        // joins consecutive paragraphs with equal borders and indents into
+        // one box, so two sibling ruled paragraphs are one box there (a
+        // browser draws two). The import writes what both read: equal
+        // borders, no mark.
+        let d = doc("<p style='border-bottom:1px solid #dddddd'>A</p>\
+             <p style='border-bottom:1px solid #dddddd'>B</p>\
+             <div style='border:1px solid #cccccc'><p>box one</p><p>box two</p></div>");
+        let b = |t: &str| para_of(&d, t).props.borders;
+        assert_eq!(b("A"), b("B"));
+        assert_eq!(b("box one"), b("box two"));
+        for t in ["A", "B", "box one", "box two"] {
+            assert_eq!(b(t).nil, 0, "{t}");
+        }
+        let xml = crate::serialize::blocks_to_xml(&d.body);
+        assert!(!xml.contains("w:between"), "{xml}");
     }
 
     #[test]
-    fn sibling_bordered_blocks_are_separate_boxes_1883() {
-        // r1 M2: a browser draws a line under each of two ruled paragraphs
-        // and two boxes for two boxed `div`s; one block's paragraphs are
-        // still one box.
-        let d = doc(
-            "<p style='border-bottom:1px solid #dddddd'>A</p>             <p style='border-bottom:1px solid #dddddd'>B</p>             <p style='border-bottom:1px solid #dddddd'>C</p>             <div style='border:1px solid #cccccc'><p>box1 one</p><p>box1 two</p></div>             <div style='border:1px solid #cccccc'><p>box2 one</p><p>box2 two</p></div>",
-        );
-        assert!(!one_box(&d, "A", "B"));
-        assert!(!one_box(&d, "B", "C"));
-        assert!(one_box(&d, "box1 one", "box1 two"));
-        assert!(one_box(&d, "box2 one", "box2 two"));
-        assert!(!one_box(&d, "box1 two", "box2 one"));
-        // The mark draws nothing: no `between` line on any of them.
-        for t in ["A", "B", "C", "box1 one", "box2 two"] {
-            assert!(para_of(&d, t).props.borders.between.is_none(), "{t}");
+    fn many_elements_with_sibling_and_attribute_rules_import_1883() {
+        // r2 m1: an element's key, and the 32 last children's a parent
+        // keeps, are work, not memory built: a long page is no TOO_BIG.
+        let mut page =
+            String::from("<style>b + b {color:#FF0000} b[title^=t] {font-style:italic}</style><p>");
+        for i in 0..200_000 {
+            page.push_str(&format!("<b title=t{i}>{i} </b>"));
         }
-        // It saves and loads as it was, so the boxes stay apart.
-        let back = reloaded(&d);
-        assert!(!one_box(&back, "A", "B") && one_box(&back, "box2 one", "box2 two"));
-        assert_eq!(
-            para_of(&back, "B").props.borders,
-            para_of(&d, "B").props.borders
-        );
+        page.push_str("</p>");
+        let d = doc(&page);
+        let last = run_of(&d, "199999").props;
+        assert_eq!(last.color.as_deref(), Some("FF0000"));
+        assert!(last.italic && last.bold);
+        assert_eq!(run_of(&d, "0 ").props.color, None);
     }
 
     #[test]
