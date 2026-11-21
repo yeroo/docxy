@@ -78,7 +78,10 @@ use super::html_table::{self, CellSpec, MAX_TABLE_NESTING, TableSpec, VAlign, Wi
 use super::{
     Budget, Builder, FlowTail, Link, MAX_DEPTH, TOO_BIG, heading_props, marker_is_numbered,
 };
-use crate::model::{Align, Block as DocBlock, Document, Inline, ParProps, RunProps, VertAlign};
+use crate::model::{
+    Align, Block as DocBlock, BorderKind, Document, Inline, ParBorder, ParBorders, ParProps,
+    RunProps, VertAlign,
+};
 use crate::package::Package;
 use std::rc::Rc;
 
@@ -513,6 +516,20 @@ struct Look {
     indent_right: i32,
     /// Paragraph shading (`RRGGBB`) of the nearest shaded block.
     shade: Option<String>,
+    /// Paragraph borders (#1883): the sides blocks draw, an inner block's
+    /// own sides over its outer ones' (Word draws one box). Inherited, and
+    /// reset by a cell and a card.
+    borders: ParBorders,
+    /// Where the left and right lines of `borders` are, in twips from the
+    /// margins: a paragraph's `w:space` on that side is its indent less
+    /// this and the line's width (so text in a list or padded block
+    /// inside keeps its place and the line stays at the box's).
+    border_left_x: i32,
+    border_right_x: i32,
+    /// A top or bottom line of its own (not inherited, #1883): it
+    /// separates margins as padding does.
+    border_before: bool,
+    border_after: bool,
     /// Inside a list (inherited, #2114): a list in it is nested, with no
     /// user-agent vertical margins (a browser's
     /// `:is(dir,dl,menu,ol,ul) :is(dir,dl,menu,ol,ul)`, across tables too).
@@ -749,6 +766,8 @@ struct Cascade {
     /// Its own forced breaks (`Some(true)` a page break).
     break_before: Option<bool>,
     break_after: Option<bool>,
+    /// Its own border, top, right, bottom, left (#1883).
+    border: [css::BorderSide; 4],
 }
 
 /// A twips sum kept in Word's range.
@@ -823,10 +842,10 @@ fn mark_rpr(run: &RunProps) -> Option<String> {
 /// closes the margin group open below it (its margins already paid) and
 /// starts a new one; with none, a positive margin collapses into the open
 /// group, adding only what it exceeds it by. A negative margin is summed.
-fn fold_bottom(after: i32, open: i32, margin: i32, pad: i32) -> (i32, i32) {
+fn fold_bottom(after: i32, open: i32, margin: i32, pad: i32, sep: bool) -> (i32, i32) {
     let (mut after, mut open) = (i64::from(after), i64::from(open));
     let margin = i64::from(margin);
-    if pad != 0 {
+    if pad != 0 || sep {
         after += i64::from(pad);
         open = 0;
     }
@@ -1019,6 +1038,8 @@ impl Cascade {
         look.own_card = false;
         look.own_break_before = false;
         look.own_break_after = false;
+        look.border_before = false;
+        look.border_after = false;
         let parent_block_align = look.block_align;
         if kind == Kind::Cell {
             look.in_cell = true;
@@ -1028,6 +1049,7 @@ impl Cascade {
             look.indent_right = 0;
             look.first_line = 0;
             look.shade = None;
+            look.borders = ParBorders::default();
         }
         let parent_pt = font_pt(&look.run);
         let parent_color = look.run.color.clone();
@@ -1060,6 +1082,7 @@ impl Cascade {
             letter_spacing: None,
             break_before: None,
             break_after: None,
+            border: Default::default(),
         }
     }
 
@@ -1531,6 +1554,7 @@ impl Cascade {
                 Some(h) => run.highlight = Some(h.to_string()),
                 None => {}
             },
+            name if name.starts_with("border") => self.border_decl(&name["border".len()..], v),
             name => {
                 let longhand = name
                     .strip_prefix("margin-")
@@ -1549,6 +1573,108 @@ impl Cascade {
                 }
             }
         }
+    }
+
+    /// A `border…` declaration (#1883), `rest` its name past `border`:
+    /// the shorthands, `-width`, `-style`, `-color` and each side's.
+    /// Others (`-radius`, `-collapse`, `-spacing`) are not borders.
+    fn border_decl(&mut self, rest: &str, v: &str) {
+        let side = |s: &str| match s {
+            "top" => Some(0),
+            "right" => Some(1),
+            "bottom" => Some(2),
+            "left" => Some(3),
+            _ => None,
+        };
+        let Some(rest) = rest.strip_prefix('-') else {
+            if rest.is_empty() {
+                if let Some(b) = css::border_shorthand(v) {
+                    self.border = std::array::from_fn(|_| b.clone());
+                }
+            }
+            return;
+        };
+        let (s, part) = match rest.split_once('-') {
+            Some((s, part)) => (side(s), part),
+            None => (side(rest), ""),
+        };
+        let sides: Vec<usize> = match s {
+            Some(i) => vec![i],
+            // `border-width` and the like: the part is the whole rest.
+            None if part.is_empty() => (0..4).collect(),
+            None => return,
+        };
+        let part = if s.is_some() { part } else { rest };
+        match part {
+            "" => {
+                if let Some(b) = css::border_shorthand(v) {
+                    for i in sides {
+                        self.border[i] = b.clone();
+                    }
+                }
+            }
+            "width" | "style" | "color" => {
+                // One side's value, or one to four for all of them.
+                macro_rules! set {
+                    ($parse:path, $field:ident) => {
+                        if s.is_some() {
+                            if let Some(x) = $parse(v) {
+                                self.border[sides[0]].$field = x;
+                            }
+                        } else if let Some(all) = css::border_sides(v, $parse) {
+                            for (i, x) in all.into_iter().enumerate() {
+                                self.border[i].$field = x;
+                            }
+                        }
+                    };
+                }
+                match part {
+                    "width" => set!(css::border_width, width),
+                    "style" => set!(css::border_style, style),
+                    _ => set!(css::border_color, color),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A block's own drawn border sides (#1883), top, right, bottom, left,
+    /// in its final font and colour: top and bottom `w:space` its padding
+    /// there in whole points (the left and right ones are set per
+    /// paragraph, [`Html::par_props`]).
+    fn own_borders(&self, pt: f64) -> [Option<ParBorder>; 4] {
+        std::array::from_fn(|i| {
+            let b = &self.border[i];
+            if !b.drawn() {
+                return None;
+            }
+            let width = b.width.points(pt)?;
+            let kind = match b.style {
+                css::BorderStyle::Double => BorderKind::Double,
+                css::BorderStyle::Dotted => BorderKind::Dotted,
+                css::BorderStyle::Dashed => BorderKind::Dashed,
+                _ => BorderKind::Single,
+            };
+            let color = match &b.color {
+                css::BorderColor::Rgb(c) => Some(c.as_str()),
+                css::BorderColor::Current => self.look.run.color.as_deref(),
+                css::BorderColor::Auto => None,
+            }
+            .and_then(|c| u32::from_str_radix(c, 16).ok());
+            let space = if i % 2 == 0 {
+                let pad = self.padding[i].and_then(|l| l.points(pt)).unwrap_or(0.0);
+                pad.round().clamp(0.0, 31.0) as u16
+            } else {
+                0
+            };
+            Some(ParBorder {
+                kind,
+                sz: (width * 8.0).round().clamp(2.0, 96.0) as u16,
+                space,
+                color,
+                theme: None,
+            })
+        })
     }
 
     /// A block's or list's top and bottom box (#1979, #2114): the user
@@ -1622,6 +1748,13 @@ impl Cascade {
         if (self.kind == Kind::Block && !card) || self.kind == Kind::List {
             self.vertical_box(pt);
         }
+        // Its own border's drawn sides (#1883): only a block's (not a
+        // card's, cell's, table's, list's or inline element's).
+        let own = if self.kind == Kind::Block && !card {
+            self.own_borders(pt)
+        } else {
+            [None; 4]
+        };
         let look = &mut self.look;
         if card {
             // A card is a cell (#1927): a fresh block look, as a `td`
@@ -1631,6 +1764,7 @@ impl Cascade {
             look.indent_right = 0;
             look.first_line = 0;
             look.shade = None;
+            look.borders = ParBorders::default();
         }
         match self.line {
             None => {}
@@ -1669,11 +1803,20 @@ impl Cascade {
                 look.own_place = block_position(self.margin_auto, self.parent_block_align);
             }
             Kind::Block => {
-                if let Some(l) = sum(self.margin[3], self.padding[3]) {
-                    look.indent = clamp_twips(i64::from(look.indent) + i64::from(l));
+                // Its own border (#1883): a left or right line is between
+                // its margin and its padding, so it moves the text in by its
+                // width too; a top or bottom one takes that side's padding
+                // as its `w:space` (not spacing), and separates margins.
+                let line_w = |b: Option<ParBorder>| b.map_or(0, |b| i64::from(b.sz) * 5 / 2);
+                let (left_w, right_w) = (line_w(own[3]), line_w(own[1]));
+                if let Some(l) = sum(self.margin[3], self.padding[3]).or((left_w > 0).then_some(0))
+                {
+                    look.indent = clamp_twips(i64::from(look.indent) + i64::from(l) + left_w);
                 }
-                if let Some(r) = sum(self.margin[1], self.padding[1]) {
-                    look.indent_right = clamp_twips(i64::from(look.indent_right) + i64::from(r));
+                if let Some(r) = sum(self.margin[1], self.padding[1]).or((right_w > 0).then_some(0))
+                {
+                    look.indent_right =
+                        clamp_twips(i64::from(look.indent_right) + i64::from(r) + right_w);
                 }
                 // A fixed-width box with both side margins auto is centred
                 // in the body (#1922): its content box, so its own padding
@@ -1697,6 +1840,34 @@ impl Cascade {
                 }
                 if let Some(fill) = self.background {
                     look.shade = Some(fill);
+                }
+                if own.iter().any(Option::is_some) {
+                    // The lines' places, from the text's: its indent less
+                    // its padding and the line.
+                    let pad = |i: usize| i64::from(tw(self.padding[i]).unwrap_or(0));
+                    if own[3].is_some() {
+                        look.border_left_x = clamp_twips(i64::from(look.indent) - pad(3) - left_w);
+                    }
+                    if own[1].is_some() {
+                        look.border_right_x =
+                            clamp_twips(i64::from(look.indent_right) - pad(1) - right_w);
+                    }
+                    if own[0].is_some() {
+                        look.pad_before = 0;
+                        look.border_before = true;
+                    }
+                    if own[2].is_some() {
+                        look.pad_after = 0;
+                        look.border_after = true;
+                    }
+                    let mine = ParBorders {
+                        top: own[0],
+                        right: own[1],
+                        bottom: own[2],
+                        left: own[3],
+                        ..ParBorders::default()
+                    };
+                    look.borders = mine.over(look.borders);
                 }
             }
             Kind::Inline => {
@@ -3172,7 +3343,9 @@ impl<'a> Html<'a> {
             if e.kind.table() {
                 return matches!(e.key.tag.as_str(), "td" | "th");
             }
-            if matches!(e.kind, Kind::Block | Kind::List) && e.look.pad_after != 0 {
+            if matches!(e.kind, Kind::Block | Kind::List)
+                && (e.look.pad_after != 0 || e.look.border_after)
+            {
                 return false;
             }
         }
@@ -3289,16 +3462,17 @@ impl<'a> Html<'a> {
             let mut margin = i64::from(look.margin_before);
             if dropping {
                 margin -= i64::from(look.ua_before);
-                // Its padding is inside its margin: the members within
-                // are no longer at the container's start.
-                dropping = look.pad_before == 0;
+                // Its padding (or top line, #1883) is inside its margin:
+                // the members within are no longer at the container's
+                // start.
+                dropping = look.pad_before == 0 && !look.border_before;
             }
             if margin > 0 {
                 group = group.max(margin);
             } else {
                 before += margin;
             }
-            if look.pad_before != 0 {
+            if look.pad_before != 0 || look.border_before {
                 before += group - paid + i64::from(look.pad_before);
                 group = 0;
                 paid = 0;
@@ -3333,12 +3507,20 @@ impl<'a> Html<'a> {
             return;
         };
         let (margin, pad, ua) = (e.look.margin_after, e.look.pad_after, e.look.ua_after);
+        // A bottom line separates as padding does (#1883).
+        let sep = e.look.border_after;
         let quirky =
             self.quirks && ua > 0 && e.kind == Kind::Block && self.bottom_unseparated(j, in_table);
-        let (after, open) = fold_bottom(tail.after, tail.open, margin, pad);
+        let (after, open) = fold_bottom(tail.after, tail.open, margin, pad, sep);
         let bare = match tail.bare {
-            Some((a, o)) => Some(fold_bottom(a, o, margin - if quirky { ua } else { 0 }, pad)),
-            None if quirky => Some(fold_bottom(tail.after, tail.open, margin - ua, pad)),
+            Some((a, o)) => Some(fold_bottom(
+                a,
+                o,
+                margin - if quirky { ua } else { 0 },
+                pad,
+                sep,
+            )),
+            None if quirky => Some(fold_bottom(tail.after, tail.open, margin - ua, pad, sep)),
             None => None,
         };
         if let Some(p) = self.out.flow_last_mut(in_table) {
@@ -3414,6 +3596,22 @@ impl<'a> Html<'a> {
             }
         }
         p.indent_right = look.indent_right.max(0);
+        if look.borders.any() {
+            // A left or right line's `w:space` is what is between it and
+            // this paragraph's text (#1883), in whole points up to Word's 31.
+            let space = |gap: i32, b: &ParBorder| {
+                let gap = f64::from(gap) - f64::from(b.sz) * 2.5;
+                (gap / 20.0).round().clamp(0.0, 31.0) as u16
+            };
+            let mut b = look.borders;
+            if let Some(l) = b.left.as_mut() {
+                l.space = space(p.indent - look.border_left_x, l);
+            }
+            if let Some(r) = b.right.as_mut() {
+                r.space = space(p.indent_right - look.border_right_x, r);
+            }
+            p.borders = b;
+        }
         if let Some(fill) = &look.shade {
             p.raw_props.push(shd(fill));
         }
@@ -4975,6 +5173,130 @@ mod tests {
             crate::serialize::blocks_to_xml(&d.body)
         );
         crate::load::parse_document_xml(&xml, &crate::load::Relationships::default())
+    }
+
+    #[test]
+    fn gmail_blockquote_border_left_is_a_paragraph_border_1883() {
+        let d = doc("<div dir=ltr>reply</div><div class=gmail_quote>\
+             <div dir=ltr class=gmail_attr>On Monday someone wrote:<br></div>\
+             <blockquote class=gmail_quote style='margin:0px 0px 0px 0.8ex;\
+             border-left:1px solid rgb(204,204,204);padding-left:1ex'>\
+             <div dir=ltr>quoted one</div><div>quoted two</div>\
+             <ul><li>item</li></ul></blockquote></div><p>after</p>");
+        let one = para_of(&d, "quoted one").props;
+        let left = one.borders.left.expect("a left line");
+        assert_eq!(
+            (left.kind, left.sz, left.color),
+            (BorderKind::Single, 6, Some(0xCCCCCC))
+        );
+        assert!(one.borders.top.is_none() && one.borders.bottom.is_none());
+        assert!(one.borders.right.is_none());
+        // Text at margin + line + padding (0.8ex + 1px + 1ex of 12 pt);
+        // the padding is the line's space.
+        assert_eq!(one.indent, 96 + 15 + 120);
+        assert_eq!(left.space, 6);
+        // Every paragraph in it carries it; an item's text is further in,
+        // so its space grows (to Word's 31 pt) and the line stays put.
+        assert_eq!(para_of(&d, "quoted two").props.borders, one.borders);
+        let item = para_of(&d, "item").props;
+        assert_eq!(item.borders.left.map(|l| l.space), Some(31));
+        for t in ["reply", "On Monday", "after"] {
+            assert!(para_of(&d, t).props.borders.is_empty(), "{t}");
+        }
+        let back = reloaded(&d);
+        assert_eq!(para_of(&back, "quoted one").props.borders.left, Some(left));
+    }
+
+    #[test]
+    fn outlook_reply_header_border_top_1883() {
+        let d = doc("<style>p.MsoNormal {margin:0in}</style>\
+             <div style='border:none;border-left:solid #CCCCCC 1.0pt;\
+             padding:0in 0in 0in 6.0pt;margin-left:4.8pt;margin-right:0in'>\
+             <div><div style='border:none;border-top:solid #E1E1E1 1.0pt;\
+             padding:3.0pt 0in 0in 0in'>\
+             <p class=MsoNormal><b>From:</b> A</p><p class=MsoNormal><b>Sent:</b> B</p>\
+             </div></div><p class=MsoNormal>body</p></div>");
+        let from = para_of(&d, "From:").props;
+        let top = from.borders.top.expect("a top line");
+        assert_eq!((top.sz, top.space, top.color), (8, 3, Some(0xE1E1E1)));
+        // The outer box's left line goes on through the header (one side
+        // each, merged), at the outer box's place.
+        let left = from.borders.left.expect("the outer left line");
+        assert_eq!((left.sz, left.color), (8, Some(0xCCCCCC)));
+        assert_eq!(from.indent, 96 + 20 + 120);
+        assert_eq!(left.space, 6);
+        // The 3 pt padding is the line's space, not spacing.
+        assert_eq!(from.spacing.before, Some(0));
+        assert_eq!(para_of(&d, "Sent:").props.borders, from.borders);
+        let body = para_of(&d, "body").props;
+        assert!(body.borders.top.is_none());
+        assert_eq!(body.borders.left, from.borders.left);
+    }
+
+    #[test]
+    fn word_s_ruled_paragraph_keeps_its_box_1883() {
+        // Word's own HTML: the box on a `div`, `border:none` on the `p`.
+        let d = doc(
+            "<div style='border:none;border-bottom:solid windowtext 1.0pt;\
+             padding:0in 0in 1.0pt 0in'>\
+             <p class=MsoNormal style='border:none;padding:0in'>ruled</p></div><p>plain</p>",
+        );
+        let b = para_of(&d, "ruled").props.borders;
+        let bottom = b.bottom.expect("the box's bottom");
+        assert_eq!((bottom.sz, bottom.space, bottom.color), (8, 1, None));
+        assert!(b.top.is_none() && b.left.is_none() && b.right.is_none());
+        assert!(para_of(&d, "plain").props.borders.is_empty());
+    }
+
+    #[test]
+    fn border_none_and_missing_style_draw_nothing_1883() {
+        let d = doc(
+            "<p style='border:1px red'>nostyle</p><p style='border:none'>none</p>\
+             <p style='border-left:0 solid red'>zero</p>\
+             <p style='border:1px solid red;border-style:none'>longhand</p>\
+             <p style='border-top:solid;border-top-color:blue;border-top-width:2px'>longs</p>",
+        );
+        for t in ["nostyle", "none", "zero", "longhand"] {
+            assert!(para_of(&d, t).props.borders.is_empty(), "{t}");
+        }
+        let top = para_of(&d, "longs").props.borders.top.unwrap();
+        assert_eq!((top.sz, top.color), (12, Some(0x0000FF)));
+    }
+
+    #[test]
+    fn cell_card_and_inline_borders_stay_ignored_1883() {
+        let d = doc("<div style='border-left:1px solid red'><p>outer</p>\
+             <table><tr><td style='border:1px solid red'><p>cell</p></td>\
+             <td><div style='background:#eeeeee;border:1px solid red'>card</div></td></tr></table>\
+             <p>x <span style='border:1px solid red'>inline</span></p></div>");
+        assert!(para_of(&d, "outer").props.borders.left.is_some());
+        assert!(para_of(&d, "cell").props.borders.is_empty());
+        assert!(para_of(&d, "card").props.borders.is_empty());
+        // The inline element's own is ignored; its paragraph keeps the
+        // block's.
+        let p = para_of(&d, "inline").props;
+        assert!(p.borders.left.is_some() && p.borders.top.is_none());
+    }
+
+    #[test]
+    fn top_and_bottom_lines_separate_margins_1883() {
+        // Without the line the margins collapse (20 px); with it they add
+        // up (20 + 10 px), as padding would.
+        let page = |b: &str| {
+            doc(&format!(
+                "<!DOCTYPE html><p style='margin:0'>a</p>\
+                 <div style='margin:20px 0;{b}'><p style='margin:10px 0'>x</p></div>\
+                 <p style='margin:0'>b</p>"
+            ))
+        };
+        let d = page("");
+        assert_eq!(para_of(&d, "x").props.spacing.before, Some(300));
+        assert_eq!(para_of(&d, "x").props.spacing.after, Some(300));
+        let d = page("border-top:1px solid;border-bottom:1px solid");
+        let x = para_of(&d, "x").props;
+        assert_eq!(x.spacing.before, Some(450));
+        assert_eq!(x.spacing.after, Some(450));
+        assert!(x.borders.top.is_some() && x.borders.bottom.is_some());
     }
 
     #[test]

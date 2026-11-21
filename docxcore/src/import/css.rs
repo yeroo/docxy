@@ -1165,6 +1165,135 @@ pub(crate) fn box_sides(value: &str) -> Option<[Option<Len>; 4]> {
     four_sides(&vals)
 }
 
+/// A border's line style (#1883), as far as Word's paragraph borders tell
+/// them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BorderStyle {
+    /// `none`, `hidden`: no line.
+    None,
+    Solid,
+    Double,
+    Dotted,
+    Dashed,
+    /// `groove`, `ridge`, `inset`, `outset`: drawn as a plain line.
+    Other,
+}
+
+/// A border's colour (#1883).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BorderColor {
+    /// `currentColor` (the initial value): the element's text colour.
+    Current,
+    /// `windowtext`, `auto`: automatic.
+    Auto,
+    /// `RRGGBB`, uppercase.
+    Rgb(String),
+}
+
+/// One side of an element's border (#1883), every part set: what a
+/// shorthand gives (the parts it does not name at their initial values)
+/// and what the longhands change.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BorderSide {
+    pub(crate) width: Len,
+    pub(crate) style: BorderStyle,
+    pub(crate) color: BorderColor,
+}
+
+impl Default for BorderSide {
+    /// The initial value: `medium none currentColor`.
+    fn default() -> Self {
+        BorderSide {
+            width: Len {
+                v: 3.0,
+                unit: Unit::Px,
+            },
+            style: BorderStyle::None,
+            color: BorderColor::Current,
+        }
+    }
+}
+
+impl BorderSide {
+    /// Whether it draws a line: a style other than `none` and a width
+    /// above 0.
+    pub(crate) fn drawn(&self) -> bool {
+        self.style != BorderStyle::None && self.width.v > 0.0
+    }
+}
+
+/// A `border-style` keyword.
+pub(crate) fn border_style(value: &str) -> Option<BorderStyle> {
+    Some(match value.trim().to_ascii_lowercase().as_str() {
+        "none" | "hidden" => BorderStyle::None,
+        "solid" => BorderStyle::Solid,
+        "double" => BorderStyle::Double,
+        "dotted" => BorderStyle::Dotted,
+        "dashed" => BorderStyle::Dashed,
+        "groove" | "ridge" | "inset" | "outset" => BorderStyle::Other,
+        _ => return None,
+    })
+}
+
+/// A `border-width` value: `thin`, `medium`, `thick` (1, 3, 5 px) or a
+/// non-negative length (no percentage).
+pub(crate) fn border_width(value: &str) -> Option<Len> {
+    let px = |v| Some(Len { v, unit: Unit::Px });
+    match value.trim().to_ascii_lowercase().as_str() {
+        "thin" => px(1.0),
+        "medium" => px(3.0),
+        "thick" => px(5.0),
+        v => length(v).filter(|l| l.unit != Unit::Percent && l.v >= 0.0),
+    }
+}
+
+/// A `border-color` value.
+pub(crate) fn border_color(value: &str) -> Option<BorderColor> {
+    match color(value)? {
+        Color::Rgb(c) => Some(BorderColor::Rgb(c)),
+        Color::Reset => Some(BorderColor::Auto),
+        Color::Keep => Some(BorderColor::Current),
+    }
+}
+
+/// A `border` / `border-<side>` shorthand: a width, a style and a colour
+/// in any order, each at most once, the ones not named at their initial
+/// values. `None` (the declaration ignored) for anything else.
+pub(crate) fn border_shorthand(value: &str) -> Option<BorderSide> {
+    let toks = tokens(value);
+    if toks.is_empty() || toks.len() > 3 {
+        return None;
+    }
+    let mut side = BorderSide::default();
+    let (mut width, mut style, mut colour) = (false, false, false);
+    for t in toks {
+        if let Some(s) = border_style(t).filter(|_| !style) {
+            side.style = s;
+            style = true;
+        } else if let Some(w) = border_width(t).filter(|_| !width) {
+            side.width = w;
+            width = true;
+        } else {
+            side.color = border_color(t).filter(|_| !colour)?;
+            colour = true;
+        }
+    }
+    Some(side)
+}
+
+/// A `border-width`, `border-style` or `border-color` value of one to four
+/// parts, as top, right, bottom, left, each read by `part`.
+pub(crate) fn border_sides<T: Clone>(value: &str, part: fn(&str) -> Option<T>) -> Option<[T; 4]> {
+    let vals: Vec<T> = tokens(value).into_iter().map(part).collect::<Option<_>>()?;
+    Some(match vals.as_slice() {
+        [a] => [a.clone(), a.clone(), a.clone(), a.clone()],
+        [a, b] => [a.clone(), b.clone(), a.clone(), b.clone()],
+        [a, b, c] => [a.clone(), b.clone(), c.clone(), b.clone()],
+        [a, b, c, d] => [a.clone(), b.clone(), c.clone(), d.clone()],
+        _ => return None,
+    })
+}
+
 /// One to four box values as top, right, bottom, left.
 fn four_sides<T: Copy>(vals: &[T]) -> Option<[T; 4]> {
     Some(match vals {
@@ -1641,6 +1770,60 @@ mod tests {
         assert_eq!(box_autos("0 auto red"), None);
         assert_eq!(box_autos("auto auto auto auto auto"), None);
         assert_eq!(box_autos(""), None);
+    }
+
+    #[test]
+    fn borders_shorthands_and_longhands_1883() {
+        let px = |v: f64| Len { v, unit: Unit::Px };
+        let pt = |v: f64| Len { v, unit: Unit::Pt };
+        // Any order, the parts not named initial.
+        let b = border_shorthand("solid #E1E1E1 1.0pt").unwrap();
+        assert_eq!(b.width, pt(1.0));
+        assert_eq!(b.style, BorderStyle::Solid);
+        assert_eq!(b.color, BorderColor::Rgb("E1E1E1".into()));
+        assert!(b.drawn());
+        let b = border_shorthand("1px rgb(204,204,204) SOLID").unwrap();
+        assert_eq!((b.width, b.style), (px(1.0), BorderStyle::Solid));
+        assert_eq!(b.color, BorderColor::Rgb("CCCCCC".into()));
+        let b = border_shorthand("dashed").unwrap();
+        assert_eq!((b.width, b.color.clone()), (px(3.0), BorderColor::Current));
+        assert_eq!(
+            border_shorthand("thin double windowtext").unwrap().color,
+            BorderColor::Auto
+        );
+        // No line: `none`, `hidden`, no style, a zero width.
+        assert!(!border_shorthand("none").unwrap().drawn());
+        assert!(!border_shorthand("hidden 2px red").unwrap().drawn());
+        assert!(!border_shorthand("1px red").unwrap().drawn());
+        assert!(!border_shorthand("0 solid red").unwrap().drawn());
+        // Invalid: a part twice, junk, a percentage, too many parts.
+        for bad in [
+            "solid dashed",
+            "1px 2px solid",
+            "solid bogus",
+            "10% solid",
+            "",
+            "1px solid red blue",
+        ] {
+            assert_eq!(border_shorthand(bad), None, "{bad}");
+        }
+        assert_eq!(border_style("ridge"), Some(BorderStyle::Other));
+        assert_eq!(border_width("thick"), Some(px(5.0)));
+        assert_eq!(border_width("-1px"), None);
+        assert_eq!(
+            border_sides("1px 2px", border_width),
+            Some([px(1.0), px(2.0), px(1.0), px(2.0)])
+        );
+        assert_eq!(
+            border_sides("solid none dotted", border_style),
+            Some([
+                BorderStyle::Solid,
+                BorderStyle::None,
+                BorderStyle::Dotted,
+                BorderStyle::None
+            ])
+        );
+        assert_eq!(border_sides("red bogus", border_color), None);
     }
 
     #[test]
