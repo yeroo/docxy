@@ -3536,15 +3536,25 @@ impl SheetView {
         Some(self.commit_edit())
     }
 
-    /// Is sheet `s` protected? A commit into it is refused (#1054): it
-    /// sets [`SheetView::entry_error`] to Excel's message, writes nothing,
-    /// records no undo step and keeps its editor.
-    fn entry_sheet_protected(&self, s: usize) -> bool {
-        self.pkg
-            .workbook
-            .sheets
+    /// Is the cell (`s`, `r`, `c`) locked on a protected sheet? A commit
+    /// into it is refused (#1054): it sets [`SheetView::entry_error`] to
+    /// Excel's message, writes nothing, records no undo step and keeps its
+    /// editor. An unlocked cell takes the entry, as in Excel (#2230).
+    pub(crate) fn entry_locked(&self, (s, r, c): (usize, u32, u32)) -> bool {
+        let wb = &self.pkg.workbook;
+        wb.sheets
             .get(s)
-            .is_some_and(|sh| sh.is_protected())
+            .is_some_and(|sh| sh.is_protected() && sh.cell_locked(&wb.styles.xfs, r, c))
+    }
+
+    /// Is any cell of `areas` locked on sheet `s`, a protected one? A value
+    /// written over a range (Ctrl+Enter, Delete, Clear Contents) needs every
+    /// cell unlocked (#2230).
+    pub(crate) fn areas_locked(&self, s: usize, areas: &[(u32, u32, u32, u32)]) -> bool {
+        let wb = &self.pkg.workbook;
+        wb.sheets.get(s).is_some_and(|sh| {
+            sh.is_protected() && areas.iter().any(|&a| sh.any_locked(&wb.styles.xfs, a))
+        })
     }
 
     /// [`SheetView::commit_edit`] after the proposal was taken (`took`) and
@@ -3566,10 +3576,11 @@ impl SheetView {
             self.end_cell_edit();
             return false;
         }
-        // The sheet the buffer would be written to (#1054). No editor opens
-        // on a protected sheet, and Protect Sheet commits first, so this is
-        // the backstop: whatever leaves an editor open, nothing is written.
-        if self.entry_sheet_protected(origin.0) {
+        // The cell the buffer would be written to (#1054). No editor opens
+        // on a locked cell of a protected sheet, and Protect Sheet commits
+        // first, so this is the backstop: whatever leaves an editor open,
+        // nothing is written into a locked cell (#2230).
+        if self.entry_locked(origin) {
             self.entry_error = Some(crate::sheet_goto::SHEET_PROTECTED.into());
             return false;
         }
@@ -4411,7 +4422,8 @@ impl SheetView {
         if (!self.has_range() && areas.len() == 1) || s != self.active || !inside {
             return self.commit_edit_taken(took);
         }
-        if self.entry_sheet_protected(s) {
+        // Every cell it would write must be unlocked (#2230).
+        if self.areas_locked(s, &areas) {
             self.entry_error = Some(crate::sheet_goto::SHEET_PROTECTED.into());
             return false;
         }
@@ -21799,6 +21811,12 @@ impl Docxy {
             Region::Cells(r0, c0, r1, c1) => self.cells_bounds((r0, c0), (r1, c1)),
             Region::ChartPanel => lookup(&self.probes.borrow(), "chart-panel")
                 .ok_or_else(|| "the Chart panel is not open".to_string()),
+            Region::DvArrow => lookup(&self.probes.borrow(), "dv-arrow").ok_or_else(|| {
+                "the active cell shows no validation list arrow (a list rule with its drop-down)"
+                    .to_string()
+            }),
+            Region::DvItem(i) => lookup(&self.probes.borrow(), &format!("dv-item:{i}"))
+                .ok_or_else(|| format!("the validation list is not open, or has no item {i}")),
             Region::FilterButton(c) => lookup(
                 &self.probes.borrow(),
                 &format!("filter-button:{}", gridcore::sheet::col_name(c)),
@@ -23025,6 +23043,22 @@ impl Docxy {
             .is_some_and(|v| v.pkg.workbook.sheets[v.active].is_protected())
     }
 
+    /// Whether the active cell is locked on a protected sheet: no value may
+    /// be typed, picked or entered into it. An unlocked cell of a protected
+    /// sheet takes one, as in Excel's form workbooks (#2230).
+    pub(crate) fn active_cell_locked(&self) -> bool {
+        self.active_sheet()
+            .is_some_and(|v| v.entry_locked((v.active, v.sel.0, v.sel.1)))
+    }
+
+    /// Whether any cell of the selection (every area) is locked on a
+    /// protected sheet: Delete and Clear Contents need them all unlocked
+    /// (#2230).
+    fn selection_locked(&self) -> bool {
+        self.active_sheet()
+            .is_some_and(|v| v.areas_locked(v.active, &v.areas_all()))
+    }
+
     /// Toggle protection on the active sheet (undoable; Excel's default flag set).
     fn sheet_toggle_protection(&mut self, cx: &mut Context<Self>) {
         let now = !self.sheet_protected();
@@ -23471,7 +23505,7 @@ impl Docxy {
     /// Begin editing the selected cell. `initial` seeds the buffer (a freshly
     /// typed character); `None` re-edits the existing content (F2).
     fn sheet_begin_edit(&mut self, initial: Option<String>, cx: &mut Context<Self>) {
-        if self.sheet_protected() || self.protected_refused(cx) {
+        if self.active_cell_locked() || self.protected_refused(cx) {
             return;
         }
         // A cell editor and a range field cannot both hold the keyboard. The
@@ -23767,7 +23801,7 @@ impl Docxy {
     /// Clear the whole selected range's content (Delete / Backspace), keeping
     /// each cell's style.
     fn sheet_clear(&mut self, cx: &mut Context<Self>) {
-        if self.sheet_protected() || self.protected_refused(cx) || self.sheet_clear_refused(cx) {
+        if self.selection_locked() || self.protected_refused(cx) || self.sheet_clear_refused(cx) {
             return;
         }
         self.sheet_snapshot(SheetStep::Named("Clear"));
@@ -24765,11 +24799,23 @@ impl Docxy {
     }
 
     fn sheet_dv_toggle(&mut self, cx: &mut Context<Self>) {
-        if self.protected_refused(cx) {
+        if self.protected_refused(cx) || self.sheet_dv_locked(cx) {
             return;
         }
         self.sheet_dv_open = !self.sheet_dv_open;
         cx.notify();
+    }
+
+    /// Refuse the in-cell dropdown on a locked cell of a protected sheet, with
+    /// Excel's message, closing the list; `true` when it was refused (#2230).
+    pub(crate) fn sheet_dv_locked(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.active_cell_locked() {
+            return false;
+        }
+        self.sheet_dv_open = false;
+        self.set_status(sheet_goto::SHEET_PROTECTED);
+        cx.notify();
+        true
     }
 
     /// Pick a value from the in-cell dropdown ([`gridcore::validation::pick_cell`]):
@@ -24778,7 +24824,7 @@ impl Docxy {
     /// quote-prefixed text is stored as its text. What goes in passes the entry
     /// check (only items that do are offered), so it needs no second check.
     fn sheet_dv_pick(&mut self, choice: gridcore::validation::ListChoice, cx: &mut Context<Self>) {
-        if self.protected_refused(cx) {
+        if self.protected_refused(cx) || self.sheet_dv_locked(cx) {
             return;
         }
         self.sheet_dv_open = false;
@@ -27273,8 +27319,10 @@ impl Docxy {
             }
             // Excel's entry shortcuts (#663). The harness spells Ctrl+Shift+"
             // and Ctrl+Shift+; by the shifted character, the platform by the
-            // key with Shift held: take both.
-            let protected = self.sheet_protected();
+            // key with Shift held: take both. An open editor already passed
+            // the gate (its commit checks the cell it writes): with a formula
+            // pointing at cells the active cell is not the one edited.
+            let protected = !editing && self.active_cell_locked();
             let now = now_serial();
             match key {
                 "enter" => return self.sheet_commit_to_selection(cx),
@@ -27653,7 +27701,7 @@ impl Docxy {
             _ => {
                 if let Some(c) = ev.keystroke.key_char.as_deref() {
                     if !c.is_empty() && !c.chars().next().unwrap().is_control() {
-                        let protected = self.sheet_protected();
+                        let protected = self.active_cell_locked();
                         if let Some(v) = self.active_sheet_mut() {
                             // Into the editor, or a fresh edit with the
                             // typed char; AutoComplete proposes either way.
@@ -53050,6 +53098,7 @@ fn sheet_el(
                     .rounded_sm()
                     .text_size(px(8.))
                     .text_color(hsla_u(0x333333))
+                    .child(probe(probes, "dv-arrow"))
                     .child("\u{25bc}")
                     .on_mouse_down(MouseButton::Left, move |_e, _w, cx| {
                         cx.stop_propagation();
@@ -53070,12 +53119,13 @@ fn sheet_el(
                     .border_1()
                     .border_color(hsla_u(0x9a9a9a))
                     .rounded_sm();
-                for val in vals {
+                for (i, val) in vals.into_iter().enumerate() {
                     let ent_pick = ent.clone();
                     let v2 = val.clone();
                     list = list.child(
                         div()
                             .id(ElementId::Name(format!("dv-{}", val.label).into()))
+                            .child(probe(probes, format!("dv-item:{i}")))
                             .px_2()
                             .py(px(2.))
                             .cursor_pointer()

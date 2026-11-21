@@ -5,7 +5,7 @@
 
 use super::*;
 use core::prelude::v1::test;
-use gridcore::sheet::{Cell, CellValue, Xf};
+use gridcore::sheet::{Cell, CellValue, Xf, cell_name};
 
 fn view() -> SheetView {
     let Surface::Sheet(v) = new_sheet_surface() else {
@@ -2295,6 +2295,223 @@ fn the_protection_check_reads_the_origin_sheet() {
         Some(crate::sheet_goto::SHEET_PROTECTED)
     );
     assert!(v.pkg.workbook.sheets[origin].cell(0, 0).is_none());
+}
+
+// ---- #2230: unlocked cells stay editable on a protected sheet ---------------
+
+/// `uiharness/fixtures/protected-form.xlsx` (`scripts/make-protected-form-
+/// fixture.py`), opened as a file is: Sheet1 protected; A1 "Label" locked,
+/// B1 "Answer" unlocked, column C unlocked by its `<col style>`, A2 (absent,
+/// locked) and B2 (blank, unlocked) under a list "a,b", A3 "Total" locked,
+/// B3 7 unlocked.
+fn form_book() -> SheetView {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../uiharness/fixtures/protected-form.xlsx");
+    let (surface, status) = sheet_from_path(&path);
+    let Surface::Sheet(v) = surface else {
+        panic!("{status}")
+    };
+    assert!(v.sheet().is_protected());
+    v
+}
+
+fn locked_at(v: &SheetView, r: u32, c: u32) -> bool {
+    v.entry_locked((v.active, r, c))
+}
+
+#[test]
+fn the_fixture_locks_and_unlocks_the_cells_it_says() {
+    let v = form_book();
+    for (r, c, locked) in [
+        (0, 0, true),
+        (0, 1, false),
+        (4, 2, false),
+        (1, 0, true),
+        (1, 1, false),
+        (2, 0, true),
+        (2, 1, false),
+        (4, 3, true),
+    ] {
+        assert_eq!(locked_at(&v, r, c), locked, "{}", cell_name(r, c));
+    }
+    // Unprotected, no cell is locked against entry.
+    let mut v = v;
+    protect_off(&mut v);
+    assert!(!locked_at(&v, 0, 0));
+}
+
+fn protect_off(v: &mut SheetView) {
+    let s = v.active;
+    v.pkg.workbook.sheets[s].set_protected(false);
+}
+
+/// #2230: an unlocked cell of a protected sheet takes a typed entry: it
+/// writes, as one Typing step.
+#[test]
+fn typing_into_an_unlocked_cell_on_a_protected_sheet_commits() {
+    let mut v = form_book();
+    select(&mut v, 0, 1);
+    type_fresh(&mut v, "42");
+    assert!(v.commit_edit(), "{:?}", v.entry_error);
+    assert!(v.entry_error.is_none());
+    assert_eq!(value(&v, 0, 1), CellValue::Number(42.0));
+    assert_eq!(v.undo.len(), 1);
+    // An absent cell of the unlocked column C too, taking its style.
+    select(&mut v, 4, 2);
+    type_fresh(&mut v, "x");
+    assert!(v.commit_edit(), "{:?}", v.entry_error);
+    assert_eq!(value(&v, 4, 2), CellValue::Text("x".into()));
+    assert!(xf(&v, 4, 2).unlocked);
+    assert_eq!(v.undo.len(), 2);
+}
+
+/// #2230: a typed date or percent derives a new xf from the cell's; it
+/// keeps the cell unlocked, so the cell can be typed into again, and the
+/// save keeps it unlocked.
+#[test]
+fn a_typed_date_in_an_unlocked_cell_keeps_it_unlocked() {
+    let mut v = form_book();
+    let before = v.sheet().cell(0, 1).unwrap().style;
+    select(&mut v, 0, 1);
+    type_fresh(&mut v, "5%");
+    assert!(v.commit_edit(), "{:?}", v.entry_error);
+    select(&mut v, 4, 2);
+    type_fresh(&mut v, "2026-01-02");
+    assert!(v.commit_edit(), "{:?}", v.entry_error);
+    for (r, c) in [(0, 1), (4, 2)] {
+        let x = xf(&v, r, c);
+        assert!(x.code.is_some(), "{} took a format: {x:?}", cell_name(r, c));
+        assert!(x.unlocked, "{} stays unlocked", cell_name(r, c));
+    }
+    assert_ne!(v.sheet().cell(0, 1).unwrap().style, before, "a new xf");
+    select(&mut v, 0, 1);
+    type_fresh(&mut v, "7%");
+    assert!(v.commit_edit(), "a second entry: {:?}", v.entry_error);
+    assert_eq!(value(&v, 0, 1), CellValue::Number(0.07));
+    // Saved and opened again: still protected, still unlocked.
+    let back = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&v.pkg)).unwrap();
+    let sh = &back.workbook.sheets[0];
+    assert!(sh.is_protected());
+    for (r, c) in [(0, 1), (4, 2)] {
+        assert!(
+            !sh.cell_locked(&back.workbook.styles.xfs, r, c),
+            "{} unlocked after a save",
+            cell_name(r, c)
+        );
+    }
+    assert!(sh.cell_locked(&back.workbook.styles.xfs, 0, 0));
+}
+
+/// #2230: a locked cell of the same sheet still refuses, as #1054 had it.
+#[test]
+fn a_locked_cell_on_a_protected_sheet_still_refuses() {
+    let mut v = form_book();
+    select(&mut v, 0, 0);
+    type_fresh(&mut v, "99");
+    assert!(!v.commit_edit());
+    assert_eq!(
+        v.entry_error.as_deref(),
+        Some(crate::sheet_goto::SHEET_PROTECTED)
+    );
+    assert_eq!(v.editing.as_deref(), Some("99"));
+    assert_eq!(value(&v, 0, 0), CellValue::Text("Label".into()));
+    assert!(v.undo.is_empty());
+    // An absent locked cell too (A2, under the default style).
+    v.end_cell_edit();
+    select(&mut v, 1, 0);
+    type_fresh(&mut v, "a");
+    assert!(!v.commit_edit());
+    assert!(v.sheet().cell(1, 0).is_none());
+}
+
+/// #2230: Ctrl+Enter writes only when every cell of every area is
+/// unlocked; a range with one locked cell is refused whole.
+#[test]
+fn ctrl_enter_over_a_mixed_range_on_a_protected_sheet_is_refused() {
+    let mut v = form_book();
+    // A1:B1, B1 active.
+    v.anchor = (0, 0);
+    v.sel = (0, 1);
+    type_fresh(&mut v, "5");
+    assert!(!v.commit_edit_to_selection());
+    assert_eq!(
+        v.entry_error.as_deref(),
+        Some(crate::sheet_goto::SHEET_PROTECTED)
+    );
+    assert_eq!(v.editing.as_deref(), Some("5"));
+    assert_eq!(value(&v, 0, 0), CellValue::Text("Label".into()));
+    assert_eq!(value(&v, 0, 1), CellValue::Text("Answer".into()));
+    assert!(v.undo.is_empty());
+}
+
+#[test]
+fn ctrl_enter_over_an_unlocked_range_on_a_protected_sheet_writes() {
+    let mut v = form_book();
+    // B1:C3: B held unlocked, column C unlocked by its style.
+    v.anchor = (0, 1);
+    v.sel = (2, 2);
+    type_fresh(&mut v, "5");
+    assert!(v.commit_edit_to_selection(), "{:?}", v.entry_error);
+    for r in 0..3 {
+        for c in 1..3 {
+            assert_eq!(
+                value(&v, r, c),
+                CellValue::Number(5.0),
+                "{}",
+                cell_name(r, c)
+            );
+        }
+    }
+    assert_eq!(v.undo.len(), 1);
+}
+
+/// #2230: Clear Contents (and Delete, which asks the same question through
+/// `areas_locked`) clears unlocked cells of a protected sheet; a range with
+/// a locked cell is refused, and the other Clear commands stay refused.
+#[test]
+fn clear_contents_of_unlocked_cells_on_a_protected_sheet_clears() {
+    use gridcore::edit::ClearWhat;
+    let refused = Err(crate::sheet_goto::SHEET_PROTECTED.to_string());
+    let mut v = form_book();
+    let s = v.active;
+    // B1:B3, unlocked.
+    v.anchor = (0, 1);
+    v.sel = (2, 1);
+    assert!(!v.areas_locked(s, &v.areas_all()));
+    for what in [
+        ClearWhat::All,
+        ClearWhat::Formats,
+        ClearWhat::Comments,
+        ClearWhat::Hyperlinks,
+    ] {
+        assert_eq!(v.clear_what(what), refused, "{what:?}");
+    }
+    assert!(v.undo.is_empty());
+    assert_eq!(v.clear_what(ClearWhat::Contents), Ok(true));
+    assert_eq!(value(&v, 0, 1), CellValue::Empty);
+    assert_eq!(value(&v, 2, 1), CellValue::Empty);
+    assert!(xf(&v, 0, 1).unlocked, "the cell keeps its style");
+    assert_eq!(v.undo.len(), 1);
+    // A1:B3 holds locked cells: refused, nothing cleared.
+    v.anchor = (0, 0);
+    assert!(v.areas_locked(s, &v.areas_all()));
+    assert_eq!(v.clear_what(ClearWhat::Contents), refused);
+    assert_eq!(value(&v, 0, 0), CellValue::Text("Label".into()));
+    assert_eq!(v.undo.len(), 1);
+    // A whole unlocked column, and the whole sheet (locked cells in it).
+    assert!(!v.areas_locked(s, &[(0, 2, gridcore::sheet::MAX_ROWS - 1, 2)]));
+    assert!(v.areas_locked(
+        s,
+        &[(
+            0,
+            0,
+            gridcore::sheet::MAX_ROWS - 1,
+            gridcore::sheet::MAX_COLS - 1
+        )]
+    ));
+    // Unprotected, every Clear runs again.
+    protect_off(&mut v);
+    assert!(!v.areas_locked(s, &v.areas_all()));
 }
 
 // ---- #1079: Enter after a run of Tabs returns to the run's first column -----

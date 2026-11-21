@@ -1069,6 +1069,10 @@ pub enum Region {
     BackstageRailItem(&'static str),
     /// The AutoFilter button on column `.0`'s header cell (#690).
     FilterButton(u32),
+    /// The active cell's data-validation list arrow (`dv-arrow`), and item
+    /// `.0` of its open list (`dv-item:0`), as a person clicks them (#2230).
+    DvArrow,
+    DvItem(usize),
     /// A part of the document tab's scrollbars (#2080), by name:
     /// [`DOC_BAR_REGIONS`].
     DocBar(&'static str),
@@ -1117,7 +1121,8 @@ const DOC_BAR_REGIONS: [&str; 8] = [
 /// `cell:A1:C5`, `chart:0`, `gantt`, `bar:3`, `project-heading:Duration`,
 /// `project-hbar-table`,
 /// `project-hbar-chart`, `project-vbar`, `project-timeline`, `project-split`,
-/// `gallery`, `tab-chip:0`, `filter-button:B`, `backstage-content`,
+/// `gallery`, `tab-chip:0`, `filter-button:B`, `dv-arrow`, `dv-item:0`,
+/// `backstage-content`,
 /// `backstage-rail`, `ribbon-launch:Number`, `qat-undo`, `qat-redo`,
 /// `qat-undo-arrow`, `qat-redo-arrow`, `pane:navigation` (#2077).
 ///
@@ -1314,6 +1319,15 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
                 .ok_or("'project-heading-edge' needs a column, e.g. project-heading-edge:Finish")?;
             project_column(a).map(Region::ProjectHeadingEdge)
         }
+        "dv-arrow" => Ok(Region::DvArrow),
+        "dv-item" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or("'dv-item' needs an index, e.g. dv-item:0")?;
+            a.parse()
+                .map(Region::DvItem)
+                .map_err(|_| format!("'{a}' is not a list item index (they count from 0)"))
+        }
         "filter-button" => {
             let a = arg
                 .filter(|a| !a.is_empty())
@@ -1343,7 +1357,7 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             Ok(Region::Picture(i))
         }
         other => Err(format!(
-            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, picture:0, gantt, bar:3, project-heading:Duration, project-heading-arrow:Duration, project-heading-edge:Duration, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, ribbon-launch:Number, filter-button:B)"
+            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, picture:0, gantt, bar:3, project-heading:Duration, project-heading-arrow:Duration, project-heading-edge:Duration, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, ribbon-launch:Number, filter-button:B, dv-arrow, dv-item:0)"
         )),
     }
 }
@@ -1428,6 +1442,8 @@ pub fn region_name(region: Region) -> String {
             if end { "end" } else { "start" }
         ),
         Region::FilterButton(c) => format!("filter-button:{}", gridcore::sheet::col_name(c)),
+        Region::DvArrow => "dv-arrow".into(),
+        Region::DvItem(i) => format!("dv-item:{i}"),
         Region::DocBar(name) => name.into(),
         Region::Balloon(id, "body") => format!("balloon:{id}"),
         Region::Balloon(id, part) => format!("balloon-{part}:{id}"),
@@ -5519,6 +5535,8 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
             ),
             ("editing", Json::Bool(v.editing.is_some())),
             ("edit", str_or_null(v.editing.clone())),
+            // The active cell's data-validation list is open (#2230).
+            ("dv_open", Json::Bool(app.sheet_dv_open)),
             // The row list's top item (the first scrolled row, counted past
             // the frozen ones and the hidden ones): a wheel over the grid, a
             // picture on it included (#2228), moves it.
@@ -12122,6 +12140,8 @@ mod tests {
             Region::BackstageContent,
             Region::BackstageRail,
             Region::FilterButton(1),
+            Region::DvArrow,
+            Region::DvItem(2),
             Region::DocBar("doc-vbar"),
             Region::DocBar("doc-hbar-right"),
             Region::Qat("qat-undo"),

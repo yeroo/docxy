@@ -216,6 +216,36 @@ fn edit_in_formula_bar_closes_the_dialog_and_opens_the_editor() {
     assert_eq!(v.editing.as_deref(), Some("=NA()"));
 }
 
+/// #2230: on a protected sheet the button opens the editor as F2 does on
+/// an unlocked cell, and refuses a locked one with Excel's message.
+#[test]
+fn edit_in_formula_bar_on_a_protected_sheet_reads_the_cells_lock() {
+    let mut t = flagged_sheet();
+    view(&mut t).pkg.workbook.sheets[0].set_protected(true);
+    select(&mut t, "B2");
+    open_error_checking(&mut t).unwrap();
+    assert_eq!(shown(&t), Some(at("B4")));
+    assert_eq!(
+        click(&mut t, "Edit in Formula Bar"),
+        Some(Err(crate::sheet_goto::SHEET_PROTECTED.into()))
+    );
+    assert!(view(&mut t).editing.is_none(), "B4 is locked");
+    // B4 unlocked: the editor opens.
+    let v = view(&mut t);
+    let open = v.pkg.workbook.styles.intern(gridcore::sheet::Xf {
+        unlocked: true,
+        ..Default::default()
+    });
+    let (r, c) = at("B4");
+    v.pkg.workbook.sheets[0]
+        .cells
+        .get_mut(&(r, c))
+        .unwrap()
+        .style = open;
+    assert_eq!(click(&mut t, "Edit in Formula Bar"), Some(Ok(())));
+    assert_eq!(view(&mut t).editing.as_deref(), Some("=NA()"));
+}
+
 #[test]
 fn help_says_what_the_error_is_and_keeps_the_dialog() {
     let mut t = flagged_sheet();

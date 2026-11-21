@@ -267,7 +267,7 @@ impl Docxy {
             }
             AltDown::FilterButton(col) => self.sheet_filter_button(col, cx),
             AltDown::Validation => {
-                if !self.protected_refused(cx) {
+                if !self.protected_refused(cx) && !self.sheet_dv_locked(cx) {
                     self.sheet_dv_open = true;
                 }
                 cx.notify();
@@ -291,7 +291,7 @@ impl Docxy {
         if self.protected_refused(cx) {
             return Err("this workbook is open in Protected View".into());
         }
-        if self.sheet_protected() {
+        if self.active_cell_locked() {
             return refuse(
                 self,
                 "The sheet is protected: unprotect it to enter values",
@@ -330,7 +330,7 @@ impl Docxy {
 
     /// Entry `i` of the pick list, chosen: entered as a typed commit.
     pub(crate) fn sheet_pick_item(&mut self, i: usize, cx: &mut Context<Self>) {
-        if self.sheet_protected() || self.protected_refused(cx) {
+        if self.active_cell_locked() || self.protected_refused(cx) {
             return;
         }
         let Some(value) = self
