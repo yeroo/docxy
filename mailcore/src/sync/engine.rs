@@ -69,10 +69,10 @@ use crate::graph::model::{
 };
 pub use crate::store::ClearOfflineRefusal;
 use crate::store::{
-    CalendarRound, ClearOfflineResult, DroppedFolderMove, FetchedCalendar, FolderDelete,
-    FolderHistory, FolderRow, FolderWriteResult, LOCAL_DRAFTS_SENTINEL_FOLDER_ID, NewAttendee,
-    NewEvent, OutboundAttachment, OutboxOp, OutboxRow, RangeStamp, SCOPE_ALL, SCOPE_WINDOW, Store,
-    StoreError, SyncedCalendar,
+    CalendarRound, ClearOfflineResult, DroppedFolderMove, EventHolds, EventWrite, FetchedCalendar,
+    FolderDelete, FolderHistory, FolderRow, FolderWriteResult, LOCAL_DRAFTS_SENTINEL_FOLDER_ID,
+    NewAttendee, NewEvent, OutboundAttachment, OutboxOp, OutboxRow, RangeStamp, SCOPE_ALL,
+    SCOPE_WINDOW, Store, StoreError, SyncedCalendar,
 };
 use crate::sync::outbox::{
     Applied, NOT_A_MEETING_INVITE, PROPOSALS_REFUSED, apply_op, apply_send,
@@ -512,7 +512,7 @@ pub enum SyncCommand {
     /// synced calendar (`Store::synced_calendar_ids`) up to date with its
     /// `calendarView/delta` (#2013): an initial round over the window, or
     /// a round from the deltaLink the last pass stored for that window,
-    /// store it (`Store::apply_calendar_sync`), and emit
+    /// store it (`Store::apply_calendar_sync_holding`), and emit
     /// [`SyncEvent::CalendarUpdated`] (#1984). Also run automatically on the
     /// periodic tick (see `Engine::on_tick`), interleaved with the mail sync
     /// pass.
@@ -534,7 +534,7 @@ pub enum SyncCommand {
     /// parts the store does not hold fresh (`Store::calendar_range_gaps`,
     /// fetched within [`EngineOptions::calendar_range_fresh_for`]) go to
     /// `calendarView`, one request per part; each is stored as it lands
-    /// (`Store::apply_calendar_range`: that calendar's synced events there
+    /// (`Store::apply_calendar_range_holding`: that calendar's synced events there
     /// replaced). Then [`SyncEvent::CalendarUpdated`] when anything was
     /// written, and [`SyncEvent::CalendarRangeFetched`]; a range wholly
     /// fresh is served from the store with no request. With no stored
@@ -2063,15 +2063,35 @@ enum ReminderTarget {
 /// calendar rounds, and what an owed calendar reset waits for
 /// (`calendar_reset_owed`: a series edit's, #2022, or a refused
 /// response's, #2023), as an initial round would replace the row. `CreateEvent`'s `local:` row is
-/// never replaced, and `UpdateEventSeries` writes nothing locally.
+/// never replaced, and `UpdateEventSeries` writes nothing locally. The
+/// store decides which ops these are (`OutboxOp::event_local_write`, #2031),
+/// as it holds their rows in every calendar round. An `UpdateEvent` with
+/// no `fields` is not one: it sends nothing, so it is never quarantined
+/// and has no write for a reset to wait for.
 fn writes_event_locally(op: &OutboxOp) -> bool {
-    matches!(
-        op,
-        OutboxOp::RespondEvent { .. }
-            | OutboxOp::UpdateEvent { .. }
-            | OutboxOp::DeleteEvent { .. }
-            | OutboxOp::CancelEvent { .. }
-    )
+    op.event_local_write().is_some()
+}
+
+/// The events of the waiting commands whose host wrote the store before
+/// sending them (#2031): an `UpdateEvent` with `fields` (the host's
+/// `update_event_fields`) and a `DeleteEvent` (its `delete_event` or
+/// `delete_event_series`). Their ops are not queued yet, so a calendar
+/// round applied now holds them from these (`Store::apply_calendar_sync_holding`).
+/// Not `RespondEvent`, `CancelEvent` or `RemoveFromCalendar`: the engine
+/// writes for those when it handles them, after the round, and
+/// `cancel_event` needs the row a held removal would drop.
+fn waiting_event_holds<'a>(deferred: impl IntoIterator<Item = &'a SyncCommand>) -> EventHolds {
+    let mut holds = EventHolds::default();
+    for cmd in deferred {
+        match cmd {
+            SyncCommand::UpdateEvent { id, fields } if !fields.is_empty() => {
+                holds.hold(id, EventWrite::Written);
+            }
+            SyncCommand::DeleteEvent { id } => holds.hold(id, EventWrite::Removed),
+            _ => {}
+        }
+    }
+    holds
 }
 
 /// A command that queues a `writes_event_locally` op, sent after its host
@@ -2592,9 +2612,10 @@ struct Engine {
     /// (`writes_event_locally`) and no such command waiting
     /// (`command_writes_event_locally`, taken off the channel first) runs
     /// them (`refresh_calendar`). So the reset's initial rounds never run
-    /// while such an op is queued or its command has reached the engine; a
-    /// host that writes its row after the reset's refresh began has the
-    /// general race of any refresh. In memory only: a restart before then
+    /// while such an op is queued or its command has reached the engine.
+    /// Every round, a reset's or not, also keeps those rows itself (#2031,
+    /// `Store::apply_calendar_sync_holding`), the commands that arrive while
+    /// it fetches included. In memory only: a restart before then
     /// drops it, and the delta rounds go on. Signed out, it waits for the
     /// sign-in's refresh. The initial rounds cover the kept window only: a
     /// refused response's host-written status on a range-fetched row
@@ -9446,7 +9467,7 @@ impl Engine {
     /// `/me/calendars/{id}/calendarView/delta` round each
     /// (`calendar_delta_round`): from the calendar's stored deltaLink when
     /// it covers this window, else an initial round over it. It writes the
-    /// pass in one transaction (`Store::apply_calendar_sync`): an initial
+    /// pass in one transaction (`Store::apply_calendar_sync_holding`): an initial
     /// round replaces the calendar's window, which is what prunes an event
     /// Graph no longer returns; a delta round adds, changes and removes
     /// only what it names. Pre-#1984 rows move to the default calendar, the
@@ -9470,6 +9491,12 @@ impl Engine {
     /// calendar's delta state cleared first, so its rounds are initial),
     /// to reconverge the optimistic local write with server truth (see the
     /// quarantine branch there), and by `set_calendars`.
+    ///
+    /// Right before the write, the commands sent while the rounds fetched
+    /// are taken off the channel (`take_waiting`), and the events of those
+    /// whose host already wrote the store are held (`waiting_event_holds`,
+    /// #2031). A shutdown seen then ends the pass with nothing written or
+    /// reported: the next start runs it again.
     fn refresh_calendar(&mut self) {
         if self.token.is_none() {
             self.emit(SyncEvent::Error("not signed in".to_string()));
@@ -9535,8 +9562,17 @@ impl Engine {
                 }
             }
         }
+        // The commands sent while the rounds fetched: an edit or delete
+        // whose host already wrote its row keeps that write (#2031).
+        if !self.take_waiting() {
+            return;
+        }
+        let held = waiting_event_holds(&self.deferred);
         let stamp = self.range_stamp();
-        if let Err(e) = self.store.apply_calendar_sync(&from, &to, &fetched, stamp) {
+        if let Err(e) = self
+            .store
+            .apply_calendar_sync_holding(&from, &to, &fetched, stamp, &held)
+        {
             self.emit(SyncEvent::Error(e.to_string()));
             return;
         }
@@ -9844,8 +9880,10 @@ impl Engine {
     /// of `synced` over `[from, to)`, setting `wrote` once a gap is
     /// stored. `false` when the command ends early (signed out, a throttle
     /// or back-off wait, a 401, throttle or transport error, a store
-    /// error; each already reported), so no `CalendarRangeFetched` follows.
-    /// A 404, HTTP or parse error (reported by `react`) leaves that gap and
+    /// error; each already reported), so no `CalendarRangeFetched` follows;
+    /// or a shutdown seen before a gap is written (#2031: the commands
+    /// waiting are taken first, so a held edit or delete keeps its row),
+    /// which writes and reports nothing. A 404, HTTP or parse error (reported by `react`) leaves that gap and
     /// the calendar's later gaps unfetched and unrecorded, its earlier gaps
     /// stay written, and the next calendar carries on.
     fn fetch_range_gaps(
@@ -9878,8 +9916,16 @@ impl Engine {
                 match self.with_auth(|c| c.calendar_view_in(id, &a, &b)) {
                     Ok(events) => {
                         let f = fetched_calendar(id.clone(), &events);
+                        // As `refresh_calendar` (#2031).
+                        if !self.take_waiting() {
+                            return false;
+                        }
+                        let held = waiting_event_holds(&self.deferred);
                         let stamp = self.range_stamp();
-                        if let Err(e) = self.store.apply_calendar_range(&a, &b, &f, stamp) {
+                        if let Err(e) = self
+                            .store
+                            .apply_calendar_range_holding(&a, &b, &f, stamp, &held)
+                        {
                             self.emit(SyncEvent::Error(e.to_string()));
                             return false;
                         }
@@ -24128,6 +24174,295 @@ mod tests {
             x_patch.body.contains(r#""subject":"Edited""#),
             "{}",
             x_patch.body
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- A calendar round keeps a pending local write (#2031) ---
+
+    /// Seeds CAL-A with X1 (subject "X1") and no delta state, so the next
+    /// calendar refresh runs an initial round.
+    fn seed_x1_without_a_link(s: &Store) {
+        let (from, to) = today_window();
+        seed_synced_calendar(
+            s,
+            "CAL-A",
+            vec![stored_event("X1", "CAL-A", 3600)],
+            (&from, &to),
+            &delta_link_of("CAL-A"),
+        );
+        s.clear_calendar_deltas().unwrap();
+    }
+
+    /// The host's edit of X1's subject (`update_event_fields`), returning
+    /// the fields its `UpdateEvent` carries.
+    fn edit_x1(store: &Store) -> crate::graph::client::EventFieldSet {
+        let row = store.event("X1").unwrap().unwrap();
+        store
+            .update_event_fields(
+                "X1",
+                &crate::store::LocalEventFields {
+                    subject: "Edited".into(),
+                    start_utc: row.start_utc,
+                    end_utc: row.end_utc,
+                    location: row.location,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+    }
+
+    /// Calendar routes whose CAL-A views (Graph still has X1 as
+    /// "Standup") answer after `delay`, so commands sent meanwhile wait on
+    /// the channel; then `extra`.
+    fn slow_x1_routes(
+        delay: Duration,
+        extra: Vec<(Route, Option<usize>, Duration)>,
+    ) -> Vec<(Route, Option<usize>, Duration)> {
+        let mut routes = extra;
+        routes.extend(
+            calendar_routes(
+                &[("CAL-A", true, "me@x")],
+                vec![("CAL-A", 200, events_body(&[event_from_now("X1", 3600)]))],
+            )
+            .into_iter()
+            .map(|r| {
+                let d = if r.path_prefix.starts_with("/me/calendars/CAL-A/") {
+                    delay
+                } else {
+                    Duration::ZERO
+                };
+                (r, None, d)
+            }),
+        );
+        routes
+    }
+
+    /// Waits until the server has received a request whose path starts
+    /// with `prefix`.
+    fn wait_for_request(srv: &FakeServer, prefix: &str) {
+        assert!(
+            wait_until(ENGINE_WAIT, || paths_from(srv, 0)
+                .iter()
+                .any(|p| p.starts_with(prefix))),
+            "no request to {prefix}: {:?}",
+            method_paths(srv)
+        );
+    }
+
+    /// The bodies of the PATCHes of `path`, in order.
+    fn patch_bodies(srv: &FakeServer, path: &str) -> Vec<String> {
+        srv.requests()
+            .into_iter()
+            .filter(|r| r.method == "PATCH" && r.path == path)
+            .map(|r| r.body)
+            .collect()
+    }
+
+    #[test]
+    fn edit_command_waiting_during_a_refresh_keeps_its_edit() {
+        // The refresh's initial round is in flight when the host edits X1
+        // and sends `UpdateEvent`: its op is not queued when the round is
+        // written, but the round must not replace X1's edited row, which
+        // the PATCH reads at send time.
+        let (from, to) = today_window();
+        let routes = slow_x1_routes(
+            Duration::from_millis(400),
+            vec![(
+                patch_route("/me/events/X1", 200, "{}"),
+                None,
+                Duration::ZERO,
+            )],
+        );
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_paced(
+            "edit-command-during-refresh",
+            routes,
+            seed_x1_without_a_link,
+            EngineOptions::without_prefetch(),
+        );
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_request(&srv, &initial_delta_path("CAL-A", &from, &to));
+        let store = Store::open(&store_path).unwrap();
+        let fields = edit_x1(&store);
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEvent {
+                id: "X1".into(),
+                fields,
+            })
+            .unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()
+                && !patch_bodies(&srv, "/me/events/X1").is_empty()),
+            "X1's edit never drained: {:?}",
+            method_paths(&srv)
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let bodies = patch_bodies(&srv, "/me/events/X1");
+        assert!(
+            bodies[0].contains(r#""subject":"Edited""#),
+            "the PATCH sent Graph's old subject: {}",
+            bodies[0]
+        );
+        assert_eq!(store.event("X1").unwrap().unwrap().subject, "Edited");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_command_waiting_during_a_refresh_keeps_the_row_gone() {
+        // As above, with a delete: the host deleted X1 and sent
+        // `DeleteEvent` while the round was in flight; the round must not
+        // bring X1 back (nothing local deletes it again once the DELETE
+        // goes out).
+        let (from, to) = today_window();
+        let routes = slow_x1_routes(
+            Duration::from_millis(400),
+            vec![(delete_route("/me/events/X1"), None, Duration::ZERO)],
+        );
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_paced(
+            "delete-command-during-refresh",
+            routes,
+            seed_x1_without_a_link,
+            EngineOptions::without_prefetch(),
+        );
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_request(&srv, &initial_delta_path("CAL-A", &from, &to));
+        let store = Store::open(&store_path).unwrap();
+        store.delete_event("X1").unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::DeleteEvent { id: "X1".into() })
+            .unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()
+                && method_paths(&srv)
+                    .iter()
+                    .any(|(m, p)| m == "DELETE" && p == "/me/events/X1")),
+            "X1's delete never drained: {:?}",
+            method_paths(&srv)
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert!(
+            store.event("X1").unwrap().is_none(),
+            "the refresh brought X1 back"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_command_waiting_during_a_range_fetch_keeps_its_edit() {
+        // A `FetchCalendarRange`'s plain calendarView is in flight when the
+        // host edits X1: the range written must not replace X1's row.
+        let routes = slow_x1_routes(
+            Duration::from_millis(400),
+            vec![(
+                patch_route("/me/events/X1", 200, "{}"),
+                None,
+                Duration::ZERO,
+            )],
+        );
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_paced(
+            "edit-command-during-range",
+            routes,
+            seed_x1_without_a_link,
+            EngineOptions::without_prefetch(),
+        );
+        let (a, b) = (iso_from_now(-1), iso_from_now(2));
+        fetch_range(&handle, &a, &b);
+        wait_for_request(&srv, "/me/calendars/CAL-A/calendarView?");
+        let store = Store::open(&store_path).unwrap();
+        let fields = edit_x1(&store);
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEvent {
+                id: "X1".into(),
+                fields,
+            })
+            .unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()
+                && !patch_bodies(&srv, "/me/events/X1").is_empty()),
+            "X1's edit never drained: {:?}",
+            method_paths(&srv)
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let bodies = patch_bodies(&srv, "/me/events/X1");
+        assert!(
+            bodies[0].contains(r#""subject":"Edited""#),
+            "the PATCH sent Graph's old subject: {}",
+            bodies[0]
+        );
+        assert_eq!(store.event("X1").unwrap().unwrap().subject, "Edited");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn queued_event_edit_survives_an_initial_calendar_round() {
+        // X1's PATCH gets a 500 and stays queued; a calendar refresh then
+        // runs an initial round, Graph still holding the old subject. F9
+        // resends the edit, which must carry the edited subject.
+        let (from, to) = today_window();
+        let routes = slow_x1_routes(
+            Duration::ZERO,
+            vec![
+                (
+                    patch_route("/me/events/X1", 500, ""),
+                    Some(1),
+                    Duration::ZERO,
+                ),
+                (
+                    patch_route("/me/events/X1", 200, "{}"),
+                    None,
+                    Duration::ZERO,
+                ),
+            ],
+        );
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_paced(
+            "queued-edit-survives-initial-round",
+            routes,
+            seed_x1_without_a_link,
+            EngineOptions::without_prefetch(),
+        );
+        let store = Store::open(&store_path).unwrap();
+        let fields = edit_x1(&store);
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEvent {
+                id: "X1".into(),
+                fields,
+            })
+            .unwrap();
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        fetch_range(&handle, "bad", "bad");
+        wait_for(
+            &handle.evt_rx,
+            |e| matches!(e, SyncEvent::Error(m) if m.starts_with("fetch calendar range")),
+        );
+        assert!(
+            paths_from(&srv, 0).contains(&initial_delta_path("CAL-A", &from, &to)),
+            "no initial round: {:?}",
+            method_paths(&srv)
+        );
+        assert_eq!(
+            patch_bodies(&srv, "/me/events/X1").len(),
+            1,
+            "one failed PATCH"
+        );
+        assert_eq!(store.event("X1").unwrap().unwrap().subject, "Edited");
+        // F9 resends it.
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()),
+            "X1's edit never drained: {:?}",
+            method_paths(&srv)
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let bodies = patch_bodies(&srv, "/me/events/X1");
+        assert_eq!(bodies.len(), 2, "{:?}", method_paths(&srv));
+        assert!(
+            bodies[1].contains(r#""subject":"Edited""#),
+            "the resent PATCH carries Graph's old subject: {}",
+            bodies[1]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

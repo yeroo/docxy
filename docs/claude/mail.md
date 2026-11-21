@@ -1847,9 +1847,9 @@ this occurrence or the whole series, as Outlook does.
   queued or its command has reached the engine: they would replace its row
   (a host writes the row before it sends `UpdateEvent` or `DeleteEvent`), and a
   queued `UpdateEvent`, which reads its row at send time, would send Graph's old
-  values. A host that writes its row after the reset's refresh began has the
-  general race of any refresh, and a delta round from a kept link can still upsert
-  a changed occurrence over a queued edit: both are the follow-up. The refresh
+  values. Since #2031 every round keeps such rows itself too, the commands that
+  arrive while a refresh fetches included: see "A calendar round keeps a pending
+  local write (#2031)". The refresh
   does not run in the drain's loop after a series edit, so a 401, throttle or
   offline error it meets reaches the path as usual (a quarantine's or cancel-404's
   reset in the loop does not stop the drain on one: pre-existing). `on_tick`
@@ -1902,6 +1902,61 @@ this occurrence or the whole series, as Outlook does.
   `update_event_series_sent_by_a_fast_tick_resets_the_calendars`,
   `update_event_series_with_no_fields_queues_nothing`. A 503 is a throttle
   (`Throttled`), not a deferring 5xx: a test of the deferred path uses a 500.
+
+## A calendar round keeps a pending local write (#2031)
+
+- An event op whose command wrote the store first is named by
+  `OutboxOp::event_local_write` (exhaustive, like `message_id`): `RespondEvent`
+  and an `UpdateEvent` with `fields` are `EventWrite::Written` (the row holds the
+  write), `DeleteEvent` and `CancelEvent` are `Removed` (the row, or a series by
+  its master's id, was deleted). An `UpdateEvent` with no `fields` sends nothing,
+  so it is none. The engine's `writes_event_locally` (the quarantine reset, the
+  owed reset) is `event_local_write().is_some()`.
+- `apply_calendar_sync_holding` and `apply_calendar_range_holding` read those ops
+  in the round's own transaction (`queued_event_holds_on`; a row that does not
+  decode is skipped, as `fetched_body_is_kept_on` skips it) and keep their events
+  as stored (`EventHolds`), with the caller's `held` added. The plain
+  `apply_calendar_sync` / `apply_calendar_range` the older notes name are
+  `#[cfg(test)]` wrappers with no caller holds since #2031: an initial round does not delete a `written` row, no
+  round upserts a held event or its attendees (a `removed` id's occurrences, by
+  `series_master_id`, neither), and `fill_occurrences_on` never fills a `written`
+  occurrence, even from a changed master. Before this, an initial round (a window
+  move, `FetchCalendarRange`, an expired link, a reset) replaced the row, and a
+  queued `UpdateEvent`, which reads its row at send time (`event_input_for`),
+  sent Graph's old values: the edit was lost. A delta round's removals still go:
+  Graph says the event is gone.
+- Commands not queued yet: a host writes the row before it sends `UpdateEvent`
+  or `DeleteEvent`, and the engine may be fetching a refresh then. Right before it
+  writes a refresh (`refresh_calendar`) or a fetched range (`fetch_range_gaps`),
+  the engine takes the waiting commands (`take_waiting`; a shutdown writes
+  nothing) and passes their events as `held` (`waiting_event_holds`): an `UpdateEvent` with `fields` as `Written`, a
+  `DeleteEvent` as `Removed`. Not `RespondEvent`, `CancelEvent` or
+  `RemoveFromCalendar`: the engine writes for those when it handles them, after
+  the round, and `cancel_event` needs the row a held removal would drop. A host
+  write that lands between the take and the round's commit still races
+  (microseconds).
+- Convergence: a kept row of an event Graph deleted stays until its op ends. A 404
+  or a permanent failure ends in the quarantine (`drop_op`, then
+  `reset_calendars`), whose initial rounds, the op gone, replace it (and still keep
+  other queued ops' rows). A skipped delta upsert comes back: the op's PATCH,
+  RSVP or DELETE changes the event on Graph, so a later delta round names it (the
+  link this round stored predates it).
+- Tests: `store/mod.rs` `event_local_write_names_the_ops_whose_command_wrote_the_row`,
+  `initial_round_keeps_a_row_with_a_queued_update`,
+  `an_undecodable_outbox_row_does_not_stop_a_calendar_round`,
+  `initial_round_keeps_a_queued_response`,
+  `initial_round_does_not_bring_back_a_queued_delete`,
+  `initial_round_does_not_bring_back_a_deleted_series`,
+  `calendar_range_keeps_rows_with_queued_event_ops`,
+  `delta_round_does_not_overwrite_a_queued_update`,
+  `fill_occurrences_skips_an_occurrence_with_a_queued_response`,
+  `initial_round_ignores_an_empty_field_update`,
+  `initial_round_replaces_a_row_once_its_op_is_gone`,
+  `holding_applies_keep_the_callers_holds`; `engine.rs`
+  `edit_command_waiting_during_a_refresh_keeps_its_edit`,
+  `delete_command_waiting_during_a_refresh_keeps_the_row_gone`,
+  `edit_command_waiting_during_a_range_fetch_keeps_its_edit` (a slow view,
+  `spawn_calendar_engine_paced`), `queued_event_edit_survives_an_initial_calendar_round`.
 
 ## Creating a series with any recurrence (#2034)
 
