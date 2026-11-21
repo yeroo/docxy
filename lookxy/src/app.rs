@@ -2805,7 +2805,8 @@ impl App {
     /// `local:X` → the real Graph id, and an `UpdateEvent{id: local:X}`
     /// enqueued after that would find no such row anymore (quarantined as
     /// "event not found"). Only a non-`local:` (already-synced) id gets an
-    /// `UpdateEvent` sent.
+    /// `UpdateEvent` sent. An edit written while that create's POST is in
+    /// flight is queued by mailcore's reconcile for the Graph id (#2005).
     pub fn save_event_form(&mut self) {
         let Some(form) = self.event_form.as_ref() else {
             return;

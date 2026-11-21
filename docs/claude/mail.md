@@ -1005,7 +1005,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `mailcore` and M
   mailbox default. `Store::reconcile_created_event` re-points the id and, in
   the same transaction, writes Graph's returned reminder, a non-empty
   `join_url` and provider, and clears `reminder_unset`, so a Graph-id row
-  never keeps it. An edit that sets a reminder clears it too.
+  never keeps it. An edit that sets a reminder clears it too. An edit made
+  during the POST is queued as an `UpdateEvent` by the reconcile, and its
+  reminder and online meeting are kept (#2005, "An edit during an event's
+  in-flight create").
 - `GraphClient::update_event` returns Graph's updated event (`Ok(None)` for
   a 204 or a body without an `id`). When the op's set holds `onlineMeeting`,
   `apply_op` writes back the join link and provider
@@ -1957,6 +1960,52 @@ this occurrence or the whole series, as Outlook does.
   `delete_command_waiting_during_a_refresh_keeps_the_row_gone`,
   `edit_command_waiting_during_a_range_fetch_keeps_its_edit` (a slow view,
   `spawn_calendar_engine_paced`), `queued_event_edit_survives_an_initial_calendar_round`.
+
+## An edit during an event's in-flight create (#2005)
+
+- `CreateEvent` (`outbox::create_event`) reads the `local:` row
+  (`create_event_input`: every group, no reminder when it is unset), POSTs it,
+  then `Store::reconcile_created_event(local_id, created, sent)` re-keys the row.
+  Hosts send no `UpdateEvent` for a `local:` id, so an `update_event_fields`
+  that committed after the read and before the re-key used to stay local:
+  the store had the edit, and Graph had the create's values.
+- The reconcile reads the row with `event_for_send_on` in its own write
+  transaction, before any write, and compares it with `sent`
+  (`sent_event_changes`): each group the create sent, compared as
+  `update_event_fields` marks it (`TIMES` by the instants and `isAllDay`, never
+  a zone alone; attendees by name, address and type, in order), and the
+  reminder of a create sent without one when `reminder_unset` has been cleared
+  since. `RECURRENCE` is never marked. A non-empty set is queued, in the same
+  transaction, as `UpdateEvent { id: graph_id, fields }`, a `Written` hold
+  (#2031) that keeps the row through a calendar round until it is sent. A
+  host write after the commit addresses a `local:` id that is gone and is
+  refused ("no event stored for ..."), so no edit falls between the two.
+- What only Graph decides is kept for the edit: with `REMINDER` marked, the
+  row keeps its reminder (Graph's answer, the mailbox default, is not
+  written); with `ONLINE_MEETING` marked, the join link and provider Graph
+  returned are not written (the queued PATCH's answer writes them,
+  `apply_op`'s `UpdateEvent` arm). The comparison runs before those writes:
+  a provider sent `""` that Graph answers `teamsForBusiness` is no edit.
+- The drain sends the queued op before it ends. `apply_op` returns
+  `Applied::EventCreated { follow_up }`. On `follow_up`, `drain_outbox` adds
+  the ops queued after the newest one it has taken (`seq` greater) to the
+  ops still to run. Older ops are not taken again, so an op refused earlier
+  in the drain keeps its once-per-drain attempts. Without this, the PATCH
+  waited for the next tick or command.
+- A row deleted during the POST queues nothing; the re-key updates no row,
+  as before. Graph keeps that event until it is deleted again (not done).
+- plan-oos3 of this issue (a calendar round between an edit and its
+  `UpdateEvent`) was fixed by #2031, above.
+- Tests: `store/mod.rs` `calendar_tests::reconcile_created_event_queues_an_edit_made_during_the_create`,
+  `reconcile_created_event_deleted_during_the_create_queues_nothing`,
+  `reconcile_created_event_keeps_a_reminder_set_during_the_create`,
+  `reconcile_created_event_keeps_an_online_meeting_edit_made_during_the_create`,
+  `reconcile_created_event_queues_nothing_for_a_zone_only_edit`,
+  `sent_event_changes_marks_each_group`, and the older `reconcile_created_event_*`
+  (nothing queued without an edit); `engine.rs`
+  `edit_during_an_in_flight_event_create_is_patched` (a paced POST, the edit made
+  once the server has recorded it, the PATCH with no further command or tick;
+  an op refused earlier in the drain is not retried by the re-pass).
 
 ## Creating a series with any recurrence (#2034)
 

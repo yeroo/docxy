@@ -15,7 +15,8 @@ use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use crate::graph::client::{
-    AttendeeInput, ContactFieldSet, EventFieldSet, PHOTO_MAX, event_zone_error, photo_content_type,
+    AttendeeInput, ContactFieldSet, EventFieldSet, EventInput, PHOTO_MAX, event_zone_error,
+    photo_content_type,
 };
 use crate::graph::model::{
     AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Calendar, ContactFields,
@@ -5605,13 +5606,32 @@ impl Store {
     /// meeting's join link and provider when Graph returned them, and its
     /// creation and response times (#2068). Clears `reminder_unset`, so a
     /// Graph-id row never keeps it.
+    ///
+    /// An edit made while the create was in flight (#2005): `sent` is the
+    /// input the POST carried, read from the row before it. In the same
+    /// transaction, before anything is written, the row is compared with it
+    /// (`sent_event_changes`), and the groups an edit changed since are
+    /// queued as `UpdateEvent { id: graph_id, fields }`, a `Written` hold
+    /// (#2031) the drain sends next. Such an edit's reminder and online
+    /// meeting are kept: Graph's answer to the create is not written over
+    /// them (the queued PATCH's answer brings the join link). A host write
+    /// after this commits addresses a `local:` id that is gone and is
+    /// refused, so no edit is lost between the two. Returns the queued set,
+    /// empty when nothing changed or the row was deleted meanwhile.
     pub fn reconcile_created_event(
         &self,
         local_id: &str,
         created: &Event,
-    ) -> Result<(), StoreError> {
+        sent: &EventInput,
+    ) -> Result<EventFieldSet, StoreError> {
         let graph_id = created.id.as_str();
         let tx = self.write_tx()?;
+        // Before any write: Graph's reminder and provider below would
+        // otherwise look like an edit.
+        let changed = match event_for_send_on(&tx, local_id)? {
+            Some(now) => sent_event_changes(sent, &now),
+            None => EventFieldSet::default(),
+        };
         tx.pragma_update(None, "defer_foreign_keys", "ON")?;
         tx.execute(
             "UPDATE events SET id = ?2 WHERE id = ?1",
@@ -5621,11 +5641,19 @@ impl Store {
             "UPDATE event_attendees SET event_id = ?2 WHERE event_id = ?1",
             params![local_id, graph_id],
         )?;
-        tx.execute(
-            "UPDATE events SET is_reminder_on = ?2, reminder_minutes = ?3, reminder_unset = 0
-             WHERE id = ?1",
-            params![graph_id, created.is_reminder_on, created.reminder_minutes],
-        )?;
+        if changed.contains(EventFieldSet::REMINDER) {
+            // The edit's reminder, which the queued PATCH sends.
+            tx.execute(
+                "UPDATE events SET reminder_unset = 0 WHERE id = ?1",
+                params![graph_id],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE events SET is_reminder_on = ?2, reminder_minutes = ?3, reminder_unset = 0
+                 WHERE id = ?1",
+                params![graph_id, created.is_reminder_on, created.reminder_minutes],
+            )?;
+        }
         // Graph's creation time (#2068): a just-sent meeting shows its
         // "Sent" date at once, not after a delta round names it. An
         // organizer's response time is Graph's "never", `''`.
@@ -5633,14 +5661,25 @@ impl Store {
             "UPDATE events SET created_utc = ?2, response_time = ?3 WHERE id = ?1",
             params![graph_id, created.created_utc, created.response_time],
         )?;
-        set_event_online_meeting_on(
-            &tx,
-            graph_id,
-            &created.join_url,
-            &created.online_meeting_provider,
-        )?;
+        if !changed.contains(EventFieldSet::ONLINE_MEETING) {
+            set_event_online_meeting_on(
+                &tx,
+                graph_id,
+                &created.join_url,
+                &created.online_meeting_provider,
+            )?;
+        }
+        if !changed.is_empty() {
+            enqueue_op_on(
+                &tx,
+                &OutboxOp::UpdateEvent {
+                    id: graph_id.to_string(),
+                    fields: changed,
+                },
+            )?;
+        }
         tx.commit()?;
-        Ok(())
+        Ok(changed)
     }
 
     /// Writes an online meeting's join link and provider as Graph returned
@@ -10490,6 +10529,73 @@ fn event_for_send_on(conn: &Connection, id: &str) -> Result<Option<EventSendData
     Ok(Some(data))
 }
 
+/// The groups an edit changed since a create read the row (#2005): `sent`
+/// is what the POST carried (`sync::outbox::create_event_input`: every group,
+/// less `REMINDER` when it is unset), `now` the row as `event_for_send_on`
+/// reads it at the reconcile. Each group compares as
+/// `Store::update_event_fields` marks it: `TIMES` by `start_utc`, `end_utc`
+/// and `is_all_day` only (a zone alone never marks it), `ATTENDEES` by
+/// name, address and type in order. Only the groups the create sent are
+/// compared, except the reminder: a create sent without one
+/// (`reminder_unset`) has it marked when an edit set one since, which clears
+/// `reminder_unset`. `RECURRENCE` is never marked: it is create-only.
+fn sent_event_changes(sent: &EventInput, now: &EventSendData) -> EventFieldSet {
+    let mut changed = EventFieldSet::default();
+    let mut mark = |group: EventFieldSet, differs: bool| {
+        if differs && (sent.fields.contains(group) || group == EventFieldSet::REMINDER) {
+            changed.insert(group);
+        }
+    };
+    mark(EventFieldSet::SUBJECT, sent.subject != now.subject);
+    mark(
+        EventFieldSet::TIMES,
+        sent.start_utc != now.start_utc
+            || sent.end_utc != now.end_utc
+            || sent.is_all_day != now.is_all_day,
+    );
+    mark(EventFieldSet::LOCATION, sent.location != now.location);
+    mark(EventFieldSet::BODY, sent.body_html != now.body_html);
+    mark(
+        EventFieldSet::ATTENDEES,
+        sent.attendees.len() != now.attendees.len()
+            || sent
+                .attendees
+                .iter()
+                .zip(&now.attendees)
+                .any(|(a, b)| a.name != b.name || a.addr != b.addr || a.r#type != b.r#type),
+    );
+    mark(EventFieldSet::SHOW_AS, sent.show_as != now.show_as);
+    mark(
+        EventFieldSet::SENSITIVITY,
+        sent.sensitivity != now.sensitivity,
+    );
+    mark(EventFieldSet::IMPORTANCE, sent.importance != now.importance);
+    mark(EventFieldSet::CATEGORIES, sent.categories != now.categories);
+    mark(
+        EventFieldSet::REMINDER,
+        if sent.fields.contains(EventFieldSet::REMINDER) {
+            sent.is_reminder_on != now.is_reminder_on
+                || sent.reminder_minutes != now.reminder_minutes
+        } else {
+            !now.reminder_unset
+        },
+    );
+    mark(
+        EventFieldSet::ONLINE_MEETING,
+        sent.is_online_meeting != now.is_online_meeting
+            || sent.online_meeting_provider != now.online_meeting_provider,
+    );
+    mark(
+        EventFieldSet::RESPONSE_REQUESTED,
+        sent.response_requested != now.response_requested,
+    );
+    mark(
+        EventFieldSet::ALLOW_NEW_TIME_PROPOSALS,
+        sent.allow_new_time_proposals != now.allow_new_time_proposals,
+    );
+    changed
+}
+
 /// `Store::event_attendees` on `conn`.
 fn event_attendees_on(conn: &Connection, id: &str) -> Result<Vec<AttendeeRow>, StoreError> {
     let mut stmt = conn.prepare(
@@ -14283,6 +14389,279 @@ mod calendar_tests {
         }
     }
 
+    /// What the `CreateEvent` of `id` POSTs now (#2005): the `sent` a
+    /// reconcile compares the row with.
+    fn create_input(s: &Store, id: &str) -> EventInput {
+        crate::sync::outbox::create_event_input(s, id).unwrap()
+    }
+
+    /// `sample_fields` as an edit passes them: every option given as stored
+    /// after `create_local_event` with no options (`None` keeps).
+    fn edit_of(f: &LocalEventFields) -> LocalEventFields {
+        LocalEventFields {
+            attendees: f
+                .attendees
+                .iter()
+                .map(|a| AttendeeInput {
+                    r#type: "required".into(),
+                    ..a.clone()
+                })
+                .collect(),
+            ..f.clone()
+        }
+    }
+
+    #[test]
+    fn reconcile_created_event_queues_an_edit_made_during_the_create() {
+        // #2005 (plan-oos2): the create read the row (`sent`), then an edit
+        // landed before the reconcile. The reconcile queues exactly the
+        // edited groups for the Graph id, as a `Written` hold (#2031).
+        let s = Store::open_in_memory().unwrap();
+        let f = sample_fields();
+        let id = s.create_local_event(&f, "Me", "me@x").unwrap();
+        let sent = create_input(&s, &id);
+        let mut edit = edit_of(&f);
+        edit.subject = "Sync (moved)".into();
+        edit.start_utc = "2026-07-20T13:00:00Z".into();
+        edit.end_utc = "2026-07-20T14:00:00Z".into();
+        edit.attendees.push(AttendeeInput {
+            name: "Ann".into(),
+            addr: "ann@x.com".into(),
+            r#type: "optional".into(),
+        });
+        let edited = s.update_event_fields(&id, &edit).unwrap();
+        let expected = EventFieldSet::SUBJECT
+            .union(EventFieldSet::TIMES)
+            .union(EventFieldSet::ATTENDEES);
+        assert_eq!(edited, expected);
+        let created = Event {
+            id: "EV1".into(),
+            ..Event::default()
+        };
+        let queued = s.reconcile_created_event(&id, &created, &sent).unwrap();
+        assert_eq!(queued, expected);
+        let ops = s.pending_ops().unwrap();
+        assert_eq!(ops.len(), 1, "{ops:?}");
+        assert_eq!(
+            ops[0].op,
+            OutboxOp::UpdateEvent {
+                id: "EV1".into(),
+                fields: expected,
+            }
+        );
+        assert_eq!(
+            ops[0].op.event_local_write(),
+            Some(("EV1", EventWrite::Written)),
+            "a calendar round keeps the edited row until the PATCH"
+        );
+        // The row under the Graph id keeps the edit.
+        let row = s.event_for_send("EV1").unwrap().unwrap();
+        assert_eq!(row.subject, "Sync (moved)");
+        assert_eq!(row.start_utc, "2026-07-20T13:00:00Z");
+        assert_eq!(row.attendees.len(), 2);
+    }
+
+    #[test]
+    fn reconcile_created_event_deleted_during_the_create_queues_nothing() {
+        let s = Store::open_in_memory().unwrap();
+        let id = s
+            .create_local_event(&sample_fields(), "Me", "me@x")
+            .unwrap();
+        let sent = create_input(&s, &id);
+        s.delete_event(&id).unwrap();
+        let created = Event {
+            id: "EV1".into(),
+            ..Event::default()
+        };
+        let queued = s.reconcile_created_event(&id, &created, &sent).unwrap();
+        assert!(queued.is_empty());
+        assert!(s.pending_ops().unwrap().is_empty());
+        assert!(s.event_for_send("EV1").unwrap().is_none());
+    }
+
+    #[test]
+    fn reconcile_created_event_keeps_a_reminder_set_during_the_create() {
+        // Created with no reminder: the POST sent none. An edit set 30
+        // minutes during it; Graph answers with the mailbox default (15).
+        let s = Store::open_in_memory().unwrap();
+        let f = sample_fields();
+        let id = s.create_local_event(&f, "Me", "me@x").unwrap();
+        let sent = create_input(&s, &id);
+        assert!(!sent.fields.contains(EventFieldSet::REMINDER));
+        let reminder = EventReminder {
+            on: true,
+            minutes_before_start: 30,
+        };
+        let edit = LocalEventFields {
+            reminder: Some(reminder),
+            ..edit_of(&f)
+        };
+        assert_eq!(
+            s.update_event_fields(&id, &edit).unwrap(),
+            EventFieldSet::REMINDER
+        );
+        let created = Event {
+            id: "EV1".into(),
+            is_reminder_on: true,
+            reminder_minutes: 15,
+            ..Event::default()
+        };
+        let queued = s.reconcile_created_event(&id, &created, &sent).unwrap();
+        assert_eq!(queued, EventFieldSet::REMINDER);
+        let row = s.event_for_send("EV1").unwrap().unwrap();
+        assert!(row.is_reminder_on);
+        assert_eq!(row.reminder_minutes, 30, "Graph's default is not kept");
+        assert!(!row.reminder_unset, "a Graph-id row never keeps the mark");
+    }
+
+    #[test]
+    fn reconcile_created_event_keeps_an_online_meeting_edit_made_during_the_create() {
+        // Created as a Teams meeting; an edit during the POST picks Skype.
+        // Graph's provider and join link are not written over it: the
+        // queued PATCH's answer brings them.
+        let s = Store::open_in_memory().unwrap();
+        let f = LocalEventFields {
+            is_online_meeting: Some(true),
+            online_meeting_provider: Some("teamsForBusiness".into()),
+            ..sample_fields()
+        };
+        let id = s.create_local_event(&f, "Me", "me@x").unwrap();
+        let sent = create_input(&s, &id);
+        let edit = LocalEventFields {
+            online_meeting_provider: Some("skypeForBusiness".into()),
+            ..edit_of(&f)
+        };
+        assert_eq!(
+            s.update_event_fields(&id, &edit).unwrap(),
+            EventFieldSet::ONLINE_MEETING
+        );
+        let created = Event {
+            id: "EV1".into(),
+            is_online_meeting: true,
+            online_meeting_provider: "teamsForBusiness".into(),
+            join_url: "https://teams.microsoft.com/l/meetup-join/X".into(),
+            ..Event::default()
+        };
+        let queued = s.reconcile_created_event(&id, &created, &sent).unwrap();
+        assert_eq!(queued, EventFieldSet::ONLINE_MEETING);
+        let row = s.event_for_send("EV1").unwrap().unwrap();
+        assert!(row.is_online_meeting);
+        assert_eq!(row.online_meeting_provider, "skypeForBusiness");
+        let stored = s.event("EV1").unwrap().unwrap();
+        assert_eq!(stored.join_url, "", "the PATCH's answer brings the link");
+    }
+
+    #[test]
+    fn sent_event_changes_marks_each_group() {
+        // #2005: each group alone, compared as `update_event_fields` marks
+        // it; a zone alone and a recurrence mark nothing.
+        let s = Store::open_in_memory().unwrap();
+        let id = s
+            .create_local_event(&sample_fields(), "Me", "me@x")
+            .unwrap();
+        let sent = create_input(&s, &id);
+        let base = s.event_for_send(&id).unwrap().unwrap();
+        assert_eq!(sent_event_changes(&sent, &base), EventFieldSet::default());
+        type Edit = fn(&mut EventSendData);
+        let cases: [(EventFieldSet, Edit); 17] = [
+            (EventFieldSet::SUBJECT, |d| d.subject.push('!')),
+            (EventFieldSet::TIMES, |d| {
+                d.start_utc = "2026-07-20T10:00:00Z".into()
+            }),
+            (EventFieldSet::TIMES, |d| {
+                d.end_utc = "2026-07-20T13:00:00Z".into()
+            }),
+            (EventFieldSet::TIMES, |d| d.is_all_day = true),
+            (EventFieldSet::LOCATION, |d| d.location.push('!')),
+            (EventFieldSet::BODY, |d| d.body_html.clear()),
+            (EventFieldSet::ATTENDEES, |d| d.attendees.clear()),
+            (EventFieldSet::ATTENDEES, |d| {
+                d.attendees[0].r#type = "optional".into()
+            }),
+            (EventFieldSet::SHOW_AS, |d| d.show_as = "free".into()),
+            (EventFieldSet::SENSITIVITY, |d| {
+                d.sensitivity = "private".into()
+            }),
+            (EventFieldSet::IMPORTANCE, |d| d.importance = "high".into()),
+            (EventFieldSet::CATEGORIES, |d| {
+                d.categories = vec!["Red".into()]
+            }),
+            // Created unset: an edit that set one cleared the mark.
+            (EventFieldSet::REMINDER, |d| d.reminder_unset = false),
+            (EventFieldSet::ONLINE_MEETING, |d| {
+                d.is_online_meeting = true
+            }),
+            (EventFieldSet::ONLINE_MEETING, |d| {
+                d.online_meeting_provider = "skypeForBusiness".into()
+            }),
+            (EventFieldSet::RESPONSE_REQUESTED, |d| {
+                d.response_requested = !d.response_requested
+            }),
+            (EventFieldSet::ALLOW_NEW_TIME_PROPOSALS, |d| {
+                d.allow_new_time_proposals = !d.allow_new_time_proposals
+            }),
+        ];
+        for (group, edit) in cases {
+            let mut now = base.clone();
+            edit(&mut now);
+            assert_eq!(sent_event_changes(&sent, &now), group, "{now:?}");
+        }
+        // Unset and still unset: the reminder Graph will pick is no edit.
+        let mut now = base.clone();
+        now.is_reminder_on = !now.is_reminder_on;
+        assert_eq!(sent_event_changes(&sent, &now), EventFieldSet::default());
+        // A create that sent a reminder compares on/minutes.
+        let mut with_reminder = sent.clone();
+        with_reminder.fields.insert(EventFieldSet::REMINDER);
+        let mut now = base.clone();
+        now.reminder_unset = false;
+        assert_eq!(
+            sent_event_changes(&with_reminder, &now),
+            EventFieldSet::default()
+        );
+        now.reminder_minutes += 5;
+        assert_eq!(
+            sent_event_changes(&with_reminder, &now),
+            EventFieldSet::REMINDER
+        );
+        // A zone alone, and a recurrence (create-only), mark nothing.
+        let mut now = base.clone();
+        now.start_time_zone = "W. Europe Standard Time".into();
+        now.start_local = "2026-07-20T13:00:00".into();
+        now.recurrence = Some(crate::graph::model::Recurrence {
+            kind: crate::graph::model::RecurrenceKind::Daily,
+            interval: 1,
+            days_of_week: Vec::new(),
+            day_of_month: 0,
+            start_date: "2026-07-20".into(),
+            until: None,
+        });
+        assert_eq!(sent_event_changes(&sent, &now), EventFieldSet::default());
+    }
+
+    #[test]
+    fn reconcile_created_event_queues_nothing_for_a_zone_only_edit() {
+        let s = Store::open_in_memory().unwrap();
+        let f = sample_fields();
+        let id = s.create_local_event(&f, "Me", "me@x").unwrap();
+        let sent = create_input(&s, &id);
+        let edit = LocalEventFields {
+            start_time_zone: "UTC".into(),
+            start_local: "2026-07-20T11:00:00".into(),
+            end_time_zone: "UTC".into(),
+            end_local: "2026-07-20T12:00:00".into(),
+            ..edit_of(&f)
+        };
+        assert!(s.update_event_fields(&id, &edit).unwrap().is_empty());
+        let created = Event {
+            id: "EV1".into(),
+            ..Event::default()
+        };
+        let queued = s.reconcile_created_event(&id, &created, &sent).unwrap();
+        assert!(queued.is_empty(), "{queued:?}");
+        assert!(s.pending_ops().unwrap().is_empty());
+    }
+
     #[test]
     fn create_local_event_round_trips_recurrence() {
         use crate::graph::model::{Recurrence, RecurrenceKind};
@@ -14493,7 +14872,10 @@ mod calendar_tests {
             created_utc: "2026-08-01T08:00:05Z".into(),
             ..Event::default()
         };
-        s.reconcile_created_event(&id, &created).unwrap();
+        let sent = create_input(&s, &id);
+        let queued = s.reconcile_created_event(&id, &created, &sent).unwrap();
+        assert!(queued.is_empty(), "no edit during the create: {queued:?}");
+        assert!(s.pending_ops().unwrap().is_empty());
         assert!(s.event_for_send(&id).unwrap().is_none()); // old id gone
         let send = s.event_for_send("EV1").unwrap().unwrap(); // under graph id
         assert_eq!(send.attendees.len(), 1); // attendees moved too
@@ -15286,19 +15668,27 @@ mod calendar_tests {
             )
             .unwrap();
         let teams = "https://teams.microsoft.com/l/meetup-join/X";
-        s.reconcile_created_event(
-            &id,
-            &Event {
-                id: "EV1".into(),
-                is_reminder_on: true,
-                reminder_minutes: 15,
-                is_online_meeting: true,
-                online_meeting_provider: "teamsForBusiness".into(),
-                join_url: teams.into(),
-                ..Event::default()
-            },
-        )
-        .unwrap();
+        // Sent with no reminder and no provider: Graph's own are no edit.
+        let input = create_input(&s, &id);
+        assert!(!input.fields.contains(EventFieldSet::REMINDER));
+        assert_eq!(input.online_meeting_provider, "");
+        let queued = s
+            .reconcile_created_event(
+                &id,
+                &Event {
+                    id: "EV1".into(),
+                    is_reminder_on: true,
+                    reminder_minutes: 15,
+                    is_online_meeting: true,
+                    online_meeting_provider: "teamsForBusiness".into(),
+                    join_url: teams.into(),
+                    ..Event::default()
+                },
+                &input,
+            )
+            .unwrap();
+        assert!(queued.is_empty(), "{queued:?}");
+        assert!(s.pending_ops().unwrap().is_empty());
         let sent = s.event_for_send("EV1").unwrap().unwrap();
         assert!(sent.is_reminder_on);
         assert_eq!(sent.reminder_minutes, 15);
@@ -16898,7 +17288,8 @@ mod calendar_tests {
             id: "EV1".into(),
             ..Event::default()
         };
-        s.reconcile_created_event(&id, &created).unwrap();
+        let sent = create_input(&s, &id);
+        s.reconcile_created_event(&id, &created, &sent).unwrap();
         assert_eq!(calendar_of(&s, "EV1"), "CAL2");
         let cal2 = ["CAL2".to_string()];
         let ids: Vec<String> = s
@@ -17474,7 +17865,8 @@ mod calendar_tests {
             end_utc: f.end_utc.clone(),
             ..Default::default()
         };
-        s.reconcile_created_event(&local, &created).unwrap();
+        let sent = create_input(&s, &local);
+        s.reconcile_created_event(&local, &created, &sent).unwrap();
         assert_eq!(row(&s, "G-SERIES").event_type, "seriesMaster");
         assert_eq!(ids(&s.events_in_range(FROM, TO, &a).unwrap()), ["G-SERIES"]);
     }

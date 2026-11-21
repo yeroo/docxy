@@ -6190,7 +6190,14 @@ impl Engine {
 
         let mut sent = Vec::new();
         let mut deferred = false;
-        for row in ops {
+        // The newest op this drain has taken: an op queued during the drain
+        // (an edit made during an event's create, #2005) is newer, and is
+        // the only one a re-read adds. An op the drain left queued (a 4xx
+        // retried at the next drain, a skipped `DeleteFolder`) is older, so
+        // it is not taken twice and its retry pacing stays as it is.
+        let mut newest = ops.last().map_or(0, |r| r.seq);
+        let mut ops: VecDeque<OutboxRow> = ops.into();
+        while let Some(row) = ops.pop_front() {
             // A refusal earlier in this drain may have dropped it (#1910: a
             // refused create drops the message ops of the mail moved into
             // its folder, `Store::discard_local_folder`).
@@ -6315,6 +6322,20 @@ impl Engine {
                             self.emit(SyncEvent::FoldersUpdated);
                         }
                         Applied::Done => self.direct_op_done(&row.op),
+                        Applied::EventCreated { follow_up } => {
+                            // The reconcile queued an `UpdateEvent` for an
+                            // edit made during the POST (#2005): sent by
+                            // this drain, not at the next tick or command.
+                            if follow_up {
+                                if let Ok(queued) = self.store.pending_ops() {
+                                    let seen = newest;
+                                    for later in queued.into_iter().filter(|r| r.seq > seen) {
+                                        newest = later.seq;
+                                        ops.push_back(later);
+                                    }
+                                }
+                            }
+                        }
                         Applied::Refused(e) => self.emit(SyncEvent::Error(e)),
                         Applied::RemovedFromCalendar { event_id } => {
                             if let OutboxOp::RemoveFromCalendar { message_id } = &row.op {
@@ -19779,6 +19800,187 @@ mod tests {
         let store = Store::open(&store_path).unwrap();
         assert_eq!(ids_in(&store, "CAL-A"), ["EA"]);
         assert!(store.event_for_send(&local_id).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn edit_during_an_in_flight_event_create_is_patched() {
+        // #2005 (plan-oos2). The POST is paced, so the test edits the
+        // `local:` row after the create read it and before the reconcile:
+        // the reconcile queues an `UpdateEvent` for the Graph id with what
+        // the edit changed, and the same drain sends it (a re-pass over the
+        // op queued mid-drain), with no further command or tick. An op the
+        // drain refused before the create (an edit of an event that is not
+        // stored) is not taken again by that re-pass: its attempts count
+        // moves only once per drain, as before.
+        let start = now_unix() + 3600;
+        let attendee = |addr: &str| crate::graph::client::AttendeeInput {
+            name: addr.into(),
+            addr: addr.into(),
+            r#type: "required".into(),
+        };
+        let fields = |from: u64, attendees: Vec<crate::graph::client::AttendeeInput>| {
+            crate::store::LocalEventFields {
+                subject: "Standup".into(),
+                start_utc: unix_to_iso8601(from),
+                end_utc: unix_to_iso8601(from + 1800),
+                attendees,
+                ..Default::default()
+            }
+        };
+        let routes = vec![
+            (
+                Route {
+                    method: "POST".into(),
+                    path_prefix: "/me/events".into(),
+                    status: 201,
+                    headers: vec![],
+                    body: event_from_now("EV1", 3600),
+                },
+                None,
+                Duration::from_millis(1500),
+            ),
+            (
+                Route {
+                    method: "PATCH".into(),
+                    path_prefix: "/me/events/EV1".into(),
+                    status: 200,
+                    headers: vec![],
+                    body: event_from_now("EV1", 7200),
+                },
+                None,
+                Duration::ZERO,
+            ),
+        ];
+        let mut local_id = String::new();
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_paced(
+            "calendar-create-edit-in-flight",
+            routes,
+            |s| {
+                s.enqueue_op(&OutboxOp::UpdateEvent {
+                    id: "GONE".into(),
+                    fields: crate::graph::client::EventFieldSet::SUBJECT,
+                })
+                .unwrap();
+                local_id = s
+                    .create_local_event(&fields(start, vec![attendee("a@x")]), "Me", "me@x")
+                    .unwrap();
+            },
+            EngineOptions::default(),
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::CreateEvent {
+                id: local_id.clone(),
+            })
+            .unwrap();
+        let has = |method: &str| srv.requests().iter().any(|r| r.method == method);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !has("POST") {
+            assert!(Instant::now() < deadline, "the create was never sent");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let refused_attempts = || {
+            Store::open(&store_path)
+                .unwrap()
+                .pending_ops()
+                .unwrap()
+                .into_iter()
+                .find(|r| matches!(&r.op, OutboxOp::UpdateEvent { id, .. } if id == "GONE"))
+                .expect("the refused op stays queued")
+                .attempts
+        };
+        // Refused earlier in this drain, before the create's POST.
+        let attempts = refused_attempts();
+        assert!(attempts >= 1);
+        // The create has read the row: this edit lands during its POST.
+        let moved = start + 7200;
+        let edited = Store::open(&store_path)
+            .unwrap()
+            .update_event_fields(
+                &local_id,
+                &fields(moved, vec![attendee("a@x"), attendee("b@x")]),
+            )
+            .unwrap();
+        assert_eq!(
+            edited,
+            crate::graph::client::EventFieldSet::TIMES
+                .union(crate::graph::client::EventFieldSet::ATTENDEES),
+            "the edit changed times and attendees only"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !has("PATCH") {
+            assert!(
+                Instant::now() < deadline,
+                "the edit made during the create never reached Graph: {:?}",
+                srv.requests()
+                    .iter()
+                    .map(|r| format!("{} {}", r.method, r.path))
+                    .collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let store = Store::open(&store_path).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while store.pending_ops().unwrap().len() > 1 {
+            assert!(Instant::now() < deadline, "the PATCH was never dropped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        assert_eq!(
+            refused_attempts(),
+            attempts,
+            "the re-pass takes only the op queued during the drain"
+        );
+
+        let reqs = srv.requests();
+        let patches: Vec<_> = reqs.iter().filter(|r| r.method == "PATCH").collect();
+        assert_eq!(patches.len(), 1, "one PATCH");
+        assert_eq!(patches[0].path, "/me/events/EV1");
+        let mut keys = body_keys(&patches[0].body);
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["attendees", "end", "isAllDay", "start"],
+            "{}",
+            patches[0].body
+        );
+        let body = crate::json::parse(&patches[0].body).unwrap();
+        let sent_start = body
+            .get("start")
+            .and_then(|s| s.get("dateTime"))
+            .and_then(|d| d.as_str())
+            .unwrap();
+        assert!(
+            unix_to_iso8601(moved).starts_with(sent_start.trim_end_matches(".0000000")),
+            "{sent_start} vs {}",
+            unix_to_iso8601(moved)
+        );
+        let addrs: Vec<&str> = body
+            .get("attendees")
+            .and_then(|a| a.as_array())
+            .unwrap()
+            .iter()
+            .map(|a| {
+                a.get("emailAddress")
+                    .and_then(|e| e.get("address"))
+                    .and_then(|v| v.as_str())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(addrs, ["a@x", "b@x"]);
+        // The row under the Graph id keeps the edit.
+        assert!(store.event_for_send(&local_id).unwrap().is_none());
+        let row = store.event_for_send("EV1").unwrap().expect("renamed");
+        assert_eq!(row.start_utc, unix_to_iso8601(moved));
+        assert_eq!(row.end_utc, unix_to_iso8601(moved + 1800));
+        let stored: Vec<String> = store
+            .event_attendees("EV1")
+            .unwrap()
+            .into_iter()
+            .map(|a| a.addr)
+            .collect();
+        assert_eq!(stored, ["a@x", "b@x"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 
