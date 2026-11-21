@@ -174,15 +174,22 @@ fn an_outlook_reply_keeps_its_colours_and_quote_indents() {
     );
     assert_eq!(normal.props.indent, 0);
 
-    // The quoted header: inside the `border-left` div, 4pt of padding.
+    // The quoted header: inside the `border-left` div, its 1.5pt line and
+    // 4pt of padding (#1883: the line's width is in the box, as in a
+    // browser); the line is a paragraph border, and the header's own
+    // `border-top` goes with it.
     let from = para(&d, "From:");
-    assert_eq!(from.props.indent, 80);
+    assert_eq!(from.props.indent, 30 + 80);
     assert_eq!(from.props.indent_right, 0);
+    let left = from.props.borders.left.expect("the quote's line");
+    assert_eq!((left.sz, left.space, left.color), (12, 4, Some(0x0000FF)));
+    let top = from.props.borders.top.expect("the header's line");
+    assert_eq!((top.sz, top.space, top.color), (8, 3, Some(0xE1E1E1)));
     assert!(run(&d, "From:").props.bold);
     assert_eq!(run(&d, "From:").props.size_half_pts, Some(22));
     // The blockquote: its default 40px each side, on the div's padding.
     let quoted = para(&d, "Q1 figures are attached");
-    assert_eq!(quoted.props.indent, 80 + 600);
+    assert_eq!(quoted.props.indent, 30 + 80 + 600);
     assert_eq!(quoted.props.indent_right, 600);
     assert_eq!(
         run(&d, "Q1 figures are attached").props.font.as_deref(),
@@ -220,9 +227,12 @@ fn a_plain_message_and_its_gmail_quote() {
         )]
     );
     // `margin:0 0 0 0.8ex; padding-left:1ex`: 1.8ex at 12pt is 216 twips,
-    // and the right margin of 0 replaces the blockquote's default.
+    // with the 1px line between (15, #1883), and the right margin of 0
+    // replaces the blockquote's default.
     let quoted = para(&d, "free for lunch");
-    assert_eq!(quoted.props.indent, 216);
+    assert_eq!(quoted.props.indent, 216 + 15);
+    let left = quoted.props.borders.left.expect("the quote's line");
+    assert_eq!((left.sz, left.space, left.color), (6, 6, Some(0xCCCCCC)));
     assert_eq!(quoted.props.indent_right, 0);
     assert_eq!(run(&d, "-- Sam").props.color.as_deref(), Some("888888"));
 }

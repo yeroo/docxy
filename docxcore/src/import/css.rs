@@ -3,19 +3,23 @@
 //! and the values of the properties [`super::html`] maps onto runs and
 //! paragraphs.
 //!
-//! Selectors are type, `*`, `.class`, `#id`, their compounds, and the
-//! descendant (space) and child (`>`) combinators, in comma groups. A
-//! selector with anything else (`+`, `~`, `[attr]`, a pseudo-class or
-//! -element, an escape) is dropped alone; the rest of its group still
-//! applies. Every at-rule is skipped with its block, and `<!--`, `-->` and
-//! comments are ignored. Names compare ASCII case-insensitively (most email
-//! is quirks mode, where classes and ids do).
+//! Selectors are type, `*`, `.class`, `#id`, attribute selectors
+//! (`[a]`, `=`, `~=`, `|=`, `^=`, `$=`, `*=`, an `i`/`s` flag), the
+//! pseudo-classes `:first-child`, `:link`, `:any-link` and `:root`, their
+//! compounds, and the descendant (space), child (`>`) and next-sibling
+//! (`+`) combinators, in comma groups (#1883). A selector with anything
+//! else (`~`, another pseudo-class, a pseudo-element, an escape) is
+//! dropped alone; the rest of its group still applies. Every at-rule is
+//! skipped with its block, and `<!--`, `-->` and comments are ignored.
+//! Names compare ASCII case-insensitively (most email is quirks mode, where
+//! classes and ids do).
 //!
 //! Everything is one forward pass over its text with a depth counter for
 //! braces (no recursion). A sheet keeps at most [`MAX_RULES`] rules and a
 //! selector at most [`MAX_COMPOUNDS`] compounds; matching one rule against an
-//! element costs O(compounds × depth) (see [`Selector::matches`]), all
-//! charged to the import's [`Budget`].
+//! element costs O(compounds × depth) (see [`Selector::matches`]: a `+`
+//! chain looks at most [`MAX_COMPOUNDS`] siblings back), all charged to the
+//! import's [`Budget`].
 
 use super::Budget;
 use std::collections::HashMap;
@@ -29,6 +33,65 @@ pub(crate) const MAX_COMPOUNDS: usize = 32;
 pub(crate) const MAX_NAME: usize = 64;
 /// The most classes an element keeps.
 pub(crate) const MAX_CLASSES: usize = 32;
+/// The most distinct attribute names a sheet's selectors may name
+/// (#1883); a selector naming another is dropped alone.
+pub(crate) const MAX_ATTR_NAMES: usize = 32;
+/// The longest attribute value a key keeps, in bytes (#1883 r1): a longer
+/// one is present (`[a]` matches) but no value test matches it, so no
+/// comparison reads more than this.
+pub(crate) const MAX_ATTR_VALUE: usize = 1024;
+
+/// Attributes whose values HTML compares ASCII case-insensitively in a
+/// selector (the HTML Standard's list, #1883), sorted: `td[align=center]`
+/// matches `align=Center`.
+const CASELESS_ATTRS: [&str; 46] = [
+    "accept",
+    "accept-charset",
+    "align",
+    "alink",
+    "axis",
+    "bgcolor",
+    "charset",
+    "checked",
+    "clear",
+    "codetype",
+    "color",
+    "compact",
+    "declare",
+    "defer",
+    "dir",
+    "direction",
+    "disabled",
+    "enctype",
+    "face",
+    "frame",
+    "hreflang",
+    "http-equiv",
+    "lang",
+    "language",
+    "link",
+    "media",
+    "method",
+    "multiple",
+    "nohref",
+    "noresize",
+    "noshade",
+    "nowrap",
+    "readonly",
+    "rel",
+    "rev",
+    "rules",
+    "scope",
+    "scrolling",
+    "selected",
+    "shape",
+    "target",
+    "text",
+    "type",
+    "valign",
+    "valuetype",
+    "vlink",
+];
 
 /// One `property: value [!important]`.
 #[derive(Debug, Clone, PartialEq)]
@@ -180,12 +243,33 @@ fn tokens(value: &str) -> Vec<&str> {
 // Selectors and style sheets
 
 /// What a selector compound compares against: an element's tag, id and
-/// classes, all lowercased.
+/// classes, all lowercased, and since #1883 its place among its parent's
+/// element children, whether it is a link, and the attributes the sheet's
+/// selectors name.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ElemKey {
     pub(crate) tag: String,
     pub(crate) id: Option<String>,
     pub(crate) classes: Vec<String>,
+    /// How many element children of its parent come before it.
+    pub(crate) index: u32,
+    /// An `a`, `area` or `link` with an `href` (`:link`, `:any-link`).
+    pub(crate) link: bool,
+    /// The attributes named in [`StyleSheet::attr_names`] it has.
+    pub(crate) attrs: Vec<AttrValue>,
+}
+
+/// One attribute an element's key keeps (#1883).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct AttrValue {
+    /// Lowercase.
+    name: String,
+    /// Its value (character references decoded); `None` past
+    /// [`MAX_ATTR_VALUE`].
+    value: Option<String>,
+    /// The value lowercased, made once when a selector compares this name
+    /// without case.
+    lower: Option<String>,
 }
 
 impl ElemKey {
@@ -213,6 +297,7 @@ impl ElemKey {
             tag: tag.to_ascii_lowercase(),
             id,
             classes,
+            ..ElemKey::default()
         }
     }
 
@@ -221,6 +306,39 @@ impl ElemKey {
         self.tag.len()
             + self.id.as_ref().map_or(0, String::len)
             + self.classes.iter().map(String::len).sum::<usize>()
+            + self
+                .attrs
+                .iter()
+                .map(|a| {
+                    std::mem::size_of::<AttrValue>()
+                        + a.name.len()
+                        + a.value.as_ref().map_or(0, String::len)
+                        + a.lower.as_ref().map_or(0, String::len)
+                })
+                .sum::<usize>()
+    }
+
+    /// Keep attribute `name` (lowercase) of `value` (decoded), unless one
+    /// of that name is kept already (the first wins): `caseless` when a
+    /// selector compares it without case.
+    pub(crate) fn keep_attr(&mut self, name: &str, value: &str, caseless: bool) {
+        if self.attrs.iter().any(|a| a.name == name) {
+            return;
+        }
+        let value = (value.len() <= MAX_ATTR_VALUE).then(|| value.to_string());
+        let lower = value
+            .as_ref()
+            .filter(|_| caseless)
+            .map(|v| v.to_ascii_lowercase());
+        self.attrs.push(AttrValue {
+            name: name.to_string(),
+            value,
+            lower,
+        });
+    }
+
+    fn attr(&self, name: &str) -> Option<&AttrValue> {
+        self.attrs.iter().find(|a| a.name == name)
     }
 }
 
@@ -229,6 +347,9 @@ impl ElemKey {
 pub(crate) trait Path {
     fn len(&self) -> usize;
     fn key(&self, i: usize) -> &ElemKey;
+    /// The element child of `i`'s parent `back` places before `i` (#1883),
+    /// if it is known: a path keeps at most [`MAX_COMPOUNDS`] of them.
+    fn prev(&self, i: usize, back: usize) -> Option<&ElemKey>;
 }
 
 #[cfg(test)]
@@ -239,27 +360,126 @@ impl Path for [ElemKey] {
     fn key(&self, i: usize) -> &ElemKey {
         &self[i]
     }
+    fn prev(&self, _: usize, _: usize) -> Option<&ElemKey> {
+        None
+    }
 }
 
-/// One compound: a tag (`None` for `*` or none written), an id, classes.
+/// An attribute selector's value test (#1883).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AttrOp {
+    /// `[a=v]`
+    Equals,
+    /// `[a~=v]`: one of its white-space separated words.
+    Includes,
+    /// `[a|=v]`: `v` or `v-` and more.
+    Dash,
+    /// `[a^=v]`, `[a$=v]`, `[a*=v]`
+    Prefix,
+    Suffix,
+    Substring,
+}
+
+/// An attribute selector (#1883): its name (lowercase); its value test,
+/// none for `[a]`; and whether the value compares ASCII case-insensitively
+/// (an `i` flag, or a name in [`CASELESS_ATTRS`] without an `s` flag; the
+/// value is then kept lowercase).
+#[derive(Debug, Clone, PartialEq)]
+struct AttrSel {
+    name: String,
+    test: Option<(AttrOp, String)>,
+    caseless: bool,
+}
+
+impl AttrSel {
+    /// Whether `e` passes: one unit of work per 16 bytes of the value a
+    /// test reads (at most [`MAX_ATTR_VALUE`]).
+    fn matches(&self, e: &ElemKey, budget: &Budget) -> bool {
+        let Some(attr) = e.attr(&self.name) else {
+            return false;
+        };
+        let Some((op, v)) = &self.test else {
+            return true;
+        };
+        let have = if self.caseless {
+            attr.lower.as_deref()
+        } else {
+            attr.value.as_deref()
+        };
+        let Some(have) = have else {
+            // Too long to keep: no value test matches it.
+            return false;
+        };
+        if !budget.work(have.len() / 16 + 1) {
+            return false;
+        }
+        let v = v.as_str();
+        match op {
+            AttrOp::Equals => have == v,
+            AttrOp::Includes => {
+                !v.is_empty()
+                    && !v.contains(|c: char| c.is_ascii_whitespace())
+                    && have.split_ascii_whitespace().any(|w| w == v)
+            }
+            AttrOp::Dash => {
+                have == v || (have.starts_with(v) && have.as_bytes().get(v.len()) == Some(&b'-'))
+            }
+            AttrOp::Prefix => !v.is_empty() && have.starts_with(v),
+            AttrOp::Suffix => !v.is_empty() && have.ends_with(v),
+            AttrOp::Substring => !v.is_empty() && have.contains(v),
+        }
+    }
+}
+
+/// A pseudo-class kept (#1883).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Pseudo {
+    /// `:first-child`
+    FirstChild,
+    /// `:link`, `:any-link` (a page has no visited links)
+    Link,
+    /// `:root`: the `html` element.
+    Root,
+}
+
+/// One compound: a tag (`None` for `*` or none written), an id, classes,
+/// attribute selectors and pseudo-classes.
 #[derive(Debug, Clone, PartialEq)]
 struct Compound {
     tag: Option<String>,
     id: Option<String>,
     classes: Vec<String>,
+    attrs: Vec<AttrSel>,
+    pseudo: Vec<Pseudo>,
 }
 
 impl Compound {
-    fn matches(&self, e: &ElemKey) -> bool {
+    fn matches(&self, e: &ElemKey, budget: &Budget) -> bool {
         self.tag.as_ref().is_none_or(|t| *t == e.tag)
             && self.id.as_ref().is_none_or(|i| e.id.as_ref() == Some(i))
             && self.classes.iter().all(|c| e.classes.contains(c))
+            && self.pseudo.iter().all(|p| match p {
+                Pseudo::FirstChild => e.index == 0,
+                Pseudo::Link => e.link,
+                Pseudo::Root => e.tag == "html",
+            })
+            && self.attrs.iter().all(|a| a.matches(e, budget))
     }
 
     fn heap(&self) -> usize {
         self.tag.as_ref().map_or(0, String::len)
             + self.id.as_ref().map_or(0, String::len)
             + self.classes.iter().map(String::len).sum::<usize>()
+            + self
+                .attrs
+                .iter()
+                .map(|a| {
+                    a.name.len()
+                        + a.test.as_ref().map_or(0, |(_, v)| v.len())
+                        + std::mem::size_of::<AttrSel>()
+                })
+                .sum::<usize>()
+            + self.pseudo.len()
     }
 }
 
@@ -268,6 +488,82 @@ impl Compound {
 enum Comb {
     Descendant,
     Child,
+    /// `+`: the element right before it among its parent's children
+    /// (#1883).
+    Next,
+}
+
+/// An attribute selector's text, between `[` and `]` (#1883): a name, then
+/// nothing or a test, a value (an identifier or a quoted string with no
+/// escapes) and an optional `i` / `s` flag.
+fn attr_sel(text: &str) -> Option<AttrSel> {
+    let t = text.trim();
+    let name_end = t
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .unwrap_or(t.len());
+    let name = &t[..name_end];
+    if name.is_empty() || name.len() > MAX_NAME {
+        return None;
+    }
+    let name = name.to_ascii_lowercase();
+    let rest = t[name_end..].trim_start();
+    if rest.is_empty() {
+        return Some(AttrSel {
+            name,
+            test: None,
+            caseless: false,
+        });
+    }
+    let (op, rest) = [
+        ("~=", AttrOp::Includes),
+        ("|=", AttrOp::Dash),
+        ("^=", AttrOp::Prefix),
+        ("$=", AttrOp::Suffix),
+        ("*=", AttrOp::Substring),
+        ("=", AttrOp::Equals),
+    ]
+    .into_iter()
+    .find_map(|(sym, op)| rest.strip_prefix(sym).map(|r| (op, r)))?;
+    let rest = rest.trim_start();
+    let (value, rest) = match rest.as_bytes().first() {
+        Some(&q) if q == b'"' || q == b'\'' => {
+            let end = rest[1..].find(q as char)? + 1;
+            (&rest[1..end], &rest[end + 1..])
+        }
+        _ => {
+            let end = rest
+                .find(|c: char| c.is_ascii_whitespace())
+                .unwrap_or(rest.len());
+            let v = &rest[..end];
+            let ident = !v.is_empty()
+                && !v.starts_with(|c: char| c.is_ascii_digit())
+                && v.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b >= 0x80);
+            if !ident {
+                return None;
+            }
+            (v, &rest[end..])
+        }
+    };
+    if value.contains('\\') {
+        return None;
+    }
+    let caseless = match rest.trim().to_ascii_lowercase().as_str() {
+        "" => CASELESS_ATTRS.binary_search(&name.as_str()).is_ok(),
+        "i" => true,
+        "s" => false,
+        _ => return None,
+    };
+    let value = if caseless {
+        value.to_ascii_lowercase()
+    } else {
+        value.to_string()
+    };
+    Some(AttrSel {
+        name,
+        test: Some((op, value)),
+        caseless,
+    })
 }
 
 /// A complex selector: compounds left to right, `combs[i]` between
@@ -320,14 +616,14 @@ impl Selector {
                 i += 1;
                 continue;
             }
-            if c == b'>' {
+            if c == b'>' || c == b'+' {
                 if let Some(done) = cur.take() {
                     parts.push(done);
                 }
-                if parts.is_empty() || pending == Some(Comb::Child) {
+                if parts.is_empty() || matches!(pending, Some(Comb::Child | Comb::Next)) {
                     return None;
                 }
-                pending = Some(Comb::Child);
+                pending = Some(if c == b'>' { Comb::Child } else { Comb::Next });
                 i += 1;
                 continue;
             }
@@ -341,10 +637,12 @@ impl Selector {
                     tag: None,
                     id: None,
                     classes: Vec::new(),
+                    attrs: Vec::new(),
+                    pseudo: Vec::new(),
                 };
                 if c == b'*' {
                     i += 1;
-                } else if c != b'.' && c != b'#' {
+                } else if !matches!(c, b'.' | b'#' | b'[' | b':') {
                     if !(c.is_ascii_alphabetic() || c == b'_' || c >= 0x80) {
                         return None;
                     }
@@ -369,7 +667,26 @@ impl Selector {
                     }
                     compound.id = Some(name);
                 }
-                // `+ ~ [ : \ ( ,` and anything else: not a kind we keep.
+                b'[' => {
+                    let end = i + text[i..].find(']')?;
+                    compound.attrs.push(attr_sel(&text[i + 1..end])?);
+                    i = end + 1;
+                }
+                b':' => {
+                    i += 1;
+                    // A pseudo-element (`::before`) is never kept.
+                    let name = ident(&mut i)?;
+                    if b.get(i) == Some(&b'(') {
+                        return None;
+                    }
+                    compound.pseudo.push(match name.as_str() {
+                        "first-child" => Pseudo::FirstChild,
+                        "link" | "any-link" => Pseudo::Link,
+                        "root" => Pseudo::Root,
+                        _ => return None,
+                    });
+                }
+                // `~ \ ( ,` and anything else: not a kind we keep.
                 _ => return None,
             }
             if parts.len() + 1 > MAX_COMPOUNDS {
@@ -379,7 +696,10 @@ impl Selector {
         if let Some(done) = cur.take() {
             parts.push(done);
         }
-        if parts.is_empty() || pending == Some(Comb::Child) || parts.len() > MAX_COMPOUNDS {
+        if parts.is_empty()
+            || matches!(pending, Some(Comb::Child | Comb::Next))
+            || parts.len() > MAX_COMPOUNDS
+        {
             return None;
         }
         // A trailing space leaves a descendant pending with nothing after it.
@@ -389,7 +709,8 @@ impl Selector {
         let (mut ids, mut classes, mut tags) = (0u32, 0u32, 0u32);
         for p in &parts {
             ids += p.id.is_some() as u32;
-            classes += p.classes.len() as u32;
+            // An attribute selector or pseudo-class counts as a class.
+            classes += (p.classes.len() + p.attrs.len() + p.pseudo.len()) as u32;
             tags += p.tag.is_some() as u32;
         }
         let spec = (ids.min(1023) << 20) | (classes.min(1023) << 10) | tags.min(1023);
@@ -404,41 +725,68 @@ impl Selector {
 
     /// Whether the last element of `path` matches, right to left.
     ///
-    /// `reach` is the set of elements where the compounds from `j` to the
-    /// right end can match with compound `j` on that element. For the
-    /// rightmost compound it is the subject alone. Going left, a child
-    /// combinator keeps the elements whose child is in the set, and a
-    /// descendant combinator every element before the set's last one. Each
-    /// step looks at each element once: O(compounds × depth), no
-    /// backtracking. Each step costs `hi / 4 + 1` units of work (`hi` the
-    /// last element still in the set): a unit per four elements looked at.
+    /// `reach[l]` says where the compounds from `j` to the right end can
+    /// match with compound `j` on an element at depth `l`: on `path`'s
+    /// element there (`Some(0)`) or on the one `b` places before it among
+    /// its parent's children (`Some(b)`, #1883). One place a depth is
+    /// enough: a child or descendant step lands on `path`'s own elements,
+    /// a `+` step moves each place one sibling back. For the rightmost
+    /// compound it is the subject alone. Going left, a child combinator
+    /// keeps the elements whose child is reached, a descendant combinator
+    /// every one above the deepest reached, and `+` the sibling before
+    /// each reached one. Each step looks at each depth once: O(compounds ×
+    /// depth), no backtracking. Each step costs `hi / 4 + 1` units of work
+    /// (`hi` the deepest still reached): a unit per four looked at.
     pub(crate) fn matches<P: Path + ?Sized>(&self, path: &P, budget: &Budget) -> bool {
         let d = path.len();
         let k = self.parts.len();
-        if d == 0 || k == 0 || !self.parts[k - 1].matches(path.key(d - 1)) {
+        if d == 0 || k == 0 || !self.parts[k - 1].matches(path.key(d - 1), budget) {
             return false;
         }
         if k == 1 {
             return true;
         }
-        let mut reach = vec![false; d];
-        reach[d - 1] = true;
-        // The last element in `reach`; every element of it is <= hi.
+        let mut reach: Vec<Option<usize>> = vec![None; d];
+        reach[d - 1] = Some(0);
+        // The deepest depth in `reach`.
         let mut hi = d - 1;
         for j in (0..k - 1).rev() {
             if !budget.work(hi / 4 + 1) {
                 return false;
             }
-            let mut next = vec![false; d];
+            let part = &self.parts[j];
+            let mut next: Vec<Option<usize>> = vec![None; d];
             let mut new_hi: Option<usize> = None;
-            for e in 0..hi {
-                let ok = match self.combs[j] {
-                    Comb::Child => reach[e + 1],
-                    Comb::Descendant => true,
-                } && self.parts[j].matches(path.key(e));
-                if ok {
-                    next[e] = true;
-                    new_hi = Some(e);
+            match self.combs[j] {
+                Comb::Child => {
+                    for l in 1..=hi {
+                        if reach[l].is_some() && part.matches(path.key(l - 1), budget) {
+                            next[l - 1] = Some(0);
+                            new_hi = Some(l - 1);
+                        }
+                    }
+                }
+                Comb::Descendant => {
+                    for e in 0..hi {
+                        if part.matches(path.key(e), budget) {
+                            next[e] = Some(0);
+                            new_hi = Some(e);
+                        }
+                    }
+                }
+                Comb::Next => {
+                    for l in 0..=hi {
+                        let Some(b) = reach[l] else {
+                            continue;
+                        };
+                        if path
+                            .prev(l, b + 1)
+                            .is_some_and(|key| part.matches(key, budget))
+                        {
+                            next[l] = Some(b + 1);
+                            new_hi = Some(l);
+                        }
+                    }
                 }
             }
             match new_hi {
@@ -478,6 +826,15 @@ pub(crate) struct StyleSheet {
     by_class: HashMap<String, Vec<u32>>,
     by_tag: HashMap<String, Vec<u32>>,
     universal: Vec<u32>,
+    /// The attribute names its selectors test (#1883), at most
+    /// [`MAX_ATTR_NAMES`]: what an element's key keeps of its attributes.
+    attr_names: Vec<String>,
+    /// Those of them a selector compares without case: a key keeps their
+    /// values lowercased too.
+    caseless_names: Vec<String>,
+    /// A selector has a `+` (#1883): elements keep their preceding
+    /// siblings' keys.
+    uses_next: bool,
 }
 
 impl StyleSheet {
@@ -533,9 +890,27 @@ impl StyleSheet {
                 let Some(sel) = Selector::parse(sel) else {
                     continue;
                 };
+                // Its attribute names, if the sheet has room for them.
+                let mut names: Vec<&str> = Vec::new();
+                for a in sel.parts.iter().flat_map(|p| &p.attrs) {
+                    if !sheet.attr_names.contains(&a.name) && !names.contains(&a.name.as_str()) {
+                        names.push(&a.name);
+                    }
+                }
+                if sheet.attr_names.len() + names.len() > MAX_ATTR_NAMES {
+                    continue;
+                }
                 if !budget.keep::<Rule>(sel.heap()) {
                     return sheet;
                 }
+                let names: Vec<String> = names.into_iter().map(str::to_string).collect();
+                sheet.attr_names.extend(names);
+                for a in sel.parts.iter().flat_map(|p| &p.attrs) {
+                    if a.caseless && !sheet.caseless_names.contains(&a.name) {
+                        sheet.caseless_names.push(a.name.clone());
+                    }
+                }
+                sheet.uses_next |= sel.combs.contains(&Comb::Next);
                 let r = sheet.rules.len() as u32;
                 let last = &sel.parts[sel.parts.len() - 1];
                 let bucket = if let Some(id) = &last.id {
@@ -606,6 +981,27 @@ impl StyleSheet {
         check(Some(&self.universal));
         hits.sort_unstable();
         hits
+    }
+
+    /// The attribute names the selectors test (#1883).
+    pub(crate) fn attr_names(&self) -> &[String] {
+        &self.attr_names
+    }
+
+    /// Whether a selector compares attribute `name` without case (#1883).
+    pub(crate) fn caseless(&self, name: &str) -> bool {
+        self.caseless_names.iter().any(|n| n == name)
+    }
+
+    /// Whether a selector has a `+` (#1883).
+    pub(crate) fn uses_next(&self) -> bool {
+        self.uses_next
+    }
+
+    /// Whether a rule could match an element `tag` with no id or class:
+    /// one whose rightmost compound names that tag or no tag, id or class.
+    pub(crate) fn may_match_tag(&self, tag: &str) -> bool {
+        !self.universal.is_empty() || self.by_tag.contains_key(tag)
     }
 
     /// The declarations of a hit.
@@ -706,46 +1102,114 @@ pub(crate) fn color(value: &str) -> Option<Color> {
 }
 
 /// A colour as `RRGGBB`: `#rgb`, `#rrggbb`, `rgb()`/`rgba()` (integers or
-/// percentages; fully transparent is none), a named colour.
+/// percentages), `hsl()`/`hsla()` ([`hsl`]), a named colour. A zero alpha
+/// is none; a partial one is the colour over white, as on a white page
+/// (#1883 r5: `rgba(0,0,0,.5)` is `808080`).
 fn rgb(lower: &str) -> Option<String> {
     if let Some(hex) = lower.strip_prefix('#') {
         return hex_rgb(hex);
     }
-    if let Some(args) = lower
-        .strip_prefix("rgba(")
-        .or_else(|| lower.strip_prefix("rgb("))
-    {
-        let args = args.strip_suffix(')')?;
-        let parts: Vec<&str> = args
-            .split([',', ' ', '/'])
-            .filter(|p| !p.is_empty())
-            .collect();
-        if parts.len() != 3 && parts.len() != 4 {
+    if let Some((is_hsl, channels, alpha)) = color_args(lower) {
+        if alpha <= 0.0 {
             return None;
         }
-        if let Some(a) = parts.get(3) {
-            let alpha = match a.strip_suffix('%') {
-                Some(p) => p.parse::<f64>().ok()? / 100.0,
-                None => a.parse::<f64>().ok()?,
-            };
-            if alpha <= 0.0 {
-                return None;
-            }
-        }
-        let mut out = String::with_capacity(6);
-        for p in &parts[..3] {
-            let n = match p.strip_suffix('%') {
-                Some(pc) => pc.parse::<f64>().ok()? * 255.0 / 100.0,
-                None => p.parse::<f64>().ok()?,
-            };
-            if !n.is_finite() {
-                return None;
-            }
-            out.push_str(&format!("{:02X}", n.round().clamp(0.0, 255.0) as u8));
-        }
-        return Some(out);
+        let base = if is_hsl {
+            hsl(channels)?
+        } else {
+            rgb_channels(channels)?
+        };
+        return if alpha < 1.0 {
+            over_white(&base, alpha)
+        } else {
+            Some(base)
+        };
     }
     named_color(lower).map(str::to_string)
+}
+
+/// The arguments of an `rgb()`, `rgba()`, `hsl()` or `hsla()` colour
+/// (`lower`, #1883 r5): whether it is an hsl one, its three channel
+/// arguments, and its alpha (`1` when none is given; a number or a
+/// percentage, never above 1). `None` for any other value, another count of
+/// arguments, or an alpha that is no finite number.
+fn color_args(lower: &str) -> Option<(bool, [&str; 3], f64)> {
+    let (is_hsl, args) = [
+        ("rgba(", false),
+        ("rgb(", false),
+        ("hsla(", true),
+        ("hsl(", true),
+    ]
+    .into_iter()
+    .find_map(|(f, h)| lower.strip_prefix(f).map(|a| (h, a)))?;
+    let args = args.strip_suffix(')')?;
+    let parts: Vec<&str> = args
+        .split([',', ' ', '/'])
+        .filter(|p| !p.is_empty())
+        .collect();
+    let alpha = match parts.as_slice() {
+        [_, _, _] => 1.0,
+        [_, _, _, a] => match a.strip_suffix('%') {
+            Some(p) => p.parse::<f64>().ok()? / 100.0,
+            None => a.parse::<f64>().ok()?,
+        },
+        _ => return None,
+    };
+    if !alpha.is_finite() {
+        return None;
+    }
+    Some((is_hsl, [parts[0], parts[1], parts[2]], alpha.min(1.0)))
+}
+
+/// `rgb()`'s three channels, integers or percentages, as `RRGGBB`.
+fn rgb_channels(channels: [&str; 3]) -> Option<String> {
+    let mut out = String::with_capacity(6);
+    for p in channels {
+        let n = match p.strip_suffix('%') {
+            Some(pc) => pc.parse::<f64>().ok()? * 255.0 / 100.0,
+            None => p.parse::<f64>().ok()?,
+        };
+        if !n.is_finite() {
+            return None;
+        }
+        out.push_str(&format!("{:02X}", n.round().clamp(0.0, 255.0) as u8));
+    }
+    Some(out)
+}
+
+/// An `hsl()` colour's three channels (#1883 r4): a hue (degrees, `deg`,
+/// `turn` or `rad`), saturation and lightness (percentages, or plain
+/// numbers as percentages). `RRGGBB`.
+fn hsl(channels: [&str; 3]) -> Option<String> {
+    let h = channels[0];
+    let degrees = if let Some(t) = h.strip_suffix("turn") {
+        t.parse::<f64>().ok()? * 360.0
+    } else if let Some(r) = h.strip_suffix("rad") {
+        r.parse::<f64>().ok()?.to_degrees()
+    } else {
+        h.strip_suffix("deg").unwrap_or(h).parse::<f64>().ok()?
+    };
+    let pct = |p: &str| -> Option<f64> {
+        let v = p.strip_suffix('%').unwrap_or(p).parse::<f64>().ok()?;
+        v.is_finite().then(|| (v / 100.0).clamp(0.0, 1.0))
+    };
+    let (sat, light) = (pct(channels[1])?, pct(channels[2])?);
+    if !degrees.is_finite() {
+        return None;
+    }
+    let h = degrees.rem_euclid(360.0) / 60.0;
+    let c = (1.0 - (2.0 * light - 1.0).abs()) * sat;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = light - c / 2.0;
+    let byte = |v: f64| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    Some(format!("{:02X}{:02X}{:02X}", byte(r), byte(g), byte(b)))
 }
 
 fn hex_rgb(hex: &str) -> Option<String> {
@@ -1057,6 +1521,9 @@ pub(crate) fn line_height(value: &str) -> Option<LineHeight> {
 pub(crate) struct FontShorthand {
     pub(crate) italic: bool,
     pub(crate) bold: bool,
+    /// `small-caps` before the size (#1883); the shorthand resets the
+    /// variant to `normal` otherwise.
+    pub(crate) small_caps: bool,
     pub(crate) size_pt: f64,
     pub(crate) line: LineHeight,
     pub(crate) family: Option<String>,
@@ -1068,6 +1535,7 @@ pub(crate) fn font_shorthand(value: &str, parent_pt: f64) -> Option<FontShorthan
     let toks = tokens(value);
     let mut italic = false;
     let mut bold = false;
+    let mut small_caps = false;
     for (i, t) in toks.iter().enumerate() {
         let (size_tok, line_tok) = match t.split_once('/') {
             Some((s, l)) => (s, Some(l)),
@@ -1105,6 +1573,7 @@ pub(crate) fn font_shorthand(value: &str, parent_pt: f64) -> Option<FontShorthan
             return Some(FontShorthand {
                 italic,
                 bold,
+                small_caps,
                 size_pt,
                 line,
                 family,
@@ -1115,6 +1584,8 @@ pub(crate) fn font_shorthand(value: &str, parent_pt: f64) -> Option<FontShorthan
             italic = it;
         } else if let Some(w) = weight(&lower) {
             bold = w;
+        } else if lower == "small-caps" {
+            small_caps = true;
         } else if !matches!(
             lower.as_str(),
             "normal" | "small-caps" | "condensed" | "expanded"
@@ -1152,13 +1623,159 @@ pub(crate) fn box_sides(value: &str) -> Option<[Option<Len>; 4]> {
     four_sides(&vals)
 }
 
+/// A border's line style (#1883), as far as Word's paragraph borders tell
+/// them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BorderStyle {
+    /// `none`, `hidden`: no line.
+    None,
+    Solid,
+    Double,
+    Dotted,
+    Dashed,
+    /// `groove`, `ridge`, `inset`, `outset`: drawn as a plain line.
+    Other,
+}
+
+/// A border's colour (#1883).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BorderColor {
+    /// `currentColor` (the initial value): the element's text colour.
+    Current,
+    /// `windowtext`, `auto`: automatic.
+    Auto,
+    /// `RRGGBB`, uppercase.
+    Rgb(String),
+    /// `transparent`, or a colour with no alpha (#1883 r3): no line.
+    None,
+}
+
+/// One side of an element's border (#1883), every part set: what a
+/// shorthand gives (the parts it does not name at their initial values)
+/// and what the longhands change.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BorderSide {
+    pub(crate) width: Len,
+    pub(crate) style: BorderStyle,
+    pub(crate) color: BorderColor,
+}
+
+impl Default for BorderSide {
+    /// The initial value: `medium none currentColor`.
+    fn default() -> Self {
+        BorderSide {
+            width: Len {
+                v: 3.0,
+                unit: Unit::Px,
+            },
+            style: BorderStyle::None,
+            color: BorderColor::Current,
+        }
+    }
+}
+
+impl BorderSide {
+    /// Whether it draws a line: a style other than `none`, a width above 0
+    /// and a colour (not `transparent` or a zero alpha).
+    pub(crate) fn drawn(&self) -> bool {
+        self.style != BorderStyle::None && self.width.v > 0.0 && self.color != BorderColor::None
+    }
+}
+
+/// A `border-style` keyword.
+pub(crate) fn border_style(value: &str) -> Option<BorderStyle> {
+    Some(match value.trim().to_ascii_lowercase().as_str() {
+        "none" | "hidden" => BorderStyle::None,
+        "solid" => BorderStyle::Solid,
+        "double" => BorderStyle::Double,
+        "dotted" => BorderStyle::Dotted,
+        "dashed" => BorderStyle::Dashed,
+        "groove" | "ridge" | "inset" | "outset" => BorderStyle::Other,
+        _ => return None,
+    })
+}
+
+/// A `border-width` value: `thin`, `medium`, `thick` (1, 3, 5 px) or a
+/// non-negative length (no percentage).
+pub(crate) fn border_width(value: &str) -> Option<Len> {
+    let px = |v| Some(Len { v, unit: Unit::Px });
+    match value.trim().to_ascii_lowercase().as_str() {
+        "thin" => px(1.0),
+        "medium" => px(3.0),
+        "thick" => px(5.0),
+        v => length(v).filter(|l| l.unit != Unit::Percent && l.v >= 0.0),
+    }
+}
+
+/// A `border-color` value.
+///
+/// `transparent` and a zero alpha are no line (r3); a partial alpha is the
+/// colour over white, as every colour's is ([`rgb`]; `rgba(0,0,0,0.1)` is
+/// `E6E6E6`).
+pub(crate) fn border_color(value: &str) -> Option<BorderColor> {
+    let lower = value.trim().to_ascii_lowercase();
+    let transparent =
+        lower == "transparent" || color_args(&lower).is_some_and(|(_, _, a)| a <= 0.0);
+    if transparent {
+        return Some(BorderColor::None);
+    }
+    match color(value)? {
+        Color::Rgb(c) => Some(BorderColor::Rgb(c)),
+        Color::Reset => Some(BorderColor::Auto),
+        Color::Keep => Some(BorderColor::Current),
+    }
+}
+
+/// `RRGGBB` at `alpha` over white.
+fn over_white(rgb: &str, alpha: f64) -> Option<String> {
+    let mut out = String::with_capacity(6);
+    for i in 0..3 {
+        let c = f64::from(u8::from_str_radix(rgb.get(2 * i..2 * i + 2)?, 16).ok()?);
+        let v = c * alpha + 255.0 * (1.0 - alpha);
+        out.push_str(&format!("{:02X}", v.round().clamp(0.0, 255.0) as u8));
+    }
+    Some(out)
+}
+
+/// A `border` / `border-<side>` shorthand: a width, a style and a colour
+/// in any order, each at most once, the ones not named at their initial
+/// values. `None` (the declaration ignored) for anything else.
+pub(crate) fn border_shorthand(value: &str) -> Option<BorderSide> {
+    let toks = tokens(value);
+    if toks.is_empty() || toks.len() > 3 {
+        return None;
+    }
+    let mut side = BorderSide::default();
+    let (mut width, mut style, mut colour) = (false, false, false);
+    for t in toks {
+        if let Some(s) = border_style(t).filter(|_| !style) {
+            side.style = s;
+            style = true;
+        } else if let Some(w) = border_width(t).filter(|_| !width) {
+            side.width = w;
+            width = true;
+        } else {
+            side.color = border_color(t).filter(|_| !colour)?;
+            colour = true;
+        }
+    }
+    Some(side)
+}
+
+/// A `border-width`, `border-style` or `border-color` value of one to four
+/// parts, as top, right, bottom, left, each read by `part`.
+pub(crate) fn border_sides<T: Clone>(value: &str, part: fn(&str) -> Option<T>) -> Option<[T; 4]> {
+    let vals: Vec<T> = tokens(value).into_iter().map(part).collect::<Option<_>>()?;
+    four_sides(&vals)
+}
+
 /// One to four box values as top, right, bottom, left.
-fn four_sides<T: Copy>(vals: &[T]) -> Option<[T; 4]> {
+fn four_sides<T: Clone>(vals: &[T]) -> Option<[T; 4]> {
     Some(match vals {
-        [a] => [*a, *a, *a, *a],
-        [a, b] => [*a, *b, *a, *b],
-        [a, b, c] => [*a, *b, *c, *b],
-        [a, b, c, d] => [*a, *b, *c, *d],
+        [a] => [a.clone(), a.clone(), a.clone(), a.clone()],
+        [a, b] => [a.clone(), b.clone(), a.clone(), b.clone()],
+        [a, b, c] => [a.clone(), b.clone(), c.clone(), b.clone()],
+        [a, b, c, d] => [a.clone(), b.clone(), c.clone(), d.clone()],
         _ => return None,
     })
 }
@@ -1445,12 +2062,42 @@ mod tests {
         assert_eq!(c("#1f497d"), Some(Color::Rgb("1F497D".into())));
         assert_eq!(c("rgb(204, 204, 204)"), Some(Color::Rgb("CCCCCC".into())));
         assert_eq!(c("rgb(100%,0%,50%)"), Some(Color::Rgb("FF0080".into())));
-        assert_eq!(c("RGBA(0,0,255,0.5)"), Some(Color::Rgb("0000FF".into())));
-        assert_eq!(c("rgb(0 128 0 / 50%)"), Some(Color::Rgb("008000".into())));
+        // A partial alpha is the colour over white (#1883 r5).
+        assert_eq!(c("RGBA(0,0,255,0.5)"), Some(Color::Rgb("8080FF".into())));
+        assert_eq!(c("rgb(0 128 0 / 50%)"), Some(Color::Rgb("80C080".into())));
+        assert_eq!(c("rgba(0,0,0,.5)"), Some(Color::Rgb("808080".into())));
+        assert_eq!(c("rgba(204,204,204,1)"), Some(Color::Rgb("CCCCCC".into())));
+        assert_eq!(c("rgba(0,0,0,2)"), Some(Color::Rgb("000000".into())));
         assert_eq!(c("rgba(0,0,0,0)"), None);
         assert_eq!(c("rgb(300,-4,0)"), Some(Color::Rgb("FF0000".into())));
         assert_eq!(c("Navy"), Some(Color::Rgb("000080".into())));
         assert_eq!(c("rebeccapurple"), Some(Color::Rgb("663399".into())));
+        // `hsl()` / `hsla()` (#1883 r4).
+        assert_eq!(c("hsl(0, 100%, 50%)"), Some(Color::Rgb("FF0000".into())));
+        assert_eq!(c("hsl(120 100% 25%)"), Some(Color::Rgb("008000".into())));
+        assert_eq!(
+            c("HSL(0.5turn, 100%, 50%)"),
+            Some(Color::Rgb("00FFFF".into()))
+        );
+        assert_eq!(
+            c("hsla(300deg,100%,50%,0.4)"),
+            Some(Color::Rgb("FF99FF".into()))
+        );
+        assert_eq!(c("hsl(-120, 100%, 50%)"), Some(Color::Rgb("0000FF".into())));
+        assert_eq!(c("hsla(0,0%,0%,0)"), None);
+        assert_eq!(c("hsl(x, 1%, 1%)"), None);
+        // A non-finite number is none, in every form (r5).
+        for nan in [
+            "rgba(0,0,0,nan)",
+            "rgba(0,0,0,inf)",
+            "rgb(nan,0,0)",
+            "hsla(0,100%,50%,nan)",
+            "hsl(nan,100%,50%)",
+            "hsl(0,nan%,50%)",
+        ] {
+            assert_eq!(c(nan), None, "{nan}");
+            assert_eq!(border_color(nan), None, "{nan}");
+        }
         assert_eq!(c("windowtext"), Some(Color::Reset));
         assert_eq!(c("auto"), Some(Color::Reset));
         assert_eq!(c("inherit"), Some(Color::Keep));
@@ -1631,6 +2278,83 @@ mod tests {
     }
 
     #[test]
+    fn borders_shorthands_and_longhands_1883() {
+        let px = |v: f64| Len { v, unit: Unit::Px };
+        let pt = |v: f64| Len { v, unit: Unit::Pt };
+        // Any order, the parts not named initial.
+        let b = border_shorthand("solid #E1E1E1 1.0pt").unwrap();
+        assert_eq!(b.width, pt(1.0));
+        assert_eq!(b.style, BorderStyle::Solid);
+        assert_eq!(b.color, BorderColor::Rgb("E1E1E1".into()));
+        assert!(b.drawn());
+        let b = border_shorthand("1px rgb(204,204,204) SOLID").unwrap();
+        assert_eq!((b.width, b.style), (px(1.0), BorderStyle::Solid));
+        assert_eq!(b.color, BorderColor::Rgb("CCCCCC".into()));
+        let b = border_shorthand("dashed").unwrap();
+        assert_eq!((b.width, b.color.clone()), (px(3.0), BorderColor::Current));
+        assert_eq!(
+            border_shorthand("thin double windowtext").unwrap().color,
+            BorderColor::Auto
+        );
+        // No line: `none`, `hidden`, no style, a zero width.
+        assert!(!border_shorthand("none").unwrap().drawn());
+        assert!(!border_shorthand("hidden 2px red").unwrap().drawn());
+        assert!(!border_shorthand("1px red").unwrap().drawn());
+        assert!(!border_shorthand("0 solid red").unwrap().drawn());
+        // Invalid: a part twice, junk, a percentage, too many parts.
+        for bad in [
+            "solid dashed",
+            "1px 2px solid",
+            "solid bogus",
+            "10% solid",
+            "",
+            "1px solid red blue",
+        ] {
+            assert_eq!(border_shorthand(bad), None, "{bad}");
+        }
+        assert_eq!(border_style("ridge"), Some(BorderStyle::Other));
+        assert_eq!(border_width("thick"), Some(px(5.0)));
+        assert_eq!(border_width("-1px"), None);
+        assert_eq!(
+            border_sides("1px 2px", border_width),
+            Some([px(1.0), px(2.0), px(1.0), px(2.0)])
+        );
+        assert_eq!(
+            border_sides("solid none dotted", border_style),
+            Some([
+                BorderStyle::Solid,
+                BorderStyle::None,
+                BorderStyle::Dotted,
+                BorderStyle::None
+            ])
+        );
+        assert_eq!(border_sides("red bogus", border_color), None);
+    }
+
+    #[test]
+    fn transparent_and_alpha_border_colours_1883() {
+        let c = |v: &str| border_color(v).unwrap();
+        assert_eq!(c("transparent"), BorderColor::None);
+        assert_eq!(c("rgba(0,0,0,0)"), BorderColor::None);
+        assert_eq!(c("hsla(0, 0%, 0%, 0)"), BorderColor::None);
+        assert_eq!(c("rgba(0,0,0,0.1)"), BorderColor::Rgb("E6E6E6".into()));
+        assert_eq!(c("rgb(0 0 255 / 50%)"), BorderColor::Rgb("8080FF".into()));
+        assert_eq!(c("rgba(204,204,204,1)"), BorderColor::Rgb("CCCCCC".into()));
+        // `hsl()` too (r4): its colour, and a partial alpha blended.
+        assert_eq!(
+            c("hsla(240,100%,50%,0.5)"),
+            BorderColor::Rgb("8080FF".into())
+        );
+        assert_eq!(c("hsl(0 0% 80%)"), BorderColor::Rgb("CCCCCC".into()));
+        assert!(!border_shorthand("1px solid transparent").unwrap().drawn());
+        assert!(
+            border_shorthand("1px solid rgba(0,0,0,0.1)")
+                .unwrap()
+                .drawn()
+        );
+    }
+
+    #[test]
     fn border_radius_corners() {
         let px = |v: f64| Len { v, unit: Unit::Px };
         let pct = |v: f64| Len {
@@ -1705,15 +2429,41 @@ mod tests {
             "div>p",
             "body  table   td .x",
             "*.a",
+            // Since #1883.
+            "a:link",
+            "a:any-link",
+            ":root",
+            "p:first-child",
+            "h1 + p",
+            "h1+p",
+            "div > h1 + p span",
+            "input[type=text]",
+            "[x-apple-data-detectors]",
+            "a[href^='tel:' i]",
+            "td[class~=\"wrap\"]",
+            "[lang|=en]",
+            "img[src$=\".png\" s]",
+            "a[href*=x]",
         ] {
             assert!(Selector::parse(kept).is_some(), "{kept}");
         }
         for dropped in [
-            "a:link",
             "a::before",
-            "h1 + p",
+            "a:visited",
+            "a:hover",
+            "li:last-child",
+            "p:first-of-type",
+            "li:nth-child(2)",
             "h1 ~ p",
-            "input[type=text]",
+            "h1 + + p",
+            "+ p",
+            "p +",
+            "[a=b c]",
+            "[a=1x]",
+            "[a='x]",
+            "[a=x y]",
+            "[ns|a]",
+            "[a='\\'']",
             "o\\:p",
             "> p",
             "p >",
@@ -1794,9 +2544,9 @@ mod tests {
              div.Word { } h1 {color:#2F5496} -->",
             &b,
         );
-        // p.MsoNormal, li.MsoNormal, span.MsoHyperlink, h1 (the empty
-        // block keeps nothing; a:link is dropped alone).
-        assert_eq!(sheet.len(), 4);
+        // p.MsoNormal, li.MsoNormal, a:link (kept since #1883),
+        // span.MsoHyperlink, h1 (the empty block keeps nothing).
+        assert_eq!(sheet.len(), 5);
         let path = [key("p", None, None)];
         assert!(
             sheet.matching(&path[..], &b).is_empty(),
@@ -1835,6 +2585,188 @@ mod tests {
         let sheet = StyleSheet::parse(&css, &b);
         assert_eq!(sheet.len(), MAX_RULES);
         assert!(!b.exhausted());
+    }
+
+    /// A path whose elements have preceding siblings (#1883): each depth's
+    /// element and the siblings before it, nearest last.
+    struct Siblings(Vec<(ElemKey, Vec<ElemKey>)>);
+
+    impl Path for Siblings {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn key(&self, i: usize) -> &ElemKey {
+            &self.0[i].0
+        }
+        fn prev(&self, i: usize, back: usize) -> Option<&ElemKey> {
+            let before = &self.0[i].1;
+            before.get(before.len().checked_sub(back)?)
+        }
+    }
+
+    /// `tag` with `attrs`, at `index` among its parent's children.
+    fn elem(tag: &str, index: u32, attrs: &[(&str, &str)]) -> ElemKey {
+        ElemKey {
+            index,
+            link: tag == "a" && attrs.iter().any(|(n, _)| *n == "href"),
+            ..key(tag, None, None)
+        }
+        .with_attrs(attrs)
+    }
+
+    impl ElemKey {
+        /// The key with `attrs` kept, as for a sheet comparing every one
+        /// both ways.
+        fn with_attrs(mut self, attrs: &[(&str, &str)]) -> Self {
+            for (n, v) in attrs {
+                self.keep_attr(n, v, true);
+            }
+            self
+        }
+    }
+
+    /// `subject` (and `before` it) inside a `body` that is the second child
+    /// of `html`, after a `head`.
+    fn in_body(before: &[&str], subject: ElemKey) -> Siblings {
+        let before: Vec<ElemKey> = before
+            .iter()
+            .enumerate()
+            .map(|(i, t)| elem(t, i as u32, &[]))
+            .collect();
+        Siblings(vec![
+            (elem("html", 0, &[]), vec![]),
+            (elem("body", 1, &[]), vec![elem("head", 0, &[])]),
+            (subject, before),
+        ])
+    }
+
+    #[test]
+    fn attribute_selectors_1883() {
+        let b = budget();
+        let on = |attrs: &[(&str, &str)], sel: &str| {
+            Selector::parse(sel)
+                .unwrap()
+                .matches(&[elem("td", 0, attrs)][..], &b)
+        };
+        let m = |sel: &str| {
+            on(
+                &[
+                    ("align", "Center"),
+                    ("class", "wrap Inner"),
+                    ("lang", "en-GB"),
+                ],
+                sel,
+            )
+        };
+        assert!(m("td[align]"));
+        assert!(!m("td[valign]"));
+        // `align` and `lang` compare without case; `class` with it.
+        assert!(m("td[align=center]"));
+        assert!(!m("td[align=center s]"));
+        assert!(m("[class~=Inner]"));
+        assert!(!m("[class~=inner]"));
+        assert!(m("[class~=inner i]"));
+        assert!(m("[class=\"wrap Inner\"]"));
+        assert!(!m("[class~=\"wrap Inner\"]"));
+        assert!(m("[lang|=EN]"));
+        assert!(!m("[lang|=en-g]"));
+        assert!(m("[class^=wr]") && m("[class$=ner]") && m("[class*='p In']"));
+        assert!(!m("[class^='']") && !m("[class*=\"\"]"));
+        let m = |sel: &str| on(&[("x-apple-data-detectors", "")], sel);
+        assert!(m("[x-apple-data-detectors]"));
+        assert!(!m("[x-apple-data-detectors=true]"));
+        // An attribute selector or pseudo-class counts as a class.
+        let spec = |sel: &str| Selector::parse(sel).unwrap().spec;
+        assert_eq!(spec("a[href]"), spec("a.x"));
+        assert_eq!(spec("a:link"), spec("a.x"));
+        assert!(spec("#i") > spec("a[href][title]:link"));
+    }
+
+    #[test]
+    fn a_value_past_the_cap_is_present_but_never_matches_a_test_1883() {
+        let b = budget();
+        let long = "x".repeat(MAX_ATTR_VALUE + 1);
+        let fits = "x".repeat(MAX_ATTR_VALUE);
+        let m = |value: &str, sel: &str| {
+            Selector::parse(sel)
+                .unwrap()
+                .matches(&[elem("td", 0, &[("title", value)])][..], &b)
+        };
+        assert!(m(&long, "[title]"));
+        for sel in ["[title*=x]", "[title^=x]", "[title$=x]", "[title*=X i]"] {
+            assert!(!m(&long, sel), "{sel}");
+            assert!(m(&fits, sel), "{sel}");
+        }
+        assert!(m(&fits, &format!("[title={fits}]")));
+        assert!(!m(&long, &format!("[title={long}]")));
+    }
+
+    #[test]
+    fn next_sibling_first_child_link_and_root_1883() {
+        let b = budget();
+        let m = |path: &Siblings, sel: &str| Selector::parse(sel).unwrap().matches(path, &b);
+        let p = in_body(&["h1", "style", "p"], elem("p", 3, &[]));
+        assert!(m(&p, "p + p"));
+        assert!(m(&p, "style + p + p"));
+        assert!(m(&p, "h1 + style + p + p"));
+        assert!(m(&p, "h1 + * + p + p"));
+        assert!(!m(&p, "style + p"));
+        assert!(!m(&p, "h1 + style + p"));
+        assert!(!m(&p, "h1 + p"));
+        assert!(!m(&p, "h1 + style + p + p + p"));
+        assert!(m(&p, "body > p + p"));
+        assert!(m(&p, "html head + body p"));
+        assert!(m(&p, "head + body > h1 + style + p + p"));
+        assert!(!m(&p, "html + body p"));
+        assert!(!m(&p, "p:first-child"));
+        assert!(m(&p, ":root p"));
+        assert!(!m(&p, "body:root p"));
+        let first = in_body(&[], elem("p", 0, &[]));
+        assert!(m(&first, "p:first-child"));
+        assert!(!m(&first, "body:first-child p"));
+        assert!(!m(&first, "h1 + p"));
+        let a = in_body(&[], elem("a", 0, &[("href", "x")]));
+        assert!(m(&a, "a:link") && m(&a, ":any-link"));
+        let anchor = in_body(&[], elem("a", 0, &[("name", "x")]));
+        assert!(!m(&anchor, "a:link"));
+    }
+
+    #[test]
+    fn next_sibling_chains_are_polynomial_1883() {
+        // Every element of a deep path, and every sibling before each,
+        // matches every compound: a `+` chain still looks at each depth once
+        // a step.
+        let b = budget();
+        let sibs: Vec<ElemKey> = (0..MAX_COMPOUNDS)
+            .map(|i| elem("p", i as u32, &[]))
+            .collect();
+        let path = Siblings(
+            (0..256)
+                .map(|_| (elem("p", MAX_COMPOUNDS as u32, &[]), sibs.clone()))
+                .collect(),
+        );
+        let chain = Selector::parse(&vec!["p"; MAX_COMPOUNDS].join(" + ")).unwrap();
+        assert!(chain.matches(&path, &b));
+        let mixed = Selector::parse(&vec!["p + p"; MAX_COMPOUNDS / 2].join(" ")).unwrap();
+        assert!(mixed.matches(&path, &b));
+        let miss = Selector::parse(&format!(
+            "h1 + {}",
+            vec!["p"; MAX_COMPOUNDS - 1].join(" + ")
+        ))
+        .unwrap();
+        assert!(!miss.matches(&path, &b));
+        assert!(!b.exhausted());
+    }
+
+    #[test]
+    fn a_sheet_keeps_at_most_32_attribute_names_1883() {
+        let b = budget();
+        let css: String = (0..40).map(|i| format!("[a{i}] {{color:red}}\n")).collect();
+        let sheet = StyleSheet::parse(&css, &b);
+        assert_eq!(sheet.attr_names().len(), MAX_ATTR_NAMES);
+        assert_eq!(sheet.len(), MAX_ATTR_NAMES);
+        assert!(!sheet.uses_next());
+        assert!(StyleSheet::parse("h1 + p {color:red}", &b).uses_next());
     }
 
     #[test]

@@ -175,10 +175,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   table or cell (Noah's Ark), so an unclosed `<b>` per paragraph does not
   pile up. Under a heading only a not-bold declared on it or inside it
   is the explicit off (an ancestor's `font:` shorthand is not), and
-  negative top/bottom boxes write 0. Known limits: quirks mode's table-font reset
-  (browsers do not inherit font size/weight/style into a `table` there; we
-  do), no borders, no `dir`/`letter-spacing`/`text-transform`, no `+ ~
-  [attr] :pseudo`. The suite does not draw run shading yet.
+  negative top/bottom boxes write 0. The quirks table-font reset, block
+  borders, `dir`, `letter-spacing`, `text-transform`, `visibility`,
+  `white-space`, page breaks and `+ [attr] :first-child :link :root`
+  came with #1883 (below); the suite draws run shading since #2249.
 
 ## HTML import images (#1880)
 
@@ -370,8 +370,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   An unresolved, unsized image's `alt` text is the link's text.
 - A link has the user-agent look (`underline`, `LINK_COLOR` `0563C1`, Word's
   Hyperlink colour) as direct formatting, set before the page's rules, which
-  override it (Word's own `a:link` rule is a pseudo-class `css.rs` drops; a
-  page's plain `a` rule applies). `color: inherit` / `currentcolor`
+  override it (Word's own `a:link` rule applies since #1883, as a page's
+  plain `a` rule does). `color: inherit` / `currentcolor`
   (`Color::Keep`) now gives back the parent's colour
   (`Cascade::parent_color`) over a user-agent or presentational one.
 - For the empty-paragraph rule a link counts by its text (`is_object`
@@ -707,3 +707,170 @@ A batch from #1989 and #1930 (plan-2), import only.
   `text_decoration_none_is_an_explicit_no_underline_2249` and
   `card_tests::a_column_only_a_span_reaches_takes_next_to_no_width_2249`
   in `import/html.rs`.
+
+## HTML import CSS leftovers (#1883)
+
+- Quirks mode's table font: a `table` resets `font-size` (to the import's
+  unsized 12 pt), `font-weight`, `font-style` and `font-variant` at the
+  user-agent level (`Cascade::user_agent`, `Ctx::quirks`), so the table's
+  own and its cells' CSS still apply; family and colour inherit. No
+  explicit off is written (`bold_off`/`italic_off` false). Clipboard
+  fragments are quirks too: a pasted table loses a body-inherited size, as
+  a browser shows the fragment. Not done: the same rule's `line-height`,
+  `white-space` and `text-align` (they move measured mail layouts).
+- `font-style: normal` under a heading is `<w:i w:val="0"/>` (`ITALIC_OFF`,
+  `Look::italic_off`), as `font-weight: normal` is the bold off: declared on
+  or inside the heading only.
+- `dir` (any element, `auto` ignored, any case) and `direction` set the
+  inherited `Look::rtl`: the paragraph's `w:bidi`. Word reads a bidi
+  paragraph's `w:jc` left/right as start/end, so a visual `left`/`right`
+  (CSS or `align`) is swapped there and a logical `start`/`end` is not
+  (`Look::align_logical`); none stays none. Outlook's `<p dir=RTL
+  style='text-align:right'>` is rtl Left. Not done: `render.rs` and
+  `export_email` draw rtl+Right on the right (only rtl+Left is swapped
+  there); the suite ignores paragraph direction altogether; a table's
+  `dir` (`w:bidiVisual`).
+- `letter-spacing`: run `<w:spacing w:val>` in `raw_props`, in the
+  element's own final font, inherited as that length; `normal` removes it.
+  The suite does not draw it (Word does).
+- `text-transform: uppercase` is `caps` (`none`, `lowercase`,
+  `capitalize` clear it: Word has no lower case); `font-variant`,
+  `font-variant-caps` and the `font` shorthand's `small-caps` are
+  `small_caps` (the shorthand resets it otherwise).
+- Hiding is last-wins per element (`Cascade::display_none`, `mso_hide`,
+  `visibility`): `display:none` or `mso-hide:all` sets the inherited
+  `Look::display_hidden`, which nothing below undoes; `visibility:
+  hidden|collapse` sets the inherited `visibility_hidden`, which a
+  `visible` below undoes; `vanish` is either. So `.h{display:none}` with
+  an inline `display:block` shows (it stayed hidden before).
+- `white-space: pre|pre-wrap|break-spaces` (inherited `Look::pre`) keeps
+  spaces and line feeds as in a `pre`; `normal`, `nowrap` and `pre-line`
+  collapse (Not done: `pre-line`'s kept line feeds).
+- Page breaks: `page-break-before`/`break-before` (`always page left right
+  recto verso`) on a block or list is `<w:pageBreakBefore/>` on the first
+  paragraph ended in it (`Html::page_break_before`, the same fresh walk as
+  the top spacing), and `-after`, or a break-before on a block nothing
+  ended in, sets `Html::break_pending` for the next body paragraph. Never
+  in a cell (`look.in_cell`), never on the body's first paragraph; a table
+  opening drops a pending one (Word ignores the break in a first cell).
+  Word's `<br clear=all style='page-break-before:always'>` is a page break
+  run (`br_breaks_page`, its look computed only with attributes or a sheet
+  rule that could match a `br`); `Builder::has_page_break` keeps its
+  paragraph from being dropped as empty. A paragraph that shows nothing
+  (hidden) takes no break: it passes it on (`break_pending`) to the next
+  that shows (r4). A hidden block forces none (r3). A break before a block
+  whose first content is a table is lost (Word ignores one in a first
+  cell).
+- Paragraph borders (`css::border_shorthand`, `border_sides`,
+  `Cascade::border_decl`, `own_borders`): `border`, `border-<side>` and
+  the `-width`/`-style`/`-color` longhands, on a block only (cells, cards,
+  tables, lists, images and inline elements ignore theirs; a cell or card
+  starts with none). solid/groove/ridge/inset/outset are single, double,
+  dotted and dashed their own; `sz` is the width in eighths of a point
+  (2..96); the colour is the element's text colour unless given,
+  `windowtext` automatic, `transparent` or a zero alpha no line, a partial
+  alpha blended over white (`rgba(0,0,0,0.1)` is `E6E6E6`; r3; `hsl()` /
+  `hsla()` read since r4). A
+  block's left and right lines go on every paragraph in it, an inner
+  block's own over the outer's (`ParBorders::over`): Outlook's quote line
+  goes on through its header, and Word's `<p style='border:none'>` in a
+  bordered `div` keeps the box. Its top line goes only on the first
+  paragraph in it that shows anything (`Html::take_top`,
+  `Elem::top_placed`: past a table, a card or a hidden paragraph before
+  it; the innermost block's wins, and the outer's is placed with it) and
+  its bottom line on the last such when it closes (`apply_bottom`,
+  `Builder::last_shown_para_mut`: past a table or a hidden paragraph
+  after it; unless a block inside closed first and gave that paragraph
+  its own), so a box around a list or a ruled title is still one box (r3,
+  r4). A paragraph shows anything (`import::shows`) unless its mark is
+  `vanish` and all its content too, as Word and the suite collapse one
+  (r5: a shown `p` holding only hidden text is a line). Geometry as a browser's box: a
+  left/right line moves the text in by its width; each paragraph's
+  left/right `w:space` is its indent less the line's place
+  (`Look::border_left_x`) and width, in whole points up to 31, so an item
+  or padded block inside keeps its text where it was and the line where
+  the box is; a top/bottom line takes that side's padding as `w:space`
+  (rounded to whole points) instead of spacing, and separates margins as
+  padding does (`Look::border_before`/`border_after`: `fold_bottom`'s
+  `sep`, `top_spacing`, `bottom_unseparated`, the quirks drop). Known
+  limits: adjacent blocks with equal borders and indents group into one
+  box, as Word (and classic Outlook, which draws mail through it) and the
+  suite draw them, where a browser draws them apart (r2: no docx mark is
+  read by both as "a separate box, drawing nothing", so none is written);
+  a box's first, middle and last paragraphs have different borders, so
+  they are separate border groups in the suite (and in Word): the side
+  lines break across the spacing between them (the suite draws a group's
+  strips inside its own spacing only); a margin inside a top/bottom line
+  is spacing outside it in Word; nested boxes are one box; a transparent
+  line's width is not kept as room; a box holding only a table (or card)
+  loses its lines (cell and table borders from a box are out of scope),
+  and one that starts with a table draws its top under it.
+- Selectors (`css.rs`): attribute selectors (`[a]`, `=`, `~=`, `|=`, `^=`,
+  `$=`, `*=`, `i`/`s`; the HTML Standard's `CASELESS_ATTRS` compare values
+  without case, so `td[align=center]` matches `align=Center`), `+`,
+  `:first-child`, `:link`/`:any-link`, `:root` (`html` only); each counts
+  as a class. An `ElemKey` carries its `index` among its parent's element
+  children, `link`, and only the attributes the sheet names
+  (`StyleSheet::attr_names`, at most 32 names: a selector naming another
+  is dropped), each value up to `MAX_ATTR_VALUE` (1 KiB: a longer one is
+  present for `[a]` but fails every value test, r1) and lowercased once
+  when a selector compares that name without case
+  (`StyleSheet::caseless`); a value test is charged a unit per 16 bytes
+  and the kept attributes held only while their element is open or kept
+  as a sibling. Every open `Elem` (and
+  `Html::root_kids`) keeps its children's count and, only when the sheet
+  has a `+`, the serials and keys of its last 32 (`Kids`, charged as
+  work): a `+` chain never looks further back, and an open
+  ancestor is found among its parent's children by its `Elem::serial`.
+  A void or skipped element's attributes are read once (`open_void`). Every start tag
+  is a child, void and raw-text elements and `head` included. Matching's
+  reach set holds at most one place per depth (`Path::prev`), so it stays
+  O(compounds × depth). Not done: `~` and `:first-of-type` (the whole
+  sibling list, quadratic on long pages), `:last-child`, `:nth-*`,
+  `:not()`, `:hover`/`:visited`, pseudo-elements, escapes.
+- Colours (`css::rgb`, `color_args`, r5): a partial alpha in any colour
+  (`color`, `background`, a border) is the colour over white, as on a
+  white page (`rgba(0,0,0,.5)` is `808080`, a 4% black shading
+  `F5F5F5`); a zero alpha is none; `hsl()`/`hsla()` are read; a
+  non-finite number makes the colour none.
+- A `head` ends as a browser ends it (`Html::skip_head`, r3, r4; a fix
+  to code older than #1883), in one forward scan charged as scanned:
+  white space, comments, `<!…>`, `HEAD_VOID` tags and raw-text elements
+  (skipped whole, so a `<body>` in a script is none) are passed over, a
+  stray end tag is ignored, `</head>` ends it, and any other start tag
+  (`<body`, a `<p>`) or text ends it and opens. The `<style>` pre-pass
+  (`collect_styles`) reads a head's styles either way.
+- Tests (`import/html.rs` unless named): `quirks_tables_reset_font_size_weight_and_style_1883`,
+  `italic_off_is_explicit_under_a_heading_only_1883`,
+  `dir_rtl_is_paragraph_bidi_and_swaps_alignment_1883`,
+  `letter_spacing_is_run_spacing_1883`, `text_transform_and_small_caps_1883`,
+  `visibility_and_display_are_last_wins_vanish_1883`,
+  `white_space_pre_keeps_spaces_and_breaks_1883`,
+  `page_break_before_and_after_on_blocks_1883`,
+  `br_with_page_break_before_is_a_page_break_1883`,
+  `gmail_blockquote_border_left_is_a_paragraph_border_1883`,
+  `outlook_reply_header_border_top_1883`,
+  `word_s_ruled_paragraph_keeps_its_box_1883`,
+  `border_none_and_missing_style_draw_nothing_1883`,
+  `cell_card_and_inline_borders_stay_ignored_1883`,
+  `top_and_bottom_lines_separate_margins_1883`,
+  `style_block_sibling_attribute_and_pseudo_rules_apply_1883`,
+  `void_and_raw_text_elements_are_siblings_1883`,
+  `long_sibling_runs_stay_within_the_budget_1883`,
+  `long_attribute_values_are_present_but_never_compared_1883`,
+  `sibling_bordered_blocks_group_as_word_draws_them_1883`,
+  `a_box_s_top_and_bottom_are_on_its_first_and_last_paragraphs_1883`,
+  `an_unclosed_head_ends_at_the_body_1883`,
+  `many_heads_are_skipped_in_linear_time_1883`,
+  `a_box_s_lines_pass_over_tables_cards_and_hidden_paragraphs_1883`,
+  `a_paragraph_with_only_hidden_text_still_shows_1883`,
+  `partial_alpha_colours_blend_over_white_1883`,
+  `many_elements_with_sibling_and_attribute_rules_import_1883`; `css.rs`:
+  `a_value_past_the_cap_is_present_but_never_matches_a_test_1883`,
+  `borders_shorthands_and_longhands_1883`,
+  `transparent_and_alpha_border_colours_1883`, `attribute_selectors_1883`,
+  `next_sibling_first_child_link_and_root_1883`,
+  `next_sibling_chains_are_polynomial_1883`,
+  `a_sheet_keeps_at_most_32_attribute_names_1883`; `export_email.rs`:
+  `caps_small_caps_and_rtl_round_trip_1883`; `tests/html_css.rs`'s mail
+  fixtures check the quote lines.

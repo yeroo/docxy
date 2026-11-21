@@ -67,7 +67,10 @@ issue number to find its notes.
   quirks-mode edges, list indents, item continuations, marker look (#1979),
   list and parent margins, trailing `<br>`, wide hangs, wrapper tables (#2114),
   a picture in a link keeping it as its click link (#1999), hidden blocks,
-  `text-decoration:none` links and span-only columns as Word draws them (#2249).
+  `text-decoration:none` links and span-only columns as Word draws them (#2249),
+  quirks tables' font, an explicit italic off, rtl, letter spacing, caps,
+  visibility, white-space, page breaks, block borders as paragraph
+  borders, `+`, attribute and `:first-child` selectors (#1883).
 - `docs/claude/email-html.md`: before changing `docxcore::export_email` (a `Document` as an
   e-mail body): inline styles only, lists and their `start`, safe links, `cid:` pictures and
   their media, the import round trip (#1948).

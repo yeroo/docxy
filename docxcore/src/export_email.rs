@@ -1189,6 +1189,30 @@ mod tests {
     }
 
     #[test]
+    fn caps_small_caps_and_rtl_round_trip_1883() {
+        // The import reads `text-transform`, `font-variant` and `dir` since
+        // #1883.
+        let (x, n) = run_back(RunProps {
+            caps: true,
+            ..Default::default()
+        });
+        assert!(x.caps && !n.caps);
+        let (x, n) = run_back(RunProps {
+            small_caps: true,
+            ..Default::default()
+        });
+        assert!(x.small_caps && !n.small_caps);
+        // An rtl paragraph at its start: exported `dir="rtl"` and
+        // `text-align:right`, read back as Word's bidi `left`.
+        let p = par_back(ParProps {
+            rtl: true,
+            ..Default::default()
+        });
+        assert!(p.rtl);
+        assert_eq!(p.align, Align::Left);
+    }
+
+    #[test]
     fn superscript_and_subscript_round_trip() {
         let (x, _) = run_back(RunProps {
             vert_align: VertAlign::Superscript,

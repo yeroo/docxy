@@ -78,7 +78,10 @@ use super::html_table::{self, CellSpec, MAX_TABLE_NESTING, TableSpec, VAlign, Wi
 use super::{
     Budget, Builder, FlowTail, Link, MAX_DEPTH, TOO_BIG, heading_props, marker_is_numbered,
 };
-use crate::model::{Align, Block as DocBlock, Document, Inline, ParProps, RunProps, VertAlign};
+use crate::model::{
+    Align, Block as DocBlock, BorderKind, Document, Inline, ParBorder, ParBorders, ParProps,
+    RunProps, VertAlign,
+};
 use crate::package::Package;
 use std::rc::Rc;
 
@@ -469,7 +472,30 @@ struct Look {
     /// The cascade said not bold in so many words (`font-weight: normal`):
     /// under a heading that is an explicit off (#1872 6b).
     bold_off: bool,
+    /// The same for italic (`font-style: normal`, #1883).
+    italic_off: bool,
     align: Option<Align>,
+    /// `align` came from a logical `text-align: start | end` (#1883):
+    /// Word's `w:jc` of a bidi paragraph is already logical, so it is not
+    /// swapped there.
+    align_logical: bool,
+    /// Right to left (`dir="rtl"`, `direction: rtl`; inherited, #1883): a
+    /// paragraph's `w:bidi`.
+    rtl: bool,
+    /// `white-space: pre | pre-wrap | break-spaces` (inherited, #1883):
+    /// spaces kept, line feeds are breaks, as in a `pre`.
+    pre: bool,
+    /// Under `display: none` or `mso-hide: all` (inherited, #1883): hidden
+    /// whatever `visibility` says below.
+    display_hidden: bool,
+    /// `visibility: hidden | collapse` (inherited, #1883; `visible` undoes
+    /// it). The runs are `vanish` when this or `display_hidden` is set.
+    visibility_hidden: bool,
+    /// A forced page break before or after this block (not inherited,
+    /// #1883): `page-break-before` / `break-before` and the `-after` ones.
+    /// Never in a cell.
+    own_break_before: bool,
+    own_break_after: bool,
     /// Where a block-level child is placed when its own margins do not say
     /// (#1922): `Center` or `Right` from an inherited `-webkit-center` /
     /// `-webkit-right` (`<center>`, `align` on a `div`, `p`, `caption` or
@@ -490,6 +516,27 @@ struct Look {
     indent_right: i32,
     /// Paragraph shading (`RRGGBB`) of the nearest shaded block.
     shade: Option<String>,
+    /// Paragraph borders (#1883): the left and right sides blocks draw,
+    /// on every paragraph in them, an inner block's own over its outer
+    /// ones' (Word draws one box). Inherited, and reset by a cell and a
+    /// card. A block's top and bottom are its own (`own_top`,
+    /// `own_bottom`): only its first and last paragraphs take them (r3).
+    borders: ParBorders,
+    /// Where the left and right lines of `borders` are, in twips from the
+    /// margins: a paragraph's `w:space` on that side is its indent less
+    /// this and the line's width (so text in a list or padded block
+    /// inside keeps its place and the line stays at the box's).
+    border_left_x: i32,
+    border_right_x: i32,
+    /// A top or bottom line of its own (not inherited, #1883): it
+    /// separates margins as padding does.
+    border_before: bool,
+    border_after: bool,
+    /// Those lines (not inherited, #1883 r3): the top goes on the first
+    /// paragraph in the block that shows anything ([`Html::take_top`]), the
+    /// bottom on the last when it closes ([`Html::apply_bottom`]).
+    own_top: Option<ParBorder>,
+    own_bottom: Option<ParBorder>,
     /// Inside a list (inherited, #2114): a list in it is nested, with no
     /// user-agent vertical margins (a browser's
     /// `:is(dir,dl,menu,ol,ul) :is(dir,dl,menu,ol,ul)`, across tables too).
@@ -540,9 +587,39 @@ struct Look {
     link: Option<Rc<Link>>,
 }
 
+/// The element children an element (or the page's root) has had so far
+/// (#1883): their count, and the keys of the last [`css::MAX_COMPOUNDS`]
+/// when the sheet has a `+` (a `+` chain looks no further back).
+#[derive(Default)]
+struct Kids {
+    count: u32,
+    /// Each kept child's serial ([`Elem::serial`]) and key.
+    last: std::collections::VecDeque<(u64, ElemKey)>,
+}
+
+impl Kids {
+    /// The serial and key of the child numbered `index`, if it is kept.
+    fn get(&self, index: u32) -> Option<&(u64, ElemKey)> {
+        let first = self.count.checked_sub(self.last.len() as u32)?;
+        let at = index.checked_sub(first)?;
+        self.last.get(at as usize)
+    }
+}
+
 /// An open element.
 struct Elem {
+    /// Its key; `key.index` is its place among its parent's children.
     key: ElemKey,
+    /// Which element it is (#1883 r1): one number per element opened, so
+    /// its parent's [`Kids`] can tell it apart from another child without
+    /// comparing keys.
+    serial: u64,
+    /// Its own top line ([`Look::own_top`]) has gone on a paragraph (#1883
+    /// r4): the first that shows anything, whatever came before it in the
+    /// block (a table, a card, a hidden paragraph).
+    top_placed: bool,
+    /// Its own element children so far (#1883).
+    kids: Kids,
     kind: Kind,
     look: Look,
     /// Where its attribute text is in the page: what its look is computed
@@ -594,6 +671,16 @@ const RAW_TEXT: [&str; 11] = [
     "textarea",
 ];
 
+/// Void elements a `head` holds, passed over there ([`Html::skip_head`]).
+const HEAD_VOID: [&str; 5] = ["meta", "link", "base", "basefont", "bgsound"];
+
+/// Void elements: nothing opens, nothing is inside (`hr` ends an open `p`
+/// first).
+const VOID: [&str; 14] = [
+    "br", "hr", "img", "meta", "link", "input", "wbr", "col", "area", "base", "source", "param",
+    "embed", "track",
+];
+
 /// Whether `key` starts a heading: `h1`-`h6`, or Word's `MsoHeadingN`.
 fn starts_heading(key: &ElemKey) -> bool {
     key.tag
@@ -609,6 +696,8 @@ fn starts_heading(key: &ElemKey) -> bool {
 /// match against.
 struct Ancestry<'a> {
     elems: &'a [Elem],
+    /// The page root's children (#1883).
+    root: &'a Kids,
     subject: &'a ElemKey,
 }
 
@@ -622,10 +711,35 @@ impl Path for Ancestry<'_> {
             None => self.subject,
         }
     }
+    fn prev(&self, i: usize, back: usize) -> Option<&ElemKey> {
+        let kids = match i.checked_sub(1) {
+            Some(p) => &self.elems.get(p)?.kids,
+            None => self.root,
+        };
+        let me = self.key(i);
+        // An open ancestor is among its parent's children where its index
+        // says, unless a misnested close moved it (`<b><p>x</b>`): then
+        // its siblings are unknown.
+        if let Some(e) = self.elems.get(i) {
+            if kids
+                .get(me.index)
+                .is_some_and(|(serial, _)| *serial != e.serial)
+            {
+                return None;
+            }
+        }
+        let at = me.index.checked_sub(u32::try_from(back).ok()?)?;
+        kids.get(at).map(|(_, key)| key)
+    }
 }
 
 /// The explicit bold off a run under a heading gets (#1427's form).
 const BOLD_OFF: &str = "<w:b w:val=\"0\"/>";
+/// A paragraph that starts a page (#1883).
+const PAGE_BREAK_BEFORE: &str = "<w:pageBreakBefore/>";
+
+/// The explicit italic off a run under a heading gets (#1883).
+const ITALIC_OFF: &str = "<w:i w:val=\"0\"/>";
 
 /// Shading of `fill` (`RRGGBB`), run or paragraph.
 fn shd(fill: &str) -> String {
@@ -654,6 +768,7 @@ struct Attrs {
     alt: Option<String>,
     height: Option<String>,
     href: Option<String>,
+    dir: Option<String>,
 }
 
 /// One element's style, being computed: its look so far, and the box
@@ -704,6 +819,24 @@ struct Cascade {
     ua_font: f64,
     /// A font size was declared on the element itself.
     own_size: bool,
+    /// The element is a `br`: a forced break before it is a page break
+    /// (#1883, Word's HTML).
+    is_br: bool,
+    /// Its own `display` (last wins, #1883): `none` hides it and all below,
+    /// any other keyword shows it.
+    display_none: Option<bool>,
+    /// Its own `mso-hide` (`all` hides, as `display: none`).
+    mso_hide: Option<bool>,
+    /// Its own `visibility`: `Some(true)` hidden.
+    visibility: Option<bool>,
+    /// Its own `letter-spacing`, resolved in its final font: `Some(None)`
+    /// is `normal`.
+    letter_spacing: Option<Option<Len>>,
+    /// Its own forced breaks (`Some(true)` a page break).
+    break_before: Option<bool>,
+    break_after: Option<bool>,
+    /// Its own border, top, right, bottom, left (#1883).
+    border: [css::BorderSide; 4],
 }
 
 /// A twips sum kept in Word's range.
@@ -774,14 +907,15 @@ fn mark_rpr(run: &RunProps) -> Option<String> {
     (mark != RunProps::default()).then(|| crate::serialize::rpr_xml(&mark))
 }
 
-/// A bottom box folded onto a paragraph's [`FlowTail`] (#2114): padding
-/// closes the margin group open below it (its margins already paid) and
-/// starts a new one; with none, a positive margin collapses into the open
-/// group, adding only what it exceeds it by. A negative margin is summed.
-fn fold_bottom(after: i32, open: i32, margin: i32, pad: i32) -> (i32, i32) {
+/// A bottom box folded onto a paragraph's [`FlowTail`] (#2114): padding,
+/// or a bottom border line (`sep`, #1883), closes the margin group open
+/// below it (its margins already paid) and starts a new one; with neither,
+/// a positive margin collapses into the open group, adding only what it
+/// exceeds it by. A negative margin is summed.
+fn fold_bottom(after: i32, open: i32, margin: i32, pad: i32, sep: bool) -> (i32, i32) {
     let (mut after, mut open) = (i64::from(after), i64::from(open));
     let margin = i64::from(margin);
-    if pad != 0 {
+    if pad != 0 || sep {
         after += i64::from(pad);
         open = 0;
     }
@@ -972,6 +1106,12 @@ impl Cascade {
         look.own_place = None;
         look.own_block = false;
         look.own_card = false;
+        look.own_break_before = false;
+        look.own_break_after = false;
+        look.border_before = false;
+        look.border_after = false;
+        look.own_top = None;
+        look.own_bottom = None;
         let parent_block_align = look.block_align;
         if kind == Kind::Cell {
             look.in_cell = true;
@@ -981,6 +1121,7 @@ impl Cascade {
             look.indent_right = 0;
             look.first_line = 0;
             look.shade = None;
+            look.borders = ParBorders::default();
         }
         let parent_pt = font_pt(&look.run);
         let parent_color = look.run.color.clone();
@@ -1006,6 +1147,14 @@ impl Cascade {
             ua_vmargin: None,
             ua_font: 1.0,
             own_size: false,
+            is_br: false,
+            display_none: None,
+            mso_hide: None,
+            visibility: None,
+            letter_spacing: None,
+            break_before: None,
+            break_after: None,
+            border: Default::default(),
         }
     }
 
@@ -1020,25 +1169,46 @@ impl Cascade {
         self.look.bold_off = !bold;
     }
 
+    fn set_italic(&mut self, italic: bool) {
+        self.look.run.italic = italic;
+        self.look.italic_off = !italic;
+    }
+
     /// The user agent's look of `key`: tag semantics (`b`, `i`, …), the
     /// `center` alignment, the blockquote margins. A heading starts with no
     /// explicit not-bold: only a declaration on it or inside it makes one
     /// (an ancestor's `font:` shorthand must not, #1872 r1).
-    fn user_agent(&mut self, key: &ElemKey) {
+    fn user_agent(&mut self, key: &ElemKey, quirks: bool) {
         if starts_heading(key) {
             self.look.bold_off = false;
+            self.look.italic_off = false;
         }
         let tag = key.tag.as_str();
         if tag == "table" {
             // A table's cells align by their own rows (#1878).
             self.is_table = true;
             self.look.valign = None;
+            if quirks {
+                // A quirks-mode browser's `table { font-size: medium;
+                // font-weight: normal; font-style: normal }` (#1883): the
+                // body's font size, weight and style stop at a table; its
+                // family and colour still pass in. A reset, not a
+                // declared off: no explicit `w:b w:val="0"`.
+                self.look.run.size_half_pts = None;
+                self.look.run.bold = false;
+                self.look.bold_off = false;
+                self.look.run.italic = false;
+                self.look.italic_off = false;
+                // `font-variant: normal` too.
+                self.look.run.small_caps = false;
+            }
         }
         self.is_img = tag == "img";
+        self.is_br = tag == "br";
         let run = &mut self.look.run;
         match tag {
             "b" | "strong" => self.set_bold(true),
-            "i" | "em" | "cite" | "dfn" | "var" => run.italic = true,
+            "i" | "em" | "cite" | "dfn" | "var" => self.set_italic(true),
             "u" | "ins" => {
                 run.underline = true;
                 // An enclosing `text-decoration:none`'s explicit off (#2249).
@@ -1049,6 +1219,7 @@ impl Cascade {
             "sub" => run.vert_align = VertAlign::Subscript,
             "center" => {
                 self.look.align = Some(Align::Center);
+                self.look.align_logical = false;
                 self.look.block_align = Some(Align::Center);
             }
             "blockquote" => {
@@ -1091,6 +1262,13 @@ impl Cascade {
     /// group; `bgcolor` and `valign` on a table part; `width` on a table or
     /// cell; `<font color face size>`; an `a`'s `href` (#1879).
     fn presentational(&mut self, tag: &str, attrs: &Attrs) {
+        // `dir` on any element is a presentational `direction` (#1883);
+        // `auto` and anything else leave the inherited one.
+        match attrs.dir.as_deref().map(str::trim) {
+            Some(d) if d.eq_ignore_ascii_case("rtl") => self.look.rtl = true,
+            Some(d) if d.eq_ignore_ascii_case("ltr") => self.look.rtl = false,
+            _ => {}
+        }
         if tag == "a" {
             // A link (#1879), with a browser's `a:link` look; the page's
             // CSS on or inside it overrides that. An `a` without a usable
@@ -1104,6 +1282,7 @@ impl Cascade {
         if matches!(self.kind, Kind::Block | Kind::Cell) || self.table_part() {
             if let Some(a) = attrs.align.as_deref().and_then(align_attr) {
                 self.look.align = Some(a);
+                self.look.align_logical = false;
                 // `align` on these is `text-align: -webkit-*` (it also
                 // places block-level children, #1922); on a heading, `li`
                 // and the rest it is plain, which clears an inherited one.
@@ -1256,17 +1435,19 @@ impl Cascade {
             }
             "font-style" => {
                 if let Some(i) = css::italic(v) {
-                    run.italic = i;
+                    self.set_italic(i);
                 }
             }
             "font" => {
                 if let Some(f) = css::font_shorthand(v, self.parent_pt) {
-                    run.italic = f.italic;
+                    self.set_italic(f.italic);
+                    let run = &mut self.look.run;
                     run.size_half_pts = Some(css::half_points(f.size_pt));
                     self.own_size = true;
                     if let Some(family) = f.family {
                         run.font = Some(family);
                     }
+                    self.look.run.small_caps = f.small_caps;
                     self.set_bold(f.bold);
                     self.line = Some(f.line);
                 }
@@ -1306,6 +1487,8 @@ impl Cascade {
             "text-align" => {
                 if let Some(a) = align_value(v) {
                     self.look.align = Some(a);
+                    self.look.align_logical =
+                        matches!(v.trim().to_ascii_lowercase().as_str(), "start" | "end");
                     self.look.block_align = webkit_block_align(a, prefixed_align(v));
                 }
             }
@@ -1360,22 +1543,82 @@ impl Cascade {
             }
             "display" => {
                 let v = v.trim();
+                let keyword =
+                    !v.is_empty() && v.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-');
                 if v.eq_ignore_ascii_case("none") {
-                    run.vanish = true;
-                } else if self.card != CardMode::No
-                    && v.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-')
-                {
-                    // An inline or inline-block `div` is no card (#1927).
-                    self.not_block = !v.eq_ignore_ascii_case("block");
-                } else if self.is_img && v.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-') {
-                    // A block image is a paragraph of its own (#1922); any
-                    // other display (`inline`, `inline-block`) undoes it.
-                    self.look.own_block = v.eq_ignore_ascii_case("block");
+                    self.display_none = Some(true);
+                } else if keyword {
+                    // The last declaration wins (#1883): a later `block`
+                    // shows what an earlier `none` hid.
+                    self.display_none = Some(false);
+                    if self.card != CardMode::No {
+                        // An inline or inline-block `div` is no card (#1927).
+                        self.not_block = !v.eq_ignore_ascii_case("block");
+                    } else if self.is_img {
+                        // A block image is a paragraph of its own (#1922);
+                        // any other display (`inline`, `inline-block`)
+                        // undoes it.
+                        self.look.own_block = v.eq_ignore_ascii_case("block");
+                    }
                 }
             }
-            "mso-hide" => {
-                if v.trim().eq_ignore_ascii_case("all") {
-                    run.vanish = true;
+            "mso-hide" => match v.trim().to_ascii_lowercase().as_str() {
+                "all" => self.mso_hide = Some(true),
+                "none" => self.mso_hide = Some(false),
+                _ => {}
+            },
+            "visibility" => match v.trim().to_ascii_lowercase().as_str() {
+                "hidden" | "collapse" => self.visibility = Some(true),
+                "visible" => self.visibility = Some(false),
+                _ => {}
+            },
+            "direction" => match v.trim().to_ascii_lowercase().as_str() {
+                "rtl" => self.look.rtl = true,
+                "ltr" => self.look.rtl = false,
+                _ => {}
+            },
+            "letter-spacing" => {
+                let v = v.trim();
+                if v.eq_ignore_ascii_case("normal") {
+                    self.letter_spacing = Some(None);
+                } else if let Some(l) = css::length(v).filter(|l| l.unit != css::Unit::Percent) {
+                    self.letter_spacing = Some(Some(l));
+                }
+            }
+            "text-transform" => match v.trim().to_ascii_lowercase().as_str() {
+                "uppercase" => run.caps = true,
+                // Word has no lower case or capitalised words: plain text
+                // is the nearer.
+                "none" | "lowercase" | "capitalize" => run.caps = false,
+                _ => {}
+            },
+            "font-variant" | "font-variant-caps" => {
+                let v = v.trim().to_ascii_lowercase();
+                if v.split_ascii_whitespace()
+                    .any(|t| matches!(t, "small-caps" | "all-small-caps"))
+                {
+                    run.small_caps = true;
+                } else if v == "normal" || v == "none" {
+                    run.small_caps = false;
+                }
+            }
+            "white-space" => match v.trim().to_ascii_lowercase().as_str() {
+                "pre" | "pre-wrap" | "break-spaces" => self.look.pre = true,
+                "normal" | "nowrap" | "pre-line" => self.look.pre = false,
+                _ => {}
+            },
+            "page-break-before" | "break-before" | "page-break-after" | "break-after" => {
+                let brk = match v.trim().to_ascii_lowercase().as_str() {
+                    "always" | "page" | "left" | "right" | "recto" | "verso" => Some(true),
+                    "auto" | "avoid" | "avoid-page" | "avoid-column" | "column" => Some(false),
+                    _ => None,
+                };
+                if brk.is_some() {
+                    if d.name.ends_with("before") {
+                        self.break_before = brk;
+                    } else {
+                        self.break_after = brk;
+                    }
                 }
             }
             "mso-highlight" => match css::highlight(v) {
@@ -1383,6 +1626,7 @@ impl Cascade {
                 Some(h) => run.highlight = Some(h.to_string()),
                 None => {}
             },
+            name if name.starts_with("border") => self.border_decl(&name["border".len()..], v),
             name => {
                 let longhand = name
                     .strip_prefix("margin-")
@@ -1401,6 +1645,108 @@ impl Cascade {
                 }
             }
         }
+    }
+
+    /// A `border…` declaration (#1883), `rest` its name past `border`:
+    /// the shorthands, `-width`, `-style`, `-color` and each side's.
+    /// Others (`-radius`, `-collapse`, `-spacing`) are not borders.
+    fn border_decl(&mut self, rest: &str, v: &str) {
+        let side = |s: &str| match s {
+            "top" => Some(0),
+            "right" => Some(1),
+            "bottom" => Some(2),
+            "left" => Some(3),
+            _ => None,
+        };
+        let Some(rest) = rest.strip_prefix('-') else {
+            if rest.is_empty() {
+                if let Some(b) = css::border_shorthand(v) {
+                    self.border = std::array::from_fn(|_| b.clone());
+                }
+            }
+            return;
+        };
+        let (s, part) = match rest.split_once('-') {
+            Some((s, part)) => (side(s), part),
+            None => (side(rest), ""),
+        };
+        let sides: Vec<usize> = match s {
+            Some(i) => vec![i],
+            // `border-width` and the like: the part is the whole rest.
+            None if part.is_empty() => (0..4).collect(),
+            None => return,
+        };
+        let part = if s.is_some() { part } else { rest };
+        match part {
+            "" => {
+                if let Some(b) = css::border_shorthand(v) {
+                    for i in sides {
+                        self.border[i] = b.clone();
+                    }
+                }
+            }
+            "width" | "style" | "color" => {
+                // One side's value, or one to four for all of them.
+                macro_rules! set {
+                    ($parse:path, $field:ident) => {
+                        if s.is_some() {
+                            if let Some(x) = $parse(v) {
+                                self.border[sides[0]].$field = x;
+                            }
+                        } else if let Some(all) = css::border_sides(v, $parse) {
+                            for (i, x) in all.into_iter().enumerate() {
+                                self.border[i].$field = x;
+                            }
+                        }
+                    };
+                }
+                match part {
+                    "width" => set!(css::border_width, width),
+                    "style" => set!(css::border_style, style),
+                    _ => set!(css::border_color, color),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A block's own drawn border sides (#1883), top, right, bottom, left,
+    /// in its final font and colour: top and bottom `w:space` its padding
+    /// there in whole points (the left and right ones are set per
+    /// paragraph, [`Html::par_props`]).
+    fn own_borders(&self, pt: f64) -> [Option<ParBorder>; 4] {
+        std::array::from_fn(|i| {
+            let b = &self.border[i];
+            if !b.drawn() {
+                return None;
+            }
+            let width = b.width.points(pt)?;
+            let kind = match b.style {
+                css::BorderStyle::Double => BorderKind::Double,
+                css::BorderStyle::Dotted => BorderKind::Dotted,
+                css::BorderStyle::Dashed => BorderKind::Dashed,
+                _ => BorderKind::Single,
+            };
+            let color = match &b.color {
+                css::BorderColor::Rgb(c) => Some(c.as_str()),
+                css::BorderColor::Current => self.look.run.color.as_deref(),
+                css::BorderColor::Auto | css::BorderColor::None => None,
+            }
+            .and_then(|c| u32::from_str_radix(c, 16).ok());
+            let space = if i % 2 == 0 {
+                let pad = self.padding[i].and_then(|l| l.points(pt)).unwrap_or(0.0);
+                pad.round().clamp(0.0, 31.0) as u16
+            } else {
+                0
+            };
+            Some(ParBorder {
+                kind,
+                sz: (width * 8.0).round().clamp(2.0, 96.0) as u16,
+                space,
+                color,
+                theme: None,
+            })
+        })
     }
 
     /// A block's or list's top and bottom box (#1979, #2114): the user
@@ -1436,7 +1782,37 @@ impl Cascade {
 
     /// The look, the lengths resolved against the element's own font size.
     fn finish(mut self) -> Look {
+        // Hidden (#1883): `display: none` (or `mso-hide: all`) here or above
+        // hides all below; `visibility` is inherited, and `visible` below a
+        // hidden one shows again.
+        let look = &mut self.look;
+        look.display_hidden =
+            look.display_hidden || self.display_none == Some(true) || self.mso_hide == Some(true);
+        if let Some(v) = self.visibility {
+            look.visibility_hidden = v;
+        }
+        look.run.vanish = look.display_hidden || look.visibility_hidden;
         let pt = font_pt(&self.look.run);
+        if let Some(spacing) = self.letter_spacing {
+            // Computed as an absolute length in its own font, then
+            // inherited as that.
+            let run = &mut self.look.run;
+            run.raw_props.retain(|r| !r.starts_with("<w:spacing "));
+            if let Some(t) = spacing.and_then(|l| l.twips(pt)).filter(|&t| t != 0) {
+                run.raw_props.push(format!("<w:spacing w:val=\"{t}\"/>"));
+            }
+        }
+        // Forced page breaks: a block's or list's, or a `br`'s (Word's
+        // `<br style='page-break-before:always'>`); never in a cell, where a
+        // browser does not break and Word ignores `pageBreakBefore`; nor on
+        // a hidden one, which a browser does not lay out (r3).
+        if !self.look.in_cell
+            && !self.look.display_hidden
+            && (matches!(self.kind, Kind::Block | Kind::List) || self.is_br)
+        {
+            self.look.own_break_before = self.break_before == Some(true);
+            self.look.own_break_after = self.break_after == Some(true) && !self.is_br;
+        }
         let card = self.kind == Kind::Block
             && match self.card {
                 CardMode::Yes(_) => true,
@@ -1448,6 +1824,13 @@ impl Cascade {
         if (self.kind == Kind::Block && !card) || self.kind == Kind::List {
             self.vertical_box(pt);
         }
+        // Its own border's drawn sides (#1883): only a block's (not a
+        // card's, cell's, table's, list's or inline element's).
+        let own = if self.kind == Kind::Block && !card {
+            self.own_borders(pt)
+        } else {
+            [None; 4]
+        };
         let look = &mut self.look;
         if card {
             // A card is a cell (#1927): a fresh block look, as a `td`
@@ -1457,6 +1840,7 @@ impl Cascade {
             look.indent_right = 0;
             look.first_line = 0;
             look.shade = None;
+            look.borders = ParBorders::default();
         }
         match self.line {
             None => {}
@@ -1495,11 +1879,20 @@ impl Cascade {
                 look.own_place = block_position(self.margin_auto, self.parent_block_align);
             }
             Kind::Block => {
-                if let Some(l) = sum(self.margin[3], self.padding[3]) {
-                    look.indent = clamp_twips(i64::from(look.indent) + i64::from(l));
+                // Its own border (#1883): a left or right line is between
+                // its margin and its padding, so it moves the text in by its
+                // width too; a top or bottom one takes that side's padding
+                // as its `w:space` (not spacing), and separates margins.
+                let line_w = |b: Option<ParBorder>| b.map_or(0, |b| i64::from(b.sz) * 5 / 2);
+                let (left_w, right_w) = (line_w(own[3]), line_w(own[1]));
+                if let Some(l) = sum(self.margin[3], self.padding[3]).or((left_w > 0).then_some(0))
+                {
+                    look.indent = clamp_twips(i64::from(look.indent) + i64::from(l) + left_w);
                 }
-                if let Some(r) = sum(self.margin[1], self.padding[1]) {
-                    look.indent_right = clamp_twips(i64::from(look.indent_right) + i64::from(r));
+                if let Some(r) = sum(self.margin[1], self.padding[1]).or((right_w > 0).then_some(0))
+                {
+                    look.indent_right =
+                        clamp_twips(i64::from(look.indent_right) + i64::from(r) + right_w);
                 }
                 // A fixed-width box with both side margins auto is centred
                 // in the body (#1922): its content box, so its own padding
@@ -1523,6 +1916,34 @@ impl Cascade {
                 }
                 if let Some(fill) = self.background {
                     look.shade = Some(fill);
+                }
+                if own.iter().any(Option::is_some) {
+                    // The lines' places, from the text's: its indent less
+                    // its padding and the line.
+                    let pad = |i: usize| i64::from(tw(self.padding[i]).unwrap_or(0));
+                    if own[3].is_some() {
+                        look.border_left_x = clamp_twips(i64::from(look.indent) - pad(3) - left_w);
+                    }
+                    if own[1].is_some() {
+                        look.border_right_x =
+                            clamp_twips(i64::from(look.indent_right) - pad(1) - right_w);
+                    }
+                    if own[0].is_some() {
+                        look.pad_before = 0;
+                        look.border_before = true;
+                    }
+                    if own[2].is_some() {
+                        look.pad_after = 0;
+                        look.border_after = true;
+                    }
+                    look.own_top = own[0];
+                    look.own_bottom = own[2];
+                    let mine = ParBorders {
+                        right: own[1],
+                        left: own[3],
+                        ..ParBorders::default()
+                    };
+                    look.borders = mine.over(look.borders);
                 }
             }
             Kind::Inline => {
@@ -1600,6 +2021,10 @@ fn image_radius(corners: [Option<Len>; 4], font_pt: f64) -> Option<html_image::R
 struct Ctx<'c> {
     sheet: &'c StyleSheet,
     budget: &'c Budget,
+    /// The page is in quirks mode: a `table` resets the font (#1883).
+    quirks: bool,
+    /// The page root's children (#1883).
+    root: &'c Kids,
 }
 
 /// The look of an element opening on top of `below`: its parent's, then the
@@ -1614,11 +2039,12 @@ fn look_of(
     card: CardMode,
 ) -> Look {
     let mut c = Cascade::new(below.last().map(|e| &e.look), kind, card);
-    c.user_agent(key);
+    c.user_agent(key, ctx.quirks);
     c.presentational(&key.tag, attrs);
     let hits = ctx.sheet.matching(
         &Ancestry {
             elems: below,
+            root: ctx.root,
             subject: key,
         },
         ctx.budget,
@@ -1821,6 +2247,15 @@ struct Html<'a> {
     /// The page is in quirks mode ([`quirks_mode`], #1979): a block's
     /// user-agent margins at its body's or cell's edge are dropped.
     quirks: bool,
+    /// A forced page break waiting for the next body paragraph that shows
+    /// anything (#1883): set when a block with a break after it closes, an
+    /// empty block with a break before it closes, or a hidden paragraph
+    /// passes one on (r4). A table opening drops it.
+    break_pending: bool,
+    /// The element children outside every open element (#1883).
+    root_kids: Kids,
+    /// The serial the next element opened takes ([`Elem::serial`]).
+    next_serial: u64,
 }
 
 impl<'a> Html<'a> {
@@ -1846,6 +2281,9 @@ impl<'a> Html<'a> {
             after_block_object: false,
             orphan_cards: Vec::new(),
             quirks: quirks_mode(s),
+            break_pending: false,
+            root_kids: Kids::default(),
+            next_serial: 0,
         }
     }
 
@@ -1864,6 +2302,71 @@ impl<'a> Html<'a> {
                     self.text(rest);
                 }
             }
+        }
+    }
+
+    /// Skip a `head`'s content (#1883 r3, r4), as a browser ends it, in one
+    /// forward scan charged as scanned: white space, comments, `<!…>` /
+    /// `<?…>`, head-only void tags (`meta`, `link`, …) and raw-text elements
+    /// (`title`, `style`, `script`, …, skipped whole, so a `<body>` in a
+    /// script is not one) are passed over; a stray end tag is ignored;
+    /// `</head>` ends it, its `>` passed; any other start tag (`<body`, a
+    /// `<p>`) or text ends it with `pos` left before it, so that opens.
+    fn skip_head(&mut self) {
+        let start = self.pos;
+        while self.pos < self.s.len() {
+            let rest = &self.s[self.pos..];
+            let trimmed = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+            self.pos += rest.len() - trimmed.len();
+            let rest = trimmed;
+            if rest.is_empty() {
+                break;
+            }
+            if rest.starts_with("<!--") {
+                self.pos += 4;
+                self.skip_past("-->");
+                continue;
+            }
+            if rest.starts_with("<!") || rest.starts_with("<?") {
+                self.skip_past(">");
+                continue;
+            }
+            // Text ends the head.
+            let Some(after) = rest.strip_prefix('<') else {
+                break;
+            };
+            let close = after.starts_with('/');
+            let name_part = if close { &after[1..] } else { after };
+            let name_len = name_part
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == ':' || c == '-'))
+                .unwrap_or(name_part.len());
+            if name_len == 0 {
+                // A `<` that starts no tag is text.
+                break;
+            }
+            let name = name_part[..name_len].to_ascii_lowercase();
+            let end = tag_end(rest).unwrap_or(rest.len());
+            if close {
+                self.pos += end;
+                if name == "head" {
+                    break;
+                }
+                continue;
+            }
+            if RAW_TEXT.contains(&name.as_str()) {
+                self.pos += end;
+                self.skip_past(&format!("</{name}"));
+                self.skip_past(">");
+                continue;
+            }
+            if HEAD_VOID.contains(&name.as_str()) {
+                self.pos += end;
+                continue;
+            }
+            break;
+        }
+        if !self.budget.scanned(self.pos - start) {
+            self.pos = self.s.len();
         }
     }
 
@@ -1944,35 +2447,128 @@ impl<'a> Html<'a> {
     }
 
     fn open_tag(&mut self, name: &str, attrs_at: (usize, usize)) {
+        if name == "head" || RAW_TEXT.contains(&name) || VOID.contains(&name) {
+            self.open_void(name, attrs_at);
+        } else {
+            self.open_element(name, attrs_at);
+        }
+    }
+
+    /// The element children of the innermost open element (or the root).
+    fn kids_mut(&mut self) -> &mut Kids {
+        match self.elems.last_mut() {
+            Some(e) => &mut e.kids,
+            None => &mut self.root_kids,
+        }
+    }
+
+    /// The key of an element `name` opening now (#1883): its tag, id and
+    /// classes, its place among the open element's children, whether it is
+    /// a link, and the attributes the sheet's selectors name (each value
+    /// kept up to [`css::MAX_ATTR_VALUE`], lowercased too when a selector
+    /// compares it without case): at most [`css::MAX_ATTR_NAMES`] of them,
+    /// held while the element is open or among the last children kept.
+    fn key_of(&self, name: &str, attrs: &Attrs, attrs_at: (usize, usize)) -> ElemKey {
+        let mut key = ElemKey::new(name, attrs.id.as_deref(), attrs.class.as_deref());
+        key.index = match self.elems.last() {
+            Some(e) => e.kids.count,
+            None => self.root_kids.count,
+        };
+        key.link = matches!(name, "a" | "area" | "link") && attrs.href.is_some();
+        let names = self.sheet.attr_names();
+        if !names.is_empty() {
+            let s = self.s;
+            each_attr(&s[attrs_at.0..attrs_at.1], |n, value| {
+                let n = n.to_ascii_lowercase();
+                if names.contains(&n) {
+                    key.keep_attr(&n, &attr_entities(value), self.sheet.caseless(&n));
+                }
+            });
+        }
+        key
+    }
+
+    /// A serial for an element opening now ([`Elem::serial`]).
+    fn take_serial(&mut self) -> u64 {
+        self.next_serial += 1;
+        self.next_serial
+    }
+
+    /// Count the element `serial` keyed `key` as the open element's next
+    /// child (#1883), keeping its key when the sheet has a `+`: work, as an
+    /// element's own key is, since a parent keeps at most
+    /// [`css::MAX_COMPOUNDS`] of them.
+    fn add_child(&mut self, serial: u64, key: &ElemKey) {
+        let keep = self.sheet.uses_next() && self.budget.work(1 + key.heap() / 16);
+        let kids = self.kids_mut();
+        kids.count = kids.count.saturating_add(1);
+        if keep {
+            if kids.last.len() >= css::MAX_COMPOUNDS {
+                kids.last.pop_front();
+            }
+            kids.last.push_back((serial, key.clone()));
+        } else {
+            kids.last.clear();
+        }
+    }
+
+    /// Open an element that opens nothing: a void element, or one whose
+    /// content is skipped. Its attributes are read once, and only when its
+    /// key or attributes are needed: for a `+` sibling, a `br` that may be
+    /// a page break, an image.
+    fn open_void(&mut self, name: &str, attrs_at: (usize, usize)) {
+        let s = self.s;
+        let text = &s[attrs_at.0..attrs_at.1];
         match name {
-            _ if name == "head" || RAW_TEXT.contains(&name) => {
+            "head" => self.skip_head(),
+            _ if RAW_TEXT.contains(&name) => {
                 let end = format!("</{name}");
                 self.skip_past(&end);
                 self.skip_past(">");
-                return;
             }
-            "br" => {
-                if self.visible() {
-                    let props = self.run_props();
-                    self.out.line_break(&props);
-                    self.space = None;
-                    self.para_start = true;
-                }
-                return;
-            }
-            "hr" => {
-                self.implicit_close(&["p"]);
-                return;
-            }
-            "img" => {
-                self.image(attrs_at);
-                return;
-            }
-            // Void elements: nothing opens.
-            "meta" | "link" | "input" | "wbr" | "col" | "area" | "base" | "source" | "param"
-            | "embed" | "track" => return,
+            // Its parent is what is open once the `p` it ends has closed.
+            "hr" => self.implicit_close(&["p"]),
             _ => {}
         }
+        let wanted = self.sheet.uses_next()
+            || (name == "br"
+                && self.visible()
+                && (!text.trim().is_empty() || self.sheet.may_match_tag("br")))
+            || (name == "img" && self.images.is_some() && self.image_in_view());
+        let read = (wanted && self.budget.scanned(text.len())).then(|| {
+            let attrs = attrs_of(text);
+            let key = self.key_of(name, &attrs, attrs_at);
+            (attrs, key)
+        });
+        match name {
+            "br" if self.visible() => {
+                let props = self.run_props();
+                let page = read
+                    .as_ref()
+                    .is_some_and(|(attrs, key)| self.br_breaks_page(attrs, key));
+                if page {
+                    self.out.page_break(&props);
+                } else {
+                    self.out.line_break(&props);
+                }
+                self.space = None;
+                self.para_start = true;
+            }
+            "img" => {
+                if let Some((attrs, key)) = &read {
+                    self.image(attrs, key);
+                }
+            }
+            _ => {}
+        }
+        // An element child of what is open all the same (#1883).
+        let serial = self.take_serial();
+        let key = read.map(|(_, key)| key).unwrap_or_default();
+        self.add_child(serial, &key);
+    }
+
+    /// Open an element that holds content.
+    fn open_element(&mut self, name: &str, attrs_at: (usize, usize)) {
         let s = self.s;
         let attrs = attrs_of(&s[attrs_at.0..attrs_at.1]);
         let kind = Kind::of(name);
@@ -2040,7 +2636,7 @@ impl<'a> Html<'a> {
             "dt" | "dd" => self.implicit_close(&["dt", "dd"]),
             _ => {}
         }
-        let key = ElemKey::new(name, attrs.id.as_deref(), attrs.class.as_deref());
+        let key = self.key_of(name, &attrs, attrs_at);
         if name == "span"
             && attrs
                 .style
@@ -2054,10 +2650,16 @@ impl<'a> Html<'a> {
                 self.space = None;
                 self.para_start = false;
             }
+            let serial = self.take_serial();
+            self.add_child(serial, &key);
             self.skip_past("</span");
             self.skip_past(">");
             return;
         }
+        // Its parent's next child (#1883), counted before it opens: its
+        // own look matches with `key.index` already set.
+        let serial = self.take_serial();
+        self.add_child(serial, &key);
         // The stacks as they are below this element (#1872 r4: a list's own
         // entry is above its `lists_at`, so its close ends it).
         let (blocks_at, lists_at) = (self.blocks.len(), self.lists.len());
@@ -2128,6 +2730,9 @@ impl<'a> Html<'a> {
             "table" => {
                 self.end_para_if_any();
                 self.table_depth += 1;
+                // A break after the block before it would land in the
+                // table's first cell, where Word ignores it (#1883).
+                self.break_pending = false;
             }
             _ => {}
         }
@@ -2169,6 +2774,9 @@ impl<'a> Html<'a> {
                 .map(|n| (self.table_depth, n));
             self.elems.push(Elem {
                 key,
+                serial,
+                top_placed: false,
+                kids: Kids::default(),
                 kind,
                 look,
                 attrs: attrs_at,
@@ -2253,6 +2861,8 @@ impl<'a> Html<'a> {
         Ctx {
             sheet: &self.sheet,
             budget: self.budget,
+            quirks: self.quirks,
+            root: &self.root_kids,
         }
     }
 
@@ -2274,6 +2884,8 @@ impl<'a> Html<'a> {
                 Ctx {
                     sheet: &self.sheet,
                     budget: self.budget,
+                    quirks: self.quirks,
+                    root: &self.root_kids,
                 },
                 below,
                 &e.key,
@@ -2306,6 +2918,13 @@ impl<'a> Html<'a> {
         if self.budget.work((self.elems.len() - i) / 16 + 1) {
             for j in (i..self.elems.len()).rev() {
                 self.apply_bottom(j);
+                // A forced break after it, or before it when nothing ended
+                // in it (an empty `div`), goes to the next paragraph
+                // (#1883).
+                let e = &self.elems[j];
+                if e.look.own_break_after || (e.look.own_break_before && self.fresh(e)) {
+                    self.break_pending = true;
+                }
             }
         }
         let mut reopen: Vec<Elem> = Vec::new();
@@ -2335,6 +2954,9 @@ impl<'a> Html<'a> {
                 if below.iter().filter(alike).count() + reopen.iter().filter(alike).count() < 3 {
                     reopen.push(Elem {
                         key: std::mem::take(&mut e.key),
+                        serial: 0,
+                        top_placed: false,
+                        kids: Kids::default(),
                         kind: e.kind,
                         look: Look::default(),
                         attrs: e.attrs,
@@ -2353,7 +2975,16 @@ impl<'a> Html<'a> {
             e.lists_at = lists_at;
         }
         let from = self.elems.len();
-        self.elems.extend(reopen);
+        // Each reopened element is a new child of the one below it.
+        for mut e in reopen {
+            e.key.index = match self.elems.last() {
+                Some(p) => p.kids.count,
+                None => self.root_kids.count,
+            };
+            e.serial = self.take_serial();
+            self.add_child(e.serial, &e.key);
+            self.elems.push(e);
+        }
         self.restyle(from);
     }
 
@@ -2722,26 +3353,28 @@ impl<'a> Html<'a> {
         }
     }
 
+    /// Whether an `<img>` here is seen: not in a list marker nor in a
+    /// downlevel block, unless that block is `<![if !vml]>` (#1880).
+    fn image_in_view(&self) -> bool {
+        !self.in_marker && (!self.in_downlevel || self.in_not_vml)
+    }
+
     /// An `<img>` (#1880), with images on: an inline picture, a sized
     /// placeholder, its `alt` text, or nothing (out of view, hidden, a side
     /// of 0, or unsized and unresolved with no `alt`).
-    fn image(&mut self, attrs_at: (usize, usize)) {
-        let in_view = !self.in_marker && (!self.in_downlevel || self.in_not_vml);
-        if self.images.is_none() || !in_view {
+    fn image(&mut self, attrs: &Attrs, key: &ElemKey) {
+        if self.images.is_none() || !self.image_in_view() {
             return;
         }
-        let s = self.s;
-        let attrs = attrs_of(&s[attrs_at.0..attrs_at.1]);
-        let key = ElemKey::new("img", attrs.id.as_deref(), attrs.class.as_deref());
         if !self.budget.work(1 + key.heap() / 16) {
             return;
         }
         let look = look_of(
             self.ctx(),
             &self.elems,
-            &key,
+            key,
             Kind::Other,
-            &attrs,
+            attrs,
             CardMode::No,
         );
         if look.run.vanish {
@@ -2868,6 +3501,12 @@ impl<'a> Html<'a> {
         {
             p.raw_props.push(BOLD_OFF.to_string());
         }
+        if e.look.italic_off
+            && !p.italic
+            && self.blocks.last().is_some_and(|(_, b)| b.heading.is_some())
+        {
+            p.raw_props.push(ITALIC_OFF.to_string());
+        }
         p
     }
 
@@ -2886,9 +3525,11 @@ impl<'a> Html<'a> {
         }
         let props = self.run_props();
         let link = self.run_link();
+        // In a `pre`, or under `white-space: pre` and the like (#1883).
+        let pre = self.pre > 0 || self.elems.last().is_some_and(|e| e.look.pre);
         let mut out = String::new();
         for c in text.chars() {
-            if self.pre > 0 {
+            if pre {
                 // A break or tab is written outside the link, which goes on
                 // after it as a link of its own to the same place.
                 match c {
@@ -2953,8 +3594,8 @@ impl<'a> Html<'a> {
     }
 
     /// Whether the elements below `elems[i]` reach a quirky container (the
-    /// body, or a `td` / `th`, not a card) with no bottom padding between
-    /// (#1979, #2114 r2 m3): in quirks mode a block's user-agent bottom is
+    /// body, or a `td` / `th`, not a card) with no bottom padding or bottom
+    /// border line between (#1979, #2114 r2 m3, #1883): in quirks mode a block's user-agent bottom is
     /// then dropped if its paragraph ends that flow, as Chrome drops it at
     /// a cell's end through a `div` too.
     fn bottom_unseparated(&self, i: usize, in_table: bool) -> bool {
@@ -2968,11 +3609,76 @@ impl<'a> Html<'a> {
             if e.kind.table() {
                 return matches!(e.key.tag.as_str(), "td" | "th");
             }
-            if matches!(e.kind, Kind::Block | Kind::List) && e.look.pad_after != 0 {
+            if matches!(e.kind, Kind::Block | Kind::List)
+                && (e.look.pad_after != 0 || e.look.border_after)
+            {
                 return false;
             }
         }
         !in_table
+    }
+
+    /// The top line of a paragraph ended now that shows anything (#1883
+    /// r3, r4): the innermost own top of the blocks of its flow it is in
+    /// whose top has not gone on a paragraph yet; every such block's is
+    /// placed now (Word draws one box, and its top is the innermost's).
+    fn take_top(&mut self) -> Option<ParBorder> {
+        if !self.budget.work(self.elems.len() / 16 + 1) {
+            return None;
+        }
+        let mut top = None;
+        for e in self.elems.iter_mut().rev() {
+            if e.kind.table() || matches!(e.card, CardMode::Yes(_)) {
+                break;
+            }
+            if e.kind == Kind::Block && e.look.own_top.is_some() && !e.top_placed {
+                top = top.or(e.look.own_top);
+                e.top_placed = true;
+            }
+        }
+        top
+    }
+
+    /// Whether the paragraph ended now starts a page (#1883): a block or
+    /// list it is the first paragraph of has a forced break before it, or
+    /// one closed before it with a break after it. Only in the body, and
+    /// not at its start (a browser breaks no page there).
+    fn page_break_before(&mut self, in_table: bool) -> bool {
+        if in_table {
+            return false;
+        }
+        let mut brk = std::mem::take(&mut self.break_pending);
+        if !brk && self.budget.work(self.elems.len() / 16 + 1) {
+            for e in self.elems.iter().rev() {
+                if e.kind.table() || matches!(e.card, CardMode::Yes(_)) {
+                    break;
+                }
+                if matches!(e.kind, Kind::Block | Kind::List) {
+                    if !self.fresh(e) {
+                        break;
+                    }
+                    if e.look.own_break_before {
+                        brk = true;
+                        break;
+                    }
+                }
+            }
+        }
+        brk && !self.out.flow_is_empty(false)
+    }
+
+    /// Whether a `br` of `attrs` and `key` is Word's page break, `<br
+    /// style='page-break-before:always'>` (#1883).
+    fn br_breaks_page(&self, attrs: &Attrs, key: &ElemKey) -> bool {
+        look_of(
+            self.ctx(),
+            &self.elems,
+            key,
+            Kind::Other,
+            attrs,
+            CardMode::No,
+        )
+        .own_break_before
     }
 
     /// Whether nothing has ended in `e`'s flow since it opened (#2114).
@@ -2988,15 +3694,17 @@ impl<'a> Html<'a> {
     /// it its top box, folded outermost first onto the margin group open
     /// at the bottom of the paragraph above in its flow ([`Builder::tail`]):
     /// positive margins collapse (the largest counts, less what is already
-    /// paid), padding closes the group, negative margins are summed.
+    /// paid), padding or a top border line (#1883) closes the group,
+    /// negative margins are summed.
     /// Freshness is monotonic (an element is stale once one inside it is),
     /// so the walk stops at the first stale one.
     ///
     /// In quirks mode, at the start of the body or a cell (not a card), the
     /// members drop their user-agent tops from the outermost in, up to and
-    /// including the first with top padding (#1979; #2114 r2 m2, measured
-    /// in Chrome: `<div dir=ltr><ol><li>` and `<td><div><p>` start at 0,
-    /// `<div style="padding-top:1px"><ol>` keeps the list's 1em).
+    /// including the first with top padding or a top border line (#1979,
+    /// #1883; #2114 r2 m2, measured in Chrome: `<div dir=ltr><ol><li>` and
+    /// `<td><div><p>` start at 0, `<div style="padding-top:1px"><ol>` keeps
+    /// the list's 1em).
     fn top_spacing(&self, in_table: bool) -> i32 {
         let mut chain = Vec::new();
         // The walk reached the body (`Some(true)`), a cell or another
@@ -3032,16 +3740,17 @@ impl<'a> Html<'a> {
             let mut margin = i64::from(look.margin_before);
             if dropping {
                 margin -= i64::from(look.ua_before);
-                // Its padding is inside its margin: the members within
-                // are no longer at the container's start.
-                dropping = look.pad_before == 0;
+                // Its padding (or top line, #1883) is inside its margin:
+                // the members within are no longer at the container's
+                // start.
+                dropping = look.pad_before == 0 && !look.border_before;
             }
             if margin > 0 {
                 group = group.max(margin);
             } else {
                 before += margin;
             }
-            if look.pad_before != 0 {
+            if look.pad_before != 0 || look.border_before {
                 before += group - paid + i64::from(look.pad_before);
                 group = 0;
                 paid = 0;
@@ -3072,16 +3781,34 @@ impl<'a> Html<'a> {
         if depth != self.table_depth || self.out.flow_len(in_table).is_none_or(|n| n <= at) {
             return;
         }
+        // Its bottom line goes on the last paragraph in it that shows
+        // anything (#1883 r3, r4: a table or a hidden paragraph after it is
+        // passed over), unless a block inside it, closed first, gave that
+        // paragraph its own.
+        if let Some(bottom) = e.look.own_bottom {
+            if let Some(p) = self.out.last_shown_para_mut(in_table, at) {
+                p.borders.bottom.get_or_insert(bottom);
+            }
+        }
+        let e = &self.elems[j];
         let Some(tail) = self.out.tail(in_table) else {
             return;
         };
         let (margin, pad, ua) = (e.look.margin_after, e.look.pad_after, e.look.ua_after);
+        // A bottom line separates as padding does (#1883).
+        let sep = e.look.border_after;
         let quirky =
             self.quirks && ua > 0 && e.kind == Kind::Block && self.bottom_unseparated(j, in_table);
-        let (after, open) = fold_bottom(tail.after, tail.open, margin, pad);
+        let (after, open) = fold_bottom(tail.after, tail.open, margin, pad, sep);
         let bare = match tail.bare {
-            Some((a, o)) => Some(fold_bottom(a, o, margin - if quirky { ua } else { 0 }, pad)),
-            None if quirky => Some(fold_bottom(tail.after, tail.open, margin - ua, pad)),
+            Some((a, o)) => Some(fold_bottom(
+                a,
+                o,
+                margin - if quirky { ua } else { 0 },
+                pad,
+                sep,
+            )),
+            None if quirky => Some(fold_bottom(tail.after, tail.open, margin - ua, pad, sep)),
             None => None,
         };
         if let Some(p) = self.out.flow_last_mut(in_table) {
@@ -3109,7 +3836,15 @@ impl<'a> Html<'a> {
         let Some(look) = self.para_look() else {
             return p;
         };
-        p.align = look.align.unwrap_or_default();
+        // A bidi paragraph's `w:jc` left and right are its start and end
+        // (#1883): a visual `left` or `right` is swapped, a logical `start`
+        // or `end` is not, and none stays none (the start).
+        p.rtl = look.rtl;
+        p.align = match look.align {
+            Some(Align::Left) if look.rtl && !look.align_logical => Align::Right,
+            Some(Align::Right) if look.rtl && !look.align_logical => Align::Left,
+            a => a.unwrap_or_default(),
+        };
         // `before` and `after` stay 0 here: the paragraph's flow sets them
         // from the boxes it is the first and the last paragraph of
         // ([`Self::top_spacing`], [`Self::apply_bottom`], #2114).
@@ -3149,6 +3884,22 @@ impl<'a> Html<'a> {
             }
         }
         p.indent_right = look.indent_right.max(0);
+        if look.borders.any() {
+            // A left or right line's `w:space` is what is between it and
+            // this paragraph's text (#1883), in whole points up to Word's 31.
+            let space = |gap: i32, b: &ParBorder| {
+                let gap = f64::from(gap) - f64::from(b.sz) * 2.5;
+                (gap / 20.0).round().clamp(0.0, 31.0) as u16
+            };
+            let mut b = look.borders;
+            if let Some(l) = b.left.as_mut() {
+                l.space = space(p.indent - look.border_left_x, l);
+            }
+            if let Some(r) = b.right.as_mut() {
+                r.space = space(p.indent_right - look.border_right_x, r);
+            }
+            p.borders = b;
+        }
         if let Some(fill) = &look.shade {
             p.raw_props.push(shd(fill));
         }
@@ -3236,8 +3987,26 @@ impl<'a> Html<'a> {
         }
         // Only spaces (Word's `&nbsp;` in an empty paragraph) is empty; a
         // picture is content (#1880).
-        if !self.out.has_object() && self.out.para_text().chars().all(|c| c.is_whitespace()) {
+        if !self.out.has_object()
+            && !self.out.has_page_break()
+            && self.out.para_text().chars().all(|c| c.is_whitespace())
+        {
             self.out.clear_para();
+        }
+        // A paragraph that shows nothing (hidden) takes neither a forced
+        // break nor a box's top: they wait for the next that shows (r4).
+        let shows = self.out.para_shows(crate::import::mark_vanish(&props));
+        if self.page_break_before(in_table) {
+            if shows {
+                props.raw_props.push(PAGE_BREAK_BEFORE.to_string());
+            } else {
+                self.break_pending = true;
+            }
+        }
+        if shows {
+            if let Some(top) = self.take_top() {
+                props.borders.top = Some(top);
+            }
         }
         props.spacing.before = Some(self.top_spacing(in_table));
         self.out.end_para(props, in_table);
@@ -3363,6 +4132,40 @@ fn find_ci(hay: &str, lower_needle: &str) -> Option<usize> {
 /// character references decoded.
 fn attrs_of(attrs: &str) -> Attrs {
     let mut out = Attrs::default();
+    each_attr(attrs, |key, value| {
+        let slot = match key.to_ascii_lowercase().as_str() {
+            "style" => Some(&mut out.style),
+            "class" => Some(&mut out.class),
+            "id" => Some(&mut out.id),
+            "align" => Some(&mut out.align),
+            "color" => Some(&mut out.color),
+            "face" => Some(&mut out.face),
+            "size" => Some(&mut out.size),
+            "width" => Some(&mut out.width),
+            "bgcolor" => Some(&mut out.bgcolor),
+            "border" => Some(&mut out.border),
+            "cellpadding" => Some(&mut out.cellpadding),
+            "cellspacing" => Some(&mut out.cellspacing),
+            "colspan" => Some(&mut out.colspan),
+            "rowspan" => Some(&mut out.rowspan),
+            "valign" => Some(&mut out.valign),
+            "src" => Some(&mut out.src),
+            "alt" => Some(&mut out.alt),
+            "height" => Some(&mut out.height),
+            "href" => Some(&mut out.href),
+            "dir" => Some(&mut out.dir),
+            _ => None,
+        };
+        if let Some(slot) = slot.filter(|s| s.is_none()) {
+            *slot = Some(attr_entities(value));
+        }
+    });
+    out
+}
+
+/// Each `name[=value]` of a tag's attribute text, in order, its value
+/// unquoted (empty when none is given).
+fn each_attr(attrs: &str, mut f: impl FnMut(&str, &str)) {
     let bytes = attrs.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -3400,36 +4203,13 @@ fn attrs_of(attrs: &str) -> Attrs {
                 value = &attrs[vs..i];
             }
         }
-        let slot = match key.to_ascii_lowercase().as_str() {
-            "style" => Some(&mut out.style),
-            "class" => Some(&mut out.class),
-            "id" => Some(&mut out.id),
-            "align" => Some(&mut out.align),
-            "color" => Some(&mut out.color),
-            "face" => Some(&mut out.face),
-            "size" => Some(&mut out.size),
-            "width" => Some(&mut out.width),
-            "bgcolor" => Some(&mut out.bgcolor),
-            "border" => Some(&mut out.border),
-            "cellpadding" => Some(&mut out.cellpadding),
-            "cellspacing" => Some(&mut out.cellspacing),
-            "colspan" => Some(&mut out.colspan),
-            "rowspan" => Some(&mut out.rowspan),
-            "valign" => Some(&mut out.valign),
-            "src" => Some(&mut out.src),
-            "alt" => Some(&mut out.alt),
-            "height" => Some(&mut out.height),
-            "href" => Some(&mut out.href),
-            _ => None,
-        };
-        if let Some(slot) = slot.filter(|s| s.is_none()) {
-            *slot = Some(attr_entities(value));
+        if !key.is_empty() {
+            f(key, value);
         }
         if i == start {
             i += 1;
         }
     }
-    out
 }
 
 /// The link an `href` (its character references decoded) makes (#1879),
@@ -4694,6 +5474,757 @@ mod tests {
         assert!(bold.props.raw_props.is_empty());
         assert!(run_of(&d, "body").props.raw_props.is_empty());
         assert!(run_of(&d, "default").props.raw_props.is_empty());
+    }
+
+    /// `d` saved and loaded again.
+    fn reloaded(d: &Document) -> Document {
+        let xml = format!(
+            "<w:document xmlns:w=\"w\"><w:body>{}</w:body></w:document>",
+            crate::serialize::blocks_to_xml(&d.body)
+        );
+        crate::load::parse_document_xml(&xml, &crate::load::Relationships::default())
+    }
+
+    #[test]
+    fn style_block_sibling_attribute_and_pseudo_rules_apply_1883() {
+        let d = doc(
+            "<html><head><style>a:link {color:#FF0000} td[align=center] {font-weight:bold}\
+             p:first-child {font-style:italic} h1 + p {text-decoration:underline}\
+             :root {font-family:Georgia} a[href^='mailto:' i] {color:#00FF00}\
+             p.MsoNormal + p.MsoNormal {color:#0000FF}</style></head>\
+             <body><div><p>first</p><p>second</p></div><h1>title</h1><p>adjacent</p>\
+             <p>later</p><table><tr><td align=Center>cell</td><td>plain cell</td></tr></table>\
+             <p><a href='http://x.example'>web</a> <a href='MAILTO:a@b.example'>mail</a>\
+             <a name=x>anchor</a></p>\
+             <p class=MsoNormal>one</p><p class=MsoNormal>two</p></body></html>",
+        );
+        let r = |t: &str| run_of(&d, t).props;
+        assert!(r("first").italic && !r("second").italic);
+        assert!(r("adjacent").underline && !r("later").underline);
+        assert!(r("cell").bold && !r("plain cell").bold);
+        assert_eq!(r("web").color.as_deref(), Some("FF0000"));
+        assert_eq!(r("mail").color.as_deref(), Some("00FF00"));
+        assert_ne!(r("anchor").color.as_deref(), Some("FF0000"));
+        // `:root` is the `html` element; its font reaches every run.
+        assert_eq!(r("later").font.as_deref(), Some("Georgia"));
+        assert_ne!(r("one").color.as_deref(), Some("0000FF"));
+        assert_eq!(r("two").color.as_deref(), Some("0000FF"));
+    }
+
+    #[test]
+    fn void_and_raw_text_elements_are_siblings_1883() {
+        // A `br`, `img` or `style` between is an element sibling, as in a
+        // browser's DOM; text is not.
+        let d = doc(
+            "<style>h1 + p {color:#FF0000} p:first-child {font-style:italic}</style>\
+             <h1>a</h1>text<p>after text</p>\
+             <h1>b</h1><br><p>after br</p>\
+             <h1>c</h1><img src=x.png><p>after img</p>\
+             <div><style>.x {}</style><p>after style</p></div>\
+             <div>text <p>first child</p></div>",
+        );
+        let r = |t: &str| run_of(&d, t).props;
+        assert_eq!(r("after text").color.as_deref(), Some("FF0000"));
+        assert_ne!(r("after br").color.as_deref(), Some("FF0000"));
+        assert_ne!(r("after img").color.as_deref(), Some("FF0000"));
+        assert!(!r("after style").italic);
+        assert!(r("first child").italic);
+    }
+
+    #[test]
+    fn long_sibling_runs_stay_within_the_budget_1883() {
+        // 30 000 paragraphs under one parent, a `+` rule that never matches
+        // and one that always does: still a document.
+        let mut page = String::from(
+            "<style>h1 + p {color:#FF0000} p + p {font-style:italic}\
+             p:first-child + p + p {font-weight:bold}</style><div>",
+        );
+        for i in 0..30_000 {
+            page.push_str(&format!("<p>p{i}</p>"));
+        }
+        page.push_str("</div>");
+        let d = doc(&page);
+        assert_eq!(paras(&d).len(), 30_000);
+        assert!(!run_of(&d, "p0").props.italic);
+        assert!(run_of(&d, "p29999").props.italic);
+        assert!(run_of(&d, "p2").props.bold && !run_of(&d, "p3").props.bold);
+        assert_eq!(run_of(&d, "p1").props.color, None);
+    }
+
+    #[test]
+    fn long_attribute_values_are_present_but_never_compared_1883() {
+        // r1 M1: deep nesting of elements with huge attribute values under a
+        // sheet that tests them, and many paragraphs below: a value past
+        // the cap is never copied or compared, so the import is quick, and
+        // `[title]` still matches.
+        let big = "z".repeat(60 * 1024);
+        let mut page = String::from(
+            "<style>[title*=zz] p {color:#FF0000} [title] p {font-weight:bold}\
+             [title=short] p {font-style:italic}</style>",
+        );
+        for _ in 0..200 {
+            page.push_str(&format!("<div title='{big}'>"));
+        }
+        page.push_str("<div title=short>");
+        for i in 0..3000 {
+            page.push_str(&format!("<p>p{i}</p>"));
+        }
+        let start = std::time::Instant::now();
+        let d = doc(&page);
+        assert!(start.elapsed().as_secs() < 20, "{:?}", start.elapsed());
+        assert_eq!(paras(&d).len(), 3000);
+        let p = run_of(&d, "p2999").props;
+        assert!(p.bold && p.italic);
+        assert_eq!(p.color, None, "a value past the cap is never tested");
+    }
+
+    /// Which of `texts`' paragraphs have a top line, a bottom line, and
+    /// left and right ones.
+    fn box_sides(d: &Document, texts: &[&str]) -> Vec<(bool, bool, bool)> {
+        texts
+            .iter()
+            .map(|t| {
+                let b = para_of(d, t).props.borders;
+                (
+                    b.top.is_some(),
+                    b.bottom.is_some(),
+                    b.left.is_some() && b.right.is_some(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_box_s_top_and_bottom_are_on_its_first_and_last_paragraphs_1883() {
+        // r3 M1: a box around paragraphs of different indents (a list) is
+        // one box: a top once, a bottom once, the sides on every line.
+        let d = doc(
+            "<div style='border:1px solid #cccccc;padding:6px'><p>Intro</p>\
+             <ul><li>one</li><li>two</li></ul><p>End</p></div><p>after</p>",
+        );
+        assert_eq!(
+            box_sides(&d, &["Intro", "one", "two", "End"]),
+            [
+                (true, false, true),
+                (false, false, true),
+                (false, false, true),
+                (false, true, true),
+            ]
+        );
+        assert!(para_of(&d, "after").props.borders.is_empty());
+        // A ruled title inside a box: its own bottom, and the box's top
+        // on it alone; the box's bottom on the last paragraph.
+        let d = doc("<div style='border:1px solid #cccccc'>\
+             <p style='border-bottom:2px solid #333333'>Title</p><p>Body</p></div>");
+        assert_eq!(
+            box_sides(&d, &["Title", "Body"]),
+            [(true, true, true), (false, true, true)]
+        );
+        let title = para_of(&d, "Title").props.borders;
+        assert_eq!(
+            title.bottom.map(|b| (b.sz, b.color)),
+            Some((12, Some(0x333333)))
+        );
+        assert_eq!(title.top.map(|b| b.color), Some(Some(0xCCCCCC)));
+        let body = para_of(&d, "Body").props.borders;
+        assert_eq!(body.bottom.map(|b| b.color), Some(Some(0xCCCCCC)));
+    }
+
+    #[test]
+    fn a_box_s_lines_pass_over_tables_cards_and_hidden_paragraphs_1883() {
+        // r4 M1, m1: the top goes on the first paragraph in the box that
+        // shows anything, the bottom on the last, past a table, a card or
+        // a hidden paragraph at either end.
+        let boxed = |inner: &str| {
+            doc(&format!(
+                "<div style='border:1px solid #cccccc'>{inner}</div><p>outside</p>"
+            ))
+        };
+        let d = boxed("<table><tr><td>cell</td></tr></table><p>Note</p>");
+        assert_eq!(box_sides(&d, &["Note"]), [(true, true, true)]);
+        assert!(para_of(&d, "cell").props.borders.is_empty());
+        let d = boxed("<p>Order</p><table><tr><td>row</td></tr></table>");
+        assert_eq!(box_sides(&d, &["Order"]), [(true, true, true)]);
+        assert!(para_of(&d, "row").props.borders.is_empty());
+        assert!(para_of(&d, "outside").props.borders.is_empty());
+        // A hidden preheader first and an `mso-hide` block last.
+        let d = boxed(
+            "<div style='display:none'>preheader</div><p>First</p><p>Last</p>\
+             <div style='mso-hide:all'>hidden end</div>",
+        );
+        assert_eq!(
+            box_sides(&d, &["preheader", "First", "Last", "hidden end"]),
+            [
+                (false, false, true),
+                (true, false, true),
+                (false, true, true),
+                (false, false, true),
+            ]
+        );
+        // A card at a box's start, in a cell: its own flow takes nothing.
+        let d = doc("<table><tr><td><div style='border:1px solid #cccccc'>\
+             <div style='background:#eeeeee'>card</div><p>after card</p></div>\
+             </td></tr></table>");
+        assert_eq!(box_sides(&d, &["after card"]), [(true, true, true)]);
+        assert!(para_of(&d, "card").props.borders.is_empty());
+        // A box holding only a table loses its lines (a known limit).
+        let d = boxed("<table><tr><td>only</td></tr></table>");
+        assert!(para_of(&d, "only").props.borders.is_empty());
+        assert!(para_of(&d, "outside").props.borders.is_empty());
+    }
+
+    #[test]
+    fn a_paragraph_with_only_hidden_text_still_shows_1883() {
+        // r5 m4: as Word and the suite collapse a paragraph only when its
+        // mark is hidden too, a shown `p` holding only hidden text is a
+        // line, and takes the box's top.
+        let d = doc("<div style='border:1px solid #cccccc'>\
+             <p><span style='display:none'>pre</span></p><p>Body</p></div>");
+        let first = all_paras(&d)
+            .into_iter()
+            .find(|p| p.plain_text().contains("pre"))
+            .expect("the hidden text's paragraph");
+        assert!(first.props.borders.top.is_some());
+        assert_eq!(box_sides(&d, &["Body"]), [(false, true, true)]);
+    }
+
+    #[test]
+    fn partial_alpha_colours_blend_over_white_1883() {
+        // r5 m3: a faint shading or text colour is drawn as on a white
+        // page, not as the opaque colour.
+        let d = doc("<p style='background-color:hsla(0,0%,0%,0.04)'>shaded</p>\
+             <p><span style='background:rgba(0,0,0,0.04)'>run</span> \
+             <span style='color:rgba(0,0,0,.5)'>grey</span> \
+             <span style='color:rgba(0,0,0,0)'>none</span></p>");
+        assert!(has_shd(&para_of(&d, "shaded").props.raw_props, "F5F5F5"));
+        assert!(has_shd(&run_of(&d, "run").props.raw_props, "F5F5F5"));
+        assert_eq!(run_of(&d, "grey").props.color.as_deref(), Some("808080"));
+        assert_eq!(run_of(&d, "none").props.color, None);
+    }
+
+    #[test]
+    fn sibling_bordered_blocks_group_as_word_draws_them_1883() {
+        // r2 (planner's decision): Word, and classic Outlook through it,
+        // joins consecutive paragraphs with equal borders and indents into
+        // one box, so two sibling ruled paragraphs are one box there (a
+        // browser draws two). The import writes what both read: equal
+        // borders, no mark.
+        let d = doc("<p style='border-bottom:1px solid #dddddd'>A</p>\
+             <p style='border-bottom:1px solid #dddddd'>B</p>\
+             <div style='border:1px solid #cccccc'><p>box one</p><p>box two</p></div>");
+        let b = |t: &str| para_of(&d, t).props.borders;
+        assert_eq!(b("A"), b("B"));
+        // A box's top is on its first paragraph only, its bottom on its
+        // last (r3); its sides on both.
+        let (one, two) = (b("box one"), b("box two"));
+        assert!(one.top.is_some() && one.bottom.is_none());
+        assert!(two.top.is_none() && two.bottom.is_some());
+        assert_eq!((one.left, one.right), (two.left, two.right));
+        for t in ["A", "B", "box one", "box two"] {
+            assert_eq!(b(t).nil, 0, "{t}");
+        }
+        let xml = crate::serialize::blocks_to_xml(&d.body);
+        assert!(!xml.contains("w:between"), "{xml}");
+    }
+
+    #[test]
+    fn many_elements_with_sibling_and_attribute_rules_import_1883() {
+        // r2 m1: an element's key, and the 32 last children's a parent
+        // keeps, are work, not memory built: a long page is no TOO_BIG.
+        let mut page =
+            String::from("<style>b + b {color:#FF0000} b[title^=t] {font-style:italic}</style><p>");
+        for i in 0..200_000 {
+            page.push_str(&format!("<b title=t{i}>{i} </b>"));
+        }
+        page.push_str("</p>");
+        // It builds under 2 MB; charging each key as memory built (about
+        // 280 bytes an element) would pass 16 MB.
+        let budget = Budget::with_built(
+            crate::import::MAX_DECODED,
+            crate::import::MAX_WORK,
+            16 << 20,
+        );
+        let d = import_html_within(page.as_bytes(), &budget, None)
+            .expect("not too big")
+            .document;
+        let last = run_of(&d, "199999").props;
+        assert_eq!(last.color.as_deref(), Some("FF0000"));
+        assert!(last.italic && last.bold);
+        assert_eq!(run_of(&d, "0 ").props.color, None);
+    }
+
+    #[test]
+    fn gmail_blockquote_border_left_is_a_paragraph_border_1883() {
+        let d = doc("<div dir=ltr>reply</div><div class=gmail_quote>\
+             <div dir=ltr class=gmail_attr>On Monday someone wrote:<br></div>\
+             <blockquote class=gmail_quote style='margin:0px 0px 0px 0.8ex;\
+             border-left:1px solid rgb(204,204,204);padding-left:1ex'>\
+             <div dir=ltr>quoted one</div><div>quoted two</div>\
+             <ul><li>item</li></ul></blockquote></div><p>after</p>");
+        let one = para_of(&d, "quoted one").props;
+        let left = one.borders.left.expect("a left line");
+        assert_eq!(
+            (left.kind, left.sz, left.color),
+            (BorderKind::Single, 6, Some(0xCCCCCC))
+        );
+        assert!(one.borders.top.is_none() && one.borders.bottom.is_none());
+        assert!(one.borders.right.is_none());
+        // Text at margin + line + padding (0.8ex + 1px + 1ex of 12 pt);
+        // the padding is the line's space.
+        assert_eq!(one.indent, 96 + 15 + 120);
+        assert_eq!(left.space, 6);
+        // Every paragraph in it carries it; an item's text is further in,
+        // so its space grows (to Word's 31 pt) and the line stays put.
+        assert_eq!(para_of(&d, "quoted two").props.borders, one.borders);
+        let item = para_of(&d, "item").props;
+        assert_eq!(item.borders.left.map(|l| l.space), Some(31));
+        for t in ["reply", "On Monday", "after"] {
+            assert!(para_of(&d, t).props.borders.is_empty(), "{t}");
+        }
+        let back = reloaded(&d);
+        assert_eq!(para_of(&back, "quoted one").props.borders.left, Some(left));
+    }
+
+    #[test]
+    fn outlook_reply_header_border_top_1883() {
+        let d = doc("<style>p.MsoNormal {margin:0in}</style>\
+             <div style='border:none;border-left:solid #CCCCCC 1.0pt;\
+             padding:0in 0in 0in 6.0pt;margin-left:4.8pt;margin-right:0in'>\
+             <div><div style='border:none;border-top:solid #E1E1E1 1.0pt;\
+             padding:3.0pt 0in 0in 0in'>\
+             <p class=MsoNormal><b>From:</b> A</p><p class=MsoNormal><b>Sent:</b> B</p>\
+             </div></div><p class=MsoNormal>body</p></div>");
+        let from = para_of(&d, "From:").props;
+        let top = from.borders.top.expect("a top line");
+        assert_eq!((top.sz, top.space, top.color), (8, 3, Some(0xE1E1E1)));
+        // The outer box's left line goes on through the header (one side
+        // each, merged), at the outer box's place.
+        let left = from.borders.left.expect("the outer left line");
+        assert_eq!((left.sz, left.color), (8, Some(0xCCCCCC)));
+        assert_eq!(from.indent, 96 + 20 + 120);
+        assert_eq!(left.space, 6);
+        // The 3 pt padding is the line's space, not spacing.
+        assert_eq!(from.spacing.before, Some(0));
+        // The header's top line is on its first paragraph only (r3).
+        let sent = para_of(&d, "Sent:").props.borders;
+        assert_eq!(sent.left, from.borders.left);
+        assert!(sent.top.is_none() && sent.bottom.is_none());
+        let body = para_of(&d, "body").props;
+        assert!(body.borders.top.is_none());
+        assert_eq!(body.borders.left, from.borders.left);
+    }
+
+    #[test]
+    fn word_s_ruled_paragraph_keeps_its_box_1883() {
+        // Word's own HTML: the box on a `div`, `border:none` on the `p`.
+        let d = doc(
+            "<div style='border:none;border-bottom:solid windowtext 1.0pt;\
+             padding:0in 0in 1.0pt 0in'>\
+             <p class=MsoNormal style='border:none;padding:0in'>ruled</p></div><p>plain</p>",
+        );
+        let b = para_of(&d, "ruled").props.borders;
+        let bottom = b.bottom.expect("the box's bottom");
+        assert_eq!((bottom.sz, bottom.space, bottom.color), (8, 1, None));
+        assert!(b.top.is_none() && b.left.is_none() && b.right.is_none());
+        assert!(para_of(&d, "plain").props.borders.is_empty());
+    }
+
+    #[test]
+    fn border_none_and_missing_style_draw_nothing_1883() {
+        let d = doc(
+            "<p style='border:1px red'>nostyle</p><p style='border:none'>none</p>\
+             <p style='border-left:0 solid red'>zero</p>\
+             <p style='border:1px solid red;border-style:none'>longhand</p>\
+             <p style='border-top:solid;border-top-color:blue;border-top-width:2px'>longs</p>",
+        );
+        for t in ["nostyle", "none", "zero", "longhand"] {
+            assert!(para_of(&d, t).props.borders.is_empty(), "{t}");
+        }
+        let top = para_of(&d, "longs").props.borders.top.unwrap();
+        assert_eq!((top.sz, top.color), (12, Some(0x0000FF)));
+        // A transparent colour hides a line the cascade gave earlier (r3).
+        let d = doc("<style>.box {border:1px solid #dddddd}</style>\
+             <div class=box style='border:1px solid transparent'>shorthand</div>\
+             <div style='border:2px solid #cccccc;border-bottom-color:transparent'>bottom</div>\
+             <div style='border-style:solid;border-color:transparent'>all</div>\
+             <div style='border-bottom:1px solid rgba(0,0,0,0.1)'>faint</div>");
+        assert!(para_of(&d, "shorthand").props.borders.is_empty());
+        let bottom = para_of(&d, "bottom").props.borders;
+        assert!(bottom.bottom.is_none() && bottom.top.is_some());
+        assert!(para_of(&d, "all").props.borders.is_empty());
+        let faint = para_of(&d, "faint").props.borders.bottom.unwrap();
+        assert_eq!(faint.color, Some(0xE6E6E6));
+    }
+
+    #[test]
+    fn cell_card_and_inline_borders_stay_ignored_1883() {
+        let d = doc("<div style='border-left:1px solid red'><p>outer</p>\
+             <table><tr><td style='border:1px solid red'><p>cell</p></td>\
+             <td><div style='background:#eeeeee;border:1px solid red'>card</div></td></tr></table>\
+             <p>x <span style='border:1px solid red'>inline</span></p></div>");
+        assert!(para_of(&d, "outer").props.borders.left.is_some());
+        assert!(para_of(&d, "cell").props.borders.is_empty());
+        assert!(para_of(&d, "card").props.borders.is_empty());
+        // The inline element's own is ignored; its paragraph keeps the
+        // block's.
+        let p = para_of(&d, "inline").props;
+        assert!(p.borders.left.is_some() && p.borders.top.is_none());
+    }
+
+    #[test]
+    fn top_and_bottom_lines_separate_margins_1883() {
+        // Without the line the margins collapse (20 px); with it they add
+        // up (20 + 10 px), as padding would.
+        let page = |b: &str| {
+            doc(&format!(
+                "<!DOCTYPE html><p style='margin:0'>a</p>\
+                 <div style='margin:20px 0;{b}'><p style='margin:10px 0'>x</p></div>\
+                 <p style='margin:0'>b</p>"
+            ))
+        };
+        let d = page("");
+        assert_eq!(para_of(&d, "x").props.spacing.before, Some(300));
+        assert_eq!(para_of(&d, "x").props.spacing.after, Some(300));
+        let d = page("border-top:1px solid;border-bottom:1px solid");
+        let x = para_of(&d, "x").props;
+        assert_eq!(x.spacing.before, Some(450));
+        assert_eq!(x.spacing.after, Some(450));
+        assert!(x.borders.top.is_some() && x.borders.bottom.is_some());
+    }
+
+    #[test]
+    fn dir_rtl_is_paragraph_bidi_and_swaps_alignment_1883() {
+        let d = doc(
+            "<p dir=RTL style='text-align:right;direction:rtl;unicode-bidi:embed'>outlook</p>\
+             <div dir='rtl'><p>plain</p><p align=left>visual left</p>\
+             <p style='text-align:start'>start</p><p style='text-align:end'>end</p>\
+             <p style='text-align:center'>centre</p><p dir=ltr>back</p>\
+             <p dir=auto>auto</p></div>\
+             <p style='direction:rtl;text-align:left'>css</p><p>ltr</p>\
+             <p>text <span dir=rtl>inline</span></p>",
+        );
+        let at = |t: &str| {
+            let p = para_of(&d, t).props;
+            (p.rtl, p.align)
+        };
+        // Outlook's own markup: a right-aligned rtl paragraph is at its
+        // start, Word's `left` of a bidi paragraph.
+        assert_eq!(at("outlook"), (true, Align::Left));
+        assert_eq!(at("plain"), (true, Align::Left));
+        assert_eq!(at("visual left"), (true, Align::Right));
+        assert_eq!(at("start"), (true, Align::Left));
+        assert_eq!(at("end"), (true, Align::Right));
+        assert_eq!(at("centre"), (true, Align::Center));
+        assert_eq!(at("back"), (false, Align::Left));
+        assert_eq!(at("auto"), (true, Align::Left));
+        assert_eq!(at("css"), (true, Align::Right));
+        assert_eq!(at("ltr"), (false, Align::Left));
+        // An inline element's direction is not its paragraph's.
+        assert_eq!(at("inline"), (false, Align::Left));
+        let back = reloaded(&d);
+        assert!(para_of(&back, "outlook").props.rtl);
+        assert_eq!(para_of(&back, "visual left").props.align, Align::Right);
+    }
+
+    #[test]
+    fn letter_spacing_is_run_spacing_1883() {
+        let d = doc(
+            "<p style='letter-spacing:1px'>wide <span style='font-size:20pt'>inherited</span> \
+             <span style='letter-spacing:0.1em;font-size:20pt'>em</span> \
+             <span style='letter-spacing:normal'>normal</span> \
+             <span style='letter-spacing:-0.5pt'>tight</span></p>",
+        );
+        let sp = |t: &str| {
+            run_of(&d, t)
+                .props
+                .raw_props
+                .into_iter()
+                .filter(|r| r.starts_with("<w:spacing "))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sp("wide"), ["<w:spacing w:val=\"15\"/>"]);
+        // Inherited as the absolute length it computed to.
+        assert_eq!(sp("inherited"), ["<w:spacing w:val=\"15\"/>"]);
+        // An em in the element's own (final) font: 0.1 × 20 pt.
+        assert_eq!(sp("em"), ["<w:spacing w:val=\"40\"/>"]);
+        assert!(sp("normal").is_empty());
+        assert_eq!(sp("tight"), ["<w:spacing w:val=\"-10\"/>"]);
+        let back = reloaded(&d);
+        let xml = crate::serialize::rpr_xml(&run_of(&back, "em").props);
+        assert!(xml.contains("<w:spacing w:val=\"40\"/>"), "{xml}");
+    }
+
+    #[test]
+    fn text_transform_and_small_caps_1883() {
+        let d = doc(
+            "<p style='text-transform:uppercase'>up <span style='text-transform:none'>none</span>\
+             <span style='text-transform:lowercase'>lower</span></p>\
+             <p style='font-variant:small-caps'>small <span style='font-variant:normal'>plain</span>\
+             <span style='font:12px Arial'>reset</span></p>\
+             <p><span style='font-variant-caps:all-small-caps'>caps2</span>\
+             <span style='font:small-caps bold 12px Arial'>short</span></p>",
+        );
+        let r = |t: &str| run_of(&d, t).props;
+        assert!(r("up").caps);
+        assert!(!r("none").caps && !r("lower").caps);
+        assert!(r("small").small_caps);
+        assert!(!r("plain").small_caps);
+        // The `font` shorthand resets the variant, or sets it.
+        assert!(!r("reset").small_caps);
+        assert!(r("caps2").small_caps);
+        assert!(r("short").small_caps && r("short").bold);
+        // A quirks-mode table resets `font-variant` (not `text-transform`).
+        let d = doc(
+            "<body style='font-variant:small-caps;text-transform:uppercase'>\
+             <table><tr><td>cell</td></tr></table></body>",
+        );
+        let cell = run_of(&d, "cell").props;
+        assert!(!cell.small_caps && cell.caps);
+    }
+
+    #[test]
+    fn visibility_and_display_are_last_wins_vanish_1883() {
+        let d = doc("<style>.h {display:none} .v {visibility:hidden}</style>\
+             <p class=h style='display:block'>shown block</p>\
+             <div style='display:none'><p style='visibility:visible'>still hidden</p></div>\
+             <div class=v><p>invisible <span style='visibility:visible'>visible again</span></p></div>\
+             <p style='visibility:collapse'>collapsed</p>\
+             <div style='mso-hide:all'><p style='display:block'>outlook hidden</p></div>\
+             <p>plain</p>");
+        let hidden = |t: &str| run_of(&d, t).props.vanish;
+        assert!(!hidden("shown block"));
+        assert!(hidden("still hidden"));
+        assert!(hidden("invisible"));
+        assert!(!hidden("visible again"));
+        assert!(hidden("collapsed"));
+        assert!(hidden("outlook hidden"));
+        assert!(!hidden("plain"));
+        // The paragraph mark follows (#2249).
+        let mark = |t: &str| {
+            para_of(&d, t)
+                .props
+                .mark_run_props()
+                .is_some_and(|m| m.vanish)
+        };
+        assert!(mark("collapsed") && !mark("shown block"));
+    }
+
+    #[test]
+    fn white_space_pre_keeps_spaces_and_breaks_1883() {
+        let d = doc("<div style='white-space:pre-wrap'>a  b\nc</div>\
+             <div style='white-space:pre'><span style='white-space:normal'>x  y\nz</span></div>\
+             <p style='white-space:nowrap'>n  o\np</p>");
+        let texts = paragraph_texts(&d);
+        assert!(texts.contains(&"a  b\nc".to_string()), "{texts:?}");
+        assert!(texts.contains(&"x y z".to_string()), "{texts:?}");
+        assert!(texts.contains(&"n o p".to_string()), "{texts:?}");
+    }
+
+    fn breaks_page(p: &Paragraph) -> bool {
+        p.props.raw_props.iter().any(|r| r == PAGE_BREAK_BEFORE)
+    }
+
+    #[test]
+    fn page_break_before_and_after_on_blocks_1883() {
+        let d = doc("<p style='page-break-before:always'>first</p>\
+             <div style='break-before:page'><p>one</p><p>two</p></div>\
+             <p style='page-break-after:always'>three</p><p>four</p>\
+             <p style='page-break-before:auto'>five</p>\
+             <div style='page-break-before:always'></div><p>six</p>\
+             <table><tr><td><p style='page-break-before:always'>cell</p></td></tr></table>\
+             <div style='break-after:page'>seven</div>\
+             <table><tr><td>table</td></tr></table><p>eight</p>\
+             <table><tr><td><p style='page-break-after:always'>x</p></td></tr></table>\
+             <p>nine</p>\
+             <div style='display:none;page-break-after:always'>hidden</div><p>ten</p>\
+             <div style='display:none;page-break-before:always'></div><p>eleven</p>\
+             <div style='break-before:page'><p style='display:none'>pre</p><p>twelve</p></div>\
+             <p style='page-break-after:always'>thirteen</p>\
+             <p style='mso-hide:all'>mso gone</p><p>fourteen</p>");
+        let b = |t: &str| breaks_page(&para_of(&d, t));
+        // None at the document's start, where a browser breaks no page.
+        assert!(!b("first"));
+        assert!(b("one") && !b("two"));
+        assert!(!b("three") && b("four"));
+        assert!(!b("five"));
+        // An empty block's break goes to the next paragraph.
+        assert!(b("six"));
+        // Never in a cell; a break after the block before a table is
+        // dropped (Word ignores it in a first cell).
+        assert!(!b("cell") && !b("table") && !b("eight"));
+        // A break after a block in a cell does not reach the paragraph
+        // after the table either (r1 m2).
+        assert!(!b("nine"));
+        // A hidden block breaks nothing (r3).
+        assert!(!b("ten") && !b("eleven"));
+        // A hidden paragraph passes a break on to the next that shows
+        // (r4).
+        assert!(!b("pre") && b("twelve"));
+        assert!(!b("mso gone") && b("fourteen"));
+        let back = reloaded(&d);
+        assert!(breaks_page(&para_of(&back, "one")));
+    }
+
+    #[test]
+    fn br_with_page_break_before_is_a_page_break_1883() {
+        // Word's HTML between two sections.
+        let d = doc(
+            "<div class=WordSection1><p class=MsoNormal>before</p></div>\
+             <span style='font-size:12.0pt'><br clear=all \
+             style='mso-special-character:line-break;page-break-before:always'></span>\
+             <div class=WordSection2><p class=MsoNormal>after</p></div>\
+             <p>line<br>break</p>",
+        );
+        let pages: Vec<usize> = all_paras(&d)
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| {
+                p.content
+                    .iter()
+                    .any(|i| matches!(i, Inline::Break(crate::model::BreakKind::Page, _)))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let texts = paragraph_texts(&d);
+        assert_eq!(pages.len(), 1, "{texts:?}");
+        let at = pages[0];
+        assert!(
+            texts[at - 1].contains("before") && texts[at + 1].contains("after"),
+            "{texts:?}"
+        );
+        // A plain `br` is still a line break.
+        assert!(texts.contains(&"line\nbreak".to_string()), "{texts:?}");
+        // A sheet's rule on `br` counts too.
+        let d = doc("<style>br.pb {page-break-before:always}</style><p>a<br class=pb>b</p>");
+        let p = para_of(&d, "a");
+        assert!(
+            p.content
+                .iter()
+                .any(|i| matches!(i, Inline::Break(crate::model::BreakKind::Page, _)))
+        );
+    }
+
+    #[test]
+    fn italic_off_is_explicit_under_a_heading_only_1883() {
+        let d = doc(
+            "<style>h4 {font-style:normal}</style><h4>head <em>em</em></h4>\
+             <p><span style='font-style:normal'>body</span></p>\
+             <h3><span style='font:normal 10pt Arial'>short</span></h3>\
+             <div style='font:normal 10pt Arial'><h5>outer</h5></div>\
+             <h2>default</h2>",
+        );
+        let off = "<w:i w:val=\"0\"/>".to_string();
+        let head = run_of(&d, "head");
+        assert!(!head.props.italic);
+        assert_eq!(head.props.raw_props, std::slice::from_ref(&off));
+        let em = run_of(&d, "em");
+        assert!(em.props.italic);
+        assert!(em.props.raw_props.is_empty(), "{:?}", em.props.raw_props);
+        assert!(run_of(&d, "body").props.raw_props.is_empty());
+        // A `font:` shorthand on or inside the heading is an off; an
+        // ancestor's is not (#1872 r1, as for bold).
+        assert!(run_of(&d, "short").props.raw_props.contains(&off));
+        let outer = run_of(&d, "outer");
+        assert!(
+            !outer.props.raw_props.contains(&off),
+            "{:?}",
+            outer.props.raw_props
+        );
+        assert!(run_of(&d, "default").props.raw_props.is_empty());
+        // Written in schema order beside the bold off.
+        let d = doc("<h1 style='font-weight:normal;font-style:normal'>both</h1>");
+        let x = crate::serialize::rpr_xml(&run_of(&d, "both").props);
+        let (b, i) = (x.find("<w:b ").unwrap(), x.find("<w:i ").unwrap());
+        assert!(b < i, "{x}");
+    }
+
+    #[test]
+    fn an_unclosed_head_ends_at_the_body_1883() {
+        // r3 p1: a missing `</head>` no longer swallows the page; the
+        // `<style>` in it still applies.
+        let d = doc("<html><head><title>x</title><style>p{color:red}</style>\
+             <body><p>Hello</p></body></html>");
+        assert_eq!(paragraph_texts(&d), ["Hello"]);
+        assert_eq!(run_of(&d, "Hello").props.color.as_deref(), Some("FF0000"));
+        // A `<header>` in the body after a closed head is untouched, and
+        // `</header` in a head is no `</head`.
+        let d = doc(
+            "<html><head><title>t</title></head><body><header><p>top</p></header>\
+             <p>after</p></body></html>",
+        );
+        assert_eq!(paragraph_texts(&d), ["top", "after"]);
+        let d = doc("<head><title>a </header> b</title></head><p>body</p>");
+        assert_eq!(paragraph_texts(&d), ["body"]);
+        // `<BODY>` and `</HEAD >` in any case and spacing.
+        let d = doc("<HEAD><TITLE>t</TITLE></HEAD ><P>one</P>");
+        assert_eq!(paragraph_texts(&d), ["one"]);
+        let d = doc("<head><meta charset=utf-8><BODY bgcolor=white><p>two</p>");
+        assert_eq!(paragraph_texts(&d), ["two"]);
+        // r4: a `<body>` in a script is no body; a flow element or text
+        // ends the head too, as in a browser.
+        let d = doc("<head><script>var s=\"<body>\";</script></head><p>x</p>");
+        assert_eq!(paragraph_texts(&d), ["x"]);
+        let d = doc("<head><title>t</title><p>x");
+        assert_eq!(paragraph_texts(&d), ["x"]);
+        let d = doc("<head><title>t</title>loose text<p>y</p>");
+        assert_eq!(paragraph_texts(&d), ["loose text", "y"]);
+        // Word's head: meta, a conditional comment with XML, a style.
+        let d = doc(
+            "<html><head><meta http-equiv=Content-Type content='text/html'>\
+             <link rel=File-List href=x.xml><!--[if gte mso 9]><xml><o:x>junk</o:x></xml>\
+             <![endif]--><style><!-- p.MsoNormal {color:red} --></style></head>\
+             <body><p class=MsoNormal>w</p></body></html>",
+        );
+        assert_eq!(paragraph_texts(&d), ["w"]);
+        assert_eq!(run_of(&d, "w").props.color.as_deref(), Some("FF0000"));
+    }
+
+    #[test]
+    fn many_heads_are_skipped_in_linear_time_1883() {
+        // r4 M2: each `head` is one forward scan of its own content, not of
+        // the rest of the page.
+        let mut page = "<head></head>".repeat(200_000);
+        page.push_str("<p>end</p>");
+        let start = std::time::Instant::now();
+        let d = doc(&page);
+        assert!(start.elapsed().as_secs() < 20, "{:?}", start.elapsed());
+        assert_eq!(paragraph_texts(&d), ["end"]);
+    }
+
+    #[test]
+    fn quirks_tables_reset_font_size_weight_and_style_1883() {
+        let body = "<body style='font-size:14px;font-weight:bold;font-style:italic;\
+                    font-family:Georgia;color:#336699'><p>out</p>\
+                    <table><tr><td>in</td></tr></table></body>";
+        // Quirks mode (no doctype): the table starts at medium, not bold,
+        // not italic; family and colour still inherit.
+        let d = doc(body);
+        let out = run_of(&d, "out").props;
+        assert_eq!(out.size_half_pts, Some(21));
+        assert!(out.bold && out.italic);
+        let inner = run_of(&d, "in").props;
+        assert_eq!(inner.size_half_pts, None);
+        assert!(!inner.bold && !inner.italic);
+        assert!(inner.raw_props.is_empty(), "{:?}", inner.raw_props);
+        assert_eq!(inner.font.as_deref(), Some("Georgia"));
+        assert_eq!(inner.color.as_deref(), Some("336699"));
+        // Standards mode inherits all of it.
+        let d = doc(&format!("<!DOCTYPE html>{body}"));
+        let inner = run_of(&d, "in").props;
+        assert_eq!(inner.size_half_pts, Some(21));
+        assert!(inner.bold && inner.italic);
+        // The table's own style and its cells' still apply over the reset.
+        let d = doc(
+            "<body style='font-size:20px'><table style='font-size:10px'><tr>\
+             <td style='font-weight:bold'>own</td><td><i>em</i></td></tr></table>\
+             <table><tr><td style='font-size:80%'>pct</td></tr></table></body>",
+        );
+        let own = run_of(&d, "own").props;
+        assert_eq!(own.size_half_pts, Some(15));
+        assert!(own.bold);
+        assert!(run_of(&d, "em").props.italic);
+        // A percentage on a cell is of the table's medium (12 pt).
+        assert_eq!(run_of(&d, "pct").props.size_half_pts, Some(19));
     }
 
     #[test]
