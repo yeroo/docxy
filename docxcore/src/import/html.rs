@@ -5474,7 +5474,16 @@ mod tests {
             page.push_str(&format!("<b title=t{i}>{i} </b>"));
         }
         page.push_str("</p>");
-        let d = doc(&page);
+        // It builds under 2 MB; charging each key as memory built (about
+        // 280 bytes an element) would pass 16 MB.
+        let budget = Budget::with_built(
+            crate::import::MAX_DECODED,
+            crate::import::MAX_WORK,
+            16 << 20,
+        );
+        let d = import_html_within(page.as_bytes(), &budget, None)
+            .expect("not too big")
+            .document;
         let last = run_of(&d, "199999").props;
         assert_eq!(last.color.as_deref(), Some("FF0000"));
         assert!(last.italic && last.bold);
