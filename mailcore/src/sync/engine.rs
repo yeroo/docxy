@@ -10190,6 +10190,8 @@ impl Engine {
         }
         let t = match attempt {
             SignInAttempt::Signed(t) => t,
+            // A shutdown during the wait (#2131): nothing more to do here.
+            SignInAttempt::Aborted => return,
             SignInAttempt::NotStarted if fell_back => {
                 self.sign_in_failed();
                 return;
@@ -10300,8 +10302,14 @@ impl Engine {
         self.emit(SyncEvent::SignInStarted {
             authorize_url: req.authorize_url.clone(),
         });
-        let code = match listen_for_code(&listener, &req.state, fallback, self.signin_timeout()) {
+        // The wait reads the channel on each poll (#2131): a `Shutdown`
+        // ends it, and the commands before it go to `deferred`, in order,
+        // as `take_waiting` does everywhere.
+        let timeout = self.signin_timeout();
+        let mut abort = || !self.take_waiting();
+        let code = match listen_for_code(&listener, &req.state, fallback, timeout, &mut abort) {
             Ok(code) => code,
+            Err(_) if self.shutting_down => return SignInAttempt::Aborted,
             Err(f) => {
                 return SignInAttempt::Failed {
                     text: f.message,
@@ -10735,12 +10743,14 @@ const SIGNIN_RETRY_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-
 /// Uses a non-blocking `accept` polled against a deadline rather than a
 /// dedicated timeout API (std's `TcpListener` has none) — simple, and the
 /// listener is only ever used for this one accept. `fallback` is passed to
-/// [`handle_redirect`].
+/// [`handle_redirect`]. `abort` is asked on each idle poll (#2131): `true`
+/// ends the wait with a failure (the engine is shutting down).
 fn listen_for_code(
     listener: &TcpListener,
     expected_state: &str,
     fallback: bool,
     timeout: Duration,
+    abort: &mut dyn FnMut() -> bool,
 ) -> Result<String, RedirectFailure> {
     listener.set_nonblocking(true).map_err(|e| {
         RedirectFailure::other(format!("could not configure sign-in listener: {e}"))
@@ -10750,6 +10760,9 @@ fn listen_for_code(
         match listener.accept() {
             Ok((stream, _addr)) => return handle_redirect(stream, expected_state, fallback),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if abort() {
+                    return Err(RedirectFailure::other("sign-in stopped by a shutdown"));
+                }
                 if Instant::now() >= deadline {
                     return Err(RedirectFailure::other(
                         "timed out waiting for the browser to complete sign-in",
@@ -10773,6 +10786,9 @@ enum SignInAttempt {
     /// No loopback listener: its `Error` is already sent, and no
     /// `SignInStarted`.
     NotStarted,
+    /// A `Shutdown` (or a dropped handle) ended the wait for the browser
+    /// (#2131): no retry, no event; `main_loop` persists what was kept.
+    Aborted,
     /// The redirect or the redemption failed: the text for
     /// `Error("sign-in failed: …")`, and whether it was a refusal for
     /// consent ([`auth::is_consent_refusal`]).
@@ -46691,6 +46707,128 @@ mod tests {
             want.sort();
             assert_eq!(both, want, "the two servers saw every id once");
             let _ = handle2.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// An idle signed-in engine on F1 holding `ids`, whose sign-in
+        /// waits `signin_timeout` for a browser, and the store beside it.
+        fn signin_engine(
+            srv: &FakeServer,
+            tag: &str,
+            ids: &[String],
+            signin_timeout: Duration,
+        ) -> (SyncHandle, Store, PathBuf) {
+            let dir = unique_dir(tag);
+            let store_path = dir.join("mail.db");
+            let token_path = dir.join("token.bin");
+            seed_token(&token_path);
+            let handle = spawn_with_bases_and_options(
+                store_path.clone(),
+                token_path,
+                test_cfg(),
+                3650,
+                srv.base_url.clone(),
+                srv.base_url.clone(),
+                Duration::from_secs(3600),
+                EngineOptions {
+                    signin_timeout,
+                    ..EngineOptions::without_prefetch()
+                },
+            );
+            wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::State(SyncState::Idle))
+            });
+            let store = Store::open(&store_path).unwrap();
+            assert_eq!(
+                store.messages_in_folder("F1", 50, 0).unwrap().len(),
+                ids.len()
+            );
+            (handle, store, dir)
+        }
+
+        /// #2131: an engine waiting for a sign-in's browser (no redirect
+        /// ever comes, the wait 30 s) reads its channel: writes then a
+        /// `Shutdown` (or a dropped handle) end the wait, the engine returns
+        /// within the bound with the writes queued, nothing sent, and no
+        /// second attempt.
+        fn shutdown_during_a_sign_in_wait(tag: &str, drop_handle: bool) {
+            let all = ids(2);
+            let mut routes = vec![route("DELETE", "/me/messages/", 204, "")];
+            routes.extend(inbox_routes(&all));
+            let srv = FakeServer::start(routes);
+            let (handle, store, dir) = signin_engine(&srv, tag, &all, Duration::from_secs(30));
+            let SyncHandle { cmd_tx, evt_rx } = handle;
+            cmd_tx.send(SyncCommand::SignIn).unwrap();
+            wait_for(&evt_rx, |e| matches!(e, SyncEvent::SignInStarted { .. }));
+            for id in &all {
+                cmd_tx.send(SyncCommand::Delete { id: id.clone() }).unwrap();
+            }
+            if drop_handle {
+                drop(cmd_tx);
+            } else {
+                cmd_tx.send(SyncCommand::Shutdown).unwrap();
+            }
+            let started = Instant::now();
+            returns_within(&evt_rx, RETURN_BOUND);
+            assert!(started.elapsed() < RETURN_BOUND);
+            assert!(
+                deletes(&srv).is_empty(),
+                "nothing sent: {:?}",
+                deletes(&srv)
+            );
+            let want: Vec<OutboxOp> = all
+                .iter()
+                .map(|id| OutboxOp::Delete { id: id.clone() })
+                .collect();
+            assert_eq!(queued(&store), want, "the writes are queued, in order");
+            assert!(store.messages_in_folder("F1", 50, 0).unwrap().is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_shutdown_ends_a_sign_in_wait_and_persists_the_writes() {
+            shutdown_during_a_sign_in_wait("shutdown-signin", false);
+        }
+
+        #[test]
+        fn a_dropped_handle_ends_a_sign_in_wait_and_persists_the_writes() {
+            shutdown_during_a_sign_in_wait("shutdown-signin-drop", true);
+        }
+
+        /// #2131 outside a shutdown: a write the sign-in wait took into
+        /// `deferred` runs once the wait ends (here its timeout), as it
+        /// would have from the channel.
+        #[test]
+        fn a_write_taken_during_a_sign_in_wait_runs_after_it() {
+            let all = ids(1);
+            let mut routes = vec![route("DELETE", "/me/messages/", 204, "")];
+            routes.extend(inbox_routes(&all));
+            let srv = FakeServer::start(routes);
+            let (handle, store, dir) =
+                signin_engine(&srv, "signin-deferred", &all, Duration::from_millis(500));
+            handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+            wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::SignInStarted { .. })
+            });
+            handle
+                .cmd_tx
+                .send(SyncCommand::Delete { id: "D1".into() })
+                .unwrap();
+            let events = wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::Error(t) if t.starts_with("sign-in failed: timed out")),
+            );
+            assert!(!signs_out(&events), "{events:?}");
+            assert!(
+                wait_until(ENGINE_WAIT, || deletes(&srv) == ["D1"]),
+                "the kept Delete is sent: {:?}",
+                deletes(&srv)
+            );
+            assert!(wait_until(ENGINE_WAIT, || store
+                .pending_ops()
+                .unwrap()
+                .is_empty()));
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
             let _ = std::fs::remove_dir_all(&dir);
         }
 
