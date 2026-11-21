@@ -2549,6 +2549,39 @@ fn clear_contents_of_unlocked_cells_on_a_protected_sheet_clears() {
     assert!(!v.areas_locked(s, &v.areas_all()));
 }
 
+/// #2230: Replace writes a matching cell only when it is unlocked; Replace
+/// All is refused whole when any cell it would change is locked. The app
+/// asks `replace_refused` before it writes, and shows `entry_error`.
+#[test]
+fn replace_writes_only_unlocked_cells_of_a_protected_sheet() {
+    let protected = Some(crate::sheet_goto::SHEET_PROTECTED);
+    let mut v = form_book();
+    // Replace on the locked A1: refused, nothing written.
+    assert!(v.replace_refused((0, 0), "Label", "X", false));
+    assert_eq!(v.entry_error.as_deref(), protected);
+    assert_eq!(value(&v, 0, 0), CellValue::Text("Label".into()));
+    // On the unlocked B1: replaced.
+    v.entry_error = None;
+    assert!(!v.replace_refused((0, 1), "Answer", "Done", false));
+    assert!(v.entry_error.is_none());
+    assert!(v.replace_in_cell(0, 1, "Answer", "Done"));
+    assert_eq!(value(&v, 0, 1), CellValue::Text("Done".into()));
+    // Replace All matching the locked Label and Total and the unlocked Done:
+    // refused whole.
+    assert!(v.replace_refused(v.sel, "l", "L", true));
+    assert_eq!(v.entry_error.as_deref(), protected);
+    assert_eq!(value(&v, 0, 0), CellValue::Text("Label".into()));
+    assert_eq!(value(&v, 0, 1), CellValue::Text("Done".into()));
+    // Matching only unlocked cells: replaced.
+    v.entry_error = None;
+    assert!(!v.replace_refused(v.sel, "one", "ONE", true));
+    assert_eq!(v.replace_all_cells("one", "ONE"), 1);
+    assert_eq!(value(&v, 0, 1), CellValue::Text("DONE".into()));
+    // Unprotected, a locked cell is replaced as before.
+    protect_off(&mut v);
+    assert!(!v.replace_refused((0, 0), "Label", "X", false));
+}
+
 // ---- #1079: Enter after a run of Tabs returns to the run's first column -----
 
 fn enter_text(v: &mut SheetView, text: &str) {

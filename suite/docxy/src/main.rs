@@ -4354,8 +4354,11 @@ impl SheetView {
             .collect()
     }
 
-    /// Would Replace (on `(r, c)`, or with `all` on every cell) change part
-    /// of an array ([`Self::refuses`])? Asked before the undo step is taken.
+    /// Would Replace (on `(r, c)`, or with `all` on every cell) write a
+    /// locked cell of a protected sheet (#2230; Replace All is refused whole,
+    /// nothing replaced) or change part of an array ([`Self::refuses`])?
+    /// Asked before the undo step is taken; [`SheetView::entry_error`] says
+    /// which.
     fn replace_refused(&mut self, (r, c): (u32, u32), q: &str, rep: &str, all: bool) -> bool {
         let changes = if all {
             self.replace_all_changes(q, rep)
@@ -4365,6 +4368,13 @@ impl SheetView {
                 .unwrap_or_default()
         };
         let s = self.active;
+        if changes
+            .iter()
+            .any(|&(r, c, _)| self.entry_locked((s, r, c)))
+        {
+            self.entry_error = Some(crate::sheet_goto::SHEET_PROTECTED.into());
+            return true;
+        }
         self.refuses(s, &changes)
     }
 

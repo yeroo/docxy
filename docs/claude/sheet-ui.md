@@ -107,9 +107,16 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   from the validation list into an absent cell (`gridcore` `pick_cell`)
   takes the style its row or column gives it (#1660), so a cell of an
   unlocked column stays unlocked after the pick.
+- Find & Replace follows the same rule (`replace_refused`): Replace writes
+  the matching cell only when it is unlocked, and Replace All (the active
+  sheet's cells) is refused whole, nothing replaced, when any cell it would
+  change is locked; `SHEET_PROTECTED` in the status either way.
 - Every other command still refuses a protected sheet whole: paste, fill,
   drag, Flash Fill, AutoSum, Convert to Number, Copy Formula from Above,
-  formats and the other Clear commands. The `<sheetProtection>` flags
+  Format Cells, the Font / Font Size boxes and the other Clear commands.
+  The ribbon's and the shortcuts' format commands (Bold, Italic, alignment,
+  number formats, colours, borders: `sheet_format_rc` → `apply_format`) do
+  not check sheet protection yet. The `<sheetProtection>` flags
   (`formatCells`, `selectLockedCells`, ...) are kept but not read.
 - The suite cannot unlock a cell (no Format Cells › Protection tab): unlocked
   xfs come from files. `uiharness/fixtures/protected-form.xlsx`, made by
