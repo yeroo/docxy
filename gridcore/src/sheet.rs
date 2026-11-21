@@ -629,14 +629,14 @@ pub(crate) fn xml_attr<'a>(s: &'a str, name: &str) -> Option<&'a str> {
         .map(|(_, v, _)| v)
 }
 
-/// A row's `s` or a column's `style` as a style index: `None` when absent,
-/// 0 or unreadable, which is the default style.
 /// Whether style `s` locks its cells: its xf is not [`Xf::unlocked`], or
 /// there is no such xf (#2230).
 fn style_locked(xfs: &[Xf], s: u32) -> bool {
     xfs.get(s as usize).is_none_or(|x| !x.unlocked)
 }
 
+/// A row's `s` or a column's `style` as a style index: `None` when absent,
+/// 0 or unreadable, which is the default style.
 fn style_index(v: Option<&str>) -> Option<u32> {
     v.and_then(|v| v.trim().parse::<u32>().ok())
         .filter(|&s| s != 0)
