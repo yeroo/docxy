@@ -81,6 +81,10 @@ pub enum Applied {
     /// A `SaveAttachment` (#2132) downloaded the attachment: the caller
     /// writes `bytes` to the op's file.
     Downloaded { bytes: Vec<u8> },
+    /// A `CreateEvent` reached Graph and the store re-keyed the event
+    /// (#2005). `follow_up`: the reconcile queued an `UpdateEvent` for an
+    /// edit made during the POST, which the drain sends before it ends.
+    EventCreated { follow_up: bool },
 }
 
 /// Why an RSVP from an invite is refused (#2023): the stored event's
@@ -175,6 +179,7 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Ap
             Ok(Applied::Moved { old_id, new_id })
         }
         OutboxOp::CreateContact { id } => create_contact(client, store, id),
+        OutboxOp::CreateEvent { id } => create_event(client, store, id),
         OutboxOp::CreateFolder { id, parent, name } => {
             create_folder(client, store, id, parent.as_deref(), name)
         }
@@ -249,6 +254,42 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Ap
         }
         op => apply_other(client, store, op).map(|()| Applied::Done),
     }
+}
+
+/// `CreateEvent`: POST the `local:` row as stored now (`event_input_for`),
+/// then re-key it (`Store::reconcile_created_event`), which queues an
+/// `UpdateEvent` for an edit made during the POST (#2005).
+fn create_event(client: &GraphClient, store: &Store, id: &str) -> Result<Applied, GraphError> {
+    let input = create_event_input(store, id)?;
+    // The calendar the event was filed in (#2048): `/me/events` for
+    // the default, as before.
+    let calendar = store
+        .event_create_calendar(id)
+        .map_err(|e| GraphError::Parse(e.to_string()))?;
+    let created = match calendar {
+        Some(cal) => client.create_event_in(&cal, &input)?,
+        None => client.create_event(&input)?,
+    };
+    let queued = store
+        .reconcile_created_event(id, &created, &input)
+        .map_err(|e| GraphError::Parse(e.to_string()))?;
+    Ok(Applied::EventCreated {
+        follow_up: !queued.is_empty(),
+    })
+}
+
+/// What a `CreateEvent` POSTs for the stored event `id`: every group, read
+/// at send time, so an edit of the `local:` event before the drain is
+/// carried too, and one during the POST through the reconcile's queued
+/// `UpdateEvent` (#2005); no reminder when the host set none, so Graph
+/// applies the mailbox default (#1994).
+pub(crate) fn create_event_input(store: &Store, id: &str) -> Result<EventInput, GraphError> {
+    let (mut input, reminder_unset) = event_input_for(store, id)?;
+    input.fields = EventFieldSet::ALL;
+    if reminder_unset {
+        input.fields.remove(EventFieldSet::REMINDER);
+    }
+    Ok(input)
 }
 
 /// `RespondMeeting` (#2132), as the command does it (#2023): the invite's
@@ -457,7 +498,7 @@ fn copy_folder(
 }
 
 /// `apply_op` for every op it does not handle itself (`Move`, `CreateContact`,
-/// `CreateFolder`, `MoveFolder`, `CopyFolder`).
+/// `CreateEvent`, `CreateFolder`, `MoveFolder`, `CopyFolder`).
 fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(), GraphError> {
     match op {
         OutboxOp::MarkRead { id, read } => match for_draft(store, id)? {
@@ -473,6 +514,7 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
             None => Ok(()),
         },
         OutboxOp::Move { .. }
+        | OutboxOp::CreateEvent { .. }
         | OutboxOp::CreateFolder { .. }
         | OutboxOp::MoveFolder { .. }
         | OutboxOp::CopyFolder { .. }
@@ -530,30 +572,6 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
                 .ok_or_else(|| GraphError::Parse(format!("unrecognized RSVP kind: {kind}")))?;
             let proposed = proposed_start_utc.clone().zip(proposed_end_utc.clone());
             client.respond_event(id, rsvp, comment.as_deref(), *send_response, proposed)
-        }
-        OutboxOp::CreateEvent { id } => {
-            // Every group, read at send time, so an edit of the `local:`
-            // event before the drain is carried too; no reminder when the
-            // host set none, so Graph applies the mailbox default (#1994).
-            let mut fields = EventFieldSet::ALL;
-            let (mut input, reminder_unset) = event_input_for(store, id)?;
-            if reminder_unset {
-                fields.remove(EventFieldSet::REMINDER);
-            }
-            input.fields = fields;
-            // The calendar the event was filed in (#2048): `/me/events` for
-            // the default, as before.
-            let calendar = store
-                .event_create_calendar(id)
-                .map_err(|e| GraphError::Parse(e.to_string()))?;
-            let created = match calendar {
-                Some(cal) => client.create_event_in(&cal, &input)?,
-                None => client.create_event(&input)?,
-            };
-            store
-                .reconcile_created_event(id, &created)
-                .map_err(|e| GraphError::Parse(e.to_string()))?;
-            Ok(())
         }
         OutboxOp::UpdateEvent { id, fields } => {
             // Only the groups the edit changed (#1994), each with its latest
