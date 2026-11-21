@@ -2884,13 +2884,13 @@ impl Package {
     }
 
     /// Add a `<w:comment>` to `comments.xml`, creating the part + relationship +
-    /// content-type if absent. `text` is the comment body (XML-escaped here).
+    /// content-type if absent. `text` is the comment body (XML-escaped here;
+    /// characters XML cannot hold are dropped, #1993).
     pub fn add_comment(&mut self, id: i32, author: &str, initials: &str, date: &str, text: &str) {
         let esc = |s: &str| {
-            s.replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-                .replace('"', "&quot;")
+            let mut out = String::with_capacity(s.len());
+            crate::serialize::esc_attr(s, &mut out);
+            out
         };
         let comment = format!(
             "<w:comment w:id=\"{id}\" w:author=\"{}\" w:initials=\"{}\" w:date=\"{}\">\
@@ -4976,18 +4976,12 @@ fn collect_inline_links<'a>(
     }
 }
 
-/// Minimal XML attribute escaping for relationship targets (URLs).
+/// Minimal XML attribute escaping for relationship targets (URLs): `& < >
+/// "` escaped, characters XML cannot hold dropped (#1993), as
+/// [`crate::serialize::esc_attr`] does.
 fn esc_xml_attr(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            _ => out.push(c),
-        }
-    }
+    crate::serialize::esc_attr(s, &mut out);
     out
 }
 
@@ -5246,6 +5240,35 @@ mod tests {
     /// The declared uncompressed bytes of every entry.
     fn declared_total(zip: &[u8]) -> u64 {
         opccore::zip::declared_bytes(ZipArchive::open(zip).unwrap().entries())
+    }
+
+    /// #1993: a comment's body, author and initials never put a character
+    /// XML cannot hold into `comments.xml`; the rest is written escaped.
+    #[test]
+    fn add_comment_drops_xml_forbidden_characters_1993() {
+        let mut p = load_package(&make_docx("<w:document/>")).unwrap();
+        p.add_comment(
+            1,
+            "A\u{1}nn",
+            "A\u{FFFF}",
+            "2026-11-21T00:00:00Z",
+            "x\u{1}<y\u{0B}z\u{FFFE}",
+        );
+        let xml = p.part_text("word/comments.xml").unwrap();
+        assert!(xml.chars().all(crate::serialize::xml_char), "{xml:?}");
+        assert!(xml.contains("w:author=\"Ann\""), "{xml}");
+        assert!(xml.contains(">x&lt;yz</w:t>"), "{xml}");
+        assert!(!crate::comments::parse_comments_xml(&xml).is_empty());
+    }
+
+    /// #1993: a relationship target or attribute value is escaped, and
+    /// loses what XML cannot hold.
+    #[test]
+    fn esc_xml_attr_drops_xml_forbidden_characters_1993() {
+        assert_eq!(
+            esc_xml_attr("https://x/\u{1}a?b=\"c\"&d\u{FFFE}"),
+            "https://x/a?b=&quot;c&quot;&amp;d"
+        );
     }
 
     /// #851: a document whose parts declare more than the budget is refused
