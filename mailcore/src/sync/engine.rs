@@ -521,7 +521,11 @@ pub enum SyncCommand {
     /// `None` goes back to the default, every calendar the user owns
     /// (`Store::synced_calendar_ids`). The choice is kept in the store, so it
     /// survives a restart. The events of a stored calendar that no longer
-    /// syncs are deleted at once (`Store::set_calendar_selection_holding`), then
+    /// syncs are deleted at once, except a row a pending local write holds
+    /// (#2017: a queued edit or RSVP, a waiting `UpdateEvent`, a host write
+    /// not yet sent), which stays under its calendar's id until the first
+    /// pass after its op is gone deletes it
+    /// (`Store::set_calendar_selection_holding`); then
     /// [`SyncEvent::CalendarUpdated`] is emitted, and
     /// [`SyncEvent::CalendarsUpdated`] when the synced set changed (each
     /// `CalendarRow::syncs` follows it). When signed in and not waiting out
