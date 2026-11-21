@@ -9517,12 +9517,23 @@ impl Engine {
     /// are taken off the channel (`take_waiting`), and the events of those
     /// whose host already wrote the store are held (`waiting_event_holds`,
     /// #2031). A shutdown seen then ends the pass with nothing written or
-    /// reported: the next start runs it again.
+    /// reported: the next start runs it again. The host writes recorded
+    /// after the mark (`Store::event_write_mark`) read before any request
+    /// are held too (#2262): a write whose command is still on its way.
     fn refresh_calendar(&mut self) {
         if self.token.is_none() {
             self.emit(SyncEvent::Error("not signed in".to_string()));
             return;
         }
+        // Before any request (#2262): the round holds every host write
+        // made from here on, whether or not its command has come.
+        let since = match self.store.event_write_mark() {
+            Ok(mark) => mark,
+            Err(e) => {
+                self.emit(SyncEvent::Error(e.to_string()));
+                return;
+            }
+        };
         // An owed reset (#2022, #2023), decided now, as these rounds would
         // replace rows: only with no event op with a local write queued or
         // its command waiting. The waiting commands are taken first; a
@@ -9592,7 +9603,7 @@ impl Engine {
         let stamp = self.range_stamp();
         if let Err(e) = self
             .store
-            .apply_calendar_sync_holding(&from, &to, &fetched, stamp, &held)
+            .apply_calendar_sync_holding(&from, &to, &fetched, stamp, &held, since)
         {
             self.emit(SyncEvent::Error(e.to_string()));
             return;
@@ -9934,6 +9945,14 @@ impl Engine {
                 return false;
             }
             for (a, b) in gaps {
+                // As `refresh_calendar` (#2262): before the gap's request.
+                let since = match self.store.event_write_mark() {
+                    Ok(mark) => mark,
+                    Err(e) => {
+                        self.emit(SyncEvent::Error(e.to_string()));
+                        return false;
+                    }
+                };
                 match self.with_auth(|c| c.calendar_view_in(id, &a, &b)) {
                     Ok(events) => {
                         let f = fetched_calendar(id.clone(), &events);
@@ -9945,7 +9964,7 @@ impl Engine {
                         let stamp = self.range_stamp();
                         if let Err(e) = self
                             .store
-                            .apply_calendar_range_holding(&a, &b, &f, stamp, &held)
+                            .apply_calendar_range_holding(&a, &b, &f, stamp, &held, since)
                         {
                             self.emit(SyncEvent::Error(e.to_string()));
                             return false;
