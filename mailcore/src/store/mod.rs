@@ -1467,7 +1467,9 @@ pub enum EventWrite {
 /// the engine at all yet.
 ///
 /// A `written` id's row is not deleted by any round (an initial round's
-/// replace, a delta round's removal or series cascade, #2262), nor
+/// replace, a delta round's removal or series cascade, #2262; a pass's
+/// step 3 for a calendar that no longer syncs, #2017), nor by
+/// `Store::set_calendar_selection` (#2017), nor
 /// overwritten by any round's upsert, nor filled from its series master; a
 /// `removed` id is not upserted, nor is an event whose `series_master_id`
 /// it is (a series deleted locally), nor their attendees. A round that
@@ -5812,7 +5814,11 @@ impl Store {
     /// Stores (`Some`) or clears (`None`, back to the own-calendars default)
     /// the host's choice of calendars, and, in the same transaction, deletes
     /// the synced (non-`local:`) events of every **stored** calendar that no
-    /// longer syncs. Events of an id the list does not hold, and pre-#1984
+    /// longer syncs, except the rows a pending local write holds (#2017,
+    /// `EventHolds`): the events of queued ops with one, and every host
+    /// write recorded and not yet pruned, whose command may not have reached
+    /// the engine. Such a row stays under its calendar's id until a pass
+    /// after its op is gone deletes it. Events of an id the list does not hold, and pre-#1984
     /// rows without a calendar id, are left to the next sync pass
     /// (`apply_calendar_sync_holding`), which runs only after a successful list: so
     /// a host restoring its choice at startup, before the first list,
@@ -5835,9 +5841,15 @@ impl Store {
         }
         let after = synced_calendar_ids_on(&tx)?;
         let synced: HashSet<&str> = after.iter().map(String::as_str).collect();
+        // Every recorded host write (`since` 0), not only the queued ops':
+        // the host may have edited a row whose `UpdateEvent` is still behind
+        // this `SetCalendars` on the engine's channel. Only rounds prune the
+        // records, so one whose command never comes keeps its row until the
+        // next pass, whose mark is past it (#2017).
+        let holds = round_holds_on(&tx, &EventHolds::default(), 0)?;
         for c in stored_calendars_on(&tx)? {
             if !synced.contains(c.id.as_str()) {
-                delete_calendar_events_on(&tx, &c.id)?;
+                delete_calendar_events_on(&tx, &c.id, &holds)?;
             }
         }
         tx.commit()?;
@@ -5878,14 +5890,17 @@ impl Store {
     /// 3. Every synced event, of any date, whose non-empty `calendar_id` is
     ///    not in `synced_calendar_ids` is deleted: a deselected calendar, or
     ///    one Graph no longer lists. `''` rows (left only when no default is
-    ///    known) and `local:` rows are kept. The fetched ranges and the
+    ///    known), `local:` rows and held `written` rows (#2017) are kept.
+    ///    The fetched ranges and the
     ///    delta state of every calendar not synced go too, events or not
     ///    (#2014, #2013).
     ///
     /// No round undoes a pending local write (#2031, `EventHolds`): the
     /// events of the queued event ops with one, read in this transaction,
     /// and `held`, keep their rows (or
-    /// their absence) until the op is gone. A kept row converges after:
+    /// their absence) until the op is gone, step 3's included (#2017): a
+    /// held row of a calendar that no longer syncs goes with the first
+    /// pass after its op. A kept row converges after:
     /// the op's PATCH, RSVP or DELETE changes the event on Graph, so a
     /// later delta round names it (this round's deltaLink predates it);
     /// an op that fails for good is quarantined, and its calendar reset's
@@ -5955,7 +5970,7 @@ impl Store {
             .query_map([], |row| row.get(0))?
             .collect::<Result<_, _>>()?;
         for id in stored.iter().filter(|id| !synced.contains(*id)) {
-            delete_calendar_events_on(&tx, id)?;
+            delete_calendar_events_on(&tx, id, &holds)?;
         }
         for table in ["calendar_ranges", "calendar_deltas"] {
             let kept: Vec<String> = tx
@@ -9648,13 +9663,27 @@ fn owner_key(addr: &str) -> String {
     addr.trim().to_ascii_lowercase()
 }
 
-/// Deletes a calendar's synced (non-`local:`) events, of any date; their
-/// attendees go by `ON DELETE CASCADE`.
-fn delete_calendar_events_on(conn: &Connection, calendar_id: &str) -> Result<(), StoreError> {
-    conn.execute(
-        "DELETE FROM events WHERE calendar_id = ?1 AND id NOT LIKE 'local:%'",
-        params![calendar_id],
-    )?;
+/// Deletes the synced (non-`local:`) events of a calendar that no longer
+/// syncs, of any date; their attendees go by `ON DELETE CASCADE`. A
+/// `holds.written` row stays (#2017, `EventHolds`): a queued `UpdateEvent`
+/// reads it at send time, so deleting it would lose the user's edit. The
+/// first pass after its op is gone deletes it (`apply_calendar_sync_holding`'s
+/// step 3), its calendar still not synced.
+fn delete_calendar_events_on(
+    conn: &Connection,
+    calendar_id: &str,
+    holds: &EventHolds,
+) -> Result<(), StoreError> {
+    let stored: Vec<String> = conn
+        .prepare("SELECT id FROM events WHERE calendar_id = ?1 AND id NOT LIKE 'local:%'")?
+        .query_map(params![calendar_id], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    {
+        let mut delete = conn.prepare_cached("DELETE FROM events WHERE id = ?1")?;
+        for id in stored.iter().filter(|id| !holds.written.contains(*id)) {
+            delete.execute(params![id])?;
+        }
+    }
     // Its fetched ranges go with them (#2014): selected again, the
     // calendar fetches them again. So does its delta state (#2013), or
     // the calendar selected again would replay its link onto no rows.
@@ -18227,7 +18256,7 @@ mod calendar_tests {
             subject: "Edited".into(),
             location: "Room 9".into(),
             end_utc: "2026-07-20T12:00:00Z".into(),
-            ..in_cal(id, "A", &r.start_utc, &r.end_utc)
+            ..in_cal(id, &r.calendar_id, &r.start_utc, &r.end_utc)
         })
         .unwrap();
         s.put_event_attendees(id, &[attendee("bob@x")]).unwrap();
@@ -19088,6 +19117,99 @@ mod calendar_tests {
         s.apply_calendar_sync(FROM, TO, &[next_day(m("", "Renamed"))], STAMP)
             .unwrap();
         assert_eq!(row(&s, "O-FAR").response_status, "accepted");
+    }
+
+    // --- A deselected calendar keeps a row with a pending local write (#2017) ---
+
+    /// Calendars `A` (default) and `B`, both the user's own and synced,
+    /// after an initial round of each: `A` holds `graph_events`, `B` holds
+    /// `B1`, `B2` and `B3`, each with attendee ann.
+    fn two_calendar_store() -> Store {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x"), cal("B", false, "me@x")])
+            .unwrap();
+        let mut b = window(
+            "B",
+            vec![
+                in_cal("B1", "B", E_START, E_END),
+                in_cal("B2", "B", E_START, E_END),
+                in_cal("B3", "B", E2_START, E2_END),
+            ],
+        );
+        b.fetched = with_ann(b.fetched);
+        s.apply_calendar_sync(FROM, TO, &[ann_window(graph_events()), b], STAMP)
+            .unwrap();
+        assert_eq!(s.synced_calendar_ids().unwrap(), ["A", "B"]);
+        assert_eq!(addrs(&s, "B1"), ["ann@x"]);
+        s
+    }
+
+    fn only_a() -> Vec<String> {
+        vec!["A".to_string()]
+    }
+
+    #[test]
+    fn set_calendar_selection_keeps_an_event_with_a_queued_edit() {
+        // B1's PATCH and B2's RSVP are queued when the host deselects B:
+        // the PATCH reads B1's row at send time. B3, with no op, goes.
+        let s = two_calendar_store();
+        edit_locally(&s, "B1");
+        s.enqueue_op(&update_op("B1")).unwrap();
+        s.set_event_response("B2", "declined", "2026-07-15T08:00:00Z")
+            .unwrap();
+        s.enqueue_op(&respond_op("B2")).unwrap();
+        assert!(s.set_calendar_selection(Some(&only_a())).unwrap());
+        assert_edited(&s, "B1");
+        assert_eq!(row(&s, "B1").calendar_id, "B");
+        assert_eq!(row(&s, "B2").response_status, "declined");
+        assert!(s.event("B3").unwrap().is_none());
+        assert!(addrs(&s, "B3").is_empty());
+        // B's delta state goes all the same: selected again, it starts
+        // with an initial round.
+        assert!(s.calendar_delta("B").unwrap().is_none());
+        assert!(s.calendar_delta("A").unwrap().is_some());
+    }
+
+    #[test]
+    fn set_calendar_selection_keeps_an_event_the_host_just_edited() {
+        // The host edited B1, and its `UpdateEvent` is still behind
+        // `SetCalendars` on the channel: no op is queued yet.
+        let s = two_calendar_store();
+        host_rename(&s, "B1", "Edited");
+        assert!(s.set_calendar_selection(Some(&only_a())).unwrap());
+        assert_eq!(row(&s, "B1").subject, "Edited");
+        assert!(s.event("B2").unwrap().is_none());
+        // Its command never comes: the next pass, its mark past the write,
+        // deletes B1.
+        s.apply_calendar_sync(FROM, TO, &[ann_window(graph_events())], STAMP)
+            .unwrap();
+        assert!(s.event("B1").unwrap().is_none());
+        assert_eq!(local_write_count(&s), 0);
+    }
+
+    #[test]
+    fn sync_pass_keeps_a_deselected_calendars_held_row_until_its_op_is_gone() {
+        // G1 is of calendar GONE, which Graph no longer lists: only a
+        // pass's step 3 deletes it, and not while its edit is queued.
+        let s = synced_store();
+        s.upsert_event(&in_cal("G1", "GONE", E_START, E_END))
+            .unwrap();
+        s.upsert_event(&in_cal("G2", "GONE", E2_START, E2_END))
+            .unwrap();
+        edit_locally(&s, "G1");
+        let seq = s.enqueue_op(&update_op("G1")).unwrap();
+        s.apply_calendar_sync(FROM, TO, &[ann_window(graph_events())], STAMP)
+            .unwrap();
+        assert_edited(&s, "G1");
+        assert_eq!(row(&s, "G1").calendar_id, "GONE");
+        assert!(s.event("G2").unwrap().is_none());
+        // Once the op is gone (sent, dropped or quarantined), the next
+        // pass deletes it.
+        s.drop_op(seq).unwrap();
+        s.apply_calendar_sync(FROM, TO, &[ann_window(graph_events())], STAMP)
+            .unwrap();
+        assert!(s.event("G1").unwrap().is_none());
+        assert!(addrs(&s, "G1").is_empty());
     }
 }
 
