@@ -592,7 +592,8 @@ pub(crate) fn click(tab: &mut DocTab, button: &str) -> Option<Result<(), String>
             Ok(v) => v,
             Err(e) => return Some(Err(e)),
         };
-        if v.sheet().is_protected() {
+        // As F2: an unlocked cell of a protected sheet is edited (#2230).
+        if v.entry_locked((v.active, v.sel.0, v.sel.1)) {
             return Some(Err(SHEET_PROTECTED.into()));
         }
         v.begin_cell_edit(None);

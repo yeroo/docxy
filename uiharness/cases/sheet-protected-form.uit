@@ -1,0 +1,82 @@
+# #2230: on a protected sheet an unlocked cell takes a value, as in Excel's
+# form workbooks; a locked one refuses as before (#1054). On
+# fixtures/protected-form.xlsx (scripts/make-protected-form-fixture.py):
+# Sheet1 protected; A1 "Label" locked, B1 "Answer" unlocked; column C
+# unlocked by its <col style>; A2 (locked) and B2 (unlocked, blank) under a
+# list validation "a,b"; A3 "Total" locked, B3 7 unlocked.
+
+test typing goes into unlocked cells and not into locked ones
+  open copy:../fixtures/protected-form.xlsx
+  click B1
+  type Yes
+  assert editing is true
+  key enter
+  assert editing is false
+  assert cell B1 is Yes
+  # An absent cell of the unlocked column C, typed into.
+  click C5
+  type 12
+  key enter
+  assert cell C5 is 12
+  # A locked cell opens no editor and keeps its text.
+  click A1
+  type No
+  assert editing is false
+  assert cell A1 is Label
+  # F2 re-edits an unlocked cell, and refuses a locked one.
+  click B3
+  key f2
+  assert editing is true
+  assert edit is 7
+  key escape
+  click A3
+  key f2
+  assert editing is false
+
+test delete clears unlocked cells only when the whole selection is unlocked
+  open copy:../fixtures/protected-form.xlsx
+  click B1
+  key delete
+  assert cell B1 is empty
+  click A3
+  key shift+right
+  key delete
+  assert cell A3 is Total
+  assert cell B3 is 7
+
+test the validation list picks into an unlocked cell and refuses a locked one
+  open copy:../fixtures/protected-form.xlsx
+  click B2
+  key alt+down
+  assert dv_open is true
+  call pointer-click {"region":"dv-item:1"}
+  assert dv_open is false
+  assert cell B2 is b
+  # The locked A2: the list does not open, and the status says why.
+  click A2
+  key alt+down
+  assert dv_open is false
+  assert status is The cell or chart you're trying to change is on a protected sheet.
+  assert cell A2 is empty
+  # Nor does its arrow open it.
+  call pointer-click {"region":"dv-arrow"}
+  assert dv_open is false
+
+test the pick list enters into an unlocked cell and refuses a locked one
+  open copy:../fixtures/protected-form.xlsx
+  click C1
+  type x
+  key enter
+  type y
+  key enter
+  assert cell C2 is y
+  click C3
+  key alt+down
+  assert menu.target is pick-list
+  key down enter
+  assert menu is null
+  assert cell C3 is x
+  click A4
+  key alt+down
+  assert menu is null
+  assert status is The sheet is protected: unprotect it to enter values

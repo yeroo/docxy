@@ -629,6 +629,12 @@ pub(crate) fn xml_attr<'a>(s: &'a str, name: &str) -> Option<&'a str> {
         .map(|(_, v, _)| v)
 }
 
+/// Whether style `s` locks its cells: its xf is not [`Xf::unlocked`], or
+/// there is no such xf (#2230).
+fn style_locked(xfs: &[Xf], s: u32) -> bool {
+    xfs.get(s as usize).is_none_or(|x| !x.unlocked)
+}
+
 /// A row's `s` or a column's `style` as a style index: `None` when absent,
 /// 0 or unreadable, which is the default style.
 fn style_index(v: Option<&str>) -> Option<u32> {
@@ -1839,6 +1845,78 @@ impl Sheet {
     pub fn entry_style_at(&self, row: u32, col: u32) -> u32 {
         self.cell(row, col)
             .map_or_else(|| self.inherited_style(row, col), |c| c.style)
+    }
+
+    /// Whether the cell at `(row, col)` is locked, as a protected sheet asks
+    /// before a value goes in (#2230): the xf it shows ([`Sheet::entry_style_at`]:
+    /// its own, or for an absent cell the one its row or column gives) is not
+    /// [`Xf::unlocked`]. A style index past `xfs` is locked, Excel's default.
+    pub fn cell_locked(&self, xfs: &[Xf], row: u32, col: u32) -> bool {
+        style_locked(xfs, self.entry_style_at(row, col))
+    }
+
+    /// Whether any cell of `area` (`(r0, c0, r1, c1)`, inclusive) is locked
+    /// ([`Sheet::cell_locked`]), without visiting its absent cells one by one:
+    /// the held cells, the styled rows and the area's columns are each looked
+    /// at once, so a whole-sheet area answers as fast as a small one (#2230).
+    pub fn any_locked(&self, xfs: &[Xf], area: (u32, u32, u32, u32)) -> bool {
+        let (r0, c0, r1, c1) = area;
+        if r0 > r1 || c0 > c1 {
+            return false;
+        }
+        let width = (c1 - c0 + 1) as usize;
+        let height = u64::from(r1 - r0 + 1);
+        // The styled rows of the area, by row: their style and how many of
+        // their cells inside the columns are held.
+        let mut styled: BTreeMap<u32, (u32, usize)> = BTreeMap::new();
+        for &r in self.row_attrs.range(r0..=r1).map(|(r, _)| r) {
+            if let Some(s) = self.row_style(r) {
+                styled.insert(r, (s, 0));
+            }
+        }
+        // Held cells: each shows its own style. Count them where an absent
+        // neighbour would show the row's or the column's style instead.
+        let mut held_in_col = vec![0u64; width];
+        for (&(r, c), cell) in self.cells.range((r0, c0)..=(r1, c1)) {
+            if !(c0..=c1).contains(&c) {
+                continue;
+            }
+            if style_locked(xfs, cell.style) {
+                return true;
+            }
+            match styled.get_mut(&r) {
+                Some((_, held)) => *held += 1,
+                None => held_in_col[(c - c0) as usize] += 1,
+            }
+        }
+        // A styled row with an absent cell in the columns shows its style.
+        if styled
+            .values()
+            .any(|&(s, held)| held < width && style_locked(xfs, s))
+        {
+            return true;
+        }
+        // The other rows' absent cells show their column's style: the first
+        // `<col>` covering it with a style, as `col_style` reads it, so the
+        // definitions are painted last to first.
+        let unstyled = height - styled.len() as u64;
+        if unstyled == 0 {
+            return false;
+        }
+        let mut col_style = vec![0u32; width];
+        for d in self.col_defs.iter().rev() {
+            let Some(s) = style_index(xml_attr(&d.attrs, "style")) else {
+                continue;
+            };
+            let (lo, hi) = (d.min.max(c0), d.max.min(c1));
+            if lo <= hi {
+                col_style[(lo - c0) as usize..=(hi - c0) as usize].fill(s);
+            }
+        }
+        col_style
+            .iter()
+            .zip(&held_in_col)
+            .any(|(&s, &held)| held < unstyled && style_locked(xfs, s))
     }
 
     /// How a copy, fill or move reads this sheet's cells ([`CopyReader`]).
@@ -4297,5 +4375,144 @@ mod tests {
         s.set_row_hidden(4, true);
         assert!(s.row_hidden(4) && !s.row_filtered(4));
         assert!(s.filtered_rows.is_empty());
+    }
+
+    /// xfs for the #2230 tests: 0 locked (the default), 1 unlocked, 2 locked,
+    /// 3 unlocked. Index 4 and up are missing, so locked.
+    fn lock_xfs() -> Vec<Xf> {
+        [false, true, false, true]
+            .into_iter()
+            .map(|unlocked| Xf {
+                unlocked,
+                ..Xf::default()
+            })
+            .collect()
+    }
+
+    fn col_def(min: u32, max: u32, attrs: &str) -> ColDef {
+        ColDef {
+            min,
+            max,
+            width: None,
+            attrs: attrs.into(),
+            default_width: false,
+            plain_width: false,
+        }
+    }
+
+    fn styled(style: u32) -> Cell {
+        Cell {
+            style,
+            ..Cell::text("x")
+        }
+    }
+
+    #[test]
+    fn cell_locked_follows_the_shown_xf() {
+        let xfs = lock_xfs();
+        let mut s = Sheet::default();
+        s.cells.insert((0, 0), styled(1));
+        s.cells.insert((0, 1), styled(2));
+        s.cells.insert((0, 2), styled(9));
+        // Column D is unlocked; row 5 is a locked formatted row.
+        s.col_defs.push(col_def(3, 3, " style=\"3\""));
+        s.row_attrs.insert(5, " customFormat=\"1\" s=\"2\"".into());
+        assert!(!s.cell_locked(&xfs, 0, 0), "held unlocked");
+        assert!(s.cell_locked(&xfs, 0, 1), "held locked");
+        assert!(s.cell_locked(&xfs, 0, 2), "a missing xf is locked");
+        assert!(s.cell_locked(&xfs, 7, 7), "absent, default style");
+        assert!(
+            !s.cell_locked(&xfs, 7, 3),
+            "absent under an unlocked column"
+        );
+        assert!(
+            s.cell_locked(&xfs, 5, 3),
+            "a locked row style wins over the unlocked column"
+        );
+        // A held cell shows its own style over its column's.
+        s.cells.insert((8, 3), styled(0));
+        assert!(s.cell_locked(&xfs, 8, 3));
+    }
+
+    #[test]
+    fn any_locked_matches_brute_force() {
+        let xfs = lock_xfs();
+        let mut s = Sheet::default();
+        // Columns: B unlocked; C..D covered first by a def without a style,
+        // then by an unlocked one (the first def WITH a style wins); E's first
+        // styled def is locked over a later unlocked one; F under style 0.
+        s.col_defs.push(col_def(1, 1, " style=\"1\""));
+        s.col_defs.push(col_def(2, 3, " width=\"9\""));
+        s.col_defs.push(col_def(2, 4, " style=\"3\""));
+        s.col_defs.push(col_def(4, 4, " style=\"2\""));
+        s.col_defs.push(col_def(4, 5, " style=\"0\""));
+        // Rows: 1 unlocked, 3 locked, 4 formatted with s="0" (falls through
+        // to the columns), 2 attributes without customFormat.
+        s.row_attrs.insert(1, " customFormat=\"1\" s=\"1\"".into());
+        s.row_attrs
+            .insert(2, " ht=\"20\" customHeight=\"1\"".into());
+        s.row_attrs.insert(3, " customFormat=\"1\" s=\"2\"".into());
+        s.row_attrs.insert(4, " customFormat=\"1\" s=\"0\"".into());
+        for (r, c, st) in [
+            (0, 0, 1),
+            (0, 1, 0),
+            (1, 2, 2),
+            (2, 2, 3),
+            (3, 0, 1),
+            (3, 1, 3),
+            (3, 2, 1),
+            (3, 3, 1),
+            (3, 4, 3),
+            (3, 5, 1),
+            (4, 1, 3),
+            (5, 3, 0),
+            (5, 4, 1),
+        ] {
+            s.cells.insert((r, c), styled(st));
+        }
+        let n = 6;
+        let mut seen = (0, 0);
+        for r0 in 0..n {
+            for r1 in r0..n {
+                for c0 in 0..n {
+                    for c1 in c0..n {
+                        let brute = (r0..=r1).any(|r| (c0..=c1).any(|c| s.cell_locked(&xfs, r, c)));
+                        assert_eq!(
+                            s.any_locked(&xfs, (r0, c0, r1, c1)),
+                            brute,
+                            "area ({r0}, {c0}, {r1}, {c1})"
+                        );
+                        if brute {
+                            seen.0 += 1;
+                        } else {
+                            seen.1 += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            seen.0 > 0 && seen.1 > 0,
+            "both answers are exercised: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn any_locked_on_a_whole_sheet_area_is_sparse() {
+        let xfs = lock_xfs();
+        let whole = (0, 0, MAX_ROWS - 1, MAX_COLS - 1);
+        let mut s = Sheet::default();
+        s.col_defs.push(col_def(0, MAX_COLS - 1, " style=\"1\""));
+        s.cells.insert((70_000, 9_000), styled(3));
+        assert!(!s.any_locked(&xfs, whole));
+        // One locked cell anywhere locks the area.
+        s.cells.insert((1_000_000, 16_000), styled(0));
+        assert!(s.any_locked(&xfs, whole));
+        s.cells.remove(&(1_000_000, 16_000));
+        // So does a locked formatted row with an absent cell.
+        s.row_attrs
+            .insert(500_000, " customFormat=\"1\" s=\"2\"".into());
+        assert!(s.any_locked(&xfs, whole));
+        assert!(!s.any_locked(&xfs, (0, 0, 499_999, MAX_COLS - 1)));
     }
 }
