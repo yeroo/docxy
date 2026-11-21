@@ -1753,9 +1753,10 @@ pub struct LocalEventFields {
     /// attendee with the same address on an update, and is `required`
     /// otherwise.
     pub attendees: Vec<AttendeeInput>,
-    /// The recurrence pattern for a repeating event (create-only), or `None`:
-    /// three kinds and two range types (`Recurrence`). `series_recurrence`
-    /// wins when both are set.
+    /// The recurrence pattern for a repeating event, or `None`: three kinds
+    /// and two range types (`Recurrence`). `series_recurrence` wins when both
+    /// are set. Written on create, and by `update_event_fields` only on a
+    /// pending `local:` row (#2036).
     pub recurrence: Option<Recurrence>,
     /// Graph's whole recurrence for a repeating event (create-only, #2034):
     /// every pattern type, `noEnd`/`endDate`/`numbered` ranges,
@@ -1763,7 +1764,8 @@ pub struct LocalEventFields {
     /// except that a start sent in its named zone (`start_time_zone`, #2039)
     /// sends that zone as `recurrenceTimeZone` instead. Its `CreateEvent`
     /// sends it with `EventRecurrence::to_send_json`, and it wins over
-    /// `recurrence`. `update_event_fields` ignores it.
+    /// `recurrence`. `update_event_fields` writes it only on a pending
+    /// `local:` row (#2036), and ignores it on a synced one.
     pub series_recurrence: Option<EventRecurrence>,
     pub show_as: Option<String>,
     pub sensitivity: Option<String>,
@@ -5346,9 +5348,21 @@ impl Store {
     /// (its create would otherwise send none). Attendees are rewritten only when they changed (as the
     /// ordered list of name, address and type), and each one whose address
     /// matches a stored one (case-insensitive) keeps its response and
-    /// response time, and its type when the input's is `""`. Recurrence,
-    /// `recurrence` and `series_recurrence` alike, is create-only: never
-    /// written here, never in the set.
+    /// response time, and its type when the input's is `""`.
+    ///
+    /// Recurrence (#2036): on a pending `local:` row, whose `CreateEvent`
+    /// reads the row at send time, a `Some` `series_recurrence`, else a
+    /// `Some` `recurrence`, is the edit's recurrence, normalized as
+    /// `create_local_event` stores it (`series_recurrence` wins; the other
+    /// shape is dropped). When it differs from the stored one (the decoded
+    /// pair `event_for_send` reads) it is written, as the send encoding in
+    /// `events.recurrence` and in Graph's shape in `graph_recurrence`, the
+    /// row becomes a `seriesMaster`, and `RECURRENCE` is in the set. A
+    /// create-side `recurrence` over a stored lossless one is such a change
+    /// and replaces it. Both `None` keeps it: a pending series cannot be
+    /// turned back into a single event here. On a synced row recurrence is
+    /// ignored, never written and never in the set: a series on Graph is
+    /// edited with `SyncCommand::UpdateEventSeries`.
     ///
     /// `join_url` follows the new location and body (`meeting_link_in`, as
     /// `create_local_event` derives it), except on an event stored as an
@@ -5447,6 +5461,19 @@ impl Store {
             EventFieldSet::ALLOW_NEW_TIME_PROPOSALS,
             allow_new != old.allow_new_time_proposals,
         );
+        // A pending `local:` row's recurrence (#2036), normalized as
+        // `create_local_event` stores it; `None` when not written.
+        let recurrence = if id.starts_with("local:") {
+            match (&f.series_recurrence, &f.recurrence) {
+                (Some(s), _) => Some((None, Some(s.clone()))),
+                (None, Some(r)) => Some((Some(r.clone()), None)),
+                (None, None) => None,
+            }
+        } else {
+            None
+        }
+        .filter(|(r, s)| (r, s) != (&old.recurrence, &old.series_recurrence));
+        mark(EventFieldSet::RECURRENCE, recurrence.is_some());
         let attendees = typed_attendees(&f.attendees, &stored_attendees);
         let attendees_differ = attendees.len() != stored_attendees.len()
             || attendees
@@ -5491,6 +5518,24 @@ impl Store {
         )?;
         if attendees_differ {
             put_event_attendees_on(&tx, id, &attendees)?;
+        }
+        if let Some((r, s)) = &recurrence {
+            // As `create_local_event`: the send encoding, and Graph's shape
+            // for the agenda (the next sync writes Graph's own).
+            let graph = s.clone().or_else(|| {
+                r.as_ref()
+                    .and_then(|r| EventRecurrence::from_json(&r.to_json()))
+            });
+            tx.execute(
+                "UPDATE events SET recurrence = ?2, graph_recurrence = ?3,
+                        event_type = 'seriesMaster'
+                 WHERE id = ?1",
+                params![
+                    id,
+                    encode_send_recurrence(r.as_ref(), s.as_ref()),
+                    graph.map(|g| g.to_json().to_string()).unwrap_or_default()
+                ],
+            )?;
         }
         // Each end's named zone (#2039): a named pair is written as given; a
         // `""` one keeps the stored pair, unless the times changed, which
@@ -10762,7 +10807,9 @@ fn event_for_send_on(conn: &Connection, id: &str) -> Result<Option<EventSendData
 /// name, address and type in order. Only the groups the create sent are
 /// compared, except the reminder: a create sent without one
 /// (`reminder_unset`) has it marked when an edit set one since, which clears
-/// `reminder_unset`. `RECURRENCE` is never marked: it is create-only.
+/// `reminder_unset`. `RECURRENCE` compares the decoded pair
+/// `(recurrence, series_recurrence)`, as `update_event_fields` marks it: a
+/// pending series' pattern edited during the POST (#2036).
 fn sent_event_changes(sent: &EventInput, now: &EventSendData) -> EventFieldSet {
     let mut changed = EventFieldSet::default();
     let mut mark = |group: EventFieldSet, differs: bool| {
@@ -10816,6 +10863,10 @@ fn sent_event_changes(sent: &EventInput, now: &EventSendData) -> EventFieldSet {
     mark(
         EventFieldSet::ALLOW_NEW_TIME_PROPOSALS,
         sent.allow_new_time_proposals != now.allow_new_time_proposals,
+    );
+    mark(
+        EventFieldSet::RECURRENCE,
+        (&sent.recurrence, &sent.series_recurrence) != (&now.recurrence, &now.series_recurrence),
     );
     changed
 }
@@ -14848,10 +14899,13 @@ mod calendar_tests {
             sent_event_changes(&with_reminder, &now),
             EventFieldSet::REMINDER
         );
-        // A zone alone, and a recurrence (create-only), mark nothing.
+        // A zone alone marks nothing.
         let mut now = base.clone();
         now.start_time_zone = "W. Europe Standard Time".into();
         now.start_local = "2026-07-20T13:00:00".into();
+        assert_eq!(sent_event_changes(&sent, &now), EventFieldSet::default());
+        // A recurrence edited during the create (#2036), either shape.
+        let mut now = base.clone();
         now.recurrence = Some(crate::graph::model::Recurrence {
             kind: crate::graph::model::RecurrenceKind::Daily,
             interval: 1,
@@ -14860,7 +14914,10 @@ mod calendar_tests {
             start_date: "2026-07-20".into(),
             until: None,
         });
-        assert_eq!(sent_event_changes(&sent, &now), EventFieldSet::default());
+        assert_eq!(sent_event_changes(&sent, &now), EventFieldSet::RECURRENCE);
+        let mut now = base.clone();
+        now.series_recurrence = Some(lossless_recurrence());
+        assert_eq!(sent_event_changes(&sent, &now), EventFieldSet::RECURRENCE);
     }
 
     #[test]
@@ -14999,10 +15056,12 @@ mod calendar_tests {
     }
 
     #[test]
-    fn update_event_fields_never_changes_a_lossless_recurrence() {
+    fn update_event_fields_never_changes_a_synced_series_recurrence() {
+        // A series on Graph is edited with `UpdateEventSeries`: the row
+        // edit neither writes its recurrence nor marks it (#2034, #2036).
         let s = Store::open_in_memory().unwrap();
         let rec = lossless_recurrence();
-        let id = s
+        let local = s
             .create_local_event(
                 &LocalEventFields {
                     series_recurrence: Some(rec.clone()),
@@ -15012,12 +15071,18 @@ mod calendar_tests {
                 "me@x",
             )
             .unwrap();
+        let created = Event {
+            id: "EV1".into(),
+            ..Event::default()
+        };
+        let sent = create_input(&s, &local);
+        s.reconcile_created_event(&local, &created, &sent).unwrap();
         let mut other = rec.clone();
         other.pattern.r#type = "daily".into();
         other.range.r#type = "noEnd".into();
         let changed = s
             .update_event_fields(
-                &id,
+                "EV1",
                 &LocalEventFields {
                     subject: "Renamed".into(),
                     series_recurrence: Some(other),
@@ -15027,9 +15092,213 @@ mod calendar_tests {
             .unwrap();
         assert!(!changed.contains(EventFieldSet::RECURRENCE));
         assert!(changed.contains(EventFieldSet::SUBJECT));
-        let sent = s.event_for_send(&id).unwrap().unwrap();
+        let sent = s.event_for_send("EV1").unwrap().unwrap();
         assert_eq!(sent.series_recurrence, Some(rec.clone()));
-        assert_eq!(local_row(&s, &id).recurrence, Some(rec));
+        assert_eq!(local_row(&s, "EV1").recurrence, Some(rec));
+    }
+
+    /// A second lossless recurrence, unlike `lossless_recurrence`.
+    fn other_recurrence() -> EventRecurrence {
+        let mut other = lossless_recurrence();
+        other.pattern.r#type = "relativeMonthly".into();
+        other.pattern.month = 0;
+        other.range.r#type = "endDate".into();
+        other.range.end_date = "2027-06-30".into();
+        other.range.number_of_occurrences = 0;
+        other
+    }
+
+    #[test]
+    fn update_event_fields_writes_a_local_series_recurrence() {
+        // #2036: a pending series' pattern edited before its create: the
+        // row holds the edit, which its `CreateEvent` reads at send time.
+        let s = Store::open_in_memory().unwrap();
+        let f = LocalEventFields {
+            series_recurrence: Some(lossless_recurrence()),
+            ..sample_fields()
+        };
+        let id = s.create_local_event(&f, "Me", "me@x").unwrap();
+        let other = other_recurrence();
+        let changed = s
+            .update_event_fields(
+                &id,
+                &LocalEventFields {
+                    series_recurrence: Some(other.clone()),
+                    ..edit_of(&f)
+                },
+            )
+            .unwrap();
+        assert_eq!(changed, EventFieldSet::RECURRENCE);
+        let sent = s.event_for_send(&id).unwrap().unwrap();
+        assert_eq!(sent.series_recurrence, Some(other.clone()));
+        assert_eq!(sent.recurrence, None);
+        let row = local_row(&s, &id);
+        assert_eq!(row.recurrence, Some(other.clone()));
+        assert_eq!(row.event_type, "seriesMaster");
+        assert_eq!(create_input(&s, &id).series_recurrence, Some(other));
+    }
+
+    #[test]
+    fn update_event_fields_equal_or_unset_local_recurrence_marks_nothing() {
+        use crate::graph::model::{Recurrence, RecurrenceKind};
+        let s = Store::open_in_memory().unwrap();
+        let rec = lossless_recurrence();
+        let f = LocalEventFields {
+            series_recurrence: Some(rec.clone()),
+            ..sample_fields()
+        };
+        let id = s.create_local_event(&f, "Me", "me@x").unwrap();
+        // The same recurrence, and none (keep), change nothing.
+        for series_recurrence in [Some(rec.clone()), None] {
+            let changed = s
+                .update_event_fields(
+                    &id,
+                    &LocalEventFields {
+                        series_recurrence,
+                        ..edit_of(&f)
+                    },
+                )
+                .unwrap();
+            assert_eq!(changed, EventFieldSet::default());
+            let sent = s.event_for_send(&id).unwrap().unwrap();
+            assert_eq!(sent.series_recurrence, Some(rec.clone()));
+            assert_eq!(local_row(&s, &id).recurrence, Some(rec.clone()));
+        }
+        // A create-side one compares as stored, in its own shape.
+        let daily = Recurrence {
+            kind: RecurrenceKind::Daily,
+            interval: 2,
+            days_of_week: Vec::new(),
+            day_of_month: 0,
+            start_date: "2026-07-20".into(),
+            until: None,
+        };
+        let g = LocalEventFields {
+            recurrence: Some(daily.clone()),
+            ..sample_fields()
+        };
+        let id = s.create_local_event(&g, "Me", "me@x").unwrap();
+        let changed = s.update_event_fields(&id, &edit_of(&g)).unwrap();
+        assert_eq!(changed, EventFieldSet::default());
+        assert_eq!(
+            s.event_for_send(&id).unwrap().unwrap().recurrence,
+            Some(daily)
+        );
+    }
+
+    #[test]
+    fn update_event_fields_create_side_recurrence_on_a_local_row() {
+        // A create-side `recurrence` over a stored lossless one is a change
+        // and replaces it, as a create given only it would have stored it.
+        use crate::graph::model::{Recurrence, RecurrenceKind};
+        let s = Store::open_in_memory().unwrap();
+        let f = LocalEventFields {
+            series_recurrence: Some(lossless_recurrence()),
+            ..sample_fields()
+        };
+        let id = s.create_local_event(&f, "Me", "me@x").unwrap();
+        let weekly = Recurrence {
+            kind: RecurrenceKind::Weekly,
+            interval: 1,
+            days_of_week: vec!["monday".into()],
+            day_of_month: 0,
+            start_date: "2026-07-20".into(),
+            until: Some("2026-08-31".into()),
+        };
+        let changed = s
+            .update_event_fields(
+                &id,
+                &LocalEventFields {
+                    recurrence: Some(weekly.clone()),
+                    series_recurrence: None,
+                    ..edit_of(&f)
+                },
+            )
+            .unwrap();
+        assert_eq!(changed, EventFieldSet::RECURRENCE);
+        let sent = s.event_for_send(&id).unwrap().unwrap();
+        assert_eq!(sent.recurrence, Some(weekly.clone()));
+        assert_eq!(sent.series_recurrence, None);
+        assert_eq!(
+            local_row(&s, &id).recurrence,
+            EventRecurrence::from_json(&weekly.to_json())
+        );
+        // Both given: the lossless one wins, as on create.
+        let other = other_recurrence();
+        let changed = s
+            .update_event_fields(
+                &id,
+                &LocalEventFields {
+                    recurrence: Some(weekly),
+                    series_recurrence: Some(other.clone()),
+                    ..edit_of(&f)
+                },
+            )
+            .unwrap();
+        assert_eq!(changed, EventFieldSet::RECURRENCE);
+        let sent = s.event_for_send(&id).unwrap().unwrap();
+        assert_eq!(sent.series_recurrence, Some(other));
+        assert_eq!(sent.recurrence, None);
+    }
+
+    #[test]
+    fn update_event_fields_gives_a_pending_single_event_a_recurrence() {
+        // As if created with it: the row becomes a series master.
+        let s = Store::open_in_memory().unwrap();
+        let f = sample_fields();
+        let id = s.create_local_event(&f, "Me", "me@x").unwrap();
+        assert_eq!(local_row(&s, &id).event_type, "singleInstance");
+        let changed = s
+            .update_event_fields(
+                &id,
+                &LocalEventFields {
+                    series_recurrence: Some(lossless_recurrence()),
+                    ..edit_of(&f)
+                },
+            )
+            .unwrap();
+        assert_eq!(changed, EventFieldSet::RECURRENCE);
+        let row = local_row(&s, &id);
+        assert_eq!(row.event_type, "seriesMaster");
+        assert_eq!(row.recurrence, Some(lossless_recurrence()));
+    }
+
+    #[test]
+    fn reconcile_created_event_queues_a_recurrence_edit_made_during_the_create() {
+        // #2036 in the #2005 window: the POST carried the first pattern,
+        // the edit landed before the reconcile, which queues its PATCH.
+        let s = Store::open_in_memory().unwrap();
+        let f = LocalEventFields {
+            series_recurrence: Some(lossless_recurrence()),
+            ..sample_fields()
+        };
+        let id = s.create_local_event(&f, "Me", "me@x").unwrap();
+        let sent = create_input(&s, &id);
+        let other = other_recurrence();
+        s.update_event_fields(
+            &id,
+            &LocalEventFields {
+                series_recurrence: Some(other.clone()),
+                ..edit_of(&f)
+            },
+        )
+        .unwrap();
+        let created = Event {
+            id: "EV1".into(),
+            ..Event::default()
+        };
+        let queued = s.reconcile_created_event(&id, &created, &sent).unwrap();
+        assert_eq!(queued, EventFieldSet::RECURRENCE);
+        let ops = s.pending_ops().unwrap();
+        assert_eq!(
+            ops.iter().map(|r| r.op.clone()).collect::<Vec<_>>(),
+            [OutboxOp::UpdateEvent {
+                id: "EV1".into(),
+                fields: EventFieldSet::RECURRENCE,
+            }]
+        );
+        let row = s.event_for_send("EV1").unwrap().unwrap();
+        assert_eq!(row.series_recurrence, Some(other));
     }
 
     #[test]
