@@ -2067,8 +2067,9 @@ enum ReminderTarget {
 /// An event op whose command wrote the store first (an RSVP, edited
 /// fields, a deleted row): what a quarantine must undo with initial
 /// calendar rounds, and what an owed calendar reset waits for
-/// (`calendar_reset_owed`: a series edit's, #2022, or a refused
-/// response's, #2023), as an initial round would replace the row. `CreateEvent`'s `local:` row is
+/// (`calendar_reset_owed`: a series edit's, #2022, a refused
+/// response's, #2023, or an applied `UpdateEvent` carrying `RECURRENCE`,
+/// #2036), as an initial round would replace the row. `CreateEvent`'s `local:` row is
 /// never replaced, and `UpdateEventSeries` writes nothing locally. The
 /// store decides which ops these are (`OutboxOp::event_local_write`, #2031),
 /// as it holds their rows in every calendar round. An `UpdateEvent` with
@@ -2104,8 +2105,9 @@ fn waiting_event_holds<'a>(deferred: impl IntoIterator<Item = &'a SyncCommand>) 
 /// wrote the row (`DeleteEvent`, `UpdateEvent`), or whose op the engine
 /// writes for (`RespondEvent`, `CancelEvent`, `RemoveFromCalendar`'s
 /// `DeleteEvent`, #2024): while one waits, an owed
-/// calendar reset (`calendar_reset_owed`: a series edit's, #2022, or a
-/// refused response's, #2023) does not run.
+/// calendar reset (`calendar_reset_owed`: a series edit's, #2022, a
+/// refused response's, #2023, or an applied `UpdateEvent` carrying
+/// `RECURRENCE`, #2036) does not run.
 fn command_writes_event_locally(cmd: &SyncCommand) -> bool {
     matches!(
         cmd,
@@ -2611,9 +2613,11 @@ struct Engine {
     /// under it is synced, so the mail Graph copied arrives.
     copied_after_drain: Vec<String>,
     /// The calendars owe a reset: initial rounds over every window. Owed
-    /// when a series edit went through (#2022), and when a `RespondEvent`
-    /// was refused (#2023), whose host may have written the status itself
-    /// on a row no delta round would name again. The first calendar
+    /// when a series edit went through (#2022), when an `UpdateEvent`
+    /// carrying `RECURRENCE` did (a pending series' pattern edited during
+    /// its create, #2036), and when a `RespondEvent` was refused (#2023),
+    /// whose host may have written the status itself on a row no delta
+    /// round would name again. The first calendar
     /// refresh that finds no event op with a local write queued
     /// (`writes_event_locally`) and no such command waiting
     /// (`command_writes_event_locally`, taken off the channel first) runs
@@ -6021,8 +6025,9 @@ impl Engine {
         });
     }
 
-    /// Whether the calendars' reset (a series edit's, #2022, or a refused
-    /// response's, #2023) is owed and may run now: no
+    /// Whether the calendars' reset (a series edit's, #2022, a refused
+    /// response's, #2023, or an applied `UpdateEvent` carrying
+    /// `RECURRENCE`, #2036) is owed and may run now: no
     /// event op with a local write is queued, and no command that queues one
     /// is waiting in `deferred` (its host wrote the row already). An initial
     /// round would replace that row, and a queued `UpdateEvent` reads its

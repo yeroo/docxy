@@ -1801,8 +1801,9 @@ this occurrence or the whole series, as Outlook does.
   id}/instances?startDateTime=&endDateTime=&$top=50`, paged and with the `Prefer`
   of `calendar_view` (`calendar_view_paged`).
 - Which id: **this occurrence** is the occurrence's own id, through the existing
-  `UpdateEvent` (its PATCH never carries `recurrence`: `update_event_fields` never
-  reports the group, and a synced occurrence's row has none) and `DeleteEvent`.
+  `UpdateEvent` (its PATCH never carries `recurrence`: on a synced row
+  `update_event_fields` never reports the group, #2036, and a synced occurrence's
+  row has none) and `DeleteEvent`.
   **The series** is the master's id: `UpdateEventSeries`, and for a delete
   `Store::delete_event_series(master)` (the row with that id, a local series' own,
   and every row whose `series_master_id` it is, in any calendar, with attendees),
@@ -2130,7 +2131,6 @@ this occurrence or the whole series, as Outlook does.
 - A pending `local:` series' recurrence is edited through its row (#2036, below).
 - Tests: `store` `calendar_tests` `create_local_event_stores_a_lossless_recurrence`,
   `create_local_event_lossless_recurrence_wins`,
-  `update_event_fields_never_changes_a_lossless_recurrence`,
   `event_for_send_reads_neither_shape_as_no_recurrence`,
   `create_local_event_round_trips_recurrence`,
   `update_event_fields_never_changes_a_synced_series_recurrence` (renamed by
@@ -2151,7 +2151,9 @@ series through the mailcore API was.
 - `Store::update_event_fields` on a `local:` row: a `Some` `series_recurrence`,
   else a `Some` `recurrence`, is the edit's recurrence, normalized as
   `create_local_event` stores it (`(None, Some(s))` or `(Some(r), None)`). When it
-  differs from the stored pair (`event_for_send`'s decode) it writes
+  differs from the stored pair (`event_for_send`'s decode; a create-side one is
+  first read back through its `to_json`, so a field it does not send, such as a
+  daily `day_of_month`, is no change) it writes
   `events.recurrence` (`encode_send_recurrence`), `graph_recurrence` (Graph's
   shape, for the agenda) and `event_type = 'seriesMaster'`, and marks
   `RECURRENCE`, so the `Written` hold (#2031) is recorded. The pending
@@ -2172,6 +2174,7 @@ series through the mailcore API was.
   calendars a reset (`calendar_reset_owed`), as `UpdateEventSeries` does (#2022).
 - Tests: `store` `calendar_tests` `update_event_fields_writes_a_local_series_recurrence`,
   `update_event_fields_equal_or_unset_local_recurrence_marks_nothing`,
+  `update_event_fields_unchanged_noncanonical_create_side_recurrence_marks_nothing`,
   `update_event_fields_create_side_recurrence_on_a_local_row`,
   `update_event_fields_gives_a_pending_single_event_a_recurrence`,
   `reconcile_created_event_queues_a_recurrence_edit_made_during_the_create`,
