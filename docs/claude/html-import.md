@@ -775,9 +775,16 @@ A batch from #1989 and #1930 (plan-2), import only.
   the box is; a top/bottom line takes that side's padding as `w:space`
   (rounded to whole points) instead of spacing, and separates margins as
   padding does (`Look::border_before`/`border_after`: `fold_bottom`'s
-  `sep`, `top_spacing`, `bottom_unseparated`, the quirks drop). Known
-  limits: a margin inside a top/bottom line is spacing outside it in Word;
-  nested boxes are one box.
+  `sep`, `top_spacing`, `bottom_unseparated`, the quirks drop). Two
+  sibling blocks with borders of their own stay two boxes (r1): Word and
+  the suite join consecutive paragraphs with equal borders and indents,
+  so every other such block (`Html::bordered_blocks`, kept on
+  `Elem::border_mark` for a restyle, `mark_borders`) gives its paragraphs
+  a `w:between` cancel (`ParBorders::nil`, saved as `w:val="nil"`), which
+  draws nothing; one block's paragraphs stay equal. The suite groups by
+  `ParBorders` equality; that Word splits on the cancel too is unverified
+  (no Word here). Known limits: a margin inside a top/bottom line is
+  spacing outside it in Word; nested boxes are one box.
 - Selectors (`css.rs`): attribute selectors (`[a]`, `=`, `~=`, `|=`, `^=`,
   `$=`, `*=`, `i`/`s`; the HTML Standard's `CASELESS_ATTRS` compare values
   without case, so `td[align=center]` matches `align=Center`), `+`,
@@ -785,9 +792,16 @@ A batch from #1989 and #1930 (plan-2), import only.
   as a class. An `ElemKey` carries its `index` among its parent's element
   children, `link`, and only the attributes the sheet names
   (`StyleSheet::attr_names`, at most 32 names: a selector naming another
-  is dropped). Every open `Elem` (and `Html::root_kids`) keeps its
-  children's count and, only when the sheet has a `+`, the keys of its
-  last 32 (`Kids`): a `+` chain never looks further back. Every start tag
+  is dropped), each value up to `MAX_ATTR_VALUE` (1 KiB: a longer one is
+  present for `[a]` but fails every value test, r1) and lowercased once
+  when a selector compares that name without case
+  (`StyleSheet::caseless`); a value test is charged a unit per 16 bytes
+  and the kept attributes as memory built. Every open `Elem` (and
+  `Html::root_kids`) keeps its children's count and, only when the sheet
+  has a `+`, the serials and keys of its last 32 (`Kids`, charged as
+  memory built): a `+` chain never looks further back, and an open
+  ancestor is found among its parent's children by its `Elem::serial`.
+  A void or skipped element's attributes are read once (`open_void`). Every start tag
   is a child, void and raw-text elements and `head` included. Matching's
   reach set holds at most one place per depth (`Path::prev`), so it stays
   O(compounds × depth). Not done: `~` and `:first-of-type` (the whole
@@ -809,7 +823,10 @@ A batch from #1989 and #1930 (plan-2), import only.
   `top_and_bottom_lines_separate_margins_1883`,
   `style_block_sibling_attribute_and_pseudo_rules_apply_1883`,
   `void_and_raw_text_elements_are_siblings_1883`,
-  `long_sibling_runs_stay_within_the_budget_1883`; `css.rs`:
+  `long_sibling_runs_stay_within_the_budget_1883`,
+  `long_attribute_values_are_present_but_never_compared_1883`,
+  `sibling_bordered_blocks_are_separate_boxes_1883`; `css.rs`:
+  `a_value_past_the_cap_is_present_but_never_matches_a_test_1883`,
   `borders_shorthands_and_longhands_1883`, `attribute_selectors_1883`,
   `next_sibling_first_child_link_and_root_1883`,
   `next_sibling_chains_are_polynomial_1883`,

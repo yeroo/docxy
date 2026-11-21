@@ -530,6 +530,8 @@ struct Look {
     /// separates margins as padding does.
     border_before: bool,
     border_after: bool,
+    /// It draws border sides of its own (not inherited, #1883 r1).
+    own_bordered: bool,
     /// Inside a list (inherited, #2114): a list in it is nested, with no
     /// user-agent vertical margins (a browser's
     /// `:is(dir,dl,menu,ol,ul) :is(dir,dl,menu,ol,ul)`, across tables too).
@@ -586,12 +588,13 @@ struct Look {
 #[derive(Default)]
 struct Kids {
     count: u32,
-    last: std::collections::VecDeque<ElemKey>,
+    /// Each kept child's serial ([`Elem::serial`]) and key.
+    last: std::collections::VecDeque<(u64, ElemKey)>,
 }
 
 impl Kids {
-    /// The child numbered `index`, if it is kept.
-    fn get(&self, index: u32) -> Option<&ElemKey> {
+    /// The serial and key of the child numbered `index`, if it is kept.
+    fn get(&self, index: u32) -> Option<&(u64, ElemKey)> {
         let first = self.count.checked_sub(self.last.len() as u32)?;
         let at = index.checked_sub(first)?;
         self.last.get(at as usize)
@@ -602,6 +605,14 @@ impl Kids {
 struct Elem {
     /// Its key; `key.index` is its place among its parent's children.
     key: ElemKey,
+    /// Which element it is (#1883 r1): one number per element opened, so
+    /// its parent's [`Kids`] can tell it apart from another child without
+    /// comparing keys.
+    serial: u64,
+    /// It draws borders of its own and is an odd one of those
+    /// ([`Html::bordered_blocks`]): its paragraphs' borders carry a
+    /// `w:between` cancel ([`mark_borders`]), decided once, when it opens.
+    border_mark: bool,
     /// Its own element children so far (#1883).
     kids: Kids,
     kind: Kind,
@@ -655,6 +666,13 @@ const RAW_TEXT: [&str; 11] = [
     "textarea",
 ];
 
+/// Void elements: nothing opens, nothing is inside (`hr` ends an open `p`
+/// first).
+const VOID: [&str; 14] = [
+    "br", "hr", "img", "meta", "link", "input", "wbr", "col", "area", "base", "source", "param",
+    "embed", "track",
+];
+
 /// Whether `key` starts a heading: `h1`-`h6`, or Word's `MsoHeadingN`.
 fn starts_heading(key: &ElemKey) -> bool {
     key.tag
@@ -694,11 +712,16 @@ impl Path for Ancestry<'_> {
         // An open ancestor is among its parent's children where its index
         // says, unless a misnested close moved it (`<b><p>x</b>`): then
         // its siblings are unknown.
-        if i < self.elems.len() && kids.get(me.index).is_some_and(|k| k != me) {
-            return None;
+        if let Some(e) = self.elems.get(i) {
+            if kids
+                .get(me.index)
+                .is_some_and(|(serial, _)| *serial != e.serial)
+            {
+                return None;
+            }
         }
         let at = me.index.checked_sub(u32::try_from(back).ok()?)?;
-        kids.get(at)
+        kids.get(at).map(|(_, key)| key)
     }
 }
 
@@ -709,6 +732,25 @@ const PAGE_BREAK_BEFORE: &str = "<w:pageBreakBefore/>";
 
 /// The explicit italic off a run under a heading gets (#1883).
 const ITALIC_OFF: &str = "<w:i w:val=\"0\"/>";
+
+/// Keep two sibling blocks with borders of their own from being drawn as
+/// one box (#1883 r1). Word and the suite join consecutive paragraphs with
+/// equal borders and indents; a browser draws each block's box. Every
+/// other such block (`mark`) gives its paragraphs a `w:between` cancel
+/// (`ParBorders::nil`), which draws nothing but makes its borders differ
+/// from its neighbours', while one block's paragraphs stay equal. A
+/// block inside one keeps its own mark, not the outer's.
+fn mark_borders(look: &mut Look, mark: bool) {
+    const BETWEEN: usize = 4;
+    if !look.own_bordered {
+        return;
+    }
+    if mark {
+        look.borders.set_side(BETWEEN, None);
+    } else {
+        look.borders.clear_side(BETWEEN);
+    }
+}
 
 /// Shading of `fill` (`RRGGBB`), run or paragraph.
 fn shd(fill: &str) -> String {
@@ -876,10 +918,11 @@ fn mark_rpr(run: &RunProps) -> Option<String> {
     (mark != RunProps::default()).then(|| crate::serialize::rpr_xml(&mark))
 }
 
-/// A bottom box folded onto a paragraph's [`FlowTail`] (#2114): padding
-/// closes the margin group open below it (its margins already paid) and
-/// starts a new one; with none, a positive margin collapses into the open
-/// group, adding only what it exceeds it by. A negative margin is summed.
+/// A bottom box folded onto a paragraph's [`FlowTail`] (#2114): padding,
+/// or a bottom border line (`sep`, #1883), closes the margin group open
+/// below it (its margins already paid) and starts a new one; with neither,
+/// a positive margin collapses into the open group, adding only what it
+/// exceeds it by. A negative margin is summed.
 fn fold_bottom(after: i32, open: i32, margin: i32, pad: i32, sep: bool) -> (i32, i32) {
     let (mut after, mut open) = (i64::from(after), i64::from(open));
     let margin = i64::from(margin);
@@ -1078,6 +1121,7 @@ impl Cascade {
         look.own_break_after = false;
         look.border_before = false;
         look.border_after = false;
+        look.own_bordered = false;
         let parent_block_align = look.block_align;
         if kind == Kind::Cell {
             look.in_cell = true;
@@ -1906,6 +1950,7 @@ impl Cascade {
                         ..ParBorders::default()
                     };
                     look.borders = mine.over(look.borders);
+                    look.own_bordered = true;
                 }
             }
             Kind::Inline => {
@@ -2214,6 +2259,12 @@ struct Html<'a> {
     break_pending: bool,
     /// The element children outside every open element (#1883).
     root_kids: Kids,
+    /// The serial the next element opened takes ([`Elem::serial`]).
+    next_serial: u64,
+    /// How many blocks drawing borders of their own have opened (#1883
+    /// r1): every other one's paragraphs carry a `w:between` cancel, so
+    /// two such sibling blocks are never one box.
+    bordered_blocks: u64,
 }
 
 impl<'a> Html<'a> {
@@ -2241,6 +2292,8 @@ impl<'a> Html<'a> {
             quirks: quirks_mode(s),
             break_pending: false,
             root_kids: Kids::default(),
+            next_serial: 0,
+            bordered_blocks: 0,
         }
     }
 
@@ -2339,18 +2392,10 @@ impl<'a> Html<'a> {
     }
 
     fn open_tag(&mut self, name: &str, attrs_at: (usize, usize)) {
-        if self.open_leaf(name, attrs_at) {
-            // An element child of what is open all the same (#1883).
-            if self.sheet.uses_next() {
-                let s = self.s;
-                if self.budget.scanned(attrs_at.1 - attrs_at.0) {
-                    let attrs = attrs_of(&s[attrs_at.0..attrs_at.1]);
-                    let key = self.key_of(name, &attrs, attrs_at);
-                    self.add_child(key);
-                }
-            } else {
-                self.add_child(ElemKey::default());
-            }
+        if name == "head" || RAW_TEXT.contains(&name) || VOID.contains(&name) {
+            self.open_void(name, attrs_at);
+        } else {
+            self.open_element(name, attrs_at);
         }
     }
 
@@ -2364,7 +2409,9 @@ impl<'a> Html<'a> {
 
     /// The key of an element `name` opening now (#1883): its tag, id and
     /// classes, its place among the open element's children, whether it is
-    /// a link, and the attributes the sheet's selectors name.
+    /// a link, and the attributes the sheet's selectors name (each value
+    /// kept up to [`css::MAX_ATTR_VALUE`], lowercased too when a selector
+    /// compares it without case), their memory charged.
     fn key_of(&self, name: &str, attrs: &Attrs, attrs_at: (usize, usize)) -> ElemKey {
         let mut key = ElemKey::new(name, attrs.id.as_deref(), attrs.class.as_deref());
         key.index = match self.elems.last() {
@@ -2375,65 +2422,93 @@ impl<'a> Html<'a> {
         let names = self.sheet.attr_names();
         if !names.is_empty() {
             let s = self.s;
-            key.attrs = named_attrs(&s[attrs_at.0..attrs_at.1], names);
+            each_attr(&s[attrs_at.0..attrs_at.1], |n, value| {
+                let n = n.to_ascii_lowercase();
+                if names.contains(&n) {
+                    key.keep_attr(&n, &attr_entities(value), self.sheet.caseless(&n));
+                }
+            });
+            if !self.budget.alloc(key.heap()) {
+                key.attrs.clear();
+            }
         }
         key
     }
 
-    /// Count `key`'s element as the open element's next child (#1883),
-    /// keeping its key when the sheet has a `+`.
-    fn add_child(&mut self, key: ElemKey) {
-        let keep = self.sheet.uses_next() && self.budget.work(1 + key.heap() / 16);
+    /// A serial for an element opening now ([`Elem::serial`]).
+    fn take_serial(&mut self) -> u64 {
+        self.next_serial += 1;
+        self.next_serial
+    }
+
+    /// Count the element `serial` keyed `key` as the open element's next
+    /// child (#1883), keeping its key, charged as memory built, when the
+    /// sheet has a `+`.
+    fn add_child(&mut self, serial: u64, key: ElemKey) {
+        let keep = self.sheet.uses_next() && self.budget.keep::<(u64, ElemKey)>(key.heap());
         let kids = self.kids_mut();
         kids.count = kids.count.saturating_add(1);
         if keep {
             if kids.last.len() >= css::MAX_COMPOUNDS {
                 kids.last.pop_front();
             }
-            kids.last.push_back(key);
+            kids.last.push_back((serial, key));
         } else {
             kids.last.clear();
         }
     }
 
-    /// Open an element that opens nothing (a void element, or one whose
-    /// content is skipped), returning whether it was one.
-    fn open_leaf(&mut self, name: &str, attrs_at: (usize, usize)) -> bool {
+    /// Open an element that opens nothing: a void element, or one whose
+    /// content is skipped. Its attributes are read once, and only when its
+    /// key or attributes are needed: for a `+` sibling, a `br` that may be
+    /// a page break, an image.
+    fn open_void(&mut self, name: &str, attrs_at: (usize, usize)) {
+        let s = self.s;
+        let text = &s[attrs_at.0..attrs_at.1];
         match name {
             _ if name == "head" || RAW_TEXT.contains(&name) => {
                 let end = format!("</{name}");
                 self.skip_past(&end);
                 self.skip_past(">");
-                return true;
             }
-            "br" => {
-                if self.visible() {
-                    let props = self.run_props();
-                    if self.br_breaks_page(attrs_at) {
-                        self.out.page_break(&props);
-                    } else {
-                        self.out.line_break(&props);
-                    }
-                    self.space = None;
-                    self.para_start = true;
-                }
-                return true;
-            }
-            "hr" => {
-                self.implicit_close(&["p"]);
-                return true;
-            }
-            "img" => {
-                self.image(attrs_at);
-                return true;
-            }
-            // Void elements: nothing opens.
-            "meta" | "link" | "input" | "wbr" | "col" | "area" | "base" | "source" | "param"
-            | "embed" | "track" => return true,
+            // Its parent is what is open once the `p` it ends has closed.
+            "hr" => self.implicit_close(&["p"]),
             _ => {}
         }
-        self.open_element(name, attrs_at);
-        false
+        let wanted = self.sheet.uses_next()
+            || (name == "br"
+                && self.visible()
+                && (!text.trim().is_empty() || self.sheet.may_match_tag("br")))
+            || (name == "img" && self.images.is_some() && self.image_in_view());
+        let read = (wanted && self.budget.scanned(text.len())).then(|| {
+            let attrs = attrs_of(text);
+            let key = self.key_of(name, &attrs, attrs_at);
+            (attrs, key)
+        });
+        match name {
+            "br" if self.visible() => {
+                let props = self.run_props();
+                let page = read
+                    .as_ref()
+                    .is_some_and(|(attrs, key)| self.br_breaks_page(attrs, key));
+                if page {
+                    self.out.page_break(&props);
+                } else {
+                    self.out.line_break(&props);
+                }
+                self.space = None;
+                self.para_start = true;
+            }
+            "img" => {
+                if let Some((attrs, key)) = &read {
+                    self.image(attrs, key);
+                }
+            }
+            _ => {}
+        }
+        // An element child of what is open all the same (#1883).
+        let serial = self.take_serial();
+        self.add_child(serial, read.map(|(_, key)| key).unwrap_or_default());
     }
 
     /// Open an element that holds content.
@@ -2519,14 +2594,16 @@ impl<'a> Html<'a> {
                 self.space = None;
                 self.para_start = false;
             }
-            self.add_child(key);
+            let serial = self.take_serial();
+            self.add_child(serial, key);
             self.skip_past("</span");
             self.skip_past(">");
             return;
         }
         // Its parent's next child (#1883), counted before it opens: its
         // own look matches with `key.index` already set.
-        self.add_child(key.clone());
+        let serial = self.take_serial();
+        self.add_child(serial, key.clone());
         // The stacks as they are below this element (#1872 r4: a list's own
         // entry is above its `lists_at`, so its close ends it).
         let (blocks_at, lists_at) = (self.blocks.len(), self.lists.len());
@@ -2626,7 +2703,12 @@ impl<'a> Html<'a> {
             } else {
                 CardMode::No
             };
-            let look = look_of(self.ctx(), &self.elems, &key, kind, &attrs, mode);
+            let mut look = look_of(self.ctx(), &self.elems, &key, kind, &attrs, mode);
+            let border_mark = look.own_bordered && {
+                self.bordered_blocks += 1;
+                self.bordered_blocks.is_multiple_of(2)
+            };
+            mark_borders(&mut look, border_mark);
             // A card's table opens one level down (`begin_card`).
             let card = match mode {
                 CardMode::Maybe if look.own_card => CardMode::Yes(self.table_depth + 1),
@@ -2641,6 +2723,8 @@ impl<'a> Html<'a> {
                 .map(|n| (self.table_depth, n));
             self.elems.push(Elem {
                 key,
+                serial,
+                border_mark,
                 kids: Kids::default(),
                 kind,
                 look,
@@ -2758,6 +2842,7 @@ impl<'a> Html<'a> {
                 &attrs,
                 e.card,
             );
+            mark_borders(&mut e.look, e.border_mark);
         }
     }
 
@@ -2819,6 +2904,8 @@ impl<'a> Html<'a> {
                 if below.iter().filter(alike).count() + reopen.iter().filter(alike).count() < 3 {
                     reopen.push(Elem {
                         key: std::mem::take(&mut e.key),
+                        serial: 0,
+                        border_mark: false,
                         kids: Kids::default(),
                         kind: e.kind,
                         look: Look::default(),
@@ -2844,7 +2931,8 @@ impl<'a> Html<'a> {
                 Some(p) => p.kids.count,
                 None => self.root_kids.count,
             };
-            self.add_child(e.key.clone());
+            e.serial = self.take_serial();
+            self.add_child(e.serial, e.key.clone());
             self.elems.push(e);
         }
         self.restyle(from);
@@ -3215,26 +3303,28 @@ impl<'a> Html<'a> {
         }
     }
 
+    /// Whether an `<img>` here is seen: not in a list marker nor in a
+    /// downlevel block, unless that block is `<![if !vml]>` (#1880).
+    fn image_in_view(&self) -> bool {
+        !self.in_marker && (!self.in_downlevel || self.in_not_vml)
+    }
+
     /// An `<img>` (#1880), with images on: an inline picture, a sized
     /// placeholder, its `alt` text, or nothing (out of view, hidden, a side
     /// of 0, or unsized and unresolved with no `alt`).
-    fn image(&mut self, attrs_at: (usize, usize)) {
-        let in_view = !self.in_marker && (!self.in_downlevel || self.in_not_vml);
-        if self.images.is_none() || !in_view {
+    fn image(&mut self, attrs: &Attrs, key: &ElemKey) {
+        if self.images.is_none() || !self.image_in_view() {
             return;
         }
-        let s = self.s;
-        let attrs = attrs_of(&s[attrs_at.0..attrs_at.1]);
-        let key = self.key_of("img", &attrs, attrs_at);
         if !self.budget.work(1 + key.heap() / 16) {
             return;
         }
         let look = look_of(
             self.ctx(),
             &self.elems,
-            &key,
+            key,
             Kind::Other,
-            &attrs,
+            attrs,
             CardMode::No,
         );
         if look.run.vanish {
@@ -3454,8 +3544,8 @@ impl<'a> Html<'a> {
     }
 
     /// Whether the elements below `elems[i]` reach a quirky container (the
-    /// body, or a `td` / `th`, not a card) with no bottom padding between
-    /// (#1979, #2114 r2 m3): in quirks mode a block's user-agent bottom is
+    /// body, or a `td` / `th`, not a card) with no bottom padding or bottom
+    /// border line between (#1979, #2114 r2 m3, #1883): in quirks mode a block's user-agent bottom is
     /// then dropped if its paragraph ends that flow, as Chrome drops it at
     /// a cell's end through a `div` too.
     fn bottom_unseparated(&self, i: usize, in_table: bool) -> bool {
@@ -3506,26 +3596,15 @@ impl<'a> Html<'a> {
         brk && !self.out.flow_is_empty(false)
     }
 
-    /// Whether the `br` whose attributes are at `attrs_at` is Word's page
-    /// break, `<br style='page-break-before:always'>` (#1883). Its look is
-    /// computed only when its attributes or the page's rules could say so.
-    fn br_breaks_page(&self, attrs_at: (usize, usize)) -> bool {
-        let s = self.s;
-        let text = &s[attrs_at.0..attrs_at.1];
-        if text.trim().is_empty() && !self.sheet.may_match_tag("br") {
-            return false;
-        }
-        if !self.budget.scanned(text.len()) {
-            return false;
-        }
-        let attrs = attrs_of(text);
-        let key = self.key_of("br", &attrs, attrs_at);
+    /// Whether a `br` of `attrs` and `key` is Word's page break, `<br
+    /// style='page-break-before:always'>` (#1883).
+    fn br_breaks_page(&self, attrs: &Attrs, key: &ElemKey) -> bool {
         look_of(
             self.ctx(),
             &self.elems,
-            &key,
+            key,
             Kind::Other,
-            &attrs,
+            attrs,
             CardMode::No,
         )
         .own_break_before
@@ -3544,15 +3623,17 @@ impl<'a> Html<'a> {
     /// it its top box, folded outermost first onto the margin group open
     /// at the bottom of the paragraph above in its flow ([`Builder::tail`]):
     /// positive margins collapse (the largest counts, less what is already
-    /// paid), padding closes the group, negative margins are summed.
+    /// paid), padding or a top border line (#1883) closes the group,
+    /// negative margins are summed.
     /// Freshness is monotonic (an element is stale once one inside it is),
     /// so the walk stops at the first stale one.
     ///
     /// In quirks mode, at the start of the body or a cell (not a card), the
     /// members drop their user-agent tops from the outermost in, up to and
-    /// including the first with top padding (#1979; #2114 r2 m2, measured
-    /// in Chrome: `<div dir=ltr><ol><li>` and `<td><div><p>` start at 0,
-    /// `<div style="padding-top:1px"><ol>` keeps the list's 1em).
+    /// including the first with top padding or a top border line (#1979,
+    /// #1883; #2114 r2 m2, measured in Chrome: `<div dir=ltr><ol><li>` and
+    /// `<td><div><p>` start at 0, `<div style="padding-top:1px"><ol>` keeps
+    /// the list's 1em).
     fn top_spacing(&self, in_table: bool) -> i32 {
         let mut chain = Vec::new();
         // The walk reached the body (`Some(true)`), a cell or another
@@ -3984,19 +4065,6 @@ fn attrs_of(attrs: &str) -> Attrs {
         };
         if let Some(slot) = slot.filter(|s| s.is_none()) {
             *slot = Some(attr_entities(value));
-        }
-    });
-    out
-}
-
-/// The attributes of a tag's attribute text whose names are in `names`
-/// (lowercase), the first of a name winning, values decoded (#1883).
-fn named_attrs(attrs: &str, names: &[String]) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    each_attr(attrs, |key, value| {
-        let key = key.to_ascii_lowercase();
-        if names.contains(&key) && !out.iter().any(|(n, _)| *n == key) {
-            out.push((key, attr_entities(value)));
         }
     });
     out
@@ -5391,6 +5459,66 @@ mod tests {
     }
 
     #[test]
+    fn long_attribute_values_are_present_but_never_compared_1883() {
+        // r1 M1: deep nesting of elements with huge attribute values under a
+        // sheet that tests them, and many paragraphs below: a value past
+        // the cap is never copied or compared, so the import is quick, and
+        // `[title]` still matches.
+        let big = "z".repeat(60 * 1024);
+        let mut page = String::from(
+            "<style>[title*=zz] p {color:#FF0000} [title] p {font-weight:bold}\
+             [title=short] p {font-style:italic}</style>",
+        );
+        for _ in 0..200 {
+            page.push_str(&format!("<div title='{big}'>"));
+        }
+        page.push_str("<div title=short>");
+        for i in 0..3000 {
+            page.push_str(&format!("<p>p{i}</p>"));
+        }
+        let start = std::time::Instant::now();
+        let d = doc(&page);
+        assert!(start.elapsed().as_secs() < 20, "{:?}", start.elapsed());
+        assert_eq!(paras(&d).len(), 3000);
+        let p = run_of(&d, "p2999").props;
+        assert!(p.bold && p.italic);
+        assert_eq!(p.color, None, "a value past the cap is never tested");
+    }
+
+    /// Whether the paragraphs holding `a` and `b` share one border box, as
+    /// the suite and Word group them: equal borders (and indents).
+    fn one_box(d: &Document, a: &str, b: &str) -> bool {
+        let (a, b) = (para_of(d, a).props, para_of(d, b).props);
+        a.borders == b.borders && (a.indent, a.indent_right) == (b.indent, b.indent_right)
+    }
+
+    #[test]
+    fn sibling_bordered_blocks_are_separate_boxes_1883() {
+        // r1 M2: a browser draws a line under each of two ruled paragraphs
+        // and two boxes for two boxed `div`s; one block's paragraphs are
+        // still one box.
+        let d = doc(
+            "<p style='border-bottom:1px solid #dddddd'>A</p>             <p style='border-bottom:1px solid #dddddd'>B</p>             <p style='border-bottom:1px solid #dddddd'>C</p>             <div style='border:1px solid #cccccc'><p>box1 one</p><p>box1 two</p></div>             <div style='border:1px solid #cccccc'><p>box2 one</p><p>box2 two</p></div>",
+        );
+        assert!(!one_box(&d, "A", "B"));
+        assert!(!one_box(&d, "B", "C"));
+        assert!(one_box(&d, "box1 one", "box1 two"));
+        assert!(one_box(&d, "box2 one", "box2 two"));
+        assert!(!one_box(&d, "box1 two", "box2 one"));
+        // The mark draws nothing: no `between` line on any of them.
+        for t in ["A", "B", "C", "box1 one", "box2 two"] {
+            assert!(para_of(&d, t).props.borders.between.is_none(), "{t}");
+        }
+        // It saves and loads as it was, so the boxes stay apart.
+        let back = reloaded(&d);
+        assert!(!one_box(&back, "A", "B") && one_box(&back, "box2 one", "box2 two"));
+        assert_eq!(
+            para_of(&back, "B").props.borders,
+            para_of(&d, "B").props.borders
+        );
+    }
+
+    #[test]
     fn gmail_blockquote_border_left_is_a_paragraph_border_1883() {
         let d = doc("<div dir=ltr>reply</div><div class=gmail_quote>\
              <div dir=ltr class=gmail_attr>On Monday someone wrote:<br></div>\
@@ -5655,7 +5783,7 @@ mod tests {
              <div style='page-break-before:always'></div><p>six</p>\
              <table><tr><td><p style='page-break-before:always'>cell</p></td></tr></table>\
              <div style='break-after:page'>seven</div>\
-             <table><tr><td>table</td></tr></table><p>eight</p>");
+             <table><tr><td>table</td></tr></table><p>eight</p>             <table><tr><td><p style='page-break-after:always'>x</p></td></tr></table>             <p>nine</p>");
         let b = |t: &str| breaks_page(&para_of(&d, t));
         // None at the document's start, where a browser breaks no page.
         assert!(!b("first"));
@@ -5667,6 +5795,9 @@ mod tests {
         // Never in a cell; a break after the block before a table is
         // dropped (Word ignores it in a first cell).
         assert!(!b("cell") && !b("table") && !b("eight"));
+        // A break after a block in a cell does not reach the paragraph
+        // after the table either (r1 m2).
+        assert!(!b("nine"));
         let back = reloaded(&d);
         assert!(breaks_page(&para_of(&back, "one")));
     }

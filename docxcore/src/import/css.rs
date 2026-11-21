@@ -36,6 +36,10 @@ pub(crate) const MAX_CLASSES: usize = 32;
 /// The most distinct attribute names a sheet's selectors may name
 /// (#1883); a selector naming another is dropped alone.
 pub(crate) const MAX_ATTR_NAMES: usize = 32;
+/// The longest attribute value a key keeps, in bytes (#1883 r1): a longer
+/// one is present (`[a]` matches) but no value test matches it, so no
+/// comparison reads more than this.
+pub(crate) const MAX_ATTR_VALUE: usize = 1024;
 
 /// Attributes whose values HTML compares ASCII case-insensitively in a
 /// selector (the HTML Standard's list, #1883), sorted: `td[align=center]`
@@ -251,9 +255,21 @@ pub(crate) struct ElemKey {
     pub(crate) index: u32,
     /// An `a`, `area` or `link` with an `href` (`:link`, `:any-link`).
     pub(crate) link: bool,
-    /// The attributes named in [`StyleSheet::attr_names`] it has: name
-    /// (lowercase) and value (character references decoded).
-    pub(crate) attrs: Vec<(String, String)>,
+    /// The attributes named in [`StyleSheet::attr_names`] it has.
+    pub(crate) attrs: Vec<AttrValue>,
+}
+
+/// One attribute an element's key keeps (#1883).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct AttrValue {
+    /// Lowercase.
+    name: String,
+    /// Its value (character references decoded); `None` past
+    /// [`MAX_ATTR_VALUE`].
+    value: Option<String>,
+    /// The value lowercased, made once when a selector compares this name
+    /// without case.
+    lower: Option<String>,
 }
 
 impl ElemKey {
@@ -293,15 +309,36 @@ impl ElemKey {
             + self
                 .attrs
                 .iter()
-                .map(|(n, v)| n.len() + v.len())
+                .map(|a| {
+                    std::mem::size_of::<AttrValue>()
+                        + a.name.len()
+                        + a.value.as_ref().map_or(0, String::len)
+                        + a.lower.as_ref().map_or(0, String::len)
+                })
                 .sum::<usize>()
     }
 
-    fn attr(&self, name: &str) -> Option<&str> {
-        self.attrs
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v.as_str())
+    /// Keep attribute `name` (lowercase) of `value` (decoded), unless one
+    /// of that name is kept already (the first wins): `caseless` when a
+    /// selector compares it without case.
+    pub(crate) fn keep_attr(&mut self, name: &str, value: &str, caseless: bool) {
+        if self.attrs.iter().any(|a| a.name == name) {
+            return;
+        }
+        let value = (value.len() <= MAX_ATTR_VALUE).then(|| value.to_string());
+        let lower = value
+            .as_ref()
+            .filter(|_| caseless)
+            .map(|v| v.to_ascii_lowercase());
+        self.attrs.push(AttrValue {
+            name: name.to_string(),
+            value,
+            lower,
+        });
+    }
+
+    fn attr(&self, name: &str) -> Option<&AttrValue> {
+        self.attrs.iter().find(|a| a.name == name)
     }
 }
 
@@ -328,11 +365,9 @@ impl Path for [ElemKey] {
     }
 }
 
-/// An attribute selector's test (#1883).
+/// An attribute selector's value test (#1883).
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum AttrOp {
-    /// `[a]`
-    Exists,
     /// `[a=v]`
     Equals,
     /// `[a~=v]`: one of its white-space separated words.
@@ -345,36 +380,41 @@ enum AttrOp {
     Substring,
 }
 
-/// An attribute selector (#1883): its name (lowercase), test, value, and
-/// whether the value compares ASCII case-insensitively (an `i` flag, or a
-/// name in [`CASELESS_ATTRS`] without an `s` flag; the value is then kept
-/// lowercase).
+/// An attribute selector (#1883): its name (lowercase); its value test,
+/// none for `[a]`; and whether the value compares ASCII case-insensitively
+/// (an `i` flag, or a name in [`CASELESS_ATTRS`] without an `s` flag; the
+/// value is then kept lowercase).
 #[derive(Debug, Clone, PartialEq)]
 struct AttrSel {
     name: String,
-    op: AttrOp,
-    value: String,
+    test: Option<(AttrOp, String)>,
     caseless: bool,
 }
 
 impl AttrSel {
-    fn matches(&self, e: &ElemKey) -> bool {
-        let Some(have) = e.attr(&self.name) else {
+    /// Whether `e` passes: one unit of work per 16 bytes of the value a
+    /// test reads (at most [`MAX_ATTR_VALUE`]).
+    fn matches(&self, e: &ElemKey, budget: &Budget) -> bool {
+        let Some(attr) = e.attr(&self.name) else {
             return false;
         };
-        if self.op == AttrOp::Exists {
+        let Some((op, v)) = &self.test else {
             return true;
-        }
-        let lower;
-        let have = if self.caseless {
-            lower = have.to_ascii_lowercase();
-            lower.as_str()
-        } else {
-            have
         };
-        let v = self.value.as_str();
-        match self.op {
-            AttrOp::Exists => true,
+        let have = if self.caseless {
+            attr.lower.as_deref()
+        } else {
+            attr.value.as_deref()
+        };
+        let Some(have) = have else {
+            // Too long to keep: no value test matches it.
+            return false;
+        };
+        if !budget.work(have.len() / 16 + 1) {
+            return false;
+        }
+        let v = v.as_str();
+        match op {
             AttrOp::Equals => have == v,
             AttrOp::Includes => {
                 !v.is_empty()
@@ -414,7 +454,7 @@ struct Compound {
 }
 
 impl Compound {
-    fn matches(&self, e: &ElemKey) -> bool {
+    fn matches(&self, e: &ElemKey, budget: &Budget) -> bool {
         self.tag.as_ref().is_none_or(|t| *t == e.tag)
             && self.id.as_ref().is_none_or(|i| e.id.as_ref() == Some(i))
             && self.classes.iter().all(|c| e.classes.contains(c))
@@ -423,7 +463,7 @@ impl Compound {
                 Pseudo::Link => e.link,
                 Pseudo::Root => e.tag == "html",
             })
-            && self.attrs.iter().all(|a| a.matches(e))
+            && self.attrs.iter().all(|a| a.matches(e, budget))
     }
 
     fn heap(&self) -> usize {
@@ -433,7 +473,11 @@ impl Compound {
             + self
                 .attrs
                 .iter()
-                .map(|a| a.name.len() + a.value.len() + std::mem::size_of::<AttrSel>())
+                .map(|a| {
+                    a.name.len()
+                        + a.test.as_ref().map_or(0, |(_, v)| v.len())
+                        + std::mem::size_of::<AttrSel>()
+                })
                 .sum::<usize>()
             + self.pseudo.len()
     }
@@ -466,8 +510,7 @@ fn attr_sel(text: &str) -> Option<AttrSel> {
     if rest.is_empty() {
         return Some(AttrSel {
             name,
-            op: AttrOp::Exists,
-            value: String::new(),
+            test: None,
             caseless: false,
         });
     }
@@ -518,8 +561,7 @@ fn attr_sel(text: &str) -> Option<AttrSel> {
     };
     Some(AttrSel {
         name,
-        op,
-        value,
+        test: Some((op, value)),
         caseless,
     })
 }
@@ -698,7 +740,7 @@ impl Selector {
     pub(crate) fn matches<P: Path + ?Sized>(&self, path: &P, budget: &Budget) -> bool {
         let d = path.len();
         let k = self.parts.len();
-        if d == 0 || k == 0 || !self.parts[k - 1].matches(path.key(d - 1)) {
+        if d == 0 || k == 0 || !self.parts[k - 1].matches(path.key(d - 1), budget) {
             return false;
         }
         if k == 1 {
@@ -718,7 +760,7 @@ impl Selector {
             match self.combs[j] {
                 Comb::Child => {
                     for l in 1..=hi {
-                        if reach[l].is_some() && part.matches(path.key(l - 1)) {
+                        if reach[l].is_some() && part.matches(path.key(l - 1), budget) {
                             next[l - 1] = Some(0);
                             new_hi = Some(l - 1);
                         }
@@ -726,7 +768,7 @@ impl Selector {
                 }
                 Comb::Descendant => {
                     for e in 0..hi {
-                        if part.matches(path.key(e)) {
+                        if part.matches(path.key(e), budget) {
                             next[e] = Some(0);
                             new_hi = Some(e);
                         }
@@ -737,7 +779,10 @@ impl Selector {
                         let Some(b) = reach[l] else {
                             continue;
                         };
-                        if path.prev(l, b + 1).is_some_and(|key| part.matches(key)) {
+                        if path
+                            .prev(l, b + 1)
+                            .is_some_and(|key| part.matches(key, budget))
+                        {
                             next[l] = Some(b + 1);
                             new_hi = Some(l);
                         }
@@ -784,6 +829,9 @@ pub(crate) struct StyleSheet {
     /// The attribute names its selectors test (#1883), at most
     /// [`MAX_ATTR_NAMES`]: what an element's key keeps of its attributes.
     attr_names: Vec<String>,
+    /// Those of them a selector compares without case: a key keeps their
+    /// values lowercased too.
+    caseless_names: Vec<String>,
     /// A selector has a `+` (#1883): elements keep their preceding
     /// siblings' keys.
     uses_next: bool,
@@ -857,6 +905,11 @@ impl StyleSheet {
                 }
                 let names: Vec<String> = names.into_iter().map(str::to_string).collect();
                 sheet.attr_names.extend(names);
+                for a in sel.parts.iter().flat_map(|p| &p.attrs) {
+                    if a.caseless && !sheet.caseless_names.contains(&a.name) {
+                        sheet.caseless_names.push(a.name.clone());
+                    }
+                }
                 sheet.uses_next |= sel.combs.contains(&Comb::Next);
                 let r = sheet.rules.len() as u32;
                 let last = &sel.parts[sel.parts.len() - 1];
@@ -933,6 +986,11 @@ impl StyleSheet {
     /// The attribute names the selectors test (#1883).
     pub(crate) fn attr_names(&self) -> &[String] {
         &self.attr_names
+    }
+
+    /// Whether a selector compares attribute `name` without case (#1883).
+    pub(crate) fn caseless(&self, name: &str) -> bool {
+        self.caseless_names.iter().any(|n| n == name)
     }
 
     /// Whether a selector has a `+` (#1883).
@@ -1617,22 +1675,16 @@ pub(crate) fn border_shorthand(value: &str) -> Option<BorderSide> {
 /// parts, as top, right, bottom, left, each read by `part`.
 pub(crate) fn border_sides<T: Clone>(value: &str, part: fn(&str) -> Option<T>) -> Option<[T; 4]> {
     let vals: Vec<T> = tokens(value).into_iter().map(part).collect::<Option<_>>()?;
-    Some(match vals.as_slice() {
+    four_sides(&vals)
+}
+
+/// One to four box values as top, right, bottom, left.
+fn four_sides<T: Clone>(vals: &[T]) -> Option<[T; 4]> {
+    Some(match vals {
         [a] => [a.clone(), a.clone(), a.clone(), a.clone()],
         [a, b] => [a.clone(), b.clone(), a.clone(), b.clone()],
         [a, b, c] => [a.clone(), b.clone(), c.clone(), b.clone()],
         [a, b, c, d] => [a.clone(), b.clone(), c.clone(), d.clone()],
-        _ => return None,
-    })
-}
-
-/// One to four box values as top, right, bottom, left.
-fn four_sides<T: Copy>(vals: &[T]) -> Option<[T; 4]> {
-    Some(match vals {
-        [a] => [*a, *a, *a, *a],
-        [a, b] => [*a, *b, *a, *b],
-        [a, b, c] => [*a, *b, *c, *b],
-        [a, b, c, d] => [*a, *b, *c, *d],
         _ => return None,
     })
 }
@@ -2413,11 +2465,19 @@ mod tests {
         ElemKey {
             index,
             link: tag == "a" && attrs.iter().any(|(n, _)| *n == "href"),
-            attrs: attrs
-                .iter()
-                .map(|(n, v)| (n.to_string(), v.to_string()))
-                .collect(),
             ..key(tag, None, None)
+        }
+        .with_attrs(attrs)
+    }
+
+    impl ElemKey {
+        /// The key with `attrs` kept, as for a sheet comparing every one
+        /// both ways.
+        fn with_attrs(mut self, attrs: &[(&str, &str)]) -> Self {
+            for (n, v) in attrs {
+                self.keep_attr(n, v, true);
+            }
+            self
         }
     }
 
@@ -2476,6 +2536,25 @@ mod tests {
         assert_eq!(spec("a[href]"), spec("a.x"));
         assert_eq!(spec("a:link"), spec("a.x"));
         assert!(spec("#i") > spec("a[href][title]:link"));
+    }
+
+    #[test]
+    fn a_value_past_the_cap_is_present_but_never_matches_a_test_1883() {
+        let b = budget();
+        let long = "x".repeat(MAX_ATTR_VALUE + 1);
+        let fits = "x".repeat(MAX_ATTR_VALUE);
+        let m = |value: &str, sel: &str| {
+            Selector::parse(sel)
+                .unwrap()
+                .matches(&[elem("td", 0, &[("title", value)])][..], &b)
+        };
+        assert!(m(&long, "[title]"));
+        for sel in ["[title*=x]", "[title^=x]", "[title$=x]", "[title*=X i]"] {
+            assert!(!m(&long, sel), "{sel}");
+            assert!(m(&fits, sel), "{sel}");
+        }
+        assert!(m(&fits, &format!("[title={fits}]")));
+        assert!(!m(&long, &format!("[title={long}]")));
     }
 
     #[test]
