@@ -758,6 +758,59 @@ impl OutboxOp {
         }
     }
 
+    /// The event an event op with a local write names, as it was queued,
+    /// and what that write is (#2031): an op whose command wrote the store
+    /// before it was queued (an RSVP, edited fields, a deleted row), which
+    /// a calendar round must not undo while the op waits (`EventHolds`).
+    /// `None` for every other op: `CreateEvent`'s `local:` row is never
+    /// replaced, `UpdateEventSeries`, `ForwardEvent` and the reminder ops
+    /// write nothing locally, and an `UpdateEvent` with no `fields` sends
+    /// nothing, so it has no write to keep. Exhaustive, so a new op must
+    /// say which it is.
+    pub fn event_local_write(&self) -> Option<(&str, EventWrite)> {
+        match self {
+            OutboxOp::RespondEvent { id, .. } => Some((id, EventWrite::Written)),
+            OutboxOp::UpdateEvent { id, fields } if !fields.is_empty() => {
+                Some((id, EventWrite::Written))
+            }
+            OutboxOp::DeleteEvent { id } | OutboxOp::CancelEvent { id, .. } => {
+                Some((id, EventWrite::Removed))
+            }
+            OutboxOp::UpdateEvent { .. }
+            | OutboxOp::CreateEvent { .. }
+            | OutboxOp::ForwardEvent { .. }
+            | OutboxOp::UpdateEventSeries { .. }
+            | OutboxOp::DismissReminder { .. }
+            | OutboxOp::SnoozeReminder { .. }
+            | OutboxOp::MarkRead { .. }
+            | OutboxOp::SetFlag { .. }
+            | OutboxOp::SetCategories { .. }
+            | OutboxOp::Move { .. }
+            | OutboxOp::Delete { .. }
+            | OutboxOp::SaveDraft { .. }
+            | OutboxOp::SendDraft { .. }
+            | OutboxOp::DismissMessageReminder { .. }
+            | OutboxOp::SnoozeMessageReminder { .. }
+            | OutboxOp::CreateContact { .. }
+            | OutboxOp::UpdateContact { .. }
+            | OutboxOp::DeleteContact { .. }
+            | OutboxOp::SetContactPhoto { .. }
+            | OutboxOp::CreateFolder { .. }
+            | OutboxOp::RenameFolder { .. }
+            | OutboxOp::MoveFolder { .. }
+            | OutboxOp::MarkFolderRead { .. }
+            | OutboxOp::DeleteFolder { .. }
+            | OutboxOp::EmptyFolder { .. }
+            | OutboxOp::CopyFolder { .. }
+            | OutboxOp::MoveFolderMessages { .. }
+            // Its DELETE happens before the engine deletes any row.
+            | OutboxOp::RespondMeeting { .. }
+            | OutboxOp::RemoveFromCalendar { .. }
+            | OutboxOp::SetAutomaticReplies { .. }
+            | OutboxOp::SaveAttachment { .. } => None,
+        }
+    }
+
     /// The `kind` tag stored alongside the JSON payload (used for the
     /// `outbox.op` column, which is `NOT NULL`; the payload itself is the
     /// source of truth when reading a row back).
@@ -1388,6 +1441,55 @@ pub struct FetchedCalendar {
     pub calendar_id: String,
     pub events: Vec<NewEvent>,
     pub attendees: Vec<(String, Vec<NewAttendee>)>,
+}
+
+/// What a pending event write did to its row (#2031,
+/// `OutboxOp::event_local_write`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventWrite {
+    /// The row holds the write (an RSVP, edited fields): it stays as
+    /// stored.
+    Written,
+    /// The row was deleted (one event, or a series by its master's id):
+    /// it is not brought back.
+    Removed,
+}
+
+/// The events a calendar round leaves as stored (#2031): those a pending
+/// local write names. `Store::apply_calendar_sync` and
+/// `Store::apply_calendar_range` hold the events of every queued op with a
+/// local write (`OutboxOp::event_local_write`), read in the round's own
+/// transaction, plus the ones their caller passes: the sync engine's
+/// commands not yet queued whose host wrote the store before sending them.
+///
+/// A `written` id's row is neither deleted by an initial round nor
+/// overwritten by any round's upsert, nor filled from its series master; a
+/// `removed` id is not upserted, nor is an event whose `series_master_id`
+/// it is (a series deleted locally), nor their attendees. A delta round's
+/// removals still go: Graph says the event is gone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventHolds {
+    pub written: HashSet<String>,
+    pub removed: HashSet<String>,
+}
+
+impl EventHolds {
+    /// Holds `id` for a write of kind `write`.
+    pub fn hold(&mut self, id: &str, write: EventWrite) {
+        match write {
+            EventWrite::Written => self.written.insert(id.to_string()),
+            EventWrite::Removed => self.removed.insert(id.to_string()),
+        };
+    }
+
+    /// Whether a round must not upsert `e` (nor its attendees).
+    fn skips(&self, e: &NewEvent) -> bool {
+        self.written.contains(&e.id)
+            || self.removed.contains(&e.id)
+            || e.series_master_id
+                .as_ref()
+                .is_some_and(|m| self.removed.contains(m))
+    }
 }
 
 /// What one calendar's round of a sync pass fetched (#2013).
@@ -5716,6 +5818,15 @@ impl Store {
     ///    known) and `local:` rows are kept. The fetched ranges and the
     ///    delta state of every calendar not synced go too, events or not
     ///    (#2014, #2013).
+    ///
+    /// No round undoes a pending local write (#2031, `EventHolds`): the
+    /// events of the queued event ops with one, read in this transaction,
+    /// and `apply_calendar_sync_holding`'s `held`, keep their rows (or
+    /// their absence) until the op is gone. A kept row converges after:
+    /// the op's PATCH, RSVP or DELETE changes the event on Graph, so a
+    /// later delta round names it (this round's deltaLink predates it);
+    /// an op that fails for good is quarantined, and its calendar reset's
+    /// initial rounds, the op gone, replace the row.
     pub fn apply_calendar_sync(
         &self,
         from_utc: &str,
@@ -5723,14 +5834,31 @@ impl Store {
         fetched: &[SyncedCalendar],
         stamp: RangeStamp,
     ) -> Result<(), StoreError> {
+        self.apply_calendar_sync_holding(from_utc, to_utc, fetched, stamp, &EventHolds::default())
+    }
+
+    /// `apply_calendar_sync`, holding `held`'s events too (#2031): the
+    /// sync engine's waiting commands whose host wrote the store before
+    /// sending them, which have no op queued yet.
+    pub fn apply_calendar_sync_holding(
+        &self,
+        from_utc: &str,
+        to_utc: &str,
+        fetched: &[SyncedCalendar],
+        stamp: RangeStamp,
+        held: &EventHolds,
+    ) -> Result<(), StoreError> {
         let tx = self.write_tx()?;
         adopt_blank_calendar_rows_on(&tx)?;
+        let holds = queued_event_holds_on(&tx, held)?;
         for c in fetched {
             // Read before the round's writes replace the masters.
             let changed = changed_masters_on(&tx, &c.fetched)?;
             let cascaded = match &c.round {
                 CalendarRound::Window => {
-                    replace_calendar_range_on(&tx, from_utc, to_utc, &c.fetched, stamp, false)?;
+                    replace_calendar_range_on(
+                        &tx, from_utc, to_utc, &c.fetched, stamp, false, &holds,
+                    )?;
                     false
                 }
                 CalendarRound::Delta {
@@ -5744,9 +5872,10 @@ impl Store {
                     removed,
                     gone_masters,
                     stamp,
+                    &holds,
                 )?,
             };
-            fill_occurrences_on(&tx, &c.fetched, &changed)?;
+            fill_occurrences_on(&tx, &c.fetched, &changed, &holds)?;
             if cascaded {
                 tx.execute(
                     "DELETE FROM calendar_deltas WHERE calendar_id = ?1",
@@ -5792,7 +5921,9 @@ impl Store {
     /// 1), then the calendar's synced (non-`local:`) events overlapping the
     /// range are replaced by `f`'s, and the range is recorded as fetched at
     /// `stamp`. Other calendars' rows, and rows of other calendars that no
-    /// longer sync, are left to the sync pass.
+    /// longer sync, are left to the sync pass. Rows with a pending local
+    /// write are kept as `apply_calendar_sync` keeps them (#2031,
+    /// `EventHolds`).
     pub fn apply_calendar_range(
         &self,
         from_utc: &str,
@@ -5800,9 +5931,23 @@ impl Store {
         f: &FetchedCalendar,
         stamp: RangeStamp,
     ) -> Result<(), StoreError> {
+        self.apply_calendar_range_holding(from_utc, to_utc, f, stamp, &EventHolds::default())
+    }
+
+    /// `apply_calendar_range`, holding `held`'s events too (#2031), as
+    /// `apply_calendar_sync_holding`.
+    pub fn apply_calendar_range_holding(
+        &self,
+        from_utc: &str,
+        to_utc: &str,
+        f: &FetchedCalendar,
+        stamp: RangeStamp,
+        held: &EventHolds,
+    ) -> Result<(), StoreError> {
         let tx = self.write_tx()?;
         adopt_blank_calendar_rows_on(&tx)?;
-        replace_calendar_range_on(&tx, from_utc, to_utc, f, stamp, true)?;
+        let holds = queued_event_holds_on(&tx, held)?;
+        replace_calendar_range_on(&tx, from_utc, to_utc, f, stamp, true, &holds)?;
         tx.commit()?;
         Ok(())
     }
@@ -9432,6 +9577,9 @@ fn adopt_blank_calendar_rows_on(conn: &Connection) -> Result<(), StoreError> {
 /// replacing the range holding a series' first occurrence (the master's
 /// own times) would drop the master its occurrences are filled from. A
 /// delta round's initial window returns them, so it replaces them too.
+///
+/// A `holds.written` row (#2031) is not deleted, and no held event is
+/// upserted (`upsert_fetched_events_on`).
 fn replace_calendar_range_on(
     conn: &Connection,
     from_utc: &str,
@@ -9439,23 +9587,44 @@ fn replace_calendar_range_on(
     f: &FetchedCalendar,
     stamp: RangeStamp,
     keep_masters: bool,
+    holds: &EventHolds,
 ) -> Result<(), StoreError> {
-    conn.execute(
-        "DELETE FROM events
-         WHERE calendar_id = ?3 AND start_utc < ?2 AND end_utc > ?1
-               AND id NOT LIKE 'local:%'
-               AND NOT (?4 AND event_type = 'seriesMaster')",
-        params![from_utc, to_utc, f.calendar_id, keep_masters],
-    )?;
-    upsert_fetched_events_on(conn, f)?;
+    let replaced: Vec<String> = conn
+        .prepare(
+            "SELECT id FROM events
+             WHERE calendar_id = ?3 AND start_utc < ?2 AND end_utc > ?1
+                   AND id NOT LIKE 'local:%'
+                   AND NOT (?4 AND event_type = 'seriesMaster')",
+        )?
+        .query_map(
+            params![from_utc, to_utc, f.calendar_id, keep_masters],
+            |r| r.get(0),
+        )?
+        .collect::<Result<_, _>>()?;
+    {
+        let mut delete = conn.prepare_cached("DELETE FROM events WHERE id = ?1")?;
+        for id in replaced.iter().filter(|id| !holds.written.contains(*id)) {
+            delete.execute(params![id])?;
+        }
+    }
+    upsert_fetched_events_on(conn, f, holds)?;
     record_calendar_range_on(conn, &f.calendar_id, from_utc, to_utc, stamp)
 }
 
 /// Upserts `f`'s events, each under `f.calendar_id` (the URL decides,
-/// #1984), and replaces their attendees.
-fn upsert_fetched_events_on(conn: &Connection, f: &FetchedCalendar) -> Result<(), StoreError> {
+/// #1984), and replaces their attendees, except the events `holds` keeps
+/// as stored (#2031, `EventHolds::skips`): their rows and attendees, or
+/// their absence, stay.
+fn upsert_fetched_events_on(
+    conn: &Connection,
+    f: &FetchedCalendar,
+    holds: &EventHolds,
+) -> Result<(), StoreError> {
+    let mut skipped: HashSet<&str> = HashSet::new();
     for e in &f.events {
-        if e.calendar_id == f.calendar_id {
+        if holds.skips(e) {
+            skipped.insert(e.id.as_str());
+        } else if e.calendar_id == f.calendar_id {
             upsert_event_on(conn, e)?;
         } else {
             let e = NewEvent {
@@ -9466,9 +9635,25 @@ fn upsert_fetched_events_on(conn: &Connection, f: &FetchedCalendar) -> Result<()
         }
     }
     for (id, atts) in &f.attendees {
-        put_event_attendees_on(conn, id, atts)?;
+        if !skipped.contains(id.as_str()) {
+            put_event_attendees_on(conn, id, atts)?;
+        }
     }
     Ok(())
+}
+
+/// `held` plus the events of every queued op with a local write
+/// (`OutboxOp::event_local_write`), as the outbox on `conn` holds them now
+/// (#2031). A `local:` id may be among them: no round replaces such a row
+/// anyway.
+fn queued_event_holds_on(conn: &Connection, held: &EventHolds) -> Result<EventHolds, StoreError> {
+    let mut holds = held.clone();
+    for row in pending_ops_on(conn)? {
+        if let Some((id, write)) = row.op.event_local_write() {
+            holds.hold(id, write);
+        }
+    }
+    Ok(holds)
 }
 
 /// Applies one calendar's delta round (#2013, `apply_calendar_sync`'s
@@ -9497,6 +9682,11 @@ fn upsert_fetched_events_on(conn: &Connection, f: &FetchedCalendar) -> Result<()
 /// only have changed (its series end moved past the window, say), so the
 /// next pass's initial round restores the occurrences Graph still has,
 /// or confirms they are gone.
+///
+/// The upserts skip the events `holds` keeps as stored (#2031): a later
+/// edit queued behind a drained one would otherwise be overwritten. The
+/// removals do not: Graph says the event is gone.
+#[allow(clippy::too_many_arguments)]
 fn apply_calendar_delta_on(
     conn: &Connection,
     from_utc: &str,
@@ -9505,6 +9695,7 @@ fn apply_calendar_delta_on(
     removed: &[String],
     gone_masters: &[String],
     stamp: RangeStamp,
+    holds: &EventHolds,
 ) -> Result<bool, StoreError> {
     let named_masters: HashSet<&str> = f
         .events
@@ -9537,7 +9728,7 @@ fn apply_calendar_delta_on(
             params![f.calendar_id, id],
         )?;
     }
-    upsert_fetched_events_on(conn, f)?;
+    upsert_fetched_events_on(conn, f, holds)?;
     if !cascaded {
         record_calendar_range_on(conn, &f.calendar_id, from_utc, to_utc, stamp)?;
     }
@@ -9581,10 +9772,15 @@ const SERIES_FIELDS: &str = "subject, location, organizer_name, organizer_addr,
 /// The master's `SERIES_FIELDS` are copied and its attendees replace the
 /// occurrence's. This runs after `upsert_fetched_events_on`, which writes
 /// each minimal occurrence's own (empty) attendee list, so the copy wins.
+///
+/// An occurrence with a pending local write (`holds.written`, #2031) is
+/// never filled, even from a changed master: its RSVP or edit waits for
+/// its op.
 fn fill_occurrences_on(
     conn: &Connection,
     f: &FetchedCalendar,
     changed: &HashSet<String>,
+    holds: &EventHolds,
 ) -> Result<(), StoreError> {
     let touched_occurrences: HashSet<&str> = f
         .events
@@ -9607,6 +9803,9 @@ fn fill_occurrences_on(
         })?
         .collect::<Result<_, _>>()?;
     for (id, master, blank) in candidates {
+        if holds.written.contains(&id) {
+            continue;
+        }
         if !(blank || touched_occurrences.contains(id.as_str()) || changed.contains(&master)) {
             continue;
         }
@@ -17394,6 +17593,330 @@ mod calendar_tests {
         s.apply_calendar_sync(FROM, TO, &[window("A", vec![])], STAMP)
             .unwrap();
         assert!(!s.has_series_master("A", "M").unwrap());
+    }
+
+    // --- Rows with a pending local write survive every round (#2031) ---
+
+    const E_START: &str = "2026-07-20T10:00:00Z";
+    const E_END: &str = "2026-07-20T11:00:00Z";
+    const E2_START: &str = "2026-07-21T10:00:00Z";
+    const E2_END: &str = "2026-07-21T11:00:00Z";
+
+    /// Graph's `E1` and `E2` of calendar `A`, each with attendee ann.
+    fn graph_events() -> Vec<NewEvent> {
+        vec![
+            in_cal("E1", "A", E_START, E_END),
+            in_cal("E2", "A", E2_START, E2_END),
+        ]
+    }
+
+    fn with_ann(mut f: FetchedCalendar) -> FetchedCalendar {
+        for (_, atts) in &mut f.attendees {
+            *atts = vec![attendee("ann@x")];
+        }
+        f
+    }
+
+    /// An initial round of `A` with `events`, each with attendee ann.
+    fn ann_window(events: Vec<NewEvent>) -> SyncedCalendar {
+        let mut round = window("A", events);
+        round.fetched = with_ann(round.fetched);
+        round
+    }
+
+    /// Calendar `A` after an initial round of `graph_events`.
+    fn synced_store() -> Store {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_calendars(&[cal("A", true, "me@x")]).unwrap();
+        s.apply_calendar_sync(FROM, TO, &[ann_window(graph_events())], STAMP)
+            .unwrap();
+        assert_eq!(addrs(&s, "E1"), ["ann@x"]);
+        s
+    }
+
+    /// The host's edit of `id`: a new subject, location and end, and
+    /// attendee bob instead of ann, as `update_event_fields` leaves the row.
+    fn edit_locally(s: &Store, id: &str) {
+        let r = row(s, id);
+        s.upsert_event(&NewEvent {
+            subject: "Edited".into(),
+            location: "Room 9".into(),
+            end_utc: "2026-07-20T12:00:00Z".into(),
+            ..in_cal(id, "A", &r.start_utc, &r.end_utc)
+        })
+        .unwrap();
+        s.put_event_attendees(id, &[attendee("bob@x")]).unwrap();
+    }
+
+    fn update_op(id: &str) -> OutboxOp {
+        OutboxOp::UpdateEvent {
+            id: id.into(),
+            fields: EventFieldSet::SUBJECT,
+        }
+    }
+
+    fn respond_op(id: &str) -> OutboxOp {
+        OutboxOp::RespondEvent {
+            id: id.into(),
+            kind: "declined".into(),
+            comment: None,
+            send_response: true,
+            proposed_start_utc: None,
+            proposed_end_utc: None,
+        }
+    }
+
+    fn assert_edited(s: &Store, id: &str) {
+        let r = row(s, id);
+        assert_eq!(
+            (r.subject.as_str(), r.location.as_str(), r.end_utc.as_str()),
+            ("Edited", "Room 9", "2026-07-20T12:00:00Z"),
+            "{id} keeps its local edit"
+        );
+        assert_eq!(addrs(s, id), ["bob@x"], "{id} keeps its local attendees");
+    }
+
+    #[test]
+    fn event_local_write_names_the_ops_whose_command_wrote_the_row() {
+        let w = |op: OutboxOp| {
+            op.event_local_write()
+                .map(|(id, write)| (id.to_string(), write))
+        };
+        assert_eq!(w(respond_op("R")), Some(("R".into(), EventWrite::Written)));
+        assert_eq!(w(update_op("U")), Some(("U".into(), EventWrite::Written)));
+        assert_eq!(
+            w(OutboxOp::DeleteEvent { id: "D".into() }),
+            Some(("D".into(), EventWrite::Removed))
+        );
+        assert_eq!(
+            w(OutboxOp::CancelEvent {
+                id: "C".into(),
+                comment: Some("off".into()),
+            }),
+            Some(("C".into(), EventWrite::Removed))
+        );
+        // An edit that changed nothing sends nothing, so holds nothing.
+        assert_eq!(
+            w(OutboxOp::UpdateEvent {
+                id: "U".into(),
+                fields: EventFieldSet::default(),
+            }),
+            None
+        );
+        for op in [
+            OutboxOp::CreateEvent {
+                id: "local:1".into(),
+            },
+            OutboxOp::UpdateEventSeries {
+                id: "M".into(),
+                body: "{}".into(),
+            },
+            OutboxOp::ForwardEvent {
+                id: "F".into(),
+                to: Vec::new(),
+                comment: None,
+            },
+            OutboxOp::DismissReminder { id: "E".into() },
+            OutboxOp::SnoozeReminder {
+                id: "E".into(),
+                new_reminder_utc: "2026-07-20T09:00:00Z".into(),
+            },
+            OutboxOp::RemoveFromCalendar {
+                message_id: "m".into(),
+            },
+            OutboxOp::MarkRead {
+                id: "m".into(),
+                read: true,
+            },
+        ] {
+            assert_eq!(w(op.clone()), None, "{op:?}");
+        }
+    }
+
+    #[test]
+    fn initial_round_keeps_a_row_with_a_queued_update() {
+        let s = synced_store();
+        edit_locally(&s, "E1");
+        s.enqueue_op(&update_op("E1")).unwrap();
+        // Graph still has the old values.
+        s.apply_calendar_sync(FROM, TO, &[ann_window(graph_events())], STAMP)
+            .unwrap();
+        assert_edited(&s, "E1");
+        // E2, with no op, is Graph's.
+        assert_eq!(row(&s, "E2").subject, "sE2");
+        // A round without it does not delete it either.
+        s.apply_calendar_sync(FROM, TO, &[ann_window(vec![])], STAMP)
+            .unwrap();
+        assert_edited(&s, "E1");
+        assert!(s.event("E2").unwrap().is_none());
+    }
+
+    #[test]
+    fn initial_round_keeps_a_queued_response() {
+        let s = synced_store();
+        s.set_event_response("E1", "declined", "2026-07-15T08:00:00Z")
+            .unwrap();
+        s.enqueue_op(&respond_op("E1")).unwrap();
+        s.apply_calendar_sync(FROM, TO, &[ann_window(graph_events())], STAMP)
+            .unwrap();
+        let r = row(&s, "E1");
+        assert_eq!(r.response_status, "declined");
+        assert_eq!(r.response_time, "2026-07-15T08:00:00Z");
+    }
+
+    #[test]
+    fn initial_round_does_not_bring_back_a_queued_delete() {
+        for op in [
+            OutboxOp::DeleteEvent { id: "E2".into() },
+            OutboxOp::CancelEvent {
+                id: "E2".into(),
+                comment: None,
+            },
+        ] {
+            let s = synced_store();
+            s.delete_event("E2").unwrap();
+            s.enqueue_op(&op).unwrap();
+            s.apply_calendar_sync(FROM, TO, &[ann_window(graph_events())], STAMP)
+                .unwrap();
+            assert!(s.event("E2").unwrap().is_none(), "{op:?}");
+            assert!(addrs(&s, "E2").is_empty(), "{op:?}");
+            assert_eq!(addrs(&s, "E1"), ["ann@x"], "{op:?}");
+        }
+    }
+
+    #[test]
+    fn initial_round_does_not_bring_back_a_deleted_series() {
+        let s = series_store();
+        s.delete_event_series("M").unwrap();
+        s.enqueue_op(&OutboxOp::DeleteEvent { id: "M".into() })
+            .unwrap();
+        s.apply_calendar_sync(FROM, TO, &[series_round()], STAMP)
+            .unwrap();
+        for id in ["M", "O1", "O2", "X"] {
+            assert!(s.event(id).unwrap().is_none(), "{id} stays deleted");
+            assert!(addrs(&s, id).is_empty(), "{id} has no attendees back");
+        }
+    }
+
+    #[test]
+    fn calendar_range_keeps_rows_with_queued_event_ops() {
+        let s = synced_store();
+        edit_locally(&s, "E1");
+        s.enqueue_op(&update_op("E1")).unwrap();
+        s.delete_event("E2").unwrap();
+        s.enqueue_op(&OutboxOp::DeleteEvent { id: "E2".into() })
+            .unwrap();
+        let (a, b) = ("2026-07-20T00:00:00Z", "2026-07-22T00:00:00Z");
+        s.apply_calendar_range(a, b, &with_ann(fetched("A", graph_events())), STAMP)
+            .unwrap();
+        assert_edited(&s, "E1");
+        assert!(s.event("E2").unwrap().is_none());
+        // A range without E1 keeps it too.
+        s.apply_calendar_range(a, b, &fetched("A", vec![]), STAMP)
+            .unwrap();
+        assert_edited(&s, "E1");
+    }
+
+    #[test]
+    fn delta_round_does_not_overwrite_a_queued_update() {
+        let s = synced_store();
+        edit_locally(&s, "E1");
+        s.enqueue_op(&update_op("E1")).unwrap();
+        s.delete_event("E2").unwrap();
+        s.enqueue_op(&OutboxOp::DeleteEvent { id: "E2".into() })
+            .unwrap();
+        // Graph changed both (an earlier edit drained, say).
+        let changed: Vec<NewEvent> = graph_events()
+            .into_iter()
+            .map(|e| NewEvent {
+                subject: "From Graph".into(),
+                ..e
+            })
+            .collect();
+        let mut round = delta("A", changed, &[], "L2");
+        round.fetched = with_ann(round.fetched);
+        s.apply_calendar_sync(FROM, TO, &[round], STAMP).unwrap();
+        assert_edited(&s, "E1");
+        assert!(s.event("E2").unwrap().is_none());
+        assert!(addrs(&s, "E2").is_empty());
+    }
+
+    #[test]
+    fn fill_occurrences_skips_an_occurrence_with_a_queued_response() {
+        let s = series_store();
+        s.set_event_response("O1", "declined", "2026-08-13T19:19:00Z")
+            .unwrap();
+        s.enqueue_op(&respond_op("O1")).unwrap();
+        // A changed master, which fills every occurrence of the series
+        // (`apply_calendar_sync_delta_master_change_refreshes_its_occurrences`).
+        let changed = NewEvent {
+            subject: "Renamed".into(),
+            last_modified: "2026-08-14T00:00:00Z".into(),
+            ..master("M", "A", M_START, M_END)
+        };
+        s.apply_calendar_sync(FROM, TO, &[delta("A", vec![changed], &[], "L2")], STAMP)
+            .unwrap();
+        let o1 = row(&s, "O1");
+        assert_eq!(o1.response_status, "declined");
+        assert_eq!(o1.response_time, "2026-08-13T19:19:00Z");
+        assert_eq!(o1.subject, "Standup", "O1 is not filled while its op waits");
+        assert_eq!(row(&s, "O2").subject, "Renamed");
+    }
+
+    #[test]
+    fn initial_round_ignores_an_empty_field_update() {
+        let s = synced_store();
+        edit_locally(&s, "E1");
+        s.enqueue_op(&OutboxOp::UpdateEvent {
+            id: "E1".into(),
+            fields: EventFieldSet::default(),
+        })
+        .unwrap();
+        s.apply_calendar_sync(FROM, TO, &[ann_window(graph_events())], STAMP)
+            .unwrap();
+        assert_eq!(row(&s, "E1").subject, "sE1");
+        assert_eq!(addrs(&s, "E1"), ["ann@x"]);
+    }
+
+    #[test]
+    fn initial_round_replaces_a_row_once_its_op_is_gone() {
+        let s = synced_store();
+        edit_locally(&s, "E1");
+        let seq = s.enqueue_op(&update_op("E1")).unwrap();
+        s.apply_calendar_sync(FROM, TO, &[ann_window(graph_events())], STAMP)
+            .unwrap();
+        assert_edited(&s, "E1");
+        s.drop_op(seq).unwrap();
+        s.apply_calendar_sync(FROM, TO, &[ann_window(graph_events())], STAMP)
+            .unwrap();
+        let r = row(&s, "E1");
+        assert_eq!((r.subject.as_str(), r.end_utc.as_str()), ("sE1", E_END));
+        assert_eq!(addrs(&s, "E1"), ["ann@x"]);
+    }
+
+    #[test]
+    fn holding_applies_keep_the_callers_holds() {
+        // No op queued: the caller's holds (the engine's waiting commands).
+        let s = synced_store();
+        edit_locally(&s, "E1");
+        s.delete_event("E2").unwrap();
+        let mut held = EventHolds::default();
+        held.hold("E1", EventWrite::Written);
+        held.hold("E2", EventWrite::Removed);
+        s.apply_calendar_sync_holding(FROM, TO, &[ann_window(graph_events())], STAMP, &held)
+            .unwrap();
+        assert_edited(&s, "E1");
+        assert!(s.event("E2").unwrap().is_none());
+        let (a, b) = ("2026-07-20T00:00:00Z", "2026-07-22T00:00:00Z");
+        s.apply_calendar_range_holding(a, b, &with_ann(fetched("A", graph_events())), STAMP, &held)
+            .unwrap();
+        assert_edited(&s, "E1");
+        assert!(s.event("E2").unwrap().is_none());
+        // Without them, Graph's rows come back.
+        s.apply_calendar_sync(FROM, TO, &[ann_window(graph_events())], STAMP)
+            .unwrap();
+        assert_eq!(row(&s, "E1").subject, "sE1");
+        assert_eq!(row(&s, "E2").subject, "sE2");
     }
 
     #[test]
