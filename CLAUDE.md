@@ -239,7 +239,8 @@ issue number to find its notes.
   sign-in with a token held keeping it, no fallback while it holds the required scopes
   (#2213), a failed mark-sent, local RSVP, outbox drop or attempt count told (#2215),
   a person's details by address from /me/people (#2239), a calendar round keeping
-  a pending event write, the commands waiting during a refresh too (#2031),
+  a pending event write, the commands waiting during a refresh too (#2031), a
+  host write made while it fetched and a delta removal (#2262),
   an edit during an event's in-flight create queued by its reconcile (#2005),
   lookxy's bounded wait for the engine at quit (#2131).
 
