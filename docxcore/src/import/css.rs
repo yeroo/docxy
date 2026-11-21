@@ -29,6 +29,61 @@ pub(crate) const MAX_COMPOUNDS: usize = 32;
 pub(crate) const MAX_NAME: usize = 64;
 /// The most classes an element keeps.
 pub(crate) const MAX_CLASSES: usize = 32;
+/// The most distinct attribute names a sheet's selectors may name
+/// (#1883); a selector naming another is dropped alone.
+pub(crate) const MAX_ATTR_NAMES: usize = 32;
+
+/// Attributes whose values HTML compares ASCII case-insensitively in a
+/// selector (the HTML Standard's list, #1883), sorted: `td[align=center]`
+/// matches `align=Center`.
+const CASELESS_ATTRS: [&str; 46] = [
+    "accept",
+    "accept-charset",
+    "align",
+    "alink",
+    "axis",
+    "bgcolor",
+    "charset",
+    "checked",
+    "clear",
+    "codetype",
+    "color",
+    "compact",
+    "declare",
+    "defer",
+    "dir",
+    "direction",
+    "disabled",
+    "enctype",
+    "face",
+    "frame",
+    "hreflang",
+    "http-equiv",
+    "lang",
+    "language",
+    "link",
+    "media",
+    "method",
+    "multiple",
+    "nohref",
+    "noresize",
+    "noshade",
+    "nowrap",
+    "readonly",
+    "rel",
+    "rev",
+    "rules",
+    "scope",
+    "scrolling",
+    "selected",
+    "shape",
+    "target",
+    "text",
+    "type",
+    "valign",
+    "valuetype",
+    "vlink",
+];
 
 /// One `property: value [!important]`.
 #[derive(Debug, Clone, PartialEq)]
@@ -180,12 +235,21 @@ fn tokens(value: &str) -> Vec<&str> {
 // Selectors and style sheets
 
 /// What a selector compound compares against: an element's tag, id and
-/// classes, all lowercased.
+/// classes, all lowercased, and since #1883 its place among its parent's
+/// element children, whether it is a link, and the attributes the sheet's
+/// selectors name.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ElemKey {
     pub(crate) tag: String,
     pub(crate) id: Option<String>,
     pub(crate) classes: Vec<String>,
+    /// How many element children of its parent come before it.
+    pub(crate) index: u32,
+    /// An `a`, `area` or `link` with an `href` (`:link`, `:any-link`).
+    pub(crate) link: bool,
+    /// The attributes named in [`StyleSheet::attr_names`] it has: name
+    /// (lowercase) and value (character references decoded).
+    pub(crate) attrs: Vec<(String, String)>,
 }
 
 impl ElemKey {
@@ -213,6 +277,7 @@ impl ElemKey {
             tag: tag.to_ascii_lowercase(),
             id,
             classes,
+            ..ElemKey::default()
         }
     }
 
@@ -221,6 +286,18 @@ impl ElemKey {
         self.tag.len()
             + self.id.as_ref().map_or(0, String::len)
             + self.classes.iter().map(String::len).sum::<usize>()
+            + self
+                .attrs
+                .iter()
+                .map(|(n, v)| n.len() + v.len())
+                .sum::<usize>()
+    }
+
+    fn attr(&self, name: &str) -> Option<&str> {
+        self.attrs
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
     }
 }
 
@@ -229,6 +306,9 @@ impl ElemKey {
 pub(crate) trait Path {
     fn len(&self) -> usize;
     fn key(&self, i: usize) -> &ElemKey;
+    /// The element child of `i`'s parent `back` places before `i` (#1883),
+    /// if it is known: a path keeps at most [`MAX_COMPOUNDS`] of them.
+    fn prev(&self, i: usize, back: usize) -> Option<&ElemKey>;
 }
 
 #[cfg(test)]
@@ -239,14 +319,94 @@ impl Path for [ElemKey] {
     fn key(&self, i: usize) -> &ElemKey {
         &self[i]
     }
+    fn prev(&self, _: usize, _: usize) -> Option<&ElemKey> {
+        None
+    }
 }
 
-/// One compound: a tag (`None` for `*` or none written), an id, classes.
+/// An attribute selector's test (#1883).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AttrOp {
+    /// `[a]`
+    Exists,
+    /// `[a=v]`
+    Equals,
+    /// `[a~=v]`: one of its white-space separated words.
+    Includes,
+    /// `[a|=v]`: `v` or `v-` and more.
+    Dash,
+    /// `[a^=v]`, `[a$=v]`, `[a*=v]`
+    Prefix,
+    Suffix,
+    Substring,
+}
+
+/// An attribute selector (#1883): its name (lowercase), test, value, and
+/// whether the value compares ASCII case-insensitively (an `i` flag, or a
+/// name in [`CASELESS_ATTRS`] without an `s` flag; the value is then kept
+/// lowercase).
+#[derive(Debug, Clone, PartialEq)]
+struct AttrSel {
+    name: String,
+    op: AttrOp,
+    value: String,
+    caseless: bool,
+}
+
+impl AttrSel {
+    fn matches(&self, e: &ElemKey) -> bool {
+        let Some(have) = e.attr(&self.name) else {
+            return false;
+        };
+        if self.op == AttrOp::Exists {
+            return true;
+        }
+        let lower;
+        let have = if self.caseless {
+            lower = have.to_ascii_lowercase();
+            lower.as_str()
+        } else {
+            have
+        };
+        let v = self.value.as_str();
+        match self.op {
+            AttrOp::Exists => true,
+            AttrOp::Equals => have == v,
+            AttrOp::Includes => {
+                !v.is_empty()
+                    && !v.contains(|c: char| c.is_ascii_whitespace())
+                    && have.split_ascii_whitespace().any(|w| w == v)
+            }
+            AttrOp::Dash => {
+                have == v || (have.starts_with(v) && have.as_bytes().get(v.len()) == Some(&b'-'))
+            }
+            AttrOp::Prefix => !v.is_empty() && have.starts_with(v),
+            AttrOp::Suffix => !v.is_empty() && have.ends_with(v),
+            AttrOp::Substring => !v.is_empty() && have.contains(v),
+        }
+    }
+}
+
+/// A pseudo-class kept (#1883).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Pseudo {
+    /// `:first-child`
+    FirstChild,
+    /// `:link`, `:any-link` (a page has no visited links)
+    Link,
+    /// `:root`: the `html` element.
+    Root,
+}
+
+/// One compound: a tag (`None` for `*` or none written), an id, classes,
+/// attribute selectors and pseudo-classes.
 #[derive(Debug, Clone, PartialEq)]
 struct Compound {
     tag: Option<String>,
     id: Option<String>,
     classes: Vec<String>,
+    attrs: Vec<AttrSel>,
+    pseudo: Vec<Pseudo>,
 }
 
 impl Compound {
@@ -254,12 +414,24 @@ impl Compound {
         self.tag.as_ref().is_none_or(|t| *t == e.tag)
             && self.id.as_ref().is_none_or(|i| e.id.as_ref() == Some(i))
             && self.classes.iter().all(|c| e.classes.contains(c))
+            && self.pseudo.iter().all(|p| match p {
+                Pseudo::FirstChild => e.index == 0,
+                Pseudo::Link => e.link,
+                Pseudo::Root => e.tag == "html",
+            })
+            && self.attrs.iter().all(|a| a.matches(e))
     }
 
     fn heap(&self) -> usize {
         self.tag.as_ref().map_or(0, String::len)
             + self.id.as_ref().map_or(0, String::len)
             + self.classes.iter().map(String::len).sum::<usize>()
+            + self
+                .attrs
+                .iter()
+                .map(|a| a.name.len() + a.value.len() + std::mem::size_of::<AttrSel>())
+                .sum::<usize>()
+            + self.pseudo.len()
     }
 }
 
@@ -268,6 +440,84 @@ impl Compound {
 enum Comb {
     Descendant,
     Child,
+    /// `+`: the element right before it among its parent's children
+    /// (#1883).
+    Next,
+}
+
+/// An attribute selector's text, between `[` and `]` (#1883): a name, then
+/// nothing or a test, a value (an identifier or a quoted string with no
+/// escapes) and an optional `i` / `s` flag.
+fn attr_sel(text: &str) -> Option<AttrSel> {
+    let t = text.trim();
+    let name_end = t
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .unwrap_or(t.len());
+    let name = &t[..name_end];
+    if name.is_empty() || name.len() > MAX_NAME {
+        return None;
+    }
+    let name = name.to_ascii_lowercase();
+    let rest = t[name_end..].trim_start();
+    if rest.is_empty() {
+        return Some(AttrSel {
+            name,
+            op: AttrOp::Exists,
+            value: String::new(),
+            caseless: false,
+        });
+    }
+    let (op, rest) = [
+        ("~=", AttrOp::Includes),
+        ("|=", AttrOp::Dash),
+        ("^=", AttrOp::Prefix),
+        ("$=", AttrOp::Suffix),
+        ("*=", AttrOp::Substring),
+        ("=", AttrOp::Equals),
+    ]
+    .into_iter()
+    .find_map(|(sym, op)| rest.strip_prefix(sym).map(|r| (op, r)))?;
+    let rest = rest.trim_start();
+    let (value, rest) = match rest.as_bytes().first() {
+        Some(&q) if q == b'"' || q == b'\'' => {
+            let end = rest[1..].find(q as char)? + 1;
+            (&rest[1..end], &rest[end + 1..])
+        }
+        _ => {
+            let end = rest
+                .find(|c: char| c.is_ascii_whitespace())
+                .unwrap_or(rest.len());
+            let v = &rest[..end];
+            let ident = !v.is_empty()
+                && !v.starts_with(|c: char| c.is_ascii_digit())
+                && v.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b >= 0x80);
+            if !ident {
+                return None;
+            }
+            (v, &rest[end..])
+        }
+    };
+    if value.contains('\\') {
+        return None;
+    }
+    let caseless = match rest.trim().to_ascii_lowercase().as_str() {
+        "" => CASELESS_ATTRS.binary_search(&name.as_str()).is_ok(),
+        "i" => true,
+        "s" => false,
+        _ => return None,
+    };
+    let value = if caseless {
+        value.to_ascii_lowercase()
+    } else {
+        value.to_string()
+    };
+    Some(AttrSel {
+        name,
+        op,
+        value,
+        caseless,
+    })
 }
 
 /// A complex selector: compounds left to right, `combs[i]` between
@@ -320,14 +570,14 @@ impl Selector {
                 i += 1;
                 continue;
             }
-            if c == b'>' {
+            if c == b'>' || c == b'+' {
                 if let Some(done) = cur.take() {
                     parts.push(done);
                 }
-                if parts.is_empty() || pending == Some(Comb::Child) {
+                if parts.is_empty() || matches!(pending, Some(Comb::Child | Comb::Next)) {
                     return None;
                 }
-                pending = Some(Comb::Child);
+                pending = Some(if c == b'>' { Comb::Child } else { Comb::Next });
                 i += 1;
                 continue;
             }
@@ -341,10 +591,12 @@ impl Selector {
                     tag: None,
                     id: None,
                     classes: Vec::new(),
+                    attrs: Vec::new(),
+                    pseudo: Vec::new(),
                 };
                 if c == b'*' {
                     i += 1;
-                } else if c != b'.' && c != b'#' {
+                } else if !matches!(c, b'.' | b'#' | b'[' | b':') {
                     if !(c.is_ascii_alphabetic() || c == b'_' || c >= 0x80) {
                         return None;
                     }
@@ -369,7 +621,26 @@ impl Selector {
                     }
                     compound.id = Some(name);
                 }
-                // `+ ~ [ : \ ( ,` and anything else: not a kind we keep.
+                b'[' => {
+                    let end = i + text[i..].find(']')?;
+                    compound.attrs.push(attr_sel(&text[i + 1..end])?);
+                    i = end + 1;
+                }
+                b':' => {
+                    i += 1;
+                    // A pseudo-element (`::before`) is never kept.
+                    let name = ident(&mut i)?;
+                    if b.get(i) == Some(&b'(') {
+                        return None;
+                    }
+                    compound.pseudo.push(match name.as_str() {
+                        "first-child" => Pseudo::FirstChild,
+                        "link" | "any-link" => Pseudo::Link,
+                        "root" => Pseudo::Root,
+                        _ => return None,
+                    });
+                }
+                // `~ \ ( ,` and anything else: not a kind we keep.
                 _ => return None,
             }
             if parts.len() + 1 > MAX_COMPOUNDS {
@@ -379,7 +650,10 @@ impl Selector {
         if let Some(done) = cur.take() {
             parts.push(done);
         }
-        if parts.is_empty() || pending == Some(Comb::Child) || parts.len() > MAX_COMPOUNDS {
+        if parts.is_empty()
+            || matches!(pending, Some(Comb::Child | Comb::Next))
+            || parts.len() > MAX_COMPOUNDS
+        {
             return None;
         }
         // A trailing space leaves a descendant pending with nothing after it.
@@ -389,7 +663,8 @@ impl Selector {
         let (mut ids, mut classes, mut tags) = (0u32, 0u32, 0u32);
         for p in &parts {
             ids += p.id.is_some() as u32;
-            classes += p.classes.len() as u32;
+            // An attribute selector or pseudo-class counts as a class.
+            classes += (p.classes.len() + p.attrs.len() + p.pseudo.len()) as u32;
             tags += p.tag.is_some() as u32;
         }
         let spec = (ids.min(1023) << 20) | (classes.min(1023) << 10) | tags.min(1023);
@@ -404,14 +679,18 @@ impl Selector {
 
     /// Whether the last element of `path` matches, right to left.
     ///
-    /// `reach` is the set of elements where the compounds from `j` to the
-    /// right end can match with compound `j` on that element. For the
-    /// rightmost compound it is the subject alone. Going left, a child
-    /// combinator keeps the elements whose child is in the set, and a
-    /// descendant combinator every element before the set's last one. Each
-    /// step looks at each element once: O(compounds × depth), no
-    /// backtracking. Each step costs `hi / 4 + 1` units of work (`hi` the
-    /// last element still in the set): a unit per four elements looked at.
+    /// `reach[l]` says where the compounds from `j` to the right end can
+    /// match with compound `j` on an element at depth `l`: on `path`'s
+    /// element there (`Some(0)`) or on the one `b` places before it among
+    /// its parent's children (`Some(b)`, #1883). One place a depth is
+    /// enough: a child or descendant step lands on `path`'s own elements,
+    /// a `+` step moves each place one sibling back. For the rightmost
+    /// compound it is the subject alone. Going left, a child combinator
+    /// keeps the elements whose child is reached, a descendant combinator
+    /// every one above the deepest reached, and `+` the sibling before
+    /// each reached one. Each step looks at each depth once: O(compounds ×
+    /// depth), no backtracking. Each step costs `hi / 4 + 1` units of work
+    /// (`hi` the deepest still reached): a unit per four looked at.
     pub(crate) fn matches<P: Path + ?Sized>(&self, path: &P, budget: &Budget) -> bool {
         let d = path.len();
         let k = self.parts.len();
@@ -421,24 +700,44 @@ impl Selector {
         if k == 1 {
             return true;
         }
-        let mut reach = vec![false; d];
-        reach[d - 1] = true;
-        // The last element in `reach`; every element of it is <= hi.
+        let mut reach: Vec<Option<usize>> = vec![None; d];
+        reach[d - 1] = Some(0);
+        // The deepest depth in `reach`.
         let mut hi = d - 1;
         for j in (0..k - 1).rev() {
             if !budget.work(hi / 4 + 1) {
                 return false;
             }
-            let mut next = vec![false; d];
+            let part = &self.parts[j];
+            let mut next: Vec<Option<usize>> = vec![None; d];
             let mut new_hi: Option<usize> = None;
-            for e in 0..hi {
-                let ok = match self.combs[j] {
-                    Comb::Child => reach[e + 1],
-                    Comb::Descendant => true,
-                } && self.parts[j].matches(path.key(e));
-                if ok {
-                    next[e] = true;
-                    new_hi = Some(e);
+            match self.combs[j] {
+                Comb::Child => {
+                    for l in 1..=hi {
+                        if reach[l].is_some() && part.matches(path.key(l - 1)) {
+                            next[l - 1] = Some(0);
+                            new_hi = Some(l - 1);
+                        }
+                    }
+                }
+                Comb::Descendant => {
+                    for e in 0..hi {
+                        if part.matches(path.key(e)) {
+                            next[e] = Some(0);
+                            new_hi = Some(e);
+                        }
+                    }
+                }
+                Comb::Next => {
+                    for l in 0..=hi {
+                        let Some(b) = reach[l] else {
+                            continue;
+                        };
+                        if path.prev(l, b + 1).is_some_and(|key| part.matches(key)) {
+                            next[l] = Some(b + 1);
+                            new_hi = Some(l);
+                        }
+                    }
                 }
             }
             match new_hi {
@@ -478,6 +777,12 @@ pub(crate) struct StyleSheet {
     by_class: HashMap<String, Vec<u32>>,
     by_tag: HashMap<String, Vec<u32>>,
     universal: Vec<u32>,
+    /// The attribute names its selectors test (#1883), at most
+    /// [`MAX_ATTR_NAMES`]: what an element's key keeps of its attributes.
+    attr_names: Vec<String>,
+    /// A selector has a `+` (#1883): elements keep their preceding
+    /// siblings' keys.
+    uses_next: bool,
 }
 
 impl StyleSheet {
@@ -533,9 +838,22 @@ impl StyleSheet {
                 let Some(sel) = Selector::parse(sel) else {
                     continue;
                 };
+                // Its attribute names, if the sheet has room for them.
+                let mut names: Vec<&str> = Vec::new();
+                for a in sel.parts.iter().flat_map(|p| &p.attrs) {
+                    if !sheet.attr_names.contains(&a.name) && !names.contains(&a.name.as_str()) {
+                        names.push(&a.name);
+                    }
+                }
+                if sheet.attr_names.len() + names.len() > MAX_ATTR_NAMES {
+                    continue;
+                }
                 if !budget.keep::<Rule>(sel.heap()) {
                     return sheet;
                 }
+                let names: Vec<String> = names.into_iter().map(str::to_string).collect();
+                sheet.attr_names.extend(names);
+                sheet.uses_next |= sel.combs.contains(&Comb::Next);
                 let r = sheet.rules.len() as u32;
                 let last = &sel.parts[sel.parts.len() - 1];
                 let bucket = if let Some(id) = &last.id {
@@ -606,6 +924,16 @@ impl StyleSheet {
         check(Some(&self.universal));
         hits.sort_unstable();
         hits
+    }
+
+    /// The attribute names the selectors test (#1883).
+    pub(crate) fn attr_names(&self) -> &[String] {
+        &self.attr_names
+    }
+
+    /// Whether a selector has a `+` (#1883).
+    pub(crate) fn uses_next(&self) -> bool {
+        self.uses_next
     }
 
     /// Whether a rule could match an element `tag` with no id or class:
@@ -1901,15 +2229,41 @@ mod tests {
             "div>p",
             "body  table   td .x",
             "*.a",
+            // Since #1883.
+            "a:link",
+            "a:any-link",
+            ":root",
+            "p:first-child",
+            "h1 + p",
+            "h1+p",
+            "div > h1 + p span",
+            "input[type=text]",
+            "[x-apple-data-detectors]",
+            "a[href^='tel:' i]",
+            "td[class~=\"wrap\"]",
+            "[lang|=en]",
+            "img[src$=\".png\" s]",
+            "a[href*=x]",
         ] {
             assert!(Selector::parse(kept).is_some(), "{kept}");
         }
         for dropped in [
-            "a:link",
             "a::before",
-            "h1 + p",
+            "a:visited",
+            "a:hover",
+            "li:last-child",
+            "p:first-of-type",
+            "li:nth-child(2)",
             "h1 ~ p",
-            "input[type=text]",
+            "h1 + + p",
+            "+ p",
+            "p +",
+            "[a=b c]",
+            "[a=1x]",
+            "[a='x]",
+            "[a=x y]",
+            "[ns|a]",
+            "[a='\\'']",
             "o\\:p",
             "> p",
             "p >",
@@ -1990,9 +2344,9 @@ mod tests {
              div.Word { } h1 {color:#2F5496} -->",
             &b,
         );
-        // p.MsoNormal, li.MsoNormal, span.MsoHyperlink, h1 (the empty
-        // block keeps nothing; a:link is dropped alone).
-        assert_eq!(sheet.len(), 4);
+        // p.MsoNormal, li.MsoNormal, a:link (kept since #1883),
+        // span.MsoHyperlink, h1 (the empty block keeps nothing).
+        assert_eq!(sheet.len(), 5);
         let path = [key("p", None, None)];
         assert!(
             sheet.matching(&path[..], &b).is_empty(),
@@ -2031,6 +2385,161 @@ mod tests {
         let sheet = StyleSheet::parse(&css, &b);
         assert_eq!(sheet.len(), MAX_RULES);
         assert!(!b.exhausted());
+    }
+
+    /// A path whose elements have preceding siblings (#1883): each depth's
+    /// element and the siblings before it, nearest last.
+    struct Siblings(Vec<(ElemKey, Vec<ElemKey>)>);
+
+    impl Path for Siblings {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn key(&self, i: usize) -> &ElemKey {
+            &self.0[i].0
+        }
+        fn prev(&self, i: usize, back: usize) -> Option<&ElemKey> {
+            let before = &self.0[i].1;
+            before.get(before.len().checked_sub(back)?)
+        }
+    }
+
+    /// `tag` with `attrs`, at `index` among its parent's children.
+    fn elem(tag: &str, index: u32, attrs: &[(&str, &str)]) -> ElemKey {
+        ElemKey {
+            index,
+            link: tag == "a" && attrs.iter().any(|(n, _)| *n == "href"),
+            attrs: attrs
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+            ..key(tag, None, None)
+        }
+    }
+
+    /// `subject` (and `before` it) inside a `body` that is the second child
+    /// of `html`, after a `head`.
+    fn in_body(before: &[&str], subject: ElemKey) -> Siblings {
+        let before: Vec<ElemKey> = before
+            .iter()
+            .enumerate()
+            .map(|(i, t)| elem(t, i as u32, &[]))
+            .collect();
+        Siblings(vec![
+            (elem("html", 0, &[]), vec![]),
+            (elem("body", 1, &[]), vec![elem("head", 0, &[])]),
+            (subject, before),
+        ])
+    }
+
+    #[test]
+    fn attribute_selectors_1883() {
+        let b = budget();
+        let on = |attrs: &[(&str, &str)], sel: &str| {
+            Selector::parse(sel)
+                .unwrap()
+                .matches(&[elem("td", 0, attrs)][..], &b)
+        };
+        let m = |sel: &str| {
+            on(
+                &[
+                    ("align", "Center"),
+                    ("class", "wrap Inner"),
+                    ("lang", "en-GB"),
+                ],
+                sel,
+            )
+        };
+        assert!(m("td[align]"));
+        assert!(!m("td[valign]"));
+        // `align` and `lang` compare without case; `class` with it.
+        assert!(m("td[align=center]"));
+        assert!(!m("td[align=center s]"));
+        assert!(m("[class~=Inner]"));
+        assert!(!m("[class~=inner]"));
+        assert!(m("[class~=inner i]"));
+        assert!(m("[class=\"wrap Inner\"]"));
+        assert!(!m("[class~=\"wrap Inner\"]"));
+        assert!(m("[lang|=EN]"));
+        assert!(!m("[lang|=en-g]"));
+        assert!(m("[class^=wr]") && m("[class$=ner]") && m("[class*='p In']"));
+        assert!(!m("[class^='']") && !m("[class*=\"\"]"));
+        let m = |sel: &str| on(&[("x-apple-data-detectors", "")], sel);
+        assert!(m("[x-apple-data-detectors]"));
+        assert!(!m("[x-apple-data-detectors=true]"));
+        // An attribute selector or pseudo-class counts as a class.
+        let spec = |sel: &str| Selector::parse(sel).unwrap().spec;
+        assert_eq!(spec("a[href]"), spec("a.x"));
+        assert_eq!(spec("a:link"), spec("a.x"));
+        assert!(spec("#i") > spec("a[href][title]:link"));
+    }
+
+    #[test]
+    fn next_sibling_first_child_link_and_root_1883() {
+        let b = budget();
+        let m = |path: &Siblings, sel: &str| Selector::parse(sel).unwrap().matches(path, &b);
+        let p = in_body(&["h1", "style", "p"], elem("p", 3, &[]));
+        assert!(m(&p, "p + p"));
+        assert!(m(&p, "style + p + p"));
+        assert!(m(&p, "h1 + style + p + p"));
+        assert!(m(&p, "h1 + * + p + p"));
+        assert!(!m(&p, "style + p"));
+        assert!(!m(&p, "h1 + style + p"));
+        assert!(!m(&p, "h1 + p"));
+        assert!(!m(&p, "h1 + style + p + p + p"));
+        assert!(m(&p, "body > p + p"));
+        assert!(m(&p, "html head + body p"));
+        assert!(m(&p, "head + body > h1 + style + p + p"));
+        assert!(!m(&p, "html + body p"));
+        assert!(!m(&p, "p:first-child"));
+        assert!(m(&p, ":root p"));
+        assert!(!m(&p, "body:root p"));
+        let first = in_body(&[], elem("p", 0, &[]));
+        assert!(m(&first, "p:first-child"));
+        assert!(!m(&first, "body:first-child p"));
+        assert!(!m(&first, "h1 + p"));
+        let a = in_body(&[], elem("a", 0, &[("href", "x")]));
+        assert!(m(&a, "a:link") && m(&a, ":any-link"));
+        let anchor = in_body(&[], elem("a", 0, &[("name", "x")]));
+        assert!(!m(&anchor, "a:link"));
+    }
+
+    #[test]
+    fn next_sibling_chains_are_polynomial_1883() {
+        // Every element of a deep path, and every sibling before each,
+        // matches every compound: a `+` chain still looks at each depth once
+        // a step.
+        let b = budget();
+        let sibs: Vec<ElemKey> = (0..MAX_COMPOUNDS)
+            .map(|i| elem("p", i as u32, &[]))
+            .collect();
+        let path = Siblings(
+            (0..256)
+                .map(|_| (elem("p", MAX_COMPOUNDS as u32, &[]), sibs.clone()))
+                .collect(),
+        );
+        let chain = Selector::parse(&vec!["p"; MAX_COMPOUNDS].join(" + ")).unwrap();
+        assert!(chain.matches(&path, &b));
+        let mixed = Selector::parse(&vec!["p + p"; MAX_COMPOUNDS / 2].join(" ")).unwrap();
+        assert!(mixed.matches(&path, &b));
+        let miss = Selector::parse(&format!(
+            "h1 + {}",
+            vec!["p"; MAX_COMPOUNDS - 1].join(" + ")
+        ))
+        .unwrap();
+        assert!(!miss.matches(&path, &b));
+        assert!(!b.exhausted());
+    }
+
+    #[test]
+    fn a_sheet_keeps_at_most_32_attribute_names_1883() {
+        let b = budget();
+        let css: String = (0..40).map(|i| format!("[a{i}] {{color:red}}\n")).collect();
+        let sheet = StyleSheet::parse(&css, &b);
+        assert_eq!(sheet.attr_names().len(), MAX_ATTR_NAMES);
+        assert_eq!(sheet.len(), MAX_ATTR_NAMES);
+        assert!(!sheet.uses_next());
+        assert!(StyleSheet::parse("h1 + p {color:red}", &b).uses_next());
     }
 
     #[test]

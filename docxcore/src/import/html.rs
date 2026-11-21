@@ -580,9 +580,30 @@ struct Look {
     link: Option<Rc<Link>>,
 }
 
+/// The element children an element (or the page's root) has had so far
+/// (#1883): their count, and the keys of the last [`css::MAX_COMPOUNDS`]
+/// when the sheet has a `+` (a `+` chain looks no further back).
+#[derive(Default)]
+struct Kids {
+    count: u32,
+    last: std::collections::VecDeque<ElemKey>,
+}
+
+impl Kids {
+    /// The child numbered `index`, if it is kept.
+    fn get(&self, index: u32) -> Option<&ElemKey> {
+        let first = self.count.checked_sub(self.last.len() as u32)?;
+        let at = index.checked_sub(first)?;
+        self.last.get(at as usize)
+    }
+}
+
 /// An open element.
 struct Elem {
+    /// Its key; `key.index` is its place among its parent's children.
     key: ElemKey,
+    /// Its own element children so far (#1883).
+    kids: Kids,
     kind: Kind,
     look: Look,
     /// Where its attribute text is in the page: what its look is computed
@@ -649,6 +670,8 @@ fn starts_heading(key: &ElemKey) -> bool {
 /// match against.
 struct Ancestry<'a> {
     elems: &'a [Elem],
+    /// The page root's children (#1883).
+    root: &'a Kids,
     subject: &'a ElemKey,
 }
 
@@ -661,6 +684,21 @@ impl Path for Ancestry<'_> {
             Some(e) => &e.key,
             None => self.subject,
         }
+    }
+    fn prev(&self, i: usize, back: usize) -> Option<&ElemKey> {
+        let kids = match i.checked_sub(1) {
+            Some(p) => &self.elems.get(p)?.kids,
+            None => self.root,
+        };
+        let me = self.key(i);
+        // An open ancestor is among its parent's children where its index
+        // says, unless a misnested close moved it (`<b><p>x</b>`): then
+        // its siblings are unknown.
+        if i < self.elems.len() && kids.get(me.index).is_some_and(|k| k != me) {
+            return None;
+        }
+        let at = me.index.checked_sub(u32::try_from(back).ok()?)?;
+        kids.get(at)
     }
 }
 
@@ -1947,6 +1985,8 @@ struct Ctx<'c> {
     budget: &'c Budget,
     /// The page is in quirks mode: a `table` resets the font (#1883).
     quirks: bool,
+    /// The page root's children (#1883).
+    root: &'c Kids,
 }
 
 /// The look of an element opening on top of `below`: its parent's, then the
@@ -1966,6 +2006,7 @@ fn look_of(
     let hits = ctx.sheet.matching(
         &Ancestry {
             elems: below,
+            root: ctx.root,
             subject: key,
         },
         ctx.budget,
@@ -2171,6 +2212,8 @@ struct Html<'a> {
     /// A block with a forced page break after it has closed (#1883): the
     /// next body paragraph starts a page. A table opening drops it.
     break_pending: bool,
+    /// The element children outside every open element (#1883).
+    root_kids: Kids,
 }
 
 impl<'a> Html<'a> {
@@ -2197,6 +2240,7 @@ impl<'a> Html<'a> {
             orphan_cards: Vec::new(),
             quirks: quirks_mode(s),
             break_pending: false,
+            root_kids: Kids::default(),
         }
     }
 
@@ -2295,12 +2339,72 @@ impl<'a> Html<'a> {
     }
 
     fn open_tag(&mut self, name: &str, attrs_at: (usize, usize)) {
+        if self.open_leaf(name, attrs_at) {
+            // An element child of what is open all the same (#1883).
+            if self.sheet.uses_next() {
+                let s = self.s;
+                if self.budget.scanned(attrs_at.1 - attrs_at.0) {
+                    let attrs = attrs_of(&s[attrs_at.0..attrs_at.1]);
+                    let key = self.key_of(name, &attrs, attrs_at);
+                    self.add_child(key);
+                }
+            } else {
+                self.add_child(ElemKey::default());
+            }
+        }
+    }
+
+    /// The element children of the innermost open element (or the root).
+    fn kids_mut(&mut self) -> &mut Kids {
+        match self.elems.last_mut() {
+            Some(e) => &mut e.kids,
+            None => &mut self.root_kids,
+        }
+    }
+
+    /// The key of an element `name` opening now (#1883): its tag, id and
+    /// classes, its place among the open element's children, whether it is
+    /// a link, and the attributes the sheet's selectors name.
+    fn key_of(&self, name: &str, attrs: &Attrs, attrs_at: (usize, usize)) -> ElemKey {
+        let mut key = ElemKey::new(name, attrs.id.as_deref(), attrs.class.as_deref());
+        key.index = match self.elems.last() {
+            Some(e) => e.kids.count,
+            None => self.root_kids.count,
+        };
+        key.link = matches!(name, "a" | "area" | "link") && attrs.href.is_some();
+        let names = self.sheet.attr_names();
+        if !names.is_empty() {
+            let s = self.s;
+            key.attrs = named_attrs(&s[attrs_at.0..attrs_at.1], names);
+        }
+        key
+    }
+
+    /// Count `key`'s element as the open element's next child (#1883),
+    /// keeping its key when the sheet has a `+`.
+    fn add_child(&mut self, key: ElemKey) {
+        let keep = self.sheet.uses_next() && self.budget.work(1 + key.heap() / 16);
+        let kids = self.kids_mut();
+        kids.count = kids.count.saturating_add(1);
+        if keep {
+            if kids.last.len() >= css::MAX_COMPOUNDS {
+                kids.last.pop_front();
+            }
+            kids.last.push_back(key);
+        } else {
+            kids.last.clear();
+        }
+    }
+
+    /// Open an element that opens nothing (a void element, or one whose
+    /// content is skipped), returning whether it was one.
+    fn open_leaf(&mut self, name: &str, attrs_at: (usize, usize)) -> bool {
         match name {
             _ if name == "head" || RAW_TEXT.contains(&name) => {
                 let end = format!("</{name}");
                 self.skip_past(&end);
                 self.skip_past(">");
-                return;
+                return true;
             }
             "br" => {
                 if self.visible() {
@@ -2313,21 +2417,27 @@ impl<'a> Html<'a> {
                     self.space = None;
                     self.para_start = true;
                 }
-                return;
+                return true;
             }
             "hr" => {
                 self.implicit_close(&["p"]);
-                return;
+                return true;
             }
             "img" => {
                 self.image(attrs_at);
-                return;
+                return true;
             }
             // Void elements: nothing opens.
             "meta" | "link" | "input" | "wbr" | "col" | "area" | "base" | "source" | "param"
-            | "embed" | "track" => return,
+            | "embed" | "track" => return true,
             _ => {}
         }
+        self.open_element(name, attrs_at);
+        false
+    }
+
+    /// Open an element that holds content.
+    fn open_element(&mut self, name: &str, attrs_at: (usize, usize)) {
         let s = self.s;
         let attrs = attrs_of(&s[attrs_at.0..attrs_at.1]);
         let kind = Kind::of(name);
@@ -2395,7 +2505,7 @@ impl<'a> Html<'a> {
             "dt" | "dd" => self.implicit_close(&["dt", "dd"]),
             _ => {}
         }
-        let key = ElemKey::new(name, attrs.id.as_deref(), attrs.class.as_deref());
+        let key = self.key_of(name, &attrs, attrs_at);
         if name == "span"
             && attrs
                 .style
@@ -2409,10 +2519,14 @@ impl<'a> Html<'a> {
                 self.space = None;
                 self.para_start = false;
             }
+            self.add_child(key);
             self.skip_past("</span");
             self.skip_past(">");
             return;
         }
+        // Its parent's next child (#1883), counted before it opens: its
+        // own look matches with `key.index` already set.
+        self.add_child(key.clone());
         // The stacks as they are below this element (#1872 r4: a list's own
         // entry is above its `lists_at`, so its close ends it).
         let (blocks_at, lists_at) = (self.blocks.len(), self.lists.len());
@@ -2527,6 +2641,7 @@ impl<'a> Html<'a> {
                 .map(|n| (self.table_depth, n));
             self.elems.push(Elem {
                 key,
+                kids: Kids::default(),
                 kind,
                 look,
                 attrs: attrs_at,
@@ -2612,6 +2727,7 @@ impl<'a> Html<'a> {
             sheet: &self.sheet,
             budget: self.budget,
             quirks: self.quirks,
+            root: &self.root_kids,
         }
     }
 
@@ -2634,6 +2750,7 @@ impl<'a> Html<'a> {
                     sheet: &self.sheet,
                     budget: self.budget,
                     quirks: self.quirks,
+                    root: &self.root_kids,
                 },
                 below,
                 &e.key,
@@ -2702,6 +2819,7 @@ impl<'a> Html<'a> {
                 if below.iter().filter(alike).count() + reopen.iter().filter(alike).count() < 3 {
                     reopen.push(Elem {
                         key: std::mem::take(&mut e.key),
+                        kids: Kids::default(),
                         kind: e.kind,
                         look: Look::default(),
                         attrs: e.attrs,
@@ -2720,7 +2838,15 @@ impl<'a> Html<'a> {
             e.lists_at = lists_at;
         }
         let from = self.elems.len();
-        self.elems.extend(reopen);
+        // Each reopened element is a new child of the one below it.
+        for mut e in reopen {
+            e.key.index = match self.elems.last() {
+                Some(p) => p.kids.count,
+                None => self.root_kids.count,
+            };
+            self.add_child(e.key.clone());
+            self.elems.push(e);
+        }
         self.restyle(from);
     }
 
@@ -3099,7 +3225,7 @@ impl<'a> Html<'a> {
         }
         let s = self.s;
         let attrs = attrs_of(&s[attrs_at.0..attrs_at.1]);
-        let key = ElemKey::new("img", attrs.id.as_deref(), attrs.class.as_deref());
+        let key = self.key_of("img", &attrs, attrs_at);
         if !self.budget.work(1 + key.heap() / 16) {
             return;
         }
@@ -3393,7 +3519,7 @@ impl<'a> Html<'a> {
             return false;
         }
         let attrs = attrs_of(text);
-        let key = ElemKey::new("br", attrs.id.as_deref(), attrs.class.as_deref());
+        let key = self.key_of("br", &attrs, attrs_at);
         look_of(
             self.ctx(),
             &self.elems,
@@ -3832,6 +3958,53 @@ fn find_ci(hay: &str, lower_needle: &str) -> Option<usize> {
 /// character references decoded.
 fn attrs_of(attrs: &str) -> Attrs {
     let mut out = Attrs::default();
+    each_attr(attrs, |key, value| {
+        let slot = match key.to_ascii_lowercase().as_str() {
+            "style" => Some(&mut out.style),
+            "class" => Some(&mut out.class),
+            "id" => Some(&mut out.id),
+            "align" => Some(&mut out.align),
+            "color" => Some(&mut out.color),
+            "face" => Some(&mut out.face),
+            "size" => Some(&mut out.size),
+            "width" => Some(&mut out.width),
+            "bgcolor" => Some(&mut out.bgcolor),
+            "border" => Some(&mut out.border),
+            "cellpadding" => Some(&mut out.cellpadding),
+            "cellspacing" => Some(&mut out.cellspacing),
+            "colspan" => Some(&mut out.colspan),
+            "rowspan" => Some(&mut out.rowspan),
+            "valign" => Some(&mut out.valign),
+            "src" => Some(&mut out.src),
+            "alt" => Some(&mut out.alt),
+            "height" => Some(&mut out.height),
+            "href" => Some(&mut out.href),
+            "dir" => Some(&mut out.dir),
+            _ => None,
+        };
+        if let Some(slot) = slot.filter(|s| s.is_none()) {
+            *slot = Some(attr_entities(value));
+        }
+    });
+    out
+}
+
+/// The attributes of a tag's attribute text whose names are in `names`
+/// (lowercase), the first of a name winning, values decoded (#1883).
+fn named_attrs(attrs: &str, names: &[String]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    each_attr(attrs, |key, value| {
+        let key = key.to_ascii_lowercase();
+        if names.contains(&key) && !out.iter().any(|(n, _)| *n == key) {
+            out.push((key, attr_entities(value)));
+        }
+    });
+    out
+}
+
+/// Each `name[=value]` of a tag's attribute text, in order, its value
+/// unquoted (empty when none is given).
+fn each_attr(attrs: &str, mut f: impl FnMut(&str, &str)) {
     let bytes = attrs.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -3869,37 +4042,13 @@ fn attrs_of(attrs: &str) -> Attrs {
                 value = &attrs[vs..i];
             }
         }
-        let slot = match key.to_ascii_lowercase().as_str() {
-            "style" => Some(&mut out.style),
-            "class" => Some(&mut out.class),
-            "id" => Some(&mut out.id),
-            "align" => Some(&mut out.align),
-            "color" => Some(&mut out.color),
-            "face" => Some(&mut out.face),
-            "size" => Some(&mut out.size),
-            "width" => Some(&mut out.width),
-            "bgcolor" => Some(&mut out.bgcolor),
-            "border" => Some(&mut out.border),
-            "cellpadding" => Some(&mut out.cellpadding),
-            "cellspacing" => Some(&mut out.cellspacing),
-            "colspan" => Some(&mut out.colspan),
-            "rowspan" => Some(&mut out.rowspan),
-            "valign" => Some(&mut out.valign),
-            "src" => Some(&mut out.src),
-            "alt" => Some(&mut out.alt),
-            "height" => Some(&mut out.height),
-            "href" => Some(&mut out.href),
-            "dir" => Some(&mut out.dir),
-            _ => None,
-        };
-        if let Some(slot) = slot.filter(|s| s.is_none()) {
-            *slot = Some(attr_entities(value));
+        if !key.is_empty() {
+            f(key, value);
         }
         if i == start {
             i += 1;
         }
     }
-    out
 }
 
 /// The link an `href` (its character references decoded) makes (#1879),
@@ -5173,6 +5322,72 @@ mod tests {
             crate::serialize::blocks_to_xml(&d.body)
         );
         crate::load::parse_document_xml(&xml, &crate::load::Relationships::default())
+    }
+
+    #[test]
+    fn style_block_sibling_attribute_and_pseudo_rules_apply_1883() {
+        let d = doc(
+            "<html><head><style>a:link {color:#FF0000} td[align=center] {font-weight:bold}\
+             p:first-child {font-style:italic} h1 + p {text-decoration:underline}\
+             :root {font-family:Georgia} a[href^='mailto:' i] {color:#00FF00}\
+             p.MsoNormal + p.MsoNormal {color:#0000FF}</style></head>\
+             <body><div><p>first</p><p>second</p></div><h1>title</h1><p>adjacent</p>\
+             <p>later</p><table><tr><td align=Center>cell</td><td>plain cell</td></tr></table>\
+             <p><a href='http://x.example'>web</a> <a href='MAILTO:a@b.example'>mail</a>\
+             <a name=x>anchor</a></p>\
+             <p class=MsoNormal>one</p><p class=MsoNormal>two</p></body></html>",
+        );
+        let r = |t: &str| run_of(&d, t).props;
+        assert!(r("first").italic && !r("second").italic);
+        assert!(r("adjacent").underline && !r("later").underline);
+        assert!(r("cell").bold && !r("plain cell").bold);
+        assert_eq!(r("web").color.as_deref(), Some("FF0000"));
+        assert_eq!(r("mail").color.as_deref(), Some("00FF00"));
+        assert_ne!(r("anchor").color.as_deref(), Some("FF0000"));
+        // `:root` is the `html` element; its font reaches every run.
+        assert_eq!(r("later").font.as_deref(), Some("Georgia"));
+        assert_ne!(r("one").color.as_deref(), Some("0000FF"));
+        assert_eq!(r("two").color.as_deref(), Some("0000FF"));
+    }
+
+    #[test]
+    fn void_and_raw_text_elements_are_siblings_1883() {
+        // A `br`, `img` or `style` between is an element sibling, as in a
+        // browser's DOM; text is not.
+        let d = doc(
+            "<style>h1 + p {color:#FF0000} p:first-child {font-style:italic}</style>\
+             <h1>a</h1>text<p>after text</p>\
+             <h1>b</h1><br><p>after br</p>\
+             <h1>c</h1><img src=x.png><p>after img</p>\
+             <div><style>.x {}</style><p>after style</p></div>\
+             <div>text <p>first child</p></div>",
+        );
+        let r = |t: &str| run_of(&d, t).props;
+        assert_eq!(r("after text").color.as_deref(), Some("FF0000"));
+        assert_ne!(r("after br").color.as_deref(), Some("FF0000"));
+        assert_ne!(r("after img").color.as_deref(), Some("FF0000"));
+        assert!(!r("after style").italic);
+        assert!(r("first child").italic);
+    }
+
+    #[test]
+    fn long_sibling_runs_stay_within_the_budget_1883() {
+        // 30 000 paragraphs under one parent, a `+` rule that never matches
+        // and one that always does: still a document.
+        let mut page = String::from(
+            "<style>h1 + p {color:#FF0000} p + p {font-style:italic}\
+             p:first-child + p + p {font-weight:bold}</style><div>",
+        );
+        for i in 0..30_000 {
+            page.push_str(&format!("<p>p{i}</p>"));
+        }
+        page.push_str("</div>");
+        let d = doc(&page);
+        assert_eq!(paras(&d).len(), 30_000);
+        assert!(!run_of(&d, "p0").props.italic);
+        assert!(run_of(&d, "p29999").props.italic);
+        assert!(run_of(&d, "p2").props.bold && !run_of(&d, "p3").props.bold);
+        assert_eq!(run_of(&d, "p1").props.color, None);
     }
 
     #[test]
