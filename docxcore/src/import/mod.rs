@@ -592,6 +592,14 @@ impl<'b> Builder<'b> {
         }
     }
 
+    /// Whether the paragraph in progress holds a page break (#1883): kept
+    /// though it has no text.
+    pub(crate) fn has_page_break(&self) -> bool {
+        self.para
+            .iter()
+            .any(|i| matches!(i, Inline::Break(BreakKind::Page, _)))
+    }
+
     /// The text of the paragraph in progress.
     pub(crate) fn para_text(&self) -> String {
         self.para.iter().map(|i| i.text()).collect()

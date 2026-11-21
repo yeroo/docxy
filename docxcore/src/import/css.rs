@@ -608,6 +608,12 @@ impl StyleSheet {
         hits
     }
 
+    /// Whether a rule could match an element `tag` with no id or class:
+    /// one whose rightmost compound names that tag or no tag, id or class.
+    pub(crate) fn may_match_tag(&self, tag: &str) -> bool {
+        !self.universal.is_empty() || self.by_tag.contains_key(tag)
+    }
+
     /// The declarations of a hit.
     pub(crate) fn decls(&self, hit: Hit) -> &[Decl] {
         &self.blocks[hit.block as usize]
@@ -1057,6 +1063,9 @@ pub(crate) fn line_height(value: &str) -> Option<LineHeight> {
 pub(crate) struct FontShorthand {
     pub(crate) italic: bool,
     pub(crate) bold: bool,
+    /// `small-caps` before the size (#1883); the shorthand resets the
+    /// variant to `normal` otherwise.
+    pub(crate) small_caps: bool,
     pub(crate) size_pt: f64,
     pub(crate) line: LineHeight,
     pub(crate) family: Option<String>,
@@ -1068,6 +1077,7 @@ pub(crate) fn font_shorthand(value: &str, parent_pt: f64) -> Option<FontShorthan
     let toks = tokens(value);
     let mut italic = false;
     let mut bold = false;
+    let mut small_caps = false;
     for (i, t) in toks.iter().enumerate() {
         let (size_tok, line_tok) = match t.split_once('/') {
             Some((s, l)) => (s, Some(l)),
@@ -1105,6 +1115,7 @@ pub(crate) fn font_shorthand(value: &str, parent_pt: f64) -> Option<FontShorthan
             return Some(FontShorthand {
                 italic,
                 bold,
+                small_caps,
                 size_pt,
                 line,
                 family,
@@ -1115,6 +1126,8 @@ pub(crate) fn font_shorthand(value: &str, parent_pt: f64) -> Option<FontShorthan
             italic = it;
         } else if let Some(w) = weight(&lower) {
             bold = w;
+        } else if lower == "small-caps" {
+            small_caps = true;
         } else if !matches!(
             lower.as_str(),
             "normal" | "small-caps" | "condensed" | "expanded"
