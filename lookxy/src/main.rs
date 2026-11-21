@@ -26,15 +26,15 @@ mod skill;
 mod ui;
 
 use std::io;
-use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use app::App;
 use config::Config;
 
 use mailcore::auth::AuthConfig;
 use mailcore::store::Store;
-use mailcore::sync::engine::{self as sync_engine, SyncCommand};
+use mailcore::sync::engine::{self as sync_engine, SyncCommand, SyncHandle};
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -163,6 +163,15 @@ fn main() -> io::Result<()> {
 
     let res = run_tui(&mut app, ctl_rx);
     drop(ctl_server); // remove the discovery file
+    // With the terminal restored and no agent able to connect, give the
+    // engine the moment it needs to queue the last writes (#2131); also
+    // when the TUI failed.
+    if !shutdown_engine(&app.sync, ENGINE_SHUTDOWN_WAIT) {
+        eprintln!(
+            "lookxy: the sync engine did not stop within {} s; changes made just before quitting may be lost",
+            ENGINE_SHUTDOWN_WAIT.as_secs()
+        );
+    }
     res
 }
 
@@ -254,8 +263,8 @@ fn run(
             }
         }
 
+        // `main` sends the engine its `Shutdown` and waits for it (#2131).
         if app.quit {
-            let _ = app.sync.cmd_tx.send(SyncCommand::Shutdown);
             return Ok(());
         }
     }
@@ -281,6 +290,31 @@ fn is_global_quit(app: &App, k: &event::KeyEvent) -> bool {
 fn drain_events(app: &mut App) {
     while let Ok(evt) = app.sync.evt_rx.try_recv() {
         app.on_sync_event(evt);
+    }
+}
+
+/// How long lookxy waits at quit for the sync engine to stop (#2131).
+const ENGINE_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+
+/// Sends the engine its `Shutdown` and waits up to `wait` for the engine
+/// thread to return (#2131). The thread owns the only `Sender<SyncEvent>`,
+/// so it has returned once `evt_rx` reports `Disconnected`. By then it has
+/// queued the writes sent before the `Shutdown` as outbox ops (#2127), and
+/// the next start sends them. The UI already applied those writes to its
+/// store, so exiting before the engine read them would lose them silently.
+/// Events read meanwhile are discarded: the UI is gone. Returns `false` when
+/// `wait` ran out first, e.g. the engine was inside a Graph request that
+/// does not return in time.
+fn shutdown_engine(sync: &SyncHandle, wait: Duration) -> bool {
+    let _ = sync.cmd_tx.send(SyncCommand::Shutdown);
+    let deadline = Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match sync.evt_rx.recv_timeout(left) {
+            Ok(_) => {}
+            Err(RecvTimeoutError::Disconnected) => return true,
+            Err(RecvTimeoutError::Timeout) => return false,
+        }
     }
 }
 
@@ -314,6 +348,82 @@ fn drain_ctl(app: &mut App, ctl_rx: Option<&Receiver<ctlcore::Request>>) {
 mod tests {
     use super::*;
     use ratatui::crossterm::event::KeyEvent;
+
+    /// The quit-time wait (#2131): `shutdown_engine` returns only once the
+    /// engine thread has returned, so the writes it persists on `Shutdown`
+    /// are on disk before lookxy exits.
+    #[test]
+    fn shutdown_waits_for_the_engine_thread_to_return() {
+        use mailcore::sync::engine::SyncEvent;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SyncCommand>();
+        let (evt_tx, evt_rx) = mpsc::channel::<SyncEvent>();
+        let persisted = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&persisted);
+        // A stand-in engine thread: on `Shutdown` it emits a few events,
+        // takes a while to persist, then returns (dropping its sender).
+        let engine = std::thread::spawn(move || {
+            assert!(matches!(cmd_rx.recv(), Ok(SyncCommand::Shutdown)));
+            for _ in 0..3 {
+                let _ = evt_tx.send(SyncEvent::Error("late".into()));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let sync = SyncHandle { cmd_tx, evt_rx };
+        assert!(shutdown_engine(&sync, Duration::from_secs(2)));
+        assert!(
+            persisted.load(Ordering::SeqCst),
+            "shutdown_engine returned before the engine thread did"
+        );
+        engine.join().unwrap();
+    }
+
+    /// An engine that never stops (its sender kept alive) costs lookxy the
+    /// bound, not more.
+    #[test]
+    fn shutdown_gives_up_after_the_bound() {
+        use mailcore::sync::engine::SyncEvent;
+        use std::sync::mpsc;
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SyncCommand>();
+        let (evt_tx, evt_rx) = mpsc::channel::<SyncEvent>();
+        let sync = SyncHandle { cmd_tx, evt_rx };
+        let started = Instant::now();
+        assert!(!shutdown_engine(&sync, Duration::from_millis(200)));
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(200),
+            "returned early: {took:?}"
+        );
+        assert!(
+            took < Duration::from_millis(1500),
+            "overran the bound: {took:?}"
+        );
+        assert!(matches!(cmd_rx.try_recv(), Ok(SyncCommand::Shutdown)));
+        drop(evt_tx);
+    }
+
+    /// An engine thread that already returned (e.g. its store would not
+    /// open) is not waited for, and it is still sent the `Shutdown`.
+    #[test]
+    fn shutdown_of_an_engine_already_gone_returns_at_once() {
+        use mailcore::sync::engine::SyncEvent;
+        use std::sync::mpsc;
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SyncCommand>();
+        let (evt_tx, evt_rx) = mpsc::channel::<SyncEvent>();
+        let _ = evt_tx.send(SyncEvent::Error("cannot open store".into()));
+        drop(evt_tx);
+        let sync = SyncHandle { cmd_tx, evt_rx };
+        let started = Instant::now();
+        assert!(shutdown_engine(&sync, Duration::from_secs(2)));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(matches!(cmd_rx.try_recv(), Ok(SyncCommand::Shutdown)));
+    }
 
     /// Test-only mirror of `run`'s key dispatch: the shared confirm modal
     /// wins first (so a key while it's open answers the dialog rather than

@@ -4529,9 +4529,8 @@ quarantine re-listed the mailbox and brought the lost writes back.
 - A drain cut by the shutdown after an op went through returns before its post-drain syncs
   (`sync_after_send`, `relist_after_drain`, `sync_copied_folders`). A copy applied just before it
   gets its contents synced by the next start's pass, as after a bulk run's checkpoint stop.
-- Not done: the drain is no faster (no `$batch` for per-message ops, #2137), and hosts still do not
-  wait for the engine thread at quit (`lookxy` sends `Shutdown` and returns; a bounded wait
-  for `evt_rx` to disconnect is the host's change).
+- Not done: the drain is no faster (no `$batch` for per-message ops, #2137). The host's wait
+  for the engine thread at quit is #2131 (`lookxy`, below).
 - Tests (`engine.rs` `tests::shutdown_persists`): 20 `Delete`s against a `DELETE` paced 500 ms,
   then a `Shutdown` or a dropped handle: the engine returns within 3 s with at most one sent,
   and a second engine on the store sends the rest. Commands sent during a paced startup pass
@@ -4603,6 +4602,41 @@ already shown it as done.
   `a_5xx_keeps_a_direct_op_queued`, `a_queued_remove_from_calendar_deletes_the_row_after_the_delete`
   and `..._takes_a_404_as_done`, `remove_from_calendar_while_a_kept_remove_waits_queues_no_delete`; `store` `kept_at_shutdown_ops_round_trip_json_and_name_no_message`;
   `graph::client` `rsvp_kind_as_status_round_trips`.
+
+## lookxy waits for the engine at quit (#2131)
+
+Before #2131 `lookxy` sent `Shutdown` from its run loop and returned, so the process could exit
+before the engine thread had read the writes sent before it and queued them (#2127). The UI had
+already applied them to its store, so they looked done and the next start never sent them.
+
+- `main` (`lookxy/src/main.rs`) calls `shutdown_engine(&app.sync, ENGINE_SHUTDOWN_WAIT)` (2 s)
+  after `run_tui` returned, `Ok` or `Err`, and after the control server is dropped: the
+  terminal is already restored and no agent can connect. `run` no longer sends `Shutdown`, so
+  one place does.
+- `shutdown_engine` sends `Shutdown`, then reads `evt_rx` with `recv_timeout` against one
+  deadline, discarding events, until `Disconnected` (`true`) or the deadline (`false`). The
+  engine thread owns the only long-lived `Sender<SyncEvent>` (the clone in
+  `apply_op_with_retry` ends with the call), so `Disconnected` means the thread returned; the
+  `Engine`'s `store` drops before its `evt_tx`, so the store is closed by then too.
+- On a timeout lookxy prints one line to stderr (`the sync engine did not stop within 2 s;
+  changes made just before quitting may be lost`) and exits. Nothing is printed otherwise.
+- The browser sign-in's wait reads the channel (mailcore): `listen_for_code` asks an `abort`
+  closure on each idle 50 ms poll, which `sign_in_attempt` builds on `take_waiting`. Before,
+  the wait (up to `SIGNIN_TIMEOUT`, 180 s) read nothing, so quitting while the sign-in modal
+  showed cost the whole 2 s and lost the writes the control surface sent meanwhile. A
+  `Shutdown` or a dropped handle ends the wait: `SignInAttempt::Aborted`, no event, no
+  #2218 consent retry, and `main_loop` persists the kept commands. Outside a shutdown the
+  commands taken go to `deferred` in order and run after the sign-in, as they would have from
+  the channel.
+- Not done: an engine inside a Graph request of a sync pass cannot read the channel until the
+  request returns. If that takes longer than the bound, the commands it has not read are lost
+  as before, and only the stderr line says so. A panic exits without the wait.
+- Tests: `lookxy/src/main.rs` `tests`: `shutdown_waits_for_the_engine_thread_to_return`,
+  `shutdown_gives_up_after_the_bound`, `shutdown_of_an_engine_already_gone_returns_at_once`,
+  on stand-in channels (a real engine from lookxy would reach the platform secret store).
+  `engine.rs` `tests::shutdown_persists`: `a_shutdown_ends_a_sign_in_wait_and_persists_the_writes`
+  and `a_dropped_handle_...` (a 30 s wait, two `Delete`s and a `Shutdown`: back within 3 s,
+  both queued, nothing sent), `a_write_taken_during_a_sign_in_wait_runs_after_it`.
 
 ## Backfill one folder next (#2133)
 
