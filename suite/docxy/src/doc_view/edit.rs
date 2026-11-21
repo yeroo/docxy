@@ -210,10 +210,10 @@ pub(crate) fn history(ed: &mut Editor, redo: bool) -> Formatted {
 /// What a host's text keeps on its way into the document
 /// ([`insert_text`]): line ends made `\n` (`\r\n` and a lone `\r`, which
 /// [`Clip::from_text`] would drop), and only the characters a `w:t` can
-/// hold. The writer escapes `& < >` alone, so a C0 control other than tab,
-/// newline and [`LINE_BREAK`] (Word's plain-text manual line break), or
-/// U+FFFE / U+FFFF, would make the saved part ill-formed XML. A field's
-/// stand-in ([`FIELD_CHAR`]) is not text either.
+/// hold: no C0 control but tab, newline and [`LINE_BREAK`] (Word's
+/// plain-text manual line break), no U+FFFE / U+FFFF, the set
+/// [`Clip::from_text`] keeps too, and the writer drops the rest anyway
+/// (#1993). A field's stand-in ([`FIELD_CHAR`]) is not text either.
 fn insertable(text: &str) -> String {
     text.replace("\r\n", "\n")
         .replace('\r', "\n")

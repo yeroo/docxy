@@ -249,35 +249,42 @@ impl Clip {
     }
 
     /// Build a clip from external plain text (newlines split paragraphs, tabs
-    /// become tab inlines) — used to paste text from the OS clipboard.
+    /// become tab inlines, [`LINE_BREAK`] a line break) — used to paste text
+    /// from the OS clipboard. Characters a `w:t` cannot hold (other C0
+    /// controls, U+FFFE, U+FFFF) are dropped, so the saved part stays
+    /// well-formed (#1993); so are `\r` and [`FIELD_CHAR`].
     pub fn from_text(s: &str) -> Clip {
         let mut paras = Vec::new();
         for line in s.split('\n') {
             let mut inl: Vec<Inline> = Vec::new();
             let mut buf = String::new();
+            let flush = |buf: &mut String, inl: &mut Vec<Inline>| {
+                if !buf.is_empty() {
+                    inl.push(Inline::Run(Run {
+                        text: std::mem::take(buf),
+                        props: RunProps::default(),
+                    }));
+                }
+            };
             for ch in line.chars() {
                 match ch {
                     // A field's stand-in (from editor or automation text) is
                     // not text: pasting it back must not add a character.
                     '\r' | FIELD_CHAR => {}
                     '\t' => {
-                        if !buf.is_empty() {
-                            inl.push(Inline::Run(Run {
-                                text: std::mem::take(&mut buf),
-                                props: RunProps::default(),
-                            }));
-                        }
+                        flush(&mut buf, &mut inl);
                         inl.push(Inline::Tab(RunProps::default()));
                     }
+                    // Word's plain-text manual line break (Shift+Enter).
+                    LINE_BREAK => {
+                        flush(&mut buf, &mut inl);
+                        inl.push(Inline::Break(BreakKind::Line, RunProps::default()));
+                    }
+                    _ if !crate::serialize::xml_char(ch) => {}
                     _ => buf.push(ch),
                 }
             }
-            if !buf.is_empty() {
-                inl.push(Inline::Run(Run {
-                    text: buf,
-                    props: RunProps::default(),
-                }));
-            }
+            flush(&mut buf, &mut inl);
             paras.push(inl);
         }
         Clip::new(paras)
@@ -1734,7 +1741,8 @@ impl Editor {
     }
 
     /// Paste Special's Keep Text Only (#753): paste `text` (newlines split
-    /// paragraphs, tabs become tab inlines) with the formatting typing at the
+    /// paragraphs, tabs become tab inlines, [`LINE_BREAK`] a line break, as
+    /// [`Clip::from_text`] reads it) with the formatting typing at the
     /// caret would give, as [`Editor::insert_tab`] takes it, never the
     /// source's. One undo step "Paste": it replaces the selection and is
     /// recorded as a tracked insertion when tracking, as [`Editor::paste`] is.
@@ -1751,7 +1759,7 @@ impl Editor {
             for inline in clip.paras.iter_mut().flatten() {
                 match inline {
                     Inline::Run(r) => r.props = props.clone(),
-                    Inline::Tab(p) => *p = props.clone(),
+                    Inline::Tab(p) | Inline::Break(_, p) => *p = props.clone(),
                     _ => {}
                 }
             }
@@ -9877,6 +9885,108 @@ mod tests {
         ed.paste_text_only("");
         assert_eq!(first_para(&ed).plain_text(), "abc");
         assert!(ed.has_selection());
+    }
+
+    /// #1993: text from the clipboard never brings a character a `w:t`
+    /// cannot hold: other C0 controls, U+FFFE and U+FFFF are dropped.
+    #[test]
+    fn from_text_drops_xml_forbidden_characters_1993() {
+        let c = Clip::from_text("a\u{1}b\u{0C}c\u{FFFE}d\u{FFFF}e\u{0}\u{1F}\u{0E}");
+        assert_eq!(c.paras.len(), 1);
+        assert_eq!(
+            c.paras[0],
+            vec![Inline::Run(Run {
+                text: "abcde".into(),
+                props: RunProps::default(),
+            })]
+        );
+        // Nothing but such characters is nothing to paste.
+        assert_eq!(Clip::from_text("\u{1}\u{FFFF}").paras, vec![Vec::new()]);
+    }
+
+    /// #1993: `\u{0B}`, Word's plain-text manual line break, is a line
+    /// break inline, between the runs around it; tabs, newlines, `\r` and a
+    /// field's stand-in behave as before.
+    #[test]
+    fn from_text_makes_a_line_break_of_vertical_tab_1993() {
+        let c = Clip::from_text("a\u{0B}b\tc\r\nd\u{FFFC}e\u{0B}");
+        let run = |t: &str| {
+            Inline::Run(Run {
+                text: t.into(),
+                props: RunProps::default(),
+            })
+        };
+        let line = || Inline::Break(BreakKind::Line, RunProps::default());
+        assert_eq!(
+            c.paras,
+            vec![
+                vec![
+                    run("a"),
+                    line(),
+                    run("b"),
+                    Inline::Tab(RunProps::default()),
+                    run("c")
+                ],
+                vec![run("de"), line()],
+            ]
+        );
+    }
+
+    /// #1993: a Keep Text Only paste of text holding control characters
+    /// and noncharacters saves as well-formed XML: the forbidden ones are
+    /// gone, `\u{0B}` is a `<w:br/>` formatted as typing at the caret, and
+    /// it is all one Paste step.
+    #[test]
+    fn paste_text_only_writes_well_formed_xml_1993() {
+        let mut ed = selected(vec![run("[]", italic())], 1, 1);
+        ed.anchor = None;
+        let before = ed.doc.clone();
+        ed.paste_text_only("x\u{1}\u{1F}\u{FFFE}\u{0B}y\u{FFFF}");
+        let content = &first_para(&ed).content;
+        let breaks: Vec<&RunProps> = content
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Break(BreakKind::Line, p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(breaks.len(), 1, "{content:?}");
+        assert!(breaks[0].italic, "{content:?}");
+        let text: String = pieces(&ed, 0).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(text, "[xy]");
+        let xml = crate::serialize::document_to_xml(&ed.doc);
+        assert!(xml.chars().all(crate::serialize::xml_char), "{xml:?}");
+        assert!(xml.contains("<w:br/>"), "{xml}");
+        assert_eq!(ed.undo_names(), vec!["Paste"]);
+        assert!(ed.undo());
+        assert_eq!(ed.doc, before);
+        assert!(!ed.undo(), "one step");
+    }
+
+    /// #1993: `\u{0B}` alone pastes one line break; text with nothing a
+    /// document can hold pastes nothing and keeps the selection.
+    #[test]
+    fn paste_text_only_of_a_break_or_of_forbidden_characters_1993() {
+        let mut ed = selected(vec![run("ab", RunProps::default())], 1, 1);
+        ed.anchor = None;
+        ed.paste_text_only("\u{0B}");
+        let content = &first_para(&ed).content;
+        assert_eq!(
+            content
+                .iter()
+                .filter(|i| matches!(i, Inline::Break(BreakKind::Line, _)))
+                .count(),
+            1,
+            "{content:?}"
+        );
+        assert_eq!(ed.undo_names(), vec!["Paste"]);
+
+        let mut ed = selected(vec![run("abc", RunProps::default())], 0, 2);
+        let before = ed.doc.clone();
+        ed.paste_text_only("\u{1}\u{FFFF}");
+        assert_eq!(ed.doc, before);
+        assert!(ed.has_selection());
+        assert!(ed.undo_names().is_empty());
     }
 
     #[test]

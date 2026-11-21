@@ -193,9 +193,21 @@ pub fn blocks_to_xml(blocks: &[Block]) -> String {
     without_duplicate_para_ids(s)
 }
 
+/// Whether XML 1.0 can hold `c` at all (its `Char` production): tab, line
+/// feed, carriage return and everything from U+0020 up but U+FFFE and
+/// U+FFFF (a `char` is never a surrogate). No character reference makes any
+/// other one legal, so the escapers below drop them: a saved part stays
+/// well-formed whatever text the model holds (#1993).
+pub(crate) fn xml_char(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\r') || (c >= ' ' && !matches!(c, '\u{FFFE}' | '\u{FFFF}'))
+}
+
+/// `s` as XML element text: `& < >` escaped, characters XML cannot hold
+/// ([`xml_char`]) dropped.
 pub(crate) fn esc_text(s: &str, out: &mut String) {
     for ch in s.chars() {
         match ch {
+            _ if !xml_char(ch) => {}
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
@@ -204,9 +216,12 @@ pub(crate) fn esc_text(s: &str, out: &mut String) {
     }
 }
 
+/// `s` as a double-quoted XML attribute value: `& < > "` escaped,
+/// characters XML cannot hold ([`xml_char`]) dropped.
 pub(crate) fn esc_attr(s: &str, out: &mut String) {
     for ch in s.chars() {
         match ch {
+            _ if !xml_char(ch) => {}
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
@@ -2325,6 +2340,65 @@ mod tests {
             p.content
         );
         assert!(blocks_to_xml(&loaded.body).contains(&xml));
+    }
+
+    /// #1993: `xml_char` is XML 1.0's `Char` production, at its edges.
+    #[test]
+    fn xml_char_is_the_xml_1_0_char_production_1993() {
+        for ok in [
+            '\t',
+            '\n',
+            '\r',
+            ' ',
+            'a',
+            '\u{D7FF}',
+            '\u{E000}',
+            '\u{FFFC}',
+            '\u{FFFD}',
+            '\u{10000}',
+            '\u{10FFFF}',
+        ] {
+            assert!(xml_char(ok), "{ok:?}");
+        }
+        for bad in [
+            '\0', '\u{1}', '\u{8}', '\u{B}', '\u{C}', '\u{E}', '\u{1F}', '\u{FFFE}', '\u{FFFF}',
+        ] {
+            assert!(!xml_char(bad), "{bad:?}");
+        }
+    }
+
+    /// #1993: the escapers drop what XML cannot hold and write the rest as
+    /// before, so a part stays well-formed whatever text the model holds.
+    #[test]
+    fn esc_text_and_esc_attr_drop_xml_forbidden_characters_1993() {
+        let raw = "a\u{0}b\u{1}c\u{B}d\u{C}e\u{1F}f\u{FFFE}g\u{FFFF}h\t\n\r<&>\"\u{FFFD}\u{1F600}";
+        let mut text = String::new();
+        esc_text(raw, &mut text);
+        assert_eq!(text, "abcdefgh\t\n\r&lt;&amp;&gt;\"\u{FFFD}\u{1F600}");
+        let mut attr = String::new();
+        esc_attr(raw, &mut attr);
+        assert_eq!(attr, "abcdefgh\t\n\r&lt;&amp;&gt;&quot;\u{FFFD}\u{1F600}");
+    }
+
+    /// #1993: a run whose text holds characters XML cannot hold, however
+    /// they got there, saves as well-formed text without them.
+    #[test]
+    fn a_run_with_forbidden_characters_saves_well_formed_1993() {
+        let d = Document {
+            body: vec![para(
+                ParProps::default(),
+                vec![Inline::Run(Run {
+                    text: "a\u{1}b\u{FFFF}c".into(),
+                    props: RunProps::default(),
+                })],
+            )],
+        };
+        let xml = document_to_xml(&d);
+        assert!(
+            xml.contains("<w:t xml:space=\"preserve\">abc</w:t>"),
+            "{xml}"
+        );
+        assert!(xml.chars().all(xml_char), "{xml:?}");
     }
 
     /// `doc` saved and loaded again. The loaded copy's shadows (its modeled
