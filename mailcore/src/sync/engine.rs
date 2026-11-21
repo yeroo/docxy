@@ -521,7 +521,7 @@ pub enum SyncCommand {
     /// `None` goes back to the default, every calendar the user owns
     /// (`Store::synced_calendar_ids`). The choice is kept in the store, so it
     /// survives a restart. The events of a stored calendar that no longer
-    /// syncs are deleted at once (`Store::set_calendar_selection`), then
+    /// syncs are deleted at once (`Store::set_calendar_selection_holding`), then
     /// [`SyncEvent::CalendarUpdated`] is emitted, and
     /// [`SyncEvent::CalendarsUpdated`] when the synced set changed (each
     /// `CalendarRow::syncs` follows it). When signed in and not waiting out
@@ -9993,7 +9993,11 @@ impl Engine {
     /// the calendar when signed in and not waiting out a throttle or
     /// back-off (`next_retry` still ahead), as `on_tick` would not run then.
     fn set_calendars(&mut self, ids: Option<&[String]>) {
-        let changed = match self.store.set_calendar_selection(ids) {
+        // A waiting edit's row stays (#2017): served from `deferred`, this
+        // command may have an `UpdateEvent` behind it whose host write a
+        // round already pruned.
+        let held = waiting_event_holds(&self.deferred);
+        let changed = match self.store.set_calendar_selection_holding(ids, &held) {
             Ok(changed) => changed,
             Err(e) => {
                 self.emit(SyncEvent::Error(e.to_string()));
@@ -24800,6 +24804,112 @@ mod tests {
         );
 
         // The op gone, a pass deletes B1: CAL-B still does not sync.
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || store.event("B1").unwrap().is_none()),
+            "B1 outlived its op: {:?}",
+            method_paths(&srv)
+        );
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_command_behind_a_deferred_deselect_keeps_its_row() {
+        // #2017 r1. The host edits B1 before a refresh begins (its record
+        // is at or below the round's mark), then sends `SetCalendars`
+        // (deselecting CAL-B) and `UpdateEvent` while the round fetches.
+        // The round takes both into `deferred`, holds B1 for the waiting
+        // edit and prunes its record; `SetCalendars`, served first, must
+        // still keep B1 for the edit behind it.
+        let mut routes = vec![(
+            patch_route("/me/events/B1", 200, "{}"),
+            None,
+            Duration::ZERO,
+        )];
+        routes.extend(
+            calendar_routes(
+                &[("CAL-A", true, "me@x"), ("CAL-B", false, "me@x")],
+                vec![
+                    ("CAL-A", 200, events_body(&[event_from_now("EA", 3600)])),
+                    ("CAL-B", 200, events_body(&[event_from_now("B1", 7200)])),
+                ],
+            )
+            .into_iter()
+            .map(|r| {
+                let slow = r.path_prefix.starts_with("/me/calendars/CAL-")
+                    || r.path_prefix.starts_with("/cal-delta/");
+                let d = if slow {
+                    Duration::from_millis(400)
+                } else {
+                    Duration::ZERO
+                };
+                (r, None, d)
+            }),
+        );
+        let (srv, handle, store_path, dir) = spawn_calendar_engine_paced(
+            "edit-behind-deferred-deselect",
+            routes,
+            |_| {},
+            EngineOptions::without_prefetch(),
+        );
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        wait_for_calendar_updates(&handle.evt_rx, 1);
+        let store = Store::open(&store_path).unwrap();
+        assert_eq!(ids_in(&store, "CAL-B"), ["B1"]);
+        let row = store.event("B1").unwrap().unwrap();
+        let fields = store
+            .update_event_fields(
+                "B1",
+                &crate::store::LocalEventFields {
+                    subject: "Edited".into(),
+                    start_utc: row.start_utc,
+                    end_utc: row.end_utc,
+                    location: row.location,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let before = srv.requests().len();
+        handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
+        assert!(
+            wait_until(ENGINE_WAIT, || paths_from(&srv, before)
+                .iter()
+                .any(|p| p.starts_with("/cal-delta/"))),
+            "no round began: {:?}",
+            method_paths(&srv)
+        );
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetCalendars {
+                ids: Some(vec!["CAL-A".into()]),
+            })
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateEvent {
+                id: "B1".into(),
+                fields,
+            })
+            .unwrap();
+
+        // The edit is sent from B1's kept row. Deleted, its op fails
+        // "no local event stored" on every attempt and is never sent.
+        assert!(
+            wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()
+                && patch_bodies(&srv, "/me/events/B1").len() == 1),
+            "B1's edit never drained (its row deleted?): {:?}",
+            method_paths(&srv)
+        );
+        let bodies = patch_bodies(&srv, "/me/events/B1");
+        assert!(
+            bodies[0].contains(r#""subject":"Edited""#),
+            "the PATCH lost the edit: {}",
+            bodies[0]
+        );
+
+        // The op gone, a pass deletes B1: CAL-B no longer syncs.
         handle.cmd_tx.send(SyncCommand::RefreshCalendar).unwrap();
         assert!(
             wait_until(ENGINE_WAIT, || store.event("B1").unwrap().is_none()),

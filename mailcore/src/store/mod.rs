@@ -1469,7 +1469,7 @@ pub enum EventWrite {
 /// A `written` id's row is not deleted by any round (an initial round's
 /// replace, a delta round's removal or series cascade, #2262; a pass's
 /// step 3 for a calendar that no longer syncs, #2017), nor by
-/// `Store::set_calendar_selection` (#2017), nor
+/// `Store::set_calendar_selection_holding` (#2017), nor
 /// overwritten by any round's upsert, nor filled from its series master; a
 /// `removed` id is not upserted, nor is an event whose `series_master_id`
 /// it is (a series deleted locally), nor their attendees. A round that
@@ -5740,7 +5740,7 @@ impl Store {
     /// exactly `calendars` (a calendar Graph no longer lists is deleted; a
     /// repeated id keeps its first place). Returns whether the stored list
     /// changed (any field, or the order), so the engine announces
-    /// `CalendarsUpdated` only then. The selection (`set_calendar_selection`)
+    /// `CalendarsUpdated` only then. The selection (`set_calendar_selection_holding`)
     /// is kept apart from this list, so a chosen calendar that vanishes and
     /// comes back is still chosen.
     pub fn replace_calendars(&self, calendars: &[Calendar]) -> Result<bool, StoreError> {
@@ -5792,7 +5792,7 @@ impl Store {
     }
 
     /// The ids of the calendars the engine syncs, in `position` order: the
-    /// stored calendars a host chose (`set_calendar_selection`), or, with no
+    /// stored calendars a host chose (`set_calendar_selection_holding`), or, with no
     /// choice, the user's own. A calendar is the user's own when its owner
     /// address equals the default calendar's owner address (ASCII case and
     /// surrounding whitespace ignored, as `is_contact` folds); the default
@@ -5815,15 +5815,21 @@ impl Store {
     /// the host's choice of calendars, and, in the same transaction, deletes
     /// the synced (non-`local:`) events of every **stored** calendar that no
     /// longer syncs, except the rows a pending local write holds (#2017,
-    /// `EventHolds`): the events of queued ops with one, and every host
-    /// write recorded and not yet pruned, whose command may not have reached
-    /// the engine. Such a row stays under its calendar's id until a pass
-    /// after its op is gone deletes it. Events of an id the list does not hold, and pre-#1984
+    /// `EventHolds`): the events of queued ops with one, `held` (the sync
+    /// engine's waiting commands whose host wrote the store before sending
+    /// them, as a round's), and every host write recorded and not yet
+    /// pruned, whose command may not have reached the engine. Such a row
+    /// stays under its calendar's id until a pass after its op is gone
+    /// deletes it. Events of an id the list does not hold, and pre-#1984
     /// rows without a calendar id, are left to the next sync pass
     /// (`apply_calendar_sync_holding`), which runs only after a successful list: so
     /// a host restoring its choice at startup, before the first list,
     /// deletes nothing. Returns whether the synced set changed.
-    pub fn set_calendar_selection(&self, ids: Option<&[String]>) -> Result<bool, StoreError> {
+    pub fn set_calendar_selection_holding(
+        &self,
+        ids: Option<&[String]>,
+        held: &EventHolds,
+    ) -> Result<bool, StoreError> {
         let tx = self.write_tx()?;
         let before = synced_calendar_ids_on(&tx)?;
         match ids {
@@ -5841,12 +5847,14 @@ impl Store {
         }
         let after = synced_calendar_ids_on(&tx)?;
         let synced: HashSet<&str> = after.iter().map(String::as_str).collect();
-        // Every recorded host write (`since` 0), not only the queued ops':
-        // the host may have edited a row whose `UpdateEvent` is still behind
-        // this `SetCalendars` on the engine's channel. Only rounds prune the
+        // `held` and every recorded host write (`since` 0), besides the
+        // queued ops': the host may have edited a row whose `UpdateEvent`
+        // is still behind this `SetCalendars`, on the engine's channel (a
+        // record) or in its `deferred` commands, where a round that took
+        // them has pruned the record (`held`). Only rounds prune the
         // records, so one whose command never comes keeps its row until the
         // next pass, whose mark is past it (#2017).
-        let holds = round_holds_on(&tx, &EventHolds::default(), 0)?;
+        let holds = round_holds_on(&tx, held, 0)?;
         for c in stored_calendars_on(&tx)? {
             if !synced.contains(c.id.as_str()) {
                 delete_calendar_events_on(&tx, &c.id, &holds)?;
@@ -6041,6 +6049,14 @@ impl Store {
             [],
             |r| r.get(0),
         )?)
+    }
+
+    /// `set_calendar_selection_holding` with no caller holds (the outbox's
+    /// and the recorded host writes still apply). Test-only (#2017), so
+    /// every other caller passes its holds.
+    #[cfg(test)]
+    pub fn set_calendar_selection(&self, ids: Option<&[String]>) -> Result<bool, StoreError> {
+        self.set_calendar_selection_holding(ids, &EventHolds::default())
     }
 
     /// `apply_calendar_sync_holding` with no caller holds (the outbox's
@@ -19185,6 +19201,27 @@ mod calendar_tests {
             .unwrap();
         assert!(s.event("B1").unwrap().is_none());
         assert_eq!(local_write_count(&s), 0);
+    }
+
+    #[test]
+    fn set_calendar_selection_keeps_an_event_a_waiting_command_names() {
+        // The host edited B1 and sent `UpdateEvent` behind `SetCalendars`;
+        // a round took both into the engine's `deferred` and pruned the
+        // write's record. Only the caller's `held` names B1 now.
+        let s = two_calendar_store();
+        host_rename(&s, "B1", "Edited");
+        s.apply_calendar_sync(FROM, TO, &[ann_window(graph_events())], STAMP)
+            .unwrap();
+        assert_eq!(local_write_count(&s), 0);
+        assert!(s.pending_ops().unwrap().is_empty());
+        let mut held = EventHolds::default();
+        held.hold("B1", EventWrite::Written);
+        assert!(
+            s.set_calendar_selection_holding(Some(&only_a()), &held)
+                .unwrap()
+        );
+        assert_eq!(row(&s, "B1").subject, "Edited");
+        assert!(s.event("B2").unwrap().is_none());
     }
 
     #[test]
