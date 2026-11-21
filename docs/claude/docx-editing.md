@@ -472,3 +472,22 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
 - Compare: a field failing `is_run_level(run_level_field(..))` is never in a
   `w:ins`/`w:del`: deleted, it is skipped; inserted, `emit_wrapped` lifts it
   out like a marker. Both report `CompareSkip::Object`.
+
+## Plain text into a document: only characters XML can hold (#1993)
+
+- `Clip::from_text` (every plain-text paste: Paste Text Only, the suite's
+  plain-text paste, docxwasm's `paste`, `agent.rs`) drops `\r`,
+  `FIELD_CHAR` and every character outside XML 1.0's `Char`
+  (`serialize::xml_char`: C0 controls but tab and newline, U+FFFE, U+FFFF).
+  `LINE_BREAK` (`\u{0B}`, Word's plain-text manual line break) becomes an
+  `Inline::Break(Line)`, which `paste_text_only` formats as typing at the
+  caret, like its runs and tabs. `\u{0C}` and `\u{0E}` (how `flat.rs` reads
+  back a page or column break) are dropped, not made breaks.
+- The safety net is the writer: `serialize::esc_text` / `esc_attr` drop what
+  `xml_char` refuses (no character reference makes those legal), so a run
+  that got such text another way (`insert_char`, automation) still saves
+  well-formed. `Package::add_comment` and `package.rs`'s `esc_xml_attr` go
+  through `esc_attr`. Escapers of their own (`latex.rs`, `mermaid.rs`,
+  `cover.rs`) do not.
+- The embedded view's `insertable` (#1977) keeps its own filter: it also
+  makes a lone `\r` a newline, which `from_text` drops.
