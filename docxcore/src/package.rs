@@ -2887,18 +2887,13 @@ impl Package {
     /// content-type if absent. `text` is the comment body (XML-escaped here;
     /// characters XML cannot hold are dropped, #1993).
     pub fn add_comment(&mut self, id: i32, author: &str, initials: &str, date: &str, text: &str) {
-        let esc = |s: &str| {
-            let mut out = String::with_capacity(s.len());
-            crate::serialize::esc_attr(s, &mut out);
-            out
-        };
         let comment = format!(
             "<w:comment w:id=\"{id}\" w:author=\"{}\" w:initials=\"{}\" w:date=\"{}\">\
              <w:p><w:r><w:t xml:space=\"preserve\">{}</w:t></w:r></w:p></w:comment>",
-            esc(author),
-            esc(initials),
-            esc(date),
-            esc(text),
+            esc_xml_attr(author),
+            esc_xml_attr(initials),
+            esc_xml_attr(date),
+            esc_xml_attr(text),
         );
         self.insert_comment_xml(&comment);
     }
