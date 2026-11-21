@@ -4620,12 +4620,23 @@ already applied them to its store, so they looked done and the next start never 
   `Engine`'s `store` drops before its `evt_tx`, so the store is closed by then too.
 - On a timeout lookxy prints one line to stderr (`the sync engine did not stop within 2 s;
   changes made just before quitting may be lost`) and exits. Nothing is printed otherwise.
-- Not done: an engine inside a long Graph request (a sync pass, a device-code sign-in poll)
-  cannot read the channel within the bound, and the commands it has not read are lost as
-  before; only the stderr line says so. A panic exits without the wait.
-- Tests (`lookxy/src/main.rs` `tests`): `shutdown_waits_for_the_engine_thread_to_return`,
+- The browser sign-in's wait reads the channel (mailcore): `listen_for_code` asks an `abort`
+  closure on each idle 50 ms poll, which `sign_in_attempt` builds on `take_waiting`. Before,
+  the wait (up to `SIGNIN_TIMEOUT`, 180 s) read nothing, so quitting while the sign-in modal
+  showed cost the whole 2 s and lost the writes the control surface sent meanwhile. A
+  `Shutdown` or a dropped handle ends the wait: `SignInAttempt::Aborted`, no event, no
+  #2218 consent retry, and `main_loop` persists the kept commands. Outside a shutdown the
+  commands taken go to `deferred` in order and run after the sign-in, as they would have from
+  the channel.
+- Not done: an engine inside a Graph request of a sync pass cannot read the channel until the
+  request returns. If that takes longer than the bound, the commands it has not read are lost
+  as before, and only the stderr line says so. A panic exits without the wait.
+- Tests: `lookxy/src/main.rs` `tests`: `shutdown_waits_for_the_engine_thread_to_return`,
   `shutdown_gives_up_after_the_bound`, `shutdown_of_an_engine_already_gone_returns_at_once`,
   on stand-in channels (a real engine from lookxy would reach the platform secret store).
+  `engine.rs` `tests::shutdown_persists`: `a_shutdown_ends_a_sign_in_wait_and_persists_the_writes`
+  and `a_dropped_handle_...` (a 30 s wait, two `Delete`s and a `Shutdown`: back within 3 s,
+  both queued, nothing sent), `a_write_taken_during_a_sign_in_wait_runs_after_it`.
 
 ## Backfill one folder next (#2133)
 
