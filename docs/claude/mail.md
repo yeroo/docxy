@@ -1926,8 +1926,14 @@ this occurrence or the whole series, as Outlook does.
   occurrence, even from a changed master. Before this, an initial round (a window
   move, `FetchCalendarRange`, an expired link, a reset) replaced the row, and a
   queued `UpdateEvent`, which reads its row at send time (`event_input_for`),
-  sent Graph's old values: the edit was lost. A delta round's removals still go:
-  Graph says the event is gone.
+  sent Graph's old values: the edit was lost. Since #2262 no round deletes a
+  `written` row either: not a delta round's removal nor its series cascade (the
+  held occurrences stay, the others go). Graph lists as `@removed` an event
+  that only moved out of the window (an organizer moved it), and the row gone,
+  the queued `UpdateEvent` failed to read it and the edit went through the
+  attempts to the quarantine. A gone master (#2064: Graph answered 404 for its
+  `GET`) still goes whatever the holds: its op 404s too, and the reset's
+  initial rounds would not reach a master that starts before the window.
 - Commands not queued yet: a host writes the row before it sends `UpdateEvent`
   or `DeleteEvent`, and the engine may be fetching a refresh then. Right before it
   writes a refresh (`refresh_calendar`) or a fetched range (`fetch_range_gaps`),
@@ -1935,15 +1941,55 @@ this occurrence or the whole series, as Outlook does.
   nothing) and passes their events as `held` (`waiting_event_holds`): an `UpdateEvent` with `fields` as `Written`, a
   `DeleteEvent` as `Removed`. Not `RespondEvent`, `CancelEvent` or
   `RemoveFromCalendar`: the engine writes for those when it handles them, after
-  the round, and `cancel_event` needs the row a held removal would drop. A host
-  write that lands between the take and the round's commit still races
-  (microseconds).
+  the round, and `cancel_event` needs the row a held removal would drop.
+- Host writes with no command yet (#2262): `update_event_fields` (only when its
+  returned set is non-empty: a zone-only edit, which writes `send_*_tz` but is
+  never sent, marks nothing), `delete_event` and `delete_event_series` (the
+  master's id) record a row in `event_local_writes` (`seq` AUTOINCREMENT, the
+  event id, `written` / `removed`) in their own write transaction. The engine
+  reads the mark (`Store::event_write_mark`, the newest `seq`) before any
+  request: first thing in `refresh_calendar` after the signed-in check, and in
+  `fetch_range_gaps` before each gap's view. Both `_holding` applies take it as
+  `since` and hold every record past it (`round_holds_on`, in the round's own
+  IMMEDIATE transaction, so a host write either is seen or commits after the
+  round). This closes the window `waiting_event_holds` cannot see: a write
+  whose command is still on the channel, or sent only after the round.
+  A write is held only by the rounds that were fetching when it was made, so
+  one whose command never comes (an edit that changed nothing marks nothing;
+  a `local:` id; a host that died) freezes nothing past them (the orphan). Each
+  round prunes the records at or below its mark: rounds never nest or
+  interleave (one engine thread; `fetch_range_gaps` only from
+  `FetchCalendarRange`), so no later round can hold them. The engine's own
+  deletes (`cancel_event`'s `delete_event`, `removed_from_calendar`'s
+  `delete_event_series`) record too, harmlessly: no command is served inside a
+  round's mark-to-write window (`take_waiting` serves nothing, `checkpoint`
+  only reads). The `#[cfg(test)]` wrappers `apply_calendar_sync` /
+  `apply_calendar_range` are a round that started at the call: they read the
+  mark then, so earlier writes in a store test are no holds.
 - Convergence: a kept row of an event Graph deleted stays until its op ends. A 404
   or a permanent failure ends in the quarantine (`drop_op`, then
   `reset_calendars`), whose initial rounds, the op gone, replace it (and still keep
   other queued ops' rows). A skipped delta upsert comes back: the op's PATCH,
   RSVP or DELETE changes the event on Graph, so a later delta round names it (the
-  link this round stored predates it).
+  link this round stored predates it). A round that keeps a `written` row it
+  would otherwise have deleted (#2262 r1) drops its calendar's delta state, as a
+  series cascade does: a delta round's kept removal (and the window is not
+  recorded as fetched), or an initial round's held row Graph's window does not
+  list. The removal's `@removed` is behind the link the round would store, and
+  an event out of the window may never be named again, so the calendar's passes
+  stay initial while the hold lasts, and the first one after it (the op sent,
+  dropped or quarantined; an orphan write's record below the mark) deletes the
+  row as Graph's window says, without relying on Graph to list it again. A held
+  row Graph's round lists keeps the delta state: the ordinary edit costs no
+  extra initial rounds. A `FetchCalendarRange` stores no delta state, and its
+  dates mostly lie outside the sync window, which no sync round touches: a
+  range round that keeps a held row its fetch does not list leaves the range
+  unrecorded instead (#2262 r2; `replace_calendar_range_on` returns it, and
+  the caller records), so the next `FetchCalendarRange` of those dates fetches
+  them again and the first after the hold deletes the row. A range whose held
+  rows Graph lists is recorded as before. The engine's `fetch_range_gaps`
+  computes the gaps once per calendar per command, so an unrecorded gap is no
+  loop: the command still ends with `CalendarRangeFetched`.
 - Tests: `store/mod.rs` `event_local_write_names_the_ops_whose_command_wrote_the_row`,
   `initial_round_keeps_a_row_with_a_queued_update`,
   `an_undecodable_outbox_row_does_not_stop_a_calendar_round`,
@@ -1960,6 +2006,30 @@ this occurrence or the whole series, as Outlook does.
   `delete_command_waiting_during_a_refresh_keeps_the_row_gone`,
   `edit_command_waiting_during_a_range_fetch_keeps_its_edit` (a slow view,
   `spawn_calendar_engine_paced`), `queued_event_edit_survives_an_initial_calendar_round`.
+  #2262: `store/mod.rs` `delta_removal_keeps_a_row_with_a_queued_update`,
+  `delta_removal_keeps_a_row_with_a_queued_response`,
+  `delta_removal_keeps_a_held_occurrence_of_a_removed_series`,
+  `gone_master_goes_despite_a_queued_response`,
+  `delta_removal_of_an_orphan_edit_keeps_it_once_then_converges`,
+  `initial_round_keeping_a_held_row_graph_does_not_list_stays_initial`,
+  `range_keeping_a_held_row_graph_does_not_list_stays_unrecorded`,
+  `round_keeps_a_host_edit_made_after_its_mark`,
+  `round_does_not_bring_back_a_host_delete_made_after_its_mark`,
+  `round_after_a_host_edit_with_no_command_replaces_the_row`,
+  `an_edit_that_changed_nothing_marks_nothing`; `engine.rs`
+  `host_edit_during_a_refresh_with_its_command_after_the_round_keeps_its_edit`,
+  `host_delete_during_a_refresh_with_its_command_after_the_round_stays_gone`,
+  `host_edit_during_a_range_fetch_with_its_command_after_the_round_keeps_its_edit`,
+  `orphan_host_edit_does_not_freeze_the_row`,
+  `deferred_event_move_survives_an_initial_round_and_patches_the_new_times`
+  (the PATCH's times compared as instants),
+  `deferred_event_edit_survives_a_delta_round_naming_it`,
+  `deferred_event_edit_survives_a_delta_removal` (then an initial round
+  deletes X1),
+  `deferred_response_survives_an_initial_round`,
+  `deferred_delete_and_cancel_rows_stay_gone_through_an_initial_round`,
+  `quarantined_event_edit_releases_the_row`,
+  `round_after_the_edit_lands_takes_graphs_row`.
 
 ## An edit during an event's in-flight create (#2005)
 

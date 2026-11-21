@@ -557,6 +557,19 @@ CREATE TABLE IF NOT EXISTS event_attendees (
 
 CREATE INDEX IF NOT EXISTS idx_event_attendees_event ON event_attendees(event_id);
 
+-- A host's local event writes in commit order (#2262): `update_event_fields`
+-- that changed something (`written`), `delete_event` and `delete_event_series`
+-- (`removed`, the series by its master's id). A calendar round holds every
+-- row past the mark read before its fetch began (`Store::event_write_mark`),
+-- as its command may not have reached the sync engine yet, and prunes the
+-- rows at or below it. `AUTOINCREMENT`, so a `seq` is never reused once the
+-- table empties.
+CREATE TABLE IF NOT EXISTS event_local_writes (
+    seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL,
+    kind     TEXT NOT NULL
+);
+
 -- Full-text index over subject/sender/body, kept in step with `messages`
 -- and `bodies` by the triggers below (Task 9 exercises search itself).
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
