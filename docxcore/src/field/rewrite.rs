@@ -409,7 +409,8 @@ mod tests {
         );
         assert_eq!(
             instr_of(&out).as_deref(),
-            Some(" DATE \\@ \"M/d/yyyy\" \\* MERGEFORMAT ")
+            // The unpreserved second piece loses its edge space, as in Word (#1186).
+            Some(" DATE \\@ \"M/d/yyyy\" \\* MERGEFORMAT")
         );
     }
 
