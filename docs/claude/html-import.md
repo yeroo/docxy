@@ -770,7 +770,7 @@ A batch from #1989 and #1930 (plan-2), import only.
   (2..96); the colour is the element's text colour unless given,
   `windowtext` automatic, `transparent` or a zero alpha no line, a partial
   alpha blended over white (`rgba(0,0,0,0.1)` is `E6E6E6`; r3; `hsl()` /
-  `hsla()` read since r4, for text colours too). A
+  `hsla()` read since r4). A
   block's left and right lines go on every paragraph in it, an inner
   block's own over the outer's (`ParBorders::over`): Outlook's quote line
   goes on through its header, and Word's `<p style='border:none'>` in a
@@ -782,8 +782,9 @@ A batch from #1989 and #1930 (plan-2), import only.
   `Builder::last_shown_para_mut`: past a table or a hidden paragraph
   after it; unless a block inside closed first and gave that paragraph
   its own), so a box around a list or a ruled title is still one box (r3,
-  r4). A paragraph shows anything (`import::shows`) when some content is
-  not `vanish`, or with none, when its mark is not. Geometry as a browser's box: a
+  r4). A paragraph shows anything (`import::shows`) unless its mark is
+  `vanish` and all its content too, as Word and the suite collapse one
+  (r5: a shown `p` holding only hidden text is a line). Geometry as a browser's box: a
   left/right line moves the text in by its width; each paragraph's
   left/right `w:space` is its indent less the line's place
   (`Look::border_left_x`) and width, in whole points up to 31, so an item
@@ -827,6 +828,11 @@ A batch from #1989 and #1930 (plan-2), import only.
   O(compounds × depth). Not done: `~` and `:first-of-type` (the whole
   sibling list, quadratic on long pages), `:last-child`, `:nth-*`,
   `:not()`, `:hover`/`:visited`, pseudo-elements, escapes.
+- Colours (`css::rgb`, `color_args`, r5): a partial alpha in any colour
+  (`color`, `background`, a border) is the colour over white, as on a
+  white page (`rgba(0,0,0,.5)` is `808080`, a 4% black shading
+  `F5F5F5`); a zero alpha is none; `hsl()`/`hsla()` are read; a
+  non-finite number makes the colour none.
 - A `head` ends as a browser ends it (`Html::skip_head`, r3, r4; a fix
   to code older than #1883), in one forward scan charged as scanned:
   white space, comments, `<!…>`, `HEAD_VOID` tags and raw-text elements
@@ -857,6 +863,8 @@ A batch from #1989 and #1930 (plan-2), import only.
   `an_unclosed_head_ends_at_the_body_1883`,
   `many_heads_are_skipped_in_linear_time_1883`,
   `a_box_s_lines_pass_over_tables_cards_and_hidden_paragraphs_1883`,
+  `a_paragraph_with_only_hidden_text_still_shows_1883`,
+  `partial_alpha_colours_blend_over_white_1883`,
   `many_elements_with_sibling_and_attribute_rules_import_1883`; `css.rs`:
   `a_value_past_the_cap_is_present_but_never_matches_a_test_1883`,
   `borders_shorthands_and_longhands_1883`,

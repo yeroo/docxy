@@ -367,21 +367,18 @@ pub(crate) fn marker_is_numbered(marker: &str) -> bool {
         .all(|part| !part.is_empty() && part.chars().all(|c| c.is_alphanumeric()))
 }
 
-/// An inline that is neither text nor a break nor a link: an object,
-/// content of its own. A link (#1879) counts by its text.
-/// Whether a paragraph of `content` shows anything (#1883 r4): some of it
-/// not hidden (`vanish`), or, with none, a mark not hidden. A picture or
-/// other object always shows.
+/// Whether a paragraph of `content` shows anything (#1883 r4, r5): as
+/// Word and the suite collapse one, it is hidden only when its mark is
+/// hidden and all its content too (`vanish`); a picture or other object
+/// always shows.
 pub(crate) fn shows(content: &[Inline], mark_vanish: bool) -> bool {
-    if content.is_empty() {
-        return !mark_vanish;
-    }
-    content.iter().any(|i| match i {
-        Inline::Run(r) => !r.props.vanish,
-        Inline::Hyperlink(h) => h.runs.iter().any(|r| !r.props.vanish),
-        Inline::Break(_, p) | Inline::Tab(p) => !p.vanish,
-        _ => true,
-    })
+    !mark_vanish
+        || content.iter().any(|i| match i {
+            Inline::Run(r) => !r.props.vanish,
+            Inline::Hyperlink(h) => h.runs.iter().any(|r| !r.props.vanish),
+            Inline::Break(_, p) | Inline::Tab(p) => !p.vanish,
+            _ => true,
+        })
 }
 
 /// Whether a paragraph's mark (its `w:rPr` in `raw_props`, as the HTML
@@ -393,6 +390,8 @@ pub(crate) fn mark_vanish(props: &ParProps) -> bool {
         .any(|r| r.starts_with("<w:rPr") && r.contains("<w:vanish/>"))
 }
 
+/// An inline that is neither text nor a break nor a link: an object,
+/// content of its own. A link (#1879) counts by its text.
 fn is_object(inline: &Inline) -> bool {
     !matches!(
         inline,

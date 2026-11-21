@@ -1102,76 +1102,85 @@ pub(crate) fn color(value: &str) -> Option<Color> {
 }
 
 /// A colour as `RRGGBB`: `#rgb`, `#rrggbb`, `rgb()`/`rgba()` (integers or
-/// percentages; fully transparent is none), a named colour.
+/// percentages), `hsl()`/`hsla()` ([`hsl`]), a named colour. A zero alpha
+/// is none; a partial one is the colour over white, as on a white page
+/// (#1883 r5: `rgba(0,0,0,.5)` is `808080`).
 fn rgb(lower: &str) -> Option<String> {
     if let Some(hex) = lower.strip_prefix('#') {
         return hex_rgb(hex);
     }
-    if let Some(args) = lower
-        .strip_prefix("rgba(")
-        .or_else(|| lower.strip_prefix("rgb("))
-    {
-        let args = args.strip_suffix(')')?;
-        let parts: Vec<&str> = args
-            .split([',', ' ', '/'])
-            .filter(|p| !p.is_empty())
-            .collect();
-        if parts.len() != 3 && parts.len() != 4 {
+    if let Some((is_hsl, channels, alpha)) = color_args(lower) {
+        if alpha <= 0.0 {
             return None;
         }
-        if let Some(a) = parts.get(3) {
-            let alpha = match a.strip_suffix('%') {
-                Some(p) => p.parse::<f64>().ok()? / 100.0,
-                None => a.parse::<f64>().ok()?,
-            };
-            if alpha <= 0.0 {
-                return None;
-            }
-        }
-        let mut out = String::with_capacity(6);
-        for p in &parts[..3] {
-            let n = match p.strip_suffix('%') {
-                Some(pc) => pc.parse::<f64>().ok()? * 255.0 / 100.0,
-                None => p.parse::<f64>().ok()?,
-            };
-            if !n.is_finite() {
-                return None;
-            }
-            out.push_str(&format!("{:02X}", n.round().clamp(0.0, 255.0) as u8));
-        }
-        return Some(out);
-    }
-    if let Some(args) = lower
-        .strip_prefix("hsla(")
-        .or_else(|| lower.strip_prefix("hsl("))
-    {
-        return hsl(args.strip_suffix(')')?);
+        let base = if is_hsl {
+            hsl(channels)?
+        } else {
+            rgb_channels(channels)?
+        };
+        return if alpha < 1.0 {
+            over_white(&base, alpha)
+        } else {
+            Some(base)
+        };
     }
     named_color(lower).map(str::to_string)
 }
 
-/// An `hsl()` / `hsla()` colour's arguments (#1883 r4): a hue (degrees,
-/// `deg`, `turn` or `rad`), saturation and lightness (percentages, or plain
-/// numbers as percentages), an optional alpha; a zero alpha is none, as
-/// in [`rgb`]. `RRGGBB`.
-fn hsl(args: &str) -> Option<String> {
+/// The arguments of an `rgb()`, `rgba()`, `hsl()` or `hsla()` colour
+/// (`lower`, #1883 r5): whether it is an hsl one, its three channel
+/// arguments, and its alpha (`1` when none is given; a number or a
+/// percentage, never above 1). `None` for any other value, another count of
+/// arguments, or an alpha that is no finite number.
+fn color_args(lower: &str) -> Option<(bool, [&str; 3], f64)> {
+    let (is_hsl, args) = [
+        ("rgba(", false),
+        ("rgb(", false),
+        ("hsla(", true),
+        ("hsl(", true),
+    ]
+    .into_iter()
+    .find_map(|(f, h)| lower.strip_prefix(f).map(|a| (h, a)))?;
+    let args = args.strip_suffix(')')?;
     let parts: Vec<&str> = args
         .split([',', ' ', '/'])
         .filter(|p| !p.is_empty())
         .collect();
-    if parts.len() != 3 && parts.len() != 4 {
-        return None;
-    }
-    if let Some(a) = parts.get(3) {
-        let alpha = match a.strip_suffix('%') {
+    let alpha = match parts.as_slice() {
+        [_, _, _] => 1.0,
+        [_, _, _, a] => match a.strip_suffix('%') {
             Some(p) => p.parse::<f64>().ok()? / 100.0,
             None => a.parse::<f64>().ok()?,
+        },
+        _ => return None,
+    };
+    if !alpha.is_finite() {
+        return None;
+    }
+    Some((is_hsl, [parts[0], parts[1], parts[2]], alpha.min(1.0)))
+}
+
+/// `rgb()`'s three channels, integers or percentages, as `RRGGBB`.
+fn rgb_channels(channels: [&str; 3]) -> Option<String> {
+    let mut out = String::with_capacity(6);
+    for p in channels {
+        let n = match p.strip_suffix('%') {
+            Some(pc) => pc.parse::<f64>().ok()? * 255.0 / 100.0,
+            None => p.parse::<f64>().ok()?,
         };
-        if alpha <= 0.0 {
+        if !n.is_finite() {
             return None;
         }
+        out.push_str(&format!("{:02X}", n.round().clamp(0.0, 255.0) as u8));
     }
-    let h = parts[0];
+    Some(out)
+}
+
+/// An `hsl()` colour's three channels (#1883 r4): a hue (degrees, `deg`,
+/// `turn` or `rad`), saturation and lightness (percentages, or plain
+/// numbers as percentages). `RRGGBB`.
+fn hsl(channels: [&str; 3]) -> Option<String> {
+    let h = channels[0];
     let degrees = if let Some(t) = h.strip_suffix("turn") {
         t.parse::<f64>().ok()? * 360.0
     } else if let Some(r) = h.strip_suffix("rad") {
@@ -1181,9 +1190,9 @@ fn hsl(args: &str) -> Option<String> {
     };
     let pct = |p: &str| -> Option<f64> {
         let v = p.strip_suffix('%').unwrap_or(p).parse::<f64>().ok()?;
-        Some((v / 100.0).clamp(0.0, 1.0))
+        v.is_finite().then(|| (v / 100.0).clamp(0.0, 1.0))
     };
-    let (sat, light) = (pct(parts[1])?, pct(parts[2])?);
+    let (sat, light) = (pct(channels[1])?, pct(channels[2])?);
     if !degrees.is_finite() {
         return None;
     }
@@ -1701,41 +1710,20 @@ pub(crate) fn border_width(value: &str) -> Option<Len> {
 /// A `border-color` value.
 ///
 /// `transparent` and a zero alpha are no line (r3); a partial alpha is the
-/// colour over white, as a line on a white page looks (`rgba(0,0,0,0.1)`
-/// is `E6E6E6`).
+/// colour over white, as every colour's is ([`rgb`]; `rgba(0,0,0,0.1)` is
+/// `E6E6E6`).
 pub(crate) fn border_color(value: &str) -> Option<BorderColor> {
     let lower = value.trim().to_ascii_lowercase();
-    let alpha = match alpha_of(&lower) {
-        Some(a) if a <= 0.0 => return Some(BorderColor::None),
-        Some(a) => a.min(1.0),
-        None if lower == "transparent" => return Some(BorderColor::None),
-        None => 1.0,
-    };
+    let transparent =
+        lower == "transparent" || color_args(&lower).is_some_and(|(_, _, a)| a <= 0.0);
+    if transparent {
+        return Some(BorderColor::None);
+    }
     match color(value)? {
-        Color::Rgb(c) if alpha < 1.0 => Some(BorderColor::Rgb(over_white(&c, alpha)?)),
         Color::Rgb(c) => Some(BorderColor::Rgb(c)),
         Color::Reset => Some(BorderColor::Auto),
         Color::Keep => Some(BorderColor::Current),
     }
-}
-
-/// The alpha of an `rgba()` / `rgb()` / `hsla()` / `hsl()` value given with
-/// one (`0.5`, `50%`), else `None`.
-fn alpha_of(lower: &str) -> Option<f64> {
-    let args = ["rgba(", "rgb(", "hsla(", "hsl("]
-        .iter()
-        .find_map(|f| lower.strip_prefix(f))?
-        .strip_suffix(')')?;
-    let parts: Vec<&str> = args
-        .split([',', ' ', '/'])
-        .filter(|p| !p.is_empty())
-        .collect();
-    let a = parts.get(3)?;
-    let a = match a.strip_suffix('%') {
-        Some(p) => p.parse::<f64>().ok()? / 100.0,
-        None => a.parse::<f64>().ok()?,
-    };
-    a.is_finite().then_some(a)
 }
 
 /// `RRGGBB` at `alpha` over white.
@@ -2074,8 +2062,12 @@ mod tests {
         assert_eq!(c("#1f497d"), Some(Color::Rgb("1F497D".into())));
         assert_eq!(c("rgb(204, 204, 204)"), Some(Color::Rgb("CCCCCC".into())));
         assert_eq!(c("rgb(100%,0%,50%)"), Some(Color::Rgb("FF0080".into())));
-        assert_eq!(c("RGBA(0,0,255,0.5)"), Some(Color::Rgb("0000FF".into())));
-        assert_eq!(c("rgb(0 128 0 / 50%)"), Some(Color::Rgb("008000".into())));
+        // A partial alpha is the colour over white (#1883 r5).
+        assert_eq!(c("RGBA(0,0,255,0.5)"), Some(Color::Rgb("8080FF".into())));
+        assert_eq!(c("rgb(0 128 0 / 50%)"), Some(Color::Rgb("80C080".into())));
+        assert_eq!(c("rgba(0,0,0,.5)"), Some(Color::Rgb("808080".into())));
+        assert_eq!(c("rgba(204,204,204,1)"), Some(Color::Rgb("CCCCCC".into())));
+        assert_eq!(c("rgba(0,0,0,2)"), Some(Color::Rgb("000000".into())));
         assert_eq!(c("rgba(0,0,0,0)"), None);
         assert_eq!(c("rgb(300,-4,0)"), Some(Color::Rgb("FF0000".into())));
         assert_eq!(c("Navy"), Some(Color::Rgb("000080".into())));
@@ -2089,11 +2081,23 @@ mod tests {
         );
         assert_eq!(
             c("hsla(300deg,100%,50%,0.4)"),
-            Some(Color::Rgb("FF00FF".into()))
+            Some(Color::Rgb("FF99FF".into()))
         );
         assert_eq!(c("hsl(-120, 100%, 50%)"), Some(Color::Rgb("0000FF".into())));
         assert_eq!(c("hsla(0,0%,0%,0)"), None);
         assert_eq!(c("hsl(x, 1%, 1%)"), None);
+        // A non-finite number is none, in every form (r5).
+        for nan in [
+            "rgba(0,0,0,nan)",
+            "rgba(0,0,0,inf)",
+            "rgb(nan,0,0)",
+            "hsla(0,100%,50%,nan)",
+            "hsl(nan,100%,50%)",
+            "hsl(0,nan%,50%)",
+        ] {
+            assert_eq!(c(nan), None, "{nan}");
+            assert_eq!(border_color(nan), None, "{nan}");
+        }
         assert_eq!(c("windowtext"), Some(Color::Reset));
         assert_eq!(c("auto"), Some(Color::Reset));
         assert_eq!(c("inherit"), Some(Color::Keep));

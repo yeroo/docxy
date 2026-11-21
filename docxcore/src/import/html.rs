@@ -2247,8 +2247,10 @@ struct Html<'a> {
     /// The page is in quirks mode ([`quirks_mode`], #1979): a block's
     /// user-agent margins at its body's or cell's edge are dropped.
     quirks: bool,
-    /// A block with a forced page break after it has closed (#1883): the
-    /// next body paragraph starts a page. A table opening drops it.
+    /// A forced page break waiting for the next body paragraph that shows
+    /// anything (#1883): set when a block with a break after it closes, an
+    /// empty block with a break before it closes, or a hidden paragraph
+    /// passes one on (r4). A table opening drops it.
     break_pending: bool,
     /// The element children outside every open element (#1883).
     root_kids: Kids,
@@ -5669,6 +5671,35 @@ mod tests {
         let d = boxed("<table><tr><td>only</td></tr></table>");
         assert!(para_of(&d, "only").props.borders.is_empty());
         assert!(para_of(&d, "outside").props.borders.is_empty());
+    }
+
+    #[test]
+    fn a_paragraph_with_only_hidden_text_still_shows_1883() {
+        // r5 m4: as Word and the suite collapse a paragraph only when its
+        // mark is hidden too, a shown `p` holding only hidden text is a
+        // line, and takes the box's top.
+        let d = doc("<div style='border:1px solid #cccccc'>\
+             <p><span style='display:none'>pre</span></p><p>Body</p></div>");
+        let first = all_paras(&d)
+            .into_iter()
+            .find(|p| p.plain_text().contains("pre"))
+            .expect("the hidden text's paragraph");
+        assert!(first.props.borders.top.is_some());
+        assert_eq!(box_sides(&d, &["Body"]), [(false, true, true)]);
+    }
+
+    #[test]
+    fn partial_alpha_colours_blend_over_white_1883() {
+        // r5 m3: a faint shading or text colour is drawn as on a white
+        // page, not as the opaque colour.
+        let d = doc("<p style='background-color:hsla(0,0%,0%,0.04)'>shaded</p>\
+             <p><span style='background:rgba(0,0,0,0.04)'>run</span> \
+             <span style='color:rgba(0,0,0,.5)'>grey</span> \
+             <span style='color:rgba(0,0,0,0)'>none</span></p>");
+        assert!(has_shd(&para_of(&d, "shaded").props.raw_props, "F5F5F5"));
+        assert!(has_shd(&run_of(&d, "run").props.raw_props, "F5F5F5"));
+        assert_eq!(run_of(&d, "grey").props.color.as_deref(), Some("808080"));
+        assert_eq!(run_of(&d, "none").props.color, None);
     }
 
     #[test]
