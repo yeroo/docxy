@@ -1068,15 +1068,17 @@ range on demand (`FetchCalendarRange`) #2014 (the next section).
   fetched calendar's non-`local:` rows overlapping the window are replaced
   (an initial round; a delta round applies only what it names);
   (3) non-`local:` rows of any date whose non-empty `calendar_id` is not
-  synced are deleted. Step 1 matters: before #1984 sync read only the
+  synced are deleted, except a held `written` row (#2017, "A calendar round
+  keeps a pending local write"). Step 1 matters: before #1984 sync read only the
   default calendar and never deleted rows that slid out of the window, so a
   `''` row is the default calendar's history, which a date navigator shows.
   A failed list changes nothing. A 401, throttle or transport error on any
   view writes no events for the pass (the calendar list, stored and
   announced before the views, stays); a 404/HTTP/parse error on one calendar
   emits `Error` and keeps that calendar's rows.
-- `SetCalendars` (`Store::set_calendar_selection`) deletes at once only the
-  events of **stored** calendars that no longer sync. Unknown ids and `''`
+- `SetCalendars` (`Store::set_calendar_selection_holding`) deletes at once only the
+  events of **stored** calendars that no longer sync, and of those not the
+  rows a pending local write holds (#2017, below). Unknown ids and `''`
   rows wait for the next pass, which runs only after a successful list, so a
   host restoring its choice at startup (empty `calendars`) deletes nothing.
   It emits `CalendarUpdated`, `CalendarsUpdated` when the synced set changed,
@@ -1098,9 +1100,7 @@ range on demand (`FetchCalendarRange`) #2014 (the next section).
   `/me/calendars/{id}/calendarView`); `engine.rs` `calendar_routes` builds
   both. A test that only silences the tick answers `/me/calendars?` with an
   empty list (no view requests; `is_calendar` counts list requests).
-- Known gaps: deselecting a calendar while an edit or RSVP on one of its
-  events is queued deletes the row, so `apply_op`'s `event_input_for` fails
-  until the op is quarantined. A chosen calendar of another owner needs
+- Known gaps: a chosen calendar of another owner needs
   `Calendars.Read.Shared`, which the default scope lacks, so its view errors
   on every pass (it is not synced unless chosen). A create goes to the
   calendar the host names since #2048; editing and deleting still address
@@ -1990,6 +1990,25 @@ this occurrence or the whole series, as Outlook does.
   rows Graph lists is recorded as before. The engine's `fetch_range_gaps`
   computes the gaps once per calendar per command, so an unrecorded gap is no
   loop: the command still ends with `CalendarRangeFetched`.
+- A calendar that stops syncing (#2017): `delete_calendar_events_on` takes the
+  holds and keeps `written` rows, from both callers.
+  `set_calendar_selection_holding` computes them in its own transaction
+  (`round_holds_on` with `since` 0: the queued ops, the caller's `held`, and
+  every unpruned host write, as an `UpdateEvent` may still be behind
+  `SetCalendars` on the channel; it prunes nothing). `Engine::set_calendars`
+  passes `waiting_event_holds(&self.deferred)` as `held` (r1): served from
+  `deferred`, `SetCalendars` may have an `UpdateEvent` behind it whose record
+  the round that took them both already pruned. `set_calendar_selection` is
+  its `#[cfg(test)]` wrapper with no caller holds. The pass's step 3 passes
+  the round's holds. Before, a deselect deleted the row of a queued
+  `UpdateEvent`, which then failed `event_input_for` to the quarantine: the
+  edit was lost (a `RespondEvent` builds its POST from the op alone, so an RSVP
+  was not, but its row is kept too). The kept row stays under its deselected
+  calendar's id until the first pass after its op is gone (an orphan write's
+  record is below that pass's mark), whose step 3 deletes it; meanwhile
+  `events_in_range` / `days_with_events` with the synced ids do not show it,
+  `events_in_window` does. The calendar's ranges and delta state go at once
+  all the same, so selected again it starts with an initial round.
 - Tests: `store/mod.rs` `event_local_write_names_the_ops_whose_command_wrote_the_row`,
   `initial_round_keeps_a_row_with_a_queued_update`,
   `an_undecodable_outbox_row_does_not_stop_a_calendar_round`,
@@ -2030,6 +2049,12 @@ this occurrence or the whole series, as Outlook does.
   `deferred_delete_and_cancel_rows_stay_gone_through_an_initial_round`,
   `quarantined_event_edit_releases_the_row`,
   `round_after_the_edit_lands_takes_graphs_row`.
+  #2017: `store/mod.rs` `set_calendar_selection_keeps_an_event_with_a_queued_edit`,
+  `set_calendar_selection_keeps_an_event_the_host_just_edited`,
+  `set_calendar_selection_keeps_an_event_a_waiting_command_names`,
+  `sync_pass_keeps_a_deselected_calendars_held_row_until_its_op_is_gone`;
+  `engine.rs` `queued_event_edit_survives_deselecting_its_calendar`,
+  `edit_command_behind_a_deferred_deselect_keeps_its_row` (paced views).
 
 ## An edit during an event's in-flight create (#2005)
 
