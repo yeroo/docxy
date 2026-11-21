@@ -103,7 +103,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
 - An entry on a protected sheet writes only the cells checked: table
   AutoCorrect (`table_autocorrect`: a table growing to take the entry, a
   calculated column filling its other cells) never runs there, for the
-  typed commit and for a validation alert's accepted entry alike.
+  typed commit and for a validation alert's accepted entry alike. A pick
+  from the validation list into an absent cell (`gridcore` `pick_cell`)
+  takes the style its row or column gives it (#1660), so a cell of an
+  unlocked column stays unlocked after the pick.
 - Every other command still refuses a protected sheet whole: paste, fill,
   drag, Flash Fill, AutoSum, Convert to Number, Copy Formula from Above,
   formats and the other Clear commands. The `<sheetProtection>` flags

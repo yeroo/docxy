@@ -337,12 +337,14 @@ pub fn pick_cell(
             CellValue::Text(choice.label.clone())
         }
     };
-    let mut cell = wb
-        .sheets
-        .get(sheet)
-        .and_then(|s| s.cell(row, col))
-        .cloned()
-        .unwrap_or_default();
+    // An absent cell takes the style its row or column gives it, as a typed
+    // entry does (#1660): an unlocked column's cell stays unlocked (#2230).
+    let mut cell = wb.sheets.get(sheet).map_or_else(Cell::default, |s| {
+        s.cell(row, col).cloned().unwrap_or_else(|| Cell {
+            style: s.entry_style_at(row, col),
+            ..Cell::default()
+        })
+    });
     cell.value = value;
     cell.formula = None;
     cell.f_attrs = None;
@@ -511,8 +513,7 @@ fn target_xf(wb: &Workbook, sheet: usize, row: u32, col: u32) -> crate::sheet::X
     let style = wb
         .sheets
         .get(sheet)
-        .and_then(|s| s.cell(row, col))
-        .map_or(0, |c| c.style);
+        .map_or(0, |s| s.entry_style_at(row, col));
     wb.styles.xf(style)
 }
 
@@ -2704,6 +2705,47 @@ mod tests {
         assert_eq!(xf.code.as_deref(), Some("m/d/yyyy"));
         // And a value near but not equal to an item still breaks the rule.
         assert!(check(&mut wb, 9, 3, "3.14").is_some());
+    }
+
+    /// #2230: a pick into an absent cell takes the style its column gives
+    /// it, as typing does (#1660), so an unlocked column's cell stays
+    /// unlocked on a protected sheet and can be picked into again.
+    #[test]
+    fn a_pick_into_an_absent_cell_keeps_its_columns_style() {
+        use crate::sheet::{ColDef, Xf};
+        let mut wb = book();
+        wb.styles.intern(Xf::default()); // style 0: General, locked
+        let open = wb.styles.intern(Xf {
+            unlocked: true,
+            ..Xf::default()
+        });
+        wb.sheets[0].col_defs.push(ColDef {
+            min: 3,
+            max: 3,
+            width: None,
+            attrs: format!(" style=\"{open}\""),
+            default_width: false,
+            plain_width: false,
+        });
+        wb.sheets[0].set_cell(0, 0, Cell::text("a"));
+        wb.sheets[0].set_cell(1, 0, Cell::text("=b"));
+        let mut dv = rule("list", "", "$A$1:$A$2", "");
+        dv.ranges = vec![(0, 3, 9, 3)];
+        wb.sheets[0].validations.push(dv);
+        let choices = list_choices(&wb, 0, 9, 3, None).unwrap();
+        for c in &choices {
+            let cell = pick_cell(&mut wb, 0, 9, 3, c, None).unwrap();
+            assert_eq!(cell.style, open, "{:?}", c.label);
+        }
+        // An inline item stored as its text (a formula-like label) too.
+        let mut dv = rule("list", "", "\"=x,y\"", "");
+        dv.ranges = vec![(0, 4, 9, 4)];
+        wb.sheets[0].validations.push(dv);
+        wb.sheets[0].col_defs[0].max = 4;
+        let choices = list_choices(&wb, 0, 9, 4, None).unwrap();
+        let cell = pick_cell(&mut wb, 0, 9, 4, &choices[0], None).unwrap();
+        assert_eq!(cell.value, CellValue::Text("=x".into()));
+        assert_eq!(cell.style, open);
     }
 
     // ---- review r6 ----
