@@ -1758,7 +1758,7 @@ pub struct LocalEventFields {
     /// are set. Written on create, and by `update_event_fields` only on a
     /// pending `local:` row (#2036).
     pub recurrence: Option<Recurrence>,
-    /// Graph's whole recurrence for a repeating event (create-only, #2034):
+    /// Graph's whole recurrence for a repeating event (#2034):
     /// every pattern type, `noEnd`/`endDate`/`numbered` ranges,
     /// `firstDayOfWeek`, `index`, `month` and `recurrenceTimeZone` as given,
     /// except that a start sent in its named zone (`start_time_zone`, #2039)
@@ -5354,7 +5354,8 @@ impl Store {
     /// reads the row at send time, a `Some` `series_recurrence`, else a
     /// `Some` `recurrence`, is the edit's recurrence, normalized as
     /// `create_local_event` stores it (`series_recurrence` wins; the other
-    /// shape is dropped). When it differs from the stored one (the decoded
+    /// shape is dropped; a create-side one is read back through its
+    /// `to_json`, so a field it does not send is no change). When it differs from the stored one (the decoded
     /// pair `event_for_send` reads) it is written, as the send encoding in
     /// `events.recurrence` and in Graph's shape in `graph_recurrence`, the
     /// row becomes a `seriesMaster`, and `RECURRENCE` is in the set. A
@@ -5462,11 +5463,14 @@ impl Store {
             allow_new != old.allow_new_time_proposals,
         );
         // A pending `local:` row's recurrence (#2036), normalized as
-        // `create_local_event` stores it; `None` when not written.
+        // `create_local_event` stores it and `event_for_send` reads it back:
+        // a create-side one keeps only what its `to_json` writes (an
+        // unchanged one with, say, a daily `day_of_month` is no edit). `None`
+        // when not written.
         let recurrence = if id.starts_with("local:") {
             match (&f.series_recurrence, &f.recurrence) {
                 (Some(s), _) => Some((None, Some(s.clone()))),
-                (None, Some(r)) => Some((Some(r.clone()), None)),
+                (None, Some(r)) => Recurrence::from_json(&r.to_json()).map(|r| (Some(r), None)),
                 (None, None) => None,
             }
         } else {
@@ -15184,6 +15188,50 @@ mod calendar_tests {
             s.event_for_send(&id).unwrap().unwrap().recurrence,
             Some(daily)
         );
+    }
+
+    #[test]
+    fn update_event_fields_unchanged_noncanonical_create_side_recurrence_marks_nothing() {
+        // r1 m1: a daily create-side recurrence carrying a weekday and a
+        // day of month (as a form fills them) is stored without them; given
+        // back unchanged it is no edit, and the row is not rewritten.
+        use crate::graph::model::{Recurrence, RecurrenceKind};
+        let s = Store::open_in_memory().unwrap();
+        let daily = Recurrence {
+            kind: RecurrenceKind::Daily,
+            interval: 1,
+            days_of_week: vec!["monday".into()],
+            day_of_month: 20,
+            start_date: "2026-07-20".into(),
+            until: None,
+        };
+        let f = LocalEventFields {
+            recurrence: Some(daily.clone()),
+            ..sample_fields()
+        };
+        let id = s.create_local_event(&f, "Me", "me@x").unwrap();
+        let changed = s.update_event_fields(&id, &edit_of(&f)).unwrap();
+        assert_eq!(changed, EventFieldSet::default());
+        assert!(s.pending_ops().unwrap().is_empty());
+        let stored = s.event_for_send(&id).unwrap().unwrap().recurrence.unwrap();
+        assert_eq!(stored.days_of_week, Vec::<String>::new());
+        assert_eq!(stored.day_of_month, 0);
+        // A real change still marks, and is stored as it is sent.
+        let changed = s
+            .update_event_fields(
+                &id,
+                &LocalEventFields {
+                    recurrence: Some(Recurrence {
+                        interval: 2,
+                        ..daily
+                    }),
+                    ..edit_of(&f)
+                },
+            )
+            .unwrap();
+        assert_eq!(changed, EventFieldSet::RECURRENCE);
+        let stored = s.event_for_send(&id).unwrap().unwrap().recurrence.unwrap();
+        assert_eq!((stored.interval, stored.day_of_month), (2, 0));
     }
 
     #[test]
