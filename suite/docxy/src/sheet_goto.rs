@@ -38,10 +38,17 @@ impl SheetView {
     /// array or split a merge.
     pub(crate) fn clear_what(&mut self, what: ClearWhat) -> Result<bool, String> {
         let s = self.active;
-        if self.sheet().is_protected() {
+        let areas = self.areas_all();
+        // Clear Contents writes only values, so a protected sheet lets it
+        // clear unlocked cells, as typing does; the others change formats,
+        // links or notes and stay refused (#2230).
+        let locked = match what {
+            ClearWhat::Contents => self.areas_locked(s, &areas),
+            _ => self.sheet().is_protected(),
+        };
+        if locked {
             return Err(SHEET_PROTECTED.into());
         }
-        let areas = self.areas_all();
         let plan = clear_plan(self.sheet(), &areas, what, &self.note_cells())?;
         if plan.is_empty() {
             return Ok(false);

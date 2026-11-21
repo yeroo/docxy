@@ -413,7 +413,7 @@ pub fn typed_formula<'a>(
 
 /// The style an entry typed into (sheet, row, col) is read under
 /// ([`crate::sheet::Sheet::entry_style_at`]).
-fn base_style(wb: &Workbook, sheet: usize, row: u32, col: u32) -> u32 {
+pub(crate) fn base_style(wb: &Workbook, sheet: usize, row: u32, col: u32) -> u32 {
     wb.sheets
         .get(sheet)
         .map_or(0, |s| s.entry_style_at(row, col))
