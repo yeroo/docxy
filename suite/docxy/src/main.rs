@@ -53119,7 +53119,7 @@ fn sheet_el(
                     .border_1()
                     .border_color(hsla_u(0x9a9a9a))
                     .rounded_sm();
-                for (i, val) in vals.into_iter().enumerate() {
+                for (i, val) in vals.iter().enumerate() {
                     let ent_pick = ent.clone();
                     let v2 = val.clone();
                     list = list.child(
