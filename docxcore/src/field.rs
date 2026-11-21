@@ -99,6 +99,11 @@ fn field_args(s: &str) -> Vec<String> {
                 cur.push(c);
             }
         } else if c == '"' {
+            // A quote opens a new token even when glued to the last one:
+            // Word evaluates `IF 1 = 1"yes""no"` to `yes` (#1186).
+            if started {
+                out.push(std::mem::take(&mut cur));
+            }
             in_quote = true;
             started = true;
         } else if c.is_whitespace() {
@@ -1068,10 +1073,13 @@ pub(crate) fn field_events(raw: &str) -> Vec<FieldEvent> {
         let body_end = raw[body_start..]
             .find("</w:instrText>")
             .map_or(raw.len(), |e| body_start + e);
-        // Word drops the XML whitespace at either end of each unpreserved
-        // fragment before it joins them, as it does for `w:t` (#1084): Word's
-        // own oracle reads `MERGEFIELD` + ` Name` as `MERGEFIELDName`, and an
-        // all-space fragment as nothing (#1186). The run itself stays raw.
+        // Word drops the XML whitespace at either end of each fragment without
+        // its own `xml:space="preserve"` before it joins them: Word's oracle
+        // reads `MERGEFIELD` + ` Name` as `MERGEFIELDName`, and an all-space
+        // fragment as nothing (#1186). Unlike `w:t` (#1084), an ancestor's
+        // `xml:space` and character references (`&#32;`) aren't considered:
+        // only run slices reach here, and the oracle didn't cover them. The
+        // run itself stays raw.
         let body = &raw[body_start..body_end];
         let preserve = crate::load::xml_attr_value(el, "xml:space").as_deref() == Some("preserve");
         let body = if preserve {
@@ -1280,6 +1288,11 @@ mod tests {
             );
             assert_eq!(instr_of(&raw).as_deref(), Some(*word), "{frags:?}");
         }
+        // Word's Update results for those codes: a glued quote still splits
+        // the IF's arguments, a glued switch leaves the keyword unknown.
+        assert_eq!(ev("IF 1 = 1\"yes\"\"no\"").as_deref(), Some("yes"));
+        assert_eq!(ev("IF 1 = 1 \"ab\" \"c\"").as_deref(), Some("ab"));
+        assert_eq!(ev("DATE\\@\"yyyy\""), None);
     }
 
     #[test]
