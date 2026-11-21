@@ -715,7 +715,9 @@ pub enum SyncCommand {
     /// occurrences. The owed reset
     /// is in memory: a restart before then drops it, and the delta rounds
     /// carry on. An empty `input.fields` queues nothing; a `local:`
-    /// master is an `Error` (a local series is edited through its row).
+    /// master is an `Error`: a pending series is edited through its row
+    /// (`Store::update_event_fields`, recurrence included, #2036), which its
+    /// `CreateEvent` reads at send time.
     /// "This occurrence" is `UpdateEvent` / `DeleteEvent` on the
     /// occurrence's id, "delete the series" `Store::delete_event_series`
     /// then `DeleteEvent` on the master's id.
@@ -6356,8 +6358,14 @@ impl Engine {
                     if contact_op(&row.op).is_some() && self.settle_contact_rereads() {
                         self.emit(SyncEvent::ContactsUpdated);
                     }
-                    // The calendars owe a reset (`calendar_reset_owed`).
-                    if matches!(row.op, OutboxOp::UpdateEventSeries { .. }) {
+                    // The calendars owe a reset (`calendar_reset_owed`):
+                    // a series edit, or a just-created series' pattern
+                    // edited during its create (#2036), regenerates the
+                    // occurrences.
+                    if matches!(row.op, OutboxOp::UpdateEventSeries { .. })
+                        || matches!(&row.op, OutboxOp::UpdateEvent { fields, .. }
+                            if fields.contains(crate::graph::client::EventFieldSet::RECURRENCE))
+                    {
                         self.calendar_reset_owed = true;
                     }
                     if let OutboxOp::SendDraft { id } = &row.op {
@@ -25945,6 +25953,86 @@ mod tests {
             "{views:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2036: an applied `UpdateEvent` that PATCHed a recurrence (a pending
+    /// series' pattern edited during its create) owes the calendars a
+    /// reset, as a series edit does (#2022); one without it does not.
+    #[test]
+    fn a_recurrence_update_event_owes_a_calendar_reset() {
+        use crate::graph::client::EventFieldSet;
+        for (fields, owed) in [
+            (EventFieldSet::SUBJECT, false),
+            (EventFieldSet::RECURRENCE, true),
+        ] {
+            let srv = FakeServer::start(vec![Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/events/EV1".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"id":"EV1","subject":"Sync"}"#.into(),
+            }]);
+            let store = Store::open_in_memory().unwrap();
+            let local = store
+                .create_local_event(
+                    &crate::store::LocalEventFields {
+                        subject: "Sync".into(),
+                        start_utc: "2026-07-20T11:00:00Z".into(),
+                        end_utc: "2026-07-20T12:00:00Z".into(),
+                        ..Default::default()
+                    },
+                    "Me",
+                    "me@x",
+                )
+                .unwrap();
+            let sent = crate::sync::outbox::create_event_input(&store, &local).unwrap();
+            let created = Event {
+                id: "EV1".into(),
+                ..Event::default()
+            };
+            store
+                .reconcile_created_event(&local, &created, &sent)
+                .unwrap();
+            store
+                .enqueue_op(&OutboxOp::UpdateEvent {
+                    id: "EV1".into(),
+                    fields,
+                })
+                .unwrap();
+            let (cmd_tx, cmd_rx) = mpsc::channel();
+            let (evt_tx, _evt_rx) = mpsc::channel();
+            let config = EngineConfig {
+                store_path: PathBuf::from("unused.db"),
+                token_path: PathBuf::from("unused-token.json"),
+                cfg: test_cfg(),
+                backfill_days: 30,
+                graph_base: srv.base_url.clone(),
+                auth_base: srv.base_url.clone(),
+                tick: HOUR,
+                options: EngineOptions::without_prefetch(),
+                token_store: None,
+            };
+            let mut engine = Engine::new(config, store, cmd_rx, evt_tx);
+            engine.token = Some(TokenSet {
+                access_token: "AT".into(),
+                refresh_token: "RT".into(),
+                expires_at_unix: u64::MAX / 2,
+                account: String::new(),
+                scopes: None,
+                cloud: Cloud::Global,
+            });
+            engine.mailbox_unchecked = false;
+            assert!(engine.drain_outbox().carry_on());
+            let patches = srv
+                .requests()
+                .into_iter()
+                .filter(|r| r.method == "PATCH")
+                .count();
+            assert_eq!(patches, 1, "{fields:?}");
+            assert!(engine.store.pending_ops().unwrap().is_empty());
+            assert_eq!(engine.calendar_reset_owed, owed, "{fields:?}");
+            drop(cmd_tx);
+        }
     }
 
     /// #2113 (#1918 plan-spin): dropping to sign-in ends a back-off, so a

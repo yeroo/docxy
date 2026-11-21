@@ -627,7 +627,8 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
         // master was not stored when #2022 added this, and still may not be
         // (a calendar pass stores it only when a round returns or fetches
         // it, #2064). A `local:` series is edited through its row
-        // (`UpdateEvent`, or its pending `CreateEvent`), so nothing goes.
+        // (`Store::update_event_fields`, its recurrence too, #2036), which
+        // its pending `CreateEvent` sends, so nothing goes.
         OutboxOp::UpdateEventSeries { id, body } => {
             if id.starts_with("local:") {
                 return Ok(());
@@ -3204,6 +3205,108 @@ mod tests {
         assert!(body.get("recurrence").is_none());
         assert_eq!(row.recurrence, None);
         assert_eq!(row.event_type, "singleInstance");
+    }
+
+    /// #2036: a pending series' pattern edited before the drain is what its
+    /// `CreateEvent` POSTs, not the pattern it was created with.
+    #[test]
+    fn create_event_sends_a_recurrence_edited_before_the_drain() {
+        let srv = FakeServer::start(vec![Route {
+            method: "POST".into(),
+            path_prefix: "/me/events".into(),
+            status: 201,
+            headers: vec![],
+            body: event_json("EV1", "Sync"),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let f = crate::store::LocalEventFields {
+            series_recurrence: Some(lossless("weekly", "noEnd")),
+            ..sample_event_fields()
+        };
+        let id = store.create_local_event(&f, "Me", "me@x").unwrap();
+        let edited = lossless("relativeYearly", "numbered");
+        let changed = store
+            .update_event_fields(
+                &id,
+                &crate::store::LocalEventFields {
+                    series_recurrence: Some(edited.clone()),
+                    ..f
+                },
+            )
+            .unwrap();
+        assert!(changed.contains(EventFieldSet::RECURRENCE), "{changed:?}");
+        apply_op(&c, &store, &OutboxOp::CreateEvent { id }).unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        let body = json::parse(&reqs[0].body).unwrap();
+        assert_eq!(body.get("recurrence"), Some(&edited.to_send_json()));
+    }
+
+    /// #2036 in the #2005 window: a pattern edited while the create was in
+    /// flight goes as the reconcile's queued `UpdateEvent`, a PATCH of the
+    /// recurrence alone, in the start's named zone.
+    #[test]
+    fn update_event_queued_by_the_reconcile_sends_the_edited_recurrence() {
+        let srv = FakeServer::start(vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/me/events".into(),
+                status: 201,
+                headers: vec![],
+                body: event_json("EV1", "Sync"),
+            },
+            Route {
+                method: "PATCH".into(),
+                path_prefix: "/me/events/EV1".into(),
+                status: 200,
+                headers: vec![],
+                body: event_json("EV1", "Sync"),
+            },
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = Store::open_in_memory().unwrap();
+        let f = crate::store::LocalEventFields {
+            series_recurrence: Some(lossless("weekly", "noEnd")),
+            start_time_zone: "W. Europe Standard Time".into(),
+            start_local: "2026-07-20T13:00:00".into(),
+            ..sample_event_fields()
+        };
+        let id = store.create_local_event(&f, "Me", "me@x").unwrap();
+        // `create_event`'s steps, with the edit between the read and the
+        // reconcile.
+        let input = create_event_input(&store, &id).unwrap();
+        let created = c.create_event(&input).unwrap();
+        let edited = lossless("relativeYearly", "numbered");
+        store
+            .update_event_fields(
+                &id,
+                &crate::store::LocalEventFields {
+                    series_recurrence: Some(edited.clone()),
+                    ..f
+                },
+            )
+            .unwrap();
+        let queued = store
+            .reconcile_created_event(&id, &created, &input)
+            .unwrap();
+        assert_eq!(queued, EventFieldSet::RECURRENCE);
+        let ops = store.pending_ops().unwrap();
+        assert_eq!(ops.len(), 1, "{ops:?}");
+        apply_op(&c, &store, &ops[0].op).unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(
+            (reqs[1].method.as_str(), reqs[1].path.as_str()),
+            ("PATCH", "/me/events/EV1")
+        );
+        assert_eq!(sent_keys(&reqs[1].body), ["recurrence"]);
+        let mut zoned = edited;
+        zoned.range.recurrence_time_zone = "W. Europe Standard Time".into();
+        assert_eq!(
+            json::parse(&reqs[1].body).unwrap().get("recurrence"),
+            Some(&zoned.to_send_json())
+        );
     }
 
     /// The keys of a sent JSON object, in order.
