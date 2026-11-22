@@ -747,7 +747,17 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
             let Some(row) = store.folder_contact(&target).map_err(store_err)? else {
                 return Ok(());
             };
-            client.update_contact(&target, &row.fields, *fields)
+            // `If-Match` on the stored key (#2067): an edit made elsewhere
+            // since this client last read the contact is a 412, not
+            // overwritten. Graph's answered key is this client's own write,
+            // so the next PATCH sends it. Storing it is best-effort: Graph
+            // applied the PATCH, so a store error here must not report it
+            // refused; at worst the next edit is a false 412, reported.
+            let answered = client.update_contact(&target, &row.change_key, &row.fields, *fields)?;
+            if let Some(new_key) = answered {
+                let _ = store.note_contact_change_key(&target, &row.change_key, &new_key);
+            }
+            Ok(())
         }
         // The photo as stored at send time (#2065), its revision noted as
         // sent (a refusal forgets only what Graph refused), then confirmed at
@@ -771,19 +781,42 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
             store
                 .note_contact_photo_sent(&target, revision)
                 .map_err(store_err)?;
+            // The PUT may move the contact's `changeKey` (#2065's
+            // assumption), which would make the next field edit's
+            // `If-Match` a false 412 (#2067). Graph's key is read before and
+            // after the PUT; only when it was the stored one before (nobody
+            // else changed the contact since this client last read it) is
+            // the key after adopted. Best-effort: a failed read adopts
+            // nothing, and the PUT meets the same condition and reports it.
+            let stored_key = store
+                .folder_contact(&target)
+                .map_err(store_err)?
+                .map(|c| c.change_key)
+                .unwrap_or_default();
+            let untouched = !stored_key.is_empty()
+                && client.contact_change_key(&target).ok().as_deref() == Some(stored_key.as_str());
             client.set_contact_photo(&target, &photo.bytes, &photo.content_type)?;
+            if untouched {
+                if let Ok(new_key) = client.contact_change_key(&target) {
+                    // Before the confirm, which learns the photo against
+                    // the record's key. Best-effort, as the reads: Graph
+                    // accepted the PUT.
+                    let _ = store.note_contact_change_key(&target, &stored_key, &new_key);
+                }
+            }
             store
                 .confirm_contact_photo(&target, revision)
                 .map_err(store_err)?;
             Ok(())
         }
         // A 404 is done: the contact is already gone (#2063).
-        OutboxOp::DeleteContact { id } => {
+        // `If-Match` on the key the row had when it was deleted (#2067).
+        OutboxOp::DeleteContact { id, change_key } => {
             let target = store.resolve_contact_id(id).map_err(store_err)?;
             if target.starts_with("local:") {
                 return Ok(());
             }
-            match client.delete_contact(&target) {
+            match client.delete_contact(&target, change_key) {
                 Err(GraphError::NotFound) => Ok(()),
                 r => r,
             }
@@ -4924,7 +4957,15 @@ mod tests {
         };
         apply_op(&c, &store, &op).unwrap();
         // Nor does a delete of one, nor an update of a row gone.
-        apply_op(&c, &store, &OutboxOp::DeleteContact { id: local }).unwrap();
+        apply_op(
+            &c,
+            &store,
+            &OutboxOp::DeleteContact {
+                id: local,
+                change_key: String::new(),
+            },
+        )
+        .unwrap();
         let gone = OutboxOp::UpdateContact {
             id: "G9".into(),
             fields: ContactFieldSet::SURNAME,
@@ -4973,11 +5014,50 @@ mod tests {
     }
 
     #[test]
+    fn update_contact_stores_the_answered_change_key() {
+        let srv = FakeServer::start(vec![contact_route(
+            "PATCH",
+            "/me/contacts/G1",
+            200,
+            r#"{"id":"G1","changeKey":"ck2","surname":"Cole-Smith"}"#,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = photo_store();
+        let mut f = store.folder_contact("G1").unwrap().unwrap().fields;
+        f.surname = "Cole-Smith".into();
+        let fields = store.update_contact_fields("G1", &f).unwrap();
+        let op = OutboxOp::UpdateContact {
+            id: "G1".into(),
+            fields,
+        };
+        assert_eq!(apply_op(&c, &store, &op).unwrap(), Applied::Done);
+        let reqs = srv.requests();
+        let if_match: Vec<&str> = reqs[0]
+            .headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("if-match"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(if_match, [r#"W/"ck1""#], "the stored key");
+        let row = store.folder_contact("G1").unwrap().unwrap();
+        assert_eq!(row.change_key, "ck2", "Graph's answered key");
+        assert_eq!(row.fields.surname, "Cole-Smith");
+    }
+
+    #[test]
     fn delete_contact_404_is_success() {
         let srv = FakeServer::start(vec![contact_route("DELETE", "/me/contacts/G1", 404, "{}")]);
         let c = GraphClient::new(&srv.base_url, "AT");
         let store = Store::open_in_memory().unwrap();
-        let applied = apply_op(&c, &store, &OutboxOp::DeleteContact { id: "G1".into() }).unwrap();
+        let applied = apply_op(
+            &c,
+            &store,
+            &OutboxOp::DeleteContact {
+                id: "G1".into(),
+                change_key: "ck1".into(),
+            },
+        )
+        .unwrap();
         assert_eq!(applied, Applied::Done);
         assert_eq!(srv.requests()[0].method, "DELETE");
     }
@@ -4997,8 +5077,83 @@ mod tests {
         store
     }
 
+    /// The photo op's `changeKey`-only read of G1 (#2067), answering `key`.
+    fn key_route(key: &str) -> Route {
+        contact_route(
+            "GET",
+            "/me/contacts/G1?$select=changeKey",
+            200,
+            &format!(r#"{{"id":"G1","changeKey":"{key}"}}"#),
+        )
+    }
+
     #[test]
     fn set_contact_photo_puts_the_pending_row_and_confirms_it() {
+        // Graph's key is the stored one before the PUT and moved after it:
+        // only this PUT moved it, so it is adopted (#2067).
+        let srv = FakeServer::start_limited(vec![
+            (key_route("ck1"), Some(1)),
+            (
+                contact_route("PUT", "/me/contacts/G1/photo/$value", 200, ""),
+                None,
+            ),
+            (key_route("ck2"), None),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = photo_store();
+        let bytes = [0xFF, 0xD8, 0xFF, 0x00, 0x80];
+        store.set_contact_photo("G1", &bytes, "image/jpeg").unwrap();
+        let op = last_op(&store);
+        assert_eq!(apply_op(&c, &store, &op).unwrap(), Applied::Done);
+        let reqs = srv.requests();
+        let methods: Vec<&str> = reqs.iter().map(|r| r.method.as_str()).collect();
+        assert_eq!(methods, ["GET", "PUT", "GET"]);
+        assert_eq!(reqs[1].body_bytes, bytes);
+        assert_eq!(
+            store.folder_contact("G1").unwrap().unwrap().change_key,
+            "ck2"
+        );
+        let stored = store.contact_photo("G1").unwrap().unwrap();
+        assert!(!stored.pending, "confirmed");
+        assert!(stored.current, "learnt against the adopted key");
+        assert_eq!(stored.photo.unwrap().bytes, bytes);
+        // A second op for the same photo finds nothing pending.
+        apply_op(&c, &store, &op).unwrap();
+        assert_eq!(srv.requests().len(), 3);
+    }
+
+    #[test]
+    fn set_contact_photo_keeps_the_key_when_graph_had_moved_before_the_put() {
+        // An edit made elsewhere moved Graph's key before the PUT: the key
+        // after it is not adopted, so the next PATCH still conflicts.
+        let srv = FakeServer::start_limited(vec![
+            (key_route("ck-outlook"), Some(1)),
+            (
+                contact_route("PUT", "/me/contacts/G1/photo/$value", 200, ""),
+                None,
+            ),
+            (key_route("ck3"), None),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = photo_store();
+        store.set_contact_photo("G1", b"P", "image/jpeg").unwrap();
+        assert_eq!(
+            apply_op(&c, &store, &last_op(&store)).unwrap(),
+            Applied::Done
+        );
+        let methods: Vec<String> = srv.requests().into_iter().map(|r| r.method).collect();
+        assert_eq!(methods, ["GET", "PUT"], "no read after the PUT");
+        assert_eq!(
+            store.folder_contact("G1").unwrap().unwrap().change_key,
+            "ck1"
+        );
+        assert!(!store.contact_photo("G1").unwrap().unwrap().pending);
+    }
+
+    #[test]
+    fn set_contact_photo_key_read_failure_adopts_nothing() {
+        // No route for the key read: a 404 there, best-effort, never fails
+        // the photo op.
         let srv = FakeServer::start(vec![contact_route(
             "PUT",
             "/me/contacts/G1/photo/$value",
@@ -5007,21 +5162,43 @@ mod tests {
         )]);
         let c = GraphClient::new(&srv.base_url, "AT");
         let store = photo_store();
-        let bytes = [0xFF, 0xD8, 0xFF, 0x00, 0x80];
-        store.set_contact_photo("G1", &bytes, "image/jpeg").unwrap();
-        let op = last_op(&store);
-        assert_eq!(apply_op(&c, &store, &op).unwrap(), Applied::Done);
-        let reqs = srv.requests();
-        assert_eq!(reqs.len(), 1);
-        assert_eq!(reqs[0].method, "PUT");
-        assert_eq!(reqs[0].body_bytes, bytes);
-        let stored = store.contact_photo("G1").unwrap().unwrap();
-        assert!(!stored.pending, "confirmed");
-        assert!(stored.current);
-        assert_eq!(stored.photo.unwrap().bytes, bytes);
-        // A second op for the same photo finds nothing pending.
-        apply_op(&c, &store, &op).unwrap();
-        assert_eq!(srv.requests().len(), 1);
+        store.set_contact_photo("G1", b"P", "image/jpeg").unwrap();
+        assert_eq!(
+            apply_op(&c, &store, &last_op(&store)).unwrap(),
+            Applied::Done
+        );
+        assert_eq!(
+            store.folder_contact("G1").unwrap().unwrap().change_key,
+            "ck1"
+        );
+        assert!(!store.contact_photo("G1").unwrap().unwrap().pending);
+    }
+
+    #[test]
+    fn set_contact_photo_key_read_after_the_put_failure_adopts_nothing() {
+        // The read before the PUT matches; the one after it fails (no route
+        // left: a 404). Nothing is adopted and the op still succeeds.
+        let srv = FakeServer::start_limited(vec![
+            (key_route("ck1"), Some(1)),
+            (
+                contact_route("PUT", "/me/contacts/G1/photo/$value", 200, ""),
+                None,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = photo_store();
+        store.set_contact_photo("G1", b"P", "image/jpeg").unwrap();
+        assert_eq!(
+            apply_op(&c, &store, &last_op(&store)).unwrap(),
+            Applied::Done
+        );
+        let methods: Vec<String> = srv.requests().into_iter().map(|r| r.method).collect();
+        assert_eq!(methods, ["GET", "PUT", "GET"]);
+        assert_eq!(
+            store.folder_contact("G1").unwrap().unwrap().change_key,
+            "ck1"
+        );
+        assert!(!store.contact_photo("G1").unwrap().unwrap().pending);
     }
 
     #[test]
@@ -5039,9 +5216,13 @@ mod tests {
         for r in store.pending_ops().unwrap() {
             apply_op(&c, &store, &r.op).unwrap();
         }
-        let reqs = srv.requests();
-        assert_eq!(reqs.len(), 1, "the first op sent the latest photo");
-        assert_eq!(reqs[0].body_bytes, b"TWO");
+        let puts: Vec<_> = srv
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PUT")
+            .collect();
+        assert_eq!(puts.len(), 1, "the first op sent the latest photo");
+        assert_eq!(puts[0].body_bytes, b"TWO");
     }
 
     #[test]
@@ -5092,7 +5273,12 @@ mod tests {
         for r in ops {
             apply_op(&c, &store, &r.op).unwrap();
         }
-        let reqs = srv.requests();
+        // Not the best-effort `changeKey` reads around the PUT (#2067).
+        let reqs: Vec<_> = srv
+            .requests()
+            .into_iter()
+            .filter(|r| r.method != "GET")
+            .collect();
         assert_eq!(reqs.len(), 2);
         assert_eq!(reqs[1].method, "PUT");
         assert_eq!(reqs[1].path, "/me/contacts/G7/photo/$value");

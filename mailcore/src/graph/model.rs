@@ -486,8 +486,10 @@ pub struct ContactFields {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FolderContact {
     pub id: String,
-    /// Graph's `changeKey`. Stored, not used for concurrency: a write sends
-    /// no `If-Match`, so the last writer wins.
+    /// Graph's `changeKey`, as last read (a full pass, a re-read) or moved
+    /// by this client's own write. An update or delete sends it as
+    /// `If-Match: W/"<changeKey>"` (#2067), so an edit made elsewhere since
+    /// is a 412, not overwritten; `""` sends no condition.
     pub change_key: String,
     pub fields: ContactFields,
 }

@@ -1206,6 +1206,13 @@ pub enum SyncEvent {
         /// when one was written while the refused PUT was in flight. `None`
         /// for every other write.
         attempted_photo: Option<ContactPhoto>,
+        /// Graph's version of the contact, for a conflict (#2067): an update
+        /// or delete refused 412, its `If-Match` key moved past by an edit
+        /// made elsewhere. Read once at the refusal; the stored row becomes
+        /// it, as after any refused update or delete. `None` for every other
+        /// refusal, and when that read failed (the owed re-read then
+        /// reverts the row as ever).
+        server: Option<FolderContact>,
     },
     /// A folder created (#1910) or copied (#2118) locally reached Graph: the
     /// row created as `local_id` is stored as `id` now, with its messages
@@ -2015,7 +2022,7 @@ fn contact_op(op: &OutboxOp) -> Option<(ContactWrite, &str)> {
     match op {
         OutboxOp::CreateContact { id } => Some((ContactWrite::Create, id)),
         OutboxOp::UpdateContact { id, .. } => Some((ContactWrite::Update, id)),
-        OutboxOp::DeleteContact { id } => Some((ContactWrite::Delete, id)),
+        OutboxOp::DeleteContact { id, .. } => Some((ContactWrite::Delete, id)),
         OutboxOp::SetContactPhoto { id } => Some((ContactWrite::SetPhoto, id)),
         _ => None,
     }
@@ -6571,7 +6578,13 @@ impl Engine {
     /// it), and owes a re-read only on a 404
     /// (the contact gone). Before the op is dropped, the contact as the user
     /// left it is read into `attempted` (create, update) and the pending
-    /// photo into `attempted_photo` (create, photo set).
+    /// photo into `attempted_photo` (create, photo set). A conflict (#2067:
+    /// an update or delete refused 412, its `If-Match` key stale) also
+    /// reads Graph's version once into `server`, and reverts to it at once
+    /// when no other queued op names the contact, instead of a second GET.
+    /// An update refused 412 whose sent values Graph already holds (a retry
+    /// after a lost answer, r1) is no refusal: it is dropped as applied,
+    /// unreported (`adopt_applied_contact_edit`).
     fn refuse_contact_write(&mut self, row: &OutboxRow, err: &GraphError) {
         let Some((write, queued_id)) = contact_op(&row.op) else {
             return;
@@ -6596,6 +6609,32 @@ impl Engine {
                 .map(|(photo, _)| photo),
             ContactWrite::Update | ContactWrite::Delete => None,
         };
+        // A conflict (#2067): Graph's version, which moved past the key the
+        // write sent, read once now and reported beside the user's. Best
+        // effort, with the token the refused write just used: a failure is
+        // `None`, and the owed re-read below handles it as ever (no pause,
+        // no back-off, no sign-in from here).
+        let server = match (write, err) {
+            (ContactWrite::Update | ContactWrite::Delete, GraphError::Http { status: 412, .. }) => {
+                self.client().contact(&id).ok()
+            }
+            _ => None,
+        };
+        // Graph already holds every value the PATCH sends: its earlier try
+        // was applied but its answer lost (a transport error, a 5xx after
+        // the write), so the key it sent is stale by this client's own
+        // write; or the same change was made elsewhere. Not a conflict:
+        // the op is done.
+        if let (OutboxOp::UpdateContact { fields: sent, .. }, Some(mine), Some(server)) =
+            (&row.op, &attempted, &server)
+        {
+            if !ContactFieldSet::changed(&server.fields, &mine.fields).intersects(*sent) {
+                self.drop_op(row.seq);
+                self.adopt_applied_contact_edit(&id, mine, server);
+                self.emit(SyncEvent::ContactsUpdated);
+                return;
+            }
+        }
         self.drop_op(row.seq);
         match write {
             ContactWrite::Create => {
@@ -6603,7 +6642,17 @@ impl Engine {
             }
             ContactWrite::Update | ContactWrite::Delete => {
                 let _ = self.store.owe_contact_reread(&id);
-                self.settle_contact_rereads();
+                // Graph's version is in hand: the revert needs no second
+                // GET, unless another queued op names the contact (it
+                // writes nothing then, and the re-read stays owed).
+                let reverted = server.as_ref().is_some_and(|server| {
+                    self.store
+                        .revert_folder_contact(&id, Some(server))
+                        .unwrap_or(false)
+                });
+                if !reverted {
+                    self.settle_contact_rereads();
+                }
             }
             ContactWrite::SetPhoto => {
                 let _ = self.store.revert_contact_photo(&id);
@@ -6628,12 +6677,53 @@ impl Engine {
             error: error.clone(),
             attempted,
             attempted_photo,
+            server,
         });
         self.emit(SyncEvent::Error(format!(
             "{} contact {id}: {error}",
             write.verb()
         )));
         self.emit(SyncEvent::ContactsUpdated);
+    }
+
+    /// An `UpdateContact` refused 412 whose values Graph already holds
+    /// (#2067, `refuse_contact_write`), its op dropped: the row becomes
+    /// Graph's `server` when no other queued op names the contact
+    /// (`revert_folder_contact`, which also settles an owed re-read).
+    /// Otherwise the row, `mine` as stored, stays for those ops, and only
+    /// Graph's key is adopted, so the next one does not 412 for this
+    /// client's own write, and only when Graph's copy equals the row on
+    /// every property no queued `UpdateContact` of the contact names. A
+    /// difference anywhere else may be an edit made elsewhere: the key is
+    /// kept, and the next op is refused 412 and reported (a false conflict
+    /// at worst, never an overwrite of a property this client does not
+    /// send).
+    fn adopt_applied_contact_edit(&self, id: &str, mine: &FolderContact, server: &FolderContact) {
+        if self
+            .store
+            .revert_folder_contact(id, Some(server))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let Ok(ops) = self.store.pending_ops() else {
+            return;
+        };
+        let mut queued = ContactFieldSet::default();
+        for op in ops {
+            if let OutboxOp::UpdateContact { id: other, fields } = &op.op {
+                if self.store.resolve_contact_id(other).ok().as_deref() == Some(id) {
+                    queued.insert(*fields);
+                }
+            }
+        }
+        let mut elsewhere = ContactFieldSet::changed(&server.fields, &mine.fields);
+        elsewhere.remove(queued);
+        if elsewhere.is_empty() {
+            let _ = self
+                .store
+                .note_contact_change_key(id, &mine.change_key, &server.change_key);
+        }
     }
 
     /// A folder command's store write (#1910): `FoldersUpdated` and a drain
@@ -12329,6 +12419,19 @@ mod tests {
         format!(r#"{{"value":[{}]}}"#, items.join(","))
     }
 
+    /// The re-reads of the contact `id` (`GraphClient::contact`, whose
+    /// `$select` starts with `id,`): not the photo op's `changeKey`-only
+    /// reads around its PUT (#2067), nor a photo GET.
+    fn rereads_of(srv: &FakeServer, id: &str) -> Vec<RecordedRequestView> {
+        requests_of(srv, "GET", &format!("/me/contacts/{id}?$select=id,"))
+    }
+
+    /// The `changeKey`-only reads of the contact `id` around a photo PUT
+    /// (#2067).
+    fn key_reads_of(srv: &FakeServer, id: &str) -> Vec<RecordedRequestView> {
+        requests_of(srv, "GET", &format!("/me/contacts/{id}?$select=changeKey"))
+    }
+
     fn requests_of(srv: &FakeServer, method: &str, prefix: &str) -> Vec<RecordedRequestView> {
         srv.requests()
             .into_iter()
@@ -12336,6 +12439,11 @@ mod tests {
             .filter(|(_, r)| r.method == method && r.path.starts_with(prefix))
             .map(|(i, r)| RecordedRequestView {
                 index: i,
+                if_match: r
+                    .headers
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case("if-match"))
+                    .map(|(_, v)| v.clone()),
                 path: r.path,
                 body: r.body,
             })
@@ -12346,6 +12454,8 @@ mod tests {
         index: usize,
         path: String,
         body: String,
+        /// The request's `If-Match` header (#2067), if it sent one.
+        if_match: Option<String>,
     }
 
     fn body_keys(body: &str) -> Vec<String> {
@@ -12571,10 +12681,7 @@ mod tests {
         assert_eq!(requests_of(&srv, "DELETE", "/me/contacts/").len(), 1);
         assert!(store.pending_ops().unwrap().is_empty());
         assert!(store.folder_contact("C-dave").unwrap().is_none());
-        assert!(
-            requests_of(&srv, "GET", "/me/contacts/C-dave").is_empty(),
-            "no re-read"
-        );
+        assert!(rereads_of(&srv, "C-dave").is_empty(), "no re-read");
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
@@ -12621,6 +12728,7 @@ mod tests {
                 error: "HTTP 403: Access is denied.".into(),
                 attempted: Some(attempted),
                 attempted_photo: None,
+                server: None,
             }),
             "{seen:?}"
         );
@@ -12670,7 +12778,7 @@ mod tests {
             store.folder_contact("C-dave").unwrap(),
             Some(dave_contact())
         );
-        assert_eq!(requests_of(&srv, "GET", "/me/contacts/C-dave").len(), 1);
+        assert_eq!(rereads_of(&srv, "C-dave").len(), 1);
 
         // An update answered 404: the contact is gone on the server.
         let mut f = store.folder_contact("C-erin").unwrap().unwrap().fields;
@@ -12746,7 +12854,547 @@ mod tests {
             Some(dave_contact())
         );
         assert!(store.is_contact("dave@x.com").unwrap());
-        assert_eq!(requests_of(&srv, "GET", "/me/contacts/C-dave").len(), 1);
+        assert_eq!(rereads_of(&srv, "C-dave").len(), 1);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- If-Match on contact updates and deletes (#2067) ------------------
+
+    /// Dave as Graph has him after an edit made in Outlook: the key moved.
+    const DAVE_OUTLOOK_JSON: &str = r#"{"id":"C-dave","changeKey":"ck-dave-2","displayName":"Dave","jobTitle":"Manager","emailAddresses":[{"name":"Dave","address":"dave@x.com"}]}"#;
+    const CONFLICT: &str = r#"{"error":{"code":"ErrorIrresolvableConflict","message":"The change key does not match."}}"#;
+
+    fn dave_outlook() -> FolderContact {
+        let mut c = dave_contact();
+        c.change_key = "ck-dave-2".into();
+        c.fields.job_title = "Manager".into();
+        c
+    }
+
+    /// The `If-Match` values of the `method` requests to `prefix`, in order.
+    fn if_matches(srv: &FakeServer, method: &str, prefix: &str) -> Vec<Option<String>> {
+        requests_of(srv, method, prefix)
+            .into_iter()
+            .map(|r| r.if_match)
+            .collect()
+    }
+
+    fn w(key: &str) -> Option<String> {
+        Some(format!("W/\"{key}\""))
+    }
+
+    #[test]
+    fn contact_edit_412_reports_both_versions_and_restores_graphs() {
+        // The store read Dave at ck-dave; Graph's copy has since moved to
+        // ck-dave-2 (an edit made in Outlook). Without `If-Match` the PATCH
+        // overwrote that edit (#2067).
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-edit-412",
+            vec![
+                (
+                    any_route("PATCH", "/me/contacts/C-dave", 412, CONFLICT),
+                    None,
+                ),
+                (
+                    any_route("GET", "/me/contacts/C-dave", 200, DAVE_OUTLOOK_JSON),
+                    None,
+                ),
+            ],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        let mut f = store.folder_contact("C-dave").unwrap().unwrap().fields;
+        f.job_title = "Lead".into();
+        let fields = store.update_contact_fields("C-dave", &f).unwrap();
+        let mine = store.folder_contact("C-dave").unwrap().unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateContact {
+                id: "C-dave".into(),
+                fields,
+            })
+            .unwrap();
+        let seen = wait_refused(&handle.evt_rx);
+        assert_eq!(
+            if_matches(&srv, "PATCH", "/me/contacts/C-dave"),
+            [w("ck-dave")],
+            "the stored key"
+        );
+        assert_eq!(
+            contact_failure(&seen),
+            Some(SyncEvent::ContactWriteFailed {
+                id: "C-dave".into(),
+                write: ContactWrite::Update,
+                status: Some(412),
+                error: "HTTP 412: The change key does not match.".into(),
+                attempted: Some(mine),
+                attempted_photo: None,
+                server: Some(dave_outlook()),
+            }),
+            "{seen:?}"
+        );
+        assert_eq!(
+            store.folder_contact("C-dave").unwrap(),
+            Some(dave_outlook()),
+            "Graph's version, its key included"
+        );
+        assert_eq!(rereads_of(&srv, "C-dave").len(), 1, "one GET serves both");
+        assert!(store.pending_ops().unwrap().is_empty());
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contact_delete_412_keeps_the_contact() {
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-delete-412",
+            vec![
+                (
+                    any_route("DELETE", "/me/contacts/C-dave", 412, CONFLICT),
+                    None,
+                ),
+                (
+                    any_route("GET", "/me/contacts/C-dave", 200, DAVE_OUTLOOK_JSON),
+                    None,
+                ),
+            ],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        store.delete_contact("C-dave").unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::DeleteContact {
+                id: "C-dave".into(),
+            })
+            .unwrap();
+        let seen = wait_refused(&handle.evt_rx);
+        assert_eq!(
+            if_matches(&srv, "DELETE", "/me/contacts/C-dave"),
+            [w("ck-dave")],
+            "the key the row had when it was deleted"
+        );
+        match contact_failure(&seen) {
+            Some(SyncEvent::ContactWriteFailed {
+                write,
+                status,
+                attempted,
+                server,
+                ..
+            }) => {
+                assert_eq!(write, ContactWrite::Delete);
+                assert_eq!(status, Some(412));
+                assert_eq!(attempted, None);
+                assert_eq!(server, Some(dave_outlook()));
+            }
+            other => panic!("{other:?} in {seen:?}"),
+        }
+        assert_eq!(
+            store.folder_contact("C-dave").unwrap(),
+            Some(dave_outlook())
+        );
+        assert!(store.is_contact("dave@x.com").unwrap());
+        assert_eq!(rereads_of(&srv, "C-dave").len(), 1);
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_contact_edits_in_turn_do_not_conflict_with_themselves() {
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-edits-in-turn",
+            vec![
+                (
+                    any_route(
+                        "PATCH",
+                        "/me/contacts/C-dave",
+                        200,
+                        r#"{"id":"C-dave","changeKey":"ck-dave-2"}"#,
+                    ),
+                    Some(1),
+                ),
+                (
+                    any_route(
+                        "PATCH",
+                        "/me/contacts/C-dave",
+                        200,
+                        r#"{"id":"C-dave","changeKey":"ck-dave-3"}"#,
+                    ),
+                    None,
+                ),
+            ],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        // Both queued before one drain: the second op reads the row at send
+        // time, after the first stored the key Graph answered it with.
+        let mut f = store.folder_contact("C-dave").unwrap().unwrap().fields;
+        f.job_title = "Lead".into();
+        store.update_contact_fields("C-dave", &f).unwrap();
+        f.mobile_phone = "+1 555 0300".into();
+        let fields = store.update_contact_fields("C-dave", &f).unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateContact {
+                id: "C-dave".into(),
+                fields,
+            })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        assert!(contact_failure(&seen).is_none(), "{seen:?}");
+        assert_eq!(
+            if_matches(&srv, "PATCH", "/me/contacts/C-dave"),
+            [w("ck-dave"), w("ck-dave-2")]
+        );
+        let row = store.folder_contact("C-dave").unwrap().unwrap();
+        assert_eq!(row.change_key, "ck-dave-3");
+        assert_eq!(row.fields, f);
+        assert!(store.pending_ops().unwrap().is_empty());
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dave as Graph has him once a PATCH of `jobTitle: Lead` was applied
+    /// (its answer lost), at `ck-dave-2`; `extra` adds JSON properties.
+    fn dave_lead_json(extra: &str) -> String {
+        format!(
+            r#"{{"id":"C-dave","changeKey":"ck-dave-2","displayName":"Dave","jobTitle":"Lead"{extra},"emailAddresses":[{{"name":"Dave","address":"dave@x.com"}}]}}"#
+        )
+    }
+
+    /// Sends `Refresh` (which resends an op deferred by a 5xx) and waits
+    /// until the outbox is empty, returning every event seen.
+    fn refresh_until_drained(handle: &SyncHandle, store: &Store) -> Vec<SyncEvent> {
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            seen.extend(wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::ContactsUpdated)
+            }));
+            if store.pending_ops().unwrap().is_empty() {
+                break;
+            }
+        }
+        assert!(store.pending_ops().unwrap().is_empty(), "{seen:?}");
+        seen
+    }
+
+    /// Edits Dave's job title to Lead and sends the command, whose PATCH
+    /// the first route answers 500 after applying it (the answer lost).
+    fn edit_dave_into_a_lost_answer(handle: &SyncHandle, store: &Store) {
+        edit_dave(handle, store);
+        let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        assert!(contact_failure(&seen).is_none(), "{seen:?}");
+        assert_eq!(store.pending_ops().unwrap().len(), 1, "kept for a retry");
+    }
+
+    #[test]
+    fn contact_edit_retried_after_a_lost_answer_is_not_a_conflict() {
+        // The first PATCH was applied but answered 500: Graph moved to
+        // ck-dave-2 by this client's own write. The retry, with ck-dave,
+        // is refused 412, and Graph's copy holds the value it sends.
+        let first = list_of(&[DAVE_JSON]);
+        let later = list_of(&[&dave_lead_json("")]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-edit-lost-answer",
+            vec![
+                (
+                    any_route("PATCH", "/me/contacts/C-dave", 500, "{}"),
+                    Some(1),
+                ),
+                (
+                    any_route("PATCH", "/me/contacts/C-dave", 412, CONFLICT),
+                    None,
+                ),
+                (
+                    any_route("GET", "/me/contacts/C-dave", 200, &dave_lead_json("")),
+                    None,
+                ),
+            ],
+            &[
+                ("/me/contacts", 200, &first, Some(1)),
+                ("/me/contacts", 200, &later, None),
+            ],
+            |_| {},
+        );
+        edit_dave_into_a_lost_answer(&handle, &store);
+        let seen = refresh_until_drained(&handle, &store);
+        assert!(contact_failure(&seen).is_none(), "{seen:?}");
+        assert!(
+            !seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "{seen:?}"
+        );
+        assert_eq!(
+            if_matches(&srv, "PATCH", "/me/contacts/C-dave"),
+            [w("ck-dave"), w("ck-dave")]
+        );
+        let row = store.folder_contact("C-dave").unwrap().unwrap();
+        assert_eq!(row.change_key, "ck-dave-2");
+        assert_eq!(row.fields.job_title, "Lead");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contact_edit_after_a_lost_answer_goes_out_with_graphs_key() {
+        // A second edit queued behind the retried one: Graph's copy differs
+        // from the row only on the property that edit sends, so Graph's key
+        // is adopted and the second PATCH carries it.
+        let first = list_of(&[DAVE_JSON]);
+        let later =
+            list_of(&[&dave_lead_json(r#","mobilePhone":"+1 555 0300""#)
+                .replace("ck-dave-2", "ck-dave-3")]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-edit-after-lost-answer",
+            vec![
+                (
+                    any_route("PATCH", "/me/contacts/C-dave", 500, "{}"),
+                    Some(1),
+                ),
+                (
+                    any_route("PATCH", "/me/contacts/C-dave", 412, CONFLICT),
+                    Some(1),
+                ),
+                (
+                    any_route(
+                        "PATCH",
+                        "/me/contacts/C-dave",
+                        200,
+                        r#"{"id":"C-dave","changeKey":"ck-dave-3"}"#,
+                    ),
+                    None,
+                ),
+                (
+                    any_route("GET", "/me/contacts/C-dave", 200, &dave_lead_json("")),
+                    None,
+                ),
+            ],
+            &[
+                ("/me/contacts", 200, &first, Some(1)),
+                ("/me/contacts", 200, &later, None),
+            ],
+            |_| {},
+        );
+        edit_dave_into_a_lost_answer(&handle, &store);
+        let mut f = store.folder_contact("C-dave").unwrap().unwrap().fields;
+        f.mobile_phone = "+1 555 0300".into();
+        store.update_contact_fields("C-dave", &f).unwrap();
+        let seen = refresh_until_drained(&handle, &store);
+        assert!(contact_failure(&seen).is_none(), "{seen:?}");
+        assert_eq!(
+            if_matches(&srv, "PATCH", "/me/contacts/C-dave"),
+            [w("ck-dave"), w("ck-dave"), w("ck-dave-2")]
+        );
+        let row = store.folder_contact("C-dave").unwrap().unwrap();
+        assert_eq!(row.change_key, "ck-dave-3");
+        assert_eq!(row.fields, f, "both edits kept");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contact_edit_after_a_lost_answer_and_an_outside_edit_still_conflicts() {
+        // As above, but Graph's copy also holds a department set in Outlook,
+        // which no queued edit sends: the key is kept, so the second edit is
+        // refused 412 and reported, and the outside edit is not overwritten.
+        let first = list_of(&[DAVE_JSON]);
+        let graph = dave_lead_json(r#","department":"Ops""#);
+        let later = list_of(&[&graph]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-edit-lost-answer-outside-edit",
+            vec![
+                (
+                    any_route("PATCH", "/me/contacts/C-dave", 500, "{}"),
+                    Some(1),
+                ),
+                (
+                    any_route("PATCH", "/me/contacts/C-dave", 412, CONFLICT),
+                    None,
+                ),
+                (any_route("GET", "/me/contacts/C-dave", 200, &graph), None),
+            ],
+            &[
+                ("/me/contacts", 200, &first, Some(1)),
+                ("/me/contacts", 200, &later, None),
+            ],
+            |_| {},
+        );
+        edit_dave_into_a_lost_answer(&handle, &store);
+        let mut f = store.folder_contact("C-dave").unwrap().unwrap().fields;
+        f.mobile_phone = "+1 555 0300".into();
+        store.update_contact_fields("C-dave", &f).unwrap();
+        let mine = store.folder_contact("C-dave").unwrap().unwrap();
+        let seen = refresh_until_drained(&handle, &store);
+        assert_eq!(
+            if_matches(&srv, "PATCH", "/me/contacts/C-dave"),
+            [w("ck-dave"), w("ck-dave"), w("ck-dave")]
+        );
+        let failures: Vec<&SyncEvent> = seen
+            .iter()
+            .filter(|e| matches!(e, SyncEvent::ContactWriteFailed { .. }))
+            .collect();
+        assert_eq!(failures.len(), 1, "only the second edit: {seen:?}");
+        match failures[0] {
+            SyncEvent::ContactWriteFailed {
+                status,
+                attempted,
+                server,
+                ..
+            } => {
+                assert_eq!(*status, Some(412));
+                assert_eq!(attempted.as_ref(), Some(&mine));
+                assert_eq!(
+                    server.as_ref().map(|c| c.fields.department.as_str()),
+                    Some("Ops")
+                );
+            }
+            _ => unreachable!(),
+        }
+        let row = store.folder_contact("C-dave").unwrap().unwrap();
+        assert_eq!(row.fields.department, "Ops", "the outside edit stands");
+        assert_eq!(row.change_key, "ck-dave-2");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The photo op's `changeKey`-only read of Dave, answering `key`.
+    fn dave_key_route(key: &str) -> Route {
+        any_route(
+            "GET",
+            "/me/contacts/C-dave?$select=changeKey",
+            200,
+            &format!(r#"{{"id":"C-dave","changeKey":"{key}"}}"#),
+        )
+    }
+
+    /// Sets a photo on Dave and waits for its op to be sent.
+    fn set_dave_photo(handle: &SyncHandle, store: &Store) {
+        store
+            .set_contact_photo("C-dave", b"P", "image/jpeg")
+            .unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::SetContactPhoto {
+                id: "C-dave".into(),
+            })
+            .unwrap();
+        let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        assert!(contact_failure(&seen).is_none(), "{seen:?}");
+    }
+
+    /// Edits Dave's job title and sends the command.
+    fn edit_dave(handle: &SyncHandle, store: &Store) {
+        let mut f = store.folder_contact("C-dave").unwrap().unwrap().fields;
+        f.job_title = "Lead".into();
+        let fields = store.update_contact_fields("C-dave", &f).unwrap();
+        handle
+            .cmd_tx
+            .send(SyncCommand::UpdateContact {
+                id: "C-dave".into(),
+                fields,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn contact_edit_after_own_photo_set_does_not_conflict() {
+        // The PUT moves Graph's key (#2065's assumption): Graph had the
+        // stored key before it, so the key after it is this client's own.
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-edit-after-photo",
+            vec![
+                (dave_key_route("ck-dave"), Some(1)),
+                (dave_key_route("ck-dave-2"), None),
+                (any_route("PUT", DAVE_PHOTO, 200, ""), None),
+                (
+                    any_route(
+                        "PATCH",
+                        "/me/contacts/C-dave",
+                        200,
+                        r#"{"id":"C-dave","changeKey":"ck-dave-3"}"#,
+                    ),
+                    None,
+                ),
+            ],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        set_dave_photo(&handle, &store);
+        assert_eq!(key_reads_of(&srv, "C-dave").len(), 2, "before and after");
+        assert_eq!(
+            store.folder_contact("C-dave").unwrap().unwrap().change_key,
+            "ck-dave-2"
+        );
+        assert!(store.contact_photo("C-dave").unwrap().unwrap().current);
+        edit_dave(&handle, &store);
+        let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        assert!(contact_failure(&seen).is_none(), "{seen:?}");
+        assert_eq!(
+            if_matches(&srv, "PATCH", "/me/contacts/C-dave"),
+            [w("ck-dave-2")]
+        );
+        assert!(
+            store.contact_photo("C-dave").unwrap().unwrap().current,
+            "the PATCH's key moved the photo along"
+        );
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contact_edit_after_outside_edit_and_photo_set_still_conflicts() {
+        // Graph's key had already moved before the PUT (an Outlook edit):
+        // the key after it is not adopted, so the edit still conflicts.
+        let list = list_of(&[DAVE_JSON]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-edit-after-outside-edit-and-photo",
+            vec![
+                (dave_key_route("ck-dave-2"), None),
+                (any_route("PUT", DAVE_PHOTO, 200, ""), None),
+                (
+                    any_route("PATCH", "/me/contacts/C-dave", 412, CONFLICT),
+                    None,
+                ),
+                (
+                    any_route("GET", "/me/contacts/C-dave", 200, DAVE_OUTLOOK_JSON),
+                    None,
+                ),
+            ],
+            &[("/me/contacts", 200, &list, None)],
+            |_| {},
+        );
+        set_dave_photo(&handle, &store);
+        assert_eq!(key_reads_of(&srv, "C-dave").len(), 1, "none after the PUT");
+        assert_eq!(
+            store.folder_contact("C-dave").unwrap().unwrap().change_key,
+            "ck-dave"
+        );
+        edit_dave(&handle, &store);
+        let seen = wait_refused(&handle.evt_rx);
+        assert_eq!(
+            if_matches(&srv, "PATCH", "/me/contacts/C-dave"),
+            [w("ck-dave")]
+        );
+        match contact_failure(&seen) {
+            Some(SyncEvent::ContactWriteFailed { status, server, .. }) => {
+                assert_eq!(status, Some(412));
+                assert_eq!(server, Some(dave_outlook()));
+            }
+            other => panic!("{other:?} in {seen:?}"),
+        }
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
@@ -12776,7 +13424,7 @@ mod tests {
             .unwrap();
         let seen = wait_refused(&handle.evt_rx);
         assert!(contact_failure(&seen).is_some(), "{seen:?}");
-        assert_eq!(requests_of(&srv, "GET", "/me/contacts/C-dave").len(), 1);
+        assert_eq!(rereads_of(&srv, "C-dave").len(), 1);
         assert_eq!(
             store
                 .folder_contact("C-dave")
@@ -12829,7 +13477,7 @@ mod tests {
             .unwrap();
         let seen = wait_refused(&handle.evt_rx);
         assert!(contact_failure(&seen).is_some(), "{seen:?}");
-        assert_eq!(requests_of(&srv, "GET", "/me/contacts/C-dave").len(), 1);
+        assert_eq!(rereads_of(&srv, "C-dave").len(), 1);
         assert_eq!(
             store.owed_contact_rereads().unwrap(),
             [("C-dave".to_string(), false)],
@@ -12853,7 +13501,7 @@ mod tests {
             })
             .unwrap();
         wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
-        assert_eq!(requests_of(&srv, "GET", "/me/contacts/C-dave").len(), 2);
+        assert_eq!(rereads_of(&srv, "C-dave").len(), 2);
         assert!(store.owed_contact_rereads().unwrap().is_empty());
         assert_eq!(
             store.folder_contact("C-dave").unwrap(),
@@ -12927,7 +13575,7 @@ mod tests {
             patches[1].body, r#"{"mobilePhone":"+1 555 0300"}"#,
             "the later edit sends the user's value, not the server's"
         );
-        let rereads = requests_of(&srv, "GET", "/me/contacts/C-dave");
+        let rereads = rereads_of(&srv, "C-dave");
         assert_eq!(rereads.len(), 1);
         assert!(
             rereads[0].index > patches[1].index,
@@ -13232,6 +13880,7 @@ mod tests {
                 error: "HTTP 403: Access is denied.".into(),
                 attempted: None,
                 attempted_photo: Some(jpeg(b"MINE")),
+                server: None,
             }),
             "{seen:?}"
         );
@@ -13253,7 +13902,7 @@ mod tests {
         assert!(store.folder_contact("C-dave").unwrap().is_some());
         assert!(store.pending_ops().unwrap().is_empty(), "dropped at once");
         assert!(
-            requests_of(&srv, "GET", "/me/contacts/C-dave").is_empty(),
+            rereads_of(&srv, "C-dave").is_empty(),
             "a 403 owes the contact no re-read"
         );
 
@@ -13346,10 +13995,11 @@ mod tests {
                 attempted: None,
                 // The row as the user left it: the later set's photo.
                 attempted_photo: Some(jpeg(b"TWO")),
+                server: None,
             }],
             "{seen:?}"
         );
-        assert_eq!(requests_of(&srv, "GET", "/me/contacts/C-dave").len(), 1);
+        assert_eq!(rereads_of(&srv, "C-dave").len(), 1);
         assert!(store.folder_contact("C-dave").unwrap().is_none());
         assert_eq!(store.contact_photo("C-dave").unwrap(), None);
         assert!(!store.is_contact("dave@x.com").unwrap());
@@ -13468,7 +14118,7 @@ mod tests {
             .collect();
         assert_eq!(puts.len(), 1);
         assert_eq!(puts[0].body_bytes, b"TWO", "the first op sent the latest");
-        assert_eq!(requests_of(&srv, "GET", "/me/contacts/C-dave").len(), 1);
+        assert_eq!(rereads_of(&srv, "C-dave").len(), 1);
         assert!(
             store.folder_contact("C-dave").unwrap().is_none(),
             "not lingering"
@@ -13603,13 +14253,14 @@ mod tests {
                 error: "not found (404)".into(),
                 attempted: None,
                 attempted_photo: Some(jpeg(b"MINE")),
+                server: None,
             }
         );
         assert_eq!(
             srv.requests().iter().filter(|r| r.method == "PUT").count(),
             1
         );
-        assert_eq!(requests_of(&srv, "GET", "/me/contacts/C-dave").len(), 2);
+        assert_eq!(rereads_of(&srv, "C-dave").len(), 2);
         assert!(store.folder_contact("C-dave").unwrap().is_none());
         assert!(store.pending_ops().unwrap().is_empty());
 
@@ -13892,7 +14543,7 @@ mod tests {
             .unwrap()
             .is_some_and(|c| c.change_key == "ck-2")));
         let patches = requests_of(&srv, "PATCH", "/me/contacts/C-dave");
-        let rereads = requests_of(&srv, "GET", "/me/contacts/C-dave");
+        let rereads = rereads_of(&srv, "C-dave");
         assert_eq!((patches.len(), rereads.len()), (1, 1));
         assert_eq!(patches[0].body, r#"{"mobilePhone":"+1 555 0300"}"#);
         assert!(rereads[0].index > patches[0].index, "after its last op");

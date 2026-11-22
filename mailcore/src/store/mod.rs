@@ -564,9 +564,14 @@ pub enum OutboxOp {
     },
     /// DELETE a contact the host removed locally (#2063,
     /// `Store::delete_contact`). A 404 is done. A `local:` id never re-keyed
-    /// sends nothing.
+    /// sends nothing. `change_key` is the row's when it was deleted (#2067),
+    /// sent as `If-Match`, since the row is gone at send time; `""` (never
+    /// learnt, or an op queued before #2067, whose JSON has no `changeKey`)
+    /// sends no condition. `Store::note_contact_change_key` moves it along
+    /// with this client's own PATCH that answered after the delete.
     DeleteContact {
         id: String,
+        change_key: String,
     },
     /// PUT the photo set locally on a stored contact (#2065,
     /// `Store::set_contact_photo`). The bytes are not in the op: they are
@@ -960,10 +965,14 @@ impl OutboxOp {
             | OutboxOp::DismissReminder { id }
             | OutboxOp::DismissMessageReminder { id }
             | OutboxOp::CreateContact { id }
-            | OutboxOp::DeleteContact { id }
             | OutboxOp::SetContactPhoto { id } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("id".to_string(), Value::Str(id.clone())),
+            ]),
+            OutboxOp::DeleteContact { id, change_key } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                ("changeKey".to_string(), Value::Str(change_key.clone())),
             ]),
             OutboxOp::CreateFolder { id, parent, name } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
@@ -1231,7 +1240,16 @@ impl OutboxOp {
                         .collect::<Vec<_>>(),
                 ),
             }),
-            "deleteContact" => Some(OutboxOp::DeleteContact { id: id()? }),
+            // `changeKey` is absent from an op queued before #2067: no
+            // condition is sent for it.
+            "deleteContact" => Some(OutboxOp::DeleteContact {
+                id: id()?,
+                change_key: v
+                    .get("changeKey")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            }),
             "setContactPhoto" => Some(OutboxOp::SetContactPhoto { id: id()? }),
             "createFolder" => Some(OutboxOp::CreateFolder {
                 id: id()?,
@@ -6558,16 +6576,73 @@ impl Store {
     /// a row was removed, queues `OutboxOp::DeleteContact` for it in the same
     /// transaction; `SyncCommand::DeleteContact` then pushes it now, and
     /// without the command the next drain sends it. `id` may be the `local:`
-    /// id it was created under. Whether a row was removed.
+    /// id it was created under. The op carries the row's `change_key`
+    /// (#2067), read in the same transaction: the DELETE's `If-Match`.
+    /// Whether a row was removed.
     pub fn delete_contact(&self, id: &str) -> Result<bool, StoreError> {
         let tx = self.write_tx()?;
         let id = resolve_contact_id_on(&tx, id)?;
-        let n = tx.execute("DELETE FROM contact_records WHERE id = ?1", params![id])?;
-        if n > 0 {
-            enqueue_op_on(&tx, &OutboxOp::DeleteContact { id })?;
-            tx.commit()?;
+        let Some(change_key) = contact_change_key_on(&tx, &id)? else {
+            return Ok(false);
+        };
+        tx.execute("DELETE FROM contact_records WHERE id = ?1", params![id])?;
+        enqueue_op_on(&tx, &OutboxOp::DeleteContact { id, change_key })?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// This client's own write moved the contact `id` (a Graph id, or the
+    /// `local:` id it was created under) from `sent_key` to `new_key`
+    /// (#2067): a PATCH answered with it, or a photo PUT that was the only
+    /// change. In one transaction: the stored row's `change_key` becomes
+    /// `new_key` when it still is `sent_key` (only the key: the fields stay
+    /// as stored, a later local edit included); its photo row's key moves
+    /// along when it was `sent_key` too, so a photo learnt before stays
+    /// `current`; and a queued `DeleteContact` of the contact (the row
+    /// deleted while the write was in flight) whose key is `sent_key` takes
+    /// `new_key`, so its DELETE does not conflict with this client's own
+    /// write. A key moved by anyone else since is left as it is. Nothing
+    /// is written for an empty `new_key`.
+    pub(crate) fn note_contact_change_key(
+        &self,
+        id: &str,
+        sent_key: &str,
+        new_key: &str,
+    ) -> Result<(), StoreError> {
+        if new_key.is_empty() || new_key == sent_key {
+            return Ok(());
         }
-        Ok(n > 0)
+        let tx = self.write_tx()?;
+        let id = resolve_contact_id_on(&tx, id)?;
+        tx.execute(
+            "UPDATE contact_photos SET change_key = ?3
+             WHERE contact_id = ?1 AND change_key = ?2
+               AND EXISTS (SELECT 1 FROM contact_records WHERE id = ?1 AND change_key = ?2)",
+            params![id, sent_key, new_key],
+        )?;
+        tx.execute(
+            "UPDATE contact_records SET change_key = ?3 WHERE id = ?1 AND change_key = ?2",
+            params![id, sent_key, new_key],
+        )?;
+        for mut row in pending_ops_on(&tx)? {
+            let OutboxOp::DeleteContact {
+                id: queued,
+                change_key,
+            } = &mut row.op
+            else {
+                continue;
+            };
+            if change_key != sent_key || resolve_contact_id_on(&tx, queued)? != id {
+                continue;
+            }
+            *change_key = new_key.to_string();
+            tx.execute(
+                "UPDATE outbox SET payload = ?2 WHERE seq = ?1",
+                params![row.seq, row.op.to_json().to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Deletes the row of a contact whose create Graph refused (#2063), and
@@ -9148,7 +9223,7 @@ fn queued_contacts_on(conn: &Connection) -> Result<QueuedContacts, StoreError> {
     for row in pending_ops_on(conn)? {
         let (id, set) = match row.op {
             OutboxOp::UpdateContact { id, .. } => (id, Some(&mut q.edited)),
-            OutboxOp::DeleteContact { id } => (id, Some(&mut q.deleted)),
+            OutboxOp::DeleteContact { id, .. } => (id, Some(&mut q.deleted)),
             OutboxOp::CreateContact { id } => (id, None),
             OutboxOp::SetContactPhoto { id } => {
                 let id = resolve_contact_id_on(conn, &id)?;
@@ -13572,7 +13647,8 @@ mod tests {
         assert_eq!(
             ops(&s)[3],
             OutboxOp::DeleteContact {
-                id: "C-ann@x.com".into()
+                id: "C-ann@x.com".into(),
+                change_key: "ck-C-ann@x.com".into()
             }
         );
         assert!(!s.delete_contact("C-ann@x.com").unwrap());
@@ -13750,6 +13826,134 @@ mod tests {
         s.record_contact_photo("G1", Some(&photo(b"Q", "")))
             .unwrap();
         assert!(s.contact_photo("G1").unwrap().unwrap().current);
+    }
+
+    #[test]
+    fn delete_contact_queues_its_change_key() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[contact_record("G1", "Ann", &[])])
+            .unwrap();
+        assert!(s.delete_contact("G1").unwrap());
+        assert!(!s.delete_contact("G1").unwrap(), "gone: nothing queued");
+        let ops: Vec<OutboxOp> = s.pending_ops().unwrap().into_iter().map(|r| r.op).collect();
+        assert_eq!(
+            ops,
+            [OutboxOp::DeleteContact {
+                id: "G1".into(),
+                change_key: "ck-G1".into(),
+            }]
+        );
+        // A row that never had a key queues an empty one.
+        let local = s.create_local_contact(&full_fields()).unwrap();
+        assert!(s.delete_contact(&local).unwrap());
+        assert_eq!(
+            s.pending_ops().unwrap().last().unwrap().op,
+            OutboxOp::DeleteContact {
+                id: local,
+                change_key: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn delete_contact_op_without_change_key_parses() {
+        // As an op queued before #2067 holds it.
+        let v = json::parse(r#"{"kind":"deleteContact","id":"G1"}"#).unwrap();
+        assert_eq!(
+            OutboxOp::from_json(&v),
+            Some(OutboxOp::DeleteContact {
+                id: "G1".into(),
+                change_key: String::new(),
+            })
+        );
+        assert_eq!(
+            OutboxOp::DeleteContact {
+                id: "G1".into(),
+                change_key: "ck1".into(),
+            }
+            .to_json()
+            .to_string(),
+            r#"{"kind":"deleteContact","id":"G1","changeKey":"ck1"}"#
+        );
+    }
+
+    #[test]
+    fn note_contact_change_key_moves_a_current_photo_along() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[contact_record("G1", "Ann", &[])])
+            .unwrap();
+        s.record_contact_photo("G1", Some(&photo(b"P", "")))
+            .unwrap();
+        let mut f = s.folder_contact("G1").unwrap().unwrap().fields;
+        f.surname = "Cole".into();
+        s.update_contact_fields("G1", &f).unwrap();
+        s.note_contact_change_key("G1", "ck-G1", "ck-G1-2").unwrap();
+        let row = s.folder_contact("G1").unwrap().unwrap();
+        assert_eq!(row.change_key, "ck-G1-2");
+        assert_eq!(row.fields.surname, "Cole", "only the key is written");
+        assert!(
+            s.contact_photo("G1").unwrap().unwrap().current,
+            "our own PATCH did not touch the photo"
+        );
+        // A key someone else moved since is left as it is.
+        s.note_contact_change_key("G1", "ck-G1", "ck-G1-3").unwrap();
+        assert_eq!(
+            s.folder_contact("G1").unwrap().unwrap().change_key,
+            "ck-G1-2"
+        );
+        // An empty answer key writes nothing.
+        s.note_contact_change_key("G1", "ck-G1-2", "").unwrap();
+        assert_eq!(
+            s.folder_contact("G1").unwrap().unwrap().change_key,
+            "ck-G1-2"
+        );
+    }
+
+    #[test]
+    fn note_contact_change_key_rewrites_a_queued_delete() {
+        let s = Store::open_in_memory().unwrap();
+        s.replace_contacts(&[
+            contact_record("G1", "Ann", &[]),
+            contact_record("G2", "Bo", &[]),
+        ])
+        .unwrap();
+        // Deleted while this client's PATCH (sent with ck-G1) was in flight.
+        assert!(s.delete_contact("G1").unwrap());
+        assert!(s.delete_contact("G2").unwrap());
+        s.note_contact_change_key("G1", "ck-G1", "ck-G1-2").unwrap();
+        let ops: Vec<OutboxOp> = s.pending_ops().unwrap().into_iter().map(|r| r.op).collect();
+        assert_eq!(
+            ops,
+            [
+                OutboxOp::DeleteContact {
+                    id: "G1".into(),
+                    change_key: "ck-G1-2".into(),
+                },
+                OutboxOp::DeleteContact {
+                    id: "G2".into(),
+                    change_key: "ck-G2".into(),
+                },
+            ],
+            "only that contact's delete, and only from the key the PATCH sent"
+        );
+        assert!(
+            s.folder_contact("G1").unwrap().is_none(),
+            "no row written back"
+        );
+        // By the `local:` id a re-keyed contact was created under.
+        let local = s.create_local_contact(&full_fields()).unwrap();
+        s.reconcile_created_contact(&local, &contact_record("G3", "", &[]))
+            .unwrap();
+        assert!(s.delete_contact(&local).unwrap());
+        s.note_contact_change_key(&local, "ck-G3", "ck-G3-2")
+            .unwrap();
+        assert_eq!(
+            s.pending_ops().unwrap().last().unwrap().op,
+            OutboxOp::DeleteContact {
+                id: "G3".into(),
+                change_key: "ck-G3-2".into(),
+            }
+        );
     }
 
     #[test]
@@ -14131,7 +14335,14 @@ mod tests {
                 id: "G1".into(),
                 fields,
             },
-            OutboxOp::DeleteContact { id: "G1".into() },
+            OutboxOp::DeleteContact {
+                id: "G1".into(),
+                change_key: "ck1".into(),
+            },
+            OutboxOp::DeleteContact {
+                id: "G1".into(),
+                change_key: String::new(),
+            },
         ];
         for op in ops {
             let back = OutboxOp::from_json(&json::parse(&op.to_json().to_string()).unwrap());
@@ -14160,8 +14371,11 @@ mod tests {
         assert_eq!(OutboxOp::from_json(&v), None);
         // Contact ops name no message.
         let s = Store::open_in_memory().unwrap();
-        s.enqueue_op(&OutboxOp::DeleteContact { id: "G1".into() })
-            .unwrap();
+        s.enqueue_op(&OutboxOp::DeleteContact {
+            id: "G1".into(),
+            change_key: String::new(),
+        })
+        .unwrap();
         assert!(s.pending_message_ids().unwrap().is_empty());
     }
 

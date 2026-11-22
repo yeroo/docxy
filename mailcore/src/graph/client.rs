@@ -618,6 +618,11 @@ impl ContactFieldSet {
         ContactFieldSet(self.0 | other.0)
     }
 
+    /// Whether the two sets share a property.
+    pub fn intersects(self, other: ContactFieldSet) -> bool {
+        self.0 & other.0 != 0
+    }
+
     pub fn is_empty(self) -> bool {
         self.0 == 0
     }
@@ -3206,36 +3211,77 @@ impl GraphClient {
             .ok_or_else(|| GraphError::Parse("malformed created contact".into()))
     }
 
+    /// GET `/me/contacts/{id}?$select=changeKey` (#2067): the contact's
+    /// current `changeKey` only (`""` when Graph sends none). Around a photo
+    /// PUT, to tell whether the key moved only by that PUT. A 404 is
+    /// `NotFound`.
+    pub fn contact_change_key(&self, id: &str) -> Result<String, GraphError> {
+        let path = format!("/me/contacts/{}?$select=changeKey", encode_path_segment(id));
+        let resp = self.send(Method::Get, &path, None, &[])?;
+        let v = parse_body(resp)?;
+        Ok(v.get("changeKey")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string())
+    }
+
     /// PATCH `/me/contacts/{id}` with only the properties in `set`, each with
-    /// its value in `fields` (#2063). An empty set sends nothing. Graph's
-    /// answer body is not read: the PATCH was applied. Requires
-    /// `Contacts.ReadWrite`.
+    /// its value in `fields` (#2063). An empty set sends nothing. With a
+    /// non-empty `change_key` the PATCH carries `If-Match: W/"{change_key}"`
+    /// (#2067, `contact_if_match`), so Graph answers 412 when the contact
+    /// moved past it (an edit made elsewhere) instead of overwriting that
+    /// edit. Returns the `changeKey` of Graph's answer, the contact after the
+    /// PATCH; `None` when the answer holds none or does not parse, which is
+    /// not an error: the PATCH was applied. Requires `Contacts.ReadWrite`.
     pub fn update_contact(
         &self,
         id: &str,
+        change_key: &str,
         fields: &ContactFields,
         set: ContactFieldSet,
-    ) -> Result<(), GraphError> {
+    ) -> Result<Option<String>, GraphError> {
         if set.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let path = format!("/me/contacts/{}", encode_path_segment(id));
-        self.send(
+        let resp = self.send_contact_write(
             Method::Patch,
             &path,
             Some(contact_body_json(fields, set)),
-            &[],
+            change_key,
         )?;
+        Ok(parse_body(resp).ok().and_then(|v| {
+            v.get("changeKey")
+                .and_then(Value::as_str)
+                .filter(|k| !k.is_empty())
+                .map(str::to_string)
+        }))
+    }
+
+    /// DELETE `/me/contacts/{id}` (#2063), with `If-Match` on a non-empty
+    /// `change_key` as `update_contact` (#2067): a contact changed elsewhere
+    /// since is refused 412, not deleted. A 404 is `NotFound`, as every
+    /// call returns it: the outbox treats it as done. Requires
+    /// `Contacts.ReadWrite`.
+    pub fn delete_contact(&self, id: &str, change_key: &str) -> Result<(), GraphError> {
+        let path = format!("/me/contacts/{}", encode_path_segment(id));
+        self.send_contact_write(Method::Delete, &path, None, change_key)?;
         Ok(())
     }
 
-    /// DELETE `/me/contacts/{id}` (#2063). A 404 is `NotFound`, as every
-    /// call returns it: the outbox treats it as done. Requires
-    /// `Contacts.ReadWrite`.
-    pub fn delete_contact(&self, id: &str) -> Result<(), GraphError> {
-        let path = format!("/me/contacts/{}", encode_path_segment(id));
-        self.send(Method::Delete, &path, None, &[])?;
-        Ok(())
+    /// `send`, with `If-Match` on a non-empty `change_key`
+    /// (`contact_if_match`, #2067): a contact update's or delete's request.
+    fn send_contact_write(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<String>,
+        change_key: &str,
+    ) -> Result<ureq::Response, GraphError> {
+        match contact_if_match(change_key) {
+            Some(tag) => self.send(method, path, body, &[("If-Match", &tag)]),
+            None => self.send(method, path, body, &[]),
+        }
     }
 
     /// POST `/me/messages/{id}/attachments` with an inline
@@ -3613,6 +3659,14 @@ pub const BODY_SELECT: &str = "body,internetMessageHeaders";
 /// [`JSON_MAX`] bytes ([`parse_body_capped`]).
 fn parse_body(resp: ureq::Response) -> Result<Value, GraphError> {
     parse_body_capped(resp, JSON_MAX)
+}
+
+/// The `If-Match` value for a contact write (#2067): Graph's `@odata.etag`
+/// of an Outlook item is the weak tag `W/"<changeKey>"`. `None` for an empty
+/// key (a contact whose key was never learnt): the write then sends no
+/// condition, as before #2067.
+fn contact_if_match(change_key: &str) -> Option<String> {
+    (!change_key.is_empty()).then(|| format!("W/\"{change_key}\""))
 }
 
 /// `{"displayName": name}`, a folder create's or rename's body (#1910).
@@ -9507,15 +9561,81 @@ mod tests {
         f.job_title = "".into();
         let mut set = ContactFieldSet::BIRTHDAY;
         set.insert(ContactFieldSet::JOB_TITLE);
-        c.update_contact("G/1", &f, set).unwrap();
+        assert_eq!(c.update_contact("G/1", "", &f, set).unwrap(), None);
         // An empty set sends nothing.
-        c.update_contact("G/1", &f, ContactFieldSet::default())
-            .unwrap();
+        assert_eq!(
+            c.update_contact("G/1", "CK", &f, ContactFieldSet::default())
+                .unwrap(),
+            None
+        );
         let reqs = srv.requests();
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].method, "PATCH");
         assert_eq!(reqs[0].path, "/me/contacts/G%2F1");
         assert_eq!(reqs[0].body, r#"{"jobTitle":"","birthday":null}"#);
+    }
+
+    #[test]
+    fn update_contact_sends_if_match_and_returns_the_new_change_key() {
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/contacts/G1".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"id":"G1","changeKey":"CK2","surname":"Cole"}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let got = c
+            .update_contact(
+                "G1",
+                "CK1",
+                &sample_contact_fields(),
+                ContactFieldSet::SURNAME,
+            )
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("CK2"));
+        let reqs = srv.requests();
+        assert_eq!(header_values(&reqs[0], "If-Match"), [r#"W/"CK1""#]);
+    }
+
+    #[test]
+    fn update_contact_without_change_key_sends_no_if_match() {
+        let srv = FakeServer::start(vec![Route {
+            method: "PATCH".into(),
+            path_prefix: "/me/contacts/G1".into(),
+            status: 200,
+            headers: vec![],
+            // An answer without a key, or one that does not parse, is no
+            // error: the PATCH was applied.
+            body: "not json".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let got = c
+            .update_contact("G1", "", &sample_contact_fields(), ContactFieldSet::SURNAME)
+            .unwrap();
+        assert_eq!(got, None);
+        assert!(header_values(&srv.requests()[0], "If-Match").is_empty());
+    }
+
+    #[test]
+    fn contact_change_key_gets_only_the_key() {
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/contacts/G%2F1".into(),
+            status: 200,
+            headers: vec![],
+            body: r#"{"id":"G/1","changeKey":"CK9"}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(c.contact_change_key("G/1").unwrap(), "CK9");
+        assert_eq!(
+            srv.requests()[0].path,
+            "/me/contacts/G%2F1?$select=changeKey"
+        );
+        assert!(matches!(
+            c.contact_change_key("gone"),
+            Err(GraphError::NotFound)
+        ));
     }
 
     fn folder_route(method: &str, path: &str, status: u16, body: &str) -> Route {
@@ -10144,9 +10264,58 @@ mod tests {
             ),
         ]);
         let c = GraphClient::new(&srv.base_url, "AT");
-        c.delete_contact("G1").unwrap();
-        assert!(matches!(c.delete_contact("G1"), Err(GraphError::NotFound)));
-        assert_eq!(srv.requests()[0].method, "DELETE");
+        c.delete_contact("G1", "").unwrap();
+        assert!(matches!(
+            c.delete_contact("G1", ""),
+            Err(GraphError::NotFound)
+        ));
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "DELETE");
+        assert!(
+            header_values(&reqs[0], "If-Match").is_empty(),
+            "no key, no condition"
+        );
+    }
+
+    #[test]
+    fn delete_contact_sends_if_match() {
+        let srv = FakeServer::start(vec![Route {
+            method: "DELETE".into(),
+            path_prefix: "/me/contacts/G1".into(),
+            status: 204,
+            headers: vec![],
+            body: "".into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.delete_contact("G1", "CK1").unwrap();
+        assert_eq!(
+            header_values(&srv.requests()[0], "If-Match"),
+            [r#"W/"CK1""#]
+        );
+    }
+
+    #[test]
+    fn contact_write_412_is_http_412() {
+        let stale = |method: &str| {
+            Route {
+            method: method.into(),
+            path_prefix: "/me/contacts/G1".into(),
+            status: 412,
+            headers: vec![],
+            body: r#"{"error":{"code":"ErrorIrresolvableConflict","message":"The send or update operation could not be performed because the change key passed in the request does not match the current change key for the item."}}"#.into(),
+        }
+        };
+        let srv = FakeServer::start(vec![stale("PATCH"), stale("DELETE")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let f = sample_contact_fields();
+        assert!(matches!(
+            c.update_contact("G1", "CK1", &f, ContactFieldSet::SURNAME),
+            Err(GraphError::Http { status: 412, .. })
+        ));
+        assert!(matches!(
+            c.delete_contact("G1", "CK1"),
+            Err(GraphError::Http { status: 412, .. })
+        ));
     }
 
     #[test]
@@ -10164,9 +10333,12 @@ mod tests {
         let is_403 =
             |r: Result<(), GraphError>| matches!(r, Err(GraphError::Http { status: 403, .. }));
         assert!(is_403(c.create_contact(&f).map(|_| ())));
-        assert!(is_403(c.update_contact("G1", &f, ContactFieldSet::SURNAME)));
-        assert!(is_403(c.delete_contact("G1")));
-        let err = c.delete_contact("G1").unwrap_err().to_string();
+        assert!(is_403(
+            c.update_contact("G1", "CK", &f, ContactFieldSet::SURNAME)
+                .map(|_| ())
+        ));
+        assert!(is_403(c.delete_contact("G1", "CK")));
+        let err = c.delete_contact("G1", "").unwrap_err().to_string();
         assert_eq!(err, "HTTP 403: Access is denied.");
     }
 

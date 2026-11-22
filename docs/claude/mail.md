@@ -1374,8 +1374,10 @@ wider window fresh without downloading it again.
   an `Err`, never a partial list. `contact(id)` GETs one with the same
   `$select`. `create_contact(&ContactFields)` POSTs the non-empty properties
   (`ContactFieldSet::non_empty`) and parses Graph's answer.
-  `update_contact(id, &fields, set)` PATCHes only `set`'s properties (an empty
-  set sends nothing). `delete_contact(id)`. Path ids are percent-encoded
+  `update_contact(id, change_key, &fields, set)` PATCHes only `set`'s
+  properties (an empty set sends nothing) and returns the answer's
+  `changeKey`. `delete_contact(id, change_key)`. Both send `If-Match` on a
+  non-empty key (#2067, below). Path ids are percent-encoded
   (`encode_path_segment`). Errors are the usual `GraphError`: a 404 is
   `NotFound`, a 403 `Http { status: 403, .. }`. The body
   (`contact_body_json`): strings as given (`""` clears), lists whole, an
@@ -1429,7 +1431,8 @@ wider window fresh without downloading it again.
     PATCH sends those properties with their values at send time. An empty set
     writes and queues nothing, and its command does nothing. An id still `local:` after resolving, or a row gone, sends
     nothing.
-  - `Store::delete_contact(id)` → `DeleteContact` queued when a row went;
+  - `Store::delete_contact(id)` → `DeleteContact { id, change_key }` queued
+    when a row went, the key the row had (#2067);
     `SyncCommand::DeleteContact { id }` pushes it. A 404 is success. A `local:` id never re-keyed sends nothing.
 - Refused writes: 401, throttle, transport and 5xx are unchanged (stop or
   defer; a 5xx keeps the op queued, and the pending-op rule above keeps a full
@@ -1459,7 +1462,8 @@ wider window fresh without downloading it again.
   back-off, offline state or sign-in is started from there.
   `owed_contact_rereads` is a plain read (no write lock), as it runs on every
   drain; the revert checks the queue again in its own write transaction. Then `SyncEvent::ContactWriteFailed { id, write, status, error,
-  attempted }`, one `SyncEvent::Error("{create|update|delete} contact {id}:
+  attempted, attempted_photo, server }` (`server`: Graph's version on a
+  412 conflict, #2067), one `SyncEvent::Error("{create|update|delete} contact {id}:
   {error}")` (as the reminder ops report, so a host showing only `Error` lines
   sees it), and `ContactsUpdated`. `id` is the id stored at the failure (the
   Graph id once re-keyed); `status` is the HTTP status (`NotFound` →
@@ -1469,8 +1473,9 @@ wider window fresh without downloading it again.
   but whose answer did not parse, or whose re-key failed in the store, lands
   there with `status: None`. Deleting the `local:` row is still right: the
   next full pass brings Graph's copy back.
-- No `If-Match`: the stored `changeKey` is not used for optimistic
-  concurrency, the last writer wins.
+- Updates and deletes are conditional on the stored `changeKey` since
+  #2067 (its own section below): an edit made elsewhere is a 412 conflict,
+  not overwritten.
 - Scope: `AuthConfig::default()` asks for neither. Reading needs
   `Contacts.Read`; writing needs `Contacts.ReadWrite`, which a host adds to
   its `AuthConfig::scope` (#1875's `Scopes { missing }` tells it when the
@@ -1537,7 +1542,7 @@ wider window fresh without downloading it again.
   contact's X500 DN address is not matched: resolving it needs `/users`.
   Feeding the folder into autocomplete. Clearing the set on sign-out (the
   store is kept across sign-out, #1920). Dedup of a create retried after a
-  lost POST answer (as events: Graph has nothing to ask). `If-Match`.
+  lost POST answer (as events: Graph has nothing to ask).
   The contact photo is the next section (#2065).
 
 ## A Contacts-folder contact's photo (#2065)
@@ -1599,8 +1604,10 @@ Builds on the records and contact writes above (#2063).
   verified against a live tenant. Asking for each contact's
   `@odata.mediaEtag` instead would cost one request per contact per pass.
   Consequences: a photo changed elsewhere reads `current` until the next full
-  pass (as `is_contact`, full passes only); a field edit, or the user's own
-  confirmed set (whose PUT moves the key), costs one needless refetch.
+  pass (as `is_contact`, full passes only). Since #2067 neither a field
+  edit (`note_contact_change_key` moves a current photo's key along with
+  the PATCH's) nor the user's own confirmed set (its key adopted around the
+  PUT, below) costs a refetch.
 - `Store::set_contact_photo(id, bytes, type)` stores the row (pending, a new
   revision, the type `image/jpeg` when empty) and queues
   `OutboxOp::SetContactPhoto { id }` (`setContactPhoto`, `{id}`) under the
@@ -1732,6 +1739,115 @@ Builds on the records and contact writes above (#2063).
   form and its `@odata.mediaEtag`. Image conversion: a non-JPEG is sent as
   given, and Graph's refusal is reported. Other contact folders, contact
   groups.
+
+## Contact updates and deletes conditional on the changeKey (#2067)
+
+Builds on #2063's writes and #2065's photo. Before it, a PATCH from here
+overwrote, property by property, an edit made in Outlook since this client
+last read the contact, and a DELETE deleted it: the last writer won.
+
+- `GraphClient::update_contact(id, change_key, ..)` and
+  `delete_contact(id, change_key)` send `If-Match: W/"<changeKey>"`
+  (`contact_if_match`) when the key is not empty; an empty key (never
+  learnt, a `local:` row, an op queued before #2067) sends no condition.
+  Graph's `@odata.etag` for an Outlook item is that weak tag, and Exchange
+  answers a stale one with 412 `ErrorIrresolvableConflict`. **Not verified
+  against a live tenant**, like #2065's photo assumption. A 412 is the
+  usual `GraphError::Http { status: 412, .. }`.
+- The key sent: an update reads the row's `change_key` at send time; a
+  delete carries the row's key from when it was deleted, in the op
+  (`OutboxOp::DeleteContact { id, change_key }`, JSON `changeKey`, absent →
+  `""`), since the row is gone at send time.
+- This client's own writes move the key, so they never conflict with
+  themselves. `update_contact` returns the PATCH answer's `changeKey`
+  (`None` when there is none or the answer does not parse: no error, the
+  PATCH was applied), and the outbox stores it with
+  `Store::note_contact_change_key(id, sent_key, new_key)`, which in one
+  transaction writes only the key, and only where it still is `sent_key`:
+  the row's (its fields, a later local edit included, stay), the photo
+  row's (so a photo learnt before stays `current`), and a queued
+  `DeleteContact`'s (the contact deleted while the PATCH was in flight).
+  Two edits queued before one drain therefore send the stored key, then the
+  first one's answered key. Storing an answered or adopted key is
+  best-effort (r1): Graph applied the write, so a store error there (a busy
+  timeout) must not report it refused. At worst the next edit is a false
+  412, reported.
+- A photo PUT may move the key too (#2065's assumption). The outbox reads
+  Graph's key (`contact_change_key`: `GET /me/contacts/{id}?$select=changeKey`)
+  before the PUT and, only when it was the stored one (nobody else changed
+  the contact since this client last read it), again after the PUT, and
+  adopts that one through `note_contact_change_key` before
+  `confirm_contact_photo` (which learns the photo against the record's
+  key). Either read failing adopts nothing and never fails the op: at worst
+  the next edit is a false conflict, reported with the edit in `attempted`.
+  No field comparison: Graph recomputes `displayName`/`fileAs` and fills
+  blank email names, so one would misfire. Residual: an edit made elsewhere
+  between the two reads (the PUT's round trip) is adopted, and a later edit
+  from here can overwrite it. A PUT retried after a lost answer (applied,
+  then a 5xx or a transport error) finds the key moved by its own first
+  try, so nothing is adopted. The next field edit may then be a false 412,
+  reported with its `attempted`.
+- A 412 is a final refusal like any other (#2063): the op is dropped, the
+  row goes back to Graph's version, and `ContactWriteFailed { status:
+  Some(412), attempted, server }` reports it. `server` is new: for an update
+  or delete refused 412, `refuse_contact_write` reads Graph's version once
+  (`GET /me/contacts/{id}`, with the token the write used: no refresh, no
+  pause, no back-off; a failure is `None`). When no other queued op names
+  the contact, that copy is the revert (`revert_folder_contact`), with no
+  second GET; otherwise the owed re-read runs as ever. `server` is `None`
+  for every other refusal. A conflict is not merged: the server wins in the
+  store, and the user's version is in `attempted` (`None` for a delete).
+- A PATCH retried after a lost answer (r1). Graph applied the first try,
+  but its answer was lost (a transport error, a 5xx after the write), so
+  the stored key is stale by this client's own write and the retry is
+  refused 412. That is not a conflict when Graph's copy (the `server` read)
+  already holds the row's value on every property the op sends
+  (`ContactFieldSet::changed(server, row)` does not intersect the op's
+  set): a lost answer, or the same change made elsewhere. The op is dropped
+  as applied, with no `ContactWriteFailed` and no `Error`, then
+  `ContactsUpdated` (`adopt_applied_contact_edit`):
+  - with no other queued op naming the contact, the row becomes Graph's
+    version (`revert_folder_contact`), key included;
+  - otherwise the row stays for those ops, and only Graph's key is adopted
+    (`note_contact_change_key`), and only when Graph's copy equals the row
+    on every property no queued `UpdateContact` of the contact names. A
+    difference elsewhere may be an edit made in Outlook: the key is kept,
+    so the next op is refused 412 and reported. That is a false conflict
+    at worst, never an overwrite of a property this client does not send.
+  Residual: an edit made elsewhere, in the lost-answer window, to a
+  property a queued edit of ours also changes is overwritten by that edit.
+  So is a photo changed elsewhere then: the photo row's key moves along and
+  reads `current`. A 412 whose Graph copy differs on a sent property is a
+  conflict, reported as above. Delete is unchanged: a DELETE retried after
+  a lost answer finds the contact gone, which is a 404, already done.
+- Later queued edits of a contact whose edit was refused 412 still send the
+  stale key (the revert waits for them), so each is refused 412 in turn and
+  reported with its `attempted`: no edit is lost silently.
+- Tests: `client.rs` `update_contact_sends_if_match_and_returns_the_new_change_key`,
+  `update_contact_without_change_key_sends_no_if_match`,
+  `delete_contact_sends_if_match`, `delete_contact_404_is_not_found` (no key,
+  no header), `contact_write_412_is_http_412`, `contact_change_key_gets_only_the_key`;
+  `store` `delete_contact_queues_its_change_key`,
+  `delete_contact_op_without_change_key_parses`,
+  `note_contact_change_key_moves_a_current_photo_along`,
+  `note_contact_change_key_rewrites_a_queued_delete`, `contact_ops_round_trip_json`;
+  `outbox.rs` `update_contact_stores_the_answered_change_key`,
+  `set_contact_photo_puts_the_pending_row_and_confirms_it` (key adopted),
+  `set_contact_photo_keeps_the_key_when_graph_had_moved_before_the_put`,
+  `set_contact_photo_key_read_failure_adopts_nothing`; `engine.rs`
+  `contact_edit_412_reports_both_versions_and_restores_graphs` and
+  `contact_delete_412_keeps_the_contact` (the repro: on main the PATCH and
+  DELETE carry no `If-Match`), `two_contact_edits_in_turn_do_not_conflict_with_themselves`,
+  `contact_edit_after_own_photo_set_does_not_conflict`,
+  `contact_edit_after_outside_edit_and_photo_set_still_conflicts`; r1:
+  `contact_edit_retried_after_a_lost_answer_is_not_a_conflict`,
+  `contact_edit_after_a_lost_answer_goes_out_with_graphs_key`,
+  `contact_edit_after_a_lost_answer_and_an_outside_edit_still_conflicts`,
+  and `outbox.rs` `set_contact_photo_key_read_after_the_put_failure_adopts_nothing`. The engine
+  tests count re-reads with `rereads_of` (the `$select=id,…` GET), apart
+  from the photo op's `key_reads_of`.
+- Not done: `If-Match` on the photo PUT, and on event or message writes.
+  Merging a conflict property by property.
 
 ## Cancel and forward a meeting (#1985)
 
