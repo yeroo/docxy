@@ -4682,6 +4682,9 @@ pub struct Eval<'a> {
     /// over its own criteria range) is a circular reference and matches
     /// nothing, instead of recursing without end.
     db_crit_stack: Vec<(usize, u32, u32)>,
+    /// How many `INDIRECT` texts are being evaluated: a reference one
+    /// names is the sheet's text at run time, not the formula's.
+    indirect: u32,
 }
 
 /// A matrix of computed values (a dynamic-array result). Always non-empty
@@ -4747,6 +4750,7 @@ impl<'a> Eval<'a> {
             lets: Vec::new(),
             omitted: Vec::new(),
             db_crit_stack: Vec::new(),
+            indirect: 0,
         }
     }
 
@@ -5045,8 +5049,11 @@ impl<'a> Eval<'a> {
                     // A sheet of another workbook (`'[1]My Sheet'!A1`,
                     // `'C:\Docs\[Book.xlsx]Sheet1'!A1`; no sheet name holds
                     // `[`): its cells aren't in the model, so the formula
-                    // keeps its cached value rather than turning #REF!.
-                    if n.contains('[') {
+                    // keeps its cached value rather than turning #REF!. One
+                    // an INDIRECT text names is #REF!, as Excel's INDIRECT
+                    // gives for a closed book: marking it would freeze the
+                    // cell after the text changes.
+                    if n.contains('[') && self.indirect == 0 {
                         self.unsupported = true;
                     }
                     Err(Value::Err(ExcelError::Ref))
@@ -6456,7 +6463,9 @@ impl<'a> Eval<'a> {
         match self.indirect_target(args) {
             Ok(ast) => {
                 self.depth += 1;
+                self.indirect += 1;
                 let arg = self.eval_arg(&ast);
+                self.indirect -= 1;
                 self.depth -= 1;
                 arg
             }
