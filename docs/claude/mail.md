@@ -3925,11 +3925,55 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `a_folder_only_moved_under_a_refused_create_keeps_its_own_create`,
   `a_folder_created_under_a_refused_create_is_reported`,
   `fast_folders_follow_a_created_folder`).
-- Not done: a lookxy folder-management UI; dedup of a create retried
-  after a lost POST answer (a retry may 409 on the name Graph already has; the refusal discards
-  the local row and the next listing brings Graph's folder); `GET /me/mailFolders/delta`; search
+- Not done: a lookxy folder-management UI; `GET /me/mailFolders/delta`; search
   folders; folders in other mailboxes; returning the `local:` id synchronously (a host finds the
-  new row on `FoldersUpdated`; `FolderCreated` names both ids).
+  new row on `FoldersUpdated`; `FolderCreated` names both ids). A create retried after a lost
+  answer: see the next section (#2109).
+
+## A folder create retried after a lost answer (#2109)
+
+- The gap: a `CreateFolder` POST reached Graph but its answer was lost (a 5xx after the commit,
+  a dropped connection, a crash before the re-key). The retry got 409 (`ErrorFolderExists`), and
+  the refusal discarded the `local:` row with every op queued on its id: a rename, a move, and
+  messages moved into it.
+- The flag: the drain runs the create through `outbox::create_folder` with the row's `seq`
+  (`apply_op_with_retry`, as `SendDraft`'s `apply_send`), which sets `outbox.send_posted` right
+  before the POST (the #1874 column, no migration; the engine reads it as a send's only for
+  `SendDraft`). So a 5xx, a 429/503 throttle, a transport failure and a crash all count as
+  "may have made the folder". A 401 puts the flag back as it was before this run: Graph did
+  nothing, and the refresh runs the create again, so its 409 must still read as a first POST.
+  `apply_op` (no row) passes `None` and never looks up.
+- On a 409 with the flag set before this run: `GraphClient::find_child_folder(parent, name)`
+  (`childFolders` of the parent, or `/me/mailFolders` for the top, 100 a page, following
+  nextLink; an exact `displayName`, else the first caseless match, compared locally, no
+  `$filter`) with the **op's** name, the one POSTed (a queued rename changed the row's, not the
+  op's). Found, and not already taken (`Store::folder_taken_by_alias`: no `folder_aliases` row
+  other than `local_id → G` maps onto it, so another create, copy or move re-keyed onto G is
+  never merged with this one): `reconcile_created_folder` and `FolderCreated`, as a 2xx. A stale
+  row a listing stored for G is no alias: it merges (`rekey_folder_on` hands its mail and children
+  over). Otherwise the 409 itself is returned and refused as before. A 409 on a first POST is a
+  clash with a folder the user has: refused with no lookup. A lookup failure is returned as is:
+  a 5xx, throttle, transport or 401 keeps the op; another 4xx or `Parse` refuses it.
+- Residual: a POST that answered 5xx without committing, then a folder of that name made
+  elsewhere before the retry, is adopted. That is rare and loses nothing: the queued ops land in
+  a folder of that name.
+- Tests: `client.rs` `find_child_folder_pages_children_and_top_and_matches_names`,
+  `find_child_folder_returns_a_page_error`; `store/mod.rs`
+  `folder_taken_by_alias_ignores_the_folders_own_alias`; `outbox.rs`
+  `create_folder_marks_its_post_sent`,
+  `create_folder_409_after_a_posted_attempt_adopts_graphs_folder` (the flag with no attempt
+  counted: the crash case), `create_folder_409_on_a_first_post_is_refused_without_a_lookup`,
+  `create_folder_409_retried_with_no_such_folder_returns_the_409`,
+  `create_folder_409_does_not_adopt_a_folder_another_create_already_took`,
+  `create_folder_401_restores_the_posted_flag`, `create_folder_lookup_failure_is_returned_as_is`;
+  `engine.rs` `folder_writes`
+  `a_create_retried_after_a_lost_answer_adopts_graphs_folder_on_409` (end to end: a 500, a
+  Refresh pass listing G1 as its own row, then the 409; it fails with `FolderWriteFailed(409)`
+  without the fix) and `refused_folder_writes_revert_and_report` (a first POST's 409 sends no
+  lookup).
+- Not done: a `CopyFolder` (#2118) retried after a lost answer (it may copy twice or 409).
+  Contacts and events: Graph allows duplicates, so a lost answer there makes a duplicate, not a
+  loss.
 
 ## Delete a folder (#2107)
 

@@ -208,6 +208,7 @@ issue number to find its notes.
   a reply draft's In-Reply-To, each message's Internet message id, `isDraft` kept (#2096),
   folders created, renamed and moved through the outbox (#1910), a folder deleted only
   after a walk of Graph finds nothing the store shows elsewhere (#2107),
+  a folder create retried after a lost answer adopting Graph's folder on a 409 (#2109),
   a whole folder marked read on the server through `$batch` (#1913),
   a folder emptied on the server through `$batch`, unsent mail kept, FTS rows in bulk (#2110),
   a folder copied with its contents through the outbox, synced after (#2118),
