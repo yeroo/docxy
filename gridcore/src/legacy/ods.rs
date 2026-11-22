@@ -977,6 +977,17 @@ struct CellIn {
     text: String,
     paragraphs: usize,
     repeat: u32,
+    /// Its annotation (#884): (author, text).
+    comment: Option<(String, String)>,
+}
+
+/// An `office:annotation` being read: its author (`dc:creator`), its text
+/// (each `text:p` a line) and how many paragraphs it has had.
+#[derive(Default)]
+struct NoteIn {
+    author: String,
+    text: String,
+    paragraphs: usize,
 }
 
 /// Read an `.ods` package.
@@ -1090,6 +1101,10 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
     let mut row_cells: Vec<(u32, Cell)> = Vec::new();
     // The current row's merges: (column, columns, rows) spanned.
     let mut row_merges: Vec<(u32, u32, u32)> = Vec::new();
+    // The current row's comments: (column, author, text).
+    let mut row_comments: Vec<(u32, String, String)> = Vec::new();
+    // The annotation being read, and its depth in `stack`.
+    let mut note: Option<(usize, NoteIn)> = None;
     let mut cell: Option<CellIn> = None;
     // Depth inside an annotation or a drawn shape, whose text is not the
     // cell's.
@@ -1134,6 +1149,7 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                         col = 0;
                         row_cells.clear();
                         row_merges.clear();
+                        row_comments.clear();
                         row_repeat = p
                             .attr("table:number-rows-repeated")
                             .parse()
@@ -1157,7 +1173,31 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                         }
                         cell = Some(c);
                     }
+                    "office:annotation" if cell.is_some() && note.is_none() => {
+                        hidden += 1;
+                        note = Some((stack.len(), NoteIn::default()));
+                    }
                     n if n == "office:annotation" || n.starts_with("draw:") => hidden += 1,
+                    // An annotation's own paragraphs and spacing.
+                    "text:p" if note.is_some() && hidden == 1 => {
+                        if let Some((_, n)) = note.as_mut() {
+                            if n.paragraphs > 0 {
+                                n.text.push('\n');
+                            }
+                            n.paragraphs += 1;
+                        }
+                    }
+                    "text:s" if note.is_some() && hidden == 1 => {
+                        if let Some((_, n)) = note.as_mut() {
+                            let k = p.attr("text:c").parse().unwrap_or(1usize).min(1 << 12);
+                            n.text.push_str(&" ".repeat(k));
+                        }
+                    }
+                    "text:line-break" if note.is_some() && hidden == 1 => {
+                        if let Some((_, n)) = note.as_mut() {
+                            n.text.push('\n');
+                        }
+                    }
                     "text:p" if hidden == 0 => {
                         if let Some(c) = cell.as_mut() {
                             if c.paragraphs > 0 {
@@ -1205,6 +1245,14 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                 stack.push(name);
             }
             Event::Text => {
+                if let Some((depth, n)) = note.as_mut().filter(|_| hidden == 1) {
+                    let inside = &stack[*depth..];
+                    if inside.iter().any(|e| e == "dc:creator") {
+                        XmlParser::append_decoded(p.text(), &mut n.author);
+                    } else if inside.iter().any(|e| e == "text:p") {
+                        XmlParser::append_decoded(p.text(), &mut n.text);
+                    }
+                }
                 if hidden == 0 && stack.iter().any(|e| e == "text:p") {
                     if let Some(c) = cell.as_mut() {
                         XmlParser::append_decoded(p.text(), &mut c.text);
@@ -1216,6 +1264,11 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                 match name.as_str() {
                     n if n == "office:annotation" || n.starts_with("draw:") => {
                         hidden = hidden.saturating_sub(1);
+                        if note.as_ref().is_some_and(|(d, _)| *d == stack.len()) {
+                            if let (Some((_, n)), Some(c)) = (note.take(), cell.as_mut()) {
+                                c.comment = Some((n.author.trim().to_string(), n.text));
+                            }
+                        }
                     }
                     "table:table" => {
                         if let Some(sheet) = book.sheets.last_mut() {
@@ -1307,6 +1360,12 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                         if (cs > 1 || rs > 1) && col < MAX_COLS {
                             row_merges.push((col, cs, rs));
                         }
+                        // A repeated cell's comment is on its first copy
+                        // only, as is a repeated row's: a copy of a note
+                        // is not another note.
+                        if let Some((author, text)) = c.comment.filter(|_| col < MAX_COLS) {
+                            row_comments.push((col, author, text));
+                        }
                         col = col.saturating_add(repeat);
                     }
                     "table:table-row" => {
@@ -1356,6 +1415,11 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                                     let c2 = c.saturating_add(cs - 1).min(MAX_COLS - 1);
                                     sheet.merges.push((r, c, r2, c2));
                                 }
+                            }
+                        }
+                        if let Some(sheet) = book.sheets.last_mut().filter(|_| row < MAX_ROWS) {
+                            for (c, author, text) in row_comments.drain(..) {
+                                sheet.comments.push((row, c, author, text));
                             }
                         }
                         row = row.saturating_add(row_repeat);
@@ -2040,7 +2104,7 @@ mod tests {
                  <table:table-column table:style-name="co2"/>
                  <table:table-column table:style-name="co1" table:number-columns-repeated="16382"/>
                  <table:table-row><table:table-cell table:style-name="ce1" office:value-type="float" office:value="1"/></table:table-row>
-                 <table:table-row><table:table-cell/></table:table-row>
+                 <table:table-row><table:table-cell><office:annotation><dc:creator>Ann</dc:creator><text:p>a note</text:p></office:annotation></table:table-cell></table:table-row>
                  <table:table-row><table:table-cell table:number-columns-spanned="2" table:number-rows-spanned="2"/></table:table-row>
                </table:table>"#,
         )
@@ -2076,5 +2140,45 @@ mod tests {
         let w = (144.0f64 / 7.0 * 256.0).trunc() / 256.0;
         assert_eq!(widths, [(1, 1, Some(w))]);
         assert_eq!(s.merges, [(2, 0, 3, 1)]);
+        let notes: Vec<_> = back
+            .comments()
+            .into_iter()
+            .map(|c| (c.row, c.col, c.author, c.text))
+            .collect();
+        assert_eq!(notes, [(1, 0, "Ann".to_string(), "a note".to_string())]);
+    }
+
+    /// An annotation is its cell's comment: `dc:creator` the author, each
+    /// paragraph a line; the cell's own text is not touched. A repeated
+    /// cell's or row's annotation is on its first copy only.
+    #[test]
+    fn ods_annotations_become_comments() {
+        let xml = styled_content(
+            "",
+            "",
+            r#"<table:table table:name="S">
+                 <table:table-row>
+                   <table:table-cell office:value-type="string"><office:annotation><dc:creator>Ann Lee</dc:creator><dc:date>2024-01-01T00:00:00</dc:date><text:p>first<text:s text:c="2"/>line</text:p><text:p>second</text:p></office:annotation><text:p>value</text:p></table:table-cell>
+                   <table:table-cell table:number-columns-repeated="3"><office:annotation><text:p>on an empty cell</text:p></office:annotation></table:table-cell>
+                 </table:table-row>
+                 <table:table-row table:number-rows-repeated="1048575"><table:table-cell><office:annotation><dc:creator>Bob</dc:creator><text:p>padding</text:p></office:annotation></table:table-cell></table:table-row>
+               </table:table>"#,
+        );
+        let b = read_styled("", &xml, Limits::default());
+        let s = &b.sheets[0];
+        assert_eq!(s.cells[&(0, 0)].value, CellValue::Text("value".into()));
+        assert_eq!(
+            s.comments,
+            [
+                (
+                    0,
+                    0,
+                    "Ann Lee".to_string(),
+                    "first  line\nsecond".to_string()
+                ),
+                (0, 1, String::new(), "on an empty cell".to_string()),
+                (1, 0, "Bob".to_string(), "padding".to_string()),
+            ]
+        );
     }
 }

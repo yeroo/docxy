@@ -214,6 +214,53 @@ fn read_tables(zip: &ZipArchive, part: &str, sheet: &str, out: &mut HashMap<u32,
     }
 }
 
+/// BrtCommentAuthor, BrtBeginComment and BrtCommentText: [MS-XLSB] 2.4
+/// (record ids 632, 635 and 637), in the comments part
+/// ([MS-XLSB] 2.1.7.8) a sheet's rels name.
+const BRT_COMMENT_AUTHOR: u32 = 632;
+const BRT_BEGIN_COMMENT: u32 = 635;
+const BRT_COMMENT_TEXT: u32 = 637;
+
+/// The comments of the sheet in `part` (#884): (row, col, author, text).
+/// BrtBeginComment: iauth (into the BrtCommentAuthor list), an RfX
+/// (rwFirst, rwLast, colFirst, colLast) and a GUID; BrtCommentText: a
+/// RichStr (flags, then the plain text; its runs are not read).
+fn read_comments(zip: &ZipArchive, part: &str) -> Vec<(u32, u32, String, String)> {
+    let mut out = Vec::new();
+    for (ty, target) in rels(zip, part).into_values() {
+        if !ty.ends_with("/comments") {
+            continue;
+        }
+        let Some(bytes) = zip.read(&target) else {
+            continue;
+        };
+        let mut authors: Vec<String> = Vec::new();
+        let mut at: Option<(u32, u32, String)> = None;
+        for (ty, body) in records(&bytes) {
+            let mut c = Cur::new(body);
+            let _ = (|| -> Option<()> {
+                match ty {
+                    BRT_COMMENT_AUTHOR => authors.push(c.wide()?),
+                    BRT_BEGIN_COMMENT => {
+                        let iauth = c.u32()? as usize;
+                        let (row, _, col) = (c.u32()?, c.u32()?, c.u32()?);
+                        at = on_grid(row, col)
+                            .then(|| (row, col, authors.get(iauth).cloned().unwrap_or_default()));
+                    }
+                    BRT_COMMENT_TEXT => {
+                        let (row, col, author) = at.take()?;
+                        c.u8()?;
+                        out.push((row, col, author, c.wide()?));
+                    }
+                    _ => {}
+                }
+                Some(())
+            })();
+        }
+    }
+    out
+}
+
 /// The relationships of `part`, by `Id`: (type, the target part's name).
 fn rels(zip: &ZipArchive, part: &str) -> HashMap<String, (String, String)> {
     let Some(bytes) = zip.read(&rels_part_name(part)) else {
@@ -428,16 +475,17 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
     let mut seen: HashSet<&str> = HashSet::new();
     for (i, part) in parts.iter().enumerate() {
         // Only worksheets: a chartsheet's or macro sheet's part is no grid.
-        let Some(bytes) = part
+        let Some((part, bytes)) = part
             .as_ref()
             .filter(|p| p.contains("worksheets/") && seen.insert(p.as_str()))
-            .and_then(|p| zip.read(p))
+            .and_then(|p| Some((p, zip.read(p)?)))
         else {
             imported.push(None);
             continue;
         };
         let mut sheet = read_sheet(&bytes, &g, &sst, &mut book, &mut styles)?;
         sheet.name = g.sheets[i].clone();
+        sheet.comments = read_comments(zip, part);
         imported.push(Some(book.sheets.len()));
         book.push_sheet(sheet)?;
     }
@@ -1665,7 +1713,11 @@ mod tests {
                 rec(BRT_MERGE_CELL, &merge),
             ],
             &[],
-            vec![("xl/styles.bin".to_string(), styles)],
+            [
+                vec![("xl/styles.bin".to_string(), styles)],
+                comments_parts(&["Ann"], &[(0, 1, 0, "a note")]),
+            ]
+            .concat(),
         )
     }
 
@@ -1688,5 +1740,67 @@ mod tests {
         let widths: Vec<_> = s.col_defs.iter().map(|d| (d.min, d.max, d.width)).collect();
         assert_eq!(widths, [(1, 1, Some(20.0))]);
         assert_eq!(s.merges, [(2, 0, 3, 1)]);
+        let notes: Vec<_> = back
+            .comments()
+            .into_iter()
+            .map(|c| (c.row, c.col, c.author, c.text))
+            .collect();
+        assert_eq!(notes, [(0, 1, "Ann".to_string(), "a note".to_string())]);
+    }
+
+    /// The sheet rels and comments part of a sheet with these comments:
+    /// (row, col, author index, text), and the author list.
+    fn comments_parts(
+        authors: &[&str],
+        comments: &[(u32, u32, u32, &str)],
+    ) -> Vec<(String, Vec<u8>)> {
+        let mut v = Vec::new();
+        for a in authors {
+            v.extend(rec(BRT_COMMENT_AUTHOR, &wide(a)));
+        }
+        for &(row, col, iauth, text) in comments {
+            let mut b = iauth.to_le_bytes().to_vec();
+            for n in [row, row, col, col] {
+                b.extend(n.to_le_bytes());
+            }
+            b.extend([0; 16]);
+            v.extend(rec(BRT_BEGIN_COMMENT, &b));
+            let mut t = vec![0u8];
+            t.extend(wide(text));
+            v.extend(rec(BRT_COMMENT_TEXT, &t));
+            v.extend(rec(636, &[]));
+        }
+        vec![
+            (
+                "xl/worksheets/_rels/sheet1.bin.rels".to_string(),
+                br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments1.bin"/></Relationships>"#.to_vec(),
+            ),
+            ("xl/comments1.bin".to_string(), v),
+        ]
+    }
+
+    /// The comments part's comments: their cell, author and text.
+    #[test]
+    fn xlsb_comments() {
+        let book = open(&xlsb_with(
+            &[],
+            &[rec(BRT_ROW_HDR, &0u32.to_le_bytes()), real(0, 0, 1.0)],
+            &[],
+            comments_parts(
+                &["Ann", "Bob"],
+                &[
+                    (3, 1, 1, "Bob:\nsee this"),
+                    (0, 0, 0, "first"),
+                    (0, 16384, 0, "off"),
+                ],
+            ),
+        ));
+        assert_eq!(
+            book.sheets[0].comments,
+            [
+                (3, 1, "Bob".to_string(), "Bob:\nsee this".to_string()),
+                (0, 0, "Ann".to_string(), "first".to_string()),
+            ]
+        );
     }
 }

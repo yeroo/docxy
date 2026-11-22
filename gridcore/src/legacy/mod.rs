@@ -346,6 +346,8 @@ pub(crate) struct SheetIn {
     pub col_breaks: Vec<crate::sheet::PageBreak>,
     /// Where outline summaries sit.
     pub outline: crate::sheet::OutlineSettings,
+    /// Cell comments (#884): (row, col, author, text).
+    pub comments: Vec<(u32, u32, String, String)>,
 }
 
 /// One column definition as a reader collects it.
@@ -556,7 +558,9 @@ impl BookIn {
             pkg.workbook.styles.xfs.push(xf);
             xf_of[i] = (pkg.workbook.styles.xfs.len() - 1) as u32;
         }
-        for (at, sheet) in self.sheets.into_iter().enumerate() {
+        for (at, mut sheet) in self.sheets.into_iter().enumerate() {
+            // The comments part, its drawing and rels, written once.
+            pkg.set_comments(at, &std::mem::take(&mut sheet.comments));
             let s = &mut pkg.workbook.sheets[at];
             for (key, mut cell) in sheet.cells {
                 cell.style = xf_of.get(cell.style as usize).copied().unwrap_or(0);

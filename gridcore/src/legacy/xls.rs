@@ -549,7 +549,8 @@ const SHEET_KNOWN: &[u16] = &[
     0x003C, 0x01AB,
     // PASSWORD (PROTECT's hash), SELECTION, GUTS (the outline gutters'
     // size), GRIDSET, OBJPROTECT and SCENPROTECT (PROTECT's parts),
-    // DBCELL, DIMENSIONS, INDEX, TXO (a note's text: notes are named).
+    // DBCELL, DIMENSIONS, INDEX, TXO (a note's text, read when it follows
+    // a note's OBJ; a text box's TXO follows an OBJ that is named).
     0x0013, 0x001D, 0x0080, 0x0082, 0x0063, 0x00DD, 0x00D7, 0x0200, 0x020B, 0x01B6,
     // FEATHDR, FEATHDR11 and LIST12 (FEAT and FEATURE11 are named), and
     // 0x01C2, which Excel writes beside spilled dynamic arrays (the arrays
@@ -1004,6 +1005,12 @@ fn read_sheet(
     let mut last_formula: Option<(u32, u32)> = None;
     // Array formulas: anchor → (range, rgce, extra).
     let mut arrays: HashMap<(u32, u32), Group> = HashMap::new();
+    // Notes (#884): the id of the note OBJ just read, whose text the next
+    // TXO holds; each note's text by its OBJ id; and the NOTE records
+    // (row, col, OBJ id, author), joined with their text at the end.
+    let mut note_obj: Option<u16> = None;
+    let mut note_text: HashMap<u16, String> = HashMap::new();
+    let mut notes: Vec<(u16, u16, u16, String)> = Vec::new();
 
     let mut put = |cells: &mut BTreeMap<(u32, u32), Cell>,
                    r: u16,
@@ -1422,11 +1429,42 @@ fn read_sheet(
                 0x0041 => {
                     book.dropped.insert("sheet view settings");
                 }
-                0x005D | 0x00EC => {
-                    book.dropped.insert("pictures, shapes and charts");
+                // OBJ ([MS-XLS] 2.4.181): its first subrecord is an FtCmo
+                // (ft 0x15, cb, ot, id). A note's (ot 0x19) is read with
+                // its TXO and NOTE; any other object is named. Every drawn
+                // object has one, so MSODRAWING (0x00EC) itself is not.
+                0x005D => {
+                    note_obj = None;
+                    let (ft, _cb, ot, id) = (c.u16(), c.u16(), c.u16(), c.u16());
+                    match (ft, ot, id) {
+                        (Some(0x15), Some(0x19), Some(id)) => note_obj = Some(id),
+                        _ => {
+                            book.dropped.insert("pictures, shapes and charts");
+                        }
+                    }
                 }
+                // TXO ([MS-XLS] 2.4.329): cchText at offset 10; the text
+                // is in the CONTINUE pieces after it, each starting with
+                // its high-byte flag (the formatting runs come last).
+                0x01B6 => {
+                    let id = note_obj.take()?;
+                    c.at = 10;
+                    let cch = c.u16()? as usize;
+                    let text = match r.breaks.first() {
+                        Some(&at) if cch > 0 => {
+                            c.at = at;
+                            c.chars(cch, false)?
+                        }
+                        _ => String::new(),
+                    };
+                    note_text.insert(id, text);
+                }
+                // NOTE ([MS-XLS] 2.4.179): rw, col, grbit, idObj,
+                // stAuthor.
                 0x001C => {
-                    book.dropped.insert("comments");
+                    let (rw, col, _grbit, id) = (c.u16()?, c.u16()?, c.u16()?, c.u16()?);
+                    let author = c.xl_string().unwrap_or_default();
+                    notes.push((rw, col, id, author));
                 }
                 0x01B0 | 0x01B1 | 0x0879 | 0x087A => {
                     book.dropped.insert("conditional formatting");
@@ -1529,6 +1567,17 @@ fn read_sheet(
         }
     }
     sheet.cells = cells;
+    // A note whose text wasn't found is named.
+    for (rw, col, id, author) in notes {
+        match note_text.remove(&id) {
+            Some(text) if on_grid(rw as u32, col as u32) => {
+                sheet.comments.push((rw as u32, col as u32, author, text));
+            }
+            _ => {
+                book.dropped.insert("comments");
+            }
+        }
+    }
     if book.sheets.is_empty() && iteration == Some(true) {
         book.iterate = Some((calc_count.unwrap_or(100) as u32, delta.unwrap_or(0.001)));
     }
@@ -3492,5 +3541,118 @@ pub(crate) mod tests {
                 "ifmt {id}"
             );
         }
+    }
+
+    // --- #884: notes, data validation and conditional formatting --------
+
+    /// OBJ: an FtCmo (ft 0x15, cb 18, ot, id, flags, 12 reserved bytes),
+    /// then an FtNts for a note, and an FtEnd.
+    fn obj(ot: u16, id: u16) -> Vec<u8> {
+        let mut b = vec![0x15, 0, 18, 0];
+        b.extend(ot.to_le_bytes());
+        b.extend(id.to_le_bytes());
+        b.extend([0x11, 0x60]);
+        b.extend([0; 12]);
+        if ot == 0x19 {
+            b.extend([0x0D, 0, 22, 0]);
+            b.extend([0; 22]);
+        }
+        b.extend([0; 4]);
+        rec(0x005D, &b)
+    }
+
+    /// A note's records as Excel writes them: MSODRAWING, OBJ, MSODRAWING,
+    /// TXO (cchText at offset 10, cbRuns 16), its text in CONTINUEs (the
+    /// first 8-bit, the second 16-bit, each with its own flag), the runs.
+    fn note_object(id: u16, first: &str, second: &str) -> Vec<Vec<u8>> {
+        let cch = (first.len() + second.chars().count()) as u16;
+        let mut txo = vec![0x12, 0x02, 0, 0, 0, 0, 0, 0, 0, 0];
+        txo.extend(cch.to_le_bytes());
+        txo.extend(16u16.to_le_bytes());
+        txo.extend([0; 4]);
+        let mut a = vec![0u8];
+        a.extend(first.as_bytes());
+        let mut b = vec![1u8];
+        for u in second.encode_utf16() {
+            b.extend(u.to_le_bytes());
+        }
+        vec![
+            rec(0x00EC, &[0; 8]),
+            obj(0x19, id),
+            rec(0x00EC, &[0; 8]),
+            rec(0x01B6, &txo),
+            rec(CONTINUE, &a),
+            rec(CONTINUE, &b),
+            rec(CONTINUE, &[0; 16]),
+        ]
+    }
+
+    /// NOTE: rw, col, grbit, idObj, stAuthor and a padding byte.
+    fn note(rw: u16, col: u16, id: u16, author: &str) -> Vec<u8> {
+        let mut b = rw.to_le_bytes().to_vec();
+        b.extend(col.to_le_bytes());
+        b.extend(0u16.to_le_bytes());
+        b.extend(id.to_le_bytes());
+        b.extend((author.len() as u16).to_le_bytes());
+        b.push(0);
+        b.extend(author.as_bytes());
+        b.push(0);
+        rec(0x001C, &b)
+    }
+
+    /// Notes become comments: NOTE's cell and author with the text of the
+    /// TXO after its OBJ. Notes alone name nothing; another object still
+    /// names "pictures, shapes and charts", and a note without its text
+    /// names "comments".
+    #[test]
+    fn xls_notes_become_comments() {
+        let mut sheet = vec![number(0, 0, 1.0)];
+        sheet.extend(note_object(1, "Ann:\nhi ", "wörld"));
+        sheet.extend(note_object(2, "two", ""));
+        sheet.push(note(1, 2, 1, "Ann"));
+        sheet.push(note(4, 0, 2, "Bob"));
+        let book = read(&workbook(&[], &sheet)).unwrap();
+        assert_eq!(
+            book.sheets[0].comments,
+            [
+                (1, 2, "Ann".to_string(), "Ann:\nhi wörld".to_string()),
+                (4, 0, "Bob".to_string(), "two".to_string()),
+            ]
+        );
+        assert!(book.dropped.is_empty(), "{:?}", book.dropped);
+
+        // A picture (ot 8), and a NOTE naming no object read.
+        sheet.extend([rec(0x00EC, &[0; 8]), obj(8, 3), note(5, 5, 9, "Cy")]);
+        let book = read(&workbook(&[], &sheet)).unwrap();
+        assert_eq!(book.sheets[0].comments.len(), 2);
+        assert_eq!(
+            book.dropped.iter().copied().collect::<Vec<_>>(),
+            ["comments", "pictures, shapes and charts"]
+        );
+    }
+
+    /// The `.xls` of [`round_trip_xls`]: a note (later slices add to it).
+    fn feature_xls() -> Vec<u8> {
+        let mut sheet = vec![number(0, 0, 1.0)];
+        sheet.extend(note_object(1, "a note", ""));
+        sheet.push(note(0, 1, 1, "Ann"));
+        let stream = workbook(&[], &sheet);
+        opccore::cfb::write_cfb_tree(&[opccore::cfb::Node::Stream("Workbook", stream)])
+    }
+
+    /// Opened, saved as `.xlsx` and reloaded, an `.xls` keeps what the
+    /// import read (#884: notes, validation and conditional formats were
+    /// lost on save).
+    #[test]
+    fn round_trip_xls() {
+        let opened = crate::legacy::open_workbook_ex(&feature_xls()).unwrap();
+        assert!(opened.dropped.is_empty(), "{:?}", opened.dropped);
+        let back = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&opened.pkg)).unwrap();
+        let notes: Vec<_> = back
+            .comments()
+            .into_iter()
+            .map(|c| (c.row, c.col, c.author, c.text))
+            .collect();
+        assert_eq!(notes, [(0, 1, "Ann".to_string(), "a note".to_string())]);
     }
 }
