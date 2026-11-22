@@ -54,8 +54,8 @@
 use crate::auth::{self, AuthConfig, Cloud, TokenSet};
 use crate::graph::client::{
     BATCH_MAX, BatchRequest, CalendarDeltaCursor, ContactFieldSet, DeltaCursor, EventInput,
-    GraphClient, GraphError, RsvpKind, TypeTier, UserIds, automatic_replies_body, event_body_json,
-    event_zone_error, is_expired_sync_state, moved_message_id, rsvp_proposal,
+    GraphClient, GraphError, RsvpKind, ServerClock, TypeTier, UserIds, automatic_replies_body,
+    event_body_json, event_zone_error, is_expired_sync_state, moved_message_id, rsvp_proposal,
 };
 pub use crate::graph::model::BodyFormat;
 /// The answer a [`SyncEvent::DraftReady`] draft was made as (#2085); it
@@ -840,7 +840,9 @@ pub enum SyncCommand {
     /// queued ([`SyncEvent::MessagesUpdated`], then
     /// [`SyncEvent::FoldersUpdated`]). Then the engine pages the ids of the
     /// unread messages Graph holds there, received at or before the
-    /// command (mail that comes later is not marked), and PATCHes them
+    /// command's cutoff (the later of Graph's clock at the command, as last
+    /// read off its `Date`, #2121, and the newest stored message: mail that
+    /// comes later is not marked), and PATCHes them
     /// read through `POST /$batch`, 20 a batch, waiting out a throttled
     /// one's `Retry-After`. Until it is done a pass keeps the folder's
     /// stored count and stores that mail read. A refusal is
@@ -871,9 +873,10 @@ pub enum SyncCommand {
     /// ([`SyncEvent::MessagesUpdated`], then [`SyncEvent::FoldersUpdated`]).
     /// Then, once no older op is queued, the engine pages every message
     /// Graph holds there, received at or before the command's cutoff (the
-    /// later of this client's clock and the newest stored message: with a
-    /// clock ahead of Graph's, mail delivered up to that skew after the
-    /// command is deleted too; later mail stays). It keeps each one the
+    /// later of Graph's clock at the command, as last read off its `Date`,
+    /// #2121, and the newest stored message: once an answer was measured
+    /// this run, mail Graph receives later stays, however far ahead this
+    /// client's clock runs). It keeps each one the
     /// store shows elsewhere (a move out still unsent or refused, a lost
     /// move answer), and leaves alone the unsent mail still held in the
     /// folder and mail moved into it since; an emptied message stored
@@ -896,8 +899,8 @@ pub enum SyncCommand {
     /// `dest` its Deleted Items. The op is queued at once (nothing in the
     /// store moves yet); then, once no older op is queued, the engine pages
     /// every message Graph holds in the folder received at or before the
-    /// command's cutoff (the later of this client's clock and the newest
-    /// stored message), all of them before the first move, and sends
+    /// command's cutoff (the later of Graph's clock at the command, #2121,
+    /// and the newest stored message), all of them before the first move, and sends
     /// `POST /me/messages/{id}/move` through `POST /$batch`, 20 a batch,
     /// waiting out a throttled one's `Retry-After`. Unsent mail Graph lists
     /// there (a draft with an unpushed edit, or one a queued save or send
@@ -2655,6 +2658,17 @@ struct Engine {
     /// (`enter_signin`: the next account may be another tenant's) and for
     /// another mailbox (`reset_for_new_mailbox`).
     user_ids: UserIds,
+    /// Graph's clock as last read off a 2xx answer's `Date` (#2121), shared
+    /// by every client `client()` builds: the clock a folder-wide op's
+    /// cutoff is taken on (`graph_now_utc`). Seeded at start from the
+    /// store's `graph_clock_offset`; never cleared, as any Microsoft
+    /// clock's offset beats none and the next answer measures again.
+    server_clock: ServerClock,
+    /// The offset last kept in the store (`graph_clock_offset`), so a pass
+    /// writes it only when it changed (`persist_graph_clock`); `None` after
+    /// a mailbox reset, which deletes the row, so the next pass writes it
+    /// again.
+    clock_persisted: Option<i64>,
     /// Removed stored masters whose failed refetch (an HTTP or parse error)
     /// already left their calendar out of a pass (#2064 r2,
     /// `fetch_missing_masters`): the next failure writes the round. An id
@@ -2728,8 +2742,16 @@ struct Engine {
     /// op, #2127): the main loop runs them before it reads the channel
     /// again or does any idle work. A served kind (`served_at_checkpoint`)
     /// waits here only until the next `checkpoint`, which serves it.
-    /// At shutdown only the ones `persists_at_shutdown` keeps run.
-    deferred: VecDeque<SyncCommand>,
+    /// At shutdown only the ones `persists_at_shutdown` keeps run. Each
+    /// is kept with Graph's clock when it was taken (Unix seconds,
+    /// `ServerClock::now_secs`, #2121 r1): a folder-wide op that waited
+    /// behind a pass or a drain takes its cutoff from then, not from when
+    /// it runs. That bounds the clock part of the cutoff only. Mail the
+    /// pass stores in the folder before the op runs is still taken: by the
+    /// newest-stored max (`folder_cutoff_on`) and by the store's
+    /// whole-folder write (a known shape: bounding those by the take time
+    /// would need its own design).
+    deferred: VecDeque<(SyncCommand, i64)>,
     /// The `MarkFolderRead` op being run (#1913; an `EmptyFolder` or
     /// `MoveFolderMessages` too, #2110, #2126): the ids still to mark,
     /// kept across drains (a throttle, a 5xx, a checkpoint stop), so a run
@@ -2864,6 +2886,13 @@ impl Engine {
         // A sign-in whose mailbox check never finished (#1946); a store that
         // cannot say counts as owed.
         let mailbox_unchecked = store.mailbox_check_owed().unwrap_or(true);
+        // Graph's clock as an earlier run last saw it (#2121), for a
+        // folder-wide op issued before any answer comes.
+        let server_clock = ServerClock::default();
+        let clock_persisted = store.graph_clock_offset().ok().flatten();
+        if let Some(offset) = clock_persisted {
+            server_clock.seed(offset);
+        }
         Engine {
             store,
             token: None,
@@ -2879,6 +2908,8 @@ impl Engine {
             calendar_reset_owed: false,
             masters_not_found: HashSet::new(),
             user_ids: UserIds::default(),
+            server_clock,
+            clock_persisted,
             masters_skipped: HashSet::new(),
             parked: Vec::new(),
             expired: Vec::new(),
@@ -3097,11 +3128,11 @@ impl Engine {
         self.follow_saved_signin_backoff();
         self.next_tick = Instant::now() + self.config.tick;
         loop {
-            if let Some(cmd) = self.deferred.pop_front() {
+            if let Some((cmd, taken)) = self.deferred.pop_front() {
                 if self.shutting_down && !persists_at_shutdown(&cmd) {
                     continue;
                 }
-                self.handle_command(cmd);
+                self.handle_command_at(cmd, Some(taken));
                 // Without a fast tick the wait restarts on every command.
                 self.next_tick = Instant::now() + self.config.tick;
                 continue;
@@ -3180,10 +3211,14 @@ impl Engine {
             if !self.take_waiting() {
                 return false;
             }
-            let Some(at) = self.deferred.iter().position(served_at_checkpoint) else {
+            let Some(at) = self
+                .deferred
+                .iter()
+                .position(|(cmd, _)| served_at_checkpoint(cmd))
+            else {
                 return carry_on;
             };
-            let served = match self.deferred.remove(at) {
+            let served = match self.deferred.remove(at).map(|(cmd, _)| cmd) {
                 Some(SyncCommand::FetchBody { id }) => self.fetch_body(&id),
                 Some(SyncCommand::SearchMessages {
                     query,
@@ -3215,7 +3250,7 @@ impl Engine {
     }
 
     /// Moves every command waiting on the channel into `deferred`, in order,
-    /// serving none (#2127). A `Shutdown` or a dropped handle sets
+    /// serving none (#2127), each with Graph's clock now (#2121 r1). A `Shutdown` or a dropped handle sets
     /// `shutting_down` and ends the take: commands sent after a `Shutdown`
     /// stay unread. Returns whether the work goes on (`false` once shutting
     /// down). A drain calls it before each op, so a `Shutdown` sent behind
@@ -3227,7 +3262,10 @@ impl Engine {
                 Ok(SyncCommand::Shutdown) | Err(TryRecvError::Disconnected) => {
                     self.shutting_down = true;
                 }
-                Ok(cmd) => self.deferred.push_back(cmd),
+                Ok(cmd) => {
+                    let taken = self.server_clock.now_secs();
+                    self.deferred.push_back((cmd, taken));
+                }
                 Err(TryRecvError::Empty) => return true,
             }
         }
@@ -3462,8 +3500,16 @@ impl Engine {
         }
     }
 
-    /// Dispatches one UI command.
+    /// Dispatches one UI command, received now.
     fn handle_command(&mut self, cmd: SyncCommand) {
+        self.handle_command_at(cmd, None);
+    }
+
+    /// Dispatches one UI command. `taken` is Graph's clock when it was
+    /// taken off the channel and kept (`deferred`, #2121 r1), `None` for
+    /// one handled as it is received: a folder-wide op's cutoff is taken
+    /// from it (`graph_now_utc`).
+    fn handle_command_at(&mut self, cmd: SyncCommand, taken: Option<i64>) {
         match cmd {
             SyncCommand::Refresh => {
                 // F9 resends a deferred op now; its back-off keeps growing
@@ -3825,7 +3871,7 @@ impl Engine {
             SyncCommand::MarkFolderRead { folder } => {
                 let r = self
                     .store
-                    .mark_folder_read(&folder, &unix_to_iso8601(now_unix()));
+                    .mark_folder_read(&folder, &self.graph_now_utc(taken));
                 // Its mail changed as well as its count.
                 if let Ok(FolderWriteResult::Written(id)) = &r {
                     self.emit(SyncEvent::MessagesUpdated {
@@ -3836,10 +3882,10 @@ impl Engine {
             }
             SyncCommand::DeleteFolder { id } => self.delete_folder(&id),
             SyncCommand::EmptyFolder { folder, subfolders } => {
-                self.empty_folder(&folder, subfolders)
+                self.empty_folder(&folder, subfolders, taken)
             }
             SyncCommand::MoveFolderMessages { folder, dest } => {
-                self.move_folder_messages(&folder, &dest)
+                self.move_folder_messages(&folder, &dest, taken)
             }
             // Handled in `main_loop` so the thread can actually return.
             SyncCommand::Shutdown => {}
@@ -3856,7 +3902,15 @@ impl Engine {
     /// order, each best-effort. Auth/throttle/transport
     /// failures abort the pass (state already set); per-folder 4xx/parse
     /// errors are surfaced and skipped so one folder can't sink the rest.
+    /// However it ends, the offset to Graph's clock its answers measured is
+    /// then kept (`persist_graph_clock`, #2121).
     fn sync_pass(&mut self, full: bool) {
+        self.run_sync_pass(full);
+        self.persist_graph_clock();
+    }
+
+    /// `sync_pass` without keeping the clock offset.
+    fn run_sync_pass(&mut self, full: bool) {
         if self.token.is_none() {
             return;
         }
@@ -6047,7 +6101,10 @@ impl Engine {
     /// takes the waiting commands first (`checkpoint`).
     fn calendar_reset_ready(&self) -> bool {
         self.calendar_reset_owed
-            && !self.deferred.iter().any(command_writes_event_locally)
+            && !self
+                .deferred
+                .iter()
+                .any(|(cmd, _)| command_writes_event_locally(cmd))
             && self
                 .store
                 .pending_ops()
@@ -7414,8 +7471,8 @@ impl Engine {
     /// `delete_folder` deletes it (each refused or not on its own), before
     /// the one drain (r1): the children leave the UI at once, and their
     /// `DeleteFolder`s, queued after the empty and waiting for it, survive
-    /// a restart.
-    fn empty_folder(&mut self, folder: &str, subfolders: bool) {
+    /// a restart. `taken`: as `handle_command_at`'s.
+    fn empty_folder(&mut self, folder: &str, subfolders: bool, taken: Option<i64>) {
         let children: Vec<String> = if subfolders {
             let parent = self
                 .store
@@ -7431,9 +7488,7 @@ impl Engine {
         } else {
             Vec::new()
         };
-        let r = self
-            .store
-            .empty_folder(folder, &unix_to_iso8601(now_unix()));
+        let r = self.store.empty_folder(folder, &self.graph_now_utc(taken));
         if let Ok(FolderWriteResult::Written(id)) = &r {
             self.emit(SyncEvent::MessagesUpdated {
                 folder_id: id.clone(),
@@ -7618,10 +7673,11 @@ impl Engine {
     /// (`Store::queue_folder_messages_move`; no row moves yet), then a
     /// drain. A store refusal is `FolderWriteFailed` + `Error`, then the
     /// command's `FolderMessagesMoved` with `Err` and nothing counted.
-    fn move_folder_messages(&mut self, folder: &str, dest: &str) {
+    /// `taken`: as `handle_command_at`'s.
+    fn move_folder_messages(&mut self, folder: &str, dest: &str, taken: Option<i64>) {
         let r = self
             .store
-            .queue_folder_messages_move(folder, dest, &unix_to_iso8601(now_unix()));
+            .queue_folder_messages_move(folder, dest, &self.graph_now_utc(taken));
         let error = match r {
             Ok(FolderWriteResult::Written(_)) => {
                 self.drain_queued();
@@ -9714,7 +9770,7 @@ impl Engine {
         if !self.take_waiting() {
             return;
         }
-        let held = waiting_event_holds(&self.deferred);
+        let held = waiting_event_holds(self.deferred.iter().map(|(cmd, _)| cmd));
         let stamp = self.range_stamp();
         if let Err(e) = self
             .store
@@ -10075,7 +10131,7 @@ impl Engine {
                         if !self.take_waiting() {
                             return false;
                         }
-                        let held = waiting_event_holds(&self.deferred);
+                        let held = waiting_event_holds(self.deferred.iter().map(|(cmd, _)| cmd));
                         let stamp = self.range_stamp();
                         if let Err(e) = self
                             .store
@@ -10111,7 +10167,7 @@ impl Engine {
         // A waiting edit's row stays (#2017): served from `deferred`, this
         // command may have an `UpdateEvent` behind it whose host write a
         // round already pruned.
-        let held = waiting_event_holds(&self.deferred);
+        let held = waiting_event_holds(self.deferred.iter().map(|(cmd, _)| cmd));
         let changed = match self.store.set_calendar_selection_holding(ids, &held) {
             Ok(changed) => changed,
             Err(e) => {
@@ -10199,7 +10255,39 @@ impl Engine {
             .as_ref()
             .map(|t| t.access_token.as_str())
             .unwrap_or("");
-        GraphClient::new(&self.config.graph_base, token).with_user_ids(self.user_ids.clone())
+        GraphClient::new(&self.config.graph_base, token)
+            .with_user_ids(self.user_ids.clone())
+            .with_server_clock(self.server_clock.clone())
+    }
+
+    /// Graph's clock now as `YYYY-MM-DDTHH:MM:SSZ` (#2121,
+    /// `ServerClock::now_secs`): this client's clock shifted by the offset
+    /// last read off Graph's `Date`. A reading taken in this run is never
+    /// ahead of Graph's clock. One seeded from the store is never later
+    /// than this client's clock (a forward step of the client clock
+    /// between runs shows until the first answer). With no reading, it is
+    /// this client's clock, as before #2121. The `now_utc` of a folder-wide
+    /// op's cutoff, taken when the engine took the command off the
+    /// channel: `taken` for one kept in `deferred` (#2121 r1), now for one
+    /// handled as it is received. Once an answer was measured this run,
+    /// mail Graph receives after the command stays outside the cutoff
+    /// whatever this client's clock says (the three cases above).
+    fn graph_now_utc(&self, taken: Option<i64>) -> String {
+        crate::store::unix_secs_to_iso8601(taken.unwrap_or_else(|| self.server_clock.now_secs()))
+    }
+
+    /// Keeps the latest offset to Graph's clock in the store (#2121) when it
+    /// differs from the one kept, so a restart that is offline still takes
+    /// a folder-wide op's cutoff on Graph's clock. Best-effort: a failed
+    /// write is tried again after the next pass.
+    fn persist_graph_clock(&mut self) {
+        let Some(offset) = self.server_clock.offset() else {
+            return;
+        };
+        if self.clock_persisted != Some(offset) && self.store.set_graph_clock_offset(offset).is_ok()
+        {
+            self.clock_persisted = Some(offset);
+        }
     }
 
     /// Refreshes the access token if it's missing or within the expiry skew.
@@ -10628,6 +10716,8 @@ impl Engine {
     /// makes the next deadline a full pass, which lists the new mailbox.
     fn reset_for_new_mailbox(&mut self, root: &str) -> Result<MailboxCheck, StoreError> {
         let dropped_ops = self.store.reset_mailbox(root)?;
+        // The reset deleted the kept offset (#2121): the pass writes it back.
+        self.clock_persisted = None;
         self.backfill_done = false;
         self.reconverge_pending = false;
         self.relist_after_drain = false;
@@ -44428,6 +44518,258 @@ mod tests {
                     assert!(row(&store, "PROJ").is_none());
                     stop(handle, dir);
                 }
+            }
+        }
+
+        /// A folder-wide op's cutoff on Graph's clock, not this client's
+        /// (#2121): `EmptyFolder`, `MarkFolderRead`, `MoveFolderMessages`.
+        mod graph_clock {
+            use super::*;
+
+            /// How far Graph's clock runs behind this client's.
+            const SKEW: i64 = 3600;
+            /// The listing `EmptyFolder` and `MoveFolderMessages` run on.
+            const BEFORE_LIST: &str =
+                "/me/mailFolders/INBOX/messages?$filter=receivedDateTime%20le%20";
+            /// The listing `MarkFolderRead` runs on.
+            const UNREAD_LIST: &str = "/me/mailFolders/INBOX/messages?$filter=isRead%20eq%20false";
+
+            fn wall() -> i64 {
+                i64::try_from(now_unix()).unwrap()
+            }
+
+            /// `routes` with every answer's `Date` `SKEW` behind this
+            /// client's clock (stamped now: the fake's clock stands still).
+            fn dated(routes: Vec<(Route, Option<usize>)>) -> Vec<(Route, Option<usize>)> {
+                let date = crate::graph::client::http_date(wall() - SKEW);
+                routes
+                    .into_iter()
+                    .map(|(mut r, n)| {
+                        r.headers.push(("Date".into(), date.clone()));
+                        (r, n)
+                    })
+                    .collect()
+            }
+
+            /// `first` ahead of a world with M1 in Inbox, whose op listings
+            /// answer 500, so a queued op stays queued.
+            fn routes(first: Vec<(Route, Option<usize>)>) -> Vec<(Route, Option<usize>)> {
+                let mut writes = first;
+                writes.push(write("GET", BEFORE_LIST, 500, "busy"));
+                writes.push(write("GET", UNREAD_LIST, 500, "busy"));
+                world(writes, TREE, &[("INBOX", "M1")])
+            }
+
+            /// An engine after a startup pass on a Graph `SKEW` behind.
+            fn skewed(
+                tag: &str,
+                first: Vec<(Route, Option<usize>)>,
+            ) -> (FakeServer, SyncHandle, Store, PathBuf) {
+                engine(tag, dated(routes(first)), None)
+            }
+
+            fn empty_inbox() -> SyncCommand {
+                SyncCommand::EmptyFolder {
+                    folder: "INBOX".into(),
+                    subfolders: false,
+                }
+            }
+
+            /// The one queued op's cutoff.
+            fn queued_before(store: &Store) -> String {
+                wait_queued(store, 1);
+                match &store.pending_ops().unwrap()[..] {
+                    [r] => match &r.op {
+                        OutboxOp::EmptyFolder { before, .. }
+                        | OutboxOp::MarkFolderRead { before, .. }
+                        | OutboxOp::MoveFolderMessages { before, .. } => before.clone(),
+                        other => panic!("{other:?}"),
+                    },
+                    other => panic!("{other:?}"),
+                }
+            }
+
+            /// `before` is Graph's clock now: never later, and at most a
+            /// minute earlier (the fake's `Date` was stamped when its
+            /// routes were built), so an hour before this client's.
+            fn assert_on_graphs_clock(before: &str) {
+                let secs = crate::store::iso8601_to_unix_secs(before).unwrap();
+                let graph_now = wall() - SKEW;
+                assert!(
+                    (graph_now - 60..=graph_now + 1).contains(&secs),
+                    "{before} vs Graph's {}",
+                    unix_to_iso8601(graph_now as u64)
+                );
+            }
+
+            /// Criterion 1: Inbox's stored mail is older than Graph's
+            /// clock, so the cutoff is Graph's clock at the command, and the
+            /// run lists up to it: mail Graph receives after the command
+            /// stays out, however far ahead this client's clock runs.
+            #[test]
+            fn empty_folder_cutoff_follows_graphs_clock_not_the_clients() {
+                let (srv, handle, store, dir) = skewed("clock-empty", vec![]);
+                send(&handle, empty_inbox());
+                let before = queued_before(&store);
+                assert_on_graphs_clock(&before);
+                assert!(wait_until(ENGINE_WAIT, || srv
+                    .requests()
+                    .iter()
+                    .any(|r| r.path.starts_with(BEFORE_LIST))));
+                let listing = srv
+                    .requests()
+                    .into_iter()
+                    .map(|r| r.path)
+                    .find(|p| p.starts_with(BEFORE_LIST))
+                    .unwrap();
+                assert!(
+                    listing.starts_with(&format!("{BEFORE_LIST}{before}&")),
+                    "{listing}"
+                );
+                stop(handle, dir);
+            }
+
+            /// Criterion 2: the other two folder-wide ops take the same
+            /// cutoff.
+            #[test]
+            fn mark_folder_read_and_move_folder_messages_cutoff_follow_graphs_clock() {
+                let commands = [
+                    (
+                        "clock-mark-read",
+                        SyncCommand::MarkFolderRead {
+                            folder: "INBOX".into(),
+                        },
+                    ),
+                    (
+                        "clock-move",
+                        SyncCommand::MoveFolderMessages {
+                            folder: "INBOX".into(),
+                            dest: "ARCH".into(),
+                        },
+                    ),
+                ];
+                for (tag, cmd) in commands {
+                    let (_srv, handle, store, dir) = skewed(tag, vec![]);
+                    send(&handle, cmd);
+                    assert_on_graphs_clock(&queued_before(&store));
+                    stop(handle, dir);
+                }
+            }
+
+            /// Criterion 3: a stored message newer than Graph's clock (the
+            /// user saw it) still sets the cutoff, its fraction rounded up.
+            #[test]
+            fn a_stored_message_newer_than_graphs_clock_still_sets_the_cutoff() {
+                let seen = wall() - SKEW / 2;
+                let received = format!("{}.500Z", &unix_to_iso8601(seen as u64)[..19]);
+                let delta = "/me/mailFolders/INBOX/messages/delta";
+                let first = vec![once(
+                    "GET",
+                    delta,
+                    200,
+                    &delta_page(
+                        &[full_message_json("NEW", "NEW", &received)],
+                        &format!("{delta}?token=D-INBOX"),
+                    ),
+                )];
+                let (_srv, handle, store, dir) = skewed("clock-newest", first);
+                assert!(store.message_row("NEW").unwrap().is_some());
+                send(&handle, empty_inbox());
+                assert_eq!(queued_before(&store), unix_to_iso8601(seen as u64 + 1));
+                stop(handle, dir);
+            }
+
+            /// Criterion 4: a pass keeps the offset it measured, and the
+            /// next run takes its cutoff on the kept offset before any
+            /// answer measures again (its Graph sends no `Date` at all).
+            #[test]
+            fn graph_clock_offset_is_kept_and_seeds_the_next_run() {
+                let (_srv, handle, store, dir) = skewed("clock-kept", vec![]);
+                assert!(wait_until(ENGINE_WAIT, || store
+                    .graph_clock_offset()
+                    .unwrap()
+                    .is_some()));
+                let kept = store.graph_clock_offset().unwrap().unwrap();
+                assert!((SKEW..=SKEW + 60).contains(&kept), "{kept}");
+                stop(handle, dir);
+
+                let srv = FakeServer::start_limited(routes(vec![]));
+                let (handle, store_path, dir) = spawn_fast(&srv, "clock-seeded", HOUR, None, |s| {
+                    s.set_graph_clock_offset(SKEW).unwrap();
+                });
+                wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+                let store = Store::open(&store_path).unwrap();
+                send(&handle, empty_inbox());
+                assert_on_graphs_clock(&queued_before(&store));
+                assert_eq!(store.graph_clock_offset().unwrap(), Some(SKEW));
+                stop(handle, dir);
+            }
+
+            /// Criterion 4: a mailbox reset deletes the kept offset with the
+            /// rest of `meta`; the pass after it writes it back.
+            #[test]
+            fn a_mailbox_reset_has_the_next_pass_keep_the_offset_again() {
+                let (mut engine, _evt_rx, _cmd_tx) = offline_session();
+                engine.server_clock.seed(SKEW);
+                engine.persist_graph_clock();
+                assert_eq!(engine.store.graph_clock_offset().unwrap(), Some(SKEW));
+                engine.reset_for_new_mailbox("ROOT_B").unwrap();
+                assert_eq!(engine.store.graph_clock_offset().unwrap(), None);
+                // Offline (nothing listens on its Graph base): the pass
+                // fails, and still keeps the offset.
+                engine.sync_pass(false);
+                assert_eq!(engine.store.graph_clock_offset().unwrap(), Some(SKEW));
+            }
+
+            /// r1 P1: a command that waits behind a pass takes its cutoff
+            /// when the engine took it off the channel (the pass's first
+            /// checkpoint), not when the pass let it run: mail delivered
+            /// while the pass went on is not the command's. Each folder's
+            /// first delta takes 1.5 s, so the startup pass runs past 7 s
+            /// after the command (no `Date`: the client clock).
+            #[test]
+            fn a_command_waiting_behind_a_pass_keeps_the_cutoff_it_was_taken_at() {
+                let pace = Duration::from_millis(1500);
+                let paced = routes(vec![])
+                    .into_iter()
+                    .map(|(r, n)| {
+                        let d = if r.path_prefix.ends_with("/messages/delta") {
+                            pace
+                        } else {
+                            Duration::ZERO
+                        };
+                        (r, n, d)
+                    })
+                    .collect();
+                let srv = FakeServer::start_paced(paced);
+                let (handle, store_path, dir) = spawn_fast(&srv, "clock-taken", HOUR, None, |_| {});
+                let sent = wall();
+                send(&handle, empty_inbox());
+                let store = Store::open(&store_path).unwrap();
+                let before = queued_before(&store);
+                let handled = wall();
+                let secs = crate::store::iso8601_to_unix_secs(&before).unwrap();
+                assert!(handled >= sent + 6, "the pass held it: {sent} .. {handled}");
+                assert!(
+                    (sent..=sent + 2).contains(&secs),
+                    "{before}: sent at {}, handled at {}",
+                    unix_to_iso8601(sent as u64),
+                    unix_to_iso8601(handled as u64)
+                );
+                stop(handle, dir);
+            }
+
+            /// Criterion 5: no `Date` ever seen, the cutoff is this
+            /// client's clock, as before #2121, and nothing is kept.
+            #[test]
+            fn with_no_date_seen_the_cutoff_is_the_clients_clock() {
+                let (_srv, handle, store, dir) = engine("clock-none", routes(vec![]), None);
+                send(&handle, empty_inbox());
+                let before = queued_before(&store);
+                let secs = crate::store::iso8601_to_unix_secs(&before).unwrap();
+                assert!((wall() - 60..=wall()).contains(&secs), "{before}");
+                assert_eq!(store.graph_clock_offset().unwrap(), None);
+                stop(handle, dir);
             }
         }
 

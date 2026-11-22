@@ -614,7 +614,7 @@ pub enum OutboxOp {
         prev_parent: Option<String>,
     },
     /// Mark every unread message Graph holds in `folder` received at or
-    /// before `before` (ISO-8601 UTC, fixed at the command) read (#1913,
+    /// before `before` (ISO-8601 UTC, fixed at the command on Graph's clock, #2121) read (#1913,
     /// `Store::mark_folder_read`). Run by the engine, not `apply_op`: it
     /// pages the ids and PATCHes them through `$batch`. A `local:` id never
     /// re-keyed sends nothing.
@@ -634,7 +634,7 @@ pub enum OutboxOp {
         batch: String,
     },
     /// Delete every message Graph holds in `folder` received at or before
-    /// `before` (ISO-8601 UTC, fixed at the command) through `$batch`
+    /// `before` (ISO-8601 UTC, fixed at the command on Graph's clock, #2121) through `$batch`
     /// (#2110, `Store::empty_folder`), each checked first against the
     /// command's allow-list `batch` (`folder_delete_allow`, as #2107's
     /// walk): a message the store shows elsewhere is kept. Run by the
@@ -662,7 +662,7 @@ pub enum OutboxOp {
         dest: Option<String>,
     },
     /// Move every message Graph holds in `folder` received at or before
-    /// `before` (ISO-8601 UTC, fixed at the command) to `dest` through
+    /// `before` (ISO-8601 UTC, fixed at the command on Graph's clock, #2121) to `dest` through
     /// `$batch` (#2126, `Store::queue_folder_messages_move`): a host's
     /// Delete All, with `dest` its Deleted Items. Run by the engine, not
     /// `apply_op`; sent only once no older op is queued. No stored row
@@ -3423,6 +3423,33 @@ impl Store {
         )?;
         tx.execute("DELETE FROM meta WHERE key = 'mailbox_check_owed'", [])?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// The offset between this client's clock and Graph's kept from the
+    /// last run (#2121, `meta.graph_clock_offset`, seconds, the client's
+    /// clock minus Graph's), or `None` when none was kept (a fresh store,
+    /// or one a mailbox reset cleared). A value that is not a whole number
+    /// counts as none.
+    pub fn graph_clock_offset(&self) -> Result<Option<i64>, StoreError> {
+        let v: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'graph_clock_offset'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.and_then(|v| v.parse().ok()))
+    }
+
+    /// Keeps `offset` as [`Store::graph_clock_offset`] (#2121).
+    pub fn set_graph_clock_offset(&self, offset: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('graph_clock_offset', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![offset.to_string()],
+        )?;
         Ok(())
     }
 
@@ -7683,11 +7710,12 @@ impl Store {
     /// Marks every stored message of `folder` read, zeroes its
     /// `unread_count` and queues its `MarkFolderRead` (#1913), in one
     /// IMMEDIATE transaction: all or nothing. The op's `before` is the
-    /// later of `now_utc` and the newest stored `received_at` in the folder
-    /// (a fractional second rounded up to the next whole one, so Graph's
-    /// `receivedDateTime le` still takes that message), so a client clock
-    /// behind Graph's still covers the mail the user saw, and every stored
-    /// row is at or before it.
+    /// later of `now_utc` (Graph's clock at the command, the engine's
+    /// `graph_now_utc`, #2121) and the newest stored `received_at` in the
+    /// folder (a fractional second rounded up to the next whole one, so
+    /// Graph's `receivedDateTime le` still takes that message), so a clock
+    /// estimate behind Graph's still covers the mail the user saw, and
+    /// every stored row is at or before it.
     /// Every command queues its own op: a `MarkRead` to unread queued
     /// between two of them must not win. Refused: an unknown folder and the
     /// drafts sentinel.
@@ -9026,10 +9054,11 @@ fn rekey_folder_on(
 }
 
 /// The cutoff of a folder-wide op (#1913, #2110): the later of `now_utc`
-/// and the newest stored `received_at` in `folder`, a fractional second
-/// rounded up (`ceil_to_whole_second`), so Graph's `receivedDateTime le`
-/// still takes every stored message even when the client clock is behind
-/// Graph's.
+/// (Graph's clock at the command as the engine estimates it,
+/// `Engine::graph_now_utc`, #2121) and the newest stored `received_at` in `folder`, a
+/// fractional second rounded up (`ceil_to_whole_second`), so Graph's
+/// `receivedDateTime le` still takes every stored message even when the
+/// estimate is behind Graph's clock.
 fn folder_cutoff_on(conn: &Connection, folder: &str, now_utc: &str) -> Result<String, StoreError> {
     let newest: Option<String> = conn.query_row(
         "SELECT MAX(received_at) FROM messages WHERE folder_id = ?1 AND received_at <> ''",
@@ -30188,6 +30217,27 @@ mod mailbox_reset_tests {
             .unwrap()
             .collect::<Result<Vec<String>, _>>()
             .unwrap()
+    }
+
+    #[test]
+    fn graph_clock_offset_round_trips_in_meta() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.graph_clock_offset().unwrap(), None);
+        s.set_graph_clock_offset(3601).unwrap();
+        assert_eq!(s.graph_clock_offset().unwrap(), Some(3601));
+        s.set_graph_clock_offset(-42).unwrap();
+        assert_eq!(s.graph_clock_offset().unwrap(), Some(-42));
+        // Another mailbox's sign-in clears it with the rest of `meta`.
+        s.reset_mailbox("ROOT_B").unwrap();
+        assert_eq!(s.graph_clock_offset().unwrap(), None);
+        // A value that is not a whole number counts as none.
+        s.conn
+            .execute(
+                "INSERT INTO meta (key, value) VALUES ('graph_clock_offset', 'x')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(s.graph_clock_offset().unwrap(), None);
     }
 
     #[test]
