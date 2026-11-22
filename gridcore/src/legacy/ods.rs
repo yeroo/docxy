@@ -1013,6 +1013,220 @@ fn copy_bytes(cell: &Cell) -> usize {
     1 + text + cell.formula.as_ref().map_or(0, String::len)
 }
 
+// ---------------------------------------------------------------------------
+// Conditions (data validation, conditional formatting)
+// ---------------------------------------------------------------------------
+
+/// `s` split at each top-level `sep` (outside quotes, brackets and
+/// parentheses).
+fn split_top<'a>(s: &'a str, sep: &str) -> Vec<&'a str> {
+    let (mut out, mut start, mut depth, mut quoted) = (Vec::new(), 0, 0i32, false);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => quoted = !quoted,
+            b'(' | b'[' | b'{' if !quoted => depth += 1,
+            b')' | b']' | b'}' if !quoted => depth -= 1,
+            _ if !quoted && depth == 0 && s[i..].starts_with(sep) => {
+                out.push(&s[start..i]);
+                i += sep.len();
+                start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// The arguments of `term` when it is a call of `name`, split at its
+/// top-level `;`.
+fn call_args<'a>(term: &'a str, name: &str) -> Option<Vec<&'a str>> {
+    let inner = term.trim().strip_prefix(name)?.trim_start();
+    let inner = inner.strip_prefix('(')?.strip_suffix(')')?;
+    Some(split_top(inner, ";").into_iter().map(str::trim).collect())
+}
+
+/// A comparison's operator and the operand after it (`>=5` →
+/// greaterThanOrEqual, `5`).
+fn comparison(rest: &str) -> Option<(&'static str, &str)> {
+    let rest = rest.trim_start();
+    for (sym, op) in [
+        ("<=", "lessThanOrEqual"),
+        (">=", "greaterThanOrEqual"),
+        ("!=", "notEqual"),
+        ("<>", "notEqual"),
+        ("=", "equal"),
+        ("<", "lessThan"),
+        (">", "greaterThan"),
+    ] {
+        if let Some(v) = rest.strip_prefix(sym) {
+            return Some((op, v.trim()));
+        }
+    }
+    None
+}
+
+/// An ODF expression operand in Excel's syntax.
+fn operand(f: &str) -> Option<String> {
+    convert_formula(f.trim())
+}
+
+/// A condition as the model holds it: (kind, operator, formula1, formula2)
+/// in Excel's syntax, relative to the base cell. `kind` is a validation's
+/// (`whole`, `list`, `custom`, ...; `""` when the condition names none),
+/// or for a conditional format `cellIs` and `expression` (with
+/// `formula1` its formula).
+type Condition = (String, String, String, String);
+
+/// A validation's `table:condition` (`of:cell-content-is-whole-number()
+/// and cell-content-is-between(1;10)`, `cell-content-is-in-list("a";"b")`,
+/// `is-true-formula([.A1]>0)`, ...). `None` for one this doesn't read.
+fn validation_condition(cond: &str) -> Option<Condition> {
+    let body = match cond.split_once(':') {
+        Some((ns, rest)) if ns.bytes().all(|b| b.is_ascii_alphabetic()) => rest,
+        _ => cond,
+    };
+    let (mut kind, mut op, mut f1, mut f2) = (String::new(), String::new(), None, None);
+    for term in split_top(body, " and ") {
+        let term = term.trim();
+        let numeric = [
+            ("cell-content-is-whole-number()", "whole"),
+            ("cell-content-is-decimal-number()", "decimal"),
+            ("cell-content-is-date()", "date"),
+            ("cell-content-is-time()", "time"),
+        ];
+        if let Some((_, k)) = numeric.iter().find(|(t, _)| *t == term) {
+            kind = k.to_string();
+            continue;
+        }
+        let between = [
+            ("cell-content-is-between", false, "between"),
+            ("cell-content-is-not-between", false, "notBetween"),
+            ("cell-content-text-length-is-between", true, "between"),
+            (
+                "cell-content-text-length-is-not-between",
+                true,
+                "notBetween",
+            ),
+        ];
+        if let Some((args, text, o)) = between
+            .iter()
+            .find_map(|&(n, t, o)| Some((call_args(term, n)?, t, o)))
+        {
+            let [a, b] = args.as_slice() else {
+                return None;
+            };
+            if text {
+                kind = "textLength".to_string();
+            }
+            op = o.to_string();
+            f1 = Some(operand(a)?);
+            f2 = Some(operand(b)?);
+            continue;
+        }
+        if let Some(rest) = term.strip_prefix("cell-content-text-length()") {
+            let (o, v) = comparison(rest)?;
+            kind = "textLength".to_string();
+            op = o.to_string();
+            f1 = Some(operand(v)?);
+            continue;
+        }
+        if let Some(rest) = term.strip_prefix("cell-content()") {
+            let (o, v) = comparison(rest)?;
+            op = o.to_string();
+            f1 = Some(operand(v)?);
+            continue;
+        }
+        if let Some(args) = call_args(term, "cell-content-is-in-list") {
+            kind = "list".to_string();
+            let items: Option<Vec<String>> = args
+                .iter()
+                .map(|a| {
+                    let inner = a.strip_prefix('"')?.strip_suffix('"')?;
+                    Some(inner.replace("\"\"", "\""))
+                })
+                .collect();
+            f1 = Some(match (items, args.as_slice()) {
+                // Constants: Excel's one string of items.
+                (Some(items), _) => format!("\"{}\"", items.join(",").replace('"', "\"\"")),
+                (None, [one]) => operand(one)?,
+                _ => return None,
+            });
+            continue;
+        }
+        if let Some(args) = call_args(term, "is-true-formula") {
+            let [f] = args.as_slice() else {
+                return None;
+            };
+            kind = "custom".to_string();
+            f1 = Some(operand(f)?);
+            continue;
+        }
+        return None;
+    }
+    if kind.is_empty() && f1.is_some() {
+        kind = "decimal".to_string();
+    }
+    if crate::validation::takes_operator(&kind) && op.is_empty() {
+        return None;
+    }
+    Some((kind, op, f1.unwrap_or_default(), f2.unwrap_or_default()))
+}
+
+/// An ODF cell address (`Sheet1.A1`, `$'My Sheet'.$B$2`) as (row, col).
+fn address_cell(s: &str) -> Option<(u32, u32)> {
+    let (_, cell) = split_address(s)?;
+    crate::sheet::parse_cell_name(&cell)
+}
+
+/// `f`, its relative references moved from being based at `base` to
+/// being based at `at` (an `.xlsx` bases them at the range's top-left).
+fn rebase(f: &str, base: Option<(u32, u32)>, at: (u32, u32)) -> Option<String> {
+    let Some(base) = base.filter(|&b| b != at && !f.is_empty()) else {
+        return Some(f.to_string());
+    };
+    let (dr, dc) = (
+        i64::from(at.0) - i64::from(base.0),
+        i64::from(at.1) - i64::from(base.1),
+    );
+    crate::formula::translate_formula(f, dr, dc)
+}
+
+/// A `table:content-validation` as read: its condition, base cell and
+/// the rule's flags and texts (its ranges come from the cells naming it).
+#[derive(Default)]
+struct ValidationIn {
+    condition: Option<Condition>,
+    base: Option<(u32, u32)>,
+    rule: crate::sheet::DataValidation,
+}
+
+/// Rectangles of cells, as row runs that grow down while the next row has
+/// the same columns: a repeated row or column adds one range.
+#[derive(Default)]
+struct Ranges {
+    rects: Vec<(u32, u32, u32, u32)>,
+    /// The rectangle a run (c1, c2) ending at row r2 may extend.
+    open: HashMap<(u32, u32), usize>,
+}
+
+impl Ranges {
+    fn add(&mut self, r1: u32, r2: u32, c1: u32, c2: u32) {
+        if let Some(&i) = self.open.get(&(c1, c2)) {
+            if self.rects[i].2.checked_add(1) == Some(r1) {
+                self.rects[i].2 = r2;
+                return;
+            }
+        }
+        self.rects.push((r1, c1, r2, c2));
+        self.open.insert((c1, c2), self.rects.len() - 1);
+    }
+}
+
 /// A table's column runs as read: (first column, count, width in points,
 /// hidden).
 type ColRun = (u32, u32, Option<f64>, bool);
@@ -1105,6 +1319,15 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
     let mut row_comments: Vec<(u32, String, String)> = Vec::new();
     // The annotation being read, and its depth in `stack`.
     let mut note: Option<(usize, NoteIn)> = None;
+    // Data validation (#884): the rules by name, the one being read, the
+    // message (help: false, error: true) whose paragraphs are being read,
+    // the current row's runs (first, end, rule) and, per rule in the
+    // order the table first names them, its cells.
+    let mut validations: HashMap<String, ValidationIn> = HashMap::new();
+    let mut validation: Option<(String, ValidationIn)> = None;
+    let mut message: Option<(bool, String, usize)> = None;
+    let mut row_rules: Vec<(u32, u32, String)> = Vec::new();
+    let mut rule_cells: Vec<(String, Ranges)> = Vec::new();
     let mut cell: Option<CellIn> = None;
     // Depth inside an annotation or a drawn shape, whose text is not the
     // cell's.
@@ -1127,6 +1350,7 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                         })?;
                         col_styles.clear();
                         col_runs.clear();
+                        rule_cells.clear();
                         next_col = 0;
                         row = 0;
                     }
@@ -1150,6 +1374,7 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                         row_cells.clear();
                         row_merges.clear();
                         row_comments.clear();
+                        row_rules.clear();
                         row_repeat = p
                             .attr("table:number-rows-repeated")
                             .parse()
@@ -1198,7 +1423,7 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                             n.text.push('\n');
                         }
                     }
-                    "text:p" if hidden == 0 => {
+                    "text:p" if hidden == 0 && message.is_none() => {
                         if let Some(c) = cell.as_mut() {
                             if c.paragraphs > 0 {
                                 c.text.push('\n');
@@ -1220,6 +1445,54 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                     "text:line-break" if hidden == 0 => {
                         if let Some(c) = cell.as_mut() {
                             c.text.push('\n');
+                        }
+                    }
+                    "table:content-validation" => {
+                        let mut rule = crate::sheet::DataValidation {
+                            allow_blank: p.attr("table:allow-empty-cell") != "false",
+                            show_dropdown: p.attr("table:display-list") != "none",
+                            ..crate::sheet::DataValidation::default()
+                        };
+                        let condition = validation_condition(&attr("table:condition"));
+                        if let Some((kind, op, ..)) = &condition {
+                            rule.kind = kind.clone();
+                            rule.operator = op.clone();
+                        }
+                        validation = Some((
+                            attr("table:name"),
+                            ValidationIn {
+                                condition,
+                                base: address_cell(&attr("table:base-cell-address")),
+                                rule,
+                            },
+                        ));
+                    }
+                    "table:help-message" | "table:error-message" => {
+                        if let Some((_, v)) = validation.as_mut() {
+                            let error = name == "table:error-message";
+                            let shown = p.attr("table:display") == "true";
+                            let title = attr("table:title");
+                            if error {
+                                v.rule.show_error = shown;
+                                v.rule.error_title = title;
+                                v.rule.error_style = match p.attr("table:message-type") {
+                                    "warning" => crate::sheet::AlertStyle::Warning,
+                                    "information" => crate::sheet::AlertStyle::Information,
+                                    _ => crate::sheet::AlertStyle::Stop,
+                                };
+                            } else {
+                                v.rule.show_input = shown;
+                                v.rule.prompt_title = title;
+                            }
+                            message = Some((error, String::new(), 0));
+                        }
+                    }
+                    "text:p" if message.is_some() => {
+                        if let Some((_, text, n)) = message.as_mut() {
+                            if *n > 0 {
+                                text.push('\n');
+                            }
+                            *n += 1;
                         }
                     }
                     "table:null-date" => {
@@ -1253,6 +1526,9 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                         XmlParser::append_decoded(p.text(), &mut n.text);
                     }
                 }
+                if let Some((_, text, _)) = message.as_mut() {
+                    XmlParser::append_decoded(p.text(), text);
+                }
                 if hidden == 0 && stack.iter().any(|e| e == "text:p") {
                     if let Some(c) = cell.as_mut() {
                         XmlParser::append_decoded(p.text(), &mut c.text);
@@ -1273,6 +1549,44 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                     "table:table" => {
                         if let Some(sheet) = book.sheets.last_mut() {
                             table_columns(&col_runs, sheet);
+                            for (name, cells) in rule_cells.drain(..) {
+                                let Some(v) = validations.get(&name) else {
+                                    continue;
+                                };
+                                let Some((_, _, f1, f2)) = &v.condition else {
+                                    continue;
+                                };
+                                let Some(&(r, c, ..)) = cells.rects.first() else {
+                                    continue;
+                                };
+                                let (Some(f1), Some(f2)) =
+                                    (rebase(f1, v.base, (r, c)), rebase(f2, v.base, (r, c)))
+                                else {
+                                    continue;
+                                };
+                                sheet.validations.push(crate::sheet::DataValidation {
+                                    ranges: cells.rects,
+                                    formula1: f1,
+                                    formula2: f2,
+                                    ..v.rule.clone()
+                                });
+                            }
+                        }
+                    }
+                    "table:content-validation" => {
+                        if let Some((name, v)) = validation.take() {
+                            validations.insert(name, v);
+                        }
+                    }
+                    "table:help-message" | "table:error-message" => {
+                        if let (Some((error, text, _)), Some((_, v))) =
+                            (message.take(), validation.as_mut())
+                        {
+                            if error {
+                                v.rule.error = text;
+                            } else {
+                                v.rule.prompt = (!text.is_empty()).then_some(text);
+                            }
                         }
                     }
                     "table:table-cell" | "table:covered-table-cell" => {
@@ -1360,6 +1674,13 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                         if (cs > 1 || rs > 1) && col < MAX_COLS {
                             row_merges.push((col, cs, rs));
                         }
+                        if let Some(rule) = c
+                            .attrs
+                            .get("table:content-validation-name")
+                            .filter(|n| !n.is_empty() && col < MAX_COLS)
+                        {
+                            row_rules.push((col, last, rule.clone()));
+                        }
                         // A repeated cell's comment is on its first copy
                         // only, as is a repeated row's: a copy of a note
                         // is not another note.
@@ -1415,6 +1736,20 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                                     let c2 = c.saturating_add(cs - 1).min(MAX_COLS - 1);
                                     sheet.merges.push((r, c, r2, c2));
                                 }
+                            }
+                        }
+                        // The cells naming a validation rule: one range per
+                        // run, however many rows repeat it.
+                        if row < MAX_ROWS {
+                            for (c1, c2, rule) in row_rules.drain(..) {
+                                let at = match rule_cells.iter().position(|(n, _)| *n == rule) {
+                                    Some(i) => i,
+                                    None => {
+                                        rule_cells.push((rule, Ranges::default()));
+                                        rule_cells.len() - 1
+                                    }
+                                };
+                                rule_cells[at].1.add(row, last - 1, c1, c2 - 1);
                             }
                         }
                         if let Some(sheet) = book.sheets.last_mut().filter(|_| row < MAX_ROWS) {
@@ -2090,7 +2425,7 @@ mod tests {
         assert_eq!(cells[&(5000, 0)].value, CellValue::Number(2.0));
     }
 
-    /// The content.xml of [`round_trip_ods`] (later slices add to it).
+    /// The content.xml of [`round_trip_ods`].
     fn feature_ods_content() -> String {
         styled_content(
             r#"<style:font-face style:name="Arial" svg:font-family="Arial"/>"#,
@@ -2099,11 +2434,12 @@ mod tests {
                  <style:text-properties fo:font-weight="bold" fo:font-style="italic" fo:color="#ff0000" fo:font-size="14pt" style:font-name="Arial"/></style:style>
                <style:style style:name="co1" style:family="table-column"><style:table-column-properties style:column-width="1.5875cm"/></style:style>
                <style:style style:name="co2" style:family="table-column"><style:table-column-properties style:column-width="1.5in"/></style:style>"##,
-            r#"<table:table table:name="S">
+            r#"<table:content-validations><table:content-validation table:name="v1" table:condition="of:is-true-formula([.A1]&gt;0)" table:base-cell-address="S.A1"/></table:content-validations>
+               <table:table table:name="S">
                  <table:table-column table:style-name="co1"/>
                  <table:table-column table:style-name="co2"/>
                  <table:table-column table:style-name="co1" table:number-columns-repeated="16382"/>
-                 <table:table-row><table:table-cell table:style-name="ce1" office:value-type="float" office:value="1"/></table:table-row>
+                 <table:table-row><table:table-cell table:style-name="ce1" office:value-type="float" office:value="1"/><table:table-cell table:content-validation-name="v1" table:number-columns-repeated="2"/></table:table-row>
                  <table:table-row><table:table-cell><office:annotation><dc:creator>Ann</dc:creator><text:p>a note</text:p></office:annotation></table:table-cell></table:table-row>
                  <table:table-row><table:table-cell table:number-columns-spanned="2" table:number-rows-spanned="2"/></table:table-row>
                </table:table>"#,
@@ -2146,6 +2482,14 @@ mod tests {
             .map(|c| (c.row, c.col, c.author, c.text))
             .collect();
         assert_eq!(notes, [(1, 0, "Ann".to_string(), "a note".to_string())]);
+        let v = &s.validations;
+        assert_eq!(v.len(), 1);
+        // Based at A1, `[.A1]` is the cell itself: B1 at the range's top.
+        assert_eq!(
+            (v[0].kind.as_str(), v[0].formula1.as_str()),
+            ("custom", "B1>0")
+        );
+        assert_eq!(v[0].ranges, [(0, 1, 0, 2)]);
     }
 
     /// An annotation is its cell's comment: `dc:creator` the author, each
@@ -2180,5 +2524,116 @@ mod tests {
                 (1, 0, "Bob".to_string(), "padding".to_string()),
             ]
         );
+    }
+
+    /// The content validations of [`ods_content_validations`].
+    const VALIDATIONS: &str = r#"<table:content-validations>
+        <table:content-validation table:name="val1" table:condition="of:cell-content-is-whole-number() and cell-content-is-between(1;10)" table:allow-empty-cell="true" table:base-cell-address="S.B2">
+          <table:help-message table:title="Number" table:display="true"><text:p>Enter</text:p><text:p>1-10</text:p></table:help-message>
+          <table:error-message table:message-type="warning" table:title="Oops" table:display="true"><text:p>Out of range</text:p></table:error-message>
+        </table:content-validation>
+        <table:content-validation table:name="val2" table:condition="of:cell-content-is-in-list(&quot;a&quot;;&quot;b c&quot;)" table:allow-empty-cell="false" table:display-list="none" table:base-cell-address="S.A1"/>
+        <table:content-validation table:name="val3" table:condition="of:is-true-formula([.A1]&gt;0)" table:base-cell-address="S.C2"/>
+        <table:content-validation table:name="val4" table:condition="of:cell-content-is-decimal-number() and cell-content()&gt;=[.$Z$1]" table:base-cell-address="S.D1"/>
+        <table:content-validation table:name="val5" table:condition="of:cell-content-text-length()&lt;=5" table:base-cell-address="S.E1"/>
+        <table:content-validation table:name="val6" table:condition="of:cell-content-is-in-list([.$Y$1:.$Y$3])" table:base-cell-address="S.F1"/>
+        <table:content-validation table:name="bad" table:condition="of:something-odd()" table:base-cell-address="S.A1"/>
+      </table:content-validations>"#;
+
+    /// The table of [`ods_content_validations`]: val1 on B2:B5 (a repeated
+    /// row), val2 on A1:C1 (a repeated cell), val3 on C3:C4, val4 on D1,
+    /// val5 on E1:E1048576 (padding), val6 on F1 and `bad` on G1.
+    const VALIDATED: &str = r#"<table:table table:name="S">
+        <table:table-row><table:table-cell table:content-validation-name="val2" table:number-columns-repeated="3"/><table:table-cell table:content-validation-name="val4"/><table:table-cell table:content-validation-name="val5"/><table:table-cell table:content-validation-name="val6"/><table:table-cell table:content-validation-name="bad"/></table:table-row>
+        <table:table-row><table:table-cell/><table:table-cell table:content-validation-name="val1" office:value-type="float" office:value="3"/></table:table-row>
+        <table:table-row table:number-rows-repeated="2"><table:table-cell/><table:table-cell table:content-validation-name="val1"/><table:table-cell table:content-validation-name="val3"/></table:table-row>
+        <table:table-row><table:table-cell/><table:table-cell table:content-validation-name="val1"/></table:table-row>
+        <table:table-row table:number-rows-repeated="1048571"><table:table-cell table:number-columns-repeated="4"/><table:table-cell table:content-validation-name="val5"/></table:table-row>
+      </table:table>"#;
+
+    /// Content validations are the sheet's rules over the cells that name
+    /// them, their formulas moved from the base cell to the range's
+    /// top-left; a condition this doesn't read is left out.
+    #[test]
+    fn ods_content_validations() {
+        use crate::sheet::AlertStyle;
+        let xml = styled_content("", "", &format!("{VALIDATIONS}{VALIDATED}"));
+        let b = read_styled("", &xml, Limits::default());
+        let v = &b.sheets[0].validations;
+        let got: Vec<_> = v
+            .iter()
+            .map(|d| {
+                (
+                    d.kind.as_str(),
+                    d.operator.as_str(),
+                    d.formula1.as_str(),
+                    d.formula2.as_str(),
+                    d.ranges.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("list", "", "\"a,b c\"", "", vec![(0, 0, 0, 2)]),
+                (
+                    "decimal",
+                    "greaterThanOrEqual",
+                    "$Z$1",
+                    "",
+                    vec![(0, 3, 0, 3)]
+                ),
+                (
+                    "textLength",
+                    "lessThanOrEqual",
+                    "5",
+                    "",
+                    vec![(0, 4, 0, 4), (5, 4, 1048575, 4)]
+                ),
+                ("list", "", "$Y$1:$Y$3", "", vec![(0, 5, 0, 5)]),
+                ("whole", "between", "1", "10", vec![(1, 1, 4, 1)]),
+                // Based at C2, A1 is the row above; at C3, A2.
+                ("custom", "", "A2>0", "", vec![(2, 2, 3, 2)]),
+            ]
+        );
+        let w = &v[4];
+        assert_eq!(
+            (w.prompt_title.as_str(), w.prompt.as_deref()),
+            ("Number", Some("Enter\n1-10"))
+        );
+        assert_eq!(
+            (w.error_title.as_str(), w.error.as_str()),
+            ("Oops", "Out of range")
+        );
+        assert!(w.show_input && w.show_error && w.allow_blank && w.show_dropdown);
+        assert_eq!(w.error_style, AlertStyle::Warning);
+        assert!(!v[0].allow_blank && !v[0].show_dropdown && !v[0].show_input);
+    }
+
+    #[test]
+    fn ods_validation_conditions() {
+        let c = |s: &str| validation_condition(s);
+        let row = |k: &str, o: &str, a: &str, b: &str| {
+            Some((k.to_string(), o.to_string(), a.to_string(), b.to_string()))
+        };
+        assert_eq!(
+            c("of:cell-content-is-date() and cell-content-is-not-between([.A1];[.A2])"),
+            row("date", "notBetween", "A1", "A2")
+        );
+        assert_eq!(
+            c("cell-content-text-length-is-between(1;5)"),
+            row("textLength", "between", "1", "5")
+        );
+        assert_eq!(
+            c("of:cell-content()!=3"),
+            row("decimal", "notEqual", "3", "")
+        );
+        assert_eq!(
+            c("of:is-true-formula(AND([.A1]>0;[.B1]<2))"),
+            row("custom", "", "AND(A1>0,B1<2)", "")
+        );
+        assert_eq!(c("of:cell-content-is-whole-number()"), None);
+        assert_eq!(c("of:cell-content-is-between(1)"), None);
+        assert_eq!(c(""), None);
     }
 }

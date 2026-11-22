@@ -531,6 +531,50 @@ const BRT_COL_INFO: u32 = 60;
 const BRT_MERGE_CELL: u32 = 176;
 /// BrtWsFmtInfo, [MS-XLSB] 2.4 (record id 485).
 const BRT_WS_FMT_INFO: u32 = 485;
+/// BrtDVal, [MS-XLSB] 2.4 (record id 64), inside BrtBeginDVals (573).
+const BRT_DVAL: u32 = 64;
+
+/// An UncheckedSqRfX: crfx, then each RfX (rwFirst, rwLast, colFirst,
+/// colLast), as (r1, c1, r2, c2); the ones off the grid left out.
+fn sqrfx(c: &mut Cur) -> Option<Vec<(u32, u32, u32, u32)>> {
+    let n = c.u32()?;
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let (r1, r2, c1, c2) = (c.u32()?, c.u32()?, c.u32()?, c.u32()?);
+        if r2 >= r1 && c2 >= c1 && on_grid(r2, c2) {
+            out.push((r1, c1, r2, c2));
+        }
+    }
+    Some(out)
+}
+
+/// BrtDVal: flags (as BIFF8's DV, [`super::dv_from_flags`]), sqrfx, then
+/// strErrorTitle, strError, strPromptTitle and strPrompt
+/// (XLNullableWideStrings), formula1 and formula2 (CellParsedFormulas,
+/// their relative references based at the first range's top-left).
+fn read_dval(c: &mut Cur, g: &Globals) -> Option<crate::sheet::DataValidation> {
+    let mut dv = super::dv_from_flags(c.u32()?);
+    dv.ranges = sqrfx(c)?;
+    dv.error_title = c.wide()?;
+    dv.error = c.wide()?;
+    dv.prompt_title = c.wide()?;
+    let prompt = c.wide()?;
+    dv.prompt = (!prompt.is_empty()).then_some(prompt);
+    let &(r, col, ..) = dv.ranges.first()?;
+    let formula = |c: &mut Cur| -> Option<String> {
+        let (rgce, extra) = c.formula()?;
+        if rgce.is_empty() {
+            return Some(String::new());
+        }
+        ptg::decompile(Biff::V12, rgce, extra, Base::Shared(r, col), g)
+    };
+    dv.formula1 = formula(c)?;
+    dv.formula2 = formula(c)?;
+    if dv.kind == "list" {
+        dv.formula1 = super::dv_list_formula(dv.formula1);
+    }
+    Some(dv)
+}
 
 /// A sheet part: its cells, column widths and merged cells (the name is
 /// the caller's).
@@ -654,6 +698,11 @@ fn read_sheet(
                             level,
                             collapsed,
                         });
+                    }
+                }
+                BRT_DVAL => {
+                    if let Some(dv) = read_dval(&mut c, g) {
+                        sheet.validations.push(dv);
                     }
                 }
                 // BrtMergeCell: an RfX (rwFirst, rwLast, colFirst,
@@ -1711,7 +1760,10 @@ mod tests {
                 rec(BRT_ROW_HDR, &0u32.to_le_bytes()),
                 real(0, 1, 1.0),
                 rec(BRT_MERGE_CELL, &merge),
-            ],
+            ]
+            .into_iter()
+            .chain(dv_records())
+            .collect::<Vec<_>>(),
             &[],
             [
                 vec![("xl/styles.bin".to_string(), styles)],
@@ -1746,6 +1798,20 @@ mod tests {
             .map(|c| (c.row, c.col, c.author, c.text))
             .collect();
         assert_eq!(notes, [(0, 1, "Ann".to_string(), "a note".to_string())]);
+        let got: Vec<_> = s
+            .validations
+            .iter()
+            .map(|d| (d.kind.as_str(), d.operator.as_str(), d.formula1.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("whole", "greaterThan", "5"),
+                ("list", "", "\"a,b,c\""),
+                ("custom", "", "A3>0"),
+                ("custom", "", "A3>0"),
+            ]
+        );
     }
 
     /// The sheet rels and comments part of a sheet with these comments:
@@ -1802,5 +1868,93 @@ mod tests {
                 (0, 0, "Ann".to_string(), "first".to_string()),
             ]
         );
+    }
+
+    /// BrtDVal: flags, sqrfx, the error title, error, prompt title and
+    /// prompt, formula1 and formula2.
+    fn dval(
+        flags: u32,
+        ranges: &[(u32, u32, u32, u32)],
+        texts: [&str; 4],
+        f1: &[u8],
+        f2: &[u8],
+    ) -> Vec<u8> {
+        let mut b = flags.to_le_bytes().to_vec();
+        b.extend((ranges.len() as u32).to_le_bytes());
+        for &(r1, r2, c1, c2) in ranges {
+            for n in [r1, r2, c1, c2] {
+                b.extend(n.to_le_bytes());
+            }
+        }
+        for t in texts {
+            b.extend(wide(t));
+        }
+        for f in [f1, f2] {
+            b.extend((f.len() as u32).to_le_bytes());
+            b.extend_from_slice(f);
+            b.extend(0u32.to_le_bytes());
+        }
+        rec(BRT_DVAL, &b)
+    }
+
+    fn dv_records() -> Vec<Vec<u8>> {
+        // =A3>0 on C3:C4: ptgRefN (0 rows, -2 columns) and ptgRef (A3).
+        let ref_n = [0x2C, 0, 0, 0, 0, 0xFE, 0xFF, 0x1E, 0, 0, 0x0D];
+        let ref_a = [0x24, 2, 0, 0, 0, 0, 0xC0, 0x1E, 0, 0, 0x0D];
+        let mut list = vec![0x17, 5, 0];
+        for u in "a\0b\0c".encode_utf16() {
+            list.extend(u.to_le_bytes());
+        }
+        vec![
+            rec(573, &[0; 18]),
+            dval(
+                1 | (2 << 4) | (1 << 8) | (1 << 18) | (1 << 19) | (4 << 20),
+                &[(1, 4, 1, 1)],
+                ["Oops", "Too small", "Number", "More than 5"],
+                &[0x1E, 5, 0],
+                &[],
+            ),
+            dval(3 | (1 << 9), &[(0, 2, 0, 0)], ["", "", "", ""], &list, &[]),
+            dval(7, &[(2, 3, 2, 2)], ["", "", "", ""], &ref_n, &[]),
+            dval(7, &[(2, 3, 4, 4)], ["", "", "", ""], &ref_a, &[]),
+            rec(574, &[]),
+        ]
+    }
+
+    /// BrtDVal records are the sheet's validation rules.
+    #[test]
+    fn xlsb_dv_rules() {
+        use crate::sheet::AlertStyle;
+        let mut sheet = vec![rec(BRT_ROW_HDR, &0u32.to_le_bytes()), real(0, 0, 1.0)];
+        sheet.extend(dv_records());
+        let book = open(&xlsb(&[], &sheet));
+        let v = &book.sheets[0].validations;
+        assert_eq!(v.len(), 4);
+        assert_eq!(
+            (v[0].kind.as_str(), v[0].operator.as_str()),
+            ("whole", "greaterThan")
+        );
+        assert_eq!((v[0].formula1.as_str(), v[0].formula2.as_str()), ("5", ""));
+        assert_eq!(v[0].ranges, [(1, 1, 4, 1)]);
+        assert_eq!(
+            (v[0].error_title.as_str(), v[0].error.as_str()),
+            ("Oops", "Too small")
+        );
+        assert_eq!(
+            (v[0].prompt_title.as_str(), v[0].prompt.as_deref()),
+            ("Number", Some("More than 5"))
+        );
+        assert_eq!(v[0].error_style, AlertStyle::Information);
+        assert!(v[0].allow_blank && v[0].show_input && v[0].show_error);
+        assert_eq!(
+            (v[1].kind.as_str(), v[1].formula1.as_str()),
+            ("list", "\"a,b,c\"")
+        );
+        assert!(!v[1].show_dropdown && v[1].prompt.is_none());
+        assert_eq!(
+            (v[2].kind.as_str(), v[2].formula1.as_str()),
+            ("custom", "A3>0")
+        );
+        assert_eq!(v[3].formula1, "A3>0");
     }
 }

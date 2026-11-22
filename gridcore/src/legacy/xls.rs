@@ -1469,9 +1469,20 @@ fn read_sheet(
                 0x01B0 | 0x01B1 | 0x0879 | 0x087A => {
                     book.dropped.insert("conditional formatting");
                 }
-                0x01B2 | 0x01BE => {
-                    book.dropped.insert("data validation");
-                }
+                // DV ([MS-XLS] 2.4.123): dwDvFlags, the prompt title,
+                // error title, prompt and error (XLUnicodeStrings, a lone
+                // NUL for none), formula1 and formula2 (DVParsedFormula:
+                // cce, unused, rgce) and the sqref (SqRefU: cref, then
+                // Ref8U rwFirst, rwLast, colFirst, colLast). The formulas'
+                // relative references are based at the first range's
+                // top-left. DVAL (0x01B2), the list's header, holds
+                // nothing to keep.
+                0x01BE => match read_dv(&mut c, g) {
+                    Some(dv) => sheet.validations.push(dv),
+                    None => {
+                        book.dropped.insert("data validation");
+                    }
+                },
                 super::hlink::HLINK_TOOLTIP => {
                     book.dropped.insert("hyperlink ScreenTips");
                 }
@@ -1582,6 +1593,48 @@ fn read_sheet(
         book.iterate = Some((calc_count.unwrap_or(100) as u32, delta.unwrap_or(0.001)));
     }
     Ok(sheet)
+}
+
+/// A DV record's rule (see the reader's arm for its layout); `None` when it
+/// doesn't read.
+fn read_dv(c: &mut Cur, g: &Globals) -> Option<crate::sheet::DataValidation> {
+    let mut dv = super::dv_from_flags(c.u32()?);
+    let text = |c: &mut Cur| -> Option<String> {
+        let s = c.xl_string()?;
+        Some(if s == "\0" { String::new() } else { s })
+    };
+    dv.prompt_title = text(c)?;
+    dv.error_title = text(c)?;
+    let prompt = text(c)?;
+    dv.prompt = (!prompt.is_empty()).then_some(prompt);
+    dv.error = text(c)?;
+    let formula = |c: &mut Cur| -> Option<Vec<u8>> {
+        let cce = c.u16()? as usize;
+        c.u16()?;
+        Some(c.take(cce)?.to_vec())
+    };
+    let (f1, f2) = (formula(c)?, formula(c)?);
+    let n = c.u16()?;
+    for _ in 0..n {
+        let (r1, r2, c1, c2) = (c.u16()?, c.u16()?, c.u16()?, c.u16()?);
+        let (r1, r2, c1, c2) = (r1 as u32, r2 as u32, c1 as u32, c2 as u32);
+        if r2 >= r1 && c2 >= c1 && on_grid(r2, c2) {
+            dv.ranges.push((r1, c1, r2, c2));
+        }
+    }
+    let &(r, col, ..) = dv.ranges.first()?;
+    let decompile = |rgce: &[u8]| -> Option<String> {
+        if rgce.is_empty() {
+            return Some(String::new());
+        }
+        ptg::decompile(Biff::V8, rgce, &[], Base::Shared(r, col), g)
+    };
+    dv.formula1 = decompile(&f1)?;
+    dv.formula2 = decompile(&f2)?;
+    if dv.kind == "list" {
+        dv.formula1 = super::dv_list_formula(dv.formula1);
+    }
+    Some(dv)
 }
 
 /// Whether a COLINFO width is the sheet's default: its STANDARDWIDTH, or
@@ -3636,6 +3689,7 @@ pub(crate) mod tests {
         let mut sheet = vec![number(0, 0, 1.0)];
         sheet.extend(note_object(1, "a note", ""));
         sheet.push(note(0, 1, 1, "Ann"));
+        sheet.extend(dv_sheet());
         let stream = workbook(&[], &sheet);
         opccore::cfb::write_cfb_tree(&[opccore::cfb::Node::Stream("Workbook", stream)])
     }
@@ -3654,5 +3708,139 @@ pub(crate) mod tests {
             .map(|c| (c.row, c.col, c.author, c.text))
             .collect();
         assert_eq!(notes, [(0, 1, "Ann".to_string(), "a note".to_string())]);
+        let v = &back.workbook.sheets[0].validations;
+        let got: Vec<_> = v
+            .iter()
+            .map(|d| (d.kind.as_str(), d.formula1.as_str(), d.ranges.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("whole", "1", vec![(1, 1, 4, 1), (0, 3, 0, 3)]),
+                ("list", "\"a,b,c\"", vec![(0, 0, 2, 0)]),
+                ("custom", "A3>0", vec![(2, 2, 3, 2)]),
+                ("custom", "A3>0", vec![(2, 4, 3, 4)]),
+            ]
+        );
+        assert_eq!(v[0].prompt.as_deref(), Some("Enter 1-10"));
+        assert!(v[0].show_error && !v[1].show_dropdown);
+    }
+
+    /// DV: dwDvFlags, the prompt title, error title, prompt and error (a
+    /// lone NUL for none, as Excel writes them), formula1 and formula2,
+    /// the ranges (r1, r2, c1, c2).
+    fn dv_rec(
+        flags: u32,
+        texts: [&str; 4],
+        f1: &[u8],
+        f2: &[u8],
+        ranges: &[(u16, u16, u16, u16)],
+    ) -> Vec<u8> {
+        let mut b = flags.to_le_bytes().to_vec();
+        for t in texts {
+            let t = if t.is_empty() { "\0" } else { t };
+            b.extend((t.len() as u16).to_le_bytes());
+            b.push(0);
+            b.extend(t.as_bytes());
+        }
+        for f in [f1, f2] {
+            b.extend((f.len() as u16).to_le_bytes());
+            b.extend([0, 0]);
+            b.extend_from_slice(f);
+        }
+        b.extend((ranges.len() as u16).to_le_bytes());
+        for &(r1, r2, c1, c2) in ranges {
+            for n in [r1, r2, c1, c2] {
+                b.extend(n.to_le_bytes());
+            }
+        }
+        rec(0x01BE, &b)
+    }
+
+    /// DVAL: the list's header.
+    fn dval_rec(count: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 14];
+        b.extend(count.to_le_bytes());
+        rec(0x01B2, &b)
+    }
+
+    /// The validation rules the import reads from a sheet's DVs.
+    fn dv_sheet() -> Vec<Vec<u8>> {
+        // =C3>0 on C3:C4, its reference relative: as ptgRefN (an offset of
+        // 0 rows, -2 columns from the top-left) and as ptgRef (A3 itself).
+        let ref_n = [0x2C, 0, 0, 0xFE, 0xC0, 0x1E, 0, 0, 0x0D];
+        let ref_a = [0x24, 2, 0, 0, 0xC0, 0x1E, 0, 0, 0x0D];
+        let mut list = vec![0x17, 5, 0];
+        list.extend(b"a\0b\0c");
+        vec![
+            dval_rec(4),
+            // whole between 1 and 10, warning style, allow blank, show
+            // input and error
+            dv_rec(
+                1 | (1 << 4) | (1 << 8) | (1 << 18) | (1 << 19),
+                ["Number", "Oops", "Enter 1-10", "Out of range"],
+                &[0x1E, 1, 0],
+                &[0x1E, 10, 0],
+                &[(1, 4, 1, 1), (0, 0, 3, 3)],
+            ),
+            // an explicit list, its dropdown hidden
+            dv_rec(
+                3 | (1 << 7) | (1 << 9),
+                ["", "", "", ""],
+                &list,
+                &[],
+                &[(0, 2, 0, 0)],
+            ),
+            dv_rec(7, ["", "", "", ""], &ref_n, &[], &[(2, 3, 2, 2)]),
+            dv_rec(7, ["", "", "", ""], &ref_a, &[], &[(2, 3, 4, 4)]),
+        ]
+    }
+
+    /// DV records are the sheet's validation rules: kind, operator, the
+    /// formulas based at the first range's top-left, texts and flags.
+    #[test]
+    fn xls_dv_rules() {
+        use crate::sheet::AlertStyle;
+        let book = read(&workbook(&[], &dv_sheet())).unwrap();
+        assert!(book.dropped.is_empty(), "{:?}", book.dropped);
+        let v = &book.sheets[0].validations;
+        assert_eq!(v.len(), 4);
+        assert_eq!(
+            (v[0].kind.as_str(), v[0].operator.as_str()),
+            ("whole", "between")
+        );
+        assert_eq!(
+            (v[0].formula1.as_str(), v[0].formula2.as_str()),
+            ("1", "10")
+        );
+        assert_eq!(v[0].ranges, [(1, 1, 4, 1), (0, 3, 0, 3)]);
+        assert_eq!(v[0].prompt.as_deref(), Some("Enter 1-10"));
+        assert_eq!(
+            (v[0].prompt_title.as_str(), v[0].error_title.as_str()),
+            ("Number", "Oops")
+        );
+        assert_eq!(v[0].error, "Out of range");
+        assert!(v[0].allow_blank && v[0].show_input && v[0].show_error && v[0].show_dropdown);
+        assert_eq!(v[0].error_style, AlertStyle::Warning);
+        assert_eq!(
+            (v[1].kind.as_str(), v[1].formula1.as_str()),
+            ("list", "\"a,b,c\"")
+        );
+        assert_eq!((v[1].operator.as_str(), v[1].show_dropdown), ("", false));
+        assert_eq!(v[1].prompt, None);
+        assert!(!v[1].allow_blank && !v[1].show_input && !v[1].show_error);
+        assert_eq!(
+            (v[2].kind.as_str(), v[2].formula1.as_str()),
+            ("custom", "A3>0")
+        );
+        assert_eq!(v[3].formula1, "A3>0");
+
+        // A DV cut short is named.
+        let book = read(&workbook(&[], &[rec(0x01BE, &[1, 0, 0])])).unwrap();
+        assert!(book.sheets[0].validations.is_empty());
+        assert_eq!(
+            book.dropped.iter().copied().collect::<Vec<_>>(),
+            ["data validation"]
+        );
     }
 }

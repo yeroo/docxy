@@ -348,6 +348,9 @@ pub(crate) struct SheetIn {
     pub outline: crate::sheet::OutlineSettings,
     /// Cell comments (#884): (row, col, author, text).
     pub comments: Vec<(u32, u32, String, String)>,
+    /// Data-validation rules (#884), their formulas in Excel's syntax
+    /// relative to their first range's top-left, as an `.xlsx` has them.
+    pub validations: Vec<crate::sheet::DataValidation>,
 }
 
 /// One column definition as a reader collects it.
@@ -571,6 +574,22 @@ impl BookIn {
                 s.cells.insert(key, cell);
             }
             s.merges = sheet.merges;
+            // Built in memory (`ix` and `orig` none), so a save appends
+            // them. One whose formula can't be kept is left out.
+            for mut dv in sheet.validations {
+                let mut kept = true;
+                for f in [&mut dv.formula1, &mut dv.formula2] {
+                    if !f.is_empty() {
+                        match fix(std::mem::take(f), false) {
+                            Some(g) => *f = g,
+                            None => kept = false,
+                        }
+                    }
+                }
+                if kept && !dv.ranges.is_empty() {
+                    s.validations.push(dv);
+                }
+            }
             for (rect, target) in sheet.hyperlinks {
                 for cell in crate::sheet::hyperlink_cells(rect) {
                     s.hyperlinks.insert(cell, target.clone());
@@ -1071,6 +1090,74 @@ pub(crate) fn format_code(codes: &HashMap<u16, String>, ifmt: u16) -> Option<Str
         .cloned()
         .or_else(|| builtin_format(ifmt as u32))
         .filter(|c| !c.eq_ignore_ascii_case("General"))
+}
+
+/// The rule kind of a data validation's `valType` (BIFF8 DV and BIFF12
+/// BrtDVal alike): `""` is Any value.
+pub(crate) fn dv_kind(val_type: u32) -> &'static str {
+    match val_type {
+        1 => "whole",
+        2 => "decimal",
+        3 => "list",
+        4 => "date",
+        5 => "time",
+        6 => "textLength",
+        7 => "custom",
+        _ => "",
+    }
+}
+
+/// The operator of a data validation's `typOperator`, for the kinds that
+/// compare (empty for the others).
+pub(crate) fn dv_operator(kind: &str, op: u32) -> String {
+    if !crate::validation::takes_operator(kind) {
+        return String::new();
+    }
+    match op {
+        1 => "notBetween",
+        2 => "equal",
+        3 => "notEqual",
+        4 => "greaterThan",
+        5 => "lessThan",
+        6 => "greaterThanOrEqual",
+        7 => "lessThanOrEqual",
+        _ => "between",
+    }
+    .to_string()
+}
+
+/// A data validation's flags word (BIFF8 DV's dwDvFlags, BIFF12 BrtDVal's
+/// flags; [MS-XLS] 2.4.123, [MS-XLSB] 2.4 BrtDVal): valType (bits 0-3),
+/// errStyle (4-6), fAllowBlank (8), fSuppressCombo (9), fShowInputMsg
+/// (18), fShowErrorMsg (19), typOperator (20-23). The rule they make,
+/// without its ranges, texts and formulas.
+pub(crate) fn dv_from_flags(flags: u32) -> crate::sheet::DataValidation {
+    use crate::sheet::AlertStyle;
+    let kind = dv_kind(flags & 0x0F);
+    crate::sheet::DataValidation {
+        kind: kind.to_string(),
+        operator: dv_operator(kind, (flags >> 20) & 0x0F),
+        error_style: match (flags >> 4) & 0x07 {
+            1 => AlertStyle::Warning,
+            2 => AlertStyle::Information,
+            _ => AlertStyle::Stop,
+        },
+        allow_blank: flags & (1 << 8) != 0,
+        show_dropdown: flags & (1 << 9) == 0,
+        show_input: flags & (1 << 18) != 0,
+        show_error: flags & (1 << 19) != 0,
+        ..crate::sheet::DataValidation::default()
+    }
+}
+
+/// A list rule's formula as decompiled: an explicit list is one string of
+/// items split by NULs (`"a\0b"`), which an `.xlsx` spells `"a,b"`.
+pub(crate) fn dv_list_formula(f: String) -> String {
+    if f.contains('\0') {
+        f.replace('\0', ",")
+    } else {
+        f
+    }
 }
 
 /// An RK number (BIFF8 and BIFF12): a 30-bit integer or the top of an
