@@ -709,7 +709,11 @@ pub enum OutboxOp {
     /// (`item` false; `dest` is the file) or `SaveItemAttachment` (`item`
     /// true; `dest` is the `dest_base`, the extension chosen by sniffing)
     /// kept at a `Shutdown`. The drain downloads it and the engine writes
-    /// the file. Nothing in the store changes.
+    /// the file. Nothing in the store changes. The write never replaces a
+    /// file: one at the path by then (made since, or there at a Save As
+    /// the user agreed to replace: the engine cannot tell which) is kept,
+    /// and the attachment goes to the first free `name (n).ext` beside it
+    /// (#2267).
     SaveAttachment {
         message_id: String,
         attachment_id: String,

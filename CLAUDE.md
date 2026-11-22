@@ -252,7 +252,8 @@ issue number to find its notes.
   sent (#2017),
   an edit during an event's in-flight create queued by its reconcile (#2005),
   lookxy's bounded wait for the engine at quit (#2131), a queued SaveDraft
-  or SendDraft following its draft's move (#2265).
+  or SendDraft following its draft's move (#2265), a save kept at a
+  shutdown never replacing a file made at its path (#2267).
 
 ## Build and test
 

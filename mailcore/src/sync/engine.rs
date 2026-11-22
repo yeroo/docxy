@@ -315,7 +315,12 @@ pub enum SyncCommand {
     /// One kept at a [`SyncCommand::Shutdown`] is queued as
     /// [`crate::store::OutboxOp::SaveAttachment`] and saved by the next
     /// start (#2132); a `dest` that is not UTF-8 then cannot be stored, and
-    /// is an `Error`.
+    /// is an `Error`. The live command replaces a file at `dest`; a kept one
+    /// never does: a file there by the time the next start writes it (made
+    /// since, or already there at a Save As the user agreed to replace,
+    /// which the engine cannot tell apart) is kept, the attachment goes to
+    /// the first free `name (1).ext`, `name (2).ext`, … beside it, and
+    /// `AttachmentSaved` names that path (#2267).
     SaveAttachment {
         message_id: String,
         attachment_id: String,
@@ -327,7 +332,9 @@ pub enum SyncCommand {
     /// `dest_base` is the Downloads path WITHOUT an extension (the UI can't
     /// know it until the bytes are sniffed). Emits [`SyncEvent::AttachmentSaved`]
     /// with the extended path, the same event `SaveAttachment` uses. Kept
-    /// at a `Shutdown`, it is queued as `SaveAttachment` is (#2132).
+    /// at a `Shutdown`, it is queued as `SaveAttachment` is (#2132), and
+    /// never replaces a file either: `{dest_base} (1).eml` beside an
+    /// existing `{dest_base}.eml` (#2267).
     SaveItemAttachment {
         message_id: String,
         attachment_id: String,
@@ -1072,8 +1079,12 @@ pub enum SyncEvent {
     /// resolves (`Store::current_id`) for commands, but a host re-keys what
     /// it holds by id: a selection, an undo record, an open read window.
     MessageMoved { old_id: String, new_id: String },
-    /// An attachment's bytes were fetched and written to `path` (the `dest`
-    /// from the triggering [`SyncCommand::SaveAttachment`]).
+    /// An attachment's bytes were fetched and written to `path`: the
+    /// command's `dest` (for [`SyncCommand::SaveItemAttachment`],
+    /// `dest_base` plus the sniffed `.eml`/`.ics`), or, for a save kept at
+    /// a `Shutdown` (#2132), the first free `name (n).ext` beside it when a
+    /// file was already there (#2267). A host must not assume `path` is the
+    /// `dest` it sent.
     AttachmentSaved { path: PathBuf },
     /// A meeting invite was RSVP'd (from [`SyncCommand::RespondMeeting`]); the
     /// UI shows a confirmation and marks the message read.
@@ -6427,7 +6438,14 @@ impl Engine {
                         }
                         Applied::Downloaded { bytes } => {
                             if let OutboxOp::SaveAttachment { dest, item, .. } = &row.op {
-                                self.write_attachment(PathBuf::from(dest), *item, &bytes);
+                                // Kept: written beside a file made at
+                                // `dest` since, never over it (#2267).
+                                self.write_attachment(
+                                    PathBuf::from(dest),
+                                    *item,
+                                    &bytes,
+                                    /* kept */ true,
+                                );
                             }
                         }
                     }
@@ -8977,7 +8995,7 @@ impl Engine {
             return;
         }
         match self.with_auth(|c| c.get_attachment_bytes(message_id, attachment_id)) {
-            Ok(bytes) => self.write_attachment(dest, false, &bytes),
+            Ok(bytes) => self.write_attachment(dest, false, &bytes, /* kept */ false),
             Err(e) => {
                 self.react(e);
             }
@@ -8999,7 +9017,7 @@ impl Engine {
             return;
         }
         match self.with_auth(|c| c.get_attachment_raw_value(message_id, attachment_id)) {
-            Ok(bytes) => self.write_attachment(dest_base, true, &bytes),
+            Ok(bytes) => self.write_attachment(dest_base, true, &bytes, /* kept */ false),
             Err(e) => {
                 self.react(e);
             }
@@ -9035,7 +9053,14 @@ impl Engine {
     /// `SaveItemAttachment`): `dest` is the base, and the extension is
     /// sniffed (`.ics` for a calendar item, else `.eml`). From the command
     /// and from a queued `OutboxOp::SaveAttachment` (#2132).
-    fn write_attachment(&mut self, dest: PathBuf, item: bool, bytes: &[u8]) {
+    ///
+    /// The command (`kept` false) replaces a file at `dest`: the host chose
+    /// it just now, and a Save As has asked the user. A save kept at a
+    /// `Shutdown` (`kept`, written by the next start's drain) never
+    /// replaces one, as a file may have been made at `dest` since: it goes
+    /// to the first free `name (n).ext` beside it (`write_new_file`), and
+    /// `AttachmentSaved` names the path written (#2267).
+    fn write_attachment(&mut self, dest: PathBuf, item: bool, bytes: &[u8], kept: bool) {
         let dest = if item {
             let ext = if looks_like_icalendar(bytes) {
                 "ics"
@@ -9060,8 +9085,13 @@ impl Engine {
                 return;
             }
         }
-        match std::fs::write(&dest, bytes) {
-            Ok(()) => self.emit(SyncEvent::AttachmentSaved { path: dest }),
+        let written = if kept {
+            write_new_file(&dest, bytes, KEPT_SAVE_TRIES)
+        } else {
+            std::fs::write(&dest, bytes).map(|()| dest.clone())
+        };
+        match written {
+            Ok(path) => self.emit(SyncEvent::AttachmentSaved { path }),
             Err(e) => self.emit(SyncEvent::Error(format!(
                 "failed to save attachment to {}: {e}",
                 dest.display()
@@ -11409,6 +11439,67 @@ fn looks_like_icalendar(bytes: &[u8]) -> bool {
     let s = String::from_utf8_lossy(head);
     let s = s.trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n']);
     s.to_ascii_uppercase().starts_with("BEGIN:VCALENDAR")
+}
+
+/// How many names a save kept at a `Shutdown` tries before it gives up:
+/// `dest`, then `name (1).ext` up to `name (999).ext` (#2267).
+const KEPT_SAVE_TRIES: u32 = 999;
+
+/// Writes `bytes` to a new file at `dest`, or, when a file (or anything
+/// else) is already there, at the first free `numbered_sibling` of it,
+/// trying `dest` and up to `tries` siblings, and returns the path written
+/// (#2267). Every name is created with `create_new`, with no separate
+/// check, so a file that appears at a name meanwhile is never replaced: an
+/// `AlreadyExists` moves to the next number. Any other error, a name that
+/// cannot be numbered or no free name in `tries` ends it with nothing left
+/// behind (a file it created and could not fill is removed).
+fn write_new_file(dest: &std::path::Path, bytes: &[u8], tries: u32) -> std::io::Result<PathBuf> {
+    let mut candidate = dest.to_path_buf();
+    let mut n = 0;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                return match file.write_all(bytes) {
+                    Ok(()) => Ok(candidate),
+                    Err(e) => {
+                        drop(file);
+                        let _ = std::fs::remove_file(&candidate);
+                        Err(e)
+                    }
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if n == tries {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("no free name beside it after {tries} tries"),
+                    ));
+                }
+                n += 1;
+                candidate = numbered_sibling(dest, n).ok_or(e)?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// `path` numbered as a copy beside it (#2267): `report (2).pdf` for
+/// `report.pdf`, the stem's own dots kept (`re.meeting (1).eml`), only the
+/// last extension split off (`archive.tar (1).gz`), none for `README (1)`
+/// or `.hidden (1)`. `None` for a path with no file name (`/`, `..`).
+fn numbered_sibling(path: &std::path::Path, n: u32) -> Option<PathBuf> {
+    let stem = path.file_stem()?;
+    let mut name = stem.to_os_string();
+    name.push(format!(" ({n})"));
+    if let Some(ext) = path.extension() {
+        name.push(".");
+        name.push(ext);
+    }
+    Some(path.with_file_name(name))
 }
 
 /// How a token refresh ended (#2167).
@@ -15140,6 +15231,10 @@ mod tests {
         let token_path = dir.join("token.bin");
         seed_token(&token_path);
         let dest = dir.join("downloads").join("f.txt");
+        // A live save replaces a file at `dest`: the host chose it just
+        // now, and a Save As asked the user (#2267, unlike a kept save).
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"an older file").unwrap();
 
         let handle = spawn_with_bases(
             store_path,
@@ -15177,6 +15272,11 @@ mod tests {
                 .any(|e| matches!(e, SyncEvent::AttachmentSaved { path } if path == &dest))
         );
         assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+        assert_eq!(
+            names_in(dest.parent().unwrap()),
+            ["f.txt"],
+            "no copy beside it"
+        );
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
@@ -28568,6 +28668,229 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir_out);
+    }
+
+    /// #2267: a copy's name beside the file, Explorer's way.
+    #[test]
+    fn numbered_sibling_numbers_the_stem() {
+        let dir = std::path::Path::new("d");
+        let at = |name: &str, n| numbered_sibling(&dir.join(name), n);
+        assert_eq!(at("report.pdf", 1), Some(dir.join("report (1).pdf")));
+        assert_eq!(at("report.pdf", 12), Some(dir.join("report (12).pdf")));
+        assert_eq!(at("README", 1), Some(dir.join("README (1)")));
+        assert_eq!(at(".hidden", 2), Some(dir.join(".hidden (2)")));
+        assert_eq!(
+            at("re.meeting.eml", 1),
+            Some(dir.join("re.meeting (1).eml"))
+        );
+        assert_eq!(
+            at("archive.tar.gz", 1),
+            Some(dir.join("archive.tar (1).gz"))
+        );
+        assert_eq!(numbered_sibling(std::path::Path::new("/"), 1), None);
+        assert_eq!(numbered_sibling(&dir.join(".."), 1), None);
+    }
+
+    /// The names in `dir`, sorted.
+    fn names_in(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// #2267: `write_new_file` writes a free `dest` as is, and otherwise the
+    /// first free numbered name beside it, leaving every existing file's
+    /// bytes as they were.
+    #[test]
+    fn write_new_file_never_replaces_a_file() {
+        let dir = unique_dir("write-new-file");
+        let free = dir.join("free.txt");
+        assert_eq!(write_new_file(&free, b"new", 3).unwrap(), free);
+        assert_eq!(std::fs::read(&free).unwrap(), b"new");
+
+        let one = dir.join("one.txt");
+        std::fs::write(&one, b"mine").unwrap();
+        assert_eq!(
+            write_new_file(&one, b"new", 3).unwrap(),
+            dir.join("one (1).txt")
+        );
+        assert_eq!(std::fs::read(&one).unwrap(), b"mine");
+        assert_eq!(std::fs::read(dir.join("one (1).txt")).unwrap(), b"new");
+
+        let two = dir.join("two.txt");
+        std::fs::write(&two, b"mine").unwrap();
+        std::fs::write(dir.join("two (1).txt"), b"mine too").unwrap();
+        assert_eq!(
+            write_new_file(&two, b"new", 3).unwrap(),
+            dir.join("two (2).txt")
+        );
+        assert_eq!(std::fs::read(&two).unwrap(), b"mine");
+        assert_eq!(std::fs::read(dir.join("two (1).txt")).unwrap(), b"mine too");
+        assert_eq!(std::fs::read(dir.join("two (2).txt")).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2267: no free name within the bound, or an error other than
+    /// `AlreadyExists`, is an `Err` with nothing created and nothing
+    /// changed.
+    #[test]
+    fn write_new_file_fails_without_leaving_a_file() {
+        let dir = unique_dir("write-new-file-fails");
+        for name in ["full.txt", "full (1).txt", "full (2).txt"] {
+            std::fs::write(dir.join(name), name).unwrap();
+        }
+        let before = names_in(&dir);
+        let e = write_new_file(&dir.join("full.txt"), b"new", 2).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
+        assert_eq!(names_in(&dir), before);
+        for name in ["full.txt", "full (1).txt", "full (2).txt"] {
+            assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), name);
+        }
+
+        // A regular file where the folder should be: not `AlreadyExists`.
+        let e = write_new_file(&dir.join("full.txt").join("x.txt"), b"new", 3).unwrap_err();
+        assert_ne!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e}");
+        assert_eq!(names_in(&dir), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2267: the drain writes a save kept at a `Shutdown` beside a file
+    /// made at its path since, never over it, and `AttachmentSaved` names
+    /// the path written: `name (1).ext`, `name (2).ext` past a taken
+    /// `(1)`, `base (1).eml` / `base (1).ics` for an item. A free path is
+    /// written as is, its folder made.
+    #[test]
+    fn a_kept_save_never_replaces_a_file_made_at_its_path() {
+        let out = unique_dir("kept-save-out");
+        let taken = out.join("taken");
+        std::fs::create_dir_all(&taken).unwrap();
+        for (name, bytes) in [
+            ("report.txt", "mine"),
+            ("two.txt", "mine 2"),
+            ("two (1).txt", "mine 2 (1)"),
+            ("invite.eml", "mine eml"),
+            ("meeting.ics", "mine ics"),
+        ] {
+            std::fs::write(taken.join(name), bytes).unwrap();
+        }
+        let free = out.join("new").join("free.txt");
+        let save = |id: &str, dest: &std::path::Path, item: bool| OutboxOp::SaveAttachment {
+            message_id: "M1".into(),
+            attachment_id: id.into(),
+            dest: dest.to_str().unwrap().into(),
+            item,
+        };
+        let queued = vec![
+            save("P1", &taken.join("report.txt"), false),
+            save("P2", &taken.join("two.txt"), false),
+            save("I1", &taken.join("invite"), true),
+            save("I2", &taken.join("meeting"), true),
+            save("P3", &free, false),
+        ];
+        let (_srv, handle, store_path, dir) = spawn_calendar_engine(
+            "kept-save",
+            vec![
+                get_route(
+                    "/me/messages/M1/attachments/P1",
+                    200,
+                    r#"{"contentBytes":"aGVsbG8="}"#,
+                ),
+                get_route(
+                    "/me/messages/M1/attachments/P2",
+                    200,
+                    r#"{"contentBytes":"aGVsbG8="}"#,
+                ),
+                get_route(
+                    "/me/messages/M1/attachments/P3",
+                    200,
+                    r#"{"contentBytes":"aGVsbG8="}"#,
+                ),
+                get_route(
+                    "/me/messages/M1/attachments/I1/$value",
+                    200,
+                    "Received: x\r\n\r\nbody",
+                ),
+                get_route(
+                    "/me/messages/M1/attachments/I2/$value",
+                    200,
+                    "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n",
+                ),
+            ],
+            |s| {
+                for op in &queued {
+                    s.enqueue_op(op).unwrap();
+                }
+            },
+        );
+        let mut saved = Vec::new();
+        let seen = wait_for(&handle.evt_rx, |e| {
+            if let SyncEvent::AttachmentSaved { path } = e {
+                saved.push(path.clone());
+            }
+            saved.len() == 5
+        });
+        assert_eq!(
+            saved,
+            [
+                taken.join("report (1).txt"),
+                taken.join("two (2).txt"),
+                taken.join("invite (1).eml"),
+                taken.join("meeting (1).ics"),
+                free.clone(),
+            ]
+        );
+        assert!(
+            !seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "{seen:?}"
+        );
+        // Every file that was there keeps its bytes.
+        for (name, bytes) in [
+            ("report.txt", "mine"),
+            ("two.txt", "mine 2"),
+            ("two (1).txt", "mine 2 (1)"),
+            ("invite.eml", "mine eml"),
+            ("meeting.ics", "mine ics"),
+        ] {
+            assert_eq!(std::fs::read_to_string(taken.join(name)).unwrap(), bytes);
+        }
+        assert_eq!(
+            std::fs::read(taken.join("report (1).txt")).unwrap(),
+            b"hello"
+        );
+        assert_eq!(std::fs::read(taken.join("two (2).txt")).unwrap(), b"hello");
+        assert!(
+            std::fs::read_to_string(taken.join("invite (1).eml"))
+                .unwrap()
+                .starts_with("Received: x")
+        );
+        assert!(
+            std::fs::read_to_string(taken.join("meeting (1).ics"))
+                .unwrap()
+                .starts_with("BEGIN:VCALENDAR")
+        );
+        assert_eq!(std::fs::read(&free).unwrap(), b"hello");
+        assert_eq!(
+            names_in(&taken),
+            [
+                "invite (1).eml",
+                "invite.eml",
+                "meeting (1).ics",
+                "meeting.ics",
+                "report (1).txt",
+                "report.txt",
+                "two (1).txt",
+                "two (2).txt",
+                "two.txt",
+            ]
+        );
+        let store = Store::open(&store_path).unwrap();
+        assert!(store.pending_ops().unwrap().is_empty());
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     /// #2132: a 5xx keeps a queued `SetAutomaticReplies` under the outbox
@@ -49629,7 +49952,9 @@ mod tests {
         /// bound; each is queued behind the deletes, in order, with nothing
         /// written. A second engine on the store sends the deletes and then
         /// each of them, in queue order, and emits its event, writing both
-        /// files. `drop_handle`: the handle is dropped instead of a
+        /// files: the plain one beside a file made at its path meanwhile,
+        /// which keeps its bytes (#2267). `drop_handle`: the handle is
+        /// dropped instead of a
         /// `Shutdown`.
         fn direct_writes_and_saves_then(tag: &str, drop_handle: bool) {
             let all = ids(20);
@@ -49707,6 +50032,11 @@ mod tests {
                 .collect();
             assert_eq!(queued(&store), want, "queued behind the deletes, in order");
             assert!(!file.parent().unwrap().exists(), "nothing written yet");
+            // A file made at the kept save's path before the next start
+            // (#2267): kept, and the save goes beside it.
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, b"made since").unwrap();
+            let copy = dir.join("saved").join("report (1).txt");
 
             // The next start sends them, behind the deletes.
             let srv2 = FakeServer::start({
@@ -49768,7 +50098,7 @@ mod tests {
                     event_id: Some("E2".into()),
                 },
                 SyncEvent::AutomaticRepliesUpdated,
-                SyncEvent::AttachmentSaved { path: file.clone() },
+                SyncEvent::AttachmentSaved { path: copy.clone() },
                 SyncEvent::AttachmentSaved { path: ics.clone() },
             ];
             let at = |want: &SyncEvent| {
@@ -49786,7 +50116,8 @@ mod tests {
                 !seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
                 "{seen:?}"
             );
-            assert_eq!(std::fs::read(&file).unwrap(), b"hello");
+            assert_eq!(std::fs::read(&file).unwrap(), b"made since");
+            assert_eq!(std::fs::read(&copy).unwrap(), b"hello");
             assert!(
                 std::fs::read_to_string(&ics)
                     .unwrap()
