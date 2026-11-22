@@ -22,9 +22,10 @@ the Library file `EUROTOOL.XLAM` in the `.xls`. The main test doesn't cover it
 saves as `.xlsx` keep the formula and the link the way Excel's `.xlsx` has
 them (#888, #890). `ext-name` (with its source `ext-name-src.xlsx`) calls
 names of an ordinary workbook instead: `SUM([1]!Prices)` and `[1]!Half*2`. Its
-`.xlsb` and `.xls` store those names the same way, but each has a definition
-and the book's cells are cached, and the import reads neither. So the formulas
-are dropped and the values kept. `xll-udf` calls `XLLTWICE`, a function that
+`.xlsb` and `.xls` store those names the same way, each with a definition
+(`Prices` is `'P'!$A$1:$A$2`, `Half` `#REF!`), and cache the book's cells. The
+imports keep the formulas and write the link as Excel's `.xlsx` has it: the
+book's path, sheet, names with their definitions and cached cells (#903). `xll-udf` calls `XLLTWICE`, a function that
 an XLL add-in registers. No XLL that ships with Office has a function that
 isn't built in, so `scripts/xll-fixture` is a tiny XLL the script builds for
 it. Excel's `.xlsx` spells the call `_xll.XLLTWICE(A1)`, with no external
