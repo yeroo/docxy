@@ -603,22 +603,28 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
 /// data.
 type Group = ((u32, u32, u32, u32), Vec<u8>, Vec<u8>);
 
-/// BrtColInfo, [MS-XLSB] 2.4 (record id 60).
 // A worksheet's page setup, breaks and outline settings (#901), [MS-XLSB]
-// 2.4: BrtWsProp, BrtMargins, BrtPrintOptions, BrtPageSetup,
-// BrtBeginHeaderFooter, the break collections and BrtBrk, and a custom
-// view's BrtBeginUserShView..BrtEndUserShView.
+// 2.4.
+/// BrtWsProp (record id 147): WSBOOL's flags.
 const BRT_WS_PROP: u32 = 147;
+/// BrtBeginRwBrk and BrtEndRwBrk (392, 393): the row breaks' collection.
 const BRT_BEGIN_RW_BRK: u32 = 392;
 const BRT_END_RW_BRK: u32 = 393;
+/// BrtBeginColBrk and BrtEndColBrk (394, 395): the column breaks'.
 const BRT_BEGIN_COL_BRK: u32 = 394;
 const BRT_END_COL_BRK: u32 = 395;
+/// BrtBrk (396): one page break.
 const BRT_BRK: u32 = 396;
+/// BrtBeginUserShView and BrtEndUserShView (423, 424): a custom view.
 const BRT_BEGIN_USER_SH_VIEW: u32 = 423;
 const BRT_END_USER_SH_VIEW: u32 = 424;
+/// BrtMargins (476).
 const BRT_MARGINS: u32 = 476;
+/// BrtPrintOptions (477).
 const BRT_PRINT_OPTIONS: u32 = 477;
+/// BrtPageSetup (478).
 const BRT_PAGE_SETUP: u32 = 478;
+/// BrtBeginHeaderFooter (479).
 const BRT_BEGIN_HEADER_FOOTER: u32 = 479;
 
 /// Which break collection a BrtBrk belongs to.
@@ -629,6 +635,7 @@ enum Breaks {
     Cols,
 }
 
+/// BrtColInfo, [MS-XLSB] 2.4 (record id 60).
 const BRT_COL_INFO: u32 = 60;
 /// BrtMergeCell, [MS-XLSB] 2.4 (record id 176).
 const BRT_MERGE_CELL: u32 = 176;
@@ -2842,6 +2849,13 @@ mod tests {
             ..crate::print::setup::PageSetup::default()
         };
         assert_eq!(s.page_setup, want);
+        assert!(s.row_breaks.is_empty() && s.col_breaks.is_empty());
+
+        // A sheet with no page setup of its own after the view: the
+        // defaults, never the view's.
+        let book = open(&xlsb(&[], &sheet[..sheet.len() - 2]));
+        let s = &book.sheets[0];
+        assert_eq!(s.page_setup, crate::print::setup::PageSetup::default());
         assert!(s.row_breaks.is_empty() && s.col_breaks.is_empty());
     }
 

@@ -2311,7 +2311,7 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                                 names.push((
                                     PRINT_TITLES.to_string(),
                                     Some(book.sheets.len() - 1),
-                                    spell_refs(&sheet.name, &refs),
+                                    spell_refs(&super::escape_colon(&sheet.name), &refs),
                                 ));
                             }
                         }
@@ -2654,29 +2654,17 @@ fn span(start: Option<u32>, end: u32, max: u32) -> Option<(u32, u32)> {
 /// has none, or a range that doesn't read.
 fn print_area(table: &str, ranges: &str) -> Option<String> {
     use crate::print::area::{PrintRef, parse_refs, spell_refs};
-    // Split at spaces outside quoted sheet names (`'My Sheet'.A1`).
-    let mut parts = Vec::new();
-    let (mut quoted, mut start) = (false, 0);
-    for (i, c) in ranges.char_indices() {
-        match c {
-            '\'' => quoted = !quoted,
-            ' ' if !quoted => {
-                parts.push(&ranges[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&ranges[start..]);
     let mut refs = Vec::new();
-    for r in parts.into_iter().filter(|r| !r.trim().is_empty()) {
+    for r in split_unquoted(ranges, char::is_whitespace) {
         let excel = convert_ref(r)?;
         let [one] = parse_refs(&excel)[..] else {
             return None;
         };
         refs.push(PrintRef::of_rect(one.rect()));
     }
-    (!refs.is_empty()).then(|| spell_refs(table, &refs))
+    // The table's name with `:` spelled as the build's marker, so a
+    // renamed sheet's definition follows it (as `sheet_prefix` spells).
+    (!refs.is_empty()).then(|| spell_refs(&super::escape_colon(table), &refs))
 }
 
 /// A cell's value from its `office:value-type` and value attributes (or its
@@ -4121,6 +4109,42 @@ mod tests {
             .map(|d| (d.name.as_str(), d.scope, d.formula.as_str()))
             .collect();
         assert_eq!(kept, names);
+    }
+
+    /// A table named with a `:` is renamed (`A:B` → `A_B`), and its print
+    /// area and titles follow it (#901): spelled with the build's colon
+    /// marker, as every other reference the reader builds.
+    #[test]
+    fn a_colon_named_tables_print_area_and_titles_follow_its_rename() {
+        use crate::print::area::{PrintTitles, print_area, print_titles};
+        let xml = styled_content(
+            "",
+            "",
+            r#"<table:table table:name="A:B" table:print-ranges="'A:B'.A1:'A:B'.C5"><table:table-header-rows><table:table-row table:number-rows-repeated="2"/></table:table-header-rows><table:table-row><table:table-cell office:value-type="float" office:value="1"/></table:table-row></table:table>"#,
+        );
+        let (pkg, _) = super::super::open_workbook(&ods_zip(&xml)).unwrap();
+        let wb = &pkg.workbook;
+        assert_eq!(wb.sheets[0].name, "A_B");
+        let names: Vec<_> = wb
+            .defined_names
+            .iter()
+            .map(|d| (d.name.as_str(), d.scope, d.formula.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("_xlnm.Print_Area", Some(0), "A_B!$A$1:$C$5"),
+                ("_xlnm.Print_Titles", Some(0), "A_B!$1:$2"),
+            ]
+        );
+        assert_eq!(print_area(wb, 0), [(0, 0, 4, 2)]);
+        assert_eq!(
+            print_titles(wb, 0),
+            PrintTitles {
+                rows: Some((0, 1)),
+                cols: None,
+            }
+        );
     }
 
     /// Side effect (#901): an imported `.ods`'s page setup and manual breaks

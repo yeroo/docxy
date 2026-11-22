@@ -7,6 +7,13 @@
 //! (0x0083), VCENTER (0x0084), PRINTHEADERS (0x002A), PRINTGRIDLINES
 //! (0x002B), WSBOOL (0x0081), HORIZONTALPAGEBREAKS (0x001B) and
 //! VERTICALPAGEBREAKS (0x001A).
+//!
+//! The `.xlsb` reader's BIFF12 counterparts (#901) are here too
+//! ([MS-XLSB] 2.4): BrtMargins, BrtPrintOptions and BrtPageSetup, whose
+//! flags differ from SETUP's ([`read_page_setup_12`]); BrtWsProp and
+//! BrtBeginHeaderFooter reuse [`read_wsbool`] and [`read_hf_flags`].
+//! [`read_break`] and [`MAX_BREAKS`] serve the `.xlsb` and `.ods` readers'
+//! manual breaks as well.
 
 use crate::print::setup::{
     CellComments, HeaderFooter, Margins, Orientation, PageOrder, PageSetup, PrintErrors,

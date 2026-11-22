@@ -492,7 +492,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   outside quoted names) → a sheet-local `_xlnm.Print_Area`, all ranges or
   none; `table:table-header-rows`/`-columns` → `_xlnm.Print_Titles`,
   columns first. Both are spelled by `print::area::spell_refs`, which quotes
-  a sheet name that looks like a cell (`'T2'!$A:$B`).
+  a sheet name that looks like a cell (`'T2'!$A:$B`), over the table name
+  with `:` as the build's COLON marker (`escape_colon`), so a table `A:B`'s
+  definitions follow its rename to `A_B`.
 - Not done: `.xlsb` row outline levels (BrtRowHdr), `.ods` outline groups,
   `style:scale-to-pages`, header and footer fonts, paper sizes outside
   `paper_points`.
