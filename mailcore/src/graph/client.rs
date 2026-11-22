@@ -3790,7 +3790,8 @@ impl GraphClient {
 
     /// A PUT of a binary body (#2065's contact photo): the bearer and JSON
     /// `Accept` as `send`, `Content-Type` as given, the bytes as they are
-    /// (`send_bytes`, never a string). A non-2xx maps as `send`'s does.
+    /// (`send_bytes`, never a string). A non-2xx maps as `send`'s does,
+    /// and a 2xx's `Date` is measured as `send`'s is (#2121).
     fn put_binary(
         &self,
         path: &str,
@@ -3803,7 +3804,10 @@ impl GraphClient {
             .set("Content-Type", content_type)
             .send_bytes(bytes);
         match result {
-            Ok(resp) => Ok(resp),
+            Ok(resp) => {
+                self.measure_clock(&resp);
+                Ok(resp)
+            }
             Err(ureq::Error::Status(status, resp)) => Err(classify_status(status, resp)),
             Err(ureq::Error::Transport(t)) => Err(GraphError::Transport(t.to_string())),
         }
