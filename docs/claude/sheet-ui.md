@@ -246,3 +246,20 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
 - The harness's `spill` key lists the runs the last frame drew (`A8:E8`, a
   run in both panes once) and `sel_row_px` the active row's laid-out
   height; case `uiharness/cases/sheet-spill.uit`.
+
+## Row and column inserts that would push data off the sheet (#1175)
+
+- `gridcore::edit::insert_rows`/`insert_cols` drop whatever they push past
+  the last row or column, and they do not check for it. Each host checks
+  first, with `edit::insert_shifts_data_off` (a cell that isn't blank, or a
+  merged range, at the edge), and refuses with Excel's `SHIFT_OFF_SHEET`
+  before an undo step is pushed. The suite (`structural_edit`, which also
+  checks notes with `insert_shifts_comments_off`), the xlsxy TUI
+  (`row_op`/`col_op`, its status line), the xlsxy control verbs
+  `row.insert`/`col.insert` and the MCP tools on them (`"{verb}: …"`), the
+  gridwasm dispatch `insrow`/`inscol` (`err`, shown as `view.err`), and its
+  `row.insert`/`col.insert` verbs, which read that `err` back as
+  `"{verb}: …"`. A new insert entry point needs the same guard. A delete
+  never shifts anything off.
+- The issue's other item (deleting every row of a table left a stale table)
+  was already fixed by #991's `delete_table_rows` in `gridcore/src/edit.rs`.
