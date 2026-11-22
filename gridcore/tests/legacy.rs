@@ -24,7 +24,7 @@ enum Check {
     Formula,
     /// (f): the number-format code.
     Format,
-    /// (i): the cell's font, fill and border (#884).
+    /// (i): the cell's font and fill (#884).
     Style,
 }
 
@@ -205,7 +205,11 @@ fn code(wb: &Workbook, style: u32) -> String {
 }
 
 /// The parts of a cell format the import keeps (#884): bold, italic, the
-/// font colour, size and name, the fill and the thin box.
+/// font colour, size and name, and the fill. Not the thin box: the `.xlsx`
+/// loader never sets `Xf::border` (a loaded box lives in its `<xf>`'s
+/// `<border>`, through `loaded_from`), so the source would always say no
+/// box. The readers' round-trip tests check the box after a save
+/// (`legacy::saved_thin_box`).
 type Look = (
     bool,
     bool,
@@ -213,7 +217,6 @@ type Look = (
     Option<f64>,
     Option<String>,
     (Option<(u8, u8, u8)>, bool),
-    bool,
 );
 
 fn look(wb: &Workbook, style: u32) -> Look {
@@ -229,7 +232,6 @@ fn look(wb: &Workbook, style: u32) -> Look {
             .map(|n| n.to_ascii_lowercase())
             .filter(|n| n != "calibri"),
         (x.fill, x.fill_unresolved),
-        x.border,
     )
 }
 

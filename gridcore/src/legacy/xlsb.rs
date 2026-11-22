@@ -536,6 +536,8 @@ const BRT_DVAL: u32 = 64;
 /// BrtBeginConditionalFormatting and BrtBeginCFRule, [MS-XLSB] 2.4
 /// (record ids 461 and 463).
 const BRT_BEGIN_CONDITIONAL_FORMATTING: u32 = 461;
+/// BrtEndConditionalFormatting, [MS-XLSB] 2.4 (record id 462).
+const BRT_END_CONDITIONAL_FORMATTING: u32 = 462;
 const BRT_BEGIN_CF_RULE: u32 = 463;
 
 /// BrtBeginCFRule: iType (1 cellIs, 2 expression), iTemplate, dxfId, iPri,
@@ -548,8 +550,8 @@ fn read_cf_rule(
     at: (u32, u32, u32, u32),
     styles: &Styles,
     g: &Globals,
-) -> Option<(crate::sheet::CfKind, crate::sheet::Dxf)> {
-    use crate::sheet::CfKind;
+) -> Option<(crate::xlsx::NewCfRule, crate::sheet::Dxf)> {
+    use crate::xlsx::NewCfRule;
     let (ty, _template, dxf_id) = (c.u32()?, c.u32()?, c.u32()?);
     c.u32()?;
     let param = c.u32()?;
@@ -576,11 +578,11 @@ fn read_cf_rule(
         .cloned()
         .unwrap_or_default();
     let kind = match ty {
-        1 if !formulas.is_empty() => CfKind::CellIs {
+        1 if !formulas.is_empty() => NewCfRule::CellIs {
             op: super::cf_operator(param)?.to_string(),
             formulas,
         },
-        2 => CfKind::Expression {
+        2 => NewCfRule::Expression {
             formula: formulas.into_iter().next()?,
         },
         _ => return None,
@@ -656,6 +658,9 @@ fn read_sheet(
     // The last formula cell read: a BrtShrFmla's master, the cell its
     // members' ptgExp names (not necessarily the range's top-left).
     let mut last_formula: Option<(u32, u32)> = None;
+    // The conditional-formatting block whose rules follow: the index of the
+    // one just pushed, none after a block that wasn't (or its end).
+    let mut cf_open: Option<usize> = None;
     for (ty, body) in records(bytes) {
         let mut c = Cur::new(body);
         let _ = (|| -> Option<()> {
@@ -762,6 +767,7 @@ fn read_sheet(
                 // BrtBeginConditionalFormatting: ccf, fPivot, sqrfx. Its
                 // BrtBeginCFRules follow.
                 BRT_BEGIN_CONDITIONAL_FORMATTING => {
+                    cf_open = None;
                     c.take(8)?;
                     let ranges = sqrfx(&mut c)?;
                     if !ranges.is_empty() {
@@ -769,10 +775,12 @@ fn read_sheet(
                             ranges,
                             rules: Vec::new(),
                         });
+                        cf_open = Some(sheet.cond_formats.len() - 1);
                     }
                 }
+                BRT_END_CONDITIONAL_FORMATTING => cf_open = None,
                 BRT_BEGIN_CF_RULE => {
-                    let cf = sheet.cond_formats.last_mut()?;
+                    let cf = sheet.cond_formats.get_mut(cf_open?)?;
                     let rule = read_cf_rule(&mut c, cf.ranges[0], styles, g)?;
                     cf.rules.push(rule);
                 }
@@ -2142,7 +2150,8 @@ mod tests {
     /// sheet's conditional formats, with the BrtDXF their dxfId names.
     #[test]
     fn xlsb_cf_rules_and_dxfs() {
-        use crate::sheet::{CfKind, Dxf};
+        use crate::sheet::Dxf;
+        use crate::xlsx::NewCfRule;
         let mut sheet = vec![rec(BRT_ROW_HDR, &0u32.to_le_bytes()), real(0, 0, 1.0)];
         sheet.extend(cf_records());
         let book = open(&xlsb_with(
@@ -2154,7 +2163,7 @@ mod tests {
         let cf = &book.sheets[0].cond_formats;
         assert_eq!(cf.len(), 2);
         assert_eq!(cf[0].ranges, [(1, 1, 4, 1)]);
-        let expr = CfKind::Expression {
+        let expr = NewCfRule::Expression {
             formula: "$A2>5".into(),
         };
         let italic = Dxf {
@@ -2165,7 +2174,7 @@ mod tests {
             cf[0].rules,
             [
                 (
-                    CfKind::CellIs {
+                    NewCfRule::CellIs {
                         op: "greaterThan".into(),
                         formulas: vec!["5".into()],
                     },
@@ -2180,5 +2189,43 @@ mod tests {
             ]
         );
         assert_eq!(cf[1].rules, [(expr, italic)]);
+    }
+
+    /// A rule after a block that wasn't kept (its ranges off the grid, or
+    /// cut short), or after a block's end, joins no other block (#884 r1).
+    #[test]
+    fn xlsb_cf_rules_join_only_their_block() {
+        let block = |r: u32, c: u32| {
+            let mut b = vec![0u8; 8];
+            b.extend(1u32.to_le_bytes());
+            for n in [r, r, c, c] {
+                b.extend(n.to_le_bytes());
+            }
+            rec(BRT_BEGIN_CONDITIONAL_FORMATTING, &b)
+        };
+        let gt = cf_rule(1, 0, 5, &[&[0x1E, 5, 0]]);
+        let sheet = vec![
+            rec(BRT_ROW_HDR, &0u32.to_le_bytes()),
+            real(0, 0, 1.0),
+            block(0, 0),
+            gt.clone(),
+            rec(462, &[]),
+            // After the end: no block.
+            gt.clone(),
+            // Off the grid, then cut short.
+            block(0, 16384),
+            gt.clone(),
+            rec(BRT_BEGIN_CONDITIONAL_FORMATTING, &[0; 4]),
+            gt,
+        ];
+        let book = open(&xlsb_with(
+            &[],
+            &sheet,
+            &[],
+            vec![("xl/styles.bin".to_string(), dxf_styles())],
+        ));
+        let cf = &book.sheets[0].cond_formats;
+        assert_eq!(cf.len(), 1);
+        assert_eq!(cf[0].rules.len(), 1);
     }
 }

@@ -279,15 +279,18 @@ pub fn open_workbook_ex(data: &[u8]) -> Result<Opened, OpenError> {
 }
 
 /// What an imported file may make the import allocate. Past any of these
-/// the file is refused ([`OpenError::Corrupt`]), never silently truncated.
+/// but [`Limits::styled_blanks`] the file is refused
+/// ([`OpenError::Corrupt`]), never silently truncated. Past that one,
+/// further formatted empty cells are left out instead: they hold no value.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Limits {
     /// Cells across the workbook, every reader ("too many cells"). Far
     /// past any real workbook, which memory bounds long before this.
     pub cells: usize,
     /// The copies `.ods` repeats add (a repeated cell's or row's 2nd, 3rd,
-    /// ... instance): the guard against a tiny file that expands to
-    /// billions ("too many repeated cells").
+    /// ... instance, and the merges a repeated row's copies make): the
+    /// guard against a tiny file that expands to billions ("too many
+    /// repeated cells").
     pub repeat_cells: usize,
     /// The text and formula bytes those copies add.
     pub repeat_bytes: usize,
@@ -297,8 +300,9 @@ pub(crate) struct Limits {
     /// external links").
     pub links: usize,
     /// Empty cells an `.ods` keeps only for their format (#884), across
-    /// the workbook. Past it, further ones are left out: they hold no
-    /// value, so that loses formatting, never data, and is no error.
+    /// the workbook. The one limit that truncates: past it, further ones
+    /// are left out, as they hold no value. That loses formatting, never
+    /// data, and is no error.
     pub styled_blanks: usize,
 }
 
@@ -363,7 +367,7 @@ pub(crate) struct SheetIn {
 #[derive(Debug, Default)]
 pub(crate) struct CfIn {
     pub ranges: Vec<(u32, u32, u32, u32)>,
-    pub rules: Vec<(crate::sheet::CfKind, crate::sheet::Dxf)>,
+    pub rules: Vec<(crate::xlsx::NewCfRule, crate::sheet::Dxf)>,
 }
 
 /// One column definition as a reader collects it.
@@ -584,14 +588,7 @@ impl BookIn {
                 let mut rules = Vec::new();
                 for (mut kind, dxf) in cf.rules {
                     let mut kept = true;
-                    let formulas: Vec<&mut String> = match &mut kind {
-                        crate::sheet::CfKind::CellIs { formulas, .. } => {
-                            formulas.iter_mut().collect()
-                        }
-                        crate::sheet::CfKind::Expression { formula } => vec![formula],
-                        _ => Vec::new(),
-                    };
-                    for f in formulas {
+                    for f in kind.formulas_mut() {
                         match fix(std::mem::take(f), false) {
                             Some(g) => *f = g,
                             None => kept = false,
@@ -1944,5 +1941,39 @@ mod tests {
             err.to_string(),
             "password-protected workbooks are not supported"
         );
+    }
+
+    /// `add_cond_formats` writes no block of no rules (the schema wants
+    /// one) and leaves it out of the model; the others are written and
+    /// claim their elements (#884 r1).
+    #[test]
+    fn add_cond_formats_skips_a_block_of_no_rules() {
+        use crate::xlsx::{NewCfRule, NewCondFormat};
+        let mut pkg = crate::xlsx::new_xlsx_sheets(&["S".to_string()]);
+        let block = |rules: Vec<(NewCfRule, crate::sheet::Dxf)>| NewCondFormat {
+            ranges: vec![(0, 0, 1, 0)],
+            sqref: "A1:A2".into(),
+            rules,
+        };
+        let rule = NewCfRule::Expression {
+            formula: "A1>0".into(),
+        };
+        assert!(pkg.add_cond_formats(
+            0,
+            vec![
+                block(Vec::new()),
+                block(vec![(rule, crate::sheet::Dxf::default())])
+            ]
+        ));
+        let part = String::from_utf8_lossy(pkg.part(&pkg.sheet_parts[0]).unwrap()).into_owned();
+        assert_eq!(part.matches("<conditionalFormatting").count(), 1, "{part}");
+        let cf = &pkg.workbook.sheets[0].cond_formats;
+        assert_eq!(cf.len(), 1);
+        assert_eq!((cf[0].rules.len(), cf[0].ix), (1, Some(0)));
+        // A batch of only empty blocks changes nothing.
+        let before = pkg.workbook.styles.dxfs.len();
+        assert!(pkg.add_cond_formats(0, vec![block(Vec::new())]));
+        assert_eq!(pkg.workbook.sheets[0].cond_formats.len(), 1);
+        assert_eq!(pkg.workbook.styles.dxfs.len(), before);
     }
 }

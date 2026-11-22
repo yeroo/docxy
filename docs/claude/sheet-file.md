@@ -359,7 +359,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   `<xf>`'s `<border>` through `loaded_from`. The round-trip tests check it
   with `legacy::saved_thin_box`.
 - The legacy oracle (`gridcore/tests/legacy.rs`) checks (i): the cells'
-  formats, column widths and merges against the `.xlsx` source, with
-  Calibri 11 as the default on both sides. The corpus has no CF, DV or
+  fonts and fills, column widths and merges against the `.xlsx` source,
+  with Calibri 11 as the default on both sides. Not the thin box: the
+  source's `Xf::border` is always false (above), so the readers' round
+  trips check it with `saved_thin_box`. The corpus has no CF, DV or
   comments, and no Excel-made fixture has them, so those rest on
   hand-built records laid out from [MS-XLS]/[MS-XLSB]/ODF.

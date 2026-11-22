@@ -6,11 +6,13 @@
 //! (DATEMODE), the reference tables (SUPBOOK, EXTERNSHEET, EXTERNNAME),
 //! defined names (NAME) and the active sheet (WINDOW1). Each worksheet
 //! substream gives its cells, merged cells (MERGECELLS), column widths
-//! (COLINFO), row heights (ROW) and frozen panes (WINDOW2, PANE). Records
-//! not listed here are skipped, and those whose content the import leaves
-//! out (charts, comments, conditional formatting, ...) are named in
-//! [`BookIn::dropped`], as are the formats a cell uses that the model can't
-//! hold (underline, borders other than a thin box, ...).
+//! (COLINFO), row heights (ROW), frozen panes (WINDOW2, PANE), notes (NOTE
+//! with its OBJ and TXO), data validation (DV) and conditional formats
+//! (CONDFMT and its CFs) (#884). Records not listed here are skipped, and
+//! those whose content the import leaves out (charts, pictures, Excel
+//! 2007's conditional formats in CF12, CONDFMT12 and CFEX, ...) are named
+//! in [`BookIn::dropped`], as are the formats a cell uses that the model
+//! can't hold (underline, borders other than a thin box, ...).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -1651,8 +1653,8 @@ fn read_cf(
     at: (u32, u32, u32, u32),
     styles: &Styles,
     g: &Globals,
-) -> Option<(crate::sheet::CfKind, crate::sheet::Dxf)> {
-    use crate::sheet::CfKind;
+) -> Option<(crate::xlsx::NewCfRule, crate::sheet::Dxf)> {
+    use crate::xlsx::NewCfRule;
     let (ct, cp) = (c.u8()?, c.u8()?);
     let (cce1, cce2) = (c.u16()? as usize, c.u16()? as usize);
     let dxf = read_dxfn(c, styles)?;
@@ -1665,12 +1667,12 @@ fn read_cf(
             if cce2 > 0 {
                 formulas.push(decompile(rgce2)?);
             }
-            CfKind::CellIs {
+            NewCfRule::CellIs {
                 op: super::cf_operator(cp as u32)?.to_string(),
                 formulas,
             }
         }
-        2 => CfKind::Expression {
+        2 => NewCfRule::Expression {
             formula: decompile(rgce1)?,
         },
         _ => return None,
@@ -4093,13 +4095,14 @@ pub(crate) mod tests {
     /// rules (CF12 and the CFEX extension) are named.
     #[test]
     fn xls_cf_cellis_and_expression() {
-        use crate::sheet::{CfKind, Dxf};
+        use crate::sheet::Dxf;
+        use crate::xlsx::NewCfRule;
         let book = read(&workbook(&[], &cf_sheet())).unwrap();
         assert!(book.dropped.is_empty(), "{:?}", book.dropped);
         let cf = &book.sheets[0].cond_formats;
         assert_eq!(cf.len(), 2);
         assert_eq!(cf[0].ranges, [(1, 1, 4, 1)]);
-        let gt = CfKind::CellIs {
+        let gt = NewCfRule::CellIs {
             op: "greaterThan".into(),
             formulas: vec!["5".into()],
         };
@@ -4120,7 +4123,7 @@ pub(crate) mod tests {
                     }
                 ),
                 (
-                    CfKind::Expression {
+                    NewCfRule::Expression {
                         formula: "$A2>5".into()
                     },
                     red_fill.clone()
@@ -4130,7 +4133,7 @@ pub(crate) mod tests {
         assert_eq!(
             cf[1].rules,
             [(
-                CfKind::Expression {
+                NewCfRule::Expression {
                     formula: "$A2>5".into()
                 },
                 red_fill

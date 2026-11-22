@@ -5486,12 +5486,41 @@ fn parse_sqref_token(tok: &str) -> Option<(u32, u32, u32, u32)> {
 }
 
 /// A conditional-formatting block for [`SheetPackage::add_cond_formats`]:
-/// its ranges, their `sqref` text, and its rules (`cellIs` or
-/// `expression`), each with the differential format it applies.
+/// its ranges, their `sqref` text, and its rules, each with the
+/// differential format it applies.
 pub(crate) struct NewCondFormat {
     pub ranges: Vec<(u32, u32, u32, u32)>,
     pub sqref: String,
-    pub rules: Vec<(crate::sheet::CfKind, crate::sheet::Dxf)>,
+    pub rules: Vec<(NewCfRule, crate::sheet::Dxf)>,
+}
+
+/// A rule [`SheetPackage::add_cond_formats`] writes: the two kinds of
+/// [`crate::sheet::CfKind`] the engine evaluates with a format of their own.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum NewCfRule {
+    /// `cellIs` with an operator and one or two operand formulas.
+    CellIs { op: String, formulas: Vec<String> },
+    /// `expression`: a formula truthy when the rule applies.
+    Expression { formula: String },
+}
+
+impl NewCfRule {
+    /// Its formulas, mutably.
+    pub(crate) fn formulas_mut(&mut self) -> Vec<&mut String> {
+        match self {
+            NewCfRule::CellIs { formulas, .. } => formulas.iter_mut().collect(),
+            NewCfRule::Expression { formula } => vec![formula],
+        }
+    }
+}
+
+impl From<NewCfRule> for crate::sheet::CfKind {
+    fn from(rule: NewCfRule) -> Self {
+        match rule {
+            NewCfRule::CellIs { op, formulas } => crate::sheet::CfKind::CellIs { op, formulas },
+            NewCfRule::Expression { formula } => crate::sheet::CfKind::Expression { formula },
+        }
+    }
 }
 
 /// `ranges` as an `sqref` value: whole columns and rows as `B:C` and `3:5`.
@@ -10247,7 +10276,7 @@ impl SheetPackage {
                 ranges: vec![range],
                 sqref: format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2)),
                 rules: vec![(
-                    crate::sheet::CfKind::CellIs {
+                    NewCfRule::CellIs {
                         op: op.to_string(),
                         formulas,
                     },
@@ -10269,7 +10298,7 @@ impl SheetPackage {
     /// the sheet doesn't exist, or its worksheet part is malformed where
     /// they would go.
     pub(crate) fn add_cond_formats(&mut self, sheet: usize, blocks: Vec<NewCondFormat>) -> bool {
-        use crate::sheet::{CfKind, CfRule, CondFormat};
+        use crate::sheet::{CfRule, CondFormat};
         if sheet >= self.workbook.sheets.len()
             || !self.sheet_takes(sheet, "conditionalFormatting", false)
         {
@@ -10291,39 +10320,37 @@ impl SheetPackage {
         let mut xml = String::new();
         let mut model = Vec::with_capacity(blocks.len());
         for block in blocks {
+            // A block of no rules isn't written: the schema wants one.
+            if block.rules.is_empty() {
+                continue;
+            }
             let mut rules = Vec::with_capacity(block.rules.len());
             xml.push_str(&format!(
                 "<conditionalFormatting sqref=\"{}\">",
                 block.sqref
             ));
-            for (kind, dxf) in block.rules {
+            for (rule, dxf) in block.rules {
                 let dxf_id = self.workbook.styles.dxfs.len();
                 self.workbook.styles.dxfs.push(dxf);
                 priority += 1;
                 let fml = |f: &str| format!("<formula>{}</formula>", esc_text(&file_formula(f)));
-                match &kind {
-                    CfKind::CellIs { op, formulas } => {
+                match &rule {
+                    NewCfRule::CellIs { op, formulas } => {
                         let fmls: String = formulas.iter().map(|f| fml(f)).collect();
                         xml.push_str(&format!(
                             "<cfRule type=\"cellIs\" dxfId=\"{dxf_id}\" priority=\"{priority}\" operator=\"{}\">{fmls}</cfRule>",
                             esc_attr(op)
                         ));
                     }
-                    CfKind::Expression { formula } => {
+                    NewCfRule::Expression { formula } => {
                         xml.push_str(&format!(
                             "<cfRule type=\"expression\" dxfId=\"{dxf_id}\" priority=\"{priority}\">{}</cfRule>",
                             fml(formula)
                         ));
                     }
-                    // Only the kinds above are written here.
-                    _ => {
-                        self.workbook.styles.dxfs.pop();
-                        priority -= 1;
-                        continue;
-                    }
                 }
                 rules.push(CfRule {
-                    kind,
+                    kind: rule.into(),
                     dxf_id: Some(dxf_id),
                     priority,
                 });
@@ -10334,6 +10361,9 @@ impl SheetPackage {
                 rules,
                 ix: None,
             });
+        }
+        if model.is_empty() {
+            return true;
         }
         // The styles part: regenerate <dxfs> from the model (splice_styles
         // preserves it).
