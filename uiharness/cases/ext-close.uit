@@ -140,7 +140,7 @@ test issue 2260 a held tab keeps its window open, File closed and the tab in fro
   assert tab is 0
   call ext-hold {}
   assert reply.may_close_calls is 1
-  shot window
+  # No shot here: window 1 lies over this one. Each verb draws a frame.
   call ext-ribbon-read {}
   assert reply.header_focused is true
   # With File up on the document: File goes, so the question can be seen.

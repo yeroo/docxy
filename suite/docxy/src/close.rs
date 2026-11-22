@@ -791,8 +791,8 @@ impl Docxy {
     /// and switched from as a click on the chip does. The keys go to
     /// `moved`, the focus the extension moved to its question while asked:
     /// already in front, they are there and stay; from another tab, the
-    /// switch focuses the suite and `focus_ext_surface` gives them back
-    /// (`ext_focus_back`). No status line text: the extension asks.
+    /// switch focuses the suite, and they are given back right after it. No
+    /// status line text: the extension asks.
     fn ext_close_refused(
         &mut self,
         i: usize,
@@ -810,10 +810,11 @@ impl Docxy {
             self.sheet_comment_bar_leave();
             self.sheet_rename_commit(false, cx);
             self.select_tab(i, window, cx);
-            if let (Some(had), Some(Surface::Ext(e))) =
-                (moved, self.tabs.get(i).map(|t| &t.surface))
-            {
-                self.ext_focus_back = Some((e.view().entity_id(), had));
+            // The switch focused the suite; the question gets the keys back
+            // now, not on a later render: `focus_ext_surface` leaves a focus
+            // that is not the suite's alone.
+            if let Some(had) = moved {
+                window.focus(&had, cx);
             }
         }
         cx.notify();

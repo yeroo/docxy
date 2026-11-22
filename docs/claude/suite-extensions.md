@@ -1090,10 +1090,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   - The keys go where the extension put them. `ext_ask` notes the focus
     before `may_close`, and after a refusal it takes a focus that changed as
     the extension's (one held before may be another tab's). From another tab,
-    `select_tab` focuses the suite root, so that focus goes into
-    `ext_focus_back` (owner: the surface's view), and `focus_ext_surface`
-    gives it back on the next render. With the tab already active there is
-    no refocus, and the focus stays. A suite root left focused by File, with
+    `select_tab` focuses the suite root, so that focus is given back right
+    after it, not left to a render: a window under another may draw no frame
+    before the next harness verb (#2260 r1). `focus_ext_surface` leaves a
+    focus that is not the suite root's alone. With the tab already active
+    there is no refocus, and the focus stays. A suite root left focused by File, with
     no focus moved, goes to the view as usual.
 - Fixture: `FixtureView::hold` (off when made) and `may_close_calls`. Both
   belong to one fixture tab, and a closed tab takes them with it. Refusing,
