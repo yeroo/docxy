@@ -47,9 +47,14 @@ pub struct GraphClient {
 /// clock stepped since shows at the next answer.
 ///
 /// Only a 2xx measures: a proxy's or captive portal's own error page
-/// carries that box's `Date`. The estimate never runs ahead of Graph's
-/// clock: `Date` is truncated to the second and stamped before the answer
-/// travels back, and the receipt time is rounded up (`clock_offset`).
+/// carries that box's `Date`. A reading taken in this run never runs
+/// ahead of Graph's clock: `Date` is truncated to the second and stamped
+/// before the answer travels back, and the receipt time is rounded up
+/// (`clock_offset`). A reading seeded from an earlier run (`seed`) is
+/// only trusted to move the clock back: it is never later than this
+/// client's clock, though a client clock stepped forward between the runs
+/// shows until the first answer. With no reading, the clock is this
+/// client's (`graph_now`).
 #[derive(Debug, Clone, Default)]
 pub struct ServerClock(Arc<Mutex<Option<ClockReading>>>);
 
@@ -125,7 +130,10 @@ fn clock_offset(receipt: Duration, date_secs: i64) -> i64 {
 /// reading's `Date` plus the monotonic time since it came, so a wall clock
 /// stepped forward since the reading cannot move it ahead (the monotonic
 /// term only lags, across a suspend: the safe side). A seeded reading has
-/// the wall term alone; no reading is the wall clock itself.
+/// the wall term alone, and never later than the wall clock: its offset may
+/// be stale, as a client clock that was behind Graph's and has since been
+/// corrected would otherwise put the clock ahead of Graph's (#2121 r1). No
+/// reading is the wall clock itself.
 fn graph_now(reading: Option<ClockReading>, wall: i64, mono: Instant) -> i64 {
     let Some(r) = reading else { return wall };
     let by_wall = wall.saturating_sub(r.offset);
@@ -134,7 +142,7 @@ fn graph_now(reading: Option<ClockReading>, wall: i64, mono: Instant) -> i64 {
             let since = mono.saturating_duration_since(at).as_secs();
             by_wall.min(date.saturating_add(i64::try_from(since).unwrap_or(i64::MAX)))
         }
-        None => by_wall,
+        None => by_wall.min(wall),
     }
 }
 
@@ -4658,6 +4666,14 @@ mod tests {
             anchor: None,
         });
         assert_eq!(graph_now(seeded, date + 610, later), date + 510);
+        // r1 M1: a seeded negative offset (the client was behind Graph in
+        // an earlier run, and its clock may have been corrected since)
+        // never moves the clock past the wall clock.
+        let seeded_behind = Some(ClockReading {
+            offset: -600,
+            anchor: None,
+        });
+        assert_eq!(graph_now(seeded_behind, date, later), date);
         // A negative offset (client behind Graph) moves the clock forward.
         let behind = Some(ClockReading {
             offset: -60,
