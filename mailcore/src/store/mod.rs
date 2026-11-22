@@ -9054,8 +9054,8 @@ fn rekey_folder_on(
 }
 
 /// The cutoff of a folder-wide op (#1913, #2110): the later of `now_utc`
-/// (Graph's clock at the command as the engine estimates it, never ahead
-/// of it, #2121) and the newest stored `received_at` in `folder`, a
+/// (Graph's clock at the command as the engine estimates it,
+/// `Engine::graph_now_utc`, #2121) and the newest stored `received_at` in `folder`, a
 /// fractional second rounded up (`ceil_to_whole_second`), so Graph's
 /// `receivedDateTime le` still takes every stored message even when the
 /// estimate is behind Graph's clock.
