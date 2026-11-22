@@ -392,14 +392,16 @@ impl Engine {
 
     /// Apply one cell edit and recalculate everything affected.
     ///
-    /// A formula whose text differs from the one in the cell is typed: it is
-    /// ours now, modern (it spills), and its preserved `<f>` attributes go. The
-    /// same text again (re-committing the editor unchanged builds a fresh
-    /// cell; a pasted clone) keeps what the formula was — a loaded
-    /// legacy formula stays legacy, a CSE array keeps its `<f>` attributes, a
-    /// dynamic array stays one. A restyle is not an edit: it goes through
-    /// [`Engine::set_styles`], which leaves a spill whole. Nor is the same
-    /// text again on a formula the engine can't evaluate ([`Engine::is_frozen`]):
+    /// A formula other than the one in the cell is typed: it is ours now,
+    /// modern (it spills), and its preserved `<f>` attributes go. The same
+    /// formula again, file spelling aside ([`same_formula`]: a loaded
+    /// `_xlfn.PIVOTBY(A1,4)` retyped as `PIVOTBY(A1,4)`; re-committing the
+    /// editor unchanged builds a fresh cell; a pasted clone), keeps what the
+    /// formula was and the text it held — a loaded legacy formula stays
+    /// legacy, a CSE array keeps its `<f>` attributes, a dynamic array stays
+    /// one. A restyle is not an edit: it goes through [`Engine::set_styles`],
+    /// which leaves a spill whole. Nor is the same formula again on one the
+    /// engine can't evaluate ([`Engine::is_frozen`]):
     /// it would never recompute the cached value, or re-spill the cached
     /// block, that a re-entry clears, so only its style is taken.
     ///
@@ -412,8 +414,8 @@ impl Engine {
         self.type_cell(wb, key, cell, true, true)
     }
 
-    /// [`Engine::set_cell`]; `recommit` takes the same text on a frozen
-    /// formula as a restyle. [`Engine::paste_block`] types a pasted anchor
+    /// [`Engine::set_cell`]; `recommit` takes the same formula on a frozen
+    /// one as a restyle. [`Engine::paste_block`] types a pasted anchor
     /// without it: the copied block replaces this cell's, whatever its text.
     /// `refuse` is [`Engine::put_cell`]'s: off for a cell of a group already
     /// checked whole ([`Engine::set_cells_prechecked`]).
@@ -430,7 +432,7 @@ impl Engine {
         // [`Engine::put_cell`] drops it, and evaluation works out the spill
         // afresh.
         let prev = wb.sheets.get(s).and_then(|sh| sh.cell(r, c));
-        let same = prev.filter(|p| cell.formula.is_some() && p.formula == cell.formula);
+        let same = prev.filter(|p| same_formula(p, &cell));
         if recommit && same.is_some() && self.is_frozen_now(wb, key) {
             self.set_styles(wb, s, &[(r, c, cell.style)]);
             return true;
@@ -441,6 +443,9 @@ impl Engine {
             // one (Enter) or a clone pasted from another address, or from
             // another workbook, whose `ref`/`si`/`cm`/`vm` are not this cell's.
             Some(p) => {
+                // And the text it held (file spelling): the kind kept below
+                // came with that text, and a save writes it back as loaded.
+                cell.formula = p.formula.clone();
                 cell.f_attrs = p.f_attrs.clone();
                 own_array_ref(&mut cell, r, c);
                 let pm = p.meta.as_deref().cloned().unwrap_or_default();
@@ -569,11 +574,11 @@ impl Engine {
     /// change part of an evaluated legacy CSE block? Excel refuses that
     /// ([`PART_OF_ARRAY`]): any plain value or blank written into a cell of
     /// the block's `ref` other than its anchor, whatever the cell holds now,
-    /// unless the group also replaces the anchor (with a plain cell, or a
-    /// formula whose text differs from the anchor's; the same text again
-    /// keeps it a block). A formula written into the block is not refused,
-    /// nor is a write over a formula already there: the formula blocks the
-    /// block, and replacing it frees it. A frozen block
+    /// unless the group also replaces the anchor (with a plain cell, or
+    /// another formula; the anchor's own formula again, file spelling aside
+    /// ([`same_formula`]), keeps it a block). A formula written into the
+    /// block is not refused, nor is a write over a formula already there: the
+    /// formula blocks the block, and replacing it frees it. A frozen block
     /// ([`Engine::is_frozen`]) keeps its own rules. Hosts that write one
     /// group in parts ask this, or [`Engine::refuses_paste`], once for the
     /// whole of it before the first part.
@@ -588,8 +593,8 @@ impl Engine {
     /// clears on the same sheet). A pasted cell on a block's anchor replaces
     /// it as a typed one does, and so does an array block `paste_block`
     /// restores in place there with its own `ref` ([`paste_anchors`]); a
-    /// copied formula with the anchor's own text, typed there, keeps the
-    /// block.
+    /// copied formula that is the anchor's own ([`same_formula`]), typed
+    /// there, keeps the block.
     pub fn refuses_paste(
         &self,
         wb: &Workbook,
@@ -657,7 +662,7 @@ impl Engine {
                     new.formula.is_none()
                         || sheet
                             .cell(a.0, a.1)
-                            .is_none_or(|held| held.formula != new.formula)
+                            .is_none_or(|held| !same_formula(held, new))
                 })
         };
         let mut frozen: HashMap<(u32, u32), bool> = HashMap::new();
@@ -2211,6 +2216,34 @@ impl Engine {
         if let Some(cover) = self.pass_anchors.get_mut(&s) {
             cover.note((r, c), h);
         }
+    }
+}
+
+/// Is `new`'s formula the one `held` already holds, spelling aside (#849)?
+/// The same text, or, when either spells a name in file form (`_xlfn.`,
+/// `_xlws.`, `_xlpm.`; `_xlfn.ANCHORARRAY`/`_xlfn.SINGLE` against `A1#`/`@x`
+/// too), the same formula as a file prints it: a loaded `_xlfn.PIVOTBY(A1,4)`
+/// retyped as Excel shows it, `PIVOTBY(A1,4)`. Text with no prefix on either
+/// side keeps the exact-text rule. Not for a held formula kept as loaded
+/// ([`CellMeta::loaded_f`]: a bare name that may be a UDF named like a
+/// builtin), where the prefix names another function. An unknown `_xlfn.FOO`
+/// counts as a typed `FOO`: the caller keeps the held text, so the file stays
+/// as it was and no cached value is lost.
+fn same_formula(held: &Cell, new: &Cell) -> bool {
+    let (Some(h), Some(n)) = (held.formula.as_deref(), new.formula.as_deref()) else {
+        return false;
+    };
+    if h == n {
+        return true;
+    }
+    if held.meta.as_deref().is_some_and(|m| m.loaded_f.is_some())
+        || !(formula::has_file_prefix(h) || formula::has_file_prefix(n))
+    {
+        return false;
+    }
+    match (formula::parse(h), formula::parse(n)) {
+        (Ok(a), Ok(b)) => formula::to_file_string(&a) == formula::to_file_string(&b),
+        _ => false,
     }
 }
 
@@ -8030,6 +8063,186 @@ mod tests {
         set(&mut eng, &mut wb, "C1", Cell::formula("SEQUENCE(3)"));
         assert_eq!(value_at(&wb, "C3"), CellValue::Number(3.0));
         assert_eq!(cell_at(&wb, "C1").spill, Some((3, 1)));
+    }
+
+    /// [`frozen_block_wb`] with E1 holding `src`, as loaded: in file
+    /// spelling, with the dynamic-array `cm` Excel gave it.
+    fn frozen_block_wb_as(src: &str) -> Workbook {
+        let mut wb = frozen_block_wb();
+        let e1 = wb.sheets[0].cells.get_mut(&(0, 4)).unwrap();
+        e1.formula = Some(src.to_string());
+        e1.meta = Some(Box::new(CellMeta {
+            cm: Some("1".to_string()),
+            ..CellMeta::default()
+        }));
+        wb
+    }
+
+    #[test]
+    fn retyping_a_frozen_formula_without_its_prefix_keeps_its_cached_values() {
+        // #849: a loaded formula is held in file spelling. Retyped as Excel
+        // shows it, without `_xlfn.`/`_xlpm.`, it is the same formula: as
+        // the same text again (#840) only its style is taken, and its cached
+        // block, extent, `<f>` attributes, `cm` and held text stay.
+        let n = |v: f64| CellValue::Number(v);
+        let cases = [
+            ("_xlfn.PIVOTBY(A1,4)", "PIVOTBY(A1,4)"),
+            ("_xlfn.PIVOTBY(A1,4)", "pivotby(a1,4)"),
+            ("_xlfn.PIVOTBY(A1,4)", "PIVOTBY( A1 , 4 )"),
+            (
+                "_xlfn.LET(_xlpm.x,A1,_xlfn.PIVOTBY(_xlpm.x,4))",
+                "LET(x,A1,PIVOTBY(x,4))",
+            ),
+        ];
+        for (held, typed) in cases {
+            for evaluated in [false, true] {
+                let at = format!("{typed} {evaluated}");
+                let mut wb = frozen_block_wb_as(held);
+                let mut eng = Engine::new(&wb);
+                if evaluated {
+                    eng.recalc_all(&mut wb);
+                }
+                assert!(eng.is_frozen(&wb, (0, 0, 4)), "{at}");
+                let before = cell_at(&wb, "E1");
+                let entered = Cell {
+                    style: 3,
+                    ..Cell::formula(typed)
+                };
+                set(&mut eng, &mut wb, "E1", entered);
+                assert_eq!(col_e(&wb), vec![n(7.0), n(8.0), n(9.0)], "{at}");
+                let e1 = cell_at(&wb, "E1");
+                assert_eq!(e1.formula.as_deref(), Some(held), "{at}");
+                assert_eq!(e1.spill, Some((3, 1)), "{at}");
+                assert!(e1.has_cm(), "{at}");
+                assert_eq!(e1.style, 3, "{at}");
+                assert_eq!(Cell { style: 0, ..e1 }, before, "{at}");
+                eng.recalc_all(&mut wb);
+                assert_eq!(col_e(&wb), vec![n(7.0), n(8.0), n(9.0)], "{at}");
+            }
+        }
+        // A frozen scalar keeps its cached value too.
+        let mut b1 = Cell::formula("_xlfn.PIVOTBY(A1,4)");
+        b1.value = n(5.0);
+        let mut wb = wb_one_sheet(&[("A1", Cell::number(1.0)), ("B1", b1)]);
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "B1", Cell::formula("PIVOTBY(A1,4)"));
+        assert_eq!(value_at(&wb, "B1"), n(5.0));
+        assert_eq!(
+            cell_at(&wb, "B1").formula.as_deref(),
+            Some("_xlfn.PIVOTBY(A1,4)")
+        );
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "B1"), n(5.0));
+    }
+
+    #[test]
+    fn a_formula_retyped_in_other_spelling_keeps_its_kind() {
+        // #849: a formula the engine evaluates, retyped without its prefix,
+        // is the same formula too: it keeps what it was and the text it held.
+        // A loaded legacy XLOOKUP stays legacy (not modern, not dynamic).
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::number(1.0)),
+            ("A2", Cell::number(2.0)),
+            ("B1", Cell::text("one")),
+            ("B2", Cell::text("two")),
+            ("C1", Cell::formula("_xlfn.XLOOKUP(2,A1:A2,B1:B2)")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        set(
+            &mut eng,
+            &mut wb,
+            "C1",
+            Cell::formula("XLOOKUP(2,A1:A2,B1:B2)"),
+        );
+        let c1 = cell_at(&wb, "C1");
+        assert_eq!(c1.formula.as_deref(), Some("_xlfn.XLOOKUP(2,A1:A2,B1:B2)"));
+        assert!(!c1.is_modern() && !c1.is_dynamic());
+        assert_eq!(c1.value, CellValue::Text("two".into()));
+        // A loaded CSE array keeps its `<f>` attributes.
+        let mut d1 = Cell::formula("_xlfn.SEQUENCE(3)");
+        d1.f_attrs = Some(" t=\"array\" ref=\"D1:D3\"".to_string());
+        let mut wb = wb_one_sheet(&[("D1", d1)]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        set(&mut eng, &mut wb, "D1", Cell::formula("SEQUENCE(3)"));
+        let d1 = cell_at(&wb, "D1");
+        assert_eq!(d1.formula.as_deref(), Some("_xlfn.SEQUENCE(3)"));
+        assert_eq!(d1.f_attrs.as_deref(), Some(" t=\"array\" ref=\"D1:D3\""));
+        assert!(!d1.is_modern());
+        assert_eq!(value_at(&wb, "D3"), CellValue::Number(3.0));
+    }
+
+    #[test]
+    fn a_held_formula_kept_as_loaded_is_not_the_prefixed_one() {
+        // #849 guard: a bare post-2007 name kept as loaded (`loaded_f`) may
+        // be a UDF named like the builtin; the prefixed text names the
+        // builtin, so it is a new formula, typed as one.
+        let mut c1 = Cell::formula("TEXTJOIN(\",\",TRUE,A1:A2)");
+        c1.meta = Some(Box::new(CellMeta {
+            loaded_f: Some("TEXTJOIN(\",\",TRUE,A1:A2)".to_string()),
+            ..CellMeta::default()
+        }));
+        let mut wb = wb_one_sheet(&[("A1", Cell::text("a")), ("C1", c1)]);
+        let mut eng = Engine::new(&wb);
+        set(
+            &mut eng,
+            &mut wb,
+            "C1",
+            Cell::formula("_xlfn.TEXTJOIN(\",\",TRUE,A1:A2)"),
+        );
+        let c1 = cell_at(&wb, "C1");
+        assert_eq!(
+            c1.formula.as_deref(),
+            Some("_xlfn.TEXTJOIN(\",\",TRUE,A1:A2)")
+        );
+        assert!(c1.is_modern());
+    }
+
+    #[test]
+    fn a_new_formula_on_a_prefixed_frozen_anchor_still_clears_its_block() {
+        // #849 guard: other arguments are another formula, prefix or not.
+        let mut wb = frozen_block_wb_as("_xlfn.PIVOTBY(A1,4)");
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "E1", Cell::formula("PIVOTBY(A1,5)"));
+        assert_eq!(value_at(&wb, "E2"), CellValue::Empty);
+        assert_eq!(value_at(&wb, "E3"), CellValue::Empty);
+        let e1 = cell_at(&wb, "E1");
+        assert_eq!(e1.spill, None);
+        assert_eq!(e1.formula.as_deref(), Some("PIVOTBY(A1,5)"));
+        assert!(!e1.has_cm());
+    }
+
+    #[test]
+    fn a_same_formula_anchor_in_other_spelling_keeps_the_block_so_the_rest_is_refused() {
+        // #849: as the same text again does, the anchor's formula retyped
+        // without its prefix keeps a live CSE block, so a value written into
+        // the rest of it in the same group is refused, as a group and as a
+        // paste.
+        let mut d1 = Cell::formula("_xlfn.SEQUENCE(3)");
+        d1.f_attrs = Some(" t=\"array\" ref=\"D1:D3\"".to_string());
+        let mut wb = wb_one_sheet(&[("D1", d1)]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert!(eng.is_live_cse(&wb, (0, 0, 3)));
+        let group = vec![
+            (0, 3, Cell::formula("SEQUENCE(3)")),
+            (1, 3, Cell::number(8.0)),
+        ];
+        assert!(eng.refuses(&wb, 0, &group));
+        let before = wb.sheets[0].cells.clone();
+        assert!(!eng.set_cells(&mut wb, 0, group));
+        assert_eq!(wb.sheets[0].cells, before);
+        let clip = vec![vec![Cell::formula("SEQUENCE(3)")], vec![Cell::number(4.0)]];
+        assert!(eng.refuses_paste(&wb, 0, (0, 3), &clip, &[]));
+        assert!(!eng.paste_block(&mut wb, 0, (0, 3), &clip));
+        assert_eq!(wb.sheets[0].cells, before);
+        // Another formula on the anchor replaces the block: not refused.
+        let group = vec![
+            (0, 3, Cell::formula("SEQUENCE(2)")),
+            (1, 3, Cell::number(8.0)),
+        ];
+        assert!(!eng.refuses(&wb, 0, &group));
     }
 
     #[test]
