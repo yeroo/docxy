@@ -4236,7 +4236,8 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   marks every stored message of the folder read, sets its `unread_count` to 0 and queues
   `OutboxOp::MarkFolderRead { folder, before }` (kind `markFolderRead`). It is all or nothing,
   and the test proves it on 5 000 rows with an aborting trigger. `before` is the cutoff: the later
-  of the command's UTC time and the newest stored `received_at` in the folder. A fractional
+  of Graph's clock at the command (`Engine::graph_now_utc`, #2121) and the newest stored
+  `received_at` in the folder. A fractional
   second rounds up to the next whole one (`ceil_to_whole_second`, carrying across a minute or
   a day), so Graph's `receivedDateTime le` still takes a message at `…07.512Z` (r1). Mail
   Graph receives after the command, or while the engine is offline, is not the command's, and
@@ -4428,9 +4429,9 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   (the internet-message-id rule then finds no row or tombstone). Don't "fix" that clearing.
 - Known shapes: mail moved into the folder on Graph by a rule or another client after the
   command, with an old `receivedDateTime`, is deleted (never held, before the cutoff), as #1913
-  marks it read. The cutoff takes this client's clock (r1-m2): with it Δ ahead of Graph's, mail
-  delivered to the folder up to Δ after the command passes the filter and, never held, is
-  deleted unseen. A server time source (the `Date` header) would close it; none is read today. While the op is queued no new mail shows in the folder (often Inbox, a fast
+  marks it read. The cutoff once took this client's clock (r1-m2): with it Δ ahead of Graph's,
+  mail delivered to the folder up to Δ after the command passed the filter and, never held, was
+  deleted unseen. #2121 takes it on Graph's clock, read off its `Date` header (below). While the op is queued no new mail shows in the folder (often Inbox, a fast
   folder); a long throttled run makes that visible. A long run holds every op queued behind it,
   as #1913's does. Another client changing the folder between the listing and the deletes is out
   of scope, as are "empty to Deleted Items" (a move), `permanentDelete`, emptying subfolders'
@@ -4458,6 +4459,44 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `mail_moved_into_the_folder_while_the_empty_waits_is_left_alone`,
   `a_delete_of_the_folder_drops_its_queued_empty`,
   `empty_folder_of_an_unknown_folder_reports_and_queues_nothing`).
+
+## Folder-op cutoffs on Graph's clock (#2121)
+
+- The `now_utc` that `folder_cutoff_on` takes for `MarkFolderRead`, `EmptyFolder` and
+  `MoveFolderMessages` is `Engine::graph_now_utc`, never this client's raw clock. Mail Graph
+  receives after the command then stays outside `receivedDateTime le`, however far ahead the
+  client clock runs. The max with the newest stored row is unchanged.
+- `GraphClient::send` reads `Date` (IMF-fixdate only, `parse_http_date`; another form measures
+  nothing) off a **2xx** answer into the engine's `ServerClock`, shared by every client
+  `Engine::client()` builds, as `UserIds` is. Only a 2xx: a proxy's or captive portal's own
+  error page carries that box's `Date`. Upload chunks, `put_binary` and the token endpoint
+  (other hosts) measure nothing.
+- The offset is `clock_offset`: the receipt rounded **up** to the whole second, minus `Date`.
+  `Date` is truncated and stamped before the answer leaves, so the estimate never runs ahead
+  of Graph's clock. The latest reading wins, not the smallest offset, so a stepped client clock
+  shows at the next answer. `graph_now` also bounds the wall term by `Date` plus the monotonic
+  time since the reading: a wall clock stepped forward between a reading and a command cannot
+  move the cutoff ahead. Across a suspend `Instant` lags, which is the safe side.
+- The offset is kept in `meta.graph_clock_offset` (`Store::graph_clock_offset`), written at the
+  end of each `sync_pass` (`persist_graph_clock`, however the pass ended) when it changed.
+  `Engine::new` seeds the clock from it (wall term only), so a restart that is offline still
+  cuts on Graph's clock. `reset_mailbox` deletes it with the rest of `meta`, and the engine's
+  marker (`clock_persisted`) is cleared with it, so the next pass writes it back. The in-memory
+  clock is never cleared at session end: any Microsoft clock beats none. With no reading ever
+  taken (every test fake but these, which sends no `Date`), the cutoff is the client clock.
+- Out of scope: other client-clock uses (event response times, snoozes: not cutoffs), and
+  Exchange's `receivedDateTime` against the front end's `Date`.
+- Tests: `client.rs` `parse_http_date_reads_imf_fixdate_only`,
+  `http_date_formats_what_parse_http_date_reads`, `clock_offset_rounds_the_receipt_up`,
+  `graph_now_is_bounded_by_the_monotonic_term`, `send_records_the_graph_clock_offset`,
+  `a_status_error_measures_nothing`; `store` `graph_clock_offset_round_trips_in_meta`;
+  `engine.rs` `folder_writes::graph_clock`
+  (`empty_folder_cutoff_follows_graphs_clock_not_the_clients`,
+  `mark_folder_read_and_move_folder_messages_cutoff_follow_graphs_clock`,
+  `a_stored_message_newer_than_graphs_clock_still_sets_the_cutoff`,
+  `graph_clock_offset_is_kept_and_seeds_the_next_run`,
+  `a_mailbox_reset_has_the_next_pass_keep_the_offset_again`,
+  `with_no_date_seen_the_cutoff_is_the_clients_clock`).
 
 ## Copy a folder (#2118)
 

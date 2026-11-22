@@ -213,6 +213,7 @@ issue number to find its notes.
   a folder create retried after a lost answer adopting Graph's folder on a 409 (#2109),
   a whole folder marked read on the server through `$batch` (#1913),
   a folder emptied on the server through `$batch`, unsent mail kept, FTS rows in bulk (#2110),
+  folder-wide ops' cutoff on Graph's clock from its `Date` header (#2121),
   a folder copied with its contents through the outbox, synced after (#2118),
   every message of a folder moved on the server through `$batch` (Delete All), rows
   following Graph's answers, unsent mail kept, a dropped move reported (#2126),
