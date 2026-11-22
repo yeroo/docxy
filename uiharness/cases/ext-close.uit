@@ -1,0 +1,179 @@
+# An extension tab refusing a close the user started (#2260). The script's
+# `ext fixture` line has this instance draw Mail tabs with the suite's test
+# extension, whose `TabSurface::may_close` counts each time it is asked and
+# refuses while its hold is on (`ext-hold {"on":bool}` sets it, `ext-hold
+# {}` reads it; both reply `hold` and `may_close_calls`). The hold and the
+# count belong to one fixture tab: a new Mail tab starts at 0, hold off, and
+# a tab that closed takes both with it, so the count is read only after a
+# refused close. A refusal keeps the tab and makes it the active one, with
+# File closed; a window close stops whole. The extension's own Exit
+# (`ext::CloseTab`) is never asked. `tab-close:<i>` is tab i's close button.
+# The instance starts with one document tab (the first test also opens
+# basic.docx and closes it); each test leaves only that one, in one window.
+ext fixture
+
+test issue 2260 a held tab's close button keeps it and brings it to the front
+  open copy:../fixtures/basic.docx
+  call tab-list {}
+  assert reply.count is 2
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 1
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call ext-hold {"on":true}
+  assert reply.hold is true
+  assert reply.may_close_calls is 0
+  call pointer-click {"region":"tab-chip:0"}
+  call tab-list {}
+  assert reply.active is 0
+  call pointer-click {"region":"tab-close:1"}
+  shot window
+  call tab-list {}
+  assert reply.count is 2
+  assert reply.active is 1
+  assert reply.tabs.1.kind is mail
+  call ext-hold {}
+  assert reply.may_close_calls is 1
+  # The active tab's own close button: refused again, asked again.
+  call pointer-click {"region":"tab-close:1"}
+  call tab-list {}
+  assert reply.count is 2
+  assert reply.active is 1
+  call ext-hold {}
+  assert reply.may_close_calls is 2
+  # Cleared: the same click closes it.
+  call ext-hold {"on":false}
+  call pointer-click {"region":"tab-close:1"}
+  call tab-list {}
+  assert reply.count is 1
+  assert reply.tabs.0.kind is docx
+
+test issue 2260 a held tab stays through File Close and Ctrl+W
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call ext-hold {"on":true}
+  call backstage {"action":"open"}
+  call backstage-close {}
+  call backstage {"action":"read"}
+  assert reply.open is false
+  call tab-list {}
+  assert reply.count is 2
+  assert reply.active is 1
+  call ext-hold {}
+  assert reply.may_close_calls is 1
+  # The rail's Close, clicked.
+  call backstage {"action":"open"}
+  shot window
+  call pointer-click {"region":"bs-rail:close"}
+  call backstage {"action":"read"}
+  assert reply.open is false
+  call tab-list {}
+  assert reply.count is 2
+  assert reply.active is 1
+  call ext-hold {}
+  assert reply.may_close_calls is 2
+  # Ctrl+W from the extension's view.
+  shot window
+  call real-key {"key":"ctrl+w"}
+  call tab-list {}
+  assert reply.count is 2
+  assert reply.active is 1
+  call ext-hold {}
+  assert reply.may_close_calls is 3
+  # Cleared: File > Close closes it.
+  call ext-hold {"on":false}
+  call backstage {"action":"open"}
+  call backstage-close {}
+  call tab-list {}
+  assert reply.count is 1
+  assert reply.tabs.0.kind is docx
+
+test issue 2260 the extension's own close is not asked
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call ext-hold {"on":true}
+  assert reply.may_close_calls is 0
+  call ext-close-tab {}
+  assert reply.from is view
+  shot window
+  # Gone with its hold on: `CloseTab` never asked it.
+  call tab-list {}
+  assert reply.count is 1
+  assert reply.tabs.0.kind is docx
+
+test issue 2260 a held tab keeps its window open, File closed and the tab in front
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call window-new {"tab":1}
+  assert windows is 2
+  assert window is 2
+  # A clean document beside it, in front.
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-doc-card"}
+  call tab-list {}
+  assert reply.count is 2
+  assert reply.active is 1
+  call pointer-click {"region":"tab-chip:0"}
+  call ext-hold {"on":true}
+  call pointer-click {"region":"tab-chip:1"}
+  call tab-list {}
+  assert reply.active is 1
+  # A non-last window's close: refused, so the window stays, the tab in front.
+  call close-window {}
+  assert windows is 2
+  assert window is 2
+  assert tab is 0
+  call ext-hold {}
+  assert reply.may_close_calls is 1
+  # With File up on the document: File goes, so the question can be seen.
+  call pointer-click {"region":"tab-chip:1"}
+  call backstage {"action":"open"}
+  call close-window {}
+  assert windows is 2
+  assert tab is 0
+  call backstage {"action":"read"}
+  assert reply.open is false
+  call ext-hold {}
+  assert reply.may_close_calls is 2
+  # Cleared: the window goes, the extension's tab with it.
+  call ext-hold {"on":false}
+  call close-window {}
+  assert windows is 1
+  assert window is 1
+  call tab-list {}
+  assert reply.count is 1
+  assert reply.tabs.0.kind is docx
+
+test issue 2260 a held tab keeps the last window open whatever ask before closing says
+  call ask-on-close {"on":false}
+  assert windows is 1
+  assert ask_on_close is false
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call ext-hold {"on":true}
+  call pointer-click {"region":"tab-chip:0"}
+  # The last window's close is the app's quit: refused, the run goes on.
+  call close-window {}
+  assert windows is 1
+  assert tab is 1
+  call ext-hold {}
+  assert reply.may_close_calls is 1
+  call ext-hold {"on":false}
+  shot window
+  call ext-close-tab {}
+  shot window
+  call tab-list {}
+  assert reply.count is 1
+  assert reply.tabs.0.kind is docx

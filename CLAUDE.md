@@ -101,7 +101,8 @@ issue number to find its notes.
   (#1923), File opened on an extension's own page (#2204), Bullets/Numbering
   on the document's lists (#2087), hidden text, run shading and
   plain-text links in an imported mail (#2249), further tab kinds
-  besides Mail: their cards, accent, session rows (#2253).
+  besides Mail: their cards, accent, session rows (#2253), a tab refusing
+  its close (#2260).
 - `docs/claude/ribbon.md`: before changing the ribbon: contributed group launchers
   (#1669), ribbon fit per ribbon (#1020, #1608, #1685, #1763), swatch galleries, their
   sections, More button and KeyTips (#1761, #1762, #1823). A new ribbon command also needs
