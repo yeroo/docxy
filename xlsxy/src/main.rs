@@ -15820,18 +15820,26 @@ mod tests {
         yes(&mut app);
         app.save();
         assert!(app.confirm.is_none());
-        app.pkg.workbook.sheets[app.sheet].set_row_outline(3, 1);
+        // A header over BIFF8's 255 characters (outlines have records
+        // since #1440).
+        app.pkg.workbook.sheets[app.sheet]
+            .page_setup
+            .header_footer
+            .odd_header = Some("h".repeat(256));
         app.save();
         assert!(
             app.confirm
                 .as_ref()
                 .unwrap()
                 .prompt()
-                .contains("sheet protection; outlines")
+                .contains("lost: page setup; sheet protection.")
         );
         yes(&mut app);
         // Fewer losses than were accepted don't ask again.
-        app.pkg.workbook.sheets[app.sheet].set_row_outline(3, 0);
+        app.pkg.workbook.sheets[app.sheet]
+            .page_setup
+            .header_footer
+            .odd_header = None;
         app.save();
         assert!(app.confirm.is_none());
         // Nor does the Data Model go without a word.
