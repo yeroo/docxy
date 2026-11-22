@@ -1208,6 +1208,45 @@ impl GraphClient {
         parse_folder_answer(resp, "created folder")
     }
 
+    /// The folder named `name` directly under `parent` (#2109): `GET
+    /// /me/mailFolders/{parent}/childFolders`, or `/me/mailFolders` (the top
+    /// folders) for `None`, 100 a page, following `@odata.nextLink`. The
+    /// first whose `displayName` is exactly `name`, else the first equal to
+    /// it ignoring case (Exchange refuses a name that clashes in any case),
+    /// else `None`. The names are compared here, not with `$filter`, so no
+    /// OData quoting is involved. Any failure is an `Err`.
+    pub fn find_child_folder(
+        &self,
+        parent: Option<&str>,
+        name: &str,
+    ) -> Result<Option<MailFolder>, GraphError> {
+        let mut target = match parent {
+            Some(p) => format!(
+                "/me/mailFolders/{}/childFolders?$top=100",
+                encode_path_segment(p)
+            ),
+            None => "/me/mailFolders?$top=100".to_string(),
+        };
+        let mut caseless = None;
+        loop {
+            let page = self.fetch_folder_page(&target)?;
+            for (folder, _) in page.folders {
+                if folder.display_name == name {
+                    return Ok(Some(folder));
+                }
+                if caseless.is_none()
+                    && crate::graph::model::folder_names_clash(&folder.display_name, name)
+                {
+                    caseless = Some(folder);
+                }
+            }
+            match page.next_link {
+                Some(next) => target = next,
+                None => return Ok(caseless),
+            }
+        }
+    }
+
     /// `PATCH /me/mailFolders/{id}` with `{"displayName": name}` (#1910).
     /// Graph's answer body is not read.
     pub fn rename_folder(&self, id: &str, name: &str) -> Result<(), GraphError> {
@@ -9522,6 +9561,78 @@ mod tests {
             sent.get("displayName").and_then(Value::as_str),
             Some("Kid \"2\"")
         );
+    }
+
+    #[test]
+    fn find_child_folder_pages_children_and_top_and_matches_names() {
+        // Second pages first: the fake server matches the first route whose
+        // prefix fits.
+        let named = |id: &str, name: &str| {
+            format!(r#"{{"id":"{id}","displayName":"{name}","parentFolderId":"P/1"}}"#)
+        };
+        let srv = FakeServer::start(vec![
+            folder_route(
+                "GET",
+                "/me/mailFolders/P%2F1/childFolders?$skiptoken=C2",
+                200,
+                &format!(
+                    r#"{{"value":[{},{}]}}"#,
+                    named("LOW", "new"),
+                    named("G1", "New")
+                ),
+            ),
+            folder_route(
+                "GET",
+                "/me/mailFolders/P%2F1/childFolders",
+                200,
+                &format!(
+                    r#"{{"value":[{},{}],"@odata.nextLink":"/me/mailFolders/P%2F1/childFolders?$skiptoken=C2"}}"#,
+                    named("O1", "Other"),
+                    named("UP", "NEW")
+                ),
+            ),
+            folder_route(
+                "GET",
+                "/me/mailFolders?",
+                200,
+                &format!(r#"{{"value":[{}]}}"#, named("T1", "Top")),
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        // An exact match on a later page wins over an earlier caseless one.
+        let found = c.find_child_folder(Some("P/1"), "New").unwrap().unwrap();
+        assert_eq!(found.id, "G1");
+        // No exact match: the first caseless one, across the pages.
+        let found = c.find_child_folder(Some("P/1"), "nEw").unwrap().unwrap();
+        assert_eq!(found.id, "UP");
+        assert!(c.find_child_folder(Some("P/1"), "Gone").unwrap().is_none());
+        // The top folders.
+        assert_eq!(c.find_child_folder(None, "Top").unwrap().unwrap().id, "T1");
+        assert!(c.find_child_folder(None, "New").unwrap().is_none());
+        let reqs = srv.requests();
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(reqs[0].path, "/me/mailFolders/P%2F1/childFolders?$top=100");
+        assert_eq!(
+            reqs[1].path,
+            "/me/mailFolders/P%2F1/childFolders?$skiptoken=C2"
+        );
+        assert_eq!(reqs[6].path, "/me/mailFolders?$top=100");
+        assert_eq!(reqs.len(), 8);
+    }
+
+    #[test]
+    fn find_child_folder_returns_a_page_error() {
+        let srv = FakeServer::start(vec![folder_route(
+            "GET",
+            "/me/mailFolders/P1/childFolders",
+            503,
+            "",
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert!(matches!(
+            c.find_child_folder(Some("P1"), "New"),
+            Err(GraphError::Throttled { .. })
+        ));
     }
 
     #[test]

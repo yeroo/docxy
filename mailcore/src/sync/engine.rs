@@ -75,7 +75,7 @@ use crate::store::{
     SCOPE_WINDOW, Store, StoreError, SyncedCalendar,
 };
 use crate::sync::outbox::{
-    Applied, NOT_A_MEETING_INVITE, PROPOSALS_REFUSED, apply_op, apply_send,
+    Applied, NOT_A_MEETING_INVITE, PROPOSALS_REFUSED, apply_op, apply_send, create_folder,
     remove_from_calendar_refusal, send_error_text,
 };
 use crate::tokencache;
@@ -794,8 +794,11 @@ pub enum SyncCommand {
     /// ([`SyncEvent::FolderCreated`], `FoldersUpdated`). Anything aimed at
     /// the `local:` id meanwhile (a rename, a move, a child folder, a
     /// message moved into it) follows it (`Store::current_folder_id`). An
-    /// unknown parent or the drafts sentinel is refused at once
-    /// ([`SyncEvent::FolderWriteFailed`] with no status).
+    /// unknown parent, the drafts sentinel, or a name a sibling already
+    /// has, in any case (#2109), is refused at once
+    /// ([`SyncEvent::FolderWriteFailed`] with no status). A create retried
+    /// after a lost answer and answered 409 adopts Graph's folder of that
+    /// name under the parent (#2109).
     CreateFolder {
         parent: Option<String>,
         name: String,
@@ -1215,7 +1218,8 @@ pub enum SyncEvent {
     /// queued; a 404 too, except for a delete, where a 404 is done), or by
     /// the store at once (`status: None`, nothing queued: an unknown folder,
     /// the drafts sentinel, a move into itself, a delete of folders holding
-    /// unsent mail). A queued delete is also refused, with `status: None`
+    /// unsent mail, a create of a name a sibling already has, in any case,
+    /// #2109). A queued delete is also refused, with `status: None`
     /// and nothing sent, when its walk of Graph finds an item the store
     /// shows elsewhere or removed (#2107).
     /// Graph's refusal is final at once and reverts the store:
@@ -8024,7 +8028,8 @@ impl Engine {
     ///
     /// A `SendDraft` goes through `apply_send` with the row's `seq`, so its
     /// `/send` POST is recorded and a later attempt checks delivery first
-    /// (#1874).
+    /// (#1874). A `CreateFolder` goes through `create_folder` with it too,
+    /// so a retry answered 409 adopts the folder its lost POST made (#2109).
     fn apply_op_with_retry(&mut self, row: &OutboxRow) -> Result<Applied, GraphError> {
         // A `SendDraft`'s upload progress (#1941) goes out as it runs, from
         // a clone: the closure must not borrow `self` across `try_refresh`.
@@ -8042,6 +8047,9 @@ impl Engine {
                 };
                 apply_send(client, store, id.as_str(), Some(row.seq), &mut progress)
                     .map(|()| Applied::Done)
+            }
+            OutboxOp::CreateFolder { id, parent, name } => {
+                create_folder(client, store, id, parent.as_deref(), name, Some(row.seq))
             }
             op => apply_op(client, store, op),
         };
@@ -42186,6 +42194,155 @@ mod tests {
             stop(handle, dir);
         }
 
+        /// #2109: a create whose POST reached Graph but whose answer was
+        /// lost (a 500 here) is retried and answered 409. The folder that
+        /// POST made, listed by a pass before the retry as a row of its own,
+        /// is found under the parent by name and adopted: the rename and the
+        /// message move queued on the `local:` id reach it, and there is one
+        /// folder G1, holding the stale row's mail too.
+        #[test]
+        fn a_create_retried_after_a_lost_answer_adopts_graphs_folder_on_409() {
+            let child = "/me/mailFolders/INBOX/childFolders";
+            let g1 = r#"{"id":"G1","displayName":"New","parentFolderId":"INBOX","totalItemCount":0,"unreadItemCount":0,"childFolderCount":0,"wellKnownName":null}"#;
+            let listing = |with_g1: bool| {
+                let mut listed: Vec<String> = TREE
+                    .iter()
+                    .map(|(id, parent, wk)| listed_json(id, *parent, *wk))
+                    .collect();
+                if with_g1 {
+                    listed.push(g1.to_string());
+                }
+                format!(r#"{{"value":[{}]}}"#, listed.join(","))
+            };
+            let mut tree = TREE.to_vec();
+            tree.push(("G1", Some("INBOX"), None));
+            let (srv, handle, store, dir) = engine(
+                "folder-create-lost-answer",
+                world(
+                    vec![
+                        // The startup pass's listing, before the POST.
+                        (get_route("/me/mailFolders?", 200, &listing(false)), Some(1)),
+                        (get_route("/me/mailFolders?", 200, &listing(true)), None),
+                        once("POST", child, 500, "busy"),
+                        write("POST", child, 409, EXISTS),
+                        (
+                            get_route(
+                                child,
+                                200,
+                                &format!(
+                                    r#"{{"value":[{},{g1}]}}"#,
+                                    listed_json("PROJ", Some("INBOX"), None)
+                                ),
+                            ),
+                            None,
+                        ),
+                        write("PATCH", "/me/mailFolders/G1", 200, "{}"),
+                        write("POST", "/me/messages/I1/move", 201, r#"{"id":"I1b"}"#),
+                    ],
+                    &tree,
+                    &[("INBOX", "I1"), ("G1", "S1")],
+                ),
+                None,
+            );
+            assert!(row(&store, "G1").is_none(), "not on Graph yet");
+            send(
+                &handle,
+                SyncCommand::CreateFolder {
+                    parent: Some("INBOX".into()),
+                    name: "New".into(),
+                },
+            );
+            wait_requests(&srv, "POST", child, 1);
+            let local = local_folders(&store).pop().expect("the local: row");
+            send(
+                &handle,
+                SyncCommand::RenameFolder {
+                    id: local.clone(),
+                    name: "Renamed".into(),
+                },
+            );
+            send(
+                &handle,
+                SyncCommand::Move {
+                    id: "I1".into(),
+                    dest: local.clone(),
+                },
+            );
+            wait_queued(&store, 3);
+            assert_eq!(writes_sent(&srv).len(), 1, "all wait behind the 500");
+
+            // A pass first, whose listing stores Graph's G1 as its own row,
+            // then the drain: the retried POST answers 409.
+            send(&handle, SyncCommand::Refresh);
+            let mut seen = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::FolderCreated { .. })
+            });
+            assert_eq!(
+                seen.last(),
+                Some(&SyncEvent::FolderCreated {
+                    local_id: local.clone(),
+                    id: "G1".into()
+                })
+            );
+            wait_requests(&srv, "POST", "/me/messages/I1/move", 1);
+            wait_drained(&store);
+            seen.extend(handle.evt_rx.try_iter());
+            assert!(
+                !seen
+                    .iter()
+                    .any(|e| matches!(e, SyncEvent::FolderWriteFailed { .. })),
+                "{seen:?}"
+            );
+            let sent: Vec<(String, String, String)> = writes_sent(&srv);
+            let want = [
+                ("POST", child, r#"{"displayName":"New"}"#),
+                ("POST", child, r#"{"displayName":"New"}"#),
+                (
+                    "PATCH",
+                    "/me/mailFolders/G1",
+                    r#"{"displayName":"Renamed"}"#,
+                ),
+                ("POST", "/me/messages/I1/move", r#"{"destinationId":"G1"}"#),
+            ]
+            .map(|(m, p, b)| (m.to_string(), p.to_string(), b.to_string()));
+            assert_eq!(sent, want);
+            // The Refresh pass listed G1 (stored as its own row) between the
+            // two POSTs.
+            let reqs = srv.requests();
+            let posts: Vec<usize> = (0..reqs.len())
+                .filter(|&i| reqs[i].method == "POST" && reqs[i].path == child)
+                .collect();
+            assert!(
+                reqs[posts[0]..posts[1]]
+                    .iter()
+                    .any(|r| r.method == "GET" && r.path.starts_with("/me/mailFolders?")),
+                "a listing before the retry"
+            );
+            assert_eq!(
+                hits(&srv, "GET", "/me/mailFolders/INBOX/childFolders?$top=100"),
+                1,
+                "one lookup"
+            );
+            // One folder G1: the stale row merged, no `local:` row left.
+            assert!(local_folders(&store).is_empty());
+            assert_eq!(store.current_folder_id(&local).unwrap(), "G1");
+            let under_inbox: Vec<String> = store
+                .folders()
+                .unwrap()
+                .into_iter()
+                .filter(|f| f.parent_id.as_deref() == Some("INBOX"))
+                .map(|f| f.id)
+                .collect();
+            assert_eq!(under_inbox, ["PROJ", "G1"].map(String::from).to_vec());
+            assert!(wait_until(ENGINE_WAIT, || {
+                let mut mail = mail_in(&store, "G1");
+                mail.sort();
+                mail == ["I1b", "S1"]
+            }));
+            no_local_request(&srv);
+            stop(handle, dir);
+        }
+
         #[test]
         fn refused_folder_writes_revert_and_report() {
             let (srv, handle, store, dir) = engine(
@@ -42222,6 +42379,12 @@ mod tests {
             assert!(id.starts_with("local:"), "{id}");
             assert!(error.contains("already exists"), "{error}");
             assert!(local_folders(&store).is_empty(), "the local: row is gone");
+            // A 409 on a first POST is a clash with a folder the user has
+            // (#2109): no lookup of the parent's children.
+            assert_eq!(
+                hits(&srv, "GET", "/me/mailFolders/INBOX/childFolders?$top=100"),
+                0
+            );
 
             store.set_folder_expanded("PROJ", true).unwrap();
             send(
@@ -42692,6 +42855,26 @@ mod tests {
                     error: "no folder NOPE".into(),
                 }
             );
+            // A name a stored sibling has, in any case (#2109): under a
+            // parent, and at the top (reported under no id).
+            for (parent, name, id) in [(Some("INBOX"), "proj", "INBOX"), (None, "Arch", "")] {
+                send(
+                    &handle,
+                    SyncCommand::CreateFolder {
+                        parent: parent.map(str::to_string),
+                        name: name.into(),
+                    },
+                );
+                assert_eq!(
+                    wait_store_refused(&handle),
+                    SyncEvent::FolderWriteFailed {
+                        id: id.into(),
+                        write: FolderWrite::Create,
+                        status: None,
+                        error: format!("a folder named {name} is already there"),
+                    }
+                );
+            }
             // A copy (#2118): an unknown source or dest, the drafts
             // sentinel as either.
             for (id, dest, named, error) in [

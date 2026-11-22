@@ -3826,7 +3826,8 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   before any listing); Graph's move answer then stores the real one.
 - Refused by the store, with nothing written or queued: an unknown id, parent or dest; the drafts
   sentinel (`local:drafts-pending`) as any of them, since Graph never had it; and a move into the
-  folder itself or a folder under it (the stored `parent_id` would hold a cycle). The engine never
+  folder itself or a folder under it (the stored `parent_id` would hold a cycle); a create of a name
+  a sibling already has, in any case (#2109, `FolderRefusal::NameTaken`). The engine never
   refuses a folder for being well known; Graph does. Reported as `FolderWriteFailed { status:
   None }` plus `Error`; its `id` is the folder named, or a create's parent.
 - A created folder lives under a `local:` id (`local_draft_id`) until its create reaches Graph.
@@ -3925,11 +3926,81 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `a_folder_only_moved_under_a_refused_create_keeps_its_own_create`,
   `a_folder_created_under_a_refused_create_is_reported`,
   `fast_folders_follow_a_created_folder`).
-- Not done: a lookxy folder-management UI; dedup of a create retried
-  after a lost POST answer (a retry may 409 on the name Graph already has; the refusal discards
-  the local row and the next listing brings Graph's folder); `GET /me/mailFolders/delta`; search
+- Not done: a lookxy folder-management UI; `GET /me/mailFolders/delta`; search
   folders; folders in other mailboxes; returning the `local:` id synchronously (a host finds the
-  new row on `FoldersUpdated`; `FolderCreated` names both ids).
+  new row on `FoldersUpdated`; `FolderCreated` names both ids). A create retried after a lost
+  answer: see the next section (#2109).
+
+## A folder create retried after a lost answer (#2109)
+
+- The gap: a `CreateFolder` POST reached Graph but its answer was lost (a 5xx after the commit,
+  a dropped connection, a crash before the re-key). The retry got 409 (`ErrorFolderExists`), and
+  the refusal discarded the `local:` row with every op queued on its id: a rename, a move, and
+  messages moved into it.
+- The flag: the drain runs the create through `outbox::create_folder` with the row's `seq`
+  (`apply_op_with_retry`, as `SendDraft`'s `apply_send`), which sets `outbox.send_posted` right
+  before the POST (the #1874 column, no migration; the engine reads it as a send's only for
+  `SendDraft`). So a 5xx, a 429/503 throttle, a transport failure and a crash all count as
+  "may have made the folder". A 401 puts the flag back as it was before this run: Graph did
+  nothing, and the refresh runs the create again, so its 409 must still read as a first POST.
+  `apply_op` (no row) passes `None` and never looks up.
+- On a 409 with the flag set before this run: `GraphClient::find_child_folder(parent, name)`
+  (`childFolders` of the parent, or `/me/mailFolders` for the top, 100 a page, following
+  nextLink; an exact `displayName`, else the first caseless match, compared locally, no
+  `$filter`) with the **op's** name, the one POSTed (a queued rename changed the row's, not the
+  op's). Found, and adoptable (`Store::folder_not_adoptable`: no `folder_aliases` row other than
+  `local_id → G` maps onto it, so another create, copy or move re-keyed onto G is never merged
+  with this one; no queued delete takes it): `reconcile_created_folder` and `FolderCreated`, as a 2xx. A stale
+  row a listing stored for G is no alias: it merges (`rekey_folder_on` hands its mail and children
+  over). Otherwise the 409 itself is returned and refused as before. A 409 on a first POST is a
+  clash with a folder the user has: refused with no lookup. A lookup failure is returned as is:
+  a 5xx, throttle, transport or 401 keeps the op; another 4xx or `Parse` refuses it.
+- The store refuses the clash at its source: `Store::create_local_folder` refuses a name a stored
+  folder under the same stored parent has (the resolved parent; for a top create the root the
+  listing gives, or `parent_id IS NULL` with none known), `local:` siblings included, compared
+  with `graph::model::folder_names_clash` (exact, else caseless, as Exchange), the one rule
+  `find_child_folder`'s caseless match uses too. `FolderRefusal::NameTaken` ("a folder named
+  {name} is already there"), reported as the other store refusals (`FolderWriteFailed { status:
+  None }` and `Error`, the parent as its id, `""` at the top), nothing written or queued. Graph
+  would answer such a create 409 anyway. So a retry's 409 comes from our own earlier POST, or
+  from a folder another client made under that parent after the create was queued. The flag is
+  not put back on a transport failure (it can be a read timeout after the request went out) or
+  a throttle (`Throttled` covers a 503, which may follow a commit). The alias guard stays as a
+  second line.
+- Not adopted either (`Store::folder_not_adoptable`, one helper for both rules, the 409 then
+  stands): a folder another create, copy or move was already re-keyed onto (the alias rule), and
+  a folder a queued `DeleteFolder` takes (`folder_being_deleted`): the delete removed its row at
+  once, so the sibling check let the create through, but Graph has the folder until the delete
+  is sent.
+- Residual: any folder of that name under the parent on Graph that the store did not have when
+  the create was queued is adopted. That includes one another client made after the last
+  listing, the ordinary case for a create made offline: its first attempt is a transport failure,
+  which sets the flag. The `local:` folder's mail then lands in that folder, and a rename or move
+  queued on the `local:` id applies to it
+  (`create_folder_after_a_transport_failure_adopts_a_folder_listed_later_residual` asserts it).
+- Tests: `client.rs` `find_child_folder_pages_children_and_top_and_matches_names`,
+  `find_child_folder_returns_a_page_error`; `store/mod.rs`
+  `folder_not_adoptable_ignores_the_folders_own_alias`; `outbox.rs`
+  `create_folder_marks_its_post_sent`,
+  `create_folder_409_after_a_posted_attempt_adopts_graphs_folder` (the flag with no attempt
+  counted: the crash case), `create_folder_409_on_a_first_post_is_refused_without_a_lookup`,
+  `create_folder_409_retried_with_no_such_folder_returns_the_409`,
+  `create_folder_409_does_not_adopt_a_folder_another_create_already_took`,
+  `create_folder_401_restores_the_posted_flag`, `create_folder_lookup_failure_is_returned_as_is`,
+  `create_folder_refuses_a_name_a_stored_sibling_has_at_queue_time`,
+  `create_folder_after_a_transport_failure_adopts_a_folder_listed_later_residual` (the flag kept
+  after a transport failure; the residual adopted),
+  `create_folder_409_does_not_adopt_a_folder_whose_delete_is_queued`;
+  `store/mod.rs` `create_local_folder_refuses_a_name_a_sibling_has`;
+  `engine.rs` `folder_writes`
+  `a_create_retried_after_a_lost_answer_adopts_graphs_folder_on_409` (end to end: a 500, a
+  Refresh pass listing G1 as its own row, then the 409; it fails with `FolderWriteFailed(409)`
+  without the fix), `refused_folder_writes_revert_and_report` (a first POST's 409 sends no
+  lookup) and `folder_commands_the_store_refuses_report_and_queue_nothing` (`NameTaken` under a
+  parent and at the top, no request).
+- Not done: a `CopyFolder` (#2118) retried after a lost answer (it may copy twice or 409).
+  Contacts and events: Graph allows duplicates, so a lost answer there makes a duplicate, not a
+  loss.
 
 ## Delete a folder (#2107)
 
