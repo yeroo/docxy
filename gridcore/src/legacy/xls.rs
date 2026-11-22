@@ -233,6 +233,10 @@ const EXTERNAL_LINK_PATH: &str =
 ///   absolute target, `file:///C:\dir\file.ext`, a space as `%20` (as
 ///   addin-udf.xlsb's has it).
 ///
+/// A target is a URI reference, so in either form a `%` is `%25` (as a
+/// hyperlink's path is written, `xlsx::hyperlinks`) and a `#`, which
+/// would start a fragment, `%23`.
+///
 /// Any other form (the same volume, relative directories, a UNC or long
 /// volume, the startup directories, an unencoded path, DDE and OLE) has no
 /// file showing how the `.xlsx` spells it, so it gives `None`.
@@ -243,6 +247,7 @@ fn virt_path(path: &str) -> Option<(String, bool)> {
                 .chars()
                 .any(|ch| ch < ' ' || matches!(ch, '\\' | '/' | ':'))
     };
+    let uri = |s: &str| s.replace('%', "%25").replace('#', "%23");
     let rest = path.strip_prefix('\u{1}')?;
     if let Some(file) = rest.strip_prefix('\u{8}') {
         return plain(file).then(|| (file.to_string(), true));
@@ -258,10 +263,10 @@ fn virt_path(path: &str) -> Option<(String, bool)> {
         if !parts.iter().all(|p| plain(p)) {
             return None;
         }
-        let path = parts.join("\\").replace(' ', "%20");
+        let path = uri(&parts.join("\\")).replace(' ', "%20");
         return Some((format!("file:///{drive}:\\{path}"), false));
     }
-    (plain(rest) && !rest.starts_with('@')).then(|| (rest.to_string(), false))
+    (plain(rest) && !rest.starts_with('@')).then(|| (uri(rest), false))
 }
 
 /// A NAME record as read, decompiled once every NAME is known.
@@ -579,17 +584,16 @@ impl Styles {
 /// without a word.
 #[rustfmt::skip]
 const GLOBALS_KNOWN: &[u16] = &[
-    // Read.
+    // Read (XCT and CRN, 0x0059 and 0x005A, as a linked book's cached
+    // cells, #903).
     0x000E, 0x0012, 0x0017, 0x0018, 0x0019, 0x0022, 0x0023, 0x002F, 0x0031, 0x003D, 0x0040,
-    0x005B, 0x0085, 0x008D, 0x0092, 0x00DA, 0x00E0, 0x00FC, 0x01A9, 0x01AE, 0x01AF, 0x0293,
-    0x041E, 0x0863, 0x087C, 0x087D, 0x088C,
+    0x0059, 0x005A, 0x005B, 0x0085, 0x008D, 0x0092, 0x00DA, 0x00E0, 0x00FC, 0x01A9, 0x01AE,
+    0x01AF, 0x0293, 0x041E, 0x0863, 0x087C, 0x087D, 0x088C,
     // CONTINUE (joined to its record), BOF.
     0x003C, 0x0809,
-    // PASSWORD (PROTECT's hash; PROTECT is named), CODEPAGE, XCT and CRN
-    // (another workbook's cached cells: formulas into it are counted),
-    // WRITEACCESS, COUNTRY, FNGROUPCOUNT, MMS, INTERFACEHDR,
-    // INTERFACEEND.
-    0x0013, 0x0042, 0x0059, 0x005A, 0x005C, 0x008C, 0x009C, 0x00C1, 0x00E1, 0x00E2,
+    // PASSWORD (PROTECT's hash; PROTECT is named), CODEPAGE, WRITEACCESS,
+    // COUNTRY, FNGROUPCOUNT, MMS, INTERFACEHDR, INTERFACEEND.
+    0x0013, 0x0042, 0x005C, 0x008C, 0x009C, 0x00C1, 0x00E1, 0x00E2,
     // MSODRAWINGGROUP, and HFPICTURE with the drawing group
     // (fIsDrawingGroup), which Excel writes beside it: the drawings, and a
     // sheet's own header and footer pictures (its HFPICTURE), are named
@@ -677,6 +681,8 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
         xf_count: None,
     };
     let mut itab_cur = 0usize;
+    // A linked book's cache that outgrew the cell budget (CRN).
+    let mut cells_err: Option<OpenError> = None;
 
     for (k, r) in recs.iter().enumerate().skip(1) {
         if r.ty == EOF {
@@ -939,9 +945,17 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
                             }
                             _ => return None,
                         };
-                        if let Some(v) = value {
-                            b.cache.insert((sheet, row, u32::from(col)), v);
+                        let Some(v) = value else { continue };
+                        let key = (sheet, row, u32::from(col));
+                        // Charged as it is read, so a crafted stream is
+                        // refused before the cache outgrows the budget.
+                        if !b.cache.contains_key(&key) {
+                            if let Err(e) = book.charge_cells(1) {
+                                cells_err = Some(e);
+                                return None;
+                            }
                         }
+                        b.cache.insert(key, v);
                     }
                 }
                 0x0017 => {
@@ -990,11 +1004,14 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
         if r.ty == 0x002F {
             return Err(OpenError::EncryptedXls);
         }
+        if let Some(e) = cells_err.take() {
+            return Err(e);
+        }
     }
 
     // Links are numbered in the order of the books that have one: every
     // external book whose path decodes, as Excel keeps every SUPBOOK.
-    // Their cached cells count against the cell budget.
+    // Their cached cells were charged against the cell budget as read.
     for b in &mut g.books {
         let (Book::External(k), Some((target, library))) = (&mut b.kind, b.link.take()) else {
             continue;
@@ -1005,7 +1022,6 @@ pub(crate) fn read_with(stream: &[u8], limits: Limits) -> Result<BookIn, OpenErr
                 book.limits.links
             )));
         }
-        book.charge_cells(b.cache.len())?;
         let ty = if library {
             XL_LIBRARY
         } else {
@@ -3585,6 +3601,15 @@ pub(crate) mod tests {
             got(b"\x01\x01C\x03A.xlsx"),
             Some((r"file:///C:\A.xlsx".to_string(), false))
         );
+        // `%` and `#` escaped, so the target reads back as the path.
+        assert_eq!(
+            got(b"\x01\x01C\x03100% off\x03A#1.xlsx"),
+            Some((r"file:///C:\100%25%20off\A%231.xlsx".to_string(), false))
+        );
+        assert_eq!(
+            got(b"\x01100%#.xlsx"),
+            Some(("100%25%23.xlsx".to_string(), false))
+        );
         for bad in [
             &b"\x01\x08Analysis\x03ANALYS32.XLL"[..],
             b"\x01\x08",
@@ -3918,6 +3943,47 @@ pub(crate) mod tests {
             )),
             "{xml}"
         );
+    }
+
+    /// A linked book's cached cells count against the cell budget as they
+    /// are read (#903 r1): past it the workbook is refused before the cache
+    /// grows further; cells of a sheet the book doesn't list are neither
+    /// kept nor charged, and a cell cached twice is charged once.
+    #[test]
+    fn a_linked_books_cache_is_budgeted() {
+        let mut nums = Vec::new();
+        for v in [1.0f64, 2.0, 3.0] {
+            nums.push(0x01);
+            nums.extend(v.to_le_bytes());
+        }
+        let mut crn = vec![2, 0, 0, 0];
+        crn.extend(&nums);
+        let xct = |itab: u16| {
+            let mut b = 3u16.to_le_bytes().to_vec();
+            b.extend(itab.to_le_bytes());
+            rec(0x0059, &b)
+        };
+        let stream = |itab: u16| {
+            workbook(
+                &[
+                    supbook(b"\x01src.xlsx", &["P"]),
+                    xct(itab),
+                    rec(0x005A, &crn),
+                    rec(0x005A, &crn),
+                ],
+                &[],
+            )
+        };
+        let limits = |cells| Limits {
+            cells,
+            ..Limits::default()
+        };
+        let err = read_with(&stream(0), limits(2)).err().unwrap();
+        assert!(err.to_string().contains("too many cells"), "{err}");
+        let book = read_with(&stream(0), limits(3)).unwrap();
+        assert_eq!(book.external_links[0].cache.len(), 3);
+        let book = read_with(&stream(5), limits(0)).unwrap();
+        assert!(book.external_links[0].cache.is_empty());
     }
 
     /// A SUPBOOK or EXTERNNAME cut short still takes its place, so the

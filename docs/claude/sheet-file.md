@@ -392,12 +392,18 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   (`xls::virt_path`). In an `.xlsb`, it is a BrtSupBookSrc whose part is read
   (`sbt` 0, its rel there). A book needs no function name any more (it did in
   #888/#890), as Excel keeps every book. Each link counts against
-  `Limits::links`, and its cached cells against `Limits::cells`.
+  `Limits::links`. Its cached cells count against `Limits::cells`, charged
+  one by one as they are read (CRN, BrtExternCell*), so a crafted cache is
+  refused before it outgrows the budget.
 - virtPath forms with an Excel oracle are decoded:
   - `\x01\x08file`: Library, `xlLibrary` rel.
   - `\x01file`: beside the workbook, target `file`, as ext-name.xls has it.
   - `\x01\x01C\x03dir\x03file`: `file:///C:\dir\file`, with a space as `%20`
     (the spelling of the `.xlsb`'s absolute rel).
+
+  A target is a URI reference, so in the last two forms `%` is written `%25`
+  and `#` is written `%23`. The Library form stays raw: the `.xls` writer
+  reads it back as a plain file name.
 
   The other forms (same volume, `\x03`/`\x04` relative directories, long or
   UNC volumes, startup directories, unencoded, DDE/OLE) give no link, so a
@@ -426,7 +432,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
 - Neither `[1]P!A1` nor `[1]!Name` parses, so the engine keeps the cached
   value. A quoted `'[1]My Sheet'!A1` does parse: `Eval::resolve_sheet` marks a
   missing sheet whose name holds `[` unsupported, so it keeps its cached value
-  too, for an `.xlsx` as well. Because these don't parse,
+  too, for an `.xlsx` as well. This doesn't apply to a reference that
+  INDIRECT's text names (`Eval::indirect` depth): that one is `#REF!`, as in
+  Excel for a closed book. Marking it would freeze the cell after the text
+  changes. Because these don't parse,
   `BookIn::build` can't carry a sheet rename into them. One that names a
   renamed sheet is dropped (`names_external_book`).
 - Not done:

@@ -309,14 +309,22 @@ fn rels(zip: &ZipArchive, part: &str) -> HashMap<String, (String, String)> {
 ///
 /// The cached cells are the BrtExternTableStart blocks: the sheet, then
 /// rows (BrtExternRowHdr) of cells. A blank is left out, as is a cell cut
-/// short or off the grid; [`super::write_external_links`] leaves out a
-/// sheet the book doesn't list.
-fn read_link(zip: &ZipArchive, part: &str) -> Option<ExternalLink> {
-    let bytes = zip.read(part)?;
+/// short, off the grid or on a sheet the book doesn't list. Each cell kept
+/// is charged to `book`'s cell budget as it is read, so a crafted part is
+/// refused (the error) before its cache outgrows the budget.
+fn read_link(
+    zip: &ZipArchive,
+    part: &str,
+    book: &mut BookIn,
+) -> Result<Option<ExternalLink>, OpenError> {
+    let Some(bytes) = zip.read(part) else {
+        return Ok(None);
+    };
     let mut link = ExternalLink::default();
     let mut workbook = false;
     // The sheet and row the cached cells go in.
     let (mut sheet, mut row): (Option<u32>, Option<u32>) = (None, None);
+    let mut over: Option<OpenError> = None;
     for (ty, body) in records(&bytes) {
         let mut c = Cur::new(body);
         let _ = (|| -> Option<()> {
@@ -357,19 +365,31 @@ fn read_link(zip: &ZipArchive, part: &str) -> Option<ExternalLink> {
                         BRT_EXTERN_CELL_STRING => ExtValue::Str(c.wide()?),
                         _ => return None,
                     };
-                    if on_grid(r, col) {
-                        link.cache.insert((s, r, col), value);
+                    if (s as usize) >= link.sheets.len() || !on_grid(r, col) {
+                        return None;
                     }
+                    if !link.cache.contains_key(&(s, r, col)) {
+                        if let Err(e) = book.charge_cells(1) {
+                            over = Some(e);
+                            return None;
+                        }
+                    }
+                    link.cache.insert((s, r, col), value);
                 }
                 _ => {}
             }
             Some(())
         })();
+        if let Some(e) = over {
+            return Err(e);
+        }
     }
-    let bytes = zip.read(&rels_part_name(part))?;
+    let Some(bytes) = zip.read(&rels_part_name(part)) else {
+        return Ok(None);
+    };
     link.rels = parse_rels_mode(&String::from_utf8_lossy(&bytes));
     let named = link.rels.iter().any(|(id, ..)| *id == link.book);
-    (workbook && named).then_some(link)
+    Ok((workbook && named).then_some(link))
 }
 
 /// Read an `.xlsb` package.
@@ -398,6 +418,8 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
     // Each external link part read so far: its place in `g.links`.
     let mut link_of: HashMap<String, Option<usize>> = HashMap::new();
     let mut too_many_links = false;
+    // A link part whose cache outgrew the cell budget.
+    let mut link_err: Option<OpenError> = None;
     for (ty, body) in records(&wb) {
         let mut c = Cur::new(body);
         let _ = (|| -> Option<()> {
@@ -425,7 +447,14 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
                         Some((_, part)) => match link_of.get(part) {
                             Some(&k) => k,
                             None => {
-                                let k = match read_link(zip, part) {
+                                let read = match read_link(zip, part, &mut book) {
+                                    Ok(l) => l,
+                                    Err(e) => {
+                                        link_err = Some(e);
+                                        None
+                                    }
+                                };
+                                let k = match read {
                                     Some(_) if g.links.len() >= book.limits.links => {
                                         too_many_links = true;
                                         None
@@ -486,9 +515,8 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
             book.limits.links
         )));
     }
-    // The links' cached cells count against the cell budget.
-    for l in &g.links {
-        book.charge_cells(l.cache.len())?;
+    if let Some(e) = link_err {
+        return Err(e);
     }
 
     let sst: Vec<String> = zip
@@ -1632,6 +1660,43 @@ mod tests {
         }
         assert_eq!(book.names[0].formula, "[1]P!$A$1");
         assert_eq!(book.external_links.len(), 1);
+    }
+
+    /// A link part's cached cells count against the cell budget as they
+    /// are read (#903 r1): past it the workbook is refused; cells of a
+    /// sheet the book doesn't list are neither kept nor charged, and a cell
+    /// cached twice is charged once.
+    #[test]
+    fn a_link_parts_cache_is_budgeted() {
+        let part = |itab: u8| {
+            let mut v = link_part(0, "rId1", &["P"], &["F"]);
+            v.extend(rec(BRT_EXTERN_TABLE_START, &[itab, 0, 0, 0, 0]));
+            v.extend(rec(BRT_EXTERN_ROW_HDR, &0u32.to_le_bytes()));
+            for col in [0u32, 1, 2, 2] {
+                let mut b = col.to_le_bytes().to_vec();
+                b.extend(1.0f64.to_le_bytes());
+                v.extend(rec(BRT_EXTERN_CELL_REAL, &b));
+            }
+            v.extend(rec(BRT_EXTERN_TABLE_END, &[]));
+            v
+        };
+        let file = |itab: u8| {
+            xlsb_links(
+                &[rec(BRT_SUP_BOOK_SRC, &wide("rId2"))],
+                &[],
+                &[("rId2", part(itab), LINK_RELS)],
+            )
+        };
+        let limits = |cells| Limits {
+            cells,
+            ..Limits::default()
+        };
+        let read =
+            |itab: u8, cells| read_with(&ZipArchive::open(&file(itab)).unwrap(), limits(cells));
+        let err = read(0, 2).err().unwrap();
+        assert!(err.to_string().contains("too many cells"), "{err}");
+        assert_eq!(read(0, 3).unwrap().external_links[0].cache.len(), 3);
+        assert!(read(5, 0).unwrap().external_links[0].cache.is_empty());
     }
 
     /// Books naming the same link part are one link, read once, however
