@@ -2223,7 +2223,10 @@ impl Engine {
 /// The same text, or, when either spells a name in file form (`_xlfn.`,
 /// `_xlws.`, `_xlpm.`; `_xlfn.ANCHORARRAY`/`_xlfn.SINGLE` against `A1#`/`@x`
 /// too), the same formula as a file prints it: a loaded `_xlfn.PIVOTBY(A1,4)`
-/// retyped as Excel shows it, `PIVOTBY(A1,4)`. Text with no prefix on either
+/// retyped as Excel shows it, `PIVOTBY(A1,4)`. The prints compare as Excel
+/// matches names, case aside ([`crate::names::name_eq`]: defined names, sheet
+/// names, table and column names, LET names), but string literals byte for
+/// byte (`"a"` is not `"A"`): [`same_print`]. Text with no prefix on either
 /// side keeps the exact-text rule. Not for a held formula kept as loaded
 /// ([`CellMeta::loaded_f`]: a bare name that may be a UDF named like a
 /// builtin), where the prefix names another function. An unknown `_xlfn.FOO`
@@ -2242,9 +2245,53 @@ fn same_formula(held: &Cell, new: &Cell) -> bool {
         return false;
     }
     match (formula::parse(h), formula::parse(n)) {
-        (Ok(a), Ok(b)) => formula::to_file_string(&a) == formula::to_file_string(&b),
+        (Ok(a), Ok(b)) => same_print(&formula::to_file_string(&a), &formula::to_file_string(&b)),
         _ => false,
     }
+}
+
+/// Are two printed formulas the same, case aside outside string literals?
+/// Each splits into its `"…"` runs, which must match exactly, and the text
+/// between them (quoted sheet names and `[…]` specs included, read whole so
+/// a `"` inside one starts nothing), which matches by
+/// [`crate::names::name_eq`]. The runs must line up.
+fn same_print(a: &str, b: &str) -> bool {
+    /// `src` as alternating runs: `(true, "…")` for a string literal,
+    /// `(false, text)` for what lies between.
+    fn runs(src: &str) -> Vec<(bool, &str)> {
+        let b = src.as_bytes();
+        let mut out = Vec::new();
+        let (mut from, mut i) = (0, 0);
+        while i < b.len() {
+            if !formula::is_quote_open(b[i]) {
+                i += 1;
+                continue;
+            }
+            let end = formula::skip_quoted(b, i);
+            if b[i] == b'"' {
+                if from < i {
+                    out.push((false, &src[from..i]));
+                }
+                out.push((true, &src[i..end]));
+                from = end;
+            }
+            i = end;
+        }
+        if from < b.len() {
+            out.push((false, &src[from..]));
+        }
+        out
+    }
+    let (ra, rb) = (runs(a), runs(b));
+    ra.len() == rb.len()
+        && ra.iter().zip(&rb).all(|(&(sa, x), &(sb, y))| {
+            sa == sb
+                && if sa {
+                    x == y
+                } else {
+                    crate::names::name_eq(x, y)
+                }
+        })
 }
 
 /// The fixed block of a legacy Ctrl+Shift+Enter array at `(row, col)`: a
@@ -8135,6 +8182,91 @@ mod tests {
         assert_eq!(value_at(&wb, "B1"), n(5.0));
     }
 
+    #[test]
+    fn same_formula_folds_the_case_of_names_but_not_of_strings() {
+        // #849 r1 m1: a prefixed formula retyped in other case is the same
+        // formula when only names differ in case (defined names, sheets,
+        // tables and columns, LET names), as Excel matches them; a string
+        // literal in other case is another formula.
+        let same =
+            |held: &str, typed: &str| same_formula(&Cell::formula(held), &Cell::formula(typed));
+        for (held, typed) in [
+            ("_xlfn.PIVOTBY(Sales,4)", "pivotby(sales,4)"),
+            ("_xlfn.PIVOTBY(Sheet2!A1:B9,4)", "pivotby(sheet2!a1:b9,4)"),
+            ("_xlfn.PIVOTBY('my sheet'!A1,4)", "PIVOTBY('My Sheet'!A1,4)"),
+            ("_xlfn.PIVOTBY(Table1[Col],4)", "pivotby(table1[col],4)"),
+            (
+                "_xlfn.PIVOTBY(Table1[[#All],[Col]],4)",
+                "pivotby(table1[[#all],[col]],4)",
+            ),
+            (
+                "_xlfn.LET(_xlpm.x,A1,_xlfn.PIVOTBY(_xlpm.x,4))",
+                "let(X,a1,pivotby(X,4))",
+            ),
+            ("_xlfn.PIVOTBY(Ärger,4)", "PIVOTBY(ÄRGER,4)"),
+            ("_xlfn.PIVOTBY(\"a\",4)", "PIVOTBY(\"a\",4)"),
+        ] {
+            assert!(same(held, typed), "{held} / {typed}");
+        }
+        for (held, typed) in [
+            ("_xlfn.PIVOTBY(\"a\",4)", "PIVOTBY(\"A\",4)"),
+            ("_xlfn.PIVOTBY(A1,\"x\"&\"y\")", "PIVOTBY(A1,\"X\"&\"y\")"),
+            ("_xlfn.PIVOTBY(Sales,4)", "PIVOTBY(Sale,4)"),
+            ("_xlfn.PIVOTBY(Sheet2!A1,4)", "PIVOTBY(Sheet3!A1,4)"),
+        ] {
+            assert!(!same(held, typed), "{held} / {typed}");
+        }
+    }
+
+    #[test]
+    fn a_frozen_formula_retyped_with_names_in_other_case_keeps_its_cached_values() {
+        // #849 r1 m1: through `set_cell`, a frozen block whose formula reads
+        // a defined name, another sheet or a LET name, retyped bare and in
+        // other case, keeps its block; a string in other case clears it.
+        let n = |v: f64| CellValue::Number(v);
+        let wb_with = |src: &str| {
+            let mut wb = frozen_block_wb_as(src);
+            for name in ["Sheet2", "my sheet"] {
+                let mut sh = Sheet {
+                    name: name.to_string(),
+                    ..Sheet::default()
+                };
+                sh.set_cell(0, 0, Cell::number(2.0));
+                wb.sheets.push(sh);
+            }
+            wb.defined_names.push(crate::sheet::DefinedName {
+                name: "Sales".to_string(),
+                scope: None,
+                formula: "Sheet1!$A$1".to_string(),
+            });
+            wb
+        };
+        for (held, typed) in [
+            ("_xlfn.PIVOTBY(Sales,4)", "pivotby(sales,4)"),
+            ("_xlfn.PIVOTBY(Sheet2!A1,4)", "pivotby(sheet2!a1,4)"),
+            ("_xlfn.PIVOTBY('my sheet'!A1,4)", "PIVOTBY('My Sheet'!A1,4)"),
+            (
+                "_xlfn.LET(_xlpm.x,A1,_xlfn.PIVOTBY(_xlpm.x,4))",
+                "let(X,a1,pivotby(X,4))",
+            ),
+        ] {
+            let mut wb = wb_with(held);
+            let mut eng = Engine::new(&wb);
+            eng.recalc_all(&mut wb);
+            assert!(eng.is_frozen(&wb, (0, 0, 4)), "{typed}");
+            set(&mut eng, &mut wb, "E1", Cell::formula(typed));
+            assert_eq!(col_e(&wb), vec![n(7.0), n(8.0), n(9.0)], "{typed}");
+            assert_eq!(cell_at(&wb, "E1").formula.as_deref(), Some(held));
+        }
+        let mut wb = wb_with("_xlfn.PIVOTBY(\"a\",4)");
+        let mut eng = Engine::new(&wb);
+        set(&mut eng, &mut wb, "E1", Cell::formula("PIVOTBY(\"A\",4)"));
+        assert_eq!(value_at(&wb, "E2"), CellValue::Empty);
+        assert_eq!(
+            cell_at(&wb, "E1").formula.as_deref(),
+            Some("PIVOTBY(\"A\",4)")
+        );
+    }
     #[test]
     fn a_formula_retyped_in_other_spelling_keeps_its_kind() {
         // #849: a formula the engine evaluates, retyped without its prefix,

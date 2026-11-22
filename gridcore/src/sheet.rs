@@ -177,10 +177,10 @@ pub struct CellMeta {
     /// edit or reprint changes the text and the save translates it again.
     pub loaded_f: Option<String>,
     /// The formula was typed here: set when [`crate::engine::Engine::set_cell`]
-    /// gets new formula text (the same text keeps what the formula was), and
-    /// carried by copies ([`crate::edit`]'s rebase). Evaluated with spill
-    /// semantics (not implicit intersection), also after the engine is
-    /// rebuilt. Never written to the file.
+    /// gets a new formula (the same formula again, file spelling aside, keeps
+    /// what the formula was), and carried by copies ([`crate::edit`]'s
+    /// rebase). Evaluated with spill semantics (not implicit intersection),
+    /// also after the engine is rebuilt. Never written to the file.
     pub modern: bool,
     /// The engine evaluated this typed formula as an array (a multi-cell range
     /// or any computed array, even 1x1), so it is a dynamic array: the writer
