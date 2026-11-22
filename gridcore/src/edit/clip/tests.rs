@@ -338,7 +338,8 @@ fn move_refs_rules_stay_follows_absolute_refs_in_rules_left_in_place() {
     sheet
         .cond_formats
         .push(cf(&[(0, 0, 9, 3)], expr("F1+$F1+F$1+$F$1#")));
-    // A rule the cut doesn't meet is re-pointed whole.
+    // A rule the cut doesn't meet follows it, split where its cells read it
+    // differently (#1458).
     sheet.cond_formats.push(cf(&[(5, 7, 9, 9)], expr("F1>0")));
     assert!(move_refs_rules_stay(&mut wb, 0, &cut_a1_f1_to_a20()));
     assert_eq!(rule_formula(&wb, 0, 0), "$F$20=\"on\"");
