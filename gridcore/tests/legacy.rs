@@ -428,6 +428,213 @@ fn legacy_imports_match_their_xlsx_originals() {
     );
 }
 
+/// A page setup with empty header and footer texts as none: Excel's
+/// `.xlsx` writes `<oddHeader></oddHeader>`, its `.xls` an empty HEADER.
+fn page_setup_of(s: &gridcore::sheet::Sheet) -> gridcore::print::setup::PageSetup {
+    let mut ps = s.page_setup.clone();
+    let hf = &mut ps.header_footer;
+    for t in [
+        &mut hf.odd_header,
+        &mut hf.odd_footer,
+        &mut hf.even_header,
+        &mut hf.even_footer,
+        &mut hf.first_header,
+        &mut hf.first_footer,
+    ] {
+        if t.as_deref() == Some("") {
+            *t = None;
+        }
+    }
+    ps
+}
+
+/// The `.xls` import reads each sheet's page setup, page breaks and
+/// outline settings as Excel's `.xlsx` original has them, and Convert
+/// (a save as `.xlsx`) keeps them (#1440).
+#[test]
+fn xls_page_setup_matches_the_xlsx_originals() {
+    let mut errs = Vec::new();
+    let mut compared = 0;
+    for (src_dir, legacy_dir) in [
+        (corpus("xlsx"), corpus("legacy")),
+        (
+            corpus("legacy").join("extra"),
+            corpus("legacy").join("extra"),
+        ),
+    ] {
+        let mut stems: Vec<String> = std::fs::read_dir(&src_dir)
+            .expect("corpus dir")
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.extension().is_some_and(|x| x == "xlsx"))
+            .map(|p| p.file_stem().unwrap().to_string_lossy().into_owned())
+            .collect();
+        stems.sort();
+        for stem in stems {
+            let src = load_xlsx(&std::fs::read(src_dir.join(format!("{stem}.xlsx"))).unwrap())
+                .expect("corpus xlsx loads")
+                .workbook;
+            let file = format!("{stem}.xls");
+            let data = std::fs::read(legacy_dir.join(&file)).unwrap();
+            let (pkg, _) = open_workbook(&data).unwrap_or_else(|e| panic!("{file}: {e}"));
+            let converted = load_xlsx(&save_xlsx(&pkg)).expect("converted import reloads");
+            for (how, got) in [("import", &pkg.workbook), ("convert", &converted.workbook)] {
+                for (want, have) in src.sheets.iter().zip(&got.sheets) {
+                    let at = |what: &str| format!("{file} ({how}): {}: {what}", want.name);
+                    if page_setup_of(want) != page_setup_of(have) {
+                        errs.push(at(&format!(
+                            "page setup\n  xls  {:?}\n  xlsx {:?}",
+                            page_setup_of(have),
+                            page_setup_of(want)
+                        )));
+                    }
+                    let ids = |b: &[gridcore::sheet::PageBreak]| {
+                        b.iter().map(|b| (b.id, b.is_manual())).collect::<Vec<_>>()
+                    };
+                    if ids(&want.row_breaks) != ids(&have.row_breaks)
+                        || ids(&want.col_breaks) != ids(&have.col_breaks)
+                    {
+                        errs.push(at("page breaks"));
+                    }
+                    if want.outline != have.outline {
+                        errs.push(at("outline settings"));
+                    }
+                    if want.max_row_outline() != have.max_row_outline()
+                        || want.max_col_outline() != have.max_col_outline()
+                    {
+                        errs.push(at("outline levels"));
+                    }
+                    compared += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(compared, 2 * 22, "sheets compared");
+    assert!(
+        errs.is_empty(),
+        "{} problems:\n{}",
+        errs.len(),
+        errs.join("\n")
+    );
+}
+
+/// Convert keeps what the corpus lacks: an imported `.xls`'s outlines,
+/// manual page breaks and outline settings come through a save as `.xlsx`
+/// (#1440).
+#[test]
+fn xls_outlines_and_breaks_survive_convert() {
+    let data = std::fs::read(corpus("legacy").join("oracle-basic.xls")).unwrap();
+    let (mut pkg, _) = open_workbook(&data).unwrap();
+    let s = &mut pkg.workbook.sheets[0];
+    for r in 2..=4 {
+        s.set_row_outline(r, 2);
+    }
+    s.set_row_collapsed(5, true);
+    s.set_col_outline(1, 1);
+    s.set_col_collapsed(2, true);
+    s.outline.summary_below = false;
+    s.row_breaks = vec![gridcore::sheet::PageBreak {
+        id: 6,
+        attrs: " max=\"16383\" man=\"1\"".into(),
+    }];
+    s.col_breaks = vec![gridcore::sheet::PageBreak {
+        id: 3,
+        attrs: " man=\"1\"".into(),
+    }];
+    s.page_setup.orientation = gridcore::print::setup::Orientation::Landscape;
+    // Write it as an .xls (Ctrl+S), open that, Convert it.
+    let out = gridcore::legacy::write_xls(&pkg);
+    assert!(out.lost.is_empty(), "{:?}", out.lost);
+    let (xls, _) = open_workbook(&out.bytes).unwrap();
+    let back = load_xlsx(&save_xlsx(&xls)).expect("converted reloads");
+    let (a, b) = (&pkg.workbook.sheets[0], &back.workbook.sheets[0]);
+    assert_eq!(page_setup_of(b), page_setup_of(a));
+    for r in 0..8 {
+        assert_eq!(
+            (b.row_outline(r), b.row_collapsed(r)),
+            (a.row_outline(r), a.row_collapsed(r)),
+            "row {r}"
+        );
+    }
+    for c in 0..4 {
+        assert_eq!(
+            (b.col_outline(c), b.col_collapsed(c)),
+            (a.col_outline(c), a.col_collapsed(c)),
+            "col {c}"
+        );
+    }
+    assert_eq!(b.outline, a.outline);
+    let ids = |v: &[gridcore::sheet::PageBreak]| {
+        v.iter().map(|b| (b.id, b.is_manual())).collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&b.row_breaks), [(6, true)]);
+    assert_eq!(ids(&b.col_breaks), [(3, true)]);
+}
+
+/// The sheet records a writer puts around the page setup, in the order
+/// they come: BOF to DIMENSIONS of each worksheet substream.
+fn page_setup_record_order(file: &[u8]) -> Vec<Vec<u16>> {
+    const PAGE: &[u16] = &[
+        0x002A, 0x002B, 0x0082, 0x0080, 0x0225, 0x0081, 0x001B, 0x001A, 0x0014, 0x0015, 0x0083,
+        0x0084, 0x0026, 0x0027, 0x0028, 0x0029, 0x00A1, 0x089C, 0x0055, 0x0200,
+    ];
+    let cfb = opccore::cfb::Cfb::open(file).unwrap();
+    let s = cfb.read_stream("Workbook").unwrap();
+    let (mut out, mut at, mut depth): (Vec<Vec<u16>>, usize, usize) = (Vec::new(), 0, 0);
+    let mut open = false;
+    while at + 4 <= s.len() {
+        let ty = u16::from_le_bytes([s[at], s[at + 1]]);
+        let len = u16::from_le_bytes([s[at + 2], s[at + 3]]) as usize;
+        let dt = s
+            .get(at + 6..at + 8)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]));
+        at += 4 + len;
+        match ty {
+            0x0809 => {
+                depth += 1;
+                open = depth == 1 && dt == Some(0x0010);
+                if open {
+                    out.push(Vec::new());
+                }
+            }
+            0x000A => depth = depth.saturating_sub(1),
+            0x0200 if open => {
+                out.last_mut().unwrap().push(ty);
+                open = false;
+            }
+            _ if open && PAGE.contains(&ty) => out.last_mut().unwrap().push(ty),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The writer puts the page setup records where Excel does (#1440): its
+/// sheets' sequence, BOF to DIMENSIONS, is the corpus file's own.
+#[test]
+fn xls_page_setup_records_come_in_excels_order() {
+    for stem in ["oracle-basic", "calc-3d", "shape-amortization"] {
+        let data = std::fs::read(corpus("legacy").join(format!("{stem}.xls"))).unwrap();
+        let (pkg, _) = open_workbook(&data).unwrap();
+        let excel = page_setup_record_order(&data);
+        let ours = page_setup_record_order(&gridcore::legacy::write_xls(&pkg).bytes);
+        assert_eq!(ours, excel, "{stem}");
+        assert!(excel.iter().all(|s| s.len() >= 18), "{stem}: {excel:?}");
+    }
+    // With breaks: they go between WSBOOL and HEADER.
+    let data = std::fs::read(corpus("legacy").join("oracle-basic.xls")).unwrap();
+    let (mut pkg, _) = open_workbook(&data).unwrap();
+    let s = &mut pkg.workbook.sheets[0];
+    let brk = |id| gridcore::sheet::PageBreak {
+        id,
+        attrs: " man=\"1\"".into(),
+    };
+    s.row_breaks = vec![brk(4)];
+    s.col_breaks = vec![brk(2)];
+    let order = page_setup_record_order(&gridcore::legacy::write_xls(&pkg).bytes);
+    let wsbool = order[0].iter().position(|&t| t == 0x0081).unwrap();
+    assert_eq!(order[0][wsbool + 1..wsbool + 4], [0x001B, 0x001A, 0x0014]);
+}
+
 /// `corpus/legacy/addin`: Excel's `.xlsx` of a workbook calling a function
 /// of the add-in shipped with Office (EUROTOOL.XLAM), and the import of
 /// Excel's `addin-udf.<ext>` of it. Excel stores the call as a library
@@ -694,37 +901,15 @@ fn xls_corpus() -> Vec<std::path::PathBuf> {
 
 /// What the import of each corpus `.xls` leaves out besides its document
 /// properties (every file Excel writes has them), by file; every other
-/// file has nothing else. The 17 workbooks of corpus/xlsx have margins
-/// other than Excel's Normal ones, which their `.xls` keep.
+/// file has nothing else. The page setup of all 17 is read (#1440).
 const XLS_DROPPED: &[(&str, &[&str])] = &[
-    ("calc-3d.xls", &["page setup"]),
-    ("calc-arithmetic.xls", &["page setup"]),
-    ("calc-criteria.xls", &["page setup"]),
-    ("calc-dates.xls", &["page setup"]),
-    ("calc-financial.xls", &["page setup"]),
-    ("calc-logic.xls", &["page setup"]),
-    ("calc-lookup.xls", &["page setup"]),
-    ("calc-math.xls", &["page setup"]),
-    ("calc-refs.xls", &["page setup"]),
-    ("calc-stats.xls", &["page setup"]),
-    ("calc-text.xls", &["page setup"]),
-    ("calc-textfmt.xls", &["page setup"]),
     // Two strings of the source are rich text.
-    (
-        "edge-cases.xls",
-        &["formatting within cell text", "page setup"],
-    ),
-    ("oracle-basic.xls", &["page setup"]),
-    ("shape-amortization.xls", &["page setup"]),
-    ("shape-gradebook.xls", &["page setup"]),
+    ("edge-cases.xls", &["formatting within cell text"]),
     // Its table, which Excel wrote as a list (FEATURE11): the import keeps
     // the cells, as Save As .xls from its .xlsx says.
     (
         "shape-salestable.xls",
-        &[
-            "page setup",
-            "tables (their cells are kept as plain ranges)",
-        ],
+        &["tables (their cells are kept as plain ranges)"],
     ),
     ("chart-embedded.xls", &["pictures, shapes and charts"]),
     // `SUM([1]!Prices)` and `[1]!Half*2`, names of another workbook.
@@ -741,7 +926,8 @@ const XLS_LOST: &[(&str, &[&str])] = &[];
 /// Import, write with `write_xls`, import again: the second import is the
 /// first. The sheets (names, order, hidden), values, formulas (as parsed;
 /// `[1]!` calls, which don't parse, as text), the whole cell format, names,
-/// date system, merges, columns, rows, panes and the active sheet. Each
+/// date system, merges, columns, rows, panes, page setup, page breaks,
+/// outline settings and the active sheet. Each
 /// written file keeps the structural rules Excel holds it to.
 #[test]
 fn xls_corpus_round_trips_through_the_writer() {
@@ -799,6 +985,19 @@ fn xls_corpus_round_trips_through_the_writer() {
             }
             if sheet.freeze != theirs.freeze {
                 errs.push(at("frozen panes"));
+            }
+            // Page setup, breaks and outline settings (#1440).
+            if sheet.page_setup != theirs.page_setup {
+                errs.push(at(&format!(
+                    "page setup {:?} != {:?}",
+                    theirs.page_setup, sheet.page_setup
+                )));
+            }
+            if (&sheet.row_breaks, &sheet.col_breaks) != (&theirs.row_breaks, &theirs.col_breaks) {
+                errs.push(at("page breaks"));
+            }
+            if sheet.outline != theirs.outline {
+                errs.push(at("outline settings"));
             }
             for (&(r, c), cell) in &sheet.cells {
                 let Some(mine) = theirs.cell(r, c) else {

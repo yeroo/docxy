@@ -20,6 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 use crate::sheet::{Align, Cell, CellValue, Sheet, Workbook, Xf};
 use crate::xlsx::SheetPackage;
 
+use super::page;
 use super::ptg_write::{self, Book, Compiled, Site, Tables, Why};
 
 /// A written `.xls` and what it couldn't hold.
@@ -135,6 +136,14 @@ enum Loss {
     Fonts,
     HyperlinksPastGrid,
     HyperlinksTooLong,
+    /// Page setup BIFF8 can't hold: a header or footer over 255
+    /// characters, a first page number over 32,767, a paper code over
+    /// 65,535. Named as the whole feature, counted by sheet.
+    PageSetup,
+    /// Manual page breaks past the grid or past 1,026 in a sheet.
+    PageBreaks,
+    /// Outlined rows and columns past the grid, or deeper than 7 levels.
+    Outlines,
 }
 
 pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
@@ -192,6 +201,9 @@ impl Loss {
                 "{} Excel 97-2003 cannot hold",
                 plural(n, "hyperlink", "hyperlinks")
             ),
+            Loss::PageSetup => "page setup".to_string(),
+            Loss::PageBreaks => "page breaks".to_string(),
+            Loss::Outlines => "outlines (grouped rows and columns)".to_string(),
         }
     }
 }
@@ -282,15 +294,6 @@ fn unsupported_features(pkg: &SheetPackage, extras: &[crate::xlsx::LoadedXfExtra
     if any(&|s| s.protection.is_some()) {
         out.push("sheet protection");
     }
-    if any(&|s| custom_page_setup(&s.page_setup)) {
-        out.push("page setup");
-    }
-    if any(&|s| !s.row_breaks.is_empty() || !s.col_breaks.is_empty()) {
-        out.push("page breaks");
-    }
-    if any(&|s| s.max_row_outline() > 0 || s.max_col_outline() > 0) {
-        out.push("outlines (grouped rows and columns)");
-    }
     let used: std::collections::BTreeSet<u32> = wb
         .sheets
         .iter()
@@ -364,40 +367,6 @@ fn unsupported_features(pkg: &SheetPackage, extras: &[crate::xlsx::LoadedXfExtra
         v.push(m.to_string());
     }
     v
-}
-
-/// Whether a sheet's page setup has something a person set, which the
-/// `.xls` would lose: Excel's defaults (portrait, 100%, Normal margins, no
-/// header or footer, ...) aren't worth a warning. Nor is the paper size,
-/// which is the printer's locale default as often as a choice.
-fn custom_page_setup(p: &crate::print::setup::PageSetup) -> bool {
-    let d = crate::print::setup::PageSetup::default();
-    let hf = &p.header_footer;
-    let text = [
-        &hf.odd_header,
-        &hf.odd_footer,
-        &hf.even_header,
-        &hf.even_footer,
-        &hf.first_header,
-        &hf.first_footer,
-    ]
-    .iter()
-    .any(|t| t.as_deref().is_some_and(|t| !t.is_empty()));
-    p.orientation.is_landscape()
-        || p.scale != d.scale
-        || p.fit_to_page
-        || p.margins != d.margins
-        || p.first_page_number.is_some()
-        || p.page_order != d.page_order
-        || p.black_and_white
-        || p.draft
-        || p.cell_comments != d.cell_comments
-        || p.errors != d.errors
-        || p.grid_lines
-        || p.headings
-        || p.h_centered
-        || p.v_centered
-        || text
 }
 
 /// What each loaded `<cellXfs>` entry of the package's styles part has
@@ -1306,9 +1275,56 @@ fn sheet_records(
         .format
         .default_row_height
         .map(|h| (h * 20.0).round().clamp(1.0, 8192.0) as u16);
+    // PRINTHEADERS, PRINTGRIDLINES, GRIDSET and GUTS, then
+    // DEFAULTROWHEIGHT, WSBOOL, the breaks, HEADER .. HEADERFOOTER, in
+    // Excel's order (#1440).
+    for (ty, body) in page::print_records(&s.page_setup) {
+        rec(&mut out, ty, &body);
+    }
+    rec(&mut out, page::GRIDSET, &1u16.to_le_bytes());
+    let mut levels = |max: u8| {
+        if max > page::MAX_LEVEL {
+            *lost.entry(Loss::Outlines).or_default() += 1;
+        }
+        max.min(page::MAX_LEVEL)
+    };
+    let (row_levels, col_levels) = (levels(s.max_row_outline()), levels(s.max_col_outline()));
+    rec(&mut out, page::GUTS, &page::guts(row_levels, col_levels));
     if let Some(miy) = default_miy {
         // fUnsynced: a height other than the default font's 15 points.
         rec(&mut out, 0x0225, &u16s(&[u16::from(miy != 300), miy]));
+    }
+    rec(
+        &mut out,
+        page::WSBOOL,
+        &page::wsbool(&s.page_setup, s.outline).to_le_bytes(),
+    );
+    let written = page::records(
+        &s.page_setup,
+        &s.row_breaks,
+        &s.col_breaks,
+        ptg_write::MAX_ROW as u32,
+        ptg_write::MAX_COL as u32,
+    );
+    for (ty, body) in &written.records {
+        rec(&mut out, *ty, body);
+    }
+    if written.setup_lost {
+        *lost.entry(Loss::PageSetup).or_default() += 1;
+    }
+    if written.breaks_lost {
+        *lost.entry(Loss::PageBreaks).or_default() += 1;
+    }
+    // Outlined rows and columns the grid can't hold.
+    if s.row_attrs
+        .keys()
+        .any(|&r| r as i64 > ptg_write::MAX_ROW && s.row_outline(r) > 0)
+        || s.col_defs.iter().any(|d| {
+            d.max as i64 > ptg_write::MAX_COL
+                && crate::sheet::xml_attr(&d.attrs, "outlineLevel").is_some_and(|v| v.trim() != "0")
+        })
+    {
+        *lost.entry(Loss::Outlines).or_default() += 1;
     }
     let base = s.format.base_col_width.clamp(0, 255) as u16;
     rec(&mut out, 0x0055, &base.to_le_bytes());
@@ -1325,7 +1341,9 @@ fn sheet_records(
         }
         let last = (d.max as i64).min(ptg_write::MAX_COL) as u16;
         let hidden = s.col_hidden(d.min);
-        if d.width.is_none() && !hidden {
+        let level = s.col_outline(d.min).min(page::MAX_LEVEL);
+        let collapsed = s.col_collapsed(d.min);
+        if d.width.is_none() && !hidden && level == 0 && !collapsed {
             continue;
         }
         let coldx = match d.width {
@@ -1342,7 +1360,11 @@ fn sheet_records(
                     standard.map(|w| f64::from(w) / 256.0),
                     coldx,
                 ));
-        let flags: u16 = if hidden { 0x0001 } else { 0 } | if user_set { 0x0002 } else { 0 };
+        // fHidden, fUserSet, iOutLevel, fCollapsed.
+        let flags: u16 = if hidden { 0x0001 } else { 0 }
+            | if user_set { 0x0002 } else { 0 }
+            | u16::from(level) << 8
+            | if collapsed { 0x1000 } else { 0 };
         let b = u16s(&[d.min as u16, last, coldx, STYLE_XFS as u16, flags, 0]);
         rec(&mut out, 0x007D, &b);
     }
@@ -1378,6 +1400,11 @@ fn sheet_records(
             }
             if height.is_some() {
                 flags |= 0x0040;
+            }
+            // iOutLevel and fCollapsed.
+            flags |= u16::from(s.row_outline(r).min(page::MAX_LEVEL));
+            if s.row_collapsed(r) {
+                flags |= 0x0010;
             }
             let b = u16s(&[r as u16, lo, hi, miy, 0, 0, flags, STYLE_XFS as u16]);
             rec(&mut out, 0x0208, &b);
@@ -2326,26 +2353,203 @@ mod tests {
             .hyperlinks
             .insert((0, 0), "https://example.com".into());
         pkg.workbook.sheets[0].set_row_outline(1, 1);
-        // Hyperlinks have records (#1726): only the outline is named.
-        assert_eq!(
-            write_xls(&pkg).lost,
-            ["outlines (grouped rows and columns)"]
-        );
-        // Excel's own page setup isn't a loss (an .xlsx's says portrait and
-        // A4), a landscape one is.
-        let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
-        let ps = &mut pkg.workbook.sheets[0].page_setup;
-        ps.orientation = crate::print::setup::Orientation::Portrait;
-        ps.paper_size = 9;
+        // Hyperlinks (#1726) and outlines (#1440) have records.
         assert!(write_xls(&pkg).lost.is_empty());
+        // So has page setup (#1440).
         pkg.workbook.sheets[0].page_setup.orientation = crate::print::setup::Orientation::Landscape;
-        assert_eq!(write_xls(&pkg).lost, ["page setup"]);
+        assert!(write_xls(&pkg).lost.is_empty());
         // Document properties go in streams this doesn't write.
         let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
         let mut p = pkg.doc_properties();
         p.title = Some("Budget".into());
         pkg.set_doc_properties(&p).unwrap();
         assert_eq!(write_xls(&pkg).lost, ["document properties"]);
+    }
+
+    /// Every page setup field BIFF8 holds, manual page breaks, row and
+    /// column outlines (outline-only ones among them) and the outline
+    /// settings come back from the written `.xls`, and nothing is named
+    /// lost (#1440).
+    #[test]
+    fn page_setup_breaks_and_outlines_round_trip() {
+        use crate::print::setup::{
+            CellComments, Margins, Orientation, PageOrder, PageSetup, PrintErrors,
+        };
+        use crate::sheet::PageBreak;
+        let mut pkg = book(&[(0, 0, Cell::number(1.0)), (20, 5, Cell::number(2.0))]);
+        let mut ps = PageSetup {
+            margins: Margins {
+                left: 0.25,
+                right: 0.5,
+                top: 1.25,
+                bottom: 1.5,
+                header: 0.2,
+                footer: 0.4,
+            },
+            paper_size: 9,
+            orientation: Orientation::Landscape,
+            scale: 85,
+            fit_to_page: true,
+            fit_width: 2,
+            fit_height: 0,
+            first_page_number: Some(7),
+            page_order: PageOrder::OverThenDown,
+            black_and_white: true,
+            draft: true,
+            cell_comments: CellComments::AtEnd,
+            errors: PrintErrors::Dash,
+            grid_lines: true,
+            headings: true,
+            h_centered: true,
+            v_centered: true,
+            ..PageSetup::default()
+        };
+        let hf = &mut ps.header_footer;
+        hf.different_odd_even = true;
+        hf.different_first = true;
+        hf.scale_with_doc = false;
+        hf.align_with_margins = false;
+        hf.odd_header = Some("&L&\"Arial,Bold\"Odd&R&P of &N".into());
+        hf.odd_footer = Some("&C&F \u{2013} &A".into());
+        hf.even_header = Some("&CEven".into());
+        hf.even_footer = Some("&R\u{e9}ven".into());
+        hf.first_header = Some("&CFirst".into());
+        hf.first_footer = Some("x".repeat(255));
+        let s = &mut pkg.workbook.sheets[0];
+        s.page_setup = ps.clone();
+        let brk = |id: u32| PageBreak {
+            id,
+            attrs: " max=\"16383\" man=\"1\"".into(),
+        };
+        s.row_breaks = vec![brk(10), brk(4)];
+        s.col_breaks = vec![PageBreak {
+            id: 3,
+            attrs: " man=\"1\"".into(),
+        }];
+        // An automatic break is Excel's to work out again: not written,
+        // not named.
+        s.row_breaks.push(PageBreak {
+            id: 30,
+            attrs: String::new(),
+        });
+        s.outline.summary_below = false;
+        s.outline.summary_right = false;
+        for r in 2..=5 {
+            s.set_row_outline(r, 1);
+        }
+        s.set_row_outline(3, 7);
+        s.set_row_hidden(4, true);
+        s.set_row_collapsed(6, true);
+        s.set_row_height(2, Some(30.0));
+        s.set_col_outline(1, 2);
+        s.set_col_outline(2, 2);
+        s.set_col_collapsed(3, true);
+        s.set_col_outline(4, 1);
+        s.set_col_hidden(4, true);
+        let (back, lost) = round(&pkg);
+        assert!(lost.is_empty(), "{lost:?}");
+        let b = &back.workbook.sheets[0];
+        assert_eq!(b.page_setup, ps);
+        let ids = |v: &[PageBreak]| v.iter().map(|b| (b.id, b.is_manual())).collect::<Vec<_>>();
+        assert_eq!(ids(&b.row_breaks), [(4, true), (10, true)]);
+        assert_eq!(ids(&b.col_breaks), [(3, true)]);
+        assert_eq!(b.outline, s_outline(false, false));
+        let s = &pkg.workbook.sheets[0];
+        for r in 0..10 {
+            assert_eq!(b.row_outline(r), s.row_outline(r), "row {r}");
+            assert_eq!(b.row_collapsed(r), s.row_collapsed(r), "row {r}");
+            assert_eq!(b.row_hidden(r), s.row_hidden(r), "row {r}");
+            assert_eq!(b.row_height(r), s.row_height(r), "row {r}");
+        }
+        for c in 0..8 {
+            assert_eq!(b.col_outline(c), s.col_outline(c), "col {c}");
+            assert_eq!(b.col_collapsed(c), s.col_collapsed(c), "col {c}");
+            assert_eq!(b.col_hidden(c), s.col_hidden(c), "col {c}");
+        }
+        // The read-back book writes the same again.
+        assert_eq!(write_xls(&back).bytes, write_xls(&back).bytes);
+        let (again, lost) = round(&back);
+        assert!(lost.is_empty());
+        let a = &again.workbook.sheets[0];
+        assert_eq!(
+            (
+                &a.page_setup,
+                &a.row_breaks,
+                &a.col_breaks,
+                &a.row_attrs,
+                &a.col_defs
+            ),
+            (
+                &b.page_setup,
+                &b.row_breaks,
+                &b.col_breaks,
+                &b.row_attrs,
+                &b.col_defs
+            )
+        );
+        // The model's defaults come back as they were: Default orientation,
+        // Letter, 100%, Normal margins.
+        let (back, _) = round(&book(&[(0, 0, Cell::number(1.0))]));
+        assert_eq!(back.workbook.sheets[0].page_setup, PageSetup::default());
+        assert_eq!(
+            back.workbook.sheets[0].outline,
+            crate::sheet::OutlineSettings::default()
+        );
+    }
+
+    fn s_outline(below: bool, right: bool) -> crate::sheet::OutlineSettings {
+        crate::sheet::OutlineSettings {
+            summary_below: below,
+            summary_right: right,
+        }
+    }
+
+    /// What BIFF8 can't hold of page setup, breaks and outlines is named
+    /// with the feature's words (#1440), and the rest is still written.
+    #[test]
+    fn page_setup_breaks_and_outlines_biff8_cannot_hold_are_named() {
+        use crate::sheet::PageBreak;
+        let named = |f: &dyn Fn(&mut Sheet)| {
+            let mut pkg = book(&[(0, 0, Cell::number(1.0))]);
+            f(&mut pkg.workbook.sheets[0]);
+            let (back, lost) = round(&pkg);
+            (back.workbook.sheets.into_iter().next().unwrap(), lost)
+        };
+        let (b, lost) = named(&|s| {
+            s.page_setup.header_footer.odd_footer = Some("y".repeat(256));
+            s.page_setup.margins.left = 2.0;
+        });
+        assert_eq!(lost, ["page setup"]);
+        assert_eq!(b.page_setup.header_footer.odd_footer, None);
+        assert_eq!(b.page_setup.margins.left, 2.0);
+        let (_, lost) = named(&|s| s.page_setup.header_footer.first_header = Some("z".repeat(300)));
+        assert_eq!(lost, ["page setup"]);
+        let (b, lost) = named(&|s| s.page_setup.first_page_number = Some(40_000));
+        assert_eq!(lost, ["page setup"]);
+        assert_eq!(b.page_setup.first_page_number, None);
+        let (_, lost) = named(&|s| s.page_setup.paper_size = 70_000);
+        assert_eq!(lost, ["page setup"]);
+        let manual = |id: u32| PageBreak {
+            id,
+            attrs: " man=\"1\"".into(),
+        };
+        let (b, lost) = named(&|s| s.row_breaks = vec![manual(5), manual(70_000)]);
+        assert_eq!(lost, ["page breaks"]);
+        assert_eq!(b.row_breaks.len(), 1);
+        let (_, lost) = named(&|s| s.col_breaks = vec![manual(300)]);
+        assert_eq!(lost, ["page breaks"]);
+        let (b, lost) = named(&|s| {
+            s.set_row_outline(2, 1);
+            s.set_row_outline(70_000, 1);
+        });
+        assert_eq!(lost, ["outlines (grouped rows and columns)"]);
+        assert_eq!(b.row_outline(2), 1);
+        let (_, lost) = named(&|s| s.set_col_outline(300, 2));
+        assert_eq!(lost, ["outlines (grouped rows and columns)"]);
+        // An xlsx can't go past 7 levels, but a model can be told to.
+        let (b, lost) = named(&|s| s.set_row_outline(1, 9));
+        assert_eq!(lost, ["outlines (grouped rows and columns)"]);
+        assert_eq!(b.row_outline(1), 7);
     }
 
     #[test]
