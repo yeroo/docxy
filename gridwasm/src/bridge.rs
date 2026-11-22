@@ -3774,10 +3774,10 @@ impl Session {
     /// stash from `k` up (wiring the later one first would leave the other
     /// out), or one sharing a name with a scoped defined name of its own
     /// stash or a later one (`restore_top` has put those back before the
-    /// table is wired; `k`'s own come back after it). The first found, latest stash first; restoring that sheet first
-    /// (in stack order) still works. A taken part name or id is no reason:
-    /// `SheetPackage::restore_table` picks a free one, which the replayed
-    /// removal then stashes.
+    /// table is wired; `k`'s own come back after it). The first found, latest
+    /// stash first; restoring that sheet first (in stack order) still works.
+    /// A taken part name or id is no reason: `SheetPackage::restore_table`
+    /// picks a free one, which the replayed removal then stashes.
     fn later_table_blocker(&self, k: usize) -> Option<String> {
         let stashes = &self.removed_sheet_stashes[k..];
         for (si, st) in stashes.iter().enumerate().skip(1).rev() {
