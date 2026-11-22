@@ -261,5 +261,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   `row.insert`/`col.insert` verbs, which read that `err` back as
   `"{verb}: …"`. A new insert entry point needs the same guard. A delete
   never shifts anything off.
+- Subtotal inserts whole rows too (`gridcore::edit::subtotal`): once the
+  groups are known it checks `groups + 1` rows (a total per group and the
+  grand total) at the region's first data row and refuses with
+  `SubtotalError::ShiftOffSheet`, whose text is `SHIFT_OFF_SHEET`. With
+  Replace the old totals are already gone then (the check is exact, as
+  rows come out before rows go in), so both hosts put the workbook back on
+  any refusal: the suite's `apply_subtotal` (`restore`) and xlsxy's
+  `try_outline_edit_on` (`put_back`).
 - The issue's other item (deleting every row of a table left a stale table)
   was already fixed by #991's `delete_table_rows` in `gridcore/src/edit.rs`.

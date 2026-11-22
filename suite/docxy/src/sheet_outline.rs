@@ -507,9 +507,9 @@ fn apply_subtotal(
         Some(o) => match subtotal(&mut v.pkg.workbook, sheet, area, o) {
             Ok(n) => format!("Inserted {n} subtotal row{}", if n == 1 { "" } else { "s" }),
             Err(e) => {
-                // gridcore refuses before it changes anything; should that
-                // ever slip, a row delete reaches every sheet, so the whole
-                // workbook goes back.
+                // A refusal can come after Replace removed the old totals
+                // (rows pushed off the sheet, #1175), and a row delete
+                // reaches every sheet, so the whole workbook goes back.
                 v.restore(snap);
                 return Err(e.to_string());
             }
