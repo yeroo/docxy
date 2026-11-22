@@ -959,15 +959,16 @@ worth knowing:
   back). An out-of-order restore brings the tables of the sheets removed
   after it back for the unwind, so their formulas read as in stack order; it
   is refused, with nothing changed, while one of those tables could not come
-  back (no part kept, its name taken since, or shared with another removed
-  table or a removed sheet's defined name): restore that sheet first (the error names it). The cells then
-  recalculate. Every restore clears the undo/redo
+  back (no part kept, its name taken since, or shared with a table of another
+  sheet removed from it on, or with a defined name scoped to that table's
+  sheet or one removed after it): restore that sheet first (the error names
+  it). The cells then recalculate. Every restore clears the undo/redo
   history, as `sheet.remove` itself does.
 - **Agent sheet-removals are undoable in any order**, except that an
   out-of-order undo is refused (`cannot restore …`, nothing changed) while a
   sheet removed after it has the same name, or holds a table that could not
-  come back (restore that one first). The restore is
-  backed by a stack of stashes (the latest 16 removals): two consecutive
+  come back (restore that one first). The restore is backed by a stack of
+  stashes (the latest 16 removals): two consecutive
   `sheet.remove`s followed by two undos restore the second removal, then the
   first. An undo out of order (a removal with later ones still stashed, as
   after undoing a remove and then an import) restores the sheet that removal

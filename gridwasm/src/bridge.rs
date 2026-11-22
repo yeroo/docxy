@@ -3519,8 +3519,9 @@ impl Session {
     /// formulas), and the replayed removal stashes them again with their
     /// parts; it is refused, before any change, when one of those tables
     /// could not come back ([`Self::later_table_blocker`]: no part kept, its
-    /// name taken since, or shared with a table of another stash from the
-    /// target up; restore that sheet first, in stack order). A table that
+    /// name taken since, shared with a table of another stash from the
+    /// target up, or with a scoped defined name of its own stash or a later
+    /// one; restore that sheet first, in stack order). A table that
     /// must take a free part name or id comes back under it and is stashed
     /// again with it. The target's own tables are wired before the later
     /// sheets go again, so that removal rewrites and records their formulas.
