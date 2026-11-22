@@ -475,6 +475,13 @@ fn cut_moves_refs_agrees_with_move_refs_rules_stay() {
             Box::new(|wb| (wb.sheets[0].cond_formats).push(cf(&[(0, 0, 9, 3)], expr("G$1=1")))),
         ),
         (
+            "a rule whose corner alone reads the cut (#1458 r1)",
+            true,
+            Box::new(|wb| {
+                (wb.sheets[0].cond_formats).push(cf(&[(0, 7, 4, 7), (5, 6, 9, 6)], expr("F1>0")))
+            }),
+        ),
+        (
             "a rule's cfvo formula",
             true,
             Box::new(move |wb| {
@@ -1025,4 +1032,45 @@ fn a_data_form_delete_splits_a_rule_beside_the_list() {
             block("B5", "#REF!>0", None, Some(0)),
         ]
     );
+}
+
+/// A rule's anchor is the top-left of its ranges, which may be no cell of
+/// it: when that corner reads the cut and none of its cells does, the rule
+/// is split so that no block is rewritten for a cell it doesn't hold.
+#[test]
+fn a_rule_whose_corner_alone_reads_the_cut_keeps_what_its_cells_read() {
+    // C1:C5 B6:B10 is anchored on B1, which reads A1; C1 reads B1 and B6
+    // reads A6, neither cut.
+    let a1_to_e1 = CellMove {
+        src: "Sheet1",
+        dst: "Sheet1",
+        rect: (0, 0, 0, 0),
+        dr: 0,
+        dc: 4,
+    };
+    let mut rule = held("C1:C5 B6:B10", expr("A1>0"), 0);
+    rule.rules[0].dxf_id = Some(0);
+    let (mut wb, _) = cut_with_rules(vec![rule], &a1_to_e1);
+    assert_eq!(
+        blocks(&wb, 0),
+        vec![
+            block("C1:C5", "B1>0", Some(0), None),
+            block("B6:B10", "A6>0", None, Some(0)),
+        ]
+    );
+    // Each cell is still formatted by the cell it read.
+    let red = crate::sheet::Dxf {
+        fill: Some((255, 0, 0)),
+        ..Default::default()
+    };
+    wb.styles.dxfs = vec![red.clone()];
+    wb.sheets[0].set_cell(0, 1, Cell::number(1.0)); // B1
+    wb.sheets[0].set_cell(5, 0, Cell::number(1.0)); // A6
+    wb.sheets[0].set_cell(0, 4, Cell::number(-1.0)); // E1, where A1 went
+    assert_eq!(
+        crate::cf::cell_dxf(&wb, 0, 0, 2),
+        Some(red.clone()),
+        "C1 by B1"
+    );
+    assert_eq!(crate::cf::cell_dxf(&wb, 0, 5, 1), Some(red), "B6 by A6");
 }

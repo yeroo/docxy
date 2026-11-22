@@ -27898,7 +27898,8 @@ mod rule_shift_tests {
         };
         let (re, ws) = saved(pkg, SHEET1);
         assert_eq!(blocks(&re), blocks(pkg), "{ws}");
-        assert_eq!(saved(pkg, SHEET1).1, ws, "a second save");
+        // The clones, now elements of their own, save as they were read.
+        assert_eq!(saved(&re, SHEET1).1, ws, "a second save");
         ws
     }
 

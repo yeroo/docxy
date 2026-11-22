@@ -280,7 +280,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   another) and read the cut otherwise; then its parts are packed greedily
   into blocks whose anchors read it as their parts do (H6:J10 with `F1>0`,
   cut A1:F1: H6, I6:J10, H7:H10). A pack's anchor can be a cut cell; only
-  its ranges decide the walk's routing.
+  its ranges decide the walk's routing. A rule whose cells all read the cut
+  alike is packed too when its anchor reads it otherwise (`A1>0` on
+  C1:C5 B6:B10, cut A1: only the corner B1 reads A1). The reverse can't
+  happen: cells all reading cut cells make their anchor read one too.
 - A rule over the cut on the source sheet (#1687's, left in place) is split
   only when a cell beside the cut reads into it through a relative or mixed
   reference (`A2>A1` on A2:A20, cut A5:A10: A11 alone reads `C10`). Its cut

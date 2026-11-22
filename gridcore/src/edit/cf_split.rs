@@ -73,6 +73,11 @@ pub(super) fn split_cond_formats(
     for (h, sheet) in wb.sheets.iter_mut().enumerate() {
         let mut blocks = Vec::with_capacity(sheet.cond_formats.len());
         for cf in std::mem::take(&mut sheet.cond_formats) {
+            // A dry run stops planning at the first split.
+            if out.any && !write {
+                blocks.push(cf);
+                continue;
+            }
             let is_over = over && h == src && cf.ranges.iter().any(meets);
             let groups = if is_over || take(h, &cf.ranges) {
                 plan(&cf, &names[h], mv, is_over)
@@ -205,7 +210,18 @@ fn plan(cf: &CondFormat, home: &str, mv: &CellMove, over: bool) -> Option<Vec<Gr
                 .is_some_and(|b| b.iter().zip(&fixed).any(|(&b, &fixed)| b && !fixed))
         })
     } else {
+        // Its cells read the cut differently, or alike but otherwise than
+        // its anchor, which may be no cell of it (`A1>0` on C1:C5 B6:B10 is
+        // anchored on B1): the packing below gives each block an anchor
+        // that reads the cut as its cells do. Cells that all read a cut
+        // cell make their anchor read it too (its row and column are each
+        // some cell's), so only an anchor reading what no cell reads
+        // differs. A rule over the cut left whole needs no check: it moves
+        // only fully absolute references, read alike from any anchor.
         groups.len() > 1
+            || groups
+                .first()
+                .is_some_and(|(k, _)| k.as_ref() != Some(&moved(a)))
     };
     if !split {
         return None;
