@@ -3195,7 +3195,8 @@ impl Store {
     /// which is not an error. A failed statement (above all a busy store) is
     /// an `Err`, as `set_read`'s is (#2209, #2215): the engine reports it,
     /// still sends, and skips its optimistic re-file into Sent Items. A
-    /// reconciled draft's `local:` id still reaches it (#1884).
+    /// reconciled draft's `local:` id still reaches it (#1884); an id from
+    /// before a move does not (resolve it with `current_id` first, #2265).
     pub fn mark_sent(&self, id: &str) -> Result<(), StoreError> {
         self.conn.execute(
             concat!("UPDATE messages SET is_draft = 0 WHERE ", draft_row_sql!()),
@@ -3208,8 +3209,9 @@ impl Store {
     /// Items after a send failed for good (#1874): the row is a draft again
     /// (`is_draft = 1`), filed under `drafts_folder_id`. One statement, so a
     /// `local:` id the failed send's own create reconciled still reaches the
-    /// row (#1884). Subject, recipients, body and attachments are untouched.
-    /// A missing row changes nothing (not an error).
+    /// row (#1884); an id from before a move does not (resolve it with
+    /// `current_id` first, #2265). Subject, recipients, body and attachments
+    /// are untouched. A missing row changes nothing (not an error).
     pub fn return_to_drafts(&self, id: &str, drafts_folder_id: &str) -> Result<(), StoreError> {
         self.conn.execute(
             concat!(
@@ -4734,9 +4736,12 @@ impl Store {
     ///
     /// Only this function follows a move: `draft_row_sql!`,
     /// `current_id_sql!` and the calls built on them (`delete_message`,
-    /// which the delta `@removed` path uses, `set_read`, `move_message`, …)
-    /// do not, so a caller holding an id from before a move resolves it
-    /// here first.
+    /// which the delta `@removed` path uses, `set_read`, `move_message`,
+    /// `draft`, `mark_sent`, `return_to_drafts`, …) do not, so a caller
+    /// holding an id from before a move resolves it here first. The draft
+    /// ops do (#2265): the outbox's `SaveDraft` / `SendDraft`
+    /// (`ensure_draft_on_graph`, `apply_send`), and the engine's `SendDraft`
+    /// arm, `fail_send` and `sync_after_send`.
     pub fn current_id(&self, id: &str) -> Result<String, StoreError> {
         current_id_on(&self.conn, id)
     }

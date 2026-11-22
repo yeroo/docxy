@@ -2792,7 +2792,8 @@ so the user's other devices follow.
   `set_categories`, `move_message`) match the id only. The delta
   `@removed` path uses `delete_message`, so the source folder's
   `@removed` of the old id deletes nothing. Do not make those writes
-  follow aliases.
+  follow aliases. The draft ops resolve at their call sites instead
+  (#2265, its own section).
 - The engine's `MarkRead`, `SetFlag`, `SetCategories`, `Move` and `Delete`
   arms resolve with `current_id` first, and `apply_op` resolves the
   queued op's id again at apply time. A queued `Move(old, B)` followed by
@@ -2818,7 +2819,7 @@ so the user's other devices follow.
   wants "delete moves to Deleted Items" sends `Move` to that folder.
 - Not followed: `FetchBody`, `FetchAttachments`, `SaveAttachment`,
   `SaveItemAttachment`, reply/forward and the meeting commands take the id
-  as given, since the host re-keys on `MessageMoved`. Re-keyed
+  as given (`SaveDraft` and `SendDraft` follow since #2265), since the host re-keys on `MessageMoved`. Re-keyed
   `attachments` rows keep the pre-move attachment ids until the next
   `FetchAttachments`. `moved_ids` rows are never pruned.
 - Tests. Store (`moved_id_tests`): `follow_move_rekeys_the_row_body_headers_and_attachments`,
@@ -6281,3 +6282,56 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   `a_refused_re_consent_falls_back_when_the_token_lacks_a_required_scope` (`scope` gains
   `Mail.Send`: the second tab asks `scope`, its token replaces the held one),
   `token_holds_required_scope_only_for_a_known_full_grant`.
+
+## A queued SaveDraft or SendDraft follows its draft's move (#2265)
+
+- A host that moves a connected draft (Delete to Deleted Items, with Undo)
+  may queue `SaveDraft { D1 }` or `SendDraft { D1 }` behind that `Move`, or
+  send them by `D1` after the move drained. Both reach the row under the id
+  Graph gave it: `outbox::ensure_draft_on_graph` and `apply_send` resolve
+  the op's id with `Store::current_id` before they read the draft
+  (`local_edit_generation`, `Store::draft`, the posted send's delivery
+  check). A reconciled `local:` id resolves to its Graph id, then through
+  `moved_ids`. A chain (to Deleted Items and back) reaches the newest id.
+  The sync thread resolves, reads and re-keys (`follow_move`,
+  `reconcile_id`), so nothing lands in between.
+- The engine resolves its local writes the same way: the `SendDraft` arm's
+  optimistic `mark_sent` and re-file into Sent Items, `fail_send`'s
+  `return_to_drafts`, and `sync_after_send`'s re-file of a sent row still
+  in Drafts. The queued op keeps the caller's id, and it is resolved again
+  when the op is applied.
+- Why not `draft_row_sql!`: it is shared with `delete_message` (the delta
+  `@removed` path), `delete_message_resolved` and `move_message`, which
+  must not follow aliases (#1896). So `Store::draft`,
+  `update_draft_fields` and the other draft writes still match the id
+  only, and a host editing a draft by its pre-move id writes nothing. Hosts
+  re-key on `MessageMoved`.
+- Events keep the op's id: `Sending`, `Sent`, `SendFailed` and
+  `AttachmentProgress` name `D1` even after the host re-keyed to `DM2` on
+  `MessageMoved`, as they name a reconciled `local:` id. A host matches
+  either id.
+- A send that fails for good after a move to Deleted Items files the row
+  in Drafts locally (`return_to_drafts`), while Graph keeps it in Deleted
+  Items. The failed attempt PATCHed it first and `mark_pushed` cleared
+  `local_edit`, so nothing protects the row: Deleted Items' next delta for
+  that id files it back there.
+- `ensure_draft_on_graph`'s missing-draft error names both ids when they
+  differ (`no local draft stored for D1 (now DM2)`).
+- A reconciled-then-moved `local:` id already reached the row before
+  #2265: `follow_move` keeps `local_id` on the row, and `draft_row_sql!`
+  matches it. Its test is a regression guard.
+- Tests. Outbox: `apply_op_save_draft_of_a_moved_id_patches_the_new_id`,
+  `apply_op_send_draft_of_a_moved_id_sends_the_new_id`,
+  `apply_op_save_draft_of_a_twice_moved_id_patches_the_newest_id`,
+  `apply_op_save_draft_of_a_reconciled_then_moved_local_id_patches_the_moved_id`,
+  `apply_op_save_draft_of_a_moved_id_no_longer_stored_names_both_ids`
+  (helper `store_with_moved_draft`). Engine (`tests::moved_drafts`). The
+  queued cases seed the outbox together with the local writes the `Move`
+  and `SendDraft` arms make (`queue_move`, `queue_send`), so the row starts
+  where those arms leave it:
+  `queued_save_draft_behind_a_move_patches_the_moved_id`,
+  `queued_send_draft_behind_a_move_sends_the_moved_id`,
+  `queued_send_draft_behind_a_move_that_fails_returns_the_moved_row_to_drafts`,
+  `send_draft_by_an_old_id_after_the_move_drained_marks_the_moved_row_sent`
+  (the arm), `a_send_after_a_move_and_back_is_filed_under_sent_after_the_send`
+  (`sync_after_send`).
