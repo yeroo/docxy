@@ -404,6 +404,7 @@ fn a_cut_leaves_a_rule_over_it_reading_what_it_read() {
             priority: 1,
         }],
         ix: None,
+        copy_of: None,
     };
     let cfs = &mut v.pkg.workbook.sheets[s].cond_formats;
     cfs.push(rule("A1>5"));

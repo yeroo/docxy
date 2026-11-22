@@ -3,10 +3,11 @@
 //! translated to where they land; a cut is a move, and the references to
 //! the moved cells follow them ([`move_refs`]).
 
+use super::cf_split::split_cond_formats;
 use super::{Area, FormulaSite, rewrite_workbook_formulas, walk_workbook_formulas};
 use crate::formula::{
-    CellMove, Expr, move_abs_ref_expr, move_block_expr, move_ref_expr, parse, qualify_bare_refs,
-    qualify_local_names, to_string, translate_formula,
+    CellMove, Expr, move_abs_ref_expr, move_block_expr, move_ref_expr, move_ref_expr_keeping_own,
+    parse, qualify_bare_refs, qualify_local_names, to_string, translate_formula,
 };
 use crate::sheet::{Cell, MAX_COLS, MAX_ROWS, Workbook};
 
@@ -151,7 +152,10 @@ pub fn tiled_block(
 /// ([`crate::formula::move_block_formula`]), and validation rules to
 /// [`crate::validation::cut_rules`], called first: a rule's cells may lie
 /// partly inside the cut, so its formula, written once for its anchor, is
-/// rewritten part by part (#1050). A formula the move doesn't reach keeps
+/// rewritten part by part (#1050). A conditional-format rule whose cells
+/// read the cut differently is split first into blocks in each of which
+/// they read it alike, so each cell follows the cells it read (#1458,
+/// `edit::cf_split`). A formula the move doesn't reach keeps
 /// its text exactly, and a shared formula held verbatim is left alone, as an
 /// insert or delete leaves it. Whether any formula was rewritten.
 pub fn move_refs(wb: &mut Workbook, src: usize, mv: &CellMove) -> bool {
@@ -164,8 +168,13 @@ pub fn move_refs(wb: &mut Workbook, src: usize, mv: &CellMove) -> bool {
 /// range) it keeps checking what it checked, as the data form's Delete
 /// leaves such rules; only its fully absolute references to moved cells
 /// outside its own ranges (`$F$1`) follow them ([`move_abs_ref_expr`]), as
-/// they name those cells themselves. Every other rule is re-pointed whole.
-/// Whether any formula was rewritten.
+/// they name those cells themselves. When a cell of such a rule beside the
+/// cut reads into it through a relative or mixed reference, the rule is
+/// split: its cut cells stay one block as above, and the cells beside the
+/// cut follow the cells they read, but for fully absolute references to
+/// the rule's own cells. Every other rule is re-pointed whole, split first
+/// where its cells read the cut differently (#1458). Whether any formula
+/// was rewritten.
 pub fn move_refs_rules_stay(wb: &mut Workbook, src: usize, mv: &CellMove) -> bool {
     walk_rules_stay(wb, src, mv, true)
 }
@@ -183,12 +192,37 @@ pub fn cut_moves_refs(wb: &mut Workbook, src: usize, mv: &CellMove) -> bool {
 fn walk_rules_stay(wb: &mut Workbook, src: usize, mv: &CellMove, write: bool) -> bool {
     let (r0, c0, r1, c1) = mv.rect;
     let meets = |a: &Area| a.0 <= r1 && r0 <= a.2 && a.1 <= c1 && c0 <= a.3;
+    // Rules whose cells read the cut differently are split first, so the
+    // walk's one rewrite per rule is right for each of its cells (#1458). A
+    // split changes the rules by itself (blocks added, formulas
+    // re-anchored), even one only re-anchoring a rule whose corner alone
+    // reads the cut, so a dry run that would split answers true at once,
+    // and the rewrite reports it whatever the walk then does.
+    let split = split_cond_formats(wb, src, mv, |_, _| true, true, write);
+    if split.any && !write {
+        return true;
+    }
     let names: Vec<String> = wb.sheets.iter().map(|s| s.name.clone()).collect();
-    walk_workbook_formulas(
+    let changed = walk_workbook_formulas(
         wb,
         |_, _| true,
         false,
         |e, site| {
+            let home = site.sheet.map(|s| names[s].as_str());
+            // Split off a rule over the cut, beside it: its cells follow
+            // the cut but for references to the rule's own cells.
+            let beside_over = site
+                .sheet
+                .zip(site.block)
+                .and_then(|at| split.beside_over.get(&at));
+            if let Some(own) = beside_over {
+                return move_ref_expr_keeping_own(e, home, mv, own);
+            }
+            // A rule over the cut, left whole, or split off one, inside the
+            // cut (#1687). The latter's ranges are the rule's cells in the
+            // cut; as only a reference to cut cells follows, one meets these
+            // when it meets the rule's ranges before the split, so they
+            // serve as its own cells (#880).
             if let Some(own) = site
                 .rule
                 .filter(|r| site.sheet == Some(src) && r.iter().any(meets))
@@ -198,7 +232,8 @@ fn walk_rules_stay(wb: &mut Workbook, src: usize, mv: &CellMove, write: bool) ->
             moved_ref_expr(e, &names, src, mv, site)
         },
         write,
-    )
+    );
+    changed || split.any
 }
 
 /// Rewrite every formula in the workbook for the move `mv` of the cells in
@@ -206,7 +241,10 @@ fn walk_rules_stay(wb: &mut Workbook, src: usize, mv: &CellMove, write: bool) ->
 /// conditional-format rules (and, with `validations`, the validation rules)
 /// only those `rules` takes, given the rule's sheet and ranges: a move that
 /// leaves some rules' ranges in place (the data form's Delete) leaves their
-/// formulas too, so each keeps reading relative to its own range.
+/// formulas too, so each keeps reading relative to its own range. The
+/// conditional-format rules it takes are split where their cells read the
+/// move differently (#1458); `rules` must take every part of a rule it
+/// takes.
 pub(super) fn move_refs_with(
     wb: &mut Workbook,
     src: usize,
@@ -214,10 +252,14 @@ pub(super) fn move_refs_with(
     rules: impl Fn(usize, &[Area]) -> bool,
     validations: bool,
 ) -> bool {
+    // The conditional-format rules it takes whose cells read the move
+    // differently are split first (#1458).
+    let split = split_cond_formats(wb, src, mv, &rules, false, true);
     let names: Vec<String> = wb.sheets.iter().map(|s| s.name.clone()).collect();
-    rewrite_workbook_formulas(wb, rules, validations, |e, site| {
+    let changed = rewrite_workbook_formulas(wb, rules, validations, |e, site| {
         moved_ref_expr(e, &names, src, mv, site)
-    })
+    });
+    changed || split.any
 }
 
 /// A formula at `site` rewritten for the move `mv` off sheet `src`

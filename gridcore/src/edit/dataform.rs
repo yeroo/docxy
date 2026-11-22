@@ -518,6 +518,7 @@ mod tests {
                 priority: 1,
             }],
             ix: None,
+            copy_of: None,
         });
         s.validations.push(DataValidation {
             ranges: vec![(1, 1, 3, 1)],

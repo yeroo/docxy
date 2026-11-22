@@ -257,11 +257,13 @@ fn conditional_formats_and_validation_all_or_same() {
         ranges: vec![rect("A1:A3")],
         rules: Vec::new(),
         ix: None,
+        copy_of: None,
     });
     wb.sheets[0].cond_formats.push(CondFormat {
         ranges: vec![rect("C1:C2")],
         rules: Vec::new(),
         ix: None,
+        copy_of: None,
     });
     let cf = |same| GoSpecial::ConditionalFormats { same };
     assert_eq!(
@@ -349,6 +351,7 @@ fn whole_sheet_scopes_are_fast_and_keep_excels_results() {
         ranges: vec![(0, 0, MAX_ROWS - 1, 1)],
         rules: Vec::new(),
         ix: None,
+        copy_of: None,
     });
     let found = go_to_special(
         &wb,

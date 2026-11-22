@@ -226,6 +226,7 @@ fn colorsort() -> Workbook {
             priority: 1,
         }],
         ix: None,
+        copy_of: None,
     });
     s.cond_formats.push(CondFormat {
         ranges: vec![area("C2:C11")],
@@ -247,6 +248,7 @@ fn colorsort() -> Workbook {
             priority: 2,
         }],
         ix: None,
+        copy_of: None,
     });
     wb.styles.dxfs.push(Dxf {
         fill: Some((255, 0, 0)),
@@ -551,6 +553,7 @@ fn an_icon_level_over_ten_thousand_rows_reads_the_rule_once() {
             priority: 1,
         }],
         ix: None,
+        copy_of: None,
     });
     let up = SortLevel {
         key: 0,

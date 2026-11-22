@@ -496,6 +496,7 @@ mod tests {
         };
         let cf = CondFormat {
             ix: None,
+            copy_of: None,
             ranges: vec![(0, 0, 9, 0)], // A1:A10
             rules: vec![CfRule {
                 kind: CfKind::CellIs {
@@ -520,6 +521,7 @@ mod tests {
         };
         let cf = CondFormat {
             ix: None,
+            copy_of: None,
             ranges: vec![(0, 0, 4, 0)],
             rules: vec![CfRule {
                 kind: CfKind::Expression {
@@ -560,6 +562,7 @@ mod tests {
     fn cell_is(op: &str, formulas: &[&str]) -> CondFormat {
         CondFormat {
             ix: None,
+            copy_of: None,
             ranges: vec![(0, 0, 9, 0)],
             rules: vec![CfRule {
                 kind: CfKind::CellIs {
@@ -726,6 +729,7 @@ mod tests {
         // A rule with no dxf_id is skipped even when it would match.
         let cf = CondFormat {
             ix: None,
+            copy_of: None,
             ranges: vec![(0, 0, 9, 0)],
             rules: vec![CfRule {
                 kind: CfKind::CellIs {
@@ -742,6 +746,7 @@ mod tests {
         // CfKind::Other is never evaluated.
         let cf = CondFormat {
             ix: None,
+            copy_of: None,
             ranges: vec![(0, 0, 9, 0)],
             rules: vec![CfRule {
                 kind: CfKind::Other {
@@ -771,6 +776,7 @@ mod tests {
         // Lower priority number = higher precedence → green wins.
         let cf = CondFormat {
             ix: None,
+            copy_of: None,
             ranges: vec![(0, 0, 9, 0)],
             rules: vec![
                 CfRule {
@@ -824,6 +830,7 @@ mod tests {
         // order in the file doesn't decide, the priority does.
         let cf = CondFormat {
             ix: None,
+            copy_of: None,
             ranges: vec![(0, 0, 9, 0)],
             rules: (0..3)
                 .rev()
@@ -855,6 +862,7 @@ mod tests {
         };
         let cf = CondFormat {
             ix: None,
+            copy_of: None,
             ranges: vec![(0, 0, 4, 0)],
             rules: vec![CfRule {
                 kind: CfKind::Expression {
@@ -877,6 +885,7 @@ mod tests {
         let cells: Vec<(&str, f64)> = cells.iter().map(|(n, v)| (n.as_str(), *v)).collect();
         let cf = CondFormat {
             ix: None,
+            copy_of: None,
             ranges: vec![(0, 0, 99, 0)],
             rules: vec![CfRule {
                 kind: CfKind::IconSet {

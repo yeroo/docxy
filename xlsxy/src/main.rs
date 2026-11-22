@@ -28288,6 +28288,7 @@ mod tests {
                 priority: 1,
             }],
             ix: None,
+            copy_of: None,
         });
         wb.tables.push(gridcore::sheet::Table {
             name: "T".into(),
@@ -28497,6 +28498,7 @@ mod tests {
                     priority: 1,
                 }],
                 ix: None,
+                copy_of: None,
             });
         cut_across(&mut app, 0, ((0, 0), (0, 5)), 0, (19, 0));
         assert_eq!(cf_formula(&app), "$F$20=\"on\"");
@@ -28585,6 +28587,7 @@ mod tests {
                 priority: 1,
             }],
             ix: None,
+            copy_of: None,
         };
         let sheets = &mut app.pkg.workbook.sheets;
         // Over the cut cell: relative to its own range, so unchanged.

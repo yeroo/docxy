@@ -2865,15 +2865,37 @@ pub fn move_abs_ref_expr(
     mv: &CellMove,
     own: &[(u32, u32, u32, u32)],
 ) -> Expr {
-    let meets_own = |p: &CellRef, q: &CellRef| {
-        let (r1, r2) = (p.row.min(q.row), p.row.max(q.row));
-        let (c1, c2) = (p.col.min(q.col), p.col.max(q.col));
-        own.iter().any(|&(a, b, c, d)| {
+    let abs = |r: &CellRef| r.abs_row && r.abs_col;
+    move_refs_in(e, home, mv, &|p, q| {
+        abs(p) && abs(q) && !names_own_cells(p, q, own)
+    })
+}
+
+/// [`move_ref_expr`] for the part of a conditional-format rule over a cut
+/// that lies beside it, split off it (#1458): every reference to a moved
+/// cell follows it but a fully absolute one into the rule's own cells
+/// `own` (its ranges before the split), which stay with the rule, as
+/// [`move_abs_ref_expr`] keeps them (#880).
+pub(crate) fn move_ref_expr_keeping_own(
+    e: &Expr,
+    home: Option<&str>,
+    mv: &CellMove,
+    own: &[(u32, u32, u32, u32)],
+) -> Expr {
+    move_refs_in(e, home, mv, &|p, q| !names_own_cells(p, q, own))
+}
+
+/// Whether the reference `p` (`q` its second corner, or `p` again) is fully
+/// absolute and meets the rule's own cells `own`, so names them (#880).
+pub(crate) fn names_own_cells(p: &CellRef, q: &CellRef, own: &[(u32, u32, u32, u32)]) -> bool {
+    let abs = |r: &CellRef| r.abs_row && r.abs_col;
+    let (r1, r2) = (p.row.min(q.row), p.row.max(q.row));
+    let (c1, c2) = (p.col.min(q.col), p.col.max(q.col));
+    abs(p)
+        && abs(q)
+        && own.iter().any(|&(a, b, c, d)| {
             i64::from(a) <= r2 && r1 <= i64::from(c) && i64::from(b) <= c2 && c1 <= i64::from(d)
         })
-    };
-    let abs = |r: &CellRef| r.abs_row && r.abs_col;
-    move_refs_in(e, home, mv, &|p, q| abs(p) && abs(q) && !meets_own(p, q))
 }
 
 /// [`move_ref_expr`], of only the references `takes` takes, given a
