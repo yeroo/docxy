@@ -5041,7 +5041,16 @@ impl<'a> Eval<'a> {
             None => Ok(self.sheet),
             Some(n) => match self.res.sheet_index(n) {
                 Some(i) => Ok(i),
-                None => Err(Value::Err(ExcelError::Ref)),
+                None => {
+                    // A sheet of another workbook (`'[1]My Sheet'!A1`,
+                    // `'C:\Docs\[Book.xlsx]Sheet1'!A1`; no sheet name holds
+                    // `[`): its cells aren't in the model, so the formula
+                    // keeps its cached value rather than turning #REF!.
+                    if n.contains('[') {
+                        self.unsupported = true;
+                    }
+                    Err(Value::Err(ExcelError::Ref))
+                }
             },
         }
     }
