@@ -471,6 +471,23 @@ pub fn paper_points(code: u32) -> (f64, f64) {
     }
 }
 
+/// The paper codes [`paper_points`] knows, in its order: Letter before Note
+/// and Letter small, Tabloid before 11x17 and Ledger, A4 before A4 small.
+pub const KNOWN_PAPERS: [u32; 25] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 27, 28, 34, 37, 66, 70,
+];
+
+/// The paper code of a page `w` × `h` points, either way round, within 2
+/// points (an `.ods` page layout's `fo:page-width`/`fo:page-height`, #901):
+/// the first of [`KNOWN_PAPERS`] that fits. `None` for any other size.
+pub fn paper_code(w: f64, h: f64) -> Option<u32> {
+    let near = |a: f64, b: f64| (a - b).abs() <= 2.0;
+    KNOWN_PAPERS.into_iter().find(|&code| {
+        let (pw, ph) = paper_points(code);
+        (near(w, pw) && near(h, ph)) || (near(w, ph) && near(h, pw))
+    })
+}
+
 /// An XML boolean attribute value as the schema reads it.
 pub(crate) fn xml_bool(v: &str) -> Option<bool> {
     match v.trim() {
@@ -494,6 +511,30 @@ mod tests {
         assert_eq!(d.page_order, PageOrder::DownThenOver);
         assert!(d.header_footer.scale_with_doc && d.header_footer.align_with_margins);
         assert_eq!(d.margins, Margins::default());
+    }
+
+    /// A page size names the first paper code of its size, either way
+    /// round; a size no code has names none (#901).
+    #[test]
+    fn paper_code_matches_known_sizes_either_way_round() {
+        assert_eq!(paper_code(612.0, 792.0), Some(1));
+        assert_eq!(paper_code(792.0, 612.0), Some(1));
+        assert_eq!(paper_code(595.3, 841.9), Some(9));
+        assert_eq!(paper_code(841.0, 596.0), Some(9));
+        assert_eq!(paper_code(792.0, 1224.0), Some(3));
+        assert_eq!(paper_code(1224.0, 792.0), Some(3));
+        assert_eq!(paper_code(297.6, 419.5), Some(70));
+        assert_eq!(paper_code(500.0, 500.0), None);
+        assert_eq!(paper_code(612.0, 795.0), None);
+        // Every known size names itself or an earlier code of its size
+        // (Ledger is Tabloid turned: orientation says which).
+        for code in KNOWN_PAPERS {
+            let (w, h) = paper_points(code);
+            let got = paper_code(w, h).unwrap();
+            let (gw, gh) = paper_points(got);
+            assert!((gw, gh) == (w, h) || (gw, gh) == (h, w), "code {code}");
+            assert!(got <= code);
+        }
     }
 
     #[test]

@@ -554,18 +554,36 @@ fn page_setup_of(s: &gridcore::sheet::Sheet) -> gridcore::print::setup::PageSetu
     ps
 }
 
-/// The `.xls` import reads each sheet's page setup, page breaks and
-/// outline settings as Excel's `.xlsx` original has them, and Convert
-/// (a save as `.xlsx`) keeps them (#1440).
+/// The `.xls` (#1440), `.xlsb` and `.ods` (#901) imports read each sheet's
+/// page setup, page breaks and outline settings as Excel's `.xlsx`
+/// original has them, and Convert (a save as `.xlsx`) keeps them.
+///
+/// The one allowance is an `.ods` sheet's paper: Excel's ODS writer gives
+/// a page layout no `fo:page-width`/`fo:page-height` (no corpus `.ods` has
+/// them), so its import must give the default paper, Letter (1), and only
+/// then is the original's paper put in before comparing.
 #[test]
-fn xls_page_setup_matches_the_xlsx_originals() {
+fn legacy_page_setup_matches_the_xlsx_originals() {
     let mut errs = Vec::new();
     let mut compared = 0;
-    for (src_dir, legacy_dir) in [
-        (corpus("xlsx"), corpus("legacy")),
+    for (src_dir, legacy_dir, ext) in [
+        (corpus("xlsx"), corpus("legacy"), "xls"),
+        (corpus("xlsx"), corpus("legacy"), "xlsb"),
+        (corpus("xlsx"), corpus("legacy"), "ods"),
         (
             corpus("legacy").join("extra"),
             corpus("legacy").join("extra"),
+            "xls",
+        ),
+        (
+            corpus("legacy").join("extra"),
+            corpus("legacy").join("extra"),
+            "xlsb",
+        ),
+        (
+            corpus("legacy").join("extra"),
+            corpus("legacy").join("extra"),
+            "ods",
         ),
     ] {
         let mut stems: Vec<String> = std::fs::read_dir(&src_dir)
@@ -579,17 +597,27 @@ fn xls_page_setup_matches_the_xlsx_originals() {
             let src = load_xlsx(&std::fs::read(src_dir.join(format!("{stem}.xlsx"))).unwrap())
                 .expect("corpus xlsx loads")
                 .workbook;
-            let file = format!("{stem}.xls");
+            let file = format!("{stem}.{ext}");
             let data = std::fs::read(legacy_dir.join(&file)).unwrap();
             let (pkg, _) = open_workbook(&data).unwrap_or_else(|e| panic!("{file}: {e}"));
             let converted = load_xlsx(&save_xlsx(&pkg)).expect("converted import reloads");
             for (how, got) in [("import", &pkg.workbook), ("convert", &converted.workbook)] {
                 for (want, have) in src.sheets.iter().zip(&got.sheets) {
                     let at = |what: &str| format!("{file} ({how}): {}: {what}", want.name);
-                    if page_setup_of(want) != page_setup_of(have) {
+                    let mut got_ps = page_setup_of(have);
+                    if ext == "ods" {
+                        if got_ps.paper_size != 1 {
+                            errs.push(at(&format!(
+                                "paper {} from a page layout without a page size",
+                                got_ps.paper_size
+                            )));
+                        }
+                        got_ps.paper_size = want.page_setup.paper_size;
+                    }
+                    if page_setup_of(want) != got_ps {
                         errs.push(at(&format!(
-                            "page setup\n  xls  {:?}\n  xlsx {:?}",
-                            page_setup_of(have),
+                            "page setup\n  {ext}  {:?}\n  xlsx {:?}",
+                            got_ps,
                             page_setup_of(want)
                         )));
                     }
@@ -614,7 +642,7 @@ fn xls_page_setup_matches_the_xlsx_originals() {
             }
         }
     }
-    assert_eq!(compared, 2 * 22, "sheets compared");
+    assert_eq!(compared, 3 * 2 * 22, "sheets compared");
     assert!(
         errs.is_empty(),
         "{} problems:\n{}",

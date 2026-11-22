@@ -18,12 +18,13 @@
 //! (`office:annotation`, `draw:*`) is not the cell's value; an annotation
 //! is the cell's comment.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use opccore::xml::{Event, XmlParser};
 use opccore::zip::ZipArchive;
 
 use super::{BookIn, ColIn, Limits, OpenError, SheetIn, sheet_prefix};
+use crate::print::setup::{CellComments, Orientation, PageOrder, PageSetup};
 use crate::sheet::{Cell, CellValue, DefinedName, MAX_COLS, MAX_ROWS, Xf};
 
 /// `2024-01-15` or `2024-01-15T12:30:00.5` as a serial.
@@ -719,8 +720,257 @@ struct CellStyle {
     maps: Vec<(String, String, String)>,
 }
 
+/// A `style:page-layout` (#901): what its `style:page-layout-properties`
+/// and header and footer styles say, lengths in points.
+#[derive(Clone, Debug, Default)]
+struct PageLayout {
+    margin_left: Option<f64>,
+    margin_right: Option<f64>,
+    margin_top: Option<f64>,
+    margin_bottom: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+    orientation: Option<Orientation>,
+    /// `style:scale-to`'s percentage.
+    scale: Option<u32>,
+    /// `style:scale-to-X` / `-Y` (or `loext:`'s): pages wide and tall.
+    fit_x: Option<u32>,
+    fit_y: Option<u32>,
+    over_then_down: bool,
+    first_page: Option<u32>,
+    centering: (bool, bool),
+    /// `style:print`'s `grid`, `headers` and `annotations`.
+    grid: bool,
+    headings: bool,
+    annotations: bool,
+    /// The header's and footer's height plus their spacing from the body,
+    /// when the layout styles them.
+    header_room: Option<f64>,
+    footer_room: Option<f64>,
+}
+
+impl PageLayout {
+    /// `style:page-layout-properties`' attributes. A length or number that
+    /// doesn't read, or is out of the model's range, is left out.
+    fn read(&mut self, p: &XmlParser) {
+        let len = |a: &str| length_in(p.attr(a));
+        self.margin_left = len("fo:margin-left");
+        self.margin_right = len("fo:margin-right");
+        self.margin_top = len("fo:margin-top");
+        self.margin_bottom = len("fo:margin-bottom");
+        self.width = length_pt(p.attr("fo:page-width"));
+        self.height = length_pt(p.attr("fo:page-height"));
+        self.orientation = match p.attr("style:print-orientation") {
+            "portrait" => Some(Orientation::Portrait),
+            "landscape" => Some(Orientation::Landscape),
+            _ => None,
+        };
+        self.scale = p
+            .attr("style:scale-to")
+            .trim()
+            .strip_suffix('%')
+            .and_then(|n| n.trim().parse::<f64>().ok())
+            .filter(|n| n.fract() == 0.0)
+            .map(|n| n as u32)
+            .filter(|n| crate::print::setup::SCALE_RANGE.contains(n));
+        let fit = |name: &str| {
+            let v = match p.attr(&format!("style:{name}")) {
+                "" => p.attr(&format!("loext:{name}")),
+                v => v,
+            };
+            v.trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|&n| n <= crate::print::setup::FIT_MAX)
+        };
+        self.fit_x = fit("scale-to-X");
+        self.fit_y = fit("scale-to-Y");
+        self.over_then_down = p.attr("style:print-page-order") == "ltr";
+        self.first_page = p
+            .attr("style:first-page-number")
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|&n| n >= 1);
+        self.centering = match p.attr("style:table-centering") {
+            "horizontal" => (true, false),
+            "vertical" => (false, true),
+            "both" => (true, true),
+            _ => (false, false),
+        };
+        for token in p.attr("style:print").split_whitespace() {
+            match token {
+                "grid" => self.grid = true,
+                "headers" => self.headings = true,
+                "annotations" => self.annotations = true,
+                _ => {}
+            }
+        }
+    }
+}
+
+/// One header or footer of a master page: present, shown (not
+/// `style:display="false"`) and its text as an Excel header string.
+#[derive(Clone, Debug, Default)]
+struct HfPart {
+    present: bool,
+    shown: bool,
+    text: Option<String>,
+}
+
+impl HfPart {
+    /// Its text, when it is shown.
+    fn shown_text(&self) -> Option<String> {
+        (self.present && self.shown)
+            .then(|| self.text.clone())
+            .flatten()
+    }
+}
+
+/// A `style:master-page`: its page layout and its header and footer parts
+/// (header, footer, header-left, footer-left, header-first, footer-first).
+#[derive(Clone, Debug, Default)]
+struct MasterPage {
+    layout: String,
+    parts: [HfPart; 6],
+}
+
+/// The header or footer part `name` names: its index in
+/// [`MasterPage::parts`].
+fn hf_part(name: &str) -> Option<usize> {
+    Some(match name {
+        "style:header" => 0,
+        "style:footer" => 1,
+        "style:header-left" => 2,
+        "style:footer-left" => 3,
+        "style:header-first" | "loext:header-first" => 4,
+        "style:footer-first" | "loext:footer-first" => 5,
+        _ => return None,
+    })
+}
+
+/// A header or footer part being read into Excel's header string: its
+/// left, centre and right sections (paragraphs outside any region are the
+/// centre's), the section being read, paragraphs per section, depth inside
+/// a `text:p` and inside a field whose cached text is not kept.
+#[derive(Default)]
+struct HfText {
+    sections: [String; 3],
+    paragraphs: [usize; 3],
+    region: Option<usize>,
+    in_p: usize,
+    skip: usize,
+}
+
+impl HfText {
+    fn at(&mut self) -> &mut String {
+        &mut self.sections[self.region.unwrap_or(1)]
+    }
+
+    /// An element starts inside the part.
+    fn start(&mut self, name: &str, p: &XmlParser) {
+        let field = |t: &str| Some(t.to_string());
+        let code = match name {
+            "style:region-left" => {
+                self.region = Some(0);
+                None
+            }
+            "style:region-center" => {
+                self.region = Some(1);
+                None
+            }
+            "style:region-right" => {
+                self.region = Some(2);
+                None
+            }
+            "text:p" => {
+                let k = self.region.unwrap_or(1);
+                if self.paragraphs[k] > 0 {
+                    self.sections[k].push('\n');
+                }
+                self.paragraphs[k] += 1;
+                self.in_p += 1;
+                None
+            }
+            "text:s" => {
+                let n = p.attr("text:c").parse().unwrap_or(1usize).min(255);
+                Some(" ".repeat(n))
+            }
+            "text:tab" => field(" "),
+            "text:line-break" => field("\n"),
+            "text:page-number" => field("&P"),
+            "text:page-count" => field("&N"),
+            "text:sheet-name" => field("&A"),
+            "text:date" => field("&D"),
+            "text:time" => field("&T"),
+            "text:file-name" => match p.attr("text:display") {
+                "full" => field("&Z&F"),
+                "path" => field("&Z"),
+                _ => field("&F"),
+            },
+            _ => None,
+        };
+        if matches!(
+            name,
+            "text:page-number"
+                | "text:page-count"
+                | "text:sheet-name"
+                | "text:date"
+                | "text:time"
+                | "text:file-name"
+        ) {
+            self.skip += 1;
+        }
+        if let Some(code) = code {
+            if self.in_p > 0 {
+                self.at().push_str(&code);
+            }
+        }
+    }
+
+    fn text(&mut self, raw: &str) {
+        if self.in_p > 0 && self.skip == 0 {
+            let mut t = String::new();
+            XmlParser::append_decoded(raw, &mut t);
+            let t = t.replace('&', "&&");
+            self.at().push_str(&t);
+        }
+    }
+
+    fn end(&mut self, name: &str) {
+        match name {
+            "style:region-left" | "style:region-center" | "style:region-right" => {
+                self.region = None;
+            }
+            "text:p" => self.in_p = self.in_p.saturating_sub(1),
+            "text:page-number" | "text:page-count" | "text:sheet-name" | "text:date"
+            | "text:time" | "text:file-name" => self.skip = self.skip.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    /// Excel's header string: `&L`, `&C`, `&R` before each non-empty
+    /// section; `None` when all are empty.
+    fn finish(self) -> Option<String> {
+        let mut out = String::new();
+        for (code, text) in ["&L", "&C", "&R"].iter().zip(&self.sections) {
+            if !text.is_empty() {
+                out.push_str(code);
+                out.push_str(text);
+            }
+        }
+        super::page::hf_text(out)
+    }
+}
+
+/// An ODF length in inches.
+fn length_in(s: &str) -> Option<f64> {
+    length_pt(s).map(|pt| pt / 72.0)
+}
+
 /// The data styles, table-cell styles and column styles of a styles or
-/// content part.
+/// content part, and (#901) its page layouts, master pages and the table,
+/// row and column styles that place a sheet on a page.
 #[derive(Default)]
 struct StyleSheet {
     data: HashMap<String, DataStyle>,
@@ -734,6 +984,16 @@ struct StyleSheet {
     columns: HashMap<String, f64>,
     /// `style:default-style style:family="table-column"`'s width.
     default_column: Option<f64>,
+    /// Table style → its `style:master-page-name` (#901).
+    table_masters: HashMap<String, String>,
+    /// `office:master-styles`' master pages by name.
+    masters: HashMap<String, MasterPage>,
+    /// `style:page-layout`s by name.
+    layouts: HashMap<String, PageLayout>,
+    /// Row and column styles with `fo:break-before="page"`: a manual page
+    /// break before each row (column) in them.
+    break_rows: HashSet<String>,
+    break_cols: HashSet<String>,
 }
 
 impl StyleSheet {
@@ -745,14 +1005,41 @@ impl StyleSheet {
         let mut cell_style: Option<Option<String>> = None;
         // The table-column style being read (`Some(None)`: the default).
         let mut column_style: Option<Option<String>> = None;
+        // The table-row style being read.
+        let mut row_style: Option<String> = None;
+        // The page layout being read, and whether inside its header style
+        // (false) or footer style (true).
+        let mut layout: Option<(String, PageLayout)> = None;
+        let mut hf_style: Option<bool> = None;
+        // The master page being read, and the header or footer part inside
+        // it (its index, its depth and its text).
+        let mut master: Option<(String, MasterPage)> = None;
+        let mut part: Option<(usize, usize, HfText)> = None;
+        let mut depth = 0usize;
         // The element whose text the current part collects.
         let mut text_into: Option<usize> = None;
         let mut text = String::new();
         loop {
             match p.next() {
                 Event::Start => {
+                    depth += 1;
                     let name = p.name();
                     let attr = |a: &str| decoded(p.attr(a));
+                    if let Some((_, _, t)) = part.as_mut() {
+                        t.start(name, &p);
+                        continue;
+                    }
+                    if self.page_element(name, &p, &mut layout, &mut hf_style, &mut master) {
+                        if let (Some((_, m)), Some(k)) = (master.as_mut(), hf_part(name)) {
+                            m.parts[k] = HfPart {
+                                present: true,
+                                shown: p.attr("style:display") != "false",
+                                text: None,
+                            };
+                            part = Some((k, depth, HfText::default()));
+                        }
+                        continue;
+                    }
                     if let Some(kind) = name
                         .strip_prefix("number:")
                         .filter(|k| k.ends_with("-style"))
@@ -795,6 +1082,25 @@ impl StyleSheet {
                             column_style = Some(None);
                             continue;
                         }
+                        ("style:style", "table-row") => {
+                            row_style = Some(attr("style:name"));
+                            continue;
+                        }
+                        ("style:style", "table") => {
+                            let m = attr("style:master-page-name");
+                            if !m.is_empty() {
+                                self.table_masters.insert(attr("style:name"), m);
+                            }
+                            continue;
+                        }
+                        ("style:table-row-properties", _) => {
+                            if let Some(n) = &row_style {
+                                if p.attr("fo:break-before") == "page" {
+                                    self.break_rows.insert(n.clone());
+                                }
+                            }
+                            continue;
+                        }
                         ("style:font-face", _) => {
                             let family = attr("svg:font-family");
                             if !family.is_empty() {
@@ -830,6 +1136,11 @@ impl StyleSheet {
                             continue;
                         }
                         ("style:table-column-properties", _) if column_style.is_some() => {
+                            if let Some(Some(n)) = &column_style {
+                                if p.attr("fo:break-before") == "page" {
+                                    self.break_cols.insert(n.clone());
+                                }
+                            }
                             if let Some(pt) = length_pt(p.attr("style:column-width")) {
                                 match column_style.clone().flatten() {
                                     Some(n) => {
@@ -916,14 +1227,45 @@ impl StyleSheet {
                     }
                 }
                 Event::Text => {
+                    if let Some((_, _, t)) = part.as_mut() {
+                        t.text(p.text());
+                    }
                     if text_into.is_some() {
                         XmlParser::append_decoded(p.text(), &mut text);
                     }
                 }
                 Event::End => {
+                    let at = depth;
+                    depth = depth.saturating_sub(1);
+                    if let Some((k, d, mut t)) = part.take() {
+                        if at != d {
+                            t.end(p.name());
+                            part = Some((k, d, t));
+                            continue;
+                        }
+                        if let Some((_, m)) = master.as_mut() {
+                            m.parts[k].text = t.finish();
+                        }
+                        continue;
+                    }
+                    match p.name() {
+                        "style:page-layout" => {
+                            if let Some((n, l)) = layout.take() {
+                                self.layouts.insert(n, l);
+                            }
+                        }
+                        "style:header-style" | "style:footer-style" => hf_style = None,
+                        "style:master-page" => {
+                            if let Some((n, m)) = master.take() {
+                                self.masters.insert(n, m);
+                            }
+                        }
+                        _ => {}
+                    }
                     if matches!(p.name(), "style:style" | "style:default-style") {
                         cell_style = None;
                         column_style = None;
+                        row_style = None;
                     }
                     if let (Some(i), Some((_, style))) = (text_into, cur.as_mut()) {
                         match style.parts.get_mut(i) {
@@ -946,6 +1288,146 @@ impl StyleSheet {
                 Event::Eof => break,
             }
         }
+    }
+
+    /// Read a page-layout or master-page element (#901) into `layout` or
+    /// `master`. True when `name` was one: a header or footer part of the
+    /// master page being read is the caller's to collect.
+    fn page_element(
+        &mut self,
+        name: &str,
+        p: &XmlParser,
+        layout: &mut Option<(String, PageLayout)>,
+        hf_style: &mut Option<bool>,
+        master: &mut Option<(String, MasterPage)>,
+    ) -> bool {
+        let attr = |a: &str| decoded(p.attr(a));
+        match name {
+            "style:page-layout" => {
+                *layout = Some((attr("style:name"), PageLayout::default()));
+            }
+            "style:page-layout-properties" => {
+                if let Some((_, l)) = layout.as_mut() {
+                    l.read(p);
+                }
+            }
+            "style:header-style" => *hf_style = Some(false),
+            "style:footer-style" => *hf_style = Some(true),
+            "style:header-footer-properties" => {
+                let (Some((_, l)), Some(footer)) = (layout.as_mut(), *hf_style) else {
+                    return true;
+                };
+                let len = |a: &str| length_in(p.attr(a));
+                let height = len("fo:min-height").or_else(|| len("svg:height"));
+                // The spacing is the margin on the body's side.
+                let spacing = len(if footer {
+                    "fo:margin-top"
+                } else {
+                    "fo:margin-bottom"
+                });
+                let room = Some(height.unwrap_or(0.0) + spacing.unwrap_or(0.0));
+                if footer {
+                    l.footer_room = room;
+                } else {
+                    l.header_room = room;
+                }
+            }
+            "style:master-page" => {
+                *master = Some((
+                    attr("style:name"),
+                    MasterPage {
+                        layout: attr("style:page-layout-name"),
+                        ..MasterPage::default()
+                    },
+                ));
+            }
+            n if master.is_some() && hf_part(n).is_some() => {}
+            _ => return false,
+        }
+        true
+    }
+
+    /// The page setup of a table in table style `style` (#901): its master
+    /// page's (the one named `Default` when the style names none, or one
+    /// that isn't there), its page layout and header and footer. With no
+    /// master page, the model's default.
+    fn page_setup(&self, style: &str) -> PageSetup {
+        let mut ps = PageSetup::default();
+        let Some(master) = self
+            .table_masters
+            .get(style)
+            .and_then(|m| self.masters.get(m))
+            .or_else(|| self.masters.get("Default"))
+        else {
+            return ps;
+        };
+        let [
+            header,
+            footer,
+            header_left,
+            footer_left,
+            header_first,
+            footer_first,
+        ] = &master.parts;
+        if let Some(l) = self.layouts.get(&master.layout) {
+            let m = &mut ps.margins;
+            if let Some(v) = l.margin_left {
+                m.left = v;
+            }
+            if let Some(v) = l.margin_right {
+                m.right = v;
+            }
+            // The page margin is the header's distance from the edge; the
+            // body starts below the header and its spacing, when shown.
+            let shown = |part: &HfPart| part.present && part.shown;
+            if let Some(v) = l.margin_top {
+                m.header = v;
+                m.top = v + l.header_room.filter(|_| shown(header)).unwrap_or(0.0);
+            }
+            if let Some(v) = l.margin_bottom {
+                m.footer = v;
+                m.bottom = v + l.footer_room.filter(|_| shown(footer)).unwrap_or(0.0);
+            }
+            if let (Some(w), Some(h)) = (l.width, l.height) {
+                if let Some(code) = crate::print::setup::paper_code(w, h) {
+                    ps.paper_size = code;
+                }
+            }
+            if let Some(o) = l.orientation {
+                ps.orientation = o;
+            }
+            if let Some(n) = l.scale {
+                ps.scale = n;
+            }
+            if l.fit_x.is_some() || l.fit_y.is_some() {
+                ps.fit_to_page = true;
+                ps.fit_width = l.fit_x.unwrap_or(0);
+                ps.fit_height = l.fit_y.unwrap_or(0);
+            }
+            if l.over_then_down {
+                ps.page_order = PageOrder::OverThenDown;
+            }
+            ps.first_page_number = l.first_page;
+            (ps.h_centered, ps.v_centered) = l.centering;
+            ps.grid_lines = l.grid;
+            ps.headings = l.headings;
+            if l.annotations {
+                ps.cell_comments = CellComments::AtEnd;
+            }
+        }
+        let hf = &mut ps.header_footer;
+        hf.odd_header = header.shown_text();
+        hf.odd_footer = footer.shown_text();
+        // Even and first pages differ only where a shown part has text:
+        // Excel's ODS writer gives every master page an empty first-page
+        // header and footer, and an even one not displayed.
+        hf.even_header = header_left.shown_text();
+        hf.even_footer = footer_left.shown_text();
+        hf.different_odd_even = hf.even_header.is_some() || hf.even_footer.is_some();
+        hf.first_header = header_first.shown_text();
+        hf.first_footer = footer_first.shown_text();
+        hf.different_first = hf.first_header.is_some() || hf.first_footer.is_some();
+        ps
     }
 
     /// The format code of cell style `name`, through its parents.
@@ -1575,6 +2057,12 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
     // (name, sheet scope, definition) of each named range/expression.
     let mut names: Vec<(String, Option<usize>, String)> = Vec::new();
     let mut null_date_1904 = false;
+    // Print titles (#901): where the table's header rows (columns) start,
+    // and the span they cover once they end.
+    let mut header_rows: Option<u32> = None;
+    let mut header_cols: Option<u32> = None;
+    let mut title_rows: Option<(u32, u32)> = None;
+    let mut title_cols: Option<(u32, u32)> = None;
 
     loop {
         match p.next() {
@@ -1583,11 +2071,27 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                 let attr = |a: &str| decoded(p.attr(a));
                 match name.as_str() {
                     "table:table" => {
+                        let table = attr("table:name");
+                        // Its print area (#901): the ranges of
+                        // `table:print-ranges`, all of them or none.
+                        let ranges = attr("table:print-ranges");
+                        if let Some(area) = print_area(&table, &ranges) {
+                            names.push((
+                                crate::print::area::PRINT_AREA.to_string(),
+                                Some(book.sheets.len()),
+                                area,
+                            ));
+                        }
                         book.push_sheet(SheetIn {
-                            name: attr("table:name"),
+                            name: table,
                             cells: BTreeMap::new(),
+                            page_setup: styles.page_setup(&attr("table:style-name")),
                             ..SheetIn::default()
                         })?;
+                        header_rows = None;
+                        header_cols = None;
+                        title_rows = None;
+                        title_cols = None;
                         col_styles.clear();
                         col_interest = None;
                         col_runs.clear();
@@ -1602,6 +2106,11 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                             .attr("table:number-columns-repeated")
                             .parse()
                             .unwrap_or(1u32);
+                        if styles.break_cols.contains(&attr("table:style-name")) {
+                            if let Some(sheet) = book.sheets.last_mut() {
+                                add_breaks(&mut sheet.col_breaks, next_col, n, MAX_COLS, MAX_ROWS);
+                            }
+                        }
                         // Adjacent columns in one style are one run.
                         let style = attr("table:default-cell-style-name");
                         if col_styles.last().is_none_or(|(_, s)| *s != style) {
@@ -1630,6 +2139,17 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                             .unwrap_or(1u32)
                             .max(1);
                         row_style = attr("table:default-cell-style-name");
+                        if styles.break_rows.contains(&attr("table:style-name")) {
+                            if let Some(sheet) = book.sheets.last_mut() {
+                                add_breaks(
+                                    &mut sheet.row_breaks,
+                                    row,
+                                    row_repeat,
+                                    MAX_ROWS,
+                                    MAX_COLS,
+                                );
+                            }
+                        }
                     }
                     "table:table-cell" | "table:covered-table-cell" => {
                         let mut c = CellIn {
@@ -1720,6 +2240,9 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                             message = Some((error, Para::default()));
                         }
                     }
+                    // The rows and columns repeated on every page (#901).
+                    "table:table-header-rows" => header_rows = Some(row),
+                    "table:table-header-columns" => header_cols = Some(next_col),
                     "table:null-date" => {
                         null_date_1904 = p.attr("table:date-value").starts_with("1904-01-01");
                     }
@@ -1766,7 +2289,32 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                             }
                         }
                     }
+                    "table:table-header-rows" => {
+                        title_rows = span(header_rows.take(), row, MAX_ROWS);
+                    }
+                    "table:table-header-columns" => {
+                        title_cols = span(header_cols.take(), next_col, MAX_COLS);
+                    }
                     "table:table" => {
+                        // Its print titles (#901): columns first, then rows,
+                        // as Excel writes them.
+                        if let Some(sheet) = book.sheets.last() {
+                            use crate::print::area::{PRINT_TITLES, PrintRef, spell_refs};
+                            let refs: Vec<PrintRef> = [
+                                title_cols.take().map(|(a, b)| PrintRef::Cols(a, b)),
+                                title_rows.take().map(|(a, b)| PrintRef::Rows(a, b)),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                            if !refs.is_empty() {
+                                names.push((
+                                    PRINT_TITLES.to_string(),
+                                    Some(book.sheets.len() - 1),
+                                    spell_refs(&super::escape_colon(&sheet.name), &refs),
+                                ));
+                            }
+                        }
                         if let Some(sheet) = book.sheets.last_mut() {
                             table_columns(&col_runs, sheet);
                             for (name, cells) in rule_cells.take() {
@@ -2077,6 +2625,46 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
         });
     }
     Ok(book)
+}
+
+/// Manual page breaks before each of `n` rows (columns) from `first` (#901):
+/// row (column) 0 has nothing before it, none past the grid's `max`, and at
+/// most [`super::page::MAX_BREAKS`] in all. Each spans the whole sheet, to
+/// `span` - 1, as Excel writes them. Bounded by the cap, never by `n`, so a
+/// filler run of a million rows costs nothing.
+fn add_breaks(list: &mut Vec<crate::sheet::PageBreak>, first: u32, n: u32, max: u32, span: u32) {
+    let end = first.saturating_add(n).min(max);
+    for at in first.max(1)..end {
+        if list.len() >= super::page::MAX_BREAKS {
+            break;
+        }
+        list.push(super::page::read_break(at, 0, span - 1));
+    }
+}
+
+/// The rows (columns) from `start` up to `end`, on the grid of `max`.
+fn span(start: Option<u32>, end: u32, max: u32) -> Option<(u32, u32)> {
+    let start = start?;
+    let end = end.min(max);
+    (end > start).then(|| (start, end - 1))
+}
+
+/// A table's `table:print-ranges` (space-separated ODF ranges) as Excel's
+/// `_xlnm.Print_Area` definition on table `table` (#901); `None` when it
+/// has none, or a range that doesn't read.
+fn print_area(table: &str, ranges: &str) -> Option<String> {
+    use crate::print::area::{PrintRef, parse_refs, spell_refs};
+    let mut refs = Vec::new();
+    for r in split_unquoted(ranges, char::is_whitespace) {
+        let excel = convert_ref(r)?;
+        let [one] = parse_refs(&excel)[..] else {
+            return None;
+        };
+        refs.push(PrintRef::of_rect(one.rect()));
+    }
+    // The table's name with `:` spelled as the build's marker, so a
+    // renamed sheet's definition follows it (as `sheet_prefix` spells).
+    (!refs.is_empty()).then(|| spell_refs(&super::escape_colon(table), &refs))
 }
 
 /// A cell's value from its `office:value-type` and value attributes (or its
@@ -3285,5 +3873,300 @@ mod tests {
             [(0, 0, "Ann".to_string(), "x\ty z\nw".to_string())]
         );
         assert_eq!(s.cells[&(0, 0)].value, CellValue::Text("own\ttext".into()));
+    }
+
+    /// A styles part with these automatic styles (page layouts) and
+    /// master pages.
+    fn styles_part(auto: &str, masters: &str) -> String {
+        format!(
+            r#"<office:document-styles xmlns:office="o" xmlns:style="s" xmlns:fo="f" xmlns:svg="g" xmlns:text="x" xmlns:loext="l"><office:automatic-styles>{auto}</office:automatic-styles><office:master-styles>{masters}</office:master-styles></office:document-styles>"#
+        )
+    }
+
+    /// Page layouts and master pages for four tables (#901): `mA` with
+    /// every field away from its default and text in every header part,
+    /// `mB` on `loext:` names with its header not displayed, and `Default`.
+    fn page_styles() -> String {
+        styles_part(
+            r#"<style:page-layout style:name="pmA"><style:page-layout-properties fo:page-width="297mm" fo:page-height="210mm" fo:margin-left="0.5in" fo:margin-right="0.6in" fo:margin-top="0.4in" fo:margin-bottom="0.3in" style:print-orientation="landscape" style:scale-to="80%" style:print-page-order="ltr" style:first-page-number="3" style:table-centering="both" style:print="objects grid headers annotations charts"/>
+                 <style:header-style><style:header-footer-properties fo:min-height="0.5in" fo:margin-bottom="0.1in"/></style:header-style>
+                 <style:footer-style><style:header-footer-properties svg:height="0.25in" fo:margin-top="0.05in"/></style:footer-style></style:page-layout>
+               <style:page-layout style:name="pmB"><style:page-layout-properties fo:page-width="8.5in" fo:page-height="11in" fo:margin-top="0.7in" fo:margin-bottom="0.7in" loext:scale-to-X="2" loext:scale-to-Y="3" style:first-page-number="continue" style:print-page-order="ttb" style:table-centering="none"/>
+                 <style:header-style><style:header-footer-properties fo:min-height="0.4in"/></style:header-style>
+                 <style:footer-style><style:header-footer-properties fo:min-height="0.2in"/></style:footer-style></style:page-layout>
+               <style:page-layout style:name="pmC"><style:page-layout-properties fo:margin-left="1in" fo:margin-top="oops"/></style:page-layout>"#,
+            r#"<style:master-page style:name="mA" style:page-layout-name="pmA">
+                 <style:header><style:region-left><text:p>Page <text:page-number>1</text:page-number> of <text:page-count>9</text:page-count></text:p></style:region-left><style:region-center><text:p><text:sheet-name>???</text:sheet-name> &amp; <text:span>Co</text:span></text:p></style:region-center><style:region-right><text:p><text:date>2026-01-01</text:date> <text:time>10:00</text:time></text:p></style:region-right></style:header>
+                 <style:header-left><text:p>Even</text:p></style:header-left>
+                 <style:header-first/>
+                 <style:footer><text:p>Line1</text:p><text:p><text:file-name text:display="full">a.ods</text:file-name><text:s text:c="2"/>end<text:tab/>x<text:line-break/>y <text:title>Report</text:title></text:p></style:footer>
+                 <style:footer-left style:display="false"><text:p>not shown</text:p></style:footer-left>
+                 <loext:footer-first><text:p>First</text:p></loext:footer-first>
+               </style:master-page>
+               <style:master-page style:name="mB" style:page-layout-name="pmB"><style:header style:display="false"><text:p>hidden</text:p></style:header><style:footer/><style:header-first/><style:footer-first/></style:master-page>
+               <style:master-page style:name="Default" style:page-layout-name="pmC"/>"#,
+        )
+    }
+
+    /// Four tables on `mA`, `mB`, a master page that isn't there and none.
+    fn page_content() -> String {
+        styled_content(
+            "",
+            r#"<style:style style:name="ta1" style:family="table" style:master-page-name="mA"/><style:style style:name="ta2" style:family="table" style:master-page-name="mB"/><style:style style:name="ta3" style:family="table" style:master-page-name="Missing"/>"#,
+            r#"<table:table table:name="A" table:style-name="ta1"><table:table-row><table:table-cell office:value-type="float" office:value="1"/></table:table-row></table:table>
+               <table:table table:name="B" table:style-name="ta2"/>
+               <table:table table:name="C" table:style-name="ta3"/>
+               <table:table table:name="D"/>"#,
+        )
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    /// An `.ods` sheet's page setup comes from its table style's master page
+    /// and that page's layout (#901): margins with the header and footer's
+    /// room, paper, orientation, scale or fit, page order, first page,
+    /// centring, print options and the header and footer text in Excel's
+    /// codes.
+    #[test]
+    fn ods_reads_page_layout_and_header_footer() {
+        let b = read_styled(&page_styles(), &page_content(), Limits::default());
+        let a = &b.sheets[0].page_setup;
+        let m = a.margins;
+        for (got, want) in [
+            (m.left, 0.5),
+            (m.right, 0.6),
+            (m.header, 0.4),
+            (m.top, 1.0),
+            (m.footer, 0.3),
+            (m.bottom, 0.6),
+        ] {
+            assert!(close(got, want), "{m:?}");
+        }
+        assert_eq!(a.paper_size, 9);
+        assert_eq!(a.orientation, Orientation::Landscape);
+        assert_eq!(a.scale, 80);
+        assert!(!a.fit_to_page);
+        assert_eq!(a.page_order, PageOrder::OverThenDown);
+        assert_eq!(a.first_page_number, Some(3));
+        assert!(a.h_centered && a.v_centered && a.grid_lines && a.headings);
+        assert_eq!(a.cell_comments, CellComments::AtEnd);
+        let hf = &a.header_footer;
+        assert_eq!(
+            hf.odd_header.as_deref(),
+            Some("&LPage &P of &N&C&A && Co&R&D &T")
+        );
+        assert_eq!(
+            hf.odd_footer.as_deref(),
+            Some("&CLine1\n&Z&F  end x\ny Report")
+        );
+        assert!(hf.different_odd_even && hf.different_first);
+        assert_eq!(hf.even_header.as_deref(), Some("&CEven"));
+        assert_eq!(hf.even_footer, None);
+        assert_eq!(hf.first_header, None);
+        assert_eq!(hf.first_footer.as_deref(), Some("&CFirst"));
+        assert!(hf.scale_with_doc && hf.align_with_margins);
+
+        // mB: its header isn't displayed, so the body starts at the page
+        // margin (top == header); its shown, empty footer still takes room.
+        let b2 = &b.sheets[1].page_setup;
+        let m = b2.margins;
+        assert!(close(m.top, 0.7) && close(m.header, 0.7), "{m:?}");
+        assert!(close(m.bottom, 0.9) && close(m.footer, 0.7), "{m:?}");
+        assert!(close(m.left, 0.7) && close(m.right, 0.7), "{m:?}");
+        assert_eq!(b2.paper_size, 1);
+        assert_eq!(b2.orientation, Orientation::Default);
+        assert!(b2.fit_to_page);
+        assert_eq!((b2.fit_width, b2.fit_height, b2.scale), (2, 3, 100));
+        assert_eq!(b2.first_page_number, None);
+        assert_eq!(b2.page_order, PageOrder::DownThenOver);
+        assert_eq!(b2.header_footer, Default::default());
+
+        // A master page that isn't there, and no table style: `Default`'s,
+        // whose unreadable top margin is left out.
+        let want = PageSetup {
+            margins: crate::print::setup::Margins {
+                left: 1.0,
+                ..Default::default()
+            },
+            ..PageSetup::default()
+        };
+        assert_eq!(b.sheets[2].page_setup, want);
+        assert_eq!(b.sheets[3].page_setup, want);
+
+        // No master pages at all: the model's default.
+        let b = read_styled("", &page_content(), Limits::default());
+        assert_eq!(b.sheets[0].page_setup, PageSetup::default());
+    }
+
+    /// Rows and columns in a style with `fo:break-before="page"` are manual
+    /// page breaks (#901), each row (column) of a repeated run, row and
+    /// column 0 and anything past the grid left out, at most
+    /// `page::MAX_BREAKS` however long the run.
+    #[test]
+    fn ods_reads_row_and_column_breaks() {
+        let xml = styled_content(
+            "",
+            r#"<style:style style:name="ro1" style:family="table-row"><style:table-row-properties fo:break-before="page"/></style:style><style:style style:name="ro2" style:family="table-row"><style:table-row-properties fo:break-before="auto"/></style:style><style:style style:name="co1" style:family="table-column"><style:table-column-properties fo:break-before="page" style:column-width="1in"/></style:style><style:style style:name="co2" style:family="table-column"><style:table-column-properties style:column-width="1in"/></style:style>"#,
+            r#"<table:table table:name="S">
+                 <table:table-column table:style-name="co1"/><table:table-column table:style-name="co2"/><table:table-column table:style-name="co1"/><table:table-column table:style-name="co2" table:number-columns-repeated="2"/><table:table-column table:style-name="co1" table:number-columns-repeated="2"/>
+                 <table:table-row table:style-name="ro1"><table:table-cell office:value-type="float" office:value="1"/></table:table-row>
+                 <table:table-row table:style-name="ro2" table:number-rows-repeated="2"/>
+                 <table:table-row table:style-name="ro1"/>
+                 <table:table-row table:style-name="ro2"/>
+                 <table:table-row table:style-name="ro1" table:number-rows-repeated="1048571"/>
+               </table:table>
+               <table:table table:name="T"><table:table-column table:number-columns-repeated="16384"/><table:table-column table:style-name="co1"/><table:table-row table:number-rows-repeated="1048576"/><table:table-row table:style-name="ro1"/></table:table>"#,
+        );
+        let started = std::time::Instant::now();
+        let b = read_styled("", &xml, Limits::default());
+        assert!(started.elapsed().as_secs() < 5, "a long run is walked");
+        let s = &b.sheets[0];
+        let ids = |v: &[crate::sheet::PageBreak]| v.iter().map(|b| b.id).collect::<Vec<_>>();
+        assert_eq!(ids(&s.col_breaks), [2, 5, 6]);
+        assert!(
+            s.col_breaks
+                .iter()
+                .all(|b| b.attrs == r#" max="1048575" man="1""#)
+        );
+        assert_eq!(s.row_breaks.len(), super::super::page::MAX_BREAKS);
+        assert_eq!(ids(&s.row_breaks[..3]), [3, 5, 6]);
+        assert_eq!(
+            s.row_breaks.last().unwrap().id,
+            5 + super::super::page::MAX_BREAKS as u32 - 2
+        );
+        assert!(
+            s.row_breaks
+                .iter()
+                .all(|b| b.attrs == r#" max="16383" man="1""#)
+        );
+        let t = &b.sheets[1];
+        assert!(t.row_breaks.is_empty() && t.col_breaks.is_empty());
+    }
+
+    fn ods_zip_styled(styles: &str, content: &str) -> Vec<u8> {
+        opccore::zipwrite::write_zip(&[
+            (
+                "mimetype".to_string(),
+                b"application/vnd.oasis.opendocument.spreadsheet".to_vec(),
+            ),
+            ("styles.xml".to_string(), styles.as_bytes().to_vec()),
+            ("content.xml".to_string(), content.as_bytes().to_vec()),
+        ])
+    }
+
+    /// A table's `table:print-ranges` is its sheet's `_xlnm.Print_Area` and
+    /// its header rows and columns its `_xlnm.Print_Titles` (#901), as
+    /// Excel spells them, and they come through Convert.
+    #[test]
+    fn ods_reads_print_area_and_titles() {
+        use crate::print::area::{PrintTitles, print_area, print_titles};
+        let xml = styled_content(
+            "",
+            "",
+            r#"<table:table table:name="My Sheet" table:print-ranges="'My Sheet'.A1:'My Sheet'.C5 $'My Sheet'.$E$1:.$F$2"><table:table-row><table:table-cell office:value-type="float" office:value="1"/></table:table-row></table:table>
+               <table:table table:name="T2"><table:table-header-columns><table:table-column table:number-columns-repeated="2"/></table:table-header-columns><table:table-column/><table:table-row/><table:table-header-rows><table:table-row table:number-rows-repeated="2"/></table:table-header-rows><table:table-row/></table:table>
+               <table:table table:name="T3" table:print-ranges="T3.A1:T3.B2 nonsense"/>
+               <table:table table:name="T4" table:print-ranges="T4.A1:T4.B1048576"><table:table-header-rows><table:table-row/></table:table-header-rows></table:table>"#,
+        );
+        let b = read_styled("", &xml, Limits::default());
+        let names: Vec<_> = b
+            .names
+            .iter()
+            .map(|d| (d.name.as_str(), d.scope, d.formula.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                (
+                    "_xlnm.Print_Area",
+                    Some(0),
+                    "'My Sheet'!$A$1:$C$5,'My Sheet'!$E$1:$F$2"
+                ),
+                // T2 and T4 are cell addresses, so their names are quoted.
+                ("_xlnm.Print_Titles", Some(1), "'T2'!$A:$B,'T2'!$2:$3"),
+                ("_xlnm.Print_Area", Some(3), "'T4'!$A:$B"),
+                ("_xlnm.Print_Titles", Some(3), "'T4'!$1:$1"),
+            ]
+        );
+        let (pkg, _) = super::super::open_workbook(&ods_zip(&xml)).unwrap();
+        let back = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        let wb = &back.workbook;
+        assert_eq!(print_area(wb, 0), [(0, 0, 4, 2), (0, 4, 1, 5)]);
+        assert_eq!(
+            print_titles(wb, 1),
+            PrintTitles {
+                rows: Some((1, 2)),
+                cols: Some((0, 1)),
+            }
+        );
+        assert!(print_area(wb, 2).is_empty());
+        assert_eq!(print_area(wb, 3), [(0, 0, MAX_ROWS - 1, 1)]);
+        let kept: Vec<_> = wb
+            .defined_names
+            .iter()
+            .map(|d| (d.name.as_str(), d.scope, d.formula.as_str()))
+            .collect();
+        assert_eq!(kept, names);
+    }
+
+    /// A table named with a `:` is renamed (`A:B` → `A_B`), and its print
+    /// area and titles follow it (#901): spelled with the build's colon
+    /// marker, as every other reference the reader builds.
+    #[test]
+    fn a_colon_named_tables_print_area_and_titles_follow_its_rename() {
+        use crate::print::area::{PrintTitles, print_area, print_titles};
+        let xml = styled_content(
+            "",
+            "",
+            r#"<table:table table:name="A:B" table:print-ranges="'A:B'.A1:'A:B'.C5"><table:table-header-rows><table:table-row table:number-rows-repeated="2"/></table:table-header-rows><table:table-row><table:table-cell office:value-type="float" office:value="1"/></table:table-row></table:table>"#,
+        );
+        let (pkg, _) = super::super::open_workbook(&ods_zip(&xml)).unwrap();
+        let wb = &pkg.workbook;
+        assert_eq!(wb.sheets[0].name, "A_B");
+        let names: Vec<_> = wb
+            .defined_names
+            .iter()
+            .map(|d| (d.name.as_str(), d.scope, d.formula.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("_xlnm.Print_Area", Some(0), "A_B!$A$1:$C$5"),
+                ("_xlnm.Print_Titles", Some(0), "A_B!$1:$2"),
+            ]
+        );
+        assert_eq!(print_area(wb, 0), [(0, 0, 4, 2)]);
+        assert_eq!(
+            print_titles(wb, 0),
+            PrintTitles {
+                rows: Some((0, 1)),
+                cols: None,
+            }
+        );
+    }
+
+    /// Side effect (#901): an imported `.ods`'s page setup and manual breaks
+    /// come through Convert (a save as `.xlsx` and a reload).
+    #[test]
+    fn ods_page_setup_survives_convert() {
+        let content = styled_content(
+            "",
+            r#"<style:style style:name="ta1" style:family="table" style:master-page-name="mA"/><style:style style:name="ro1" style:family="table-row"><style:table-row-properties fo:break-before="page"/></style:style><style:style style:name="co1" style:family="table-column"><style:table-column-properties fo:break-before="page"/></style:style>"#,
+            r#"<table:table table:name="A" table:style-name="ta1"><table:table-column/><table:table-column table:style-name="co1"/><table:table-row><table:table-cell office:value-type="float" office:value="1"/></table:table-row><table:table-row table:style-name="ro1"/></table:table>"#,
+        );
+        let (pkg, _) =
+            super::super::open_workbook(&ods_zip_styled(&page_styles(), &content)).unwrap();
+        let imported = pkg.workbook.sheets[0].clone();
+        assert_eq!(imported.page_setup.paper_size, 9);
+        let back = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        let s = &back.workbook.sheets[0];
+        assert_eq!(s.page_setup, imported.page_setup);
+        let ids = |b: &[crate::sheet::PageBreak]| {
+            b.iter().map(|b| (b.id, b.is_manual())).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&s.row_breaks), [(1, true)]);
+        assert_eq!(ids(&s.col_breaks), [(1, true)]);
     }
 }

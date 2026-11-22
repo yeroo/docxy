@@ -1688,7 +1688,7 @@ fn read_sheet(
                     let mut list = Vec::new();
                     for _ in 0..n {
                         let (at, start, end) = (c.u16()?, c.u16()?, c.u16()?);
-                        list.push(page::read_break(at, start, end));
+                        list.push(page::read_break(at.into(), start.into(), end.into()));
                     }
                     if r.ty == page::HPAGEBREAKS {
                         sheet.row_breaks = list;

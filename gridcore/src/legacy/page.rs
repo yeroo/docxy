@@ -7,6 +7,13 @@
 //! (0x0083), VCENTER (0x0084), PRINTHEADERS (0x002A), PRINTGRIDLINES
 //! (0x002B), WSBOOL (0x0081), HORIZONTALPAGEBREAKS (0x001B) and
 //! VERTICALPAGEBREAKS (0x001A).
+//!
+//! The `.xlsb` reader's BIFF12 counterparts (#901) are here too
+//! ([MS-XLSB] 2.4): BrtMargins, BrtPrintOptions and BrtPageSetup, whose
+//! flags differ from SETUP's ([`read_page_setup_12`]); BrtWsProp and
+//! BrtBeginHeaderFooter reuse [`read_wsbool`] and [`read_hf_flags`].
+//! [`read_break`] and [`MAX_BREAKS`] serve the `.xlsb` and `.ods` readers'
+//! manual breaks as well.
 
 use crate::print::setup::{
     CellComments, HeaderFooter, Margins, Orientation, PageOrder, PageSetup, PrintErrors,
@@ -182,18 +189,121 @@ pub(super) fn hf_text(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// A break the reader read: BIFF8's are all manual. `start`/`end` are the
-/// columns (rows) it spans; `min` is written only when it isn't 0.
-pub(super) fn read_break(id: u16, start: u16, end: u16) -> PageBreak {
+/// A manual break the reader read (BIFF8's are all manual, and so are the
+/// ones the `.xlsb` and `.ods` readers keep). `start`/`end` are the columns
+/// (rows) it spans; `min` is written only when it isn't 0.
+pub(super) fn read_break(id: u32, start: u32, end: u32) -> PageBreak {
     let min = if start == 0 {
         String::new()
     } else {
         format!(" min=\"{start}\"")
     };
     PageBreak {
-        id: id as u32,
+        id,
         attrs: format!("{min} max=\"{end}\" man=\"1\""),
     }
+}
+
+// BrtPageSetup's flags ([MS-XLSB] 2.4.722), which are not SETUP's: bit 1
+// is fLandscape (SETUP's fPortrait), bit 2 is reserved (no fNoPls),
+// fEndNotes is bit 8 and iErrors bits 9-10.
+const B12_LEFT_TO_RIGHT: u16 = 0x0001;
+const B12_LANDSCAPE: u16 = 0x0002;
+const B12_NO_COLOR: u16 = 0x0008;
+const B12_DRAFT: u16 = 0x0010;
+const B12_NOTES: u16 = 0x0020;
+const B12_NO_ORIENT: u16 = 0x0040;
+const B12_USE_PAGE: u16 = 0x0080;
+const B12_END_NOTES: u16 = 0x0100;
+
+/// Read a BIFF12 BrtPageSetup body (iPaperSize, iScale, iRes, iVRes,
+/// iCopies, iPageStart, iFitWidth, iFitHeight, flags, szRelID) into `ps`.
+/// A value the model can't hold (paper 0, a scale outside 10–400, a fit
+/// count past 32767, a first page number below 1) leaves that field as it
+/// was; the resolutions, copies and printer settings part aren't modelled.
+pub(super) fn read_page_setup_12(ps: &mut PageSetup, b: &[u8]) -> Option<()> {
+    let u32_at = |i: usize| {
+        b.get(i..i + 4)
+            .map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
+    };
+    let (paper, scale, start) = (u32_at(0)?, u32_at(4)?, u32_at(20)? as i32);
+    let (fit_w, fit_h) = (u32_at(24)?, u32_at(28)?);
+    let flags = b.get(32..34).map(|x| u16::from_le_bytes([x[0], x[1]]))?;
+    if paper != 0 {
+        ps.paper_size = paper;
+    }
+    if crate::print::setup::SCALE_RANGE.contains(&scale) {
+        ps.scale = scale;
+    }
+    if fit_w <= crate::print::setup::FIT_MAX {
+        ps.fit_width = fit_w;
+    }
+    if fit_h <= crate::print::setup::FIT_MAX {
+        ps.fit_height = fit_h;
+    }
+    ps.orientation = if flags & B12_NO_ORIENT != 0 {
+        Orientation::Default
+    } else if flags & B12_LANDSCAPE != 0 {
+        Orientation::Landscape
+    } else {
+        Orientation::Portrait
+    };
+    ps.first_page_number = (flags & B12_USE_PAGE != 0 && start >= 1).then_some(start as u32);
+    ps.page_order = if flags & B12_LEFT_TO_RIGHT != 0 {
+        PageOrder::OverThenDown
+    } else {
+        PageOrder::DownThenOver
+    };
+    ps.black_and_white = flags & B12_NO_COLOR != 0;
+    ps.draft = flags & B12_DRAFT != 0;
+    ps.cell_comments = match (flags & B12_NOTES != 0, flags & B12_END_NOTES != 0) {
+        (false, _) => CellComments::None,
+        (true, false) => CellComments::AsDisplayed,
+        (true, true) => CellComments::AtEnd,
+    };
+    ps.errors = match (flags >> 9) & 3 {
+        0 => PrintErrors::Displayed,
+        1 => PrintErrors::Blank,
+        2 => PrintErrors::Dash,
+        _ => PrintErrors::NA,
+    };
+    Some(())
+}
+
+/// Read a BIFF12 BrtMargins body (left, right, top, bottom, header,
+/// footer, inches) into `ps`: a negative or non-finite one is left out.
+pub(super) fn read_margins_12(ps: &mut PageSetup, b: &[u8]) -> Option<()> {
+    let mut v = [0.0f64; 6];
+    for (k, slot) in v.iter_mut().enumerate() {
+        let x = b.get(k * 8..k * 8 + 8)?;
+        *slot = f64::from_le_bytes(x.try_into().ok()?);
+    }
+    let m = &mut ps.margins;
+    for (slot, x) in [
+        &mut m.left,
+        &mut m.right,
+        &mut m.top,
+        &mut m.bottom,
+        &mut m.header,
+        &mut m.footer,
+    ]
+    .into_iter()
+    .zip(v)
+    {
+        if x.is_finite() && x >= 0.0 {
+            *slot = x;
+        }
+    }
+    Some(())
+}
+
+/// BIFF12 BrtPrintOptions' flags (fHCenter, fVCenter, fPrintHeaders,
+/// fPrintGrid) into `ps`.
+pub(super) fn read_print_options_12(ps: &mut PageSetup, flags: u16) {
+    ps.h_centered = flags & 0x0001 != 0;
+    ps.v_centered = flags & 0x0002 != 0;
+    ps.headings = flags & 0x0004 != 0;
+    ps.grid_lines = flags & 0x0008 != 0;
 }
 
 // ---- writing ----------------------------------------------------------------
