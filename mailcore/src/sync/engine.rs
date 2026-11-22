@@ -6582,6 +6582,9 @@ impl Engine {
     /// an update or delete refused 412, its `If-Match` key stale) also
     /// reads Graph's version once into `server`, and reverts to it at once
     /// when no other queued op names the contact, instead of a second GET.
+    /// An update refused 412 whose sent values Graph already holds (a retry
+    /// after a lost answer, r1) is no refusal: it is dropped as applied,
+    /// unreported (`adopt_applied_contact_edit`).
     fn refuse_contact_write(&mut self, row: &OutboxRow, err: &GraphError) {
         let Some((write, queued_id)) = contact_op(&row.op) else {
             return;
@@ -6617,6 +6620,21 @@ impl Engine {
             }
             _ => None,
         };
+        // Graph already holds every value the PATCH sends: its earlier try
+        // was applied but its answer lost (a transport error, a 5xx after
+        // the write), so the key it sent is stale by this client's own
+        // write; or the same change was made elsewhere. Not a conflict:
+        // the op is done.
+        if let (OutboxOp::UpdateContact { fields: sent, .. }, Some(mine), Some(server)) =
+            (&row.op, &attempted, &server)
+        {
+            if !ContactFieldSet::changed(&server.fields, &mine.fields).intersects(*sent) {
+                self.drop_op(row.seq);
+                self.adopt_applied_contact_edit(&id, mine, server);
+                self.emit(SyncEvent::ContactsUpdated);
+                return;
+            }
+        }
         self.drop_op(row.seq);
         match write {
             ContactWrite::Create => {
@@ -6666,6 +6684,46 @@ impl Engine {
             write.verb()
         )));
         self.emit(SyncEvent::ContactsUpdated);
+    }
+
+    /// An `UpdateContact` refused 412 whose values Graph already holds
+    /// (#2067, `refuse_contact_write`), its op dropped: the row becomes
+    /// Graph's `server` when no other queued op names the contact
+    /// (`revert_folder_contact`, which also settles an owed re-read).
+    /// Otherwise the row, `mine` as stored, stays for those ops, and only
+    /// Graph's key is adopted, so the next one does not 412 for this
+    /// client's own write, and only when Graph's copy equals the row on
+    /// every property no queued `UpdateContact` of the contact names. A
+    /// difference anywhere else may be an edit made elsewhere: the key is
+    /// kept, and the next op is refused 412 and reported (a false conflict
+    /// at worst, never an overwrite of a property this client does not
+    /// send).
+    fn adopt_applied_contact_edit(&self, id: &str, mine: &FolderContact, server: &FolderContact) {
+        if self
+            .store
+            .revert_folder_contact(id, Some(server))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let Ok(ops) = self.store.pending_ops() else {
+            return;
+        };
+        let mut queued = ContactFieldSet::default();
+        for op in ops {
+            if let OutboxOp::UpdateContact { id: other, fields } = &op.op {
+                if self.store.resolve_contact_id(other).ok().as_deref() == Some(id) {
+                    queued.insert(*fields);
+                }
+            }
+        }
+        let mut elsewhere = ContactFieldSet::changed(&server.fields, &mine.fields);
+        elsewhere.remove(queued);
+        if elsewhere.is_empty() {
+            let _ = self
+                .store
+                .note_contact_change_key(id, &mine.change_key, &server.change_key);
+        }
     }
 
     /// A folder command's store write (#1910): `FoldersUpdated` and a drain
@@ -12999,6 +13057,212 @@ mod tests {
         assert_eq!(row.change_key, "ck-dave-3");
         assert_eq!(row.fields, f);
         assert!(store.pending_ops().unwrap().is_empty());
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dave as Graph has him once a PATCH of `jobTitle: Lead` was applied
+    /// (its answer lost), at `ck-dave-2`; `extra` adds JSON properties.
+    fn dave_lead_json(extra: &str) -> String {
+        format!(
+            r#"{{"id":"C-dave","changeKey":"ck-dave-2","displayName":"Dave","jobTitle":"Lead"{extra},"emailAddresses":[{{"name":"Dave","address":"dave@x.com"}}]}}"#
+        )
+    }
+
+    /// Sends `Refresh` (which resends an op deferred by a 5xx) and waits
+    /// until the outbox is empty, returning every event seen.
+    fn refresh_until_drained(handle: &SyncHandle, store: &Store) -> Vec<SyncEvent> {
+        handle.cmd_tx.send(SyncCommand::Refresh).unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            seen.extend(wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::ContactsUpdated)
+            }));
+            if store.pending_ops().unwrap().is_empty() {
+                break;
+            }
+        }
+        assert!(store.pending_ops().unwrap().is_empty(), "{seen:?}");
+        seen
+    }
+
+    /// Edits Dave's job title to Lead and sends the command, whose PATCH
+    /// the first route answers 500 after applying it (the answer lost).
+    fn edit_dave_into_a_lost_answer(handle: &SyncHandle, store: &Store) {
+        edit_dave(handle, store);
+        let seen = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::ContactsUpdated));
+        assert!(contact_failure(&seen).is_none(), "{seen:?}");
+        assert_eq!(store.pending_ops().unwrap().len(), 1, "kept for a retry");
+    }
+
+    #[test]
+    fn contact_edit_retried_after_a_lost_answer_is_not_a_conflict() {
+        // The first PATCH was applied but answered 500: Graph moved to
+        // ck-dave-2 by this client's own write. The retry, with ck-dave,
+        // is refused 412, and Graph's copy holds the value it sends.
+        let first = list_of(&[DAVE_JSON]);
+        let later = list_of(&[&dave_lead_json("")]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-edit-lost-answer",
+            vec![
+                (
+                    any_route("PATCH", "/me/contacts/C-dave", 500, "{}"),
+                    Some(1),
+                ),
+                (
+                    any_route("PATCH", "/me/contacts/C-dave", 412, CONFLICT),
+                    None,
+                ),
+                (
+                    any_route("GET", "/me/contacts/C-dave", 200, &dave_lead_json("")),
+                    None,
+                ),
+            ],
+            &[
+                ("/me/contacts", 200, &first, Some(1)),
+                ("/me/contacts", 200, &later, None),
+            ],
+            |_| {},
+        );
+        edit_dave_into_a_lost_answer(&handle, &store);
+        let seen = refresh_until_drained(&handle, &store);
+        assert!(contact_failure(&seen).is_none(), "{seen:?}");
+        assert!(
+            !seen.iter().any(|e| matches!(e, SyncEvent::Error(_))),
+            "{seen:?}"
+        );
+        assert_eq!(
+            if_matches(&srv, "PATCH", "/me/contacts/C-dave"),
+            [w("ck-dave"), w("ck-dave")]
+        );
+        let row = store.folder_contact("C-dave").unwrap().unwrap();
+        assert_eq!(row.change_key, "ck-dave-2");
+        assert_eq!(row.fields.job_title, "Lead");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contact_edit_after_a_lost_answer_goes_out_with_graphs_key() {
+        // A second edit queued behind the retried one: Graph's copy differs
+        // from the row only on the property that edit sends, so Graph's key
+        // is adopted and the second PATCH carries it.
+        let first = list_of(&[DAVE_JSON]);
+        let later =
+            list_of(&[&dave_lead_json(r#","mobilePhone":"+1 555 0300""#)
+                .replace("ck-dave-2", "ck-dave-3")]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-edit-after-lost-answer",
+            vec![
+                (
+                    any_route("PATCH", "/me/contacts/C-dave", 500, "{}"),
+                    Some(1),
+                ),
+                (
+                    any_route("PATCH", "/me/contacts/C-dave", 412, CONFLICT),
+                    Some(1),
+                ),
+                (
+                    any_route(
+                        "PATCH",
+                        "/me/contacts/C-dave",
+                        200,
+                        r#"{"id":"C-dave","changeKey":"ck-dave-3"}"#,
+                    ),
+                    None,
+                ),
+                (
+                    any_route("GET", "/me/contacts/C-dave", 200, &dave_lead_json("")),
+                    None,
+                ),
+            ],
+            &[
+                ("/me/contacts", 200, &first, Some(1)),
+                ("/me/contacts", 200, &later, None),
+            ],
+            |_| {},
+        );
+        edit_dave_into_a_lost_answer(&handle, &store);
+        let mut f = store.folder_contact("C-dave").unwrap().unwrap().fields;
+        f.mobile_phone = "+1 555 0300".into();
+        store.update_contact_fields("C-dave", &f).unwrap();
+        let seen = refresh_until_drained(&handle, &store);
+        assert!(contact_failure(&seen).is_none(), "{seen:?}");
+        assert_eq!(
+            if_matches(&srv, "PATCH", "/me/contacts/C-dave"),
+            [w("ck-dave"), w("ck-dave"), w("ck-dave-2")]
+        );
+        let row = store.folder_contact("C-dave").unwrap().unwrap();
+        assert_eq!(row.change_key, "ck-dave-3");
+        assert_eq!(row.fields, f, "both edits kept");
+
+        let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contact_edit_after_a_lost_answer_and_an_outside_edit_still_conflicts() {
+        // As above, but Graph's copy also holds a department set in Outlook,
+        // which no queued edit sends: the key is kept, so the second edit is
+        // refused 412 and reported, and the outside edit is not overwritten.
+        let first = list_of(&[DAVE_JSON]);
+        let graph = dave_lead_json(r#","department":"Ops""#);
+        let later = list_of(&[&graph]);
+        let (srv, handle, store, dir) = contact_engine(
+            "contact-edit-lost-answer-outside-edit",
+            vec![
+                (
+                    any_route("PATCH", "/me/contacts/C-dave", 500, "{}"),
+                    Some(1),
+                ),
+                (
+                    any_route("PATCH", "/me/contacts/C-dave", 412, CONFLICT),
+                    None,
+                ),
+                (any_route("GET", "/me/contacts/C-dave", 200, &graph), None),
+            ],
+            &[
+                ("/me/contacts", 200, &first, Some(1)),
+                ("/me/contacts", 200, &later, None),
+            ],
+            |_| {},
+        );
+        edit_dave_into_a_lost_answer(&handle, &store);
+        let mut f = store.folder_contact("C-dave").unwrap().unwrap().fields;
+        f.mobile_phone = "+1 555 0300".into();
+        store.update_contact_fields("C-dave", &f).unwrap();
+        let mine = store.folder_contact("C-dave").unwrap().unwrap();
+        let seen = refresh_until_drained(&handle, &store);
+        assert_eq!(
+            if_matches(&srv, "PATCH", "/me/contacts/C-dave"),
+            [w("ck-dave"), w("ck-dave"), w("ck-dave")]
+        );
+        let failures: Vec<&SyncEvent> = seen
+            .iter()
+            .filter(|e| matches!(e, SyncEvent::ContactWriteFailed { .. }))
+            .collect();
+        assert_eq!(failures.len(), 1, "only the second edit: {seen:?}");
+        match failures[0] {
+            SyncEvent::ContactWriteFailed {
+                status,
+                attempted,
+                server,
+                ..
+            } => {
+                assert_eq!(*status, Some(412));
+                assert_eq!(attempted.as_ref(), Some(&mine));
+                assert_eq!(
+                    server.as_ref().map(|c| c.fields.department.as_str()),
+                    Some("Ops")
+                );
+            }
+            _ => unreachable!(),
+        }
+        let row = store.folder_contact("C-dave").unwrap().unwrap();
+        assert_eq!(row.fields.department, "Ops", "the outside edit stands");
+        assert_eq!(row.change_key, "ck-dave-2");
 
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

@@ -750,12 +750,12 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
             // `If-Match` on the stored key (#2067): an edit made elsewhere
             // since this client last read the contact is a 412, not
             // overwritten. Graph's answered key is this client's own write,
-            // so the next PATCH sends it.
+            // so the next PATCH sends it. Storing it is best-effort: Graph
+            // applied the PATCH, so a store error here must not report it
+            // refused; at worst the next edit is a false 412, reported.
             let answered = client.update_contact(&target, &row.change_key, &row.fields, *fields)?;
             if let Some(new_key) = answered {
-                store
-                    .note_contact_change_key(&target, &row.change_key, &new_key)
-                    .map_err(store_err)?;
+                let _ = store.note_contact_change_key(&target, &row.change_key, &new_key);
             }
             Ok(())
         }
@@ -799,10 +799,9 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
             if untouched {
                 if let Ok(new_key) = client.contact_change_key(&target) {
                     // Before the confirm, which learns the photo against
-                    // the record's key.
-                    store
-                        .note_contact_change_key(&target, &stored_key, &new_key)
-                        .map_err(store_err)?;
+                    // the record's key. Best-effort, as the reads: Graph
+                    // accepted the PUT.
+                    let _ = store.note_contact_change_key(&target, &stored_key, &new_key);
                 }
             }
             store
@@ -5168,6 +5167,33 @@ mod tests {
             apply_op(&c, &store, &last_op(&store)).unwrap(),
             Applied::Done
         );
+        assert_eq!(
+            store.folder_contact("G1").unwrap().unwrap().change_key,
+            "ck1"
+        );
+        assert!(!store.contact_photo("G1").unwrap().unwrap().pending);
+    }
+
+    #[test]
+    fn set_contact_photo_key_read_after_the_put_failure_adopts_nothing() {
+        // The read before the PUT matches; the one after it fails (no route
+        // left: a 404). Nothing is adopted and the op still succeeds.
+        let srv = FakeServer::start_limited(vec![
+            (key_route("ck1"), Some(1)),
+            (
+                contact_route("PUT", "/me/contacts/G1/photo/$value", 200, ""),
+                None,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = photo_store();
+        store.set_contact_photo("G1", b"P", "image/jpeg").unwrap();
+        assert_eq!(
+            apply_op(&c, &store, &last_op(&store)).unwrap(),
+            Applied::Done
+        );
+        let methods: Vec<String> = srv.requests().into_iter().map(|r| r.method).collect();
+        assert_eq!(methods, ["GET", "PUT", "GET"]);
         assert_eq!(
             store.folder_contact("G1").unwrap().unwrap().change_key,
             "ck1"

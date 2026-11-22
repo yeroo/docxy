@@ -618,6 +618,11 @@ impl ContactFieldSet {
         ContactFieldSet(self.0 | other.0)
     }
 
+    /// Whether the two sets share a property.
+    pub fn intersects(self, other: ContactFieldSet) -> bool {
+        self.0 & other.0 != 0
+    }
+
     pub fn is_empty(self) -> bool {
         self.0 == 0
     }
@@ -3239,17 +3244,11 @@ impl GraphClient {
             return Ok(None);
         }
         let path = format!("/me/contacts/{}", encode_path_segment(id));
-        let if_match = contact_if_match(change_key);
-        let headers: Vec<(&str, &str)> = if_match
-            .as_deref()
-            .map(|v| ("If-Match", v))
-            .into_iter()
-            .collect();
-        let resp = self.send(
+        let resp = self.send_contact_write(
             Method::Patch,
             &path,
             Some(contact_body_json(fields, set)),
-            &headers,
+            change_key,
         )?;
         Ok(parse_body(resp).ok().and_then(|v| {
             v.get("changeKey")
@@ -3266,14 +3265,23 @@ impl GraphClient {
     /// `Contacts.ReadWrite`.
     pub fn delete_contact(&self, id: &str, change_key: &str) -> Result<(), GraphError> {
         let path = format!("/me/contacts/{}", encode_path_segment(id));
-        let if_match = contact_if_match(change_key);
-        let headers: Vec<(&str, &str)> = if_match
-            .as_deref()
-            .map(|v| ("If-Match", v))
-            .into_iter()
-            .collect();
-        self.send(Method::Delete, &path, None, &headers)?;
+        self.send_contact_write(Method::Delete, &path, None, change_key)?;
         Ok(())
+    }
+
+    /// `send`, with `If-Match` on a non-empty `change_key`
+    /// (`contact_if_match`, #2067): a contact update's or delete's request.
+    fn send_contact_write(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<String>,
+        change_key: &str,
+    ) -> Result<ureq::Response, GraphError> {
+        match contact_if_match(change_key) {
+            Some(tag) => self.send(method, path, body, &[("If-Match", &tag)]),
+            None => self.send(method, path, body, &[]),
+        }
     }
 
     /// POST `/me/messages/{id}/attachments` with an inline

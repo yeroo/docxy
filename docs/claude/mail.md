@@ -1768,7 +1768,10 @@ last read the contact, and a DELETE deleted it: the last writer won.
   row's (so a photo learnt before stays `current`), and a queued
   `DeleteContact`'s (the contact deleted while the PATCH was in flight).
   Two edits queued before one drain therefore send the stored key, then the
-  first one's answered key.
+  first one's answered key. Storing an answered or adopted key is
+  best-effort (r1): Graph applied the write, so a store error there (a busy
+  timeout) must not report it refused. At worst the next edit is a false
+  412, reported.
 - A photo PUT may move the key too (#2065's assumption). The outbox reads
   Graph's key (`contact_change_key`: `GET /me/contacts/{id}?$select=changeKey`)
   before the PUT and, only when it was the stored one (nobody else changed
@@ -1780,7 +1783,10 @@ last read the contact, and a DELETE deleted it: the last writer won.
   No field comparison: Graph recomputes `displayName`/`fileAs` and fills
   blank email names, so one would misfire. Residual: an edit made elsewhere
   between the two reads (the PUT's round trip) is adopted, and a later edit
-  from here can overwrite it.
+  from here can overwrite it. A PUT retried after a lost answer (applied,
+  then a 5xx or a transport error) finds the key moved by its own first
+  try, so nothing is adopted. The next field edit may then be a false 412,
+  reported with its `attempted`.
 - A 412 is a final refusal like any other (#2063): the op is dropped, the
   row goes back to Graph's version, and `ContactWriteFailed { status:
   Some(412), attempted, server }` reports it. `server` is new: for an update
@@ -1791,6 +1797,29 @@ last read the contact, and a DELETE deleted it: the last writer won.
   second GET; otherwise the owed re-read runs as ever. `server` is `None`
   for every other refusal. A conflict is not merged: the server wins in the
   store, and the user's version is in `attempted` (`None` for a delete).
+- A PATCH retried after a lost answer (r1). Graph applied the first try,
+  but its answer was lost (a transport error, a 5xx after the write), so
+  the stored key is stale by this client's own write and the retry is
+  refused 412. That is not a conflict when Graph's copy (the `server` read)
+  already holds the row's value on every property the op sends
+  (`ContactFieldSet::changed(server, row)` does not intersect the op's
+  set): a lost answer, or the same change made elsewhere. The op is dropped
+  as applied, with no `ContactWriteFailed` and no `Error`, then
+  `ContactsUpdated` (`adopt_applied_contact_edit`):
+  - with no other queued op naming the contact, the row becomes Graph's
+    version (`revert_folder_contact`), key included;
+  - otherwise the row stays for those ops, and only Graph's key is adopted
+    (`note_contact_change_key`), and only when Graph's copy equals the row
+    on every property no queued `UpdateContact` of the contact names. A
+    difference elsewhere may be an edit made in Outlook: the key is kept,
+    so the next op is refused 412 and reported. That is a false conflict
+    at worst, never an overwrite of a property this client does not send.
+  Residual: an edit made elsewhere, in the lost-answer window, to a
+  property a queued edit of ours also changes is overwritten by that edit.
+  So is a photo changed elsewhere then: the photo row's key moves along and
+  reads `current`. A 412 whose Graph copy differs on a sent property is a
+  conflict, reported as above. Delete is unchanged: a DELETE retried after
+  a lost answer finds the contact gone, which is a 404, already done.
 - Later queued edits of a contact whose edit was refused 412 still send the
   stale key (the revert waits for them), so each is refused 412 in turn and
   reported with its `attempted`: no edit is lost silently.
@@ -1810,7 +1839,11 @@ last read the contact, and a DELETE deleted it: the last writer won.
   `contact_delete_412_keeps_the_contact` (the repro: on main the PATCH and
   DELETE carry no `If-Match`), `two_contact_edits_in_turn_do_not_conflict_with_themselves`,
   `contact_edit_after_own_photo_set_does_not_conflict`,
-  `contact_edit_after_outside_edit_and_photo_set_still_conflicts`. The engine
+  `contact_edit_after_outside_edit_and_photo_set_still_conflicts`; r1:
+  `contact_edit_retried_after_a_lost_answer_is_not_a_conflict`,
+  `contact_edit_after_a_lost_answer_goes_out_with_graphs_key`,
+  `contact_edit_after_a_lost_answer_and_an_outside_edit_still_conflicts`,
+  and `outbox.rs` `set_contact_photo_key_read_after_the_put_failure_adopts_nothing`. The engine
   tests count re-reads with `rereads_of` (the `$select=id,…` GET), apart
   from the photo op's `key_reads_of`.
 - Not done: `If-Match` on the photo PUT, and on event or message writes.
