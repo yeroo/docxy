@@ -1473,10 +1473,13 @@ fn read_sheet(
                     notes.push((rw, col, id, author));
                 }
                 // CONDFMT ([MS-XLS] 2.4.56): ccf, flags, refBound (a
-                // Ref8U), then the sqref (SqRefU). Its CF records follow.
+                // Ref8U: the ranges' bounds, whose top-left its CFs'
+                // formulas are based at), then the sqref (SqRefU). Its CF
+                // records follow.
                 0x01B0 => {
                     cf_open = false;
-                    c.take(12)?;
+                    c.take(4)?;
+                    let (top, _, left, _) = (c.u16()?, c.u16()?, c.u16()?, c.u16()?);
                     let n = c.u16()?;
                     let mut ranges = Vec::new();
                     for _ in 0..n {
@@ -1490,6 +1493,7 @@ fn read_sheet(
                         sheet.cond_formats.push(super::CfIn {
                             ranges,
                             rules: Vec::new(),
+                            base: (top as u32, left as u32),
                         });
                         cf_open = true;
                     }
@@ -1514,8 +1518,9 @@ fn read_sheet(
                 // cce, unused, rgce) and the sqref (SqRefU: cref, then
                 // Ref8U rwFirst, rwLast, colFirst, colLast). The formulas'
                 // relative references are based at the first range's
-                // top-left. DVAL (0x01B2), the list's header, holds
-                // nothing to keep.
+                // top-left (as LibreOffice reads them; the build moves them
+                // to the model's anchor). DVAL (0x01B2), the list's
+                // header, holds nothing to keep.
                 0x01BE => match read_dv(&mut c, g) {
                     Some(dv) => sheet.validations.push(dv),
                     None => {
@@ -1620,7 +1625,7 @@ fn read_sheet(
     // A CF the model doesn't hold (or that doesn't read) is named.
     for (k, r) in cf_recs {
         let cf = &mut sheet.cond_formats[k];
-        match read_cf(&mut Cur::new(r), cf.ranges[0], styles, g) {
+        match read_cf(&mut Cur::new(r), cf.base, styles, g) {
             Some(rule) => cf.rules.push(rule),
             None => {
                 book.dropped.insert("conditional formatting");
@@ -1646,11 +1651,11 @@ fn read_sheet(
 
 /// A CF record's rule: ct (1 cellIs, 2 expression), cp (the operator),
 /// cce1, cce2, the DXFN, then rgce1 and rgce2, their relative references
-/// based at the block's first range's top-left. `None` for one that
+/// based at `at`, the block's refBound top-left. `None` for one that
 /// doesn't read or that the model doesn't hold.
 fn read_cf(
     c: &mut Cur,
-    at: (u32, u32, u32, u32),
+    at: (u32, u32),
     styles: &Styles,
     g: &Globals,
 ) -> Option<(crate::xlsx::NewCfRule, crate::sheet::Dxf)> {
@@ -1740,7 +1745,7 @@ fn read_dxfn(c: &mut Cur, styles: &Styles) -> Option<crate::sheet::Dxf> {
 
 /// A DV record's rule (see the reader's arm for its layout); `None` when it
 /// doesn't read.
-fn read_dv(c: &mut Cur, g: &Globals) -> Option<crate::sheet::DataValidation> {
+fn read_dv(c: &mut Cur, g: &Globals) -> Option<super::DvIn> {
     let mut dv = super::dv_from_flags(c.u32()?);
     let text = |c: &mut Cur| -> Option<String> {
         let s = c.xl_string()?;
@@ -1777,7 +1782,10 @@ fn read_dv(c: &mut Cur, g: &Globals) -> Option<crate::sheet::DataValidation> {
     if dv.kind == "list" {
         dv.formula1 = super::dv_list_formula(dv.formula1);
     }
-    Some(dv)
+    Some(super::DvIn {
+        rule: dv,
+        base: (r, col),
+    })
 }
 
 /// Whether a COLINFO width is the sheet's default: its STANDARDWIDTH, or
@@ -3955,13 +3963,13 @@ pub(crate) mod tests {
     }
 
     /// DV records are the sheet's validation rules: kind, operator, the
-    /// formulas based at the first range's top-left, texts and flags.
+    /// formulas (at the model's anchor once placed), texts and flags.
     #[test]
     fn xls_dv_rules() {
         use crate::sheet::AlertStyle;
         let book = read(&workbook(&[], &dv_sheet())).unwrap();
         assert!(book.dropped.is_empty(), "{:?}", book.dropped);
-        let v = &book.sheets[0].validations;
+        let v = &super::super::placed_dvs(&book.sheets[0]);
         assert_eq!(v.len(), 4);
         assert_eq!(
             (v[0].kind.as_str(), v[0].operator.as_str()),
@@ -4150,5 +4158,44 @@ pub(crate) mod tests {
             book.dropped.iter().copied().collect::<Vec<_>>(),
             ["conditional formatting"]
         );
+    }
+
+    /// A rule whose first range isn't its top-left-most one is anchored as
+    /// the model anchors it, at its ranges' least row and column: a DV's
+    /// formula (based at its first range) and a CF's (based at its
+    /// refBound) both read `B2>0` over D5:D10 and B2:B3, so D5 checks
+    /// itself (#884 r2).
+    #[test]
+    fn xls_rules_are_anchored_at_their_least_corner() {
+        // ptgRefN (0, 0), relative both ways; ptgInt 0; ptgGt.
+        let here = [0x2C, 0, 0, 0, 0xC0, 0x1E, 0, 0, 0x0D];
+        let mut cf = 2u16.to_le_bytes().to_vec();
+        cf.extend(1u16.to_le_bytes());
+        // refBound B2:D10, then the sqref D5:D10 B2:B3.
+        for n in [1u16, 9, 1, 3, 2, 4, 9, 3, 3, 1, 2, 1, 1] {
+            cf.extend(n.to_le_bytes());
+        }
+        let sheet = vec![
+            number(1, 1, -1.0),
+            number(4, 3, 5.0),
+            dv_rec(
+                7,
+                ["", "", "", ""],
+                &here,
+                &[],
+                &[(4, 9, 3, 3), (1, 2, 1, 1)],
+            ),
+            rec(0x01B0, &cf),
+            cf_rec(2, 0, &dxfn(None, Some((Some(1), 2))), &here, &[]),
+        ];
+        let stream = workbook(&[], &sheet);
+        let cfb = opccore::cfb::write_cfb_tree(&[opccore::cfb::Node::Stream("Workbook", stream)]);
+        let (pkg, _) = crate::legacy::open_workbook(&cfb).unwrap();
+        let back = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        let wb = &back.workbook;
+        assert_eq!(wb.sheets[0].validations[0].formula1, "B2>0");
+        assert_eq!(crate::validation::invalid_cells(wb, 0, None), [(1, 1)]);
+        assert!(crate::cf::cell_dxf(wb, 0, 4, 3).is_some());
+        assert!(crate::cf::cell_dxf(wb, 0, 1, 1).is_none());
     }
 }

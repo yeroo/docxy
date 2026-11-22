@@ -304,6 +304,11 @@ pub(crate) struct Limits {
     /// are left out, as they hold no value. That loses formatting, never
     /// data, and is no error.
     pub styled_blanks: usize,
+    /// Column default styles an `.ods` looks up for empty cells without a
+    /// style of their own (#884): a run across many columns visits each
+    /// style it crosses. Past it, empty cells take no column style (no
+    /// styled blanks or conditional styles from it), never a refusal.
+    pub column_walk: usize,
 }
 
 impl Default for Limits {
@@ -315,6 +320,7 @@ impl Default for Limits {
             sheets: 4_096,
             links: 4_096,
             styled_blanks: 1_000_000,
+            column_walk: 4_000_000,
         }
     }
 }
@@ -353,21 +359,103 @@ pub(crate) struct SheetIn {
     pub outline: crate::sheet::OutlineSettings,
     /// Cell comments (#884): (row, col, author, text).
     pub comments: Vec<(u32, u32, String, String)>,
-    /// Data-validation rules (#884), their formulas in Excel's syntax
-    /// relative to their first range's top-left, as an `.xlsx` has them.
-    pub validations: Vec<crate::sheet::DataValidation>,
+    /// Data-validation rules (#884).
+    pub validations: Vec<DvIn>,
     /// Conditional-formatting blocks (#884), in file order.
     pub cond_formats: Vec<CfIn>,
 }
 
+/// A data-validation rule as a reader collects it (#884): its formulas in
+/// Excel's syntax, relative to `base`, the cell the file's format bases
+/// them at. [`BookIn::build`] moves them to the model's anchor
+/// ([`anchor_of`] its ranges).
+#[derive(Clone, Debug)]
+pub(crate) struct DvIn {
+    pub rule: crate::sheet::DataValidation,
+    pub base: (u32, u32),
+}
+
+impl DvIn {
+    /// The rule, its formulas moved from `base` to the model's anchor;
+    /// `None` when one must move and doesn't parse.
+    pub(crate) fn placed(self) -> Option<crate::sheet::DataValidation> {
+        let DvIn { rule: mut dv, base } = self;
+        let to = anchor_of(&dv.ranges).unwrap_or(base);
+        dv.formula1 = rebase(&dv.formula1, Some(base), to)?;
+        dv.formula2 = rebase(&dv.formula2, Some(base), to)?;
+        Some(dv)
+    }
+}
+
+impl CfIn {
+    /// The block, its rules' formulas moved from `base` to the model's
+    /// anchor (now its `base`); a rule whose formula must move and
+    /// doesn't parse is left out.
+    pub(crate) fn placed(self) -> CfIn {
+        let to = anchor_of(&self.ranges).unwrap_or(self.base);
+        let rules = self
+            .rules
+            .into_iter()
+            .filter_map(|(mut rule, dxf)| {
+                for f in rule.formulas_mut() {
+                    *f = rebase(f, Some(self.base), to)?;
+                }
+                Some((rule, dxf))
+            })
+            .collect();
+        CfIn {
+            ranges: self.ranges,
+            rules,
+            base: to,
+        }
+    }
+}
+
+/// The validation rules of `sheet` as the build places them (#884).
+#[cfg(test)]
+pub(crate) fn placed_dvs(sheet: &SheetIn) -> Vec<crate::sheet::DataValidation> {
+    sheet
+        .validations
+        .iter()
+        .filter_map(|v| v.clone().placed())
+        .collect()
+}
+
 /// A conditional-formatting block as a reader collects it (#884): its
-/// ranges and its rules, each `cellIs` or `expression` (their formulas in
-/// Excel's syntax, relative to the first range's top-left) with the
-/// differential format it applies.
+/// ranges and its rules, each `cellIs` or `expression` with the
+/// differential format it applies, their formulas in Excel's syntax
+/// relative to `base` (the cell the file's format bases them at).
+/// [`BookIn::build`] moves them to the model's anchor.
 #[derive(Debug, Default)]
 pub(crate) struct CfIn {
     pub ranges: Vec<(u32, u32, u32, u32)>,
     pub rules: Vec<(crate::xlsx::NewCfRule, crate::sheet::Dxf)>,
+    pub base: (u32, u32),
+}
+
+/// The cell a rule's relative formulas are written for in the model: the
+/// least row and least column of its ranges, as
+/// `validation::anchor_of` and `cf::cell_dxf` take it. `None` for no
+/// ranges.
+pub(crate) fn anchor_of(ranges: &[(u32, u32, u32, u32)]) -> Option<(u32, u32)> {
+    ranges
+        .iter()
+        .map(|&(r1, c1, ..)| (r1, c1))
+        .reduce(|(r, c), (r1, c1)| (r.min(r1), c.min(c1)))
+}
+
+/// `f`, its relative references moved from being based at `from` to being
+/// based at `to` (`from` none: they are already); `None` when it must move
+/// and doesn't parse.
+pub(crate) fn rebase(f: &str, from: Option<(u32, u32)>, to: (u32, u32)) -> Option<String> {
+    let Some(from) = from.filter(|&b| b != to && !f.is_empty()) else {
+        return Some(f.to_string());
+    };
+    let (dr, dc) = (
+        i64::from(to.0) - i64::from(from.0),
+        i64::from(to.1) - i64::from(from.1),
+    );
+    crate::formula::translate_formula(f, dr, dc)
 }
 
 /// One column definition as a reader collects it.
@@ -586,6 +674,8 @@ impl BookIn {
             let mut blocks = Vec::new();
             for cf in std::mem::take(&mut sheet.cond_formats) {
                 let mut rules = Vec::new();
+                // From the reader's base to the model's anchor, as above.
+                let cf = cf.placed();
                 for (mut kind, dxf) in cf.rules {
                     let mut kept = true;
                     for f in kind.formulas_mut() {
@@ -618,8 +708,13 @@ impl BookIn {
             }
             s.merges = sheet.merges;
             // Built in memory (`ix` and `orig` none), so a save appends
-            // them. One whose formula can't be kept is left out.
-            for mut dv in sheet.validations {
+            // them. Their formulas move from the reader's base to the
+            // model's anchor; one that can't move (it doesn't parse), or
+            // whose formula can't be kept, is left out.
+            for dv in sheet.validations {
+                let Some(mut dv) = dv.placed() else {
+                    continue;
+                };
                 let mut kept = true;
                 for f in [&mut dv.formula1, &mut dv.formula2] {
                     if !f.is_empty() {
@@ -1842,6 +1937,7 @@ mod tests {
             sheets: 2,
             links: 1,
             styled_blanks: 5,
+            column_walk: 0,
         });
         // Styled blanks fit or are left out, never refused.
         assert!(book.take_styled_blanks(5));

@@ -543,11 +543,11 @@ const BRT_BEGIN_CF_RULE: u32 = 463;
 /// BrtBeginCFRule: iType (1 cellIs, 2 expression), iTemplate, dxfId, iPri,
 /// iParam (cellIs's operator), two reserved, flags, cbFmla1..3,
 /// strParam, then the formulas whose cbFmla isn't 0 (CFParsedFormulas,
-/// their relative references based at the block's first range's
+/// their relative references based at `at`, the block's ranges' bounds'
 /// top-left). `None` for a rule the model doesn't hold.
 fn read_cf_rule(
     c: &mut Cur,
-    at: (u32, u32, u32, u32),
+    at: (u32, u32),
     styles: &Styles,
     g: &Globals,
 ) -> Option<(crate::xlsx::NewCfRule, crate::sheet::Dxf)> {
@@ -607,8 +607,9 @@ fn sqrfx(c: &mut Cur) -> Option<Vec<(u32, u32, u32, u32)>> {
 /// BrtDVal: flags (as BIFF8's DV, [`super::dv_from_flags`]), sqrfx, then
 /// strErrorTitle, strError, strPromptTitle and strPrompt
 /// (XLNullableWideStrings), formula1 and formula2 (CellParsedFormulas,
-/// their relative references based at the first range's top-left).
-fn read_dval(c: &mut Cur, g: &Globals) -> Option<crate::sheet::DataValidation> {
+/// their relative references based at the first range's top-left, as
+/// BIFF8's DV; the build moves them to the model's anchor).
+fn read_dval(c: &mut Cur, g: &Globals) -> Option<super::DvIn> {
     let mut dv = super::dv_from_flags(c.u32()?);
     dv.ranges = sqrfx(c)?;
     dv.error_title = c.wide()?;
@@ -629,7 +630,10 @@ fn read_dval(c: &mut Cur, g: &Globals) -> Option<crate::sheet::DataValidation> {
     if dv.kind == "list" {
         dv.formula1 = super::dv_list_formula(dv.formula1);
     }
-    Some(dv)
+    Some(super::DvIn {
+        rule: dv,
+        base: (r, col),
+    })
 }
 
 /// A sheet part: its cells, column widths and merged cells (the name is
@@ -770,10 +774,13 @@ fn read_sheet(
                     cf_open = None;
                     c.take(8)?;
                     let ranges = sqrfx(&mut c)?;
-                    if !ranges.is_empty() {
+                    // Based, as BIFF8's CONDFMT, at the ranges' bounds'
+                    // top-left.
+                    if let Some(base) = super::anchor_of(&ranges) {
                         sheet.cond_formats.push(super::CfIn {
                             ranges,
                             rules: Vec::new(),
+                            base,
                         });
                         cf_open = Some(sheet.cond_formats.len() - 1);
                     }
@@ -781,7 +788,7 @@ fn read_sheet(
                 BRT_END_CONDITIONAL_FORMATTING => cf_open = None,
                 BRT_BEGIN_CF_RULE => {
                     let cf = sheet.cond_formats.get_mut(cf_open?)?;
-                    let rule = read_cf_rule(&mut c, cf.ranges[0], styles, g)?;
+                    let rule = read_cf_rule(&mut c, cf.base, styles, g)?;
                     cf.rules.push(rule);
                 }
                 // BrtMergeCell: an RfX (rwFirst, rwLast, colFirst,
@@ -2014,7 +2021,7 @@ mod tests {
         let mut sheet = vec![rec(BRT_ROW_HDR, &0u32.to_le_bytes()), real(0, 0, 1.0)];
         sheet.extend(dv_records());
         let book = open(&xlsb(&[], &sheet));
-        let v = &book.sheets[0].validations;
+        let v = &super::super::placed_dvs(&book.sheets[0]);
         assert_eq!(v.len(), 4);
         assert_eq!(
             (v[0].kind.as_str(), v[0].operator.as_str()),
@@ -2227,5 +2234,45 @@ mod tests {
         let cf = &book.sheets[0].cond_formats;
         assert_eq!(cf.len(), 1);
         assert_eq!(cf[0].rules.len(), 1);
+    }
+
+    /// As `.xls`'s: a DV based at its first range and a CF based at its
+    /// ranges' bounds both land at the least corner (#884 r2).
+    #[test]
+    fn xlsb_rules_are_anchored_at_their_least_corner() {
+        // ptgRefN (0, 0), relative both ways; ptgInt 0; ptgGt.
+        let here: &[u8] = &[0x2C, 0, 0, 0, 0, 0, 0xC0, 0x1E, 0, 0, 0x0D];
+        let ranges: [(u32, u32, u32, u32); 2] = [(4, 9, 3, 3), (1, 2, 1, 1)];
+        let mut block = vec![0u8; 8];
+        block.extend(2u32.to_le_bytes());
+        for &(r1, r2, c1, c2) in &ranges {
+            for n in [r1, r2, c1, c2] {
+                block.extend(n.to_le_bytes());
+            }
+        }
+        let sheet = vec![
+            rec(BRT_ROW_HDR, &1u32.to_le_bytes()),
+            real(1, 0, -1.0),
+            rec(BRT_ROW_HDR, &4u32.to_le_bytes()),
+            real(3, 0, 5.0),
+            dval(7, &ranges, ["", "", "", ""], here, &[]),
+            rec(BRT_BEGIN_CONDITIONAL_FORMATTING, &block),
+            cf_rule(2, 1, 0, &[here]),
+            rec(464, &[]),
+            rec(462, &[]),
+        ];
+        let bytes = xlsb_with(
+            &[],
+            &sheet,
+            &[],
+            vec![("xl/styles.bin".to_string(), dxf_styles())],
+        );
+        let (pkg, _) = crate::legacy::open_workbook(&bytes).unwrap();
+        let back = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        let wb = &back.workbook;
+        assert_eq!(wb.sheets[0].validations[0].formula1, "B2>0");
+        assert_eq!(crate::validation::invalid_cells(wb, 0, None), [(1, 1)]);
+        assert!(crate::cf::cell_dxf(wb, 0, 4, 3).is_some());
+        assert!(crate::cf::cell_dxf(wb, 0, 1, 1).is_none());
     }
 }

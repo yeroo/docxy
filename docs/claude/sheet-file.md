@@ -315,12 +315,24 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   import can't leave them in the model alone. `add_cond_formats` is the
   batched writer `add_conditional_format` now calls: dxfs once, all of a
   sheet's blocks in one splice.
-- Rule formulas are in Excel's syntax, relative to the first range's
-  top-left (as `.xlsx` has them), and go through the build's `fix` (sheet
-  renames, `file_formula`). BIFF8 and BIFF12 CF/DV formulas decompile with
-  `Base::Shared(top-left)`, which reads ptgRefN as offsets and ptgRef as
-  absolute coordinates. `.ods` conditions are parsed, then moved from their
-  `base-cell-address` to the top-left with `translate_formula`.
+- Rule formulas are in Excel's syntax, relative to the model's anchor: the
+  least row and least column of the rule's ranges, as
+  `validation::anchor_of` and `cf::cell_dxf` take it (`legacy::anchor_of`).
+  That cell is not always the first range's top-left (`D5:D10 B2:B3` is
+  anchored at B2). Each reader decodes against the base its format defines
+  and records it (`DvIn::base`, `CfIn::base`), and `BookIn::build` moves the
+  formulas from there to the anchor (`DvIn::placed`, `CfIn::placed`, with
+  `translate_formula`); a rule whose formula must move and doesn't parse is
+  left out. Then `fix` runs (sheet renames, `file_formula`). The bases:
+  - BIFF8 CF: its CONDFMT's refBound top-left;
+  - BIFF12 CF: the ranges' bounds' top-left;
+  - BIFF8 DV and BIFF12 BrtDVal: the first range's top-left, as LibreOffice
+    reads them;
+  - `.ods`: each condition's own `base-cell-address`. The `.ods` reader moves
+    each CF rule itself, since a block's rules have bases of their own.
+
+  BIFF8/BIFF12 formulas decompile with `Base::Shared(base)`, which reads
+  ptgRefN as offsets and ptgRef as absolute coordinates.
 - `.xlsb`: `xlsb_style.rs` reads `styles.bin` (BrtFont, BrtFill, BrtBorder,
   whole BrtXF, BrtDXF's XFProps) into model formats, made once per XF.
   Excel's default text colour (theme 1, no tint) is no colour, as the
@@ -336,6 +348,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   blanks have their own cap, `Limits::styled_blanks` (1,000,000). Past it
   they are left out, never refused, and they never count against the
   repeat budget, so no file that opened before is refused now.
+- An `.ods` empty cell with no style of its own takes its column's default
+  style, so its run walks the column styles it crosses. The walk happens
+  only when some column default style gives a blank something to keep (a
+  format, or `style:map`s). Adjacent columns in one style are one step.
+  The total is capped by `Limits::column_walk` (4,000,000 steps); past it,
+  further blanks take no column style, never an error.
 - `.ods` column widths: the width most columns have is the sheet's default
   (no definition; `default_col_width` unless it is Excel's own). Only the
   others become definitions, `paginate::width_of_px` of the length at 96

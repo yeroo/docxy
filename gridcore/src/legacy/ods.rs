@@ -1014,24 +1014,69 @@ impl StyleSheet {
 // Tables
 // ---------------------------------------------------------------------------
 
+/// Paragraph text being read (a cell's, an annotation's, a validation
+/// message's): each `text:p` a line, `text:s` its spaces, `text:tab` a tab
+/// and `text:line-break` a new line.
+#[derive(Default)]
+struct Para {
+    text: String,
+    paragraphs: usize,
+}
+
+impl Para {
+    /// The text element `name` (one of the four above) starts.
+    fn element(&mut self, name: &str, p: &XmlParser) {
+        match name {
+            "text:p" => {
+                if self.paragraphs > 0 {
+                    self.text.push('\n');
+                }
+                self.paragraphs += 1;
+            }
+            "text:s" => {
+                let n = p.attr("text:c").parse().unwrap_or(1usize).min(1 << 12);
+                self.text.push_str(&" ".repeat(n));
+            }
+            "text:tab" => self.text.push('\t'),
+            _ => self.text.push('\n'),
+        }
+    }
+}
+
 /// The cell being read.
 #[derive(Default)]
 struct CellIn {
     attrs: HashMap<String, String>,
-    text: String,
-    paragraphs: usize,
+    text: Para,
     repeat: u32,
     /// Its annotation (#884): (author, text).
     comment: Option<(String, String)>,
 }
 
-/// An `office:annotation` being read: its author (`dc:creator`), its text
-/// (each `text:p` a line) and how many paragraphs it has had.
+/// An `office:annotation` being read: its author (`dc:creator`) and text.
 #[derive(Default)]
 struct NoteIn {
     author: String,
-    text: String,
-    paragraphs: usize,
+    text: Para,
+}
+
+/// The paragraph text the reader is in: a validation message's, else an
+/// annotation's (directly inside it), else the cell's own (outside any
+/// annotation or drawn shape).
+fn active_para<'a>(
+    message: &'a mut Option<(bool, Para)>,
+    note: &'a mut Option<(usize, NoteIn)>,
+    cell: &'a mut Option<CellIn>,
+    hidden: usize,
+) -> Option<&'a mut Para> {
+    if let Some((_, m)) = message.as_mut() {
+        return Some(m);
+    }
+    match hidden {
+        0 => cell.as_mut().map(|c| &mut c.text),
+        1 => note.as_mut().map(|(_, n)| &mut n.text),
+        _ => None,
+    }
 }
 
 /// Read an `.ods` package.
@@ -1127,12 +1172,18 @@ fn strip_ns(cond: &str) -> &str {
     }
 }
 
-/// A condition as the model holds it: (kind, operator, formula1, formula2)
-/// in Excel's syntax, relative to the base cell. `kind` is a validation's
-/// (`whole`, `list`, `custom`, ...; `""` when the condition names none),
-/// or for a conditional format `cellIs` and `expression` (with
-/// `formula1` its formula).
-type Condition = (String, String, String, String);
+/// A validation's condition as the model holds it: its formulas in
+/// Excel's syntax, relative to the rule's base cell.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Condition {
+    /// `whole`, `decimal`, `list`, `custom`, ...; `""` for any value.
+    kind: String,
+    /// For the kinds that compare (`between`, `greaterThan`, ...); `""`
+    /// for the others.
+    operator: String,
+    formula1: String,
+    formula2: String,
+}
 
 /// A validation's `table:condition` (`of:cell-content-is-whole-number()
 /// and cell-content-is-between(1;10)`, `cell-content-is-in-list("a";"b")`,
@@ -1228,7 +1279,12 @@ fn validation_condition(cond: &str) -> Option<Condition> {
     if crate::validation::takes_operator(&kind) && op.is_empty() {
         return None;
     }
-    Some((kind, op, f1.unwrap_or_default(), f2.unwrap_or_default()))
+    Some(Condition {
+        kind,
+        operator: op,
+        formula1: f1.unwrap_or_default(),
+        formula2: f2.unwrap_or_default(),
+    })
 }
 
 /// A conditional format's condition, from a `style:map`
@@ -1286,14 +1342,14 @@ fn cf_condition(cond: &str) -> Option<crate::xlsx::NewCfRule> {
     })
 }
 
-/// `kind`'s formulas moved from `base` to `at` ([`rebase`]).
+/// `kind`'s formulas moved from `base` to `at` ([`super::rebase`]).
 fn rebase_cf(
     mut kind: crate::xlsx::NewCfRule,
     base: Option<(u32, u32)>,
     at: (u32, u32),
 ) -> Option<crate::xlsx::NewCfRule> {
     for f in kind.formulas_mut() {
-        *f = rebase(f, base, at)?;
+        *f = super::rebase(f, base, at)?;
     }
     Some(kind)
 }
@@ -1336,19 +1392,6 @@ fn range_list(s: &str) -> Vec<(u32, u32, u32, u32)> {
 fn address_cell(s: &str) -> Option<(u32, u32)> {
     let (_, cell) = split_address(s)?;
     crate::sheet::parse_cell_name(&cell)
-}
-
-/// `f`, its relative references moved from being based at `base` to
-/// being based at `at` (an `.xlsx` bases them at the range's top-left).
-fn rebase(f: &str, base: Option<(u32, u32)>, at: (u32, u32)) -> Option<String> {
-    let Some(base) = base.filter(|&b| b != at && !f.is_empty()) else {
-        return Some(f.to_string());
-    };
-    let (dr, dc) = (
-        i64::from(at.0) - i64::from(base.0),
-        i64::from(at.1) - i64::from(base.1),
-    );
-    crate::formula::translate_formula(f, dr, dc)
 }
 
 /// A `table:content-validation` as read: its condition, base cell and
@@ -1488,6 +1531,11 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
     let mut stack: Vec<String> = Vec::new();
     // Per table: the column default styles as runs (first column, style).
     let mut col_styles: Vec<(u32, String)> = Vec::new();
+    // Whether any column default style gives an empty cell something to
+    // keep (a format, or conditional styles), worked out once per table;
+    // and what is left of the walk budget (`Limits::column_walk`).
+    let mut col_interest: Option<bool> = None;
+    let mut walk_left = limits.column_walk;
     let mut col_runs: Vec<ColRun> = Vec::new();
     let mut next_col = 0u32;
     let mut row = 0u32;
@@ -1508,14 +1556,14 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
     // order the table first names them, its cells.
     let mut validations: HashMap<String, ValidationIn> = HashMap::new();
     let mut validation: Option<(String, ValidationIn)> = None;
-    let mut message: Option<(bool, String, usize)> = None;
+    let mut message: Option<(bool, Para)> = None;
     let mut row_rules: Vec<(u32, u32, String)> = Vec::new();
     let mut rule_cells = KeyedRanges::default();
     // Conditional formatting (#884): the current row's cells in a style
     // with `style:map`s (first, end, style) and, per such style in the
     // order the table first uses it, its cells; and the table's
-    // LibreOffice conditional formats (`calcext:conditional-format`), the
-    // one being read with its first range's top-left.
+    // LibreOffice conditional formats (`calcext:conditional-format`) and
+    // the one being read.
     let mut row_maps: Vec<(u32, u32, String)> = Vec::new();
     let mut map_cells = KeyedRanges::default();
     let mut table_cf: Vec<super::CfIn> = Vec::new();
@@ -1541,6 +1589,7 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                             ..SheetIn::default()
                         })?;
                         col_styles.clear();
+                        col_interest = None;
                         col_runs.clear();
                         rule_cells.take();
                         map_cells.take();
@@ -1553,7 +1602,12 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                             .attr("table:number-columns-repeated")
                             .parse()
                             .unwrap_or(1u32);
-                        col_styles.push((next_col, attr("table:default-cell-style-name")));
+                        // Adjacent columns in one style are one run.
+                        let style = attr("table:default-cell-style-name");
+                        if col_styles.last().is_none_or(|(_, s)| *s != style) {
+                            col_styles.push((next_col, style));
+                        }
+                        col_interest = None;
                         let width = styles
                             .columns
                             .get(&attr("table:style-name"))
@@ -1598,48 +1652,9 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                         note = Some((stack.len(), NoteIn::default()));
                     }
                     n if n == "office:annotation" || n.starts_with("draw:") => hidden += 1,
-                    // An annotation's own paragraphs and spacing.
-                    "text:p" if note.is_some() && hidden == 1 => {
-                        if let Some((_, n)) = note.as_mut() {
-                            if n.paragraphs > 0 {
-                                n.text.push('\n');
-                            }
-                            n.paragraphs += 1;
-                        }
-                    }
-                    "text:s" if note.is_some() && hidden == 1 => {
-                        if let Some((_, n)) = note.as_mut() {
-                            let k = p.attr("text:c").parse().unwrap_or(1usize).min(1 << 12);
-                            n.text.push_str(&" ".repeat(k));
-                        }
-                    }
-                    "text:line-break" if note.is_some() && hidden == 1 => {
-                        if let Some((_, n)) = note.as_mut() {
-                            n.text.push('\n');
-                        }
-                    }
-                    "text:p" if hidden == 0 && message.is_none() => {
-                        if let Some(c) = cell.as_mut() {
-                            if c.paragraphs > 0 {
-                                c.text.push('\n');
-                            }
-                            c.paragraphs += 1;
-                        }
-                    }
-                    "text:s" if hidden == 0 => {
-                        if let Some(c) = cell.as_mut() {
-                            let n = p.attr("text:c").parse().unwrap_or(1usize).min(1 << 12);
-                            c.text.push_str(&" ".repeat(n));
-                        }
-                    }
-                    "text:tab" if hidden == 0 => {
-                        if let Some(c) = cell.as_mut() {
-                            c.text.push('\t');
-                        }
-                    }
-                    "text:line-break" if hidden == 0 => {
-                        if let Some(c) = cell.as_mut() {
-                            c.text.push('\n');
+                    "text:p" | "text:s" | "text:tab" | "text:line-break" => {
+                        if let Some(t) = active_para(&mut message, &mut note, &mut cell, hidden) {
+                            t.element(&name, &p);
                         }
                     }
                     "table:content-validation" => {
@@ -1649,9 +1664,9 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                             ..crate::sheet::DataValidation::default()
                         };
                         let condition = validation_condition(&attr("table:condition"));
-                        if let Some((kind, op, ..)) = &condition {
-                            rule.kind = kind.clone();
-                            rule.operator = op.clone();
+                        if let Some(c) = &condition {
+                            rule.kind = c.kind.clone();
+                            rule.operator = c.operator.clone();
                         }
                         validation = Some((
                             attr("table:name"),
@@ -1664,14 +1679,17 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                     }
                     "calcext:conditional-format" => {
                         let ranges = range_list(&attr("calcext:target-range-address"));
+                        // Each condition has a base of its own: its rules
+                        // are moved to the block's anchor here.
                         calc_cf = Some(super::CfIn {
+                            base: super::anchor_of(&ranges).unwrap_or_default(),
                             ranges,
                             rules: Vec::new(),
                         });
                     }
                     "calcext:condition" => {
                         if let Some(cf) = calc_cf.as_mut() {
-                            let at = cf.ranges.first().map(|r| (r.0, r.1));
+                            let at = super::anchor_of(&cf.ranges);
                             let base = address_cell(&attr("calcext:base-cell-address"));
                             let rule = cf_condition(&attr("calcext:value"))
                                 .zip(at)
@@ -1699,15 +1717,7 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                                 v.rule.show_input = shown;
                                 v.rule.prompt_title = title;
                             }
-                            message = Some((error, String::new(), 0));
-                        }
-                    }
-                    "text:p" if message.is_some() => {
-                        if let Some((_, text, n)) = message.as_mut() {
-                            if *n > 0 {
-                                text.push('\n');
-                            }
-                            *n += 1;
+                            message = Some((error, Para::default()));
                         }
                     }
                     "table:null-date" => {
@@ -1733,20 +1743,15 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                 stack.push(name);
             }
             Event::Text => {
+                // An annotation's author.
                 if let Some((depth, n)) = note.as_mut().filter(|_| hidden == 1) {
-                    let inside = &stack[*depth..];
-                    if inside.iter().any(|e| e == "dc:creator") {
+                    if stack[*depth..].iter().any(|e| e == "dc:creator") {
                         XmlParser::append_decoded(p.text(), &mut n.author);
-                    } else if inside.iter().any(|e| e == "text:p") {
-                        XmlParser::append_decoded(p.text(), &mut n.text);
                     }
                 }
-                if let Some((_, text, _)) = message.as_mut() {
-                    XmlParser::append_decoded(p.text(), text);
-                }
-                if hidden == 0 && stack.iter().any(|e| e == "text:p") {
-                    if let Some(c) = cell.as_mut() {
-                        XmlParser::append_decoded(p.text(), &mut c.text);
+                if stack.iter().any(|e| e == "text:p") {
+                    if let Some(t) = active_para(&mut message, &mut note, &mut cell, hidden) {
+                        XmlParser::append_decoded(p.text(), &mut t.text);
                     }
                 }
             }
@@ -1757,7 +1762,7 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                         hidden = hidden.saturating_sub(1);
                         if note.as_ref().is_some_and(|(d, _)| *d == stack.len()) {
                             if let (Some((_, n)), Some(c)) = (note.take(), cell.as_mut()) {
-                                c.comment = Some((n.author.trim().to_string(), n.text));
+                                c.comment = Some((n.author.trim().to_string(), n.text.text));
                             }
                         }
                     }
@@ -1768,22 +1773,22 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                                 let Some(v) = validations.get(&name) else {
                                     continue;
                                 };
-                                let Some((_, _, f1, f2)) = &v.condition else {
+                                let Some(cond) = &v.condition else {
                                     continue;
                                 };
-                                let Some(&(r, c, ..)) = cells.rects.first() else {
+                                let Some(anchor) = super::anchor_of(&cells.rects) else {
                                     continue;
                                 };
-                                let (Some(f1), Some(f2)) =
-                                    (rebase(f1, v.base, (r, c)), rebase(f2, v.base, (r, c)))
-                                else {
-                                    continue;
-                                };
-                                sheet.validations.push(crate::sheet::DataValidation {
-                                    ranges: cells.rects,
-                                    formula1: f1,
-                                    formula2: f2,
-                                    ..v.rule.clone()
+                                // Based at the rule's base cell (none: its
+                                // anchor); the build moves them.
+                                sheet.validations.push(super::DvIn {
+                                    rule: crate::sheet::DataValidation {
+                                        ranges: cells.rects,
+                                        formula1: cond.formula1.clone(),
+                                        formula2: cond.formula2.clone(),
+                                        ..v.rule.clone()
+                                    },
+                                    base: v.base.unwrap_or(anchor),
                                 });
                             }
                             // LibreOffice writes its conditional formats
@@ -1793,7 +1798,9 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                                 sheet.cond_formats.append(&mut table_cf);
                             } else {
                                 for (style, cells) in map_cells.take() {
-                                    let Some(&(r, c, ..)) = cells.rects.first() else {
+                                    // Each map has a base of its own: its
+                                    // rules are moved to the anchor here.
+                                    let Some((r, c)) = super::anchor_of(&cells.rects) else {
                                         continue;
                                     };
                                     let maps =
@@ -1813,6 +1820,7 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                                         sheet.cond_formats.push(super::CfIn {
                                             ranges: cells.rects,
                                             rules,
+                                            base: (r, c),
                                         });
                                     }
                                 }
@@ -1832,7 +1840,7 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                         }
                     }
                     "table:help-message" | "table:error-message" => {
-                        if let (Some((error, text, _)), Some((_, v))) =
+                        if let (Some((error, Para { text, .. })), Some((_, v))) =
                             (message.take(), validation.as_mut())
                         {
                             if error {
@@ -1874,10 +1882,32 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                         // none of its own, unless it reaches the grid's
                         // last column (padding): its styled blanks and
                         // conditional styles.
+                        // A run with no style of its own walks the column
+                        // styles it crosses only when one of them matters,
+                        // and only while the walk budget lasts: the walk
+                        // is bounded however many rows and columns.
                         let runs = if name == "table:table-cell" && last < MAX_COLS {
                             match &own {
                                 Some(s) => vec![(col, last, Some(s.clone()))],
-                                None => by_column(col, last),
+                                None => {
+                                    let interest = *col_interest.get_or_insert_with(|| {
+                                        col_styles.iter().any(|(_, s)| {
+                                            !s.is_empty()
+                                                && (look_of(Some(s), &mut book).styled
+                                                    || styles
+                                                        .cells
+                                                        .get(s)
+                                                        .is_some_and(|x| !x.maps.is_empty()))
+                                        })
+                                    });
+                                    if interest && walk_left > 0 {
+                                        let runs = by_column(col, last);
+                                        walk_left = walk_left.saturating_sub(runs.len());
+                                        runs
+                                    } else {
+                                        Vec::new()
+                                    }
+                                }
                             }
                         } else {
                             Vec::new()
@@ -2053,7 +2083,7 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
 /// text); `None` for an empty cell, which then takes no place in the model.
 fn cell_value(c: &CellIn, date1904: bool) -> Option<CellValue> {
     let a = |k: &str| c.attrs.get(k).map(String::as_str);
-    let text = || a("office:string-value").map_or_else(|| c.text.clone(), str::to_string);
+    let text = || a("office:string-value").map_or_else(|| c.text.text.clone(), str::to_string);
     // LibreOffice marks an error result with calcext:value-type; Excel uses
     // its own office:value-type="error".
     if a("calcext:value-type") == Some("error") || a("office:value-type") == Some("error") {
@@ -2069,7 +2099,7 @@ fn cell_value(c: &CellIn, date1904: bool) -> Option<CellValue> {
         Some("string") => CellValue::Text(text()),
         // No type: text without a value, or nothing.
         _ if a("table:formula").is_some() => CellValue::Text(text()),
-        _ if !c.text.is_empty() => CellValue::Text(c.text.clone()),
+        _ if !c.text.text.is_empty() => CellValue::Text(c.text.text.clone()),
         _ => return None,
     };
     Some(value)
@@ -2842,7 +2872,7 @@ mod tests {
         use crate::sheet::AlertStyle;
         let xml = styled_content("", "", &format!("{VALIDATIONS}{VALIDATED}"));
         let b = read_styled("", &xml, Limits::default());
-        let v = &b.sheets[0].validations;
+        let v = &super::super::placed_dvs(&b.sheets[0]);
         let got: Vec<_> = v
             .iter()
             .map(|d| {
@@ -2897,7 +2927,12 @@ mod tests {
     fn ods_validation_conditions() {
         let c = |s: &str| validation_condition(s);
         let row = |k: &str, o: &str, a: &str, b: &str| {
-            Some((k.to_string(), o.to_string(), a.to_string(), b.to_string()))
+            Some(Condition {
+                kind: k.into(),
+                operator: o.into(),
+                formula1: a.into(),
+                formula2: b.into(),
+            })
         };
         assert_eq!(
             c("of:cell-content-is-date() and cell-content-is-not-between([.A1];[.A2])"),
@@ -3093,7 +3128,8 @@ mod tests {
             r##"<style:style style:name="Good" style:family="table-cell"><style:table-cell-properties fo:background-color="#00ff00"/></style:style>"##,
             r#"<table:content-validations><table:content-validation table:name="v" table:condition="of:is-true-formula([.A1]&gt;0)" table:base-cell-address="'Q1 Sales'.B1"/></table:content-validations>
                <table:table table:name="Q1 Sales">
-                 <table:table-row><table:table-cell/><table:table-cell table:content-validation-name="v"/></table:table-row>
+                 <table:table-row><table:table-cell/></table:table-row>
+                 <table:table-row><table:table-cell table:number-columns-repeated="2"/><table:table-cell table:content-validation-name="v"/></table:table-row>
                  <calcext:conditional-formats><calcext:conditional-format calcext:target-range-address="'Q1 Sales'.A1:'Q1 Sales'.A3">
                    <calcext:condition calcext:apply-style-name="Good" calcext:value="formula-is([.B2]&gt;0)" calcext:base-cell-address="'Q1 Sales'.A2"/>
                  </calcext:conditional-format></calcext:conditional-formats>
@@ -3101,8 +3137,11 @@ mod tests {
         );
         let b = read_styled("", &xml, Limits::default());
         let s = &b.sheets[0];
-        // Based at B1 and applied at B1: unmoved.
-        assert_eq!(s.validations[0].formula1, "A1>0");
+        // Based at B1, `[.A1]` is the cell to its left; on C2 (its
+        // anchor), that is B2.
+        let dv = &super::super::placed_dvs(s)[0];
+        assert_eq!(dv.ranges, [(1, 2, 1, 2)]);
+        assert_eq!(dv.formula1, "B2>0");
         assert_eq!(s.cond_formats[0].ranges, [(0, 0, 2, 0)]);
         assert_eq!(
             s.cond_formats[0].rules[0].0,
@@ -3129,7 +3168,7 @@ mod tests {
                <table:table table:name="S"><table:table-row><table:table-cell table:content-validation-name="v1"/><table:table-cell table:content-validation-name="v2"/></table:table-row></table:table>"#,
         );
         let b = read_styled("", &xml, Limits::default());
-        let v = &b.sheets[0].validations;
+        let v = &super::super::placed_dvs(&b.sheets[0]);
         assert_eq!(v.len(), 2);
         assert_eq!((v[0].kind.as_str(), v[0].formula1.as_str()), ("", ""));
         assert_eq!(
@@ -3141,5 +3180,110 @@ mod tests {
             (v[1].kind.as_str(), v[1].ranges.clone()),
             ("", vec![(0, 1, 0, 1)])
         );
+    }
+
+    /// A rule over D2 and B5 is anchored at B2, the least row and column
+    /// of its ranges, which is in neither: its formulas move there from
+    /// their base cell, D2 (#884 r2).
+    #[test]
+    fn ods_rules_are_anchored_at_their_least_corner() {
+        let xml = styled_content(
+            "",
+            r##"<style:style style:name="Good" style:family="table-cell"><style:table-cell-properties fo:background-color="#00ff00"/></style:style>"##,
+            r#"<table:content-validations><table:content-validation table:name="v" table:condition="of:is-true-formula([.D2]&gt;0)" table:base-cell-address="S.D2"/></table:content-validations>
+               <table:table table:name="S">
+                 <table:table-row><table:table-cell/></table:table-row>
+                 <table:table-row><table:table-cell table:number-columns-repeated="3"/><table:table-cell table:content-validation-name="v" office:value-type="float" office:value="5"/></table:table-row>
+                 <table:table-row table:number-rows-repeated="2"><table:table-cell/></table:table-row>
+                 <table:table-row><table:table-cell/><table:table-cell table:content-validation-name="v" office:value-type="float" office:value="-1"/></table:table-row>
+                 <calcext:conditional-formats><calcext:conditional-format calcext:target-range-address="S.D2 S.B5">
+                   <calcext:condition calcext:apply-style-name="Good" calcext:value="formula-is([.D2]&gt;0)" calcext:base-cell-address="S.D2"/>
+                 </calcext:conditional-format></calcext:conditional-formats>
+               </table:table>"#,
+        );
+        let (pkg, _) = super::super::open_workbook(&ods_zip(&xml)).unwrap();
+        let back = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        let wb = &back.workbook;
+        let dv = &wb.sheets[0].validations[0];
+        assert_eq!(dv.ranges, [(1, 3, 1, 3), (4, 1, 4, 1)]);
+        assert_eq!(dv.formula1, "B2>0");
+        assert_eq!(crate::validation::invalid_cells(wb, 0, None), [(4, 1)]);
+        assert!(crate::cf::cell_dxf(wb, 0, 1, 3).is_some());
+        assert!(crate::cf::cell_dxf(wb, 0, 4, 1).is_none());
+    }
+
+    /// Empty cells walk the column styles they cross only when one gives
+    /// them something to keep, and only within `Limits::column_walk`, so
+    /// rows x column elements can't grow the import's time; adjacent
+    /// columns in one style are one step (#884 r2).
+    #[test]
+    fn ods_column_style_walk_is_bounded() {
+        let auto = r##"<style:style style:name="ce1" style:family="table-cell"><style:table-cell-properties fo:background-color="#00ff00"/></style:style>
+            <style:style style:name="ce2" style:family="table-cell"/>
+            <style:style style:name="ce3" style:family="table-cell"/>"##;
+        let table = |a: &str, b: &str| {
+            let cols: String = (0..16384)
+                .map(|i| {
+                    format!(
+                        r#"<table:table-column table:default-cell-style-name="{}"/>"#,
+                        if i % 2 == 0 { a } else { b }
+                    )
+                })
+                .collect();
+            let rows = r#"<table:table-row><table:table-cell table:number-columns-repeated="16383"/></table:table-row>"#.repeat(5);
+            styled_content(
+                "",
+                auto,
+                &format!(r#"<table:table table:name="S">{cols}{rows}</table:table>"#),
+            )
+        };
+        let read = |xml: &str, walk: usize| {
+            let limits = Limits {
+                column_walk: walk,
+                ..Limits::default()
+            };
+            let b = read_styled("", xml, limits);
+            let cells = &b.sheets[0].cells;
+            let rows: std::collections::BTreeSet<u32> = cells.keys().map(|k| k.0).collect();
+            (cells.len(), rows.into_iter().collect::<Vec<_>>())
+        };
+        // Alternating styles: each row's run is 16383 steps. The budget
+        // lasts two rows; the rows after it keep no styled blanks.
+        assert_eq!(read(&table("ce1", "ce2"), 20_000), (2 * 8192, vec![0, 1]));
+        // One style throughout is one step a row.
+        assert_eq!(read(&table("ce1", "ce1"), 2), (2 * 16383, vec![0, 1]));
+        // No column style gives a blank anything to keep: no walk at all.
+        assert_eq!(read(&table("ce2", "ce3"), 0), (0, vec![]));
+        assert_eq!(read(&table("ce2", "ce3"), 4_000_000), (0, vec![]));
+    }
+
+    /// A cell's text, an annotation's and a validation message's read the
+    /// same paragraph elements: spaces, tabs and line breaks too (#884 r2).
+    #[test]
+    fn ods_message_and_annotation_text_elements() {
+        let xml = styled_content(
+            "",
+            "",
+            r#"<table:content-validations><table:content-validation table:name="v" table:base-cell-address="S.A1">
+                 <table:help-message table:display="true">
+                   <text:p>a<text:s/>b<text:line-break/>c</text:p>
+                   <text:p>d<text:s text:c="2"/>e</text:p>
+                 </table:help-message>
+               </table:content-validation></table:content-validations>
+               <table:table table:name="S"><table:table-row>
+                 <table:table-cell table:content-validation-name="v" office:value-type="string"><office:annotation><dc:creator>Ann</dc:creator><text:p>x<text:tab/>y<text:s/>z<text:line-break/>w</text:p></office:annotation><text:p>own<text:tab/>text</text:p></table:table-cell>
+               </table:table-row></table:table>"#,
+        );
+        let b = read_styled("", &xml, Limits::default());
+        let s = &b.sheets[0];
+        assert_eq!(
+            super::super::placed_dvs(s)[0].prompt.as_deref(),
+            Some("a b\nc\nd  e")
+        );
+        assert_eq!(
+            s.comments,
+            [(0, 0, "Ann".to_string(), "x\ty z\nw".to_string())]
+        );
+        assert_eq!(s.cells[&(0, 0)].value, CellValue::Text("own\ttext".into()));
     }
 }
