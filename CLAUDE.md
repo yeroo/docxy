@@ -187,7 +187,8 @@ issue number to find its notes.
   a contact's photo fetched, set through the outbox, no delete on Graph (#2065),
   cancelling a meeting with a message and forwarding it (#1985),
   a series' occurrences, its master and editing either (#2022),
-  a series created with any Graph recurrence (#2034),
+  a series created with any Graph recurrence (#2034), a pending series'
+  recurrence edited through its row (#2036),
   event times in a named time zone, zone-preserving series edits (#2039, #2030),
   respond options: no response, a proposal on tentative, attendees' proposals (#2023),
   meeting message types, the referred event and Remove from Calendar (#2024),
