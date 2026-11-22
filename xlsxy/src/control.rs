@@ -49,8 +49,8 @@
 //! | `table.rename` | `{name,new}` | the table, as `table.list` shows it — Excel's name rules; every formula naming it follows. One undo step; refused when the table's sheet is protected |
 //! | `table.resize` | `{name,ref}` | the table — the header row stays, the new range overlaps the old and keeps a data row; a table with a Total Row keeps its bottom row; new columns' unique names are written into their header cells. One undo step; refused when the table's sheet is protected |
 //! | `table.convert` | `{name}` | `{converted}` — structured references become cell references; refused while a PivotTable, a SUMX-style formula or the data model uses the table. One undo step; refused when the table's sheet is protected |
-//! | `row.insert` / `row.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}`; a protected sheet is refused |
-//! | `col.insert` / `col.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}`; a protected sheet is refused |
+//! | `row.insert` / `row.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}`; a protected sheet is refused, and so is an insert that would push data off the sheet |
+//! | `col.insert` / `col.delete` | `{at,count?,sheet?}` | `{inserted\|deleted}`; a protected sheet is refused, and so is an insert that would push data off the sheet |
 //! | `cell.format` | `{range,patch,sheet?}` | `{formatted}` — one undo group; `patch` keys: `numFmt`/`bold`/`italic`/`fontColor`/`fillColor`/`align` (≥1 required); a protected sheet is refused |
 //! | `col.width` | `{col,width,sheet?}` | `{col,width}` — NOT on the undo stack (mirrors the TUI's F7/F8, which mutate directly); a protected sheet is refused |
 //! | `page.setup` | `{sheet?\|sheets?, …fields}` | the sheet's page layout. Settable fields: `margins:{left,right,top,bottom,header,footer}` (inches), `paperSize`, `orientation`, `scale`, `fitToPage`, `fitToWidth`, `fitToHeight` (0 = Automatic), `firstPageNumber` (`null` = Auto), `pageOrder`, `blackAndWhite`, `draft`, `cellComments`, `errors`, `gridLines`, `headings`, `horizontalCentered`, `verticalCentered`, `differentOddEven`, `differentFirst`, `scaleWithDoc`, `alignWithMargins`. Reply-only: `headers:{oddHeader…firstFooter}` (stored codes; set with `page.header`), `printArea` (`print-area.*`), `printTitles:{rows,cols}` (`print-titles.set`), `rowBreaks`, `colBreaks` (`page-break.*`). Any settable field given sets it (+ `changed`): a fit count turns `fitToPage` on and `scale` turns it off unless `fitToPage` is given; scale outside 10–400 is refused. With `sheets`, the first sheet's page setup is then copied to the others (grouped sheets: not print areas, titles or header pictures). One undo step |
@@ -2017,6 +2017,11 @@ fn row_op(app: &mut App, args: &Json, insert: bool) -> Result<Json, String> {
     if count == 0 {
         return Err(format!("{verb}: 'count' must be at least 1"));
     }
+    // As the TUI's Insert: refused when it would push data off the sheet,
+    // which the engine drops (#1175).
+    if insert && gridcore::edit::insert_shifts_data_off(&app.pkg.workbook, si, true, at, count) {
+        return Err(format!("{verb}: {}", gridcore::edit::SHIFT_OFF_SHEET));
+    }
     app.structural(|wb| {
         if insert {
             gridcore::edit::insert_rows(wb, si, at, count);
@@ -2040,6 +2045,11 @@ fn col_op(app: &mut App, args: &Json, insert: bool) -> Result<Json, String> {
     let count = args.get_usize("count").unwrap_or(1) as u32;
     if count == 0 {
         return Err(format!("{verb}: 'count' must be at least 1"));
+    }
+    // As the TUI's Insert: refused when it would push data off the sheet,
+    // which the engine drops (#1175).
+    if insert && gridcore::edit::insert_shifts_data_off(&app.pkg.workbook, si, false, at, count) {
+        return Err(format!("{verb}: {}", gridcore::edit::SHIFT_OFF_SHEET));
     }
     app.structural(|wb| {
         if insert {
@@ -4909,6 +4919,76 @@ mod tests {
         a.undo();
         a.undo();
         assert_eq!(a.status.as_deref(), Some("Nothing to undo"));
+    }
+
+    /// `row.insert`/`col.insert` (and the MCP tools on them) refuse an
+    /// insert that would push data off the sheet, as the TUI does (#1175):
+    /// nothing moves and nothing goes on the undo stack.
+    fn assert_insert_refused(a: &mut App, verb: &str, at: u32) {
+        let (undo, redo, modified) = (a.undo.len(), a.redo.len(), a.modified);
+        let before = a.pkg.workbook.sheets[0].clone();
+        let err = dispatch(a, verb, &Json::obj(vec![("at", Json::Num(at as f64))])).unwrap_err();
+        assert_eq!(err, format!("{verb}: {}", gridcore::edit::SHIFT_OFF_SHEET));
+        assert_eq!(a.pkg.workbook.sheets[0].cells, before.cells, "{verb}");
+        assert_eq!(a.pkg.workbook.sheets[0].merges, before.merges, "{verb}");
+        assert_eq!((a.undo.len(), a.redo.len()), (undo, redo), "{verb}");
+        assert_eq!(a.modified, modified, "{verb}");
+    }
+
+    #[test]
+    fn row_insert_refuses_to_push_data_off_the_sheet_1175() {
+        use gridcore::sheet::MAX_ROWS;
+        let mut a = app();
+        a.pkg.workbook.sheets[0].set_cell(MAX_ROWS - 1, 0, Cell::text("edge"));
+        assert_insert_refused(&mut a, "row.insert", 0);
+        assert_eq!(text_at(&a, 0, MAX_ROWS - 1, 0).as_deref(), Some("edge"));
+        // A merged range reaching the last row is refused too.
+        let mut a = app();
+        a.pkg.workbook.sheets[0]
+            .merges
+            .push((MAX_ROWS - 2, 0, MAX_ROWS - 1, 1));
+        assert_insert_refused(&mut a, "row.insert", 0);
+        // With nothing at the edge the insert goes through as one step.
+        let mut a = app();
+        a.pkg.workbook.sheets[0].set_cell(MAX_ROWS - 2, 0, Cell::text("near"));
+        let out = dispatch(
+            &mut a,
+            "row.insert",
+            &Json::obj(vec![("at", Json::Num(0.0))]),
+        );
+        assert_eq!(
+            out.unwrap().get("inserted").and_then(Json::as_f64),
+            Some(1.0)
+        );
+        assert_eq!(a.undo.len(), 1);
+        assert_eq!(text_at(&a, 0, MAX_ROWS - 1, 0).as_deref(), Some("near"));
+    }
+
+    #[test]
+    fn col_insert_refuses_to_push_data_off_the_sheet_1175() {
+        use gridcore::sheet::MAX_COLS;
+        let mut a = app();
+        a.pkg.workbook.sheets[0].set_cell(0, MAX_COLS - 1, Cell::text("edge"));
+        assert_insert_refused(&mut a, "col.insert", 0);
+        assert_eq!(text_at(&a, 0, 0, MAX_COLS - 1).as_deref(), Some("edge"));
+        let mut a = app();
+        a.pkg.workbook.sheets[0]
+            .merges
+            .push((0, MAX_COLS - 2, 1, MAX_COLS - 1));
+        assert_insert_refused(&mut a, "col.insert", 0);
+        let mut a = app();
+        a.pkg.workbook.sheets[0].set_cell(0, MAX_COLS - 2, Cell::text("near"));
+        let out = dispatch(
+            &mut a,
+            "col.insert",
+            &Json::obj(vec![("at", Json::Num(0.0))]),
+        );
+        assert_eq!(
+            out.unwrap().get("inserted").and_then(Json::as_f64),
+            Some(1.0)
+        );
+        assert_eq!(a.undo.len(), 1);
+        assert_eq!(text_at(&a, 0, 0, MAX_COLS - 1).as_deref(), Some("near"));
     }
 
     #[test]
