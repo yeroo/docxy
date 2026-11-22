@@ -21699,7 +21699,7 @@ impl Docxy {
                 size: window.viewport_size(),
             }),
             Region::TitleTabs | Region::TabPrev | Region::TabNext | Region::TabMore
-            | Region::TabMoreItem(_) | Region::TabChip(_) => lookup(
+            | Region::TabMoreItem(_) | Region::TabChip(_) | Region::TabClose(_) => lookup(
                 &self.probes.borrow(),
                 &harness::region_name(region),
             )
@@ -47414,11 +47414,15 @@ impl Render for Docxy {
                     .child(
                         div()
                             .id(("chipx", i))
+                            .relative()
                             .flex_none()
                             .px_1()
                             .rounded_sm()
                             .hover(|d| d.bg(border))
                             .child("\u{00d7}")
+                            // The `tab-close:<i>` region (#2260): inside the
+                            // button, so a click on it closes, not selects.
+                            .child(probe(&self.probes, format!("tab-close:{i}")))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.close_tab(i, window, cx);

@@ -344,3 +344,37 @@ fn extension_backstage_pages_are_public_api() {
     // A page is a top one unless set.
     assert_eq!(ext::BackstageGroup::default(), ext::BackstageGroup::Top);
 }
+
+/// A surface that refuses a close the user started while it holds unsent
+/// work (#2260), and asks in its own view.
+struct Composer {
+    reader: Reader,
+    unsent: Rc<Cell<bool>>,
+}
+
+impl TabSurface for Composer {
+    fn view(&self) -> AnyView {
+        self.reader.view()
+    }
+
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.reader.focus_handle(cx)
+    }
+
+    fn may_close(&self, window: &mut Window, cx: &mut App) -> bool {
+        if !self.unsent.get() {
+            return true;
+        }
+        // Its own question takes the keys: the suite brings the tab to the
+        // front and gives them back there (here, its view stands for it).
+        window.focus(&self.reader.focus_handle(cx), cx);
+        false
+    }
+}
+
+#[test]
+fn an_extension_refusing_its_close_is_public_api() {
+    let _ = <Composer as TabSurface>::may_close as fn(&Composer, &mut Window, &mut App) -> bool;
+    // Not overridden: a close as before.
+    let _ = <Account as TabSurface>::may_close as fn(&Account, &mut Window, &mut App) -> bool;
+}

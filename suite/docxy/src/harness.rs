@@ -994,6 +994,9 @@ pub enum Region {
     /// One visible title-bar chip, by absolute tab index — the same index
     /// `tab-list` reports. Absent while the chip is scrolled out of the strip.
     TabChip(usize),
+    /// A chip's close button (×), by absolute tab index (#2260). Absent
+    /// while the chip is scrolled out of the strip.
+    TabClose(usize),
     /// The scrolling cell area of the grid: below the column header, above the
     /// sheet-tab row.
     Grid,
@@ -1171,6 +1174,13 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
                 .parse::<usize>()
                 .map_err(|_| "'tab-chip' needs a numeric index".to_string())?;
             Ok(Region::TabChip(i))
+        }
+        "tab-close" => {
+            let i = arg
+                .ok_or("'tab-close' needs an index")?
+                .parse::<usize>()
+                .map_err(|_| "'tab-close' needs a numeric index".to_string())?;
+            Ok(Region::TabClose(i))
         }
         "grid" if arg.is_none() => Ok(Region::Grid),
         "chart-panel" if arg.is_none() => Ok(Region::ChartPanel),
@@ -1357,7 +1367,7 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             Ok(Region::Picture(i))
         }
         other => Err(format!(
-            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, picture:0, gantt, bar:3, project-heading:Duration, project-heading-arrow:Duration, project-heading-edge:Duration, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, ribbon-launch:Number, filter-button:B, dv-arrow, dv-item:0)"
+            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, tab-chip:0, tab-close:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, picture:0, gantt, bar:3, project-heading:Duration, project-heading-arrow:Duration, project-heading-edge:Duration, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery, ribbon, ribbon-flyout, ribbon-group:0, ribbon-launch:Number, filter-button:B, dv-arrow, dv-item:0)"
         )),
     }
 }
@@ -1396,6 +1406,7 @@ pub fn region_name(region: Region) -> String {
         Region::TabMore => "tab-more".into(),
         Region::TabMoreItem(i) => format!("tab-more-item:{i}"),
         Region::TabChip(i) => format!("tab-chip:{i}"),
+        Region::TabClose(i) => format!("tab-close:{i}"),
         Region::Grid => "grid".into(),
         Region::ChartPanel => "chart-panel".into(),
         Region::Cells(r0, c0, r1, c1) => format!("cell:{}", a1_range((r0, c0, r1, c1))),
@@ -6516,6 +6527,23 @@ fn dispatch_verb(
             Done::ok(Json::obj(vec![
                 ("dispatched", Json::Bool(true)),
                 ("from", Json::Str(from.into())),
+            ]))
+        }
+        // The test extension's hold (#2260): while on, its tab refuses a
+        // close the user started. `{"on": bool}` sets it, no argument reads
+        // it; both reply `hold` and `may_close_calls`, how many times the
+        // suite asked this tab whether it may close.
+        "ext-hold" => {
+            let fixture = ext_fixture_view(app)?;
+            let f = fixture.read(cx);
+            match args.get("on") {
+                None => {}
+                Some(Json::Bool(on)) => f.hold.set(*on),
+                Some(_) => return Err("'on' must be a boolean".into()),
+            }
+            Done::ok(Json::obj(vec![
+                ("hold", Json::Bool(f.hold.get())),
+                ("may_close_calls", Json::Num(f.may_close_calls.get() as f64)),
             ]))
         }
         // The test extension's embedded document view (#1873), on a Mail tab
@@ -12102,6 +12130,7 @@ mod tests {
             Region::TabMore,
             Region::TabMoreItem(19),
             Region::TabChip(3),
+            Region::TabClose(2),
             Region::Grid,
             Region::ChartPanel,
             Region::Cells(2, 1, 2, 1),
@@ -12214,6 +12243,9 @@ mod tests {
         assert!(parse_region("bar:").is_err());
         assert!(parse_region("tab-chip").is_err());
         assert!(parse_region("tab-chip:x").is_err());
+        assert!(parse_region("tab-close").is_err());
+        assert!(parse_region("tab-close:x").is_err());
+        assert_eq!(parse_region("tab-close:1"), Ok(Region::TabClose(1)));
         // A launcher is named by its group's title (#1164), any title: a
         // plugin's group may draw one (#1669); `launch_title` resolves it.
         assert_eq!(

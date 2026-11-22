@@ -1036,3 +1036,83 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   trip, an unregistered kind and the four cards of `Extensions::default()`
   are unit tests in `session_union_tests`. A new window follows the OS
   appearance under Auto, so the New Window test sets Light.
+
+## A tab refusing its close (#2260)
+
+- `TabSurface::may_close(&self, window, cx) -> bool` (default `true`) is
+  asked before the suite closes an extension tab for a reason the user
+  started. `false` keeps the tab; the extension asks its question in its
+  own view, and the user closes again once it is answered. The suite draws
+  no prompt and sets no status line for it.
+- Where it is asked:
+  - The single-tab entry `close_tab_with` (`close.rs`): the chip's ×, Ctrl+W,
+    File > Close (`backstage_close`, the rail's Close) and the harness
+    `close-tab`. It is asked after the dialog check (`refuse_close_under_dialog`
+    stays first) and before `commit_dialog_buffers_for_exit`. A future
+    single-tab close gets it too.
+  - `window_should_close`: every Ext tab in tab order, right after the
+    stale-quit check and before the commits and the persist, whatever
+    `ask_on_close` says. Hot exit keeps a document's unsaved work but saves
+    an extension tab as nothing, so a silent close would lose it. Not on
+    `CloseAsk::HarnessQuit`.
+  - `quit_ask` (macOS Quit): every Ext tab, after the "already asking" return
+    and before the `holds` shortcut. `resume_quit` re-walks the windows after
+    each window's questions, and an Ext tab may have taken work meanwhile.
+    A refusal clears `quit_agreed`, cancels a stale question and defers
+    `cancel_quit`, as a Cancel does. Quit has no harness verb; review covers
+    it.
+- Asking before the commits matters: `commit_dialog_buffers_for_exit` drops
+  the half-typed rule bars, so a refusal that came after it would lose them
+  for nothing. A refusal drops nothing typed and commits no tab's pending
+  work into a save. It leaves File, KeyTips and menus, and brings the tab to
+  the front; switching from another tab commits what a leave commits, below.
+- The extension's question comes before its own window's document questions.
+  After answering it, the user closes again and then gets them. A Quit with
+  several windows walks them newest first (`resume_quit`), each asking only
+  its own Ext tabs, so a newer window's documents may already have been asked
+  about (and saved) when an older window's Ext tab refuses. The quit then
+  applies none of their answers, and a save stays saved.
+- Not asked: `ext::CloseTab` (`close_ext_tab` → `backstage_close_asking(false)`:
+  the extension has decided), moving a tab to another window (`new_window_at`
+  and tear-off use `remove_tab` directly), session restore, `apply_quit` and
+  `forget_on_quit`, and the harness `quit`.
+- `ext_close_refused`:
+  - It leaves File as File > Close does (Info edit applied). `focus_ext_surface`
+    returns early while File is up, so a question under File could never be
+    seen or take the keys.
+  - It turns KeyTips off and closes a ribbon menu, which would also take the
+    keys.
+  - When the tab was not the active one, it first commits a cell note and a
+    sheet rename being typed, as a leave does (`sheet_comment_bar_leave`,
+    `sheet_rename_commit`): `select_tab`'s `drop_grid_state` would drop them,
+    where a window close commits them. Then it switches with `select_tab`
+    (menus, pointer modes, persist, refocus).
+  - The keys go where the extension put them. `ext_ask` notes the focus
+    before `may_close`, and after a refusal it takes a focus that changed as
+    the extension's (one held before may be another tab's). From another tab,
+    `select_tab` focuses the suite root, so that focus is given back right
+    after it, not left to a render: a window under another may draw no frame
+    before the next harness verb (#2260 r1). `focus_ext_surface` leaves a
+    focus that is not the suite root's alone. With the tab already active
+    there is no refocus, and the focus stays. A suite root left focused by File, with
+    no focus moved, goes to the view as usual.
+- Fixture: `FixtureView::hold` (off when made) and `may_close_calls`. Both
+  belong to one fixture tab, and a closed tab takes them with it. Refusing,
+  the fixture focuses its header line (`ext-ribbon-read`'s `header_focused`). Harness
+  `ext-hold {"on"?}` sets or reads them and replies `hold` and
+  `may_close_calls`. Region `tab-close:<i>` is a chip's × (its probe is
+  inside the button, which stops the click's propagation).
+  `uiharness/cases/ext-close.uit` drives it:
+  - the ×, active and not;
+  - File > Close by the verb and the rail;
+  - Ctrl+W;
+  - `CloseTab` with the hold on;
+  - a non-last window, with File up on another tab;
+  - the last window with "ask before closing" off;
+  - a sheet rename being typed when a background Ext tab refuses the window
+    close (committed);
+  - the header keeping the keys after a refusal from another tab.
+
+  `ext_doc_view_api.rs` holds the method to the public API.
+- Not done: asking the Ext tabs again after a window close's document
+  questions (an extension's own window could take work while they are up).

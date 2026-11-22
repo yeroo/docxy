@@ -23,6 +23,11 @@
 //!
 //! Every variant also registers the same surface as a further tab kind,
 //! `fixture` (#2253, [`kind`]): its own File > New card, icon and accent.
+//!
+//! Its tab refuses a close the user started while its `hold` is on (#2260,
+//! the harness's `ext-hold`), as an extension holding unsent work would,
+//! moving the focus to its header line as it would to its question, and
+//! counts how many times it was asked ([`FixtureView::may_close_calls`]).
 
 use crate::ext::{
     self, BackstageGroup, BackstagePage, DocView, Ribbon, RibbonCommand, RibbonControl,
@@ -75,6 +80,11 @@ pub(crate) struct FixtureView {
     pub(crate) ribbon: Option<Rc<RibbonState>>,
     /// Every theme the suite told it, the last one last (#1870).
     pub(crate) themes: Rc<RefCell<Vec<SuiteTheme>>>,
+    /// While on, the tab refuses a close the user started (#2260); off
+    /// when the tab is made.
+    pub(crate) hold: Cell<bool>,
+    /// How many times the suite asked whether the tab may close (#2260).
+    pub(crate) may_close_calls: Cell<usize>,
 }
 
 impl FixtureView {
@@ -420,6 +430,19 @@ impl TabSurface for FixtureMail {
     fn backstage_pages(&self, _cx: &App) -> Vec<BackstagePage> {
         self.pages.clone()
     }
+
+    fn may_close(&self, window: &mut Window, cx: &mut App) -> bool {
+        let root = self.root.read(cx);
+        root.may_close_calls.set(root.may_close_calls.get() + 1);
+        if !root.hold.get() {
+            return true;
+        }
+        // Refusing, it moves the keys to its question, as an extension
+        // would: here its header line (#2260 r1).
+        let header = root.header_focus.clone();
+        window.focus(&header, cx);
+        false
+    }
 }
 
 /// The id of the fixture's further tab kind (#2253).
@@ -476,6 +499,8 @@ pub(crate) fn factory(ribbon: bool) -> ext::Factory {
             header_focus: cx.focus_handle(),
             ribbon: ribbon.then(Rc::default),
             themes: Rc::default(),
+            hold: Cell::new(false),
+            may_close_calls: Cell::new(0),
         });
         let pages = fixture_pages(cx);
         Ok(Box::new(FixtureMail { root, pages }) as Box<dyn TabSurface>)
