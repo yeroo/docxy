@@ -3610,7 +3610,7 @@ pub(crate) fn esc_text(s: &str) -> String {
 
 /// Full-precision float for `<v>` (must round-trip; display formatting is a
 /// separate concern).
-fn num_repr(n: f64) -> String {
+pub(crate) fn num_repr(n: f64) -> String {
     // `NaN`/`inf` are not `xsd:double` lexical forms, and Rust's `{}` prints
     // exactly those. A load can carry one in: `parse::<f64>()` accepts them, so
     // a hand-written (or foreign-tool) `<v>NaN</v>` would round-trip out again

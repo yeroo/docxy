@@ -6,7 +6,8 @@
 //! Opening one is an *import*, like a CSV: the reader builds a fresh
 //! [`SheetPackage`] (as `new_xlsx` makes one) with the sheets, values, formulas,
 //! number formats, date system, defined names and the external links that
-//! calls to add-in functions need (`.xlsb`, `.xls`), so everything downstream
+//! calls to add-in functions and references into other workbooks need
+//! (`.xlsb`, `.xls`; #888, #903), so everything downstream
 //! (engine, editor, save) sees an ordinary workbook. Nothing the readers don't
 //! model survives the import. All three read the cell formats the model holds
 //! (fonts, fills, thin borders), column widths, merged cells, comments, data
@@ -296,8 +297,9 @@ pub(crate) struct Limits {
     pub repeat_bytes: usize,
     /// Sheets ("too many sheets").
     pub sheets: usize,
-    /// Distinct external link parts with a function name ("too many
-    /// external links").
+    /// Distinct external books the import links: every `.xls` SUPBOOK
+    /// whose path it decodes, every `.xlsb` link part it reads ("too many
+    /// external links"). Their cached cells count as `cells`.
     pub links: usize,
     /// Empty cells an `.ods` keeps only for their format (#884), across
     /// the workbook. Past it, further ones are left out, as they hold no
@@ -486,9 +488,10 @@ pub(crate) struct RowIn {
     pub collapsed: bool,
 }
 
-/// Another workbook or add-in whose names formulas call, as `[k]!NAME`
-/// with `k` its 1-based place in [`BookIn::external_links`] (#888).
-/// [`BookIn::build`] writes it as `xl/externalLinks/externalLink{k}.xml`.
+/// Another workbook or add-in whose names or cells formulas refer to, as
+/// `[k]!NAME` or `[k]Sheet!A1`, with `k` its 1-based place in
+/// [`BookIn::external_links`] (#888, #903). [`BookIn::build`] writes it as
+/// `xl/externalLinks/externalLink{k}.xml`.
 #[derive(Debug, Default)]
 pub(crate) struct ExternalLink {
     /// The `Id` in `rels` that names the book (`<externalBook r:id>`).
@@ -498,9 +501,55 @@ pub(crate) struct ExternalLink {
     pub rels: Vec<(String, String, String, Option<String>)>,
     /// The book's sheet names.
     pub sheets: Vec<String>,
-    /// The book's names, in the file's order (ptgNameX counts them all):
-    /// a function name, or `None` for a name that isn't imported.
-    pub names: Vec<Option<String>>,
+    /// The book's names, in the file's order (ptgNameX counts them all),
+    /// or `None` for a name that isn't imported.
+    pub names: Vec<Option<ExtName>>,
+    /// The book's cells as the file cached them: (sheet, row, col), the
+    /// sheet an index into `sheets`. Written as `<sheetDataSet>`, which
+    /// Excel shows until it updates the link.
+    pub cache: BTreeMap<(u32, u32, u32), ExtValue>,
+}
+
+/// One name of an external book.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ExtName {
+    pub name: String,
+    /// Its definition as the `.xlsx` spells it (`refersTo`), when the
+    /// reader could read it ([`ext_definition`]); `None` for a function
+    /// name, or a definition of another shape.
+    pub refers_to: Option<String>,
+    /// The 0-based sheet of the book the name is scoped to; `None` for a
+    /// workbook name.
+    pub sheet: Option<u32>,
+}
+
+impl ExtName {
+    /// A workbook-scoped name with no definition (an add-in's function).
+    pub fn function(name: impl Into<String>) -> ExtName {
+        ExtName {
+            name: name.into(),
+            refers_to: None,
+            sheet: None,
+        }
+    }
+}
+
+/// A test's shorthand for a function name.
+#[cfg(test)]
+impl From<&str> for ExtName {
+    fn from(name: &str) -> ExtName {
+        ExtName::function(name)
+    }
+}
+
+/// A cached cell of an external book.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ExtValue {
+    Num(f64),
+    Str(String),
+    Bool(bool),
+    /// The error's text (`#N/A`).
+    Err(&'static str),
 }
 
 /// A workbook as a reader collects it, before it becomes a package.
@@ -636,14 +685,14 @@ impl BookIn {
         // so the old names are looked up that way.
         let keys: Vec<String> = raw.iter().map(|n| escape_colon(n)).collect();
         let renames = sheet_renames(&keys, &names);
-        // A formula calling another book's name (`[1]!F(...)`) doesn't
+        // A formula naming another book (`[1]!F(...)`, `[1]P!A1`) doesn't
         // parse, so `retarget` can't move its references to a renamed
         // sheet. Rather than keep a stale one, it is dropped (`None`): the
-        // cell keeps its value, as before the import read those names.
+        // cell keeps its value, as before the import read those books.
         let fix = |f: String, name: bool| -> Option<String> {
             let f = match retarget(&f, &renames, name) {
                 Some(f) => f,
-                None if f.contains("]!")
+                None if (f.contains("]!") || names_external_book(&f))
                     && sheet_qualifiers(&f)
                         .iter()
                         .any(|q| renames.by_old.contains_key(q)) =>
@@ -811,6 +860,52 @@ impl BookIn {
     }
 }
 
+/// An external book's cached cells as `<sheetDataSet>` (empty for none),
+/// those on its `sheets` sheets only:
+/// one `<sheetData>` per sheet with cells, rows and cells in order, as
+/// Excel writes them (corpus/legacy/addin/ext-name.xlsx). A number has no
+/// `t`; text is `str`, a boolean `b` and an error `e`.
+fn sheet_data_set(cache: &BTreeMap<(u32, u32, u32), ExtValue>, sheets: usize) -> String {
+    use crate::xlsx::{esc_text, num_repr};
+    // A sheet the book doesn't list, or a cell off the grid, is left out.
+    let mut cells = cache
+        .iter()
+        .filter(|&(&(s, r, c), _)| (s as usize) < sheets && on_grid(r, c))
+        .peekable();
+    if cells.peek().is_none() {
+        return String::new();
+    }
+    let mut out = String::from("<sheetDataSet>");
+    let mut at: Option<(u32, u32)> = None;
+    for (&(sheet, row, col), value) in cells {
+        if at.map(|a| a.0) != Some(sheet) {
+            if at.is_some() {
+                out.push_str("</row></sheetData>");
+            }
+            out.push_str(&format!(
+                r#"<sheetData sheetId="{sheet}"><row r="{}">"#,
+                row + 1
+            ));
+        } else if at.map(|a| a.1) != Some(row) {
+            out.push_str(&format!(r#"</row><row r="{}">"#, row + 1));
+        }
+        at = Some((sheet, row));
+        let (t, v) = match value {
+            ExtValue::Num(n) => ("", num_repr(*n)),
+            ExtValue::Str(s) => (r#" t="str""#, esc_text(s)),
+            ExtValue::Bool(b) => (r#" t="b""#, u8::from(*b).to_string()),
+            ExtValue::Err(e) => (r#" t="e""#, esc_text(e)),
+        };
+        out.push_str(&format!(
+            r#"<cell r="{}{}"{t}><v>{v}</v></cell>"#,
+            crate::sheet::col_name(col),
+            row + 1
+        ));
+    }
+    out.push_str("</row></sheetData></sheetDataSet>");
+    out
+}
+
 /// Each external link as `xl/externalLinks/externalLink{k}.xml` (with its
 /// rels, content type and workbook rel), and `<externalReferences>` naming
 /// them in order, so `[k]!NAME` names link `k`. `pkg` is the fresh package
@@ -845,22 +940,30 @@ fn write_external_links(pkg: &mut SheetPackage, links: &[ExternalLink]) {
             }
             body.push_str("</sheetNames>");
         }
-        // Each name once: a book's sheet-scoped names may repeat one, and
-        // their scope isn't read.
+        // Each name once in its scope (a repeat would make the part
+        // invalid), with its definition when the reader read one.
         let mut seen = std::collections::HashSet::new();
-        let names: Vec<&String> = link
+        let names: Vec<&ExtName> = link
             .names
             .iter()
             .flatten()
-            .filter(|n| seen.insert(n.to_lowercase()))
+            .filter(|n| seen.insert((n.name.to_lowercase(), n.sheet)))
             .collect();
         if !names.is_empty() {
             body.push_str("<definedNames>");
             for n in names {
-                body.push_str(&format!(r#"<definedName name="{}"/>"#, esc_attr(n)));
+                body.push_str(&format!(r#"<definedName name="{}""#, esc_attr(&n.name)));
+                if let Some(f) = &n.refers_to {
+                    body.push_str(&format!(r#" refersTo="{}""#, esc_attr(f)));
+                }
+                if let Some(s) = n.sheet {
+                    body.push_str(&format!(r#" sheetId="{s}""#));
+                }
+                body.push_str("/>");
             }
             body.push_str("</definedNames>");
         }
+        body.push_str(&sheet_data_set(&link.cache, link.sheets.len()));
         let xml = format!(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <externalLink xmlns="{MAIN}"><externalBook xmlns:r="{RELS}" r:id="{}">{body}</externalBook></externalLink>"#,
@@ -1127,6 +1230,114 @@ pub(crate) fn sheet_prefix(first: &str, last: &str) -> String {
         return format!("{}!", crate::sheet::quote_sheet_name(&first));
     }
     crate::formula::span_prefix(&first, &last)
+}
+
+/// The sheet part of a reference into sheet `sheet` of external book `k`
+/// (1-based), as Excel's `.xlsx` spells it: `[1]P!`, or `'[1]My Sheet'!`
+/// when the name needs quotes, which then hold the book number too. The
+/// quoting rule is our own sheets' ([`crate::sheet::quote_sheet_name`]).
+/// `None` for an empty name.
+pub(crate) fn external_prefix(k: usize, sheet: &str) -> Option<String> {
+    if sheet.is_empty() {
+        return None;
+    }
+    Some(if crate::sheet::quote_sheet_name(sheet) == sheet {
+        format!("[{k}]{sheet}!")
+    } else {
+        format!("'[{k}]{}'!", sheet.replace('\'', "''"))
+    })
+}
+
+/// The `refersTo` of an external book's name from its definition `rgce`,
+/// as Excel's `.xlsx` spells it; `None` for any other shape.
+///
+/// - ptgErr (2 bytes): the error, `#REF!` (no `=`).
+/// - An area (ptgArea3d, any class; 13 bytes) or a cell (ptgRef3d; 9
+///   bytes): `='P'!$A$1:$A$2` / `='P'!$A$1`, the sheet always quoted. The
+///   token is neither BIFF8's nor BIFF12's ptgArea3d: it is the ptg,
+///   itabFirst u16 and itabLast u16 (the book's sheets), then BIFF8's
+///   RgceArea (rows u16, columns u16 with the relative flags in bits 14
+///   and 15) or RgceLoc, the same in `.xls` and `.xlsb`. Excel wrote
+///   `Prices` (`'P'!$A$1:$A$2`) as `3b 0000 0000 0000 0100 0000 0000` in
+///   both files of corpus/legacy/addin/ext-name. One spanning sheets, on a
+///   sheet the book doesn't list, off the grid or with a relative part
+///   (no file shows its spelling) gives `None`.
+pub(crate) fn ext_definition(rgce: &[u8], sheets: &[String]) -> Option<String> {
+    let mut rd = Le::new(rgce);
+    let ptg = rd.u8()?;
+    if ptg == 0x1C && rgce.len() == 2 {
+        return Some(biff_error(rd.u8()?).to_string());
+    }
+    let area = match (ptg & 0x9F | 0x20, rgce.len()) {
+        (0x3B, 13) if ptg & 0x60 != 0 => true,
+        (0x3A, 9) if ptg & 0x60 != 0 => false,
+        _ => return None,
+    };
+    let (first, last) = (rd.u16()?, rd.u16()?);
+    let sheet = sheets.get(first as usize).filter(|_| first == last)?;
+    let (r1, r2) = if area {
+        (rd.u16()?, rd.u16()?)
+    } else {
+        let r = rd.u16()?;
+        (r, r)
+    };
+    let (c1, c2) = if area {
+        (rd.u16()?, rd.u16()?)
+    } else {
+        let c = rd.u16()?;
+        (c, c)
+    };
+    if (c1 | c2) & 0xC000 != 0 {
+        return None;
+    }
+    let (c1, c2) = (u32::from(c1 & 0x3FFF), u32::from(c2 & 0x3FFF));
+    let (r1, r2) = (u32::from(r1), u32::from(r2));
+    if !on_grid(r1, c1) || !on_grid(r2, c2) {
+        return None;
+    }
+    let cell = |r: u32, c: u32| format!("${}${}", crate::sheet::col_name(c), r + 1);
+    let at = format!("='{}'!{}", sheet.replace('\'', "''"), cell(r1, c1));
+    Some(if area {
+        format!("{at}:{}", cell(r2, c2))
+    } else {
+        at
+    })
+}
+
+/// Whether `src` holds an external book's qualifier, `[k]` (`[1]!F`,
+/// `[1]P!A1`), outside string literals and quoted names (skipped as
+/// [`sheet_qualifiers`] skips them). Such a formula doesn't parse, so
+/// [`BookIn::build`] can't follow a sheet rename through it.
+fn names_external_book(src: &str) -> bool {
+    let b = src.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            q @ (b'"' | b'\'') => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == q {
+                        if b.get(i + 1) == Some(&q) {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'[' => {
+                let digits = b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+                if digits > 0 && b.get(i + 1 + digits) == Some(&b']') {
+                    return true;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 /// `src` with each [`COLON`] left in a sheet qualifier turned back into
@@ -1539,7 +1750,8 @@ mod tests {
                 Some("External".into()),
             )],
             sheets: vec!["S&1".into()],
-            names: names.iter().map(|n| Some(n.to_string())).collect(),
+            names: names.iter().map(|&n| Some(n.into())).collect(),
+            cache: BTreeMap::new(),
         }
         };
         let mut book = BookIn::new();
@@ -1670,10 +1882,11 @@ mod tests {
         assert_eq!(wb.defined_names[1].formula, "A_B!$A$2");
     }
 
-    /// A call into another book (`[1]!F(...)`) doesn't parse, so a sheet
-    /// rename can't reach inside it: one naming a renamed sheet is dropped
-    /// (a cell keeps its value, a name is left out), and one that doesn't
-    /// stays as it is.
+    /// A call into another book (`[1]!F(...)`) or a reference to one of its
+    /// sheets (`[1]P!A1`, #903) doesn't parse, so a sheet rename can't
+    /// reach inside it: one naming a renamed sheet is dropped (a cell keeps
+    /// its value, a name is left out), and one that doesn't stays as it is.
+    /// A quoted one (`'[1]My Sheet'!A1`) parses, so the rename follows.
     #[test]
     fn a_call_into_another_book_naming_a_renamed_sheet_is_dropped() {
         use crate::sheet::CellValue;
@@ -1696,6 +1909,9 @@ mod tests {
                 ((0, 0), cell(&format!("[1]!F('{long}'!A1)"), 9.0)),
                 ((1, 0), cell("[1]!F(Calc!A1)", 8.0)),
                 ((2, 0), cell(&format!("'{long}'!A1*2"), 7.0)),
+                ((3, 0), cell(&format!("[1]P!A1+'{long}'!A1"), 6.0)),
+                ((4, 0), cell("[1]P!A1+Calc!A1", 5.0)),
+                ((5, 0), cell(&format!("'[1]My Sheet'!A1+'{long}'!A1"), 4.0)),
             ]
             .into_iter()
             .collect(),
@@ -1721,6 +1937,13 @@ mod tests {
         assert_eq!(
             at(2).formula.as_deref(),
             Some(format!("{cut}!A1*2").as_str())
+        );
+        assert_eq!(at(3).formula, None);
+        assert_eq!(at(3).value, CellValue::Number(6.0));
+        assert_eq!(at(4).formula.as_deref(), Some("[1]P!A1+Calc!A1"));
+        assert_eq!(
+            at(5).formula.as_deref(),
+            Some(format!("'[1]My Sheet'!A1+{cut}!A1").as_str())
         );
         let names: Vec<(&str, &str)> = pkg
             .workbook
@@ -1879,7 +2102,8 @@ mod tests {
                 book: "rId1".into(),
                 rels: vec![("rId1".into(), "t".into(), format!("B{i}.XLAM"), None)],
                 sheets: Vec::new(),
-                names: vec![Some(format!("F{i}"))],
+                names: vec![Some(ExtName::function(format!("F{i}")))],
+                cache: BTreeMap::new(),
             })
             .collect();
         let started = std::time::Instant::now();
@@ -1977,6 +2201,133 @@ mod tests {
             restore_colons("T[[#This Row],[a'[\u{FDD0}]]&'X\u{FDD0}Y'!A1"),
             "T[[#This Row],[a'[\u{FDD0}]]&'X:Y'!A1"
         );
+    }
+
+    /// Another book's sheet is spelled as Excel's `.xlsx` spells it: bare
+    /// when its name needs no quotes, else the book inside the quotes.
+    #[test]
+    fn external_prefixes_quote_as_needed() {
+        assert_eq!(external_prefix(1, "P").as_deref(), Some("[1]P!"));
+        assert_eq!(
+            external_prefix(12, "Sheet.1").as_deref(),
+            Some("[12]Sheet.1!")
+        );
+        assert_eq!(
+            external_prefix(1, "My Sheet").as_deref(),
+            Some("'[1]My Sheet'!")
+        );
+        assert_eq!(external_prefix(2, "It's").as_deref(), Some("'[2]It''s'!"));
+        assert_eq!(external_prefix(1, "A1").as_deref(), Some("'[1]A1'!"));
+        assert_eq!(external_prefix(1, "2024").as_deref(), Some("'[1]2024'!"));
+        assert_eq!(external_prefix(1, ""), None);
+    }
+
+    /// An external name's definition: an error, an area or a cell of one
+    /// of the book's sheets, as Excel's `.xlsx` spells them (#903). Any
+    /// other shape gives none.
+    #[test]
+    fn external_definitions_take_only_the_shapes_excel_wrote() {
+        let sheets = ["P".to_string(), "It's".to_string()];
+        let def = |b: &[u8]| ext_definition(b, &sheets);
+        let area = |ptg: u8, first: u16, last: u16, cols: (u16, u16)| {
+            let mut v = vec![ptg];
+            for x in [first, last, 0, 1, cols.0, cols.1] {
+                v.extend(x.to_le_bytes());
+            }
+            v
+        };
+        let cell = |ptg: u8, first: u16, col: u16| {
+            let mut v = vec![ptg];
+            for x in [first, first, 4, col] {
+                v.extend(x.to_le_bytes());
+            }
+            v
+        };
+        // Excel's, in corpus/legacy/addin/ext-name.
+        assert_eq!(
+            def(&[0x3B, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]).as_deref(),
+            Some("='P'!$A$1:$A$2")
+        );
+        assert_eq!(def(&[0x1C, 0x17]).as_deref(), Some("#REF!"));
+        assert_eq!(def(&[0x1C, 0x2A]).as_deref(), Some("#N/A"));
+        // Every class; the second sheet, its apostrophe doubled.
+        assert_eq!(
+            def(&area(0x7B, 1, 1, (2, 3))).as_deref(),
+            Some("='It''s'!$C$1:$D$2")
+        );
+        assert_eq!(
+            def(&area(0x5B, 0, 0, (0, 0))).as_deref(),
+            Some("='P'!$A$1:$A$2")
+        );
+        assert_eq!(def(&cell(0x3A, 0, 1)).as_deref(), Some("='P'!$B$5"));
+        assert_eq!(def(&cell(0x5A, 1, 0)).as_deref(), Some("='It''s'!$A$5"));
+        for bad in [
+            // A span, a sheet the book doesn't list, a relative column or
+            // row, no class, a length of another layout, other tokens.
+            area(0x3B, 0, 1, (0, 0)),
+            area(0x3B, 2, 2, (0, 0)),
+            area(0x3B, 0, 0, (0x4000, 0)),
+            area(0x3B, 0, 0, (0, 0x8000)),
+            cell(0x3A, 0, 0xC000),
+            area(0x1B, 0, 0, (0, 0)),
+            cell(0x1A, 0, 0),
+            area(0x3B, 0, 0, (0, 0))[..11].to_vec(),
+            vec![0x1C],
+            vec![0x1C, 0x17, 0],
+            vec![0x1E, 1, 0],
+            vec![],
+        ] {
+            assert_eq!(def(&bad), None, "{bad:?}");
+        }
+    }
+
+    /// An external book's qualifier is found outside literals and quoted
+    /// names only.
+    #[test]
+    fn external_book_qualifiers_are_found_outside_quotes() {
+        for yes in ["[1]!F(A1)", "[1]P!A1", "SUM([12]P!A1:A2)", "\"[\"&[1]P!A1"] {
+            assert!(names_external_book(yes), "{yes}");
+        }
+        for no in [
+            "'[1]My Sheet'!A1",
+            "\"[1]P\"&A1",
+            "T[Col]",
+            "T[1x]",
+            "[]",
+            "A1",
+            "'it''s [1]'!A1",
+        ] {
+            assert!(!names_external_book(no), "{no}");
+        }
+    }
+
+    /// A book's cached cells are written per sheet in order; a sheet the
+    /// book doesn't list, or a cell off the grid, is left out, and a book
+    /// with none gets no `<sheetDataSet>`.
+    #[test]
+    fn cached_cells_are_written_per_sheet_in_order() {
+        let cache: BTreeMap<(u32, u32, u32), ExtValue> = [
+            ((1, 0, 2), ExtValue::Num(0.5)),
+            ((0, 4, 0), ExtValue::Err("#DIV/0!")),
+            ((0, 0, 1), ExtValue::Str("<x>".into())),
+            ((0, 0, 0), ExtValue::Bool(false)),
+            ((2, 0, 0), ExtValue::Num(1.0)),
+            ((0, 0, crate::sheet::MAX_COLS), ExtValue::Num(1.0)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            sheet_data_set(&cache, 2),
+            concat!(
+                r#"<sheetDataSet><sheetData sheetId="0"><row r="1">"#,
+                r#"<cell r="A1" t="b"><v>0</v></cell><cell r="B1" t="str"><v>&lt;x&gt;</v></cell>"#,
+                r##"</row><row r="5"><cell r="A5" t="e"><v>#DIV/0!</v></cell></row></sheetData>"##,
+                r#"<sheetData sheetId="1"><row r="1"><cell r="C1"><v>0.5</v></cell></row>"#,
+                r#"</sheetData></sheetDataSet>"#,
+            )
+        );
+        assert_eq!(sheet_data_set(&cache, 0), "");
+        assert_eq!(sheet_data_set(&BTreeMap::new(), 3), "");
     }
 
     #[test]

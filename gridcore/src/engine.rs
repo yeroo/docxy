@@ -3672,6 +3672,58 @@ mod tests {
         assert!(eng.is_unsupported((0, r, c)));
     }
 
+    /// A reference into another workbook that parses (its quoted
+    /// qualifier, `'[1]My Sheet'!A1`, or a path) keeps Excel's cached
+    /// value, as one that doesn't parse (`[1]P!A1`) does (#903); a missing
+    /// sheet of this workbook is #REF!.
+    #[test]
+    fn a_reference_into_another_workbook_keeps_cached_value() {
+        let cached = |f: &str| Cell {
+            value: CellValue::Number(42.0),
+            formula: Some(f.to_string()),
+            ..Cell::default()
+        };
+        let mut wb = wb_one_sheet(&[
+            ("A1", cached("'[1]My Sheet'!$A$1+1")),
+            ("B1", cached(r"SUM('C:\Docs\[Book.xlsx]Sheet 1'!A1:A2)")),
+            ("C1", cached("[1]P!A1")),
+            ("D1", cached("'No Sheet'!A1")),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        for name in ["A1", "B1", "C1"] {
+            assert_eq!(value_at(&wb, name), CellValue::Number(42.0), "{name}");
+        }
+        assert_eq!(value_at(&wb, "D1"), CellValue::Error("#REF!".into()));
+    }
+
+    /// INDIRECT's text naming another workbook's sheet is #REF!, as
+    /// Excel's INDIRECT gives for a closed book, and doesn't freeze the
+    /// cell: it follows the text when it names a sheet of this workbook
+    /// again (#903 r1).
+    #[test]
+    fn indirect_into_another_workbook_stays_live() {
+        let mut wb = wb_one_sheet(&[
+            ("A1", Cell::text("'[1]X'!A1")),
+            ("B1", Cell::number(5.0)),
+            (
+                "C1",
+                Cell {
+                    value: CellValue::Number(42.0),
+                    formula: Some("INDIRECT(A1)".to_string()),
+                    ..Cell::default()
+                },
+            ),
+        ]);
+        let mut eng = Engine::new(&wb);
+        eng.recalc_all(&mut wb);
+        assert_eq!(value_at(&wb, "C1"), CellValue::Error("#REF!".into()));
+        let (r, c) = crate::sheet::parse_cell_name("C1").unwrap();
+        assert!(!eng.is_unsupported((0, r, c)));
+        set(&mut eng, &mut wb, "A1", Cell::text("B1"));
+        assert_eq!(value_at(&wb, "C1"), CellValue::Number(5.0));
+    }
+
     #[test]
     fn empty_ref_result_becomes_zero() {
         let mut wb = wb_one_sheet(&[("A1", Cell::formula("Z99"))]);

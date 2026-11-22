@@ -384,3 +384,64 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   trips check it with `saved_thin_box`. The corpus has no CF, DV or
   comments, and no Excel-made fixture has them, so those rest on
   hand-built records laid out from [MS-XLS]/[MS-XLSB]/ODF.
+
+## References into other workbooks from `.xls`/`.xlsb` (#903)
+
+- Every external book the import can name becomes an `ExternalLink`, `[k]` in
+  file order. In an `.xls`, that is a SUPBOOK whose virtPath decodes
+  (`xls::virt_path`). In an `.xlsb`, it is a BrtSupBookSrc whose part is read
+  (`sbt` 0, its rel there). A book needs no function name any more (it did in
+  #888/#890), as Excel keeps every book. Each link counts against
+  `Limits::links`. Its cached cells count against `Limits::cells`, charged
+  one by one as they are read (CRN, BrtExternCell*), so a crafted cache is
+  refused before it outgrows the budget.
+- virtPath forms with an Excel oracle are decoded:
+  - `\x01\x08file`: Library, `xlLibrary` rel.
+  - `\x01file`: beside the workbook, target `file`, as ext-name.xls has it.
+  - `\x01\x01C\x03dir\x03file`: `file:///C:\dir\file`, with a space as `%20`
+    (the spelling of the `.xlsb`'s absolute rel).
+
+  A target is a URI reference, so in the last two forms `%` is written `%25`
+  and `#` is written `%23`. The Library form stays raw: the `.xls` writer
+  reads it back as a plain file name.
+
+  The other forms (same volume, `\x03`/`\x04` relative directories, long or
+  UNC volumes, startup directories, unencoded, DDE/OLE) give no link, so a
+  formula referring to such a book is dropped and its value kept, as before.
+- References: ptgRef3d/ptgArea3d through an XTI naming one sheet of a linked
+  book give `[1]P!A1`. When the sheet's name needs quotes, the book number goes
+  inside them: `'[1]My Sheet'!A1` (`legacy::external_prefix`).
+  ptgRefErr3d/ptgAreaErr3d give `[1]P!#REF!`. A span over the book's sheets
+  and a sheet the book doesn't list stay unread.
+- Names: `[1]!Prices`. Each name keeps its `refersTo` from
+  `legacy::ext_definition`:
+  - a ptgErr gives `#REF!`;
+  - the 13-byte area token gives `='P'!$A$1:$A$2`;
+  - the 9-byte cell token gives `='P'!$A$1`.
+
+  The sheet is always quoted, as Excel quotes it. The token is the ptg,
+  itabFirst/itabLast u16, then BIFF8's RgceArea/RgceLoc, in both formats; the
+  only evidence is the oracle's bytes. Any other shape, a span or a relative
+  part gives no `refersTo`.
+- Name scope: an `.xls` name's `ixals` becomes `sheetId`, and the writer dedupes
+  names by (name, scope). A formula through the whole book names only a
+  workbook-scoped one. The `.xlsb` scope (BrtSupNameBits) isn't read.
+- Cached cells: the `.xls` XCT/CRN (SerAr) records and the `.xlsb`
+  BrtExternTable/Row/Cell records become `<sheetDataSet>`. A number has no `t`,
+  text is `str`, a boolean `b` and an error `e`. Blanks are left out.
+- Neither `[1]P!A1` nor `[1]!Name` parses, so the engine keeps the cached
+  value. A quoted `'[1]My Sheet'!A1` does parse: `Eval::resolve_sheet` marks a
+  missing sheet whose name holds `[` unsupported, so it keeps its cached value
+  too, for an `.xlsx` as well. This doesn't apply to a reference that
+  INDIRECT's text names (`Eval::indirect` depth): that one is `#REF!`, as in
+  Excel for a closed book. Marking it would freeze the cell after the text
+  changes. Because these don't parse,
+  `BookIn::build` can't carry a sheet rename into them. One that names a
+  renamed sheet is dropped (`names_external_book`).
+- Not done:
+  - the `.xls` writer writes only a Library book's SUPBOOK, so Save back to
+    `.xls` (xlsxy's Compatibility Mode) loses these formulas, after naming
+    the loss;
+  - the parser reading `[k]` references;
+  - sheet-scoped external names through a sheet XTI;
+  - 3D spans across another book.

@@ -20,6 +20,8 @@ enum Check {
     Value,
     /// (d): the recalculated value.
     Recalc,
+    /// (c): the formula kept at all.
+    Kept,
     /// (e): the formula's text.
     Formula,
     /// (f): the number-format code.
@@ -113,6 +115,15 @@ const ALLOW: &[Allow] = &[
         cells: STRUCTURED_REFS,
         checks: &[Check::Formula],
         why: "tables are not imported; structured refs become ranges",
+    },
+    // The writer's loss of these, which it names (`XLS_LOST`), in the
+    // round trip through it.
+    Allow {
+        file: "ext-name.xls",
+        sheet: "Data",
+        cells: &["A1", "A2"],
+        checks: &[Check::Kept],
+        why: "the writer can't write an ordinary book's link (#903 Not done)",
     },
 ];
 
@@ -338,7 +349,9 @@ fn compare_static(file: &str, src: &Workbook, got: &Workbook, errs: &mut Vec<Str
                     mine.value, cell.value
                 ));
             }
-            if let (Some(f), None) = (&cell.formula, &mine.formula) {
+            if let (Some(f), None) = (&cell.formula, &mine.formula)
+                && !allowed(file, &sheet.name, &cell_name(r, c), Check::Kept)
+            {
                 errs.push(format!("{at}: (c) formula ={f} lost"));
             }
             let (want, have) = (code(src, cell.style), code(got, mine.style));
@@ -937,37 +950,134 @@ fn xll_function_keeps_its_formula(ext: &str) {
 }
 
 #[test]
-fn xlsb_external_workbook_name_keeps_only_its_value() {
-    external_workbook_name_keeps_only_its_value("xlsb");
+fn xlsb_external_workbook_name_keeps_its_formula_and_link() {
+    external_workbook_name_keeps_its_formula_and_link("xlsb");
 }
 
 #[test]
-fn xls_external_workbook_name_keeps_only_its_value() {
-    external_workbook_name_keeps_only_its_value("xls");
+fn xls_external_workbook_name_keeps_its_formula_and_link() {
+    external_workbook_name_keeps_its_formula_and_link("xls");
 }
 
-/// A name of an ordinary workbook (`SUM([1]!Prices)`, `[1]!Half*2` in
-/// Excel's `.xlsx`) has a definition and cached cells the import doesn't
-/// read: its formula is dropped and the value kept, and no link is written.
-/// In the `.xls` the book's SUPBOOK path is an ordinary path, not a Library
-/// file, so it gets no link either.
-fn external_workbook_name_keeps_only_its_value(ext: &str) {
+/// The facts of an external link part that make Excel resolve `[1]...`:
+/// its book's rel id, sheet names, names with their definitions and scope,
+/// and cached cells, in document order.
+fn link_facts(xml: &str) -> Vec<String> {
+    use opccore::xml::{Event, XmlParser};
+    let local = |n: &str| n.rsplit(':').next().unwrap_or(n).to_string();
+    let mut out = Vec::new();
+    let mut p = XmlParser::new(xml);
+    let (mut sheet, mut cell, mut in_v) = (String::new(), String::new(), false);
+    loop {
+        match p.next() {
+            Event::Start => match local(p.name()).as_str() {
+                "externalBook" => out.push(format!("book {}", p.attr("r:id"))),
+                "sheetName" => out.push(format!("sheet {}", p.attr("val"))),
+                "definedName" => out.push(format!(
+                    "name {} = {:?} in {:?}",
+                    p.attr("name"),
+                    p.attr("refersTo"),
+                    p.attr("sheetId")
+                )),
+                "sheetData" => sheet = p.attr("sheetId").to_string(),
+                "cell" => cell = format!("{sheet}/{} t={:?}", p.attr("r"), p.attr("t")),
+                "v" => in_v = true,
+                _ => {}
+            },
+            Event::Text if in_v => out.push(format!("cell {cell} = {}", p.text())),
+            Event::End => in_v = false,
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// corpus/legacy/addin/ext-name: `SUM([1]!Prices)` and `[1]!Half*2`, names
+/// of an ordinary workbook (ext-name-src.xlsx, beside it), whose `Prices`
+/// is `'P'!$A$1:$A$2` and `Half` `#REF!` (#903). Both imports keep the
+/// formulas as Excel's `.xlsx` spells them, and their cached values, which
+/// recalculation keeps (`[1]!` doesn't parse). Save As `.xlsx` writes the
+/// link Excel's `.xlsx` has: the book's path, its sheet, its names with
+/// their definitions and the cells it cached; the `.xlsb`'s part also
+/// keeps the absolute path, which the `.xls` doesn't hold. The saved file
+/// reloads with the same formulas and values.
+fn external_workbook_name_keeps_its_formula_and_link(ext: &str) {
     let dir = corpus("legacy").join("addin");
+    let excel = std::fs::read(dir.join("ext-name.xlsx")).unwrap();
+    let src = load_xlsx(&excel).expect("ext-name.xlsx loads").workbook;
     let (pkg, _) = open_workbook(&std::fs::read(dir.join(format!("ext-name.{ext}"))).unwrap())
         .unwrap_or_else(|e| panic!("{ext} opens: {e}"));
-    let sheet = &pkg.workbook.sheets[0];
-    for (r, want) in [(0, 7.0), (1, 1.0)] {
-        let cell = sheet.cell(r, 0).expect("cell");
-        assert_eq!(cell.value, CellValue::Number(want), "row {r}");
-        assert_eq!(cell.formula, None, "row {r}");
+    let got = &pkg.workbook;
+    let cell = |wb: &Workbook, r| {
+        let c = wb.sheets[0].cell(r, 0).expect("cell");
+        (c.formula.clone(), c.value.clone())
+    };
+    let want = [
+        (Some("SUM([1]!Prices)".to_string()), CellValue::Number(7.0)),
+        (Some("[1]!Half*2".to_string()), CellValue::Number(1.0)),
+    ];
+    for (r, want) in want.iter().enumerate() {
+        assert_eq!(&cell(got, r as u32), want, "{ext} row {r}");
     }
+    let file = format!("ext-name.{ext}");
+    let mut errs = Vec::new();
+    compare_static(&file, &src, got, &mut errs);
+    same_formula_text(&file, &src, got, &mut errs);
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+
+    let mut wb = got.clone();
+    Engine::new(&wb).recalc_all(&mut wb);
+    for (r, want) in want.iter().enumerate() {
+        assert_eq!(&cell(&wb, r as u32), want, "{ext} row {r} recalculated");
+    }
+
     let bytes = save_xlsx(&pkg);
-    let back = load_xlsx(&bytes).expect("saved import reloads");
-    assert!(
-        !back.part_names().iter().any(|n| n.contains("externalLink")),
-        "{:?}",
-        back.part_names()
+    let part = |zip: &opccore::zip::ZipArchive, name: &str| {
+        String::from_utf8(zip.read(name).unwrap_or_else(|| panic!("{name} missing"))).unwrap()
+    };
+    let saved = opccore::zip::ZipArchive::open(&bytes).expect("saved package");
+    let theirs = opccore::zip::ZipArchive::open(&excel).expect("Excel's package");
+    let link = "xl/externalLinks/externalLink1.xml";
+    let facts = link_facts(&part(&saved, link));
+    assert_eq!(facts, link_facts(&part(&theirs, link)), "{ext}");
+    assert_eq!(
+        facts,
+        [
+            "book rId1",
+            "sheet P",
+            r##"name Half = "#REF!" in """##,
+            r#"name Prices = "='P'!$A$1:$A$2" in """#,
+            r#"cell 0/A1 t="" = 3"#,
+            r#"cell 0/A2 t="" = 4"#,
+        ]
     );
+    let rels = "xl/externalLinks/_rels/externalLink1.xml.rels";
+    let rel = |id: &str, target: &str| {
+        format!(
+            r#"<Relationship Id="{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLinkPath" Target="{target}" TargetMode="External"/>"#
+        )
+    };
+    let ours = part(&saved, rels);
+    assert!(ours.contains(&rel("rId1", "ext-name-src.xlsx")), "{ours}");
+    let absolute = r"file:///C:\Users\boris\source\workbench\docxy-issue-890\corpus\legacy\addin\ext-name-src.xlsx";
+    assert_eq!(
+        ours.contains(&rel("rId2", absolute)),
+        ext == "xlsb",
+        "{ours}"
+    );
+    assert_eq!(
+        ours.matches("<Relationship ").count(),
+        if ext == "xlsb" { 2 } else { 1 },
+        "{ours}"
+    );
+
+    let back = load_xlsx(&bytes).expect("saved import reloads");
+    assert!(back.part_names().contains(&link), "{:?}", back.part_names());
+    let file = format!("ext-name.{ext} (h)");
+    compare_static(&file, &src, &back.workbook, &mut errs);
+    same_formula_text(&file, &src, &back.workbook, &mut errs);
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
 }
 
 // ---- the .xls writer (#874) ---------------------------------------------------
@@ -1005,20 +1115,24 @@ const XLS_DROPPED: &[(&str, &[&str])] = &[
         &["tables (their cells are kept as plain ranges)"],
     ),
     ("chart-embedded.xls", &["pictures, shapes and charts"]),
-    // `SUM([1]!Prices)` and `[1]!Half*2`, names of another workbook.
-    (
-        "ext-name.xls",
-        &["2 formulas that refer to other workbooks or can't be read (kept as values)"],
-    ),
 ];
 
 /// What writing each corpus `.xls`'s import back loses, by file; every
 /// other file loses nothing.
-const XLS_LOST: &[(&str, &[&str])] = &[];
+const XLS_LOST: &[(&str, &[&str])] = &[
+    // `SUM([1]!Prices)` and `[1]!Half*2`, names of an ordinary workbook:
+    // the import keeps them (#903), but the writer writes only a Library
+    // book's SUPBOOK.
+    (
+        "ext-name.xls",
+        &["2 formulas with references to other workbooks (saved as values)"],
+    ),
+];
 
 /// Import, write with `write_xls`, import again: the second import is the
 /// first. The sheets (names, order, hidden), values, formulas (as parsed;
-/// `[1]!` calls, which don't parse, as text), the whole cell format, names,
+/// `[1]!` calls, which don't parse, as text; one the writer names as lost
+/// in [`XLS_LOST`] is allowed by [`ALLOW`]), the whole cell format, names,
 /// date system, merges, columns, rows, panes, page setup, page breaks,
 /// outline settings and the active sheet. Each
 /// written file keeps the structural rules Excel holds it to.

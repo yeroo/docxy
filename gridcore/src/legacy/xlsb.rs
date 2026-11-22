@@ -14,8 +14,8 @@ use super::ftab;
 use super::ptg::{self, Base, Biff, Names, Table, utf16};
 use super::xlsb_style::Styles;
 use super::{
-    BookIn, ColIn, ExternalLink, Le, Limits, OpenError, SheetIn, biff_error, on_grid, rk,
-    set_array, sheet_prefix,
+    BookIn, ColIn, ExtName, ExtValue, ExternalLink, Le, Limits, OpenError, SheetIn, biff_error,
+    ext_definition, external_prefix, on_grid, rk, set_array, sheet_prefix,
 };
 use crate::sheet::{Cell, CellValue, DefinedName};
 use crate::xlsx::{parse_rels, parse_rels_mode, rels_part_name, resolve_relative};
@@ -84,6 +84,18 @@ const BRT_SUP_SELF: u32 = 357;
 const BRT_SUP_SAME: u32 = 358;
 const BRT_SUP_TABS: u32 = 359;
 const BRT_BEGIN_SUP_BOOK: u32 = 360;
+/// An external link part's cached cells ([`read_link`]): the sheet, then
+/// per row its header and cells ([MS-XLSB] 2.4: BrtExternTableStart,
+/// BrtExternTableEnd, BrtExternRowHdr, BrtExternCellBlank, ...Real,
+/// ...Bool, ...Error, ...String).
+const BRT_EXTERN_TABLE_START: u32 = 363;
+const BRT_EXTERN_TABLE_END: u32 = 364;
+const BRT_EXTERN_ROW_HDR: u32 = 366;
+const BRT_EXTERN_CELL_BLANK: u32 = 367;
+const BRT_EXTERN_CELL_REAL: u32 = 368;
+const BRT_EXTERN_CELL_BOOL: u32 = 369;
+const BRT_EXTERN_CELL_ERROR: u32 = 370;
+const BRT_EXTERN_CELL_STRING: u32 = 371;
 /// A name of the BrtSupAddin book before it: one function the XLL
 /// registers (corpus/legacy/addin/xll-udf.xlsb has XLLTWICE's).
 const BRT_PLACEHOLDER_NAME: u32 = 361;
@@ -114,7 +126,8 @@ enum Book {
     /// This workbook (BrtSupSelf, BrtSupSame).
     Own,
     /// Another workbook or an add-in workbook (BrtSupBookSrc): its place in
-    /// [`Globals::links`], or `None` when its link part isn't read.
+    /// [`Globals::links`], or `None` when its link part isn't read
+    /// ([`read_link`]).
     External(Option<usize>),
     /// An XLL add-in (BrtSupAddin): the functions it registers, from the
     /// BrtPlaceholderName records after it, spelled as [`ftab::xll_name`]
@@ -127,8 +140,8 @@ struct Globals {
     sheets: Vec<String>,
     /// Per SUPBOOK, what it is.
     books: Vec<Book>,
-    /// The external books with a function name formulas can call
-    /// ([`read_link`]), `[1]` first.
+    /// The external books whose link parts were read ([`read_link`]), `[1]`
+    /// first.
     links: Vec<ExternalLink>,
     xti: Vec<(u32, i32, i32)>,
     /// Each BrtName's name and sheet (`0xFFFFFFFF` for the workbook).
@@ -140,11 +153,19 @@ struct Globals {
 impl Names for Globals {
     fn xti(&self, ixti: u32) -> Option<String> {
         let &(book, first, last) = self.xti.get(ixti as usize)?;
-        if *self.books.get(book as usize)? != Book::Own {
-            return None;
+        match *self.books.get(book as usize)? {
+            Book::Own => {
+                let name = |i: i32| self.sheets.get(usize::try_from(i).ok()?).cloned();
+                Some(sheet_prefix(&name(first)?, &name(last)?))
+            }
+            // One sheet of a linked book (#903): `[1]P!`. A span of its
+            // sheets has no file showing its spelling.
+            Book::External(Some(k)) if first == last => {
+                let sheets = &self.links[k].sheets;
+                external_prefix(k + 1, sheets.get(usize::try_from(first).ok()?)?)
+            }
+            _ => None,
         }
-        let name = |i: i32| self.sheets.get(usize::try_from(i).ok()?).cloned();
-        Some(sheet_prefix(&name(first)?, &name(last)?))
     }
     fn name(&self, index: u32) -> Option<String> {
         Some(self.names.get(index.checked_sub(1)? as usize)?.0.clone())
@@ -161,12 +182,12 @@ impl Names for Globals {
                     Some(format!("{}{name}", self.xti(ixti)?))
                 }
             }
-            // A function name of the whole book (first sheet -2), as the
-            // `.xlsx` spells it: `[1]!EUROCONVERT`. One scoped to a sheet of
-            // the book, or a range or constant name, isn't read.
+            // A name of the whole book (first sheet -2), as the `.xlsx`
+            // spells it: `[1]!EUROCONVERT`, `[1]!Prices`. A reference to a
+            // name scoped to a sheet of the book isn't read.
             Book::External(Some(k)) if first == -2 => {
                 let name = self.links[k].names.get(index.checked_sub(1)? as usize)?;
-                Some(format!("[{}]!{}", k + 1, name.as_ref()?))
+                Some(format!("[{}]!{}", k + 1, name.as_ref()?.name))
             }
             Book::AddIn(ref names) => names.get(index.checked_sub(1)? as usize)?.clone(),
             Book::External(_) => None,
@@ -274,56 +295,101 @@ fn rels(zip: &ZipArchive, part: &str) -> HashMap<String, (String, String)> {
 }
 
 /// The external link part `part` of a BrtSupBookSrc: the book's rel, sheet
-/// names and names (BrtBeginSupBook, BrtSupTabs, BrtSupNameStart) and the
-/// part's relationships. `None` unless it is a workbook's (`sbt` 0, not DDE
-/// or OLE) whose rel is there and which has a function name: only a
-/// function name makes a formula refer to the book in a way the import
-/// keeps, and it keeps nothing else of it.
+/// names, names and cached cells, and the part's relationships. `None`
+/// unless it is a workbook's (`sbt` 0, not DDE or OLE) whose rel is there
+/// (#888, #903).
 ///
-/// A name is a function (an add-in's, such as EUROCONVERT) when its
-/// BrtSupNameFmla holds no tokens (`cce` 0, as Excel writes EUROTOOL.XLAM's
-/// names). A workbook's range or constant name has its definition there
-/// (`Prices`: ptgArea3d, `Half`: `#REF!`) and the book's cells cached
-/// beside it, neither of which the import reads, so such a name is `None`;
-/// so is one with the record missing or cut short.
-fn read_link(zip: &ZipArchive, part: &str) -> Option<ExternalLink> {
-    let bytes = zip.read(part)?;
+/// Every name (BrtSupNameStart) is kept, with its definition from the
+/// BrtSupNameFmla after it: none for a function (`cce` 0, as Excel writes
+/// EUROTOOL.XLAM's names), the `refersTo` [`ext_definition`] reads for a
+/// range or constant name (`Prices`: an area, `Half`: `#REF!`), and none
+/// when the record is missing, cut short or of another shape. Its scope
+/// (in BrtSupNameBits) isn't read: no file shows it, so every name is the
+/// book's. A name that can't be read is `None`, keeping its place.
+///
+/// The cached cells are the BrtExternTableStart blocks: the sheet, then
+/// rows (BrtExternRowHdr) of cells. A blank is left out, as is a cell cut
+/// short, off the grid or on a sheet the book doesn't list. Each cell kept
+/// is charged to `book`'s cell budget as it is read, so a crafted part is
+/// refused (the error) before its cache outgrows the budget.
+fn read_link(
+    zip: &ZipArchive,
+    part: &str,
+    book: &mut BookIn,
+) -> Result<Option<ExternalLink>, OpenError> {
+    let Some(bytes) = zip.read(part) else {
+        return Ok(None);
+    };
     let mut link = ExternalLink::default();
     let mut workbook = false;
-    // The latest BrtSupNameStart's name, until its BrtSupNameFmla.
-    let mut pending: Option<String> = None;
+    // The sheet and row the cached cells go in.
+    let (mut sheet, mut row): (Option<u32>, Option<u32>) = (None, None);
+    let mut over: Option<OpenError> = None;
     for (ty, body) in records(&bytes) {
         let mut c = Cur::new(body);
-        match ty {
-            BRT_BEGIN_SUP_BOOK => {
-                workbook = c.u16()? == 0;
-                link.book = c.wide()?;
-            }
-            BRT_SUP_TABS => {
-                for _ in 0..c.u32()? {
-                    link.sheets.push(c.wide()?);
+        let _ = (|| -> Option<()> {
+            match ty {
+                BRT_BEGIN_SUP_BOOK => {
+                    workbook = c.u16()? == 0;
+                    link.book = c.wide()?;
                 }
-            }
-            // Every name takes its place: ptgNameX counts them all.
-            BRT_SUP_NAME_START => {
-                pending = c.wide();
-                link.names.push(None);
-            }
-            BRT_SUP_NAME_FMLA => {
-                if let (Some(name), Some(0)) = (pending.take(), c.u32()) {
-                    if let Some(slot) = link.names.last_mut() {
-                        *slot = Some(name);
+                BRT_SUP_TABS => {
+                    for _ in 0..c.u32()? {
+                        link.sheets.push(c.wide()?);
                     }
                 }
+                // Every name takes its place: ptgNameX counts them all.
+                BRT_SUP_NAME_START => {
+                    link.names.push(None);
+                    *link.names.last_mut()? = Some(ExtName::function(c.wide()?));
+                }
+                BRT_SUP_NAME_FMLA => {
+                    let cce = c.u32()? as usize;
+                    let rgce = c.take(cce)?;
+                    let refers_to = ext_definition(rgce, &link.sheets);
+                    link.names.last_mut()?.as_mut()?.refers_to = refers_to;
+                }
+                BRT_EXTERN_TABLE_START => {
+                    sheet = Some(c.u32()?);
+                    row = None;
+                }
+                BRT_EXTERN_TABLE_END => (sheet, row) = (None, None),
+                BRT_EXTERN_ROW_HDR => row = Some(c.u32()?),
+                BRT_EXTERN_CELL_BLANK..=BRT_EXTERN_CELL_STRING => {
+                    let (s, r) = (sheet?, row?);
+                    let col = c.u32()?;
+                    let value = match ty {
+                        BRT_EXTERN_CELL_REAL => ExtValue::Num(c.f64()?),
+                        BRT_EXTERN_CELL_BOOL => ExtValue::Bool(c.u8()? != 0),
+                        BRT_EXTERN_CELL_ERROR => ExtValue::Err(biff_error(c.u8()?)),
+                        BRT_EXTERN_CELL_STRING => ExtValue::Str(c.wide()?),
+                        _ => return None,
+                    };
+                    if (s as usize) >= link.sheets.len() || !on_grid(r, col) {
+                        return None;
+                    }
+                    if !link.cache.contains_key(&(s, r, col)) {
+                        if let Err(e) = book.charge_cells(1) {
+                            over = Some(e);
+                            return None;
+                        }
+                    }
+                    link.cache.insert((s, r, col), value);
+                }
+                _ => {}
             }
-            _ => {}
+            Some(())
+        })();
+        if let Some(e) = over {
+            return Err(e);
         }
     }
-    let bytes = zip.read(&rels_part_name(part))?;
+    let Some(bytes) = zip.read(&rels_part_name(part)) else {
+        return Ok(None);
+    };
     link.rels = parse_rels_mode(&String::from_utf8_lossy(&bytes));
     let named = link.rels.iter().any(|(id, ..)| *id == link.book);
-    let functions = link.names.iter().any(Option::is_some);
-    (workbook && named && functions).then_some(link)
+    Ok((workbook && named).then_some(link))
 }
 
 /// Read an `.xlsb` package.
@@ -352,6 +418,8 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
     // Each external link part read so far: its place in `g.links`.
     let mut link_of: HashMap<String, Option<usize>> = HashMap::new();
     let mut too_many_links = false;
+    // A link part whose cache outgrew the cell budget.
+    let mut link_err: Option<OpenError> = None;
     for (ty, body) in records(&wb) {
         let mut c = Cur::new(body);
         let _ = (|| -> Option<()> {
@@ -367,20 +435,26 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
                 BRT_SUP_SELF | BRT_SUP_SAME => g.books.push(Book::Own),
                 BRT_SUP_BOOK_SRC => {
                     // Links are numbered in the order of the books that
-                    // have one: those with a function name. That is
-                    // Excel's `[k]` unless a book without one comes first
-                    // (one only cells refer to, or whose range or constant
-                    // names formulas call, neither imported): then the
-                    // numbers differ from Excel's but still name the links
-                    // this import writes. A part several books name is
-                    // read once and is one link.
+                    // have one: every workbook's whose part is read. That
+                    // is Excel's `[k]` unless a book without one (DDE, OLE,
+                    // a part missing) comes first: then the numbers differ
+                    // from Excel's but still name the links this import
+                    // writes. A part several books name is read once and
+                    // is one link.
                     let part = c.wide().and_then(|rid| rel.get(&rid));
                     let k = match part {
                         None => None,
                         Some((_, part)) => match link_of.get(part) {
                             Some(&k) => k,
                             None => {
-                                let k = match read_link(zip, part) {
+                                let read = match read_link(zip, part, &mut book) {
+                                    Ok(l) => l,
+                                    Err(e) => {
+                                        link_err = Some(e);
+                                        None
+                                    }
+                                };
+                                let k = match read {
                                     Some(_) if g.links.len() >= book.limits.links => {
                                         too_many_links = true;
                                         None
@@ -440,6 +514,9 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
             "too many external links (more than {})",
             book.limits.links
         )));
+    }
+    if let Some(e) = link_err {
+        return Err(e);
     }
 
     let sst: Vec<String> = zip
@@ -1226,8 +1303,8 @@ mod tests {
     }
 
     /// ptgNameX into another book's function name reads `[k]!NAME`, `k`
-    /// counting the books that have a function name: one without (the
-    /// first) gets no link.
+    /// counting the books whose parts are read: one with no names (the
+    /// first) is a link too, as Excel keeps it (#903).
     #[test]
     fn name_x_into_an_external_book_is_numbered_and_qualified() {
         let src = |rid: &str| rec(BRT_SUP_BOOK_SRC, &wide(rid));
@@ -1258,19 +1335,21 @@ mod tests {
             ],
         ));
         let c = &book.sheets[0].cells;
-        assert_eq!(c[&(0, 0)].formula.as_deref(), Some("[1]!ONE"));
-        assert_eq!(c[&(0, 1)].formula.as_deref(), Some("[2]!EUROCONVERT(2)"));
+        assert_eq!(c[&(0, 0)].formula.as_deref(), Some("[2]!ONE"));
+        assert_eq!(c[&(0, 1)].formula.as_deref(), Some("[3]!EUROCONVERT(2)"));
         let links = &book.external_links;
-        assert_eq!(links.len(), 2);
-        assert_eq!(links[0].names, [Some("ONE".to_string())]);
-        assert_eq!(links[1].book, "rId1");
-        assert_eq!(links[1].sheets, ["1028", "1030"]);
+        assert_eq!(links.len(), 3);
+        assert_eq!(links[0].sheets, ["S"]);
+        assert!(links[0].names.is_empty());
+        assert_eq!(links[1].names, [Some("ONE".into())]);
+        assert_eq!(links[2].book, "rId1");
+        assert_eq!(links[2].sheets, ["1028", "1030"]);
         assert_eq!(
-            links[1].names,
-            [Some("X".to_string()), Some("EUROCONVERT".to_string())]
+            links[2].names,
+            [Some("X".into()), Some("EUROCONVERT".into())]
         );
         assert_eq!(
-            links[1].rels,
+            links[2].rels,
             [(
                 "rId1".to_string(),
                 "http://schemas.microsoft.com/office/2006/relationships/xlExternalLinkPath/xlLibrary".to_string(),
@@ -1368,13 +1447,15 @@ mod tests {
         assert!(book.external_links.is_empty());
     }
 
-    /// Only a function name (no tokens in its BrtSupNameFmla) is read: a
-    /// range or constant name of the book, or one whose definition is
-    /// missing or cut short, keeps its place among the names but gives no
-    /// formula, and only function names are written. A book with no
-    /// function name gets no link.
+    /// Every name of an external book is read (#903): a function name (no
+    /// tokens in its BrtSupNameFmla), a range or constant name with the
+    /// `refersTo` its definition spells (`Prices` and `Half` as Excel wrote
+    /// them), and one whose definition is missing, cut short or of another
+    /// shape with none. A book with no function name is a link too. Its
+    /// cached cells are kept, a blank, a sheet the book doesn't list and a
+    /// cell off the grid left out.
     #[test]
-    fn only_function_names_of_an_external_book_are_read() {
+    fn every_name_and_cached_cell_of_an_external_book_is_read() {
         let src = |rid: &str| rec(BRT_SUP_BOOK_SRC, &wide(rid));
         let name = |n: &str, fmla: Option<&[u8]>| {
             let mut v = rec(BRT_SUP_NAME_START, &wide(n));
@@ -1383,8 +1464,14 @@ mod tests {
             }
             v
         };
-        // Excel's: Prices = ptgArea3d, Half = #REF!.
-        let prices: &[u8] = &[13, 0, 0, 0, 0x3B, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+        let cell = |ty: u32, col: u32, value: &[u8]| {
+            let mut b = col.to_le_bytes().to_vec();
+            b.extend_from_slice(value);
+            rec(ty, &b)
+        };
+        // Excel's (corpus/legacy/addin/ext-name.xlsb): Prices = 'P'!$A$1:$A$2,
+        // Half = #REF!.
+        let prices: &[u8] = &[13, 0, 0, 0, 0x3B, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0];
         let half: &[u8] = &[2, 0, 0, 0, 0x1C, 0x17];
         let mut part = link_part(0, "rId1", &["P"], &["F"]);
         part.extend(name("Prices", Some(prices)));
@@ -1392,6 +1479,24 @@ mod tests {
         part.extend(name("Missing", None));
         part.extend(name("Cut", Some(&[0, 0])));
         part.extend(name("G", Some(&[0; 4])));
+        part.extend(name("Int", Some(&[3, 0, 0, 0, 0x1E, 1, 0])));
+        part.extend(rec(BRT_EXTERN_TABLE_START, &[0, 0, 0, 0, 0]));
+        part.extend(rec(BRT_EXTERN_ROW_HDR, &0u32.to_le_bytes()));
+        part.extend(cell(BRT_EXTERN_CELL_REAL, 0, &3.0f64.to_le_bytes()));
+        part.extend(cell(BRT_EXTERN_CELL_STRING, 1, &wide("a&b")));
+        part.extend(rec(BRT_EXTERN_ROW_HDR, &1u32.to_le_bytes()));
+        part.extend(cell(BRT_EXTERN_CELL_BOOL, 0, &[1]));
+        part.extend(cell(BRT_EXTERN_CELL_ERROR, 1, &[0x2A]));
+        part.extend(cell(BRT_EXTERN_CELL_BLANK, 2, &[]));
+        part.extend(cell(BRT_EXTERN_CELL_REAL, 20_000, &1.0f64.to_le_bytes()));
+        part.extend(cell(BRT_EXTERN_CELL_REAL, 3, &[0, 0]));
+        part.extend(rec(BRT_EXTERN_TABLE_END, &[]));
+        // A cell outside any table, then a sheet the book doesn't list.
+        part.extend(cell(BRT_EXTERN_CELL_REAL, 0, &9.0f64.to_le_bytes()));
+        part.extend(rec(BRT_EXTERN_TABLE_START, &[5, 0, 0, 0, 0]));
+        part.extend(rec(BRT_EXTERN_ROW_HDR, &0u32.to_le_bytes()));
+        part.extend(cell(BRT_EXTERN_CELL_REAL, 0, &9.0f64.to_le_bytes()));
+        part.extend(rec(BRT_EXTERN_TABLE_END, &[]));
         let mut ranges = link_part(0, "rId1", &["P"], &[]);
         ranges.extend(name("Prices", Some(prices)));
         let book = open(&xlsb_links(
@@ -1416,26 +1521,182 @@ mod tests {
         let got: Vec<Option<&str>> = (0..7).map(|col| c[&(0, col)].formula.as_deref()).collect();
         assert_eq!(
             got,
-            [Some("[1]!F"), None, None, None, None, Some("[1]!G"), None]
+            [
+                Some("[1]!F"),
+                Some("[1]!Prices"),
+                Some("[1]!Half"),
+                Some("[1]!Missing"),
+                Some("[1]!Cut"),
+                Some("[1]!G"),
+                Some("[2]!Prices")
+            ]
         );
         for col in 0..7 {
             assert_eq!(c[&(0, col)].value, CellValue::Number(col as f64 + 1.0));
         }
-        assert_eq!(book.external_links.len(), 1);
+        assert_eq!(book.external_links.len(), 2);
         let pkg = book.build();
-        let link = String::from_utf8(
-            pkg.part("xl/externalLinks/externalLink1.xml")
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
+        let link = |k: usize| {
+            String::from_utf8(
+                pkg.part(&format!("xl/externalLinks/externalLink{k}.xml"))
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap()
+        };
         assert!(
-            link.contains(
-                r#"<definedNames><definedName name="F"/><definedName name="G"/></definedNames>"#
-            ),
-            "{link}"
+            link(1).contains(concat!(
+                r#"<definedNames><definedName name="F"/>"#,
+                r#"<definedName name="Prices" refersTo="='P'!$A$1:$A$2"/>"#,
+                r##"<definedName name="Half" refersTo="#REF!"/>"##,
+                r#"<definedName name="Missing"/><definedName name="Cut"/>"#,
+                r#"<definedName name="G"/><definedName name="Int"/></definedNames>"#,
+                r#"<sheetDataSet><sheetData sheetId="0">"#,
+                r#"<row r="1"><cell r="A1"><v>3</v></cell><cell r="B1" t="str"><v>a&amp;b</v></cell></row>"#,
+                r##"<row r="2"><cell r="A2" t="b"><v>1</v></cell><cell r="B2" t="e"><v>#N/A</v></cell></row>"##,
+                r#"</sheetData></sheetDataSet></externalBook>"#,
+            )),
+            "{}",
+            link(1)
         );
-        assert!(pkg.part("xl/externalLinks/externalLink2.xml").is_none());
+        assert!(
+            link(2).contains(r#"<definedNames><definedName name="Prices" refersTo="='P'!$A$1:$A$2"/></definedNames></externalBook>"#),
+            "{}",
+            link(2)
+        );
+    }
+
+    /// References into a linked book's sheets (#903), as in the `.xls`:
+    /// ptgRef3d and ptgArea3d of each class through an XTI naming one of
+    /// its sheets, spelled as Excel's `.xlsx` spells them, and
+    /// ptgRefErr3d/ptgAreaErr3d keeping the sheet. A span over its sheets,
+    /// a sheet it doesn't list, a book whose part isn't read and one that
+    /// isn't a workbook's (`sbt` 1, DDE) keep only their values. A defined
+    /// name referring to it is kept too.
+    #[test]
+    fn references_into_a_linked_book_keep_the_book_and_sheet() {
+        let src = |rid: &str| rec(BRT_SUP_BOOK_SRC, &wide(rid));
+        let ref3d = |ptg: u8, ixti: u16, row: u32, col: u16| {
+            let mut f = vec![ptg];
+            f.extend(ixti.to_le_bytes());
+            f.extend(row.to_le_bytes());
+            f.extend(col.to_le_bytes());
+            f
+        };
+        let mut area = vec![0x5B, 0, 0];
+        area.extend(0u32.to_le_bytes());
+        area.extend(1u32.to_le_bytes());
+        area.extend([0, 0, 1, 0]);
+        let mut ref_err = vec![0x3C, 0, 0];
+        ref_err.extend([0; 6]);
+        let mut area_err = vec![0x3D, 1, 0];
+        area_err.extend([0; 12]);
+        let my_ref = ref3d(0x3A, 0, 0, 0);
+        let mut name = 0u32.to_le_bytes().to_vec();
+        name.push(0);
+        name.extend(0xFFFF_FFFFu32.to_le_bytes());
+        name.extend(wide("MyRef"));
+        name.extend((my_ref.len() as u32).to_le_bytes());
+        name.extend(&my_ref);
+        name.extend(0u32.to_le_bytes());
+        let book = open(&xlsb_links(
+            &[
+                src("rId2"),
+                src("rId9"),
+                src("rId3"),
+                rec(BRT_SUP_SELF, &[]),
+                extern_sheet(&[
+                    (0, 0, 0),
+                    (0, 1, 1),
+                    (0, 0, 1),
+                    (0, -1, -1),
+                    (0, 2, 2),
+                    (1, 0, 0),
+                    (2, 0, 0),
+                ]),
+                rec(BRT_NAME, &name),
+            ],
+            &[
+                rec(BRT_ROW_HDR, &0u32.to_le_bytes()),
+                fmla_num(0, 0.0, &ref3d(0x3A, 0, 0, 0xC000)),
+                fmla_num(1, 1.0, &area),
+                fmla_num(2, 2.0, &ref3d(0x7A, 1, 0, 0)),
+                fmla_num(3, 3.0, &ref_err),
+                fmla_num(4, 4.0, &area_err),
+                fmla_num(5, 5.0, &ref3d(0x3A, 2, 0, 0)),
+                fmla_num(6, 6.0, &ref3d(0x3A, 3, 0, 0)),
+                fmla_num(7, 7.0, &ref3d(0x3A, 4, 0, 0)),
+                fmla_num(8, 8.0, &ref3d(0x3A, 5, 0, 0)),
+                fmla_num(9, 9.0, &ref3d(0x3A, 6, 0, 0)),
+            ],
+            &[
+                (
+                    "rId2",
+                    link_part(0, "rId1", &["P", "My Sheet"], &[]),
+                    LINK_RELS,
+                ),
+                ("rId3", link_part(1, "rId1", &["P"], &[]), LINK_RELS),
+            ],
+        ));
+        let c = &book.sheets[0].cells;
+        let got: Vec<Option<&str>> = (0..10).map(|col| c[&(0, col)].formula.as_deref()).collect();
+        assert_eq!(
+            got,
+            [
+                Some("[1]P!A1"),
+                Some("[1]P!$A$1:$B$2"),
+                Some("'[1]My Sheet'!$A$1"),
+                Some("[1]P!#REF!"),
+                Some("'[1]My Sheet'!#REF!"),
+                None,
+                None,
+                None,
+                None,
+                None
+            ]
+        );
+        for col in 0..10 {
+            assert_eq!(c[&(0, col)].value, CellValue::Number(col as f64));
+        }
+        assert_eq!(book.names[0].formula, "[1]P!$A$1");
+        assert_eq!(book.external_links.len(), 1);
+    }
+
+    /// A link part's cached cells count against the cell budget as they
+    /// are read (#903 r1): past it the workbook is refused; cells of a
+    /// sheet the book doesn't list are neither kept nor charged, and a cell
+    /// cached twice is charged once.
+    #[test]
+    fn a_link_parts_cache_is_budgeted() {
+        let part = |itab: u8| {
+            let mut v = link_part(0, "rId1", &["P"], &["F"]);
+            v.extend(rec(BRT_EXTERN_TABLE_START, &[itab, 0, 0, 0, 0]));
+            v.extend(rec(BRT_EXTERN_ROW_HDR, &0u32.to_le_bytes()));
+            for col in [0u32, 1, 2, 2] {
+                let mut b = col.to_le_bytes().to_vec();
+                b.extend(1.0f64.to_le_bytes());
+                v.extend(rec(BRT_EXTERN_CELL_REAL, &b));
+            }
+            v.extend(rec(BRT_EXTERN_TABLE_END, &[]));
+            v
+        };
+        let file = |itab: u8| {
+            xlsb_links(
+                &[rec(BRT_SUP_BOOK_SRC, &wide("rId2"))],
+                &[],
+                &[("rId2", part(itab), LINK_RELS)],
+            )
+        };
+        let limits = |cells| Limits {
+            cells,
+            ..Limits::default()
+        };
+        let read =
+            |itab: u8, cells| read_with(&ZipArchive::open(&file(itab)).unwrap(), limits(cells));
+        let err = read(0, 2).err().unwrap();
+        assert!(err.to_string().contains("too many cells"), "{err}");
+        assert_eq!(read(0, 3).unwrap().external_links[0].cache.len(), 3);
+        assert!(read(5, 0).unwrap().external_links[0].cache.is_empty());
     }
 
     /// Books naming the same link part are one link, read once, however
