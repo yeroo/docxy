@@ -35,6 +35,7 @@ mod ptg_write;
 mod xls;
 mod xls_write;
 mod xlsb;
+mod xlsb_style;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -1057,27 +1058,6 @@ impl<'a> Le<'a> {
     }
 }
 
-/// An `.xlsb`'s number formats as its xfs use them (the `.xls` reader
-/// reads whole XFs, see `xls::Styles`): each xf's format id, and the file's
-/// own format codes by id.
-#[derive(Default)]
-pub(crate) struct XfFormats {
-    pub(crate) xf_fmt: Vec<u16>,
-    pub(crate) codes: HashMap<u16, String>,
-}
-
-impl XfFormats {
-    /// The `book.xfs` index of xf `xf`'s number format alone
-    /// ([`format_code`]).
-    pub(crate) fn format_of(&self, xf: u32, book: &mut BookIn) -> u32 {
-        let ifmt = self.xf_fmt.get(xf as usize).copied().unwrap_or(0);
-        match format_code(&self.codes, ifmt) {
-            Some(code) => book.format_index(&code),
-            None => 0,
-        }
-    }
-}
-
 /// The number format code of format id `ifmt` (BIFF8 and BIFF12 alike):
 /// the file's own code for it, else the built-in one; `None` for General.
 pub(crate) fn format_code(codes: &HashMap<u16, String>, ifmt: u16) -> Option<String> {
@@ -1173,6 +1153,24 @@ pub(crate) fn biff_error(code: u8) -> &'static str {
 /// for ids below 164).
 pub(crate) fn builtin_format(id: u32) -> Option<String> {
     crate::numfmt::builtin_code(id).map(str::to_string)
+}
+
+/// Whether cell format `style` of `pkg` is a thin box: the model's
+/// `border`, or a loaded `<xf>` whose `<border>` is one (the `.xlsx` loader
+/// keeps the border element through [`Xf::loaded_from`] and never sets
+/// `border`). For the round-trip tests of the imports (#884).
+#[cfg(test)]
+pub(crate) fn saved_thin_box(pkg: &SheetPackage, style: u32) -> bool {
+    let xf = pkg.workbook.styles.xf(style);
+    let extras = pkg
+        .part(pkg.styles_part_name())
+        .map(|b| crate::xlsx::loaded_xf_extras(&String::from_utf8_lossy(b)))
+        .unwrap_or_default();
+    xf.border
+        || xf
+            .loaded_from
+            .and_then(|k| extras.get(k as usize))
+            .is_some_and(|e| e.thin_box)
 }
 
 #[cfg(test)]

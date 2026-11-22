@@ -12,8 +12,9 @@ use opccore::zip::ZipArchive;
 
 use super::ftab;
 use super::ptg::{self, Base, Biff, Names, Table, utf16};
+use super::xlsb_style::Styles;
 use super::{
-    BookIn, ExternalLink, Le, Limits, OpenError, SheetIn, XfFormats, biff_error, on_grid, rk,
+    BookIn, ColIn, ExternalLink, Le, Limits, OpenError, SheetIn, biff_error, on_grid, rk,
     set_array, sheet_prefix,
 };
 use crate::sheet::{Cell, CellValue, DefinedName};
@@ -21,7 +22,7 @@ use crate::xlsx::{parse_rels, parse_rels_mode, rels_part_name, resolve_relative}
 
 /// The records of a part: (type, body). A record cut off by the end of the
 /// part ends the list.
-fn records(b: &[u8]) -> Vec<(u32, &[u8])> {
+pub(super) fn records(b: &[u8]) -> Vec<(u32, &[u8])> {
     fn varint(b: &[u8], at: &mut usize, max: usize) -> Option<u32> {
         let mut v = 0u32;
         for k in 0..max {
@@ -56,7 +57,7 @@ type Cur<'a> = Le<'a>;
 impl<'a> Le<'a> {
     /// `XLWideString`: a 32-bit count of UTF-16 units. `0xFFFFFFFF` (a null
     /// `XLNullableWideString`) reads as empty.
-    fn wide(&mut self) -> Option<String> {
+    pub(super) fn wide(&mut self) -> Option<String> {
         let n = self.u32()?;
         if n == 0xFFFF_FFFF {
             return Some(String::new());
@@ -64,7 +65,7 @@ impl<'a> Le<'a> {
         Some(utf16(self.take((n as usize).checked_mul(2)?)?))
     }
     /// A parsed formula: `cce`, the tokens, `cb`, the extra data.
-    fn formula(&mut self) -> Option<(&'a [u8], &'a [u8])> {
+    pub(super) fn formula(&mut self) -> Option<(&'a [u8], &'a [u8])> {
         let cce = self.u32()? as usize;
         let rgce = self.take(cce)?;
         let cb = self.u32()? as usize;
@@ -75,8 +76,6 @@ impl<'a> Le<'a> {
 
 const BRT_ROW_HDR: u32 = 0;
 const BRT_NAME: u32 = 39;
-const BRT_FMT: u32 = 44;
-const BRT_XF: u32 = 47;
 const BRT_WB_PROP: u32 = 153;
 const BRT_BUNDLE_SH: u32 = 156;
 const BRT_SST_ITEM: u32 = 19;
@@ -95,8 +94,6 @@ const BRT_SUP_NAME_START: u32 = 577;
 /// A name's definition in an external link part: `cce` and tokens (see
 /// [`read_link`]; corpus/legacy/addin has both kinds).
 const BRT_SUP_NAME_FMLA: u32 = 585;
-const BRT_BEGIN_CELL_XFS: u32 = 617;
-const BRT_END_CELL_XFS: u32 = 618;
 const BRT_SUP_ADDIN: u32 = 667;
 
 /// A BrtName as read, decompiled once every name is known.
@@ -412,33 +409,11 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
         })
         .unwrap_or_default();
 
-    // styles.bin: format codes, and the cell XFs' format ids.
-    let mut fmt_codes: HashMap<u16, String> = HashMap::new();
-    let mut xf_fmt: Vec<u16> = Vec::new();
-    if let Some(b) = zip.read("xl/styles.bin") {
-        let mut in_cell_xfs = false;
-        for (ty, body) in records(&b) {
-            let mut c = Cur::new(body);
-            match ty {
-                BRT_FMT => {
-                    if let (Some(id), Some(code)) = (c.u16(), c.wide()) {
-                        fmt_codes.insert(id, code);
-                    }
-                }
-                BRT_BEGIN_CELL_XFS => in_cell_xfs = true,
-                BRT_END_CELL_XFS => in_cell_xfs = false,
-                BRT_XF if in_cell_xfs => {
-                    let _ = c.u16();
-                    xf_fmt.push(c.u16().unwrap_or(0));
-                }
-                _ => {}
-            }
-        }
-    }
-    let formats = XfFormats {
-        xf_fmt,
-        codes: fmt_codes,
-    };
+    // styles.bin: the cell formats and the differential formats.
+    let mut styles = zip
+        .read("xl/styles.bin")
+        .map(|b| Styles::read(&b))
+        .unwrap_or_default();
 
     // Every table first: a formula may name one on another sheet.
     for (i, part) in parts.iter().enumerate() {
@@ -461,13 +436,10 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
             imported.push(None);
             continue;
         };
-        let cells = read_sheet(&bytes, &g, &sst, &mut book, &formats)?;
+        let mut sheet = read_sheet(&bytes, &g, &sst, &mut book, &mut styles)?;
+        sheet.name = g.sheets[i].clone();
         imported.push(Some(book.sheets.len()));
-        book.push_sheet(SheetIn {
-            name: g.sheets[i].clone(),
-            cells,
-            ..SheetIn::default()
-        })?;
+        book.push_sheet(sheet)?;
     }
 
     for RawName {
@@ -505,14 +477,23 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
 /// data.
 type Group = ((u32, u32, u32, u32), Vec<u8>, Vec<u8>);
 
-/// A sheet part's cells.
+/// BrtColInfo, [MS-XLSB] 2.4 (record id 60).
+const BRT_COL_INFO: u32 = 60;
+/// BrtMergeCell, [MS-XLSB] 2.4 (record id 176).
+const BRT_MERGE_CELL: u32 = 176;
+/// BrtWsFmtInfo, [MS-XLSB] 2.4 (record id 485).
+const BRT_WS_FMT_INFO: u32 = 485;
+
+/// A sheet part: its cells, column widths and merged cells (the name is
+/// the caller's).
 fn read_sheet(
     bytes: &[u8],
     g: &Globals,
     sst: &[String],
     book: &mut BookIn,
-    formats: &XfFormats,
-) -> Result<BTreeMap<(u32, u32), Cell>, OpenError> {
+    styles: &mut Styles,
+) -> Result<SheetIn, OpenError> {
+    let mut sheet = SheetIn::default();
     let mut cells = BTreeMap::new();
     let mut charged = 0usize;
     let mut row = 0u32;
@@ -558,7 +539,7 @@ fn read_sheet(
                     };
                     let mut cell = Cell {
                         value,
-                        style: formats.format_of(style, book),
+                        style: styles.of(style, book),
                         ..Cell::default()
                     };
                     if ty >= 8 {
@@ -578,6 +559,62 @@ fn read_sheet(
                         }
                     }
                     cells.insert((row, col), cell);
+                }
+                // BrtWsFmtInfo: dxGCol (the default width, 1/256
+                // characters, 0xFFFFFFFF for none), cchDefColWidth (the
+                // base width, characters), miyDefRwHeight and flags.
+                BRT_WS_FMT_INFO => {
+                    let dx = c.u32()?;
+                    let base = c.u16()? as u32;
+                    sheet.base_col_width = (base != 8).then_some(base);
+                    // Excel writes the width the base gives (2194 for 8):
+                    // only another one is the sheet's own default.
+                    sheet.default_col_width = u16::try_from(dx)
+                        .ok()
+                        .filter(|&dx| !super::xls::is_default_coldx(sheet.base_col_width, None, dx))
+                        .map(|dx| dx as f64 / 256.0);
+                }
+                // BrtColInfo: colFirst, colLast, coldx (1/256 characters),
+                // ixfe, then flags: fHidden (bit 0), fUserSet (1),
+                // iOutLevel (8-10) and fCollapsed (12). Read as `.xls`'s
+                // COLINFO is: a width at the sheet's default without
+                // fUserSet is no width.
+                BRT_COL_INFO => {
+                    let (first, last, coldx) = (c.u32()?, c.u32()?, c.u32()?);
+                    c.u32()?;
+                    let flags = c.u16()?;
+                    let hidden = flags & 0x0001 != 0;
+                    let user = flags & 0x0002 != 0;
+                    let default = u16::try_from(coldx).is_ok_and(|dx| {
+                        super::xls::is_default_coldx(
+                            sheet.base_col_width,
+                            sheet.default_col_width,
+                            dx,
+                        )
+                    });
+                    let width = (user || !default).then_some(coldx as f64 / 256.0);
+                    let level = ((flags >> 8) & 0x0007) as u8;
+                    let collapsed = flags & 0x1000 != 0;
+                    let last = last.min(crate::sheet::MAX_COLS - 1);
+                    if (width.is_some() || hidden || level > 0 || collapsed) && first <= last {
+                        sheet.cols.push(ColIn {
+                            first,
+                            last,
+                            width,
+                            hidden,
+                            plain: width.is_some() && !user,
+                            level,
+                            collapsed,
+                        });
+                    }
+                }
+                // BrtMergeCell: an RfX (rwFirst, rwLast, colFirst,
+                // colLast).
+                BRT_MERGE_CELL => {
+                    let (r1, r2, c1, c2) = (c.u32()?, c.u32()?, c.u32()?, c.u32()?);
+                    if r2 >= r1 && c2 >= c1 && on_grid(r2, c2) {
+                        sheet.merges.push((r1, c1, r2, c2));
+                    }
                 }
                 BRT_SHR_FMLA | BRT_ARR_FMLA => {
                     let range = (c.u32()?, c.u32()?, c.u32()?, c.u32()?);
@@ -632,7 +669,8 @@ fn read_sheet(
             cell.formula = Some(f);
         }
     }
-    Ok(cells)
+    sheet.cells = cells;
+    Ok(sheet)
 }
 
 #[cfg(test)]
@@ -696,6 +734,17 @@ mod tests {
         sheet: &[Vec<u8>],
         links: &[(&str, Vec<u8>, &str)],
     ) -> Vec<u8> {
+        xlsb_with(workbook, sheet, links, Vec::new())
+    }
+
+    /// [`xlsb_links`] plus `extra` parts (name, bytes): `xl/styles.bin`,
+    /// a sheet's rels and what they name.
+    fn xlsb_with(
+        workbook: &[Vec<u8>],
+        sheet: &[Vec<u8>],
+        links: &[(&str, Vec<u8>, &str)],
+        extra: Vec<(String, Vec<u8>)>,
+    ) -> Vec<u8> {
         let mut bundle = vec![0u8; 8];
         bundle.extend(wide("rId1"));
         bundle.extend(wide("Data"));
@@ -725,6 +774,7 @@ mod tests {
         parts.push(("xl/workbook.bin".to_string(), wb));
         parts.push(("xl/_rels/workbook.bin.rels".to_string(), rels.into_bytes()));
         parts.push(("xl/worksheets/sheet1.bin".to_string(), sheet.concat()));
+        parts.extend(extra);
         opccore::zipwrite::write_zip(&parts)
     }
 
@@ -1331,5 +1381,312 @@ mod tests {
         let (pkg, fmt) = super::super::open_workbook(&bytes).unwrap();
         assert_eq!(fmt, super::super::SourceFormat::Xlsb);
         assert_eq!(pkg.workbook.sheets[0].name, "Data");
+    }
+
+    // --- #884: cell formats, column widths and merges -------------------
+
+    use crate::sheet::Xf;
+
+    use super::super::xlsb_style::{
+        BRT_BEGIN_BORDERS, BRT_BEGIN_CELL_XFS, BRT_BEGIN_FILLS, BRT_BEGIN_FONTS, BRT_BORDER,
+        BRT_END_BORDERS, BRT_END_CELL_XFS, BRT_END_FILLS, BRT_END_FONTS, BRT_FILL, BRT_FMT,
+        BRT_FONT, BRT_XF,
+    };
+
+    /// A BrtColor: automatic, RGB, indexed or theme (fValidRGB set).
+    pub(crate) fn auto_color() -> Vec<u8> {
+        vec![0x01, 0, 0, 0, 0, 0, 0, 0xFF]
+    }
+    pub(crate) fn rgb_color(r: u8, g: u8, b: u8) -> Vec<u8> {
+        vec![(2 << 1) | 1, 0, 0, 0, r, g, b, 0xFF]
+    }
+    pub(crate) fn indexed_color(i: u8) -> Vec<u8> {
+        vec![(1 << 1) | 1, i, 0, 0, 0, 0, 0, 0xFF]
+    }
+    pub(crate) fn theme_color(i: u8) -> Vec<u8> {
+        vec![(3 << 1) | 1, i, 0, 0, 0, 0, 0, 0xFF]
+    }
+
+    /// BrtFont as Excel writes it: dyHeight, grbit, bls, sss, uls,
+    /// bFamily, bCharSet, unused, brtColor, bFontScheme, name.
+    fn font(pt: u16, italic: bool, bold: bool, color: &[u8], name: &str) -> Vec<u8> {
+        let mut v = (pt * 20).to_le_bytes().to_vec();
+        v.extend((if italic { 2u16 } else { 0 }).to_le_bytes());
+        v.extend((if bold { 700u16 } else { 400 }).to_le_bytes());
+        v.extend([0, 0, 0, 2, 1, 0]);
+        v.extend_from_slice(color);
+        v.push(0);
+        v.extend(wide(name));
+        rec(BRT_FONT, &v)
+    }
+
+    /// BrtFill: fls, the foreground and background colours, then the
+    /// gradient fields (68 bytes, as Excel writes them).
+    fn fill(fls: u32, fore: &[u8]) -> Vec<u8> {
+        let mut v = fls.to_le_bytes().to_vec();
+        v.extend_from_slice(fore);
+        v.extend(indexed_color(65));
+        v.extend([0u8; 48]);
+        rec(BRT_FILL, &v)
+    }
+
+    /// BrtBorder: flags, then the top, bottom, left, right and diagonal
+    /// lines' dg, reserved and colour.
+    fn border(dg: [u8; 5]) -> Vec<u8> {
+        let mut v = vec![0u8];
+        for d in dg {
+            v.extend([d, 0]);
+            v.extend(auto_color());
+        }
+        rec(BRT_BORDER, &v)
+    }
+
+    /// BrtXF: ixfeParent, iFmt, iFont, iFill, ixBorder, trot, indent,
+    /// flags, xfGrbitAtr, unused.
+    fn xf(fmt: u16, font: u16, fill: u16, border: u16) -> Vec<u8> {
+        let mut v = 0u16.to_le_bytes().to_vec();
+        for n in [fmt, font, fill, border] {
+            v.extend(n.to_le_bytes());
+        }
+        v.extend([0, 0, 0x10, 0x10, 0, 0]);
+        rec(BRT_XF, &v)
+    }
+
+    /// A list of records between its begin and end records.
+    fn list(begin: u32, end: u32, items: &[Vec<u8>]) -> Vec<u8> {
+        let mut v = rec(begin, &(items.len() as u32).to_le_bytes());
+        for i in items {
+            v.extend_from_slice(i);
+        }
+        v.extend(rec(end, &[]));
+        v
+    }
+
+    /// A styles.bin: Excel's default font 0 (Calibri 11, theme 1) and
+    /// fills 0 and 1, then the fonts, fills, borders and cell XFs given.
+    fn styles(
+        fonts: &[Vec<u8>],
+        fills: &[Vec<u8>],
+        borders: &[Vec<u8>],
+        xfs: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut all_fonts = vec![font(11, false, false, &theme_color(1), "Calibri")];
+        all_fonts.extend_from_slice(fonts);
+        let mut all_fills = vec![fill(0, &indexed_color(64)), fill(17, &indexed_color(64))];
+        all_fills.extend_from_slice(fills);
+        let mut all_borders = vec![border([0; 5])];
+        all_borders.extend_from_slice(borders);
+        let mut all_xfs = vec![xf(0, 0, 0, 0)];
+        all_xfs.extend_from_slice(xfs);
+        let mut fmt = 164u16.to_le_bytes().to_vec();
+        fmt.extend(wide("0.000"));
+        [
+            rec(BRT_FMT, &fmt),
+            list(BRT_BEGIN_FONTS, BRT_END_FONTS, &all_fonts),
+            list(BRT_BEGIN_FILLS, BRT_END_FILLS, &all_fills),
+            list(BRT_BEGIN_BORDERS, BRT_END_BORDERS, &all_borders),
+            list(BRT_BEGIN_CELL_XFS, BRT_END_CELL_XFS, &all_xfs),
+        ]
+        .concat()
+    }
+
+    fn real(col: u32, style: u32, v: f64) -> Vec<u8> {
+        let mut b = cell(col, style);
+        b.extend(v.to_le_bytes());
+        rec(5, &b)
+    }
+
+    /// The model formats of the cells of row 0, by column.
+    fn row0_xfs(book: &BookIn) -> Vec<Xf> {
+        let cells = &book.sheets[0].cells;
+        (0..cells.len() as u32)
+            .map(|c| book.xfs[cells[&(0, c)].style as usize].clone())
+            .collect()
+    }
+
+    /// A BrtXF's font, fill and border become the cell's model format; a
+    /// patterned fill, a medium box and the default font are none of it.
+    #[test]
+    fn xlsb_fonts_fills_borders_into_xfs() {
+        let styles = styles(
+            &[
+                // 1: bold italic red 14pt Arial
+                font(14, true, true, &rgb_color(255, 0, 0), "Arial"),
+                // 2: Calibri 11 in theme colour 4 (accent 1)
+                font(11, false, false, &theme_color(4), "Calibri"),
+                // 3: Calibri 11 in black, as an RGB and indexed 8
+                font(11, false, false, &indexed_color(8), "Calibri"),
+            ],
+            &[
+                // 2: solid yellow; 3: a pattern in yellow; 4: solid theme
+                fill(1, &rgb_color(255, 255, 0)),
+                fill(2, &rgb_color(255, 255, 0)),
+                fill(1, &theme_color(5)),
+            ],
+            &[
+                // 1: a thin box; 2: a medium box; 3: three thin sides
+                border([1, 1, 1, 1, 0]),
+                border([2, 2, 2, 2, 0]),
+                border([1, 1, 1, 0, 0]),
+            ],
+            &[
+                xf(164, 1, 2, 1),
+                xf(0, 0, 3, 2),
+                xf(0, 2, 4, 3),
+                xf(0, 3, 0, 0),
+            ],
+        );
+        let book = open(&xlsb_with(
+            &[],
+            &[
+                rec(BRT_ROW_HDR, &0u32.to_le_bytes()),
+                real(0, 1, 1.0),
+                real(1, 2, 2.0),
+                real(2, 3, 3.0),
+                real(3, 4, 4.0),
+                real(4, 0, 5.0),
+                // A blank cell keeps its format too.
+                rec(1, &cell(5, 1)),
+            ],
+            &[],
+            vec![("xl/styles.bin".to_string(), styles)],
+        ));
+        let x = row0_xfs(&book);
+        assert!(x[0].bold && x[0].italic, "{:?}", x[0]);
+        assert_eq!(x[0].color, Some((255, 0, 0)));
+        assert_eq!(x[0].font_size, Some(14.0));
+        assert_eq!(x[0].font_name.as_deref(), Some("Arial"));
+        assert_eq!(x[0].fill, Some((255, 255, 0)));
+        assert!(x[0].border);
+        assert_eq!(x[0].code.as_deref(), Some("0.000"));
+        // A pattern isn't a solid fill; a medium box isn't a thin one.
+        assert_eq!(
+            (x[1].fill, x[1].fill_unresolved, x[1].border),
+            (None, false, false)
+        );
+        // Theme colours other than the default text colour are unresolved.
+        assert!(x[2].color_unresolved && x[2].fill_unresolved, "{:?}", x[2]);
+        assert_eq!((x[2].color, x[2].fill, x[2].border), (None, None, false));
+        // Black, the default font and the default XF are no format at all.
+        assert_eq!(x[3], Xf::default());
+        assert_eq!(x[4], Xf::default());
+        assert_eq!(book.sheets[0].cells[&(0, 4)].style, 0);
+        assert_eq!(x[5], x[0]);
+        // Each XF is made once.
+        assert_eq!(book.xfs.len(), 3);
+    }
+
+    /// BrtColInfo gives the column widths (a width at the default without
+    /// fUserSet is none), BrtWsFmtInfo the base width, BrtMergeCell merges.
+    #[test]
+    fn xlsb_col_widths_and_merges() {
+        let col_info = |first: u32, last: u32, coldx: u32, flags: u16| {
+            let mut v = first.to_le_bytes().to_vec();
+            v.extend(last.to_le_bytes());
+            v.extend(coldx.to_le_bytes());
+            v.extend(0u32.to_le_bytes());
+            v.extend(flags.to_le_bytes());
+            rec(BRT_COL_INFO, &v)
+        };
+        let mut fmt_info = 2194u32.to_le_bytes().to_vec();
+        fmt_info.extend(8u16.to_le_bytes());
+        fmt_info.extend(300u16.to_le_bytes());
+        fmt_info.extend([0, 0, 0, 0]);
+        let merge = |r1: u32, r2: u32, c1: u32, c2: u32| {
+            let v: Vec<u8> = [r1, r2, c1, c2]
+                .iter()
+                .flat_map(|n| n.to_le_bytes())
+                .collect();
+            rec(BRT_MERGE_CELL, &v)
+        };
+        let book = open(&xlsb(
+            &[],
+            &[
+                rec(BRT_WS_FMT_INFO, &fmt_info),
+                // B:C 20 characters, user set
+                col_info(1, 2, 20 * 256, 0x0002),
+                // D hidden, at the default width
+                col_info(3, 3, 2194, 0x0001),
+                // E at the default width: nothing
+                col_info(4, 4, 2194, 0),
+                // F wide but not user set: a plain width; outline level 1
+                col_info(5, 5, 12 * 256, 0x0100),
+                rec(BRT_ROW_HDR, &0u32.to_le_bytes()),
+                real(0, 0, 1.0),
+                merge(5, 6, 0, 2),
+                // Off the grid, or backwards: left out.
+                merge(0, 0, 3, 16384),
+                merge(4, 2, 0, 0),
+            ],
+        ));
+        let s = &book.sheets[0];
+        assert_eq!(s.base_col_width, None);
+        assert_eq!(s.default_col_width, None);
+        let cols: Vec<_> = s
+            .cols
+            .iter()
+            .map(|c| (c.first, c.last, c.width, c.hidden, c.plain, c.level))
+            .collect();
+        assert_eq!(
+            cols,
+            [
+                (1, 2, Some(20.0), false, false, 0),
+                (3, 3, None, true, false, 0),
+                (5, 5, Some(12.0), false, true, 1),
+            ]
+        );
+        assert_eq!(s.merges, [(5, 0, 6, 2)]);
+    }
+
+    /// The `.xlsb` of [`round_trip_xlsb`]: a formatted cell, a wide
+    /// column and a merge (later slices add to it).
+    fn feature_xlsb() -> Vec<u8> {
+        let styles = styles(
+            &[font(14, true, true, &rgb_color(255, 0, 0), "Arial")],
+            &[fill(1, &rgb_color(255, 255, 0))],
+            &[border([1, 1, 1, 1, 0])],
+            &[xf(0, 1, 2, 1)],
+        );
+        let mut col = 1u32.to_le_bytes().to_vec();
+        col.extend(1u32.to_le_bytes());
+        col.extend((20 * 256u32).to_le_bytes());
+        col.extend(0u32.to_le_bytes());
+        col.extend(2u16.to_le_bytes());
+        let merge: Vec<u8> = [2u32, 3, 0, 1]
+            .iter()
+            .flat_map(|n| n.to_le_bytes())
+            .collect();
+        xlsb_with(
+            &[],
+            &[
+                rec(BRT_COL_INFO, &col),
+                rec(BRT_ROW_HDR, &0u32.to_le_bytes()),
+                real(0, 1, 1.0),
+                rec(BRT_MERGE_CELL, &merge),
+            ],
+            &[],
+            vec![("xl/styles.bin".to_string(), styles)],
+        )
+    }
+
+    /// Opened, saved as `.xlsx` and reloaded, an `.xlsb` keeps what the
+    /// import read (#884: they were lost on save).
+    #[test]
+    fn round_trip_xlsb() {
+        let (pkg, _) = crate::legacy::open_workbook(&feature_xlsb()).unwrap();
+        let back = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        let wb = &back.workbook;
+        let s = &wb.sheets[0];
+        let style = s.cell(0, 0).unwrap().style;
+        let x = wb.styles.xf(style);
+        assert!(x.bold && x.italic, "{x:?}");
+        assert!(crate::legacy::saved_thin_box(&back, style));
+        assert_eq!(x.color, Some((255, 0, 0)));
+        assert_eq!(x.fill, Some((255, 255, 0)));
+        assert_eq!(x.font_size, Some(14.0));
+        assert_eq!(x.font_name.as_deref(), Some("Arial"));
+        let widths: Vec<_> = s.col_defs.iter().map(|d| (d.min, d.max, d.width)).collect();
+        assert_eq!(widths, [(1, 1, Some(20.0))]);
+        assert_eq!(s.merges, [(2, 0, 3, 1)]);
     }
 }
