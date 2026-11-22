@@ -3721,10 +3721,14 @@ impl Engine {
                 // stays a draft where it is (a busy store would refuse the
                 // move too, after another wait), the queued op still sends,
                 // and the syncs after the send (`sync_after_send`) file it.
-                match self.store.mark_sent(&id) {
+                // The local write goes to the row as it is stored now
+                // (#2265): a host may still hold the id the draft had before
+                // a move. The op and the events keep the caller's id.
+                let row_id = self.store.current_id(&id).unwrap_or_else(|_| id.clone());
+                match self.store.mark_sent(&row_id) {
                     Ok(()) => {
                         if let Some(sent_id) = self.sent_items_folder_id() {
-                            let _ = self.store.move_message(&id, &sent_id);
+                            let _ = self.store.move_message(&row_id, &sent_id);
                         }
                     }
                     Err(e) => self.emit(SyncEvent::Error(format!(
@@ -8058,14 +8062,17 @@ impl Engine {
     /// again, in the Drafts folder, or the local sentinel before Drafts has
     /// synced; nothing else of the message changes), emits `SendFailed`, and
     /// reloads Drafts and Sent Items. The revert is exact, so unlike a
-    /// quarantine there is no delta reconverge and no `Error`.
+    /// quarantine there is no delta reconverge and no `Error`. The row is
+    /// the one `id` resolves to now (#2265: a move drained ahead of the
+    /// send re-keyed it); `SendFailed` names `id`, as the op does.
     fn fail_send(&mut self, seq: i64, id: &str, err: &GraphError) {
         self.drop_op(seq);
         // The sync thread resolves the sentinel itself, so `retain_folders`
         // cannot remove it in between (#1886).
         let drafts = self.store.drafts_folder_id().ok();
         if let Some(drafts) = &drafts {
-            let _ = self.store.return_to_drafts(id, drafts);
+            let row_id = self.store.current_id(id).unwrap_or_else(|_| id.to_string());
+            let _ = self.store.return_to_drafts(&row_id, drafts);
         }
         self.emit(SyncEvent::SendFailed {
             id: id.to_string(),
@@ -8080,7 +8087,8 @@ impl Engine {
     }
 
     /// Right after a drain sent the drafts `sent` (the ids their ops
-    /// carried) (#1885): sync Drafts, then Sent Items, each only when stored
+    /// carried; each is resolved to the row it names now, #2265) (#1885):
+    /// sync Drafts, then Sent Items, each only when stored
     /// with a delta link (this never backfills). Drafts first: Graph gives a
     /// sent message a new id in Sent Items, so the Drafts delta's `@removed`
     /// of the draft's id removes the row `SendDraft` re-filed under Sent,
@@ -8106,12 +8114,15 @@ impl Engine {
             }
             if let Some(s) = sent_items {
                 for id in sent {
+                    // The row as it is stored now (#2265): a move drained
+                    // ahead of the send re-keyed it.
+                    let id = self.store.current_id(id).unwrap_or_else(|_| id.clone());
                     let in_drafts = matches!(
-                        self.store.draft(id),
+                        self.store.draft(&id),
                         Ok(Some((row, _))) if row.folder_id == d.id
                     );
                     if in_drafts {
-                        let _ = self.store.move_message(id, &s.id);
+                        let _ = self.store.move_message(&id, &s.id);
                     }
                 }
             }
@@ -35550,6 +35561,360 @@ mod tests {
             );
             let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
             let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // --- A queued SaveDraft or SendDraft follows its draft's move (#2265) --
+
+    /// #2265: a draft's `SaveDraft` / `SendDraft` queued behind its `Move`,
+    /// or sent by the id a host held before the move, reaches the row under
+    /// the id Graph gave it. The queued cases seed the outbox before the
+    /// engine starts (as `moved::queued_moves_by_the_old_id_drain_in_order`
+    /// does) together with the local writes the `Move` and `SendDraft` arms
+    /// make when they queue their ops, so the row starts where those arms
+    /// leave it.
+    mod moved_drafts {
+        use super::*;
+
+        const FOLDERS: &[(&str, &str, Option<&str>)] = &[
+            ("DRF", "Drafts", Some("drafts")),
+            ("DEL", "Deleted Items", Some("deleteditems")),
+            ("SNT", "Sent Items", Some("sentitems")),
+        ];
+
+        fn route(method: &str, path: &str, status: u16, body: &str) -> Route {
+            Route {
+                method: method.into(),
+                path_prefix: path.into(),
+                status,
+                headers: vec![],
+                body: body.into(),
+            }
+        }
+
+        /// `D1` moves to `DM2`, and `DM2` to `DM3`; `DM2` and `DM3` take
+        /// PATCHes, and their `/send` answers `send_status`.
+        fn routes(send_status: u16) -> Vec<(Route, Option<usize>)> {
+            let send_body = if send_status < 300 {
+                ""
+            } else {
+                r#"{"error":{"code":"ErrorInvalidRecipients","message":"no recipients"}}"#
+            };
+            let mut routes = vec![
+                (
+                    route("POST", "/me/messages/D1/move", 200, r#"{"id":"DM2"}"#),
+                    Some(1),
+                ),
+                (
+                    route("POST", "/me/messages/DM2/move", 200, r#"{"id":"DM3"}"#),
+                    Some(1),
+                ),
+            ];
+            for id in ["DM2", "DM3"] {
+                routes.push((
+                    route(
+                        "POST",
+                        &format!("/me/messages/{id}/send"),
+                        send_status,
+                        send_body,
+                    ),
+                    None,
+                ));
+                routes.push((
+                    route("PATCH", &format!("/me/messages/{id}"), 200, "{}"),
+                    None,
+                ));
+            }
+            routes.extend(folder_routes(FOLDERS, &[], &[]));
+            routes
+        }
+
+        /// The three folders and a synced draft `D1` in Drafts, edited
+        /// since its last push (a compose form saved it).
+        fn seed_draft(s: &Store) {
+            for (id, name, well_known) in FOLDERS {
+                s.upsert_folder(&crate::graph::model::MailFolder {
+                    id: (*id).into(),
+                    display_name: (*name).into(),
+                    parent_id: None,
+                    total_count: 0,
+                    unread_count: 0,
+                    well_known_name: well_known.map(str::to_string),
+                })
+                .unwrap();
+            }
+            let local = s
+                .create_local_draft("Hi", "bob@x", "", "<p>first</p>")
+                .unwrap();
+            s.reconcile_id(&local, "D1").unwrap();
+            s.update_draft_fields("D1", "Edited", "bob@x", "", "", "<p>second</p>")
+                .unwrap();
+            assert_eq!(s.draft("D1").unwrap().unwrap().0.folder_id, "DRF");
+        }
+
+        /// What `SyncCommand::Move { D1 -> dest }` leaves: the row re-filed
+        /// and the op queued, both by the id the host had.
+        fn queue_move(s: &Store, dest: &str) {
+            s.move_message("D1", dest).unwrap();
+            s.enqueue_op(&OutboxOp::Move {
+                id: "D1".into(),
+                dest: dest.into(),
+            })
+            .unwrap();
+        }
+
+        /// What `SyncCommand::SendDraft { D1 }` leaves while nothing has
+        /// drained yet: the op queued, the row marked sent and re-filed in
+        /// Sent Items.
+        fn queue_send(s: &Store) {
+            s.enqueue_op(&OutboxOp::SendDraft { id: "D1".into() })
+                .unwrap();
+            s.mark_sent("D1").unwrap();
+            s.move_message("D1", "SNT").unwrap();
+        }
+
+        fn spawn(
+            srv: &FakeServer,
+            tag: &str,
+            seed: impl FnOnce(&Store),
+        ) -> (SyncHandle, PathBuf, PathBuf) {
+            spawn_fast(srv, tag, HOUR, None, |s| {
+                seed_draft(s);
+                seed(s);
+            })
+        }
+
+        fn requests(srv: &FakeServer, method: &str) -> Vec<String> {
+            srv.requests()
+                .into_iter()
+                .filter(|r| r.method == method)
+                .map(|r| r.path)
+                .collect()
+        }
+
+        fn patched_subjects(srv: &FakeServer) -> Vec<(String, Option<String>)> {
+            srv.requests()
+                .into_iter()
+                .filter(|r| r.method == "PATCH")
+                .map(|r| {
+                    let sent = crate::json::parse(&r.body).unwrap();
+                    let subject = sent
+                        .get("subject")
+                        .and_then(crate::json::Value::as_str)
+                        .map(str::to_string);
+                    (r.path, subject)
+                })
+                .collect()
+        }
+
+        /// `(folder, is_draft)` of the row stored as `id`.
+        fn filed(store: &Store, id: &str) -> (String, bool) {
+            let (row, _) = store
+                .draft(id)
+                .unwrap()
+                .unwrap_or_else(|| panic!("no row {id}"));
+            assert_eq!(row.id, id);
+            (row.folder_id, row.is_draft)
+        }
+
+        fn drained(store: &Store) -> bool {
+            wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty())
+        }
+
+        fn shut(handle: SyncHandle, dir: PathBuf) {
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn queued_save_draft_behind_a_move_patches_the_moved_id() {
+            let srv = FakeServer::start_limited(routes(202));
+            let (handle, store_path, dir) = spawn(&srv, "moved-draft-save", |s| {
+                queue_move(s, "DEL");
+                s.enqueue_op(&OutboxOp::SaveDraft { id: "D1".into() })
+                    .unwrap();
+            });
+            let store = Store::open(&store_path).unwrap();
+
+            let mut seen = wait_for(&handle.evt_rx, |e| {
+                *e == SyncEvent::MessageMoved {
+                    old_id: "D1".into(),
+                    new_id: "DM2".into(),
+                }
+            });
+            assert!(drained(&store));
+            seen.extend(handle.evt_rx.try_iter());
+            assert_eq!(requests(&srv, "POST"), ["/me/messages/D1/move"]);
+            assert_eq!(
+                patched_subjects(&srv),
+                [("/me/messages/DM2".to_string(), Some("Edited".to_string()))]
+            );
+            assert_eq!(filed(&store, "DM2"), ("DEL".to_string(), true));
+            assert_eq!(store.local_edit_generation("DM2").unwrap(), 0);
+            no_quarantine(&seen);
+            assert!(
+                !seen
+                    .iter()
+                    .any(|e| matches!(e, SyncEvent::Error(m) if m.contains("no local draft"))),
+                "{seen:?}"
+            );
+
+            shut(handle, dir);
+        }
+
+        #[test]
+        fn queued_send_draft_behind_a_move_sends_the_moved_id() {
+            let srv = FakeServer::start_limited(routes(202));
+            let (handle, store_path, dir) = spawn(&srv, "moved-draft-send", |s| {
+                queue_move(s, "DEL");
+                queue_send(s);
+            });
+            let store = Store::open(&store_path).unwrap();
+
+            let mut seen = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::Sent { .. } | SyncEvent::SendFailed { .. })
+            });
+            assert!(
+                seen.contains(&SyncEvent::Sent { id: "D1".into() }),
+                "{seen:?}"
+            );
+            assert!(drained(&store));
+            seen.extend(handle.evt_rx.try_iter());
+            assert_eq!(
+                requests(&srv, "POST"),
+                ["/me/messages/D1/move", "/me/messages/DM2/send"]
+            );
+            assert_eq!(
+                patched_subjects(&srv),
+                [("/me/messages/DM2".to_string(), Some("Edited".to_string()))]
+            );
+            no_quarantine(&seen);
+
+            shut(handle, dir);
+        }
+
+        #[test]
+        fn queued_send_draft_behind_a_move_that_fails_returns_the_moved_row_to_drafts() {
+            let srv = FakeServer::start_limited(routes(400));
+            let (handle, store_path, dir) = spawn(&srv, "moved-draft-fail", |s| {
+                queue_move(s, "DEL");
+                queue_send(s);
+                // Where the arms leave the row, checked before the engine
+                // starts: once it runs, the drain may re-key it at any time.
+                assert_eq!(filed(s, "D1"), ("SNT".to_string(), false));
+            });
+            let store = Store::open(&store_path).unwrap();
+
+            let seen = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::Sent { .. } | SyncEvent::SendFailed { .. })
+            });
+            assert!(
+                seen.iter().any(|e| matches!(
+                    e,
+                    SyncEvent::SendFailed { id, error } if id == "D1" && error == "no recipients"
+                )),
+                "{seen:?}"
+            );
+            assert_eq!(
+                requests(&srv, "POST").last().unwrap(),
+                "/me/messages/DM2/send"
+            );
+            assert_eq!(filed(&store, "DM2"), ("DRF".to_string(), true));
+            assert!(drained(&store));
+
+            shut(handle, dir);
+        }
+
+        #[test]
+        fn send_draft_by_an_old_id_after_the_move_drained_marks_the_moved_row_sent() {
+            let srv = FakeServer::start_limited(routes(202));
+            let (handle, store_path, dir) = spawn(&srv, "moved-draft-arm", |_| {});
+            let store = Store::open(&store_path).unwrap();
+
+            handle
+                .cmd_tx
+                .send(SyncCommand::Move {
+                    id: "D1".into(),
+                    dest: "DEL".into(),
+                })
+                .unwrap();
+            let mut seen = wait_for(&handle.evt_rx, |e| {
+                *e == SyncEvent::MessageMoved {
+                    old_id: "D1".into(),
+                    new_id: "DM2".into(),
+                }
+            });
+            assert_eq!(filed(&store, "DM2"), ("DEL".to_string(), true));
+
+            // The host still holds the id the draft had before the move.
+            handle
+                .cmd_tx
+                .send(SyncCommand::SendDraft { id: "D1".into() })
+                .unwrap();
+            seen.extend(wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::Sent { .. } | SyncEvent::SendFailed { .. })
+            }));
+            assert!(
+                seen.contains(&SyncEvent::Sending { id: "D1".into() }),
+                "{seen:?}"
+            );
+            assert!(
+                seen.contains(&SyncEvent::Sent { id: "D1".into() }),
+                "{seen:?}"
+            );
+            assert!(drained(&store));
+            // The optimistic write reached the moved row: sent, in Sent Items.
+            assert_eq!(filed(&store, "DM2"), ("SNT".to_string(), false));
+            assert_eq!(
+                requests(&srv, "POST"),
+                ["/me/messages/D1/move", "/me/messages/DM2/send"]
+            );
+            no_quarantine(&seen);
+
+            shut(handle, dir);
+        }
+
+        /// Moved to Deleted Items and back (Undo), then sent, all queued by
+        /// the first id; the send's optimistic re-file never happened (its
+        /// `mark_sent` was refused, #2215), so the row is still a draft in
+        /// Drafts. After the send, `sync_after_send` re-files the row it
+        /// finds in Drafts under Sent Items, by the id it is stored as now.
+        #[test]
+        fn a_send_after_a_move_and_back_is_filed_under_sent_after_the_send() {
+            let srv = FakeServer::start_limited(routes(202));
+            let (handle, store_path, dir) = spawn(&srv, "moved-draft-back", |s| {
+                queue_move(s, "DEL");
+                queue_move(s, "DRF");
+                s.enqueue_op(&OutboxOp::SendDraft { id: "D1".into() })
+                    .unwrap();
+            });
+            let store = Store::open(&store_path).unwrap();
+
+            let mut seen = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::Sent { .. } | SyncEvent::SendFailed { .. })
+            });
+            assert!(
+                seen.contains(&SyncEvent::Sent { id: "D1".into() }),
+                "{seen:?}"
+            );
+            assert!(drained(&store));
+            assert!(wait_until(ENGINE_WAIT, || filed(&store, "DM3").0 == "SNT"));
+            seen.extend(handle.evt_rx.try_iter());
+            assert_eq!(
+                requests(&srv, "POST"),
+                [
+                    "/me/messages/D1/move",
+                    "/me/messages/DM2/move",
+                    "/me/messages/DM3/send"
+                ]
+            );
+            assert_eq!(
+                patched_subjects(&srv),
+                [("/me/messages/DM3".to_string(), Some("Edited".to_string()))]
+            );
+            no_quarantine(&seen);
+
+            shut(handle, dir);
         }
     }
 

@@ -18,7 +18,10 @@
 //! the same reason: `event_input_for` reads the event's currently-stored
 //! fields to build the `EventInput` Graph is sent, and `CreateEvent`
 //! reconciles a `local:` id to its Graph id afterward exactly like
-//! `SaveDraft`/`SendDraft` do for drafts.
+//! `SaveDraft`/`SendDraft` do for drafts. `SaveDraft`/`SendDraft` resolve
+//! their id first too (`Store::current_id`, #2265): a draft moved after its
+//! op was queued (a `Move` to Deleted Items ahead of it) is saved and sent
+//! under the id Graph gave it on the move.
 //!
 //! The message ops (`MarkRead`, `SetFlag`, `SetCategories`, `Move`,
 //! `Delete`, and #2054's `DismissMessageReminder` / `SnoozeMessageReminder`)
@@ -826,7 +829,9 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
 
 /// Sends the draft `id`: `SaveDraft`'s create or PATCH, then each pending
 /// attachment, then the `/send` POST. `seq` is the queued op's outbox row
-/// (`None` for a call outside the outbox, which tracks nothing).
+/// (`None` for a call outside the outbox, which tracks nothing). `id` is
+/// resolved first (`Store::current_id`), so a draft moved after the send
+/// was queued is sent under its new id (#2265).
 ///
 /// With a `seq`, `outbox.send_posted` is set right before the POST (#1874),
 /// so an answer that may follow a delivery (any 5xx, a 429/503 throttle
@@ -872,6 +877,10 @@ pub(crate) fn apply_send(
     progress: &mut dyn FnMut(&OutboundAttachment, u64, u64),
 ) -> Result<(), GraphError> {
     let store_err = |e: crate::store::StoreError| GraphError::Parse(e.to_string());
+    // The draft as it is stored now (#2265): a move queued before this
+    // send re-keyed it to the id Graph gave it.
+    let id = resolve(store, id)?;
+    let id = id.as_str();
     if let Some(seq) = seq
         && store.send_posted(seq).map_err(store_err)?
     {
@@ -1096,9 +1105,11 @@ fn content_type_for(name: &str) -> String {
 /// Ensures the draft addressed by `id` exists on Graph with its
 /// currently-stored fields, returning the id it now lives under on Graph.
 ///
-/// The draft is loaded with `Store::draft`, which also follows a `local:` id
-/// already reconciled to its Graph id (#1884, #1881), and create vs update is
-/// decided by the id it is stored under now (`row.id`), not by `id`. Still
+/// `id` is resolved first (`Store::current_id`): a `local:` id already
+/// reconciled to its Graph id (#1884, #1881), then the latest id a move
+/// gave it (#2265, a `Move` queued ahead of this op). The draft is loaded
+/// with `Store::draft` by that id, and create vs update is decided by the
+/// id it is stored under now (`row.id`), not by `id`. Still
 /// `local:` (never yet pushed): `create_draft`s it with its stored
 /// subject/recipients/body, importance and flag (`draft_options`, #1955)
 /// and reconciles the store (`Store::reconcile_id`)
@@ -1126,16 +1137,27 @@ fn ensure_draft_on_graph(
     store: &Store,
     id: &str,
 ) -> Result<String, GraphError> {
+    // The draft as it is stored now (#2265): an id from before a move (a
+    // `Move` queued ahead of this op) reaches the row Graph re-keyed. The
+    // sync thread resolves and reads, and only it re-keys, so nothing can
+    // land in between.
+    let current = resolve(store, id)?;
     // The unsaved-edit generation is read before the draft (#1871): an edit
     // compose makes after this read bumps it past, so the clear below
     // leaves that edit marked unsaved.
     let generation = store
-        .local_edit_generation(id)
+        .local_edit_generation(&current)
         .map_err(|e| GraphError::Parse(e.to_string()))?;
     let (row, body) = store
-        .draft(id)
+        .draft(&current)
         .map_err(|e| GraphError::Parse(e.to_string()))?
-        .ok_or_else(|| GraphError::Parse(format!("no local draft stored for {id}")))?;
+        .ok_or_else(|| {
+            GraphError::Parse(if current == id {
+                format!("no local draft stored for {id}")
+            } else {
+                format!("no local draft stored for {id} (now {current})")
+            })
+        })?;
     let to = parse_recipients(&row.to_recipients);
     let cc = parse_recipients(&row.cc_recipients);
     let bcc = parse_recipients(&row.bcc_recipients);
@@ -4554,6 +4576,134 @@ mod tests {
                 ("POST", "/me/messages/GRAPH-7/send")
             ]
         );
+    }
+
+    /// A synced draft `D1` (a reconciled `local:` draft, edited since) that
+    /// Graph then moved through `moves`, each `(old, new)` (#2265).
+    fn store_with_moved_draft(moves: &[(&str, &str)]) -> (Store, String) {
+        let store = Store::open_in_memory().unwrap();
+        let local_id = store.create_local_draft("Old", "b@x", "", "old").unwrap();
+        store.reconcile_id(&local_id, "D1").unwrap();
+        store
+            .update_draft_fields("D1", "Edited", "b@x", "", "", "<p>new</p>")
+            .unwrap();
+        for (old, new) in moves {
+            assert!(store.follow_move(old, new).unwrap());
+        }
+        (store, local_id)
+    }
+
+    fn method_paths(srv: &FakeServer) -> Vec<(String, String)> {
+        srv.requests()
+            .into_iter()
+            .map(|r| (r.method, r.path))
+            .collect()
+    }
+
+    fn patched_subject(srv: &FakeServer) -> Option<String> {
+        let reqs = srv.requests();
+        let patch = reqs.iter().find(|r| r.method == "PATCH")?;
+        let sent = json::parse(&patch.body).unwrap();
+        sent.get("subject")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn apply_op_save_draft_of_a_moved_id_patches_the_new_id() {
+        // #2265: a `SaveDraft` queued behind the draft's `Move` (Deleted
+        // Items, say) still names the id it had before the move.
+        let srv = FakeServer::start(vec![
+            route("PATCH", "/me/messages/DM2", 200, "{}"),
+            route("POST", "/me/messages", 201, r#"{"id":"SECOND"}"#),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let (store, _) = store_with_moved_draft(&[("D1", "DM2")]);
+
+        let result = apply_op(&c, &store, &OutboxOp::SaveDraft { id: "D1".into() });
+
+        assert_eq!(result, Ok(Applied::Done));
+        assert_eq!(
+            method_paths(&srv),
+            [("PATCH".to_string(), "/me/messages/DM2".to_string())]
+        );
+        assert_eq!(patched_subject(&srv).as_deref(), Some("Edited"));
+        // The push cleared the moved row's unsaved edit.
+        assert_eq!(store.local_edit_generation("DM2").unwrap(), 0);
+    }
+
+    #[test]
+    fn apply_op_send_draft_of_a_moved_id_sends_the_new_id() {
+        let srv = FakeServer::start(vec![
+            route("POST", "/me/messages/DM2/send", 202, ""),
+            route("PATCH", "/me/messages/DM2", 200, "{}"),
+            route("POST", "/me/messages", 201, r#"{"id":"SECOND"}"#),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let (store, _) = store_with_moved_draft(&[("D1", "DM2")]);
+
+        apply_op(&c, &store, &OutboxOp::SendDraft { id: "D1".into() }).unwrap();
+
+        assert_eq!(
+            method_paths(&srv),
+            [
+                ("PATCH".to_string(), "/me/messages/DM2".to_string()),
+                ("POST".to_string(), "/me/messages/DM2/send".to_string()),
+            ]
+        );
+        assert_eq!(patched_subject(&srv).as_deref(), Some("Edited"));
+    }
+
+    #[test]
+    fn apply_op_save_draft_of_a_twice_moved_id_patches_the_newest_id() {
+        // The Undo the issue is for: the draft moved to Deleted Items and
+        // back, both moves and the save queued by the id the host had.
+        let srv = FakeServer::start(vec![
+            route("PATCH", "/me/messages/DM3", 200, "{}"),
+            route("PATCH", "/me/messages/DM2", 200, "{}"),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let (store, _) = store_with_moved_draft(&[("D1", "DM2"), ("DM2", "DM3")]);
+
+        apply_op(&c, &store, &OutboxOp::SaveDraft { id: "D1".into() }).unwrap();
+
+        assert_eq!(
+            method_paths(&srv),
+            [("PATCH".to_string(), "/me/messages/DM3".to_string())]
+        );
+    }
+
+    #[test]
+    fn apply_op_save_draft_of_a_reconciled_then_moved_local_id_patches_the_moved_id() {
+        let srv = FakeServer::start(vec![
+            route("PATCH", "/me/messages/DM2", 200, "{}"),
+            route("POST", "/me/messages", 201, r#"{"id":"SECOND"}"#),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let (store, local_id) = store_with_moved_draft(&[("D1", "DM2")]);
+
+        apply_op(&c, &store, &OutboxOp::SaveDraft { id: local_id }).unwrap();
+
+        assert_eq!(
+            method_paths(&srv),
+            [("PATCH".to_string(), "/me/messages/DM2".to_string())]
+        );
+    }
+
+    #[test]
+    fn apply_op_save_draft_of_a_moved_id_no_longer_stored_names_both_ids() {
+        let srv = FakeServer::start(vec![]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let (store, _) = store_with_moved_draft(&[("D1", "DM2")]);
+        store.delete_message("DM2").unwrap();
+
+        let err = apply_op(&c, &store, &OutboxOp::SaveDraft { id: "D1".into() }).unwrap_err();
+
+        assert_eq!(
+            err,
+            GraphError::Parse("no local draft stored for D1 (now DM2)".into())
+        );
+        assert!(srv.requests().is_empty());
     }
 
     #[test]

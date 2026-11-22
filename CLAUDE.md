@@ -251,7 +251,8 @@ issue number to find its notes.
   deselected calendar keeping an event with a pending edit until it is
   sent (#2017),
   an edit during an event's in-flight create queued by its reconcile (#2005),
-  lookxy's bounded wait for the engine at quit (#2131).
+  lookxy's bounded wait for the engine at quit (#2131), a queued SaveDraft
+  or SendDraft following its draft's move (#2265).
 
 ## Build and test
 
