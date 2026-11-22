@@ -185,6 +185,8 @@ issue number to find its notes.
   the Contacts folder as records, `is_contact`, contacts created, updated and
   deleted through the outbox, a refused write reported and reverted (#1934, #2063),
   a contact's photo fetched, set through the outbox, no delete on Graph (#2065),
+  contact updates and deletes sent with `If-Match` on the stored changeKey,
+  a 412 reported with Graph's version (#2067),
   cancelling a meeting with a message and forwarding it (#1985),
   a series' occurrences, its master and editing either (#2022),
   a series created with any Graph recurrence (#2034), a pending series'
