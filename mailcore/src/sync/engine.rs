@@ -35564,11 +35564,8 @@ mod tests {
         }
     }
 
-    // --- A moved message follows its new id (#1896) ----------------------
+    // --- A queued SaveDraft or SendDraft follows its draft's move (#2265) --
 
-    /// Engine tests for `follow_move`: Graph answers each move with a new
-    /// id; ids are never prefixes of one another, as `FakeServer` matches
-    /// by prefix, and every test checks the exact path.
     /// #2265: a draft's `SaveDraft` / `SendDraft` queued behind its `Move`,
     /// or sent by the id a host held before the move, reaches the row under
     /// the id Graph gave it. The queued cases seed the outbox before the
@@ -35919,6 +35916,11 @@ mod tests {
         }
     }
 
+    // --- A moved message follows its new id (#1896) ----------------------
+
+    /// Engine tests for `follow_move`: Graph answers each move with a new
+    /// id; ids are never prefixes of one another, as `FakeServer` matches
+    /// by prefix, and every test checks the exact path.
     mod moved {
         use super::*;
 
