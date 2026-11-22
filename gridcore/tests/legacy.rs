@@ -20,7 +20,9 @@ enum Check {
     Value,
     /// (d): the recalculated value.
     Recalc,
-    /// (e): the formula's text; and (c), the formula kept at all.
+    /// (c): the formula kept at all.
+    Kept,
+    /// (e): the formula's text.
     Formula,
     /// (f): the number-format code.
     Format,
@@ -120,7 +122,7 @@ const ALLOW: &[Allow] = &[
         file: "ext-name.xls",
         sheet: "Data",
         cells: &["A1", "A2"],
-        checks: &[Check::Formula],
+        checks: &[Check::Kept],
         why: "the writer can't write an ordinary book's link (#903 Not done)",
     },
 ];
@@ -348,7 +350,7 @@ fn compare_static(file: &str, src: &Workbook, got: &Workbook, errs: &mut Vec<Str
                 ));
             }
             if let (Some(f), None) = (&cell.formula, &mine.formula)
-                && !allowed(file, &sheet.name, &cell_name(r, c), Check::Formula)
+                && !allowed(file, &sheet.name, &cell_name(r, c), Check::Kept)
             {
                 errs.push(format!("{at}: (c) formula ={f} lost"));
             }
