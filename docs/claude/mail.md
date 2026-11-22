@@ -4978,6 +4978,24 @@ already shown it as done.
 - `ComposeReply`/`ComposeForward` stay dropped: Graph builds the draft from the original, so
   nothing the user wrote is lost, and a draft created at the next start would send a
   `DraftReady` and open a compose editor the user did not ask for then.
+- A kept save never replaces a file (#2267). The next start may write it long after the click,
+  and a file may have been made at `dest` meanwhile (a browser download, the user), which
+  `std::fs::write` would truncate. The drain's write (`write_attachment` with `kept`) goes
+  through `write_new_file`: `dest` (for an item, `dest` plus the sniffed extension), then
+  `numbered_sibling`'s `name (1).ext`, `name (2).ext`, … up to `KEPT_SAVE_TRIES` (999), each
+  opened with `create_new` and no separate check, so a file that appears meanwhile is never
+  replaced: `AlreadyExists` moves on, any other error stops. The sibling keeps the stem's dots
+  and splits off only the last extension (`re.meeting (1).eml`, `archive.tar (1).gz`,
+  `README (1)`, `.hidden (1)`). `AttachmentSaved` names the path written. No free name, another
+  error or a name that cannot be numbered is the usual `failed to save attachment to <dest>: …`,
+  with nothing left behind. A kept Save As whose target existed at the click goes beside it
+  too: the engine cannot tell it from the Downloads case, and keeping both loses nothing. The
+  live command still replaces `dest`: the host chose it just now, and Save As asked the user.
+  Tests: `engine.rs` `tests::a_kept_save_never_replaces_a_file_made_at_its_path`,
+  `numbered_sibling_numbers_the_stem`, `write_new_file_never_replaces_a_file`,
+  `write_new_file_fails_without_leaving_a_file`, the live
+  `save_attachment_writes_bytes_and_emits_saved_path` (it replaces a file), and
+  `direct_writes_and_saves_then` (a file made at `report.txt` before the restart).
 - Not done: offline is not made durable (a transport error on the direct path is still an
   `Error`, as before; queuing the three writes then is a follow-up, saves excluded for the
   head-of-line reason above). A crash before the shutdown still loses a command in flight.
