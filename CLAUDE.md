@@ -156,7 +156,9 @@ issue number to find its notes.
   spill output, `CopyReader`'s used-extent bound, `set_cell` never storing
   it (#1660), a cut paste's formulas: source-sheet local names, bare table
   refs, absolute refs in rules left in place, the snapshot's dry run (#1687),
-  `.xls` page setup, page breaks and outlines read and written (#1440).
+  `.xls` page setup, page breaks and outlines read and written (#1440),
+  `.xls`/`.xlsb`/`.ods` formats, widths, merges, comments, validation and
+  conditional formats imported, styled blanks and their cap (#884).
 - `docs/claude/terminal-editors.md`: before changing terminal `docxy`, `xlsxy` or
   `yppxy`, or `backstagecore`'s Save As name field: docxy's Layout tab (#1274), prompts
   editing at a caret (#1372, #1373, #1374, #1375, #1379), Ctrl+C/X/V (#1377, #1378),

@@ -1,6 +1,6 @@
 //! OpenDocument Spreadsheet `.ods`: `content.xml` (the tables, their
-//! cells and names) and `styles.xml` (data styles), read with
-//! [`opccore::xml`].
+//! cells and names, validations and conditional formats) and `styles.xml`
+//! (data styles and cell styles), read with [`opccore::xml`].
 //!
 //! Formulas are OpenFormula (`of:=SUM([.A1:.A3];[Data.B1])`) as Excel and
 //! LibreOffice write it, converted to Excel's syntax: `[.A1]` references,
@@ -12,9 +12,11 @@
 //! something, so padding costs nothing. The copies a repeat that does hold
 //! something adds are charged to a budget ([`super::Limits`]: copies, and
 //! the text and formula bytes they hold) before they are made; a file that
-//! asks for more is refused rather than allowed to exhaust memory. Text in
-//! a cell's annotation or drawn shapes (`office:annotation`, `draw:*`) is
-//! not the cell's value.
+//! asks for more is refused rather than allowed to exhaust memory. An
+//! empty cell kept for its format has its own cap, past which it is left
+//! out, never refused (#884). Text in a cell's annotation or drawn shapes
+//! (`office:annotation`, `draw:*`) is not the cell's value; an annotation
+//! is the cell's comment.
 
 use std::collections::{BTreeMap, HashMap};
 

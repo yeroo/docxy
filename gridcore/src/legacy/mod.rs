@@ -8,10 +8,11 @@
 //! number formats, date system, defined names and the external links that
 //! calls to add-in functions need (`.xlsb`, `.xls`), so everything downstream
 //! (engine, editor, save) sees an ordinary workbook. Nothing the readers don't
-//! model survives the import. The `.xls` reader also reads the formatting the
-//! model holds (fonts, fills, alignment, wrap, borders, merged cells, column
-//! widths, row heights, hidden rows, columns and sheets, frozen panes), and
-//! names what it skipped ([`Opened::dropped`]).
+//! model survives the import. All three read the cell formats the model holds
+//! (fonts, fills, thin borders), column widths, merged cells, comments, data
+//! validation and conditional formats (#884). The `.xls` reader also reads
+//! alignment, wrap, row heights, hidden rows, columns and sheets and frozen
+//! panes, and names what it skipped ([`Opened::dropped`]).
 //!
 //! An `.xls` can be written back too ([`write_xls`], #874): a host in
 //! Excel's Compatibility Mode saves the workbook as BIFF8 again, and names
