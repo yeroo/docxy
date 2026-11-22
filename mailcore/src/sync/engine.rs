@@ -874,8 +874,9 @@ pub enum SyncCommand {
     /// Then, once no older op is queued, the engine pages every message
     /// Graph holds there, received at or before the command's cutoff (the
     /// later of Graph's clock at the command, as last read off its `Date`,
-    /// #2121, and the newest stored message: mail Graph receives later
-    /// stays, however far ahead this client's clock runs). It keeps each one the
+    /// #2121, and the newest stored message: once an answer was measured
+    /// this run, mail Graph receives later stays, however far ahead this
+    /// client's clock runs). It keeps each one the
     /// store shows elsewhere (a move out still unsent or refused, a lost
     /// move answer), and leaves alone the unsent mail still held in the
     /// folder and mail moved into it since; an emptied message stored
@@ -2745,7 +2746,11 @@ struct Engine {
     /// is kept with Graph's clock when it was taken (Unix seconds,
     /// `ServerClock::now_secs`, #2121 r1): a folder-wide op that waited
     /// behind a pass or a drain takes its cutoff from then, not from when
-    /// it runs, so mail delivered meanwhile is not the command's.
+    /// it runs. That bounds the clock part of the cutoff only. Mail the
+    /// pass stores in the folder before the op runs is still taken: by the
+    /// newest-stored max (`folder_cutoff_on`) and by the store's
+    /// whole-folder write (a known shape: bounding those by the take time
+    /// would need its own design).
     deferred: VecDeque<(SyncCommand, i64)>,
     /// The `MarkFolderRead` op being run (#1913; an `EmptyFolder` or
     /// `MoveFolderMessages` too, #2110, #2126): the ids still to mark,
@@ -10264,8 +10269,9 @@ impl Engine {
     /// this client's clock, as before #2121. The `now_utc` of a folder-wide
     /// op's cutoff, taken when the engine took the command off the
     /// channel: `taken` for one kept in `deferred` (#2121 r1), now for one
-    /// handled as it is received. Mail Graph receives after the command
-    /// then stays outside the cutoff whatever this client's clock says.
+    /// handled as it is received. Once an answer was measured this run,
+    /// mail Graph receives after the command stays outside the cutoff
+    /// whatever this client's clock says (the three cases above).
     fn graph_now_utc(&self, taken: Option<i64>) -> String {
         crate::store::unix_secs_to_iso8601(taken.unwrap_or_else(|| self.server_clock.now_secs()))
     }

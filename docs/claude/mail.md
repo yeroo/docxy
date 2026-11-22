@@ -4463,20 +4463,27 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
 ## Folder-op cutoffs on Graph's clock (#2121)
 
 - The `now_utc` that `folder_cutoff_on` takes for `MarkFolderRead`, `EmptyFolder` and
-  `MoveFolderMessages` is `Engine::graph_now_utc`, never this client's raw clock. Mail Graph
-  receives after the command then stays outside `receivedDateTime le`, however far ahead the
-  client clock runs. The max with the newest stored row is unchanged.
+  `MoveFolderMessages` is `Engine::graph_now_utc`, never this client's raw clock. Once an
+  answer was measured this run, mail Graph receives after the command stays outside
+  `receivedDateTime le`, however far ahead the client clock runs (the three cases below). The
+  max with the newest stored row is unchanged.
 - The clock is read when the engine takes the command off the channel, not when it runs it
   (r1 P1). `take_waiting` keeps each command in `deferred` with `ServerClock::now_secs()`, and
   `handle_command_at(cmd, Some(taken))` hands that stamp to `graph_now_utc`. A command that
-  waits behind a pass or a drain still cuts at its take. One the main loop receives and handles
-  at once reads the clock then. The residue is one request in flight: a command sent during a
-  request is taken at the next checkpoint.
+  waits behind a pass or a drain still takes the clock part of its cutoff at its take. One the
+  main loop receives and handles at once reads the clock then. The residue is one request in
+  flight: a command sent during a request is taken at the next checkpoint.
+- Known shape (r2 m1): the stamp bounds only the clock part. The pass a command waits behind can
+  store new mail in the folder before the command runs, and that mail is still taken: the
+  newest-stored max lifts the cutoff to it, and the store's whole-folder write (`empty_folder`'s
+  allow-list and deletes, `mark_folder_read`'s update) covers it. Bounding those by
+  `received_at <= taken` needs its own design, since the newest-stored max exists for an
+  estimate behind Graph's clock.
 - `GraphClient::send` reads `Date` (IMF-fixdate only, `parse_http_date`; another form measures
   nothing) off a **2xx** answer into the engine's `ServerClock`, shared by every client
   `Engine::client()` builds, as `UserIds` is. Only a 2xx: a proxy's or captive portal's own
-  error page carries that box's `Date`. Upload chunks, `put_binary` and the token endpoint
-  (other hosts) measure nothing.
+  error page carries that box's `Date`. `put_binary` (the contact photo PUT, Graph's own base)
+  measures as `send` does. Upload chunks and the token endpoint (other hosts) measure nothing.
 - The offset is `clock_offset`: the receipt rounded **up** to the whole second, minus `Date`.
   `Date` is truncated and stamped before the answer leaves, so a reading taken in this run
   never runs ahead of Graph's clock. The latest reading wins, not the smallest offset, so a stepped client clock
