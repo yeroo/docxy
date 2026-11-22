@@ -1632,6 +1632,22 @@ fn read_sheet(
             }
         }
     }
+    // A rule the build would leave out (its formulas can't move to the
+    // model's anchor: one would leave the grid) is named.
+    if sheet
+        .validations
+        .iter()
+        .any(|v| v.clone().placed().is_none())
+    {
+        book.dropped.insert("data validation");
+    }
+    if sheet
+        .cond_formats
+        .iter()
+        .any(|cf| cf.clone().placed().rules.len() < cf.rules.len())
+    {
+        book.dropped.insert("conditional formatting");
+    }
     // A note whose text wasn't found is named.
     for (rw, col, id, author) in notes {
         match note_text.remove(&id) {
@@ -4197,5 +4213,58 @@ pub(crate) mod tests {
         assert_eq!(crate::validation::invalid_cells(wb, 0, None), [(1, 1)]);
         assert!(crate::cf::cell_dxf(wb, 0, 4, 3).is_some());
         assert!(crate::cf::cell_dxf(wb, 0, 1, 1).is_none());
+    }
+
+    /// A rule whose move to the model's anchor pushes a reference off the
+    /// grid is left out and named, not kept as `#REF!` that every entry
+    /// fails: `=A5>0` based at D5, over D5:D10 and B2:B3, would need the
+    /// column left of A at B2 (#884 r3). A `#REF!` the formula already had
+    /// doesn't stop it moving.
+    #[test]
+    fn xls_a_rule_whose_move_leaves_the_grid_is_left_out() {
+        // ptgRefN (0 rows, -3 columns), relative; ptgInt 0; ptgGt.
+        let left = [0x2C, 0, 0, 0xFD, 0xC0, 0x1E, 0, 0, 0x0D];
+        // ptgRefErr, then ptgInt 0 and ptgGt: `#REF!>0`.
+        let err = [0x2A, 0, 0, 0, 0, 0x1E, 0, 0, 0x0D];
+        let ranges = [(4, 9, 3, 3), (1, 2, 1, 1)];
+        let mut cf = 1u16.to_le_bytes().to_vec();
+        cf.extend(1u16.to_le_bytes());
+        // refBound B2:D10, then the sqref: its CF is based at the anchor
+        // already, so `=A2>0` needs no move.
+        for n in [1u16, 9, 1, 3, 2, 4, 9, 3, 3, 1, 2, 1, 1] {
+            cf.extend(n.to_le_bytes());
+        }
+        let sheet = vec![
+            dv_rec(7, ["", "", "", ""], &left, &[], &ranges),
+            dv_rec(7, ["", "", "", ""], &err, &[], &ranges),
+            rec(0x01B0, &cf),
+            cf_rec(2, 0, &dxfn(None, Some((Some(1), 2))), &left, &[]),
+        ];
+        let stream = workbook(&[], &sheet);
+        let cfb = opccore::cfb::write_cfb_tree(&[opccore::cfb::Node::Stream("Workbook", stream)]);
+        let opened = crate::legacy::open_workbook_ex(&cfb).unwrap();
+        assert_eq!(opened.dropped, ["data validation"]);
+        let s = &opened.pkg.workbook.sheets[0];
+        let kept: Vec<_> = s.validations.iter().map(|v| v.formula1.as_str()).collect();
+        assert_eq!(kept, ["#REF!>0"]);
+        assert_eq!(s.cond_formats.len(), 1);
+
+        // A CF whose move leaves the grid is left out and named too: the
+        // same rule over a block whose refBound is D5 (as a writer that
+        // bounds only the first range would put it).
+        let mut cf = 1u16.to_le_bytes().to_vec();
+        cf.extend(1u16.to_le_bytes());
+        for n in [4u16, 9, 3, 3, 2, 4, 9, 3, 3, 1, 2, 1, 1] {
+            cf.extend(n.to_le_bytes());
+        }
+        let sheet = vec![
+            rec(0x01B0, &cf),
+            cf_rec(2, 0, &dxfn(None, Some((Some(1), 2))), &left, &[]),
+        ];
+        let stream = workbook(&[], &sheet);
+        let cfb = opccore::cfb::write_cfb_tree(&[opccore::cfb::Node::Stream("Workbook", stream)]);
+        let opened = crate::legacy::open_workbook_ex(&cfb).unwrap();
+        assert_eq!(opened.dropped, ["conditional formatting"]);
+        assert!(opened.pkg.workbook.sheets[0].cond_formats.is_empty());
     }
 }

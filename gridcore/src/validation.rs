@@ -985,8 +985,10 @@ fn shift_formulas(dv: &mut DataValidation, dr: i64, dc: i64) {
     }
 }
 
-/// The corner of `ranges` that formulas written for them are relative to.
-fn anchor_of(ranges: &[Rect]) -> (u32, u32) {
+/// The corner of `ranges` that formulas written for them are relative to:
+/// their least row and least column. Conditional formats (`cf`) and the
+/// legacy imports take the same one.
+pub(crate) fn anchor_of(ranges: &[Rect]) -> (u32, u32) {
     ranges
         .iter()
         .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, ..)| {

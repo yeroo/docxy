@@ -279,9 +279,9 @@ pub fn open_workbook_ex(data: &[u8]) -> Result<Opened, OpenError> {
 }
 
 /// What an imported file may make the import allocate. Past any of these
-/// but [`Limits::styled_blanks`] the file is refused
-/// ([`OpenError::Corrupt`]), never silently truncated. Past that one,
-/// further formatted empty cells are left out instead: they hold no value.
+/// but [`Limits::styled_blanks`] and [`Limits::column_walk`] the file is
+/// refused ([`OpenError::Corrupt`]), never silently truncated; past those
+/// two, formatting is left out (they hold no value).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Limits {
     /// Cells across the workbook, every reader ("too many cells"). Far
@@ -300,9 +300,8 @@ pub(crate) struct Limits {
     /// external links").
     pub links: usize,
     /// Empty cells an `.ods` keeps only for their format (#884), across
-    /// the workbook. The one limit that truncates: past it, further ones
-    /// are left out, as they hold no value. That loses formatting, never
-    /// data, and is no error.
+    /// the workbook. Past it, further ones are left out, as they hold no
+    /// value. That loses formatting, never data, and is no error.
     pub styled_blanks: usize,
     /// Column default styles an `.ods` looks up for empty cells without a
     /// style of their own (#884): a run across many columns visits each
@@ -426,7 +425,7 @@ pub(crate) fn placed_dvs(sheet: &SheetIn) -> Vec<crate::sheet::DataValidation> {
 /// differential format it applies, their formulas in Excel's syntax
 /// relative to `base` (the cell the file's format bases them at).
 /// [`BookIn::build`] moves them to the model's anchor.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct CfIn {
     pub ranges: Vec<(u32, u32, u32, u32)>,
     pub rules: Vec<(crate::xlsx::NewCfRule, crate::sheet::Dxf)>,
@@ -438,15 +437,15 @@ pub(crate) struct CfIn {
 /// `validation::anchor_of` and `cf::cell_dxf` take it. `None` for no
 /// ranges.
 pub(crate) fn anchor_of(ranges: &[(u32, u32, u32, u32)]) -> Option<(u32, u32)> {
-    ranges
-        .iter()
-        .map(|&(r1, c1, ..)| (r1, c1))
-        .reduce(|(r, c), (r1, c1)| (r.min(r1), c.min(c1)))
+    (!ranges.is_empty()).then(|| crate::validation::anchor_of(ranges))
 }
 
 /// `f`, its relative references moved from being based at `from` to being
 /// based at `to` (`from` none: they are already); `None` when it must move
-/// and doesn't parse.
+/// and doesn't parse, or when the move pushes a reference off the grid
+/// (`translate_formula` prints it `#REF!`, which every cell would then
+/// see: the rule is better left out). A `#REF!` the formula already had
+/// stays.
 pub(crate) fn rebase(f: &str, from: Option<(u32, u32)>, to: (u32, u32)) -> Option<String> {
     let Some(from) = from.filter(|&b| b != to && !f.is_empty()) else {
         return Some(f.to_string());
@@ -455,7 +454,9 @@ pub(crate) fn rebase(f: &str, from: Option<(u32, u32)>, to: (u32, u32)) -> Optio
         i64::from(to.0) - i64::from(from.0),
         i64::from(to.1) - i64::from(from.1),
     );
-    crate::formula::translate_formula(f, dr, dc)
+    let moved = crate::formula::translate_formula(f, dr, dc)?;
+    let refs = |s: &str| s.matches("#REF!").count();
+    (refs(&moved) <= refs(f)).then_some(moved)
 }
 
 /// One column definition as a reader collects it.
@@ -2071,5 +2072,26 @@ mod tests {
         assert!(pkg.add_cond_formats(0, vec![block(Vec::new())]));
         assert_eq!(pkg.workbook.sheets[0].cond_formats.len(), 1);
         assert_eq!(pkg.workbook.styles.dxfs.len(), before);
+    }
+
+    /// `rebase` refuses a move that pushes a reference off the grid, and
+    /// keeps a `#REF!` the formula already had (#884 r3).
+    #[test]
+    fn rebase_refuses_a_move_off_the_grid() {
+        assert_eq!(rebase("A5>0", Some((4, 3)), (1, 1)), None);
+        assert_eq!(
+            rebase("D5>0", Some((4, 3)), (1, 1)).as_deref(),
+            Some("B2>0")
+        );
+        assert_eq!(
+            rebase("#REF!+D5", Some((4, 3)), (1, 1)).as_deref(),
+            Some("#REF!+B2")
+        );
+        assert_eq!(rebase("#REF!+A5", Some((4, 3)), (1, 1)), None);
+        assert_eq!(
+            rebase("$A$5>0", Some((4, 3)), (1, 1)).as_deref(),
+            Some("$A$5>0")
+        );
+        assert_eq!(rebase("A5", None, (1, 1)).as_deref(), Some("A5"));
     }
 }

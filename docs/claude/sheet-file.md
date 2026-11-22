@@ -322,8 +322,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   anchored at B2). Each reader decodes against the base its format defines
   and records it (`DvIn::base`, `CfIn::base`), and `BookIn::build` moves the
   formulas from there to the anchor (`DvIn::placed`, `CfIn::placed`, with
-  `translate_formula`); a rule whose formula must move and doesn't parse is
-  left out. Then `fix` runs (sheet renames, `file_formula`). The bases:
+  `translate_formula`). A rule whose formula must move and doesn't parse,
+  or whose move pushes a reference off the grid (a new `#REF!`), is left
+  out, and `.xls` names it. Then `fix` runs (sheet renames, `file_formula`). The bases:
   - BIFF8 CF: its CONDFMT's refBound top-left;
   - BIFF12 CF: the ranges' bounds' top-left;
   - BIFF8 DV and BIFF12 BrtDVal: the first range's top-left, as LibreOffice
