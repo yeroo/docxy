@@ -75,7 +75,7 @@ use crate::store::{
     SCOPE_WINDOW, Store, StoreError, SyncedCalendar,
 };
 use crate::sync::outbox::{
-    Applied, NOT_A_MEETING_INVITE, PROPOSALS_REFUSED, apply_op, apply_send,
+    Applied, NOT_A_MEETING_INVITE, PROPOSALS_REFUSED, apply_op, apply_send, create_folder,
     remove_from_calendar_refusal, send_error_text,
 };
 use crate::tokencache;
@@ -8024,7 +8024,8 @@ impl Engine {
     ///
     /// A `SendDraft` goes through `apply_send` with the row's `seq`, so its
     /// `/send` POST is recorded and a later attempt checks delivery first
-    /// (#1874).
+    /// (#1874). A `CreateFolder` goes through `create_folder` with it too,
+    /// so a retry answered 409 adopts the folder its lost POST made (#2109).
     fn apply_op_with_retry(&mut self, row: &OutboxRow) -> Result<Applied, GraphError> {
         // A `SendDraft`'s upload progress (#1941) goes out as it runs, from
         // a clone: the closure must not borrow `self` across `try_refresh`.
@@ -8042,6 +8043,9 @@ impl Engine {
                 };
                 apply_send(client, store, id.as_str(), Some(row.seq), &mut progress)
                     .map(|()| Applied::Done)
+            }
+            OutboxOp::CreateFolder { id, parent, name } => {
+                create_folder(client, store, id, parent.as_deref(), name, Some(row.seq))
             }
             op => apply_op(client, store, op),
         };

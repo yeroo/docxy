@@ -4890,8 +4890,10 @@ impl Store {
     /// Records whether the `/send` POST of the `SendDraft` op `seq` went out
     /// (#1874). Set right before the POST, so a lost answer or a crash
     /// counts; cleared when Graph refuses the POST (a 4xx, a 404, a 401) or
-    /// later says the message is still a draft. A missing `seq` changes
-    /// nothing.
+    /// later says the message is still a draft. A `CreateFolder` op's POST
+    /// is recorded the same way (#2109): a retried create answered 409 then
+    /// looks for the folder its earlier POST may have made. A missing `seq`
+    /// changes nothing.
     pub fn set_send_posted(&self, seq: i64, posted: bool) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE outbox SET send_posted = ?2 WHERE seq = ?1",
@@ -4900,8 +4902,9 @@ impl Store {
         Ok(())
     }
 
-    /// Whether the `/send` POST of the op `seq` may have gone out
-    /// (`set_send_posted`). A missing `seq` is `false`.
+    /// Whether the `/send` POST of the op `seq` (a `SendDraft`'s, or a
+    /// `CreateFolder`'s POST, #2109) may have gone out (`set_send_posted`).
+    /// A missing `seq` is `false`.
     pub fn send_posted(&self, seq: i64) -> Result<bool, StoreError> {
         let posted = self
             .conn
@@ -7396,6 +7399,23 @@ impl Store {
         record_folder_alias_on(&tx, local_id, &created.id)?;
         tx.commit()?;
         Ok(exists)
+    }
+
+    /// Whether a folder other than `local_id` was already re-keyed onto the
+    /// Graph id `id` (#2109): a `folder_aliases` row `old → id` with `old`
+    /// not `local_id` (another create's, a copy's or a move's). A retried
+    /// create answered 409 never adopts such a folder: it is another of the
+    /// user's folders, and adopting it would merge the two.
+    pub(crate) fn folder_taken_by_alias(
+        &self,
+        local_id: &str,
+        id: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM folder_aliases WHERE id = ?1 AND old_id <> ?2)",
+            params![id, local_id],
+            |r| r.get(0),
+        )?)
     }
 
     /// Stores what Graph answered a folder move with (#1910): its parent,
@@ -26146,6 +26166,22 @@ mod folder_write_tests {
         assert_eq!(folder_of(&s, "m-stale").as_deref(), Some("G1"));
         assert_eq!(folder_of(&s, "m-local").as_deref(), Some("G1"));
         assert_eq!(row(&s, "UNDER").unwrap().parent_id.as_deref(), Some("G1"));
+    }
+
+    #[test]
+    fn folder_taken_by_alias_ignores_the_folders_own_alias() {
+        let s = mailbox();
+        let a = written(s.create_local_folder(Some("INBOX"), "New").unwrap());
+        let b = written(s.create_local_folder(Some("INBOX"), "New").unwrap());
+        // A listing's stale row has no alias: free to adopt.
+        s.upsert_folder(&listed("G1", Some("INBOX"), "New"))
+            .unwrap();
+        assert!(!s.folder_taken_by_alias(&a, "G1").unwrap());
+        s.reconcile_created_folder(&a, &listed("G1", Some("INBOX"), "New"))
+            .unwrap();
+        assert!(!s.folder_taken_by_alias(&a, "G1").unwrap(), "its own");
+        assert!(s.folder_taken_by_alias(&b, "G1").unwrap(), "A's, not B's");
+        assert!(!s.folder_taken_by_alias(&b, "G2").unwrap());
     }
 
     #[test]

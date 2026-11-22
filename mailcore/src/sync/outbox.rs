@@ -181,7 +181,7 @@ pub fn apply_op(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<Ap
         OutboxOp::CreateContact { id } => create_contact(client, store, id),
         OutboxOp::CreateEvent { id } => create_event(client, store, id),
         OutboxOp::CreateFolder { id, parent, name } => {
-            create_folder(client, store, id, parent.as_deref(), name)
+            create_folder(client, store, id, parent.as_deref(), name, None)
         }
         OutboxOp::MoveFolder {
             id, dest, parent, ..
@@ -389,12 +389,30 @@ fn graph_folder(store: &Store, id: &str) -> Result<Option<String>, GraphError> {
 /// as `Parse`), then re-key the row. A row gone before the drain (a refused
 /// create discarded it) sends nothing, nor does an id that already resolves
 /// to a Graph id (a retry after the re-key).
-fn create_folder(
+///
+/// With a `seq` (the engine's drain), `outbox.send_posted` is set right
+/// before the POST (#2109), so a lost answer (a 5xx, a 429/503 throttle, a
+/// dropped connection) or a crash before the re-key counts as "may have
+/// made the folder". A 401 puts the flag back as it was: Graph did nothing,
+/// and the refresh runs this create again. When a create whose earlier POST
+/// may have gone out is answered 409 (a folder of that name is already
+/// under the parent), that folder is likely the one the earlier POST made:
+/// it is looked up by the **op's** name (`GraphClient::find_child_folder`;
+/// the name POSTed, not the row's `display_name`, which a queued rename
+/// changed) and adopted as a 2xx answer would be, so the rename, move and
+/// message moves queued on the `local:` id reach it. A 409 on a first POST
+/// is a clash with a folder the user already has, and is returned. So is
+/// one whose lookup finds nothing, or a folder another create, copy or move
+/// was already re-keyed onto (`Store::folder_taken_by_alias`: adopting it
+/// would merge two of the user's folders). A lookup failure is returned as
+/// is, and the drain keeps or refuses it as any other.
+pub(crate) fn create_folder(
     client: &GraphClient,
     store: &Store,
     id: &str,
     parent: Option<&str>,
     name: &str,
+    seq: Option<i64>,
 ) -> Result<Applied, GraphError> {
     if store.current_folder_id(id).map_err(store_err)? != id
         || !store.has_folder(id).map_err(store_err)?
@@ -409,7 +427,36 @@ fn create_folder(
             "parent folder never reached Graph".to_string(),
         ));
     }
-    let created = client.create_folder(parent.as_deref(), name)?;
+    let retried = match seq {
+        Some(seq) => {
+            let retried = store.send_posted(seq).map_err(store_err)?;
+            store.set_send_posted(seq, true).map_err(store_err)?;
+            retried
+        }
+        None => false,
+    };
+    let created = match client.create_folder(parent.as_deref(), name) {
+        Ok(created) => created,
+        Err(GraphError::Unauthorized) => {
+            if let Some(seq) = seq {
+                let _ = store.set_send_posted(seq, retried);
+            }
+            return Err(GraphError::Unauthorized);
+        }
+        Err(e @ GraphError::Http { status: 409, .. }) if retried => {
+            match client.find_child_folder(parent.as_deref(), name)? {
+                Some(found)
+                    if !store
+                        .folder_taken_by_alias(id, &found.id)
+                        .map_err(store_err)? =>
+                {
+                    found
+                }
+                _ => return Err(e),
+            }
+        }
+        Err(e) => return Err(e),
+    };
     store
         .reconcile_created_folder(id, &created)
         .map_err(store_err)?;
@@ -5159,6 +5206,236 @@ mod tests {
             Err(GraphError::Parse(_))
         ));
         assert!(srv.requests().is_empty());
+    }
+
+    /// Graph's answer to a create whose name is taken under the parent.
+    const FOLDER_EXISTS: &str = r#"{"error":{"code":"ErrorFolderExists","message":"A folder with the specified name already exists."}}"#;
+
+    /// Creates `name` under INBOX in `store` and returns its `local:` id
+    /// and the queued op's row.
+    fn queued_create(store: &Store, name: &str) -> (String, crate::store::OutboxRow) {
+        let local = written(store.create_local_folder(Some("INBOX"), name).unwrap());
+        let row = store.pending_ops().unwrap().pop().unwrap();
+        (local, row)
+    }
+
+    fn create_row(
+        c: &GraphClient,
+        store: &Store,
+        row: &crate::store::OutboxRow,
+    ) -> Result<Applied, GraphError> {
+        let OutboxOp::CreateFolder { id, parent, name } = &row.op else {
+            panic!("not a create: {:?}", row.op);
+        };
+        create_folder(c, store, id, parent.as_deref(), name, Some(row.seq))
+    }
+
+    #[test]
+    fn create_folder_marks_its_post_sent() {
+        let srv = FakeServer::start(vec![route(
+            "POST",
+            "/me/mailFolders/INBOX/childFolders",
+            500,
+            "",
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        let (_, row) = queued_create(&store, "New");
+        assert!(!store.send_posted(row.seq).unwrap());
+        assert!(matches!(
+            create_row(&c, &store, &row),
+            Err(GraphError::Http { status: 500, .. })
+        ));
+        assert!(
+            store.send_posted(row.seq).unwrap(),
+            "a 5xx may follow the commit"
+        );
+    }
+
+    #[test]
+    fn create_folder_409_after_a_posted_attempt_adopts_graphs_folder() {
+        // The flag set with no attempt counted is also a crash between the
+        // POST and the re-key (criterion 4).
+        let srv = FakeServer::start(vec![
+            route(
+                "POST",
+                "/me/mailFolders/INBOX/childFolders",
+                409,
+                FOLDER_EXISTS,
+            ),
+            route(
+                "GET",
+                "/me/mailFolders/INBOX/childFolders",
+                200,
+                r#"{"value":[{"id":"PROJ","displayName":"Projects","parentFolderId":"INBOX"},{"id":"G1","displayName":"New","parentFolderId":"INBOX"}]}"#,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        let (local, row) = queued_create(&store, "New");
+        // A queued rename changes the row, not the name the create POSTs and
+        // looks up.
+        written(store.rename_folder(&local, "Renamed").unwrap());
+        store.set_send_posted(row.seq, true).unwrap();
+        assert_eq!(
+            create_row(&c, &store, &row).unwrap(),
+            Applied::FolderCreated {
+                local_id: local.clone(),
+                id: "G1".into()
+            }
+        );
+        assert!(!store.has_folder(&local).unwrap());
+        assert!(store.has_folder("G1").unwrap());
+        assert_eq!(store.current_folder_id(&local).unwrap(), "G1");
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].body, r#"{"displayName":"New"}"#);
+        assert_eq!(reqs[1].method, "GET");
+        assert_eq!(reqs[1].path, "/me/mailFolders/INBOX/childFolders?$top=100");
+    }
+
+    #[test]
+    fn create_folder_409_on_a_first_post_is_refused_without_a_lookup() {
+        let srv = FakeServer::start(vec![route(
+            "POST",
+            "/me/mailFolders/INBOX/childFolders",
+            409,
+            FOLDER_EXISTS,
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        let (local, row) = queued_create(&store, "New");
+        assert!(matches!(
+            create_row(&c, &store, &row),
+            Err(GraphError::Http { status: 409, .. })
+        ));
+        assert!(store.has_folder(&local).unwrap(), "the engine discards it");
+        assert_eq!(srv.requests().len(), 1, "no lookup");
+        // Nor without a row to track (`apply_op`).
+        assert!(matches!(
+            apply_op(&c, &store, &row.op),
+            Err(GraphError::Http { status: 409, .. })
+        ));
+        assert_eq!(srv.requests().len(), 2);
+    }
+
+    #[test]
+    fn create_folder_409_retried_with_no_such_folder_returns_the_409() {
+        let srv = FakeServer::start(vec![
+            route(
+                "POST",
+                "/me/mailFolders/INBOX/childFolders",
+                409,
+                FOLDER_EXISTS,
+            ),
+            route(
+                "GET",
+                "/me/mailFolders/INBOX/childFolders",
+                200,
+                r#"{"value":[{"id":"PROJ","displayName":"Projects","parentFolderId":"INBOX"}]}"#,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        let (local, row) = queued_create(&store, "New");
+        store.set_send_posted(row.seq, true).unwrap();
+        assert!(matches!(
+            create_row(&c, &store, &row),
+            Err(GraphError::Http { status: 409, .. })
+        ));
+        assert!(store.has_folder(&local).unwrap());
+        assert_eq!(store.current_folder_id(&local).unwrap(), local);
+        assert_eq!(srv.requests().len(), 2);
+    }
+
+    #[test]
+    fn create_folder_409_does_not_adopt_a_folder_another_create_already_took() {
+        let srv = FakeServer::start(vec![
+            route(
+                "POST",
+                "/me/mailFolders/INBOX/childFolders",
+                409,
+                FOLDER_EXISTS,
+            ),
+            route(
+                "GET",
+                "/me/mailFolders/INBOX/childFolders",
+                200,
+                r#"{"value":[{"id":"G1","displayName":"New","parentFolderId":"INBOX"}]}"#,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        let (a, _) = queued_create(&store, "New");
+        let (b, row_b) = queued_create(&store, "New");
+        store
+            .reconcile_created_folder(&a, &mail_folder("G1", Some("INBOX")))
+            .unwrap();
+        store.upsert_message("G1", &original("m-a")).unwrap();
+        store.set_send_posted(row_b.seq, true).unwrap();
+        assert!(matches!(
+            create_row(&c, &store, &row_b),
+            Err(GraphError::Http { status: 409, .. })
+        ));
+        assert!(store.has_folder(&b).unwrap(), "B is refused, not merged");
+        assert_eq!(store.current_folder_id(&b).unwrap(), b);
+        assert!(store.has_folder("G1").unwrap(), "A's folder stays");
+        assert_eq!(
+            store.message_folder("m-a").unwrap().as_deref(),
+            Some("G1"),
+            "with its mail"
+        );
+    }
+
+    #[test]
+    fn create_folder_401_restores_the_posted_flag() {
+        let srv = FakeServer::start(vec![route(
+            "POST",
+            "/me/mailFolders/INBOX/childFolders",
+            401,
+            "",
+        )]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        // A first POST: Graph did nothing, so the refresh's re-run is a
+        // first POST too, and a 409 there is refused.
+        let (_, row) = queued_create(&store, "New");
+        assert!(matches!(
+            create_row(&c, &store, &row),
+            Err(GraphError::Unauthorized)
+        ));
+        assert!(!store.send_posted(row.seq).unwrap(), "false stays false");
+        // An earlier POST that may have gone out still may have.
+        store.set_send_posted(row.seq, true).unwrap();
+        assert!(matches!(
+            create_row(&c, &store, &row),
+            Err(GraphError::Unauthorized)
+        ));
+        assert!(store.send_posted(row.seq).unwrap(), "true stays true");
+    }
+
+    #[test]
+    fn create_folder_lookup_failure_is_returned_as_is() {
+        let srv = FakeServer::start(vec![
+            route(
+                "POST",
+                "/me/mailFolders/INBOX/childFolders",
+                409,
+                FOLDER_EXISTS,
+            ),
+            route("GET", "/me/mailFolders/INBOX/childFolders", 502, ""),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        let (local, row) = queued_create(&store, "New");
+        store.set_send_posted(row.seq, true).unwrap();
+        assert!(matches!(
+            create_row(&c, &store, &row),
+            Err(GraphError::Http { status: 502, .. })
+        ));
+        assert!(store.has_folder(&local).unwrap());
+        assert!(store.send_posted(row.seq).unwrap(), "kept for the retry");
     }
 
     #[test]
