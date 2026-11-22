@@ -4466,21 +4466,32 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `MoveFolderMessages` is `Engine::graph_now_utc`, never this client's raw clock. Mail Graph
   receives after the command then stays outside `receivedDateTime le`, however far ahead the
   client clock runs. The max with the newest stored row is unchanged.
+- The clock is read when the engine takes the command off the channel, not when it runs it
+  (r1 P1). `take_waiting` keeps each command in `deferred` with `ServerClock::now_secs()`, and
+  `handle_command_at(cmd, Some(taken))` hands that stamp to `graph_now_utc`. A command that
+  waits behind a pass or a drain still cuts at its take. One the main loop receives and handles
+  at once reads the clock then. The residue is one request in flight: a command sent during a
+  request is taken at the next checkpoint.
 - `GraphClient::send` reads `Date` (IMF-fixdate only, `parse_http_date`; another form measures
   nothing) off a **2xx** answer into the engine's `ServerClock`, shared by every client
   `Engine::client()` builds, as `UserIds` is. Only a 2xx: a proxy's or captive portal's own
   error page carries that box's `Date`. Upload chunks, `put_binary` and the token endpoint
   (other hosts) measure nothing.
 - The offset is `clock_offset`: the receipt rounded **up** to the whole second, minus `Date`.
-  `Date` is truncated and stamped before the answer leaves, so the estimate never runs ahead
-  of Graph's clock. The latest reading wins, not the smallest offset, so a stepped client clock
+  `Date` is truncated and stamped before the answer leaves, so a reading taken in this run
+  never runs ahead of Graph's clock. The latest reading wins, not the smallest offset, so a stepped client clock
   shows at the next answer. `graph_now` also bounds the wall term by `Date` plus the monotonic
   time since the reading: a wall clock stepped forward between a reading and a command cannot
   move the cutoff ahead. Across a suspend `Instant` lags, which is the safe side.
 - The offset is kept in `meta.graph_clock_offset` (`Store::graph_clock_offset`), written at the
   end of each `sync_pass` (`persist_graph_clock`, however the pass ended) when it changed.
   `Engine::new` seeds the clock from it (wall term only), so a restart that is offline still
-  cuts on Graph's clock. `reset_mailbox` deletes it with the rest of `meta`, and the engine's
+  cuts on Graph's clock. A seeded reading is never later than the client clock (`graph_now`'s
+  `min(wall)`, r1 M1): a client that was behind Graph keeps a negative offset, and once its
+  clock is corrected, that offset alone would put the cutoff ahead of Graph's, past mail never
+  stored. A client clock stepped forward between runs still shows until the first answer of the
+  new run. So there are three cases: a reading taken in this run (never ahead of Graph), a seeded
+  one (never later than the client clock), and none (the client clock, as before #2121). `reset_mailbox` deletes it with the rest of `meta`, and the engine's
   marker (`clock_persisted`) is cleared with it, so the next pass writes it back. The in-memory
   clock is never cleared at session end: any Microsoft clock beats none. With no reading ever
   taken (every test fake but these, which sends no `Date`), the cutoff is the client clock.
@@ -4496,6 +4507,7 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   `a_stored_message_newer_than_graphs_clock_still_sets_the_cutoff`,
   `graph_clock_offset_is_kept_and_seeds_the_next_run`,
   `a_mailbox_reset_has_the_next_pass_keep_the_offset_again`,
+  `a_command_waiting_behind_a_pass_keeps_the_cutoff_it_was_taken_at`,
   `with_no_date_seen_the_cutoff_is_the_clients_clock`).
 
 ## Copy a folder (#2118)
