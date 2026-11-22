@@ -5,8 +5,10 @@
 # {}` reads it; both reply `hold` and `may_close_calls`). The hold and the
 # count belong to one fixture tab: a new Mail tab starts at 0, hold off, and
 # a tab that closed takes both with it, so the count is read only after a
-# refused close. A refusal keeps the tab and makes it the active one, with
-# File closed; a window close stops whole. The extension's own Exit
+# refused close. Refusing, the fixture moves the focus to its header line, as
+# an extension would to its question (`ext-ribbon-read`'s `header_focused`).
+# A refusal keeps the tab and makes it the active one, with File closed and
+# the keys where the extension put them; a window close stops whole. The extension's own Exit
 # (`ext::CloseTab`) is never asked. `tab-close:<i>` is tab i's close button.
 # The instance starts with one document tab (the first test also opens
 # basic.docx and closes it); each test leaves only that one, in one window.
@@ -37,6 +39,9 @@ test issue 2260 a held tab's close button keeps it and brings it to the front
   assert reply.tabs.1.kind is mail
   call ext-hold {}
   assert reply.may_close_calls is 1
+  # The keys are where it put them, not on its view's own focus.
+  call ext-ribbon-read {}
+  assert reply.header_focused is true
   # The active tab's own close button: refused again, asked again.
   call pointer-click {"region":"tab-close:1"}
   call tab-list {}
@@ -135,6 +140,9 @@ test issue 2260 a held tab keeps its window open, File closed and the tab in fro
   assert tab is 0
   call ext-hold {}
   assert reply.may_close_calls is 1
+  shot window
+  call ext-ribbon-read {}
+  assert reply.header_focused is true
   # With File up on the document: File goes, so the question can be seen.
   call pointer-click {"region":"tab-chip:1"}
   call backstage {"action":"open"}
@@ -170,6 +178,40 @@ test issue 2260 a held tab keeps the last window open whatever ask before closin
   assert tab is 1
   call ext-hold {}
   assert reply.may_close_calls is 1
+  call ext-hold {"on":false}
+  shot window
+  call ext-close-tab {}
+  shot window
+  call tab-list {}
+  assert reply.count is 1
+  assert reply.tabs.0.kind is docx
+
+test issue 2260 a refusal from another tab commits a sheet rename being typed
+  call backstage {"action":"open"}
+  call backstage-page {"page":"new"}
+  call new-card {"card":"new-mail-card"}
+  shot window
+  call ext-hold {"on":true}
+  open copy:../fixtures/basic.xlsx
+  call tab-list {}
+  assert reply.count is 3
+  assert reply.active is 2
+  click E1
+  call real-key {"key":"escape"}
+  call pointer-click {"input":"sheet-tab-rename"}
+  call real-key {"key":"backspace","times":6}
+  call real-type {"text":"Zed"}
+  # The last window's close, refused by the Mail tab behind: the switch to
+  # it leaves the workbook as a leave does, the rename committed.
+  call close-window {}
+  assert windows is 1
+  assert tab is 1
+  call pointer-click {"region":"tab-chip:2"}
+  assert sheet is Zed
+  call close-tab {"answer":"discard"}
+  call tab-list {}
+  assert reply.count is 2
+  call pointer-click {"region":"tab-chip:1"}
   call ext-hold {"on":false}
   shot window
   call ext-close-tab {}
