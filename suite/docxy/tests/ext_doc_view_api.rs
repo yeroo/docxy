@@ -365,7 +365,8 @@ impl TabSurface for Composer {
         if !self.unsent.get() {
             return true;
         }
-        // Its own question: here, the focus moved into its view.
+        // Its own question takes the keys: the suite brings the tab to the
+        // front and gives them back there (here, its view stands for it).
         window.focus(&self.reader.focus_handle(cx), cx);
         false
     }

@@ -149,9 +149,11 @@ pub trait TabSurface: 'static {
     /// closes this tab for a reason the user started: the tab's close
     /// button, File > Close (Ctrl+W), closing the window it is in, the app's
     /// Quit. `false` keeps it open: the suite leaves File, makes the tab the
-    /// active one and stops that close (a window close or Quit stops whole,
-    /// as a document's Cancel does, before any document is asked about);
-    /// the extension asks its question in its own view, and the user closes
+    /// active one and stops that close. A window close stops whole, as a
+    /// document's Cancel does, before its documents are asked about; a Quit
+    /// with several windows may already have asked about another window's
+    /// (the quit then applies none of their answers; a save stays saved).
+    /// The extension asks its question in its own view, and the user closes
     /// again once it is answered.
     ///
     /// It may be asked more than once for one close (the app's Quit asks
@@ -160,9 +162,10 @@ pub trait TabSurface: 'static {
     /// returning `false`. Never asked for [`CloseTab`] (the extension's own
     /// close), for moving the tab to another window, or for the harness's
     /// own quit. Called while the suite's view is being updated: do not
-    /// update the suite or dispatch [`CloseTab`] from here; it may update the
-    /// extension's own entities and move the focus into its view. Default:
-    /// `true`, a close as before.
+    /// update the suite or dispatch [`CloseTab`] from here. It may update the
+    /// extension's own entities and move the focus to its question: refusing,
+    /// that focus keeps the keys once the tab is in front. Default: `true`, a
+    /// close as before.
     fn may_close(&self, _window: &mut Window, _cx: &mut App) -> bool {
         true
     }

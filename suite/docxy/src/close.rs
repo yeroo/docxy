@@ -759,29 +759,47 @@ impl Docxy {
         }
     }
 
+    /// Asks tab `i` whether it may close ([`Self::ext_may_close`]); on a
+    /// refusal it comes to the front ([`Self::ext_close_refused`]). Whether
+    /// it may.
+    fn ext_ask(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let before = window.focused(cx);
+        if self.ext_may_close(i, window, cx) {
+            return true;
+        }
+        // A focus the extension moved while asked (to its question), and
+        // only that: one held before may be another tab's.
+        let moved = window.focused(cx).filter(|f| before.as_ref() != Some(f));
+        self.ext_close_refused(i, moved, window, cx);
+        false
+    }
+
     /// Asks every extension tab in tab order whether it may close, before a
     /// window close or the app's Quit (#2260); at the first refusal, that
     /// tab comes to the front ([`Self::ext_close_refused`]) and the rest are
     /// not asked. Whether one refused.
     fn ext_refusal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        for i in 0..self.tabs.len() {
-            if !self.ext_may_close(i, window, cx) {
-                self.ext_close_refused(i, window, cx);
-                return true;
-            }
-        }
-        false
+        (0..self.tabs.len()).any(|i| !self.ext_ask(i, window, cx))
     }
 
     /// Extension tab `i` refused its close (#2260): it stays, as the
     /// active tab, with nothing over its view so it can ask its question
     /// there. File goes (as File > Close leaves it: the Info edit applied),
     /// so do KeyTips and a ribbon menu, which would take the keys from the
-    /// view (`focus_ext_surface`); another tab is switched from as a click
-    /// on the chip does. Already the active tab, the focus stays where it is:
-    /// the extension may have moved it to its own question. No status line
-    /// text: the extension asks.
-    fn ext_close_refused(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// view (`focus_ext_surface`). Another tab is left as a leave does (a
+    /// cell note or a sheet rename being typed is committed, not dropped)
+    /// and switched from as a click on the chip does. The keys go to
+    /// `moved`, the focus the extension moved to its question while asked:
+    /// already in front, they are there and stay; from another tab, the
+    /// switch focuses the suite and `focus_ext_surface` gives them back
+    /// (`ext_focus_back`). No status line text: the extension asks.
+    fn ext_close_refused(
+        &mut self,
+        i: usize,
+        moved: Option<FocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.backstage {
             self.info_edit_apply_now();
             self.backstage = false;
@@ -789,7 +807,14 @@ impl Docxy {
         self.keytips = KeyTip::Off;
         self.close_menu();
         if i != self.active {
+            self.sheet_comment_bar_leave();
+            self.sheet_rename_commit(false, cx);
             self.select_tab(i, window, cx);
+            if let (Some(had), Some(Surface::Ext(e))) =
+                (moved, self.tabs.get(i).map(|t| &t.surface))
+            {
+                self.ext_focus_back = Some((e.view().entity_id(), had));
+            }
         }
         cx.notify();
     }
@@ -873,8 +898,9 @@ impl Docxy {
 
     /// [`Self::close_tab_with`], asking an extension tab whether it may
     /// close only when `ask` (not for its own `ext::CloseTab`). Asked after
-    /// the dialog check and before anything is committed, so a refusal
-    /// changes nothing but which tab is in front.
+    /// the dialog check and before the close's commits, so a refusal drops
+    /// nothing typed: it leaves File, KeyTips and a menu and brings the tab
+    /// to the front ([`Self::ext_close_refused`]).
     fn close_tab_asking(
         &mut self,
         i: usize,
@@ -890,8 +916,7 @@ impl Docxy {
             self.refuse_close_under_dialog(i, window, cx);
             return None;
         }
-        if ask && !self.ext_may_close(i, window, cx) {
-            self.ext_close_refused(i, window, cx);
+        if ask && !self.ext_ask(i, window, cx) {
             return None;
         }
         self.flush_project_passes(cx);
@@ -1190,8 +1215,8 @@ impl Docxy {
         // An extension tab that would lose work keeps the window, whatever
         // "ask before closing" says: hot exit keeps a document's unsaved
         // work, but an extension tab's is gone (#2260). Before the commits,
-        // which drop the half-typed rule bars: a refused close changes
-        // nothing. A harness's own quit never asks.
+        // which drop the half-typed rule bars: a refused close drops nothing
+        // typed (`ext_close_refused`). A harness's own quit never asks.
         if ask != CloseAsk::HarnessQuit && self.ext_refusal(window, cx) {
             return false;
         }

@@ -26,7 +26,8 @@
 //!
 //! Its tab refuses a close the user started while its `hold` is on (#2260,
 //! the harness's `ext-hold`), as an extension holding unsent work would,
-//! and counts how many times it was asked ([`FixtureView::may_close_calls`]).
+//! moving the focus to its header line as it would to its question, and
+//! counts how many times it was asked ([`FixtureView::may_close_calls`]).
 
 use crate::ext::{
     self, BackstageGroup, BackstagePage, DocView, Ribbon, RibbonCommand, RibbonControl,
@@ -430,10 +431,17 @@ impl TabSurface for FixtureMail {
         self.pages.clone()
     }
 
-    fn may_close(&self, _window: &mut Window, cx: &mut App) -> bool {
+    fn may_close(&self, window: &mut Window, cx: &mut App) -> bool {
         let root = self.root.read(cx);
         root.may_close_calls.set(root.may_close_calls.get() + 1);
-        !root.hold.get()
+        if !root.hold.get() {
+            return true;
+        }
+        // Refusing, it moves the keys to its question, as an extension
+        // would: here its header line (#2260 r1).
+        let header = root.header_focus.clone();
+        window.focus(&header, cx);
+        false
     }
 }
 
