@@ -23,6 +23,10 @@
 //! active ([`TabSurface::backstage_pages`], #1923), and its view may close
 //! its own tab by dispatching [`CloseTab`] or open File straight on one of
 //! those pages by dispatching [`ShowBackstagePage`] (#2204).
+//!
+//! A surface holding work it would lose may refuse a close the user started
+//! ([`TabSurface::may_close`], #2260): its tab's close button, File > Close,
+//! closing its window or quitting then keep the tab, and it asks in its view.
 
 use gpui::{AnyView, App, FocusHandle, Global, Hsla, Window, actions};
 use std::rc::Rc;
@@ -52,7 +56,8 @@ actions!(
         /// it closes whichever extension tab is active when it runs, so a late
         /// dispatch (from a spawned task, after the user moved to another tab)
         /// closes that one. On a tab that is not an extension's it does
-        /// nothing.
+        /// nothing. It never asks [`TabSurface::may_close`]: the extension
+        /// dispatching it has already decided (#2260).
         CloseTab
     ]
 );
@@ -139,6 +144,27 @@ pub trait TabSurface: 'static {
     /// File as on the suite's own pages.
     fn backstage_pages(&self, _cx: &App) -> Vec<BackstagePage> {
         Vec::new()
+    }
+    /// Whether the tab may close now (#2260). The suite asks before it
+    /// closes this tab for a reason the user started: the tab's close
+    /// button, File > Close (Ctrl+W), closing the window it is in, the app's
+    /// Quit. `false` keeps it open: the suite leaves File, makes the tab the
+    /// active one and stops that close (a window close or Quit stops whole,
+    /// as a document's Cancel does, before any document is asked about);
+    /// the extension asks its question in its own view, and the user closes
+    /// again once it is answered.
+    ///
+    /// It may be asked more than once for one close (the app's Quit asks
+    /// every window again after each window's questions), so return `true`
+    /// cheaply when nothing would be lost, and show the question only when
+    /// returning `false`. Never asked for [`CloseTab`] (the extension's own
+    /// close), for moving the tab to another window, or for the harness's
+    /// own quit. Called while the suite's view is being updated: do not
+    /// update the suite or dispatch [`CloseTab`] from here; it may update the
+    /// extension's own entities and move the focus into its view. Default:
+    /// `true`, a close as before.
+    fn may_close(&self, _window: &mut Window, _cx: &mut App) -> bool {
+        true
     }
 }
 

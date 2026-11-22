@@ -718,7 +718,13 @@ pub(crate) fn remove_tab(tabs: &mut Vec<DocTab>, active: &mut usize, i: usize) -
 }
 
 impl Docxy {
+    /// File > Close: the active tab closes, File with it. An extension tab
+    /// is asked first ([`ext::TabSurface::may_close`], #2260).
     pub(super) fn backstage_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.backstage_close_asking(true, window, cx);
+    }
+
+    fn backstage_close_asking(&mut self, ask: bool, window: &mut Window, cx: &mut Context<Self>) {
         // Leaving File applies a typed Info property first (#1364).
         self.info_edit_apply_now();
         // No tab to close: the Start screen stays (#806).
@@ -726,13 +732,14 @@ impl Docxy {
             return;
         }
         self.backstage = false;
-        self.close_tab(self.active, window, cx);
+        self.close_tab_asking(self.active, None, ask, window, cx);
     }
 
     /// `ext::CloseTab` (#1923): the active tab closes as through its close
     /// button, File with it, when it is an extension's; on any other tab
     /// nothing happens. Only the active tab's view (or its File page) is
-    /// drawn, so the dispatcher is the active tab.
+    /// drawn, so the dispatcher is the active tab. The extension has
+    /// decided already, so it is not asked whether it may close (#2260).
     pub(super) fn close_ext_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(
             self.tabs.get(self.active).map(|t| &t.surface),
@@ -740,7 +747,51 @@ impl Docxy {
         ) {
             return;
         }
-        self.backstage_close(window, cx);
+        self.backstage_close_asking(false, window, cx);
+    }
+
+    /// Whether tab `i` may close: an extension tab's own answer
+    /// ([`ext::TabSurface::may_close`], #2260); every other tab may.
+    fn ext_may_close(&self, i: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        match self.tabs.get(i).map(|t| &t.surface) {
+            Some(Surface::Ext(e)) => e.may_close(window, cx),
+            _ => true,
+        }
+    }
+
+    /// Asks every extension tab in tab order whether it may close, before a
+    /// window close or the app's Quit (#2260); at the first refusal, that
+    /// tab comes to the front ([`Self::ext_close_refused`]) and the rest are
+    /// not asked. Whether one refused.
+    fn ext_refusal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        for i in 0..self.tabs.len() {
+            if !self.ext_may_close(i, window, cx) {
+                self.ext_close_refused(i, window, cx);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Extension tab `i` refused its close (#2260): it stays, as the
+    /// active tab, with nothing over its view so it can ask its question
+    /// there. File goes (as File > Close leaves it: the Info edit applied),
+    /// so do KeyTips and a ribbon menu, which would take the keys from the
+    /// view (`focus_ext_surface`); another tab is switched from as a click
+    /// on the chip does. Already the active tab, the focus stays where it is:
+    /// the extension may have moved it to its own question. No status line
+    /// text: the extension asks.
+    fn ext_close_refused(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.backstage {
+            self.info_edit_apply_now();
+            self.backstage = false;
+        }
+        self.keytips = KeyTip::Off;
+        self.close_menu();
+        if i != self.active {
+            self.select_tab(i, window, cx);
+        }
+        cx.notify();
     }
 
     pub(super) fn close_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -808,11 +859,27 @@ impl Docxy {
     /// `close-tab` may give one) opens the close prompt on it, which answers
     /// later through [`Self::close_prompt_click`]. Returns why a Don't Save
     /// draft was not kept, if it was not (#613): the harness reports it,
-    /// since with no tab left there is no status line to carry it.
+    /// since with no tab left there is no status line to carry it. An
+    /// extension tab is asked first, and a refusal keeps it (#2260).
     pub(super) fn close_tab_with(
         &mut self,
         i: usize,
         answer: Option<CloseAnswer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        self.close_tab_asking(i, answer, true, window, cx)
+    }
+
+    /// [`Self::close_tab_with`], asking an extension tab whether it may
+    /// close only when `ask` (not for its own `ext::CloseTab`). Asked after
+    /// the dialog check and before anything is committed, so a refusal
+    /// changes nothing but which tab is in front.
+    fn close_tab_asking(
+        &mut self,
+        i: usize,
+        answer: Option<CloseAnswer>,
+        ask: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
@@ -821,6 +888,10 @@ impl Docxy {
         }
         if self.tabs[i].dialogs.is_open() {
             self.refuse_close_under_dialog(i, window, cx);
+            return None;
+        }
+        if ask && !self.ext_may_close(i, window, cx) {
+            self.ext_close_refused(i, window, cx);
             return None;
         }
         self.flush_project_passes(cx);
@@ -1116,6 +1187,14 @@ impl Docxy {
             // Its question went away some other way: start again.
             self.quit_cancelled(cx);
         }
+        // An extension tab that would lose work keeps the window, whatever
+        // "ask before closing" says: hot exit keeps a document's unsaved
+        // work, but an extension tab's is gone (#2260). Before the commits,
+        // which drop the half-typed rule bars: a refused close changes
+        // nothing. A harness's own quit never asks.
+        if ask != CloseAsk::HarnessQuit && self.ext_refusal(window, cx) {
+            return false;
+        }
         self.commit_dialog_buffers_for_exit(cx);
         commit_pending_for_exit(&mut self.tabs);
         self.persist(cx);
@@ -1150,6 +1229,18 @@ impl Docxy {
             // Already asking, for its own close or the quit: its last answer
             // now goes on with the quit.
             self.app_quit = true;
+            return false;
+        }
+        // An extension tab that would lose work stops the whole quit, as a
+        // Cancel does (#2260). Asked on every walk, before an agreement is
+        // judged to hold: the tab may have taken work while another window
+        // asked its questions.
+        if self.ext_refusal(window, cx) {
+            self.quit_agreed = None;
+            if self.quitting {
+                self.quit_cancelled(cx);
+            }
+            App::defer(cx, crate::macos_menu::cancel_quit);
             return false;
         }
         // An open cell editor, comment, rename or the like is work too: in
