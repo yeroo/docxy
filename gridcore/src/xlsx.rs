@@ -18366,6 +18366,28 @@ b",
     }
 
     #[test]
+    fn a_frozen_block_retyped_without_its_prefix_saves_its_cached_values() {
+        // #849: a frozen dynamic array retyped as Excel shows it
+        // (`PIVOTBY(A1,4)`, no `_xlfn.`) is the same formula: it saves as
+        // loaded, its `<f>`, `cm` and the block's cached values whole.
+        let rows = concat!(
+            r#"<row r="1"><c r="A1"><v>1</v></c><c r="E1" cm="1"><f t="array" ref="E1:E3">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c></row>"#,
+            r#"<row r="2"><c r="E2"><v>8</v></c></row>"#,
+            r#"<row r="3"><c r="E3"><v>9</v></c></row>"#,
+        );
+        let mut pkg = load_xlsx(&cell_meta_fixture(rows)).unwrap();
+        let mut eng = crate::engine::Engine::new(&pkg.workbook);
+        eng.set_cell(&mut pkg.workbook, (0, 0, 4), Cell::formula("PIVOTBY(A1,4)"));
+        let ws = saved_sheet1(&pkg);
+        assert_eq!(
+            saved_cell(&ws, "E1"),
+            r#"<c r="E1" cm="1"><f t="array" ref="E1:E3">_xlfn.PIVOTBY(A1,4)</f><v>7</v></c>"#
+        );
+        assert_eq!(saved_cell(&ws, "E2"), r#"<c r="E2"><v>8</v></c>"#);
+        assert_eq!(saved_cell(&ws, "E3"), r#"<c r="E3"><v>9</v></c>"#);
+    }
+
+    #[test]
     fn delete_outside_a_frozen_arrays_shifted_ref_still_clears() {
         // #777 r4: a row delete shifts a frozen anchor's `ref` (E1:E3 →
         // E1:E2) but not its stale extent, so E3 — now the user's "x" — is
