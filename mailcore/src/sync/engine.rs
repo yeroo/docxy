@@ -1079,8 +1079,12 @@ pub enum SyncEvent {
     /// resolves (`Store::current_id`) for commands, but a host re-keys what
     /// it holds by id: a selection, an undo record, an open read window.
     MessageMoved { old_id: String, new_id: String },
-    /// An attachment's bytes were fetched and written to `path` (the `dest`
-    /// from the triggering [`SyncCommand::SaveAttachment`]).
+    /// An attachment's bytes were fetched and written to `path`: the
+    /// command's `dest` (for [`SyncCommand::SaveItemAttachment`],
+    /// `dest_base` plus the sniffed `.eml`/`.ics`), or, for a save kept at
+    /// a `Shutdown` (#2132), the first free `name (n).ext` beside it when a
+    /// file was already there (#2267). A host must not assume `path` is the
+    /// `dest` it sent.
     AttachmentSaved { path: PathBuf },
     /// A meeting invite was RSVP'd (from [`SyncCommand::RespondMeeting`]); the
     /// UI shows a confirmation and marks the message read.
