@@ -3826,7 +3826,8 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   before any listing); Graph's move answer then stores the real one.
 - Refused by the store, with nothing written or queued: an unknown id, parent or dest; the drafts
   sentinel (`local:drafts-pending`) as any of them, since Graph never had it; and a move into the
-  folder itself or a folder under it (the stored `parent_id` would hold a cycle). The engine never
+  folder itself or a folder under it (the stored `parent_id` would hold a cycle); a create of a name
+  a sibling already has, in any case (#2109, `FolderRefusal::NameTaken`). The engine never
   refuses a folder for being well known; Graph does. Reported as `FolderWriteFailed { status:
   None }` plus `Error`; its `id` is the folder named, or a create's parent.
 - A created folder lives under a `local:` id (`local_draft_id`) until its create reaches Graph.
@@ -3947,9 +3948,9 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   (`childFolders` of the parent, or `/me/mailFolders` for the top, 100 a page, following
   nextLink; an exact `displayName`, else the first caseless match, compared locally, no
   `$filter`) with the **op's** name, the one POSTed (a queued rename changed the row's, not the
-  op's). Found, and not already taken (`Store::folder_taken_by_alias`: no `folder_aliases` row
-  other than `local_id → G` maps onto it, so another create, copy or move re-keyed onto G is
-  never merged with this one): `reconcile_created_folder` and `FolderCreated`, as a 2xx. A stale
+  op's). Found, and adoptable (`Store::folder_not_adoptable`: no `folder_aliases` row other than
+  `local_id → G` maps onto it, so another create, copy or move re-keyed onto G is never merged
+  with this one; no queued delete takes it): `reconcile_created_folder` and `FolderCreated`, as a 2xx. A stale
   row a listing stored for G is no alias: it merges (`rekey_folder_on` hands its mail and children
   over). Otherwise the 409 itself is returned and refused as before. A 409 on a first POST is a
   clash with a folder the user has: refused with no lookup. A lookup failure is returned as is:
@@ -3966,21 +3967,30 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   not put back on a transport failure (it can be a read timeout after the request went out) or
   a throttle (`Throttled` covers a 503, which may follow a commit). The alias guard stays as a
   second line.
-- Residual: a folder of that name made by another client under the parent after the create was
-  queued, with any attempt that set the flag (a 5xx, a 429/503, a transport failure, a crash)
-  before the retry's 409, is adopted. Nothing is lost: the queued ops land in a folder of that
-  name (`create_folder_transport_then_409_does_not_adopt_a_stored_sibling` asserts it, commented).
+- Not adopted either (`Store::folder_not_adoptable`, one helper for both rules, the 409 then
+  stands): a folder another create, copy or move was already re-keyed onto (the alias rule), and
+  a folder a queued `DeleteFolder` takes (`folder_being_deleted`): the delete removed its row at
+  once, so the sibling check let the create through, but Graph has the folder until the delete
+  is sent.
+- Residual: any folder of that name under the parent on Graph that the store did not have when
+  the create was queued is adopted. That includes one another client made after the last
+  listing, the ordinary case for a create made offline: its first attempt is a transport failure,
+  which sets the flag. The `local:` folder's mail then lands in that folder, and a rename or move
+  queued on the `local:` id applies to it
+  (`create_folder_after_a_transport_failure_adopts_a_folder_listed_later_residual` asserts it).
 - Tests: `client.rs` `find_child_folder_pages_children_and_top_and_matches_names`,
   `find_child_folder_returns_a_page_error`; `store/mod.rs`
-  `folder_taken_by_alias_ignores_the_folders_own_alias`; `outbox.rs`
+  `folder_not_adoptable_ignores_the_folders_own_alias`; `outbox.rs`
   `create_folder_marks_its_post_sent`,
   `create_folder_409_after_a_posted_attempt_adopts_graphs_folder` (the flag with no attempt
   counted: the crash case), `create_folder_409_on_a_first_post_is_refused_without_a_lookup`,
   `create_folder_409_retried_with_no_such_folder_returns_the_409`,
   `create_folder_409_does_not_adopt_a_folder_another_create_already_took`,
   `create_folder_401_restores_the_posted_flag`, `create_folder_lookup_failure_is_returned_as_is`,
-  `create_folder_transport_then_409_does_not_adopt_a_stored_sibling` (a sibling stored at queue
-  time refuses the create; the flag kept after a transport failure; the residual adopted);
+  `create_folder_refuses_a_name_a_stored_sibling_has_at_queue_time`,
+  `create_folder_after_a_transport_failure_adopts_a_folder_listed_later_residual` (the flag kept
+  after a transport failure; the residual adopted),
+  `create_folder_409_does_not_adopt_a_folder_whose_delete_is_queued`;
   `store/mod.rs` `create_local_folder_refuses_a_name_a_sibling_has`;
   `engine.rs` `folder_writes`
   `a_create_retried_after_a_lost_answer_adopts_graphs_folder_on_409` (end to end: a 500, a

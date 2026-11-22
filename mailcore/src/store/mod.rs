@@ -7423,21 +7423,29 @@ impl Store {
         Ok(exists)
     }
 
-    /// Whether a folder other than `local_id` was already re-keyed onto the
-    /// Graph id `id` (#2109): a `folder_aliases` row `old → id` with `old`
-    /// not `local_id` (another create's, a copy's or a move's). A retried
-    /// create answered 409 never adopts such a folder: it is another of the
-    /// user's folders, and adopting it would merge the two.
-    pub(crate) fn folder_taken_by_alias(
+    /// Whether a retried create answered 409 (#2109) must not adopt the
+    /// Graph folder `id` it found under its parent for the `local:` folder
+    /// `local_id`, so the 409 stands:
+    /// - another folder was already re-keyed onto `id` (a `folder_aliases`
+    ///   row `old → id` with `old` not `local_id`: another create's, a
+    ///   copy's or a move's). It is another of the user's folders, and
+    ///   adopting it would merge the two;
+    /// - a queued `DeleteFolder` takes `id` (`folder_being_deleted`, through
+    ///   `folder_aliases`). The delete removed its row at once, so the
+    ///   store's sibling check let this create through, but Graph still has
+    ///   the folder until the delete is sent; adopting it would aim this
+    ///   create's queued ops at a folder about to go.
+    pub(crate) fn folder_not_adoptable(
         &self,
         local_id: &str,
         id: &str,
     ) -> Result<bool, StoreError> {
-        Ok(self.conn.query_row(
+        let taken: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM folder_aliases WHERE id = ?1 AND old_id <> ?2)",
             params![id, local_id],
             |r| r.get(0),
-        )?)
+        )?;
+        Ok(taken || self.folder_being_deleted(id)?)
     }
 
     /// Stores what Graph answered a folder move with (#1910): its parent,
@@ -26203,10 +26211,16 @@ mod folder_write_tests {
         // Under a parent: a listed sibling, exact and in another case.
         taken(s.create_local_folder(Some("INBOX"), "A").unwrap(), "A");
         taken(s.create_local_folder(Some("INBOX"), "a").unwrap(), "a");
-        // A `local:` sibling still queued counts too, by the alias of its
-        // parent as well.
+        // A `local:` sibling still queued counts too.
         let new = written(s.create_local_folder(Some("A"), "New").unwrap());
         taken(s.create_local_folder(Some("A"), "NEW").unwrap(), "NEW");
+        // A parent named by its old `local:` id resolves through its alias
+        // to the Graph id its children are stored under.
+        let p = written(s.create_local_folder(Some("INBOX"), "P").unwrap());
+        s.reconcile_created_folder(&p, &listed("GP", Some("INBOX"), "P"))
+            .unwrap();
+        s.upsert_folder(&listed("KID", Some("GP"), "Kid")).unwrap();
+        taken(s.create_local_folder(Some(&p), "kid").unwrap(), "kid");
         // At the top: the root the listing gives top folders.
         taken(s.create_local_folder(None, "inbox").unwrap(), "inbox");
         // Another parent's name is free, and so is the name of a folder
@@ -26215,7 +26229,7 @@ mod folder_write_tests {
         written(s.create_local_folder(Some("INBOX"), "B").unwrap());
         written(s.create_local_folder(None, "Top").unwrap());
         assert_eq!(row(&s, &new).unwrap().display_name, "New");
-        assert_eq!(ops(&s).len(), before + 4, "only the written ones queued");
+        assert_eq!(ops(&s).len(), before + 5, "only the written ones queued");
         // No root known yet: top folders are those without a parent.
         let empty = Store::open_in_memory().unwrap();
         written(empty.create_local_folder(None, "X").unwrap());
@@ -26223,19 +26237,19 @@ mod folder_write_tests {
     }
 
     #[test]
-    fn folder_taken_by_alias_ignores_the_folders_own_alias() {
+    fn folder_not_adoptable_ignores_the_folders_own_alias() {
         let s = mailbox();
         let a = written(s.create_local_folder(Some("INBOX"), "New").unwrap());
         let b = written(s.create_local_folder(Some("INBOX"), "Other").unwrap());
         // A listing's stale row has no alias: free to adopt.
         s.upsert_folder(&listed("G1", Some("INBOX"), "New"))
             .unwrap();
-        assert!(!s.folder_taken_by_alias(&a, "G1").unwrap());
+        assert!(!s.folder_not_adoptable(&a, "G1").unwrap());
         s.reconcile_created_folder(&a, &listed("G1", Some("INBOX"), "New"))
             .unwrap();
-        assert!(!s.folder_taken_by_alias(&a, "G1").unwrap(), "its own");
-        assert!(s.folder_taken_by_alias(&b, "G1").unwrap(), "A's, not B's");
-        assert!(!s.folder_taken_by_alias(&b, "G2").unwrap());
+        assert!(!s.folder_not_adoptable(&a, "G1").unwrap(), "its own");
+        assert!(s.folder_not_adoptable(&b, "G1").unwrap(), "A's, not B's");
+        assert!(!s.folder_not_adoptable(&b, "G2").unwrap());
     }
 
     #[test]

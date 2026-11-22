@@ -794,8 +794,11 @@ pub enum SyncCommand {
     /// ([`SyncEvent::FolderCreated`], `FoldersUpdated`). Anything aimed at
     /// the `local:` id meanwhile (a rename, a move, a child folder, a
     /// message moved into it) follows it (`Store::current_folder_id`). An
-    /// unknown parent or the drafts sentinel is refused at once
-    /// ([`SyncEvent::FolderWriteFailed`] with no status).
+    /// unknown parent, the drafts sentinel, or a name a sibling already
+    /// has, in any case (#2109), is refused at once
+    /// ([`SyncEvent::FolderWriteFailed`] with no status). A create retried
+    /// after a lost answer and answered 409 adopts Graph's folder of that
+    /// name under the parent (#2109).
     CreateFolder {
         parent: Option<String>,
         name: String,
@@ -1215,7 +1218,8 @@ pub enum SyncEvent {
     /// queued; a 404 too, except for a delete, where a 404 is done), or by
     /// the store at once (`status: None`, nothing queued: an unknown folder,
     /// the drafts sentinel, a move into itself, a delete of folders holding
-    /// unsent mail). A queued delete is also refused, with `status: None`
+    /// unsent mail, a create of a name a sibling already has, in any case,
+    /// #2109). A queued delete is also refused, with `status: None`
     /// and nothing sent, when its walk of Graph finds an item the store
     /// shows elsewhere or removed (#2107).
     /// Graph's refusal is final at once and reverts the store:

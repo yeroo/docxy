@@ -396,23 +396,31 @@ fn graph_folder(store: &Store, id: &str) -> Result<Option<String>, GraphError> {
 /// made the folder". A 401 puts the flag back as it was: Graph did nothing,
 /// and the refresh runs this create again. A transport failure or a
 /// throttle keeps it: the first can be a read timeout after the request
-/// went out, and `Throttled` covers a 503, which may follow the commit.
-/// That costs nothing, as the store refuses a create whose name a stored
-/// sibling has (`FolderRefusal::NameTaken`): a retry's 409 then comes from
-/// our own earlier POST, or from a folder another client made under the
-/// parent after the create was queued (the documented residual, adopted
-/// alike; nothing is lost). When a create whose earlier POST
-/// may have gone out is answered 409 (a folder of that name is already
-/// under the parent), that folder is likely the one the earlier POST made:
-/// it is looked up by the **op's** name (`GraphClient::find_child_folder`;
-/// the name POSTed, not the row's `display_name`, which a queued rename
-/// changed) and adopted as a 2xx answer would be, so the rename, move and
-/// message moves queued on the `local:` id reach it. A 409 on a first POST
-/// is a clash with a folder the user already has, and is returned. So is
-/// one whose lookup finds nothing, or a folder another create, copy or move
-/// was already re-keyed onto (`Store::folder_taken_by_alias`: adopting it
-/// would merge two of the user's folders). A lookup failure is returned as
-/// is, and the drain keeps or refuses it as any other.
+/// went out, and `Throttled` covers a 503, which may follow the commit. The
+/// store refuses a create whose name a stored sibling has
+/// (`FolderRefusal::NameTaken`), so a folder the store showed under the
+/// parent when the create was queued is never the 409's.
+///
+/// When a create whose earlier POST may have gone out is answered 409 (a
+/// folder of that name is already under the parent), that folder is
+/// likely the one the earlier POST made: it is looked up by the **op's**
+/// name (`GraphClient::find_child_folder`; the name POSTed, not the row's
+/// `display_name`, which a queued rename changed) and adopted as a 2xx
+/// answer would be, so the rename, move and message moves queued on the
+/// `local:` id reach it. A 409 on a first POST is a clash with a folder the
+/// user already has, and is returned. So is one whose lookup finds
+/// nothing, or a folder `Store::folder_not_adoptable` names: one another
+/// create, copy or move was already re-keyed onto (adopting it would merge
+/// two of the user's folders), or one a queued `DeleteFolder` takes (its row
+/// is gone, but Graph has it until the delete is sent). A lookup failure is
+/// returned as is, and the drain keeps or refuses it as any other.
+///
+/// Residual: any folder of that name under the parent on Graph that the
+/// store did not have when the create was queued is adopted. That includes
+/// one another client made after the last listing, the ordinary case for a
+/// create made offline, whose first attempt is a transport failure that
+/// sets the flag. The `local:` folder's mail then lands in that folder,
+/// and a rename or move queued on the `local:` id applies to it.
 pub(crate) fn create_folder(
     client: &GraphClient,
     store: &Store,
@@ -454,7 +462,7 @@ pub(crate) fn create_folder(
             match client.find_child_folder(parent.as_deref(), name)? {
                 Some(found)
                     if !store
-                        .folder_taken_by_alias(id, &found.id)
+                        .folder_not_adoptable(id, &found.id)
                         .map_err(store_err)? =>
                 {
                     found
@@ -5215,6 +5223,14 @@ mod tests {
         assert!(srv.requests().is_empty());
     }
 
+    /// A folder `id` named `name` under INBOX.
+    fn named_folder(id: &str, name: &str) -> MailFolder {
+        MailFolder {
+            display_name: name.into(),
+            ..mail_folder(id, Some("INBOX"))
+        }
+    }
+
     /// Graph's answer to a create whose name is taken under the parent.
     const FOLDER_EXISTS: &str = r#"{"error":{"code":"ErrorFolderExists","message":"A folder with the specified name already exists."}}"#;
 
@@ -5398,16 +5414,12 @@ mod tests {
         );
     }
 
+    /// A sibling "New" the store has when the create is queued: the store
+    /// refuses the create (`NameTaken`), so no POST and no retry exist.
     #[test]
-    fn create_folder_transport_then_409_does_not_adopt_a_stored_sibling() {
-        let named = |id: &str, name: &str| MailFolder {
-            display_name: name.into(),
-            ..mail_folder(id, Some("INBOX"))
-        };
-        // A sibling "New" the store has when the create is queued: the
-        // store refuses the create, so no POST and no retry ever exist.
+    fn create_folder_refuses_a_name_a_stored_sibling_has_at_queue_time() {
         let store = folder_store();
-        store.upsert_folder(&named("G0", "New")).unwrap();
+        store.upsert_folder(&named_folder("G0", "New")).unwrap();
         assert_eq!(
             store.create_local_folder(Some("INBOX"), "new").unwrap(),
             crate::store::FolderWriteResult::Refused(crate::store::FolderRefusal::NameTaken(
@@ -5415,9 +5427,16 @@ mod tests {
             ))
         );
         assert!(store.pending_ops().unwrap().is_empty());
+    }
 
-        // No sibling then: the first POST fails in transport. That may be a
-        // read timeout after the request went out, so the flag stays.
+    /// The documented residual (#2109): the first POST fails in transport
+    /// (it may be a read timeout after the request went out, so the flag
+    /// stays), and G0 "New" is listed only after the create was queued
+    /// (another client made it meanwhile). The retry's 409 cannot be told
+    /// from one answering our own lost POST, so G0 is adopted, and the ops
+    /// queued on the `local:` id apply to it.
+    #[test]
+    fn create_folder_after_a_transport_failure_adopts_a_folder_listed_later_residual() {
         let store = folder_store();
         let (local, row) = queued_create(&store, "New");
         let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -5432,12 +5451,7 @@ mod tests {
         ));
         assert!(store.send_posted(row.seq).unwrap(), "may have gone out");
 
-        // The documented residual (#2109): G0 "New" is listed only after
-        // the create was queued (another client made it meanwhile). The
-        // retry's 409 cannot be told from one answering our own lost POST,
-        // so G0 is adopted; nothing is lost, the queued ops land in a
-        // folder of that name.
-        store.upsert_folder(&named("G0", "New")).unwrap();
+        store.upsert_folder(&named_folder("G0", "New")).unwrap();
         let srv = FakeServer::start(vec![
             route(
                 "POST",
@@ -5461,6 +5475,46 @@ mod tests {
             }
         );
         assert_eq!(store.current_folder_id(&local).unwrap(), "G0");
+    }
+
+    /// A folder whose delete is still queued (#2107) is not adopted: the
+    /// delete removed its row at once, so the create got past the sibling
+    /// check, but Graph still has it until the delete is sent.
+    #[test]
+    fn create_folder_409_does_not_adopt_a_folder_whose_delete_is_queued() {
+        let srv = FakeServer::start(vec![
+            route(
+                "POST",
+                "/me/mailFolders/INBOX/childFolders",
+                409,
+                FOLDER_EXISTS,
+            ),
+            route(
+                "GET",
+                "/me/mailFolders/INBOX/childFolders",
+                200,
+                r#"{"value":[{"id":"G0","displayName":"New","parentFolderId":"INBOX"}]}"#,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let store = folder_store();
+        store.upsert_folder(&named_folder("G0", "New")).unwrap();
+        let (deleted, _) = store.delete_folder("G0").unwrap();
+        assert_eq!(
+            deleted,
+            crate::store::FolderWriteResult::Written("G0".into())
+        );
+        assert!(!store.has_folder("G0").unwrap(), "its row went at once");
+        let (local, row) = queued_create(&store, "New");
+        store.set_send_posted(row.seq, true).unwrap();
+        assert!(matches!(
+            create_row(&c, &store, &row),
+            Err(GraphError::Http { status: 409, .. })
+        ));
+        assert!(store.has_folder(&local).unwrap(), "the engine refuses it");
+        assert_eq!(store.current_folder_id(&local).unwrap(), local);
+        assert!(!store.has_folder("G0").unwrap(), "nothing re-keyed");
+        assert_eq!(srv.requests().len(), 2, "the POST and the lookup");
     }
 
     #[test]
