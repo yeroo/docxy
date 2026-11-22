@@ -820,6 +820,21 @@ impl Session {
                     let at: u32 = p[0].parse().unwrap_or(0);
                     let n: u32 = p[1].parse().unwrap_or(1).max(1);
                     let idx = self.active;
+                    // As the suite and xlsxy refuse it: the engine drops
+                    // what an insert pushes off the sheet (#1175).
+                    let rows = op == "insrow";
+                    if (rows || op == "inscol")
+                        && gridcore::edit::insert_shifts_data_off(
+                            &self.pkg.workbook,
+                            idx,
+                            rows,
+                            at,
+                            n,
+                        )
+                    {
+                        self.err = Some(gridcore::edit::SHIFT_OFF_SHEET.to_string());
+                        return None;
+                    }
                     match op {
                         "insrow" => {
                             self.structural(|wb| gridcore::edit::insert_rows(wb, idx, at, n))
@@ -4018,7 +4033,8 @@ impl Session {
     /// `{at,count?,sheet?}` -> `{inserted|deleted,undoSteps:1}`. Reuses the
     /// interactive `"insrow"`/`"delrow"` dispatch commands (one `Structural`
     /// undo group each), temporarily swapping `active` to the target sheet
-    /// since those commands target `self.active`.
+    /// since those commands target `self.active`. An insert the dispatch
+    /// refuses, as it would push data off the sheet, is an error (#1175).
     fn ctl_row_op(&mut self, args: &json::Json, insert: bool) -> Result<String, String> {
         let verb = if insert { "row.insert" } else { "row.delete" };
         let si = self.ctl_sheet_arg(args)?;
@@ -4032,8 +4048,17 @@ impl Session {
         let prev_active = self.active;
         self.active = si;
         let cmd = if insert { "insrow" } else { "delrow" };
+        // As `ctl_range_clear`: only this insert's own refusal is read back.
+        self.err = None;
         self.dispatch(&format!("{cmd}\t{at}\t{count}"));
         self.active = prev_active;
+        if self
+            .err
+            .take()
+            .is_some_and(|e| e == gridcore::edit::SHIFT_OFF_SHEET)
+        {
+            return Err(format!("{verb}: {}", gridcore::edit::SHIFT_OFF_SHEET));
+        }
         let key = if insert { "inserted" } else { "deleted" };
         Ok(format!("{{\"{key}\":{count},\"undoSteps\":1}}"))
     }
@@ -4053,8 +4078,17 @@ impl Session {
         let prev_active = self.active;
         self.active = si;
         let cmd = if insert { "inscol" } else { "delcol" };
+        // As `ctl_range_clear`: only this insert's own refusal is read back.
+        self.err = None;
         self.dispatch(&format!("{cmd}\t{at}\t{count}"));
         self.active = prev_active;
+        if self
+            .err
+            .take()
+            .is_some_and(|e| e == gridcore::edit::SHIFT_OFF_SHEET)
+        {
+            return Err(format!("{verb}: {}", gridcore::edit::SHIFT_OFF_SHEET));
+        }
         let key = if insert { "inserted" } else { "deleted" };
         Ok(format!("{{\"{key}\":{count},\"undoSteps\":1}}"))
     }
@@ -8957,6 +8991,66 @@ mod tests {
     }
 
     // -- row.* / col.*: one wasm-undo-stack (Structural) group -------------
+
+    /// What an insert refused for pushing data off the sheet must leave as
+    /// it was (#1175).
+    fn insert_state(s: &Session) -> (Vec<gridcore::sheet::Sheet>, usize, usize, bool, u64) {
+        let sheets = s.pkg.workbook.sheets.clone();
+        (sheets, s.undo.len(), s.redo.len(), s.dirty, s.edits)
+    }
+
+    #[test]
+    fn insrow_and_inscol_refuse_to_push_data_off_the_sheet_1175() {
+        use gridcore::sheet::{MAX_COLS, MAX_ROWS};
+        for (cmd, at) in [
+            ("insrow\t0\t1", (MAX_ROWS - 1, 0)),
+            ("inscol\t0\t1", (0, MAX_COLS - 1)),
+        ] {
+            let mut s = Session::open(&sample_xlsx()).expect("open");
+            s.pkg.workbook.sheets[0].set_cell(at.0, at.1, Cell::text("edge"));
+            let before = insert_state(&s);
+            s.dispatch(cmd);
+            assert_eq!(
+                s.err.as_deref(),
+                Some(gridcore::edit::SHIFT_OFF_SHEET),
+                "{cmd}"
+            );
+            assert!(insert_state(&s) == before, "{cmd}: nothing moves");
+            // The host shows the refusal.
+            assert!(s.view_json(None).contains("can't be shifted off"), "{cmd}");
+        }
+        // An insert that pushes only blanks off still goes ahead.
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("insrow\t0\t1");
+        assert_eq!(s.err, None);
+        assert_eq!((s.undo.len(), s.edits), (1, 1));
+    }
+
+    #[test]
+    fn ctl_row_and_col_insert_refuse_to_push_data_off_the_sheet_1175() {
+        use gridcore::sheet::{MAX_COLS, MAX_ROWS};
+        for (verb, at) in [
+            ("row.insert", (MAX_ROWS - 1, 0)),
+            ("col.insert", (0, MAX_COLS - 1)),
+        ] {
+            // The edge cell is on sheet 1, the target; sheet 0 is active.
+            let mut s = abc_session();
+            s.pkg.workbook.sheets[1].set_cell(at.0, at.1, Cell::text("edge"));
+            let before = insert_state(&s);
+            let out = s.ctl(&format!(
+                r#"{{"verb":"{verb}","args":{{"at":0,"sheet":1}}}}"#
+            ));
+            let want = format!("{verb}: {}", gridcore::edit::SHIFT_OFF_SHEET);
+            assert!(out.contains(&want), "{out}");
+            assert!(!out.contains("inserted"), "{out}");
+            assert!(insert_state(&s) == before, "{verb}: nothing moves");
+            assert_eq!(s.active, 0, "{verb}");
+            assert_eq!(s.err, None, "{verb}: the reply carries the refusal");
+            // The active sheet's own edge is what a sheet-less call reads.
+            let out = s.ctl(&format!(r#"{{"verb":"{verb}","args":{{"at":0}}}}"#));
+            assert!(out.contains("\"inserted\":1"), "{out}");
+        }
+    }
 
     #[test]
     fn ctl_row_insert_shifts_refs_and_is_one_undo_group() {
