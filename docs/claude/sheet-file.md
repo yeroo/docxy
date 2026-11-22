@@ -445,3 +445,54 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   - the parser reading `[k]` references;
   - sheet-scoped external names through a sheet XTI;
   - 3D spans across another book.
+
+## Page setup, breaks, print area and titles from `.xlsb` and `.ods` (#901)
+
+- Both readers fill `SheetIn::page_setup`, `row_breaks`, `col_breaks` (and
+  `.xlsb` `outline`), which `build_counted` copies into the `Sheet` as for
+  `.xls` (#1440), so Convert writes them. `legacy_page_setup_matches_the_xlsx_originals`
+  checks all three formats against the corpus `.xlsx` (3 × 2 × 22 sheets).
+- `.xlsb` (`xlsb.rs::read_sheet`): BrtWsProp (147, WSBOOL's bits:
+  `page::read_wsbool`), BrtMargins (476, six f64s), BrtPrintOptions (477),
+  BrtPageSetup (478), BrtBeginHeaderFooter (479, flags then six nullable
+  strings) and BrtBrk (396) between BrtBegin/EndRwBrk (392/393) or
+  ColBrk (394/395). BrtPageSetup's flags are not SETUP's: bit 1 is
+  fLandscape, there is no fNoPls, fEndNotes is bit 8 and iErrors bits 9-10
+  (`page::read_page_setup_12`). A first page below 1 is `None` (`.xls`'s
+  `read_setup` keeps 0). Records inside BrtBegin/EndUserShView (423/424)
+  are a custom view's and are skipped. Absent records leave
+  `PageSetup::default()`, the `.xlsx` loader's reading, not `page::absent`.
+  Only manual breaks (fMan) are kept. `.xlsb` has no `dropped` list, so
+  nothing is named.
+- `.ods` (`ods.rs`): a table's `table:style-name` → that table style's
+  `style:master-page-name` (else the master page `Default`) →
+  `style:page-layout`. The page's `fo:margin-top` is the header margin; the
+  model's top adds the header's `fo:min-height` (or `svg:height`) and its
+  `fo:margin-bottom` spacing when the master page's `style:header` is
+  present and not `style:display="false"`. Bottom/footer likewise with
+  `fo:margin-top` as the spacing. This inverts Excel's ODS writing
+  (corpus: 0.5118 + 0.4882 = top 1).
+- `.ods` paper comes from `fo:page-width`/`-height` through
+  `print::setup::paper_code` (`KNOWN_PAPERS`, within 2 pt either way
+  round). Excel's ODS writer gives none, so every corpus `.ods` imports as
+  Letter: the corpus test checks that, then puts in the original's paper.
+- `.ods` header and footer parts become Excel strings: regions as
+  `&L`/`&C`/`&R`, a paragraph outside any region in the centre, `&` as
+  `&&`, the page-number/page-count/sheet-name/date/time/file-name fields as
+  `&P &N &A &D &T &F` (their cached text skipped), formatting dropped.
+  Even and first pages differ only when a shown part has text: Excel writes
+  an empty `style:header-first` and a hidden `style:header-left` on every
+  master page. `loext:` spellings of `scale-to-X/Y` and
+  `header-first`/`footer-first` are read too.
+- `.ods` breaks: rows and columns in a style with `fo:break-before="page"`
+  (`StyleSheet::break_rows`/`break_cols`), each of a repeated run, row or
+  column 0 and anything off the grid left out. `add_breaks` stops at
+  `page::MAX_BREAKS`, so a million-row filler run costs nothing.
+- `.ods` print area and titles: `table:print-ranges` (split at spaces
+  outside quoted names) → a sheet-local `_xlnm.Print_Area`, all ranges or
+  none; `table:table-header-rows`/`-columns` → `_xlnm.Print_Titles`,
+  columns first. Both are spelled by `print::area::spell_refs`, which quotes
+  a sheet name that looks like a cell (`'T2'!$A:$B`).
+- Not done: `.xlsb` row outline levels (BrtRowHdr), `.ods` outline groups,
+  `style:scale-to-pages`, header and footer fonts, paper sizes outside
+  `paper_points`.
