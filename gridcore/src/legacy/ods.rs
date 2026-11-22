@@ -21,8 +21,8 @@ use std::collections::{BTreeMap, HashMap};
 use opccore::xml::{Event, XmlParser};
 use opccore::zip::ZipArchive;
 
-use super::{BookIn, Limits, OpenError, SheetIn, sheet_prefix};
-use crate::sheet::{Cell, CellValue, DefinedName, MAX_COLS, MAX_ROWS};
+use super::{BookIn, ColIn, Limits, OpenError, SheetIn, sheet_prefix};
+use crate::sheet::{Cell, CellValue, DefinedName, MAX_COLS, MAX_ROWS, Xf};
 
 /// `2024-01-15` or `2024-01-15T12:30:00.5` as a serial.
 fn parse_date(s: &str, date1904: bool) -> Option<f64> {
@@ -541,18 +541,205 @@ fn format_code(styles: &HashMap<String, DataStyle>, name: &str) -> Option<String
     })
 }
 
-/// The data styles and table-cell styles of a styles or content part.
+/// The parts of a table-cell style's text and cell properties the model
+/// holds (#884): each `None` where the style leaves it to its parent.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CellProps {
+    bold: Option<bool>,
+    italic: Option<bool>,
+    /// `fo:color`: a colour, or `None` for one that doesn't read.
+    color: Option<Option<(u8, u8, u8)>>,
+    /// `fo:font-size`, in points.
+    size: Option<f64>,
+    /// The font family (`style:font-name` through the font-face
+    /// declarations, or `fo:font-family`).
+    font: Option<String>,
+    /// `fo:background-color`: a colour, or `None` for `transparent`.
+    fill: Option<Option<(u8, u8, u8)>>,
+    /// Each side (top, bottom, left, right): a thin solid line.
+    sides: [Option<bool>; 4],
+    /// A diagonal line is drawn.
+    diagonal: Option<bool>,
+}
+
+impl CellProps {
+    /// These properties, each one this style leaves unset taken from
+    /// `parent`.
+    fn over(&self, parent: &CellProps) -> CellProps {
+        let mut sides = self.sides;
+        for (s, p) in sides.iter_mut().zip(parent.sides) {
+            *s = s.or(p);
+        }
+        CellProps {
+            bold: self.bold.or(parent.bold),
+            italic: self.italic.or(parent.italic),
+            color: self.color.or(parent.color),
+            size: self.size.or(parent.size),
+            font: self.font.clone().or_else(|| parent.font.clone()),
+            fill: self.fill.or(parent.fill),
+            sides,
+            diagonal: self.diagonal.or(parent.diagonal),
+        }
+    }
+
+    /// Read the attributes of a `style:text-properties` or
+    /// `style:table-cell-properties` element.
+    fn read(&mut self, p: &XmlParser, faces: &HashMap<String, String>) {
+        let attr = |a: &str| Some(decoded(p.attr(a))).filter(|v| !v.is_empty());
+        if let Some(w) = attr("fo:font-weight") {
+            self.bold = Some(match w.as_str() {
+                "bold" => true,
+                "normal" => false,
+                n => n.parse::<u32>().is_ok_and(|n| n >= 600),
+            });
+        }
+        if let Some(st) = attr("fo:font-style") {
+            self.italic = Some(matches!(st.as_str(), "italic" | "oblique"));
+        }
+        if let Some(c) = attr("fo:color") {
+            self.color = Some(hex_color(&c));
+        }
+        if let Some(sz) = attr("fo:font-size") {
+            if let Some(pt) = length_pt(&sz) {
+                self.size = Some(pt);
+            }
+        }
+        if let Some(face) = attr("style:font-name") {
+            self.font = Some(faces.get(&face).cloned().unwrap_or(face));
+        } else if let Some(family) = attr("fo:font-family") {
+            self.font = Some(unquote(&family));
+        }
+        if let Some(bg) = attr("fo:background-color") {
+            self.fill = Some(hex_color(&bg));
+        }
+        if let Some(b) = attr("fo:border") {
+            self.sides = [Some(thin_line(&b)); 4];
+        }
+        for (i, side) in ["top", "bottom", "left", "right"].iter().enumerate() {
+            if let Some(b) = attr(&format!("fo:border-{side}")) {
+                self.sides[i] = Some(thin_line(&b));
+            }
+        }
+        for d in ["style:diagonal-bl-tr", "style:diagonal-tl-br"] {
+            if let Some(v) = attr(d) {
+                self.diagonal = Some(self.diagonal == Some(true) || v != "none");
+            }
+        }
+    }
+
+    /// The model format these properties give, with number format `code`.
+    fn xf(&self, code: Option<String>) -> Xf {
+        let mut x = Xf::default();
+        if code.is_some() {
+            x.set_code(code);
+        }
+        x.bold = self.bold.unwrap_or(false);
+        x.italic = self.italic.unwrap_or(false);
+        // Black is the automatic colour as the model sees it.
+        x.color = self.color.flatten().filter(|&c| c != (0, 0, 0));
+        x.font_size = self.size.filter(|&s| s != 11.0);
+        x.font_name = self
+            .font
+            .clone()
+            .filter(|f| !f.is_empty() && !f.eq_ignore_ascii_case("Calibri"));
+        x.fill = self.fill.flatten();
+        x.border = self.sides == [Some(true); 4] && self.diagonal != Some(true);
+        x
+    }
+}
+
+/// `#rrggbb` as a colour; `None` for `transparent` or anything else.
+fn hex_color(s: &str) -> Option<(u8, u8, u8)> {
+    let h = s.trim().strip_prefix('#')?;
+    if h.len() != 6 || !h.is_ascii() {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+    Some((byte(0)?, byte(2)?, byte(4)?))
+}
+
+/// A font family as `svg:font-family` or `fo:font-family` spells it, its
+/// quotes off (`'Liberation Sans'`).
+fn unquote(s: &str) -> String {
+    s.trim().trim_matches(|c| c == '\'' || c == '"').to_string()
+}
+
+/// An ODF length (`0.06pt`, `1.5875cm`, `0.889in`, `22.58mm`, `60px`) in
+/// points.
+pub(super) fn length_pt(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let split = s.find(|c: char| c.is_ascii_alphabetic())?;
+    let (n, unit) = s.split_at(split);
+    let n: f64 = n.trim().parse().ok()?;
+    let pt = match unit {
+        "pt" => n,
+        "in" => n * 72.0,
+        "cm" => n * 72.0 / 2.54,
+        "mm" => n * 72.0 / 25.4,
+        "pc" => n * 12.0,
+        "px" => n * 0.75,
+        _ => return None,
+    };
+    (pt.is_finite() && pt >= 0.0).then_some(pt)
+}
+
+/// Whether a border side (`0.06pt solid #000000`, `none`) is a thin solid
+/// line: what the model's thin box holds. A line of 1pt or less is thin
+/// (Excel writes its thin line as 0.06pt or 0.74pt, LibreOffice 0.74pt);
+/// its colour doesn't matter, as the `.xls` reader keeps a coloured box.
+fn thin_line(s: &str) -> bool {
+    let mut solid = false;
+    let mut width = None;
+    for w in s.split_whitespace() {
+        match w {
+            "solid" => solid = true,
+            "thin" => width = Some(0.75),
+            "none" | "hidden" => return false,
+            w => {
+                if let Some(pt) = length_pt(w) {
+                    width = Some(pt);
+                }
+            }
+        }
+    }
+    solid && width.is_some_and(|pt| pt <= 1.0)
+}
+
+/// One table-cell style: its data style, its parent and its own
+/// properties.
+#[derive(Clone, Debug, Default)]
+struct CellStyle {
+    data: Option<String>,
+    parent: Option<String>,
+    props: CellProps,
+}
+
+/// The data styles, table-cell styles and column styles of a styles or
+/// content part.
 #[derive(Default)]
 struct StyleSheet {
     data: HashMap<String, DataStyle>,
-    /// Cell style → (data style, parent style).
-    cells: HashMap<String, (Option<String>, Option<String>)>,
+    cells: HashMap<String, CellStyle>,
+    /// `style:default-style style:family="table-cell"`: what every cell
+    /// style inherits last.
+    default_cell: CellProps,
+    /// Font-face name → family (`office:font-face-decls`).
+    faces: HashMap<String, String>,
+    /// Column style → `style:column-width`, in points.
+    columns: HashMap<String, f64>,
+    /// `style:default-style style:family="table-column"`'s width.
+    default_column: Option<f64>,
 }
 
 impl StyleSheet {
     fn read(&mut self, xml: &str) {
         let mut p = XmlParser::new(xml);
         let mut cur: Option<(String, DataStyle)> = None;
+        // The table-cell style whose properties are being read: a named
+        // one, or (`Some(None)`) the default style.
+        let mut cell_style: Option<Option<String>> = None;
+        // The table-column style being read (`Some(None)`: the default).
+        let mut column_style: Option<Option<String>> = None;
         // The element whose text the current part collects.
         let mut text_into: Option<usize> = None;
         let mut text = String::new();
@@ -574,13 +761,67 @@ impl StyleSheet {
                         ));
                         continue;
                     }
-                    if name == "style:style" && p.attr("style:family") == "table-cell" {
-                        let opt = |a: &str| Some(attr(a)).filter(|s| !s.is_empty());
-                        self.cells.insert(
-                            attr("style:name"),
-                            (opt("style:data-style-name"), opt("style:parent-style-name")),
-                        );
-                        continue;
+                    let family = p.attr("style:family");
+                    match (name, family) {
+                        ("style:style", "table-cell") => {
+                            let opt = |a: &str| Some(attr(a)).filter(|s| !s.is_empty());
+                            let name = attr("style:name");
+                            self.cells.insert(
+                                name.clone(),
+                                CellStyle {
+                                    data: opt("style:data-style-name"),
+                                    parent: opt("style:parent-style-name"),
+                                    props: CellProps::default(),
+                                },
+                            );
+                            cell_style = Some(Some(name));
+                            continue;
+                        }
+                        ("style:default-style", "table-cell") => {
+                            cell_style = Some(None);
+                            continue;
+                        }
+                        ("style:style", "table-column") => {
+                            column_style = Some(Some(attr("style:name")));
+                            continue;
+                        }
+                        ("style:default-style", "table-column") => {
+                            column_style = Some(None);
+                            continue;
+                        }
+                        ("style:font-face", _) => {
+                            let family = attr("svg:font-family");
+                            if !family.is_empty() {
+                                self.faces.insert(attr("style:name"), unquote(&family));
+                            }
+                            continue;
+                        }
+                        ("style:text-properties" | "style:table-cell-properties", _)
+                            if cell_style.is_some() =>
+                        {
+                            let faces = std::mem::take(&mut self.faces);
+                            let props = match cell_style.as_ref() {
+                                Some(Some(n)) => self.cells.get_mut(n).map(|c| &mut c.props),
+                                _ => Some(&mut self.default_cell),
+                            };
+                            if let Some(props) = props {
+                                props.read(&p, &faces);
+                            }
+                            self.faces = faces;
+                            continue;
+                        }
+                        ("style:table-column-properties", _) if column_style.is_some() => {
+                            if let Some(pt) = length_pt(p.attr("style:column-width")) {
+                                match column_style.clone().flatten() {
+                                    Some(n) => {
+                                        self.columns.insert(n, pt);
+                                    }
+                                    None => self.default_column = Some(pt),
+                                }
+                            }
+                            continue;
+                        }
+                        _ => {}
                     }
                     let Some((_, style)) = cur.as_mut() else {
                         continue;
@@ -661,6 +902,10 @@ impl StyleSheet {
                     }
                 }
                 Event::End => {
+                    if matches!(p.name(), "style:style" | "style:default-style") {
+                        cell_style = None;
+                        column_style = None;
+                    }
                     if let (Some(i), Some((_, style))) = (text_into, cur.as_mut()) {
                         match style.parts.get_mut(i) {
                             Some(Part::Text(t)) | Some(Part::Currency(t, _)) => {
@@ -688,13 +933,36 @@ impl StyleSheet {
     fn code(&self, name: &str) -> Option<String> {
         let mut at = name;
         for _ in 0..16 {
-            let (data, parent) = self.cells.get(at)?;
-            if let Some(d) = data {
+            let style = self.cells.get(at)?;
+            if let Some(d) = &style.data {
                 return format_code(&self.data, d);
             }
-            at = parent.as_deref()?;
+            at = style.parent.as_deref()?;
         }
         None
+    }
+
+    /// The properties of cell style `name` (`None`: a cell with no style,
+    /// which takes `Default`), through its parents and the default style.
+    fn props(&self, name: Option<&str>) -> CellProps {
+        let mut chain = Vec::new();
+        let mut at = name.or(self.cells.contains_key("Default").then_some("Default"));
+        while let Some(n) = at.filter(|_| chain.len() < 16) {
+            let Some(style) = self.cells.get(n) else {
+                break;
+            };
+            chain.push(&style.props);
+            at = style.parent.as_deref();
+        }
+        chain
+            .into_iter()
+            .rev()
+            .fold(self.default_cell.clone(), |acc, own| own.over(&acc))
+    }
+
+    /// The model format of cell style `name` (`None`: no style).
+    fn xf(&self, name: Option<&str>) -> Xf {
+        self.props(name).xf(self.code(name.unwrap_or("Default")))
     }
 }
 
@@ -734,13 +1002,85 @@ fn copy_bytes(cell: &Cell) -> usize {
     1 + text + cell.formula.as_ref().map_or(0, String::len)
 }
 
+/// A table's column runs as read: (first column, count, width in points,
+/// hidden).
+type ColRun = (u32, u32, Option<f64>, bool);
+
+/// The column definitions of a table's runs (#884). The width that covers
+/// the most columns is the sheet's default and gives no definition (Excel
+/// and LibreOffice give every column a width, the default ones too); it
+/// is the sheet's default width unless it is Excel's own. Each other width
+/// becomes one, as does a hidden column.
+fn table_columns(runs: &[ColRun], sheet: &mut SheetIn) {
+    use crate::print::paginate::width_of_px;
+    let key = |pt: f64| (pt * 100.0).round() as i64;
+    let mut cover: HashMap<Option<i64>, u64> = HashMap::new();
+    for &(first, n, pt, _) in runs {
+        let n = n.min(MAX_COLS.saturating_sub(first)) as u64;
+        *cover.entry(pt.map(key)).or_default() += n;
+    }
+    // Most columns; a tie goes to the narrower width, so it is the same
+    // on every run.
+    let common = cover
+        .into_iter()
+        .max_by_key(|&(k, n)| (n, std::cmp::Reverse(k)))
+        .and_then(|(k, _)| k);
+    let chars = |pt: f64| width_of_px(pt * 96.0 / 72.0);
+    if let Some(k) = common {
+        let w = chars(k as f64 / 100.0);
+        let dx = (w * 256.0).round();
+        let excel = dx <= f64::from(u16::MAX)
+            && super::xls::is_default_coldx(sheet.base_col_width, None, dx as u16);
+        sheet.default_col_width = (!excel).then_some(w);
+    }
+    for &(first, n, pt, hidden) in runs {
+        if first >= MAX_COLS || n == 0 {
+            continue;
+        }
+        let width = pt.filter(|&pt| Some(key(pt)) != common).map(chars);
+        if width.is_some() || hidden {
+            sheet.cols.push(ColIn {
+                first,
+                last: first.saturating_add(n - 1).min(MAX_COLS - 1),
+                width,
+                hidden,
+                ..ColIn::default()
+            });
+        }
+    }
+}
+
+/// A cell's format in the book: its `book.xfs` index, and whether it
+/// differs from the document's default format (a styled blank is kept
+/// only then).
+#[derive(Clone, Copy)]
+struct Look {
+    style: u32,
+    styled: bool,
+}
+
 fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn, OpenError> {
     let mut book = BookIn::with_limits(limits);
-    let mut codes: HashMap<String, u32> = HashMap::new();
+    // Each cell style's format, made once (the key "" is no style).
+    let mut looks: HashMap<String, Look> = HashMap::new();
+    let doc_default = styles.xf(None);
+    let mut look_of = |name: Option<&str>, book: &mut BookIn| -> Look {
+        *looks
+            .entry(name.unwrap_or("").to_string())
+            .or_insert_with(|| {
+                let xf = styles.xf(name);
+                let styled = xf != doc_default;
+                Look {
+                    style: book.add_xf(xf),
+                    styled,
+                }
+            })
+    };
     let mut p = XmlParser::new(xml);
     let mut stack: Vec<String> = Vec::new();
     // Per table: the column default styles as runs (first column, style).
     let mut col_styles: Vec<(u32, String)> = Vec::new();
+    let mut col_runs: Vec<ColRun> = Vec::new();
     let mut next_col = 0u32;
     let mut row = 0u32;
     let mut col = 0u32;
@@ -748,6 +1088,8 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
     let mut row_style = String::new();
     // The current row's cells, before its repeat is known to apply.
     let mut row_cells: Vec<(u32, Cell)> = Vec::new();
+    // The current row's merges: (column, columns, rows) spanned.
+    let mut row_merges: Vec<(u32, u32, u32)> = Vec::new();
     let mut cell: Option<CellIn> = None;
     // Depth inside an annotation or a drawn shape, whose text is not the
     // cell's.
@@ -769,6 +1111,7 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                             ..SheetIn::default()
                         })?;
                         col_styles.clear();
+                        col_runs.clear();
                         next_col = 0;
                         row = 0;
                     }
@@ -778,11 +1121,19 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                             .parse()
                             .unwrap_or(1u32);
                         col_styles.push((next_col, attr("table:default-cell-style-name")));
+                        let width = styles
+                            .columns
+                            .get(&attr("table:style-name"))
+                            .copied()
+                            .or(styles.default_column);
+                        let collapsed = p.attr("table:visibility") == "collapse";
+                        col_runs.push((next_col, n, width, collapsed));
                         next_col = next_col.saturating_add(n);
                     }
                     "table:table-row" => {
                         col = 0;
                         row_cells.clear();
+                        row_merges.clear();
                         row_repeat = p
                             .attr("table:number-rows-repeated")
                             .parse()
@@ -866,30 +1217,46 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                     n if n == "office:annotation" || n.starts_with("draw:") => {
                         hidden = hidden.saturating_sub(1);
                     }
+                    "table:table" => {
+                        if let Some(sheet) = book.sheets.last_mut() {
+                            table_columns(&col_runs, sheet);
+                        }
+                    }
                     "table:table-cell" | "table:covered-table-cell" => {
                         let Some(c) = cell.take() else { continue };
                         let repeat = c.repeat;
+                        let last = col.saturating_add(repeat).min(MAX_COLS);
+                        let own = c
+                            .attrs
+                            .get("table:style-name")
+                            .filter(|s| !s.is_empty())
+                            .cloned()
+                            .or_else(|| (!row_style.is_empty()).then(|| row_style.clone()));
+                        // The column default style of each column from
+                        // `from`: runs of (first, end, style).
+                        let by_column = |from: u32, to: u32| -> Vec<(u32, u32, Option<String>)> {
+                            let mut out = Vec::new();
+                            let mut at = from;
+                            while at < to {
+                                let k = col_styles.partition_point(|(first, _)| *first <= at);
+                                let style = k
+                                    .checked_sub(1)
+                                    .map(|k| col_styles[k].1.clone())
+                                    .filter(|s| !s.is_empty());
+                                let end =
+                                    col_styles.get(k).map_or(to, |(first, _)| (*first).min(to));
+                                out.push((at, end, style));
+                                at = end;
+                            }
+                            out
+                        };
                         if let Some(value) = cell_value(&c, null_date_1904) {
-                            let style_name = c
-                                .attrs
-                                .get("table:style-name")
-                                .cloned()
-                                .filter(|s| !s.is_empty())
-                                .or_else(|| (!row_style.is_empty()).then(|| row_style.clone()))
-                                .or_else(|| {
-                                    col_styles
-                                        .iter()
-                                        .rev()
-                                        .find(|(first, _)| *first <= col)
-                                        .map(|(_, s)| s.clone())
-                                        .filter(|s| !s.is_empty())
-                                });
-                            let style = match style_name {
-                                Some(s) => *codes.entry(s.clone()).or_insert_with(|| {
-                                    styles.code(&s).map_or(0, |code| book.format_index(&code))
-                                }),
-                                None => 0,
-                            };
+                            let style_name = own.clone().or_else(|| {
+                                by_column(col, col.saturating_add(1))
+                                    .pop()
+                                    .and_then(|r| r.2)
+                            });
+                            let style = look_of(style_name.as_deref(), &mut book).style;
                             let formula = c
                                 .attrs
                                 .get("table:formula")
@@ -900,7 +1267,6 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                                 style,
                                 ..Cell::default()
                             };
-                            let last = col.saturating_add(repeat).min(MAX_COLS);
                             let n = last.saturating_sub(col) as usize;
                             let copies = n.saturating_sub(1);
                             book.charge_repeats(copies, copies.saturating_mul(copy_bytes(&made)))?;
@@ -908,25 +1274,87 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                             for cc in col..last {
                                 row_cells.push((cc, made.clone()));
                             }
+                        } else if name == "table:table-cell" && last < MAX_COLS {
+                            // A styled blank (#884), unless its run reaches
+                            // the grid's last column: that is padding.
+                            let runs = match &own {
+                                Some(s) => vec![(col, last, Some(s.clone()))],
+                                None => by_column(col, last),
+                            };
+                            for (from, to, style) in runs {
+                                let look = look_of(style.as_deref(), &mut book);
+                                if look.styled && book.take_styled_blanks((to - from) as usize) {
+                                    let made = Cell {
+                                        style: look.style,
+                                        ..Cell::default()
+                                    };
+                                    row_cells.extend((from..to).map(|cc| (cc, made.clone())));
+                                }
+                            }
+                        }
+                        // A merged range starts here (its first copy only).
+                        let span = |a: &str| {
+                            c.attrs
+                                .get(a)
+                                .and_then(|v| v.parse::<u32>().ok())
+                                .unwrap_or(1)
+                                .max(1)
+                        };
+                        let (cs, rs) = (
+                            span("table:number-columns-spanned"),
+                            span("table:number-rows-spanned"),
+                        );
+                        if (cs > 1 || rs > 1) && col < MAX_COLS {
+                            row_merges.push((col, cs, rs));
                         }
                         col = col.saturating_add(repeat);
                     }
                     "table:table-row" => {
-                        if !row_cells.is_empty() && !book.sheets.is_empty() {
-                            let last = row.saturating_add(row_repeat).min(MAX_ROWS);
+                        let last = row.saturating_add(row_repeat).min(MAX_ROWS);
+                        // A run of rows to the grid's last row is padding:
+                        // its styled blanks and merges are not kept.
+                        let padding = row_repeat > 1 && last == MAX_ROWS;
+                        if padding {
+                            row_cells.retain(|(_, c)| c.value != CellValue::Empty);
+                            row_merges.clear();
+                        }
+                        if (!row_cells.is_empty() || !row_merges.is_empty())
+                            && !book.sheets.is_empty()
+                        {
                             // The first instance was charged cell by cell;
                             // each further row copies them all.
                             let extra = (last.saturating_sub(row) as usize).saturating_sub(1);
-                            let row_bytes: usize =
-                                row_cells.iter().map(|(_, c)| copy_bytes(c)).sum();
-                            let copies = extra.saturating_mul(row_cells.len());
+                            let blanks = row_cells
+                                .iter()
+                                .filter(|(_, c)| c.value == CellValue::Empty)
+                                .count();
+                            let values = row_cells.len() - blanks;
+                            let row_bytes: usize = row_cells
+                                .iter()
+                                .filter(|(_, c)| c.value != CellValue::Empty)
+                                .map(|(_, c)| copy_bytes(c))
+                                .sum();
+                            let copies = extra.saturating_mul(values);
                             book.charge_repeats(copies, extra.saturating_mul(row_bytes))?;
                             book.charge_cells(copies)?;
-                            if let Some(sheet) = book.sheets.last_mut() {
-                                for r in row..last {
-                                    for (cc, made) in &row_cells {
+                            let merge_copies = extra.saturating_mul(row_merges.len());
+                            book.charge_repeats(merge_copies, 0)?;
+                            for r in row..last {
+                                // A copy's styled blanks, while they fit.
+                                let with_blanks =
+                                    r == row || (blanks > 0 && book.take_styled_blanks(blanks));
+                                let Some(sheet) = book.sheets.last_mut() else {
+                                    break;
+                                };
+                                for (cc, made) in &row_cells {
+                                    if with_blanks || made.value != CellValue::Empty {
                                         sheet.cells.insert((r, *cc), made.clone());
                                     }
+                                }
+                                for &(c, cs, rs) in &row_merges {
+                                    let r2 = r.saturating_add(rs - 1).min(MAX_ROWS - 1);
+                                    let c2 = c.saturating_add(cs - 1).min(MAX_COLS - 1);
+                                    sheet.merges.push((r, c, r2, c2));
                                 }
                             }
                         }
@@ -1357,5 +1785,296 @@ mod tests {
             back.workbook.sheets[0].cell(0, 0).unwrap().value,
             CellValue::Number(100.0)
         );
+    }
+
+    // --- #884: cell formats, styled blanks, column widths and merges ----
+
+    /// A content.xml with these font faces, automatic styles and tables.
+    fn styled_content(faces: &str, auto: &str, body: &str) -> String {
+        format!(
+            r#"<office:document-content xmlns:office="o" xmlns:table="t" xmlns:text="x" xmlns:number="n" xmlns:style="s" xmlns:fo="f" xmlns:svg="g" xmlns:dc="d"><office:font-face-decls>{faces}</office:font-face-decls><office:automatic-styles>{auto}</office:automatic-styles><office:body><office:spreadsheet>{body}</office:spreadsheet></office:body></office:document-content>"#
+        )
+    }
+
+    /// Read `content` after the styles part `styles_xml` (may be empty),
+    /// under `limits`.
+    fn read_styled(styles_xml: &str, content: &str, limits: Limits) -> BookIn {
+        let mut styles = StyleSheet::default();
+        styles.read(styles_xml);
+        styles.read(content);
+        read_content(content, &styles, limits).unwrap()
+    }
+
+    fn xf_at(b: &BookIn, r: u32, c: u32) -> Xf {
+        b.xfs[b.sheets[0].cells[&(r, c)].style as usize].clone()
+    }
+
+    /// A cell style's text and cell properties become the cell's model
+    /// format, through its parent; a thick or partial border is no box.
+    #[test]
+    fn ods_cell_style_formatting() {
+        let xml = styled_content(
+            r#"<style:font-face style:name="Arial1" svg:font-family="'Arial'"/>"#,
+            r##"<style:style style:name="ce1" style:family="table-cell">
+                 <style:table-cell-properties fo:background-color="#ffff00" fo:border="0.06pt solid #000000"/>
+                 <style:text-properties fo:font-weight="bold" fo:font-style="italic" fo:color="#ff0000" fo:font-size="14pt" style:font-name="Arial1"/></style:style>
+               <style:style style:name="ce2" style:family="table-cell" style:parent-style-name="ce1">
+                 <style:table-cell-properties fo:background-color="transparent" fo:border="none" fo:border-top="0.74pt solid #ff0000" fo:border-bottom="0.74pt solid #000000" fo:border-left="0.74pt solid #000000" fo:border-right="0.74pt solid #000000"/>
+                 <style:text-properties fo:font-weight="normal" fo:color="#000000"/></style:style>
+               <style:style style:name="ce3" style:family="table-cell">
+                 <style:table-cell-properties fo:border="2.5pt solid #000000"/></style:style>
+               <style:style style:name="ce4" style:family="table-cell">
+                 <style:table-cell-properties fo:border-top="0.74pt solid #000000" fo:border-bottom="0.74pt solid #000000"/></style:style>"##,
+            r#"<table:table table:name="S"><table:table-row>
+                 <table:table-cell table:style-name="ce1" office:value-type="float" office:value="1"/>
+                 <table:table-cell table:style-name="ce2" office:value-type="float" office:value="2"/>
+                 <table:table-cell table:style-name="ce3" office:value-type="float" office:value="3"/>
+                 <table:table-cell table:style-name="ce4" office:value-type="float" office:value="4"/>
+                 <table:table-cell office:value-type="float" office:value="5"/>
+               </table:table-row></table:table>"#,
+        );
+        let b = read_styled("", &xml, Limits::default());
+        let x = xf_at(&b, 0, 0);
+        assert!(x.bold && x.italic && x.border, "{x:?}");
+        assert_eq!(x.color, Some((255, 0, 0)));
+        assert_eq!(x.fill, Some((255, 255, 0)));
+        assert_eq!(x.font_size, Some(14.0));
+        assert_eq!(x.font_name.as_deref(), Some("Arial"));
+        // The four sides set one by one: a box, in any colour; the rest
+        // as ce2 overrides its parent.
+        let x = xf_at(&b, 0, 1);
+        assert!(x.border && !x.bold && x.italic, "{x:?}");
+        assert_eq!((x.color, x.fill, x.font_size), (None, None, Some(14.0)));
+        // A thick box and two sides are no thin box.
+        assert!(!xf_at(&b, 0, 2).border);
+        assert!(!xf_at(&b, 0, 3).border);
+        assert_eq!(b.sheets[0].cells[&(0, 4)].style, 0);
+    }
+
+    /// An empty cell whose style differs from the document's default is
+    /// kept for its format; one in the default style isn't.
+    #[test]
+    fn ods_styled_blank_kept() {
+        let xml = styled_content(
+            "",
+            r##"<style:style style:name="ce1" style:family="table-cell"><style:table-cell-properties fo:background-color="#00ff00"/></style:style>
+               <style:style style:name="ce2" style:family="table-cell"/>"##,
+            r#"<table:table table:name="S">
+                 <table:table-column table:number-columns-repeated="2"/>
+                 <table:table-column table:default-cell-style-name="ce1" table:number-columns-repeated="2"/>
+                 <table:table-column table:number-columns-repeated="16380"/>
+                 <table:table-row>
+                   <table:table-cell table:style-name="ce1" table:number-columns-repeated="2"/>
+                   <table:table-cell table:style-name="ce2"/>
+                   <table:table-cell/>
+                   <table:table-cell table:number-columns-repeated="16380"/>
+                 </table:table-row>
+                 <table:table-row table:number-rows-repeated="2">
+                   <table:table-cell table:number-columns-repeated="4"/>
+                 </table:table-row>
+               </table:table>"#,
+        );
+        let b = read_styled("", &xml, Limits::default());
+        let cells = &b.sheets[0].cells;
+        let at: Vec<_> = cells.keys().copied().collect();
+        // A1:B1 by their own style, D1 by its column's; C3:D3 and C2:D2
+        // (the repeated row) by their columns'. The rest is the default.
+        assert_eq!(at, [(0, 0), (0, 1), (0, 3), (1, 2), (1, 3), (2, 2), (2, 3)]);
+        for c in cells.values() {
+            assert_eq!(c.value, CellValue::Empty);
+            assert_eq!(b.xfs[c.style as usize].fill, Some((0, 255, 0)));
+        }
+    }
+
+    /// A LibreOffice document: its default cell style is Liberation Sans
+    /// 10, every column defaults to it, and padding fills the grid. No
+    /// empty cell is kept, and a value takes the default's font, as the
+    /// `.xls` reader keeps a workbook's Arial 10 (and Excel's `.xlsx` of
+    /// an `.ods` whose default is Aptos Narrow has it on every cell).
+    #[test]
+    fn ods_libreoffice_default_style_is_no_format() {
+        let styles_xml = r#"<office:document-styles xmlns:office="o" xmlns:style="s" xmlns:fo="f" xmlns:svg="g"><office:font-face-decls><style:font-face style:name="Liberation Sans" svg:font-family="'Liberation Sans'"/></office:font-face-decls><office:styles>
+            <style:default-style style:family="table-cell"><style:text-properties style:font-name="Liberation Sans" fo:font-size="10pt"/></style:default-style>
+            <style:default-style style:family="table-column"><style:table-column-properties style:column-width="0.889in"/></style:default-style>
+            <style:style style:name="Default" style:family="table-cell"/>
+            </office:styles></office:document-styles>"#;
+        let xml = styled_content(
+            "",
+            r#"<style:style style:name="co1" style:family="table-column"><style:table-column-properties style:column-width="0.889in"/></style:style>
+               <style:style style:name="ce1" style:family="table-cell" style:parent-style-name="Default"/>"#,
+            r#"<table:table table:name="S">
+                 <table:table-column table:style-name="co1" table:number-columns-repeated="1024" table:default-cell-style-name="Default"/>
+                 <table:table-row><table:table-cell table:style-name="ce1" office:value-type="float" office:value="1"/><table:table-cell table:number-columns-repeated="1023"/></table:table-row>
+                 <table:table-row table:number-rows-repeated="1048575"><table:table-cell table:number-columns-repeated="1024"/></table:table-row>
+               </table:table>"#,
+        );
+        let b = read_styled(styles_xml, &xml, Limits::default());
+        let s = &b.sheets[0];
+        assert_eq!(s.cells.len(), 1);
+        let x = xf_at(&b, 0, 0);
+        assert_eq!(x.font_name.as_deref(), Some("Liberation Sans"));
+        assert_eq!(x.font_size, Some(10.0));
+        assert!(!x.bold && x.fill.is_none() && !x.border);
+        // Every column is at the default width: no definition, and the
+        // sheet's default is LibreOffice's 0.889in (85 px).
+        assert!(s.cols.is_empty());
+        let w = s.default_col_width.unwrap();
+        assert_eq!(crate::print::paginate::width_px(w), 85.0);
+    }
+
+    /// The width most columns have is the default; the others are column
+    /// definitions in Excel's units, as is a collapsed column. A spanned
+    /// cell is a merge, made in each copy of a repeated row.
+    #[test]
+    fn ods_column_widths_and_spans() {
+        let xml = styled_content(
+            "",
+            r#"<style:style style:name="co1" style:family="table-column"><style:table-column-properties style:column-width="1.5875cm"/></style:style>
+               <style:style style:name="co2" style:family="table-column"><style:table-column-properties style:column-width="1.5in"/></style:style>"#,
+            r#"<table:table table:name="S">
+                 <table:table-column table:style-name="co1"/>
+                 <table:table-column table:style-name="co2" table:number-columns-repeated="2"/>
+                 <table:table-column table:style-name="co1" table:visibility="collapse"/>
+                 <table:table-column table:style-name="co1" table:number-columns-repeated="16380"/>
+                 <table:table-row>
+                   <table:table-cell table:number-columns-spanned="2" table:number-rows-spanned="3" office:value-type="float" office:value="1"/>
+                   <table:covered-table-cell/>
+                 </table:table-row>
+                 <table:table-row table:number-rows-repeated="2"><table:covered-table-cell/>
+                   <table:table-cell table:number-columns-spanned="3"/>
+                 </table:table-row>
+                 <table:table-row table:number-rows-repeated="1048573">
+                   <table:table-cell table:number-columns-spanned="2"/>
+                 </table:table-row>
+               </table:table>"#,
+        );
+        let b = read_styled("", &xml, Limits::default());
+        let s = &b.sheets[0];
+        assert_eq!(s.default_col_width, None);
+        let cols: Vec<_> = s
+            .cols
+            .iter()
+            .map(|c| (c.first, c.last, c.width, c.hidden))
+            .collect();
+        // 1.5in = 144 px, which Excel stores as 144/7 characters.
+        let w = (144.0f64 / 7.0 * 256.0).trunc() / 256.0;
+        assert_eq!(cols, [(1, 2, Some(w), false), (3, 3, None, true)]);
+        assert_eq!(crate::print::paginate::width_px(w), 144.0);
+        // The padding row's span is not a merge.
+        assert_eq!(s.merges, [(0, 0, 2, 1), (1, 1, 1, 3), (2, 1, 2, 3)]);
+    }
+
+    /// Styled blanks never refuse a file: padding in a style to the grid's
+    /// edge costs nothing, the rest has its own cap past which it is left
+    /// out, and none of it counts against the repeat budget.
+    #[test]
+    fn ods_padding_of_styled_blanks_opens() {
+        let auto = r##"<style:style style:name="ce1" style:family="table-cell"><style:table-cell-properties fo:background-color="#00ff00"/></style:style>"##;
+        // Padding in a style, as wide and as deep as the grid.
+        let xml = styled_content(
+            "",
+            auto,
+            r#"<table:table table:name="S"><table:table-column table:number-columns-repeated="16384" table:default-cell-style-name="ce1"/>
+                 <table:table-row><table:table-cell office:value-type="float" office:value="1"/><table:table-cell table:style-name="ce1" table:number-columns-repeated="16383"/></table:table-row>
+                 <table:table-row table:number-rows-repeated="1048575"><table:table-cell table:number-columns-repeated="16384"/></table:table-row>
+               </table:table>"#,
+        );
+        let started = std::time::Instant::now();
+        let b = read_styled("", &xml, Limits::default());
+        assert_eq!(b.sheets[0].cells.len(), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        // A styled 3x2000 block is kept, whole; at a repeat budget the
+        // values use up, it still opens.
+        let block = |rows: u32| {
+            styled_content(
+                "",
+                auto,
+                &format!(
+                    r#"<table:table table:name="S">
+                     <table:table-row table:number-rows-repeated="4"><table:table-cell office:value-type="float" office:value="1"/></table:table-row>
+                     <table:table-row table:number-rows-repeated="{rows}"><table:table-cell table:style-name="ce1" table:number-columns-repeated="3"/></table:table-row>
+                   </table:table>"#
+                ),
+            )
+        };
+        let at_budget = Limits {
+            repeat_cells: 3,
+            ..Limits::default()
+        };
+        let b = read_styled("", &block(2000), at_budget);
+        assert_eq!(b.sheets[0].cells.len(), 4 + 3 * 2000);
+
+        // Old LibreOffice pads rows to 1024 columns, not the grid's
+        // 16384: past the cap, the blanks are left out, and the file opens.
+        let old = styled_content(
+            "",
+            auto,
+            r#"<table:table table:name="S">
+                 <table:table-row table:number-rows-repeated="5000"><table:table-cell table:style-name="ce1" table:number-columns-repeated="1024"/></table:table-row>
+                 <table:table-row><table:table-cell office:value-type="float" office:value="2"/></table:table-row>
+               </table:table>"#,
+        );
+        let capped = Limits {
+            styled_blanks: 10_000,
+            ..Limits::default()
+        };
+        let b = read_styled("", &old, capped);
+        let cells = &b.sheets[0].cells;
+        // Nine rows of 1024 fit; the value after them is still there.
+        assert_eq!(cells.len(), 9 * 1024 + 1);
+        assert_eq!(cells[&(5000, 0)].value, CellValue::Number(2.0));
+    }
+
+    /// The content.xml of [`round_trip_ods`] (later slices add to it).
+    fn feature_ods_content() -> String {
+        styled_content(
+            r#"<style:font-face style:name="Arial" svg:font-family="Arial"/>"#,
+            r##"<style:style style:name="ce1" style:family="table-cell">
+                 <style:table-cell-properties fo:background-color="#ffff00" fo:border="0.74pt solid #000000"/>
+                 <style:text-properties fo:font-weight="bold" fo:font-style="italic" fo:color="#ff0000" fo:font-size="14pt" style:font-name="Arial"/></style:style>
+               <style:style style:name="co1" style:family="table-column"><style:table-column-properties style:column-width="1.5875cm"/></style:style>
+               <style:style style:name="co2" style:family="table-column"><style:table-column-properties style:column-width="1.5in"/></style:style>"##,
+            r#"<table:table table:name="S">
+                 <table:table-column table:style-name="co1"/>
+                 <table:table-column table:style-name="co2"/>
+                 <table:table-column table:style-name="co1" table:number-columns-repeated="16382"/>
+                 <table:table-row><table:table-cell table:style-name="ce1" office:value-type="float" office:value="1"/></table:table-row>
+                 <table:table-row><table:table-cell/></table:table-row>
+                 <table:table-row><table:table-cell table:number-columns-spanned="2" table:number-rows-spanned="2"/></table:table-row>
+               </table:table>"#,
+        )
+    }
+
+    fn ods_zip(content: &str) -> Vec<u8> {
+        opccore::zipwrite::write_zip(&[
+            (
+                "mimetype".to_string(),
+                b"application/vnd.oasis.opendocument.spreadsheet".to_vec(),
+            ),
+            ("content.xml".to_string(), content.as_bytes().to_vec()),
+        ])
+    }
+
+    /// Opened, saved as `.xlsx` and reloaded, an `.ods` keeps what the
+    /// import read (#884: they were lost on save).
+    #[test]
+    fn round_trip_ods() {
+        let (pkg, _) = super::super::open_workbook(&ods_zip(&feature_ods_content())).unwrap();
+        let back = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        let wb = &back.workbook;
+        let s = &wb.sheets[0];
+        let style = s.cell(0, 0).unwrap().style;
+        let x = wb.styles.xf(style);
+        assert!(x.bold && x.italic, "{x:?}");
+        assert!(super::super::saved_thin_box(&back, style));
+        assert_eq!(x.color, Some((255, 0, 0)));
+        assert_eq!(x.fill, Some((255, 255, 0)));
+        assert_eq!(x.font_size, Some(14.0));
+        assert_eq!(x.font_name.as_deref(), Some("Arial"));
+        let widths: Vec<_> = s.col_defs.iter().map(|d| (d.min, d.max, d.width)).collect();
+        let w = (144.0f64 / 7.0 * 256.0).trunc() / 256.0;
+        assert_eq!(widths, [(1, 1, Some(w))]);
+        assert_eq!(s.merges, [(2, 0, 3, 1)]);
     }
 }

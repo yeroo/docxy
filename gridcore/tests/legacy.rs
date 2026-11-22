@@ -483,17 +483,12 @@ fn legacy_imports_match_their_xlsx_originals() {
             assert_eq!(got_format, format, "{file}");
             compare_static(&file, &src, &pkg.workbook, &mut errs);
             compare_formulas(&file, &src, &pkg.workbook, &mut errs);
-            // The `.ods` reader reads formats from #884's next slice.
-            if ext != "ods" {
-                compare_looks(&file, &src, &pkg.workbook, &mut errs);
-            }
+            compare_looks(&file, &src, &pkg.workbook, &mut errs);
             // (h) what a user gets: open, save as .xlsx, reopen.
             let back = load_xlsx(&save_xlsx(&pkg)).expect("saved import reloads");
             let mut round = Vec::new();
             compare_static(&file, &src, &back.workbook, &mut round);
-            if ext != "ods" {
-                compare_looks(&file, &src, &back.workbook, &mut round);
-            }
+            compare_looks(&file, &src, &back.workbook, &mut round);
             errs.extend(round.into_iter().map(|e| format!("(h) after save: {e}")));
         }
     }

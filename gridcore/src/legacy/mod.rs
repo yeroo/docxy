@@ -295,6 +295,10 @@ pub(crate) struct Limits {
     /// Distinct external link parts with a function name ("too many
     /// external links").
     pub links: usize,
+    /// Empty cells an `.ods` keeps only for their format (#884), across
+    /// the workbook. Past it, further ones are left out: they hold no
+    /// value, so that loses formatting, never data, and is no error.
+    pub styled_blanks: usize,
 }
 
 impl Default for Limits {
@@ -305,6 +309,7 @@ impl Default for Limits {
             repeat_bytes: 256 << 20,
             sheets: 4_096,
             links: 4_096,
+            styled_blanks: 1_000_000,
         }
     }
 }
@@ -394,8 +399,6 @@ pub(crate) struct BookIn {
     /// The cell formats the cells' `style` indices name; index 0 is always
     /// the default (General).
     pub xfs: Vec<Xf>,
-    /// The `xfs` that are a number format alone, by code.
-    format_ix: HashMap<String, u32>,
     /// What the file has that the import leaves out ([`Opened::dropped`]).
     pub dropped: BTreeSet<&'static str>,
     /// The sheet the workbook opens on (an index into `sheets`).
@@ -419,6 +422,7 @@ pub(crate) struct BookIn {
     cells: usize,
     repeat_cells: usize,
     repeat_bytes: usize,
+    styled_blanks: usize,
 }
 
 impl BookIn {
@@ -433,21 +437,6 @@ impl BookIn {
             limits,
             ..BookIn::default()
         }
-    }
-
-    /// The `xfs` index of number format `code` alone, added when new.
-    pub fn format_index(&mut self, code: &str) -> u32 {
-        if code.eq_ignore_ascii_case("General") || code.is_empty() {
-            return 0;
-        }
-        if let Some(&i) = self.format_ix.get(code) {
-            return i;
-        }
-        let mut xf = Xf::default();
-        xf.set_code(Some(code.to_string()));
-        let i = self.add_xf(xf);
-        self.format_ix.insert(code.to_string(), i);
-        i
     }
 
     /// The `xfs` index of a new cell format `xf` (0 for the default).
@@ -495,6 +484,18 @@ impl BookIn {
             return Err(OpenError::Corrupt("too many repeated cells".into()));
         }
         Ok(())
+    }
+
+    /// Whether `n` more styled blanks fit [`Limits::styled_blanks`], and
+    /// if so, take them. Never an error: what doesn't fit is left out.
+    pub fn take_styled_blanks(&mut self, n: usize) -> bool {
+        match self.styled_blanks.checked_add(n) {
+            Some(t) if t <= self.limits.styled_blanks => {
+                self.styled_blanks = t;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The package: a fresh workbook with these sheets, cells, number
@@ -1689,7 +1690,12 @@ mod tests {
             repeat_bytes: 100,
             sheets: 2,
             links: 1,
+            styled_blanks: 5,
         });
+        // Styled blanks fit or are left out, never refused.
+        assert!(book.take_styled_blanks(5));
+        assert!(!book.take_styled_blanks(1));
+        assert!(!book.take_styled_blanks(usize::MAX));
         book.charge_cells(10).unwrap();
         assert!(
             book.charge_cells(1)
