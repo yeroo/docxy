@@ -29,6 +29,7 @@
 mod ftab;
 mod hlink;
 mod ods;
+mod page;
 mod ptg;
 mod ptg_write;
 mod xls;
@@ -316,11 +317,10 @@ pub(crate) struct SheetIn {
     pub cells: BTreeMap<(u32, u32), Cell>,
     /// Merged ranges (r1, c1, r2, c2).
     pub merges: Vec<(u32, u32, u32, u32)>,
-    /// Column definitions: (first, last, width in characters when set,
-    /// hidden, plain width: a width the file did not mark as user-set).
-    pub cols: Vec<(u32, u32, Option<f64>, bool, bool)>,
-    /// Rows: (row, height in points when set, hidden).
-    pub rows: Vec<(u32, Option<f64>, bool)>,
+    /// Column definitions.
+    pub cols: Vec<ColIn>,
+    /// Rows with a height, hidden or in an outline.
+    pub rows: Vec<RowIn>,
     /// Frozen rows and columns.
     pub freeze: (u32, u32),
     pub hidden: bool,
@@ -332,6 +332,41 @@ pub(crate) struct SheetIn {
     /// Cell hyperlinks in file order: (range, model target). A later one wins
     /// over a cell an earlier one covers.
     pub hyperlinks: Vec<(hlink::Rect, String)>,
+    /// The sheet's page setup; the readers that don't read one leave the
+    /// model's default.
+    pub page_setup: crate::print::setup::PageSetup,
+    /// Manual page breaks, as the model holds them.
+    pub row_breaks: Vec<crate::sheet::PageBreak>,
+    pub col_breaks: Vec<crate::sheet::PageBreak>,
+    /// Where outline summaries sit.
+    pub outline: crate::sheet::OutlineSettings,
+}
+
+/// One column definition as a reader collects it.
+#[derive(Debug, Default)]
+pub(crate) struct ColIn {
+    pub first: u32,
+    pub last: u32,
+    /// Width in characters, when set.
+    pub width: Option<f64>,
+    pub hidden: bool,
+    /// A width the file did not mark as user-set.
+    pub plain: bool,
+    /// Outline level (0 when ungrouped) and collapsed flag.
+    pub level: u8,
+    pub collapsed: bool,
+}
+
+/// One row as a reader collects it.
+#[derive(Debug, Default)]
+pub(crate) struct RowIn {
+    pub row: u32,
+    /// Height in points, when set.
+    pub height: Option<f64>,
+    pub hidden: bool,
+    /// Outline level (0 when ungrouped) and collapsed flag.
+    pub level: u8,
+    pub collapsed: bool,
 }
 
 /// Another workbook or add-in whose names formulas call, as `[k]!NAME`
@@ -547,28 +582,47 @@ impl BookIn {
                     );
                 }
             }
-            for (first, last, width, hidden, plain) in sheet.cols {
+            for c in sheet.cols {
+                use crate::sheet::with_xml_attr;
+                let mut attrs = String::new();
+                if c.hidden {
+                    attrs = with_xml_attr(&attrs, "hidden", Some("1"));
+                }
+                if c.level > 0 {
+                    attrs = with_xml_attr(&attrs, "outlineLevel", Some(&c.level.to_string()));
+                }
+                if c.collapsed {
+                    attrs = with_xml_attr(&attrs, "collapsed", Some("1"));
+                }
                 s.col_defs.push(crate::sheet::ColDef {
-                    min: first,
-                    max: last,
-                    width,
-                    attrs: if hidden {
-                        crate::sheet::with_xml_attr("", "hidden", Some("1"))
-                    } else {
-                        String::new()
-                    },
-                    default_width: width.is_none(),
-                    plain_width: plain,
+                    min: c.first,
+                    max: c.last,
+                    width: c.width,
+                    attrs,
+                    default_width: c.width.is_none(),
+                    plain_width: c.plain,
                 });
             }
-            for (row, height, hidden) in sheet.rows {
-                if height.is_some() {
-                    s.set_row_height(row, height);
+            for r in sheet.rows {
+                if r.height.is_some() {
+                    s.set_row_height(r.row, r.height);
                 }
-                if hidden {
-                    s.set_row_hidden(row, true);
+                if r.hidden {
+                    s.set_row_hidden(r.row, true);
+                }
+                if r.level > 0 {
+                    s.set_row_outline(r.row, r.level);
+                }
+                if r.collapsed {
+                    s.set_row_collapsed(r.row, true);
                 }
             }
+            // `page_setup_loaded` and `outline_loaded` stay the fresh
+            // part's defaults, so a save as .xlsx writes these.
+            s.page_setup = sheet.page_setup;
+            s.row_breaks = sheet.row_breaks;
+            s.col_breaks = sheet.col_breaks;
+            s.outline = sheet.outline;
             s.freeze = sheet.freeze;
             s.hidden = sheet.hidden;
             s.format.default_row_height = sheet.default_row_height;

@@ -15599,7 +15599,8 @@ mod tests {
     }
 
     /// An `.xls` that loses nothing on save: corpus/legacy's oracle-basic
-    /// (whose margins aren't Excel's) as the writer writes it, opened.
+    /// as the writer writes it (without Excel's document properties,
+    /// which the import drops), opened.
     fn open_clean_xls(dir: &Path, name: &str) -> (App, std::path::PathBuf) {
         let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/legacy");
         let data = std::fs::read(corpus.join("oracle-basic.xls")).unwrap();
@@ -15714,6 +15715,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Page setup is no loss any more (#1440): Ctrl+S on an Excel-made
+    /// `.xls` with custom margins asks only about its document properties.
+    #[test]
+    fn an_xls_page_setup_is_not_asked_about() {
+        let dir = tmp("compat-page-setup");
+        let (mut app, _) = open_xls(&dir, "calc-3d.xls", "book.xls");
+        assert_eq!(app.compat_losses(), ["document properties"]);
+        press_mod(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(
+            app.confirm.as_ref().expect("a prompt").prompt(),
+            "The following features are not supported by Excel 97-2003 and will be lost: \
+             document properties. Save anyway?"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An `.xls` with custom margins, landscape and a row outline saves with
+    /// Ctrl+S without asking, and opens again with them (#1440).
+    #[test]
+    fn ctrl_s_keeps_the_xls_page_setup_and_outlines() {
+        let dir = tmp("compat-keeps-setup");
+        let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/legacy");
+        let data = std::fs::read(corpus.join("oracle-basic.xls")).unwrap();
+        let (mut pkg, _) = gridcore::legacy::open_workbook(&data).unwrap();
+        let s = &mut pkg.workbook.sheets[0];
+        s.page_setup.margins.left = 1.5;
+        s.page_setup.margins.top = 0.25;
+        s.page_setup.orientation = gridcore::print::setup::Orientation::Landscape;
+        s.page_setup.header_footer.odd_header = Some("&CQuarterly".into());
+        for r in 2..=4 {
+            s.set_row_outline(r, 1);
+        }
+        let path = dir.join("book.xls");
+        std::fs::write(&path, gridcore::legacy::write_xls(&pkg).bytes).unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.os_clip = None;
+        app.open_workbook(path.to_str().unwrap());
+        assert!(app.compat());
+        app.apply(vec![(0, 0, gridcore::sheet::Cell::text("edited"))]);
+        press_mod(&mut app, KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(app.confirm.is_none(), "{:?}", app.status);
+        assert!(!app.modified);
+        let mut again = App::new(new_xlsx(), "untitled.xlsx");
+        again.open_workbook(path.to_str().unwrap());
+        let s = &again.pkg.workbook.sheets[0];
+        assert_eq!(s.cells[&(0, 0)].value, CellValue::Text("edited".into()));
+        assert_eq!(s.page_setup, pkg.workbook.sheets[0].page_setup);
+        assert_eq!(
+            (2..=5).map(|r| s.row_outline(r)).collect::<Vec<_>>(),
+            [1, 1, 1, 0]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A save that would lose what the `.xls` can't hold asks first (No by
     /// default), naming it: No writes nothing; Yes writes; the same list
     /// isn't asked about again this session, a longer one is. Once written,
@@ -15765,18 +15820,26 @@ mod tests {
         yes(&mut app);
         app.save();
         assert!(app.confirm.is_none());
-        app.pkg.workbook.sheets[app.sheet].set_row_outline(3, 1);
+        // A header over BIFF8's 255 characters (outlines have records
+        // since #1440).
+        app.pkg.workbook.sheets[app.sheet]
+            .page_setup
+            .header_footer
+            .odd_header = Some("h".repeat(256));
         app.save();
         assert!(
             app.confirm
                 .as_ref()
                 .unwrap()
                 .prompt()
-                .contains("sheet protection; outlines")
+                .contains("lost: page setup; sheet protection.")
         );
         yes(&mut app);
         // Fewer losses than were accepted don't ask again.
-        app.pkg.workbook.sheets[app.sheet].set_row_outline(3, 0);
+        app.pkg.workbook.sheets[app.sheet]
+            .page_setup
+            .header_footer
+            .odd_header = None;
         app.save();
         assert!(app.confirm.is_none());
         // Nor does the Data Model go without a word.

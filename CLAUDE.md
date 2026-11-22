@@ -155,7 +155,8 @@ issue number to find its notes.
   cell's inherited row/column style in typing, paste, copy, fill, cut and
   spill output, `CopyReader`'s used-extent bound, `set_cell` never storing
   it (#1660), a cut paste's formulas: source-sheet local names, bare table
-  refs, absolute refs in rules left in place, the snapshot's dry run (#1687).
+  refs, absolute refs in rules left in place, the snapshot's dry run (#1687),
+  `.xls` page setup, page breaks and outlines read and written (#1440).
 - `docs/claude/terminal-editors.md`: before changing terminal `docxy`, `xlsxy` or
   `yppxy`, or `backstagecore`'s Save As name field: docxy's Layout tab (#1274), prompts
   editing at a caret (#1372, #1373, #1374, #1375, #1379), Ctrl+C/X/V (#1377, #1378),

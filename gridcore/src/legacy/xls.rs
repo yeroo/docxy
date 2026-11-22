@@ -15,6 +15,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::ftab;
+use super::page;
 use super::ptg::{self, Base, Biff, Names};
 use super::{
     BookIn, ExternalLink, Le, Limits, OpenError, SheetIn, biff_error, on_grid, rk, set_array,
@@ -980,8 +981,14 @@ fn read_sheet(
     book: &mut BookIn,
     styles: &mut Styles,
 ) -> Result<SheetIn, OpenError> {
-    let mut sheet = SheetIn::default();
+    let mut sheet = SheetIn {
+        page_setup: page::absent(),
+        ..SheetIn::default()
+    };
     let mut frozen = false;
+    // Inside a custom view's USERSVIEWBEGIN..USERSVIEWEND: its page setup
+    // records are the view's (custom views are named), not the sheet's.
+    let mut in_view = false;
     let (mut iteration, mut calc_count, mut delta) = (None, None, None);
     let mut cells = BTreeMap::new();
     // Cells charged to the workbook's budget so far.
@@ -1211,15 +1218,24 @@ fn read_sheet(
                     if ixfe != 15 {
                         book.dropped.insert("column and row formats");
                     }
-                    if grbit & 0x0700 != 0 {
-                        book.dropped.insert("outlines (grouped rows and columns)");
-                    }
+                    // iOutLevel and fCollapsed.
+                    let level = ((grbit >> 8) & 0x0007) as u8;
+                    let collapsed = grbit & 0x1000 != 0;
                     let last = (last as u32).min(crate::sheet::MAX_COLS - 1);
-                    if (width.is_some() || hidden) && first as u32 <= last {
+                    if (width.is_some() || hidden || level > 0 || collapsed) && first as u32 <= last
+                    {
                         // fUserSet clear on a width: xlsx's plain width,
                         // without customWidth.
                         let plain = width.is_some() && grbit & 0x0002 == 0;
-                        sheet.cols.push((first as u32, last, width, hidden, plain));
+                        sheet.cols.push(super::ColIn {
+                            first: first as u32,
+                            last,
+                            width,
+                            hidden,
+                            plain,
+                            level,
+                            collapsed,
+                        });
                     }
                 }
                 0x0208 => {
@@ -1235,11 +1251,17 @@ fn read_sheet(
                     if grbit & 0x0080 != 0 && ixfe != 15 {
                         book.dropped.insert("column and row formats");
                     }
-                    if grbit & 0x0007 != 0 {
-                        book.dropped.insert("outlines (grouped rows and columns)");
-                    }
-                    if height.is_some() || hidden {
-                        sheet.rows.push((row as u32, height, hidden));
+                    // iOutLevel and fCollapsed.
+                    let level = (grbit & 0x0007) as u8;
+                    let collapsed = grbit & 0x0010 != 0;
+                    if height.is_some() || hidden || level > 0 || collapsed {
+                        sheet.rows.push(super::RowIn {
+                            row: row as u32,
+                            height,
+                            hidden,
+                            level,
+                            collapsed,
+                        });
                     }
                 }
                 0x023E => {
@@ -1283,19 +1305,50 @@ fn read_sheet(
                 0x000F if c.u16()? == 0 => {
                     book.dropped.insert("R1C1 reference style");
                 }
+                // USERSVIEWBEGIN..USERSVIEWEND: a custom view's settings.
+                0x01AA => {
+                    in_view = true;
+                    book.dropped.insert("custom views");
+                }
+                0x01AB => in_view = false,
+                // The page setup records of a custom view are its own.
+                page::HEADER
+                | page::FOOTER
+                | page::VPAGEBREAKS
+                | page::HPAGEBREAKS
+                | page::LEFTMARGIN..=page::PRINTGRIDLINES
+                | page::WSBOOL
+                | page::HCENTER
+                | page::VCENTER
+                | page::SETUP
+                | page::HEADERFOOTER
+                    if in_view => {}
                 // HEADERFOOTER: different odd and even or first page
-                // headers, their text, or headers that don't scale with
-                // the document or align with its margins.
-                0x089C => {
-                    c.take(28)?;
-                    let flags = c.u16()?;
-                    let cch = [c.u16()?, c.u16()?, c.u16()?, c.u16()?];
-                    if flags & 0x0003 != 0
-                        || flags & 0x000C != 0x000C
-                        || cch.iter().any(|&n| n != 0)
-                    {
-                        book.dropped.insert("page setup");
+                // headers and their text, and whether headers scale with
+                // the document and align with its margins.
+                page::HEADERFOOTER => {
+                    // FrtHeader, then guidSView: one naming a view is a
+                    // custom view's (some writers put it outside the
+                    // view's block), not the sheet's.
+                    c.take(12)?;
+                    if c.take(16)?.iter().any(|&b| b != 0) {
+                        return Some(());
                     }
+                    let hf = &mut sheet.page_setup.header_footer;
+                    page::read_hf_flags(hf, c.u16()?);
+                    let cch = [c.u16()?, c.u16()?, c.u16()?, c.u16()?];
+                    // XLUnicodeStringNoCch: the flags byte, then the text.
+                    let mut text = |n: u16| -> Option<Option<String>> {
+                        if n == 0 {
+                            return Some(None);
+                        }
+                        let high = c.u8()? & 1 == 1;
+                        Some(page::hf_text(c.chars(n as usize, high)?))
+                    };
+                    hf.even_header = text(cch[0])?;
+                    hf.even_footer = text(cch[1])?;
+                    hf.first_header = text(cch[2])?;
+                    hf.first_footer = text(cch[3])?;
                 }
                 // SAVERECALC 0: no recalculation before saving.
                 0x005F if c.u16()? == 0 => {
@@ -1304,10 +1357,6 @@ fn read_sheet(
                 // HFPICTURE: the sheet's header and footer pictures.
                 0x0866 => {
                     book.dropped.insert("header and footer pictures");
-                }
-                // USERSVIEWBEGIN: a custom view's settings for the sheet.
-                0x01AA => {
-                    book.dropped.insert("custom views");
                 }
                 // FEAT: protected ranges (isf 2), ignored errors (3),
                 // smart tags (4).
@@ -1357,10 +1406,10 @@ fn read_sheet(
                 0x01AD => {
                     book.dropped.insert("external data ranges");
                 }
-                // PRINTHEADERS, PRINTGRIDLINES, HCENTER, VCENTER.
-                0x002A | 0x002B | 0x0083 | 0x0084 if c.u16()? != 0 => {
-                    book.dropped.insert("page setup");
-                }
+                page::PRINTHEADERS => sheet.page_setup.headings = c.u16()? != 0,
+                page::PRINTGRIDLINES => sheet.page_setup.grid_lines = c.u16()? != 0,
+                page::HCENTER => sheet.page_setup.h_centered = c.u16()? != 0,
+                page::VCENTER => sheet.page_setup.v_centered = c.u16()? != 0,
                 // Iterative calculation, the same in every sheet's block.
                 0x0011 => iteration = Some(c.u16()? != 0),
                 0x000C => calc_count = Some(c.u16()?),
@@ -1397,44 +1446,46 @@ fn read_sheet(
                 0x0012 if c.u16()? != 0 => {
                     book.dropped.insert("sheet protection");
                 }
-                0x001A | 0x001B if c.u16()? != 0 => {
-                    book.dropped.insert("page breaks");
+                // HORIZONTALPAGEBREAKS (rw, colStart, colEnd) and
+                // VERTICALPAGEBREAKS (col, rwStart, rwEnd).
+                page::HPAGEBREAKS | page::VPAGEBREAKS => {
+                    let n = c.u16()?;
+                    let mut list = Vec::new();
+                    for _ in 0..n {
+                        let (at, start, end) = (c.u16()?, c.u16()?, c.u16()?);
+                        list.push(page::read_break(at, start, end));
+                    }
+                    if r.ty == page::HPAGEBREAKS {
+                        sheet.row_breaks = list;
+                    } else {
+                        sheet.col_breaks = list;
+                    }
                 }
-                0x0014 | 0x0015 if !r.data.is_empty() => {
-                    book.dropped.insert("page setup");
+                // HEADER, FOOTER: an empty body is none.
+                page::HEADER | page::FOOTER => {
+                    let text = if r.data.is_empty() {
+                        None
+                    } else {
+                        page::hf_text(c.xl_string()?)
+                    };
+                    let hf = &mut sheet.page_setup.header_footer;
+                    if r.ty == page::HEADER {
+                        hf.odd_header = text;
+                    } else {
+                        hf.odd_footer = text;
+                    }
                 }
-                0x0081 if c.u16()? & 0x0100 != 0 => {
-                    book.dropped.insert("page setup");
+                page::WSBOOL => {
+                    page::read_wsbool(&mut sheet.page_setup, &mut sheet.outline, c.u16()?);
                 }
-                0x00A1 => {
-                    c.u16()?;
-                    let scale = c.u16()?;
-                    c.take(6)?;
-                    let grbit = c.u16()?;
-                    c.take(4)?;
-                    let (header, footer) = (c.f64()?, c.f64()?);
-                    // fPortrait off is landscape, unless fNoPls or
-                    // fNoOrient says there is no orientation; the header and
-                    // footer margins count only with the printer settings.
-                    let landscape = grbit & 0x0046 == 0;
-                    let set = grbit & 0x0004 == 0;
-                    // Over then down, black and white, draft, comments,
-                    // a first page number.
-                    let options = grbit & 0x00B9 != 0;
-                    if (set
-                        && (scale != 100 || options || !near(header, 0.3) || !near(footer, 0.3)))
-                        || landscape
-                    {
+                page::SETUP => {
+                    // A first page number the model can't hold is named.
+                    if !page::read_setup(&mut sheet.page_setup, &r.data)? {
                         book.dropped.insert("page setup");
                     }
                 }
-                // LEFTMARGIN, RIGHTMARGIN, TOPMARGIN, BOTTOMMARGIN: other
-                // than Excel's Normal margins.
-                0x0026..=0x0029 => {
-                    let normal = if r.ty <= 0x0027 { 0.7 } else { 0.75 };
-                    if !near(c.f64()?, normal) {
-                        book.dropped.insert("page setup");
-                    }
+                page::LEFTMARGIN..=page::BOTTOMMARGIN => {
+                    page::read_margin(&mut sheet.page_setup, r.ty, c.f64()?);
                 }
                 ty if SHEET_KNOWN.contains(&ty) => {}
                 ty => {
@@ -1498,11 +1549,6 @@ pub(super) fn is_default_coldx(
         Some(w) => (coldx as f64 - w * 256.0).abs() < 1.0,
         None => (base..base + 256).contains(&(coldx as u32)),
     }
-}
-
-/// Whether two margins (inches) are the same, as Excel rounds them.
-fn near(a: f64, b: f64) -> bool {
-    (a - b).abs() < 1e-6
 }
 
 /// A `RefU`: rwFirst, rwLast (16-bit), colFirst, colLast (8-bit), as
@@ -2170,24 +2216,276 @@ pub(crate) mod tests {
         assert!(book.sheets[0].cols.is_empty());
     }
 
-    /// Margins are page setup the import leaves out: Excel's Normal ones
-    /// are no loss, others are.
+    /// The page setup records read into the sheet (#1440): margins, SETUP,
+    /// HEADER/FOOTER, HEADERFOOTER, the print options, WSBOOL and the
+    /// breaks, with nothing named. Without them a sheet has BIFF's absent
+    /// margins (0.75, 0.75, 1, 1; 0.5 for header and footer), not the
+    /// model's Normal ones.
     #[test]
-    fn custom_margins_are_dropped_page_setup() {
+    fn page_setup_records_read_into_the_sheet() {
+        use crate::print::setup::{CellComments, Margins, Orientation, PageOrder, PrintErrors};
+        let read_ps = |sheet: &[Vec<u8>]| {
+            let book = read(&workbook(&[], sheet)).unwrap();
+            assert!(book.dropped.is_empty(), "{:?}", book.dropped);
+            assert!(book.unknown_records.is_empty());
+            book.sheets.into_iter().next().unwrap()
+        };
+        let absent = read_ps(&[]);
+        assert_eq!(
+            absent.page_setup.margins,
+            Margins {
+                left: 0.75,
+                right: 0.75,
+                top: 1.0,
+                bottom: 1.0,
+                header: 0.5,
+                footer: 0.5
+            }
+        );
+        assert_eq!(absent.page_setup.orientation, Orientation::Default);
+        assert_eq!(absent.outline, crate::sheet::OutlineSettings::default());
+        assert!(!absent.page_setup.fit_to_page);
+
         let margin = |ty: u16, v: f64| rec(ty, &v.to_le_bytes());
-        let normal = [
-            margin(0x0026, 0.7),
-            margin(0x0027, 0.7),
-            margin(0x0028, 0.75),
-            margin(0x0029, 0.75),
-        ];
-        let book = read(&workbook(&[], &normal)).unwrap();
-        assert!(book.dropped.is_empty());
-        let book = read(&workbook(&[], &[margin(0x0026, 1.0)])).unwrap();
+        let flag = |ty: u16| rec(ty, &[1, 0]);
+        let text = |ty: u16, t: &str| {
+            let mut b = (t.len() as u16).to_le_bytes().to_vec();
+            b.push(0);
+            b.extend(t.as_bytes());
+            rec(ty, &b)
+        };
+        // SETUP: A4, 85%, first page 4, fit 2 x 3, over then down, black
+        // and white, draft, comments at the end, errors as #N/A,
+        // landscape; header 0.2, footer 0.4.
+        let mut setup = Vec::new();
+        let grbit: u16 = 0x0001 | 0x0008 | 0x0010 | 0x0020 | 0x0080 | 0x0200 | (3 << 10);
+        for v in [9u16, 85, 4, 2, 3, grbit, 600, 600] {
+            setup.extend(v.to_le_bytes());
+        }
+        setup.extend(0.2f64.to_le_bytes());
+        setup.extend(0.4f64.to_le_bytes());
+        setup.extend(1u16.to_le_bytes());
+        // HEADERFOOTER: different first page and odd/even, scaled but not
+        // aligned, with even and first page texts.
+        let mut hf = vec![0u8; 28];
+        hf.extend((0x0007u16 | 0x6000).to_le_bytes());
+        for n in [4u16, 0, 0, 6] {
+            hf.extend(n.to_le_bytes());
+        }
+        hf.extend([0]);
+        hf.extend(b"&CEv");
+        hf.extend([1]);
+        for u in "&R1st\u{2116}".encode_utf16() {
+            hf.extend(u.to_le_bytes());
+        }
+        let breaks = |ty: u16, list: &[[u16; 3]]| {
+            let mut b = (list.len() as u16).to_le_bytes().to_vec();
+            for v in list.iter().flatten() {
+                b.extend(v.to_le_bytes());
+            }
+            rec(ty, &b)
+        };
+        let sheet = read_ps(&[
+            flag(0x002A),
+            flag(0x002B),
+            // fRowSumsBelow and fColSumsRight clear, fFitToPage set.
+            rec(0x0081, &(0x0401u16 | 0x0100).to_le_bytes()),
+            breaks(0x001B, &[[5, 0, 255], [12, 0, 255]]),
+            breaks(0x001A, &[[3, 2, 65535]]),
+            text(0x0014, "&LLeft&CPage &P"),
+            rec(0x0015, &[]),
+            flag(0x0083),
+            flag(0x0084),
+            margin(0x0026, 0.25),
+            margin(0x0027, 0.5),
+            margin(0x0028, 1.25),
+            margin(0x0029, 1.5),
+            rec(0x00A1, &setup),
+            rec(0x089C, &hf),
+        ]);
+        let ps = &sheet.page_setup;
+        assert_eq!(
+            ps.margins,
+            Margins {
+                left: 0.25,
+                right: 0.5,
+                top: 1.25,
+                bottom: 1.5,
+                header: 0.2,
+                footer: 0.4
+            }
+        );
+        assert_eq!(ps.paper_size, 9);
+        assert_eq!(ps.scale, 85);
+        assert_eq!(ps.orientation, Orientation::Landscape);
+        assert!(ps.fit_to_page);
+        assert_eq!((ps.fit_width, ps.fit_height), (2, 3));
+        assert_eq!(ps.first_page_number, Some(4));
+        assert_eq!(ps.page_order, PageOrder::OverThenDown);
+        assert!(ps.black_and_white && ps.draft);
+        assert_eq!(ps.cell_comments, CellComments::AtEnd);
+        assert_eq!(ps.errors, PrintErrors::NA);
+        assert!(ps.grid_lines && ps.headings && ps.h_centered && ps.v_centered);
+        let h = &ps.header_footer;
+        assert_eq!(h.odd_header.as_deref(), Some("&LLeft&CPage &P"));
+        assert_eq!(h.odd_footer, None);
+        assert!(h.different_odd_even && h.different_first && h.scale_with_doc);
+        assert!(!h.align_with_margins);
+        assert_eq!(h.even_header.as_deref(), Some("&CEv"));
+        assert_eq!(h.even_footer, None);
+        assert_eq!(h.first_header, None);
+        assert_eq!(h.first_footer.as_deref(), Some("&R1st\u{2116}"));
+        assert!(!sheet.outline.summary_below && !sheet.outline.summary_right);
+        let ids = |b: &[crate::sheet::PageBreak]| {
+            b.iter()
+                .map(|b| (b.id, b.attrs.clone(), b.is_manual()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&sheet.row_breaks),
+            [
+                (5, " max=\"255\" man=\"1\"".to_string(), true),
+                (12, " max=\"255\" man=\"1\"".to_string(), true)
+            ]
+        );
+        assert_eq!(
+            ids(&sheet.col_breaks),
+            [(3, " min=\"2\" max=\"65535\" man=\"1\"".to_string(), true)]
+        );
+
+        // fNoPls: paper, scale and orientation are undefined, the rest
+        // counts (oracle-basic's header and footer margins of 0.5 among
+        // them).
+        let mut setup = Vec::new();
+        for v in [0u16, 300, 1, 1, 1, 0x0004 | 0x0010, 0, 0] {
+            setup.extend(v.to_le_bytes());
+        }
+        setup.extend(0.6f64.to_le_bytes());
+        setup.extend(0.7f64.to_le_bytes());
+        setup.extend(0u16.to_le_bytes());
+        let ps = read_ps(&[rec(0x00A1, &setup)]).page_setup;
+        assert_eq!((ps.paper_size, ps.scale), (1, 100));
+        assert_eq!(ps.orientation, Orientation::Default);
+        assert!(ps.draft);
+        assert_eq!((ps.margins.header, ps.margins.footer), (0.6, 0.7));
+        // fNoOrient with printer settings: Default; fPortrait: Portrait.
+        for (bits, want) in [
+            (0x0040u16, Orientation::Default),
+            (0x0002, Orientation::Portrait),
+        ] {
+            setup[10..12].copy_from_slice(&bits.to_le_bytes());
+            assert_eq!(read_ps(&[rec(0x00A1, &setup)]).page_setup.orientation, want);
+        }
+    }
+
+    /// ROW's and COLINFO's outline level and collapsed flag are read, an
+    /// outline-only row or column too (#1440).
+    #[test]
+    fn row_and_column_outlines_are_read() {
+        let colinfo = |first: u16, last: u16, grbit: u16| {
+            let mut b = Vec::new();
+            for v in [first, last, 2194, 15, grbit, 0] {
+                b.extend(v.to_le_bytes());
+            }
+            rec(0x007D, &b)
+        };
+        let row = |r: u16, grbit: u16| {
+            let mut b = Vec::new();
+            for v in [r, 0, 0, 300, 0, 0, grbit | 0x0100, 15] {
+                b.extend(v.to_le_bytes());
+            }
+            rec(0x0208, &b)
+        };
+        let book = read(&workbook(
+            &[],
+            &[
+                colinfo(1, 3, 0x0200),
+                colinfo(4, 4, 0x1000),
+                colinfo(6, 6, 0x0701),
+                row(2, 0x0001),
+                row(3, 0x0007 | 0x0020),
+                row(4, 0x0010),
+            ],
+        ))
+        .unwrap();
+        assert!(book.dropped.is_empty(), "{:?}", book.dropped);
+        let sheet = &book.sheets[0];
+        let cols: Vec<_> = sheet
+            .cols
+            .iter()
+            .map(|c| (c.first, c.last, c.width, c.hidden, c.level, c.collapsed))
+            .collect();
+        assert_eq!(
+            cols,
+            [
+                (1, 3, None, false, 2, false),
+                (4, 4, None, false, 0, true),
+                (6, 6, None, true, 7, false)
+            ]
+        );
+        let rows: Vec<_> = sheet
+            .rows
+            .iter()
+            .map(|r| (r.row, r.height, r.hidden, r.level, r.collapsed))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (2, None, false, 1, false),
+                (3, None, true, 7, false),
+                (4, None, false, 0, true)
+            ]
+        );
+    }
+
+    /// A HEADERFOOTER naming a view (non-zero guidSView) is that custom
+    /// view's, even outside its USERSVIEWBEGIN..END: the sheet's stays.
+    #[test]
+    fn a_headerfooter_naming_a_view_is_not_the_sheets() {
+        let hf = |guid: u8, flags: u16, even: &str| {
+            let mut b = vec![0u8; 12];
+            b.extend([guid; 16]);
+            b.extend(flags.to_le_bytes());
+            for n in [even.len() as u16, 0, 0, 0] {
+                b.extend(n.to_le_bytes());
+            }
+            b.push(0);
+            b.extend(even.as_bytes());
+            rec(0x089C, &b)
+        };
+        let book = read(&workbook(
+            &[],
+            &[hf(0, 0x000D, "&CSheet"), hf(0x5A, 0x0002, "&CView")],
+        ))
+        .unwrap();
+        let h = &book.sheets[0].page_setup.header_footer;
+        assert!(h.different_odd_even && h.scale_with_doc && h.align_with_margins);
+        assert!(!h.different_first);
+        assert_eq!(h.even_header.as_deref(), Some("&CSheet"));
+    }
+
+    /// A custom view's page setup records are its own, not the sheet's.
+    #[test]
+    fn a_custom_views_page_setup_is_not_the_sheets() {
+        let book = read(&workbook(
+            &[],
+            &[
+                rec(0x0026, &0.4f64.to_le_bytes()),
+                rec(0x01AA, &[0; 8]),
+                rec(0x0026, &3.0f64.to_le_bytes()),
+                rec(0x0083, &[1, 0]),
+                rec(0x0081, &0x0100u16.to_le_bytes()),
+                rec(0x01AB, &[]),
+            ],
+        ))
+        .unwrap();
         assert_eq!(
             book.dropped.iter().copied().collect::<Vec<_>>(),
-            ["page setup"]
+            ["custom views"]
         );
+        let ps = &book.sheets[0].page_setup;
+        assert_eq!(ps.margins.left, 0.4);
+        assert!(!ps.h_centered && !ps.fit_to_page);
     }
 
     /// A formula the reader can't read keeps its value and is counted: one
@@ -2241,8 +2539,6 @@ pub(crate) mod tests {
             (rec(0x00B0, &[0; 4]), "PivotTables"),
             (rec(0x00AE, &[0; 4]), "scenarios"),
             (rec(0x01AD, &[0; 4]), "external data ranges"),
-            (rec(0x002B, &[1, 0]), "page setup"),
-            (rec(0x0083, &[1, 0]), "page setup"),
             (rec(0x000D, &[0, 0]), "manual calculation"),
             (w2(0x06B7), "sheet view settings"),
             (w2(0x06A6), "sheet view settings"),
@@ -2267,24 +2563,22 @@ pub(crate) mod tests {
             rec(0x000D, &[1, 0]),
         ];
         assert!(read(&workbook(&[], &plain)).unwrap().dropped.is_empty());
-        // SETUP's draft bit, with printer settings.
+        // SETUP's first page number below 0, which the model can't hold
+        // (#1440: the rest of SETUP is read).
         let mut setup = vec![0u8; 34];
         setup[2] = 100;
-        setup[10] = 0x12;
-        setup[16..24].copy_from_slice(&0.3f64.to_le_bytes());
-        setup[24..32].copy_from_slice(&0.3f64.to_le_bytes());
+        setup[4..6].copy_from_slice(&(-3i16).to_le_bytes());
+        setup[10] = 0x82;
         let book = read(&workbook(&[], &[rec(0x00A1, &setup)])).unwrap();
         assert_eq!(
             book.dropped.iter().copied().collect::<Vec<_>>(),
             ["page setup"]
         );
-        setup[10] = 0x02;
-        assert!(
-            read(&workbook(&[], &[rec(0x00A1, &setup)]))
-                .unwrap()
-                .dropped
-                .is_empty()
-        );
+        assert_eq!(book.sheets[0].page_setup.first_page_number, None);
+        setup[4..6].copy_from_slice(&3i16.to_le_bytes());
+        let book = read(&workbook(&[], &[rec(0x00A1, &setup)])).unwrap();
+        assert!(book.dropped.is_empty());
+        assert_eq!(book.sheets[0].page_setup.first_page_number, Some(3));
         // Precision as displayed (globals' PRECISION 0).
         let book = read(&workbook(&[rec(0x000E, &[0, 0])], &[])).unwrap();
         assert_eq!(
@@ -2625,10 +2919,6 @@ pub(crate) mod tests {
             book.dropped.iter().copied().collect::<Vec<_>>()
         };
         for (r, want) in [
-            (hf(0x000D, [0; 4]), "page setup"),
-            (hf(0x000E, [0; 4]), "page setup"),
-            (hf(0x0008, [0; 4]), "page setup"),
-            (hf(0x000C, [0, 5, 0, 0]), "page setup"),
             (rec(0x005F, &[0, 0]), "workbook options"),
             (frt(0x0866, &[1, 0]), "header and footer pictures"),
         ] {
@@ -2710,7 +3000,13 @@ pub(crate) mod tests {
             }
             rec(0x007D, &b)
         };
-        let cols = |sheet: &[Vec<u8>]| read(&workbook(&[], sheet)).unwrap().sheets[0].cols.clone();
+        let cols = |sheet: &[Vec<u8>]| {
+            read(&workbook(&[], sheet)).unwrap().sheets[0]
+                .cols
+                .iter()
+                .map(|c| (c.first, c.last, c.width, c.hidden, c.plain))
+                .collect::<Vec<_>>()
+        };
         // xlwt's 0x0B6D (11.43 characters), flags clear.
         assert_eq!(
             cols(&[colinfo(1, 2, 0x0B6D, 0)]),

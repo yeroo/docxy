@@ -260,3 +260,40 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
 - A restyle (`apply_styles_on`, xlsxy's only style-only writer) of a cell a
   pending cut was taken from ends the cut, as an edit does (`end_cut_on`): the
   paste is then a copy of the cut-time cells, and the source keeps its format.
+
+## `.xls` page setup, page breaks and outlines (#1440)
+
+- `gridcore/src/legacy/page.rs` holds the BIFF8 page setup codec that both
+  the `.xls` reader (`xls.rs`) and the writer (`xls_write.rs`) use: SETUP,
+  the four margins, HEADER/FOOTER, HEADERFOOTER, HCENTER/VCENTER,
+  PRINTHEADERS/PRINTGRIDLINES, WSBOOL, HORIZONTAL/VERTICALPAGEBREAKS, GUTS.
+  ROW and COLINFO carry the outline level and collapsed flag.
+- A sheet substream starts from BIFF's absent defaults (`page::absent`):
+  margins 0.75/0.75/1/1 and header/footer 0.5, not the model's Normal
+  ones. So the writer always writes all four margins and SETUP.
+- fNoPls makes only paper, scale, resolution, copies and orientation
+  undefined. Header/footer margins, fit counts, the first page and the
+  print options count either way: oracle-basic has fNoPls with header 0.5,
+  as its `.xlsx` has. Orientation is three-state: fNoPls or fNoOrient is
+  `Default`. The writer always clears fNoPls (600 dpi, one copy) and writes
+  `Default` as fNoOrient.
+- Mask HEADERFOOTER's flags with 0x000F: Excel leaves reserved high bits
+  set (0x60CC in the corpus). Excel writes it right after SETUP, before
+  DEFCOLWIDTH, and the writer does the same
+  (`xls_page_setup_records_come_in_excels_order`).
+- A custom view's (USERSVIEWBEGIN..END) page setup records are skipped: they
+  are the view's, and custom views are named.
+- Breaks: every BIFF8 break is manual. The reader keeps
+  ` [min="s"] max="e" man="1"`, and the writer writes only `is_manual()`
+  breaks over their min/max span, cut to the grid. Automatic ones are
+  dropped without a name.
+- `build_counted` copies the page setup, breaks and outline settings into
+  the `Sheet` and leaves `page_setup_loaded`/`outline_loaded` at the fresh
+  part's defaults, so Convert (a save as `.xlsx`) writes them.
+- What BIFF8 can't hold is named with the feature's own words: "page setup"
+  for a header or footer over 255 characters, a first page over 32,767 or a
+  paper code over 65,535; "page breaks" past the grid or past 1,026;
+  "outlines (grouped rows and columns)" past the grid or deeper than 7.
+- The corpus has no outlines or breaks, so these rest on synthetic round
+  trips. An Excel-made `.xls` still asks on Ctrl+S because its document
+  properties are dropped at import (a later slice of #1440).
