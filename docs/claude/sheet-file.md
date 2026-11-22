@@ -250,7 +250,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   those cells themselves. One into its own ranges reads the rule's own
   cells, which stay with it (`A1>AVERAGE($A$1:$A$10)` on A1:A10, #880), so
   it stays (`formula::move_abs_ref_expr`). `FormulaSite::rule` carries the
-  rule's ranges to the per-formula rewrite.
+  rule's ranges to the per-formula rewrite. Its cells beside the cut that
+  read into it, and rules beside the cut, are split first (#1458, below).
 - xlsxy asks `cut_moves_refs` (the rewrite's dry run) before writing: only a
   cut that re-points something outside its own cells takes the
   whole-workbook snapshot and becomes a `Structural` step; the rest stay a
@@ -260,6 +261,58 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
 - A restyle (`apply_styles_on`, xlsxy's only style-only writer) of a cell a
   pending cut was taken from ends the cut, as an edit does (`end_cut_on`): the
   paste is then a copy of the cut-time cells, and the source keeps its format.
+
+## A cut splits a conditional-format rule its cells read differently (#1458)
+
+- A rule's formulas are written for its anchor (the top-left of its
+  ranges), so one rewrite per rule is wrong when its cells read the cut
+  differently (`A2>0` on B2:B20, cut A5:A10: only B5:B10 read it).
+  `edit::cf_split::split_cond_formats` runs before the formula walk in
+  `walk_rules_stay` (the cut and its dry run `cut_moves_refs`) and in
+  `move_refs_with` (`move_refs`, the data form's Delete), and splits such a
+  rule into blocks in each of which every cell reads the cut alike. The
+  walk then re-points each block whole, unchanged.
+- Keyed per reference on what `move_ref_expr` decides (a cell: its corner
+  names a cut cell; a range: both corners), not per row/column component:
+  that would split `$D2>0` beside the cut's rows with no change. Parts come
+  from `validation::cut_lines` and `split_at` (shared with `cut_rule`).
+  A block's anchor can be no cell of it (row from one part, column from
+  another) and read the cut otherwise; then its parts are packed greedily
+  into blocks whose anchors read it as their parts do (H6:J10 with `F1>0`,
+  cut A1:F1: H6, I6:J10, H7:H10). A pack's anchor can be a cut cell; only
+  its ranges decide the walk's routing.
+- A rule over the cut on the source sheet (#1687's, left in place) is split
+  only when a cell beside the cut reads into it through a relative or mixed
+  reference (`A2>A1` on A2:A20, cut A5:A10: A11 alone reads `C10`). Its cut
+  cells stay one block with #1687's rewrite (`move_abs_ref_expr`, whose
+  `own` is now that block's ranges: the same for #880, since only cut cells
+  follow). The blocks beside the cut follow it but keep fully absolute
+  references into the rule's ranges before the split
+  (`formula::move_ref_expr_keeping_own`); the walk finds them by
+  `FormulaSite::block`, the index in `cond_formats`
+  (`Split::beside_over`).
+- Only rules judged cell by cell split: cellIs, expression, and the text,
+  blanks, errors and timePeriod kinds. Icon sets, color scales, data bars,
+  top/bottom, average and duplicate rules, a block mixing them, and a block
+  with a formula that doesn't parse are re-pointed whole as before. Excel
+  2010 `x14:conditionalFormatting` rules (`ext_rules`) are too: a clone
+  would need new `x14:cfRule` ids.
+- Model: the part holding the first range's top-left keeps `ix`; the other
+  blocks go right after it with `ix: None` and
+  `CondFormat::copy_of = ix.or(copy_of)`, so a copy split again (a second
+  cut, the data form's `gone` then `up`) still names the element.
+  `add_cond_formats` renumbers `copy_of` with `ix`.
+- Save (`set_cond_formats`): each copy is a clone of its source element as
+  the part holds it, right after it (`cf_element_as`: own `sqref` and
+  formulas, every attribute and child kept, `stopIfTrue`, `dxfId`,
+  `priority`). Clones are written only when the source element is written
+  for its claimant or removed, in one edit with it; an element left as it is
+  (two claims, no claim, unreadable `sqref`, rule count differs) still
+  covers their cells, so they are dropped.
+- Copies keep their rules' priorities, so the file holds duplicate
+  `priority` values over disjoint cells. Not measured against Excel. A
+  rule's `extLst` (an `x14:id`) would be cloned too; Excel writes one for
+  data bars, which don't split.
 
 ## `.xls` page setup, page breaks and outlines (#1440)
 

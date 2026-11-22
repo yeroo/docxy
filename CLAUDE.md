@@ -161,7 +161,9 @@ issue number to find its notes.
   conditional formats imported, styled blanks and their cap (#884),
   references into other workbooks kept: links, names' definitions, cached
   cells, quoted refs keeping their cache (#903), page setup, breaks, print
-  area and titles from `.xlsb`/`.ods` (#901).
+  area and titles from `.xlsb`/`.ods` (#901), a cut splitting a
+  conditional-format rule its cells read differently, saved as clones
+  (#1458).
 - `docs/claude/terminal-editors.md`: before changing terminal `docxy`, `xlsxy` or
   `yppxy`, or `backstagecore`'s Save As name field: docxy's Layout tab (#1274), prompts
   editing at a caret (#1372, #1373, #1374, #1375, #1379), Ctrl+C/X/V (#1377, #1378),
