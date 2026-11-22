@@ -1234,7 +1234,9 @@ impl GraphClient {
                 if folder.display_name == name {
                     return Ok(Some(folder));
                 }
-                if caseless.is_none() && folder.display_name.to_lowercase() == name.to_lowercase() {
+                if caseless.is_none()
+                    && crate::graph::model::folder_names_clash(&folder.display_name, name)
+                {
                     caseless = Some(folder);
                 }
             }

@@ -3954,9 +3954,22 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   over). Otherwise the 409 itself is returned and refused as before. A 409 on a first POST is a
   clash with a folder the user has: refused with no lookup. A lookup failure is returned as is:
   a 5xx, throttle, transport or 401 keeps the op; another 4xx or `Parse` refuses it.
-- Residual: a POST that answered 5xx without committing, then a folder of that name made
-  elsewhere before the retry, is adopted. That is rare and loses nothing: the queued ops land in
-  a folder of that name.
+- The store refuses the clash at its source: `Store::create_local_folder` refuses a name a stored
+  folder under the same stored parent has (the resolved parent; for a top create the root the
+  listing gives, or `parent_id IS NULL` with none known), `local:` siblings included, compared
+  with `graph::model::folder_names_clash` (exact, else caseless, as Exchange), the one rule
+  `find_child_folder`'s caseless match uses too. `FolderRefusal::NameTaken` ("a folder named
+  {name} is already there"), reported as the other store refusals (`FolderWriteFailed { status:
+  None }` and `Error`, the parent as its id, `""` at the top), nothing written or queued. Graph
+  would answer such a create 409 anyway. So a retry's 409 comes from our own earlier POST, or
+  from a folder another client made under that parent after the create was queued. The flag is
+  not put back on a transport failure (it can be a read timeout after the request went out) or
+  a throttle (`Throttled` covers a 503, which may follow a commit). The alias guard stays as a
+  second line.
+- Residual: a folder of that name made by another client under the parent after the create was
+  queued, with any attempt that set the flag (a 5xx, a 429/503, a transport failure, a crash)
+  before the retry's 409, is adopted. Nothing is lost: the queued ops land in a folder of that
+  name (`create_folder_transport_then_409_does_not_adopt_a_stored_sibling` asserts it, commented).
 - Tests: `client.rs` `find_child_folder_pages_children_and_top_and_matches_names`,
   `find_child_folder_returns_a_page_error`; `store/mod.rs`
   `folder_taken_by_alias_ignores_the_folders_own_alias`; `outbox.rs`
@@ -3965,12 +3978,16 @@ spelling, nor even typed as stored, because the query was lowercased in Rust fir
   counted: the crash case), `create_folder_409_on_a_first_post_is_refused_without_a_lookup`,
   `create_folder_409_retried_with_no_such_folder_returns_the_409`,
   `create_folder_409_does_not_adopt_a_folder_another_create_already_took`,
-  `create_folder_401_restores_the_posted_flag`, `create_folder_lookup_failure_is_returned_as_is`;
+  `create_folder_401_restores_the_posted_flag`, `create_folder_lookup_failure_is_returned_as_is`,
+  `create_folder_transport_then_409_does_not_adopt_a_stored_sibling` (a sibling stored at queue
+  time refuses the create; the flag kept after a transport failure; the residual adopted);
+  `store/mod.rs` `create_local_folder_refuses_a_name_a_sibling_has`;
   `engine.rs` `folder_writes`
   `a_create_retried_after_a_lost_answer_adopts_graphs_folder_on_409` (end to end: a 500, a
   Refresh pass listing G1 as its own row, then the 409; it fails with `FolderWriteFailed(409)`
-  without the fix) and `refused_folder_writes_revert_and_report` (a first POST's 409 sends no
-  lookup).
+  without the fix), `refused_folder_writes_revert_and_report` (a first POST's 409 sends no
+  lookup) and `folder_commands_the_store_refuses_report_and_queue_nothing` (`NameTaken` under a
+  parent and at the top, no request).
 - Not done: a `CopyFolder` (#2118) retried after a lost answer (it may copy twice or 409).
   Contacts and events: Graph allows duplicates, so a lost answer there makes a duplicate, not a
   loss.

@@ -42851,6 +42851,26 @@ mod tests {
                     error: "no folder NOPE".into(),
                 }
             );
+            // A name a stored sibling has, in any case (#2109): under a
+            // parent, and at the top (reported under no id).
+            for (parent, name, id) in [(Some("INBOX"), "proj", "INBOX"), (None, "Arch", "")] {
+                send(
+                    &handle,
+                    SyncCommand::CreateFolder {
+                        parent: parent.map(str::to_string),
+                        name: name.into(),
+                    },
+                );
+                assert_eq!(
+                    wait_store_refused(&handle),
+                    SyncEvent::FolderWriteFailed {
+                        id: id.into(),
+                        write: FolderWrite::Create,
+                        status: None,
+                        error: format!("a folder named {name} is already there"),
+                    }
+                );
+            }
             // A copy (#2118): an unknown source or dest, the drafts
             // sentinel as either.
             for (id, dest, named, error) in [

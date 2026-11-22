@@ -5,6 +5,14 @@
 
 use crate::json::Value;
 
+/// Whether two folder names clash under one parent (#2109): Exchange
+/// refuses a sibling whose name differs only in case. The one rule for the
+/// store's refusal of a local create (`Store::create_local_folder`) and the
+/// caseless match of `GraphClient::find_child_folder`.
+pub(crate) fn folder_names_clash(a: &str, b: &str) -> bool {
+    a == b || a.to_lowercase() == b.to_lowercase()
+}
+
 /// A mail folder (e.g. Inbox, Sent Items, or a user-created folder).
 #[derive(Debug, Clone, PartialEq)]
 pub struct MailFolder {

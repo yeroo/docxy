@@ -4887,13 +4887,14 @@ impl Store {
         pending_ops_on(&self.conn)
     }
 
-    /// Records whether the `/send` POST of the `SendDraft` op `seq` went out
-    /// (#1874). Set right before the POST, so a lost answer or a crash
-    /// counts; cleared when Graph refuses the POST (a 4xx, a 404, a 401) or
-    /// later says the message is still a draft. A `CreateFolder` op's POST
-    /// is recorded the same way (#2109): a retried create answered 409 then
-    /// looks for the folder its earlier POST may have made. A missing `seq`
-    /// changes nothing.
+    /// Records whether the POST of the op `seq` may have gone out. Set
+    /// right before the POST, so a lost answer or a crash counts. A
+    /// `SendDraft`'s `/send` (#1874) is cleared when Graph refuses the POST
+    /// (a 4xx, a 404, a 401) or later says the message is still a draft. A
+    /// `CreateFolder`'s POST (#2109) is put back to its earlier value on a
+    /// 401 and never cleared otherwise: a retry answered 409 then looks for
+    /// the folder an earlier POST may have made. A missing `seq` changes
+    /// nothing.
     pub fn set_send_posted(&self, seq: i64, posted: bool) -> Result<(), StoreError> {
         self.conn.execute(
             "UPDATE outbox SET send_posted = ?2 WHERE seq = ?1",
@@ -4902,9 +4903,9 @@ impl Store {
         Ok(())
     }
 
-    /// Whether the `/send` POST of the op `seq` (a `SendDraft`'s, or a
-    /// `CreateFolder`'s POST, #2109) may have gone out (`set_send_posted`).
-    /// A missing `seq` is `false`.
+    /// Whether the POST of the op `seq` (a `SendDraft`'s `/send`, #1874, or
+    /// a `CreateFolder`'s, #2109) may have gone out (`set_send_posted`). A
+    /// missing `seq` is `false`.
     pub fn send_posted(&self, seq: i64) -> Result<bool, StoreError> {
         let posted = self
             .conn
@@ -6993,6 +6994,10 @@ pub(crate) enum FolderRefusal {
     UnsentMail(usize),
     /// A move of a folder's mail into that same folder (#2126).
     SameFolder,
+    /// A create whose name a stored folder under the same parent has, in
+    /// any case (#2109): Graph would refuse it with 409, and a retry of it
+    /// answered 409 must only ever find the folder its own POST made.
+    NameTaken(String),
 }
 
 impl std::fmt::Display for FolderRefusal {
@@ -7007,6 +7012,7 @@ impl std::fmt::Display for FolderRefusal {
             }
             FolderRefusal::UnsentMail(n) => write!(f, "it holds {n} unsent message(s)"),
             FolderRefusal::SameFolder => f.write_str("the mail is already in that folder"),
+            FolderRefusal::NameTaken(name) => write!(f, "a folder named {name} is already there"),
         }
     }
 }
@@ -7183,7 +7189,9 @@ impl Store {
     /// mailbox, stored under the root id the listing gives top folders, see
     /// `root_folder_id_on`) with a fresh `local:` id, and queues its
     /// `CreateFolder`. `parent` is resolved through `folder_aliases`; an
-    /// unknown parent or the drafts sentinel is refused.
+    /// unknown parent or the drafts sentinel is refused, and so is a name a
+    /// stored folder under the same parent has, in any case
+    /// (`FolderRefusal::NameTaken`, #2109; `folder_names_clash`).
     pub(crate) fn create_local_folder(
         &self,
         parent: Option<&str>,
@@ -7204,6 +7212,20 @@ impl Store {
             Some(p) => Some(p.clone()),
             None => root_folder_id_on(&tx)?,
         };
+        let taken = {
+            let mut stmt = tx.prepare("SELECT display_name FROM folders WHERE parent_id IS ?1")?;
+            let names = stmt.query_map(params![stored_parent], |r| r.get::<_, String>(0))?;
+            let mut taken = false;
+            for sibling in names {
+                taken |= crate::graph::model::folder_names_clash(&sibling?, name);
+            }
+            taken
+        };
+        if taken {
+            return Ok(FolderWriteResult::Refused(FolderRefusal::NameTaken(
+                name.to_string(),
+            )));
+        }
         let id = local_draft_id();
         tx.execute(
             "INSERT INTO folders (id, parent_id, display_name) VALUES (?1, ?2, ?3)",
@@ -26169,10 +26191,42 @@ mod folder_write_tests {
     }
 
     #[test]
+    fn create_local_folder_refuses_a_name_a_sibling_has() {
+        let s = mailbox();
+        let taken = |r: FolderWriteResult, name: &str| {
+            assert_eq!(
+                r,
+                FolderWriteResult::Refused(FolderRefusal::NameTaken(name.into()))
+            );
+        };
+        let before = ops(&s).len();
+        // Under a parent: a listed sibling, exact and in another case.
+        taken(s.create_local_folder(Some("INBOX"), "A").unwrap(), "A");
+        taken(s.create_local_folder(Some("INBOX"), "a").unwrap(), "a");
+        // A `local:` sibling still queued counts too, by the alias of its
+        // parent as well.
+        let new = written(s.create_local_folder(Some("A"), "New").unwrap());
+        taken(s.create_local_folder(Some("A"), "NEW").unwrap(), "NEW");
+        // At the top: the root the listing gives top folders.
+        taken(s.create_local_folder(None, "inbox").unwrap(), "inbox");
+        // Another parent's name is free, and so is the name of a folder
+        // under the sibling.
+        written(s.create_local_folder(Some("ARCH"), "New").unwrap());
+        written(s.create_local_folder(Some("INBOX"), "B").unwrap());
+        written(s.create_local_folder(None, "Top").unwrap());
+        assert_eq!(row(&s, &new).unwrap().display_name, "New");
+        assert_eq!(ops(&s).len(), before + 4, "only the written ones queued");
+        // No root known yet: top folders are those without a parent.
+        let empty = Store::open_in_memory().unwrap();
+        written(empty.create_local_folder(None, "X").unwrap());
+        taken(empty.create_local_folder(None, "x").unwrap(), "x");
+    }
+
+    #[test]
     fn folder_taken_by_alias_ignores_the_folders_own_alias() {
         let s = mailbox();
         let a = written(s.create_local_folder(Some("INBOX"), "New").unwrap());
-        let b = written(s.create_local_folder(Some("INBOX"), "New").unwrap());
+        let b = written(s.create_local_folder(Some("INBOX"), "Other").unwrap());
         // A listing's stale row has no alias: free to adopt.
         s.upsert_folder(&listed("G1", Some("INBOX"), "New"))
             .unwrap();

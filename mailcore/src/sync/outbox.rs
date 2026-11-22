@@ -394,7 +394,14 @@ fn graph_folder(store: &Store, id: &str) -> Result<Option<String>, GraphError> {
 /// before the POST (#2109), so a lost answer (a 5xx, a 429/503 throttle, a
 /// dropped connection) or a crash before the re-key counts as "may have
 /// made the folder". A 401 puts the flag back as it was: Graph did nothing,
-/// and the refresh runs this create again. When a create whose earlier POST
+/// and the refresh runs this create again. A transport failure or a
+/// throttle keeps it: the first can be a read timeout after the request
+/// went out, and `Throttled` covers a 503, which may follow the commit.
+/// That costs nothing, as the store refuses a create whose name a stored
+/// sibling has (`FolderRefusal::NameTaken`): a retry's 409 then comes from
+/// our own earlier POST, or from a folder another client made under the
+/// parent after the create was queued (the documented residual, adopted
+/// alike; nothing is lost). When a create whose earlier POST
 /// may have gone out is answered 409 (a folder of that name is already
 /// under the parent), that folder is likely the one the earlier POST made:
 /// it is looked up by the **op's** name (`GraphClient::find_child_folder`;
@@ -5367,7 +5374,10 @@ mod tests {
         ]);
         let c = GraphClient::new(&srv.base_url, "AT");
         let store = folder_store();
-        let (a, _) = queued_create(&store, "New");
+        // The store refuses a second "New" under INBOX (`NameTaken`), so the
+        // folder another create took is G1 under another name, which Graph
+        // now lists as "New" (renamed by another client): still not B's.
+        let (a, _) = queued_create(&store, "Other");
         let (b, row_b) = queued_create(&store, "New");
         store
             .reconcile_created_folder(&a, &mail_folder("G1", Some("INBOX")))
@@ -5386,6 +5396,71 @@ mod tests {
             Some("G1"),
             "with its mail"
         );
+    }
+
+    #[test]
+    fn create_folder_transport_then_409_does_not_adopt_a_stored_sibling() {
+        let named = |id: &str, name: &str| MailFolder {
+            display_name: name.into(),
+            ..mail_folder(id, Some("INBOX"))
+        };
+        // A sibling "New" the store has when the create is queued: the
+        // store refuses the create, so no POST and no retry ever exist.
+        let store = folder_store();
+        store.upsert_folder(&named("G0", "New")).unwrap();
+        assert_eq!(
+            store.create_local_folder(Some("INBOX"), "new").unwrap(),
+            crate::store::FolderWriteResult::Refused(crate::store::FolderRefusal::NameTaken(
+                "new".into()
+            ))
+        );
+        assert!(store.pending_ops().unwrap().is_empty());
+
+        // No sibling then: the first POST fails in transport. That may be a
+        // read timeout after the request went out, so the flag stays.
+        let store = folder_store();
+        let (local, row) = queued_create(&store, "New");
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let dead = GraphClient::new(&format!("http://127.0.0.1:{port}"), "AT");
+        assert!(matches!(
+            create_row(&dead, &store, &row),
+            Err(GraphError::Transport(_))
+        ));
+        assert!(store.send_posted(row.seq).unwrap(), "may have gone out");
+
+        // The documented residual (#2109): G0 "New" is listed only after
+        // the create was queued (another client made it meanwhile). The
+        // retry's 409 cannot be told from one answering our own lost POST,
+        // so G0 is adopted; nothing is lost, the queued ops land in a
+        // folder of that name.
+        store.upsert_folder(&named("G0", "New")).unwrap();
+        let srv = FakeServer::start(vec![
+            route(
+                "POST",
+                "/me/mailFolders/INBOX/childFolders",
+                409,
+                FOLDER_EXISTS,
+            ),
+            route(
+                "GET",
+                "/me/mailFolders/INBOX/childFolders",
+                200,
+                r#"{"value":[{"id":"G0","displayName":"New","parentFolderId":"INBOX"}]}"#,
+            ),
+        ]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        assert_eq!(
+            create_row(&c, &store, &row).unwrap(),
+            Applied::FolderCreated {
+                local_id: local.clone(),
+                id: "G0".into()
+            }
+        );
+        assert_eq!(store.current_folder_id(&local).unwrap(), "G0");
     }
 
     #[test]
