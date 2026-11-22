@@ -35799,9 +35799,11 @@ mod tests {
             let (handle, store_path, dir) = spawn(&srv, "moved-draft-fail", |s| {
                 queue_move(s, "DEL");
                 queue_send(s);
+                // Where the arms leave the row, checked before the engine
+                // starts: once it runs, the drain may re-key it at any time.
+                assert_eq!(filed(s, "D1"), ("SNT".to_string(), false));
             });
             let store = Store::open(&store_path).unwrap();
-            assert_eq!(filed(&store, "D1"), ("SNT".to_string(), false));
 
             let seen = wait_for(&handle.evt_rx, |e| {
                 matches!(e, SyncEvent::Sent { .. } | SyncEvent::SendFailed { .. })
