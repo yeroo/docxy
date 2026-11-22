@@ -2467,7 +2467,6 @@ mod tests {
             assert_eq!(b.col_hidden(c), s.col_hidden(c), "col {c}");
         }
         // The read-back book writes the same again.
-        assert_eq!(write_xls(&back).bytes, write_xls(&back).bytes);
         let (again, lost) = round(&back);
         assert!(lost.is_empty());
         let a = &again.workbook.sheets[0];

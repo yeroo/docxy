@@ -1327,7 +1327,13 @@ fn read_sheet(
                 // headers and their text, and whether headers scale with
                 // the document and align with its margins.
                 page::HEADERFOOTER => {
-                    c.take(28)?;
+                    // FrtHeader, then guidSView: one naming a view is a
+                    // custom view's (some writers put it outside the
+                    // view's block), not the sheet's.
+                    c.take(12)?;
+                    if c.take(16)?.iter().any(|&b| b != 0) {
+                        return Some(());
+                    }
                     let hf = &mut sheet.page_setup.header_footer;
                     page::read_hf_flags(hf, c.u16()?);
                     let cch = [c.u16()?, c.u16()?, c.u16()?, c.u16()?];
@@ -2430,6 +2436,32 @@ pub(crate) mod tests {
                 (4, None, false, 0, true)
             ]
         );
+    }
+
+    /// A HEADERFOOTER naming a view (non-zero guidSView) is that custom
+    /// view's, even outside its USERSVIEWBEGIN..END: the sheet's stays.
+    #[test]
+    fn a_headerfooter_naming_a_view_is_not_the_sheets() {
+        let hf = |guid: u8, flags: u16, even: &str| {
+            let mut b = vec![0u8; 12];
+            b.extend([guid; 16]);
+            b.extend(flags.to_le_bytes());
+            for n in [even.len() as u16, 0, 0, 0] {
+                b.extend(n.to_le_bytes());
+            }
+            b.push(0);
+            b.extend(even.as_bytes());
+            rec(0x089C, &b)
+        };
+        let book = read(&workbook(
+            &[],
+            &[hf(0, 0x000D, "&CSheet"), hf(0x5A, 0x0002, "&CView")],
+        ))
+        .unwrap();
+        let h = &book.sheets[0].page_setup.header_footer;
+        assert!(h.different_odd_even && h.scale_with_doc && h.align_with_margins);
+        assert!(!h.different_first);
+        assert_eq!(h.even_header.as_deref(), Some("&CSheet"));
     }
 
     /// A custom view's page setup records are its own, not the sheet's.

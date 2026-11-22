@@ -59,8 +59,9 @@ const F_HF_ALIGN_MARGINS: u16 = 0x0008;
 pub(super) const MAX_HF: usize = 255;
 /// The most breaks a BIFF8 page-break record holds (Excel's limit).
 pub(super) const MAX_BREAKS: usize = 1026;
-/// The deepest outline level BIFF8 holds (ROW and COLINFO's 3 bits).
-pub(super) const MAX_LEVEL: u8 = 7;
+/// The deepest outline level BIFF8 holds (ROW and COLINFO's 3 bits), the
+/// model's own limit.
+pub(super) const MAX_LEVEL: u8 = crate::outline::MAX_LEVEL;
 
 /// The page setup a sheet substream means before any of its records: the
 /// margins Excel assumes for an absent LEFTMARGIN..BOTTOMMARGIN (0.75, 0.75,
