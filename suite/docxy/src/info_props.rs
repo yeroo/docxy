@@ -830,7 +830,10 @@ mod tests {
             (main, "fn open_account("),
             (main, "fn add_tab("),
             (include_str!("doc_export.rs"), "fn open_export("),
-            (close, "fn backstage_close("),
+            // File > Close and `ext::CloseTab` both leave File through it
+            // (#2260), and so does an extension tab's refused close.
+            (close, "fn backstage_close_asking("),
+            (close, "fn ext_close_refused("),
             // Save, and the close prompt's Save, go through it (#2194).
             (main, "fn save_active_inner("),
             (main, "fn save_as("),
