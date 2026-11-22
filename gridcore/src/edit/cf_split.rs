@@ -150,11 +150,27 @@ fn plan(cf: &CondFormat, home: &str, mv: &CellMove, over: bool) -> Option<Vec<Gr
     if a.0 == u32::MAX {
         return None;
     }
+    // The farthest any cell of the block lies from its anchor: re-anchoring
+    // moves the formulas by no more than this.
+    let far = cf.ranges.iter().fold((0, 0), |(r, c), p| {
+        (
+            r.max(i64::from(p.2) - i64::from(a.0)),
+            c.max(i64::from(p.3) - i64::from(a.1)),
+        )
+    });
     let mut refs = Vec::new();
     for rule in &cf.rules {
         for f in rule.formulas() {
             // A formula that doesn't parse can't be re-anchored.
             let e = parse(f).ok()?;
+            // Nor one whose relative references some cell reads off the
+            // grid's edge, which Excel wraps (`A1<>A1048576` on B1:B10 reads
+            // the cell above): `translate` would make them #REF!, and the
+            // cut's reading here doesn't wrap either. Reads grow with the
+            // cell's distance from the anchor, so the farthest one decides.
+            if translate(&translate(&e, far.0, far.1), -far.0, -far.1) != e {
+                return None;
+            }
             references(&e, home, mv.src, &mut refs);
         }
     }

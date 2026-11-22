@@ -1074,3 +1074,48 @@ fn a_rule_whose_corner_alone_reads_the_cut_keeps_what_its_cells_read() {
     );
     assert_eq!(crate::cf::cell_dxf(&wb, 0, 5, 1), Some(red), "B6 by A6");
 }
+
+/// Excel wraps a rule's relative references off the grid's edge
+/// (`A1<>A1048576` on B1:B10 reads the cell above, B1 reading the last
+/// row). Re-anchoring such a rule would push them off the grid, so it is
+/// not split, and is re-pointed whole as before #1458 (r2).
+#[test]
+fn a_rule_whose_references_wrap_off_the_grid_is_not_split() {
+    let a5_to_c5 = CellMove {
+        rect: (4, 0, 4, 0),
+        ..cut_a5_a10_to_c5()
+    };
+    let (wb, wrote) = cut_with_rules(vec![held("B1:B10", expr("A1<>A1048576"), 0)], &a5_to_c5);
+    assert!(!wrote);
+    assert_eq!(
+        blocks(&wb, 0),
+        vec![block("B1:B10", "A1<>A1048576", Some(0), None)]
+    );
+    // Wrapping across columns too: A1 on B1:D1 reading XFD from B1.
+    let (wb, _) = cut_with_rules(
+        vec![held("B1:D1", expr("A1<>XFD1"), 0)],
+        &CellMove {
+            rect: (0, 1, 0, 1),
+            ..cut_a5_a10_to_c5()
+        },
+    );
+    assert_eq!(
+        blocks(&wb, 0),
+        vec![block("B1:D1", "A1<>XFD1", Some(0), None)]
+    );
+
+    // The data form's Delete beside such a rule: no #REF! from re-anchoring.
+    let cells: Vec<(String, Cell)> = (1..=10)
+        .map(|r| (format!("A{r}"), Cell::number(f64::from(r))))
+        .collect();
+    let cells: Vec<(&str, Cell)> = cells.iter().map(|(a, c)| (a.as_str(), c.clone())).collect();
+    let mut wb = book(&[("Sheet1", &cells)]);
+    wb.sheets[0]
+        .cond_formats
+        .push(held("B2:B10", expr("A2<>A1048576"), 0));
+    crate::edit::delete_record(&mut wb, 0, (0, 0, 9, 0), 4);
+    assert_eq!(
+        blocks(&wb, 0),
+        vec![block("B2:B10", "A2<>A1048576", Some(0), None)]
+    );
+}

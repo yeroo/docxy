@@ -194,8 +194,10 @@ fn walk_rules_stay(wb: &mut Workbook, src: usize, mv: &CellMove, write: bool) ->
     let meets = |a: &Area| a.0 <= r1 && r0 <= a.2 && a.1 <= c1 && c0 <= a.3;
     // Rules whose cells read the cut differently are split first, so the
     // walk's one rewrite per rule is right for each of its cells (#1458). A
-    // split rule always has a part the walk rewrites, so a dry run that
-    // would split can stop there.
+    // split changes the rules by itself (blocks added, formulas
+    // re-anchored), even one only re-anchoring a rule whose corner alone
+    // reads the cut, so a dry run that would split answers true at once,
+    // and the rewrite reports it whatever the walk then does.
     let split = split_cond_formats(wb, src, mv, |_, _| true, true, write);
     if split.any && !write {
         return true;

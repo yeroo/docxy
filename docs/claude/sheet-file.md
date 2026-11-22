@@ -296,8 +296,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   (`Split::beside_over`).
 - Only rules judged cell by cell split: cellIs, expression, and the text,
   blanks, errors and timePeriod kinds. Icon sets, color scales, data bars,
-  top/bottom, average and duplicate rules, a block mixing them, and a block
-  with a formula that doesn't parse are re-pointed whole as before. Excel
+  top/bottom, average and duplicate rules, a block mixing them, a block
+  with a formula that doesn't parse, and a block whose relative references
+  some cell reads off the grid's edge (Excel wraps them: `A1<>A1048576` on
+  B1:B10; re-anchoring would make them `#REF!`) are re-pointed whole as
+  before. Excel
   2010 `x14:conditionalFormatting` rules (`ext_rules`) are too: a clone
   would need new `x14:cfRule` ids.
 - Model: the part holding the first range's top-left keeps `ix`; the other
