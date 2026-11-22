@@ -2942,6 +2942,7 @@ fn parse_worksheet_with(
                         ranges,
                         rules: Vec::new(),
                         ix: cf_spans.iter().position(|&(s, _)| s == start),
+                        copy_of: None,
                     });
                 }
                 "cfRule" if cur_cf.is_some() && !in_ext => {
@@ -5640,8 +5641,16 @@ fn sole_claim<T>(
 /// Clear All or Clear Formats) loses its element.
 /// An element two model blocks claim, or whose `sqref` doesn't read, is left
 /// as it is.
+///
+/// A block a cut split off another (#1458, [`crate::sheet::CondFormat::copy_of`])
+/// is written as a clone of its source's element, as the part holds it,
+/// right after it: its own `sqref` and formulas, every other attribute and
+/// child kept. Clones are written only when their source element is
+/// written for its block or removed: one left as it is still covers their
+/// cells, and they would cover them twice.
 fn set_cond_formats(xml: String, sheet: &Sheet) -> String {
-    if sheet.cond_formats.iter().all(|cf| cf.ix.is_none()) && sheet.cf_removed.is_empty() {
+    let unclaimed = |cf: &crate::sheet::CondFormat| cf.ix.is_none() && cf.copy_of.is_none();
+    if sheet.cond_formats.iter().all(unclaimed) && sheet.cf_removed.is_empty() {
         return xml;
     }
     let mut edits = Vec::new();
@@ -5650,48 +5659,65 @@ fn set_cond_formats(xml: String, sheet: &Sheet) -> String {
         let Some(held) = held_sqref(element) else {
             continue;
         };
-        let cf = match sole_claim(&sheet.cond_formats, k, |cf| cf.ix) {
+        let own = match sole_claim(&sheet.cond_formats, k, |cf| cf.ix) {
             Err(()) => continue,
-            Ok(None) => {
-                if sheet.cf_removed.contains(&k) {
-                    edits.push((start, end, String::new()));
-                }
-                continue;
-            }
-            Ok(Some(cf)) => cf,
+            Ok(None) if sheet.cf_removed.contains(&k) => String::new(),
+            Ok(None) => continue,
+            Ok(Some(cf)) => match cf_element_as(element, &held, cf) {
+                Some(own) => own,
+                None => continue,
+            },
         };
-        let rules: Vec<(usize, usize)> = element_children(element)
-            .into_iter()
-            .filter(|(n, _, _)| n == "cfRule")
-            .map(|(_, s, e)| (s, e))
+        let clones: String = sheet
+            .cond_formats
+            .iter()
+            .filter(|cf| cf.copy_of == Some(k))
+            .filter_map(|cf| cf_element_as(element, &held, cf))
             .collect();
-        if rules.len() != cf.rules.len() {
-            continue;
+        if own != element || !clones.is_empty() {
+            edits.push((start, end, own + &clones));
         }
-        let mut inner = Vec::new();
-        for (&(rs, re), rule) in rules.iter().zip(&cf.rules) {
-            let held_f = held_formulas(&element[rs..re], "formula");
-            inner.extend(
-                formula_edits(&held_f, &rule.formulas())
-                    .into_iter()
-                    .map(|(s, e, t)| (rs + s, rs + e, t)),
-            );
-            inner.extend(
-                cfvo_edits(&element[rs..re], rule.cfvos())
-                    .into_iter()
-                    .map(|(s, e, t)| (rs + s, rs + e, t)),
-            );
-        }
-        if held == cf.ranges && inner.is_empty() {
-            continue;
-        }
-        let mut block = apply_edits(element.to_string(), inner);
-        if held != cf.ranges {
-            block = set_tag_attr_in_place(block, "sqref", &sqref_of(&cf.ranges));
-        }
-        edits.push((start, end, block));
     }
     apply_edits(xml, edits)
+}
+
+/// `element`, a `<conditionalFormatting>` whose `sqref` reads `held`,
+/// written for block `cf`: a new `sqref` and the `<formula>`s and `formula`
+/// thresholds that differ set in place, everything else kept (the element
+/// itself when nothing differs). `None` when its `<cfRule>`s don't match
+/// `cf`'s rules one for one.
+fn cf_element_as(
+    element: &str,
+    held: &[(u32, u32, u32, u32)],
+    cf: &crate::sheet::CondFormat,
+) -> Option<String> {
+    let rules: Vec<(usize, usize)> = element_children(element)
+        .into_iter()
+        .filter(|(n, _, _)| n == "cfRule")
+        .map(|(_, s, e)| (s, e))
+        .collect();
+    if rules.len() != cf.rules.len() {
+        return None;
+    }
+    let mut inner = Vec::new();
+    for (&(rs, re), rule) in rules.iter().zip(&cf.rules) {
+        let held_f = held_formulas(&element[rs..re], "formula");
+        inner.extend(
+            formula_edits(&held_f, &rule.formulas())
+                .into_iter()
+                .map(|(s, e, t)| (rs + s, rs + e, t)),
+        );
+        inner.extend(
+            cfvo_edits(&element[rs..re], rule.cfvos())
+                .into_iter()
+                .map(|(s, e, t)| (rs + s, rs + e, t)),
+        );
+    }
+    let mut block = apply_edits(element.to_string(), inner);
+    if held != cf.ranges {
+        block = set_tag_attr_in_place(block, "sqref", &sqref_of(&cf.ranges));
+    }
+    Some(block)
 }
 
 /// The descendants of `element` (a fragment that starts with its start tag)
@@ -10360,6 +10386,7 @@ impl SheetPackage {
                 ranges: block.ranges,
                 rules,
                 ix: None,
+                copy_of: None,
             });
         }
         if model.is_empty() {
@@ -10409,6 +10436,7 @@ impl SheetPackage {
             };
             for cf in &mut s.cond_formats {
                 cf.ix = cf.ix.and_then(renumber);
+                cf.copy_of = cf.copy_of.and_then(renumber);
             }
             s.cf_removed = s.cf_removed.iter().filter_map(|&i| renumber(i)).collect();
         }
@@ -27841,6 +27869,175 @@ mod rule_shift_tests {
             expr_cf("B1", "B1=2")
         );
         add_into_misordered(&body, 1, &[("A2", "A2=1"), ("B2", "B2=2")]);
+    }
+
+    // ---- a cut splits a rule its cells read differently (#1458) --------------
+
+    const SPLIT_CF: &str = r#"<conditionalFormatting sqref="B2:B20"><cfRule type="expression" dxfId="0" priority="3" stopIfTrue="1"><formula>A2&gt;0</formula></cfRule></conditionalFormatting>"#;
+
+    /// A5:A10 cut to C5 on sheet `S`.
+    fn cut_a5_a10_to_c5() -> crate::formula::CellMove<'static> {
+        crate::formula::CellMove {
+            src: "S",
+            dst: "S",
+            rect: (4, 0, 9, 0),
+            dr: 0,
+            dc: 2,
+        }
+    }
+
+    /// Saved and reloaded, `pkg` holds the same blocks (ranges and rules, in
+    /// order), and saving it again writes the same sheet; the saved sheet.
+    fn round_trips(pkg: &SheetPackage) -> String {
+        let blocks = |p: &SheetPackage| {
+            p.workbook.sheets[0]
+                .cond_formats
+                .iter()
+                .map(|c| (sqref_of(&c.ranges), c.rules.clone()))
+                .collect::<Vec<_>>()
+        };
+        let (re, ws) = saved(pkg, SHEET1);
+        assert_eq!(blocks(&re), blocks(pkg), "{ws}");
+        assert_eq!(saved(pkg, SHEET1).1, ws, "a second save");
+        ws
+    }
+
+    #[test]
+    fn a_split_cond_format_saves_as_clones_of_its_element() {
+        let mut pkg = one("S", SPLIT_CF);
+        assert!(crate::edit::move_refs_rules_stay(
+            &mut pkg.workbook,
+            0,
+            &cut_a5_a10_to_c5()
+        ));
+        let ws = round_trips(&pkg);
+        // The element keeps the cells that read nothing in the cut; B5:B10
+        // follow it in a clone of the element, every attribute kept.
+        assert!(
+            ws.contains(concat!(
+                r#"<conditionalFormatting sqref="B2:B4 B11:B20"><cfRule type="expression" dxfId="0" priority="3" stopIfTrue="1"><formula>A2&gt;0</formula></cfRule></conditionalFormatting>"#,
+                r#"<conditionalFormatting sqref="B5:B10"><cfRule type="expression" dxfId="0" priority="3" stopIfTrue="1"><formula>C5&gt;0</formula></cfRule></conditionalFormatting>"#,
+            )),
+            "{ws}"
+        );
+        assert_eq!(count(&ws, "<conditionalFormatting"), 2, "{ws}");
+
+        // The element's own cells all deleted: it goes, its clone stays.
+        delete_rows(&mut pkg.workbook, 0, 10, 10);
+        delete_rows(&mut pkg.workbook, 0, 1, 3);
+        assert_eq!(pkg.workbook.sheets[0].cf_removed, vec![0]);
+        let ws = round_trips(&pkg);
+        assert!(
+            ws.contains(r#"<conditionalFormatting sqref="B2:B7"><cfRule type="expression" dxfId="0" priority="3" stopIfTrue="1"><formula>C2&gt;0</formula></cfRule></conditionalFormatting>"#),
+            "{ws}"
+        );
+        assert_eq!(count(&ws, "<conditionalFormatting"), 1, "{ws}");
+    }
+
+    #[test]
+    fn a_split_copy_saves_after_a_second_split_and_a_data_form_delete() {
+        // A second cut splits the copy the first made.
+        let mut pkg = one("S", SPLIT_CF);
+        crate::edit::move_refs_rules_stay(&mut pkg.workbook, 0, &cut_a5_a10_to_c5());
+        let c7_c8 = crate::formula::CellMove {
+            rect: (6, 2, 7, 2),
+            ..cut_a5_a10_to_c5()
+        };
+        crate::edit::move_refs_rules_stay(&mut pkg.workbook, 0, &c7_c8);
+        let ws = round_trips(&pkg);
+        for (sqref, f) in [
+            ("B2:B4 B11:B20", "A2"),
+            ("B5:B6 B9:B10", "C5"),
+            ("B7:B8", "E7"),
+        ] {
+            assert!(
+                ws.contains(&format!(
+                    r#"<conditionalFormatting sqref="{sqref}"><cfRule type="expression" dxfId="0" priority="3" stopIfTrue="1"><formula>{f}&gt;0</formula>"#
+                )),
+                "{sqref}: {ws}"
+            );
+        }
+        assert_eq!(count(&ws, "<conditionalFormatting"), 3, "{ws}");
+
+        // The data form's Delete of the record in row 5 of the list A1:A10,
+        // beside a rule over B2:B10 that reads it.
+        let mut pkg = one("S", &SPLIT_CF.replace("B2:B20", "B2:B10"));
+        crate::edit::delete_record(&mut pkg.workbook, 0, (0, 0, 9, 0), 4);
+        let ws = round_trips(&pkg);
+        for (sqref, f) in [("B2:B4", "A2"), ("B6:B10", "A5"), ("B5", "#REF!")] {
+            assert!(
+                ws.contains(&format!(
+                    r#"<conditionalFormatting sqref="{sqref}"><cfRule type="expression" dxfId="0" priority="3" stopIfTrue="1"><formula>{f}&gt;0</formula>"#
+                )),
+                "{sqref}: {ws}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_split_copy_follows_its_element_when_a_block_is_added_ahead_of_it() {
+        // Misordered: the new block lands after the first element, ahead of
+        // the split one, which becomes the third.
+        let body = format!("{}{MARGINS}{SPLIT_CF}", expr_cf("H1", "TRUE"));
+        let mut pkg = one("S", &body);
+        crate::edit::move_refs_rules_stay(&mut pkg.workbook, 0, &cut_a5_a10_to_c5());
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(
+            s.cond_formats
+                .iter()
+                .map(|c| (c.ix, c.copy_of))
+                .collect::<Vec<_>>(),
+            vec![(Some(0), None), (Some(1), None), (None, Some(1))]
+        );
+        assert!(pkg.add_conditional_format(
+            0,
+            (2, 2, 2, 2),
+            "greaterThan",
+            "5",
+            None,
+            Dxf::default()
+        ));
+        let s = &pkg.workbook.sheets[0];
+        assert_eq!(
+            s.cond_formats
+                .iter()
+                .map(|c| (c.ix, c.copy_of))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(0), None),
+                (Some(2), None),
+                (None, Some(2)),
+                (Some(1), None)
+            ]
+        );
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(
+            ws.contains(concat!(
+                r#"<conditionalFormatting sqref="B2:B4 B11:B20"><cfRule type="expression" dxfId="0" priority="3" stopIfTrue="1"><formula>A2&gt;0</formula></cfRule></conditionalFormatting>"#,
+                r#"<conditionalFormatting sqref="B5:B10"><cfRule type="expression" dxfId="0" priority="3" stopIfTrue="1"><formula>C5&gt;0</formula></cfRule></conditionalFormatting>"#,
+            )),
+            "{ws}"
+        );
+        assert_eq!(count(&ws, "<conditionalFormatting"), 4, "{ws}");
+    }
+
+    #[test]
+    fn a_clone_is_not_written_beside_an_element_left_as_is() {
+        let mut pkg = one("S", SPLIT_CF);
+        crate::edit::move_refs_rules_stay(&mut pkg.workbook, 0, &cut_a5_a10_to_c5());
+        // The part's element now has a rule the model's block lacks: the save
+        // leaves it as it is, so it still covers B5:B10, and no clone goes
+        // beside it.
+        let two = SPLIT_CF.replace(
+            "</cfRule>",
+            r#"</cfRule><cfRule type="expression" priority="4"><formula>TRUE</formula></cfRule>"#,
+        );
+        let held = part(&pkg, SHEET1).replace(SPLIT_CF, &two);
+        assert!(held.contains(&two));
+        pkg.set_part(SHEET1, held.into_bytes());
+        let (_, ws) = saved(&pkg, SHEET1);
+        assert!(ws.contains(&two), "{ws}");
+        assert_eq!(count(&ws, "<conditionalFormatting"), 1, "{ws}");
     }
 }
 

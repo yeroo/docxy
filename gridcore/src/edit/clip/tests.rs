@@ -279,6 +279,7 @@ fn cf(ranges: &[(u32, u32, u32, u32)], kind: crate::sheet::CfKind) -> crate::she
             priority: 1,
         }],
         ix: None,
+        copy_of: None,
     }
 }
 
@@ -348,9 +349,23 @@ fn move_refs_rules_stay_follows_absolute_refs_in_rules_left_in_place() {
         "SUM($F$1:$G$1)+SUM($A$1:$G$1)",
         "G1 is not cut: neither range has both corners moved"
     );
-    // Relative and mixed refs stay; a fully absolute spill ref follows.
+    // In the cut cells relative and mixed refs stay, and a fully absolute
+    // spill ref follows. Beside the cut, A2:A10 read F1 through `F$1`, so
+    // they follow it; B2:D10 read G1:I1 there, and are split from them
+    // (#1458).
     assert_eq!(rule_formula(&wb, 0, 2), "F1+$F1+F$1+$F$20#");
-    assert_eq!(rule_formula(&wb, 0, 3), "F20>0");
+    // Beside the cut, only H6 read F1 (#1458).
+    assert_eq!(
+        blocks(&wb, 0)[2..],
+        [
+            block("A1:D1", "F1+$F1+F$1+$F$20#", None, None),
+            block("A2:A10", "F2+$F2+F$20+$F$20#", None, None),
+            block("B2:D10", "G2+$F2+G$1+$F$20#", None, None),
+            block("H6", "F20>0", None, None),
+            block("I6:J10", "G1>0", None, None),
+            block("H7:H10", "F2>0", None, None),
+        ]
+    );
 
     // Both corners in the cut: the absolute range follows.
     let mut wb = book(&[("Sheet1", &[])]);
@@ -443,6 +458,21 @@ fn cut_moves_refs_agrees_with_move_refs_rules_stay() {
             "a rule's formula",
             true,
             Box::new(|wb| (wb.sheets[0].cond_formats).push(cf(&[(4, 7, 9, 9)], expr("A1>0")))),
+        ),
+        (
+            "a rule split by the cut (#1458)",
+            true,
+            Box::new(|wb| (wb.sheets[0].cond_formats).push(cf(&[(5, 7, 9, 9)], expr("F1>0")))),
+        ),
+        (
+            "a rule over the cut split where a cell beside it reads it (#1458)",
+            true,
+            Box::new(|wb| (wb.sheets[0].cond_formats).push(cf(&[(0, 0, 9, 3)], expr("F$1=1")))),
+        ),
+        (
+            "a rule over the cut whose cells beside it read past it",
+            false,
+            Box::new(|wb| (wb.sheets[0].cond_formats).push(cf(&[(0, 0, 9, 3)], expr("G$1=1")))),
         ),
         (
             "a rule's cfvo formula",
@@ -632,5 +662,367 @@ fn a_moved_formula_qualifies_bare_table_refs_leaving_its_table() {
     assert_eq!(
         moved_cell_formula(&wb, (0, (9, 9)), (0, (10, 10)), "Qty+1", &plain),
         None
+    );
+}
+
+// ---- a cut splits a rule its cells read differently (#1458) -----------------
+
+/// The rectangle of A1 text `a` (`B5` or `B5:B20`).
+fn area(a: &str) -> (u32, u32, u32, u32) {
+    let (p, q) = a.split_once(':').unwrap_or((a, a));
+    let ((r1, c1), (r2, c2)) = (parse_cell_name(p).unwrap(), parse_cell_name(q).unwrap());
+    (r1, c1, r2, c2)
+}
+
+/// A rule `kind` over `sqref` held by the part's element `ix`, with a format
+/// and a priority of its own to check the split copies keep.
+fn held(sqref: &str, kind: crate::sheet::CfKind, ix: usize) -> crate::sheet::CondFormat {
+    crate::sheet::CondFormat {
+        ranges: sqref.split(' ').map(area).collect(),
+        rules: vec![crate::sheet::CfRule {
+            kind,
+            dxf_id: Some(3),
+            priority: 7,
+        }],
+        ix: Some(ix),
+        copy_of: None,
+    }
+}
+
+/// Each block on sheet `s`: (sqref, its first formula, `ix`, `copy_of`).
+type Block = (String, String, Option<usize>, Option<usize>);
+
+fn blocks(wb: &Workbook, s: usize) -> Vec<Block> {
+    wb.sheets[s]
+        .cond_formats
+        .iter()
+        .map(|cf| {
+            let f = cf.rules[0]
+                .formulas()
+                .first()
+                .map_or(String::new(), |f| (*f).clone());
+            (crate::xlsx::sqref_of(&cf.ranges), f, cf.ix, cf.copy_of)
+        })
+        .collect()
+}
+
+fn block(sqref: &str, formula: &str, ix: Option<usize>, copy_of: Option<usize>) -> Block {
+    (sqref.into(), formula.into(), ix, copy_of)
+}
+
+/// A5:A10 cut to C5 on Sheet1.
+fn cut_a5_a10_to_c5<'a>() -> CellMove<'a> {
+    CellMove {
+        src: "Sheet1",
+        dst: "Sheet1",
+        rect: (4, 0, 9, 0),
+        dr: 0,
+        dc: 2,
+    }
+}
+
+/// `move_refs_rules_stay` on a one-sheet book holding `rules`, after its dry
+/// run said the same and wrote nothing; the book and what both said.
+fn cut_with_rules(rules: Vec<crate::sheet::CondFormat>, mv: &CellMove) -> (Workbook, bool) {
+    let mut wb = book(&[("Sheet1", &[])]);
+    wb.sheets[0].cond_formats = rules;
+    let before = wb.sheets.clone();
+    let dry = cut_moves_refs(&mut wb, 0, mv);
+    assert!(wb.sheets == before, "the dry run wrote");
+    let wrote = move_refs_rules_stay(&mut wb, 0, mv);
+    assert_eq!(dry, wrote, "the dry run and the rewrite disagree");
+    (wb, wrote)
+}
+
+#[test]
+fn a_cut_splits_a_rule_whose_cells_read_it_differently() {
+    let mv = cut_a5_a10_to_c5();
+    // The anchor reads the cut: only B5:B10 follow it, B11:B20 keep A11:A20.
+    let (wb, wrote) = cut_with_rules(vec![held("B5:B20", expr("A5>0"), 0)], &mv);
+    assert!(wrote);
+    assert_eq!(
+        blocks(&wb, 0),
+        vec![
+            block("B5:B10", "C5>0", Some(0), None),
+            block("B11:B20", "A11>0", None, Some(0)),
+        ]
+    );
+    // Every part keeps the rule's format, priority and kind.
+    for cf in &wb.sheets[0].cond_formats {
+        assert_eq!((cf.rules[0].dxf_id, cf.rules[0].priority), (Some(3), 7));
+    }
+    // A cellIs rule keeps its operator.
+    let cell_is = crate::sheet::CfKind::CellIs {
+        op: "between".into(),
+        formulas: vec!["A5".into(), "$D$1".into()],
+    };
+    let (wb, _) = cut_with_rules(vec![held("B5:B20", cell_is, 0)], &mv);
+    let kinds: Vec<_> = wb.sheets[0]
+        .cond_formats
+        .iter()
+        .map(|cf| cf.rules[0].kind.clone())
+        .collect();
+    let between = |a: &str| crate::sheet::CfKind::CellIs {
+        op: "between".into(),
+        formulas: vec![a.into(), "$D$1".into()],
+    };
+    assert_eq!(kinds, vec![between("C5"), between("A11")]);
+
+    // The anchor doesn't read the cut (main left the rule alone and said
+    // nothing changed): B5:B10 split off and follow it.
+    let (wb, wrote) = cut_with_rules(vec![held("B2:B20", expr("A2>0"), 0)], &mv);
+    assert!(wrote, "cut_moves_refs sees the split");
+    assert_eq!(
+        blocks(&wb, 0),
+        vec![
+            block("B2:B4 B11:B20", "A2>0", Some(0), None),
+            block("B5:B10", "C5>0", None, Some(0)),
+        ]
+    );
+
+    // #1687's r2 rule beside the cut: only H6 read F1, so only it follows.
+    // The cells reading nothing in the cut can't be one block: its corner
+    // would be H6, which reads F1. They are two, each cornered on a cell of
+    // its own.
+    let (wb, _) = cut_with_rules(vec![held("H6:J10", expr("F1>0"), 0)], &cut_a1_f1_to_a20());
+    assert_eq!(
+        blocks(&wb, 0),
+        vec![
+            block("H6", "F20>0", Some(0), None),
+            block("I6:J10", "G1>0", None, Some(0)),
+            block("H7:H10", "F2>0", None, Some(0)),
+        ]
+    );
+}
+
+#[test]
+fn a_rule_reading_nothing_in_the_cut_is_not_split() {
+    // Another column on the cut's rows: nothing is read in the cut.
+    let mv_e5 = CellMove {
+        dc: 4,
+        ..cut_a5_a10_to_c5()
+    };
+    let (wb, wrote) = cut_with_rules(vec![held("D2:D20", expr("$D2>0"), 0)], &mv_e5);
+    assert!(!wrote);
+    assert_eq!(
+        blocks(&wb, 0),
+        vec![block("D2:D20", "$D2>0", Some(0), None)]
+    );
+    // A range only partly in the cut never follows it.
+    let mv = cut_a5_a10_to_c5();
+    let (wb, wrote) = cut_with_rules(vec![held("B1:B20", expr("SUM(A1:A10)>0"), 0)], &mv);
+    assert!(!wrote);
+    assert_eq!(
+        blocks(&wb, 0),
+        vec![block("B1:B20", "SUM(A1:A10)>0", Some(0), None)]
+    );
+    // Two columns, only B reading A: two blocks, not one per line.
+    let (wb, _) = cut_with_rules(vec![held("B2:C20", expr("A2>0"), 0)], &mv);
+    assert_eq!(
+        blocks(&wb, 0),
+        vec![
+            block("B2:B4 C2:C20 B11:B20", "A2>0", Some(0), None),
+            block("B5:B10", "C5>0", None, Some(0)),
+        ]
+    );
+    // A pasted where it was moves nothing.
+    let still = CellMove {
+        dc: 0,
+        ..cut_a5_a10_to_c5()
+    };
+    let (wb, wrote) = cut_with_rules(vec![held("B2:B20", expr("A2>0"), 0)], &still);
+    assert!(!wrote);
+    assert_eq!(blocks(&wb, 0), vec![block("B2:B20", "A2>0", Some(0), None)]);
+}
+
+#[test]
+fn a_rule_left_whole_when_its_cells_read_the_cut_alike() {
+    let mv = cut_a5_a10_to_c5();
+    // Every cell reads the cut: rewritten in place, one block.
+    let (wb, wrote) = cut_with_rules(vec![held("B5:B10", expr("A5>0"), 0)], &mv);
+    assert!(wrote);
+    assert_eq!(blocks(&wb, 0), vec![block("B5:B10", "C5>0", Some(0), None)]);
+    // None does: untouched.
+    let (wb, wrote) = cut_with_rules(vec![held("B5:B20", expr("H1>0"), 0)], &mv);
+    assert!(!wrote);
+    assert_eq!(blocks(&wb, 0), vec![block("B5:B20", "H1>0", Some(0), None)]);
+    // Judged over the whole range (a color scale with a relative formula
+    // threshold), or mixed with such a rule: re-pointed whole, not split.
+    let scale = crate::sheet::CfKind::Other {
+        rule_type: "colorScale".into(),
+        formulas: Vec::new(),
+        cfvos: vec![crate::sheet::Cfvo {
+            kind: "formula".into(),
+            val: "A5".into(),
+            gte: true,
+        }],
+    };
+    let (wb, wrote) = cut_with_rules(vec![held("B5:B20", scale.clone(), 0)], &mv);
+    assert!(wrote);
+    assert_eq!(wb.sheets[0].cond_formats.len(), 1);
+    assert_eq!(wb.sheets[0].cond_formats[0].rules[0].cfvos()[0].val, "C5");
+    let mut mixed = held("B5:B20", expr("A5>0"), 0);
+    mixed.rules.push(crate::sheet::CfRule {
+        kind: scale,
+        dxf_id: None,
+        priority: 8,
+    });
+    let (wb, _) = cut_with_rules(vec![mixed], &mv);
+    assert_eq!(blocks(&wb, 0), vec![block("B5:B20", "C5>0", Some(0), None)]);
+}
+
+/// The side effect: after the cut each cell of the rule is formatted by
+/// the cell it read, moved or not.
+#[test]
+fn a_split_rule_formats_each_cell_by_what_it_read() {
+    let red = crate::sheet::Dxf {
+        fill: Some((255, 0, 0)),
+        ..Default::default()
+    };
+    let mut rule = held("B5:B20", expr("A5>0"), 0);
+    rule.rules[0].dxf_id = Some(0);
+    let (mut wb, _) = cut_with_rules(vec![rule], &cut_a5_a10_to_c5());
+    wb.styles.dxfs = vec![red.clone()];
+    // The cells as the cut leaves them: A5 now at C5; A11 stays.
+    let s = &mut wb.sheets[0];
+    s.set_cell(4, 2, Cell::number(1.0)); // C5
+    s.set_cell(10, 0, Cell::number(1.0)); // A11
+    s.set_cell(10, 2, Cell::number(-1.0)); // C11
+    assert_eq!(
+        crate::cf::cell_dxf(&wb, 0, 4, 1),
+        Some(red.clone()),
+        "B5 by C5"
+    );
+    assert_eq!(crate::cf::cell_dxf(&wb, 0, 10, 1), Some(red), "B11 by A11");
+    assert_eq!(
+        crate::cf::cell_dxf(&wb, 0, 5, 1),
+        None,
+        "B6 by the empty C6"
+    );
+}
+
+#[test]
+fn a_cut_on_another_sheet_splits_a_rule_reading_it() {
+    let mut wb = book(&[("Sheet1", &[]), ("Sheet2", &[]), ("Sheet3", &[])]);
+    wb.sheets[1]
+        .cond_formats
+        .push(held("B5:B20", expr("Sheet1!A5>0"), 0));
+    let mv = CellMove {
+        src: "Sheet1",
+        dst: "Sheet3",
+        rect: (4, 0, 9, 0),
+        dr: 0,
+        dc: 0,
+    };
+    assert!(cut_moves_refs(&mut wb, 0, &mv));
+    assert!(move_refs_rules_stay(&mut wb, 0, &mv));
+    assert_eq!(
+        blocks(&wb, 1),
+        vec![
+            block("B5:B10", "Sheet3!A5>0", Some(0), None),
+            block("B11:B20", "Sheet1!A11>0", None, Some(0)),
+        ]
+    );
+}
+
+#[test]
+fn a_cut_splits_a_rule_over_it_where_cells_beside_read_into_it() {
+    let mv = cut_a5_a10_to_c5();
+    // The item's example: A11 read A10, which moved to C10. The cut cells
+    // keep the rule as #1687 left it; the rest read nothing in the cut.
+    let (wb, wrote) = cut_with_rules(vec![held("A2:A20", expr("A2>A1"), 0)], &mv);
+    assert!(wrote);
+    assert_eq!(
+        blocks(&wb, 0),
+        vec![
+            block("A2:A4 A12:A20", "A2>A1", Some(0), None),
+            block("A5:A10", "A5>A4", None, Some(0)),
+            block("A11", "A11>C10", None, Some(0)),
+        ]
+    );
+    // #880: a fully absolute reference into the rule's own cells stays,
+    // inside the cut and beside it alike: A1:A4 cut to C1.
+    let a1_a4 = CellMove {
+        rect: (0, 0, 3, 0),
+        ..mv
+    };
+    let (wb, wrote) = cut_with_rules(vec![held("A1:A10", expr("A1>$A$1"), 0)], &a1_a4);
+    assert!(!wrote);
+    assert_eq!(
+        blocks(&wb, 0),
+        vec![block("A1:A10", "A1>$A$1", Some(0), None)]
+    );
+    let a2_a4 = CellMove {
+        rect: (1, 0, 3, 0),
+        ..mv
+    };
+    let (wb, _) = cut_with_rules(vec![held("A2:A10", expr("A2>$A$2+A1"), 0)], &a2_a4);
+    assert_eq!(
+        blocks(&wb, 0),
+        vec![
+            block("A2:A4", "A2>$A$2+A1", Some(0), None),
+            block("A5", "A5>$A$2+C4", None, Some(0)),
+            block("A6:A10", "A6>$A$2+A5", None, Some(0)),
+        ]
+    );
+    // A part beside the cut whose corner lies in it: C6:C11 and B11 read
+    // $B5:$B10 (moved to E), and their block's corner B6 is a cut cell.
+    let b5_b10 = CellMove {
+        rect: (4, 1, 9, 1),
+        dc: 3,
+        ..mv
+    };
+    let (wb, _) = cut_with_rules(vec![held("B2:C20", expr("$B1>0"), 0)], &b5_b10);
+    assert_eq!(
+        blocks(&wb, 0),
+        vec![
+            block("B2:B4 C2:C5 B12:C20", "$B1>0", Some(0), None),
+            block("B5:B10", "$B4>0", None, Some(0)),
+            block("C6:C11 B11", "$E5>0", None, Some(0)),
+        ]
+    );
+}
+
+#[test]
+fn a_split_copy_splits_again_and_keeps_naming_its_element() {
+    let (mut wb, _) = cut_with_rules(vec![held("B2:B20", expr("A2>0"), 4)], &cut_a5_a10_to_c5());
+    // Then C7:C8 (A7:A8 before) cut to E7: the copy over B5:B10 splits.
+    let c7_c8 = CellMove {
+        src: "Sheet1",
+        dst: "Sheet1",
+        rect: (6, 2, 7, 2),
+        dr: 0,
+        dc: 2,
+    };
+    assert!(move_refs_rules_stay(&mut wb, 0, &c7_c8));
+    assert_eq!(
+        blocks(&wb, 0),
+        vec![
+            block("B2:B4 B11:B20", "A2>0", Some(4), None),
+            block("B5:B6 B9:B10", "C5>0", None, Some(4)),
+            block("B7:B8", "E7>0", None, Some(4)),
+        ]
+    );
+}
+
+#[test]
+fn a_data_form_delete_splits_a_rule_beside_the_list() {
+    let cells: Vec<(String, Cell)> = (1..=10)
+        .map(|r| (format!("A{r}"), Cell::number(f64::from(r))))
+        .collect();
+    let cells: Vec<(&str, Cell)> = cells.iter().map(|(a, c)| (a.as_str(), c.clone())).collect();
+    let mut wb = book(&[("Sheet1", &cells)]);
+    wb.sheets[0]
+        .cond_formats
+        .push(held("B2:B10", expr("A2>0"), 0));
+    // The record in row 5 of the list A1:A10 goes; A6:A10 move up.
+    crate::edit::delete_record(&mut wb, 0, (0, 0, 9, 0), 4);
+    assert_eq!(
+        blocks(&wb, 0),
+        vec![
+            block("B2:B4", "A2>0", Some(0), None),
+            block("B6:B10", "A5>0", None, Some(0)),
+            block("B5", "#REF!>0", None, Some(0)),
+        ]
     );
 }

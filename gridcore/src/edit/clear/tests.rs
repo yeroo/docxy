@@ -181,6 +181,7 @@ fn clearing_10k_areas_out_of_conditional_formatting_is_fast() {
             priority: 1,
         }],
         ix: None,
+        copy_of: None,
     });
     let areas: Vec<Area> = (0..10_000u32)
         .map(|k| {
@@ -233,6 +234,7 @@ fn clear_formats_reanchors_a_classic_cfvo_formula() {
             priority: 1,
         }],
         ix: None,
+        copy_of: None,
     });
     let plan = clear_plan(&wb.sheets[0], &[(0, 0, 2, 0)], ClearWhat::Formats, &[]).unwrap();
     apply_clear_sheet(&mut wb.sheets[0], &plan);

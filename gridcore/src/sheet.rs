@@ -2858,6 +2858,12 @@ pub struct CondFormat {
     /// built in memory). An Excel 2010 one in `extLst` is a
     /// [`Sheet::ext_rules`] entry.
     pub ix: Option<usize>,
+    /// For a block the part doesn't hold yet that a cut split off a block it
+    /// does (#1458): the ordinal of that block's element, which a save
+    /// clones right after itself for this block (its own `sqref` and
+    /// formulas, every other attribute and child kept). `None` on every
+    /// other block; `ix` stays `None` on a copy.
+    pub copy_of: Option<usize>,
 }
 
 /// Which Excel 2010 extension a [`ExtRule`] came from.

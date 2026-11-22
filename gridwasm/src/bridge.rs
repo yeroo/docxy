@@ -7753,6 +7753,7 @@ mod tests {
                 priority: 1,
             }],
             ix: None,
+            copy_of: None,
         });
     }
 

@@ -485,6 +485,7 @@ fn colours() -> Workbook {
             priority: 1,
         }],
         ix: None,
+        copy_of: None,
     });
     s.cond_formats.push(crate::sheet::CondFormat {
         ranges: vec![(1, 2, 10, 2)],
@@ -506,6 +507,7 @@ fn colours() -> Workbook {
             priority: 2,
         }],
         ix: None,
+        copy_of: None,
     });
     wb.styles.dxfs.push(crate::sheet::Dxf {
         fill: Some((255, 0, 0)),
@@ -907,6 +909,7 @@ fn an_icon_filter_over_ten_thousand_rows_reads_the_rule_once() {
             priority: 1,
         }],
         ix: None,
+        copy_of: None,
     });
     auto_filter_on(&mut wb, 0, (0, 0)).unwrap();
     let up = ColumnFilter::Icon {

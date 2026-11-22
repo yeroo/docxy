@@ -23,6 +23,7 @@ pub(crate) mod areas;
 #[cfg(test)]
 pub(crate) const PERF_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
 pub use areas::{RectIndex, cells_in_areas};
+mod cf_split;
 mod clear;
 mod clip;
 mod goto_special;
@@ -1153,7 +1154,7 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
     // too (a list on another sheet). Only one the rename touches is
     // reprinted, so the loaded spelling stays otherwise.
     for sheet in &mut wb.sheets {
-        for_each_rule_formula(sheet, true, |_, src| {
+        for_each_rule_formula(sheet, true, |_, _, src| {
             rename_sheet_in_rule(src, &old, new_name)
         });
     }
@@ -1331,7 +1332,7 @@ pub fn remove_sheet_refs_in_rules(wb: &mut Workbook, removed: &[String]) {
     }
     let order = sheet_order(wb);
     for sheet in &mut wb.sheets {
-        for_each_rule_formula(sheet, true, |_, src| {
+        for_each_rule_formula(sheet, true, |_, _, src| {
             let rewrite = |e: &Expr| crate::formula::remove_sheet_refs_in_expr(e, removed, &order);
             if let Some(updated) = rewrite_if_changed(src, rewrite) {
                 *src = updated;
@@ -2023,31 +2024,33 @@ fn delete_table_columns(wb: &mut Workbook, idx: usize, shift: &EditShift) {
 /// rewrites: a host that records the texts by their place in this walk can
 /// put them back.
 pub fn for_each_rule_formula_text(sheet: &mut Sheet, mut f: impl FnMut(&mut String)) {
-    for_each_rule_formula(sheet, true, |_, src| f(src));
+    for_each_rule_formula(sheet, true, |_, _, src| f(src));
 }
 
 /// Every conditional-formatting formula on `sheet` (a rule's `<formula>`s, the
 /// `val`s of its `formula` thresholds, and the Excel 2010 `extLst` ones), and
-/// with `validations` every data-validation formula too.
+/// with `validations` every data-validation formula too. `f` gets the rule's
+/// ranges, the index of a classic conditional-format block in
+/// [`Sheet::cond_formats`] (`None` for the others), and the formula.
 fn for_each_rule_formula(
     sheet: &mut Sheet,
     validations: bool,
-    mut f: impl FnMut(&[Area], &mut String),
+    mut f: impl FnMut(&[Area], Option<usize>, &mut String),
 ) {
-    for cf in &mut sheet.cond_formats {
+    for (i, cf) in sheet.cond_formats.iter_mut().enumerate() {
         for rule in &mut cf.rules {
             for src in rule.formulas_mut() {
-                f(&cf.ranges, src);
+                f(&cf.ranges, Some(i), src);
             }
             for src in rule.cfvo_formulas_mut() {
-                f(&cf.ranges, src);
+                f(&cf.ranges, Some(i), src);
             }
         }
     }
     for ext in &mut sheet.ext_rules {
         if validations || ext.kind == crate::sheet::ExtKind::Cf {
             for src in &mut ext.formulas {
-                f(&ext.ranges, src);
+                f(&ext.ranges, None, src);
             }
         }
     }
@@ -2055,8 +2058,8 @@ fn for_each_rule_formula(
         return;
     }
     for dv in &mut sheet.validations {
-        f(&dv.ranges, &mut dv.formula1);
-        f(&dv.ranges, &mut dv.formula2);
+        f(&dv.ranges, None, &mut dv.formula1);
+        f(&dv.ranges, None, &mut dv.formula2);
     }
 }
 
@@ -2740,13 +2743,15 @@ pub fn table_range_conflict(
 /// Where a formula sits, for the table rewrites: its sheet (a defined name
 /// has none), its cell (a conditional-format or validation rule has none),
 /// for a table's calculated-column formula that table's name, and for a
-/// rule's formula the rule's ranges.
+/// rule's formula the rule's ranges (and for a classic conditional-format
+/// block its index in [`Sheet::cond_formats`]).
 #[derive(Clone, Copy)]
 struct FormulaSite<'a> {
     sheet: Option<usize>,
     cell: Option<(u32, u32)>,
     table: Option<&'a str>,
     rule: Option<&'a [Area]>,
+    block: Option<usize>,
 }
 
 impl FormulaSite<'_> {
@@ -2799,6 +2804,7 @@ fn walk_workbook_formulas(
         cell,
         table: None,
         rule: None,
+        block: None,
     };
     for (s, sheet) in wb.sheets.iter_mut().enumerate() {
         for (&(r, c), cell) in sheet.cells.iter_mut() {
@@ -2818,12 +2824,13 @@ fn walk_workbook_formulas(
                 changed = true;
             }
         }
-        for_each_rule_formula(sheet, validations, |ranges, src| {
+        for_each_rule_formula(sheet, validations, |ranges, block, src| {
             if !go(changed) || !rules(s, ranges) {
                 return;
             }
             let site = FormulaSite {
                 rule: Some(ranges),
+                block,
                 ..at(Some(s), None)
             };
             if let Some(updated) = rewrite_if_changed(src, |e| f(e, site)) {
@@ -2865,6 +2872,7 @@ fn walk_workbook_formulas(
                 cell: Some((row, c1 + j as u32)),
                 table: Some(&name),
                 rule: None,
+                block: None,
             };
             if let Some(updated) = rewrite_if_changed(src, |e| f(e, site)) {
                 if write {

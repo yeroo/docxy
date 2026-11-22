@@ -1541,9 +1541,33 @@ fn src_corners(e: &Expr, home: &str, src: &str, out: &mut Vec<CellRef>) {
     }
 }
 
+/// Where each of `corners` (references of a rule anchored at `a`) starts or
+/// stops naming a cell of the cut `c`, as the rule's cells read it: the
+/// first row (`rows`) or column (`cols`) of a new part, so that each part
+/// [`split_at`] makes is wholly in or out for each reference. An absolute
+/// row or column reads the same from every cell and adds none.
+pub(crate) fn cut_lines(
+    corners: &[CellRef],
+    a: (u32, u32),
+    c: Rect,
+    rows: &mut Vec<i64>,
+    cols: &mut Vec<i64>,
+) {
+    for r in corners {
+        if !r.abs_row {
+            let lo = i64::from(c.0) + i64::from(a.0) - r.row;
+            rows.extend([lo, lo + i64::from(c.2 - c.0) + 1]);
+        }
+        if !r.abs_col {
+            let lo = i64::from(c.1) + i64::from(a.1) - r.col;
+            cols.extend([lo, lo + i64::from(c.3 - c.1) + 1]);
+        }
+    }
+}
+
 /// `range` split at the row and column lines (the first row or column of a
 /// new part) that fall inside it.
-fn split_at(range: Rect, rows: &[i64], cols: &[i64]) -> Vec<Rect> {
+pub(crate) fn split_at(range: Rect, rows: &[i64], cols: &[i64]) -> Vec<Rect> {
     let spans = |lo: u32, hi: u32, lines: &[i64]| {
         let mut starts = vec![lo];
         starts.extend(
@@ -1688,19 +1712,8 @@ fn cut_rule(
         return CutOutcome::Keep;
     }
     let c = mv.rect;
-    // Where a reference starts or stops naming a cut cell, as the rule's
-    // cells read it: each part is then wholly in or out for each reference.
     let (mut rows, mut cols) = (Vec::new(), Vec::new());
-    for r in &corners {
-        if !r.abs_row {
-            let lo = i64::from(c.0) + i64::from(a.0) - r.row;
-            rows.extend([lo, lo + i64::from(c.2 - c.0) + 1]);
-        }
-        if !r.abs_col {
-            let lo = i64::from(c.1) + i64::from(a.1) - r.col;
-            cols.extend([lo, lo + i64::from(c.3 - c.1) + 1]);
-        }
-    }
+    cut_lines(&corners, a, c, &mut rows, &mut cols);
     for (on, (r1, c1, r2, c2)) in [(on_src, c), (on_dst, cut.landed)] {
         if on {
             rows.extend([i64::from(r1), i64::from(r2) + 1]);
