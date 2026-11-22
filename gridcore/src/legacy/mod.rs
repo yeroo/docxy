@@ -8,10 +8,11 @@
 //! number formats, date system, defined names and the external links that
 //! calls to add-in functions need (`.xlsb`, `.xls`), so everything downstream
 //! (engine, editor, save) sees an ordinary workbook. Nothing the readers don't
-//! model survives the import. The `.xls` reader also reads the formatting the
-//! model holds (fonts, fills, alignment, wrap, borders, merged cells, column
-//! widths, row heights, hidden rows, columns and sheets, frozen panes), and
-//! names what it skipped ([`Opened::dropped`]).
+//! model survives the import. All three read the cell formats the model holds
+//! (fonts, fills, thin borders), column widths, merged cells, comments, data
+//! validation and conditional formats (#884). The `.xls` reader also reads
+//! alignment, wrap, row heights, hidden rows, columns and sheets and frozen
+//! panes, and names what it skipped ([`Opened::dropped`]).
 //!
 //! An `.xls` can be written back too ([`write_xls`], #874): a host in
 //! Excel's Compatibility Mode saves the workbook as BIFF8 again, and names
@@ -35,6 +36,7 @@ mod ptg_write;
 mod xls;
 mod xls_write;
 mod xlsb;
+mod xlsb_style;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -277,15 +279,18 @@ pub fn open_workbook_ex(data: &[u8]) -> Result<Opened, OpenError> {
 }
 
 /// What an imported file may make the import allocate. Past any of these
-/// the file is refused ([`OpenError::Corrupt`]), never silently truncated.
+/// but [`Limits::styled_blanks`] and [`Limits::column_walk`] the file is
+/// refused ([`OpenError::Corrupt`]), never silently truncated; past those
+/// two, formatting is left out (they hold no value).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Limits {
     /// Cells across the workbook, every reader ("too many cells"). Far
     /// past any real workbook, which memory bounds long before this.
     pub cells: usize,
     /// The copies `.ods` repeats add (a repeated cell's or row's 2nd, 3rd,
-    /// ... instance): the guard against a tiny file that expands to
-    /// billions ("too many repeated cells").
+    /// ... instance, and the merges a repeated row's copies make): the
+    /// guard against a tiny file that expands to billions ("too many
+    /// repeated cells").
     pub repeat_cells: usize,
     /// The text and formula bytes those copies add.
     pub repeat_bytes: usize,
@@ -294,6 +299,15 @@ pub(crate) struct Limits {
     /// Distinct external link parts with a function name ("too many
     /// external links").
     pub links: usize,
+    /// Empty cells an `.ods` keeps only for their format (#884), across
+    /// the workbook. Past it, further ones are left out, as they hold no
+    /// value. That loses formatting, never data, and is no error.
+    pub styled_blanks: usize,
+    /// Column default styles an `.ods` looks up for empty cells without a
+    /// style of their own (#884): a run across many columns visits each
+    /// style it crosses. Past it, empty cells take no column style (no
+    /// styled blanks or conditional styles from it), never a refusal.
+    pub column_walk: usize,
 }
 
 impl Default for Limits {
@@ -304,6 +318,8 @@ impl Default for Limits {
             repeat_bytes: 256 << 20,
             sheets: 4_096,
             links: 4_096,
+            styled_blanks: 1_000_000,
+            column_walk: 4_000_000,
         }
     }
 }
@@ -340,6 +356,107 @@ pub(crate) struct SheetIn {
     pub col_breaks: Vec<crate::sheet::PageBreak>,
     /// Where outline summaries sit.
     pub outline: crate::sheet::OutlineSettings,
+    /// Cell comments (#884): (row, col, author, text).
+    pub comments: Vec<(u32, u32, String, String)>,
+    /// Data-validation rules (#884).
+    pub validations: Vec<DvIn>,
+    /// Conditional-formatting blocks (#884), in file order.
+    pub cond_formats: Vec<CfIn>,
+}
+
+/// A data-validation rule as a reader collects it (#884): its formulas in
+/// Excel's syntax, relative to `base`, the cell the file's format bases
+/// them at. [`BookIn::build`] moves them to the model's anchor
+/// ([`anchor_of`] its ranges).
+#[derive(Clone, Debug)]
+pub(crate) struct DvIn {
+    pub rule: crate::sheet::DataValidation,
+    pub base: (u32, u32),
+}
+
+impl DvIn {
+    /// The rule, its formulas moved from `base` to the model's anchor;
+    /// `None` when one must move and doesn't parse.
+    pub(crate) fn placed(self) -> Option<crate::sheet::DataValidation> {
+        let DvIn { rule: mut dv, base } = self;
+        let to = anchor_of(&dv.ranges).unwrap_or(base);
+        dv.formula1 = rebase(&dv.formula1, Some(base), to)?;
+        dv.formula2 = rebase(&dv.formula2, Some(base), to)?;
+        Some(dv)
+    }
+}
+
+impl CfIn {
+    /// The block, its rules' formulas moved from `base` to the model's
+    /// anchor (now its `base`); a rule whose formula must move and
+    /// doesn't parse is left out.
+    pub(crate) fn placed(self) -> CfIn {
+        let to = anchor_of(&self.ranges).unwrap_or(self.base);
+        let rules = self
+            .rules
+            .into_iter()
+            .filter_map(|(mut rule, dxf)| {
+                for f in rule.formulas_mut() {
+                    *f = rebase(f, Some(self.base), to)?;
+                }
+                Some((rule, dxf))
+            })
+            .collect();
+        CfIn {
+            ranges: self.ranges,
+            rules,
+            base: to,
+        }
+    }
+}
+
+/// The validation rules of `sheet` as the build places them (#884).
+#[cfg(test)]
+pub(crate) fn placed_dvs(sheet: &SheetIn) -> Vec<crate::sheet::DataValidation> {
+    sheet
+        .validations
+        .iter()
+        .filter_map(|v| v.clone().placed())
+        .collect()
+}
+
+/// A conditional-formatting block as a reader collects it (#884): its
+/// ranges and its rules, each `cellIs` or `expression` with the
+/// differential format it applies, their formulas in Excel's syntax
+/// relative to `base` (the cell the file's format bases them at).
+/// [`BookIn::build`] moves them to the model's anchor.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CfIn {
+    pub ranges: Vec<(u32, u32, u32, u32)>,
+    pub rules: Vec<(crate::xlsx::NewCfRule, crate::sheet::Dxf)>,
+    pub base: (u32, u32),
+}
+
+/// The cell a rule's relative formulas are written for in the model: the
+/// least row and least column of its ranges, as
+/// `validation::anchor_of` and `cf::cell_dxf` take it. `None` for no
+/// ranges.
+pub(crate) fn anchor_of(ranges: &[(u32, u32, u32, u32)]) -> Option<(u32, u32)> {
+    (!ranges.is_empty()).then(|| crate::validation::anchor_of(ranges))
+}
+
+/// `f`, its relative references moved from being based at `from` to being
+/// based at `to` (`from` none: they are already); `None` when it must move
+/// and doesn't parse, or when the move pushes a reference off the grid
+/// (`translate_formula` prints it `#REF!`, which every cell would then
+/// see: the rule is better left out). A `#REF!` the formula already had
+/// stays.
+pub(crate) fn rebase(f: &str, from: Option<(u32, u32)>, to: (u32, u32)) -> Option<String> {
+    let Some(from) = from.filter(|&b| b != to && !f.is_empty()) else {
+        return Some(f.to_string());
+    };
+    let (dr, dc) = (
+        i64::from(to.0) - i64::from(from.0),
+        i64::from(to.1) - i64::from(from.1),
+    );
+    let moved = crate::formula::translate_formula(f, dr, dc)?;
+    let refs = |s: &str| s.matches("#REF!").count();
+    (refs(&moved) <= refs(f)).then_some(moved)
 }
 
 /// One column definition as a reader collects it.
@@ -393,8 +510,6 @@ pub(crate) struct BookIn {
     /// The cell formats the cells' `style` indices name; index 0 is always
     /// the default (General).
     pub xfs: Vec<Xf>,
-    /// The `xfs` that are a number format alone, by code.
-    format_ix: HashMap<String, u32>,
     /// What the file has that the import leaves out ([`Opened::dropped`]).
     pub dropped: BTreeSet<&'static str>,
     /// The sheet the workbook opens on (an index into `sheets`).
@@ -418,6 +533,7 @@ pub(crate) struct BookIn {
     cells: usize,
     repeat_cells: usize,
     repeat_bytes: usize,
+    styled_blanks: usize,
 }
 
 impl BookIn {
@@ -432,21 +548,6 @@ impl BookIn {
             limits,
             ..BookIn::default()
         }
-    }
-
-    /// The `xfs` index of number format `code` alone, added when new.
-    pub fn format_index(&mut self, code: &str) -> u32 {
-        if code.eq_ignore_ascii_case("General") || code.is_empty() {
-            return 0;
-        }
-        if let Some(&i) = self.format_ix.get(code) {
-            return i;
-        }
-        let mut xf = Xf::default();
-        xf.set_code(Some(code.to_string()));
-        let i = self.add_xf(xf);
-        self.format_ix.insert(code.to_string(), i);
-        i
     }
 
     /// The `xfs` index of a new cell format `xf` (0 for the default).
@@ -494,6 +595,18 @@ impl BookIn {
             return Err(OpenError::Corrupt("too many repeated cells".into()));
         }
         Ok(())
+    }
+
+    /// Whether `n` more styled blanks fit [`Limits::styled_blanks`], and
+    /// if so, take them. Never an error: what doesn't fit is left out.
+    pub fn take_styled_blanks(&mut self, n: usize) -> bool {
+        match self.styled_blanks.checked_add(n) {
+            Some(t) if t <= self.limits.styled_blanks => {
+                self.styled_blanks = t;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The package: a fresh workbook with these sheets, cells, number
@@ -554,7 +667,37 @@ impl BookIn {
             pkg.workbook.styles.xfs.push(xf);
             xf_of[i] = (pkg.workbook.styles.xfs.len() - 1) as u32;
         }
-        for (at, sheet) in self.sheets.into_iter().enumerate() {
+        for (at, mut sheet) in self.sheets.into_iter().enumerate() {
+            // The comments part, its drawing and rels, written once.
+            pkg.set_comments(at, &std::mem::take(&mut sheet.comments));
+            // The conditional formats, in one pass over the parts; a rule
+            // whose formula can't be kept is left out.
+            let mut blocks = Vec::new();
+            for cf in std::mem::take(&mut sheet.cond_formats) {
+                let mut rules = Vec::new();
+                // From the reader's base to the model's anchor, as above.
+                let cf = cf.placed();
+                for (mut kind, dxf) in cf.rules {
+                    let mut kept = true;
+                    for f in kind.formulas_mut() {
+                        match fix(std::mem::take(f), false) {
+                            Some(g) => *f = g,
+                            None => kept = false,
+                        }
+                    }
+                    if kept {
+                        rules.push((kind, dxf));
+                    }
+                }
+                if !rules.is_empty() && !cf.ranges.is_empty() {
+                    blocks.push(crate::xlsx::NewCondFormat {
+                        sqref: crate::xlsx::sqref_of(&cf.ranges),
+                        ranges: cf.ranges,
+                        rules,
+                    });
+                }
+            }
+            pkg.add_cond_formats(at, blocks);
             let s = &mut pkg.workbook.sheets[at];
             for (key, mut cell) in sheet.cells {
                 cell.style = xf_of.get(cell.style as usize).copied().unwrap_or(0);
@@ -565,6 +708,27 @@ impl BookIn {
                 s.cells.insert(key, cell);
             }
             s.merges = sheet.merges;
+            // Built in memory (`ix` and `orig` none), so a save appends
+            // them. Their formulas move from the reader's base to the
+            // model's anchor; one that can't move (it doesn't parse), or
+            // whose formula can't be kept, is left out.
+            for dv in sheet.validations {
+                let Some(mut dv) = dv.placed() else {
+                    continue;
+                };
+                let mut kept = true;
+                for f in [&mut dv.formula1, &mut dv.formula2] {
+                    if !f.is_empty() {
+                        match fix(std::mem::take(f), false) {
+                            Some(g) => *f = g,
+                            None => kept = false,
+                        }
+                    }
+                }
+                if kept && !dv.ranges.is_empty() {
+                    s.validations.push(dv);
+                }
+            }
             for (rect, target) in sheet.hyperlinks {
                 for cell in crate::sheet::hyperlink_cells(rect) {
                     s.hyperlinks.insert(cell, target.clone());
@@ -1057,27 +1221,6 @@ impl<'a> Le<'a> {
     }
 }
 
-/// An `.xlsb`'s number formats as its xfs use them (the `.xls` reader
-/// reads whole XFs, see `xls::Styles`): each xf's format id, and the file's
-/// own format codes by id.
-#[derive(Default)]
-pub(crate) struct XfFormats {
-    pub(crate) xf_fmt: Vec<u16>,
-    pub(crate) codes: HashMap<u16, String>,
-}
-
-impl XfFormats {
-    /// The `book.xfs` index of xf `xf`'s number format alone
-    /// ([`format_code`]).
-    pub(crate) fn format_of(&self, xf: u32, book: &mut BookIn) -> u32 {
-        let ifmt = self.xf_fmt.get(xf as usize).copied().unwrap_or(0);
-        match format_code(&self.codes, ifmt) {
-            Some(code) => book.format_index(&code),
-            None => 0,
-        }
-    }
-}
-
 /// The number format code of format id `ifmt` (BIFF8 and BIFF12 alike):
 /// the file's own code for it, else the built-in one; `None` for General.
 pub(crate) fn format_code(codes: &HashMap<u16, String>, ifmt: u16) -> Option<String> {
@@ -1086,6 +1229,91 @@ pub(crate) fn format_code(codes: &HashMap<u16, String>, ifmt: u16) -> Option<Str
         .cloned()
         .or_else(|| builtin_format(ifmt as u32))
         .filter(|c| !c.eq_ignore_ascii_case("General"))
+}
+
+/// The `cellIs` operator of a conditional format's CFOper (BIFF8 CF's
+/// `cp`, BIFF12 BrtBeginCFRule's `iParam`): 1 between ... 8 less than or
+/// equal; `None` for another.
+pub(crate) fn cf_operator(op: u32) -> Option<&'static str> {
+    Some(match op {
+        1 => "between",
+        2 => "notBetween",
+        3 => "equal",
+        4 => "notEqual",
+        5 => "greaterThan",
+        6 => "lessThan",
+        7 => "greaterThanOrEqual",
+        8 => "lessThanOrEqual",
+        _ => return None,
+    })
+}
+
+/// The rule kind of a data validation's `valType` (BIFF8 DV and BIFF12
+/// BrtDVal alike): `""` is Any value.
+pub(crate) fn dv_kind(val_type: u32) -> &'static str {
+    match val_type {
+        1 => "whole",
+        2 => "decimal",
+        3 => "list",
+        4 => "date",
+        5 => "time",
+        6 => "textLength",
+        7 => "custom",
+        _ => "",
+    }
+}
+
+/// The operator of a data validation's `typOperator`, for the kinds that
+/// compare (empty for the others).
+pub(crate) fn dv_operator(kind: &str, op: u32) -> String {
+    if !crate::validation::takes_operator(kind) {
+        return String::new();
+    }
+    match op {
+        1 => "notBetween",
+        2 => "equal",
+        3 => "notEqual",
+        4 => "greaterThan",
+        5 => "lessThan",
+        6 => "greaterThanOrEqual",
+        7 => "lessThanOrEqual",
+        _ => "between",
+    }
+    .to_string()
+}
+
+/// A data validation's flags word (BIFF8 DV's dwDvFlags, BIFF12 BrtDVal's
+/// flags; [MS-XLS] 2.4.123, [MS-XLSB] 2.4 BrtDVal): valType (bits 0-3),
+/// errStyle (4-6), fAllowBlank (8), fSuppressCombo (9), fShowInputMsg
+/// (18), fShowErrorMsg (19), typOperator (20-23). The rule they make,
+/// without its ranges, texts and formulas.
+pub(crate) fn dv_from_flags(flags: u32) -> crate::sheet::DataValidation {
+    use crate::sheet::AlertStyle;
+    let kind = dv_kind(flags & 0x0F);
+    crate::sheet::DataValidation {
+        kind: kind.to_string(),
+        operator: dv_operator(kind, (flags >> 20) & 0x0F),
+        error_style: match (flags >> 4) & 0x07 {
+            1 => AlertStyle::Warning,
+            2 => AlertStyle::Information,
+            _ => AlertStyle::Stop,
+        },
+        allow_blank: flags & (1 << 8) != 0,
+        show_dropdown: flags & (1 << 9) == 0,
+        show_input: flags & (1 << 18) != 0,
+        show_error: flags & (1 << 19) != 0,
+        ..crate::sheet::DataValidation::default()
+    }
+}
+
+/// A list rule's formula as decompiled: an explicit list is one string of
+/// items split by NULs (`"a\0b"`), which an `.xlsx` spells `"a,b"`.
+pub(crate) fn dv_list_formula(f: String) -> String {
+    if f.contains('\0') {
+        f.replace('\0', ",")
+    } else {
+        f
+    }
 }
 
 /// An RK number (BIFF8 and BIFF12): a 30-bit integer or the top of an
@@ -1173,6 +1401,24 @@ pub(crate) fn biff_error(code: u8) -> &'static str {
 /// for ids below 164).
 pub(crate) fn builtin_format(id: u32) -> Option<String> {
     crate::numfmt::builtin_code(id).map(str::to_string)
+}
+
+/// Whether cell format `style` of `pkg` is a thin box: the model's
+/// `border`, or a loaded `<xf>` whose `<border>` is one (the `.xlsx` loader
+/// keeps the border element through [`Xf::loaded_from`] and never sets
+/// `border`). For the round-trip tests of the imports (#884).
+#[cfg(test)]
+pub(crate) fn saved_thin_box(pkg: &SheetPackage, style: u32) -> bool {
+    let xf = pkg.workbook.styles.xf(style);
+    let extras = pkg
+        .part(pkg.styles_part_name())
+        .map(|b| crate::xlsx::loaded_xf_extras(&String::from_utf8_lossy(b)))
+        .unwrap_or_default();
+    xf.border
+        || xf
+            .loaded_from
+            .and_then(|k| extras.get(k as usize))
+            .is_some_and(|e| e.thin_box)
 }
 
 #[cfg(test)]
@@ -1691,7 +1937,13 @@ mod tests {
             repeat_bytes: 100,
             sheets: 2,
             links: 1,
+            styled_blanks: 5,
+            column_walk: 0,
         });
+        // Styled blanks fit or are left out, never refused.
+        assert!(book.take_styled_blanks(5));
+        assert!(!book.take_styled_blanks(1));
+        assert!(!book.take_styled_blanks(usize::MAX));
         book.charge_cells(10).unwrap();
         assert!(
             book.charge_cells(1)
@@ -1786,5 +2038,60 @@ mod tests {
             err.to_string(),
             "password-protected workbooks are not supported"
         );
+    }
+
+    /// `add_cond_formats` writes no block of no rules (the schema wants
+    /// one) and leaves it out of the model; the others are written and
+    /// claim their elements (#884 r1).
+    #[test]
+    fn add_cond_formats_skips_a_block_of_no_rules() {
+        use crate::xlsx::{NewCfRule, NewCondFormat};
+        let mut pkg = crate::xlsx::new_xlsx_sheets(&["S".to_string()]);
+        let block = |rules: Vec<(NewCfRule, crate::sheet::Dxf)>| NewCondFormat {
+            ranges: vec![(0, 0, 1, 0)],
+            sqref: "A1:A2".into(),
+            rules,
+        };
+        let rule = NewCfRule::Expression {
+            formula: "A1>0".into(),
+        };
+        assert!(pkg.add_cond_formats(
+            0,
+            vec![
+                block(Vec::new()),
+                block(vec![(rule, crate::sheet::Dxf::default())])
+            ]
+        ));
+        let part = String::from_utf8_lossy(pkg.part(&pkg.sheet_parts[0]).unwrap()).into_owned();
+        assert_eq!(part.matches("<conditionalFormatting").count(), 1, "{part}");
+        let cf = &pkg.workbook.sheets[0].cond_formats;
+        assert_eq!(cf.len(), 1);
+        assert_eq!((cf[0].rules.len(), cf[0].ix), (1, Some(0)));
+        // A batch of only empty blocks changes nothing.
+        let before = pkg.workbook.styles.dxfs.len();
+        assert!(pkg.add_cond_formats(0, vec![block(Vec::new())]));
+        assert_eq!(pkg.workbook.sheets[0].cond_formats.len(), 1);
+        assert_eq!(pkg.workbook.styles.dxfs.len(), before);
+    }
+
+    /// `rebase` refuses a move that pushes a reference off the grid, and
+    /// keeps a `#REF!` the formula already had (#884 r3).
+    #[test]
+    fn rebase_refuses_a_move_off_the_grid() {
+        assert_eq!(rebase("A5>0", Some((4, 3)), (1, 1)), None);
+        assert_eq!(
+            rebase("D5>0", Some((4, 3)), (1, 1)).as_deref(),
+            Some("B2>0")
+        );
+        assert_eq!(
+            rebase("#REF!+D5", Some((4, 3)), (1, 1)).as_deref(),
+            Some("#REF!+B2")
+        );
+        assert_eq!(rebase("#REF!+A5", Some((4, 3)), (1, 1)), None);
+        assert_eq!(
+            rebase("$A$5>0", Some((4, 3)), (1, 1)).as_deref(),
+            Some("$A$5>0")
+        );
+        assert_eq!(rebase("A5", None, (1, 1)).as_deref(), Some("A5"));
     }
 }

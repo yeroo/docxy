@@ -1,6 +1,6 @@
 //! OpenDocument Spreadsheet `.ods`: `content.xml` (the tables, their
-//! cells and names) and `styles.xml` (data styles), read with
-//! [`opccore::xml`].
+//! cells and names, validations and conditional formats) and `styles.xml`
+//! (data styles and cell styles), read with [`opccore::xml`].
 //!
 //! Formulas are OpenFormula (`of:=SUM([.A1:.A3];[Data.B1])`) as Excel and
 //! LibreOffice write it, converted to Excel's syntax: `[.A1]` references,
@@ -12,17 +12,19 @@
 //! something, so padding costs nothing. The copies a repeat that does hold
 //! something adds are charged to a budget ([`super::Limits`]: copies, and
 //! the text and formula bytes they hold) before they are made; a file that
-//! asks for more is refused rather than allowed to exhaust memory. Text in
-//! a cell's annotation or drawn shapes (`office:annotation`, `draw:*`) is
-//! not the cell's value.
+//! asks for more is refused rather than allowed to exhaust memory. An
+//! empty cell kept for its format has its own cap, past which it is left
+//! out, never refused (#884). Text in a cell's annotation or drawn shapes
+//! (`office:annotation`, `draw:*`) is not the cell's value; an annotation
+//! is the cell's comment.
 
 use std::collections::{BTreeMap, HashMap};
 
 use opccore::xml::{Event, XmlParser};
 use opccore::zip::ZipArchive;
 
-use super::{BookIn, Limits, OpenError, SheetIn, sheet_prefix};
-use crate::sheet::{Cell, CellValue, DefinedName, MAX_COLS, MAX_ROWS};
+use super::{BookIn, ColIn, Limits, OpenError, SheetIn, sheet_prefix};
+use crate::sheet::{Cell, CellValue, DefinedName, MAX_COLS, MAX_ROWS, Xf};
 
 /// `2024-01-15` or `2024-01-15T12:30:00.5` as a serial.
 fn parse_date(s: &str, date1904: bool) -> Option<f64> {
@@ -541,18 +543,208 @@ fn format_code(styles: &HashMap<String, DataStyle>, name: &str) -> Option<String
     })
 }
 
-/// The data styles and table-cell styles of a styles or content part.
+/// The parts of a table-cell style's text and cell properties the model
+/// holds (#884): each `None` where the style leaves it to its parent.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CellProps {
+    bold: Option<bool>,
+    italic: Option<bool>,
+    /// `fo:color`: a colour, or `None` for one that doesn't read.
+    color: Option<Option<(u8, u8, u8)>>,
+    /// `fo:font-size`, in points.
+    size: Option<f64>,
+    /// The font family (`style:font-name` through the font-face
+    /// declarations, or `fo:font-family`).
+    font: Option<String>,
+    /// `fo:background-color`: a colour, or `None` for `transparent`.
+    fill: Option<Option<(u8, u8, u8)>>,
+    /// Each side (top, bottom, left, right): a thin solid line.
+    sides: [Option<bool>; 4],
+    /// A diagonal line is drawn.
+    diagonal: Option<bool>,
+}
+
+impl CellProps {
+    /// These properties, each one this style leaves unset taken from
+    /// `parent`.
+    fn over(&self, parent: &CellProps) -> CellProps {
+        let mut sides = self.sides;
+        for (s, p) in sides.iter_mut().zip(parent.sides) {
+            *s = s.or(p);
+        }
+        CellProps {
+            bold: self.bold.or(parent.bold),
+            italic: self.italic.or(parent.italic),
+            color: self.color.or(parent.color),
+            size: self.size.or(parent.size),
+            font: self.font.clone().or_else(|| parent.font.clone()),
+            fill: self.fill.or(parent.fill),
+            sides,
+            diagonal: self.diagonal.or(parent.diagonal),
+        }
+    }
+
+    /// Read the attributes of a `style:text-properties` or
+    /// `style:table-cell-properties` element.
+    fn read(&mut self, p: &XmlParser, faces: &HashMap<String, String>) {
+        let attr = |a: &str| Some(decoded(p.attr(a))).filter(|v| !v.is_empty());
+        if let Some(w) = attr("fo:font-weight") {
+            self.bold = Some(match w.as_str() {
+                "bold" => true,
+                "normal" => false,
+                n => n.parse::<u32>().is_ok_and(|n| n >= 600),
+            });
+        }
+        if let Some(st) = attr("fo:font-style") {
+            self.italic = Some(matches!(st.as_str(), "italic" | "oblique"));
+        }
+        if let Some(c) = attr("fo:color") {
+            self.color = Some(hex_color(&c));
+        }
+        if let Some(sz) = attr("fo:font-size") {
+            if let Some(pt) = length_pt(&sz) {
+                self.size = Some(pt);
+            }
+        }
+        if let Some(face) = attr("style:font-name") {
+            self.font = Some(faces.get(&face).cloned().unwrap_or(face));
+        } else if let Some(family) = attr("fo:font-family") {
+            self.font = Some(unquote(&family));
+        }
+        if let Some(bg) = attr("fo:background-color") {
+            self.fill = Some(hex_color(&bg));
+        }
+        if let Some(b) = attr("fo:border") {
+            self.sides = [Some(thin_line(&b)); 4];
+        }
+        for (i, side) in ["top", "bottom", "left", "right"].iter().enumerate() {
+            if let Some(b) = attr(&format!("fo:border-{side}")) {
+                self.sides[i] = Some(thin_line(&b));
+            }
+        }
+        for d in ["style:diagonal-bl-tr", "style:diagonal-tl-br"] {
+            if let Some(v) = attr(d) {
+                self.diagonal = Some(self.diagonal == Some(true) || v != "none");
+            }
+        }
+    }
+
+    /// The model format these properties give, with number format `code`.
+    fn xf(&self, code: Option<String>) -> Xf {
+        let mut x = Xf::default();
+        if code.is_some() {
+            x.set_code(code);
+        }
+        x.bold = self.bold.unwrap_or(false);
+        x.italic = self.italic.unwrap_or(false);
+        // Black is the automatic colour as the model sees it.
+        x.color = self.color.flatten().filter(|&c| c != (0, 0, 0));
+        x.font_size = self.size.filter(|&s| s != 11.0);
+        x.font_name = self
+            .font
+            .clone()
+            .filter(|f| !f.is_empty() && !f.eq_ignore_ascii_case("Calibri"));
+        x.fill = self.fill.flatten();
+        x.border = self.sides == [Some(true); 4] && self.diagonal != Some(true);
+        x
+    }
+}
+
+/// `#rrggbb` as a colour; `None` for `transparent` or anything else.
+fn hex_color(s: &str) -> Option<(u8, u8, u8)> {
+    let h = s.trim().strip_prefix('#')?;
+    if h.len() != 6 || !h.is_ascii() {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+    Some((byte(0)?, byte(2)?, byte(4)?))
+}
+
+/// A font family as `svg:font-family` or `fo:font-family` spells it, its
+/// quotes off (`'Liberation Sans'`).
+fn unquote(s: &str) -> String {
+    s.trim().trim_matches(|c| c == '\'' || c == '"').to_string()
+}
+
+/// An ODF length (`0.06pt`, `1.5875cm`, `0.889in`, `22.58mm`, `60px`) in
+/// points.
+pub(super) fn length_pt(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let split = s.find(|c: char| c.is_ascii_alphabetic())?;
+    let (n, unit) = s.split_at(split);
+    let n: f64 = n.trim().parse().ok()?;
+    let pt = match unit {
+        "pt" => n,
+        "in" => n * 72.0,
+        "cm" => n * 72.0 / 2.54,
+        "mm" => n * 72.0 / 25.4,
+        "pc" => n * 12.0,
+        "px" => n * 0.75,
+        _ => return None,
+    };
+    (pt.is_finite() && pt >= 0.0).then_some(pt)
+}
+
+/// Whether a border side (`0.06pt solid #000000`, `none`) is a thin solid
+/// line: what the model's thin box holds. A line of 1pt or less is thin
+/// (Excel writes its thin line as 0.06pt or 0.74pt, LibreOffice 0.74pt);
+/// its colour doesn't matter, as the `.xls` reader keeps a coloured box.
+fn thin_line(s: &str) -> bool {
+    let mut solid = false;
+    let mut width = None;
+    for w in s.split_whitespace() {
+        match w {
+            "solid" => solid = true,
+            "thin" => width = Some(0.75),
+            "none" | "hidden" => return false,
+            w => {
+                if let Some(pt) = length_pt(w) {
+                    width = Some(pt);
+                }
+            }
+        }
+    }
+    solid && width.is_some_and(|pt| pt <= 1.0)
+}
+
+/// One table-cell style: its data style, its parent and its own
+/// properties.
+#[derive(Clone, Debug, Default)]
+struct CellStyle {
+    data: Option<String>,
+    parent: Option<String>,
+    props: CellProps,
+    /// Its conditional styles (`style:map`): (condition, the style it
+    /// applies, base cell).
+    maps: Vec<(String, String, String)>,
+}
+
+/// The data styles, table-cell styles and column styles of a styles or
+/// content part.
 #[derive(Default)]
 struct StyleSheet {
     data: HashMap<String, DataStyle>,
-    /// Cell style → (data style, parent style).
-    cells: HashMap<String, (Option<String>, Option<String>)>,
+    cells: HashMap<String, CellStyle>,
+    /// `style:default-style style:family="table-cell"`: what every cell
+    /// style inherits last.
+    default_cell: CellProps,
+    /// Font-face name → family (`office:font-face-decls`).
+    faces: HashMap<String, String>,
+    /// Column style → `style:column-width`, in points.
+    columns: HashMap<String, f64>,
+    /// `style:default-style style:family="table-column"`'s width.
+    default_column: Option<f64>,
 }
 
 impl StyleSheet {
     fn read(&mut self, xml: &str) {
         let mut p = XmlParser::new(xml);
         let mut cur: Option<(String, DataStyle)> = None;
+        // The table-cell style whose properties are being read: a named
+        // one, or (`Some(None)`) the default style.
+        let mut cell_style: Option<Option<String>> = None;
+        // The table-column style being read (`Some(None)`: the default).
+        let mut column_style: Option<Option<String>> = None;
         // The element whose text the current part collects.
         let mut text_into: Option<usize> = None;
         let mut text = String::new();
@@ -574,13 +766,81 @@ impl StyleSheet {
                         ));
                         continue;
                     }
-                    if name == "style:style" && p.attr("style:family") == "table-cell" {
-                        let opt = |a: &str| Some(attr(a)).filter(|s| !s.is_empty());
-                        self.cells.insert(
-                            attr("style:name"),
-                            (opt("style:data-style-name"), opt("style:parent-style-name")),
-                        );
-                        continue;
+                    let family = p.attr("style:family");
+                    match (name, family) {
+                        ("style:style", "table-cell") => {
+                            let opt = |a: &str| Some(attr(a)).filter(|s| !s.is_empty());
+                            let name = attr("style:name");
+                            self.cells.insert(
+                                name.clone(),
+                                CellStyle {
+                                    data: opt("style:data-style-name"),
+                                    parent: opt("style:parent-style-name"),
+                                    props: CellProps::default(),
+                                    maps: Vec::new(),
+                                },
+                            );
+                            cell_style = Some(Some(name));
+                            continue;
+                        }
+                        ("style:default-style", "table-cell") => {
+                            cell_style = Some(None);
+                            continue;
+                        }
+                        ("style:style", "table-column") => {
+                            column_style = Some(Some(attr("style:name")));
+                            continue;
+                        }
+                        ("style:default-style", "table-column") => {
+                            column_style = Some(None);
+                            continue;
+                        }
+                        ("style:font-face", _) => {
+                            let family = attr("svg:font-family");
+                            if !family.is_empty() {
+                                self.faces.insert(attr("style:name"), unquote(&family));
+                            }
+                            continue;
+                        }
+                        ("style:text-properties" | "style:table-cell-properties", _)
+                            if cell_style.is_some() =>
+                        {
+                            let faces = std::mem::take(&mut self.faces);
+                            let props = match cell_style.as_ref() {
+                                Some(Some(n)) => self.cells.get_mut(n).map(|c| &mut c.props),
+                                _ => Some(&mut self.default_cell),
+                            };
+                            if let Some(props) = props {
+                                props.read(&p, &faces);
+                            }
+                            self.faces = faces;
+                            continue;
+                        }
+                        ("style:map", _) if matches!(cell_style, Some(Some(_))) => {
+                            if let Some(Some(n)) = &cell_style {
+                                let map = (
+                                    attr("style:condition"),
+                                    attr("style:apply-style-name"),
+                                    attr("style:base-cell-address"),
+                                );
+                                if let Some(c) = self.cells.get_mut(n) {
+                                    c.maps.push(map);
+                                }
+                            }
+                            continue;
+                        }
+                        ("style:table-column-properties", _) if column_style.is_some() => {
+                            if let Some(pt) = length_pt(p.attr("style:column-width")) {
+                                match column_style.clone().flatten() {
+                                    Some(n) => {
+                                        self.columns.insert(n, pt);
+                                    }
+                                    None => self.default_column = Some(pt),
+                                }
+                            }
+                            continue;
+                        }
+                        _ => {}
                     }
                     let Some((_, style)) = cur.as_mut() else {
                         continue;
@@ -661,6 +921,10 @@ impl StyleSheet {
                     }
                 }
                 Event::End => {
+                    if matches!(p.name(), "style:style" | "style:default-style") {
+                        cell_style = None;
+                        column_style = None;
+                    }
                     if let (Some(i), Some((_, style))) = (text_into, cur.as_mut()) {
                         match style.parts.get_mut(i) {
                             Some(Part::Text(t)) | Some(Part::Currency(t, _)) => {
@@ -688,13 +952,61 @@ impl StyleSheet {
     fn code(&self, name: &str) -> Option<String> {
         let mut at = name;
         for _ in 0..16 {
-            let (data, parent) = self.cells.get(at)?;
-            if let Some(d) = data {
+            let style = self.cells.get(at)?;
+            if let Some(d) = &style.data {
                 return format_code(&self.data, d);
             }
-            at = parent.as_deref()?;
+            at = style.parent.as_deref()?;
         }
         None
+    }
+
+    /// The properties of cell style `name` (`None`: a cell with no style,
+    /// which takes `Default`), through its parents and the default style.
+    fn props(&self, name: Option<&str>) -> CellProps {
+        let mut chain = Vec::new();
+        let mut at = name.or(self.cells.contains_key("Default").then_some("Default"));
+        while let Some(n) = at.filter(|_| chain.len() < 16) {
+            let Some(style) = self.cells.get(n) else {
+                break;
+            };
+            chain.push(&style.props);
+            at = style.parent.as_deref();
+        }
+        chain
+            .into_iter()
+            .rev()
+            .fold(self.default_cell.clone(), |acc, own| own.over(&acc))
+    }
+
+    /// The differential format of the style a conditional format applies:
+    /// what it and its parents set, short of `Default` (which every cell
+    /// has anyway). An explicit black is a colour it sets.
+    fn dxf(&self, name: &str) -> crate::sheet::Dxf {
+        let mut props = CellProps::default();
+        let mut at = Some(name);
+        for _ in 0..16 {
+            let Some(style) = at
+                .filter(|n| *n != "Default")
+                .and_then(|n| self.cells.get(n))
+            else {
+                break;
+            };
+            props = props.over(&style.props);
+            at = style.parent.as_deref();
+        }
+        crate::sheet::Dxf {
+            fill: props.fill.flatten(),
+            color: props.color.flatten(),
+            bold: props.bold,
+            italic: props.italic,
+            ..crate::sheet::Dxf::default()
+        }
+    }
+
+    /// The model format of cell style `name` (`None`: no style).
+    fn xf(&self, name: Option<&str>) -> Xf {
+        self.props(name).xf(self.code(name.unwrap_or("Default")))
     }
 }
 
@@ -702,13 +1014,69 @@ impl StyleSheet {
 // Tables
 // ---------------------------------------------------------------------------
 
+/// Paragraph text being read (a cell's, an annotation's, a validation
+/// message's): each `text:p` a line, `text:s` its spaces, `text:tab` a tab
+/// and `text:line-break` a new line.
+#[derive(Default)]
+struct Para {
+    text: String,
+    paragraphs: usize,
+}
+
+impl Para {
+    /// The text element `name` (one of the four above) starts.
+    fn element(&mut self, name: &str, p: &XmlParser) {
+        match name {
+            "text:p" => {
+                if self.paragraphs > 0 {
+                    self.text.push('\n');
+                }
+                self.paragraphs += 1;
+            }
+            "text:s" => {
+                let n = p.attr("text:c").parse().unwrap_or(1usize).min(1 << 12);
+                self.text.push_str(&" ".repeat(n));
+            }
+            "text:tab" => self.text.push('\t'),
+            _ => self.text.push('\n'),
+        }
+    }
+}
+
 /// The cell being read.
 #[derive(Default)]
 struct CellIn {
     attrs: HashMap<String, String>,
-    text: String,
-    paragraphs: usize,
+    text: Para,
     repeat: u32,
+    /// Its annotation (#884): (author, text).
+    comment: Option<(String, String)>,
+}
+
+/// An `office:annotation` being read: its author (`dc:creator`) and text.
+#[derive(Default)]
+struct NoteIn {
+    author: String,
+    text: Para,
+}
+
+/// The paragraph text the reader is in: a validation message's, else an
+/// annotation's (directly inside it), else the cell's own (outside any
+/// annotation or drawn shape).
+fn active_para<'a>(
+    message: &'a mut Option<(bool, Para)>,
+    note: &'a mut Option<(usize, NoteIn)>,
+    cell: &'a mut Option<CellIn>,
+    hidden: usize,
+) -> Option<&'a mut Para> {
+    if let Some((_, m)) = message.as_mut() {
+        return Some(m);
+    }
+    match hidden {
+        0 => cell.as_mut().map(|c| &mut c.text),
+        1 => note.as_mut().map(|(_, n)| &mut n.text),
+        _ => None,
+    }
 }
 
 /// Read an `.ods` package.
@@ -734,13 +1102,441 @@ fn copy_bytes(cell: &Cell) -> usize {
     1 + text + cell.formula.as_ref().map_or(0, String::len)
 }
 
+// ---------------------------------------------------------------------------
+// Conditions (data validation, conditional formatting)
+// ---------------------------------------------------------------------------
+
+/// `s` split at each top-level `sep` (outside quotes, brackets and
+/// parentheses).
+fn split_top<'a>(s: &'a str, sep: &str) -> Vec<&'a str> {
+    let (mut out, mut start, mut depth, mut quoted) = (Vec::new(), 0, 0i32, false);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => quoted = !quoted,
+            b'(' | b'[' | b'{' if !quoted => depth += 1,
+            b')' | b']' | b'}' if !quoted => depth -= 1,
+            _ if !quoted && depth == 0 && s[i..].starts_with(sep) => {
+                out.push(&s[start..i]);
+                i += sep.len();
+                start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// The arguments of `term` when it is a call of `name`, split at its
+/// top-level `;`.
+fn call_args<'a>(term: &'a str, name: &str) -> Option<Vec<&'a str>> {
+    let inner = term.trim().strip_prefix(name)?.trim_start();
+    let inner = inner.strip_prefix('(')?.strip_suffix(')')?;
+    Some(split_top(inner, ";").into_iter().map(str::trim).collect())
+}
+
+/// A comparison's operator and the operand after it (`>=5` →
+/// greaterThanOrEqual, `5`).
+fn comparison(rest: &str) -> Option<(&'static str, &str)> {
+    let rest = rest.trim_start();
+    for (sym, op) in [
+        ("<=", "lessThanOrEqual"),
+        (">=", "greaterThanOrEqual"),
+        ("!=", "notEqual"),
+        ("<>", "notEqual"),
+        ("=", "equal"),
+        ("<", "lessThan"),
+        (">", "greaterThan"),
+    ] {
+        if let Some(v) = rest.strip_prefix(sym) {
+            return Some((op, v.trim()));
+        }
+    }
+    None
+}
+
+/// An ODF expression operand in Excel's syntax.
+fn operand(f: &str) -> Option<String> {
+    convert_formula(f.trim())
+}
+
+/// A condition without its namespace prefix (`of:`, `ooow:`).
+fn strip_ns(cond: &str) -> &str {
+    match cond.split_once(':') {
+        Some((ns, rest)) if !ns.is_empty() && ns.bytes().all(|b| b.is_ascii_alphabetic()) => rest,
+        _ => cond,
+    }
+}
+
+/// A validation's condition as the model holds it: its formulas in
+/// Excel's syntax, relative to the rule's base cell.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Condition {
+    /// `whole`, `decimal`, `list`, `custom`, ...; `""` for any value.
+    kind: String,
+    /// For the kinds that compare (`between`, `greaterThan`, ...); `""`
+    /// for the others.
+    operator: String,
+    formula1: String,
+    formula2: String,
+}
+
+/// A validation's `table:condition` (`of:cell-content-is-whole-number()
+/// and cell-content-is-between(1;10)`, `cell-content-is-in-list("a";"b")`,
+/// `is-true-formula([.A1]>0)`, ...). `None` for one this doesn't read.
+fn validation_condition(cond: &str) -> Option<Condition> {
+    let body = strip_ns(cond);
+    // No condition: any value, the rule kept for its messages and flags
+    // (as `.xls`/`.xlsb` keep a valType 0 rule).
+    if body.trim().is_empty() {
+        return Some(Default::default());
+    }
+    let (mut kind, mut op, mut f1, mut f2) = (String::new(), String::new(), None, None);
+    for term in split_top(body, " and ") {
+        let term = term.trim();
+        let numeric = [
+            ("cell-content-is-whole-number()", "whole"),
+            ("cell-content-is-decimal-number()", "decimal"),
+            ("cell-content-is-date()", "date"),
+            ("cell-content-is-time()", "time"),
+        ];
+        if let Some((_, k)) = numeric.iter().find(|(t, _)| *t == term) {
+            kind = k.to_string();
+            continue;
+        }
+        let between = [
+            ("cell-content-is-between", false, "between"),
+            ("cell-content-is-not-between", false, "notBetween"),
+            ("cell-content-text-length-is-between", true, "between"),
+            (
+                "cell-content-text-length-is-not-between",
+                true,
+                "notBetween",
+            ),
+        ];
+        if let Some((args, text, o)) = between
+            .iter()
+            .find_map(|&(n, t, o)| Some((call_args(term, n)?, t, o)))
+        {
+            let [a, b] = args.as_slice() else {
+                return None;
+            };
+            if text {
+                kind = "textLength".to_string();
+            }
+            op = o.to_string();
+            f1 = Some(operand(a)?);
+            f2 = Some(operand(b)?);
+            continue;
+        }
+        if let Some(rest) = term.strip_prefix("cell-content-text-length()") {
+            let (o, v) = comparison(rest)?;
+            kind = "textLength".to_string();
+            op = o.to_string();
+            f1 = Some(operand(v)?);
+            continue;
+        }
+        if let Some(rest) = term.strip_prefix("cell-content()") {
+            let (o, v) = comparison(rest)?;
+            op = o.to_string();
+            f1 = Some(operand(v)?);
+            continue;
+        }
+        if let Some(args) = call_args(term, "cell-content-is-in-list") {
+            kind = "list".to_string();
+            let items: Option<Vec<String>> = args
+                .iter()
+                .map(|a| {
+                    let inner = a.strip_prefix('"')?.strip_suffix('"')?;
+                    Some(inner.replace("\"\"", "\""))
+                })
+                .collect();
+            f1 = Some(match (items, args.as_slice()) {
+                // Constants: Excel's one string of items.
+                (Some(items), _) => format!("\"{}\"", items.join(",").replace('"', "\"\"")),
+                (None, [one]) => operand(one)?,
+                _ => return None,
+            });
+            continue;
+        }
+        if let Some(args) = call_args(term, "is-true-formula") {
+            let [f] = args.as_slice() else {
+                return None;
+            };
+            kind = "custom".to_string();
+            f1 = Some(operand(f)?);
+            continue;
+        }
+        return None;
+    }
+    if kind.is_empty() && f1.is_some() {
+        kind = "decimal".to_string();
+    }
+    if crate::validation::takes_operator(&kind) && op.is_empty() {
+        return None;
+    }
+    Some(Condition {
+        kind,
+        operator: op,
+        formula1: f1.unwrap_or_default(),
+        formula2: f2.unwrap_or_default(),
+    })
+}
+
+/// A conditional format's condition, from a `style:map`
+/// (`cell-content()>5`, `cell-content-is-between(1,5)`,
+/// `is-true-formula([.A1]>0)`) or LibreOffice's `calcext:condition`
+/// (`>5`, `between(1,5)`, `not-between(1,5)`, `formula-is([.A1]>0)`).
+/// `None` for a kind the model doesn't evaluate (duplicates, top 10, text
+/// tests, ...).
+fn cf_condition(cond: &str) -> Option<crate::xlsx::NewCfRule> {
+    use crate::xlsx::NewCfRule;
+    let body = strip_ns(cond).trim();
+    // Arguments split at `;`, or at `,` as LibreOffice writes two values.
+    let args = |name: &str| -> Option<Vec<String>> {
+        let a = call_args(body, name)?;
+        let a = if a.len() == 1 {
+            let inner = body
+                .strip_prefix(name)?
+                .trim()
+                .strip_prefix('(')?
+                .strip_suffix(')')?;
+            split_top(inner, ",")
+        } else {
+            a
+        };
+        a.iter().map(|x| operand(x)).collect()
+    };
+    for (name, op) in [
+        ("cell-content-is-between", "between"),
+        ("cell-content-is-not-between", "notBetween"),
+        ("between", "between"),
+        ("not-between", "notBetween"),
+    ] {
+        if let Some(formulas) = args(name) {
+            return (formulas.len() == 2).then(|| NewCfRule::CellIs {
+                op: op.to_string(),
+                formulas,
+            });
+        }
+    }
+    for name in ["is-true-formula", "formula-is"] {
+        if let Some(a) = call_args(body, name) {
+            let [f] = a.as_slice() else {
+                return None;
+            };
+            return Some(NewCfRule::Expression {
+                formula: operand(f)?,
+            });
+        }
+    }
+    let rest = body.strip_prefix("cell-content()").unwrap_or(body);
+    let (op, v) = comparison(rest)?;
+    Some(NewCfRule::CellIs {
+        op: op.to_string(),
+        formulas: vec![operand(v)?],
+    })
+}
+
+/// `kind`'s formulas moved from `base` to `at` ([`super::rebase`]).
+fn rebase_cf(
+    mut kind: crate::xlsx::NewCfRule,
+    base: Option<(u32, u32)>,
+    at: (u32, u32),
+) -> Option<crate::xlsx::NewCfRule> {
+    for f in kind.formulas_mut() {
+        *f = super::rebase(f, base, at)?;
+    }
+    Some(kind)
+}
+
+/// `s` split at each character `at` accepts outside a quoted sheet name
+/// (`'Q1 Sales'`, `'A:B'`; `''` inside is a quote, which toggles twice),
+/// empty pieces left out.
+fn split_unquoted(s: &str, at: impl Fn(char) -> bool) -> Vec<&str> {
+    let (mut out, mut start, mut quoted) = (Vec::new(), 0, false);
+    for (i, ch) in s.char_indices() {
+        if ch == '\'' {
+            quoted = !quoted;
+        } else if !quoted && at(ch) {
+            out.push(&s[start..i]);
+            start = i + ch.len_utf8();
+        }
+    }
+    out.push(&s[start..]);
+    out.retain(|p| !p.is_empty());
+    out
+}
+
+/// An ODF range list (`S.A1:S.B2 S.D4`, `'Q1 Sales'.A1:'Q1 Sales'.A10`)
+/// as (r1, c1, r2, c2) rectangles.
+fn range_list(s: &str) -> Vec<(u32, u32, u32, u32)> {
+    split_unquoted(s, char::is_whitespace)
+        .into_iter()
+        .filter_map(|r| {
+            let (a, b) = match split_unquoted(r, |c| c == ':').as_slice() {
+                [a] => (address_cell(a)?, address_cell(a)?),
+                [a, b] => (address_cell(a)?, address_cell(b)?),
+                _ => return None,
+            };
+            Some((a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)))
+        })
+        .collect()
+}
+
+/// An ODF cell address (`Sheet1.A1`, `$'My Sheet'.$B$2`) as (row, col).
+fn address_cell(s: &str) -> Option<(u32, u32)> {
+    let (_, cell) = split_address(s)?;
+    crate::sheet::parse_cell_name(&cell)
+}
+
+/// A `table:content-validation` as read: its condition, base cell and
+/// the rule's flags and texts (its ranges come from the cells naming it).
+#[derive(Default)]
+struct ValidationIn {
+    condition: Option<Condition>,
+    base: Option<(u32, u32)>,
+    rule: crate::sheet::DataValidation,
+}
+
+/// Rectangles of cells, as row runs that grow down while the next row has
+/// the same columns: a repeated row or column adds one range.
+#[derive(Default)]
+struct Ranges {
+    rects: Vec<(u32, u32, u32, u32)>,
+    /// The rectangle a run (c1, c2) ending at row r2 may extend.
+    open: HashMap<(u32, u32), usize>,
+}
+
+impl Ranges {
+    fn add(&mut self, r1: u32, r2: u32, c1: u32, c2: u32) {
+        if let Some(&i) = self.open.get(&(c1, c2)) {
+            if self.rects[i].2.checked_add(1) == Some(r1) {
+                self.rects[i].2 = r2;
+                return;
+            }
+        }
+        self.rects.push((r1, c1, r2, c2));
+        self.open.insert((c1, c2), self.rects.len() - 1);
+    }
+}
+
+/// [`Ranges`] by name (a validation rule's, or a style with conditional
+/// styles), in the order a table first names them.
+#[derive(Default)]
+struct KeyedRanges {
+    order: Vec<(String, Ranges)>,
+    at: HashMap<String, usize>,
+}
+
+impl KeyedRanges {
+    fn add(&mut self, key: String, r1: u32, r2: u32, c1: u32, c2: u32) {
+        let i = match self.at.get(&key) {
+            Some(&i) => i,
+            None => {
+                self.at.insert(key.clone(), self.order.len());
+                self.order.push((key, Ranges::default()));
+                self.order.len() - 1
+            }
+        };
+        self.order[i].1.add(r1, r2, c1, c2);
+    }
+
+    /// Every name's ranges, in order, leaving none.
+    fn take(&mut self) -> Vec<(String, Ranges)> {
+        self.at.clear();
+        std::mem::take(&mut self.order)
+    }
+}
+
+/// A table's column runs as read: (first column, count, width in points,
+/// hidden).
+type ColRun = (u32, u32, Option<f64>, bool);
+
+/// The column definitions of a table's runs (#884). The width that covers
+/// the most columns is the sheet's default and gives no definition (Excel
+/// and LibreOffice give every column a width, the default ones too); it
+/// is the sheet's default width unless it is Excel's own. Each other width
+/// becomes one, as does a hidden column.
+fn table_columns(runs: &[ColRun], sheet: &mut SheetIn) {
+    use crate::print::paginate::width_of_px;
+    let key = |pt: f64| (pt * 100.0).round() as i64;
+    let mut cover: HashMap<Option<i64>, u64> = HashMap::new();
+    for &(first, n, pt, _) in runs {
+        let n = n.min(MAX_COLS.saturating_sub(first)) as u64;
+        *cover.entry(pt.map(key)).or_default() += n;
+    }
+    // Most columns; a tie goes to the narrower width, so it is the same
+    // on every run.
+    let common = cover
+        .into_iter()
+        .max_by_key(|&(k, n)| (n, std::cmp::Reverse(k)))
+        .and_then(|(k, _)| k);
+    let chars = |pt: f64| width_of_px(pt * 96.0 / 72.0);
+    if let Some(k) = common {
+        let w = chars(k as f64 / 100.0);
+        let dx = (w * 256.0).round();
+        let excel = dx <= f64::from(u16::MAX)
+            && super::xls::is_default_coldx(sheet.base_col_width, None, dx as u16);
+        sheet.default_col_width = (!excel).then_some(w);
+    }
+    for &(first, n, pt, hidden) in runs {
+        if first >= MAX_COLS || n == 0 {
+            continue;
+        }
+        let width = pt.filter(|&pt| Some(key(pt)) != common).map(chars);
+        if width.is_some() || hidden {
+            sheet.cols.push(ColIn {
+                first,
+                last: first.saturating_add(n - 1).min(MAX_COLS - 1),
+                width,
+                hidden,
+                ..ColIn::default()
+            });
+        }
+    }
+}
+
+/// A cell's format in the book: its `book.xfs` index, and whether it
+/// differs from the document's default format (a styled blank is kept
+/// only then).
+#[derive(Clone, Copy)]
+struct Look {
+    style: u32,
+    styled: bool,
+}
+
 fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn, OpenError> {
     let mut book = BookIn::with_limits(limits);
-    let mut codes: HashMap<String, u32> = HashMap::new();
+    // Each cell style's format, made once (the key "" is no style).
+    let mut looks: HashMap<String, Look> = HashMap::new();
+    let doc_default = styles.xf(None);
+    let mut look_of = |name: Option<&str>, book: &mut BookIn| -> Look {
+        *looks
+            .entry(name.unwrap_or("").to_string())
+            .or_insert_with(|| {
+                let xf = styles.xf(name);
+                let styled = xf != doc_default;
+                Look {
+                    style: book.add_xf(xf),
+                    styled,
+                }
+            })
+    };
     let mut p = XmlParser::new(xml);
     let mut stack: Vec<String> = Vec::new();
     // Per table: the column default styles as runs (first column, style).
     let mut col_styles: Vec<(u32, String)> = Vec::new();
+    // Whether any column default style gives an empty cell something to
+    // keep (a format, or conditional styles), worked out once per table;
+    // and what is left of the walk budget (`Limits::column_walk`).
+    let mut col_interest: Option<bool> = None;
+    let mut walk_left = limits.column_walk;
+    let mut col_runs: Vec<ColRun> = Vec::new();
     let mut next_col = 0u32;
     let mut row = 0u32;
     let mut col = 0u32;
@@ -748,6 +1544,30 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
     let mut row_style = String::new();
     // The current row's cells, before its repeat is known to apply.
     let mut row_cells: Vec<(u32, Cell)> = Vec::new();
+    // The current row's merges: (column, columns, rows) spanned.
+    let mut row_merges: Vec<(u32, u32, u32)> = Vec::new();
+    // The current row's comments: (column, author, text).
+    let mut row_comments: Vec<(u32, String, String)> = Vec::new();
+    // The annotation being read, and its depth in `stack`.
+    let mut note: Option<(usize, NoteIn)> = None;
+    // Data validation (#884): the rules by name, the one being read, the
+    // message (help: false, error: true) whose paragraphs are being read,
+    // the current row's runs (first, end, rule) and, per rule in the
+    // order the table first names them, its cells.
+    let mut validations: HashMap<String, ValidationIn> = HashMap::new();
+    let mut validation: Option<(String, ValidationIn)> = None;
+    let mut message: Option<(bool, Para)> = None;
+    let mut row_rules: Vec<(u32, u32, String)> = Vec::new();
+    let mut rule_cells = KeyedRanges::default();
+    // Conditional formatting (#884): the current row's cells in a style
+    // with `style:map`s (first, end, style) and, per such style in the
+    // order the table first uses it, its cells; and the table's
+    // LibreOffice conditional formats (`calcext:conditional-format`) and
+    // the one being read.
+    let mut row_maps: Vec<(u32, u32, String)> = Vec::new();
+    let mut map_cells = KeyedRanges::default();
+    let mut table_cf: Vec<super::CfIn> = Vec::new();
+    let mut calc_cf: Option<super::CfIn> = None;
     let mut cell: Option<CellIn> = None;
     // Depth inside an annotation or a drawn shape, whose text is not the
     // cell's.
@@ -769,6 +1589,11 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                             ..SheetIn::default()
                         })?;
                         col_styles.clear();
+                        col_interest = None;
+                        col_runs.clear();
+                        rule_cells.take();
+                        map_cells.take();
+                        table_cf.clear();
                         next_col = 0;
                         row = 0;
                     }
@@ -777,12 +1602,28 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                             .attr("table:number-columns-repeated")
                             .parse()
                             .unwrap_or(1u32);
-                        col_styles.push((next_col, attr("table:default-cell-style-name")));
+                        // Adjacent columns in one style are one run.
+                        let style = attr("table:default-cell-style-name");
+                        if col_styles.last().is_none_or(|(_, s)| *s != style) {
+                            col_styles.push((next_col, style));
+                        }
+                        col_interest = None;
+                        let width = styles
+                            .columns
+                            .get(&attr("table:style-name"))
+                            .copied()
+                            .or(styles.default_column);
+                        let collapsed = p.attr("table:visibility") == "collapse";
+                        col_runs.push((next_col, n, width, collapsed));
                         next_col = next_col.saturating_add(n);
                     }
                     "table:table-row" => {
                         col = 0;
                         row_cells.clear();
+                        row_merges.clear();
+                        row_comments.clear();
+                        row_rules.clear();
+                        row_maps.clear();
                         row_repeat = p
                             .attr("table:number-rows-repeated")
                             .parse()
@@ -806,29 +1647,77 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                         }
                         cell = Some(c);
                     }
+                    "office:annotation" if cell.is_some() && note.is_none() => {
+                        hidden += 1;
+                        note = Some((stack.len(), NoteIn::default()));
+                    }
                     n if n == "office:annotation" || n.starts_with("draw:") => hidden += 1,
-                    "text:p" if hidden == 0 => {
-                        if let Some(c) = cell.as_mut() {
-                            if c.paragraphs > 0 {
-                                c.text.push('\n');
+                    "text:p" | "text:s" | "text:tab" | "text:line-break" => {
+                        if let Some(t) = active_para(&mut message, &mut note, &mut cell, hidden) {
+                            t.element(&name, &p);
+                        }
+                    }
+                    "table:content-validation" => {
+                        let mut rule = crate::sheet::DataValidation {
+                            allow_blank: p.attr("table:allow-empty-cell") != "false",
+                            show_dropdown: p.attr("table:display-list") != "none",
+                            ..crate::sheet::DataValidation::default()
+                        };
+                        let condition = validation_condition(&attr("table:condition"));
+                        if let Some(c) = &condition {
+                            rule.kind = c.kind.clone();
+                            rule.operator = c.operator.clone();
+                        }
+                        validation = Some((
+                            attr("table:name"),
+                            ValidationIn {
+                                condition,
+                                base: address_cell(&attr("table:base-cell-address")),
+                                rule,
+                            },
+                        ));
+                    }
+                    "calcext:conditional-format" => {
+                        let ranges = range_list(&attr("calcext:target-range-address"));
+                        // Each condition has a base of its own: its rules
+                        // are moved to the block's anchor here.
+                        calc_cf = Some(super::CfIn {
+                            base: super::anchor_of(&ranges).unwrap_or_default(),
+                            ranges,
+                            rules: Vec::new(),
+                        });
+                    }
+                    "calcext:condition" => {
+                        if let Some(cf) = calc_cf.as_mut() {
+                            let at = super::anchor_of(&cf.ranges);
+                            let base = address_cell(&attr("calcext:base-cell-address"));
+                            let rule = cf_condition(&attr("calcext:value"))
+                                .zip(at)
+                                .and_then(|(k, at)| rebase_cf(k, base, at));
+                            if let Some(kind) = rule {
+                                let dxf = styles.dxf(&attr("calcext:apply-style-name"));
+                                cf.rules.push((kind, dxf));
                             }
-                            c.paragraphs += 1;
                         }
                     }
-                    "text:s" if hidden == 0 => {
-                        if let Some(c) = cell.as_mut() {
-                            let n = p.attr("text:c").parse().unwrap_or(1usize).min(1 << 12);
-                            c.text.push_str(&" ".repeat(n));
-                        }
-                    }
-                    "text:tab" if hidden == 0 => {
-                        if let Some(c) = cell.as_mut() {
-                            c.text.push('\t');
-                        }
-                    }
-                    "text:line-break" if hidden == 0 => {
-                        if let Some(c) = cell.as_mut() {
-                            c.text.push('\n');
+                    "table:help-message" | "table:error-message" => {
+                        if let Some((_, v)) = validation.as_mut() {
+                            let error = name == "table:error-message";
+                            let shown = p.attr("table:display") == "true";
+                            let title = attr("table:title");
+                            if error {
+                                v.rule.show_error = shown;
+                                v.rule.error_title = title;
+                                v.rule.error_style = match p.attr("table:message-type") {
+                                    "warning" => crate::sheet::AlertStyle::Warning,
+                                    "information" => crate::sheet::AlertStyle::Information,
+                                    _ => crate::sheet::AlertStyle::Stop,
+                                };
+                            } else {
+                                v.rule.show_input = shown;
+                                v.rule.prompt_title = title;
+                            }
+                            message = Some((error, Para::default()));
                         }
                     }
                     "table:null-date" => {
@@ -854,9 +1743,15 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                 stack.push(name);
             }
             Event::Text => {
-                if hidden == 0 && stack.iter().any(|e| e == "text:p") {
-                    if let Some(c) = cell.as_mut() {
-                        XmlParser::append_decoded(p.text(), &mut c.text);
+                // An annotation's author.
+                if let Some((depth, n)) = note.as_mut().filter(|_| hidden == 1) {
+                    if stack[*depth..].iter().any(|e| e == "dc:creator") {
+                        XmlParser::append_decoded(p.text(), &mut n.author);
+                    }
+                }
+                if stack.iter().any(|e| e == "text:p") {
+                    if let Some(t) = active_para(&mut message, &mut note, &mut cell, hidden) {
+                        XmlParser::append_decoded(p.text(), &mut t.text);
                     }
                 }
             }
@@ -865,31 +1760,165 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                 match name.as_str() {
                     n if n == "office:annotation" || n.starts_with("draw:") => {
                         hidden = hidden.saturating_sub(1);
+                        if note.as_ref().is_some_and(|(d, _)| *d == stack.len()) {
+                            if let (Some((_, n)), Some(c)) = (note.take(), cell.as_mut()) {
+                                c.comment = Some((n.author.trim().to_string(), n.text.text));
+                            }
+                        }
+                    }
+                    "table:table" => {
+                        if let Some(sheet) = book.sheets.last_mut() {
+                            table_columns(&col_runs, sheet);
+                            for (name, cells) in rule_cells.take() {
+                                let Some(v) = validations.get(&name) else {
+                                    continue;
+                                };
+                                let Some(cond) = &v.condition else {
+                                    continue;
+                                };
+                                let Some(anchor) = super::anchor_of(&cells.rects) else {
+                                    continue;
+                                };
+                                // Based at the rule's base cell (none: its
+                                // anchor); the build moves them.
+                                sheet.validations.push(super::DvIn {
+                                    rule: crate::sheet::DataValidation {
+                                        ranges: cells.rects,
+                                        formula1: cond.formula1.clone(),
+                                        formula2: cond.formula2.clone(),
+                                        ..v.rule.clone()
+                                    },
+                                    base: v.base.unwrap_or(anchor),
+                                });
+                            }
+                            // LibreOffice writes its conditional formats
+                            // twice: as calcext ones, and as `style:map`s
+                            // for other readers. The calcext ones win.
+                            if !table_cf.is_empty() {
+                                sheet.cond_formats.append(&mut table_cf);
+                            } else {
+                                for (style, cells) in map_cells.take() {
+                                    // Each map has a base of its own: its
+                                    // rules are moved to the anchor here.
+                                    let Some((r, c)) = super::anchor_of(&cells.rects) else {
+                                        continue;
+                                    };
+                                    let maps =
+                                        styles.cells.get(&style).map_or(&[][..], |s| &s.maps);
+                                    let rules: Vec<_> = maps
+                                        .iter()
+                                        .filter_map(|(cond, apply, base)| {
+                                            let kind = rebase_cf(
+                                                cf_condition(cond)?,
+                                                address_cell(base),
+                                                (r, c),
+                                            )?;
+                                            Some((kind, styles.dxf(apply)))
+                                        })
+                                        .collect();
+                                    if !rules.is_empty() {
+                                        sheet.cond_formats.push(super::CfIn {
+                                            ranges: cells.rects,
+                                            rules,
+                                            base: (r, c),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "calcext:conditional-format" => {
+                        if let Some(cf) = calc_cf.take() {
+                            if !cf.ranges.is_empty() && !cf.rules.is_empty() {
+                                table_cf.push(cf);
+                            }
+                        }
+                    }
+                    "table:content-validation" => {
+                        if let Some((name, v)) = validation.take() {
+                            validations.insert(name, v);
+                        }
+                    }
+                    "table:help-message" | "table:error-message" => {
+                        if let (Some((error, Para { text, .. })), Some((_, v))) =
+                            (message.take(), validation.as_mut())
+                        {
+                            if error {
+                                v.rule.error = text;
+                            } else {
+                                v.rule.prompt = (!text.is_empty()).then_some(text);
+                            }
+                        }
                     }
                     "table:table-cell" | "table:covered-table-cell" => {
                         let Some(c) = cell.take() else { continue };
                         let repeat = c.repeat;
+                        let last = col.saturating_add(repeat).min(MAX_COLS);
+                        let own = c
+                            .attrs
+                            .get("table:style-name")
+                            .filter(|s| !s.is_empty())
+                            .cloned()
+                            .or_else(|| (!row_style.is_empty()).then(|| row_style.clone()));
+                        // The column default style of each column from
+                        // `from`: runs of (first, end, style).
+                        let by_column = |from: u32, to: u32| -> Vec<(u32, u32, Option<String>)> {
+                            let mut out = Vec::new();
+                            let mut at = from;
+                            while at < to {
+                                let k = col_styles.partition_point(|(first, _)| *first <= at);
+                                let style = k
+                                    .checked_sub(1)
+                                    .map(|k| col_styles[k].1.clone())
+                                    .filter(|s| !s.is_empty());
+                                let end =
+                                    col_styles.get(k).map_or(to, |(first, _)| (*first).min(to));
+                                out.push((at, end, style));
+                                at = end;
+                            }
+                            out
+                        };
+                        // The run's styles, column by column where it has
+                        // none of its own, unless it reaches the grid's
+                        // last column (padding): its styled blanks and
+                        // conditional styles.
+                        // A run with no style of its own walks the column
+                        // styles it crosses only when one of them matters,
+                        // and only while the walk budget lasts: the walk
+                        // is bounded however many rows and columns.
+                        let runs = if name == "table:table-cell" && last < MAX_COLS {
+                            match &own {
+                                Some(s) => vec![(col, last, Some(s.clone()))],
+                                None => {
+                                    let interest = *col_interest.get_or_insert_with(|| {
+                                        col_styles.iter().any(|(_, s)| {
+                                            !s.is_empty()
+                                                && (look_of(Some(s), &mut book).styled
+                                                    || styles
+                                                        .cells
+                                                        .get(s)
+                                                        .is_some_and(|x| !x.maps.is_empty()))
+                                        })
+                                    });
+                                    if interest && walk_left > 0 {
+                                        let runs = by_column(col, last);
+                                        walk_left = walk_left.saturating_sub(runs.len());
+                                        runs
+                                    } else {
+                                        Vec::new()
+                                    }
+                                }
+                            }
+                        } else {
+                            Vec::new()
+                        };
                         if let Some(value) = cell_value(&c, null_date_1904) {
-                            let style_name = c
-                                .attrs
-                                .get("table:style-name")
-                                .cloned()
-                                .filter(|s| !s.is_empty())
-                                .or_else(|| (!row_style.is_empty()).then(|| row_style.clone()))
-                                .or_else(|| {
-                                    col_styles
-                                        .iter()
-                                        .rev()
-                                        .find(|(first, _)| *first <= col)
-                                        .map(|(_, s)| s.clone())
-                                        .filter(|s| !s.is_empty())
-                                });
-                            let style = match style_name {
-                                Some(s) => *codes.entry(s.clone()).or_insert_with(|| {
-                                    styles.code(&s).map_or(0, |code| book.format_index(&code))
-                                }),
-                                None => 0,
-                            };
+                            let style_name = own.clone().or_else(|| {
+                                by_column(col, col.saturating_add(1))
+                                    .pop()
+                                    .and_then(|r| r.2)
+                            });
+                            let style = look_of(style_name.as_deref(), &mut book).style;
                             let formula = c
                                 .attrs
                                 .get("table:formula")
@@ -900,7 +1929,6 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                                 style,
                                 ..Cell::default()
                             };
-                            let last = col.saturating_add(repeat).min(MAX_COLS);
                             let n = last.saturating_sub(col) as usize;
                             let copies = n.saturating_sub(1);
                             book.charge_repeats(copies, copies.saturating_mul(copy_bytes(&made)))?;
@@ -908,26 +1936,128 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                             for cc in col..last {
                                 row_cells.push((cc, made.clone()));
                             }
+                        } else {
+                            // A styled blank (#884).
+                            for (from, to, style) in &runs {
+                                let look = look_of(style.as_deref(), &mut book);
+                                if look.styled && book.take_styled_blanks((to - from) as usize) {
+                                    let made = Cell {
+                                        style: look.style,
+                                        ..Cell::default()
+                                    };
+                                    row_cells.extend((*from..*to).map(|cc| (cc, made.clone())));
+                                }
+                            }
+                        }
+                        // A merged range starts here (its first copy only).
+                        let span = |a: &str| {
+                            c.attrs
+                                .get(a)
+                                .and_then(|v| v.parse::<u32>().ok())
+                                .unwrap_or(1)
+                                .max(1)
+                        };
+                        let (cs, rs) = (
+                            span("table:number-columns-spanned"),
+                            span("table:number-rows-spanned"),
+                        );
+                        if (cs > 1 || rs > 1) && col < MAX_COLS {
+                            row_merges.push((col, cs, rs));
+                        }
+                        // The cells of a style with conditional styles.
+                        for (from, to, style) in runs {
+                            if let Some(st) = style.filter(|st| {
+                                styles.cells.get(st).is_some_and(|x| !x.maps.is_empty())
+                            }) {
+                                row_maps.push((from, to, st));
+                            }
+                        }
+                        if let Some(rule) = c
+                            .attrs
+                            .get("table:content-validation-name")
+                            .filter(|n| !n.is_empty() && col < MAX_COLS)
+                        {
+                            row_rules.push((col, last, rule.clone()));
+                        }
+                        // A repeated cell's comment is on its first copy
+                        // only, as is a repeated row's: a copy of a note
+                        // is not another note.
+                        if let Some((author, text)) = c.comment.filter(|_| col < MAX_COLS) {
+                            row_comments.push((col, author, text));
                         }
                         col = col.saturating_add(repeat);
                     }
                     "table:table-row" => {
-                        if !row_cells.is_empty() && !book.sheets.is_empty() {
-                            let last = row.saturating_add(row_repeat).min(MAX_ROWS);
+                        let last = row.saturating_add(row_repeat).min(MAX_ROWS);
+                        // A run of rows to the grid's last row is padding:
+                        // its styled blanks and merges are not kept.
+                        let padding = row_repeat > 1 && last == MAX_ROWS;
+                        if padding {
+                            row_cells.retain(|(_, c)| c.value != CellValue::Empty);
+                            row_merges.clear();
+                        }
+                        if (!row_cells.is_empty() || !row_merges.is_empty())
+                            && !book.sheets.is_empty()
+                        {
+                            // Values and styled blanks apart, once: a copy
+                            // takes its blanks only while they fit the cap,
+                            // and a row of nothing else stops copying when
+                            // they don't. So the time is bounded by the
+                            // values and merges charged and the cap, never
+                            // rows x blanks.
+                            let (blanks, values): (Vec<_>, Vec<_>) = std::mem::take(&mut row_cells)
+                                .into_iter()
+                                .partition(|(_, c)| c.value == CellValue::Empty);
                             // The first instance was charged cell by cell;
                             // each further row copies them all.
                             let extra = (last.saturating_sub(row) as usize).saturating_sub(1);
-                            let row_bytes: usize =
-                                row_cells.iter().map(|(_, c)| copy_bytes(c)).sum();
-                            let copies = extra.saturating_mul(row_cells.len());
+                            let row_bytes: usize = values.iter().map(|(_, c)| copy_bytes(c)).sum();
+                            let copies = extra.saturating_mul(values.len());
                             book.charge_repeats(copies, extra.saturating_mul(row_bytes))?;
                             book.charge_cells(copies)?;
-                            if let Some(sheet) = book.sheets.last_mut() {
-                                for r in row..last {
-                                    for (cc, made) in &row_cells {
+                            let merge_copies = extra.saturating_mul(row_merges.len());
+                            book.charge_repeats(merge_copies, 0)?;
+                            for r in row..last {
+                                let with_blanks = !blanks.is_empty()
+                                    && (r == row || book.take_styled_blanks(blanks.len()));
+                                if !with_blanks && values.is_empty() && row_merges.is_empty() {
+                                    break;
+                                }
+                                let Some(sheet) = book.sheets.last_mut() else {
+                                    break;
+                                };
+                                if with_blanks {
+                                    for (cc, made) in &blanks {
                                         sheet.cells.insert((r, *cc), made.clone());
                                     }
                                 }
+                                for (cc, made) in &values {
+                                    sheet.cells.insert((r, *cc), made.clone());
+                                }
+                                for &(c, cs, rs) in &row_merges {
+                                    let r2 = r.saturating_add(rs - 1).min(MAX_ROWS - 1);
+                                    let c2 = c.saturating_add(cs - 1).min(MAX_COLS - 1);
+                                    sheet.merges.push((r, c, r2, c2));
+                                }
+                            }
+                        }
+                        // A style's cells with conditional styles, but not
+                        // in padding.
+                        if row < MAX_ROWS && !padding {
+                            for (c1, c2, style) in row_maps.drain(..) {
+                                map_cells.add(style, row, last - 1, c1, c2 - 1);
+                            }
+                        }
+                        // The cells naming a validation rule: one range per
+                        // run, however many rows repeat it.
+                        if row < MAX_ROWS {
+                            for (c1, c2, rule) in row_rules.drain(..) {
+                                rule_cells.add(rule, row, last - 1, c1, c2 - 1);
+                            }
+                        }
+                        if let Some(sheet) = book.sheets.last_mut().filter(|_| row < MAX_ROWS) {
+                            for (c, author, text) in row_comments.drain(..) {
+                                sheet.comments.push((row, c, author, text));
                             }
                         }
                         row = row.saturating_add(row_repeat);
@@ -953,7 +2083,7 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
 /// text); `None` for an empty cell, which then takes no place in the model.
 fn cell_value(c: &CellIn, date1904: bool) -> Option<CellValue> {
     let a = |k: &str| c.attrs.get(k).map(String::as_str);
-    let text = || a("office:string-value").map_or_else(|| c.text.clone(), str::to_string);
+    let text = || a("office:string-value").map_or_else(|| c.text.text.clone(), str::to_string);
     // LibreOffice marks an error result with calcext:value-type; Excel uses
     // its own office:value-type="error".
     if a("calcext:value-type") == Some("error") || a("office:value-type") == Some("error") {
@@ -969,7 +2099,7 @@ fn cell_value(c: &CellIn, date1904: bool) -> Option<CellValue> {
         Some("string") => CellValue::Text(text()),
         // No type: text without a value, or nothing.
         _ if a("table:formula").is_some() => CellValue::Text(text()),
-        _ if !c.text.is_empty() => CellValue::Text(c.text.clone()),
+        _ if !c.text.text.is_empty() => CellValue::Text(c.text.text.clone()),
         _ => return None,
     };
     Some(value)
@@ -1357,5 +2487,803 @@ mod tests {
             back.workbook.sheets[0].cell(0, 0).unwrap().value,
             CellValue::Number(100.0)
         );
+    }
+
+    // --- #884: cell formats, styled blanks, column widths and merges ----
+
+    /// A content.xml with these font faces, automatic styles and tables.
+    fn styled_content(faces: &str, auto: &str, body: &str) -> String {
+        format!(
+            r#"<office:document-content xmlns:office="o" xmlns:table="t" xmlns:text="x" xmlns:number="n" xmlns:style="s" xmlns:fo="f" xmlns:svg="g" xmlns:dc="d"><office:font-face-decls>{faces}</office:font-face-decls><office:automatic-styles>{auto}</office:automatic-styles><office:body><office:spreadsheet>{body}</office:spreadsheet></office:body></office:document-content>"#
+        )
+    }
+
+    /// Read `content` after the styles part `styles_xml` (may be empty),
+    /// under `limits`.
+    fn read_styled(styles_xml: &str, content: &str, limits: Limits) -> BookIn {
+        let mut styles = StyleSheet::default();
+        styles.read(styles_xml);
+        styles.read(content);
+        read_content(content, &styles, limits).unwrap()
+    }
+
+    fn xf_at(b: &BookIn, r: u32, c: u32) -> Xf {
+        b.xfs[b.sheets[0].cells[&(r, c)].style as usize].clone()
+    }
+
+    /// A cell style's text and cell properties become the cell's model
+    /// format, through its parent; a thick or partial border is no box.
+    #[test]
+    fn ods_cell_style_formatting() {
+        let xml = styled_content(
+            r#"<style:font-face style:name="Arial1" svg:font-family="'Arial'"/>"#,
+            r##"<style:style style:name="ce1" style:family="table-cell">
+                 <style:table-cell-properties fo:background-color="#ffff00" fo:border="0.06pt solid #000000"/>
+                 <style:text-properties fo:font-weight="bold" fo:font-style="italic" fo:color="#ff0000" fo:font-size="14pt" style:font-name="Arial1"/></style:style>
+               <style:style style:name="ce2" style:family="table-cell" style:parent-style-name="ce1">
+                 <style:table-cell-properties fo:background-color="transparent" fo:border="none" fo:border-top="0.74pt solid #ff0000" fo:border-bottom="0.74pt solid #000000" fo:border-left="0.74pt solid #000000" fo:border-right="0.74pt solid #000000"/>
+                 <style:text-properties fo:font-weight="normal" fo:color="#000000"/></style:style>
+               <style:style style:name="ce3" style:family="table-cell">
+                 <style:table-cell-properties fo:border="2.5pt solid #000000"/></style:style>
+               <style:style style:name="ce4" style:family="table-cell">
+                 <style:table-cell-properties fo:border-top="0.74pt solid #000000" fo:border-bottom="0.74pt solid #000000"/></style:style>"##,
+            r#"<table:table table:name="S"><table:table-row>
+                 <table:table-cell table:style-name="ce1" office:value-type="float" office:value="1"/>
+                 <table:table-cell table:style-name="ce2" office:value-type="float" office:value="2"/>
+                 <table:table-cell table:style-name="ce3" office:value-type="float" office:value="3"/>
+                 <table:table-cell table:style-name="ce4" office:value-type="float" office:value="4"/>
+                 <table:table-cell office:value-type="float" office:value="5"/>
+               </table:table-row></table:table>"#,
+        );
+        let b = read_styled("", &xml, Limits::default());
+        let x = xf_at(&b, 0, 0);
+        assert!(x.bold && x.italic && x.border, "{x:?}");
+        assert_eq!(x.color, Some((255, 0, 0)));
+        assert_eq!(x.fill, Some((255, 255, 0)));
+        assert_eq!(x.font_size, Some(14.0));
+        assert_eq!(x.font_name.as_deref(), Some("Arial"));
+        // The four sides set one by one: a box, in any colour; the rest
+        // as ce2 overrides its parent.
+        let x = xf_at(&b, 0, 1);
+        assert!(x.border && !x.bold && x.italic, "{x:?}");
+        assert_eq!((x.color, x.fill, x.font_size), (None, None, Some(14.0)));
+        // A thick box and two sides are no thin box.
+        assert!(!xf_at(&b, 0, 2).border);
+        assert!(!xf_at(&b, 0, 3).border);
+        assert_eq!(b.sheets[0].cells[&(0, 4)].style, 0);
+    }
+
+    /// An empty cell whose style differs from the document's default is
+    /// kept for its format; one in the default style isn't.
+    #[test]
+    fn ods_styled_blank_kept() {
+        let xml = styled_content(
+            "",
+            r##"<style:style style:name="ce1" style:family="table-cell"><style:table-cell-properties fo:background-color="#00ff00"/></style:style>
+               <style:style style:name="ce2" style:family="table-cell"/>"##,
+            r#"<table:table table:name="S">
+                 <table:table-column table:number-columns-repeated="2"/>
+                 <table:table-column table:default-cell-style-name="ce1" table:number-columns-repeated="2"/>
+                 <table:table-column table:number-columns-repeated="16380"/>
+                 <table:table-row>
+                   <table:table-cell table:style-name="ce1" table:number-columns-repeated="2"/>
+                   <table:table-cell table:style-name="ce2"/>
+                   <table:table-cell/>
+                   <table:table-cell table:number-columns-repeated="16380"/>
+                 </table:table-row>
+                 <table:table-row table:number-rows-repeated="2">
+                   <table:table-cell table:number-columns-repeated="4"/>
+                 </table:table-row>
+               </table:table>"#,
+        );
+        let b = read_styled("", &xml, Limits::default());
+        let cells = &b.sheets[0].cells;
+        let at: Vec<_> = cells.keys().copied().collect();
+        // A1:B1 by their own style, D1 by its column's; C3:D3 and C2:D2
+        // (the repeated row) by their columns'. The rest is the default.
+        assert_eq!(at, [(0, 0), (0, 1), (0, 3), (1, 2), (1, 3), (2, 2), (2, 3)]);
+        for c in cells.values() {
+            assert_eq!(c.value, CellValue::Empty);
+            assert_eq!(b.xfs[c.style as usize].fill, Some((0, 255, 0)));
+        }
+    }
+
+    /// A LibreOffice document: its default cell style is Liberation Sans
+    /// 10, every column defaults to it, and padding fills the grid. No
+    /// empty cell is kept, and a value takes the default's font, as the
+    /// `.xls` reader keeps a workbook's Arial 10 (and Excel's `.xlsx` of
+    /// an `.ods` whose default is Aptos Narrow has it on every cell).
+    #[test]
+    fn ods_libreoffice_default_style_is_no_format() {
+        let styles_xml = r#"<office:document-styles xmlns:office="o" xmlns:style="s" xmlns:fo="f" xmlns:svg="g"><office:font-face-decls><style:font-face style:name="Liberation Sans" svg:font-family="'Liberation Sans'"/></office:font-face-decls><office:styles>
+            <style:default-style style:family="table-cell"><style:text-properties style:font-name="Liberation Sans" fo:font-size="10pt"/></style:default-style>
+            <style:default-style style:family="table-column"><style:table-column-properties style:column-width="0.889in"/></style:default-style>
+            <style:style style:name="Default" style:family="table-cell"/>
+            </office:styles></office:document-styles>"#;
+        let xml = styled_content(
+            "",
+            r#"<style:style style:name="co1" style:family="table-column"><style:table-column-properties style:column-width="0.889in"/></style:style>
+               <style:style style:name="ce1" style:family="table-cell" style:parent-style-name="Default"/>"#,
+            r#"<table:table table:name="S">
+                 <table:table-column table:style-name="co1" table:number-columns-repeated="1024" table:default-cell-style-name="Default"/>
+                 <table:table-row><table:table-cell table:style-name="ce1" office:value-type="float" office:value="1"/><table:table-cell table:number-columns-repeated="1023"/></table:table-row>
+                 <table:table-row table:number-rows-repeated="1048575"><table:table-cell table:number-columns-repeated="1024"/></table:table-row>
+               </table:table>"#,
+        );
+        let b = read_styled(styles_xml, &xml, Limits::default());
+        let s = &b.sheets[0];
+        assert_eq!(s.cells.len(), 1);
+        let x = xf_at(&b, 0, 0);
+        assert_eq!(x.font_name.as_deref(), Some("Liberation Sans"));
+        assert_eq!(x.font_size, Some(10.0));
+        assert!(!x.bold && x.fill.is_none() && !x.border);
+        // Every column is at the default width: no definition, and the
+        // sheet's default is LibreOffice's 0.889in (85 px).
+        assert!(s.cols.is_empty());
+        let w = s.default_col_width.unwrap();
+        assert_eq!(crate::print::paginate::width_px(w), 85.0);
+    }
+
+    /// The width most columns have is the default; the others are column
+    /// definitions in Excel's units, as is a collapsed column. A spanned
+    /// cell is a merge, made in each copy of a repeated row.
+    #[test]
+    fn ods_column_widths_and_spans() {
+        let xml = styled_content(
+            "",
+            r#"<style:style style:name="co1" style:family="table-column"><style:table-column-properties style:column-width="1.5875cm"/></style:style>
+               <style:style style:name="co2" style:family="table-column"><style:table-column-properties style:column-width="1.5in"/></style:style>"#,
+            r#"<table:table table:name="S">
+                 <table:table-column table:style-name="co1"/>
+                 <table:table-column table:style-name="co2" table:number-columns-repeated="2"/>
+                 <table:table-column table:style-name="co1" table:visibility="collapse"/>
+                 <table:table-column table:style-name="co1" table:number-columns-repeated="16380"/>
+                 <table:table-row>
+                   <table:table-cell table:number-columns-spanned="2" table:number-rows-spanned="3" office:value-type="float" office:value="1"/>
+                   <table:covered-table-cell/>
+                 </table:table-row>
+                 <table:table-row table:number-rows-repeated="2"><table:covered-table-cell/>
+                   <table:table-cell table:number-columns-spanned="3"/>
+                 </table:table-row>
+                 <table:table-row table:number-rows-repeated="1048573">
+                   <table:table-cell table:number-columns-spanned="2"/>
+                 </table:table-row>
+               </table:table>"#,
+        );
+        let b = read_styled("", &xml, Limits::default());
+        let s = &b.sheets[0];
+        assert_eq!(s.default_col_width, None);
+        let cols: Vec<_> = s
+            .cols
+            .iter()
+            .map(|c| (c.first, c.last, c.width, c.hidden))
+            .collect();
+        // 1.5in = 144 px, which Excel stores as 144/7 characters.
+        let w = (144.0f64 / 7.0 * 256.0).trunc() / 256.0;
+        assert_eq!(cols, [(1, 2, Some(w), false), (3, 3, None, true)]);
+        assert_eq!(crate::print::paginate::width_px(w), 144.0);
+        // The padding row's span is not a merge.
+        assert_eq!(s.merges, [(0, 0, 2, 1), (1, 1, 1, 3), (2, 1, 2, 3)]);
+    }
+
+    /// Styled blanks never refuse a file: padding in a style to the grid's
+    /// edge costs nothing, the rest has its own cap past which it is left
+    /// out, and none of it counts against the repeat budget.
+    #[test]
+    fn ods_padding_of_styled_blanks_opens() {
+        let auto = r##"<style:style style:name="ce1" style:family="table-cell"><style:table-cell-properties fo:background-color="#00ff00"/></style:style>"##;
+        // Padding in a style, as wide and as deep as the grid.
+        let xml = styled_content(
+            "",
+            auto,
+            r#"<table:table table:name="S"><table:table-column table:number-columns-repeated="16384" table:default-cell-style-name="ce1"/>
+                 <table:table-row><table:table-cell office:value-type="float" office:value="1"/><table:table-cell table:style-name="ce1" table:number-columns-repeated="16383"/></table:table-row>
+                 <table:table-row table:number-rows-repeated="1048575"><table:table-cell table:number-columns-repeated="16384"/></table:table-row>
+               </table:table>"#,
+        );
+        let started = std::time::Instant::now();
+        let b = read_styled("", &xml, Limits::default());
+        assert_eq!(b.sheets[0].cells.len(), 1);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        // A styled 3x2000 block is kept, whole; at a repeat budget the
+        // values use up, it still opens.
+        let block = |rows: u32| {
+            styled_content(
+                "",
+                auto,
+                &format!(
+                    r#"<table:table table:name="S">
+                     <table:table-row table:number-rows-repeated="4"><table:table-cell office:value-type="float" office:value="1"/></table:table-row>
+                     <table:table-row table:number-rows-repeated="{rows}"><table:table-cell table:style-name="ce1" table:number-columns-repeated="3"/></table:table-row>
+                   </table:table>"#
+                ),
+            )
+        };
+        let at_budget = Limits {
+            repeat_cells: 3,
+            ..Limits::default()
+        };
+        let b = read_styled("", &block(2000), at_budget);
+        assert_eq!(b.sheets[0].cells.len(), 4 + 3 * 2000);
+
+        // Old LibreOffice pads rows to 1024 columns, not the grid's
+        // 16384: past the cap, the blanks are left out, and the file opens.
+        let old = styled_content(
+            "",
+            auto,
+            r#"<table:table table:name="S">
+                 <table:table-row table:number-rows-repeated="5000"><table:table-cell table:style-name="ce1" table:number-columns-repeated="1024"/></table:table-row>
+                 <table:table-row><table:table-cell office:value-type="float" office:value="2"/></table:table-row>
+               </table:table>"#,
+        );
+        let capped = Limits {
+            styled_blanks: 10_000,
+            ..Limits::default()
+        };
+        let b = read_styled("", &old, capped);
+        let cells = &b.sheets[0].cells;
+        // Nine rows of 1024 fit; the value after them is still there.
+        assert_eq!(cells.len(), 9 * 1024 + 1);
+        assert_eq!(cells[&(5000, 0)].value, CellValue::Number(2.0));
+    }
+
+    /// The content.xml of [`round_trip_ods`].
+    fn feature_ods_content() -> String {
+        styled_content(
+            r#"<style:font-face style:name="Arial" svg:font-family="Arial"/>"#,
+            r##"<style:style style:name="ce1" style:family="table-cell">
+                 <style:table-cell-properties fo:background-color="#ffff00" fo:border="0.74pt solid #000000"/>
+                 <style:text-properties fo:font-weight="bold" fo:font-style="italic" fo:color="#ff0000" fo:font-size="14pt" style:font-name="Arial"/></style:style>
+               <style:style style:name="co1" style:family="table-column"><style:table-column-properties style:column-width="1.5875cm"/></style:style>
+               <style:style style:name="co2" style:family="table-column"><style:table-column-properties style:column-width="1.5in"/></style:style>
+               <style:style style:name="cf1" style:family="table-cell"><style:table-cell-properties fo:background-color="#00ff00"/></style:style>
+               <style:style style:name="ce2" style:family="table-cell"><style:map style:condition="cell-content()&gt;5" style:apply-style-name="cf1" style:base-cell-address="S.B4"/></style:style>"##,
+            r#"<table:content-validations><table:content-validation table:name="v1" table:condition="of:is-true-formula([.A1]&gt;0)" table:base-cell-address="S.A1"/></table:content-validations>
+               <table:table table:name="S">
+                 <table:table-column table:style-name="co1"/>
+                 <table:table-column table:style-name="co2"/>
+                 <table:table-column table:style-name="co1" table:number-columns-repeated="16382"/>
+                 <table:table-row><table:table-cell table:style-name="ce1" office:value-type="float" office:value="1"/><table:table-cell table:content-validation-name="v1" table:number-columns-repeated="2"/></table:table-row>
+                 <table:table-row><table:table-cell><office:annotation><dc:creator>Ann</dc:creator><text:p>a note</text:p></office:annotation></table:table-cell></table:table-row>
+                 <table:table-row><table:table-cell table:number-columns-spanned="2" table:number-rows-spanned="2"/></table:table-row>
+                 <table:table-row><table:table-cell/><table:table-cell table:style-name="ce2" office:value-type="float" office:value="7"/><table:table-cell table:style-name="ce2" office:value-type="float" office:value="3"/></table:table-row>
+               </table:table>"#,
+        )
+    }
+
+    fn ods_zip(content: &str) -> Vec<u8> {
+        opccore::zipwrite::write_zip(&[
+            (
+                "mimetype".to_string(),
+                b"application/vnd.oasis.opendocument.spreadsheet".to_vec(),
+            ),
+            ("content.xml".to_string(), content.as_bytes().to_vec()),
+        ])
+    }
+
+    /// Opened, saved as `.xlsx` and reloaded, an `.ods` keeps what the
+    /// import read (#884: they were lost on save).
+    #[test]
+    fn round_trip_ods() {
+        let (pkg, _) = super::super::open_workbook(&ods_zip(&feature_ods_content())).unwrap();
+        let back = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        let wb = &back.workbook;
+        let s = &wb.sheets[0];
+        let style = s.cell(0, 0).unwrap().style;
+        let x = wb.styles.xf(style);
+        assert!(x.bold && x.italic, "{x:?}");
+        assert!(super::super::saved_thin_box(&back, style));
+        assert_eq!(x.color, Some((255, 0, 0)));
+        assert_eq!(x.fill, Some((255, 255, 0)));
+        assert_eq!(x.font_size, Some(14.0));
+        assert_eq!(x.font_name.as_deref(), Some("Arial"));
+        let widths: Vec<_> = s.col_defs.iter().map(|d| (d.min, d.max, d.width)).collect();
+        let w = (144.0f64 / 7.0 * 256.0).trunc() / 256.0;
+        assert_eq!(widths, [(1, 1, Some(w))]);
+        assert_eq!(s.merges, [(2, 0, 3, 1)]);
+        let notes: Vec<_> = back
+            .comments()
+            .into_iter()
+            .map(|c| (c.row, c.col, c.author, c.text))
+            .collect();
+        assert_eq!(notes, [(1, 0, "Ann".to_string(), "a note".to_string())]);
+        let v = &s.validations;
+        assert_eq!(v.len(), 1);
+        // Based at A1, `[.A1]` is the cell itself: B1 at the range's top.
+        assert_eq!(
+            (v[0].kind.as_str(), v[0].formula1.as_str()),
+            ("custom", "B1>0")
+        );
+        assert_eq!(v[0].ranges, [(0, 1, 0, 2)]);
+        // B4's 7 is on green; C4's 3 isn't.
+        assert_eq!(s.cond_formats.len(), 1);
+        assert_eq!(
+            crate::cf::cell_dxf(wb, 0, 3, 1).unwrap().fill,
+            Some((0, 255, 0))
+        );
+        assert!(crate::cf::cell_dxf(wb, 0, 3, 2).is_none());
+    }
+
+    /// An annotation is its cell's comment: `dc:creator` the author, each
+    /// paragraph a line; the cell's own text is not touched. A repeated
+    /// cell's or row's annotation is on its first copy only.
+    #[test]
+    fn ods_annotations_become_comments() {
+        let xml = styled_content(
+            "",
+            "",
+            r#"<table:table table:name="S">
+                 <table:table-row>
+                   <table:table-cell office:value-type="string"><office:annotation><dc:creator>Ann Lee</dc:creator><dc:date>2024-01-01T00:00:00</dc:date><text:p>first<text:s text:c="2"/>line</text:p><text:p>second</text:p></office:annotation><text:p>value</text:p></table:table-cell>
+                   <table:table-cell table:number-columns-repeated="3"><office:annotation><text:p>on an empty cell</text:p></office:annotation></table:table-cell>
+                 </table:table-row>
+                 <table:table-row table:number-rows-repeated="1048575"><table:table-cell><office:annotation><dc:creator>Bob</dc:creator><text:p>padding</text:p></office:annotation></table:table-cell></table:table-row>
+               </table:table>"#,
+        );
+        let b = read_styled("", &xml, Limits::default());
+        let s = &b.sheets[0];
+        assert_eq!(s.cells[&(0, 0)].value, CellValue::Text("value".into()));
+        assert_eq!(
+            s.comments,
+            [
+                (
+                    0,
+                    0,
+                    "Ann Lee".to_string(),
+                    "first  line\nsecond".to_string()
+                ),
+                (0, 1, String::new(), "on an empty cell".to_string()),
+                (1, 0, "Bob".to_string(), "padding".to_string()),
+            ]
+        );
+    }
+
+    /// The content validations of [`ods_content_validations`].
+    const VALIDATIONS: &str = r#"<table:content-validations>
+        <table:content-validation table:name="val1" table:condition="of:cell-content-is-whole-number() and cell-content-is-between(1;10)" table:allow-empty-cell="true" table:base-cell-address="S.B2">
+          <table:help-message table:title="Number" table:display="true"><text:p>Enter</text:p><text:p>1-10</text:p></table:help-message>
+          <table:error-message table:message-type="warning" table:title="Oops" table:display="true"><text:p>Out of range</text:p></table:error-message>
+        </table:content-validation>
+        <table:content-validation table:name="val2" table:condition="of:cell-content-is-in-list(&quot;a&quot;;&quot;b c&quot;)" table:allow-empty-cell="false" table:display-list="none" table:base-cell-address="S.A1"/>
+        <table:content-validation table:name="val3" table:condition="of:is-true-formula([.A1]&gt;0)" table:base-cell-address="S.C2"/>
+        <table:content-validation table:name="val4" table:condition="of:cell-content-is-decimal-number() and cell-content()&gt;=[.$Z$1]" table:base-cell-address="S.D1"/>
+        <table:content-validation table:name="val5" table:condition="of:cell-content-text-length()&lt;=5" table:base-cell-address="S.E1"/>
+        <table:content-validation table:name="val6" table:condition="of:cell-content-is-in-list([.$Y$1:.$Y$3])" table:base-cell-address="S.F1"/>
+        <table:content-validation table:name="bad" table:condition="of:something-odd()" table:base-cell-address="S.A1"/>
+      </table:content-validations>"#;
+
+    /// The table of [`ods_content_validations`]: val1 on B2:B5 (a repeated
+    /// row), val2 on A1:C1 (a repeated cell), val3 on C3:C4, val4 on D1,
+    /// val5 on E1:E1048576 (padding), val6 on F1 and `bad` on G1.
+    const VALIDATED: &str = r#"<table:table table:name="S">
+        <table:table-row><table:table-cell table:content-validation-name="val2" table:number-columns-repeated="3"/><table:table-cell table:content-validation-name="val4"/><table:table-cell table:content-validation-name="val5"/><table:table-cell table:content-validation-name="val6"/><table:table-cell table:content-validation-name="bad"/></table:table-row>
+        <table:table-row><table:table-cell/><table:table-cell table:content-validation-name="val1" office:value-type="float" office:value="3"/></table:table-row>
+        <table:table-row table:number-rows-repeated="2"><table:table-cell/><table:table-cell table:content-validation-name="val1"/><table:table-cell table:content-validation-name="val3"/></table:table-row>
+        <table:table-row><table:table-cell/><table:table-cell table:content-validation-name="val1"/></table:table-row>
+        <table:table-row table:number-rows-repeated="1048571"><table:table-cell table:number-columns-repeated="4"/><table:table-cell table:content-validation-name="val5"/></table:table-row>
+      </table:table>"#;
+
+    /// Content validations are the sheet's rules over the cells that name
+    /// them, their formulas moved from the base cell to the range's
+    /// top-left; a condition this doesn't read is left out.
+    #[test]
+    fn ods_content_validations() {
+        use crate::sheet::AlertStyle;
+        let xml = styled_content("", "", &format!("{VALIDATIONS}{VALIDATED}"));
+        let b = read_styled("", &xml, Limits::default());
+        let v = &super::super::placed_dvs(&b.sheets[0]);
+        let got: Vec<_> = v
+            .iter()
+            .map(|d| {
+                (
+                    d.kind.as_str(),
+                    d.operator.as_str(),
+                    d.formula1.as_str(),
+                    d.formula2.as_str(),
+                    d.ranges.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("list", "", "\"a,b c\"", "", vec![(0, 0, 0, 2)]),
+                (
+                    "decimal",
+                    "greaterThanOrEqual",
+                    "$Z$1",
+                    "",
+                    vec![(0, 3, 0, 3)]
+                ),
+                (
+                    "textLength",
+                    "lessThanOrEqual",
+                    "5",
+                    "",
+                    vec![(0, 4, 0, 4), (5, 4, 1048575, 4)]
+                ),
+                ("list", "", "$Y$1:$Y$3", "", vec![(0, 5, 0, 5)]),
+                ("whole", "between", "1", "10", vec![(1, 1, 4, 1)]),
+                // Based at C2, A1 is the row above; at C3, A2.
+                ("custom", "", "A2>0", "", vec![(2, 2, 3, 2)]),
+            ]
+        );
+        let w = &v[4];
+        assert_eq!(
+            (w.prompt_title.as_str(), w.prompt.as_deref()),
+            ("Number", Some("Enter\n1-10"))
+        );
+        assert_eq!(
+            (w.error_title.as_str(), w.error.as_str()),
+            ("Oops", "Out of range")
+        );
+        assert!(w.show_input && w.show_error && w.allow_blank && w.show_dropdown);
+        assert_eq!(w.error_style, AlertStyle::Warning);
+        assert!(!v[0].allow_blank && !v[0].show_dropdown && !v[0].show_input);
+    }
+
+    #[test]
+    fn ods_validation_conditions() {
+        let c = |s: &str| validation_condition(s);
+        let row = |k: &str, o: &str, a: &str, b: &str| {
+            Some(Condition {
+                kind: k.into(),
+                operator: o.into(),
+                formula1: a.into(),
+                formula2: b.into(),
+            })
+        };
+        assert_eq!(
+            c("of:cell-content-is-date() and cell-content-is-not-between([.A1];[.A2])"),
+            row("date", "notBetween", "A1", "A2")
+        );
+        assert_eq!(
+            c("cell-content-text-length-is-between(1;5)"),
+            row("textLength", "between", "1", "5")
+        );
+        assert_eq!(
+            c("of:cell-content()!=3"),
+            row("decimal", "notEqual", "3", "")
+        );
+        assert_eq!(
+            c("of:is-true-formula(AND([.A1]>0;[.B1]<2))"),
+            row("custom", "", "AND(A1>0,B1<2)", "")
+        );
+        assert_eq!(c("of:cell-content-is-whole-number()"), None);
+        assert_eq!(c("of:cell-content-is-between(1)"), None);
+        // No condition: any value.
+        assert_eq!(c(""), row("", "", "", ""));
+        assert_eq!(c("of:"), row("", "", "", ""));
+    }
+
+    /// The named styles of [`ods_style_map_and_calcext_cf`]: `Default` in
+    /// black, `Good` bold on green and `Bad` italic red, both under it.
+    const CF_STYLES: &str = r##"<office:document-styles xmlns:office="o" xmlns:style="s" xmlns:fo="f"><office:styles>
+        <style:style style:name="Default" style:family="table-cell"><style:text-properties fo:color="#000000"/></style:style>
+        <style:style style:name="Good" style:family="table-cell" style:parent-style-name="Default"><style:table-cell-properties fo:background-color="#00ff00"/><style:text-properties fo:font-weight="bold"/></style:style>
+        <style:style style:name="Bad" style:family="table-cell" style:parent-style-name="Default"><style:text-properties fo:color="#ff0000" fo:font-style="italic"/></style:style>
+        </office:styles></office:document-styles>"##;
+
+    /// `style:map`s are conditional formats over the cells in their style,
+    /// formulas moved from their base cell to the range's top-left; a
+    /// table with LibreOffice's `calcext:conditional-format`s takes those
+    /// instead (its maps are their copies). The applied style's own
+    /// properties, short of `Default`, are the format.
+    #[test]
+    fn ods_style_map_and_calcext_cf() {
+        use crate::sheet::Dxf;
+        use crate::xlsx::NewCfRule;
+        let xml = styled_content(
+            "",
+            r#"<style:style style:name="ce1" style:family="table-cell">
+                 <style:map style:condition="cell-content()&gt;5" style:apply-style-name="Good" style:base-cell-address="S.B2"/>
+                 <style:map style:condition="is-true-formula([.$A1]&gt;5)" style:apply-style-name="Bad" style:base-cell-address="S.B1"/>
+                 <style:map style:condition="cell-content-is-duplicate()" style:apply-style-name="Bad" style:base-cell-address="S.B1"/>
+               </style:style>"#,
+            r#"<table:table table:name="S">
+                 <table:table-row><table:table-cell/></table:table-row>
+                 <table:table-row><table:table-cell/><table:table-cell table:style-name="ce1" table:number-columns-repeated="2"/></table:table-row>
+                 <table:table-row table:number-rows-repeated="2"><table:table-cell/><table:table-cell table:style-name="ce1"/></table:table-row>
+                 <table:table-row table:number-rows-repeated="1048572"><table:table-cell table:style-name="ce1"/></table:table-row>
+               </table:table>
+               <table:table table:name="T">
+                 <table:table-row><table:table-cell table:style-name="ce1"/></table:table-row>
+                 <calcext:conditional-formats><calcext:conditional-format calcext:target-range-address="T.A1:T.A3 T.C1">
+                   <calcext:condition calcext:apply-style-name="Good" calcext:value="between(1,5)" calcext:base-cell-address="T.A1"/>
+                   <calcext:condition calcext:apply-style-name="Bad" calcext:value="formula-is([.A2]&gt;0)" calcext:base-cell-address="T.A2"/>
+                   <calcext:condition calcext:apply-style-name="Good" calcext:value="duplicate" calcext:base-cell-address="T.A1"/>
+                 </calcext:conditional-format></calcext:conditional-formats>
+               </table:table>"#,
+        );
+        let b = read_styled(CF_STYLES, &xml, Limits::default());
+        let good = Dxf {
+            fill: Some((0, 255, 0)),
+            bold: Some(true),
+            ..Dxf::default()
+        };
+        let bad = Dxf {
+            color: Some((255, 0, 0)),
+            italic: Some(true),
+            ..Dxf::default()
+        };
+        let s = &b.sheets[0].cond_formats;
+        assert_eq!(s.len(), 1);
+        // B2:C2 and B3:B4; not the padding rows.
+        assert_eq!(s[0].ranges, [(1, 1, 1, 2), (2, 1, 3, 1)]);
+        assert_eq!(
+            s[0].rules,
+            [
+                (
+                    NewCfRule::CellIs {
+                        op: "greaterThan".into(),
+                        formulas: vec!["5".into()],
+                    },
+                    good.clone()
+                ),
+                (
+                    NewCfRule::Expression {
+                        formula: "$A2>5".into()
+                    },
+                    bad.clone()
+                ),
+            ]
+        );
+        let t = &b.sheets[1].cond_formats;
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].ranges, [(0, 0, 2, 0), (0, 2, 0, 2)]);
+        assert_eq!(
+            t[0].rules,
+            [
+                (
+                    NewCfRule::CellIs {
+                        op: "between".into(),
+                        formulas: vec!["1".into(), "5".into()],
+                    },
+                    good
+                ),
+                (
+                    NewCfRule::Expression {
+                        formula: "A1>0".into()
+                    },
+                    bad
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn ods_cf_conditions() {
+        use crate::xlsx::NewCfRule;
+        let cell_is = |op: &str, f: &[&str]| {
+            Some(NewCfRule::CellIs {
+                op: op.into(),
+                formulas: f.iter().map(|s| s.to_string()).collect(),
+            })
+        };
+        assert_eq!(
+            cf_condition("cell-content-is-between(1;[.A1])"),
+            cell_is("between", &["1", "A1"])
+        );
+        assert_eq!(
+            cf_condition("not-between(1,5)"),
+            cell_is("notBetween", &["1", "5"])
+        );
+        assert_eq!(cf_condition("!=0"), cell_is("notEqual", &["0"]));
+        assert_eq!(
+            cf_condition("<=[.$B$1]"),
+            cell_is("lessThanOrEqual", &["$B$1"])
+        );
+        assert_eq!(
+            cf_condition("cell-content()=\"x\""),
+            cell_is("equal", &["\"x\""])
+        );
+        assert_eq!(cf_condition("top-elements(10)"), None);
+        assert_eq!(cf_condition("begins-with(\"a\")"), None);
+    }
+
+    /// A run of styled blanks short of the grid's edge, repeated for
+    /// almost every row (so neither padding test drops it), costs the
+    /// styled-blank cap, not rows x blanks: once a copy no longer fits, a
+    /// row of nothing else stops copying (#884 r1). Under the old loop this
+    /// visited about 1.7e10 cells.
+    #[test]
+    fn ods_styled_blank_rows_stop_at_the_cap() {
+        let auto = r##"<style:style style:name="ce1" style:family="table-cell"><style:text-properties fo:font-weight="bold"/></style:style>"##;
+        let xml = styled_content(
+            "",
+            auto,
+            r#"<table:table table:name="S">
+                 <table:table-row table:number-rows-repeated="1048574"><table:table-cell table:style-name="ce1" table:number-columns-repeated="16383"/></table:table-row>
+                 <table:table-row><table:table-cell office:value-type="float" office:value="1"/></table:table-row>
+               </table:table>"#,
+        );
+        for (cap, rows) in [(16_383, 1), (40_000, 2), (10, 0)] {
+            let limits = Limits {
+                styled_blanks: cap,
+                ..Limits::default()
+            };
+            let b = read_styled("", &xml, limits);
+            let cells = &b.sheets[0].cells;
+            assert_eq!(cells.len(), rows * 16_383 + 1, "cap {cap}");
+            assert_eq!(cells[&(1_048_574, 0)].value, CellValue::Number(1.0));
+        }
+    }
+
+    /// Range lists and base addresses on sheets whose quoted names hold a
+    /// space, a quote or a colon (#884 r1).
+    #[test]
+    fn ods_quoted_sheet_addresses() {
+        assert_eq!(
+            range_list("'Q1 Sales'.A1:'Q1 Sales'.A10 'Q1 Sales'.C1 $'Bob''s'.$B$2:.$C$3 'A:B'.D4"),
+            [(0, 0, 9, 0), (0, 2, 0, 2), (1, 1, 2, 2), (3, 3, 3, 3)]
+        );
+        assert_eq!(address_cell("$'Q1 Sales'.$B$2"), Some((1, 1)));
+        assert_eq!(address_cell("'Bob''s'.C3"), Some((2, 2)));
+
+        // A calcext conditional format and a validation's base cell on
+        // `Q1 Sales`.
+        let xml = styled_content(
+            "",
+            r##"<style:style style:name="Good" style:family="table-cell"><style:table-cell-properties fo:background-color="#00ff00"/></style:style>"##,
+            r#"<table:content-validations><table:content-validation table:name="v" table:condition="of:is-true-formula([.A1]&gt;0)" table:base-cell-address="'Q1 Sales'.B1"/></table:content-validations>
+               <table:table table:name="Q1 Sales">
+                 <table:table-row><table:table-cell/></table:table-row>
+                 <table:table-row><table:table-cell table:number-columns-repeated="2"/><table:table-cell table:content-validation-name="v"/></table:table-row>
+                 <calcext:conditional-formats><calcext:conditional-format calcext:target-range-address="'Q1 Sales'.A1:'Q1 Sales'.A3">
+                   <calcext:condition calcext:apply-style-name="Good" calcext:value="formula-is([.B2]&gt;0)" calcext:base-cell-address="'Q1 Sales'.A2"/>
+                 </calcext:conditional-format></calcext:conditional-formats>
+               </table:table>"#,
+        );
+        let b = read_styled("", &xml, Limits::default());
+        let s = &b.sheets[0];
+        // Based at B1, `[.A1]` is the cell to its left; on C2 (its
+        // anchor), that is B2.
+        let dv = &super::super::placed_dvs(s)[0];
+        assert_eq!(dv.ranges, [(1, 2, 1, 2)]);
+        assert_eq!(dv.formula1, "B2>0");
+        assert_eq!(s.cond_formats[0].ranges, [(0, 0, 2, 0)]);
+        assert_eq!(
+            s.cond_formats[0].rules[0].0,
+            crate::xlsx::NewCfRule::Expression {
+                formula: "B1>0".into()
+            }
+        );
+    }
+
+    /// A validation with no condition, or an empty one, is an any-value
+    /// rule: its messages and flags are kept, as `.xls`/`.xlsb` keep a
+    /// valType 0 rule (#884 r1).
+    #[test]
+    fn ods_validation_without_a_condition_keeps_its_messages() {
+        let xml = styled_content(
+            "",
+            "",
+            r#"<table:content-validations>
+                 <table:content-validation table:name="v1" table:allow-empty-cell="true" table:base-cell-address="S.A1">
+                   <table:help-message table:title="Tip" table:display="true"><text:p>Type a name</text:p></table:help-message>
+                 </table:content-validation>
+                 <table:content-validation table:name="v2" table:condition="" table:base-cell-address="S.A1"/>
+               </table:content-validations>
+               <table:table table:name="S"><table:table-row><table:table-cell table:content-validation-name="v1"/><table:table-cell table:content-validation-name="v2"/></table:table-row></table:table>"#,
+        );
+        let b = read_styled("", &xml, Limits::default());
+        let v = &super::super::placed_dvs(&b.sheets[0]);
+        assert_eq!(v.len(), 2);
+        assert_eq!((v[0].kind.as_str(), v[0].formula1.as_str()), ("", ""));
+        assert_eq!(
+            (v[0].prompt_title.as_str(), v[0].prompt.as_deref()),
+            ("Tip", Some("Type a name"))
+        );
+        assert!(v[0].show_input && v[0].allow_blank);
+        assert_eq!(
+            (v[1].kind.as_str(), v[1].ranges.clone()),
+            ("", vec![(0, 1, 0, 1)])
+        );
+    }
+
+    /// A rule over D2 and B5 is anchored at B2, the least row and column
+    /// of its ranges, which is in neither: its formulas move there from
+    /// their base cell, D2 (#884 r2).
+    #[test]
+    fn ods_rules_are_anchored_at_their_least_corner() {
+        let xml = styled_content(
+            "",
+            r##"<style:style style:name="Good" style:family="table-cell"><style:table-cell-properties fo:background-color="#00ff00"/></style:style>"##,
+            r#"<table:content-validations><table:content-validation table:name="v" table:condition="of:is-true-formula([.D2]&gt;0)" table:base-cell-address="S.D2"/></table:content-validations>
+               <table:table table:name="S">
+                 <table:table-row><table:table-cell/></table:table-row>
+                 <table:table-row><table:table-cell table:number-columns-repeated="3"/><table:table-cell table:content-validation-name="v" office:value-type="float" office:value="5"/></table:table-row>
+                 <table:table-row table:number-rows-repeated="2"><table:table-cell/></table:table-row>
+                 <table:table-row><table:table-cell/><table:table-cell table:content-validation-name="v" office:value-type="float" office:value="-1"/></table:table-row>
+                 <calcext:conditional-formats><calcext:conditional-format calcext:target-range-address="S.D2 S.B5">
+                   <calcext:condition calcext:apply-style-name="Good" calcext:value="formula-is([.D2]&gt;0)" calcext:base-cell-address="S.D2"/>
+                 </calcext:conditional-format></calcext:conditional-formats>
+               </table:table>"#,
+        );
+        let (pkg, _) = super::super::open_workbook(&ods_zip(&xml)).unwrap();
+        let back = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        let wb = &back.workbook;
+        let dv = &wb.sheets[0].validations[0];
+        assert_eq!(dv.ranges, [(1, 3, 1, 3), (4, 1, 4, 1)]);
+        assert_eq!(dv.formula1, "B2>0");
+        assert_eq!(crate::validation::invalid_cells(wb, 0, None), [(4, 1)]);
+        assert!(crate::cf::cell_dxf(wb, 0, 1, 3).is_some());
+        assert!(crate::cf::cell_dxf(wb, 0, 4, 1).is_none());
+    }
+
+    /// Empty cells walk the column styles they cross only when one gives
+    /// them something to keep, and only within `Limits::column_walk`, so
+    /// rows x column elements can't grow the import's time; adjacent
+    /// columns in one style are one step (#884 r2).
+    #[test]
+    fn ods_column_style_walk_is_bounded() {
+        let auto = r##"<style:style style:name="ce1" style:family="table-cell"><style:table-cell-properties fo:background-color="#00ff00"/></style:style>
+            <style:style style:name="ce2" style:family="table-cell"/>
+            <style:style style:name="ce3" style:family="table-cell"/>"##;
+        let table = |a: &str, b: &str| {
+            let cols: String = (0..16384)
+                .map(|i| {
+                    format!(
+                        r#"<table:table-column table:default-cell-style-name="{}"/>"#,
+                        if i % 2 == 0 { a } else { b }
+                    )
+                })
+                .collect();
+            let rows = r#"<table:table-row><table:table-cell table:number-columns-repeated="16383"/></table:table-row>"#.repeat(5);
+            styled_content(
+                "",
+                auto,
+                &format!(r#"<table:table table:name="S">{cols}{rows}</table:table>"#),
+            )
+        };
+        let read = |xml: &str, walk: usize| {
+            let limits = Limits {
+                column_walk: walk,
+                ..Limits::default()
+            };
+            let b = read_styled("", xml, limits);
+            let cells = &b.sheets[0].cells;
+            let rows: std::collections::BTreeSet<u32> = cells.keys().map(|k| k.0).collect();
+            (cells.len(), rows.into_iter().collect::<Vec<_>>())
+        };
+        // Alternating styles: each row's run is 16383 steps. The budget
+        // lasts two rows; the rows after it keep no styled blanks.
+        assert_eq!(read(&table("ce1", "ce2"), 20_000), (2 * 8192, vec![0, 1]));
+        // One style throughout is one step a row.
+        assert_eq!(read(&table("ce1", "ce1"), 2), (2 * 16383, vec![0, 1]));
+        // No column style gives a blank anything to keep: no walk at all.
+        assert_eq!(read(&table("ce2", "ce3"), 0), (0, vec![]));
+        assert_eq!(read(&table("ce2", "ce3"), 4_000_000), (0, vec![]));
+    }
+
+    /// A cell's text, an annotation's and a validation message's read the
+    /// same paragraph elements: spaces, tabs and line breaks too (#884 r2).
+    #[test]
+    fn ods_message_and_annotation_text_elements() {
+        let xml = styled_content(
+            "",
+            "",
+            r#"<table:content-validations><table:content-validation table:name="v" table:base-cell-address="S.A1">
+                 <table:help-message table:display="true">
+                   <text:p>a<text:s/>b<text:line-break/>c</text:p>
+                   <text:p>d<text:s text:c="2"/>e</text:p>
+                 </table:help-message>
+               </table:content-validation></table:content-validations>
+               <table:table table:name="S"><table:table-row>
+                 <table:table-cell table:content-validation-name="v" office:value-type="string"><office:annotation><dc:creator>Ann</dc:creator><text:p>x<text:tab/>y<text:s/>z<text:line-break/>w</text:p></office:annotation><text:p>own<text:tab/>text</text:p></table:table-cell>
+               </table:table-row></table:table>"#,
+        );
+        let b = read_styled("", &xml, Limits::default());
+        let s = &b.sheets[0];
+        assert_eq!(
+            super::super::placed_dvs(s)[0].prompt.as_deref(),
+            Some("a b\nc\nd  e")
+        );
+        assert_eq!(
+            s.comments,
+            [(0, 0, "Ann".to_string(), "x\ty z\nw".to_string())]
+        );
+        assert_eq!(s.cells[&(0, 0)].value, CellValue::Text("own\ttext".into()));
     }
 }

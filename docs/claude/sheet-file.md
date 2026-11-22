@@ -297,3 +297,90 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
 - The corpus has no outlines or breaks, so these rest on synthetic round
   trips. An Excel-made `.xls` still asks on Ctrl+S because its document
   properties are dropped at import (a later slice of #1440).
+
+## Formats, widths, merges, comments, validation and conditional formats from `.xls`/`.xlsb`/`.ods` (#884)
+
+- The three importers (`gridcore/src/legacy/`) now keep what the model
+  holds of each: a cell's bold, italic, font colour, size and name, solid
+  fill and thin box; column widths; merges; comments (author and plain
+  text); data validation; and `cellIs`/`expression` conditional formats with
+  their differential format. Alignment, wrap, row heights and charts are
+  still parked. `.xls` names what it leaves out in `dropped`; `.xlsb` and
+  `.ods` have no such list.
+- `SheetIn` carries `comments`, `validations` and `cond_formats` (`CfIn`).
+  `BookIn::build` writes comments with `set_comments`, appends validations
+  as rules built in memory (`ix`/`orig` none, which a save appends), and
+  writes conditional formats through `SheetPackage::add_cond_formats`. A
+  block with `ix: None` is never written by `set_cond_formats`, so the
+  import can't leave them in the model alone. `add_cond_formats` is the
+  batched writer `add_conditional_format` now calls: dxfs once, all of a
+  sheet's blocks in one splice.
+- Rule formulas are in Excel's syntax, relative to the model's anchor: the
+  least row and least column of the rule's ranges, as
+  `validation::anchor_of` and `cf::cell_dxf` take it (`legacy::anchor_of`).
+  That cell is not always the first range's top-left (`D5:D10 B2:B3` is
+  anchored at B2). Each reader decodes against the base its format defines
+  and records it (`DvIn::base`, `CfIn::base`), and `BookIn::build` moves the
+  formulas from there to the anchor (`DvIn::placed`, `CfIn::placed`, with
+  `translate_formula`). A rule whose formula must move and doesn't parse,
+  or whose move pushes a reference off the grid (a new `#REF!`), is left
+  out, and `.xls` names it. Then `fix` runs (sheet renames, `file_formula`). The bases:
+  - BIFF8 CF: its CONDFMT's refBound top-left;
+  - BIFF12 CF: the ranges' bounds' top-left;
+  - BIFF8 DV and BIFF12 BrtDVal: the first range's top-left, as LibreOffice
+    reads them;
+  - `.ods`: each condition's own `base-cell-address`. The `.ods` reader moves
+    each CF rule itself, since a block's rules have bases of their own.
+
+  BIFF8/BIFF12 formulas decompile with `Base::Shared(base)`, which reads
+  ptgRefN as offsets and ptgRef as absolute coordinates.
+- `.xlsb`: `xlsb_style.rs` reads `styles.bin` (BrtFont, BrtFill, BrtBorder,
+  whole BrtXF, BrtDXF's XFProps) into model formats, made once per XF.
+  Excel's default text colour (theme 1, no tint) is no colour, as the
+  `.xlsx` loader reads it. The other theme colours are `*_unresolved`.
+  Indexed colours use the default palette.
+- `.ods`: cell styles resolve through their parents, `Default` and the
+  `table-cell` default style. A value in no style of its own takes the
+  document default's font, as the `.xls` reader keeps a workbook's Arial 10
+  (Excel's `.xlsx` of an `.ods` whose default is Aptos Narrow has it on
+  every cell). An empty cell is kept only when its format differs from that
+  default (so LibreOffice's Liberation Sans 10 keeps no blank), and never
+  in a run that reaches the grid's last row or column (padding). Styled
+  blanks have their own cap, `Limits::styled_blanks` (1,000,000). Past it
+  they are left out, never refused, and they never count against the
+  repeat budget, so no file that opened before is refused now.
+- An `.ods` empty cell with no style of its own takes its column's default
+  style, so its run walks the column styles it crosses. The walk happens
+  only when some column default style gives a blank something to keep (a
+  format, or `style:map`s). Adjacent columns in one style are one step.
+  The total is capped by `Limits::column_walk` (4,000,000 steps); past it,
+  further blanks take no column style, never an error.
+- `.ods` column widths: the width most columns have is the sheet's default
+  (no definition; `default_col_width` unless it is Excel's own). Only the
+  others become definitions, `paginate::width_of_px` of the length at 96
+  dpi (the inverse of `width_px`). This matches Excel's `.ods` (1.5875cm =
+  60 px for 8.54 characters). LibreOffice's own widths are unverified.
+- `.ods` repeats: a span is a merge in every copy of a repeated row,
+  charged as repeats. An annotation is on the first copy only. Padding
+  rows make neither. Validation and conditional-format ranges are row runs
+  that grow into rectangles, so a repeat adds one range. A table with
+  LibreOffice's `calcext:conditional-format`s takes those and ignores its
+  `style:map`s, which are their copies.
+- `.xls` notes: an OBJ whose FtCmo has ot 0x19 is a note; the TXO after it
+  holds the text (cchText at offset 10, the text in its CONTINUE pieces).
+  Only another OBJ, or a chart substream, names "pictures, shapes and
+  charts"; MSODRAWING alone doesn't. CF12, CONDFMT12 and CFEX name
+  "conditional formatting".
+- `.xls` CF records are read after the sheet's cells (the cell closure
+  borrows the styles). A CF's solid fill is its DXFPat background colour,
+  as an `.xlsx` dxf's `<bgColor>`.
+- The xlsx loader never sets `Xf::border`: a loaded thin box lives in the
+  `<xf>`'s `<border>` through `loaded_from`. The round-trip tests check it
+  with `legacy::saved_thin_box`.
+- The legacy oracle (`gridcore/tests/legacy.rs`) checks (i): the cells'
+  fonts and fills, column widths and merges against the `.xlsx` source,
+  with Calibri 11 as the default on both sides. Not the thin box: the
+  source's `Xf::border` is always false (above), so the readers' round
+  trips check it with `saved_thin_box`. The corpus has no CF, DV or
+  comments, and no Excel-made fixture has them, so those rest on
+  hand-built records laid out from [MS-XLS]/[MS-XLSB]/ODF.

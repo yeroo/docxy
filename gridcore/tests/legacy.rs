@@ -24,6 +24,8 @@ enum Check {
     Formula,
     /// (f): the number-format code.
     Format,
+    /// (i): the cell's font and fill (#884).
+    Style,
 }
 
 /// One exemption: in `file`, the `cells` of sheet `sheet` (`["*"]` for
@@ -200,6 +202,95 @@ fn code(wb: &Workbook, style: u32) -> String {
         }
     }
     out
+}
+
+/// The parts of a cell format the import keeps (#884): bold, italic, the
+/// font colour, size and name, and the fill. Not the thin box: the `.xlsx`
+/// loader never sets `Xf::border` (a loaded box lives in its `<xf>`'s
+/// `<border>`, through `loaded_from`), so the source would always say no
+/// box. The readers' round-trip tests check the box after a save
+/// (`legacy::saved_thin_box`).
+type Look = (
+    bool,
+    bool,
+    (Option<(u8, u8, u8)>, bool),
+    Option<f64>,
+    Option<String>,
+    (Option<(u8, u8, u8)>, bool),
+);
+
+fn look(wb: &Workbook, style: u32) -> Look {
+    let x = wb.styles.xf(style);
+    (
+        x.bold,
+        x.italic,
+        (x.color, x.color_unresolved),
+        // Calibri 11, the default, as none: the `.xlsx` loader keeps it
+        // spelled out, the imports as the default.
+        x.font_size.filter(|&s| s != 11.0),
+        x.font_name
+            .map(|n| n.to_ascii_lowercase())
+            .filter(|n| n != "calibri"),
+        (x.fill, x.fill_unresolved),
+    )
+}
+
+/// (i) the cells' formats, the column widths (within 0.1) and the merged
+/// cells (#884).
+fn compare_looks(file: &str, src: &Workbook, got: &Workbook, errs: &mut Vec<String>) {
+    for (s, sheet) in src.sheets.iter().enumerate() {
+        let Some(theirs) = got.sheets.get(s) else {
+            return;
+        };
+        let cells: std::collections::BTreeSet<(u32, u32)> = sheet
+            .cells
+            .keys()
+            .chain(theirs.cells.keys())
+            .copied()
+            .collect();
+        for (r, c) in cells {
+            let style = |x: &gridcore::sheet::Sheet| x.cell(r, c).map_or(0, |x| x.style);
+            let (want, have) = (look(src, style(sheet)), look(got, style(theirs)));
+            if want != have && !allowed(file, &sheet.name, &cell_name(r, c), Check::Style) {
+                errs.push(format!(
+                    "{file}: {}!{}: (i) format {have:?} != source {want:?}",
+                    sheet.name,
+                    cell_name(r, c)
+                ));
+            }
+        }
+        if allowed(file, &sheet.name, "*", Check::Style) {
+            continue;
+        }
+        let widths = |x: &gridcore::sheet::Sheet| {
+            x.col_defs
+                .iter()
+                .filter_map(|d| Some((d.min, d.max, d.width?)))
+                .collect::<Vec<_>>()
+        };
+        let (want, have) = (widths(sheet), widths(theirs));
+        let same = want.len() == have.len()
+            && want
+                .iter()
+                .zip(&have)
+                .all(|(a, b)| (a.0, a.1) == (b.0, b.1) && (a.2 - b.2).abs() < 0.1);
+        if !same {
+            errs.push(format!(
+                "{file}: {}: (i) column widths {have:?} != source {want:?}",
+                sheet.name
+            ));
+        }
+        let mut want = sheet.merges.clone();
+        let mut have = theirs.merges.clone();
+        want.sort();
+        have.sort();
+        if want != have {
+            errs.push(format!(
+                "{file}: {}: (i) merges {have:?} != source {want:?}",
+                sheet.name
+            ));
+        }
+    }
 }
 
 fn corpus(dir: &str) -> std::path::PathBuf {
@@ -394,10 +485,12 @@ fn legacy_imports_match_their_xlsx_originals() {
             assert_eq!(got_format, format, "{file}");
             compare_static(&file, &src, &pkg.workbook, &mut errs);
             compare_formulas(&file, &src, &pkg.workbook, &mut errs);
+            compare_looks(&file, &src, &pkg.workbook, &mut errs);
             // (h) what a user gets: open, save as .xlsx, reopen.
             let back = load_xlsx(&save_xlsx(&pkg)).expect("saved import reloads");
             let mut round = Vec::new();
             compare_static(&file, &src, &back.workbook, &mut round);
+            compare_looks(&file, &src, &back.workbook, &mut round);
             errs.extend(round.into_iter().map(|e| format!("(h) after save: {e}")));
         }
     }

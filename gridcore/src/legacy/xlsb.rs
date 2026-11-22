@@ -12,8 +12,9 @@ use opccore::zip::ZipArchive;
 
 use super::ftab;
 use super::ptg::{self, Base, Biff, Names, Table, utf16};
+use super::xlsb_style::Styles;
 use super::{
-    BookIn, ExternalLink, Le, Limits, OpenError, SheetIn, XfFormats, biff_error, on_grid, rk,
+    BookIn, ColIn, ExternalLink, Le, Limits, OpenError, SheetIn, biff_error, on_grid, rk,
     set_array, sheet_prefix,
 };
 use crate::sheet::{Cell, CellValue, DefinedName};
@@ -21,7 +22,7 @@ use crate::xlsx::{parse_rels, parse_rels_mode, rels_part_name, resolve_relative}
 
 /// The records of a part: (type, body). A record cut off by the end of the
 /// part ends the list.
-fn records(b: &[u8]) -> Vec<(u32, &[u8])> {
+pub(super) fn records(b: &[u8]) -> Vec<(u32, &[u8])> {
     fn varint(b: &[u8], at: &mut usize, max: usize) -> Option<u32> {
         let mut v = 0u32;
         for k in 0..max {
@@ -56,7 +57,7 @@ type Cur<'a> = Le<'a>;
 impl<'a> Le<'a> {
     /// `XLWideString`: a 32-bit count of UTF-16 units. `0xFFFFFFFF` (a null
     /// `XLNullableWideString`) reads as empty.
-    fn wide(&mut self) -> Option<String> {
+    pub(super) fn wide(&mut self) -> Option<String> {
         let n = self.u32()?;
         if n == 0xFFFF_FFFF {
             return Some(String::new());
@@ -64,7 +65,7 @@ impl<'a> Le<'a> {
         Some(utf16(self.take((n as usize).checked_mul(2)?)?))
     }
     /// A parsed formula: `cce`, the tokens, `cb`, the extra data.
-    fn formula(&mut self) -> Option<(&'a [u8], &'a [u8])> {
+    pub(super) fn formula(&mut self) -> Option<(&'a [u8], &'a [u8])> {
         let cce = self.u32()? as usize;
         let rgce = self.take(cce)?;
         let cb = self.u32()? as usize;
@@ -75,8 +76,6 @@ impl<'a> Le<'a> {
 
 const BRT_ROW_HDR: u32 = 0;
 const BRT_NAME: u32 = 39;
-const BRT_FMT: u32 = 44;
-const BRT_XF: u32 = 47;
 const BRT_WB_PROP: u32 = 153;
 const BRT_BUNDLE_SH: u32 = 156;
 const BRT_SST_ITEM: u32 = 19;
@@ -95,8 +94,6 @@ const BRT_SUP_NAME_START: u32 = 577;
 /// A name's definition in an external link part: `cce` and tokens (see
 /// [`read_link`]; corpus/legacy/addin has both kinds).
 const BRT_SUP_NAME_FMLA: u32 = 585;
-const BRT_BEGIN_CELL_XFS: u32 = 617;
-const BRT_END_CELL_XFS: u32 = 618;
 const BRT_SUP_ADDIN: u32 = 667;
 
 /// A BrtName as read, decompiled once every name is known.
@@ -215,6 +212,53 @@ fn read_tables(zip: &ZipArchive, part: &str, sheet: &str, out: &mut HashMap<u32,
             })();
         }
     }
+}
+
+/// BrtCommentAuthor, BrtBeginComment and BrtCommentText: [MS-XLSB] 2.4
+/// (record ids 632, 635 and 637), in the comments part
+/// ([MS-XLSB] 2.1.7.8) a sheet's rels name.
+const BRT_COMMENT_AUTHOR: u32 = 632;
+const BRT_BEGIN_COMMENT: u32 = 635;
+const BRT_COMMENT_TEXT: u32 = 637;
+
+/// The comments of the sheet in `part` (#884): (row, col, author, text).
+/// BrtBeginComment: iauth (into the BrtCommentAuthor list), an RfX
+/// (rwFirst, rwLast, colFirst, colLast) and a GUID; BrtCommentText: a
+/// RichStr (flags, then the plain text; its runs are not read).
+fn read_comments(zip: &ZipArchive, part: &str) -> Vec<(u32, u32, String, String)> {
+    let mut out = Vec::new();
+    for (ty, target) in rels(zip, part).into_values() {
+        if !ty.ends_with("/comments") {
+            continue;
+        }
+        let Some(bytes) = zip.read(&target) else {
+            continue;
+        };
+        let mut authors: Vec<String> = Vec::new();
+        let mut at: Option<(u32, u32, String)> = None;
+        for (ty, body) in records(&bytes) {
+            let mut c = Cur::new(body);
+            let _ = (|| -> Option<()> {
+                match ty {
+                    BRT_COMMENT_AUTHOR => authors.push(c.wide()?),
+                    BRT_BEGIN_COMMENT => {
+                        let iauth = c.u32()? as usize;
+                        let (row, _, col) = (c.u32()?, c.u32()?, c.u32()?);
+                        at = on_grid(row, col)
+                            .then(|| (row, col, authors.get(iauth).cloned().unwrap_or_default()));
+                    }
+                    BRT_COMMENT_TEXT => {
+                        let (row, col, author) = at.take()?;
+                        c.u8()?;
+                        out.push((row, col, author, c.wide()?));
+                    }
+                    _ => {}
+                }
+                Some(())
+            })();
+        }
+    }
+    out
 }
 
 /// The relationships of `part`, by `Id`: (type, the target part's name).
@@ -412,33 +456,11 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
         })
         .unwrap_or_default();
 
-    // styles.bin: format codes, and the cell XFs' format ids.
-    let mut fmt_codes: HashMap<u16, String> = HashMap::new();
-    let mut xf_fmt: Vec<u16> = Vec::new();
-    if let Some(b) = zip.read("xl/styles.bin") {
-        let mut in_cell_xfs = false;
-        for (ty, body) in records(&b) {
-            let mut c = Cur::new(body);
-            match ty {
-                BRT_FMT => {
-                    if let (Some(id), Some(code)) = (c.u16(), c.wide()) {
-                        fmt_codes.insert(id, code);
-                    }
-                }
-                BRT_BEGIN_CELL_XFS => in_cell_xfs = true,
-                BRT_END_CELL_XFS => in_cell_xfs = false,
-                BRT_XF if in_cell_xfs => {
-                    let _ = c.u16();
-                    xf_fmt.push(c.u16().unwrap_or(0));
-                }
-                _ => {}
-            }
-        }
-    }
-    let formats = XfFormats {
-        xf_fmt,
-        codes: fmt_codes,
-    };
+    // styles.bin: the cell formats and the differential formats.
+    let mut styles = zip
+        .read("xl/styles.bin")
+        .map(|b| Styles::read(&b))
+        .unwrap_or_default();
 
     // Every table first: a formula may name one on another sheet.
     for (i, part) in parts.iter().enumerate() {
@@ -453,21 +475,19 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
     let mut seen: HashSet<&str> = HashSet::new();
     for (i, part) in parts.iter().enumerate() {
         // Only worksheets: a chartsheet's or macro sheet's part is no grid.
-        let Some(bytes) = part
+        let Some((part, bytes)) = part
             .as_ref()
             .filter(|p| p.contains("worksheets/") && seen.insert(p.as_str()))
-            .and_then(|p| zip.read(p))
+            .and_then(|p| Some((p, zip.read(p)?)))
         else {
             imported.push(None);
             continue;
         };
-        let cells = read_sheet(&bytes, &g, &sst, &mut book, &formats)?;
+        let mut sheet = read_sheet(&bytes, &g, &sst, &mut book, &mut styles)?;
+        sheet.name = g.sheets[i].clone();
+        sheet.comments = read_comments(zip, part);
         imported.push(Some(book.sheets.len()));
-        book.push_sheet(SheetIn {
-            name: g.sheets[i].clone(),
-            cells,
-            ..SheetIn::default()
-        })?;
+        book.push_sheet(sheet)?;
     }
 
     for RawName {
@@ -505,14 +525,127 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
 /// data.
 type Group = ((u32, u32, u32, u32), Vec<u8>, Vec<u8>);
 
-/// A sheet part's cells.
+/// BrtColInfo, [MS-XLSB] 2.4 (record id 60).
+const BRT_COL_INFO: u32 = 60;
+/// BrtMergeCell, [MS-XLSB] 2.4 (record id 176).
+const BRT_MERGE_CELL: u32 = 176;
+/// BrtWsFmtInfo, [MS-XLSB] 2.4 (record id 485).
+const BRT_WS_FMT_INFO: u32 = 485;
+/// BrtDVal, [MS-XLSB] 2.4 (record id 64), inside BrtBeginDVals (573).
+const BRT_DVAL: u32 = 64;
+/// BrtBeginConditionalFormatting and BrtBeginCFRule, [MS-XLSB] 2.4
+/// (record ids 461 and 463).
+const BRT_BEGIN_CONDITIONAL_FORMATTING: u32 = 461;
+/// BrtEndConditionalFormatting, [MS-XLSB] 2.4 (record id 462).
+const BRT_END_CONDITIONAL_FORMATTING: u32 = 462;
+const BRT_BEGIN_CF_RULE: u32 = 463;
+
+/// BrtBeginCFRule: iType (1 cellIs, 2 expression), iTemplate, dxfId, iPri,
+/// iParam (cellIs's operator), two reserved, flags, cbFmla1..3,
+/// strParam, then the formulas whose cbFmla isn't 0 (CFParsedFormulas,
+/// their relative references based at `at`, the block's ranges' bounds'
+/// top-left). `None` for a rule the model doesn't hold.
+fn read_cf_rule(
+    c: &mut Cur,
+    at: (u32, u32),
+    styles: &Styles,
+    g: &Globals,
+) -> Option<(crate::xlsx::NewCfRule, crate::sheet::Dxf)> {
+    use crate::xlsx::NewCfRule;
+    let (ty, _template, dxf_id) = (c.u32()?, c.u32()?, c.u32()?);
+    c.u32()?;
+    let param = c.u32()?;
+    c.take(10)?;
+    let cb = [c.u32()?, c.u32()?, c.u32()?];
+    c.wide()?;
+    let mut formulas = Vec::new();
+    for n in cb {
+        if n == 0 {
+            continue;
+        }
+        let (rgce, extra) = c.formula()?;
+        formulas.push(ptg::decompile(
+            Biff::V12,
+            rgce,
+            extra,
+            Base::Shared(at.0, at.1),
+            g,
+        )?);
+    }
+    let dxf = styles
+        .dxfs
+        .get(dxf_id as usize)
+        .cloned()
+        .unwrap_or_default();
+    let kind = match ty {
+        1 if !formulas.is_empty() => NewCfRule::CellIs {
+            op: super::cf_operator(param)?.to_string(),
+            formulas,
+        },
+        2 => NewCfRule::Expression {
+            formula: formulas.into_iter().next()?,
+        },
+        _ => return None,
+    };
+    Some((kind, dxf))
+}
+
+/// An UncheckedSqRfX: crfx, then each RfX (rwFirst, rwLast, colFirst,
+/// colLast), as (r1, c1, r2, c2); the ones off the grid left out.
+fn sqrfx(c: &mut Cur) -> Option<Vec<(u32, u32, u32, u32)>> {
+    let n = c.u32()?;
+    let mut out = Vec::new();
+    for _ in 0..n {
+        let (r1, r2, c1, c2) = (c.u32()?, c.u32()?, c.u32()?, c.u32()?);
+        if r2 >= r1 && c2 >= c1 && on_grid(r2, c2) {
+            out.push((r1, c1, r2, c2));
+        }
+    }
+    Some(out)
+}
+
+/// BrtDVal: flags (as BIFF8's DV, [`super::dv_from_flags`]), sqrfx, then
+/// strErrorTitle, strError, strPromptTitle and strPrompt
+/// (XLNullableWideStrings), formula1 and formula2 (CellParsedFormulas,
+/// their relative references based at the first range's top-left, as
+/// BIFF8's DV; the build moves them to the model's anchor).
+fn read_dval(c: &mut Cur, g: &Globals) -> Option<super::DvIn> {
+    let mut dv = super::dv_from_flags(c.u32()?);
+    dv.ranges = sqrfx(c)?;
+    dv.error_title = c.wide()?;
+    dv.error = c.wide()?;
+    dv.prompt_title = c.wide()?;
+    let prompt = c.wide()?;
+    dv.prompt = (!prompt.is_empty()).then_some(prompt);
+    let &(r, col, ..) = dv.ranges.first()?;
+    let formula = |c: &mut Cur| -> Option<String> {
+        let (rgce, extra) = c.formula()?;
+        if rgce.is_empty() {
+            return Some(String::new());
+        }
+        ptg::decompile(Biff::V12, rgce, extra, Base::Shared(r, col), g)
+    };
+    dv.formula1 = formula(c)?;
+    dv.formula2 = formula(c)?;
+    if dv.kind == "list" {
+        dv.formula1 = super::dv_list_formula(dv.formula1);
+    }
+    Some(super::DvIn {
+        rule: dv,
+        base: (r, col),
+    })
+}
+
+/// A sheet part: its cells, column widths and merged cells (the name is
+/// the caller's).
 fn read_sheet(
     bytes: &[u8],
     g: &Globals,
     sst: &[String],
     book: &mut BookIn,
-    formats: &XfFormats,
-) -> Result<BTreeMap<(u32, u32), Cell>, OpenError> {
+    styles: &mut Styles,
+) -> Result<SheetIn, OpenError> {
+    let mut sheet = SheetIn::default();
     let mut cells = BTreeMap::new();
     let mut charged = 0usize;
     let mut row = 0u32;
@@ -529,6 +662,9 @@ fn read_sheet(
     // The last formula cell read: a BrtShrFmla's master, the cell its
     // members' ptgExp names (not necessarily the range's top-left).
     let mut last_formula: Option<(u32, u32)> = None;
+    // The conditional-formatting block whose rules follow: the index of the
+    // one just pushed, none after a block that wasn't (or its end).
+    let mut cf_open: Option<usize> = None;
     for (ty, body) in records(bytes) {
         let mut c = Cur::new(body);
         let _ = (|| -> Option<()> {
@@ -558,7 +694,7 @@ fn read_sheet(
                     };
                     let mut cell = Cell {
                         value,
-                        style: formats.format_of(style, book),
+                        style: styles.of(style, book),
                         ..Cell::default()
                     };
                     if ty >= 8 {
@@ -578,6 +714,90 @@ fn read_sheet(
                         }
                     }
                     cells.insert((row, col), cell);
+                }
+                // BrtWsFmtInfo: dxGCol (the default width, 1/256
+                // characters, 0xFFFFFFFF for none), cchDefColWidth (the
+                // base width, characters), miyDefRwHeight and flags.
+                BRT_WS_FMT_INFO => {
+                    let dx = c.u32()?;
+                    let base = c.u16()? as u32;
+                    sheet.base_col_width = (base != 8).then_some(base);
+                    // Excel writes the width the base gives (2194 for 8):
+                    // only another one is the sheet's own default.
+                    sheet.default_col_width = u16::try_from(dx)
+                        .ok()
+                        .filter(|&dx| !super::xls::is_default_coldx(sheet.base_col_width, None, dx))
+                        .map(|dx| dx as f64 / 256.0);
+                }
+                // BrtColInfo: colFirst, colLast, coldx (1/256 characters),
+                // ixfe, then flags: fHidden (bit 0), fUserSet (1),
+                // iOutLevel (8-10) and fCollapsed (12). Read as `.xls`'s
+                // COLINFO is: a width at the sheet's default without
+                // fUserSet is no width.
+                BRT_COL_INFO => {
+                    let (first, last, coldx) = (c.u32()?, c.u32()?, c.u32()?);
+                    c.u32()?;
+                    let flags = c.u16()?;
+                    let hidden = flags & 0x0001 != 0;
+                    let user = flags & 0x0002 != 0;
+                    let default = u16::try_from(coldx).is_ok_and(|dx| {
+                        super::xls::is_default_coldx(
+                            sheet.base_col_width,
+                            sheet.default_col_width,
+                            dx,
+                        )
+                    });
+                    let width = (user || !default).then_some(coldx as f64 / 256.0);
+                    let level = ((flags >> 8) & 0x0007) as u8;
+                    let collapsed = flags & 0x1000 != 0;
+                    let last = last.min(crate::sheet::MAX_COLS - 1);
+                    if (width.is_some() || hidden || level > 0 || collapsed) && first <= last {
+                        sheet.cols.push(ColIn {
+                            first,
+                            last,
+                            width,
+                            hidden,
+                            plain: width.is_some() && !user,
+                            level,
+                            collapsed,
+                        });
+                    }
+                }
+                BRT_DVAL => {
+                    if let Some(dv) = read_dval(&mut c, g) {
+                        sheet.validations.push(dv);
+                    }
+                }
+                // BrtBeginConditionalFormatting: ccf, fPivot, sqrfx. Its
+                // BrtBeginCFRules follow.
+                BRT_BEGIN_CONDITIONAL_FORMATTING => {
+                    cf_open = None;
+                    c.take(8)?;
+                    let ranges = sqrfx(&mut c)?;
+                    // Based, as BIFF8's CONDFMT, at the ranges' bounds'
+                    // top-left.
+                    if let Some(base) = super::anchor_of(&ranges) {
+                        sheet.cond_formats.push(super::CfIn {
+                            ranges,
+                            rules: Vec::new(),
+                            base,
+                        });
+                        cf_open = Some(sheet.cond_formats.len() - 1);
+                    }
+                }
+                BRT_END_CONDITIONAL_FORMATTING => cf_open = None,
+                BRT_BEGIN_CF_RULE => {
+                    let cf = sheet.cond_formats.get_mut(cf_open?)?;
+                    let rule = read_cf_rule(&mut c, cf.base, styles, g)?;
+                    cf.rules.push(rule);
+                }
+                // BrtMergeCell: an RfX (rwFirst, rwLast, colFirst,
+                // colLast).
+                BRT_MERGE_CELL => {
+                    let (r1, r2, c1, c2) = (c.u32()?, c.u32()?, c.u32()?, c.u32()?);
+                    if r2 >= r1 && c2 >= c1 && on_grid(r2, c2) {
+                        sheet.merges.push((r1, c1, r2, c2));
+                    }
                 }
                 BRT_SHR_FMLA | BRT_ARR_FMLA => {
                     let range = (c.u32()?, c.u32()?, c.u32()?, c.u32()?);
@@ -632,7 +852,8 @@ fn read_sheet(
             cell.formula = Some(f);
         }
     }
-    Ok(cells)
+    sheet.cells = cells;
+    Ok(sheet)
 }
 
 #[cfg(test)]
@@ -696,6 +917,17 @@ mod tests {
         sheet: &[Vec<u8>],
         links: &[(&str, Vec<u8>, &str)],
     ) -> Vec<u8> {
+        xlsb_with(workbook, sheet, links, Vec::new())
+    }
+
+    /// [`xlsb_links`] plus `extra` parts (name, bytes): `xl/styles.bin`,
+    /// a sheet's rels and what they name.
+    fn xlsb_with(
+        workbook: &[Vec<u8>],
+        sheet: &[Vec<u8>],
+        links: &[(&str, Vec<u8>, &str)],
+        extra: Vec<(String, Vec<u8>)>,
+    ) -> Vec<u8> {
         let mut bundle = vec![0u8; 8];
         bundle.extend(wide("rId1"));
         bundle.extend(wide("Data"));
@@ -725,6 +957,7 @@ mod tests {
         parts.push(("xl/workbook.bin".to_string(), wb));
         parts.push(("xl/_rels/workbook.bin.rels".to_string(), rels.into_bytes()));
         parts.push(("xl/worksheets/sheet1.bin".to_string(), sheet.concat()));
+        parts.extend(extra);
         opccore::zipwrite::write_zip(&parts)
     }
 
@@ -1331,5 +1564,715 @@ mod tests {
         let (pkg, fmt) = super::super::open_workbook(&bytes).unwrap();
         assert_eq!(fmt, super::super::SourceFormat::Xlsb);
         assert_eq!(pkg.workbook.sheets[0].name, "Data");
+    }
+
+    // --- #884: cell formats, column widths and merges -------------------
+
+    use crate::sheet::Xf;
+
+    use super::super::xlsb_style::{
+        BRT_BEGIN_BORDERS, BRT_BEGIN_CELL_XFS, BRT_BEGIN_FILLS, BRT_BEGIN_FONTS, BRT_BORDER,
+        BRT_END_BORDERS, BRT_END_CELL_XFS, BRT_END_FILLS, BRT_END_FONTS, BRT_FILL, BRT_FMT,
+        BRT_FONT, BRT_XF,
+    };
+
+    /// A BrtColor: automatic, RGB, indexed or theme (fValidRGB set).
+    pub(crate) fn auto_color() -> Vec<u8> {
+        vec![0x01, 0, 0, 0, 0, 0, 0, 0xFF]
+    }
+    pub(crate) fn rgb_color(r: u8, g: u8, b: u8) -> Vec<u8> {
+        vec![(2 << 1) | 1, 0, 0, 0, r, g, b, 0xFF]
+    }
+    pub(crate) fn indexed_color(i: u8) -> Vec<u8> {
+        vec![(1 << 1) | 1, i, 0, 0, 0, 0, 0, 0xFF]
+    }
+    pub(crate) fn theme_color(i: u8) -> Vec<u8> {
+        vec![(3 << 1) | 1, i, 0, 0, 0, 0, 0, 0xFF]
+    }
+
+    /// BrtFont as Excel writes it: dyHeight, grbit, bls, sss, uls,
+    /// bFamily, bCharSet, unused, brtColor, bFontScheme, name.
+    fn font(pt: u16, italic: bool, bold: bool, color: &[u8], name: &str) -> Vec<u8> {
+        let mut v = (pt * 20).to_le_bytes().to_vec();
+        v.extend((if italic { 2u16 } else { 0 }).to_le_bytes());
+        v.extend((if bold { 700u16 } else { 400 }).to_le_bytes());
+        v.extend([0, 0, 0, 2, 1, 0]);
+        v.extend_from_slice(color);
+        v.push(0);
+        v.extend(wide(name));
+        rec(BRT_FONT, &v)
+    }
+
+    /// BrtFill: fls, the foreground and background colours, then the
+    /// gradient fields (68 bytes, as Excel writes them).
+    fn fill(fls: u32, fore: &[u8]) -> Vec<u8> {
+        let mut v = fls.to_le_bytes().to_vec();
+        v.extend_from_slice(fore);
+        v.extend(indexed_color(65));
+        v.extend([0u8; 48]);
+        rec(BRT_FILL, &v)
+    }
+
+    /// BrtBorder: flags, then the top, bottom, left, right and diagonal
+    /// lines' dg, reserved and colour.
+    fn border(dg: [u8; 5]) -> Vec<u8> {
+        let mut v = vec![0u8];
+        for d in dg {
+            v.extend([d, 0]);
+            v.extend(auto_color());
+        }
+        rec(BRT_BORDER, &v)
+    }
+
+    /// BrtXF: ixfeParent, iFmt, iFont, iFill, ixBorder, trot, indent,
+    /// flags, xfGrbitAtr, unused.
+    fn xf(fmt: u16, font: u16, fill: u16, border: u16) -> Vec<u8> {
+        let mut v = 0u16.to_le_bytes().to_vec();
+        for n in [fmt, font, fill, border] {
+            v.extend(n.to_le_bytes());
+        }
+        v.extend([0, 0, 0x10, 0x10, 0, 0]);
+        rec(BRT_XF, &v)
+    }
+
+    /// A list of records between its begin and end records.
+    fn list(begin: u32, end: u32, items: &[Vec<u8>]) -> Vec<u8> {
+        let mut v = rec(begin, &(items.len() as u32).to_le_bytes());
+        for i in items {
+            v.extend_from_slice(i);
+        }
+        v.extend(rec(end, &[]));
+        v
+    }
+
+    /// A styles.bin: Excel's default font 0 (Calibri 11, theme 1) and
+    /// fills 0 and 1, then the fonts, fills, borders and cell XFs given.
+    fn styles(
+        fonts: &[Vec<u8>],
+        fills: &[Vec<u8>],
+        borders: &[Vec<u8>],
+        xfs: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut all_fonts = vec![font(11, false, false, &theme_color(1), "Calibri")];
+        all_fonts.extend_from_slice(fonts);
+        let mut all_fills = vec![fill(0, &indexed_color(64)), fill(17, &indexed_color(64))];
+        all_fills.extend_from_slice(fills);
+        let mut all_borders = vec![border([0; 5])];
+        all_borders.extend_from_slice(borders);
+        let mut all_xfs = vec![xf(0, 0, 0, 0)];
+        all_xfs.extend_from_slice(xfs);
+        let mut fmt = 164u16.to_le_bytes().to_vec();
+        fmt.extend(wide("0.000"));
+        [
+            rec(BRT_FMT, &fmt),
+            list(BRT_BEGIN_FONTS, BRT_END_FONTS, &all_fonts),
+            list(BRT_BEGIN_FILLS, BRT_END_FILLS, &all_fills),
+            list(BRT_BEGIN_BORDERS, BRT_END_BORDERS, &all_borders),
+            list(BRT_BEGIN_CELL_XFS, BRT_END_CELL_XFS, &all_xfs),
+        ]
+        .concat()
+    }
+
+    fn real(col: u32, style: u32, v: f64) -> Vec<u8> {
+        let mut b = cell(col, style);
+        b.extend(v.to_le_bytes());
+        rec(5, &b)
+    }
+
+    /// The model formats of the cells of row 0, by column.
+    fn row0_xfs(book: &BookIn) -> Vec<Xf> {
+        let cells = &book.sheets[0].cells;
+        (0..cells.len() as u32)
+            .map(|c| book.xfs[cells[&(0, c)].style as usize].clone())
+            .collect()
+    }
+
+    /// A BrtXF's font, fill and border become the cell's model format; a
+    /// patterned fill, a medium box and the default font are none of it.
+    #[test]
+    fn xlsb_fonts_fills_borders_into_xfs() {
+        let styles = styles(
+            &[
+                // 1: bold italic red 14pt Arial
+                font(14, true, true, &rgb_color(255, 0, 0), "Arial"),
+                // 2: Calibri 11 in theme colour 4 (accent 1)
+                font(11, false, false, &theme_color(4), "Calibri"),
+                // 3: Calibri 11 in black, as an RGB and indexed 8
+                font(11, false, false, &indexed_color(8), "Calibri"),
+            ],
+            &[
+                // 2: solid yellow; 3: a pattern in yellow; 4: solid theme
+                fill(1, &rgb_color(255, 255, 0)),
+                fill(2, &rgb_color(255, 255, 0)),
+                fill(1, &theme_color(5)),
+            ],
+            &[
+                // 1: a thin box; 2: a medium box; 3: three thin sides
+                border([1, 1, 1, 1, 0]),
+                border([2, 2, 2, 2, 0]),
+                border([1, 1, 1, 0, 0]),
+            ],
+            &[
+                xf(164, 1, 2, 1),
+                xf(0, 0, 3, 2),
+                xf(0, 2, 4, 3),
+                xf(0, 3, 0, 0),
+            ],
+        );
+        let book = open(&xlsb_with(
+            &[],
+            &[
+                rec(BRT_ROW_HDR, &0u32.to_le_bytes()),
+                real(0, 1, 1.0),
+                real(1, 2, 2.0),
+                real(2, 3, 3.0),
+                real(3, 4, 4.0),
+                real(4, 0, 5.0),
+                // A blank cell keeps its format too.
+                rec(1, &cell(5, 1)),
+            ],
+            &[],
+            vec![("xl/styles.bin".to_string(), styles)],
+        ));
+        let x = row0_xfs(&book);
+        assert!(x[0].bold && x[0].italic, "{:?}", x[0]);
+        assert_eq!(x[0].color, Some((255, 0, 0)));
+        assert_eq!(x[0].font_size, Some(14.0));
+        assert_eq!(x[0].font_name.as_deref(), Some("Arial"));
+        assert_eq!(x[0].fill, Some((255, 255, 0)));
+        assert!(x[0].border);
+        assert_eq!(x[0].code.as_deref(), Some("0.000"));
+        // A pattern isn't a solid fill; a medium box isn't a thin one.
+        assert_eq!(
+            (x[1].fill, x[1].fill_unresolved, x[1].border),
+            (None, false, false)
+        );
+        // Theme colours other than the default text colour are unresolved.
+        assert!(x[2].color_unresolved && x[2].fill_unresolved, "{:?}", x[2]);
+        assert_eq!((x[2].color, x[2].fill, x[2].border), (None, None, false));
+        // Black, the default font and the default XF are no format at all.
+        assert_eq!(x[3], Xf::default());
+        assert_eq!(x[4], Xf::default());
+        assert_eq!(book.sheets[0].cells[&(0, 4)].style, 0);
+        assert_eq!(x[5], x[0]);
+        // Each XF is made once.
+        assert_eq!(book.xfs.len(), 3);
+    }
+
+    /// BrtColInfo gives the column widths (a width at the default without
+    /// fUserSet is none), BrtWsFmtInfo the base width, BrtMergeCell merges.
+    #[test]
+    fn xlsb_col_widths_and_merges() {
+        let col_info = |first: u32, last: u32, coldx: u32, flags: u16| {
+            let mut v = first.to_le_bytes().to_vec();
+            v.extend(last.to_le_bytes());
+            v.extend(coldx.to_le_bytes());
+            v.extend(0u32.to_le_bytes());
+            v.extend(flags.to_le_bytes());
+            rec(BRT_COL_INFO, &v)
+        };
+        let mut fmt_info = 2194u32.to_le_bytes().to_vec();
+        fmt_info.extend(8u16.to_le_bytes());
+        fmt_info.extend(300u16.to_le_bytes());
+        fmt_info.extend([0, 0, 0, 0]);
+        let merge = |r1: u32, r2: u32, c1: u32, c2: u32| {
+            let v: Vec<u8> = [r1, r2, c1, c2]
+                .iter()
+                .flat_map(|n| n.to_le_bytes())
+                .collect();
+            rec(BRT_MERGE_CELL, &v)
+        };
+        let book = open(&xlsb(
+            &[],
+            &[
+                rec(BRT_WS_FMT_INFO, &fmt_info),
+                // B:C 20 characters, user set
+                col_info(1, 2, 20 * 256, 0x0002),
+                // D hidden, at the default width
+                col_info(3, 3, 2194, 0x0001),
+                // E at the default width: nothing
+                col_info(4, 4, 2194, 0),
+                // F wide but not user set: a plain width; outline level 1
+                col_info(5, 5, 12 * 256, 0x0100),
+                rec(BRT_ROW_HDR, &0u32.to_le_bytes()),
+                real(0, 0, 1.0),
+                merge(5, 6, 0, 2),
+                // Off the grid, or backwards: left out.
+                merge(0, 0, 3, 16384),
+                merge(4, 2, 0, 0),
+            ],
+        ));
+        let s = &book.sheets[0];
+        assert_eq!(s.base_col_width, None);
+        assert_eq!(s.default_col_width, None);
+        let cols: Vec<_> = s
+            .cols
+            .iter()
+            .map(|c| (c.first, c.last, c.width, c.hidden, c.plain, c.level))
+            .collect();
+        assert_eq!(
+            cols,
+            [
+                (1, 2, Some(20.0), false, false, 0),
+                (3, 3, None, true, false, 0),
+                (5, 5, Some(12.0), false, true, 1),
+            ]
+        );
+        assert_eq!(s.merges, [(5, 0, 6, 2)]);
+    }
+
+    /// The `.xlsb` of [`round_trip_xlsb`]: a formatted cell, a wide
+    /// column and a merge (later slices add to it).
+    fn feature_xlsb() -> Vec<u8> {
+        let mut styles = styles(
+            &[font(14, true, true, &rgb_color(255, 0, 0), "Arial")],
+            &[fill(1, &rgb_color(255, 255, 0))],
+            &[border([1, 1, 1, 1, 0])],
+            &[xf(0, 1, 2, 1)],
+        );
+        styles.extend(dxf_list());
+        let mut col = 1u32.to_le_bytes().to_vec();
+        col.extend(1u32.to_le_bytes());
+        col.extend((20 * 256u32).to_le_bytes());
+        col.extend(0u32.to_le_bytes());
+        col.extend(2u16.to_le_bytes());
+        let merge: Vec<u8> = [2u32, 3, 0, 1]
+            .iter()
+            .flat_map(|n| n.to_le_bytes())
+            .collect();
+        xlsb_with(
+            &[],
+            &[
+                rec(BRT_COL_INFO, &col),
+                rec(BRT_ROW_HDR, &0u32.to_le_bytes()),
+                real(0, 1, 1.0),
+                rec(BRT_MERGE_CELL, &merge),
+            ]
+            .into_iter()
+            .chain(dv_records())
+            .chain([rec(BRT_ROW_HDR, &1u32.to_le_bytes()), real(0, 0, 9.0)])
+            .chain(cf_records())
+            .collect::<Vec<_>>(),
+            &[],
+            [
+                vec![("xl/styles.bin".to_string(), styles)],
+                comments_parts(&["Ann"], &[(0, 1, 0, "a note")]),
+            ]
+            .concat(),
+        )
+    }
+
+    /// Opened, saved as `.xlsx` and reloaded, an `.xlsb` keeps what the
+    /// import read (#884: they were lost on save).
+    #[test]
+    fn round_trip_xlsb() {
+        let (pkg, _) = crate::legacy::open_workbook(&feature_xlsb()).unwrap();
+        let back = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        let wb = &back.workbook;
+        let s = &wb.sheets[0];
+        let style = s.cell(0, 0).unwrap().style;
+        let x = wb.styles.xf(style);
+        assert!(x.bold && x.italic, "{x:?}");
+        assert!(crate::legacy::saved_thin_box(&back, style));
+        assert_eq!(x.color, Some((255, 0, 0)));
+        assert_eq!(x.fill, Some((255, 255, 0)));
+        assert_eq!(x.font_size, Some(14.0));
+        assert_eq!(x.font_name.as_deref(), Some("Arial"));
+        let widths: Vec<_> = s.col_defs.iter().map(|d| (d.min, d.max, d.width)).collect();
+        assert_eq!(widths, [(1, 1, Some(20.0))]);
+        assert_eq!(s.merges, [(2, 0, 3, 1)]);
+        let notes: Vec<_> = back
+            .comments()
+            .into_iter()
+            .map(|c| (c.row, c.col, c.author, c.text))
+            .collect();
+        assert_eq!(notes, [(0, 1, "Ann".to_string(), "a note".to_string())]);
+        let got: Vec<_> = s
+            .validations
+            .iter()
+            .map(|d| (d.kind.as_str(), d.operator.as_str(), d.formula1.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("whole", "greaterThan", "5"),
+                ("list", "", "\"a,b,c\""),
+                ("custom", "", "A3>0"),
+                ("custom", "", "A3>0"),
+            ]
+        );
+        // The rules apply: A2's 9 makes B2 italic (`$A2>5`).
+        assert_eq!(wb.sheets[0].cond_formats.len(), 2);
+        assert_eq!(crate::cf::cell_dxf(wb, 0, 1, 1).unwrap().italic, Some(true));
+        assert!(crate::cf::cell_dxf(wb, 0, 2, 1).is_none());
+    }
+
+    /// The sheet rels and comments part of a sheet with these comments:
+    /// (row, col, author index, text), and the author list.
+    fn comments_parts(
+        authors: &[&str],
+        comments: &[(u32, u32, u32, &str)],
+    ) -> Vec<(String, Vec<u8>)> {
+        let mut v = Vec::new();
+        for a in authors {
+            v.extend(rec(BRT_COMMENT_AUTHOR, &wide(a)));
+        }
+        for &(row, col, iauth, text) in comments {
+            let mut b = iauth.to_le_bytes().to_vec();
+            for n in [row, row, col, col] {
+                b.extend(n.to_le_bytes());
+            }
+            b.extend([0; 16]);
+            v.extend(rec(BRT_BEGIN_COMMENT, &b));
+            let mut t = vec![0u8];
+            t.extend(wide(text));
+            v.extend(rec(BRT_COMMENT_TEXT, &t));
+            v.extend(rec(636, &[]));
+        }
+        vec![
+            (
+                "xl/worksheets/_rels/sheet1.bin.rels".to_string(),
+                br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments1.bin"/></Relationships>"#.to_vec(),
+            ),
+            ("xl/comments1.bin".to_string(), v),
+        ]
+    }
+
+    /// The comments part's comments: their cell, author and text.
+    #[test]
+    fn xlsb_comments() {
+        let book = open(&xlsb_with(
+            &[],
+            &[rec(BRT_ROW_HDR, &0u32.to_le_bytes()), real(0, 0, 1.0)],
+            &[],
+            comments_parts(
+                &["Ann", "Bob"],
+                &[
+                    (3, 1, 1, "Bob:\nsee this"),
+                    (0, 0, 0, "first"),
+                    (0, 16384, 0, "off"),
+                ],
+            ),
+        ));
+        assert_eq!(
+            book.sheets[0].comments,
+            [
+                (3, 1, "Bob".to_string(), "Bob:\nsee this".to_string()),
+                (0, 0, "Ann".to_string(), "first".to_string()),
+            ]
+        );
+    }
+
+    /// BrtDVal: flags, sqrfx, the error title, error, prompt title and
+    /// prompt, formula1 and formula2.
+    fn dval(
+        flags: u32,
+        ranges: &[(u32, u32, u32, u32)],
+        texts: [&str; 4],
+        f1: &[u8],
+        f2: &[u8],
+    ) -> Vec<u8> {
+        let mut b = flags.to_le_bytes().to_vec();
+        b.extend((ranges.len() as u32).to_le_bytes());
+        for &(r1, r2, c1, c2) in ranges {
+            for n in [r1, r2, c1, c2] {
+                b.extend(n.to_le_bytes());
+            }
+        }
+        for t in texts {
+            b.extend(wide(t));
+        }
+        for f in [f1, f2] {
+            b.extend((f.len() as u32).to_le_bytes());
+            b.extend_from_slice(f);
+            b.extend(0u32.to_le_bytes());
+        }
+        rec(BRT_DVAL, &b)
+    }
+
+    fn dv_records() -> Vec<Vec<u8>> {
+        // =A3>0 on C3:C4: ptgRefN (0 rows, -2 columns) and ptgRef (A3).
+        let ref_n = [0x2C, 0, 0, 0, 0, 0xFE, 0xFF, 0x1E, 0, 0, 0x0D];
+        let ref_a = [0x24, 2, 0, 0, 0, 0, 0xC0, 0x1E, 0, 0, 0x0D];
+        let mut list = vec![0x17, 5, 0];
+        for u in "a\0b\0c".encode_utf16() {
+            list.extend(u.to_le_bytes());
+        }
+        vec![
+            rec(573, &[0; 18]),
+            dval(
+                1 | (2 << 4) | (1 << 8) | (1 << 18) | (1 << 19) | (4 << 20),
+                &[(1, 4, 1, 1)],
+                ["Oops", "Too small", "Number", "More than 5"],
+                &[0x1E, 5, 0],
+                &[],
+            ),
+            dval(3 | (1 << 9), &[(0, 2, 0, 0)], ["", "", "", ""], &list, &[]),
+            dval(7, &[(2, 3, 2, 2)], ["", "", "", ""], &ref_n, &[]),
+            dval(7, &[(2, 3, 4, 4)], ["", "", "", ""], &ref_a, &[]),
+            rec(574, &[]),
+        ]
+    }
+
+    /// BrtDVal records are the sheet's validation rules.
+    #[test]
+    fn xlsb_dv_rules() {
+        use crate::sheet::AlertStyle;
+        let mut sheet = vec![rec(BRT_ROW_HDR, &0u32.to_le_bytes()), real(0, 0, 1.0)];
+        sheet.extend(dv_records());
+        let book = open(&xlsb(&[], &sheet));
+        let v = &super::super::placed_dvs(&book.sheets[0]);
+        assert_eq!(v.len(), 4);
+        assert_eq!(
+            (v[0].kind.as_str(), v[0].operator.as_str()),
+            ("whole", "greaterThan")
+        );
+        assert_eq!((v[0].formula1.as_str(), v[0].formula2.as_str()), ("5", ""));
+        assert_eq!(v[0].ranges, [(1, 1, 4, 1)]);
+        assert_eq!(
+            (v[0].error_title.as_str(), v[0].error.as_str()),
+            ("Oops", "Too small")
+        );
+        assert_eq!(
+            (v[0].prompt_title.as_str(), v[0].prompt.as_deref()),
+            ("Number", Some("More than 5"))
+        );
+        assert_eq!(v[0].error_style, AlertStyle::Information);
+        assert!(v[0].allow_blank && v[0].show_input && v[0].show_error);
+        assert_eq!(
+            (v[1].kind.as_str(), v[1].formula1.as_str()),
+            ("list", "\"a,b,c\"")
+        );
+        assert!(!v[1].show_dropdown && v[1].prompt.is_none());
+        assert_eq!(
+            (v[2].kind.as_str(), v[2].formula1.as_str()),
+            ("custom", "A3>0")
+        );
+        assert_eq!(v[3].formula1, "A3>0");
+    }
+
+    /// BrtDXF: flags, reserved, cprops, then each XFProp (type, cb, value).
+    fn dxf_rec(props: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut b = vec![0u8; 4];
+        b.extend((props.len() as u16).to_le_bytes());
+        for (ty, v) in props {
+            b.extend(ty.to_le_bytes());
+            b.extend(((v.len() + 4) as u16).to_le_bytes());
+            b.extend_from_slice(v);
+        }
+        rec(super::super::xlsb_style::BRT_DXF, &b)
+    }
+
+    /// A styles.bin with two differential formats: 0 bold red text on a
+    /// solid yellow fill (its background colour); 1 italic on a fill
+    /// pattern of none.
+    fn dxf_styles() -> Vec<u8> {
+        let mut v = styles(&[], &[], &[], &[]);
+        v.extend(dxf_list());
+        v
+    }
+
+    /// The BrtDXF list of [`dxf_styles`].
+    fn dxf_list() -> Vec<u8> {
+        use super::super::xlsb_style::{BRT_BEGIN_DXFS, BRT_END_DXFS};
+        list(
+            BRT_BEGIN_DXFS,
+            BRT_END_DXFS,
+            &[
+                dxf_rec(&[
+                    (0x00, vec![1]),
+                    (0x02, rgb_color(255, 255, 0)),
+                    (0x05, rgb_color(255, 0, 0)),
+                    (0x19, 700u16.to_le_bytes().to_vec()),
+                ]),
+                dxf_rec(&[
+                    (0x00, vec![0]),
+                    (0x02, rgb_color(0, 0, 255)),
+                    (0x1C, vec![1]),
+                ]),
+            ],
+        )
+    }
+
+    /// BrtBeginCFRule: iType, iTemplate, dxfId, iPri, iParam, reserved,
+    /// flags, cbFmla1..3, strParam, the formulas.
+    fn cf_rule(ty: u32, dxf: u32, param: u32, formulas: &[&[u8]]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for n in [ty, 0, dxf, 1, param, 0, 0] {
+            b.extend(n.to_le_bytes());
+        }
+        b.extend(0u16.to_le_bytes());
+        let parsed: Vec<Vec<u8>> = formulas
+            .iter()
+            .map(|f| {
+                let mut v = (f.len() as u32).to_le_bytes().to_vec();
+                v.extend_from_slice(f);
+                v.extend(0u32.to_le_bytes());
+                v
+            })
+            .collect();
+        for i in 0..3 {
+            b.extend((parsed.get(i).map_or(0, Vec::len) as u32).to_le_bytes());
+        }
+        b.extend(0xFFFF_FFFFu32.to_le_bytes());
+        for p in &parsed {
+            b.extend_from_slice(p);
+        }
+        rec(BRT_BEGIN_CF_RULE, &b)
+    }
+
+    /// The conditional formats of [`xlsb_cf_rules_and_dxfs`]: on B2:B5,
+    /// value > 5 (dxf 0), `$A2>5` (dxf 1, ptgRefN based at B2) and a
+    /// color scale the model doesn't hold; on D2:D3 `$A2>5` as ptgRef.
+    fn cf_records() -> Vec<Vec<u8>> {
+        let block = |ranges: &[(u32, u32, u32, u32)]| {
+            let mut b = vec![0u8; 8];
+            b.extend((ranges.len() as u32).to_le_bytes());
+            for &(r1, r2, c1, c2) in ranges {
+                for n in [r1, r2, c1, c2] {
+                    b.extend(n.to_le_bytes());
+                }
+            }
+            rec(BRT_BEGIN_CONDITIONAL_FORMATTING, &b)
+        };
+        let ref_n: &[u8] = &[0x2C, 0, 0, 0, 0, 0, 0x80, 0x1E, 5, 0, 0x0D];
+        let ref_a: &[u8] = &[0x24, 1, 0, 0, 0, 0, 0x80, 0x1E, 5, 0, 0x0D];
+        vec![
+            block(&[(1, 4, 1, 1)]),
+            cf_rule(1, 0, 5, &[&[0x1E, 5, 0]]),
+            rec(464, &[]),
+            cf_rule(2, 1, 0, &[ref_n]),
+            rec(464, &[]),
+            cf_rule(3, 0, 0, &[]),
+            rec(464, &[]),
+            rec(462, &[]),
+            block(&[(1, 2, 3, 3)]),
+            cf_rule(2, 1, 0, &[ref_a]),
+            rec(464, &[]),
+            rec(462, &[]),
+        ]
+    }
+
+    /// BrtBeginConditionalFormatting and BrtBeginCFRule records are the
+    /// sheet's conditional formats, with the BrtDXF their dxfId names.
+    #[test]
+    fn xlsb_cf_rules_and_dxfs() {
+        use crate::sheet::Dxf;
+        use crate::xlsx::NewCfRule;
+        let mut sheet = vec![rec(BRT_ROW_HDR, &0u32.to_le_bytes()), real(0, 0, 1.0)];
+        sheet.extend(cf_records());
+        let book = open(&xlsb_with(
+            &[],
+            &sheet,
+            &[],
+            vec![("xl/styles.bin".to_string(), dxf_styles())],
+        ));
+        let cf = &book.sheets[0].cond_formats;
+        assert_eq!(cf.len(), 2);
+        assert_eq!(cf[0].ranges, [(1, 1, 4, 1)]);
+        let expr = NewCfRule::Expression {
+            formula: "$A2>5".into(),
+        };
+        let italic = Dxf {
+            italic: Some(true),
+            ..Dxf::default()
+        };
+        assert_eq!(
+            cf[0].rules,
+            [
+                (
+                    NewCfRule::CellIs {
+                        op: "greaterThan".into(),
+                        formulas: vec!["5".into()],
+                    },
+                    Dxf {
+                        bold: Some(true),
+                        color: Some((255, 0, 0)),
+                        fill: Some((255, 255, 0)),
+                        ..Dxf::default()
+                    }
+                ),
+                (expr.clone(), italic.clone()),
+            ]
+        );
+        assert_eq!(cf[1].rules, [(expr, italic)]);
+    }
+
+    /// A rule after a block that wasn't kept (its ranges off the grid, or
+    /// cut short), or after a block's end, joins no other block (#884 r1).
+    #[test]
+    fn xlsb_cf_rules_join_only_their_block() {
+        let block = |r: u32, c: u32| {
+            let mut b = vec![0u8; 8];
+            b.extend(1u32.to_le_bytes());
+            for n in [r, r, c, c] {
+                b.extend(n.to_le_bytes());
+            }
+            rec(BRT_BEGIN_CONDITIONAL_FORMATTING, &b)
+        };
+        let gt = cf_rule(1, 0, 5, &[&[0x1E, 5, 0]]);
+        let sheet = vec![
+            rec(BRT_ROW_HDR, &0u32.to_le_bytes()),
+            real(0, 0, 1.0),
+            block(0, 0),
+            gt.clone(),
+            rec(462, &[]),
+            // After the end: no block.
+            gt.clone(),
+            // Off the grid, then cut short.
+            block(0, 16384),
+            gt.clone(),
+            rec(BRT_BEGIN_CONDITIONAL_FORMATTING, &[0; 4]),
+            gt,
+        ];
+        let book = open(&xlsb_with(
+            &[],
+            &sheet,
+            &[],
+            vec![("xl/styles.bin".to_string(), dxf_styles())],
+        ));
+        let cf = &book.sheets[0].cond_formats;
+        assert_eq!(cf.len(), 1);
+        assert_eq!(cf[0].rules.len(), 1);
+    }
+
+    /// As `.xls`'s: a DV based at its first range and a CF based at its
+    /// ranges' bounds both land at the least corner (#884 r2).
+    #[test]
+    fn xlsb_rules_are_anchored_at_their_least_corner() {
+        // ptgRefN (0, 0), relative both ways; ptgInt 0; ptgGt.
+        let here: &[u8] = &[0x2C, 0, 0, 0, 0, 0, 0xC0, 0x1E, 0, 0, 0x0D];
+        let ranges: [(u32, u32, u32, u32); 2] = [(4, 9, 3, 3), (1, 2, 1, 1)];
+        let mut block = vec![0u8; 8];
+        block.extend(2u32.to_le_bytes());
+        for &(r1, r2, c1, c2) in &ranges {
+            for n in [r1, r2, c1, c2] {
+                block.extend(n.to_le_bytes());
+            }
+        }
+        let sheet = vec![
+            rec(BRT_ROW_HDR, &1u32.to_le_bytes()),
+            real(1, 0, -1.0),
+            rec(BRT_ROW_HDR, &4u32.to_le_bytes()),
+            real(3, 0, 5.0),
+            dval(7, &ranges, ["", "", "", ""], here, &[]),
+            rec(BRT_BEGIN_CONDITIONAL_FORMATTING, &block),
+            cf_rule(2, 1, 0, &[here]),
+            rec(464, &[]),
+            rec(462, &[]),
+        ];
+        let bytes = xlsb_with(
+            &[],
+            &sheet,
+            &[],
+            vec![("xl/styles.bin".to_string(), dxf_styles())],
+        );
+        let (pkg, _) = crate::legacy::open_workbook(&bytes).unwrap();
+        let back = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        let wb = &back.workbook;
+        assert_eq!(wb.sheets[0].validations[0].formula1, "B2>0");
+        assert_eq!(crate::validation::invalid_cells(wb, 0, None), [(1, 1)]);
+        assert!(crate::cf::cell_dxf(wb, 0, 4, 3).is_some());
+        assert!(crate::cf::cell_dxf(wb, 0, 1, 1).is_none());
     }
 }

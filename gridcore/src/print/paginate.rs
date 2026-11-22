@@ -184,6 +184,13 @@ pub fn width_px(w: f64) -> f64 {
     ((256.0 * w + (128.0 / MDW).trunc()) / 256.0 * MDW).trunc()
 }
 
+/// The stored column width whose [`width_px`] is `px` (rounded to whole
+/// pixels first): the width an import gives a column it knows in pixels
+/// (#884).
+pub fn width_of_px(px: f64) -> f64 {
+    (px.round().max(0.0) / MDW * 256.0).trunc() / 256.0
+}
+
 /// Pixels of a column with no width of its own.
 fn default_col_px(sheet: &Sheet) -> f64 {
     match sheet.format.default_col_width {

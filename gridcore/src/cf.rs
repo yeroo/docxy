@@ -86,12 +86,7 @@ fn matching_rules(wb: &Workbook, sheet: usize, row: u32, col: u32) -> Vec<(i32, 
             continue;
         }
         // The anchor for relative-reference shifting is the block's top-left.
-        let anchor = cf
-            .ranges
-            .iter()
-            .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, ..)| {
-                (r.min(r1), c.min(c1))
-            });
+        let anchor = crate::validation::anchor_of(&cf.ranges);
         for rule in &cf.rules {
             let Some(d) = rule.dxf_id.and_then(|i| wb.styles.dxfs.get(i)) else {
                 continue;
@@ -420,12 +415,7 @@ impl<'a> Icons<'a> {
         };
         let nums = self.numbers(i);
         let (lo, hi) = (*nums.first()?, *nums.last()?);
-        let anchor = s.cond_formats[i]
-            .ranges
-            .iter()
-            .fold((u32::MAX, u32::MAX), |(r, c), &(r1, c1, ..)| {
-                (r.min(r1), c.min(c1))
-            });
+        let anchor = crate::validation::anchor_of(&s.cond_formats[i].ranges);
         let threshold = |c: &crate::sheet::Cfvo| -> Option<f64> {
             let num = || match c.val.trim().parse::<f64>() {
                 Ok(n) => Some(n),
