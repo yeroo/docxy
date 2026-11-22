@@ -22,6 +22,7 @@ use crate::json::{self, Value};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A Microsoft Graph REST client bound to one base URL and access token.
 pub struct GraphClient {
@@ -30,6 +31,172 @@ pub struct GraphClient {
     /// The user ids found by address (#2158), shared by every client built
     /// with the same [`UserIds`] (`with_user_ids`).
     user_ids: UserIds,
+    /// Graph's clock as last read off a response's `Date` (#2121), shared
+    /// by every client built with the same [`ServerClock`]
+    /// (`with_server_clock`).
+    server_clock: ServerClock,
+}
+
+/// Graph's clock as this client last saw it (#2121): the offset between
+/// this client's wall clock and the `Date` header of Graph's latest 2xx
+/// answer, so a folder-wide op's cutoff (`receivedDateTime le`) is taken on
+/// Graph's clock and a client clock ahead of Exchange's cannot pull mail
+/// delivered after the command inside it. Cloning shares the one reading:
+/// the sync engine keeps one for its run and hands it to every client it
+/// builds. The latest reading wins (not the smallest offset), so a client
+/// clock stepped since shows at the next answer.
+///
+/// Only a 2xx measures: a proxy's or captive portal's own error page
+/// carries that box's `Date`. The estimate never runs ahead of Graph's
+/// clock: `Date` is truncated to the second and stamped before the answer
+/// travels back, and the receipt time is rounded up (`clock_offset`).
+#[derive(Debug, Clone, Default)]
+pub struct ServerClock(Arc<Mutex<Option<ClockReading>>>);
+
+/// One reading of Graph's clock: `offset` is this client's wall clock
+/// minus Graph's, in seconds (negative when the client is behind).
+/// `anchor` is the `Date` and the monotonic instant it was received at,
+/// for a reading taken in this run; `None` for one seeded from the store.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ClockReading {
+    offset: i64,
+    anchor: Option<(i64, Instant)>,
+}
+
+impl ServerClock {
+    /// Seeds the clock with an offset kept from an earlier run (the
+    /// store's `graph_clock_offset`), with no anchor: the next answer's
+    /// reading replaces it.
+    pub fn seed(&self, offset: i64) {
+        *self.reading() = Some(ClockReading {
+            offset,
+            anchor: None,
+        });
+    }
+
+    /// The offset of the latest reading, `None` before any.
+    pub fn offset(&self) -> Option<i64> {
+        self.reading().map(|r| r.offset)
+    }
+
+    /// Graph's clock now, as Unix seconds: this client's clock when no
+    /// reading was ever taken (`graph_now`).
+    pub fn now_secs(&self) -> i64 {
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        graph_now(
+            *self.reading(),
+            i64::try_from(wall).unwrap_or(i64::MAX),
+            Instant::now(),
+        )
+    }
+
+    /// Records the `Date` of an answer received at `wall` (since the epoch)
+    /// and `mono`.
+    fn record(&self, wall: Duration, mono: Instant, date_secs: i64) {
+        *self.reading() = Some(ClockReading {
+            offset: clock_offset(wall, date_secs),
+            anchor: Some((date_secs, mono)),
+        });
+    }
+
+    /// The reading, a poisoned lock taken over (a plain value: never
+    /// half-written).
+    fn reading(&self) -> MutexGuard<'_, Option<ClockReading>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// This client's clock minus Graph's, from an answer received at `receipt`
+/// (since the epoch) whose `Date` is `date_secs`: the receipt rounded up to
+/// the whole second, as `Date` is truncated to it and stamped before the
+/// answer left, so the offset is never smaller than the real one.
+fn clock_offset(receipt: Duration, date_secs: i64) -> i64 {
+    let up = u64::from(receipt.subsec_nanos() > 0);
+    i64::try_from(receipt.as_secs() + up)
+        .unwrap_or(i64::MAX)
+        .saturating_sub(date_secs)
+}
+
+/// Graph's clock at wall time `wall` (Unix seconds) and monotonic instant
+/// `mono`, from `reading`: the wall clock less the offset, bounded by the
+/// reading's `Date` plus the monotonic time since it came, so a wall clock
+/// stepped forward since the reading cannot move it ahead (the monotonic
+/// term only lags, across a suspend: the safe side). A seeded reading has
+/// the wall term alone; no reading is the wall clock itself.
+fn graph_now(reading: Option<ClockReading>, wall: i64, mono: Instant) -> i64 {
+    let Some(r) = reading else { return wall };
+    let by_wall = wall.saturating_sub(r.offset);
+    match r.anchor {
+        Some((date, at)) => {
+            let since = mono.saturating_duration_since(at).as_secs();
+            by_wall.min(date.saturating_add(i64::try_from(since).unwrap_or(i64::MAX)))
+        }
+        None => by_wall,
+    }
+}
+
+/// An HTTP `Date` in the IMF-fixdate form (`Sun, 06 Nov 1994 08:49:37
+/// GMT`, RFC 9110 §5.6.7) as Unix seconds; `None` for any other form (the
+/// obsolete RFC 850 and asctime ones too) or a date that does not exist.
+/// The weekday must be a weekday's name but need not match the date.
+fn parse_http_date(s: &str) -> Option<i64> {
+    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let b = s.as_bytes();
+    if b.len() != 29
+        || &b[3..5] != b", "
+        || b[7] != b' '
+        || b[11] != b' '
+        || b[16] != b' '
+        || b[19] != b':'
+        || b[22] != b':'
+        || &b[25..] != b" GMT"
+    {
+        return None;
+    }
+    if !DAYS.contains(&s.get(0..3)?) {
+        return None;
+    }
+    let month = MONTHS.iter().position(|m| Some(*m) == s.get(8..11))? + 1;
+    let digits = |r: std::ops::Range<usize>| {
+        let t = s.get(r)?;
+        t.bytes().all(|c| c.is_ascii_digit()).then_some(t)
+    };
+    let iso = format!(
+        "{}-{month:02}-{}T{}:{}:{}Z",
+        digits(12..16)?,
+        digits(5..7)?,
+        digits(17..19)?,
+        digits(20..22)?,
+        digits(23..25)?,
+    );
+    crate::store::iso8601_to_unix_secs(&iso)
+}
+
+/// `secs` as an IMF-fixdate `Date` (`Sun, 06 Nov 1994 08:49:37 GMT`), for
+/// tests whose fake Graph runs on another clock (#2121).
+#[cfg(test)]
+pub(crate) fn http_date(secs: i64) -> String {
+    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    // 1970-01-01 was a Thursday.
+    let weekday = DAYS[usize::try_from((secs.div_euclid(86400) + 3).rem_euclid(7)).unwrap()];
+    let iso = crate::store::unix_secs_to_iso8601(secs);
+    let month: usize = iso[5..7].parse().unwrap();
+    format!(
+        "{weekday}, {} {} {} {} GMT",
+        &iso[8..10],
+        MONTHS[month - 1],
+        &iso[0..4],
+        &iso[11..19]
+    )
 }
 
 /// The user ids found for e-mail addresses (#2158), kept so an address is
@@ -987,7 +1154,16 @@ impl GraphClient {
             base: base.trim_end_matches('/').to_string(),
             token: access_token.to_string(),
             user_ids: UserIds::default(),
+            server_clock: ServerClock::default(),
         }
+    }
+
+    /// This client with `clock` as its [`ServerClock`] (#2121): each 2xx
+    /// answer's `Date` becomes the latest reading every client given the
+    /// same clock sees.
+    pub fn with_server_clock(mut self, clock: ServerClock) -> Self {
+        self.server_clock = clock;
+        self
     }
 
     /// This client with `ids` as its [`UserIds`] (#2158), shared with every
@@ -3582,9 +3758,25 @@ impl GraphClient {
         };
 
         match result {
-            Ok(resp) => Ok(resp),
+            Ok(resp) => {
+                self.measure_clock(&resp);
+                Ok(resp)
+            }
             Err(ureq::Error::Status(status, resp)) => Err(classify_status(status, resp)),
             Err(ureq::Error::Transport(t)) => Err(GraphError::Transport(t.to_string())),
+        }
+    }
+
+    /// Reads Graph's clock off a 2xx answer's `Date` (#2121) into the
+    /// shared [`ServerClock`]; an answer without one, or with another form,
+    /// measures nothing.
+    fn measure_clock(&self, resp: &ureq::Response) {
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let mono = Instant::now();
+        if let Some(date) = resp.header("Date").and_then(parse_http_date) {
+            self.server_clock.record(wall, mono, date);
         }
     }
 
@@ -4378,6 +4570,180 @@ mod tests {
     use super::*;
     use crate::graph::model::{Importance, MeetingMessageType, MeetingRequestType, MemberKind};
     use crate::testserver::{FakeServer, RecordedRequest, Route};
+
+    #[test]
+    fn parse_http_date_reads_imf_fixdate_only() {
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        // The weekday is a weekday's name, not checked against the date.
+        assert_eq!(
+            parse_http_date("Mon, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        assert_eq!(
+            parse_http_date("Sun, 22 Nov 2026 03:30:46 GMT"),
+            crate::store::iso8601_to_unix_secs("2026-11-22T03:30:46Z")
+        );
+        for bad in [
+            "",
+            "garbage",
+            // RFC 850 and asctime, obsolete forms.
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+            "Sun Nov  6 08:49:37 1994",
+            // Not GMT, not a weekday, not a month, not digits.
+            "Sun, 06 Nov 1994 08:49:37 UTC",
+            "Xyz, 06 Nov 1994 08:49:37 GMT",
+            "Sun, 06 Foo 1994 08:49:37 GMT",
+            "Sun, 0x Nov 1994 08:49:37 GMT",
+            "Sun, +6 Nov 1994 08:49:37 GMT",
+            // No such date or time.
+            "Sun, 31 Nov 1994 08:49:37 GMT",
+            "Sun, 06 Nov 1994 24:49:37 GMT",
+            "Sun, 06 Nov 1994 08:60:37 GMT",
+            // Extra text.
+            "Sun, 06 Nov 1994 08:49:37 GMT ",
+        ] {
+            assert_eq!(parse_http_date(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn http_date_formats_what_parse_http_date_reads() {
+        assert_eq!(http_date(784_111_777), "Sun, 06 Nov 1994 08:49:37 GMT");
+        for secs in [0, 951_782_400, 1_795_000_000] {
+            assert_eq!(parse_http_date(&http_date(secs)), Some(secs));
+        }
+    }
+
+    #[test]
+    fn clock_offset_rounds_the_receipt_up() {
+        let date = 1_000_000;
+        // A receipt on an exact second is not rounded.
+        assert_eq!(clock_offset(Duration::from_secs(1_003_600), date), 3600);
+        // A fractional one is rounded up: `Date` is truncated and was
+        // stamped before the answer left, so the offset never comes out
+        // smaller than the real one.
+        assert_eq!(clock_offset(Duration::new(1_003_600, 1), date), 3601);
+        assert_eq!(
+            clock_offset(Duration::new(1_003_600, 999_999_999), date),
+            3601
+        );
+        // A client behind Graph: a negative offset.
+        assert_eq!(clock_offset(Duration::new(999_000, 500), date), -999);
+    }
+
+    #[test]
+    fn graph_now_is_bounded_by_the_monotonic_term() {
+        let date = 1_000_000;
+        let at = Instant::now();
+        let measured = Some(ClockReading {
+            offset: 100,
+            anchor: Some((date, at)),
+        });
+        let later = at + Duration::from_secs(10);
+        // No reading: the wall clock itself.
+        assert_eq!(graph_now(None, 5_000, later), 5_000);
+        // Ten seconds on, both terms agree.
+        assert_eq!(graph_now(measured, date + 100 + 10, later), date + 10);
+        // A wall clock stepped 500 s forward since the reading does not
+        // move Graph's clock ahead: the monotonic term bounds it.
+        assert_eq!(graph_now(measured, date + 100 + 510, later), date + 10);
+        // A wall clock stepped back is followed (the earlier is safe).
+        assert_eq!(graph_now(measured, date + 100 - 50, later), date - 50);
+        // A seeded reading has no anchor: the wall term alone.
+        let seeded = Some(ClockReading {
+            offset: 100,
+            anchor: None,
+        });
+        assert_eq!(graph_now(seeded, date + 610, later), date + 510);
+        // A negative offset (client behind Graph) moves the clock forward.
+        let behind = Some(ClockReading {
+            offset: -60,
+            anchor: Some((date, at)),
+        });
+        assert_eq!(graph_now(behind, date - 60 + 10, later), date + 10);
+    }
+
+    /// A route answering `/me/mailFolders` with `status` and a `Date` `skew`
+    /// seconds behind this client's clock.
+    fn dated_folders_route(status: u16, skew: i64) -> Route {
+        let now = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        Route {
+            method: "GET".into(),
+            path_prefix: "/me/mailFolders".into(),
+            status,
+            headers: vec![("Date".into(), http_date(now - skew))],
+            body: r#"{"value":[]}"#.into(),
+        }
+    }
+
+    #[test]
+    fn send_records_the_graph_clock_offset() {
+        let srv = FakeServer::start(vec![dated_folders_route(200, 3600)]);
+        let clock = ServerClock::default();
+        let c = GraphClient::new(&srv.base_url, "AT").with_server_clock(clock.clone());
+        assert_eq!(clock.offset(), None);
+        c.list_folders().unwrap();
+        let offset = clock.offset().expect("measured");
+        assert!((3600..=3602).contains(&offset), "{offset}");
+        // Graph's clock now is an hour behind this client's.
+        let wall = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap();
+        let graph = clock.now_secs();
+        assert!(
+            (wall - 3602..=wall - 3599).contains(&graph),
+            "{graph} vs {wall}"
+        );
+        // A clone shares the reading; a client without one measures alone.
+        let other = ServerClock::default();
+        GraphClient::new(&srv.base_url, "AT")
+            .with_server_clock(other.clone())
+            .list_folders()
+            .unwrap();
+        assert!(other.offset().is_some());
+        GraphClient::new(&srv.base_url, "AT")
+            .list_folders()
+            .unwrap();
+        assert_eq!(clock.offset(), Some(offset));
+    }
+
+    #[test]
+    fn a_status_error_measures_nothing() {
+        // A proxy's or portal's own error page carries its own `Date`.
+        let srv = FakeServer::start(vec![dated_folders_route(503, -3600)]);
+        let clock = ServerClock::default();
+        clock.seed(7);
+        let c = GraphClient::new(&srv.base_url, "AT").with_server_clock(clock.clone());
+        assert!(matches!(
+            c.list_folders(),
+            Err(GraphError::Throttled { .. })
+        ));
+        assert_eq!(clock.offset(), Some(7));
+        // Nor does an answer without a `Date`, or with another form.
+        let srv = FakeServer::start(vec![Route {
+            method: "GET".into(),
+            path_prefix: "/me/mailFolders".into(),
+            status: 200,
+            headers: vec![("Date".into(), "Sunday, 06-Nov-94 08:49:37 GMT".into())],
+            body: r#"{"value":[]}"#.into(),
+        }]);
+        let c = GraphClient::new(&srv.base_url, "AT").with_server_clock(clock.clone());
+        c.list_folders().unwrap();
+        assert_eq!(clock.offset(), Some(7));
+    }
 
     #[test]
     fn list_folders_parses() {
