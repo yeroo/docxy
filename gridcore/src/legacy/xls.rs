@@ -1011,6 +1011,10 @@ fn read_sheet(
     let mut note_obj: Option<u16> = None;
     let mut note_text: HashMap<u16, String> = HashMap::new();
     let mut notes: Vec<(u16, u16, u16, String)> = Vec::new();
+    // A CONDFMT whose ranges read was just read: the CFs after it are its,
+    // kept with their block's index.
+    let mut cf_open = false;
+    let mut cf_recs: Vec<(usize, &Rec)> = Vec::new();
 
     let mut put = |cells: &mut BTreeMap<(u32, u32), Cell>,
                    r: u16,
@@ -1466,7 +1470,40 @@ fn read_sheet(
                     let author = c.xl_string().unwrap_or_default();
                     notes.push((rw, col, id, author));
                 }
-                0x01B0 | 0x01B1 | 0x0879 | 0x087A => {
+                // CONDFMT ([MS-XLS] 2.4.56): ccf, flags, refBound (a
+                // Ref8U), then the sqref (SqRefU). Its CF records follow.
+                0x01B0 => {
+                    cf_open = false;
+                    c.take(12)?;
+                    let n = c.u16()?;
+                    let mut ranges = Vec::new();
+                    for _ in 0..n {
+                        let (r1, r2, c1, c2) = (c.u16()?, c.u16()?, c.u16()?, c.u16()?);
+                        let (r1, r2, c1, c2) = (r1 as u32, r2 as u32, c1 as u32, c2 as u32);
+                        if r2 >= r1 && c2 >= c1 && on_grid(r2, c2) {
+                            ranges.push((r1, c1, r2, c2));
+                        }
+                    }
+                    if !ranges.is_empty() {
+                        sheet.cond_formats.push(super::CfIn {
+                            ranges,
+                            rules: Vec::new(),
+                        });
+                        cf_open = true;
+                    }
+                }
+                // CF ([MS-XLS] 2.4.42): a rule of the CONDFMT before it,
+                // read once the cells are (their XFs' styles are borrowed
+                // until then).
+                0x01B1 => match sheet.cond_formats.len().checked_sub(1) {
+                    Some(k) if cf_open => cf_recs.push((k, r)),
+                    _ => {
+                        book.dropped.insert("conditional formatting");
+                    }
+                },
+                // CONDFMT12, CF12 and CFEX: Excel 2007's rules and what
+                // they add to a CF, which the model doesn't hold.
+                0x0879..=0x087B => {
                     book.dropped.insert("conditional formatting");
                 }
                 // DV ([MS-XLS] 2.4.123): dwDvFlags, the prompt title,
@@ -1578,6 +1615,16 @@ fn read_sheet(
         }
     }
     sheet.cells = cells;
+    // A CF the model doesn't hold (or that doesn't read) is named.
+    for (k, r) in cf_recs {
+        let cf = &mut sheet.cond_formats[k];
+        match read_cf(&mut Cur::new(r), cf.ranges[0], styles, g) {
+            Some(rule) => cf.rules.push(rule),
+            None => {
+                book.dropped.insert("conditional formatting");
+            }
+        }
+    }
     // A note whose text wasn't found is named.
     for (rw, col, id, author) in notes {
         match note_text.remove(&id) {
@@ -1593,6 +1640,100 @@ fn read_sheet(
         book.iterate = Some((calc_count.unwrap_or(100) as u32, delta.unwrap_or(0.001)));
     }
     Ok(sheet)
+}
+
+/// A CF record's rule: ct (1 cellIs, 2 expression), cp (the operator),
+/// cce1, cce2, the DXFN, then rgce1 and rgce2, their relative references
+/// based at the block's first range's top-left. `None` for one that
+/// doesn't read or that the model doesn't hold.
+fn read_cf(
+    c: &mut Cur,
+    at: (u32, u32, u32, u32),
+    styles: &Styles,
+    g: &Globals,
+) -> Option<(crate::sheet::CfKind, crate::sheet::Dxf)> {
+    use crate::sheet::CfKind;
+    let (ct, cp) = (c.u8()?, c.u8()?);
+    let (cce1, cce2) = (c.u16()? as usize, c.u16()? as usize);
+    let dxf = read_dxfn(c, styles)?;
+    let (rgce1, rgce2) = (c.take(cce1)?, c.take(cce2)?);
+    let base = Base::Shared(at.0, at.1);
+    let decompile = |rgce: &[u8]| ptg::decompile(Biff::V8, rgce, &[], base, g);
+    let kind = match ct {
+        1 => {
+            let mut formulas = vec![decompile(rgce1)?];
+            if cce2 > 0 {
+                formulas.push(decompile(rgce2)?);
+            }
+            CfKind::CellIs {
+                op: super::cf_operator(cp as u32)?.to_string(),
+                formulas,
+            }
+        }
+        2 => CfKind::Expression {
+            formula: decompile(rgce1)?,
+        },
+        _ => return None,
+    };
+    Some((kind, dxf))
+}
+
+/// A DXFN ([MS-XLS] 2.5.86): its flags (the ninch bits say what is not
+/// set; ibitAtrNum, Fnt, Alc, Bdr, Pat and Prot which blocks follow), then
+/// those blocks in that order. The model's differential format holds the
+/// font's weight, italic and colour (DXFFntD, 118 bytes: the Stxp at 64,
+/// icvFore at 80, tsNinch at 88, fBlsNinch at 100) and a solid fill
+/// (DXFPat: fls, icvForeground, icvBackground). A conditional format's
+/// solid fill is its background colour, as an `.xlsx` dxf's `<bgColor>`.
+fn read_dxfn(c: &mut Cur, styles: &Styles) -> Option<crate::sheet::Dxf> {
+    let flags = c.u32()?;
+    let user_fmt = c.u16()? & 0x0001 != 0;
+    let on = |bit: u32| flags & (1 << bit) != 0;
+    let mut d = crate::sheet::Dxf::default();
+    if on(25) {
+        // DXFNumUsr (cb, then the code) or DXFNumIfmt (2 bytes).
+        if user_fmt {
+            let cb = c.u16()? as usize;
+            c.take(cb.checked_sub(2)?)?;
+        } else {
+            c.take(2)?;
+        }
+    }
+    if on(26) {
+        let f = c.take(118)?;
+        let u32_at = |i: usize| u32::from_le_bytes([f[i], f[i + 1], f[i + 2], f[i + 3]]);
+        let (ts, bls) = (u32_at(68), u16::from_le_bytes([f[72], f[73]]));
+        if u32_at(88) & 0x0002 == 0 {
+            d.italic = Some(ts & 0x0002 != 0);
+        }
+        if u32_at(100) == 0 {
+            d.bold = Some(bls >= 600);
+        }
+        let icv = u32_at(80);
+        if icv != 0xFFFF_FFFF {
+            d.color = styles.rgb(icv as u16);
+        }
+    }
+    if on(27) {
+        c.take(8)?;
+    }
+    if on(28) {
+        c.take(8)?;
+    }
+    if on(29) {
+        let fls = (c.u16()? >> 10) & 0x3F;
+        let icvs = c.u16()?;
+        let (fore, back) = (icvs & 0x7F, (icvs >> 7) & 0x7F);
+        let (pattern_set, fore_set, back_set) = (!on(16), !on(17), !on(18));
+        // Excel's rule (as LibreOffice reads it): a background colour with
+        // no pattern, or a solid one, is the solid fill's colour.
+        if back_set && (!pattern_set || fls == 1) {
+            d.fill = styles.rgb(back);
+        } else if fore_set && pattern_set && fls == 1 {
+            d.fill = styles.rgb(fore);
+        }
+    }
+    Some(d)
 }
 
 /// A DV record's rule (see the reader's arm for its layout); `None` when it
@@ -3690,6 +3831,8 @@ pub(crate) mod tests {
         sheet.extend(note_object(1, "a note", ""));
         sheet.push(note(0, 1, 1, "Ann"));
         sheet.extend(dv_sheet());
+        sheet.extend([number(2, 1, 7.0), number(3, 0, 9.0)]);
+        sheet.extend(cf_sheet());
         let stream = workbook(&[], &sheet);
         opccore::cfb::write_cfb_tree(&[opccore::cfb::Node::Stream("Workbook", stream)])
     }
@@ -3724,6 +3867,19 @@ pub(crate) mod tests {
         );
         assert_eq!(v[0].prompt.as_deref(), Some("Enter 1-10"));
         assert!(v[0].show_error && !v[1].show_dropdown);
+        // B3 (7 > 5) is bold red on yellow; B4 ($A4 is 9) red; B2 neither.
+        let wb = &back.workbook;
+        assert_eq!(wb.sheets[0].cond_formats.len(), 2);
+        let d = crate::cf::cell_dxf(wb, 0, 2, 1).unwrap();
+        assert_eq!(
+            (d.bold, d.color, d.fill),
+            (Some(true), Some((255, 0, 0)), Some((255, 255, 0)))
+        );
+        assert_eq!(
+            crate::cf::cell_dxf(wb, 0, 3, 1).unwrap().fill,
+            Some((255, 0, 0))
+        );
+        assert!(crate::cf::cell_dxf(wb, 0, 1, 1).is_none());
     }
 
     /// DV: dwDvFlags, the prompt title, error title, prompt and error (a
@@ -3841,6 +3997,155 @@ pub(crate) mod tests {
         assert_eq!(
             book.dropped.iter().copied().collect::<Vec<_>>(),
             ["data validation"]
+        );
+    }
+
+    /// A DXFN as Excel writes one: every alignment, border and protection
+    /// bit not in charge, then a DXFFntD when `font` is given (bold, the
+    /// colour index; italic, size, underline and the rest not in charge)
+    /// and a DXFPat when `pattern` is (fls, or `None` not in charge, and
+    /// the background colour index).
+    fn dxfn(font: Option<(bool, u32)>, pattern: Option<(Option<u16>, u16)>) -> Vec<u8> {
+        let mut flags: u32 = 0xFFFF | (1 << 17) | (1 << 19) | (1 << 20);
+        if font.is_some() {
+            flags |= 1 << 26;
+        }
+        match pattern {
+            Some((None, _)) => flags |= (1 << 16) | (1 << 29),
+            Some(_) => flags |= 1 << 29,
+            None => flags |= (1 << 16) | (1 << 18),
+        }
+        let mut b = flags.to_le_bytes().to_vec();
+        b.extend(0x8000u16.to_le_bytes());
+        if let Some((bold, icv)) = font {
+            let mut f = vec![0u8; 118];
+            f[64..68].copy_from_slice(&u32::MAX.to_le_bytes());
+            f[72..74].copy_from_slice(&(if bold { 700u16 } else { 400 }).to_le_bytes());
+            f[80..84].copy_from_slice(&icv.to_le_bytes());
+            // italic and strikeout not in charge; sss and uls neither
+            f[88..92].copy_from_slice(&0x82u32.to_le_bytes());
+            f[92..96].copy_from_slice(&1u32.to_le_bytes());
+            f[96..100].copy_from_slice(&1u32.to_le_bytes());
+            f[108..116].copy_from_slice(&[0xFF; 8]);
+            f[116..118].copy_from_slice(&1u16.to_le_bytes());
+            b.extend(f);
+        }
+        if let Some((fls, back)) = pattern {
+            b.extend((fls.unwrap_or(0) << 10).to_le_bytes());
+            b.extend((64u16 | (back << 7)).to_le_bytes());
+        }
+        b
+    }
+
+    /// CONDFMT over `ranges` (r1, r2, c1, c2) with `ccf` rules.
+    fn condfmt(ccf: u16, ranges: &[(u16, u16, u16, u16)]) -> Vec<u8> {
+        let mut b = ccf.to_le_bytes().to_vec();
+        b.extend(1u16.to_le_bytes());
+        let &(r1, r2, c1, c2) = ranges.first().unwrap();
+        for n in [r1, r2, c1, c2] {
+            b.extend(n.to_le_bytes());
+        }
+        b.extend((ranges.len() as u16).to_le_bytes());
+        for &(r1, r2, c1, c2) in ranges {
+            for n in [r1, r2, c1, c2] {
+                b.extend(n.to_le_bytes());
+            }
+        }
+        rec(0x01B0, &b)
+    }
+
+    /// CF: ct, cp, cce1, cce2, the DXFN, rgce1, rgce2.
+    fn cf_rec(ct: u8, cp: u8, dxf: &[u8], f1: &[u8], f2: &[u8]) -> Vec<u8> {
+        let mut b = vec![ct, cp];
+        b.extend((f1.len() as u16).to_le_bytes());
+        b.extend((f2.len() as u16).to_le_bytes());
+        b.extend_from_slice(dxf);
+        b.extend_from_slice(f1);
+        b.extend_from_slice(f2);
+        rec(0x01B1, &b)
+    }
+
+    /// A sheet's conditional formats: on B2:B5, value > 5 in bold red on
+    /// yellow, and `$A2>5` (based at B2) on a red fill; the latter again
+    /// over D2:D3 with ptgRef's absolute coordinates.
+    fn cf_sheet() -> Vec<Vec<u8>> {
+        // $A2>5: ptgRefN, row offset 0 (relative), column A (absolute).
+        let ref_n = [0x2C, 0, 0, 0, 0x80, 0x1E, 5, 0, 0x0D];
+        let ref_a = [0x24, 1, 0, 0, 0x80, 0x1E, 5, 0, 0x0D];
+        vec![
+            condfmt(2, &[(1, 4, 1, 1)]),
+            cf_rec(
+                1,
+                5,
+                &dxfn(Some((true, 2)), Some((None, 5))),
+                &[0x1E, 5, 0],
+                &[],
+            ),
+            cf_rec(2, 0, &dxfn(None, Some((Some(1), 2))), &ref_n, &[]),
+            condfmt(1, &[(1, 2, 3, 3)]),
+            cf_rec(2, 0, &dxfn(None, Some((Some(1), 2))), &ref_a, &[]),
+        ]
+    }
+
+    /// CONDFMT and CF records are the sheet's conditional formats: cellIs
+    /// and expression rules, their formulas based at the block's first
+    /// range's top-left, their DXFN's font and solid fill. Excel 2007's
+    /// rules (CF12 and the CFEX extension) are named.
+    #[test]
+    fn xls_cf_cellis_and_expression() {
+        use crate::sheet::{CfKind, Dxf};
+        let book = read(&workbook(&[], &cf_sheet())).unwrap();
+        assert!(book.dropped.is_empty(), "{:?}", book.dropped);
+        let cf = &book.sheets[0].cond_formats;
+        assert_eq!(cf.len(), 2);
+        assert_eq!(cf[0].ranges, [(1, 1, 4, 1)]);
+        let gt = CfKind::CellIs {
+            op: "greaterThan".into(),
+            formulas: vec!["5".into()],
+        };
+        let red_fill = Dxf {
+            fill: Some((255, 0, 0)),
+            ..Dxf::default()
+        };
+        assert_eq!(
+            cf[0].rules,
+            [
+                (
+                    gt,
+                    Dxf {
+                        bold: Some(true),
+                        color: Some((255, 0, 0)),
+                        fill: Some((255, 255, 0)),
+                        ..Dxf::default()
+                    }
+                ),
+                (
+                    CfKind::Expression {
+                        formula: "$A2>5".into()
+                    },
+                    red_fill.clone()
+                ),
+            ]
+        );
+        assert_eq!(
+            cf[1].rules,
+            [(
+                CfKind::Expression {
+                    formula: "$A2>5".into()
+                },
+                red_fill
+            )]
+        );
+
+        // A rule type BIFF8's CF doesn't have, CF12 and CFEX are named.
+        let mut sheet = cf_sheet();
+        sheet.push(cf_rec(3, 0, &dxfn(None, None), &[], &[]));
+        sheet.push(rec(0x087B, &[0; 20]));
+        let book = read(&workbook(&[], &sheet)).unwrap();
+        assert_eq!(book.sheets[0].cond_formats[1].rules.len(), 1);
+        assert_eq!(
+            book.dropped.iter().copied().collect::<Vec<_>>(),
+            ["conditional formatting"]
         );
     }
 }

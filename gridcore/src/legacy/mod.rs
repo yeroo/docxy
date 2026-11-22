@@ -351,6 +351,18 @@ pub(crate) struct SheetIn {
     /// Data-validation rules (#884), their formulas in Excel's syntax
     /// relative to their first range's top-left, as an `.xlsx` has them.
     pub validations: Vec<crate::sheet::DataValidation>,
+    /// Conditional-formatting blocks (#884), in file order.
+    pub cond_formats: Vec<CfIn>,
+}
+
+/// A conditional-formatting block as a reader collects it (#884): its
+/// ranges and its rules, each `cellIs` or `expression` (their formulas in
+/// Excel's syntax, relative to the first range's top-left) with the
+/// differential format it applies.
+#[derive(Debug, Default)]
+pub(crate) struct CfIn {
+    pub ranges: Vec<(u32, u32, u32, u32)>,
+    pub rules: Vec<(crate::sheet::CfKind, crate::sheet::Dxf)>,
 }
 
 /// One column definition as a reader collects it.
@@ -564,6 +576,39 @@ impl BookIn {
         for (at, mut sheet) in self.sheets.into_iter().enumerate() {
             // The comments part, its drawing and rels, written once.
             pkg.set_comments(at, &std::mem::take(&mut sheet.comments));
+            // The conditional formats, in one pass over the parts; a rule
+            // whose formula can't be kept is left out.
+            let mut blocks = Vec::new();
+            for cf in std::mem::take(&mut sheet.cond_formats) {
+                let mut rules = Vec::new();
+                for (mut kind, dxf) in cf.rules {
+                    let mut kept = true;
+                    let formulas: Vec<&mut String> = match &mut kind {
+                        crate::sheet::CfKind::CellIs { formulas, .. } => {
+                            formulas.iter_mut().collect()
+                        }
+                        crate::sheet::CfKind::Expression { formula } => vec![formula],
+                        _ => Vec::new(),
+                    };
+                    for f in formulas {
+                        match fix(std::mem::take(f), false) {
+                            Some(g) => *f = g,
+                            None => kept = false,
+                        }
+                    }
+                    if kept {
+                        rules.push((kind, dxf));
+                    }
+                }
+                if !rules.is_empty() && !cf.ranges.is_empty() {
+                    blocks.push(crate::xlsx::NewCondFormat {
+                        sqref: crate::xlsx::sqref_of(&cf.ranges),
+                        ranges: cf.ranges,
+                        rules,
+                    });
+                }
+            }
+            pkg.add_cond_formats(at, blocks);
             let s = &mut pkg.workbook.sheets[at];
             for (key, mut cell) in sheet.cells {
                 cell.style = xf_of.get(cell.style as usize).copied().unwrap_or(0);
@@ -1090,6 +1135,23 @@ pub(crate) fn format_code(codes: &HashMap<u16, String>, ifmt: u16) -> Option<Str
         .cloned()
         .or_else(|| builtin_format(ifmt as u32))
         .filter(|c| !c.eq_ignore_ascii_case("General"))
+}
+
+/// The `cellIs` operator of a conditional format's CFOper (BIFF8 CF's
+/// `cp`, BIFF12 BrtBeginCFRule's `iParam`): 1 between ... 8 less than or
+/// equal; `None` for another.
+pub(crate) fn cf_operator(op: u32) -> Option<&'static str> {
+    Some(match op {
+        1 => "between",
+        2 => "notBetween",
+        3 => "equal",
+        4 => "notEqual",
+        5 => "greaterThan",
+        6 => "lessThan",
+        7 => "greaterThanOrEqual",
+        8 => "lessThanOrEqual",
+        _ => return None,
+    })
 }
 
 /// The rule kind of a data validation's `valType` (BIFF8 DV and BIFF12

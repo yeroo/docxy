@@ -712,6 +712,9 @@ struct CellStyle {
     data: Option<String>,
     parent: Option<String>,
     props: CellProps,
+    /// Its conditional styles (`style:map`): (condition, the style it
+    /// applies, base cell).
+    maps: Vec<(String, String, String)>,
 }
 
 /// The data styles, table-cell styles and column styles of a styles or
@@ -772,6 +775,7 @@ impl StyleSheet {
                                     data: opt("style:data-style-name"),
                                     parent: opt("style:parent-style-name"),
                                     props: CellProps::default(),
+                                    maps: Vec::new(),
                                 },
                             );
                             cell_style = Some(Some(name));
@@ -808,6 +812,19 @@ impl StyleSheet {
                                 props.read(&p, &faces);
                             }
                             self.faces = faces;
+                            continue;
+                        }
+                        ("style:map", _) if matches!(cell_style, Some(Some(_))) => {
+                            if let Some(Some(n)) = &cell_style {
+                                let map = (
+                                    attr("style:condition"),
+                                    attr("style:apply-style-name"),
+                                    attr("style:base-cell-address"),
+                                );
+                                if let Some(c) = self.cells.get_mut(n) {
+                                    c.maps.push(map);
+                                }
+                            }
                             continue;
                         }
                         ("style:table-column-properties", _) if column_style.is_some() => {
@@ -958,6 +975,31 @@ impl StyleSheet {
             .into_iter()
             .rev()
             .fold(self.default_cell.clone(), |acc, own| own.over(&acc))
+    }
+
+    /// The differential format of the style a conditional format applies:
+    /// what it and its parents set, short of `Default` (which every cell
+    /// has anyway). An explicit black is a colour it sets.
+    fn dxf(&self, name: &str) -> crate::sheet::Dxf {
+        let mut props = CellProps::default();
+        let mut at = Some(name);
+        for _ in 0..16 {
+            let Some(style) = at
+                .filter(|n| *n != "Default")
+                .and_then(|n| self.cells.get(n))
+            else {
+                break;
+            };
+            props = props.over(&style.props);
+            at = style.parent.as_deref();
+        }
+        crate::sheet::Dxf {
+            fill: props.fill.flatten(),
+            color: props.color.flatten(),
+            bold: props.bold,
+            italic: props.italic,
+            ..crate::sheet::Dxf::default()
+        }
     }
 
     /// The model format of cell style `name` (`None`: no style).
@@ -1177,6 +1219,99 @@ fn validation_condition(cond: &str) -> Option<Condition> {
     Some((kind, op, f1.unwrap_or_default(), f2.unwrap_or_default()))
 }
 
+/// A conditional format's condition, from a `style:map`
+/// (`cell-content()>5`, `cell-content-is-between(1,5)`,
+/// `is-true-formula([.A1]>0)`) or LibreOffice's `calcext:condition`
+/// (`>5`, `between(1,5)`, `not-between(1,5)`, `formula-is([.A1]>0)`).
+/// `None` for a kind the model doesn't evaluate (duplicates, top 10, text
+/// tests, ...).
+fn cf_condition(cond: &str) -> Option<crate::sheet::CfKind> {
+    use crate::sheet::CfKind;
+    let body = match cond.split_once(':') {
+        Some((ns, rest)) if ns.bytes().all(|b| b.is_ascii_alphabetic()) => rest,
+        _ => cond,
+    };
+    let body = body.trim();
+    // Arguments split at `;`, or at `,` as LibreOffice writes two values.
+    let args = |name: &str| -> Option<Vec<String>> {
+        let a = call_args(body, name)?;
+        let a = if a.len() == 1 {
+            let inner = body
+                .strip_prefix(name)?
+                .trim()
+                .strip_prefix('(')?
+                .strip_suffix(')')?;
+            split_top(inner, ",")
+        } else {
+            a
+        };
+        a.iter().map(|x| operand(x)).collect()
+    };
+    for (name, op) in [
+        ("cell-content-is-between", "between"),
+        ("cell-content-is-not-between", "notBetween"),
+        ("between", "between"),
+        ("not-between", "notBetween"),
+    ] {
+        if let Some(formulas) = args(name) {
+            return (formulas.len() == 2).then(|| CfKind::CellIs {
+                op: op.to_string(),
+                formulas,
+            });
+        }
+    }
+    for name in ["is-true-formula", "formula-is"] {
+        if let Some(a) = call_args(body, name) {
+            let [f] = a.as_slice() else {
+                return None;
+            };
+            return Some(CfKind::Expression {
+                formula: operand(f)?,
+            });
+        }
+    }
+    let rest = body.strip_prefix("cell-content()").unwrap_or(body);
+    let (op, v) = comparison(rest)?;
+    Some(CfKind::CellIs {
+        op: op.to_string(),
+        formulas: vec![operand(v)?],
+    })
+}
+
+/// `kind`'s formulas moved from `base` to `at` ([`rebase`]).
+fn rebase_cf(
+    mut kind: crate::sheet::CfKind,
+    base: Option<(u32, u32)>,
+    at: (u32, u32),
+) -> Option<crate::sheet::CfKind> {
+    use crate::sheet::CfKind;
+    match &mut kind {
+        CfKind::CellIs { formulas, .. } => {
+            for f in formulas {
+                *f = rebase(f, base, at)?;
+            }
+        }
+        CfKind::Expression { formula } => *formula = rebase(formula, base, at)?,
+        _ => return None,
+    }
+    Some(kind)
+}
+
+/// An ODF range list (`S.A1:S.B2 S.D4`) as (r1, c1, r2, c2) rectangles.
+fn range_list(s: &str) -> Vec<(u32, u32, u32, u32)> {
+    s.split_whitespace()
+        .filter_map(|r| {
+            let parts = split_top(r, ":");
+            let (a, b) = match parts.as_slice() {
+                [a] => (address_cell(a)?, address_cell(a)?),
+                [a, b] => (address_cell(a)?, address_cell(b)?),
+                _ => return None,
+            };
+            Some((a.0.min(b.0), a.1.min(b.1), a.0.max(b.0), a.1.max(b.1)))
+        })
+        .collect()
+}
+
 /// An ODF cell address (`Sheet1.A1`, `$'My Sheet'.$B$2`) as (row, col).
 fn address_cell(s: &str) -> Option<(u32, u32)> {
     let (_, cell) = split_address(s)?;
@@ -1328,6 +1463,15 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
     let mut message: Option<(bool, String, usize)> = None;
     let mut row_rules: Vec<(u32, u32, String)> = Vec::new();
     let mut rule_cells: Vec<(String, Ranges)> = Vec::new();
+    // Conditional formatting (#884): the current row's cells in a style
+    // with `style:map`s (first, end, style) and, per such style in the
+    // order the table first uses it, its cells; and the table's
+    // LibreOffice conditional formats (`calcext:conditional-format`), the
+    // one being read with its first range's top-left.
+    let mut row_maps: Vec<(u32, u32, String)> = Vec::new();
+    let mut map_cells: Vec<(String, Ranges)> = Vec::new();
+    let mut table_cf: Vec<super::CfIn> = Vec::new();
+    let mut calc_cf: Option<super::CfIn> = None;
     let mut cell: Option<CellIn> = None;
     // Depth inside an annotation or a drawn shape, whose text is not the
     // cell's.
@@ -1351,6 +1495,8 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                         col_styles.clear();
                         col_runs.clear();
                         rule_cells.clear();
+                        map_cells.clear();
+                        table_cf.clear();
                         next_col = 0;
                         row = 0;
                     }
@@ -1375,6 +1521,7 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                         row_merges.clear();
                         row_comments.clear();
                         row_rules.clear();
+                        row_maps.clear();
                         row_repeat = p
                             .attr("table:number-rows-repeated")
                             .parse()
@@ -1466,6 +1613,26 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                                 rule,
                             },
                         ));
+                    }
+                    "calcext:conditional-format" => {
+                        let ranges = range_list(&attr("calcext:target-range-address"));
+                        calc_cf = Some(super::CfIn {
+                            ranges,
+                            rules: Vec::new(),
+                        });
+                    }
+                    "calcext:condition" => {
+                        if let Some(cf) = calc_cf.as_mut() {
+                            let at = cf.ranges.first().map(|r| (r.0, r.1));
+                            let base = address_cell(&attr("calcext:base-cell-address"));
+                            let rule = cf_condition(&attr("calcext:value"))
+                                .zip(at)
+                                .and_then(|(k, at)| rebase_cf(k, base, at));
+                            if let Some(kind) = rule {
+                                let dxf = styles.dxf(&attr("calcext:apply-style-name"));
+                                cf.rules.push((kind, dxf));
+                            }
+                        }
                     }
                     "table:help-message" | "table:error-message" => {
                         if let Some((_, v)) = validation.as_mut() {
@@ -1571,6 +1738,44 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                                     ..v.rule.clone()
                                 });
                             }
+                            // LibreOffice writes its conditional formats
+                            // twice: as calcext ones, and as `style:map`s
+                            // for other readers. The calcext ones win.
+                            if !table_cf.is_empty() {
+                                sheet.cond_formats.append(&mut table_cf);
+                            } else {
+                                for (style, cells) in map_cells.drain(..) {
+                                    let Some(&(r, c, ..)) = cells.rects.first() else {
+                                        continue;
+                                    };
+                                    let maps =
+                                        styles.cells.get(&style).map_or(&[][..], |s| &s.maps);
+                                    let rules: Vec<_> = maps
+                                        .iter()
+                                        .filter_map(|(cond, apply, base)| {
+                                            let kind = rebase_cf(
+                                                cf_condition(cond)?,
+                                                address_cell(base),
+                                                (r, c),
+                                            )?;
+                                            Some((kind, styles.dxf(apply)))
+                                        })
+                                        .collect();
+                                    if !rules.is_empty() {
+                                        sheet.cond_formats.push(super::CfIn {
+                                            ranges: cells.rects,
+                                            rules,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "calcext:conditional-format" => {
+                        if let Some(cf) = calc_cf.take() {
+                            if !cf.ranges.is_empty() && !cf.rules.is_empty() {
+                                table_cf.push(cf);
+                            }
                         }
                     }
                     "table:content-validation" => {
@@ -1674,6 +1879,21 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                         if (cs > 1 || rs > 1) && col < MAX_COLS {
                             row_merges.push((col, cs, rs));
                         }
+                        // The cells of a style with conditional styles, but
+                        // not a run to the grid's last column (padding).
+                        if last < MAX_COLS && name == "table:table-cell" {
+                            let runs = match &own {
+                                Some(s) => vec![(col, last, Some(s.clone()))],
+                                None => by_column(col, last),
+                            };
+                            for (from, to, style) in runs {
+                                if let Some(st) = style.filter(|st| {
+                                    styles.cells.get(st).is_some_and(|x| !x.maps.is_empty())
+                                }) {
+                                    row_maps.push((from, to, st));
+                                }
+                            }
+                        }
                         if let Some(rule) = c
                             .attrs
                             .get("table:content-validation-name")
@@ -1736,6 +1956,20 @@ fn read_content(xml: &str, styles: &StyleSheet, limits: Limits) -> Result<BookIn
                                     let c2 = c.saturating_add(cs - 1).min(MAX_COLS - 1);
                                     sheet.merges.push((r, c, r2, c2));
                                 }
+                            }
+                        }
+                        // A style's cells with conditional styles, but not
+                        // in padding.
+                        if row < MAX_ROWS && !padding {
+                            for (c1, c2, style) in row_maps.drain(..) {
+                                let at = match map_cells.iter().position(|(n, _)| *n == style) {
+                                    Some(i) => i,
+                                    None => {
+                                        map_cells.push((style, Ranges::default()));
+                                        map_cells.len() - 1
+                                    }
+                                };
+                                map_cells[at].1.add(row, last - 1, c1, c2 - 1);
                             }
                         }
                         // The cells naming a validation rule: one range per
@@ -2433,7 +2667,9 @@ mod tests {
                  <style:table-cell-properties fo:background-color="#ffff00" fo:border="0.74pt solid #000000"/>
                  <style:text-properties fo:font-weight="bold" fo:font-style="italic" fo:color="#ff0000" fo:font-size="14pt" style:font-name="Arial"/></style:style>
                <style:style style:name="co1" style:family="table-column"><style:table-column-properties style:column-width="1.5875cm"/></style:style>
-               <style:style style:name="co2" style:family="table-column"><style:table-column-properties style:column-width="1.5in"/></style:style>"##,
+               <style:style style:name="co2" style:family="table-column"><style:table-column-properties style:column-width="1.5in"/></style:style>
+               <style:style style:name="cf1" style:family="table-cell"><style:table-cell-properties fo:background-color="#00ff00"/></style:style>
+               <style:style style:name="ce2" style:family="table-cell"><style:map style:condition="cell-content()&gt;5" style:apply-style-name="cf1" style:base-cell-address="S.B4"/></style:style>"##,
             r#"<table:content-validations><table:content-validation table:name="v1" table:condition="of:is-true-formula([.A1]&gt;0)" table:base-cell-address="S.A1"/></table:content-validations>
                <table:table table:name="S">
                  <table:table-column table:style-name="co1"/>
@@ -2442,6 +2678,7 @@ mod tests {
                  <table:table-row><table:table-cell table:style-name="ce1" office:value-type="float" office:value="1"/><table:table-cell table:content-validation-name="v1" table:number-columns-repeated="2"/></table:table-row>
                  <table:table-row><table:table-cell><office:annotation><dc:creator>Ann</dc:creator><text:p>a note</text:p></office:annotation></table:table-cell></table:table-row>
                  <table:table-row><table:table-cell table:number-columns-spanned="2" table:number-rows-spanned="2"/></table:table-row>
+                 <table:table-row><table:table-cell/><table:table-cell table:style-name="ce2" office:value-type="float" office:value="7"/><table:table-cell table:style-name="ce2" office:value-type="float" office:value="3"/></table:table-row>
                </table:table>"#,
         )
     }
@@ -2490,6 +2727,13 @@ mod tests {
             ("custom", "B1>0")
         );
         assert_eq!(v[0].ranges, [(0, 1, 0, 2)]);
+        // B4's 7 is on green; C4's 3 isn't.
+        assert_eq!(s.cond_formats.len(), 1);
+        assert_eq!(
+            crate::cf::cell_dxf(wb, 0, 3, 1).unwrap().fill,
+            Some((0, 255, 0))
+        );
+        assert!(crate::cf::cell_dxf(wb, 0, 3, 2).is_none());
     }
 
     /// An annotation is its cell's comment: `dc:creator` the author, each
@@ -2635,5 +2879,129 @@ mod tests {
         assert_eq!(c("of:cell-content-is-whole-number()"), None);
         assert_eq!(c("of:cell-content-is-between(1)"), None);
         assert_eq!(c(""), None);
+    }
+
+    /// The named styles of [`ods_style_map_and_calcext_cf`]: `Default` in
+    /// black, `Good` bold on green and `Bad` italic red, both under it.
+    const CF_STYLES: &str = r##"<office:document-styles xmlns:office="o" xmlns:style="s" xmlns:fo="f"><office:styles>
+        <style:style style:name="Default" style:family="table-cell"><style:text-properties fo:color="#000000"/></style:style>
+        <style:style style:name="Good" style:family="table-cell" style:parent-style-name="Default"><style:table-cell-properties fo:background-color="#00ff00"/><style:text-properties fo:font-weight="bold"/></style:style>
+        <style:style style:name="Bad" style:family="table-cell" style:parent-style-name="Default"><style:text-properties fo:color="#ff0000" fo:font-style="italic"/></style:style>
+        </office:styles></office:document-styles>"##;
+
+    /// `style:map`s are conditional formats over the cells in their style,
+    /// formulas moved from their base cell to the range's top-left; a
+    /// table with LibreOffice's `calcext:conditional-format`s takes those
+    /// instead (its maps are their copies). The applied style's own
+    /// properties, short of `Default`, are the format.
+    #[test]
+    fn ods_style_map_and_calcext_cf() {
+        use crate::sheet::{CfKind, Dxf};
+        let xml = styled_content(
+            "",
+            r#"<style:style style:name="ce1" style:family="table-cell">
+                 <style:map style:condition="cell-content()&gt;5" style:apply-style-name="Good" style:base-cell-address="S.B2"/>
+                 <style:map style:condition="is-true-formula([.$A1]&gt;5)" style:apply-style-name="Bad" style:base-cell-address="S.B1"/>
+                 <style:map style:condition="cell-content-is-duplicate()" style:apply-style-name="Bad" style:base-cell-address="S.B1"/>
+               </style:style>"#,
+            r#"<table:table table:name="S">
+                 <table:table-row><table:table-cell/></table:table-row>
+                 <table:table-row><table:table-cell/><table:table-cell table:style-name="ce1" table:number-columns-repeated="2"/></table:table-row>
+                 <table:table-row table:number-rows-repeated="2"><table:table-cell/><table:table-cell table:style-name="ce1"/></table:table-row>
+                 <table:table-row table:number-rows-repeated="1048572"><table:table-cell table:style-name="ce1"/></table:table-row>
+               </table:table>
+               <table:table table:name="T">
+                 <table:table-row><table:table-cell table:style-name="ce1"/></table:table-row>
+                 <calcext:conditional-formats><calcext:conditional-format calcext:target-range-address="T.A1:T.A3 T.C1">
+                   <calcext:condition calcext:apply-style-name="Good" calcext:value="between(1,5)" calcext:base-cell-address="T.A1"/>
+                   <calcext:condition calcext:apply-style-name="Bad" calcext:value="formula-is([.A2]&gt;0)" calcext:base-cell-address="T.A2"/>
+                   <calcext:condition calcext:apply-style-name="Good" calcext:value="duplicate" calcext:base-cell-address="T.A1"/>
+                 </calcext:conditional-format></calcext:conditional-formats>
+               </table:table>"#,
+        );
+        let b = read_styled(CF_STYLES, &xml, Limits::default());
+        let good = Dxf {
+            fill: Some((0, 255, 0)),
+            bold: Some(true),
+            ..Dxf::default()
+        };
+        let bad = Dxf {
+            color: Some((255, 0, 0)),
+            italic: Some(true),
+            ..Dxf::default()
+        };
+        let s = &b.sheets[0].cond_formats;
+        assert_eq!(s.len(), 1);
+        // B2:C2 and B3:B4; not the padding rows.
+        assert_eq!(s[0].ranges, [(1, 1, 1, 2), (2, 1, 3, 1)]);
+        assert_eq!(
+            s[0].rules,
+            [
+                (
+                    CfKind::CellIs {
+                        op: "greaterThan".into(),
+                        formulas: vec!["5".into()],
+                    },
+                    good.clone()
+                ),
+                (
+                    CfKind::Expression {
+                        formula: "$A2>5".into()
+                    },
+                    bad.clone()
+                ),
+            ]
+        );
+        let t = &b.sheets[1].cond_formats;
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].ranges, [(0, 0, 2, 0), (0, 2, 0, 2)]);
+        assert_eq!(
+            t[0].rules,
+            [
+                (
+                    CfKind::CellIs {
+                        op: "between".into(),
+                        formulas: vec!["1".into(), "5".into()],
+                    },
+                    good
+                ),
+                (
+                    CfKind::Expression {
+                        formula: "A1>0".into()
+                    },
+                    bad
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn ods_cf_conditions() {
+        use crate::sheet::CfKind;
+        let cell_is = |op: &str, f: &[&str]| {
+            Some(CfKind::CellIs {
+                op: op.into(),
+                formulas: f.iter().map(|s| s.to_string()).collect(),
+            })
+        };
+        assert_eq!(
+            cf_condition("cell-content-is-between(1;[.A1])"),
+            cell_is("between", &["1", "A1"])
+        );
+        assert_eq!(
+            cf_condition("not-between(1,5)"),
+            cell_is("notBetween", &["1", "5"])
+        );
+        assert_eq!(cf_condition("!=0"), cell_is("notEqual", &["0"]));
+        assert_eq!(
+            cf_condition("<=[.$B$1]"),
+            cell_is("lessThanOrEqual", &["$B$1"])
+        );
+        assert_eq!(
+            cf_condition("cell-content()=\"x\""),
+            cell_is("equal", &["\"x\""])
+        );
+        assert_eq!(cf_condition("top-elements(10)"), None);
+        assert_eq!(cf_condition("begins-with(\"a\")"), None);
     }
 }

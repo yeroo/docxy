@@ -533,6 +533,60 @@ const BRT_MERGE_CELL: u32 = 176;
 const BRT_WS_FMT_INFO: u32 = 485;
 /// BrtDVal, [MS-XLSB] 2.4 (record id 64), inside BrtBeginDVals (573).
 const BRT_DVAL: u32 = 64;
+/// BrtBeginConditionalFormatting and BrtBeginCFRule, [MS-XLSB] 2.4
+/// (record ids 461 and 463).
+const BRT_BEGIN_CONDITIONAL_FORMATTING: u32 = 461;
+const BRT_BEGIN_CF_RULE: u32 = 463;
+
+/// BrtBeginCFRule: iType (1 cellIs, 2 expression), iTemplate, dxfId, iPri,
+/// iParam (cellIs's operator), two reserved, flags, cbFmla1..3,
+/// strParam, then the formulas whose cbFmla isn't 0 (CFParsedFormulas,
+/// their relative references based at the block's first range's
+/// top-left). `None` for a rule the model doesn't hold.
+fn read_cf_rule(
+    c: &mut Cur,
+    at: (u32, u32, u32, u32),
+    styles: &Styles,
+    g: &Globals,
+) -> Option<(crate::sheet::CfKind, crate::sheet::Dxf)> {
+    use crate::sheet::CfKind;
+    let (ty, _template, dxf_id) = (c.u32()?, c.u32()?, c.u32()?);
+    c.u32()?;
+    let param = c.u32()?;
+    c.take(10)?;
+    let cb = [c.u32()?, c.u32()?, c.u32()?];
+    c.wide()?;
+    let mut formulas = Vec::new();
+    for n in cb {
+        if n == 0 {
+            continue;
+        }
+        let (rgce, extra) = c.formula()?;
+        formulas.push(ptg::decompile(
+            Biff::V12,
+            rgce,
+            extra,
+            Base::Shared(at.0, at.1),
+            g,
+        )?);
+    }
+    let dxf = styles
+        .dxfs
+        .get(dxf_id as usize)
+        .cloned()
+        .unwrap_or_default();
+    let kind = match ty {
+        1 if !formulas.is_empty() => CfKind::CellIs {
+            op: super::cf_operator(param)?.to_string(),
+            formulas,
+        },
+        2 => CfKind::Expression {
+            formula: formulas.into_iter().next()?,
+        },
+        _ => return None,
+    };
+    Some((kind, dxf))
+}
 
 /// An UncheckedSqRfX: crfx, then each RfX (rwFirst, rwLast, colFirst,
 /// colLast), as (r1, c1, r2, c2); the ones off the grid left out.
@@ -704,6 +758,23 @@ fn read_sheet(
                     if let Some(dv) = read_dval(&mut c, g) {
                         sheet.validations.push(dv);
                     }
+                }
+                // BrtBeginConditionalFormatting: ccf, fPivot, sqrfx. Its
+                // BrtBeginCFRules follow.
+                BRT_BEGIN_CONDITIONAL_FORMATTING => {
+                    c.take(8)?;
+                    let ranges = sqrfx(&mut c)?;
+                    if !ranges.is_empty() {
+                        sheet.cond_formats.push(super::CfIn {
+                            ranges,
+                            rules: Vec::new(),
+                        });
+                    }
+                }
+                BRT_BEGIN_CF_RULE => {
+                    let cf = sheet.cond_formats.last_mut()?;
+                    let rule = read_cf_rule(&mut c, cf.ranges[0], styles, g)?;
+                    cf.rules.push(rule);
                 }
                 // BrtMergeCell: an RfX (rwFirst, rwLast, colFirst,
                 // colLast).
@@ -1738,12 +1809,13 @@ mod tests {
     /// The `.xlsb` of [`round_trip_xlsb`]: a formatted cell, a wide
     /// column and a merge (later slices add to it).
     fn feature_xlsb() -> Vec<u8> {
-        let styles = styles(
+        let mut styles = styles(
             &[font(14, true, true, &rgb_color(255, 0, 0), "Arial")],
             &[fill(1, &rgb_color(255, 255, 0))],
             &[border([1, 1, 1, 1, 0])],
             &[xf(0, 1, 2, 1)],
         );
+        styles.extend(dxf_list());
         let mut col = 1u32.to_le_bytes().to_vec();
         col.extend(1u32.to_le_bytes());
         col.extend((20 * 256u32).to_le_bytes());
@@ -1763,6 +1835,8 @@ mod tests {
             ]
             .into_iter()
             .chain(dv_records())
+            .chain([rec(BRT_ROW_HDR, &1u32.to_le_bytes()), real(0, 0, 9.0)])
+            .chain(cf_records())
             .collect::<Vec<_>>(),
             &[],
             [
@@ -1812,6 +1886,10 @@ mod tests {
                 ("custom", "", "A3>0"),
             ]
         );
+        // The rules apply: A2's 9 makes B2 italic (`$A2>5`).
+        assert_eq!(wb.sheets[0].cond_formats.len(), 2);
+        assert_eq!(crate::cf::cell_dxf(wb, 0, 1, 1).unwrap().italic, Some(true));
+        assert!(crate::cf::cell_dxf(wb, 0, 2, 1).is_none());
     }
 
     /// The sheet rels and comments part of a sheet with these comments:
@@ -1956,5 +2034,151 @@ mod tests {
             ("custom", "A3>0")
         );
         assert_eq!(v[3].formula1, "A3>0");
+    }
+
+    /// BrtDXF: flags, reserved, cprops, then each XFProp (type, cb, value).
+    fn dxf_rec(props: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut b = vec![0u8; 4];
+        b.extend((props.len() as u16).to_le_bytes());
+        for (ty, v) in props {
+            b.extend(ty.to_le_bytes());
+            b.extend(((v.len() + 4) as u16).to_le_bytes());
+            b.extend_from_slice(v);
+        }
+        rec(super::super::xlsb_style::BRT_DXF, &b)
+    }
+
+    /// A styles.bin with two differential formats: 0 bold red text on a
+    /// solid yellow fill (its background colour); 1 italic on a fill
+    /// pattern of none.
+    fn dxf_styles() -> Vec<u8> {
+        let mut v = styles(&[], &[], &[], &[]);
+        v.extend(dxf_list());
+        v
+    }
+
+    /// The BrtDXF list of [`dxf_styles`].
+    fn dxf_list() -> Vec<u8> {
+        use super::super::xlsb_style::{BRT_BEGIN_DXFS, BRT_END_DXFS};
+        list(
+            BRT_BEGIN_DXFS,
+            BRT_END_DXFS,
+            &[
+                dxf_rec(&[
+                    (0x00, vec![1]),
+                    (0x02, rgb_color(255, 255, 0)),
+                    (0x05, rgb_color(255, 0, 0)),
+                    (0x19, 700u16.to_le_bytes().to_vec()),
+                ]),
+                dxf_rec(&[
+                    (0x00, vec![0]),
+                    (0x02, rgb_color(0, 0, 255)),
+                    (0x1C, vec![1]),
+                ]),
+            ],
+        )
+    }
+
+    /// BrtBeginCFRule: iType, iTemplate, dxfId, iPri, iParam, reserved,
+    /// flags, cbFmla1..3, strParam, the formulas.
+    fn cf_rule(ty: u32, dxf: u32, param: u32, formulas: &[&[u8]]) -> Vec<u8> {
+        let mut b = Vec::new();
+        for n in [ty, 0, dxf, 1, param, 0, 0] {
+            b.extend(n.to_le_bytes());
+        }
+        b.extend(0u16.to_le_bytes());
+        let parsed: Vec<Vec<u8>> = formulas
+            .iter()
+            .map(|f| {
+                let mut v = (f.len() as u32).to_le_bytes().to_vec();
+                v.extend_from_slice(f);
+                v.extend(0u32.to_le_bytes());
+                v
+            })
+            .collect();
+        for i in 0..3 {
+            b.extend((parsed.get(i).map_or(0, Vec::len) as u32).to_le_bytes());
+        }
+        b.extend(0xFFFF_FFFFu32.to_le_bytes());
+        for p in &parsed {
+            b.extend_from_slice(p);
+        }
+        rec(BRT_BEGIN_CF_RULE, &b)
+    }
+
+    /// The conditional formats of [`xlsb_cf_rules_and_dxfs`]: on B2:B5,
+    /// value > 5 (dxf 0), `$A2>5` (dxf 1, ptgRefN based at B2) and a
+    /// color scale the model doesn't hold; on D2:D3 `$A2>5` as ptgRef.
+    fn cf_records() -> Vec<Vec<u8>> {
+        let block = |ranges: &[(u32, u32, u32, u32)]| {
+            let mut b = vec![0u8; 8];
+            b.extend((ranges.len() as u32).to_le_bytes());
+            for &(r1, r2, c1, c2) in ranges {
+                for n in [r1, r2, c1, c2] {
+                    b.extend(n.to_le_bytes());
+                }
+            }
+            rec(BRT_BEGIN_CONDITIONAL_FORMATTING, &b)
+        };
+        let ref_n: &[u8] = &[0x2C, 0, 0, 0, 0, 0, 0x80, 0x1E, 5, 0, 0x0D];
+        let ref_a: &[u8] = &[0x24, 1, 0, 0, 0, 0, 0x80, 0x1E, 5, 0, 0x0D];
+        vec![
+            block(&[(1, 4, 1, 1)]),
+            cf_rule(1, 0, 5, &[&[0x1E, 5, 0]]),
+            rec(464, &[]),
+            cf_rule(2, 1, 0, &[ref_n]),
+            rec(464, &[]),
+            cf_rule(3, 0, 0, &[]),
+            rec(464, &[]),
+            rec(462, &[]),
+            block(&[(1, 2, 3, 3)]),
+            cf_rule(2, 1, 0, &[ref_a]),
+            rec(464, &[]),
+            rec(462, &[]),
+        ]
+    }
+
+    /// BrtBeginConditionalFormatting and BrtBeginCFRule records are the
+    /// sheet's conditional formats, with the BrtDXF their dxfId names.
+    #[test]
+    fn xlsb_cf_rules_and_dxfs() {
+        use crate::sheet::{CfKind, Dxf};
+        let mut sheet = vec![rec(BRT_ROW_HDR, &0u32.to_le_bytes()), real(0, 0, 1.0)];
+        sheet.extend(cf_records());
+        let book = open(&xlsb_with(
+            &[],
+            &sheet,
+            &[],
+            vec![("xl/styles.bin".to_string(), dxf_styles())],
+        ));
+        let cf = &book.sheets[0].cond_formats;
+        assert_eq!(cf.len(), 2);
+        assert_eq!(cf[0].ranges, [(1, 1, 4, 1)]);
+        let expr = CfKind::Expression {
+            formula: "$A2>5".into(),
+        };
+        let italic = Dxf {
+            italic: Some(true),
+            ..Dxf::default()
+        };
+        assert_eq!(
+            cf[0].rules,
+            [
+                (
+                    CfKind::CellIs {
+                        op: "greaterThan".into(),
+                        formulas: vec!["5".into()],
+                    },
+                    Dxf {
+                        bold: Some(true),
+                        color: Some((255, 0, 0)),
+                        fill: Some((255, 255, 0)),
+                        ..Dxf::default()
+                    }
+                ),
+                (expr.clone(), italic.clone()),
+            ]
+        );
+        assert_eq!(cf[1].rules, [(expr, italic)]);
     }
 }

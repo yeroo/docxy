@@ -5485,8 +5485,17 @@ fn parse_sqref_token(tok: &str) -> Option<(u32, u32, u32, u32)> {
     })
 }
 
+/// A conditional-formatting block for [`SheetPackage::add_cond_formats`]:
+/// its ranges, their `sqref` text, and its rules (`cellIs` or
+/// `expression`), each with the differential format it applies.
+pub(crate) struct NewCondFormat {
+    pub ranges: Vec<(u32, u32, u32, u32)>,
+    pub sqref: String,
+    pub rules: Vec<(crate::sheet::CfKind, crate::sheet::Dxf)>,
+}
+
 /// `ranges` as an `sqref` value: whole columns and rows as `B:C` and `3:5`.
-fn sqref_of(ranges: &[(u32, u32, u32, u32)]) -> String {
+pub(crate) fn sqref_of(ranges: &[(u32, u32, u32, u32)]) -> String {
     ranges
         .iter()
         .map(|&(r1, c1, r2, c2)| {
@@ -10227,22 +10236,50 @@ impl SheetPackage {
         formula2: Option<&str>,
         dxf: crate::sheet::Dxf,
     ) -> bool {
+        let (r1, c1, r2, c2) = range;
+        let mut formulas = vec![formula1.to_string()];
+        if let Some(f2) = formula2 {
+            formulas.push(f2.to_string());
+        }
+        self.add_cond_formats(
+            sheet,
+            vec![NewCondFormat {
+                ranges: vec![range],
+                sqref: format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2)),
+                rules: vec![(
+                    crate::sheet::CfKind::CellIs {
+                        op: op.to_string(),
+                        formulas,
+                    },
+                    dxf,
+                )],
+            }],
+        )
+    }
+
+    /// Add conditional-formatting `blocks` to `sheet` at once (#884): each
+    /// block's rules (`cellIs` or `expression`) with their differential
+    /// formats. The dxfs are written to styles.xml once and the blocks
+    /// spliced into the worksheet in one pass, so an import's many blocks
+    /// cost time linear in the parts. Priorities continue past the
+    /// workbook's highest, in order. Wires the model as
+    /// [`SheetPackage::add_conditional_format`] does.
+    ///
+    /// `false`, with nothing changed, when the blocks can't be written:
+    /// the sheet doesn't exist, or its worksheet part is malformed where
+    /// they would go.
+    pub(crate) fn add_cond_formats(&mut self, sheet: usize, blocks: Vec<NewCondFormat>) -> bool {
+        use crate::sheet::{CfKind, CfRule, CondFormat};
         if sheet >= self.workbook.sheets.len()
             || !self.sheet_takes(sheet, "conditionalFormatting", false)
         {
             return false;
         }
-        let dxf_id = self.workbook.styles.dxfs.len();
-        self.workbook.styles.dxfs.push(dxf);
-        // The styles part: regenerate <dxfs> from the model (splice_styles
-        // preserves it).
-        let styles_name = self.styles_part_name().to_string();
-        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == styles_name) {
-            let xml = String::from_utf8_lossy(&p.1).into_owned();
-            p.1 = set_dxfs(&xml, &self.workbook.styles.dxfs).into_bytes();
+        if blocks.is_empty() {
+            return true;
         }
         // Next-highest priority across the workbook (lower = higher precedence).
-        let priority = self
+        let mut priority = self
             .workbook
             .sheets
             .iter()
@@ -10250,35 +10287,78 @@ impl SheetPackage {
             .flat_map(|cf| cf.rules.iter())
             .map(|r| r.priority)
             .max()
-            .unwrap_or(0)
-            + 1;
-        // Worksheet: inject <conditionalFormatting> at its schema position,
-        // after any existing ones.
-        let (r1, c1, r2, c2) = range;
-        let sqref = format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2));
-        let mut fmls = format!("<formula>{}</formula>", esc_text(&file_formula(formula1)));
-        if let Some(f2) = formula2 {
-            fmls.push_str(&format!(
-                "<formula>{}</formula>",
-                esc_text(&file_formula(f2))
+            .unwrap_or(0);
+        let mut xml = String::new();
+        let mut model = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            let mut rules = Vec::with_capacity(block.rules.len());
+            xml.push_str(&format!(
+                "<conditionalFormatting sqref=\"{}\">",
+                block.sqref
             ));
+            for (kind, dxf) in block.rules {
+                let dxf_id = self.workbook.styles.dxfs.len();
+                self.workbook.styles.dxfs.push(dxf);
+                priority += 1;
+                let fml = |f: &str| format!("<formula>{}</formula>", esc_text(&file_formula(f)));
+                match &kind {
+                    CfKind::CellIs { op, formulas } => {
+                        let fmls: String = formulas.iter().map(|f| fml(f)).collect();
+                        xml.push_str(&format!(
+                            "<cfRule type=\"cellIs\" dxfId=\"{dxf_id}\" priority=\"{priority}\" operator=\"{}\">{fmls}</cfRule>",
+                            esc_attr(op)
+                        ));
+                    }
+                    CfKind::Expression { formula } => {
+                        xml.push_str(&format!(
+                            "<cfRule type=\"expression\" dxfId=\"{dxf_id}\" priority=\"{priority}\">{}</cfRule>",
+                            fml(formula)
+                        ));
+                    }
+                    // Only the kinds above are written here.
+                    _ => {
+                        self.workbook.styles.dxfs.pop();
+                        priority -= 1;
+                        continue;
+                    }
+                }
+                rules.push(CfRule {
+                    kind,
+                    dxf_id: Some(dxf_id),
+                    priority,
+                });
+            }
+            xml.push_str("</conditionalFormatting>");
+            model.push(CondFormat {
+                ranges: block.ranges,
+                rules,
+                ix: None,
+            });
         }
-        let cf_xml = format!(
-            "<conditionalFormatting sqref=\"{sqref}\"><cfRule type=\"cellIs\" dxfId=\"{dxf_id}\" priority=\"{priority}\" operator=\"{op}\">{fmls}</cfRule></conditionalFormatting>"
-        );
+        // The styles part: regenerate <dxfs> from the model (splice_styles
+        // preserves it).
+        let styles_name = self.styles_part_name().to_string();
+        if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == styles_name) {
+            let styles = String::from_utf8_lossy(&p.1).into_owned();
+            p.1 = set_dxfs(&styles, &self.workbook.styles.dxfs).into_bytes();
+        }
+        // Worksheet: inject the blocks at their schema position, after any
+        // existing ones.
         let sheet_part = self.sheet_parts[sheet].clone();
-        // (the new block's ordinal, how many there were before it)
+        let added = model.len();
+        // (the first new block's ordinal, how many there were before)
         let mut placed = None;
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
-            let xml = String::from_utf8_lossy(&p.1).into_owned();
-            let old = cond_format_spans(&xml);
-            let out = put_worksheet_child(&xml, "conditionalFormatting", &cf_xml, None, false);
-            // It lands at its schema position: after the existing blocks in
-            // a well-ordered part, but before any that follow a later-ranked
-            // child in a misordered one. The blocks ahead of it keep their
-            // starts, so the first start that differs is its ordinal.
+            let part = String::from_utf8_lossy(&p.1).into_owned();
+            let old = cond_format_spans(&part);
+            let out = put_worksheet_child(&part, "conditionalFormatting", &xml, None, false);
+            // They land at their schema position: after the existing blocks
+            // in a well-ordered part, but before any that follow a
+            // later-ranked child in a misordered one. The blocks ahead of
+            // them keep their starts, so the first start that differs is
+            // the first one's ordinal.
             let new = cond_format_spans(&out);
-            if new.len() == old.len() + 1 {
+            if new.len() == old.len() + added {
                 let k = (0..old.len())
                     .find(|&i| new[i].0 != old[i].0)
                     .unwrap_or(old.len());
@@ -10287,27 +10367,14 @@ impl SheetPackage {
             p.1 = out.into_bytes();
         }
         // Model.
-        let mut formulas = vec![formula1.to_string()];
-        if let Some(f2) = formula2 {
-            formulas.push(f2.to_string());
-        }
-        let rule = crate::sheet::CfRule {
-            kind: crate::sheet::CfKind::CellIs {
-                op: op.to_string(),
-                formulas,
-            },
-            dxf_id: Some(dxf_id),
-            priority,
-        };
         let s = &mut self.workbook.sheets[sheet];
-        let ix = placed.map(|(k, _)| k);
         if let Some((k, n)) = placed {
             // A claim on an ordinal the part didn't have (n or later) names
             // nothing (an undo restored the model but not the part): it goes.
-            // The real blocks from the new one's place on moved up one.
+            // The real blocks from the new ones' place on moved up.
             let renumber = |i: usize| match i {
                 i if i >= n => None,
-                i if i >= k => Some(i + 1),
+                i if i >= k => Some(i + added),
                 i => Some(i),
             };
             for cf in &mut s.cond_formats {
@@ -10315,11 +10382,10 @@ impl SheetPackage {
             }
             s.cf_removed = s.cf_removed.iter().filter_map(|&i| renumber(i)).collect();
         }
-        s.cond_formats.push(crate::sheet::CondFormat {
-            ranges: vec![range],
-            rules: vec![rule],
-            ix,
-        });
+        for (j, mut cf) in model.into_iter().enumerate() {
+            cf.ix = placed.map(|(k, _)| k + j);
+            s.cond_formats.push(cf);
+        }
         true
     }
 
