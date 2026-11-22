@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use opccore::zip::ZipArchive;
 
 use super::ftab;
+use super::page;
 use super::ptg::{self, Base, Biff, Names, Table, utf16};
 use super::xlsb_style::Styles;
 use super::{
@@ -603,6 +604,31 @@ pub(crate) fn read_with(zip: &ZipArchive, limits: Limits) -> Result<BookIn, Open
 type Group = ((u32, u32, u32, u32), Vec<u8>, Vec<u8>);
 
 /// BrtColInfo, [MS-XLSB] 2.4 (record id 60).
+// A worksheet's page setup, breaks and outline settings (#901), [MS-XLSB]
+// 2.4: BrtWsProp, BrtMargins, BrtPrintOptions, BrtPageSetup,
+// BrtBeginHeaderFooter, the break collections and BrtBrk, and a custom
+// view's BrtBeginUserShView..BrtEndUserShView.
+const BRT_WS_PROP: u32 = 147;
+const BRT_BEGIN_RW_BRK: u32 = 392;
+const BRT_END_RW_BRK: u32 = 393;
+const BRT_BEGIN_COL_BRK: u32 = 394;
+const BRT_END_COL_BRK: u32 = 395;
+const BRT_BRK: u32 = 396;
+const BRT_BEGIN_USER_SH_VIEW: u32 = 423;
+const BRT_END_USER_SH_VIEW: u32 = 424;
+const BRT_MARGINS: u32 = 476;
+const BRT_PRINT_OPTIONS: u32 = 477;
+const BRT_PAGE_SETUP: u32 = 478;
+const BRT_BEGIN_HEADER_FOOTER: u32 = 479;
+
+/// Which break collection a BrtBrk belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Breaks {
+    None,
+    Rows,
+    Cols,
+}
+
 const BRT_COL_INFO: u32 = 60;
 /// BrtMergeCell, [MS-XLSB] 2.4 (record id 176).
 const BRT_MERGE_CELL: u32 = 176;
@@ -742,11 +768,70 @@ fn read_sheet(
     // The conditional-formatting block whose rules follow: the index of the
     // one just pushed, none after a block that wasn't (or its end).
     let mut cf_open: Option<usize> = None;
+    // Inside a custom view (BrtBeginUserShView..BrtEndUserShView): its
+    // page setup and break records are the view's, not the sheet's.
+    let mut in_view = false;
+    // The break collection a BrtBrk adds to.
+    let mut breaks = Breaks::None;
     for (ty, body) in records(bytes) {
         let mut c = Cur::new(body);
         let _ = (|| -> Option<()> {
             match ty {
                 BRT_ROW_HDR => row = c.u32()?,
+                BRT_BEGIN_USER_SH_VIEW => in_view = true,
+                BRT_END_USER_SH_VIEW => in_view = false,
+                BRT_MARGINS
+                | BRT_PRINT_OPTIONS
+                | BRT_PAGE_SETUP
+                | BRT_BEGIN_HEADER_FOOTER
+                | BRT_BEGIN_RW_BRK
+                | BRT_BEGIN_COL_BRK
+                | BRT_BRK
+                    if in_view => {}
+                // BrtWsProp: its flags are BIFF8 WSBOOL's (fRowSumsBelow,
+                // fColSumsRight, fFitToPage at bits 6-8).
+                BRT_WS_PROP => {
+                    let flags = c.u16()?;
+                    page::read_wsbool(&mut sheet.page_setup, &mut sheet.outline, flags);
+                }
+                BRT_MARGINS => page::read_margins_12(&mut sheet.page_setup, body)?,
+                BRT_PRINT_OPTIONS => page::read_print_options_12(&mut sheet.page_setup, c.u16()?),
+                BRT_PAGE_SETUP => page::read_page_setup_12(&mut sheet.page_setup, body)?,
+                // BrtBeginHeaderFooter: flags, then six nullable strings
+                // (odd, even and first page header and footer); a null one
+                // reads as empty, which is none.
+                BRT_BEGIN_HEADER_FOOTER => {
+                    let flags = c.u16()?;
+                    let hf = &mut sheet.page_setup.header_footer;
+                    page::read_hf_flags(hf, flags);
+                    for slot in [
+                        &mut hf.odd_header,
+                        &mut hf.odd_footer,
+                        &mut hf.even_header,
+                        &mut hf.even_footer,
+                        &mut hf.first_header,
+                        &mut hf.first_footer,
+                    ] {
+                        *slot = page::hf_text(c.wide()?);
+                    }
+                }
+                BRT_BEGIN_RW_BRK => breaks = Breaks::Rows,
+                BRT_BEGIN_COL_BRK => breaks = Breaks::Cols,
+                BRT_END_RW_BRK | BRT_END_COL_BRK => breaks = Breaks::None,
+                // BrtBrk: unRwCol (the first row or column of the new
+                // page), unColRwStrt, unColRwEnd, fMan, fPivot. Only manual
+                // ones are kept, as `.xls`'s are.
+                BRT_BRK => {
+                    let (at, start, end, man) = (c.u32()?, c.u32()?, c.u32()?, c.u32()?);
+                    let (list, max) = match breaks {
+                        Breaks::Rows => (&mut sheet.row_breaks, crate::sheet::MAX_ROWS),
+                        Breaks::Cols => (&mut sheet.col_breaks, crate::sheet::MAX_COLS),
+                        Breaks::None => return None,
+                    };
+                    if man != 0 && at < max && list.len() < page::MAX_BREAKS {
+                        list.push(page::read_break(at, start, end));
+                    }
+                }
                 // BrtCellBlank .. BrtFmlaError: column, style, then the value.
                 1..=11 => {
                     let col = c.u32()?;
@@ -2535,5 +2620,248 @@ mod tests {
         assert_eq!(crate::validation::invalid_cells(wb, 0, None), [(1, 1)]);
         assert!(crate::cf::cell_dxf(wb, 0, 4, 3).is_some());
         assert!(crate::cf::cell_dxf(wb, 0, 1, 1).is_none());
+    }
+
+    /// BrtPageSetup: paper, scale, the resolutions and copies, the first
+    /// page, fit width and height, the flags and a null szRelID.
+    fn page_setup_rec(paper: u32, scale: u32, start: i32, fit: (u32, u32), flags: u16) -> Vec<u8> {
+        let mut v = Vec::new();
+        for n in [paper, scale, 600, 600, 1] {
+            v.extend(n.to_le_bytes());
+        }
+        v.extend(start.to_le_bytes());
+        v.extend(fit.0.to_le_bytes());
+        v.extend(fit.1.to_le_bytes());
+        v.extend(flags.to_le_bytes());
+        v.extend(0xFFFF_FFFFu32.to_le_bytes());
+        rec(BRT_PAGE_SETUP, &v)
+    }
+
+    fn margins_rec(m: [f64; 6]) -> Vec<u8> {
+        rec(
+            BRT_MARGINS,
+            &m.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+        )
+    }
+
+    /// BrtBeginHeaderFooter with `flags` and six strings (None: null).
+    fn hf_rec(flags: u16, texts: [Option<&str>; 6]) -> Vec<u8> {
+        let mut v = flags.to_le_bytes().to_vec();
+        for t in texts {
+            match t {
+                Some(t) => v.extend(wide(t)),
+                None => v.extend(0xFFFF_FFFFu32.to_le_bytes()),
+            }
+        }
+        rec(BRT_BEGIN_HEADER_FOOTER, &v)
+    }
+
+    fn brk(at: u32, start: u32, end: u32, man: u32) -> Vec<u8> {
+        let mut v = Vec::new();
+        for n in [at, start, end, man, 0] {
+            v.extend(n.to_le_bytes());
+        }
+        rec(BRT_BRK, &v)
+    }
+
+    /// A break collection's begin record: ibrkMac, ibrkManMac.
+    fn brk_begin(ty: u32, n: u32) -> Vec<u8> {
+        let mut v = n.to_le_bytes().to_vec();
+        v.extend(n.to_le_bytes());
+        rec(ty, &v)
+    }
+
+    /// BrtWsProp: the flags (u16 + u8), brtcolorTab, rwSync, colSync and
+    /// an empty strName.
+    fn ws_prop(flags: u16) -> Vec<u8> {
+        let mut v = flags.to_le_bytes().to_vec();
+        v.push(0);
+        v.extend([0u8; 8]);
+        v.extend(0xFFFF_FFFFu32.to_le_bytes());
+        v.extend(0xFFFF_FFFFu32.to_le_bytes());
+        v.extend(0u32.to_le_bytes());
+        rec(BRT_WS_PROP, &v)
+    }
+
+    /// A sheet's page setup records in the Worksheet ABNF's order: every
+    /// field away from its default, a 1,048,000-row break past `.xls`'s
+    /// grid, an automatic break (left out) and fit to page.
+    fn page_setup_sheet() -> Vec<Vec<u8>> {
+        vec![
+            // fShowAutoBreaks, fFitToPage; summaries above and left.
+            ws_prop(0x0001 | 0x0100),
+            rec(BRT_ROW_HDR, &0u32.to_le_bytes()),
+            rec(BRT_PRINT_OPTIONS, &0x000Fu16.to_le_bytes()),
+            margins_rec([0.25, 0.5, 1.25, 1.5, 0.4, 0.6]),
+            // A3, 75%, page 3, fit 2 × 0, left to right, landscape, black
+            // and white, draft, notes at the end, errors as #N/A, use page.
+            page_setup_rec(
+                8,
+                75,
+                3,
+                (2, 0),
+                0x0001 | 0x0002 | 0x0008 | 0x0010 | 0x0020 | 0x0080 | 0x0100 | (3 << 9),
+            ),
+            hf_rec(
+                0x0001 | 0x0002,
+                [
+                    Some("&LOdd &P"),
+                    Some("&CFoot"),
+                    Some("&REven"),
+                    None,
+                    Some("First"),
+                    Some(""),
+                ],
+            ),
+            rec(480, &[]),
+            brk_begin(BRT_BEGIN_RW_BRK, 3),
+            brk(10, 0, 16383, 1),
+            brk(1_048_000, 2, 9, 1),
+            brk(20, 0, 16383, 0),
+            rec(BRT_END_RW_BRK, &[]),
+            brk_begin(BRT_BEGIN_COL_BRK, 1),
+            brk(4, 0, 1_048_575, 1),
+            rec(BRT_END_COL_BRK, &[]),
+        ]
+    }
+
+    /// The `.xlsb` reader reads a sheet's BrtWsProp, BrtPrintOptions,
+    /// BrtMargins, BrtPageSetup, BrtBeginHeaderFooter and manual breaks into
+    /// the page setup, breaks and outline settings (#901).
+    #[test]
+    fn xlsb_reads_page_setup_breaks_and_outline_settings() {
+        use crate::print::setup::{CellComments, Orientation, PageOrder, PrintErrors};
+        let book = open(&xlsb(&[], &page_setup_sheet()));
+        let s = &book.sheets[0];
+        let ps = &s.page_setup;
+        let m = ps.margins;
+        assert_eq!(
+            (m.left, m.right, m.top, m.bottom, m.header, m.footer),
+            (0.25, 0.5, 1.25, 1.5, 0.4, 0.6)
+        );
+        assert_eq!((ps.paper_size, ps.scale), (8, 75));
+        assert_eq!(ps.orientation, Orientation::Landscape);
+        assert!(ps.fit_to_page);
+        assert_eq!((ps.fit_width, ps.fit_height), (2, 0));
+        assert_eq!(ps.first_page_number, Some(3));
+        assert_eq!(ps.page_order, PageOrder::OverThenDown);
+        assert!(ps.black_and_white && ps.draft);
+        assert_eq!(ps.cell_comments, CellComments::AtEnd);
+        assert_eq!(ps.errors, PrintErrors::NA);
+        assert!(ps.h_centered && ps.v_centered && ps.headings && ps.grid_lines);
+        let hf = &ps.header_footer;
+        assert!(hf.different_odd_even && hf.different_first);
+        assert!(!hf.scale_with_doc && !hf.align_with_margins);
+        assert_eq!(hf.odd_header.as_deref(), Some("&LOdd &P"));
+        assert_eq!(hf.odd_footer.as_deref(), Some("&CFoot"));
+        assert_eq!(hf.even_header.as_deref(), Some("&REven"));
+        assert_eq!(hf.even_footer, None);
+        assert_eq!(hf.first_header.as_deref(), Some("First"));
+        assert_eq!(hf.first_footer, None);
+        let breaks = |b: &[crate::sheet::PageBreak]| {
+            b.iter()
+                .map(|b| (b.id, b.attrs.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            breaks(&s.row_breaks),
+            [
+                (10, r#" max="16383" man="1""#.to_string()),
+                (1_048_000, r#" min="2" max="9" man="1""#.to_string()),
+            ]
+        );
+        assert_eq!(
+            breaks(&s.col_breaks),
+            [(4, r#" max="1048575" man="1""#.to_string())]
+        );
+        assert!(!s.outline.summary_below && !s.outline.summary_right);
+
+        // Portrait, not fUsePage, fNoOrient: Default, no first page; a
+        // scale of 0 and a paper of 0 keep the defaults, as does a fit
+        // count past 32767.
+        let book = open(&xlsb(&[], &[page_setup_rec(0, 0, 5, (40_000, 3), 0x0040)]));
+        let ps = &book.sheets[0].page_setup;
+        assert_eq!(ps.orientation, Orientation::Default);
+        assert_eq!((ps.paper_size, ps.scale), (1, 100));
+        assert_eq!((ps.fit_width, ps.fit_height), (1, 3));
+        assert_eq!(ps.first_page_number, None);
+        // A first page below 1 is none: the model has no 0 or negatives.
+        for start in [0, -4] {
+            let book = open(&xlsb(&[], &[page_setup_rec(9, 100, start, (1, 1), 0x0080)]));
+            let ps = &book.sheets[0].page_setup;
+            assert_eq!(ps.first_page_number, None);
+            assert_eq!(ps.orientation, Orientation::Portrait);
+        }
+        // No page setup records: the `.xlsx` loader's defaults.
+        let book = open(&xlsb(&[], &[]));
+        assert_eq!(
+            book.sheets[0].page_setup,
+            crate::print::setup::PageSetup::default()
+        );
+    }
+
+    /// A custom view's page setup, header and footer and breaks
+    /// (BrtBeginUserShView..BrtEndUserShView) are the view's: they never
+    /// stand in for the sheet's own.
+    #[test]
+    fn xlsb_custom_view_page_setup_is_not_the_sheets() {
+        let view = |inner: Vec<Vec<u8>>| {
+            let mut v = vec![rec(BRT_BEGIN_USER_SH_VIEW, &[0; 16])];
+            v.extend(inner);
+            v.push(rec(BRT_END_USER_SH_VIEW, &[]));
+            v
+        };
+        let mut sheet = vec![rec(BRT_ROW_HDR, &0u32.to_le_bytes())];
+        sheet.extend(view(vec![
+            rec(BRT_PRINT_OPTIONS, &0x000Fu16.to_le_bytes()),
+            margins_rec([2.0; 6]),
+            page_setup_rec(8, 50, 7, (3, 3), 0x0082),
+            hf_rec(0, [Some("View"), None, None, None, None, None]),
+            rec(480, &[]),
+            brk_begin(BRT_BEGIN_RW_BRK, 1),
+            brk(5, 0, 16383, 1),
+            rec(BRT_END_RW_BRK, &[]),
+        ]));
+        // The sheet's own: only margins and a page setup.
+        sheet.push(margins_rec([0.1, 0.2, 0.3, 0.4, 0.05, 0.06]));
+        sheet.push(page_setup_rec(9, 90, 1, (1, 1), 0));
+        let book = open(&xlsb(&[], &sheet));
+        let s = &book.sheets[0];
+        let want = crate::print::setup::PageSetup {
+            margins: crate::print::setup::Margins {
+                left: 0.1,
+                right: 0.2,
+                top: 0.3,
+                bottom: 0.4,
+                header: 0.05,
+                footer: 0.06,
+            },
+            paper_size: 9,
+            scale: 90,
+            orientation: crate::print::setup::Orientation::Portrait,
+            ..crate::print::setup::PageSetup::default()
+        };
+        assert_eq!(s.page_setup, want);
+        assert!(s.row_breaks.is_empty() && s.col_breaks.is_empty());
+    }
+
+    /// Side effect (#901): an imported `.xlsb`'s page setup and manual
+    /// breaks come through Convert (a save as `.xlsx` and a reload).
+    #[test]
+    fn xlsb_page_setup_survives_convert() {
+        let bytes = xlsb(&[], &page_setup_sheet());
+        let (pkg, _) = crate::legacy::open_workbook(&bytes).unwrap();
+        let imported = pkg.workbook.sheets[0].clone();
+        let back = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        let s = &back.workbook.sheets[0];
+        assert_ne!(s.page_setup, crate::print::setup::PageSetup::default());
+        assert_eq!(s.page_setup, imported.page_setup);
+        let ids = |b: &[crate::sheet::PageBreak]| {
+            b.iter().map(|b| (b.id, b.is_manual())).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&s.row_breaks), [(10, true), (1_048_000, true)]);
+        assert_eq!(ids(&s.col_breaks), [(4, true)]);
+        assert_eq!(s.outline, imported.outline);
+        assert!(!s.outline.summary_below);
     }
 }
