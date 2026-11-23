@@ -149,12 +149,68 @@ impl RevisionLocation {
     }
 }
 
-/// The run XML of an inline that may be a picture (#1639).
-fn picture_raw(inl: &Inline) -> Option<&str> {
-    match inl {
-        Inline::Raw(raw) | Inline::SmartArt { raw, .. } => Some(raw),
-        _ => None,
+/// The media rids of the pictures among `inlines` (#1639), those inside a
+/// link or a tracked change too, at any depth (#1853), each added to `out`
+/// once, in order.
+fn collect_embeds(inlines: &[Inline], out: &mut Vec<String>) {
+    for inl in inlines {
+        match inl {
+            Inline::Raw(raw) | Inline::SmartArt { raw, .. } => {
+                for rid in crate::image::inline_embeds(raw) {
+                    if !out.contains(&rid) {
+                        out.push(rid);
+                    }
+                }
+            }
+            Inline::Hyperlink(h) => collect_embeds(&h.content, out),
+            Inline::Revision { content, .. } => collect_embeds(content, out),
+            _ => {}
+        }
     }
+}
+
+/// `inlines`' pictures with their media rids renamed by `map`, at any
+/// depth (#1853); whether any was. A link or tracked change holding a
+/// renamed one is marked changed, so save rebuilds it from its content
+/// rather than writing its loaded XML and the old rid; one holding none
+/// is left as it was.
+fn remap_embeds_in(
+    inlines: &mut [Inline],
+    map: &std::collections::HashMap<String, String>,
+) -> bool {
+    let mut any = false;
+    for inl in inlines {
+        match inl {
+            Inline::Raw(raw) | Inline::SmartArt { raw, .. } => {
+                // `Some` for any picture, renamed or not: only a different
+                // string is a rename.
+                if let Some(out) = crate::image::replace_inline_embeds(raw, map)
+                    && out != *raw
+                {
+                    *raw = out;
+                    any = true;
+                }
+            }
+            Inline::Hyperlink(h) => {
+                if remap_embeds_in(&mut h.content, map) {
+                    h.content_changed |= h.raw.is_some();
+                    any = true;
+                }
+            }
+            Inline::Revision {
+                content,
+                content_changed,
+                ..
+            } => {
+                if remap_embeds_in(content, map) {
+                    *content_changed = true;
+                    any = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    any
 }
 
 /// Clipboard contents: styled inline content, one entry per (partial)
@@ -206,35 +262,27 @@ impl Clip {
         self.lists = lists;
     }
 
-    /// The media rids of the inline pictures among the clip's top-level
-    /// runs and SmartArt drawings ([`crate::image::inline_embeds`]: blip and
-    /// SVG blip), each once, in order (#1639).
+    /// The media rids of the inline pictures among the clip's runs and
+    /// SmartArt drawings ([`crate::image::inline_embeds`]: blip and SVG
+    /// blip), each once, in order (#1639): those in a link or a tracked
+    /// change too, at any depth (#1853).
     pub fn inline_embeds(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for raw in self.paras.iter().flatten().filter_map(picture_raw) {
-            for rid in crate::image::inline_embeds(raw) {
-                if !out.contains(&rid) {
-                    out.push(rid);
-                }
-            }
+        for para in &self.paras {
+            collect_embeds(para, &mut out);
         }
         out
     }
 
     /// The clip with each inline picture's media rids renamed by `map`; a
-    /// rid not in it is kept (#1639).
+    /// rid not in it is kept (#1639). A link or tracked change holding a
+    /// renamed picture is saved from its content (#1853).
     pub fn remap_embeds(&mut self, map: &std::collections::HashMap<String, String>) {
         if map.is_empty() {
             return;
         }
-        for inl in self.paras.iter_mut().flatten() {
-            let raw = match inl {
-                Inline::Raw(raw) | Inline::SmartArt { raw, .. } => raw,
-                _ => continue,
-            };
-            if let Some(out) = crate::image::replace_inline_embeds(raw, map) {
-                *raw = out;
-            }
+        for para in &mut self.paras {
+            remap_embeds_in(para, map);
         }
     }
 
@@ -6518,6 +6566,134 @@ mod tests {
             vec!["rId20".to_string(), "rId6".to_string()]
         );
         assert_eq!(clip.paras[0][1], Inline::Raw("<w:r><w:ptab/></w:r>".into()));
+    }
+
+    /// #1853: a picture in a link or a tracked change of the clip, at any
+    /// depth, is listed and renamed as a top-level one is; a wrapper a
+    /// rename reached is rebuilt from its content at save, one it did not
+    /// reach is left as it was.
+    #[test]
+    fn clip_lists_and_remaps_embeds_inside_links_and_revisions_1853() {
+        let pic =
+            |rid: &str| Inline::Raw(crate::image::inline_picture_run(rid, 10, 10, 1, "a.png"));
+        let link = |content: Vec<Inline>| {
+            Inline::Hyperlink(Hyperlink {
+                rel_id: Some("rId1".into()),
+                content,
+                raw: Some("<w:hyperlink r:id=\"rId1\">…</w:hyperlink>".into()),
+                ..Default::default()
+            })
+        };
+        let revision = |content: Vec<Inline>| Inline::Revision {
+            kind: RevisionKind::Insert,
+            metadata: RevisionMetadata::default(),
+            raw: "<w:ins w:id=\"1\">…</w:ins>".into(),
+            content,
+            content_changed: false,
+        };
+        let untouched_link = link(vec![run("l", RunProps::default())]);
+        let untouched_rev = revision(vec![run("r", RunProps::default())]);
+        let mut clip = Clip::new(vec![
+            vec![
+                pic("rId5"),
+                link(vec![
+                    run("l", RunProps::default()),
+                    pic("rId6"),
+                    pic("rId9"),
+                ]),
+            ],
+            vec![
+                revision(vec![pic("rId7")]),
+                revision(vec![link(vec![pic("rId8")])]),
+            ],
+            vec![untouched_link.clone(), untouched_rev.clone()],
+        ]);
+        let rids = |c: &Clip| -> Vec<String> { c.inline_embeds() };
+        assert_eq!(rids(&clip), ["rId5", "rId6", "rId9", "rId7", "rId8"]);
+        let map = [
+            ("rId6", "rId20"),
+            ("rId9", "rId23"),
+            ("rId7", "rId21"),
+            ("rId8", "rId22"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+        clip.remap_embeds(&map);
+        assert_eq!(rids(&clip), ["rId5", "rId20", "rId23", "rId21", "rId22"]);
+        let Inline::Hyperlink(h) = &clip.paras[0][1] else {
+            panic!()
+        };
+        assert!(h.content_changed, "both of its pictures were renamed");
+        for inl in &clip.paras[1] {
+            let Inline::Revision {
+                content,
+                content_changed,
+                ..
+            } = inl
+            else {
+                panic!()
+            };
+            assert!(content_changed);
+            if let [Inline::Hyperlink(h)] = content.as_slice() {
+                assert!(h.content_changed, "the nested link too");
+            }
+        }
+        // Nothing renamed in them: the same bytes, still written from `raw`.
+        assert_eq!(clip.paras[2], vec![untouched_link, untouched_rev]);
+        // A map that renames nothing in a wrapper leaves it unchanged.
+        let before = clip.clone();
+        let other = [("rId99".to_string(), "rId98".to_string())]
+            .into_iter()
+            .collect();
+        let mut again = Clip::new(vec![vec![link(vec![pic("rId5")])]]);
+        let fresh = again.clone();
+        again.remap_embeds(&other);
+        assert_eq!(again, fresh);
+        clip.remap_embeds(&other);
+        assert_eq!(clip, before);
+    }
+
+    /// #1853: a copied link holding a picture, plain or as a tracked
+    /// insertion, saves with the picture's renamed rid inside the link
+    /// once pasted: the link is not written from its stale loaded XML.
+    #[test]
+    fn a_copied_picture_in_a_link_saves_with_its_remapped_rid_1853() {
+        let pic = crate::image::inline_picture_run("rId9", 10, 10, 1, "a.png");
+        for inner in [
+            pic.clone(),
+            format!("<w:ins w:id=\"3\" w:author=\"A\">{pic}</w:ins>"),
+        ] {
+            let xml = format!(
+                "<w:document xmlns:w=\"w\" xmlns:r=\"r\"><w:body><w:p><w:r><w:t>a</w:t></w:r>\
+                 <w:hyperlink w:anchor=\"top\"><w:r><w:t>l</w:t></w:r>{inner}</w:hyperlink>\
+                 <w:r><w:t>b</w:t></w:r></w:p></w:body></w:document>"
+            );
+            let mut src = Editor::new(crate::load::parse_document_xml(
+                &xml,
+                &crate::load::Relationships::default(),
+            ));
+            src.select_all();
+            let mut clip = src.copy().expect("a clip");
+            assert_eq!(clip.inline_embeds(), ["rId9"], "{inner}");
+            let map = [("rId9".to_string(), "rId30".to_string())]
+                .into_iter()
+                .collect();
+            clip.remap_embeds(&map);
+            let mut dst = Editor::new(crate::load::parse_document_xml(
+                "<w:document xmlns:w=\"w\"><w:body><w:p/></w:body></w:document>",
+                &crate::load::Relationships::default(),
+            ));
+            dst.paste(&clip);
+            let saved = crate::serialize::blocks_to_xml(&dst.doc.body);
+            let at = saved.find("<w:hyperlink").expect("the link");
+            let end = at + saved[at..].find("</w:hyperlink>").expect("closed");
+            let link = &saved[at..end];
+            assert!(link.contains("r:embed=\"rId30\""), "{saved}");
+            assert!(!saved.contains("rId9"), "{saved}");
+            // The copy took the insertion's picture as itself (#1625).
+            assert!(!link.contains("<w:ins"), "{saved}");
+        }
     }
 
     #[test]

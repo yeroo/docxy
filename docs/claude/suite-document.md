@@ -138,8 +138,14 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   of media (EMF, WMF, TIFF, SVG too: the part name's extension, the content
   type from the source's `[Content_Types].xml`, else
   `image::media_content_type`, else the bytes; `Package::add_part_media`
-  writes it), in `Inline::Raw` and `Inline::SmartArt` runs at
-  the clip's top level (not inside a tracked change or a hyperlink). A paste
+  writes it), in `Inline::Raw` and `Inline::SmartArt` runs, those inside a
+  hyperlink's `content` or a tracked change too, at any depth (#1853:
+  `Clip::inline_embeds`, `Clip::remap_embeds`). A link or revision holding a
+  renamed picture is marked `content_changed`, so its save rebuilds it from
+  its content instead of writing its loaded XML and the old rid; one holding
+  none stays byte-identical. Not reached: a text box's blocks, a field's
+  result, a `w:ins` around a whole link (its zero-width revision is not
+  copied at all). A paste
   of the window's own clip runs `pictures::carry` into the part it lands in:
   a rid that names the same bytes there is kept, else a relationship of that
   part to identical bytes is taken (`Package::part_rel_targets`, the rels

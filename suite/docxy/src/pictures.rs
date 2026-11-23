@@ -674,6 +674,64 @@ mod tests {
         );
     }
 
+    /// #1853: a picture inside a link, plain or in a tracked insertion,
+    /// brings its media into another package as a top-level one does, and
+    /// the link saves with the new rid.
+    #[test]
+    fn a_picture_in_a_link_pasted_in_another_package_brings_its_media_1853() {
+        use docxcore::model::{
+            Block, Hyperlink, Inline, Paragraph, RevisionKind, RevisionMetadata,
+        };
+        let mut src = new_package(Document { body: vec![] });
+        let body_rid = add(&mut src, "word/document.xml", &png(1));
+        let pic = docxcore::image::inline_picture_run(&body_rid, 9525, 9525, 1, "a.png");
+        let ins = format!("<w:ins w:id=\"1\">{pic}</w:ins>");
+        let tracked = Inline::Revision {
+            kind: RevisionKind::Insert,
+            metadata: RevisionMetadata::default(),
+            raw: ins.clone(),
+            content: vec![Inline::Raw(pic.clone())],
+            content_changed: false,
+        };
+        for (inner, xml) in [(Inline::Raw(pic.clone()), &pic), (tracked, &ins)] {
+            let copied = docxcore::editor::Clip::new(vec![vec![Inline::Hyperlink(Hyperlink {
+                anchor: Some("top".into()),
+                content: vec![inner],
+                raw: Some(format!("<w:hyperlink w:anchor=\"top\">{xml}</w:hyperlink>")),
+                ..Default::default()
+            })]]);
+            let media = capture(&src, "word/document.xml", &copied);
+            assert_eq!(media.len(), 1, "{xml}");
+            // The other document's body names a different picture by that rid.
+            let mut dst = new_package(Document { body: vec![] });
+            let other = add(&mut dst, "word/document.xml", &png(7));
+            assert_eq!(other, body_rid);
+            let mut clip = copied.clone();
+            carry(&mut dst, "word/document.xml", &media, &mut clip);
+            let rid = clip.inline_embeds().pop().unwrap();
+            assert_ne!(rid, other);
+            assert_eq!(
+                resolve(&dst, "word/document.xml", &rid),
+                Some(("png", png(1)))
+            );
+            assert_eq!(
+                resolve(&dst, "word/document.xml", &other),
+                Some(("png", png(7)))
+            );
+            // Saved, the link names the carried media, not the stale rid.
+            let saved = docxcore::serialize::blocks_to_xml(&[Block::Paragraph(Paragraph {
+                content: clip.paras[0].clone(),
+                ..Default::default()
+            })]);
+            let at = saved.find("<w:hyperlink").expect("the link");
+            assert!(
+                saved[at..].contains(&format!("r:embed=\"{rid}\"")),
+                "{saved}"
+            );
+            assert!(!saved.contains(&format!("r:embed=\"{other}\"")), "{saved}");
+        }
+    }
+
     #[test]
     fn a_picture_that_did_not_resolve_at_copy_is_pasted_as_it_was() {
         let (mut pkg, header, _, _) = package();

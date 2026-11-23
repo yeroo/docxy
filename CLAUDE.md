@@ -56,7 +56,8 @@ issue number to find its notes.
   borders and their grouping, Segoe UI's substitutes (#2231), comment
   balloons shown on open, resolved hidden, no inline glyph (#2232), cell
   list numbers, All caps and Small caps drawn, Table Styles tiles on a
-  dark page, Switch Modes not persisted (#2087).
+  dark page, Switch Modes not persisted (#2087), a pasted picture in a
+  link or a tracked change bringing its media (#1853).
 - `docs/claude/pdf-export.md`: before changing PDF export: embedded fonts (#1508),
   borders, picture watermarks and unequal columns (#797).
 - `docs/claude/pdf-view.md`: before changing the suite's PDF view (#2245): the
