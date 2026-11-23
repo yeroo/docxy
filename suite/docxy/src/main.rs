@@ -17535,15 +17535,32 @@ fn note_dead_story_markers(tab: &mut DocTab) {
 /// The package a new document is saved into (what [`doc_to_docx_styled`]
 /// builds without a base).
 fn blank_base(doc: &Document) -> Package {
-    let has_list = doc
-        .body
-        .iter()
-        .any(|b| matches!(b, Block::Paragraph(p) if p.props.in_list()));
-    if has_list {
+    if names_a_list(&doc.body) {
         docxcore::package::new_markdown_package(doc.clone())
     } else {
         docxcore::package::new_package(doc.clone())
     }
+}
+
+/// Whether a paragraph of `blocks` is in a list: one at the top level, in
+/// a table's cell (nested tables too) or in a paragraph's text box, the
+/// stories the editor edits there (#2181). A document with no package
+/// holds only docxy's own lists, which the package made for it must
+/// define wherever they are.
+pub(crate) fn names_a_list(blocks: &[Block]) -> bool {
+    blocks.iter().any(|b| match b {
+        Block::Paragraph(p) => {
+            p.props.in_list()
+                || p.content
+                    .iter()
+                    .any(|i| matches!(i, Inline::TextBox { blocks, .. } if names_a_list(blocks)))
+        }
+        Block::Table(t) => t
+            .rows
+            .iter()
+            .any(|r| r.cells.iter().any(|c| names_a_list(&c.blocks))),
+        Block::Raw(_) | Block::SectionProperties(_) => false,
+    })
 }
 
 /// Add a comment on `tab`'s selection: its markers go around the selection
@@ -36498,6 +36515,184 @@ mod repeat_tests {
             body: vec![p(Some(0))],
         });
         assert!(base.part("word/numbering.xml").is_none());
+    }
+
+    /// The numbering part `pkg` holds, parsed.
+    fn numbering_2181(pkg: &Package) -> docxcore::numbering::Numbering {
+        docxcore::numbering::parse_numbering_xml(
+            &pkg.part_text("word/numbering.xml")
+                .expect("a numbering part"),
+        )
+    }
+
+    /// `blocks` as one table of one cell.
+    fn in_a_cell_2181(blocks: Vec<Block>) -> Block {
+        Block::Table(Table {
+            rows: vec![docxcore::model::Row {
+                cells: vec![docxcore::model::Cell {
+                    blocks,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    }
+
+    /// #2181: a new document whose only list item is in a table cell, a
+    /// nested table's cell or a text box is saved into a package whose
+    /// numbering part defines docxy's own lists 1 and 2; with no list item
+    /// anywhere, none.
+    #[test]
+    fn blank_base_defines_lists_of_a_table_cell_2181() {
+        let item = || {
+            Block::Paragraph(Paragraph {
+                props: docxcore::model::ParProps {
+                    num_id: Some(NUM_BULLET),
+                    ..Default::default()
+                },
+                content: vec![],
+            })
+        };
+        let text_box = Block::Paragraph(Paragraph {
+            content: vec![Inline::TextBox {
+                raw: String::new(),
+                blocks: vec![item()],
+            }],
+            ..Default::default()
+        });
+        for (name, body) in [
+            ("a cell", vec![in_a_cell_2181(vec![item()])]),
+            (
+                "a nested cell",
+                vec![in_a_cell_2181(vec![in_a_cell_2181(vec![item()])])],
+            ),
+            ("a text box", vec![text_box]),
+            ("a cell's text box", {
+                let Block::Paragraph(p) = item() else {
+                    unreachable!()
+                };
+                let inner = Block::Paragraph(Paragraph {
+                    content: vec![Inline::TextBox {
+                        raw: String::new(),
+                        blocks: vec![Block::Paragraph(p)],
+                    }],
+                    ..Default::default()
+                });
+                vec![in_a_cell_2181(vec![inner])]
+            }),
+        ] {
+            assert!(names_a_list(&body), "{name}");
+            let numbering = numbering_2181(&blank_base(&Document { body }));
+            assert!(numbering.defines(NUM_BULLET), "{name}");
+            assert!(numbering.defines(NUM_DECIMAL), "{name}");
+        }
+        let plain = vec![in_a_cell_2181(vec![Block::Paragraph(Paragraph::default())])];
+        assert!(!names_a_list(&plain));
+        let base = blank_base(&Document { body: plain });
+        assert!(base.part("word/numbering.xml").is_none());
+    }
+
+    /// The first table's first cell's first paragraph's numId in `doc`.
+    fn cell_num_id_2181(doc: &Document) -> Option<i32> {
+        doc.body.iter().find_map(|b| match b {
+            Block::Table(t) => match t.rows[0].cells[0].blocks.first() {
+                Some(Block::Paragraph(p)) => p.props.num_id,
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
+    /// The document `tab` holds, saved by its Save As to a `.docx` and
+    /// loaded again.
+    fn saved_2181(tab: &mut DocTab, name: &str) -> Package {
+        let dir = std::env::temp_dir().join(format!("docxy-2181-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("new.docx");
+        assert!(save_doc_tab(tab, Some(path.clone())), "{}", tab.status);
+        let pkg = docxcore::package::load_package(&std::fs::read(&path).unwrap()).expect("loads");
+        let _ = std::fs::remove_dir_all(&dir);
+        pkg
+    }
+
+    /// A new document tab's editor with the caret in a one-cell table's
+    /// cell, the tab still without a package.
+    fn new_tab_in_a_cell_2181() -> DocTab {
+        let mut tab = blank_docx_tab("Document1");
+        assert!(tab.pkg.is_none());
+        let Surface::Doc(ed) = &mut tab.surface else {
+            unreachable!()
+        };
+        ed.insert_table(1, 1, docxcore::table::AutoFit::Default)
+            .unwrap();
+        tab
+    }
+
+    /// #2181: Bullets in a table cell of a new document (no package, so the
+    /// list is docxy's own and `define` has nowhere to put it), then Save:
+    /// the saved package's numbering defines the cell paragraph's numId.
+    #[test]
+    fn a_new_documents_cell_bullets_save_defined_2181() {
+        let mut tab = new_tab_in_a_cell_2181();
+        let ids = ListIds::of_package(tab.pkg.as_ref());
+        let Surface::Doc(ed) = &mut tab.surface else {
+            unreachable!()
+        };
+        // What run_act's Bullets runs.
+        toggle_list(ed, ids.bullet);
+        ids.define(tab.pkg.as_mut(), true);
+        let Surface::Doc(ed) = &tab.surface else {
+            unreachable!()
+        };
+        assert_eq!(cell_num_id_2181(&ed.doc), Some(NUM_BULLET));
+        assert!(
+            !ed.doc
+                .body
+                .iter()
+                .any(|b| matches!(b, Block::Paragraph(p) if p.props.in_list())),
+            "no list item at the top level"
+        );
+        let pkg = saved_2181(&mut tab, "bullets");
+        let num = cell_num_id_2181(&pkg.document).expect("the cell keeps its list");
+        assert!(numbering_2181(&pkg).defines(num), "numId {num} is defined");
+    }
+
+    /// #2181: another app's list pasted into a table cell of a new
+    /// document, as `do_paste` pastes it, saves a numbering that defines it.
+    #[test]
+    fn a_list_pasted_into_a_new_documents_cell_saves_defined_2181() {
+        let mut tab = new_tab_in_a_cell_2181();
+        let mut clip = Clip::from_html("<ul><li>a</li><li>b</li></ul>", None).unwrap();
+        crate::doc_paste::numbering_for_paste(tab.pkg.as_mut(), &mut clip);
+        let Surface::Doc(ed) = &mut tab.surface else {
+            unreachable!()
+        };
+        ed.one_step("Paste", |e| e.paste(&clip));
+        assert_eq!(cell_num_id_2181(&ed.doc), Some(NUM_BULLET));
+        let pkg = saved_2181(&mut tab, "paste");
+        let num = cell_num_id_2181(&pkg.document).expect("the cell keeps its list");
+        assert!(numbering_2181(&pkg).defines(num), "numId {num} is defined");
+    }
+
+    /// #2181: with Track Changes on, a new document's save base (made by
+    /// `save_base`, the tab having no package) defines a cell's list too.
+    #[test]
+    fn a_tracked_new_documents_cell_list_has_a_numbering_2181() {
+        let mut tab = new_tab_in_a_cell_2181();
+        let Surface::Doc(ed) = &mut tab.surface else {
+            unreachable!()
+        };
+        toggle_list(ed, NUM_BULLET);
+        ed.set_track_changes(Some(docxcore::editor::TrackAuthor {
+            author: "Ada".into(),
+            clock: || "2026-11-23T00:00:00Z".into(),
+        }));
+        let doc = ed.doc.clone();
+        let base = save_base(&tab, &doc, &[]).expect("a tracked document has a base");
+        assert!(base.track_revisions());
+        assert!(numbering_2181(&base).defines(NUM_BULLET));
     }
 
     /// An undo step pushed in another editor (another tab, the
