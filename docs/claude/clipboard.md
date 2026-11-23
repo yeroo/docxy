@@ -100,9 +100,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
   Reject of the paste leaves the list on the caret's paragraph (a gap).
 - A paste with lists puts its items in the package's own lists
   (`doc_paste::numbering_for_paste`, #2087 r3): the importers' 1
-  (bullets) and 2 (decimal) become `ListIds`' (1 and 2, or docxy's
-  reserved 9990 / 9991 where the numbering part defines 1 or 2 as the other
-  kind or leaves them undefined, `docs/claude/docx-editing.md` §Lists), and
+  (bullets) and 2 (decimal) become `ListIds`' (1 and 2 where the numbering
+  part is docxy's own, else docxy's reserved 9990 / 9991, never a Word
+  document's own 1 or 2, #2180, `docs/claude/docx-editing.md` §Lists), and
   each kind pasted is defined (`ListIds::define`: a package without a
   numbering part gets `add_markdown_numbering`'s): `Docxy::do_paste` for a
   tab that `saves_as_word`, and the ext DocView's `paste_clip`. A tab with no package gets it from

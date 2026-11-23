@@ -156,11 +156,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   tab and Shift+Tab is Decrease Indent; Tab does not change a list's
   level, as in a document tab), `apply_format` (`apply_doc_act` and the
   font boxes' calls; Bullets/Numbering toggle the document's lists with
-  `all_in_list`, `ListIds::of_package` and `ListIds::define`, #2087: 1 and
-  2, or 9990 / 9991 where the numbering part defines them otherwise or
-  leaves them undefined, `docs/claude/docx-editing.md` §Lists;
+  `ListIds::of_package` and `ListIds::define`, #2087: 1 and 2 only where
+  the numbering part is docxy's own, else 9990 / 9991, never a Word
+  document's own 1 or 2, #2180; on and off by the kind of list,
+  `all_in_list_kind`, `docs/claude/docx-editing.md` §Lists;
   `apply_doc_act`'s Bullets/Numbers are a no-op) and `caret_format`
-  (`caret_format(ed, lists)`: its list buttons over the same ids;
+  (`caret_format(ed, numbering)`: its list buttons by the same kind test;
   `caret_props_shown`,
   pending toggles included, #854; the caret end's, no mixed state; font,
   size and colour over the seeded styles, `None` only when neither the run
