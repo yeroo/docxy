@@ -498,7 +498,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   longer empties the cells untracked: `clear_cells` (`tables.rs`) records
   the text of every cell paragraph (`cell_range_spans`, text-box paragraphs
   and nested tables' included) as deleted, as `delete_text_across_paragraphs`
-  does, with `from_before` true for each (`copy_taking`'s cell spans).
+  does, with `from_before` true for each (`copy_taking`'s cell spans),
+  walked last-first: a text-box paragraph's path holds the box's inline
+  index in its host, which the host's edit can move (FIX r1 M1).
   Equations and fields a `w:del` cannot hold stay (`kept_while_tracking`),
   inline pictures are recorded, the author's own pending insertions go and
   another's stay (#1625), floating pictures and `w:ptab`s are recorded on a

@@ -669,7 +669,7 @@ fn a_plain_text_cut_copies_every_equation_it_removes_1242() {
 /// paragraph cut does, so its clip leaves them out: a paste must not add a
 /// second.
 #[test]
-fn a_tracked_cut_of_cells_carries_their_equations_1242() {
+fn a_tracked_cut_of_cells_keeps_their_equations_1242() {
     let has_eq = |clip: &Clip| {
         clip.paras
             .iter()
@@ -874,6 +874,118 @@ fn a_tracked_cell_delete_records_a_floating_picture_1471() {
             .any(|d| d.contains("wp:anchor")),
         "{xml}"
     );
+}
+
+/// A text box (an inline drawing) holding one paragraph of `text`.
+fn text_box(text: &str) -> String {
+    format!(
+        "<w:r><w:drawing><wp:inline><wp:extent cx=\"952500\" cy=\"952500\"/>\
+         <w:txbxContent><w:p>{}</w:p></w:txbxContent></wp:inline></w:drawing></w:r>",
+        t(text)
+    )
+}
+
+/// The paragraph of the `nth` text box in the paragraph at `host`, found
+/// afresh (its path holds the box's inline index, which edits move).
+fn box_para(ed: &Editor, host: &[usize], nth: usize) -> Vec<usize> {
+    let p = resolve_para(&ed.doc.body, host).expect("a host paragraph");
+    let k = p
+        .content
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| matches!(i, Inline::TextBox { .. }))
+        .nth(nth)
+        .expect("a text box")
+        .0;
+    let mut path = host.to_vec();
+    path.extend([k, 0]);
+    path
+}
+
+/// FIX r1 M1: a tracked clear walks a cell's text-box paragraphs before
+/// their host, whose edit (two differently formatted runs recorded as one
+/// deletion) moves the box's inline index: the box's text is recorded, not
+/// left live, so a cut and paste brings it back once.
+#[test]
+fn a_tracked_clear_records_a_text_box_in_a_cell_1471() {
+    let host = vec![0, 0, 0, 0];
+    let cells = || {
+        let bold = "<w:r><w:rPr><w:b/></w:rPr><w:t>A</w:t></w:r>";
+        let mut ed = table_of(&[
+            format!("<w:p>{bold}{}{}</w:p>", t("b"), text_box("box")),
+            format!("<w:p>{}</w:p>", t("c")),
+        ]);
+        track(&mut ed);
+        ed.anchor = Some(Caret::at(host.clone(), 0));
+        ed.caret = Caret::at(vec![0, 0, 1, 0], 1);
+        ed
+    };
+    let original = saved(&cells());
+    let table =
+        |xml: &str| xml[xml.find("<w:tbl>").unwrap()..xml.find("</w:tbl>").unwrap()].to_string();
+    let boxed = |ed: &Editor| {
+        let path = box_para(ed, &host, 0);
+        (etext_at(ed, path.clone()), para_plain(ed, path))
+    };
+    // A tracked Delete records the box's text.
+    let mut ed = cells();
+    assert!(ed.delete_selection());
+    assert_eq!(boxed(&ed), (String::new(), "box".into()), "{}", saved(&ed));
+    assert!(
+        deleted_objects(&saved(&ed))
+            .iter()
+            .any(|d| d.contains(">box<"))
+    );
+    // A tracked cut, then a tracked paste: the box's text is deleted in the
+    // cell and inserted once by the paste.
+    let mut ed = cells();
+    let clip = ed.cut().expect("a clip");
+    assert_eq!(clip.to_text(), "Ab\nbox\nc");
+    assert_eq!(boxed(&ed), (String::new(), "box".into()), "{}", saved(&ed));
+    ed.anchor = None;
+    ed.set_caret(Caret::at(vec![1], 0));
+    ed.paste(&clip);
+    let live = |ed: &Editor| {
+        all_paragraph_paths(&ed.doc.body)
+            .into_iter()
+            .filter(|p| etext_at(ed, p.clone()) == "box")
+            .count()
+    };
+    assert_eq!(live(&ed), 1, "the paste's alone: {}", saved(&ed));
+    let mut accepted = cells();
+    let clip = accepted.cut().expect("a clip");
+    accepted.anchor = None;
+    accepted.set_caret(Caret::at(vec![1], 0));
+    accepted.paste(&clip);
+    accepted.accept_all_revisions();
+    assert_eq!(live(&accepted), 1, "{}", saved(&accepted));
+    assert_eq!(boxed(&accepted), (String::new(), String::new()));
+    ed.reject_all_revisions();
+    assert_eq!(table(&saved(&ed)), table(&original));
+    assert_eq!(live(&ed), 1, "the cell's box alone");
+}
+
+/// FIX r1 M1: the author's own pending insertion before two text boxes goes
+/// outright, moving both boxes' inline indices; each box's text is still
+/// recorded in its own box.
+#[test]
+fn a_tracked_clear_records_each_text_box_in_its_own_box_1471() {
+    let host = vec![0, 0, 0, 0];
+    let pending = format!("<w:ins w:id=\"1\" w:author=\"Ann\">{PIC}</w:ins>");
+    let mut ed = table_of(&[
+        format!("<w:p>{pending}{}{}</w:p>", text_box("one"), text_box("two")),
+        format!("<w:p>{}</w:p>", t("c")),
+    ]);
+    track(&mut ed);
+    ed.anchor = Some(Caret::at(host.clone(), 0));
+    ed.caret = Caret::at(vec![0, 0, 1, 0], 1);
+    assert!(ed.delete_selection());
+    assert!(!saved(&ed).contains("rId5"), "the own insertion went");
+    for (nth, text) in [(0, "one"), (1, "two")] {
+        let path = box_para(&ed, &host, nth);
+        assert_eq!(etext_at(&ed, path.clone()), "", "{}", saved(&ed));
+        assert_eq!(para_plain(&ed, path), text);
+    }
 }
 
 const LINKED: &str = "<w:fldSimple w:instr=\" REF x \"><w:hyperlink w:anchor=\"x\">\

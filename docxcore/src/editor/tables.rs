@@ -355,10 +355,14 @@ impl Editor {
             self.clear_placeholders_around(&path);
         }
         if self.track.is_some() {
-            // Taken before any edit: a recorded deletion takes no offset and
-            // no block moves, so each span stays where it was.
+            // Taken before any edit and walked last-first, so no edit moves a
+            // path still to be walked: a text box's paragraphs (whose paths
+            // hold the box's inline index in its host) come after their host
+            // and are done before it, whose edit can change that index (a
+            // merged deletion, an own insertion removed). No block moves, and
+            // a recorded deletion takes no offset.
             let spans = self.cell_range_spans(range);
-            for (path, from, to) in &spans {
+            for (path, from, to) in spans.iter().rev() {
                 if drop_objects {
                     self.drop_or_record_objects(path, *from, *to, true, true);
                 }
