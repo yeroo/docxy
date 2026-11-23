@@ -1083,6 +1083,28 @@ fn import_binding(path: &str) -> String {
         .unwrap_or_else(|| plain.to_string_lossy().into_owned())
 }
 
+/// The free name a new workbook bound to `path` (`untitled.xlsx`) saves
+/// to when a file has that name (#907): `untitled1.xlsx`, `untitled2.xlsx`,
+/// and so on beside it, numbered from the name without its number, so a
+/// workbook already moved to `untitled1.xlsx` goes on to `untitled2.xlsx`.
+fn untitled_binding(path: &str) -> String {
+    let source = Path::new(path);
+    let stem = source
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let base = match stem.trim_end_matches(|c: char| c.is_ascii_digit()) {
+        "" => stem.as_str(),
+        b => b,
+    };
+    let at = |name: String| source.with_file_name(name);
+    std::iter::once(at(format!("{base}.xlsx")))
+        .chain((1u32..).map(|n| at(format!("{base}{n}.xlsx"))))
+        .find(|p| !p.exists())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
 /// Whether `path` names a template (`.xltx`, `.xltm`).
 fn is_template(path: &str) -> bool {
     matches!(
@@ -2704,6 +2726,12 @@ struct App {
     /// The template this workbook was started from, until this session first
     /// writes it (to `Budget1.xlsx` from `Budget.xltx`, or a Save As name).
     template: Option<String>,
+    /// A new workbook (a bare launch, File › New, Ctrl+N, the start screen's
+    /// Blank workbook, one from XLSTART's `book.xltx`) that has no file of
+    /// its own until this session writes one: it is bound to `untitled.xlsx`
+    /// only as a name, so an interactive save opens Save As, as Excel does
+    /// for a never-saved workbook (#907).
+    untitled: bool,
     /// An import (a `.tsv`/`.prn` or an `.xls`/`.xlsb`/`.ods`; an opened
     /// `.csv`/`.txt` is bound to itself instead) this session has not
     /// written yet: its binding was free when it
@@ -2932,6 +2960,7 @@ impl App {
             path: path.to_string(),
             import_source: None,
             template: None,
+            untitled: false,
             import_unsaved: false,
             dropped: Vec::new(),
             compat_accepted: Vec::new(),
@@ -5761,7 +5790,7 @@ impl App {
             self.status = Some(msg);
             return;
         }
-        if self.ask_where_to_save_template_workbook() {
+        if self.ask_where_to_save_new_workbook() {
             return;
         }
         let path = self.path.clone();
@@ -5859,27 +5888,37 @@ impl App {
         );
     }
 
-    /// A workbook started from a template has no file of its own until this
-    /// session writes one, so an interactive save opens Save As instead, as
-    /// Excel does, with the name the workbook was bound to (`Budget1.xlsx`),
-    /// or the next free one when that has been taken since it opened.
-    /// Returns whether it did. The control surface's `wb.save` is scripted
-    /// and writes the bound name directly, as Excel's `Workbook.Save` does.
-    fn ask_where_to_save_template_workbook(&mut self) -> bool {
-        let Some(template) = self.template.clone() else {
+    /// A workbook started from a template, or a new one (#907), has no file
+    /// of its own until this session writes one, so an interactive save
+    /// opens Save As instead, as Excel does, with the name the workbook was
+    /// bound to (`Budget1.xlsx`, `untitled.xlsx`), or the next free one when
+    /// a file has that name. Returns whether it did. The control surface's
+    /// `wb.save` is scripted and writes the bound name directly (moving on
+    /// the same way), as Excel's `Workbook.Save` does.
+    fn ask_where_to_save_new_workbook(&mut self) -> bool {
+        let template = self.template.clone();
+        if template.is_none() && !self.untitled {
             return false;
-        };
+        }
         if Path::new(&self.path).exists() {
-            if let Some(free) = template_binding(&template) {
-                self.path = free;
+            match &template {
+                Some(t) => {
+                    if let Some(free) = template_binding(t) {
+                        self.path = free;
+                    }
+                }
+                None => self.path = untitled_binding(&self.path),
             }
         }
         self.open_prompt(PromptKind::SaveAs);
-        self.status = Some(format!(
-            "{} is a new workbook from {}: choose where to save it",
-            file_name_of(&self.path),
-            file_name_of(&template)
-        ));
+        let name = file_name_of(&self.path);
+        self.status = Some(match template {
+            Some(t) => format!(
+                "{name} is a new workbook from {}: choose where to save it",
+                file_name_of(&t)
+            ),
+            None => format!("{name} is a new workbook: choose where to save it"),
+        });
         true
     }
 
@@ -5981,13 +6020,19 @@ impl App {
         // moves on to the next free one rather than replace that file.
         // The same for an imported workbook not yet written: if its
         // `<stem>.xlsx` appeared since it opened, it moves on to the next
-        // free name rather than replace that file.
+        // free name rather than replace that file. And for a new workbook
+        // (#907; never also template-born): an `untitled.xlsx` already there
+        // is someone else's, so `wb.save` writes `untitled1.xlsx`, ...
         let taken = match (&self.template, &self.import_source) {
             (Some(t), _) if Path::new(&self.path).exists() => {
                 template_binding(t).map(|free| std::mem::replace(&mut self.path, free))
             }
             (None, Some(source)) if self.import_unsaved && Path::new(&self.path).exists() => {
                 Some(std::mem::replace(&mut self.path, import_binding(source)))
+            }
+            (None, _) if self.untitled && Path::new(&self.path).exists() => {
+                let free = untitled_binding(&self.path);
+                Some(std::mem::replace(&mut self.path, free))
             }
             _ => None,
         };
@@ -6009,6 +6054,7 @@ impl App {
                 self.text_type = None;
                 self.text_read = None;
                 self.template = None;
+                self.untitled = false;
                 self.import_unsaved = false;
                 // The file the workbook is bound to no longer has what the
                 // open dropped.
@@ -6042,14 +6088,17 @@ impl App {
         let previous = std::mem::replace(&mut self.path, path);
         // A name chosen in Save As is written as chosen, even over a file.
         let template = self.template.take();
+        let untitled = std::mem::take(&mut self.untitled);
         let import_unsaved = std::mem::take(&mut self.import_unsaved);
         if self.save_current().is_ok() {
             self.import_source = None;
             true
         } else {
-            // A failed Save As must retain protection for the imported file.
+            // A failed Save As must retain protection for the imported file,
+            // and leaves a new workbook without a file (#907).
             self.path = previous;
             self.template = template;
+            self.untitled = untitled;
             self.import_unsaved = import_unsaved;
             false
         }
@@ -8074,6 +8123,7 @@ impl App {
         self.import_source = import_source;
         self.bind_text(text);
         self.template = None;
+        self.untitled = false;
         self.import_unsaved = false;
         self.dropped = Vec::new();
         self.compat_accepted.clear();
@@ -8267,9 +8317,10 @@ impl App {
     /// cannot be read back, so reload refuses them and changes nothing.
     fn reload(&mut self) -> Result<(), String> {
         let path = self.path.clone();
-        // A workbook started from a template has no file of its own until
-        // this session writes one; a file of its name is someone else's.
-        if self.template.is_some() {
+        // A workbook started from a template, or a new one, has no file of
+        // its own until this session writes one; a file of its name is
+        // someone else's (#907).
+        if self.template.is_some() || self.untitled {
             let msg = "nothing to revert: not saved yet".to_string();
             self.status = Some(msg.clone());
             return Err(msg);
@@ -8339,7 +8390,8 @@ impl App {
 
     /// Start a new workbook (discarding the current one): from `book.xltx`
     /// in the XLSTART folder when there is one, as Excel's Ctrl+N does, else
-    /// blank. Either way it is `untitled.xlsx`, never bound into XLSTART.
+    /// blank. Either way it is `untitled.xlsx`, never bound into XLSTART, and
+    /// has no file until a Save As gives it one (#907).
     fn new_workbook(&mut self) {
         let mut failed = None;
         if let Some(t) = self.xlstart.as_deref().and_then(default_template) {
@@ -8350,6 +8402,7 @@ impl App {
             {
                 Ok(o) => {
                     self.install_workbook(o.pkg, "untitled.xlsx".to_string(), None, None, None);
+                    self.untitled = true;
                     self.read_only = None;
                     self.status = Some(format!("New workbook from {name}"));
                     return;
@@ -8369,6 +8422,7 @@ impl App {
         self.protected_view = None;
         self.import_source = None;
         self.template = None;
+        self.untitled = true;
         self.import_unsaved = false;
         // Nothing of the last workbook's Compatibility Mode carries over.
         self.dropped.clear();
@@ -10773,7 +10827,7 @@ impl App {
             // (the workbook stays modified), keeps the editor open with the
             // reason on the status line.
             "wq" | "x" => {
-                if self.ask_where_to_save_template_workbook() {
+                if self.ask_where_to_save_new_workbook() {
                     return false;
                 }
                 // A file opened read-only is refused before any question.
@@ -13950,6 +14004,10 @@ fn run_tui(
         });
     }
     app.start_screen = welcome;
+    // A bare launch and a `.txt`/`.prn` start bound to `untitled.xlsx`, a
+    // name and not a file (#907); a startup workbook or the import's finish
+    // below installs a workbook that has one.
+    app.untitled = welcome || wizard.is_some();
     // With no file to open, the startup folders' workbooks open instead of
     // the welcome screen.
     if welcome {
@@ -17250,9 +17308,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// #727 r2: File > New after opening a template starts an ordinary
-    /// workbook: Ctrl-S writes `untitled.xlsx` where it is bound, and does
-    /// not move on to a `<template>N` name.
+    /// #727 r2: File > New after opening a template starts an ordinary new
+    /// workbook, not a template-born one: its scripted save never moves on
+    /// to a `<template>N` name. #907: as a new workbook, it never replaces
+    /// an `untitled.xlsx` already there either, and writes `untitled1.xlsx`.
     #[test]
     fn a_new_workbook_after_a_template_is_not_template_born() {
         let dir = macro_dir("tmpl-new");
@@ -17272,10 +17331,271 @@ mod tests {
         std::fs::write(&untitled, b"old").unwrap();
         app.path = untitled.to_str().unwrap().to_string();
         app.save_current().unwrap();
-        assert_eq!(Path::new(&app.path), untitled);
-        assert!(load_xlsx(&std::fs::read(&untitled).unwrap()).is_ok());
+        let free = dir.join("untitled1.xlsx");
+        assert_eq!(Path::new(&app.path), free);
+        assert!(load_xlsx(&std::fs::read(&free).unwrap()).is_ok());
+        assert_eq!(std::fs::read(&untitled).unwrap(), b"old");
         assert!(!dir.join("Budget1.xlsx").exists());
         assert!(app.reload().is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #907: a new workbook (File › New) bound to `dir/untitled.xlsx`, a
+    /// name and not a file.
+    fn untitled_workbook(dir: &Path) -> App {
+        let mut app = App::new(new_xlsx(), "kept.xlsx");
+        app.os_clip = None;
+        app.new_workbook();
+        assert!(app.untitled);
+        app.path = dir.join("untitled.xlsx").to_string_lossy().into_owned();
+        app
+    }
+
+    /// #907: Ctrl+S on a new workbook opens Save As with the name it is
+    /// bound to and writes nothing, as Excel does for a never-saved
+    /// workbook; once Save As gives it a file, Ctrl+S saves there.
+    #[test]
+    fn ctrl_s_on_a_new_workbook_opens_save_as() {
+        let dir = macro_dir("untitled-save-as");
+        let mut app = untitled_workbook(&dir);
+        let bound = dir.join("untitled.xlsx");
+        handle_key(&mut app, ctrl('s'));
+        assert!(prompts_save_as(&app), "Ctrl+S opens Save As");
+        assert_eq!(
+            Path::new(&app.prompt.as_ref().unwrap().text),
+            bound.as_path()
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("untitled.xlsx is a new workbook: choose where to save it")
+        );
+        assert!(!bound.exists(), "nothing written yet");
+        // Esc leaves it new: the next Ctrl+S asks again.
+        app.prompt = None;
+        handle_key(&mut app, ctrl('s'));
+        assert!(prompts_save_as(&app));
+        assert!(app.untitled);
+
+        // Confirmed, it has a file: Ctrl+S writes it in place.
+        app.commit_prompt();
+        assert!(app.status.as_deref().unwrap().starts_with("Saved"));
+        assert!(load_xlsx(&std::fs::read(&bound).unwrap()).is_ok());
+        assert!(!app.untitled && app.prompt.is_none());
+        put_cells(&mut app, 0, &[(0, 0, "x")]);
+        handle_key(&mut app, ctrl('s'));
+        assert!(app.prompt.is_none(), "no prompt once it has a file");
+        assert!(app.status.as_deref().unwrap().starts_with("Saved"));
+        assert!(!app.modified);
+        assert_eq!(Path::new(&app.path), bound);
+        assert!(app.reload().is_ok(), "revert reads its own file back");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #907: the bug: an `untitled.xlsx` already in the folder is someone
+    /// else's. Ctrl+S leaves its bytes alone and offers `untitled1.xlsx`;
+    /// confirming writes that one.
+    #[test]
+    fn saving_a_new_workbook_never_replaces_an_untitled_file() {
+        let dir = macro_dir("untitled-taken");
+        let mut app = untitled_workbook(&dir);
+        let taken = dir.join("untitled.xlsx");
+        std::fs::write(&taken, b"old").unwrap();
+        handle_key(&mut app, ctrl('s'));
+        let free = dir.join("untitled1.xlsx");
+        assert!(prompts_save_as(&app));
+        assert_eq!(
+            Path::new(&app.prompt.as_ref().unwrap().text),
+            free.as_path()
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("untitled1.xlsx is a new workbook: choose where to save it")
+        );
+        assert_eq!(std::fs::read(&taken).unwrap(), b"old");
+        // That one taken too before the next Ctrl+S: on to untitled2.xlsx.
+        std::fs::write(&free, b"older").unwrap();
+        app.prompt = None;
+        handle_key(&mut app, ctrl('s'));
+        let next = dir.join("untitled2.xlsx");
+        assert_eq!(
+            Path::new(&app.prompt.as_ref().unwrap().text),
+            next.as_path()
+        );
+        app.commit_prompt();
+        assert!(load_xlsx(&std::fs::read(&next).unwrap()).is_ok());
+        assert_eq!(std::fs::read(&taken).unwrap(), b"old");
+        assert_eq!(std::fs::read(&free).unwrap(), b"older");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #907: `:w`, `:wq`, `:x`, the ribbon's Save and File › Save on a new
+    /// workbook ask as Ctrl+S does; `:wq` and `:x` do not quit.
+    #[test]
+    fn every_save_route_on_a_new_workbook_opens_save_as() {
+        let dir = macro_dir("untitled-routes");
+        type Route = fn(&mut App) -> bool;
+        let routes: [(&str, Route); 5] = [
+            (":w", |app| app.vim_run_command("w")),
+            (":wq", |app| app.vim_run_command("wq")),
+            (":x", |app| app.vim_run_command("x")),
+            ("ribbon", |app| {
+                app.ribbon_act(ribbon::Act::Save);
+                false
+            }),
+            ("backstage", |app| {
+                app.open_backstage();
+                app.apply_backstage_event(backstage::BackstageEvent::Save)
+            }),
+        ];
+        for (route, save) in routes {
+            let mut app = untitled_workbook(&dir);
+            let bound = PathBuf::from(&app.path);
+            assert!(!save(&mut app), "{route} does not quit");
+            assert!(prompts_save_as(&app), "{route} opens Save As");
+            assert!(app.backstage.is_none(), "{route}: the prompt is visible");
+            assert!(!bound.exists(), "{route} writes nothing");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #907: Ctrl+N with XLSTART's `book.xltx` starts a new workbook too.
+    #[test]
+    fn a_new_workbook_from_book_xltx_opens_save_as() {
+        let dir = macro_dir("untitled-book-xltx");
+        let xlstart = dir.join("XLSTART");
+        std::fs::create_dir_all(&xlstart).unwrap();
+        let bytes = gridcore::xlsx::save_xlsx_as(&new_xlsx(), SpreadsheetKind::Template);
+        std::fs::write(xlstart.join("book.xltx"), &bytes).unwrap();
+        let mut app = App::new(new_xlsx(), "kept.xlsx");
+        app.os_clip = None;
+        app.xlstart = Some(xlstart.clone());
+        handle_key(&mut app, ctrl('n'));
+        assert_eq!(app.status.as_deref(), Some("New workbook from book.xltx"));
+        assert!(app.untitled && app.template.is_none());
+        app.path = dir.join("untitled.xlsx").to_string_lossy().into_owned();
+        handle_key(&mut app, ctrl('s'));
+        assert!(prompts_save_as(&app));
+        assert!(!dir.join("untitled.xlsx").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #907: the scripted `wb.save` writes a new workbook without a dialog,
+    /// as Excel's `Workbook.Save` does, but never over an `untitled.xlsx`
+    /// already there: it moves on to the next free name.
+    #[test]
+    fn wb_save_on_a_new_workbook_takes_a_free_name() {
+        use ctlcore::json::Json;
+        let dir = macro_dir("untitled-wb-save");
+        let mut app = untitled_workbook(&dir);
+        let taken = dir.join("untitled.xlsx");
+        std::fs::write(&taken, b"old").unwrap();
+        control::dispatch(&mut app, "wb.save", &Json::obj(vec![])).unwrap();
+        assert!(app.prompt.is_none());
+        let free = dir.join("untitled1.xlsx");
+        assert_eq!(Path::new(&app.path), free);
+        assert!(load_xlsx(&std::fs::read(&free).unwrap()).is_ok());
+        assert_eq!(std::fs::read(&taken).unwrap(), b"old");
+        let status = app.status.clone().unwrap();
+        assert!(status.contains("already exists"), "{status}");
+        // Written once, it is an ordinary workbook.
+        assert!(!app.untitled);
+        control::dispatch(&mut app, "wb.save", &Json::obj(vec![])).unwrap();
+        assert_eq!(Path::new(&app.path), free);
+        // A free name: written where it is bound.
+        let mut fresh = untitled_workbook(&macro_dir("untitled-wb-save-free"));
+        let bound = PathBuf::from(&fresh.path);
+        control::dispatch(&mut fresh, "wb.save", &Json::obj(vec![])).unwrap();
+        assert!(load_xlsx(&std::fs::read(&bound).unwrap()).is_ok());
+        std::fs::remove_dir_all(bound.parent().unwrap()).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #907: revert on a new workbook has nothing to read back, and never
+    /// loads someone else's `untitled.xlsx`.
+    #[test]
+    fn reload_of_a_new_workbook_has_nothing_to_revert() {
+        let dir = macro_dir("untitled-reload");
+        let mut app = untitled_workbook(&dir);
+        std::fs::write(dir.join("untitled.xlsx"), b"old").unwrap();
+        put_cells(&mut app, 0, &[(0, 0, "mine")]);
+        assert_eq!(
+            app.reload(),
+            Err("nothing to revert: not saved yet".to_string())
+        );
+        assert_eq!(
+            app.sheet().cell(0, 0).map(|c| &c.value),
+            Some(&CellValue::Text("mine".into()))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #907: a failed Save As leaves a new workbook new: Ctrl+S asks again.
+    #[test]
+    fn a_failed_save_as_keeps_a_new_workbook_new() {
+        let dir = macro_dir("untitled-failed");
+        let mut app = untitled_workbook(&dir);
+        let bound = app.path.clone();
+        let nowhere = dir.join("missing").join("a.xlsx");
+        assert!(!app.save_as(nowhere.to_string_lossy().into_owned()));
+        assert!(app.untitled);
+        assert_eq!(app.path, bound);
+        handle_key(&mut app, ctrl('s'));
+        assert!(prompts_save_as(&app));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #907: a workbook opened from a file is not new: Ctrl+S writes it in
+    /// place, also after a File › New before the open.
+    #[test]
+    fn an_opened_workbook_is_not_untitled() {
+        let dir = macro_dir("untitled-opened");
+        let file = dir.join("book.xlsx");
+        std::fs::write(&file, gridcore::xlsx::save_xlsx(&new_xlsx())).unwrap();
+        let mut app = untitled_workbook(&dir);
+        app.open_workbook(file.to_str().unwrap());
+        assert!(!app.untitled);
+        put_cells(&mut app, 0, &[(0, 0, "x")]);
+        handle_key(&mut app, ctrl('s'));
+        assert!(app.prompt.is_none());
+        assert!(!app.modified);
+        assert_eq!(Path::new(&app.path), file);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #907: `xlsxy notes.txt` starts a new workbook under the Text Import
+    /// Wizard (`run_tui` marks it new). Cancelled, it stays new and Ctrl+S
+    /// asks; finished, it is bound to the text file and Ctrl+S writes it.
+    #[test]
+    fn a_startup_text_import_is_new_until_it_finishes() {
+        let dir = macro_dir("untitled-txt");
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, "1\t2\n").unwrap();
+        let start = |cancel: bool| {
+            let mut app = App::new(new_xlsx(), "untitled.xlsx");
+            app.os_clip = None;
+            app.untitled = true;
+            app.open_startup_wizard(txt.to_str().unwrap());
+            assert!(app.text_dialog.is_some());
+            if cancel {
+                app.text_dialog_key(KeyCode::Esc);
+            } else {
+                app.finish_text_dialog();
+            }
+            assert!(app.text_dialog.is_none());
+            app
+        };
+        let mut cancelled = start(true);
+        assert!(cancelled.untitled);
+        cancelled.path = dir.join("untitled.xlsx").to_string_lossy().into_owned();
+        handle_key(&mut cancelled, ctrl('s'));
+        assert!(prompts_save_as(&cancelled));
+        assert!(!dir.join("untitled.xlsx").exists());
+
+        let mut finished = start(false);
+        assert!(!finished.untitled);
+        assert_eq!(Path::new(&finished.path), txt);
+        handle_key(&mut finished, ctrl('s'));
+        assert!(finished.prompt.is_none(), "a finished import has its file");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
