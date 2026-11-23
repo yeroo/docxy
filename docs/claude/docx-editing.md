@@ -480,9 +480,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   marker run, or an orphan marker) loses only its `w:ptab`s instead
   (`editor::spanned_object`, `split_marker_object_run`, on the run's direct
   children through `field::children`), so the field keeps its begin and
-  end. Tracked, the tabs go in a `w:del` of their own, in a run with the
-  original start tag and `w:rPr`, beside the marker's run on the side the
-  first tab was on (`drop_or_record_objects`). A marker run that cannot be
+  end. Tracked, the run is cut where its children turn from tabs to
+  anything else and back, each piece a run with the original start tag and
+  `w:rPr`, and each piece of tabs is a `w:del` of its own
+  (`drop_or_record_objects`), so a reject puts every tab back in its place
+  among the markers (FIX r1 m1). A marker run that cannot be
   split (malformed, anything after its close) stays whole. A drawing whose
   own content holds markers goes whole, as before.
 - A field in one paragraph whose marker run holds a `w:ptab` collapses into

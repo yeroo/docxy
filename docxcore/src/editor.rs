@@ -5432,9 +5432,10 @@ fn end_props(content: &[Inline]) -> RunProps {
 /// Whether `raw` is a run holding a drawing or a positional tab (#768):
 /// zero-width in the editor (an inline picture, one offset since #1242, is
 /// deleted through its offset instead), yet something a person put there, which a
-/// delete over it removes, as Word deletes the character it is. Other
-/// zero-width XML (bookmarks, content-control boundaries, comment ranges)
-/// stays.
+/// delete over it removes, as Word deletes the character it is (a run that
+/// also holds field code loses only its tabs: [`spanned_object`], #1463).
+/// Other zero-width XML (bookmarks, content-control boundaries, comment
+/// ranges) stays.
 fn is_spanned_object(raw: &str) -> bool {
     raw.starts_with("<w:r")
         && (raw.contains("<w:drawing") || raw.contains("<w:ptab"))
@@ -5448,7 +5449,9 @@ fn is_spanned_object(raw: &str) -> bool {
 /// inside the range goes, the paragraph marks the range takes counting as
 /// inside it; one at the paragraph's start or end goes only when the range
 /// covers the whole paragraph. So retyping the first or last word of
-/// `[LOGO]Page 1` keeps the logo, as in Word.
+/// `[LOGO]Page 1` keeps the logo, as in Word. A run that also holds field
+/// code loses only its `w:ptab`s, or stays whole when it cannot be split
+/// ([`SpannedObject`], #1463).
 fn drop_spanned_objects(
     content: &mut Vec<Inline>,
     lo: usize,
@@ -5465,13 +5468,14 @@ pub(crate) enum SpannedObject {
     /// It goes whole (#768).
     Whole,
     /// It also holds field code, so only its alignment tabs go and its
-    /// markers stay (#1463): `kept` is the run without them, `tab` a run of
-    /// the tabs alone with the run's start tag and properties, `tab_first`
-    /// whether the first tab came before the first marker.
+    /// markers stay (#1463): `kept` is the run without them (what an
+    /// untracked delete leaves), `pieces` the run cut where its children
+    /// turn from tabs to anything else and back, in order, each a run of its
+    /// own with the start tag and `w:rPr`, `true` for a piece of tabs (what a
+    /// tracked delete records, so a reject puts each tab back in its place).
     Split {
         kept: String,
-        tab: String,
-        tab_first: bool,
+        pieces: Vec<(String, bool)>,
     },
     /// It holds field code but cannot be split safely: it stays whole, as
     /// removing it would leave a field unbalanced.
@@ -5485,45 +5489,45 @@ pub(crate) fn spanned_object(raw: &str) -> SpannedObject {
     if !crate::load::is_field_code_raw(raw) {
         return SpannedObject::Whole;
     }
-    split_marker_object_run(raw).map_or(SpannedObject::Keep, |(kept, tab, tab_first)| {
-        SpannedObject::Split {
-            kept,
-            tab,
-            tab_first,
-        }
+    split_marker_object_run(raw).map_or(SpannedObject::Keep, |(kept, pieces)| {
+        SpannedObject::Split { kept, pieces }
     })
 }
 
-/// The run `raw` split on its direct children into one without its
-/// `w:ptab`s and one of them alone (start tag and `w:rPr` repeated), and
-/// whether the first `w:ptab` comes before the first marker. `None` when it
-/// is malformed, holds no direct `w:ptab` or is followed by anything.
-fn split_marker_object_run(raw: &str) -> Option<(String, String, bool)> {
+/// The run `raw` split on its direct children: the run without its
+/// `w:ptab`s, and its pieces as [`SpannedObject::Split`] lists them. `None`
+/// when it is malformed, holds no direct `w:ptab` or is followed by
+/// anything.
+fn split_marker_object_run(raw: &str) -> Option<(String, Vec<(String, bool)>)> {
     let (open_end, kids) = crate::field::children(raw)?;
     if raw[kids.last()?.end..].trim() != "</w:r>" {
         return None;
     }
-    let is_tab = |name: &str| name == "w:ptab";
-    let first_tab = kids.iter().position(|k| is_tab(k.name))?;
-    let first_marker = kids
-        .iter()
-        .position(|k| matches!(k.name, "w:fldChar" | "w:instrText"));
-    let open = &raw[..open_end];
-    let (mut kept, mut tab) = (open.to_string(), open.to_string());
-    if let Some(rpr) = kids.iter().find(|k| k.name == "w:rPr") {
-        tab.push_str(&raw[rpr.start..rpr.end]);
+    if !kids.iter().any(|k| k.name == "w:ptab") {
+        return None;
     }
-    for k in &kids {
-        let el = &raw[k.start..k.end];
-        if is_tab(k.name) {
-            tab.push_str(el);
-        } else {
+    let rpr = kids
+        .iter()
+        .find(|k| k.name == "w:rPr")
+        .map_or("", |k| &raw[k.start..k.end]);
+    let head = format!("{}{rpr}", &raw[..open_end]);
+    let mut kept = head.clone();
+    let mut pieces: Vec<(String, bool)> = Vec::new();
+    for k in kids.iter().filter(|k| k.name != "w:rPr") {
+        let (el, tab) = (&raw[k.start..k.end], k.name == "w:ptab");
+        if !tab {
             kept.push_str(el);
+        }
+        match pieces.last_mut() {
+            Some((xml, was_tab)) if *was_tab == tab => xml.push_str(el),
+            _ => pieces.push((format!("{head}{el}"), tab)),
         }
     }
     kept.push_str("</w:r>");
-    tab.push_str("</w:r>");
-    Some((kept, tab, first_marker.is_some_and(|m| first_tab < m)))
+    for (xml, _) in &mut pieces {
+        xml.push_str("</w:r>");
+    }
+    Some((kept, pieces))
 }
 
 /// Remove the spanned objects at the ascending indices `found` of
@@ -5557,7 +5561,8 @@ fn remove_indices(content: &mut Vec<Inline>, gone: &[usize]) {
 
 /// The `content` indices of the drawing and positional-tab runs the delete
 /// spans; [`drop_spanned_objects`] removes them and a tracked delete records
-/// them (`Editor::drop_or_record_objects`).
+/// them (`Editor::drop_or_record_objects`), each as [`spanned_object`]
+/// says.
 pub(crate) fn spanned_object_indices(
     content: &[Inline],
     lo: usize,
