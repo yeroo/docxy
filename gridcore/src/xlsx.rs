@@ -34,6 +34,8 @@ mod foreign_xf_tests;
 #[cfg(test)]
 mod hyperlink_tests;
 mod hyperlinks;
+#[cfg(test)]
+mod rels_tests;
 pub(crate) use hyperlinks::{has_scheme, model_target};
 mod page;
 pub(crate) mod repair;
@@ -10309,42 +10311,158 @@ fn wsdr_prefix(xml: &str) -> &str {
     &xml[open..at]
 }
 
-/// The rId a rels part already gives `target`, if any — what [`add_rel`]
-/// declines to assign a second time.
-fn rel_id_for(parts: &[(String, Vec<u8>)], rels_part: &str, target: &str) -> Option<String> {
+/// The `rIdN` values in `xml`'s quoted attribute values (`"rId3"` or
+/// `'rId3'`), whatever attribute holds them.
+pub(crate) fn quoted_rids(xml: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut from = 0;
+    while let Some(at) = xml[from..].find("rId") {
+        let start = from + at;
+        from = start + 3;
+        let quote = match xml[..start].chars().next_back() {
+            Some(q @ ('"' | '\'')) => q,
+            _ => continue,
+        };
+        let digits = xml[from..].bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && xml[from + digits..].starts_with(quote) {
+            out.insert(xml[start..from + digits].to_string());
+        }
+    }
+    out
+}
+
+/// The folder a rels part's targets resolve against: its owner's
+/// (`xl/worksheets/_rels/sheet1.xml.rels` → `xl/worksheets`; the package
+/// root's `_rels/.rels` → ``).
+fn rels_dir(rels_part: &str) -> &str {
+    match rels_part.rsplit_once("_rels/") {
+        Some((dir, _)) => dir.trim_end_matches('/'),
+        None => "",
+    }
+}
+
+/// The part a rels part belongs to (`xl/_rels/workbook.xml.rels` →
+/// `xl/workbook.xml`); `None` for the package's own `_rels/.rels`.
+fn rels_owner(rels_part: &str) -> Option<String> {
+    let (_, file) = rels_part.rsplit_once("_rels/")?;
+    let file = file.strip_suffix(".rels").filter(|f| !f.is_empty())?;
+    let dir = rels_dir(rels_part);
+    Some(if dir.is_empty() {
+        file.to_string()
+    } else {
+        format!("{dir}/{file}")
+    })
+}
+
+/// The rId a rels part already gives `target` (written relative to the
+/// part's owner), if any — what [`add_rel`] declines to assign a second
+/// time. Read as the loader reads the part ([`parse_rels_mode`]), so an
+/// element it never reads relates nothing, and any spelling of a target
+/// that resolves to the same part (`/xl/…`, `./…`) is the same target. An
+/// External rel or one without an `Id` names no part a caller could reuse.
+pub(crate) fn rel_id_for(
+    parts: &[(String, Vec<u8>)],
+    rels_part: &str,
+    target: &str,
+) -> Option<String> {
     let xml = parts
         .iter()
         .find(|(n, _)| n == rels_part)
         .map(|(_, b)| String::from_utf8_lossy(b).into_owned())?;
-    let at = xml.find(&format!("Target=\"{target}\""))?;
-    let open = xml[..at].rfind("<Relationship")?;
-    attr_of_tag(&xml[open..], "<Relationship", "Id")
+    let dir = rels_dir(rels_part);
+    let want = resolve_relative(dir, target);
+    parse_rels_mode(&xml)
+        .into_iter()
+        .find(|(id, _, t, mode)| {
+            !id.is_empty()
+                && mode.as_deref() != Some("External")
+                && resolve_relative(dir, t) == want
+        })
+        .map(|(id, ..)| id)
 }
 
-/// Whether a new relationship in `rels_part` would really be written by
-/// [`add_rel`] (which creates a missing part, so `must_exist` is `false`) or
-/// [`add_workbook_rel`] (which doesn't): both splice it in before
-/// `</Relationships>`, and on a part without one (truncated, a self-closed
-/// or prefixed root) they still hand back an rId that names nothing. A
-/// writer asks this before it writes anything that rId would be put in.
+/// Whether a new relationship in `rels_part` goes in without the part being
+/// rewritten ([`splice_rels`]): a missing part passes unless `must_exist`.
+/// [`add_rel`] writes one into any part (#831), rebuilding one it can't
+/// splice into from what the loader reads in it; the writers that can
+/// refuse an edit (charts, pivots, hyperlinks) ask this first and leave a
+/// damaged part alone instead.
 fn rels_takes(parts: &[(String, Vec<u8>)], rels_part: &str, must_exist: bool) -> bool {
     match parts.iter().find(|(n, _)| n == rels_part) {
-        Some((_, bytes)) => String::from_utf8_lossy(bytes).contains("</Relationships>"),
+        Some((_, bytes)) => splice_rels(&String::from_utf8_lossy(bytes), "").is_some(),
         None => !must_exist,
     }
+}
+
+/// `xml`, a rels part, with `added` (`<Relationship …/>` elements) put in
+/// and every other byte kept: before its `</Relationships>`, or into its
+/// self-closed `<Relationships …/>` root, opened for them. `None` when it
+/// has neither: a part cut short, or a prefixed root.
+fn splice_rels(xml: &str, added: &str) -> Option<String> {
+    if xml.contains("</Relationships>") {
+        return Some(xml.replacen("</Relationships>", &format!("{added}</Relationships>"), 1));
+    }
+    let opened = open_self_closed_root(xml, "Relationships")?;
+    // `opened` is `xml` up to the root's `/>`, its `/` dropped.
+    let rest = &xml[opened.len() + 1..];
+    Some(format!("{opened}{added}</Relationships>{rest}"))
+}
+
+/// `xml` with `added` in it ([`splice_rels`]), or, when it has no root to
+/// splice into, a new part holding the relationships the loader reads in
+/// it ([`parse_rels_mode`]), then `added`: what the model knew of the part
+/// is all kept (#831). One read without an `Id`, which the loader still
+/// finds by its type, gets a fresh one past every id `xml` and `added` use.
+fn with_rels(xml: &str, added: &str) -> String {
+    if let Some(out) = splice_rels(xml, added) {
+        return out;
+    }
+    let mut fresh = max_rid(xml).max(max_rid(added));
+    let mut body = String::new();
+    for (id, ty, target, mode) in parse_rels_mode(xml) {
+        let id = if id.is_empty() {
+            fresh = fresh.saturating_add(1);
+            format!("rId{fresh}")
+        } else {
+            id
+        };
+        body.push_str(&format!(
+            "<Relationship Id=\"{}\" Type=\"{}\" Target=\"{}\"",
+            esc_attr(&id),
+            esc_attr(&ty),
+            esc_attr(&target)
+        ));
+        if let Some(mode) = mode {
+            body.push_str(&format!(" TargetMode=\"{}\"", esc_attr(&mode)));
+        }
+        body.push_str("/>");
+    }
+    body.push_str(added);
+    EMPTY_RELS.replacen("</Relationships>", &format!("{body}</Relationships>"), 1)
 }
 
 /// A new, empty rels part.
 pub(crate) const EMPTY_RELS: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>";
 
-/// The next free `rIdN` in a rels part: one past the highest in use.
-pub(crate) fn next_rid(xml: &str) -> String {
-    format!("rId{}", max_rid(xml) + 1)
+/// The highest `N` of the `rIdN` among `ids`, 0 for none: the one count
+/// [`add_rel`] and the hyperlink writer mint past.
+pub(crate) fn max_rid_in<'a>(ids: impl IntoIterator<Item = &'a str>) -> u64 {
+    ids.into_iter()
+        .filter_map(|id| id.strip_prefix("rId")?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
 }
 
-/// The highest `N` of an `Id="rIdN"` in a rels part, 0 for none.
-fn max_rid(xml: &str) -> u32 {
-    let mut max = 0u32;
+/// The highest `N` of an `rIdN` a part quotes ([`quoted_rids`]), 0 for none.
+fn max_quoted_rid(xml: &str) -> u64 {
+    max_rid_in(quoted_rids(xml).iter().map(String::as_str))
+}
+
+/// The highest `N` of an `rIdN` in use in a rels part, 0 for none: every
+/// quoted one, whatever its quote and spacing (`Id='rId2'`, `Id = "rId2"`,
+/// as the loader reads them), and an `Id="rIdN` a cut-short tail ends in.
+fn max_rid(xml: &str) -> u64 {
+    let mut max = max_quoted_rid(xml);
     let mut i = 0;
     while let Some(pos) = xml[i..].find("Id=\"rId") {
         let s = i + pos + "Id=\"rId".len();
@@ -10352,7 +10470,7 @@ fn max_rid(xml: &str) -> u32 {
             .chars()
             .take_while(|c| c.is_ascii_digit())
             .collect();
-        if let Ok(n) = digits.parse::<u32>() {
+        if let Ok(n) = digits.parse::<u64>() {
             max = max.max(n);
         }
         i = s;
@@ -10360,54 +10478,54 @@ fn max_rid(xml: &str) -> u32 {
     max
 }
 
-/// Add a relationship to any rels part (created when missing). Returns the
-/// assigned rId ("" when the target is already related).
+/// Add a relationship to any rels part (created when missing) and return
+/// its rId: the part as saved holds it, spliced in or rebuilt
+/// ([`with_rels`], #831), and neither the part nor its owner used it
+/// before. "" only when the target is already related ([`rel_id_for`],
+/// which gives the caller that rel's id).
 pub(crate) fn add_rel(
     parts: &mut Vec<(String, Vec<u8>)>,
     rels_part: &str,
     rel_type: &str,
     target: &str,
 ) -> String {
-    if !parts.iter().any(|(n, _)| n == rels_part) {
-        parts.push((rels_part.to_string(), EMPTY_RELS.as_bytes().to_vec()));
+    if rel_id_for(parts, rels_part, target).is_some() {
+        return String::new();
     }
-    if let Some(p) = parts.iter_mut().find(|(n, _)| n == rels_part) {
-        let xml = String::from_utf8_lossy(&p.1).into_owned();
-        if xml.contains(&format!("Target=\"{target}\"")) {
-            return String::new();
+    // Past every rId the owner quotes too: one whose rel was lost (a part
+    // cut short, a dangling `<sheet>` or `<drawing>`) is still named there,
+    // and a new rel under it would rebind that reference (#831).
+    let owner_max = rels_owner(rels_part)
+        .and_then(|o| parts.iter().find(|(n, _)| *n == o))
+        .map(|(_, b)| max_quoted_rid(&String::from_utf8_lossy(b)))
+        .unwrap_or(0);
+    let at = match parts.iter().position(|(n, _)| n == rels_part) {
+        Some(at) => at,
+        None => {
+            parts.push((rels_part.to_string(), EMPTY_RELS.as_bytes().to_vec()));
+            parts.len() - 1
         }
-        let rid = next_rid(&xml);
-        let rel = format!("<Relationship Id=\"{rid}\" Type=\"{rel_type}\" Target=\"{target}\"/>");
-        p.1 = xml
-            .replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
-            .into_bytes();
-        return rid;
-    }
-    String::new()
+    };
+    let xml = String::from_utf8_lossy(&parts[at].1).into_owned();
+    // From the text as it is, so an id only an unreadable tail holds is
+    // not handed out again by a rebuild.
+    let rid = format!("rId{}", max_rid(&xml).max(owner_max).saturating_add(1));
+    let rel = format!("<Relationship Id=\"{rid}\" Type=\"{rel_type}\" Target=\"{target}\"/>");
+    parts[at].1 = with_rels(&xml, &rel).into_bytes();
+    rid
 }
 
 /// Relate the workbook to `target_part` (a package path), written as a
-/// target relative to the workbook part's folder.
+/// target relative to the workbook part's folder: [`add_rel`] on the
+/// workbook's rels part.
 pub(crate) fn add_workbook_rel(
-    parts: &mut [(String, Vec<u8>)],
+    parts: &mut Vec<(String, Vec<u8>)>,
     rel_type: &str,
     target_part: &str,
 ) -> String {
     let target = relative_target(&workbook_dir(parts), target_part);
     let wb_rels = rels_part_name(&workbook_part_name(parts));
-    if let Some(p) = parts.iter_mut().find(|(n, _)| *n == wb_rels) {
-        let xml = String::from_utf8_lossy(&p.1).into_owned();
-        if xml.contains(&format!("Target=\"{target}\"")) {
-            return String::new();
-        }
-        let rid = next_rid(&xml);
-        let rel = format!("<Relationship Id=\"{rid}\" Type=\"{rel_type}\" Target=\"{target}\"/>");
-        p.1 = xml
-            .replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
-            .into_bytes();
-        return rid;
-    }
-    String::new()
+    add_rel(parts, &wb_rels, rel_type, &target)
 }
 
 // ---------------------------------------------------------------------------
@@ -10433,12 +10551,21 @@ impl SheetPackage {
             "add_sheet({name:?}): {}",
             crate::sheet::SHEET_NAME_TAKEN
         );
-        // Unused part name xl/worksheets/sheetN.xml.
+        // Unused part name xl/worksheets/sheetN.xml, which no workbook rel
+        // names either: a dangling one's `<sheet>` entry stays in
+        // workbook.xml, and reusing its rId would give two entries one (#831).
+        let wb_rels = rels_part_name(&workbook_part_name(&self.parts));
+        let wb_dir = workbook_dir(&self.parts);
         let mut n = 1;
-        while self.part(&format!("xl/worksheets/sheet{n}.xml")).is_some() {
+        let part_name = loop {
+            let p = format!("xl/worksheets/sheet{n}.xml");
+            if self.part(&p).is_none()
+                && rel_id_for(&self.parts, &wb_rels, &relative_target(&wb_dir, &p)).is_none()
+            {
+                break p;
+            }
             n += 1;
-        }
-        let part_name = format!("xl/worksheets/sheet{n}.xml");
+        };
         let ns = self.ns();
         let body = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"{}\"><dimension ref=\"A1\"/><sheetData/></worksheet>",
@@ -10451,6 +10578,7 @@ impl SheetPackage {
             "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml",
         );
         let rid = add_workbook_rel(&mut self.parts, &ns.rel("worksheet"), &part_name);
+        debug_assert!(!rid.is_empty(), "add_sheet: {part_name} already related");
         // workbook.xml <sheets> entry with the next free sheetId.
         let wb_part = workbook_part_name(&self.parts);
         if let Some(p) = self.parts.iter_mut().find(|(pn, _)| *pn == wb_part) {
@@ -10875,17 +11003,21 @@ impl SheetPackage {
             .unwrap_or(("", sheet_part.as_str()));
         let rels_part = format!("{ws_dir}/_rels/{ws_file}.rels");
         let file = part.rsplit_once('/').map_or(part, |(_, f)| f);
-        let rid = add_rel(
-            &mut self.parts,
-            &rels_part,
-            &ns.rel("table"),
-            &format!("../tables/{file}"),
-        );
-        if rid.is_empty() {
-            return;
-        }
+        let target = format!("../tables/{file}");
+        let rid = match add_rel(&mut self.parts, &rels_part, &ns.rel("table"), &target) {
+            // A dangling rel to the free part name is reused (#831).
+            rid if rid.is_empty() => match rel_id_for(&self.parts, &rels_part, &target) {
+                Some(rid) => rid,
+                None => return,
+            },
+            rid => rid,
+        };
         if let Some(p) = self.parts.iter_mut().find(|(n, _)| *n == sheet_part) {
             let xml = String::from_utf8_lossy(&p.1).into_owned();
+            // Its `<tablePart>` may be there already, kept as loaded.
+            if find_element_by_attr(&xml, "tablePart", "id", |v| v == rid).is_some() {
+                return;
+            }
             let entry = format!("<tablePart r:id=\"{rid}\"/>");
             let rels = Some(ns.rels);
             let xml =
@@ -24638,9 +24770,23 @@ mod ct_worksheet_order_tests {
         let mut pkg = loaded(&format!("{ROWS}{MARGINS}"));
         pkg.set_part(
             SHEET_RELS,
-            format!(r#"<Relationships xmlns="{R}"/>"#).into_bytes(),
+            format!(r#"<Relationships xmlns="{R}">"#).into_bytes(),
         );
         assert!(!pkg.can_add_chart(0));
+    }
+
+    #[test]
+    fn a_self_closed_worksheet_rels_takes_a_chart() {
+        // #831: an empty root written self-closed is opened for the rel.
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}"));
+        pkg.set_part(
+            SHEET_RELS,
+            format!(r#"<Relationships xmlns="{R}"/>"#).into_bytes(),
+        );
+        assert!(pkg.can_add_chart(0));
+        assert!(pkg.add_chart(0, (0, 3), (10, 8), &chart()));
+        let re = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        assert!(re.chart_host(0).is_some());
     }
 
     #[test]
@@ -24673,17 +24819,31 @@ mod ct_worksheet_order_tests {
     #[test]
     fn a_new_drawings_orphaned_rels_part_that_cannot_take_the_chart_refuses_it() {
         // drawing1.xml is free, but a rels part for it is left behind,
-        // self-closed: the chart's rel could not go in.
+        // cut short: the chart's rel could not go in.
         let mut pkg = loaded(&format!("{ROWS}{MARGINS}"));
         pkg.set_part(
             DRAWING_RELS,
-            format!(r#"<Relationships xmlns="{R}"/>"#).into_bytes(),
+            format!(r#"<Relationships xmlns="{R}">"#).into_bytes(),
         );
         assert!(pkg.part("xl/drawings/drawing1.xml").is_none());
         let parts = pkg.parts.clone();
         assert!(!pkg.can_add_chart(0));
         assert!(!pkg.add_chart(0, (0, 3), (10, 8), &chart()));
         assert_eq!(pkg.parts, parts);
+    }
+
+    #[test]
+    fn a_new_drawings_orphaned_self_closed_rels_part_takes_the_chart() {
+        // #831: left behind self-closed, it is opened for the chart's rel.
+        let mut pkg = loaded(&format!("{ROWS}{MARGINS}"));
+        pkg.set_part(
+            DRAWING_RELS,
+            format!(r#"<Relationships xmlns="{R}"/>"#).into_bytes(),
+        );
+        assert!(pkg.can_add_chart(0));
+        assert!(pkg.add_chart(0, (0, 3), (10, 8), &chart()));
+        let re = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        assert!(re.chart_host(0).is_some());
     }
 
     #[test]
@@ -26250,12 +26410,32 @@ mod ct_workbook_order_tests {
         let mut pkg = with_data(None);
         pkg.set_part(
             "xl/worksheets/_rels/sheet1.xml.rels",
-            format!(r#"<Relationships xmlns="{R}"/>"#).into_bytes(),
+            format!(r#"<Relationships xmlns="{R}">"#).into_bytes(),
         );
         let parts = pkg.parts.clone();
         assert!(add_default_pivot(&mut pkg).is_none());
         assert_eq!(pkg.parts, parts);
         assert!(pkg.workbook.pivots.is_empty());
+    }
+
+    #[test]
+    fn a_self_closed_destination_sheet_rels_takes_a_pivot() {
+        // #831: an empty root written self-closed is opened for the rel.
+        let mut pkg = with_data(None);
+        pkg.set_part(
+            "xl/worksheets/_rels/sheet1.xml.rels",
+            format!(r#"<Relationships xmlns="{R}"/>"#).into_bytes(),
+        );
+        pivot(&mut pkg);
+        let rels = part(&pkg, "xl/worksheets/_rels/sheet1.xml.rels");
+        assert!(
+            parse_rels(&rels)
+                .iter()
+                .any(|(_, ty, _)| ty.ends_with("/pivotTable")),
+            "{rels}"
+        );
+        let re = load_xlsx(&save_xlsx(&pkg)).expect("reload");
+        assert_eq!(re.workbook.pivots.len(), 1);
     }
 
     #[test]

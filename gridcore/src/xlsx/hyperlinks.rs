@@ -11,8 +11,9 @@ use opccore::xml::{Event, XmlParser};
 
 use super::{
     EMPTY_RELS, OoxmlNs, append_all_to_worksheet_child, decode, element_children, esc_attr,
-    parse_rels, parse_rels_mode, put_worksheet_child, rels_part_name, rels_takes,
-    remove_worksheet_child, start_tag, worksheet_child_span, worksheet_takes,
+    max_rid_in, parse_rels, parse_rels_mode, put_worksheet_child, quoted_rids, rels_part_name,
+    rels_takes, remove_worksheet_child, splice_rels, start_tag, worksheet_child_span,
+    worksheet_takes,
 };
 use crate::sheet::{
     Sheet, cell_name, hyperlink_cells as link_cells, parse_cell_name, parse_range_name,
@@ -522,12 +523,7 @@ impl ExternalRels {
         }
         let takes = rels_takes(parts, &rels_part, false) && (exists || rels_have_a_type(parts));
         let xml = takes.then(|| current.unwrap_or_else(|| EMPTY_RELS.to_string()));
-        let next = taken
-            .iter()
-            .filter_map(|id| id.strip_prefix("rId")?.parse::<u64>().ok())
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1);
+        let next = max_rid_in(taken.iter().map(String::as_str)).saturating_add(1);
         ExternalRels {
             rels_part,
             rel_type,
@@ -571,11 +567,10 @@ impl ExternalRels {
         let (Some(xml), false) = (self.xml, self.added.is_empty()) else {
             return;
         };
-        let xml = xml.replacen(
-            "</Relationships>",
-            &format!("{}</Relationships>", self.added),
-            1,
-        );
+        // `rels_takes` let only a part it can splice into give `xml`.
+        let Some(xml) = splice_rels(&xml, &self.added) else {
+            return;
+        };
         if self.exists {
             if let Some(p) = parts.iter_mut().find(|(n, _)| *n == self.rels_part) {
                 p.1 = xml.into_bytes();
@@ -651,26 +646,6 @@ pub(super) fn prune_orphans(
     }
     out.push_str(&xml[from..]);
     part.1 = out.into_bytes();
-}
-
-/// The `rIdN` values in `xml`'s quoted attribute values (`"rId3"` or
-/// `'rId3'`), whatever attribute holds them.
-fn quoted_rids(xml: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
-    let mut from = 0;
-    while let Some(at) = xml[from..].find("rId") {
-        let start = from + at;
-        from = start + 3;
-        let quote = match xml[..start].chars().next_back() {
-            Some(q @ ('"' | '\'')) => q,
-            _ => continue,
-        };
-        let digits = xml[from..].bytes().take_while(u8::is_ascii_digit).count();
-        if digits > 0 && xml[from + digits..].starts_with(quote) {
-            out.insert(xml[start..from + digits].to_string());
-        }
-    }
-    out
 }
 
 /// Whether `[Content_Types].xml` gives a `.rels` part a type: a `Default`
