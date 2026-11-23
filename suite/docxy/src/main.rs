@@ -125,6 +125,8 @@ mod sheet_consolidate;
 mod sheet_drag;
 mod sheet_pictures;
 mod sheet_spill;
+#[cfg(test)]
+mod sheet_xbook_tests;
 mod tab_tear;
 /// The wall-clock bound of the tests that guard against a quadratic cost
 /// (#707): generous, since they run as debug builds on shared CI runners,
@@ -5177,17 +5179,29 @@ impl SheetView {
             )));
         }
         let at = (sel.0, sel.1);
-        let mut block = tiled_block(
-            &clip.block.cells,
-            &clip.block.rows,
-            &clip.block.cols,
-            at,
-            tiles,
-        );
+        // A copy from another workbook brings its formats into this one: its
+        // style ids are that workbook's (#1011). Taken back if the paste is
+        // refused.
+        let styles = (clip.view != self.id).then(|| self.pkg.workbook.styles.clone());
+        let adopted;
+        let src = if styles.is_some() {
+            let mut b = clip.block.clone();
+            b.adopt_styles(&mut self.pkg.workbook.styles);
+            adopted = b;
+            &adopted
+        } else {
+            &clip.block
+        };
+        let mut block = tiled_block(&src.cells, &src.rows, &src.cols, at, tiles);
         // A copied absent cell from past its sheet's used extent lands as the
         // target's absence (#1660).
-        clip.block.land_absent(self.sheet(), at, &mut block);
-        self.write_block(at, &block, step)?;
+        src.land_absent(self.sheet(), at, &mut block);
+        if let Err(e) = self.write_block(at, &block, step) {
+            if let Some(styles) = styles {
+                self.pkg.workbook.styles = styles;
+            }
+            return Err(e);
+        }
         // The source cells' rules replace the target's (#688) — an ordinary
         // paste moves validation along with the cells, so a source with no
         // rule clears the target's. A copy that left out filtered rows (or

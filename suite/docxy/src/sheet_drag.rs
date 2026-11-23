@@ -118,9 +118,14 @@ impl SheetView {
                 match choice {
                     DropChoice::Link => self.paste_link_at(&block, at)?,
                     DropChoice::CopyValues => {
-                        self.paste_special_at(&block, &PasteSpec::of(PasteWhat::Values), at)?
+                        self.paste_special_at(&block, &PasteSpec::of(PasteWhat::Values), at, false)?
                     }
-                    _ => self.paste_special_at(&block, &PasteSpec::of(PasteWhat::Formats), at)?,
+                    _ => self.paste_special_at(
+                        &block,
+                        &PasteSpec::of(PasteWhat::Formats),
+                        at,
+                        false,
+                    )?,
                 };
             }
             DropChoice::Cancel => unreachable!("returned above"),

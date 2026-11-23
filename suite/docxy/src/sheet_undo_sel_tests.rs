@@ -288,8 +288,13 @@ fn undo_and_redo_of_paste_special_and_paste_link_select_the_pasted_range() {
     let mut v = view();
     let clip = three_copied(&mut v);
     select(&mut v, "D1", "D1");
-    v.paste_special_at(&clip.block, &PasteSpec::of(PasteWhat::Values), at("D1"))
-        .unwrap();
+    v.paste_special_at(
+        &clip.block,
+        &PasteSpec::of(PasteWhat::Values),
+        at("D1"),
+        false,
+    )
+    .unwrap();
     undo_redo_select(&mut v, "D1", "D3");
 
     let mut v = view();

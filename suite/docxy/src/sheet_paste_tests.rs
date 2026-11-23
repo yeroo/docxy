@@ -57,7 +57,12 @@ fn paste_values_and_transpose_are_one_step_each() {
     let clip = copy(&mut v, "A1", "A2");
     select(&mut v, "C1");
     let rect = v
-        .paste_special_at(&clip.block, &PasteSpec::of(PasteWhat::Values), at("C1"))
+        .paste_special_at(
+            &clip.block,
+            &PasteSpec::of(PasteWhat::Values),
+            at("C1"),
+            false,
+        )
         .unwrap();
     assert_eq!(rect, (0, 2, 1, 2));
     assert_eq!(value(&v, "C2"), CellValue::Number(6.0));
@@ -69,7 +74,8 @@ fn paste_values_and_transpose_are_one_step_each() {
         transpose: true,
         ..PasteSpec::default()
     };
-    v.paste_special_at(&clip.block, &spec, at("E1")).unwrap();
+    v.paste_special_at(&clip.block, &spec, at("E1"), false)
+        .unwrap();
     assert_eq!(formula(&v, "F1").as_deref(), Some("E1*3"));
     assert_eq!(value(&v, "F1"), CellValue::Number(6.0));
     assert_eq!(v.undo.len(), 2);
@@ -86,7 +92,8 @@ fn an_operation_combines_with_the_destination() {
         op: PasteOp::Multiply,
         ..PasteSpec::default()
     };
-    v.paste_special_at(&clip.block, &spec, at("C9")).unwrap();
+    v.paste_special_at(&clip.block, &spec, at("C9"), false)
+        .unwrap();
     assert_eq!(formula(&v, "C9").as_deref(), Some("(B9*2)*1.05"));
     assert_eq!(value(&v, "C9"), CellValue::Number(8.4));
 }
@@ -98,8 +105,13 @@ fn notes_paste_through_the_package_and_undo_takes_them_back() {
     assert!(v.pkg.set_comment(0, 0, 0, "Ann", "a note"));
     let clip = copy(&mut v, "A1", "A1");
     assert_eq!(clip.block.notes.len(), 1);
-    v.paste_special_at(&clip.block, &PasteSpec::of(PasteWhat::Comments), at("B3"))
-        .unwrap();
+    v.paste_special_at(
+        &clip.block,
+        &PasteSpec::of(PasteWhat::Comments),
+        at("B3"),
+        false,
+    )
+    .unwrap();
     assert!(v.note_cells().contains(&(2, 1)));
     assert_eq!(value(&v, "B3"), CellValue::Empty, "notes only");
     assert!(v.undo_step());
@@ -115,8 +127,13 @@ fn validation_pastes_as_a_rule_over_the_destination() {
             .add_data_validation(0, (0, 0, 0, 0), "list", "", "\"Yes,No\"", None)
     );
     let clip = copy(&mut v, "A1", "A1");
-    v.paste_special_at(&clip.block, &PasteSpec::of(PasteWhat::Validation), at("D4"))
-        .unwrap();
+    v.paste_special_at(
+        &clip.block,
+        &PasteSpec::of(PasteWhat::Validation),
+        at("D4"),
+        false,
+    )
+    .unwrap();
     assert!(v.sheet().validations.iter().any(|dv| dv.covers(3, 3)));
     assert_eq!(value(&v, "D4"), CellValue::Empty);
 }
@@ -160,7 +177,7 @@ fn paste_options_repaste_in_place_as_one_step() {
     let mut v = view();
     put(&mut v, "A1", Cell::number(1.0));
     let clip = copy(&mut v, "A1", "A1");
-    v.paste_special_at(&clip.block, &PasteSpec::default(), at("B1"))
+    v.paste_special_at(&clip.block, &PasteSpec::default(), at("B1"), false)
         .unwrap();
     let stale = PasteOptions {
         view: v.id,
@@ -184,7 +201,7 @@ fn text_from_another_program_pastes_as_values_and_transposed() {
         transpose: true,
         ..PasteSpec::of(PasteWhat::Values)
     };
-    v.paste_special_at(&block, &spec, at("A1")).unwrap();
+    v.paste_special_at(&block, &spec, at("A1"), false).unwrap();
     assert_eq!(value(&v, "B1"), CellValue::Number(3.0));
     assert_eq!(value(&v, "A2"), CellValue::Number(2.0));
 }
@@ -388,7 +405,7 @@ fn fifty_thousand_notes_and_rules_paste_fast() {
     // Each paste timed on its own.
     for what in [PasteWhat::Comments, PasteWhat::Validation] {
         let t = std::time::Instant::now();
-        v.paste_special_at(&clip.block, &PasteSpec::of(what), at("C1"))
+        v.paste_special_at(&clip.block, &PasteSpec::of(what), at("C1"), false)
             .unwrap();
         fast_enough(t);
     }
@@ -413,8 +430,13 @@ fn a_pasted_note_replaces_a_thread_on_the_destination() {
             .add_threaded_comment(0, 1, 1, "Bob", "a thread", "2024-01-02T03:04:05Z")
     );
     let clip = copy(&mut v, "A1", "A1");
-    v.paste_special_at(&clip.block, &PasteSpec::of(PasteWhat::Comments), at("B2"))
-        .unwrap();
+    v.paste_special_at(
+        &clip.block,
+        &PasteSpec::of(PasteWhat::Comments),
+        at("B2"),
+        false,
+    )
+    .unwrap();
     let on_b2 = |cs: Vec<gridcore::comments::Comment>| -> Vec<(String, bool)> {
         cs.into_iter()
             .filter(|c| (c.row, c.col) == (1, 1))
@@ -440,7 +462,7 @@ fn typed_formulas_in_text_paste_as_typed() {
     put(&mut v, "A1", Cell::number(7.0));
     put(&mut v, "A2", Cell::number(9.0));
     let block = v.text_clip_block("=A1\n", at("C5"));
-    v.paste_special_at(&block, &PasteSpec::of(PasteWhat::All), at("C5"))
+    v.paste_special_at(&block, &PasteSpec::of(PasteWhat::All), at("C5"), false)
         .unwrap();
     assert_eq!(formula(&v, "C5").as_deref(), Some("A1"));
     assert_eq!(value(&v, "C5"), CellValue::Number(7.0));
@@ -449,12 +471,12 @@ fn typed_formulas_in_text_paste_as_typed() {
         transpose: true,
         ..PasteSpec::default()
     };
-    v.paste_special_at(&block, &spec, at("C5")).unwrap();
+    v.paste_special_at(&block, &spec, at("C5"), false).unwrap();
     assert_eq!(formula(&v, "C5").as_deref(), Some("A1+1"));
     assert_eq!(formula(&v, "D5").as_deref(), Some("A2+1"));
     assert_eq!(value(&v, "D5"), CellValue::Number(10.0));
     let block = v.text_clip_block("=A1\n", at("E9"));
-    v.paste_special_at(&block, &PasteSpec::of(PasteWhat::Values), at("E9"))
+    v.paste_special_at(&block, &PasteSpec::of(PasteWhat::Values), at("E9"), false)
         .unwrap();
     assert_eq!(formula(&v, "E9"), None);
     assert_eq!(value(&v, "E9"), CellValue::Number(7.0));
@@ -479,7 +501,7 @@ fn a_text_paste_keeps_the_destinations_validation() {
         );
         let width = v.sheet().col_width(2);
         let block = v.text_clip_block("a\tb\nc\td\n", at("B2"));
-        v.paste_special_at(&block, &spec, at("B2")).unwrap();
+        v.paste_special_at(&block, &spec, at("B2"), false).unwrap();
         let rules = |dvs: &[gridcore::sheet::DataValidation]| -> Vec<_> {
             dvs.iter()
                 .map(|dv| (dv.ranges.clone(), dv.formula1.clone()))
