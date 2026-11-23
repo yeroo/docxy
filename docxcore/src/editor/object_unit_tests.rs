@@ -664,35 +664,270 @@ fn a_plain_text_cut_copies_every_equation_it_removes_1242() {
     assert_eq!(eqs(&ed), 1, "only the paragraph's left");
 }
 
-/// FIX r2 M2: a tracked cut over a cell range clears the cells (keeping
-/// nothing), so its clip carries their equations: an untracked paste brings
-/// them back (a tracked paste leaves equations out, a known gap).
+/// FIX r2 M2, then #1471: a tracked cut over a cell range records the
+/// cells' text as deleted and keeps their equations in place, as a tracked
+/// paragraph cut does, so its clip leaves them out: a paste must not add a
+/// second.
 #[test]
 fn a_tracked_cut_of_cells_carries_their_equations_1242() {
+    let has_eq = |clip: &Clip| {
+        clip.paras
+            .iter()
+            .flatten()
+            .any(|i| matches!(i, Inline::Equation { .. }))
+    };
     let mut ed = three_paras_and_a_table();
     track(&mut ed);
     select(&mut ed, vec![3, 0, 0, 0], 0, 0);
     ed.caret = Caret::at(vec![3, 0, 1, 0], 1);
     let clip = ed.cut().expect("a clip");
-    assert!(
-        clip.paras
-            .iter()
-            .flatten()
-            .any(|i| matches!(i, Inline::Equation { .. })),
-        "{clip:?}"
-    );
+    assert!(!has_eq(&clip), "{clip:?}");
+    assert_eq!(cell_equations(&ed, vec![3, 0, 1, 0]), 1, "kept in its cell");
     // And a paragraph cut while tracking still leaves its equation out.
     let mut ed = three_paras_and_a_table();
     track(&mut ed);
     select(&mut ed, vec![1], 0, 3);
     let clip = ed.cut().expect("a clip");
+    assert!(!has_eq(&clip));
+}
+
+/// The equations in the paragraph at `path`.
+fn cell_equations(ed: &Editor, path: Vec<usize>) -> usize {
+    resolve_para(&ed.doc.body, &path)
+        .expect("a paragraph")
+        .content
+        .iter()
+        .filter(|i| matches!(i, Inline::Equation { .. }))
+        .count()
+}
+
+/// The text of the paragraph at `path` with its deletions, as Reject would
+/// leave it.
+fn para_plain(ed: &Editor, path: Vec<usize>) -> String {
+    resolve_para(&ed.doc.body, &path)
+        .expect("a paragraph")
+        .plain_text()
+}
+
+/// #1471: a tracked cut of table cells, then a tracked paste, keeps their
+/// equations (it lost them: the cells were cleared untracked, the clip
+/// carried the equations and the tracked paste left them out), and Reject
+/// All brings the cells back and takes the paste away.
+#[test]
+fn a_tracked_cut_and_paste_of_cells_keeps_their_equations_1471() {
+    let eqs = |ed: &Editor| saved(ed).matches("<m:oMath>").count();
+    let mut ed = three_paras_and_a_table();
+    let original = saved(&ed);
+    assert_eq!(eqs(&ed), 2);
+    track(&mut ed);
+    select(&mut ed, vec![3, 0, 0, 0], 0, 0);
+    ed.caret = Caret::at(vec![3, 0, 1, 0], 1);
+    let clip = ed.cut().expect("a clip");
+    ed.anchor = None;
+    ed.set_caret(Caret::at(vec![4], 0));
+    ed.paste(&clip);
+    let xml = saved(&ed);
+    assert_eq!(eqs(&ed), 2, "{xml}");
+    assert_eq!(cell_equations(&ed, vec![3, 0, 1, 0]), 1, "{xml}");
+    let dels = deleted_objects(&xml);
+    assert!(dels.iter().any(|d| d.contains(">y<")), "{dels:?}");
+    assert!(dels.iter().any(|d| d.contains(">x<")), "{dels:?}");
+    // One clip paragraph per cell; the pasted text is a tracked insertion.
+    assert_eq!(para_plain(&ed, vec![4]), "y");
+    assert_eq!(para_plain(&ed, vec![5]), "x");
+    assert_eq!(insertions(&xml).len(), 2, "{xml}");
+    // Reject All: the table exactly as it was, the pasted text gone (the
+    // paste's paragraph mark stays: a tracked paste does not record one).
+    ed.reject_all_revisions();
+    assert_eq!(para_plain(&ed, vec![3, 0, 0, 0]), "y");
+    assert_eq!(cell_equations(&ed, vec![3, 0, 1, 0]), 1);
+    assert_eq!(etext_at(&ed, vec![3, 0, 1, 0]), "x\u{FFFC}");
+    let table =
+        |xml: &str| xml[xml.find("<w:tbl>").unwrap()..xml.find("</w:tbl>").unwrap()].to_string();
+    assert_eq!(table(&saved(&ed)), table(&original));
+    assert_eq!(para_plain(&ed, vec![4]), "");
+    assert_eq!(para_plain(&ed, vec![5]), "");
+    assert_eq!(eqs(&ed), 2);
+}
+
+/// The `w:ins` wrappers in the saved XML.
+fn insertions(xml: &str) -> Vec<&str> {
+    xml.match_indices("<w:ins ")
+        .map(|(at, _)| &xml[at..])
+        .collect()
+}
+
+/// The editor text of the paragraph at `path` (an equation is one
+/// [`FIELD_CHAR`]-like offset).
+fn etext_at(ed: &Editor, path: Vec<usize>) -> String {
+    editor_text(
+        &resolve_para(&ed.doc.body, &path)
+            .expect("a paragraph")
+            .content,
+    )
+}
+
+/// #1471: a tracked Delete over a cell range records the cells' text as
+/// deleted, keeping their equations; Reject All restores the text, Accept
+/// All removes it and keeps the equations, and Undo takes it back in one
+/// step.
+#[test]
+fn a_tracked_delete_of_cells_is_recorded_1471() {
+    let deleted = || {
+        let mut ed = three_paras_and_a_table();
+        track(&mut ed);
+        select(&mut ed, vec![3, 0, 0, 0], 0, 0);
+        ed.caret = Caret::at(vec![3, 0, 1, 0], 1);
+        assert!(ed.delete_selection());
+        ed
+    };
+    let original = saved(&three_paras_and_a_table());
+    let mut ed = deleted();
+    let dels = deleted_objects(&saved(&ed));
+    assert_eq!(dels.len(), 2, "{dels:?}");
+    assert_eq!(cell_equations(&ed, vec![3, 0, 1, 0]), 1);
+    assert_eq!(ed.caret, Caret::at(vec![3, 0, 0, 0], 0));
+    assert!(ed.anchor.is_none());
+    // Undo: one step back to the cells as they were.
+    assert!(ed.undo());
+    assert_eq!(saved(&ed), original);
+    assert!(!ed.undo(), "one step");
+    // Reject All restores the text.
+    let mut ed = deleted();
+    ed.reject_all_revisions();
+    assert_eq!(saved(&ed), original);
+    // Accept All empties the cells' text and keeps the equation.
+    let mut ed = deleted();
+    ed.accept_all_revisions();
+    assert_eq!(para_plain(&ed, vec![3, 0, 0, 0]), "");
+    assert_eq!(etext_at(&ed, vec![3, 0, 1, 0]), "\u{FFFC}");
+    assert_eq!(cell_equations(&ed, vec![3, 0, 1, 0]), 1);
+}
+
+/// A one-row table whose cells hold `cells` (each a cell's inner XML), then
+/// an empty paragraph.
+fn table_of(cells: &[String]) -> Editor {
+    let tcs: String = cells.iter().map(|c| format!("<w:tc>{c}</w:tc>")).collect();
+    Editor::new(parse_document_xml(
+        &format!(
+            "<w:document><w:body><w:tbl><w:tr>{tcs}</w:tr></w:tbl><w:p/></w:body></w:document>"
+        ),
+        &Relationships::default(),
+    ))
+}
+
+/// #1471: a tracked clear keeps the cells' blocks, so the caret goes to the
+/// first cell's first paragraph, here in a nested table, never to the
+/// nested table itself; text typed over the range lands there.
+#[test]
+fn a_tracked_clear_puts_the_caret_on_a_paragraph_1471() {
+    let nested = format!(
+        "<w:tbl><w:tr><w:tc><w:p>{}</w:p></w:tc></w:tr></w:tbl><w:p>{}</w:p>",
+        t("n"),
+        t("y")
+    );
+    let mut ed = table_of(&[nested, format!("<w:p>{}</w:p>", t("x"))]);
+    track(&mut ed);
+    ed.anchor = Some(Caret::at(vec![0, 0, 0, 1], 0));
+    ed.caret = Caret::at(vec![0, 0, 1, 0], 1);
+    assert!(ed.cell_range().is_some());
+    ed.insert_char('z');
+    let first = vec![0, 0, 0, 0, 0, 0, 0];
+    assert_eq!(ed.caret, Caret::at(first.clone(), 1));
+    assert!(resolve_para(&ed.doc.body, &ed.caret.path).is_some());
+    assert_eq!(etext_at(&ed, first.clone()), "z");
+    assert_eq!(para_plain(&ed, first), "zn");
+    assert_eq!(para_plain(&ed, vec![0, 0, 0, 1]), "y");
+    assert_eq!(etext_at(&ed, vec![0, 0, 0, 1]), "");
+}
+
+/// #1471: a tracked Delete over cells records a floating picture in them as
+/// a `w:del` (it went with the cell's blocks before); a tracked cut keeps it
+/// in place, as a paragraph cut does (the clip cannot carry it).
+#[test]
+fn a_tracked_cell_delete_records_a_floating_picture_1471() {
+    let cells = || {
+        let mut ed = table_of(&[
+            format!("<w:p>{}{ANCHORED}{}</w:p>", t("a"), t("b")),
+            format!("<w:p>{}</w:p>", t("c")),
+        ]);
+        track(&mut ed);
+        ed.anchor = Some(Caret::at(vec![0, 0, 0, 0], 0));
+        ed.caret = Caret::at(vec![0, 0, 1, 0], 1);
+        ed
+    };
+    let mut ed = cells();
+    assert!(ed.delete_selection());
+    let dels = deleted_objects(&saved(&ed));
+    assert!(dels.iter().any(|d| d.contains("wp:anchor")), "{dels:?}");
+    ed.reject_all_revisions();
+    let rejected = saved(&ed);
+    assert!(rejected.contains("wp:anchor"), "{rejected}");
+    assert!(deleted_objects(&rejected).is_empty(), "{rejected}");
+    let mut ed = cells();
+    ed.cut().expect("a clip");
+    let xml = saved(&ed);
+    assert!(xml.contains("wp:anchor"), "{xml}");
+    assert!(
+        !deleted_objects(&xml)
+            .iter()
+            .any(|d| d.contains("wp:anchor")),
+        "{xml}"
+    );
+}
+
+const LINKED: &str = "<w:fldSimple w:instr=\" REF x \"><w:hyperlink w:anchor=\"x\">\
+    <w:r><w:t>7</w:t></w:r></w:hyperlink></w:fldSimple>";
+
+/// #1471: a tracked plain-text cut of cells copies their text but not the
+/// text of what its delete keeps in place, an equation or a field a `w:del`
+/// cannot hold (#1470), so a paste never doubles one; both stay. The clip
+/// of a cut leaves both out too.
+#[test]
+fn a_tracked_plain_text_cut_of_cells_keeps_the_equation_1471() {
+    let eqs = |ed: &Editor| saved(ed).matches("<m:oMath>").count();
+    let mut ed = three_paras_and_a_table();
+    track(&mut ed);
+    select(&mut ed, vec![3, 0, 0, 0], 0, 0);
+    ed.caret = Caret::at(vec![3, 0, 1, 0], 1);
+    assert_eq!(ed.cut_text().as_deref(), Some("y\nx"));
+    assert_eq!(eqs(&ed), 2);
+    assert_eq!(cell_equations(&ed, vec![3, 0, 1, 0]), 1);
+
+    let fields = |ed: &Editor| {
+        resolve_para(&ed.doc.body, &[0, 0, 1, 0])
+            .expect("a paragraph")
+            .content
+            .iter()
+            .filter(|i| matches!(i, Inline::Field { .. }))
+            .count()
+    };
+    let linked = || {
+        let mut ed = table_of(&[
+            format!("<w:p>{}</w:p>", t("y")),
+            format!("<w:p>{}{LINKED}{}</w:p>", t("a"), t("b")),
+        ]);
+        track(&mut ed);
+        ed.anchor = Some(Caret::at(vec![0, 0, 0, 0], 0));
+        ed.caret = Caret::at(vec![0, 0, 1, 0], 3);
+        assert_eq!(fields(&ed), 1);
+        ed
+    };
+    let mut ed = linked();
+    assert_eq!(ed.cut_text().as_deref(), Some("y\nab"));
+    assert_eq!(fields(&ed), 1);
+    let mut ed = linked();
+    let clip = ed.cut().expect("a clip");
+    assert_eq!(clip.to_text(), "y\nab");
     assert!(
         !clip
             .paras
             .iter()
             .flatten()
-            .any(|i| matches!(i, Inline::Equation { .. }))
+            .any(|i| matches!(i, Inline::Field { .. })),
+        "{clip:?}"
     );
+    assert_eq!(fields(&ed), 1);
 }
 
 /// The `w:del` wrappers in the saved XML, each with its id.

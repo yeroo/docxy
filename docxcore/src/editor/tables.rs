@@ -331,7 +331,17 @@ impl Editor {
 
     /// Word's Delete over selected cells: empty them (keeping each cell's first
     /// paragraph's formatting). One undo step.
-    pub(crate) fn clear_cells(&mut self, range: &CellRange) -> bool {
+    ///
+    /// While tracking, the cells keep their blocks and the text of each of
+    /// their paragraphs (text-box ones included) is recorded as deleted, as a
+    /// tracked delete across paragraphs does (#1471): equations and the
+    /// fields a `w:del` cannot hold stay ([`super::kept_while_tracking`]),
+    /// inline pictures are recorded, the author's own pending object
+    /// insertions go and another author's stay (#1625), and, when
+    /// `drop_objects` (a Delete, not a cut), floating pictures and alignment
+    /// tabs are recorded too. Paragraph marks and nested tables stay. The
+    /// caret goes to the first cell's first paragraph.
+    pub(crate) fn clear_cells(&mut self, range: &CellRange, drop_objects: bool) -> bool {
         self.checkpoint(EditKind::Structural);
         self.anchor = None;
         let Some(t) = table_at_mut(&mut self.doc.body, &range.table) else {
@@ -343,6 +353,33 @@ impl Editor {
             let mut path = range.table.clone();
             path.extend([r, c, 0]);
             self.clear_placeholders_around(&path);
+        }
+        if self.track.is_some() {
+            // Taken before any edit: a recorded deletion takes no offset and
+            // no block moves, so each span stays where it was.
+            let spans = self.cell_range_spans(range);
+            for (path, from, to) in &spans {
+                if drop_objects {
+                    self.drop_or_record_objects(path, *from, *to, true, true);
+                }
+                self.remove_own_pending_objects_in(path, *from, *to, true);
+                self.delete_chars(path, *from, *to, false);
+            }
+            // The cells keep their blocks, so the first may be a nested
+            // table: the caret goes to a paragraph.
+            let first = match spans.first() {
+                Some((path, _, _)) => path.clone(),
+                None => {
+                    let Some(&(r, c)) = cells.first() else {
+                        return true;
+                    };
+                    let mut path = range.table.clone();
+                    path.extend([r, c, 0]);
+                    path
+                }
+            };
+            self.caret = Caret::at(first, 0);
+            return true;
         }
         let Some(t) = table_at_mut(&mut self.doc.body, &range.table) else {
             return false;

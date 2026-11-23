@@ -2418,7 +2418,9 @@ impl Editor {
     /// sibling paragraphs (merging the ends). A selection spanning different
     /// containers (e.g. body into a table cell) just collapses to the start.
     ///
-    /// Over a cell range it empties the selected cells, as Word's Delete does.
+    /// Over a cell range it empties the selected cells, as Word's Delete does;
+    /// while tracking it records their text as deleted instead (#1471, see
+    /// `clear_cells`).
     ///
     /// A picture or alignment tab the delete spans goes with it (#768). A
     /// loose field the selection cuts (one edge inside it) goes whole, and
@@ -2450,7 +2452,7 @@ impl Editor {
     /// is plain text.
     fn delete_selection_with(&mut self, drop_objects: bool, keep_units: bool) -> bool {
         if let Some(range) = self.cell_range() {
-            return self.clear_cells(&range);
+            return self.clear_cells(&range, drop_objects);
         }
         let Some((mut lo, mut hi)) = self.selection_range() else {
             return false;
@@ -2714,21 +2716,24 @@ impl Editor {
         // Invariant: the pending object insertions the cut removes are
         // exactly the ones its clip carries. A tracked delete removes the
         // author's own it covers, by the rule the clip is taken by
-        // ([`track::covers_pending`], over the same paragraphs); clearing
-        // cells removes every one in them. An untracked cut carries none,
-        // and its delete across paragraphs drops those in what it removes
-        // (a known gap).
+        // ([`track::covers_pending`], over the same paragraphs), a tracked
+        // clear of cells included (#1471); an untracked clear of cells
+        // removes every one in them. An untracked cut carries none, and its
+        // delete across paragraphs drops those in what it removes (a known
+        // gap).
         let author = self.track_author().map(str::to_owned);
         let cells = self.cell_range().is_some();
+        let every = cells && author.is_none();
         let own = |inline: &Inline| {
-            cells
+            every
                 || matches!(inline, Inline::Revision { metadata, .. }
                     if author.is_some() && metadata.author == author)
         };
         let mut clip = self.copy_taking(&own, !cells)?;
         // A tracked delete keeps every equation and every field a `w:del`
-        // cannot hold ([`kept_while_tracking`]; a cell range's aside), so the
-        // clip leaves them out: a paste must not add a second (#1242).
+        // cannot hold ([`kept_while_tracking`]), over a cell range too
+        // (#1471), so the clip leaves them out: a paste must not add a
+        // second (#1242).
         if self.delete_keeps_equations_in(&self.caret.path, false) {
             clip = without_kept(&clip);
         }
@@ -2749,7 +2754,8 @@ impl Editor {
     /// pictures and alignment tabs (#768), and equations and inline
     /// pictures (#1242) where [`Editor::delete_keeps_equations_in`] says:
     /// in the paragraphs where it starts and ends, every equation while
-    /// tracking, none over a cell range (which clears the cells). It leaves
+    /// tracking (over a cell range too, #1471), none over an untracked cell
+    /// range (which clears the cells). It leaves
     /// out the text of the equations it keeps, so a paste does not bring
     /// one back as text beside the one kept; so does a field a tracked delete
     /// keeps ([`kept_while_tracking`]), while untracked it is cut with its
@@ -2772,9 +2778,8 @@ impl Editor {
     ///
     /// While tracking, a pasted inline picture is recorded as an insertion,
     /// and an equation, which a `w:ins` cannot hold whole, is left out
-    /// (#1242): a tracked cut keeps its equations in place. A tracked cut
-    /// of table cells clears them and carries their equations, which a
-    /// tracked paste then leaves out too: a known gap.
+    /// (#1242): a tracked cut keeps its equations in place, a cut of table
+    /// cells too, whose text it records as deleted (#1471).
     pub fn paste(&mut self, clip: &Clip) {
         self.paste_clip(clip, true);
     }
@@ -3557,7 +3562,7 @@ impl Editor {
     /// fields a tracked delete keeps ([`kept_while_tracking`]; untracked, the
     /// delete takes them, so their text is cut). A copy leaves out none.
     fn selection_text_with(&self, for_plain_text_cut: bool) -> String {
-        let fields_kept = for_plain_text_cut && self.track.is_some() && self.cell_range().is_none();
+        let fields_kept = for_plain_text_cut && self.track.is_some();
         self.selection_spans()
             .iter()
             .filter_map(|(path, s, e)| {
@@ -3570,20 +3575,21 @@ impl Editor {
     }
 
     /// Whether deleting the selection keeps the equations in the paragraph
-    /// at `path` (#1242), as [`Editor::delete_selection_with`] does: a cell
-    /// range's delete keeps nothing; while tracking a delete keeps every
-    /// equation; else `keep_units` (the delete of a plain-text cut) keeps
-    /// them in the paragraphs where the selection starts and ends, and the
+    /// at `path` (#1242), as [`Editor::delete_selection_with`] does: while
+    /// tracking a delete keeps every equation, over a cell range too
+    /// (#1471); an untracked cell range's delete keeps nothing; else
+    /// `keep_units` (the delete of a plain-text cut) keeps them in the
+    /// paragraphs where the selection starts and ends, and the
     /// paragraphs between go whole. A cut's copied text and clip follow it,
     /// so a cut never both keeps an equation of the selection's own
     /// paragraphs and carries it, nor drops it from both (a text box's
     /// content is another matter).
     fn delete_keeps_equations_in(&self, path: &[usize], keep_units: bool) -> bool {
-        if self.cell_range().is_some() {
-            return false;
-        }
         if self.track.is_some() {
             return true;
+        }
+        if self.cell_range().is_some() {
+            return false;
         }
         keep_units
             && self
