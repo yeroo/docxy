@@ -21,9 +21,10 @@ const NO_TEXT: &str = "There is no text to paste";
 
 /// Another app's pasted list items in the package's own lists (#1967,
 /// #2087 r3): its importers name 1 (bullets) and 2 (decimal), which become
-/// the lists Bullets and Numbering apply there ([`crate::ListIds`]: 1 and 2,
-/// or docxy's reserved 9990 / 9991 where the package's numbering part
-/// defines 1 or 2 as the other kind or leaves them undefined), and each kind
+/// the lists Bullets and Numbering apply there ([`crate::ListIds`]: 1 and 2
+/// only where the package has no numbering part or its 1 and 2 are docxy's
+/// own, on `add_markdown_numbering`'s abstracts; else docxy's reserved
+/// 9990 / 9991, never a document's own 1 or 2, #2180), and each kind
 /// pasted is defined in the package ([`crate::ListIds::define`]), so the
 /// view and a save show it. A clip without lists changes nothing; a tab
 /// with no package keeps 1 and 2 and gets the part when its save builds one

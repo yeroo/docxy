@@ -716,10 +716,10 @@ pub(crate) fn apply_format(ed: &mut Editor, pkg: Option<&mut Package>, f: &DocFo
             Box::new(move |ed| ed.set_highlight(h))
         }
         DocFormat::Bullets | DocFormat::Numbering => {
-            // The document's list (#2087): docxy's own 1 and 2, or its
-            // reserved one where the package defines those otherwise.
-            // Off on a list of its kind, the document's own included
-            // (#2180).
+            // The document's list (#2087): docxy's own 1 and 2 where the
+            // package's are docxy's own, else its reserved one, never the
+            // document's own 1 or 2 (#2180). Off on a list of its kind,
+            // the document's own included.
             let bullet = *f == DocFormat::Bullets;
             let ids = ListIds::of_package(pkg.as_deref());
             let numbering = pkg.and_then(|pkg| {

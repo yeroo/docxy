@@ -40555,8 +40555,9 @@ impl ListIds {
     /// moved) and a save show it: [`Package::ensure_list`]'s for its own
     /// id; for docxy's own 1 and 2, the numbering part
     /// [`Package::add_markdown_numbering`] adds to a package that has none
-    /// (with a part, [`ListIds::of`] keeps 1 and 2 only where it defines
-    /// them). A tab with no package yet gets them when it is given one.
+    /// (with a part, [`ListIds::of`] keeps 1 and 2 only where they are
+    /// docxy's own lists, on `add_markdown_numbering`'s abstracts). A tab
+    /// with no package yet gets them when it is given one.
     pub(crate) fn define(self, pkg: Option<&mut Package>, bullet: bool) {
         let Some(pkg) = pkg else {
             return;
