@@ -1152,7 +1152,8 @@ fn text_to_pkg(text: &str, sheet_name: &str, opts: &TextParse, open: &TextOpen) 
     let mut pkg = new_xlsx();
     let wb = &mut pkg.workbook;
     if !sheet_name.is_empty() {
-        wb.sheets[0].name = sheet_name.chars().take(31).collect();
+        // A file's stem can hold what Excel refuses in a sheet name (#2153).
+        wb.sheets[0].name = gridcore::legacy::clean_sheet_name(sheet_name);
     }
     import_text(&mut wb.sheets[0], &mut wb.styles, text, opts, open, false);
     // A text file carries no cached values: work out its formulas now.
@@ -2234,9 +2235,6 @@ fn rename_sheet_in_snapshot(snap: &mut WbSnapshot, idx: usize, old: &str, name: 
         }
     }
 }
-
-/// A rename to a name another sheet already has.
-const SHEET_NAME_TAKEN: &str = "Sheet name already taken";
 
 /// How many steps the undo history keeps, as Excel does: the oldest goes.
 const UNDO_CAP: usize = 100;
@@ -4259,13 +4257,8 @@ impl App {
         let Some(old) = wb.sheets.get(idx).map(|s| s.name.clone()) else {
             return Err("no such sheet".into());
         };
-        if let Some(why) = gridcore::sheet::sheet_name_error(name) {
+        if let Some(why) = wb.sheet_name_refused(name, Some(idx)) {
             return Err(why.into());
-        }
-        let taken = (wb.sheets.iter().enumerate())
-            .any(|(i, s)| i != idx && s.name.eq_ignore_ascii_case(name));
-        if taken {
-            return Err(SHEET_NAME_TAKEN.into());
         }
         let circles_before = self.engine.circular_refs().len();
         gridcore::edit::rename_sheet(&mut self.pkg.workbook, idx, name);
@@ -11042,10 +11035,10 @@ impl App {
                 self.build_model_report(&base, &spec);
             }
             PromptKind::AddSheet => {
-                if text.is_empty() || self.pkg.workbook.sheet_index(&text).is_some() {
-                    self.status = Some("Sheet name empty or already taken".to_string());
-                } else {
-                    self.add_sheet(&text);
+                // Excel's rules and a taken name, in any case (#2153).
+                match self.pkg.workbook.sheet_name_refused(&text, None) {
+                    Some(why) => self.status = Some(why.to_string()),
+                    None => self.add_sheet(&text),
                 }
             }
         }
@@ -14089,6 +14082,7 @@ fn run_tui(
 mod tests {
     use super::*;
     use gridcore::edit::parse_input;
+    use gridcore::sheet::SHEET_NAME_TAKEN;
     use gridcore::xlsx::{load_xlsx, save_xlsx};
 
     /// CSV text as a fresh one-sheet workbook, as opening a `.csv` reads it
@@ -22914,6 +22908,62 @@ mod tests {
         // Wraps back around.
         app.find_next("world");
         assert_eq!(app.cur, (0, 0));
+    }
+
+    /// #2153: the AddSheet prompt refuses a name Excel refuses, or one
+    /// another sheet has in any case, with the reason; nothing changes.
+    #[test]
+    fn add_sheet_prompt_refuses_names_excel_refuses_or_taken() {
+        let mut app = App::new(new_xlsx(), "t.xlsx");
+        app.os_clip = None;
+        app.pkg.workbook.sheets[0].name = "Données".to_string();
+        let long = "x".repeat(32);
+        let cases = [
+            ("Sheet/1", "Sheet name cannot contain [ ] : * ? / \\"),
+            (long.as_str(), "Sheet name is longer than 31 characters"),
+            ("'x", "Sheet name cannot start or end with an apostrophe"),
+            ("   ", "Sheet name is empty"),
+            ("DONNÉES", SHEET_NAME_TAKEN),
+            (" données ", SHEET_NAME_TAKEN),
+        ];
+        for (name, why) in cases {
+            app.open_prompt(PromptKind::AddSheet);
+            app.prompt.as_mut().unwrap().text = name.to_string();
+            app.commit_prompt();
+            assert_eq!(app.status.as_deref(), Some(why), "{name:?}");
+            assert_eq!(app.pkg.workbook.sheets.len(), 1, "{name:?}");
+            assert_eq!(app.sheet, 0, "{name:?}");
+            assert!(!app.modified, "{name:?}");
+        }
+        // A refused add leaves the saved workbook's sheets as they were.
+        let re = load_xlsx(&save_xlsx(&app.pkg)).unwrap();
+        let names: Vec<&str> = re.workbook.sheets.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Données"]);
+        app.open_prompt(PromptKind::AddSheet);
+        app.prompt.as_mut().unwrap().text = "Bob's Data".to_string();
+        app.commit_prompt();
+        assert_eq!(app.pkg.workbook.sheets[1].name, "Bob's Data");
+    }
+
+    /// #2153: a sheet named after a text file's stem is cleaned as an import
+    /// cleans names, so the workbook it saves is one Excel opens unrepaired.
+    #[test]
+    fn text_to_pkg_cleans_the_file_stem_into_a_sheet_name() {
+        let open = csv_open(AutoConvert::default());
+        for (stem, want) in [
+            ("a[1]'", "a_1_"),
+            ("'q'", "q"),
+            ("x:y*?", "x_y__"),
+            ("report", "report"),
+        ] {
+            let pkg = csv_to_pkg("a,b\n1,2\n", stem, false, &open);
+            let name = &pkg.workbook.sheets[0].name;
+            assert_eq!(name, want, "{stem:?}");
+            assert_eq!(gridcore::sheet::sheet_name_error(name), None, "{stem:?}");
+        }
+        let long = "n".repeat(40);
+        let pkg = csv_to_pkg("a\n", &long, false, &open);
+        assert_eq!(pkg.workbook.sheets[0].name, "n".repeat(31));
     }
 
     #[test]
