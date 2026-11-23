@@ -833,7 +833,7 @@ fn read_doc(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
             } else {
                 (&app.replace_text, crate::FindField::Replace)
             };
-            let focused = app.find_open && !app.comment_open && app.find_field == field;
+            let focused = app.find_open && !app.comment_open() && app.find_field == field;
             let (caret, sel) = app.sf_state(field);
             let len = text.chars().count();
             let selection = if focused && sel && len > 0 {
@@ -892,9 +892,11 @@ fn read_doc(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
             );
         }
         "comment-editor" => {
-            let focused = app.comment_open;
-            let (caret, sel) = app.comment_state();
-            let len = app.comment_text.chars().count();
+            let draft = app.comment_draft();
+            let focused = draft.is_some();
+            let (caret, sel) = draft.map(|d| d.state()).unwrap_or_default();
+            let text = draft.map(|d| d.text.clone()).unwrap_or_default();
+            let len = text.chars().count();
             let selection = if focused && sel && len > 0 {
                 Json::Arr(vec![Json::Num(0.0), Json::Num(len as f64)])
             } else {
@@ -905,12 +907,7 @@ fn read_doc(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
             } else {
                 Json::Null
             };
-            (
-                Json::Str(app.comment_text.clone()),
-                focused,
-                caret,
-                selection,
-            )
+            (Json::Str(text), focused, caret, selection)
         }
         _ => return Err(not_covered(i)),
     };

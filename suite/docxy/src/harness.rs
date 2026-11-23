@@ -9362,6 +9362,7 @@ mod tests {
             mail: Default::default(),
             field_codes: false,
             import: Default::default(),
+            comment_draft: None,
         };
         let mut word = doc(crate::Kind::Docx, "a.docx");
         word.path = Some("C:/work/a.docx".into());

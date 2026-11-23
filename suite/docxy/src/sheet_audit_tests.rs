@@ -38,6 +38,7 @@ fn tab() -> DocTab {
         mail: Default::default(),
         field_codes: false,
         import: Default::default(),
+        comment_draft: None,
     }
 }
 

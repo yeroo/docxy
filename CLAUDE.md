@@ -47,7 +47,8 @@ issue number to find its notes.
   tracked clear of table cells keeping equations, Reject All (#1471).
 - `docs/claude/suite-document.md`: before changing the suite's document tab: save-as
   names (#807), Home Font / Font Size boxes (#1361), File > Info Properties (#1364), the
-  comment editor (#1362), inline pictures (#1432), run styles (#1427), font substitution
+  comment editor and its draft per tab (#1362, #1329), inline pictures (#1432), run
+  styles (#1427), font substitution
   (#1900), link colours (#1906), tables placed by `w:jc` (#1922), rounded
   picture crops (#1926), the document views' scrollbars and Print Layout's
   sideways scroll (#2080), Word's dark mode for the document and View >
