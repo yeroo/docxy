@@ -286,7 +286,8 @@
     add.textContent = '+';
     add.title = 'Add sheet';
     add.addEventListener('click', () => {
-      userCmd('sheet\tadd\tSheet' + (view.sheets.length + 1));
+      // No name: the engine picks Excel's next free SheetN (#2153).
+      userCmd('sheet\tadd');
       requestView();
     });
     bar.appendChild(add);
