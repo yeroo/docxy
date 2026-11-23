@@ -447,8 +447,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   (`tracked_delete_paths`), decides coverage for the tracked delete
   (`remove_own_pending_objects_in`) and the clip (`copy_taking` /
   `extract_range_taking`, which walks into a link even where the range is
-  empty in it): a cut carries exactly what its delete removes (a cell range:
-  every one, as `clear_cells` does), a copy every one covered, any author.
+  empty in it): a cut carries exactly what its delete removes (an untracked
+  cell range: every one, as `clear_cells` does; a tracked one: the author's
+  own, #1471), a copy every one covered, any author.
   `tests/tracked_field_insert.rs` cross-checks every selection of a small
   document. An untracked cut carries none (an untracked delete across
   paragraphs drops them: a known gap). Typing before a link whose text
@@ -490,6 +491,28 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
 - A field in one paragraph whose marker run holds a `w:ptab` collapses into
   one `Inline::Field` (`is_clean_code_run` does not list `w:ptab`), so the
   tab is hidden in it and no delete splits it.
+
+## A tracked clear of table cells (#1471)
+
+- Delete, a cut, typing or a paste over a cell range while tracking no
+  longer empties the cells untracked: `clear_cells` (`tables.rs`) records
+  the text of every cell paragraph (`cell_range_spans`, text-box paragraphs
+  and nested tables' included) as deleted, as `delete_text_across_paragraphs`
+  does, with `from_before` true for each (`copy_taking`'s cell spans).
+  Equations and fields a `w:del` cannot hold stay (`kept_while_tracking`),
+  inline pictures are recorded, the author's own pending insertions go and
+  another's stay (#1625), floating pictures and `w:ptab`s are recorded on a
+  Delete and kept by a cut. Paragraph marks, nested tables and text boxes
+  stay; `keep_units` (a plain-text cut) is ignored. The caret goes to the
+  first cell's first paragraph (a nested table's, if it starts the cell).
+- The cut follows: `delete_keeps_equations_in` asks tracking before the cell
+  range, so the clip and `cut_text` leave out the equations and kept fields
+  that stay (`selection_text_with`'s `fields_kept` no longer excludes cell
+  ranges), and `cut()` takes only the author's own pending objects. A tracked
+  cut and paste of cells then loses nothing, and Reject All restores the
+  table exactly; the paste's paragraph marks stay (unrecorded, as ever). A
+  tracked cut of cells holding only equations makes an undo step that
+  changes nothing. Untracked clearing is unchanged.
 
 ## Plain text into a document: only characters XML can hold (#1993)
 

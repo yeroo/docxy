@@ -42,7 +42,8 @@ issue number to find its notes.
   part, counted across a table's cells (#2087), fields inside tracked
   changes: loaded `w:del`, tracked insertion, Compare (#1625), plain text
   pasted with only the characters XML can hold, `\u{0B}` a line break (#1993),
-  an alignment tab deleted out of a field marker's run (#1463).
+  an alignment tab deleted out of a field marker's run (#1463), a
+  tracked clear of table cells keeping equations, Reject All (#1471).
 - `docs/claude/suite-document.md`: before changing the suite's document tab: save-as
   names (#807), Home Font / Font Size boxes (#1361), File > Info Properties (#1364), the
   comment editor (#1362), inline pictures (#1432), run styles (#1427), font substitution
