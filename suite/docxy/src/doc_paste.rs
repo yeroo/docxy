@@ -21,9 +21,10 @@ const NO_TEXT: &str = "There is no text to paste";
 
 /// Another app's pasted list items in the package's own lists (#1967,
 /// #2087 r3): its importers name 1 (bullets) and 2 (decimal), which become
-/// the lists Bullets and Numbering apply there ([`crate::ListIds`]: 1 and 2,
-/// or docxy's reserved 9990 / 9991 where the package's numbering part
-/// defines 1 or 2 as the other kind or leaves them undefined), and each kind
+/// the lists Bullets and Numbering apply there ([`crate::ListIds`]: 1 and 2
+/// only where the package has no numbering part or its 1 and 2 are docxy's
+/// own, on `add_markdown_numbering`'s abstracts; else docxy's reserved
+/// 9990 / 9991, never a document's own 1 or 2, #2180), and each kind
 /// pasted is defined in the package ([`crate::ListIds::define`]), so the
 /// view and a save show it. A clip without lists changes nothing; a tab
 /// with no package keeps 1 and 2 and gets the part when its save builds one
@@ -331,9 +332,12 @@ mod tests {
     }
 
     /// A list pasted into a package whose numbering part defines 1 as
-    /// decimal, or leaves 1 and 2 undefined (#2087 r3): its items take the
-    /// lists Bullets and Numbering apply there, docxy's reserved 9990 /
-    /// 9991, defined in the part, so the bullets draw as bullets.
+    /// decimal, or leaves 1 and 2 undefined (#2087 r3), or is a Word
+    /// document's own with 1 its bullet list and 2 its decimal one (#2180:
+    /// joining them would draw its format and continue its count): its
+    /// items take the lists Bullets and Numbering apply there, docxy's
+    /// reserved 9990 / 9991, defined in the part, so the bullets draw as
+    /// bullets.
     #[test]
     fn a_list_paste_takes_the_documents_lists_2087() {
         use docxcore::package::{BULLET_LIST_NUM_ID, NUMBER_LIST_NUM_ID, new_package};
@@ -346,6 +350,8 @@ mod tests {
             r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
             // Neither defined.
             r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"></w:numbering>"#,
+            // Word's own lists, of docxy's kinds (#2180).
+            r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/><w:lvlText w:val="&#x25AA;"/></w:lvl></w:abstractNum><w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num></w:numbering>"#,
         ] {
             let mut pkg = new_package(docxcore::model::Document { body: vec![] });
             pkg.add_markdown_numbering();

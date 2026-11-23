@@ -1053,6 +1053,13 @@ pub struct Package {
 pub const BULLET_LIST_NUM_ID: i32 = 9990;
 /// The decimal-list counterpart of [`BULLET_LIST_NUM_ID`].
 pub const NUMBER_LIST_NUM_ID: i32 = 9991;
+/// The abstract numbering [`Package::add_markdown_numbering`] gives docxy's
+/// own bullet list, `numId` 1: what tells that list from a document's own
+/// numId 1 (#2180).
+pub const MARKDOWN_BULLET_ABSTRACT_ID: i32 = 100;
+/// The decimal-list counterpart of [`MARKDOWN_BULLET_ABSTRACT_ID`], for
+/// `numId` 2.
+pub const MARKDOWN_DECIMAL_ABSTRACT_ID: i32 = 101;
 impl Package {
     /// Resolve the settings part through the main document relationship. The
     /// conventional name remains a compatibility fallback for older fixtures
@@ -4503,13 +4510,14 @@ impl Package {
         const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         let bullets = markdown_list_levels(true);
         let decimals = markdown_list_levels(false);
+        let (b, d) = (MARKDOWN_BULLET_ABSTRACT_ID, MARKDOWN_DECIMAL_ABSTRACT_ID);
         let numbering = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
          <w:numbering xmlns:w=\"{W}\">\
-         <w:abstractNum w:abstractNumId=\"100\">{bullets}</w:abstractNum>\
-         <w:abstractNum w:abstractNumId=\"101\">{decimals}</w:abstractNum>\
-         <w:num w:numId=\"1\"><w:abstractNumId w:val=\"100\"/></w:num>\
-         <w:num w:numId=\"2\"><w:abstractNumId w:val=\"101\"/></w:num>\
+         <w:abstractNum w:abstractNumId=\"{b}\">{bullets}</w:abstractNum>\
+         <w:abstractNum w:abstractNumId=\"{d}\">{decimals}</w:abstractNum>\
+         <w:num w:numId=\"1\"><w:abstractNumId w:val=\"{b}\"/></w:num>\
+         <w:num w:numId=\"2\"><w:abstractNumId w:val=\"{d}\"/></w:num>\
          </w:numbering>"
         );
         self.parts

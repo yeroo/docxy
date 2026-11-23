@@ -30,8 +30,9 @@ issue number to find its notes.
 
 - `docs/claude/docx-editing.md`: before changing the document editor's lists, indents,
   hyphenation, sections, settings.xml or headers/footers: lists, numId 0 and indents
-  (#1653, #1728, #1792, #1814, #1815), manual hyphenation (#1266), Page Setup / Columns
-  Apply to Selected text (#1272), Layout settings.xml undo steps (#1273), Header & Footer
+  (#1653, #1728, #1792, #1814, #1815), Bullets and Numbering never joining a
+  document's own numId 1 or 2, on and off by kind (#2180), manual hyphenation
+  (#1266), Page Setup / Columns Apply to Selected text (#1272), Layout settings.xml undo steps (#1273), Header & Footer
   leftovers: `w:ptab`, bound Company/Manager properties, Date & Time (#1433), live page
   fields (#1437), Web Layout and DocView fitting tables to the view width, horizontal
   scroll (#1895), Print Layout's y-only caret follow (#2080), the flow view drawing an

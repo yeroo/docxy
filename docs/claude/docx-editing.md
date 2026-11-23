@@ -25,17 +25,31 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   `w:lvlOverride` / `w:startOverride` restarts.
 - The lists Bullets, Numbers, AutoCorrect's `* ` / `1. ` and another app's
   pasted list items (r3, `doc_paste::numbering_for_paste`) apply
-  (`ListIds`, #2087 r1): docxy's own 1 and 2 in a document with no
-  numbering part or one whose part defines that id as the same kind at
-  level 0; else (the part defines it as the other kind, or leaves it
-  undefined, r2: `add_markdown_numbering` never touches an existing part,
-  so nothing would define it) `Package::ensure_list`'s 9990 / 9991. The
+  (`ListIds`, #2087 r1, #2180): docxy's own 1 and 2 in a document with no
+  numbering part or one where that id is docxy's own list, the one
+  `add_markdown_numbering` writes (`numId` 1 on abstract
+  `MARKDOWN_BULLET_ABSTRACT_ID` 100, 2 on `MARKDOWN_DECIMAL_ABSTRACT_ID`
+  101, level 0 of that kind); else `Package::ensure_list`'s 9990 / 9991. A
+  Word document's own 1 or 2 is never joined, even of the same kind
+  (#2180): Word would draw its format and continue its count (a new
+  numbered list starting at 4). A part that leaves 1 or 2 undefined takes
+  9990 / 9991 too (r2: `add_markdown_numbering` never touches an existing
+  part, so nothing would define it); so does a docxy document Word saved
+  again with its abstracts renumbered, the safe side. The
   command defines its list in the package first (`ListIds::define`:
   `ensure_list`, or for 1 and 2 `add_markdown_numbering` on a package
   with no part; AutoCorrect after the key that started the list), so the
-  next frame's `run_look` cache sees it. The pressed
-  states ask for the same ids (the suite's `act_active`, `ext::DocView`'s
-  `caret_format`), and F4 repeats the list applied (`Repeat::List`). The
+  next frame's `run_look` cache sees it. The pressed states and the
+  toggle go by the kind of list, not its id (#2180, `all_in_list_kind`
+  over `Editor::all_selected_list_items` and `list_level_numbered`, the
+  rule `list_markers` draws by): Bullets is pressed, and a click takes the
+  selection off, when every selected paragraph is a bullet list item, the
+  document's own included, as in Word; a selection with any other
+  paragraph takes the applied list whole (the document's own items in it
+  too: Word merges them), and unselected items never change. So do the
+  suite's `act_active`, `ext::DocView`'s `caret_format` and F4
+  (`Repeat::List`, which repeats the list applied, over the tab's
+  numbering). The
   definition is a part write, not an undo step: an Undo leaves it unused.
 - `Editor::change_indent`: a list item with a direct left indent that
   reaches 0 writes `w:left="0"` (`ParProps::pin_left_indent_zero`,

@@ -3459,6 +3459,20 @@ impl Editor {
         });
     }
 
+    /// Whether the selection touches paragraphs and each one is a list item
+    /// (a `w:numId` other than 0) whose list and level `f(num_id, ilvl)`
+    /// accepts: Bullets and Numbering's pressed state and toggle by the
+    /// kind of list a paragraph is in, not its id (#2180).
+    pub fn all_selected_list_items(&self, f: impl Fn(i32, i32) -> bool) -> bool {
+        let paths = self.selected_para_paths();
+        !paths.is_empty()
+            && paths.iter().all(|path| {
+                resolve_para(&self.doc.body, path).is_some_and(|p| {
+                    p.props.in_list() && f(p.props.num_id.unwrap_or_default(), p.props.ilvl)
+                })
+            })
+    }
+
     /// The paragraph style id at the caret (for syncing the Styles ribbon/dialog).
     pub fn caret_para_style(&self) -> Option<String> {
         self.caret_para_props().style_id
@@ -7880,6 +7894,28 @@ mod tests {
         assert!(ed.all_in_list(42));
         ed.set_list(None);
         assert!(!ed.all_in_list(42));
+    }
+
+    /// `all_selected_list_items` asks every selected paragraph to be a list
+    /// item its test accepts, by list and level (#2180); a numId 0 item and
+    /// a plain paragraph are not list items.
+    #[test]
+    fn all_selected_list_items_tests_each_selected_list_item_2180() {
+        let mut ed = Editor::new(doc(&["a", "b", "c"]));
+        ed.select_all();
+        assert!(!ed.all_selected_list_items(|_, _| true));
+        ed.set_list(Some(7));
+        assert!(ed.all_selected_list_items(|num, ilvl| num == 7 && ilvl == 0));
+        assert!(!ed.all_selected_list_items(|num, _| num == 8));
+        ed.change_indent(720);
+        assert!(ed.all_selected_list_items(|_, ilvl| ilvl == 1));
+        if let Block::Paragraph(p) = &mut ed.doc.body[1] {
+            p.props.num_id = Some(0);
+        }
+        assert!(!ed.all_selected_list_items(|_, _| true));
+        // Only the selected paragraphs count: the caret in the first.
+        ed.set_caret(Caret::top(0, 0));
+        assert!(ed.all_selected_list_items(|num, _| num == 7));
     }
 
     #[test]

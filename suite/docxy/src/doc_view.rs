@@ -633,7 +633,7 @@ impl DocView {
     /// runs the link commands.
     pub fn caret_format(&self) -> CaretFormat {
         let parts = self.run_styles.borrow_mut().parts(self.pkg.as_ref());
-        edit::caret_format(&self.editor, ListIds::of(parts.numbering.as_deref()))
+        edit::caret_format(&self.editor, parts.numbering.as_deref())
     }
 
     /// The document as it is now, edits included: what the host exports.
