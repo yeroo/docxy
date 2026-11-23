@@ -601,3 +601,27 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   differently. `.xls`/`.ods` saves ignore `foreign`, as they lose these parts
   of a loaded xf. Not done: conditional formats and named cell styles
   (`cellStyleXfs`) across workbooks.
+
+## Relationship helpers write every rId they return (#831)
+
+- `add_rel` and `add_workbook_rel` (a wrapper over it, so it now creates a
+  missing workbook rels part too) always write the relationship whose rId
+  they return. "" means only "already related", and the caller finds that id
+  with `rel_id_for`. `with_rels` splices the new element in before
+  `</Relationships>`, or into a self-closed root it opens (`splice_rels`). A
+  part with neither (cut short, or a prefixed `<r:Relationships>`) is
+  rebuilt as a default-namespace part from what `parse_rels_mode` reads in
+  it, which is what the loader resolved. A read element without an `Id`
+  gets a fresh one, since the loader finds styles and shared strings by
+  type. `next_rid` reads the original text, so an id held only by an
+  unreadable tail is not handed out again.
+- The writers that can refuse an edit (charts, pivots, hyperlinks) still ask
+  `rels_takes` first. It now accepts a self-closed root, and still refuses a
+  part that would have to be rebuilt. `ExternalRels::finish` splices through
+  `splice_rels`.
+- `add_sheet` skips a part name that any workbook rel already targets. A
+  dangling rel's `<sheet>` entry stays in workbook.xml text even though the
+  loader skipped it, so reusing that rel's id would give two entries the
+  same `r:id`. `wire_table_part` reuses a dangling rel to its free table
+  part, and adds no second `<tablePart>` when the worksheet already names
+  that rel.
