@@ -1196,3 +1196,105 @@ fn a_header_property_with_no_body_control_survives_body_undo_1364() {
     assert_eq!(ed.core_fields().title, "New");
     assert_eq!(ed.core_unsynced(), []);
 }
+
+/// The raw inlines of paragraph 0, verbatim.
+fn raws(ed: &Editor) -> Vec<String> {
+    para(ed, 0)
+        .content
+        .iter()
+        .filter_map(|i| match i {
+            Inline::Raw(r) => Some(r.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+const PTAB_EL: &str = "<w:ptab w:relativeTo=\"margin\" w:alignment=\"right\" w:leader=\"none\"/>";
+
+/// #1463: a run holding a field marker and an alignment tab (an orphan
+/// marker here, so the run stays raw) loses only the tab to a delete over
+/// it: the marker stays in its run, as in Word, so no field is left
+/// unbalanced. Undo brings the run back as it was.
+#[test]
+fn a_delete_over_a_ptab_keeps_a_field_marker_in_its_run_1463() {
+    let end = "<w:fldChar w:fldCharType=\"end\"/>";
+    let begin = "<w:fldChar w:fldCharType=\"begin\"/>";
+    let rpr = "<w:rPr><w:b/></w:rPr>";
+    for (run, kept) in [
+        (
+            format!("<w:r>{end}{PTAB_EL}</w:r>"),
+            format!("<w:r>{end}</w:r>"),
+        ),
+        (
+            format!("<w:r>{PTAB_EL}{begin}</w:r>"),
+            format!("<w:r>{begin}</w:r>"),
+        ),
+        (
+            format!("<w:r w:rsidR=\"00A1\">{rpr}{end}{PTAB_EL}</w:r>"),
+            format!("<w:r w:rsidR=\"00A1\">{rpr}{end}</w:r>"),
+        ),
+    ] {
+        let mut ed = ed_with(&run);
+        assert_eq!(
+            raws(&ed),
+            std::slice::from_ref(&run),
+            "loaded as one raw run"
+        );
+        select(&mut ed, vec![0], 1, 3);
+        assert!(ed.delete_selection());
+        assert_eq!(raws(&ed), std::slice::from_ref(&kept), "{run}");
+        assert_eq!(etext(&ed), "ad");
+        assert!(ed.undo());
+        assert_eq!(raws(&ed), std::slice::from_ref(&run), "undo: {run}");
+        assert_eq!(etext(&ed), "abcd");
+    }
+}
+
+/// #1463: tracked, the marker's run stays undeleted and the alignment tab
+/// is recorded alone in a `w:del`, in a run with the original properties
+/// (a `w:rPrChange` with an `w:rPr` of its own in them included). Accept
+/// removes the tab, reject keeps it, and either way the field's end stays.
+#[test]
+fn a_tracked_delete_over_a_ptab_keeps_a_field_marker_in_its_run_1463() {
+    let end = "<w:fldChar w:fldCharType=\"end\"/>";
+    let rpr = "<w:rPr><w:b/><w:rPrChange w:id=\"9\" w:author=\"Bo\" \
+        w:date=\"2026-01-01T00:00:00Z\"><w:rPr><w:i/></w:rPr></w:rPrChange></w:rPr>";
+    let count = |xml: &str, needle: &str| xml.matches(needle).count();
+    for tab_first in [false, true] {
+        let run = if tab_first {
+            format!("<w:r>{rpr}{PTAB_EL}{end}</w:r>")
+        } else {
+            format!("<w:r>{rpr}{end}{PTAB_EL}</w:r>")
+        };
+        let mut ed = ed_with(&run);
+        let before = saved(&ed);
+        track(&mut ed);
+        select(&mut ed, vec![0], 1, 3);
+        assert!(ed.delete_selection());
+        let xml = saved(&ed);
+        assert_eq!(count(&xml, "fldCharType=\"end\""), 1, "{xml}");
+        assert_eq!(count(&xml, "<w:ptab"), 1, "{xml}");
+        let dels = deleted_objects(&xml);
+        let tab_dels: Vec<&String> = dels.iter().filter(|d| d.contains("<w:ptab")).collect();
+        assert_eq!(tab_dels.len(), 1, "{xml}");
+        assert!(tab_dels[0].contains(rpr), "the run's properties: {xml}");
+        assert!(dels.iter().all(|d| !d.contains("<w:fldChar")), "{xml}");
+        // The tab's record sits on the side of the marker the tab was on.
+        let (tab_at, end_at) = (xml.find("<w:ptab").unwrap(), xml.find(end).unwrap());
+        assert_eq!(tab_at < end_at, tab_first, "{xml}");
+
+        let mut rejected = Editor::new(ed.doc.clone());
+        rejected.reject_all_revisions();
+        let after = saved(&rejected);
+        assert_eq!(count(&after, "fldCharType=\"end\""), 1, "{after}");
+        assert_eq!(count(&after, "<w:ptab"), 1, "{after}");
+        let mut accepted = Editor::new(ed.doc.clone());
+        accepted.accept_all_revisions();
+        let after = saved(&accepted);
+        assert_eq!(count(&after, "fldCharType=\"end\""), 1, "{after}");
+        assert_eq!(count(&after, "<w:ptab"), 0, "{after}");
+
+        assert!(ed.undo());
+        assert_eq!(saved(&ed), before, "undo restores the run");
+    }
+}

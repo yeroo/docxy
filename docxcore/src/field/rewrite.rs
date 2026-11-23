@@ -11,10 +11,10 @@ use crate::field::{FieldEvent, field_events};
 use crate::xml::{Event, XmlParser};
 
 /// One element of a slice of XML siblings: its byte span and its name.
-struct El<'a> {
-    start: usize,
-    end: usize,
-    name: &'a str,
+pub(crate) struct El<'a> {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) name: &'a str,
 }
 
 /// The top-level elements of `xml`, a run of siblings. `None` when it is
@@ -45,7 +45,7 @@ fn siblings(xml: &str) -> Option<Vec<El<'_>>> {
 
 /// The children of the one element `xml` is (a `w:r`), with spans relative
 /// to `xml`, and the end of its start tag. `None` when malformed or empty.
-fn children(xml: &str) -> Option<(usize, Vec<El<'_>>)> {
+pub(crate) fn children(xml: &str) -> Option<(usize, Vec<El<'_>>)> {
     let mut p = XmlParser::new(xml);
     if p.next() != Event::Start {
         return None;

@@ -236,17 +236,43 @@ impl Editor {
         }
         if self.track.is_none() {
             if let Some(p) = para_mut(&mut self.doc.body, path) {
-                super::remove_indices(&mut p.content, &found);
+                super::remove_spanned_objects(&mut p.content, &found);
             }
             return;
         }
+        // A run holding field code records only its alignment tabs, in a
+        // run of their own beside it (#1463); `shift` counts those added.
+        let mut shift = 0;
         for k in found {
+            let k = k + shift;
+            let action = match resolve_para(&self.doc.body, path).and_then(|p| p.content.get(k)) {
+                Some(Inline::Raw(raw)) => super::spanned_object(raw),
+                _ => continue,
+            };
+            if matches!(action, super::SpannedObject::Keep) {
+                continue;
+            }
             let Some(meta) = self.fresh_revision_metadata() else {
                 return;
             };
             if let Some(p) = para_mut(&mut self.doc.body, path) {
-                let inner = p.content[k].clone();
-                p.content[k] = deletion_wrapper(meta, inner);
+                match action {
+                    super::SpannedObject::Split {
+                        kept,
+                        tab,
+                        tab_first,
+                    } => {
+                        p.content[k] = Inline::Raw(kept);
+                        let at = if tab_first { k } else { k + 1 };
+                        p.content
+                            .insert(at, deletion_wrapper(meta, Inline::Raw(tab)));
+                        shift += 1;
+                    }
+                    _ => {
+                        let inner = p.content[k].clone();
+                        p.content[k] = deletion_wrapper(meta, inner);
+                    }
+                }
             }
             // Each wrapper takes its id before the next is made.
             self.settle_revisions();
