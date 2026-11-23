@@ -1110,11 +1110,16 @@ pub const SHEET_NAME_MAX: usize = 31;
 /// The characters Excel refuses anywhere in a sheet name.
 pub const SHEET_NAME_FORBIDDEN: &str = "[]:*?/\\";
 
+/// The reason a host shows for a sheet name another sheet already has
+/// ([`Workbook::sheet_name_refused`]).
+pub const SHEET_NAME_TAKEN: &str = "Sheet name already taken";
+
 /// Why Excel would refuse `name` (already trimmed) as a sheet name, or `None`
 /// when it takes it: empty, longer than [`SHEET_NAME_MAX`] characters, any of
 /// [`SHEET_NAME_FORBIDDEN`], or an apostrophe first or last (one inside, as
-/// in `Bob's Data`, is fine). A taken name is the caller's check. The one
-/// rule a rename applies; an import cleans names by the same constants
+/// in `Bob's Data`, is fine). A taken name is the caller's check
+/// ([`Workbook::sheet_name_refused`] makes both). The one rule a rename or an
+/// add applies; an import cleans names by the same constants
 /// (`legacy::valid_sheet_names`).
 pub fn sheet_name_error(name: &str) -> Option<&'static str> {
     if name.trim().is_empty() {
@@ -2569,6 +2574,49 @@ impl Workbook {
             .expect("an unused sheet name")
     }
 
+    /// Whether a sheet other than `except` is named `name`, ignoring case
+    /// beyond ASCII as Excel does (`Données` and `DONNÉES` are one name; the
+    /// import's `legacy::valid_sheet_names` folds the same way).
+    fn sheet_name_taken(&self, name: &str, except: Option<usize>) -> bool {
+        let folded = name.to_lowercase();
+        (self.sheets.iter().enumerate())
+            .any(|(i, s)| Some(i) != except && s.name.to_lowercase() == folded)
+    }
+
+    /// Why `name` (already trimmed) cannot name a sheet of this workbook, or
+    /// `None` when it can: a name Excel refuses ([`sheet_name_error`]), then
+    /// one another sheet has in any case ([`SHEET_NAME_TAKEN`]). `except` is
+    /// the sheet being renamed (`None` for a new sheet), so a rename may
+    /// change only the case of its own name. The one check every path that
+    /// adds or renames a sheet from an outside name applies (#2153): Excel
+    /// repairs a file holding such a name, renaming or dropping sheets.
+    pub fn sheet_name_refused(&self, name: &str, except: Option<usize>) -> Option<&'static str> {
+        sheet_name_error(name).or_else(|| {
+            self.sheet_name_taken(name, except)
+                .then_some(SHEET_NAME_TAKEN)
+        })
+    }
+
+    /// `base` when no sheet has it (in any case), else `"{base} {n}"` for the
+    /// lowest free `n` from 2, `base` cut by characters so the whole name
+    /// fits [`SHEET_NAME_MAX`]. The caller has checked `base` with
+    /// [`sheet_name_error`]. The `sheet.add`/`sheet.import-*` control verbs'
+    /// "deduplicate on collision" name (#2153).
+    pub fn free_sheet_name(&self, base: &str) -> String {
+        if !self.sheet_name_taken(base, None) {
+            return base.to_string();
+        }
+        (2..)
+            .map(|n| {
+                let suffix = format!(" {n}");
+                let room = SHEET_NAME_MAX.saturating_sub(suffix.chars().count());
+                let cut: String = base.chars().take(room).collect();
+                format!("{cut}{suffix}")
+            })
+            .find(|name| !self.sheet_name_taken(name, None))
+            .expect("a free sheet name")
+    }
+
     /// A table by displayName, case-insensitive.
     pub fn table(&self, name: &str) -> Option<&Table> {
         self.tables.iter().find(|t| name_eq(&t.name, name))
@@ -3534,6 +3582,73 @@ mod tests {
         for name in ["Bob's Data", "Q1 2026", "Data (2)", "Sheet-1"] {
             assert_eq!(sheet_name_error(name), None, "{name}");
         }
+    }
+
+    fn named_sheets(names: &[&str]) -> Workbook {
+        Workbook {
+            sheets: (names.iter())
+                .map(|n| Sheet {
+                    name: n.to_string(),
+                    ..Sheet::default()
+                })
+                .collect(),
+            ..Workbook::default()
+        }
+    }
+
+    /// #2153: the one check an add or a rename makes: Excel's rules first,
+    /// then a name another sheet has in any case, beyond ASCII.
+    #[test]
+    fn sheet_name_refused_rules_and_taken() {
+        let wb = named_sheets(&["Data", "Données", "Лист"]);
+        // Excel's rules pass through with their reasons.
+        for name in ["", "A:B", "'x", &"z".repeat(32)] {
+            assert_eq!(
+                wb.sheet_name_refused(name, None),
+                sheet_name_error(name),
+                "{name:?}"
+            );
+            assert!(wb.sheet_name_refused(name, None).is_some(), "{name:?}");
+        }
+        // Taken, in any case, also outside ASCII.
+        for name in ["Data", "DATA", "données", "DONNÉES", "ЛИСТ"] {
+            assert_eq!(
+                wb.sheet_name_refused(name, None),
+                Some(SHEET_NAME_TAKEN),
+                "{name}"
+            );
+        }
+        // A rename may change only the case of its own name...
+        assert_eq!(wb.sheet_name_refused("DONNÉES", Some(1)), None);
+        assert_eq!(wb.sheet_name_refused("data", Some(0)), None);
+        // ...but not take another sheet's.
+        assert_eq!(
+            wb.sheet_name_refused("DONNÉES", Some(0)),
+            Some(SHEET_NAME_TAKEN)
+        );
+        assert_eq!(wb.sheet_name_refused("Data 2", None), None);
+    }
+
+    /// #2153: the "deduplicate on collision" name of `sheet.add` and the
+    /// imports never passes 31 characters and folds case as the check does.
+    #[test]
+    fn free_sheet_name_fits_31_chars() {
+        let long = "L".repeat(31);
+        let wb = named_sheets(&["Sheet", "Sheet 2", &long, "Données"]);
+        assert_eq!(wb.free_sheet_name("Fresh"), "Fresh");
+        assert_eq!(wb.free_sheet_name("Sheet"), "Sheet 3");
+        assert_eq!(wb.free_sheet_name("SHEET"), "SHEET 3");
+        let deduped = wb.free_sheet_name(&long.to_lowercase());
+        assert_eq!(deduped, format!("{} 2", "l".repeat(29)));
+        assert_eq!(deduped.chars().count(), 31);
+        assert_eq!(sheet_name_error(&deduped), None);
+        assert_eq!(wb.free_sheet_name("DONNÉES"), "DONNÉES 2");
+        // Multi-byte characters are cut as characters.
+        let accents = "é".repeat(31);
+        let wb = named_sheets(&[&accents]);
+        let deduped = wb.free_sheet_name(&accents);
+        assert_eq!(deduped, format!("{} 2", "é".repeat(29)));
+        assert_eq!(wb.sheet_name_refused(&deduped, None), None);
     }
 
     #[test]

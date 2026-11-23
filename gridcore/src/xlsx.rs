@@ -10417,7 +10417,17 @@ pub(crate) fn add_workbook_rel(
 impl SheetPackage {
     /// Append a blank sheet named `name`; returns its index. Wires up the
     /// part, content type, relationship, and the workbook.xml entry.
+    ///
+    /// `name` must pass [`crate::sheet::Workbook::sheet_name_refused`]`(name,
+    /// None)`: a host checks an outside name first and says why it refuses
+    /// it, since Excel repairs a file whose sheet names break its rules or
+    /// repeat in another case (#2153). Debug builds assert it.
     pub fn add_sheet(&mut self, name: &str) -> usize {
+        debug_assert!(
+            self.workbook.sheet_name_refused(name, None).is_none(),
+            "add_sheet({name:?}): {:?}",
+            self.workbook.sheet_name_refused(name, None)
+        );
         // Unused part name xl/worksheets/sheetN.xml.
         let mut n = 1;
         while self.part(&format!("xl/worksheets/sheet{n}.xml")).is_some() {
@@ -11708,21 +11718,15 @@ impl SheetPackage {
     /// Rename sheet `idx`, updating the model, any formulas that reference the
     /// old sheet name (via [`crate::edit::rename_sheet`]), and the `<sheet
     /// name="…">` entries in `workbook.xml`. Rejects a name that collides
-    /// (case-insensitively) with another sheet, an out-of-range sheet, and a
-    /// name Excel refuses ([`crate::sheet::sheet_name_error`]: empty, over 31
-    /// characters, `[ ] : * ? / \`, an apostrophe first or last). Returns
-    /// whether the rename happened.
+    /// (in any case, [`crate::sheet::Workbook::sheet_name_refused`]) with
+    /// another sheet, an out-of-range sheet, and a name Excel refuses
+    /// ([`crate::sheet::sheet_name_error`]: empty, over 31 characters,
+    /// `[ ] : * ? / \`, an apostrophe first or last). Returns whether the
+    /// rename happened.
     pub fn rename_sheet(&mut self, idx: usize, name: &str) -> bool {
         let name = name.trim();
-        if crate::sheet::sheet_name_error(name).is_some() || idx >= self.workbook.sheets.len() {
-            return false;
-        }
-        if self
-            .workbook
-            .sheets
-            .iter()
-            .enumerate()
-            .any(|(i, s)| i != idx && s.name.eq_ignore_ascii_case(name))
+        if idx >= self.workbook.sheets.len()
+            || (self.workbook.sheet_name_refused(name, Some(idx))).is_some()
         {
             return false;
         }
@@ -13180,6 +13184,40 @@ mod tests {
             pkg.workbook.sheets[0].cells[&(0, 0)].formula.as_deref(),
             Some("'Bob''s Data'!A1")
         );
+    }
+
+    /// #2153: a rename onto another sheet's name in a case that differs
+    /// outside ASCII is refused too (Excel repairs a file holding both);
+    /// changing the case of the sheet's own name is still a rename.
+    #[test]
+    fn rename_sheet_refuses_a_taken_name_in_any_case() {
+        let mut pkg = new_xlsx();
+        let s2 = pkg.add_sheet("Données");
+        let s3 = pkg.add_sheet("Other");
+        let wb_before = pkg.part("xl/workbook.xml").unwrap().to_vec();
+        assert!(!pkg.rename_sheet(s3, "DONNÉES"));
+        assert_eq!(pkg.workbook.sheets[s3].name, "Other");
+        assert_eq!(pkg.part("xl/workbook.xml").unwrap(), wb_before);
+        assert!(pkg.rename_sheet(s2, "DONNÉES"));
+        assert_eq!(pkg.workbook.sheets[s2].name, "DONNÉES");
+    }
+
+    /// #2153: `add_sheet` takes only a name the hosts have checked; a path
+    /// that skips the check fails in a debug build.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "Sheet name already taken")]
+    fn add_sheet_debug_asserts_on_a_taken_name() {
+        let mut pkg = new_xlsx();
+        pkg.add_sheet("Données");
+        pkg.add_sheet("DONNÉES");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "Sheet name cannot contain")]
+    fn add_sheet_debug_asserts_on_a_name_excel_refuses() {
+        new_xlsx().add_sheet("Sheet/1");
     }
 
     #[test]
