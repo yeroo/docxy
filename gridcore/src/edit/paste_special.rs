@@ -60,6 +60,25 @@ pub enum PasteWhat {
 }
 
 impl PasteWhat {
+    /// Whether a paste of this kind reads the copy's own style ids, so a
+    /// paste from another workbook adopts its formats first
+    /// ([`ClipBlock::adopt_styles`], #1011): exactly the kinds the style
+    /// `match` in [`paste_special_changes`] takes `src.style` for; the others
+    /// keep the destination's style. `every_kind_that_reads_the_source_style_says_so`
+    /// holds the two together.
+    pub fn uses_source_styles(self) -> bool {
+        matches!(
+            self,
+            PasteWhat::All
+                | PasteWhat::AllAndColumnWidths
+                | PasteWhat::Formats
+                | PasteWhat::ValuesAndSourceFormatting
+                | PasteWhat::AllExceptBorders
+                | PasteWhat::FormulasAndNumberFormats
+                | PasteWhat::ValuesAndNumberFormats
+        )
+    }
+
     /// The dialog's Paste options, in its order.
     pub const DIALOG: [PasteWhat; 10] = [
         PasteWhat::All,
@@ -266,6 +285,11 @@ pub struct ClipBlock {
     /// column is past it is an absent cell with nothing of its own to paste
     /// ([`ClipBlock::lands_absent`], #1660). `None`: no such cells.
     pub used: Option<(u32, u32)>,
+    /// The source workbook's format of every style id the cells use: a
+    /// paste into another workbook adopts them ([`ClipBlock::adopt_styles`],
+    /// #1011), as the cells' ids mean nothing there. Empty for a block
+    /// already in its destination's ids (typed text).
+    pub xfs: std::collections::BTreeMap<u32, crate::sheet::Xf>,
 }
 
 impl ClipBlock {
@@ -278,7 +302,7 @@ impl ClipBlock {
         // An absent cell is read with the style it inherits (#1660).
         let read = s.copy_reader();
         let used = Some(read.used());
-        let cells = rows
+        let cells: Vec<Vec<Cell>> = rows
             .iter()
             .map(|&r| cols.iter().map(|&c| read.cell(r, c)).collect())
             .collect();
@@ -319,6 +343,11 @@ impl ClipBlock {
                 })
             })
             .collect();
+        let xfs = cells
+            .iter()
+            .flatten()
+            .map(|c| (c.style, wb.styles.xf(c.style)))
+            .collect();
         ClipBlock {
             cells,
             rows,
@@ -330,6 +359,83 @@ impl ClipBlock {
             rules,
             typed: false,
             used,
+            xfs,
+        }
+    }
+
+    /// Give each of [`ClipBlock::xfs`] loaded from the source's styles part
+    /// ([`Xf::loaded_from`]) the raw parts a paste into another workbook
+    /// saves it with ([`Xf::foreign`], #1011). `read` gets those entries'
+    /// indices (all at once: the part is read once) and returns what it
+    /// found of them, [`crate::xlsx::SheetPackage::foreign_xfs`]. An xf that
+    /// already carries another workbook's parts keeps them, and a copy of
+    /// nothing loaded never calls `read`.
+    ///
+    /// [`Xf::loaded_from`]: crate::sheet::Xf::loaded_from
+    /// [`Xf::foreign`]: crate::sheet::Xf::foreign
+    pub fn carry_parts(
+        &mut self,
+        read: impl FnOnce(Vec<u32>) -> std::collections::BTreeMap<u32, crate::sheet::ForeignXf>,
+    ) {
+        let mut wanted: Vec<u32> = (self.xfs.values())
+            .filter(|x| x.foreign.is_none())
+            .filter_map(|x| x.loaded_from)
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        if wanted.is_empty() {
+            return;
+        }
+        // An edit keeps `loaded_from`, so xfs derived from one entry share
+        // its parts.
+        let found: std::collections::BTreeMap<u32, std::sync::Arc<_>> = read(wanted)
+            .into_iter()
+            .map(|(k, f)| (k, std::sync::Arc::new(f)))
+            .collect();
+        for xf in self.xfs.values_mut().filter(|x| x.foreign.is_none()) {
+            xf.foreign = xf.loaded_from.and_then(|k| found.get(&k).cloned());
+        }
+    }
+
+    /// The block as a paste into another workbook takes it (#1011): every
+    /// cell's style id, which names an xf of the source workbook, replaced by
+    /// one of `dst` with the same format ([`ClipBlock::xfs`]), interned
+    /// (appended where `dst` has none equal). A plain cell of the source's
+    /// default style lands on `dst`'s own default when the two read alike.
+    /// The source's [`Xf::loaded_from`] indexes the source's styles part, so
+    /// it is dropped; its [`Xf::foreign`] parts carry what save needs instead.
+    /// Interning finds what an earlier paste of the same copy appended, so
+    /// pasting it again appends nothing. Afterwards the block is in `dst`'s
+    /// ids, and adopting it again changes nothing.
+    pub fn adopt_styles(&mut self, dst: &mut crate::sheet::Styles) {
+        use crate::sheet::Xf;
+        if self.xfs.is_empty() {
+            return;
+        }
+        // The format alone, whichever part it was loaded from.
+        let modeled = |x: &Xf| Xf {
+            loaded_from: None,
+            foreign: None,
+            ..x.clone()
+        };
+        let map: std::collections::HashMap<u32, u32> = std::mem::take(&mut self.xfs)
+            .into_iter()
+            .map(|(id, xf)| {
+                let to = if id == 0 && modeled(&xf) == modeled(&dst.xf(0)) {
+                    0
+                } else {
+                    dst.intern(Xf {
+                        loaded_from: None,
+                        ..xf
+                    })
+                };
+                (id, to)
+            })
+            .collect();
+        for cell in self.cells.iter_mut().flatten() {
+            if let Some(&to) = map.get(&cell.style) {
+                cell.style = to;
+            }
         }
     }
 
@@ -700,6 +806,8 @@ pub fn paste_special_changes(
             }
             let d = (s.cell(dest.0, dest.1).cloned())
                 .unwrap_or_else(|| read.absent_cell(dest.0, dest.1));
+            // The kinds that read `src.style` are
+            // [`PasteWhat::uses_source_styles`]'s: keep the two in step.
             let style = match spec.what {
                 PasteWhat::All
                 | PasteWhat::AllAndColumnWidths

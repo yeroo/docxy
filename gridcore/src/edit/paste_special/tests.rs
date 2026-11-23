@@ -855,3 +855,176 @@ fn an_operation_past_the_largest_number_is_num() {
         assert_eq!(value(&wb, 0, "C1"), CellValue::Error(want.into()), "{o:?}");
     }
 }
+
+/// #1011: a copy pasted into another workbook lands with the source's
+/// formats, not with whatever the destination's xfs hold at the source's
+/// ids. The destination's own xfs are left as they were, a plain cell lands
+/// on its default style, and pasting again appends nothing.
+#[test]
+fn adopt_styles_maps_source_formats_into_the_destination() {
+    let mut src = book(&[(
+        "Sheet1",
+        &[("A1", Cell::number(0.5)), ("A2", Cell::number(2.0))],
+    )]);
+    let mut pct = Xf {
+        bold: true,
+        fill: Some((255, 0, 0)),
+        loaded_from: Some(1),
+        ..Xf::default()
+    };
+    pct.set_code(Some("0.00%".into()));
+    src.styles.xfs.push(pct.clone());
+    src.sheets[0].cells.get_mut(&(0, 0)).unwrap().style = 1;
+    let mut dst = book(&[("Sheet1", &[])]);
+    let italic = Xf {
+        italic: true,
+        loaded_from: Some(1),
+        ..Xf::default()
+    };
+    dst.styles.xfs.push(italic.clone());
+    let before = dst.styles.clone();
+
+    let clip = copy(&src, 0, "A1:A2");
+    assert_eq!(clip.xfs.len(), 2, "both ids the copy uses");
+    let mut block = clip.clone();
+    block.adopt_styles(&mut dst.styles);
+    let (a1, a2) = (block.cells[0][0].style, block.cells[1][0].style);
+    assert_eq!(a2, 0, "a plain cell lands on the destination's default");
+    assert_ne!(a1, 1, "not the destination's italic xf");
+    let landed = dst.styles.xf(a1);
+    assert_eq!(
+        Xf {
+            loaded_from: Some(1),
+            ..landed
+        },
+        pct,
+        "the source's format"
+    );
+    assert_eq!(
+        landed.loaded_from, None,
+        "the source's part is not this one"
+    );
+    assert_eq!(
+        dst.styles.xfs[..2],
+        before.xfs[..],
+        "nothing changed, one added"
+    );
+    assert_eq!(dst.styles.xfs.len(), 3);
+    assert!(block.xfs.is_empty(), "adopted: in the destination's ids");
+
+    // A second paste of the same copy finds the xf the first appended.
+    let mut again = clip.clone();
+    again.adopt_styles(&mut dst.styles);
+    assert_eq!(again.cells[0][0].style, a1);
+    assert_eq!(dst.styles.xfs.len(), 3);
+
+    // A default style that reads differently is a format of its own.
+    dst.styles.xfs[0].font_name = Some("Aptos".into());
+    let mut other = clip.clone();
+    other.adopt_styles(&mut dst.styles);
+    assert_ne!(other.cells[1][0].style, 0);
+    assert_eq!(dst.styles.xf(other.cells[1][0].style).font_name, None);
+
+    // Typed text is in its destination's ids already.
+    let mut typed = ClipBlock {
+        cells: vec![vec![Cell {
+            style: 1,
+            ..Cell::number(1.0)
+        }]],
+        typed: true,
+        ..ClipBlock::default()
+    };
+    let n = dst.styles.xfs.len();
+    typed.adopt_styles(&mut dst.styles);
+    assert_eq!((typed.cells[0][0].style, dst.styles.xfs.len()), (1, n));
+}
+
+/// #1011: the raw parts a paste saves with go only to xfs loaded from the
+/// source's part, are read once for all of them, and an xf that already
+/// carries a third workbook's parts (A pasted into B, then copied from B
+/// into C) keeps them.
+#[test]
+fn adopt_chains_keep_the_first_sources_parts() {
+    use crate::sheet::ForeignXf;
+    use std::sync::Arc;
+    let parts = |tag: &str| ForeignXf {
+        font: Some(format!("<font><u/><name val=\"{tag}\"/></font>")),
+        ..ForeignXf::default()
+    };
+    // A: a loaded xf and one an edit derived from it.
+    let mut a = book(&[(
+        "Sheet1",
+        &[("A1", Cell::number(1.0)), ("A2", Cell::number(2.0))],
+    )]);
+    a.styles.xfs.push(Xf {
+        italic: true,
+        loaded_from: Some(1),
+        ..Xf::default()
+    });
+    a.styles.xfs.push(Xf {
+        italic: true,
+        bold: true,
+        loaded_from: Some(1),
+        ..Xf::default()
+    });
+    a.sheets[0].cells.get_mut(&(0, 0)).unwrap().style = 1;
+    a.sheets[0].cells.get_mut(&(1, 0)).unwrap().style = 2;
+    let mut from_a = copy(&a, 0, "A1:A2");
+    let mut asked = Vec::new();
+    from_a.carry_parts(|ids| {
+        asked = ids.clone();
+        ids.into_iter().map(|k| (k, parts("A"))).collect()
+    });
+    assert_eq!(asked, [1], "one read, for the one entry both derive from");
+    for k in [1, 2] {
+        assert_eq!(from_a.xfs[&k].foreign.as_deref(), Some(&parts("A")), "{k}");
+    }
+
+    // Pasted into B.
+    let mut b = book(&[("Sheet1", &[])]);
+    from_a.adopt_styles(&mut b.styles);
+    for (i, row) in from_a.cells.iter().enumerate() {
+        b.sheets[0].set_cell(i as u32, 0, row[0].clone());
+    }
+    // Copied from B: its xfs carry A's parts, and B's part is never read.
+    let mut from_b = copy(&b, 0, "A1:A2");
+    from_b.carry_parts(|_| panic!("B's part holds none of them"));
+    let mut c = book(&[("Sheet1", &[])]);
+    from_b.adopt_styles(&mut c.styles);
+    for row in &from_b.cells {
+        let xf = c.styles.xf(row[0].style);
+        assert_eq!(xf.foreign, Some(Arc::new(parts("A"))), "{xf:?}");
+        assert!(xf.italic && xf.loaded_from.is_none());
+    }
+}
+
+/// #1011 r1: a paste from another workbook adopts its formats only for a
+/// kind that reads the copy's style ids. Every kind's pasted style tells
+/// whether it did, so [`PasteWhat::uses_source_styles`] can't drift from
+/// [`paste_special_changes`].
+#[test]
+fn every_kind_that_reads_the_source_style_says_so() {
+    let mut wb = book(&[("Sheet1", &[("A1", Cell::number(1.0))])]);
+    let mut pct = Xf {
+        bold: true,
+        ..Xf::default()
+    };
+    pct.set_code(Some("0.00%".into()));
+    wb.styles.xfs.push(pct);
+    wb.sheets[0].cells.get_mut(&(0, 0)).unwrap().style = 1;
+    let clip = copy(&wb, 0, "A1");
+    let kinds = PasteWhat::DIALOG.into_iter().chain([
+        PasteWhat::AllAndColumnWidths,
+        PasteWhat::ValuesAndSourceFormatting,
+    ]);
+    let mut seen = 0;
+    for what in kinds {
+        seen += 1;
+        let mut w = wb.clone();
+        let changes =
+            paste_special_changes(&mut w, 0, at("C1"), &clip, &PasteSpec::of(what)).unwrap();
+        let read = changes.iter().any(|(_, _, c)| c.style != 0);
+        assert_eq!(read, what.uses_source_styles(), "{what:?}");
+    }
+    assert_eq!(seen, 12, "every kind");
+}

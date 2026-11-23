@@ -2713,6 +2713,34 @@ pub struct Xf {
     /// indent, protection) survives an edit. `None` for an xf built from
     /// scratch.
     pub loaded_from: Option<u32>,
+    /// The `<cellXfs>` entry of *another* workbook this xf was pasted from
+    /// (#1011): its raw parts, which save appends to this workbook's styles
+    /// part the way it reuses a [`Xf::loaded_from`] entry's, so a pasted
+    /// cell keeps its source's underline, borders, theme colours and the
+    /// rest. Kept by every copy an edit derives from it. `None` for an xf of
+    /// this workbook.
+    pub foreign: Option<std::sync::Arc<ForeignXf>>,
+}
+
+/// One `<cellXfs>` entry of another workbook's styles part, as a pasted
+/// [`Xf::foreign`] carries it: everything save needs to write it into this
+/// workbook without the source part (#1011).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ForeignXf {
+    /// The entry as the loader read it (`loaded_from` and `foreign`
+    /// `None`): what an edit of the pasted xf is compared with, to tell
+    /// which raw parts still hold.
+    pub parsed: Xf,
+    /// Its raw `<font>`, `<fill>` and `<border>` elements.
+    pub font: Option<String>,
+    pub fill: Option<String>,
+    pub border: Option<String>,
+    /// Its `numFmtId` when that is a built-in format (below 164) the source
+    /// part does not redefine; a custom code is written as a new `<numFmt>`.
+    pub numfmt_id: Option<u32>,
+    /// Its `<alignment …/>` and `<protection …/>` children, as written.
+    pub alignment: Option<String>,
+    pub protection: Option<String>,
 }
 
 impl Xf {

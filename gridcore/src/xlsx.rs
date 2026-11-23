@@ -30,6 +30,8 @@ mod container_tests;
 #[cfg(test)]
 mod filter_tests;
 #[cfg(test)]
+mod foreign_xf_tests;
+#[cfg(test)]
 mod hyperlink_tests;
 mod hyperlinks;
 pub(crate) use hyperlinks::{has_scheme, model_target};
@@ -41,9 +43,9 @@ use std::borrow::Cow;
 
 use crate::formula::{file_formula, translate_formula, translate_formula_spaced};
 use crate::sheet::{
-    CalcMode, CalcSettings, Cell, CellMeta, CellValue, ColDef, DefinedName, NumFmt, Sheet, Styles,
-    Table, Workbook, Xf, cell_name, classify_builtin, classify_format_code, is_array_f,
-    parse_cell_name, parse_range_name, ref_starts_at, with_ref,
+    CalcMode, CalcSettings, Cell, CellMeta, CellValue, ColDef, DefinedName, ForeignXf, NumFmt,
+    Sheet, Styles, Table, Workbook, Xf, cell_name, classify_builtin, classify_format_code,
+    is_array_f, parse_cell_name, parse_range_name, ref_starts_at, with_ref,
 };
 
 const OLE2: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
@@ -194,6 +196,15 @@ impl SheetPackage {
                 Event::Eof => return false,
                 _ => {}
             }
+        }
+    }
+
+    /// [`foreign_xfs`] of this package's styles part: what a paste into
+    /// another workbook needs of the `<cellXfs>` entries `ids` (#1011).
+    pub fn foreign_xfs(&self, ids: impl IntoIterator<Item = u32>) -> BTreeMap<u32, ForeignXf> {
+        match self.part(self.styles_part_name()) {
+            Some(b) => foreign_xfs(&String::from_utf8_lossy(b), ids),
+            None => BTreeMap::new(),
         }
     }
 
@@ -1455,6 +1466,7 @@ fn parse_styles(xml: &str) -> Styles {
                         quote_prefix: matches!(p.attr("quotePrefix"), "1" | "true"),
                         unlocked: false,
                         loaded_from,
+                        foreign: None,
                     });
                 }
                 "protection" if in_cellxfs => {
@@ -2283,13 +2295,93 @@ fn max_numfmt_id(xml: &str) -> u32 {
     max
 }
 
+/// The `<cellXfs>` entries `ids` of styles part `xml` as a paste into
+/// another workbook carries them ([`ForeignXf`], #1011), read in one pass.
+/// An id is left out when the raw entries don't line up with what the
+/// loader read (the guard [`splice_styles`] uses for its own sources), or
+/// when any of its elements is namespace-prefixed (`<x:font>`): its prefix
+/// would mean nothing in the destination part. The pasted xf is then written
+/// from its modeled fields alone.
+pub(crate) fn foreign_xfs(
+    xml: &str,
+    ids: impl IntoIterator<Item = u32>,
+) -> BTreeMap<u32, ForeignXf> {
+    let mut out = BTreeMap::new();
+    let parsed = parse_styles(xml).xfs;
+    let raw = cell_xf_elements(xml);
+    if raw.len() != parsed.len() {
+        return out;
+    }
+    let fonts = font_elements(xml);
+    let fills = section_children(xml, "fills", "fill");
+    let borders = section_children(xml, "borders", "border");
+    // A built-in id the part redefines means its own code, not the built-in.
+    let redefined: HashSet<u32> = section_children(xml, "numFmts", "numFmt")
+        .into_iter()
+        .filter_map(|n| tag_attr(n, "numFmtId")?.parse().ok())
+        .collect();
+    for k in ids {
+        let (Some(p), Some(r)) = (parsed.get(k as usize), raw.get(k as usize)) else {
+            continue;
+        };
+        let open = &r[..r.find('>').map_or(r.len(), |e| e + 1)];
+        let id = |attr: &str| -> Option<usize> { tag_attr(open, attr)?.parse().ok() };
+        let font = id("fontId").and_then(|i| fonts.get(i));
+        let fill = id("fillId").and_then(|i| fills.get(i));
+        let border = id("borderId").and_then(|i| borders.get(i));
+        if [Some(r), font, fill, border]
+            .into_iter()
+            .flatten()
+            .any(|e| prefixed(e))
+        {
+            continue;
+        }
+        let numfmt_id = id("numFmtId")
+            .map(|n| n as u32)
+            .filter(|n| *n < 164 && !redefined.contains(n));
+        out.insert(
+            k,
+            ForeignXf {
+                parsed: Xf {
+                    loaded_from: None,
+                    foreign: None,
+                    ..p.clone()
+                },
+                font: font.map(|e| e.to_string()),
+                fill: fill.map(|e| e.to_string()),
+                border: border.map(|e| e.to_string()),
+                numfmt_id,
+                alignment: child_open_tag(r, "alignment"),
+                protection: child_open_tag(r, "protection"),
+            },
+        );
+    }
+    out
+}
+
+/// Whether any element of the raw XML `raw` has a namespace prefix.
+fn prefixed(raw: &str) -> bool {
+    raw.match_indices('<').any(|(i, _)| {
+        let name = raw[i + 1..].trim_start_matches('/');
+        let end = name
+            .find(|c: char| c.is_whitespace() || matches!(c, '>' | '/'))
+            .unwrap_or(name.len());
+        !name.starts_with(['!', '?']) && name[..end].contains(':')
+    })
+}
+
 /// Append the authored `xfs` to the original `styles.xml`, leaving every
 /// existing style byte-for-byte intact. An xf derived from a loaded one
 /// (`Xf::loaded_from`) reuses that source `<xf>`'s font, fill, border and
 /// number format wherever the modeled fields still match it, and keeps its
 /// alignment attributes, protection and `xfId`; only what an edit changed is
 /// minted fresh (a font, a solid fill, a thin box border, a custom numFmt).
-/// An xf built from scratch mints all of its parts.
+/// An xf pasted from another workbook (`Xf::foreign`, #1011) derives the
+/// same way from that entry's raw parts, which are not in this part, so they
+/// are appended: each reuses an equal element the part already holds, or one
+/// appended earlier in this save. Its `xfId` is 0, and a built-in numFmt id
+/// this part redefines is minted as a custom code. An xf built from scratch
+/// mints all of its parts.
 fn splice_styles(orig: &str, authored: &[Xf]) -> String {
     if authored.is_empty() {
         return orig.to_string();
@@ -2324,31 +2416,63 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
     let src_raw = cell_xf_elements(orig);
     let sources_ok = src_raw.len() == src_parsed.len();
     let src_fonts = font_elements(orig);
+    // This part's own fonts, fills and borders, and the built-in number
+    // formats it redefines: a pasted xf's raw part (#1011) reuses an equal
+    // element already here, and a built-in id only means the built-in where
+    // the part doesn't redefine it.
+    let src_fills = section_children(orig, "fills", "fill");
+    let src_borders = section_children(orig, "borders", "border");
+    let redefined: HashSet<u32> = section_children(orig, "numFmts", "numFmt")
+        .into_iter()
+        .filter_map(|n| tag_attr(n, "numFmtId")?.parse().ok())
+        .collect();
+    // A pasted xf's raw part goes in once per splice, however many xfs carry
+    // it, and not at all when the part already holds it.
+    let mut placed: HashMap<(u8, String), u32> = HashMap::new();
+    let mut place = |kind: u8, raw: &str, out: &mut String, added: &mut u32| -> u32 {
+        let (have, base) = match kind {
+            0 => (&src_fonts, font_base),
+            1 => (&src_fills, fill_base),
+            _ => (&src_borders, border_base),
+        };
+        if have.len() == base as usize {
+            if let Some(i) = have.iter().position(|e| *e == raw) {
+                return i as u32;
+            }
+        }
+        *placed.entry((kind, raw.to_string())).or_insert_with(|| {
+            out.push_str(raw);
+            *added += 1;
+            base + *added - 1
+        })
+    };
 
     for xf in authored {
-        let source = xf
-            .loaded_from
-            .filter(|_| sources_ok)
-            .and_then(|i| Some((src_parsed.get(i as usize)?, src_raw.get(i as usize)?)));
-        let open = |raw: &str| raw[..raw.find('>').map_or(raw.len(), |e| e + 1)].to_string();
-        let src_id = |attr: &str| -> Option<u32> {
-            source.and_then(|(_, raw)| tag_attr(&open(raw), attr)?.parse().ok())
-        };
+        let d = derive_from(
+            xf,
+            sources_ok,
+            &src_parsed,
+            &src_raw,
+            &src_fonts,
+            &redefined,
+        );
+        let sx = d.as_ref().map(|d| d.parsed);
 
         // Font: the source's while bold/italic/colour/size/name still match
         // (its underline and the rest come along), else a fresh one: the
         // source font with only the changed children rewritten, or one built
         // from scratch when there is no source font.
-        let same_font = source.is_some_and(|(sx, _)| {
+        let same_font = sx.is_some_and(|sx| {
             (sx.bold, sx.italic, sx.color, sx.font_size, &sx.font_name)
                 == (xf.bold, xf.italic, xf.color, xf.font_size, &xf.font_name)
         });
-        let src_font = source.and_then(|(sx, _)| {
-            let raw = src_fonts.get(src_id("fontId")? as usize)?;
-            Some((sx, *raw))
-        });
-        let font_id = match (src_id("fontId").filter(|_| same_font), src_font) {
-            (Some(id), _) => id,
+        let src_font = d.as_ref().and_then(|d| Some((d.parsed, d.font_raw?)));
+        let font_id = match (
+            d.as_ref().and_then(|d| d.font).filter(|_| same_font),
+            src_font,
+        ) {
+            (Some(Part::Here(id)), _) => id,
+            (Some(Part::Raw(raw)), _) => place(0, raw, &mut new_fonts, &mut fonts_added),
             (None, Some((sx, raw))) => {
                 new_fonts.push_str(&edit_font(raw, sx, xf, fmt_size));
                 let id = font_base + fonts_added;
@@ -2379,9 +2503,10 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
         };
 
         // Fill: the source's while the solid colour still matches.
-        let same_fill = source.is_some_and(|(sx, _)| sx.fill == xf.fill);
-        let fill_id = match src_id("fillId").filter(|_| same_fill) {
-            Some(id) => id,
+        let same_fill = sx.is_some_and(|sx| sx.fill == xf.fill);
+        let fill_id = match d.as_ref().and_then(|d| d.fill).filter(|_| same_fill) {
+            Some(Part::Here(id)) => id,
+            Some(Part::Raw(raw)) => place(1, raw, &mut new_fills, &mut fills_added),
             None => {
                 if let Some((r, g, b)) = xf.fill {
                     new_fills.push_str(&format!(
@@ -2397,9 +2522,10 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
         };
 
         // Border: the source's while the box flag still matches.
-        let same_border = source.is_some_and(|(sx, _)| sx.border == xf.border);
-        let border_id = match src_id("borderId").filter(|_| same_border) {
-            Some(id) => id,
+        let same_border = sx.is_some_and(|sx| sx.border == xf.border);
+        let border_id = match d.as_ref().and_then(|d| d.border).filter(|_| same_border) {
+            Some(Part::Here(id)) => id,
+            Some(Part::Raw(raw)) => place(2, raw, &mut new_borders, &mut borders_added),
             None => {
                 if xf.border {
                     new_borders.push_str(
@@ -2416,8 +2542,8 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
 
         // Number format: the source's id while the code still matches, else
         // a custom one.
-        let same_num = source.is_some_and(|(sx, _)| sx.code == xf.code);
-        let num_id = match src_id("numFmtId").filter(|_| same_num) {
+        let same_num = sx.is_some_and(|sx| sx.code == xf.code);
+        let num_id = match d.as_ref().and_then(|d| d.numfmt).filter(|_| same_num) {
             Some(id) => id,
             None => {
                 if let Some(code) = &xf.code {
@@ -2434,7 +2560,7 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
                 }
             }
         };
-        let xf_id = src_id("xfId").unwrap_or(0);
+        let xf_id = d.as_ref().map_or(0, |d| d.xf_id);
 
         let mut x = format!(
             "<xf numFmtId=\"{num_id}\" fontId=\"{font_id}\" fillId=\"{fill_id}\" borderId=\"{border_id}\" xfId=\"{xf_id}\" applyFont=\"1\""
@@ -2456,12 +2582,13 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
         // horizontal the model has no name for such as centerContinuous…),
         // with horizontal / wrapText rewritten only where the edit changed
         // them.
-        let mut align: Vec<(String, String)> = source
-            .and_then(|(_, raw)| child_open_tag(raw, "alignment"))
-            .map(|tag| tag_attrs(&tag))
+        let mut align: Vec<(String, String)> = d
+            .as_ref()
+            .and_then(|d| d.alignment.as_deref())
+            .map(tag_attrs)
             .unwrap_or_default();
-        let (align_changed, wrap_changed) = match source {
-            Some((sx, _)) => (sx.align != xf.align, sx.wrap != xf.wrap),
+        let (align_changed, wrap_changed) = match sx {
+            Some(sx) => (sx.align != xf.align, sx.wrap != xf.wrap),
             None => (true, true),
         };
         if align_changed {
@@ -2476,7 +2603,7 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
                 align.push(("wrapText".into(), "1".into()));
             }
         }
-        let protection = source.and_then(|(_, raw)| child_open_tag(raw, "protection"));
+        let protection = d.and_then(|d| d.protection);
         if protection.is_some() {
             x.push_str(" applyProtection=\"1\"");
         }
@@ -2526,6 +2653,77 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
     xml = bump_count(&xml, "<cellXfs", authored.len() as u32);
     xml = xml.replacen("</cellXfs>", &format!("{new_xfs}</cellXfs>"), 1);
     xml
+}
+
+/// One part an authored xf derives from ([`splice_styles`]): an element of
+/// the styles part being written, by index, or a pasted xf's raw element,
+/// which goes in with it (#1011).
+#[derive(Clone, Copy)]
+enum Part<'a> {
+    Here(u32),
+    Raw(&'a str),
+}
+
+/// What an authored xf derives from: the `<cellXfs>` entry it was loaded
+/// from ([`Xf::loaded_from`]) in the part being written, or the entry of
+/// another workbook it was pasted from ([`Xf::foreign`]).
+struct Derive<'a> {
+    /// The entry as the loader read it.
+    parsed: &'a Xf,
+    font: Option<Part<'a>>,
+    /// The raw font an edit of the font rewrites ([`edit_font`]).
+    font_raw: Option<&'a str>,
+    fill: Option<Part<'a>>,
+    border: Option<Part<'a>>,
+    numfmt: Option<u32>,
+    /// The cell style (`xfId`): a pasted xf's is not in this part, so 0.
+    xf_id: u32,
+    alignment: Option<String>,
+    protection: Option<String>,
+}
+
+/// [`Derive`] of the authored `xf`, if it derives from anything: its loaded
+/// entry in `src_raw` (trusted only when `sources_ok`), else its foreign one.
+fn derive_from<'a>(
+    xf: &'a Xf,
+    sources_ok: bool,
+    src_parsed: &'a [Xf],
+    src_raw: &[&'a str],
+    src_fonts: &[&'a str],
+    redefined: &HashSet<u32>,
+) -> Option<Derive<'a>> {
+    if let Some(k) = xf.loaded_from {
+        let (parsed, raw) = (src_parsed.get(k as usize), src_raw.get(k as usize));
+        let (Some(parsed), Some(&raw), true) = (parsed, raw, sources_ok) else {
+            return None;
+        };
+        let open = &raw[..raw.find('>').map_or(raw.len(), |e| e + 1)];
+        let id = |attr: &str| -> Option<u32> { tag_attr(open, attr)?.parse().ok() };
+        return Some(Derive {
+            parsed,
+            font: id("fontId").map(Part::Here),
+            font_raw: id("fontId").and_then(|i| src_fonts.get(i as usize).copied()),
+            fill: id("fillId").map(Part::Here),
+            border: id("borderId").map(Part::Here),
+            numfmt: id("numFmtId"),
+            xf_id: id("xfId").unwrap_or(0),
+            alignment: child_open_tag(raw, "alignment"),
+            protection: child_open_tag(raw, "protection"),
+        });
+    }
+    let f = xf.foreign.as_deref()?;
+    Some(Derive {
+        parsed: &f.parsed,
+        font: f.font.as_deref().map(Part::Raw),
+        font_raw: f.font.as_deref(),
+        fill: f.fill.as_deref().map(Part::Raw),
+        border: f.border.as_deref().map(Part::Raw),
+        // A built-in id this part redefines means something else here.
+        numfmt: f.numfmt_id.filter(|n| !redefined.contains(n)),
+        xf_id: 0,
+        alignment: f.alignment.clone(),
+        protection: f.protection.clone(),
+    })
 }
 
 /// The `<col>`s a save writes for `defs`: ascending and never overlapping,

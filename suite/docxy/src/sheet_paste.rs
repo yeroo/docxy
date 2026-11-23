@@ -94,6 +94,8 @@ impl SheetView {
     pub(crate) fn clip_block(&self, rows: Vec<u32>, cols: Vec<u32>) -> ClipBlock {
         let s = self.active;
         let mut block = ClipBlock::capture(&self.pkg.workbook, s, rows, cols);
+        // What a paste into another workbook saves its formats with (#1011).
+        block.carry_parts(|ids| self.pkg.foreign_xfs(ids));
         block.set_notes(
             self.pkg
                 .comments()
@@ -158,25 +160,41 @@ impl SheetView {
             notes: Vec::new(),
             rules: Vec::new(),
             used: None,
+            // Typed where it lands: already in this workbook's ids.
+            xfs: Default::default(),
         }
     }
 
     /// Paste Special `block` at `at` as one undo step (a package step when it
     /// writes notes or validation, which live in the parts), the pasted range
     /// selected. Refused, with nothing changed, over part of an array.
+    /// `foreign`: the block was copied in another workbook, so its style ids
+    /// are that workbook's and its formats are adopted into this one (#1011).
     pub(crate) fn paste_special_at(
         &mut self,
         block: &ClipBlock,
         spec: &PasteSpec,
         at: (u32, u32),
+        foreign: bool,
     ) -> Result<Area, String> {
         let s = self.active;
         if self.sheet().is_protected() {
             return Err(crate::sheet_goto::SHEET_PROTECTED.into());
         }
         // The styles a paste interns are taken back when it is refused, so a
-        // refusal leaves nothing behind.
+        // refusal leaves nothing behind: an adopted format too.
         let styles = self.pkg.workbook.styles.clone();
+        let adopted;
+        // Only a kind that pastes the copy's formats reads its style ids
+        // ([`PasteWhat::uses_source_styles`]): Values, say, adopts nothing.
+        let block = if foreign && spec.what.uses_source_styles() {
+            let mut b = block.clone();
+            b.adopt_styles(&mut self.pkg.workbook.styles);
+            adopted = b;
+            &adopted
+        } else {
+            block
+        };
         let changes =
             match gridcore::edit::paste_special_changes(&mut self.pkg.workbook, s, at, block, spec)
             {
@@ -263,15 +281,18 @@ impl SheetView {
         Ok(rect)
     }
 
-    /// A gallery item (or a Paste Options choice) pasting `block` at `at`.
+    /// A gallery item (or a Paste Options choice) pasting `block` at `at`;
+    /// `foreign` as [`Self::paste_special_at`] takes it. Paste Link is
+    /// refused for a foreign block before it gets here.
     pub(crate) fn paste_item_at(
         &mut self,
         block: &ClipBlock,
         item: PasteItem,
         at: (u32, u32),
+        foreign: bool,
     ) -> Result<Area, String> {
         match item.spec() {
-            Some(spec) => self.paste_special_at(block, &spec, at),
+            Some(spec) => self.paste_special_at(block, &spec, at, foreign),
             None => self.paste_link_at(block, at),
         }
     }
@@ -283,8 +304,8 @@ impl SheetView {
         if !opts.stands(self) {
             return Err("The paste has changed since; there is nothing to redo".into());
         }
-        let (block, at) = (&opts.block, opts.at);
-        self.redo_last_step(|v| v.paste_item_at(block, item, at))
+        let (block, at, foreign) = (&opts.block, opts.at, opts.foreign);
+        self.redo_last_step(|v| v.paste_item_at(block, item, at, foreign))
             .ok_or_else(|| "There is no paste to redo".to_string())?
     }
 }
@@ -500,7 +521,7 @@ impl Docxy {
             return;
         };
         let (r, c, _, _) = v.range();
-        match v.paste_item_at(&src.block, item, (r, c)) {
+        match v.paste_item_at(&src.block, item, (r, c), src.foreign) {
             Ok(rect) => {
                 let opts = src.clip.then_some(PasteOptions {
                     view: v.id,
@@ -607,7 +628,7 @@ impl Docxy {
                 return Some(Err(why.into()));
             }
         }
-        let block = src.block;
+        let (block, foreign) = (src.block, src.foreign);
         // A locked workbook (Protected View, Read-Only) takes no paste.
         if let Some(access) = self
             .tabs
@@ -627,7 +648,7 @@ impl Docxy {
         let v = self.active_sheet_mut()?;
         let (r, c, _, _) = v.range();
         let done = match spec {
-            Some(spec) => v.paste_special_at(&block, &spec, (r, c)),
+            Some(spec) => v.paste_special_at(&block, &spec, (r, c), foreign),
             // `item_refusal` has refused Paste Link for anything but a copy
             // from this workbook.
             None => v.paste_link_at(&block, (r, c)),

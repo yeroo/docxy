@@ -1261,8 +1261,13 @@ mod tests {
         v.anchor = at("B2");
         v.sel = at("B2");
         let clip = v.grid_clip(false).unwrap();
-        v.paste_special_at(&clip.block, &PasteSpec::of(PasteWhat::Validation), at("F4"))
-            .unwrap();
+        v.paste_special_at(
+            &clip.block,
+            &PasteSpec::of(PasteWhat::Validation),
+            at("F4"),
+            false,
+        )
+        .unwrap();
         let (r, c) = at("F4");
         let dv =
             gridcore::validation::validation_at(view(&mut t).sheet(), r, c).expect("F4 validated");
