@@ -106,7 +106,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
   each kind pasted is defined (`ListIds::define`: a package without a
   numbering part gets `add_markdown_numbering`'s): `Docxy::do_paste` for a
   tab that `saves_as_word`, and the ext DocView's `paste_clip`. A tab with no package gets it from
-  `blank_base` at its save, which sees body paragraphs only.
+  `blank_base` at its save, which sees every list item: a table cell's,
+  a nested table's and a text box's included (`names_a_list`, #2181).
 - Only list membership crosses: an HTML item's indent and marker look, and
   other paragraph formatting, do not. The RTF importer reads `\pnlvlbody`
   / `\pnlvlblt` outside a group only, not in Word 95's `{\*\pn …}`.

@@ -276,7 +276,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   start drawing the new one. A view given no package is given
   `new_package`'s (empty styles: what it shows does not change, checked in
   the uit's `ext-doc-layout`), whose `document` is empty: the host exports
-  `document()` with `package()`. The picture cache renews on the package's
+  `document()` with `package()`. A fresh package for a view whose
+  document holds a list (after the insert or paste that made it) gets
+  `add_markdown_numbering`'s part, defining the lists 1 and 2 the view
+  toggled with no package; a host's own package never does (#2181). The picture cache renews on the package's
   `parts_stamp`, so the new part draws on the next frame.
 - Paste: the view keeps its own last copy or cut (`clip: Option<DocClip>`,
   with `pictures::capture`'s media, recorded in either mode), as a
