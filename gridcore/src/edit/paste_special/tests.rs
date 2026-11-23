@@ -997,3 +997,34 @@ fn adopt_chains_keep_the_first_sources_parts() {
         assert!(xf.italic && xf.loaded_from.is_none());
     }
 }
+
+/// #1011 r1: a paste from another workbook adopts its formats only for a
+/// kind that reads the copy's style ids. Every kind's pasted style tells
+/// whether it did, so [`PasteWhat::uses_source_styles`] can't drift from
+/// [`paste_special_changes`].
+#[test]
+fn every_kind_that_reads_the_source_style_says_so() {
+    let mut wb = book(&[("Sheet1", &[("A1", Cell::number(1.0))])]);
+    let mut pct = Xf {
+        bold: true,
+        ..Xf::default()
+    };
+    pct.set_code(Some("0.00%".into()));
+    wb.styles.xfs.push(pct);
+    wb.sheets[0].cells.get_mut(&(0, 0)).unwrap().style = 1;
+    let clip = copy(&wb, 0, "A1");
+    let kinds = PasteWhat::DIALOG.into_iter().chain([
+        PasteWhat::AllAndColumnWidths,
+        PasteWhat::ValuesAndSourceFormatting,
+    ]);
+    let mut seen = 0;
+    for what in kinds {
+        seen += 1;
+        let mut w = wb.clone();
+        let changes =
+            paste_special_changes(&mut w, 0, at("C1"), &clip, &PasteSpec::of(what)).unwrap();
+        let read = changes.iter().any(|(_, _, c)| c.style != 0);
+        assert_eq!(read, what.uses_source_styles(), "{what:?}");
+    }
+    assert_eq!(seen, 12, "every kind");
+}

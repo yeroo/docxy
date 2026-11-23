@@ -60,6 +60,25 @@ pub enum PasteWhat {
 }
 
 impl PasteWhat {
+    /// Whether a paste of this kind reads the copy's own style ids, so a
+    /// paste from another workbook adopts its formats first
+    /// ([`ClipBlock::adopt_styles`], #1011): exactly the kinds the style
+    /// `match` in [`paste_special_changes`] takes `src.style` for; the others
+    /// keep the destination's style. `every_kind_that_reads_the_source_style_says_so`
+    /// holds the two together.
+    pub fn uses_source_styles(self) -> bool {
+        matches!(
+            self,
+            PasteWhat::All
+                | PasteWhat::AllAndColumnWidths
+                | PasteWhat::Formats
+                | PasteWhat::ValuesAndSourceFormatting
+                | PasteWhat::AllExceptBorders
+                | PasteWhat::FormulasAndNumberFormats
+                | PasteWhat::ValuesAndNumberFormats
+        )
+    }
+
     /// The dialog's Paste options, in its order.
     pub const DIALOG: [PasteWhat; 10] = [
         PasteWhat::All,
@@ -787,6 +806,8 @@ pub fn paste_special_changes(
             }
             let d = (s.cell(dest.0, dest.1).cloned())
                 .unwrap_or_else(|| read.absent_cell(dest.0, dest.1));
+            // The kinds that read `src.style` are
+            // [`PasteWhat::uses_source_styles`]'s: keep the two in step.
             let style = match spec.what {
                 PasteWhat::All
                 | PasteWhat::AllAndColumnWidths

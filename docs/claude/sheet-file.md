@@ -573,7 +573,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   them with the source sheet). Each paste adopts a clone inside the guarded
   paste: `paste_copy` when `clip.view != self.id` (Ctrl+V, Enter, a cut from
   another workbook), `paste_special_at`/`paste_item_at` when passed
-  `foreign` (the dialog, the gallery, Paste Options' repaste). A refused
+  `foreign` (the dialog, the gallery, Paste Options' repaste) and the kind
+  pastes the copy's formats (`PasteWhat::uses_source_styles`, held to
+  `paste_special_changes`' style match by a test): Values adopts nothing. A refused
   paste restores the styles, so a refusal leaves nothing appended; an
   undone Ctrl+V may leave its unused xfs, as a text paste already does.
 - What the model doesn't carry of a source xf (borders: the loader models

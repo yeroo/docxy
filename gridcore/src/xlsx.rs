@@ -2302,7 +2302,10 @@ fn max_numfmt_id(xml: &str) -> u32 {
 /// when any of its elements is namespace-prefixed (`<x:font>`): its prefix
 /// would mean nothing in the destination part. The pasted xf is then written
 /// from its modeled fields alone.
-pub fn foreign_xfs(xml: &str, ids: impl IntoIterator<Item = u32>) -> BTreeMap<u32, ForeignXf> {
+pub(crate) fn foreign_xfs(
+    xml: &str,
+    ids: impl IntoIterator<Item = u32>,
+) -> BTreeMap<u32, ForeignXf> {
     let mut out = BTreeMap::new();
     let parsed = parse_styles(xml).xfs;
     let raw = cell_xf_elements(xml);
@@ -2373,7 +2376,12 @@ fn prefixed(raw: &str) -> bool {
 /// number format wherever the modeled fields still match it, and keeps its
 /// alignment attributes, protection and `xfId`; only what an edit changed is
 /// minted fresh (a font, a solid fill, a thin box border, a custom numFmt).
-/// An xf built from scratch mints all of its parts.
+/// An xf pasted from another workbook (`Xf::foreign`, #1011) derives the
+/// same way from that entry's raw parts, which are not in this part, so they
+/// are appended: each reuses an equal element the part already holds, or one
+/// appended earlier in this save. Its `xfId` is 0, and a built-in numFmt id
+/// this part redefines is minted as a custom code. An xf built from scratch
+/// mints all of its parts.
 fn splice_styles(orig: &str, authored: &[Xf]) -> String {
     if authored.is_empty() {
         return orig.to_string();

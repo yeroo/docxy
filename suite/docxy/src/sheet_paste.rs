@@ -185,7 +185,9 @@ impl SheetView {
         // refusal leaves nothing behind: an adopted format too.
         let styles = self.pkg.workbook.styles.clone();
         let adopted;
-        let block = if foreign {
+        // Only a kind that pastes the copy's formats reads its style ids
+        // ([`PasteWhat::uses_source_styles`]): Values, say, adopts nothing.
+        let block = if foreign && spec.what.uses_source_styles() {
             let mut b = block.clone();
             b.adopt_styles(&mut self.pkg.workbook.styles);
             adopted = b;

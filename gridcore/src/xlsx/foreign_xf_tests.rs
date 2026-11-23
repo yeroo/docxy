@@ -239,3 +239,34 @@ fn splice_styles_dedupes_appended_parts() {
         tag_attr(xfs[xfs.len() - 2], "fontId")
     );
 }
+
+/// #1011 r1: a destination that redefines the built-in id a pasted xf uses
+/// (10, `0.00%`, as `0.0%`) gets the source's code as a custom format.
+#[test]
+fn a_built_in_id_the_destination_redefines_is_minted() {
+    let (mut src, pct, _) = source();
+    src.workbook.sheets[0].set_cell(
+        0,
+        0,
+        Cell {
+            style: pct,
+            ..Cell::number(0.5)
+        },
+    );
+    let mut dst = new_xlsx();
+    let xml = styles_xml(&dst).replacen(
+        "<fonts",
+        "<numFmts count=\"1\"><numFmt numFmtId=\"10\" formatCode=\"0.0%\"/></numFmts><fonts",
+        1,
+    );
+    dst.set_part("xl/styles.xml", xml.into_bytes());
+    let mut dst = load_xlsx(&save_xlsx(&dst)).unwrap();
+    paste_across(&src, &mut dst, vec![0]);
+    let saved = load_xlsx(&save_xlsx(&dst)).unwrap();
+    let xml = styles_xml(&saved);
+    let s = saved.workbook.sheets[0].cell(0, 0).unwrap().style;
+    let pasted = cell_xf_elements(&xml)[s as usize];
+    let id: u32 = tag_attr(pasted, "numFmtId").unwrap().parse().unwrap();
+    assert!(id >= 164, "{pasted}");
+    assert_eq!(saved.workbook.styles.xf(s).code.as_deref(), Some("0.00%"));
+}

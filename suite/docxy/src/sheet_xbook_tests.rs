@@ -166,6 +166,28 @@ fn paste_special_from_another_workbook_keeps_its_formats() {
     appended(&b, &before, 1);
 }
 
+/// #1011 r1: a kind that keeps the destination's formats adopts none of the
+/// copy's, so nothing unused is appended to be saved.
+#[test]
+fn a_foreign_paste_of_values_appends_no_format() {
+    let (mut a, mut b, _) = books();
+    let before = b.pkg.workbook.styles.xfs.clone();
+    let clip = copy(&mut a, "A1", "A2", false);
+    for what in [
+        PasteWhat::Values,
+        PasteWhat::Formulas,
+        PasteWhat::ColumnWidths,
+    ] {
+        b.paste_special_at(&clip.block, &PasteSpec::of(what), at("C1"), true)
+            .unwrap();
+        appended(&b, &before, 0);
+    }
+    b.paste_item_at(&clip.block, PasteItem::Values, at("E1"), true)
+        .unwrap();
+    appended(&b, &before, 0);
+    assert_eq!(style(&b, "E1"), 0);
+}
+
 #[test]
 fn paste_options_repaste_from_another_workbook_keeps_its_formats() {
     let (mut a, mut b, _) = books();
