@@ -20,6 +20,8 @@ test a tab switch keeps a comment draft with its tab
   key shift+home
   call ribbon-click {"tab":"Review","command":"newcomment"}
   type Draft
+  key left
+  key left
   key ctrl+f6
   assert tab is 1
   call field-read {"input":"comment-editor"}
@@ -35,7 +37,7 @@ test a tab switch keeps a comment draft with its tab
   call field-read {"input":"comment-editor"}
   assert reply.focused is true
   assert reply.value is exactly "Draft"
-  assert reply.caret is 5
+  assert reply.caret is 3
   key enter
   call comments {}
   assert reply.comments.0.text is Draft
@@ -73,12 +75,14 @@ test escape drops a restored comment draft
   key shift+home
   call ribbon-click {"tab":"Review","command":"newcomment"}
   type Lost
+  key ctrl+a
   key ctrl+f6
   assert tab is 0
   key ctrl+shift+f6
   assert tab is 2
   call field-read {"input":"comment-editor"}
   assert reply.value is exactly "Lost"
+  assert reply.selection is [0,4]
   key escape
   call field-read {"input":"comment-editor"}
   assert reply.focused is false
