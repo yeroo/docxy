@@ -19105,6 +19105,48 @@ mod tests {
         assert_eq!(app.sheet().max_row_outline(), 0);
     }
 
+    /// Subtotal with Replace on over subtotals already there: the old total
+    /// rows go first, and when the new ones would then push data off the
+    /// sheet it is refused and everything, the old totals too, comes back
+    /// (#1175). With as many totals as before nothing goes off.
+    #[test]
+    fn subtotal_replace_refuses_to_push_data_off_the_sheet_1175() {
+        use gridcore::sheet::{Cell, CellValue, MAX_ROWS};
+        let mut app = subtotal_app();
+        app.ribbon_act(ribbon::Act::Subtotal);
+        app.outline_dialog_key(KeyCode::Enter); // A, A, A Total, B, B Total, Grand Total
+        assert_eq!(app.sheet().used_size().0, 7);
+        app.pkg.workbook.sheets[0].set_cell(MAX_ROWS - 1, 0, Cell::text("edge"));
+        let rerun = |app: &mut App| {
+            app.cur = (1, 0);
+            app.ribbon_act(ribbon::Act::Subtotal);
+            let Some(outlinedlg::Dialog::Subtotal(d)) = &app.outline_dialog else {
+                panic!("the Subtotal dialog opens");
+            };
+            assert!(d.replace, "Replace current subtotals is on");
+            app.outline_dialog_key(KeyCode::Enter);
+        };
+        // Three groups now (A, C, B): one total row more than was removed.
+        app.pkg.workbook.sheets[0].set_cell(2, 0, Cell::text("C"));
+        let (before, undo_len) = (app.pkg.workbook.sheets.clone(), app.undo.len());
+        rerun(&mut app);
+        assert_eq!(app.status.as_deref(), Some(gridcore::edit::SHIFT_OFF_SHEET));
+        assert!(app.outline_dialog.is_some(), "the refusal keeps the dialog");
+        assert!(!gridcore::edit::sheets_differ(
+            &before,
+            &app.pkg.workbook.sheets
+        ));
+        assert_eq!(app.undo.len(), undo_len);
+        app.outline_dialog_key(KeyCode::Esc);
+        // Two groups again: as many rows go in as come out.
+        app.pkg.workbook.sheets[0].set_cell(2, 0, Cell::text("A"));
+        rerun(&mut app);
+        assert!(app.outline_dialog.is_none());
+        let v = |app: &App, r| app.sheet().cell(r, 0).map(|cl| cl.value.clone());
+        assert_eq!(v(&app, 6), Some(CellValue::Text("Grand Total".into())));
+        assert_eq!(v(&app, MAX_ROWS - 1), Some(CellValue::Text("edge".into())));
+    }
+
     #[test]
     fn subtotal_dialog_remove_all_and_refusal() {
         let mut app = subtotal_app();

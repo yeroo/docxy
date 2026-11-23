@@ -145,7 +145,9 @@ issue number to find its notes.
   protected sheet (#2230), or floating pictures: their anchors, an
   unedited save keeping the drawing part, where the sheet view draws them, their
   cache and selection (#2228), or text spilling over empty neighbours: the
-  rules shared with the sheet PDF, freeze panes, the text layer (#2240).
+  rules shared with the sheet PDF, freeze panes, the text layer (#2240), or a
+  row or column insert entry or Subtotal: every host refuses one that pushes data
+  off (#1175).
 - `docs/claude/sheet-file.md`: before changing a sheet's notes, slicers, data validation
   or hyperlinks in `gridcore` (and the dialogs and Undo over them): notes that follow
   row/column insert and delete (#1335), table slicers on save and Undo of a table step

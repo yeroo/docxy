@@ -11,7 +11,7 @@
 
 use std::fmt;
 
-use super::{delete_rows, insert_rows};
+use super::{SHIFT_OFF_SHEET, delete_rows, insert_rows, insert_shifts_data_off};
 use crate::sheet::{Cell, CellValue, Sheet, Workbook, cell_name};
 
 /// The functions of Excel's Subtotal dialog, in its order.
@@ -135,6 +135,9 @@ pub enum SubtotalError {
     NoColumns,
     /// The region holds no rows to total.
     Empty,
+    /// The total rows would push data off the sheet (#1175): Excel's
+    /// [`SHIFT_OFF_SHEET`].
+    ShiftOffSheet,
 }
 
 impl fmt::Display for SubtotalError {
@@ -142,6 +145,7 @@ impl fmt::Display for SubtotalError {
         f.write_str(match self {
             SubtotalError::NoColumns => "Choose at least one column to add a subtotal to.",
             SubtotalError::Empty => "There is no data to subtotal here.",
+            SubtotalError::ShiftOffSheet => SHIFT_OFF_SHEET,
         })
     }
 }
@@ -253,7 +257,10 @@ pub fn numeric_columns(s: &Sheet, (r1, c1, r2, c2): Area, group_col: u32) -> Vec
 /// go the way the sheet's outline already does, whatever
 /// `opts.summary_below` says. Total rows are recognised only in the area's
 /// columns. Refuses, changing nothing, when there is nothing to total.
-/// Returns the number of rows inserted.
+/// Refuses too when the total rows would push data off the sheet
+/// ([`SubtotalError::ShiftOffSheet`], #1175); with `replace` that is known
+/// only once the old totals are gone, so the caller puts the workbook back
+/// on any refusal. Returns the number of rows inserted.
 pub fn subtotal(
     wb: &mut Workbook,
     sheet: usize,
@@ -327,6 +334,11 @@ pub fn subtotal(
     };
     if groups.is_empty() {
         return Err(SubtotalError::Empty);
+    }
+    // A total row per group and the grand total, each at or after `start`:
+    // what sits at the sheet's bottom would be pushed off (#1175).
+    if insert_shifts_data_off(wb, sheet, true, start, groups.len() as u32 + 1) {
+        return Err(SubtotalError::ShiftOffSheet);
     }
     let grand_level = wb.sheets[sheet].row_outline(start);
     // A sheet's outline has one summary direction, so new totals nested in
@@ -900,6 +912,41 @@ mod tests {
         s.set_cell(at + 1, 0, Cell::text("Grand Total"));
         s.set_cell(at + 1, 1, Cell::formula("SUBTOTAL(9,B1:B2)"));
         w
+    }
+
+    /// Subtotal's rows push what is below them down, as an Insert does:
+    /// refused, changing nothing, when that would push data off the sheet
+    /// (#1175). `sales()` has two groups: three rows go in.
+    #[test]
+    fn subtotal_refuses_to_push_data_off_the_sheet_1175() {
+        use crate::sheet::MAX_ROWS;
+        // The last row three inserts reach, and a merge ending on the last row.
+        for edge in [MAX_ROWS - 1, MAX_ROWS - 3] {
+            let mut w = sales();
+            w.sheets[0].set_cell(edge, 0, Cell::text("edge"));
+            let before = w.sheets[0].clone();
+            assert_eq!(
+                subtotal(&mut w, 0, (0, 0, 5, 1), &opts()),
+                Err(SubtotalError::ShiftOffSheet),
+                "{edge}"
+            );
+            assert!(w.sheets[0] == before, "{edge}: nothing changes");
+        }
+        let mut w = sales();
+        w.sheets[0].merges.push((MAX_ROWS - 2, 0, MAX_ROWS - 1, 1));
+        let before = w.sheets[0].clone();
+        assert_eq!(
+            subtotal(&mut w, 0, (0, 0, 5, 1), &opts()),
+            Err(SubtotalError::ShiftOffSheet)
+        );
+        assert!(w.sheets[0] == before, "merge: nothing changes");
+        assert_eq!(SubtotalError::ShiftOffSheet.to_string(), SHIFT_OFF_SHEET);
+        // One row higher it is just out of reach: it ends on the last row.
+        let mut w = sales();
+        w.sheets[0].set_cell(MAX_ROWS - 4, 0, Cell::text("edge"));
+        assert_eq!(subtotal(&mut w, 0, (0, 0, 5, 1), &opts()), Ok(3));
+        let last = w.sheets[0].cell(MAX_ROWS - 1, 0).map(|c| c.value.clone());
+        assert_eq!(last, Some(CellValue::Text("edge".into())));
     }
 
     #[test]
