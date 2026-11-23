@@ -736,6 +736,40 @@ fn a_cell_range_cut_carries_a_pending_field_at_a_cells_start() {
     assert_eq!(xml(&ed).matches("<w:instrText").count(), 1, "{}", xml(&ed));
 }
 
+/// #1471: a tracked cut of cells records their text as deleted, so it keeps
+/// #1625's rule: the author's own pending insertion in a cell goes, in the
+/// clip; another author's stays in its cell, out of the clip.
+#[test]
+fn a_tracked_cell_cut_takes_only_own_pending_objects_1471() {
+    let ins = |id: u32, author: &str, inner: &str| {
+        format!("<w:ins w:id=\"{id}\" w:author=\"{author}\">{inner}</w:ins>")
+    };
+    let mut ed = table(&[
+        &format!("<w:p><w:r><w:t>a</w:t></w:r>{}</w:p>", ins(1, "Ada", PIC)),
+        &format!(
+            "<w:p>{}<w:r><w:t>b</w:t></w:r></w:p>",
+            ins(2, "Bo", COMPLEX)
+        ),
+    ]);
+    track(&mut ed, "Ada");
+    ed.anchor = Some(Caret::at(vec![0, 0, 0, 0], 0));
+    ed.caret = Caret::at(vec![0, 0, 1, 0], 1);
+    let before = xml(&ed);
+    assert_eq!(insertions(&before).len(), 2, "{before}");
+    let clip = ed.cut().expect("a clip");
+    let carried: Vec<usize> = clip.paras.iter().map(|p| objects_in(p)).collect();
+    assert_eq!(carried, vec![1, 0], "Ada's picture alone: {clip:?}");
+    let after = xml(&ed);
+    assert!(
+        !after.contains("<w:drawing"),
+        "Ada's picture moved: {after}"
+    );
+    let left = insertions(&after);
+    assert_eq!(left.len(), 1, "{after}");
+    assert!(left[0].contains("w:author=\"Bo\""), "{after}");
+    assert!(left[0].contains("instrText"), "{after}");
+}
+
 #[test]
 fn copy_carries_a_pending_field_or_picture() {
     for object in [simple_field(), picture()] {
