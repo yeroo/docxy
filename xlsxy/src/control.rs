@@ -957,8 +957,9 @@ fn pivot_create(app: &mut App, args: &Json) -> Result<Json, String> {
 }
 
 /// A default pivot-sheet name: `Pivot1`, `Pivot2`, … — unique among existing
-/// sheet names. Distinct pattern from `unique_sheet_name`'s "Sheet"/"Sheet 2"
-/// (no space before the number) — Wave-3's convention for agent-created
+/// sheet names. Distinct pattern from
+/// `gridcore::sheet::Workbook::free_sheet_name`'s "Sheet"/"Sheet 2" (no space
+/// before the number) — Wave-3's convention for agent-created
 /// pivot sheets, chosen for the verb's spec.
 fn unique_pivot_name(wb: &gridcore::sheet::Workbook) -> String {
     let mut n = 1;

@@ -3604,8 +3604,7 @@ impl Session {
         // restore leaves the stack intact for a correct later attempt.
         let ghosts_only = k + 1 < self.removed_sheet_stashes.len()
             && self.removed_sheet_stashes[k + 1..].iter().all(|st| {
-                st.name
-                    .eq_ignore_ascii_case(&self.removed_sheet_stashes[k].name)
+                gridcore::sheet::sheet_names_match(&st.name, &self.removed_sheet_stashes[k].name)
             })
             && restore_is_lossless(&mut self.pkg.workbook, &self.removed_sheet_stashes[k]);
         let names: Vec<&str> = self.removed_sheet_stashes[k..]
@@ -3613,8 +3612,12 @@ impl Session {
             .take(if ghosts_only { 1 } else { usize::MAX })
             .map(|st| st.name.as_str())
             .collect();
+        // Names are told apart as Excel tells them, beyond ASCII
+        // (`sheet_names_match`, as `add_sheet` asserts, #2153): past these
+        // checks no live sheet and no other stash from `k` up matches one, so
+        // the `sheet_index` lookups below find the very sheet restored.
         for (i, name) in names.iter().enumerate() {
-            if self.pkg.workbook.sheet_index(name).is_some() {
+            if self.pkg.workbook.sheet_name_taken(name, None) {
                 return Err(if i == 0 {
                     format!("cannot restore \"{name}\": a sheet with that name already exists")
                 } else {
@@ -3624,13 +3627,16 @@ impl Session {
                     )
                 });
             }
-            if i > 0 && names[0].eq_ignore_ascii_case(name) {
+            if i > 0 && gridcore::sheet::sheet_names_match(names[0], name) {
                 return Err(format!(
                     "cannot restore \"{}\": a sheet named \"{name}\" was removed after it",
                     names[0]
                 ));
             }
-            if names[..i].iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            if names[..i]
+                .iter()
+                .any(|n| gridcore::sheet::sheet_names_match(n, name))
+            {
                 return Err(format!(
                     "cannot restore \"{}\": two sheets removed after it are named \"{name}\"",
                     names[0]
@@ -4397,8 +4403,9 @@ fn ctl_names_arg(args: &json::Json, key: &str) -> Vec<String> {
 }
 
 /// A default pivot-sheet name: `Pivot1`, `Pivot2`, … — unique among
-/// existing sheet names. Distinct pattern from `ctl_unique_sheet_name`'s
-/// "Sheet"/"Sheet 2" (no space before the number) — Wave-3's convention for
+/// existing sheet names. Distinct pattern from
+/// `gridcore::sheet::Workbook::free_sheet_name`'s "Sheet"/"Sheet 2" (no space
+/// before the number) — Wave-3's convention for
 /// agent-created pivot sheets. Mirrors xlsxy control.rs's
 /// `unique_pivot_name`.
 fn ctl_unique_pivot_name(wb: &gridcore::sheet::Workbook) -> String {
@@ -7472,6 +7479,46 @@ mod tests {
         assert_eq!(sheet_order(&s), ["Sheet1", "A", "B", "C"]);
         let a1 = s.pkg.workbook.sheets[1].cell(0, 0).map(|c| c.value.clone());
         assert_eq!(a1, Some(number(1.0)));
+    }
+
+    /// #2153 r1: a sheet added under a removed one's name in a case that
+    /// differs outside ASCII is that name to Excel: the restore is refused
+    /// before anything changes, never a second `Données`/`DONNÉES`.
+    #[test]
+    fn ctl_sheet_restore_removed_refuses_a_live_name_matching_beyond_ascii() {
+        let mut s = abc_session();
+        s.dispatch("sheet\trename\t1\tDonnées");
+        let removed = s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Données"}}"#);
+        let added = s.ctl(r#"{"verb":"sheet.add","args":{"name":"DONNÉES"}}"#);
+        assert!(added.contains("\"name\":\"DONNÉES\""), "{added}");
+        let before = (sheet_order(&s), stash_order(&s));
+        let out = s.ctl(&extract_inverse(&removed));
+        assert!(
+            out.contains(r#"cannot restore \"Données\": a sheet with that name already exists"#),
+            "{out}"
+        );
+        assert_eq!((sheet_order(&s), stash_order(&s)), before);
+    }
+
+    /// #2153 r1: stashes `Données` then `DONNÉES` (added and removed after
+    /// it) are one name, so the later one is a ghost as `a` is for `A`:
+    /// the first comes back with no panic and the ghost stays stashed.
+    #[test]
+    fn ctl_sheet_restore_removed_a_ghost_matches_beyond_ascii() {
+        let mut s = abc_session();
+        s.dispatch("sheet\trename\t1\tDonnées");
+        let removed = s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Données"}}"#);
+        s.ctl(r#"{"verb":"sheet.add","args":{"name":"DONNÉES"}}"#);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"DONNÉES"}}"#);
+        assert_eq!(stash_order(&s), ["Données", "DONNÉES"]);
+        let out = s.ctl(&extract_inverse(&removed));
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert_eq!(sheet_order(&s), ["Sheet1", "Données", "B", "C"]);
+        assert_eq!(stash_order(&s), ["DONNÉES"]);
+        // The ghost is refused while `Données` is live.
+        let out = restore(&mut s, "DONNÉES");
+        assert!(out.contains("already exists"), "{out}");
+        assert_eq!(sheet_order(&s), ["Sheet1", "Données", "B", "C"]);
     }
 
     #[test]

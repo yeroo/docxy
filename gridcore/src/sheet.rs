@@ -1135,6 +1135,14 @@ pub fn sheet_name_error(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Whether `a` and `b` are one sheet name to Excel: equal ignoring case
+/// beyond ASCII (`Données` and `DONNÉES`; the import's
+/// `legacy::valid_sheet_names` folds the same way). Two sheets whose names
+/// match are a file Excel repairs (#2153).
+pub fn sheet_names_match(a: &str, b: &str) -> bool {
+    a == b || a.to_lowercase() == b.to_lowercase()
+}
+
 /// A sheet name as a formula/`<c:f>` reference spells it. Anything that isn't a
 /// bare identifier has to be quoted — spaces, but also `-`, `(`, `.`, `&`, a
 /// leading digit — and an apostrophe inside the name is doubled. Excel reports a
@@ -2574,13 +2582,11 @@ impl Workbook {
             .expect("an unused sheet name")
     }
 
-    /// Whether a sheet other than `except` is named `name`, ignoring case
-    /// beyond ASCII as Excel does (`Données` and `DONNÉES` are one name; the
-    /// import's `legacy::valid_sheet_names` folds the same way).
-    fn sheet_name_taken(&self, name: &str, except: Option<usize>) -> bool {
-        let folded = name.to_lowercase();
+    /// Whether a sheet other than `except` is named `name` as Excel tells
+    /// sheet names apart ([`sheet_names_match`]).
+    pub fn sheet_name_taken(&self, name: &str, except: Option<usize>) -> bool {
         (self.sheets.iter().enumerate())
-            .any(|(i, s)| Some(i) != except && s.name.to_lowercase() == folded)
+            .any(|(i, s)| Some(i) != except && sheet_names_match(&s.name, name))
     }
 
     /// Why `name` (already trimmed) cannot name a sheet of this workbook, or
