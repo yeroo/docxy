@@ -34260,8 +34260,9 @@ mod sheet_save_tests {
     }
 
     /// #814: a UI chart the package can no longer take at save (here a
-    /// worksheet rels part with no `</Relationships>` to add the drawing's
-    /// rel to) is not in the file, and the save says so.
+    /// worksheet rels part cut short, with no `</Relationships>` to add the
+    /// drawing's rel to: a self-closed one takes it, #831) is not in the
+    /// file, and the save says so.
     #[test]
     fn a_save_reports_a_chart_add_chart_refused() {
         let dir = Scratch::new();
@@ -34286,7 +34287,7 @@ mod sheet_save_tests {
         });
         v.pkg.set_part(
             "xl/worksheets/_rels/sheet1.xml.rels",
-            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>"#
+            br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#
                 .to_vec(),
         );
         let target = dir.path("report.xlsx");
