@@ -10421,7 +10421,7 @@ fn with_rels(xml: &str, added: &str) -> String {
     let mut body = String::new();
     for (id, ty, target, mode) in parse_rels_mode(xml) {
         let id = if id.is_empty() {
-            fresh += 1;
+            fresh = fresh.saturating_add(1);
             format!("rId{fresh}")
         } else {
             id
@@ -10444,9 +10444,25 @@ fn with_rels(xml: &str, added: &str) -> String {
 /// A new, empty rels part.
 pub(crate) const EMPTY_RELS: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>";
 
-/// The highest `N` of an `Id="rIdN"` in a rels part, 0 for none.
-fn max_rid(xml: &str) -> u32 {
-    let mut max = 0u32;
+/// The highest `N` of the `rIdN` among `ids`, 0 for none: the one count
+/// [`add_rel`] and the hyperlink writer mint past.
+pub(crate) fn max_rid_in<'a>(ids: impl IntoIterator<Item = &'a str>) -> u64 {
+    ids.into_iter()
+        .filter_map(|id| id.strip_prefix("rId")?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+}
+
+/// The highest `N` of an `rIdN` a part quotes ([`quoted_rids`]), 0 for none.
+fn max_quoted_rid(xml: &str) -> u64 {
+    max_rid_in(quoted_rids(xml).iter().map(String::as_str))
+}
+
+/// The highest `N` of an `rIdN` in use in a rels part, 0 for none: every
+/// quoted one, whatever its quote and spacing (`Id='rId2'`, `Id = "rId2"`,
+/// as the loader reads them), and an `Id="rIdN` a cut-short tail ends in.
+fn max_rid(xml: &str) -> u64 {
+    let mut max = max_quoted_rid(xml);
     let mut i = 0;
     while let Some(pos) = xml[i..].find("Id=\"rId") {
         let s = i + pos + "Id=\"rId".len();
@@ -10454,7 +10470,7 @@ fn max_rid(xml: &str) -> u32 {
             .chars()
             .take_while(|c| c.is_ascii_digit())
             .collect();
-        if let Ok(n) = digits.parse::<u32>() {
+        if let Ok(n) = digits.parse::<u64>() {
             max = max.max(n);
         }
         i = s;
@@ -10481,13 +10497,7 @@ pub(crate) fn add_rel(
     // and a new rel under it would rebind that reference (#831).
     let owner_max = rels_owner(rels_part)
         .and_then(|o| parts.iter().find(|(n, _)| *n == o))
-        .map(|(_, b)| {
-            quoted_rids(&String::from_utf8_lossy(b))
-                .iter()
-                .filter_map(|id| id.strip_prefix("rId")?.parse::<u32>().ok())
-                .max()
-                .unwrap_or(0)
-        })
+        .map(|(_, b)| max_quoted_rid(&String::from_utf8_lossy(b)))
         .unwrap_or(0);
     let at = match parts.iter().position(|(n, _)| n == rels_part) {
         Some(at) => at,
@@ -10499,7 +10509,7 @@ pub(crate) fn add_rel(
     let xml = String::from_utf8_lossy(&parts[at].1).into_owned();
     // From the text as it is, so an id only an unreadable tail holds is
     // not handed out again by a rebuild.
-    let rid = format!("rId{}", max_rid(&xml).max(owner_max) + 1);
+    let rid = format!("rId{}", max_rid(&xml).max(owner_max).saturating_add(1));
     let rel = format!("<Relationship Id=\"{rid}\" Type=\"{rel_type}\" Target=\"{target}\"/>");
     parts[at].1 = with_rels(&xml, &rel).into_bytes();
     rid

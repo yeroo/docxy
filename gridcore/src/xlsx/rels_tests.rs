@@ -487,3 +487,51 @@ fn a_rel_cut_inside_its_element_relates_nothing() {
     assert!(ws.contains("<tablePart r:id=\"rId5\"/>"), "{ws}");
     assert_eq!(re.workbook.tables.len(), 1, "{ws}");
 }
+
+#[test]
+fn a_new_sheet_takes_no_single_quoted_rid() {
+    // FIX r2 P1: the loader reads `Id='rId2'` as it reads `Id="rId2"`; a
+    // second rId2 would resolve the new sheet to the styles part.
+    let mut parts = new_xlsx().parts;
+    let rels = format!(
+        "{DECL}<Relationships xmlns=\"{PKG}\">\
+         <Relationship Id='rId1' Type='{R}/worksheet' Target='worksheets/sheet1.xml'/>\
+         <Relationship Id = 'rId2' Type='{R}/styles' Target='styles.xml'/>\
+         <Relationship Id='rId3' Type='{R}/sharedStrings' Target='sharedStrings.xml'/>\
+         </Relationships>"
+    );
+    set(&mut parts, WB_RELS, &rels);
+    let (re, rids) = add_sheet_and_reload(&parts);
+    assert_eq!(rids, ["rId1", "rId4"]);
+    let ids: Vec<String> = parse_rels(&text_of(&re.parts, WB_RELS))
+        .into_iter()
+        .map(|(id, ..)| id)
+        .collect();
+    assert_eq!(ids, ["rId1", "rId2", "rId3", "rId4"]);
+    assert_eq!(sheet_names(&re), ["Sheet1", "Added"]);
+    assert_eq!(
+        re.workbook.sheets[1].cell(0, 0).unwrap().value,
+        CellValue::Number(5.0)
+    );
+    assert!(re.part("xl/styles.xml").is_some());
+}
+
+#[test]
+fn a_huge_quoted_rid_in_cell_text_mints_past_it() {
+    // FIX r2 I1: a formula's text quotes `"rId4294967295"`, past u32.
+    let mut parts = new_xlsx().parts;
+    set(
+        &mut parts,
+        SHEET,
+        &format!(
+            "{DECL}<worksheet xmlns=\"{SML}\"><sheetData><row r=\"1\"><c r=\"A1\" t=\"str\"><f>\"rId4294967295\"</f><v>rId4294967295</v></c></row></sheetData></worksheet>"
+        ),
+    );
+    let mut pkg = load_xlsx(&write_zip(&parts)).unwrap();
+    assert!(pkg.set_comment(0, 1, 1, "A", "note"));
+    let rels = text_of(&pkg.parts, SHEET_RELS);
+    let ids: Vec<String> = parse_rels(&rels).into_iter().map(|(id, ..)| id).collect();
+    assert_eq!(ids, ["rId4294967296", "rId4294967297"], "{rels}");
+    let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+    assert_eq!(re.comments().len(), 1);
+}

@@ -614,9 +614,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   it, which is what the loader resolved. A read element without an `Id`
   gets a fresh one, since the loader finds styles and shared strings by
   type.
-- The new rId is past every `rIdN` in the rels text, including an
-  unreadable tail, and past every `rIdN` the owner part quotes
-  (`rels_owner`, `quoted_rids`). A `<sheet>` or `<drawing>` whose rel was
+- The new rId is past every `rIdN` in the rels text (`max_rid`: any quote
+  or spacing the loader reads, `Id='rId2'`, and an unreadable tail's
+  `Id="rIdN`), and past every `rIdN` the owner part quotes (`rels_owner`,
+  `max_quoted_rid`, cell text included). It is counted in u64 and minted
+  with `saturating_add`, as the hyperlink writer does (`max_rid_in`). A `<sheet>` or `<drawing>` whose rel was
   lost still names its id in the owner's text, so a new rel under that id
   would rebind it: a skipped sheet would come back reading the new sheet's
   part.
