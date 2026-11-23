@@ -1026,7 +1026,7 @@ pub fn clean_sheet_name(raw: &str) -> String {
 }
 
 /// Sheet names Excel accepts, in order: at most 31 characters, none of
-/// `[]:*?/\`, not empty (`SheetN` instead), and unique ignoring case (a
+/// `[]:*?/\` nor a control character (`_` for each), not empty (`SheetN` instead), and unique ignoring case (a
 /// repeat becomes `Name (2)`). References to a renamed sheet follow it
 /// ([`sheet_renames`], [`retarget`]).
 pub(crate) fn valid_sheet_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<String> {
@@ -1043,7 +1043,10 @@ pub(crate) fn valid_sheet_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec
         let clean: String = raw
             .chars()
             .map(|c| {
-                if crate::sheet::SHEET_NAME_FORBIDDEN.contains(c) || c == COLON {
+                if crate::sheet::SHEET_NAME_FORBIDDEN.contains(c)
+                    || c == COLON
+                    || crate::sheet::sheet_name_control(c)
+                {
                     '_'
                 } else {
                     c
@@ -1749,9 +1752,21 @@ mod tests {
         assert_eq!(clean_sheet_name(""), "Sheet1");
         assert_eq!(clean_sheet_name("''"), "Sheet1");
         assert_eq!(clean_sheet_name("Report"), "Report");
+        assert_eq!(clean_sheet_name("a\u{1}b"), "a_b");
+        assert_eq!(clean_sheet_name("\t"), "_");
         let long = "n".repeat(40);
         assert_eq!(clean_sheet_name(&long), "n".repeat(31));
-        for raw in ["a[1]'", "'q'", "x:y*?", "", &long, "/\\"] {
+        for raw in [
+            "a[1]'",
+            "'q'",
+            "x:y*?",
+            "",
+            &long,
+            "/\\",
+            "a\u{1}b",
+            "\t",
+            "x\u{ffff}",
+        ] {
             let name = clean_sheet_name(raw);
             assert_eq!(crate::sheet::sheet_name_error(&name), None, "{raw:?}");
         }

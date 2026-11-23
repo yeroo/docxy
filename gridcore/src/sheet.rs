@@ -1114,9 +1114,18 @@ pub const SHEET_NAME_FORBIDDEN: &str = "[]:*?/\\";
 /// ([`Workbook::sheet_name_refused`]).
 pub const SHEET_NAME_TAKEN: &str = "Sheet name already taken";
 
+/// A character no sheet name may hold although [`SHEET_NAME_FORBIDDEN`] does
+/// not list it: a control character (tab and line breaks too, which Excel's
+/// sheet tab cannot take) or U+FFFE/U+FFFF. The save drops the ones XML 1.0
+/// forbids, so `Data\u{1}` would save as a second `Data` (#2153).
+pub fn sheet_name_control(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{fffe}' | '\u{ffff}')
+}
+
 /// Why Excel would refuse `name` (already trimmed) as a sheet name, or `None`
 /// when it takes it: empty, longer than [`SHEET_NAME_MAX`] characters, any of
-/// [`SHEET_NAME_FORBIDDEN`], or an apostrophe first or last (one inside, as
+/// [`SHEET_NAME_FORBIDDEN`], a control character ([`sheet_name_control`],
+/// #2153), or an apostrophe first or last (one inside, as
 /// in `Bob's Data`, is fine). A taken name is the caller's check
 /// ([`Workbook::sheet_name_refused`] makes both). The one rule a rename or an
 /// add applies; an import cleans names by the same constants
@@ -1128,6 +1137,8 @@ pub fn sheet_name_error(name: &str) -> Option<&'static str> {
         Some("Sheet name is longer than 31 characters")
     } else if name.contains(|c| SHEET_NAME_FORBIDDEN.contains(c)) {
         Some("Sheet name cannot contain [ ] : * ? / \\")
+    } else if name.contains(sheet_name_control) {
+        Some("Sheet name cannot contain control characters")
     } else if name.starts_with('\'') || name.ends_with('\'') {
         Some("Sheet name cannot start or end with an apostrophe")
     } else {
@@ -3588,6 +3599,25 @@ mod tests {
         for name in ["Bob's Data", "Q1 2026", "Data (2)", "Sheet-1"] {
             assert_eq!(sheet_name_error(name), None, "{name}");
         }
+        // #2153 r1: what the save would drop, and the tab and line breaks
+        // Excel's sheet tab cannot take.
+        for name in [
+            "Data\u{1}",
+            "a\tb",
+            "a\nb",
+            "a\rb",
+            "a\u{7f}b",
+            "a\u{85}b",
+            "a\u{fffe}",
+            "\u{ffff}b",
+        ] {
+            assert_eq!(
+                sheet_name_error(name),
+                Some("Sheet name cannot contain control characters"),
+                "{name:?}"
+            );
+        }
+        assert_eq!(sheet_name_error("\t"), Some("Sheet name is empty"));
     }
 
     fn named_sheets(names: &[&str]) -> Workbook {

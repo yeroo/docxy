@@ -16,15 +16,20 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
 
 - `gridcore::sheet::sheet_name_error(name)` is the rule, with the reason a
   host shows: empty, over `SHEET_NAME_MAX` (31) characters, any of
-  `SHEET_NAME_FORBIDDEN` (`[ ] : * ? / \`), or an apostrophe first or last
-  (`Bob's Data` is fine). `legacy::valid_sheet_names` cleans imported names
-  by the same constants.
+  `SHEET_NAME_FORBIDDEN` (`[ ] : * ? / \`), a control character
+  (`sheet_name_control`: `char::is_control`, tab and line breaks too, and
+  U+FFFE/U+FFFF; the save drops what XML 1.0 forbids, so `Data\u{1}` would
+  save as a second `Data`, #2153), or an apostrophe first or last (`Bob's
+  Data` is fine). `legacy::valid_sheet_names` cleans imported names by the
+  same rules (`_` for a forbidden or control character).
 - `Workbook::sheet_name_refused(name, except)` adds the taken check
   (`SHEET_NAME_TAKEN`): another sheet's name folded with `to_lowercase()`,
   not ASCII only, as Excel compares (`Données` and `DONNÉES` are one name,
   and a file holding both is repaired). `except` is the sheet a rename
   renames, so a case-only rename holds. Every add or rename of an outside
-  name goes through it (#2153). `Workbook::sheet_index` and
+  name goes through it (#2153), xlcomshim's `Worksheet.Name` put too (a
+  refused name is `E_FAIL`); `sheet_names_match` is the same fold for two
+  names, which gridwasm's `sheet.restore-removed` uses between stashes. `Workbook::sheet_index` and
   `next_sheet_name` still fold ASCII only (formula resolution).
 - `SheetPackage::add_sheet` takes only a name that passes it: a host checks
   an outside name first and says why. Debug builds assert it, so a path that
