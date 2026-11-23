@@ -9,7 +9,7 @@
 
 mod rewrite;
 
-pub(crate) use rewrite::stored_result;
+pub(crate) use rewrite::{children, stored_result};
 pub use rewrite::{with_instr, with_result};
 
 /// Compute a field's result from its (entity-decoded) instruction, or `None` when

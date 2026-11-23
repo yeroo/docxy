@@ -572,17 +572,18 @@ fn a_marker_run_sharing_text_or_a_break_stays_as_today_1240() {
         assert!(!ed.has_selection(), "{kept}: Backspace does not select");
 
         // A delete covering it deletes the result as on main: the shared
-        // run, and the markers with it, stay. (Not a positional tab's run:
-        // on main a delete spanning an alignment tab drops its run, #768,
-        // and this field's end with it.)
-        if kept == "<w:ptab " {
-            continue;
-        }
+        // run, and the markers with it, stay. A positional tab there is
+        // something the delete spans (#768), so it goes, but the field's
+        // end stays in its run (#1463).
         let mut ed = toc_with(begin, end);
         select(&mut ed, Caret::at(vec![1], 0), Caret::at(vec![3], 0));
         ed.backspace();
         let xml = saved(&ed);
-        assert!(xml.contains(kept), "{kept} left: {xml}");
+        if kept == "<w:ptab " {
+            assert!(!xml.contains("<w:ptab"), "the tab goes: {xml}");
+        } else {
+            assert!(xml.contains(kept), "{kept} left: {xml}");
+        }
         for kind in ["begin", "end"] {
             let marker = format!("w:fldCharType=\"{kind}\"");
             assert_eq!(xml.matches(&marker).count(), 1, "{kind} in {xml}");

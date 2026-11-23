@@ -218,7 +218,10 @@ impl Editor {
     /// The drawing and positional-tab runs a delete spans in the paragraph
     /// at `path` ([`super::spanned_object_indices`]): removed outright, or
     /// while tracking recorded as a `w:del` each, with an id of its own
-    /// (#1433). Offsets do not move either way.
+    /// (#1433). A run that also holds field code loses only its `w:ptab`s
+    /// (tracked: recorded in runs of their own, in their places among the
+    /// markers' runs), or stays whole when it cannot be split
+    /// ([`super::spanned_object`], #1463). Offsets do not move either way.
     pub(super) fn drop_or_record_objects(
         &mut self,
         path: &[usize],
@@ -236,20 +239,48 @@ impl Editor {
         }
         if self.track.is_none() {
             if let Some(p) = para_mut(&mut self.doc.body, path) {
-                super::remove_indices(&mut p.content, &found);
+                super::remove_spanned_objects(&mut p.content, &found);
             }
             return;
         }
+        // A run holding field code becomes its pieces, a `w:del` around each
+        // piece of tabs (#1463); `shift` counts the inlines added.
+        let mut shift = 0;
         for k in found {
-            let Some(meta) = self.fresh_revision_metadata() else {
-                return;
+            let k = k + shift;
+            let pieces = match resolve_para(&self.doc.body, path).and_then(|p| p.content.get(k)) {
+                Some(Inline::Raw(raw)) => match super::spanned_object(raw) {
+                    super::SpannedObject::Whole => vec![(Inline::Raw(raw.clone()), true)],
+                    super::SpannedObject::Split { pieces, .. } => pieces
+                        .into_iter()
+                        .map(|(xml, tab)| (Inline::Raw(xml), tab))
+                        .collect(),
+                    super::SpannedObject::Keep => continue,
+                },
+                _ => continue,
             };
-            if let Some(p) = para_mut(&mut self.doc.body, path) {
-                let inner = p.content[k].clone();
-                p.content[k] = deletion_wrapper(meta, inner);
+            shift += pieces.len() - 1;
+            for (j, (inline, deleted)) in pieces.into_iter().enumerate() {
+                let inline = if deleted {
+                    let Some(meta) = self.fresh_revision_metadata() else {
+                        return;
+                    };
+                    deletion_wrapper(meta, inline)
+                } else {
+                    inline
+                };
+                if let Some(p) = para_mut(&mut self.doc.body, path) {
+                    if j == 0 {
+                        p.content[k] = inline;
+                    } else {
+                        p.content.insert(k + j, inline);
+                    }
+                }
+                if deleted {
+                    // Each wrapper takes its id before the next is made.
+                    self.settle_revisions();
+                }
             }
-            // Each wrapper takes its id before the next is made.
-            self.settle_revisions();
         }
     }
 
