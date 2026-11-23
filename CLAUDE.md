@@ -165,7 +165,8 @@ issue number to find its notes.
   cells, quoted refs keeping their cache (#903), page setup, breaks, print
   area and titles from `.xlsb`/`.ods` (#901), a cut splitting a
   conditional-format rule its cells read differently, saved as clones
-  (#1458).
+  (#1458), a paste into another workbook adopting the source's formats and
+  saving their raw parts (#1011).
 - `docs/claude/terminal-editors.md`: before changing terminal `docxy`, `xlsxy` or
   `yppxy`, or `backstagecore`'s Save As name field: docxy's Layout tab (#1274), prompts
   editing at a caret (#1372, #1373, #1374, #1375, #1379), Ctrl+C/X/V (#1377, #1378),

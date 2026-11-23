@@ -557,3 +557,45 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
 - Not done: `.xlsb` row outline levels (BrtRowHdr), `.ods` outline groups,
   `style:scale-to-pages`, header and footer fonts, paper sizes outside
   `paper_points`.
+
+## A paste into another workbook keeps its formats (#1011)
+
+- A cell's `style` indexes its own workbook's `<cellXfs>`, so a copy taken in
+  one suite sheet tab and pasted into another would land on whatever xf the
+  destination holds at that index. `ClipBlock::capture` keeps the source's
+  `Xf` of every id its cells use (`ClipBlock::xfs`), and
+  `ClipBlock::adopt_styles(&mut dst)` rewrites the ids into `dst`'s: style 0
+  stays 0 while its modeled fields equal `dst`'s default, anything else is
+  interned with `loaded_from: None` (the source's index means nothing here).
+  Interning finds what an earlier paste of the same copy appended.
+- Blocks are never stored adopted: `GridClip.block`, `PasteSource.block` and
+  `PasteOptions.block` stay in the source's ids (`cut_still_live` compares
+  them with the source sheet). Each paste adopts a clone inside the guarded
+  paste: `paste_copy` when `clip.view != self.id` (Ctrl+V, Enter, a cut from
+  another workbook), `paste_special_at`/`paste_item_at` when passed
+  `foreign` (the dialog, the gallery, Paste Options' repaste). A refused
+  paste restores the styles, so a refusal leaves nothing appended; an
+  undone Ctrl+V may leave its unused xfs, as a text paste already does.
+- What the model doesn't carry of a source xf (borders: the loader models
+  none, underline, theme colours, vertical alignment, `locked="0"`) travels
+  as `Xf::foreign` (`ForeignXf`: the parsed entry, its raw `<font>`,
+  `<fill>`, `<border>`, built-in `numFmtId`, `<alignment>`, `<protection>`).
+  `SheetView::clip_block` fills it through `ClipBlock::carry_parts` from
+  `SheetPackage::foreign_xfs`, one pass over the styles part, for each xf
+  with `loaded_from` and no `foreign` yet: an xf pasted from A into B and
+  copied on into C keeps A's parts. An entry whose elements are
+  namespace-prefixed, or a part whose raw and parsed entries don't line up,
+  carries none and is saved from its modeled fields.
+- `splice_styles` derives a foreign xf as it does a loaded one (`Derive`,
+  `derive_from`), except that its parts are appended: each raw part while the
+  modeled fields it carries still match (an edited font goes through
+  `edit_font`), reusing an equal element the part already has or one appended
+  earlier in the same save; `xfId` is 0; a built-in id the destination part
+  redefines is minted as a custom code.
+- A raw font's theme colours and `<scheme val="minor"/>` resolve against the
+  destination's theme in Excel, as Excel's plain paste does (keeping the
+  source's theme is "All using Source theme", not offered). The model keeps
+  the source's `font_name`, so the suite and Excel may draw such a font
+  differently. `.xls`/`.ods` saves ignore `foreign`, as they lose these parts
+  of a loaded xf. Not done: conditional formats and named cell styles
+  (`cellStyleXfs`) across workbooks.
