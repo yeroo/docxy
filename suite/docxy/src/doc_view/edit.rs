@@ -285,6 +285,18 @@ fn fresh_package() -> Package {
     docxcore::package::new_package(Document { body: vec![] })
 }
 
+/// Give a package [`fresh_package`] just made the numbering part that
+/// defines docxy's own lists 1 and 2 when the view's document (`body`)
+/// names a list (#2181): a view with no package toggles those lists
+/// without defining them, and the host exports the document with the
+/// package once it has one. Only for a fresh package: this step leaves
+/// one the host gave the view as it is.
+fn define_own_lists(fresh: &mut Package, body: &[docxcore::model::Block]) {
+    if crate::names_a_list(body) {
+        fresh.add_markdown_numbering();
+    }
+}
+
 /// The picture a host's bytes are (#1953): what [`docxcore::image::sniff`]
 /// reads (PNG, JPEG, GIF or BMP), when `content_type` names the same kind.
 /// The type is read as a header gives it: any case, parameters after `;`
@@ -360,7 +372,13 @@ pub(crate) fn insert_picture(
     let max_cx = caret_text_width_emu(ed, pkg.as_ref());
     let (cx, cy) = docxcore::image::extent_emu(info, Some(max_cx));
     let body = docxcore::serialize::blocks_to_xml(&ed.doc.body);
+    // A picture adds no list: the lists the view's document names now are
+    // those the new package must define (#2181).
+    let fresh = pkg.is_none();
     let pkg = pkg.get_or_insert_with(fresh_package);
+    if fresh {
+        define_own_lists(pkg, &ed.doc.body);
+    }
     // Unique among the body's drawings and every story part's.
     let mut xmls = vec![body];
     for name in pkg.part_names() {
@@ -438,6 +456,7 @@ pub(crate) fn paste_clip(
     mut clip: Clip,
     media: Option<&pictures::Media>,
 ) -> Formatted {
+    let fresh = pkg.is_none();
     if let Some(media) = media.filter(|m| !m.is_empty()) {
         if clip.inline_embeds().iter().any(|r| media.contains_key(r)) {
             let taken = embed_ids(&docxcore::serialize::blocks_to_xml(&ed.doc.body));
@@ -448,6 +467,10 @@ pub(crate) fn paste_clip(
     // Another app's list items name lists the package must define (#1967).
     crate::doc_paste::numbering_for_paste(pkg.as_mut(), &mut clip);
     let out = edit(ed, |ed| ed.one_step("Paste", |e| e.paste(&clip)));
+    // Decided on what the paste leaves: its text boxes may hold a list.
+    if let Some(pkg) = pkg.as_mut().filter(|_| fresh) {
+        define_own_lists(pkg, &ed.doc.body);
+    }
     Formatted {
         ran: true,
         changed: out.changed(),
@@ -2061,6 +2084,75 @@ mod tests {
         assert!(pkg.part_rel_target(BODY_PART, "rId2").is_none());
         let target = pkg.part_rel_target(BODY_PART, &rids[1]).unwrap();
         assert_eq!(pkg.part(&target), Some(&png(3, 2)[..]));
+    }
+
+    /// #2181: a view given no package keeps its Bullets as docxy's own
+    /// list 1, defined nowhere; its first picture makes it a package,
+    /// which the host exports the document with, so that package defines
+    /// the list. A view with no list gets one without a numbering part, and
+    /// a package the host gave the view is not given one by the picture's
+    /// step.
+    #[test]
+    fn a_fresh_package_defines_the_views_lists_2181() {
+        const NUMBERING: &str = "word/numbering.xml";
+        let mut ed = editor(&["a"]);
+        let mut pkg = None;
+        assert!(apply_format(&mut ed, pkg.as_mut(), &DocFormat::Bullets).ran);
+        assert!(pkg.is_none());
+        assert!(ed.all_in_list(ListIds::OWN.bullet));
+        assert!(put(&mut ed, &mut pkg, &png(3, 2)).changed);
+        let pkg = pkg.expect("a package for the picture");
+        let numbering = docxcore::numbering::parse_numbering_xml(
+            &pkg.part_text(NUMBERING).expect("a numbering part"),
+        );
+        assert!(numbering.defines(ListIds::OWN.bullet));
+        // No list: no numbering part, as before.
+        let mut plain = editor(&["a"]);
+        let mut pkg = None;
+        assert!(put(&mut plain, &mut pkg, &png(3, 2)).changed);
+        assert!(pkg.expect("a package").part(NUMBERING).is_none());
+        // The host's package, without a numbering part, stays without one.
+        let mut ed = editor(&["a"]);
+        ed.set_list(Some(ListIds::OWN.bullet));
+        let mut host = Some(docxcore::package::new_package(Document { body: vec![] }));
+        assert!(put(&mut ed, &mut host, &png(3, 2)).changed);
+        assert!(host.unwrap().part(NUMBERING).is_none());
+    }
+
+    /// #2181: the view's own clip with a picture, pasted into a view with
+    /// no package, makes it one; the list item the clip's text box holds
+    /// is defined there, decided on what the paste leaves.
+    #[test]
+    fn a_paste_making_a_package_defines_its_lists_2181() {
+        let mut src = editor(&["ab"]);
+        let mut src_pkg = None;
+        src.caret = Caret::at(vec![0], 1);
+        put(&mut src, &mut src_pkg, &png(3, 2));
+        src.select_all();
+        let mut clip = src.copy().expect("a selection");
+        let media = pictures::capture(src_pkg.as_ref().unwrap(), BODY_PART, &clip);
+        assert!(!media.is_empty());
+        // A text box holding a list item beside the picture.
+        let mut item = Paragraph::default();
+        item.props.num_id = Some(ListIds::OWN.bullet);
+        clip.paras[0].push(Inline::TextBox {
+            raw: String::new(),
+            blocks: vec![Block::Paragraph(item)],
+        });
+        let mut dst = editor(&["x"]);
+        assert!(!crate::names_a_list(&dst.doc.body));
+        let mut dst_pkg = None;
+        assert!(paste_clip(&mut dst, &mut dst_pkg, clip, Some(&media)).changed);
+        assert!(
+            crate::names_a_list(&dst.doc.body),
+            "the text box's list came"
+        );
+        let pkg = dst_pkg.expect("a package for the picture");
+        let numbering = docxcore::numbering::parse_numbering_xml(
+            &pkg.part_text("word/numbering.xml")
+                .expect("a numbering part"),
+        );
+        assert!(numbering.defines(ListIds::OWN.bullet));
     }
 
     /// The embedded view's Bullets in a document whose numId 1 is decimal
