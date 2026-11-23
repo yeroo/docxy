@@ -1017,8 +1017,17 @@ fn write_external_links(pkg: &mut SheetPackage, links: &[ExternalLink]) {
     );
 }
 
+/// `raw` (a file's stem, say) as a name Excel takes for a workbook's only
+/// sheet: [`valid_sheet_names`] on it alone, so `[]:*?/\` and control
+/// characters become `_`, it is
+/// cut to 31 characters, apostrophes are trimmed off its ends, and an empty
+/// result is `Sheet1` (#2153).
+pub fn clean_sheet_name(raw: &str) -> String {
+    valid_sheet_names(std::iter::once(raw)).remove(0)
+}
+
 /// Sheet names Excel accepts, in order: at most 31 characters, none of
-/// `[]:*?/\`, not empty (`SheetN` instead), and unique ignoring case (a
+/// `[]:*?/\` nor a control character (`_` for each), not empty (`SheetN` instead), and unique ignoring case (a
 /// repeat becomes `Name (2)`). References to a renamed sheet follow it
 /// ([`sheet_renames`], [`retarget`]).
 pub(crate) fn valid_sheet_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<String> {
@@ -1035,7 +1044,10 @@ pub(crate) fn valid_sheet_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec
         let clean: String = raw
             .chars()
             .map(|c| {
-                if crate::sheet::SHEET_NAME_FORBIDDEN.contains(c) || c == COLON {
+                if crate::sheet::SHEET_NAME_FORBIDDEN.contains(c)
+                    || c == COLON
+                    || crate::sheet::sheet_name_control(c)
+                {
                     '_'
                 } else {
                     c
@@ -1728,6 +1740,36 @@ mod tests {
         assert_eq!(got[5], "Sheet6");
         for n in &got {
             assert_eq!(crate::sheet::sheet_name_error(n), None, "{n:?}");
+        }
+    }
+
+    /// #2153: a file's stem as a lone sheet's name is cleaned as an import
+    /// cleans names, so Excel takes it.
+    #[test]
+    fn clean_sheet_name_gives_a_name_excel_takes() {
+        assert_eq!(clean_sheet_name("a[1]'"), "a_1_");
+        assert_eq!(clean_sheet_name("'q'"), "q");
+        assert_eq!(clean_sheet_name("x:y*?"), "x_y__");
+        assert_eq!(clean_sheet_name(""), "Sheet1");
+        assert_eq!(clean_sheet_name("''"), "Sheet1");
+        assert_eq!(clean_sheet_name("Report"), "Report");
+        assert_eq!(clean_sheet_name("a\u{1}b"), "a_b");
+        assert_eq!(clean_sheet_name("\t"), "_");
+        let long = "n".repeat(40);
+        assert_eq!(clean_sheet_name(&long), "n".repeat(31));
+        for raw in [
+            "a[1]'",
+            "'q'",
+            "x:y*?",
+            "",
+            &long,
+            "/\\",
+            "a\u{1}b",
+            "\t",
+            "x\u{ffff}",
+        ] {
+            let name = clean_sheet_name(raw);
+            assert_eq!(crate::sheet::sheet_name_error(&name), None, "{raw:?}");
         }
     }
 

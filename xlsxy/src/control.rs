@@ -922,10 +922,11 @@ fn pivot_create(app: &mut App, args: &Json) -> Result<Json, String> {
 
     let sheet_name = match args.get_str("name") {
         Some(n) => {
-            if n.is_empty() || n.contains(['[', ']', '*', '?', ':', '/', '\\']) {
-                return Err("invalid sheet name".into());
+            // Excel's rules, then a taken name in any case (#2153).
+            if let Some(why) = gridcore::sheet::sheet_name_error(n) {
+                return Err(format!("pivot.create: {why}"));
             }
-            if app.pkg.workbook.sheet_index(n).is_some() {
+            if app.pkg.workbook.sheet_name_refused(n, None).is_some() {
                 return Err(format!("pivot.create: sheet name '{n}' is already taken"));
             }
             n.to_string()
@@ -956,8 +957,9 @@ fn pivot_create(app: &mut App, args: &Json) -> Result<Json, String> {
 }
 
 /// A default pivot-sheet name: `Pivot1`, `Pivot2`, … — unique among existing
-/// sheet names. Distinct pattern from `unique_sheet_name`'s "Sheet"/"Sheet 2"
-/// (no space before the number) — Wave-3's convention for agent-created
+/// sheet names. Distinct pattern from
+/// `gridcore::sheet::Workbook::free_sheet_name`'s "Sheet"/"Sheet 2" (no space
+/// before the number) — Wave-3's convention for agent-created
 /// pivot sheets, chosen for the verb's spec.
 fn unique_pivot_name(wb: &gridcore::sheet::Workbook) -> String {
     let mut n = 1;
@@ -1315,21 +1317,15 @@ fn range_set(app: &mut App, args: &Json) -> Result<Json, String> {
     Ok(Json::obj(vec![("set", Json::Num(n as f64))]))
 }
 
-/// A sheet name derived from `base`, deduplicated against existing sheet
-/// names by appending " 2", " 3", … (the same scheme `create_pivot_from`/
-/// `build_model_report` use for their generated sheets).
-fn unique_sheet_name(wb: &gridcore::sheet::Workbook, base: &str) -> String {
-    if wb.sheet_index(base).is_none() {
-        return base.to_string();
+/// The name a new sheet asked for as `requested` gets: an error naming
+/// `verb` when Excel refuses it, else `requested` deduplicated against the
+/// other sheets by appending " 2", " 3", … within 31 characters
+/// ([`gridcore::sheet::Workbook::free_sheet_name`], #2153).
+fn new_sheet_name(app: &App, verb: &str, requested: &str) -> Result<String, String> {
+    if let Some(why) = gridcore::sheet::sheet_name_error(requested) {
+        return Err(format!("{verb}: {why}"));
     }
-    let mut n = 1;
-    loop {
-        n += 1;
-        let candidate = format!("{base} {n}");
-        if wb.sheet_index(&candidate).is_none() {
-            return candidate;
-        }
-    }
+    Ok(app.pkg.workbook.free_sheet_name(requested))
 }
 
 /// The Text Import Wizard / Text to Columns options of a verb's `options`
@@ -1691,7 +1687,7 @@ fn sheet_import_text(app: &mut App, args: &Json) -> Result<Json, String> {
         }
         (None, None) => return Err("sheet.import-text needs 'text' or 'path'".into()),
     };
-    import_new_sheet(app, args, &text, &opts)
+    import_new_sheet(app, "sheet.import-text", args, &text, &opts)
 }
 
 /// Data › Text to Columns on one column: `range` converted under `options`
@@ -1780,20 +1776,22 @@ fn sheet_import_csv(app: &mut App, args: &Json) -> Result<Json, String> {
         .get_str("text")
         .ok_or("sheet.import-csv needs 'text'")?;
     let (opts, body) = gridcore::textio::csv_parse(text, false);
-    import_new_sheet(app, args, body, &opts)
+    import_new_sheet(app, "sheet.import-csv", args, body, &opts)
 }
 
 /// `text` read under `opts` into a brand-new sheet named by `args.name`
-/// (deduplicated), converted as opening a text file converts it. Shared by
-/// `sheet.import-csv` and `sheet.import-text`.
+/// (deduplicated; a name Excel refuses is `verb`'s error), converted as
+/// opening a text file converts it. Shared by `sheet.import-csv` and
+/// `sheet.import-text`.
 fn import_new_sheet(
     app: &mut App,
+    verb: &str,
     args: &Json,
     text: &str,
     opts: &gridcore::textio::TextParse,
 ) -> Result<Json, String> {
     let requested = args.get_str("name").unwrap_or("Sheet");
-    let name = unique_sheet_name(&app.pkg.workbook, requested);
+    let name = new_sheet_name(app, verb, requested)?;
     let idx = app.pkg.add_sheet(&name);
     let open = app.text_open();
     let wb = &mut app.pkg.workbook;
@@ -1857,10 +1855,10 @@ fn wb_replace_all(app: &mut App, args: &Json) -> Result<Json, String> {
 }
 
 /// Add a new sheet (default base name "Sheet", deduplicated on collision —
-/// never errors on a taken name).
+/// never errors on a taken name; errors on a name Excel refuses, #2153).
 fn sheet_add(app: &mut App, args: &Json) -> Result<Json, String> {
     let requested = args.get_str("name").unwrap_or("Sheet");
-    let name = unique_sheet_name(&app.pkg.workbook, requested);
+    let name = new_sheet_name(app, "sheet.add", requested)?;
     let idx = app.pkg.add_sheet(&name);
     // As the TUI's AddSheet: the history stays (see `App::put_back`).
     app.rebuild_engine();
@@ -4878,6 +4876,52 @@ mod tests {
         assert_eq!(a.status.as_deref(), Some("Nothing to undo"));
     }
 
+    /// #2153: `sheet.add` refuses a name Excel refuses and dedupes a taken
+    /// one (in any case) within 31 characters.
+    #[test]
+    fn sheet_add_refuses_excels_names_and_dedupes_within_31() {
+        let mut a = app();
+        let named = |n: &str| Json::obj(vec![("name", Json::Str(n.into()))]);
+        for bad in ["a/b", "'x", "", &"z".repeat(32)] {
+            let err = dispatch(&mut a, "sheet.add", &named(bad)).unwrap_err();
+            assert_eq!(
+                Some(err.as_str().trim_start_matches("sheet.add: ")),
+                gridcore::sheet::sheet_name_error(bad),
+                "{bad:?}"
+            );
+            assert_eq!(a.pkg.workbook.sheets.len(), 1, "{bad:?}");
+            assert!(!a.modified, "{bad:?}");
+        }
+        let long = "L".repeat(31);
+        dispatch(&mut a, "sheet.add", &named(&long)).unwrap();
+        let r = dispatch(&mut a, "sheet.add", &named(&long.to_lowercase())).unwrap();
+        let name = r.get_str("name").unwrap();
+        assert_eq!(name, format!("{} 2", "l".repeat(29)));
+        assert_eq!(gridcore::sheet::sheet_name_error(name), None);
+        dispatch(&mut a, "sheet.add", &named("Données")).unwrap();
+        let r = dispatch(&mut a, "sheet.add", &named("DONNÉES")).unwrap();
+        assert_eq!(r.get_str("name"), Some("DONNÉES 2"));
+    }
+
+    /// #2153: the imports into a new sheet check the name as `sheet.add` does.
+    #[test]
+    fn sheet_import_refuses_a_name_excel_refuses() {
+        let mut a = app();
+        for verb in ["sheet.import-csv", "sheet.import-text"] {
+            let args = Json::obj(vec![
+                ("text", Json::Str("a,b\n1,2\n".into())),
+                ("name", Json::Str("In:put".into())),
+            ]);
+            let err = dispatch(&mut a, verb, &args).unwrap_err();
+            assert_eq!(
+                err,
+                format!("{verb}: Sheet name cannot contain [ ] : * ? / \\")
+            );
+            assert_eq!(a.pkg.workbook.sheets.len(), 1, "{verb}");
+            assert!(!a.modified, "{verb}");
+        }
+    }
+
     #[test]
     fn sheet_add_defaults_name_and_dedupes() {
         let mut a = app();
@@ -6386,6 +6430,27 @@ mod tests {
         // Colliding with a plain (non-pivot) sheet name errors the same way.
         let err = dispatch(&mut a, "pivot.create", &pivot_create_args(Some("Sheet1"))).unwrap_err();
         assert!(err.contains("Sheet1"), "{err}");
+    }
+
+    /// #2153: `pivot.create`'s sheet name follows Excel's rules (length,
+    /// apostrophes too) and is taken in any case; nothing is added.
+    #[test]
+    fn pivot_create_refuses_a_sheet_name_excel_refuses() {
+        let mut a = app();
+        pivot_fixture(&mut a);
+        let long = "p".repeat(32);
+        for bad in [long.as_str(), "'x'", "a?b", ""] {
+            let err = dispatch(&mut a, "pivot.create", &pivot_create_args(Some(bad))).unwrap_err();
+            let why = gridcore::sheet::sheet_name_error(bad).unwrap();
+            assert_eq!(err, format!("pivot.create: {why}"), "{bad:?}");
+            assert_eq!(a.pkg.workbook.sheets.len(), 1, "{bad:?}");
+            assert!(a.pkg.workbook.pivots.is_empty(), "{bad:?}");
+        }
+        a.pkg.workbook.sheets[0].name = "Données".into();
+        let err =
+            dispatch(&mut a, "pivot.create", &pivot_create_args(Some("DONNÉES"))).unwrap_err();
+        assert_eq!(err, "pivot.create: sheet name 'DONNÉES' is already taken");
+        assert_eq!(a.pkg.workbook.sheets.len(), 1);
     }
 
     #[test]

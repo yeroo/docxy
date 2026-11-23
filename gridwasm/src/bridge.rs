@@ -860,7 +860,20 @@ impl Session {
                             self.anchor = None;
                         }
                     }
-                    (Some("add"), Some(name)) if !name.is_empty() => {
+                    (Some("add"), name) => {
+                        // The "+" button sends no name: Excel's next free
+                        // `SheetN`. A typed name is trimmed (as the suite's
+                        // rename bar trims) and checked as Excel checks it,
+                        // a taken one in any case: a refused name changes
+                        // nothing and says why (#2153).
+                        let name = match name {
+                            None | Some("") => self.pkg.workbook.next_sheet_name(),
+                            Some(typed) => typed.trim().to_string(),
+                        };
+                        if let Some(why) = self.pkg.workbook.sheet_name_refused(&name, None) {
+                            self.err = Some(why.to_string());
+                            return None;
+                        }
                         // add_sheet operates on the whole SheetPackage (parts,
                         // not just Workbook), so its undo can't be a
                         // `Structural` before/after snapshot — that only
@@ -875,12 +888,9 @@ impl Session {
                         // is the real inverse: it drops the part, the
                         // content-type override, the workbook rel, and the
                         // workbook.xml entry together.
-                        let idx = self.pkg.add_sheet(name);
+                        let idx = self.pkg.add_sheet(&name);
                         self.rebuild_engine();
-                        self.undo.push(UndoAction::SheetAdd {
-                            idx,
-                            name: name.to_string(),
-                        });
+                        self.undo.push(UndoAction::SheetAdd { idx, name });
                         // A third genuine undo-group chokepoint alongside
                         // `apply()`/`structural()`: this push happens
                         // directly (see the comment above — a `SheetAdd`'s
@@ -899,9 +909,14 @@ impl Session {
                     (Some("rename"), Some(rest2)) => {
                         if let Some((i, name)) = rest2.split_once('\t') {
                             let i: usize = i.parse().unwrap_or(usize::MAX);
-                            if i < self.pkg.workbook.sheets.len() && !name.is_empty() {
-                                let n = name.to_string();
-                                self.structural(|wb| gridcore::edit::rename_sheet(wb, i, &n));
+                            if i < self.pkg.workbook.sheets.len() {
+                                // Trimmed and checked as an add is (#2153).
+                                let n = name.trim().to_string();
+                                match self.pkg.workbook.sheet_name_refused(&n, Some(i)) {
+                                    Some(why) => self.err = Some(why.to_string()),
+                                    None => self
+                                        .structural(|wb| gridcore::edit::rename_sheet(wb, i, &n)),
+                                }
                             }
                         }
                     }
@@ -2472,10 +2487,11 @@ impl Session {
 
         let sheet_name = match args.get_str("name") {
             Some(n) => {
-                if n.is_empty() || n.contains(['[', ']', '*', '?', ':', '/', '\\']) {
-                    return Err("invalid sheet name".into());
+                // Excel's rules, then a taken name in any case (#2153).
+                if let Some(why) = gridcore::sheet::sheet_name_error(n) {
+                    return Err(format!("pivot.create: {why}"));
                 }
-                if self.pkg.workbook.sheet_index(n).is_some() {
+                if self.pkg.workbook.sheet_name_refused(n, None).is_some() {
                     return Err(format!("pivot.create: sheet name '{n}' is already taken"));
                 }
                 n.to_string()
@@ -3049,12 +3065,11 @@ impl Session {
     /// string, so it neither disturbs `active`/`cur`/`anchor` (an
     /// agent-driven background edit shouldn't yank a human's live view, same
     /// principle xlsxy's Task 5 established) nor silently no-ops on an
-    /// empty-string `name` (the dispatch command's `!name.is_empty()` guard
-    /// would otherwise turn `{"name":""}` into a no-op that still reports
-    /// success).
+    /// empty-string `name` (an error, as a name Excel refuses is, #2153); a
+    /// taken name is deduplicated within 31 characters.
     fn ctl_sheet_add(&mut self, args: &json::Json) -> Result<String, String> {
         let requested = args.get_str("name").unwrap_or("Sheet");
-        let name = ctl_unique_sheet_name(&self.pkg.workbook, requested);
+        let name = ctl_new_sheet_name(&self.pkg.workbook, "sheet.add", requested)?;
         let idx = self.pkg.add_sheet(&name);
         self.rebuild_engine();
         self.undo.push(UndoAction::SheetAdd {
@@ -3589,8 +3604,7 @@ impl Session {
         // restore leaves the stack intact for a correct later attempt.
         let ghosts_only = k + 1 < self.removed_sheet_stashes.len()
             && self.removed_sheet_stashes[k + 1..].iter().all(|st| {
-                st.name
-                    .eq_ignore_ascii_case(&self.removed_sheet_stashes[k].name)
+                gridcore::sheet::sheet_names_match(&st.name, &self.removed_sheet_stashes[k].name)
             })
             && restore_is_lossless(&mut self.pkg.workbook, &self.removed_sheet_stashes[k]);
         let names: Vec<&str> = self.removed_sheet_stashes[k..]
@@ -3598,8 +3612,12 @@ impl Session {
             .take(if ghosts_only { 1 } else { usize::MAX })
             .map(|st| st.name.as_str())
             .collect();
+        // Names are told apart as Excel tells them, beyond ASCII
+        // (`sheet_names_match`, as `add_sheet` asserts, #2153): past these
+        // checks no live sheet and no other stash from `k` up matches one, so
+        // the `sheet_index` lookups below find the very sheet restored.
         for (i, name) in names.iter().enumerate() {
-            if self.pkg.workbook.sheet_index(name).is_some() {
+            if self.pkg.workbook.sheet_name_taken(name, None) {
                 return Err(if i == 0 {
                     format!("cannot restore \"{name}\": a sheet with that name already exists")
                 } else {
@@ -3609,13 +3627,16 @@ impl Session {
                     )
                 });
             }
-            if i > 0 && names[0].eq_ignore_ascii_case(name) {
+            if i > 0 && gridcore::sheet::sheet_names_match(names[0], name) {
                 return Err(format!(
                     "cannot restore \"{}\": a sheet named \"{name}\" was removed after it",
                     names[0]
                 ));
             }
-            if names[..i].iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            if names[..i]
+                .iter()
+                .any(|n| gridcore::sheet::sheet_names_match(n, name))
+            {
                 return Err(format!(
                     "cannot restore \"{}\": two sheets removed after it are named \"{name}\"",
                     names[0]
@@ -4012,16 +4033,16 @@ impl Session {
 
     /// `{sheet,name}` -> `{name,undoSteps:1}`. Reuses the interactive
     /// `"sheet\trename"` dispatch command (one `Structural` undo group), but
-    /// validates the name FIRST — the dispatch command itself only checks
-    /// non-empty, silently no-op'ing on an invalid one; mirrors xlsxy
-    /// control.rs's `sheet_rename` validation. Terminal xlsxy also refuses a
-    /// name another sheet has (its rename is no undo step, #858); this one
-    /// does not yet.
+    /// validates the name FIRST, as the dispatch command does (trimmed, a
+    /// name Excel refuses or another sheet has in any case, #2153), so a
+    /// refused one is an error with the reason rather than a dispatch that
+    /// only sets `err`; mirrors xlsxy control.rs's `sheet_rename`.
     fn ctl_sheet_rename(&mut self, args: &json::Json) -> Result<String, String> {
         let si = self.ctl_sheet_arg_required(args)?;
         let name = args.get_str("name").ok_or("sheet.rename needs a 'name'")?;
-        if name.is_empty() || name.contains(['[', ']', '*', '?', ':', '/', '\\']) {
-            return Err("invalid sheet name".into());
+        let name = name.trim();
+        if let Some(why) = self.pkg.workbook.sheet_name_refused(name, Some(si)) {
+            return Err(why.into());
         }
         self.dispatch(&format!("sheet\trename\t{si}\t{name}"));
         let mut out = String::from("{\"name\":");
@@ -4151,7 +4172,7 @@ impl Session {
         // converts as if typed, a year-less date taking the host's clock.
         let (opts, body) = gridcore::textio::csv_parse(text, false);
         let requested = args.get_str("name").unwrap_or("Sheet");
-        let name = ctl_unique_sheet_name(&self.pkg.workbook, requested);
+        let name = ctl_new_sheet_name(&self.pkg.workbook, "sheet.import-csv", requested)?;
         let idx = self.pkg.add_sheet(&name);
         let ctx = gridcore::entry::entry_ctx(&self.pkg.workbook, self.engine.clock);
         let wb = &mut self.pkg.workbook;
@@ -4352,21 +4373,20 @@ fn ctl_format_json(styles: &Styles, style: u32) -> Option<String> {
     Some(out)
 }
 
-/// A sheet name derived from `base`, deduplicated against existing sheet
-/// names by appending " 2", " 3", … — same scheme xlsxy control.rs's
-/// `unique_sheet_name` uses.
-fn ctl_unique_sheet_name(wb: &gridcore::sheet::Workbook, base: &str) -> String {
-    if wb.sheet_index(base).is_none() {
-        return base.to_string();
+/// The name a new sheet asked for as `requested` gets: an error naming
+/// `verb` when Excel refuses it, else `requested` deduplicated against the
+/// other sheets by appending " 2", " 3", … within 31 characters
+/// ([`gridcore::sheet::Workbook::free_sheet_name`], #2153) — the same as
+/// xlsxy control.rs's `new_sheet_name`.
+fn ctl_new_sheet_name(
+    wb: &gridcore::sheet::Workbook,
+    verb: &str,
+    requested: &str,
+) -> Result<String, String> {
+    if let Some(why) = gridcore::sheet::sheet_name_error(requested) {
+        return Err(format!("{verb}: {why}"));
     }
-    let mut n = 1;
-    loop {
-        n += 1;
-        let candidate = format!("{base} {n}");
-        if wb.sheet_index(&candidate).is_none() {
-            return candidate;
-        }
-    }
+    Ok(wb.free_sheet_name(requested))
 }
 
 /// An array of header-name strings (`rows`/`cols`), defaulting to empty when
@@ -4383,8 +4403,9 @@ fn ctl_names_arg(args: &json::Json, key: &str) -> Vec<String> {
 }
 
 /// A default pivot-sheet name: `Pivot1`, `Pivot2`, … — unique among
-/// existing sheet names. Distinct pattern from `ctl_unique_sheet_name`'s
-/// "Sheet"/"Sheet 2" (no space before the number) — Wave-3's convention for
+/// existing sheet names. Distinct pattern from
+/// `gridcore::sheet::Workbook::free_sheet_name`'s "Sheet"/"Sheet 2" (no space
+/// before the number) — Wave-3's convention for
 /// agent-created pivot sheets. Mirrors xlsxy control.rs's
 /// `unique_pivot_name`.
 fn ctl_unique_pivot_name(wb: &gridcore::sheet::Workbook) -> String {
@@ -7460,6 +7481,74 @@ mod tests {
         assert_eq!(a1, Some(number(1.0)));
     }
 
+    /// #2153 r2: a sheet keeps the name it was loaded with, which Excel's
+    /// rules may refuse (the xlsx loader keeps names as the file had them):
+    /// removed and restored, it comes back under that very name, with no
+    /// debug panic from `add_sheet`, which asserts only that no sheet has it.
+    #[test]
+    fn ctl_sheet_restore_removed_puts_back_a_loaded_name_excels_rules_refuse() {
+        let long = "w".repeat(32);
+        for loaded in ["Data\tQ1", "a/b", "'x", long.as_str()] {
+            let mut pkg = new_xlsx();
+            let at = pkg.add_sheet("Placeholder");
+            pkg.workbook.sheets[at].name = loaded.to_string();
+            pkg.workbook.sheets[at].set_cell(0, 0, Cell::number(7.0));
+            let mut s = Session::open(&save_xlsx(&pkg)).expect("open");
+            assert_eq!(s.pkg.workbook.sheets[1].name, loaded, "loaded as it was");
+            assert!(gridcore::sheet::sheet_name_error(loaded).is_some());
+            let removed = s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":1}}"#);
+            assert!(
+                removed.contains("\"removed\":true"),
+                "{loaded:?}: {removed}"
+            );
+            let out = s.ctl(&extract_inverse(&removed));
+            assert!(out.contains("\"ok\":true"), "{loaded:?}: {out}");
+            assert_eq!(sheet_order(&s), ["Sheet1", loaded]);
+            let a1 = s.pkg.workbook.sheets[1].cell(0, 0).map(|c| c.value.clone());
+            assert_eq!(a1, Some(number(7.0)), "{loaded:?}");
+        }
+    }
+
+    /// #2153 r1: a sheet added under a removed one's name in a case that
+    /// differs outside ASCII is that name to Excel: the restore is refused
+    /// before anything changes, never a second `Données`/`DONNÉES`.
+    #[test]
+    fn ctl_sheet_restore_removed_refuses_a_live_name_matching_beyond_ascii() {
+        let mut s = abc_session();
+        s.dispatch("sheet\trename\t1\tDonnées");
+        let removed = s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Données"}}"#);
+        let added = s.ctl(r#"{"verb":"sheet.add","args":{"name":"DONNÉES"}}"#);
+        assert!(added.contains("\"name\":\"DONNÉES\""), "{added}");
+        let before = (sheet_order(&s), stash_order(&s));
+        let out = s.ctl(&extract_inverse(&removed));
+        assert!(
+            out.contains(r#"cannot restore \"Données\": a sheet with that name already exists"#),
+            "{out}"
+        );
+        assert_eq!((sheet_order(&s), stash_order(&s)), before);
+    }
+
+    /// #2153 r1: stashes `Données` then `DONNÉES` (added and removed after
+    /// it) are one name, so the later one is a ghost as `a` is for `A`:
+    /// the first comes back with no panic and the ghost stays stashed.
+    #[test]
+    fn ctl_sheet_restore_removed_a_ghost_matches_beyond_ascii() {
+        let mut s = abc_session();
+        s.dispatch("sheet\trename\t1\tDonnées");
+        let removed = s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"Données"}}"#);
+        s.ctl(r#"{"verb":"sheet.add","args":{"name":"DONNÉES"}}"#);
+        s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":"DONNÉES"}}"#);
+        assert_eq!(stash_order(&s), ["Données", "DONNÉES"]);
+        let out = s.ctl(&extract_inverse(&removed));
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert_eq!(sheet_order(&s), ["Sheet1", "Données", "B", "C"]);
+        assert_eq!(stash_order(&s), ["DONNÉES"]);
+        // The ghost is refused while `Données` is live.
+        let out = restore(&mut s, "DONNÉES");
+        assert!(out.contains("already exists"), "{out}");
+        assert_eq!(sheet_order(&s), ["Sheet1", "Données", "B", "C"]);
+    }
+
     #[test]
     fn ctl_sheet_restore_removed_a_same_name_stash_above_another_kind_is_still_refused() {
         // [A, B, A(imported)]: B sits between, so the imported A would have
@@ -8987,7 +9076,196 @@ mod tests {
     fn ctl_sheet_rename_rejects_invalid_names() {
         let mut s = Session::open(&sample_xlsx()).expect("open");
         let out = s.ctl(r#"{"verb":"sheet.rename","args":{"sheet":0,"name":"a/b"}}"#);
-        assert!(out.contains("invalid sheet name"), "{out}");
+        assert!(out.contains("\"ok\":false"), "{out}");
+        assert!(out.contains("Sheet name cannot contain"), "{out}");
+    }
+
+    /// The sheets' names, what an add or rename refused must leave as it
+    /// was, with the undo and redo depths, `dirty` and the `edits` count.
+    fn sheet_state(s: &Session) -> (Vec<String>, usize, usize, bool, u64) {
+        let names = s
+            .pkg
+            .workbook
+            .sheets
+            .iter()
+            .map(|x| x.name.clone())
+            .collect();
+        (names, s.undo.len(), s.redo.len(), s.dirty, s.edits)
+    }
+
+    /// #2153: `sheet.rename` refuses Excel's names (length, apostrophes too)
+    /// and a name another sheet has in any case, with the reason, before
+    /// any step is pushed.
+    #[test]
+    fn ctl_sheet_rename_refuses_names_excel_refuses_or_taken() {
+        let mut s = two_sheet_session();
+        s.pkg.workbook.sheets[0].name = "Données".into();
+        let before = sheet_state(&s);
+        let long = "r".repeat(32);
+        for (name, why) in [
+            ("DONNÉES", gridcore::sheet::SHEET_NAME_TAKEN),
+            ("'x", "Sheet name cannot start or end with an apostrophe"),
+            (long.as_str(), "Sheet name is longer than 31 characters"),
+        ] {
+            let out = s.ctl(&format!(
+                r#"{{"verb":"sheet.rename","args":{{"sheet":1,"name":"{name}"}}}}"#
+            ));
+            assert!(out.contains("\"ok\":false"), "{name}: {out}");
+            assert!(out.contains(why), "{name}: {out}");
+            assert_eq!(sheet_state(&s), before, "{name}");
+        }
+        // A case-only rename of its own name is a rename.
+        let out = s.ctl(r#"{"verb":"sheet.rename","args":{"sheet":0,"name":"DONNÉES"}}"#);
+        assert!(out.contains("\"ok\":true"), "{out}");
+        assert_eq!(s.pkg.workbook.sheets[0].name, "DONNÉES");
+    }
+
+    /// #2153: the webview's typed name on `sheet\tadd` is checked as Excel
+    /// checks it, trimmed, and taken in any case: a refused add changes
+    /// nothing, says why, and the saved workbook keeps its own names only.
+    #[test]
+    fn dispatch_sheet_add_refuses_a_taken_or_refused_name() {
+        let mut s = two_sheet_session();
+        let before = sheet_state(&s);
+        let long = "a".repeat(32);
+        for (name, why) in [
+            ("SHEET2", gridcore::sheet::SHEET_NAME_TAKEN),
+            (" sheet1 ", gridcore::sheet::SHEET_NAME_TAKEN),
+            ("A:B", "Sheet name cannot contain [ ] : * ? / \\"),
+            ("'x", "Sheet name cannot start or end with an apostrophe"),
+            (long.as_str(), "Sheet name is longer than 31 characters"),
+            ("   ", "Sheet name is empty"),
+        ] {
+            s.err = None;
+            s.dispatch(&format!("sheet\tadd\t{name}"));
+            assert_eq!(s.err.as_deref(), Some(why), "{name:?}");
+            assert_eq!(sheet_state(&s), before, "{name:?}");
+            assert_eq!(s.active, 0, "{name:?}");
+        }
+        let re = gridcore::xlsx::load_xlsx(&s.save()).unwrap();
+        let names: Vec<&str> = re.workbook.sheets.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["Sheet1", "Sheet2"]);
+        // A name Excel takes is added, trimmed.
+        s.dispatch("sheet\tadd\t Bob's Data ");
+        assert_eq!(s.pkg.workbook.sheets[2].name, "Bob's Data");
+    }
+
+    /// #2153: the "+" button sends `sheet\tadd` with no name and gets the
+    /// next free `SheetN`, never a duplicate (it used to send
+    /// `Sheet<count+1>`, taken once a middle sheet was deleted).
+    #[test]
+    fn dispatch_sheet_add_with_no_name_adds_the_next_free_sheetn() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("sheet\tadd");
+        assert_eq!(s.err, None);
+        s.dispatch("sheet\tadd\t");
+        let names: Vec<&str> = s
+            .pkg
+            .workbook
+            .sheets
+            .iter()
+            .map(|x| x.name.as_str())
+            .collect();
+        assert_eq!(names, ["Sheet1", "Sheet2", "Sheet3"]);
+        assert_eq!(s.undo.len(), 2);
+        assert_eq!(s.active, 2);
+        // Sheet2 goes: two sheets, and "Sheet3" is still taken.
+        s.dispatch("undo");
+        s.dispatch("undo");
+        s.dispatch("sheet\tadd\tSheet3");
+        s.dispatch("sheet\trename\t0\tFirst");
+        s.dispatch("sheet\tadd");
+        let names: Vec<&str> = s
+            .pkg
+            .workbook
+            .sheets
+            .iter()
+            .map(|x| x.name.as_str())
+            .collect();
+        assert_eq!(names, ["First", "Sheet3", "Sheet4"]);
+    }
+
+    /// #2153: the webview's rename is checked as Excel checks it, trimmed,
+    /// and a name another sheet has in any case is refused: no step, the
+    /// reason in `err`. A case-only rename of the sheet's own name holds.
+    #[test]
+    fn dispatch_sheet_rename_refuses_names_excel_refuses_or_taken() {
+        let mut s = two_sheet_session();
+        let before = sheet_state(&s);
+        for (i, name, why) in [
+            (1, "A:B", "Sheet name cannot contain [ ] : * ? / \\"),
+            (1, "SHEET1", gridcore::sheet::SHEET_NAME_TAKEN),
+            (1, " Sheet1", gridcore::sheet::SHEET_NAME_TAKEN),
+            (0, "'x", "Sheet name cannot start or end with an apostrophe"),
+            (0, "", "Sheet name is empty"),
+        ] {
+            s.err = None;
+            s.dispatch(&format!("sheet\trename\t{i}\t{name}"));
+            assert_eq!(s.err.as_deref(), Some(why), "{name:?}");
+            assert_eq!(sheet_state(&s), before, "{name:?}");
+        }
+        s.err = None;
+        s.dispatch("sheet\trename\t1\tSHEET2");
+        assert_eq!(s.err, None);
+        assert_eq!(s.pkg.workbook.sheets[1].name, "SHEET2");
+        s.dispatch("sheet\trename\t1\t Data ");
+        assert_eq!(s.pkg.workbook.sheets[1].name, "Data");
+    }
+
+    /// #2153: `sheet.add` and `sheet.import-csv` refuse a name Excel refuses
+    /// and dedupe a taken one (in any case) within 31 characters.
+    #[test]
+    fn ctl_sheet_add_and_import_refuse_excels_names_and_dedupe_within_31() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        let before = sheet_state(&s);
+        for verb in ["sheet.add", "sheet.import-csv"] {
+            let out = s.ctl(&format!(
+                r#"{{"verb":"{verb}","args":{{"name":"a/b","text":"x,y\n1,2\n"}}}}"#
+            ));
+            assert!(out.contains("\"ok\":false"), "{verb}: {out}");
+            assert!(
+                out.contains(&format!("{verb}: Sheet name cannot contain")),
+                "{verb}: {out}"
+            );
+            assert_eq!(sheet_state(&s), before, "{verb}");
+        }
+        let long = "L".repeat(31);
+        s.ctl(&format!(
+            r#"{{"verb":"sheet.add","args":{{"name":"{long}"}}}}"#
+        ));
+        let out = s.ctl(&format!(
+            r#"{{"verb":"sheet.import-csv","args":{{"name":"{}","text":"x\n"}}}}"#,
+            long.to_lowercase()
+        ));
+        let want = format!("{} 2", "l".repeat(29));
+        assert!(out.contains(&format!("\"name\":\"{want}\"")), "{out}");
+        assert_eq!(s.pkg.workbook.sheets[2].name, want);
+    }
+
+    /// #2153: `pivot.create`'s sheet name follows Excel's rules (length,
+    /// apostrophes too), with the reason; nothing is added.
+    #[test]
+    fn ctl_pivot_create_refuses_a_sheet_name_excel_refuses() {
+        let mut s = Session::open(&new_workbook()).expect("open");
+        pivot_fixture(&mut s);
+        let sheets = s.pkg.workbook.sheets.len();
+        let long = "p".repeat(32);
+        for bad in [long.as_str(), "'x'", "a?b", ""] {
+            let out = s.ctl(&pivot_create_args(Some(bad)));
+            let why = gridcore::sheet::sheet_name_error(bad).unwrap();
+            assert!(
+                out.contains(&format!("pivot.create: {why}")),
+                "{bad:?}: {out}"
+            );
+            assert_eq!(s.pkg.workbook.sheets.len(), sheets, "{bad:?}");
+            assert!(s.pkg.workbook.pivots.is_empty(), "{bad:?}");
+        }
+        let first = s.pkg.workbook.sheets[0].name.to_uppercase();
+        let out = s.ctl(&pivot_create_args(Some(&first)));
+        assert!(
+            out.contains(&format!("sheet name '{first}' is already taken")),
+            "{out}"
+        );
     }
 
     // -- row.* / col.*: one wasm-undo-stack (Structural) group -------------

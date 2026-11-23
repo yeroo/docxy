@@ -12,21 +12,55 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   `field-read sheet-tab-rename` reports the caret and `[0,len]` selection.
   Click-to-place and Shift+arrows are not there.
 
-## Sheet names Excel refuses on rename (#2115)
+## Sheet names Excel refuses on rename and add (#2115, #2153)
 
-- `gridcore::sheet::sheet_name_error(name)` is the one rule, with the reason a
+- `gridcore::sheet::sheet_name_error(name)` is the rule, with the reason a
   host shows: empty, over `SHEET_NAME_MAX` (31) characters, any of
-  `SHEET_NAME_FORBIDDEN` (`[ ] : * ? / \`), or an apostrophe first or last
-  (`Bob's Data` is fine). A taken name is the caller's check.
-  `legacy::valid_sheet_names` cleans imported names by the same constants.
-- `XlsxPackage::rename_sheet` declines such a name (so `close::commit_rename_buffer`
+  `SHEET_NAME_FORBIDDEN` (`[ ] : * ? / \`), a control character
+  (`sheet_name_control`: `char::is_control`, tab and line breaks too, and
+  U+FFFE/U+FFFF; the save drops what XML 1.0 forbids, so `Data\u{1}` would
+  save as a second `Data`, #2153), or an apostrophe first or last (`Bob's
+  Data` is fine). `legacy::valid_sheet_names` cleans imported names by the
+  same rules (`_` for a forbidden or control character).
+- `Workbook::sheet_name_refused(name, except)` adds the taken check
+  (`SHEET_NAME_TAKEN`): another sheet's name folded with `to_lowercase()`,
+  not ASCII only, as Excel compares (`Données` and `DONNÉES` are one name,
+  and a file holding both is repaired). `except` is the sheet a rename
+  renames, so a case-only rename holds. Every add or rename of an outside
+  name goes through it (#2153), xlcomshim's `Worksheet.Name` put too (a
+  refused name is `E_FAIL`); `sheet_names_match` is the same fold for two
+  names, which gridwasm's `sheet.restore-removed` uses between stashes. `Workbook::sheet_index` and
+  `next_sheet_name` still fold ASCII only (formula resolution).
+- `SheetPackage::add_sheet`: a host checks an outside name with
+  `sheet_name_refused` first and says why. Debug builds assert only that no
+  sheet has the name (`sheet_name_taken`), which every caller must meet, so a
+  path that skips the taken check fails its tests; code-chosen names
+  (`SheetN`, `PivotN`) pick a free one themselves. Excel's rules are not
+  asserted: gridwasm's `sheet.restore-removed` puts a sheet back under the
+  name it was loaded with, which the xlsx loader keeps as it is (`Data<tab>Q1`,
+  `a/b`); only the legacy import cleans names.
+- Hosts that add a sheet from an outside name: xlsxy's AddSheet prompt (the
+  reason on the status line), `sheet.add` and `sheet.import-csv`/`-text`
+  (`"<verb>: <reason>"` for a name Excel refuses; a taken one is deduplicated
+  by `Workbook::free_sheet_name`, `Name 2`… cut to fit 31 characters, the
+  verbs' documented contract), and `pivot.create` in both xlsxy and gridwasm
+  (`"pivot.create: <reason>"`, or its documented `sheet name '<name>' is
+  already taken`).
+- Opening a `.csv`/`.tsv`/`.prn` in xlsxy names the sheet after the file
+  stem through `legacy::clean_sheet_name` (the import's cleaning: `_` for a
+  forbidden character, cut to 31, apostrophes trimmed off its ends), since a
+  `.tsv` is rebound to an `.xlsx` that would otherwise hold `a[1]`.
+- gridwasm (the VS Code tab): `sheet\tadd` and `sheet\trename` trim the
+  webview's typed text and check it; a refused one sets `err` (the cell-ref
+  tooltip) and pushes no step and no `edits` bump. `sheet\tadd` with no name
+  (the "+" button) adds `next_sheet_name()`. The ctl `sheet.rename` checks
+  first and errors with the reason.
+- `XlsxPackage::rename_sheet` declines a name `sheet_name_refused` refuses (so `close::commit_rename_buffer`
   and its exit path change nothing). The suite's Enter on the rename bar with a
   changed, refused name sets the status line to the reason and closes the bar;
   Excel keeps the bar open behind a message box (a known deviation).
 - xlsxy's `App::rename_sheet` returns the reason as `Err`, which the Rename
   sheet prompt and the `sheet.rename` control show.
-- Add paths do not check yet: `XlsxPackage::add_sheet`, xlsxy's AddSheet
-  prompt and `pivot.create`'s sheet name, gridwasm's `rename` message.
 
 ## Fixed-denominator fractions and fractional seconds (#2115)
 

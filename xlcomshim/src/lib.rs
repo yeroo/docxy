@@ -267,6 +267,24 @@ mod win {
             }
         }
 
+        /// `Worksheet.Name = name`: renamed through
+        /// [`SheetPackage::rename_sheet`] (trimmed; formulas naming the
+        /// sheet follow, and `workbook.xml`), which refuses a name Excel
+        /// refuses or another sheet has in any case (#2153): that, or no
+        /// such sheet, writes nothing and is `Err(E_FAIL)`, the shim's
+        /// failed-put answer (Excel raises run-time error 1004).
+        fn rename(&mut self, sheet: usize, name: &str) -> std::result::Result<(), HRESULT> {
+            if !self.pkg.rename_sheet(sheet, name) {
+                log(&format!("Name put refused: {name:?}"));
+                return Err(E_FAIL);
+            }
+            // The engine holds the formulas by their old text.
+            self.engine = book_engine(&self.pkg);
+            self.dirty = true;
+            self.saved = false;
+            Ok(())
+        }
+
         fn set(&mut self, sheet: usize, r: u32, c: u32, cell: Cell) {
             self.engine
                 .set_cell(&mut self.pkg.workbook, (sheet, r, c), cell);
@@ -779,16 +797,12 @@ mod win {
     unsafe fn vt_ws_name_put(t: &Worksheet_Impl, v: *const u16) -> HRESULT {
         let name = unsafe { PCWSTR(v).to_string() }.unwrap_or_default();
         let (book, sheet) = (t.book, t.sheet);
-        reg(|r| {
-            if let Some(s) = r
-                .books
-                .get_mut(book)
-                .and_then(|b| b.pkg.workbook.sheets.get_mut(sheet))
-            {
-                s.name = name;
-            }
-        });
-        S_OK
+        let done = reg(|r| r.books.get_mut(book).map(|b| b.rename(sheet, &name)));
+        match done {
+            Some(Ok(())) => S_OK,
+            Some(Err(hr)) => hr,
+            None => DISP_E_BADINDEX,
+        }
     }
     unsafe fn vt_ws_cells(t: &Worksheet_Impl, ret: *mut *mut c_void) -> HRESULT {
         let rng: IRange = Range {
@@ -1551,15 +1565,13 @@ mod win {
                     110 => {
                         if is_put(wflags) {
                             if let Some(name) = arg_string(params, 0) {
-                                reg(|r| {
-                                    if let Some(s) = r
-                                        .books
-                                        .get_mut(book)
-                                        .and_then(|b| b.pkg.workbook.sheets.get_mut(sheet))
-                                    {
-                                        s.name = name;
-                                    }
-                                });
+                                let done =
+                                    reg(|r| r.books.get_mut(book).map(|b| b.rename(sheet, &name)));
+                                match done {
+                                    Some(Ok(())) => {}
+                                    Some(Err(hr)) => return Err(hr.into()),
+                                    None => return Err(DISP_E_BADINDEX.into()),
+                                }
                             }
                         } else {
                             let name = reg(|r| {
@@ -2750,6 +2762,37 @@ mod win {
             assert!(book.pkg.has_macro_sheets());
             assert_eq!(book.pkg.workbook.sheets.len(), 2, "the live sheet count");
             assert_eq!(book.sheet_name(1), "Macro1");
+        }
+
+        /// #2153: `Worksheet.Name = …` renames as Excel does: a name Excel
+        /// refuses, or another sheet's in any case, is a failed put and
+        /// changes nothing; a name it takes renames the sheet, and a formula
+        /// naming the old sheet follows.
+        #[test]
+        fn name_put_refuses_names_excel_refuses_and_renames_references() {
+            let mut book = Book::new();
+            book.pkg.add_sheet("Data");
+            book.pkg.add_sheet("Données");
+            book.set(0, 0, 0, Cell::formula("Data!A1+1"));
+            for bad in ["a/b", "SHEET1", "DONNÉES", "'x", ""] {
+                assert_eq!(book.rename(1, bad), Err(E_FAIL), "{bad:?}");
+                assert_eq!(book.pkg.workbook.sheets[1].name, "Data", "{bad:?}");
+            }
+            assert_eq!(book.rename(5, "Other"), Err(E_FAIL));
+            book.saved = true;
+            assert_eq!(book.rename(1, " Figures "), Ok(()));
+            assert_eq!(book.pkg.workbook.sheets[1].name, "Figures");
+            assert_eq!(
+                book.pkg.workbook.sheets[0]
+                    .cell(0, 0)
+                    .unwrap()
+                    .formula
+                    .as_deref(),
+                Some("Figures!A1+1")
+            );
+            assert!(!book.saved);
+            let saved = load_xlsx(&gridcore::xlsx::save_xlsx(&book.pkg)).unwrap();
+            assert_eq!(saved.workbook.sheets[1].name, "Figures");
         }
 
         /// #1723: `SaveAs "x.xlsx", 51` evaluates a clock formula that reads
