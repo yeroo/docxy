@@ -473,6 +473,22 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   `w:ins`/`w:del`: deleted, it is skipped; inserted, `emit_wrapped` lifts it
   out like a marker. Both report `CompareSkip::Object`.
 
+## An alignment tab sharing a field marker's run (#1463)
+
+- #768's rule removes a run holding a `w:ptab` that a delete spans. A run
+  that also holds field code (`load::is_field_code_raw`: a loose field's
+  marker run, or an orphan marker) loses only its `w:ptab`s instead
+  (`editor::spanned_object`, `split_marker_object_run`, on the run's direct
+  children through `field::children`), so the field keeps its begin and
+  end. Tracked, the tabs go in a `w:del` of their own, in a run with the
+  original start tag and `w:rPr`, beside the marker's run on the side the
+  first tab was on (`drop_or_record_objects`). A marker run that cannot be
+  split (malformed, anything after its close) stays whole. A drawing whose
+  own content holds markers goes whole, as before.
+- A field in one paragraph whose marker run holds a `w:ptab` collapses into
+  one `Inline::Field` (`is_clean_code_run` does not list `w:ptab`), so the
+  tab is hidden in it and no delete splits it.
+
 ## Plain text into a document: only characters XML can hold (#1993)
 
 - `Clip::from_text` (every plain-text paste: Paste Text Only, the suite's
