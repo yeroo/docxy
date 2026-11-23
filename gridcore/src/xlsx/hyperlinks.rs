@@ -12,7 +12,7 @@ use opccore::xml::{Event, XmlParser};
 use super::{
     EMPTY_RELS, OoxmlNs, append_all_to_worksheet_child, decode, element_children, esc_attr,
     parse_rels, parse_rels_mode, put_worksheet_child, rels_part_name, rels_takes,
-    remove_worksheet_child, start_tag, worksheet_child_span, worksheet_takes,
+    remove_worksheet_child, splice_rels, start_tag, worksheet_child_span, worksheet_takes,
 };
 use crate::sheet::{
     Sheet, cell_name, hyperlink_cells as link_cells, parse_cell_name, parse_range_name,
@@ -571,11 +571,10 @@ impl ExternalRels {
         let (Some(xml), false) = (self.xml, self.added.is_empty()) else {
             return;
         };
-        let xml = xml.replacen(
-            "</Relationships>",
-            &format!("{}</Relationships>", self.added),
-            1,
-        );
+        // `rels_takes` let only a part it can splice into give `xml`.
+        let Some(xml) = splice_rels(&xml, &self.added) else {
+            return;
+        };
         if self.exists {
             if let Some(p) = parts.iter_mut().find(|(n, _)| *n == self.rels_part) {
                 p.1 = xml.into_bytes();

@@ -377,13 +377,28 @@ fn a_broken_rels_part_takes_no_new_relationship() {
     let mut pkg = book(
         &ws,
         Some(
-            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"/>",
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
         ),
     );
     link(&mut pkg, "A1", "https://example.com");
     let re = resaved(&pkg);
     assert!(!text(&re, SHEET).contains("r:id"));
     assert!(re.workbook.sheets[0].hyperlinks.is_empty());
+}
+
+/// #831: an empty rels root written self-closed is opened for the link.
+#[test]
+fn a_self_closed_rels_part_takes_a_new_link() {
+    let ws = format!("<worksheet xmlns=\"{SML}\"><sheetData></sheetData></worksheet>");
+    let mut pkg = book(
+        &ws,
+        Some(
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"/>",
+        ),
+    );
+    link(&mut pkg, "A1", "https://example.com");
+    let re = resaved(&pkg);
+    assert_links_kept(&pkg, &re);
 }
 
 /// #707 r6 M2's bound, for links added: 20,000 new ones save in linear time.
