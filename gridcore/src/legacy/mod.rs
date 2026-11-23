@@ -1018,7 +1018,8 @@ fn write_external_links(pkg: &mut SheetPackage, links: &[ExternalLink]) {
 }
 
 /// `raw` (a file's stem, say) as a name Excel takes for a workbook's only
-/// sheet: [`valid_sheet_names`] on it alone, so `[]:*?/\` become `_`, it is
+/// sheet: [`valid_sheet_names`] on it alone, so `[]:*?/\` and control
+/// characters become `_`, it is
 /// cut to 31 characters, apostrophes are trimmed off its ends, and an empty
 /// result is `Sheet1` (#2153).
 pub fn clean_sheet_name(raw: &str) -> String {

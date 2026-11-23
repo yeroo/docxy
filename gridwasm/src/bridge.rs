@@ -7481,6 +7481,34 @@ mod tests {
         assert_eq!(a1, Some(number(1.0)));
     }
 
+    /// #2153 r2: a sheet keeps the name it was loaded with, which Excel's
+    /// rules may refuse (the xlsx loader keeps names as the file had them):
+    /// removed and restored, it comes back under that very name, with no
+    /// debug panic from `add_sheet`, which asserts only that no sheet has it.
+    #[test]
+    fn ctl_sheet_restore_removed_puts_back_a_loaded_name_excels_rules_refuse() {
+        let long = "w".repeat(32);
+        for loaded in ["Data\tQ1", "a/b", "'x", long.as_str()] {
+            let mut pkg = new_xlsx();
+            let at = pkg.add_sheet("Placeholder");
+            pkg.workbook.sheets[at].name = loaded.to_string();
+            pkg.workbook.sheets[at].set_cell(0, 0, Cell::number(7.0));
+            let mut s = Session::open(&save_xlsx(&pkg)).expect("open");
+            assert_eq!(s.pkg.workbook.sheets[1].name, loaded, "loaded as it was");
+            assert!(gridcore::sheet::sheet_name_error(loaded).is_some());
+            let removed = s.ctl(r#"{"verb":"sheet.remove","args":{"sheet":1}}"#);
+            assert!(
+                removed.contains("\"removed\":true"),
+                "{loaded:?}: {removed}"
+            );
+            let out = s.ctl(&extract_inverse(&removed));
+            assert!(out.contains("\"ok\":true"), "{loaded:?}: {out}");
+            assert_eq!(sheet_order(&s), ["Sheet1", loaded]);
+            let a1 = s.pkg.workbook.sheets[1].cell(0, 0).map(|c| c.value.clone());
+            assert_eq!(a1, Some(number(7.0)), "{loaded:?}");
+        }
+    }
+
     /// #2153 r1: a sheet added under a removed one's name in a case that
     /// differs outside ASCII is that name to Excel: the restore is refused
     /// before anything changes, never a second `Données`/`DONNÉES`.

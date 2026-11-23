@@ -10418,15 +10418,20 @@ impl SheetPackage {
     /// Append a blank sheet named `name`; returns its index. Wires up the
     /// part, content type, relationship, and the workbook.xml entry.
     ///
-    /// `name` must pass [`crate::sheet::Workbook::sheet_name_refused`]`(name,
-    /// None)`: a host checks an outside name first and says why it refuses
-    /// it, since Excel repairs a file whose sheet names break its rules or
-    /// repeat in another case (#2153). Debug builds assert it.
+    /// A host checks an outside name with
+    /// [`crate::sheet::Workbook::sheet_name_refused`]`(name, None)` first and
+    /// says why it refuses it, since Excel repairs a file whose sheet names
+    /// break its rules or repeat in another case (#2153). Debug builds assert
+    /// only that no sheet has the name
+    /// ([`crate::sheet::Workbook::sheet_name_taken`]), which every caller
+    /// must meet: a sheet put back under the name it was loaded with
+    /// (gridwasm's `sheet.restore-removed`) may keep one Excel's rules would
+    /// refuse, as the file it came from held it.
     pub fn add_sheet(&mut self, name: &str) -> usize {
         debug_assert!(
-            self.workbook.sheet_name_refused(name, None).is_none(),
-            "add_sheet({name:?}): {:?}",
-            self.workbook.sheet_name_refused(name, None)
+            !self.workbook.sheet_name_taken(name, None),
+            "add_sheet({name:?}): {}",
+            crate::sheet::SHEET_NAME_TAKEN
         );
         // Unused part name xl/worksheets/sheetN.xml.
         let mut n = 1;
@@ -11721,8 +11726,8 @@ impl SheetPackage {
     /// (in any case, [`crate::sheet::Workbook::sheet_name_refused`]) with
     /// another sheet, an out-of-range sheet, and a name Excel refuses
     /// ([`crate::sheet::sheet_name_error`]: empty, over 31 characters,
-    /// `[ ] : * ? / \`, an apostrophe first or last). Returns whether the
-    /// rename happened.
+    /// `[ ] : * ? / \`, a control character (tab and line breaks too), an
+    /// apostrophe first or last). Returns whether the rename happened.
     pub fn rename_sheet(&mut self, idx: usize, name: &str) -> bool {
         let name = name.trim();
         if idx >= self.workbook.sheets.len()
@@ -13211,13 +13216,6 @@ mod tests {
         let mut pkg = new_xlsx();
         pkg.add_sheet("Données");
         pkg.add_sheet("DONNÉES");
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "Sheet name cannot contain")]
-    fn add_sheet_debug_asserts_on_a_name_excel_refuses() {
-        new_xlsx().add_sheet("Sheet/1");
     }
 
     #[test]

@@ -31,10 +31,14 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
   refused name is `E_FAIL`); `sheet_names_match` is the same fold for two
   names, which gridwasm's `sheet.restore-removed` uses between stashes. `Workbook::sheet_index` and
   `next_sheet_name` still fold ASCII only (formula resolution).
-- `SheetPackage::add_sheet` takes only a name that passes it: a host checks
-  an outside name first and says why. Debug builds assert it, so a path that
-  skips the check fails its tests; code-chosen names (`SheetN`, `PivotN`)
-  pick a free one themselves.
+- `SheetPackage::add_sheet`: a host checks an outside name with
+  `sheet_name_refused` first and says why. Debug builds assert only that no
+  sheet has the name (`sheet_name_taken`), which every caller must meet, so a
+  path that skips the taken check fails its tests; code-chosen names
+  (`SheetN`, `PivotN`) pick a free one themselves. Excel's rules are not
+  asserted: gridwasm's `sheet.restore-removed` puts a sheet back under the
+  name it was loaded with, which the xlsx loader keeps as it is (`Data<tab>Q1`,
+  `a/b`); only the legacy import cleans names.
 - Hosts that add a sheet from an outside name: xlsxy's AddSheet prompt (the
   reason on the status line), `sheet.add` and `sheet.import-csv`/`-text`
   (`"<verb>: <reason>"` for a name Excel refuses; a taken one is deduplicated
