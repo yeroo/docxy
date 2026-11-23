@@ -279,7 +279,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite as a l
   `document()` with `package()`. A fresh package for a view whose
   document holds a list (after the insert or paste that made it) gets
   `add_markdown_numbering`'s part, defining the lists 1 and 2 the view
-  toggled with no package; a host's own package never does (#2181). The picture cache renews on the package's
+  toggled with no package. This step never touches a package the host
+  gave (Bullets/Numbering and a pasted list still define their list
+  there, `ListIds::define`, #1967/#2087) (#2181). The picture cache renews on the package's
   `parts_stamp`, so the new part draws on the next frame.
 - Paste: the view keeps its own last copy or cut (`clip: Option<DocClip>`,
   with `pictures::capture`'s media, recorded in either mode), as a

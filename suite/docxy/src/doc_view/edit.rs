@@ -289,8 +289,8 @@ fn fresh_package() -> Package {
 /// defines docxy's own lists 1 and 2 when the view's document (`body`)
 /// names a list (#2181): a view with no package toggles those lists
 /// without defining them, and the host exports the document with the
-/// package once it has one. Only for a fresh package: one the host gave
-/// the view is left as it is.
+/// package once it has one. Only for a fresh package: this step leaves
+/// one the host gave the view as it is.
 fn define_own_lists(fresh: &mut Package, body: &[docxcore::model::Block]) {
     if crate::names_a_list(body) {
         fresh.add_markdown_numbering();
@@ -2090,7 +2090,8 @@ mod tests {
     /// list 1, defined nowhere; its first picture makes it a package,
     /// which the host exports the document with, so that package defines
     /// the list. A view with no list gets one without a numbering part, and
-    /// a package the host gave the view is never given one.
+    /// a package the host gave the view is not given one by the picture's
+    /// step.
     #[test]
     fn a_fresh_package_defines_the_views_lists_2181() {
         const NUMBERING: &str = "word/numbering.xml";

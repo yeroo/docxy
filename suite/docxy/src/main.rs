@@ -17543,23 +17543,30 @@ fn blank_base(doc: &Document) -> Package {
 }
 
 /// Whether a paragraph of `blocks` is in a list: one at the top level, in
-/// a table's cell (nested tables too) or in a paragraph's text box, the
-/// stories the editor edits there (#2181). A document with no package
-/// holds only docxy's own lists, which the package made for it must
-/// define wherever they are.
+/// a table's cell (nested tables too) or in a text box
+/// ([`inlines_name_a_list`]), the stories the editor edits there (#2181).
+/// A document with no package holds only docxy's own lists, which the
+/// package made for it must define wherever they are.
 pub(crate) fn names_a_list(blocks: &[Block]) -> bool {
     blocks.iter().any(|b| match b {
-        Block::Paragraph(p) => {
-            p.props.in_list()
-                || p.content
-                    .iter()
-                    .any(|i| matches!(i, Inline::TextBox { blocks, .. } if names_a_list(blocks)))
-        }
+        Block::Paragraph(p) => p.props.in_list() || inlines_name_a_list(&p.content),
         Block::Table(t) => t
             .rows
             .iter()
             .any(|r| r.cells.iter().any(|c| names_a_list(&c.blocks))),
         Block::Raw(_) | Block::SectionProperties(_) => false,
+    })
+}
+
+/// Whether a text box among `content` holds a list item
+/// ([`names_a_list`]), one inside a tracked change or a link's content
+/// included (#2181 r1).
+fn inlines_name_a_list(content: &[Inline]) -> bool {
+    content.iter().any(|i| match i {
+        Inline::TextBox { blocks, .. } => names_a_list(blocks),
+        Inline::Revision { content, .. } => inlines_name_a_list(content),
+        Inline::Hyperlink(h) => inlines_name_a_list(&h.content),
+        _ => false,
     })
 }
 
@@ -36567,7 +36574,30 @@ mod repeat_tests {
                 "a nested cell",
                 vec![in_a_cell_2181(vec![in_a_cell_2181(vec![item()])])],
             ),
-            ("a text box", vec![text_box]),
+            ("a text box", vec![text_box.clone()]),
+            ("a tracked insertion's text box", {
+                let Block::Paragraph(mut p) = text_box.clone() else {
+                    unreachable!()
+                };
+                p.content = vec![Inline::Revision {
+                    kind: docxcore::model::RevisionKind::Insert,
+                    metadata: Default::default(),
+                    raw: String::new(),
+                    content: p.content,
+                    content_changed: false,
+                }];
+                vec![Block::Paragraph(p)]
+            }),
+            ("a link's text box", {
+                let Block::Paragraph(mut p) = text_box.clone() else {
+                    unreachable!()
+                };
+                p.content = vec![Inline::Hyperlink(docxcore::model::Hyperlink {
+                    content: p.content,
+                    ..Default::default()
+                })];
+                vec![Block::Paragraph(p)]
+            }),
             ("a cell's text box", {
                 let Block::Paragraph(p) = item() else {
                     unreachable!()
