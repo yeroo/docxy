@@ -179,10 +179,12 @@ fn add_workbook_rel_creates_a_missing_workbook_rels_part() {
     let mut parts = new_xlsx().parts;
     parts.retain(|(n, _)| n != WB_RELS);
     let rid = add_workbook_rel(&mut parts, &format!("{R}/styles"), "xl/styles.xml");
-    assert_eq!(rid, "rId1");
+    // workbook.xml still names rId1 for its sheet, whose rel went with the
+    // part: the new rel takes the next id.
+    assert_eq!(rid, "rId2");
     assert_eq!(
         parse_rels(&text_of(&parts, WB_RELS)),
-        vec![("rId1".into(), format!("{R}/styles"), "styles.xml".into())]
+        vec![("rId2".into(), format!("{R}/styles"), "styles.xml".into())]
     );
 }
 
@@ -334,4 +336,154 @@ fn strings_survive_a_save_into_a_cut_short_workbook_rels() {
         re.workbook.sheets[0].cell(0, 0).map(|c| &c.value),
         Some(&CellValue::Text("hello".into()))
     );
+}
+
+/// The `r:id` of every `<sheet>` in a workbook part, in order.
+fn sheet_rids(wb: &str) -> Vec<String> {
+    let mut rids = Vec::new();
+    let mut p = XmlParser::new(wb);
+    loop {
+        match p.next() {
+            Event::Start if local(p.name()) == "sheet" => rids.push(decode(p.attr("r:id"))),
+            Event::Eof => return rids,
+            _ => {}
+        }
+    }
+}
+
+/// `rids` are all set and all different.
+fn assert_distinct(rids: &[String], wb: &str) {
+    assert!(rids.iter().all(|r| !r.is_empty()), "{wb}");
+    let mut unique = rids.to_vec();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), rids.len(), "one <sheet> per r:id: {wb}");
+}
+
+/// Add "Added" (A1 = 5) to `parts` loaded, save, reload; the sheet names
+/// and r:ids the next open sees.
+fn add_sheet_and_reload(parts: &[(String, Vec<u8>)]) -> (SheetPackage, Vec<String>) {
+    let mut pkg = load_xlsx(&write_zip(parts)).unwrap();
+    let at = pkg.add_sheet("Added");
+    pkg.workbook.sheets[at].set_cell(0, 0, Cell::number(5.0));
+    let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+    let wb = text_of(&re.parts, "xl/workbook.xml");
+    let rids = sheet_rids(&wb);
+    assert_distinct(&rids, &wb);
+    (re, rids)
+}
+
+fn sheet_names(pkg: &SheetPackage) -> Vec<&str> {
+    pkg.workbook
+        .sheets
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect()
+}
+
+#[test]
+fn a_new_sheet_takes_no_rid_workbook_xml_names_for_a_lost_rel() {
+    // FIX r1 M1: three sheets (rId1, then rId4 and rId5 past styles' rId2
+    // and shared strings' rId3), the workbook rels cut short after rId3.
+    // Sheet2 and Sheet3 are skipped, but workbook.xml still names rId4 and
+    // rId5: a new rel under rId4 would bring Sheet2 back, reading Added's
+    // part.
+    let mut pkg = new_xlsx();
+    pkg.add_sheet("Sheet2");
+    pkg.add_sheet("Sheet3");
+    let mut parts = load_xlsx(&save_xlsx(&pkg)).unwrap().parts;
+    let rels = text_of(&parts, WB_RELS);
+    let third = rels.find("Id=\"rId3\"").unwrap();
+    let cut = rels[third..].find("/>").unwrap() + third + 2;
+    assert!(!rels[..cut].contains("rId4"), "{rels}");
+    assert!(rels[cut..].contains("Id=\"rId4\""), "{rels}");
+    set(&mut parts, WB_RELS, &rels[..cut]);
+    assert_eq!(
+        sheet_names(&load_xlsx(&write_zip(&parts)).unwrap()),
+        ["Sheet1"]
+    );
+
+    let (re, rids) = add_sheet_and_reload(&parts);
+    assert!(!rids[..3].contains(&rids[3]), "{rids:?}");
+    assert_eq!(sheet_names(&re), ["Sheet1", "Added"]);
+    assert_eq!(
+        re.workbook.sheets[1].cell(0, 0).unwrap().value,
+        CellValue::Number(5.0)
+    );
+}
+
+#[test]
+fn a_new_sheet_takes_no_rid_a_dangling_sheet_entry_names() {
+    // FIX r1 P1: workbook.xml names rId4, which no rel defines at all.
+    let mut parts = new_xlsx().parts;
+    let wb = text_of(&parts, "xl/workbook.xml").replace(
+        "</sheets>",
+        "<sheet name=\"Gone\" sheetId=\"2\" r:id=\"rId4\"/></sheets>",
+    );
+    set(&mut parts, "xl/workbook.xml", &wb);
+    let (re, rids) = add_sheet_and_reload(&parts);
+    assert_eq!(rids, ["rId1", "rId4", "rId5"]);
+    assert_eq!(sheet_names(&re), ["Sheet1", "Added"]);
+}
+
+#[test]
+fn add_sheet_skips_a_part_name_a_dangling_rel_spells_absolute() {
+    // FIX r1 m2: `/xl/worksheets/sheet2.xml` names the same part as
+    // `worksheets/sheet2.xml`.
+    let mut parts = new_xlsx().parts;
+    let wb = text_of(&parts, "xl/workbook.xml").replace(
+        "</sheets>",
+        "<sheet name=\"Gone\" sheetId=\"2\" r:id=\"rId5\"/></sheets>",
+    );
+    set(&mut parts, "xl/workbook.xml", &wb);
+    let rels = text_of(&parts, WB_RELS).replace(
+        "</Relationships>",
+        &format!(
+            "<Relationship Id=\"rId5\" Type=\"{R}/worksheet\" Target=\"/xl/worksheets/sheet2.xml\"/></Relationships>"
+        ),
+    );
+    set(&mut parts, WB_RELS, &rels);
+    let mut pkg = load_xlsx(&write_zip(&parts)).unwrap();
+    let at = pkg.add_sheet("Added");
+    assert_eq!(pkg.sheet_parts[at], "xl/worksheets/sheet3.xml");
+    let (re, _) = add_sheet_and_reload(&parts);
+    assert_eq!(sheet_names(&re), ["Sheet1", "Added"]);
+}
+
+#[test]
+fn a_new_table_rel_takes_no_rid_the_worksheet_names_for_a_lost_rel() {
+    // FIX r1 M1, worksheet side: `<drawing r:id="rId2">` lost its rel.
+    let mut pkg = with_a_dangling_table_rel("<drawing r:id=\"rId2\"/>");
+    // The table goes in as table2.xml's rel would: drop the fixture's
+    // table rel so only the drawing's lost id is in play.
+    pkg.set_part(
+        SHEET_RELS,
+        format!("{DECL}<Relationships xmlns=\"{PKG}\"/>").into_bytes(),
+    );
+    pkg.add_table(0, (0, 0, 2, 1), true, "TableStyleMedium2")
+        .expect("add_table");
+    let ws = text_of(&pkg.parts, SHEET);
+    assert!(ws.contains("<tablePart r:id=\"rId3\"/>"), "{ws}");
+    let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+    assert_eq!(re.workbook.tables.len(), 1);
+}
+
+#[test]
+fn a_rel_cut_inside_its_element_relates_nothing() {
+    // FIX r1 m1: the loader never reads the cut element, so its Target
+    // does not count as related, and its rId4 is not handed out again.
+    let mut pkg = with_a_dangling_table_rel("");
+    pkg.set_part(
+        SHEET_RELS,
+        format!(
+            "{DECL}<Relationships xmlns=\"{PKG}\"><Relationship Id=\"rId4\" Type=\"{R}/table\" Target=\"../tables/table1.xml\""
+        )
+        .into_bytes(),
+    );
+    pkg.add_table(0, (0, 0, 2, 1), true, "TableStyleMedium2")
+        .expect("add_table");
+    let re = load_xlsx(&save_xlsx(&pkg)).unwrap();
+    let ws = text_of(&re.parts, SHEET);
+    assert!(ws.contains("<tablePart r:id=\"rId5\"/>"), "{ws}");
+    assert_eq!(re.workbook.tables.len(), 1, "{ws}");
 }

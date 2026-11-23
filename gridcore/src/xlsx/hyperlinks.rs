@@ -11,7 +11,7 @@ use opccore::xml::{Event, XmlParser};
 
 use super::{
     EMPTY_RELS, OoxmlNs, append_all_to_worksheet_child, decode, element_children, esc_attr,
-    parse_rels, parse_rels_mode, put_worksheet_child, rels_part_name, rels_takes,
+    parse_rels, parse_rels_mode, put_worksheet_child, quoted_rids, rels_part_name, rels_takes,
     remove_worksheet_child, splice_rels, start_tag, worksheet_child_span, worksheet_takes,
 };
 use crate::sheet::{
@@ -650,26 +650,6 @@ pub(super) fn prune_orphans(
     }
     out.push_str(&xml[from..]);
     part.1 = out.into_bytes();
-}
-
-/// The `rIdN` values in `xml`'s quoted attribute values (`"rId3"` or
-/// `'rId3'`), whatever attribute holds them.
-fn quoted_rids(xml: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
-    let mut from = 0;
-    while let Some(at) = xml[from..].find("rId") {
-        let start = from + at;
-        from = start + 3;
-        let quote = match xml[..start].chars().next_back() {
-            Some(q @ ('"' | '\'')) => q,
-            _ => continue,
-        };
-        let digits = xml[from..].bytes().take_while(u8::is_ascii_digit).count();
-        if digits > 0 && xml[from + digits..].starts_with(quote) {
-            out.insert(xml[start..from + digits].to_string());
-        }
-    }
-    out
 }
 
 /// Whether `[Content_Types].xml` gives a `.rels` part a type: a `Default`

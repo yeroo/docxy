@@ -613,8 +613,19 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing a sheet's notes,
   rebuilt as a default-namespace part from what `parse_rels_mode` reads in
   it, which is what the loader resolved. A read element without an `Id`
   gets a fresh one, since the loader finds styles and shared strings by
-  type. `next_rid` reads the original text, so an id held only by an
-  unreadable tail is not handed out again.
+  type.
+- The new rId is past every `rIdN` in the rels text, including an
+  unreadable tail, and past every `rIdN` the owner part quotes
+  (`rels_owner`, `quoted_rids`). A `<sheet>` or `<drawing>` whose rel was
+  lost still names its id in the owner's text, so a new rel under that id
+  would rebind it: a skipped sheet would come back reading the new sheet's
+  part.
+- "Already related" (`rel_id_for`) is read as the loader reads the part
+  (`parse_rels_mode`): an element cut inside its start tag relates nothing.
+  Targets compare once resolved against the owner's folder, so
+  `/xl/worksheets/sheet2.xml` and `worksheets/sheet2.xml` are one part.
+  External rels and rels without an `Id` are left out. comments.rs's lookup
+  of its VML rel uses `rel_id_for` too.
 - The writers that can refuse an edit (charts, pivots, hyperlinks) still ask
   `rels_takes` first. It now accepts a self-closed root, and still refuses a
   part that would have to be rebuilt. `ExternalRels::finish` splices through

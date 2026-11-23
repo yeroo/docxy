@@ -10311,25 +10311,74 @@ fn wsdr_prefix(xml: &str) -> &str {
     &xml[open..at]
 }
 
-/// Whether a rels part already names `target`: what [`add_rel`] declines
-/// to relate a second time.
-fn relates(parts: &[(String, Vec<u8>)], rels_part: &str, target: &str) -> bool {
-    parts
-        .iter()
-        .find(|(n, _)| n == rels_part)
-        .is_some_and(|(_, b)| String::from_utf8_lossy(b).contains(&format!("Target=\"{target}\"")))
+/// The `rIdN` values in `xml`'s quoted attribute values (`"rId3"` or
+/// `'rId3'`), whatever attribute holds them.
+pub(crate) fn quoted_rids(xml: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut from = 0;
+    while let Some(at) = xml[from..].find("rId") {
+        let start = from + at;
+        from = start + 3;
+        let quote = match xml[..start].chars().next_back() {
+            Some(q @ ('"' | '\'')) => q,
+            _ => continue,
+        };
+        let digits = xml[from..].bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && xml[from + digits..].starts_with(quote) {
+            out.insert(xml[start..from + digits].to_string());
+        }
+    }
+    out
 }
 
-/// The rId a rels part already gives `target`, if any — what [`add_rel`]
-/// declines to assign a second time.
-fn rel_id_for(parts: &[(String, Vec<u8>)], rels_part: &str, target: &str) -> Option<String> {
+/// The folder a rels part's targets resolve against: its owner's
+/// (`xl/worksheets/_rels/sheet1.xml.rels` → `xl/worksheets`; the package
+/// root's `_rels/.rels` → ``).
+fn rels_dir(rels_part: &str) -> &str {
+    match rels_part.rsplit_once("_rels/") {
+        Some((dir, _)) => dir.trim_end_matches('/'),
+        None => "",
+    }
+}
+
+/// The part a rels part belongs to (`xl/_rels/workbook.xml.rels` →
+/// `xl/workbook.xml`); `None` for the package's own `_rels/.rels`.
+fn rels_owner(rels_part: &str) -> Option<String> {
+    let (_, file) = rels_part.rsplit_once("_rels/")?;
+    let file = file.strip_suffix(".rels").filter(|f| !f.is_empty())?;
+    let dir = rels_dir(rels_part);
+    Some(if dir.is_empty() {
+        file.to_string()
+    } else {
+        format!("{dir}/{file}")
+    })
+}
+
+/// The rId a rels part already gives `target` (written relative to the
+/// part's owner), if any — what [`add_rel`] declines to assign a second
+/// time. Read as the loader reads the part ([`parse_rels_mode`]), so an
+/// element it never reads relates nothing, and any spelling of a target
+/// that resolves to the same part (`/xl/…`, `./…`) is the same target. An
+/// External rel or one without an `Id` names no part a caller could reuse.
+pub(crate) fn rel_id_for(
+    parts: &[(String, Vec<u8>)],
+    rels_part: &str,
+    target: &str,
+) -> Option<String> {
     let xml = parts
         .iter()
         .find(|(n, _)| n == rels_part)
         .map(|(_, b)| String::from_utf8_lossy(b).into_owned())?;
-    let at = xml.find(&format!("Target=\"{target}\""))?;
-    let open = xml[..at].rfind("<Relationship")?;
-    attr_of_tag(&xml[open..], "<Relationship", "Id")
+    let dir = rels_dir(rels_part);
+    let want = resolve_relative(dir, target);
+    parse_rels_mode(&xml)
+        .into_iter()
+        .find(|(id, _, t, mode)| {
+            !id.is_empty()
+                && mode.as_deref() != Some("External")
+                && resolve_relative(dir, t) == want
+        })
+        .map(|(id, ..)| id)
 }
 
 /// Whether a new relationship in `rels_part` goes in without the part being
@@ -10395,11 +10444,6 @@ fn with_rels(xml: &str, added: &str) -> String {
 /// A new, empty rels part.
 pub(crate) const EMPTY_RELS: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"></Relationships>";
 
-/// The next free `rIdN` in a rels part: one past the highest in use.
-pub(crate) fn next_rid(xml: &str) -> String {
-    format!("rId{}", max_rid(xml) + 1)
-}
-
 /// The highest `N` of an `Id="rIdN"` in a rels part, 0 for none.
 fn max_rid(xml: &str) -> u32 {
     let mut max = 0u32;
@@ -10419,18 +10463,32 @@ fn max_rid(xml: &str) -> u32 {
 }
 
 /// Add a relationship to any rels part (created when missing) and return
-/// its rId, which the part then really holds whatever shape it had
-/// ([`with_rels`], #831). "" only when the target is already related: the
-/// caller finds that rel's id with [`rel_id_for`].
+/// its rId: the part as saved holds it, spliced in or rebuilt
+/// ([`with_rels`], #831), and neither the part nor its owner used it
+/// before. "" only when the target is already related ([`rel_id_for`],
+/// which gives the caller that rel's id).
 pub(crate) fn add_rel(
     parts: &mut Vec<(String, Vec<u8>)>,
     rels_part: &str,
     rel_type: &str,
     target: &str,
 ) -> String {
-    if relates(parts, rels_part, target) {
+    if rel_id_for(parts, rels_part, target).is_some() {
         return String::new();
     }
+    // Past every rId the owner quotes too: one whose rel was lost (a part
+    // cut short, a dangling `<sheet>` or `<drawing>`) is still named there,
+    // and a new rel under it would rebind that reference (#831).
+    let owner_max = rels_owner(rels_part)
+        .and_then(|o| parts.iter().find(|(n, _)| *n == o))
+        .map(|(_, b)| {
+            quoted_rids(&String::from_utf8_lossy(b))
+                .iter()
+                .filter_map(|id| id.strip_prefix("rId")?.parse::<u32>().ok())
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
     let at = match parts.iter().position(|(n, _)| n == rels_part) {
         Some(at) => at,
         None => {
@@ -10441,7 +10499,7 @@ pub(crate) fn add_rel(
     let xml = String::from_utf8_lossy(&parts[at].1).into_owned();
     // From the text as it is, so an id only an unreadable tail holds is
     // not handed out again by a rebuild.
-    let rid = next_rid(&xml);
+    let rid = format!("rId{}", max_rid(&xml).max(owner_max) + 1);
     let rel = format!("<Relationship Id=\"{rid}\" Type=\"{rel_type}\" Target=\"{target}\"/>");
     parts[at].1 = with_rels(&xml, &rel).into_bytes();
     rid
@@ -10492,7 +10550,7 @@ impl SheetPackage {
         let part_name = loop {
             let p = format!("xl/worksheets/sheet{n}.xml");
             if self.part(&p).is_none()
-                && !relates(&self.parts, &wb_rels, &relative_target(&wb_dir, &p))
+                && rel_id_for(&self.parts, &wb_rels, &relative_target(&wb_dir, &p)).is_none()
             {
                 break p;
             }

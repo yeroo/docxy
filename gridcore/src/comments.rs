@@ -12,7 +12,7 @@ use crate::formula::EditShift;
 use crate::sheet::{MAX_COLS, MAX_ROWS, cell_name, parse_col};
 use crate::xlsx::{
     SheetPackage, add_content_type_override, add_rel, add_workbook_rel, normalise_eol, parse_rels,
-    put_worksheet_child, remove_worksheet_singleton, resolve_relative, runs_text,
+    put_worksheet_child, rel_id_for, remove_worksheet_singleton, resolve_relative, runs_text,
     worksheet_child_span,
 };
 
@@ -565,7 +565,7 @@ impl SheetPackage {
         );
         // add_rel returns "" when the target already existed; find the rId then.
         let vml_rid = if vml_rid.is_empty() {
-            self.find_rid(&rels_name, &vml_target)
+            rel_id_for(&self.parts, &rels_name, &vml_target).unwrap_or_default()
         } else {
             vml_rid
         };
@@ -940,19 +940,6 @@ impl SheetPackage {
             };
             p.1 = updated.into_bytes();
         }
-    }
-
-    fn find_rid(&self, rels_name: &str, target: &str) -> String {
-        self.part_str(rels_name)
-            .and_then(|xml| {
-                let key = format!("Target=\"{target}\"");
-                let pos = xml.find(&key)?;
-                let head = &xml[..pos];
-                let id_pos = head.rfind("Id=\"")? + 4;
-                let end = head[id_pos..].find('"')? + id_pos;
-                Some(head[id_pos..end].to_string())
-            })
-            .unwrap_or_default()
     }
 
     /// Insert `<legacyDrawing r:id="…"/>` into the worksheet part in a
