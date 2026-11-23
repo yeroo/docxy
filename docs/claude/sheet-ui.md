@@ -311,15 +311,19 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the sheet's tab 
 - A new workbook in terminal xlsxy (a bare launch, a `.txt`/`.prn` before
   its wizard finishes, File › New / Ctrl+N, the start screen's Blank
   workbook, one from XLSTART's `book.xltx`) is bound to `untitled.xlsx` as
-  a name only: `App::untitled`. `run_tui` sets it for a bare launch and a
-  startup import, `new_workbook` sets it, and `install_workbook` (every
-  open) and a successful `save_current` clear it.
+  a name only: `App::untitled`. `App::start` (`run_tui`'s terminal-free
+  startup) sets it for a bare launch and a startup import before the
+  startup workbooks open, `new_workbook` sets it, and `install_workbook`
+  (every open) and a successful `save_current` clear it.
 - Every interactive save (Ctrl+S, `:w`, `:wq`/`:x`, the ribbon's and File's
   Save) asks through `ask_where_to_save_new_workbook`, shared with #614's
   template-born workbook: Save As, prefilled with the bound name, or with
   `untitled_binding`'s next free `untitledN.xlsx` when a file has that name,
-  and `:wq` does not quit. A name typed or kept in Save As is written as
-  chosen, as before. Revert refuses ("nothing to revert: not saved yet").
+  and `:wq` does not quit. F12, the ribbon's Save As and File › Save As
+  offer that same free name (`new_workbook_save_name`, also the prompt's
+  prefill and `default_save_name`), for a template-born workbook too, so
+  Enter on the offered name never replaces a file. A name typed in Save As
+  is written as chosen, as before. Revert refuses ("nothing to revert: not saved yet").
 - The scripted `wb.save` writes without asking, as Excel's `Workbook.Save`
   does, and moves on to a free name the same way (`save_current`'s `taken`
   match), so no save of a new workbook replaces a file the person did not
