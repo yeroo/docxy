@@ -1663,6 +1663,25 @@ pub struct Project {
     /// lands here only when its text does not parse; one that parses is kept
     /// in its field and saved in canonical form (`true` saves as `1`).
     pub options: Vec<(String, String)>,
+    /// Project-level MSPDI leaves that are prefixed or carry attributes
+    /// (`<x:Ext>`, `<Author xsi:nil="true"/>`), which an option's name and
+    /// text cannot hold, as (key, the leaf's XML) in read order (#429). The
+    /// key of an unprefixed leaf is its name. A prefixed leaf, or an
+    /// unprefixed one declaring a default namespace other than MSPDI's, is
+    /// keyed by its expanded name, `{uri}local`, which matches no schema
+    /// slot, plain option or `set_option`, and which two spellings of one
+    /// element share. The XML is rebuilt from the parsed, decoded leaf with
+    /// the save's escaping, which drops the characters XML 1.0 forbids
+    /// (#1120), and carries the valid prefixed namespace declarations in
+    /// scope that the leaf uses and lacked, so a save writes an equivalent
+    /// element. An unprefixed leaf with no default of its own
+    /// takes the saved root's default namespace, as a plain option does. A
+    /// leaf that is malformed, has a name XML refuses or a duplicate
+    /// attribute, uses a prefix bound nowhere valid, or is a prefixed MSPDI
+    /// element, is not kept. A plain value of the same key (an option or a
+    /// modeled field) wins over it even when it was read earlier, and
+    /// [`Project::set_option`] replaces it. Blocks are never kept here.
+    pub raw_options: Vec<(String, String)>,
     /// Outline code definitions (each an MSPDI `<OutlineCode>` from the
     /// project's `<OutlineCodes>` block), in read order.
     pub outline_code_definitions: Vec<XmlElement>,
@@ -1708,6 +1727,7 @@ impl Default for Project {
             hours_per_week: 40.0,
             default_calendar_uid: 1,
             options: Vec::new(),
+            raw_options: Vec::new(),
             outline_code_definitions: Vec::new(),
             wbs_masks: None,
             extended_attribute_definitions: Vec::new(),
@@ -1852,8 +1872,10 @@ impl Project {
     }
 
     /// Set an option's stored text in place (or append it), or remove it
-    /// with `None` (#1587).
+    /// with `None` (#1587). Either way a raw leaf of that name read from the
+    /// file ([`Project::raw_options`]) is dropped: the edit replaces it.
     pub fn set_option(&mut self, name: &str, value: Option<&str>) {
+        self.raw_options.retain(|(n, _)| n != name);
         match (self.options.iter_mut().find(|(n, _)| n == name), value) {
             (Some(slot), Some(v)) => slot.1 = v.to_string(),
             (None, Some(v)) => self.options.push((name.to_string(), v.to_string())),

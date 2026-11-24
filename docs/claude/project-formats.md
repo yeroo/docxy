@@ -147,3 +147,63 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing Project file rea
   `char::is_control` characters from each field, as `LineEdit::paste`
   (`suite/docxy/src/project/cell.rs`) does; a field of only control
   characters is an empty field (it clears Name).
+
+## Prefixed or attributed header leaves (#429)
+
+- `read_mspdi` keeps a prefixed or attributed leaf directly under
+  `<Project>` (`<x:Ext>1</x:Ext>`, `<Author xsi:nil="true"/>`,
+  `<Other xmlns="urn:other">2</Other>`) in `Project::raw_options` as
+  (key, XML), through `read_raw_leaf`. That covers modeled options too:
+  `read_option` stores the leaf and leaves the field alone. An unprefixed
+  leaf is keyed by its name. A prefixed leaf, or an unprefixed one with its
+  own non-MSPDI default `xmlns`, is keyed by its expanded name, `{uri}local`
+  (Clark notation). Such an element is not the header's, so it takes no
+  schema slot, loses to no plain option, and `set_option` leaves it alone.
+  Two spellings of one element (`<x:Ext>` and `<y:Ext>` with one URI) share
+  a key, and the later wins, as for repeats.
+- The leaf is rebuilt from its parsed parts, not copied: its name, its own
+  attributes in source order, then the valid prefixed declarations in scope
+  that it uses and does not make itself. It uses the prefixes of its name
+  and attribute names, and one starting an attribute value or its text,
+  where a QName can hide (`xsi:type="x:T"`). One rule: nothing raw from `XmlParser` is written or compared.
+  `attr_value` normalises, decodes and scrubs every value, declarations
+  included, before the checks, `uri_of` and the output. Values are then
+  written `"`-quoted by `esc_attr_into` (tab, LF and CR as references).
+  Text is decoded as `append_text` does and written with `esc_into`. Both
+  drop the characters #1120 forbids. The permissive parser takes a bare
+  `&`, a `<` in a value or unspaced attributes as they are, so a verbatim
+  copy could save ill-formed XML. The rebuild is an
+  equivalent element, and a second round trip changes nothing.
+- A leaf is dropped, as before #429, when:
+  - it is a block;
+  - a name is not a QName (`is_qname`: XML 1.0's NameStartChar and
+    NameChar ranges), or two attributes share a qualified or an expanded
+    name;
+  - a prefix of its name or of an attribute's is bound nowhere valid (`xml:`
+    always is), or it makes a declaration `declaration_ok` refuses: an empty
+    prefixed URI, a non-NCName prefix, `xmlns:xmlns`, `xml` bound elsewhere
+    than its URI, or anything else bound to the `xml` or `xmlns` URI. Such a
+    declaration on the root is not injected, so its prefix is unbound;
+  - it is prefixed and its namespace is MSPDI's or the root's default
+    (`<p:Name>`). Only the unprefixed spelling of an MSPDI element is read
+    and written, and keeping this one raw would write that element twice,
+    so it and its value are dropped, as before #429;
+  - its source is not one complete element. A fresh `XmlParser::new(raw)`
+    checks the slice, because the reader's `is_malformed` is sticky and its
+    end tags never check their names (`<x:Ext>1</Project>` would swallow the
+    root's end).
+
+  An attributed or prefixed `OutlineCodes`/`WBSMasks` wrapper is dropped
+  even when empty (#428 is parked). The tests' `strictly_well_formed`
+  checks a save for what `XmlParser` lets through.
+- The writer puts a raw leaf of a `PROJECT_HEADER` name in that slot when
+  `header_text` gives nothing, and the others after the plain unknown
+  options. A plain value of the key (an option, or a modeled field) wins
+  even when it was read earlier. `Project::set_option` drops the raw leaf of
+  its key. `leveling.rs` sets all five leveling options on each
+  `level.options` edit, so it drops a raw leaf of an unchanged one. That is
+  harmless, since a nil reads as the default, and it is not special-cased.
+- An unprefixed raw leaf lands in the saved root's default
+  `http://schemas.microsoft.com/project` namespace even when the source root
+  declared none, as plain options do. Attributes on the always-written
+  modeled fields (`<Name foo="x">`) are still dropped (the value is kept).
