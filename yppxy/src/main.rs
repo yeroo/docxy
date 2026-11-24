@@ -1483,6 +1483,14 @@ impl App {
         .into_owned();
         self.ed.commit_save();
         self.status = format!("Saved {path}");
+        // What the type does not keep (#1618), said once the save has succeeded.
+        if let Some(note) = self
+            .formats
+            .registry
+            .save_note(self.ed.project(), Path::new(&path))
+        {
+            self.status.push_str(&format!(". {note}"));
+        }
         self.path = Some(path);
         Ok(())
     }
@@ -3253,6 +3261,36 @@ mod tests {
         assert!(saved.task(0).unwrap().name.is_empty());
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// #1618: MSPDI has no element for Display on Timeline, so an `.xml`
+    /// save says it is not kept; the save itself is as before, and a `.yppx`
+    /// save's message is unchanged.
+    #[test]
+    fn xml_save_status_says_display_on_timeline_is_not_saved() {
+        let dir = std::env::temp_dir().join(format!("yppxy-timeline-note-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new(new_project(), None, false);
+        app.ed.set_display_on_timeline(1, true).unwrap();
+        let xml = dir.join("plan.xml").to_string_lossy().into_owned();
+        app.save_to_path(&xml).unwrap();
+        assert_eq!(
+            app.status,
+            format!(
+                "Saved {xml}. Display on Timeline is not saved in .xml files; \
+                 save as .yppx to keep it"
+            )
+        );
+        assert!(!app.ed.dirty());
+        assert_eq!(app.path.as_deref(), Some(xml.as_str()));
+        assert_eq!(
+            std::fs::read(&xml).unwrap(),
+            mspdi::write_mspdi(app.ed.project()).into_bytes()
+        );
+        let native = dir.join("plan.yppx").to_string_lossy().into_owned();
+        app.save_to_path(&native).unwrap();
+        assert_eq!(app.status, format!("Saved {native}"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
