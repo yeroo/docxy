@@ -17,7 +17,7 @@
 use crate::datetime::DateTime;
 use crate::model::*;
 use crate::schedule::TaskResult;
-use opccore::xml::{Event, XmlAttr, XmlParser};
+use opccore::xml::{Event, XmlParser};
 
 /// Parse an MSPDI document into a [`Project`].
 pub fn read_mspdi(xml: &str) -> Result<Project, String> {
@@ -147,8 +147,8 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                         let local = name.split_once(':').map_or(name.as_str(), |(_, l)| l);
                         if matches!(local, "OutlineCodes" | "WBSMasks") {
                             p.skip_element();
-                        } else if let Some(raw) = read_raw_leaf(&mut p) {
-                            set_option(&mut proj.raw_options, name, raw);
+                        } else if let Some((key, raw)) = read_raw_leaf(&mut p) {
+                            set_option(&mut proj.raw_options, key, raw);
                         }
                     }
                     _ => {
@@ -248,8 +248,8 @@ fn read_option<T>(
     field: impl Fn(&mut Project) -> &mut Option<T>,
 ) {
     if !kept_as_element(p) {
-        if let Some(raw) = read_raw_leaf(p) {
-            set_option(&mut proj.raw_options, name, raw);
+        if let Some((key, raw)) = read_raw_leaf(p) {
+            set_option(&mut proj.raw_options, key, raw);
         }
         return;
     }
@@ -287,131 +287,203 @@ fn set_option(options: &mut Vec<(String, String)>, name: String, text: String) {
     }
 }
 
+/// The MSPDI namespace, the saved root's default.
+const MSPDI_NS: &str = "http://schemas.microsoft.com/project";
+/// The namespace the `xml` prefix is bound to, and only it.
+const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+/// The namespace of `xmlns` declarations, which nothing may be bound to.
+const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
+
 /// Read the prefixed or attributed header leaf whose `Start` was just
-/// consumed, as the XML a save writes for it (#429). The leaf is rebuilt from
-/// its parsed parts, not kept as source bytes: its qualified name, its own
-/// attributes in source order, then each prefixed namespace declaration in
-/// scope that it does not make itself, so it reads the same under the saved
-/// root. All of them, not only the ones its names use, since a QName can
-/// hide in a value (`xsi:type="x:T"`). Attribute values and text are decoded
-/// as the reader decodes (CDATA verbatim) and written with the save's
-/// escaping, which drops the characters XML 1.0 forbids (#1120); see
-/// [`esc_attr_into`] and [`esc_into`]. The source's entity spelling and
-/// quotes are not kept, only an equivalent element.
+/// consumed, as the key and XML a save writes for it (#429). The leaf is
+/// rebuilt from its parsed parts, never copied: its qualified name, its own
+/// attributes in source order, then each valid prefixed namespace
+/// declaration in scope that it does not make itself, so it reads the same
+/// under the saved root. All of them, not only the ones its names use, since
+/// a QName can hide in a value (`xsi:type="x:T"`). Everything written or
+/// compared is decoded and scrubbed first ([`attr_value`], and text as
+/// [`append_text`] reads it), then escaped by [`esc_attr_into`] and
+/// [`esc_into`], which drop the characters XML 1.0 forbids (#1120). Only an
+/// equivalent element is kept, not the source's spelling.
+///
+/// The key is the qualified name, which is matched against the header's
+/// schema names, plain options and [`Project::set_option`]. An unprefixed
+/// leaf that declares a default namespace other than MSPDI's is keyed
+/// `{uri}name` (Clark notation) instead, so it matches none of them: it is
+/// another element.
 ///
 /// `None`, the element consumed and dropped as before, when:
 /// - it is a block;
 /// - its name or an attribute's is not a QName ([`is_qname`]), or two of its
-///   attributes share a qualified name or an expanded one (two prefixes
-///   bound to one URI);
-/// - a prefix of its name or of an attribute's is bound nowhere (`xml:`
-///   always is), or it declares a prefix as empty: a namespace-ill-formed
-///   save is a file Project refuses;
+///   attributes share a qualified name or an expanded one;
+/// - a prefix it uses is bound nowhere valid (`xml:` always is), or it makes
+///   a declaration namespaces forbid ([`declaration_ok`]);
+/// - it is prefixed and its namespace is MSPDI's, or the root's default: it
+///   is then the plain element of that name, which a save writes as such;
 /// - its source is not one complete element ([`is_one_element`]): an end tag
 ///   that does not match (`<x:Ext>1</Project>` would swallow the root's end),
 ///   a broken tag, the end of input.
-fn read_raw_leaf(p: &mut XmlParser) -> Option<String> {
+fn read_raw_leaf(p: &mut XmlParser) -> Option<(String, String)> {
     let start = p.start_pos();
     let qname = p.name();
-    let own = p.attrs().to_vec();
-    // In scope includes the element's own declarations.
-    let in_scope = p.namespace_attrs().to_vec();
-    let mut kept = start_tag(qname, &own, &in_scope);
-    let mut text = String::new();
-    let mut leaf = true;
-    loop {
-        match p.next() {
-            Event::Text => append_text(p, &mut text),
-            Event::Start => {
-                leaf = false;
-                p.skip_element();
-            }
-            Event::End | Event::Eof => break,
-        }
+    let own: Vec<(&str, String)> = p
+        .attrs()
+        .iter()
+        .map(|a| (a.name, attr_value(a.value)))
+        .collect();
+    // In scope includes the element's own declarations; an invalid one of
+    // the root's is skipped, leaving its prefix unbound.
+    let scope: Vec<(&str, String)> = p
+        .namespace_attrs()
+        .iter()
+        .filter_map(|ns| {
+            let prefix = ns.name.strip_prefix("xmlns:")?;
+            let uri = attr_value(ns.value);
+            declaration_ok(ns.name, &uri).then_some((prefix, uri))
+        })
+        .collect();
+    // The default namespace the root gives its children: the one in scope,
+    // or, when the leaf declares its own, the one that replaced.
+    let defaults = p.namespace_declaration_chain("xmlns");
+    let own_default = own.iter().find(|(n, _)| *n == "xmlns");
+    let parent_default = match own_default {
+        Some(_) => defaults.len().checked_sub(2).map(|i| defaults[i]),
+        None => defaults.last().copied(),
     }
+    .map(|d| attr_value(d.attr.value));
+    let built = start_tag(qname, &own, &scope);
+    let (text, leaf) = element_text(p);
     if !leaf || !is_one_element(p.raw_slice(start, p.pos()), qname) {
         return None;
     }
-    let s = kept.as_mut()?;
+    let mut s = built?;
+    let key = match qname.split_once(':') {
+        Some((prefix, _)) => {
+            let uri = uri_of(prefix, &scope)?;
+            if uri == MSPDI_NS
+                || parent_default
+                    .as_deref()
+                    .is_some_and(|d| !d.is_empty() && d == uri)
+            {
+                return None;
+            }
+            qname.to_string()
+        }
+        None => match own_default {
+            Some((_, uri)) if uri != MSPDI_NS => format!("{{{uri}}}{qname}"),
+            _ => qname.to_string(),
+        },
+    };
+    let text: String = text.chars().filter(|&c| xml_char(c)).collect();
     if text.is_empty() {
         s.push_str("/>");
     } else {
         s.push('>');
-        esc_into(&text, s);
+        esc_into(&text, &mut s);
         s.push_str("</");
         s.push_str(qname);
         s.push('>');
     }
-    kept
+    Some((key, s))
+}
+
+/// The URI `prefix` is bound to in `scope` (decoded, valid declarations);
+/// `xml` is always bound to [`XML_NS`].
+fn uri_of<'s>(prefix: &str, scope: &'s [(&str, String)]) -> Option<&'s str> {
+    if prefix == "xml" {
+        return Some(XML_NS);
+    }
+    scope
+        .iter()
+        .find(|(p, _)| *p == prefix)
+        .map(|(_, uri)| uri.as_str())
+}
+
+/// Whether a namespace declaration (`xmlns` or `xmlns:p`, by attribute
+/// name) with the decoded `uri` is one XML namespaces allow: a prefix that
+/// is an NCName and not `xmlns`, bound to a non-empty URI; `xml` bound only
+/// to [`XML_NS`]; nothing else, the default included, bound to [`XML_NS`]
+/// or [`XMLNS_NS`].
+fn declaration_ok(name: &str, uri: &str) -> bool {
+    let reserved = uri == XML_NS || uri == XMLNS_NS;
+    match name.strip_prefix("xmlns:") {
+        None => name == "xmlns" && !reserved,
+        Some("xml") => uri == XML_NS,
+        Some(prefix) => {
+            is_qname(prefix)
+                && !prefix.contains(':')
+                && prefix != "xmlns"
+                && !uri.is_empty()
+                && !reserved
+        }
+    }
 }
 
 /// The rebuilt start tag of a raw leaf, without its closing `>` or `/>` (see
-/// [`read_raw_leaf`]), or `None` when the leaf cannot be written back.
-fn start_tag(qname: &str, own: &[XmlAttr], in_scope: &[XmlAttr]) -> Option<String> {
-    const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+/// [`read_raw_leaf`]), from its own attributes and the valid declarations in
+/// scope, all decoded; `None` when the leaf cannot be written back.
+fn start_tag(qname: &str, own: &[(&str, String)], scope: &[(&str, String)]) -> Option<String> {
     let declares = |name: &str| name == "xmlns" || name.starts_with("xmlns:");
-    // The URI a prefix is bound to; `None` when it is bound nowhere (or to
-    // nothing, which XML 1.0 namespaces do not allow).
-    let uri = |prefix: &str| -> Option<&str> {
-        if prefix == "xml" {
-            return Some(XML_NS);
-        }
-        let ns = in_scope
-            .iter()
-            .find(|ns| ns.name.strip_prefix("xmlns:") == Some(prefix))?;
-        (!ns.value.is_empty()).then_some(ns.value)
+    let resolves = |name: &str| {
+        name.split_once(':')
+            .is_none_or(|(p, _)| uri_of(p, scope).is_some())
     };
-    let resolves = |name: &str| name.split_once(':').is_none_or(|(p, _)| uri(p).is_some());
     if !is_qname(qname) || !resolves(qname) {
         return None;
     }
     let mut expanded = Vec::new();
-    for (i, a) in own.iter().enumerate() {
-        if !is_qname(a.name) || own[..i].iter().any(|b| b.name == a.name) {
+    for (i, (name, value)) in own.iter().enumerate() {
+        if !is_qname(name) || own[..i].iter().any(|(n, _)| n == name) {
             return None;
         }
-        if a.name.starts_with("xmlns:") && a.value.is_empty() {
-            return None;
-        }
-        if !declares(a.name) {
-            if !resolves(a.name) {
+        if declares(name) {
+            if !declaration_ok(name, value) {
                 return None;
             }
-            if let Some((prefix, local)) = a.name.split_once(':') {
-                let name = (uri(prefix), local);
-                if expanded.contains(&name) {
-                    return None;
-                }
-                expanded.push(name);
+        } else if let Some((prefix, local)) = name.split_once(':') {
+            let name = (uri_of(prefix, scope)?, local);
+            if expanded.contains(&name) {
+                return None;
             }
+            expanded.push(name);
         }
     }
     let mut s = format!("<{qname}");
-    let injected = in_scope
-        .iter()
-        .filter(|ns| ns.name.starts_with("xmlns:") && !ns.value.is_empty())
-        .filter(|ns| !own.iter().any(|a| a.name == ns.name));
-    for a in own.iter().chain(injected) {
+    let mut attr = |name: &str, value: &str| {
         s.push(' ');
-        s.push_str(a.name);
+        s.push_str(name);
         s.push_str("=\"");
-        esc_attr_into(a.value, &mut s);
+        esc_attr_into(value, &mut s);
         s.push('"');
+    };
+    for (name, value) in own {
+        attr(name, value);
+    }
+    for (prefix, uri) in scope {
+        let name = format!("xmlns:{prefix}");
+        if !own.iter().any(|(n, _)| *n == name) {
+            attr(&name, uri);
+        }
     }
     Some(s)
 }
 
-/// Write a raw attribute value, as the parser hands it over (entities not
-/// decoded), escaped for a `"`-quoted attribute. The value is first read as
-/// a conformant reader would: literal tab, LF and CR (a CR LF pair once)
-/// become spaces, then entities decode. Tab, LF and CR left after that came
-/// from references, and are written as references so they survive the same
-/// normalisation on the next read. Characters XML 1.0 forbids are dropped
-/// (#1120).
-fn esc_attr_into(raw: &str, out: &mut String) {
+/// An attribute value as the parser hands it over (entities not decoded),
+/// read as a conformant reader would: literal tab, LF and CR (a CR LF pair
+/// once) become spaces, then entities decode; the characters XML 1.0 forbids
+/// are dropped (#1120).
+fn attr_value(raw: &str) -> String {
     let normalised = raw.replace("\r\n", " ").replace(['\t', '\n', '\r'], " ");
     let mut value = String::new();
     XmlParser::append_decoded(&normalised, &mut value);
+    value.retain(xml_char);
+    value
+}
+
+/// Write a decoded attribute value ([`attr_value`]) escaped for a
+/// `"`-quoted attribute. Tab, LF and CR are written as references, so they
+/// survive the normalisation of the next read.
+fn esc_attr_into(value: &str, out: &mut String) {
     for c in value.chars().filter(|&c| xml_char(c)) {
         match c {
             '&' => out.push_str("&amp;"),
@@ -426,19 +498,25 @@ fn esc_attr_into(raw: &str, out: &mut String) {
     }
 }
 
-/// Whether `name` is an XML QName: an NCName, or two joined by one `:`. An
-/// NCName starts with a letter, `_` or a non-ASCII character and goes on
-/// with letters, digits, `.`, `-`, `_` or non-ASCII characters; that is
-/// looser than XML's tables for non-ASCII, but never admits a character
-/// XML 1.0 forbids.
+/// Whether `name` is an XML QName: an NCName, or two joined by one `:`,
+/// with XML 1.0's (fifth edition) `NameStartChar` and `NameChar` ranges.
 fn is_qname(name: &str) -> bool {
-    let wide = |c: char| !c.is_ascii() && xml_char(c);
+    fn start(c: char) -> bool {
+        matches!(c,
+            'A'..='Z' | '_' | 'a'..='z'
+            | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{2FF}'
+            | '\u{370}'..='\u{37D}' | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}'
+            | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}'
+            | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}')
+    }
+    fn rest(c: char) -> bool {
+        start(c)
+            || matches!(c,
+                '-' | '.' | '0'..='9' | '\u{B7}' | '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
+    }
     let ncname = |s: &str| {
         let mut chars = s.chars();
-        chars
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || wide(c))
-            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') || wide(c))
+        chars.next().is_some_and(start) && chars.all(rest)
     };
     match name.split_once(':') {
         Some((prefix, local)) => ncname(prefix) && ncname(local),
@@ -1761,7 +1839,7 @@ pub(crate) fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 pub fn write_mspdi(proj: &Project) -> String {
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
-    s.push_str("<Project xmlns=\"http://schemas.microsoft.com/project\">\n");
+    s.push_str(&format!("<Project xmlns=\"{MSPDI_NS}\">\n"));
     let sched = crate::schedule::schedule(proj);
     let dates = scheduled_dates(proj, &sched);
     // A plan with no StartDate schedules from the earliest stored, pinned or
@@ -7430,8 +7508,9 @@ mod tests {
             proj.raw_options,
             raws(&[
                 ("x:Ext", r#"<x:Ext xmlns:x="urn:x">1</x:Ext>"#),
+                // Another default namespace's element is keyed apart.
                 (
-                    "Other",
+                    "{urn:other}Other",
                     r#"<Other xmlns="urn:other" xmlns:x="urn:x">2</Other>"#
                 ),
                 (
@@ -7656,6 +7735,8 @@ mod tests {
                 "<Foo a=\"1\t2\r\n3&#10;\"><![CDATA[<&amp;>]]></Foo>",
                 r#"<Foo a="1 2 3&#10;" xmlns:x="urn:x">&lt;&amp;amp;&gt;</Foo>"#,
             ),
+            // A text of only forbidden characters is an empty element.
+            (r#"<x:Ext>&#11;</x:Ext>"#, r#"<x:Ext xmlns:x="urn:x"/>"#),
             // The source's quotes and an empty element's end tag are not kept.
             (
                 r#"<Foo a='"'></Foo>"#,
@@ -7719,6 +7800,132 @@ mod tests {
         .unwrap();
         assert_eq!(proj.raw_options.len(), 1);
         assert!(parses_whole(&write_mspdi(&proj)));
+    }
+
+    /// Namespace declarations are judged and written decoded, and one that
+    /// namespaces forbid drops the leaf making it, or is not injected from
+    /// the root (its prefix then unbound).
+    #[test]
+    fn raw_leaves_carry_only_valid_decoded_declarations() {
+        let one = |xml: &str| {
+            let proj = read_mspdi(xml).unwrap();
+            assert!(parses_whole(&write_mspdi(&proj)), "{xml}");
+            proj.raw_options
+        };
+        // A root declaration that decodes to nothing is not injected, and a
+        // leaf using its prefix is dropped.
+        for z in ["&#0;", "&#1;", "\u{1}"] {
+            let xml = format!(r#"<Project xmlns:z="{z}"><Foo a="1"/><z:A>1</z:A></Project>"#);
+            assert_eq!(one(&xml), raws(&[("Foo", r#"<Foo a="1"/>"#)]), "{z}");
+        }
+        // The injected value is the decoded one.
+        assert_eq!(
+            one(r#"<Project xmlns:x="urn:&#97;"><Foo a="1"/></Project>"#),
+            raws(&[("Foo", r#"<Foo a="1" xmlns:x="urn:a"/>"#)])
+        );
+        // Two prefixes bound to one URI, spelt two ways.
+        assert!(
+            one(r#"<Project xmlns:x="urn:a" xmlns:y="urn:&#97;"><Foo x:b="1" y:b="2"/></Project>"#)
+                .is_empty()
+        );
+        // Declarations namespaces forbid, on the leaf: it is dropped.
+        for decl in [
+            r#"xmlns:xmlns="urn:q""#,
+            r#"xmlns:xml="urn:other""#,
+            r#"xmlns:q="http://www.w3.org/2000/xmlns/""#,
+            r#"xmlns:q="http://www.w3.org/XML/1998/namespace""#,
+            r#"xmlns="http://www.w3.org/XML/1998/namespace""#,
+            r#"xmlns:q="""#,
+        ] {
+            let xml = format!(r#"<Project><Foo {decl} a="1"/></Project>"#);
+            assert!(one(&xml).is_empty(), "{decl}");
+        }
+        // ... and on the root: not injected; `xml:` stays bound.
+        assert_eq!(
+            one(
+                r#"<Project xmlns:xmlns="urn:q" xmlns:xml="urn:other"><Foo xml:lang="en"/></Project>"#
+            ),
+            raws(&[("Foo", r#"<Foo xml:lang="en"/>"#)])
+        );
+        // A root declaration whose prefix is not an NCName is not injected.
+        assert_eq!(
+            one(
+                r#"<Project xmlns:a<b="urn:1" xmlns:1x="urn:2" xmlns:a:b="urn:3" xmlns:="urn:4"><Foo k="1"/></Project>"#
+            ),
+            raws(&[("Foo", r#"<Foo k="1"/>"#)])
+        );
+    }
+
+    /// Names follow XML 1.0's NameStartChar and NameChar, typed out here
+    /// apart from `is_qname`'s table.
+    #[test]
+    fn raw_leaf_names_follow_xml_name_characters() {
+        for bad in [
+            "\u{A0}x", "a\u{A0}b", "\u{D7}", "x\u{D7}", "\u{B7}a", "1a", "-a", "a:", ":a",
+        ] {
+            assert!(!is_qname(bad), "{bad:?}");
+        }
+        for good in ["é", "日本", "a\u{B7}b", "x:é", "_a.b-c", "a\u{300}"] {
+            assert!(is_qname(good), "{good:?}");
+        }
+        for leaf in [
+            "<Foo a\u{A0}b=\"1\"/>",
+            "<Foo\u{A0}x a=\"1\"/>",
+            "<x:Ext\u{D7}>1</x:Ext\u{D7}>",
+        ] {
+            let proj =
+                read_mspdi(&format!(r#"<Project xmlns:x="urn:x">{leaf}</Project>"#)).unwrap();
+            assert!(proj.raw_options.is_empty(), "{leaf}");
+        }
+        let proj = read_mspdi(r#"<Project><Foo é="1"/></Project>"#).unwrap();
+        assert_eq!(proj.raw_options, raws(&[("Foo", r#"<Foo é="1"/>"#)]));
+    }
+
+    /// A leaf is keyed by what it is: a prefixed MSPDI element is the plain
+    /// one and is dropped; another default namespace's is keyed apart.
+    #[test]
+    fn raw_leaves_are_keyed_by_their_namespace() {
+        let proj = read_mspdi(&format!(
+            r#"<Project xmlns="{MSPDI_NS}" xmlns:p="{MSPDI_NS}"><p:Name>X</p:Name><Name>N</Name><p:Author>A</p:Author><p:ProjectExternallyEdited>1</p:ProjectExternallyEdited></Project>"#
+        ))
+        .unwrap();
+        assert!(proj.raw_options.is_empty(), "{:?}", proj.raw_options);
+        let xml = write_mspdi(&proj);
+        let names = header_of(&xml).into_iter().filter(|(n, _)| n == "Name");
+        assert_eq!(names.collect::<Vec<_>>(), [("Name".into(), "N".into())]);
+        assert!(!xml.contains("<p:") && !xml.contains("Author"), "{xml}");
+        // A prefix bound to the root's own default is that element too.
+        let proj =
+            read_mspdi(r#"<Project xmlns="urn:r" xmlns:p="urn:r"><p:Foo>1</p:Foo></Project>"#)
+                .unwrap();
+        assert!(proj.raw_options.is_empty());
+
+        // Another namespace's Author is not the header's Author.
+        let mut proj = read_mspdi(
+            r#"<Project><Author xmlns="urn:other">x</Author><Author>Me</Author></Project>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            proj.raw_options,
+            raws(&[(
+                "{urn:other}Author",
+                r#"<Author xmlns="urn:other">x</Author>"#
+            )])
+        );
+        let xml = write_mspdi(&proj);
+        let plain = xml.find("<Author>Me</Author>").unwrap();
+        let other = xml.find(r#"<Author xmlns="urn:other">x</Author>"#).unwrap();
+        let tail = xml.find("<ProjectExternallyEdited>").unwrap();
+        assert!(plain < tail && tail < other, "{xml}");
+        assert_eq!(write_mspdi(&read_mspdi(&xml).unwrap()), xml);
+        proj.set_option("Author", None);
+        assert_eq!(proj.raw_options.len(), 1);
+        // An own default of MSPDI's namespace keeps the plain key.
+        let proj = read_mspdi(&format!(
+            r#"<Project><Author xmlns="{MSPDI_NS}" a="1"/></Project>"#
+        ))
+        .unwrap();
+        assert_eq!(proj.raw_options[0].0, "Author");
     }
 
     #[test]

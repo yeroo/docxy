@@ -153,12 +153,18 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing Project file rea
 - `read_mspdi` keeps a prefixed or attributed leaf directly under
   `<Project>` (`<x:Ext>1</x:Ext>`, `<Author xsi:nil="true"/>`,
   `<Other xmlns="urn:other">2</Other>`) in `Project::raw_options` as
-  (qualified name, XML), through `read_raw_leaf`. That covers modeled
-  options too: `read_option` stores the leaf and leaves the field alone.
+  (key, XML), through `read_raw_leaf`. That covers modeled options too:
+  `read_option` stores the leaf and leaves the field alone. The key is the
+  qualified name, or `{uri}name` (Clark notation) for an unprefixed leaf
+  with its own non-MSPDI default `xmlns`. That element is not the header's,
+  so it takes no schema slot, loses to no plain option, and `set_option`
+  leaves it alone.
 - The leaf is rebuilt from its parsed parts, not copied: its name, its own
-  attributes in source order, then every prefixed declaration in scope that
-  it does not make itself (all of them, since a QName can hide in a value).
-  Values are normalised and decoded as a conformant reader would, then
+  attributes in source order, then every valid prefixed declaration in
+  scope that it does not make itself (all of them, since a QName can hide in
+  a value). One rule: nothing raw from `XmlParser` is written or compared.
+  `attr_value` normalises, decodes and scrubs every value, declarations
+  included, before the checks, `uri_of` and the output. Values are then
   written `"`-quoted by `esc_attr_into` (tab, LF and CR as references).
   Text is decoded as `append_text` does and written with `esc_into`. Both
   drop the characters #1120 forbids. The permissive parser takes a bare
@@ -167,10 +173,16 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing Project file rea
   equivalent element, and a second round trip changes nothing.
 - A leaf is dropped, as before #429, when:
   - it is a block;
-  - a name is not a QName (`is_qname`), or two attributes share a
-    qualified or an expanded name;
-  - a prefix of its name or of an attribute's is bound nowhere (`xml:`
-    always is), or it declares one as empty;
+  - a name is not a QName (`is_qname`: XML 1.0's NameStartChar and
+    NameChar ranges), or two attributes share a qualified or an expanded
+    name;
+  - a prefix of its name or of an attribute's is bound nowhere valid (`xml:`
+    always is), or it makes a declaration `declaration_ok` refuses: an empty
+    prefixed URI, a non-NCName prefix, `xmlns:xmlns`, `xml` bound elsewhere
+    than its URI, or anything else bound to the `xml` or `xmlns` URI. Such a
+    declaration on the root is not injected, so its prefix is unbound;
+  - it is prefixed and its namespace is MSPDI's or the root's default: it
+    is the plain element (`<p:Name>`), which a save writes as such;
   - its source is not one complete element. A fresh `XmlParser::new(raw)`
     checks the slice, because the reader's `is_malformed` is sticky and its
     end tags never check their names (`<x:Ext>1</Project>` would swallow the
