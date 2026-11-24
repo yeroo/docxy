@@ -539,10 +539,11 @@ pub(crate) fn attach_with_dispatch(
                                         .filter(|_| reaches);
                                 // A key the root left to the input context
                                 // gets the `insertText:` AppKit would send
-                                // (#1072), and a key `on_key` typed on
-                                // Windows the WM_CHAR TranslateMessage would
-                                // post (#1139): this input never passes
-                                // through AppKit or the window procedure.
+                                // (#1072), and on Windows a key the root
+                                // left propagating (withheld or typed) the
+                                // WM_CHAR TranslateMessage would post (#1139,
+                                // #1277): this input never passes through
+                                // AppKit or the window procedure.
                                 if !window.dispatch_event(event, cx).propagate {
                                     continue;
                                 }

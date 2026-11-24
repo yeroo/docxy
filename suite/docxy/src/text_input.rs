@@ -50,21 +50,25 @@
 //! ([`owed_text`]): a debt whose WM_CHAR is dropped. With no root focus
 //! there is no handler, so no WM_CHAR, and a key leaves no debt.
 //!
-//! A character pays the first entry still owed that starts with it among
-//! the leading entries that [`may_not_come`] and the first sure one after
-//! them, preferring the sure one. A character no candidate starts with is a
-//! packet's, sent before every key still owed, and is typed in its place.
-//! The candidates before the one paid that never came (an AltGr dead key's
-//! accent, which makes WM_DEADCHAR) are dropped; a key-down cannot tell an
-//! AltGr dead key from an AltGr character. A dead key's accent comes in the
+//! A character's candidates are the leading entries still owed that are
+//! not sure to be paid (they [`may_not_come`], or are past
+//! [`WM_CHAR_WAIT`]) and the first sure one after them. It pays the sure one
+//! if that starts with it, else the first of the others that does. A
+//! character no candidate starts with is a packet's, sent before every key
+//! still owed, and is typed in its place. Of the entries before the one
+//! paid, the withheld and waiting ones never had their character come (an
+//! AltGr dead key's accent makes WM_DEADCHAR) and are dropped, and a typed
+//! key's debt stays until it lapses; a key-down cannot tell an AltGr dead
+//! key from an AltGr character. A dead key's accent comes in the
 //! next key's text: a plain dead key reaches nothing ([`passes_to_on_key`])
 //! and owes nothing, and the next key owes the composed "é" or "´x". A
 //! WM_CHAR that does not come (an AltGr dead key, a key handled after the
 //! root) holds for [`WM_CHAR_WAIT`] at most: a plain key is then replayed
 //! as it was before #1277 and owes its text, and an AltGr key still types
 //! its character if it comes later. A command right after an AltGr dead key
-//! waits that long. A mouse-down releases every held key first, so a click
-//! acts after the keys before it. A packet's text against a command sent
+//! waits that long. A mouse-down on either root releases every held key
+//! first, an AltGr key typing its character then, so a click acts after
+//! the keys before it. A packet's text against a command sent
 //! after it is not ordered: gpui hides the packet's key-down. The handler
 //! never accepts text input there ([`accepts_text_input`]), so the Windows
 //! IME stays off as it was.
@@ -254,10 +258,11 @@ pub(crate) fn deferred_text(event: &PlatformInput) -> Option<String> {
     }
 }
 
-/// The text of the WM_CHAR Windows posts for a key event `on_key` typed: what
-/// the harness's queued real input sends the handler when `windows`, since it
-/// never passes through the window procedure. `None` for any other event, and
-/// for a key that owes no WM_CHAR ([`owed_text`]).
+/// The text of the WM_CHAR Windows posts for a key event the root left
+/// propagating (withheld or typed): what the harness's queued real input
+/// sends the handler when `windows`, since it never passes through the
+/// window procedure. `None` for any other event, and for a key that owes no
+/// WM_CHAR ([`owed_text`]).
 pub(crate) fn char_message_text(event: &PlatformInput, windows: bool) -> Option<String> {
     match event {
         PlatformInput::KeyDown(ev) if windows => owed_text(ev),
@@ -602,13 +607,32 @@ impl WmChars {
         self.release(now, host);
     }
 
-    /// Releases every held input now, in order (a mouse-down acts after the
-    /// keys before it): as [`WmChars::release_lapsed`] does at the time
-    /// limit, each withheld key stops holding.
+    /// Releases every held input now, in order, so a mouse-down acts after
+    /// the keys before it: each withheld key stops holding, a plain key
+    /// replayed as at the time limit ([`WmChars::release_lapsed`]), and an
+    /// AltGr key whose character has not come types its text now (under the
+    /// field rule) and owes it, so its late WM_CHAR is dropped. An AltGr dead
+    /// key then types its accent: a click ends a dead key.
     pub(crate) fn flush(&mut self, now: Instant, host: &mut impl KeyHost) {
         while self.holding() {
             for e in &mut self.entries {
-                if e.holds {
+                if !e.holds {
+                    continue;
+                }
+                if e.state == State::Withheld(Withheld::AltGr) {
+                    let types = if e.field {
+                        host.text_field_open()
+                    } else {
+                        host.takes_text()
+                    };
+                    if types {
+                        for k in e.text.chars().filter_map(char_stroke) {
+                            host.on_key(&typed(k));
+                        }
+                    }
+                    e.holds = false;
+                    e.state = State::Typed;
+                } else {
                     Self::unhold(e, host);
                 }
             }
@@ -673,11 +697,9 @@ impl WmChars {
             };
             i -= 1;
             if e.text.is_empty() {
-                if let Some(e) = self.route(e, now, host) {
-                    self.entries.insert(j, e);
-                    i += 1;
-                    j += 1;
-                }
+                // A waiting command: `route` keeps only an entry that owes text.
+                let kept = self.route(e, now, host);
+                debug_assert!(kept.is_none());
             }
         }
         if self.entries[i].state == State::Waiting {
@@ -1940,9 +1962,9 @@ mod tests {
         assert_eq!(took(&mut r), ["a"]);
     }
 
-    /// A mouse-down releases the held keys first, in order; their WM_CHARs
-    /// are then dropped. An AltGr key flushed still types when its
-    /// character comes.
+    /// A mouse-down releases the held keys first, in order, an AltGr key's
+    /// character typed then too ("user@x", then a click on OK); their
+    /// WM_CHARs are then dropped.
     #[test]
     fn a_flush_replays_the_held_keys() {
         let (mut q, mut r) = win();
@@ -1960,10 +1982,34 @@ mod tests {
             ],
         );
         q.flush(at, &mut r);
-        assert_eq!(took(&mut r), ["a", "[backspace]", "b", "c"]);
+        assert_eq!(took(&mut r), ["a", "[backspace]", "b", "@", "c"]);
         assert!(!q.holding());
         chars(&mut q, &mut r, at, &["a", "b", "@", "c"]);
-        assert_eq!(took(&mut r), ["@"]);
+        assert!(took(&mut r).is_empty());
+        assert_eq!(q.owed(), 0);
+        // Under a dialog that closed before the flush, an AltGr key types
+        // nothing, as its WM_CHAR would.
+        r.dialog = true;
+        q.key_down(&altgr("q", "@"), at, &mut r);
+        r.dialog = false;
+        q.flush(at, &mut r);
+        chars(&mut q, &mut r, at, &["@"]);
+        assert!(took(&mut r).is_empty());
+        assert_eq!(q.owed(), 0);
+    }
+
+    /// A packet whose character a later key also owes, sent before the keys
+    /// (packet "b", keys A and B, every WM_CHAR late), is typed in its place:
+    /// "bab", each once. The first "b" is not taken as B's, which would make
+    /// A's WM_CHAR look lost (#1277 r1 i2).
+    #[test]
+    fn a_packet_like_a_later_key_is_typed_in_its_place() {
+        let (mut q, mut r) = win();
+        let at = t0();
+        keys(&mut q, &mut r, at, &[key("a"), key("b")]);
+        chars(&mut q, &mut r, ms(at, 5), &["b", "a", "b"]);
+        q.release_lapsed(after_wait(after_wait(at)), &mut r);
+        assert_eq!(took(&mut r), ["b", "a", "b"]);
         assert_eq!(q.owed(), 0);
     }
 

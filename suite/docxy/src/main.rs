@@ -49662,10 +49662,7 @@ impl Render for Docxy {
             // A press anywhere but in the Name Box takes the keyboard from it
             // (#1343): the ribbon, the headers, the sheet tabs and the rest stop
             // their events below, so it is asked while the press is captured.
-            .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                // Windows: the keys still waiting for their WM_CHAR act
-                // before the press (#1277).
-                this.flush_wm_chars(window, cx);
+            .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
                 let inside = this
                     .probes
                     .borrow()
@@ -49839,6 +49836,11 @@ impl KeyRouting for Div {
         .size_full();
         self.child(input)
             .on_key_down(cx.listener(Docxy::route_key))
+            // Windows: the keys still waiting for their WM_CHAR act before a
+            // press, on either root (#1277).
+            .capture_any_mouse_down(
+                cx.listener(|this, _: &MouseDownEvent, window, cx| this.flush_wm_chars(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &ext::ShowBackstage, window, cx| {
                 let was_up = this.backstage;
                 this.open_backstage(cx);

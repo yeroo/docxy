@@ -350,11 +350,14 @@ Restated from the area notes, which hold the detail:
   dialog or Project edit only while one is open). A withheld key holds every
   later key-down and the Tab/Shift+Tab actions (`queued_tab`) until its
   character comes, at most `WM_CHAR_WAIT` (250 ms; then a plain key is
-  replayed). A mouse-down flushes the queue first. Other keys reach `on_key`
-  at once and owe their text; without the root's focus they owe nothing (no
-  handler, no WM_CHAR). A character pays the first sure entry or an earlier
-  `may_not_come` one (AltGr dead keys, dropped when a later one is paid);
-  matching none, it is a packet's and is typed. No count cap; `WM_CHAR_KEEP`
+  replayed). A mouse-down on either root (`key_routing`) flushes the queue
+  first, AltGr keys typing then. Other keys reach `on_key` at once and owe
+  their text; without the root's focus they owe nothing (no handler, no
+  WM_CHAR). A character's candidates are the leading entries not sure to be
+  paid (`may_not_come`, or past `WM_CHAR_WAIT`) and the first sure one; it
+  pays the sure one if it can, else the first other that matches. Before the
+  paid one, withheld and waiting entries are dropped, typed debts stay until
+  they lapse. Matching none, it is a packet's and is typed. No count cap; `WM_CHAR_KEEP`
   (60 s) is hygiene. A plain dead key never reaches `on_key`
   (`passes_to_on_key`): the next key-down's `key_char` carries the composed
   text whole ("´" on Space, "´x"). The handler's `accepts_text_input` is
