@@ -340,40 +340,38 @@ Restated from the area notes, which hold the detail:
   propagation: a handled key-down on Windows is never translated (#1072).
 - Windows registers the handler too, for WM_CHAR only (#1139): Unicode-packet
   text (`SendInput` `KEYEVENTF_UNICODE`, a `VK_PACKET` key-down gpui drops)
-  arrives nowhere else. Each key-down `on_key` typed owes its WM_CHAR text
-  (`owed_text`: printable, no Alt without Ctrl), and each WM_CHAR character
-  pays only the oldest debt that starts with it, preferring one sure to be
-  paid (not `may_not_come`), or, matching none, is typed: matched by text, not
-  counted. A packet whose character a pending debt starts with pays that debt,
-  and the key's own WM_CHAR is then typed. No match drops another debt. A
-  plain dead key owes nothing; an AltGr dead key owes its accent until it
-  lapses. A WM_CHAR can come after its key-up and later key-downs (gpui drains
-  input alone under load), so no key-up ends a debt; it waits up to
-  `WM_CHAR_KEEP` (60 s, with a 4096-debt cap), hygiene only. Packet text
-  queued behind typed keys under load may land after their text. The handler's
-  `accepts_text_input` is false there, so the Windows IME stays off. Linux
-  registers none (it would get every key `on_key` typed). The harness's
-  `win-char` sends WM_CHAR, and `real-type`'s `"wm_char":true` (always on
-  Windows) or `"late"` replays each typed key's twin.
+  arrives nowhere else. WM_CHARs come in key-down order but may come late
+  (gpui drains input alone under load), so all Windows text is typed from
+  them through one queue (`text_input::WmChars`, #1277). While the root has
+  the focus and the app takes text, a plain or AltGr (Ctrl+Alt with
+  `prefer_character_input`) key that owes text (`owed_text`) is withheld
+  from `on_key`: a plain key is replayed unchanged at its first character,
+  and an AltGr key types its characters (never its Ctrl+Alt chord; under a
+  dialog or Project edit only while one is open). A withheld key holds every
+  later key-down and the Tab/Shift+Tab actions (`queued_tab`) until its
+  character comes, at most `WM_CHAR_WAIT` (250 ms; then a plain key is
+  replayed). A mouse-down anywhere (a window listener from `key_routing`)
+  flushes the queue first, AltGr keys typing then: a press within
+  `WM_CHAR_WAIT` of an AltGr dead key types its accent (a key-down cannot
+  tell it from a character) unless the plain key right after it carries it.
+  Other keys reach `on_key` at once and owe
+  their text; without the root's focus they owe nothing (no handler, no
+  WM_CHAR). A character's candidates are the leading entries not sure to be
+  paid (`may_not_come`, or past `WM_CHAR_WAIT`) and the first sure one; it
+  pays the sure one if it can, else the first other that matches. Before the
+  paid one, withheld and waiting entries are dropped, typed debts stay until
+  they lapse. Matching none, it is a packet's and is typed. No count cap; `WM_CHAR_KEEP`
+  (60 s) is hygiene. A plain dead key never reaches `on_key`
+  (`passes_to_on_key`): the next key-down's `key_char` carries the composed
+  text whole ("´" on Space, "´x"). The handler's `accepts_text_input` is
+  false there, so the Windows IME stays off. Linux registers none. The
+  harness's `win-char` sends WM_CHAR, and `real-type`'s `"wm_char":true`
+  (always on Windows) or `"late"` sends each key's twin while the root has
+  the focus.
 - A dialog field takes the character ⌥ made on macOS: `modal_takes_key`
-  hands the dialog `text_input::dialog_stroke`'s plain typed key (#1162).
-  On Windows an AltGr key (Ctrl+Alt with `prefer_character_input`) under a
-  dialog owes the dialog (`dialog_altgr`, decided before `on_key`): its
-  WM_CHAR types it while a dialog is open and nothing once none is, and an
-  AltGr dead key, which sends none, types nothing. Under load that WM_CHAR
-  may land after later keys' text, or in the next field after a Tab. A plain
-  Windows dead key never reaches `on_key` (`passes_to_on_key`): the next
-  key-down carries the composed text whole in its `key_char` (Space with
-  "´", a letter with "´x"), which a dialog field types in full.
+  hands the dialog `text_input::dialog_stroke`'s plain typed key (#1162);
+  the Project cell editor and prompt do the same (`project_stroke`, #1312).
   `edit_key` still swallows every ⌥ key, and Windows' plain Alt is never text.
-- The Project cell editor and prompt take ⌥ and AltGr text the same way
-  (#1312): `project_key` runs `text_input::dialog_stroke` while an edit is
-  open (`project_stroke`; with none open the key is untouched), and the AltGr
-  debt is the field's (`text_field_open`) when a dialog or a Project edit
-  is open at the key-down.
-  On Windows a plain dead key (`plain_dead_key`: `prefer_character_input`, no
-  Ctrl/Alt/Win) never reaches `on_key`: it owes nothing and its accent comes
-  composed with the next key, so no field types it twice.
 
 ## Build info
 

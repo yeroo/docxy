@@ -5705,8 +5705,8 @@ fn state(app: &crate::Docxy, window: &Window, cx: &App) -> Json {
             "ime_marked",
             str_or_null(app.ime.marked().map(str::to_string)),
         ),
-        // The WM_CHAR characters typed keys still owe, lapsed ones included
-        // (#1139).
+        // The WM_CHAR characters typed, withheld and waiting keys still owe
+        // (#1139, #1277).
         ("wm_char_owed", Json::Num(app.ime.owed() as f64)),
     ]);
     let mut out: Vec<_> = out.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
@@ -8660,8 +8660,9 @@ fn dispatch_verb(
         }
         // What Windows' WM_CHAR hands the input handler (#1139): a Unicode
         // packet's text (`SendInput` with KEYEVENTF_UNICODE, which has no
-        // key-down `on_key` sees), or the twin of a key `on_key` typed, which
-        // it drops. The handler's own method, so it runs on every platform.
+        // key-down `on_key` sees), or the twin of a key: a withheld key's types
+        // it (#1277), a typed key's is dropped. The handler's own method, so
+        // it runs on every platform.
         "win-char" => {
             let text = arg_str(args, "text")?;
             app.windows_char(text, window, cx);
