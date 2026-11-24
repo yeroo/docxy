@@ -163,7 +163,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing Project's Task I
 - The suite's `apply_save` and yppxy's `App::save_to_path` add it to the
   save's status after a successful save (`saved N bytes → <path>. <note>`,
   `Saved <path>. <note>`); the save itself, its bytes and its clean state
-  are as before, with no prompt.
+  are as before, with no prompt. `proj.save` (both hosts' control verb)
+  adds it to its reply as `note` (absent when nothing is lost), and yppxy's
+  headless `--save` prints `yppxy: <path>: <note>` on stderr, stdout left
+  to `--command`'s status, the exit still success.
 - Not done: a save whose status nobody sees (yppxy `:wq`/`:x`, the suite's
   Save on closing a tab) gives the note to no one; an `.xml` save also drops
   `formatting.xml` and `tableview.xml` without a word, and the note names

@@ -412,7 +412,11 @@ File handling differs from the TUI:
   reject `.mpp`. Saving commits a valid pending cell edit first; invalid cell
   input blocks the write. A subsequent I/O failure preserves the file binding
   and retains the committed edit in memory, including its dirty flag and history.
-  A successful save clears undo and redo, as in Project (#863).
+  A successful save clears undo and redo, as in Project (#863). A save to a
+  type that drops Display on Timeline or Marked (any but the built-in `.yppx`)
+  adds `note`, the sentence the status gives ("Display on Timeline is not
+  saved in .xml files; save as .yppx to keep it"), to the reply (#1618); the
+  save still succeeds.
   Saves and exports normally write and sync a temporary sibling before replacing
   the destination. A failed temporary write leaves the previous file intact. On
   Unix, if the original owner/group cannot be restored on the temp, the synced
