@@ -25592,6 +25592,7 @@ mod last_verb_tests {
             s.set_backfill_progress("G", "https://graph/G?$skiptoken=3", 4, SCOPE_ALL)
                 .unwrap();
             s.set_reminder_expand_refused("G", true).unwrap();
+            s.set_backfill_expand_refused("G").unwrap();
             drop_2301_columns(&s.conn);
         }
         let s = Store::open(&path).unwrap();

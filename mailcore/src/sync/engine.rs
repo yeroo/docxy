@@ -6436,13 +6436,7 @@ impl Engine {
                             // edit made during the POST (#2005): sent by
                             // this drain, not at the next tick or command.
                             if follow_up {
-                                if let Ok(queued) = self.store.pending_ops() {
-                                    let seen = newest;
-                                    for later in queued.into_iter().filter(|r| r.seq > seen) {
-                                        newest = later.seq;
-                                        ops.push_back(later);
-                                    }
-                                }
+                                self.take_ops_queued_since(&mut newest, &mut ops);
                             }
                         }
                         Applied::Refused(e) => self.emit(SyncEvent::Error(e)),
@@ -6485,13 +6479,7 @@ impl Engine {
                         // this drain, before `sync_after_send`, as #2005's
                         // follow-up does.
                         if self.record_sent_verb(id) {
-                            if let Ok(queued) = self.store.pending_ops() {
-                                let seen = newest;
-                                for later in queued.into_iter().filter(|r| r.seq > seen) {
-                                    newest = later.seq;
-                                    ops.push_back(later);
-                                }
-                            }
+                            self.take_ops_queued_since(&mut newest, &mut ops);
                         }
                     }
                 }
@@ -6664,6 +6652,22 @@ impl Engine {
             Drain::Deferred
         } else {
             Drain::Done
+        }
+    }
+
+    /// Adds to a running drain's `ops` the ops queued during it (#2005's
+    /// follow-up `UpdateEvent`, #2301's `SetLastVerb`): those newer than
+    /// `newest`, the newest op the drain has taken, which moves on to the
+    /// last one added. An op the drain left queued is older, so it is never
+    /// taken twice. A queue that cannot be read adds nothing: the next drain
+    /// sends them.
+    fn take_ops_queued_since(&self, newest: &mut i64, ops: &mut VecDeque<OutboxRow>) {
+        if let Ok(queued) = self.store.pending_ops() {
+            let seen = *newest;
+            for later in queued.into_iter().filter(|r| r.seq > seen) {
+                *newest = later.seq;
+                ops.push_back(later);
+            }
         }
     }
 
