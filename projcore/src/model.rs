@@ -1666,13 +1666,15 @@ pub struct Project {
     /// Project-level MSPDI leaves that are prefixed or carry attributes
     /// (`<x:Ext>`, `<Author xsi:nil="true"/>`), which an option's name and
     /// text cannot hold, as (key, the leaf's XML) in read order (#429). The
-    /// key is the qualified name, or `{uri}name` for an unprefixed leaf
-    /// declaring a default namespace other than MSPDI's, which then matches
-    /// no schema slot, plain option or `set_option`. The XML is rebuilt from
-    /// the parsed, decoded leaf with the save's escaping, which drops the
-    /// characters XML 1.0 forbids (#1120), and carries every valid prefixed
-    /// namespace declaration in scope that the leaf lacked, so a save writes
-    /// an equivalent element. An unprefixed leaf with no default of its own
+    /// key of an unprefixed leaf is its name. A prefixed leaf, or an
+    /// unprefixed one declaring a default namespace other than MSPDI's, is
+    /// keyed by its expanded name, `{uri}local`, which matches no schema
+    /// slot, plain option or `set_option`, and which two spellings of one
+    /// element share. The XML is rebuilt from the parsed, decoded leaf with
+    /// the save's escaping, which drops the characters XML 1.0 forbids
+    /// (#1120), and carries the valid prefixed namespace declarations in
+    /// scope that the leaf uses and lacked, so a save writes an equivalent
+    /// element. An unprefixed leaf with no default of its own
     /// takes the saved root's default namespace, as a plain option does. A
     /// leaf that is malformed, has a name XML refuses or a duplicate
     /// attribute, uses a prefix bound nowhere valid, or is a prefixed MSPDI

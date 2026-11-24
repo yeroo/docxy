@@ -154,15 +154,18 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing Project file rea
   `<Project>` (`<x:Ext>1</x:Ext>`, `<Author xsi:nil="true"/>`,
   `<Other xmlns="urn:other">2</Other>`) in `Project::raw_options` as
   (key, XML), through `read_raw_leaf`. That covers modeled options too:
-  `read_option` stores the leaf and leaves the field alone. The key is the
-  qualified name, or `{uri}name` (Clark notation) for an unprefixed leaf
-  with its own non-MSPDI default `xmlns`. That element is not the header's,
-  so it takes no schema slot, loses to no plain option, and `set_option`
-  leaves it alone.
+  `read_option` stores the leaf and leaves the field alone. An unprefixed
+  leaf is keyed by its name. A prefixed leaf, or an unprefixed one with its
+  own non-MSPDI default `xmlns`, is keyed by its expanded name, `{uri}local`
+  (Clark notation). Such an element is not the header's, so it takes no
+  schema slot, loses to no plain option, and `set_option` leaves it alone.
+  Two spellings of one element (`<x:Ext>` and `<y:Ext>` with one URI) share
+  a key, and the later wins, as for repeats.
 - The leaf is rebuilt from its parsed parts, not copied: its name, its own
-  attributes in source order, then every valid prefixed declaration in
-  scope that it does not make itself (all of them, since a QName can hide in
-  a value). One rule: nothing raw from `XmlParser` is written or compared.
+  attributes in source order, then the valid prefixed declarations in scope
+  that it uses and does not make itself. It uses the prefixes of its name
+  and attribute names, and one starting an attribute value or its text,
+  where a QName can hide (`xsi:type="x:T"`). One rule: nothing raw from `XmlParser` is written or compared.
   `attr_value` normalises, decodes and scrubs every value, declarations
   included, before the checks, `uri_of` and the output. Values are then
   written `"`-quoted by `esc_attr_into` (tab, LF and CR as references).
@@ -181,8 +184,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing Project file rea
     prefixed URI, a non-NCName prefix, `xmlns:xmlns`, `xml` bound elsewhere
     than its URI, or anything else bound to the `xml` or `xmlns` URI. Such a
     declaration on the root is not injected, so its prefix is unbound;
-  - it is prefixed and its namespace is MSPDI's or the root's default: it
-    is the plain element (`<p:Name>`), which a save writes as such;
+  - it is prefixed and its namespace is MSPDI's or the root's default
+    (`<p:Name>`). Only the unprefixed spelling of an MSPDI element is read
+    and written, and keeping this one raw would write that element twice,
+    so it and its value are dropped, as before #429;
   - its source is not one complete element. A fresh `XmlParser::new(raw)`
     checks the slice, because the reader's `is_malformed` is sticky and its
     end tags never check their names (`<x:Ext>1</Project>` would swallow the
@@ -193,9 +198,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing Project file rea
   checks a save for what `XmlParser` lets through.
 - The writer puts a raw leaf of a `PROJECT_HEADER` name in that slot when
   `header_text` gives nothing, and the others after the plain unknown
-  options. A plain value of the name (an option, or a modeled field) wins
+  options. A plain value of the key (an option, or a modeled field) wins
   even when it was read earlier. `Project::set_option` drops the raw leaf of
-  its name. `leveling.rs` sets all five leveling options on each
+  its key. `leveling.rs` sets all five leveling options on each
   `level.options` edit, so it drops a raw leaf of an unchanged one. That is
   harmless, since a nil reads as the default, and it is not special-cased.
 - An unprefixed raw leaf lands in the saved root's default
