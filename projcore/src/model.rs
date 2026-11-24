@@ -1663,6 +1663,16 @@ pub struct Project {
     /// lands here only when its text does not parse; one that parses is kept
     /// in its field and saved in canonical form (`true` saves as `1`).
     pub options: Vec<(String, String)>,
+    /// Project-level MSPDI leaves that are prefixed or carry attributes
+    /// (`<x:Ext>`, `<Author xsi:nil="true"/>`), which an option's name and
+    /// text cannot hold, as (qualified element name, raw XML of the whole
+    /// leaf) in read order (#429). The raw XML carries every namespace
+    /// declaration of the source root it lacked, so a save writes it back as
+    /// it was read; a leaf that is malformed, or uses a prefix bound nowhere,
+    /// is not kept. A plain value of the same name, an option or a modeled
+    /// field, wins over it even when it was read earlier, and
+    /// [`Project::set_option`] replaces it. Blocks are never kept here.
+    pub raw_options: Vec<(String, String)>,
     /// Outline code definitions (each an MSPDI `<OutlineCode>` from the
     /// project's `<OutlineCodes>` block), in read order.
     pub outline_code_definitions: Vec<XmlElement>,
@@ -1708,6 +1718,7 @@ impl Default for Project {
             hours_per_week: 40.0,
             default_calendar_uid: 1,
             options: Vec::new(),
+            raw_options: Vec::new(),
             outline_code_definitions: Vec::new(),
             wbs_masks: None,
             extended_attribute_definitions: Vec::new(),
@@ -1852,8 +1863,10 @@ impl Project {
     }
 
     /// Set an option's stored text in place (or append it), or remove it
-    /// with `None` (#1587).
+    /// with `None` (#1587). Either way a raw leaf of that name read from the
+    /// file ([`Project::raw_options`]) is dropped: the edit replaces it.
     pub fn set_option(&mut self, name: &str, value: Option<&str>) {
+        self.raw_options.retain(|(n, _)| n != name);
         match (self.options.iter_mut().find(|(n, _)| n == name), value) {
             (Some(slot), Some(v)) => slot.1 = v.to_string(),
             (None, Some(v)) => self.options.push((name.to_string(), v.to_string())),

@@ -63,9 +63,9 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                     "NewTasksAreManual" => proj.new_tasks_are_manual = bool_of(&mut p),
                     // Modeled options: a value that parses fills the field; one
                     // that does not is kept verbatim. Of repeated leaves, the
-                    // later wins, as `set_option` has it; a block or an
-                    // attributed or prefixed repeat is skipped (see
-                    // `read_option`).
+                    // later wins, as `set_option` has it; a block is skipped,
+                    // and an attributed or prefixed leaf is kept raw without
+                    // touching the field (see `read_option`).
                     "NewTasksEffortDriven" => {
                         read_option(&mut p, &mut proj, name, parse_bool, |proj| {
                             &mut proj.new_tasks_effort_driven
@@ -133,14 +133,24 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                         "ExtendedAttribute",
                         &mut proj.extended_attribute_definitions,
                     ),
-                    // A prefixed or attributed element (leaf or block) is
-                    // consumed here, including OutlineCodes/WBSMasks wrappers:
-                    // an option stores only name and text, so writing it back
-                    // would lose namespace bindings or attributes like xsi:nil.
+                    // A prefixed or attributed element: a leaf is kept raw,
+                    // with the namespace declarations it needs (#429); a
+                    // block is dropped, as a plain unknown block is. An
+                    // attributed or prefixed OutlineCodes/WBSMasks wrapper is
+                    // dropped too (#428): a non-empty one is a block anyway,
+                    // so this only refuses an empty one (`<WBSMasks a="1"/>`),
+                    // which a raw leaf would otherwise keep.
                     // The final arm keeps plain unknown leaves as options.
                     // Plain unknown blocks such as Views reach that arm, but
                     // leaf_text_of returns None and drops them whole.
-                    _ if !kept_as_element(&p) => p.skip_element(),
+                    _ if !kept_as_element(&p) => {
+                        let local = name.split_once(':').map_or(name.as_str(), |(_, l)| l);
+                        if matches!(local, "OutlineCodes" | "WBSMasks") {
+                            p.skip_element();
+                        } else if let Some(raw) = read_raw_leaf(&mut p) {
+                            set_option(&mut proj.raw_options, name, raw);
+                        }
+                    }
                     _ => {
                         if let Some(text) = leaf_text_of(&mut p) {
                             set_option(&mut proj.options, name, text);
@@ -225,9 +235,11 @@ fn element_text(p: &mut XmlParser) -> (String, bool) {
 
 /// Read a modeled project option into its field. Text that parses sets the
 /// field and drops any stored text of an earlier repeat; text that does not
-/// clears the field and is stored verbatim. A block, a prefixed element or one
-/// with attributes is skipped, as an unmodeled option's is, and leaves an
-/// earlier repeat's value in place.
+/// clears the field and is stored verbatim. A block is skipped, as an
+/// unmodeled option's is. A prefixed or attributed leaf is kept raw (see
+/// [`read_raw_leaf`]) and leaves the field and an earlier repeat's value in
+/// place: a save writes the raw leaf only when no plain value of its name is
+/// left, so a plain repeat wins over a raw one even when it came first.
 fn read_option<T>(
     p: &mut XmlParser,
     proj: &mut Project,
@@ -236,7 +248,9 @@ fn read_option<T>(
     field: impl Fn(&mut Project) -> &mut Option<T>,
 ) {
     if !kept_as_element(p) {
-        p.skip_element();
+        if let Some(raw) = read_raw_leaf(p) {
+            set_option(&mut proj.raw_options, name, raw);
+        }
         return;
     }
     let Some(text) = leaf_text_of(p) else {
@@ -263,13 +277,82 @@ fn parse_bool(text: &str) -> Option<bool> {
     }
 }
 
-/// Store an unmodeled project option. A repeated name keeps its first
-/// position and takes the later value, as a reader of the last value would.
+/// Store an unmodeled project option, or a raw leaf. A repeated name keeps
+/// its first position and takes the later value, as a reader of the last
+/// value would.
 fn set_option(options: &mut Vec<(String, String)>, name: String, text: String) {
     match options.iter_mut().find(|(n, _)| *n == name) {
         Some(slot) => slot.1 = text,
         None => options.push((name, text)),
     }
+}
+
+/// Read the prefixed or attributed header leaf whose `Start` was just
+/// consumed, whole, as the raw XML a save writes back (#429): its source text
+/// with each prefixed namespace declaration in scope that it does not make
+/// itself added to its start tag, so it reads the same under the saved root.
+/// All of them, not only the ones its names use, since a QName can hide in a
+/// value (`xsi:type="x:T"`). `None`, the element consumed and dropped as
+/// before, when it is a block; when a prefix of its name or of an attribute's
+/// is bound nowhere, since a namespace-ill-formed save is a file Project
+/// refuses; or when its text is not one complete well-formed element on its
+/// own (an end tag that does not match, a bad attribute, the end of input),
+/// checked with a fresh parser because the reader's `is_malformed` is sticky
+/// and its end tags never check their names.
+fn read_raw_leaf(p: &mut XmlParser) -> Option<String> {
+    let start = p.start_pos();
+    let qname = p.name();
+    let in_scope = p.namespace_attrs();
+    let bound = |name: &str| match name.split_once(':') {
+        None | Some(("xml", _)) => true,
+        Some((prefix, _)) => in_scope
+            .iter()
+            .any(|ns| ns.name.strip_prefix("xmlns:") == Some(prefix)),
+    };
+    let bound = bound(qname)
+        && p.attrs()
+            .iter()
+            .filter(|a| a.name != "xmlns" && !a.name.starts_with("xmlns:"))
+            .all(|a| bound(a.name));
+    // In scope includes the element's own declarations; add the others.
+    let mut declarations = String::new();
+    for ns in in_scope {
+        if ns.name.starts_with("xmlns:") && !p.attrs().iter().any(|a| a.name == ns.name) {
+            let quote = if ns.value.contains('"') { '\'' } else { '"' };
+            declarations.push_str(&format!(" {}={quote}{}{quote}", ns.name, ns.value));
+        }
+    }
+    let mut leaf = true;
+    loop {
+        match p.next() {
+            Event::Start => {
+                leaf = false;
+                p.skip_element();
+            }
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    let raw = p.raw_slice(start, p.pos());
+    if !leaf || !bound || !is_one_element(raw, qname) {
+        return None;
+    }
+    let name_end = 1 + qname.len();
+    Some(format!(
+        "{}{declarations}{}",
+        &raw[..name_end],
+        &raw[name_end..]
+    ))
+}
+
+/// Whether `raw` is exactly one complete, well-formed element named `name`.
+fn is_one_element(raw: &str, name: &str) -> bool {
+    let mut p = XmlParser::new(raw);
+    p.next() == Event::Start
+        && p.name() == name
+        && p.skip_element_complete()
+        && !p.is_malformed()
+        && p.pos() == raw.len()
 }
 
 /// Reject ambiguous explicit IDs before allocating missing ones in file order.
@@ -1516,7 +1599,12 @@ pub(crate) fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// Emits the fields projcore models — enough for MS Project to open the file
 /// and for our own reader to round-trip — plus every project-level option the
 /// reader kept verbatim in [`Project::options`]: the schema's in
-/// [`PROJECT_HEADER`] order, then any others in read order. Outline code
+/// [`PROJECT_HEADER`] order, then any others in read order. A prefixed or
+/// attributed leaf the reader kept raw ([`Project::raw_options`], #429) is
+/// written as it was read, in its schema slot or after the other options,
+/// unless a plain value of its name is written instead. An unprefixed one
+/// lands in the saved root's default namespace, as a plain option does, even
+/// when the source root declared none. Outline code
 /// definitions, WBS masks and extended attribute definitions follow in schema
 /// order. Other elements outside the model (views, etc.) are not preserved:
 /// this is a model-faithful writer, not a byte-faithful one.
@@ -1575,9 +1663,16 @@ pub fn write_mspdi(proj: &Project) -> String {
     // actual start of its tasks, and a save that writes dates moves that: it pins the anchor it scheduled
     // from, as Project always states one (#701).
     let anchor = pinned_start_date(proj, &sched, &dates);
+    let raw_leaf = |s: &mut String, raw: &str| {
+        s.push_str("  ");
+        s.push_str(raw);
+        s.push('\n');
+    };
     for &name in PROJECT_HEADER {
         if let Some(text) = header_text(proj, name, anchor) {
             tag(&mut s, 1, name, &text);
+        } else if let Some((_, raw)) = proj.raw_options.iter().find(|(n, _)| n == name) {
+            raw_leaf(&mut s, raw);
         }
     }
     // Options the schema does not name (a newer Project's, or another
@@ -1585,6 +1680,11 @@ pub fn write_mspdi(proj: &Project) -> String {
     for (name, text) in &proj.options {
         if !PROJECT_HEADER.contains(&name.as_str()) {
             tag(&mut s, 1, name, text);
+        }
+    }
+    for (name, raw) in &proj.raw_options {
+        if !PROJECT_HEADER.contains(&name.as_str()) && proj.option(name).is_none() {
+            raw_leaf(&mut s, raw);
         }
     }
     // Definition blocks follow header leaves and precede Calendars and Tasks.
@@ -7119,8 +7219,25 @@ mod tests {
         assert!(!xml.contains("<Alias") && !xml.contains("<FieldID>1<"));
     }
 
+    const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
+
+    /// `(name, raw)` pairs as owned strings, for comparing `raw_options`.
+    fn raws(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(n, r)| (n.to_string(), r.to_string()))
+            .collect()
+    }
+
+    /// Whether `xml` reads as one complete element (the saved file parses).
+    fn parses_whole(xml: &str) -> bool {
+        let mut p = XmlParser::new(xml);
+        while p.next() != Event::Start {}
+        p.skip_element_complete() && !p.is_malformed()
+    }
+
     #[test]
-    fn namespaced_or_attributed_header_leaves_are_not_stored() {
+    fn prefixed_or_attributed_header_leaves_survive_a_save() {
         let proj = read_mspdi(
             r#"<Project xmlns="http://schemas.microsoft.com/project" xmlns:x="urn:x">
                  <x:Ext>1</x:Ext>
@@ -7131,11 +7248,217 @@ mod tests {
                </Project>"#,
         )
         .unwrap();
-        // Only the plain leaf is an option; a save could not rebind the rest.
+        // The plain leaf is an option; the others are kept whole, each with
+        // the root's declarations it lacked (#429).
         assert_eq!(proj.options, [("Author".to_string(), "Me".to_string())]);
+        assert_eq!(
+            proj.raw_options,
+            raws(&[
+                ("x:Ext", r#"<x:Ext xmlns:x="urn:x">1</x:Ext>"#),
+                (
+                    "Other",
+                    r#"<Other xmlns:x="urn:x" xmlns="urn:other">2</Other>"#
+                ),
+                (
+                    "Nil",
+                    r#"<Nil xmlns:x="urn:x" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:nil="true"/>"#
+                ),
+            ])
+        );
         let xml = write_mspdi(&proj);
-        assert!(!xml.contains("x:") && !xml.contains("urn:other"));
-        assert!(!xml.contains("<Other>") && !xml.contains("<Nil>"));
+        for (_, raw) in &proj.raw_options {
+            assert!(xml.contains(&format!("  {raw}\n")), "{raw} in {xml}");
+        }
+        assert!(parses_whole(&xml), "{xml}");
+        // In the saved file, x:Ext's prefix still resolves to urn:x.
+        let mut p = XmlParser::new(&xml);
+        loop {
+            match p.next() {
+                Event::Start if p.name() == "x:Ext" => break,
+                Event::Eof => panic!("no x:Ext in {xml}"),
+                _ => {}
+            }
+        }
+        assert!(
+            p.namespace_attrs()
+                .iter()
+                .any(|a| a.name == "xmlns:x" && a.value == "urn:x")
+        );
+        // A second round trip changes nothing.
+        assert_eq!(write_mspdi(&read_mspdi(&xml).unwrap()), xml);
+    }
+
+    #[test]
+    fn raw_header_leaf_takes_its_schema_slot() {
+        let proj = read_mspdi(&format!(
+            r#"<Project xmlns:xsi="{XSI}"><Title>T</Title><CreationDate>2020-01-01T08:00:00</CreationDate><Author xsi:nil="true"/></Project>"#
+        ))
+        .unwrap();
+        let xml = write_mspdi(&proj);
+        let author = format!(r#"  <Author xmlns:xsi="{XSI}" xsi:nil="true"/>"#);
+        let at = |needle: &str| {
+            xml.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {xml}"))
+        };
+        assert!(at("<Title>T</Title>") < at(&author));
+        assert!(at(&author) < at("<CreationDate>"));
+        assert_eq!(xml.matches("<Author").count(), 1);
+    }
+
+    #[test]
+    fn a_plain_value_wins_over_a_raw_leaf() {
+        // A plain repeat of a raw leaf's name is saved, the raw one is not.
+        let proj = read_mspdi(&format!(
+            r#"<Project xmlns:xsi="{XSI}"><Author xsi:nil="true"/><Author>Me</Author></Project>"#
+        ))
+        .unwrap();
+        let xml = write_mspdi(&proj);
+        assert_eq!(xml.matches("<Author").count(), 1, "{xml}");
+        assert!(xml.contains("<Author>Me</Author>"));
+        // ... also when the raw one is the later repeat (unlike two plain
+        // repeats, where the later wins).
+        let proj = read_mspdi(r#"<Project><Foo>1</Foo><Foo a="b">2</Foo></Project>"#).unwrap();
+        let xml = write_mspdi(&proj);
+        assert_eq!(xml.matches("<Foo").count(), 1, "{xml}");
+        assert!(xml.contains("<Foo>1</Foo>"));
+
+        // A modeled option's raw leaf is saved in its slot until the field
+        // is set. The root has no default xmlns: the leaf moves into the
+        // writer's, as a plain option does.
+        let mut proj = read_mspdi(&format!(
+            r#"<Project xmlns:xsi="{XSI}"><Autolink xsi:nil="true"/></Project>"#
+        ))
+        .unwrap();
+        assert_eq!(proj.autolink, None);
+        let raw = format!(r#"<Autolink xmlns:xsi="{XSI}" xsi:nil="true"/>"#);
+        assert!(write_mspdi(&proj).contains(&format!("  {raw}\n")));
+        proj.autolink = Some(true);
+        let xml = write_mspdi(&proj);
+        assert_eq!(xml.matches("<Autolink").count(), 1, "{xml}");
+        assert!(xml.contains("<Autolink>1</Autolink>"));
+
+        // An edit through `set_option` replaces the raw leaf, or removes it.
+        let raw_author =
+            format!(r#"<Project xmlns:xsi="{XSI}"><Author xsi:nil="true"/></Project>"#);
+        let mut proj = read_mspdi(&raw_author).unwrap();
+        assert_eq!(proj.raw_options.len(), 1);
+        proj.set_option("Author", None);
+        assert!(proj.raw_options.is_empty());
+        assert!(!write_mspdi(&proj).contains("<Author"));
+        let mut proj = read_mspdi(&raw_author).unwrap();
+        proj.set_option("Author", Some("X"));
+        assert!(proj.raw_options.is_empty());
+        let xml = write_mspdi(&proj);
+        assert_eq!(xml.matches("<Author").count(), 1, "{xml}");
+        assert!(xml.contains("<Author>X</Author>"));
+
+        // Raw repeats of one name keep the first position and the later leaf.
+        let proj =
+            read_mspdi(r#"<Project><Foo a="1"/><Bar a="0"/><Foo a="2"/></Project>"#).unwrap();
+        assert_eq!(
+            proj.raw_options,
+            raws(&[("Foo", r#"<Foo a="2"/>"#), ("Bar", r#"<Bar a="0"/>"#)])
+        );
+        let xml = write_mspdi(&proj);
+        assert_eq!(xml.matches("<Foo").count(), 1, "{xml}");
+        assert!(xml.find(r#"<Foo a="2"/>"#) < xml.find(r#"<Bar a="0"/>"#));
+    }
+
+    #[test]
+    fn prefixed_or_attributed_header_blocks_are_still_dropped() {
+        let proj = read_mspdi(
+            r#"<Project xmlns:x="urn:x"><x:Ext><Inner>1</Inner></x:Ext><Other a="1"><B/></Other><Author>A</Author></Project>"#,
+        )
+        .unwrap();
+        assert!(proj.raw_options.is_empty());
+        assert_eq!(proj.options, [("Author".to_string(), "A".to_string())]);
+        let xml = write_mspdi(&proj);
+        assert!(!xml.contains("x:Ext") && !xml.contains("<Other") && !xml.contains("Inner"));
+    }
+
+    #[test]
+    fn an_empty_attributed_wrapper_is_not_saved() {
+        let proj = read_mspdi(
+            r#"<Project xmlns:a="urn:a"><OutlineCodes a:b="1"/><WBSMasks a="1"/><x:OutlineCodes xmlns:x="urn:x"/></Project>"#,
+        )
+        .unwrap();
+        assert!(proj.raw_options.is_empty());
+        let xml = write_mspdi(&proj);
+        assert!(
+            !xml.contains("OutlineCodes") && !xml.contains("WBSMasks"),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn injected_declaration_keeps_a_quote_in_its_value() {
+        let proj = read_mspdi(r#"<Project xmlns:x='urn:"q"'><x:A>1</x:A></Project>"#).unwrap();
+        assert_eq!(
+            proj.raw_options,
+            raws(&[("x:A", r#"<x:A xmlns:x='urn:"q"'>1</x:A>"#)])
+        );
+        let xml = write_mspdi(&proj);
+        assert!(parses_whole(&xml), "{xml}");
+        assert_eq!(read_mspdi(&xml).unwrap().raw_options, proj.raw_options);
+    }
+
+    #[test]
+    fn malformed_or_mismatched_raw_leaves_are_dropped() {
+        for xml in [
+            // A mismatched end tag.
+            r#"<Project xmlns:x="urn:x"><x:Ext>1</x:Other><Author>A</Author></Project>"#,
+            // An unquoted attribute value.
+            r#"<Project><Nil a=1/><Author>A</Author></Project>"#,
+            // An end tag that would swallow the root's.
+            r#"<Project xmlns:x="urn:x"><Author>A</Author><x:Ext>1</Project>"#,
+        ] {
+            let proj = read_mspdi(xml).unwrap();
+            assert!(proj.raw_options.is_empty(), "{xml}: {:?}", proj.raw_options);
+            assert_eq!(proj.option("Author"), Some("A"), "{xml}");
+            let saved = write_mspdi(&proj);
+            assert!(parses_whole(&saved), "{saved}");
+            assert!(
+                !saved.contains("x:Ext") && !saved.contains("<Nil"),
+                "{saved}"
+            );
+        }
+        // Each leaf is judged on its own: an earlier malformed element does
+        // not drop a later good one, nor keep a later bad one.
+        let proj = read_mspdi(
+            r#"<Project xmlns:x="urn:x"><Junk a=1/><x:A>1</x:A><Nil b=2/><Author>A</Author></Project>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            proj.raw_options,
+            raws(&[("x:A", r#"<x:A xmlns:x="urn:x">1</x:A>"#)])
+        );
+        assert_eq!(proj.option("Author"), Some("A"));
+    }
+
+    #[test]
+    fn unbound_prefix_leaves_are_dropped() {
+        let proj = read_mspdi(
+            r#"<Project><y:Ext>1</y:Ext><Nil q:a="1"/><Lang xml:lang="en">x</Lang></Project>"#,
+        )
+        .unwrap();
+        // `xml:` is always bound; `y` and `q` are not.
+        assert_eq!(
+            proj.raw_options,
+            raws(&[("Lang", r#"<Lang xml:lang="en">x</Lang>"#)])
+        );
+        let xml = write_mspdi(&proj);
+        assert!(!xml.contains("y:Ext") && !xml.contains("<Nil"), "{xml}");
+    }
+
+    #[test]
+    fn a_raw_header_leaf_survives_a_yppx_save() {
+        let proj = read_mspdi(r#"<Project xmlns:x="urn:x"><x:Ext>1</x:Ext></Project>"#).unwrap();
+        let bytes = crate::yppx::write_yppx(&proj).unwrap();
+        let back = crate::yppx::read_yppx(&bytes).unwrap();
+        assert_eq!(
+            back.raw_options,
+            raws(&[("x:Ext", r#"<x:Ext xmlns:x="urn:x">1</x:Ext>"#)])
+        );
     }
 
     #[test]

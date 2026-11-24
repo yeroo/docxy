@@ -147,3 +147,34 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing Project file rea
   `char::is_control` characters from each field, as `LineEdit::paste`
   (`suite/docxy/src/project/cell.rs`) does; a field of only control
   characters is an empty field (it clears Name).
+
+## Prefixed or attributed header leaves (#429)
+
+- `read_mspdi` keeps a prefixed or attributed leaf directly under
+  `<Project>` (`<x:Ext>1</x:Ext>`, `<Author xsi:nil="true"/>`,
+  `<Other xmlns="urn:other">2</Other>`) in `Project::raw_options` as
+  (qualified name, raw XML), through `read_raw_leaf`. That covers modeled
+  options too: `read_option` stores the raw leaf and leaves the field alone.
+  Every prefixed declaration in scope that the leaf does not make itself is
+  added to its start tag (all of them, since a QName can hide in a value),
+  with `'` quotes when the value holds `"`. So `write_mspdi` writes the leaf
+  back as it was read, and a second round trip changes nothing.
+- A leaf is dropped, as before #429, when it is a block, when a prefix of
+  its name or of an attribute's is bound nowhere (`xml:` always is), or when
+  its slice is not one complete well-formed element. A fresh
+  `XmlParser::new(raw)` checks the slice, because the reader's
+  `is_malformed` is sticky and its end tags never check their names
+  (`<x:Ext>1</Project>` would swallow the root's end). An attributed or
+  prefixed `OutlineCodes`/`WBSMasks` wrapper is dropped even when empty
+  (#428 is parked).
+- The writer puts a raw leaf of a `PROJECT_HEADER` name in that slot when
+  `header_text` gives nothing, and the others after the plain unknown
+  options. A plain value of the name (an option, or a modeled field) wins
+  even when it was read earlier. `Project::set_option` drops the raw leaf of
+  its name. `leveling.rs` sets all five leveling options on each
+  `level.options` edit, so it drops a raw leaf of an unchanged one. That is
+  harmless, since a nil reads as the default, and it is not special-cased.
+- An unprefixed raw leaf lands in the saved root's default
+  `http://schemas.microsoft.com/project` namespace even when the source root
+  declared none, as plain options do. Attributes on the always-written
+  modeled fields (`<Name foo="x">`) are still dropped (the value is kept).
