@@ -733,6 +733,14 @@ fn apply_other(client: &GraphClient, store: &Store, op: &OutboxOp) -> Result<(),
             Some(target) => client.snooze_message_reminder(&target, new_reminder_utc),
             None => Ok(()),
         },
+        // An answered message's last verb (#2301), as the reminder ops: under
+        // the id the original is stored as now, nothing for one that still
+        // resolves to `local:` (never on Graph). A 404 is returned as is:
+        // the drain drops the op, silently.
+        OutboxOp::SetLastVerb { id, verb, at } => match on_graph(store, id)? {
+            Some(target) => client.set_last_verb(&target, *verb, at),
+            None => Ok(()),
+        },
         OutboxOp::CreateContact { .. } => unreachable!("apply_op handles CreateContact"),
         // Only the properties the edit changed (#2063), each with its value
         // at send time. An id still `local:` after resolving has no Graph
@@ -1559,6 +1567,8 @@ mod tests {
                     in_reply_to: String::new(),
                     size: None,
                     is_event_message: false,
+                    last_verb: None,
+                    last_verb_time: None,
                 },
             )
             .unwrap();
@@ -4342,6 +4352,8 @@ mod tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         };
         store.upsert_message("DRAFTS", &draft).unwrap();
         store
@@ -4455,6 +4467,8 @@ mod tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         };
         store.upsert_message("DRAFTS", &draft).unwrap();
         store
@@ -6385,6 +6399,8 @@ mod tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         }
     }
 

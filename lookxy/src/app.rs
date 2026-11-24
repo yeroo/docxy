@@ -4226,6 +4226,8 @@ impl App {
                     in_reply_to: String::new(),
                     size: None,
                     is_event_message: false,
+                    last_verb: None,
+                    last_verb_time: None,
                 },
             )
             .expect("seed message");
@@ -4648,6 +4650,8 @@ pub(crate) mod tests {
                     in_reply_to: String::new(),
                     size: None,
                     is_event_message: false,
+                    last_verb: None,
+                    last_verb_time: None,
                 },
             )
             .expect("seed invite");
@@ -5134,6 +5138,8 @@ pub(crate) mod tests {
                     in_reply_to: String::new(),
                     size: None,
                     is_event_message: false,
+                    last_verb: None,
+                    last_verb_time: None,
                 },
             )
             .unwrap();
@@ -5378,6 +5384,8 @@ pub(crate) mod tests {
                     in_reply_to: String::new(),
                     size: None,
                     is_event_message: false,
+                    last_verb: None,
+                    last_verb_time: None,
                 },
             )
             .expect("seed m2");
@@ -5420,6 +5428,8 @@ pub(crate) mod tests {
                     in_reply_to: String::new(),
                     size: None,
                     is_event_message: false,
+                    last_verb: None,
+                    last_verb_time: None,
                 },
             )
             .expect("seed m3");
@@ -6117,6 +6127,8 @@ pub(crate) mod tests {
                     in_reply_to: String::new(),
                     size: None,
                     is_event_message: false,
+                    last_verb: None,
+                    last_verb_time: None,
                 },
             )
             .expect("update message to has_attachments=true");
@@ -6164,6 +6176,8 @@ pub(crate) mod tests {
                     in_reply_to: String::new(),
                     size: None,
                     is_event_message: false,
+                    last_verb: None,
+                    last_verb_time: None,
                 },
             )
             .expect("seed message");
@@ -7281,6 +7295,8 @@ pub(crate) mod tests {
                     in_reply_to: String::new(),
                     size: None,
                     is_event_message: false,
+                    last_verb: None,
+                    last_verb_time: None,
                 },
             )
             .expect("mark m1 has_attachments");
@@ -7318,6 +7334,8 @@ pub(crate) mod tests {
                     in_reply_to: String::new(),
                     size: None,
                     is_event_message: false,
+                    last_verb: None,
+                    last_verb_time: None,
                 },
             )
             .expect("mark m2 has_attachments");
@@ -7480,6 +7498,8 @@ pub(crate) mod tests {
                     in_reply_to: "<m1@x>".into(),
                     size: None,
                     is_event_message: false,
+                    last_verb: None,
+                    last_verb_time: None,
                 },
             )
             .unwrap();
@@ -7671,6 +7691,8 @@ pub(crate) mod tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         };
         app.store
             .upsert_message("inbox", &a("a1", "2026-07-17T10:00:00Z"))

@@ -12,11 +12,11 @@
 use crate::graph::model::{
     AttachmentMeta, AutomaticReplies, Body, Calendar, ContactFields, ContactPhoto, DeltaPage,
     DirectoryGroup, DirectoryUser, DraftOptions, Event, EventDeltaItem, EventDeltaPage,
-    EventRecurrence, FolderContact, FolderListing, GroupMember, GroupMemberList, MailFolder,
-    MasterCategory, Me, MeetingMessage, Message, MessageFields, MessageHeader, OofStatus, Person,
-    PersonDetails, PhysicalAddress, Presence, REMINDER_SET_PROP, REMINDER_SIGNAL_TIME_PROP,
-    Recipient, Recurrence, ScheduleEntry, SearchHit, SubtreeItems, is_event_message_type,
-    parse_message_size, plain_to_html, reminder_time, to_utc,
+    EventRecurrence, FolderContact, FolderListing, GroupMember, GroupMemberList, LAST_VERB_PROP,
+    LAST_VERB_TIME_PROP, LastVerb, MailFolder, MasterCategory, Me, MeetingMessage, Message,
+    MessageFields, MessageHeader, OofStatus, Person, PersonDetails, PhysicalAddress, Presence,
+    REMINDER_SET_PROP, REMINDER_SIGNAL_TIME_PROP, Recipient, Recurrence, ScheduleEntry, SearchHit,
+    SubtreeItems, is_event_message_type, parse_message_size, plain_to_html, reminder_time, to_utc,
 };
 use crate::json::{self, Value};
 use std::collections::{HashMap, HashSet};
@@ -973,15 +973,17 @@ internetMessageId,isDraft";
 
 /// The `$expand` that brings a message's Outlook reminder (#2054), its
 /// message class (#2081), its protection (#2088), its In-Reply-To
-/// (#2096) and its size (#2123): the three
+/// (#2096), its size (#2123) and its last verb (#2301): the three
 /// PSETID_Common named properties `Message::from_json` reads
 /// (`PidLidReminderSet`, `PidLidReminderTime`, `PidLidReminderSignalTime`,
 /// the `REMINDER_*_PROP` ids), `PidTagMessageClass` (`MESSAGE_CLASS_PROP`),
 /// from which a meeting message's type is read, and `PidTagSensitivity`,
 /// the `msip_labels` header and `PidNameContentClass`
 /// (`SENSITIVITY_PROP`, `MSIP_LABELS_PROP`, `CONTENT_CLASS_PROP`), and
-/// `PidTagInReplyToId` (`IN_REPLY_TO_PROP`) and `PidTagMessageSize`
-/// (`MESSAGE_SIZE_PROP`), filtered so nothing else comes. Quotes and braces are percent-encoded, so the URL
+/// `PidTagInReplyToId` (`IN_REPLY_TO_PROP`), `PidTagMessageSize`
+/// (`MESSAGE_SIZE_PROP`), and `PidTagLastVerbExecuted` and
+/// `PidTagLastVerbExecutionTime` (`LAST_VERB_PROP`, `LAST_VERB_TIME_PROP`),
+/// filtered so nothing else comes. Quotes and braces are percent-encoded, so the URL
 /// goes out as written here. One expand: a 400 on any term sends the call
 /// again without all of them.
 const MESSAGE_EXPAND: &str = "singleValueExtendedProperties($filter=\
@@ -993,10 +995,12 @@ id%20eq%20%27Integer%200x0036%27%20or%20\
 id%20eq%20%27String%20%7B00020386-0000-0000-C000-000000000046%7D%20Name%20msip_labels%27%20or%20\
 id%20eq%20%27String%20%7B00020386-0000-0000-C000-000000000046%7D%20Name%20Content-Class%27%20or%20\
 id%20eq%20%27String%200x1042%27%20or%20\
-id%20eq%20%27Integer%200x0E08%27)";
+id%20eq%20%27Integer%200x0E08%27%20or%20\
+id%20eq%20%27Integer%200x1081%27%20or%20\
+id%20eq%20%27SystemTime%200x1082%27)";
 
-/// `target` with the reminder, class, protection, In-Reply-To and size
-/// `$expand` (#2054, #2081, #2088, #2096, #2123) appended.
+/// `target` with the reminder, class, protection, In-Reply-To, size and
+/// last verb `$expand` (#2054, #2081, #2088, #2096, #2123, #2301) appended.
 fn with_expand(target: &str) -> String {
     format!("{target}&$expand={MESSAGE_EXPAND}")
 }
@@ -2217,17 +2221,56 @@ impl GraphClient {
         self.patch_message_property(id, REMINDER_SIGNAL_TIME_PROP, new_reminder_utc)
     }
 
+    /// PATCH `/me/messages/{id}` with `PidTagLastVerbExecuted` set to
+    /// `verb`'s MAPI value and `PidTagLastVerbExecutionTime` to `at`, a
+    /// store-shaped UTC time sent as is (#2301): marks the original of an
+    /// answer mailcore sent as replied to, replied all to or forwarded, as
+    /// Outlook does after its own send, so every client shows the arrow.
+    ///
+    /// What Graph does by itself is not known. Its documentation of `send`
+    /// (of a `createReply` / `createReplyAll` / `createForward` draft, the
+    /// only way mailcore answers) and of the one-shot `reply` / `replyAll`
+    /// / `forward` says nothing about the original's last verb, and no live
+    /// mailbox can be tried from this repository (none in CI). So the
+    /// engine always sends this after a successful answer: the PATCH is
+    /// idempotent, and if Exchange did set the pair itself, it is written
+    /// again with the same verb and this client's send time. Should Graph
+    /// refuse a write of these tags, every sent answer would give one
+    /// `SyncEvent::Error` ("set last verb …") and a re-read of the
+    /// original: that Error is kept on purpose, as the symptom to look for.
+    pub fn set_last_verb(&self, id: &str, verb: LastVerb, at: &str) -> Result<(), GraphError> {
+        self.patch_message_properties(
+            id,
+            &[
+                (LAST_VERB_PROP, &verb.as_mapi().to_string()),
+                (LAST_VERB_TIME_PROP, at),
+            ],
+        )
+    }
+
     /// PATCH `/me/messages/{id}` with one `singleValueExtendedProperties`
     /// entry.
     fn patch_message_property(&self, id: &str, prop: &str, value: &str) -> Result<(), GraphError> {
+        self.patch_message_properties(id, &[(prop, value)])
+    }
+
+    /// PATCH `/me/messages/{id}` with one `singleValueExtendedProperties`
+    /// entry per `(id, value)` of `props`, in order.
+    fn patch_message_properties(&self, id: &str, props: &[(&str, &str)]) -> Result<(), GraphError> {
         let id = encode_path_segment(id);
         let path = format!("/me/messages/{id}");
+        let entries = props
+            .iter()
+            .map(|(prop, value)| {
+                Value::Object(vec![
+                    ("id".to_string(), Value::Str(prop.to_string())),
+                    ("value".to_string(), Value::Str(value.to_string())),
+                ])
+            })
+            .collect();
         let body = Value::Object(vec![(
             "singleValueExtendedProperties".to_string(),
-            Value::Array(vec![Value::Object(vec![
-                ("id".to_string(), Value::Str(prop.to_string())),
-                ("value".to_string(), Value::Str(value.to_string())),
-            ])]),
+            Value::Array(entries),
         )])
         .to_string();
         self.send(Method::Patch, &path, Some(body), &[])?;
@@ -12336,8 +12379,8 @@ mod tests {
     fn message_expand_names_every_property() {
         // The `$filter` inside the expand, decoded, is exactly the three
         // reminder property ids, the message class id, the three
-        // protection ids (#2088), the In-Reply-To id (#2096) and the size
-        // id (#2123) the model reads.
+        // protection ids (#2088), the In-Reply-To id (#2096), the size
+        // id (#2123) and the two last verb ids (#2301) the model reads.
         use crate::graph::model::{
             CONTENT_CLASS_PROP, IN_REPLY_TO_PROP, MESSAGE_CLASS_PROP, MESSAGE_SIZE_PROP,
             MSIP_LABELS_PROP, REMINDER_TIME_PROP, SENSITIVITY_PROP,
@@ -12354,7 +12397,8 @@ mod tests {
                  id eq '{REMINDER_TIME_PROP}' or id eq '{REMINDER_SIGNAL_TIME_PROP}' or \
                  id eq '{MESSAGE_CLASS_PROP}' or id eq '{SENSITIVITY_PROP}' or \
                  id eq '{MSIP_LABELS_PROP}' or id eq '{CONTENT_CLASS_PROP}' or \
-                 id eq '{IN_REPLY_TO_PROP}' or id eq '{MESSAGE_SIZE_PROP}')"
+                 id eq '{IN_REPLY_TO_PROP}' or id eq '{MESSAGE_SIZE_PROP}' or \
+                 id eq '{LAST_VERB_PROP}' or id eq '{LAST_VERB_TIME_PROP}')"
             )
         );
         assert!(!MESSAGE_EXPAND.contains(' '));
@@ -12458,6 +12502,76 @@ mod tests {
             "{}",
             srv.requests()[0].path
         );
+    }
+
+    /// #2301: a delta page reads each item's last verb and its time, and
+    /// whether it carried them (its class); the first call asks for both.
+    #[test]
+    fn delta_page_reads_the_last_verb() {
+        let body = r#"{"value":[
+            {"id":"M1","subject":"s","singleValueExtendedProperties":[
+                {"id":"String 0x1a","value":"IPM.Note"},
+                {"id":"Integer 0x1081","value":"103"},
+                {"id":"SystemTime 0x1082","value":"2026-11-20T09:30:00Z"}]},
+            {"id":"M2","subject":"s","singleValueExtendedProperties":[
+                {"id":"String 0x1a","value":"IPM.Note"},
+                {"id":"Integer 0x1081","value":"261"}]},
+            {"id":"M3","subject":"s"}
+            ],"@odata.deltaLink":"http://x/d"}"#;
+        let srv = FakeServer::start(vec![get_route("/me/mailFolders/F1/", 200, body)]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        let page = c.delta(DeltaCursor::Full("F1".to_string())).unwrap();
+        let got: Vec<_> = page
+            .items
+            .iter()
+            .map(|i| match i {
+                crate::graph::model::DeltaItem::Upsert(m, f) => (
+                    m.id.as_str(),
+                    m.last_verb,
+                    m.last_verb_time,
+                    f.writes_last_verb(),
+                ),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("M1", Some(LastVerb::ReplyAll), Some(1_795_167_000), true),
+                ("M2", None, None, true),
+                ("M3", None, None, false),
+            ]
+        );
+        let path = &srv.requests()[0].path;
+        assert!(path.contains("Integer%200x1081"), "{path}");
+        assert!(path.contains("SystemTime%200x1082"), "{path}");
+    }
+
+    #[test]
+    fn set_last_verb_patches_both_properties() {
+        let srv = FakeServer::start(vec![ok_patch("/me/messages/")]);
+        let c = GraphClient::new(&srv.base_url, "AT");
+        c.set_last_verb("A/B+C=", LastVerb::Forward, "2026-11-20T09:30:00Z")
+            .unwrap();
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "PATCH");
+        assert_eq!(reqs[0].path, "/me/messages/A%2FB%2BC%3D");
+        assert_eq!(
+            reqs[0].body,
+            r#"{"singleValueExtendedProperties":[{"id":"Integer 0x1081","value":"104"},{"id":"SystemTime 0x1082","value":"2026-11-20T09:30:00Z"}]}"#
+        );
+        for (verb, n) in [(LastVerb::Reply, "102"), (LastVerb::ReplyAll, "103")] {
+            let srv = FakeServer::start(vec![ok_patch("/me/messages/")]);
+            let c = GraphClient::new(&srv.base_url, "AT");
+            c.set_last_verb("M1", verb, "2026-11-20T09:30:00Z").unwrap();
+            assert!(
+                srv.requests()[0]
+                    .body
+                    .contains(&format!(r#"{{"id":"Integer 0x1081","value":"{n}"}}"#)),
+                "{verb:?}"
+            );
+        }
     }
 
     /// #2123: the size fill's listing reads ids and sizes only, from the

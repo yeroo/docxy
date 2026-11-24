@@ -146,7 +146,23 @@ CREATE TABLE IF NOT EXISTS messages (
     -- the fill still has to look at is made in `Store::init`, after the
     -- migration.
     is_event_message       INTEGER DEFAULT 0,
-    meeting_type_known     INTEGER NOT NULL DEFAULT 0
+    meeting_type_known     INTEGER NOT NULL DEFAULT 0,
+    -- The message's last verb (#2301, `PidTagLastVerbExecuted`): 102
+    -- replied, 103 replied all, 104 forwarded, NULL for none (a value
+    -- `LastVerb::from_mapi` does not know reads none too), and when, as
+    -- Unix seconds (UTC, `PidTagLastVerbExecutionTime`). Written by a merge
+    -- only when the item carried its class, as the protection. An old file
+    -- gets them in `Store::init`, with a delta reset.
+    last_verb              INTEGER,
+    last_verb_time         INTEGER,
+    -- The message an answer draft answers and how (#2301), for the verb
+    -- the engine writes on that original once the draft is sent: the
+    -- original's id as the compose command carried it (resolved with
+    -- `Store::current_id` when used) and `DraftKind::as_stored`; `''` for
+    -- every other row. Unlike `answers_id` it survives the first push, and
+    -- no merge writes it. Added by the same migration as `last_verb`.
+    send_verb_original     TEXT NOT NULL DEFAULT '',
+    send_verb              TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_folder_received

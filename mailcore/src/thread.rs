@@ -129,6 +129,8 @@ mod tests {
             size: None,
             is_event_message: false,
             meeting_type_pending: false,
+            last_verb: None,
+            last_verb_time: None,
         }
     }
 
