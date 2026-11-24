@@ -1,21 +1,26 @@
-//! The PDF view (#2245): a PDF opens as a reader shows it, a read-only
-//! column of drawn pages with zoom, page navigation, the outline, and text
-//! that selects, copies and searches in reading order. This is its state,
-//! without gpui drawing: the page layout at a zoom, which page to ask the
-//! worker for next, the raster cache and its budget, the selection, Find,
-//! and the `pdf-read` JSON. `worker.rs` reads the file (in a child
-//! process), `render.rs` draws, `host.rs` wires keys and presses.
+//! The PDF view (#2245): a PDF opens as a reader shows it, a column of
+//! drawn pages with zoom, page navigation, the outline, and text that
+//! selects, copies and searches in reading order; links, comments' pop-ups
+//! and form filling (#2255, `form.rs`). This is its state, without gpui
+//! drawing: the page layout at a zoom, which page to ask the worker for
+//! next (form operations first), the raster cache and its budget, each
+//! page's revision, the selection, Find, and the `pdf-read` JSON.
+//! `worker.rs` reads, fills and saves the file (in a child process),
+//! `render.rs` draws, `host.rs` wires keys, presses and Save.
 
 use ctlcore::json::Json;
 use gpui::{RenderImage, ScrollHandle};
 use pdfcraft_render::PageText;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use worker::{Answer, Bookmark, DocMeta, Done, Engine, Op, PageMeta};
+use worker::{
+    Answer, Bookmark, DocMeta, Done, Engine, FieldMeta, FormState, LinkMeta, NoteMeta, Op, PageMeta,
+};
 
+pub(crate) mod form;
 pub(crate) mod host;
 pub(crate) mod render;
 pub(crate) mod worker;
@@ -167,9 +172,54 @@ pub(crate) fn parse_page_box(text: &str, count: usize) -> Option<usize> {
 pub(crate) struct Cached {
     pub image: Arc<RenderImage>,
     pub scale: f32,
+    /// The page's revision it was drawn at (#2255): an older one is shown
+    /// until the page drawn again comes in.
+    pub rev: u64,
     bytes: usize,
     used: u64,
 }
+
+/// A save on its way (#2255): what runs once it is over, and how it went.
+pub(crate) struct PendingSave {
+    /// Run last, once the save is over (#2194).
+    pub after: Option<crate::AfterSave>,
+    /// The written file's path, or why not; `None` while the worker writes.
+    pub outcome: Option<Result<PathBuf, String>>,
+}
+
+/// A press on a link, followed on its release unless a drag starts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LinkPress {
+    pub page: usize,
+    pub link: usize,
+    /// Content coordinates of the press.
+    pub at: (f32, f32),
+}
+
+/// A comment's pop-up: shown while the pointer is on it, or pinned open by
+/// a click until another click or Esc.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NotePopup {
+    pub page: usize,
+    pub note: usize,
+    pub pinned: bool,
+}
+
+/// What is under the pointer (#2255): what its cursor and tooltip show.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Under {
+    #[default]
+    Nothing,
+    /// A form field's widget: `(field, widget)`.
+    Widget(usize, usize),
+    /// Comment `note` of `page`'s notes.
+    Note(usize, usize),
+    /// Link `link` of `page`'s links.
+    Link(usize, usize),
+}
+
+/// How far a press on a link may move before it is a drag (content px).
+const DRAG_SLOP: f32 = 4.;
 
 /// A glyph of a page's text: `glyph` indexes its `PageText`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -312,6 +362,39 @@ pub(crate) struct PdfView {
     /// The selection a Ctrl+C waits on for a page's text. A change of the
     /// selection (Escape, a press, Find, Ctrl+A) drops the copy.
     pub copy_pending: Option<Sel>,
+    /// Each page's links and comments with text (#2255), in view space.
+    pub links: Vec<Vec<LinkMeta>>,
+    pub notes: Vec<Vec<NoteMeta>>,
+    /// The form's fields, and each page's widgets as `(field, widget)`.
+    pub form: worker::FormMeta,
+    pub widgets: Vec<Vec<(usize, usize)>>,
+    /// Form operations waiting: sent before any page, in order.
+    pub form_ops: VecDeque<Op>,
+    /// Form values accepted so far, and how many of them the file holds:
+    /// the tab is unsaved while they differ.
+    pub form_rev: u64,
+    pub saved_rev: u64,
+    /// Each page's revision: bumped when a value shown on it changes, so it
+    /// is drawn and read again.
+    page_rev: Vec<u64>,
+    text_rev: Vec<u64>,
+    /// The field that has the keys.
+    pub focus: Option<form::FormFocus>,
+    pub popup: Option<NotePopup>,
+    /// What the pointer is over, and where (content px).
+    pub under: Under,
+    pub pointer: (f32, f32),
+    pub link_press: Option<LinkPress>,
+    pub pending_save: Option<PendingSave>,
+    /// A save of a signed PDF waiting on its question: where, and what
+    /// runs once it is over.
+    pub ask_signed: Option<(PathBuf, crate::AfterSave)>,
+    /// For the host: a status line to show, a web or mail address to open,
+    /// and that the unsaved values were lost (a new reader could not take
+    /// them).
+    pub notice: Option<String>,
+    pub open_url: Option<String>,
+    pub values_lost: bool,
     /// The questions sent so far (the scheduler's tests).
     #[cfg(test)]
     pub sent: Vec<Op>,
@@ -321,7 +404,7 @@ impl PdfView {
     /// A view of `path` whose `info` is `meta`, its pages asked of `engine`.
     pub(crate) fn new(path: &Path, meta: DocMeta, engine: Option<Engine>) -> PdfView {
         let n = meta.pages.len();
-        PdfView {
+        let mut v = PdfView {
             path: path.to_path_buf(),
             engine,
             in_flight: None,
@@ -346,10 +429,49 @@ impl PdfView {
             restore_page: None,
             want_all_text: false,
             copy_pending: None,
+            links: per_page(n, &meta.links, |l| l.page),
+            notes: per_page(n, &meta.notes, |l| l.page),
+            form: meta.form.clone(),
+            widgets: Vec::new(),
+            form_ops: VecDeque::new(),
+            form_rev: 0,
+            saved_rev: 0,
+            page_rev: vec![0; n],
+            text_rev: vec![0; n],
+            focus: None,
+            popup: None,
+            under: Under::Nothing,
+            pointer: (0., 0.),
+            link_press: None,
+            pending_save: None,
+            ask_signed: None,
+            notice: None,
+            open_url: None,
+            values_lost: false,
             #[cfg(test)]
             sent: Vec::new(),
             meta,
+        };
+        v.index_widgets();
+        v
+    }
+
+    /// Each page's widgets, from the form's fields.
+    pub(crate) fn index_widgets(&mut self) {
+        let mut widgets = vec![Vec::new(); self.page_count()];
+        for (f, field) in self.form.fields.iter().enumerate() {
+            for (w, widget) in field.widgets.iter().enumerate() {
+                if let Some(p) = widget.page.filter(|p| *p < widgets.len()) {
+                    widgets[p].push((f, w));
+                }
+            }
         }
+        self.widgets = widgets;
+    }
+
+    /// Whether the tab has values the file does not (#2255).
+    pub(crate) fn unsaved(&self) -> bool {
+        self.form_rev != self.saved_rev
     }
 
     /// Open `path`: start a worker and ask its `info`, waiting at most the
@@ -425,6 +547,10 @@ impl PdfView {
     /// Find or Ctrl+A needs. A page no longer showing, or an old zoom, is
     /// never asked for; a page that failed is never asked for again.
     pub(crate) fn next_job(&self) -> Option<Op> {
+        // The form first (#2255): a value set or a save goes ahead of pages.
+        if let Some(op) = self.form_ops.front() {
+            return Some(op.clone());
+        }
         let showing = self.showing.clone();
         let pixels = |p: usize| -> Option<Op> {
             let meta = self.meta.pages.get(p)?;
@@ -434,10 +560,10 @@ impl PdfView {
             let scale = raster_scale(meta, self.zoom, self.scale_factor);
             let have = self.rasters[p]
                 .as_ref()
-                .is_some_and(|c| same_scale(c.scale, scale));
+                .is_some_and(|c| same_scale(c.scale, scale) && c.rev == self.page_rev[p]);
             (!have).then_some(Op::Pixels { page: p, scale })
         };
-        let text = |p: usize| -> Option<Op> { self.text_owed(p).then_some(Op::Text { page: p }) };
+        let text = |p: usize| -> Option<Op> { self.text_due(p).then_some(Op::Text { page: p }) };
         if let Some(op) = showing.clone().find_map(pixels) {
             return Some(op);
         }
@@ -462,9 +588,9 @@ impl PdfView {
         None
     }
 
-    /// Whether the worker has a question out.
+    /// Whether the worker has a question out, or a form operation waits.
     pub(crate) fn busy(&self) -> bool {
-        self.in_flight.is_some()
+        self.in_flight.is_some() || !self.form_ops.is_empty()
     }
 
     /// Whether an answer waits to be taken.
@@ -482,16 +608,37 @@ impl PdfView {
         if self.in_flight.is_none()
             && let Some(op) = self.next_job()
         {
-            let sent = self.engine.as_ref().is_some_and(|e| e.send(op.clone()));
-            if sent {
-                #[cfg(test)]
-                self.sent.push(op.clone());
-                self.in_flight = Some(op);
-            } else {
-                // No worker (it could not start a thread): the page says so
-                // rather than wait for ever.
-                self.fail(&op, worker::DIED.into());
-            }
+            self.send(op);
+        }
+    }
+
+    /// Take the answers in and send form operations only: a view behind
+    /// another tab finishes its save (#2255) without asking for pages.
+    pub(crate) fn pump_form(&mut self) {
+        let done = self.engine.as_ref().map(Engine::take).unwrap_or_default();
+        for d in done {
+            self.absorb(d);
+        }
+        if self.in_flight.is_none()
+            && let Some(op) = self.form_ops.front().cloned()
+        {
+            self.send(op);
+        }
+    }
+
+    fn send(&mut self, op: Op) {
+        if op.is_form() {
+            self.form_ops.pop_front();
+        }
+        let sent = self.engine.as_ref().is_some_and(|e| e.send(op.clone()));
+        if sent {
+            #[cfg(test)]
+            self.sent.push(op.clone());
+            self.in_flight = Some(op);
+        } else {
+            // No worker (it could not start a thread): the page says so
+            // rather than wait for ever.
+            self.fail(&op, worker::DIED.into());
         }
     }
 
@@ -499,6 +646,9 @@ impl PdfView {
     pub(crate) fn absorb(&mut self, d: Done) {
         if self.in_flight.as_ref() == Some(&d.op) {
             self.in_flight = None;
+        }
+        if d.lost {
+            self.lose_values();
         }
         match (d.op, d.answer) {
             (Op::Pixels { page, scale }, Answer::Pixels(r)) if page < self.page_count() => {
@@ -514,29 +664,94 @@ impl PdfView {
                 self.rasters[page] = Some(Cached {
                     image,
                     scale,
+                    rev: self.page_rev[page],
                     bytes,
                     used: self.clock,
                 });
                 self.evict(RASTER_BUDGET);
             }
             (Op::Text { page }, Answer::Text(t)) if page < self.page_count() => {
+                // Read again after a value changed (#2255): a selection on
+                // the page goes, and its Find hits are replaced.
+                if self.texts[page].is_some()
+                    && self
+                        .sel
+                        .is_some_and(|s| s.on_page(page, usize::MAX).is_some())
+                {
+                    self.sel = None;
+                    self.drag = None;
+                }
                 self.texts[page] = Some(t);
+                self.text_rev[page] = self.page_rev[page];
                 self.find_on_page(page);
+            }
+            (Op::SetField { .. }, Answer::Form(st)) => {
+                self.form_rev += 1;
+                self.take_form(st);
+            }
+            (Op::Fields | Op::SetFields { .. }, Answer::Form(st)) => self.take_form(st),
+            (Op::SaveTo { .. }, Answer::Saved(path)) => {
+                // Every value accepted before the save went in it; one
+                // accepted after keeps the tab unsaved.
+                self.saved_rev = self.form_rev;
+                self.path = path.clone();
+                if let Some(s) = self.pending_save.as_mut() {
+                    s.outcome = Some(Ok(path));
+                }
             }
             (op, Answer::Failed(why)) => self.fail(&op, why),
             _ => {}
         }
     }
 
+    /// The form as an answer has it: the pages whose values changed are
+    /// drawn and read again.
+    fn take_form(&mut self, st: FormState) {
+        for p in st.pages {
+            if let Some(r) = self.page_rev.get_mut(p) {
+                *r += 1;
+            }
+        }
+        let same_shape = st.fields.len() == self.form.fields.len();
+        self.form.fields = st.fields;
+        if !same_shape {
+            self.focus = None;
+        }
+        self.index_widgets();
+    }
+
+    /// A new reader could not take the unsaved values (#2255): the form is
+    /// read again from the file, every page with a field is drawn again, and
+    /// the tab holds nothing unsaved.
+    fn lose_values(&mut self) {
+        self.saved_rev = self.form_rev;
+        self.focus = None;
+        self.form_ops.push_front(Op::Fields);
+        for (p, w) in self.widgets.iter().enumerate() {
+            if !w.is_empty() {
+                self.page_rev[p] += 1;
+            }
+        }
+        self.values_lost = true;
+    }
+
     fn fail(&mut self, op: &Op, why: String) {
-        match *op {
+        match op {
             Op::Pixels { page, .. } => {
-                self.failed.insert(page, why);
+                self.failed.insert(*page, why);
             }
             Op::Text { page } => {
-                self.text_failed.insert(page, why);
+                self.text_failed.insert(*page, why);
             }
-            Op::Info => {}
+            Op::SetField { name, .. } => {
+                self.notice = Some(format!("{name} was not filled in: {why}"));
+            }
+            Op::SaveTo { .. } => {
+                if let Some(s) = self.pending_save.as_mut() {
+                    s.outcome = Some(Err(why));
+                }
+            }
+            Op::Info | Op::Fields | Op::SetFields { .. } | Op::Save | Op::Saved => {}
         }
     }
 
@@ -860,6 +1075,15 @@ impl PdfView {
         self.texts.get(p).is_some_and(Option::is_none) && !self.text_failed.contains_key(&p)
     }
 
+    /// Whether page `p`'s text is to be asked for: never read, or read
+    /// before a value on it changed (#2255).
+    pub(crate) fn text_due(&self, p: usize) -> bool {
+        self.text_owed(p)
+            || (self.texts.get(p).is_some_and(Option::is_some)
+                && self.text_rev[p] != self.page_rev[p]
+                && !self.text_failed.contains_key(&p))
+    }
+
     /// Text is still needed for a selection: ask for it.
     pub(crate) fn note_selection_needs(&mut self) {
         if self.selection_waits() {
@@ -895,13 +1119,12 @@ impl PdfView {
             .collect()
     }
 
-    /// A page's text came in: its hits join the others in page order, and
-    /// the current hit stays the same hit. Only that page is searched.
+    /// A page's text came in (or was read again after a value on it changed,
+    /// #2255): its hits replace that page's old ones, in page order; the
+    /// current hit stays the same hit, unless it was on that page, when
+    /// there is none. Only that page is searched.
     fn find_on_page(&mut self, page: usize) {
         let new = self.hits_on(page);
-        if new.is_empty() {
-            return;
-        }
         let at = self.find.hits.partition_point(|h| h.page < page);
         let end = self.find.hits.partition_point(|h| h.page <= page);
         let n = new.len();
@@ -1112,6 +1335,55 @@ impl PdfView {
                 Json::obj(vec![("page", n(h.page + 1)), ("text", s(&text))])
             })
             .collect();
+        let links = self
+            .links
+            .iter()
+            .flatten()
+            .map(|l| {
+                Json::obj(vec![
+                    ("page", n(l.page + 1)),
+                    ("go", s(&form::link_tip(&l.go, &self.meta.pages))),
+                ])
+            })
+            .collect();
+        let notes = self
+            .notes
+            .iter()
+            .flatten()
+            .map(|x| {
+                Json::obj(vec![
+                    ("page", n(x.page + 1)),
+                    ("subtype", s(&x.subtype)),
+                    ("author", x.author.as_deref().map_or(Json::Null, s)),
+                    ("date", x.date.as_deref().map_or(Json::Null, s)),
+                    ("contents", s(&x.contents)),
+                ])
+            })
+            .collect();
+        let fields = self
+            .form
+            .fields
+            .iter()
+            .map(|f| {
+                Json::obj(vec![
+                    ("name", s(&f.name)),
+                    ("kind", s(field_kind_name(f.kind))),
+                    ("value", s(&field_value_text(f))),
+                    (
+                        "on",
+                        Json::Arr(f.widgets.iter().map(|w| Json::Bool(w.on)).collect()),
+                    ),
+                    ("read_only", Json::Bool(f.read_only)),
+                    ("required", Json::Bool(f.required)),
+                ])
+            })
+            .collect();
+        let values = self
+            .form
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), s(&field_value_text(f))))
+            .collect();
         Json::obj(vec![
             ("open", Json::Bool(true)),
             ("file", s(&self.file_name())),
@@ -1140,10 +1412,91 @@ impl PdfView {
             ),
             ("copy_pending", Json::Bool(self.copy_waits())),
             ("busy", Json::Bool(self.busy())),
+            // Links, comments and the form (#2255).
+            ("links", Json::Arr(links)),
+            ("notes", Json::Arr(notes)),
+            (
+                "popup",
+                self.popup
+                    .and_then(|p| self.notes.get(p.page).and_then(|n| n.get(p.note)))
+                    .map_or(Json::Null, |n| s(&n.contents)),
+            ),
+            (
+                "popup_pinned",
+                Json::Bool(self.popup.is_some_and(|p| p.pinned)),
+            ),
+            ("tooltip", self.tooltip().map_or(Json::Null, |t| s(&t))),
+            ("fields", Json::Arr(fields)),
+            ("values", Json::Obj(values)),
+            (
+                "focus",
+                self.focus
+                    .as_ref()
+                    .and_then(|f| self.field(f.field))
+                    .map_or(Json::Null, |f| s(&f.name)),
+            ),
+            (
+                "focus_open",
+                Json::Bool(self.focus.as_ref().is_some_and(|f| f.open)),
+            ),
+            (
+                "unsaved",
+                Json::Bool(self.unsaved() || self.fills_waiting()),
+            ),
+            ("saving", Json::Bool(self.pending_save.is_some())),
+            ("signed", Json::Bool(self.form.signed)),
+            ("incremental", Json::Bool(self.form.incremental)),
             ("title", self.meta.title.as_deref().map_or(Json::Null, s)),
             ("author", self.meta.author.as_deref().map_or(Json::Null, s)),
         ])
     }
+}
+
+/// A field's kind as `pdf-read` names it.
+fn field_kind_name(k: worker::FieldKind) -> &'static str {
+    use worker::FieldKind as K;
+    match k {
+        K::Text => "text",
+        K::Check => "check",
+        K::Radio => "radio",
+        K::Button => "button",
+        K::Combo => "combo",
+        K::List => "list",
+        K::Signature => "signature",
+    }
+}
+
+/// A field's value as `pdf-read` reports it: a text field's text, the on
+/// state of a check box or radio group ("Off" when none), a choice's picked
+/// options' texts joined by ", ".
+pub(crate) fn field_value_text(f: &FieldMeta) -> String {
+    use worker::FieldKind as K;
+    match f.kind {
+        K::Check | K::Radio => f
+            .widgets
+            .iter()
+            .find(|w| w.on)
+            .and_then(|w| w.on_state.clone())
+            .unwrap_or_else(|| "Off".into()),
+        K::Combo | K::List if !f.picked.is_empty() => f
+            .picked
+            .iter()
+            .filter_map(|i| f.options.get(*i).map(|o| o.1.clone()))
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => f.value.join(", "),
+    }
+}
+
+/// `items` by page, `n` pages (an item on a page past the end is dropped).
+fn per_page<T: Clone>(n: usize, items: &[T], page: impl Fn(&T) -> usize) -> Vec<Vec<T>> {
+    let mut out = vec![Vec::new(); n];
+    for it in items {
+        if let Some(v) = out.get_mut(page(it)) {
+            v.push(it.clone());
+        }
+    }
+    out
 }
 
 /// A raster as gpui's image: one frame of BGRA rows.
@@ -1152,5 +1505,7 @@ pub(crate) fn image_of(r: worker::Raster) -> Option<Arc<RenderImage>> {
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(buf)])))
 }
 
+#[cfg(test)]
+mod form_tests;
 #[cfg(test)]
 mod tests;

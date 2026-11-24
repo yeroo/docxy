@@ -285,6 +285,10 @@ pub(crate) enum DialogOwner {
     SaveOnClose {
         quit: bool,
     },
+    /// "This PDF is signed. Saving changes invalidates the signature."
+    /// before a signed PDF's form values are saved (#2255); pressed in
+    /// `pdf_view::host`'s `pdf_signed_save_click`.
+    PdfSignedSave,
     /// A dialog the model tests build; the app never applies one.
     #[cfg(test)]
     Test,

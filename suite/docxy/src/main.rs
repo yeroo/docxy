@@ -351,7 +351,8 @@ enum Kind {
     /// An editor's manual (#1855). Never written to the session: a Help tab
     /// is gone after a restart.
     Help,
-    /// A PDF shown as it looks (#2245), read-only. Written to the session as
+    /// A PDF shown as it looks (#2245), read-only but for its form's values
+    /// (#2255). Written to the session as
     /// a document with `pdf_view` set, so an older build reads the session
     /// (and converts the PDF).
     Pdf,
@@ -13329,8 +13330,9 @@ fn doc_tab_from_path_mode(
     mode: OpenMode,
     trusted: &trusted::TrustStore,
 ) -> DocTab {
-    // A PDF opens as it looks (#2245), read-only, so Protected View has
-    // nothing to hold back; Recover Text still reads its text.
+    // A PDF opens as it looks (#2245), and Protected View has nothing to
+    // hold back: the view runs no script and writes only form values typed
+    // into it (#2255), on Save; Recover Text still reads its text.
     if mode != OpenMode::RecoverText
         && let Some(tab) = pdf_view::host::pdf_view_tab(path, None)
     {
@@ -28390,11 +28392,9 @@ impl Docxy {
             self.refocus(window, cx);
             return Some(after);
         }
-        // Nor on a PDF tab (#2245): it never writes the PDF.
+        // A PDF tab writes its filled-in form values back to the PDF (#2255).
         if self.active_kind_is_pdf() {
-            self.set_status(pdf_view::host::PDF_NO_SAVE);
-            self.refocus(window, cx);
-            return Some(after);
+            return self.save_pdf_then(None, after, window, cx);
         }
         if self.active_is_project() {
             return self.save_project_then(false, after, window, cx);
@@ -28717,10 +28717,9 @@ impl Docxy {
             self.set_status(help_view::host::HELP_NO_SAVE);
             return self.refocus(window, cx);
         }
-        // Nor Save As on a PDF tab (#2245, a later slice).
+        // A PDF tab is saved as a PDF (#2255).
         if self.active_kind_is_pdf() {
-            self.set_status(pdf_view::host::PDF_NO_SAVE_AS);
-            return self.refocus(window, cx);
+            return self.pdf_save_as(window, cx);
         }
         if self.active_is_project() {
             return self.save_project(true, window, cx);
@@ -32036,7 +32035,8 @@ impl Docxy {
             self.keytips = KeyTip::Off;
             return self.help_key(ev, window, cx);
         }
-        // Nor has a PDF view (#2245): its own keys, read-only.
+        // Nor has a PDF view (#2245): its own keys, which edit only its
+        // form's fields (#2255).
         if self.active_is_pdf() {
             self.keytips = KeyTip::Off;
             return self.pdf_key(ev, window, cx);

@@ -1839,9 +1839,76 @@ fn region_point(
     Ok(bounds.center())
 }
 
-/// [`region_point`]'s `pdf-` names on the active PDF view (#2245).
+/// The window point at the middle of widget `w` of field `f` (#2255).
+pub(crate) fn pdf_widget_point(
+    v: &crate::pdf_view::PdfView,
+    f: usize,
+    w: usize,
+) -> Option<Point<Pixels>> {
+    let widget = v.form.fields.get(f)?.widgets.get(w)?;
+    pdf_rect_point(v, widget.page?, widget.rect)
+}
+
+/// The window point at the middle of `rect` (view space) on `page`.
+fn pdf_rect_point(v: &crate::pdf_view::PdfView, page: usize, r: [f32; 4]) -> Option<Point<Pixels>> {
+    let pr = *v.layout().pages.get(page)?;
+    let k = v.zoom * crate::pdf_view::PX_PER_PT;
+    Some(crate::pdf_view::render::window_point(
+        v,
+        pr.x + (r[0] + r[2]) / 2. * k,
+        pr.y + (r[1] + r[3]) / 2. * k,
+    ))
+}
+
+/// [`region_point`]'s `pdf-` names on the active PDF view (#2245):
+/// `pdf-field:<name>[:<widget>]` a form field's widget (#2255),
+/// `pdf-link:<page>:<n>` a page's link and `pdf-annot:<page>:<n>` a
+/// comment with text (both from 1), `pdf-text:…` a glyph, anything else a
+/// probe (`pdf-option:<n>` an open combo box's option).
 fn pdf_point(app: &crate::Docxy, part: &str) -> Result<Point<Pixels>, String> {
     let v = app.active_pdf().ok_or("the active tab is not a PDF view")?;
+    if let Some(spec) = part.strip_prefix("field:") {
+        let (name, w) = match spec.rsplit_once(':') {
+            Some((n, w)) if w.parse::<usize>().is_ok() => (n, w.parse::<usize>().unwrap_or(0)),
+            _ => (spec, 0),
+        };
+        let f = v
+            .form
+            .fields
+            .iter()
+            .position(|f| f.name == name)
+            .ok_or_else(|| format!("the form has no field '{name}'"))?;
+        return pdf_widget_point(v, f, w)
+            .ok_or_else(|| format!("'{name}' has no widget {w} on a page"));
+    }
+    for (prefix, notes) in [("link:", false), ("annot:", true)] {
+        if let Some(spec) = part.strip_prefix(prefix) {
+            let mut it = spec.splitn(2, ':');
+            let num = |s: Option<&str>| s.and_then(|s| s.parse::<usize>().ok()).filter(|n| *n >= 1);
+            let (Some(page), Some(n)) = (num(it.next()), num(it.next())) else {
+                return Err(format!("use pdf-{prefix}<page>:<n>, both from 1"));
+            };
+            let rect = if notes {
+                v.notes
+                    .get(page - 1)
+                    .and_then(|l| l.get(n - 1))
+                    .map(|x| x.rect)
+            } else {
+                v.links.get(page - 1).and_then(|l| l.get(n - 1)).map(|x| {
+                    // A link active over its quads: the first one's middle.
+                    x.quads.first().map_or(x.rect, |q| {
+                        let xs = [q[0], q[2], q[4], q[6]];
+                        let ys = [q[1], q[3], q[5], q[7]];
+                        let lo = |a: [f32; 4]| a.iter().copied().fold(f32::MAX, f32::min);
+                        let hi = |a: [f32; 4]| a.iter().copied().fold(f32::MIN, f32::max);
+                        [lo(xs), lo(ys), hi(xs), hi(ys)]
+                    })
+                })
+            };
+            let rect = rect.ok_or_else(|| format!("page {page} has no {prefix}{n}"))?;
+            return pdf_rect_point(v, page - 1, rect).ok_or_else(|| "no such page".to_string());
+        }
+    }
     let Some(spec) = part.strip_prefix("text:") else {
         return app
             .probes
@@ -1898,7 +1965,7 @@ fn pdf_point(app: &crate::Docxy, part: &str) -> Result<Point<Pixels>, String> {
 /// `until_drawn` (page numbers) asks again until those pages are drawn or
 /// failed, `until_text` until their text is read or failed, `until_idle`
 /// until the worker has nothing out and nothing waits (a Copy, Find's
-/// pages), for up to `within_ms` (default and at most the pump's
+/// pages, a form operation or a save, #2255), for up to `within_ms` (default and at most the pump's
 /// `RETRY_MAX`, 5 s); a timeout is no error, the reply says where it got.
 fn pdf_read(app: &crate::Docxy, args: &Json) -> Result<Done, String> {
     let Some(v) = app.active_pdf() else {
@@ -1940,6 +2007,7 @@ fn pdf_read(app: &crate::Docxy, args: &Json) -> Result<Done, String> {
         && (!idle
             || (!v.busy()
                 && !v.copy_waits()
+                && v.pending_save.is_none()
                 && (v.find.field.text.is_empty() && !v.want_all_text || v.unread_pages() == 0)));
     let mut done = Done::ok(v.read_json())?;
     done.retry = (!settled).then(|| std::time::Duration::from_millis(within as u64));
@@ -8183,6 +8251,38 @@ fn dispatch_verb(
             let overwrite = arg_flag(args, "overwrite")?;
             let tab = app.tabs.get(app.active).ok_or("no tab is open")?;
             let base = tab.path.as_deref().and_then(Path::parent);
+            // A PDF tab is saved as a PDF (#2255), by its worker: the reply
+            // says it is on its way (`pdf-read until_idle` waits for it).
+            if tab.kind == crate::Kind::Pdf {
+                // `save_as_target`'s refusals for a path, the same words.
+                if raw.trim().is_empty() {
+                    return Err("save-as needs a non-empty 'path'".into());
+                }
+                let given = PathBuf::from(raw.trim());
+                let target = match base {
+                    _ if given.is_absolute() => given,
+                    Some(b) => b.join(given),
+                    None => {
+                        return Err("this tab has never been saved, so a relative 'path' has no folder: give an absolute path".into());
+                    }
+                };
+                let target = crate::pdf_view::host::pdf_save_as_target(target)?;
+                if target.exists() && !overwrite {
+                    return Err(format!(
+                        "{} already exists; pass \"overwrite\": true to replace it",
+                        target.display()
+                    ));
+                }
+                let after = app.save_pdf_then(Some(target.clone()), crate::no_after(), window, cx);
+                let queued = after.is_none();
+                app.run_after(after, window, cx);
+                let tab = &app.tabs[app.active];
+                return Done::ok(Json::obj(vec![
+                    ("path", Json::Str(target.display().to_string())),
+                    ("queued", Json::Bool(queued)),
+                    ("status", Json::Str(tab.status.to_string())),
+                ]));
+            }
             let (target, written) = save_as_target(
                 tab.kind,
                 base,

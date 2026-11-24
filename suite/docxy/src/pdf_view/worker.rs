@@ -45,14 +45,24 @@ const EXIT_WATCHDOG: i32 = 4;
 const EXIT_USAGE: i32 = 2;
 /// The first line a worker writes.
 const HELLO: &str = "docxy-pdf-worker";
-/// The protocol's revision, in the hello line.
-const PROTOCOL: u32 = 1;
+/// The protocol's revision, in the hello line: 2 adds links, notes and the
+/// form to `info`, and the form's operations (#2255).
+const PROTOCOL: u32 = 2;
 /// The longest answer line read (a page's text as JSON).
 const MAX_LINE: u64 = 256 << 20;
 /// The most pixel bytes one answer may carry (8192 × 8192 BGRA).
 const MAX_PIXEL_BYTES: usize = 8192 * 8192 * 4;
 /// The most bookmarks the outline keeps.
 const MAX_BOOKMARKS: usize = 10_000;
+/// The largest file a save hands over (bytes after its line).
+const MAX_SAVE_BYTES: usize = 1 << 31;
+/// What a save onto a file another program changed says (#2255).
+pub(crate) const CHANGED: &str = "the file was changed by another program since it was opened; \
+     use Save As to keep your values in another file";
+/// What a view says when the unsaved form values could not be set again in
+/// a new reader (#2255).
+pub(crate) const VALUES_LOST: &str = "the PDF reader stopped and the form values \
+     not yet saved could not be restored";
 
 /// What the worker is asked.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -65,6 +75,202 @@ pub(crate) enum Op {
     Pixels { page: usize, scale: f32 },
     /// Page `page`'s text in reading order.
     Text { page: usize },
+    /// Fill the form field `name` (#2255): the answer is the form after it,
+    /// and the pages whose fields show something else now.
+    SetField { name: String, value: FieldValue },
+    /// The fills of [`Op::SetField`]s again, at once, in a new child: the
+    /// [`Worker`] sends it, never the view.
+    SetFields { values: Vec<(String, FieldValue)> },
+    /// The form's fields as they are now.
+    Fields,
+    /// The child: the bytes a save writes (an incremental update when it
+    /// can be one), after their line. The [`Worker`] sends it.
+    Save,
+    /// The child: the bytes the last `save` gave were written; take them as
+    /// the file. The [`Worker`] sends it.
+    Saved,
+    /// The parent: save to `path` (the file itself, or Save As). The
+    /// [`Worker`] asks the child for the bytes and writes them; never sent
+    /// to the child.
+    SaveTo { path: PathBuf },
+}
+
+impl Op {
+    /// The form's operations, which the view sends before any page.
+    pub(crate) fn is_form(&self) -> bool {
+        matches!(
+            self,
+            Op::SetField { .. } | Op::SetFields { .. } | Op::Fields | Op::SaveTo { .. }
+        )
+    }
+}
+
+/// A form field's new value on the wire (#2255).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum FieldValue {
+    /// A text field's text, or an editable combo box's typed text.
+    Text { text: String },
+    /// A check box on or off.
+    Check { on: bool },
+    /// Turn on widget `index` of a check box or radio group.
+    Widget { index: usize },
+    /// A combo or list box's options, by position in its options.
+    Choice { picked: Vec<usize> },
+}
+
+/// A link on a page (#2255): where it is in view space (points, y down,
+/// after `/Rotate`, as the text layer), and where it goes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct LinkMeta {
+    pub page: usize,
+    pub rect: [f32; 4],
+    /// The areas it is active over when not the whole of `rect`, each four
+    /// corners (`x y` four times).
+    #[serde(default)]
+    pub quads: Vec<[f32; 8]>,
+    pub go: LinkGo,
+}
+
+/// Where a link goes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum LinkGo {
+    /// A web or mail address (the view opens only `http`, `https` and
+    /// `mailto`).
+    Uri { uri: String },
+    /// A place in this document: page `page`, its view-space point (a
+    /// coordinate the destination leaves as it is is `None`), the zoom an
+    /// `/XYZ` asks for, and whether it fits the page's width (`/FitH`).
+    Page {
+        page: usize,
+        x: Option<f32>,
+        y: Option<f32>,
+        zoom: Option<f32>,
+        fit_width: bool,
+    },
+    /// What the view does not do (a script, a launch, a layer change, another
+    /// file), as the status line names it.
+    Other { what: String },
+}
+
+/// A comment whose text shows in a pop-up on hover (#2255).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct NoteMeta {
+    pub page: usize,
+    /// Where it shows on the page, view space.
+    pub rect: [f32; 4],
+    pub subtype: String,
+    pub author: Option<String>,
+    /// Its `/M`, as `inspect` writes it out.
+    pub date: Option<String>,
+    pub contents: String,
+}
+
+/// What kind of form field (#2255).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum FieldKind {
+    Text,
+    Check,
+    Radio,
+    Button,
+    Combo,
+    List,
+    Signature,
+}
+
+/// A list box's rows on its widget, as PdfCraft draws them (points).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ListRowsMeta {
+    /// The first option shown.
+    pub top: usize,
+    /// From the widget's top edge to the first row.
+    pub inset: f32,
+    pub row: f32,
+}
+
+/// One widget of a field: where it shows (view space), and for a check box
+/// or radio button its on state and whether it is on.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct WidgetMeta {
+    pub page: Option<usize>,
+    pub rect: [f32; 4],
+    pub on_state: Option<String>,
+    pub on: bool,
+    pub hidden: bool,
+    pub read_only: bool,
+    /// Its place in the document's tab order.
+    pub tab: usize,
+    pub list: Option<ListRowsMeta>,
+}
+
+/// A terminal form field (#2255).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FieldMeta {
+    pub name: String,
+    pub kind: FieldKind,
+    /// Text: its text; check box and radio: the on state that is on;
+    /// choice: the picked export values.
+    pub value: Vec<String>,
+    /// Choice: the picked options, by position.
+    #[serde(default)]
+    pub picked: Vec<usize>,
+    /// Choice: (export value, text shown).
+    #[serde(default)]
+    pub options: Vec<(String, String)>,
+    pub read_only: bool,
+    pub required: bool,
+    pub multiline: bool,
+    pub password: bool,
+    pub comb: bool,
+    /// A combo box that takes typed text.
+    pub edit: bool,
+    pub multi: bool,
+    pub max_len: Option<usize>,
+    pub tooltip: Option<String>,
+    /// The text size its `/DA` asks for, points (0: fit the widget).
+    pub font_size: f32,
+    pub widgets: Vec<WidgetMeta>,
+}
+
+impl FieldMeta {
+    /// Nothing filled in: what a required field's red outline shows.
+    pub(crate) fn is_empty(&self) -> bool {
+        match self.kind {
+            FieldKind::Check | FieldKind::Radio => !self.widgets.iter().any(|w| w.on),
+            FieldKind::Combo | FieldKind::List => {
+                self.picked.is_empty() && self.value.iter().all(|v| v.is_empty())
+            }
+            _ => self.value.iter().all(|v| v.is_empty()),
+        }
+    }
+
+    /// Whether a person can fill it: not read-only, and a kind the view
+    /// fills (push buttons and signatures are not).
+    pub(crate) fn fillable(&self) -> bool {
+        !self.read_only && !matches!(self.kind, FieldKind::Button | FieldKind::Signature)
+    }
+}
+
+/// The form as a view needs it (#2255).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FormMeta {
+    pub fields: Vec<FieldMeta>,
+    /// A signature field holds a signature: saving changes invalidates it.
+    pub signed: bool,
+    /// A save appends to the file (an incremental update) rather than
+    /// writing it anew, as a damaged file is.
+    pub incremental: bool,
+}
+
+/// What a form operation answers: the form now, and the pages whose
+/// fields show something else (to draw again).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FormState {
+    pub fields: Vec<FieldMeta>,
+    #[serde(default)]
+    pub pages: Vec<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -106,6 +312,14 @@ pub(crate) struct DocMeta {
     pub author: Option<String>,
     #[serde(default)]
     pub version: String,
+    /// Every page's links, in view space (#2255).
+    #[serde(default)]
+    pub links: Vec<LinkMeta>,
+    /// The comments with text to show on hover.
+    #[serde(default)]
+    pub notes: Vec<NoteMeta>,
+    #[serde(default)]
+    pub form: FormMeta,
 }
 
 /// A glyph on the wire: [`TextGlyph`] with short names.
@@ -136,6 +350,15 @@ struct Head {
     info: Option<DocMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<TextWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    form: Option<FormState>,
+    /// A save's file: `bytes` bytes follow the line.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    bytes: usize,
+    /// The child goes after this answer (a form operation panicked, and its
+    /// working document may be half changed): the parent starts another.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    fatal: bool,
     /// A raster's size; `len` pixel bytes follow the line.
     #[serde(default)]
     w: u32,
@@ -143,6 +366,10 @@ struct Head {
     h: u32,
     #[serde(default)]
     len: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Serialize, Deserialize)]
@@ -165,6 +392,14 @@ pub(crate) enum Answer {
     Info(DocMeta),
     Pixels(Raster),
     Text(Arc<PageText>),
+    /// A form operation's answer (#2255).
+    Form(FormState),
+    /// A save's file, from the child.
+    Bytes(Vec<u8>),
+    /// The file was written to this path ([`Op::SaveTo`]).
+    Saved(PathBuf),
+    /// Done, nothing to say ([`Op::Saved`]).
+    Ok,
     /// Why it could not: the file's fault, or the child's fate.
     Failed(String),
 }
@@ -273,7 +508,7 @@ pub(crate) fn serve(
     if write_line(&mut output, &hello).is_err() || output.flush().is_err() {
         return;
     }
-    let mut renderer: Option<pdfcraft_render::PageRenderer> = None;
+    let mut served: Option<doc::Served> = None;
     let mut line = String::new();
     loop {
         line.clear();
@@ -288,7 +523,9 @@ pub(crate) fn serve(
                 }
                 before(&req.op);
                 let answered = match &bytes {
-                    Ok(bytes) => answer(bytes, &mut renderer, req.id, &req.op),
+                    Ok(bytes) => served
+                        .get_or_insert_with(|| doc::Served::new(bytes.clone()))
+                        .answer(req.id, &req.op),
                     Err(why) => (failed(req.id, why.clone()), Vec::new()),
                 };
                 if let Some(b) = busy {
@@ -307,6 +544,11 @@ pub(crate) fn serve(
         {
             return;
         }
+        // A form operation panicked: its working copy may be half changed,
+        // so this child serves nothing more (#2255).
+        if head.fatal {
+            return;
+        }
     }
 }
 
@@ -320,85 +562,6 @@ fn failed(id: u64, why: String) -> Head {
         id,
         error: Some(why),
         ..Head::default()
-    }
-}
-
-/// One request's answer, in this process.
-fn answer(
-    bytes: &Arc<Vec<u8>>,
-    renderer: &mut Option<pdfcraft_render::PageRenderer>,
-    id: u64,
-    op: &Op,
-) -> (Head, Vec<u8>) {
-    use pdfcraft_render::{PageRenderer, RenderConfig, RenderRequest, RequestKind};
-    let mut renderer = |req: RenderRequest| {
-        renderer
-            .get_or_insert_with(|| PageRenderer::new(bytes.clone(), RenderConfig::default()))
-            .render(req)
-    };
-    match *op {
-        Op::Info => match pdfcraft_render::inspect(bytes.clone(), None) {
-            Ok(info) if info.pages.is_empty() => {
-                (failed(id, "the PDF has no pages".into()), vec![])
-            }
-            Ok(info) => (
-                Head {
-                    id,
-                    info: Some(doc_meta(&info)),
-                    ..Head::default()
-                },
-                vec![],
-            ),
-            Err(e) => (failed(id, e.to_string()), vec![]),
-        },
-        Op::Pixels { page, scale } => {
-            let scale = if scale.is_finite() && scale > 0. {
-                scale
-            } else {
-                1.
-            };
-            let r = renderer(RenderRequest {
-                page,
-                scale,
-                ..RenderRequest::default()
-            });
-            if let Some(e) = r.error {
-                return (failed(id, e), vec![]);
-            }
-            let bgra = straight_bgra(&r.rgba);
-            if bgra.len() != r.width as usize * r.height as usize * 4 || bgra.is_empty() {
-                return (failed(id, "the page drew nothing".into()), vec![]);
-            }
-            (
-                Head {
-                    id,
-                    w: r.width,
-                    h: r.height,
-                    len: bgra.len(),
-                    ..Head::default()
-                },
-                bgra,
-            )
-        }
-        Op::Text { page } => {
-            let r = renderer(RenderRequest {
-                page,
-                kind: RequestKind::Text,
-                ..RenderRequest::default()
-            });
-            match (r.error, r.text) {
-                (Some(e), _) => (failed(id, e), vec![]),
-                (None, Some(text)) => (
-                    Head {
-                        id,
-                        text: Some(text_wire(&text)),
-                        ..Head::default()
-                    },
-                    vec![],
-                ),
-                (None, None) => (failed(id, "the page has no text layer".into()), vec![]),
-            }
-        }
     }
 }
 
@@ -421,6 +584,7 @@ fn doc_meta(info: &pdfcraft_render::DocInfo) -> DocMeta {
         title: info.title.clone().filter(|t| !t.trim().is_empty()),
         author: info.author.clone().filter(|t| !t.trim().is_empty()),
         version: info.pdf_version.clone(),
+        ..DocMeta::default()
     }
 }
 
@@ -547,9 +711,35 @@ pub(crate) struct Worker {
     conn: Option<Conn>,
     slot: Slot,
     next_id: u64,
+    /// The form values filled since the file was last read or saved, in
+    /// order: a new child is given them again before anything else
+    /// (#2255).
+    edits: Vec<(String, FieldValue)>,
+    /// The file's size and time when its child last read it: a new child
+    /// that would read another file gets no values, and a save in place
+    /// onto one refuses ([`CHANGED`]).
+    stamp: Option<Stamp>,
+    /// A new child could not be given the values: they are gone, and the
+    /// next answer says so ([`Self::take_lost`]).
+    lost: bool,
     /// Children started so far (the tests' respawn check).
     #[cfg(test)]
     pub(crate) started: usize,
+}
+
+/// What tells a file apart from another at its path: its length and time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn stamp_of(path: &Path) -> Option<Stamp> {
+    let m = std::fs::metadata(path).ok()?;
+    Some(Stamp {
+        len: m.len(),
+        modified: m.modified().ok(),
+    })
 }
 
 impl Worker {
@@ -561,6 +751,9 @@ impl Worker {
             conn: None,
             slot: Arc::default(),
             next_id: 0,
+            edits: Vec::new(),
+            stamp: None,
+            lost: false,
             #[cfg(test)]
             started: 0,
         }
@@ -568,24 +761,120 @@ impl Worker {
 
     /// Ask `op` and wait for its answer, at most the timeout. A child that
     /// runs out of time, dies or answers nonsense is killed: the answer says
-    /// why, and the next question starts a new one.
+    /// why, and the next question starts a new one, given the form values
+    /// filled so far first. [`Op::SaveTo`] is answered here: the child's
+    /// bytes, written.
     pub(crate) fn ask(&mut self, op: &Op) -> Answer {
-        match self.ask_raw(op) {
+        if let Op::SaveTo { path } = op {
+            return self.save_to(path);
+        }
+        let answer = match self.ask_raw(op) {
             Ok((head, body)) => decode(op, head, body),
             Err(why) => Answer::Failed(why),
+        };
+        if let (Op::SetField { name, value }, Answer::Form(_)) = (op, &answer) {
+            self.edits.push((name.clone(), value.clone()));
         }
+        answer
+    }
+
+    /// Whether the form values filled were lost since the last call: a new
+    /// child could not take them again (#2255).
+    pub(crate) fn take_lost(&mut self) -> bool {
+        std::mem::take(&mut self.lost)
+    }
+
+    /// The form values a new child is given (the tests' look).
+    #[cfg(test)]
+    pub(crate) fn edits(&self) -> &[(String, FieldValue)] {
+        &self.edits
     }
 
     fn ask_raw(&mut self, op: &Op) -> Reply {
-        if self.conn.is_none() {
-            let conn = self
-                .start()
-                .map_err(|e| format!("the PDF reader could not start: {e}"))?;
-            self.conn = Some(conn);
-            #[cfg(test)]
-            {
-                self.started += 1;
+        self.ensure()?;
+        self.exchange(op)
+    }
+
+    fn connect(&mut self) -> Result<(), String> {
+        let conn = self
+            .start()
+            .map_err(|e| format!("the PDF reader could not start: {e}"))?;
+        self.conn = Some(conn);
+        #[cfg(test)]
+        {
+            self.started += 1;
+        }
+        Ok(())
+    }
+
+    /// A live child, given the form values filled so far. When it cannot
+    /// take them (an error, death, a timeout), or its file is no longer the
+    /// one they were filled into, they are dropped and never tried again:
+    /// the child is replaced by a clean one, and [`Self::take_lost`] says so.
+    fn ensure(&mut self) -> Result<(), String> {
+        if self.conn.is_some() {
+            return Ok(());
+        }
+        let now = stamp_of(&self.path);
+        let changed = self.stamp.is_some() && now != self.stamp;
+        self.connect()?;
+        if !self.edits.is_empty() {
+            let replayed = !changed
+                && {
+                    let op = Op::SetFields {
+                        values: self.edits.clone(),
+                    };
+                    matches!(self.exchange(&op), Ok((head, _)) if head.error.is_none() && head.form.is_some())
+                };
+            if !replayed {
+                self.edits.clear();
+                self.lost = true;
+                self.stop();
+                self.connect()?;
             }
+        }
+        self.stamp = now;
+        Ok(())
+    }
+
+    /// Save to `target`: the child's bytes, written atomically; then the
+    /// child takes them as its file, and they are the file a new child
+    /// reads. A save in place onto a file another program changed refuses.
+    fn save_to(&mut self, target: &Path) -> Answer {
+        if let Err(why) = self.ensure() {
+            return Answer::Failed(why);
+        }
+        if self.lost {
+            return Answer::Failed(VALUES_LOST.into());
+        }
+        if target == self.path && self.stamp.is_some() && stamp_of(target) != self.stamp {
+            return Answer::Failed(CHANGED.into());
+        }
+        let bytes = match self.exchange(&Op::Save) {
+            Ok((head, body)) => match decode(&Op::Save, head, body) {
+                Answer::Bytes(b) => b,
+                Answer::Failed(why) => return Answer::Failed(why),
+                _ => return Answer::Failed(DIED.into()),
+            },
+            Err(why) => return Answer::Failed(why),
+        };
+        if let Err(e) = opccore::fsio::write_atomic(target, &bytes) {
+            return Answer::Failed(format!("the file could not be written: {e}"));
+        }
+        // A child that cannot take them in goes: the next one reads them.
+        if !matches!(self.exchange(&Op::Saved), Ok((head, _)) if head.error.is_none()) {
+            self.stop();
+        }
+        self.path = target.to_path_buf();
+        self.edits.clear();
+        self.stamp = stamp_of(target);
+        Answer::Saved(target.to_path_buf())
+    }
+
+    /// Send `op` to the live child and wait for its answer.
+    fn exchange(&mut self, op: &Op) -> Reply {
+        if self.conn.is_none() {
+            return Err(DIED.into());
         }
         self.next_id += 1;
         let id = self.next_id;
@@ -603,7 +892,13 @@ impl Worker {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.conn.as_ref().expect("live").replies.recv_timeout(left) {
-                Ok(Ok((head, body))) if head.id == id => return Ok((head, body)),
+                Ok(Ok((head, body))) if head.id == id => {
+                    // Its form operation panicked: it serves nothing more.
+                    if head.fatal {
+                        self.stop();
+                    }
+                    return Ok((head, body));
+                }
                 // An answer to a question given up on: not this one.
                 Ok(Ok(_)) => continue,
                 Ok(Err(_)) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -733,7 +1028,14 @@ fn read_replies(mut out: impl BufRead, tx: mpsc::Sender<Reply>) {
             continue;
         }
         let reply = match serde_json::from_str::<Head>(line.trim()) {
-            Ok(head) if head.len == 0 => Ok((head, Vec::new())),
+            Ok(head) if head.bytes > 0 && head.len == 0 && head.bytes <= MAX_SAVE_BYTES => {
+                let mut body = vec![0; head.bytes];
+                match out.read_exact(&mut body) {
+                    Ok(()) => Ok((head, body)),
+                    Err(_) => Err(DIED.to_string()),
+                }
+            }
+            Ok(head) if head.len == 0 && head.bytes == 0 => Ok((head, Vec::new())),
             Ok(head)
                 if head.len <= MAX_PIXEL_BYTES
                     && head.len == head.w as usize * head.h as usize * 4 =>
@@ -773,6 +1075,14 @@ fn decode(op: &Op, head: Head, body: Vec<u8>) -> Answer {
             Some(Err(why)) => Answer::Failed(why),
             None => Answer::Failed(DIED.into()),
         },
+        Op::SetField { .. } | Op::SetFields { .. } | Op::Fields => head
+            .form
+            .map_or_else(|| Answer::Failed(DIED.into()), Answer::Form),
+        Op::Save if head.bytes > 0 => Answer::Bytes(body),
+        Op::Save => Answer::Failed(DIED.into()),
+        Op::Saved => Answer::Ok,
+        // Never sent: the Worker answers it.
+        Op::SaveTo { .. } => Answer::Failed(DIED.into()),
     }
 }
 
@@ -783,6 +1093,9 @@ fn decode(op: &Op, head: Head, body: Vec<u8>) -> Answer {
 pub(crate) struct Done {
     pub op: Op,
     pub answer: Answer,
+    /// The form values filled were lost on the way: a new child could not
+    /// take them (#2255).
+    pub lost: bool,
 }
 
 /// A [`Worker`] on a thread of its own: the view sends a question and
@@ -806,10 +1119,11 @@ impl Engine {
                 let mut worker = worker;
                 for op in rx {
                     let answer = worker.ask(&op);
+                    let lost = worker.take_lost();
                     theirs
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .push_back(Done { op, answer });
+                        .push_back(Done { op, answer, lost });
                 }
             });
         Engine {
@@ -852,5 +1166,6 @@ impl Drop for Engine {
     }
 }
 
+mod doc;
 #[cfg(test)]
 pub(crate) mod tests;

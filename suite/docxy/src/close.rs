@@ -108,6 +108,7 @@ fn commit_pending_for_close(tab: &mut DocTab) -> Result<(), String> {
     // Project buffer does: closing would drop what was typed.
     commit_changed_cell(tab)?;
     exit_hf_tab(tab);
+    crate::pdf_view::host::commit_pdf_tab(tab);
     Ok(())
 }
 
@@ -124,6 +125,7 @@ pub(crate) fn commit_pending_for_exit(tabs: &mut [DocTab]) {
         let _ = commit_project_cell(tab);
         let _ = commit_changed_cell(tab);
         flush_hf_tab(tab);
+        crate::pdf_view::host::commit_pdf_tab(tab);
     }
 }
 
@@ -296,6 +298,18 @@ fn commit_changed_cell(tab: &mut DocTab) -> Result<(), String> {
 /// (or mark clean) a workbook without what is being typed.
 pub(crate) fn prepare_sheet_save(tab: &mut DocTab) -> Result<(), String> {
     commit_changed_cell(tab)
+}
+
+/// The PDF tab a window close or Quit stops for (#2255): when the close
+/// would not ask (`asked` false, "ask before closing" off), the first PDF
+/// tab with values hot exit cannot keep. A close that asks asks about it
+/// with the rest.
+pub(crate) fn pdf_stops_close(asked: bool, tabs: &[DocTab]) -> Option<usize> {
+    if asked {
+        None
+    } else {
+        crate::pdf_view::host::unsaved_pdf(tabs)
+    }
 }
 
 /// What closing `tab` does: `answer` is how a dirty tab was answered, or
@@ -689,6 +703,8 @@ fn close_prompt(tab: &DocTab, quit: bool, known: &[PathBuf]) -> Dialog {
     match &tab.surface {
         Surface::Doc(_) => doc_prompt(&prompt_name(tab, known), quit),
         Surface::Project(_) => message_prompt(catalog::PROJECT_SAVE_ON_CLOSE, &tab.title, quit),
+        // A PDF's filled-in values are saved into it, in place (#2255).
+        Surface::Pdf(_) => message_prompt(catalog::PDF_SAVE_ON_CLOSE, &tab.title, quit),
         _ => message_prompt(catalog::SHEET_SAVE_ON_CLOSE, &tab.title, quit),
     }
 }
@@ -780,6 +796,32 @@ impl Docxy {
     /// not asked. Whether one refused.
     fn ext_refusal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         (0..self.tabs.len()).any(|i| !self.ext_ask(i, window, cx))
+    }
+
+    /// A window close or Quit that would not ask (`asked` false) and a PDF
+    /// tab with filled-in values not saved (#2255), which hot exit cannot
+    /// keep: `true` (the window stays) when there is one, and its own close
+    /// prompt opens; or, when a dialog is already up over it, the tab comes
+    /// to the front to answer that first. `false` when the close asks
+    /// anyway, or there is none ([`pdf_stops_close`]).
+    pub(crate) fn pdf_refusal(
+        &mut self,
+        asked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(i) = pdf_stops_close(asked, &self.tabs) else {
+            return false;
+        };
+        if self.tabs[i].dialogs.is_open() {
+            self.refuse_close_under_dialog(i, window, cx);
+            return true;
+        }
+        if self.active != i {
+            self.select_tab(i, window, cx);
+        }
+        self.close_tab_asking(i, None, false, window, cx);
+        true
     }
 
     /// Extension tab `i` refused its close (#2260): it stays, as the
@@ -969,10 +1011,25 @@ impl Docxy {
                 // Only a harness `close-tab save` reaches here with the tab
                 // still dirty: the prompt's own Save saves first and closes
                 // a clean tab (`close_prompt_save`). A harness never opens a
-                // native dialog, so the save is over when this returns
-                // (#2194); the prompt's Save is the one that waits for it.
+                // native dialog, so a document's save is over when this
+                // returns (#2194); the prompt's Save is the one that waits
+                // for it. A PDF's is not (#2255): its worker writes the file,
+                // and the tab closes from the save's `after` once it is clean.
                 debug_assert!(self.harness, "a close's Save outside a harness");
-                self.save_active_then(crate::no_after(), window, cx);
+                let after: crate::AfterSave = if self.tabs[i].kind == Kind::Pdf {
+                    Box::new(move |this, window, cx| {
+                        if this
+                            .tabs
+                            .get(i)
+                            .is_some_and(|t| t.kind == Kind::Pdf && !t.dirty)
+                        {
+                            this.close_tab_with(i, None, window, cx);
+                        }
+                    })
+                } else {
+                    crate::no_after()
+                };
+                self.save_active_then(after, window, cx);
                 !self.tabs[i].dirty
             }
         };
@@ -1221,6 +1278,14 @@ impl Docxy {
         if ask != CloseAsk::HarnessQuit && self.ext_refusal(window, cx) {
             return false;
         }
+        // Neither does hot exit keep a PDF's filled-in values (#2255): with
+        // "ask before closing" off, the window stays and the PDF tab's own
+        // close prompt asks.
+        if ask != CloseAsk::HarnessQuit
+            && self.pdf_refusal(asks(ask, self.ask_on_close), window, cx)
+        {
+            return false;
+        }
         self.commit_dialog_buffers_for_exit(cx);
         commit_pending_for_exit(&mut self.tabs);
         self.persist(cx);
@@ -1261,7 +1326,9 @@ impl Docxy {
         // Cancel does (#2260). Asked on every walk, before an agreement is
         // judged to hold: the tab may have taken work while another window
         // asked its questions.
-        if self.ext_refusal(window, cx) {
+        if self.ext_refusal(window, cx)
+            || self.pdf_refusal(quit_asks(self.ask_on_close, self.harness), window, cx)
+        {
             self.quit_agreed = None;
             if self.quitting {
                 self.quit_cancelled(cx);

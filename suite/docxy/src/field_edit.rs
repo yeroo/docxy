@@ -114,6 +114,16 @@ pub(crate) fn one_line(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).collect()
 }
 
+/// `text` for a multi-line field (a PDF form's, #2255): line breaks as
+/// `\n` (`\r\n` and `\r` too), every other control character dropped.
+pub(crate) fn multi_line(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter(|&c| c == '\n' || !c.is_control())
+        .collect()
+}
+
 /// `text` as one line for a Find field: as [`one_line`], but a tab stays, as
 /// it is a character a paragraph or a cell holds and the Find searches for
 /// (docxcore's visible text has a document tab as `\t`).
@@ -530,5 +540,17 @@ mod tests {
             run("é😀", 1, false, vec![Op::Insert("x")]),
             ("éx😀".into(), 2, false)
         );
+    }
+
+    /// #2255 r2: a paste into a multi-line field keeps its line breaks, as
+    /// `\n` whatever the source wrote, and drops other control characters;
+    /// a one-line field's keeps none.
+    #[test]
+    fn a_multi_line_paste_keeps_its_line_breaks() {
+        assert_eq!(
+            super::multi_line("Street 1\r\nOslo\rNorway\n\t!"),
+            "Street 1\nOslo\nNorway\n!"
+        );
+        assert_eq!(super::one_line("Street 1\nOslo"), "Street 1Oslo");
     }
 }

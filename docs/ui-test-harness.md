@@ -739,7 +739,13 @@ existing other file. A tab whose Save is Save As (opened read-only, repaired
 or converted) proposes `<name> (copy)` beside its file and refuses its own
 file's name. Under the harness the only location offered after the tab's own folder
 is the sandbox. A workbook or a Project asks `Save changes to <title> before
-closing?`. A tab with another dialog open is not closed: it comes to the
+closing?`. A PDF tab (#2255) asks the same plain question as
+`dialog is pdf-save-on-close`, whose Save writes its form values in place.
+Its worker writes the file, so with `{"answer":"save"}` the verb replies
+before the file is written, and the tab closes once the save is over: a case
+waits with `pdf-read {"until_idle":true}`. With `ask-on-close` off,
+`close-window` stops for a PDF tab with values not saved (hot exit cannot
+keep them) and opens that tab's close prompt. A tab with another dialog open is not closed: it comes to the
 front with `Close the open dialog first`.
 An optional `index` targets an inactive tab; it defaults to the active tab.
 `call backstage-close {}` calls the Backstage Close handler without supplying
@@ -1049,7 +1055,7 @@ pointer on a few pixels, each driven through the app's own handlers (#699).
 |---|---|
 | `mail-attach {"path":"list.csv"}` | Mailings › Select Recipients › Use an Existing List… without the native dialog (#628): the path goes to the same attach the dialog's answer feeds, on the active Word document. A relative path resolves against the tab's folder. The reply is `{rows, columns, status}`; a file that is not a `.csv`/`.txt` list, cannot be read or has no header row is refused |
 | `hf-insert-picture {"path":"logo.png"}` | Header & Footer › Pictures… without the native dialog (#768): the picture at `path` goes to the same insert the dialog's answer feeds, at the caret of the open header or footer, related from that part's own rels. A relative path resolves against the tab's folder. The reply is `{status}`; with no header or footer open, in Protected View, or for a file that is not a PNG, JPEG, GIF or BMP, nothing is inserted and the verb is refused |
-| `save-as {"path":"out.md"}` | Save As the active tab to `path` without the native dialog: the path goes to the same save function the dialog's answer feeds (`save_doc_to`, `save_sheet_as`, `save_project_to`), and the tab is rebound (title, path, clean, a document's Markdown flag) exactly as after a dialog Save As. Optional `format` and `overwrite` |
+| `save-as {"path":"out.md"}` | Save As the active tab to `path` without the native dialog: the path goes to the same save function the dialog's answer feeds (`save_doc_to`, `save_sheet_as`, `save_project_to`), and the tab is rebound (title, path, clean, a document's Markdown flag) exactly as after a dialog Save As. Optional `format` and `overwrite`. A PDF tab (#2255): `.pdf` only, `format` not taken; the save is queued (reply `{path, queued, status}`) and finishes later: wait with `pdf-read {"until_idle":true}` |
 | `save-types {}` | what the Save As dialog lists for the active tab, which a harness instance never opens: `{count, default, types: [{label, extensions}]}` in the dialog's order, `default` the first type's first extension, the one the dialog opens on. A document's types, the workbook type, or a Project's writable types: the one its Save As proposes first (the plan's own type when something writes it, else a format plugin's declared default, else `yppx`), then `Project schedule` (`yppx`) and `MSPDI` (`xml`) and any a format plugin writes. A read |
 | `new-from-template {"path":"Letter.dotx"}` | File › New › Personal templates without the click (#636): a new, untitled document from the `.dotx`/`.dotm` at `path` (a relative one resolves against the active tab's folder and is refused when that tab was never saved), the way opening a template makes one. Replies `{path: null, title, dirty, status}`; a file that is not a Word template, or one that will not load, opens nothing and is refused |
 | `clipboard {"action":"read"}` | the clipboard's text, its RTF (`rtf`, null without one) and the text of that RTF's bold runs (`rtf_bold`, #1074), its HTML table (`html`, null without one) and the texts of that table's bold cells (`html_bold`, #1248), and what the active tab's paste would use |
@@ -1075,8 +1081,13 @@ no extension takes `format`'s (`docx`, `docm`, `dotx`, `dotm`, `rtf`, `txt`,
 plugin's extension) or the kind's
 first (`.docx`, `.xlsx`, a Project's `save-types` `default`: `.yppx` unless
 the plan's own type or a format plugin's default is proposed). The reply is
-`{path, format, title, dirty, status}`. Refused in words, with nothing written
-and the tab unchanged:
+`{path, format, title, dirty, status}`. A PDF tab (#2255) saves as a PDF
+only: `.pdf` is added to a name without an extension, any other extension
+is refused, and `format` is not taken. Its worker writes the file, so the
+verb only queues the save: the reply is `{path, queued, status}`, and the
+tab is rebound when the save is over; a case waits for it with `pdf-read
+{"until_idle":true}`. Refused in words, with nothing written and the tab
+unchanged:
 
 - a missing or empty `path`; a relative `path` on a never-saved tab;
 - a format the tab kind cannot save (`Documents can be saved as .docx, .docm,

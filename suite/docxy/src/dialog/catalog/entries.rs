@@ -1627,6 +1627,39 @@ dialogs! {
         accept_closes: true,
         unreachable: None,
     }
+    // ---- A PDF view (#2255), from a document tab's surface -------------------
+    // Message boxes: nothing to type; `pdf-forms.uit` answers both.
+    PDF_SIGNED_SAVE = "pdf-signed-save" {
+        surface: Surface::Doc,
+        file: "doc-app",
+        fixture: "copy:../fixtures/pdf-view-signed.pdf",
+        open: &[
+            r#"call pdf-read {"until_drawn":[1]}"#,
+            r#"call pointer-click {"region":"pdf-field:name:0"}"#,
+            r#"call real-type {"text":"x"}"#,
+            "key ctrl+s",
+        ],
+        fields: &[],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
+    PDF_SAVE_ON_CLOSE = "pdf-save-on-close" {
+        surface: Surface::Doc,
+        file: "doc-app",
+        fixture: "copy:../fixtures/pdf-view-forms.pdf",
+        open: &[
+            r#"call pdf-read {"until_drawn":[1]}"#,
+            r#"call pointer-click {"region":"pdf-field:name:0"}"#,
+            r#"call real-type {"text":"x"}"#,
+            "key tab",
+            "call close-tab {}",
+        ],
+        fields: &[],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
     // ---- Project -----------------------------------------------------------
     TASK_INFORMATION = "task-information" {
         surface: Surface::Project,

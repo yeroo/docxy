@@ -136,7 +136,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   one that asked (`active_tab_is`). The window is disabled while the dialog is
   up, so this is defence. Sites: Save As for documents (`pick_doc_save_target`,
   for Save, Save As, Export's Change File Type and the close prompt's More
-  options…), workbooks and Projects, the macro-free question, Project Export,
+  options…), workbooks, Projects and PDFs (`pdf_save_as`, #2255), the
+  macro-free question, Project Export,
   header/footer Insert Picture, Mailings' Use an Existing List (taken in
   `mail_act`, which has the window) and the close warning about a draft that
   was not kept. `native_dialog::tests::no_native_dialog_outside_the_helper`
@@ -144,8 +145,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   the one exception). The macOS scan counts a dialog as wrapped only inside
   `native_dialog(`'s `show` argument (the second), not in `dialog` or `then`.
 - **A save is over when its dialogs are answered.** `save_active_inner`,
-  `save_doc_then`, `save_sheet_then` and `save_project_then` take an
-  `AfterSave` and hand it back (`Some`) when the save is over now. When a
+  `save_doc_then`, `save_sheet_then`, `save_project_then` and
+  `save_pdf_then` take an `AfterSave` and hand it back (`Some`) when the
+  save is over now. A PDF tab's save (#2255) is over when its worker
+  answers: `save_pdf_then` keeps `after` in the view's `pending_save`, and
+  `pdf_settle_tabs` runs it, deferred out of the frame (`cx.defer_in`),
+  written or not. When a
   dialog's answer carries the save on, they move it into that answer
   (`None`); `#[must_use]` keeps a caller from dropping it.
   `save_active_then` returns nothing: it runs what `save_active_inner`
@@ -161,7 +166,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   before `close_prompt_click` returned (always off Windows, and on Windows
   whenever no dialog asked), else `Ok(())`. A harness never asks.
   `close_tab_with`'s `CloseStep::Save` is reached only by a harness
-  `close-tab save` (`debug_assert!`), so its save is over when it returns.
+  `close-tab save` (`debug_assert!`), so its save is over when it returns;
+  but a PDF tab's (#2255), whose worker writes the file later: it closes
+  the tab from that save's `AfterSave`, once the tab is clean.
 - **Workbook Save is steps** (`SheetSaveStep`): `sheet_save_begin`, then
   `sheet_save_answer` for each answer (`Pick`, the Save As dialog, then
   possibly `Confirm`, the macro-free question, then `Done`). The tests'

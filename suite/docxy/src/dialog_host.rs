@@ -300,6 +300,9 @@ fn apply_dialog(
         // Handled in `close::close_prompt_click`, before this: it closes
         // the tab, or goes on with the window's close.
         DialogOwner::SaveOnClose { .. } => Err("closing a tab applies through the app".into()),
+        // Handled in `pdf_signed_save_click`, before this: it goes on with
+        // the save, which the app does.
+        DialogOwner::PdfSignedSave => Err("a PDF's save applies through the app".into()),
         // Handled in `user_name::click`, before this: it is the app's.
         DialogOwner::UserName => Err("the user name is an app setting".into()),
         // Handled in `doc_recovery::click`, before this: it replaces tabs.
@@ -346,6 +349,7 @@ pub(crate) fn presses_through_app(owner: &DialogOwner) -> bool {
                 | DialogOwner::DocumentRecovery
                 | DialogOwner::About
                 | DialogOwner::SaveOnClose { .. }
+                | DialogOwner::PdfSignedSave
                 | DialogOwner::Series
                 | DialogOwner::JustifyOverflow
                 | DialogOwner::CustomLists
@@ -781,6 +785,10 @@ impl Docxy {
         // The close prompt closes the tab, or goes on with the window's
         // close (#629, #630).
         if let Some(done) = self.close_prompt_click(button, window, cx) {
+            return done;
+        }
+        // The signed PDF's question goes on with its save, or not (#2255).
+        if let Some(done) = self.pdf_signed_save_click(button, window, cx) {
             return done;
         }
         // So are the custom lists, which the Series dialog reads (#668).

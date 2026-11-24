@@ -1,10 +1,13 @@
 //! Drawing the PDF view (#2245): its toolbar, the Find bar, the outline
 //! pane and the page column. Each page is its raster (stretched while one
 //! at the new zoom is drawn), or a placeholder that says why it is not;
-//! the selection and Find's hits are boxes over the glyphs. Only the pages
-//! on screen (and one either side) are drawn.
+//! the selection and Find's hits are boxes over the glyphs, form fields'
+//! highlights and the focused field's editor over its widget (#2255). A
+//! combo box's list, a comment's pop-up and the tooltip are drawn over the
+//! column. Only the pages on screen (and one either side) are drawn.
 
-use super::{Field, PX_PER_PT, PdfView};
+use super::worker::FieldKind;
+use super::{Field, PX_PER_PT, PdfView, Under};
 use crate::*;
 
 /// A toolbar or Find bar command.
@@ -27,6 +30,12 @@ pub(crate) enum PdfCmd {
 const SEL: u32 = 0x3B82F6;
 const HIT: u32 = 0xFACC15;
 const HIT_NOW: u32 = 0xF97316;
+/// A fillable field's highlight and a required empty one's outline (#2255):
+/// fixed colours, as the page is white in either theme.
+const FIELD: u32 = 0x3B82F6;
+const REQUIRED: u32 = 0xDC2626;
+/// A combo box's open list: one row's height (logical px).
+pub(crate) const OPTION_ROW: f32 = 20.;
 
 fn rgba(rgb: u32, a: f32) -> Hsla {
     let mut c: Hsla = rgb_u(rgb);
@@ -448,6 +457,7 @@ impl Docxy {
                     marks.extend(boxes(t.line_rects(range), rgba(SEL, 0.35)));
                 }
             }
+            marks.extend(self.pdf_widgets(v, p, k));
             let body: AnyElement = match (&v.rasters[p], v.placeholder(p)) {
                 (Some(c), _) => img(c.image.clone())
                     .absolute()
@@ -496,34 +506,45 @@ impl Docxy {
                     .into_any_element(),
             );
         }
+        let overlays = self.pdf_overlays(v, &l, k, pal, cx);
         let content = div()
             .relative()
             .w(px(l.width))
             .h(px(l.height))
-            .cursor_text()
+            .cursor(pointer_cursor(v))
             .children(pages)
+            .children(overlays)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
                     let Some(v) = this.active_pdf() else { return };
                     let (x, y) = content_point(v, ev.position);
-                    this.pdf_page_press(x, y, ev.click_count, ev.modifiers.shift, cx);
+                    let m = ev.modifiers;
+                    this.pdf_page_press(x, y, ev.click_count, m.shift, m.control || m.platform, cx);
                 }),
             )
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
-                if ev.pressed_button != Some(MouseButton::Left) {
-                    return;
-                }
                 let Some(v) = this.active_pdf() else { return };
-                if v.drag.is_none() {
+                let (x, y) = content_point(v, ev.position);
+                if ev.pressed_button == Some(MouseButton::Left) {
+                    if v.drag.is_some() || v.link_press.is_some() {
+                        this.with_pdf(cx, |v| v.drag_at(x, y));
+                    }
                     return;
                 }
-                let (x, y) = content_point(v, ev.position);
-                this.with_pdf(cx, |v| v.drag_to(x, y));
+                // What the pointer is over: its cursor, tooltip and a
+                // comment's pop-up (#2255). A redraw only when they change.
+                if let Some(v) = this.active_pdf_mut()
+                    && v.hover(x, y)
+                {
+                    cx.notify();
+                }
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _w, cx| this.with_pdf(cx, PdfView::release)),
+                cx.listener(|this, _: &MouseUpEvent, _w, cx| {
+                    this.with_pdf(cx, PdfView::release_at)
+                }),
             )
             .on_mouse_up_out(
                 MouseButton::Left,
@@ -559,6 +580,282 @@ impl Docxy {
             .child(content)
             .child(probe(&self.probes, "pdf-body"))
             .into_any_element()
+    }
+}
+
+impl Docxy {
+    /// Page `p`'s form widgets (#2255): fillable ones lightly highlighted,
+    /// a required empty one outlined red, and the focused one as an editor
+    /// (its typed text, caret and selection; bullets for a password) or a
+    /// focus ring. In the page's own coordinates.
+    fn pdf_widgets(&self, v: &PdfView, p: usize, k: f32) -> Vec<AnyElement> {
+        let mut out = Vec::new();
+        for &(f, w) in &v.widgets[p] {
+            let field = &v.form.fields[f];
+            let widget = &field.widgets[w];
+            if widget.hidden || !field.fillable() || widget.read_only {
+                continue;
+            }
+            let r = widget.rect;
+            let (x, y, ww, hh) = (
+                r[0] * k,
+                r[1] * k,
+                ((r[2] - r[0]) * k).max(2.),
+                ((r[3] - r[1]) * k).max(2.),
+            );
+            let focused = v.focus.as_ref().filter(|x| x.field == f && x.widget == w);
+            let required = field.required && field.is_empty();
+            let mut d = div()
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .w(px(ww))
+                .h(px(hh))
+                .border_1()
+                .border_color(if required {
+                    rgb_u(REQUIRED)
+                } else {
+                    rgba(FIELD, 0.45)
+                })
+                .bg(rgba(FIELD, 0.10));
+            if let Some(focus) = focused {
+                d = d.border_2().border_color(rgb_u(SEL));
+                if let Some(e) = &focus.edit {
+                    let size = if field.font_size > 0. {
+                        field.font_size
+                    } else {
+                        ((r[3] - r[1]) * 0.6).clamp(6., 14.)
+                    } * k;
+                    let shown = if field.password {
+                        "\u{2022}".repeat(e.text.chars().count())
+                    } else {
+                        e.text.clone()
+                    };
+                    let caret = e.caret.min(shown.chars().count());
+                    let (before, after): (String, String) = if e.sel {
+                        (shown.clone(), String::new())
+                    } else {
+                        (
+                            shown.chars().take(caret).collect(),
+                            shown.chars().skip(caret).collect(),
+                        )
+                    };
+                    d = d.bg(rgb_u(0xFFFFFF)).child(
+                        div()
+                            .size_full()
+                            .px(px(2. * k))
+                            .flex()
+                            .when(field.multiline, |d| d.flex_wrap().items_start())
+                            .when(!field.multiline, |d| d.items_center())
+                            .overflow_hidden()
+                            .text_size(px(size))
+                            .line_height(px(size * 1.15))
+                            .text_color(rgb_u(0x000000))
+                            .child(
+                                div()
+                                    .when(e.sel && !shown.is_empty(), |d| d.bg(rgba(SEL, 0.35)))
+                                    .child(before),
+                            )
+                            .when(!e.sel, |d| {
+                                d.child(div().w(px(1.)).h(px(size)).bg(rgb_u(0x000000)))
+                            })
+                            .child(div().child(after)),
+                    );
+                }
+                // A list box's option under the keys.
+                if field.kind == FieldKind::List
+                    && let Some(rows) = widget.list
+                    && focus.cursor >= rows.top
+                {
+                    let top = rows.inset + (focus.cursor - rows.top) as f32 * rows.row;
+                    if top + rows.row <= r[3] - r[1] {
+                        d = d.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top(px(top * k))
+                                .w_full()
+                                .h(px(rows.row * k))
+                                .border_1()
+                                .border_color(rgb_u(SEL)),
+                        );
+                    }
+                }
+            }
+            out.push(d.into_any_element());
+        }
+        out
+    }
+
+    /// What is drawn over the pages in the content's coordinates, so a page
+    /// edge never cuts it (#2255): a combo box's open list, a comment's
+    /// pop-up and the tooltip.
+    fn pdf_overlays(
+        &self,
+        v: &PdfView,
+        l: &super::Layout,
+        k: f32,
+        pal: Pal,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut out = Vec::new();
+        if let Some((x, y, w)) = combo_list(v, l, k) {
+            let focus = v.focus.as_ref();
+            let field = focus.and_then(|f| v.field(f.field));
+            // The rows the list shows (#2255 r1): a window of the options
+            // that follows the keys' cursor and scrolls by the wheel.
+            let window = v.list_window();
+            let items: Vec<AnyElement> = field
+                .map(|f| f.options.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+                .skip(window.start)
+                .take(window.len())
+                .map(|(i, (_, text))| {
+                    let on = focus.is_some_and(|f| f.cursor == i);
+                    div()
+                        .relative()
+                        .h(px(OPTION_ROW))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .text_size(px(12.))
+                        .text_color(rgb_u(if on { 0xFFFFFF } else { 0x111827 }))
+                        .when(on, |d| d.bg(rgb_u(SEL)))
+                        .hover(|d| d.bg(rgba(SEL, 0.25)))
+                        .child(text)
+                        .child(probe(&self.probes, format!("pdf-option:{}", i + 1)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _w, cx| {
+                                cx.stop_propagation();
+                                this.with_pdf(cx, |v| v.pick(i, false));
+                            }),
+                        )
+                        .into_any_element()
+                })
+                .collect();
+            out.push(
+                div()
+                    .absolute()
+                    .left(px(x))
+                    .top(px(y))
+                    .w(px(w))
+                    .bg(rgb_u(0xFFFFFF))
+                    .border_1()
+                    .border_color(rgb_u(0x6B7280))
+                    .shadow_md()
+                    .children(items)
+                    .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| {
+                        let dy = match ev.delta {
+                            ScrollDelta::Lines(p) => p.y,
+                            ScrollDelta::Pixels(p) => f32::from(p.y) / OPTION_ROW,
+                        };
+                        let rows = (-dy).round() as i32;
+                        if rows != 0 {
+                            cx.stop_propagation();
+                            this.with_pdf(cx, |v| v.list_scroll(rows));
+                        }
+                    }))
+                    .into_any_element(),
+            );
+        }
+        if let Some(pop) = v.popup
+            && let Some(note) = v.notes.get(pop.page).and_then(|n| n.get(pop.note))
+            && let Some(pr) = l.pages.get(pop.page)
+        {
+            let x = pr.x + note.rect[2] * k + 8.;
+            let y = pr.y + note.rect[1] * k;
+            let head = match (&note.author, &note.date) {
+                (Some(a), Some(d)) => format!("{a} · {d}"),
+                (Some(a), None) => a.clone(),
+                (None, Some(d)) => d.clone(),
+                (None, None) => note.subtype.clone(),
+            };
+            out.push(
+                div()
+                    .id("pdf-popup")
+                    .absolute()
+                    .left(px(x.min((l.width - 268.).max(0.))))
+                    .top(px(y))
+                    .w(px(260.))
+                    .p_2()
+                    .bg(rgb_u(0xFEF9C3))
+                    .border_1()
+                    .border_color(rgb_u(0xCA8A04))
+                    .shadow_md()
+                    .text_size(px(12.))
+                    .text_color(rgb_u(0x1F2937))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(head))
+                    .child(div().mt_1().child(note.contents.clone()))
+                    .child(probe(&self.probes, "pdf-popup"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _: &MouseDownEvent, _w, cx| cx.stop_propagation()),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if let Some(tip) = v.tooltip() {
+            let (x, y) = v.pointer;
+            out.push(
+                div()
+                    .absolute()
+                    .left(px(x + 12.))
+                    .top(px(y + 18.))
+                    .max_w(px(360.))
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(pal.panel)
+                    .border_1()
+                    .border_color(pal.border)
+                    .text_color(pal.fg)
+                    .text_size(px(12.))
+                    .child(tip)
+                    .child(probe(&self.probes, "pdf-tooltip"))
+                    .into_any_element(),
+            );
+        }
+        out
+    }
+}
+
+/// Where the focused combo box's open list goes (content px): left, top
+/// and width; its rows are [`PdfView::list_window`].
+pub(crate) fn combo_list(v: &PdfView, l: &super::Layout, k: f32) -> Option<(f32, f32, f32)> {
+    let focus = v.focus.as_ref().filter(|f| f.open)?;
+    let field = v
+        .field(focus.field)
+        .filter(|f| f.kind == FieldKind::Combo)?;
+    let widget = field.widgets.get(focus.widget)?;
+    let pr = l.pages.get(widget.page?)?;
+    let r = widget.rect;
+    Some((
+        pr.x + r[0] * k,
+        pr.y + r[3] * k,
+        ((r[2] - r[0]) * k).max(80.),
+    ))
+}
+
+/// The pointer over the pages: a hand over links, comments and the fields
+/// a click fills, an I-beam over text fields and text, an arrow over a
+/// read-only field.
+fn pointer_cursor(v: &PdfView) -> CursorStyle {
+    match v.under {
+        Under::Link(..) | Under::Note(..) => CursorStyle::PointingHand,
+        Under::Widget(f, _) => match v.field(f) {
+            Some(field) if !field.fillable() => CursorStyle::Arrow,
+            Some(field)
+                if field.kind == FieldKind::Text
+                    || (field.kind == FieldKind::Combo && field.edit) =>
+            {
+                CursorStyle::IBeam
+            }
+            _ => CursorStyle::PointingHand,
+        },
+        Under::Nothing => CursorStyle::IBeam,
     }
 }
 

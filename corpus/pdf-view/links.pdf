@@ -1,0 +1,128 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /Names << /Dests 21 0 R >> /Dests << /old [5 0 R /FitR 100 100 300 300] >> >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R 5 0 R 6 0 R] /Count 3 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 17 0 R /Annots [7 0 R 8 0 R 9 0 R 10 0 R 11 0 R 12 0 R 13 0 R 14 0 R 15 0 R 16 0 R]  >>
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 18 0 R /Annots []  >>
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 20 0 R /Annots [19 0 R] /Rotate 90 >>
+endobj
+7 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 740 330 758] /Border [0 0 0] /A << /S /URI /URI (https://example.com/docxy) >> >>
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 710 330 728] /Border [0 0 0] /A << /S /URI /URI (mailto:docs@example.com) >> >>
+endobj
+9 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 680 330 698] /Border [0 0 0] /Dest [5 0 R /XYZ 72 600 2] >>
+endobj
+10 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 650 330 668] /Border [0 0 0] /Dest (chapter3) >>
+endobj
+11 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 620 330 638] /Border [0 0 0] /A << /S /GoTo /D /old >> >>
+endobj
+12 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 590 330 608] /Border [0 0 0] /A << /S /GoTo /D [5 0 R /Fit] >> >>
+endobj
+13 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 560 330 578] /Border [0 0 0] /A << /S /JavaScript /JS (app.alert\(1\)) >> >>
+endobj
+14 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 530 330 548] /Border [0 0 0] /A << /S /Launch /F (notes.txt) >> >>
+endobj
+15 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 500 330 518] /Border [0 0 0] /A << /S /URI /URI (javascript:alert\(1\)) >> >>
+endobj
+16 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 400 400 450] /Border [0 0 0] /QuadPoints [72 450 250 450 72 428 250 428] /A << /S /URI /URI (https://example.com/quad) >> >>
+endobj
+17 0 obj
+<<  /Length 538 >>
+stream
+0 g BT
+/F1 11 Tf
+1 0 0 1 72 780 Tm (Links) Tj
+1 0 0 1 76 744 Tm (Open https://example.com/docxy) Tj
+1 0 0 1 76 714 Tm (Write to docs@example.com) Tj
+1 0 0 1 76 684 Tm (Go to page 2 at 200 %) Tj
+1 0 0 1 76 654 Tm (Go to chapter 3 \(a named destination\)) Tj
+1 0 0 1 76 624 Tm (Go to the old section \(GoTo, /Dests\)) Tj
+1 0 0 1 76 594 Tm (Go to page 2, fitted) Tj
+1 0 0 1 76 564 Tm (Run a script) Tj
+1 0 0 1 76 534 Tm (Launch notes.txt) Tj
+1 0 0 1 76 504 Tm (A javascript: address) Tj
+1 0 0 1 76 434 Tm (Quad link \(only this part\)) Tj
+ET
+endstream
+endobj
+18 0 obj
+<<  /Length 89 >>
+stream
+0 g BT
+/F1 11 Tf
+1 0 0 1 72 780 Tm (Page two) Tj
+1 0 0 1 72 600 Tm (XYZ lands here) Tj
+ET
+endstream
+endobj
+19 0 obj
+<< /Type /Annot /Subtype /Link /Rect [72 700 300 716] /Border [0 0 0] /Dest [4 0 R /XYZ null null 0] >>
+endobj
+20 0 obj
+<<  /Length 124 >>
+stream
+0 g BT
+/F1 11 Tf
+1 0 0 1 72 760 Tm (Chapter 3, on a page turned a quarter right) Tj
+1 0 0 1 76 704 Tm (Back to page 1) Tj
+ET
+endstream
+endobj
+21 0 obj
+<< /Names [(chapter3) [6 0 R /FitH 400]] >>
+endobj
+22 0 obj
+<< /Title (Links corpus) /Author (docxy) >>
+endobj
+xref
+0 23
+0000000000 65535 f 
+0000000015 00000 n 
+0000000139 00000 n 
+0000000208 00000 n 
+0000000305 00000 n 
+0000000510 00000 n 
+0000000649 00000 n 
+0000000804 00000 n 
+0000000942 00000 n 
+0000001078 00000 n 
+0000001194 00000 n 
+0000001300 00000 n 
+0000001415 00000 n 
+0000001538 00000 n 
+0000001672 00000 n 
+0000001796 00000 n 
+0000001931 00000 n 
+0000002113 00000 n 
+0000002704 00000 n 
+0000002845 00000 n 
+0000002965 00000 n 
+0000003142 00000 n 
+0000003202 00000 n 
+trailer
+<< /Size 23 /Root 1 0 R /Info 22 0 R /ID [<22552255225522552255225522552255> <22552255225522552255225522552255>] >>
+startxref
+3262
+%%EOF

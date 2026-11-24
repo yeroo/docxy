@@ -1424,6 +1424,7 @@ dependencies = [
  "chrono",
  "craft-stream-codecs",
  "flate2",
+ "hayro-syntax",
  "js-sys",
  "md-5 0.11.0",
  "sha2 0.11.0",
@@ -1708,11 +1709,16 @@ dependencies = [
  "helpdocs",
  "htmlbundle",
  "image",
+ "lopdf",
  "mppread",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "opccore",
+ "pdfcraft-annot",
+ "pdfcraft-cos",
+ "pdfcraft-forms",
+ "pdfcraft-model",
  "pdfcraft-render",
  "projcore",
  "projctl",
@@ -5012,6 +5018,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdfcraft-annot"
+version = "0.21.1"
+source = "git+https://github.com/storytold/pdfcraft?rev=eeee51ff7b805b52652a7e00305cc8cf91748239#eeee51ff7b805b52652a7e00305cc8cf91748239"
+dependencies = [
+ "pdfcraft-cos",
+ "pdfcraft-fonts",
+ "pdfcraft-geom",
+ "pdfcraft-model",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "pdfcraft-content"
+version = "0.21.1"
+source = "git+https://github.com/storytold/pdfcraft?rev=eeee51ff7b805b52652a7e00305cc8cf91748239#eeee51ff7b805b52652a7e00305cc8cf91748239"
+dependencies = [
+ "craft-pdf",
+]
+
+[[package]]
 name = "pdfcraft-cos"
 version = "0.21.1"
 source = "git+https://github.com/storytold/pdfcraft?rev=eeee51ff7b805b52652a7e00305cc8cf91748239#eeee51ff7b805b52652a7e00305cc8cf91748239"
@@ -5031,9 +5057,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdfcraft-forms"
+version = "0.21.1"
+source = "git+https://github.com/storytold/pdfcraft?rev=eeee51ff7b805b52652a7e00305cc8cf91748239#eeee51ff7b805b52652a7e00305cc8cf91748239"
+dependencies = [
+ "pdfcraft-content",
+ "pdfcraft-cos",
+ "pdfcraft-fonts",
+ "pdfcraft-model",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "pdfcraft-geom"
 version = "0.21.1"
 source = "git+https://github.com/storytold/pdfcraft?rev=eeee51ff7b805b52652a7e00305cc8cf91748239#eeee51ff7b805b52652a7e00305cc8cf91748239"
+
+[[package]]
+name = "pdfcraft-model"
+version = "0.21.1"
+source = "git+https://github.com/storytold/pdfcraft?rev=eeee51ff7b805b52652a7e00305cc8cf91748239#eeee51ff7b805b52652a7e00305cc8cf91748239"
+dependencies = [
+ "pdfcraft-cos",
+]
 
 [[package]]
 name = "pdfcraft-render"
