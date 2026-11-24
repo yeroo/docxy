@@ -14,7 +14,7 @@
 use crate::model::Project;
 use crate::mpx::{is_mpx, read_mpx};
 use crate::mspdi::{read_mspdi, write_mspdi};
-use crate::yppx::{read_yppx, write_yppx};
+use crate::yppx::{package_only, read_yppx, write_yppx};
 use std::path::{Path, PathBuf};
 
 #[cfg(feature = "plugins")]
@@ -57,6 +57,15 @@ pub trait ProjectFormat: Send + Sync {
     fn is_default(&self) -> bool {
         false
     }
+    /// Whether the bytes keep the task flags only a `.yppx` package holds
+    /// (Display on Timeline and Marked, [`crate::yppx::package_only`]); a
+    /// save by a writer that does not is told what it lost
+    /// ([`Registry::save_note`]). Only the built-in [`Yppx`] does: a format
+    /// plugin, even one that claims `.yppx`, is handed MSPDI and the
+    /// formatting part.
+    fn keeps_task_flags(&self) -> bool {
+        false
+    }
 }
 
 /// The native `.yppx` package ([`crate::yppx`]).
@@ -81,6 +90,9 @@ impl ProjectFormat for Yppx {
     }
     fn write(&self, project: &Project, _source: Option<&[u8]>) -> Result<Vec<u8>, String> {
         write_yppx(project)
+    }
+    fn keeps_task_flags(&self) -> bool {
+        true
     }
 }
 
@@ -376,6 +388,43 @@ impl Registry {
         self.writer(extension(path))
             .ok_or_else(|| self.save_refusal())?
             .write(project, source)
+    }
+
+    /// What a save of `project` to `path` (resolved by
+    /// [`Registry::save_target`]) loses, for the host to add to the save's
+    /// status (#1618): the task flags some task has on that its writer does
+    /// not keep ([`ProjectFormat::keeps_task_flags`]), as in "Display on
+    /// Timeline is not saved in .xml files; save as .yppx to keep it". The
+    /// advice is left out when this registry's `.yppx` writer would lose them
+    /// too. `None` when nothing is lost or no format writes the type.
+    pub fn save_note(&self, project: &Project, path: &Path) -> Option<String> {
+        if self.writer(extension(path))?.keeps_task_flags() {
+            return None;
+        }
+        let lost = package_only(project);
+        let (last, rest) = lost.split_last()?;
+        let names = match rest {
+            [] => last.to_string(),
+            rest => format!("{} and {last}", rest.join(", ")),
+        };
+        let (verb, them) = if rest.is_empty() {
+            ("is", "it")
+        } else {
+            ("are", "them")
+        };
+        let mut note = format!(
+            "{names} {verb} not saved in .{} files",
+            normalize(extension(path))
+        );
+        if self
+            .writer(DEFAULT_SAVE_EXTENSION)
+            .is_some_and(|w| w.keeps_task_flags())
+        {
+            note.push_str(&format!(
+                "; save as .{DEFAULT_SAVE_EXTENSION} to keep {them}"
+            ));
+        }
+        Some(note)
     }
 }
 
@@ -788,5 +837,99 @@ mod tests {
             "Out files (.out) can be saved but not opened"
         );
         assert_eq!(registry.for_extension("OUT").unwrap().label(), "Out");
+    }
+
+    /// A plan of two tasks, the first with Display on Timeline and Marked as
+    /// given, the second stating neither.
+    fn flagged(timeline: Option<bool>, marked: Option<bool>) -> Project {
+        let mut p = crate::editor::untitled_project();
+        for uid in [1, 2] {
+            p.tasks.push(crate::model::Task {
+                uid,
+                id: uid,
+                name: format!("Task {uid}"),
+                outline_level: 1,
+                duration_min: 480,
+                ..crate::model::Task::default()
+            });
+        }
+        p.tasks[0].display_on_timeline = timeline;
+        p.tasks[0].marked = marked;
+        p
+    }
+
+    /// The loss #1618 reports: MSPDI has no element for Display on Timeline
+    /// (nor Marked), so an `.xml` save reopens without it; `.yppx` keeps it.
+    #[test]
+    fn an_xml_save_drops_display_on_timeline() {
+        let registry = Registry::new();
+        let plan = flagged(Some(true), Some(true));
+        let round = |name: &str| {
+            let path = Path::new(name);
+            let bytes = registry.write(&plan, path, None).unwrap();
+            registry.read(path, &bytes).unwrap()
+        };
+        let xml = round("plan.xml");
+        assert_eq!(xml.tasks[0].name, "Task 1");
+        assert_eq!(xml.tasks[0].display_on_timeline, None);
+        assert_eq!(xml.tasks[0].marked, None);
+        let yppx = round("plan.yppx");
+        assert_eq!(yppx.tasks[0].display_on_timeline, Some(true));
+        assert_eq!(yppx.tasks[0].marked, Some(true));
+    }
+
+    #[test]
+    fn save_note_names_flags_only_yppx_keeps() {
+        let registry = Registry::new();
+        let note = |plan: &Project, name: &str| registry.save_note(plan, Path::new(name));
+        let timeline = flagged(Some(true), None);
+        assert_eq!(
+            note(&timeline, "plan.xml").as_deref(),
+            Some("Display on Timeline is not saved in .xml files; save as .yppx to keep it")
+        );
+        // The target's type as the registry keys it.
+        assert_eq!(note(&timeline, "PLAN.XML"), note(&timeline, "plan.xml"));
+        assert_eq!(note(&timeline, "plan.yppx"), None);
+        assert_eq!(note(&timeline, "plan.YPPX"), None);
+        // Nothing to lose: no flag, or only flags off, which reopen as off.
+        assert_eq!(note(&flagged(None, None), "plan.xml"), None);
+        assert_eq!(note(&flagged(Some(false), Some(false)), "plan.xml"), None);
+        assert_eq!(
+            note(&flagged(Some(false), Some(true)), "plan.xml").as_deref(),
+            Some("Marked is not saved in .xml files; save as .yppx to keep it")
+        );
+        assert_eq!(
+            note(&flagged(Some(true), Some(true)), "plan.xml").as_deref(),
+            Some(
+                "Display on Timeline and Marked are not saved in .xml files; \
+                 save as .yppx to keep them"
+            )
+        );
+        // No format writes the type: no note (the save is refused anyway).
+        assert_eq!(note(&timeline, "plan.mpx"), None);
+        assert_eq!(note(&timeline, "plan.doc"), None);
+    }
+
+    #[test]
+    fn save_note_asks_the_writer_not_the_extension() {
+        let plan = flagged(Some(true), None);
+        let mut registry = Registry::new();
+        // A plugin-like writer of another type loses the flags too.
+        registry.register(named(&["mpp"], "Project", true, true));
+        assert_eq!(
+            registry.save_note(&plan, Path::new("plan.mpp")).as_deref(),
+            Some("Display on Timeline is not saved in .mpp files; save as .yppx to keep it")
+        );
+        // One that takes over .yppx: its .yppx loses them, and no type this
+        // registry writes keeps them, so there is no advice to give.
+        registry.register(named(&["yppx"], "Own yppx", true, true));
+        assert_eq!(
+            registry.save_note(&plan, Path::new("plan.yppx")).as_deref(),
+            Some("Display on Timeline is not saved in .yppx files")
+        );
+        assert_eq!(
+            registry.save_note(&plan, Path::new("plan.xml")).as_deref(),
+            Some("Display on Timeline is not saved in .xml files")
+        );
     }
 }

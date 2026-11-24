@@ -183,7 +183,7 @@ fn main() -> ExitCode {
             }
         }
         if let Some(out) = &parsed.save
-            && let Err(e) = save_with(formats.registry, ed.project(), out, source.as_ref())
+            && let Err(e) = headless_save(formats.registry, ed.project(), out, source.as_ref())
         {
             eprintln!("{out}: {e}");
             return ExitCode::FAILURE;
@@ -207,7 +207,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if let Some(out) = &parsed.save {
-        if let Err(e) = save_with(formats.registry, &proj, out, source.as_ref()) {
+        if let Err(e) = headless_save(formats.registry, &proj, out, source.as_ref()) {
             eprintln!("{out}: {e}");
             return ExitCode::FAILURE;
         }
@@ -364,22 +364,40 @@ fn export_base(path: Option<&str>) -> String {
 
 #[cfg(test)]
 fn save_to(proj: &Project, path: &str) -> Result<std::path::PathBuf, String> {
-    save_with(formats::global().registry, proj, path, None)
+    save_with(formats::global().registry, proj, path, None).map(|(path, _)| path)
 }
 
 /// Save `proj` to `path` (extensionless names become `.yppx`) by its
 /// extension's writer, refusing a type nothing writes. `source`, the file the
-/// plan was opened from, goes to a save of the same type.
+/// plan was opened from, goes to a save of the same type. Returns the saved
+/// path and what its type does not keep ([`Registry::save_note`], #1618).
 fn save_with(
     registry: &Registry,
     proj: &Project,
     path: &str,
     source: Option<&formats::Source>,
-) -> Result<std::path::PathBuf, String> {
+) -> Result<(std::path::PathBuf, Option<String>), String> {
     let path = registry.save_target(Path::new(path))?;
     let bytes = registry.write(proj, &path, source.and_then(|s| s.for_target(&path)))?;
     write_atomic(&path, &bytes).map_err(|e| e.to_string())?;
-    Ok(path)
+    let note = registry.save_note(proj, &path);
+    Ok((path, note))
+}
+
+/// A headless `--save`: write the plan, and say on stderr what the type
+/// drops (#1618), leaving stdout to `--command`'s status. A note is not a
+/// failure.
+fn headless_save(
+    registry: &Registry,
+    proj: &Project,
+    out: &str,
+    source: Option<&formats::Source>,
+) -> Result<(), String> {
+    let (path, note) = save_with(registry, proj, out, source)?;
+    if let Some(note) = note {
+        eprintln!("yppxy: {}: {note}", path.display());
+    }
+    Ok(())
 }
 
 /// A fresh schedule: one task so the chart has something to show.
@@ -1472,19 +1490,23 @@ impl App {
     }
 
     /// Publish the resolved binding and clean state only after a successful save.
-    fn save_to_path(&mut self, path: &str) -> Result<(), String> {
-        let path = save_with(
+    /// Save to `path`; the status says where and what the type does not keep
+    /// (#1618), which is also returned.
+    fn save_to_path(&mut self, path: &str) -> Result<Option<String>, String> {
+        let (path, note) = save_with(
             self.formats.registry,
             self.ed.project(),
             path,
             self.source.as_ref(),
-        )?
-        .to_string_lossy()
-        .into_owned();
+        )?;
+        let path = path.to_string_lossy().into_owned();
         self.ed.commit_save();
         self.status = format!("Saved {path}");
+        if let Some(note) = &note {
+            self.status.push_str(&format!(". {note}"));
+        }
         self.path = Some(path);
-        Ok(())
+        Ok(note)
     }
 
     fn save(&mut self) {
@@ -3253,6 +3275,40 @@ mod tests {
         assert!(saved.task(0).unwrap().name.is_empty());
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// #1618: MSPDI has no element for Display on Timeline, so an `.xml`
+    /// save says it is not kept; the save itself is as before, and a `.yppx`
+    /// save's message is unchanged.
+    #[test]
+    fn xml_save_status_says_display_on_timeline_is_not_saved() {
+        let dir = std::env::temp_dir().join(format!("yppxy-timeline-note-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new(new_project(), None, false);
+        app.ed.set_display_on_timeline(1, true).unwrap();
+        let xml = dir.join("plan.xml").to_string_lossy().into_owned();
+        let note = app.save_to_path(&xml).unwrap();
+        assert!(
+            note.unwrap()
+                .starts_with("Display on Timeline is not saved")
+        );
+        assert_eq!(
+            app.status,
+            format!(
+                "Saved {xml}. Display on Timeline is not saved in .xml files; \
+                 save as .yppx to keep it"
+            )
+        );
+        assert!(!app.ed.dirty());
+        assert_eq!(app.path.as_deref(), Some(xml.as_str()));
+        assert_eq!(
+            std::fs::read(&xml).unwrap(),
+            mspdi::write_mspdi(app.ed.project()).into_bytes()
+        );
+        let native = dir.join("plan.yppx").to_string_lossy().into_owned();
+        assert_eq!(app.save_to_path(&native).unwrap(), None);
+        assert_eq!(app.status, format!("Saved {native}"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

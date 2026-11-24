@@ -10,6 +10,7 @@ use crate::flagpart::TaskFlagPart;
 /// The part's description ([`TaskFlagPart`]).
 pub const FLAGS: TaskFlagPart = TaskFlagPart {
     part: PART,
+    label: "Display on Timeline",
     content_type: CONTENT_TYPE,
     root: "timeline",
     attr: "show",

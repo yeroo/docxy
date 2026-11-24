@@ -52,6 +52,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing Project's text s
   task, written only when one states a value, an unreadable part kept as a
   retained extra) and `yppx::FLAG_PARTS` writes them in order, so a plan
   without marks saves byte-identically. Bar Styles `Marked` reads it.
+  A save to any other type says it drops Marked when a task has it on
+  (`Registry::save_note`, #1618, in `docs/claude/project-task-info.md`).
 - Highlight (View > Highlight, no UI yet) is view state beside the
   AutoFilter: `Editor::set_highlight` / `clear_highlight` /
   `is_highlighted(_by)` / `highlighted_rows`, the filters' checklists

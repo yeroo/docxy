@@ -208,16 +208,25 @@ pub(crate) fn project_verb(
                     };
                     apply_save(tab, &target)
                 })();
-                if let Err(e) = save {
-                    tab.status = old_status;
-                    return Err(e);
-                }
+                let note = match save {
+                    Ok((_, note)) => note,
+                    Err(e) => {
+                        tab.status = old_status;
+                        return Err(e);
+                    }
+                };
                 if let Surface::Project(v) = &mut tab.surface {
                     v.cancel_prompt();
                 }
                 tab.dialogs.clear();
+                // What the saved type does not keep (#1618), only when it
+                // drops something.
+                let mut info = path_info(tab, index);
+                if let (Json::Obj(fields), Some(note)) = (&mut info, note) {
+                    fields.push(("note".into(), Json::Str(note)));
+                }
                 Ok((
-                    path_info(tab, index),
+                    info,
                     Effect {
                         repaint: true,
                         ..Effect::default()

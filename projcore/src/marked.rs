@@ -13,6 +13,7 @@ pub const CONTENT_TYPE: &str = "application/vnd.yppx.marked+xml";
 /// The part's description ([`TaskFlagPart`]).
 pub const FLAGS: TaskFlagPart = TaskFlagPart {
     part: PART,
+    label: "Marked",
     content_type: CONTENT_TYPE,
     root: "marked",
     attr: "on",

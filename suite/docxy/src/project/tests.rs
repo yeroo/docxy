@@ -328,7 +328,7 @@ fn saved_formats_round_trip_the_complete_project() {
     let dir = Scratch::new();
     let tab = project_tab_from_path(&corpus("11-resource-assignment.xml"));
     for name in ["saved.yppx", "saved.XML", "extensionless"] {
-        let (path, n) = write_project(&view(&tab).ed, &dir.path(name), None).unwrap();
+        let (path, n, _) = write_project(&view(&tab).ed, &dir.path(name), None).unwrap();
         assert!(n > 0);
         assert_eq!(&project_from_path(&path).unwrap(), view(&tab).ed.project());
     }
@@ -1042,6 +1042,46 @@ fn a_body_click_counts_only_when_it_stayed_below_the_entry_row() {
     assert!(
         !below_entry_row(px(500.), px(500.), None),
         "entry row not drawn"
+    );
+}
+
+/// #1618: MSPDI has no element for Display on Timeline, so an `.xml` save
+/// says it is not kept; the save itself is as before, and a `.yppx` save's
+/// message is unchanged.
+#[test]
+fn an_xml_save_says_display_on_timeline_is_not_saved() {
+    let dir = Scratch::new();
+    let mut tab = edited_tab();
+    view_mut(&mut tab)
+        .ed
+        .set_display_on_timeline(1, true)
+        .unwrap();
+    let xml = dir.path("plan.xml");
+    let (n, note) = apply_save(&mut tab, &xml).unwrap();
+    assert!(
+        note.unwrap()
+            .starts_with("Display on Timeline is not saved")
+    );
+    assert_eq!(
+        tab.status.as_ref(),
+        format!(
+            "saved {n} bytes → {}. Display on Timeline is not saved in .xml files; \
+             save as .yppx to keep it",
+            xml.display()
+        )
+    );
+    assert!(!tab.dirty);
+    assert!(!view(&tab).ed.dirty());
+    assert_eq!(
+        std::fs::read(&xml).unwrap(),
+        mspdi::write_mspdi(view(&tab).ed.project()).into_bytes()
+    );
+    let native = dir.path("plan.yppx");
+    let (n, note) = apply_save(&mut tab, &native).unwrap();
+    assert_eq!(note, None);
+    assert_eq!(
+        tab.status.as_ref(),
+        format!("saved {n} bytes → {}", native.display())
     );
 }
 

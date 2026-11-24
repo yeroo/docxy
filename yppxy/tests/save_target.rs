@@ -431,3 +431,49 @@ fn a_new_plan_is_named_project1() {
     assert!(md_text.contains("title Project1\n"), "{md_text}");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// #1618: a headless `--save` to `.xml` of a plan with a task on the
+/// Timeline still succeeds, and says on stderr that the type drops it; to
+/// `.yppx` it says nothing.
+#[test]
+fn headless_save_says_on_stderr_what_the_type_drops() {
+    let dir = std::env::temp_dir().join(format!("yppxy-cli-save-note-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut project = projcore::editor::untitled_project();
+    project.tasks.push(projcore::model::Task {
+        uid: 1,
+        id: 1,
+        name: "On the Timeline".into(),
+        outline_level: 1,
+        duration_min: 480,
+        display_on_timeline: Some(true),
+        ..projcore::model::Task::default()
+    });
+    let input = dir.join("plan.yppx");
+    std::fs::write(&input, projcore::yppx::write_yppx(&project).unwrap()).unwrap();
+
+    let target = dir.join("plan.xml");
+    let result = yppxy_save(Some(&input), &target);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert_eq!(
+        stderr.trim_end(),
+        format!(
+            "yppxy: {}: Display on Timeline is not saved in .xml files; \
+             save as .yppx to keep it",
+            target.display()
+        )
+    );
+    assert!(result.stdout.is_empty());
+    assert!(target.exists());
+
+    let copy = dir.join("copy.yppx");
+    let result = yppxy_save(Some(&input), &copy);
+    assert!(result.status.success());
+    assert!(
+        result.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
