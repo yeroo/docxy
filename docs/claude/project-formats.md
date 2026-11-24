@@ -153,20 +153,32 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing Project file rea
 - `read_mspdi` keeps a prefixed or attributed leaf directly under
   `<Project>` (`<x:Ext>1</x:Ext>`, `<Author xsi:nil="true"/>`,
   `<Other xmlns="urn:other">2</Other>`) in `Project::raw_options` as
-  (qualified name, raw XML), through `read_raw_leaf`. That covers modeled
-  options too: `read_option` stores the raw leaf and leaves the field alone.
-  Every prefixed declaration in scope that the leaf does not make itself is
-  added to its start tag (all of them, since a QName can hide in a value),
-  with `'` quotes when the value holds `"`. So `write_mspdi` writes the leaf
-  back as it was read, and a second round trip changes nothing.
-- A leaf is dropped, as before #429, when it is a block, when a prefix of
-  its name or of an attribute's is bound nowhere (`xml:` always is), or when
-  its slice is not one complete well-formed element. A fresh
-  `XmlParser::new(raw)` checks the slice, because the reader's
-  `is_malformed` is sticky and its end tags never check their names
-  (`<x:Ext>1</Project>` would swallow the root's end). An attributed or
-  prefixed `OutlineCodes`/`WBSMasks` wrapper is dropped even when empty
-  (#428 is parked).
+  (qualified name, XML), through `read_raw_leaf`. That covers modeled
+  options too: `read_option` stores the leaf and leaves the field alone.
+- The leaf is rebuilt from its parsed parts, not copied: its name, its own
+  attributes in source order, then every prefixed declaration in scope that
+  it does not make itself (all of them, since a QName can hide in a value).
+  Values are normalised and decoded as a conformant reader would, then
+  written `"`-quoted by `esc_attr_into` (tab, LF and CR as references).
+  Text is decoded as `append_text` does and written with `esc_into`. Both
+  drop the characters #1120 forbids. The permissive parser takes a bare
+  `&`, a `<` in a value or unspaced attributes as they are, so a verbatim
+  copy could save ill-formed XML. The rebuild is an
+  equivalent element, and a second round trip changes nothing.
+- A leaf is dropped, as before #429, when:
+  - it is a block;
+  - a name is not a QName (`is_qname`), or two attributes share a
+    qualified or an expanded name;
+  - a prefix of its name or of an attribute's is bound nowhere (`xml:`
+    always is), or it declares one as empty;
+  - its source is not one complete element. A fresh `XmlParser::new(raw)`
+    checks the slice, because the reader's `is_malformed` is sticky and its
+    end tags never check their names (`<x:Ext>1</Project>` would swallow the
+    root's end).
+
+  An attributed or prefixed `OutlineCodes`/`WBSMasks` wrapper is dropped
+  even when empty (#428 is parked). The tests' `strictly_well_formed`
+  checks a save for what `XmlParser` lets through.
 - The writer puts a raw leaf of a `PROJECT_HEADER` name in that slot when
   `header_text` gives nothing, and the others after the plain unknown
   options. A plain value of the name (an option, or a modeled field) wins

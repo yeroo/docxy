@@ -1665,12 +1665,15 @@ pub struct Project {
     pub options: Vec<(String, String)>,
     /// Project-level MSPDI leaves that are prefixed or carry attributes
     /// (`<x:Ext>`, `<Author xsi:nil="true"/>`), which an option's name and
-    /// text cannot hold, as (qualified element name, raw XML of the whole
-    /// leaf) in read order (#429). The raw XML carries every namespace
-    /// declaration of the source root it lacked, so a save writes it back as
-    /// it was read; a leaf that is malformed, or uses a prefix bound nowhere,
-    /// is not kept. A plain value of the same name, an option or a modeled
-    /// field, wins over it even when it was read earlier, and
+    /// text cannot hold, as (qualified element name, the leaf's XML) in read
+    /// order (#429). The XML is rebuilt from the parsed leaf with the save's
+    /// escaping, which drops the characters XML 1.0 forbids (#1120), and
+    /// carries every prefixed namespace declaration in scope that the leaf
+    /// lacked, so a save writes an equivalent element. An unprefixed leaf
+    /// takes the saved root's default namespace, as a plain option does. A
+    /// leaf that is malformed, has a duplicate attribute or uses a prefix
+    /// bound nowhere is not kept. A plain value of the same name (an option
+    /// or a modeled field) wins over it even when it was read earlier, and
     /// [`Project::set_option`] replaces it. Blocks are never kept here.
     pub raw_options: Vec<(String, String)>,
     /// Outline code definitions (each an MSPDI `<OutlineCode>` from the
