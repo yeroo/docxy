@@ -66,7 +66,9 @@ issue number to find its notes.
   pdfcraft-render dependency and the patch table a rev bump moves, the
   `--pdf-worker` child and its protocol, timeouts and watchdog, the tab's
   routing, session row and read-only rules, the harness's `pdf-read`, the
-  corpus and its reference tolerance.
+  corpus and its reference tolerance; links, comment pop-ups and AcroForm
+  filling, the display copy, Save as an incremental update, replay in a
+  new child, the signed-PDF question and quit (#2255).
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),
   images (#1880), links (#1879), centring (#1922), rounded images (#1926),
   nested cards (#1927), page margins (#1928), Outlook mail: CSS-only spacing,

@@ -17,8 +17,13 @@ Notes for the suite's PDF view: opening a PDF as it looks, read-only.
   compare the two tables, and keep lopdf's (its fuzz fixes are what the
   worker's hostile inputs need). Those crates get `opt-level = 2` in dev
   builds: unoptimized, a page draws 25-40x slower and the corpus tests crawl.
-- Not used yet: `-forms`, `-annot`, `-crypt` (forms, annotations, encrypted
-  files: later slices), `-content`, `-print`, `-export`.
+- Slice 2 (#2255) adds `-cos` (the working document, `write_incremental`),
+  `-annot` (appearances for comments without one), `-forms` (fields,
+  `set_value`, field appearances, password values) and `-model` (a page's
+  `/Annots`, for Hidden flags), same rev; they bring `-content`, nothing to
+  patch. `stream_limited` is `pub(crate)` in craft-pdf, so `incremental` in
+  `info` reads the public `reconstructed`, `encryption_changed` and
+  `full_save_required` only. Not used yet: `-crypt`, `-print`, `-export`.
 
 ## PDF view: the worker child (#2245)
 
@@ -46,6 +51,65 @@ Notes for the suite's PDF view: opening a PDF as it looks, read-only.
   test binary as the child (`worker::tests::child_entry`, misbehaving by
   `DOCXY_PDF_WORKER_TEST_MODE`).
 
+## PDF view: links, comments and forms (#2255)
+
+- The child draws from a **display copy** (`worker/doc.rs`), as PdfCraft's
+  own app does (`pdfcraft-engine`'s `display_bytes`): the working document
+  (`pdfcraft_cos::Document`, opened lazily) plus
+  `with_missing_appearances_cached` and `with_field_appearances_cached`,
+  written with `write_incremental`; the bytes as they are when neither adds
+  anything. A fill marks it stale and it is built again before the next
+  `pixels`/`text`, so ten fills build it once. hayro already draws `/AP`
+  appearances, and a Highlight without one by itself; every other kind
+  without `/AP` is blank but for PdfCraft's appearance.
+- Protocol 2: `info` adds `links` (view space, quads too: `LinkGo::Uri`,
+  `Page` with an optional point, `/XYZ` zoom and `/FitH`, `Other` for a
+  script, launch, layers, another file), `notes` (comments with text, not
+  replies, free text or Hidden/NoView ones; `shown_rect`) and `form`
+  (`FieldMeta`s with widgets in view space, `signed`, `incremental`). Every
+  geometry is turned into view space in the child (`PageInfo::user_to_view`,
+  `dest_fraction`). `set-field` / `set-fields` (`set_value` / `set_values`)
+  answer the fields and the pages whose fields changed; `save` hands the
+  bytes over after the line (`bytes`), password values cleared on a copy
+  (ISO 32000-2 Table 231; `restore_password_values` after `saved`), and the
+  child rebases only on `saved`. A form op runs in `catch_unwind`; a panic
+  answers `fatal` and the child ends (its working copy may be half changed).
+- The parent's `Worker` writes the file (`Op::SaveTo`, on the engine
+  thread, `opccore::fsio::write_atomic`), then sends `saved`, follows Save
+  As and clears its edit list. It keeps the fills since the last save and
+  gives a new child them as one `set-fields` before anything else; a replay
+  that fails in any way, or a file whose length or time changed (`Stamp`),
+  drops them for good (`take_lost`, `Done::lost`: the view reads `fields`
+  again, every page with a field is drawn again, `VALUES_LOST`). A save in
+  place onto a changed file refuses (`CHANGED`); Save As still works.
+- The view (`pdf_view/form.rs`): hit order widget, comment, link, text;
+  a press on a link follows it on release unless the pointer moved past
+  `DRAG_SLOP` (then the text drag selects). Only `http`, `https`, `mailto`
+  open (`cx.open_url`). Form ops (`form_ops`) go before any page. Each page
+  has a revision: a raster or text older than it is kept and asked again;
+  a page's text read again replaces its Find hits and drops a selection on
+  it. `form_rev` / `saved_rev` say unsaved; the host mirrors them into
+  `DocTab.dirty` each frame (`pdf_tabs_tick`, which also finishes a save of
+  a tab behind another). Tab order is the widgets' `tab`, a radio group one
+  stop, read-only and hidden ones skipped. The focused text field is drawn
+  as an editor over the raster (bullets for a password; MaxLen kept);
+  Up/Down between a multi-line field's lines is not done.
+- Save (`pdf_save_step`): commits the typed text; nothing filled since the
+  last read or save writes nothing (`PDF_NO_CHANGES`) but Save As writes the
+  copy; a signed PDF asks `PDF_SIGNED_SAVE` first (`SIGNED_LOST_QUESTION`
+  when the file would be written anew). `after` runs when the worker's
+  answer comes, written or not (#2194). Save As: the native dialog, PDF
+  only; refused in a harness (`PDF_SAVE_AS_HARNESS`), whose `save-as` verb
+  queues it. The close prompt is `PDF_SAVE_ON_CLOSE` (plain, in place). Hot
+  exit cannot keep the values: with "ask before closing" off, a window close
+  or Quit with a dirty PDF tab stays and opens that tab's close prompt
+  (`pdf_refusal`, as #2260's extension tabs).
+- Harness: `pdf-read` adds `links`, `notes`, `popup`, `tooltip`, `fields`,
+  `values` (by name), `focus`, `focus_open`, `unsaved`, `saving`, `signed`;
+  regions `pdf-field:<name>[:<widget>]`, `pdf-link:<page>:<n>`,
+  `pdf-annot:<page>:<n>`, `pdf-option:<n>`; input `pdf-form-field`.
+  `uiharness/cases/pdf-forms.uit` drives them.
+
 ## PDF view: the tab (#2245)
 
 - `Kind::Pdf` / `Surface::Pdf(PdfView)`. A File-only ribbon, as a Help tab.
@@ -54,8 +118,7 @@ Notes for the suite's PDF view: opening a PDF as it looks, read-only.
   in `load_doc_file`: a restored `Converted::Pdf` tab, Protected View's
   rollback and Recover Text keep converting. A file named `.pdf` that does
   not sniff as one (or cannot be read) opens as a document would.
-- Read-only: Save and Save As refuse with `PDF_NO_SAVE` / `PDF_NO_SAVE_AS`;
-  no key edits. Protected View is ignored (nothing to hold back);
+- Only form values are written (#2255, above); no other key edits. Protected View is ignored (nothing to hold back);
   `converted_pdf_tab` (Convert to editable document) opens today's
   converted tab after the view, protected when the file's zone says so. A
   second open of the PDF focuses its PDF tab (open, failed or pending), not
@@ -113,4 +176,12 @@ Notes for the suite's PDF view: opening a PDF as it looks, read-only.
 - `worker::tests::no_corpus_file_or_mutation_crashes_or_hangs_the_parent`
   runs every corpus file and 21 seeded mutations of each (truncated, bytes
   flipped, a span zeroed) through a real child: `info`, then three pages'
-  pixels and text, each an answer or a failure with a reason, in time.
+  pixels and text, each an answer or a failure with a reason, in time; a
+  file with a form also gets a `set-field` and a `save` (#2255).
+- Slice 2's files (#2255) are written object by object by the generator's
+  `RawPdf` (deterministic): `links`, `annots` (every kind with `/AP`; its
+  reference is in the reference test), `annots-noap` (the same without, on a
+  blank page), `forms`, `signed` (a placeholder signature). Run
+  `python3 scripts/make-pdf-view-corpus.py links annots annots-noap forms
+  signed` to write only them; the slice 1 files are not written byte for
+  byte again by cairo and gs.
