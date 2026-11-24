@@ -585,9 +585,9 @@ impl WmChars {
         }
     }
 
-    /// A withheld key stops holding before its character came: a plain key
-    /// is replayed now, as it was before #1277, and owes its text; an AltGr
-    /// key still types its character if it comes.
+    /// A withheld key stops holding: a plain key is replayed now and owes the
+    /// rest of its text (at its first character, at the time limit, or at a
+    /// flush); an AltGr key still types its character if it comes.
     fn unhold(e: &mut Entry, host: &mut impl KeyHost) {
         e.holds = false;
         if e.state == State::Withheld(Withheld::Plain) {
@@ -683,8 +683,9 @@ impl WmChars {
     }
 
     fn char(&mut self, c: char, now: Instant, host: &mut impl KeyHost) {
-        // The candidates: the leading entries owed that may not come, and
-        // the first sure one; the sure one first.
+        // The candidates: the leading entries owed that are not sure to be
+        // paid (`may_not_come`, or late), and the first sure one; the sure
+        // one first.
         let mut sure = None;
         let mut unsure = None;
         for (i, e) in self.entries.iter().enumerate() {
