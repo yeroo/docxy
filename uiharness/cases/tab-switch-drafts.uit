@@ -1,9 +1,11 @@
-# A comment draft belongs to the document it was started on (#1286): a tab
-# switch cancels it, so typed keys reach the new tab's document and Enter
-# never comments on that tab's selection. A fresh instance starts with the
-# one sample.docx tab; the case swaps it for basic.docx and a new document.
+# A comment draft belongs to the document it was started on (#1286, #1329):
+# a tab switch hides it, so typed keys reach the new tab's document and Enter
+# never comments on that tab's selection, and switching back shows it again
+# with its text and caret, as Word keeps a comment being written with its
+# document. A fresh instance starts with the one sample.docx tab; the case
+# swaps it for basic.docx and a new document.
 
-test a tab switch cancels a comment draft
+test a tab switch keeps a comment draft with its tab
   call close-tab {}
   assert tabs is 0
   open copy:../fixtures/basic.docx
@@ -18,8 +20,12 @@ test a tab switch cancels a comment draft
   key shift+home
   call ribbon-click {"tab":"Review","command":"newcomment"}
   type Draft
+  key left
+  key left
   key ctrl+f6
   assert tab is 1
+  call field-read {"input":"comment-editor"}
+  assert reply.focused is false
   key end
   type !
   assert text is world!
@@ -28,21 +34,58 @@ test a tab switch cancels a comment draft
   assert reply.comments is []
   key ctrl+f6
   assert tab is 0
+  call field-read {"input":"comment-editor"}
+  assert reply.focused is true
+  assert reply.value is exactly "Draft"
+  assert reply.caret is 3
+  key enter
+  call comments {}
+  assert reply.comments.0.text is Draft
+  key ctrl+f6
+  assert tab is 1
   call comments {}
   assert reply.comments is []
 
 test a click on the tab in front or closing another tab keeps a comment draft
   assert tabs is 2
-  assert tab is 0
+  assert tab is 1
+  key ctrl+n
+  assert tabs is 3
+  assert tab is 2
   type more
   key shift+home
   call ribbon-click {"tab":"Review","command":"newcomment"}
   type Kept
-  call pointer-click {"region":"tab-chip:0"}
-  assert tab is 0
+  call pointer-click {"region":"tab-chip:2"}
+  assert tab is 2
   call close-tab {"index":1,"answer":"discard"}
-  assert tabs is 1
-  assert tab is 0
+  assert tabs is 2
+  assert tab is 1
   key enter
   call comments {}
   assert reply.comments.0.text is Kept
+
+test escape drops a restored comment draft
+  assert tabs is 2
+  assert tab is 1
+  key ctrl+n
+  assert tabs is 3
+  assert tab is 2
+  type gone
+  key shift+home
+  call ribbon-click {"tab":"Review","command":"newcomment"}
+  type Lost
+  key ctrl+a
+  key ctrl+f6
+  assert tab is 0
+  key ctrl+shift+f6
+  assert tab is 2
+  call field-read {"input":"comment-editor"}
+  assert reply.value is exactly "Lost"
+  assert reply.selection is [0,4]
+  key escape
+  call field-read {"input":"comment-editor"}
+  assert reply.focused is false
+  key enter
+  call comments {}
+  assert reply.comments is []

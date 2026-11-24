@@ -88,13 +88,24 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   (`inputs.rs`; `Reach::Missing` is gone); `backstage-inputs-typing.uit`
   types into them. Backstage swallows Ctrl+Z, so its undo steps close File.
 
-## Document comment editor (#1362)
+## Document comment editor (#1362, #1329)
 
 - The comment bar (`comment_key` / `comment_bar`) edits at a caret through
-  `field_edit` like the Find bar: `comment_caret/sel/len` with `comment_state`
-  and `comment_edit`, Ctrl+A/C/X/V in `comment_chord` (paste is one line),
+  `field_edit` like the Find bar: `CommentDraft`'s `caret/sel/len` with its
+  `state` and `edit`, Ctrl+A/C/X/V in `comment_chord` (paste is one line),
   and `field-read comment-editor` reports the caret and the `[0,len]`
   selection. Click-to-place and Shift+arrows are not there.
+- The draft is the document's, not the window's (#1329):
+  `DocTab::comment_draft`, `Some` while the bar is open. `comment_open()` and
+  `comment_draft()` read the active tab's (a non-document tab has none). A
+  tab switch hides the bar with its tab and shows it again, text and caret,
+  when the tab is back in front, as Word keeps a comment being written with
+  its document; Enter then comments on that tab's own selection. Nothing on
+  activation stashes or restores it, and close, tear-off and move carry or
+  drop it with the tab. `drop_grid_state` cancels only a ruler drag
+  (`ruler_drag_tab`, #1286). Escape, Enter and focusing a Home Font box
+  (`font_box_open_doc`) drop the draft. A close does not ask about it and
+  the session does not keep it. Case: `uiharness/cases/tab-switch-drafts.uit`.
 
 ## Suite inline pictures (#1432)
 

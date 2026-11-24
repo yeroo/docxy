@@ -5555,6 +5555,41 @@ struct DocTab {
     /// Whether this document was imported from a Word 97-2003 file, and
     /// whether it is still in Compatibility Mode (#634).
     import: doc_import::DocImport,
+    /// The new comment being typed in the comment entry bar (Review >
+    /// New Comment), or `None` when the bar is shut. It is this document's,
+    /// not the window's (#1329): a tab switch hides the bar with its tab
+    /// and brings it back, text and caret, when the tab returns to the
+    /// front, as Word keeps a comment being written with its document.
+    /// Never saved, not in the session either.
+    comment_draft: Option<CommentDraft>,
+}
+
+/// A new comment being typed in the comment entry bar (#1329), with its
+/// caret, whole-field selection and the text length they were kept for
+/// (see [`field_edit::current`]).
+#[derive(Default)]
+struct CommentDraft {
+    text: String,
+    caret: usize,
+    sel: bool,
+    len: usize,
+}
+
+impl CommentDraft {
+    /// The caret and whole-field selection: kept while the text is as the
+    /// bar left it, else the end and none.
+    fn state(&self) -> (usize, bool) {
+        field_edit::current(&self.text, self.caret, self.sel, self.len)
+    }
+
+    /// One caret edit of the text.
+    fn edit(&mut self, op: field_edit::Op) {
+        let (mut caret, mut sel) = self.state();
+        field_edit::apply(&mut self.text, &mut caret, &mut sel, op);
+        self.caret = caret;
+        self.sel = sel;
+        self.len = self.text.chars().count();
+    }
 }
 
 impl DocTab {
@@ -5973,8 +6008,6 @@ struct Docxy {
     dialog_lists: std::cell::RefCell<dialog_host::ListScrolls>,
     /// The top dialog's scrolling grids (#1609), kept like the lists.
     dialog_grids: std::cell::RefCell<dialog_host::GridScrolls>,
-    // New-comment entry bar (Review ▸ New comment); routes keys while open.
-    comment_open: bool,
     /// The comment the Review tab's Resolve acts on: the one last clicked in
     /// the Comments pane, with the tab it is in (ids are per document). The tab
     /// is named by its title and file ([`close::TabId`]), not its index, so
@@ -5983,16 +6016,11 @@ struct Docxy {
     /// Display for Review (#625): how tracked changes are shown. A view only,
     /// not saved; No Markup and Original refuse edits.
     markup: docxcore::markup::MarkupView,
-    comment_text: String,
-    /// The comment bar's caret, whole-field selection and the text length they
-    /// were kept for (see [`field_edit::current`]).
-    comment_caret: usize,
-    comment_sel: bool,
-    comment_len: usize,
-    /// The document the comment entry bar or a ruler drag was started on
-    /// (#1286), named as `selected_comment` names it: a change of active
-    /// tab to any other document cancels both (`drop_grid_state`).
-    doc_entry_tab: Option<close::TabId>,
+    /// The document a ruler drag was started on (#1286), named as
+    /// `selected_comment` names it: a change of active tab to any other
+    /// document cancels the drag (`drop_grid_state`). The comment entry
+    /// bar's draft is the tab's own ([`DocTab::comment_draft`], #1329).
+    ruler_drag_tab: Option<close::TabId>,
     // Show formatting marks (¶, tab arrows) — View ▸ Show/Hide.
     show_marks: bool,
     // Comments review side panel (View / Review ▸ Comments).
@@ -12645,6 +12673,7 @@ fn blank_docx_tab(title: &str) -> DocTab {
         mail: Default::default(),
         field_codes: false,
         import: Default::default(),
+        comment_draft: None,
     }
 }
 
@@ -12728,6 +12757,7 @@ impl Loaded {
             converted_docx: self.converted_docx,
             pending_conversion: false,
             import: self.import,
+            comment_draft: None,
         };
         seed_used_comment_ids(&mut tab);
         tab
@@ -13253,6 +13283,7 @@ fn sheet_tab_from_path(path: &PathBuf, repair: bool, fresh_volatile: bool) -> Do
         mail: Default::default(),
         field_codes: false,
         import: Default::default(),
+        comment_draft: None,
     }
 }
 
@@ -18106,6 +18137,7 @@ fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 mail: Default::default(),
                 field_codes: false,
                 import: Default::default(),
+                comment_draft: None,
             }
         }
         // A document with no sidecar reloads its file, bundle included; the
@@ -18152,6 +18184,7 @@ fn restore_tab_content(t: &PersistTab, trusted: &trusted::TrustStore) -> (DocTab
                 mail: mailings_tab::MailState::from_pkg(pkg.as_ref()),
                 field_codes: false,
                 import: Default::default(),
+                comment_draft: None,
                 pkg,
                 notes,
                 markdown,
@@ -18895,14 +18928,9 @@ impl Docxy {
             menu_scroll: ScrollHandle::new(),
             dialog_lists: Default::default(),
             dialog_grids: Default::default(),
-            comment_open: false,
             selected_comment: None,
             markup: Default::default(),
-            comment_text: String::new(),
-            comment_caret: 0,
-            comment_sel: false,
-            comment_len: 0,
-            doc_entry_tab: None,
+            ruler_drag_tab: None,
             show_marks: false,
             show_comments: false,
             show_nav: false,
@@ -19989,6 +20017,7 @@ impl Docxy {
             mail: Default::default(),
             field_codes: false,
             import: Default::default(),
+            comment_draft: None,
         };
         self.tabs.push(match kind {
             Kind::Project => new_project_tab(&windows::next_project_title(cx)),
@@ -20690,19 +20719,17 @@ impl Docxy {
         // A drag by the selection's border, or a drop waiting on its menu or
         // question, belongs to the grid it started on (#707 r2 M4).
         self.drops.clear();
-        // The comment entry bar and a ruler drag belong to the document
-        // they started on. Carried into another tab, Enter would comment
-        // on its selection and the drag would apply the old document's
-        // geometry to its paragraph (#1286). A click on the tab already
-        // in front, or the close of a background tab, keeps them.
-        if self.doc_entry_tab.is_some() && self.doc_entry_tab != self.active_tab_id() {
-            self.comment_open = false;
-            self.comment_text.clear();
-            self.comment_reset();
+        // A ruler drag belongs to the document it started on. Carried into
+        // another tab, it would apply the old document's geometry to its
+        // paragraph (#1286). A click on the tab already in front, or the
+        // close of a background tab, keeps it. The comment entry bar needs
+        // nothing here: its draft is on its tab, so it hides and comes back
+        // with it (#1329).
+        if self.ruler_drag_tab.is_some() && self.ruler_drag_tab != self.active_tab_id() {
             self.ruler_drag = None;
             self.ruler_indent_base = RulerIndentBase::default();
             self.ruler_guide = None;
-            self.doc_entry_tab = None;
+            self.ruler_drag_tab = None;
         }
     }
 
@@ -23311,7 +23338,7 @@ impl Docxy {
         let doc = self.active_is_doc();
         let sheet = self.active_is_sheet();
         (self.find_open && (doc || sheet))
-            || (self.comment_open && doc)
+            || (self.comment_open() && doc)
             || (doc && self.font_box_live())
             || self.project_edit_open()
             || (sheet
@@ -25337,7 +25364,7 @@ impl Docxy {
         let text = self.font_box_value(which);
         let caret = text.chars().count();
         self.find_open = false;
-        self.comment_open = false;
+        self.set_comment_draft(None);
         self.picker = None;
         self.font_box = Some(FontBoxEdit {
             which,
@@ -29882,11 +29909,8 @@ impl Docxy {
             }
             return self.refocus(window, cx);
         }
-        self.comment_open = true;
+        self.set_comment_draft(Some(CommentDraft::default()));
         self.font_box = None;
-        self.doc_entry_tab = self.active_tab_id();
-        self.comment_text.clear();
-        self.comment_reset();
         self.picker = None;
         self.find_open = false;
         self.refocus(window, cx);
@@ -29894,8 +29918,10 @@ impl Docxy {
 
     /// Commit the pending comment: wrap the selection in markers, store the text.
     fn commit_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.comment_text.trim().to_string();
-        self.comment_open = false;
+        let text = self
+            .set_comment_draft(None)
+            .map(|d| d.text.trim().to_string())
+            .unwrap_or_default();
         if text.is_empty() {
             return self.refocus(window, cx);
         }
@@ -29912,31 +29938,41 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
-    /// The comment bar's caret and whole-field selection: kept while its text
-    /// is as the bar left it, else the end and none.
-    fn comment_state(&self) -> (usize, bool) {
-        field_edit::current(
-            &self.comment_text,
-            self.comment_caret,
-            self.comment_sel,
-            self.comment_len,
-        )
+    /// The active document's comment draft: `Some` while its comment entry
+    /// bar is open (#1329). A tab that is not a document has none.
+    fn comment_draft(&self) -> Option<&CommentDraft> {
+        self.tabs
+            .get(self.active)
+            .filter(|t| matches!(t.surface, Surface::Doc(_)))
+            .and_then(|t| t.comment_draft.as_ref())
     }
 
-    /// Empty the comment bar's caret state (the text was just cleared).
-    fn comment_reset(&mut self) {
-        self.comment_caret = 0;
-        self.comment_sel = false;
-        self.comment_len = 0;
+    /// [`Self::comment_draft`], to edit.
+    fn comment_draft_mut(&mut self) -> Option<&mut CommentDraft> {
+        self.tabs
+            .get_mut(self.active)
+            .filter(|t| matches!(t.surface, Surface::Doc(_)))
+            .and_then(|t| t.comment_draft.as_mut())
+    }
+
+    /// Whether the active document's comment entry bar is open: it then
+    /// takes the keys.
+    fn comment_open(&self) -> bool {
+        self.comment_draft().is_some()
+    }
+
+    /// Open (`Some`) or shut (`None`) the active tab's comment entry bar,
+    /// returning the draft it held.
+    fn set_comment_draft(&mut self, draft: Option<CommentDraft>) -> Option<CommentDraft> {
+        let t = self.tabs.get_mut(self.active)?;
+        std::mem::replace(&mut t.comment_draft, draft)
     }
 
     /// One caret edit of the comment bar's text.
     fn comment_edit(&mut self, op: field_edit::Op) {
-        let (mut caret, mut sel) = self.comment_state();
-        field_edit::apply(&mut self.comment_text, &mut caret, &mut sel, op);
-        self.comment_caret = caret;
-        self.comment_sel = sel;
-        self.comment_len = self.comment_text.chars().count();
+        if let Some(d) = self.comment_draft_mut() {
+            d.edit(op);
+        }
     }
 
     /// A Ctrl chord in the comment bar: A selects the field, C and X copy it,
@@ -29946,8 +29982,11 @@ impl Docxy {
         match key {
             "a" => self.comment_edit(Op::SelectAll),
             "c" | "x" => {
-                let text = self.comment_text.clone();
-                if self.comment_state().1 && !text.is_empty() {
+                let Some(d) = self.comment_draft() else {
+                    return;
+                };
+                let text = d.text.clone();
+                if d.state().1 && !text.is_empty() {
                     self.clipboard_write(text.clone(), cx);
                     self.office_clip.push(&text);
                     if key == "x" {
@@ -29985,9 +30024,7 @@ impl Docxy {
         }
         let op = match key {
             "escape" => {
-                self.comment_open = false;
-                self.comment_text.clear();
-                self.comment_reset();
+                self.set_comment_draft(None);
                 return self.refocus(window, cx);
             }
             "enter" => return self.commit_comment(window, cx),
@@ -30074,7 +30111,7 @@ impl Docxy {
             page_right: g.page_right,
             sect_checkpointed: false,
         });
-        self.doc_entry_tab = self.active_tab_id();
+        self.ruler_drag_tab = self.active_tab_id();
         self.ruler_guide = Some(x); // guide starts under the pointer
         cx.notify();
     }
@@ -30536,7 +30573,8 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// The comment entry bar, shown under the ribbon while `comment_open`.
+    /// The comment entry bar, shown under the ribbon while the active
+    /// document has a comment draft ([`Self::comment_draft`]).
     fn comment_bar(&self, pal: Pal, _cx: &mut Context<Self>) -> AnyElement {
         h_flex()
             .w_full()
@@ -30568,9 +30606,11 @@ impl Docxy {
                     .border_color(hsla_u(BRAND))
                     .bg(pal.panel)
                     .child({
-                        let (caret, sel) = self.comment_state();
-                        let at = char_to_byte(&self.comment_text, caret);
-                        let (head, tail) = self.comment_text.split_at(at);
+                        let empty = CommentDraft::default();
+                        let d = self.comment_draft().unwrap_or(&empty);
+                        let (caret, sel) = d.state();
+                        let at = char_to_byte(&d.text, caret);
+                        let (head, tail) = d.text.split_at(at);
                         h_flex()
                             .text_size(px(13.))
                             .text_color(pal.fg)
@@ -31722,7 +31762,7 @@ impl Docxy {
             cx.notify();
             return;
         }
-        if self.keytips != KeyTip::Off || self.comment_open || self.sheet_field_live() {
+        if self.keytips != KeyTip::Off || self.comment_open() || self.sheet_field_live() {
             return;
         }
         self.mini_bar = None;
@@ -31857,7 +31897,7 @@ impl Docxy {
         }
         if self.keytips != KeyTip::Off
             || self.find_open
-            || self.comment_open
+            || self.comment_open()
             || self.sheet_field_live()
         {
             return;
@@ -31938,7 +31978,7 @@ impl Docxy {
             && self.keytips == KeyTip::Off
             && !self.find_open
             && !self.sheet_field_live()
-            && !self.comment_open
+            && !self.comment_open()
             && !matches!(
                 hl_key,
                 "shift" | "control" | "alt" | "platform" | "function"
@@ -32050,7 +32090,7 @@ impl Docxy {
         if self.active_is_doc()
             && self.find_open
             && !self.active_is_ext()
-            && !self.comment_open
+            && !self.comment_open()
             && !self.font_box_live()
             && field_edit::alt_replace(
                 &key,
@@ -32074,7 +32114,7 @@ impl Docxy {
             self.keytips = KeyTip::Off;
             // The highlighting-mode check above skipped this key because the
             // KeyTips were up; the find and comment bars still take their keys.
-            if !self.find_open && !self.comment_open {
+            if !self.find_open && !self.comment_open() {
                 self.cancel_pointer_modes();
             }
         }
@@ -32185,7 +32225,7 @@ impl Docxy {
         if ctrl && key == "f" && !ext {
             return self.toggle_find(window, cx);
         }
-        if self.comment_open {
+        if self.comment_open() {
             return self.comment_key(ev, ctrl, m.alt, key.as_str(), window, cx);
         }
         // Ctrl+S from a Find bar field saves, the bar staying open, as the
@@ -34183,6 +34223,7 @@ mod sheet_save_tests {
             mail: Default::default(),
             field_codes: false,
             import: Default::default(),
+            comment_draft: None,
         }
     }
 
@@ -48229,7 +48270,7 @@ impl Render for Docxy {
             .sheet_rowh_edit
             .clone()
             .map(|buf| self.sheet_rowh_bar(&buf, pal, cx));
-        let comment_bar = (is_doc && self.comment_open).then(|| self.comment_bar(pal, cx));
+        let comment_bar = (is_doc && self.comment_open()).then(|| self.comment_bar(pal, cx));
         let ruler = (is_doc && self.show_ruler).then(|| self.ruler(cx));
 
         // Text measurer for tab-stop positioning (shared across the
