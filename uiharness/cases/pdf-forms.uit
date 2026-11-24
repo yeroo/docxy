@@ -127,7 +127,10 @@ test issue 2255 a signed PDF asks before its values are saved
   call pdf-read {"until_idle":true}
   assert reply.unsaved is false
   call close-tab {}
-  assert tabs is 0
+  # The PDF tab is gone (the case's own document tab stays).
+  call pdf-read {}
+  assert reply.open is false
+  assert reply.pdf_tab is false
 
 test issue 2255 closing a PDF tab with unsaved values asks, and its Save writes them
   open copy:"../fixtures/pdf-view-forms.pdf" as forms.pdf
@@ -140,7 +143,10 @@ test issue 2255 closing a PDF tab with unsaved values asks, and its Save writes 
   assert dialog is pdf-save-on-close
   call dialog-click {"button":"Save"}
   call pdf-read {"until_idle":true}
-  assert tabs is 0
+  # The PDF tab is gone (the case's own document tab stays).
+  call pdf-read {}
+  assert reply.open is false
+  assert reply.pdf_tab is false
   open copy:"../fixtures/pdf-view-links.pdf" as links.pdf
   call open {"path":"forms.pdf"}
   call pdf-read {"until_drawn":[1]}

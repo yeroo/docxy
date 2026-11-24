@@ -1965,7 +1965,7 @@ fn pdf_point(app: &crate::Docxy, part: &str) -> Result<Point<Pixels>, String> {
 /// `until_drawn` (page numbers) asks again until those pages are drawn or
 /// failed, `until_text` until their text is read or failed, `until_idle`
 /// until the worker has nothing out and nothing waits (a Copy, Find's
-/// pages), for up to `within_ms` (default and at most the pump's
+/// pages, a form operation or a save, #2255), for up to `within_ms` (default and at most the pump's
 /// `RETRY_MAX`, 5 s); a timeout is no error, the reply says where it got.
 fn pdf_read(app: &crate::Docxy, args: &Json) -> Result<Done, String> {
     let Some(v) = app.active_pdf() else {
@@ -2007,6 +2007,7 @@ fn pdf_read(app: &crate::Docxy, args: &Json) -> Result<Done, String> {
         && (!idle
             || (!v.busy()
                 && !v.copy_waits()
+                && v.pending_save.is_none()
                 && (v.find.field.text.is_empty() && !v.want_all_text || v.unread_pages() == 0)));
     let mut done = Done::ok(v.read_json())?;
     done.retry = (!settled).then(|| std::time::Duration::from_millis(within as u64));

@@ -353,6 +353,22 @@ impl PdfView {
         }
     }
 
+    /// Whether the tab has values the file does not: accepted, waiting for
+    /// the worker, or typed into the focused field and not yet committed.
+    pub(crate) fn has_unsaved(&self) -> bool {
+        self.unsaved() || self.fills_waiting() || self.typed_uncommitted()
+    }
+
+    /// Text typed into the focused field that differs from its value.
+    fn typed_uncommitted(&self) -> bool {
+        self.focus.as_ref().is_some_and(|x| {
+            x.edit
+                .as_ref()
+                .zip(self.field(x.field))
+                .is_some_and(|(e, f)| e.text != shown_text(f))
+        })
+    }
+
     /// Whether a form operation is waiting (a value set, not yet answered).
     pub(crate) fn fills_waiting(&self) -> bool {
         self.form_ops

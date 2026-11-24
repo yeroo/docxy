@@ -167,7 +167,7 @@ pub(crate) fn finish_pdf_save(tab: &mut DocTab, outcome: Result<std::path::PathB
                 tab.title = file_name(&path).into();
                 tab.path = Some(path.clone());
             }
-            tab.dirty = matches!(&tab.surface, Surface::Pdf(v) if v.unsaved() || v.fills_waiting());
+            tab.dirty = matches!(&tab.surface, Surface::Pdf(v) if v.has_unsaved());
             tab.status = format!("saved {}", path.display()).into();
         }
         Err(why) => tab.status = format!("save error: {why}").into(),
@@ -177,7 +177,20 @@ pub(crate) fn finish_pdf_save(tab: &mut DocTab, outcome: Result<std::path::PathB
 /// The first PDF tab with filled-in values not saved: hot exit cannot keep
 /// them (#2255).
 pub(crate) fn unsaved_pdf(tabs: &[DocTab]) -> Option<usize> {
-    tabs.iter().position(|t| t.kind == Kind::Pdf && t.dirty)
+    tabs.iter().position(|t| {
+        t.kind == Kind::Pdf && (t.dirty || matches!(&t.surface, Surface::Pdf(v) if v.has_unsaved()))
+    })
+}
+
+/// A PDF tab before a close or the window's close asks about it (#2255):
+/// the text being typed into a field goes in, and the tab is unsaved
+/// exactly when it has values the file does not, without waiting for the
+/// next frame.
+pub(crate) fn commit_pdf_tab(tab: &mut DocTab) {
+    if let Surface::Pdf(v) = &mut tab.surface {
+        v.commit_focus();
+        tab.dirty = v.has_unsaved();
+    }
 }
 
 /// Where a PDF view was, as the session keeps it.
@@ -334,10 +347,10 @@ impl Docxy {
         {
             finish_pending_conversion(t);
         }
-        self.pdf_tabs_tick(window, cx);
+        self.pdf_pump_behind();
         let scale_factor = window.scale_factor();
         let Some(v) = self.active_pdf_mut() else {
-            return;
+            return self.pdf_settle_tabs(window, cx);
         };
         let b = v.scroll.bounds();
         let (w, h) = (f32::from(b.size.width), f32::from(b.size.height));
@@ -369,6 +382,9 @@ impl Docxy {
         if let Some(url) = url {
             cx.open_url(&url);
         }
+        // After the active view took its answers in: a save it finished is
+        // over in this frame.
+        self.pdf_settle_tabs(window, cx);
         let due = self.pdf_due();
         if due && !self.pdf_polling {
             self.pdf_polling = true;
@@ -411,20 +427,28 @@ impl Docxy {
             })
     }
 
+    /// Every PDF tab behind another, each frame (#2255): it takes its
+    /// answers in and goes on with its form operations (a save).
+    fn pdf_pump_behind(&mut self) {
+        for (i, t) in self.tabs.iter_mut().enumerate() {
+            if let Surface::Pdf(v) = &mut t.surface
+                && i != self.active
+            {
+                v.pump_form();
+            }
+        }
+    }
+
     /// Every PDF tab, each frame (#2255): its unsaved mark follows its
-    /// values; one behind another tab takes its answers in and finishes a
-    /// save; a save that is over updates the tab and runs its `after`,
+    /// values; a save that is over updates the tab and runs its `after`,
     /// last; values a new reader could not take say so.
-    fn pdf_tabs_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn pdf_settle_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut over: Vec<(usize, PendingSave)> = Vec::new();
         for (i, t) in self.tabs.iter_mut().enumerate() {
             let Surface::Pdf(v) = &mut t.surface else {
                 continue;
             };
-            if i != self.active {
-                v.pump_form();
-            }
-            t.dirty = v.unsaved() || v.fills_waiting();
+            t.dirty = v.has_unsaved();
             if std::mem::take(&mut v.values_lost) {
                 t.status = super::worker::VALUES_LOST.into();
             }

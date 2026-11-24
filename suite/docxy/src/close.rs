@@ -108,6 +108,7 @@ fn commit_pending_for_close(tab: &mut DocTab) -> Result<(), String> {
     // Project buffer does: closing would drop what was typed.
     commit_changed_cell(tab)?;
     exit_hf_tab(tab);
+    crate::pdf_view::host::commit_pdf_tab(tab);
     Ok(())
 }
 
@@ -124,6 +125,7 @@ pub(crate) fn commit_pending_for_exit(tabs: &mut [DocTab]) {
         let _ = commit_project_cell(tab);
         let _ = commit_changed_cell(tab);
         flush_hf_tab(tab);
+        crate::pdf_view::host::commit_pdf_tab(tab);
     }
 }
 
