@@ -680,6 +680,15 @@ pub struct Message {
     /// [`parse_message_size`]. `None` when absent or unreadable; a stored
     /// size is never cleared by a merge (`Store::merge_message`).
     pub size: Option<i64>,
+    /// The message's last verb (#2301): replied to, replied all to or
+    /// forwarded, from `PidTagLastVerbExecuted` ([`LAST_VERB_PROP`], which
+    /// the delta's `$expand` brings): see [`parse_last_verb`]. `None` when
+    /// absent, unknown (another verb) or unreadable.
+    pub last_verb: Option<LastVerb>,
+    /// When [`Message::last_verb`] was done, as Unix seconds (UTC), from
+    /// `PidTagLastVerbExecutionTime` ([`LAST_VERB_TIME_PROP`]); `None`
+    /// without a verb, or when absent or unreadable.
+    pub last_verb_time: Option<i64>,
 }
 
 impl Message {
@@ -690,6 +699,7 @@ impl Message {
         let (_, meeting_reminder_on) = parse_meeting_reminder(v);
         let (_, in_reply_to) = parse_in_reply_to(v);
         let size = parse_message_size(v);
+        let (_, last_verb, last_verb_time) = parse_last_verb(v);
         Some(Message {
             id: str_field(v, "id"),
             conversation_id: str_field(v, "conversationId"),
@@ -728,6 +738,8 @@ impl Message {
             internet_message_id: str_field(v, "internetMessageId"),
             in_reply_to,
             size,
+            last_verb,
+            last_verb_time,
         })
     }
 }
@@ -818,6 +830,126 @@ pub fn parse_message_size(v: &Value) -> Option<i64> {
 /// non-negative integer (string or number), else `None`.
 pub fn parse_folder_size(v: &Value) -> Option<i64> {
     size_prop(v, is_folder_size_prop)
+}
+
+/// `PidTagLastVerbExecuted` (property tag `0x1081`, PT_LONG) as a Graph
+/// extended property id (#2301): the last thing the user did to a message,
+/// which Outlook shows as the reply or forward arrow on its row (MS-OXOMSG
+/// 2.2.1.31). Only [`LastVerb`]'s three values are read.
+pub const LAST_VERB_PROP: &str = "Integer 0x1081";
+
+/// `PidTagLastVerbExecutionTime` (property tag `0x1082`, PT_SYSTIME) as a
+/// Graph extended property id (#2301): when [`LAST_VERB_PROP`] was set,
+/// what Outlook's "You replied to this message on …" shows.
+pub const LAST_VERB_TIME_PROP: &str = "SystemTime 0x1082";
+
+/// Whether `id` names [`LAST_VERB_PROP`] (#2301): `Integer ` (any case) and
+/// a hex tag equal to `0x1081`.
+pub fn is_last_verb_prop(id: &str) -> bool {
+    is_tag_prop(id, "Integer", 0x1081)
+}
+
+/// Whether `id` names [`LAST_VERB_TIME_PROP`] (#2301): `SystemTime ` (any
+/// case) and a hex tag equal to `0x1082`.
+pub fn is_last_verb_time_prop(id: &str) -> bool {
+    is_tag_prop(id, "SystemTime", 0x1082)
+}
+
+/// A message's last verb (#2301, `PidTagLastVerbExecuted`): what a list
+/// draws as Outlook's reply, reply-all or forward arrow. Any other verb
+/// (a meeting response, a vote) is not one of these and reads as none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LastVerb {
+    /// `NOTEIVERB_REPLYTOSENDER`, 102.
+    Reply,
+    /// `NOTEIVERB_REPLYTOALL`, 103.
+    ReplyAll,
+    /// `NOTEIVERB_FORWARD`, 104.
+    Forward,
+}
+
+impl LastVerb {
+    /// MAPI's value: 102 reply, 103 reply all, 104 forward; anything else
+    /// is `None`, never an error.
+    pub fn from_mapi(n: i64) -> Option<LastVerb> {
+        match n {
+            102 => Some(LastVerb::Reply),
+            103 => Some(LastVerb::ReplyAll),
+            104 => Some(LastVerb::Forward),
+            _ => None,
+        }
+    }
+
+    /// MAPI's value, as [`LastVerb::from_mapi`] reads it back: what the
+    /// store keeps in `messages.last_verb` and the PATCH sends.
+    pub fn as_mapi(self) -> i64 {
+        match self {
+            LastVerb::Reply => 102,
+            LastVerb::ReplyAll => 103,
+            LastVerb::Forward => 104,
+        }
+    }
+
+    /// The verb an answer of `kind` leaves on its original (#2301).
+    pub fn of_kind(kind: DraftKind) -> LastVerb {
+        match kind {
+            DraftKind::Reply => LastVerb::Reply,
+            DraftKind::ReplyAll => LastVerb::ReplyAll,
+            DraftKind::Forward => LastVerb::Forward,
+        }
+    }
+}
+
+/// A message's last verb and its time (#2301), and whether the item
+/// carried them: `(carried, verb, time)`, one pass over its
+/// `singleValueExtendedProperties`. Lenient, never an error.
+///
+/// Carried means the array holds a [`MESSAGE_CLASS_PROP`] entry: the rule
+/// [`parse_message_protection`] uses, for the same reason. Most mail was
+/// never answered, so the verb's absence alone cannot tell "none" from "not
+/// asked"; the class rides the same `$expand`. An item without it is
+/// `(false, None, None)`, and a stored verb is kept
+/// (`MessageFields::writes_last_verb`).
+///
+/// The verb ([`LAST_VERB_PROP`]) is a JSON integer or a string holding one
+/// (Graph sends extended values as strings), read by [`LastVerb::from_mapi`];
+/// anything else is `None`. The time ([`LAST_VERB_TIME_PROP`]) is read only
+/// with a known verb, by [`reminder_time`]'s rules into Unix seconds (UTC),
+/// so an offset time or junk is `None`.
+pub fn parse_last_verb(v: &Value) -> (bool, Option<LastVerb>, Option<i64>) {
+    let mut carried = false;
+    let mut verb = None;
+    let mut time = None;
+    let props = v
+        .get("singleValueExtendedProperties")
+        .and_then(Value::as_array)
+        .unwrap_or(&[]);
+    for p in props {
+        let Some(id) = p.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let value = p.get("value");
+        if is_message_class_prop(id) {
+            carried = true;
+        } else if is_last_verb_prop(id) {
+            let n = match value {
+                Some(Value::Num(n)) if n.fract() == 0.0 => Some(*n as i64),
+                Some(Value::Str(s)) => s.trim().parse::<i64>().ok(),
+                _ => None,
+            };
+            verb = n.and_then(LastVerb::from_mapi);
+        } else if is_last_verb_time_prop(id) {
+            time = value
+                .and_then(Value::as_str)
+                .map(reminder_time)
+                .and_then(|t| crate::store::iso8601_to_unix_secs(&t));
+        }
+    }
+    match (carried, verb) {
+        (false, _) => (false, None, None),
+        (true, None) => (true, None, None),
+        (true, Some(verb)) => (true, Some(verb), time),
+    }
 }
 
 /// `PidTagMessageClass` (property tag `0x001A`, PT_UNICODE) as a Graph
@@ -1640,6 +1772,10 @@ pub struct MessageFields {
     /// The In-Reply-To (#2096): a string `PidTagInReplyToId` entry
     /// (`parse_in_reply_to`'s carried flag).
     pub in_reply_to: bool,
+    /// The last verb and its time (#2301): the item carried its
+    /// `PidTagMessageClass` entry (`parse_last_verb`'s carried flag, the
+    /// same rule as `protection`).
+    pub last_verb: bool,
 }
 
 impl MessageFields {
@@ -1669,6 +1805,7 @@ impl MessageFields {
             meeting_reminder: parse_meeting_reminder(v).0,
             internet_message_id: v.get("internetMessageId").and_then(Value::as_str).is_some(),
             in_reply_to: parse_in_reply_to(v).0,
+            last_verb: parse_last_verb(v).0,
         }
     }
 
@@ -1698,6 +1835,7 @@ impl MessageFields {
             meeting_reminder: true,
             internet_message_id: true,
             in_reply_to: true,
+            last_verb: true,
         }
     }
 
@@ -1776,6 +1914,16 @@ impl MessageFields {
     /// id, the store never clears a stored value.
     pub fn writes_in_reply_to(&self) -> bool {
         self.in_reply_to
+    }
+
+    /// Whether `last_verb` and `last_verb_time` are to be written (#2301):
+    /// only when the item carried its message class, as for the
+    /// protection. An item without it says nothing, and the stored pair is
+    /// kept; a carried item without a known verb clears it (another client
+    /// did something else to the message since, which Outlook would show
+    /// without an arrow).
+    pub fn writes_last_verb(&self) -> bool {
+        self.last_verb
     }
 }
 
@@ -6381,5 +6529,166 @@ mod tests {
         assert!(!MessageFields::of(&partial).writes_is_draft());
         let partial = parse(r#"{"isRead":true,"isDraft":true}"#).unwrap();
         assert!(MessageFields::of(&partial).writes_is_draft());
+    }
+
+    /// An item carrying its class, and `extra` extended properties after it.
+    fn with_last_verb(extra: &str) -> Value {
+        parse(&format!(
+            r#"{{"id":"M1","subject":"s","from":{{"emailAddress":{{"address":"a@x"}}}},
+                "receivedDateTime":"2026-11-10T00:00:00Z","singleValueExtendedProperties":[
+                {{"id":"{MESSAGE_CLASS_PROP}","value":"IPM.Note"}}{extra}]}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn last_verb_reads_reply_reply_all_and_forward() {
+        // 2026-11-20T09:30:00Z.
+        const AT: i64 = 1_795_167_000;
+        for (value, want) in [
+            (r#""102""#, LastVerb::Reply),
+            (r#""103""#, LastVerb::ReplyAll),
+            (r#""104""#, LastVerb::Forward),
+            // A JSON number, and a padded string.
+            ("103", LastVerb::ReplyAll),
+            (r#"" 104 ""#, LastVerb::Forward),
+        ] {
+            let v = with_last_verb(&format!(
+                ",{},{}",
+                prop(LAST_VERB_PROP, value),
+                prop(LAST_VERB_TIME_PROP, r#""2026-11-20T09:30:00Z""#)
+            ));
+            assert_eq!(parse_last_verb(&v), (true, Some(want), Some(AT)), "{value}");
+            let m = Message::from_json(&v).unwrap();
+            assert_eq!((m.last_verb, m.last_verb_time), (Some(want), Some(AT)));
+            assert_eq!(LastVerb::from_mapi(want.as_mapi()), Some(want));
+        }
+        // Graph's fractional seconds and the lower-case short ids it may
+        // echo back.
+        let v = with_last_verb(&format!(
+            ",{},{}",
+            prop("integer 0x1081", r#""102""#),
+            prop("systemtime 0x1082", r#""2026-11-20T09:30:00.0000000Z""#)
+        ));
+        assert_eq!(parse_last_verb(&v), (true, Some(LastVerb::Reply), Some(AT)));
+    }
+
+    #[test]
+    fn last_verb_ignores_an_unknown_value() {
+        // 261 (a meeting response's verb), 0, a negative and a fraction.
+        for value in [r#""261""#, "0", r#""-102""#, "102.5"] {
+            let v = with_last_verb(&format!(
+                ",{},{}",
+                prop(LAST_VERB_PROP, value),
+                prop(LAST_VERB_TIME_PROP, r#""2026-11-20T09:30:00Z""#)
+            ));
+            assert_eq!(parse_last_verb(&v), (true, None, None), "{value}");
+            let m = Message::from_json(&v).unwrap();
+            assert_eq!((m.last_verb, m.last_verb_time), (None, None), "{value}");
+        }
+    }
+
+    #[test]
+    fn last_verb_is_none_when_absent_or_not_an_integer() {
+        // No verb at all: carried, none (the class proves the expand ran).
+        assert_eq!(parse_last_verb(&with_last_verb("")), (true, None, None));
+        // A time alone says nothing.
+        let v = with_last_verb(&format!(
+            ",{}",
+            prop(LAST_VERB_TIME_PROP, r#""2026-11-20T09:30:00Z""#)
+        ));
+        assert_eq!(parse_last_verb(&v), (true, None, None));
+        for value in [r#""abc""#, "true", "{}", "null", r#""""#] {
+            let v = with_last_verb(&format!(",{}", prop(LAST_VERB_PROP, value)));
+            assert_eq!(parse_last_verb(&v), (true, None, None), "{value}");
+        }
+        // A good verb with a bad time keeps the verb; the time is `None`:
+        // junk, an offset `to_utc` would drop unapplied, a non-string, no
+        // time at all.
+        for time in [
+            r#""soon""#,
+            r#""2026-11-20T09:30:00+02:00""#,
+            "1795685400",
+            r#""2026-13-40T09:30:00Z""#,
+        ] {
+            let v = with_last_verb(&format!(
+                ",{},{}",
+                prop(LAST_VERB_PROP, r#""102""#),
+                prop(LAST_VERB_TIME_PROP, time)
+            ));
+            assert_eq!(
+                parse_last_verb(&v),
+                (true, Some(LastVerb::Reply), None),
+                "{time}"
+            );
+        }
+        let v = with_last_verb(&format!(",{}", prop(LAST_VERB_PROP, r#""104""#)));
+        assert_eq!(parse_last_verb(&v), (true, Some(LastVerb::Forward), None));
+        // An entry without an id, or an array of non-objects, is skipped.
+        let v = with_last_verb(r#",{"value":"102"},"x",7"#);
+        assert_eq!(parse_last_verb(&v), (true, None, None));
+    }
+
+    #[test]
+    fn last_verb_is_carried_only_with_the_class() {
+        let verb = prop(LAST_VERB_PROP, r#""102""#);
+        let time = prop(LAST_VERB_TIME_PROP, r#""2026-11-20T09:30:00Z""#);
+        assert!(MessageFields::of(&with_last_verb("")).writes_last_verb());
+        // The verb without the class (a refused or silently dropped expand
+        // could not bring it, so this is a partial or odd item), no array,
+        // a partial item, a non-array: not carried, and nothing is read.
+        for json in [
+            format!(
+                r#"{{"id":"M1","subject":"s","receivedDateTime":"2026-11-10T00:00:00Z",
+                    "singleValueExtendedProperties":[{verb},{time}]}}"#
+            ),
+            r#"{"id":"M1","subject":"s","receivedDateTime":"2026-11-10T00:00:00Z"}"#.to_string(),
+            r#"{"id":"M1","isRead":true}"#.to_string(),
+            r#"{"id":"M1","singleValueExtendedProperties":"x"}"#.to_string(),
+        ] {
+            let v = parse(&json).unwrap();
+            assert_eq!(parse_last_verb(&v), (false, None, None), "{json}");
+            assert!(!MessageFields::of(&v).writes_last_verb(), "{json}");
+            let m = Message::from_json(&v).unwrap();
+            assert_eq!((m.last_verb, m.last_verb_time), (None, None), "{json}");
+        }
+        // A merge of a `Message` built in code writes it.
+        assert!(MessageFields::all().writes_last_verb());
+    }
+
+    #[test]
+    fn last_verb_prop_ids_match_their_forms() {
+        for id in [
+            LAST_VERB_PROP,
+            "integer 0x1081",
+            "Integer 0X1081",
+            "INTEGER 0x01081",
+        ] {
+            assert!(is_last_verb_prop(id), "{id}");
+        }
+        for id in [
+            "Long 0x1081",
+            "Integer 0x1082",
+            "Integer 0x",
+            "Integer1081",
+            "SystemTime 0x1081",
+        ] {
+            assert!(!is_last_verb_prop(id), "{id}");
+        }
+        for id in [LAST_VERB_TIME_PROP, "systemtime 0x1082"] {
+            assert!(is_last_verb_time_prop(id), "{id}");
+        }
+        for id in ["SystemTime 0x1081", "Integer 0x1082", "String 0x1082"] {
+            assert!(!is_last_verb_time_prop(id), "{id}");
+        }
+        assert_eq!(LAST_VERB_PROP, "Integer 0x1081");
+        assert_eq!(LAST_VERB_TIME_PROP, "SystemTime 0x1082");
+    }
+
+    #[test]
+    fn last_verb_of_each_draft_kind() {
+        assert_eq!(LastVerb::of_kind(DraftKind::Reply).as_mapi(), 102);
+        assert_eq!(LastVerb::of_kind(DraftKind::ReplyAll).as_mapi(), 103);
+        assert_eq!(LastVerb::of_kind(DraftKind::Forward).as_mapi(), 104);
     }
 }

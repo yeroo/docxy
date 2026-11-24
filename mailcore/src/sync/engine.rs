@@ -63,9 +63,9 @@ pub use crate::graph::model::BodyFormat;
 pub use crate::graph::model::DraftKind;
 use crate::graph::model::{
     AutomaticReplies, ContactPhoto, DeltaItem, DirectoryGroup, DirectoryUser, Event,
-    EventDeltaItem, FolderContact, GroupMember, MailFolder, Me, MeetingMessage, MeetingMessageType,
-    Message, MessageFields, PersonDetails, Presence, Recipient, ScheduleEntry, SearchHit,
-    parse_folder_size, parse_meeting_message_type,
+    EventDeltaItem, FolderContact, GroupMember, LastVerb, MailFolder, Me, MeetingMessage,
+    MeetingMessageType, Message, MessageFields, PersonDetails, Presence, Recipient, ScheduleEntry,
+    SearchHit, parse_folder_size, parse_meeting_message_type,
 };
 pub use crate::store::ClearOfflineRefusal;
 use crate::store::{
@@ -2065,6 +2065,21 @@ fn refused_write_status(e: &GraphError) -> Option<u16> {
         GraphError::Unauthorized => Some(401),
         GraphError::Throttled { .. } => Some(429),
         GraphError::Parse(_) | GraphError::Transport(_) => None,
+    }
+}
+
+/// The message a message property op names, as it was queued, and the
+/// action its refusal reports: a message reminder op (#2054) or a last
+/// verb (#2301). Each wrote the store first, and is dropped at its first
+/// refusal with a re-read of the message (a 404 silently); `None` for every
+/// other op. Not the reminder dedupe's: that is
+/// [`message_reminder_op_id`].
+fn message_property_op_id(op: &OutboxOp) -> Option<(&str, &'static str)> {
+    match op {
+        OutboxOp::DismissMessageReminder { id } => Some((id, "dismiss message reminder")),
+        OutboxOp::SnoozeMessageReminder { id, .. } => Some((id, "snooze message reminder")),
+        OutboxOp::SetLastVerb { id, .. } => Some((id, "set last verb")),
+        _ => None,
     }
 }
 
@@ -6466,6 +6481,18 @@ impl Engine {
                     if let OutboxOp::SendDraft { id } = &row.op {
                         self.emit(SyncEvent::Sent { id: id.clone() });
                         sent.push(id.clone());
+                        // The answered original's PATCH (#2301) goes out in
+                        // this drain, before `sync_after_send`, as #2005's
+                        // follow-up does.
+                        if self.record_sent_verb(id) {
+                            if let Ok(queued) = self.store.pending_ops() {
+                                let seen = newest;
+                                for later in queued.into_iter().filter(|r| r.seq > seen) {
+                                    newest = later.seq;
+                                    ops.push_back(later);
+                                }
+                            }
+                        }
                     }
                 }
                 Err(GraphError::Unauthorized) => {
@@ -6527,16 +6554,11 @@ impl Engine {
                     // A message reminder op (#2054) is dropped the same
                     // way, but it wrote the store first: after a refusal
                     // other than a 404 the message is read again, as no
-                    // delta re-reports a message Graph never changed.
-                    if let Some(id) = message_reminder_op_id(&row.op) {
+                    // delta re-reports a message Graph never changed. A
+                    // last verb (#2301) is too.
+                    if let Some((id, action)) = message_property_op_id(&row.op) {
                         self.drop_op(row.seq);
                         if !matches!(other, GraphError::NotFound) {
-                            let action = match row.op {
-                                OutboxOp::DismissMessageReminder { .. } => {
-                                    "dismiss message reminder"
-                                }
-                                _ => "snooze message reminder",
-                            };
                             self.emit(SyncEvent::Error(format!("{action} {id}: {other}")));
                             let id = id.to_string();
                             self.reread_message(&id);
@@ -9638,7 +9660,9 @@ impl Engine {
     /// uses — real folder if synced, sentinel otherwise), stores the body,
     /// and emits `DraftReady` so the UI can open the compose editor on it.
     /// `original` is the message id as the command carried it, unresolved,
-    /// and `kind` the answer asked for: the event names its request (#2085).
+    /// and `kind` the answer asked for: the event names its request (#2085),
+    /// and the draft's row keeps both (`Store::set_send_verb`, #2301) for
+    /// the verb its send leaves on the original (`record_sent_verb`).
     ///
     /// The stored row is a draft (`is_draft`) whatever the response says: a
     /// `createReply`/`createReplyAll`/`createForward` result is one by
@@ -9678,6 +9702,14 @@ impl Engine {
             self.emit(SyncEvent::Error(e.to_string()));
             return;
         }
+        // What the draft answers (#2301), for the verb its send leaves on
+        // the original. A failed write only loses that mark.
+        if let Err(e) = self.store.set_send_verb(&draft.id, original, kind) {
+            self.emit(SyncEvent::Error(format!(
+                "local answer link of draft {} failed: {e}",
+                draft.id
+            )));
+        }
         if let Err(e) = self.store.put_body(&draft.id, &body) {
             self.emit(SyncEvent::Error(e.to_string()));
             return;
@@ -9687,6 +9719,79 @@ impl Engine {
             original: original.to_string(),
             kind,
         });
+    }
+
+    /// Marks the message a sent answer draft answered (#2301), once the
+    /// drain counts the draft's `SendDraft` done (a retry whose delivery
+    /// check finds it delivered too): `draft_id` is the op's id, resolved
+    /// with `current_id` first (#2265: a move queued before the send
+    /// re-keyed the draft). A draft that answers nothing
+    /// (`Store::send_verb` `None`) does nothing. Else, in order: the
+    /// original's row (resolved with `current_id`, #1896) gets the verb and
+    /// now ([`Store::set_last_verb`]; a missing row changes nothing) and its
+    /// folder a [`SyncEvent::MessagesUpdated`], as the host did not make the
+    /// write; unless the original resolves to `local:`, a
+    /// [`OutboxOp::SetLastVerb`] is queued under the original as stored;
+    /// then the draft's link is cleared (the done arm runs once per op).
+    /// Every store error is a [`SyncEvent::Error`], never a failed send: the
+    /// send's own result and events are unchanged. Returns whether an op
+    /// was queued, so the drain sends it at once.
+    ///
+    /// A retry whose delivery check finds the draft's row gone (`apply_send`
+    /// answers `Ok` without one) has no link left, so nothing is marked.
+    fn record_sent_verb(&mut self, draft_id: &str) -> bool {
+        let draft = self
+            .store
+            .current_id(draft_id)
+            .unwrap_or_else(|_| draft_id.to_string());
+        let (original, kind) = match self.store.send_verb(&draft) {
+            Ok(Some(link)) => link,
+            Ok(None) => return false,
+            Err(e) => {
+                self.emit(SyncEvent::Error(format!(
+                    "answer link of sent draft {draft_id} unreadable: {e}"
+                )));
+                return false;
+            }
+        };
+        let verb = LastVerb::of_kind(kind);
+        let target = self
+            .store
+            .current_id(&original)
+            .unwrap_or_else(|_| original.clone());
+        let secs = now_unix() as i64;
+        match self.store.set_last_verb(&target, verb, secs) {
+            Ok(()) => {
+                if let Ok(Some(row)) = self.store.message_row(&target) {
+                    self.emit(SyncEvent::MessagesUpdated {
+                        folder_id: row.folder_id,
+                    });
+                }
+            }
+            Err(e) => self.emit(SyncEvent::Error(format!(
+                "local last verb of {target} failed: {e}"
+            ))),
+        }
+        let mut queued = false;
+        if !target.starts_with("local:") {
+            let op = OutboxOp::SetLastVerb {
+                id: original,
+                verb,
+                at: crate::store::unix_secs_to_iso8601(secs),
+            };
+            match self.store.enqueue_op(&op) {
+                Ok(_) => queued = true,
+                Err(e) => self.emit(SyncEvent::Error(format!(
+                    "queueing the last verb of {target} failed: {e}"
+                ))),
+            }
+        }
+        if let Err(e) = self.store.clear_send_verb(&draft) {
+            self.emit(SyncEvent::Error(format!(
+                "clearing the answer link of draft {draft} failed: {e}"
+            )));
+        }
+        queued
     }
 
     // --- Calendar ----------------------------------------------------------
@@ -11950,6 +12055,8 @@ mod tests {
                             in_reply_to: String::new(),
                             size: None,
                             is_event_message: false,
+                            last_verb: None,
+                            last_verb_time: None,
                         },
                         &crate::graph::model::MessageFields::default(),
                     )
@@ -31989,6 +32096,8 @@ mod tests {
                 in_reply_to: String::new(),
                 size: None,
                 is_event_message: false,
+                last_verb: None,
+                last_verb_time: None,
             },
         )
         .unwrap();
@@ -33170,6 +33279,688 @@ mod tests {
             );
             let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
             let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    mod last_verbs {
+        //! A message's last verb (#2301): the delta brings it, and an
+        //! answer mailcore sends marks its original at once, locally and
+        //! with one PATCH in the same drain.
+        use super::*;
+        use crate::graph::model::LastVerb;
+
+        const ORIGINALS: [&str; 3] = ["M1", "M2", "M3"];
+
+        fn verb_of(store: &Store, id: &str) -> Option<(Option<LastVerb>, Option<i64>)> {
+            store
+                .message_row(id)
+                .unwrap()
+                .map(|r| (r.last_verb, r.last_verb_time))
+        }
+
+        /// `message_json(id)` carrying its class and `props` (JSON entries)
+        /// in its extended properties.
+        fn carried(id: &str, props: &str) -> String {
+            let plain = message_json(id, false, false, &[]);
+            format!(
+                r#"{},"singleValueExtendedProperties":[{{"id":"String 0x1a","value":"IPM.Note"}}{props}]}}"#,
+                plain.strip_suffix('}').unwrap()
+            )
+        }
+
+        fn verb_props(verb: &str) -> String {
+            format!(
+                r#",{{"id":"Integer 0x1081","value":"{verb}"}},{{"id":"SystemTime 0x1082","value":"2026-11-20T09:30:00Z"}}"#
+            )
+        }
+
+        /// 2026-11-20T09:30:00Z.
+        const AT: i64 = 1_795_167_000;
+
+        /// F1 (the Inbox) holding the `ORIGINALS`, none answered.
+        fn seed_originals(s: &Store) {
+            s.upsert_folder(&crate::graph::model::MailFolder {
+                id: "F1".into(),
+                display_name: "Inbox".into(),
+                parent_id: None,
+                total_count: 3,
+                unread_count: 3,
+                well_known_name: Some("inbox".into()),
+            })
+            .unwrap();
+            for id in ORIGINALS {
+                let v = crate::json::parse(&carried(id, "")).unwrap();
+                s.upsert_message("F1", &Message::from_json(&v).unwrap())
+                    .unwrap();
+            }
+        }
+
+        const MAILBOX: &[(&str, &str, Option<&str>)] = &[
+            ("F1", "Inbox", Some("inbox")),
+            ("DRAFTS1", "Drafts", Some("drafts")),
+            ("SENT1", "Sent Items", Some("sentitems")),
+        ];
+
+        /// A `createReply*`/`createForward` answer on `original`: the draft
+        /// `draft`.
+        fn answer_route(original: &str, action: &str, draft: &str) -> (Route, Option<usize>) {
+            (
+                Route {
+                    method: "POST".into(),
+                    path_prefix: format!("/me/messages/{original}/{action}"),
+                    status: 200,
+                    headers: vec![],
+                    body: format!(
+                        r#"{{"id":"{draft}","conversationId":"C-{original}","subject":"Re: S {original}","from":{{"emailAddress":{{"name":"Me","address":"me@x"}}}},"toRecipients":[{{"emailAddress":{{"name":"Alice","address":"alice@x"}}}}],"ccRecipients":[],"receivedDateTime":"2026-11-10T00:00:00Z","sentDateTime":"","isRead":true,"hasAttachments":false,"importance":"normal","bodyPreview":"","isDraft":true}}"#
+                    ),
+                },
+                None,
+            )
+        }
+
+        fn method_route(method: &str, path: &str, status: u16, body: &str) -> Route {
+            Route {
+                method: method.into(),
+                path_prefix: path.into(),
+                status,
+                headers: vec![],
+                body: body.into(),
+            }
+        }
+
+        /// What a sent draft `draft` needs: its body, its PATCH and its
+        /// `/send`.
+        fn draft_routes(draft: &str) -> Vec<(Route, Option<usize>)> {
+            vec![
+                (
+                    get_route(
+                        &body_get_path(draft),
+                        200,
+                        r#"{"body":{"contentType":"html","content":"<p>q</p>"}}"#,
+                    ),
+                    None,
+                ),
+                (
+                    method_route("POST", &format!("/me/messages/{draft}/send"), 202, ""),
+                    None,
+                ),
+                (
+                    method_route("PATCH", &format!("/me/messages/{draft}"), 200, "{}"),
+                    None,
+                ),
+            ]
+        }
+
+        /// The verb PATCH of each original, answered `status`.
+        fn verb_patches(status: u16) -> Vec<(Route, Option<usize>)> {
+            ORIGINALS
+                .iter()
+                .chain(["M1N"].iter())
+                .map(|o| {
+                    (
+                        method_route("PATCH", &format!("/me/messages/{o}"), status, "{}"),
+                        None,
+                    )
+                })
+                .collect()
+        }
+
+        fn ready(store: &Store) -> bool {
+            ["F1", "DRAFTS1", "SENT1"]
+                .iter()
+                .all(|f| store.get_delta_link(f).unwrap().is_some())
+        }
+
+        /// `(method, path, body)` of the requests from `from` on.
+        fn requests_from(srv: &FakeServer, from: usize) -> Vec<(String, String, String)> {
+            srv.requests()
+                .into_iter()
+                .skip(from)
+                .map(|r| (r.method, r.path, r.body))
+                .collect()
+        }
+
+        /// The verb PATCHes (to an original) among `reqs`, by path.
+        fn verb_patches_in(reqs: &[(String, String, String)]) -> Vec<(String, String)> {
+            reqs.iter()
+                .filter(|(m, _, b)| m == "PATCH" && b.contains("0x1081"))
+                .map(|(_, p, b)| (p.clone(), b.clone()))
+                .collect()
+        }
+
+        fn want_body(verb: i64, secs: i64) -> String {
+            format!(
+                r#"{{"singleValueExtendedProperties":[{{"id":"Integer 0x1081","value":"{verb}"}},{{"id":"SystemTime 0x1082","value":"{}"}}]}}"#,
+                crate::store::unix_secs_to_iso8601(secs)
+            )
+        }
+
+        fn now_secs() -> i64 {
+            now_unix() as i64
+        }
+
+        /// Composes `cmd` and waits for its draft `draft`.
+        fn compose(handle: &SyncHandle, cmd: SyncCommand, draft: &str) {
+            handle.cmd_tx.send(cmd).unwrap();
+            wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::DraftReady { id, .. } if id == draft),
+            );
+        }
+
+        /// Sends `draft` and waits for the engine to settle after its send;
+        /// returns the events seen.
+        fn send(handle: &SyncHandle, draft: &str) -> Vec<SyncEvent> {
+            handle
+                .cmd_tx
+                .send(SyncCommand::SendDraft { id: draft.into() })
+                .unwrap();
+            let mut seen = wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::Sent { id } if id == draft),
+            );
+            wait_idle(handle, &mut seen);
+            seen
+        }
+
+        #[test]
+        fn a_delta_that_changes_the_verb_updates_the_row() {
+            let delta = "/me/mailFolders/F1/messages/delta";
+            let link = format!("{delta}?token=D-F1");
+            let startup = [
+                // None → reply.
+                carried("M1", &verb_props("102")),
+                // Carried without a verb: a stored one is cleared.
+                carried("M2", ""),
+                // Not carried (no class): the stored one is kept.
+                message_json("M3", false, false, &[]),
+            ];
+            // Reply → forward; then a round without the class keeps it.
+            let next = [carried("M1", &verb_props("104"))];
+            let after = [message_json("M1", true, false, &[])];
+            let mut routes = vec![
+                calendar_route(),
+                (get_route(&link, 200, &delta_page(&next, &link)), Some(1)),
+                (get_route(&link, 200, &delta_page(&after, &link)), Some(1)),
+                (get_route(&link, 200, &delta_page(&[], &link)), None),
+                (get_route(delta, 200, &delta_page(&startup, &link)), None),
+            ];
+            routes.extend(startup_then(
+                "/me/mailFolders?",
+                &list(&[tree_folder("F1", "Inbox", None, (3, 0), 0)]),
+                &list(&[tree_folder("F1", "Inbox", None, (3, 0), 0)]),
+            ));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) = spawn_fast(&srv, "last-verb-delta", TICK, None, |s| {
+                seed_originals(s);
+                s.set_last_verb("M2", LastVerb::ReplyAll, AT).unwrap();
+                s.set_last_verb("M3", LastVerb::Forward, AT).unwrap();
+            });
+            let store = Store::open(&store_path).unwrap();
+            // The page's items are merged one by one: wait for both.
+            assert!(
+                wait_until(TICK_WAIT, || verb_of(&store, "M1")
+                    == Some((Some(LastVerb::Reply), Some(AT)))
+                    && verb_of(&store, "M2") == Some((None, None))),
+                "{:?} {:?}",
+                verb_of(&store, "M1"),
+                verb_of(&store, "M2")
+            );
+            assert_eq!(verb_of(&store, "M2"), Some((None, None)));
+            assert_eq!(
+                verb_of(&store, "M3"),
+                Some((Some(LastVerb::Forward), Some(AT)))
+            );
+            // The next round changes it, the one after (read, no class)
+            // keeps it.
+            assert!(
+                wait_until(TICK_WAIT, || store
+                    .message_row("M1")
+                    .unwrap()
+                    .is_some_and(|r| r.is_read)),
+                "{:?}",
+                store.message_row("M1")
+            );
+            assert_eq!(
+                verb_of(&store, "M1"),
+                Some((Some(LastVerb::Forward), Some(AT)))
+            );
+            // The delta asked for both properties.
+            let first = paths_from(&srv, 0)
+                .into_iter()
+                .find(|p| is_delta(p, "F1"))
+                .unwrap();
+            assert!(first.contains("Integer%200x1081"), "{first}");
+            assert!(first.contains("SystemTime%200x1082"), "{first}");
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_sent_answer_marks_its_original_and_patches_it_in_the_same_drain() {
+            let mut routes = vec![
+                answer_route("M1", "createReply", "R1"),
+                answer_route("M2", "createReplyAll", "RA1"),
+                answer_route("M3", "createForward", "FW1"),
+            ];
+            for d in ["R1", "RA1", "FW1"] {
+                routes.extend(draft_routes(d));
+            }
+            routes.extend(verb_patches(200));
+            routes.extend(folder_routes(MAILBOX, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) =
+                spawn_fast(&srv, "last-verb-send", HOUR, None, seed_originals);
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || ready(&store)));
+            for (cmd, original, draft, verb) in [
+                (
+                    SyncCommand::ComposeReply {
+                        id: "M1".into(),
+                        all: false,
+                    },
+                    "M1",
+                    "R1",
+                    LastVerb::Reply,
+                ),
+                (
+                    SyncCommand::ComposeReply {
+                        id: "M2".into(),
+                        all: true,
+                    },
+                    "M2",
+                    "RA1",
+                    LastVerb::ReplyAll,
+                ),
+                (
+                    SyncCommand::ComposeForward { id: "M3".into() },
+                    "M3",
+                    "FW1",
+                    LastVerb::Forward,
+                ),
+            ] {
+                compose(&handle, cmd, draft);
+                assert_eq!(verb_of(&store, original), Some((None, None)));
+                let from = srv.requests().len();
+                let before = now_secs();
+                let seen = send(&handle, draft);
+                let after = now_secs();
+                // The original reads the verb, with the send's time.
+                let (got, time) = verb_of(&store, original).unwrap();
+                assert_eq!(got, Some(verb), "{draft}");
+                let time = time.unwrap();
+                assert!((before..=after).contains(&time), "{time} {before} {after}");
+                // Its folder is told, after the send.
+                let sent = position(&seen, |e| e == &SyncEvent::Sent { id: draft.into() });
+                let told = position(&seen, |e| {
+                    e == &SyncEvent::MessagesUpdated {
+                        folder_id: "F1".into(),
+                    }
+                });
+                assert!(sent < told && told.is_some(), "{seen:?}");
+                // One PATCH, after the `/send` and before the syncs after
+                // a send (Drafts first), with no tick in between (an hour).
+                let reqs = requests_from(&srv, from);
+                assert_eq!(
+                    verb_patches_in(&reqs),
+                    [(
+                        format!("/me/messages/{original}"),
+                        want_body(verb.as_mapi(), time)
+                    )],
+                    "{reqs:?}"
+                );
+                let at = |pred: &dyn Fn(&(String, String, String)) -> bool| {
+                    reqs.iter().position(pred).unwrap()
+                };
+                let send_at =
+                    at(&|(m, p, _)| m == "POST" && p == &format!("/me/messages/{draft}/send"));
+                let patch_at =
+                    at(&|(m, p, _)| m == "PATCH" && p == &format!("/me/messages/{original}"));
+                let drafts_at = at(&|(_, p, _)| is_delta(p, "DRAFTS1"));
+                assert!(send_at < patch_at && patch_at < drafts_at, "{reqs:?}");
+                assert!(store.pending_ops().unwrap().is_empty());
+                assert_eq!(store.send_verb(draft).unwrap(), None);
+            }
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_local_answer_draft_marks_its_original_once_sent() {
+            let mut routes = vec![answer_route("M1", "createReply", "G1")];
+            routes.extend(draft_routes("G1"));
+            routes.extend(verb_patches(200));
+            routes.extend(folder_routes(MAILBOX, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let mut local = String::new();
+            let (handle, store_path, dir) = spawn_fast(&srv, "last-verb-local", HOUR, None, |s| {
+                seed_originals(s);
+                local = s
+                    .create_local_answer_draft(
+                        "M1",
+                        DraftKind::Reply,
+                        "Re: S M1",
+                        "alice@x",
+                        "",
+                        "<p>mine</p>",
+                    )
+                    .unwrap();
+            });
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || ready(&store)));
+            let from = srv.requests().len();
+            send(&handle, &local);
+            let (got, time) = verb_of(&store, "M1").unwrap();
+            assert_eq!(got, Some(LastVerb::Reply));
+            let reqs = requests_from(&srv, from);
+            assert_eq!(
+                verb_patches_in(&reqs),
+                [("/me/messages/M1".to_string(), want_body(102, time.unwrap()))],
+                "{reqs:?}"
+            );
+            assert!(store.pending_ops().unwrap().is_empty());
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn an_offline_patch_stays_queued_and_goes_out_on_reconnect() {
+            let mut routes = vec![
+                answer_route("M1", "createReply", "R1"),
+                // The PATCH loses its connection once.
+                (method_route("PATCH", "/me/messages/M1", 0, ""), Some(1)),
+            ];
+            routes.extend(draft_routes("R1"));
+            routes.extend(verb_patches(200));
+            routes.extend(folder_routes(MAILBOX, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) =
+                spawn_fast(&srv, "last-verb-offline", HOUR, None, seed_originals);
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || ready(&store)));
+            compose(
+                &handle,
+                SyncCommand::ComposeReply {
+                    id: "M1".into(),
+                    all: false,
+                },
+                "R1",
+            );
+            let from = srv.requests().len();
+            handle
+                .cmd_tx
+                .send(SyncCommand::SendDraft { id: "R1".into() })
+                .unwrap();
+            let mut seen = wait_for(
+                &handle.evt_rx,
+                |e| matches!(e, SyncEvent::Sent { id } if id == "R1"),
+            );
+            seen.extend(wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::State(SyncState::Offline))
+            }));
+            // Sent, marked locally, and the PATCH still queued.
+            assert!(
+                !seen
+                    .iter()
+                    .any(|e| matches!(e, SyncEvent::SendFailed { .. }))
+            );
+            let (got, time) = verb_of(&store, "M1").unwrap();
+            assert_eq!(got, Some(LastVerb::Reply));
+            let queued: Vec<OutboxOp> = store
+                .pending_ops()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.op)
+                .collect();
+            assert_eq!(
+                queued,
+                [OutboxOp::SetLastVerb {
+                    id: "M1".into(),
+                    verb: LastVerb::Reply,
+                    at: crate::store::unix_secs_to_iso8601(time.unwrap()),
+                }]
+            );
+            // The back-off's tick drains it.
+            assert!(
+                wait_until(ENGINE_WAIT, || store.pending_ops().unwrap().is_empty()),
+                "{:?}",
+                store.pending_ops()
+            );
+            let reqs = requests_from(&srv, from);
+            let patches = verb_patches_in(&reqs);
+            assert_eq!(patches.len(), 2, "{reqs:?}");
+            assert!(
+                patches
+                    .iter()
+                    .all(|(p, b)| p == "/me/messages/M1" && *b == want_body(102, time.unwrap()))
+            );
+            assert_eq!(verb_of(&store, "M1").unwrap().0, Some(LastVerb::Reply));
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A refused PATCH is dropped at once: a 400 with an `Error` and a
+        /// re-read of the original (its row then matches Graph), a 404
+        /// silently with the row as written. The send is `Sent` either way.
+        #[test]
+        fn a_refused_patch_is_dropped_and_the_send_stays_sent() {
+            for (status, tag) in [(400, "last-verb-400"), (404, "last-verb-404")] {
+                let mut routes = vec![
+                    answer_route("M1", "createReply", "R1"),
+                    (
+                        method_route(
+                            "PATCH",
+                            "/me/messages/M1",
+                            status,
+                            r#"{"error":{"code":"ErrorInvalidProperty","message":"nope"}}"#,
+                        ),
+                        None,
+                    ),
+                    // The re-read: Graph's M1, carried, with no verb.
+                    (get_route("/me/messages/M1?", 200, &carried("M1", "")), None),
+                ];
+                routes.extend(draft_routes("R1"));
+                routes.extend(folder_routes(MAILBOX, &[], &[]));
+                let srv = FakeServer::start_limited(routes);
+                let (handle, store_path, dir) = spawn_fast(&srv, tag, HOUR, None, seed_originals);
+                let store = Store::open(&store_path).unwrap();
+                assert!(wait_until(ENGINE_WAIT, || ready(&store)));
+                compose(
+                    &handle,
+                    SyncCommand::ComposeReply {
+                        id: "M1".into(),
+                        all: false,
+                    },
+                    "R1",
+                );
+                let from = srv.requests().len();
+                let seen = send(&handle, "R1");
+                assert!(
+                    !seen
+                        .iter()
+                        .any(|e| matches!(e, SyncEvent::SendFailed { .. }))
+                );
+                assert!(store.pending_ops().unwrap().is_empty(), "{status}");
+                let errors: Vec<&SyncEvent> = seen
+                    .iter()
+                    .filter(|e| matches!(e, SyncEvent::Error(m) if m.contains("last verb")))
+                    .collect();
+                let reread = requests_from(&srv, from)
+                    .iter()
+                    .any(|(m, p, _)| m == "GET" && p.starts_with("/me/messages/M1?"));
+                if status == 404 {
+                    assert!(errors.is_empty(), "{seen:?}");
+                    assert!(!reread);
+                    assert_eq!(verb_of(&store, "M1").unwrap().0, Some(LastVerb::Reply));
+                } else {
+                    assert!(
+                        matches!(errors.as_slice(), [SyncEvent::Error(m)] if m.starts_with("set last verb M1: ")),
+                        "{seen:?}"
+                    );
+                    assert!(reread);
+                    assert!(
+                        wait_until(ENGINE_WAIT, || verb_of(&store, "M1") == Some((None, None))),
+                        "{:?}",
+                        verb_of(&store, "M1")
+                    );
+                }
+                let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        #[test]
+        fn a_plain_new_message_s_send_queues_no_patch() {
+            let mut routes = vec![(
+                method_route(
+                    "POST",
+                    "/me/messages",
+                    201,
+                    r#"{"id":"P1","conversationId":"C","subject":"Hi","from":{"emailAddress":{"name":"","address":""}},"toRecipients":[],"ccRecipients":[],"receivedDateTime":"","sentDateTime":"","isRead":false,"hasAttachments":false,"importance":"normal","bodyPreview":"","isDraft":true}"#,
+                ),
+                None,
+            )];
+            // `/send` ahead of the create: both are POSTs under the prefix.
+            routes.insert(
+                0,
+                (method_route("POST", "/me/messages/P1/send", 202, ""), None),
+            );
+            routes.extend(verb_patches(200));
+            routes.extend(folder_routes(MAILBOX, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let mut local = String::new();
+            let (handle, store_path, dir) = spawn_fast(&srv, "last-verb-plain", HOUR, None, |s| {
+                seed_originals(s);
+                local = s
+                    .create_local_draft("Hi", "bob@x", "", "<p>hello</p>")
+                    .unwrap();
+            });
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || ready(&store)));
+            let from = srv.requests().len();
+            send(&handle, &local);
+            let reqs = requests_from(&srv, from);
+            assert!(
+                reqs.iter()
+                    .any(|(m, p, _)| m == "POST" && p == "/me/messages/P1/send"),
+                "{reqs:?}"
+            );
+            assert!(verb_patches_in(&reqs).is_empty(), "{reqs:?}");
+            assert!(store.pending_ops().unwrap().is_empty());
+            for id in ORIGINALS {
+                assert_eq!(verb_of(&store, id), Some((None, None)), "{id}");
+            }
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_moved_original_is_marked_and_patched_under_its_new_id() {
+            let mut routes = vec![answer_route("M1N", "createReply", "R1")];
+            routes.extend(draft_routes("R1"));
+            routes.extend(verb_patches(200));
+            routes.extend(folder_routes(MAILBOX, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) = spawn_fast(&srv, "last-verb-moved", HOUR, None, |s| {
+                seed_originals(s);
+                assert!(s.follow_move("M1", "M1N").unwrap());
+            });
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || ready(&store)));
+            compose(
+                &handle,
+                SyncCommand::ComposeReply {
+                    id: "M1".into(),
+                    all: false,
+                },
+                "R1",
+            );
+            let from = srv.requests().len();
+            send(&handle, "R1");
+            let (got, time) = verb_of(&store, "M1N").unwrap();
+            assert_eq!(got, Some(LastVerb::Reply));
+            let reqs = requests_from(&srv, from);
+            assert_eq!(
+                verb_patches_in(&reqs),
+                [(
+                    "/me/messages/M1N".to_string(),
+                    want_body(102, time.unwrap())
+                )],
+                "{reqs:?}"
+            );
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// #2265: a draft moved before its send (here re-keyed as a landed
+        /// `Move` re-keys it) is sent under its new id, and still marks its
+        /// original, though the send names the old one.
+        #[test]
+        fn a_draft_moved_before_its_send_still_marks_its_original() {
+            let mut routes = vec![answer_route("M1", "createReply", "R1")];
+            routes.extend(draft_routes("R1N"));
+            routes.extend(draft_routes("R1"));
+            routes.extend(verb_patches(200));
+            routes.extend(folder_routes(MAILBOX, &[], &[]));
+            let srv = FakeServer::start_limited(routes);
+            let (handle, store_path, dir) =
+                spawn_fast(&srv, "last-verb-moved-draft", HOUR, None, seed_originals);
+            let store = Store::open(&store_path).unwrap();
+            assert!(wait_until(ENGINE_WAIT, || ready(&store)));
+            compose(
+                &handle,
+                SyncCommand::ComposeReply {
+                    id: "M1".into(),
+                    all: false,
+                },
+                "R1",
+            );
+            assert!(store.follow_move("R1", "R1N").unwrap());
+            let from = srv.requests().len();
+            send(&handle, "R1");
+            let reqs = requests_from(&srv, from);
+            assert!(
+                reqs.iter()
+                    .any(|(m, p, _)| m == "POST" && p == "/me/messages/R1N/send"),
+                "{reqs:?}"
+            );
+            let (got, time) = verb_of(&store, "M1").unwrap();
+            assert_eq!(got, Some(LastVerb::Reply));
+            assert_eq!(
+                verb_patches_in(&reqs),
+                [("/me/messages/M1".to_string(), want_body(102, time.unwrap()))],
+                "{reqs:?}"
+            );
+            let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Critique 4: a `SetLastVerb` is a message property op for the
+        /// refusal arm, never a reminder op for `enqueue_reminder_op`'s
+        /// dedupe.
+        #[test]
+        fn set_last_verb_is_no_reminder_op() {
+            let op = OutboxOp::SetLastVerb {
+                id: "M1".into(),
+                verb: LastVerb::Reply,
+                at: "2026-11-20T09:30:00Z".into(),
+            };
+            assert_eq!(message_reminder_op_id(&op), None);
+            assert_eq!(message_property_op_id(&op), Some(("M1", "set last verb")));
+            let dismiss = OutboxOp::DismissMessageReminder { id: "M1".into() };
+            assert_eq!(message_reminder_op_id(&dismiss), Some("M1"));
+            assert_eq!(
+                message_property_op_id(&dismiss),
+                Some(("M1", "dismiss message reminder"))
+            );
+            let snooze = OutboxOp::SnoozeMessageReminder {
+                id: "M1".into(),
+                new_reminder_utc: "2026-11-20T09:30:00Z".into(),
+            };
+            assert_eq!(
+                message_property_op_id(&snooze),
+                Some(("M1", "snooze message reminder"))
+            );
         }
     }
 
@@ -35244,6 +36035,8 @@ mod tests {
                     in_reply_to: String::new(),
                     size: None,
                     is_event_message: false,
+                    last_verb: None,
+                    last_verb_time: None,
                 },
             )
             .unwrap();
@@ -36325,6 +37118,8 @@ mod tests {
                     in_reply_to: String::new(),
                     size: None,
                     is_event_message: false,
+                    last_verb: None,
+                    last_verb_time: None,
                 },
             )
             .unwrap();

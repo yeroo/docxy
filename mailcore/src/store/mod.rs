@@ -20,10 +20,10 @@ use crate::graph::client::{
 };
 use crate::graph::model::{
     AttachmentKind, AttachmentMeta, Attendee, Body, BodyFormat, Calendar, ContactFields,
-    ContactPhoto, DraftKind, DraftOptions, Event, EventRecurrence, FolderContact, MailFolder,
-    MasterCategory, MeetingMessageType, Message, MessageFields, MessageHeader, MessageProtection,
-    PhysicalAddress, Recipient, Recurrence, Sensitivity, is_stored_header, meeting_link_in,
-    reminder_time,
+    ContactPhoto, DraftKind, DraftOptions, Event, EventRecurrence, FolderContact, LastVerb,
+    MailFolder, MasterCategory, MeetingMessageType, Message, MessageFields, MessageHeader,
+    MessageProtection, PhysicalAddress, Recipient, Recurrence, Sensitivity, is_stored_header,
+    meeting_link_in, reminder_time,
 };
 use crate::json::{self, Value};
 
@@ -312,6 +312,16 @@ pub struct MessageRow {
     /// delta's class `$expand` was refused). While it is true a `None`
     /// `meeting_message_type` says nothing.
     pub meeting_type_pending: bool,
+    /// The message's last verb (#2301, `Message::last_verb`): replied to,
+    /// replied all to or forwarded, for a host's list to draw Outlook's
+    /// arrow. Set at once when mailcore sends an answer to it; else from
+    /// Graph's `PidTagLastVerbExecuted`. `None` for none (or another verb),
+    /// and for a row stored before #2301 until a sync re-reads it.
+    pub last_verb: Option<LastVerb>,
+    /// When `last_verb` was done, as Unix seconds (UTC), for "You replied
+    /// to this message on …"; `None` without a verb or when Graph sent no
+    /// readable time.
+    pub last_verb_time: Option<i64>,
 }
 
 /// One folder's local size (#2123, [`Store::folder_sizes`]): what the store
@@ -546,6 +556,17 @@ pub enum OutboxOp {
         id: String,
         new_reminder_utc: String,
     },
+    /// Mark a message replied to, replied all to or forwarded on the server
+    /// (#2301): a PATCH of `PidTagLastVerbExecuted` to `verb` and
+    /// `PidTagLastVerbExecutionTime` to `at` (the store's
+    /// `YYYY-MM-DDTHH:MM:SSZ`), queued by the engine once an answer to it
+    /// was sent. A message op (it follows a move, #1896), written to the
+    /// store first (`Store::set_last_verb`). A `local:` id sends nothing.
+    SetLastVerb {
+        id: String,
+        verb: LastVerb,
+        at: String,
+    },
     /// Create a contact the host wrote locally (#2063,
     /// `Store::create_local_contact`): `POST /me/contacts` with the row as
     /// stored at send time, then re-key it to Graph's id
@@ -737,7 +758,8 @@ impl OutboxOp {
             | OutboxOp::SaveDraft { id }
             | OutboxOp::SendDraft { id }
             | OutboxOp::DismissMessageReminder { id }
-            | OutboxOp::SnoozeMessageReminder { id, .. } => Some(id),
+            | OutboxOp::SnoozeMessageReminder { id, .. }
+            | OutboxOp::SetLastVerb { id, .. } => Some(id),
             OutboxOp::RespondEvent { .. }
             | OutboxOp::CreateEvent { .. }
             | OutboxOp::UpdateEvent { .. }
@@ -801,6 +823,7 @@ impl OutboxOp {
             | OutboxOp::SendDraft { .. }
             | OutboxOp::DismissMessageReminder { .. }
             | OutboxOp::SnoozeMessageReminder { .. }
+            | OutboxOp::SetLastVerb { .. }
             | OutboxOp::CreateContact { .. }
             | OutboxOp::UpdateContact { .. }
             | OutboxOp::DeleteContact { .. }
@@ -844,6 +867,7 @@ impl OutboxOp {
             OutboxOp::SnoozeReminder { .. } => "snoozeReminder",
             OutboxOp::DismissMessageReminder { .. } => "dismissMessageReminder",
             OutboxOp::SnoozeMessageReminder { .. } => "snoozeMessageReminder",
+            OutboxOp::SetLastVerb { .. } => "setLastVerb",
             OutboxOp::CreateContact { .. } => "createContact",
             OutboxOp::UpdateContact { .. } => "updateContact",
             OutboxOp::DeleteContact { .. } => "deleteContact",
@@ -1067,6 +1091,12 @@ impl OutboxOp {
                     Value::Str(new_reminder_utc.clone()),
                 ),
             ]),
+            OutboxOp::SetLastVerb { id, verb, at } => Value::Object(vec![
+                ("kind".to_string(), Value::Str(self.kind().to_string())),
+                ("id".to_string(), Value::Str(id.clone())),
+                ("verb".to_string(), Value::Num(verb.as_mapi() as f64)),
+                ("at".to_string(), Value::Str(at.clone())),
+            ]),
             OutboxOp::ForwardEvent { id, to, comment } => Value::Object(vec![
                 ("kind".to_string(), Value::Str(self.kind().to_string())),
                 ("id".to_string(), Value::Str(id.clone())),
@@ -1230,6 +1260,13 @@ impl OutboxOp {
             "snoozeMessageReminder" => Some(OutboxOp::SnoozeMessageReminder {
                 id: id()?,
                 new_reminder_utc: v.get("newReminderUtc")?.as_str()?.to_string(),
+            }),
+            // A verb this build does not know is a corrupt row: every
+            // `setLastVerb` ever queued names one of `LastVerb`'s.
+            "setLastVerb" => Some(OutboxOp::SetLastVerb {
+                id: id()?,
+                verb: LastVerb::from_mapi(v.get("verb")?.as_i64()?)?,
+                at: v.get("at")?.as_str()?.to_string(),
             }),
             "createContact" => Some(OutboxOp::CreateContact { id: id()? }),
             // A row without `fields` is corrupt: every `updateContact` ever
@@ -2162,6 +2199,7 @@ impl Store {
         // After `migrate_meeting_type_fill`, never in `schema.rs`, for the
         // same reason as `UNSIZED_INDEX_SQL`.
         conn.execute(UNTYPED_INDEX_SQL, [])?;
+        migrate_last_verb(&conn)?;
         register_contact_match(&conn)?;
         Ok(Store { conn })
     }
@@ -2305,7 +2343,9 @@ impl Store {
     /// item has one (`COALESCE`): a size never goes from known to unknown,
     /// so a partial item, a refused or dropped expand, a link minted before
     /// #2123 or a code-built `Message` without one keeps the stored size.
-    /// The reminder is on only while the row is flagged (the
+    /// `last_verb` and `last_verb_time` follow `writes_last_verb` (#2301:
+    /// only when the item carried its class, `NULL`s included, so a carried
+    /// item without a verb clears a stored one). The reminder is on only while the row is flagged (the
     /// stored flag when the item carries none), so an unflag or a completed
     /// flag Graph reports leaves it off even if Exchange kept
     /// `PidLidReminderSet`.
@@ -2364,10 +2404,10 @@ impl Store {
                  meeting_message_type,
                  sensitivity, has_sensitivity_label, sensitivity_label_name, is_rights_protected,
                  meeting_reminder_on, internet_message_id, in_reply_to, size,
-                 is_event_message, meeting_type_known
+                 is_event_message, meeting_type_known, last_verb, last_verb_time
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
                        ?35 AND ?12, ?36, ?37, ?38, ?40, ?42, ?43, ?44, ?45, ?47, ?49, ?51, ?53,
-                       ?54, ?41)
+                       ?54, ?41, ?55, ?56)
              ON CONFLICT(id) DO UPDATE SET
                  folder_id = excluded.folder_id,
                  conversation_id = CASE WHEN ?19 THEN excluded.conversation_id ELSE messages.conversation_id END,
@@ -2411,7 +2451,10 @@ impl Store {
                                             ELSE messages.internet_message_id END,
                  in_reply_to = CASE WHEN ?52 AND excluded.in_reply_to <> ''
                                     THEN excluded.in_reply_to ELSE messages.in_reply_to END,
-                 size = COALESCE(excluded.size, messages.size)
+                 size = COALESCE(excluded.size, messages.size),
+                 last_verb = CASE WHEN ?57 THEN excluded.last_verb ELSE messages.last_verb END,
+                 last_verb_time = CASE WHEN ?57 THEN excluded.last_verb_time
+                                       ELSE messages.last_verb_time END
              WHERE (NOT ?34 OR messages.local_edit = 0)
                AND NOT (messages.answers_id <> '' AND messages.local_edit > 0)",
             params![
@@ -2469,6 +2512,9 @@ impl Store {
                 fields.writes_in_reply_to(),
                 m.size,
                 m.is_event_message,
+                m.last_verb.map(LastVerb::as_mapi),
+                m.last_verb_time,
+                fields.writes_last_verb(),
             ],
         )?;
         Ok(n > 0)
@@ -3008,6 +3054,7 @@ impl Store {
                         internet_message_id, in_reply_to, size, is_event_message, "#,
             meeting_type_pending_sql!(),
             r#",
+                        last_verb, last_verb_time,
                         CASE WHEN conversation_id <> '' THEN conversation_id
                              ELSE 'msg:' || id END AS conv_key
                  FROM messages
@@ -3029,7 +3076,8 @@ impl Store {
                     k.sensitivity, k.has_sensitivity_label, k.sensitivity_label_name,
                     k.is_rights_protected, k.meeting_reminder_on,
                     k.internet_message_id, k.in_reply_to, k.size,
-                    k.is_event_message, k.meeting_type_pending
+                    k.is_event_message, k.meeting_type_pending,
+                    k.last_verb, k.last_verb_time
              FROM keyed k
              JOIN ranked r ON k.conv_key = r.conv_key
              ORDER BY r.latest DESC, k.received_at ASC"#,
@@ -4137,9 +4185,10 @@ impl Store {
                  id, folder_id, conversation_id, subject, from_name, from_addr,
                  to_recipients, cc_recipients, received_at, sent_at,
                  is_read, is_flagged, has_attachments, importance, preview, is_draft,
-                 in_reply_to, local_edit, answers_id, answers_kind
+                 in_reply_to, local_edit, answers_id, answers_kind,
+                 send_verb_original, send_verb
              ) VALUES (?1, ?2, ?3, ?4, '', '', ?5, ?6, '', '', 1, 0, 0, 'normal', '', 1,
-                       ?7, ?8, ?9, ?10)",
+                       ?7, ?8, ?9, ?10, ?9, ?10)",
             params![
                 id,
                 folder_id,
@@ -4184,6 +4233,83 @@ impl Store {
             let kind = DraftKind::from_stored(&kind)?;
             (!original.is_empty()).then_some((original, kind))
         }))
+    }
+
+    /// Records on the draft `id` addresses (a reconciled `local:` id still
+    /// reaches it) the message it answers and how (#2301): `original` as the
+    /// compose command carried it, unresolved, and `kind`. What the engine
+    /// reads once the draft is sent ([`Store::send_verb`]) to mark that
+    /// original replied to or forwarded. Unlike [`Store::draft_answers`]'s
+    /// link it survives the first push and every merge. No row changes
+    /// nothing.
+    pub fn set_send_verb(
+        &self,
+        id: &str,
+        original: &str,
+        kind: DraftKind,
+    ) -> Result<(), StoreError> {
+        self.conn.execute(
+            concat!(
+                "UPDATE messages SET send_verb_original = ?2, send_verb = ?3 WHERE ",
+                draft_row_sql!()
+            ),
+            params![id, original, kind.as_stored()],
+        )?;
+        Ok(())
+    }
+
+    /// The message the draft `id` addresses answers, and how (#2301): what
+    /// [`Store::set_send_verb`] or [`Store::create_local_answer_draft`]
+    /// stored, the original unresolved. `None` for no such row, a draft that
+    /// answers nothing, a stored kind this build does not read, or a link
+    /// already used ([`Store::clear_send_verb`]). `id` is matched by
+    /// `draft_row_sql!` (a `local:` id after `reconcile_id`), not through a
+    /// move: resolve it with [`Store::current_id`] first.
+    pub fn send_verb(&self, id: &str) -> Result<Option<(String, DraftKind)>, StoreError> {
+        let found: Option<(String, String)> = self
+            .conn
+            .query_row(
+                concat!(
+                    "SELECT send_verb_original, send_verb FROM messages WHERE ",
+                    draft_row_sql!()
+                ),
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(found.and_then(|(original, kind)| {
+            let kind = DraftKind::from_stored(&kind)?;
+            (!original.is_empty()).then_some((original, kind))
+        }))
+    }
+
+    /// Forgets the draft `id`'s answer link (#2301), once the engine has
+    /// used it after the draft's send. A draft with none, or no row,
+    /// changes nothing.
+    pub fn clear_send_verb(&self, id: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            concat!(
+                "UPDATE messages SET send_verb_original = '', send_verb = ''
+                 WHERE send_verb <> '' AND ",
+                draft_row_sql!()
+            ),
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Writes a message's last verb and its time (#2301): the optimistic
+    /// local write when mailcore sent an answer to it, before Graph has the
+    /// PATCH (`OutboxOp::SetLastVerb`), which a fresh delta leaves alone
+    /// while it is queued (`pending_message_ids`). `id` is the message as it
+    /// is stored now (resolve it with [`Store::current_id`]). A missing row
+    /// changes nothing (not an error).
+    pub fn set_last_verb(&self, id: &str, verb: LastVerb, secs: i64) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE messages SET last_verb = ?2, last_verb_time = ?3 WHERE id = ?1",
+            params![id, verb.as_mapi(), secs],
+        )?;
+        Ok(())
     }
 
     /// Forgets the link of the draft `id` addresses (#2212), once Graph has
@@ -8761,6 +8887,16 @@ fn follow_move_on(conn: &Connection, old_id: &str, new_id: &str) -> Result<(), S
                 "UPDATE messages SET local_id = COALESCE(local_id, ?2) WHERE id = ?1",
                 params![new_id, local],
             )?;
+            // An answer draft's link (#2301) goes with it too, unless the
+            // kept row has its own: no merge writes it, so the row a delta
+            // brought under the new id has none.
+            conn.execute(
+                "UPDATE messages SET
+                     send_verb_original = (SELECT send_verb_original FROM messages WHERE id = ?2),
+                     send_verb = (SELECT send_verb FROM messages WHERE id = ?2)
+                 WHERE id = ?1 AND send_verb = ''",
+                params![new_id, old_id],
+            )?;
             for sql in CHILDREN {
                 conn.execute(sql, params![old_id, new_id])?;
             }
@@ -10806,6 +10942,43 @@ fn migrate_meeting_type_fill(conn: &Connection) -> Result<bool, StoreError> {
     Ok(true)
 }
 
+/// Brings a store from before #2301 up to date: adds `messages.last_verb`
+/// and `messages.last_verb_time` (old rows read none) and the answer
+/// draft's link, `messages.send_verb_original` and `messages.send_verb`,
+/// and resets every folder's delta and backfill state and both
+/// expand-refused marks, as `migrate_message_protection` and
+/// `migrate_reply_links` do. Here the reset is required, not only
+/// precedent: a link minted before #2301 keeps the old `$expand`, which
+/// brings the class but not the verb, so every item it brings reads as
+/// carried with no verb (`parse_last_verb`), and a reply made on another
+/// device would be written none until the link expired; mail answered
+/// before the upgrade needs the backfill's re-walk to show its arrow. One
+/// IMMEDIATE transaction that probes for `last_verb` first; a store that
+/// has it (every fresh one) is left alone. Returns whether it migrated.
+fn migrate_last_verb(conn: &Connection) -> Result<bool, StoreError> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let has: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'last_verb'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has > 0 {
+        return Ok(false);
+    }
+    tx.execute_batch(
+        "ALTER TABLE messages ADD COLUMN last_verb INTEGER;
+         ALTER TABLE messages ADD COLUMN last_verb_time INTEGER;
+         ALTER TABLE messages ADD COLUMN send_verb_original TEXT NOT NULL DEFAULT '';
+         ALTER TABLE messages ADD COLUMN send_verb TEXT NOT NULL DEFAULT '';
+         UPDATE folders SET delta_link = NULL, backfill_link = NULL,
+                            backfill_synced = 0, history_scope = NULL,
+                            backfill_scope = NULL, reminder_expand_refused = 0,
+                            backfill_expand_refused = 0;",
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
 /// The partial index over [`untyped_where!`]'s rows (#2168), keyed by
 /// folder, which `Store::type_fill_folders`, `event_kind_candidates` and
 /// `meeting_type_candidates` read.
@@ -11301,12 +11474,13 @@ const MESSAGE_ROW_COLUMNS: &str = concat!(
     sensitivity, has_sensitivity_label, sensitivity_label_name, is_rights_protected,
     meeting_reminder_on, internet_message_id, in_reply_to, size,
     is_event_message, ",
-    meeting_type_pending_sql!()
+    meeting_type_pending_sql!(),
+    ", last_verb, last_verb_time"
 );
 
 /// How many columns `MESSAGE_ROW_COLUMNS` names: the index of the first
 /// column a query selects after them (`Store::draft`'s body).
-const BODY_AFTER_ROW_COLUMNS: usize = 34;
+const BODY_AFTER_ROW_COLUMNS: usize = 36;
 
 /// `Store::due_message_reminders`'s statement (#2054): flagged rows whose
 /// reminder is on and whose next signal (`reminder_signal_at`, else
@@ -11343,6 +11517,7 @@ fn message_rows_sql() -> String {
 /// spell the list out), so there's only one place mapping can drift out of
 /// sync with the column list.
 fn map_message_row(row: &Row) -> rusqlite::Result<MessageRow> {
+    let last_verb = row.get::<_, Option<i64>>(34)?.and_then(LastVerb::from_mapi);
     Ok(MessageRow {
         id: row.get(0)?,
         folder_id: row.get(1)?,
@@ -11383,6 +11558,13 @@ fn map_message_row(row: &Row) -> rusqlite::Result<MessageRow> {
         size: row.get(31)?,
         is_event_message: row.get::<_, Option<bool>>(32)?.unwrap_or(false),
         meeting_type_pending: row.get(33)?,
+        last_verb,
+        // A time without a verb this client knows says nothing.
+        last_verb_time: if last_verb.is_some() {
+            row.get(35)?
+        } else {
+            None
+        },
     })
 }
 
@@ -11573,6 +11755,8 @@ mod tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         }
     }
 
@@ -12138,6 +12322,8 @@ mod tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         };
         s.merge_message("G", &partial, &read_only_fields()).unwrap();
         let after = raw_row(&s, "11");
@@ -12228,6 +12414,8 @@ mod tests {
         m.in_reply_to = "<12@x>".into();
         m.size = Some(4321);
         m.is_event_message = true;
+        m.last_verb = Some(LastVerb::ReplyAll);
+        m.last_verb_time = Some(1_784_000_000);
         m.to = vec![Recipient {
             name: "B".into(),
             address: "b@x".into(),
@@ -12279,16 +12467,23 @@ mod tests {
             ("size_asked", V::Integer(0)),
             ("is_event_message", V::Integer(1)),
             ("meeting_type_known", V::Integer(1)),
+            ("last_verb", V::Integer(103)),
+            ("last_verb_time", V::Integer(1_784_000_000)),
+            ("send_verb_original", t("")),
+            ("send_verb", t("")),
         ];
         expect(&s, "13", &first);
 
         // Over the row, with every column changed (to empty / false where
         // a value can be), moved to G; bcc (not a Graph column here) kept,
         // and so are the two ids (#2096: a merge never clears a stored one)
-        // and the size (#2123: nor a size).
+        // and the size (#2123: nor a size), and the answer link (#2301: no
+        // merge writes it). The last verb is cleared (#2301: written as
+        // carried, `NULL`s included).
         s.conn
             .execute(
-                "UPDATE messages SET bcc_recipients = 'kept' WHERE id = '13'",
+                "UPDATE messages SET bcc_recipients = 'kept', send_verb_original = 'O',
+                                     send_verb = 'forward' WHERE id = '13'",
                 [],
             )
             .unwrap();
@@ -12320,6 +12515,8 @@ mod tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         };
         s.upsert_message("G", &m2).unwrap();
         expect(
@@ -12366,6 +12563,10 @@ mod tests {
                 ("size_asked", V::Integer(0)),
                 ("is_event_message", V::Integer(0)),
                 ("meeting_type_known", V::Integer(1)),
+                ("last_verb", V::Null),
+                ("last_verb_time", V::Null),
+                ("send_verb_original", t("O")),
+                ("send_verb", t("forward")),
             ],
         );
     }
@@ -20323,6 +20524,8 @@ mod search_tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         };
         s.upsert_message("F", &m).unwrap();
         s.put_body(
@@ -21654,6 +21857,8 @@ mod local_id_tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         };
         s.upsert_message(&folder, &m).unwrap();
         assert_eq!(s.current_id(&local).unwrap(), "G");
@@ -21767,6 +21972,8 @@ mod body_format_tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         }
     }
 
@@ -22479,6 +22686,8 @@ mod kept_body_tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         }
     }
 
@@ -22706,6 +22915,8 @@ mod folder_retain_tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         }
     }
 
@@ -23177,6 +23388,8 @@ mod backfill_tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         };
         let all = MessageFields::all();
         assert!(
@@ -23355,6 +23568,8 @@ mod moved_id_tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         }
     }
 
@@ -23728,6 +23943,8 @@ mod message_reminder_tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         }
     }
 
@@ -24410,6 +24627,8 @@ mod meeting_message_type_tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         }
     }
 
@@ -24690,10 +24909,14 @@ mod meeting_message_type_tests {
             s.set_backfill_progress("G", "https://graph/G?$skiptoken=3", 4, SCOPE_ALL)
                 .unwrap();
             // Back to a store from before #2054 (and so before #2081,
-            // #2088, #2089, #2096 and #2123).
+            // #2088, #2089, #2096, #2123, #2168 and #2301).
             s.conn
                 .execute_batch(
-                    "DROP INDEX idx_messages_reminder;
+                    "ALTER TABLE messages DROP COLUMN last_verb;
+                     ALTER TABLE messages DROP COLUMN last_verb_time;
+                     ALTER TABLE messages DROP COLUMN send_verb_original;
+                     ALTER TABLE messages DROP COLUMN send_verb;
+                     DROP INDEX idx_messages_reminder;
                      DROP INDEX idx_messages_reply_drafts;
                      DROP INDEX idx_messages_unsized;
                      DROP INDEX idx_messages_untyped;
@@ -24744,6 +24967,7 @@ mod meeting_message_type_tests {
         );
         assert_eq!(row.subject, "budget M1");
         assert_eq!(row.size, None);
+        assert_eq!((row.last_verb, row.last_verb_time), (None, None));
         // #2168: a request is a meeting message whose type the fill asks.
         assert!(row.is_event_message && row.meeting_type_pending);
         // Every folder's delta and backfill state is reset.
@@ -24860,6 +25084,8 @@ mod message_protection_tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         }
     }
 
@@ -25129,6 +25355,453 @@ mod message_protection_tests {
 }
 
 #[cfg(test)]
+mod last_verb_tests {
+    //! Each message's last verb on its row (#2301): the columns through
+    //! every row read, the merge rule, the migration, the answer draft's
+    //! link and the optimistic write.
+    use super::*;
+
+    fn folder(s: &Store, id: &str) {
+        s.upsert_folder(&MailFolder {
+            id: id.into(),
+            display_name: id.into(),
+            parent_id: None,
+            total_count: 0,
+            unread_count: 0,
+            well_known_name: None,
+        })
+        .unwrap();
+    }
+
+    fn msg(id: &str, verb: Option<LastVerb>, time: Option<i64>) -> Message {
+        Message {
+            id: id.into(),
+            conversation_id: format!("C{id}"),
+            subject: format!("answered {id}"),
+            from: Recipient {
+                name: "A".into(),
+                address: "a@x".into(),
+            },
+            to: vec![],
+            cc: vec![],
+            received: "2026-11-01T00:00:00Z".into(),
+            sent: String::new(),
+            is_read: false,
+            is_flagged: false,
+            has_attachments: false,
+            importance: "normal".into(),
+            preview: "p".into(),
+            is_draft: false,
+            is_meeting_request: false,
+            meeting_message_type: None,
+            protection: MessageProtection::default(),
+            meeting_reminder_on: false,
+            categories: vec![],
+            is_reminder_on: false,
+            reminder_at: String::new(),
+            reminder_signal_at: String::new(),
+            flag_due_at: String::new(),
+            internet_message_id: String::new(),
+            in_reply_to: String::new(),
+            size: None,
+            is_event_message: false,
+            last_verb: verb,
+            last_verb_time: time,
+        }
+    }
+
+    fn verb_of(s: &Store, id: &str) -> Verb {
+        let r = s.message_row(id).unwrap().unwrap();
+        (r.last_verb, r.last_verb_time)
+    }
+
+    const T: i64 = 1_795_167_000;
+
+    /// A row's `(last_verb, last_verb_time)`.
+    type Verb = (Option<LastVerb>, Option<i64>);
+
+    fn cases() -> Vec<(String, Verb)> {
+        [
+            (Some(LastVerb::Reply), Some(T)),
+            (Some(LastVerb::ReplyAll), Some(T + 1)),
+            (Some(LastVerb::Forward), Some(T + 2)),
+            (Some(LastVerb::Reply), None),
+            (None, None),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| (format!("M{i}"), v))
+        .collect()
+    }
+
+    #[test]
+    fn message_round_trips_the_last_verb_on_every_row_read() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        let want = cases();
+        for (id, (verb, time)) in &want {
+            s.upsert_message("F", &msg(id, *verb, *time)).unwrap();
+        }
+        let sorted = |rows: Vec<MessageRow>| {
+            let mut got: Vec<_> = rows
+                .into_iter()
+                .map(|r| (r.id, (r.last_verb, r.last_verb_time)))
+                .collect();
+            got.sort_by(|a, b| a.0.cmp(&b.0));
+            got
+        };
+        for (id, v) in &want {
+            assert_eq!(&verb_of(&s, id), v, "{id}");
+        }
+        let id_refs: Vec<&str> = want.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(sorted(s.message_rows(&id_refs).unwrap()), want);
+        assert_eq!(sorted(s.messages_in_folder("F", 50, 0).unwrap()), want);
+        assert_eq!(sorted(s.conversations_in_folder("F", 50, 0).unwrap()), want);
+        assert_eq!(sorted(s.search("answered", 50).unwrap()), want);
+        let mut r = msg("R1", Some(LastVerb::Forward), Some(T));
+        r.is_flagged = true;
+        r.is_reminder_on = true;
+        r.reminder_at = "2026-11-08T10:00:00Z".into();
+        s.upsert_message("F", &r).unwrap();
+        let due = s.due_message_reminders("2026-11-08T12:00:00Z").unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(
+            (due[0].last_verb, due[0].last_verb_time),
+            (Some(LastVerb::Forward), Some(T))
+        );
+        // `draft`, whose body columns follow the row's (36 of them).
+        let mut d = msg("D1", Some(LastVerb::ReplyAll), Some(T));
+        d.is_draft = true;
+        s.upsert_message("F", &d).unwrap();
+        s.put_body(
+            "D1",
+            &Body {
+                content_type: "html".into(),
+                content: "<p>hi</p>".into(),
+            },
+        )
+        .unwrap();
+        let (row, body) = s.draft("D1").unwrap().unwrap();
+        assert_eq!(
+            (row.last_verb, row.last_verb_time),
+            (Some(LastVerb::ReplyAll), Some(T))
+        );
+        assert_eq!(row.subject, "answered D1");
+        assert_eq!(body.content_type, "html");
+        assert_eq!(body.content, "<p>hi</p>");
+    }
+
+    #[test]
+    fn an_unknown_stored_verb_reads_none() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.upsert_message("F", &msg("M1", Some(LastVerb::Reply), Some(T)))
+            .unwrap();
+        s.conn
+            .execute("UPDATE messages SET last_verb = 261", [])
+            .unwrap();
+        // The time of a verb this build does not read says nothing either.
+        assert_eq!(verb_of(&s, "M1"), (None, None));
+    }
+
+    #[test]
+    fn the_merge_writes_the_last_verb_only_when_carried() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        let reply = (Some(LastVerb::Reply), Some(T));
+        s.upsert_message("F", &msg("M1", reply.0, reply.1)).unwrap();
+        // `{id, isRead}`: partial, carries no class.
+        let read = Message {
+            is_read: true,
+            ..msg("M1", None, None)
+        };
+        let fields = MessageFields {
+            is_read: true,
+            ..MessageFields::default()
+        };
+        s.merge_message("F", &read, &fields).unwrap();
+        assert_eq!(verb_of(&s, "M1"), reply);
+        assert!(s.message_row("M1").unwrap().unwrap().is_read);
+        // A complete item whose expand came without the class (refused,
+        // dropped): kept.
+        let bare = MessageFields {
+            last_verb: false,
+            protection: false,
+            meeting_type: false,
+            meeting_reminder: false,
+            ..MessageFields::all()
+        };
+        s.merge_message("F", &msg("M1", None, None), &bare).unwrap();
+        assert_eq!(verb_of(&s, "M1"), reply);
+        // A fresh delta's guard changes nothing here.
+        s.merge_message_unless_edited("F", &msg("M1", None, None), &bare)
+            .unwrap();
+        assert_eq!(verb_of(&s, "M1"), reply);
+        // Carried: none → reply all, reply all → forward, and a carried
+        // item with no verb clears it.
+        let carried = MessageFields::all();
+        for want in [
+            (Some(LastVerb::ReplyAll), Some(T + 5)),
+            (Some(LastVerb::Forward), Some(T + 9)),
+            (None, None),
+        ] {
+            s.merge_message("F", &msg("M1", want.0, want.1), &carried)
+                .unwrap();
+            assert_eq!(verb_of(&s, "M1"), want);
+        }
+        // A missing row is inserted with what the item has.
+        s.merge_message("F", &msg("M2", reply.0, reply.1), &carried)
+            .unwrap();
+        assert_eq!(verb_of(&s, "M2"), reply);
+        s.merge_message("F", &msg("M3", None, None), &fields)
+            .unwrap();
+        assert_eq!(verb_of(&s, "M3"), (None, None));
+    }
+
+    /// Drops the columns #2301 added: a store from before it (after #2168).
+    fn drop_2301_columns(conn: &Connection) {
+        conn.execute_batch(
+            "ALTER TABLE messages DROP COLUMN last_verb;
+             ALTER TABLE messages DROP COLUMN last_verb_time;
+             ALTER TABLE messages DROP COLUMN send_verb_original;
+             ALTER TABLE messages DROP COLUMN send_verb;",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn messages_without_2301_columns_migrate_and_reset_delta_links() {
+        let dir = std::env::temp_dir().join(format!(
+            "lookxy-store-last-verb-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mail.db");
+        {
+            let s = Store::open(&path).unwrap();
+            folder(&s, "F");
+            folder(&s, "G");
+            let mut m = msg("M1", None, None);
+            m.size = Some(77);
+            s.upsert_message("F", &m).unwrap();
+            s.complete_backfill("F", "https://graph/F?$deltatoken=1", SCOPE_ALL, 7, None)
+                .unwrap();
+            s.set_head_link("G", "https://graph/G?$deltatoken=2", false)
+                .unwrap();
+            s.set_backfill_progress("G", "https://graph/G?$skiptoken=3", 4, SCOPE_ALL)
+                .unwrap();
+            s.set_reminder_expand_refused("G", true).unwrap();
+            drop_2301_columns(&s.conn);
+        }
+        let s = Store::open(&path).unwrap();
+        // The columns are there and the old row reads none, the rest kept.
+        let row = s.message_row("M1").unwrap().unwrap();
+        assert_eq!((row.last_verb, row.last_verb_time), (None, None));
+        assert_eq!(row.subject, "answered M1");
+        assert_eq!(row.size, Some(77));
+        assert_eq!(s.send_verb("M1").unwrap(), None);
+        // Every folder's delta and backfill state is reset, the expand
+        // refusals with it, with no reconverge.
+        for f in ["F", "G"] {
+            assert_eq!(s.get_delta_link(f).unwrap(), None, "{f}");
+            let (backfill, synced, history, scope): (
+                Option<String>,
+                i64,
+                Option<String>,
+                Option<String>,
+            ) = s
+                .conn
+                .query_row(
+                    "SELECT backfill_link, backfill_synced, history_scope, backfill_scope
+                     FROM folders WHERE id = ?1",
+                    [f],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (backfill, synced, history, scope),
+                (None, 0, None, None),
+                "{f}"
+            );
+            assert!(!s.reminder_expand_refused(f).unwrap(), "{f}");
+            assert!(!s.backfill_expand_refused(f).unwrap(), "{f}");
+        }
+        assert!(!s.reconverge_pending().unwrap());
+        // Written from now on, and a link stored after the migration
+        // survives the next open (idempotent).
+        s.upsert_message("F", &msg("M1", Some(LastVerb::Forward), Some(T)))
+            .unwrap();
+        s.set_head_link("F", "https://graph/F?$deltatoken=new", false)
+            .unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(
+            s.get_delta_link("F").unwrap().as_deref(),
+            Some("https://graph/F?$deltatoken=new")
+        );
+        assert_eq!(verb_of(&s, "M1"), (Some(LastVerb::Forward), Some(T)));
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_store_has_the_columns_and_is_not_migrated() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(schema::SCHEMA_SQL).unwrap();
+        assert!(!migrate_last_verb(&conn).unwrap());
+    }
+
+    #[test]
+    fn a_store_without_the_columns_migrates_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(schema::SCHEMA_SQL).unwrap();
+        drop_2301_columns(&conn);
+        assert!(migrate_last_verb(&conn).unwrap());
+        assert!(!migrate_last_verb(&conn).unwrap());
+    }
+
+    #[test]
+    fn set_last_verb_writes_the_row_and_ignores_a_missing_one() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.upsert_message("F", &msg("M1", None, None)).unwrap();
+        s.set_last_verb("M1", LastVerb::ReplyAll, T).unwrap();
+        assert_eq!(verb_of(&s, "M1"), (Some(LastVerb::ReplyAll), Some(T)));
+        s.set_last_verb("GONE", LastVerb::Reply, T).unwrap();
+        assert!(s.message_row("GONE").unwrap().is_none());
+    }
+
+    #[test]
+    fn send_verb_round_trips_and_survives_the_first_push() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        // A Graph draft (online compose): set, read, kept through the
+        // first push's bookkeeping and every merge, then cleared.
+        let mut d = msg("D1", None, None);
+        d.is_draft = true;
+        s.upsert_message("F", &d).unwrap();
+        assert_eq!(s.send_verb("D1").unwrap(), None);
+        s.set_send_verb("D1", "OLD-O1", DraftKind::ReplyAll)
+            .unwrap();
+        let link = Some(("OLD-O1".to_string(), DraftKind::ReplyAll));
+        assert_eq!(s.send_verb("D1").unwrap(), link);
+        s.clear_draft_answers("D1").unwrap();
+        let generation = s.local_edit_generation("D1").unwrap();
+        s.clear_local_edit("D1", generation).unwrap();
+        s.upsert_message("F", &d).unwrap();
+        s.merge_message_unless_edited("F", &d, &MessageFields::all())
+            .unwrap();
+        assert_eq!(s.send_verb("D1").unwrap(), link);
+        s.clear_send_verb("D1").unwrap();
+        assert_eq!(s.send_verb("D1").unwrap(), None);
+        // A stored kind this build does not read, and no row, are none.
+        s.set_send_verb("D1", "O1", DraftKind::Reply).unwrap();
+        s.conn
+            .execute("UPDATE messages SET send_verb = 'vote'", [])
+            .unwrap();
+        assert_eq!(s.send_verb("D1").unwrap(), None);
+        assert_eq!(s.send_verb("NOPE").unwrap(), None);
+        s.clear_send_verb("NOPE").unwrap();
+        s.set_send_verb("NOPE", "O1", DraftKind::Reply).unwrap();
+    }
+
+    #[test]
+    fn a_local_answer_draft_stores_its_send_verb_through_reconcile_id() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        s.upsert_message("F", &msg("O1", None, None)).unwrap();
+        let local = s
+            .create_local_answer_draft("O1", DraftKind::Forward, "FW: x", "b@x", "", "<p>x</p>")
+            .unwrap();
+        let link = Some(("O1".to_string(), DraftKind::Forward));
+        assert_eq!(s.send_verb(&local).unwrap(), link);
+        // The first push clears the answers link, never this one; the
+        // reconciled `local:` id still reaches it.
+        s.reconcile_id(&local, "G1").unwrap();
+        s.clear_draft_answers(&local).unwrap();
+        assert_eq!(s.draft_answers(&local).unwrap(), None);
+        assert_eq!(s.send_verb(&local).unwrap(), link);
+        assert_eq!(s.send_verb("G1").unwrap(), link);
+        // A plain local draft answers nothing.
+        let plain = s.create_local_draft("Hi", "a@x", "", "<p>x</p>").unwrap();
+        assert_eq!(s.send_verb(&plain).unwrap(), None);
+    }
+
+    #[test]
+    fn follow_move_keeps_the_drafts_send_verb() {
+        let s = Store::open_in_memory().unwrap();
+        folder(&s, "F");
+        let link = Some(("O1".to_string(), DraftKind::Reply));
+        // The plain re-key.
+        let mut d = msg("D1", None, None);
+        d.is_draft = true;
+        s.upsert_message("F", &d).unwrap();
+        s.set_send_verb("D1", "O1", DraftKind::Reply).unwrap();
+        assert!(s.follow_move("D1", "D2").unwrap());
+        assert_eq!(s.send_verb("D2").unwrap(), link);
+        // Onto a row a delta stored first under the new id: the old row
+        // goes, its link onto the kept row.
+        let mut moved = msg("D3", None, None);
+        moved.is_draft = true;
+        s.upsert_message("F", &moved).unwrap();
+        assert!(s.follow_move("D2", "D3").unwrap());
+        assert!(s.message_row("D2").unwrap().is_none());
+        assert_eq!(s.send_verb("D3").unwrap(), link);
+        assert_eq!(s.send_verb(&s.current_id("D1").unwrap()).unwrap(), link);
+        // A kept row with a link of its own keeps it.
+        let mut e = msg("E1", None, None);
+        e.is_draft = true;
+        s.upsert_message("F", &e).unwrap();
+        s.set_send_verb("E1", "O9", DraftKind::Forward).unwrap();
+        assert!(s.follow_move("D3", "E1").unwrap());
+        assert_eq!(
+            s.send_verb("E1").unwrap(),
+            Some(("O9".to_string(), DraftKind::Forward))
+        );
+    }
+
+    #[test]
+    fn set_last_verb_op_round_trips_and_is_a_message_op() {
+        let s = Store::open_in_memory().unwrap();
+        for verb in [LastVerb::Reply, LastVerb::ReplyAll, LastVerb::Forward] {
+            let op = OutboxOp::SetLastVerb {
+                id: "M1".into(),
+                verb,
+                at: "2026-11-20T09:30:00Z".into(),
+            };
+            assert_eq!(OutboxOp::from_json(&op.to_json()), Some(op.clone()));
+            assert_eq!(op.message_id(), Some("M1"));
+            assert_eq!(op.event_local_write(), None);
+        }
+        let op = OutboxOp::SetLastVerb {
+            id: "M1".into(),
+            verb: LastVerb::Forward,
+            at: "2026-11-20T09:30:00Z".into(),
+        };
+        assert_eq!(
+            op.to_json().to_string(),
+            r#"{"kind":"setLastVerb","id":"M1","verb":104,"at":"2026-11-20T09:30:00Z"}"#
+        );
+        s.enqueue_op(&op).unwrap();
+        assert_eq!(s.pending_message_ids().unwrap(), ["M1"]);
+        assert_eq!(s.pending_ops().unwrap()[0].op, op);
+        // A verb this build does not know, or a missing field, is corrupt.
+        for json in [
+            r#"{"kind":"setLastVerb","id":"M1","verb":261,"at":"x"}"#,
+            r#"{"kind":"setLastVerb","id":"M1","at":"x"}"#,
+            r#"{"kind":"setLastVerb","id":"M1","verb":102}"#,
+        ] {
+            assert_eq!(
+                OutboxOp::from_json(&json::parse(json).unwrap()),
+                None,
+                "{json}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod meeting_reminder_tests {
     //! A meeting message's own reminder on its row (#2089): the column
     //! through every row read, the merge rule (no flag term), that it never
@@ -25179,6 +25852,8 @@ mod meeting_reminder_tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         }
     }
 
@@ -25485,6 +26160,8 @@ mod reply_link_tests {
             in_reply_to: irt.into(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         }
     }
 
@@ -28975,6 +29652,8 @@ mod message_size_tests {
             in_reply_to: String::new(),
             size,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         }
     }
 
@@ -30209,6 +30888,8 @@ mod mailbox_reset_tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         }
     }
 
@@ -30468,6 +31149,8 @@ mod meeting_type_fill_tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: event,
+            last_verb: None,
+            last_verb_time: None,
         }
     }
 
@@ -31114,6 +31797,8 @@ mod optimistic_write_tests {
             in_reply_to: String::new(),
             size: None,
             is_event_message: false,
+            last_verb: None,
+            last_verb_time: None,
         }
     }
 

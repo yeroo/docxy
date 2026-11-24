@@ -101,6 +101,8 @@ mod tests {
                     in_reply_to: String::new(),
                     size: None,
                     is_event_message: false,
+                    last_verb: None,
+                    last_verb_time: None,
                 },
             )
             .expect("seed second message");
