@@ -485,10 +485,13 @@ fn link_go(pages: &[PageInfo], target: &LinkTarget) -> LinkGo {
             };
             // The point the view goes to, by the coordinates the
             // destination gives (user space, either may be left as it is).
+            // A destination with no point goes to the page's displayed top
+            // (no coordinate: the view's own), whatever its /Rotate: the
+            // crop box's top edge is its side or bottom when turned.
             let (ux, uy, zoom, fit_width) = match *view {
-                DestView::Top | DestView::Fit => (None, Some(p.crop[3]), None, false),
+                DestView::Top | DestView::Fit => (None, None, None, false),
                 DestView::Xyz { left, top, zoom } => (left, top, zoom, false),
-                DestView::FitH { top } => (None, top.or(Some(p.crop[3])), None, true),
+                DestView::FitH { top } => (None, top, None, true),
                 DestView::FitV { left } => (left, None, None, false),
                 DestView::FitR { rect } => (Some(rect[0]), Some(rect[3]), None, false),
             };
@@ -661,4 +664,55 @@ pub(super) fn da_size(da: &str) -> f32 {
         .and_then(|w| w.parse::<f32>().ok())
         .filter(|s| s.is_finite() && *s >= 0.)
         .unwrap_or(0.)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pdfcraft_render::DestView;
+
+    fn page(rotation: u16) -> PageInfo {
+        let (w, h) = if rotation.is_multiple_of(180) {
+            (595., 842.)
+        } else {
+            (842., 595.)
+        };
+        PageInfo {
+            width: w,
+            height: h,
+            label: "1".into(),
+            crop: [0., 0., 595., 842.],
+            rotation,
+        }
+    }
+
+    /// r1: a destination with no point (/Fit, a bare page, /FitH null) goes
+    /// to the page's displayed top on every /Rotate: no coordinate, never
+    /// the crop box's top edge, which a turned page shows at its side or
+    /// bottom.
+    #[test]
+    fn a_destination_with_no_point_goes_to_the_top_on_any_rotation() {
+        for rotation in [0, 90, 180, 270] {
+            let pages = [page(rotation)];
+            for view in [DestView::Top, DestView::Fit, DestView::FitH { top: None }] {
+                match link_go(&pages, &LinkTarget::Page(0, view)) {
+                    LinkGo::Page {
+                        x: None, y: None, ..
+                    } => {}
+                    other => panic!("{rotation} {view:?}: {other:?}"),
+                }
+            }
+            // A /FitH with a top keeps it: on a page turned upside down,
+            // 742 points up shows 100 points from the top.
+            if rotation == 180 {
+                match link_go(
+                    &pages,
+                    &LinkTarget::Page(0, DestView::FitH { top: Some(742.) }),
+                ) {
+                    LinkGo::Page { y: Some(y), .. } => assert!((y - 742.).abs() < 0.01, "{y}"),
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+    }
 }

@@ -10,6 +10,7 @@
 use super::worker::{FieldKind, FieldMeta, FieldValue, LinkGo, Op};
 use super::*;
 use crate::field_edit;
+use std::ops::Range;
 
 /// The field that has the keys, and the widget it was entered by.
 #[derive(Clone, Debug, PartialEq)]
@@ -22,7 +23,14 @@ pub(crate) struct FormFocus {
     pub open: bool,
     /// The option a combo box's open list or a list box is on.
     pub cursor: usize,
+    /// The first option an open combo box's list shows: it shows
+    /// [`LIST_ROWS`] at a time, scrolled by the wheel and following the
+    /// cursor.
+    pub top: usize,
 }
+
+/// The rows an open combo box's list shows at a time.
+pub(crate) const LIST_ROWS: usize = 12;
 
 /// The schemes a link may open in the browser or mail program.
 pub(crate) fn opens(uri: &str) -> bool {
@@ -286,8 +294,10 @@ impl PdfView {
             return true;
         }
         let edit = matches!(f.kind, FieldKind::Text) || (f.kind == FieldKind::Combo && f.edit);
-        let text = shown_text(f);
         let cursor = f.picked.first().copied().unwrap_or(0);
+        // What the field will hold once the values on their way are in: a
+        // field entered again before its fill was answered shows it.
+        let text = self.expected_text(field);
         self.blur();
         let mut e = Field {
             text,
@@ -300,6 +310,7 @@ impl PdfView {
             edit: edit.then_some(e),
             open: false,
             cursor,
+            top: cursor.saturating_sub(LIST_ROWS - 1),
         });
         self.find.field.focused = false;
         self.page_box = Field::default();
@@ -328,12 +339,38 @@ impl PdfView {
             return;
         };
         let field = focus.field;
-        let Some(f) = self.field(field) else { return };
-        if edit.text != shown_text(f) {
+        if edit.text != self.expected_text(field) {
             let value = FieldValue::Text {
                 text: edit.text.clone(),
             };
             self.fill(field, value);
+        }
+    }
+
+    /// The text field `field`'s editor compares with: the text the last
+    /// fill of it on its way sets (queued, or out with the worker), else
+    /// what it holds. A combo box's picked option shows its text.
+    pub(crate) fn expected_text(&self, field: usize) -> String {
+        let Some(f) = self.field(field) else {
+            return String::new();
+        };
+        let waiting = self
+            .form_ops
+            .iter()
+            .rev()
+            .chain(self.in_flight.as_ref())
+            .find_map(|op| match op {
+                Op::SetField { name, value } if *name == f.name => Some(value),
+                _ => None,
+            });
+        match waiting {
+            Some(FieldValue::Text { text }) => text.clone(),
+            Some(FieldValue::Choice { picked }) => picked
+                .first()
+                .and_then(|i| f.options.get(*i))
+                .map(|o| o.1.clone())
+                .unwrap_or_default(),
+            _ => shown_text(f),
         }
     }
 
@@ -364,8 +401,7 @@ impl PdfView {
         self.focus.as_ref().is_some_and(|x| {
             x.edit
                 .as_ref()
-                .zip(self.field(x.field))
-                .is_some_and(|(e, f)| e.text != shown_text(f))
+                .is_some_and(|e| e.text != self.expected_text(x.field))
         })
     }
 
@@ -533,10 +569,21 @@ impl PdfView {
         if order.is_empty() {
             return false;
         }
-        let at = self
-            .focus
-            .as_ref()
-            .and_then(|x| order.iter().position(|(f, _)| *f == x.field));
+        // The stop of the widget with the keys; a radio group's one stop
+        // may be another of its buttons.
+        let at = self.focus.as_ref().and_then(|x| {
+            order
+                .iter()
+                .position(|&(f, w)| f == x.field && w == x.widget)
+                .or_else(|| {
+                    let radio = self
+                        .field(x.field)
+                        .is_some_and(|f| f.kind == FieldKind::Radio);
+                    radio
+                        .then(|| order.iter().position(|(f, _)| *f == x.field))
+                        .flatten()
+                })
+        });
         let n = order.len();
         let next = match (at, back) {
             (None, false) => 0,
@@ -587,7 +634,9 @@ impl PdfView {
     // ---- keys ---------------------------------------------------------------
 
     /// A one-line edit in the focused field's text (typed text, caret keys,
-    /// Ctrl+A); a field with a `/MaxLen` keeps at most that many characters.
+    /// Ctrl+A). In a field with a `/MaxLen`, typed or pasted text goes in
+    /// only as far as there is room, as other readers take it: a full field
+    /// refuses the keystroke, and nothing already in it is cut.
     pub(crate) fn edit_text(&mut self, op: field_edit::Op) {
         let max = self
             .focus
@@ -597,12 +646,18 @@ impl PdfView {
         let Some(e) = self.focus.as_mut().and_then(|x| x.edit.as_mut()) else {
             return;
         };
-        e.edit(op);
-        if let Some(max) = max
-            && e.text.chars().count() > max
-        {
-            e.text = e.text.chars().take(max).collect();
-            e.caret = e.caret.min(max);
+        match (op, max) {
+            (field_edit::Op::Insert(t), Some(max)) => {
+                let len = e.text.chars().count();
+                // A selection is the whole text, which the insert replaces.
+                let kept = if e.sel { 0 } else { len };
+                let room = max.saturating_sub(kept);
+                let fits: String = t.chars().take(room).collect();
+                if !fits.is_empty() {
+                    e.edit(field_edit::Op::Insert(&fits));
+                }
+            }
+            (op, _) => e.edit(op),
         }
     }
 
@@ -643,7 +698,7 @@ impl PdfView {
     /// (picking in a closed combo box and a single-pick list), Space picks
     /// in a multi-pick list, Alt+Down and F4 open a combo box's list.
     /// `true` when it took the key.
-    pub(crate) fn form_key(&mut self, key: &str, ctrl: bool, alt: bool) -> bool {
+    pub(crate) fn form_key(&mut self, key: &str, alt: bool) -> bool {
         let Some(focus) = self.focus.clone() else {
             return false;
         };
@@ -681,22 +736,56 @@ impl PdfView {
                 } else if let Some(x) = self.focus.as_mut() {
                     x.cursor = next;
                 }
+                self.keep_cursor_shown();
                 true
             }
             (FieldKind::List, "space") if f.multi => {
                 self.pick(focus.cursor, true);
                 true
             }
-            _ => {
-                let _ = ctrl;
-                false
-            }
+            _ => false,
         }
     }
 
     fn set_open(&mut self, open: bool) {
         if let Some(x) = self.focus.as_mut() {
             x.open = open;
+        }
+        self.keep_cursor_shown();
+    }
+
+    /// The options an open combo box's list shows: [`LIST_ROWS`] from its
+    /// `top`. Empty when no list is open.
+    pub(crate) fn list_window(&self) -> Range<usize> {
+        let Some(x) = self.focus.as_ref().filter(|x| x.open) else {
+            return 0..0;
+        };
+        let n = self.field(x.field).map_or(0, |f| f.options.len());
+        let top = x.top.min(n.saturating_sub(LIST_ROWS));
+        top..(top + LIST_ROWS).min(n)
+    }
+
+    /// The wheel over an open list: `rows` down (up when negative).
+    pub(crate) fn list_scroll(&mut self, rows: i32) {
+        let n = self
+            .focus
+            .as_ref()
+            .and_then(|x| self.field(x.field))
+            .map_or(0, |f| f.options.len());
+        if let Some(x) = self.focus.as_mut() {
+            let last = n.saturating_sub(LIST_ROWS) as i64;
+            x.top = (x.top as i64 + i64::from(rows)).clamp(0, last.max(0)) as usize;
+        }
+    }
+
+    /// The list's window follows its cursor.
+    fn keep_cursor_shown(&mut self) {
+        if let Some(x) = self.focus.as_mut() {
+            if x.cursor < x.top {
+                x.top = x.cursor;
+            } else if x.cursor >= x.top + LIST_ROWS {
+                x.top = x.cursor + 1 - LIST_ROWS;
+            }
         }
     }
 }

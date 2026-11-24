@@ -1,6 +1,7 @@
 # PDF view
 
-Notes for the suite's PDF view: opening a PDF as it looks, read-only.
+Notes for the suite's PDF view: opening a PDF as it looks; its links,
+comments and form, the only thing it writes back (#2255).
 
 ## PDF view: the renderer and its patch table (#2245)
 
@@ -63,7 +64,9 @@ Notes for the suite's PDF view: opening a PDF as it looks, read-only.
   appearances, and a Highlight without one by itself; every other kind
   without `/AP` is blank but for PdfCraft's appearance.
 - Protocol 2: `info` adds `links` (view space, quads too: `LinkGo::Uri`,
-  `Page` with an optional point, `/XYZ` zoom and `/FitH`, `Other` for a
+  `Page` with an optional point (none for `/Fit`, a bare page or `/FitH
+  null`: the page's displayed top on any `/Rotate`), `/XYZ` zoom and
+  `/FitH`, `Other` for a
   script, launch, layers, another file), `notes` (comments with text, not
   replies, free text or Hidden/NoView ones; `shown_rect`) and `form`
   (`FieldMeta`s with widgets in view space, `signed`, `incremental`). Every
@@ -89,23 +92,33 @@ Notes for the suite's PDF view: opening a PDF as it looks, read-only.
   has a revision: a raster or text older than it is kept and asked again;
   a page's text read again replaces its Find hits and drops a selection on
   it. `form_rev` / `saved_rev` say unsaved; the host mirrors them into
-  `DocTab.dirty` each frame (`pdf_tabs_tick`, which also finishes a save of
-  a tab behind another). Tab order is the widgets' `tab`, a radio group one
-  stop, read-only and hidden ones skipped. The focused text field is drawn
-  as an editor over the raster (bullets for a password; MaxLen kept);
+  `DocTab.dirty` each frame (`pdf_settle_tabs`, after the active view took
+  its answers in, also finishes saves; `pdf_pump_behind` pumps the tabs
+  behind it), and a close or the window's close reads them at once
+  (`commit_pdf_tab`). Tab order is the widgets' `tab`, one stop per widget
+  (found by field and widget), a radio group one stop, read-only and hidden
+  ones skipped. A field's editor starts from, and commits against, the
+  value of its last fill still on its way (`expected_text`), so entering it
+  again before the answer neither shows nor sends a stale value. The
+  focused text field is drawn as an editor over the raster (bullets for a
+  password); MaxLen refuses what does not fit. A combo box's open list shows
+  `LIST_ROWS` (12) at a time, following the keys' cursor and the wheel.
   Up/Down between a multi-line field's lines is not done.
 - Save (`pdf_save_step`): commits the typed text; nothing filled since the
   last read or save writes nothing (`PDF_NO_CHANGES`) but Save As writes the
   copy; a signed PDF asks `PDF_SIGNED_SAVE` first (`SIGNED_LOST_QUESTION`
   when the file would be written anew). `after` runs when the worker's
   answer comes, written or not (#2194). Save As: the native dialog, PDF
-  only; refused in a harness (`PDF_SAVE_AS_HARNESS`), whose `save-as` verb
-  queues it. The close prompt is `PDF_SAVE_ON_CLOSE` (plain, in place). Hot
+  only (`pdf_save_as_target`: `.pdf` added to a name without an extension,
+  any other refused); refused in a harness (`PDF_SAVE_AS_HARNESS`), whose
+  `save-as` verb queues it; `close-tab {"answer":"save"}` closes a PDF tab
+  from its save's `after`. The close prompt is `PDF_SAVE_ON_CLOSE` (plain, in place). Hot
   exit cannot keep the values: with "ask before closing" off, a window close
   or Quit with a dirty PDF tab stays and opens that tab's close prompt
   (`pdf_refusal`, as #2260's extension tabs).
-- Harness: `pdf-read` adds `links`, `notes`, `popup`, `tooltip`, `fields`,
-  `values` (by name), `focus`, `focus_open`, `unsaved`, `saving`, `signed`;
+- Harness: `pdf-read` adds `links`, `notes`, `popup`, `popup_pinned`,
+  `tooltip`, `fields`, `values` (by name), `focus`, `focus_open`,
+  `unsaved`, `saving`, `signed`, `incremental`;
   regions `pdf-field:<name>[:<widget>]`, `pdf-link:<page>:<n>`,
   `pdf-annot:<page>:<n>`, `pdf-option:<n>`; input `pdf-form-field`.
   `uiharness/cases/pdf-forms.uit` drives them.

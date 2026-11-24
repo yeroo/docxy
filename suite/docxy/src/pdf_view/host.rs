@@ -143,6 +143,26 @@ pub(crate) fn pdf_save_step(tab: &mut DocTab, target: Option<std::path::PathBuf>
     PdfSaveStep::Go(path)
 }
 
+/// What Save As on a PDF tab writes to, from the path its dialog gave
+/// (#2255): a name without an extension gets `.pdf` (the dialog may not add
+/// the filter's), a `.pdf` one is kept; any other extension is refused, as
+/// a workbook's Save As refuses one, since the dialog confirmed replacing
+/// that name and no other.
+pub(crate) fn pdf_save_as_target(path: std::path::PathBuf) -> Result<std::path::PathBuf, String> {
+    match path.extension() {
+        None => {
+            let mut name = path.file_name().unwrap_or_default().to_os_string();
+            name.push(".pdf");
+            Ok(path.with_file_name(name))
+        }
+        Some(e) if e.eq_ignore_ascii_case("pdf") => Ok(path),
+        Some(e) => Err(format!(
+            "A PDF is saved as a .pdf file, not .{}: choose a name that ends in .pdf",
+            e.to_string_lossy()
+        )),
+    }
+}
+
 /// The signed PDF's question (#2255): Save goes on, Cancel writes nothing.
 pub(crate) fn signed_dialog(question: &str) -> crate::dialog::Dialog {
     crate::dialog::Dialog::message(
@@ -610,16 +630,16 @@ impl Docxy {
                 let Some(target) = target else {
                     return this.refocus(window, cx);
                 };
-                let target = if target
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
-                {
-                    target
-                } else {
-                    target.with_extension("pdf")
-                };
-                let after = this.save_pdf_then(Some(target), crate::no_after(), window, cx);
-                this.run_after(after, window, cx);
+                match pdf_save_as_target(target) {
+                    Ok(target) => {
+                        let after = this.save_pdf_then(Some(target), crate::no_after(), window, cx);
+                        this.run_after(after, window, cx);
+                    }
+                    Err(why) => {
+                        this.set_status(why);
+                        this.refocus(window, cx);
+                    }
+                }
             },
             window,
             cx,
@@ -649,7 +669,7 @@ impl Docxy {
     }
 
     /// A key on the active PDF view: its fields, zoom, navigation, Find,
-    /// selection and copy. Nothing edits.
+    /// selection and copy. Only form fields edit (#2255).
     pub(crate) fn pdf_key(
         &mut self,
         ev: &KeyDownEvent,
@@ -734,7 +754,7 @@ impl Docxy {
         let ctrl = m.control || m.platform;
         let taken = self
             .active_pdf_mut()
-            .is_some_and(|v| v.form_key(key, ctrl, m.alt));
+            .is_some_and(|v| v.form_key(key, m.alt));
         if taken {
             cx.notify();
             return true;

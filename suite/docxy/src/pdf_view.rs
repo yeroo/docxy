@@ -1119,8 +1119,10 @@ impl PdfView {
             .collect()
     }
 
-    /// A page's text came in: its hits join the others in page order, and
-    /// the current hit stays the same hit. Only that page is searched.
+    /// A page's text came in (or was read again after a value on it changed,
+    /// #2255): its hits replace that page's old ones, in page order; the
+    /// current hit stays the same hit, unless it was on that page, when
+    /// there is none. Only that page is searched.
     fn find_on_page(&mut self, page: usize) {
         let new = self.hits_on(page);
         let at = self.find.hits.partition_point(|h| h.page < page);

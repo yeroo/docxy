@@ -153,3 +153,20 @@ test issue 2255 closing a PDF tab with unsaved values asks, and its Save writes 
   assert reply.values.name is Bea
   call real-key {"key":"ctrl+w"}
   call real-key {"key":"ctrl+w"}
+
+test issue 2255 close-tab with a save answer writes the PDF, then closes its tab
+  open copy:"../fixtures/pdf-view-forms.pdf" as forms.pdf
+  call pdf-read {"until_drawn":[1]}
+  call pointer-click {"input":"pdf-form-field"}
+  call real-type {"text":"Cy"}
+  # The text typed goes in first; the tab closes once its save is written.
+  call close-tab {"answer":"save"}
+  call pdf-read {"until_idle":true}
+  call pdf-read {}
+  assert reply.pdf_tab is false
+  open copy:"../fixtures/pdf-view-links.pdf" as links.pdf
+  call open {"path":"forms.pdf"}
+  call pdf-read {"until_drawn":[1]}
+  assert reply.values.name is Cy
+  call real-key {"key":"ctrl+w"}
+  call real-key {"key":"ctrl+w"}

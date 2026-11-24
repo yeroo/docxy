@@ -787,9 +787,9 @@ impl Docxy {
     }
 
     /// A PDF tab with filled-in values not saved (#2255), which hot exit
-    /// cannot keep: it comes to the front with its own close prompt, and
-    /// `true` (the window stays). `false` when there is none, or when a
-    /// dialog is already up over it (that dialog is answered first).
+    /// cannot keep: `true` (the window stays) when there is one, and its own
+    /// close prompt opens; or, when a dialog is already up over it, the tab
+    /// comes to the front to answer that first. `false` when there is none.
     pub(crate) fn pdf_refusal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(i) = crate::pdf_view::host::unsaved_pdf(&self.tabs) else {
             return false;
@@ -992,10 +992,25 @@ impl Docxy {
                 // Only a harness `close-tab save` reaches here with the tab
                 // still dirty: the prompt's own Save saves first and closes
                 // a clean tab (`close_prompt_save`). A harness never opens a
-                // native dialog, so the save is over when this returns
-                // (#2194); the prompt's Save is the one that waits for it.
+                // native dialog, so a document's save is over when this
+                // returns (#2194); the prompt's Save is the one that waits
+                // for it. A PDF's is not (#2255): its worker writes the file,
+                // and the tab closes from the save's `after` once it is clean.
                 debug_assert!(self.harness, "a close's Save outside a harness");
-                self.save_active_then(crate::no_after(), window, cx);
+                let after: crate::AfterSave = if self.tabs[i].kind == Kind::Pdf {
+                    Box::new(move |this, window, cx| {
+                        if this
+                            .tabs
+                            .get(i)
+                            .is_some_and(|t| t.kind == Kind::Pdf && !t.dirty)
+                        {
+                            this.close_tab_with(i, None, window, cx);
+                        }
+                    })
+                } else {
+                    crate::no_after()
+                };
+                self.save_active_then(after, window, cx);
                 !self.tabs[i].dirty
             }
         };

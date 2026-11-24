@@ -125,10 +125,16 @@ fn info_reads_links_in_view_space() {
         } => assert!(near(*x, 100.) && near(*y, 542.)),
         other => panic!("{other:?}"),
     }
-    // A GoTo with an explicit /Fit: the page's top.
+    // A GoTo with an explicit /Fit: no point, so the page's displayed top
+    // (whatever its /Rotate: `worker::doc`'s tests).
     assert!(matches!(
         &p1[5].go,
-        LinkGo::Page { page: 1, x: None, y: Some(y), .. } if near(*y, 0.)
+        LinkGo::Page {
+            page: 1,
+            x: None,
+            y: None,
+            ..
+        }
     ));
     assert_eq!(
         p1[6].go,
@@ -841,7 +847,7 @@ fn check_radio_combo_and_list_fill_by_mouse_and_keys() {
     );
     let colour = field_index(&v, "colour");
     v.focus_widget(colour, 1);
-    assert!(v.form_key("space", false, false));
+    assert!(v.form_key("space", false));
     assert_eq!(
         sent_fills(&v).last().unwrap(),
         &("colour".to_string(), FieldValue::Widget { index: 1 })
@@ -850,8 +856,8 @@ fn check_radio_combo_and_list_fill_by_mouse_and_keys() {
     let (x, y) = widget_at(&v, "size", 0);
     v.press_at(x, y, 1, false, false);
     assert!(v.focus.as_ref().unwrap().open);
-    assert!(v.form_key("down", false, false));
-    assert!(v.form_key("down", false, false));
+    assert!(v.form_key("down", false));
+    assert!(v.form_key("down", false));
     v.form_enter(false);
     assert_eq!(
         sent_fills(&v).last().unwrap(),
@@ -859,7 +865,7 @@ fn check_radio_combo_and_list_fill_by_mouse_and_keys() {
     );
     assert!(!v.focus.as_ref().unwrap().open);
     // Closed, Up picks the one before at once.
-    assert!(v.form_key("up", false, false));
+    assert!(v.form_key("up", false));
     assert_eq!(
         sent_fills(&v).last().unwrap(),
         &("size".to_string(), FieldValue::Choice { picked: vec![1] })
@@ -898,9 +904,9 @@ fn check_radio_combo_and_list_fill_by_mouse_and_keys() {
         )
     );
     v.form.fields[tags].picked = vec![0, 2];
-    assert!(v.form_key("up", false, false), "moves the cursor only");
+    assert!(v.form_key("up", false), "moves the cursor only");
     assert_eq!(v.focus.as_ref().unwrap().cursor, 1);
-    assert!(v.form_key("space", false, false));
+    assert!(v.form_key("space", false));
     assert_eq!(
         sent_fills(&v).last().unwrap(),
         &(
@@ -1090,6 +1096,7 @@ fn lost_values_read_the_form_again_and_leave_nothing_unsaved() {
         edit: None,
         open: false,
         cursor: 0,
+        top: 0,
     });
     v.absorb(Done {
         op: Op::Text { page: 1 },
@@ -1193,15 +1200,219 @@ fn a_pdf_tabs_save_is_finished_on_the_tab() {
     let dir = Scratch::new();
     let path = copy(&dir, "forms");
     let mut tab = host::pdf_view_tab_with(&path, None, Spawn::InProcess).unwrap();
-    tab.dirty = true;
+    let crate::Surface::Pdf(v) = &mut tab.surface else {
+        unreachable!()
+    };
+    v.form_rev = 1;
     assert_eq!(host::unsaved_pdf(std::slice::from_ref(&tab)), Some(0));
     host::finish_pdf_save(&mut tab, Err("disk full".into()));
     assert!(tab.status.contains("disk full"));
-    assert!(tab.dirty, "kept");
+    host::commit_pdf_tab(&mut tab);
+    assert!(tab.dirty, "the values are still unsaved");
+    // The worker's answer to a save that wrote: the view holds nothing
+    // unsaved (`absorb`), then the tab follows it.
+    let crate::Surface::Pdf(v) = &mut tab.surface else {
+        unreachable!()
+    };
+    v.saved_rev = v.form_rev;
     let other = dir.path("other.pdf");
     host::finish_pdf_save(&mut tab, Ok(other.clone()));
     assert_eq!(tab.path.as_deref(), Some(other.as_path()));
     assert_eq!(tab.title.as_ref(), "other.pdf");
     assert!(!tab.dirty);
     assert_eq!(host::unsaved_pdf(std::slice::from_ref(&tab)), None);
+}
+
+// ---- FIX r1 (#2255) ------------------------------------------------------------------
+
+/// r1 M1: Tab finds the stop of the widget with the keys, not its field's
+/// first: a field with a widget on each of two pages, between two others,
+/// is two stops, each visited once forward, and Shift+Tab goes back the
+/// same way.
+#[test]
+fn tab_visits_each_widget_of_a_field_on_two_pages_once() {
+    let mut v = forms_view();
+    let name = field_index(&v, "name");
+    let page2 = field_index(&v, "page2");
+    let mut second = v.form.fields[name].widgets[0].clone();
+    second.page = Some(1);
+    second.rect = [200., 200., 450., 220.];
+    second.tab = 20;
+    v.form.fields[name].widgets.push(second);
+    v.form.fields[page2].widgets[0].tab = 30;
+    v.index_widgets();
+    let order = v.tab_order();
+    let n = order.len();
+    assert_eq!(order[n - 2], (name, 1));
+    assert_eq!(order[n - 1], (page2, 0));
+    let mut seen = Vec::new();
+    for _ in 0..n {
+        assert!(v.tab_field(false));
+        let f = v.focus.as_ref().unwrap();
+        seen.push((f.field, f.widget));
+    }
+    assert_eq!(seen, order, "every stop once, in order");
+    let mut back = Vec::new();
+    for _ in 0..n {
+        assert!(v.tab_field(true));
+        let f = v.focus.as_ref().unwrap();
+        back.push((f.field, f.widget));
+    }
+    let mut want: Vec<_> = order.clone();
+    want.rotate_right(1);
+    want.reverse();
+    assert_eq!(back, want, "Shift+Tab goes back the same way");
+}
+
+/// r1 M2: an open combo box's list shows 12 rows at a time, following the
+/// keys' cursor past the 12th option, and the wheel scrolls it.
+#[test]
+fn a_long_combo_lists_window_follows_the_cursor_and_the_wheel() {
+    use super::form::LIST_ROWS;
+    let mut v = forms_view();
+    let size = field_index(&v, "size");
+    v.form.fields[size].options = (1..=20)
+        .map(|i| (format!("o{i}"), format!("Option {i}")))
+        .collect();
+    v.focus_widget(size, 0);
+    assert!(v.form_key("f4", false));
+    assert_eq!(v.list_window(), 0..LIST_ROWS);
+    for _ in 0..14 {
+        assert!(v.form_key("down", false));
+    }
+    assert_eq!(v.focus.as_ref().unwrap().cursor, 14);
+    assert!(v.list_window().contains(&14), "{:?}", v.list_window());
+    assert_eq!(v.list_window(), 3..15);
+    v.list_scroll(100);
+    assert_eq!(v.list_window(), 8..20, "the last 12");
+    v.list_scroll(-100);
+    assert_eq!(v.list_window(), 0..12);
+    // Option 15 is picked by its row (the list's click picks by index).
+    v.pick(14, false);
+    assert_eq!(
+        sent_fills(&v).last().unwrap(),
+        &("size".to_string(), FieldValue::Choice { picked: vec![14] })
+    );
+}
+
+/// r1 M3: Save As adds `.pdf` to a name without an extension, keeps a
+/// `.pdf` one, and refuses any other instead of writing over another name.
+#[test]
+fn save_as_takes_a_pdf_name_only() {
+    use super::host::pdf_save_as_target;
+    let p = |s: &str| PathBuf::from(s);
+    assert_eq!(pdf_save_as_target(p("/d/form")).unwrap(), p("/d/form.pdf"));
+    assert_eq!(
+        pdf_save_as_target(p("/d/form.PDF")).unwrap(),
+        p("/d/form.PDF")
+    );
+    assert!(pdf_save_as_target(p("/d/invoice.final")).is_err());
+    assert!(pdf_save_as_target(p("/d/Form v1.2")).is_err());
+}
+
+/// r1 M4: a field entered again before its fill was answered shows the
+/// value on its way, and leaving it sends nothing more; the answer then
+/// changes nothing. An editable combo box's pick is not sent again as text.
+#[test]
+fn a_field_entered_again_before_its_answer_keeps_the_value_on_its_way() {
+    let mut v = forms_view();
+    let name = field_index(&v, "name");
+    v.focus_widget(name, 0);
+    v.edit_text(crate::field_edit::Op::Insert("Ada"));
+    assert!(v.tab_field(false));
+    assert!(v.tab_field(true));
+    let e = v.focus.as_ref().unwrap().edit.as_ref().unwrap();
+    assert_eq!(e.text, "Ada");
+    assert!(!v.has_unsaved() || v.fills_waiting());
+    assert!(v.tab_field(false));
+    assert_eq!(
+        sent_fills(&v),
+        [("name".to_string(), text("Ada"))],
+        "sent once"
+    );
+    // The answer comes; Shift+Tab, Tab: still nothing more.
+    let op = v.form_ops.pop_front().unwrap();
+    let st = state_with(&v, "name", "Ada", vec![0]);
+    v.absorb(Done {
+        op,
+        answer: Answer::Form(st),
+        lost: false,
+    });
+    assert!(v.tab_field(true));
+    assert!(v.tab_field(false));
+    assert!(sent_fills(&v).is_empty());
+    // An editable combo box: a pick, then Tab before its answer.
+    let city = field_index(&v, "city");
+    v.focus_widget(city, 0);
+    v.pick(1, false);
+    assert!(v.tab_field(false));
+    assert_eq!(
+        sent_fills(&v),
+        [("city".to_string(), FieldValue::Choice { picked: vec![1] })],
+        "no text fill after the pick"
+    );
+}
+
+/// r1: a full field with a MaxLen refuses a keystroke (nothing is cut off
+/// its end), and a paste goes in only as far as there is room.
+#[test]
+fn a_full_field_refuses_a_keystroke() {
+    let mut v = forms_view();
+    let code = field_index(&v, "code");
+    v.focus_widget(code, 0);
+    v.edit_text(crate::field_edit::Op::Insert("abcde"));
+    let edit = |v: &PdfView| {
+        v.focus
+            .as_ref()
+            .unwrap()
+            .edit
+            .as_ref()
+            .unwrap()
+            .text
+            .clone()
+    };
+    assert_eq!(edit(&v), "abcde");
+    v.edit_text(crate::field_edit::Op::Insert("xyz"));
+    assert_eq!(edit(&v), "abcdex", "one fits");
+    v.edit_text(crate::field_edit::Op::Home);
+    v.edit_text(crate::field_edit::Op::Insert("q"));
+    assert_eq!(edit(&v), "abcdex", "full: refused, nothing cut");
+    v.edit_text(crate::field_edit::Op::SelectAll);
+    v.edit_text(crate::field_edit::Op::Insert("123456789"));
+    assert_eq!(
+        edit(&v),
+        "123456",
+        "a selection is replaced, as far as it fits"
+    );
+}
+
+/// r1: a save the worker failed keeps every value unsaved and says why.
+#[test]
+fn a_failed_save_keeps_the_values_unsaved() {
+    let mut v = forms_view();
+    let name = field_index(&v, "name");
+    v.fill(name, text("Ada"));
+    let op = v.form_ops.pop_front().unwrap();
+    let st = state_with(&v, "name", "Ada", vec![0]);
+    v.absorb(Done {
+        op,
+        answer: Answer::Form(st),
+        lost: false,
+    });
+    let path = v.path.clone();
+    v.pending_save = Some(PendingSave {
+        after: None,
+        outcome: None,
+    });
+    v.absorb(Done {
+        op: Op::SaveTo { path: path.clone() },
+        answer: Answer::Failed("disk full".into()),
+        lost: false,
+    });
+    assert!(v.unsaved());
+    assert_eq!(
+        v.pending_save.as_ref().unwrap().outcome,
+        Some(Err("disk full".to_string()))
+    );
+    assert_eq!(v.path, path);
 }

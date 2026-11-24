@@ -699,15 +699,19 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let mut out = Vec::new();
-        if let Some((x, y, w, rows)) = combo_list(v, l, k) {
+        if let Some((x, y, w)) = combo_list(v, l, k) {
             let focus = v.focus.as_ref();
             let field = focus.and_then(|f| v.field(f.field));
+            // The rows the list shows (#2255 r1): a window of the options
+            // that follows the keys' cursor and scrolls by the wheel.
+            let window = v.list_window();
             let items: Vec<AnyElement> = field
                 .map(|f| f.options.clone())
                 .unwrap_or_default()
                 .into_iter()
                 .enumerate()
-                .take(rows)
+                .skip(window.start)
+                .take(window.len())
                 .map(|(i, (_, text))| {
                     let on = focus.is_some_and(|f| f.cursor == i);
                     div()
@@ -743,6 +747,17 @@ impl Docxy {
                     .border_color(rgb_u(0x6B7280))
                     .shadow_md()
                     .children(items)
+                    .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _w, cx| {
+                        let dy = match ev.delta {
+                            ScrollDelta::Lines(p) => p.y,
+                            ScrollDelta::Pixels(p) => f32::from(p.y) / OPTION_ROW,
+                        };
+                        let rows = (-dy).round() as i32;
+                        if rows != 0 {
+                            cx.stop_propagation();
+                            this.with_pdf(cx, |v| v.list_scroll(rows));
+                        }
+                    }))
                     .into_any_element(),
             );
         }
@@ -807,9 +822,9 @@ impl Docxy {
     }
 }
 
-/// Where the focused combo box's open list goes (content px): left, top,
-/// width, and how many rows.
-pub(crate) fn combo_list(v: &PdfView, l: &super::Layout, k: f32) -> Option<(f32, f32, f32, usize)> {
+/// Where the focused combo box's open list goes (content px): left, top
+/// and width; its rows are [`PdfView::list_window`].
+pub(crate) fn combo_list(v: &PdfView, l: &super::Layout, k: f32) -> Option<(f32, f32, f32)> {
     let focus = v.focus.as_ref().filter(|f| f.open)?;
     let field = v
         .field(focus.field)
@@ -821,7 +836,6 @@ pub(crate) fn combo_list(v: &PdfView, l: &super::Layout, k: f32) -> Option<(f32,
         pr.x + r[0] * k,
         pr.y + r[3] * k,
         ((r[2] - r[0]) * k).max(80.),
-        field.options.len().min(12),
     ))
 }
 

@@ -366,11 +366,14 @@ fn no_corpus_file_or_mutation_crashes_or_hangs_the_parent() {
             files.push(p);
         }
     }
+    // Saves go here, never next to a corpus file.
+    let saves = dir.path("saved");
+    std::fs::create_dir_all(&saves).unwrap();
     let files = Arc::new(Mutex::new(files));
     let tally = Arc::new(Mutex::new((0usize, 0usize, Vec::<String>::new())));
     let threads: Vec<_> = (0..6)
         .map(|_| {
-            let (files, tally) = (files.clone(), tally.clone());
+            let (files, tally, saves) = (files.clone(), tally.clone(), saves.clone());
             std::thread::spawn(move || {
                 loop {
                     let Some(path) = files.lock().unwrap().pop() else {
@@ -406,7 +409,8 @@ fn no_corpus_file_or_mutation_crashes_or_hangs_the_parent() {
                         ask(Op::Text { page });
                     }
                     // A form's mutations are filled and saved too (#2255),
-                    // to a file of their own: the bytes, whatever they are.
+                    // to a file of their own in the scratch folder: the
+                    // bytes, whatever they are.
                     if let Some(f) = m.form.fields.iter().find(|f| f.fillable()) {
                         let value = match f.kind {
                             FieldKind::Check | FieldKind::Radio => FieldValue::Widget { index: 0 },
@@ -420,7 +424,7 @@ fn no_corpus_file_or_mutation_crashes_or_hangs_the_parent() {
                             value,
                         });
                         ask(Op::SaveTo {
-                            path: path.with_extension("saved.pdf"),
+                            path: saves.join(path.file_name().unwrap_or_default()),
                         });
                     }
                 }

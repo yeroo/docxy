@@ -8259,12 +8259,7 @@ fn dispatch_verb(
                     Some(b) if !given.is_absolute() => b.join(given),
                     _ => given,
                 };
-                if !target
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
-                {
-                    return Err("a PDF tab is saved as a .pdf".into());
-                }
+                let target = crate::pdf_view::host::pdf_save_as_target(target)?;
                 if target.exists() && !overwrite {
                     return Err(format!(
                         "{} already exists; pass \"overwrite\": true to replace it",
