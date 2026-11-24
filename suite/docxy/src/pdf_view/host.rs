@@ -617,6 +617,7 @@ impl Docxy {
             self.set_status(PDF_SAVE_AS_HARNESS);
             return self.refocus(window, cx);
         }
+        let id = self.active_tab_id();
         let mut dialog = rfd::FileDialog::new()
             .add_filter("PDF", &["pdf"])
             .set_file_name(tab.title.to_string());
@@ -626,8 +627,10 @@ impl Docxy {
         self.native_dialog(
             dialog,
             |d| d.save_file(),
-            |this, target, window, cx| {
-                let Some(target) = target else {
+            move |this, target, window, cx| {
+                // Not the tab that asked (the window is disabled while the
+                // dialog is up, so this is defence): nothing to save.
+                let Some(target) = target.filter(|_| this.active_tab_is(&id)) else {
                     return this.refocus(window, cx);
                 };
                 match pdf_save_as_target(target) {
@@ -805,7 +808,17 @@ impl Docxy {
                     .active_pdf()
                     .and_then(|v| v.focus.as_ref().and_then(|f| v.field(f.field)))
                     .is_some_and(|f| f.multiline);
-                if let Some(text) = self.field_paste(!multiline, cx) {
+                // A multi-line field keeps the pasted line breaks; a
+                // one-line field takes the text as one line, as every other.
+                let text = if multiline {
+                    match self.clipboard_read(cx) {
+                        ClipRead::Text(t) => Some(crate::field_edit::multi_line(&t)),
+                        _ => None,
+                    }
+                } else {
+                    self.field_paste(false, cx)
+                };
+                if let Some(text) = text.filter(|t| !t.is_empty()) {
                     self.with_pdf(cx, |v| v.edit_text(crate::field_edit::Op::Insert(&text)));
                 }
             }

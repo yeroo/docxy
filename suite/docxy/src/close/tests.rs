@@ -4206,3 +4206,65 @@ fn a_pdf_tabs_close_prompt_is_the_plain_one() {
     let labels: Vec<&str> = d.buttons.iter().map(|b| b.label.as_str()).collect();
     assert_eq!(labels, ["Save", "Don't Save", "Cancel"]);
 }
+
+/// A PDF tab on a scratch copy of the forms corpus file, with values not
+/// yet saved when `dirty`.
+fn pdf_tab(dir: &crate::open_mode_tests::Scratch, dirty: bool) -> DocTab {
+    let path = dir.path(if dirty { "dirty.pdf" } else { "clean.pdf" });
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pdf-view/forms.pdf"),
+        &path,
+    )
+    .unwrap();
+    let mut tab = crate::pdf_view::host::pdf_view_tab_with(
+        &path,
+        None,
+        crate::pdf_view::worker::Spawn::InProcess,
+    )
+    .unwrap();
+    if dirty && let Surface::Pdf(v) = &mut tab.surface {
+        v.form_rev = 1;
+    }
+    tab
+}
+
+/// #2255 r2: hot exit keeps no PDF values, so a window close or Quit that
+/// would not ask ("ask before closing" off) stops for a PDF tab with values
+/// not saved, and only then; the tab's close then asks with its own
+/// prompt, and a clean one just closes. Both close.rs sites decide through
+/// `pdf_stops_close`.
+#[test]
+fn a_close_that_would_not_ask_stops_for_a_pdf_tab_with_unsaved_values() {
+    let dir = crate::open_mode_tests::Scratch::new();
+    let mut tabs = vec![tab(Kind::Docx), pdf_tab(&dir, true), pdf_tab(&dir, false)];
+    assert_eq!(pdf_stops_close(false, &tabs), Some(1));
+    assert_eq!(
+        pdf_stops_close(true, &tabs),
+        None,
+        "a close that asks asks about it"
+    );
+    assert_eq!(close_step(&mut tabs[1], None), CloseStep::Ask);
+    assert_eq!(
+        close_prompt(&tabs[1], true, &[]).id,
+        catalog::PDF_SAVE_ON_CLOSE
+    );
+    assert_eq!(close_step(&mut tabs[2], None), CloseStep::Remove);
+    // Saved, nothing stops the close.
+    if let Surface::Pdf(v) = &mut tabs[1].surface {
+        v.saved_rev = v.form_rev;
+    }
+    tabs[1].dirty = false;
+    assert_eq!(pdf_stops_close(false, &tabs), None);
+    // Text typed into a field and not yet committed counts.
+    if let Surface::Pdf(v) = &mut tabs[2].surface {
+        let name = v.form.fields.iter().position(|f| f.name == "name").unwrap();
+        v.focus_widget(name, 0);
+        v.edit_text(crate::field_edit::Op::Insert("x"));
+    }
+    assert_eq!(pdf_stops_close(false, &tabs), Some(2));
+    assert_eq!(
+        close_step(&mut tabs[2], None),
+        CloseStep::Ask,
+        "committed, then asked"
+    );
+}

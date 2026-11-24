@@ -739,7 +739,13 @@ existing other file. A tab whose Save is Save As (opened read-only, repaired
 or converted) proposes `<name> (copy)` beside its file and refuses its own
 file's name. Under the harness the only location offered after the tab's own folder
 is the sandbox. A workbook or a Project asks `Save changes to <title> before
-closing?`. A tab with another dialog open is not closed: it comes to the
+closing?`. A PDF tab (#2255) asks the same plain question as
+`dialog is pdf-save-on-close`, whose Save writes its form values in place.
+Its worker writes the file, so with `{"answer":"save"}` the verb replies
+before the file is written, and the tab closes once the save is over: a case
+waits with `pdf-read {"until_idle":true}`. With `ask-on-close` off,
+`close-window` stops for a PDF tab with values not saved (hot exit cannot
+keep them) and opens that tab's close prompt. A tab with another dialog open is not closed: it comes to the
 front with `Close the open dialog first`.
 An optional `index` targets an inactive tab; it defaults to the active tab.
 `call backstage-close {}` calls the Backstage Close handler without supplying

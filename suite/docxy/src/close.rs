@@ -300,6 +300,18 @@ pub(crate) fn prepare_sheet_save(tab: &mut DocTab) -> Result<(), String> {
     commit_changed_cell(tab)
 }
 
+/// The PDF tab a window close or Quit stops for (#2255): when the close
+/// would not ask (`asked` false, "ask before closing" off), the first PDF
+/// tab with values hot exit cannot keep. A close that asks asks about it
+/// with the rest.
+pub(crate) fn pdf_stops_close(asked: bool, tabs: &[DocTab]) -> Option<usize> {
+    if asked {
+        None
+    } else {
+        crate::pdf_view::host::unsaved_pdf(tabs)
+    }
+}
+
 /// What closing `tab` does: `answer` is how a dirty tab was answered, or
 /// `None` when it has not been asked yet.
 fn close_step(tab: &mut DocTab, answer: Option<CloseAnswer>) -> CloseStep {
@@ -786,12 +798,19 @@ impl Docxy {
         (0..self.tabs.len()).any(|i| !self.ext_ask(i, window, cx))
     }
 
-    /// A PDF tab with filled-in values not saved (#2255), which hot exit
-    /// cannot keep: `true` (the window stays) when there is one, and its own
-    /// close prompt opens; or, when a dialog is already up over it, the tab
-    /// comes to the front to answer that first. `false` when there is none.
-    pub(crate) fn pdf_refusal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(i) = crate::pdf_view::host::unsaved_pdf(&self.tabs) else {
+    /// A window close or Quit that would not ask (`asked` false) and a PDF
+    /// tab with filled-in values not saved (#2255), which hot exit cannot
+    /// keep: `true` (the window stays) when there is one, and its own close
+    /// prompt opens; or, when a dialog is already up over it, the tab comes
+    /// to the front to answer that first. `false` when the close asks
+    /// anyway, or there is none ([`pdf_stops_close`]).
+    pub(crate) fn pdf_refusal(
+        &mut self,
+        asked: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(i) = pdf_stops_close(asked, &self.tabs) else {
             return false;
         };
         if self.tabs[i].dialogs.is_open() {
@@ -1263,8 +1282,7 @@ impl Docxy {
         // "ask before closing" off, the window stays and the PDF tab's own
         // close prompt asks.
         if ask != CloseAsk::HarnessQuit
-            && !asks(ask, self.ask_on_close)
-            && self.pdf_refusal(window, cx)
+            && self.pdf_refusal(asks(ask, self.ask_on_close), window, cx)
         {
             return false;
         }
@@ -1309,7 +1327,7 @@ impl Docxy {
         // judged to hold: the tab may have taken work while another window
         // asked its questions.
         if self.ext_refusal(window, cx)
-            || (!quit_asks(self.ask_on_close, self.harness) && self.pdf_refusal(window, cx))
+            || self.pdf_refusal(quit_asks(self.ask_on_close, self.harness), window, cx)
         {
             self.quit_agreed = None;
             if self.quitting {

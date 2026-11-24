@@ -305,6 +305,42 @@ fn values_a_new_child_cannot_take_are_dropped_and_never_tried_again() {
     assert_eq!(w.started, 3);
 }
 
+/// #2255 r2: a child that dies after values were set, when the file was
+/// changed on disk meanwhile, gives the new one no values (they were filled
+/// into the file as it was): they are dropped and said once, and a save in
+/// place then leaves the other program's bytes as they are.
+#[test]
+fn a_new_child_on_a_changed_file_gets_no_values() {
+    let dir = Scratch::new();
+    let path = dir.path("forms.pdf");
+    std::fs::copy(corpus_path("forms"), &path).unwrap();
+    let mut w = Worker::new(&path, test_child(&path, LONG, Some("abort-on-text")), LONG);
+    assert!(matches!(w.ask(&Op::Info), Answer::Info(_)));
+    let set = Op::SetField {
+        name: "name".into(),
+        value: FieldValue::Text { text: "Ada".into() },
+    };
+    assert!(matches!(w.ask(&set), Answer::Form(_)));
+    let mut changed = std::fs::read(&path).unwrap();
+    changed.extend_from_slice(b"\n% another program was here\n");
+    std::fs::write(&path, &changed).unwrap();
+    assert!(matches!(w.ask(&Op::Text { page: 0 }), Answer::Failed(_)));
+    assert_eq!(name_of(&mut w), "", "nothing replayed");
+    assert!(w.take_lost());
+    assert!(w.edits().is_empty());
+    // The new child read the changed file: a save in place writes it as it
+    // is, never the values filled into the old one.
+    assert!(matches!(
+        w.ask(&Op::SaveTo { path: path.clone() }),
+        Answer::Saved(_)
+    ));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        changed,
+        "the other program's bytes"
+    );
+}
+
 /// A small, seeded generator: the mutated set is the same on every run.
 struct Rng(u64);
 

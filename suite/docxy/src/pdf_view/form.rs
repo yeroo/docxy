@@ -354,16 +354,7 @@ impl PdfView {
         let Some(f) = self.field(field) else {
             return String::new();
         };
-        let waiting = self
-            .form_ops
-            .iter()
-            .rev()
-            .chain(self.in_flight.as_ref())
-            .find_map(|op| match op {
-                Op::SetField { name, value } if *name == f.name => Some(value),
-                _ => None,
-            });
-        match waiting {
+        match self.expected_value(field) {
             Some(FieldValue::Text { text }) => text.clone(),
             Some(FieldValue::Choice { picked }) => picked
                 .first()
@@ -371,6 +362,44 @@ impl PdfView {
                 .map(|o| o.1.clone())
                 .unwrap_or_default(),
             _ => shown_text(f),
+        }
+    }
+
+    /// The last fill of field `field` still on its way: queued, else out
+    /// with the worker (newest first). What a key or click builds on, so a
+    /// quick second one does not start again from the value before the
+    /// first (#2255 r2).
+    pub(crate) fn expected_value(&self, field: usize) -> Option<&FieldValue> {
+        let f = self.field(field)?;
+        self.form_ops
+            .iter()
+            .rev()
+            .chain(self.in_flight.as_ref())
+            .find_map(|op| match op {
+                Op::SetField { name, value } if *name == f.name => Some(value),
+                _ => None,
+            })
+    }
+
+    /// Whether widget `w` of field `f` will be on once the fills on their
+    /// way are in.
+    fn widget_on_expected(&self, f: usize, w: usize) -> bool {
+        match self.expected_value(f) {
+            Some(FieldValue::Check { on }) => *on,
+            Some(FieldValue::Widget { index }) => *index == w,
+            _ => self
+                .field(f)
+                .and_then(|x| x.widgets.get(w))
+                .is_some_and(|x| x.on),
+        }
+    }
+
+    /// The options field `f` will have picked once the fills on their way
+    /// are in.
+    fn picked_expected(&self, f: usize) -> Vec<usize> {
+        match self.expected_value(f) {
+            Some(FieldValue::Choice { picked }) => picked.clone(),
+            _ => self.field(f).map(|x| x.picked.clone()).unwrap_or_default(),
         }
     }
 
@@ -480,10 +509,10 @@ impl PdfView {
     /// A check box turned over, or a radio button turned on.
     pub(crate) fn toggle(&mut self, f: usize, w: usize) {
         let Some(field) = self.field(f) else { return };
-        let Some(widget) = field.widgets.get(w) else {
+        if field.widgets.get(w).is_none() {
             return;
-        };
-        let value = match (field.kind, widget.on) {
+        }
+        let value = match (field.kind, self.widget_on_expected(f, w)) {
             (FieldKind::Check, true) => FieldValue::Check { on: false },
             (FieldKind::Check | FieldKind::Radio, false) => FieldValue::Widget { index: w },
             // A radio button on stays on.
@@ -503,9 +532,10 @@ impl PdfView {
         focus.open = false;
         let field = focus.field;
         let Some(f) = self.field(field) else { return };
+        let before = self.picked_expected(field);
         let mut picked = vec![option];
         if f.kind == FieldKind::List && f.multi && ctrl {
-            picked = f.picked.clone();
+            picked = before.clone();
             match picked.iter().position(|p| *p == option) {
                 Some(i) => {
                     picked.remove(i);
@@ -524,7 +554,7 @@ impl PdfView {
                 .unwrap_or_default();
             e.focus_all();
         }
-        if self.field(field).is_some_and(|f| f.picked != picked) {
+        if before != picked {
             self.fill(field, FieldValue::Choice { picked });
         }
     }
@@ -723,7 +753,10 @@ impl PdfView {
                 let cur = if focus.open || f.kind == FieldKind::List {
                     focus.cursor
                 } else {
-                    f.picked.first().copied().unwrap_or(focus.cursor)
+                    self.picked_expected(focus.field)
+                        .first()
+                        .copied()
+                        .unwrap_or(focus.cursor)
                 };
                 let next = if key == "down" {
                     (cur + 1).min(n - 1)

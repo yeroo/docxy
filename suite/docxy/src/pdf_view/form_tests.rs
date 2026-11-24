@@ -1416,3 +1416,49 @@ fn a_failed_save_keeps_the_values_unsaved() {
     );
     assert_eq!(v.path, path);
 }
+
+/// #2255 r2: a quick second toggle, Ctrl pick or Up/Down builds on the
+/// first one still on its way, not on the value before it.
+#[test]
+fn quick_repeats_build_on_the_fills_on_their_way() {
+    let mut v = forms_view();
+    let agree = field_index(&v, "agree");
+    v.focus_widget(agree, 0);
+    assert!(v.form_key("space", false));
+    assert!(v.form_key("space", false));
+    assert_eq!(
+        sent_fills(&v),
+        [
+            ("agree".to_string(), FieldValue::Widget { index: 0 }),
+            ("agree".to_string(), FieldValue::Check { on: false })
+        ],
+        "on, then off again"
+    );
+    v.form_ops.clear();
+    let tags = field_index(&v, "tags");
+    v.focus_widget(tags, 0);
+    v.pick(0, true);
+    v.pick(2, true);
+    assert_eq!(
+        sent_fills(&v).last().unwrap(),
+        &(
+            "tags".to_string(),
+            FieldValue::Choice { picked: vec![0, 2] }
+        ),
+        "the first pick kept"
+    );
+    v.form_ops.clear();
+    let size = field_index(&v, "size");
+    v.focus_widget(size, 0);
+    assert!(v.form_key("down", false));
+    assert!(v.form_key("down", false));
+    let picks: Vec<_> = sent_fills(&v).into_iter().map(|(_, x)| x).collect();
+    assert_eq!(
+        picks,
+        [
+            FieldValue::Choice { picked: vec![1] },
+            FieldValue::Choice { picked: vec![2] }
+        ],
+        "two steps, not the same one twice"
+    );
+}

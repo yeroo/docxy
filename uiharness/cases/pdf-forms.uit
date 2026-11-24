@@ -170,3 +170,23 @@ test issue 2255 close-tab with a save answer writes the PDF, then closes its tab
   assert reply.values.name is Cy
   call real-key {"key":"ctrl+w"}
   call real-key {"key":"ctrl+w"}
+
+test issue 2255 with ask before closing off, closing the window stops for a PDF tab with unsaved values
+  open copy:"../fixtures/pdf-view-forms.pdf" as forms.pdf
+  call pdf-read {"until_drawn":[1]}
+  call pointer-click {"input":"pdf-form-field"}
+  call real-type {"text":"Di"}
+  call ask-on-close {"on":false}
+  assert ask_on_close is false
+  # Hot exit cannot keep the values: the last window's close (the app's
+  # quit) is refused, and the PDF tab's own close prompt asks.
+  call close-window {}
+  assert windows is 1
+  assert dialog is pdf-save-on-close
+  call dialog-click {"button":"Cancel"}
+  assert dialog is none
+  call pdf-read {}
+  assert reply.unsaved is true
+  call close-tab {"answer":"discard"}
+  call pdf-read {}
+  assert reply.pdf_tab is false

@@ -8254,10 +8254,17 @@ fn dispatch_verb(
             // A PDF tab is saved as a PDF (#2255), by its worker: the reply
             // says it is on its way (`pdf-read until_idle` waits for it).
             if tab.kind == crate::Kind::Pdf {
+                // `save_as_target`'s refusals for a path, the same words.
+                if raw.trim().is_empty() {
+                    return Err("save-as needs a non-empty 'path'".into());
+                }
                 let given = PathBuf::from(raw.trim());
                 let target = match base {
-                    Some(b) if !given.is_absolute() => b.join(given),
-                    _ => given,
+                    _ if given.is_absolute() => given,
+                    Some(b) => b.join(given),
+                    None => {
+                        return Err("this tab has never been saved, so a relative 'path' has no folder: give an absolute path".into());
+                    }
                 };
                 let target = crate::pdf_view::host::pdf_save_as_target(target)?;
                 if target.exists() && !overwrite {
