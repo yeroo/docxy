@@ -1105,19 +1105,21 @@ fn save_target(path: &Path) -> Result<PathBuf, String> {
 }
 
 /// Write the plan to `path` by its type's writer, handing `source` (the
-/// file it was opened from) to a save of that file's type.
+/// file it was opened from) to a save of that file's type. Also returns what
+/// that type loses ([`projcore::formats::Registry::save_note`]).
 fn write_project(
     ed: &ProjectEditor,
     path: &Path,
     source: Option<&Source>,
-) -> Result<(PathBuf, usize), String> {
+) -> Result<(PathBuf, usize, Option<String>), String> {
     let path = save_target(path)?;
     let source = source.and_then(|s| s.for_target(&path));
-    let bytes = project_formats::global()
-        .registry
-        .write(ed.project(), &path, source)?;
+    let registry = &project_formats::global().registry;
+    let bytes = registry.write(ed.project(), &path, source)?;
     opccore::fsio::write_atomic(&path, &bytes).map_err(|e| format!("save failed: {e}"))?;
-    Ok((path, bytes.len()))
+    // What the type does not keep (#1618), said once the save has succeeded.
+    let note = registry.save_note(ed.project(), &path);
+    Ok((path, bytes.len(), note))
 }
 
 #[derive(Debug, PartialEq)]
@@ -1164,13 +1166,17 @@ pub(super) fn apply_save(tab: &mut DocTab, target: &Path) -> Result<usize, Strin
         _ => Err("This project could not be loaded and cannot be saved".into()),
     };
     match result {
-        Ok((path, n)) => {
+        Ok((path, n, note)) => {
             if let Surface::Project(v) = &mut tab.surface {
                 v.ed.commit_save();
             }
             tab.dirty = false;
             tab.title = file_name(&path).into();
-            tab.status = format!("saved {n} bytes → {}", path.display()).into();
+            let mut status = format!("saved {n} bytes → {}", path.display());
+            if let Some(note) = note {
+                status.push_str(&format!(". {note}"));
+            }
+            tab.status = status.into();
             tab.path = Some(path);
             Ok(n)
         }
