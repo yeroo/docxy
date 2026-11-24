@@ -28695,7 +28695,7 @@ impl Docxy {
             return Err("no tab is open".into());
         }
         let prev = self.tabs[self.active].path.clone();
-        let result = apply_save(&mut self.tabs[self.active], target);
+        let result = apply_save(&mut self.tabs[self.active], target).map(|(n, _)| n);
         self.note_recent_if_moved(prev);
         self.backstage = false;
         self.bs_new = false;

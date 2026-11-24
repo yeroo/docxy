@@ -1057,7 +1057,11 @@ fn an_xml_save_says_display_on_timeline_is_not_saved() {
         .set_display_on_timeline(1, true)
         .unwrap();
     let xml = dir.path("plan.xml");
-    let n = apply_save(&mut tab, &xml).unwrap();
+    let (n, note) = apply_save(&mut tab, &xml).unwrap();
+    assert!(
+        note.unwrap()
+            .starts_with("Display on Timeline is not saved")
+    );
     assert_eq!(
         tab.status.as_ref(),
         format!(
@@ -1073,7 +1077,8 @@ fn an_xml_save_says_display_on_timeline_is_not_saved() {
         mspdi::write_mspdi(view(&tab).ed.project()).into_bytes()
     );
     let native = dir.path("plan.yppx");
-    let n = apply_save(&mut tab, &native).unwrap();
+    let (n, note) = apply_save(&mut tab, &native).unwrap();
+    assert_eq!(note, None);
     assert_eq!(
         tab.status.as_ref(),
         format!("saved {n} bytes → {}", native.display())

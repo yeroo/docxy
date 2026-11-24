@@ -661,6 +661,26 @@ fn proj_save_takes_a_format_plugins_type() {
     );
 }
 
+/// #1618: `proj.save` to a type that drops Display on Timeline says so in
+/// `note`; a `.yppx` save's reply has no `note`.
+#[test]
+fn proj_save_returns_the_note_of_what_the_type_drops() {
+    let dir = scratch();
+    let mut tabs = vec![tab()];
+    vm(&mut tabs[0])
+        .ed
+        .set_display_on_timeline(1, true)
+        .unwrap();
+    let (info, _) = call(&mut tabs, 0, "proj.save", path_args(&dir.join("plan.xml"))).unwrap();
+    assert_eq!(
+        info.get("note").and_then(Json::as_str),
+        Some("Display on Timeline is not saved in .xml files; save as .yppx to keep it")
+    );
+    let (info, _) = call(&mut tabs, 0, "proj.save", path_args(&dir.join("plan.yppx"))).unwrap();
+    assert!(info.get("note").is_none());
+    assert!(info.get("path").is_some());
+}
+
 #[test]
 fn reload_commits_only_a_successful_load() {
     let dir = scratch();

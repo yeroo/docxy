@@ -1153,7 +1153,12 @@ pub(super) fn save_decision(tab: &DocTab, harness: bool, explicit_save_as: bool)
     }
 }
 
-pub(super) fn apply_save(tab: &mut DocTab, target: &Path) -> Result<usize, String> {
+/// Save the tab's plan to `target`: the bytes written and what the type
+/// does not keep (`Registry::save_note`, #1618), which the status also says.
+pub(super) fn apply_save(
+    tab: &mut DocTab,
+    target: &Path,
+) -> Result<(usize, Option<String>), String> {
     // Levelling changes only the displayed dates, not what is written, but a
     // pass asked for runs first so the save's message is the last word and
     // the tab it reports on is settled.
@@ -1173,12 +1178,12 @@ pub(super) fn apply_save(tab: &mut DocTab, target: &Path) -> Result<usize, Strin
             tab.dirty = false;
             tab.title = file_name(&path).into();
             let mut status = format!("saved {n} bytes → {}", path.display());
-            if let Some(note) = note {
+            if let Some(note) = &note {
                 status.push_str(&format!(". {note}"));
             }
             tab.status = status.into();
             tab.path = Some(path);
-            Ok(n)
+            Ok((n, note))
         }
         Err(e) => {
             tab.status = e.clone().into();
