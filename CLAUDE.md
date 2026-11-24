@@ -353,7 +353,7 @@ Restated from the area notes, which hold the detail:
   replayed). A mouse-down anywhere (a window listener from `key_routing`)
   flushes the queue first, AltGr keys typing then: a press within
   `WM_CHAR_WAIT` of an AltGr dead key types its accent (a key-down cannot
-  tell it from a character) unless the next key's text starts with it.
+  tell it from a character) unless the plain key right after it carries it.
   Other keys reach `on_key` at once and owe
   their text; without the root's focus they owe nothing (no handler, no
   WM_CHAR). A character's candidates are the leading entries not sure to be

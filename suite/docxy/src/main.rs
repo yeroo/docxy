@@ -49662,7 +49662,12 @@ impl Render for Docxy {
             // A press anywhere but in the Name Box takes the keyboard from it
             // (#1343): the ribbon, the headers, the sheet tabs and the rest stop
             // their events below, so it is asked while the press is captured.
-            .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+            .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                // Windows: first the keys still waiting for their WM_CHAR,
+                // which may be typing into the Name Box (#1277). A div's own
+                // listeners run before its children's, so this runs before
+                // `key_routing`'s window listener does.
+                this.flush_wm_chars(window, cx);
                 let inside = this
                     .probes
                     .borrow()
@@ -49833,7 +49838,11 @@ impl KeyRouting for Div {
                 // Windows: the keys still waiting for their WM_CHAR act before
                 // a press, on either root (#1277). A window listener, as an
                 // element's runs only while its hitbox is hovered, which an
-                // open dialog's or a flyout's occluding backdrop stops.
+                // open dialog's or a flyout's occluding backdrop stops. It
+                // runs after the root's own capture listeners (painted before
+                // this child), so one that acts on a press flushes first
+                // itself (the main root's Name Box closer); the listeners of
+                // the root's later children run after it.
                 if text_input::WINDOWS {
                     window.on_mouse_event(move |_: &MouseDownEvent, phase, window, cx| {
                         if phase == DispatchPhase::Capture {

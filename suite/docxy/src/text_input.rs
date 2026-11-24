@@ -70,8 +70,9 @@
 //! both roots register) releases every held key first, an AltGr key typing
 //! its character then, so a click acts after the keys before it. A key-down
 //! cannot tell an AltGr dead key from an AltGr character, so a press within
-//! `WM_CHAR_WAIT` of an AltGr dead key types its accent, unless the next
-//! key's text starts with it (Space carrying the accent). A packet's text
+//! `WM_CHAR_WAIT` of an AltGr dead key types its accent, unless the key
+//! right after it is a plain key whose text starts with it (Space carrying
+//! the accent). A packet's text
 //! against a command sent
 //! after it is not ordered: gpui hides the packet's key-down. The handler
 //! never accepts text input there ([`accepts_text_input`]), so the Windows
@@ -630,8 +631,10 @@ impl WmChars {
     /// after the drain that carried the press, is dropped. A key-down cannot
     /// tell an AltGr dead key from an AltGr character, so a press within
     /// [`WM_CHAR_WAIT`] of an AltGr dead key types its accent; except when
-    /// the next key's text starts with it (Space after the dead key carries
-    /// the accent), where the AltGr key stays an unsure candidate.
+    /// the key right after it is a plain key whose text starts with it
+    /// (Space after the dead key carries the accent), where the AltGr key
+    /// stays an unsure candidate. Another AltGr key, or a command or Tab
+    /// between, does not count: "{{" or "@", Tab, "@" types both.
     pub(crate) fn flush(&mut self, now: Instant, host: &mut impl KeyHost) {
         while self.holding() {
             for i in 0..self.entries.len() {
@@ -642,12 +645,13 @@ impl WmChars {
                     Self::unhold(&mut self.entries[i], host);
                     continue;
                 }
-                let accent_follows = self
-                    .entries
-                    .iter()
-                    .skip(i + 1)
-                    .find(|n| !n.text.is_empty())
-                    .is_some_and(|n| n.text.starts_with(self.entries[i].text.as_str()));
+                // A dead key's accent is carried by the very next key, a plain
+                // one: not across a command or Tab, nor by another AltGr key.
+                let accent_follows = self.entries.get(i + 1).is_some_and(|n| {
+                    !n.text.is_empty()
+                        && !n.may_not_come
+                        && n.text.starts_with(self.entries[i].text.as_str())
+                });
                 let e = &mut self.entries[i];
                 e.holds = false;
                 if accent_follows {
@@ -2027,6 +2031,21 @@ mod tests {
         q.flush(ms(at, 200), &mut r);
         assert_eq!(took(&mut r), ["@"]);
         chars(&mut q, &mut r, after_wait(at), &["@"]);
+        assert!(took(&mut r).is_empty());
+        assert_eq!(q.owed(), 0);
+        // A doubled AltGr character, and two with a Tab between, are
+        // characters, not a dead key and its accent: all typed at the flush.
+        keys(&mut q, &mut r, at, &[altgr("7", "{"), altgr("7", "{")]);
+        q.flush(at, &mut r);
+        assert_eq!(took(&mut r), ["{", "{"]);
+        chars(&mut q, &mut r, at, &["{", "{"]);
+        assert!(took(&mut r).is_empty());
+        q.key_down(&altgr("q", "@"), at, &mut r);
+        q.tab(false, at, &mut r);
+        q.key_down(&altgr("q", "@"), at, &mut r);
+        q.flush(at, &mut r);
+        assert_eq!(took(&mut r), ["@", "[tab]", "@"]);
+        chars(&mut q, &mut r, at, &["@", "@"]);
         assert!(took(&mut r).is_empty());
         assert_eq!(q.owed(), 0);
         // Under a dialog that closed before the flush, an AltGr key types
