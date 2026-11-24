@@ -689,6 +689,8 @@ fn close_prompt(tab: &DocTab, quit: bool, known: &[PathBuf]) -> Dialog {
     match &tab.surface {
         Surface::Doc(_) => doc_prompt(&prompt_name(tab, known), quit),
         Surface::Project(_) => message_prompt(catalog::PROJECT_SAVE_ON_CLOSE, &tab.title, quit),
+        // A PDF's filled-in values are saved into it, in place (#2255).
+        Surface::Pdf(_) => message_prompt(catalog::PDF_SAVE_ON_CLOSE, &tab.title, quit),
         _ => message_prompt(catalog::SHEET_SAVE_ON_CLOSE, &tab.title, quit),
     }
 }
@@ -780,6 +782,25 @@ impl Docxy {
     /// not asked. Whether one refused.
     fn ext_refusal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         (0..self.tabs.len()).any(|i| !self.ext_ask(i, window, cx))
+    }
+
+    /// A PDF tab with filled-in values not saved (#2255), which hot exit
+    /// cannot keep: it comes to the front with its own close prompt, and
+    /// `true` (the window stays). `false` when there is none, or when a
+    /// dialog is already up over it (that dialog is answered first).
+    pub(crate) fn pdf_refusal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(i) = crate::pdf_view::host::unsaved_pdf(&self.tabs) else {
+            return false;
+        };
+        if self.tabs[i].dialogs.is_open() {
+            self.refuse_close_under_dialog(i, window, cx);
+            return true;
+        }
+        if self.active != i {
+            self.select_tab(i, window, cx);
+        }
+        self.close_tab_asking(i, None, false, window, cx);
+        true
     }
 
     /// Extension tab `i` refused its close (#2260): it stays, as the
@@ -1221,6 +1242,15 @@ impl Docxy {
         if ask != CloseAsk::HarnessQuit && self.ext_refusal(window, cx) {
             return false;
         }
+        // Neither does hot exit keep a PDF's filled-in values (#2255): with
+        // "ask before closing" off, the window stays and the PDF tab's own
+        // close prompt asks.
+        if ask != CloseAsk::HarnessQuit
+            && !asks(ask, self.ask_on_close)
+            && self.pdf_refusal(window, cx)
+        {
+            return false;
+        }
         self.commit_dialog_buffers_for_exit(cx);
         commit_pending_for_exit(&mut self.tabs);
         self.persist(cx);
@@ -1261,7 +1291,9 @@ impl Docxy {
         // Cancel does (#2260). Asked on every walk, before an agreement is
         // judged to hold: the tab may have taken work while another window
         // asked its questions.
-        if self.ext_refusal(window, cx) {
+        if self.ext_refusal(window, cx)
+            || (!quit_asks(self.ask_on_close, self.harness) && self.pdf_refusal(window, cx))
+        {
             self.quit_agreed = None;
             if self.quitting {
                 self.quit_cancelled(cx);

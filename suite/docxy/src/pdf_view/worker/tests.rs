@@ -8,14 +8,16 @@
 use super::*;
 use crate::open_mode_tests::Scratch;
 use crate::pdf_view::PdfView;
-use crate::pdf_view::tests::{CORPUS, corpus_path};
+use crate::pdf_view::tests::{CORPUS, UNREFERENCED, corpus_path};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// Set to `<file>|<timeout ms>` to make the test binary a worker child.
 const CHILD_ENV: &str = "DOCXY_PDF_WORKER_TEST_CHILD";
 /// How the child misbehaves: `hang-pixels`, `abort-page-2`,
-/// `garbage-on-text`.
+/// `garbage-on-text`; `abort-on-text` and `abort-on-replay` (#2255) abort
+/// on any text and on the form values given again, and a mode may name
+/// both.
 const MODE_ENV: &str = "DOCXY_PDF_WORKER_TEST_MODE";
 
 /// The child half of the tests below: the same `run` the suite's child
@@ -32,6 +34,8 @@ fn child_entry() {
         Path::new(path),
         Duration::from_millis(ms.parse().expect("ms")),
         move |op| match (mode.as_str(), op) {
+            (m, Op::Text { .. }) if m.contains("abort-on-text") => std::process::abort(),
+            (m, Op::SetFields { .. }) if m.contains("abort-on-replay") => std::process::abort(),
             ("hang-pixels", Op::Pixels { .. }) => loop {
                 std::thread::sleep(Duration::from_secs(1));
             },
@@ -228,6 +232,79 @@ fn the_view_fails_only_the_page_its_child_died_on() {
     );
 }
 
+fn forms_worker(mode: &'static str) -> Worker {
+    let path = corpus_path("forms");
+    Worker::new(&path, test_child(&path, LONG, Some(mode)), LONG)
+}
+
+fn name_of(w: &mut Worker) -> String {
+    match w.ask(&Op::Fields) {
+        Answer::Form(st) => st
+            .fields
+            .iter()
+            .find(|f| f.name == "name")
+            .map(|f| f.value.join(""))
+            .unwrap_or_default(),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Criterion 10: a child that dies after values were set is replaced, and
+/// the new one is given them before it answers anything: its fields and its
+/// pages have them.
+#[test]
+fn a_new_child_is_given_the_values_set_so_far() {
+    let mut w = forms_worker("abort-on-text");
+    assert!(matches!(w.ask(&Op::Info), Answer::Info(_)));
+    let set = Op::SetField {
+        name: "name".into(),
+        value: FieldValue::Text { text: "Ada".into() },
+    };
+    assert!(matches!(w.ask(&set), Answer::Form(_)));
+    match w.ask(&Op::Text { page: 0 }) {
+        Answer::Failed(why) => assert_eq!(why, DIED),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(name_of(&mut w), "Ada");
+    assert!(!w.take_lost());
+    assert_eq!(w.started, 2);
+    assert!(matches!(
+        w.ask(&Op::Pixels {
+            page: 0,
+            scale: 0.5
+        }),
+        Answer::Pixels(_)
+    ));
+}
+
+/// Criterion 10: a new child that dies taking the values again drops them,
+/// says so once, and is replaced by a clean one: nothing loops, the next
+/// page draws.
+#[test]
+fn values_a_new_child_cannot_take_are_dropped_and_never_tried_again() {
+    let mut w = forms_worker("abort-on-text abort-on-replay");
+    assert!(matches!(w.ask(&Op::Info), Answer::Info(_)));
+    let set = Op::SetField {
+        name: "name".into(),
+        value: FieldValue::Text { text: "Ada".into() },
+    };
+    assert!(matches!(w.ask(&set), Answer::Form(_)));
+    assert!(matches!(w.ask(&Op::Text { page: 0 }), Answer::Failed(_)));
+    assert!(matches!(
+        w.ask(&Op::Pixels {
+            page: 0,
+            scale: 0.5
+        }),
+        Answer::Pixels(_)
+    ));
+    assert!(w.take_lost(), "said once");
+    assert!(!w.take_lost());
+    assert!(w.edits().is_empty());
+    assert_eq!(name_of(&mut w), "");
+    // The child that died on the replay, then a clean one: no more.
+    assert_eq!(w.started, 3);
+}
+
 /// A small, seeded generator: the mutated set is the same on every run.
 struct Rng(u64);
 
@@ -278,7 +355,7 @@ const FUZZ_TIMEOUT: Duration = Duration::from_secs(5);
 fn no_corpus_file_or_mutation_crashes_or_hangs_the_parent() {
     let dir = Scratch::new();
     let mut files = Vec::new();
-    for (n, name) in CORPUS.iter().enumerate() {
+    for (n, name) in CORPUS.iter().chain(&UNREFERENCED).enumerate() {
         let src = corpus_path(name);
         let bytes = std::fs::read(&src).unwrap();
         files.push(src);
@@ -327,6 +404,24 @@ fn no_corpus_file_or_mutation_crashes_or_hangs_the_parent() {
                     for page in 0..m.pages.len().min(3) {
                         ask(Op::Pixels { page, scale: 0.5 });
                         ask(Op::Text { page });
+                    }
+                    // A form's mutations are filled and saved too (#2255),
+                    // to a file of their own: the bytes, whatever they are.
+                    if let Some(f) = m.form.fields.iter().find(|f| f.fillable()) {
+                        let value = match f.kind {
+                            FieldKind::Check | FieldKind::Radio => FieldValue::Widget { index: 0 },
+                            FieldKind::Combo | FieldKind::List => {
+                                FieldValue::Choice { picked: vec![0] }
+                            }
+                            _ => FieldValue::Text { text: "x".into() },
+                        };
+                        ask(Op::SetField {
+                            name: f.name.clone(),
+                            value,
+                        });
+                        ask(Op::SaveTo {
+                            path: path.with_extension("saved.pdf"),
+                        });
                     }
                 }
             })

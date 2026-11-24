@@ -79,6 +79,7 @@ fn drawn(v: &mut PdfView, page: usize, bytes: usize) {
     v.absorb(Done {
         op: Op::Pixels { page, scale },
         answer: Answer::Pixels(raster(bytes)),
+        lost: false,
     });
 }
 
@@ -211,6 +212,7 @@ fn a_page_scrolled_past_is_never_asked_for() {
     v.absorb(Done {
         op: first,
         answer: Answer::Pixels(raster(4)),
+        lost: false,
     });
     let mut asked = Vec::new();
     while let Some(op) = v.next_job() {
@@ -218,15 +220,19 @@ fn a_page_scrolled_past_is_never_asked_for() {
         let answer = match op {
             Op::Pixels { .. } => Answer::Pixels(raster(4)),
             Op::Text { .. } => Answer::Text(page_text(&["x"])),
-            Op::Info => unreachable!(),
+            _ => unreachable!(),
         };
-        v.absorb(Done { op, answer });
+        v.absorb(Done {
+            op,
+            answer,
+            lost: false,
+        });
     }
     let pages: Vec<usize> = asked
         .iter()
         .map(|op| match op {
             Op::Pixels { page, .. } | Op::Text { page } => *page,
-            Op::Info => usize::MAX,
+            _ => usize::MAX,
         })
         .collect();
     assert!(pages.iter().all(|p| (17..=20).contains(p)), "{asked:?}");
@@ -244,6 +250,7 @@ fn a_new_zoom_asks_again_and_a_failed_page_never_does() {
     v.absorb(Done {
         op: Op::Pixels { page: 1, scale: 1. },
         answer: Answer::Failed(worker::TOO_LONG.into()),
+        lost: false,
     });
     v.texts = vec![Some(page_text(&["a"])), Some(page_text(&["b"]))];
     assert_eq!(v.next_job(), None);
@@ -483,6 +490,7 @@ fn a_page_text_coming_in_searches_that_page_alone() {
         v.absorb(Done {
             op: Op::Text { page },
             answer: Answer::Text(texts[page].clone()),
+            lost: false,
         });
         assert_eq!(v.find.searched, before + 1, "page {page} alone");
     };
@@ -572,9 +580,13 @@ fn corpus(name: &str) -> PathBuf {
 }
 
 /// Every corpus file, by its reference name.
-pub(crate) const CORPUS: [&str; 7] = [
-    "text", "columns", "vector", "scanned", "rotated", "slides", "source",
+pub(crate) const CORPUS: [&str; 8] = [
+    "text", "columns", "vector", "scanned", "rotated", "slides", "source", "annots",
 ];
+
+/// The slice 2 files without a reference rendering (#2255): checked by what
+/// they hold (`form_tests`), and in the mutation test.
+pub(crate) const UNREFERENCED: [&str; 4] = ["links", "annots-noap", "forms", "signed"];
 
 pub(crate) fn corpus_path(name: &str) -> PathBuf {
     corpus(name)

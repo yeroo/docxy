@@ -104,6 +104,10 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.craft-pdf]
 opt-level = 2
+[profile.dev.package.pdfcraft-forms]
+opt-level = 2
+[profile.dev.package.pdfcraft-annot]
+opt-level = 2
 
 # Line tables in release builds, so a backtrace in crash.log names the source
 # line of each frame (#795). On Windows they live in suite.pdb, which the

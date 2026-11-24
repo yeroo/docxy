@@ -18,7 +18,9 @@
 //! catalogued Task Information dialog (#1368). So is the Help tab's search
 //! box (#1855), typed into by `uiharness/cases/help-docs.uit` with the
 //! fixture manual installed. So are the PDF view's Find box and page box
-//! (#2245), typed into by `uiharness/cases/pdf-view.uit`. So is the
+//! (#2245), typed into by `uiharness/cases/pdf-view.uit`, and the editor of
+//! a PDF form's text field (#2255), by `uiharness/cases/pdf-forms.uit`. So
+//! is the
 //! embedded document view's Find box
 //! on an extension's tab (#1887), typed into by
 //! `uiharness/cases/ext-doc-view.uit` on the test extension's Mail tab. The
@@ -97,6 +99,7 @@ const HELP: u32 = 1855;
 const EXT: u32 = 1887;
 /// The PDF view's Find box and page box (#2245).
 const PDF: u32 = 2245;
+const PDF_FORMS: u32 = 2255;
 const SHEET: u32 = 1200;
 const DOC: u32 = 1201;
 const BACKSTAGE: u32 = 1202;
@@ -248,6 +251,12 @@ static REGISTRY: &[Input] = &[
     ),
     input("pdf-find", "the PDF view's Find box", Surface::Pdf, PDF),
     input("pdf-page-box", "the PDF view's page box", Surface::Pdf, PDF),
+    input(
+        "pdf-form-field",
+        "a PDF form's text field, as typed into",
+        Surface::Pdf,
+        PDF_FORMS,
+    ),
     input(
         "ext-doc-find",
         "the embedded document view's Find box",
@@ -524,8 +533,27 @@ fn press_help(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
 /// The PDF view's Find box (open, Ctrl+F) or page box, pressed where it is
 /// drawn (#2245).
 fn press_pdf(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
-    app.active_pdf()
+    let v = app
+        .active_pdf()
         .ok_or_else(|| format!("{} is not drawn: the active tab is not a PDF view", i.name))?;
+    // A form's text field (#2255): the one with the keys, else the first
+    // text field in the document's tab order.
+    if i.id == "pdf-form-field" {
+        use crate::pdf_view::worker::FieldKind;
+        let (f, w) = v
+            .focus
+            .as_ref()
+            .map(|x| (x.field, x.widget))
+            .or_else(|| {
+                v.tab_order()
+                    .into_iter()
+                    .find(|(f, _)| v.form.fields[*f].kind == FieldKind::Text)
+            })
+            .ok_or_else(|| format!("{}: this PDF has no text field to type into", i.name))?;
+        let at = crate::harness::pdf_widget_point(v, f, w)
+            .ok_or_else(|| format!("{} is not on a page", i.name))?;
+        return Ok(Press { at, double: false });
+    }
     let b = app
         .probes
         .borrow()
@@ -541,10 +569,26 @@ fn press_pdf(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
 /// keys, and a whole-text selection.
 fn read_pdf(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
     let v = app.active_pdf().ok_or("the active tab is not a PDF view")?;
-    let f = if i.id == "pdf-find" {
-        &v.find.field
-    } else {
-        &v.page_box
+    let none = crate::pdf_view::Field::default();
+    let f = match i.id {
+        "pdf-find" => &v.find.field,
+        "pdf-form-field" => {
+            let mut j = pdf_field_json(
+                i.id,
+                v.focus
+                    .as_ref()
+                    .and_then(|x| x.edit.as_ref())
+                    .unwrap_or(&none),
+            );
+            if let (Json::Obj(items), Some(f)) = (
+                &mut j,
+                v.focus.as_ref().and_then(|x| v.form.fields.get(x.field)),
+            ) {
+                items.push(("field".into(), Json::Str(f.name.clone())));
+            }
+            return Ok(j);
+        }
+        _ => &v.page_box,
     };
     Ok(pdf_field_json(i.id, f))
 }
@@ -1029,8 +1073,8 @@ mod tests {
         for i in registry() {
             assert!(
                 (SHEET..=TERMINAL).contains(&i.covered_by)
-                    || [HELP, EXT, PDF].contains(&i.covered_by),
-                "{} is covered by #{}, not one of #1200-#1204, #1855, #1887 or #2245",
+                    || [HELP, EXT, PDF, PDF_FORMS].contains(&i.covered_by),
+                "{} is covered by #{}, not one of #1200-#1204, #1855, #1887, #2245 or #2255",
                 i.id,
                 i.covered_by
             );
@@ -1210,17 +1254,22 @@ mod tests {
         }
     }
 
-    /// #2245: the PDF view's fields are typed into with real keys by
-    /// pdf-view.uit, after a real click, and read back.
+    /// #2245, #2255: the PDF view's fields are typed into with real keys by
+    /// pdf-view.uit (the form's by pdf-forms.uit), after a real click, and
+    /// read back.
     #[test]
     fn the_pdf_views_fields_are_typed_into_by_its_case() {
-        let case = include_str!("../../../uiharness/cases/pdf-view.uit");
         let pdf: Vec<&Input> = registry()
             .iter()
             .filter(|i| i.surface == Surface::Pdf)
             .collect();
-        assert_eq!(pdf.len(), 2);
+        assert_eq!(pdf.len(), 3);
         for i in pdf {
+            let case = if i.covered_by == PDF_FORMS {
+                include_str!("../../../uiharness/cases/pdf-forms.uit")
+            } else {
+                include_str!("../../../uiharness/cases/pdf-view.uit")
+            };
             let click = format!("pointer-click {{\"input\":\"{}\"}}", i.id);
             let read = format!("field-read {{\"input\":\"{}\"}}", i.id);
             let at = case

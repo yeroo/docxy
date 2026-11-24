@@ -1271,3 +1271,24 @@ test doc autocorrect-redefine: matches the catalogue
   assert dialog is autocorrect-redefine
   call dialog-catalog-check {}
   call real-key {"key":"escape"}
+
+test doc pdf-signed-save: matches the catalogue
+  open copy:../fixtures/pdf-view-signed.pdf
+  call pdf-read {"until_drawn":[1]}
+  call pointer-click {"region":"pdf-field:name:0"}
+  call real-type {"text":"x"}
+  key ctrl+s
+  assert dialog is pdf-signed-save
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc pdf-save-on-close: matches the catalogue
+  open copy:../fixtures/pdf-view-forms.pdf
+  call pdf-read {"until_drawn":[1]}
+  call pointer-click {"region":"pdf-field:name:0"}
+  call real-type {"text":"x"}
+  key tab
+  call close-tab {}
+  assert dialog is pdf-save-on-close
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}

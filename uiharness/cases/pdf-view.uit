@@ -149,15 +149,17 @@ test issue 2245 Find searches every page and steps through the hits
   assert reply.find_open is false
   call real-key {"key":"ctrl+w"}
 
-test issue 2245 the PDF view never writes the PDF, and converts on request
+test issue 2245 the PDF view writes nothing it did not change, and converts on request
   open copy:"../fixtures/pdf-view-text.pdf" as text.pdf
   call pdf-read {"until_drawn":[1]}
+  # Nothing filled in (#2255): Save writes nothing.
   call real-key {"key":"ctrl+s"}
   call status-read {}
-  assert reply.items.1.text is The PDF view is read-only and never writes the PDF; Convert to editable document makes a copy you can save
+  assert reply.items.1.text is No changes to save: only filled-in form values are saved to a PDF
+  assert dirty is false
   call real-key {"key":"f12"}
   call status-read {}
-  assert reply.items.1.text is Save As is not available for a PDF view; Convert to editable document makes a copy you can save
+  assert reply.items.1.text is A harness instance cannot open the Save As dialog; use the harness save-as verb
   # Typing changes nothing: there is nothing to edit.
   call real-type {"text":"abc"}
   call real-key {"key":"backspace"}

@@ -66,6 +66,15 @@ unicode-segmentation = "1.13"
 # A drawn page's frame for gpui's `RenderImage` (the version gpui uses).
 image = { version = "0.25", default-features = false }
 pdfcraft-render = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+# Links, annotations and forms (#2255), also only in the child: the working
+# document and its incremental save (`-cos`), appearances for comments that
+# have none (`-annot`), and the AcroForm's fields, their filling and their
+# appearances (`-forms`), and the pages' annotation lists, for their Hidden
+# flags (`-model`). Same rev as `pdfcraft-render`.
+pdfcraft-annot = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+pdfcraft-cos = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+pdfcraft-forms = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+pdfcraft-model = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
 
 # The plain AppKit menu bar a native dialog runs under (#1071, macos_menu.rs),
 # and the RTF a copy adds to the pasteboard (#1074, rich_clip.rs).
@@ -102,6 +111,9 @@ htmlbundle = { path = "../../htmlbundle" }
 # Reads the PDF view corpus's reference renderings (#2245); in the lock
 # through gpui.
 image = { version = "0.25", default-features = false, features = ["png"] }
+# A reader that is not PdfCraft's, for the saved forms' round trip (#2255):
+# each field's /V read back. In the lock (patched) through pdfcraft-render.
+lopdf = "0.45"
 
 [features]
 # Embed the docxwasm engine so Save As "Editable HTML (*.docx.html)" can make

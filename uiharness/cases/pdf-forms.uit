@@ -1,0 +1,149 @@
+# The PDF view's links, comments and form (#2255): a link click goes to its
+# place, a comment's text shows on hover, and an AcroForm is filled by
+# mouse and keys and saved back into the PDF (an update appended to it),
+# which reopens with its values. A worker child (`suite --pdf-worker`)
+# fills the form and writes the bytes, so `pdf-read {"until_idle":true}`
+# waits until what was typed or saved is in. `pdf-field:<name>[:<widget>]`
+# is a field's widget, `pdf-link:<page>:<n>` and `pdf-annot:<page>:<n>` a
+# page's link and comment (from 1), `pdf-option:<n>` an open combo box's
+# option. The PDFs are uiharness/fixtures/pdf-view-{forms,links,annots,
+# signed}.pdf, byte-identical copies of corpus/pdf-view's (how they were
+# made: corpus/pdf-view/README.md). Each test closes the tabs it opened.
+
+test issue 2255 a form is filled by mouse and keys, saved, and reopens with its values
+  open copy:"../fixtures/pdf-view-forms.pdf" as forms.pdf
+  call pdf-read {"until_drawn":[1]}
+  assert reply.unsaved is false
+  assert reply.fields.0.name is name
+  # A text field: a click gives it the keys, typing goes in, Tab commits
+  # it and goes on in the document's tab order.
+  call pointer-click {"input":"pdf-form-field"}
+  call real-type {"text":"Ada"}
+  call field-read {"input":"pdf-form-field"}
+  assert reply.value is Ada
+  assert reply.focused is true
+  assert reply.field is name
+  call real-key {"key":"tab"}
+  call pdf-read {"until_idle":true}
+  assert reply.values.name is Ada
+  assert reply.focus is email
+  assert reply.unsaved is true
+  assert dirty is true
+  shot window
+  # A check box and a radio button by a click.
+  call pointer-click {"region":"pdf-field:agree:0"}
+  call pointer-click {"region":"pdf-field:colour:1"}
+  call pdf-read {"until_idle":true}
+  assert reply.values.agree is Yes
+  assert reply.values.colour is Green
+  # A combo box: a click opens its list, a click on an option picks it.
+  call pointer-click {"region":"pdf-field:size:0"}
+  call pdf-read {}
+  assert reply.focus_open is true
+  call pointer-click {"region":"pdf-option:3"}
+  call pdf-read {"until_idle":true}
+  assert reply.values.size is Large
+  assert reply.focus_open is false
+  # Space on a focused check box turns it off again, then on.
+  call pointer-click {"region":"pdf-field:agree:0"}
+  call pdf-read {"until_idle":true}
+  assert reply.values.agree is Off
+  call real-key {"key":"space"}
+  call pdf-read {"until_idle":true}
+  assert reply.values.agree is Yes
+  # A read-only field takes no keys.
+  call pointer-click {"region":"pdf-field:id:0"}
+  call pdf-read {}
+  assert reply.focus is null
+  assert reply.values.id is A-17
+  # Ctrl+S writes the values into the PDF.
+  call real-key {"key":"ctrl+s"}
+  call pdf-read {"until_idle":true}
+  assert reply.unsaved is false
+  assert reply.saving is false
+  assert dirty is false
+  call real-key {"key":"ctrl+w"}
+  # Reopened, the file has them.
+  open copy:"../fixtures/pdf-view-links.pdf" as links.pdf
+  call open {"path":"forms.pdf"}
+  call pdf-read {"until_drawn":[1]}
+  assert reply.values.name is Ada
+  assert reply.values.agree is Yes
+  assert reply.values.colour is Green
+  assert reply.values.size is Large
+  assert reply.unsaved is false
+  call real-key {"key":"ctrl+w"}
+  call real-key {"key":"ctrl+w"}
+
+test issue 2255 a link click jumps to its place and a comment shows its text on hover
+  open copy:"../fixtures/pdf-view-links.pdf" as links.pdf
+  call pdf-read {"until_drawn":[1]}
+  assert reply.links.2.go is Go to page 2
+  assert reply.links.0.go is https://example.com/docxy
+  call pointer-move {"to":"pdf-link:1:3"}
+  call pdf-read {}
+  assert reply.tooltip is Go to page 2
+  # Its /XYZ: page 2 at 200 %.
+  call pointer-click {"region":"pdf-link:1:3"}
+  call pdf-read {"until_drawn":[2]}
+  assert reply.page is 2
+  assert reply.zoom is 200
+  shot window
+  call real-key {"key":"ctrl+w"}
+  open copy:"../fixtures/pdf-view-annots.pdf" as annots.pdf
+  call pdf-read {"until_drawn":[1]}
+  assert reply.notes.1.contents is A sticky note
+  call pointer-move {"to":"pdf-annot:1:2"}
+  call pdf-read {}
+  assert reply.popup is A sticky note
+  assert reply.popup_pinned is false
+  shot window
+  # A click pins it; Esc lets it go.
+  call pointer-click {"region":"pdf-annot:1:2"}
+  call pdf-read {}
+  assert reply.popup_pinned is true
+  call real-key {"key":"escape"}
+  call pdf-read {}
+  assert reply.popup is null
+  call real-key {"key":"ctrl+w"}
+
+test issue 2255 a signed PDF asks before its values are saved
+  open copy:"../fixtures/pdf-view-signed.pdf" as signed.pdf
+  call pdf-read {"until_drawn":[1]}
+  assert reply.signed is true
+  call pointer-click {"region":"pdf-field:name:0"}
+  call real-type {"text":"x"}
+  call real-key {"key":"ctrl+s"}
+  assert dialog is pdf-signed-save
+  # Cancel writes nothing; the value stays unsaved.
+  call dialog-click {"button":"Cancel"}
+  assert dialog is none
+  call pdf-read {"until_idle":true}
+  assert reply.unsaved is true
+  assert reply.values.name is x
+  call real-key {"key":"ctrl+s"}
+  assert dialog is pdf-signed-save
+  call dialog-click {"button":"Save"}
+  call pdf-read {"until_idle":true}
+  assert reply.unsaved is false
+  call close-tab {}
+  assert tabs is 0
+
+test issue 2255 closing a PDF tab with unsaved values asks, and its Save writes them
+  open copy:"../fixtures/pdf-view-forms.pdf" as forms.pdf
+  call pdf-read {"until_drawn":[1]}
+  call pointer-click {"input":"pdf-form-field"}
+  call real-type {"text":"Bea"}
+  call real-key {"key":"tab"}
+  call pdf-read {"until_idle":true}
+  call close-tab {}
+  assert dialog is pdf-save-on-close
+  call dialog-click {"button":"Save"}
+  call pdf-read {"until_idle":true}
+  assert tabs is 0
+  open copy:"../fixtures/pdf-view-links.pdf" as links.pdf
+  call open {"path":"forms.pdf"}
+  call pdf-read {"until_drawn":[1]}
+  assert reply.values.name is Bea
+  call real-key {"key":"ctrl+w"}
+  call real-key {"key":"ctrl+w"}

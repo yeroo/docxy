@@ -28390,11 +28390,9 @@ impl Docxy {
             self.refocus(window, cx);
             return Some(after);
         }
-        // Nor on a PDF tab (#2245): it never writes the PDF.
+        // A PDF tab writes its filled-in form values back to the PDF (#2255).
         if self.active_kind_is_pdf() {
-            self.set_status(pdf_view::host::PDF_NO_SAVE);
-            self.refocus(window, cx);
-            return Some(after);
+            return self.save_pdf_then(None, after, window, cx);
         }
         if self.active_is_project() {
             return self.save_project_then(false, after, window, cx);
@@ -28717,10 +28715,9 @@ impl Docxy {
             self.set_status(help_view::host::HELP_NO_SAVE);
             return self.refocus(window, cx);
         }
-        // Nor Save As on a PDF tab (#2245, a later slice).
+        // A PDF tab is saved as a PDF (#2255).
         if self.active_kind_is_pdf() {
-            self.set_status(pdf_view::host::PDF_NO_SAVE_AS);
-            return self.refocus(window, cx);
+            return self.pdf_save_as(window, cx);
         }
         if self.active_is_project() {
             return self.save_project(true, window, cx);

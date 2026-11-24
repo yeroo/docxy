@@ -4182,3 +4182,27 @@ fn a_close_prompt_under_document_recovery_is_refused() {
     )));
     assert!(prompt_hidden(&restored[0], &app));
 }
+
+/// #2255: a PDF tab's close prompt is the plain "Save changes to …?", whose
+/// Save saves in place (no file name or folder to pick), and its own id.
+#[test]
+fn a_pdf_tabs_close_prompt_is_the_plain_one() {
+    let dir = crate::open_mode_tests::Scratch::new();
+    let path = dir.path("forms.pdf");
+    std::fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pdf-view/forms.pdf"),
+        &path,
+    )
+    .unwrap();
+    let tab = crate::pdf_view::host::pdf_view_tab_with(
+        &path,
+        None,
+        crate::pdf_view::worker::Spawn::InProcess,
+    )
+    .unwrap();
+    let d = close_prompt(&tab, false, &[]);
+    assert_eq!(d.id, catalog::PDF_SAVE_ON_CLOSE);
+    assert!(d.controls.is_empty(), "nothing to pick: it saves in place");
+    let labels: Vec<&str> = d.buttons.iter().map(|b| b.label.as_str()).collect();
+    assert_eq!(labels, ["Save", "Don't Save", "Cancel"]);
+}
