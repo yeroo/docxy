@@ -146,3 +146,25 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing Project's Task I
   limits: the page-body scroll does not follow Tab focus or the open
   calendar, and a wheel over a nested scrolling grid or multiline also
   scrolls the page body when the page overflows.
+
+## The note a save that drops the `.yppx`-only flags gives (#1618)
+
+- Display on Timeline and Marked (`yppx::FLAG_PARTS`) are kept only by the
+  built-in `.yppx` writer: `ProjectFormat::keeps_task_flags`, false by
+  default, true only for `formats::Yppx` (a format plugin is handed
+  `write_mspdi` and the formatting part, even one that claims `.yppx`).
+  `Registry::save_note(project, path)` asks the target's writer and, when
+  it does not keep them and some task has one on (`TaskFlagPart::any_on`:
+  `Some(false)` reopens as `None`, which reads as off, so it loses
+  nothing), names them in `FLAG_PARTS` order (`TaskFlagPart::label`,
+  `yppx::package_only`): "Display on Timeline and Marked are not saved in
+  .xml files; save as .yppx to keep them". The advice is left out when the
+  registry's own `.yppx` writer would lose them too.
+- The suite's `apply_save` and yppxy's `App::save_to_path` add it to the
+  save's status after a successful save (`saved N bytes → <path>. <note>`,
+  `Saved <path>. <note>`); the save itself, its bytes and its clean state
+  are as before, with no prompt.
+- Not done: a save whose status nobody sees (yppxy `:wq`/`:x`, the suite's
+  Save on closing a tab) gives the note to no one; an `.xml` save also drops
+  `formatting.xml` and `tableview.xml` without a word, and the note names
+  only the two flags.

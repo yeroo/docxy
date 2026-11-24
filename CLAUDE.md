@@ -141,7 +141,8 @@ issue number to find its notes.
   selection look (#1534), the row menu and mini toolbar (#1537).
 - `docs/claude/project-task-info.md`: before changing Task Information or task notes:
   rich task notes (#1801, #1803), the dialog (#1368), its top row, grids and date combos
-  (#1536, #1682).
+  (#1536, #1682), the note a save that drops Display on Timeline or Marked
+  gives (#1618).
 - `docs/claude/project-scheduling.md`: before changing Project scheduling, or how MSPDI
   and `.mpp` carry scheduled dates: leveling as a plan edit (#1594), elapsed durations and
   Must Start On before opening (#484).
