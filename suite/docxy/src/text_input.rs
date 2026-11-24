@@ -66,9 +66,13 @@
 //! root) holds for [`WM_CHAR_WAIT`] at most: a plain key is then replayed
 //! as it was before #1277 and owes its text, and an AltGr key still types
 //! its character if it comes later. A command right after an AltGr dead key
-//! waits that long. A mouse-down on either root releases every held key
-//! first, an AltGr key typing its character then, so a click acts after
-//! the keys before it. A packet's text against a command sent
+//! waits that long. A mouse-down anywhere in the window (a window listener
+//! both roots register) releases every held key first, an AltGr key typing
+//! its character then, so a click acts after the keys before it. A key-down
+//! cannot tell an AltGr dead key from an AltGr character, so a press within
+//! `WM_CHAR_WAIT` of an AltGr dead key types its accent, unless the next
+//! key's text starts with it (Space carrying the accent). A packet's text
+//! against a command sent
 //! after it is not ordered: gpui hides the packet's key-down. The handler
 //! never accepts text input there ([`accepts_text_input`]), so the Windows
 //! IME stays off as it was.
@@ -420,6 +424,17 @@ impl Entry {
     fn sure(&self) -> bool {
         !self.may_not_come && !self.late
     }
+
+    /// Whether a withheld AltGr key types its character here and now: under
+    /// a text field only while one is still open (#1162, #1312), elsewhere
+    /// while the app takes text.
+    fn altgr_types(&self, host: &mut impl KeyHost) -> bool {
+        if self.field {
+            host.text_field_open()
+        } else {
+            host.takes_text()
+        }
+    }
 }
 
 /// What [`WmChars`] needs of the app: the state that decides a key's route
@@ -611,30 +626,41 @@ impl WmChars {
     /// the keys before it: each withheld key stops holding, a plain key
     /// replayed as at the time limit ([`WmChars::release_lapsed`]), and an
     /// AltGr key whose character has not come types its text now (under the
-    /// field rule) and owes it, so its late WM_CHAR is dropped. An AltGr dead
-    /// key then types its accent: a click ends a dead key.
+    /// field rule) and owes it from `now`, so its WM_CHAR, which comes right
+    /// after the drain that carried the press, is dropped. A key-down cannot
+    /// tell an AltGr dead key from an AltGr character, so a press within
+    /// [`WM_CHAR_WAIT`] of an AltGr dead key types its accent; except when
+    /// the next key's text starts with it (Space after the dead key carries
+    /// the accent), where the AltGr key stays an unsure candidate.
     pub(crate) fn flush(&mut self, now: Instant, host: &mut impl KeyHost) {
         while self.holding() {
-            for e in &mut self.entries {
-                if !e.holds {
+            for i in 0..self.entries.len() {
+                if !self.entries[i].holds {
                     continue;
                 }
-                if e.state == State::Withheld(Withheld::AltGr) {
-                    let types = if e.field {
-                        host.text_field_open()
-                    } else {
-                        host.takes_text()
-                    };
-                    if types {
-                        for k in e.text.chars().filter_map(char_stroke) {
-                            host.on_key(&typed(k));
-                        }
-                    }
-                    e.holds = false;
-                    e.state = State::Typed;
-                } else {
-                    Self::unhold(e, host);
+                if self.entries[i].state != State::Withheld(Withheld::AltGr) {
+                    Self::unhold(&mut self.entries[i], host);
+                    continue;
                 }
+                let accent_follows = self
+                    .entries
+                    .iter()
+                    .skip(i + 1)
+                    .find(|n| !n.text.is_empty())
+                    .is_some_and(|n| n.text.starts_with(self.entries[i].text.as_str()));
+                let e = &mut self.entries[i];
+                e.holds = false;
+                if accent_follows {
+                    continue;
+                }
+                if e.altgr_types(host) {
+                    for k in e.text.chars().filter_map(char_stroke) {
+                        host.on_key(&typed(k));
+                    }
+                }
+                e.state = State::Typed;
+                e.at = now;
+                e.late = false;
             }
             self.release(now, host);
         }
@@ -717,12 +743,7 @@ impl WmChars {
             State::Withheld(Withheld::Plain) => Self::unhold(e, host),
             State::Withheld(Withheld::AltGr) => {
                 e.holds = false;
-                let types = if e.field {
-                    host.text_field_open()
-                } else {
-                    host.takes_text()
-                };
-                if types {
+                if e.altgr_types(host) {
                     if let Some(k) = char_stroke(c) {
                         host.on_key(&typed(k));
                     }
@@ -1819,6 +1840,19 @@ mod tests {
         assert_eq!(q.owed(), 0);
         chars(&mut q, &mut r, at, &["~"]);
         assert_eq!(took(&mut r), ["~"], "a packet after them types");
+        // A press after the dead key and Space: Space carries the accent, so
+        // the flush types it once, and the dead key nothing.
+        keys(
+            &mut q,
+            &mut r,
+            at,
+            &[dead("4", "~", ctrl_alt()), typed(plain("space", "~"))],
+        );
+        q.flush(at, &mut r);
+        assert_eq!(took(&mut r), ["~"]);
+        chars(&mut q, &mut r, at, &["~"]);
+        assert!(took(&mut r).is_empty());
+        assert_eq!(q.owed(), 0);
     }
 
     /// The same edge on a key `on_key` took (KeyTips up): its AltGr debt is
@@ -1985,6 +2019,14 @@ mod tests {
         assert_eq!(took(&mut r), ["a", "[backspace]", "b", "@", "c"]);
         assert!(!q.holding());
         chars(&mut q, &mut r, at, &["a", "b", "@", "c"]);
+        assert!(took(&mut r).is_empty());
+        assert_eq!(q.owed(), 0);
+        // The flush restarts the AltGr debt's clock: its WM_CHAR, past the
+        // wait from the key-down but within it from the flush, is dropped.
+        q.key_down(&altgr("q", "@"), at, &mut r);
+        q.flush(ms(at, 200), &mut r);
+        assert_eq!(took(&mut r), ["@"]);
+        chars(&mut q, &mut r, after_wait(at), &["@"]);
         assert!(took(&mut r).is_empty());
         assert_eq!(q.owed(), 0);
         // Under a dialog that closed before the flush, an AltGr key types

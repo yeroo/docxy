@@ -49822,7 +49822,7 @@ trait KeyRouting: Sized {
 
 impl KeyRouting for Div {
     fn key_routing(self, focus: &FocusHandle, cx: &mut Context<Docxy>) -> Self {
-        let (focus, view) = (focus.clone(), cx.entity());
+        let (focus, view, flush) = (focus.clone(), cx.entity(), cx.entity());
         // The input handler is registered at paint, while the root has focus.
         let input = canvas(
             |_, _, _| {},
@@ -49830,17 +49830,23 @@ impl KeyRouting for Div {
                 if text_input::HANDLER {
                     window.handle_input(&focus, ElementInputHandler::new(bounds, view), cx);
                 }
+                // Windows: the keys still waiting for their WM_CHAR act before
+                // a press, on either root (#1277). A window listener, as an
+                // element's runs only while its hitbox is hovered, which an
+                // open dialog's or a flyout's occluding backdrop stops.
+                if text_input::WINDOWS {
+                    window.on_mouse_event(move |_: &MouseDownEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Capture {
+                            flush.update(cx, |this, cx| this.flush_wm_chars(window, cx));
+                        }
+                    });
+                }
             },
         )
         .absolute()
         .size_full();
         self.child(input)
             .on_key_down(cx.listener(Docxy::route_key))
-            // Windows: the keys still waiting for their WM_CHAR act before a
-            // press, on either root (#1277).
-            .capture_any_mouse_down(
-                cx.listener(|this, _: &MouseDownEvent, window, cx| this.flush_wm_chars(window, cx)),
-            )
             .on_action(cx.listener(|this, _: &ext::ShowBackstage, window, cx| {
                 let was_up = this.backstage;
                 this.open_backstage(cx);

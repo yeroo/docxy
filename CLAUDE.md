@@ -350,8 +350,11 @@ Restated from the area notes, which hold the detail:
   dialog or Project edit only while one is open). A withheld key holds every
   later key-down and the Tab/Shift+Tab actions (`queued_tab`) until its
   character comes, at most `WM_CHAR_WAIT` (250 ms; then a plain key is
-  replayed). A mouse-down on either root (`key_routing`) flushes the queue
-  first, AltGr keys typing then. Other keys reach `on_key` at once and owe
+  replayed). A mouse-down anywhere (a window listener from `key_routing`)
+  flushes the queue first, AltGr keys typing then: a press within
+  `WM_CHAR_WAIT` of an AltGr dead key types its accent (a key-down cannot
+  tell it from a character) unless the next key's text starts with it.
+  Other keys reach `on_key` at once and owe
   their text; without the root's focus they owe nothing (no handler, no
   WM_CHAR). A character's candidates are the leading entries not sure to be
   paid (`may_not_come`, or past `WM_CHAR_WAIT`) and the first sure one; it
