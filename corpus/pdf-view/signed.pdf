@@ -1,0 +1,56 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [8 0 R 7 0 R] /SigFlags 3 /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv 3 0 R >> >> >> >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 9 0 R /Annots [8 0 R 7 0 R]  >>
+endobj
+5 0 obj
+<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached /ByteRange [0 0 0 0] /Contents <00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000> /M (D:20261124120000Z) >>
+endobj
+6 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 200 40] /Length 27 >>
+stream
+0 G 1 w 0.5 0.5 199 39 re S
+endstream
+endobj
+7 0 obj
+<< /Type /Annot /Subtype /Widget /Rect [72 600 272 640] /F 4 /P 4 0 R /T (Signature1) /FT /Sig /V 5 0 R /AP << /N 6 0 R >> >>
+endobj
+8 0 obj
+<< /Type /Annot /Subtype /Widget /Rect [72 700 322 720] /F 4 /P 4 0 R /T (name) /FT /Tx /DA (/Helv 11 Tf 0 g) /MK << /BC [0.5 0.5 0.5] >> >>
+endobj
+9 0 obj
+<<  /Length 91 >>
+stream
+0 g BT
+/F1 11 Tf
+1 0 0 1 72 760 Tm (A signed form) Tj
+1 0 0 1 72 650 Tm (Signed here) Tj
+ET
+endstream
+endobj
+xref
+0 10
+0000000000 65535 f 
+0000000015 00000 n 
+0000000169 00000 n 
+0000000226 00000 n 
+0000000323 00000 n 
+0000000472 00000 n 
+0000000744 00000 n 
+0000000870 00000 n 
+0000001011 00000 n 
+0000001167 00000 n 
+trailer
+<< /Size 10 /Root 1 0 R /ID [<22552255225522552255225522552255> <22552255225522552255225522552255>] >>
+startxref
+1309
+%%EOF

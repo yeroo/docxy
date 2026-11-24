@@ -275,6 +275,422 @@ showpage
 """
 
 
+# ---- slice 2 (#2255): links, annotations, forms, a signed file ------------
+#
+# Written object by object by `RawPdf`: neither cairo nor pdfwrite writes link
+# destinations, appearance streams or AcroForm fields as a test needs them.
+# Everything is deterministic (no dates but the fixed ones below), so a run
+# writes the same bytes again.
+
+
+class RawPdf:
+    """A PDF written by hand: numbered objects, a classic xref table."""
+
+    def __init__(self):
+        self.objs = []
+
+    def reserve(self):
+        self.objs.append(None)
+        return len(self.objs)
+
+    def set(self, n, body):
+        self.objs[n - 1] = body.encode("latin-1") if isinstance(body, str) else body
+
+    def add(self, body):
+        n = self.reserve()
+        self.set(n, body)
+        return n
+
+    def stream(self, data, extra=""):
+        if isinstance(data, str):
+            data = data.encode("latin-1")
+        head = f"<< {extra} /Length {len(data)} >>\nstream\n".encode("latin-1")
+        return self.add(head + data + b"\nendstream")
+
+    def form(self, w, h, ops, resources=""):
+        """A form XObject `w` x `h` (an appearance stream)."""
+        res = f" /Resources << {resources} >>" if resources else ""
+        return self.stream(ops, f"/Type /XObject /Subtype /Form /BBox [0 0 {w:g} {h:g}]{res}")
+
+    def write(self, path, root, info=None):
+        out = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+        offsets = []
+        for i, body in enumerate(self.objs, 1):
+            assert body is not None, f"object {i} reserved and never set"
+            offsets.append(len(out))
+            out += f"{i} 0 obj\n".encode() + body + b"\nendobj\n"
+        xref = len(out)
+        out += f"xref\n0 {len(self.objs) + 1}\n0000000000 65535 f \n".encode()
+        for o in offsets:
+            out += f"{o:010d} 00000 n \n".encode()
+        info_ref = f" /Info {info} 0 R" if info else ""
+        out += (
+            f"trailer\n<< /Size {len(self.objs) + 1} /Root {root} 0 R{info_ref}"
+            f" /ID [<{'2255' * 8}> <{'2255' * 8}>] >>\nstartxref\n{xref}\n%%EOF\n"
+        ).encode()
+        with open(path, "wb") as f:
+            f.write(out)
+
+
+def pdf_text(s):
+    """A PDF literal string."""
+    return "(" + s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)") + ")"
+
+
+HELV = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+
+
+def labels(lines, size=11):
+    """A content stream showing `(x, y, text)` lines in Helvetica."""
+    ops = ["0 g BT", f"/F1 {size} Tf"]
+    for x, y, s in lines:
+        ops.append(f"1 0 0 1 {x} {y} Tm {pdf_text(s)} Tj")
+    ops.append("ET")
+    return "\n".join(ops)
+
+
+def page(pdf, pages_ref, content, annots=(), extra="", size=A4, font=None):
+    res = f"/Resources << /Font << /F1 {font} 0 R >> >>" if font else "/Resources << >>"
+    c = pdf.stream(content)
+    a = " ".join(f"{r} 0 R" for r in annots)
+    return pdf.add(
+        f"<< /Type /Page /Parent {pages_ref} 0 R /MediaBox [0 0 {size[0]:g} {size[1]:g}]"
+        f" {res} /Contents {c} 0 R /Annots [{a}] {extra} >>"
+    )
+
+
+def make_links(path):
+    """Three pages of links: URIs, explicit and named destinations, GoTo
+    actions, links that do nothing here, a link by its quads, and a link on
+    a `/Rotate 90` page."""
+    pdf = RawPdf()
+    catalog, pages = pdf.reserve(), pdf.reserve()
+    font = pdf.add(HELV)
+    p1, p2, p3 = pdf.reserve(), pdf.reserve(), pdf.reserve()
+
+    def link(rect, what):
+        r = " ".join(f"{v:g}" for v in rect)
+        return pdf.add(f"<< /Type /Annot /Subtype /Link /Rect [{r}] /Border [0 0 0] {what} >>")
+
+    rows = [
+        ("Open https://example.com/docxy", "/A << /S /URI /URI (https://example.com/docxy) >>"),
+        ("Write to docs@example.com", "/A << /S /URI /URI (mailto:docs@example.com) >>"),
+        ("Go to page 2 at 200 %", f"/Dest [{p2} 0 R /XYZ 72 600 2]"),
+        ("Go to chapter 3 (a named destination)", "/Dest (chapter3)"),
+        ("Go to the old section (GoTo, /Dests)", "/A << /S /GoTo /D /old >>"),
+        ("Go to page 2, fitted", f"/A << /S /GoTo /D [{p2} 0 R /Fit] >>"),
+        ("Run a script", "/A << /S /JavaScript /JS (app.alert\\(1\\)) >>"),
+        ("Launch notes.txt", "/A << /S /Launch /F (notes.txt) >>"),
+        ("A javascript: address", "/A << /S /URI /URI (javascript:alert\\(1\\)) >>"),
+    ]
+    lines = [(72, 780, "Links")]
+    annots = []
+    for i, (label, what) in enumerate(rows):
+        y = 740 - i * 30
+        lines.append((76, y + 4, label))
+        annots.append(link([72, y, 330, y + 18], what))
+    # A link active only over its quadrilateral: the top-left part of its
+    # rectangle (upper left, upper right, lower left, lower right).
+    lines.append((76, 434, "Quad link (only this part)"))
+    annots.append(
+        link(
+            [72, 400, 400, 450],
+            "/QuadPoints [72 450 250 450 72 428 250 428]"
+            " /A << /S /URI /URI (https://example.com/quad) >>",
+        )
+    )
+    page(pdf, pages, labels(lines), annots, size=A4, font=font)
+    pdf.set(p1, pdf.objs.pop())  # the page dict just added is page 1
+    page(pdf, pages, labels([(72, 780, "Page two"), (72, 600, "XYZ lands here")]), size=A4, font=font)
+    pdf.set(p2, pdf.objs.pop())
+    back = link([72, 700, 300, 716], f"/Dest [{p1} 0 R /XYZ null null 0]")
+    page(
+        pdf,
+        pages,
+        labels([(72, 760, "Chapter 3, on a page turned a quarter right"), (76, 704, "Back to page 1")]),
+        [back],
+        extra="/Rotate 90",
+        size=A4,
+        font=font,
+    )
+    pdf.set(p3, pdf.objs.pop())
+    names = pdf.add(f"<< /Names [(chapter3) [{p3} 0 R /FitH 400]] >>")
+    pdf.set(pages, f"<< /Type /Pages /Kids [{p1} 0 R {p2} 0 R {p3} 0 R] /Count 3 >>")
+    pdf.set(
+        catalog,
+        f"<< /Type /Catalog /Pages {pages} 0 R /Names << /Dests {names} 0 R >>"
+        f" /Dests << /old [{p2} 0 R /FitR 100 100 300 300] >> >>",
+    )
+    info = pdf.add("<< /Title (Links corpus) /Author (docxy) >>")
+    pdf.write(path, catalog, info)
+
+
+# The annotations of `annots.pdf` and `annots-noap.pdf`: (subtype, rect, the
+# dictionary's own entries, the appearance's operators in its BBox or None).
+REVIEWER = "/T (Reviewer) /M (D:20261124120000Z)"
+ANNOTS = [
+    (
+        "Highlight",
+        [72, 758, 272, 774],
+        f"/QuadPoints [72 774 272 774 72 758 272 758] /C [1 1 0] /Contents (Highlighted words) {REVIEWER}",
+        "/GS0 gs 1 1 0 rg 0 0 200 16 re f",
+    ),
+    (
+        "Underline",
+        [72, 724, 272, 742],
+        "/QuadPoints [72 742 272 742 72 726 272 726] /C [0 0 1]",
+        "0 0 1 RG 1.5 w 0 2 m 200 2 l S",
+    ),
+    (
+        "StrikeOut",
+        [72, 694, 272, 712],
+        f"/QuadPoints [72 712 272 712 72 696 272 696] /C [1 0 0] /Contents (Cut this) {REVIEWER}",
+        "1 0 0 RG 1.5 w 0 9 m 200 9 l S",
+    ),
+    (
+        "Squiggly",
+        [72, 664, 272, 682],
+        "/QuadPoints [72 682 272 682 72 666 272 666] /C [0 0.6 0]",
+        "0 0.6 0 RG 1 w 0 2 m " + " ".join(f"{x} {2 + 3 * (i % 2)} l" for i, x in enumerate(range(4, 204, 4))) + " S",
+    ),
+    (
+        "Text",
+        [320, 740, 344, 764],
+        f"/Name /Note /C [1 0.82 0] /Contents (A sticky note) {REVIEWER}",
+        "1 0.82 0 rg 0 0 0 RG 1 w 0.5 0.5 23 23 re B 4 17 m 20 17 l 4 12 m 20 12 l 4 7 m 14 7 l S",
+    ),
+    (
+        "FreeText",
+        [320, 650, 520, 700],
+        "/DA (/Helv 12 Tf 0 0 1 rg) /Contents (Free text) /C [0 0 1]",
+        "0 0 1 RG 1 w 0.5 0.5 199 49 re S 0 0 1 rg 10 30 120 6 re f 10 16 80 6 re f",
+    ),
+    (
+        "Ink",
+        [72, 560, 272, 640],
+        "/InkList [[80 570 120 630 160 580 200 630 260 570]] /C [0.5 0 0.5] /BS << /W 3 >>",
+        "0.5 0 0.5 RG 3 w 1 J 1 j 8 10 m 48 70 l 88 20 l 128 70 l 188 10 l S",
+    ),
+    (
+        "Stamp",
+        [320, 560, 520, 630],
+        "/Name /Approved /C [0.8 0 0]",
+        "0.8 0 0 RG 4 w 2 2 196 66 re S 0.8 0 0 rg 20 28 160 14 re f",
+    ),
+    (
+        "Square",
+        [72, 460, 172, 540],
+        "/C [0 0.4 0.8] /IC [0.8 0.9 1] /BS << /W 2 >>",
+        "0 0.4 0.8 RG 0.8 0.9 1 rg 2 w 1 1 98 78 re B",
+    ),
+    (
+        "Circle",
+        [200, 460, 300, 540],
+        "/C [0.8 0.4 0] /BS << /W 2 >>",
+        "0.8 0.4 0 RG 2 w 50 79 m 77.6 79 99 61.3 99 40 c 99 18.7 77.6 1 50 1 c"
+        " 22.4 1 1 18.7 1 40 c 1 61.3 22.4 79 50 79 c S",
+    ),
+    (
+        "Line",
+        [320, 470, 520, 530],
+        "/L [324 480 516 520] /C [0 0 0] /BS << /W 2 >>",
+        "0 0 0 RG 2 w 4 10 m 196 50 l S",
+    ),
+    (
+        "Polygon",
+        [72, 340, 272, 440],
+        "/Vertices [80 350 260 350 230 430 110 430] /C [0 0.5 0] /BS << /W 2 >>",
+        "0 0.5 0 RG 2 w 8 10 m 188 10 l 158 90 l 38 90 l h S",
+    ),
+    (
+        "PolyLine",
+        [320, 340, 520, 440],
+        "/Vertices [330 350 380 430 430 350 510 430] /C [0 0 0.6] /BS << /W 2 >>",
+        "0 0 0.6 RG 2 w 10 10 m 60 90 l 110 10 l 190 90 l S",
+    ),
+]
+# Drawn by neither file's reader: Hidden (`/F` bit 2), text and all.
+HIDDEN = ("Square", [72, 200, 172, 280], "/F 2 /C [1 0 0] /IC [1 0 0] /Contents (Hidden from view)", "1 0 0 rg 0 0 100 80 re f")
+
+
+def make_annots(path, with_ap):
+    """One A4 page with every annotation kind slice 2 draws, with their
+    appearance streams (`annots.pdf`) or without (`annots-noap.pdf`, whose
+    page is otherwise blank, so every pixel in a rectangle is the
+    annotation's)."""
+    pdf = RawPdf()
+    catalog, pages = pdf.reserve(), pdf.reserve()
+    multiply = pdf.add("<< /Type /ExtGState /BM /Multiply >>")
+    refs = []
+    for subtype, rect, entries, ops in [*ANNOTS, HIDDEN]:
+        r = " ".join(f"{v:g}" for v in rect)
+        ap = ""
+        if with_ap:
+            res = f"/ExtGState << /GS0 {multiply} 0 R >>" if "/GS0" in ops else ""
+            form = pdf.form(rect[2] - rect[0], rect[3] - rect[1], ops, res)
+            ap = f"/AP << /N {form} 0 R >>"
+        flags = "" if "/F " in entries else "/F 4"
+        refs.append(pdf.add(f"<< /Type /Annot /Subtype /{subtype} /Rect [{r}] {flags} {entries} {ap} >>"))
+    # Grey bars where text would be, under the text markup (annots.pdf only).
+    bars = "0.6 g " + " ".join(f"72 {y} 200 12 re f" for y in (760, 728, 698, 668)) if with_ap else ""
+    p = page(pdf, pages, bars, refs)
+    pdf.set(pages, f"<< /Type /Pages /Kids [{p} 0 R] /Count 1 >>")
+    pdf.set(catalog, f"<< /Type /Catalog /Pages {pages} 0 R >>")
+    pdf.write(path, catalog)
+
+
+def check_ap(pdf, on, w, h, round_=False):
+    """A check box's or radio button's on and off appearances."""
+    if round_:
+        r = min(w, h) / 2
+        cx, cy = w / 2, h / 2
+        k = 0.5523 * (r - 4)
+        dot = (
+            f"0 g {cx} {cy + r - 4} m {cx + k} {cy + r - 4} {cx + r - 4} {cy + k} {cx + r - 4} {cy} c"
+            f" {cx + r - 4} {cy - k} {cx + k} {cy - r + 4} {cx} {cy - r + 4} c"
+            f" {cx - k} {cy - r + 4} {cx - r + 4} {cy - k} {cx - r + 4} {cy} c"
+            f" {cx - r + 4} {cy + k} {cx - k} {cy + r - 4} {cx} {cy + r - 4} c f"
+        )
+        frame = f"0 G 1 w 0.5 0.5 {w - 1} {h - 1} re S"
+        on_ops, off_ops = f"{frame} {dot}", frame
+    else:
+        frame = f"0 G 1 w 0.5 0.5 {w - 1} {h - 1} re S"
+        on_ops = f"{frame} 0 G 2 w 3 {h / 2} m {w * 0.4} 3 l {w - 3} {h - 3} l S"
+        off_ops = frame
+    a = pdf.form(w, h, on_ops)
+    b = pdf.form(w, h, off_ops)
+    return f"/AP << /N << /{on} {a} 0 R /Off {b} 0 R >> >>"
+
+
+TX, BTN, CH, SIG = "/FT /Tx", "/FT /Btn", "/FT /Ch", "/FT /Sig"
+
+
+def make_forms(path):
+    """An AcroForm over two A4 pages: text fields (plain with MaxLen,
+    required, multi-line, password, comb, read-only), a check box, a radio
+    group, combo boxes (plain and editable) and list boxes (single and
+    multi-select), and a field on page 2."""
+    pdf = RawPdf()
+    catalog, pages = pdf.reserve(), pdf.reserve()
+    font = pdf.add(HELV)
+    p1, p2 = pdf.reserve(), pdf.reserve()
+    fields, page1_annots, lines = [], [], [(72, 790, "A form")]
+    da = "/DA (/Helv 11 Tf 0 g)"
+    mk = "/MK << /BC [0.5 0.5 0.5] /BG [1 1 1] >>"
+
+    def widget_of(field_entries, rect, extra="", page_ref=p1, annots=page1_annots):
+        r = " ".join(f"{v:g}" for v in rect)
+        n = pdf.add(
+            f"<< /Type /Annot /Subtype /Widget /Rect [{r}] /F 4 /P {page_ref} 0 R {mk}"
+            f" {field_entries} {extra} >>"
+        )
+        fields.append(n)
+        annots.append(n)
+        return n
+
+    # Rows from the top down: `top` is a row's top edge.
+    top = 770
+    for label, name, entries, h in [
+        ("Name", "name", f"{TX} /MaxLen 20 /TU (Your name) {da}", 20),
+        ("Email", "email", f"{TX} /Ff 2 /TU (Email address) {da}", 20),
+        ("Notes", "notes", f"{TX} /Ff 4096 {da}", 50),
+        ("PIN", "pin", f"{TX} /Ff 8192 {da}", 20),
+        ("Code", "code", f"{TX} /Ff 16777216 /MaxLen 6 {da}", 20),
+        ("Member id", "id", f"{TX} /Ff 1 /V (A-17) {da}", 20),
+    ]:
+        lines.append((72, top - 15, label))
+        widget_of(f"/T ({name}) {entries}", [200, top - h, 450, top])
+        top -= h + 16
+    y = top - 16
+    # A check box.
+    lines.append((72, y + 4, "I agree"))
+    widget_of(f"/T (agree) {BTN} /V /Off", [200, y, 216, y + 16], "/AS /Off " + check_ap(pdf, "Yes", 16, 16))
+    y -= 32
+    # A radio group: one field, three widgets.
+    group = pdf.reserve()
+    kids = []
+    lines.append((72, y + 4, "Colour"))
+    for i, colour in enumerate(("Red", "Green", "Blue")):
+        x = 200 + i * 80
+        lines.append((x + 20, y + 4, colour))
+        r = f"{x} {y} {x + 16} {y + 16}"
+        k = pdf.add(
+            f"<< /Type /Annot /Subtype /Widget /Rect [{r}] /F 4 /P {p1} 0 R {mk} /Parent {group} 0 R"
+            f" /AS /Off {check_ap(pdf, colour, 16, 16, round_=True)} >>"
+        )
+        kids.append(k)
+        page1_annots.append(k)
+    pdf.set(
+        group,
+        f"<< /T (colour) {BTN} /Ff 49152 /V /Off /Kids [{' '.join(f'{k} 0 R' for k in kids)}] >>",
+    )
+    fields.append(group)
+    top = y - 20
+    for label, name, entries, h in [
+        ("Size", "size", f"{CH} /Ff 131072 /Opt [(Small) (Medium) (Large)] {da}", 20),
+        ("City", "city", f"{CH} /Ff 393216 /Opt [(Paris) (Berlin) (Tokyo)] {da}", 20),
+        ("Fruit", "fruit", f"{CH} /Opt [(Apple) (Banana) (Cherry) (Date)] {da}", 56),
+        ("Tags", "tags", f"{CH} /Ff 2097152 /Opt [[(r) (Red)] [(g) (Green)] [(b) (Blue)]] {da}", 56),
+    ]:
+        lines.append((72, top - 15, label))
+        widget_of(f"/T ({name}) {entries}", [200, top - h, 450, top])
+        top -= h + 16
+    page(pdf, pages, labels(lines), page1_annots, font=font)
+    pdf.set(p1, pdf.objs.pop())
+    page2_annots = []
+    widget_of(f"/T (page2) {TX} {da}", [200, 700, 450, 720], page_ref=p2, annots=page2_annots)
+    page(pdf, pages, labels([(72, 705, "On page 2")]), page2_annots, font=font)
+    pdf.set(p2, pdf.objs.pop())
+    pdf.set(pages, f"<< /Type /Pages /Kids [{p1} 0 R {p2} 0 R] /Count 2 >>")
+    acro = (
+        f"<< /Fields [{' '.join(f'{f} 0 R' for f in fields)}] /DA (/Helv 0 Tf 0 g)"
+        f" /DR << /Font << /Helv {font} 0 R >> >> >>"
+    )
+    pdf.set(catalog, f"<< /Type /Catalog /Pages {pages} 0 R /AcroForm {acro} >>")
+    info = pdf.add("<< /Title (Forms corpus) /Author (docxy) >>")
+    pdf.write(path, catalog, info)
+
+
+def make_signed(path):
+    """A signed form: a signature field whose /V is a signature dictionary
+    (placeholders, no real signature), and a text field to fill."""
+    pdf = RawPdf()
+    catalog, pages = pdf.reserve(), pdf.reserve()
+    font = pdf.add(HELV)
+    p1 = pdf.reserve()
+    sig_v = pdf.add(
+        "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached"
+        f" /ByteRange [0 0 0 0] /Contents <{'00' * 64}> /M (D:20261124120000Z) >>"
+    )
+    box = pdf.form(200, 40, "0 G 1 w 0.5 0.5 199 39 re S")
+    sig = pdf.add(
+        f"<< /Type /Annot /Subtype /Widget /Rect [72 600 272 640] /F 4 /P {p1} 0 R"
+        f" /T (Signature1) {SIG} /V {sig_v} 0 R /AP << /N {box} 0 R >> >>"
+    )
+    name = pdf.add(
+        f"<< /Type /Annot /Subtype /Widget /Rect [72 700 322 720] /F 4 /P {p1} 0 R"
+        f" /T (name) {TX} /DA (/Helv 11 Tf 0 g) /MK << /BC [0.5 0.5 0.5] >> >>"
+    )
+    page(pdf, pages, labels([(72, 760, "A signed form"), (72, 650, "Signed here")]), [name, sig], font=font)
+    pdf.set(p1, pdf.objs.pop())
+    pdf.set(pages, f"<< /Type /Pages /Kids [{p1} 0 R] /Count 1 >>")
+    pdf.set(
+        catalog,
+        f"<< /Type /Catalog /Pages {pages} 0 R /AcroForm << /Fields [{name} 0 R {sig} 0 R]"
+        f" /SigFlags 3 /DA (/Helv 0 Tf 0 g) /DR << /Font << /Helv {font} 0 R >> >> >> >>",
+    )
+    pdf.write(path, catalog)
+
+
+SLICE2 = {
+    "links": make_links,
+    "annots": lambda p: make_annots(p, True),
+    "annots-noap": lambda p: make_annots(p, False),
+    "forms": make_forms,
+    "signed": make_signed,
+}
+
+
 def gs(ps, path):
     src = path + ".ps"
     with open(src, "w") as f:
@@ -313,12 +729,22 @@ def references(pdf, name):
 
 
 def main():
+    """With no arguments, every file; with names (`links forms ...`), only
+    those and their references: a run for the slice 2 files leaves the
+    slice 1 files, which cairo and gs do not write byte for byte again,
+    as they are."""
     for tool in ("gs", "pdftoppm"):
         if not shutil.which(tool):
             sys.exit(f"{tool} is needed")
+    only = set(sys.argv[1:])
+    unknown = only - {"text", "columns", "scanned", "slides", "vector", "rotated", "source", *SLICE2}
+    if unknown:
+        sys.exit(f"no such corpus file: {', '.join(sorted(unknown))}")
+    want = lambda name: not only or name in only
     os.makedirs(REF, exist_ok=True)
     for f in os.listdir(REF):
-        os.remove(os.path.join(REF, f))
+        if want(f.rsplit("-", 1)[0]):
+            os.remove(os.path.join(REF, f))
     made = {
         "text": make_text,
         "columns": make_columns,
@@ -326,20 +752,31 @@ def main():
         "slides": make_slides,
     }
     for name, make in made.items():
-        make(os.path.join(OUT, f"{name}.pdf"))
-    gs(VECTOR_PS, os.path.join(OUT, "vector.pdf"))
-    gs(ROTATED_PS, os.path.join(OUT, "rotated.pdf"))
-    for name in [*made, "vector", "rotated"]:
-        references(os.path.join(OUT, f"{name}.pdf"), name)
-    references(SOURCE_PDF, "source")
-    # pdf-view.uit opens only the harness's own files (uiharness/tests/
-    # cases.rs): byte-identical copies of the two it uses.
+        if want(name):
+            make(os.path.join(OUT, f"{name}.pdf"))
+    if want("vector"):
+        gs(VECTOR_PS, os.path.join(OUT, "vector.pdf"))
+    if want("rotated"):
+        gs(ROTATED_PS, os.path.join(OUT, "rotated.pdf"))
+    for name, make in SLICE2.items():
+        if want(name):
+            make(os.path.join(OUT, f"{name}.pdf"))
+    # References for the files drawn against poppler; the slice 2 files
+    # other than annots.pdf are checked by what they hold, not by pixels.
+    for name in [*made, "vector", "rotated", "annots"]:
+        if want(name):
+            references(os.path.join(OUT, f"{name}.pdf"), name)
+    if want("source"):
+        references(SOURCE_PDF, "source")
+    # The UI cases open only the harness's own files (uiharness/tests/
+    # cases.rs): byte-identical copies of the ones they use.
     fixtures = os.path.join(ROOT, "uiharness", "fixtures")
-    for name in ("slides", "text"):
-        shutil.copyfile(
-            os.path.join(OUT, f"{name}.pdf"),
-            os.path.join(fixtures, f"pdf-view-{name}.pdf"),
-        )
+    for name in ("slides", "text", "forms", "links", "annots", "signed"):
+        if want(name):
+            shutil.copyfile(
+                os.path.join(OUT, f"{name}.pdf"),
+                os.path.join(fixtures, f"pdf-view-{name}.pdf"),
+            )
 
 
 if __name__ == "__main__":
