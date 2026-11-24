@@ -47,7 +47,7 @@
 //! | `proj.sort` | `{column?, descending?}` (no `column` clears) | the same as `proj.view`; view state, not an edit |
 //! | `proj.filter` | `{column, values?}` or `{clear:true}` | the same as `proj.view`; `values` are the cell texts (one may contain `|`), `(Blanks)`, or on a date column `YYYY`, `YYYY-MM`, `YYYY-MM-DD`; no `values` clears that column |
 //! | `proj.highlight` | `{field, values}` / `{field, values: null}` / `{clear: true}` / `{}` | `{highlight: [{field, values}]}`: the highlight (#1667), view state, not an edit; the terminal draws no text styles, so it shows nowhere here (a UI plugin's command may still set it); see `projctl` |
-//! | `proj.save` | `{path?}` (.yppx/.xml, or a type a format plugin writes; extensionless adds .yppx) | `{path, …}` with the actual saved path |
+//! | `proj.save` | `{path?}` (.yppx/.xml, or a type a format plugin writes; extensionless adds .yppx) | `{path, …}` with the actual saved path, and `note` when the type drops Display on Timeline or Marked (#1618) |
 //! | `proj.reload` | — | `{path, …}` |
 //! | `proj.open` | `{path}` | `{path, …}` |
 //! | `field-read` | `{input?}` | a text prompt (`yppxy-prompt`, `yppxy-save-as`): `{input, value, focused, caret, selection, at, kind, keys, clicks, frames, dirty}`; with no `input`, the counters and the ids (`ctlcore::field`, #1204) |
@@ -91,9 +91,14 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
                 .map(str::to_string)
                 .or_else(|| app.path.clone())
                 .ok_or("project has no file path yet — pass {\"path\": …}")?;
-            app.save_to_path(&p)
+            let note = app
+                .save_to_path(&p)
                 .map_err(|e| format!("save failed: {e}"))?;
-            Ok(path_info(app))
+            let mut info = path_info(app);
+            if let (Json::Obj(fields), Some(note)) = (&mut info, note) {
+                fields.push(("note".into(), Json::Str(note)));
+            }
+            Ok(info)
         }
         "proj.reload" => {
             let Some(p) = app.path.clone() else {
@@ -350,6 +355,28 @@ mod tests {
         a.undo();
         a.redo();
         assert_eq!(a.ed.project().tasks[0].name, "A");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// #1618: `proj.save` to a type that drops Display on Timeline says so
+    /// in `note`; a `.yppx` save's reply has no `note`.
+    #[test]
+    fn save_returns_the_note_of_what_the_type_drops() {
+        let dir = std::env::temp_dir().join(format!("yppxy-control-note-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let save = |a: &mut App, name: &str| {
+            let path = dir.join(name).to_string_lossy().into_owned();
+            dispatch(a, "proj.save", &Json::obj(vec![("path", Json::Str(path))])).unwrap()
+        };
+        let mut a = app();
+        a.ed.set_display_on_timeline(1, true).unwrap();
+        assert_eq!(
+            save(&mut a, "plan.xml").get_str("note"),
+            Some("Display on Timeline is not saved in .xml files; save as .yppx to keep it")
+        );
+        let info = save(&mut a, "plan.yppx");
+        assert!(info.get("note").is_none());
+        assert!(info.get_str("path").is_some());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
