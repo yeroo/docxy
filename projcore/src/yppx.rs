@@ -44,6 +44,17 @@ const MAX_FLAG_PART: u64 = 8 * 1024 * 1024;
 /// written: Display on Timeline (#1536), Marked (#1667).
 const FLAG_PARTS: [&TaskFlagPart; 2] = [&timeline::FLAGS, &marked::FLAGS];
 
+/// The names of the flags only a `.yppx` package keeps (Display on Timeline,
+/// Marked) that some task of `proj` has on, in [`FLAG_PARTS`] order: what a
+/// save to another type loses (#1618).
+pub fn package_only(proj: &Project) -> Vec<&'static str> {
+    FLAG_PARTS
+        .iter()
+        .filter(|f| f.any_on(&proj.tasks))
+        .map(|f| f.label)
+        .collect()
+}
+
 /// Name of the main document part inside the package.
 pub const MAIN_PART: &str = "project.xml";
 

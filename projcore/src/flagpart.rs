@@ -8,9 +8,11 @@ use crate::model::Task;
 use opccore::xml::{Event, XmlParser};
 
 /// One flag's part: its name, content type, root element, the `<task>`
-/// attribute holding the value, and the task field it is kept in.
+/// attribute holding the value, the task field it is kept in, and the
+/// flag's name as Project shows it (what a save that drops it names, #1618).
 pub struct TaskFlagPart {
     pub part: &'static str,
+    pub label: &'static str,
     pub content_type: &'static str,
     pub root: &'static str,
     pub attr: &'static str,
@@ -22,6 +24,12 @@ impl TaskFlagPart {
     /// Whether any task states a value, so the part is written at all.
     pub fn any(&self, tasks: &[Task]) -> bool {
         tasks.iter().any(|t| (self.get)(t).is_some())
+    }
+
+    /// Whether any task has the flag on: what a save without the part loses,
+    /// since a flag read back absent is off, as `Some(false)` is.
+    pub fn any_on(&self, tasks: &[Task]) -> bool {
+        tasks.iter().any(|t| (self.get)(t) == Some(true))
     }
 
     /// The part's XML.
