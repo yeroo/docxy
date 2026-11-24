@@ -1081,6 +1081,8 @@ mod tests {
             // A rename is #1202's, wherever it is drawn.
             let want = match i.surface {
                 _ if i.id == "sheet-tab-rename" => BACKSTAGE,
+                // A PDF form's field is #2255's, the PDF view's boxes #2245's.
+                _ if i.id == "pdf-form-field" => PDF_FORMS,
                 Surface::Sheet => SHEET,
                 Surface::Doc => DOC,
                 Surface::Backstage => BACKSTAGE,

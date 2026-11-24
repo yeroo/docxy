@@ -447,9 +447,14 @@ impl Docxy {
                 }
                 self.persist(cx);
             }
-            // Last, written or not, as a document's save runs it (#2194).
+            // Last, written or not, as a document's save runs it (#2194);
+            // after this frame's drawing, as it may close the tab or end a
+            // quit.
             if let Some(after) = done.after {
-                after(self, window, cx);
+                cx.defer_in(window, move |this, window, cx| {
+                    after(this, window, cx);
+                    cx.notify();
+                });
             }
         }
     }
