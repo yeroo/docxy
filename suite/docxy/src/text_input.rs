@@ -27,41 +27,51 @@
 //! Unicode keyboard input (`SendInput` with `KEYEVENTF_UNICODE`: password
 //! managers' auto-type, AutoHotkey, on-screen keyboards) arrives as a
 //! `VK_PACKET` key-down, which gpui reports as no key at all, and then a
-//! WM_CHAR, which reaches nothing but the handler. A real key's key-down has
-//! already been typed by `on_key`, and its WM_CHAR follows it, so the root
-//! records the text each key-down owes ([`owed_text`]) and the handler drops
-//! WM_CHAR text that matches it, in order, typing only what matches nothing.
-//! The key's text is what gpui's own ToUnicode gave, which leaves the
-//! dead-key state alone for TranslateMessage: a plain dead key owes nothing
-//! (it makes WM_DEADCHAR) and the letter after it owes "é", which the one
-//! WM_CHAR "é" matches. The WM_CHAR may come late: TranslateMessage posts it,
-//! and a queue drained of input alone (gpui does that under load, and
-//! automation may queue a key's down and up at once) hands over the key-up
-//! and later key-downs first. So a debt outlives its key's key-up and waits
-//! for its text up to [`WM_CHAR_KEEP`] (60 s). A match pays only its own
-//! debt and drops none: the character may be a packet's, queued ahead of the
-//! WM_CHARs older debts wait for, and a WM_CHAR does not say which it is. So
-//! an AltGr dead key's accent, which never comes, waits out the keep time.
-//! A character pays the oldest debt that starts with it, preferring one sure
-//! to be paid. A packet's text that no debt starts with is typed: matched by
-//! text, not counted. A packet whose character a pending debt starts with
-//! pays that debt, and the key's own WM_CHAR is then typed in its place, so
-//! the text comes out the same. Packet text queued behind typed keys under
-//! load may land after their text. The
-//! handler never accepts text input there ([`accepts_text_input`]), so the
-//! Windows IME stays off as it was.
+//! WM_CHAR, which reaches nothing but the handler. TranslateMessage posts a
+//! key's WM_CHAR when gpui leaves its key-down unhandled, and posted messages
+//! come in order, so the WM_CHARs are the one ordered record of all the text,
+//! packets included. They may come late: a queue drained of input alone (gpui
+//! does that under load, and automation may queue a key's down and up at
+//! once) hands over the key-ups and later key-downs first.
+//!
+//! So Windows text is typed from the WM_CHARs (#1277), through one queue in
+//! key-down order ([`WmChars`]). A text key-down (plain or Shift, or AltGr:
+//! Ctrl+Alt that gpui flags as changing the character) is *withheld* from
+//! `on_key` while the root has the focus and the app takes text. A plain key
+//! is replayed unchanged when its first character comes, so every surface
+//! sees the keystroke it always did. An AltGr key types its characters as
+//! they come: its own Ctrl+Alt keystroke would reach `on_key`'s Ctrl
+//! commands. Under a text field (a dialog, a Project cell or prompt) an
+//! AltGr key types only while one is still open (#1162, #1312). A withheld
+//! key *holds*: every later key-down, Tab and Shift+Tab (gpui actions)
+//! included, waits behind it and is routed once its character has come, so
+//! commands keep their place among the characters ("a", "b", Backspace, "c"
+//! under a drain). Other keys go to `on_key` at once and owe their text
+//! ([`owed_text`]): a debt whose WM_CHAR is dropped. With no root focus
+//! there is no handler, so no WM_CHAR, and a key leaves no debt.
+//!
+//! A character pays the first entry still owed that starts with it among
+//! the leading entries that [`may_not_come`] and the first sure one after
+//! them, preferring the sure one. A character no candidate starts with is a
+//! packet's, sent before every key still owed, and is typed in its place.
+//! The candidates before the one paid that never came (an AltGr dead key's
+//! accent, which makes WM_DEADCHAR) are dropped; a key-down cannot tell an
+//! AltGr dead key from an AltGr character. A dead key's accent comes in the
+//! next key's text: a plain dead key reaches nothing ([`passes_to_on_key`])
+//! and owes nothing, and the next key owes the composed "é" or "´x". A
+//! WM_CHAR that does not come (an AltGr dead key, a key handled after the
+//! root) holds for [`WM_CHAR_WAIT`] at most: a plain key is then replayed
+//! as it was before #1277 and owes its text, and an AltGr key still types
+//! its character if it comes later. A command right after an AltGr dead key
+//! waits that long. A mouse-down releases every held key first, so a click
+//! acts after the keys before it. A packet's text against a command sent
+//! after it is not ordered: gpui hides the packet's key-down. The handler
+//! never accepts text input there ([`accepts_text_input`]), so the Windows
+//! IME stays off as it was.
 //!
 //! A replayed ⌥ key still carries ⌥. On macOS the document and the find bar
 //! type its character, but a dialog field swallows ⌥ keys, so the dialog is
-//! handed the plain typed key ⌥ made instead ([`modifier_char`], #1162). A
-//! Windows AltGr key (Ctrl+Alt) is swallowed there too, and its key-down
-//! cannot tell a character from an AltGr dead key, so under a text field (a
-//! dialog, or a Project cell or prompt) its debt is the field's
-//! ([`dialog_altgr`]): the WM_CHAR, which an AltGr dead key never sends,
-//! types the character while the field is open, and nothing once it is not. Under load that WM_CHAR may land after keys typed after it
-//! ("a", AltGr+Q, "b" giving "ab@"), or in the next field after a Tab, as
-//! packet text may (#1312). A plain dead key never reaches `on_key` ([`passes_to_on_key`]): the next
-//! key-down carries the composed text, whole, in its `key_char`.
+//! handed the plain typed key ⌥ made instead ([`modifier_char`], #1162).
 //!
 //! Linux registers no handler: it would hand it every unhandled printable
 //! key, which `on_key` has already typed. Off macOS the root also leaves
@@ -160,17 +170,20 @@ pub(crate) fn accepts_text_input(macos: bool, takes_text: bool) -> bool {
 /// this is typed again.
 pub(crate) const WM_CHAR_KEEP: Duration = Duration::from_secs(60);
 
-/// At most this many debts are kept; the oldest go first (#1139). Hygiene
-/// too: a WM_CHAR queued behind more key-downs than this is typed again.
-pub(crate) const WM_CHAR_MAX_DEBTS: usize = 4096;
+/// How long a withheld key holds the keys behind it while its WM_CHAR does
+/// not come (#1277). A WM_CHAR comes in the same pump pass as its key-down,
+/// or right after gpui's input drain. Past this an entry is no longer sure
+/// to be paid, and a debt that [`may_not_come`] is dropped.
+pub(crate) const WM_CHAR_WAIT: Duration = Duration::from_millis(250);
 
-/// The WM_CHAR text a Windows key-down `on_key` has typed will send (#1139):
-/// its printable text, or none. Alt alone makes WM_SYSCHAR, not WM_CHAR
-/// (AltGr is Ctrl+Alt, which does). A Win chord the shell lets through is
-/// translated like any key, so it owes its text. A plain dead key
-/// ([`plain_dead_key`]) makes WM_DEADCHAR, so it owes nothing. Under AltGr the flag marks every character the
-/// modifiers change too, so an AltGr dead key owes its accent ([`may_not_come`])
-/// until it lapses. "´" then X owes "´x", which comes as two WM_CHARs.
+/// The WM_CHAR text a Windows key-down will send (#1139): its printable
+/// text, or none. Alt alone makes WM_SYSCHAR, not WM_CHAR (AltGr is
+/// Ctrl+Alt, which does). A Win chord the shell lets through is translated
+/// like any key, so it owes its text. A plain dead key ([`plain_dead_key`])
+/// makes WM_DEADCHAR, so it owes nothing. Under AltGr the flag marks every
+/// character the modifiers change too, so an AltGr dead key owes its accent
+/// ([`may_not_come`]), which never comes. "´" then X owes "´x", which comes
+/// as two WM_CHARs.
 pub(crate) fn owed_text(ev: &KeyDownEvent) -> Option<String> {
     let m = &ev.keystroke.modifiers;
     if m.alt && !m.control {
@@ -279,8 +292,8 @@ pub(crate) fn char_stroke(c: char) -> Option<Keystroke> {
 /// The plain typed key a macOS key-down stands for when ⌥ made its
 /// character (#1162): ⌥ with no ⌃, ⌘ or Fn, as AppKit's commit of the key's
 /// own text replays it. `None` for any other key, and for every key off
-/// macOS: Windows' AltGr text reaches a dialog by its WM_CHAR instead
-/// ([`dialog_altgr`]). A dialog field types what this returns; `edit_key`
+/// macOS: Windows' AltGr text is typed from its WM_CHAR instead
+/// ([`Withheld::AltGr`]). A dialog field types what this returns; `edit_key`
 /// swallows every other ⌥ key.
 pub(crate) fn modifier_char(ev: &KeyDownEvent, macos: bool) -> Option<Keystroke> {
     let m = &ev.keystroke.modifiers;
@@ -300,17 +313,31 @@ pub(crate) fn dialog_stroke(ev: &KeyDownEvent, macos: bool) -> Keystroke {
     modifier_char(ev, macos).unwrap_or_else(|| ev.keystroke.clone())
 }
 
-/// Whether a Windows key-down is AltGr under an open text field that
-/// swallows it (#1162, #1312): a dialog, or the Project cell editor or
-/// prompt (`field_open` is true for any of them). It is Ctrl+Alt that gpui
-/// flags as changing the character. The field swallows it, as it does every
-/// Alt key, and the key-down cannot tell a character from an AltGr dead key
-/// (whose accent then joins the next letter). So it owes no WM_CHAR
-/// ([`ImeState::typed_key`]), and the WM_CHAR, which only a character
-/// sends, types the character into the field.
-pub(crate) fn dialog_altgr(ev: &KeyDownEvent, field_open: bool) -> bool {
+/// How a Windows text key-down is withheld from `on_key` (#1277).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Withheld {
+    /// No Ctrl, Alt or Win (Shift allowed): replayed unchanged when its
+    /// first character comes.
+    Plain,
+    /// Ctrl+Alt (no Win) that gpui flags as changing the character: each
+    /// character is typed as it comes, its Ctrl+Alt keystroke never.
+    AltGr,
+}
+
+/// Whether a Windows key-down that owes text ([`owed_text`]) is one that
+/// `route_key` withholds from `on_key` while the root has the focus and the
+/// app takes text, and how: see [`Withheld`]. `None` for every other key,
+/// which goes to `on_key` at once.
+pub(crate) fn withheld(ev: &KeyDownEvent) -> Option<Withheld> {
     let m = &ev.keystroke.modifiers;
-    field_open && m.control && m.alt && !m.platform && ev.prefer_character_input
+    owed_text(ev)?;
+    if !m.control && !m.alt && !m.platform && !m.function {
+        Some(Withheld::Plain)
+    } else if m.control && m.alt && !m.platform && ev.prefer_character_input {
+        Some(Withheld::AltGr)
+    } else {
+        None
+    }
 }
 
 fn typed(keystroke: Keystroke) -> KeyDownEvent {
@@ -325,22 +352,371 @@ fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
 }
 
-/// What one Windows key-down `on_key` typed still owes in WM_CHAR (#1139).
+/// What a queue entry stands for: a key-down, or the action-bound Tab or
+/// Shift+Tab, which gpui hands the root as an action, never as a key-down
+/// (#1037), and which waits behind a withheld key as any key does (#1277).
 #[derive(Clone, Debug)]
-struct Debt {
-    /// The text not yet matched.
+pub(crate) enum Input {
+    Key(KeyDownEvent),
+    Tab { shift: bool },
+}
+
+/// Where a queued input is (#1277).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State {
+    /// Behind a holding entry, not routed yet.
+    Waiting,
+    /// `on_key` has had it: its text is a debt whose characters are dropped.
+    Typed,
+    /// Withheld from `on_key` until its characters come.
+    Withheld(Withheld),
+}
+
+/// One input in [`WmChars`]'s queue.
+#[derive(Clone, Debug)]
+struct Entry {
+    input: Input,
+    /// The text whose WM_CHARs have not come.
     text: String,
-    /// When the key was typed, for [`WM_CHAR_KEEP`].
+    /// When it was queued or, once routed, routed: for [`WM_CHAR_WAIT`] and
+    /// [`WM_CHAR_KEEP`].
     at: Instant,
-    /// [`may_not_come`]: a newer debt's match drops it.
+    /// [`may_not_come`].
     may_not_come: bool,
-    /// An AltGr key a text field swallowed ([`dialog_altgr`]): its WM_CHAR types
-    /// the character while a dialog or a Project edit is open, and nothing once none is.
+    /// Past [`WM_CHAR_WAIT`]: no longer sure to be paid.
+    late: bool,
+    /// An AltGr key withheld under a text field: it types only while one is
+    /// still open (#1162, #1312).
     field: bool,
+    /// Withheld with its first character still to come: every later input
+    /// waits behind it.
+    holds: bool,
+    state: State,
+}
+
+impl Entry {
+    fn new(input: Input, now: Instant) -> Self {
+        let (text, may_not_come) = match &input {
+            Input::Key(ev) => (owed_text(ev).unwrap_or_default(), may_not_come(ev)),
+            Input::Tab { .. } => (String::new(), false),
+        };
+        Entry {
+            input,
+            text,
+            at: now,
+            may_not_come,
+            late: false,
+            field: false,
+            holds: false,
+            state: State::Waiting,
+        }
+    }
+
+    fn sure(&self) -> bool {
+        !self.may_not_come && !self.late
+    }
+}
+
+/// What [`WmChars`] needs of the app: the state that decides a key's route
+/// and the handlers it routes to. `Docxy` is one over its window; tests
+/// record what reaches it.
+pub(crate) trait KeyHost {
+    /// Whether a WM_CHAR can reach the input handler: gpui registers it only
+    /// while the root has the focus.
+    fn focused(&mut self) -> bool;
+    /// [`takes_text`].
+    fn takes_text(&mut self) -> bool;
+    /// [`field_open`].
+    fn text_field_open(&mut self) -> bool;
+    fn on_key(&mut self, ev: &KeyDownEvent);
+    /// The action-bound Tab, or Shift+Tab when `shift`.
+    fn tab(&mut self, shift: bool);
+}
+
+/// The Windows text queue (#1139, #1277): every key-down and Tab in order,
+/// what each still owes in WM_CHAR, and the keys withheld from `on_key`
+/// until their characters come. See the module doc. Off Windows
+/// (`windows` false) nothing is withheld, and a key `on_key` typed owes
+/// its text only for the harness's WM_CHAR twins.
+#[derive(Clone, Debug)]
+pub(crate) struct WmChars {
+    windows: bool,
+    entries: VecDeque<Entry>,
+    /// A timer for [`WmChars::release_lapsed`] is armed.
+    armed: bool,
+}
+
+impl Default for WmChars {
+    fn default() -> Self {
+        Self::new(WINDOWS)
+    }
+}
+
+impl WmChars {
+    pub(crate) fn new(windows: bool) -> Self {
+        WmChars {
+            windows,
+            entries: VecDeque::new(),
+            armed: false,
+        }
+    }
+
+    /// A key-down the root's listener got at `now`.
+    pub(crate) fn key_down(&mut self, ev: &KeyDownEvent, now: Instant, host: &mut impl KeyHost) {
+        self.input(Input::Key(ev.clone()), now, host);
+    }
+
+    /// The action-bound Tab (Shift+Tab when `shift`) at `now`.
+    pub(crate) fn tab(&mut self, shift: bool, now: Instant, host: &mut impl KeyHost) {
+        self.input(Input::Tab { shift }, now, host);
+    }
+
+    fn input(&mut self, input: Input, now: Instant, host: &mut impl KeyHost) {
+        self.release_lapsed(now, host);
+        let entry = Entry::new(input, now);
+        if self.holding() {
+            self.entries.push_back(entry);
+        } else if let Some(entry) = self.route(entry, now, host) {
+            self.entries.push_back(entry);
+        }
+    }
+
+    /// Whether input is held: a withheld key waits for its first character,
+    /// and maybe inputs behind it.
+    pub(crate) fn holding(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.holds || e.state == State::Waiting)
+    }
+
+    /// How long from `now` until the holding entry lapses, if one holds.
+    pub(crate) fn next_lapse(&self, now: Instant) -> Option<Duration> {
+        self.entries
+            .iter()
+            .find(|e| e.holds)
+            .map(|e| (e.at + WM_CHAR_WAIT).saturating_duration_since(now))
+    }
+
+    /// The WM_CHAR characters still owed, by typed and withheld keys and by
+    /// the keys waiting behind them.
+    pub(crate) fn owed(&self) -> usize {
+        self.entries.iter().map(|e| e.text.chars().count()).sum()
+    }
+
+    /// Routes one input now: a Tab runs; a text key is withheld while the
+    /// root has the focus and the app takes text (Windows only); any other
+    /// key goes to `on_key`, and owes its text while the root has the focus.
+    /// The entry to keep, if it still owes text.
+    fn route(&self, mut e: Entry, now: Instant, host: &mut impl KeyHost) -> Option<Entry> {
+        let ev = match &e.input {
+            Input::Tab { shift } => {
+                host.tab(*shift);
+                return None;
+            }
+            Input::Key(ev) => ev.clone(),
+        };
+        // A Windows dead key types nothing: the composed text comes with the
+        // next key (#1312).
+        if !passes_to_on_key(&ev, self.windows) {
+            return None;
+        }
+        e.at = now;
+        // No handler, so no WM_CHAR: nothing to wait for, nothing owed.
+        if !host.focused() {
+            host.on_key(&ev);
+            return None;
+        }
+        if self.windows && host.takes_text() {
+            if let Some(how) = withheld(&ev) {
+                e.field = how == Withheld::AltGr && host.text_field_open();
+                e.state = State::Withheld(how);
+                e.holds = true;
+                return Some(e);
+            }
+        }
+        host.on_key(&ev);
+        e.state = State::Typed;
+        (!e.text.is_empty()).then_some(e)
+    }
+
+    /// Routes the waiting inputs, in order, up to the next one that holds.
+    fn release(&mut self, now: Instant, host: &mut impl KeyHost) {
+        let mut i = 0;
+        while i < self.entries.len() {
+            if self.entries[i].holds {
+                return;
+            }
+            if self.entries[i].state != State::Waiting {
+                i += 1;
+                continue;
+            }
+            let Some(e) = self.entries.remove(i) else {
+                return;
+            };
+            if let Some(e) = self.route(e, now, host) {
+                let holds = e.holds;
+                self.entries.insert(i, e);
+                if holds {
+                    return;
+                }
+                i += 1;
+            }
+        }
+    }
+
+    /// A withheld key stops holding before its character came: a plain key
+    /// is replayed now, as it was before #1277, and owes its text; an AltGr
+    /// key still types its character if it comes.
+    fn unhold(e: &mut Entry, host: &mut impl KeyHost) {
+        e.holds = false;
+        if e.state == State::Withheld(Withheld::Plain) {
+            e.state = State::Typed;
+            if let Input::Key(ev) = &e.input {
+                if host.takes_text() {
+                    host.on_key(ev);
+                }
+            }
+        }
+    }
+
+    /// At `now`: an entry past [`WM_CHAR_WAIT`] is no longer sure, a
+    /// holding one stops holding ([`WmChars::unhold`]), and a typed key's
+    /// debt that [`may_not_come`] is dropped, so a later packet's character
+    /// is never swallowed by it. Anything past [`WM_CHAR_KEEP`] goes. Then
+    /// the inputs behind are routed.
+    pub(crate) fn release_lapsed(&mut self, now: Instant, host: &mut impl KeyHost) {
+        for e in &mut self.entries {
+            if e.state == State::Waiting || now.saturating_duration_since(e.at) <= WM_CHAR_WAIT {
+                continue;
+            }
+            e.late = true;
+            if e.holds {
+                Self::unhold(e, host);
+            }
+        }
+        self.entries.retain(|e| {
+            e.state == State::Waiting
+                || !(e.state == State::Typed && e.may_not_come && e.late)
+                    && now.saturating_duration_since(e.at) <= WM_CHAR_KEEP
+        });
+        self.release(now, host);
+    }
+
+    /// Releases every held input now, in order (a mouse-down acts after the
+    /// keys before it): as [`WmChars::release_lapsed`] does at the time
+    /// limit, each withheld key stops holding.
+    pub(crate) fn flush(&mut self, now: Instant, host: &mut impl KeyHost) {
+        while self.holding() {
+            for e in &mut self.entries {
+                if e.holds {
+                    Self::unhold(e, host);
+                }
+            }
+            self.release(now, host);
+        }
+    }
+
+    /// Windows' WM_CHAR at `now` (a surrogate pair joined by gpui): each
+    /// character pays its entry and acts there, or is typed as a packet's.
+    /// See the module doc. Empty text (an IME message gpui forwards)
+    /// changes nothing but what has lapsed.
+    pub(crate) fn char_message(&mut self, text: &str, now: Instant, host: &mut impl KeyHost) {
+        self.release_lapsed(now, host);
+        for c in text.chars() {
+            self.char(c, now, host);
+            self.release(now, host);
+        }
+    }
+
+    fn char(&mut self, c: char, now: Instant, host: &mut impl KeyHost) {
+        // The candidates: the leading entries owed that may not come, and
+        // the first sure one; the sure one first.
+        let mut sure = None;
+        let mut unsure = None;
+        for (i, e) in self.entries.iter().enumerate() {
+            if e.text.is_empty() {
+                continue;
+            }
+            if e.sure() {
+                sure = Some(i);
+                break;
+            }
+            if unsure.is_none() && e.text.starts_with(c) {
+                unsure = Some(i);
+            }
+        }
+        let paid = sure
+            .filter(|&i| self.entries[i].text.starts_with(c))
+            .or(unsure);
+        let Some(mut i) = paid else {
+            // A packet's, sent before every key still owed.
+            if host.takes_text() {
+                if let Some(k) = char_stroke(c) {
+                    host.on_key(&typed(k));
+                }
+            }
+            return;
+        };
+        // Before it: the inputs that waited run, and the withheld or waiting
+        // candidates whose character never came (AltGr dead keys) go. A
+        // typed key's debt stays until it lapses: it may be a packet's
+        // character that came first.
+        let mut j = 0;
+        while j < i {
+            let e = &self.entries[j];
+            if e.state == State::Typed || (e.text.is_empty() && e.state != State::Waiting) {
+                j += 1;
+                continue;
+            }
+            let Some(e) = self.entries.remove(j) else {
+                return;
+            };
+            i -= 1;
+            if e.text.is_empty() {
+                if let Some(e) = self.route(e, now, host) {
+                    self.entries.insert(j, e);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        if self.entries[i].state == State::Waiting {
+            let Some(e) = self.entries.remove(i) else {
+                return;
+            };
+            match self.route(e, now, host) {
+                Some(e) => self.entries.insert(i, e),
+                // `on_key` had it and nothing is owed: the character is its.
+                None => return,
+            }
+        }
+        let e = &mut self.entries[i];
+        match e.state {
+            State::Withheld(Withheld::Plain) => Self::unhold(e, host),
+            State::Withheld(Withheld::AltGr) => {
+                e.holds = false;
+                let types = if e.field {
+                    host.text_field_open()
+                } else {
+                    host.takes_text()
+                };
+                if types {
+                    if let Some(k) = char_stroke(c) {
+                        host.on_key(&typed(k));
+                    }
+                }
+            }
+            State::Typed | State::Waiting => {}
+        }
+        e.text.drain(..c.len_utf8());
+        if e.text.is_empty() {
+            self.entries.remove(i);
+        }
+    }
 }
 
 /// The composition in progress and the key AppKit has been handed, and on
-/// Windows the WM_CHAR characters a typed key still owes.
+/// Windows the WM_CHAR queue.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ImeState {
     /// The provisional text (`setMarkedText:`), shown nowhere yet; `None`
@@ -351,9 +727,8 @@ pub(crate) struct ImeState {
     /// input context takes first, during a composition, does not clear it,
     /// and `mark` has by then.)
     pending: Option<KeyDownEvent>,
-    /// Windows: the WM_CHAR text each key-down `on_key` typed still owes,
-    /// oldest first, and when it was typed (#1139).
-    owed: VecDeque<Debt>,
+    /// Windows: the key-downs and their WM_CHARs, in order (#1139, #1277).
+    wm_chars: WmChars,
 }
 
 impl ImeState {
@@ -367,87 +742,9 @@ impl ImeState {
         self.pending = None;
     }
 
-    /// [`ImeState::typed_key`] with no dialog open.
-    #[cfg(test)]
-    pub(crate) fn key_down(&mut self, ev: &KeyDownEvent, now: Instant) {
-        self.owe(ev, now, false);
-    }
-
-    /// Windows: a key-down `on_key` typed at `now`, `field_open` when a text
-    /// field (a dialog, or a Project cell or prompt) was open; its WM_CHAR is
-    /// on the way, maybe behind the WM_CHARs of keys before it. AltGr under
-    /// such a field, which `on_key` did not type ([`dialog_altgr`]), owes the
-    /// field: its WM_CHAR types the character only while a field is still
-    /// open.
-    pub(crate) fn typed_key(&mut self, ev: &KeyDownEvent, now: Instant, field_open: bool) {
-        self.owe(ev, now, dialog_altgr(ev, field_open));
-    }
-
-    fn owe(&mut self, ev: &KeyDownEvent, now: Instant, field: bool) {
-        self.lapse(now);
-        if let Some(text) = owed_text(ev) {
-            if self.owed.len() == WM_CHAR_MAX_DEBTS {
-                self.owed.pop_front();
-            }
-            self.owed.push_back(Debt {
-                text,
-                at: now,
-                may_not_come: may_not_come(ev),
-                field,
-            });
-        }
-    }
-
-    /// Drops the debts kept past [`WM_CHAR_KEEP`].
-    fn lapse(&mut self, now: Instant) {
-        self.owed
-            .retain(|d| now.saturating_duration_since(d.at) <= WM_CHAR_KEEP);
-    }
-
-    /// Windows' WM_CHAR at `now` (a surrogate pair joined by gpui): the key
-    /// events that type what no key-down typed already, one per character.
-    /// Each character pays the oldest debt that starts with it, preferring
-    /// one sure to be paid over one that [`may_not_come`]. Only that debt
-    /// changes, and none is dropped: the character may be a packet's, ahead
-    /// of the WM_CHARs older debts still wait for (an older AltGr debt among
-    /// them). A character no debt starts with (a packet's) is typed and
-    /// leaves the debts as they are. A character that pays a dialog's
-    /// AltGr debt is typed when a text field is open (`field_open`), else dropped (#1162). Empty
-    /// text (an IME message gpui forwards) changes nothing.
-    pub(crate) fn char_message(
-        &mut self,
-        text: &str,
-        now: Instant,
-        field_open: bool,
-    ) -> Vec<KeyDownEvent> {
-        self.lapse(now);
-        let mut keys = Vec::new();
-        for c in text.chars() {
-            let owes = |d: &Debt| d.text.starts_with(c);
-            let found = self
-                .owed
-                .iter()
-                .position(|d| !d.may_not_come && owes(d))
-                .or_else(|| self.owed.iter().position(owes));
-            let Some(i) = found else {
-                keys.extend(char_stroke(c).map(typed));
-                continue;
-            };
-            let debt = &mut self.owed[i];
-            if debt.field && field_open {
-                keys.extend(char_stroke(c).map(typed));
-            }
-            debt.text.drain(..c.len_utf8());
-            if debt.text.is_empty() {
-                self.owed.remove(i);
-            }
-        }
-        keys
-    }
-
-    /// The WM_CHAR characters typed keys still owe, lapsed or not.
+    /// The WM_CHAR characters still owed.
     pub(crate) fn owed(&self) -> usize {
-        self.owed.iter().map(|d| d.text.chars().count()).sum()
+        self.wm_chars.owed()
     }
 
     pub(crate) fn marked(&self) -> Option<&str> {
@@ -519,18 +816,9 @@ impl Docxy {
             }
             Route::AppPropagate => {
                 self.ime.forget_key();
-                // Whether a text field (a dialog, a Project cell or prompt)
-                // took the key is decided before on_key, which may close it.
-                let field_open = self.text_field_open();
-                // A Windows dead key types nothing: the composed text comes
-                // with the next key (#1312).
-                if !passes_to_on_key(ev, cfg!(windows)) {
-                    return;
-                }
-                self.on_key(ev, window, cx);
-                // After on_key, which may run long (a save): the debt's
-                // keeping time starts once the key is typed.
-                self.ime.typed_key(ev, Instant::now(), field_open);
+                let mut q = self.take_wm_chars();
+                q.key_down(ev, Instant::now(), &mut Host::new(self, window, cx));
+                self.put_wm_chars(q, window, cx);
             }
             Route::MenuBar => self.ime.forget_key(),
         }
@@ -542,16 +830,74 @@ impl Docxy {
         self.type_committed(keys, window, cx);
     }
 
-    /// Windows' WM_CHAR (#1139): see [`ImeState::char_message`]. Text is
+    /// Windows' WM_CHAR (#1139): see [`WmChars::char_message`]. Text is
     /// typed only while the app takes it; under KeyTips or a menu its
     /// letters would be commands.
     pub(crate) fn windows_char(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let keys = self
-            .ime
-            .char_message(text, Instant::now(), self.text_field_open());
-        if !keys.is_empty() && self.takes_text() {
-            self.type_committed(keys, window, cx);
+        let mut q = self.take_wm_chars();
+        q.char_message(text, Instant::now(), &mut Host::new(self, window, cx));
+        self.put_wm_chars(q, window, cx);
+        cx.notify();
+    }
+
+    /// The action-bound Tab, or Shift+Tab when `shift`: at once, or behind
+    /// a withheld key's text (#1277).
+    pub(crate) fn queued_tab(&mut self, shift: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let mut q = self.take_wm_chars();
+        q.tab(shift, Instant::now(), &mut Host::new(self, window, cx));
+        self.put_wm_chars(q, window, cx);
+    }
+
+    /// A mouse-down: the held keys go first, so the press acts after the
+    /// keys typed before it (#1277).
+    pub(crate) fn flush_wm_chars(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.ime.wm_chars.holding() {
+            return;
         }
+        let mut q = self.take_wm_chars();
+        q.flush(Instant::now(), &mut Host::new(self, window, cx));
+        self.put_wm_chars(q, window, cx);
+        cx.notify();
+    }
+
+    /// Whether a WM_CHAR for a key-down now would reach the input handler,
+    /// which gpui registers only while the root has the focus: what the
+    /// harness's WM_CHAR twins follow.
+    pub(crate) fn wm_char_reaches(&self, window: &Window) -> bool {
+        self.focus.is_focused(window)
+    }
+
+    /// The queue, out of `self` while its host (`self`) runs keys.
+    fn take_wm_chars(&mut self) -> WmChars {
+        std::mem::take(&mut self.ime.wm_chars)
+    }
+
+    /// The queue back, and its lapse timer armed while a key holds.
+    fn put_wm_chars(&mut self, q: WmChars, window: &mut Window, cx: &mut Context<Self>) {
+        let nested = std::mem::replace(&mut self.ime.wm_chars, q);
+        // Nothing queues while the queue is out; keep it if anything did.
+        self.ime.wm_chars.entries.extend(nested.entries);
+        let q = &mut self.ime.wm_chars;
+        let Some(wait) = q.next_lapse(Instant::now()) else {
+            return;
+        };
+        if q.armed {
+            return;
+        }
+        q.armed = true;
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(wait + Duration::from_millis(1))
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.ime.wm_chars.armed = false;
+                let mut q = this.take_wm_chars();
+                q.release_lapsed(Instant::now(), &mut Host::new(this, window, cx));
+                this.put_wm_chars(q, window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// A text field that swallows AltGr is open: a dialog, or the Project
@@ -582,6 +928,45 @@ impl Docxy {
             self.on_key(ev, window, cx);
         }
         cx.notify();
+    }
+}
+
+/// `Docxy` as the queue's [`KeyHost`], over its window.
+struct Host<'a, 'b> {
+    app: &'a mut Docxy,
+    window: &'a mut Window,
+    cx: &'a mut Context<'b, Docxy>,
+}
+
+impl<'a, 'b> Host<'a, 'b> {
+    fn new(app: &'a mut Docxy, window: &'a mut Window, cx: &'a mut Context<'b, Docxy>) -> Self {
+        Host { app, window, cx }
+    }
+}
+
+impl KeyHost for Host<'_, '_> {
+    fn focused(&mut self) -> bool {
+        self.app.wm_char_reaches(self.window)
+    }
+
+    fn takes_text(&mut self) -> bool {
+        self.app.takes_text()
+    }
+
+    fn text_field_open(&mut self) -> bool {
+        self.app.text_field_open()
+    }
+
+    fn on_key(&mut self, ev: &KeyDownEvent) {
+        self.app.on_key(ev, self.window, self.cx);
+    }
+
+    fn tab(&mut self, shift: bool) {
+        if shift {
+            self.app.shift_tab_key(self.window, self.cx);
+        } else {
+            self.app.tab_key(self.window, self.cx);
+        }
     }
 }
 
@@ -1093,112 +1478,6 @@ mod tests {
         assert!(!plain_dead_key(&empty));
     }
 
-    /// Windows (#1312): the debt is the field's: typed once from the WM_CHAR
-    /// while `field_open`, and nothing once it closed. `field_open` is
-    /// decided by [`field_open`], tested below.
-    #[test]
-    fn altgr_under_any_text_field_is_typed_by_its_wm_char() {
-        let at = t0();
-        let mut ime = ImeState::default();
-        ime.typed_key(&altgr("q", "@"), at, true);
-        assert_eq!(key_chars(&ime.char_message("@", at, true)), ["@"]);
-        ime.typed_key(&altgr("q", "@"), at, true);
-        assert!(ime.char_message("@", at, false).is_empty());
-        assert_eq!(ime.owed(), 0);
-    }
-
-    /// Windows (#1162): under a dialog an AltGr key, character or dead key
-    /// alike, owes the dialog, so the WM_CHAR a character sends types it
-    /// once while a dialog is open and a dead key's accent joins the next
-    /// letter as it should.
-    #[test]
-    fn altgr_under_a_dialog_is_typed_by_its_wm_char() {
-        let at = t0();
-        let mut ime = ImeState::default();
-        assert!(dialog_altgr(&altgr("e", "€"), true));
-        ime.typed_key(&altgr("e", "€"), at, true);
-        assert_eq!(ime.owed(), 1);
-        assert_eq!(key_chars(&ime.char_message("€", at, true)), ["€"]);
-        assert_eq!(ime.owed(), 0);
-        // AltGr+4 dead "~" sends WM_DEADCHAR; N then owes and pays "ñ".
-        let tilde = dead("4", "~", ctrl_alt());
-        assert!(dialog_altgr(&tilde, true));
-        ime.typed_key(&tilde, at, true);
-        ime.typed_key(&typed(plain("n", "ñ")), at, true);
-        assert!(ime.char_message("ñ", at, true).is_empty());
-        // The dead key's debt waits out the keep time, as in the document.
-        assert_eq!(ime.owed(), 1);
-        assert!(ime.char_message("x", ms(at, 61_000), true).len() == 1);
-        assert_eq!(ime.owed(), 0);
-        // With no dialog, the document's AltGr debt is kept as before.
-        assert!(!dialog_altgr(&altgr("e", "€"), false));
-        ime.typed_key(&altgr("e", "€"), at, false);
-        assert!(ime.char_message("€", at, true).is_empty());
-        assert_eq!(ime.owed(), 0);
-    }
-
-    /// Windows (#1162): an AltGr WM_CHAR that comes after the dialog closed
-    /// (gpui drained the Enter first) types nothing into the surface below,
-    /// and pays its debt. A packet with the debt's character pays it while
-    /// the dialog is open and is typed once; the key's own WM_CHAR then is
-    /// too, so both come out.
-    #[test]
-    fn a_late_altgr_wm_char_types_nothing_once_the_dialog_closed() {
-        let at = t0();
-        let mut ime = ImeState::default();
-        ime.typed_key(&altgr("q", "@"), at, true);
-        ime.typed_key(
-            &typed(stroke("enter", Some("\r"), Modifiers::default())),
-            at,
-            true,
-        );
-        assert!(ime.char_message("@", at, false).is_empty());
-        assert_eq!(ime.owed(), 0);
-        ime.typed_key(&altgr("q", "@"), at, true);
-        assert_eq!(key_chars(&ime.char_message("@", at, true)), ["@"]);
-        assert_eq!(key_chars(&ime.char_message("@", at, true)), ["@"]);
-        assert_eq!(ime.owed(), 0);
-    }
-
-    /// Only AltGr owes the dialog (#1162): plain keys, plain Alt
-    /// (WM_SYSCHAR), Ctrl+Alt that changed nothing and a Win chord keep
-    /// their debts, so their WM_CHAR is still not typed again.
-    #[test]
-    fn other_keys_under_a_dialog_keep_their_debts() {
-        let win_altgr = KeyDownEvent {
-            keystroke: stroke(
-                "e",
-                Some("€"),
-                Modifiers {
-                    platform: true,
-                    ..ctrl_alt()
-                },
-            ),
-            ..altgr("e", "€")
-        };
-        for (ev, wm_char) in [
-            (typed(plain("a", "a")), "a"),
-            (typed(stroke("g", Some("g"), alt())), "g"),
-            (dead("g", "g", alt()), "g"),
-            (typed(stroke("e", Some("€"), ctrl_alt())), "€"),
-            (dead("´", "´", Modifiers::default()), "´"),
-            (win_altgr, "€"),
-        ] {
-            assert!(!dialog_altgr(&ev, true), "{}", ev.keystroke);
-            let mut a = ImeState::default();
-            let mut b = ImeState::default();
-            a.typed_key(&ev, t0(), true);
-            b.key_down(&ev, t0());
-            assert_eq!(a.owed(), b.owed(), "{}", ev.keystroke);
-            assert_eq!(
-                key_chars(&a.char_message(wm_char, t0(), true)),
-                key_chars(&b.char_message(wm_char, t0(), true)),
-                "{}",
-                ev.keystroke
-            );
-        }
-    }
-
     /// Keys whose modifiers made no character stay as they are (#1162):
     /// ⌥ arrows, ⌥⌫ and ⌥Enter; ⌃⌥ and ⌘⌥ chords on macOS; and every key
     /// off macOS, Windows' AltGr included (its WM_CHAR types it).
@@ -1251,243 +1530,666 @@ mod tests {
         at + Duration::from_millis(n)
     }
 
+    /// A recording [`KeyHost`]: what reaches `on_key`, in order. A key with
+    /// printable text and no Ctrl, Alt or Win is its text ("[shift-space]"
+    /// for Shift+Space), any other is "[mods-key]", and a key taken while
+    /// KeyTips are up is "kt:key". F10 toggles KeyTips, as `on_key` does;
+    /// Enter closes the dialog.
+    struct Rec {
+        focused: bool,
+        keytips: bool,
+        dialog: bool,
+        log: Vec<String>,
+    }
+
+    impl Default for Rec {
+        fn default() -> Self {
+            Rec {
+                focused: true,
+                keytips: false,
+                dialog: false,
+                log: Vec::new(),
+            }
+        }
+    }
+
+    fn label(k: &Keystroke) -> String {
+        let m = &k.modifiers;
+        let text = k
+            .key_char
+            .as_deref()
+            .filter(|t| !t.is_empty() && !t.chars().any(char::is_control));
+        match text {
+            Some(t) if !m.control && !m.alt && !m.platform && !(m.shift && k.key == "space") => {
+                t.to_string()
+            }
+            _ => {
+                let mut s = String::from("[");
+                for (on, name) in [
+                    (m.control, "ctrl-"),
+                    (m.alt, "alt-"),
+                    (m.platform, "win-"),
+                    (m.shift, "shift-"),
+                ] {
+                    if on {
+                        s.push_str(name);
+                    }
+                }
+                s.push_str(&k.key);
+                s.push(']');
+                s
+            }
+        }
+    }
+
+    impl KeyHost for Rec {
+        fn focused(&mut self) -> bool {
+            self.focused
+        }
+
+        fn takes_text(&mut self) -> bool {
+            takes_text(self.dialog, self.keytips, false)
+        }
+
+        fn text_field_open(&mut self) -> bool {
+            self.dialog
+        }
+
+        fn on_key(&mut self, ev: &KeyDownEvent) {
+            let k = &ev.keystroke;
+            let entry = if self.keytips && k.key != "f10" {
+                format!("kt:{}", k.key)
+            } else {
+                label(k)
+            };
+            self.log.push(entry);
+            match k.key.as_str() {
+                "f10" => self.keytips = !self.keytips,
+                "enter" => self.dialog = false,
+                _ => {}
+            }
+        }
+
+        fn tab(&mut self, shift: bool) {
+            self.log
+                .push(if shift { "[shift-tab]" } else { "[tab]" }.into());
+        }
+    }
+
+    /// The Windows queue and an editable surface with the root focused.
+    fn win() -> (WmChars, Rec) {
+        (WmChars::new(true), Rec::default())
+    }
+
+    /// The same off Windows: nothing is withheld, typed keys owe their
+    /// text for the harness's WM_CHAR twins.
+    fn lin() -> (WmChars, Rec) {
+        (WmChars::new(false), Rec::default())
+    }
+
+    /// What reached the host since the last call.
+    fn took(r: &mut Rec) -> Vec<String> {
+        std::mem::take(&mut r.log)
+    }
+
+    fn keys(q: &mut WmChars, r: &mut Rec, at: Instant, evs: &[KeyDownEvent]) {
+        for ev in evs {
+            q.key_down(ev, at, r);
+        }
+    }
+
+    fn chars(q: &mut WmChars, r: &mut Rec, at: Instant, texts: &[&str]) {
+        for t in texts {
+            q.char_message(t, at, r);
+        }
+    }
+
+    fn key(c: &str) -> KeyDownEvent {
+        typed(plain(c, c))
+    }
+
+    fn cmd(name: &str) -> KeyDownEvent {
+        typed(stroke(name, None, Modifiers::default()))
+    }
+
+    fn after_wait(at: Instant) -> Instant {
+        at + WM_CHAR_WAIT + Duration::from_millis(1)
+    }
+
+    #[test]
+    fn plain_and_altgr_text_keys_are_withheld_others_are_not() {
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let ctrl = Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        let win_altgr = KeyDownEvent {
+            keystroke: stroke(
+                "e",
+                Some("€"),
+                Modifiers {
+                    platform: true,
+                    ..ctrl_alt()
+                },
+            ),
+            ..altgr("e", "€")
+        };
+        assert_eq!(withheld(&key("a")), Some(Withheld::Plain));
+        assert_eq!(
+            withheld(&typed(stroke("a", Some("A"), shift))),
+            Some(Withheld::Plain)
+        );
+        assert_eq!(withheld(&altgr("e", "€")), Some(Withheld::AltGr));
+        assert_eq!(withheld(&dead("4", "~", ctrl_alt())), Some(Withheld::AltGr));
+        for ev in [
+            cmd("enter"),
+            typed(stroke("a", Some("\u{1}"), ctrl)),
+            typed(stroke("c", Some("c"), ctrl)),
+            typed(stroke("g", Some("g"), alt())),
+            typed(stroke("e", Some("e"), ctrl_alt())),
+            win_altgr,
+            dead("´", "´", Modifiers::default()),
+        ] {
+            assert_eq!(withheld(&ev), None, "{}", ev.keystroke);
+        }
+    }
+
+    /// r1-p1 (#1277): AltGr never reaches `on_key` as Ctrl+Alt, so it runs
+    /// no Ctrl command (Polish AltGr+C "ć" is not Copy) and is not dropped:
+    /// its WM_CHAR types the character once.
+    #[test]
+    fn altgr_types_its_character_and_no_ctrl_alt_key() {
+        let (mut q, mut r) = win();
+        let at = t0();
+        for (k, c) in [("e", "€"), ("c", "ć"), ("s", "ś"), ("q", "@")] {
+            q.key_down(&altgr(k, c), at, &mut r);
+            assert!(took(&mut r).is_empty(), "{c}: withheld");
+            q.char_message(c, at, &mut r);
+            assert_eq!(took(&mut r), [c]);
+        }
+        assert_eq!(q.owed(), 0);
+        assert!(!q.holding());
+    }
+
+    /// r3-m1 (#1277): a packet "ï" among typed keys, every WM_CHAR after
+    /// the last key-down (gpui's input drain): "naïve", not "naveï".
+    #[test]
+    fn packet_text_keeps_its_place_among_typed_keys() {
+        let (mut q, mut r) = win();
+        let at = t0();
+        keys(
+            &mut q,
+            &mut r,
+            at,
+            &[key("n"), key("a"), key("v"), key("e")],
+        );
+        assert!(took(&mut r).is_empty());
+        chars(&mut q, &mut r, ms(at, 5), &["n", "a", "ï", "v", "e"]);
+        assert_eq!(took(&mut r), ["n", "a", "ï", "v", "e"]);
+        assert_eq!(q.owed(), 0);
+    }
+
+    /// Commands wait behind the text typed before them (#1277): Backspace
+    /// after "ab", and Enter after an AltGr "@" in a dialog, which the "@"
+    /// reaches before Enter closes it.
+    #[test]
+    fn commands_keep_their_place_among_late_characters() {
+        let (mut q, mut r) = win();
+        let at = t0();
+        keys(
+            &mut q,
+            &mut r,
+            at,
+            &[key("a"), key("b"), cmd("backspace"), key("c")],
+        );
+        assert!(took(&mut r).is_empty());
+        chars(&mut q, &mut r, ms(at, 5), &["a", "b", "c"]);
+        assert_eq!(took(&mut r), ["a", "b", "[backspace]", "c"]);
+        r.dialog = true;
+        keys(&mut q, &mut r, at, &[altgr("q", "@"), cmd("enter")]);
+        assert!(took(&mut r).is_empty());
+        assert!(r.dialog);
+        chars(&mut q, &mut r, ms(at, 5), &["@"]);
+        assert_eq!(took(&mut r), ["@", "[enter]"]);
+        assert!(!r.dialog);
+    }
+
+    /// Tab and Shift+Tab, which gpui hands the root as actions, wait too:
+    /// auto-type "a", Tab, "b" puts "a" in the first field.
+    #[test]
+    fn tab_waits_behind_the_text_before_it() {
+        let (mut q, mut r) = win();
+        let at = t0();
+        q.key_down(&key("a"), at, &mut r);
+        q.tab(false, at, &mut r);
+        q.key_down(&key("b"), at, &mut r);
+        q.tab(true, at, &mut r);
+        assert!(took(&mut r).is_empty());
+        chars(&mut q, &mut r, ms(at, 5), &["a", "b"]);
+        assert_eq!(took(&mut r), ["a", "[tab]", "b", "[shift-tab]"]);
+        // With nothing held, a Tab runs at once.
+        q.tab(false, at, &mut r);
+        assert_eq!(took(&mut r), ["[tab]"]);
+    }
+
+    /// r4-m1.2 (#1277): an AltGr dead key's accent, which never comes, never
+    /// swallows a later packet's "~": the packet is typed once. Its next
+    /// letter's composed text drops it, and Space after it types "~" once.
+    #[test]
+    fn an_altgr_dead_key_never_swallows_a_character() {
+        let (mut q, mut r) = win();
+        let at = t0();
+        let tilde = dead("4", "~", ctrl_alt());
+        q.key_down(&tilde, at, &mut r);
+        chars(&mut q, &mut r, ms(at, 10_000), &["~"]);
+        assert_eq!(took(&mut r), ["~"]);
+        assert_eq!(q.owed(), 0);
+        keys(&mut q, &mut r, at, &[tilde.clone(), typed(plain("a", "ã"))]);
+        chars(&mut q, &mut r, at, &["ã"]);
+        assert_eq!(took(&mut r), ["ã"]);
+        assert_eq!(q.owed(), 0);
+        keys(&mut q, &mut r, at, &[tilde, typed(plain("space", "~"))]);
+        chars(&mut q, &mut r, at, &["~"]);
+        assert_eq!(took(&mut r), ["~"]);
+        assert_eq!(q.owed(), 0);
+        chars(&mut q, &mut r, at, &["~"]);
+        assert_eq!(took(&mut r), ["~"], "a packet after them types");
+    }
+
+    /// The same edge on a key `on_key` took (KeyTips up): its AltGr debt is
+    /// dropped once [`WM_CHAR_WAIT`] passes, so a later packet's "~" types.
+    #[test]
+    fn a_typed_altgr_debt_lapses_after_the_wait() {
+        let (mut q, mut r) = win();
+        let at = t0();
+        r.keytips = true;
+        q.key_down(&dead("4", "~", ctrl_alt()), at, &mut r);
+        assert_eq!(took(&mut r), ["kt:4"]);
+        r.keytips = false;
+        assert_eq!(q.owed(), 1);
+        chars(&mut q, &mut r, after_wait(at), &["~"]);
+        assert_eq!(took(&mut r), ["~"]);
+        assert_eq!(q.owed(), 0);
+    }
+
+    /// r4-m1.3 (#1277): no count cap, so 5000 key-downs queued ahead of
+    /// their WM_CHARs are each typed once, in order, and off Windows 5000
+    /// debts are each paid once.
+    #[test]
+    fn five_thousand_queued_keys_are_each_typed_once() {
+        let letters: Vec<String> = (0..5000)
+            .map(|i| char::from(b'a' + (i % 26) as u8).to_string())
+            .collect();
+        let evs: Vec<KeyDownEvent> = letters.iter().map(|c| key(c)).collect();
+        let texts: Vec<&str> = letters.iter().map(String::as_str).collect();
+        let at = t0();
+        let (mut q, mut r) = win();
+        keys(&mut q, &mut r, at, &evs);
+        assert!(took(&mut r).is_empty());
+        assert_eq!(q.owed(), 5000);
+        chars(&mut q, &mut r, ms(at, 5), &texts);
+        assert_eq!(took(&mut r), letters);
+        assert_eq!(q.owed(), 0);
+        let (mut q, mut r) = lin();
+        keys(&mut q, &mut r, at, &evs);
+        assert_eq!(took(&mut r), letters);
+        assert_eq!(q.owed(), 5000);
+        chars(&mut q, &mut r, ms(at, 5), &texts);
+        assert!(took(&mut r).is_empty());
+        assert_eq!(q.owed(), 0);
+    }
+
+    /// A withheld key whose WM_CHAR does not come is replayed at
+    /// [`WM_CHAR_WAIT`], the commands behind it after it, and a WM_CHAR that
+    /// comes later still is dropped. Behind an AltGr dead key a command runs
+    /// then too.
+    #[test]
+    fn a_missing_wm_char_holds_for_the_wait_at_most() {
+        let (mut q, mut r) = win();
+        let at = t0();
+        keys(&mut q, &mut r, at, &[key("a"), cmd("backspace")]);
+        assert_eq!(q.next_lapse(at), Some(WM_CHAR_WAIT));
+        q.release_lapsed(ms(at, 100), &mut r);
+        assert!(took(&mut r).is_empty());
+        q.release_lapsed(after_wait(at), &mut r);
+        assert_eq!(took(&mut r), ["a", "[backspace]"]);
+        assert!(!q.holding());
+        assert_eq!(q.next_lapse(at), None);
+        chars(&mut q, &mut r, after_wait(at), &["a"]);
+        assert!(took(&mut r).is_empty());
+        keys(
+            &mut q,
+            &mut r,
+            at,
+            &[dead("4", "~", ctrl_alt()), cmd("left")],
+        );
+        assert!(took(&mut r).is_empty());
+        q.release_lapsed(after_wait(at), &mut r);
+        assert_eq!(took(&mut r), ["[left]"]);
+    }
+
+    /// A replayed key is the key-down itself: Shift+Space keeps its Shift.
+    #[test]
+    fn a_withheld_key_is_replayed_unchanged() {
+        let (mut q, mut r) = win();
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        let at = t0();
+        q.key_down(&typed(stroke("space", Some(" "), shift)), at, &mut r);
+        chars(&mut q, &mut r, at, &[" "]);
+        assert_eq!(took(&mut r), ["[shift-space]"]);
+    }
+
+    /// Under KeyTips letters are commands: `on_key` takes them at key-down
+    /// and their WM_CHAR types nothing. A key behind F10 is routed after
+    /// F10 ran, so it is a KeyTip too.
+    #[test]
+    fn under_keytips_letters_go_to_on_key_at_once() {
+        let (mut q, mut r) = win();
+        let at = t0();
+        keys(&mut q, &mut r, at, &[cmd("f10"), key("h")]);
+        assert_eq!(took(&mut r), ["[f10]", "kt:h"]);
+        chars(&mut q, &mut r, at, &["h"]);
+        assert!(took(&mut r).is_empty());
+        q.key_down(&cmd("f10"), at, &mut r);
+        assert_eq!(took(&mut r), ["[f10]"]);
+        keys(&mut q, &mut r, at, &[key("a"), cmd("f10"), key("h")]);
+        assert!(took(&mut r).is_empty());
+        chars(&mut q, &mut r, at, &["a", "h"]);
+        assert_eq!(took(&mut r), ["a", "[f10]", "kt:h"]);
+        assert_eq!(q.owed(), 0);
+    }
+
+    /// Without the root's focus gpui registers no handler, so no WM_CHAR
+    /// comes: the key goes to `on_key` and owes nothing, and the next key
+    /// typed with the focus is typed once, not twice.
+    #[test]
+    fn a_key_without_the_focus_owes_nothing() {
+        let (mut q, mut r) = win();
+        let at = t0();
+        r.focused = false;
+        q.key_down(&key("x"), at, &mut r);
+        assert_eq!(took(&mut r), ["x"]);
+        assert_eq!(q.owed(), 0);
+        r.focused = true;
+        q.key_down(&key("a"), at, &mut r);
+        chars(&mut q, &mut r, at, &["a"]);
+        q.release_lapsed(after_wait(at), &mut r);
+        assert_eq!(took(&mut r), ["a"]);
+    }
+
+    /// A sure debt whose WM_CHAR was lost stops blocking the keys after it
+    /// once [`WM_CHAR_WAIT`] has passed.
+    #[test]
+    fn a_lost_wm_char_blocks_nothing_past_the_wait() {
+        let (mut q, mut r) = win();
+        let at = t0();
+        r.keytips = true;
+        q.key_down(&key("x"), at, &mut r);
+        r.keytips = false;
+        assert_eq!(took(&mut r), ["kt:x"]);
+        let later = after_wait(at);
+        q.key_down(&key("a"), later, &mut r);
+        chars(&mut q, &mut r, later, &["a"]);
+        q.release_lapsed(after_wait(later), &mut r);
+        assert_eq!(took(&mut r), ["a"]);
+    }
+
+    /// A mouse-down releases the held keys first, in order; their WM_CHARs
+    /// are then dropped. An AltGr key flushed still types when its
+    /// character comes.
+    #[test]
+    fn a_flush_replays_the_held_keys() {
+        let (mut q, mut r) = win();
+        let at = t0();
+        keys(
+            &mut q,
+            &mut r,
+            at,
+            &[
+                key("a"),
+                cmd("backspace"),
+                key("b"),
+                altgr("q", "@"),
+                key("c"),
+            ],
+        );
+        q.flush(at, &mut r);
+        assert_eq!(took(&mut r), ["a", "[backspace]", "b", "c"]);
+        assert!(!q.holding());
+        chars(&mut q, &mut r, at, &["a", "b", "@", "c"]);
+        assert_eq!(took(&mut r), ["@"]);
+        assert_eq!(q.owed(), 0);
+    }
+
+    /// A withheld key whose character comes once the app no longer takes
+    /// text is dropped, as packet text is: a letter is no KeyTip command.
+    #[test]
+    fn a_character_after_text_stopped_being_taken_is_dropped() {
+        let (mut q, mut r) = win();
+        let at = t0();
+        q.key_down(&key("a"), at, &mut r);
+        r.keytips = true;
+        chars(&mut q, &mut r, at, &["a", "z"]);
+        assert!(took(&mut r).is_empty());
+        assert_eq!(q.owed(), 0);
+    }
+
+    /// Off Windows nothing is withheld: every key reaches `on_key` at once.
+    #[test]
+    fn off_windows_keys_go_to_on_key_at_once() {
+        let (mut q, mut r) = lin();
+        let at = t0();
+        keys(
+            &mut q,
+            &mut r,
+            at,
+            &[key("a"), altgr("e", "€"), cmd("enter")],
+        );
+        assert_eq!(took(&mut r), ["a", "[ctrl-alt-e]", "[enter]"]);
+        assert!(!q.holding());
+        q.tab(false, at, &mut r);
+        assert_eq!(took(&mut r), ["[tab]"]);
+    }
+
+    /// Under a text field (#1162, #1312) an AltGr key types while one is
+    /// open, and nothing once it closed before its WM_CHAR came; a dead key
+    /// under it gives way to the next letter's composed text.
+    #[test]
+    fn altgr_under_a_text_field_types_only_while_it_is_open() {
+        let (mut q, mut r) = win();
+        let at = t0();
+        r.dialog = true;
+        q.key_down(&altgr("q", "@"), at, &mut r);
+        chars(&mut q, &mut r, at, &["@"]);
+        assert_eq!(took(&mut r), ["@"]);
+        keys(&mut q, &mut r, at, &[dead("4", "~", ctrl_alt()), key("ñ")]);
+        chars(&mut q, &mut r, at, &["ñ"]);
+        assert_eq!(took(&mut r), ["ñ"]);
+        assert_eq!(q.owed(), 0);
+        q.key_down(&altgr("q", "@"), at, &mut r);
+        q.release_lapsed(after_wait(at), &mut r);
+        r.dialog = false;
+        chars(&mut q, &mut r, after_wait(at), &["@"]);
+        assert!(took(&mut r).is_empty());
+        assert_eq!(q.owed(), 0);
+    }
+
+    /// Keys that are not withheld keep their debts under a dialog: plain
+    /// Alt (WM_SYSCHAR), Ctrl+Alt that changed nothing and a Win chord reach
+    /// `on_key` at once, and their WM_CHAR is not typed again.
+    #[test]
+    fn other_keys_under_a_dialog_keep_their_debts() {
+        let win_altgr = KeyDownEvent {
+            keystroke: stroke(
+                "e",
+                Some("€"),
+                Modifiers {
+                    platform: true,
+                    ..ctrl_alt()
+                },
+            ),
+            ..altgr("e", "€")
+        };
+        for (ev, wm_char) in [
+            (typed(stroke("g", Some("g"), alt())), "g"),
+            (dead("g", "g", alt()), "g"),
+            (typed(stroke("e", Some("€"), ctrl_alt())), "€"),
+            (win_altgr, "€"),
+        ] {
+            let (mut q, mut r) = win();
+            r.dialog = true;
+            q.key_down(&ev, t0(), &mut r);
+            assert_eq!(took(&mut r).len(), 1, "{}", ev.keystroke);
+            chars(&mut q, &mut r, t0(), &[wm_char]);
+            if ev.keystroke.modifiers.alt && !ev.keystroke.modifiers.control {
+                // No WM_CHAR was owed: the character is a packet's.
+                assert_eq!(took(&mut r), [wm_char], "{}", ev.keystroke);
+            } else {
+                assert!(took(&mut r).is_empty(), "{}", ev.keystroke);
+            }
+        }
+    }
+
     /// Windows (#1139): a typed key owes its WM_CHAR, so the handler drops
     /// it, and a Unicode packet, which has no key-down, is typed.
     #[test]
     fn a_typed_keys_wm_char_is_dropped_and_packet_text_typed() {
-        let mut ime = ImeState::default();
+        let (mut q, mut r) = lin();
         let at = t0();
-        ime.key_down(&typed(plain("a", "a")), at);
-        assert!(ime.char_message("a", ms(at, 1), false).is_empty());
-        assert_eq!(ime.owed(), 0);
+        q.key_down(&key("a"), at, &mut r);
+        assert_eq!(took(&mut r), ["a"]);
+        chars(&mut q, &mut r, ms(at, 1), &["a"]);
+        assert!(took(&mut r).is_empty());
+        assert_eq!(q.owed(), 0);
         // SendInput's KEYEVENTF_UNICODE: WM_CHAR alone.
-        assert_eq!(key_chars(&ime.char_message("Z", ms(at, 2), false)), ["Z"]);
-        assert_eq!(key_chars(&ime.char_message("é", ms(at, 3), false)), ["é"]);
+        chars(&mut q, &mut r, ms(at, 2), &["Z", "é"]);
+        assert_eq!(took(&mut r), ["Z", "é"]);
         // A key's twin, then a packet.
-        ime.key_down(&typed(plain("b", "b")), ms(at, 4));
-        assert!(ime.char_message("b", ms(at, 5), false).is_empty());
-        assert_eq!(key_chars(&ime.char_message("é", ms(at, 6), false)), ["é"]);
+        q.key_down(&key("b"), ms(at, 4), &mut r);
+        chars(&mut q, &mut r, ms(at, 5), &["b", "é"]);
+        assert_eq!(took(&mut r), ["b", "é"]);
     }
 
-    /// A WM_CHAR held behind a stall still finds its debt, up to
+    /// A WM_CHAR held behind a stall still finds a sure debt, up to
     /// `WM_CHAR_KEEP`.
     #[test]
     fn a_wm_char_after_a_long_stall_is_still_dropped() {
-        let mut ime = ImeState::default();
+        let (mut q, mut r) = lin();
         let at = t0();
-        ime.key_down(&typed(plain("a", "a")), at);
-        assert!(ime.char_message("a", ms(at, 1500), false).is_empty());
-        assert_eq!(ime.owed(), 0);
-    }
-
-    /// Two key-downs drained before either WM_CHAR: each WM_CHAR pays its
-    /// own key's debt, so neither letter types twice.
-    #[test]
-    fn queued_key_downs_each_owe_their_text() {
-        let mut ime = ImeState::default();
-        let at = t0();
-        ime.key_down(&typed(plain("a", "a")), at);
-        ime.key_down(&typed(plain("b", "b")), ms(at, 1));
-        assert_eq!(ime.owed(), 2);
-        assert!(ime.char_message("a", ms(at, 20), false).is_empty());
-        assert!(ime.char_message("b", ms(at, 20), false).is_empty());
-        assert_eq!(key_chars(&ime.char_message("é", ms(at, 21), false)), ["é"]);
+        q.key_down(&key("a"), at, &mut r);
+        took(&mut r);
+        chars(&mut q, &mut r, ms(at, 1500), &["a"]);
+        assert!(took(&mut r).is_empty());
+        assert_eq!(q.owed(), 0);
     }
 
     /// The review's "éb": a packet é queued before a typed B, both
     /// key-downs handled before either WM_CHAR. The packet's é pays no debt
-    /// (none is "é"), so it types, and B's WM_CHAR pays B's.
+    /// (none is "é"), so it types, and B's WM_CHAR pays B's. A packet "e"
+    /// ahead of typed T, H, E is typed, and the keys are not doubled.
     #[test]
     fn a_packet_before_a_typed_key_pays_no_debt() {
-        let mut ime = ImeState::default();
+        let (mut q, mut r) = lin();
         let at = t0();
-        ime.key_down(&typed(plain("b", "b")), at);
-        assert_eq!(key_chars(&ime.char_message("é", at, false)), ["é"]);
-        assert!(ime.char_message("b", at, false).is_empty());
-        assert_eq!(ime.owed(), 0);
-    }
-
-    /// A packet's character that some typed key also owes pays that key's
-    /// debt alone: the older debts' WM_CHARs are still on the way.
-    #[test]
-    fn a_match_pays_only_its_own_debt() {
-        let mut ime = ImeState::default();
-        let at = t0();
-        for c in ["t", "h", "e"] {
-            ime.key_down(&typed(plain(c, c)), at);
-        }
-        let mut typed_chars = Vec::new();
-        for c in ["e", "t", "h", "e"] {
-            typed_chars.extend(
-                key_chars(&ime.char_message(c, at, false))
-                    .into_iter()
-                    .map(str::to_string),
-            );
-        }
-        assert_eq!(typed_chars, ["e"]);
-        assert_eq!(ime.owed(), 0);
-        // A packet "b" ahead of typed A and B: "b" is typed once, A and B
-        // are not doubled.
-        ime.key_down(&typed(plain("a", "a")), at);
-        ime.key_down(&typed(plain("b", "b")), at);
-        let mut typed_chars = Vec::new();
-        for c in ["b", "a", "b"] {
-            typed_chars.extend(
-                key_chars(&ime.char_message(c, at, false))
-                    .into_iter()
-                    .map(str::to_string),
-            );
-        }
-        assert_eq!(typed_chars, ["b"]);
-        assert_eq!(ime.owed(), 0);
-    }
-
-    /// Many key-downs drained before their WM_CHARs, then a long stall:
-    /// every WM_CHAR still pays its own key's debt.
-    #[test]
-    fn a_long_queue_and_a_long_stall_still_pay() {
-        let mut ime = ImeState::default();
-        let at = t0();
-        let letters: Vec<String> = (0..100)
-            .map(|i| char::from(b'a' + (i % 26) as u8).to_string())
-            .collect();
-        for c in &letters {
-            ime.key_down(&typed(plain(c, c)), at);
-        }
-        for c in &letters {
-            assert!(ime.char_message(c, at, false).is_empty(), "{c}");
-        }
-        assert_eq!(ime.owed(), 0);
-        ime.key_down(&typed(plain("a", "a")), at);
-        assert!(ime.char_message("a", ms(at, 10_000), false).is_empty());
+        q.key_down(&key("b"), at, &mut r);
+        took(&mut r);
+        chars(&mut q, &mut r, at, &["é", "b"]);
+        assert_eq!(took(&mut r), ["é"]);
+        keys(&mut q, &mut r, at, &[key("t"), key("h"), key("e")]);
+        took(&mut r);
+        chars(&mut q, &mut r, at, &["e", "t", "h", "e"]);
+        assert_eq!(took(&mut r), ["e"]);
+        assert_eq!(q.owed(), 0);
     }
 
     /// An AltGr dead key then a letter it does not combine with: the
     /// letter's debt "~x" is sure to be paid, so "~" pays it rather than
-    /// the dead key's, and "x" is not typed twice.
+    /// the dead key's, and "x" is not typed twice. The dead key's debt goes
+    /// at [`WM_CHAR_WAIT`].
     #[test]
     fn an_altgr_dead_key_pair_prefers_the_sure_debt() {
-        let mut ime = ImeState::default();
+        let (mut q, mut r) = lin();
         let at = t0();
         let tilde = dead("4", "~", ctrl_alt());
         assert!(may_not_come(&tilde));
-        ime.key_down(&tilde, at);
-        ime.key_down(&typed(plain("x", "~x")), at);
-        assert!(ime.char_message("~", at, false).is_empty());
-        assert!(ime.char_message("x", at, false).is_empty());
-        // The dead key's accent waits out the keep time.
-        assert_eq!(ime.owed(), 1);
-        let later = at + WM_CHAR_KEEP + Duration::from_millis(1);
-        assert_eq!(key_chars(&ime.char_message("~", later, false)), ["~"]);
+        keys(&mut q, &mut r, at, &[tilde, typed(plain("x", "~x"))]);
+        took(&mut r);
+        chars(&mut q, &mut r, at, &["~", "x"]);
+        assert!(took(&mut r).is_empty());
+        assert_eq!(q.owed(), 1);
+        chars(&mut q, &mut r, after_wait(at), &["~"]);
+        assert_eq!(took(&mut r), ["~"]);
     }
 
-    /// A packet "b" queued ahead of an AltGr € and a typed B: no match
-    /// drops the € debt, whose WM_CHAR is still coming, so only the
-    /// packet's "b" is typed (in the place of B's twin), not "€b€b".
+    /// A packet "b" queued ahead of a typed AltGr € and a typed B: the €
+    /// debt, whose WM_CHAR is still coming, is not dropped by B's match, so
+    /// only the packet's "b" is typed (in the place of B's twin).
     #[test]
-    fn a_match_drops_no_older_altgr_debt() {
-        let mut ime = ImeState::default();
+    fn a_match_drops_no_older_typed_altgr_debt() {
+        let (mut q, mut r) = lin();
         let at = t0();
-        ime.key_down(&dead("e", "€", ctrl_alt()), at);
-        ime.key_down(&typed(plain("b", "b")), at);
-        let mut typed_chars = Vec::new();
-        for c in ["b", "€", "b"] {
-            typed_chars.extend(
-                key_chars(&ime.char_message(c, at, false))
-                    .into_iter()
-                    .map(str::to_string),
-            );
-        }
-        assert_eq!(typed_chars, ["b"]);
-        assert_eq!(ime.owed(), 0);
+        keys(&mut q, &mut r, at, &[dead("e", "€", ctrl_alt()), key("b")]);
+        took(&mut r);
+        chars(&mut q, &mut r, at, &["b", "€", "b"]);
+        assert_eq!(took(&mut r), ["b"]);
+        assert_eq!(q.owed(), 0);
+        // Withheld on Windows, the text comes out in the order sent.
+        let (mut q, mut r) = win();
+        keys(&mut q, &mut r, at, &[altgr("e", "€"), key("b")]);
+        chars(&mut q, &mut r, at, &["b", "€", "b"]);
+        assert_eq!(took(&mut r), ["b", "€", "b"]);
+        assert_eq!(q.owed(), 0);
     }
 
-    /// A dead key makes WM_DEADCHAR and owes nothing; the composed letter
-    /// owes "é". A packet after it types in full, however soon.
+    /// A plain dead key reaches nothing and owes nothing on Windows; the
+    /// composed letter owes "é". A packet after it types in full.
     #[test]
     fn a_dead_key_owes_nothing_and_its_letter_the_composed_text() {
-        let mut ime = ImeState::default();
+        let (mut q, mut r) = win();
         let at = t0();
         let acute = dead("´", "´", Modifiers::default());
         assert_eq!(owed_text(&acute), None);
-        ime.key_down(&acute, at);
-        assert_eq!(ime.owed(), 0);
-        ime.key_down(&typed(plain("e", "é")), ms(at, 100));
-        assert!(ime.char_message("é", ms(at, 101), false).is_empty());
-        assert_eq!(ime.owed(), 0);
-        assert_eq!(key_chars(&ime.char_message("é", ms(at, 102), false)), ["é"]);
-        // Typing on after it is typed once.
-        for c in ["a", "b", "c"] {
-            ime.key_down(&typed(plain(c, c)), ms(at, 103));
-            assert!(ime.char_message(c, ms(at, 104), false).is_empty(), "{c}");
-        }
-    }
-
-    /// An AltGr dead key cannot be told from an AltGr character, so it owes
-    /// its accent: the composed letter's WM_CHAR pays the letter's debt, and
-    /// the accent's, which never comes, waits out the keep time.
-    #[test]
-    fn an_altgr_dead_keys_debt_waits_out_the_keep_time() {
-        let mut ime = ImeState::default();
-        let at = t0();
-        let tilde = dead("4", "~", ctrl_alt());
-        assert_eq!(owed_text(&tilde).as_deref(), Some("~"));
-        ime.key_down(&tilde, at);
-        ime.key_down(&typed(plain("n", "ñ")), at);
-        assert!(ime.char_message("ñ", at, false).is_empty());
-        assert_eq!(ime.owed(), 1);
-        let later = at + WM_CHAR_KEEP + Duration::from_millis(1);
-        assert_eq!(key_chars(&ime.char_message("~", later, false)), ["~"]);
-    }
-
-    /// An unmatched debt goes after `WM_CHAR_KEEP`, and typing after it is
-    /// typed once: "abc" is never "abcc".
-    #[test]
-    fn a_lapsed_debt_leaves_later_typing_alone() {
-        let mut ime = ImeState::default();
-        let at = t0();
-        let tilde = dead("4", "~", ctrl_alt());
-        ime.key_down(&tilde, at);
-        let later = at + WM_CHAR_KEEP + Duration::from_millis(1);
-        for c in ["a", "b", "c"] {
-            ime.key_down(&typed(plain(c, c)), later);
-        }
-        assert_eq!(ime.owed(), 3);
-        for c in ["a", "b", "c"] {
-            assert!(ime.char_message(c, later, false).is_empty(), "{c}");
-        }
-        assert_eq!(key_chars(&ime.char_message("~", later, false)), ["~"]);
-    }
-
-    /// Debts are bounded where no WM_CHAR ever pays them (Linux, macOS).
-    #[test]
-    fn debts_are_capped() {
-        let mut ime = ImeState::default();
-        let at = t0();
-        for _ in 0..WM_CHAR_MAX_DEBTS + 10 {
-            ime.key_down(&typed(plain("a", "a")), at);
-        }
-        assert_eq!(ime.owed(), WM_CHAR_MAX_DEBTS);
+        q.key_down(&acute, at, &mut r);
+        assert!(took(&mut r).is_empty());
+        assert_eq!(q.owed(), 0);
+        assert!(!q.holding());
+        q.key_down(&typed(plain("e", "é")), ms(at, 100), &mut r);
+        chars(&mut q, &mut r, ms(at, 101), &["é", "é"]);
+        assert_eq!(took(&mut r), ["é", "é"]);
+        // "´" then X: one key-down, two WM_CHARs, typed once.
+        keys(&mut q, &mut r, at, &[acute, typed(plain("x", "´x"))]);
+        assert_eq!(q.owed(), 2);
+        chars(&mut q, &mut r, at, &["´", "x"]);
+        assert_eq!(took(&mut r), ["´x"]);
+        assert_eq!(q.owed(), 0);
+        // A WM_CHAR with more than is owed types the rest.
+        q.key_down(&key("a"), at, &mut r);
+        chars(&mut q, &mut r, at, &["aé"]);
+        assert_eq!(took(&mut r), ["a", "é"]);
     }
 
     /// gpui joins a surrogate pair into one WM_CHAR call: one character,
-    /// one typed key.
+    /// one typed key; and a key typing one owes one character.
     #[test]
     fn a_non_bmp_packet_is_one_typed_key() {
-        let mut ime = ImeState::default();
+        let (mut q, mut r) = win();
         let at = t0();
-        let keys = ime.char_message("😀", at, false);
-        assert_eq!(key_chars(&keys), ["😀"]);
-        assert_eq!(keys[0].keystroke.key, "😀");
-        // And a key typing one owes one character, not two UTF-16 units.
-        ime.key_down(&typed(plain("😀", "😀")), at);
-        assert_eq!(ime.owed(), 1);
-        assert!(ime.char_message("😀", at, false).is_empty());
-        assert_eq!(key_chars(&ime.char_message("x", at, false)), ["x"]);
+        chars(&mut q, &mut r, at, &["😀"]);
+        assert_eq!(took(&mut r), ["😀"]);
+        q.key_down(&key("😀"), at, &mut r);
+        assert_eq!(q.owed(), 1);
+        chars(&mut q, &mut r, at, &["😀", "x"]);
+        assert_eq!(took(&mut r), ["😀", "x"]);
     }
 
     /// Keys that make no WM_CHAR owe nothing, so a packet after them types:
-    /// Enter, Tab and arrows have no printable text, Alt+letter makes
+    /// Enter and arrows have no printable text, Alt+letter makes
     /// WM_SYSCHAR, and a Ctrl chord's text is a control character. A Win
     /// chord the shell lets through owes its letter.
     #[test]
@@ -1496,71 +2198,44 @@ mod tests {
             control: true,
             ..Default::default()
         };
-        let win = Modifiers {
+        let win_mod = Modifiers {
             platform: true,
             ..Default::default()
         };
         for k in [
             stroke("enter", Some("\r"), Modifiers::default()),
-            stroke("tab", None, Modifiers::default()),
             stroke("left", None, Modifiers::default()),
             stroke("f", Some("f"), alt()),
             stroke("a", Some("\u{1}"), ctrl),
         ] {
             assert_eq!(owed_text(&typed(k.clone())), None, "{k}");
-            let mut ime = ImeState::default();
-            ime.key_down(&typed(k.clone()), t0());
-            assert_eq!(key_chars(&ime.char_message("f", t0(), false)), ["f"], "{k}");
+            let (mut q, mut r) = win();
+            q.key_down(&typed(k.clone()), t0(), &mut r);
+            assert_eq!(took(&mut r).len(), 1, "{k}");
+            chars(&mut q, &mut r, t0(), &["f"]);
+            assert_eq!(took(&mut r), ["f"], "{k}");
         }
-        let win_y = stroke("y", Some("y"), win);
-        assert_eq!(owed_text(&typed(win_y.clone())).as_deref(), Some("y"));
-        let mut ime = ImeState::default();
-        ime.key_down(&typed(win_y), t0());
-        assert!(ime.char_message("y", t0(), false).is_empty());
-    }
-
-    /// AltGr is Ctrl+Alt on Windows and its character comes as WM_CHAR, so
-    /// it is typed once, not twice.
-    #[test]
-    fn an_altgr_character_is_typed_once() {
-        let mut ime = ImeState::default();
-        let euro = stroke("e", Some("€"), ctrl_alt());
-        assert_eq!(owed_text(&typed(euro.clone())).as_deref(), Some("€"));
-        ime.key_down(&typed(euro), t0());
-        assert!(ime.char_message("€", t0(), false).is_empty());
-        assert_eq!(ime.owed(), 0);
-    }
-
-    /// "´" then X sends two WM_CHARs for one key-down, both owed; a WM_CHAR
-    /// with more than what is owed types the rest.
-    #[test]
-    fn a_dead_key_pair_owes_two() {
-        let mut ime = ImeState::default();
-        let at = t0();
-        ime.key_down(&dead("´", "´", Modifiers::default()), at);
-        ime.key_down(&typed(plain("x", "´x")), at);
-        assert_eq!(ime.owed(), 2);
-        assert!(ime.char_message("´", at, false).is_empty());
-        assert!(ime.char_message("x", at, false).is_empty());
-        assert_eq!(ime.owed(), 0);
-        assert_eq!(key_chars(&ime.char_message("y", at, false)), ["y"]);
-        ime.key_down(&typed(plain("a", "a")), at);
-        assert_eq!(key_chars(&ime.char_message("aé", at, false)), ["é"]);
+        let win_y = typed(stroke("y", Some("y"), win_mod));
+        assert_eq!(owed_text(&win_y).as_deref(), Some("y"));
+        let (mut q, mut r) = win();
+        q.key_down(&win_y, t0(), &mut r);
+        assert_eq!(took(&mut r), ["[win-y]"]);
+        chars(&mut q, &mut r, t0(), &["y"]);
+        assert!(took(&mut r).is_empty());
     }
 
     /// gpui forwards an IME message with no text as an empty commit: it
-    /// types nothing and pays off nothing.
+    /// types nothing and pays off nothing. Control characters never type.
     #[test]
     fn an_empty_wm_char_changes_nothing() {
-        let mut ime = ImeState::default();
-        ime.key_down(&typed(plain("a", "a")), t0());
-        assert!(ime.char_message("", t0(), false).is_empty());
-        assert_eq!(ime.owed(), 1);
-        assert!(ime.char_message("a", t0(), false).is_empty());
-        // Control characters are never typed.
-        assert!(ime.char_message("\u{8}", t0(), false).is_empty());
+        let (mut q, mut r) = win();
+        q.key_down(&key("a"), t0(), &mut r);
+        chars(&mut q, &mut r, t0(), &[""]);
+        assert!(took(&mut r).is_empty());
+        assert_eq!(q.owed(), 1);
+        chars(&mut q, &mut r, t0(), &["a", "\u{8}"]);
+        assert_eq!(took(&mut r), ["a"]);
     }
-
     /// The handler turns gpui's input method on only on macOS: the Windows
     /// IME stays off as it was before the handler was registered there.
     #[test]

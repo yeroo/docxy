@@ -49662,7 +49662,10 @@ impl Render for Docxy {
             // A press anywhere but in the Name Box takes the keyboard from it
             // (#1343): the ribbon, the headers, the sheet tabs and the rest stop
             // their events below, so it is asked while the press is captured.
-            .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+            .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                // Windows: the keys still waiting for their WM_CHAR act
+                // before the press (#1277).
+                this.flush_wm_chars(window, cx);
                 let inside = this
                     .probes
                     .borrow()
@@ -49810,8 +49813,8 @@ fn col_px(units: f64) -> f32 {
 
 /// The window root's keyboard: every key to [`Docxy::on_key`] (on macOS
 /// printable keys by way of AppKit's input context and the input handler,
-/// for dead keys and IME composition, #1072; on Windows the handler types
-/// WM_CHAR text no key-down typed, #1139; see `text_input`) and the two
+/// for dead keys and IME composition, #1072; on Windows text keys by way of
+/// their WM_CHAR, in order, #1139 and #1277; see `text_input`) and the two
 /// bound actions (Tab, Shift+Tab), which gpui matches before it delivers a
 /// key-down. Both of `render`'s roots, the Backstage one too, take it from
 /// here: Backstage without it dropped every key a dialog opened from it
@@ -49852,11 +49855,14 @@ impl KeyRouting for Div {
             .on_action(cx.listener(|this, _: &ext::CloseTab, window, cx| {
                 this.close_ext_tab(window, cx);
             }))
+            // Behind any key still waiting for its WM_CHAR on Windows (#1277).
+            .on_action(cx.listener(|this, _: &InsertTabAction, window, cx| {
+                this.queued_tab(false, window, cx)
+            }))
             .on_action(
-                cx.listener(|this, _: &InsertTabAction, window, cx| this.tab_key(window, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &OutdentAction, window, cx| this.shift_tab_key(window, cx)),
+                cx.listener(|this, _: &OutdentAction, window, cx| {
+                    this.queued_tab(true, window, cx)
+                }),
             )
             .map(|root| macos_menu::window_actions(root, cx))
     }

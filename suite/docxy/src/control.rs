@@ -527,8 +527,16 @@ pub(crate) fn attach_with_dispatch(
                             let mut late = Vec::new();
                             for event in events {
                                 let deferred = text_input::deferred_text(&event);
+                                // Only while the root has the focus does
+                                // gpui register the handler a WM_CHAR
+                                // reaches (#1277).
+                                let reaches = target
+                                    .view
+                                    .read_with(cx, |this, _| this.wm_char_reaches(window))
+                                    .unwrap_or(false);
                                 let char_message =
-                                    text_input::char_message_text(&event, wm_char != WmChar::Off);
+                                    text_input::char_message_text(&event, wm_char != WmChar::Off)
+                                        .filter(|_| reaches);
                                 // A key the root left to the input context
                                 // gets the `insertText:` AppKit would send
                                 // (#1072), and a key `on_key` typed on

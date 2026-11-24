@@ -2544,7 +2544,7 @@ fn on_widget(
 mod tests {
     use super::*;
     use crate::dialog::{Button, ButtonRole, Control, Value};
-    use crate::text_input::ImeState;
+    use crate::text_input::{KeyHost, WM_CHAR_WAIT, WmChars};
     use core::prelude::v1::test;
 
     /// #1557: a click in a richtext takes the line's bullet gutter and
@@ -2821,31 +2821,54 @@ mod tests {
         dialog_key(t, &k.key, k.key_char.as_deref(), k.modifiers)
     }
 
-    /// A Windows key-down as `Docxy::route_key` takes it: the dialog's key,
-    /// then the WM_CHAR debt, decided by whether the dialog was open; then
-    /// its WM_CHAR `wm_char`, if one comes at once.
-    fn windows_key(t: &mut DocTab, ime: &mut ImeState, ev: &KeyDownEvent, wm_char: Option<&str>) {
-        let open = t.dialogs.is_open();
-        // `route_key` never hands `on_key` a plain dead key (#1312).
-        if !crate::text_input::passes_to_on_key(ev, true) {
-            return;
+    /// The dialog under `Docxy::route_key`'s Windows queue (#1277): what
+    /// the queue hands `on_key` goes to the dialog, as `modal_takes_key`
+    /// hands it; with none open, it counts as keys for the surface below.
+    struct DialogHost<'a> {
+        t: &'a mut DocTab,
+        below: usize,
+    }
+
+    impl KeyHost for DialogHost<'_> {
+        fn focused(&mut self) -> bool {
+            true
         }
-        assert!(platform_key(t, ev, false));
-        ime.typed_key(ev, std::time::Instant::now(), open);
+
+        fn takes_text(&mut self) -> bool {
+            true
+        }
+
+        fn text_field_open(&mut self) -> bool {
+            self.t.dialogs.is_open()
+        }
+
+        fn on_key(&mut self, ev: &KeyDownEvent) {
+            if self.t.dialogs.is_open() {
+                assert!(platform_key(self.t, ev, false));
+            } else {
+                self.below += 1;
+            }
+        }
+
+        fn tab(&mut self, _shift: bool) {}
+    }
+
+    /// A Windows key-down as `Docxy::route_key` takes it, then its WM_CHAR
+    /// `wm_char`, if one comes at once.
+    fn windows_key(t: &mut DocTab, q: &mut WmChars, ev: &KeyDownEvent, wm_char: Option<&str>) {
+        let now = std::time::Instant::now();
+        q.key_down(ev, now, &mut DialogHost { t, below: 0 });
         if let Some(text) = wm_char {
-            windows_char(t, ime, text);
+            windows_char(t, q, text);
         }
     }
 
-    /// A WM_CHAR as `Docxy::windows_char` takes it: the keys it types go to
-    /// the dialog; with none open, the count of keys for the surface below.
-    fn windows_char(t: &mut DocTab, ime: &mut ImeState, text: &str) -> usize {
-        let open = t.dialogs.is_open();
-        let keys = ime.char_message(text, std::time::Instant::now(), open);
-        for k in &keys {
-            assert!(platform_key(t, k, false));
-        }
-        if open { 0 } else { keys.len() }
+    /// A WM_CHAR as `Docxy::windows_char` takes it: the count of keys it
+    /// handed the surface below the dialog.
+    fn windows_char(t: &mut DocTab, q: &mut WmChars, text: &str) -> usize {
+        let mut host = DialogHost { t, below: 0 };
+        q.char_message(text, std::time::Instant::now(), &mut host);
+        host.below
     }
 
     fn key_down(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> KeyDownEvent {
@@ -2933,7 +2956,7 @@ mod tests {
         let mut t = tab_with_form();
         assert!(key(&mut t, "tab", None));
         assert!(key(&mut t, "tab", None));
-        let mut ime = ImeState::default();
+        let mut q = WmChars::new(true);
         let ctrl_alt = Modifiers {
             control: true,
             alt: true,
@@ -2947,27 +2970,60 @@ mod tests {
             alt: true,
             ..Modifiers::default()
         };
-        windows_key(&mut t, &mut ime, &altgr("q", "@"), Some("@"));
-        windows_key(&mut t, &mut ime, &altgr("e", "€"), Some("€"));
-        windows_key(&mut t, &mut ime, &altgr("4", "~"), None);
+        windows_key(&mut t, &mut q, &altgr("q", "@"), Some("@"));
+        windows_key(&mut t, &mut q, &altgr("e", "€"), Some("€"));
+        windows_key(&mut t, &mut q, &altgr("4", "~"), None);
         assert_eq!(value(&t, "note"), Value::Text("@€".into()));
         let n = key_down("n", Some("ñ"), Modifiers::default());
-        windows_key(&mut t, &mut ime, &n, Some("ñ"));
-        windows_key(&mut t, &mut ime, &key_down("g", Some("g"), alt), None);
+        windows_key(&mut t, &mut q, &n, Some("ñ"));
+        windows_key(&mut t, &mut q, &key_down("g", Some("g"), alt), None);
         assert_eq!(value(&t, "note"), Value::Text("@€ñ".into()));
-        // AltGr+Q, then Enter closes the dialog before the "@" WM_CHAR comes
-        // (gpui drained input alone): the "@" reaches nothing below.
-        windows_key(&mut t, &mut ime, &altgr("q", "@"), None);
-        windows_key(
-            &mut t,
-            &mut ime,
-            &key_down("enter", None, Modifiers::default()),
-            None,
+        // AltGr+Q, then Enter before the "@" WM_CHAR comes (gpui drained
+        // input alone): Enter waits, so the "@" is typed before OK (#1277).
+        let enter = key_down("enter", None, Modifiers::default());
+        windows_key(&mut t, &mut q, &altgr("q", "@"), None);
+        windows_key(&mut t, &mut q, &enter, None);
+        assert!(t.dialogs.is_open());
+        assert_eq!(windows_char(&mut t, &mut q, "@"), 0);
+        assert!(!t.dialogs.is_open(), "Enter pressed OK after the @");
+        assert_eq!(q.owed(), 0);
+    }
+
+    /// Windows (#1162): an AltGr WM_CHAR that comes after the dialog closed
+    /// (its key-down held for `WM_CHAR_WAIT`, and Enter ran then) types
+    /// nothing into the surface below.
+    #[test]
+    fn a_late_altgr_wm_char_types_nothing_once_the_dialog_closed() {
+        let mut t = tab_with_form();
+        assert!(key(&mut t, "tab", None));
+        assert!(key(&mut t, "tab", None));
+        let mut q = WmChars::new(true);
+        let altgr = KeyDownEvent {
+            prefer_character_input: true,
+            ..key_down(
+                "q",
+                Some("@"),
+                Modifiers {
+                    control: true,
+                    alt: true,
+                    ..Modifiers::default()
+                },
+            )
+        };
+        windows_key(&mut t, &mut q, &altgr, None);
+        let enter = key_down("enter", None, Modifiers::default());
+        windows_key(&mut t, &mut q, &enter, None);
+        let later = std::time::Instant::now() + WM_CHAR_WAIT * 2;
+        q.release_lapsed(
+            later,
+            &mut DialogHost {
+                t: &mut t,
+                below: 0,
+            },
         );
         assert!(!t.dialogs.is_open());
-        assert_eq!(windows_char(&mut t, &mut ime, "@"), 0);
-        // The tilde dead key's debt alone is left, to lapse.
-        assert_eq!(ime.owed(), 1);
+        assert_eq!(windows_char(&mut t, &mut q, "@"), 0);
+        assert_eq!(q.owed(), 0);
     }
 
     /// A composed "´5" in a numeric field: the refused accent does not stop
@@ -2990,29 +3046,29 @@ mod tests {
         let mut t = tab_with_form();
         assert!(key(&mut t, "tab", None));
         assert!(key(&mut t, "tab", None));
-        let mut ime = ImeState::default();
+        let mut q = WmChars::new(true);
         let dead = KeyDownEvent {
             prefer_character_input: true,
             ..key_down("´", Some("´"), Modifiers::default())
         };
-        windows_key(&mut t, &mut ime, &dead, None);
+        windows_key(&mut t, &mut q, &dead, None);
         assert_eq!(value(&t, "note"), Value::Text(String::new()));
         let n = key_down("n", Some("ñ"), Modifiers::default());
-        windows_key(&mut t, &mut ime, &n, Some("ñ"));
+        windows_key(&mut t, &mut q, &n, Some("ñ"));
         assert_eq!(value(&t, "note"), Value::Text("ñ".into()));
         // The accent then Space arrives as Space carrying "´"; then X as a
         // two-character "´x": both type in full.
         let space = key_down("space", Some("´"), Modifiers::default());
-        windows_key(&mut t, &mut ime, &dead, None);
-        windows_key(&mut t, &mut ime, &space, Some("´"));
+        windows_key(&mut t, &mut q, &dead, None);
+        windows_key(&mut t, &mut q, &space, Some("´"));
         let x = key_down("x", Some("´x"), Modifiers::default());
-        windows_key(&mut t, &mut ime, &dead, None);
-        windows_key(&mut t, &mut ime, &x, Some("´x"));
+        windows_key(&mut t, &mut q, &dead, None);
+        windows_key(&mut t, &mut q, &x, Some("´x"));
         assert_eq!(value(&t, "note"), Value::Text("ñ´´x".into()));
         // A plain Space still types a space.
         windows_key(
             &mut t,
-            &mut ime,
+            &mut q,
             &key_down("space", Some(" "), Modifiers::default()),
             Some(" "),
         );
