@@ -6353,3 +6353,82 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   `send_draft_by_an_old_id_after_the_move_drained_marks_the_moved_row_sent`
   (the arm), `a_send_after_a_move_and_back_is_filed_under_sent_after_the_send`
   (`sync_after_send`).
+
+## A message's last verb on its row (#2301)
+
+- What a host draws as Outlook's reply, reply-all or forward arrow, and
+  "You replied to this message on …". `MessageRow::last_verb`
+  (`Option<LastVerb>`: `Reply`, `ReplyAll`, `Forward`) and
+  `MessageRow::last_verb_time` (Unix seconds, UTC) come from every row read
+  (`MESSAGE_ROW_COLUMNS`, the last two, so `BODY_AFTER_ROW_COLUMNS` is 36;
+  `conversations_in_folder` spells them out twice).
+- Read from `PidTagLastVerbExecuted` (`Integer 0x1081`; 102 reply, 103 reply
+  all, 104 forward; any other verb, such as 261, is none) and
+  `PidTagLastVerbExecutionTime` (`SystemTime 0x1082`), both in
+  `MESSAGE_EXPAND` (its 400 fallback unchanged). `model::parse_last_verb` is
+  lenient: a string or JSON integer, never an error. The time is read only
+  with a known verb, by `reminder_time`'s rules, so an offset or junk time is
+  `None`. A stored verb `LastVerb::from_mapi` does not know reads none, with
+  no time.
+- Merge rule: #2088's, carried means the item holds its class
+  (`MessageFields::last_verb`, `writes_last_verb`). A carried item writes
+  both, `NULL`s included: another client's other verb clears the arrow, as
+  Outlook shows it. A partial item, or a refused or dropped expand, keeps the
+  stored pair. The type fill's class-only expand (#2168) never merges a
+  message, so it cannot clear one.
+- `migrate_last_verb` (after `migrate_meeting_type_fill`) resets every
+  folder's delta and backfill state and both expand-refused marks. The reset
+  is required here, unlike #2089 or #2123: a link minted before #2301 keeps
+  the old expand, which brings the class but not the verb, so through it
+  every item reads as carried with no verb, and a reply made on another
+  device would be written none until the link expired.
+- Our own send. The answer draft's row keeps what it answers:
+  `messages.send_verb_original` (as the compose command carried it,
+  unresolved) and `messages.send_verb` (`DraftKind::as_stored`). They are set
+  by `Engine::store_composed_draft` (`Store::set_send_verb`) and by
+  `create_local_answer_draft`'s insert. Unlike `answers_id` (#2212), the
+  first push never clears them, no merge writes them, and `reconcile_id` and
+  `follow_move` carry them. In `follow_move_on`'s branch where a row already
+  exists under the new id, they are copied onto the kept row unless it has
+  its own.
+- When the drain counts a `SendDraft` done (the arm that emits `Sent`),
+  `Engine::record_sent_verb` runs:
+  - It resolves the op's draft id with `current_id` (#2265), then reads
+    `Store::send_verb`.
+  - It resolves the original with `current_id` (#1896) and writes its row:
+    the verb and now (`Store::set_last_verb`). It then emits
+    `MessagesUpdated` for the original's folder, because the host did not
+    make this write.
+  - It queues `OutboxOp::SetLastVerb { id, verb, at }` and clears the link.
+  - Every store error is an `Error`, never a failed send.
+  - The drain re-reads the ops newer than `newest`, as #2005's follow-up
+    does, so the PATCH goes out in the same drain, before `sync_after_send`.
+- `SetLastVerb` (`setLastVerb`, `verb` a number) is a message op, so
+  `pending_message_ids` keeps a fresh delta off the optimistic row until it
+  lands. It is one PATCH of both properties (`GraphClient::set_last_verb`).
+  Offline, a 401, a throttle or a 5xx keep it queued. A refusal drops it at
+  once, with no quarantine: a 404 silently, any other with an
+  `Error("set last verb …")` and a re-read of the original
+  (`message_property_op_id`). `message_reminder_op_id` stays the reminder
+  dedupe's, without it.
+- What Graph does by itself is not known. Graph's docs for `send` of a
+  `createReply` / `createReplyAll` / `createForward` draft, and for the
+  one-shot `reply` / `replyAll` / `forward`, say nothing about the original's
+  last verb, and no live mailbox can be tried from this repository. So the
+  engine always PATCHes, as Outlook writes the pair itself. The PATCH is
+  idempotent. If Graph refuses writes of these tags, every sent answer gives
+  one `Error("set last verb …")` and a re-read: that is the symptom to look
+  for.
+- Gap: a retry whose delivery check finds the draft's row gone (`apply_send`
+  answers `Ok` with no draft) has no link, so nothing is marked.
+- Tests. Model: `last_verb_*` (values, unknown, malformed, carried, ids).
+  Client: `message_expand_names_every_property`,
+  `delta_page_reads_the_last_verb`, `set_last_verb_patches_both_properties`.
+  Store: `last_verb_tests` (every read path, merge rule, migration,
+  `send_verb` through the first push, `reconcile_id` and `follow_move`, the
+  op's JSON), `upsert_writes_every_column`, and
+  `a_store_from_before_2054_runs_every_migration_in_order`. Engine:
+  `tests::last_verbs` (a delta changing the verb, each answer kind marked and
+  PATCHed in the same drain, a local answer draft, an offline PATCH, a 400
+  and a 404, a plain send, a moved original, a moved draft, and no reminder
+  dedupe).
