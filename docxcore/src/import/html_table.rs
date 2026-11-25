@@ -102,13 +102,15 @@ pub(crate) struct TableSpec {
     /// container's `-webkit-` alignment. With a [`Room`], its place in
     /// the room, settled once it is laid out ([`layout`]).
     pub jc: Option<&'static str>,
-    /// An outermost table in a centred fixed-width block (#2114): the room
-    /// it is laid out in, instead of the body.
+    /// An outermost table in a centred fixed-width block (#2114), or a
+    /// card in the body (#1940): the room it is laid out in, instead of
+    /// the body.
     pub room: Option<Room>,
 }
 
 /// The content box of the centred fixed-width block an outermost table is
-/// in (#2114, #1930 plan-2), in twips from the body's left.
+/// in (#2114, #1930 plan-2), or the room the blocks around a body card and
+/// its own side margins leave (#1940), in twips from the body's left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Room {
     pub indent: u32,

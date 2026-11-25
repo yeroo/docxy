@@ -362,3 +362,93 @@ fn a_bordered_body_div_keeps_its_lines_as_paragraph_shading_1940() {
     );
     assert_eq!(table_count(&d.body), 2);
 }
+
+/// The cell blocks of the body's only table (a body card).
+fn card_cell(d: &Document) -> &[DocBlock] {
+    &only_table(d).rows[0].cells[0].blocks
+}
+
+#[test]
+fn in_a_body_card_a_div_takes_the_bodys_rule_1940() {
+    let wrap = |inner: &str| format!("<div style='background:#f4f4f4;padding:20px'>{inner}</div>");
+    // An alert in a padded wrapper keeps its left rule: shaded, ruled
+    // paragraphs in the wrapper card's cell.
+    let d = doc(&wrap(
+        "<div style='background:#fff3cd;border-left:4px solid #ffc107;padding:12px'>Warning</div>",
+    ));
+    assert_eq!(table_count(&d.body), 1);
+    let w = para(&d, "Warning");
+    assert!(shaded(w) && w.props.borders.left.is_some(), "{:?}", w.props);
+    // New Outlook's white lines in it: two shaded paragraphs, no tables,
+    // no separator.
+    let d = doc(&wrap(
+        "<div style='background-color:rgb(255,255,255)'>a</div>\
+         <div style='background-color:rgb(255,255,255)'>b</div>",
+    ));
+    assert_eq!(table_count(&d.body), 1);
+    let texts: Vec<String> = card_cell(&d)
+        .iter()
+        .map(|b| match b {
+            DocBlock::Paragraph(p) => p.plain_text(),
+            _ => "[table]".to_string(),
+        })
+        .collect();
+    assert_eq!(texts, ["a", "b"]);
+    assert!(shaded(para(&d, "a")) && shaded(para(&d, "b")));
+    // A padded plain card in it is still a nested card.
+    let d = doc(&wrap("<div style='background:#eee;padding:8px'>x</div>"));
+    assert_eq!(table_count(&d.body), 2);
+    assert!(!shaded(para(&d, "x")));
+    // The guards over what is open in the card: a list item, a ruled
+    // block, a top line.
+    for around in [
+        "<ul><li>{}</li></ul>",
+        "<div style='border-left:1px solid #ccc;padding-left:8px'>{}</div>",
+        "<div style='border-top:1px solid #ccc'>{}</div>",
+    ] {
+        let d = doc(&wrap(
+            &around.replace("{}", "<div style='background:#eee;padding:8px'>x</div>"),
+        ));
+        assert_eq!(table_count(&d.body), 1, "{around}");
+        assert!(shaded(para(&d, "x")), "{around}");
+    }
+    // In a real cell inside the body card: #1927's rule (a bordered div
+    // is a card there).
+    let d = doc(&wrap(
+        "<table><tr><td><div style='background:#eee;border-left:4px solid red'>x</div>\
+         </td></tr></table>",
+    ));
+    assert_eq!(table_count(&d.body), 3);
+    assert!(!shaded(para(&d, "x")));
+}
+
+#[test]
+fn a_stray_table_part_open_in_a_body_card_is_ignored_1940() {
+    for html in [
+        "<div style='background:#eee;padding:8px'>a<td>b</td>c</div>",
+        "<div style='background:#eee;padding:8px'>a<th>b</th>c</div>",
+        "<div style='background:#eee;padding:8px'>a<tr>b</tr>c</div>",
+        "<div style='background:#eee;padding:8px'>a<tbody><tr><td>b</td></tr></tbody>c</div>",
+    ] {
+        let d = doc(html);
+        let t = only_table(&d);
+        assert_eq!((t.rows.len(), t.rows[0].cells.len()), (1, 1), "{html}");
+        assert!(
+            tcpr(t).contains(r#"w:fill="EEEEEE""#),
+            "{html}: {}",
+            tcpr(t)
+        );
+        let text: String = all_paras(card_cell(&d))
+            .iter()
+            .map(|p| p.plain_text())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(text.split_whitespace().collect::<String>(), "abc", "{html}");
+    }
+    // A real table in the card keeps its parts.
+    let d = doc(
+        "<div style='background:#eee;padding:8px'><table><tr><td>a</td><td>b</td></tr></table></div>",
+    );
+    let inner = tables(card_cell(&d))[0];
+    assert_eq!(inner.rows[0].cells.len(), 2);
+}

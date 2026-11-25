@@ -735,6 +735,10 @@ struct Look {
     /// #1940): the indents of the blocks around it and its own side
     /// margins other than `auto`, `None` when all are 0.
     card_room: Option<html_table::Room>,
+    /// In a card in the body, or one nested in it (inherited, reset by a
+    /// cell, #1940 r2): a `div` here is a card by the body's rule, not a
+    /// cell's ([`Cascade::own_box`], no own lines, the guards).
+    body_card: bool,
     /// A cell's own `padding`, in twips, top, right, bottom, left (not
     /// inherited): its `tcMar`.
     own_padding: [Option<i32>; 4],
@@ -1442,6 +1446,7 @@ impl Cascade {
         let parent_block_align = look.block_align;
         if kind == Kind::Cell {
             look.in_cell = true;
+            look.body_card = false;
             // A cell starts a fresh block look; what is inherited (the runs,
             // alignment, line height) still passes in.
             look.indent = 0;
@@ -2368,11 +2373,12 @@ impl Cascade {
                 // shading, as a browser draws it (an Outlook body's white
                 // `div` per line). Nor one with a border line, which a card
                 // drops and its paragraphs draw (an alert's left rule).
+                // In a body card too (r2): only a real cell takes #1927's.
                 CardMode::Maybe => {
                     self.background.is_some()
                         && !self.look.run.vanish
                         && !self.not_block
-                        && (self.look.in_cell
+                        && ((self.look.in_cell && !self.look.body_card)
                             || (self.own_box(pt) && lines.iter().all(Option::is_none)))
                 }
                 CardMode::No | CardMode::Declined => false,
@@ -2436,6 +2442,7 @@ impl Cascade {
             // A card is a cell (#1927): a fresh block look, as a `td`
             // starts; a `text-indent` it declares still applies below.
             look.card_room = card_room.flatten();
+            look.body_card = !look.in_cell || look.body_card;
             look.in_cell = true;
             look.indent = 0;
             look.indent_right = 0;
@@ -3400,6 +3407,9 @@ impl<'a> Html<'a> {
         let s = self.s;
         let attrs = attrs_of(&s[attrs_at.0..attrs_at.1]);
         let kind = Kind::of(name);
+        if matches!(name, "td" | "th" | "tr" | "thead" | "tbody" | "tfoot") && self.in_bare_card() {
+            return;
+        }
         // An `a` ends the open `a` first (#1879), as a browser's adoption
         // agency does: the formatting inside it is reopened under the new
         // one. Nothing when none is open, nor across a table or cell.
@@ -3576,17 +3586,23 @@ impl<'a> Html<'a> {
             // none: the builder's innermost table there has no cell open).
             // Outside every table, one in the body (#1940), unless what is
             // around it draws on its paragraphs ([`Self::body_card_fits`]).
+            // A stray table part in a body card never gets here (r2).
+            // In a body card, the same guards, over what is open in it (r2).
             let place = self
                 .elems
                 .iter()
+                .enumerate()
                 .rev()
-                .find(|e| e.kind.table() || matches!(e.card, CardMode::Yes(_)));
+                .find(|(_, e)| e.kind.table() || matches!(e.card, CardMode::Yes(_)));
             let placed = match place {
-                Some(e) => {
+                Some((i, e)) if matches!(e.card, CardMode::Yes(_)) && e.look.body_card => {
+                    self.kept_table() && self.body_card_fits(i + 1)
+                }
+                Some((_, e)) => {
                     self.kept_table()
                         && (e.kind == Kind::Cell || matches!(e.card, CardMode::Yes(_)))
                 }
-                None => self.table_depth == 0 && self.body_card_fits(),
+                None => self.table_depth == 0 && self.body_card_fits(0),
             };
             let candidate = name == "div"
                 && self.blocks.len() > blocks_at
@@ -3944,16 +3960,10 @@ impl<'a> Html<'a> {
         // opened past `MAX_DEPTH`) owns this close instead (#1927 r2).
         // With no table part open, a browser ignores it: a card in the
         // body stays open, its table too (#1940).
-        let open_part = self.elems.iter().rposition(|e| e.kind.table());
-        if Kind::of(name).table() && open_part.is_none() && self.table_depth > 0 {
-            let card = self.elems.iter().rev().find_map(|e| match e.card {
-                CardMode::Yes(depth) => Some(depth),
-                _ => None,
-            });
-            if card.is_some_and(|depth| depth >= self.table_depth) {
-                return;
-            }
+        if Kind::of(name).table() && self.in_bare_card() {
+            return;
         }
+        let open_part = self.elems.iter().rposition(|e| e.kind.table());
         if let Some(from) = open_part.filter(|_| Kind::of(name).table()).map(|t| t + 1) {
             let innermost = self.elems[from..].iter().rev().find_map(|e| match e.card {
                 CardMode::Yes(depth) => Some(depth),
@@ -4151,15 +4161,35 @@ impl<'a> Html<'a> {
         !self.in_downlevel && !self.in_marker
     }
 
-    /// Whether a card may open in the body here (#1940): not in a list
-    /// (its number and indent are its paragraphs'), nor in a block whose
+    /// In a body card with no table part open (#1940): the builder's
+    /// innermost table is the card's, so a stray `td`, `th`, `tr` or row
+    /// group, open or close, which a browser ignores there, is ignored
+    /// ([`Self::open_element`], [`Self::close_tag`]). A table opened past
+    /// `MAX_DEPTH` above the card (no `Elem`) keeps its parts.
+    fn in_bare_card(&self) -> bool {
+        self.table_depth > 0
+            && !self.elems.iter().any(|e| e.kind.table())
+            && self
+                .elems
+                .iter()
+                .rev()
+                .find_map(|e| match e.card {
+                    CardMode::Yes(depth) => Some(depth),
+                    _ => None,
+                })
+                .is_some_and(|depth| depth >= self.table_depth)
+    }
+
+    /// Whether a card may open in the body here (#1940), or in a body
+    /// card whose content starts at `elems[from]` (r2): not in a list (its
+    /// number and indent are its paragraphs'), nor in a block whose
     /// shading, side lines or own top or bottom line go on its paragraphs
     /// (a quoted reply's rule, Outlook's reply header): a card's table
     /// would drop them.
-    fn body_card_fits(&self) -> bool {
+    fn body_card_fits(&self, from: usize) -> bool {
         let parent = self.elems.last().map(|e| &e.look);
         parent.is_none_or(|l| !l.in_list && l.shade.is_none() && l.borders == ParBorders::default())
-            && !self.elems.iter().any(|e| {
+            && !self.elems.get(from..).unwrap_or_default().iter().any(|e| {
                 e.kind == Kind::Block && (e.look.own_top.is_some() || e.look.own_bottom.is_some())
             })
     }

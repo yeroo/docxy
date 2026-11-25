@@ -605,8 +605,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   parent whose look has shading or side lines (a quoted reply's left
   rule, a shaded block that is no card), or under any open block with a
   top or bottom line of its own (`own_top`/`own_bottom`: Outlook's reply
-  header). In a body card a `div` takes #1927's path (a card open counts
-  as a cell; no guards there).
+  header). In a body card (and a card nested in one: the inherited
+  `Look::body_card`, reset by a real `td`/`th`) a `div` takes the body's
+  rule, own box, no own lines and these guards over what is open inside
+  the card (`body_card_fits(from)`; r2): the newsletter's padded wrapper
+  around an alert or Outlook's white lines. In a real cell, #1927's.
 - Room: a body card is laid out in the room the blocks around it leave
   (`Look::card_room`, from the inherited indents plus its own side
   margins other than `auto`, set in `finish` before the card resets the
@@ -620,7 +623,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   is a 9000-twip table, centred.
 - A table part's close (`</td>`, `</tr>`, `</table>`, a row group's) with
   no table part open is ignored, as in a browser: it never ends a body
-  card or its row (`close_tag`).
+  card or its row (`close_tag`). So is a stray `td`/`th`/`tr`/row group
+  start there (`open_element`, r2): the card's cell keeps its fill
+  (`Html::in_bare_card`, both).
 - Known limits: a body card's vertical margins are lost (the shaded
   paragraphs kept them as spacing before and after; a table has none),
   and so is a `page-break-before`/`-after` on it (it lands in its cell,
