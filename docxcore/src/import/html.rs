@@ -2611,10 +2611,16 @@ const QUIRKS_PUBLIC_NO_SYSTEM: [&str; 2] = [
 /// inside a comment or a script does not apply). The base is the first
 /// `<base>` with an `href`, in head or body, as a browser's document base
 /// URL: found before the tokenizer runs, it applies to an `<img>` before
-/// it too.
+/// it too. A first `<base href>` that is no base (`page_base` refuses it)
+/// still ends the search, as in a browser (#1898 r1). Each `<base>` tag is
+/// read once and passed over whole; one that never closes ends the search
+/// (no later tag can close either), so the scan stays linear.
 fn collect_styles(s: &str) -> (String, Option<String>) {
     let mut css = String::new();
-    let mut base = None;
+    // `Some(base)` once the first `<base>` with an `href` is read; `looking`
+    // until then, or until a `<base` that never closes.
+    let mut base: Option<Option<String>> = None;
+    let mut looking = true;
     let mut i = 0;
     while let Some(off) = s[i..].find('<') {
         let at = i + off;
@@ -2630,11 +2636,19 @@ fn collect_styles(s: &str) -> (String, Option<String>) {
             .find(|c: char| !c.is_ascii_alphanumeric())
             .unwrap_or(rest.len() - 1);
         let name = rest[1..1 + name_len.min(MAX_TAG)].to_ascii_lowercase();
-        if name == "base" && base.is_none() {
-            if let Some(end) = tag_end(rest) {
-                let attrs = attrs_of(&rest[1 + name_len..end - 1]);
-                base = attrs.href.and_then(|h| html_image::page_base(&h));
+        if name == "base" && looking {
+            let Some(end) = tag_end(rest) else {
+                looking = false;
+                i = at + 1;
+                continue;
+            };
+            let attrs = attrs_of(&rest[1 + name_len..end - 1]);
+            if let Some(href) = attrs.href {
+                base = Some(html_image::page_base(&href));
+                looking = false;
             }
+            i = at + end;
+            continue;
         }
         if !RAW_TEXT.contains(&name.as_str()) {
             i = at + 1;
@@ -2652,7 +2666,7 @@ fn collect_styles(s: &str) -> (String, Option<String>) {
         }
         i = end;
     }
-    (css, base)
+    (css, base.flatten())
 }
 
 struct Html<'a> {

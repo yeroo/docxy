@@ -800,3 +800,44 @@ fn with_svg_blip_opens_a_self_closing_blip_only_1898() {
     assert_eq!(crate::image::with_svg_blip(&with, "rId3"), None);
     assert_eq!(crate::image::with_svg_blip("<w:r/>", "rId3"), None);
 }
+
+#[test]
+fn a_refused_first_base_href_still_ends_the_search_r1_1898() {
+    // A browser takes only the first `<base>` with an `href`, usable or not.
+    for first in ["javascript:x", "data:text/html,x", ""] {
+        let (_, asked) = import(&format!(
+            "<base href='{first}'><base href='img/'><p><img src=a.png></p>"
+        ));
+        assert_eq!(asked, ["a.png"], "{first}");
+    }
+    // A `<base>` without an `href` does not.
+    let (_, asked) = import("<base target=_top><base href='img/'><p><img src=a.png></p>");
+    assert_eq!(asked, ["img/a.png"]);
+}
+
+#[test]
+fn many_base_tags_that_never_close_scan_in_linear_time_r1_1898() {
+    // Each `<base` that never closes (or closes only at the very end) once
+    // scanned to the end: quadratic, minutes for a megabyte here (200 KB
+    // took ~15 s a call in a debug build). Read once each, the pre-pass is
+    // linear: milliseconds.
+    for unit in ["<base ", "<base x=\"", "<base<"] {
+        let mut page = String::from("<p>x</p>");
+        page.push_str(&unit.repeat(1_000_000 / unit.len()));
+        let start = std::time::Instant::now();
+        let (css, base) = collect_styles(&page);
+        assert!(
+            start.elapsed().as_secs() < 20,
+            "{unit}: {:?}",
+            start.elapsed()
+        );
+        assert!(css.is_empty() && base.is_none(), "{unit}");
+    }
+    let mut page = "<base ".repeat(200_000);
+    page.push_str("href='img/'><p><img src=a.png></p>");
+    let start = std::time::Instant::now();
+    let (_, base) = collect_styles(&page);
+    assert!(start.elapsed().as_secs() < 20, "{:?}", start.elapsed());
+    // One tag, the first `<base` to its `>`: its `href` is the base.
+    assert_eq!(base.as_deref(), Some("img/"));
+}
