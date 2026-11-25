@@ -201,7 +201,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   distinct src, at most `MAX_IMAGES` (1000) calls, told the most bytes it
   may return (budget room, `MAX_IMAGE_BYTES` 64 MiB, what `MAX_MEDIA_BYTES`
   128 MiB leaves); a longer answer is dropped. Kind and extension come from
-  `image::sniff` only (PNG/JPEG/GIF/BMP); equal bytes are one medium.
+  `image::sniff` only (PNG/JPEG/GIF/BMP), but for SVG and WebP made PNG by
+  a caller's converter (#1898, below); equal bytes are one medium. Since
+  #1898 the src is resolved against the page's `<base href>` (or an MHTML
+  root's location) first, and an MHTML part answers before the resolver.
 - Size (twips, ×635 to EMU): CSS `width`/`height` lengths over the
   attributes, `auto` clears a side; a percentage width (CSS or attribute)
   is of the containing width and a percentage height is `auto` (#1898,
@@ -294,7 +297,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   `MAX_IMAGES`. The first that gives an image wins, its CSS size its
   pixels over its density (`2x`: half); a `w` descriptor counts as `1x`
   (`sizes` is not read). A `src` that resolves asks for no candidate.
-- MHTML (`import/mhtml.rs`): `import_html_within` first tries
+- MHTML (`import/mhtml.rs`): `import_html_converting` (behind both
+  `import_html_within` and `import_html_with_converter`) first tries
   `mhtml::parse`. A top header block (unfolded, within `MAX_HEADER` 16 KiB
   up to its blank line) whose `Content-Type` is `multipart/related` with a
   `boundary` is a message; its parts are split at `--boundary` lines (the

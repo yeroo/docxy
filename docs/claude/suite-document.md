@@ -190,8 +190,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   could not get; `Pictures::is_placeholder`, cached per (part, rid) until
   the parts stamp changes), draws the picture's Alt Text
   (`image::inline_alt_text`, `pictures::frame_alt`) inside it (#1898):
-  `picture_alt_el`, 9 pt at the zoom in the palette's `dim`, inset 2 px,
-  wrapped at the frame's width and clipped to it. A picture that loads
+  `picture_alt_el`, 12 px (9 pt) at the zoom in the palette's `dim`, inset
+  2 px at the zoom (at most a quarter of the frame each way), wrapped at
+  the frame's width and clipped to it. A picture that loads
   draws none. It is the one draw path, so every view and the embedded
   `ext::DocView` show it; the #1998 tooltip stays. `flow.pictures.N.alt` is
   the text drawn (else null); `uiharness/cases/html-image-alt.uit`.

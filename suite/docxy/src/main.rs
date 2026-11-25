@@ -40212,13 +40212,10 @@ fn picture_frame_px(cx: i64, cy: i64, zoom: f32) -> (f32, f32) {
     (px_of(cx), px_of(cy))
 }
 
-/// An inline picture's drawn size in px (#1963): its frame
-/// ([`picture_frame_px`]), scaled down with its aspect kept to `room` (a
-/// flow view's width for it) when wider; `None` draws its frame's size.
-/// At least 1 px each way.
 /// A picture frame's Alt Text (#1898), laid over its `w` x `h` px frame:
-/// 9 pt at `zoom` in `ink`, inset 2 px, wrapped at the frame's width and
-/// clipped to it.
+/// 12 px (9 pt) at `zoom`, 15 px lines, in `ink`, inset 2 px at the zoom
+/// (at most a quarter of the frame each way), wrapped at the frame's width
+/// and clipped to it.
 fn picture_alt_el(text: &str, w: f32, h: f32, zoom: f32, ink: Hsla) -> Div {
     let inset = (2.0 * zoom).min(w / 4.0).min(h / 4.0);
     div()
@@ -40235,6 +40232,10 @@ fn picture_alt_el(text: &str, w: f32, h: f32, zoom: f32, ink: Hsla) -> Div {
         .child(text.to_string())
 }
 
+/// An inline picture's drawn size in px (#1963): its frame
+/// ([`picture_frame_px`]), scaled down with its aspect kept to `room` (a
+/// flow view's width for it) when wider; `None` draws its frame's size.
+/// At least 1 px each way.
 fn shown_picture_px(cx: i64, cy: i64, zoom: f32, room: Option<f32>) -> (f32, f32) {
     let (w, h) = picture_frame_px(cx, cy, zoom);
     match room {

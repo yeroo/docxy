@@ -14,11 +14,16 @@ use super::html_table::BODY_TWIPS;
 use crate::image::{self, ImageInfo};
 use std::collections::HashMap;
 
-/// What an `<img src>` other than `data:` resolves to, given the src as the
-/// page writes it (character references decoded, trimmed) and the most
-/// bytes the import will take: the image's bytes, or `None` (refused,
-/// missing) for a placeholder. Called once per distinct src. A longer
-/// answer is dropped, as is one whose bytes are not PNG, JPEG, GIF or BMP.
+/// What an `<img src>` other than `data:` resolves to, given the src
+/// (character references decoded, trimmed; resolved against the page's
+/// `<base href>` or an MHTML root part's `Content-Location` when it has
+/// one, #1898, else as the page writes it) and the most bytes the import
+/// will take: the image's bytes, or `None` (refused, missing) for a
+/// placeholder. Called once per distinct src; a src an MHTML message's
+/// part holds never reaches it. A longer answer is dropped, as is one
+/// whose bytes are not PNG, JPEG, GIF or BMP, or, with a converter
+/// ([`crate::import::import_html_with_converter`], #1898), SVG or WebP it
+/// turns into PNG.
 pub type ImageResolver<'r> = dyn FnMut(&str, usize) -> Option<Vec<u8>> + 'r;
 
 /// What a caller's [`ImageConverter`] is asked to turn into PNG (#1898).
