@@ -125,21 +125,59 @@ use crate::editor::LINK_COLOR;
 /// than an import may ([`TOO_BIG`]).
 /// Images are not converted: a [`Document`] alone cannot hold their media
 /// ([`import_html_with`] does).
+/// Its ordered lists are folded into one count ([`HtmlImport::fold_lists`]):
+/// a bare document cannot carry their definitions.
 pub fn import_html(bytes: &[u8]) -> Result<Document, String> {
-    import_html_within(bytes, &Budget::standard(), None).map(|h| h.document)
+    import_html_within(bytes, &Budget::standard(), None).map(|mut h| {
+        h.fold_lists();
+        h.document
+    })
+}
+
+/// At most this many ordered lists of a page get a definition of their own
+/// (#1989): past it a list is numId 2, the Markdown decimal list, as every
+/// one was before. It bounds the numbering part.
+const MAX_HTML_LISTS: usize = 256;
+
+/// The work one list definition of its own is charged (#1989): about its
+/// nine levels' bytes in `numbering.xml`, in the budget's 16-byte units.
+const LIST_WORK: usize = 160;
+
+/// An ordered list of the page with a count of its own (#1989): each `<ol>`,
+/// and each run of its items an `<li value>` starts at a number other than
+/// the next, as a browser numbers them. Its own `w:num` and its own
+/// `w:abstractNum`: the Markdown decimal levels, level `level`'s `w:start`
+/// its first number. The first one starting at 1 is not one of these: it
+/// is numId 2, the Markdown package's own decimal list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportedList {
+    pub num_id: i32,
+    pub abstract_id: i32,
+    /// The level its items are at (the list's nesting depth).
+    pub level: i32,
+    /// Its first number, `0..=32767`.
+    pub start: i32,
 }
 
 /// An HTML page read with its images (#1880): the document, whose pictures
 /// name import-local rids, the media they name and the URLs of their click
 /// links (#1999). Both kinds of rid are the import's own: a caller that
 /// builds its package without [`HtmlImport::package`] maps both, or it saves
-/// pictures naming relationships the package does not have.
+/// pictures naming relationships the package does not have. Its ordered
+/// lists' definitions are the import's too (#1989, [`HtmlImport::lists`]):
+/// such a caller defines them ([`Package::add_html_lists`]) or calls
+/// [`HtmlImport::fold_lists`] first, or its items name lists the package
+/// does not define, which the suite draws as bullets.
 #[derive(Debug)]
 pub struct HtmlImport {
     pub document: Document,
     pub media: Vec<ImportedMedia>,
     /// The pictures' click links (`a:hlinkClick`), by import-local rid.
     pub links: Vec<ImportedLink>,
+    /// The ordered lists with a count of their own (#1989), each the numId
+    /// of its items: numIds from 3 up, beside the Markdown package's 1 and
+    /// 2. [`HtmlImport::package`] defines them.
+    pub lists: Vec<ImportedList>,
     /// The page's colour (#1894), `RRGGBB`: the `html` element's
     /// background, else the `body`'s (`bgcolor` or CSS); none when white.
     /// [`HtmlImport::package`] writes it as Word's page colour.
@@ -154,15 +192,25 @@ impl HtmlImport {
     /// Each medium's bytes are dropped as soon as the package holds them.
     /// Each click link is an external hyperlink relationship of
     /// `word/document.xml` (#1999), its pictures' `a:hlinkClick` renamed to
-    /// it.
+    /// it. Each list of [`HtmlImport::lists`] is defined in its numbering
+    /// part ([`Package::add_html_lists`], #1989).
     pub fn package(self) -> Package {
         let HtmlImport {
             mut document,
             media,
             links,
             page_color,
+            lists,
         } = self;
         let mut pkg = crate::package::new_markdown_package(Document::default());
+        let defs: Vec<(i32, i32, i32, i32)> = lists
+            .iter()
+            .map(|l| (l.num_id, l.abstract_id, l.level, l.start))
+            .collect();
+        if !pkg.add_html_lists(&defs) {
+            // Never on a fresh package; folded rather than left undefined.
+            fold_list_ids(&mut document.body, &lists);
+        }
         if let Some(color) = page_color.and_then(|c| u32::from_str_radix(&c, 16).ok()) {
             pkg.set_page_background(Some(&crate::page_bg::PageBackground {
                 color,
@@ -190,6 +238,41 @@ impl HtmlImport {
         rename_rids(&mut document.body, &rids);
         pkg.document = document;
         pkg
+    }
+
+    /// Fold every list of [`HtmlImport::lists`] back into numId 2, the
+    /// Markdown decimal list (#1989): one count over every ordered list of
+    /// the page, as before #1989, for a caller that cannot define them.
+    /// `lists` is left empty.
+    pub fn fold_lists(&mut self) {
+        let lists = std::mem::take(&mut self.lists);
+        fold_list_ids(&mut self.document.body, &lists);
+    }
+}
+
+/// Every paragraph of `blocks` (table cells included) on one of `lists`
+/// put on numId 2.
+fn fold_list_ids(blocks: &mut [DocBlock], lists: &[ImportedList]) {
+    if lists.is_empty() {
+        return;
+    }
+    let ids: std::collections::HashSet<i32> = lists.iter().map(|l| l.num_id).collect();
+    for b in blocks {
+        match b {
+            DocBlock::Paragraph(p) => {
+                if p.props.num_id.is_some_and(|n| ids.contains(&n)) {
+                    p.props.num_id = Some(2);
+                }
+            }
+            DocBlock::Table(t) => {
+                for row in &mut t.rows {
+                    for cell in &mut row.cells {
+                        fold_list_ids(&mut cell.blocks, lists);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -304,7 +387,10 @@ pub(crate) fn import_html_str_within(text: &str, budget: &Budget) -> Result<Docu
     if !budget.work(2 * (text.len() / 16 + 1)) {
         return Err(TOO_BIG.into());
     }
-    import_decoded(text, budget, None, None, None, false).map(|h| h.document)
+    import_decoded(text, budget, None, None, None, false).map(|mut h| {
+        h.fold_lists();
+        h.document
+    })
 }
 
 /// The import of the decoded page `text`, as [`import_html_within`] says;
@@ -391,6 +477,7 @@ fn import_decoded(
         media,
         links,
         page_color,
+        lists: h.ol_lists,
     })
 }
 
@@ -500,9 +587,12 @@ struct Block {
     /// parent's alone.
     item_numbered: bool,
     /// On an `li`'s own entry and below it (#2114): the item's number in
-    /// its own list as a browser counts it (each list from 1), what its
-    /// hang is as wide as.
-    item_ordinal: u32,
+    /// its own list as a browser counts it (each list from its `start`, an
+    /// item's `value` its own, #1989), what its hang is as wide as.
+    item_ordinal: i32,
+    /// On an `li`'s own entry and below it (#1989): the numId its numbered
+    /// paragraph takes: 1 for a bullet, its list's own for a number.
+    item_num: i32,
     /// On an `li`'s own entry (FIX r2 m1): the empty paragraph that holds
     /// the item's number until one with a line takes it, as its flow's
     /// `table_depth` and index there.
@@ -513,8 +603,12 @@ struct Block {
 #[derive(Clone, Copy, Debug, Default)]
 struct OpenList {
     ordered: bool,
-    /// The `li`s opened in it so far (#2114).
-    items: u32,
+    /// The number a browser gives its next item (#2114, #1989): an `ol`'s
+    /// `start`, else 1, then one past the last item's.
+    next: i32,
+    /// The numId its items are on so far (#1989), from its first `li` on:
+    /// a new one where an item's `value` breaks the count.
+    num: Option<i32>,
 }
 
 /// How an element takes part in the page, for its look.
@@ -986,6 +1080,9 @@ struct Attrs {
     title: Option<String>,
     target: Option<String>,
     name: Option<String>,
+    /// An `<ol>`'s `start` and an `<li>`'s `value` (#1989).
+    start: Option<String>,
+    value: Option<String>,
 }
 
 /// One element's style, being computed: its look so far, and the box
@@ -1128,9 +1225,31 @@ const DIGIT_HANG: f64 = 0.5555;
 
 /// The hang of a numbered HTML item numbered `n`, in em (#2114): wide
 /// enough for its own number, so 10 and up do not tab past the text.
-fn decimal_hang(n: u32) -> f64 {
+fn decimal_hang(n: i32) -> f64 {
     let digits = n.max(1).ilog10() + 1;
     DECIMAL_HANG + f64::from(digits - 1) * DIGIT_HANG
+}
+
+/// An `<ol>`'s `start` or an `<li>`'s `value` (#1989), read by HTML's rules
+/// for parsing integers: leading white space skipped, an optional sign,
+/// then the leading digits (`5abc` is 5); `None` with no digits. Clamped to
+/// `0..=32767`, what Word's `w:start` takes (a browser's negative numbers
+/// are not Word's).
+fn list_number(v: &str) -> Option<i32> {
+    let t = v.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (negative, t) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let digits = t.bytes().take_while(u8::is_ascii_digit);
+    let mut n: i64 = 0;
+    let mut any = false;
+    for d in digits {
+        any = true;
+        n = (n * 10 + i64::from(d - b'0')).min(i64::from(i32::MAX));
+    }
+    any.then(|| (if negative { -n } else { n }).clamp(0, 32_767) as i32)
 }
 
 /// The paragraph-mark `w:rPr` of a run's look (#1979): its font, size,
@@ -3125,6 +3244,11 @@ struct Html<'a> {
     anchors: std::collections::HashSet<String>,
     /// The page the import is laid out for (#1944, [`Html::set_page`]).
     page: html_table::Page,
+    /// The ordered lists with a count of their own so far (#1989,
+    /// [`Html::new_list`]).
+    ol_lists: Vec<ImportedList>,
+    /// A list has taken numId 2, the Markdown decimal list (#1989).
+    plain_list_taken: bool,
 }
 
 impl<'a> Html<'a> {
@@ -3166,7 +3290,33 @@ impl<'a> Html<'a> {
             bookmarks: false,
             anchors: std::collections::HashSet::new(),
             page: html_table::Page::DEFAULT,
+            ol_lists: Vec::new(),
+            plain_list_taken: false,
         }
+    }
+
+    /// The numId of a new ordered list at `level` whose first number is
+    /// `start` (#1989): the first one starting at 1 is numId 2, the
+    /// Markdown decimal list (so a page of one plain `<ol>` imports as it
+    /// did); every other one is a list of its own, numIds from 3 up on
+    /// abstracts from 102 up, until [`MAX_HTML_LISTS`], past which it is
+    /// numId 2 again.
+    fn new_list(&mut self, level: i32, start: i32) -> i32 {
+        if start == 1 && !self.plain_list_taken {
+            self.plain_list_taken = true;
+            return 2;
+        }
+        if self.ol_lists.len() >= MAX_HTML_LISTS || !self.budget.work(LIST_WORK) {
+            return 2;
+        }
+        let num_id = 3 + self.ol_lists.len() as i32;
+        self.ol_lists.push(ImportedList {
+            num_id,
+            abstract_id: num_id + 99,
+            level,
+            start,
+        });
+        num_id
     }
 
     fn run(&mut self) {
@@ -3624,10 +3774,28 @@ impl<'a> Html<'a> {
                     let numbered = self.lists.last().is_some_and(|l| l.ordered);
                     let level = self.lists.len().saturating_sub(1) as i32;
                     block.item = Some((numbered, level));
-                    block.item_ordinal = self.lists.last_mut().map_or(1, |l| {
-                        l.items = l.items.saturating_add(1);
-                        l.items
-                    });
+                    // Its number as a browser counts it (#1989): its own
+                    // `value`, else one past the item before's; a number
+                    // that is not the next starts a list of its own.
+                    let (next, num) = self.lists.last().map_or((1, None), |l| (l.next, l.num));
+                    let n = attrs
+                        .value
+                        .as_deref()
+                        .filter(|_| numbered)
+                        .and_then(list_number)
+                        .unwrap_or(next);
+                    block.item_ordinal = n;
+                    block.item_num = match num {
+                        _ if !numbered => 1,
+                        Some(id) if n == next => id,
+                        _ => self.new_list(level, n),
+                    };
+                    if let Some(l) = self.lists.last_mut() {
+                        l.next = n.saturating_add(1);
+                        if numbered {
+                            l.num = Some(block.item_num);
+                        }
+                    }
                 }
                 if name == "td" || name == "th" {
                     // A cell starts with nothing structural inherited from
@@ -3644,9 +3812,12 @@ impl<'a> Html<'a> {
             "ul" | "ol" | "dir" | "menu" => {
                 self.end_para_if_any();
                 if self.lists.len() < MAX_DEPTH {
+                    let ordered = name == "ol";
+                    let start = attrs.start.as_deref().filter(|_| ordered);
                     self.lists.push(OpenList {
-                        ordered: name == "ol",
-                        items: 0,
+                        ordered,
+                        next: start.and_then(list_number).unwrap_or(1),
+                        num: None,
                     });
                 }
             }
@@ -5266,7 +5437,7 @@ impl<'a> Html<'a> {
                 props.num_id = Some(if marker_is_numbered(m) { 2 } else { 1 });
             }
             // A heading in an item too (FIX r2 m2): its style stays.
-            (None, Some((numbered, level))) if !block.mso_list => {
+            (None, Some((_, level))) if !block.mso_list => {
                 let (done, held) = self
                     .open_item()
                     .map_or((false, None), |i| (i.item_numbered, i.item_held));
@@ -5279,7 +5450,7 @@ impl<'a> Html<'a> {
                     // The first paragraph with a line takes the number; an
                     // empty one before it holds it until then, so an item
                     // with no line still counts (FIX r2 m1).
-                    self.number_item(&mut props, numbered, level);
+                    self.number_item(&mut props, block.item_num, level);
                     if has_line {
                         if let Some((depth, index)) = held {
                             self.release_number(depth, index);
@@ -5381,9 +5552,10 @@ impl<'a> Html<'a> {
     /// level, the item's look on the mark (#1979, as a browser's
     /// `::marker`), and at the margin an explicit zero indent, or the
     /// numbering level's 720 would stand (FIX r1 m6; written as a loaded
-    /// one, so an edit replaces it).
-    fn number_item(&self, props: &mut ParProps, numbered: bool, level: i32) {
-        props.num_id = Some(if numbered { 2 } else { 1 });
+    /// one, so an edit replaces it). `num_id` is the item's list
+    /// ([`Block::item_num`], #1989).
+    fn number_item(&self, props: &mut ParProps, num_id: i32, level: i32) {
+        props.num_id = Some(num_id);
         props.ilvl = level;
         props.raw_props.retain(|r| !r.starts_with("<w:rPr"));
         if let Some(rpr) = self.item_elem().and_then(|e| mark_rpr(&e.look.run)) {
@@ -5520,6 +5692,8 @@ fn attrs_of(attrs: &str) -> Attrs {
             "title" => Some(&mut out.title),
             "target" => Some(&mut out.target),
             "name" => Some(&mut out.name),
+            "start" => Some(&mut out.start),
+            "value" => Some(&mut out.value),
             _ => None,
         };
         if let Some(slot) = slot.filter(|s| s.is_none()) {
@@ -12465,3 +12639,9 @@ mod tests_1944;
 #[cfg(test)]
 #[path = "html_tests_1973.rs"]
 mod tests_1973;
+
+// The `plan-ol-start` leftover of #1979 (#1989): each `<ol>` its own
+// count, with `start` and `value`.
+#[cfg(test)]
+#[path = "html_tests_1989.rs"]
+mod tests_1989;

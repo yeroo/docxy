@@ -979,7 +979,10 @@ mod tests {
                 .find(|m| src == format!("cid:{}", m.content_id))
                 .map(|m| m.bytes.clone())
         };
-        let imported = import_html_with(e.html.as_bytes(), &mut resolve).expect("imports");
+        let mut imported = import_html_with(e.html.as_bytes(), &mut resolve).expect("imports");
+        // The document without its package: its lists folded into the
+        // Markdown ones (#1989), which these tests name by kind (1, 2).
+        imported.fold_lists();
         (imported.document, imported.media)
     }
 

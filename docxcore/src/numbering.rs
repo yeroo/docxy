@@ -252,12 +252,16 @@ fn fill(absn: &AbstractNum, text: &str, c: &[i32]) -> String {
     for k in 1..=9usize {
         let pat = format!("%{k}");
         if s.contains(&pat) {
-            let val = c.get(k - 1).copied().unwrap_or(0).max(1);
             let fmt = absn
                 .levels
                 .get(k - 1)
                 .map(|l| l.fmt)
                 .unwrap_or(NumFmt::Decimal);
+            // A decimal level may count from 0 (`w:start 0`, an HTML
+            // `<ol start=0>`, #1989), as Word draws it; a letter or roman
+            // numeral has no 0.
+            let least = if fmt == NumFmt::Decimal { 0 } else { 1 };
+            let val = c.get(k - 1).copied().map_or(1, |v| v.max(least));
             s = s.replace(&pat, &format_num(val, fmt));
         }
     }

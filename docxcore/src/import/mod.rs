@@ -126,7 +126,9 @@ pub mod pdf;
 pub mod recover;
 pub mod rtf;
 
-pub use html::{HtmlImport, import_html, import_html_with, import_html_with_converter};
+pub use html::{
+    HtmlImport, ImportedList, import_html, import_html_with, import_html_with_converter,
+};
 pub use html_image::{
     ConvertKind, ConvertedImage, ImageConverter, ImageResolver, ImportedLink, ImportedMedia,
 };

@@ -4033,6 +4033,12 @@ fn repair_level_indents(xml: &str, num_id: i32) -> Option<String> {
 /// into an existing package), so the two list definitions can never drift
 /// apart — mirrors [`markdown_style_def`]'s role for styles.
 fn markdown_list_levels(bullet: bool) -> String {
+    markdown_levels(bullet, None)
+}
+
+/// [`markdown_list_levels`], a decimal list's level `.0` starting at `.1`
+/// when `start` gives one (#1989).
+fn markdown_levels(bullet: bool, start: Option<(i32, i32)>) -> String {
     let mut out = String::new();
     for lvl in 0..9 {
         // Word's built-in lists indent each level 720 twips further with a
@@ -4044,8 +4050,12 @@ fn markdown_list_levels(bullet: bool) -> String {
                  <w:lvlJc w:val=\"left\"/>{ind}</w:lvl>"
             ));
         } else {
+            let first = match start {
+                Some((at, n)) if at == lvl => n,
+                _ => 1,
+            };
             out.push_str(&format!(
-                "<w:lvl w:ilvl=\"{lvl}\"><w:start w:val=\"1\"/><w:numFmt w:val=\"decimal\"/>\
+                "<w:lvl w:ilvl=\"{lvl}\"><w:start w:val=\"{first}\"/><w:numFmt w:val=\"decimal\"/>\
                  <w:lvlText w:val=\"%{}.\"/><w:lvlJc w:val=\"left\"/>{ind}</w:lvl>",
                 lvl + 1
             ));
@@ -4557,6 +4567,50 @@ impl Package {
                     .into_bytes(),
             );
         }
+    }
+
+    /// Define the decimal lists `lists`, each `(num_id, abstract_id, level,
+    /// start)`, in the numbering part (#1989: an HTML page's ordered lists,
+    /// [`crate::import::html::ImportedList`]): each its own `w:num` on its
+    /// own `w:abstractNum`, the Markdown decimal levels with level `level`
+    /// starting at `start`, so each list counts alone. One write of the
+    /// part, made first by [`Package::add_markdown_numbering`] when there is
+    /// none. False, and nothing changed, when the part already defines one
+    /// of the ids (or has no `w:numbering` root): the caller folds those
+    /// lists instead. True with nothing to define.
+    pub fn add_html_lists(&mut self, lists: &[(i32, i32, i32, i32)]) -> bool {
+        if lists.is_empty() {
+            return true;
+        }
+        self.add_markdown_numbering();
+        let name = "word/numbering.xml";
+        let Some(xml) = self.part_text(name) else {
+            return false;
+        };
+        let taken = crate::numbering::parse_numbering_xml(&xml);
+        let abstract_taken = |id: i32| xml.contains(&format!("w:abstractNumId=\"{id}\""));
+        if lists
+            .iter()
+            .any(|&(n, a, _, _)| taken.defines(n) || abstract_taken(a))
+        {
+            return false;
+        }
+        let mut abstracts = String::new();
+        let mut nums = String::new();
+        for &(num_id, abstract_id, level, start) in lists {
+            let levels = markdown_levels(false, Some((level, start)));
+            abstracts.push_str(&format!(
+                "<w:abstractNum w:abstractNumId=\"{abstract_id}\">{levels}</w:abstractNum>"
+            ));
+            nums.push_str(&format!(
+                "<w:num w:numId=\"{num_id}\"><w:abstractNumId w:val=\"{abstract_id}\"/></w:num>"
+            ));
+        }
+        let Some(spliced) = splice_numbering(&xml, &abstracts, &nums) else {
+            return false;
+        };
+        self.set_part(name, spliced.into_bytes());
+        true
     }
 }
 
