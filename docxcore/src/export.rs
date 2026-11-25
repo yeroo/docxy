@@ -1152,10 +1152,99 @@ fn emit_paragraph(flow: &mut dyn Flow, p: &Paragraph, opts: &PdfOptions) {
     emit_segments(flow, segs, size, p.props.align, (m, base));
 }
 
+/// Where a table sits across its text column: its own `w:jc` (#1930), as
+/// the suite's document view reads it (`table_view::h_align`); a style's
+/// `jc` and `bidiVisual` are not read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TablePlace {
+    Left,
+    Center,
+    Right,
+}
+
+fn table_place(t: &Table) -> TablePlace {
+    match crate::table::table_props(t)
+        .attr("w:jc", "w:val")
+        .as_deref()
+    {
+        Some("center") => TablePlace::Center,
+        Some("right" | "end") => TablePlace::Right,
+        _ => TablePlace::Left,
+    }
+}
+
+/// How far right of the column's left a table `table_w` points wide sits in
+/// a `col_w` column (#1930): `None` at the left, also for a table with no
+/// width or one wider than the column (the suite's view keeps those there).
+fn place_offset(col_w: f32, table_w: f32, place: TablePlace) -> Option<f32> {
+    if place == TablePlace::Left || table_w <= 0.0 || table_w > col_w {
+        return None;
+    }
+    Some(match place {
+        TablePlace::Center => (col_w - table_w) / 2.0,
+        _ => col_w - table_w,
+    })
+}
+
+/// A flow whose lines are a placed table's (#1930): each one starts at the
+/// table's left in the column it lands in and is as wide as the table.
+/// Everything else is the inner flow's.
+struct Placed<'a> {
+    inner: &'a mut dyn Flow,
+    place: TablePlace,
+    /// The table's width, in points.
+    width: f32,
+}
+
+impl Flow for Placed<'_> {
+    fn begin_paragraph(&mut self, info: ParaInfo) {
+        self.inner.begin_paragraph(info);
+    }
+    fn chapter_heading(&mut self, p: &Paragraph) {
+        self.inner.chapter_heading(p);
+    }
+    fn next_line(&mut self, lh: f32) -> (f32, f32, f32) {
+        // Per line: a row that moves to another column or page is placed
+        // in that one.
+        let (x, w, y) = self.inner.next_line(lh);
+        match place_offset(w, self.width, self.place) {
+            Some(off) => (x + off, self.width, y),
+            None => (x, w, y),
+        }
+    }
+    fn push(&mut self, frag: Frag, link: Option<Link>) {
+        self.inner.push(frag, link);
+    }
+    fn gap(&mut self, dy: f32) {
+        self.inner.gap(dy);
+    }
+    fn hard_break(&mut self, kind: BreakKind) {
+        self.inner.hard_break(kind);
+    }
+    fn at_top(&self) -> bool {
+        self.inner.at_top()
+    }
+}
+
 fn emit_table(flow: &mut dyn Flow, t: &Table, opts: &PdfOptions) {
     // Word doesn't number table lines.
     flow.begin_paragraph(ParaInfo { numbered: false });
-    // Phase 0: flatten each row to a text line (no borders).
+    let place = table_place(t);
+    let width = t.grid.iter().map(|&w| u64::from(w)).sum::<u64>() as f32 / 20.0;
+    if place == TablePlace::Left || width <= 0.0 {
+        // At the column's left, as every table printed before #1930.
+        return emit_rows(flow, t, opts);
+    }
+    let mut placed = Placed {
+        inner: flow,
+        place,
+        width,
+    };
+    emit_rows(&mut placed, t, opts);
+}
+
+/// Phase 0 of a table: each row flattened to a text line (no borders).
+fn emit_rows(flow: &mut dyn Flow, t: &Table, opts: &PdfOptions) {
     for row in &t.rows {
         let cols: Vec<String> = row
             .cells
@@ -5656,5 +5745,136 @@ mod tests {
             }
         }
         assert!(overflowed, "some filler pushed Beta to a new page");
+    }
+
+    /// A table of `rows`, its grid `grid` (twips), its own `w:jc` `jc`.
+    fn jc_table(jc: Option<&str>, grid: &[u32], rows: &[&[&str]]) -> Block {
+        Block::Table(Table {
+            grid: grid.to_vec(),
+            raw_tblpr: jc.map(|v| format!("<w:tblPr><w:jc w:val=\"{v}\"/></w:tblPr>")),
+            rows: rows
+                .iter()
+                .map(|r| Row {
+                    cells: r
+                        .iter()
+                        .map(|t| Cell {
+                            blocks: vec![text_para(t)],
+                            ..Cell::default()
+                        })
+                        .collect(),
+                    ..Row::default()
+                })
+                .collect(),
+            ..Table::default()
+        })
+    }
+
+    /// The default page's text column: 72 pt from the left, 468 wide.
+    const COL_X: f32 = 72.0;
+    const COL_W: f32 = 468.0;
+
+    #[test]
+    fn place_offset_centres_or_right_aligns_a_table_that_fits() {
+        assert_eq!(place_offset(468.0, 288.0, TablePlace::Center), Some(90.0));
+        assert_eq!(place_offset(468.0, 288.0, TablePlace::Right), Some(180.0));
+        assert_eq!(place_offset(468.0, 468.0, TablePlace::Center), Some(0.0));
+        // Wider than the column, or no width: at the left, unplaced.
+        assert_eq!(place_offset(468.0, 500.0, TablePlace::Center), None);
+        assert_eq!(place_offset(468.0, 0.0, TablePlace::Right), None);
+        assert_eq!(place_offset(468.0, 288.0, TablePlace::Left), None);
+    }
+
+    #[test]
+    fn a_centred_table_sits_in_the_middle_of_the_column() {
+        // Two 2880-twip columns: 288 pt in the 468 pt column.
+        let d = doc(vec![
+            jc_table(
+                Some("center"),
+                &[2880, 2880],
+                &[&["a1", "b1"], &["a2", "b2"]],
+            ),
+            text_para("after"),
+        ]);
+        let pages = pages_of(&d, &PdfOptions::default());
+        let want = COL_X + (COL_W - 288.0) / 2.0;
+        assert!(close(pages[0].at("a1").0, want), "{:?}", pages[0].texts);
+        assert!(close(pages[0].at("a2").0, want), "{:?}", pages[0].texts);
+        // The paragraph after it is back at the column's left.
+        assert!(close(pages[0].at("after").0, COL_X));
+    }
+
+    #[test]
+    fn a_right_table_sits_at_the_columns_right() {
+        for jc in ["right", "end"] {
+            let d = doc(vec![jc_table(Some(jc), &[2880, 2880], &[&["a1", "b1"]])]);
+            let pages = pages_of(&d, &PdfOptions::default());
+            let x = pages[0].at("a1").0;
+            assert!(close(x, COL_X + COL_W - 288.0), "{jc}: {x}");
+        }
+    }
+
+    #[test]
+    fn a_table_wider_than_the_column_stays_at_the_left() {
+        let d = doc(vec![jc_table(
+            Some("center"),
+            &[6000, 6000],
+            &[&["a1", "b1"]],
+        )]);
+        let pages = pages_of(&d, &PdfOptions::default());
+        assert!(close(pages[0].at("a1").0, COL_X));
+        // No grid: no width to place.
+        let d = doc(vec![jc_table(Some("center"), &[], &[&["a1", "b1"]])]);
+        let pages = pages_of(&d, &PdfOptions::default());
+        assert!(close(pages[0].at("a1").0, COL_X));
+    }
+
+    #[test]
+    fn a_placed_tables_rows_wrap_at_its_width() {
+        // 144 pt: 21 Courier cells of 6.6 pt a line at 11 pt.
+        let long = "word ".repeat(20);
+        let d = doc(vec![jc_table(Some("center"), &[2880], &[&[long.trim()]])]);
+        let pages = pages_of(&d, &PdfOptions::default());
+        let want = COL_X + (COL_W - 144.0) / 2.0;
+        let lines: Vec<&(f32, f32, String)> = pages[0]
+            .texts
+            .iter()
+            .filter(|(_, _, t)| t.contains("word"))
+            .collect();
+        assert!(lines.len() >= 4, "{lines:?}");
+        for (x, _, t) in &lines {
+            assert!(close(*x, want), "{lines:?}");
+            assert!(t.trim_end().chars().count() <= 21, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn left_start_and_no_jc_tables_export_the_same_bytes() {
+        let bytes = |jc: Option<&str>| {
+            let d = doc(vec![
+                jc_table(jc, &[2880, 2880], &[&["a1", "b1"], &["a2", "b2"]]),
+                text_para("after"),
+            ]);
+            to_pdf(&d, &PdfOptions::default())
+        };
+        let plain = bytes(None);
+        assert_eq!(bytes(Some("left")), plain);
+        assert_eq!(bytes(Some("start")), plain);
+        assert_ne!(bytes(Some("center")), plain);
+    }
+
+    #[test]
+    fn a_header_band_places_a_centred_table_the_same_way() {
+        let opts = with_parts(&[(
+            "rH",
+            "header1.xml",
+            vec![jc_table(Some("center"), &[2880, 2880], &[&["h1", "h2"]])],
+        )]);
+        let d = doc(vec![
+            text_para("body"),
+            trailing(r#"<w:sectPr><w:headerReference w:type="default" r:id="rH"/></w:sectPr>"#),
+        ]);
+        let pages = pages_of(&d, &opts);
+        let x = pages[0].at("h1").0;
+        assert!(close(x, COL_X + (COL_W - 288.0) / 2.0), "{x}");
     }
 }

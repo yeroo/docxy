@@ -614,3 +614,30 @@ fn a_latin_line_in_a_right_to_left_paragraph_is_still_projected() {
         "plain Latin needs no projector"
     );
 }
+
+#[test]
+fn a_centred_table_is_placed_through_the_embedded_fonts_too() {
+    // A 2880-twip (144 pt) table in the 468 pt column, 72 pt from the left
+    // (#1930): centred 162 pt in, right-aligned 324 pt in.
+    let table = |jc: &str| {
+        format!(
+            r#"<w:tbl><w:tblPr>{jc}</w:tblPr><w:tblGrid><w:gridCol w:w="2880"/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>{}"#,
+            para("after")
+        )
+    };
+    let x_of = |jc: &str, text: &str| {
+        let pdf = export(&table(jc), Some(provider(&world_glyphs())));
+        shown(&pdf)[0]
+            .iter()
+            .find(|s| s.text.contains(text))
+            .unwrap_or_else(|| panic!("{text:?} not shown"))
+            .x
+    };
+    let close = |a: f32, b: f32| (a - b).abs() < 0.02;
+    assert!(close(x_of("", "cell"), 72.0));
+    let x = x_of(r#"<w:jc w:val="center"/>"#, "cell");
+    assert!(close(x, 72.0 + 162.0), "{x}");
+    let x = x_of(r#"<w:jc w:val="right"/>"#, "cell");
+    assert!(close(x, 72.0 + 324.0), "{x}");
+    assert!(close(x_of(r#"<w:jc w:val="center"/>"#, "after"), 72.0));
+}
