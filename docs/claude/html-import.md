@@ -107,18 +107,54 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   before it) and both side margins auto gets
   `max(0, (BODY_TWIPS - indent - indent_right - width) / 2)` more indent on
   each side, after its own box is added: a content box, so its padding is
-  outside the width. Its text alignment is unchanged. Not inside a cell
-  (`Look::in_cell`): a cell's width is known only at layout.
+  outside the width. Its text alignment is unchanged. Inside a cell or a
+  card, centred in the cell's inner width when the table is laid out (#1930:
+  see "HTML import centring in cells").
 - Drawing: the suite draws a `w:jc` table where it sits (#1922,
   `docs/claude/suite-document.md`).
 - An outermost table inside a centred fixed-width block is laid out in
   that block's width and placed in it (#2114: see "HTML import margins,
   breaks, hangs and wrapper tables").
-- Known limits: a block's auto margins inside a cell; a table in a merely
-  indented block keeps the body's width; PDF export does not place a table
-  by `w:jc`; a percentage `max-width` (an absolute one came with #1894);
+- Known limits: a table in a merely
+  indented block keeps the body's width; a percentage `max-width` (an
+  absolute one came with #1894);
   CSS `float`; `<img align>`; `box-sizing`;
   right-to-left.
+
+## HTML import centring in cells (#1930)
+
+- A cell's width is known only in `html_table::layout`, after its
+  paragraphs exist. So in a cell (`Look::in_cell`, a card too) the
+  fixed-width branch pushes an `html_table::CellBox` (its width, the look's
+  indents with its own box in) onto `Look::cell_boxes` (inherited, cleared
+  where a cell or card resets the indents) instead of indenting.
+  `end_para_with` hands each paragraph ended inside one to
+  `Builder::mark_cell_boxes` (a `CellCentring`, at its index of the cell's
+  blocks) only when `end_para` really pushed it (the budget can refuse it).
+  That is the only hook: every cell, row and card end takes its props from
+  `flow_end_props`, which ends the text through `end_para_with` first.
+  `end_cell` moves the records into `RawCell::boxes` (`absorb` shifts them,
+  as `nested`).
+- `layout` centres each paragraph in the cell's `inner` width (the one a
+  nested table gets): box by box, outermost first, each in the room the
+  enclosing ones' centring leaves, the body-level formula with `inner` for
+  `BODY_TWIPS`. A box wider than its room gets nothing. The indent stays
+  at least 0 as at body level, and `ZERO_IND` goes once it moves.
+- Paragraph lines: `Look::border_left_boxes` / `border_right_boxes` count
+  the boxes the block drawing each line is in. A line moves with those
+  boxes' centring only, so a line from a block outside the centred box
+  keeps its place and its `w:space` grows (Word's 31 pt clamp), as at body
+  level (`html_table::line_space`, shared with `par_props`). A cell as wide
+  as the body gives what the body gives (`html_tests_1930.rs`
+  `same_as_body`).
+- An auto-width table takes the whole room (`column_widths`), so a box in
+  its cell is centred in that, where a browser would shrink the table to
+  the box.
+- Known limits: a table inside a centred box in a cell still takes its
+  cell's width (`centred_box` is body-only). A list item's hang is clipped
+  against its indent before centring, so a list with an indent smaller
+  than its hang (`padding-left: 0`) in a centred box in a cell starts at
+  its box's edge with no hang.
 
 ## HTML import CSS (#1872)
 

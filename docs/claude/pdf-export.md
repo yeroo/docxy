@@ -91,3 +91,20 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the PDF export (
   columns fails it). The unlimited layout must reproduce the lines already
   placed, and the result must be shorter, or the set is left as it was; a set
   that begins mid-paragraph (spilled from the page before) is not balanced.
+
+## PDF export: tables placed by `w:jc` (#1930)
+
+- `emit_table` reads the table's own `w:tblPr/w:jc` (`table_place`, the
+  suite's `table_view::h_align` mapping: `center`, `right`/`end`, else
+  left; a style's `jc` and `bidiVisual` are not read). Its width is the
+  sum of `t.grid`, in points.
+- Left, or a table with no grid width, takes the old path, byte for byte
+  (`pdf_legacy_bytes`). Otherwise the flattened rows go through `Placed`,
+  a `Flow` adapter that delegates everything but `next_line`. That returns
+  the table's left in the column the line lands in (`place_offset`) and
+  the table's width, so rows wrap at it. It runs per line, so a row moved
+  to a new column or page is placed there. A table wider than its column
+  stays at the column's left, as in the suite. Header and footer bands
+  (`BandFlow`) take the same path.
+- Not done: `w:tblInd` (the #2114 room tables placed by indent); real
+  cells and borders (rows are still flattened text).
