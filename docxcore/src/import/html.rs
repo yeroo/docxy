@@ -590,7 +590,10 @@ struct Look {
     /// #1894): what its cells' `border` / `rules` lines inherit, `None`
     /// when transparent, `Some(None)` automatic.
     own_rule_ink: [Option<Option<u32>>; 2],
-    /// `border-collapse: collapse` (inherited, #1894; `rules` is its hint).
+    /// `border-collapse: collapse` (#1894; a known `rules` value is its
+    /// hint). Inherited, but a browser's `table { border-collapse:
+    /// separate }` resets it at every table, so only a table's own rules,
+    /// style or `rules` make one collapse.
     collapse: bool,
     /// An image's own `border-radius` (not inherited, #1926): the crop
     /// shape of its picture. Only `img` reads one.
@@ -1320,6 +1323,9 @@ impl Cascade {
             // A table's cells align by their own rows (#1878).
             self.is_table = true;
             self.look.valign = None;
+            // The user agent's `table { border-collapse: separate }` (#1894
+            // r1): a collapse around it does not reach it.
+            self.look.collapse = false;
             if quirks {
                 // A quirks-mode browser's `table { font-size: medium;
                 // font-weight: normal; font-style: normal }` (#1883): the
@@ -1847,7 +1853,8 @@ impl Cascade {
     /// the outer sides `frame` names (all of them for a `border` above 0
     /// alone, none for `rules` alone), as wide as `border` (1 px without
     /// one), in `bordercolor` (else automatic), so CSS replaces them side
-    /// by side; any `rules` is `border-collapse: collapse`. The inside
+    /// by side; a known `rules` value (`none`, `groups`, `rows`, `cols`,
+    /// `all`) is `border-collapse: collapse`. The inside
     /// lines are [`table_spec`]'s.
     fn table_border_hints(&mut self, attrs: &Attrs) {
         let border = table_border_attr(attrs);
@@ -2872,22 +2879,29 @@ impl<'a> Html<'a> {
             .as_deref()
             .map(css::parse_declarations)
             .unwrap_or_default();
-        let mut width = None;
+        // `Some(None)`: a declared `auto` (r1), which the attribute does
+        // not override.
+        let mut width: Option<Option<Width>> = None;
         for important in [false, true] {
             for d in decls.iter().filter(|d| d.important == important) {
                 if !d.name.eq_ignore_ascii_case("width") {
                     continue;
                 }
-                let Some(len) = css::length(d.value.trim()).filter(|l| l.v >= 0.0) else {
+                let v = d.value.trim();
+                if v.eq_ignore_ascii_case("auto") {
+                    width = Some(None);
+                    continue;
+                }
+                let Some(len) = css::length(v).filter(|l| l.v >= 0.0) else {
                     continue;
                 };
-                width = match len.unit {
+                width = Some(match len.unit {
                     css::Unit::Percent => Some(Width::Pct(len.v)),
                     _ => len.twips(pt).map(|t| Width::Twips(t.max(0) as u32)),
-                };
+                });
             }
         }
-        width.or_else(|| attrs.width.as_deref().and_then(width_attr))
+        width.unwrap_or_else(|| attrs.width.as_deref().and_then(width_attr))
     }
 
     /// Open an element that holds content.
@@ -7449,16 +7463,17 @@ mod image_tests {
         let plain = import_html(page.replace("height", "data-h").as_bytes()).unwrap();
         assert_eq!(with, plain);
         // A row's and a cell's are its row's height since #1894: the
-        // tallest, the cell's CSS over its attribute.
+        // tallest, the cell's CSS over its attribute (an attribute win
+        // would be 300).
         let page =
-            "<table height=40><tr height=30><td height=20 style='height:9px'>x</td></tr></table>";
+            "<table height=40><tr height=10><td height=20 style='height:40px'>x</td></tr></table>";
         let (with, _, _) = with_images(page);
         let Some(DocBlock::Table(t)) = with.body.first() else {
             panic!("{with:?}")
         };
         assert_eq!(
             t.rows[0].raw_props,
-            ["<w:trPr><w:trHeight w:val=\"450\" w:hRule=\"atLeast\"/></w:trPr>"]
+            ["<w:trPr><w:trHeight w:val=\"600\" w:hRule=\"atLeast\"/></w:trPr>"]
         );
     }
 
@@ -10703,10 +10718,24 @@ mod table_1894_tests {
         assert!(!spacing(&format!(
             "<style>table {{ border-collapse: collapse }}</style><table cellspacing=4>{row}</table>"
         )));
-        // Inherited, and `separate` undoes it.
-        assert!(!spacing(&format!(
+        // A table's own only (r1): the user agent's `separate` at every
+        // table stops a collapse around it, an outer table's or `rules`'
+        // too; its own `separate` undoes a sheet's.
+        assert!(spacing(&format!(
             "<div style=\"border-collapse:collapse\"><table cellspacing=4>{row}</table></div>"
         )));
+        for outer in ["style=\"border-collapse:collapse\"", "rules=all"] {
+            let t = table(&format!(
+                "<table {outer}><tr><td><table cellspacing=10 border=1>{row}</table></td></tr></table>"
+            ));
+            assert!(!tblpr(&t).contains("tblCellSpacing"), "{}", tblpr(&t));
+            let inner = tables(&t.rows[0].cells[0].blocks)[0];
+            assert!(
+                tblpr(inner).contains("tblCellSpacing"),
+                "{outer}: {}",
+                tblpr(inner)
+            );
+        }
         assert!(spacing(&format!(
             "<style>table {{ border-collapse: collapse }}</style>\
              <table cellspacing=4 style=\"border-collapse:separate\">{row}</table>"
@@ -10817,6 +10846,14 @@ mod table_1894_tests {
                 "<table width=600><colgroup width=100><col><col width=200></colgroup>{row3}</table>"
             )),
             [1500, 3000, 4500]
+        );
+        // A declared `auto` leaves the column to its cells, attribute or not
+        // (the attribute would make it 1500).
+        assert_eq!(
+            grid(&format!(
+                "<table width=600><col width=100 style=\"width:auto\">{row3}</table>"
+            )),
+            [3000, 3000, 3000]
         );
         // A colgroup with no end tag ends at the first row.
         assert_eq!(

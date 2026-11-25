@@ -908,9 +908,14 @@ was #1922's.
     written only when at least as wide (CSS collapse: the wider wins, a
     cell a tie). A merged (`rowspan`) cell writes its top on its first
     slot, its sides on each and its bottom on its last.
-  - `border-collapse` (inherited, `Look::collapse`) and any `rules` (its
-    hint) drop `tblCellSpacing`, as the collapsing model has no spacing:
-    a mail's `table { border-collapse: collapse }` reset drops it too.
+  - `border-collapse` (`Look::collapse`) and a known `rules` value
+    (`none`, `groups`, `rows`, `cols`, `all`: its hint; another is
+    ignored) drop `tblCellSpacing`, as the collapsing model has no
+    spacing: a mail's `table { border-collapse: collapse }` reset drops it
+    too. Only a table's own: the user agent's `table { border-collapse:
+    separate }` resets the inherited value at every table (r1), so a
+    collapsed outer table or a `div`'s collapse does not reach a table
+    in it.
 - Row heights: `height` on a `tr` (attribute: digits or px; CSS: an
   absolute length; a percentage none, `auto` clears) is the row's; on a
   `td`/`th` it is the content box, so its top and bottom margins (its own
@@ -920,7 +925,8 @@ was #1922's.
   `colgroup` in a table's own content (`Html::at_table_level`, not in a
   cell or row) give `RawTable::cols` (`Builder::begin_colgroup`,
   `table_col`, `end_colgroup`): `span` (1..=1000) copies of the `col`'s
-  width (its inline `width`, else its attribute; a sheet's rules are not
+  width (its inline `width`, else its attribute; an inline `auto` none,
+  over the attribute too; a sheet's rules are not
   read: its look is never computed), else its group's (a computed look).
   A `colgroup` with no `col` stands for its span; it ends at
   `</colgroup>`, a cell, a row group or the table's end. Total cut at
