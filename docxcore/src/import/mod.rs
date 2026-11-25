@@ -39,7 +39,10 @@
 //! | `Builder` tables | open tables | HTML: ≤ `MAX_TABLE_NESTING` (8), deeper ones are their cell's text; RTF: one |
 //! | `html_table::layout` | the slot grid, cells emitted | rows × ≤ `MAX_COLUMNS` slots; each cell emitted (placed, continuation or pad) work + built; a cell with no free slot joins a neighbour |
 //! | `html_table::layout` | nested tables | each laid out once, inside its cell, depth ≤ `MAX_TABLE_NESTING` |
-//! | `Builder::take_leading_marker` | the paragraph's text, the inlines consumed | O(paragraph), once per paragraph; one `drain` |
+//! | `Builder::take_leading_marker` | the paragraph's text, the inlines consumed | O(paragraph), once per paragraph; one pass rebuilding it |
+//! | `Builder::bookmark` (#1912) | a point bookmark waiting, then two inlines | ≤ `MAX_BOOKMARKS` (10 000) a document, each built (`size_of::<Inline>` + 3 × name + 96); names ≤ 40 characters; a name made once (a set) |
+//! | `Builder::flush_marks` (#1912 r2) | the waiting bookmarks written | only before content that keeps the paragraph (a white-space-only one, which HTML drops, takes none); work (marks) |
+//! | `Builder::clear_para` | its bookmarks put back (only a kept paragraph has any: a typed list marker taken off can leave it empty) | work (marks), no parse |
 //! | `Builder::para_text` | the paragraph in progress | O(paragraph), once per paragraph end |
 //! | run props cloned per inline | `RunProps` | flags, and strings of ≤ 64 bytes (font, colour, highlight) plus ≤ 2 kept elements (HTML's shading, bold off): O(1), charged as built |
 //! | `inflate_within` | inflate output | decoded, capped inside each block at the room; room 0 fails |
@@ -49,7 +52,8 @@
 //! | rtf `\listtext`, stylesheet names | text kept | ≤ 64 bytes each (`MAX_NAME`) |
 //! | rtf font table, heading styles | map entries | built per new entry |
 //! | `html::import_html` | decoding, the `<style>` scan, tokenizing | work (3 × input/16), up front |
-//! | html `collect_styles` | the `<style>` texts joined | ≤ input; forward only (comments and raw-text elements skipped by one search each) |
+//! | html `prescan` | the `<style>` texts joined; each `<a>` tag's attributes read (#1912) | ≤ input; forward only (comments and raw-text elements skipped by one search each, an `<a>` tag passed over whole; an `<a` that never closes read to the end once, and no `<a` after it, r1); anchor names ≤ `MAX_BOOKMARKS` |
+//! | html `open_void` (#1912 r1) | a void or raw-text element's attributes, for a linked `id` | only when the page has an anchor link; scanned (attrs/16) |
 //! | `css::StyleSheet::parse` | the CSS, once; rules, declaration blocks | work (css/16); each rule and block built; ≤ `MAX_RULES` (10 000) rules, more ignored; brace nesting counted, never recursed |
 //! | css selector | compounds | ≤ `MAX_COMPOUNDS` (32), longer dropped; names ≤ 64 bytes |
 //! | `css::StyleSheet::matching` | rules examined per element opened | work per rule examined (only those indexed by the element's id, classes, tag, or universal) |
@@ -385,7 +389,7 @@ pub(crate) fn shows(content: &[Inline], mark_vanish: bool) -> bool {
             Inline::Run(r) => !r.props.vanish,
             Inline::Hyperlink(h) => h.runs.iter().any(|r| !r.props.vanish),
             Inline::Break(_, p) | Inline::Tab(p) => !p.vanish,
-            _ => true,
+            i => !is_mark(i),
         })
 }
 
@@ -399,39 +403,154 @@ pub(crate) fn mark_vanish(props: &ParProps) -> bool {
 }
 
 /// An inline that is neither text nor a break nor a link: an object,
-/// content of its own. A link (#1879) counts by its text.
+/// content of its own. A link (#1879) counts by its text, and a bookmark
+/// (#1912) is no content.
 fn is_object(inline: &Inline) -> bool {
     !matches!(
         inline,
         Inline::Run(_) | Inline::Tab(_) | Inline::Break(..) | Inline::Hyperlink(_)
-    )
+    ) && !is_mark(inline)
 }
 
-/// Where an imported link (#1879) goes: an external URL, or an anchor (a
-/// bookmark name) in the document.
+/// Whether `inline` is half of a bookmark an importer made
+/// ([`Builder::bookmark`], #1912): a zero-width mark, never content.
+fn is_mark(inline: &Inline) -> bool {
+    matches!(inline, Inline::Raw(r) if r.starts_with("<w:bookmarkStart ") || r.starts_with("<w:bookmarkEnd "))
+}
+
+/// The most bookmarks one import makes (#1912); later names make none.
+pub(crate) const MAX_BOOKMARKS: usize = 10_000;
+
+/// Where an imported link (#1879) goes, and the `title` and `target` it
+/// keeps (#1912) as Word's `w:tooltip` and `w:tgtFrame`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Link {
+pub(crate) struct Link {
+    pub(crate) to: LinkTo,
+    pub(crate) tooltip: Option<String>,
+    pub(crate) frame: Option<String>,
+    /// Its [`Link::opener_of`], made once (#1912 r2).
+    opener: Option<String>,
+}
+
+/// An external URL, or an anchor (a bookmark name) in the document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LinkTo {
     Url(String),
     Anchor(String),
 }
 
 impl Link {
-    fn heap(&self) -> usize {
-        match self {
-            Link::Url(s) | Link::Anchor(s) => s.len(),
-        }
+    pub(crate) fn new(to: LinkTo, tooltip: Option<String>, frame: Option<String>) -> Self {
+        let mut link = Link {
+            to,
+            tooltip,
+            frame,
+            opener: None,
+        };
+        link.opener = link.opener_of();
+        link
     }
 
-    /// Whether `h` is a link the importer made to this place, so text
-    /// written in this link joins it.
+    fn heap(&self) -> usize {
+        let to = match &self.to {
+            LinkTo::Url(s) | LinkTo::Anchor(s) => s.len(),
+        };
+        let kept = self.tooltip.as_ref().map_or(0, String::len)
+            + self.frame.as_ref().map_or(0, String::len);
+        // The opener holds them again, escaped (at most 6 bytes a char).
+        to + 7 * kept + if kept > 0 { 64 + 6 * to } else { 0 }
+    }
+
+    /// The `w:hyperlink` start tag a link with a title or target keeps as
+    /// its `raw` (#1912), self-closing: save writes it, then the runs, and
+    /// a save's minted `r:id` goes into it (`with_opener_rel_id`). An
+    /// anchor link's `w:anchor` is in it too, as save writes no other.
+    /// `None` for a link with neither: it is written from its fields.
+    fn opener_of(&self) -> Option<String> {
+        if self.tooltip.is_none() && self.frame.is_none() {
+            return None;
+        }
+        let mut out = String::from("<w:hyperlink");
+        let mut attr = |name: &str, value: &str| {
+            out.push(' ');
+            out.push_str(name);
+            out.push_str("=\"");
+            crate::serialize::esc_attr(value, &mut out);
+            out.push('"');
+        };
+        if let LinkTo::Anchor(a) = &self.to {
+            attr("w:anchor", a);
+        }
+        if let Some(t) = &self.tooltip {
+            attr("w:tooltip", t);
+        }
+        if let Some(f) = &self.frame {
+            attr("w:tgtFrame", f);
+        }
+        out.push_str("/>");
+        Some(out)
+    }
+
+    /// Whether `h` is a link the importer made to this place, with this
+    /// title and target, so text written in this link joins it.
     fn made(&self, h: &Hyperlink) -> bool {
-        h.raw.is_none()
-            && h.content.is_empty()
-            && match self {
-                Link::Url(u) => h.target.as_deref() == Some(u.as_str()) && h.anchor.is_none(),
-                Link::Anchor(a) => h.anchor.as_deref() == Some(a.as_str()) && h.target.is_none(),
+        h.content.is_empty()
+            && h.raw.as_deref() == self.opener.as_deref()
+            && match &self.to {
+                LinkTo::Url(u) => h.target.as_deref() == Some(u.as_str()) && h.anchor.is_none(),
+                LinkTo::Anchor(a) => h.anchor.as_deref() == Some(a.as_str()) && h.target.is_none(),
             }
     }
+}
+
+/// The character style imported link text takes (#1912).
+pub(crate) const HYPERLINK_STYLE: &str = "Hyperlink";
+
+/// Whether link text in `props` has the look Word's `Hyperlink` style gives
+/// (#1912): underlined, in a colour, no character style of its own.
+fn link_look(props: &RunProps) -> bool {
+    props.underline
+        && props.style_id.is_none()
+        && props
+            .color
+            .as_deref()
+            .is_some_and(|c| !c.eq_ignore_ascii_case("auto"))
+}
+
+/// The two inlines of the point bookmark `w:id` `id` named `name` (#1912).
+fn mark_inlines(id: usize, name: &str) -> [Inline; 2] {
+    let mut start = format!("<w:bookmarkStart w:id=\"{id}\" w:name=\"");
+    crate::serialize::esc_attr(name, &mut start);
+    start.push_str("\"/>");
+    [
+        Inline::Raw(start),
+        Inline::Raw(format!("<w:bookmarkEnd w:id=\"{id}\"/>")),
+    ]
+}
+
+/// Whether link text in `props`, with the `Hyperlink` style when `style`,
+/// has the properties `run` has, so it joins that run: compared in place
+/// (the run's style set aside a moment), no copy made.
+fn same_link_props(run: &mut RunProps, props: &RunProps, style: bool) -> bool {
+    if !style {
+        return *run == *props;
+    }
+    if run.style_id.as_deref() != Some(HYPERLINK_STYLE) {
+        return false;
+    }
+    let kept = run.style_id.take();
+    let same = *run == *props;
+    run.style_id = kept;
+    same
+}
+
+/// The `w:id` and name of a bookmark start [`mark_inlines`] wrote.
+#[cfg(test)]
+fn mark_of(raw: &str) -> Option<(usize, String)> {
+    let rest = raw.strip_prefix("<w:bookmarkStart w:id=\"")?;
+    let (id, rest) = rest.split_once('"')?;
+    let name = rest.strip_prefix(" w:name=\"")?.strip_suffix("\"/>")?;
+    Some((id.parse().ok()?, crate::load::decode_attr(name)))
 }
 
 /// The heap bytes of the run properties an importer sets: font, colour,
@@ -457,6 +576,23 @@ pub(crate) struct Builder<'b> {
     tables: Vec<TableAcc>,
     /// The body's [`TableAcc::tail`].
     body_tail: Tail,
+    /// Bookmarks waiting for the next content written (#1912): each `w:id`
+    /// and name ([`Builder::bookmark`]).
+    marks: Vec<(usize, String)>,
+    /// Every bookmark name made so far, and so the next `w:id`.
+    marked: std::collections::HashSet<String>,
+    /// The bookmarks written into the paragraph in progress, as they were
+    /// waiting: what [`Builder::clear_para`] puts back, unparsed.
+    para_marks: Vec<(usize, String)>,
+    /// The paragraph in progress holds content that keeps it (#1912 r2):
+    /// text that is not all white space, an object or a page break. Only
+    /// then do the waiting bookmarks go in ([`Builder::flush_marks`]), so a
+    /// paragraph of spaces, tabs or line breaks, which the HTML import
+    /// drops (`clear_para`), takes none and gives none back.
+    keeps: bool,
+    /// Text in a link in its user-agent look takes Word's `Hyperlink`
+    /// character style (#1912, [`Builder::set_link_style`]).
+    link_style: bool,
 }
 
 #[derive(Default)]
@@ -542,7 +678,68 @@ impl<'b> Builder<'b> {
             para: Vec::new(),
             tables: Vec::new(),
             body_tail: None,
+            marks: Vec::new(),
+            marked: std::collections::HashSet::new(),
+            para_marks: Vec::new(),
+            keeps: false,
+            link_style: false,
         }
+    }
+
+    /// Give text in a link Word's `Hyperlink` character style (#1912) when
+    /// its properties are underlined and coloured: they then hold all the
+    /// style sets (`markdown_style_def("Hyperlink")`), so nothing drawn
+    /// changes; a link the page restyled to no underline or no colour gets
+    /// none. Only for an import saved through a package defining the style.
+    pub(crate) fn set_link_style(&mut self, on: bool) {
+        self.link_style = on;
+    }
+
+    /// A point bookmark `name` (#1912), placed right before the next
+    /// content written in the flow once its paragraph holds content that
+    /// keeps it ([`Builder::keeps`]: text not all white space, an object,
+    /// a page break; then a tab or break too), so it never makes a
+    /// paragraph of its own; one left at the end goes at
+    /// the end of the body's last paragraph ([`Builder::finish`]). A name
+    /// already made, an empty one or one past [`MAX_BOOKMARKS`] makes
+    /// nothing. `w:id`s count up from 0.
+    pub(crate) fn bookmark(&mut self, name: &str) {
+        if name.is_empty()
+            || self.marked.len() >= MAX_BOOKMARKS
+            || self.marked.contains(name)
+            || !self.budget.keep::<Inline>(3 * name.len() + 96)
+        {
+            return;
+        }
+        let id = self.marked.len();
+        self.marked.insert(name.to_string());
+        self.marks.push((id, name.to_string()));
+    }
+
+    /// Write the waiting bookmarks into the paragraph in progress, before
+    /// content that `keeps` it, or any content once it is kept. Each mark
+    /// written is charged: at most once a paragraph that keeps content (a
+    /// typed list marker taken off can leave none, `clear_para`).
+    fn flush_marks(&mut self, keeps: bool) {
+        self.keeps |= keeps;
+        if !self.keeps || self.marks.is_empty() {
+            return;
+        }
+        if !self.budget.work(self.marks.len()) {
+            self.marks.clear();
+            return;
+        }
+        for (id, name) in &self.marks {
+            self.para.extend(mark_inlines(*id, name));
+        }
+        self.para_marks.append(&mut self.marks);
+    }
+
+    /// The paragraph in progress is gone (ended or cleared): nothing in it
+    /// keeps it, no mark is in it.
+    fn para_gone(&mut self) {
+        self.keeps = false;
+        self.para_marks.clear();
     }
 
     /// Append `text` in `props`, joining the previous run when it has the
@@ -560,32 +757,47 @@ impl<'b> Builder<'b> {
         if text.is_empty() || !self.budget.scanned(text.len()) || !self.budget.alloc(text.len()) {
             return;
         }
+        self.flush_marks(!text.chars().all(char::is_whitespace));
         if let Some(link) = link {
+            // The `Hyperlink` style, added only where a run is made.
+            let style = self.link_style && link_look(props);
+            let made = || {
+                let mut p = props.clone();
+                if style {
+                    p.style_id = Some(HYPERLINK_STYLE.to_string());
+                }
+                p
+            };
             if let Some(Inline::Hyperlink(h)) = self.para.last_mut()
                 && link.made(h)
             {
                 if let Some(run) = h.runs.last_mut()
-                    && run.props == *props
+                    && same_link_props(&mut run.props, props, style)
                 {
                     run.text.push_str(text);
                     return;
                 }
-                if self.budget.keep::<Run>(props_heap(props)) {
+                if self
+                    .budget
+                    .keep::<Run>(props_heap(props) + HYPERLINK_STYLE.len())
+                {
                     h.runs.push(Run {
                         text: text.to_string(),
-                        props: props.clone(),
+                        props: made(),
                     });
                 }
                 return;
             }
+            let props = &made();
             let heap = std::mem::size_of::<Run>() + props_heap(props) + link.heap();
             if !self.budget.keep::<Inline>(heap) {
                 return;
             }
-            let (target, anchor) = match link {
-                Link::Url(u) => (Some(u.clone()), None),
-                Link::Anchor(a) => (None, Some(a.clone())),
+            let (target, anchor) = match &link.to {
+                LinkTo::Url(u) => (Some(u.clone()), None),
+                LinkTo::Anchor(a) => (None, Some(a.clone())),
             };
+            let raw = link.opener.clone();
             self.para.push(Inline::Hyperlink(Hyperlink {
                 target,
                 anchor,
@@ -593,6 +805,9 @@ impl<'b> Builder<'b> {
                     text: text.to_string(),
                     props: props.clone(),
                 }],
+                // A kept opener is rebuilt with the runs on save.
+                content_changed: raw.is_some(),
+                raw,
                 ..Hyperlink::default()
             }));
             return;
@@ -613,12 +828,14 @@ impl<'b> Builder<'b> {
     }
 
     pub(crate) fn tab(&mut self, props: &RunProps) {
+        self.flush_marks(false);
         if self.budget.keep::<Inline>(props_heap(props)) {
             self.para.push(Inline::Tab(props.clone()));
         }
     }
 
     pub(crate) fn line_break(&mut self, props: &RunProps) {
+        self.flush_marks(false);
         if self.budget.keep::<Inline>(props_heap(props)) {
             self.para
                 .push(Inline::Break(BreakKind::Line, props.clone()));
@@ -626,6 +843,7 @@ impl<'b> Builder<'b> {
     }
 
     pub(crate) fn page_break(&mut self, props: &RunProps) {
+        self.flush_marks(true);
         if self.budget.keep::<Inline>(props_heap(props)) {
             self.para
                 .push(Inline::Break(BreakKind::Page, props.clone()));
@@ -637,9 +855,10 @@ impl<'b> Builder<'b> {
     /// block adds no line, while a lone one (`<div><br></div>`) is the
     /// block's one empty line.
     pub(crate) fn drop_trailing_break(&mut self) {
-        if self.para.len() > 1
-            && matches!(self.para.last(), Some(Inline::Break(BreakKind::Line, _)))
-        {
+        // Bookmarks (#1912) are no content: `<div id=x><br></div>` keeps
+        // its one line whether `x` is a bookmark or not.
+        let content = self.para.iter().filter(|i| !is_mark(i)).count();
+        if content > 1 && matches!(self.para.last(), Some(Inline::Break(BreakKind::Line, _))) {
             self.para.pop();
         }
     }
@@ -690,6 +909,7 @@ impl<'b> Builder<'b> {
     /// Append an object (an imported picture's run, #1880) to the paragraph
     /// in progress, charged with its XML.
     pub(crate) fn object(&mut self, inline: Inline, heap: usize) {
+        self.flush_marks(true);
         if self.budget.keep::<Inline>(heap) {
             self.para.push(inline);
         }
@@ -702,9 +922,17 @@ impl<'b> Builder<'b> {
     }
 
     /// Drop everything in the paragraph in progress (text only made of
-    /// spaces that stands for an empty paragraph).
+    /// spaces that stands for an empty paragraph). Its bookmarks (#1912)
+    /// wait again, for the next content, ahead of the ones waiting.
     pub(crate) fn clear_para(&mut self) {
         self.para.clear();
+        // Only a kept paragraph has marks in it (`flush_marks`), so this is
+        // rare: a typed list marker was all that kept it.
+        if !self.para_marks.is_empty() && self.budget.work(self.para_marks.len()) {
+            self.para_marks.append(&mut self.marks);
+            self.marks = std::mem::take(&mut self.para_marks);
+        }
+        self.para_gone();
     }
 
     /// Remove a list marker typed at the start of the paragraph in progress
@@ -723,40 +951,66 @@ impl<'b> Builder<'b> {
         if gap == 0 {
             return None;
         }
-        // Drop `n + gap` characters from the front: the inlines consumed
-        // whole at once (one drain, not a shift per inline), then the front
-        // of the run the marker ends in.
-        let mut drop = n + gap;
-        let mut whole = 0;
+        // An object (an imported picture, #1880) or a link (#1879) before
+        // the marker's end: the paragraph does not start with a typed
+        // marker (only a leading run can be cut). A bookmark (#1912) is
+        // passed over and stays.
+        let mut left = n + gap;
         for inline in &self.para {
-            if drop == 0 {
+            if left == 0 {
                 break;
             }
-            // An object (an imported picture, #1880) or a link (#1879)
-            // before the marker's end: the paragraph does not start with a
-            // typed marker (only a leading run can be cut).
+            if is_mark(inline) {
+                continue;
+            }
             if is_object(inline) || matches!(inline, Inline::Hyperlink(_)) {
                 return None;
             }
             let len = inline.text().chars().count();
-            if len > drop {
+            if len > left {
                 break;
             }
-            drop -= len;
-            whole += 1;
+            left -= len;
         }
-        self.para.drain(..whole);
-        if drop > 0 {
-            if let Some(Inline::Run(run)) = self.para.first_mut() {
-                run.text = run.text.chars().skip(drop).collect();
+        // Drop `n + gap` characters from the front, in one pass: the
+        // inlines consumed whole, then the front of the run the marker
+        // ends in; the bookmarks stay where they were.
+        let mut drop = n + gap;
+        let mut kept = Vec::with_capacity(self.para.len());
+        for mut inline in self.para.drain(..) {
+            if drop > 0 && !is_mark(&inline) {
+                let len = inline.text().chars().count();
+                if len <= drop {
+                    drop -= len;
+                    continue;
+                }
+                // Only a run is cut; any other inline ends the marker.
+                if let Inline::Run(run) = &mut inline {
+                    run.text = run.text.chars().skip(drop).collect();
+                }
+                drop = 0;
             }
+            kept.push(inline);
         }
+        self.para = kept;
+        // What is left may be only white space now: the paragraph is kept
+        // only by what still keeps it.
+        self.keeps = self.para.iter().any(|i| match i {
+            Inline::Run(r) => !r.text.chars().all(char::is_whitespace),
+            Inline::Hyperlink(h) => h
+                .runs
+                .iter()
+                .any(|r| !r.text.chars().all(char::is_whitespace)),
+            Inline::Break(BreakKind::Page, _) => true,
+            i => is_object(i),
+        });
         Some(marker)
     }
 
     /// End the paragraph in progress, with `props`, in the open table cell
     /// when `in_table`, else in the body (closing a table left open).
     pub(crate) fn end_para(&mut self, props: ParProps, in_table: bool) {
+        self.para_gone();
         if !self.budget.keep::<Block>(0) {
             self.para.clear();
             return;
@@ -1169,6 +1423,13 @@ impl<'b> Builder<'b> {
             self.end_para_if_any(props, false);
         }
         self.end_tables();
+        // Bookmarks no content came after (#1912) end the body's last
+        // paragraph; after a table they are dropped (no new paragraph).
+        if let Some(Block::Paragraph(p)) = self.body.last_mut() {
+            for (id, name) in self.marks.drain(..) {
+                p.content.extend(mark_inlines(id, &name));
+            }
+        }
         Document { body: self.body }
     }
 
@@ -1235,6 +1496,170 @@ pub(crate) fn pin_list_indents(blocks: &mut [Block]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The paragraph in progress as a sketch: `Mark <name>` / `End` for a
+    /// bookmark's halves, else the inline's text.
+    fn para_sketch(b: &Builder) -> Vec<String> {
+        b.para
+            .iter()
+            .map(|i| match i {
+                Inline::Raw(r) if r.starts_with("<w:bookmarkStart ") => {
+                    format!("Mark {}", mark_of(r).unwrap().1)
+                }
+                Inline::Raw(r) if r.starts_with("<w:bookmarkEnd ") => "End".into(),
+                i => i.text(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_bookmark_waits_for_content_and_is_none_itself_1912() {
+        let budget = Budget::standard();
+        let mut b = Builder::new(&budget);
+        let props = RunProps::default();
+        b.bookmark("a");
+        b.bookmark("a"); // the first wins
+        b.bookmark("");
+        assert!(b.para.is_empty(), "no content, no mark yet");
+        b.text("1. Item", &props);
+        assert_eq!(para_sketch(&b), ["Mark a", "End", "1. Item"]);
+        // Not an object, and a paragraph shows only its content.
+        assert!(!b.has_object());
+        assert!(shows(&b.para, true));
+        assert!(!shows(&b.para[..2], true));
+        // A typed marker is still taken, the mark kept in front.
+        assert_eq!(b.take_leading_marker().as_deref(), Some("1."));
+        assert_eq!(para_sketch(&b), ["Mark a", "End", "Item"]);
+        // The ids count up.
+        b.bookmark("b");
+        b.tab(&props);
+        let raws: Vec<&String> = b
+            .para
+            .iter()
+            .filter_map(|i| match i {
+                Inline::Raw(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            raws,
+            [
+                "<w:bookmarkStart w:id=\"0\" w:name=\"a\"/>",
+                "<w:bookmarkEnd w:id=\"0\"/>",
+                "<w:bookmarkStart w:id=\"1\" w:name=\"b\"/>",
+                "<w:bookmarkEnd w:id=\"1\"/>",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_marker_split_by_a_bookmark_is_still_taken_1912() {
+        let budget = Budget::standard();
+        let mut b = Builder::new(&budget);
+        let props = RunProps::default();
+        b.text("1.", &props);
+        b.bookmark("x");
+        b.text(
+            " Item",
+            &RunProps {
+                bold: true,
+                ..RunProps::default()
+            },
+        );
+        assert_eq!(b.take_leading_marker().as_deref(), Some("1."));
+        assert_eq!(para_sketch(&b), ["Mark x", "End", "Item"]);
+    }
+
+    #[test]
+    fn a_trailing_break_after_a_bookmark_is_the_lines_one_break_1912() {
+        let budget = Budget::standard();
+        let mut b = Builder::new(&budget);
+        let props = RunProps::default();
+        b.bookmark("x");
+        b.line_break(&props);
+        b.drop_trailing_break();
+        // A break alone does not keep its paragraph (r2): the mark waits.
+        assert_eq!(para_sketch(&b), ["\n"]);
+        b.text("t", &props);
+        b.line_break(&props);
+        b.drop_trailing_break();
+        assert_eq!(para_sketch(&b), ["\n", "Mark x", "End", "t"]);
+        // Once kept, a break takes the waiting marks before it.
+        b.bookmark("y");
+        b.line_break(&props);
+        assert_eq!(
+            para_sketch(&b),
+            ["\n", "Mark x", "End", "t", "Mark y", "End", "\n"]
+        );
+    }
+
+    #[test]
+    fn white_space_takes_no_bookmark_and_a_paragraph_a_marker_emptied_gives_them_back_r2_1912() {
+        let budget = Budget::standard();
+        let mut b = Builder::new(&budget);
+        let props = RunProps::default();
+        b.bookmark("x");
+        b.text("\u{a0} ", &props);
+        b.tab(&props);
+        assert_eq!(para_sketch(&b), ["\u{a0} ", "\t"]);
+        b.clear_para();
+        // A typed marker alone kept the paragraph; taken off, it is empty
+        // and its marks wait again.
+        b.text("1. ", &props);
+        assert_eq!(para_sketch(&b), ["Mark x", "End", "1. "]);
+        assert_eq!(b.take_leading_marker().as_deref(), Some("1."));
+        b.text("\u{a0}", &props);
+        assert_eq!(para_sketch(&b), ["Mark x", "End", "\u{a0}"]);
+        b.clear_para();
+        b.text("t", &props);
+        assert_eq!(para_sketch(&b), ["Mark x", "End", "t"]);
+    }
+
+    #[test]
+    fn a_cleared_paragraphs_bookmarks_wait_again_1912() {
+        let budget = Budget::standard();
+        let mut b = Builder::new(&budget);
+        let props = RunProps::default();
+        b.bookmark("x");
+        b.text("\u{a0}", &props);
+        b.bookmark("y");
+        b.clear_para();
+        assert!(b.para.is_empty());
+        b.text("t", &props);
+        assert_eq!(para_sketch(&b), ["Mark x", "End", "Mark y", "End", "t"]);
+    }
+
+    #[test]
+    fn bookmarks_left_at_the_end_go_into_the_last_paragraph_or_nowhere_1912() {
+        let budget = Budget::standard();
+        let mut b = Builder::new(&budget);
+        let props = RunProps::default();
+        b.text("t", &props);
+        b.end_para(ParProps::default(), false);
+        b.bookmark("end");
+        let d = b.finish(ParProps::default());
+        assert_eq!(d.body.len(), 1);
+        let Block::Paragraph(p) = &d.body[0] else {
+            panic!()
+        };
+        assert_eq!(p.content.len(), 3, "{:?}", p.content);
+        assert!(is_mark(&p.content[2]));
+        // Nothing to put them in: dropped, no paragraph made.
+        let mut b = Builder::new(&budget);
+        b.bookmark("end");
+        assert!(b.finish(ParProps::default()).body.is_empty());
+    }
+
+    #[test]
+    fn bookmarks_past_the_cap_make_nothing_1912() {
+        let budget = Budget::standard();
+        let mut b = Builder::new(&budget);
+        for n in 0..MAX_BOOKMARKS + 3 {
+            b.bookmark(&format!("b{n}"));
+        }
+        b.text("t", &RunProps::default());
+        assert_eq!(b.para.len(), 2 * MAX_BOOKMARKS + 1);
+    }
 
     /// #2231: the HTML importer's list items keep the indents it computed,
     /// a 0 included, as direct ones, so neither a numbering level's indent

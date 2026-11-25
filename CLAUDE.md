@@ -71,7 +71,9 @@ issue number to find its notes.
   filling, the display copy, Save as an incremental update, replay in a
   new child, the signed-PDF question and quit (#2255).
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),
-  images (#1880), links (#1879), centring (#1922), rounded images (#1926),
+  images (#1880), links (#1879), centring (#1922),
+  bookmarks, the Hyperlink style, relative links, titles and targets,
+  Markdown link destinations (#1912), rounded images (#1926),
   nested cards (#1927), page margins (#1928), Outlook mail: CSS-only spacing,
   quirks-mode edges, list indents, item continuations, marker look (#1979),
   list and parent margins, trailing `<br>`, wide hangs, wrapper tables (#2114),

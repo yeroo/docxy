@@ -316,6 +316,37 @@ fn escape_cell_pipes(s: &str) -> String {
     out
 }
 
+/// A link destination as CommonMark reads it back (#1912): one holding a
+/// space, a parenthesis, `<`, `>` or a control character is written in
+/// angle brackets, `<`, `>` and `\` backslash-escaped inside and a line
+/// break percent-encoded (the bracketed form cannot hold one); any other is
+/// written as it is. Percent-encoding the rest instead would not round-trip:
+/// [`from_markdown`] does not decode, so an anchor `my section` would come
+/// back as `my%20section`.
+fn md_destination(url: &str) -> String {
+    let bracket = url
+        .chars()
+        .any(|c| matches!(c, ' ' | '(' | ')' | '<' | '>') || c.is_control());
+    if !bracket {
+        return url.to_string();
+    }
+    let mut out = String::with_capacity(url.len() + 2);
+    out.push('<');
+    for c in url.chars() {
+        match c {
+            '<' | '>' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("%0A"),
+            '\r' => out.push_str("%0D"),
+            _ => out.push(c),
+        }
+    }
+    out.push('>');
+    out
+}
+
 fn inlines_to_md(content: &[Inline]) -> String {
     let mut s = String::new();
     for inl in content {
@@ -338,7 +369,7 @@ fn inlines_to_md(content: &[Inline]) -> String {
                 if url.is_empty() {
                     s.push_str(&inner);
                 } else {
-                    s.push_str(&format!("[{inner}]({url})"));
+                    s.push_str(&format!("[{inner}]({})", md_destination(&url)));
                 }
             }
             Inline::Break(..) => s.push_str("  \n"),
@@ -979,9 +1010,15 @@ fn parse_inlines(s: &str) -> Vec<Inline> {
         if c == '[' {
             if let Some((label, url, adv)) = parse_link(&chars, i) {
                 push_run(&mut out, &mut buf, bold, italic, strike);
+                // `#name` is a link to the bookmark `name` (#1912), as the
+                // export writes an anchor link; `#` alone stays a target.
+                let (target, anchor) = match url.strip_prefix('#') {
+                    Some(name) if !name.is_empty() => (None, Some(name.to_string())),
+                    _ => (Some(url), None),
+                };
                 out.push(Inline::Hyperlink(Hyperlink {
-                    target: Some(url),
-                    anchor: None,
+                    target,
+                    anchor,
                     rel_id: None,
                     runs: vec![Run {
                         text: label,
@@ -1129,13 +1166,20 @@ fn is_md_escapable(c: char) -> bool {
 }
 
 /// Parse `[label](url)` starting at `chars[start] == '['`. Returns
-/// `(label, url, chars_consumed)`.
+/// `(label, url, chars_consumed)`. The url may be bracketed, `(<url>)`
+/// (#1912): backslash escapes undone inside, a `)` there not its end.
 fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
     let close = (start + 1..chars.len()).find(|&j| chars[j] == ']')?;
     if chars.get(close + 1) != Some(&'(') {
         return None;
     }
-    let url_end = (close + 2..chars.len()).find(|&j| chars[j] == ')')?;
+    let (url, url_end) = match bracketed_destination(chars, close + 2) {
+        Some(found) => found,
+        None => {
+            let url_end = (close + 2..chars.len()).find(|&j| chars[j] == ')')?;
+            (chars[close + 2..url_end].iter().collect(), url_end)
+        }
+    };
     // Unescape the label: a `\` before an escapable char drops itself and keeps
     // that char; any other `\` (or a trailing lone one) is kept, matching the
     // inline pass.
@@ -1150,8 +1194,37 @@ fn parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
             i += 1;
         }
     }
-    let url: String = chars[close + 2..url_end].iter().collect();
     Some((label, url, url_end + 1 - start))
+}
+
+/// A `<…>` link destination at `chars[at]`, followed by the `)` that ends
+/// the link (#1912): the destination with its backslash escapes undone and
+/// the index of that `)`. `None` when `chars[at]` is no `<`, or the
+/// brackets do not close (on the line) right before a `)`: the link is then
+/// read as a bare destination, as before.
+fn bracketed_destination(chars: &[char], at: usize) -> Option<(String, usize)> {
+    if chars.get(at) != Some(&'<') {
+        return None;
+    }
+    let mut url = String::new();
+    let mut j = at + 1;
+    while j < chars.len() {
+        match chars[j] {
+            '\\' if chars.get(j + 1).is_some_and(|&n| is_md_escapable(n)) => {
+                url.push(chars[j + 1]);
+                j += 2;
+            }
+            '>' => {
+                return (chars.get(j + 1) == Some(&')')).then_some((url, j + 1));
+            }
+            '<' | '\n' | '\r' => return None,
+            c => {
+                url.push(c);
+                j += 1;
+            }
+        }
+    }
+    None
 }
 
 /// Find the closing fence of a code span: the next run of *exactly* `n` backticks
@@ -1282,6 +1355,114 @@ mod tests {
                 (Some(2), String::new()),
             ]
         );
+    }
+
+    /// The one hyperlink of a one-paragraph document.
+    fn only_link_1912(doc: &Document) -> &Hyperlink {
+        match &doc.body[..] {
+            [Block::Paragraph(p)] => p
+                .content
+                .iter()
+                .find_map(|i| match i {
+                    Inline::Hyperlink(h) => Some(h),
+                    _ => None,
+                })
+                .expect("a link"),
+            other => panic!("one paragraph: {other:?}"),
+        }
+    }
+
+    fn link_doc_1912(target: Option<&str>, anchor: Option<&str>) -> Document {
+        Document {
+            body: vec![Block::Paragraph(Paragraph {
+                content: vec![Inline::Hyperlink(Hyperlink {
+                    target: target.map(str::to_string),
+                    anchor: anchor.map(str::to_string),
+                    runs: vec![Run {
+                        text: "go".into(),
+                        props: RunProps::default(),
+                    }],
+                    ..Hyperlink::default()
+                })],
+                ..Paragraph::default()
+            })],
+        }
+    }
+
+    #[test]
+    fn link_destinations_that_need_it_are_bracketed_and_round_trip_1912() {
+        for (target, anchor, want) in [
+            (None, Some("my section"), "[go](<#my section>)"),
+            (
+                Some("https://x.test/a)b"),
+                None,
+                "[go](<https://x.test/a)b>)",
+            ),
+            (
+                Some("https://x.test/(a)"),
+                None,
+                "[go](<https://x.test/(a)>)",
+            ),
+            (
+                Some("https://x.test/<a>\\b"),
+                None,
+                "[go](<https://x.test/\\<a\\>\\\\b>)",
+            ),
+        ] {
+            let doc = link_doc_1912(target, anchor);
+            let md = to_markdown(&doc);
+            assert_eq!(md.trim_end(), want, "{target:?} {anchor:?}");
+            let back = from_markdown(&md);
+            let h = only_link_1912(&back);
+            assert_eq!(h.target.as_deref(), target, "{md}");
+            assert_eq!(h.anchor.as_deref(), anchor, "{md}");
+            assert_eq!(h.runs[0].text, "go");
+        }
+        // Any other destination as before.
+        let md = to_markdown(&link_doc_1912(Some("https://x.test/a"), None));
+        assert_eq!(md.trim_end(), "[go](https://x.test/a)");
+        let md = to_markdown(&link_doc_1912(None, Some("sec")));
+        assert_eq!(md.trim_end(), "[go](#sec)");
+    }
+
+    #[test]
+    fn a_line_break_in_a_destination_is_percent_encoded_1912() {
+        let md = to_markdown(&link_doc_1912(Some("https://x.test/a\nb\rc"), None));
+        assert_eq!(md.trim_end(), "[go](<https://x.test/a%0Ab%0Dc>)");
+        let h = only_link_1912(&from_markdown(&md)).clone();
+        assert_eq!(h.target.as_deref(), Some("https://x.test/a%0Ab%0Dc"));
+    }
+
+    #[test]
+    fn an_unclosed_bracket_destination_reads_as_before_1912() {
+        // `<` not closed right before a `)`: the bare reading of old.
+        let h = only_link_1912(&from_markdown("[go](<a)")).clone();
+        assert_eq!(h.target.as_deref(), Some("<a"));
+        let h = only_link_1912(&from_markdown("[go](<a> b)")).clone();
+        assert_eq!(h.target.as_deref(), Some("<a> b"));
+    }
+
+    #[test]
+    fn a_hash_destination_is_an_anchor_link_and_saves_no_relationship_1912() {
+        let doc = from_markdown("See [the part](#sec).");
+        let h = only_link_1912(&doc);
+        assert_eq!(
+            (h.target.as_deref(), h.anchor.as_deref()),
+            (None, Some("sec"))
+        );
+        // `#` alone stays the target it was.
+        let h = only_link_1912(&from_markdown("[x](#)")).clone();
+        assert_eq!((h.target.as_deref(), h.anchor), (Some("#"), None));
+        // The save writes `w:anchor`, and no external relationship.
+        let bytes = crate::package::save_package(&crate::package::new_markdown_package(doc));
+        let pkg = crate::package::load_package(&bytes).expect("reloads");
+        let xml = pkg.part_text("word/document.xml").expect("document");
+        assert!(xml.contains("w:anchor=\"sec\""), "{xml}");
+        let rels = pkg
+            .part_text("word/_rels/document.xml.rels")
+            .unwrap_or_default();
+        assert!(!rels.contains("#sec"), "{rels}");
+        assert!(!rels.contains("TargetMode=\"External\""), "{rels}");
     }
 
     #[test]

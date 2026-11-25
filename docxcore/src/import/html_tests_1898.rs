@@ -680,7 +680,7 @@ fn many_base_tags_that_never_close_scan_in_linear_time_r1_1898() {
         let mut page = String::from("<p>x</p>");
         page.push_str(&unit.repeat(1_000_000 / unit.len()));
         let start = std::time::Instant::now();
-        let (css, base) = collect_styles(&page);
+        let Prescan { css, base, .. } = prescan(&page);
         assert!(
             start.elapsed().as_secs() < 20,
             "{unit}: {:?}",
@@ -691,7 +691,7 @@ fn many_base_tags_that_never_close_scan_in_linear_time_r1_1898() {
     let mut page = "<base ".repeat(200_000);
     page.push_str("href='img/'><p><img src=a.png></p>");
     let start = std::time::Instant::now();
-    let (_, base) = collect_styles(&page);
+    let base = prescan(&page).base;
     assert!(start.elapsed().as_secs() < 20, "{:?}", start.elapsed());
     // One tag, the first `<base` to its `>`: its `href` is the base.
     assert_eq!(base.as_deref(), Some("img/"));
