@@ -47,13 +47,18 @@
 //!
 //! Images (#1880) only through [`import_html_with`] ([`html_image`]): an
 //! `<img>` is an inline picture sized by its `width` / `height` (attributes,
-//! CSS lengths over them; `auto` clears a side, a percentage leaves the
-//! attribute's) and its pixels, scaled down to the body width. A `data:`
-//! src is decoded, any other goes to the caller's resolver; one that gives
-//! no PNG, JPEG, GIF or BMP is a grey placeholder of the declared size with
-//! its `alt` as Alt Text, or, unsized, the `alt` text itself. Word's
-//! `<![if !vml]>` image is read (its VML twin in a comment is not); a
-//! hidden one, a zero-sized one and one in a list marker make nothing.
+//! CSS lengths over them; `auto` clears a side; a percentage width is of
+//! the containing width, a percentage height `auto`, #1898), its pixels and
+//! its `max-width` / `max-height` (#1898), scaled down to the body width. A
+//! `data:` src is decoded, any other is resolved against the page's `<base
+//! href>` (#1898) and goes to the caller's resolver (or an MHTML message's
+//! part, #1898); one that gives nothing tries its `srcset` and its
+//! `<picture>`'s sources (#1898). One that gives no PNG, JPEG, GIF or BMP
+//! (nor, through [`import_html_with_converter`], an SVG or WebP) is a grey
+//! placeholder of the declared size with its `alt` as Alt Text, or,
+//! unsized, the `alt` text itself. Word's `<![if !vml]>` image is read (its
+//! VML twin in a comment is not); a hidden one, a zero-sized one and one in
+//! a list marker make nothing.
 //!
 //! Tables (#1878) are laid out by [`html_table`]: `colspan` / `rowspan`,
 //! the table's and cells' `width` (attribute or CSS), cell shading from the

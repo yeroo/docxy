@@ -59,7 +59,8 @@ issue number to find its notes.
   balloons shown on open, resolved hidden, no inline glyph (#2232), cell
   list numbers, All caps and Small caps drawn, Table Styles tiles on a
   dark page, Switch Modes not persisted (#2087), a pasted picture in a
-  link or a tracked change bringing its media (#1853).
+  link or a tracked change bringing its media (#1853), a placeholder
+  picture's Alt Text drawn in its frame (#1898).
 - `docs/claude/pdf-export.md`: before changing PDF export: embedded fonts (#1508),
   borders, picture watermarks and unequal columns (#797).
 - `docs/claude/pdf-view.md`: before changing the suite's PDF view (#2245): the
@@ -80,7 +81,9 @@ issue number to find its notes.
   visibility, white-space, page breaks, block borders as paragraph
   borders, `+`, attribute and `:first-child` selectors (#1883), table
   and cell borders, `frame`/`rules`, `border-collapse`, row heights,
-  `col` widths, `max-width`, `th`, the page colour (#1894).
+  `col` widths, `max-width`, `th`, the page colour (#1894), image
+  percentage sizes and `max-width`, `<base href>`, `srcset` and
+  `<picture>`, MHTML, SVG and WebP through a converter (#1898).
 - `docs/claude/email-html.md`: before changing `docxcore::export_email` (a `Document` as an
   e-mail body): inline styles only, lists and their `start`, safe links, `cid:` pictures and
   their media, the import round trip (#1948).

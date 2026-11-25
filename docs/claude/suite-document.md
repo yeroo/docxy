@@ -184,9 +184,20 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   (`pictures::Scope::recording`, `Docxy::drawn_pictures`, cleared at the
   frame's start like `painted_tables`): `width`, `height`, `radius`,
   `shape`, `round`; `uiharness/cases/html-rounded-images.uit` drives it.
+- A frame that shows no image (the frame-only fallback), or shows an HTML
+  import's placeholder (its media is exactly
+  `docxcore::import::html_image::PLACEHOLDER_PNG`, an image the import
+  could not get; `Pictures::is_placeholder`, cached per (part, rid) until
+  the parts stamp changes), draws the picture's Alt Text
+  (`image::inline_alt_text`, `pictures::frame_alt`) inside it (#1898):
+  `picture_alt_el`, 9 pt at the zoom in the palette's `dim`, inset 2 px,
+  wrapped at the frame's width and clipped to it. A picture that loads
+  draws none. It is the one draw path, so every view and the embedded
+  `ext::DocView` show it; the #1998 tooltip stays. `flow.pictures.N.alt` is
+  the text drawn (else null); `uiharness/cases/html-image-alt.uit`.
 - Out of scope: anchored pictures, `a:srcRect` cropping, other preset
-  shapes, rotation, alt text, the flow view's non-inline cases, PDF export,
-  wasm hosts.
+  shapes, rotation, the flow view's non-inline cases, PDF export, wasm
+  hosts.
 
 ## Run styles (#1427)
 
