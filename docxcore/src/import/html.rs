@@ -33,9 +33,14 @@
 //! not converted.
 //!
 //! Links (#1879): an `<a href>` to an absolute `http`, `https`, `ftp` or
-//! `mailto` URL is a hyperlink to it, and `href="#name"` an anchor link to
-//! `name`; any other `href` (`javascript:`, `data:`, `file:`, relative, …)
-//! leaves plain text ([`link_of`]). The link is part of the computed look,
+//! `mailto` URL is a hyperlink to it, a relative one resolved first
+//! against the page's base when that is an `http`, `https` or `ftp` URL
+//! (#1912), and `href="#name"` an anchor link to the bookmark `name`
+//! makes ([`bookmark_name`], #1912); any other `href` (`javascript:`,
+//! `data:`, `file:`, relative with no such base, …) leaves plain text
+//! ([`link_of`]). An `<a name>`, and an `id` the page links to, is a
+//! bookmark; a link's `title` and `target` are its `w:tooltip` and
+//! `w:tgtFrame` (#1912). The link is part of the computed look,
 //! so it follows the cascade, the reopened formatting elements and
 //! mis-nesting as formatting does; an `a` ends an open `a` first. A link
 //! has a browser's look (underline, Word's Hyperlink blue) under the page's
@@ -2654,22 +2659,6 @@ const QUIRKS_PUBLIC_NO_SYSTEM: [&str; 2] = [
     "-//w3c//dtd html 4.01 transitional//",
 ];
 
-/// The CSS text of every `<style>` element of the page, in order, and its
-/// `<base href>` (#1898): one forward scan, skipping comments and the
-/// contents of elements whose text is not markup (a `<style>` or `<base>`
-/// inside a comment or a script does not apply). The base is the first
-/// `<base>` with an `href`, in head or body, as a browser's document base
-/// URL: found before the tokenizer runs, it applies to an `<img>` before
-/// it too. A first `<base href>` that is no base (`page_base` refuses it)
-/// still ends the search, as in a browser (#1898 r1). Each `<base>` tag is
-/// read once and passed over whole; one that never closes ends the search
-/// (no later tag can close either), so the scan stays linear.
-#[cfg(test)]
-fn collect_styles(s: &str) -> (String, Option<String>) {
-    let p = prescan(s);
-    (p.css, p.base)
-}
-
 /// What the scan before the tokenizer finds ([`prescan`]).
 struct Prescan {
     /// Every `<style>`'s CSS, in order.
@@ -2685,11 +2674,23 @@ struct Prescan {
 
 /// The CSS text of every `<style>` element of the page, in order, its
 /// `<base href>` (#1898) and the anchors its `<a href="#…">`s name (#1912,
-/// [`Prescan::anchors`]), as [`collect_styles`] says: each `<a>` tag is
-/// read once and passed over whole.
+/// [`Prescan::anchors`]): one forward scan, skipping comments and the
+/// contents of elements whose text is not markup (a `<style>` or `<base>`
+/// inside a comment or a script does not apply). The base is the first
+/// `<base>` with an `href`, in head or body, as a browser's document base
+/// URL: found before the tokenizer runs, it applies to an `<img>` before
+/// it too. A first `<base href>` that is no base (`page_base` refuses it)
+/// still ends the search, as in a browser (#1898 r1). Each `<base>` and
+/// `<a>` tag is read once and passed over whole. A `<base` that never
+/// closes ends the search for the base; an `<a` that never closes is read
+/// to the end of the page, as the tokenizer reads it (the rest of the page
+/// is its attributes), and ends the reading of `<a>` tags (#1912 r1). No
+/// later tag can close either, so the scan stays linear.
 fn prescan(s: &str) -> Prescan {
     let mut css = String::new();
     let mut anchors = std::collections::HashSet::new();
+    // Until an `<a` that never closes.
+    let mut reading_a = true;
     // Until the first `<base>` with an `href`, or a `<base` that never closes.
     let mut looking = true;
     let mut base = None;
@@ -2722,13 +2723,18 @@ fn prescan(s: &str) -> Prescan {
             i = at + end;
             continue;
         }
-        if name == "a" {
-            let Some(end) = tag_end(rest) else {
-                i = at + 1;
-                continue;
+        if name == "a" && reading_a {
+            // Never closed: its attributes run to the end of the page, and
+            // no `<a` after it is a tag.
+            let (end, attrs_end) = match tag_end(rest) {
+                Some(end) => (end, end - 1),
+                None => {
+                    reading_a = false;
+                    (1, rest.len())
+                }
             };
             if anchors.len() < MAX_BOOKMARKS {
-                let attrs = attrs_of(&rest[1 + name_len..end - 1]);
+                let attrs = attrs_of(&rest[1 + name_len..attrs_end]);
                 if let Some(LinkTo::Anchor(n)) =
                     attrs.href.as_deref().and_then(|h| link_of(h, None))
                 {
@@ -3112,6 +3118,18 @@ impl<'a> Html<'a> {
             let key = self.key_of(name, &attrs, attrs_at);
             (attrs, key)
         });
+        // A linked `id` on a void or raw-text element (`<img id>`, `<svg
+        // id>`) is a bookmark too (#1912 r1), before what it writes. Read
+        // only when the page has an anchor link at all.
+        if self.bookmarks && !self.anchors.is_empty() && name != "head" {
+            match &read {
+                Some((attrs, _)) => self.mark_element(name, attrs),
+                None if self.budget.scanned(text.len()) => {
+                    self.mark_element(name, &attrs_of(text));
+                }
+                None => {}
+            }
+        }
         match name {
             "br" if self.visible() => {
                 let props = self.run_props();
@@ -5126,7 +5144,8 @@ fn link_of(href: &str, base: Option<&str>) -> Option<LinkTo> {
 /// absolute `http`, `https` or `ftp` URL with an authority (`//host`). A
 /// relative base, and one a browser cannot resolve against (`mailto:`,
 /// `cid:`, `about:`), resolve nothing: `mailto:a@b` and `x` must not make
-/// `mailto:x`. A `file:` base resolves to `file:`, which is no link.
+/// `mailto:x`. Nor does a `file:` base: the `href` stays relative, no link
+/// (a resolved one would be `file:`, which the allow-list refuses).
 fn hierarchical_base(base: &str) -> bool {
     html_image::scheme_of(base).is_some_and(|scheme| {
         ["http", "https", "ftp"]
@@ -7184,7 +7203,7 @@ mod tests {
         }
         let page = format!("<style>{css_text}</style><p class=c5>five</p><p class=c50000>late</p>");
         let budget = Budget::standard();
-        let sheet = StyleSheet::parse(&collect_styles(&page).0, &budget);
+        let sheet = StyleSheet::parse(&prescan(&page).css, &budget);
         assert_eq!(sheet.len(), css::MAX_RULES);
         let d = doc(&page);
         assert_eq!(run_of(&d, "five").props.color.as_deref(), Some("FF0000"));

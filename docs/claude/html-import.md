@@ -123,7 +123,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
 ## HTML import CSS (#1872)
 
 - `docxcore::import::html` reads inline `style`, `<font color face size>` and
-  every `<style>` block of the page (a pre-pass, `collect_styles`, outside
+  every `<style>` block of the page (a pre-pass, `prescan`, outside
   comments and raw-text elements, so a style in `<!--[if mso]>` or a script
   does not apply). `import/css.rs` (dependency-free) parses declarations,
   sheets of simple selectors (type, `*`, `.class`, `#id`, compounds,
@@ -275,7 +275,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   box. An unsized placeholder has no box to clamp: its alt text stays a
   run.
 - `<base href>`: the first `<base>` with an `href`, head or body, found
-  by the `collect_styles` pre-pass (so it applies to an `<img>` before
+  by the `prescan` pre-pass (so it applies to an `<img>` before
   it; `skip_head` is unchanged), unless empty, over `MAX_BASE` (4096)
   bytes, `data:` or `javascript:` (`html_image::page_base`). Every src but
   a `data:` one is resolved against it (`html_image::resolve_ref`, RFC
@@ -463,7 +463,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
 
 ## HTML import links (#1879)
 
-- `<a href>` is an `Inline::Hyperlink` (`raw: None`, no `rel_id`): an
+- `<a href>` is an `Inline::Hyperlink` (`raw: None` unless it has a
+  `title` or `target`, whose opener it keeps, #1912; no `rel_id`): an
   absolute `http`, `https`, `ftp` or `mailto` URL as `target`, `#name` as
   `anchor` (percent-decoded; `#` alone is no link). `link_of` reads the
   `href` (references already decoded by `attrs_of`) as a browser's URL
@@ -471,8 +472,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   line breaks inside removed (`java&#9;script:` is `javascript:`), then an
   allow-list (`LINK_SCHEMES`), so any other scheme however spelled
   (`javascript:`, `vbscript:`, `data:`, `file:`, `about:`), a relative
-  `href` (`page.html`, `/x`, `//host/x`, `?q`), an empty one or one holding
-  any other control character leaves plain text, as before. The scheme is
+  `href` (`page.html`, `/x`, `//host/x`, `?q`) with no `http`, `https` or
+  `ftp` base to resolve against (#1912, below), an empty one or one holding
+  any other control character leaves plain text, as before. Since #1912
+  `#name` goes through `bookmark_name`. The scheme is
   lowercased; space, `"`, `<`, `>` and `` ` `` are percent-encoded (the RTF
   export quotes the target in `HYPERLINK "…"`). Over `MAX_HREF` (4096 bytes,
   encoded) is no link; past twice that the `href` is refused unread.
@@ -554,11 +557,16 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
 
 - Bookmarks: `<a name>` always makes one, and any element's `id` makes
   one only when the page links to it. `prescan` (the scan that finds the
-  `<style>`s and `<base>`, formerly `collect_styles`) collects the mapped
-  names of every `<a href="#…">`, so a table of contents ahead of its
-  sections finds them. Outlook mail is full of unlinked ids, which would
-  clutter Insert > Bookmark. Void elements' ids (`<img id>`, `<br id>`)
-  make none: their attributes are mostly not read.
+  `<style>`s and `<base>`; it replaces #1898's `collect_styles`) collects
+  the mapped names of every `<a href="#…">`, so a table of contents ahead
+  of its sections finds them. Outlook mail is full of unlinked ids, which
+  would clutter Insert > Bookmark. A void or raw-text element's linked id
+  (`<img id>`, `<br id>`, `<svg id>`) is one too (r1): `open_void` reads
+  its attributes for it only when the page has an anchor link at all.
+  `prescan` reads each `<a>` tag once; one that never closes is read to the
+  end of the page, as the tokenizer reads it (the rest is its attributes),
+  and ends the reading of `<a>` tags, so many unclosed `<a` stay linear
+  (r1; the `<style>` and `<base>` scan goes on as before).
 - One mapping, `html::bookmark_name`, serves a link's `w:anchor` (in
   `link_of`) and the bookmark's `w:name`, so `href="#my%20section"` jumps
   to `id="my section"`, both `my_section`. Word's rule as far as it can be
@@ -593,7 +601,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   Only an `http`, `https` or `ftp` base with an authority resolves
   (`hierarchical_base`): a relative base, `mailto:` or `cid:` (a browser's
   cannot-be-a-base URL; `mailto:a@b` + `x` must not be `mailto:x`) leaves
-  plain text; a `file:` base gives `file:`, no link. `#name` stays an
+  plain text, and so does a `file:` base (the `href` stays relative: no
+  link; resolved it would be a `file:` one, which the allow-list refuses).
+  `#name` stays an
   anchor link whatever the base (Word's and Outlook's reading). A page
   opened from disk does not resolve against its own path (that would make
   `file:` links).
@@ -633,7 +643,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   suite showing a link's tooltip on hover, explicit-off underline or
   colour so a restyled link could carry the style too, bookmarks and the
   style on a paste.
-- Tests: `import/html_tests_1912.rs`, the `…_1912` Builder tests in
+- Tests: `import/html_tests_1912.rs` (`…_r1_1912` for the review's), the `…_1912` Builder tests in
   `import/mod.rs`, `markdown.rs`, `image.rs` and `package.rs`.
 
 ## HTML import page margins (#1928)
@@ -1052,7 +1062,7 @@ A batch from #1989 and #1930 (plan-2), import only.
   (skipped whole, so a `<body>` in a script is none) are passed over, a
   stray end tag is ignored, `</head>` ends it, and any other start tag
   (`<body`, a `<p>`) or text ends it and opens. The `<style>` pre-pass
-  (`collect_styles`) reads a head's styles either way.
+  (`prescan`) reads a head's styles either way.
 - Tests (`import/html.rs` unless named): `quirks_tables_reset_font_size_weight_and_style_1883`,
   `italic_off_is_explicit_under_a_heading_only_1883`,
   `dir_rtl_is_paragraph_bidi_and_swaps_alignment_1883`,

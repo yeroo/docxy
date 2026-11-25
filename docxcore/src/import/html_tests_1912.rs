@@ -586,3 +586,72 @@ fn a_picture_in_a_titled_link_takes_its_title_as_tooltip_1912() {
         "{rid}: {rels}"
     );
 }
+
+// --- Review r1 ---
+
+#[test]
+fn many_a_tags_that_never_close_scan_in_linear_time_r1_1912() {
+    // Each `<a` that never closes once scanned to the end: quadratic. Read
+    // once, the first ends the reading of `<a>` tags: linear.
+    for unit in ["<a ", "<a x=\"", "<a<"] {
+        let mut page = String::from("<p>x</p>");
+        page.push_str(&unit.repeat(1_000_000 / unit.len()));
+        let start = std::time::Instant::now();
+        let p = prescan(&page);
+        assert!(
+            start.elapsed().as_secs() < 20,
+            "{unit}: {:?}",
+            start.elapsed()
+        );
+        assert!(p.anchors.is_empty() && p.css.is_empty(), "{unit}");
+    }
+    // The CSS and the base after one are still read, as before.
+    let p = prescan("<a title='x <style>p{color:red}</style><base href='https://x.test/'>");
+    assert!(p.css.contains("color:red"), "{}", p.css);
+    assert_eq!(p.base.as_deref(), Some("https://x.test/"));
+}
+
+#[test]
+fn an_a_that_never_closes_is_read_as_the_tokenizer_reads_it_r1_1912() {
+    // The rest of the page is its attributes: its own `href` links, an
+    // `<a href>` in that text is no tag.
+    let d = doc("<p id=x>T</p><a href='#x' title='<a href=\"#y\">go</a><p id=y>Y</p>");
+    assert_eq!(marks(&d), ["x"]);
+    let d = doc("<p id=x>T</p><a title='<a href=\"#x\">go</a>");
+    assert!(marks(&d).is_empty(), "{:?}", sketches(&d));
+    // Closed `<a>`s before it are read as ever.
+    let d = doc("<p><a href=#x>go</a></p><p id=x>T</p><a title='");
+    assert_eq!(marks(&d), ["x"]);
+}
+
+#[test]
+fn a_linked_id_on_a_void_element_is_a_bookmark_r1_1912() {
+    let mut resolve =
+        |src: &str, _: usize| (src == "logo.png").then(|| super::tests_1898::png(1, 1));
+    let page = "<p><a href=#f>F</a></p><p>a<img id=f src=logo.png width=10 height=10></p>\
+                <p>b<img id=g src=logo.png width=10 height=10></p>";
+    let got = import_html_within(page.as_bytes(), &Budget::standard(), Some(&mut resolve)).unwrap();
+    assert_eq!(
+        sketches(&got.document),
+        [
+            vec![r#"Link #f ["F"]"#.to_string()],
+            vec![
+                r#"Run "a""#.into(),
+                "Mark f".into(),
+                "End".into(),
+                "Object".into()
+            ],
+            vec![r#"Run "b""#.into(), "Object".into()],
+        ]
+    );
+    // A `<br id>` too, before its break.
+    let d = doc("<p><a href=#b>B</a></p><p>x<br id=b>y</p>");
+    assert_eq!(
+        sketch(&paras(&d)[1]),
+        [r#"Run "x""#, "Mark b", "End", "Break", r#"Run "y""#]
+    );
+    // No anchor link on the page: no void element's attributes are read
+    // for it, and none is a bookmark.
+    let d = doc("<p>x<br id=b>y</p>");
+    assert!(marks(&d).is_empty());
+}

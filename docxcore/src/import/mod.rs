@@ -51,7 +51,8 @@
 //! | rtf `\listtext`, stylesheet names | text kept | ≤ 64 bytes each (`MAX_NAME`) |
 //! | rtf font table, heading styles | map entries | built per new entry |
 //! | `html::import_html` | decoding, the `<style>` scan, tokenizing | work (3 × input/16), up front |
-//! | html `prescan` | the `<style>` texts joined; each `<a>` tag's attributes read (#1912) | ≤ input; forward only (comments and raw-text elements skipped by one search each, an `<a>` tag passed over whole); anchor names ≤ `MAX_BOOKMARKS` |
+//! | html `prescan` | the `<style>` texts joined; each `<a>` tag's attributes read (#1912) | ≤ input; forward only (comments and raw-text elements skipped by one search each, an `<a>` tag passed over whole; an `<a` that never closes read to the end once, and no `<a` after it, r1); anchor names ≤ `MAX_BOOKMARKS` |
+//! | html `open_void` (#1912 r1) | a void or raw-text element's attributes, for a linked `id` | only when the page has an anchor link; scanned (attrs/16) |
 //! | `css::StyleSheet::parse` | the CSS, once; rules, declaration blocks | work (css/16); each rule and block built; ≤ `MAX_RULES` (10 000) rules, more ignored; brace nesting counted, never recursed |
 //! | css selector | compounds | ≤ `MAX_COMPOUNDS` (32), longer dropped; names ≤ 64 bytes |
 //! | `css::StyleSheet::matching` | rules examined per element opened | work per rule examined (only those indexed by the element's id, classes, tag, or universal) |
