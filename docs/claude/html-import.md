@@ -861,10 +861,69 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   writes all seven `w:pgMar` attributes from the parsed margins, and only
   Page Setup's own fields change those three.
 - Known limits: 15 px is inside most printers' unprintable band (about
-  0.17-0.25"), so Word warns about the margins when printing; a page's own
-  `@page` margins (Word-saved HTML's `@page WordSection1 {margin: ...}`)
-  are not read, as `css.rs` skips every at-rule; every import gets the same
-  fixed page.
+  0.17-0.25"), so Word warns about the margins when printing. A page that
+  declares its own `@page` gets that page instead since #1944 (next
+  section); every other import gets this fixed page.
+
+## HTML import page rule (#1944)
+
+- A page's own `@page` gives the import's section and the body the reader
+  lays out in, in place of #1928's page (`html_table::Page`,
+  `Page::DEFAULT` is #1928's; `BODY_TWIPS` stays the default page's body).
+  So a Word Web Page (`@page WordSection1 {size:8.5in 11.0in; margin:...}`
+  with `div.WordSection1 {page:WordSection1}`) keeps Word's page:
+  `corpus/word-import/source.htm` imports with `source.docx`'s `pgSz` and
+  `pgMar`.
+- `css.rs` keeps unnamed and named `@page` rules (`StyleSheet::pages`, at
+  most `MAX_PAGE_RULES`); a page selector (`:first`, `name:left`), a
+  prelude of two names, margin boxes and an `@page` inside `@media` are
+  skipped with every other at-rule. `StyleSheet::page_decls`: the unnamed
+  pages' declarations, then the selected named page's, then the
+  `!important` ones of both, each in source order (a later one wins). The
+  selected page is the one the first `page` declaration in the sheet's
+  source order names (a kept `@page` of that name, ASCII case-insensitive;
+  `auto` or an unknown name selects none). Whether an element matches that
+  rule is not checked: Word's `div.WordSection1` wraps the whole body, and
+  the import has one section, so a page of several WordSections takes the
+  first selected page throughout.
+- `Page::from_decls` reads `size` (one length, a square, or two; `auto`;
+  `letter`, `legal`, `ledger`, `a3`-`a5`, `b4`, `b5`; `portrait` /
+  `landscape` with or without one, in either order), `margin` and its
+  longhands, and Word's `mso-header-margin` / `mso-footer-margin`. Without
+  those two, header and footer are the top and bottom margins, at most
+  0.5": ours, not CSS (Word's filtered HTML drops them; Word's default is
+  0.5"). Lenient: an unreadable `size` is ignored whole, a side of it
+  outside 1"..22" alone; a percentage, negative or unreadable margin is
+  ignored alone; margins leaving a body under 0.5" wide or high are all
+  ignored (the default 225 then). A page wider than tall writes
+  `w:orient="landscape"` with `w`/`h` as given (as Word stores it).
+- The body follows the page: `Html::set_page` sets `Html::page` and
+  `Builder::set_body` (an outermost table's room); `Ctx::body` /
+  `Cascade::body` centre a fixed-width box outside a cell and give
+  `body_room`; `table_spec` takes the body; `html_image::fit_to_body` and
+  `Html::image_room` read it.
+- #1928's page stays for:
+  - a classic-Outlook mail: the first `<meta name=Generator>` (in
+    `prescan`) says `(filtered medium)`. Outlook composes in Word, so its
+    mail carries Word's default `@page` with 1" margins that the sender
+    never chose and its reading pane ignores. Word's Save as Web Page
+    writes `(filtered)` or nothing after the version.
+  - a paste (`import_html_str_within`): it goes into a document with a
+    page of its own, and Word's clipboard HTML carries the source's `@page`.
+  - `@page` rules and `page` declarations in a `<style>` after the page's
+    first `<body` tag (`Prescan::head_css`, `StyleSheet::parse_split`): a
+    quoted mail's styles sit in the body. Its other rules still apply.
+- Known limits: a classic-Outlook mail quoted by another client whose
+  styles end up in the head (no Outlook Generator) gives Word's default
+  page. Not read: `@page :first`/`:left`/`:right`, margin boxes,
+  `mso-gutter-margin`, `mso-paper-source`, page borders and columns,
+  `page` in a `style=""` attribute, and several `@page`s as several
+  sections. Web Layout and `ext::DocView`'s Web Layout never show page
+  margins; Print Layout does.
+- Tests: `import/html_tests_1944.rs`, the `…_1944` tests in `css.rs`,
+  `word_web_page_keeps_word_page` (`tests/word_import.rs`),
+  `tests/html_page.rs`, `uiharness/cases/html-page-rule.uit` (121 / 97 /
+  574 px against `html-page-margins.uit`'s 16 / 16 / 784).
 
 ## HTML import Outlook mail (#1979)
 
