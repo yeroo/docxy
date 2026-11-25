@@ -83,7 +83,8 @@ use super::html_image::{
 };
 use super::html_table::{self, CellSpec, MAX_TABLE_NESTING, TableSpec, VAlign, Width};
 use super::{
-    Budget, Builder, FlowTail, Link, MAX_DEPTH, TOO_BIG, heading_props, marker_is_numbered,
+    Budget, Builder, FlowTail, Link, LinkTo, MAX_BOOKMARKS, MAX_DEPTH, TOO_BIG, heading_props,
+    marker_is_numbered,
 };
 use crate::model::{
     Align, Block as DocBlock, BorderKind, Document, Inline, ParBorder, ParBorders, ParProps,
@@ -103,6 +104,13 @@ pub(crate) const MAX_HREF: usize = 4096;
 /// an allow-list, so `javascript:`, `data:`, `file:` and any other scheme,
 /// however spelled, stays text.
 pub(crate) const LINK_SCHEMES: [&str; 4] = ["http", "https", "ftp", "mailto"];
+
+/// The longest bookmark name Word keeps (#1912), in characters.
+pub(crate) const MAX_BOOKMARK_NAME: usize = 40;
+
+/// The longest link `title` (Word's ScreenTip) and `target` (its frame)
+/// kept (#1912), in characters.
+pub(crate) const MAX_LINK_ATTR: usize = 255;
 
 // The colour of a link's user-agent look (#1879): Word's Hyperlink style,
 // the one the editor gives a new link (#1952).
@@ -274,42 +282,55 @@ fn import_html_converting(
                     Some(part) => part,
                     None => caller(src, limit),
                 };
-                import_decoded(&text, budget, Some(&mut resolve), convert, url)
+                import_decoded(&text, budget, Some(&mut resolve), convert, url, true)
             }
-            None => import_decoded(&text, budget, None, None, url),
+            None => import_decoded(&text, budget, None, None, url, true),
         };
     }
-    import_decoded(&decode(bytes), budget, images, convert, None)
+    import_decoded(&decode(bytes), budget, images, convert, None, true)
 }
 
 /// [`import_html_within`] of a page already decoded, so no charset is read
 /// from it (#1950: the clipboard's HTML is UTF-8, whatever its text says):
-/// no images.
+/// no images, and no bookmarks or `Hyperlink` style (#1912): the paste goes
+/// into a document whose bookmark ids and styles it does not know.
 pub(crate) fn import_html_str_within(text: &str, budget: &Budget) -> Result<Document, String> {
     // Two passes: the `<style>` scan, then the tokenizer.
     if !budget.work(2 * (text.len() / 16 + 1)) {
         return Err(TOO_BIG.into());
     }
-    import_decoded(text, budget, None, None, None).map(|h| h.document)
+    import_decoded(text, budget, None, None, None, false).map(|h| h.document)
 }
 
 /// The import of the decoded page `text`, as [`import_html_within`] says;
 /// `url` is the page's own URL when it has one (an MHTML root part's,
-/// #1898), which its `<base href>` and its srcs are resolved against.
+/// #1898), which its `<base href>`, its srcs and its links are resolved
+/// against. `package`: the document is saved through a package of its own
+/// (#1912), so it gets bookmarks and the `Hyperlink` style; a clipboard
+/// paste's goes into another document and gets neither.
 fn import_decoded(
     text: &str,
     budget: &Budget,
     images: Option<&mut ImageResolver<'_>>,
     convert: Option<&mut ImageConverter<'_>>,
     url: Option<&str>,
+    package: bool,
 ) -> Result<HtmlImport, String> {
-    let (css, base) = collect_styles(text);
+    let Prescan { css, base, anchors } = prescan(text);
     let base = match (base, url) {
         (Some(b), Some(u)) => Some(html_image::resolve_ref(u, &b)),
         (b, u) => b.or(u.map(str::to_string)),
     };
     let sheet = StyleSheet::parse(&css, budget);
     let mut h = Html::new(text, budget, sheet);
+    h.base = base.clone();
+    // What only a document saved through its own package has (#1912):
+    // bookmarks and the `Hyperlink` style.
+    if package {
+        h.bookmarks = true;
+        h.anchors = anchors;
+        h.out.set_link_style(true);
+    }
     if let Some(resolve) = images {
         let mut images = Images::new(resolve);
         images.set_base(base);
@@ -903,6 +924,10 @@ struct Attrs {
     srcset: Option<String>,
     mime: Option<String>,
     media: Option<String>,
+    /// An `<a>`'s `title`, `target` and `name` (#1912).
+    title: Option<String>,
+    target: Option<String>,
+    name: Option<String>,
 }
 
 /// One element's style, being computed: its look so far, and the box
@@ -1533,7 +1558,7 @@ impl Cascade {
     /// Presentational attributes: `align` on a block, cell, row or row
     /// group; `bgcolor` and `valign` on a table part; `width` on a table or
     /// cell; `<font color face size>`; an `a`'s `href` (#1879).
-    fn presentational(&mut self, tag: &str, attrs: &Attrs) {
+    fn presentational(&mut self, tag: &str, attrs: &Attrs, base: Option<&str>) {
         // `dir` on any element is a presentational `direction` (#1883);
         // `auto` and anything else leave the inherited one.
         match attrs.dir.as_deref().map(str::trim) {
@@ -1544,8 +1569,19 @@ impl Cascade {
         if tag == "a" {
             // A link (#1879), with a browser's `a:link` look; the page's
             // CSS on or inside it overrides that. An `a` without a usable
-            // `href` (`<a name>`, `javascript:`) is no link.
-            self.look.link = attrs.href.as_deref().and_then(link_of).map(Rc::new);
+            // `href` (`<a name>`, `javascript:`) is no link. Its `title`
+            // and `target` go with it (#1912).
+            self.look.link = attrs
+                .href
+                .as_deref()
+                .and_then(|h| link_of(h, base))
+                .map(|to| {
+                    Rc::new(Link {
+                        to,
+                        tooltip: attrs.title.as_deref().and_then(link_title),
+                        frame: attrs.target.as_deref().and_then(link_frame),
+                    })
+                });
             if self.look.link.is_some() {
                 self.look.run.underline = true;
                 self.look.run.color = Some(LINK_COLOR.to_string());
@@ -2473,6 +2509,9 @@ struct Ctx<'c> {
     quirks: bool,
     /// The page root's children (#1883).
     root: &'c Kids,
+    /// The page's base URL (#1912), which a relative `href` resolves
+    /// against.
+    base: Option<&'c str>,
 }
 
 /// The look of an element opening on top of `below`: its parent's, then the
@@ -2488,7 +2527,7 @@ fn look_of(
 ) -> Look {
     let mut c = Cascade::new(below.last().map(|e| &e.look), kind, card);
     c.user_agent(key, ctx.quirks);
-    c.presentational(&key.tag, attrs);
+    c.presentational(&key.tag, attrs, ctx.base);
     let hits = ctx.sheet.matching(
         &Ancestry {
             elems: below,
@@ -2625,8 +2664,32 @@ const QUIRKS_PUBLIC_NO_SYSTEM: [&str; 2] = [
 /// still ends the search, as in a browser (#1898 r1). Each `<base>` tag is
 /// read once and passed over whole; one that never closes ends the search
 /// (no later tag can close either), so the scan stays linear.
+#[cfg(test)]
 fn collect_styles(s: &str) -> (String, Option<String>) {
+    let p = prescan(s);
+    (p.css, p.base)
+}
+
+/// What the scan before the tokenizer finds ([`prescan`]).
+struct Prescan {
+    /// Every `<style>`'s CSS, in order.
+    css: String,
+    /// The first `<base href>`'s URL, when it is one.
+    base: Option<String>,
+    /// The bookmark names the page's anchor links name (#1912): an element
+    /// `id` makes a bookmark only when one is among them, so a table of
+    /// contents ahead of its sections finds them, and an e-mail's unlinked
+    /// ids make none. At most [`MAX_BOOKMARKS`].
+    anchors: std::collections::HashSet<String>,
+}
+
+/// The CSS text of every `<style>` element of the page, in order, its
+/// `<base href>` (#1898) and the anchors its `<a href="#…">`s name (#1912,
+/// [`Prescan::anchors`]), as [`collect_styles`] says: each `<a>` tag is
+/// read once and passed over whole.
+fn prescan(s: &str) -> Prescan {
     let mut css = String::new();
+    let mut anchors = std::collections::HashSet::new();
     // Until the first `<base>` with an `href`, or a `<base` that never closes.
     let mut looking = true;
     let mut base = None;
@@ -2659,6 +2722,22 @@ fn collect_styles(s: &str) -> (String, Option<String>) {
             i = at + end;
             continue;
         }
+        if name == "a" {
+            let Some(end) = tag_end(rest) else {
+                i = at + 1;
+                continue;
+            };
+            if anchors.len() < MAX_BOOKMARKS {
+                let attrs = attrs_of(&rest[1 + name_len..end - 1]);
+                if let Some(LinkTo::Anchor(n)) =
+                    attrs.href.as_deref().and_then(|h| link_of(h, None))
+                {
+                    anchors.insert(n);
+                }
+            }
+            i = at + end;
+            continue;
+        }
         if !RAW_TEXT.contains(&name.as_str()) {
             i = at + 1;
             continue;
@@ -2675,7 +2754,7 @@ fn collect_styles(s: &str) -> (String, Option<String>) {
         }
         i = end;
     }
-    (css, base)
+    Prescan { css, base, anchors }
 }
 
 struct Html<'a> {
@@ -2734,6 +2813,14 @@ struct Html<'a> {
     /// The `html` and `body` elements' backgrounds (#1894), once each is
     /// seen: the page colour.
     page_fill: [Option<Option<String>>; 2],
+    /// The page's base URL (#1912): relative links resolve against it.
+    base: Option<String>,
+    /// The import makes bookmarks (#1912): every `<a name>`, and each `id`
+    /// among `anchors`. Off for a clipboard paste, which nothing
+    /// renumbers against the document it goes into.
+    bookmarks: bool,
+    /// [`Prescan::anchors`].
+    anchors: std::collections::HashSet<String>,
 }
 
 impl<'a> Html<'a> {
@@ -2764,6 +2851,9 @@ impl<'a> Html<'a> {
             next_serial: 0,
             picture: None,
             page_fill: [None, None],
+            base: None,
+            bookmarks: false,
+            anchors: std::collections::HashSet::new(),
         }
     }
 
@@ -3142,6 +3232,9 @@ impl<'a> Html<'a> {
             "dt" | "dd" => self.implicit_close(&["dt", "dd"]),
             _ => {}
         }
+        if self.bookmarks {
+            self.mark_element(name, &attrs);
+        }
         let key = self.key_of(name, &attrs, attrs_at);
         if name == "span"
             && attrs
@@ -3405,12 +3498,30 @@ impl<'a> Html<'a> {
         spec
     }
 
+    /// The bookmarks an element opening makes (#1912): an `<a name>`'s,
+    /// and its `id`'s when the page links to it ([`Prescan::anchors`]),
+    /// each at the next content written ([`Builder::bookmark`]).
+    fn mark_element(&mut self, name: &str, attrs: &Attrs) {
+        if name == "a" {
+            if let Some(n) = attrs.name.as_deref() {
+                self.out.bookmark(&bookmark_name(n));
+            }
+        }
+        if let Some(id) = attrs.id.as_deref() {
+            let n = bookmark_name(id);
+            if self.anchors.contains(&n) {
+                self.out.bookmark(&n);
+            }
+        }
+    }
+
     fn ctx(&self) -> Ctx<'_> {
         Ctx {
             sheet: &self.sheet,
             budget: self.budget,
             quirks: self.quirks,
             root: &self.root_kids,
+            base: self.base.as_deref(),
         }
     }
 
@@ -3434,6 +3545,7 @@ impl<'a> Html<'a> {
                     budget: self.budget,
                     quirks: self.quirks,
                     root: &self.root_kids,
+                    base: self.base.as_deref(),
                 },
                 below,
                 &e.key,
@@ -4041,9 +4153,15 @@ impl<'a> Html<'a> {
             .and_then(|s| crate::image::with_svg_blip(&raw, &s))
             .unwrap_or(raw);
         let raw = match link.as_deref() {
-            Some(Link::Url(url)) => images
+            Some(Link {
+                to: LinkTo::Url(url),
+                tooltip,
+                ..
+            }) => images
                 .link_rid(url, budget)
-                .and_then(|lrid| crate::image::with_click_link(&raw, &lrid))
+                .and_then(|lrid| {
+                    crate::image::with_titled_click_link(&raw, &lrid, tooltip.as_deref())
+                })
                 .unwrap_or(raw),
             _ => raw,
         };
@@ -4882,6 +5000,9 @@ fn attrs_of(attrs: &str) -> Attrs {
             "srcset" => Some(&mut out.srcset),
             "type" => Some(&mut out.mime),
             "media" => Some(&mut out.media),
+            "title" => Some(&mut out.title),
+            "target" => Some(&mut out.target),
+            "name" => Some(&mut out.name),
             _ => None,
         };
         if let Some(slot) = slot.filter(|s| s.is_none()) {
@@ -4943,13 +5064,17 @@ fn each_attr(attrs: &str, mut f: impl FnMut(&str, &str)) {
 /// The link an `href` (its character references decoded) makes (#1879),
 /// read as a browser's URL parser reads it: leading and trailing control
 /// characters and spaces stripped, every tab and line break inside removed
-/// (so `java\tscript:` is `javascript:`). `#name` is an anchor link to
-/// `name`, percent-decoded. Otherwise only an absolute URL whose scheme is
-/// in [`LINK_SCHEMES`] is a link, its scheme lowercased and space, `"`,
-/// `<`, `>` and `` ` `` percent-encoded (a field's `HYPERLINK "…"` quotes
-/// it). `None` (no link) for anything else: a relative or empty `href`, one
-/// holding another control character, one longer than [`MAX_HREF`].
-fn link_of(href: &str) -> Option<Link> {
+/// (so `java\tscript:` is `javascript:`). `#name` is an anchor link to the
+/// bookmark `name` makes ([`bookmark_name`], #1912), `name`
+/// percent-decoded, whatever the base (Word's and Outlook's reading). A
+/// relative `href` is resolved against `base` (#1912) when that is a
+/// hierarchical URL ([`hierarchical_base`]). Then only an absolute URL
+/// whose scheme is in [`LINK_SCHEMES`] is a link, its scheme lowercased and
+/// space, `"`, `<`, `>` and `` ` `` percent-encoded (a field's
+/// `HYPERLINK "…"` quotes it). `None` (no link) for anything else: a
+/// relative `href` with no such base, an empty one, one holding another
+/// control character, one longer than [`MAX_HREF`].
+fn link_of(href: &str, base: Option<&str>) -> Option<LinkTo> {
     // Bounded by the limit, not by the attribute.
     if href.len() > 2 * MAX_HREF {
         return None;
@@ -4966,8 +5091,14 @@ fn link_of(href: &str) -> Option<Link> {
         let name = String::from_utf8_lossy(&html_image::percent_decode(fragment)).into_owned();
         let usable =
             !name.is_empty() && name.len() <= MAX_HREF && !name.chars().any(char::is_control);
-        return usable.then_some(Link::Anchor(name));
+        return usable.then(|| LinkTo::Anchor(bookmark_name(&name)));
     }
+    let href = match base.filter(|_| !href.is_empty()) {
+        Some(base) if html_image::scheme_of(&href).is_none() && hierarchical_base(base) => {
+            html_image::resolve_ref(base, &href)
+        }
+        _ => href,
+    };
     let (scheme, rest) = href.split_once(':')?;
     let mut letters = scheme.chars();
     let is_scheme = letters.next().is_some_and(|c| c.is_ascii_alphabetic())
@@ -4988,7 +5119,80 @@ fn link_of(href: &str) -> Option<Link> {
             _ => url.push(c),
         }
     }
-    (url.len() <= MAX_HREF).then_some(Link::Url(url))
+    (url.len() <= MAX_HREF).then_some(LinkTo::Url(url))
+}
+
+/// Whether a relative `href` may be resolved against `base` (#1912): an
+/// absolute `http`, `https` or `ftp` URL with an authority (`//host`). A
+/// relative base, and one a browser cannot resolve against (`mailto:`,
+/// `cid:`, `about:`), resolve nothing: `mailto:a@b` and `x` must not make
+/// `mailto:x`. A `file:` base resolves to `file:`, which is no link.
+fn hierarchical_base(base: &str) -> bool {
+    html_image::scheme_of(base).is_some_and(|scheme| {
+        ["http", "https", "ftp"]
+            .iter()
+            .any(|k| scheme.eq_ignore_ascii_case(k))
+            && base[scheme.len() + 1..].starts_with("//")
+    })
+}
+
+/// The bookmark name an HTML anchor `raw` (an `<a name>`, an `id`, a link's
+/// `#name`) becomes (#1912), as far as Word's rule can be kept: each
+/// character that is not a letter, a digit or `_` is `_` (so a name led by
+/// one starts with `_`), a name that starts with a digit gets a leading `_`
+/// (a hidden bookmark, as Word's own `_Toc…`), and it is cut to
+/// [`MAX_BOOKMARK_NAME`] characters. Links and bookmarks both go through
+/// it, so `#my section` jumps to `id="my section"`, both `my_section`.
+/// Empty for an empty `raw`.
+pub(crate) fn bookmark_name(raw: &str) -> String {
+    let mut out = String::new();
+    let Some(first) = raw.chars().next() else {
+        return out;
+    };
+    let mut n = 0;
+    if first.is_alphanumeric() && !first.is_alphabetic() {
+        out.push('_');
+        n += 1;
+    }
+    for c in raw.chars() {
+        if n == MAX_BOOKMARK_NAME {
+            break;
+        }
+        out.push(if c.is_alphanumeric() || c == '_' {
+            c
+        } else {
+            '_'
+        });
+        n += 1;
+    }
+    out
+}
+
+/// An `<a>`'s `title` as the link's ScreenTip (#1912): trimmed,
+/// characters XML cannot hold dropped, cut to [`MAX_LINK_ATTR`]
+/// characters; none when empty.
+fn link_title(title: &str) -> Option<String> {
+    let t: String = title
+        .trim()
+        .chars()
+        .filter(|&c| crate::serialize::xml_char(c))
+        .take(MAX_LINK_ATTR)
+        .collect();
+    let t = t.trim_end();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// An `<a>`'s `target` as the link's frame (#1912): trimmed; none when
+/// empty, `_self` (where a link opens anyway), longer than
+/// [`MAX_LINK_ATTR`] characters (a cut name would name another frame) or
+/// holding a control character.
+fn link_frame(target: &str) -> Option<String> {
+    let t = target.trim();
+    let usable = !t.is_empty()
+        && !t.eq_ignore_ascii_case("_self")
+        && t.chars().count() <= MAX_LINK_ATTR
+        && !t.chars().any(char::is_control);
+    usable.then(|| t.to_string())
 }
 
 /// `text` with character references decoded.
@@ -8105,10 +8309,14 @@ mod link_tests {
             "<p><a href=\"javascript:alert(1)\">n</a></p>",
         ] {
             let d = doc(page);
-            assert_eq!(first(&d), [r#"Run "n""#], "{page}");
-            let Inline::Run(r) = &all_paras(&d)[0].content[0] else {
-                panic!()
+            let para = &all_paras(&d)[0];
+            // `<a name>` is a bookmark (#1912), before its text.
+            let marks = if page.contains("name=") { 2 } else { 0 };
+            assert_eq!(para.content.len(), marks + 1, "{page}");
+            let Inline::Run(r) = &para.content[marks] else {
+                panic!("{page}: {:?}", para.content)
             };
+            assert_eq!(r.text, "n", "{page}");
             assert!(!r.props.underline && r.props.color.is_none(), "{page}");
         }
     }
@@ -8246,7 +8454,7 @@ mod link_tests {
         assert!(links(&doc(&format!("<p><a href=\"{spaced}\">t</a></p>"))).is_empty());
         // A huge attribute is refused before any work on it.
         let huge = format!("{U}{}", "\t".repeat(3 * MAX_HREF));
-        assert!(link_of(&huge).is_none());
+        assert!(link_of(&huge, None).is_none());
         // A control character other than a tab or line break.
         for bad in [
             "https://x.test/a&#1;b",
@@ -11475,3 +11683,7 @@ mod table_1894_tests {
 #[cfg(test)]
 #[path = "html_tests_1898.rs"]
 mod tests_1898;
+
+#[cfg(test)]
+#[path = "html_tests_1912.rs"]
+mod tests_1912;

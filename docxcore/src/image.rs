@@ -272,10 +272,23 @@ fn inline_doc_pr(raw: &str) -> Option<(usize, usize)> {
 /// not an inline picture is `None`. Its `r:` prefix is the part root's, as
 /// the blip's `r:embed` is.
 pub fn with_click_link(raw: &str, rid: &str) -> Option<String> {
+    with_titled_click_link(raw, rid, None)
+}
+
+/// [`with_click_link`] with a ScreenTip (#1912): the `a:hlinkClick`'s
+/// `tooltip`, an HTML link's `title`, written after its `r:id` (so a title
+/// that spells an `r:id` is never read as the link's) and escaped for
+/// either quote, characters XML cannot hold dropped.
+pub fn with_titled_click_link(raw: &str, rid: &str, tooltip: Option<&str>) -> Option<String> {
     let (at, end) = inline_doc_pr(raw)?;
     let open = raw[at..end].strip_suffix('/')?;
+    let tip = tooltip.map_or(String::new(), |t| {
+        let mut v = String::new();
+        crate::serialize::esc_attr(t, &mut v);
+        format!(" tooltip=\"{}\"", v.replace('\'', "&apos;"))
+    });
     Some(format!(
-        "{}{open}><a:hlinkClick xmlns:a=\"{DRAWINGML_NS}\" r:id=\"{}\"/></wp:docPr>{}",
+        "{}{open}><a:hlinkClick xmlns:a=\"{DRAWINGML_NS}\" r:id=\"{}\"{tip}/></wp:docPr>{}",
         &raw[..at],
         crate::mermaid::xml_escape_attr(rid),
         &raw[end + 1..]
@@ -1219,6 +1232,33 @@ mod tests {
         let anchored = with_body("<a:hlinkClick r:id=\"rId7\"/>")
             .replace("<w:drawing>", "<w:drawing><wp:anchor/>");
         assert_eq!(inline_click_link(&anchored), None);
+    }
+
+    #[test]
+    fn a_titled_click_link_writes_its_tooltip_after_the_r_id_1912() {
+        let tip = "say \"hi\" r:id=\"evil\" r:id='bad' <x>&\u{1}";
+        let linked = with_titled_click_link(&picture(), "rIdL", Some(tip)).unwrap();
+        assert!(
+            linked.contains(&format!(
+                "<a:hlinkClick xmlns:a=\"{DRAWINGML_NS}\" r:id=\"rIdL\" \
+                 tooltip=\"say &quot;hi&quot; r:id=&quot;evil&quot; r:id=&apos;bad&apos; &lt;x&gt;&amp;\"/>"
+            )),
+            "{linked}"
+        );
+        // Nothing reads the title as the link's id.
+        assert_eq!(inline_click_link(&linked).as_deref(), Some("rIdL"));
+        let map: std::collections::HashMap<String, String> =
+            [("rIdL".to_string(), "rId9".to_string())].into();
+        let renamed = replace_click_link(&linked, &map).unwrap();
+        assert_eq!(
+            renamed,
+            with_titled_click_link(&picture(), "rId9", Some(tip)).unwrap()
+        );
+        // No title: the link of #1999.
+        assert_eq!(
+            with_titled_click_link(&picture(), "rIdL", None),
+            with_click_link(&picture(), "rIdL")
+        );
     }
 
     #[test]

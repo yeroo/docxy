@@ -3756,7 +3756,7 @@ fn encode_like(original: &[u8], text: &str) -> Vec<u8> {
 
 /// The `<w:style>` XML definition for one of the styles Markdown maps onto
 /// (`HeadingN` for `N` in `1..=6`, `Quote`, `SourceCode`, `Code`) or of Word's
-/// `Header`/`Footer`, or `None` for any other id. Shared by [`markdown_styles_xml`] (which defines the full
+/// `Header`/`Footer` or `Hyperlink` (#1912), or `None` for any other id. Shared by [`markdown_styles_xml`] (which defines the full
 /// set for a fresh markdown package) and [`Package::ensure_styles`] (which
 /// defines only the ids actually referenced, for an existing package), so the
 /// two can never drift apart.
@@ -3811,6 +3811,14 @@ fn markdown_style_def(id: &str) -> Option<String> {
              <w:tab w:val=\"right\" w:pos=\"9360\"/></w:tabs>\
              <w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr></w:style>",
             name = id.to_ascii_lowercase()
+        )),
+        // Word's built-in Hyperlink character style (#1912): what an
+        // imported HTML link's text takes, with its look also set directly.
+        "Hyperlink" => Some(format!(
+            "<w:style w:type=\"character\" w:styleId=\"Hyperlink\">\
+             <w:name w:val=\"Hyperlink\"/><w:uiPriority w:val=\"99\"/><w:unhideWhenUsed/>\
+             <w:rPr><w:color w:val=\"{}\"/><w:u w:val=\"single\"/></w:rPr></w:style>",
+            crate::editor::LINK_COLOR
         )),
         _ => None,
     }
@@ -4583,6 +4591,7 @@ fn markdown_styles_xml() -> String {
     let quote = markdown_style_def("Quote").unwrap();
     let source_code = markdown_style_def("SourceCode").unwrap();
     let code = markdown_style_def("Code").unwrap();
+    let hyperlink = markdown_style_def("Hyperlink").unwrap();
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
          <w:styles xmlns:w=\"{W}\">\
@@ -4598,6 +4607,7 @@ fn markdown_styles_xml() -> String {
          {quote}\
          {source_code}\
          {code}\
+         {hyperlink}\
          </w:styles>"
     )
 }
@@ -6855,6 +6865,27 @@ mod tests {
         );
         // Quote, genuinely absent, was appended.
         assert!(styles.contains("w:styleId=\"Quote\""), "{styles}");
+    }
+
+    #[test]
+    fn the_hyperlink_style_is_a_markdown_style_1912() {
+        // A fresh Markdown package defines it, as HTML import's links use it.
+        let pkg = new_markdown_package(Document { body: vec![] });
+        let styles = pkg.part_text("word/styles.xml").unwrap();
+        let def = markdown_style_def("Hyperlink").unwrap();
+        assert!(styles.contains(&def), "{styles}");
+        assert!(def.contains("w:type=\"character\""), "{def}");
+        // And `ensure_styles` adds it to a package without it, once.
+        let mut pkg = new_package(Document { body: vec![] });
+        pkg.set_part(
+            "word/styles.xml",
+            br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"></w:styles>"#
+                .to_vec(),
+        );
+        pkg.ensure_styles(&["Hyperlink"]);
+        pkg.ensure_styles(&["Hyperlink"]);
+        let styles = pkg.part_text("word/styles.xml").unwrap();
+        assert_eq!(styles.matches(&def).count(), 1, "{styles}");
     }
 
     fn styled_table_doc(style: Option<&str>) -> Document {
