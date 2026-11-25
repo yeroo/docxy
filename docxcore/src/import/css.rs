@@ -1116,6 +1116,11 @@ impl StyleSheet {
 /// (`None` for the unnamed page) and where its block opens. `None` for any
 /// other at-rule, a page selector (`:first`, `name:left`), a prelude of
 /// more than one name, or a rule with no block: those are skipped.
+///
+/// The prelude is read only up to the first `;`, `{`, `}` or quote, all of
+/// which [`skip_at_rule`] passes when it is not a page rule: the bytes read
+/// here are never read again by the next rule's scan, so a sheet of `@page;`
+/// statements stays linear (#1944 r1).
 fn page_rule_at(b: &[u8], at: usize) -> Option<(Option<String>, usize)> {
     let word = b.get(at + 1..at + 5)?;
     if !word.eq_ignore_ascii_case(b"page") {
@@ -1125,7 +1130,10 @@ fn page_rule_at(b: &[u8], at: usize) -> Option<(Option<String>, usize)> {
     if !(next.is_ascii_whitespace() || next == b'{') {
         return None;
     }
-    let open = find_unquoted(b, at + 5, b'{')?;
+    let open = (at + 5..b.len()).find(|&i| matches!(b[i], b';' | b'{' | b'}' | b'"' | b'\''))?;
+    if b[open] != b'{' {
+        return None;
+    }
     let prelude = std::str::from_utf8(&b[at + 5..open]).ok()?.trim();
     if prelude.is_empty() {
         return Some((None, open));
@@ -2757,6 +2765,32 @@ mod tests {
         // At most `MAX_PAGE_RULES`.
         let many = "@page {margin:1in} ".repeat(MAX_PAGE_RULES + 5);
         assert_eq!(StyleSheet::parse(&many, &b).pages.len(), MAX_PAGE_RULES);
+    }
+
+    #[test]
+    fn a_page_rule_s_prelude_ends_at_its_statement_1944() {
+        let at = |css: &str| page_rule_at(css.as_bytes(), 0);
+        assert_eq!(at("@page {}"), Some((None, 6)));
+        assert_eq!(at("@page  N\t{}"), Some((Some("N".to_string()), 9)));
+        // The prelude stops at a `;`, `}` or quote: no page rule, so the
+        // sheet goes on from the statement's end, never scanning to the
+        // next `{` further on (r1: quadratic over many `@page;`).
+        for css in [
+            "@page x; p {}",
+            "@page a } b {",
+            "@page ; p {}",
+            "@page 'a' {",
+            "@page x",
+        ] {
+            assert_eq!(at(css), None, "{css}");
+        }
+        let b = budget();
+        assert_eq!(StyleSheet::parse("@page x; p {color:red}", &b).len(), 1);
+        // A sheet of many such statements parses in linear time.
+        let many = "@page x;".repeat(100_000) + " p {color:red}";
+        let sheet = StyleSheet::parse(&many, &b);
+        assert!(sheet.pages.is_empty());
+        assert_eq!(sheet.len(), 1);
     }
 
     #[test]

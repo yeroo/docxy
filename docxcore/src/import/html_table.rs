@@ -378,14 +378,15 @@ impl Default for CellSpec {
 
 /// A fixed-width block with both side margins `auto` inside a cell
 /// (#1930): centred in the cell's inner width once [`layout`] knows it, as
-/// one in the body is centred in [`BODY_TWIPS`] while it is read (#1922).
+/// one in the body is centred in the page's body ([`Page::body`], #1944)
+/// while it is read (#1922).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CellBox {
     /// Its content width, in twips.
     pub width: i32,
     /// The look's indents with its own margins, border and padding in, the
     /// enclosing boxes' centring not yet: what the body-level branch takes
-    /// from [`BODY_TWIPS`] with the width.
+    /// from the page's body ([`Page::body`], #1944) with the width.
     pub indent: i32,
     pub indent_right: i32,
 }
@@ -440,7 +441,8 @@ impl RawCell {
 
 /// Centre the paragraphs `boxes` name in `blocks` in `inner` twips (#1930):
 /// each box in the room its enclosing ones' centring leaves, as the body
-/// does in [`BODY_TWIPS`] (#1922). A box wider than its room gets nothing.
+/// does in the page's body ([`Page::body`], #1944; #1922). A box wider than
+/// its room gets nothing.
 fn centre_in_cell(blocks: &mut [Block], boxes: Vec<(usize, CellCentring)>, inner: u32) {
     let clamp = |v: i64| v.clamp(-i64::from(MAX_TWIPS), i64::from(MAX_TWIPS));
     for (at, c) in boxes {
