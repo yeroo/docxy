@@ -388,12 +388,13 @@ pub struct Scope<'a> {
 }
 
 /// One inline picture as the view drew it (#1926): its frame (px) and the
-/// corner radius its crop shape gave the image's clip.
+/// corner radii its crop shape gave the image's clip, top left, top right,
+/// bottom right, bottom left (#1936).
 #[derive(Clone, Debug, PartialEq)]
 pub struct DrawnPicture {
     pub width: f32,
     pub height: f32,
-    pub radius: f32,
+    pub corners: [f32; 4],
     pub shape: docxcore::image::PictureShape,
     /// The Alt Text drawn inside its frame (#1898), if any.
     pub alt: Option<String>,
@@ -403,31 +404,16 @@ pub struct DrawnPicture {
 /// (#1926); cleared at the frame's start, like the painted tables.
 pub type DrawnPictures = Rc<RefCell<Vec<DrawnPicture>>>;
 
-/// The corner radius (px) a picture of `w` x `h` px is clipped to by its
-/// crop `shape` (#1926): an ellipse is drawn as corners of half the
-/// shorter side (gpui's corners are circular, so a non-square oval is a
-/// stadium), a rounded rectangle as `min(w, h) * adj / 100000`, at most
-/// that half; a rectangle is 0.
-pub fn picture_radius(shape: docxcore::image::PictureShape, w: f32, h: f32) -> f32 {
-    use docxcore::image::{PictureShape, ROUND_RECT_MAX_ADJ};
-    let half = w.min(h).max(0.0) / 2.0;
-    match shape {
-        PictureShape::Rect => 0.0,
-        PictureShape::Ellipse => half,
-        PictureShape::RoundRect { adj } => {
-            let adj = adj.min(ROUND_RECT_MAX_ADJ) as f32;
-            (w.min(h).max(0.0) * adj / 100_000.0).min(half)
-        }
-    }
-}
-
 /// The harness's view of [`DrawnPictures`] (#1926): each picture's
-/// `width`, `height` and clip `radius` in px (to 0.1), its `shape`
-/// (`rect`, `ellipse`, `roundRect`) and `round`, whether its clip is a
-/// circle's or a stadium's (the radius is half the shorter side), and the
+/// `width`, `height` and clip `radius` in px (to 0.1; its largest corner,
+/// #1936) and its `corners` (top left, top right, bottom right, bottom
+/// left), its `shape` (`rect`, `ellipse`, `roundRect`, `round1Rect`,
+/// `round2SameRect`, `round2DiagRect`) and `round`, whether its clip is a
+/// circle's or a stadium's (every corner half the shorter side), and the
 /// `alt` text drawn in its frame (#1898), else null.
 pub fn drawn_pictures_json(drawn: &DrawnPictures) -> ctlcore::json::Json {
     use ctlcore::json::Json;
+    use docxcore::image::PictureShape;
     let tenth = |v: f32| Json::Num((f64::from(v) * 10.0).round() / 10.0);
     Json::Arr(
         drawn
@@ -435,19 +421,26 @@ pub fn drawn_pictures_json(drawn: &DrawnPictures) -> ctlcore::json::Json {
             .iter()
             .map(|p| {
                 let shape = match p.shape {
-                    docxcore::image::PictureShape::Rect => "rect",
-                    docxcore::image::PictureShape::Ellipse => "ellipse",
-                    docxcore::image::PictureShape::RoundRect { .. } => "roundRect",
+                    PictureShape::Rect => "rect",
+                    PictureShape::Ellipse => "ellipse",
+                    PictureShape::RoundRect { .. } => "roundRect",
+                    PictureShape::Round1 { .. } => "round1Rect",
+                    PictureShape::Round2Same { .. } => "round2SameRect",
+                    PictureShape::Round2Diag { .. } => "round2DiagRect",
                 };
+                let radius = p.corners.iter().copied().fold(0.0f32, f32::max);
+                let half = p.width.min(p.height) - 0.1;
+                let round = p.corners.iter().all(|&r| r > 0.0 && r * 2.0 >= half);
                 Json::obj(vec![
                     ("width", tenth(p.width)),
                     ("height", tenth(p.height)),
-                    ("radius", tenth(p.radius)),
-                    ("shape", Json::Str(shape.into())),
+                    ("radius", tenth(radius)),
                     (
-                        "round",
-                        Json::Bool(p.radius > 0.0 && p.radius * 2.0 >= p.width.min(p.height) - 0.1),
+                        "corners",
+                        Json::Arr(p.corners.iter().map(|&r| tenth(r)).collect()),
                     ),
+                    ("shape", Json::Str(shape.into())),
+                    ("round", Json::Bool(round)),
                     ("alt", p.alt.clone().map_or(Json::Null, Json::Str)),
                 ])
             })
@@ -1017,32 +1010,28 @@ mod tests {
     }
 
     #[test]
-    fn a_crop_shape_is_a_clip_radius() {
-        use docxcore::image::PictureShape::{Ellipse, Rect, RoundRect};
-        assert_eq!(picture_radius(Rect, 32.0, 32.0), 0.0);
-        assert_eq!(picture_radius(Ellipse, 32.0, 32.0), 16.0);
-        // A non-square oval: a stadium, half the shorter side.
-        assert_eq!(picture_radius(Ellipse, 120.0, 40.0), 20.0);
-        assert_eq!(picture_radius(RoundRect { adj: 20_000 }, 120.0, 40.0), 8.0);
-        assert_eq!(picture_radius(RoundRect { adj: 0 }, 120.0, 40.0), 0.0);
-        // Never past half the shorter side, whatever the adj.
-        assert_eq!(picture_radius(RoundRect { adj: 50_000 }, 120.0, 40.0), 20.0);
-        assert_eq!(picture_radius(RoundRect { adj: 90_000 }, 120.0, 40.0), 20.0);
-    }
-
-    #[test]
     fn drawn_pictures_read_as_the_harness_reports_them() {
-        use docxcore::image::PictureShape::{Ellipse, Rect, RoundRect};
+        use docxcore::image::PictureShape::{Ellipse, Rect, Round2Same, RoundRect};
         let drawn = DrawnPictures::default();
         for (shape, w, h) in [
             (Ellipse, 32.0, 32.0),
             (RoundRect { adj: 20_000 }, 120.04, 40.0),
             (Rect, 200.0, 100.0),
+            // A non-square oval: a stadium, half the shorter side.
+            (Ellipse, 120.0, 40.0),
+            (
+                Round2Same {
+                    adj1: 20_000,
+                    adj2: 0,
+                },
+                120.0,
+                40.0,
+            ),
         ] {
             drawn.borrow_mut().push(DrawnPicture {
                 width: w,
                 height: h,
-                radius: picture_radius(shape, w, h),
+                corners: shape.corner_radii(w, h),
                 shape,
                 alt: (shape == Rect).then(|| "Logo".to_string()),
             });
@@ -1050,9 +1039,11 @@ mod tests {
         let json = drawn_pictures_json(&drawn).to_string();
         assert_eq!(
             json,
-            "[{\"width\":32,\"height\":32,\"radius\":16,\"shape\":\"ellipse\",\"round\":true,\"alt\":null},\
-             {\"width\":120,\"height\":40,\"radius\":8,\"shape\":\"roundRect\",\"round\":false,\"alt\":null},\
-             {\"width\":200,\"height\":100,\"radius\":0,\"shape\":\"rect\",\"round\":false,\"alt\":\"Logo\"}]"
+            "[{\"width\":32,\"height\":32,\"radius\":16,\"corners\":[16,16,16,16],\"shape\":\"ellipse\",\"round\":true,\"alt\":null},\
+             {\"width\":120,\"height\":40,\"radius\":8,\"corners\":[8,8,8,8],\"shape\":\"roundRect\",\"round\":false,\"alt\":null},\
+             {\"width\":200,\"height\":100,\"radius\":0,\"corners\":[0,0,0,0],\"shape\":\"rect\",\"round\":false,\"alt\":\"Logo\"},\
+             {\"width\":120,\"height\":40,\"radius\":20,\"corners\":[20,20,20,20],\"shape\":\"ellipse\",\"round\":true,\"alt\":null},\
+             {\"width\":120,\"height\":40,\"radius\":8,\"corners\":[8,8,0,0],\"shape\":\"round2SameRect\",\"round\":false,\"alt\":null}]"
         );
     }
 
