@@ -120,6 +120,10 @@ pub struct HtmlImport {
     pub media: Vec<ImportedMedia>,
     /// The pictures' click links (`a:hlinkClick`), by import-local rid.
     pub links: Vec<ImportedLink>,
+    /// The page's colour (#1894), `RRGGBB`: the `html` element's
+    /// background, else the `body`'s (`bgcolor` or CSS); none when white.
+    /// [`HtmlImport::package`] writes it as Word's page colour.
+    pub page_color: Option<String>,
 }
 
 impl HtmlImport {
@@ -136,8 +140,15 @@ impl HtmlImport {
             mut document,
             media,
             links,
+            page_color,
         } = self;
         let mut pkg = crate::package::new_markdown_package(Document::default());
+        if let Some(color) = page_color.and_then(|c| u32::from_str_radix(&c, 16).ok()) {
+            pkg.set_page_background(Some(&crate::page_bg::PageBackground {
+                color,
+                gradient: None,
+            }));
+        }
         let mut rids = std::collections::HashMap::new();
         for m in media {
             if let Some(rid) = pkg.add_part_media(
@@ -252,6 +263,12 @@ fn import_decoded(
         return Err("the HTML file holds no text".into());
     }
     let (media, links) = h.images.take().map(Images::into_parts).unwrap_or_default();
+    // The root's background is the canvas's, else the body's (#1894).
+    let [root, body] = std::mem::take(&mut h.page_fill);
+    let page_color = root
+        .flatten()
+        .or(body.flatten())
+        .filter(|c| !c.eq_ignore_ascii_case("FFFFFF"));
     let props = h.flow_end_props();
     let mut doc = h.out.finish(props);
     // The items' indents are the ones computed here (#2231).
@@ -265,6 +282,7 @@ fn import_decoded(
         document: doc,
         media,
         links,
+        page_color,
     })
 }
 
@@ -557,10 +575,23 @@ struct Look {
     /// A cell's or table part's own background (`RRGGBB`, not inherited):
     /// the cell shading (#1878).
     own_fill: Option<String>,
-    /// A table's, cell's or image's own `width` (not inherited).
+    /// A table's, cell's, `colgroup`'s or image's own `width` (not
+    /// inherited).
     own_width: Option<Width>,
-    /// An image's own `height` (not inherited; only `img` reads one).
+    /// An image's, row's or cell's own `height` (not inherited; a row's
+    /// and cell's in twips only, #1894).
     own_height: Option<Width>,
+    /// A table's own `max-width` (not inherited, #1894).
+    own_max_width: Option<Width>,
+    /// A table's or cell's own border lines (not inherited, #1894), top,
+    /// right, bottom, left: its `tblBorders` / `tcBorders`.
+    own_frame: [Option<ParBorder>; 4],
+    /// A table's computed top and left border colours (not inherited,
+    /// #1894): what its cells' `border` / `rules` lines inherit, `None`
+    /// when transparent, `Some(None)` automatic.
+    own_rule_ink: [Option<Option<u32>>; 2],
+    /// `border-collapse: collapse` (inherited, #1894; `rules` is its hint).
+    collapse: bool,
     /// An image's own `border-radius` (not inherited, #1926): the crop
     /// shape of its picture. Only `img` reads one.
     own_radius: Option<html_image::Radius>,
@@ -769,6 +800,10 @@ struct Attrs {
     height: Option<String>,
     href: Option<String>,
     dir: Option<String>,
+    frame: Option<String>,
+    rules: Option<String>,
+    bordercolor: Option<String>,
+    span: Option<String>,
 }
 
 /// One element's style, being computed: its look so far, and the box
@@ -837,6 +872,21 @@ struct Cascade {
     break_after: Option<bool>,
     /// Its own border, top, right, bottom, left (#1883).
     border: [css::BorderSide; 4],
+    /// The element is a `th` (#1894): centred unless it or an ancestor
+    /// says otherwise.
+    is_th: bool,
+    /// The element is a `tr`: what reads `height` as its row's (#1894).
+    is_row: bool,
+    /// The element is a `colgroup`: what reads `width` (#1894).
+    is_colgroup: bool,
+    /// The element is `html` or `body`: its background is the page's
+    /// (#1894).
+    is_page: bool,
+    /// Its own `align` or `text-align` set its alignment (#1894).
+    own_align: bool,
+    /// A block's own absolute `max-width` (#1894): it bounds the width its
+    /// auto margins centre.
+    block_max: Option<Len>,
 }
 
 /// A twips sum kept in Word's range.
@@ -978,6 +1028,25 @@ fn clears_background(v: &str) -> bool {
     )
 }
 
+/// A `col`'s or `colgroup`'s `span` (#1894): 1..=1000, 1 when absent or 0.
+fn span_attr(attrs: &Attrs) -> u32 {
+    attrs
+        .span
+        .as_deref()
+        .and_then(html_int)
+        .filter(|&n| n > 0)
+        .unwrap_or(1)
+        .min(1000)
+}
+
+/// A width in twips, if it is one.
+fn twips_of(w: Option<Width>) -> Option<u32> {
+    match w {
+        Some(Width::Twips(t)) => Some(t),
+        _ => None,
+    }
+}
+
 /// A `width` attribute: digits as px, `N%`, `Npx`; anything else none.
 fn width_attr(v: &str) -> Option<Width> {
     let (n, pct) = attr_length(v)?;
@@ -1034,15 +1103,69 @@ fn html_int(v: &str) -> Option<u32> {
     )
 }
 
+/// A `<table>`'s `border`, in px: a bare or unreadable one is 1, none 0.
+fn table_border_attr(attrs: &Attrs) -> u32 {
+    attrs
+        .border
+        .as_deref()
+        .map_or(0, |b| html_int(b).unwrap_or(1).min(1000))
+}
+
+/// The outer sides (top, right, bottom, left) a `frame` value draws
+/// (#1894); an unknown value is none.
+fn frame_sides(v: &str) -> Option<[bool; 4]> {
+    let (t, f) = (true, false);
+    Some(match v.trim().to_ascii_lowercase().as_str() {
+        "void" => [f, f, f, f],
+        "above" => [t, f, f, f],
+        "below" => [f, f, t, f],
+        "hsides" => [t, f, t, f],
+        "vsides" => [f, t, f, t],
+        "lhs" => [f, f, f, t],
+        "rhs" => [f, t, f, f],
+        "box" | "border" => [t, t, t, t],
+        _ => return None,
+    })
+}
+
+/// The lines between cells (between rows, between columns) a `rules`
+/// value draws (#1894); `groups` is drawn as `none`, an unknown value is
+/// none.
+fn rules_lines(v: &str) -> Option<[bool; 2]> {
+    Some(match v.trim().to_ascii_lowercase().as_str() {
+        "none" | "groups" => [false, false],
+        "rows" => [true, false],
+        "cols" => [false, true],
+        "all" => [true, true],
+        _ => return None,
+    })
+}
+
 /// A `<table>`'s spec from its attributes and computed look.
 fn table_spec(attrs: &Attrs, look: &Look) -> TableSpec {
+    // The cells' lines (#1894): `rules`, else all of them for a `border`
+    // above 0; 1 px, in the table's computed top and left colours.
+    let rules = attrs
+        .rules
+        .as_deref()
+        .and_then(rules_lines)
+        .unwrap_or([table_border_attr(attrs) > 0; 2]);
+    let inside = std::array::from_fn(|k| {
+        let color = look.own_rule_ink[k]?;
+        rules[k].then_some(ParBorder {
+            kind: BorderKind::Single,
+            sz: 6,
+            space: 0,
+            color,
+            theme: None,
+        })
+    });
     TableSpec {
         width: look.own_width,
-        // A bare or unreadable `border` is 1 px.
-        border: attrs
-            .border
-            .as_deref()
-            .map_or(0, |b| html_int(b).unwrap_or(1).min(1000)),
+        max_width: look.own_max_width,
+        outer: look.own_frame,
+        inside,
+        collapse: look.collapse,
         cellpadding: attrs
             .cellpadding
             .as_deref()
@@ -1101,6 +1224,9 @@ impl Cascade {
         look.own_fill = None;
         look.own_width = None;
         look.own_height = None;
+        look.own_max_width = None;
+        look.own_frame = [None; 4];
+        look.own_rule_ink = [Some(None); 2];
         look.own_radius = None;
         look.own_padding = [None; 4];
         look.own_place = None;
@@ -1155,6 +1281,12 @@ impl Cascade {
             break_before: None,
             break_after: None,
             border: Default::default(),
+            is_th: false,
+            is_row: false,
+            is_colgroup: false,
+            is_page: false,
+            own_align: false,
+            block_max: None,
         }
     }
 
@@ -1205,9 +1337,15 @@ impl Cascade {
         }
         self.is_img = tag == "img";
         self.is_br = tag == "br";
+        self.is_th = tag == "th";
+        self.is_row = tag == "tr";
+        self.is_colgroup = tag == "colgroup";
+        self.is_page = matches!(tag, "html" | "body");
         let run = &mut self.look.run;
         match tag {
-            "b" | "strong" => self.set_bold(true),
+            // A browser's `th { font-weight: bold }` (#1894); its centre
+            // waits for what the element itself says (`finish`).
+            "b" | "strong" | "th" => self.set_bold(true),
             "i" | "em" | "cite" | "dfn" | "var" => self.set_italic(true),
             "u" | "ins" => {
                 run.underline = true;
@@ -1283,6 +1421,7 @@ impl Cascade {
             if let Some(a) = attrs.align.as_deref().and_then(align_attr) {
                 self.look.align = Some(a);
                 self.look.align_logical = false;
+                self.own_align = true;
                 // `align` on these is `text-align: -webkit-*` (it also
                 // places block-level children, #1922); on a heading, `li`
                 // and the rest it is plain, which clears an inherited one.
@@ -1302,8 +1441,9 @@ impl Cascade {
                 self.margin_auto[1] = true;
                 self.margin_auto[3] = true;
             }
+            self.table_border_hints(attrs);
         }
-        if self.kind.table() {
+        if self.kind.table() || tag == "body" {
             if let Some(c) = attrs.bgcolor.as_deref().and_then(css::attr_color) {
                 self.background = Some(c);
             }
@@ -1313,9 +1453,16 @@ impl Cascade {
                 self.look.valign = Some(v);
             }
         }
-        if matches!(tag, "table" | "td" | "th") {
+        if matches!(tag, "table" | "td" | "th" | "colgroup") {
             if let Some(w) = attrs.width.as_deref().and_then(width_attr) {
                 self.look.own_width = Some(w);
+            }
+        }
+        // A row's or cell's `height` (#1894): digits or px; a percentage
+        // is none.
+        if self.is_row || self.kind == Kind::Cell {
+            if let Some(t) = attrs.height.as_deref().and_then(img_attr_twips) {
+                self.look.own_height = Some(Width::Twips(t.min(html_table::MAX_TWIPS)));
             }
         }
         if tag == "img" {
@@ -1361,7 +1508,9 @@ impl Cascade {
             "background" | "background-color" => {
                 if let Some(c) = css::background(v) {
                     self.background = Some(c);
-                } else if (self.kind.table() || self.card != CardMode::No) && clears_background(v) {
+                } else if (self.kind.table() || self.card != CardMode::No || self.is_page)
+                    && clears_background(v)
+                {
                     // A cell's `none` shows its row's or table's (#1878); a
                     // card candidate's is no card (#1927).
                     self.background = None;
@@ -1390,7 +1539,52 @@ impl Cascade {
                     }
                 }
             }
-            "width" if self.kind == Kind::Cell || is_table => {
+            // A row's or cell's height (#1894): an absolute length; a
+            // percentage or an invalid value leaves it, `auto` clears it.
+            "height" if self.is_row || self.kind == Kind::Cell => {
+                let h = v.trim();
+                if h.eq_ignore_ascii_case("auto") {
+                    self.look.own_height = None;
+                } else if let Some(len) = css::length(h).filter(|l| l.unit != css::Unit::Percent) {
+                    let pt = font_pt(&self.look.run);
+                    if let Some(t) = len.twips(pt).filter(|&t| t >= 0) {
+                        let t = (t as u32).min(html_table::MAX_TWIPS);
+                        self.look.own_height = Some(Width::Twips(t));
+                    }
+                }
+            }
+            // A table's `max-width` (#1894): a length or percentage; `none`
+            // clears it.
+            "max-width" if is_table => {
+                let m = v.trim();
+                if m.eq_ignore_ascii_case("none") {
+                    self.look.own_max_width = None;
+                } else if let Some(len) = css::length(m).filter(|l| l.v >= 0.0) {
+                    let pt = font_pt(&self.look.run);
+                    self.look.own_max_width = match len.unit {
+                        css::Unit::Percent => Some(Width::Pct(len.v)),
+                        _ => len.twips(pt).map(|t| Width::Twips(t.max(0) as u32)),
+                    };
+                }
+            }
+            // A block's (#1894): absolute only, resolved in its final font.
+            "max-width" if self.kind == Kind::Block => {
+                let m = v.trim();
+                if m.eq_ignore_ascii_case("none") {
+                    self.block_max = None;
+                } else if let Some(len) =
+                    css::length(m).filter(|l| l.v >= 0.0 && l.unit != css::Unit::Percent)
+                {
+                    self.block_max = Some(len);
+                }
+            }
+            // Inherited (#1894): a table's `tblCellSpacing` goes with it.
+            "border-collapse" => match v.trim().to_ascii_lowercase().as_str() {
+                "collapse" => self.look.collapse = true,
+                "separate" => self.look.collapse = false,
+                _ => {}
+            },
+            "width" if self.kind == Kind::Cell || is_table || self.is_colgroup => {
                 let w = v.trim();
                 if w.eq_ignore_ascii_case("auto") {
                     self.look.own_width = None;
@@ -1486,6 +1680,7 @@ impl Cascade {
             },
             "text-align" => {
                 if let Some(a) = align_value(v) {
+                    self.own_align = true;
                     self.look.align = Some(a);
                     self.look.align_logical =
                         matches!(v.trim().to_ascii_lowercase().as_str(), "start" | "end");
@@ -1645,6 +1840,47 @@ impl Cascade {
                 }
             }
         }
+    }
+
+    /// A `<table>`'s `border`, `frame`, `rules` and `bordercolor` as the
+    /// HTML Standard's presentational hints (#1894, measured in Chrome):
+    /// the outer sides `frame` names (all of them for a `border` above 0
+    /// alone, none for `rules` alone), as wide as `border` (1 px without
+    /// one), in `bordercolor` (else automatic), so CSS replaces them side
+    /// by side; any `rules` is `border-collapse: collapse`. The inside
+    /// lines are [`table_spec`]'s.
+    fn table_border_hints(&mut self, attrs: &Attrs) {
+        let border = table_border_attr(attrs);
+        let frame = attrs.frame.as_deref().and_then(frame_sides);
+        let rules = attrs.rules.as_deref().and_then(rules_lines);
+        let color = attrs.bordercolor.as_deref().and_then(css::attr_color);
+        let sides = frame.or_else(|| (border > 0).then_some([true; 4]));
+        if sides.is_some() || rules.is_some() || color.is_some() {
+            let color = color.map_or(css::BorderColor::Auto, css::BorderColor::Rgb);
+            for b in &mut self.border {
+                b.color = color.clone();
+            }
+        }
+        if let Some(sides) = sides {
+            let width = Len {
+                v: f64::from(border.max(1)),
+                unit: css::Unit::Px,
+            };
+            for (b, _) in self.border.iter_mut().zip(sides).filter(|(_, on)| *on) {
+                b.width = width;
+                b.style = css::BorderStyle::Solid;
+            }
+        }
+        if rules.is_some() {
+            self.look.collapse = true;
+        }
+    }
+
+    /// A table's or cell's own border lines (#1894): a block's drawn
+    /// sides, with no space (Word's table lines take none).
+    fn frame_lines(&self, pt: f64) -> [Option<ParBorder>; 4] {
+        self.own_borders(pt)
+            .map(|b| b.map(|b| ParBorder { space: 0, ..b }))
     }
 
     /// A `border…` declaration (#1883), `rest` its name past `border`:
@@ -1831,6 +2067,41 @@ impl Cascade {
         } else {
             [None; 4]
         };
+        // A table's and a cell's are its table lines (#1894), and a table's
+        // top and left colours are what its cells' lines inherit.
+        if self.kind == Kind::Cell || self.is_table {
+            self.look.own_frame = self.frame_lines(pt);
+        }
+        if self.is_table {
+            let ink = |b: &css::BorderSide| match &b.color {
+                css::BorderColor::Rgb(c) => Some(u32::from_str_radix(c, 16).ok()),
+                css::BorderColor::Current => Some(
+                    self.look
+                        .run
+                        .color
+                        .as_deref()
+                        .and_then(|c| u32::from_str_radix(c, 16).ok()),
+                ),
+                css::BorderColor::Auto => Some(None),
+                css::BorderColor::None => None,
+            };
+            self.look.own_rule_ink = [ink(&self.border[0]), ink(&self.border[3])];
+        }
+        // A `th`'s user-agent centre (Chrome's `-internal-center`, #1894):
+        // only over the start alignment it inherits, never over its own
+        // `align` / `text-align` or an inherited explicit one; it places no
+        // block-level child.
+        if self.is_th && !self.own_align {
+            let start = match self.look.align {
+                None => true,
+                Some(Align::Left) => self.look.align_logical,
+                Some(_) => false,
+            };
+            if start {
+                self.look.align = Some(Align::Center);
+                self.look.align_logical = false;
+            }
+        }
         let look = &mut self.look;
         if card {
             // A card is a cell (#1927): a fresh block look, as a `td`
@@ -1898,10 +2169,16 @@ impl Cascade {
                 // in the body (#1922): its content box, so its own padding
                 // (in the indents now) is outside the width.
                 // A percentage leaves the block as wide as its container.
+                // Its `max-width` bounds it, or is it with no width (#1894).
                 let width = self
                     .block_width
                     .filter(|l| l.unit != css::Unit::Percent)
                     .and_then(|l| l.twips(pt));
+                let max = self.block_max.and_then(|l| l.twips(pt));
+                let width = match (width, max) {
+                    (Some(w), Some(m)) => Some(w.min(m)),
+                    (w, m) => w.or(m),
+                };
                 if let Some(width) = width.filter(|_| self.margin_auto[1] && self.margin_auto[3]) {
                     if !look.in_cell {
                         let room = i64::from(html_table::BODY_TWIPS)
@@ -1975,6 +2252,10 @@ impl Cascade {
                 }
             }
             Kind::Container | Kind::Other => {
+                // The page colour (#1894): never a paragraph's shading.
+                if self.is_page {
+                    look.own_fill = self.background;
+                }
                 if self.is_img && look.own_block {
                     look.own_place = block_position(self.margin_auto, self.parent_block_align);
                 }
@@ -2256,6 +2537,9 @@ struct Html<'a> {
     root_kids: Kids,
     /// The serial the next element opened takes ([`Elem::serial`]).
     next_serial: u64,
+    /// The `html` and `body` elements' backgrounds (#1894), once each is
+    /// seen: the page colour.
+    page_fill: [Option<Option<String>>; 2],
 }
 
 impl<'a> Html<'a> {
@@ -2284,6 +2568,7 @@ impl<'a> Html<'a> {
             break_pending: false,
             root_kids: Kids::default(),
             next_serial: 0,
+            page_fill: [None, None],
         }
     }
 
@@ -2534,7 +2819,8 @@ impl<'a> Html<'a> {
             || (name == "br"
                 && self.visible()
                 && (!text.trim().is_empty() || self.sheet.may_match_tag("br")))
-            || (name == "img" && self.images.is_some() && self.image_in_view());
+            || (name == "img" && self.images.is_some() && self.image_in_view())
+            || (name == "col" && self.kept_table() && self.at_table_level());
         let read = (wanted && self.budget.scanned(text.len())).then(|| {
             let attrs = attrs_of(text);
             let key = self.key_of(name, &attrs, attrs_at);
@@ -2559,12 +2845,49 @@ impl<'a> Html<'a> {
                     self.image(attrs, key);
                 }
             }
+            // A table's column (#1894).
+            "col" if self.kept_table() && self.at_table_level() => {
+                if let Some((attrs, _)) = &read {
+                    let width = self.col_width(attrs);
+                    self.out.table_col(span_attr(attrs), width);
+                }
+            }
             _ => {}
         }
         // An element child of what is open all the same (#1883).
         let serial = self.take_serial();
         let key = read.map(|(_, key)| key).unwrap_or_default();
         self.add_child(serial, &key);
+    }
+
+    /// A `col`'s width (#1894): its inline `width` (its look is never
+    /// computed, so a style sheet's is not read), else its attribute.
+    fn col_width(&self, attrs: &Attrs) -> Option<Width> {
+        let pt = self
+            .elems
+            .last()
+            .map_or(css::BASE_PT, |e| font_pt(&e.look.run));
+        let decls = attrs
+            .style
+            .as_deref()
+            .map(css::parse_declarations)
+            .unwrap_or_default();
+        let mut width = None;
+        for important in [false, true] {
+            for d in decls.iter().filter(|d| d.important == important) {
+                if !d.name.eq_ignore_ascii_case("width") {
+                    continue;
+                }
+                let Some(len) = css::length(d.value.trim()).filter(|l| l.v >= 0.0) else {
+                    continue;
+                };
+                width = match len.unit {
+                    css::Unit::Percent => Some(Width::Pct(len.v)),
+                    _ => len.twips(pt).map(|t| Width::Twips(t.max(0) as u32)),
+                };
+            }
+        }
+        width.or_else(|| attrs.width.as_deref().and_then(width_attr))
     }
 
     /// Open an element that holds content.
@@ -2800,8 +3123,38 @@ impl<'a> Html<'a> {
                 let spec = self.cell_spec(&attrs, pushed);
                 self.out.begin_cell(spec);
             }
+            // A table's columns (#1894): its width, CSS over the attribute.
+            "colgroup" if self.kept_table() && self.at_table_level() => {
+                let width = match self.elems.last().filter(|_| pushed) {
+                    Some(e) => e.look.own_width,
+                    None => attrs.width.as_deref().and_then(width_attr),
+                };
+                self.out.begin_colgroup(span_attr(&attrs), width);
+            }
+            // The page colour (#1894): the first `html` and `body`'s.
+            "html" | "body" => {
+                let slot = &mut self.page_fill[usize::from(name == "body")];
+                if slot.is_none() {
+                    *slot = Some(
+                        self.elems
+                            .last()
+                            .filter(|_| pushed)
+                            .and_then(|e| e.look.own_fill.clone()),
+                    );
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Whether the innermost open table part is a `table` itself, not a
+    /// cell or row (#1894): a `col` or `colgroup` only counts there.
+    fn at_table_level(&self) -> bool {
+        self.elems
+            .iter()
+            .rev()
+            .find(|e| e.kind.table())
+            .is_some_and(|e| e.key.tag == "table")
     }
 
     /// The spec of the cell just opened (on top of `elems` when `pushed`):
@@ -2833,7 +3186,19 @@ impl<'a> Html<'a> {
                 spec.valign = e.look.valign.unwrap_or_default();
                 spec.padding = e.look.own_padding;
                 spec.fill = e.look.own_fill.clone();
+                spec.borders = e.look.own_frame;
+                spec.height = twips_of(e.look.own_height);
                 below -= 1;
+            }
+        }
+        // Its row's height (#1894).
+        for e in self.elems[..below].iter().rev() {
+            if e.kind == Kind::Cell || e.key.tag == "table" {
+                break;
+            }
+            if e.key.tag == "tr" {
+                spec.row_height = twips_of(e.look.own_height);
+                break;
             }
         }
         // Else the nearest fill of its row, row group or table.
@@ -3130,6 +3495,11 @@ impl<'a> Html<'a> {
                     self.reset_para();
                 }
             }
+            "colgroup" => {
+                if self.kept_table() && self.at_table_level() {
+                    self.out.end_colgroup();
+                }
+            }
             "table" => {
                 if self.table_depth > 0 {
                     if self.kept_table() {
@@ -3253,7 +3623,6 @@ impl<'a> Html<'a> {
         let look = &e.look;
         let table = TableSpec {
             width: Some(look.own_width.unwrap_or(Width::Pct(100.0))),
-            border: 0,
             cellpadding: Some(0),
             cellspacing: None,
             room: None,
@@ -3262,6 +3631,7 @@ impl<'a> Html<'a> {
                 Some(Align::Right) => Some("right"),
                 _ => None,
             },
+            ..TableSpec::default()
         };
         let cell = CellSpec {
             fill: look.own_fill.clone(),
@@ -4154,6 +4524,10 @@ fn attrs_of(attrs: &str) -> Attrs {
             "height" => Some(&mut out.height),
             "href" => Some(&mut out.href),
             "dir" => Some(&mut out.dir),
+            "frame" => Some(&mut out.frame),
+            "rules" => Some(&mut out.rules),
+            "bordercolor" => Some(&mut out.bordercolor),
+            "span" => Some(&mut out.span),
             _ => None,
         };
         if let Some(slot) = slot.filter(|s| s.is_none()) {
@@ -7070,11 +7444,22 @@ mod image_tests {
 
     #[test]
     fn height_still_means_nothing_on_a_table() {
-        let page =
-            "<table height=40><tr height=30><td height=20 style='height:9px'>x</td></tr></table>";
+        let page = "<table height=40><tr><td>x</td></tr></table>";
         let (with, _, _) = with_images(page);
         let plain = import_html(page.replace("height", "data-h").as_bytes()).unwrap();
         assert_eq!(with, plain);
+        // A row's and a cell's are its row's height since #1894: the
+        // tallest, the cell's CSS over its attribute.
+        let page =
+            "<table height=40><tr height=30><td height=20 style='height:9px'>x</td></tr></table>";
+        let (with, _, _) = with_images(page);
+        let Some(DocBlock::Table(t)) = with.body.first() else {
+            panic!("{with:?}")
+        };
+        assert_eq!(
+            t.rows[0].raw_props,
+            ["<w:trPr><w:trHeight w:val=\"450\" w:hRule=\"atLeast\"/></w:trPr>"]
+        );
     }
 
     #[test]
@@ -9989,5 +10374,678 @@ mod batch_2114_tests {
         assert_eq!(inner.grid.iter().sum::<u32>(), 9000);
         assert!(tblpr(inner).contains("w:type=\"pct\""));
         assert!(!tblpr(inner).contains("w:tblInd"));
+    }
+}
+
+/// Table borders, row heights, columns, `max-width`, `th` and the page
+/// colour (#1894).
+#[cfg(test)]
+mod table_1894_tests {
+    use super::*;
+    use crate::model::{Block as DocBlock, Table};
+
+    fn doc(html: &str) -> Document {
+        import_html(html.as_bytes()).unwrap()
+    }
+
+    fn tables(blocks: &[DocBlock]) -> Vec<&Table> {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                DocBlock::Table(t) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn first(d: &Document) -> Table {
+        tables(&d.body)
+            .first()
+            .copied()
+            .cloned()
+            .unwrap_or_else(|| panic!("no table: {:?}", d.body))
+    }
+
+    fn table(html: &str) -> Table {
+        first(&doc(html))
+    }
+
+    fn tcpr(t: &Table, row: usize, cell: usize) -> &str {
+        t.rows[row].cells[cell].raw_tcpr.as_deref().unwrap_or("")
+    }
+
+    fn tblpr(t: &Table) -> &str {
+        t.raw_tblpr.as_deref().unwrap_or("")
+    }
+
+    /// One border element as written.
+    fn line(edge: &str, val: &str, sz: u32, color: &str) -> String {
+        format!("<w:{edge} w:val=\"{val}\" w:sz=\"{sz}\" w:space=\"0\" w:color=\"{color}\"/>")
+    }
+
+    /// The `tblBorders` of `t`, without its tags; empty with none.
+    fn tbl_borders(t: &Table) -> String {
+        let pr = tblpr(t);
+        match (pr.find("<w:tblBorders>"), pr.find("</w:tblBorders>")) {
+            (Some(a), Some(b)) => pr[a + "<w:tblBorders>".len()..b].to_string(),
+            _ => String::new(),
+        }
+    }
+
+    fn tc_borders(t: &Table, row: usize, cell: usize) -> String {
+        let pr = tcpr(t, row, cell);
+        match (pr.find("<w:tcBorders>"), pr.find("</w:tcBorders>")) {
+            (Some(a), Some(b)) => pr[a + "<w:tcBorders>".len()..b].to_string(),
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn css_borders_on_cells_are_tc_borders_1894() {
+        let t =
+            table("<table><tr><td style=\"border-bottom:1px solid #eeeeee\">a</td></tr></table>");
+        assert_eq!(
+            tcpr(&t, 0, 0),
+            format!(
+                "<w:tcPr><w:tcW w:w=\"11790\" w:type=\"dxa\"/><w:tcBorders>{}</w:tcBorders>\
+                 <w:vAlign w:val=\"center\"/></w:tcPr>",
+                line("bottom", "single", 6, "EEEEEE")
+            )
+        );
+        // Schema order beside gridSpan, shd and tcMar; longhands; a kind of
+        // its own; currentColor is the cell's text colour.
+        let t = table(
+            "<table><tr><td colspan=2 bgcolor=red style=\"padding:2px;border-top-style:dashed;\
+             border-top-width:2px;border-top-color:#00ff00;color:#112233;border-left:3px double\">a\
+             </td></tr><tr><td>b</td><td>c</td></tr></table>",
+        );
+        let pr = tcpr(&t, 0, 0);
+        let borders = format!(
+            "<w:tcBorders>{}{}</w:tcBorders>",
+            line("top", "dashed", 12, "00FF00"),
+            line("left", "double", 18, "112233")
+        );
+        let span = pr.find("<w:gridSpan").unwrap();
+        let at = pr.find(&borders).unwrap_or_else(|| panic!("{pr}"));
+        let shd = pr.find("<w:shd").unwrap();
+        let mar = pr.find("<w:tcMar").unwrap();
+        assert!(span < at && at < shd && shd < mar, "{pr}");
+        // A dotted line; transparent and zero-alpha ones draw nothing.
+        let t = table(
+            "<table><tr><td style=\"border-right:1px dotted #000;border-top:1px solid \
+             transparent;border-bottom:1px solid rgba(0,0,0,0)\">a</td></tr></table>",
+        );
+        assert_eq!(tc_borders(&t, 0, 0), line("right", "dotted", 6, "000000"));
+        // A style sheet's rules, descendant selectors too.
+        let t = table(
+            "<style>.row td { border-top: 2px dashed red } td.x { border-bottom: 1px solid blue }\
+             </style><table><tr class=row><td>a</td></tr><tr><td class=x>b</td></tr></table>",
+        );
+        assert_eq!(tc_borders(&t, 0, 0), line("top", "dashed", 12, "FF0000"));
+        assert_eq!(tc_borders(&t, 1, 0), line("bottom", "single", 6, "0000FF"));
+    }
+
+    #[test]
+    fn a_none_cell_side_never_erases_the_frame_1894() {
+        let t = table(
+            "<style>td { border: 0 }</style><table style=\"border:1px solid #ddd\">\
+             <tr><td>a</td><td style=\"border-left:none\">b</td></tr></table>",
+        );
+        assert_eq!(
+            tbl_borders(&t),
+            ["top", "left", "bottom", "right"]
+                .map(|e| line(e, "single", 6, "DDDDDD"))
+                .concat()
+        );
+        for c in 0..2 {
+            assert!(!tcpr(&t, 0, c).contains("tcBorders"), "{}", tcpr(&t, 0, c));
+        }
+        // A `border=1` table's inside lines stay under a cell's `none`.
+        let t =
+            table("<table border=1><tr><td style=\"border:none\">a</td><td>b</td></tr></table>");
+        assert!(tbl_borders(&t).contains("<w:insideV "), "{}", tblpr(&t));
+        assert!(!tcpr(&t, 0, 0).contains("tcBorders"));
+    }
+
+    #[test]
+    fn edge_cells_lose_to_a_wider_table_frame_1894() {
+        let rows = "<tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr>";
+        let t = table(&format!(
+            "<style>table {{ border: 2px solid #333 }} td {{ border-bottom: 1px solid #eee }}\
+             </style><table>{rows}</table>"
+        ));
+        let bottom = line("bottom", "single", 6, "EEEEEE");
+        assert_eq!(tc_borders(&t, 0, 0), bottom);
+        assert_eq!(tc_borders(&t, 0, 1), bottom);
+        assert_eq!(tc_borders(&t, 1, 0), "");
+        assert_eq!(tc_borders(&t, 1, 1), "");
+        // A cell as wide wins (CSS collapse: a cell wins a tie), and a wider one.
+        let t = table(&format!(
+            "<style>table {{ border: 1px solid #333 }} td {{ border: 1px solid #eee }}\
+             td.w {{ border-right: 3px solid #eee }}</style><table>{}</table>",
+            "<tr><td>a</td><td class=w>b</td></tr>"
+        ));
+        assert_eq!(
+            tc_borders(&t, 0, 0),
+            ["top", "left", "bottom", "right"]
+                .map(|e| line(e, "single", 6, "EEEEEE"))
+                .concat()
+        );
+        assert!(tc_borders(&t, 0, 1).contains(&line("right", "single", 18, "EEEEEE")));
+        // Where the table draws no line, a cell's own is kept on its edge.
+        let t = table(&format!(
+            "<style>table {{ border-bottom: 2px solid #333 }} td {{ border-top: 1px solid #eee }}\
+             </style><table>{rows}</table>"
+        ));
+        assert_eq!(tc_borders(&t, 0, 0), line("top", "single", 6, "EEEEEE"));
+        // Cells spaced apart keep theirs: Word draws both.
+        let t = table(&format!(
+            "<style>table {{ border: 2px solid #333 }} td {{ border-bottom: 1px solid #eee }}\
+             </style><table cellspacing=4>{rows}</table>"
+        ));
+        assert_eq!(tc_borders(&t, 1, 0), bottom);
+    }
+
+    #[test]
+    fn rowspan_cell_borders_are_drawn_once_1894() {
+        let t = table(
+            "<table><tr><td rowspan=2 style=\"border:1px solid red\">a</td><td>b</td></tr>\
+             <tr><td>c</td></tr><tr><td>d</td><td>e</td></tr></table>",
+        );
+        let red = |e| line(e, "single", 6, "FF0000");
+        assert_eq!(
+            tc_borders(&t, 0, 0),
+            [red("top"), red("left"), red("right")].concat()
+        );
+        assert!(tcpr(&t, 1, 0).contains("<w:vMerge/>"));
+        assert_eq!(
+            tc_borders(&t, 1, 0),
+            [red("left"), red("bottom"), red("right")].concat()
+        );
+        assert_eq!(tc_borders(&t, 2, 0), "");
+    }
+
+    #[test]
+    fn css_table_border_is_outer_tbl_borders_1894() {
+        let t = table("<table style=\"border:2px solid #333\"><tr><td>a</td></tr></table>");
+        assert_eq!(
+            tbl_borders(&t),
+            ["top", "left", "bottom", "right"]
+                .map(|e| line(e, "single", 12, "333333"))
+                .concat()
+        );
+        // With `border=1`: CSS replaces the sides it declares; the inside
+        // lines stay, in the table's computed top colour across rows.
+        let t = table(
+            "<table border=1 style=\"border-top:3px dotted #333\"><tr><td>a</td></tr></table>",
+        );
+        assert_eq!(
+            tbl_borders(&t),
+            [
+                line("top", "dotted", 18, "333333"),
+                line("left", "single", 6, "auto"),
+                line("bottom", "single", 6, "auto"),
+                line("right", "single", 6, "auto"),
+                line("insideH", "single", 6, "333333"),
+                line("insideV", "single", 6, "auto"),
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn a_border_attribute_table_is_written_as_before_1894() {
+        let t = table("<table border=1 cellpadding=4><tr><td>a</td></tr></table>");
+        let m = "w:w=\"60\" w:type=\"dxa\"/>";
+        assert_eq!(
+            tblpr(&t),
+            format!(
+                "<w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblBorders>{}</w:tblBorders>\
+                 <w:tblCellMar><w:top {m}<w:left {m}<w:bottom {m}<w:right {m}</w:tblCellMar>\
+                 </w:tblPr>",
+                ["top", "left", "bottom", "right", "insideH", "insideV"]
+                    .map(|e| line(e, "single", 6, "auto"))
+                    .concat()
+            )
+        );
+        // `border=3`: 3 px outside, 1 px inside, as before.
+        let t = table("<table border=3><tr><td>a</td></tr></table>");
+        assert!(tbl_borders(&t).starts_with(&line("top", "single", 18, "auto")));
+        assert!(tbl_borders(&t).ends_with(&line("insideV", "single", 6, "auto")));
+        assert!(!tcpr(&t, 0, 0).contains("tcBorders"));
+    }
+
+    #[test]
+    fn inside_lines_take_the_table_s_computed_colour_1894() {
+        let all = |t: &Table, sz: u32, color: &str| {
+            assert_eq!(
+                tbl_borders(t),
+                ["top", "left", "bottom", "right", "insideH", "insideV"]
+                    .map(|e| line(
+                        e,
+                        "single",
+                        if e.starts_with("inside") { 6 } else { sz },
+                        color
+                    ))
+                    .concat()
+            );
+        };
+        all(
+            &table("<table border=1 bordercolor=#ff0000><tr><td>a</td></tr></table>"),
+            6,
+            "FF0000",
+        );
+        all(
+            &table(
+                "<table border=1 bordercolor=red style=\"border-color:blue\"><tr><td>a</td></tr>\
+                 </table>",
+            ),
+            6,
+            "0000FF",
+        );
+        let t =
+            table("<table border=1 style=\"border:2px dashed green\"><tr><td>a</td></tr></table>");
+        assert_eq!(
+            tbl_borders(&t),
+            [
+                line("top", "dashed", 12, "008000"),
+                line("left", "dashed", 12, "008000"),
+                line("bottom", "dashed", 12, "008000"),
+                line("right", "dashed", 12, "008000"),
+                line("insideH", "single", 6, "008000"),
+                line("insideV", "single", 6, "008000"),
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn frame_and_rules_pick_the_edges_1894() {
+        let one = |e| line(e, "single", 6, "auto");
+        let t = table("<table frame=hsides rules=rows><tr><td>a</td></tr></table>");
+        assert_eq!(
+            tbl_borders(&t),
+            [one("top"), one("bottom"), one("insideH")].concat()
+        );
+        let t = table("<table rules=cols><tr><td>a</td></tr></table>");
+        assert_eq!(tbl_borders(&t), one("insideV"));
+        let t = table("<table frame=box><tr><td>a</td></tr></table>");
+        assert_eq!(
+            tbl_borders(&t),
+            [one("top"), one("left"), one("bottom"), one("right")].concat()
+        );
+        let t = table("<table frame=lhs><tr><td>a</td></tr></table>");
+        assert_eq!(tbl_borders(&t), one("left"));
+        let t = table("<table border=3 frame=void><tr><td>a</td></tr></table>");
+        assert_eq!(tbl_borders(&t), [one("insideH"), one("insideV")].concat());
+        let t = table("<table border=2 rules=none><tr><td>a</td></tr></table>");
+        assert_eq!(
+            tbl_borders(&t),
+            ["top", "left", "bottom", "right"]
+                .map(|e| line(e, "single", 12, "auto"))
+                .concat()
+        );
+        // `groups` is drawn as `none`; an unknown value is as if absent.
+        let t = table("<table rules=groups><tr><td>a</td></tr></table>");
+        assert_eq!(tbl_borders(&t), "");
+        let t = table("<table frame=bogus><tr><td>a</td></tr></table>");
+        assert_eq!(tbl_borders(&t), "");
+    }
+
+    #[test]
+    fn border_collapse_drops_cell_spacing_1894() {
+        let spacing = |html: &str| tblpr(&table(html)).contains("tblCellSpacing");
+        let row = "<tr><td>a</td></tr>";
+        assert!(spacing(&format!("<table cellspacing=4>{row}</table>")));
+        assert!(!spacing(&format!(
+            "<table cellspacing=4 style=\"border-collapse:collapse\">{row}</table>"
+        )));
+        assert!(!spacing(&format!(
+            "<style>table {{ border-collapse: collapse }}</style><table cellspacing=4>{row}</table>"
+        )));
+        // Inherited, and `separate` undoes it.
+        assert!(!spacing(&format!(
+            "<div style=\"border-collapse:collapse\"><table cellspacing=4>{row}</table></div>"
+        )));
+        assert!(spacing(&format!(
+            "<style>table {{ border-collapse: collapse }}</style>\
+             <table cellspacing=4 style=\"border-collapse:separate\">{row}</table>"
+        )));
+    }
+
+    #[test]
+    fn rules_imply_collapse_1894() {
+        let row = "<tr><td>a</td></tr>";
+        let t = table(&format!("<table rules=all cellspacing=4>{row}</table>"));
+        assert!(!tblpr(&t).contains("tblCellSpacing"), "{}", tblpr(&t));
+        let t = table(&format!(
+            "<table rules=all cellspacing=4 style=\"border-collapse:separate\">{row}</table>"
+        ));
+        assert!(tblpr(&t).contains("tblCellSpacing"), "{}", tblpr(&t));
+    }
+
+    fn row_height(t: &Table, row: usize) -> Option<u32> {
+        let raw = t.rows[row].raw_props.first()?;
+        let v = raw.split("w:val=\"").nth(1)?.split('"').next()?;
+        assert!(raw.contains("w:hRule=\"atLeast\""), "{raw}");
+        v.parse().ok()
+    }
+
+    #[test]
+    fn row_heights_are_at_least_tr_height_1894() {
+        let h = |html: &str| row_height(&table(html), 0);
+        assert_eq!(h("<table><tr height=40><td>a</td></tr></table>"), Some(600));
+        assert_eq!(
+            h("<table><tr style=\"height:40px\"><td style=\"padding:10px\">a</td></tr></table>"),
+            Some(600)
+        );
+        // The tallest of the row's and its cells'.
+        assert_eq!(
+            h("<table><tr height=20><td height=30>a</td><td height=10>b</td></tr></table>"),
+            Some(450)
+        );
+        // A percentage, `auto` and an invalid value are none; no `trPr`.
+        assert_eq!(h("<table><tr height=50%><td>a</td></tr></table>"), None);
+        assert_eq!(
+            h("<table><tr><td height=40 style=\"height:auto\">a</td></tr></table>"),
+            None
+        );
+        assert_eq!(h("<table><tr><td height=tall>a</td></tr></table>"), None);
+        assert_eq!(h("<table><tr><td>a</td></tr></table>"), None);
+        // Capped at Word's widest measure.
+        assert_eq!(
+            h("<table><tr height=99999><td>a</td></tr></table>"),
+            Some(html_table::MAX_TWIPS)
+        );
+        // A cell spanning rows sets none.
+        let t = table(
+            "<table><tr><td rowspan=2 height=80>a</td><td>b</td></tr><tr><td>c</td></tr></table>",
+        );
+        assert_eq!((row_height(&t, 0), row_height(&t, 1)), (None, None));
+    }
+
+    #[test]
+    fn cell_height_adds_its_padding_1894() {
+        let h = |html: &str| row_height(&table(html), 0);
+        assert_eq!(
+            h("<table cellpadding=10><tr><td height=40>a</td></tr></table>"),
+            Some(900)
+        );
+        assert_eq!(
+            h("<table><tr><td style=\"height:40px;padding:10px\">a</td></tr></table>"),
+            Some(900)
+        );
+        // Its own padding over the table's.
+        assert_eq!(
+            h(
+                "<table cellpadding=10><tr><td style=\"height:40px;padding-top:0\">a</td></tr></table>"
+            ),
+            Some(750)
+        );
+    }
+
+    #[test]
+    fn col_and_colgroup_widths_size_the_grid_1894() {
+        let grid = |html: &str| table(html).grid;
+        let row3 = "<tr><td>a</td><td>b</td><td>c</td></tr>";
+        assert_eq!(
+            grid(&format!(
+                "<table width=600><colgroup><col width=200><col width=\"50%\"></colgroup>{row3}</table>"
+            )),
+            [3000, 4500, 1500]
+        );
+        assert_eq!(
+            grid(&format!("<table><col span=2 width=100>{row3}</table>")),
+            [1500, 1500, 8790]
+        );
+        assert_eq!(
+            grid(
+                "<table width=600><colgroup span=3 width=80></colgroup>\
+                 <tr><td>a</td><td>b</td><td>c</td><td>d</td></tr></table>"
+            ),
+            [1200, 1200, 1200, 5400]
+        );
+        assert_eq!(
+            grid(&format!(
+                "<table width=600><col style=\"width:120px\" width=10>{row3}</table>"
+            )),
+            [1800, 3600, 3600]
+        );
+        // A `col` in a `colgroup` with a width takes its own, else the group's.
+        assert_eq!(
+            grid(&format!(
+                "<table width=600><colgroup width=100><col><col width=200></colgroup>{row3}</table>"
+            )),
+            [1500, 3000, 4500]
+        );
+        // A colgroup with no end tag ends at the first row.
+        assert_eq!(
+            grid(&format!(
+                "<table width=600><colgroup span=2 width=100>{row3}</table>"
+            )),
+            [1500, 1500, 6000]
+        );
+        // Columns past the grid add none; a cell's wider width wins.
+        assert_eq!(
+            grid("<table width=600><col width=100><col width=100><tr><td>a</td></tr></table>"),
+            [9000]
+        );
+        assert_eq!(
+            grid("<table><col width=100><tr><td width=200>a</td></tr></table>"),
+            [3000]
+        );
+        // A `col` in a cell is none of its table's.
+        assert_eq!(
+            grid("<table width=600><tr><td><col width=100>a</td><td>b</td></tr></table>"),
+            [4500, 4500]
+        );
+    }
+
+    #[test]
+    fn table_max_width_caps_its_width_1894() {
+        let t = table("<table style=\"width:100%;max-width:600px\"><tr><td>a</td></tr></table>");
+        assert_eq!(t.grid.iter().sum::<u32>(), 9000);
+        assert!(tblpr(&t).starts_with("<w:tblPr><w:tblW w:w=\"9000\" w:type=\"dxa\"/>"));
+        // An auto table is laid out in no more than it.
+        let t = table("<table style=\"max-width:600px\"><tr><td>a</td><td>b</td></tr></table>");
+        assert_eq!(t.grid, [4500, 4500]);
+        assert!(tblpr(&t).contains("w:type=\"auto\""));
+        // A wider max-width changes nothing; a percentage is of the room.
+        let t = table("<table style=\"width:100%;max-width:900px\"><tr><td>a</td></tr></table>");
+        assert!(tblpr(&t).contains("<w:tblW w:w=\"5000\" w:type=\"pct\"/>"));
+        let t = table("<table style=\"width:100%;max-width:50%\"><tr><td>a</td></tr></table>");
+        assert_eq!(t.grid, [5895]);
+        let t = table(
+            "<table style=\"width:100%;max-width:600px;max-width:none\"><tr><td>a</td></tr></table>",
+        );
+        assert_eq!(t.grid, [11790]);
+        // Nested: capped in its cell's room.
+        let t = table(
+            "<table width=600 cellpadding=0><tr><td><table style=\"width:100%;max-width:300px\">\
+             <tr><td>x</td></tr></table></td></tr></table>",
+        );
+        let inner = tables(&t.rows[0].cells[0].blocks)[0];
+        assert_eq!(inner.grid, [4500]);
+        let t = table(
+            "<table width=200 cellpadding=0><tr><td><table style=\"width:100%;max-width:300px\">\
+             <tr><td>x</td></tr></table></td></tr></table>",
+        );
+        let inner = tables(&t.rows[0].cells[0].blocks)[0];
+        assert_eq!(inner.grid, [3000]);
+    }
+
+    #[test]
+    fn block_max_width_centres_like_a_width_1894() {
+        let ind = |html: &str| {
+            let p = doc(html).body[0].clone();
+            let DocBlock::Paragraph(p) = p else {
+                panic!("{p:?}")
+            };
+            (p.props.indent, p.props.indent_right)
+        };
+        let fixed = ind("<div style=\"width:600px;margin:0 auto\">x</div>");
+        assert_eq!(fixed, (1395, 1395));
+        assert_eq!(
+            ind("<div style=\"max-width:600px;margin:0 auto\">x</div>"),
+            fixed
+        );
+        assert_eq!(
+            ind("<div style=\"width:700px;max-width:600px;margin:0 auto\">x</div>"),
+            fixed
+        );
+        assert_eq!(
+            ind("<div style=\"width:600px;max-width:700px;margin:0 auto\">x</div>"),
+            fixed
+        );
+        // A percentage, or one wider than the body, moves nothing.
+        assert_eq!(
+            ind("<div style=\"max-width:50%;margin:0 auto\">x</div>"),
+            (0, 0)
+        );
+        assert_eq!(
+            ind("<div style=\"max-width:2000px;margin:0 auto\">x</div>"),
+            (0, 0)
+        );
+        // A table in it is laid out in its 600 px room.
+        let t = table(
+            "<div style=\"max-width:600px;margin:0 auto\"><table width=100%><tr><td>x</td></tr>\
+             </table></div>",
+        );
+        assert_eq!(t.grid.iter().sum::<u32>(), 9000);
+    }
+
+    fn th_look(html: &str) -> (bool, Align) {
+        let t = table(html);
+        let cell = t.rows[0]
+            .cells
+            .iter()
+            .find(|c| c.blocks.iter().any(|b| b.plain_text().contains('x')))
+            .unwrap_or_else(|| panic!("{t:?}"));
+        let DocBlock::Paragraph(p) = &cell.blocks[0] else {
+            panic!("{cell:?}")
+        };
+        let bold = p
+            .content
+            .iter()
+            .any(|i| matches!(i, Inline::Run(r) if r.props.bold));
+        (bold, p.props.align)
+    }
+
+    #[test]
+    fn th_is_bold_and_centred_unless_told_1894() {
+        assert_eq!(
+            th_look("<table><tr><th>x</th></tr></table>"),
+            (true, Align::Center)
+        );
+        // Quirks mode too, and a `td` stays as it was.
+        assert_eq!(
+            th_look("<!DOCTYPE html><table><tr><th>x</th></tr></table>"),
+            (true, Align::Center)
+        );
+        assert_eq!(
+            th_look("<table><tr><td>x</td></tr></table>"),
+            (false, Align::Left)
+        );
+        // Its own weight and alignment win.
+        assert_eq!(
+            th_look("<style>th { font-weight: normal }</style><table><tr><th>x</th></tr></table>"),
+            (false, Align::Center)
+        );
+        assert!(!th_look("<table><tr><th style=\"font-weight:400\">x</th></tr></table>").0);
+        assert_eq!(
+            th_look("<table><tr><th align=left>x</th></tr></table>").1,
+            Align::Left
+        );
+        assert_eq!(
+            th_look("<style>th { text-align: left }</style><table><tr><th>x</th></tr></table>").1,
+            Align::Left
+        );
+        // An inherited explicit alignment wins; an inherited start does not.
+        assert_eq!(
+            th_look("<table><tr align=left><th>x</th></tr></table>").1,
+            Align::Left
+        );
+        assert_eq!(
+            th_look("<div style=\"text-align:left\"><table><tr><th>x</th></tr></table></div>").1,
+            Align::Left
+        );
+        assert_eq!(
+            th_look("<table style=\"text-align:right\"><tr><th>x</th></tr></table>").1,
+            Align::Right
+        );
+        assert_eq!(
+            th_look("<div style=\"text-align:start\"><table><tr><th>x</th></tr></table></div>").1,
+            Align::Center
+        );
+        // It places no block: a table in it stays at its left; no header row.
+        let t =
+            table("<table><tr><th>h<table width=50><tr><td>x</td></tr></table></th></tr></table>");
+        let inner = tables(&t.rows[0].cells[0].blocks)[0];
+        assert!(!tblpr(inner).contains("<w:jc"), "{}", tblpr(inner));
+        assert!(t.rows[0].raw_props.is_empty());
+    }
+
+    fn page_color(html: &str) -> Option<String> {
+        import_html_within(html.as_bytes(), &Budget::standard(), None)
+            .unwrap()
+            .page_color
+    }
+
+    #[test]
+    fn body_background_is_the_page_colour_1894() {
+        let f4 = Some("F4F4F4".to_string());
+        assert_eq!(page_color("<body bgcolor=\"#f4f4f4\"><p>x</p></body>"), f4);
+        assert_eq!(
+            page_color("<style>body { background: #f4f4f4 }</style><body><p>x</p></body>"),
+            f4
+        );
+        assert_eq!(
+            page_color("<body style=\"background-color:#F4F4F4\"><p>x</p></body>"),
+            f4
+        );
+        // The root's wins, as a browser's canvas takes it first.
+        assert_eq!(
+            page_color(
+                "<html style=\"background:#010203\"><body bgcolor=#f4f4f4><p>x</p></body></html>"
+            ),
+            Some("010203".to_string())
+        );
+        assert_eq!(
+            page_color("<html><body bgcolor=#f4f4f4><p>x</p></body></html>"),
+            f4
+        );
+        // White, transparent, none and nothing are no page colour.
+        for html in [
+            "<body bgcolor=#ffffff><p>x</p></body>",
+            "<body style=\"background:transparent\"><p>x</p></body>",
+            "<body bgcolor=#f4f4f4 style=\"background:none\"><p>x</p></body>",
+            "<p>x</p>",
+        ] {
+            assert_eq!(page_color(html), None, "{html}");
+        }
+        // The body's background is no paragraph's shading.
+        let d = doc("<body bgcolor=#f4f4f4><p>x</p></body>");
+        let DocBlock::Paragraph(p) = &d.body[0] else {
+            panic!("{d:?}")
+        };
+        assert!(
+            !p.props.raw_props.iter().any(|r| r.contains("w:shd")),
+            "{p:?}"
+        );
+        // The package writes it as Word's page colour.
+        let pkg = import_html_within(
+            b"<body bgcolor=#f4f4f4><p>x</p></body>",
+            &Budget::standard(),
+            None,
+        )
+        .unwrap()
+        .package();
+        assert_eq!(pkg.page_background().map(|b| b.color), Some(0xF4F4F4));
+        assert!(pkg.has_display_background_shape());
+        let pkg = import_html_within(b"<p>x</p>", &Budget::standard(), None)
+            .unwrap()
+            .package();
+        assert_eq!(pkg.page_background(), None);
+        assert!(!pkg.has_display_background_shape());
     }
 }

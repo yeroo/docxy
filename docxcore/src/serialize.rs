@@ -338,7 +338,7 @@ fn write_inlines_tracking_inserts(s: &mut String, content: &[Inline]) {
 /// One `w:pBdr` side as written: its line, width, space and colour, and its
 /// theme colour when it names one (#2231). The editor's own rules are
 /// `w:sz="6" w:space="1" w:color="auto"`, as before.
-fn pbdr_side_xml(tag: &str, b: &crate::model::ParBorder) -> String {
+pub(crate) fn pbdr_side_xml(tag: &str, b: &crate::model::ParBorder) -> String {
     let color = b
         .color
         .map_or_else(|| "auto".to_string(), |c| format!("{c:06X}"));
