@@ -594,7 +594,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   shading: new Outlook writes a white `div` per line
   (`elementToProof`, `background-color: rgb(255,255,255)`), which a
   table per line would ruin, and with no padding the shading is what a
-  browser draws. The whole newsletter in `newsletter.html` (a grey,
+  browser draws. So does one with a border line of its own on any side
+  (`own_borders`, an alert's left rule, a boxed note): its paragraphs
+  draw the lines (#1883), a card would drop them. In a cell, #1927's
+  card as before. The whole newsletter in `newsletter.html` (a grey,
   padded `.wrapper`) is one card holding the content table.
 - Guards (`Html::body_card_fits`), where the paragraph model carries
   something a card's table would drop, so the `div` stays paragraph

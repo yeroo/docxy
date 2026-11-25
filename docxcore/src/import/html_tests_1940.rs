@@ -335,3 +335,30 @@ fn a_stray_table_part_close_leaves_a_body_card_open_1940() {
         assert_eq!(texts, ["a", "b"], "{close}");
     }
 }
+
+#[test]
+fn a_bordered_body_div_keeps_its_lines_as_paragraph_shading_1940() {
+    // An alert's left rule, a boxed note, a top rule: the paragraphs
+    // draw them (#1883); a card would drop them.
+    let d = doc("<div style='background:#eee;border-left:4px solid red;padding:8px'>x</div>");
+    assert_eq!(table_count(&d.body), 0);
+    let x = para(&d, "x");
+    assert!(shaded(x));
+    assert!(x.props.borders.left.is_some());
+    let d = doc("<div style='background:#eee;border:1px solid #ccc;padding:8px'>x</div>");
+    assert_eq!(table_count(&d.body), 0);
+    let b = &para(&d, "x").props.borders;
+    assert!(b.left.is_some() && b.right.is_some() && b.top.is_some() && b.bottom.is_some());
+    let d = doc("<div style='background:#eee;border-top:2px solid #333;padding:8px'>x</div>");
+    assert_eq!(table_count(&d.body), 0);
+    assert!(para(&d, "x").props.borders.top.is_some());
+    // A border that draws nothing is no line.
+    let d = doc("<div style='background:#eee;border:none;padding:8px'>x</div>");
+    assert_eq!(table_count(&d.body), 1);
+    // In a cell, #1927's card as before.
+    let d = doc(
+        "<table><tr><td><div style='background:#eee;border-left:4px solid red;padding:8px'>x\
+         </div></td></tr></table>",
+    );
+    assert_eq!(table_count(&d.body), 2);
+}

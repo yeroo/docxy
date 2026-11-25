@@ -694,7 +694,7 @@ struct Look {
     /// and cell's in twips only, #1894).
     own_height: Option<Width>,
     /// A table's or image's own `max-width` (not inherited, #1894; an
-    /// image's, #1898).
+    /// image's, #1898), or a card's, absolute only (#1940).
     own_max_width: Option<Width>,
     /// An image's own `max-height` in twips (not inherited, #1898): an
     /// absolute length only (a percentage of an auto height is none).
@@ -2270,10 +2270,6 @@ impl Cascade {
         })
     }
 
-    /// A block's or list's top and bottom box (#1979, #2114): the user
-    /// agent's margin where a side is not declared, in the element's own
-    /// font size or a heading's user-agent one, and the margins and
-    /// paddings in twips.
     /// A box of its own (#1940): a padding above 0 on some side, a
     /// `width` or a `max-width`. What a background `div` in the body needs
     /// to be a card.
@@ -2285,6 +2281,10 @@ impl Cascade {
             || self.block_max.is_some()
     }
 
+    /// A block's or list's top and bottom box (#1979, #2114): the user
+    /// agent's margin where a side is not declared, in the element's own
+    /// font size or a heading's user-agent one, and the margins and
+    /// paddings in twips.
     fn vertical_box(&mut self, pt: f64) {
         if let Some(em) = self.ua_vmargin {
             let font = if self.own_size {
@@ -2353,31 +2353,34 @@ impl Cascade {
         } else {
             None
         };
+        // Its own border's drawn sides (#1883): only a block's (not a
+        // card's, below, cell's, table's, list's or inline element's).
+        let lines = if self.kind == Kind::Block {
+            self.own_borders(pt)
+        } else {
+            [None; 4]
+        };
         let card = self.kind == Kind::Block
             && match self.card {
                 CardMode::Yes(_) => true,
                 // In the body (#1940), only a box of its own: padding, a
                 // width or a `max-width`. A background alone is paragraph
                 // shading, as a browser draws it (an Outlook body's white
-                // `div` per line).
+                // `div` per line). Nor one with a border line, which a card
+                // drops and its paragraphs draw (an alert's left rule).
                 CardMode::Maybe => {
                     self.background.is_some()
                         && !self.look.run.vanish
                         && !self.not_block
-                        && (self.look.in_cell || self.own_box(pt))
+                        && (self.look.in_cell
+                            || (self.own_box(pt) && lines.iter().all(Option::is_none)))
                 }
                 CardMode::No | CardMode::Declined => false,
             };
         if (self.kind == Kind::Block && !card) || self.kind == Kind::List {
             self.vertical_box(pt);
         }
-        // Its own border's drawn sides (#1883): only a block's (not a
-        // card's, cell's, table's, list's or inline element's).
-        let own = if self.kind == Kind::Block && !card {
-            self.own_borders(pt)
-        } else {
-            [None; 4]
-        };
+        let own = if card { [None; 4] } else { lines };
         // A table's and a cell's are its table lines (#1894), and a table's
         // top and left colours are what its cells' lines inherit.
         if self.kind == Kind::Cell || self.is_table {
