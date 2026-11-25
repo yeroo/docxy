@@ -403,35 +403,34 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   `pic:spPr/a:prstGeom` (`image::inline_picture_run_shaped`,
   `image::PictureShape`): `ellipse` (`<a:avLst/>`), or `roundRect` with
   `<a:gd name="adj" fmla="val N"/>` (the corner is `min(w, h) * N / 100000`,
-  N in 0..=50000). No radius, zero, or corners that differ write `rect`, the
-  run exactly as before. So it saves unchanged (the run is `Inline::Raw`),
-  Word and LibreOffice draw it, and the suite draws it (and a Word
-  document's own oval or rounded crop) clipped
-  (`docs/claude/suite-document.md`, "Suite inline pictures").
-- The cascade: only an `img` reads `border-radius` and the four longhands
-  (`Cascade::radius`, per corner, top left, top right, bottom right,
-  bottom left; not inherited, so a card's radius never reaches the picture
-  in it). Only the horizontal radius counts: the shorthand's part before
-  `/` (`css::radius_corners`), a longhand's first value
-  (`css::radius_corner`); the vertical part is checked and dropped. A
-  negative or unreadable value is invalid (ignored, the earlier one stands);
-  `initial`/`unset` is square. `Cascade::finish` resolves the corners with
-  the element's final font (`image_radius`: an `em` declared before the
-  `font-size` takes the new size) into `Look::own_radius`
-  (`html_image::Radius`: `Pct`, `Twips`, or `NonUniform`; a corner left
-  unset is a square one, and zero lengths and zero percentages are equal).
-- The mapping (`html_image::shape`), measured in the box the page declares
-  (`html_image::declared_box`, before `fit_to_body` scales a wide picture
-  to the body; the scale is uniform, so the ratio holds): a percentage of
-  50 or more is the ellipse, square or not; under 50 a `roundRect` of the
-  corner's short radius, `p% * min(w, h)` (adj `p * 1000`); a length on a
-  square box reaching half its side is the ellipse (a browser clamps there),
-  else a `roundRect` of `r / min(w, h)`, at most 50000 (a browser's
-  stadium). The unresolved placeholder takes the shape too; its outline
-  follows it in Word.
-- Every other element's `border-radius` (a card's cell, `div`, `span`) is
-  ignored as before: its background and padding import, its radius is
-  never text.
+  N in 0..=50000), and since #1936 the presets for corners that differ. No
+  radius, zero, or corners no preset draws write `rect`, the run exactly as
+  before. So it saves unchanged (the run is `Inline::Raw`), Word and
+  LibreOffice draw it, and the suite draws it (and a Word document's own
+  oval or rounded crop) clipped (`docs/claude/suite-document.md`, "Suite
+  inline pictures").
+- The cascade (`Cascade::radius`, per corner, top left, top right, bottom
+  right, bottom left; not inherited, so a card's radius never reaches the
+  picture in it): a negative or unreadable value is invalid (ignored, the
+  earlier one stands); `initial`/`unset` is square. `Cascade::finish`
+  resolves the corners with the element's final font (`image_radius`: an
+  `em` declared before the `font-size` takes the new size) into
+  `Look::own_radius`. Since #1936 every element reads it, each corner keeps
+  its vertical radius, and it is `html_image::Radius([(RLen, RLen); 4])`
+  (the #1936 section).
+- The mapping (`html_image::clipped_shape` since #1936, which holds the
+  rule), measured in the box the page declares (`html_image::declared_box`,
+  before `fit_to_body` scales a wide picture to the body; the scale is
+  uniform, so the ratio holds). Uniform corners map as #1926 did: a
+  percentage of 50 or more is the ellipse, square or not; under 50 a
+  `roundRect` of the corner's short radius, `p% * min(w, h)` (adj
+  `p * 1000`); a length on a square box reaching half its side is the
+  ellipse (a browser clamps there), else a `roundRect` of `r / min(w, h)`,
+  at most 50000 (a browser's stadium). The unresolved placeholder takes the
+  shape too; its outline follows it in Word.
+- Another element's `border-radius` (a card's cell, `div`, `span`) crops
+  nothing unless it is a clipping wrapper the picture fills (#1936): its
+  background and padding import, its radius is never text.
 - Known limits (#1926; most lifted by #1936, below): corners that differ,
   elliptical corners, a wrapper's `overflow: hidden` rounding the image
   inside it and the editable-HTML page drawing the crop are #1936's. Still
@@ -485,8 +484,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   its own; an absolute declared width and height (a cell's attributes or
   CSS, another element's CSS `width`/`height`, `Cascade::css_box`, in its
   final font; a percentage or `auto` is none) the picture's declared box
-  matches within 20 twips each way (`Look::own_clip`, `Clip`). Every open
-  element between the two is `Kind::Inline` (an `<a>` link avatar). The
+  matches within a CSS pixel, 15 twips, each way (`FILL_SLACK`,
+  `Look::own_clip`, `Clip`). Every open element between the two is
+  `Kind::Inline` (an `<a>` link avatar). The
   picture comes first in it: `Builder::shown` (bumped by
   `flush_marks(true)`: non-blank text, an object, a page break) is what it
   was when the wrapper opened (`Elem::shown_at`; `u64::MAX` for a reopened

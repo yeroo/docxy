@@ -991,9 +991,10 @@ struct Cascade {
     /// absolute, the fixed-width centring (#1922); a percentage too, a
     /// card's table width (#1927).
     block_width: Option<Len>,
-    /// An image's corner radii, top left, top right, bottom right, bottom
-    /// left, each horizontal and vertical (#1926, #1936): kept until its
-    /// font size is known, then [`Look::own_radius`].
+    /// An element's corner radii, top left, top right, bottom right,
+    /// bottom left, each horizontal and vertical (#1926, #1936): an
+    /// image's crop, or a wrapper's clip of the picture in it. Kept until
+    /// its font size is known, then [`Look::own_radius`].
     radius: [Option<css::CornerRadius>; 4],
     /// `overflow` clips (`hidden`, `clip`) horizontally and vertically
     /// (#1936).
@@ -2635,6 +2636,10 @@ fn image_radius(
     }));
     (!radius.is_square()).then_some(radius)
 }
+
+/// How far a picture's declared side may be from its rounded wrapper's
+/// and still fill it (#1936): one CSS pixel, 15 twips.
+const FILL_SLACK: u128 = 15;
 
 /// Whether an `overflow` keyword clips (#1936): `hidden` and `clip` do,
 /// `visible`, `auto` and `scroll` do not here (a scrolled box is not a
@@ -4329,8 +4334,8 @@ impl<'a> Html<'a> {
         // each way (#1936).
         let shape = declared.map_or(crate::image::PictureShape::Rect, |b| {
             let fills = |clip: &Clip| {
-                b.0.abs_diff(u128::from(clip.width)) <= 20
-                    && b.1.abs_diff(u128::from(clip.height)) <= 20
+                b.0.abs_diff(u128::from(clip.width)) <= FILL_SLACK
+                    && b.1.abs_diff(u128::from(clip.height)) <= FILL_SLACK
             };
             let clip = wrapper.filter(|(_, c)| fills(c)).map(|(r, _)| r);
             html_image::clipped_shape(look.own_radius.as_deref().copied(), clip, b)
@@ -8344,6 +8349,15 @@ mod image_tests {
             ),
             [Ellipse]
         );
+        // 15 twips off (47.25pt is 945 of the picture's 960) is within the
+        // pixel; 16 (47.2pt, 944) is not (r1 i1).
+        let off = |w: &str| {
+            case(&format!(
+                "<div style='width:{w};height:64px;border-radius:50%;overflow:hidden'>{img}</div>"
+            ))
+        };
+        assert_eq!(off("47.25pt"), [Ellipse]);
+        assert_eq!(off("47.2pt"), [Rect]);
         // A span clips only as an inline-block (or block).
         let span = |display: &str| {
             case(&format!(
