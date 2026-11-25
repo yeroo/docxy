@@ -1581,11 +1581,11 @@ impl Cascade {
                 .as_deref()
                 .and_then(|h| link_of(h, base))
                 .map(|to| {
-                    Rc::new(Link {
+                    Rc::new(Link::new(
                         to,
-                        tooltip: attrs.title.as_deref().and_then(link_title),
-                        frame: attrs.target.as_deref().and_then(link_frame),
-                    })
+                        attrs.title.as_deref().and_then(link_title),
+                        attrs.target.as_deref().and_then(link_frame),
+                    ))
                 });
             if self.look.link.is_some() {
                 self.look.run.underline = true;

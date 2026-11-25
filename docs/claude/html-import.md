@@ -577,12 +577,19 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
 - A bookmark is a point, two `Inline::Raw`s (`<w:bookmarkStart w:id="N"
   w:name="…"/><w:bookmarkEnd w:id="N"/>`, `w:id`s 0, 1, … in the import),
   queued by `Builder::bookmark` when its element opens and written right
-  before the next content (`link_text`, `tab`, the breaks, `object`), in a
-  cell when that content is. It never makes or keeps a paragraph: the
-  Builder's content checks pass over it (`is_mark`: `is_object`, `shows`,
+  before the next content once its paragraph holds content that keeps it
+  (`Builder::keeps`: text not all white space, an object, a page break;
+  after that a tab or line break takes them too), in a cell when that
+  content is. A paragraph of only spaces, tabs or line breaks, which the
+  import drops (`clear_para`), so takes none (r2: each such paragraph once
+  took every waiting mark and gave it back, marks × paragraphs): the mark
+  of `<p id=x>&nbsp;</p>` or a linked `<div id=x><br></div>` goes to the
+  next text. It never makes or keeps a paragraph: the Builder's content
+  checks pass over it (`is_mark`: `is_object`, `shows`,
   `drop_trailing_break` counts the rest, `take_leading_marker` keeps it
-  in front), and `clear_para` puts a cleared paragraph's marks back in the
-  queue (`<p id=x>&nbsp;</p>`'s mark goes to the next text). What is still
+  in front). A kept paragraph a typed list marker was all of can still be
+  cleared; `clear_para` then puts its marks back from `para_marks`, the
+  record of what went in, charged, not parsed. What is still
   queued at the end ends the body's last paragraph, or is dropped after a
   table. At most `MAX_BOOKMARKS` (10 000), charged to the budget.
 - `Hyperlink` style: a Markdown package style now (`markdown_style_def`,

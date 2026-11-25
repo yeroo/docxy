@@ -3591,9 +3591,11 @@ impl Package {
 
     /// Ensure `styles.xml` defines each style id in `ids` that Markdown-sourced
     /// content might reference (`HeadingN` for `N` in `1..=6`, `Quote`,
-    /// `SourceCode`, `Code` — the exact set [`markdown_styles_xml`] defines for
-    /// a fresh markdown package — plus Word's `Header` and `Footer`, which new
-    /// header/footer parts use; any other id is silently ignored). Strictly
+    /// `SourceCode`, `Code` and `Hyperlink` (#1912, the character style
+    /// imported HTML links take) — the exact set [`markdown_styles_xml`]
+    /// defines for a fresh markdown package — plus Word's `Header` and
+    /// `Footer`, which new header/footer parts use; any other id is silently
+    /// ignored). Strictly
     /// additive, mirroring [`Package::ensure_list`]'s idiom: a style id already
     /// defined in the package — e.g. a third-party document's own `Heading1` —
     /// is left byte-untouched; only ids genuinely ABSENT from `styles.xml` get
@@ -4576,8 +4578,9 @@ pub fn new_markdown_package(document: Document) -> Package {
 }
 
 /// A `styles.xml` defining the built-in styles Markdown uses: Normal, Title,
-/// Heading1–6, Quote, the SourceCode paragraph style, and the Code character
-/// style. Word recognizes the headings by their `styleId`/`name`.
+/// Heading1–6, Quote, the SourceCode paragraph style, the Code character
+/// style, and the Hyperlink character style imported HTML links take
+/// (#1912). Word recognizes the headings by their `styleId`/`name`.
 fn markdown_styles_xml() -> String {
     const W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
     // Heads/Quote/SourceCode/Code definitions come from `markdown_style_def`,

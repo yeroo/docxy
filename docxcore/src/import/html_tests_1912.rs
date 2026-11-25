@@ -650,8 +650,31 @@ fn a_linked_id_on_a_void_element_is_a_bookmark_r1_1912() {
         sketch(&paras(&d)[1]),
         [r#"Run "x""#, "Mark b", "End", "Break", r#"Run "y""#]
     );
-    // No anchor link on the page: no void element's attributes are read
-    // for it, and none is a bookmark.
+    // No anchor link on the page: none is a bookmark.
     let d = doc("<p>x<br id=b>y</p>");
     assert!(marks(&d).is_empty());
+}
+
+#[test]
+fn many_bookmarks_before_many_empty_paragraphs_import_in_linear_time_r2_1912() {
+    // Every white-space-only paragraph once took every waiting mark and
+    // gave it back: marks x paragraphs. Now none takes any.
+    for empty in ["<p>&nbsp;</p>", "<p><br></p>", "<p>\t</p>"] {
+        let mut page: String = (0..10_000).map(|n| format!("<a name=a{n}></a>")).collect();
+        page.push_str(&empty.repeat(60_000));
+        page.push_str("<p>T</p>");
+        let start = std::time::Instant::now();
+        let d = doc(&page);
+        assert!(
+            start.elapsed().as_secs() < 20,
+            "{empty}: {:?}",
+            start.elapsed()
+        );
+        // The marks land before the first real content, in order.
+        let last = sketch(paras(&d).last().unwrap());
+        assert_eq!(last.len(), 2 * 10_000 + 1, "{empty}");
+        assert_eq!(last[0], "Mark a0");
+        assert_eq!(last[2 * 9_999], "Mark a9999");
+        assert_eq!(last[2 * 10_000], r#"Run "T""#);
+    }
 }
