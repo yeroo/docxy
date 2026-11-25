@@ -1091,6 +1091,35 @@ mod tests {
         assert!(both.underline && both.strike);
     }
 
+    /// A blank to fill in (#1973): a paragraph of five underlined spaces,
+    /// written as `&nbsp;`s, comes back as one underlined run of them; an
+    /// underlined tab alone comes back as its tab.
+    #[test]
+    fn underlined_spaces_alone_round_trip_1973() {
+        let under = RunProps {
+            underline: true,
+            ..Default::default()
+        };
+        let d = back(&doc(vec![
+            para(ParProps::default(), vec![run("     ", under.clone())]),
+            para(ParProps::default(), vec![Inline::Tab(under)]),
+            text_para("after"),
+        ]));
+        let ps = paras(&d);
+        assert_eq!(ps.len(), 3, "{ps:?}");
+        match ps[0].content.as_slice() {
+            [Inline::Run(r)] => {
+                assert_eq!(r.text, "\u{a0}".repeat(5));
+                assert!(r.props.underline, "{r:?}");
+            }
+            other => panic!("one underlined run: {other:?}"),
+        }
+        match ps[1].content.as_slice() {
+            [Inline::Tab(p)] => assert!(p.underline, "{p:?}"),
+            other => panic!("one underlined tab: {other:?}"),
+        }
+    }
+
     #[test]
     fn font_family_round_trips() {
         let (x, _) = run_back(RunProps {

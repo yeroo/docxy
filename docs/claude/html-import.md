@@ -1429,3 +1429,46 @@ was #1922's.
   border widths in its row's height; a percentage `max-width` on a block,
   `min-width`, `height` on a `table`; `th`'s
   `scope` and header rows (`tblHeader`).
+
+## HTML import whitespace-only paragraphs (#1973)
+
+- A paragraph whose text is only white space is dropped as an empty
+  paragraph (Word's `<p>&nbsp;</p>`, `<o:p>&nbsp;</o:p>`), unless a look
+  a browser draws across a space holds it: a blank to fill in.
+  `import::shows_on_space` is that look: `underline`, `strike`,
+  `highlight` or the run shading (`<w:shd`) an inline `background`
+  writes, and not `vanish`. A font or size alone draws nothing, and an
+  explicit underline off (`<w:u w:val="none"/>`, `text-decoration:none`,
+  how Word writes an underlined empty paragraph's `&nbsp;`) is no
+  underline. A block's own underline is its runs', and counts.
+- It is decided when the content is written, not at the paragraph's end:
+  `Builder::link_text` and `Builder::tab` set `keeps` for white space or a
+  tab in such a look (outside a link: a link of spaces alone stays empty,
+  #1912), so a kept blank takes its waiting bookmarks and counts in
+  `Builder::shown` (#1936); `take_leading_marker`'s recount agrees.
+  `end_para_with` clears the paragraph when `!Builder::keeps()`.
+- An underlined tab alone (`mso-tab-count` or a `pre` tab) is kept as its
+  `Inline::Tab`: Word's usual blank line, which `export_email` writes as a
+  tab span in the run's span.
+- An empty paragraph's mark takes its line's look (`empty_line_mark`):
+  of its own visible runs, tabs and line breaks (not a link's; a lone
+  `<br>`, Gmail's empty line, too), the one with the largest
+  `size_half_pts`, the first among ties, else the first; `mark_rpr` of it
+  replaces the block's. In standards mode the size is at least the
+  block's own (`para_look`'s), a line box's strut; quirks mode (Outlook's
+  mail, no doctype) has none, so a smaller span sizes the line. None
+  visible leaves the block's mark. A list item's mark stays its marker's
+  (#1979). The runs inherit the block's look, so a span with no look of
+  its own gives the block's mark as before; a span that turns the block's
+  look off (`font-weight:normal` in a bold block) gives a plain line, and
+  the block's mark goes with nothing in its place.
+- A typed list marker's spacer (`take_leading_marker`'s gap) stops before
+  white space in a look drawn on it: `1.<span>&nbsp;&nbsp;</span><u>&nbsp;…</u>`
+  keeps the underlined blank. The inline the marker ends in is cut as
+  before.
+- ASCII spaces alone never reach the builder outside `pre`: `Html::text`
+  owes a space (`self.space`) and pays it only before a non-space
+  character (`pay_space` before an object or alt text), so they stay no
+  line.
+- Tests: `import/html_tests_1973.rs`;
+  `export_email::tests::underlined_spaces_alone_round_trip_1973`.

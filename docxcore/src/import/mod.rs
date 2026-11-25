@@ -43,7 +43,7 @@
 //! | `html_table::layout` | nested tables | each laid out once, inside its cell, depth ≤ `MAX_TABLE_NESTING` |
 //! | `Builder::take_leading_marker` | the paragraph's text, the inlines consumed | O(paragraph), once per paragraph; one pass rebuilding it |
 //! | `Builder::bookmark` (#1912) | a point bookmark waiting, then two inlines | ≤ `MAX_BOOKMARKS` (10 000) a document, each built (`size_of::<Inline>` + 3 × name + 96); names ≤ 40 characters; a name made once (a set) |
-//! | `Builder::flush_marks` (#1912 r2) | the waiting bookmarks written | only before content that keeps the paragraph (a white-space-only one, which HTML drops, takes none); work (marks) |
+//! | `Builder::flush_marks` (#1912 r2) | the waiting bookmarks written | only before content that keeps the paragraph (a white-space-only one, which HTML drops, takes none, unless its spaces show a look, #1973); work (marks) |
 //! | `Builder::clear_para` | its bookmarks put back (only a kept paragraph has any: a typed list marker taken off can leave it empty) | work (marks), no parse |
 //! | `Builder::para_text` | the paragraph in progress | O(paragraph), once per paragraph end |
 //! | run props cloned per inline | `RunProps` | flags, and strings of ≤ 64 bytes (font, colour, highlight) plus ≤ 2 kept elements (HTML's shading, bold off): O(1), charged as built |
@@ -396,6 +396,19 @@ pub(crate) fn shows(content: &[Inline], mark_vanish: bool) -> bool {
         })
 }
 
+/// Whether white space in `props` is drawn (#1973): a line across it
+/// (underline, strike) or a fill behind it (highlight, the HTML import's
+/// run shading), as a browser draws a blank to fill in, unless hidden. A
+/// font or size alone draws nothing; an explicit underline off
+/// (`<w:u w:val="none"/>`) is no underline.
+pub(crate) fn shows_on_space(props: &RunProps) -> bool {
+    !props.vanish
+        && (props.underline
+            || props.strike
+            || props.highlight.is_some()
+            || props.raw_props.iter().any(|r| r.starts_with("<w:shd")))
+}
+
 /// Whether a paragraph's mark (its `w:rPr` in `raw_props`, as the HTML
 /// import writes it) is hidden.
 pub(crate) fn mark_vanish(props: &ParProps) -> bool {
@@ -588,10 +601,11 @@ pub(crate) struct Builder<'b> {
     /// waiting: what [`Builder::clear_para`] puts back, unparsed.
     para_marks: Vec<(usize, String)>,
     /// The paragraph in progress holds content that keeps it (#1912 r2):
-    /// text that is not all white space, an object or a page break. Only
+    /// text that is not all white space, white space or a tab in a look
+    /// drawn on it ([`shows_on_space`], #1973), an object or a page break. Only
     /// then do the waiting bookmarks go in ([`Builder::flush_marks`]), so a
-    /// paragraph of spaces, tabs or line breaks, which the HTML import
-    /// drops (`clear_para`), takes none and gives none back.
+    /// paragraph of plain spaces, tabs or line breaks, which the HTML
+    /// import drops (`clear_para`), takes none and gives none back.
     keeps: bool,
     /// Text in a link in its user-agent look takes Word's `Hyperlink`
     /// character style (#1912, [`Builder::set_link_style`]).
@@ -706,8 +720,8 @@ impl<'b> Builder<'b> {
     }
 
     /// A count that grows whenever content that keeps a paragraph is
-    /// written (#1936): text that is not all white space, an object (a
-    /// picture), a page break. The HTML import compares it with what it was
+    /// written (#1936): text that is not all white space, white space in a
+    /// look drawn on it (#1973), an object (a picture), a page break. The HTML import compares it with what it was
     /// when an element opened to tell whether anything showed in it since.
     pub(crate) fn shown(&self) -> u64 {
         self.shown
@@ -724,8 +738,9 @@ impl<'b> Builder<'b> {
 
     /// A point bookmark `name` (#1912), placed right before the next
     /// content written in the flow once its paragraph holds content that
-    /// keeps it ([`Builder::keeps`]: text not all white space, an object,
-    /// a page break; then a tab or break too), so it never makes a
+    /// keeps it ([`Builder::keeps`]: text not all white space, white space
+    /// in a look drawn on it, an object, a page break; then a tab or break
+    /// too), so it never makes a
     /// paragraph of its own; one left at the end goes at
     /// the end of the body's last paragraph ([`Builder::finish`]). A name
     /// already made, an empty one or one past [`MAX_BOOKMARKS`] makes
@@ -787,7 +802,12 @@ impl<'b> Builder<'b> {
         if text.is_empty() || !self.budget.scanned(text.len()) || !self.budget.alloc(text.len()) {
             return;
         }
-        self.flush_marks(!text.chars().all(char::is_whitespace));
+        // White space alone keeps the paragraph when its look is drawn on
+        // it (#1973), outside a link: a link of spaces alone stays an empty
+        // paragraph (#1912).
+        self.flush_marks(
+            !text.chars().all(char::is_whitespace) || (link.is_none() && shows_on_space(props)),
+        );
         if let Some(link) = link {
             // The `Hyperlink` style, added only where a run is made.
             let style = self.link_style && link_look(props);
@@ -858,7 +878,8 @@ impl<'b> Builder<'b> {
     }
 
     pub(crate) fn tab(&mut self, props: &RunProps) {
-        self.flush_marks(false);
+        // An underlined tab is a blank to fill in (#1973).
+        self.flush_marks(shows_on_space(props));
         if self.budget.keep::<Inline>(props_heap(props)) {
             self.para.push(Inline::Tab(props.clone()));
         }
@@ -923,12 +944,22 @@ impl<'b> Builder<'b> {
         None
     }
 
-    /// Whether the paragraph in progress holds a page break (#1883): kept
-    /// though it has no text.
-    pub(crate) fn has_page_break(&self) -> bool {
-        self.para
-            .iter()
-            .any(|i| matches!(i, Inline::Break(BreakKind::Page, _)))
+    /// Whether the paragraph in progress holds content that keeps it
+    /// ([`Builder::keeps`]): what the HTML import does not drop as an
+    /// empty paragraph's spaces (#1973).
+    pub(crate) fn keeps(&self) -> bool {
+        self.keeps
+    }
+
+    /// The looks of the paragraph in progress's own runs, tabs and breaks,
+    /// not those in its links: what an empty line's mark takes its look
+    /// from (#1973), a lone `<br>`'s too.
+    pub(crate) fn para_looks(&self) -> impl Iterator<Item = &RunProps> {
+        self.para.iter().filter_map(|i| match i {
+            Inline::Run(r) => Some(&r.props),
+            Inline::Tab(p) | Inline::Break(_, p) => Some(p),
+            _ => None,
+        })
     }
 
     /// The text of the paragraph in progress.
@@ -977,7 +1008,29 @@ impl<'b> Builder<'b> {
             return None;
         }
         let rest = text.chars().skip(n);
-        let gap = rest.take_while(|c| c.is_whitespace()).count();
+        let mut gap = rest.take_while(|c| c.is_whitespace()).count();
+        // The gap is the marker's spacer: it ends before white space in a
+        // look drawn on it, a blank to fill in that follows the marker
+        // (#1973). The inline the marker ends in is cut as before.
+        let mut at = 0;
+        for inline in &self.para {
+            if at >= n + gap {
+                break;
+            }
+            if is_mark(inline) {
+                continue;
+            }
+            let drawn = match inline {
+                Inline::Run(r) => shows_on_space(&r.props),
+                Inline::Tab(p) => shows_on_space(p),
+                _ => false,
+            };
+            if drawn && at >= n {
+                gap = at - n;
+                break;
+            }
+            at += inline.text().chars().count();
+        }
         if gap == 0 {
             return None;
         }
@@ -1026,7 +1079,8 @@ impl<'b> Builder<'b> {
         // What is left may be only white space now: the paragraph is kept
         // only by what still keeps it.
         self.keeps = self.para.iter().any(|i| match i {
-            Inline::Run(r) => !r.text.chars().all(char::is_whitespace),
+            Inline::Run(r) => !r.text.chars().all(char::is_whitespace) || shows_on_space(&r.props),
+            Inline::Tab(p) => shows_on_space(p),
             Inline::Hyperlink(h) => h
                 .runs
                 .iter()
