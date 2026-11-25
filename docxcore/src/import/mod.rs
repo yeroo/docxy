@@ -1441,6 +1441,12 @@ impl<'b> Builder<'b> {
                 }
             }
             _ => {
+                // And in the body (#1940): a table or card right after
+                // another would be joined to it.
+                if matches!(self.body.last(), Some(Block::Table(_))) && self.budget.keep::<Block>(0)
+                {
+                    self.body.push(Block::Paragraph(Paragraph::default()));
+                }
                 let avail = raw.spec.room.map_or(html_table::BODY_TWIPS, |r| r.width);
                 let table = html_table::layout(raw, avail, self.budget);
                 self.body.push(Block::Table(table));

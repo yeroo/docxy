@@ -127,9 +127,31 @@ fn a_newsletter_takes_its_style_sheet() {
         }
     }
 
-    // The footer sits on the wrapper's grey, centred and small.
+    // The wrapper's grey, padded 20px above and below, is a card (#1940):
+    // one cell holding the content table and the footer, on its fill.
+    let wrapper = d
+        .body
+        .iter()
+        .find_map(|b| match b {
+            Block::Table(t) => Some(t),
+            _ => None,
+        })
+        .expect("the wrapper card");
+    assert_eq!((wrapper.rows.len(), wrapper.rows[0].cells.len()), (1, 1));
+    let tcpr = wrapper.rows[0].cells[0].raw_tcpr.as_deref().unwrap_or("");
+    assert!(tcpr.contains(r#"w:fill="F4F4F4""#), "{tcpr}");
+    assert!(
+        tcpr.contains(
+            "<w:tcMar><w:top w:w=\"300\" w:type=\"dxa\"/><w:left w:w=\"0\" w:type=\"dxa\"/>\
+             <w:bottom w:w=\"300\" w:type=\"dxa\"/><w:right w:w=\"0\" w:type=\"dxa\"/></w:tcMar>"
+        ),
+        "{tcpr}"
+    );
+    assert_eq!(nested(wrapper, 0, 0).len(), 1, "the content table");
+    // The footer sits on the wrapper's grey (the card's, not its own),
+    // centred and small.
     let foot = para(&d, "Northwind Traders");
-    assert!(foot.props.raw_props.contains(&shd("F4F4F4")));
+    assert!(!foot.props.raw_props.contains(&shd("F4F4F4")));
     assert_eq!(foot.props.align, docxcore::model::Align::Center);
     let ft = run(&d, "Northwind Traders");
     assert_eq!(ft.props.color.as_deref(), Some("999999"));

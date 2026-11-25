@@ -731,6 +731,10 @@ struct Look {
     /// inherited, #1927): a one-cell table of its fill, padding, width and
     /// place ([`Html::begin_card`]).
     own_card: bool,
+    /// A card outside every table's room in the body (not inherited,
+    /// #1940): the indents of the blocks around it and its own side
+    /// margins other than `auto`, `None` when all are 0.
+    card_room: Option<html_table::Room>,
     /// A cell's own `padding`, in twips, top, right, bottom, left (not
     /// inherited): its `tcMar`.
     own_padding: [Option<i32>; 4],
@@ -1385,21 +1389,24 @@ fn table_spec(attrs: &Attrs, look: &Look) -> TableSpec {
         },
         // In a centred fixed-width block, outside any cell (#2114): the
         // room left between its indents.
-        room: (look.centred_box && !look.in_cell).then(|| {
-            let body = html_table::BODY_TWIPS;
-            let indent = u32::try_from(look.indent.max(0)).unwrap_or(0).min(body);
-            let right = u32::try_from(look.indent_right.max(0))
-                .unwrap_or(0)
-                .min(body);
-            html_table::Room {
-                indent,
-                width: body
-                    .saturating_sub(indent)
-                    .saturating_sub(right)
-                    .clamp(html_table::MIN_COL, body),
-                centred: indent == right,
-            }
-        }),
+        room: (look.centred_box && !look.in_cell)
+            .then(|| body_room(look.indent, look.indent_right)),
+    }
+}
+
+/// The room left in the body between a left and a right indent, in twips
+/// (#2114; a card's, #1940): at least [`html_table::MIN_COL`] wide.
+fn body_room(indent: i32, right: i32) -> html_table::Room {
+    let body = html_table::BODY_TWIPS;
+    let indent = u32::try_from(indent.max(0)).unwrap_or(0).min(body);
+    let right = u32::try_from(right.max(0)).unwrap_or(0).min(body);
+    html_table::Room {
+        indent,
+        width: body
+            .saturating_sub(indent)
+            .saturating_sub(right)
+            .clamp(html_table::MIN_COL, body),
+        centred: indent == right,
     }
 }
 
@@ -1425,6 +1432,7 @@ impl Cascade {
         look.own_place = None;
         look.own_block = false;
         look.own_card = false;
+        look.card_room = None;
         look.own_break_before = false;
         look.own_break_after = false;
         look.border_before = false;
@@ -2266,6 +2274,17 @@ impl Cascade {
     /// agent's margin where a side is not declared, in the element's own
     /// font size or a heading's user-agent one, and the margins and
     /// paddings in twips.
+    /// A box of its own (#1940): a padding above 0 on some side, a
+    /// `width` or a `max-width`. What a background `div` in the body needs
+    /// to be a card.
+    fn own_box(&self, pt: f64) -> bool {
+        self.padding
+            .iter()
+            .any(|p| p.and_then(|l| l.twips(pt)).is_some_and(|t| t > 0))
+            || self.block_width.is_some()
+            || self.block_max.is_some()
+    }
+
     fn vertical_box(&mut self, pt: f64) {
         if let Some(em) = self.ua_vmargin {
             let font = if self.own_size {
@@ -2337,8 +2356,15 @@ impl Cascade {
         let card = self.kind == Kind::Block
             && match self.card {
                 CardMode::Yes(_) => true,
+                // In the body (#1940), only a box of its own: padding, a
+                // width or a `max-width`. A background alone is paragraph
+                // shading, as a browser draws it (an Outlook body's white
+                // `div` per line).
                 CardMode::Maybe => {
-                    self.background.is_some() && !self.look.run.vanish && !self.not_block
+                    self.background.is_some()
+                        && !self.look.run.vanish
+                        && !self.not_block
+                        && (self.look.in_cell || self.own_box(pt))
                 }
                 CardMode::No | CardMode::Declined => false,
             };
@@ -2387,10 +2413,26 @@ impl Cascade {
                 self.look.align_logical = false;
             }
         }
+        // A card in the body (#1940) is laid out in the room the blocks
+        // around it leave, less its own side margins (`auto` ones place
+        // it instead).
+        let card_room = (card && !self.look.in_cell).then(|| {
+            let margin = |i: usize| {
+                if self.margin_auto[i] {
+                    0
+                } else {
+                    self.margin[i].and_then(|l| l.twips(pt)).unwrap_or(0)
+                }
+            };
+            let left = clamp_twips(i64::from(self.look.indent) + i64::from(margin(3)));
+            let right = clamp_twips(i64::from(self.look.indent_right) + i64::from(margin(1)));
+            (left != 0 || right != 0).then(|| body_room(left, right))
+        });
         let look = &mut self.look;
         if card {
             // A card is a cell (#1927): a fresh block look, as a `td`
             // starts; a `text-indent` it declares still applies below.
+            look.card_room = card_room.flatten();
             look.in_cell = true;
             look.indent = 0;
             look.indent_right = 0;
@@ -2434,6 +2476,11 @@ impl Cascade {
                     _ => l.twips(pt).map(|t| Width::Twips(t.max(0) as u32)),
                 });
                 look.own_place = block_position(self.margin_auto, self.parent_block_align);
+                // Its absolute `max-width` (#1940): its table's.
+                look.own_max_width = self
+                    .block_max
+                    .and_then(|l| l.twips(pt))
+                    .map(|t| Width::Twips(t.max(0) as u32));
             }
             Kind::Block => {
                 // Its own border (#1883): a left or right line is between
@@ -3520,21 +3567,29 @@ impl<'a> Html<'a> {
         let pushed = self.elems.len() < MAX_DEPTH && self.budget.work(1 + key.heap() / 16);
         if pushed {
             // A `div` in a cell may be a card (#1927): only with its blocks
-            // entry on `blocks`, room for one more table, and a cell as the
-            // innermost open table part (a `div` straight in a `table`,
-            // row group or row, which a browser moves out, is none: the
-            // builder's innermost table there has no cell open).
+            // entry on `blocks`, room for one more table, and a cell (or a
+            // card) as the innermost open table part (a `div` straight in
+            // a `table`, row group or row, which a browser moves out, is
+            // none: the builder's innermost table there has no cell open).
+            // Outside every table, one in the body (#1940), unless what is
+            // around it draws on its paragraphs ([`Self::body_card_fits`]).
+            let place = self
+                .elems
+                .iter()
+                .rev()
+                .find(|e| e.kind.table() || matches!(e.card, CardMode::Yes(_)));
+            let placed = match place {
+                Some(e) => {
+                    self.kept_table()
+                        && (e.kind == Kind::Cell || matches!(e.card, CardMode::Yes(_)))
+                }
+                None => self.table_depth == 0 && self.body_card_fits(),
+            };
             let candidate = name == "div"
                 && self.blocks.len() > blocks_at
                 && self.visible()
-                && self.kept_table()
                 && self.table_depth < MAX_TABLE_NESTING
-                && self
-                    .elems
-                    .iter()
-                    .rev()
-                    .find(|e| e.kind.table())
-                    .is_some_and(|e| e.kind == Kind::Cell);
+                && placed;
             let mode = if candidate {
                 CardMode::Maybe
             } else {
@@ -3884,12 +3939,19 @@ impl<'a> Html<'a> {
         // `</td>` closes a `div` left open.
         // A builder table above the innermost card with no `Elem` (one
         // opened past `MAX_DEPTH`) owns this close instead (#1927 r2).
-        if Kind::of(name).table() {
-            let from = self
-                .elems
-                .iter()
-                .rposition(|e| e.kind.table())
-                .map_or(0, |t| t + 1);
+        // With no table part open, a browser ignores it: a card in the
+        // body stays open, its table too (#1940).
+        let open_part = self.elems.iter().rposition(|e| e.kind.table());
+        if Kind::of(name).table() && open_part.is_none() && self.table_depth > 0 {
+            let card = self.elems.iter().rev().find_map(|e| match e.card {
+                CardMode::Yes(depth) => Some(depth),
+                _ => None,
+            });
+            if card.is_some_and(|depth| depth >= self.table_depth) {
+                return;
+            }
+        }
+        if let Some(from) = open_part.filter(|_| Kind::of(name).table()).map(|t| t + 1) {
             let innermost = self.elems[from..].iter().rev().find_map(|e| match e.card {
                 CardMode::Yes(depth) => Some(depth),
                 _ => None,
@@ -4086,6 +4148,19 @@ impl<'a> Html<'a> {
         !self.in_downlevel && !self.in_marker
     }
 
+    /// Whether a card may open in the body here (#1940): not in a list
+    /// (its number and indent are its paragraphs'), nor in a block whose
+    /// shading, side lines or own top or bottom line go on its paragraphs
+    /// (a quoted reply's rule, Outlook's reply header): a card's table
+    /// would drop them.
+    fn body_card_fits(&self) -> bool {
+        let parent = self.elems.last().map(|e| &e.look);
+        parent.is_none_or(|l| !l.in_list && l.shade.is_none() && l.borders == ParBorders::default())
+            && !self.elems.iter().any(|e| {
+                e.kind == Kind::Block && (e.look.own_top.is_some() || e.look.own_bottom.is_some())
+            })
+    }
+
     /// Open the card on top of `elems` (#1927): a one-cell table, as wide
     /// as its `width` (else its container), placed by its auto margins or
     /// its container's `-webkit-` alignment, no borders or cell spacing,
@@ -4103,9 +4178,11 @@ impl<'a> Html<'a> {
         let look = &e.look;
         let table = TableSpec {
             width: Some(look.own_width.unwrap_or(Width::Pct(100.0))),
+            max_width: look.own_max_width,
             cellpadding: Some(0),
             cellspacing: None,
-            room: None,
+            // In the body, the room around it (#1940); in a cell, none.
+            room: look.card_room,
             jc: match look.own_place {
                 Some(Align::Center) => Some("center"),
                 Some(Align::Right) => Some("right"),
@@ -4397,10 +4474,18 @@ impl<'a> Html<'a> {
             } else if e.kind == Kind::Cell {
                 room = width(e.look.own_width, table) - pads(&e.look);
             } else if e.look.own_card {
-                // A card's look starts afresh (#1927): its parent's indents
-                // are around it.
-                let around = parent.map_or(room, |p| outside(room, p)).max(0);
-                room = width(e.look.own_width, around) - pads(&e.look);
+                // A card's look starts afresh (#1927):
+                // its parent's indents are around it. In the body, its room
+                // (#1940), which has its own side margins too.
+                let around = match e.look.card_room {
+                    Some(r) => i64::from(r.width),
+                    None => parent.map_or(room, |p| outside(room, p)).max(0),
+                };
+                let mut w = width(e.look.own_width, around);
+                if let Some(max) = e.look.own_max_width {
+                    w = w.min(width(Some(max), around));
+                }
+                room = w - pads(&e.look);
             }
             room = room.clamp(0, body);
             parent = Some(&e.look);
@@ -7944,14 +8029,25 @@ mod image_tests {
         (doc, media, asked)
     }
 
+    /// Every paragraph, in tables too (a padded background `div` is a
+    /// card, #1940), in document order.
     fn paras(d: &Document) -> Vec<&Paragraph> {
-        d.body
-            .iter()
-            .filter_map(|b| match b {
-                DocBlock::Paragraph(p) => Some(p),
-                _ => None,
-            })
-            .collect()
+        fn walk<'d>(blocks: &'d [DocBlock], out: &mut Vec<&'d Paragraph>) {
+            for b in blocks {
+                match b {
+                    DocBlock::Paragraph(p) => out.push(p),
+                    DocBlock::Table(t) => {
+                        for c in t.rows.iter().flat_map(|r| &r.cells) {
+                            walk(&c.blocks, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&d.body, &mut out);
+        out
     }
 
     fn pictures(p: &Paragraph) -> Vec<&str> {
@@ -10365,10 +10461,14 @@ mod card_tests {
         // Padding alone is still indent, as before.
         let d = doc("<table><tr><td><div style='padding:8px'>x</div></td></tr></table>");
         assert_eq!(para(&d, "x").props.indent, 120);
-        // Outside any table: paragraph shading, as before.
-        let d = doc("<div style='background:#eee;padding:8px'>x</div>");
+        // Outside any table, a background alone is still paragraph
+        // shading; with padding it is a card too (#1940).
+        let d = doc("<div style='background:#eee'>x</div>");
         assert_eq!(table_count(&d.body), 0);
         assert!(shaded(para(&d, "x")));
+        let d = doc("<div style='background:#eee;padding:8px'>x</div>");
+        assert_eq!(table_count(&d.body), 1);
+        assert!(!shaded(para(&d, "x")));
         // At the nesting limit: paragraph shading in the innermost cell.
         let open = "<table><tr><td>".repeat(MAX_TABLE_NESTING);
         let d = doc(&format!("{open}<div style='background:#eee'>x</div>"));
@@ -12188,3 +12288,8 @@ mod tests_1912;
 #[cfg(test)]
 #[path = "html_tests_1930.rs"]
 mod tests_1930;
+
+// The leftovers of #1927 (#1940): cards in the body, adjacent tables.
+#[cfg(test)]
+#[path = "html_tests_1940.rs"]
+mod tests_1940;
