@@ -1389,7 +1389,8 @@ impl<'b> Builder<'b> {
     /// The end of HTML table `t`: what is pending is its last cell and row;
     /// nested, it waits in its enclosing cell as a [`html_table::RawTable`]
     /// at a placeholder; outermost, it is laid out in the body's width, or
-    /// in the room of the centred block it is in (#2114).
+    /// in the room of the centred block it is in (#2114) or a body card's
+    /// (#1940), after an empty paragraph when it follows another table.
     fn end_html_table(&mut self, mut t: TableAcc, mut h: HtmlAcc) {
         if !t.blocks.is_empty() || h.cell.is_some() {
             let cell = html_table::RawCell {
@@ -1441,6 +1442,12 @@ impl<'b> Builder<'b> {
                 }
             }
             _ => {
+                // And in the body (#1940): a table or card right after
+                // another would be joined to it.
+                if matches!(self.body.last(), Some(Block::Table(_))) && self.budget.keep::<Block>(0)
+                {
+                    self.body.push(Block::Paragraph(Paragraph::default()));
+                }
                 let avail = raw.spec.room.map_or(html_table::BODY_TWIPS, |r| r.width);
                 let table = html_table::layout(raw, avail, self.budget);
                 self.body.push(Block::Table(table));

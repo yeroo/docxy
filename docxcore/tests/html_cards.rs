@@ -2,6 +2,9 @@
 //! cells and `div` cards nested three levels deep. Each level keeps its own
 //! background as its cell's `w:shd` and its padding as its `w:tcMar`, a
 //! `div` card as a one-cell table of its own, through save and load.
+//! Cards in the body (#1940): a padded background `div` outside every
+//! table is one too, unless it is a background alone or what is around it
+//! draws on its paragraphs; tables back to back are kept apart.
 
 use docxcore::import::import_html_with;
 use docxcore::model::{Block, Document, Table};
@@ -146,4 +149,80 @@ fn cards_survive_save_and_reload() {
     let pkg = digest().package();
     let back = load_package(&save_package(&pkg)).unwrap();
     check_levels(&back.document);
+}
+
+fn notice() -> docxcore::import::HtmlImport {
+    let mut resolve = |_: &str, _: usize| None;
+    import_html_with(&fixture("toplevel-cards.html"), &mut resolve).unwrap()
+}
+
+fn tblpr(t: &Table) -> &str {
+    t.raw_tblpr.as_deref().unwrap_or("")
+}
+
+fn shaded(b: &Block) -> bool {
+    matches!(b, Block::Paragraph(p) if p.props.raw_props.iter().any(|r| r.starts_with("<w:shd")))
+}
+
+/// The office notice's body (#1940), as the importer and a save and load
+/// give it.
+fn check_notice(d: &Document) {
+    let body: Vec<&Block> = d
+        .body
+        .iter()
+        .filter(|b| matches!(b, Block::Paragraph(_) | Block::Table(_)))
+        .collect();
+    let owned: Vec<Block> = body.iter().map(|b| (*b).clone()).collect();
+    assert_eq!(
+        texts(&owned),
+        [
+            "Hi team,",
+            "[table]",
+            "",
+            "[table]",
+            "",
+            "[table]",
+            "",
+            "[table]",
+            "Quoted note",
+        ]
+    );
+    // An Outlook line: a background alone, still paragraph shading.
+    assert!(shaded(body[0]));
+    let cards = tables(&d.body);
+    assert_eq!(cards.len(), 4);
+    // The callout: its fill and padding, the table in it on its fill.
+    let callout = cards[0];
+    assert!(tcpr(callout, 0).contains(&fill("FFF4E5")));
+    assert!(tcpr(callout, 0).contains(&tcmar(180, 240, 180, 240)));
+    assert_eq!(tables(blocks(callout, 0)).len(), 1);
+    assert!(!blocks(callout, 0).iter().any(shaded));
+    // The centred summary: 600 px, centred.
+    let summary = cards[1];
+    assert!(tcpr(summary, 0).contains(&fill("FAFAFA")));
+    assert!(tblpr(summary).contains(r#"<w:tblW w:w="9000" w:type="dxa"/>"#));
+    assert!(tblpr(summary).contains(r#"<w:jc w:val="center"/>"#));
+    // Two stacked cards, one empty paragraph apart.
+    for card in &cards[2..] {
+        assert!(tcpr(card, 0).contains(&fill("EEF2FF")));
+        assert!(tcpr(card, 0).contains(&tcmar(120, 120, 120, 120)));
+    }
+    // In a quoted reply's rule: shaded and ruled, as before.
+    assert!(shaded(body[8]));
+    let Block::Paragraph(quoted) = body[8] else {
+        unreachable!()
+    };
+    assert!(quoted.props.borders.left.is_some());
+}
+
+#[test]
+fn body_cards_import_as_one_cell_tables_1940() {
+    check_notice(&notice().document);
+}
+
+#[test]
+fn body_cards_survive_save_and_reload_1940() {
+    let pkg = notice().package();
+    let back = load_package(&save_package(&pkg)).unwrap();
+    check_notice(&back.document);
 }

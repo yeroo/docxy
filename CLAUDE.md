@@ -76,7 +76,8 @@ issue number to find its notes.
   bookmarks, the Hyperlink style, relative links, titles and targets,
   Markdown link destinations (#1912), rounded images (#1926), corners
   that differ, rounded wrappers and the editable page's crop (#1936),
-  nested cards (#1927), page margins (#1928), Outlook mail: CSS-only spacing,
+  nested cards (#1927), cards in the body, adjacent body tables (#1940),
+  page margins (#1928), Outlook mail: CSS-only spacing,
   quirks-mode edges, list indents, item continuations, marker look (#1979),
   list and parent margins, trailing `<br>`, wide hangs, wrapper tables (#2114),
   a picture in a link keeping it as its click link (#1999), hidden blocks,
