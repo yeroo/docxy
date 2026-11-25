@@ -1208,4 +1208,108 @@ mod tests {
         assert_eq!(a, c);
         assert_eq!(images.into_parts().0.len(), 1);
     }
+    #[test]
+    fn resolve_ref_follows_rfc_3986_1898() {
+        let r = resolve_ref;
+        let base = "http://a/b/c/d;p?q";
+        // RFC 3986 section 5.4.1's normal examples.
+        for (reference, want) in [
+            ("g:h", "g:h"),
+            ("g", "http://a/b/c/g"),
+            ("./g", "http://a/b/c/g"),
+            ("g/", "http://a/b/c/g/"),
+            ("/g", "http://a/g"),
+            ("//g", "http://g"),
+            ("?y", "http://a/b/c/d;p?y"),
+            ("g?y", "http://a/b/c/g?y"),
+            ("#s", "http://a/b/c/d;p?q#s"),
+            ("g#s", "http://a/b/c/g#s"),
+            ("g?y#s", "http://a/b/c/g?y#s"),
+            (";x", "http://a/b/c/;x"),
+            ("g;x", "http://a/b/c/g;x"),
+            (".", "http://a/b/c/"),
+            ("./", "http://a/b/c/"),
+            ("..", "http://a/b/"),
+            ("../", "http://a/b/"),
+            ("../g", "http://a/b/g"),
+            ("../..", "http://a/"),
+            ("../../g", "http://a/g"),
+            // Abnormal: no `..` above the root.
+            ("../../../g", "http://a/g"),
+            ("/./g", "http://a/g"),
+            ("g/./h", "http://a/b/c/g/h"),
+            ("g/../h", "http://a/b/c/h"),
+        ] {
+            assert_eq!(r(base, reference), want, "{reference}");
+        }
+        // A host with no path.
+        assert_eq!(
+            r("https://example.com", "a.png"),
+            "https://example.com/a.png"
+        );
+        // A `file:` base, as Word's MHTML root.
+        assert_eq!(
+            r("file:///C:/X/doc.htm", "doc_files/image001.png"),
+            "file:///C:/X/doc_files/image001.png"
+        );
+        // A relative base gives a relative src; a `..` it cannot remove stays.
+        assert_eq!(r("img/", "a.png"), "img/a.png");
+        assert_eq!(r("img/x/", "../a.png"), "img/a.png");
+        assert_eq!(r("../shared/", "a.png"), "../shared/a.png");
+        // A src with a scheme is itself.
+        assert_eq!(r("img/", "cid:logo@x"), "cid:logo@x");
+    }
+    #[test]
+    fn srcset_candidates_parse_as_the_html_standard_splits_them_1898() {
+        let c = srcset_candidates;
+        let own = |v: &[(&str, f64)]| -> Vec<(String, f64)> {
+            v.iter().map(|(u, d)| (u.to_string(), *d)).collect()
+        };
+        // `1x` and bare first, then the rest as written; `w` is 1.
+        assert_eq!(
+            c("big.png 2x, small.png 1x, plain.png, wide.png 800w"),
+            own(&[
+                ("small.png", 1.0),
+                ("plain.png", 1.0),
+                ("big.png", 2.0),
+                ("wide.png", 1.0)
+            ])
+        );
+        // A `data:` URI keeps its commas; a trailing comma ends a candidate.
+        assert_eq!(
+            c("data:image/png;base64,AA,BB 2x,a.png, b.png 1.5x"),
+            own(&[
+                ("a.png", 1.0),
+                ("data:image/png;base64,AA,BB", 2.0),
+                ("b.png", 1.5)
+            ])
+        );
+        // A URL runs to white space, commas and all, as the standard reads it.
+        assert_eq!(c("a.png,b.png 2x"), own(&[("a.png,b.png", 2.0)]));
+        // Bad descriptors drop the candidate: two, zero, unknown, negative.
+        assert_eq!(
+            c("a.png 1x 2x, b.png 0x, c.png 3q, d.png -1x, e.png 2X"),
+            own(&[("e.png", 2.0)])
+        );
+        // Parentheses hold a comma inside descriptors (a future descriptor).
+        assert_eq!(c("a.png foo(1,2), b.png"), own(&[("b.png", 1.0)]));
+        assert!(c("  , ,").is_empty());
+    }
+    /// An SVG with a prolog, a comment and a doctype, and a WebP header.
+    const SVG: &str = "<?xml version=\"1.0\"?>\n<!-- logo -->\n<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"x\" [<!ENTITY a \"b\">]>\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"30\" height=\"10\"/>";
+    const WEBP: &[u8] = b"RIFF\x1a\x00\x00\x00WEBPVP8L\x0d\x00\x00\x00";
+
+    #[test]
+    fn convertible_tells_svg_and_webp_apart_from_the_rest_1898() {
+        let c = convertible;
+        assert_eq!(c(SVG.as_bytes()), Some(ConvertKind::Svg));
+        assert_eq!(c(b"\xEF\xBB\xBF  <svg>"), Some(ConvertKind::Svg));
+        assert_eq!(c(b"<svg\nviewBox='0 0 1 1'/>"), Some(ConvertKind::Svg));
+        assert_eq!(c(WEBP), Some(ConvertKind::Webp));
+        assert_eq!(c(b"<svgx>"), None);
+        assert_eq!(c(b"<html><svg></svg></html>"), None);
+        assert_eq!(c(b"<!-- unclosed <svg>"), None);
+        assert_eq!(c(b"RIFF\0\0\0\0WAVEfmt "), None);
+        assert_eq!(c(b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR"), None);
+    }
 }

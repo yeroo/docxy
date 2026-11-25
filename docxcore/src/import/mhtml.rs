@@ -77,15 +77,15 @@ pub(crate) fn parse<'a>(bytes: &'a [u8], budget: &Budget) -> Option<Mhtml<'a>> {
     let (headers, body_at) = top_headers(bytes)?;
     let content_type = related_type(&headers)?;
     let params = type_params(&content_type);
-    let boundary = param(&params, "boundary").filter(|b| !b.is_empty() && b.len() <= 200)?;
+    let boundary = field(&params, "boundary").filter(|b| !b.is_empty() && b.len() <= 200)?;
     if !budget.scanned(bytes.len() - body_at) {
         return None;
     }
     let delimiter = format!("--{boundary}");
     let mut parts = Vec::new();
     let mut root: Option<(Fields, (usize, usize))> = None;
-    let start = param(&params, "start").map(|s| content_id(&s));
-    let root_type = param(&params, "type").map(|t| t.to_ascii_lowercase());
+    let start = field(&params, "start").map(|s| content_id(&s));
+    let root_type = field(&params, "type").map(|t| t.to_ascii_lowercase());
     // The root candidates while no `start` part is found: the first part
     // of the `type` given, else the first `text/html` one.
     let mut first_html: Option<(Fields, (usize, usize))> = None;
@@ -109,15 +109,10 @@ pub(crate) fn parse<'a>(bytes: &'a [u8], budget: &Budget) -> Option<Mhtml<'a>> {
         if parts.len() >= MAX_PARTS || !budget.keep::<Part>(64) {
             break;
         }
-        let get = |name: &str| header(&part_headers, name);
+        let get = |name: &str| field(&part_headers, name);
         let cid = get("content-id").map(|c| content_id(&c));
         let ptype = get("content-type").unwrap_or_default();
-        let mime = ptype
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
+        let mime = essence(&ptype);
         let body = (body_at, part_end);
         let is_start = start.is_some() && cid == start;
         let is_type = match root_type.as_deref() {
@@ -143,15 +138,12 @@ pub(crate) fn parse<'a>(bytes: &'a [u8], budget: &Budget) -> Option<Mhtml<'a>> {
         }
     }
     let (root_headers, (from, to)) = root.or(first_html)?;
-    let get = |name: &str| header(&root_headers, name);
+    let get = |name: &str| field(&root_headers, name);
     let root_type = get("content-type").unwrap_or_default();
-    let root_mime = root_type
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    if !matches!(root_mime.as_str(), "text/html" | "application/xhtml+xml") {
+    if !matches!(
+        essence(&root_type).as_str(),
+        "text/html" | "application/xhtml+xml"
+    ) {
         return None;
     }
     let raw = &bytes[from..to];
@@ -163,7 +155,7 @@ pub(crate) fn parse<'a>(bytes: &'a [u8], budget: &Budget) -> Option<Mhtml<'a>> {
     if !budget.take_bytes(html.len()) {
         return None;
     }
-    let charset = param(&type_params(&root_type), "charset").map(|c| c.to_ascii_lowercase());
+    let charset = field(&type_params(&root_type), "charset").map(|c| c.to_ascii_lowercase());
     Some(Mhtml {
         bytes,
         parts,
@@ -221,7 +213,7 @@ impl Mhtml<'_> {
 /// The message's top header block (unfolded `(name, value)` pairs, names
 /// lowercase) and where its body starts: `None` unless it is a header block
 /// that ends with a blank line within [`MAX_HEADER`] bytes.
-fn top_headers(bytes: &[u8]) -> Option<(Vec<(String, String)>, usize)> {
+fn top_headers(bytes: &[u8]) -> Option<(Fields, usize)> {
     let from = if bytes.starts_with(b"\xEF\xBB\xBF") {
         3
     } else {
@@ -234,9 +226,9 @@ fn top_headers(bytes: &[u8]) -> Option<(Vec<(String, String)>, usize)> {
 /// the body after its blank line starts. `None` when a line is not a
 /// field (`name: value`, or a fold of one) or no blank line ends it within
 /// [`MAX_HEADER`] bytes of `from`.
-fn header_block(bytes: &[u8], from: usize, to: usize) -> Option<(Vec<(String, String)>, usize)> {
+fn header_block(bytes: &[u8], from: usize, to: usize) -> Option<(Fields, usize)> {
     let to = to.min(from.saturating_add(MAX_HEADER)).min(bytes.len());
-    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut fields: Fields = Vec::new();
     let mut at = from;
     while at < to {
         let end = memchr(b'\n', &bytes[..to], at)?;
@@ -266,27 +258,34 @@ fn header_block(bytes: &[u8], from: usize, to: usize) -> Option<(Vec<(String, St
     None
 }
 
-/// The value of the first field `name` (lowercase).
-fn header(fields: &[(String, String)], name: &str) -> Option<String> {
+/// The value of the first of `fields` (a header block's, or a
+/// `Content-Type`'s parameters) named `name` (lowercase).
+fn field(fields: &[(String, String)], name: &str) -> Option<String> {
     fields
         .iter()
         .find(|(n, _)| n == name)
         .map(|(_, v)| v.clone())
 }
 
+/// A `Content-Type`'s type and subtype, lowercase, without parameters.
+fn essence(content_type: &str) -> String {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
 /// The message's `Content-Type`, when it is `multipart/related`.
 fn related_type(fields: &[(String, String)]) -> Option<String> {
-    let t = header(fields, "content-type")?;
-    t.split(';')
-        .next()?
-        .trim()
-        .eq_ignore_ascii_case("multipart/related")
-        .then_some(t)
+    let t = field(fields, "content-type")?;
+    (essence(&t) == "multipart/related").then_some(t)
 }
 
 /// A `Content-Type`'s parameters (`name=value` after its `;`s, a quoted
 /// value unquoted), names lowercase.
-fn type_params(content_type: &str) -> Vec<(String, String)> {
+fn type_params(content_type: &str) -> Fields {
     let mut out = Vec::new();
     let mut rest = match content_type.find(';') {
         Some(i) => &content_type[i + 1..],
@@ -313,13 +312,6 @@ fn type_params(content_type: &str) -> Vec<(String, String)> {
         rest = after;
     }
     out
-}
-
-fn param(params: &[(String, String)], name: &str) -> Option<String> {
-    params
-        .iter()
-        .find(|(n, _)| n == name)
-        .map(|(_, v)| v.clone())
 }
 
 /// A `Content-ID` (or a `start` parameter) without its angle brackets,
@@ -375,7 +367,7 @@ fn memchr(b: u8, bytes: &[u8], from: usize) -> Option<usize> {
 
 /// Quoted-printable decoded: `=XX` a byte, `=` at a line's end a soft
 /// break (removed with its CRLF or LF), any other `=` as it is.
-pub(crate) fn quoted_printable(raw: &[u8]) -> Vec<u8> {
+fn quoted_printable(raw: &[u8]) -> Vec<u8> {
     let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
     let mut out = Vec::with_capacity(raw.len());
     let mut i = 0;
@@ -414,4 +406,57 @@ pub(crate) fn quoted_printable(raw: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A message whose root names an image part `a.png`, base64.
+    const MSG: &[u8] = b"Content-Type: multipart/related; boundary=b\n\n\
+        --b\nContent-Type: text/html\nContent-Location: http://x/p.html\n\n<p>x</p>\n\
+        --b\nContent-Type: image/png\nContent-Location: http://x/a%20b.png\n\
+        Content-Transfer-Encoding: base64\n\nTWFu\n--b--\n";
+
+    #[test]
+    fn a_part_too_big_for_the_limit_is_not_read_1898() {
+        let m = parse(MSG, &Budget::standard()).unwrap();
+        assert_eq!(m.location.as_deref(), Some("http://x/p.html"));
+        assert_eq!(m.html, b"<p>x</p>");
+        // Its decoded bound (3 bytes for 4 of base64, plus slack) passes 3.
+        assert_eq!(m.part_for("http://x/a%20b.png", 3), Some(None));
+        assert_eq!(
+            m.part_for("http://x/a%20b.png", 1 << 20),
+            Some(Some(b"Man".to_vec()))
+        );
+        // Percent-decoded, the location matches too.
+        assert_eq!(
+            m.part_for("http://x/a b.png", 1 << 20),
+            Some(Some(b"Man".to_vec()))
+        );
+        assert_eq!(m.part_for("http://x/other.png", 1 << 20), None);
+    }
+
+    #[test]
+    fn a_root_that_is_no_html_is_no_mhtml_1898() {
+        let msg = b"Content-Type: multipart/related; boundary=b\n\n--b\nContent-Type: text/plain\n\nhi\n--b--\n";
+        assert!(parse(msg, &Budget::standard()).is_none());
+        // No boundary.
+        assert!(
+            parse(
+                b"Content-Type: multipart/related\n\n<p>x</p>",
+                &Budget::standard()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn quoted_printable_decodes_soft_breaks_and_escapes_1898() {
+        let qp = quoted_printable;
+        assert_eq!(
+            qp(b"a=3Db=\r\nc=\nd= \r\ne=E9=zz="),
+            b"a=bcde\xE9=zz".to_vec()
+        );
+    }
 }

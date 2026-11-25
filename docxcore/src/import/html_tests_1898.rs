@@ -214,58 +214,6 @@ fn max_width_bounds_a_sized_placeholder_and_leaves_an_unsized_one_1898() {
 }
 
 #[test]
-fn resolve_ref_follows_rfc_3986_1898() {
-    use html_image::resolve_ref as r;
-    let base = "http://a/b/c/d;p?q";
-    // RFC 3986 section 5.4.1's normal examples.
-    for (reference, want) in [
-        ("g:h", "g:h"),
-        ("g", "http://a/b/c/g"),
-        ("./g", "http://a/b/c/g"),
-        ("g/", "http://a/b/c/g/"),
-        ("/g", "http://a/g"),
-        ("//g", "http://g"),
-        ("?y", "http://a/b/c/d;p?y"),
-        ("g?y", "http://a/b/c/g?y"),
-        ("#s", "http://a/b/c/d;p?q#s"),
-        ("g#s", "http://a/b/c/g#s"),
-        ("g?y#s", "http://a/b/c/g?y#s"),
-        (";x", "http://a/b/c/;x"),
-        ("g;x", "http://a/b/c/g;x"),
-        (".", "http://a/b/c/"),
-        ("./", "http://a/b/c/"),
-        ("..", "http://a/b/"),
-        ("../", "http://a/b/"),
-        ("../g", "http://a/b/g"),
-        ("../..", "http://a/"),
-        ("../../g", "http://a/g"),
-        // Abnormal: no `..` above the root.
-        ("../../../g", "http://a/g"),
-        ("/./g", "http://a/g"),
-        ("g/./h", "http://a/b/c/g/h"),
-        ("g/../h", "http://a/b/c/h"),
-    ] {
-        assert_eq!(r(base, reference), want, "{reference}");
-    }
-    // A host with no path.
-    assert_eq!(
-        r("https://example.com", "a.png"),
-        "https://example.com/a.png"
-    );
-    // A `file:` base, as Word's MHTML root.
-    assert_eq!(
-        r("file:///C:/X/doc.htm", "doc_files/image001.png"),
-        "file:///C:/X/doc_files/image001.png"
-    );
-    // A relative base gives a relative src; a `..` it cannot remove stays.
-    assert_eq!(r("img/", "a.png"), "img/a.png");
-    assert_eq!(r("img/x/", "../a.png"), "img/a.png");
-    assert_eq!(r("../shared/", "a.png"), "../shared/a.png");
-    // A src with a scheme is itself.
-    assert_eq!(r("img/", "cid:logo@x"), "cid:logo@x");
-}
-
-#[test]
 fn a_base_href_resolves_every_src_but_a_data_one_1898() {
     let data = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAACCAIAAAA=";
     let (_, asked) = import(&format!(
@@ -299,43 +247,6 @@ fn an_absolute_base_makes_an_absolute_src_1898() {
 fn no_base_leaves_srcs_as_they_were_1898() {
     let (_, asked) = import("<p><img src='x_files/a.png'><img src='../b.png'></p>");
     assert_eq!(asked, ["x_files/a.png", "../b.png"]);
-}
-
-#[test]
-fn srcset_candidates_parse_as_the_html_standard_splits_them_1898() {
-    use html_image::srcset_candidates as c;
-    let own = |v: &[(&str, f64)]| -> Vec<(String, f64)> {
-        v.iter().map(|(u, d)| (u.to_string(), *d)).collect()
-    };
-    // `1x` and bare first, then the rest as written; `w` is 1.
-    assert_eq!(
-        c("big.png 2x, small.png 1x, plain.png, wide.png 800w"),
-        own(&[
-            ("small.png", 1.0),
-            ("plain.png", 1.0),
-            ("big.png", 2.0),
-            ("wide.png", 1.0)
-        ])
-    );
-    // A `data:` URI keeps its commas; a trailing comma ends a candidate.
-    assert_eq!(
-        c("data:image/png;base64,AA,BB 2x,a.png, b.png 1.5x"),
-        own(&[
-            ("a.png", 1.0),
-            ("data:image/png;base64,AA,BB", 2.0),
-            ("b.png", 1.5)
-        ])
-    );
-    // A URL runs to white space, commas and all, as the standard reads it.
-    assert_eq!(c("a.png,b.png 2x"), own(&[("a.png,b.png", 2.0)]));
-    // Bad descriptors drop the candidate: two, zero, unknown, negative.
-    assert_eq!(
-        c("a.png 1x 2x, b.png 0x, c.png 3q, d.png -1x, e.png 2X"),
-        own(&[("e.png", 2.0)])
-    );
-    // Parentheses hold a comma inside descriptors (a future descriptor).
-    assert_eq!(c("a.png foo(1,2), b.png"), own(&[("b.png", 1.0)]));
-    assert!(c("  , ,").is_empty());
 }
 
 #[test]
@@ -561,32 +472,10 @@ fn a_cid_src_names_a_part_by_its_content_id_and_start_names_the_root_1898() {
 }
 
 #[test]
-fn a_part_too_big_for_the_limit_is_not_read_and_not_asked_for_1898() {
-    let bytes = word_mht();
-    let m = super::super::mhtml::parse(&bytes, &Budget::standard()).unwrap();
-    let src = "file:///C:/X/doc_files/image001.png";
-    assert_eq!(m.part_for(src, 3), Some(None));
-    assert_eq!(m.part_for(src, 1 << 20), Some(Some(png(8, 4))));
-    assert_eq!(m.part_for("file:///C:/X/other.png", 1 << 20), None);
-}
-
-#[test]
 fn a_malformed_message_is_read_as_a_page_1898() {
     // No boundary: not MHTML, never an error of its own.
     let d = import_html(b"Content-Type: multipart/related\n\n<p>body</p>").unwrap();
     assert_eq!(paragraph_texts(&d).last().map(String::as_str), Some("body"));
-    // A root that is no HTML.
-    let msg = b"Content-Type: multipart/related; boundary=b\n\n--b\nContent-Type: text/plain\n\nhi\n--b--\n";
-    assert!(super::super::mhtml::parse(msg, &Budget::standard()).is_none());
-}
-
-#[test]
-fn quoted_printable_decodes_soft_breaks_and_escapes_1898() {
-    use super::super::mhtml::quoted_printable as qp;
-    assert_eq!(
-        qp(b"a=3Db=\r\nc=\nd= \r\ne=E9=zz="),
-        b"a=bcde\xE9=zz".to_vec()
-    );
 }
 
 #[test]
@@ -637,20 +526,6 @@ fn converting(html: &str) -> (HtmlImport, Vec<ConvertKind>) {
 }
 
 use html_image::ConvertKind;
-
-#[test]
-fn convertible_tells_svg_and_webp_apart_from_the_rest_1898() {
-    use html_image::convertible as c;
-    assert_eq!(c(SVG.as_bytes()), Some(ConvertKind::Svg));
-    assert_eq!(c(b"\xEF\xBB\xBF  <svg>"), Some(ConvertKind::Svg));
-    assert_eq!(c(b"<svg\nviewBox='0 0 1 1'/>"), Some(ConvertKind::Svg));
-    assert_eq!(c(WEBP), Some(ConvertKind::Webp));
-    assert_eq!(c(b"<svgx>"), None);
-    assert_eq!(c(b"<html><svg></svg></html>"), None);
-    assert_eq!(c(b"<!-- unclosed <svg>"), None);
-    assert_eq!(c(b"RIFF\0\0\0\0WAVEfmt "), None);
-    assert_eq!(c(&png(1, 1)), None);
-}
 
 #[test]
 fn without_a_converter_svg_and_webp_stay_placeholders_1898() {
@@ -779,26 +654,6 @@ fn a_converters_bad_answer_leaves_a_placeholder_1898() {
     };
     let got = import_html_with_converter(page.as_bytes(), &mut resolve, &mut convert).unwrap();
     assert_eq!(got.media[0].bytes, html_image::PLACEHOLDER_PNG);
-}
-
-#[test]
-fn with_svg_blip_opens_a_self_closing_blip_only_1898() {
-    let raw = crate::image::inline_picture_run_shaped(
-        "rId1",
-        10,
-        10,
-        1,
-        "x",
-        "",
-        None,
-        crate::image::PictureShape::Rect,
-    );
-    let with = crate::image::with_svg_blip(&raw, "rId2").unwrap();
-    assert_eq!(crate::image::inline_embeds(&with), ["rId1", "rId2"]);
-    assert!(with.contains("</a:blip><a:stretch>"), "{with}");
-    // A blip with children already is left alone.
-    assert_eq!(crate::image::with_svg_blip(&with, "rId3"), None);
-    assert_eq!(crate::image::with_svg_blip("<w:r/>", "rId3"), None);
 }
 
 #[test]

@@ -1242,4 +1242,14 @@ mod tests {
             Some(quoted.replace("'rIdHtmlLink1'", "'rId9'"))
         );
     }
+    #[test]
+    fn with_svg_blip_opens_a_self_closing_blip_only_1898() {
+        let raw = inline_picture_run_shaped("rId1", 10, 10, 1, "x", "", None, PictureShape::Rect);
+        let with = with_svg_blip(&raw, "rId2").unwrap();
+        assert_eq!(inline_embeds(&with), ["rId1", "rId2"]);
+        assert!(with.contains("</a:blip><a:stretch>"), "{with}");
+        // A blip with children already is left alone.
+        assert_eq!(with_svg_blip(&with, "rId3"), None);
+        assert_eq!(with_svg_blip("<w:r/>", "rId3"), None);
+    }
 }
