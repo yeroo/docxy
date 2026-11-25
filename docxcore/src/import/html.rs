@@ -622,9 +622,14 @@ struct Look {
     /// `-webkit-right` (`<center>`, `align` on a `div`, `p`, `caption` or
     /// table part), else `None`. A plain `text-align` clears it.
     block_align: Option<Align>,
-    /// Inside a table cell (inherited): a fixed-width block's centring
-    /// needs the body width, unknown there (#1922).
+    /// Inside a table cell (inherited): a fixed-width block is centred in
+    /// the cell's width, unknown until the table is laid out (#1922), so it
+    /// is recorded in `cell_boxes` instead (#1930).
     in_cell: bool,
+    /// The fixed-width blocks with both side margins auto this element is
+    /// in, in its cell, outermost first (inherited, reset by a cell and a
+    /// card, #1930): what [`html_table::layout`] centres a paragraph in.
+    cell_boxes: Vec<html_table::CellBox>,
     /// Inside a fixed-width block centred in the body (inherited, #2114):
     /// an outermost table is laid out in the room its indents leave.
     centred_box: bool,
@@ -649,6 +654,10 @@ struct Look {
     /// inside keeps its place and the line stays at the box's).
     border_left_x: i32,
     border_right_x: i32,
+    /// How many of `cell_boxes` the block drawing each of those lines is
+    /// in (#1930): the lines move with those boxes' centring only.
+    border_left_boxes: usize,
+    border_right_boxes: usize,
     /// A top or bottom line of its own (not inherited, #1883): it
     /// separates margins as padding does.
     border_before: bool,
@@ -1049,7 +1058,7 @@ fn align_attr(v: &str) -> Option<Align> {
 
 /// The explicit zero indent of an HTML item paragraph at the margin
 /// (FIX r1 m6), which overrides its numbering level's.
-const ZERO_IND: &str = "<w:ind w:left=\"0\" w:hanging=\"0\"/>";
+pub(super) const ZERO_IND: &str = "<w:ind w:left=\"0\" w:hanging=\"0\"/>";
 
 /// A browser's outside list marker with its space, in `em` of the item's
 /// font (#1979, measured in Chrome): `"1. "` and `"• "`. A list item's
@@ -1398,6 +1407,7 @@ impl Cascade {
             // alignment, line height) still passes in.
             look.indent = 0;
             look.indent_right = 0;
+            look.cell_boxes.clear();
             look.first_line = 0;
             look.shade = None;
             look.borders = ParBorders::default();
@@ -2317,6 +2327,7 @@ impl Cascade {
             look.in_cell = true;
             look.indent = 0;
             look.indent_right = 0;
+            look.cell_boxes.clear();
             look.first_line = 0;
             look.shade = None;
             look.borders = ParBorders::default();
@@ -2397,6 +2408,14 @@ impl Cascade {
                         look.indent = clamp_twips(i64::from(look.indent) + extra);
                         look.indent_right = clamp_twips(i64::from(look.indent_right) + extra);
                         look.centred_box = true;
+                    } else if look.cell_boxes.len() < MAX_DEPTH {
+                        // In a cell, centred in its width when the table is
+                        // laid out (#1930).
+                        look.cell_boxes.push(html_table::CellBox {
+                            width: width.max(0),
+                            indent: look.indent,
+                            indent_right: look.indent_right,
+                        });
                     }
                 }
                 if let Some(fill) = self.background {
@@ -2408,10 +2427,12 @@ impl Cascade {
                     let pad = |i: usize| i64::from(tw(self.padding[i]).unwrap_or(0));
                     if own[3].is_some() {
                         look.border_left_x = clamp_twips(i64::from(look.indent) - pad(3) - left_w);
+                        look.border_left_boxes = look.cell_boxes.len();
                     }
                     if own[1].is_some() {
                         look.border_right_x =
                             clamp_twips(i64::from(look.indent_right) - pad(1) - right_w);
+                        look.border_right_boxes = look.cell_boxes.len();
                     }
                     if own[0].is_some() {
                         look.pad_before = 0;
@@ -4744,10 +4765,7 @@ impl<'a> Html<'a> {
         if look.borders.any() {
             // A left or right line's `w:space` is what is between it and
             // this paragraph's text (#1883), in whole points up to Word's 31.
-            let space = |gap: i32, b: &ParBorder| {
-                let gap = f64::from(gap) - f64::from(b.sz) * 2.5;
-                (gap / 20.0).round().clamp(0.0, 31.0) as u16
-            };
+            let space = |gap: i32, b: &ParBorder| html_table::line_space(gap, b.sz);
             let mut b = look.borders;
             if let Some(l) = b.left.as_mut() {
                 l.space = space(p.indent - look.border_left_x, l);
@@ -4764,6 +4782,27 @@ impl<'a> Html<'a> {
             p.raw_props.push(rpr);
         }
         p
+    }
+
+    /// What a paragraph ended now with `props` needs to be centred in its
+    /// cell (#1930): `None` outside every centred box there.
+    fn cell_centring(&self, props: &ParProps) -> Option<html_table::CellCentring> {
+        let look = self.para_look().filter(|l| !l.cell_boxes.is_empty())?;
+        Some(html_table::CellCentring {
+            boxes: look.cell_boxes.clone(),
+            indent: look.indent,
+            indent_right: look.indent_right,
+            lines: [
+                props
+                    .borders
+                    .left
+                    .map(|_| (look.border_left_boxes, look.border_left_x)),
+                props
+                    .borders
+                    .right
+                    .map(|_| (look.border_right_boxes, look.border_right_x)),
+            ],
+        })
     }
 
     fn reset_para(&mut self) {
@@ -4866,7 +4905,17 @@ impl<'a> Html<'a> {
             }
         }
         props.spacing.before = Some(self.top_spacing(in_table));
+        // In centred boxes in a cell: its layout centres it (#1930), once
+        // the paragraph is surely the flow's last block (a refused one is
+        // not).
+        let centring = self.cell_centring(&props).filter(|_| in_table);
+        let len = self.out.flow_len(in_table);
         self.out.end_para(props, in_table);
+        if let Some(c) = centring {
+            if len.is_some_and(|n| self.out.flow_len(in_table) == Some(n + 1)) {
+                self.out.mark_cell_boxes(c);
+            }
+        }
         self.out.set_tail(in_table, FlowTail::default());
         if holds_number {
             let at = self.out.flow_len(in_table).and_then(|n| n.checked_sub(1));
@@ -9327,15 +9376,22 @@ mod centering_tests {
             indents("<div style='width:300px;width:auto;margin:0 auto'>x</div>"),
             [("x".into(), 0, 0)]
         );
-        // Not without a width, a percentage, both auto sides, or in a cell.
+        // Not without a width, a percentage, or both auto sides.
         for html in [
             "<div style='margin:0 auto'>x</div>",
             "<div style='width:50%;margin:0 auto'>x</div>",
             "<div style='width:300px;margin-left:auto'>x</div>",
-            "<table><tr><td><div style='width:100px;margin:0 auto'>x</div></td></tr></table>",
         ] {
             assert_eq!(indents(html), [("x".into(), 0, 0)], "{html}");
         }
+        // In a cell, centred in the cell as laid out (#1930): an auto table
+        // fills the body, (11790 - 1500) / 2 each side.
+        assert_eq!(
+            indents(
+                "<table><tr><td><div style='width:100px;margin:0 auto'>x</div></td></tr></table>"
+            ),
+            [("x".into(), 5145, 5145)]
+        );
     }
 }
 
@@ -11706,3 +11762,8 @@ mod tests_1898;
 #[cfg(test)]
 #[path = "html_tests_1912.rs"]
 mod tests_1912;
+
+// The cell centring leftover of #1922 (#1930).
+#[cfg(test)]
+#[path = "html_tests_1930.rs"]
+mod tests_1930;

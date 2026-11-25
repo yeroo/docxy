@@ -645,6 +645,9 @@ struct HtmlAcc {
     cell: Option<html_table::CellSpec>,
     /// Nested tables at placeholder indexes of `TableAcc::blocks`.
     nested: Vec<(usize, html_table::RawTable)>,
+    /// The open cell's paragraphs in centred boxes, at their indexes of
+    /// `TableAcc::blocks` ([`Builder::mark_cell_boxes`], #1930).
+    boxes: Vec<(usize, html_table::CellCentring)>,
     /// Row indexes where a row group starts ([`html_table::RawTable::groups`]).
     groups: Vec<usize>,
     /// Its columns' widths so far ([`html_table::RawTable::cols`], #1894).
@@ -1102,6 +1105,18 @@ impl<'b> Builder<'b> {
         self.para_mut(in_table, index)
     }
 
+    /// The innermost HTML table's flow ended its last block, a paragraph,
+    /// inside the centred boxes `c` names: its cell's layout centres it
+    /// there (#1930).
+    pub(crate) fn mark_cell_boxes(&mut self, c: html_table::CellCentring) {
+        if let Some(t) = self.tables.last_mut() {
+            let at = t.blocks.len().checked_sub(1);
+            if let (Some(h), Some(at)) = (t.html.as_mut(), at) {
+                h.boxes.push((at, c));
+            }
+        }
+    }
+
     /// End the paragraph in progress only when it has content.
     pub(crate) fn end_para_if_any(&mut self, props: ParProps, in_table: bool) {
         if !self.para.is_empty() {
@@ -1129,6 +1144,7 @@ impl<'b> Builder<'b> {
                 cells: Vec::new(),
                 cell: None,
                 nested: Vec::new(),
+                boxes: Vec::new(),
                 groups: Vec::new(),
                 cols: Vec::new(),
                 colgroup: None,
@@ -1222,6 +1238,7 @@ impl<'b> Builder<'b> {
                 spec: h.cell.take().unwrap_or_default(),
                 blocks,
                 nested: std::mem::take(&mut h.nested),
+                boxes: std::mem::take(&mut h.boxes),
             };
             // Past MAX_COLUMNS the cell (and its spec) joins the last.
             let full = h.cells.len() >= MAX_COLUMNS;
@@ -1364,6 +1381,7 @@ impl<'b> Builder<'b> {
                 spec: h.cell.take().unwrap_or_default(),
                 blocks: std::mem::take(&mut t.blocks),
                 nested: std::mem::take(&mut h.nested),
+                boxes: std::mem::take(&mut h.boxes),
             };
             if self.budget.keep::<Cell>(0) {
                 let full = h.cells.len() >= MAX_COLUMNS;
