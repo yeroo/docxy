@@ -56,7 +56,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   with a background in a cell is a one-cell table of its own: see "HTML
   import nested cards (#1927)". Two tables back to back in a cell (nested
   or cards) get an empty paragraph between them, or Word joins them
-  (`end_html_table`).
+  (`end_html_table`); in the body too since #1940 (a table or card right
+  after another, an empty card dropped between them making none).
 - Known limits: background images; a table directly in a `tr`/`table` (no
   cell) joins the next cell (a browser puts it before the table). CSS
   borders, `frame`/`rules`, `border-color`, row heights, `<col>` widths,
@@ -573,16 +574,56 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   `&nbsp;` too, no object, no table; only empty paragraphs) is dropped
   (`Builder::end_card`): an e-mail's 1 px divider `div` makes nothing, as
   before, not an empty shaded row.
-- Not cards (as before): a `div` outside any table (paragraph shading and
-  indent), any other block (`p`, `blockquote`, headings), padding without
-  a background, hidden ones, past `MAX_TABLE_NESTING`.
-- Known limits: a card's side margins other than `auto` and its vertical
-  margins (stacked cards are one empty paragraph apart); `max-width`;
+- Not cards (as before): any other block (`p`, `blockquote`, headings),
+  padding without a background, hidden ones, past `MAX_TABLE_NESTING`.
+- Known limits: a card's side margins other than `auto` in a cell and its
+  vertical margins (stacked cards are one empty paragraph apart);
   `border-radius` (#1926) and borders on a card; a card in a list item or
-  heading loses the item's indent and the heading level; a background
-  `div` outside tables stays paragraph shading. The suite's document view
-  does not draw `w:tcMar` (a fixed inset), so imported padding is in the
-  model but not on screen there.
+  heading in a cell loses the item's indent and the heading level. The
+  suite's document view and PDF export do not draw `w:tcMar` (a fixed
+  inset), so imported padding is in the model, Word and the saved file
+  but not on screen there.
+
+## HTML import cards in the body (#1940)
+
+- A background `div` outside every table is a card too, through the same
+  path (`open_tag`'s candidacy: no table part or card open and
+  `table_depth` 0), when it is a box of its own: some padding above 0, a
+  `width` or a `max-width` (`Cascade::own_box`, checked in `finish` while
+  `look.in_cell` is still false). A background alone stays paragraph
+  shading: new Outlook writes a white `div` per line
+  (`elementToProof`, `background-color: rgb(255,255,255)`), which a
+  table per line would ruin, and with no padding the shading is what a
+  browser draws. The whole newsletter in `newsletter.html` (a grey,
+  padded `.wrapper`) is one card holding the content table.
+- Guards (`Html::body_card_fits`), where the paragraph model carries
+  something a card's table would drop, so the `div` stays paragraph
+  shading: in a list (`in_list`: an item's number and indent), under a
+  parent whose look has shading or side lines (a quoted reply's left
+  rule, a shaded block that is no card), or under any open block with a
+  top or bottom line of its own (`own_top`/`own_bottom`: Outlook's reply
+  header). In a body card a `div` takes #1927's path (a card open counts
+  as a cell; no guards there).
+- Room: a body card is laid out in the room the blocks around it leave
+  (`Look::card_room`, from the inherited indents plus its own side
+  margins other than `auto`, set in `finish` before the card resets the
+  look; `None` when all are 0), as an outermost table in a centred box
+  is (#2114: `body_room`, shared with `table_spec`). A blockquote's
+  40 px margins, a centred `max-width` wrapper and `margin: 0 24px` place
+  it (`jc center` when it fills a centred room, else `tblInd`).
+  `image_room` takes a percentage picture's width from the same room.
+- `max-width` (absolute only, as for a block, #1894) is the card's
+  table's `max_width`, in a cell too: `max-width: 600px; margin: 0 auto`
+  is a 9000-twip table, centred.
+- A table part's close (`</td>`, `</tr>`, `</table>`, a row group's) with
+  no table part open is ignored, as in a browser: it never ends a body
+  card or its row (`close_tag`).
+- Known limits: a body card's vertical margins are lost (the shaded
+  paragraphs kept them as spacing before and after; a table has none),
+  and so is a `page-break-before`/`-after` on it (it lands in its cell,
+  where Word ignores it). A padless, widthless background `div` still
+  leaves a table inside it unfilled. Padding shows in Word, not in the
+  suite or PDF (above).
 
 ## HTML import links (#1879)
 
