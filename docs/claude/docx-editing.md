@@ -18,7 +18,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   Numbers count per list within the body, numIds on one abstract sharing a
   count (`ListKey`, `Numbering::abstract_of`, r2), as `compute_markers`
   and Word count them, and a deeper level, a bullet one included, restarts
-  only the levels below it (r1). The view's own rule, not Word's: every
+  only the levels below it (r1). A level counts from its `w:start` where
+  the part defines the list (#1989, counts `i32`, a level skipped on the
+  way in starting at its own start too, as `Numbering::count`), else from
+  1. The view's own rule, not Word's: every
   count restarts after a paragraph that is not a list item (docxy's own
   lists share numId 1 and 2); in a table they count on from cell to cell
   (`TableListCounts`, `docs/claude/suite-document.md` §#2087). Not done:

@@ -1054,9 +1054,7 @@ Outlook-like 20 px inset on this mail (`docs/claude/suite-extensions.md`).
 - Known limits:
   - Margins through a card's top.
   - An empty `<p></p>`'s margins collapsing through it.
-  - `list-style-type`; `<ol start>` and separate `<ol>`s sharing numId 2
-    (#1989 `plan-ol-start`: the suite's `list_markers` draws only numId 2
-    as numbers, so per-list `w:num`s need it to read `numbering.xml`).
+  - `list-style-type`. (`<ol start>` and each `<ol>`'s own count: #1989.)
   - A page's `em` margin on a heading resolves at the parent's size, as
     before.
   - The HTML Standard's rarer quirks public ids and the IBM system id.
@@ -1073,13 +1071,11 @@ A batch from #1989 and #1930 (plan-2), import only.
   - `<div><br></div>` stays one empty paragraph: its lone break is white
     space, cleared as before. Content after a break keeps it; of two, one
     stays.
-- Wide hangs: each open list counts its `li`s (`OpenList::items`), and an
-  item keeps its number (`Block::item_ordinal`, each list from 1, as a
-  browser counts).
+- Wide hangs: each open list counts its `li`s (`OpenList::next`, from its
+  `start` since #1989), and an item keeps its number
+  (`Block::item_ordinal`, as a browser counts).
   - `decimal_hang(n)` is `DECIMAL_HANG + (digits − 1) × DIGIT_HANG`
     (0.5555em; Chrome's "10. " is 1.668em), still clamped to the indent.
-  - Word continues numId 2 across `<ol>`s, so a later list may show a
-    wider number than its hang (#1989 `plan-ol-start`).
 - A `dl` ends the paragraph in progress at its start and its end, as any
   block (`a<dl>b</dl>c` is three lines).
 - Vertical boxes of blocks and lists, one mechanism:
@@ -1472,3 +1468,57 @@ was #1922's.
   line.
 - Tests: `import/html_tests_1973.rs`;
   `export_email::tests::underlined_spaces_alone_round_trip_1973`.
+
+## HTML ordered lists: their own count, start and value (#1989)
+
+- Each `<ol>` counts on its own, from its `start`; an `<li value>` is
+  that item's number and the next ones go on from it, as a browser numbers
+  them. Before, every `<ol>` item was numId 2, one count across the page,
+  `start` and `value` ignored.
+- A list instance: an `<ol>`, or the run of its items that a `value` other
+  than the next number starts. Each one is its own `w:num` on its **own**
+  `w:abstractNum` (the Markdown decimal levels, level `level`'s `w:start`
+  its first number). No `w:lvlOverride/w:startOverride`: siblings on one
+  abstract continue or restart differently in Word and LibreOffice, and
+  docxcore's `Numbering` and the suite's `ListKey` share a count per
+  abstract.
+  - `Html::new_list(level, start)`, allocated at the instance's first
+    `li` (`OpenList::num`, lazily, so `<ol><li value=3>` is one instance
+    starting at 3). The first one starting at 1 is numId 2 on abstract
+    101, so a page with one plain `<ol>` imports byte for byte as before,
+    and the suite's `ListIds::of` still finds docxy's own decimal list. Any
+    other is numId 3, 4, … on abstract `num_id + 99` (102, …).
+  - `MAX_HTML_LISTS` (256) instances, `LIST_WORK` charged each; past the
+    cap a list is numId 2 again.
+  - The item's numId is `Block::item_num` (1 for a bullet), copied into
+    the blocks in the `li`; `number_item` writes it. A nested `<ol>` is an
+    instance of its own at its level. Filtered HTML's typed `MsoList`
+    markers stay 1 and 2.
+- `start` and `value` (`list_number`): HTML's rules for parsing integers
+  (leading white space, a sign, the leading digits: `5abc` is 5; none is
+  ignored), clamped to `0..=32767`, Word's range. A browser's negative
+  numbers are 0. A `ul`'s `start` and its items' `value` are nothing.
+- The definitions: `HtmlImport::lists` (`ImportedList { num_id,
+  abstract_id, level, start }`), defined by `HtmlImport::package` through
+  `Package::add_html_lists(&[(num_id, abstract_id, level, start)])`. That
+  is one splice of the numbering part, adding the Markdown part first when
+  there is none. It refuses (false, nothing changed) when the part already
+  has one of the ids, and the caller folds.
+- A bare `Document` cannot carry them: `import_html` and
+  `import_html_str_within` (the clipboard's `Clip::from_html`) fold them
+  back to numId 2 (`HtmlImport::fold_lists`, table cells too). A caller
+  that builds its own package from `HtmlImport::document` defines `lists`
+  or folds, or the suite draws an undefined numId past 2 as a bullet.
+- Readers: docxcore's `compute_markers`, `export_email` (a new numId
+  reopens the list with its `start`, so a `value` split exports as a
+  second `<ol start>`) and Markdown export needed no change. The suite's
+  `list_markers` reads each level's `w:start` (`docs/claude/docx-editing.md`).
+  docxcore's `fill` draws a decimal 0 (`w:start 0`), where it drew 1.
+- Not done: `type` / `list-style-type`, `<ol reversed>`. An `li` that
+  never gets a numbered paragraph (`<li><table>…</table></li>`, whose
+  cells reset `Block`) still advances the count, so Word skips a number
+  the browser shows (as before). The suite's restart at an item's
+  unnumbered continuation (#2114) restarts to the list's start.
+- Tests: `import/html_tests_1989.rs`; the suite's
+  `list_markers_count_from_the_levels_start_1989` and
+  `imported_html_lists_draw_their_own_counts_1989`.
