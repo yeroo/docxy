@@ -38,14 +38,20 @@ pub(crate) fn convert(kind: ConvertKind, bytes: &[u8], limit: usize) -> Option<C
     (png.len() <= limit).then_some(ConvertedImage { png, width, height })
 }
 
-fn webp_to_png(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+/// `bytes` decoded as a WebP within the converter's limits
+/// ([`MAX_DECODE_SIDE`] a side, [`MAX_DECODE_ALLOC`] bytes).
+fn decode_webp(bytes: &[u8]) -> image::ImageResult<image::DynamicImage> {
     let mut reader = image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::WebP);
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_DECODE_SIDE);
     limits.max_image_height = Some(MAX_DECODE_SIDE);
     limits.max_alloc = Some(MAX_DECODE_ALLOC);
     reader.limits(limits);
-    let img = reader.decode().ok()?;
+    reader.decode()
+}
+
+fn webp_to_png(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let img = decode_webp(bytes).ok()?;
     let (w, h) = (img.width(), img.height());
     let mut png = Vec::new();
     img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
@@ -208,10 +214,45 @@ mod tests {
             None
         );
         assert_eq!(convert(ConvertKind::Webp, &webp(6, 3), 10), None);
-        // A VP8X header claiming 16384 x 16384 is refused by the limits,
-        // not decoded into a gigabyte.
-        let mut huge = b"RIFF\x16\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\x00\x00\x00\x00".to_vec();
-        huge.extend([0xff, 0x3f, 0x00, 0xff, 0x3f, 0x00]);
-        assert_eq!(convert(ConvertKind::Webp, &huge, usize::MAX), None);
+        // A VP8X header with no image chunk after it: malformed, refused
+        // before any size is looked at.
+        let mut vp8x = b"RIFF\x16\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\x00\x00\x00\x00".to_vec();
+        vp8x.extend([0xff, 0x3f, 0x00, 0xff, 0x3f, 0x00]);
+        assert_eq!(convert(ConvertKind::Webp, &vp8x, usize::MAX), None);
+    }
+
+    /// A lossless (VP8L) WebP header of `w` x `h`, its bit stream cut
+    /// short: well formed up to where the decoder sizes its buffer.
+    fn vp8l_header(w: u32, h: u32) -> Vec<u8> {
+        // Width - 1 and height - 1 in 14 bits each, then alpha and a
+        // version of 0, little endian.
+        let bits = (w - 1) | ((h - 1) << 14);
+        let mut chunk = vec![0x2f];
+        chunk.extend(bits.to_le_bytes());
+        chunk.extend([0u8; 16]);
+        let mut out = b"RIFF".to_vec();
+        out.extend((4 + 8 + chunk.len() as u32).to_le_bytes());
+        out.extend(b"WEBPVP8L");
+        out.extend((chunk.len() as u32).to_le_bytes());
+        out.extend(chunk);
+        out
+    }
+
+    /// 10000 x 10000 RGBA is 400 MB: under `image`'s default 512 MiB, so
+    /// only the converter's own [`MAX_DECODE_ALLOC`] (256 MiB) refuses it,
+    /// before any pixel is decoded (r2).
+    #[test]
+    fn a_webp_past_the_allocation_limit_is_refused_by_it_1898() {
+        assert!(10_000u64 * 10_000 * 4 > MAX_DECODE_ALLOC);
+        match decode_webp(&vp8l_header(10_000, 10_000)) {
+            Err(image::ImageError::Limits(_)) => {}
+            other => panic!("not refused by the limits: {other:?}"),
+        }
+        // The same header small enough is read past the limits (and fails
+        // on its cut-short bit stream instead).
+        assert!(!matches!(
+            decode_webp(&vp8l_header(100, 100)),
+            Err(image::ImageError::Limits(_))
+        ));
     }
 }
