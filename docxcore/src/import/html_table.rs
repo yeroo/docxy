@@ -158,6 +158,44 @@ impl Default for CellSpec {
     }
 }
 
+/// A fixed-width block with both side margins `auto` inside a cell
+/// (#1930): centred in the cell's inner width once [`layout`] knows it, as
+/// one in the body is centred in [`BODY_TWIPS`] while it is read (#1922).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CellBox {
+    /// Its content width, in twips.
+    pub width: i32,
+    /// The look's indents with its own margins, border and padding in, the
+    /// enclosing boxes' centring not yet: what the body-level branch takes
+    /// from [`BODY_TWIPS`] with the width.
+    pub indent: i32,
+    pub indent_right: i32,
+}
+
+/// What a paragraph ended in a cell, inside centred [`CellBox`]es, needs
+/// for its centring at [`layout`] (#1930).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CellCentring {
+    /// Its centred boxes, outermost first.
+    pub boxes: Vec<CellBox>,
+    /// Its look's indents, before `max(0)`: the paragraph's indent is the
+    /// centred one's at least 0, as at body level.
+    pub indent: i32,
+    pub indent_right: i32,
+    /// Per side with a line (left, right): how many of `boxes` the block
+    /// drawing it is in, and where it is (`border_left_x` /
+    /// `border_right_x`): it moves with those boxes' centring only.
+    pub lines: [Option<(usize, i32)>; 2],
+}
+
+/// A left or right line's `w:space` (#1883): what is between it and the
+/// text, `gap` twips from the line's place to the text, less the line's
+/// width, in whole points up to Word's 31.
+pub(crate) fn line_space(gap: i32, sz: u16) -> u16 {
+    let gap = f64::from(gap) - f64::from(sz) * 2.5;
+    (gap / 20.0).round().clamp(0.0, 31.0) as u16
+}
+
 /// A cell as read: its blocks, with a placeholder at each index a nested
 /// table holds (`nested`), laid out with the table.
 #[derive(Debug, Default)]
@@ -165,16 +203,68 @@ pub(crate) struct RawCell {
     pub spec: CellSpec,
     pub blocks: Vec<Block>,
     pub nested: Vec<(usize, RawTable)>,
+    /// The paragraphs at these indexes are in centred boxes (#1930).
+    pub boxes: Vec<(usize, CellCentring)>,
 }
 
 impl RawCell {
-    /// Take `other`'s blocks and nested tables after this cell's own (a cell
-    /// with no room in its row).
+    /// Take `other`'s blocks, nested tables and centred paragraphs after
+    /// this cell's own (a cell with no room in its row).
     pub(crate) fn absorb(&mut self, other: RawCell) {
         let base = self.blocks.len();
         self.blocks.extend(other.blocks);
         self.nested
             .extend(other.nested.into_iter().map(|(i, t)| (base + i, t)));
+        self.boxes
+            .extend(other.boxes.into_iter().map(|(i, c)| (base + i, c)));
+    }
+}
+
+/// Centre the paragraphs `boxes` name in `blocks` in `inner` twips (#1930):
+/// each box in the room its enclosing ones' centring leaves, as the body
+/// does in [`BODY_TWIPS`] (#1922). A box wider than its room gets nothing.
+fn centre_in_cell(blocks: &mut [Block], boxes: Vec<(usize, CellCentring)>, inner: u32) {
+    let clamp = |v: i64| v.clamp(-i64::from(MAX_TWIPS), i64::from(MAX_TWIPS));
+    for (at, c) in boxes {
+        let Some(Block::Paragraph(p)) = blocks.get_mut(at) else {
+            continue;
+        };
+        // What the boxes up to each one move the text by.
+        let mut moved = Vec::with_capacity(c.boxes.len() + 1);
+        moved.push(0i64);
+        let mut extra = 0i64;
+        for b in &c.boxes {
+            let room = i64::from(inner)
+                - clamp(i64::from(b.indent) + extra)
+                - clamp(i64::from(b.indent_right) + extra)
+                - i64::from(b.width.max(0));
+            extra = clamp(extra + (room / 2).max(0));
+            moved.push(extra);
+        }
+        if extra == 0 {
+            continue;
+        }
+        let at_least_0 = |v: i32| i64::from(v.max(0));
+        let grow = |now: i32, raw: i32| {
+            let want = clamp(i64::from(raw) + extra).max(0);
+            clamp(i64::from(now) + want - at_least_0(raw)) as i32
+        };
+        p.props.indent = grow(p.props.indent, c.indent);
+        p.props.indent_right = grow(p.props.indent_right, c.indent_right);
+        // The model's indent is no longer 0: the import's explicit zero
+        // goes (the writer writes the moved one).
+        p.props.shadow.retain(|x| x != super::html::ZERO_IND);
+        // A line stays at its block's place, which moved with the boxes
+        // that block is in only.
+        let indents = [p.props.indent, p.props.indent_right];
+        let sides = [&mut p.props.borders.left, &mut p.props.borders.right];
+        for ((line, side), text) in c.lines.iter().zip(sides).zip(indents) {
+            if let (Some((n, x)), Some(b)) = (line, side.as_mut()) {
+                let shift = moved.get(*n).copied().unwrap_or(extra);
+                let gap = clamp(i64::from(text) - i64::from(*x) - shift) as i32;
+                b.space = line_space(gap, b.sz);
+            }
+        }
     }
 }
 
@@ -231,6 +321,14 @@ enum Slot {
 /// A table with a [`Room`] (whose width its caller passes as `avail`) is
 /// then placed in it ([`place_in_room`]).
 pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
+    layout_in(t, avail, true, budget)
+}
+
+/// [`layout`], `declared` saying whether the page declares `avail` (the
+/// body, a room, a cell whose width it declares): a centred box is centred
+/// only in a cell whose width the page declares (#1930), as an auto table a
+/// browser shrinks to its content.
+fn layout_in(t: RawTable, avail: u32, declared: bool, budget: &Budget) -> Table {
     let RawTable {
         mut spec,
         rows,
@@ -238,6 +336,25 @@ pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
         cols,
     } = t;
     let avail = avail.clamp(MIN_COL, MAX_TWIPS);
+    // Its own width (a card's always), or the room it is placed in.
+    let table_declared = match spec.width {
+        Some(Width::Twips(_)) => true,
+        Some(Width::Pct(_)) => declared,
+        None => spec.room.is_some(),
+    };
+    // A width the page gives the cell: the table's, the cell's own, or
+    // `<col>`s over all its columns (a percentage of the table's).
+    let known = |w: Option<Width>| match w {
+        Some(Width::Twips(_)) => true,
+        Some(Width::Pct(_)) => table_declared,
+        None => false,
+    };
+    let cell_declared = |p: &Placed| {
+        table_declared
+            || known(p.cell.spec.width)
+            || (p.col + p.span <= cols.len()
+                && cols[p.col..p.col + p.span].iter().all(|w| known(*w)))
+    };
     // `max-width` (#1894): a wider declared width is cut to it; an auto
     // table is laid out in no more than it.
     let mut room_w = avail;
@@ -334,11 +451,18 @@ pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
             .width
             .saturating_sub(margin(1) + margin(3))
             .max(MIN_COL);
+        let declared = cell_declared(&p);
         let RawCell {
-            mut blocks, nested, ..
+            mut blocks,
+            nested,
+            boxes,
+            ..
         } = p.cell;
+        if declared {
+            centre_in_cell(&mut blocks, boxes, inner);
+        }
         for (at, raw) in nested {
-            let table = layout(raw, inner, budget);
+            let table = layout_in(raw, inner, declared, budget);
             if let Some(b) = blocks.get_mut(at) {
                 *b = Block::Table(table);
             }
@@ -857,6 +981,7 @@ mod tests {
                 ..Paragraph::default()
             })],
             nested: Vec::new(),
+            boxes: Vec::new(),
         }
     }
 
@@ -1196,6 +1321,93 @@ mod tests {
         // No border, padding or spacing: none written.
         let (_, pr) = widths(None, &[None]);
         assert_eq!(pr, "<w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/></w:tblPr>");
+    }
+
+    #[test]
+    fn a_cell_absorbed_past_max_columns_keeps_its_centred_paragraphs() {
+        let boxed = |c: &mut RawCell| {
+            c.boxes.push((
+                0,
+                CellCentring {
+                    boxes: vec![CellBox {
+                        width: 1000,
+                        ..CellBox::default()
+                    }],
+                    ..CellCentring::default()
+                },
+            ));
+        };
+        let mut first = text_cell("a", spec(1, 1));
+        boxed(&mut first);
+        let mut late = text_cell("b", spec(1, 1));
+        boxed(&mut late);
+        first.absorb(late);
+        assert_eq!(
+            first.boxes.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        let t = layout(
+            RawTable {
+                spec: TableSpec {
+                    width: Some(Width::Twips(9000)),
+                    ..TableSpec::default()
+                },
+                rows: vec![vec![first]],
+                groups: Vec::new(),
+                cols: Vec::new(),
+            },
+            BODY_TWIPS,
+            &Budget::standard(),
+        );
+        // Both paragraphs centred in the 9000 cell: 4000 each side.
+        let indents: Vec<(i32, i32)> = t.rows[0].cells[0]
+            .blocks
+            .iter()
+            .map(|b| match b {
+                Block::Paragraph(p) => (p.props.indent, p.props.indent_right),
+                b => panic!("{b:?}"),
+            })
+            .collect();
+        assert_eq!(indents, [(4000, 4000), (4000, 4000)]);
+    }
+
+    #[test]
+    fn a_line_moves_only_with_the_boxes_its_block_is_in() {
+        let mut blocks = vec![Block::Paragraph(Paragraph::default())];
+        let Some(Block::Paragraph(p)) = blocks.first_mut() else {
+            unreachable!()
+        };
+        let mut l = line(8);
+        l.space = 1;
+        p.props.borders.left = Some(l);
+        p.props.borders.right = Some(l);
+        // Two boxes, 6000 then 2000 wide, in a 9000 cell: 1500, then 2000
+        // more. The left line is in the outer box only, the right one in
+        // both; each was 40 twips from the text (1 pt after its width).
+        let c = CellCentring {
+            boxes: vec![
+                CellBox {
+                    width: 6000,
+                    ..CellBox::default()
+                },
+                CellBox {
+                    width: 2000,
+                    ..CellBox::default()
+                },
+            ],
+            lines: [Some((1, -40)), Some((2, -40))],
+            ..CellCentring::default()
+        };
+        centre_in_cell(&mut blocks, vec![(0, c)], 9000);
+        let Some(Block::Paragraph(p)) = blocks.first() else {
+            unreachable!()
+        };
+        assert_eq!((p.props.indent, p.props.indent_right), (3500, 3500));
+        // Left: 3500 + 40 - 1500 = 2040 twips, less 20 for the line, is
+        // 101 pt, Word's 31 at most; right: 3500 + 40 - 3500 = 40, 1 pt.
+        assert_eq!(p.props.borders.left.map(|b| b.space), Some(31));
+        assert_eq!(p.props.borders.right.map(|b| b.space), Some(1));
+        assert_eq!(line_space(40, 8), 1);
     }
 
     #[test]

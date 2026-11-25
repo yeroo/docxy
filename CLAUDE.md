@@ -62,7 +62,8 @@ issue number to find its notes.
   link or a tracked change bringing its media (#1853), a placeholder
   picture's Alt Text drawn in its frame (#1898).
 - `docs/claude/pdf-export.md`: before changing PDF export: embedded fonts (#1508),
-  borders, picture watermarks and unequal columns (#797).
+  borders, picture watermarks and unequal columns (#797), tables placed by
+  their `w:jc` (#1930).
 - `docs/claude/pdf-view.md`: before changing the suite's PDF view (#2245): the
   pdfcraft-render dependency and the patch table a rev bump moves, the
   `--pdf-worker` child and its protocol, timeouts and watchdog, the tab's
@@ -71,7 +72,7 @@ issue number to find its notes.
   filling, the display copy, Save as an incremental update, replay in a
   new child, the signed-PDF question and quit (#2255).
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),
-  images (#1880), links (#1879), centring (#1922),
+  images (#1880), links (#1879), centring (#1922), in cells (#1930),
   bookmarks, the Hyperlink style, relative links, titles and targets,
   Markdown link destinations (#1912), rounded images (#1926),
   nested cards (#1927), page margins (#1928), Outlook mail: CSS-only spacing,
