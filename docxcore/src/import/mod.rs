@@ -951,11 +951,13 @@ impl<'b> Builder<'b> {
         self.keeps
     }
 
-    /// The paragraph in progress's own runs, not those in its links: what
-    /// an empty line's mark takes its look from (#1973).
-    pub(crate) fn para_runs(&self) -> impl Iterator<Item = &Run> {
+    /// The looks of the paragraph in progress's own runs, tabs and breaks,
+    /// not those in its links: what an empty line's mark takes its look
+    /// from (#1973), a lone `<br>`'s too.
+    pub(crate) fn para_looks(&self) -> impl Iterator<Item = &RunProps> {
         self.para.iter().filter_map(|i| match i {
-            Inline::Run(r) => Some(r),
+            Inline::Run(r) => Some(&r.props),
+            Inline::Tab(p) | Inline::Break(_, p) => Some(p),
             _ => None,
         })
     }
@@ -1006,7 +1008,29 @@ impl<'b> Builder<'b> {
             return None;
         }
         let rest = text.chars().skip(n);
-        let gap = rest.take_while(|c| c.is_whitespace()).count();
+        let mut gap = rest.take_while(|c| c.is_whitespace()).count();
+        // The gap is the marker's spacer: it ends before white space in a
+        // look drawn on it, a blank to fill in that follows the marker
+        // (#1973). The inline the marker ends in is cut as before.
+        let mut at = 0;
+        for inline in &self.para {
+            if at >= n + gap {
+                break;
+            }
+            if is_mark(inline) {
+                continue;
+            }
+            let drawn = match inline {
+                Inline::Run(r) => shows_on_space(&r.props),
+                Inline::Tab(p) => shows_on_space(p),
+                _ => false,
+            };
+            if drawn && at >= n {
+                gap = at - n;
+                break;
+            }
+            at += inline.text().chars().count();
+        }
         if gap == 0 {
             return None;
         }

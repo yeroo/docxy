@@ -198,3 +198,59 @@ fn a_list_items_mark_is_unchanged_1973() {
     assert!(sized.props.num_id.is_some(), "{:?}", sized.props);
     assert_eq!(sized.props.raw_props, plain.props.raw_props);
 }
+
+/// A typed list marker's spacer is cut with it, not an underlined blank
+/// right after it (r1 m4).
+#[test]
+fn a_typed_markers_gap_stops_at_a_blank_1973() {
+    let d = doc(
+        "<p class=MsoListParagraph>1.<span style='font:7.0pt \"Times New Roman\"'>&nbsp;&nbsp;&nbsp;</span>\
+         <u>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</u></p><p>x</p>",
+    );
+    let p = paras(&d).remove(0);
+    assert!(p.props.num_id.is_some(), "{:?}", p.props);
+    let r = one_run(&p);
+    assert_eq!(r.text, "\u{a0}".repeat(5));
+    assert!(r.props.underline, "{r:?}");
+}
+
+/// The mark size of `html`'s first paragraph, which must be empty.
+fn mark_size(html: &str) -> Option<u32> {
+    let p = first(html);
+    assert!(p.content.is_empty(), "{html}: {:?}", p.content);
+    p.props.mark_run_props().and_then(|m| m.size_half_pts)
+}
+
+/// In standards mode a line is never shorter than its block's own font
+/// (the strut); quirks mode has none, so a smaller span sizes the line
+/// (r1 m3).
+#[test]
+fn an_empty_lines_size_is_at_least_its_blocks_in_standards_mode_1973() {
+    let body =
+        "<p style=\"font-size:20pt\"><span style=\"font-size:8pt\">&nbsp;</span></p><p>x</p>";
+    assert_eq!(mark_size(&format!("<!DOCTYPE html>{body}")), Some(40));
+    assert_eq!(mark_size(body), Some(16), "quirks mode");
+    // A larger span still sizes the line in standards mode.
+    assert_eq!(
+        mark_size(
+            "<!DOCTYPE html><p style=\"font-size:8pt\"><span style=\"font-size:20pt\">&nbsp;</span></p><p>x</p>"
+        ),
+        Some(40)
+    );
+    // Outlook's empty line: its mail has no doctype, so quirks mode, and
+    // the span's 8pt sizes it; with one, the class's 11pt stands.
+    let outlook = "<style>p.MsoNormal{font-size:11.0pt}</style>\
+                   <p class=MsoNormal><span style='font-size:8.0pt'><o:p>&nbsp;</o:p></span></p><p>x</p>";
+    assert_eq!(mark_size(outlook), Some(16), "quirks mode");
+    assert_eq!(mark_size(&format!("<!DOCTYPE html>{outlook}")), Some(22));
+}
+
+/// Gmail's empty line, a `<br>` alone in its look: the mark takes its
+/// size (r1 m5).
+#[test]
+fn a_lone_breaks_size_is_its_marks_1973() {
+    assert_eq!(
+        mark_size("<div><span style=\"font-size:20pt\"><br></span></div><div>x</div>"),
+        Some(40)
+    );
+}

@@ -5348,15 +5348,19 @@ impl<'a> Html<'a> {
         self.reset_para();
     }
 
-    /// The mark of an empty paragraph about to be cleared (#1973): its
-    /// visible runs' look, the one with the largest size (the first among
-    /// ties, the first visible run when none has one), as a browser's line
-    /// box is its tallest run's. `None` with no visible run: the block's
-    /// mark stays; `Some(None)` for a run with no look of its own.
+    /// The mark of an empty paragraph about to be cleared (#1973): the look
+    /// of its visible runs, tabs and line breaks (a lone `<br>`'s, r1 m5),
+    /// the one with the largest size (the first among ties, the first when
+    /// none has one), as a browser's line box is its tallest run's. In
+    /// standards mode the line is never shorter than the block's own font
+    /// (its strut, r1 m3), so the size is at least the block's; quirks mode
+    /// has none. `None` with nothing visible: the block's mark stays.
+    /// `Some(None)` when the look has nothing a mark holds: a span that
+    /// turned the block's look off (`font-weight:normal` in a bold block),
+    /// so the line is plain and the block's mark goes.
     fn empty_line_mark(&self) -> Option<Option<String>> {
         let mut best: Option<&RunProps> = None;
-        for run in self.out.para_runs().filter(|r| !r.props.vanish) {
-            let p = &run.props;
+        for p in self.out.para_looks().filter(|p| !p.vanish) {
             match best {
                 None => best = Some(p),
                 Some(b) if p.size_half_pts.is_some() && p.size_half_pts > b.size_half_pts => {
@@ -5365,7 +5369,12 @@ impl<'a> Html<'a> {
                 _ => {}
             }
         }
-        best.map(mark_rpr)
+        let mut mark = best?.clone();
+        if !self.quirks {
+            let strut = self.para_look().and_then(|l| l.run.size_half_pts);
+            mark.size_half_pts = mark.size_half_pts.max(strut);
+        }
+        Some(mark_rpr(&mark))
     }
 
     /// Make `props` its item's numbered paragraph: the list's number and
