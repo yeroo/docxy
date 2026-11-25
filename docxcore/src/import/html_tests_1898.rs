@@ -398,3 +398,208 @@ fn a_source_outside_a_picture_is_nothing_1898() {
     let (_, asked) = import("<video><source srcset='v.png'></video><p><img src=missing.png></p>");
     assert_eq!(asked, ["missing.png"]);
 }
+
+/// `bytes` in base64, by hand, wrapped at 76 as MIME writes it.
+fn b64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in bytes.chunks(3) {
+        let n = c.iter().fold(0u32, |a, &b| (a << 8) | u32::from(b)) << (8 * (3 - c.len()));
+        for k in 0..=c.len() {
+            out.push(T[(n >> (18 - 6 * k) & 63) as usize] as char);
+        }
+        for _ in c.len()..3 {
+            out.push('=');
+        }
+    }
+    out.as_bytes()
+        .chunks(76)
+        .map(|l| String::from_utf8_lossy(l).into_owned())
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
+/// Word's "Single File Web Page": CRLF lines, a preamble, the root part
+/// quoted-printable in windows-1252 (its meta saying otherwise), its
+/// picture a base64 part at `doc_files/image001.png`.
+fn word_mht() -> Vec<u8> {
+    let page = "<html xmlns:v=3D\"urn:schemas-microsoft-com:vml\">\r\n\
+                <head><meta http-equiv=3DContent-Type content=3D\"text/html; charset=3Dutf-8\"></head>\r\n\
+                <body><p class=3DMsoNormal>Caf=E9 <![if !vml]><img width=3D40 height=3D20 =\r\n\
+                src=3D\"doc_files/image001.png\" alt=3D\"Logo\"><![endif]><img src=3D\"doc_files/gone.png\" alt=3DGone></p></body></html>";
+    format!(
+        "MIME-Version: 1.0\r\n\
+         Content-Type: multipart/related; boundary=\"----=_NextPart_01DA0000.12345678\"\r\n\
+         \r\n\
+         This document is a Single File Web Page, also known as a Web Archive file.\r\n\
+         \r\n\
+         ------=_NextPart_01DA0000.12345678\r\n\
+         Content-Location: file:///C:/X/doc.htm\r\n\
+         Content-Transfer-Encoding: quoted-printable\r\n\
+         Content-Type: text/html; charset=\"windows-1252\"\r\n\
+         \r\n\
+         {page}\r\n\
+         \r\n\
+         ------=_NextPart_01DA0000.12345678\r\n\
+         Content-Location: file:///C:/X/doc_files/image001.png\r\n\
+         Content-Transfer-Encoding: base64\r\n\
+         Content-Type: image/png\r\n\
+         \r\n\
+         {}\r\n\
+         \r\n\
+         ------=_NextPart_01DA0000.12345678--\r\n",
+        b64(&png(8, 4))
+    )
+    .into_bytes()
+}
+
+/// Blink's "Webpage, single file": `From: <Saved by Blink>`, folded
+/// top headers, an `https:` root, absolute srcs matching their parts.
+fn blink_mhtml() -> Vec<u8> {
+    let page = "<!DOCTYPE html><html><head><meta charset=3D\"utf-8\"></head><body>\n\
+                <p>Hello <img src=3D\"https://cdn.example.com/a.png?v=3D1\"> <img src=3D\"img/b.png\">=\n \
+                <img src=3D\"https://cdn.example.com/missing.png\" width=3D10 height=3D10></p></body></html>";
+    format!(
+        "From: <Saved by Blink>\n\
+         Snapshot-Content-Location: https://example.com/news/page.html\n\
+         Subject: News\n\
+         MIME-Version: 1.0\n\
+         Content-Type: multipart/related;\n\
+         \ttype=\"text/html\";\n\
+         \tboundary=\"----MultipartBoundary--abc----\"\n\
+         \n\
+         \n\
+         ------MultipartBoundary--abc----\n\
+         Content-Type: text/html\n\
+         Content-ID: <frame-1@mhtml.blink>\n\
+         Content-Transfer-Encoding: quoted-printable\n\
+         Content-Location: https://example.com/news/page.html\n\
+         \n\
+         {page}\n\
+         ------MultipartBoundary--abc----\n\
+         Content-Type: image/png\n\
+         Content-Transfer-Encoding: base64\n\
+         Content-Location: https://cdn.example.com/a.png?v=1\n\
+         \n\
+         {}\n\
+         ------MultipartBoundary--abc----\n\
+         Content-Type: image/png\n\
+         Content-Transfer-Encoding: base64\n\
+         Content-Location: https://example.com/news/img/b.png\n\
+         \n\
+         {}\n\
+         ------MultipartBoundary--abc------\n",
+        b64(&png(6, 3)),
+        b64(&png(10, 5))
+    )
+    .into_bytes()
+}
+
+fn import_bytes(bytes: &[u8]) -> (HtmlImport, Vec<String>) {
+    let mut asked = Vec::new();
+    let mut resolve = |src: &str, _: usize| {
+        asked.push(src.to_string());
+        None
+    };
+    let got = import_html_within(bytes, &Budget::standard(), Some(&mut resolve)).unwrap();
+    (got, asked)
+}
+
+#[test]
+fn a_word_single_file_web_page_imports_its_picture_from_its_part_1898() {
+    let (got, asked) = import_bytes(&word_mht());
+    // Its part's charset (windows-1252) over the page's meta.
+    assert_eq!(paragraph_texts(&got.document), ["Café Gone"]);
+    // The picture from its part; the src no part names goes to the
+    // resolver resolved against the root's location.
+    assert_eq!(asked, ["file:///C:/X/doc_files/gone.png"]);
+    assert_eq!(got.media.len(), 1);
+    assert_eq!(got.media[0].bytes, png(8, 4));
+    let pics = pictures(&got.document.body);
+    assert_eq!(inline_extent(pics[0]), Some((40 * 9525, 20 * 9525)));
+    // Without images, the page alone (an image is nothing then).
+    let d = import_html(&word_mht()).unwrap();
+    assert_eq!(paragraph_texts(&d), ["Café"]);
+}
+
+#[test]
+fn a_blink_mhtml_matches_absolute_and_relative_srcs_to_their_parts_1898() {
+    let (got, asked) = import_bytes(&blink_mhtml());
+    assert_eq!(paragraph_texts(&got.document)[0].trim_end(), "Hello");
+    // Only the src no part holds reaches the resolver, absolute.
+    assert_eq!(asked, ["https://cdn.example.com/missing.png"]);
+    let bytes: Vec<&[u8]> = got.media.iter().map(|m| m.bytes.as_slice()).collect();
+    assert_eq!(bytes[..2], [png(6, 3).as_slice(), png(10, 5).as_slice()]);
+    // Two pictures and the placeholder.
+    assert_eq!(pictures(&got.document.body).len(), 3);
+}
+
+#[test]
+fn a_cid_src_names_a_part_by_its_content_id_and_start_names_the_root_1898() {
+    let msg = format!(
+        "Content-Type: multipart/related; boundary=b; start=\"<Root@X>\"\n\n\
+         --b\n\
+         Content-Type: text/html\n\
+         Content-ID: <decoy@x>\n\n\
+         <p>decoy</p>\n\
+         --b\n\
+         Content-Type: text/html; charset=utf-8\n\
+         Content-ID: <root@x>\n\n\
+         <p>root <img src=\"cid:Logo%40X\"></p>\n\
+         --b\n\
+         Content-Type: image/png\n\
+         Content-ID: <logo@x>\n\
+         Content-Transfer-Encoding: base64\n\n\
+         {}\n\
+         --b--\n",
+        b64(&png(2, 2))
+    );
+    let (got, asked) = import_bytes(msg.as_bytes());
+    assert_eq!(paragraph_texts(&got.document)[0].trim_end(), "root");
+    assert!(asked.is_empty(), "{asked:?}");
+    assert_eq!(got.media[0].bytes, png(2, 2));
+}
+
+#[test]
+fn a_part_too_big_for_the_limit_is_not_read_and_not_asked_for_1898() {
+    let bytes = word_mht();
+    let m = super::super::mhtml::parse(&bytes, &Budget::standard()).unwrap();
+    let src = "file:///C:/X/doc_files/image001.png";
+    assert_eq!(m.part_for(src, 3), Some(None));
+    assert_eq!(m.part_for(src, 1 << 20), Some(Some(png(8, 4))));
+    assert_eq!(m.part_for("file:///C:/X/other.png", 1 << 20), None);
+}
+
+#[test]
+fn a_malformed_message_is_read_as_a_page_1898() {
+    // No boundary: not MHTML, never an error of its own.
+    let d = import_html(b"Content-Type: multipart/related\n\n<p>body</p>").unwrap();
+    assert_eq!(paragraph_texts(&d).last().map(String::as_str), Some("body"));
+    // A root that is no HTML.
+    let msg = b"Content-Type: multipart/related; boundary=b\n\n--b\nContent-Type: text/plain\n\nhi\n--b--\n";
+    assert!(super::super::mhtml::parse(msg, &Budget::standard()).is_none());
+}
+
+#[test]
+fn quoted_printable_decodes_soft_breaks_and_escapes_1898() {
+    use super::super::mhtml::quoted_printable as qp;
+    assert_eq!(
+        qp(b"a=3Db=\r\nc=\nd= \r\ne=E9=zz="),
+        b"a=bcde\xE9=zz".to_vec()
+    );
+}
+
+#[test]
+fn sniff_takes_mhtml_by_its_headers_and_its_extension_1898() {
+    use crate::import::{Format, sniff};
+    assert_eq!(sniff(&word_mht(), "bin"), Format::Html);
+    assert_eq!(sniff(&blink_mhtml(), ""), Format::Html);
+    assert_eq!(sniff(b"plain", "mht"), Format::Html);
+    assert_eq!(sniff(b"plain", "MHTML"), Format::Html);
+    // A mail that is not multipart/related, or a text with a colon, is not.
+    assert_eq!(
+        sniff(b"Subject: x\nContent-Type: text/plain\n\nhi", ""),
+        Format::Unknown
+    );
+    assert_eq!(sniff(b"Note: x\nmore", ""), Format::Unknown);
+}

@@ -227,7 +227,25 @@ pub(crate) fn import_html_within(
     if !budget.work(3 * (bytes.len() / 16 + 1)) {
         return Err(TOO_BIG.into());
     }
-    import_decoded(&decode(bytes), budget, images)
+    // An MHTML message (#1898): its root part is the page, in the charset
+    // its part gives, at the URL its `Content-Location` gives; an image
+    // src naming one of its parts takes that part, and only one naming
+    // none goes to the caller's resolver.
+    if let Some(m) = super::mhtml::parse(bytes, budget) {
+        let text = decode_with(&m.html, m.charset.as_deref());
+        let url = m.location.as_deref();
+        return match images {
+            Some(caller) => {
+                let mut resolve = |src: &str, limit: usize| match m.part_for(src, limit) {
+                    Some(part) => part,
+                    None => caller(src, limit),
+                };
+                import_decoded(&text, budget, Some(&mut resolve), url)
+            }
+            None => import_decoded(&text, budget, None, url),
+        };
+    }
+    import_decoded(&decode(bytes), budget, images, None)
 }
 
 /// [`import_html_within`] of a page already decoded, so no charset is read
@@ -238,16 +256,23 @@ pub(crate) fn import_html_str_within(text: &str, budget: &Budget) -> Result<Docu
     if !budget.work(2 * (text.len() / 16 + 1)) {
         return Err(TOO_BIG.into());
     }
-    import_decoded(text, budget, None).map(|h| h.document)
+    import_decoded(text, budget, None, None).map(|h| h.document)
 }
 
-/// The import of the decoded page `text`, as [`import_html_within`] says.
+/// The import of the decoded page `text`, as [`import_html_within`] says;
+/// `url` is the page's own URL when it has one (an MHTML root part's,
+/// #1898), which its `<base href>` and its srcs are resolved against.
 fn import_decoded(
     text: &str,
     budget: &Budget,
     images: Option<&mut ImageResolver<'_>>,
+    url: Option<&str>,
 ) -> Result<HtmlImport, String> {
     let (css, base) = collect_styles(text);
+    let base = match (base, url) {
+        (Some(b), Some(u)) => Some(html_image::resolve_ref(u, &b)),
+        (b, u) => b.or(u.map(str::to_string)),
+    };
     let sheet = StyleSheet::parse(&css, budget);
     let mut h = Html::new(text, budget, sheet);
     if let Some(resolve) = images {
@@ -291,6 +316,14 @@ fn import_decoded(
 
 /// The page's text, in the encoding it declares.
 pub(crate) fn decode(bytes: &[u8]) -> String {
+    decode_with(bytes, None)
+}
+
+/// The page's text in `charset` when a transport header gives one (an
+/// MHTML part's `Content-Type`, #1898) and it is one this reads, as a
+/// browser lets the header win over a `<meta charset>`; a byte-order mark
+/// still wins over both. Otherwise as [`decode`].
+pub(crate) fn decode_with(bytes: &[u8], charset: Option<&str>) -> String {
     if let Some(rest) = bytes.strip_prefix(b"\xEF\xBB\xBF") {
         return String::from_utf8_lossy(rest).into_owned();
     }
@@ -300,7 +333,10 @@ pub(crate) fn decode(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(b"\xFE\xFF") {
         return utf16(rest, true);
     }
-    match declared_charset(bytes).as_deref() {
+    let known = charset
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| matches!(c.as_str(), "utf-8" | "utf8") || code_page(c).is_some());
+    match known.or_else(|| declared_charset(bytes)).as_deref() {
         Some("utf-8" | "utf8") => String::from_utf8_lossy(bytes).into_owned(),
         Some(cs) => match code_page(cs) {
             Some(page) => single_byte(bytes, page),

@@ -13170,9 +13170,10 @@ fn sheet_bytes(v: &SheetView, target: Option<&std::path::Path>) -> (Vec<u8>, usi
 
 /// The documents the Open dialog takes: Word 97-2003 `.doc` imports (#634);
 /// RTF, web pages and PDFs opened converted (#633); Word templates, opened
-/// as new documents (#636).
-const DOC_OPEN_EXTENSIONS: [&str; 11] = [
-    "docx", "docm", "dotx", "dotm", "doc", "md", "markdown", "html", "htm", "rtf", "pdf",
+/// as new documents (#636); a single-file Web Page (MHTML, #1898) as one.
+const DOC_OPEN_EXTENSIONS: [&str; 13] = [
+    "docx", "docm", "dotx", "dotm", "doc", "md", "markdown", "html", "htm", "mht", "mhtml", "rtf",
+    "pdf",
 ];
 
 /// What the Open dialog's "All supported" filter lists: documents,
@@ -28752,7 +28753,10 @@ impl Docxy {
             // Opened as a new document from the template (#636).
             .add_filter("Word Template", &["dotx", "dotm"])
             // Opened converted (#633); Save writes a Word document.
-            .add_filter("Rich Text, Web Page or PDF", &["rtf", "htm", "html", "pdf"])
+            .add_filter(
+                "Rich Text, Web Page or PDF",
+                &["rtf", "htm", "html", "mht", "mhtml", "pdf"],
+            )
             .add_filter("Word 97-2003 Document", &["doc"])
             .add_filter("Editable HTML (*.docx.html)", &["html"])
             .add_filter("Excel workbook", &SHEET_EXTENSIONS);

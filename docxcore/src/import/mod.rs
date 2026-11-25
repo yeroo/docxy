@@ -70,6 +70,10 @@
 //! | `html_image::decode_data_uri` | a `data:` src: counted, then percent- and base64-decoded | work (src/16), up front; refused unless its counted size fits the image's limit; the bytes decoded |
 //! | `ImageResolver` answer | the bytes another src resolves to | the resolver is told the limit (room, `MAX_IMAGE_BYTES` 64 MiB, what `MAX_MEDIA_BYTES` 128 MiB leaves); a longer answer dropped; decoded |
 //! | resolver calls, src cache | one call per distinct src | ≤ `MAX_IMAGES` (1000) calls; each cached src built (its length) |
+//! | html `<base href>` (#1898) | found by the `<style>` scan; each src resolved against it | ≤ `MAX_BASE` (4096) bytes, else none; a src's join O(base + src), within its resolver call |
+//! | `<img srcset>`, `<picture>` sources (#1898) | candidates parsed, each tried as a src | ≤ `MAX_SOURCES` (16) sources a picture, each built; ≤ `MAX_CANDIDATES` (16) tries an image, each a resolver call within `MAX_IMAGES` |
+//! | `mhtml::parse` (#1898) | the header blocks, the boundary scan, the parts | headers ≤ `MAX_HEADER` (16 KiB) each; the body scanned once (charged as scanned); ≤ `MAX_PARTS` (4096) parts, each built; the root part decoded |
+//! | `Mhtml::part_for` (#1898) | the part a src names, decoded | a search of ≤ `MAX_PARTS` parts per resolver call; refused unread unless its decoded bound fits the image's limit; decoded as a resolver answer |
 //! | `Images::add` | a medium equal to one kept | work (len/16) per kept medium of the same length; kept media ≤ `MAX_MEDIA_BYTES` in all, so a converting child holds ≤ 3 × 128 MiB of them (import, package, the copy a save clones) |
 //! | html `entities` | each `&` and the name after it | O(name), within the one pass |
 //! | html list marker | text kept | ≤ 32 bytes |
@@ -110,6 +114,7 @@ pub(crate) mod css;
 pub mod html;
 pub mod html_image;
 pub(crate) mod html_table;
+pub(crate) mod mhtml;
 pub mod pdf;
 pub mod recover;
 pub mod rtf;
@@ -300,7 +305,8 @@ pub fn sniff(bytes: &[u8], ext: &str) -> Format {
     if text.starts_with(b"{\\rtf") {
         return Format::Rtf;
     }
-    if looks_like_html(text) {
+    // An MHTML Web Page (#1898): read as HTML, its root part the page.
+    if looks_like_html(text) || mhtml::looks_like(bytes) {
         return Format::Html;
     }
     // A PDF reader accepts junk before the header, within the first 1 KB.
@@ -309,7 +315,7 @@ pub fn sniff(bytes: &[u8], ext: &str) -> Format {
     }
     match ext.to_ascii_lowercase().as_str() {
         "rtf" => Format::Rtf,
-        "htm" | "html" | "xhtml" => Format::Html,
+        "htm" | "html" | "xhtml" | "mht" | "mhtml" => Format::Html,
         "pdf" => Format::Pdf,
         "docx" | "docm" | "dotx" | "dotm" => Format::Docx,
         _ => Format::Unknown,

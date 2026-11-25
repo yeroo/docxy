@@ -407,6 +407,9 @@ fn binary_paths_and_the_open_filter() {
     }
     assert!(open_extensions().contains(&"doc"));
     assert!(open_extensions().contains(&"docx"));
+    // A single-file Web Page (MHTML, #1898).
+    assert!(open_extensions().contains(&"mht"));
+    assert!(open_extensions().contains(&"mhtml"));
 }
 
 /// A document Word itself saved as Word 97-2003 opens the same way, with

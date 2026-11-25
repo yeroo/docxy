@@ -578,7 +578,7 @@ pub(crate) fn percent_decode(s: &str) -> Vec<u8> {
 
 /// Standard base64 (`+/`, also the URL-safe `-_`), ASCII white space
 /// skipped, `=` padding only at the end; `None` for any other character.
-fn base64_decode(b: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(b: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(b.len() / 4 * 3 + 3);
     let mut acc: u32 = 0;
     let mut bits = 0;

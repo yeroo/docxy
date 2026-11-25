@@ -965,4 +965,51 @@ pub(crate) mod tests {
         }
         assert_eq!(c.doc, loaded);
     }
+
+    /// A single-file Web Page (MHTML, #1898): its picture comes from its
+    /// part, and a src no part holds is an absolute `file:` URL (the root's
+    /// location), which is never read, though a file of that name is
+    /// beside the page.
+    #[test]
+    fn a_single_file_web_page_takes_its_pictures_from_its_parts() {
+        let dir = TempDir::new().unwrap();
+        // A real GIF, in the page's folder under the name the missing src
+        // has: never read.
+        let gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;";
+        std::fs::create_dir(dir.0.join("doc_files")).unwrap();
+        write(&dir, "doc_files/gone.gif", gif);
+        let page = "MIME-Version: 1.0\r\n\
+            Content-Type: multipart/related; boundary=\"b\"\r\n\r\n\
+            --b\r\n\
+            Content-Location: file:///C:/X/doc.htm\r\n\
+            Content-Type: text/html; charset=\"utf-8\"\r\n\r\n\
+            <p>x<img src=doc_files/image001.gif width=5 height=5>\
+            <img src=doc_files/gone.gif width=5 height=5></p>\r\n\
+            --b\r\n\
+            Content-Location: file:///C:/X/doc_files/image001.gif\r\n\
+            Content-Transfer-Encoding: base64\r\n\
+            Content-Type: image/gif\r\n\r\n\
+            R0lGODlhAQABAAAAACw=\r\n\
+            --b--\r\n";
+        let path = dir.0.join("doc.mht");
+        std::fs::write(&path, page).unwrap();
+        assert_eq!(
+            docxcore::import::sniff(page.as_bytes(), "mht"),
+            docxcore::import::Format::Html
+        );
+        let c = convert_bytes(What::Html, page.as_bytes(), Some(&path))
+            .unwrap()
+            .unwrap();
+        let pkg = docxcore::package::load_package(&c.docx()).unwrap();
+        let media: Vec<Vec<u8>> = pkg
+            .part_names()
+            .into_iter()
+            .filter(|n| n.starts_with("word/media/"))
+            .map(|n| pkg.part(n).unwrap().to_vec())
+            .collect();
+        // The part's GIF and the placeholder for the other.
+        assert_eq!(media.len(), 2);
+        assert!(media.iter().any(|m| m.starts_with(b"GIF89a")));
+        assert!(!media.iter().any(|m| m.as_slice() == gif));
+    }
 }
