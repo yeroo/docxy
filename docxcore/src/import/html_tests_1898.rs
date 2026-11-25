@@ -300,3 +300,101 @@ fn no_base_leaves_srcs_as_they_were_1898() {
     let (_, asked) = import("<p><img src='x_files/a.png'><img src='../b.png'></p>");
     assert_eq!(asked, ["x_files/a.png", "../b.png"]);
 }
+
+#[test]
+fn srcset_candidates_parse_as_the_html_standard_splits_them_1898() {
+    use html_image::srcset_candidates as c;
+    let own = |v: &[(&str, f64)]| -> Vec<(String, f64)> {
+        v.iter().map(|(u, d)| (u.to_string(), *d)).collect()
+    };
+    // `1x` and bare first, then the rest as written; `w` is 1.
+    assert_eq!(
+        c("big.png 2x, small.png 1x, plain.png, wide.png 800w"),
+        own(&[
+            ("small.png", 1.0),
+            ("plain.png", 1.0),
+            ("big.png", 2.0),
+            ("wide.png", 1.0)
+        ])
+    );
+    // A `data:` URI keeps its commas; a trailing comma ends a candidate.
+    assert_eq!(
+        c("data:image/png;base64,AA,BB 2x,a.png, b.png 1.5x"),
+        own(&[
+            ("a.png", 1.0),
+            ("data:image/png;base64,AA,BB", 2.0),
+            ("b.png", 1.5)
+        ])
+    );
+    // A URL runs to white space, commas and all, as the standard reads it.
+    assert_eq!(c("a.png,b.png 2x"), own(&[("a.png,b.png", 2.0)]));
+    // Bad descriptors drop the candidate: two, zero, unknown, negative.
+    assert_eq!(
+        c("a.png 1x 2x, b.png 0x, c.png 3q, d.png -1x, e.png 2X"),
+        own(&[("e.png", 2.0)])
+    );
+    // Parentheses hold a comma inside descriptors (a future descriptor).
+    assert_eq!(c("a.png foo(1,2), b.png"), own(&[("b.png", 1.0)]));
+    assert!(c("  , ,").is_empty());
+}
+
+#[test]
+fn an_img_whose_src_gives_nothing_tries_its_srcset_1898() {
+    let (got, asked) = import(
+        "<p><img src=missing.png srcset='missing@3x.png 3x, a@2x.png 2x, missing@1x.png' alt=x>\
+         <img srcset='b.png 2x'></p>",
+    );
+    assert_eq!(
+        asked,
+        [
+            "missing.png",
+            "missing@1x.png",
+            "missing@3x.png",
+            "a@2x.png",
+            "b.png"
+        ]
+    );
+    let pics = pictures(&got.document.body);
+    // The 40 x 20 PNG at 2x is 20 x 10 CSS pixels.
+    let size: Vec<_> = pics.iter().map(|r| inline_extent(r).unwrap()).collect();
+    assert_eq!(size, [(20 * 9525, 10 * 9525), (20 * 9525, 10 * 9525)]);
+    // Named after the candidate that gave it.
+    assert!(pics[0].contains("name=\"a@2x.png\""), "{}", pics[0]);
+}
+
+#[test]
+fn a_src_that_resolves_never_asks_for_a_candidate_1898() {
+    let (_, asked) = import("<p><img src=a.png srcset='b.png 2x'></p>");
+    assert_eq!(asked, ["a.png"]);
+}
+
+#[test]
+fn a_picture_offers_its_sources_after_the_imgs_own_srcset_1898() {
+    let (got, asked) = import(
+        "<p><picture>\
+         <source media='(min-width: 600px)' srcset='wide.png'>\
+         <source type='image/avif' srcset='a.avif'>\
+         <source type='image/webp; codecs=x' srcset='missing.webp'>\
+         <source srcset='pic.png 2x'>\
+         <img src=missing.png srcset='missing-own.png'></picture>\
+         <img src=missing2.png></p>",
+    );
+    assert_eq!(
+        asked,
+        [
+            "missing.png",
+            "missing-own.png",
+            "missing.webp",
+            "pic.png",
+            "missing2.png"
+        ]
+    );
+    let pics = pictures(&got.document.body);
+    assert_eq!(inline_extent(pics[0]), Some((20 * 9525, 10 * 9525)));
+}
+
+#[test]
+fn a_source_outside_a_picture_is_nothing_1898() {
+    let (_, asked) = import("<video><source srcset='v.png'></video><p><img src=missing.png></p>");
+    assert_eq!(asked, ["missing.png"]);
+}

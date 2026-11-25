@@ -263,6 +263,105 @@ impl<'a> Images<'a> {
     }
 }
 
+/// The most `<source>`s of one `<picture>` kept (#1898).
+pub(crate) const MAX_SOURCES: usize = 16;
+/// The most `srcset` candidates one `<img>` tries (#1898).
+pub(crate) const MAX_CANDIDATES: usize = 16;
+
+/// Whether a `<source type>` names an image the import may use (#1898):
+/// PNG, JPEG, GIF, BMP, or (through a caller's converter) WebP and SVG;
+/// parameters and case ignored.
+pub(crate) fn usable_type(mime: &str) -> bool {
+    let t = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        t.as_str(),
+        "image/png"
+            | "image/jpeg"
+            | "image/jpg"
+            | "image/pjpeg"
+            | "image/gif"
+            | "image/bmp"
+            | "image/webp"
+            | "image/svg+xml"
+    )
+}
+
+/// A `srcset`'s candidates (#1898), each URL with its density, in the order
+/// an import tries them: those with no descriptor or `1x` first, then the
+/// rest as written. A density descriptor `Nx` (N > 0) is N; a width one
+/// (`Nw`) is 1, as the `sizes` it needs is not read; a candidate with a
+/// descriptor that is neither is dropped. Parsed as the HTML standard's
+/// srcset parser splits it: a URL runs to white space (so a `data:` URI's
+/// commas are its own), a trailing comma ends a candidate with no
+/// descriptors, and descriptors run to a comma outside parentheses.
+pub(crate) fn srcset_candidates(srcset: &str) -> Vec<(String, f64)> {
+    let mut first = Vec::new();
+    let mut rest = Vec::new();
+    let mut s = srcset;
+    loop {
+        s = s.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ',');
+        if s.is_empty() {
+            break;
+        }
+        let end = s.find(|c: char| c.is_ascii_whitespace()).unwrap_or(s.len());
+        let raw_url = &s[..end];
+        s = &s[end..];
+        let url = raw_url.trim_end_matches(',');
+        let descriptors = if url.len() < raw_url.len() {
+            ""
+        } else {
+            // To the first comma outside parentheses.
+            let mut depth = 0usize;
+            let mut stop = s.len();
+            for (i, c) in s.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth = depth.saturating_sub(1),
+                    ',' if depth == 0 => {
+                        stop = i;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let d = &s[..stop];
+            s = &s[stop..];
+            d
+        };
+        let words: Vec<&str> = descriptors.split_ascii_whitespace().collect();
+        let density = match words.as_slice() {
+            [] => Some(1.0),
+            [d] => {
+                let d = d.to_ascii_lowercase();
+                if let Some(x) = d.strip_suffix('x') {
+                    x.parse::<f64>().ok().filter(|x| x.is_finite() && *x > 0.0)
+                } else if let Some(w) = d.strip_suffix('w') {
+                    w.parse::<u32>().ok().filter(|&w| w > 0).map(|_| 1.0)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(density) = density.filter(|_| !url.is_empty()) {
+            let one = descriptors.trim().is_empty()
+                || (density == 1.0 && !descriptors.contains(['w', 'W']));
+            if one {
+                first.push((url.to_string(), density));
+            } else {
+                rest.push((url.to_string(), density));
+            }
+        }
+    }
+    first.extend(rest);
+    first
+}
+
 /// The longest `<base href>` kept (#1898), in bytes: a longer one is none.
 const MAX_BASE: usize = 4096;
 

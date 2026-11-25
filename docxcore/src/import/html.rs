@@ -814,6 +814,11 @@ struct Attrs {
     rules: Option<String>,
     bordercolor: Option<String>,
     span: Option<String>,
+    /// An `<img>`'s or `<source>`'s `srcset`, a `<source>`'s `type` and
+    /// `media` (#1898).
+    srcset: Option<String>,
+    mime: Option<String>,
+    media: Option<String>,
 }
 
 /// One element's style, being computed: its look so far, and the box
@@ -2626,6 +2631,10 @@ struct Html<'a> {
     root_kids: Kids,
     /// The serial the next element opened takes ([`Elem::serial`]).
     next_serial: u64,
+    /// The `srcset`s of the `<source>`s an open `<picture>` has had so far
+    /// (#1898), with that `picture`'s serial: the ones a browser may pick
+    /// (no `media`, a known `type`), at most [`html_image::MAX_SOURCES`].
+    picture: Option<(u64, Vec<String>)>,
     /// The `html` and `body` elements' backgrounds (#1894), once each is
     /// seen: the page colour.
     page_fill: [Option<Option<String>>; 2],
@@ -2657,6 +2666,7 @@ impl<'a> Html<'a> {
             break_pending: false,
             root_kids: Kids::default(),
             next_serial: 0,
+            picture: None,
             page_fill: [None, None],
         }
     }
@@ -2909,6 +2919,7 @@ impl<'a> Html<'a> {
                 && self.visible()
                 && (!text.trim().is_empty() || self.sheet.may_match_tag("br")))
             || (name == "img" && self.images.is_some() && self.image_in_view())
+            || (name == "source" && self.images.is_some() && self.in_picture().is_some())
             || (name == "col" && self.kept_table() && self.at_table_level());
         let read = (wanted && self.budget.scanned(text.len())).then(|| {
             let attrs = attrs_of(text);
@@ -2932,6 +2943,13 @@ impl<'a> Html<'a> {
             "img" => {
                 if let Some((attrs, key)) = &read {
                     self.image(attrs, key);
+                }
+            }
+            // A `<picture>`'s source (#1898): its `srcset` kept for the
+            // `<img>` in it.
+            "source" => {
+                if let (Some((attrs, _)), Some(serial)) = (&read, self.in_picture()) {
+                    self.picture_source(serial, attrs);
                 }
             }
             // A table's column (#1894).
@@ -3834,8 +3852,9 @@ impl<'a> Html<'a> {
             width: side(look.own_max_width),
             height: look.own_max_height,
         };
-        let src = attrs.src.as_deref().unwrap_or("").trim();
+        let mut src = attrs.src.as_deref().unwrap_or("").trim().to_string();
         let alt = html_image::alt_text(attrs.alt.as_deref().unwrap_or(""));
+        let candidates = self.image_candidates(attrs);
         let props = self.run_props();
         // A picture in a URL link keeps it as its click link (#1999), as
         // Word does; an anchor link's picture is outside the link.
@@ -3844,7 +3863,26 @@ impl<'a> Html<'a> {
         let Some(images) = self.images.as_mut() else {
             return;
         };
-        let (rid, pixels) = match images.source(src, budget) {
+        // A `src` that gives nothing falls back on the `srcset`s (#1898):
+        // the first candidate that gives an image, its size in CSS pixels
+        // by its density.
+        let mut found = images.source(&src, budget);
+        if matches!(found, Source::Unresolved) {
+            for (url, density) in candidates {
+                if let Source::Media { rid, width, height } = images.source(&url, budget) {
+                    let css = |px: u32| ((f64::from(px) / density).round() as u32).max(1);
+                    found = Source::Media {
+                        rid,
+                        width: css(width),
+                        height: css(height),
+                    };
+                    src = url;
+                    break;
+                }
+            }
+        }
+        let src = src.as_str();
+        let (rid, pixels) = match found {
             Source::Media { rid, width, height } => (Some(rid), Some((width, height))),
             Source::Unresolved => (None, None),
         };
@@ -3936,6 +3974,67 @@ impl<'a> Html<'a> {
             parent = Some(&e.look);
         }
         outside(room, look).clamp(0, body) as u32
+    }
+
+    /// The serial of the `<picture>` that is the innermost open element,
+    /// if it is one (#1898).
+    fn in_picture(&self) -> Option<u64> {
+        self.elems
+            .last()
+            .filter(|e| e.key.tag == "picture")
+            .map(|e| e.serial)
+    }
+
+    /// Keep a `<source>`'s `srcset` for the `<img>` of the `<picture>`
+    /// `serial` (#1898), unless a browser might not pick it: one with a
+    /// `media` query, or a `type` that is no image the import can use.
+    fn picture_source(&mut self, serial: u64, attrs: &Attrs) {
+        if attrs.media.is_some()
+            || attrs
+                .mime
+                .as_deref()
+                .is_some_and(|t| !html_image::usable_type(t))
+        {
+            return;
+        }
+        let Some(srcset) = attrs.srcset.as_deref() else {
+            return;
+        };
+        if self.picture.as_ref().is_none_or(|(s, _)| *s != serial) {
+            self.picture = Some((serial, Vec::new()));
+        }
+        if let Some((_, sources)) = self.picture.as_mut() {
+            if sources.len() < html_image::MAX_SOURCES && self.budget.alloc(srcset.len() + 24) {
+                sources.push(srcset.to_string());
+            }
+        }
+    }
+
+    /// Where an `<img>` whose `src` gave nothing looks next (#1898), in
+    /// order: its own `srcset`, then the kept `<source>`s of the
+    /// `<picture>` it is in, each list's candidates as
+    /// [`html_image::srcset_candidates`] orders them; at most
+    /// [`html_image::MAX_CANDIDATES`] in all.
+    fn image_candidates(&self, attrs: &Attrs) -> Vec<(String, f64)> {
+        let mut out = Vec::new();
+        let mut take = |srcset: &str| {
+            for c in html_image::srcset_candidates(srcset) {
+                if out.len() < html_image::MAX_CANDIDATES {
+                    out.push(c);
+                }
+            }
+        };
+        if let Some(own) = attrs.srcset.as_deref() {
+            take(own);
+        }
+        if let (Some(serial), Some((kept, sources))) = (self.in_picture(), self.picture.as_ref()) {
+            if serial == *kept {
+                for s in sources {
+                    take(s);
+                }
+            }
+        }
+        out
     }
 
     /// Before a block image's content (`block`: its place): end the text
@@ -4647,6 +4746,9 @@ fn attrs_of(attrs: &str) -> Attrs {
             "rules" => Some(&mut out.rules),
             "bordercolor" => Some(&mut out.bordercolor),
             "span" => Some(&mut out.span),
+            "srcset" => Some(&mut out.srcset),
+            "type" => Some(&mut out.mime),
+            "media" => Some(&mut out.media),
             _ => None,
         };
         if let Some(slot) = slot.filter(|s| s.is_none()) {
