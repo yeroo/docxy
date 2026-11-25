@@ -50,7 +50,7 @@ issue number to find its notes.
   comment editor and its draft per tab (#1362, #1329), inline pictures (#1432), run
   styles (#1427), font substitution
   (#1900), link colours (#1906), tables placed by `w:jc` (#1922), rounded
-  picture crops (#1926), the document views' scrollbars and Print Layout's
+  picture crops (#1926), per corner (#1936), the document views' scrollbars and Print Layout's
   sideways scroll (#2080), Word's dark mode for the document and View >
   Switch Modes (#2079), the Find bar's keys, clicks and the one-line fields'
   shared key map (#2116), unnamed runs in the document's theme font and a
@@ -74,7 +74,8 @@ issue number to find its notes.
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),
   images (#1880), links (#1879), centring (#1922), in cells (#1930),
   bookmarks, the Hyperlink style, relative links, titles and targets,
-  Markdown link destinations (#1912), rounded images (#1926),
+  Markdown link destinations (#1912), rounded images (#1926), corners
+  that differ, rounded wrappers and the editable page's crop (#1936),
   nested cards (#1927), page margins (#1928), Outlook mail: CSS-only spacing,
   quirks-mode edges, list indents, item continuations, marker look (#1979),
   list and parent margins, trailing `<br>`, wide hangs, wrapper tables (#2114),
