@@ -7,8 +7,10 @@
 //! [`crate::package::new_markdown_package`] defines) and simple tables. The
 //! result has no package of its own; it is saved through a fresh Markdown
 //! package, which defines every style and list it uses. Fields, notes,
-//! comments and section layout are not converted (an HTML import gets one
-//! fixed page, Letter with Outlook-like 15 px margins, #1928); images only
+//! comments and section layout are not converted (an HTML import gets its
+//! page's own `@page` size and margins, #1944, else one fixed page, Letter
+//! with Outlook-like 15 px margins, #1928, as do a paste and a
+//! classic-Outlook mail: `docs/claude/html-import.md`); images only
 //! by [`html::import_html_with`] (#1880), whose [`html::HtmlImport`] carries
 //! their media into the package it builds.
 //!
@@ -52,9 +54,10 @@
 //! | rtf `\listtext`, stylesheet names | text kept | ≤ 64 bytes each (`MAX_NAME`) |
 //! | rtf font table, heading styles | map entries | built per new entry |
 //! | `html::import_html` | decoding, the `<style>` scan, tokenizing | work (3 × input/16), up front |
-//! | html `prescan` | the `<style>` texts joined; each `<a>` tag's attributes read (#1912) | ≤ input; forward only (comments and raw-text elements skipped by one search each, an `<a>` tag passed over whole; an `<a` that never closes read to the end once, and no `<a` after it, r1); anchor names ≤ `MAX_BOOKMARKS` |
+//! | html `prescan` | the `<style>` texts joined; each `<a>` tag's attributes read (#1912); `<meta>` tags' attributes until the first Generator one, and the first `<body` tag's offset into the CSS (#1944) | ≤ input; forward only (comments and raw-text elements skipped by one search each, an `<a>` or `<meta>` tag passed over whole; an `<a` that never closes read to the end once, and no `<a` after it, r1; a `<meta` that never closes ends the Generator search); anchor names ≤ `MAX_BOOKMARKS` |
 //! | html `open_void` (#1912 r1) | a void or raw-text element's attributes, for a linked `id` | only when the page has an anchor link; scanned (attrs/16) |
-//! | `css::StyleSheet::parse` | the CSS, once; rules, declaration blocks | work (css/16); each rule and block built; ≤ `MAX_RULES` (10 000) rules, more ignored; brace nesting counted, never recursed |
+//! | `css::StyleSheet::parse_split` | the CSS, once, in two parts (head, body; #1944); rules, declaration blocks, `@page` rules | each part `scanned` (work css/16); each rule, block and `@page` rule built; ≤ `MAX_RULES` (10 000) rules and ≤ `MAX_PAGE_RULES` (64) `@page` rules, more ignored; an `@page` prelude read only to the first `;`, `{`, `}` or quote, bytes the at-rule skip passes anyway (#1944 r1); brace nesting counted, never recursed |
+//! | `css::StyleSheet::page_decls` (#1944) | the head blocks' declarations, each against ≤ 64 page names | work (decls × pages / 16 + 1), once per import |
 //! | css selector | compounds | ≤ `MAX_COMPOUNDS` (32), longer dropped; names ≤ 64 bytes |
 //! | `css::StyleSheet::matching` | rules examined per element opened | work per rule examined (only those indexed by the element's id, classes, tag, or universal) |
 //! | `css::Selector::matches` | reach sets, one per compound | work (depth/4 + 1) a compound: O(compounds × depth), no backtracking |
@@ -596,6 +599,8 @@ pub(crate) struct Builder<'b> {
     /// How many times content that keeps a paragraph has been written
     /// (#1936, [`Builder::shown`]).
     shown: u64,
+    /// The page's body width, in twips ([`Builder::set_body`], #1944).
+    body_twips: u32,
 }
 
 #[derive(Default)]
@@ -690,7 +695,14 @@ impl<'b> Builder<'b> {
             keeps: false,
             link_style: false,
             shown: 0,
+            body_twips: html_table::BODY_TWIPS,
         }
+    }
+
+    /// The page's body width (#1944): the room an outermost HTML table has
+    /// (its own declared room aside). [`html_table::BODY_TWIPS`] until set.
+    pub(crate) fn set_body(&mut self, twips: u32) {
+        self.body_twips = twips;
     }
 
     /// A count that grows whenever content that keeps a paragraph is
@@ -1448,7 +1460,7 @@ impl<'b> Builder<'b> {
                 {
                     self.body.push(Block::Paragraph(Paragraph::default()));
                 }
-                let avail = raw.spec.room.map_or(html_table::BODY_TWIPS, |r| r.width);
+                let avail = raw.spec.room.map_or(self.body_twips, |r| r.width);
                 let table = html_table::layout(raw, avail, self.budget);
                 self.body.push(Block::Table(table));
             }

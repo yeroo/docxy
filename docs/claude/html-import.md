@@ -27,8 +27,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   table, scaled down to 100 in all); a spanned cell's width spreads what its
   columns lack over those without one; the rest share what is left, each at
   least 15 twips. The table is its own width, else its columns' when all
-  are known, else the room it has (outermost, the page's 11790-twip body,
-  #1928). Declared columns
+  are known, else the room it has (outermost, the page's body,
+  `Page::body`, #1944; 11790 twips on #1928's default page). Declared columns
   narrower than a declared table grow to it; wider ones widen the grid
   (tblW stays as declared). `tblW` is dxa, pct (fiftieths) or auto; every
   cell's `tcW` is its columns' sum. Web Layout and `ext::DocView` fit a pct or auto
@@ -106,9 +106,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
 - Fixed-width blocks: a `Kind::Block` with an absolute CSS `width` (not a
   percentage or `auto`; a negative or invalid one leaves the width
   before it) and both side margins auto gets
-  `max(0, (BODY_TWIPS - indent - indent_right - width) / 2)` more indent on
+  `max(0, (body - indent - indent_right - width) / 2)` more indent on
   each side, after its own box is added: a content box, so its padding is
-  outside the width. Its text alignment is unchanged. Inside a cell or a
+  outside the width (`body` is the page's, `Page::body`, #1944;
+  `BODY_TWIPS`, 11790, on #1928's default page). Its text alignment is
+  unchanged. Inside a cell or a
   card, centred in the cell's inner width when the table is laid out, only
   in a cell whose width the page declares (#1930: see "HTML import
   centring in cells").
@@ -140,7 +142,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
 - `layout` centres each paragraph in the cell's `inner` width (the one a
   nested table gets): box by box, outermost first, each in the room the
   enclosing ones' centring leaves, the body-level formula with `inner` for
-  `BODY_TWIPS`. A box wider than its room gets nothing. The indent stays
+  the page's body. A box wider than its room gets nothing. The indent stays
   at least 0 as at body level, and `ZERO_IND` goes once it moves.
 - Paragraph lines: `Look::border_left_boxes` / `border_right_boxes` count
   the boxes the block drawing each line is in. A line moves with those
@@ -252,7 +254,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   is of the containing width and a percentage height is `auto` (#1898,
   below); one side gives the other by the pixels' aspect, none the
   pixels; `max-width`/`max-height` clamp it (#1898); scaled down to the
-  body (11790 twips, #1928).
+  page's body (`Page::body`, #1944; 11790 twips on #1928's default page).
   Of the rest, only `tr`, `td` and `th` read `height`, as a row height
   (#1894).
 - Unresolved (refused, no room, not an image): sized, a picture over one
@@ -861,10 +863,70 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   writes all seven `w:pgMar` attributes from the parsed margins, and only
   Page Setup's own fields change those three.
 - Known limits: 15 px is inside most printers' unprintable band (about
-  0.17-0.25"), so Word warns about the margins when printing; a page's own
-  `@page` margins (Word-saved HTML's `@page WordSection1 {margin: ...}`)
-  are not read, as `css.rs` skips every at-rule; every import gets the same
-  fixed page.
+  0.17-0.25"), so Word warns about the margins when printing. A page that
+  declares its own `@page` gets that page instead since #1944 (next
+  section); every other import gets this fixed page.
+
+## HTML import page rule (#1944)
+
+- A page's own `@page` gives the import's section and the body the reader
+  lays out in, in place of #1928's page (`html_table::Page`,
+  `Page::DEFAULT` is #1928's; `BODY_TWIPS` stays the default page's body).
+  So a Word Web Page (`@page WordSection1 {size:8.5in 11.0in; margin:...}`
+  with `div.WordSection1 {page:WordSection1}`) keeps Word's page:
+  `corpus/word-import/source.htm` imports with `source.docx`'s `pgSz` and
+  `pgMar`.
+- `css.rs` keeps unnamed and named `@page` rules (`StyleSheet::pages`, at
+  most `MAX_PAGE_RULES`); a page selector (`:first`, `name:left`), a
+  prelude of two names, margin boxes and an `@page` inside `@media` are
+  skipped with every other at-rule. `StyleSheet::page_decls`: the unnamed
+  pages' declarations, then the selected named page's, then the
+  `!important` ones of both, each in source order (a later one wins). The
+  selected page is the one named by the first `page` declaration (in
+  source order, of the blocks that may select one) that names a kept
+  `@page` (ASCII case-insensitive); `auto` and unknown names are passed
+  over, and with none left no page is selected. Whether an element matches that
+  rule is not checked: Word's `div.WordSection1` wraps the whole body, and
+  the import has one section, so a page of several WordSections takes the
+  first selected page throughout.
+- `Page::from_decls` reads `size` (one length, a square, or two; `auto`;
+  `letter`, `legal`, `ledger`, `a3`-`a5`, `b4`, `b5`; `portrait` /
+  `landscape` with or without one, in either order), `margin` and its
+  longhands, and Word's `mso-header-margin` / `mso-footer-margin`. Without
+  those two, header and footer are the top and bottom margins, at most
+  0.5": ours, not CSS (Word's filtered HTML drops them; Word's default is
+  0.5"). Lenient: an unreadable `size` is ignored whole, a side of it
+  outside 1"..22" alone; a percentage, negative or unreadable margin is
+  ignored alone; margins leaving a body under 0.5" wide or high are all
+  ignored (the default 225 then). A page wider than tall writes
+  `w:orient="landscape"` with `w`/`h` as given (as Word stores it).
+- The body follows the page: `Html::set_page` sets `Html::page` and
+  `Builder::set_body` (an outermost table's room); `Ctx::body` /
+  `Cascade::body` centre a fixed-width box outside a cell and give
+  `body_room`; `table_spec` takes the body; `html_image::fit_to_body` and
+  `Html::image_room` read it.
+- #1928's page stays for:
+  - a classic-Outlook mail: the first `<meta name=Generator>` (in
+    `prescan`) says `(filtered medium)`. Outlook composes in Word, so its
+    mail carries Word's default `@page` with 1" margins that the sender
+    never chose and its reading pane ignores. Word's Save as Web Page
+    writes `(filtered)` or nothing after the version.
+  - a paste (`import_html_str_within`): it goes into a document with a
+    page of its own, and Word's clipboard HTML carries the source's `@page`.
+  - `@page` rules and `page` declarations in a `<style>` after the page's
+    first `<body` tag (`Prescan::head_css`, `StyleSheet::parse_split`): a
+    quoted mail's styles sit in the body. Its other rules still apply.
+- Known limits: a classic-Outlook mail quoted by another client whose
+  styles end up in the head (no Outlook Generator) gives Word's default
+  page. Not read: `@page :first`/`:left`/`:right`, margin boxes,
+  `mso-gutter-margin`, `mso-paper-source`, page borders and columns,
+  `page` in a `style=""` attribute, and several `@page`s as several
+  sections. Web Layout and `ext::DocView`'s Web Layout never show page
+  margins; Print Layout does.
+- Tests: `import/html_tests_1944.rs`, the `…_1944` tests in `css.rs`,
+  `word_web_page_keeps_word_page` (`tests/word_import.rs`),
+  `tests/html_page.rs`, `uiharness/cases/html-page-rule.uit` (121 / 97 /
+  574 px against `html-page-margins.uit`'s 16 / 16 / 784).
 
 ## HTML import Outlook mail (#1979)
 

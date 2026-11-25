@@ -9,8 +9,11 @@
 //! compounds, and the descendant (space), child (`>`) and next-sibling
 //! (`+`) combinators, in comma groups (#1883). A selector with anything
 //! else (`~`, another pseudo-class, a pseudo-element, an escape) is
-//! dropped alone; the rest of its group still applies. Every at-rule is
-//! skipped with its block, and `<!--`, `-->` and comments are ignored.
+//! dropped alone; the rest of its group still applies. Every at-rule but
+//! `@page` is skipped with its block, and `<!--`, `-->` and comments are
+//! ignored. An unnamed or named `@page` is kept (#1944, at most
+//! [`MAX_PAGE_RULES`]), with no selector (`:first`) or margin box: the
+//! page an import is laid out for ([`StyleSheet::page_decls`]).
 //! Names compare ASCII case-insensitively (most email is quirks mode, where
 //! classes and ids do).
 //!
@@ -27,6 +30,8 @@ use std::collections::HashMap;
 /// The most rules a sheet keeps (a selector of a comma group is one rule);
 /// more are ignored.
 pub(crate) const MAX_RULES: usize = 10_000;
+/// The most `@page` rules a sheet keeps (#1944); more are ignored.
+pub(crate) const MAX_PAGE_RULES: usize = 64;
 /// The most compounds a selector may have; a longer one is dropped alone.
 pub(crate) const MAX_COMPOUNDS: usize = 32;
 /// The longest tag, class, id or font name kept, in bytes.
@@ -835,15 +840,54 @@ pub(crate) struct StyleSheet {
     /// A selector has a `+` (#1883): elements keep their preceding
     /// siblings' keys.
     uses_next: bool,
+    /// The kept `@page` rules (#1944), in source order: the page's name
+    /// (`None` for the unnamed page) and its declarations.
+    pages: Vec<(Option<String>, Vec<Decl>)>,
+    /// How many of `blocks` came from the part of the sheet that may
+    /// select a page (the page's head, [`StyleSheet::parse_split`]): only
+    /// their `page` declarations select one.
+    page_blocks: usize,
 }
 
 impl StyleSheet {
     /// Parse `css`, charging `budget`: the text scanned once, every rule and
-    /// declaration block kept. At most [`MAX_RULES`] rules are kept.
+    /// declaration block kept. At most [`MAX_RULES`] rules are kept. The
+    /// whole of it may give the page (the import splits it,
+    /// [`StyleSheet::parse_split`]).
+    #[cfg(test)]
     pub(crate) fn parse(css: &str, budget: &Budget) -> StyleSheet {
+        Self::parse_split(css, css.len(), budget)
+    }
+
+    /// [`StyleSheet::parse`] of `css`, of which only the first `head` bytes
+    /// (the `<style>`s in the page's head, #1944) may give the page: its
+    /// `@page` rules and the `page` declarations that select one. The rest
+    /// (a `<style>` in the body, such as a quoted mail's) gives rules only.
+    /// The two parts are separate texts (whole `<style>` elements), each
+    /// stripped of comments on its own; rule order runs on across them.
+    pub(crate) fn parse_split(css: &str, head: usize, budget: &Budget) -> StyleSheet {
         let mut sheet = StyleSheet::default();
-        if css.is_empty() || !budget.scanned(css.len()) {
-            return sheet;
+        let mut head = head.min(css.len());
+        while !css.is_char_boundary(head) {
+            head -= 1;
+        }
+        let (head, body) = css.split_at(head);
+        if sheet.parse_part(head, true, budget) {
+            sheet.page_blocks = sheet.blocks.len();
+            sheet.parse_part(body, false, budget);
+        }
+        sheet
+    }
+
+    /// Add `css`'s rules to the sheet, and its `@page` rules when `pages`;
+    /// `false` when the budget ran out.
+    fn parse_part(&mut self, css: &str, pages: bool, budget: &Budget) -> bool {
+        let sheet = self;
+        if css.is_empty() {
+            return true;
+        }
+        if !budget.scanned(css.len()) {
+            return false;
         }
         let css = strip_comments(css);
         let b = css.as_bytes();
@@ -863,7 +907,28 @@ impl StyleSheet {
                 continue;
             }
             if c == b'@' {
-                i = skip_at_rule(b, i);
+                let Some((name, open)) = page_rule_at(b, i) else {
+                    i = skip_at_rule(b, i);
+                    continue;
+                };
+                let close = block_end(b, open);
+                i = close + 1;
+                if !pages || sheet.pages.len() >= MAX_PAGE_RULES {
+                    continue;
+                }
+                let decls = parse_declarations(&css[open + 1..close.min(b.len())]);
+                if decls.is_empty() {
+                    continue;
+                }
+                let heap: usize = name.as_ref().map_or(0, String::len)
+                    + decls
+                        .iter()
+                        .map(|d| d.name.len() + d.value.len() + std::mem::size_of::<Decl>())
+                        .sum::<usize>();
+                if !budget.keep::<(Option<String>, Vec<Decl>)>(heap) {
+                    return false;
+                }
+                sheet.pages.push((name, decls));
                 continue;
             }
             let Some(open) = find_unquoted(b, i, b'{') else {
@@ -901,7 +966,7 @@ impl StyleSheet {
                     continue;
                 }
                 if !budget.keep::<Rule>(sel.heap()) {
-                    return sheet;
+                    return false;
                 }
                 let names: Vec<String> = names.into_iter().map(str::to_string).collect();
                 sheet.attr_names.extend(names);
@@ -932,12 +997,58 @@ impl StyleSheet {
             }
             if kept_any {
                 if !budget.keep::<Vec<Decl>>(heap) {
-                    return sheet;
+                    return false;
                 }
                 sheet.blocks.push(decls);
             }
         }
-        sheet
+        true
+    }
+
+    /// The declarations of the page the sheet selects (#1944), in cascade
+    /// order, so that a later one wins per property: the unnamed `@page`'s,
+    /// then the selected named page's, each in source order; then the
+    /// `!important` ones of both, in the same order. The selected page is
+    /// the one named by the first `page` declaration (in source order, of
+    /// the blocks that may select one) that names a kept `@page` (ASCII
+    /// case-insensitive); `auto` and unknown names are passed over, and
+    /// with none left no page is selected. Its importance is not
+    /// considered, and nor is whether an element matches its rule: a Word
+    /// page's `div.WordSection1` wraps the whole body, and an import has
+    /// one section.
+    ///
+    /// Charged to `budget` up front: the head blocks' declarations, each
+    /// compared with at most [`MAX_PAGE_RULES`] page names (work
+    /// (decls × pages / 16 + 1)); once per import.
+    pub(crate) fn page_decls(&self, budget: &Budget) -> Vec<&Decl> {
+        let decls: usize = self.blocks[..self.page_blocks].iter().map(Vec::len).sum();
+        if !budget.work(decls.saturating_mul(self.pages.len()) / 16 + 1) {
+            return Vec::new();
+        }
+        let named = |n: &str| {
+            self.pages
+                .iter()
+                .any(|(p, _)| p.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(n)))
+        };
+        let selected = self.blocks[..self.page_blocks]
+            .iter()
+            .flatten()
+            .filter(|d| d.name == "page")
+            .map(|d| d.value.trim())
+            .find(|v| !v.eq_ignore_ascii_case("auto") && named(v));
+        let unnamed = self.pages.iter().filter(|(p, _)| p.is_none());
+        let chosen = self.pages.iter().filter(|(p, _)| {
+            p.as_deref()
+                .zip(selected)
+                .is_some_and(|(p, s)| p.eq_ignore_ascii_case(s))
+        });
+        let mut out = Vec::new();
+        for important in [false, true] {
+            for (_, decls) in unnamed.clone().chain(chosen.clone()) {
+                out.extend(decls.iter().filter(|d| d.important == important));
+            }
+        }
+        out
     }
 
     #[cfg(test)]
@@ -1008,6 +1119,40 @@ impl StyleSheet {
     pub(crate) fn decls(&self, hit: Hit) -> &[Decl] {
         &self.blocks[hit.block as usize]
     }
+}
+
+/// The `@page` rule starting at `b[at] == '@'` (#1944): its page's name
+/// (`None` for the unnamed page) and where its block opens. `None` for any
+/// other at-rule, a page selector (`:first`, `name:left`), a prelude of
+/// more than one name, or a rule with no block: those are skipped.
+///
+/// The prelude is read only up to the first `;`, `{`, `}` or quote, all of
+/// which [`skip_at_rule`] passes when it is not a page rule: the bytes read
+/// here are never read again by the next rule's scan, so a sheet of `@page;`
+/// statements stays linear (#1944 r1).
+fn page_rule_at(b: &[u8], at: usize) -> Option<(Option<String>, usize)> {
+    let word = b.get(at + 1..at + 5)?;
+    if !word.eq_ignore_ascii_case(b"page") {
+        return None;
+    }
+    let next = *b.get(at + 5)?;
+    if !(next.is_ascii_whitespace() || next == b'{') {
+        return None;
+    }
+    let open = (at + 5..b.len()).find(|&i| matches!(b[i], b';' | b'{' | b'}' | b'"' | b'\''))?;
+    if b[open] != b'{' {
+        return None;
+    }
+    let prelude = std::str::from_utf8(&b[at + 5..open]).ok()?.trim();
+    if prelude.is_empty() {
+        return Some((None, open));
+    }
+    let name_like = prelude.len() <= MAX_NAME
+        && !prelude.starts_with(|c: char| c.is_ascii_digit())
+        && prelude
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_');
+    name_like.then(|| (Some(prelude.to_string()), open))
 }
 
 /// Where the at-rule starting at `b[at] == '@'` ends: after its `;`, or after
@@ -2575,10 +2720,148 @@ mod tests {
         let hits = sheet.matching(&path[..], &b);
         assert_eq!(hits.len(), 1);
         assert_eq!(sheet.decls(hits[0])[0].value, "#2F5496");
+        // The `@page` rule is kept since #1944, as a page, not a rule.
+        assert_eq!(
+            sheet.pages,
+            [(
+                Some("WordSection1".to_string()),
+                parse_declarations("size:8.5in 11.0in")
+            )]
+        );
         // An unclosed block or at-rule ends the sheet without a panic.
         for cut in ["p {color:red", "@media x { p {", "p", "{}}}", "\"{"] {
             let _ = StyleSheet::parse(cut, &b);
         }
+    }
+
+    fn values(decls: Vec<&Decl>) -> Vec<String> {
+        decls
+            .iter()
+            .map(|d| format!("{}:{}", d.name, d.value))
+            .collect()
+    }
+
+    #[test]
+    fn page_rules_are_kept_unnamed_and_named_1944() {
+        let b = budget();
+        let sheet = StyleSheet::parse(
+            "@page {margin:1in} @PAGE Word_1-a{size:a4} @page:first {margin:2in}\
+             @page W:first {margin:3in} @page A B {margin:4in} @page 1x {margin:5in}\
+             @media print { @page {margin:6in} } @pages {margin:7in} @page {}\
+             p {color:red}",
+            &b,
+        );
+        let names: Vec<Option<&str>> = sheet.pages.iter().map(|(n, _)| n.as_deref()).collect();
+        assert_eq!(names, [None, Some("Word_1-a")]);
+        // The rule after them is read as before.
+        assert_eq!(sheet.len(), 1);
+        // A page rule is no style rule: nothing matches it.
+        assert!(sheet.matching(&[key("p", None, None)][..], &b).len() == 1);
+        // Unclosed or cut page rules end the sheet without a panic.
+        for cut in [
+            "@page",
+            "@page ",
+            "@page {",
+            "@page {margin:1in",
+            "@page A",
+            "@page;p{}",
+        ] {
+            let s = StyleSheet::parse(cut, &b);
+            assert!(s.pages.len() <= 1, "{cut}");
+        }
+        // `@page;` is a statement at-rule: skipped to its `;`.
+        assert_eq!(StyleSheet::parse("@page; p {color:red}", &b).len(), 1);
+        // At most `MAX_PAGE_RULES`.
+        let many = "@page {margin:1in} ".repeat(MAX_PAGE_RULES + 5);
+        assert_eq!(StyleSheet::parse(&many, &b).pages.len(), MAX_PAGE_RULES);
+    }
+
+    #[test]
+    fn a_page_rule_s_prelude_ends_at_its_statement_1944() {
+        let at = |css: &str| page_rule_at(css.as_bytes(), 0);
+        assert_eq!(at("@page {}"), Some((None, 6)));
+        assert_eq!(at("@page  N\t{}"), Some((Some("N".to_string()), 9)));
+        // The prelude stops at a `;`, `}` or quote: no page rule, so the
+        // sheet goes on from the statement's end, never scanning to the
+        // next `{` further on (r1: quadratic over many `@page;`).
+        for css in [
+            "@page x; p {}",
+            "@page a } b {",
+            "@page ; p {}",
+            "@page 'a' {",
+            "@page x",
+        ] {
+            assert_eq!(at(css), None, "{css}");
+        }
+        let b = budget();
+        assert_eq!(StyleSheet::parse("@page x; p {color:red}", &b).len(), 1);
+        // A sheet of many such statements parses in linear time.
+        let many = "@page x;".repeat(100_000) + " p {color:red}";
+        let sheet = StyleSheet::parse(&many, &b);
+        assert!(sheet.pages.is_empty());
+        assert_eq!(sheet.len(), 1);
+    }
+
+    #[test]
+    fn page_decls_cascade_the_unnamed_then_the_selected_page_1944() {
+        let b = budget();
+        let decls = |css: &str| values(StyleSheet::parse(css, &b).page_decls(&b));
+        // No page selected: the unnamed pages, in order.
+        assert_eq!(
+            decls("@page {margin:1in} @page N {margin:2in} @page {size:a4}"),
+            ["margin:1in", "size:a4"]
+        );
+        // Selected: the unnamed then the named, important ones last.
+        assert_eq!(
+            decls(
+                "@page N {margin:2in !important; size:a5} div {page:n} \
+                 @page {margin:1in; size:a4 !important}"
+            ),
+            ["margin:1in", "size:a5", "size:a4", "margin:2in"]
+        );
+        // The first `page` naming a kept page selects it.
+        assert_eq!(
+            decls(
+                "p {page:auto} p {page:Missing} p {page:Second} p {page:First}\
+                 @page First {margin:1in} @page Second {margin:2in}"
+            ),
+            ["margin:2in"]
+        );
+        // `auto` and unknown names select none.
+        assert!(decls("@page N {margin:1in} p {page:auto} q {page:M}").is_empty());
+        // The selection is charged: with no work left, no page (r2).
+        let sheet = StyleSheet::parse("@page {margin:1in}", &b);
+        assert_eq!(sheet.page_decls(&b).len(), 1);
+        assert!(sheet.page_decls(&Budget::new(1 << 20, 0)).is_empty());
+        // Every rule named as selected applies, in order.
+        assert_eq!(
+            decls("@page N {margin:1in} @page n {size:a4} p {page:N}"),
+            ["margin:1in", "size:a4"]
+        );
+    }
+
+    #[test]
+    fn only_the_head_part_gives_the_page_1944() {
+        let b = budget();
+        let css =
+            "@page N {margin:1in} p {color:red}\n@page M {margin:2in} div {page:N} q {color:blue}";
+        let head = css.find('\n').unwrap();
+        let sheet = StyleSheet::parse_split(css, head, &b);
+        // The body part's rules apply, its page rule and `page` do not.
+        assert_eq!(sheet.len(), 3);
+        assert_eq!(sheet.pages.len(), 1);
+        assert!(sheet.page_decls(&b).is_empty());
+        // Rule order runs on across the parts.
+        let hits = sheet.matching(&[key("q", None, None)][..], &b);
+        assert_eq!(sheet.decls(hits[0])[0].value, "blue");
+        // A split inside a character, past the end or at 0 is safe.
+        let css = "@page {margin:1in} /* é */ p {color:red}";
+        let at = css.find('é').unwrap() + 1;
+        for head in [0, at, css.len() + 9] {
+            let _ = StyleSheet::parse_split(css, head, &b);
+        }
+        assert!(StyleSheet::parse_split(css, 0, &b).pages.is_empty());
+        assert_eq!(StyleSheet::parse_split(css, css.len(), &b).pages.len(), 1);
     }
 
     #[test]

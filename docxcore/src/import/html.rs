@@ -321,13 +321,28 @@ fn import_decoded(
     url: Option<&str>,
     package: bool,
 ) -> Result<HtmlImport, String> {
-    let Prescan { css, base, anchors } = prescan(text);
+    let Prescan {
+        css,
+        base,
+        anchors,
+        head_css,
+        outlook_mail,
+    } = prescan(text);
     let base = match (base, url) {
         (Some(b), Some(u)) => Some(html_image::resolve_ref(u, &b)),
         (b, u) => b.or(u.map(str::to_string)),
     };
-    let sheet = StyleSheet::parse(&css, budget);
+    let sheet = StyleSheet::parse_split(&css, head_css, budget);
+    // The page's own `@page` (#1944), but for a paste (which goes into a
+    // document with a page of its own) and a classic-Outlook mail (whose
+    // `@page` is Word's default, not the sender's): #1928's page.
+    let page = if package && !outlook_mail {
+        html_table::Page::from_decls(&sheet.page_decls(budget))
+    } else {
+        html_table::Page::DEFAULT
+    };
     let mut h = Html::new(text, budget, sheet);
+    h.set_page(page);
     h.base = base.clone();
     // What only a document saved through its own package has (#1912):
     // bookmarks and the `Hyperlink` style.
@@ -365,8 +380,9 @@ fn import_decoded(
     let mut doc = h.out.finish(props);
     // The items' indents are the ones computed here (#2231).
     super::pin_list_indents(&mut doc.body);
-    // The page the layout above assumed (#1928): Outlook-like margins.
-    doc.set_trailing_section_properties(html_table::page_section());
+    // The page the layout above assumed: the page's own (#1944), else
+    // #1928's Outlook-like margins.
+    doc.set_trailing_section_properties(html_table::page_section(&page));
     if budget.exhausted() {
         return Err(TOO_BIG.into());
     }
@@ -977,6 +993,9 @@ struct Attrs {
 struct Cascade {
     look: Look,
     kind: Kind,
+    /// The page's body width (#1944, [`html_table::Page::body`]): the room
+    /// a centred fixed-width box outside any cell is centred in.
+    body: u32,
     parent_pt: f64,
     /// The parent's run colour: what `color: inherit` gives back (#1879:
     /// over a link's user-agent blue).
@@ -1341,7 +1360,7 @@ fn rules_lines(v: &str) -> Option<[bool; 2]> {
 }
 
 /// A `<table>`'s spec from its attributes and computed look.
-fn table_spec(attrs: &Attrs, look: &Look) -> TableSpec {
+fn table_spec(attrs: &Attrs, look: &Look, body: u32) -> TableSpec {
     // The cells' lines (#1894): `rules`, else all of them for a `border`
     // above 0; 1 px, in the table's computed top and left colours.
     let rules = attrs
@@ -1394,14 +1413,14 @@ fn table_spec(attrs: &Attrs, look: &Look) -> TableSpec {
         // In a centred fixed-width block, outside any cell (#2114): the
         // room left between its indents.
         room: (look.centred_box && !look.in_cell)
-            .then(|| body_room(look.indent, look.indent_right)),
+            .then(|| body_room(body, look.indent, look.indent_right)),
     }
 }
 
-/// The room left in the body between a left and a right indent, in twips
-/// (#2114; a card's, #1940): at least [`html_table::MIN_COL`] wide.
-fn body_room(indent: i32, right: i32) -> html_table::Room {
-    let body = html_table::BODY_TWIPS;
+/// The room left in the body, `body` twips wide (the page's, #1944),
+/// between a left and a right indent, in twips (#2114; a card's, #1940): at
+/// least [`html_table::MIN_COL`] wide.
+fn body_room(body: u32, indent: i32, right: i32) -> html_table::Room {
     let indent = u32::try_from(indent.max(0)).unwrap_or(0).min(body);
     let right = u32::try_from(right.max(0)).unwrap_or(0).min(body);
     html_table::Room {
@@ -1415,7 +1434,7 @@ fn body_room(indent: i32, right: i32) -> html_table::Room {
 }
 
 impl Cascade {
-    fn new(parent: Option<&Look>, kind: Kind, card: CardMode) -> Self {
+    fn new(parent: Option<&Look>, kind: Kind, card: CardMode, body: u32) -> Self {
         let mut look = parent.cloned().unwrap_or_default();
         look.ua_before = 0;
         look.ua_after = 0;
@@ -1461,6 +1480,7 @@ impl Cascade {
         Cascade {
             look,
             kind,
+            body,
             parent_pt,
             parent_color,
             margin: [None; 4],
@@ -2435,7 +2455,7 @@ impl Cascade {
             };
             let left = clamp_twips(i64::from(self.look.indent) + i64::from(margin(3)));
             let right = clamp_twips(i64::from(self.look.indent_right) + i64::from(margin(1)));
-            (left != 0 || right != 0).then(|| body_room(left, right))
+            (left != 0 || right != 0).then(|| body_room(self.body, left, right))
         });
         let look = &mut self.look;
         if card {
@@ -2524,7 +2544,7 @@ impl Cascade {
                 };
                 if let Some(width) = width.filter(|_| self.margin_auto[1] && self.margin_auto[3]) {
                     if !look.in_cell {
-                        let room = i64::from(html_table::BODY_TWIPS)
+                        let room = i64::from(self.body)
                             - i64::from(look.indent)
                             - i64::from(look.indent_right)
                             - i64::from(width.max(0));
@@ -2731,6 +2751,8 @@ fn block_container(v: &str) -> bool {
 struct Ctx<'c> {
     sheet: &'c StyleSheet,
     budget: &'c Budget,
+    /// The page's body width (#1944).
+    body: u32,
     /// The page is in quirks mode: a `table` resets the font (#1883).
     quirks: bool,
     /// The page root's children (#1883).
@@ -2751,7 +2773,7 @@ fn look_of(
     attrs: &Attrs,
     card: CardMode,
 ) -> Look {
-    let mut c = Cascade::new(below.last().map(|e| &e.look), kind, card);
+    let mut c = Cascade::new(below.last().map(|e| &e.look), kind, card, ctx.body);
     c.user_agent(key, ctx.quirks);
     c.presentational(&key.tag, attrs, ctx.base);
     let hits = ctx.sheet.matching(
@@ -2891,6 +2913,21 @@ struct Prescan {
     /// contents ahead of its sections finds them, and an e-mail's unlinked
     /// ids make none. At most [`MAX_BOOKMARKS`].
     anchors: std::collections::HashSet<String>,
+    /// How many bytes of `css` came from `<style>`s before the page's first
+    /// `<body>` tag (all of it with none, #1944): only those give the page
+    /// its `@page`, so a quoted mail's `<style>` in the body never does.
+    head_css: usize,
+    /// The first `<meta name="Generator">` says classic Outlook wrote the
+    /// page (`(filtered medium)`, #1944): its `@page` is Word's default,
+    /// which the sender never chose, and the import keeps #1928's page.
+    outlook_mail: bool,
+}
+
+/// Whether a Generator `content` is classic Outlook's (#1944): Outlook's
+/// mail says `Microsoft Word 15 (filtered medium)` (14, 12 in older
+/// versions), Word's own Save as Web Page `(filtered)` or nothing.
+fn outlook_generator(content: &str) -> bool {
+    content.to_ascii_lowercase().contains("(filtered medium)")
 }
 
 /// The CSS text of every `<style>` element of the page, in order, its
@@ -2906,10 +2943,17 @@ struct Prescan {
 /// closes ends the search for the base; an `<a` that never closes is read
 /// to the end of the page, as the tokenizer reads it (the rest of the page
 /// is its attributes), and ends the reading of `<a>` tags (#1912 r1). No
-/// later tag can close either, so the scan stays linear.
+/// later tag can close either, so the scan stays linear. It also notes
+/// where the head's CSS ends (the first `<body` tag) and the first
+/// `<meta name="Generator">`'s verdict (#1944), each tag read once too.
 fn prescan(s: &str) -> Prescan {
     let mut css = String::new();
     let mut anchors = std::collections::HashSet::new();
+    let mut head_css = None;
+    // Until the first `<meta name=Generator>`, or a `<meta` that never
+    // closes.
+    let mut generator = true;
+    let mut outlook_mail = false;
     // Until an `<a` that never closes.
     let mut reading_a = true;
     // Until the first `<base>` with an `href`, or a `<base` that never closes.
@@ -2930,6 +2974,31 @@ fn prescan(s: &str) -> Prescan {
             .find(|c: char| !c.is_ascii_alphanumeric())
             .unwrap_or(rest.len() - 1);
         let name = rest[1..1 + name_len.min(MAX_TAG)].to_ascii_lowercase();
+        if name == "body" && head_css.is_none() {
+            head_css = Some(css.len());
+        }
+        if name == "meta" && generator {
+            let Some(end) = tag_end(rest) else {
+                generator = false;
+                i = at + 1;
+                continue;
+            };
+            // A repeated attribute's first value counts, as in a browser.
+            let (mut meta_name, mut content) = (None, None);
+            each_attr(&rest[1 + name_len..end - 1], |k, v| {
+                if k.eq_ignore_ascii_case("name") && meta_name.is_none() {
+                    meta_name = Some(v.trim().eq_ignore_ascii_case("generator"));
+                } else if k.eq_ignore_ascii_case("content") && content.is_none() {
+                    content = Some(v.to_string());
+                }
+            });
+            if meta_name == Some(true) {
+                outlook_mail = content.as_deref().is_some_and(outlook_generator);
+                generator = false;
+            }
+            i = at + end;
+            continue;
+        }
         if name == "base" && looking {
             let Some(end) = tag_end(rest) else {
                 looking = false;
@@ -2981,7 +3050,13 @@ fn prescan(s: &str) -> Prescan {
         }
         i = end;
     }
-    Prescan { css, base, anchors }
+    Prescan {
+        head_css: head_css.unwrap_or(css.len()),
+        css,
+        base,
+        anchors,
+        outlook_mail,
+    }
 }
 
 struct Html<'a> {
@@ -3048,9 +3123,18 @@ struct Html<'a> {
     bookmarks: bool,
     /// [`Prescan::anchors`].
     anchors: std::collections::HashSet<String>,
+    /// The page the import is laid out for (#1944, [`Html::set_page`]).
+    page: html_table::Page,
 }
 
 impl<'a> Html<'a> {
+    /// Lay the import out for `page` (#1944): its body is the room of
+    /// outermost tables, wide pictures and centred boxes.
+    fn set_page(&mut self, page: html_table::Page) {
+        self.page = page;
+        self.out.set_body(page.body());
+    }
+
     fn new(s: &'a str, budget: &'a Budget, sheet: StyleSheet) -> Self {
         Html {
             s,
@@ -3081,6 +3165,7 @@ impl<'a> Html<'a> {
             base: None,
             bookmarks: false,
             anchors: std::collections::HashSet::new(),
+            page: html_table::Page::DEFAULT,
         }
     }
 
@@ -3650,7 +3735,7 @@ impl<'a> Html<'a> {
         match name {
             "table" if kept => {
                 let look = self.elems.last().filter(|_| pushed).map(|e| &e.look);
-                let spec = table_spec(&attrs, look.unwrap_or(&Look::default()));
+                let spec = table_spec(&attrs, look.unwrap_or(&Look::default()), self.page.body());
                 self.out.begin_table(spec);
             }
             "td" | "th" if kept && self.table_depth > 0 => {
@@ -3777,6 +3862,7 @@ impl<'a> Html<'a> {
         Ctx {
             sheet: &self.sheet,
             budget: self.budget,
+            body: self.page.body(),
             quirks: self.quirks,
             root: &self.root_kids,
             base: self.base.as_deref(),
@@ -3801,6 +3887,7 @@ impl<'a> Html<'a> {
                 Ctx {
                     sheet: &self.sheet,
                     budget: self.budget,
+                    body: self.page.body(),
                     quirks: self.quirks,
                     root: &self.root_kids,
                     base: self.base.as_deref(),
@@ -4421,7 +4508,8 @@ impl<'a> Html<'a> {
         // declares, before the fit to the body.
         let declared =
             html_image::declared_box(width, height, pixels).map(|b| max.clamp(b, width, height));
-        let Some(box_twips) = declared.map(html_image::fit_to_body) else {
+        let body = self.page.body();
+        let Some(box_twips) = declared.map(|b| html_image::fit_to_body(body, b)) else {
             if !alt.is_empty() {
                 self.begin_block_object(block);
                 // Alt text in a link is the link's text, as a browser
@@ -4489,7 +4577,7 @@ impl<'a> Html<'a> {
     /// table's; a percentage is of its table's, a table's of the room
     /// around it. Walked from the outside in, one step per open element.
     fn image_room(&self, look: &Look) -> u32 {
-        let body = i64::from(html_table::BODY_TWIPS);
+        let body = i64::from(self.page.body());
         let width = |w: Option<Width>, of: i64| match w {
             Some(Width::Twips(t)) => i64::from(t),
             Some(Width::Pct(p)) => i64::from(pct_of(of.clamp(0, body) as u32, p)),
@@ -10582,7 +10670,9 @@ mod page_tests {
 
     #[test]
     fn the_layout_body_is_the_page_less_its_margins() {
-        let g = PageGeom::from_sect_pr(&html_table::page_section().raw);
+        let page = html_table::Page::DEFAULT;
+        let g = PageGeom::from_sect_pr(&html_table::page_section(&page).raw);
+        assert_eq!(page.body(), html_table::BODY_TWIPS);
         assert_eq!(
             i64::from(html_table::BODY_TWIPS),
             i64::from(g.w - g.ml - g.mr)
@@ -12328,3 +12418,8 @@ mod tests_1930;
 #[cfg(test)]
 #[path = "html_tests_1940.rs"]
 mod tests_1940;
+
+// The page leftover of #1928 (#1944): `@page` size and margins.
+#[cfg(test)]
+#[path = "html_tests_1944.rs"]
+mod tests_1944;
