@@ -31,6 +31,9 @@ test issue 2249 an inline background paints its band as a highlight does
 test issue 2249 a mail opened as a web page hides its preheader and paints its background in a document tab
   call theme-set {"theme":"light"}
   open copy:../fixtures/mail-fidelity.html
+  # The layout `call doc` reads is the last painted frame's, and `open`
+  # returns before one of the opened page: the shot waits for it.
+  shot window
   # The caret opens in the hidden paragraph (a link and a `<br>` in it),
   # which shows it so typing there is seen; in the next one, it collapses.
   call doc {}
