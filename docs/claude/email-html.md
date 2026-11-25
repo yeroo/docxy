@@ -73,9 +73,11 @@ root. Add this area's new notes here as `##` sections. Not to be confused with t
     (per abstract list, deeper levels restart). An `<ol>` opened for an item whose number is not 1
     says `start`. A list opened between levels has no `start` and shows 1 next: when an item reuses
     it, or any other list, and its number is not the one the browser would show next, the item says
-    `<li value="N">`. The HTML import ignores `start`, so `numbered_list_continues_after_a_paragraph`
-    tests it on the string.
-  - The import maps every bullet list to numId 1 and every numbered list to numId 2.
+    `<li value="N">`. `numbered_list_continues_after_a_paragraph` checks the string, then imports it
+    with its package and checks that the numbers come back (1, 2, 3).
+  - The import reads `start` and `value` and gives each `<ol>` its own numId (#1989,
+    `docs/claude/html-import.md`). The round-trip helper `back_with` keeps only the document, so it
+    folds them back to 1 and 2 (`HtmlImport::fold_lists`), and its tests name lists by kind.
   - An item's left and first-line indent are the client's list padding: they are not written.
   - Lists that only a paragraph style numbers (`StyleSheet::style_num_pr`) are plain paragraphs, as in
     RTF.

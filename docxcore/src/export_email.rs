@@ -1562,6 +1562,29 @@ mod tests {
         assert_eq!(tags.len(), 2, "{h}");
         assert!(!tags[0].contains("start="), "{h}");
         assert!(tags[1].contains("start=\"3\""), "{h}");
+        // The import reads the `start` (#1989): the numbers come back.
+        let pkg = import_html_with(h.as_bytes(), &mut |_, _| None)
+            .unwrap()
+            .package();
+        let num =
+            crate::numbering::parse_numbering_xml(&pkg.part_text("word/numbering.xml").unwrap());
+        let markers = crate::numbering::compute_markers(&pkg.document, &num);
+        let shown: Vec<(String, String)> = pkg
+            .document
+            .body
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| match b {
+                Block::Paragraph(p) => markers.get(&vec![i]).map(|m| (p.plain_text(), m.clone())),
+                _ => None,
+            })
+            .collect();
+        let want = [("a", "1."), ("b", "2."), ("c", "3.")];
+        assert_eq!(
+            shown,
+            want.map(|(t, m)| (t.to_string(), m.to_string())),
+            "{h}"
+        );
     }
 
     #[test]

@@ -1513,7 +1513,10 @@ was #1922's.
   reopens the list with its `start`, so a `value` split exports as a
   second `<ol start>`) and Markdown export needed no change. The suite's
   `list_markers` reads each level's `w:start` (`docs/claude/docx-editing.md`).
-  docxcore's `fill` draws a decimal 0 (`w:start 0`), where it drew 1.
+  docxcore's `fill` draws any decimal counter at 0 as 0, where it drew 1:
+  a `w:start 0` level, and a parent level not yet advanced (`%1.%2`
+  before any level-0 item is "0.1"), as Word draws them; letters and
+  roman numerals at 0 still draw as 1 (`docs/claude/docx-editing.md`).
 - Not done: `type` / `list-style-type`, `<ol reversed>`. An `li` that
   never gets a numbered paragraph (`<li><table>…</table></li>`, whose
   cells reset `Block`) still advances the count, so Word skips a number

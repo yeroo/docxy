@@ -285,8 +285,20 @@ fn add_html_lists_refuses_ids_the_part_has() {
     assert_eq!(num.abstract_of(3), Some(102));
     assert_eq!(num.level(3, 0).unwrap().start, 1);
     assert_eq!(num.level(3, 1).unwrap().start, 4);
-    // A package with no numbering part gets the Markdown one first.
+    // With no numbering part, the Markdown part's ids are refused before
+    // anything is written: no part, content type or relationship.
     let mut bare = crate::package::new_package(Document::default());
+    let (types, rels) = (
+        bare.part_text("[Content_Types].xml"),
+        bare.part_text("word/_rels/document.xml.rels"),
+    );
+    for clash in [(2, 102, 0, 5), (3, 101, 0, 5), (1, 100, 0, 5)] {
+        assert!(!bare.add_html_lists(&[clash]), "{clash:?}");
+    }
+    assert!(bare.part("word/numbering.xml").is_none());
+    assert_eq!(bare.part_text("[Content_Types].xml"), types);
+    assert_eq!(bare.part_text("word/_rels/document.xml.rels"), rels);
+    // A package with no numbering part gets the Markdown one first.
     assert!(bare.add_html_lists(&[(3, 102, 0, 2)]));
     let num = numbering(&bare);
     assert!(num.defines(1) && num.defines(2) && num.defines(3));

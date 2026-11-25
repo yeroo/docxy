@@ -242,6 +242,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   `numbering::heading_chapters` is `heading_numbers` for the top-level
   headings by body block (a heading in a table cell moves the numbering but
   sets no page's chapter, as in the export).
+- A decimal counter at 0 draws 0 in `numbering::fill` (#1989), so in
+  `compute_markers` and the chapter prefixes too: a `w:start 0` level, and
+  a parent level not yet advanced (`%1.%2` before any level-0 item is
+  "0.1", a heading under a skipped level "1.0.1"), as Word draws them;
+  before, every counter drew at least 1. Letters and roman numerals at 0
+  still draw as 1.
 - The suite's `Page` carries its `number` (restarts and fillers included).
   `page_fields::page_values` turns a `PageFlow` plus the headings into a
   `PageVals` per page; the page view's headers and footers (the editable one

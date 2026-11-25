@@ -4575,26 +4575,38 @@ impl Package {
     /// own `w:abstractNum`, the Markdown decimal levels with level `level`
     /// starting at `start`, so each list counts alone. One write of the
     /// part, made first by [`Package::add_markdown_numbering`] when there is
-    /// none. False, and nothing changed, when the part already defines one
-    /// of the ids (or has no `w:numbering` root): the caller folds those
-    /// lists instead. True with nothing to define.
+    /// none. False, and nothing changed, when the part already has one of
+    /// the ids (with no part: one of the Markdown part's, numIds 1 and 2 on
+    /// [`MARKDOWN_BULLET_ABSTRACT_ID`] and [`MARKDOWN_DECIMAL_ABSTRACT_ID`])
+    /// or has no `w:numbering` root: the caller folds those lists instead.
+    /// True with nothing to define.
     pub fn add_html_lists(&mut self, lists: &[(i32, i32, i32, i32)]) -> bool {
         if lists.is_empty() {
             return true;
         }
-        self.add_markdown_numbering();
         let name = "word/numbering.xml";
+        // Checked before anything is written, so a refusal changes nothing.
+        let clash = match self.part_text(name) {
+            Some(xml) => {
+                let taken = crate::numbering::parse_numbering_xml(&xml);
+                let has = |attr: &str, id: i32| xml.contains(&format!("{attr}=\"{id}\""));
+                lists.iter().any(|&(n, a, _, _)| {
+                    taken.defines(n) || has("w:numId", n) || has("w:abstractNumId", a)
+                })
+            }
+            None => lists.iter().any(|&(n, a, _, _)| {
+                matches!(n, 1 | 2)
+                    || a == MARKDOWN_BULLET_ABSTRACT_ID
+                    || a == MARKDOWN_DECIMAL_ABSTRACT_ID
+            }),
+        };
+        if clash {
+            return false;
+        }
+        self.add_markdown_numbering();
         let Some(xml) = self.part_text(name) else {
             return false;
         };
-        let taken = crate::numbering::parse_numbering_xml(&xml);
-        let abstract_taken = |id: i32| xml.contains(&format!("w:abstractNumId=\"{id}\""));
-        if lists
-            .iter()
-            .any(|&(n, a, _, _)| taken.defines(n) || abstract_taken(a))
-        {
-            return false;
-        }
         let mut abstracts = String::new();
         let mut nums = String::new();
         for &(num_id, abstract_id, level, start) in lists {
