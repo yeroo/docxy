@@ -1722,6 +1722,7 @@ dependencies = [
  "pdfcraft-render",
  "projcore",
  "projctl",
+ "resvg 0.46.0",
  "rfd",
  "ribbonspec",
  "rust-embed",

@@ -75,6 +75,7 @@ mod hf_tab;
 mod hl_mode;
 mod html_bundle;
 mod hyphenation_dialog;
+mod image_convert;
 mod info_props;
 mod inputs;
 mod inspector;

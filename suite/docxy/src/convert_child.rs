@@ -13,6 +13,8 @@
 //! of time is a load error; the suite carries on.
 //!
 //! A Web Page's images (#1880) come along: a `data:` src from the page, a
+//! part of a single-file Web Page (MHTML, #1898), an SVG or WebP as PNG
+//! ([`crate::image_convert`], #1898), a
 //! file under the page's folder through [`read_local_image`] (a relative
 //! src only, reached through no link: no absolute path or `file:` URI, so no
 //! automounted `/net/<host>` and no Windows `\??\` or UNC path); every
@@ -219,7 +221,9 @@ pub(crate) fn convert_bytes(
                 dir.as_deref()
                     .and_then(|dir| read_local_image(dir, src, limit))
             };
-            let imported = import::import_html_with(bytes, &mut resolve)?;
+            // SVG and WebP pictures as PNG (#1898), here in the child.
+            let mut convert = crate::image_convert::convert;
+            let imported = import::import_html_with_converter(bytes, &mut resolve, &mut convert)?;
             let mut pkg = imported.package();
             let doc = std::mem::take(&mut pkg.document);
             Ok(Some(ConvertedDoc {
@@ -964,6 +968,84 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(c.doc, loaded);
+    }
+
+    /// A page's SVG and WebP pictures (#1898) come along as PNG, the SVG
+    /// kept beside its PNG and named by the picture's `asvg:svgBlip`.
+    #[test]
+    fn a_pages_svg_and_webp_pictures_are_converted() {
+        use std::io::Cursor;
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="30" height="10"><rect width="30" height="10" fill="red"/></svg>"#;
+        let mut webp = Vec::new();
+        image::RgbaImage::from_pixel(6, 3, image::Rgba([0, 0, 255, 255]))
+            .write_to(&mut Cursor::new(&mut webp), image::ImageFormat::WebP)
+            .unwrap();
+        let svg_uri = format!("data:image/svg+xml,{}", svg.replace('#', "%23"));
+        let webp_uri = format!("data:image/webp;base64,{}", base64(&webp));
+        let page = format!("<p>x<img src='{svg_uri}'><img src='{webp_uri}'></p>");
+        let c = convert_bytes(What::Html, page.as_bytes(), None)
+            .unwrap()
+            .unwrap();
+        let pkg = docxcore::package::load_package(&c.docx()).unwrap();
+        let mut media: Vec<&str> = pkg
+            .part_names()
+            .into_iter()
+            .filter(|n| n.starts_with("word/media/"))
+            .collect();
+        media.sort();
+        let ext = |n: &&str| n.rsplit('.').next().unwrap().to_string();
+        let mut exts: Vec<String> = media.iter().map(ext).collect();
+        exts.sort();
+        assert_eq!(exts, ["png", "png", "svg"], "{media:?}");
+        let svg_part = media.iter().find(|n| n.ends_with(".svg")).unwrap();
+        assert_eq!(pkg.part(svg_part), Some(svg.as_bytes()));
+        // Every PNG is a real one the suite draws.
+        for n in media.iter().filter(|n| n.ends_with(".png")) {
+            assert!(image::load_from_memory(pkg.part(n).unwrap()).is_ok(), "{n}");
+        }
+        let pics: Vec<&str> = c
+            .doc
+            .body
+            .iter()
+            .filter_map(|b| match b {
+                docxcore::model::Block::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .flat_map(|p| &p.content)
+            .filter_map(|i| match i {
+                docxcore::model::Inline::Raw(r) if docxcore::image::inline_extent(r).is_some() => {
+                    Some(r.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pics.len(), 2);
+        // Sized by the SVG's own size and the WebP's pixels.
+        assert_eq!(
+            docxcore::image::inline_extent(pics[0]),
+            Some((30 * 9525, 10 * 9525))
+        );
+        assert_eq!(
+            docxcore::image::inline_extent(pics[1]),
+            Some((6 * 9525, 3 * 9525))
+        );
+        assert_eq!(docxcore::image::inline_embeds(pics[0]).len(), 2);
+        assert_eq!(docxcore::image::inline_embeds(pics[1]).len(), 1);
+    }
+
+    fn base64(bytes: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in bytes.chunks(3) {
+            let n = c.iter().fold(0u32, |a, &b| (a << 8) | u32::from(b)) << (8 * (3 - c.len()));
+            for k in 0..=c.len() {
+                out.push(T[(n >> (18 - 6 * k) & 63) as usize] as char);
+            }
+            for _ in c.len()..3 {
+                out.push('=');
+            }
+        }
+        out
     }
 
     /// A single-file Web Page (MHTML, #1898): its picture comes from its
