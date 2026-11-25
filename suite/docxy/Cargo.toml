@@ -67,6 +67,10 @@ unicode-segmentation = "1.13"
 # Its `png` and `webp` (in the lock through gpui) also turn an HTML import's
 # WebP pictures into PNG in the converting child (#1898, image_convert.rs).
 image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+# An HTML import's SVG pictures (#1898), rasterised to PNG in the
+# converting child (image_convert.rs), on every platform: gpui's version,
+# every feature already in the lock through it.
+resvg = "0.46"
 pdfcraft-render = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
 # Links, annotations and forms (#2255), also only in the child: the working
 # document and its incremental save (`-cos`), appearances for comments that
@@ -105,10 +109,6 @@ x11rb = "0.13"
 # device, through the suite's patched copy (the `[patch]` in ../Cargo.toml
 # points gpui_platform at the same crate).
 gpui_linux = { path = "../vendor/gpui_linux" }
-# An HTML import's SVG pictures (#1898), rasterised to PNG in the
-# converting child (image_convert.rs): gpui's version, every feature already
-# in the lock through it.
-resvg = "0.46"
 
 [build-dependencies]
 htmlbundle = { path = "../../htmlbundle" }
