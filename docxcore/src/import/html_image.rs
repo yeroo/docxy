@@ -902,6 +902,7 @@ impl Radius {
 /// The crop shape a picture of declared box `(w, h)` (twips, before
 /// [`fit_to_body`]: the fit is uniform, so the ratio holds) gets from its
 /// own `radius` (#1926); [`clipped_shape`] without a wrapper's clip.
+#[cfg(test)]
 pub(crate) fn shape(radius: Option<Radius>, (w, h): (u128, u128)) -> image::PictureShape {
     clipped_shape(radius, None, (w, h))
 }
