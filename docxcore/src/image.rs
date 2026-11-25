@@ -125,14 +125,36 @@ pub enum PictureShape {
     RoundRect {
         adj: u32,
     },
+    /// `prst="round1Rect"` (#1936): only the top-right corner rounded, of
+    /// radius `min(w, h) * adj / 100000`.
+    Round1 {
+        adj: u32,
+    },
+    /// `prst="round2SameRect"` (#1936): both top corners of `adj1`, both
+    /// bottom corners of `adj2`.
+    Round2Same {
+        adj1: u32,
+        adj2: u32,
+    },
+    /// `prst="round2DiagRect"` (#1936): top left and bottom right of
+    /// `adj1`, top right and bottom left of `adj2`.
+    Round2Diag {
+        adj1: u32,
+        adj2: u32,
+    },
 }
 
 /// The largest `roundRect` `adj` (ECMA-376 presetShapeDefinitions pins
 /// it to `0..=50000`): corners of half the shorter side.
 pub const ROUND_RECT_MAX_ADJ: u32 = 50_000;
 
-/// A `roundRect`'s `adj` when it names none (the preset's default).
+/// A `roundRect`'s `adj` when it names none (the preset's default), and
+/// `round1Rect`'s `adj` and the `round2*` presets' `adj1` (#1936).
 pub const ROUND_RECT_DEFAULT_ADJ: u32 = 16_667;
+
+/// The `round2SameRect` and `round2DiagRect` presets' `adj2` when it is
+/// absent (#1936): square corners.
+pub const ROUND2_DEFAULT_ADJ2: u32 = 0;
 
 impl PictureShape {
     /// The `a:prstGeom` element of this shape.
@@ -144,8 +166,43 @@ impl PictureShape {
                 "<a:prstGeom prst=\"roundRect\"><a:avLst><a:gd name=\"adj\" fmla=\"val {}\"/></a:avLst></a:prstGeom>",
                 adj.min(ROUND_RECT_MAX_ADJ)
             ),
+            PictureShape::Round1 { adj } => format!(
+                "<a:prstGeom prst=\"round1Rect\"><a:avLst><a:gd name=\"adj\" fmla=\"val {}\"/></a:avLst></a:prstGeom>",
+                adj.min(ROUND_RECT_MAX_ADJ)
+            ),
+            PictureShape::Round2Same { adj1, adj2 } => two_guides("round2SameRect", adj1, adj2),
+            PictureShape::Round2Diag { adj1, adj2 } => two_guides("round2DiagRect", adj1, adj2),
         }
     }
+
+    /// Each corner's circular radius (#1936), top left, top right, bottom
+    /// right, bottom left, for a picture of `w` x `h`, in the units of `w`
+    /// and `h`: `min(w, h) * adj / 100000`, at most half the shorter side
+    /// (the presets pin `adj` to `0..=50000`). An ellipse is half the
+    /// shorter side at every corner (a circle on a square, else a stadium:
+    /// the closest circular corners), a rectangle none. The suite's view and
+    /// the editable-HTML page both draw a crop from these.
+    pub fn corner_radii(self, w: f32, h: f32) -> [f32; 4] {
+        let short = w.min(h).max(0.0);
+        let r = |adj: u32| short * adj.min(ROUND_RECT_MAX_ADJ) as f32 / 100_000.0;
+        match self {
+            PictureShape::Rect => [0.0; 4],
+            PictureShape::Ellipse => [short / 2.0; 4],
+            PictureShape::RoundRect { adj } => [r(adj); 4],
+            PictureShape::Round1 { adj } => [0.0, r(adj), 0.0, 0.0],
+            PictureShape::Round2Same { adj1, adj2 } => [r(adj1), r(adj1), r(adj2), r(adj2)],
+            PictureShape::Round2Diag { adj1, adj2 } => [r(adj1), r(adj2), r(adj1), r(adj2)],
+        }
+    }
+}
+
+/// A two-guide preset's `a:prstGeom` (#1936), each guide clamped.
+fn two_guides(prst: &str, adj1: u32, adj2: u32) -> String {
+    format!(
+        "<a:prstGeom prst=\"{prst}\"><a:avLst><a:gd name=\"adj1\" fmla=\"val {}\"/><a:gd name=\"adj2\" fmla=\"val {}\"/></a:avLst></a:prstGeom>",
+        adj1.min(ROUND_RECT_MAX_ADJ),
+        adj2.min(ROUND_RECT_MAX_ADJ)
+    )
 }
 
 /// [`inline_picture_run_described`] cropped to `shape` (#1926);
@@ -398,9 +455,11 @@ pub fn inline_embed(raw: &str) -> Option<String> {
 /// The shape an inline picture run is cropped to (#1926): the `prst` of
 /// the `a:prstGeom` in its picture's `pic:spPr`, under [`inline_embed`]'s
 /// guards. Lenient, never an error: anything but an inline picture, no
-/// `pic:spPr`, a `custGeom`, or a preset other than `ellipse` or
-/// `roundRect` is [`PictureShape::Rect`]. A `roundRect`'s `adj` guide is
-/// [`ROUND_RECT_DEFAULT_ADJ`] when absent or unreadable and clamped to
+/// `pic:spPr`, a `custGeom`, or a preset other than `ellipse`,
+/// `roundRect`, `round1Rect`, `round2SameRect` or `round2DiagRect` (#1936)
+/// is [`PictureShape::Rect`]. Each guide is found by name, its preset's
+/// default when absent or unreadable ([`ROUND_RECT_DEFAULT_ADJ`], a
+/// `round2*`'s `adj2` [`ROUND2_DEFAULT_ADJ2`]), and clamped to
 /// `0..=ROUND_RECT_MAX_ADJ`.
 pub fn inline_shape(raw: &str) -> PictureShape {
     picture_shape(raw).unwrap_or(PictureShape::Rect)
@@ -414,29 +473,44 @@ fn picture_shape(raw: &str) -> Option<PictureShape> {
     let geom = start_tag(props, "<a:prstGeom")?;
     let geom_end = geom + props[geom..].find('>')?;
     let prst = crate::load::xml_attr_value(&props[geom..geom_end], "prst")?;
+    let close = props[geom..]
+        .find("</a:prstGeom>")
+        .map_or(props.len(), |at| geom + at);
+    let guides = &props[geom_end..close];
+    let guide = |name: &str, default: u32| guide_value(guides, name).unwrap_or(default);
+    let one = || guide("adj", ROUND_RECT_DEFAULT_ADJ);
+    let two = || {
+        (
+            guide("adj1", ROUND_RECT_DEFAULT_ADJ),
+            guide("adj2", ROUND2_DEFAULT_ADJ2),
+        )
+    };
     match prst.as_str() {
         "ellipse" => Some(PictureShape::Ellipse),
-        "roundRect" => {
-            let close = props[geom..]
-                .find("</a:prstGeom>")
-                .map_or(props.len(), |at| geom + at);
-            let guides = &props[geom_end..close];
-            let adj = round_rect_adj(guides).unwrap_or(ROUND_RECT_DEFAULT_ADJ);
-            Some(PictureShape::RoundRect { adj })
+        "roundRect" => Some(PictureShape::RoundRect { adj: one() }),
+        "round1Rect" => Some(PictureShape::Round1 { adj: one() }),
+        "round2SameRect" => {
+            let (adj1, adj2) = two();
+            Some(PictureShape::Round2Same { adj1, adj2 })
+        }
+        "round2DiagRect" => {
+            let (adj1, adj2) = two();
+            Some(PictureShape::Round2Diag { adj1, adj2 })
         }
         _ => None,
     }
 }
 
-/// The `adj` guide's value among a `roundRect`'s guides (`fmla="val N"`),
-/// clamped; `None` when there is none or it does not read.
-fn round_rect_adj(guides: &str) -> Option<u32> {
+/// The value of the guide called `name` among a preset's guides
+/// (`fmla="val N"`), clamped; `None` when there is none or it does not
+/// read.
+fn guide_value(guides: &str, name: &str) -> Option<u32> {
     let mut from = 0;
     while let Some(at) = start_tag(&guides[from..], "<a:gd") {
         let at = from + at;
         let end = at + guides[at..].find('>')?;
         let gd = &guides[at..end];
-        if crate::load::xml_attr_value(gd, "name").as_deref() == Some("adj") {
+        if crate::load::xml_attr_value(gd, "name").as_deref() == Some(name) {
             let fmla = crate::load::xml_attr_value(gd, "fmla")?;
             let n: i64 = fmla.trim().strip_prefix("val")?.trim().parse().ok()?;
             return Some(n.clamp(0, i64::from(ROUND_RECT_MAX_ADJ)) as u32);
@@ -1081,6 +1155,117 @@ mod tests {
         let elsewhere =
             word_picture("").replace("</pic:pic>", r#"</pic:pic><a:prstGeom prst="ellipse"/>"#);
         assert_eq!(inline_shape(&elsewhere), PictureShape::Rect);
+    }
+
+    #[test]
+    fn the_corner_presets_write_and_read_back_1936() {
+        use PictureShape::{Round1, Round2Diag, Round2Same};
+        let shaped = |shape| inline_picture_run_shaped("rId5", 10, 20, 3, "a.png", "", None, shape);
+        assert!(shaped(Round1 { adj: 20_000 }).contains(
+            r#"<a:prstGeom prst="round1Rect"><a:avLst><a:gd name="adj" fmla="val 20000"/></a:avLst></a:prstGeom>"#
+        ));
+        assert!(shaped(Round2Same { adj1: 20_000, adj2: 0 }).contains(
+            r#"<a:prstGeom prst="round2SameRect"><a:avLst><a:gd name="adj1" fmla="val 20000"/><a:gd name="adj2" fmla="val 0"/></a:avLst></a:prstGeom>"#
+        ));
+        assert!(shaped(Round2Diag { adj1: 0, adj2: 90_000 }).contains(
+            r#"<a:prstGeom prst="round2DiagRect"><a:avLst><a:gd name="adj1" fmla="val 0"/><a:gd name="adj2" fmla="val 50000"/></a:avLst></a:prstGeom>"#
+        ));
+        for shape in [
+            Round1 { adj: 20_000 },
+            Round1 { adj: 0 },
+            Round2Same {
+                adj1: 20_000,
+                adj2: 0,
+            },
+            Round2Same {
+                adj1: 0,
+                adj2: 12_500,
+            },
+            Round2Diag {
+                adj1: 20_000,
+                adj2: 0,
+            },
+            Round2Diag {
+                adj1: 3,
+                adj2: 50_000,
+            },
+        ] {
+            let run = shaped(shape);
+            assert_eq!(inline_shape(&run), shape, "{run}");
+        }
+        // Word's own: the presets' defaults when a guide is absent or junk,
+        // guides by name in either order, values clamped.
+        let read = |geom: &str| inline_shape(&word_picture(geom));
+        assert_eq!(
+            read(r#"<a:prstGeom prst="round1Rect"><a:avLst/></a:prstGeom>"#),
+            Round1 {
+                adj: ROUND_RECT_DEFAULT_ADJ
+            }
+        );
+        assert_eq!(
+            read(r#"<a:prstGeom prst="round2SameRect"/>"#),
+            Round2Same {
+                adj1: ROUND_RECT_DEFAULT_ADJ,
+                adj2: ROUND2_DEFAULT_ADJ2
+            }
+        );
+        assert_eq!(
+            read(
+                r#"<a:prstGeom prst="round2DiagRect"><a:avLst><a:gd name="adj2" fmla="val 9000"/><a:gd name="adj1" fmla="val 70000"/></a:avLst></a:prstGeom>"#
+            ),
+            Round2Diag {
+                adj1: 50_000,
+                adj2: 9000
+            }
+        );
+        assert_eq!(
+            read(
+                r#"<a:prstGeom prst="round2SameRect"><a:avLst><a:gd name="adj2" fmla="val x"/></a:avLst></a:prstGeom>"#
+            ),
+            Round2Same {
+                adj1: ROUND_RECT_DEFAULT_ADJ,
+                adj2: ROUND2_DEFAULT_ADJ2
+            }
+        );
+        assert_eq!(
+            read(
+                r#"<a:prstGeom prst="round1Rect"><a:avLst><a:gd name="adj" fmla="val -4"/></a:avLst></a:prstGeom>"#
+            ),
+            Round1 { adj: 0 }
+        );
+    }
+
+    #[test]
+    fn each_shape_gives_its_corner_radii_1936() {
+        use PictureShape::{Ellipse, Rect, Round1, Round2Diag, Round2Same, RoundRect};
+        let (w, h) = (120.0, 40.0);
+        assert_eq!(Rect.corner_radii(w, h), [0.0; 4]);
+        assert_eq!(Ellipse.corner_radii(w, h), [20.0; 4]);
+        assert_eq!(Ellipse.corner_radii(32.0, 32.0), [16.0; 4]);
+        assert_eq!(RoundRect { adj: 20_000 }.corner_radii(w, h), [8.0; 4]);
+        // At most half the shorter side.
+        assert_eq!(RoundRect { adj: 90_000 }.corner_radii(w, h), [20.0; 4]);
+        assert_eq!(
+            Round1 { adj: 20_000 }.corner_radii(w, h),
+            [0.0, 8.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            Round2Same {
+                adj1: 20_000,
+                adj2: 50_000
+            }
+            .corner_radii(w, h),
+            [8.0, 8.0, 20.0, 20.0]
+        );
+        assert_eq!(
+            Round2Diag {
+                adj1: 20_000,
+                adj2: 0
+            }
+            .corner_radii(w, h),
+            [8.0, 0.0, 8.0, 0.0]
+        );
+        assert_eq!(Ellipse.corner_radii(0.0, 4.0), [0.0; 4]);
     }
 
     /// `word_picture`'s run with its `wp:docPr` attributes replaced.
