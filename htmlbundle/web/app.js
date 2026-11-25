@@ -1101,8 +1101,11 @@
       case 'img': {
         var w = s.cx ? Math.round(s.cx / 9525) : 96;
         var ht = s.cy ? Math.round(s.cy / 9525) : 96;
+        // A picture cropped to a shape (#1936): its corners, as the engine
+        // gives them in CSS.
+        var round = s.radius ? ' style="border-radius:' + esc(s.radius) + '"' : '';
         return '<img class="atom" contenteditable="false" alt="" data-o="' + s.o + '" data-w="' + s.w +
-          '" data-rid="' + esc(s.rid) + '" width="' + w + '" height="' + ht + '">';
+          '" data-rid="' + esc(s.rid) + '" width="' + w + '" height="' + ht + '"' + round + '>';
       }
       default: return '';
     }
