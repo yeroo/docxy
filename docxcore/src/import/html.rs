@@ -575,8 +575,8 @@ struct Look {
     /// A cell's or table part's own background (`RRGGBB`, not inherited):
     /// the cell shading (#1878).
     own_fill: Option<String>,
-    /// A table's, cell's, `colgroup`'s or image's own `width` (not
-    /// inherited).
+    /// A table's, cell's, `col`'s, `colgroup`'s or image's own `width`
+    /// (not inherited).
     own_width: Option<Width>,
     /// An image's, row's or cell's own `height` (not inherited; a row's
     /// and cell's in twips only, #1894).
@@ -880,8 +880,8 @@ struct Cascade {
     is_th: bool,
     /// The element is a `tr`: what reads `height` as its row's (#1894).
     is_row: bool,
-    /// The element is a `colgroup`: what reads `width` (#1894).
-    is_colgroup: bool,
+    /// The element is a `col` or `colgroup`: what reads `width` (#1894).
+    is_col: bool,
     /// The element is `html` or `body`: its background is the page's
     /// (#1894).
     is_page: bool,
@@ -1286,7 +1286,7 @@ impl Cascade {
             border: Default::default(),
             is_th: false,
             is_row: false,
-            is_colgroup: false,
+            is_col: false,
             is_page: false,
             own_align: false,
             block_max: None,
@@ -1339,13 +1339,21 @@ impl Cascade {
                 self.look.italic_off = false;
                 // `font-variant: normal` too.
                 self.look.run.small_caps = false;
+                // And `text-align: start` (#1894 r2): the text inside
+                // starts at its start whatever is around the table, and
+                // being one property with them, a `-webkit-` alignment's
+                // block placing stops too. The table's own place is its
+                // parent's (`parent_block_align`, taken before this).
+                self.look.align = None;
+                self.look.align_logical = false;
+                self.look.block_align = None;
             }
         }
         self.is_img = tag == "img";
         self.is_br = tag == "br";
         self.is_th = tag == "th";
         self.is_row = tag == "tr";
-        self.is_colgroup = tag == "colgroup";
+        self.is_col = matches!(tag, "col" | "colgroup");
         self.is_page = matches!(tag, "html" | "body");
         let run = &mut self.look.run;
         match tag {
@@ -1459,7 +1467,7 @@ impl Cascade {
                 self.look.valign = Some(v);
             }
         }
-        if matches!(tag, "table" | "td" | "th" | "colgroup") {
+        if matches!(tag, "table" | "td" | "th" | "col" | "colgroup") {
             if let Some(w) = attrs.width.as_deref().and_then(width_attr) {
                 self.look.own_width = Some(w);
             }
@@ -1590,7 +1598,7 @@ impl Cascade {
                 "separate" => self.look.collapse = false,
                 _ => {}
             },
-            "width" if self.kind == Kind::Cell || is_table || self.is_colgroup => {
+            "width" if self.kind == Kind::Cell || is_table || self.is_col => {
                 let w = v.trim();
                 if w.eq_ignore_ascii_case("auto") {
                     self.look.own_width = None;
@@ -2853,10 +2861,20 @@ impl<'a> Html<'a> {
                 }
             }
             // A table's column (#1894).
+            // Its width by the cascade, as a `colgroup`'s (r2).
             "col" if self.kept_table() && self.at_table_level() => {
-                if let Some((attrs, _)) = &read {
-                    let width = self.col_width(attrs);
-                    self.out.table_col(span_attr(attrs), width);
+                if let Some((attrs, key)) = &read {
+                    if self.budget.work(1 + key.heap() / 16) {
+                        let look = look_of(
+                            self.ctx(),
+                            &self.elems,
+                            key,
+                            Kind::Other,
+                            attrs,
+                            CardMode::No,
+                        );
+                        self.out.table_col(span_attr(attrs), look.own_width);
+                    }
                 }
             }
             _ => {}
@@ -2865,43 +2883,6 @@ impl<'a> Html<'a> {
         let serial = self.take_serial();
         let key = read.map(|(_, key)| key).unwrap_or_default();
         self.add_child(serial, &key);
-    }
-
-    /// A `col`'s width (#1894): its inline `width` (its look is never
-    /// computed, so a style sheet's is not read), else its attribute.
-    fn col_width(&self, attrs: &Attrs) -> Option<Width> {
-        let pt = self
-            .elems
-            .last()
-            .map_or(css::BASE_PT, |e| font_pt(&e.look.run));
-        let decls = attrs
-            .style
-            .as_deref()
-            .map(css::parse_declarations)
-            .unwrap_or_default();
-        // `Some(None)`: a declared `auto` (r1), which the attribute does
-        // not override.
-        let mut width: Option<Option<Width>> = None;
-        for important in [false, true] {
-            for d in decls.iter().filter(|d| d.important == important) {
-                if !d.name.eq_ignore_ascii_case("width") {
-                    continue;
-                }
-                let v = d.value.trim();
-                if v.eq_ignore_ascii_case("auto") {
-                    width = Some(None);
-                    continue;
-                }
-                let Some(len) = css::length(v).filter(|l| l.v >= 0.0) else {
-                    continue;
-                };
-                width = Some(match len.unit {
-                    css::Unit::Percent => Some(Width::Pct(len.v)),
-                    _ => len.twips(pt).map(|t| Width::Twips(t.max(0) as u32)),
-                });
-            }
-        }
-        width.unwrap_or_else(|| attrs.width.as_deref().and_then(width_attr))
     }
 
     /// Open an element that holds content.
@@ -8418,13 +8399,15 @@ mod centering_tests {
             let html = wrap.replace("{T}", T);
             assert_eq!(jcs(&html).last(), Some(&some("right")), "{html}");
         }
-        // Through an outer table and its cell: the nested one is centred
-        // too, as a browser's standards mode inherits `text-align`.
+        // Through an outer table and its cell: this page is in quirks
+        // mode, whose `table { text-align: start }` stops the centring at
+        // the outer table (#1894 r2, measured in Chrome: the outer table
+        // centred, the nested one at its cell's left).
         assert_eq!(
             jcs(
                 "<center><table><tr><td><table><tr><td>x</td></tr></table></td></tr></table></center>"
             ),
-            [some("center"), some("center")]
+            [some("center"), None]
         );
     }
 
@@ -8504,9 +8487,11 @@ mod centering_tests {
                 .props
                 .align
         };
-        // The ancestors' alignment still reaches the text; the table's own
-        // margin never does.
-        assert_eq!(align("in"), Align::Center);
+        // The table's own margin never reaches the text; nor, on this
+        // quirks-mode page, does the ancestors' alignment (quirks'
+        // `table { text-align: start }`, #1894 r2: Chrome's `in` is
+        // `start`).
+        assert_eq!(align("in"), Align::Left);
         assert_eq!(align("own"), Align::Left);
         assert_eq!(align("left"), Align::Left);
     }
@@ -10847,6 +10832,20 @@ mod table_1894_tests {
             )),
             [1500, 3000, 4500]
         );
+        // A style sheet's rule on a `col` (r2).
+        assert_eq!(
+            grid(&format!(
+                "<style>col.w {{ width: 120px }}</style><table width=600><col class=w>{row3}</table>"
+            )),
+            [1800, 3600, 3600]
+        );
+        // Over its attribute (which would make it 4500).
+        assert_eq!(
+            grid(&format!(
+                "<style>col.w {{ width: 100px }}</style><table width=600><col class=w width=300>{row3}</table>"
+            )),
+            [1500, 3750, 3750]
+        );
         // A declared `auto` leaves the column to its cells, attribute or not
         // (the attribute would make it 1500).
         assert_eq!(
@@ -10970,15 +10969,16 @@ mod table_1894_tests {
 
     #[test]
     fn th_is_bold_and_centred_unless_told_1894() {
+        // A page with no doctype is in quirks mode; standards mode too.
         assert_eq!(
             th_look("<table><tr><th>x</th></tr></table>"),
             (true, Align::Center)
         );
-        // Quirks mode too, and a `td` stays as it was.
         assert_eq!(
             th_look("<!DOCTYPE html><table><tr><th>x</th></tr></table>"),
             (true, Align::Center)
         );
+        // A `td` stays as it was.
         assert_eq!(
             th_look("<table><tr><td>x</td></tr></table>"),
             (false, Align::Left)
@@ -11002,9 +11002,32 @@ mod table_1894_tests {
             th_look("<table><tr align=left><th>x</th></tr></table>").1,
             Align::Left
         );
+        // In standards mode only: quirks' `table { text-align: start }`
+        // stops what is outside the table (#1894 r2, measured in Chrome).
+        assert_eq!(
+            th_look(
+                "<!DOCTYPE html><div style=\"text-align:left\"><table><tr><th>x</th></tr></table>\
+                 </div>"
+            )
+            .1,
+            Align::Left
+        );
         assert_eq!(
             th_look("<div style=\"text-align:left\"><table><tr><th>x</th></tr></table></div>").1,
+            Align::Center
+        );
+        // Quirks: a `td` there starts at its start too.
+        assert_eq!(
+            th_look("<div style=\"text-align:center\"><table><tr><td>x</td></tr></table></div>").1,
             Align::Left
+        );
+        assert_eq!(
+            th_look(
+                "<!DOCTYPE html><div style=\"text-align:center\"><table><tr><td>x</td></tr>\
+                 </table></div>"
+            )
+            .1,
+            Align::Center
         );
         assert_eq!(
             th_look("<table style=\"text-align:right\"><tr><th>x</th></tr></table>").1,

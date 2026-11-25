@@ -34,7 +34,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   cell's `tcW` is its columns' sum. Web Layout and `ext::DocView` fit a pct or auto
   table to the view's width when they draw it (#1895,
   `docs/claude/docx-editing.md`); the model keeps these widths.
-- `tcPr`, in schema order: `tcW`, `gridSpan`, `vMerge`, `shd` (the cell's
+- `tcPr`, in schema order: `tcW`, `gridSpan`, `vMerge`, `tcBorders` (its
+  CSS border, #1894), `shd` (the cell's
   own `bgcolor` / CSS background, CSS over the attribute, else its row's,
   row group's, then table's; `background: none|transparent` on a table part
   clears its own), `tcMar` (the cell's CSS padding, sides given only), and
@@ -45,9 +46,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   (the table's float `align`, auto margins or container alignment: see
   "HTML import centring (#1922)"; none of them aligns the text inside;
   `align` on a row aligns its cells' text), `tblCellSpacing` (half the HTML
-  `cellspacing`, unmeasured against Word), `tblBorders` (`border=N`: outer
-  `single` N px × 6 eighths clamped 2..96, inside 1 px; a bare or unreadable
-  `border` is 1; `0` or none writes none, the layout-table case),
+  `cellspacing`, unmeasured against Word; none when collapsed, #1894),
+  `tblBorders` (`border=N`: outer `single` N px × 6 eighths clamped 2..96,
+  inside 1 px; a bare or unreadable `border` is 1; `0` or none writes none,
+  the layout-table case; CSS borders, `frame`, `rules` and `bordercolor`
+  write them too since #1894, below),
   `tblCellMar` (`cellpadding`, also 0). `raw_tcpr`/`raw_tblpr` hold them,
   `grid_span`/`v_merge` match, so a save writes them unchanged. A `div`
   with a background in a cell is a one-cell table of its own: see "HTML
@@ -84,7 +87,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   `margin-left: auto; margin-right: auto`, so a page's `margin: 0` on it
   leaves it at the left. A table's own `align` and margins never align its
   cells' text; its own `text-align`, like its ancestors', still does (it
-  is not its place).
+  is not its place), except that in quirks mode a table starts its text
+  at its start (`table { text-align: start }`, #1894 r2): an ancestor's
+  alignment, `-webkit-` ones and their block placing included, stops at
+  the table, whose own place is still its parent's.
 - Images: `display: block` on an `img` (`Look::own_block`; any other
   `display` but `none` clears it, so an e-mail's `img {display: block}`
   reset is undone by a later `inline`) makes the picture, or an unsized
@@ -201,7 +207,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   an attribute percentage is ignored; one side gives the other by the
   pixels' aspect, none the pixels; scaled down to the body (11790 twips,
   #1928).
-  Only `img` reads `height`.
+  Of the rest, only `tr`, `td` and `th` read `height`, as a row height
+  (#1894).
 - Unresolved (refused, no room, not an image): sized, a picture over one
   shared 1×1 `#F2F2F2` PNG with an `A6A6A6` 1 px line and the `alt` as
   `wp:docPr descr` (colours by estimate, unmeasured); unsized, the `alt`
@@ -718,8 +725,11 @@ A batch from #1989 and #1930 (plan-2), import only.
   own and its cells' CSS still apply; family and colour inherit. No
   explicit off is written (`bold_off`/`italic_off` false). Clipboard
   fragments are quirks too: a pasted table loses a body-inherited size, as
-  a browser shows the fragment. Not done: the same rule's `line-height`,
-  `white-space` and `text-align` (they move measured mail layouts).
+  a browser shows the fragment. Its `text-align: start` came with #1894 r2
+  (a `th` centres only over a start, so one under a `text-align:left`
+  block depended on it; see "HTML import centring"). Not done: the same
+  rule's `line-height` and `white-space` (they move measured mail
+  layouts).
 - `font-style: normal` under a heading is `<w:i w:val="0"/>` (`ITALIC_OFF`,
   `Look::italic_off`), as `font-weight: normal` is the bold off: declared on
   or inside the heading only.
@@ -765,9 +775,10 @@ A batch from #1989 and #1930 (plan-2), import only.
   cell).
 - Paragraph borders (`css::border_shorthand`, `border_sides`,
   `Cascade::border_decl`, `own_borders`): `border`, `border-<side>` and
-  the `-width`/`-style`/`-color` longhands, on a block only (cells, cards,
-  tables, lists, images and inline elements ignore theirs; a cell or card
-  starts with none). solid/groove/ridge/inset/outset are single, double,
+  the `-width`/`-style`/`-color` longhands, on a block only (cards, lists,
+  images and inline elements ignore theirs; a cell or card starts with
+  none; a cell's and a table's are its `tcBorders` / `tblBorders` since
+  #1894, never paragraph borders). solid/groove/ridge/inset/outset are single, double,
   dotted and dashed their own; `sz` is the width in eighths of a point
   (2..96); the colour is the element's text colour unless given,
   `windowtext` automatic, `transparent` or a zero alpha no line, a partial
@@ -921,13 +932,13 @@ was #1922's.
   `td`/`th` it is the content box, so its top and bottom margins (its own
   padding, else `cellpadding`) are added; a cell spanning rows sets none.
   The largest is `w:trHeight w:hRule="atLeast"` in the row's `raw_props`.
-- Columns: `col` (void; its attributes read in `open_void`) and
+- Columns: `col` (void; its attributes and look computed in `open_void`) and
   `colgroup` in a table's own content (`Html::at_table_level`, not in a
   cell or row) give `RawTable::cols` (`Builder::begin_colgroup`,
   `table_col`, `end_colgroup`): `span` (1..=1000) copies of the `col`'s
-  width (its inline `width`, else its attribute; an inline `auto` none,
-  over the attribute too; a sheet's rules are not
-  read: its look is never computed), else its group's (a computed look).
+  width (its computed look's, as a `colgroup`'s: CSS, sheet rules too,
+  over its attribute; `auto` none, over the attribute too), else its
+  group's.
   A `colgroup` with no `col` stands for its span; it ends at
   `</colgroup>`, a cell, a row group or the table's end. Total cut at
   `MAX_COLUMNS`; columns past the grid add none. `column_widths` takes
@@ -956,10 +967,12 @@ was #1922's.
   dark.
 - Tests: `table_1894_tests` in `import/html.rs`;
   `image_tests::height_still_means_nothing_on_a_table` now checks a row's
-  height too.
+  height too; `centering_tests::webkit_center_ancestors_centre_tables` and
+  `a_centred_table_keeps_its_cell_text_alignment` follow quirks mode's
+  `text-align: start` at a table (r2, measured in Chrome).
 - Not done: background images (docx has no picture fill for a cell or
   page; the shorthand's colour is read); `rules=groups`; a separated
   model's doubled lines between bordered cells (Word draws one); a cell's
   border widths in its row's height; a percentage `max-width` on a block,
-  `min-width`, `height` on a `table`; sheet rules on `col`; `th`'s
+  `min-width`, `height` on a `table`; `th`'s
   `scope` and header rows (`tblHeader`).

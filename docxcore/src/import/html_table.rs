@@ -209,6 +209,8 @@ pub(crate) fn px_twips(px: u32) -> u32 {
 /// One placed cell.
 struct Placed {
     cell: RawCell,
+    /// Its first row (#1894).
+    row: usize,
     col: usize,
     span: usize,
     /// Rows it covers, itself included (≥ 1).
@@ -268,21 +270,15 @@ pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
     let mut tcprs = Vec::with_capacity(placed.len());
     let mut cells: Vec<Option<Vec<Block>>> = Vec::with_capacity(placed.len());
     let reach: Vec<usize> = placed.iter().map(|p| p.rows).collect();
-    // Each placed cell's first row (#1894): its borders and its height.
-    let mut start_row = vec![0; placed.len()];
-    for (r, row_slots) in slots.iter().enumerate() {
-        for s in row_slots {
-            if let Slot::Start(i) = s {
-                start_row[*i] = r;
-            }
-        }
-    }
+    // Each placed cell's first row (#1894), kept for its merged slots
+    // below, once the cells are taken.
+    let start_row: Vec<usize> = placed.iter().map(|p| p.row).collect();
     // A row's height (#1894): at least its own `height` and each cell's
     // that starts in it and spans no other row, with its top and bottom
     // margins (a cell's height is its content box, Word's the row's).
     let mut heights: Vec<u32> = vec![0; nrows];
-    for (i, p) in placed.iter().enumerate() {
-        let r = start_row[i];
+    for p in &placed {
+        let r = p.row;
         let spec_pad = p.cell.spec.padding;
         let margin = |side: usize| spec_pad[side].map(|t| t.max(0) as u32).or(pad).unwrap_or(0);
         if let Some(h) = p.cell.spec.row_height {
@@ -305,10 +301,10 @@ pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
             _ => Some(b),
         }
     };
-    for (i, p) in placed.iter().enumerate() {
+    for p in &placed {
         let w = span_w(p.col, p.span);
         let mut borders = p.cell.spec.borders;
-        let first = start_row[i];
+        let first = p.row;
         if first == 0 {
             borders[0] = edge_keeps(0, borders[0]);
         }
@@ -521,6 +517,7 @@ fn place(rows: Vec<Vec<RawCell>>, nrows: usize, groups: &[usize]) -> (Vec<Placed
             }
             placed.push(Placed {
                 cell,
+                row: r,
                 col: cursor,
                 span,
                 rows: reach,
