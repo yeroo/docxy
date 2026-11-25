@@ -503,6 +503,27 @@ struct HtmlAcc {
     nested: Vec<(usize, html_table::RawTable)>,
     /// Row indexes where a row group starts ([`html_table::RawTable::groups`]).
     groups: Vec<usize>,
+    /// Its columns' widths so far ([`html_table::RawTable::cols`], #1894).
+    cols: Vec<Option<html_table::Width>>,
+    /// The open `colgroup`: its span, its width and whether a `col` has
+    /// been in it (one with none stands for its span of columns).
+    colgroup: Option<(u32, Option<html_table::Width>, bool)>,
+}
+
+impl HtmlAcc {
+    /// `n` columns of `width`, the total cut at [`MAX_COLUMNS`].
+    fn push_cols(&mut self, n: u32, width: Option<html_table::Width>) {
+        let room = MAX_COLUMNS.saturating_sub(self.cols.len());
+        let n = (n as usize).min(room);
+        self.cols.extend(std::iter::repeat_n(width, n));
+    }
+
+    /// End the open `colgroup`: one with no `col` is its span of columns.
+    fn end_colgroup(&mut self) {
+        if let Some((span, width, false)) = self.colgroup.take() {
+            self.push_cols(span, width);
+        }
+    }
 }
 
 impl<'b> Builder<'b> {
@@ -847,15 +868,54 @@ impl<'b> Builder<'b> {
                 cell: None,
                 nested: Vec::new(),
                 groups: Vec::new(),
+                cols: Vec::new(),
+                colgroup: None,
             }),
             ..TableAcc::default()
         });
     }
 
+    /// The innermost HTML table being read.
+    fn html_acc(&mut self) -> Option<&mut HtmlAcc> {
+        self.tables.last_mut().and_then(|t| t.html.as_mut())
+    }
+
+    /// A `colgroup` of the innermost HTML table opens (#1894): `span`
+    /// columns of `width` unless `col`s in it say otherwise.
+    pub(crate) fn begin_colgroup(&mut self, span: u32, width: Option<html_table::Width>) {
+        if let Some(h) = self.html_acc() {
+            h.end_colgroup();
+            h.colgroup = Some((span, width, false));
+        }
+    }
+
+    /// A `colgroup` of the innermost HTML table ends (#1894).
+    pub(crate) fn end_colgroup(&mut self) {
+        if let Some(h) = self.html_acc() {
+            h.end_colgroup();
+        }
+    }
+
+    /// A `col` of the innermost HTML table (#1894): `span` columns of its
+    /// width, else its `colgroup`'s.
+    pub(crate) fn table_col(&mut self, span: u32, width: Option<html_table::Width>) {
+        if let Some(h) = self.html_acc() {
+            let width = match &mut h.colgroup {
+                Some((_, group, had)) => {
+                    *had = true;
+                    width.or(*group)
+                }
+                None => width,
+            };
+            h.push_cols(span, width);
+        }
+    }
+
     /// Open a cell of the innermost HTML table with `spec`: its end, or the
     /// end of its row or table, makes it even when it holds nothing.
     pub(crate) fn begin_cell(&mut self, spec: html_table::CellSpec) {
-        if let Some(h) = self.tables.last_mut().and_then(|t| t.html.as_mut()) {
+        if let Some(h) = self.html_acc() {
+            h.end_colgroup();
             h.cell = Some(spec);
         }
     }
@@ -863,7 +923,8 @@ impl<'b> Builder<'b> {
     /// A row group of the innermost HTML table starts or ends here: the
     /// rows after it are another group, which no `rowspan` reaches into.
     pub(crate) fn row_group_boundary(&mut self) {
-        if let Some(h) = self.tables.last_mut().and_then(|t| t.html.as_mut()) {
+        if let Some(h) = self.html_acc() {
+            h.end_colgroup();
             let at = h.rows.len();
             if at > 0 && h.groups.last() != Some(&at) {
                 h.groups.push(at);
@@ -1056,10 +1117,12 @@ impl<'b> Builder<'b> {
         if h.rows.is_empty() {
             return;
         }
+        h.end_colgroup();
         let mut raw = html_table::RawTable {
             spec: h.spec,
             rows: h.rows,
             groups: h.groups,
+            cols: h.cols,
         };
         match self.tables.last_mut() {
             Some(outer) if outer.html.is_some() => {

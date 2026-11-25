@@ -78,7 +78,9 @@ issue number to find its notes.
   `text-decoration:none` links and span-only columns as Word draws them (#2249),
   quirks tables' font, an explicit italic off, rtl, letter spacing, caps,
   visibility, white-space, page breaks, block borders as paragraph
-  borders, `+`, attribute and `:first-child` selectors (#1883).
+  borders, `+`, attribute and `:first-child` selectors (#1883), table
+  and cell borders, `frame`/`rules`, `border-collapse`, row heights,
+  `col` widths, `max-width`, `th`, the page colour (#1894).
 - `docs/claude/email-html.md`: before changing `docxcore::export_email` (a `Document` as an
   e-mail body): inline styles only, lists and their `start`, safe links, `cid:` pictures and
   their media, the import round trip (#1948).

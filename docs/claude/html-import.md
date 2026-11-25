@@ -34,7 +34,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   cell's `tcW` is its columns' sum. Web Layout and `ext::DocView` fit a pct or auto
   table to the view's width when they draw it (#1895,
   `docs/claude/docx-editing.md`); the model keeps these widths.
-- `tcPr`, in schema order: `tcW`, `gridSpan`, `vMerge`, `shd` (the cell's
+- `tcPr`, in schema order: `tcW`, `gridSpan`, `vMerge`, `tcBorders` (its
+  CSS border, #1894), `shd` (the cell's
   own `bgcolor` / CSS background, CSS over the attribute, else its row's,
   row group's, then table's; `background: none|transparent` on a table part
   clears its own), `tcMar` (the cell's CSS padding, sides given only), and
@@ -45,19 +46,21 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   (the table's float `align`, auto margins or container alignment: see
   "HTML import centring (#1922)"; none of them aligns the text inside;
   `align` on a row aligns its cells' text), `tblCellSpacing` (half the HTML
-  `cellspacing`, unmeasured against Word), `tblBorders` (`border=N`: outer
-  `single` N px × 6 eighths clamped 2..96, inside 1 px; a bare or unreadable
-  `border` is 1; `0` or none writes none, the layout-table case),
+  `cellspacing`, unmeasured against Word; none when collapsed, #1894),
+  `tblBorders` (`border=N`: outer `single` N px × 6 eighths clamped 2..96,
+  inside 1 px; a bare or unreadable `border` is 1; `0` or none writes none,
+  the layout-table case; CSS borders, `frame`, `rules` and `bordercolor`
+  write them too since #1894, below),
   `tblCellMar` (`cellpadding`, also 0). `raw_tcpr`/`raw_tblpr` hold them,
   `grid_span`/`v_merge` match, so a save writes them unchanged. A `div`
   with a background in a cell is a one-cell table of its own: see "HTML
   import nested cards (#1927)". Two tables back to back in a cell (nested
   or cards) get an empty paragraph between them, or Word joins them
   (`end_html_table`).
-- Known limits: CSS borders, `frame`/`rules`, `border-color`, row heights,
-  `<col>` widths, `max-width`, `th` bold/centre, background images; a table
-  directly in a `tr`/`table` (no cell) joins the next cell (a browser puts
-  it before the table).
+- Known limits: background images; a table directly in a `tr`/`table` (no
+  cell) joins the next cell (a browser puts it before the table). CSS
+  borders, `frame`/`rules`, `border-color`, row heights, `<col>` widths,
+  `max-width` and `th` came with #1894 (below).
 
 ## HTML import centring (#1922)
 
@@ -84,7 +87,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   `margin-left: auto; margin-right: auto`, so a page's `margin: 0` on it
   leaves it at the left. A table's own `align` and margins never align its
   cells' text; its own `text-align`, like its ancestors', still does (it
-  is not its place).
+  is not its place), except that in quirks mode a table starts its text
+  at its start (`table { text-align: start }`, #1894 r2): an ancestor's
+  alignment, `-webkit-` ones and their block placing included, stops at
+  the table, whose own place is still its parent's.
 - Images: `display: block` on an `img` (`Look::own_block`; any other
   `display` but `none` clears it, so an e-mail's `img {display: block}`
   reset is undone by a later `inline`) makes the picture, or an unsized
@@ -110,7 +116,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   breaks, hangs and wrapper tables").
 - Known limits: a block's auto margins inside a cell; a table in a merely
   indented block keeps the body's width; PDF export does not place a table
-  by `w:jc`; `max-width`; CSS `float`; `<img align>`; `box-sizing`;
+  by `w:jc`; a percentage `max-width` (an absolute one came with #1894);
+  CSS `float`; `<img align>`; `box-sizing`;
   right-to-left.
 
 ## HTML import CSS (#1872)
@@ -141,7 +148,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   block's own top/bottom box as spacing (with the user agent's margins and
   a browser's collapse, #1979), every enclosing block's left/right box summed as indent
   (negative clamps at 0), `text-indent`, a block's background as `w:shd`.
-- Boundaries: `html`/`body` box and background are the page's, never read; a
+- Boundaries: `html`/`body` box is the page's, never read, and their
+  background is the page colour (#1894, below), never shading; a
   `td`/`th` starts a fresh indent, right indent, first line and shading (its
   padding is the cell's `tcMar`, below), while inherited run properties and
   line height pass in; `table` boxes are not counted. A list's box is
@@ -199,7 +207,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   an attribute percentage is ignored; one side gives the other by the
   pixels' aspect, none the pixels; scaled down to the body (11790 twips,
   #1928).
-  Only `img` reads `height`.
+  Of the rest, only `tr`, `td` and `th` read `height`, as a row height
+  (#1894).
 - Unresolved (refused, no room, not an image): sized, a picture over one
   shared 1×1 `#F2F2F2` PNG with an `A6A6A6` 1 px line and the `alt` as
   `wp:docPr descr` (colours by estimate, unmeasured); unsized, the `alt`
@@ -716,8 +725,11 @@ A batch from #1989 and #1930 (plan-2), import only.
   own and its cells' CSS still apply; family and colour inherit. No
   explicit off is written (`bold_off`/`italic_off` false). Clipboard
   fragments are quirks too: a pasted table loses a body-inherited size, as
-  a browser shows the fragment. Not done: the same rule's `line-height`,
-  `white-space` and `text-align` (they move measured mail layouts).
+  a browser shows the fragment. Its `text-align: start` came with #1894 r2
+  (a `th` centres only over a start, so one under a `text-align:left`
+  block depended on it; see "HTML import centring"). Not done: the same
+  rule's `line-height` and `white-space` (they move measured mail
+  layouts).
 - `font-style: normal` under a heading is `<w:i w:val="0"/>` (`ITALIC_OFF`,
   `Look::italic_off`), as `font-weight: normal` is the bold off: declared on
   or inside the heading only.
@@ -763,9 +775,10 @@ A batch from #1989 and #1930 (plan-2), import only.
   cell).
 - Paragraph borders (`css::border_shorthand`, `border_sides`,
   `Cascade::border_decl`, `own_borders`): `border`, `border-<side>` and
-  the `-width`/`-style`/`-color` longhands, on a block only (cells, cards,
-  tables, lists, images and inline elements ignore theirs; a cell or card
-  starts with none). solid/groove/ridge/inset/outset are single, double,
+  the `-width`/`-style`/`-color` longhands, on a block only (cards, lists,
+  images and inline elements ignore theirs; a cell or card starts with
+  none; a cell's and a table's are its `tcBorders` / `tblBorders` since
+  #1894, never paragraph borders). solid/groove/ridge/inset/outset are single, double,
   dotted and dashed their own; `sz` is the width in eighths of a point
   (2..96); the colour is the element's text colour unless given,
   `windowtext` automatic, `transparent` or a zero alpha no line, a partial
@@ -874,3 +887,92 @@ A batch from #1989 and #1930 (plan-2), import only.
   `a_sheet_keeps_at_most_32_attribute_names_1883`; `export_email.rs`:
   `caps_small_caps_and_rtl_round_trip_1883`; `tests/html_css.rs`'s mail
   fixtures check the quote lines.
+
+## HTML import table borders, heights, columns, `th` and the page colour (#1894)
+
+The leftovers of #1878, measured in headless Chrome (the same in quirks
+and standards mode). p3 (centring under `center`, `align`, auto margins)
+was #1922's.
+
+- Borders (`Cascade::table_border_hints`, `frame_lines`, `table_spec`):
+  - A `table`'s and a cell's CSS border (#1883's `border_decl`, every
+    shorthand and longhand, sheet rules too) is `Look::own_frame`:
+    `tblBorders` top/left/bottom/right and `tcBorders`, written by
+    `serialize::pbdr_side_xml` with `w:space="0"`. A side that draws
+    nothing (none, hidden, 0, transparent) writes nothing, never `nil`:
+    a browser's `none` loses the collapse conflict to its neighbour's
+    line, and a Word `nil` on an edge cell would erase the table's frame.
+  - `border`, `frame` and `bordercolor` seed the table's outer sides as
+    presentational hints, so CSS replaces them side by side: the sides
+    `frame` names (all for a `border` above 0 alone, none for `rules`
+    alone), `border` px wide (1 without one), `bordercolor` else
+    automatic. A `border=N` table with no CSS is written as before.
+  - Inside lines (`TableSpec::inside`): `rules` (`rows`, `cols`, `all`;
+    `groups` and `none` none), else both for a `border` above 0; 1 px
+    `single`, in the table's computed top (`insideH`) and left
+    (`insideV`) border colour (`Look::own_rule_ink`): a browser's cells
+    of such a table inherit the table's `border-color`, so CSS
+    `border-color` on the table colours them too.
+  - Edge cells (`html_table::layout`): Word draws a cell's line on the
+    table's edge instead of the table's, so where the table draws that
+    outer side and its cells are not spaced apart, a cell side there is
+    written only when at least as wide (CSS collapse: the wider wins, a
+    cell a tie). A merged (`rowspan`) cell writes its top on its first
+    slot, its sides on each and its bottom on its last.
+  - `border-collapse` (`Look::collapse`) and a known `rules` value
+    (`none`, `groups`, `rows`, `cols`, `all`: its hint; another is
+    ignored) drop `tblCellSpacing`, as the collapsing model has no
+    spacing: a mail's `table { border-collapse: collapse }` reset drops it
+    too. Only a table's own: the user agent's `table { border-collapse:
+    separate }` resets the inherited value at every table (r1), so a
+    collapsed outer table or a `div`'s collapse does not reach a table
+    in it.
+- Row heights: `height` on a `tr` (attribute: digits or px; CSS: an
+  absolute length; a percentage none, `auto` clears) is the row's; on a
+  `td`/`th` it is the content box, so its top and bottom margins (its own
+  padding, else `cellpadding`) are added; a cell spanning rows sets none.
+  The largest is `w:trHeight w:hRule="atLeast"` in the row's `raw_props`.
+- Columns: `col` (void; its attributes and look computed in `open_void`) and
+  `colgroup` in a table's own content (`Html::at_table_level`, not in a
+  cell or row) give `RawTable::cols` (`Builder::begin_colgroup`,
+  `table_col`, `end_colgroup`): `span` (1..=1000) copies of the `col`'s
+  width (its computed look's, as a `colgroup`'s: CSS, sheet rules too,
+  over its attribute; `auto` none, over the attribute too), else its
+  group's.
+  A `colgroup` with no `col` stands for its span; it ends at
+  `</colgroup>`, a cell, a row group or the table's end. Total cut at
+  `MAX_COLUMNS`; columns past the grid add none. `column_widths` takes
+  them as colspan-1 cells' widths.
+- `max-width`: on a table (`TableSpec::max_width`, a length or a
+  percentage of its room) it cuts a wider width to it, written in twips,
+  and an auto table is laid out in no more than it (`tblW` stays auto);
+  a nested table's room is its cell. On a block an absolute one bounds
+  the width its auto margins centre (#1922), or is that width with none,
+  so the #2114 room follows; a percentage one is not read.
+- `th`: bold (the user agent's), and centred only over an inherited
+  start alignment (none, or a logical `start`): its own `align` or
+  `text-align`, or an inherited explicit one (`<tr align=left>`, a
+  `div`'s `text-align:left`), win, as Chrome's `-internal-center`. The
+  centre places no block child (`block_align` is unchanged). No
+  `tblHeader`.
+- The page colour: the `html` element's background, else the `body`'s
+  (`bgcolor`, CSS `background`/`background-color`; `none`/`transparent`
+  clear the attribute's), white none, is `HtmlImport::page_color`
+  (`RRGGBB`, a public field), which `HtmlImport::package` writes with
+  `Package::set_page_background` (`w:background` and
+  `w:displayBackgroundShape`). `import_html` (a `Document`) has none. An
+  HTML file opened in the suite (`convert_child`) and the harness's
+  `ext-doc-load` get it; on a dark page Word's dark mode maps a light
+  page colour as a fill (`dark_page::page_sheet`, #2079), so it is drawn
+  dark.
+- Tests: `table_1894_tests` in `import/html.rs`;
+  `image_tests::height_still_means_nothing_on_a_table` now checks a row's
+  height too; `centering_tests::webkit_center_ancestors_centre_tables` and
+  `a_centred_table_keeps_its_cell_text_alignment` follow quirks mode's
+  `text-align: start` at a table (r2, measured in Chrome).
+- Not done: background images (docx has no picture fill for a cell or
+  page; the shorthand's colour is read); `rules=groups`; a separated
+  model's doubled lines between bordered cells (Word draws one); a cell's
+  border widths in its row's height; a percentage `max-width` on a block,
+  `min-width`, `height` on a `table`; `th`'s
+  `scope` and header rows (`tblHeader`).

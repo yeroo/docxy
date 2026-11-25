@@ -12,7 +12,7 @@
 //! point (a px is 6).
 
 use super::{Budget, MAX_COLUMNS};
-use crate::model::{Block, Cell, Paragraph, Row, Table, VMerge};
+use crate::model::{Block, Cell, ParBorder, Paragraph, Row, Table, VMerge};
 
 /// The narrowest column, in twips (one px).
 pub(crate) const MIN_COL: u32 = 15;
@@ -80,8 +80,19 @@ impl VAlign {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct TableSpec {
     pub width: Option<Width>,
-    /// `border`, in px (0: none).
-    pub border: u32,
+    /// CSS `max-width` (#1894): a width above it, or the room an auto
+    /// table is laid out in, is cut to it.
+    pub max_width: Option<Width>,
+    /// The outer lines it draws (#1894), top, right, bottom, left: its CSS
+    /// border over the `border` / `frame` / `bordercolor` hints.
+    pub outer: [Option<ParBorder>; 4],
+    /// The lines between its cells, `insideH` and `insideV` (#1894): the
+    /// `border` / `rules` attributes' 1 px lines in the table's computed
+    /// top and left border colours.
+    pub inside: [Option<ParBorder>; 2],
+    /// `border-collapse: collapse` (#1894, also `rules`' hint): no
+    /// `tblCellSpacing`.
+    pub collapse: bool,
     /// `cellpadding` / `cellspacing`, in px.
     pub cellpadding: Option<u32>,
     pub cellspacing: Option<u32>,
@@ -123,6 +134,12 @@ pub(crate) struct CellSpec {
     pub valign: VAlign,
     /// CSS `padding`, in twips, as top, right, bottom, left.
     pub padding: [Option<i32>; 4],
+    /// Its own CSS border lines (#1894), top, right, bottom, left.
+    pub borders: [Option<ParBorder>; 4],
+    /// Its own `height` (#1894), in twips: its content box.
+    pub height: Option<u32>,
+    /// Its row's `height` (#1894), in twips: the whole row.
+    pub row_height: Option<u32>,
 }
 
 impl Default for CellSpec {
@@ -134,6 +151,9 @@ impl Default for CellSpec {
             fill: None,
             valign: VAlign::Center,
             padding: [None; 4],
+            borders: [None; 4],
+            height: None,
+            row_height: None,
         }
     }
 }
@@ -167,6 +187,8 @@ pub(crate) struct RawTable {
     /// Row indexes where a row group (`thead`, `tbody`, `tfoot`, or the rows
     /// after one) starts, ascending: a `rowspan` ends with its group.
     pub groups: Vec<usize>,
+    /// Each grid column's `<col>` / `<colgroup>` width, in order (#1894).
+    pub cols: Vec<Option<Width>>,
 }
 
 /// The placeholder a nested table holds in its cell until [`layout`].
@@ -187,6 +209,8 @@ pub(crate) fn px_twips(px: u32) -> u32 {
 /// One placed cell.
 struct Placed {
     cell: RawCell,
+    /// Its first row (#1894).
+    row: usize,
     col: usize,
     span: usize,
     /// Rows it covers, itself included (≥ 1).
@@ -211,8 +235,20 @@ pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
         mut spec,
         rows,
         groups,
+        cols,
     } = t;
     let avail = avail.clamp(MIN_COL, MAX_TWIPS);
+    // `max-width` (#1894): a wider declared width is cut to it; an auto
+    // table is laid out in no more than it.
+    let mut room_w = avail;
+    if let Some(max) = spec.max_width {
+        let cap = resolve(max, avail);
+        match spec.width {
+            Some(w) if resolve(w, avail) > cap => spec.width = Some(Width::Twips(cap)),
+            Some(_) => {}
+            None => room_w = avail.min(cap),
+        }
+    }
     let nrows = rows.len();
     let (placed, slots) = place(rows, nrows, &groups);
     let ncols = slots
@@ -225,7 +261,7 @@ pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
         .max()
         .unwrap_or(0)
         .max(1);
-    let grid = column_widths(&spec, &placed, ncols, avail);
+    let grid = column_widths(&spec, &placed, &cols, ncols, room_w);
     let span_w = |col: usize, span: usize| -> u32 { grid[col..col + span].iter().sum() };
     let pad = spec.cellpadding.map(px_twips);
 
@@ -234,14 +270,60 @@ pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
     let mut tcprs = Vec::with_capacity(placed.len());
     let mut cells: Vec<Option<Vec<Block>>> = Vec::with_capacity(placed.len());
     let reach: Vec<usize> = placed.iter().map(|p| p.rows).collect();
-    for p in placed.iter() {
+    // Each placed cell's first row (#1894), kept for its merged slots
+    // below, once the cells are taken.
+    let start_row: Vec<usize> = placed.iter().map(|p| p.row).collect();
+    // A row's height (#1894): at least its own `height` and each cell's
+    // that starts in it and spans no other row, with its top and bottom
+    // margins (a cell's height is its content box, Word's the row's).
+    let mut heights: Vec<u32> = vec![0; nrows];
+    for p in &placed {
+        let r = p.row;
+        let spec_pad = p.cell.spec.padding;
+        let margin = |side: usize| spec_pad[side].map(|t| t.max(0) as u32).or(pad).unwrap_or(0);
+        if let Some(h) = p.cell.spec.row_height {
+            heights[r] = heights[r].max(h.min(MAX_TWIPS));
+        }
+        if let Some(h) = p.cell.spec.height.filter(|_| p.rows == 1) {
+            let h = h.saturating_add(margin(0)).saturating_add(margin(2));
+            heights[r] = heights[r].max(h.min(MAX_TWIPS));
+        }
+    }
+    // Where the table draws an outer line and its cells are not spaced
+    // apart, Word draws a cell's own line on that edge instead of the
+    // table's: as in a browser's collapsed borders, the wider wins, a cell
+    // a tie (#1894).
+    let spaced = !spec.collapse && spec.cellspacing.is_some_and(|n| n > 0);
+    let edge_keeps = |side: usize, b: Option<ParBorder>| -> Option<ParBorder> {
+        let b = b?;
+        match spec.outer[side] {
+            Some(t) if !spaced && t.sz > b.sz => None,
+            _ => Some(b),
+        }
+    };
+    for p in &placed {
         let w = span_w(p.col, p.span);
+        let mut borders = p.cell.spec.borders;
+        let first = p.row;
+        if first == 0 {
+            borders[0] = edge_keeps(0, borders[0]);
+        }
+        if first + p.rows >= nrows {
+            borders[2] = edge_keeps(2, borders[2]);
+        }
+        if p.col == 0 {
+            borders[3] = edge_keeps(3, borders[3]);
+        }
+        if p.col + p.span >= ncols {
+            borders[1] = edge_keeps(1, borders[1]);
+        }
         tcprs.push(TcPr {
             width: w,
             span: p.span as u32,
             fill: p.cell.spec.fill.clone(),
             valign: p.cell.spec.valign,
             padding: p.cell.spec.padding,
+            borders,
         });
         cells.push(None);
     }
@@ -269,8 +351,14 @@ pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
     }
 
     let mut out_rows = Vec::with_capacity(nrows);
-    for row_slots in &slots {
+    for (r, row_slots) in slots.iter().enumerate() {
         let mut row = Row::default();
+        if heights[r] > 0 {
+            row.raw_props.push(format!(
+                "<w:trPr><w:trHeight w:val=\"{}\" w:hRule=\"atLeast\"/></w:trPr>",
+                heights[r]
+            ));
+        }
         let mut c = 0;
         while c < ncols {
             let slot = row_slots.get(c).copied().unwrap_or(Slot::Free);
@@ -282,13 +370,26 @@ pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
                     } else {
                         VMerge::None
                     };
+                    // A merged cell's bottom line is under its last row.
+                    let mut b = p.borders;
+                    if reach[i] > 1 {
+                        b[2] = None;
+                    }
                     let blocks = cells[i].take().unwrap_or_default();
-                    (make_cell(p, merge, blocks), p.span as usize)
+                    (make_cell(p, merge, b, blocks), p.span as usize)
                 }
                 Slot::Covered(i) => {
                     let p = &tcprs[i];
+                    // Its sides on every row, its bottom on its last.
+                    let last = start_row[i] + reach[i] == r + 1;
+                    let b = [
+                        None,
+                        p.borders[1],
+                        p.borders[2].filter(|_| last),
+                        p.borders[3],
+                    ];
                     let blocks = vec![Block::Paragraph(Paragraph::default())];
-                    (make_cell(p, VMerge::Continue, blocks), p.span as usize)
+                    (make_cell(p, VMerge::Continue, b, blocks), p.span as usize)
                 }
                 Slot::Free => {
                     let p = TcPr {
@@ -297,9 +398,10 @@ pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
                         fill: None,
                         valign: VAlign::Center,
                         padding: [None; 4],
+                        borders: [None; 4],
                     };
                     let blocks = vec![Block::Paragraph(Paragraph::default())];
-                    (make_cell(&p, VMerge::None, blocks), 1)
+                    (make_cell(&p, VMerge::None, [None; 4], blocks), 1)
                 }
             };
             let heap = cell.raw_tcpr.as_ref().map_or(0, String::len);
@@ -415,6 +517,7 @@ fn place(rows: Vec<Vec<RawCell>>, nrows: usize, groups: &[usize]) -> (Vec<Placed
             }
             placed.push(Placed {
                 cell,
+                row: r,
                 col: cursor,
                 span,
                 rows: reach,
@@ -435,15 +538,34 @@ fn place(rows: Vec<Vec<RawCell>>, nrows: usize, groups: &[usize]) -> (Vec<Placed
 /// (#2249). A table's width is its own, else the columns' when
 /// every one has a width, else `avail`; declared columns narrower than a
 /// declared table grow to it, and columns wider than the table widen it.
-fn column_widths(spec: &TableSpec, placed: &[Placed], ncols: usize, avail: u32) -> Vec<u32> {
+fn column_widths(
+    spec: &TableSpec,
+    placed: &[Placed],
+    cols: &[Option<Width>],
+    ncols: usize,
+    avail: u32,
+) -> Vec<u32> {
     let declared = spec.width.map(|w| resolve(w, avail));
     let reference = declared.unwrap_or(avail);
     let single: Vec<&Placed> = placed.iter().filter(|p| p.span == 1).collect();
+    // A `<col>`'s width is its column's as a colspan-1 cell's would be
+    // (#1894); columns past the grid add none.
+    let cols = &cols[..cols.len().min(ncols)];
+    let widths = || {
+        cols.iter()
+            .enumerate()
+            .filter_map(|(c, w)| Some((c, (*w)?)))
+            .chain(
+                single
+                    .iter()
+                    .filter_map(|p| Some((p.col, p.cell.spec.width?))),
+            )
+    };
     // Percent columns, scaled to 100 in all.
     let mut pct = vec![0.0f64; ncols];
-    for p in &single {
-        if let Some(Width::Pct(v)) = p.cell.spec.width {
-            pct[p.col] = pct[p.col].max(v.max(0.0));
+    for (c, w) in widths() {
+        if let Width::Pct(v) = w {
+            pct[c] = pct[c].max(v.max(0.0));
         }
     }
     let total: f64 = pct.iter().sum();
@@ -458,9 +580,9 @@ fn column_widths(spec: &TableSpec, placed: &[Placed], ncols: usize, avail: u32) 
             col[c] = Some(resolve(Width::Pct(*v), reference));
         }
     }
-    for p in &single {
-        if let Some(Width::Twips(t)) = p.cell.spec.width {
-            col[p.col] = Some(col[p.col].unwrap_or(0).max(t));
+    for (c, w) in widths() {
+        if let Width::Twips(t) = w {
+            col[c] = Some(col[c].unwrap_or(0).max(t));
         }
     }
     for p in placed.iter().filter(|p| p.span > 1) {
@@ -590,21 +712,25 @@ struct TcPr {
     fill: Option<String>,
     valign: VAlign,
     padding: [Option<i32>; 4],
+    /// The cell's own lines (#1894), top, right, bottom, left, those the
+    /// table's frame outranks taken out; each slot of a merged cell writes
+    /// what of them is its own.
+    borders: [Option<ParBorder>; 4],
 }
 
-fn make_cell(p: &TcPr, merge: VMerge, blocks: Vec<Block>) -> Cell {
+fn make_cell(p: &TcPr, merge: VMerge, borders: [Option<ParBorder>; 4], blocks: Vec<Block>) -> Cell {
     Cell {
         grid_span: p.span.max(1),
         v_merge: merge,
         blocks,
-        raw_tcpr: Some(tcpr(p, merge)),
+        raw_tcpr: Some(tcpr(p, merge, &borders)),
         ..Cell::default()
     }
 }
 
-/// `w:tcPr`, its children in schema order: tcW, gridSpan, vMerge, shd,
-/// tcMar, vAlign.
-fn tcpr(p: &TcPr, merge: VMerge) -> String {
+/// `w:tcPr`, its children in schema order: tcW, gridSpan, vMerge,
+/// tcBorders, shd, tcMar, vAlign.
+fn tcpr(p: &TcPr, merge: VMerge, borders: &[Option<ParBorder>; 4]) -> String {
     let mut s = format!("<w:tcPr><w:tcW w:w=\"{}\" w:type=\"dxa\"/>", p.width);
     if p.span > 1 {
         s.push_str(&format!("<w:gridSpan w:val=\"{}\"/>", p.span));
@@ -613,6 +739,16 @@ fn tcpr(p: &TcPr, merge: VMerge) -> String {
         VMerge::None => {}
         VMerge::Restart => s.push_str("<w:vMerge w:val=\"restart\"/>"),
         VMerge::Continue => s.push_str("<w:vMerge/>"),
+    }
+    // CSS's top, right, bottom, left as tcBorders' top, left, bottom, right.
+    let lines = border_lines(&[
+        ("w:top", borders[0]),
+        ("w:left", borders[3]),
+        ("w:bottom", borders[2]),
+        ("w:right", borders[1]),
+    ]);
+    if !lines.is_empty() {
+        s.push_str(&format!("<w:tcBorders>{lines}</w:tcBorders>"));
     }
     if let Some(fill) = &p.fill {
         s.push_str(&format!(
@@ -632,6 +768,14 @@ fn tcpr(p: &TcPr, merge: VMerge) -> String {
     s.push_str(&format!("<w:vAlign w:val=\"{}\"/>", p.valign.val()));
     s.push_str("</w:tcPr>");
     s
+}
+
+/// The border elements of the sides that draw a line (#1894).
+fn border_lines(sides: &[(&str, Option<ParBorder>)]) -> String {
+    sides
+        .iter()
+        .filter_map(|(name, b)| b.as_ref().map(|b| crate::serialize::pbdr_side_xml(name, b)))
+        .collect()
 }
 
 /// The margin elements given, in twips (a negative one is 0).
@@ -664,7 +808,8 @@ fn tblpr(spec: &TableSpec, indent: Option<u32>) -> String {
     if let Some(jc) = spec.jc {
         s.push_str(&format!("<w:jc w:val=\"{jc}\"/>"));
     }
-    if let Some(n) = spec.cellspacing.filter(|&n| n > 0) {
+    // Collapsed borders have no spacing between cells (#1894).
+    if let Some(n) = spec.cellspacing.filter(|&n| n > 0 && !spec.collapse) {
         // Word's spacing is on each side of a cell: half the HTML gap
         // (unmeasured against Word).
         s.push_str(&format!(
@@ -675,21 +820,17 @@ fn tblpr(spec: &TableSpec, indent: Option<u32>) -> String {
     if let Some(ind) = indent {
         s.push_str(&format!("<w:tblInd w:w=\"{ind}\" w:type=\"dxa\"/>"));
     }
-    if spec.border > 0 {
-        let sz = (u64::from(spec.border) * 6).clamp(2, 96);
-        s.push_str("<w:tblBorders>");
-        for edge in ["w:top", "w:left", "w:bottom", "w:right"] {
-            s.push_str(&format!(
-                "<{edge} w:val=\"single\" w:sz=\"{sz}\" w:space=\"0\" w:color=\"auto\"/>"
-            ));
-        }
-        // A browser gives the cells of a bordered table 1 px borders.
-        for edge in ["w:insideH", "w:insideV"] {
-            s.push_str(&format!(
-                "<{edge} w:val=\"single\" w:sz=\"6\" w:space=\"0\" w:color=\"auto\"/>"
-            ));
-        }
-        s.push_str("</w:tblBorders>");
+    // CSS's top, right, bottom, left as top, left, bottom, right (#1894).
+    let lines = border_lines(&[
+        ("w:top", spec.outer[0]),
+        ("w:left", spec.outer[3]),
+        ("w:bottom", spec.outer[2]),
+        ("w:right", spec.outer[1]),
+        ("w:insideH", spec.inside[0]),
+        ("w:insideV", spec.inside[1]),
+    ]);
+    if !lines.is_empty() {
+        s.push_str(&format!("<w:tblBorders>{lines}</w:tblBorders>"));
     }
     if let Some(px) = spec.cellpadding {
         let t = Some(px_twips(px) as i32);
@@ -716,6 +857,17 @@ mod tests {
                 ..Paragraph::default()
             })],
             nested: Vec::new(),
+        }
+    }
+
+    /// A `single` automatic line of `sz` eighths, as `border=N` draws.
+    fn line(sz: u16) -> ParBorder {
+        ParBorder {
+            kind: crate::model::BorderKind::Single,
+            sz,
+            space: 0,
+            color: None,
+            theme: None,
         }
     }
 
@@ -748,6 +900,7 @@ mod tests {
                 spec: TableSpec::default(),
                 rows,
                 groups: Vec::new(),
+                cols: Vec::new(),
             },
             BODY_TWIPS,
             &Budget::standard(),
@@ -855,6 +1008,7 @@ mod tests {
                 },
                 rows: vec![row],
                 groups: Vec::new(),
+                cols: Vec::new(),
             },
             BODY_TWIPS,
             &Budget::standard(),
@@ -948,14 +1102,17 @@ mod tests {
                 RawTable {
                     spec: TableSpec {
                         width: Some(width),
-                        border: 1,
+                        outer: [Some(line(6)); 4],
+                        inside: [Some(line(6)); 2],
                         cellpadding: Some(0),
                         cellspacing: Some(4),
                         jc,
                         room: Some(room),
+                        ..TableSpec::default()
                     },
                     rows: vec![vec![text_cell("a", spec(1, 1))]],
                     groups: Vec::new(),
+                    cols: Vec::new(),
                 },
                 room.width,
                 &Budget::standard(),
@@ -990,11 +1147,13 @@ mod tests {
             RawTable {
                 spec: TableSpec {
                     width: Some(Width::Twips(9000)),
-                    border: 2,
+                    outer: [Some(line(12)); 4],
+                    inside: [Some(line(6)); 2],
                     cellpadding: Some(0),
                     cellspacing: Some(4),
                     jc: Some("center"),
                     room: None,
+                    ..TableSpec::default()
                 },
                 rows: vec![vec![text_cell(
                     "a",
@@ -1005,9 +1164,11 @@ mod tests {
                         fill: Some("FF0000".into()),
                         valign: VAlign::Top,
                         padding: [Some(150), None, Some(-30), Some(300)],
+                        ..CellSpec::default()
                     },
                 )]],
                 groups: Vec::new(),
+                cols: Vec::new(),
             },
             BODY_TWIPS,
             &Budget::standard(),
@@ -1046,6 +1207,7 @@ mod tests {
             },
             rows: vec![vec![text_cell("in", spec(1, 1))]],
             groups: Vec::new(),
+            cols: Vec::new(),
         };
         let mut outer = text_cell("out", spec(1, 1));
         outer.nested.push((1, inner));
@@ -1059,6 +1221,7 @@ mod tests {
                 },
                 rows: vec![vec![outer, text_cell("b", spec(1, 1))]],
                 groups: Vec::new(),
+                cols: Vec::new(),
             },
             BODY_TWIPS,
             &Budget::standard(),
