@@ -9384,14 +9384,22 @@ mod centering_tests {
         ] {
             assert_eq!(indents(html), [("x".into(), 0, 0)], "{html}");
         }
-        // In a cell, centred in the cell as laid out (#1930): an auto table
-        // fills the body, (11790 - 1500) / 2 each side.
+        // In a cell, centred only when the page declares the cell's width
+        // (#1930): an auto table, which a browser shrinks to the box, is
+        // not; a declared one is, in what its cell is laid out (here the
+        // whole 11790 twips: (11790 - 1500) / 2 each side).
         assert_eq!(
             indents(
                 "<table><tr><td><div style='width:100px;margin:0 auto'>x</div></td></tr></table>"
             ),
-            [("x".into(), 5145, 5145)]
+            [("x".into(), 0, 0)]
         );
+        for table in ["<table width=100%>", "<table style='width:786px'>"] {
+            let html = format!(
+                "{table}<tr><td><div style='width:100px;margin:0 auto'>x</div></td></tr></table>"
+            );
+            assert_eq!(indents(&html), [("x".into(), 5145, 5145)], "{html}");
+        }
     }
 }
 

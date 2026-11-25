@@ -288,3 +288,48 @@ fn a_centred_block_in_a_cell_keeps_its_indent_in_the_saved_xml() {
     let xml = crate::serialize::document_to_xml(&d);
     assert!(!xml.contains(ZERO_IND), "{xml}");
 }
+
+#[test]
+fn a_centred_block_is_centred_only_in_a_cell_whose_width_the_page_declares() {
+    let boxed = "<div style='width:100px;margin:0 auto'>x</div>";
+    let x = |html: &str| indents(find(&doc(html), "x").0);
+    // An auto table: a browser shrinks it to the box, at the left.
+    assert_eq!(
+        x(&format!(
+            "<table><tr><td>{boxed}</td><td>y</td></tr></table>"
+        )),
+        (0, 0)
+    );
+    // The cell's own width, or a `<col>`'s: 300 px = 4500, (4500 - 1500) / 2.
+    assert_eq!(
+        x(&format!(
+            "<table cellpadding=0><tr><td style='width:300px'>{boxed}</td><td>y</td></tr></table>"
+        )),
+        (1500, 1500)
+    );
+    assert_eq!(
+        x(&format!(
+            "<table cellpadding=0><col width=300><col><tr><td>{boxed}</td><td>y</td></tr></table>"
+        )),
+        (1500, 1500)
+    );
+    // A percentage of an auto table's width is not declared either.
+    assert_eq!(
+        x(&format!(
+            "<table><tr><td style='width:50%'>{boxed}</td><td>y</td></tr></table>"
+        )),
+        (0, 0)
+    );
+    // Nested: an auto table in a declared cell is not; a percentage one
+    // is, of its declared cell ((9000 - 1500) / 2).
+    let nested = |inner: &str| in_cell(600, &format!("{inner}<tr><td>{boxed}</td></tr></table>"));
+    assert_eq!(x(&nested("<table>")), (0, 0));
+    assert_eq!(x(&nested("<table width=100% cellpadding=0>")), (3750, 3750));
+    // And a percentage one in an auto table's cell is not.
+    assert_eq!(
+        x(&format!(
+            "<table><tr><td><table width=100%><tr><td>{boxed}</td></tr></table></td></tr></table>"
+        )),
+        (0, 0)
+    );
+}

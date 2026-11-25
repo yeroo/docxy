@@ -321,6 +321,14 @@ enum Slot {
 /// A table with a [`Room`] (whose width its caller passes as `avail`) is
 /// then placed in it ([`place_in_room`]).
 pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
+    layout_in(t, avail, true, budget)
+}
+
+/// [`layout`], `declared` saying whether the page declares `avail` (the
+/// body, a room, a cell whose width it declares): a centred box is centred
+/// only in a cell whose width the page declares (#1930), as an auto table a
+/// browser shrinks to its content.
+fn layout_in(t: RawTable, avail: u32, declared: bool, budget: &Budget) -> Table {
     let RawTable {
         mut spec,
         rows,
@@ -328,6 +336,25 @@ pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
         cols,
     } = t;
     let avail = avail.clamp(MIN_COL, MAX_TWIPS);
+    // Its own width (a card's always), or the room it is placed in.
+    let table_declared = match spec.width {
+        Some(Width::Twips(_)) => true,
+        Some(Width::Pct(_)) => declared,
+        None => spec.room.is_some(),
+    };
+    // A width the page gives the cell: the table's, the cell's own, or
+    // `<col>`s over all its columns (a percentage of the table's).
+    let known = |w: Option<Width>| match w {
+        Some(Width::Twips(_)) => true,
+        Some(Width::Pct(_)) => table_declared,
+        None => false,
+    };
+    let cell_declared = |p: &Placed| {
+        table_declared
+            || known(p.cell.spec.width)
+            || (p.col + p.span <= cols.len()
+                && cols[p.col..p.col + p.span].iter().all(|w| known(*w)))
+    };
     // `max-width` (#1894): a wider declared width is cut to it; an auto
     // table is laid out in no more than it.
     let mut room_w = avail;
@@ -424,15 +451,18 @@ pub(crate) fn layout(t: RawTable, avail: u32, budget: &Budget) -> Table {
             .width
             .saturating_sub(margin(1) + margin(3))
             .max(MIN_COL);
+        let declared = cell_declared(&p);
         let RawCell {
             mut blocks,
             nested,
             boxes,
             ..
         } = p.cell;
-        centre_in_cell(&mut blocks, boxes, inner);
+        if declared {
+            centre_in_cell(&mut blocks, boxes, inner);
+        }
         for (at, raw) in nested {
-            let table = layout(raw, inner, budget);
+            let table = layout_in(raw, inner, declared, budget);
             if let Some(b) = blocks.get_mut(at) {
                 *b = Block::Table(table);
             }

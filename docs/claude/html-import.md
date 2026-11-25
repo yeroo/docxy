@@ -108,8 +108,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   `max(0, (BODY_TWIPS - indent - indent_right - width) / 2)` more indent on
   each side, after its own box is added: a content box, so its padding is
   outside the width. Its text alignment is unchanged. Inside a cell or a
-  card, centred in the cell's inner width when the table is laid out (#1930:
-  see "HTML import centring in cells").
+  card, centred in the cell's inner width when the table is laid out, only
+  in a cell whose width the page declares (#1930: see "HTML import
+  centring in cells").
 - Drawing: the suite draws a `w:jc` table where it sits (#1922,
   `docs/claude/suite-document.md`).
 - An outermost table inside a centred fixed-width block is laid out in
@@ -147,9 +148,13 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   level (`html_table::line_space`, shared with `par_props`). A cell as wide
   as the body gives what the body gives (`html_tests_1930.rs`
   `same_as_body`).
-- An auto-width table takes the whole room (`column_widths`), so a box in
-  its cell is centred in that, where a browser would shrink the table to
-  the box.
+- Only in a cell whose width the page declares (`layout_in`'s
+  `declared`, r1): the table's own width (a card's always), its room, the
+  cell's own width or `<col>`s over all its columns; a percentage only of a
+  declared table or cell. An auto table takes the whole room in
+  `column_widths`, but a browser shrinks it to its content (the box, at
+  the left), so its cells' boxes stay where they are; so do those of a
+  nested table in such a cell.
 - Known limits: a table inside a centred box in a cell still takes its
   cell's width (`centred_box` is body-only). A list item's hang is clipped
   against its indent before centring, so a list with an indent smaller
