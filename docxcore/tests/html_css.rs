@@ -267,6 +267,7 @@ fn every_prefix_of_every_fixture_imports_without_panicking() {
         "outlook-reply.html",
         "plain-message.html",
         "links.html",
+        "toplevel-cards.html",
     ] {
         let bytes = fixture(name);
         for i in 0..=bytes.len() {
