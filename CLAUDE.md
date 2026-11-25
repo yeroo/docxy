@@ -89,7 +89,9 @@ issue number to find its notes.
   and cell borders, `frame`/`rules`, `border-collapse`, row heights,
   `col` widths, `max-width`, `th`, the page colour (#1894), image
   percentage sizes and `max-width`, `<base href>`, `srcset` and
-  `<picture>`, MHTML, SVG and WebP through a converter (#1898).
+  `<picture>`, MHTML, SVG and WebP through a converter (#1898),
+  whitespace-only paragraphs keeping a look drawn on spaces, an empty
+  line's size on its mark (#1973).
 - `docs/claude/email-html.md`: before changing `docxcore::export_email` (a `Document` as an
   e-mail body): inline styles only, lists and their `start`, safe links, `cid:` pictures and
   their media, the import round trip (#1948).

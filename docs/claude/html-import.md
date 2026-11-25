@@ -1429,3 +1429,34 @@ was #1922's.
   border widths in its row's height; a percentage `max-width` on a block,
   `min-width`, `height` on a `table`; `th`'s
   `scope` and header rows (`tblHeader`).
+
+## HTML import whitespace-only paragraphs (#1973)
+
+- A paragraph whose text is only white space is dropped as an empty
+  paragraph (Word's `<p>&nbsp;</p>`, `<o:p>&nbsp;</o:p>`), unless a look
+  a browser draws across a space holds it: a blank to fill in.
+  `import::shows_on_space` is that look: `underline`, `strike`,
+  `highlight` or the run shading (`<w:shd`) an inline `background`
+  writes, and not `vanish`. A font or size alone draws nothing, and an
+  explicit underline off (`<w:u w:val="none"/>`, `text-decoration:none`,
+  how Word writes an underlined empty paragraph's `&nbsp;`) is no
+  underline. A block's own underline is its runs', and counts.
+- It is decided when the content is written, not at the paragraph's end:
+  `Builder::link_text` and `Builder::tab` set `keeps` for white space or a
+  tab in such a look (outside a link: a link of spaces alone stays empty,
+  #1912), so a kept blank takes its waiting bookmarks and counts in
+  `Builder::shown` (#1936); `take_leading_marker`'s recount agrees.
+  `end_para_with` clears the paragraph when `!Builder::keeps()`.
+- An underlined tab alone (`mso-tab-count` or a `pre` tab) is kept as its
+  `Inline::Tab`: Word's usual blank line, which `export_email` writes as a
+  tab span in the run's span.
+- An empty paragraph's mark takes its line's look (`empty_line_mark`):
+  of its own visible runs (not a link's), the one with the largest
+  `size_half_pts`, the first among ties, else the first; `mark_rpr` of it
+  replaces the block's. None visible leaves the block's mark. A list
+  item's mark stays its marker's (#1979). A run with no look of its own
+  gives the block's mark, as before.
+- ASCII spaces alone never reach the builder outside `pre` (`on_text`
+  writes an owed space only before other text), so they stay no line.
+- Tests: `import/html_tests_1973.rs`;
+  `export_email::tests::underlined_spaces_alone_round_trip_1973`.
