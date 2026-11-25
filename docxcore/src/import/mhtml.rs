@@ -18,6 +18,7 @@
 
 use super::Budget;
 use super::html_image::{base64_decode, percent_decode};
+use std::collections::HashMap;
 
 /// The most bytes a header block (the message's or a part's) may take.
 pub(crate) const MAX_HEADER: usize = 16 << 10;
@@ -39,10 +40,6 @@ enum Encoding {
 /// One part other than the root: where its body is in the message.
 #[derive(Debug)]
 struct Part {
-    /// Its `Content-Location`, as written.
-    location: Option<String>,
-    /// Its `Content-ID`, angle brackets dropped, lowercase.
-    cid: Option<String>,
     encoding: Encoding,
     body: (usize, usize),
 }
@@ -52,6 +49,12 @@ struct Part {
 pub(crate) struct Mhtml<'a> {
     bytes: &'a [u8],
     parts: Vec<Part>,
+    /// The parts by `Content-Location`, as written and percent-decoded,
+    /// and by `Content-ID` (angle brackets dropped, lowercase): the first
+    /// part of each, each key made once when its part is read (r2).
+    by_location: HashMap<String, usize>,
+    by_decoded: HashMap<Vec<u8>, usize>,
+    by_cid: HashMap<String, usize>,
     /// The root part's decoded bytes: the page.
     pub(crate) html: Vec<u8>,
     /// The root part's `charset`, lowercase, if its `Content-Type` gives
@@ -83,6 +86,9 @@ pub(crate) fn parse<'a>(bytes: &'a [u8], budget: &Budget) -> Option<Mhtml<'a>> {
     }
     let delimiter = format!("--{boundary}");
     let mut parts = Vec::new();
+    let mut by_location = HashMap::new();
+    let mut by_decoded = HashMap::new();
+    let mut by_cid = HashMap::new();
     let mut root: Option<(Fields, (usize, usize))> = None;
     let start = field(&params, "start").map(|s| content_id(&s));
     let root_type = field(&params, "type").map(|t| t.to_ascii_lowercase());
@@ -125,9 +131,23 @@ pub(crate) fn parse<'a>(bytes: &'a [u8], budget: &Budget) -> Option<Mhtml<'a>> {
             if is_type && first_html.is_none() {
                 first_html = Some((part_headers.clone(), body));
             }
+            // Its keys, each charged as built: the location twice (as
+            // written and decoded) and the Content-ID.
+            let location = get("content-location").map(|l| l.trim().to_string());
+            let keys =
+                location.as_ref().map_or(0, |l| 2 * l.len()) + cid.as_ref().map_or(0, String::len);
+            if !budget.alloc(keys + 96) {
+                break;
+            }
+            let index = parts.len();
+            if let Some(l) = location {
+                by_decoded.entry(percent_decode(&l)).or_insert(index);
+                by_location.entry(l).or_insert(index);
+            }
+            if let Some(c) = cid {
+                by_cid.entry(c).or_insert(index);
+            }
             parts.push(Part {
-                location: get("content-location").map(|l| l.trim().to_string()),
-                cid,
                 encoding: encoding(get("content-transfer-encoding").as_deref()),
                 body,
             });
@@ -159,6 +179,9 @@ pub(crate) fn parse<'a>(bytes: &'a [u8], budget: &Budget) -> Option<Mhtml<'a>> {
     Some(Mhtml {
         bytes,
         parts,
+        by_location,
+        by_decoded,
+        by_cid,
         html,
         charset,
         location: get("content-location").map(|l| l.trim().to_string()),
@@ -171,29 +194,21 @@ impl Mhtml<'_> {
     /// body is unreadable or may decode to more than `limit` bytes (it is
     /// then not read). A `cid:` URL names a part by its `Content-ID`
     /// (percent-decoded, without case); any other by its
-    /// `Content-Location`, exactly or once both are percent-decoded.
+    /// `Content-Location`, exactly or once both are percent-decoded. Map
+    /// lookups and one decode of `src` (r2).
     pub(crate) fn part_for(&self, src: &str, limit: usize) -> Option<Option<Vec<u8>>> {
-        let part = match src.get(..4).filter(|s| s.eq_ignore_ascii_case("cid:")) {
+        let index = match src.get(..4).filter(|s| s.eq_ignore_ascii_case("cid:")) {
             Some(_) => {
                 let id = String::from_utf8_lossy(&percent_decode(&src[4..])).to_ascii_lowercase();
-                let id = content_id(&id);
-                self.parts
-                    .iter()
-                    .find(|p| p.cid.as_deref() == Some(id.as_str()))
+                self.by_cid.get(&content_id(&id)).copied()
             }
             None => self
-                .parts
-                .iter()
-                .find(|p| p.location.as_deref() == Some(src))
-                .or_else(|| {
-                    let want = percent_decode(src);
-                    self.parts.iter().find(|p| {
-                        p.location
-                            .as_deref()
-                            .is_some_and(|l| percent_decode(l) == want)
-                    })
-                }),
+                .by_location
+                .get(src)
+                .or_else(|| self.by_decoded.get(&percent_decode(src)))
+                .copied(),
         }?;
+        let part = &self.parts[index];
         let raw = &self.bytes[part.body.0..part.body.1];
         let bound = match part.encoding {
             Encoding::Base64 => raw.len() / 4 * 3 + 3,

@@ -409,12 +409,13 @@ pub(crate) fn usable_type(mime: &str) -> bool {
 /// descriptor that is neither is dropped. Parsed as the HTML standard's
 /// srcset parser splits it: a URL runs to white space (so a `data:` URI's
 /// commas are its own), a trailing comma ends a candidate with no
-/// descriptors, and descriptors run to a comma outside parentheses.
+/// descriptors, and descriptors run to a comma outside parentheses. It
+/// stops at [`MAX_CANDIDATES`] candidates (r2).
 pub(crate) fn srcset_candidates(srcset: &str) -> Vec<(String, f64)> {
     let mut first = Vec::new();
     let mut rest = Vec::new();
     let mut s = srcset;
-    loop {
+    while first.len() + rest.len() < MAX_CANDIDATES {
         s = s.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ',');
         if s.is_empty() {
             break;

@@ -779,6 +779,16 @@ const FORMATTING: [&str; 14] = [
     "a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small", "strike", "strong", "tt", "u",
 ];
 
+/// The `<source>`s of an open `<picture>` (#1898): that `picture`'s serial,
+/// how many sources were kept (at most [`html_image::MAX_SOURCES`]) and
+/// their `srcset` candidates, each list parsed once when kept, in order,
+/// at most [`html_image::MAX_CANDIDATES`] in all (r2).
+struct PictureSources {
+    serial: u64,
+    sources: usize,
+    candidates: Vec<(String, f64)>,
+}
+
 /// Elements whose content is not markup: skipped by the tokenizer and by
 /// the `<style>` scan (whose own `style` is the one it reads).
 const RAW_TEXT: [&str; 11] = [
@@ -2719,10 +2729,9 @@ struct Html<'a> {
     root_kids: Kids,
     /// The serial the next element opened takes ([`Elem::serial`]).
     next_serial: u64,
-    /// The `srcset`s of the `<source>`s an open `<picture>` has had so far
-    /// (#1898), with that `picture`'s serial: the ones a browser may pick
-    /// (no `media`, a known `type`), at most [`html_image::MAX_SOURCES`].
-    picture: Option<(u64, Vec<String>)>,
+    /// The `<source>`s an open `<picture>` has had so far (#1898): the
+    /// ones a browser may pick (no `media`, a known `type`).
+    picture: Option<PictureSources>,
     /// The `html` and `body` elements' backgrounds (#1894), once each is
     /// seen: the page colour.
     page_fill: [Option<Option<String>>; 2],
@@ -3942,7 +3951,6 @@ impl<'a> Html<'a> {
         };
         let mut src = attrs.src.as_deref().unwrap_or("").trim().to_string();
         let alt = html_image::alt_text(attrs.alt.as_deref().unwrap_or(""));
-        let candidates = self.image_candidates(attrs);
         let props = self.run_props();
         // A picture in a URL link keeps it as its click link (#1999), as
         // Word does; an anchor link's picture is outside the link.
@@ -3953,9 +3961,13 @@ impl<'a> Html<'a> {
         };
         // A `src` that gives nothing falls back on the `srcset`s (#1898):
         // the first candidate that gives an image, its size in CSS pixels
-        // by its density.
+        // by its density. They are read only then (r2).
         let mut found = images.source(&src, budget);
         if matches!(found, Source::Unresolved) {
+            let candidates = self.image_candidates(attrs);
+            let Some(images) = self.images.as_mut() else {
+                return;
+            };
             for (url, density) in candidates {
                 if let Source::Media {
                     rid,
@@ -3977,6 +3989,9 @@ impl<'a> Html<'a> {
             }
         }
         let src = src.as_str();
+        let Some(images) = self.images.as_mut() else {
+            return;
+        };
         let (rid, pixels, svg) = match found {
             Source::Media {
                 rid,
@@ -4105,13 +4120,30 @@ impl<'a> Html<'a> {
         let Some(srcset) = attrs.srcset.as_deref() else {
             return;
         };
-        if self.picture.as_ref().is_none_or(|(s, _)| *s != serial) {
-            self.picture = Some((serial, Vec::new()));
+        if self.picture.as_ref().is_none_or(|p| p.serial != serial) {
+            self.picture = Some(PictureSources {
+                serial,
+                sources: 0,
+                candidates: Vec::new(),
+            });
         }
-        if let Some((_, sources)) = self.picture.as_mut() {
-            if sources.len() < html_image::MAX_SOURCES && self.budget.alloc(srcset.len() + 24) {
-                sources.push(srcset.to_string());
+        let budget = self.budget;
+        let Some(p) = self.picture.as_mut() else {
+            return;
+        };
+        // Each kept source's list parsed once, here (r2), within the cap.
+        if p.sources >= html_image::MAX_SOURCES
+            || p.candidates.len() >= html_image::MAX_CANDIDATES
+            || !budget.scanned(srcset.len())
+        {
+            return;
+        }
+        p.sources += 1;
+        for c in html_image::srcset_candidates(srcset) {
+            if p.candidates.len() >= html_image::MAX_CANDIDATES || !budget.alloc(c.0.len() + 32) {
+                break;
             }
+            p.candidates.push(c);
         }
     }
 
@@ -4120,25 +4152,22 @@ impl<'a> Html<'a> {
     /// `<picture>` it is in, each list's candidates as
     /// [`html_image::srcset_candidates`] orders them; at most
     /// [`html_image::MAX_CANDIDATES`] in all.
+    /// Called only once its `src` has given nothing (r2): its own list is
+    /// scanned then (charged), the sources' were parsed when kept.
     fn image_candidates(&self, attrs: &Attrs) -> Vec<(String, f64)> {
         let mut out = Vec::new();
-        let mut take = |srcset: &str| {
-            for c in html_image::srcset_candidates(srcset) {
-                if out.len() < html_image::MAX_CANDIDATES {
-                    out.push(c);
-                }
-            }
-        };
         if let Some(own) = attrs.srcset.as_deref() {
-            take(own);
-        }
-        if let (Some(serial), Some((kept, sources))) = (self.in_picture(), self.picture.as_ref()) {
-            if serial == *kept {
-                for s in sources {
-                    take(s);
-                }
+            if self.budget.scanned(own.len()) {
+                out = html_image::srcset_candidates(own);
             }
         }
+        if let (Some(serial), Some(p)) = (self.in_picture(), self.picture.as_ref()) {
+            if serial == p.serial {
+                let room = html_image::MAX_CANDIDATES.saturating_sub(out.len());
+                out.extend(p.candidates.iter().take(room).cloned());
+            }
+        }
+        out.truncate(html_image::MAX_CANDIDATES);
         out
     }
 

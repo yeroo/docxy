@@ -696,3 +696,30 @@ fn many_base_tags_that_never_close_scan_in_linear_time_r1_1898() {
     // One tag, the first `<base` to its `>`: its `href` is the base.
     assert_eq!(base.as_deref(), Some("img/"));
 }
+
+#[test]
+fn candidates_stop_at_the_cap_in_a_list_and_across_a_pictures_sources_r2_1898() {
+    let list: Vec<String> = (0..100)
+        .map(|i| format!("m{i}-missing.png {}x", i + 2))
+        .collect();
+    assert_eq!(
+        html_image::srcset_candidates(&list.join(", ")).len(),
+        html_image::MAX_CANDIDATES
+    );
+    // Twenty sources of one candidate each, and an own list of ten: the
+    // own ten first, then six of the sources', then nothing more is asked.
+    let own: Vec<String> = (0..10).map(|i| format!("own{i}-missing.png")).collect();
+    let mut page = String::from("<p><picture>");
+    for i in 0..20 {
+        page.push_str(&format!("<source srcset='s{i}-missing.png'>"));
+    }
+    page.push_str(&format!(
+        "<img src=missing.png srcset='{}'></picture></p>",
+        own.join(", ")
+    ));
+    let (_, asked) = import(&page);
+    let mut want = vec!["missing.png".to_string()];
+    want.extend(own.iter().cloned());
+    want.extend((0..6).map(|i| format!("s{i}-missing.png")));
+    assert_eq!(asked, want);
+}

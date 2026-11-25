@@ -63,7 +63,7 @@
 //! | html `decode` | the page as UTF-8 | ≤ 3 × input (one pass) |
 //! | html element stacks | elems / blocks / lists | ≤ `MAX_DEPTH` each; a close searches ≤ 256; an element keeps ≤ 32 classes of ≤ 64 bytes, an id ≤ 64, its look's strings ≤ 64 each, and its link (#1879) shared (`Rc`), ≤ `MAX_HREF` (4096) bytes, so a look's clone copies none of it |
 //! | html tag name | copied, matched | ≤ 32 bytes (`MAX_TAG`) |
-//! | html attributes | one scan a tag | the nineteen read (`style class id align color face size width bgcolor border cellpadding cellspacing colspan rowspan valign src alt height href`) copied, first of a name only |
+//! | html attributes | one scan a tag | the ones `Attrs` holds copied, first of a name only |
 //! | html `link_of` (#1879) | an `a`'s `href`, once per look computed | O(href), refused unread past 2 × `MAX_HREF`; within the attribute scan's cost |
 //! | html `<img>` (#1880) | its look; the picture run | as an element's look, without being pushed; the run's XML built (alt ≤ `MAX_ALT` 1024 chars) |
 //! | html `<img>` in a link (#1999) | its URL, once per distinct URL | ≤ `MAX_PICTURE_LINKS` (1000) URLs, a later one's picture unlinked; each built (twice the URL: the list and its index); their relationships added in one pass |
@@ -71,9 +71,9 @@
 //! | `ImageResolver` answer | the bytes another src resolves to | the resolver is told the limit (room, `MAX_IMAGE_BYTES` 64 MiB, what `MAX_MEDIA_BYTES` 128 MiB leaves); a longer answer dropped; decoded |
 //! | resolver calls, src cache | one call per distinct src | ≤ `MAX_IMAGES` (1000) calls; each cached src built (its length) |
 //! | html `<base href>` (#1898) | found by the `<style>` scan; each src resolved against it | ≤ `MAX_BASE` (4096) bytes, else none; a src's join O(base + src), within its resolver call |
-//! | `<img srcset>`, `<picture>` sources (#1898) | candidates parsed, each tried as a src | ≤ `MAX_SOURCES` (16) sources a picture, each built; ≤ `MAX_CANDIDATES` (16) tries an image, each a resolver call within `MAX_IMAGES` |
-//! | `mhtml::parse` (#1898) | the header blocks, the boundary scan, the parts | headers ≤ `MAX_HEADER` (16 KiB) each; the body scanned once (charged as scanned); ≤ `MAX_PARTS` (4096) parts, each built; the root part decoded |
-//! | `Mhtml::part_for` (#1898) | the part a src names, decoded | a search of ≤ `MAX_PARTS` parts per resolver call; refused unread unless its decoded bound fits the image's limit; decoded as a resolver answer |
+//! | `<img srcset>`, `<picture>` sources (#1898) | candidates parsed, each tried as a src | a source's list parsed once when kept (scanned, each candidate built), ≤ `MAX_SOURCES` (16) sources a picture; an `<img>`'s own list only once its `src` gave nothing (scanned); every parse stops at `MAX_CANDIDATES` (16), and so do an image's tries, each a resolver call within `MAX_IMAGES` |
+//! | `mhtml::parse` (#1898) | the header blocks, the boundary scan, the parts | headers ≤ `MAX_HEADER` (16 KiB) each; the body scanned once (charged as scanned); ≤ `MAX_PARTS` (4096) parts, each built with its keys (its location as written and percent-decoded, its Content-ID: decoded once, charged as built); the root part decoded |
+//! | `Mhtml::part_for` (#1898) | the part a src names, decoded | map lookups and one percent-decode of the src per resolver call; refused unread unless its decoded bound fits the image's limit; decoded as a resolver answer |
 //! | `Images::add` | a medium equal to one kept | work (len/16) per kept medium of the same length; kept media ≤ `MAX_MEDIA_BYTES` in all, so a converting child holds ≤ 3 × 128 MiB of them (import, package, the copy a save clones) |
 //! | html `entities` | each `&` and the name after it | O(name), within the one pass |
 //! | html list marker | text kept | ≤ 32 bytes |

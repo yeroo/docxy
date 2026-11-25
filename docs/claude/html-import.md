@@ -290,7 +290,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   the `<picture>` that is its innermost open element (`Html::picture`, by
   the picture's serial; at most `MAX_SOURCES` (16), each a `<source>`
   without `media` and with no `type` or a PNG/JPEG/GIF/BMP/WebP/SVG one,
-  `html_image::usable_type`). `html_image::srcset_candidates` splits a
+  `html_image::usable_type`; each kept source's list parsed once, when it
+  is kept, into `PictureSources`; the `<img>`'s own list only once its
+  `src` gave nothing). `html_image::srcset_candidates` splits a
   list as the HTML standard's parser does (a URL runs to white space, so a
   `data:` URI keeps its commas) and orders it `1x`/bare first, then as
   written; at most `MAX_CANDIDATES` (16) tries, each a resolver call within
