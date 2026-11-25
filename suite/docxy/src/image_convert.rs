@@ -243,7 +243,7 @@ mod tests {
     /// before any pixel is decoded (r2).
     #[test]
     fn a_webp_past_the_allocation_limit_is_refused_by_it_1898() {
-        assert!(10_000u64 * 10_000 * 4 > MAX_DECODE_ALLOC);
+        const { assert!(10_000u64 * 10_000 * 4 > MAX_DECODE_ALLOC) };
         match decode_webp(&vp8l_header(10_000, 10_000)) {
             Err(image::ImageError::Limits(_)) => {}
             other => panic!("not refused by the limits: {other:?}"),
