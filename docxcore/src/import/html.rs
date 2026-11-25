@@ -581,8 +581,12 @@ struct Look {
     /// An image's, row's or cell's own `height` (not inherited; a row's
     /// and cell's in twips only, #1894).
     own_height: Option<Width>,
-    /// A table's own `max-width` (not inherited, #1894).
+    /// A table's or image's own `max-width` (not inherited, #1894; an
+    /// image's, #1898).
     own_max_width: Option<Width>,
+    /// An image's own `max-height` in twips (not inherited, #1898): an
+    /// absolute length only (a percentage of an auto height is none).
+    own_max_height: Option<u32>,
     /// A table's or cell's own border lines (not inherited, #1894), top,
     /// right, bottom, left: its `tblBorders` / `tcBorders`.
     own_frame: [Option<ParBorder>; 4],
@@ -1069,6 +1073,29 @@ fn img_attr_twips(v: &str) -> Option<u32> {
     (!pct).then(|| saturating_twips(n * 15.0))
 }
 
+/// An `<img>`'s `width` attribute (#1898): [`img_attr_twips`]'s pixels,
+/// or a percentage of the containing width, resolved when it is placed.
+fn img_attr_width(v: &str) -> Option<Width> {
+    let (n, pct) = attr_length(v)?;
+    Some(if pct {
+        Width::Pct(n)
+    } else {
+        Width::Twips(saturating_twips(n * 15.0))
+    })
+}
+
+/// An image's absolute CSS length in twips, not capped at a page (#1880
+/// r2): `None` when negative or not absolute.
+fn img_twips(len: Len, font_pt: f64) -> Option<u32> {
+    let t = len.points(font_pt).map(|p| (p * 20.0).round())?;
+    (t >= 0.0).then(|| saturating_twips(t))
+}
+
+/// `pct` percent of `of` twips, rounded, saturating (#1898).
+fn pct_of(of: u32, pct: f64) -> u32 {
+    saturating_twips(f64::from(of) * pct / 100.0)
+}
+
 /// Twips as a `u32`, rounded, saturating at its range.
 fn saturating_twips(t: f64) -> u32 {
     t.round().clamp(0.0, f64::from(u32::MAX)) as u32
@@ -1228,6 +1255,7 @@ impl Cascade {
         look.own_width = None;
         look.own_height = None;
         look.own_max_width = None;
+        look.own_max_height = None;
         look.own_frame = [None; 4];
         look.own_rule_ink = [Some(None); 2];
         look.own_radius = None;
@@ -1480,10 +1508,11 @@ impl Cascade {
             }
         }
         if tag == "img" {
-            // An image's box is in pixels; a percentage has no container
-            // width to resolve against.
+            // An image's box is in pixels; a percentage `width` is of its
+            // containing width, resolved when it is placed (#1898), and a
+            // percentage `height` is of an auto height: none.
             let px = |v: Option<&str>| v.and_then(img_attr_twips).map(Width::Twips);
-            self.look.own_width = px(attrs.width.as_deref());
+            self.look.own_width = attrs.width.as_deref().and_then(img_attr_width);
             self.look.own_height = px(attrs.height.as_deref());
         }
         if tag == "font" {
@@ -1540,15 +1569,46 @@ impl Cascade {
                 };
                 if w.eq_ignore_ascii_case("auto") {
                     *side = None;
-                } else if let Some(len) = css::length(w) {
-                    // A percentage leaves the attribute's size (an e-mail's
-                    // `width="600" style="width:100%"`).
-                    if len.unit != css::Unit::Percent {
+                } else if let Some(len) = css::length(w).filter(|l| l.v >= 0.0) {
+                    if len.unit == css::Unit::Percent {
+                        // A percentage width is of the containing width,
+                        // resolved when the picture is placed (#1898); a
+                        // percentage height is of an auto height, so
+                        // `auto`, as a browser computes it.
+                        *side = (d.name == "width").then_some(Width::Pct(len.v));
+                    } else if let Some(t) = img_twips(len, pt) {
                         // Not capped at a page's width (#1880 r2): the
                         // box is scaled to the body as a whole.
-                        let twips = len.points(pt).map(|p| (p * 20.0).round());
-                        if let Some(t) = twips.filter(|&t| t >= 0.0) {
-                            *side = Some(Width::Twips(saturating_twips(t)));
+                        *side = Some(Width::Twips(t));
+                    }
+                }
+            }
+            // An image's `max-width` / `max-height` (#1898): `none` clears
+            // it; a width's percentage is of the containing width, a
+            // height's is none (its container's height is auto).
+            "max-width" | "max-height" if self.is_img => {
+                let m = v.trim();
+                let pt = font_pt(&self.look.run);
+                let width = d.name == "max-width";
+                if m.eq_ignore_ascii_case("none") {
+                    if width {
+                        self.look.own_max_width = None;
+                    } else {
+                        self.look.own_max_height = None;
+                    }
+                } else if let Some(len) = css::length(m).filter(|l| l.v >= 0.0) {
+                    match (width, len.unit == css::Unit::Percent) {
+                        (true, true) => self.look.own_max_width = Some(Width::Pct(len.v)),
+                        (true, false) => {
+                            if let Some(t) = img_twips(len, pt) {
+                                self.look.own_max_width = Some(Width::Twips(t));
+                            }
+                        }
+                        (false, true) => self.look.own_max_height = None,
+                        (false, false) => {
+                            if let Some(t) = img_twips(len, pt) {
+                                self.look.own_max_height = Some(t);
+                            }
                         }
                     }
                 }
@@ -3745,14 +3805,21 @@ impl<'a> Html<'a> {
         if look.run.vanish {
             return;
         }
+        // A percentage is of the containing width (#1898).
+        let room = self.image_room(&look);
         let side = |w: Option<Width>| match w {
             Some(Width::Twips(t)) => Some(t),
-            _ => None,
+            Some(Width::Pct(p)) => Some(pct_of(room, p)),
+            None => None,
         };
         let (width, height) = (side(look.own_width), side(look.own_height));
         if width == Some(0) || height == Some(0) {
             return;
         }
+        let max = html_image::MaxBox {
+            width: side(look.own_max_width),
+            height: look.own_max_height,
+        };
         let src = attrs.src.as_deref().unwrap_or("").trim();
         let alt = html_image::alt_text(attrs.alt.as_deref().unwrap_or(""));
         let props = self.run_props();
@@ -3772,7 +3839,10 @@ impl<'a> Html<'a> {
         let block = look
             .own_block
             .then(|| look.own_place.unwrap_or(Align::Left));
-        let declared = html_image::declared_box(width, height, pixels);
+        // Its `max-width` / `max-height` (#1898) bound the box the page
+        // declares, before the fit to the body.
+        let declared =
+            html_image::declared_box(width, height, pixels).map(|b| max.clamp(b, width, height));
         let Some(box_twips) = declared.map(html_image::fit_to_body) else {
             if !alt.is_empty() {
                 self.begin_block_object(block);
@@ -3812,6 +3882,46 @@ impl<'a> Html<'a> {
         self.out.object(Inline::Raw(raw), heap);
         self.para_start = false;
         self.end_block_object(block);
+    }
+
+    /// The width an image whose look is `look` is laid out in, in twips
+    /// (#1898), as the page declares it, at most the body's: outside a
+    /// cell, the body less the indents of the blocks around it (a centred
+    /// fixed-width box's included, #1922); inside one, the innermost
+    /// cell's (or card's, #1927) content width less the indents of the
+    /// blocks inside it. A cell is as wide as its own width, else its
+    /// table's; a percentage is of its table's, a table's of the room
+    /// around it. Walked from the outside in, one step per open element.
+    fn image_room(&self, look: &Look) -> u32 {
+        let body = i64::from(html_table::BODY_TWIPS);
+        let width = |w: Option<Width>, of: i64| match w {
+            Some(Width::Twips(t)) => i64::from(t),
+            Some(Width::Pct(p)) => i64::from(pct_of(of.clamp(0, body) as u32, p)),
+            None => of,
+        };
+        let pads =
+            |l: &Look| i64::from(l.own_padding[1].unwrap_or(0) + l.own_padding[3].unwrap_or(0));
+        let outside = |room: i64, l: &Look| room - i64::from(l.indent) - i64::from(l.indent_right);
+        // The content width of the innermost cell so far, and the width of
+        // the innermost table.
+        let mut room = body;
+        let mut table = body;
+        let mut parent: Option<&Look> = None;
+        for e in &self.elems {
+            if e.key.tag == "table" {
+                table = width(e.look.own_width, outside(room, &e.look).max(0));
+            } else if e.kind == Kind::Cell {
+                room = width(e.look.own_width, table) - pads(&e.look);
+            } else if e.look.own_card {
+                // A card's look starts afresh (#1927): its parent's indents
+                // are around it.
+                let around = parent.map_or(room, |p| outside(room, p)).max(0);
+                room = width(e.look.own_width, around) - pads(&e.look);
+            }
+            room = room.clamp(0, body);
+            parent = Some(&e.look);
+        }
+        outside(room, look).clamp(0, body) as u32
     }
 
     /// Before a block image's content (`block`: its place): end the text
@@ -7221,7 +7331,7 @@ mod image_tests {
     }
 
     #[test]
-    fn css_lengths_beat_the_attributes_and_auto_and_percent_do_not() {
+    fn css_lengths_beat_the_attributes_and_auto_and_a_percent_is_of_the_body() {
         let (d, _, _) = with_images(
             "<style>img.w { width: 80px }</style>\
              <p><img src=a.png width=200 style='width:100px'>\
@@ -7239,8 +7349,10 @@ mod image_tests {
                 (200 * PX, 100 * PX),
                 // `auto` clears the attribute: the pixels.
                 (40 * PX, 20 * PX),
-                (200 * PX, 100 * PX),
-                (40 * PX, 20 * PX),
+                // A percentage, CSS or attribute, is of the containing
+                // width (#1898): half the body, the height by the aspect.
+                (5895 * 635, 2947 * 635),
+                (5895 * 635, 2947 * 635),
                 // The rule's width beats the attribute's height's aspect.
                 (80 * PX, 10 * PX),
                 (96 * PX, 48 * PX),
@@ -11109,3 +11221,8 @@ mod table_1894_tests {
         assert!(!pkg.has_display_background_shape());
     }
 }
+
+// The images leftovers of #1880 (#1898), kept out of this long file.
+#[cfg(test)]
+#[path = "html_tests_1898.rs"]
+mod tests_1898;

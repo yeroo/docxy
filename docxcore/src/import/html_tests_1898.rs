@@ -1,0 +1,214 @@
+//! The images leftovers of #1880 (#1898): percentage sizes and
+//! `max-width` / `max-height`, `<base href>`, `srcset` and `<picture>`,
+//! MHTML, SVG and WebP.
+
+use super::*;
+use crate::image::inline_extent;
+use crate::import::paragraph_texts;
+
+/// A PNG header of `w` x `h` pixels: enough for `image::sniff`.
+pub(super) fn png(w: u32, h: u32) -> Vec<u8> {
+    let mut out = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    out.extend(w.to_be_bytes());
+    out.extend(h.to_be_bytes());
+    out.extend([8, 2, 0, 0, 0, 0, 0, 0, 0]);
+    out
+}
+
+/// `html` imported with a resolver giving a 40 x 20 PNG for any src but
+/// `missing…`: the import and the srcs asked for.
+fn import(html: &str) -> (HtmlImport, Vec<String>) {
+    let mut asked = Vec::new();
+    let mut resolve = |src: &str, _: usize| {
+        asked.push(src.to_string());
+        (!src.contains("missing")).then(|| png(40, 20))
+    };
+    let got = import_html_within(html.as_bytes(), &Budget::standard(), Some(&mut resolve)).unwrap();
+    (got, asked)
+}
+
+/// Every picture run of `blocks`, tables (nested too) in reading order.
+pub(super) fn pictures(blocks: &[DocBlock]) -> Vec<&str> {
+    let mut out = Vec::new();
+    for b in blocks {
+        match b {
+            DocBlock::Paragraph(p) => {
+                for i in &p.content {
+                    if let Inline::Raw(raw) = i {
+                        if inline_extent(raw).is_some() {
+                            out.push(raw.as_str());
+                        }
+                    }
+                }
+            }
+            DocBlock::Table(t) => {
+                for cell in t.rows.iter().flat_map(|r| &r.cells) {
+                    out.extend(pictures(&cell.blocks));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Each picture's extent, in twips.
+fn twips(html: &str) -> Vec<(i64, i64)> {
+    let (got, _) = import(html);
+    pictures(&got.document.body)
+        .iter()
+        .map(|r| {
+            let (cx, cy) = inline_extent(r).unwrap();
+            (cx / 635, cy / 635)
+        })
+        .collect()
+}
+
+const BODY: i64 = html_table::BODY_TWIPS as i64;
+
+#[test]
+fn a_percentage_width_is_of_the_body_outside_a_cell_1898() {
+    assert_eq!(
+        twips("<p><img src=a.png width=50%><img src=a.png style='width:25%'></p>"),
+        // 25% of 11790 twips rounds up.
+        [(BODY / 2, BODY / 4), (2948, 1474)]
+    );
+    // CSS over the attribute, either way.
+    assert_eq!(
+        twips(
+            "<p><img src=a.png width=50% style='width:300px'><img src=a.png width=300 style='width:100%'></p>"
+        ),
+        [(4500, 2250), (BODY, BODY / 2)]
+    );
+}
+
+#[test]
+fn a_percentage_width_is_of_the_room_a_blocks_indents_leave_1898() {
+    // A centred `max-width` wrapper (#1922, #1894) is the room.
+    assert_eq!(
+        twips(
+            "<div style='max-width:600px;margin:0 auto'><img src=a.png style='width:100%'></div>"
+        ),
+        [(9000, 4500)]
+    );
+    // A padded block.
+    assert_eq!(
+        twips("<div style='padding:0 30px'><img src=a.png width=100%></div>"),
+        [(BODY - 900, (BODY - 900) / 2)]
+    );
+}
+
+#[test]
+fn a_percentage_width_in_a_cell_is_of_its_cells_content_1898() {
+    // The cell's own width, less its padding.
+    assert_eq!(
+        twips(
+            "<table><tr><td width=400 style='padding:0 20px'><img src=a.png width=100%></td></tr></table>"
+        ),
+        [(5400, 2700)]
+    );
+    // A cell without one: its table's.
+    assert_eq!(
+        twips("<table width=600><tr><td><img src=a.png width=100%></td></tr></table>"),
+        [(9000, 4500)]
+    );
+    // A percentage cell of its table's; a percentage table of the room
+    // around it: the outer cell's.
+    assert_eq!(
+        twips(
+            "<table width=600 cellpadding=0><tr><td><table width=50%><tr><td width=50%>\
+             <img src=a.png width=100%></td></tr></table></td></tr></table>"
+        ),
+        [(2250, 1125)]
+    );
+    // A block in the cell indents it.
+    assert_eq!(
+        twips(
+            "<table width=600><tr><td><div style='margin-left:100px'><img src=a.png width=50%></div></td></tr></table>"
+        ),
+        [(3750, 1875)]
+    );
+}
+
+#[test]
+fn a_percentage_width_in_a_card_is_of_the_cards_content_1898() {
+    assert_eq!(
+        twips(
+            "<table width=600><tr><td><div style='background:#eee;width:400px;padding:10px'>\
+             <img src=a.png width=100%></div></td></tr></table>"
+        ),
+        [(5700, 2850)]
+    );
+}
+
+#[test]
+fn a_percentage_height_is_auto_1898() {
+    // CSS `height:50%` clears the attribute's height: the width's aspect.
+    assert_eq!(
+        twips(
+            "<p><img src=a.png width=100 height=100 style='height:50%'><img src=a.png width=100 height=50%></p>"
+        ),
+        [(1500, 750), (1500, 750)]
+    );
+}
+
+#[test]
+fn max_width_and_max_height_clamp_the_declared_box_1898() {
+    assert_eq!(
+        twips(
+            "<p><img src=a.png style='max-width:20px'>\
+             <img src=a.png width=100 style='max-width:50px'>\
+             <img src=a.png width=100 height=100 style='max-width:50px'>\
+             <img src=a.png height=50 style='max-width:50px'>\
+             <img src=a.png style='max-height:10px'>\
+             <img src=a.png width=100 height=100 style='max-height:20px'>\
+             <img src=a.png style='width:100%;max-width:50%'>\
+             <img src=a.png style='max-width:20px;max-width:none'>\
+             <img src=a.png style='max-height:50%'></p>"
+        ),
+        [
+            // Unsized: its pixels, scaled together.
+            (300, 150),
+            // A declared width, its height from the aspect: both scale.
+            (750, 375),
+            // Both declared: the width alone.
+            (750, 1500),
+            // A declared height, its width from the aspect: the width alone.
+            (750, 750),
+            (300, 150),
+            (1500, 300),
+            // A percentage `max-width` is of the containing width.
+            (BODY / 2, BODY / 4),
+            // `none` clears it; a percentage `max-height` is none.
+            (600, 300),
+            (600, 300),
+        ]
+    );
+}
+
+#[test]
+fn max_width_clamps_before_the_body_fit_and_the_crop_uses_the_clamped_box_1898() {
+    let (got, _) = import(
+        "<p><img src=a.png width=2000 height=400 style='max-width:400px;border-radius:50px'></p>",
+    );
+    let pics = pictures(&got.document.body);
+    assert_eq!(inline_extent(pics[0]), Some((400 * 9525, 400 * 9525)));
+    // 50px of a 400 x 400 box is 12.5% of its short side: not an ellipse.
+    assert_eq!(
+        crate::image::inline_shape(pics[0]),
+        crate::image::PictureShape::RoundRect { adj: 12500 }
+    );
+}
+
+#[test]
+fn max_width_bounds_a_sized_placeholder_and_leaves_an_unsized_one_1898() {
+    // A refused image with one side: a square, clamped together.
+    assert_eq!(
+        twips("<p><img src=missing.png width=200 alt=x style='max-width:100px'></p>"),
+        [(1500, 1500)]
+    );
+    // None: its alt text, nothing to clamp.
+    let (got, _) = import("<p><img src=missing.png alt=Logo style='max-width:100px'></p>");
+    assert!(pictures(&got.document.body).is_empty());
+    assert_eq!(paragraph_texts(&got.document), ["Logo"]);
+}

@@ -395,6 +395,41 @@ pub(crate) fn declared_box(
     })
 }
 
+/// An image's `max-width` and `max-height` in twips (#1898), resolved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MaxBox {
+    pub(crate) width: Option<u32>,
+    pub(crate) height: Option<u32>,
+}
+
+impl MaxBox {
+    /// The declared box `(w, h)` within these bounds, as a browser
+    /// clamps a replaced element: a side over its bound takes the bound,
+    /// and the other side scales with it when it was not declared
+    /// (`width` / `height`, the declared sides) but came from the aspect
+    /// (or a placeholder's square); a declared side stays as it is.
+    pub(crate) fn clamp(
+        self,
+        (mut w, mut h): (u128, u128),
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> (u128, u128) {
+        if let Some(m) = self.width.map(u128::from).filter(|&m| w > m) {
+            if height.is_none() {
+                h = h * m / w;
+            }
+            w = m;
+        }
+        if let Some(m) = self.height.map(u128::from).filter(|&m| h > m) {
+            if width.is_none() {
+                w = w * m / h;
+            }
+            h = m;
+        }
+        (w, h)
+    }
+}
+
 /// A declared box wider than the body scaled down to the body's width,
 /// keeping its aspect.
 pub(crate) fn fit_to_body((w, h): (u128, u128)) -> (u64, u64) {

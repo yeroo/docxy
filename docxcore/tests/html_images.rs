@@ -136,8 +136,9 @@ fn pictures_take_their_declared_size_the_aspect_or_their_pixels() {
             (200 * PX, 50 * PX),
             // The logo again at `width="60"`.
             (60 * PX, 30 * PX),
-            // `width="150"` beside `width:100%` and `height:auto`.
-            (150 * PX, 50 * PX),
+            // `width:100%` (#1898) of the body, over `width="150"`, held
+            // to `max-width:600px`; `height:auto` by the 30 x 10 aspect.
+            (600 * PX, 200 * PX),
         ]
     );
     let descrs: Vec<Option<&str>> = pics.iter().map(|r| descr(r)).collect();
