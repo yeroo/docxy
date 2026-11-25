@@ -52,9 +52,6 @@ pub struct Cache {
     /// package has no parts stamp, so each entry remembers the bytes it was
     /// made from ([`Cache::sheet_image`]).
     sheet: HashMap<String, SheetPicture>,
-    /// Whether a picture's media is an HTML import's placeholder (#1898),
-    /// for the stamp of `images`.
-    placeholders: HashMap<PictureKey, bool>,
 }
 
 /// One media part a sheet draws: the address and length of the bytes its
@@ -72,7 +69,6 @@ impl Cache {
             self.retired
                 .extend(self.stale.drain().filter_map(|(_, img)| img));
             self.stale = std::mem::take(&mut self.images);
-            self.placeholders.clear();
             self.stamp = stamp;
         }
     }
@@ -369,34 +365,13 @@ impl<'a> Pictures<'a> {
     }
 }
 
-impl Pictures<'_> {
-    /// Whether the inline picture run `raw` in `part` shows an HTML
-    /// import's placeholder (#1898): its media is
-    /// [`docxcore::import::html_image::PLACEHOLDER_PNG`], an image the
-    /// import could not get. Cached until the package's parts change.
-    pub fn is_placeholder(&self, part: &str, raw: &str) -> bool {
-        let Some(rid) = docxcore::image::inline_embed(raw) else {
-            return false;
-        };
-        let key = (part.to_string(), rid);
-        if let Some(&hit) = self.cache.borrow().placeholders.get(&key) {
-            return hit;
-        }
-        let found = self
-            .pkg
-            .part_rel_target(part, &key.1)
-            .and_then(|t| self.pkg.part(&t))
-            .is_some_and(|b| b == docxcore::import::html_image::PLACEHOLDER_PNG);
-        self.cache.borrow_mut().placeholders.insert(key, found);
-        found
-    }
-}
-
 /// The Alt Text a picture's frame shows inside it (#1898): the run's
-/// [`docxcore::image::inline_alt_text`] when the frame shows no image
-/// (`shown`: it shows one) or shows an HTML import's placeholder.
-pub fn frame_alt(raw: &str, shown: bool, placeholder: bool) -> Option<String> {
-    if shown && !placeholder {
+/// [`docxcore::image::inline_alt_text`] when the frame shows no `image`, or
+/// shows an HTML import's placeholder (its bytes are
+/// [`docxcore::import::html_image::PLACEHOLDER_PNG`], an image the import
+/// could not get).
+pub fn frame_alt(raw: &str, image: Option<&Image>) -> Option<String> {
+    if image.is_some_and(|i| i.bytes != docxcore::import::html_image::PLACEHOLDER_PNG) {
         return None;
     }
     docxcore::image::inline_alt_text(raw).filter(|a| !a.trim().is_empty())
@@ -492,11 +467,6 @@ pub fn scope<'a>(pictures: Option<&'a Pictures<'a>>, part: Option<&'a str>) -> O
 impl<'a> Scope<'a> {
     pub fn image(&self, raw: &str) -> Option<Arc<Image>> {
         self.pictures.image(self.part, raw)
-    }
-
-    /// Whether `raw` shows an HTML import's placeholder (#1898).
-    pub fn is_placeholder(&self, raw: &str) -> bool {
-        self.pictures.is_placeholder(self.part, raw)
     }
 
     /// This scope, recording each picture it draws in `drawn` (#1926).
@@ -1100,10 +1070,12 @@ mod tests {
         )
     }
 
-    /// Only the HTML import's placeholder bytes are a placeholder (#1898):
-    /// another 1 x 1 PNG is a picture.
+    /// A frame shows its Alt Text only when it shows no image or the HTML
+    /// import's placeholder (#1898): the image the view drew from the
+    /// package, its bytes the placeholder's; another 1 x 1 PNG is a
+    /// picture.
     #[test]
-    fn only_the_placeholders_bytes_are_a_placeholder_1898() {
+    fn a_frame_shows_its_alt_text_without_an_image_or_over_the_placeholder_1898() {
         use docxcore::import::html_image::PLACEHOLDER_PNG;
         let mut pkg = new_package(Document { body: vec![] });
         let body = "word/document.xml";
@@ -1115,26 +1087,21 @@ mod tests {
         let real = add(&mut pkg, body, &other);
         let cache = RefCell::new(Cache::default());
         let pics = Pictures::new(&pkg, &cache);
-        assert!(pics.is_placeholder(body, &run_with_alt(&held, "Logo")));
-        assert!(!pics.is_placeholder(body, &run_with_alt(&real, "Logo")));
-        assert!(!pics.is_placeholder(body, &run_with_alt("rIdNone", "Logo")));
-        assert!(!pics.is_placeholder(body, "<w:r/>"));
-        // Asked again: from the cache, the same.
-        assert!(pics.is_placeholder(body, &run_with_alt(&held, "Logo")));
-    }
-
-    /// A frame shows its Alt Text only when it shows no image or the
-    /// placeholder (#1898).
-    #[test]
-    fn a_frame_shows_its_alt_text_without_an_image_or_over_the_placeholder_1898() {
-        let raw = run_with_alt("rId1", "Company logo");
-        assert_eq!(frame_alt(&raw, true, false), None);
-        assert_eq!(frame_alt(&raw, true, true).as_deref(), Some("Company logo"));
+        let shown = |raw: &str| frame_alt(raw, pics.image(body, raw).as_deref());
+        let placeholder = run_with_alt(&held, "Company logo");
+        assert!(
+            pics.image(body, &placeholder).is_some(),
+            "drawn as an image"
+        );
+        assert_eq!(shown(&placeholder).as_deref(), Some("Company logo"));
+        assert_eq!(shown(&run_with_alt(&real, "Company logo")), None);
+        // No image: the frame alone.
         assert_eq!(
-            frame_alt(&raw, false, false).as_deref(),
+            shown(&run_with_alt("rIdNone", "Company logo")).as_deref(),
             Some("Company logo")
         );
-        assert_eq!(frame_alt(&run_with_alt("rId1", " "), false, false), None);
-        assert_eq!(frame_alt(&run_with_alt("rId1", ""), true, true), None);
+        // No text to show.
+        assert_eq!(shown(&run_with_alt("rIdNone", " ")), None);
+        assert_eq!(shown(&run_with_alt(&held, "")), None);
     }
 }

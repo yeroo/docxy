@@ -41358,11 +41358,7 @@ fn paragraph_el(
                     let radius = pictures::picture_radius(shape, w, h);
                     let frame = div().flex_none().w(px(w)).h(px(h)).relative();
                     let image = pics.and_then(|p| p.image(xml));
-                    let alt = pictures::frame_alt(
-                        xml,
-                        image.is_some(),
-                        pics.is_some_and(|p| p.is_placeholder(xml)),
-                    );
+                    let alt = pictures::frame_alt(xml, image.as_deref());
                     let frame = match image {
                         Some(image) => frame.child(
                             img(image)

@@ -187,9 +187,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
 - A frame that shows no image (the frame-only fallback), or shows an HTML
   import's placeholder (its media is exactly
   `docxcore::import::html_image::PLACEHOLDER_PNG`, an image the import
-  could not get; `Pictures::is_placeholder`, cached per (part, rid) until
-  the parts stamp changes), draws the picture's Alt Text
-  (`image::inline_alt_text`, `pictures::frame_alt`) inside it (#1898):
+  could not get: `pictures::frame_alt` compares the bytes of the image the
+  view already drew, no second read), draws the picture's Alt Text
+  (`image::inline_alt_text`) inside it (#1898):
   `picture_alt_el`, 12 px (9 pt) at the zoom in the palette's `dim`, inset
   2 px at the zoom (at most a quarter of the frame each way), wrapped at
   the frame's width and clipped to it. A picture that loads
