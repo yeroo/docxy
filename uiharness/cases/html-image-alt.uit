@@ -1,0 +1,17 @@
+# An HTML import's placeholder shows its Alt Text (#1898): a sized
+# `<img>` whose src gives nothing (here a `cid:` src, which a page opened
+# from disk never resolves) imports as a placeholder picture, a grey box
+# whose `wp:docPr descr` is the `alt`, and the view draws that text inside
+# its frame, dim, wrapped and clipped. A picture that loads draws none.
+# `doc`'s `flow.pictures.N.alt` is the text the last frame drew in that
+# picture, else null. The read follows a `shot`, which waits for the frame.
+
+test issue 1898 a placeholder picture shows its alt text
+  open copy:../fixtures/html-image-alt.html
+  call window-size {"w":1100,"h":800}
+  shot window
+  call doc {}
+  assert reply.flow.pictures.0.width is 200
+  assert reply.flow.pictures.0.alt is Company logo
+  assert reply.flow.pictures.1.width is 120
+  assert reply.flow.pictures.1.alt is null

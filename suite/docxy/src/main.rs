@@ -40216,6 +40216,25 @@ fn picture_frame_px(cx: i64, cy: i64, zoom: f32) -> (f32, f32) {
 /// ([`picture_frame_px`]), scaled down with its aspect kept to `room` (a
 /// flow view's width for it) when wider; `None` draws its frame's size.
 /// At least 1 px each way.
+/// A picture frame's Alt Text (#1898), laid over its `w` x `h` px frame:
+/// 9 pt at `zoom` in `ink`, inset 2 px, wrapped at the frame's width and
+/// clipped to it.
+fn picture_alt_el(text: &str, w: f32, h: f32, zoom: f32, ink: Hsla) -> Div {
+    let inset = (2.0 * zoom).min(w / 4.0).min(h / 4.0);
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .w(px(w))
+        .h(px(h))
+        .p(px(inset))
+        .overflow_hidden()
+        .text_size(px(12.0 * zoom))
+        .line_height(px(15.0 * zoom))
+        .text_color(ink)
+        .child(text.to_string())
+}
+
 fn shown_picture_px(cx: i64, cy: i64, zoom: f32, room: Option<f32>) -> (f32, f32) {
     let (w, h) = picture_frame_px(cx, cy, zoom);
     match room {
@@ -41328,13 +41347,22 @@ fn paragraph_el(
                 // rectangle (Word's Crop to Shape, an HTML `border-radius`,
                 // #1926), the picture and the frame's border are clipped to
                 // its corners. A flow view draws one wider than its room
-                // scaled down to it, its aspect kept (#1963).
+                // scaled down to it, its aspect kept (#1963). A frame that
+                // shows no image, or an HTML import's placeholder (an image
+                // the import could not get), shows the picture's Alt Text
+                // inside it, dim, small, wrapped and clipped (#1898).
                 if let Some((cx_emu, cy_emu)) = docxcore::image::inline_extent(xml) {
                     let (w, h) = shown_picture_px(cx_emu, cy_emu, zoom, pic_room);
                     let shape = docxcore::image::inline_shape(xml);
                     let radius = pictures::picture_radius(shape, w, h);
-                    let frame = div().flex_none().w(px(w)).h(px(h));
-                    let frame = match pics.and_then(|p| p.image(xml)) {
+                    let frame = div().flex_none().w(px(w)).h(px(h)).relative();
+                    let image = pics.and_then(|p| p.image(xml));
+                    let alt = pictures::frame_alt(
+                        xml,
+                        image.is_some(),
+                        pics.is_some_and(|p| p.is_placeholder(xml)),
+                    );
+                    let frame = match image {
                         Some(image) => frame.child(
                             img(image)
                                 .w(px(w))
@@ -41343,6 +41371,10 @@ fn paragraph_el(
                                 .rounded(px(radius)),
                         ),
                         None => frame.border_1().border_color(pal.dim),
+                    };
+                    let frame = match &alt {
+                        Some(text) => frame.child(picture_alt_el(text, w, h, zoom, pal.dim)),
+                        None => frame,
                     };
                     let frame = frame.rounded(px(radius));
                     let frame = match flow.pictures {
@@ -41364,6 +41396,7 @@ fn paragraph_el(
                             height: h,
                             radius,
                             shape,
+                            alt,
                         });
                     }
                     // Its Alt Text as a tooltip on hover, in the embedded

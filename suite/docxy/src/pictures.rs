@@ -52,6 +52,9 @@ pub struct Cache {
     /// package has no parts stamp, so each entry remembers the bytes it was
     /// made from ([`Cache::sheet_image`]).
     sheet: HashMap<String, SheetPicture>,
+    /// Whether a picture's media is an HTML import's placeholder (#1898),
+    /// for the stamp of `images`.
+    placeholders: HashMap<PictureKey, bool>,
 }
 
 /// One media part a sheet draws: the address and length of the bytes its
@@ -69,6 +72,7 @@ impl Cache {
             self.retired
                 .extend(self.stale.drain().filter_map(|(_, img)| img));
             self.stale = std::mem::take(&mut self.images);
+            self.placeholders.clear();
             self.stamp = stamp;
         }
     }
@@ -365,6 +369,39 @@ impl<'a> Pictures<'a> {
     }
 }
 
+impl Pictures<'_> {
+    /// Whether the inline picture run `raw` in `part` shows an HTML
+    /// import's placeholder (#1898): its media is
+    /// [`docxcore::import::html_image::PLACEHOLDER_PNG`], an image the
+    /// import could not get. Cached until the package's parts change.
+    pub fn is_placeholder(&self, part: &str, raw: &str) -> bool {
+        let Some(rid) = docxcore::image::inline_embed(raw) else {
+            return false;
+        };
+        let key = (part.to_string(), rid);
+        if let Some(&hit) = self.cache.borrow().placeholders.get(&key) {
+            return hit;
+        }
+        let found = self
+            .pkg
+            .part_rel_target(part, &key.1)
+            .and_then(|t| self.pkg.part(&t))
+            .is_some_and(|b| b == docxcore::import::html_image::PLACEHOLDER_PNG);
+        self.cache.borrow_mut().placeholders.insert(key, found);
+        found
+    }
+}
+
+/// The Alt Text a picture's frame shows inside it (#1898): the run's
+/// [`docxcore::image::inline_alt_text`] when the frame shows no image
+/// (`shown`: it shows one) or shows an HTML import's placeholder.
+pub fn frame_alt(raw: &str, shown: bool, placeholder: bool) -> Option<String> {
+    if shown && !placeholder {
+        return None;
+    }
+    docxcore::image::inline_alt_text(raw).filter(|a| !a.trim().is_empty())
+}
+
 /// A story's pictures: the tab's pictures and the part the story came from.
 #[derive(Clone, Copy)]
 pub struct Scope<'a> {
@@ -377,12 +414,14 @@ pub struct Scope<'a> {
 
 /// One inline picture as the view drew it (#1926): its frame (px) and the
 /// corner radius its crop shape gave the image's clip.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DrawnPicture {
     pub width: f32,
     pub height: f32,
     pub radius: f32,
     pub shape: docxcore::image::PictureShape,
+    /// The Alt Text drawn inside its frame (#1898), if any.
+    pub alt: Option<String>,
 }
 
 /// The body's inline pictures built in the frame last drawn, in order
@@ -410,7 +449,8 @@ pub fn picture_radius(shape: docxcore::image::PictureShape, w: f32, h: f32) -> f
 /// The harness's view of [`DrawnPictures`] (#1926): each picture's
 /// `width`, `height` and clip `radius` in px (to 0.1), its `shape`
 /// (`rect`, `ellipse`, `roundRect`) and `round`, whether its clip is a
-/// circle's or a stadium's (the radius is half the shorter side).
+/// circle's or a stadium's (the radius is half the shorter side), and the
+/// `alt` text drawn in its frame (#1898), else null.
 pub fn drawn_pictures_json(drawn: &DrawnPictures) -> ctlcore::json::Json {
     use ctlcore::json::Json;
     let tenth = |v: f32| Json::Num((f64::from(v) * 10.0).round() / 10.0);
@@ -433,6 +473,7 @@ pub fn drawn_pictures_json(drawn: &DrawnPictures) -> ctlcore::json::Json {
                         "round",
                         Json::Bool(p.radius > 0.0 && p.radius * 2.0 >= p.width.min(p.height) - 0.1),
                     ),
+                    ("alt", p.alt.clone().map_or(Json::Null, Json::Str)),
                 ])
             })
             .collect(),
@@ -451,6 +492,11 @@ pub fn scope<'a>(pictures: Option<&'a Pictures<'a>>, part: Option<&'a str>) -> O
 impl<'a> Scope<'a> {
     pub fn image(&self, raw: &str) -> Option<Arc<Image>> {
         self.pictures.image(self.part, raw)
+    }
+
+    /// Whether `raw` shows an HTML import's placeholder (#1898).
+    pub fn is_placeholder(&self, raw: &str) -> bool {
+        self.pictures.is_placeholder(self.part, raw)
     }
 
     /// This scope, recording each picture it draws in `drawn` (#1926).
@@ -1028,14 +1074,67 @@ mod tests {
                 height: h,
                 radius: picture_radius(shape, w, h),
                 shape,
+                alt: (shape == Rect).then(|| "Logo".to_string()),
             });
         }
         let json = drawn_pictures_json(&drawn).to_string();
         assert_eq!(
             json,
-            "[{\"width\":32,\"height\":32,\"radius\":16,\"shape\":\"ellipse\",\"round\":true},\
-             {\"width\":120,\"height\":40,\"radius\":8,\"shape\":\"roundRect\",\"round\":false},\
-             {\"width\":200,\"height\":100,\"radius\":0,\"shape\":\"rect\",\"round\":false}]"
+            "[{\"width\":32,\"height\":32,\"radius\":16,\"shape\":\"ellipse\",\"round\":true,\"alt\":null},\
+             {\"width\":120,\"height\":40,\"radius\":8,\"shape\":\"roundRect\",\"round\":false,\"alt\":null},\
+             {\"width\":200,\"height\":100,\"radius\":0,\"shape\":\"rect\",\"round\":false,\"alt\":\"Logo\"}]"
         );
+    }
+
+    /// A picture run naming `rid` with Alt Text `alt`.
+    fn run_with_alt(rid: &str, alt: &str) -> String {
+        docxcore::image::inline_picture_run_shaped(
+            rid,
+            9525,
+            9525,
+            1,
+            "x",
+            alt,
+            None,
+            docxcore::image::PictureShape::Rect,
+        )
+    }
+
+    /// Only the HTML import's placeholder bytes are a placeholder (#1898):
+    /// another 1 x 1 PNG is a picture.
+    #[test]
+    fn only_the_placeholders_bytes_are_a_placeholder_1898() {
+        use docxcore::import::html_image::PLACEHOLDER_PNG;
+        let mut pkg = new_package(Document { body: vec![] });
+        let body = "word/document.xml";
+        let held = add(&mut pkg, body, &PLACEHOLDER_PNG);
+        let mut other = PLACEHOLDER_PNG.to_vec();
+        // The same 1 x 1 header, another pixel.
+        let at = other.len() - 20;
+        other[at] ^= 1;
+        let real = add(&mut pkg, body, &other);
+        let cache = RefCell::new(Cache::default());
+        let pics = Pictures::new(&pkg, &cache);
+        assert!(pics.is_placeholder(body, &run_with_alt(&held, "Logo")));
+        assert!(!pics.is_placeholder(body, &run_with_alt(&real, "Logo")));
+        assert!(!pics.is_placeholder(body, &run_with_alt("rIdNone", "Logo")));
+        assert!(!pics.is_placeholder(body, "<w:r/>"));
+        // Asked again: from the cache, the same.
+        assert!(pics.is_placeholder(body, &run_with_alt(&held, "Logo")));
+    }
+
+    /// A frame shows its Alt Text only when it shows no image or the
+    /// placeholder (#1898).
+    #[test]
+    fn a_frame_shows_its_alt_text_without_an_image_or_over_the_placeholder_1898() {
+        let raw = run_with_alt("rId1", "Company logo");
+        assert_eq!(frame_alt(&raw, true, false), None);
+        assert_eq!(frame_alt(&raw, true, true).as_deref(), Some("Company logo"));
+        assert_eq!(
+            frame_alt(&raw, false, false).as_deref(),
+            Some("Company logo")
+        );
+        assert_eq!(frame_alt(&run_with_alt("rId1", " "), false, false), None);
+        assert_eq!(frame_alt(&run_with_alt("rId1", ""), true, true), None);
     }
 }
