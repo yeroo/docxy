@@ -73,7 +73,9 @@
 //! side margins auto is indented evenly.
 
 use super::css::{self, Color, Decl, ElemKey, Len, LineHeight, Path, StyleSheet};
-use super::html_image::{self, ImageResolver, Images, ImportedLink, ImportedMedia, Source};
+use super::html_image::{
+    self, ImageConverter, ImageResolver, Images, ImportedLink, ImportedMedia, Source,
+};
 use super::html_table::{self, CellSpec, MAX_TABLE_NESTING, TableSpec, VAlign, Width};
 use super::{
     Budget, Builder, FlowTail, Link, MAX_DEPTH, TOO_BIG, heading_props, marker_is_numbered,
@@ -212,6 +214,22 @@ pub fn import_html_with(
     import_html_within(bytes, &Budget::standard(), Some(resolve))
 }
 
+/// [`import_html_with`], with SVG and WebP pictures (#1898) turned into
+/// PNG by `convert` ([`ImageConverter`]): a WebP is then a PNG medium; an
+/// SVG is a PNG medium and the SVG kept as a medium of its own (`svg`,
+/// `image/svg+xml`, not an image [`crate::image::sniff`] reads), which its
+/// picture's blip names in Word's `asvg:svgBlip` extension, so a caller
+/// that builds its package without [`HtmlImport::package`] maps that rid
+/// too. Without this (every other entry) every medium sniffs as PNG, JPEG,
+/// GIF or BMP, and an SVG or WebP is a placeholder.
+pub fn import_html_with_converter(
+    bytes: &[u8],
+    resolve: &mut ImageResolver<'_>,
+    convert: &mut ImageConverter<'_>,
+) -> Result<HtmlImport, String> {
+    import_html_converting(bytes, &Budget::standard(), Some(resolve), Some(convert))
+}
+
 /// [`import_html`] against `budget`, with images when `images` gives a
 /// resolver. Decoding, the `<style>` scan and the tokenizer are each one
 /// forward pass over the input (charged once here); the style sheet is
@@ -222,6 +240,17 @@ pub(crate) fn import_html_within(
     bytes: &[u8],
     budget: &Budget,
     images: Option<&mut ImageResolver<'_>>,
+) -> Result<HtmlImport, String> {
+    import_html_converting(bytes, budget, images, None)
+}
+
+/// [`import_html_within`] with a converter of SVG and WebP pictures
+/// (#1898), used only when `images` gives a resolver.
+fn import_html_converting(
+    bytes: &[u8],
+    budget: &Budget,
+    images: Option<&mut ImageResolver<'_>>,
+    convert: Option<&mut ImageConverter<'_>>,
 ) -> Result<HtmlImport, String> {
     // Three passes: decoding, the `<style>` scan, then the tokenizer.
     if !budget.work(3 * (bytes.len() / 16 + 1)) {
@@ -240,12 +269,12 @@ pub(crate) fn import_html_within(
                     Some(part) => part,
                     None => caller(src, limit),
                 };
-                import_decoded(&text, budget, Some(&mut resolve), url)
+                import_decoded(&text, budget, Some(&mut resolve), convert, url)
             }
-            None => import_decoded(&text, budget, None, url),
+            None => import_decoded(&text, budget, None, None, url),
         };
     }
-    import_decoded(&decode(bytes), budget, images, None)
+    import_decoded(&decode(bytes), budget, images, convert, None)
 }
 
 /// [`import_html_within`] of a page already decoded, so no charset is read
@@ -256,7 +285,7 @@ pub(crate) fn import_html_str_within(text: &str, budget: &Budget) -> Result<Docu
     if !budget.work(2 * (text.len() / 16 + 1)) {
         return Err(TOO_BIG.into());
     }
-    import_decoded(text, budget, None, None).map(|h| h.document)
+    import_decoded(text, budget, None, None, None).map(|h| h.document)
 }
 
 /// The import of the decoded page `text`, as [`import_html_within`] says;
@@ -266,6 +295,7 @@ fn import_decoded(
     text: &str,
     budget: &Budget,
     images: Option<&mut ImageResolver<'_>>,
+    convert: Option<&mut ImageConverter<'_>>,
     url: Option<&str>,
 ) -> Result<HtmlImport, String> {
     let (css, base) = collect_styles(text);
@@ -278,6 +308,9 @@ fn import_decoded(
     if let Some(resolve) = images {
         let mut images = Images::new(resolve);
         images.set_base(base);
+        if let Some(convert) = convert {
+            images.set_converter(convert);
+        }
         h.images = Some(images);
     }
     h.run();
@@ -3905,12 +3938,19 @@ impl<'a> Html<'a> {
         let mut found = images.source(&src, budget);
         if matches!(found, Source::Unresolved) {
             for (url, density) in candidates {
-                if let Source::Media { rid, width, height } = images.source(&url, budget) {
+                if let Source::Media {
+                    rid,
+                    width,
+                    height,
+                    svg,
+                } = images.source(&url, budget)
+                {
                     let css = |px: u32| ((f64::from(px) / density).round() as u32).max(1);
                     found = Source::Media {
                         rid,
                         width: css(width),
                         height: css(height),
+                        svg,
                     };
                     src = url;
                     break;
@@ -3918,9 +3958,14 @@ impl<'a> Html<'a> {
             }
         }
         let src = src.as_str();
-        let (rid, pixels) = match found {
-            Source::Media { rid, width, height } => (Some(rid), Some((width, height))),
-            Source::Unresolved => (None, None),
+        let (rid, pixels, svg) = match found {
+            Source::Media {
+                rid,
+                width,
+                height,
+                svg,
+            } => (Some(rid), Some((width, height)), svg),
+            Source::Unresolved => (None, None, None),
         };
         // A block image (#1922) is a paragraph of its own, placed by its
         // margins or its container's `-webkit-` alignment.
@@ -3957,6 +4002,11 @@ impl<'a> Html<'a> {
         });
         let raw =
             crate::image::inline_picture_run_shaped(&rid, cx, cy, id, &name, &alt, outline, shape);
+        // A picture converted from an SVG names it too (#1898), as Word's
+        // own SVG pictures do: the PNG is the fallback.
+        let raw = svg
+            .and_then(|s| crate::image::with_svg_blip(&raw, &s))
+            .unwrap_or(raw);
         let raw = match link.as_deref() {
             Some(Link::Url(url)) => images
                 .link_rid(url, budget)

@@ -603,3 +603,200 @@ fn sniff_takes_mhtml_by_its_headers_and_its_extension_1898() {
     );
     assert_eq!(sniff(b"Note: x\nmore", ""), Format::Unknown);
 }
+
+const SVG: &str = "<?xml version=\"1.0\"?>\n<!-- logo -->\n<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"x\" [<!ENTITY a \"b\">]>\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"30\" height=\"10\"><rect width=\"30\" height=\"10\"/></svg>";
+const WEBP: &[u8] = b"RIFF\x1a\x00\x00\x00WEBPVP8L\x0d\x00\x00\x00\x2f\x00\x00\x00\x10\x07\x10\x11\x11\x88\x88\xfe\x07\x00";
+
+fn data_uri(mime: &str, bytes: &[u8]) -> String {
+    format!("data:{mime};base64,{}", b64(bytes).replace("\r\n", ""))
+}
+
+/// `html` imported with a resolver that refuses everything and a converter
+/// making a 4 x 2 PNG of an SVG (CSS size 30 x 10) and a 6 x 3 PNG of a
+/// WebP (CSS size its pixels): the import and what it was asked to convert.
+fn converting(html: &str) -> (HtmlImport, Vec<ConvertKind>) {
+    let mut kinds = Vec::new();
+    let mut resolve = |_: &str, _: usize| None;
+    let mut convert = |kind: ConvertKind, _: &[u8], _: usize| {
+        kinds.push(kind);
+        Some(match kind {
+            ConvertKind::Svg => html_image::ConvertedImage {
+                png: png(4, 2),
+                width: 30,
+                height: 10,
+            },
+            ConvertKind::Webp => html_image::ConvertedImage {
+                png: png(6, 3),
+                width: 6,
+                height: 3,
+            },
+        })
+    };
+    let got = import_html_with_converter(html.as_bytes(), &mut resolve, &mut convert).unwrap();
+    (got, kinds)
+}
+
+use html_image::ConvertKind;
+
+#[test]
+fn convertible_tells_svg_and_webp_apart_from_the_rest_1898() {
+    use html_image::convertible as c;
+    assert_eq!(c(SVG.as_bytes()), Some(ConvertKind::Svg));
+    assert_eq!(c(b"\xEF\xBB\xBF  <svg>"), Some(ConvertKind::Svg));
+    assert_eq!(c(b"<svg\nviewBox='0 0 1 1'/>"), Some(ConvertKind::Svg));
+    assert_eq!(c(WEBP), Some(ConvertKind::Webp));
+    assert_eq!(c(b"<svgx>"), None);
+    assert_eq!(c(b"<html><svg></svg></html>"), None);
+    assert_eq!(c(b"<!-- unclosed <svg>"), None);
+    assert_eq!(c(b"RIFF\0\0\0\0WAVEfmt "), None);
+    assert_eq!(c(&png(1, 1)), None);
+}
+
+#[test]
+fn without_a_converter_svg_and_webp_stay_placeholders_1898() {
+    let page = format!(
+        "<p><img src='{}' width=30 height=10 alt=Logo><img src='{}' alt=Pic></p>",
+        data_uri("image/svg+xml", SVG.as_bytes()),
+        data_uri("image/webp", WEBP)
+    );
+    let (got, _) = import(&page);
+    // The sized one a placeholder, the unsized one its alt text.
+    assert_eq!(got.media.len(), 1);
+    assert_eq!(got.media[0].bytes, html_image::PLACEHOLDER_PNG);
+    assert_eq!(paragraph_texts(&got.document)[0].trim(), "Pic");
+    // Every medium sniffs.
+    assert!(
+        got.media
+            .iter()
+            .all(|m| crate::image::sniff(&m.bytes).is_some())
+    );
+}
+
+#[test]
+fn a_converted_webp_is_a_png_medium_sized_by_the_converter_1898() {
+    let (got, kinds) = converting(&format!(
+        "<p><img src='{}'></p>",
+        data_uri("image/webp", WEBP)
+    ));
+    assert_eq!(kinds, [ConvertKind::Webp]);
+    assert_eq!(got.media.len(), 1);
+    assert_eq!(got.media[0].bytes, png(6, 3));
+    let pics = pictures(&got.document.body);
+    assert_eq!(inline_extent(pics[0]), Some((6 * 9525, 3 * 9525)));
+    assert!(!pics[0].contains("svgBlip"));
+}
+
+#[test]
+fn a_converted_svg_keeps_the_svg_beside_its_png_fallback_once_1898() {
+    let uri = data_uri("image/svg+xml", SVG.as_bytes());
+    let (got, kinds) = converting(&format!(
+        "<p><img src='{uri}'><img src='{uri}' width=60></p>"
+    ));
+    // Converted once for the two pictures.
+    assert_eq!(kinds, [ConvertKind::Svg]);
+    assert_eq!(got.media.len(), 2);
+    assert_eq!(got.media[0].bytes, png(4, 2));
+    assert_eq!(got.media[1].bytes, SVG.as_bytes());
+    assert_eq!(got.media[1].info.ext, "svg");
+    assert_eq!(got.media[1].info.content_type, "image/svg+xml");
+    let pics = pictures(&got.document.body);
+    // The SVG's own size (30 x 10), not the PNG's pixels.
+    assert_eq!(inline_extent(pics[0]), Some((30 * 9525, 10 * 9525)));
+    assert_eq!(inline_extent(pics[1]), Some((60 * 9525, 20 * 9525)));
+    // The blip names the PNG; Word's SVG extension names the SVG.
+    for p in &pics {
+        assert_eq!(
+            crate::image::inline_embeds(p),
+            [got.media[0].rid.clone(), got.media[1].rid.clone()]
+        );
+        assert!(p.contains(crate::image::SVG_BLIP_EXT_URI), "{p}");
+    }
+}
+
+#[test]
+fn a_converted_svgs_package_holds_both_parts_and_both_rels_1898() {
+    let uri = data_uri("image/svg+xml", SVG.as_bytes());
+    let (got, _) = converting(&format!("<p>x<img src='{uri}'></p>"));
+    let pkg = got.package();
+    let saved = crate::package::save_package(&pkg);
+    let pkg = crate::package::load_package(&saved).unwrap();
+    let names = pkg.part_names();
+    let png_part = names.iter().find(|n| n.ends_with(".png")).unwrap();
+    let svg_part = names.iter().find(|n| n.ends_with(".svg")).unwrap();
+    assert_eq!(pkg.part(svg_part), Some(SVG.as_bytes()));
+    assert_eq!(pkg.part(png_part), Some(png(4, 2).as_slice()));
+    let ct = String::from_utf8(pkg.part("[Content_Types].xml").unwrap().to_vec()).unwrap();
+    assert!(ct.contains("image/svg+xml"), "{ct}");
+    // The picture's two rids are the package's relationships to them.
+    let pics = pictures(&pkg.document.body);
+    let rids = crate::image::inline_embeds(pics[0]);
+    let rels =
+        String::from_utf8(pkg.part("word/_rels/document.xml.rels").unwrap().to_vec()).unwrap();
+    for (rid, part) in rids.iter().zip([png_part, svg_part]) {
+        let target = part.trim_start_matches("word/");
+        assert!(
+            rels.contains(&format!("Id=\"{rid}\"")) && rels.contains(target),
+            "{rid} {target}: {rels}"
+        );
+    }
+}
+
+#[test]
+fn a_converters_bad_answer_leaves_a_placeholder_1898() {
+    let uri = data_uri("image/svg+xml", SVG.as_bytes());
+    let page = format!("<p><img src='{uri}' width=5 height=5></p>");
+    for answer in [
+        // Not a PNG.
+        Some(html_image::ConvertedImage {
+            png: b"GIF89a\x01\x00\x01\x00".to_vec(),
+            width: 1,
+            height: 1,
+        }),
+        // No size.
+        Some(html_image::ConvertedImage {
+            png: png(1, 1),
+            width: 0,
+            height: 1,
+        }),
+        None,
+    ] {
+        let mut resolve = |_: &str, _: usize| None;
+        let mut convert = |_: ConvertKind, _: &[u8], _: usize| answer.clone();
+        let got = import_html_with_converter(page.as_bytes(), &mut resolve, &mut convert).unwrap();
+        assert_eq!(got.media.len(), 1);
+        assert_eq!(got.media[0].bytes, html_image::PLACEHOLDER_PNG);
+    }
+    // One longer than the limit it was told.
+    let mut resolve = |_: &str, _: usize| None;
+    let mut convert = |_: ConvertKind, _: &[u8], limit: usize| {
+        let mut png = png(1, 1);
+        png.resize(limit + 1, 0);
+        Some(html_image::ConvertedImage {
+            png,
+            width: 1,
+            height: 1,
+        })
+    };
+    let got = import_html_with_converter(page.as_bytes(), &mut resolve, &mut convert).unwrap();
+    assert_eq!(got.media[0].bytes, html_image::PLACEHOLDER_PNG);
+}
+
+#[test]
+fn with_svg_blip_opens_a_self_closing_blip_only_1898() {
+    let raw = crate::image::inline_picture_run_shaped(
+        "rId1",
+        10,
+        10,
+        1,
+        "x",
+        "",
+        None,
+        crate::image::PictureShape::Rect,
+    );
+    let with = crate::image::with_svg_blip(&raw, "rId2").unwrap();
+    assert_eq!(crate::image::inline_embeds(&with), ["rId1", "rId2"]);
+    assert!(with.contains("</a:blip><a:stretch>"), "{with}");
+    // A blip with children already is left alone.
+    assert_eq!(crate::image::with_svg_blip(&with, "rId3"), None);
+    assert_eq!(crate::image::with_svg_blip("<w:r/>", "rId3"), None);
+}

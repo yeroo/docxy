@@ -119,8 +119,10 @@ pub mod pdf;
 pub mod recover;
 pub mod rtf;
 
-pub use html::{HtmlImport, import_html, import_html_with};
-pub use html_image::{ImageResolver, ImportedLink, ImportedMedia};
+pub use html::{HtmlImport, import_html, import_html_with, import_html_with_converter};
+pub use html_image::{
+    ConvertKind, ConvertedImage, ImageConverter, ImageResolver, ImportedLink, ImportedMedia,
+};
 pub use pdf::import_pdf;
 pub use recover::{paragraph_count, recover_any_text, recover_docx_text};
 pub use rtf::import_rtf;

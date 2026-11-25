@@ -21,6 +21,33 @@ use std::collections::HashMap;
 /// answer is dropped, as is one whose bytes are not PNG, JPEG, GIF or BMP.
 pub type ImageResolver<'r> = dyn FnMut(&str, usize) -> Option<Vec<u8>> + 'r;
 
+/// What a caller's [`ImageConverter`] is asked to turn into PNG (#1898).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConvertKind {
+    /// An SVG document (`<svg` after an optional XML prolog, comments and
+    /// doctype).
+    Svg,
+    /// A WebP image (`RIFF` … `WEBP`).
+    Webp,
+}
+
+/// A picture a caller's [`ImageConverter`] made (#1898): PNG bytes and the
+/// size in CSS pixels the picture takes when the page gives none (for an
+/// SVG, its intrinsic size, whatever the PNG's pixels).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConvertedImage {
+    pub png: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Turns an image the import cannot embed as it is (SVG, WebP) into PNG
+/// (#1898), given its kind, its bytes and the most PNG bytes the import
+/// will take; `None` leaves it a placeholder. A longer answer, or one that
+/// is not a PNG of a nonzero size, is dropped. Called once per distinct
+/// image.
+pub type ImageConverter<'r> = dyn FnMut(ConvertKind, &[u8], usize) -> Option<ConvertedImage> + 'r;
+
 /// The most distinct srcs an import asks its resolver for; later ones are
 /// placeholders.
 pub const MAX_IMAGES: usize = 1000;
@@ -75,11 +102,13 @@ pub struct ImportedLink {
 
 /// What one `<img>` came to.
 pub(crate) enum Source {
-    /// A medium of the import: its rid and pixel size.
+    /// A medium of the import: its rid, its size in CSS pixels, and the rid
+    /// of the SVG it was converted from (#1898), if it was.
     Media {
         rid: String,
         width: u32,
         height: u32,
+        svg: Option<String>,
     },
     /// Nothing usable: a placeholder, or the alt text.
     Unresolved,
@@ -102,6 +131,15 @@ pub(crate) struct Images<'a> {
     /// The page's base URL (#1898): its `<base href>`, which every src
     /// but a `data:` one is resolved against ([`resolve_ref`]).
     base: Option<String>,
+    /// The caller's converter of SVG and WebP pictures (#1898), if any.
+    convert: Option<&'a mut ImageConverter<'a>>,
+    /// Each medium's size in CSS pixels (its pixels, or a conversion's
+    /// size) and the index of the SVG medium it was made from (#1898).
+    css: Vec<(u32, u32)>,
+    svg_of: Vec<Option<usize>>,
+    /// Each image converted so far, its source bytes and the PNG medium it
+    /// made (`None`: refused), so equal images convert once (#1898).
+    converted: Vec<(Vec<u8>, Option<usize>)>,
 }
 
 impl<'a> Images<'a> {
@@ -117,7 +155,16 @@ impl<'a> Images<'a> {
             links: Vec::new(),
             link_index: HashMap::new(),
             base: None,
+            convert: None,
+            css: Vec::new(),
+            svg_of: Vec::new(),
+            converted: Vec::new(),
         }
+    }
+
+    /// Turn SVG and WebP pictures into PNG through `convert` (#1898).
+    pub(crate) fn set_converter(&mut self, convert: &'a mut ImageConverter<'a>) {
+        self.convert = Some(convert);
     }
 
     /// Resolve every later src against `base` (#1898).
@@ -201,21 +248,91 @@ impl<'a> Images<'a> {
         };
         match index {
             Some(i) => {
-                let m = &self.media[i];
+                let (width, height) = self.css[i];
                 Source::Media {
-                    rid: m.rid.clone(),
-                    width: m.info.width,
-                    height: m.info.height,
+                    rid: self.media[i].rid.clone(),
+                    width,
+                    height,
+                    svg: self.svg_of[i].map(|s| self.media[s].rid.clone()),
                 }
             }
             None => Source::Unresolved,
         }
     }
 
+    /// Push a medium (its bytes already charged as decoded and within
+    /// [`MAX_MEDIA_BYTES`]): its index.
+    fn push(&mut self, bytes: Vec<u8>, info: ImageInfo, css: (u32, u32)) -> usize {
+        let index = self.media.len();
+        self.media_bytes += bytes.len();
+        self.media.push(ImportedMedia {
+            rid: local_rid(index),
+            bytes,
+            info,
+        });
+        self.css.push(css);
+        self.svg_of.push(None);
+        index
+    }
+
+    /// `bytes`, an SVG or WebP, as a PNG medium made by the caller's
+    /// converter (#1898), an SVG keeping its own medium beside it: the PNG
+    /// medium's index. `None` without a converter, or when it refuses.
+    fn add_converted(&mut self, bytes: Vec<u8>, budget: &Budget) -> Option<usize> {
+        let kind = convertible(&bytes)?;
+        for (src, made) in &self.converted {
+            if src.len() == bytes.len() {
+                if !budget.scanned(bytes.len()) {
+                    return None;
+                }
+                if *src == bytes {
+                    return *made;
+                }
+            }
+        }
+        let limit = self.limit(budget);
+        let convert = self.convert.as_mut()?;
+        let made = convert(kind, &bytes, limit)
+            .filter(|c| c.width > 0 && c.height > 0 && c.png.len() <= limit)
+            .and_then(|c| {
+                let info = image::sniff(&c.png).filter(|i| i.ext == "png")?;
+                Some((c, info))
+            });
+        let made = made.and_then(|(c, info)| {
+            let svg = kind == ConvertKind::Svg;
+            let kept = c.png.len() + if svg { bytes.len() } else { 0 };
+            if kept > MAX_MEDIA_BYTES.saturating_sub(self.media_bytes)
+                || !budget.take_bytes(c.png.len())
+                || !budget.keep::<ImportedMedia>(32)
+            {
+                return None;
+            }
+            let css = (c.width, c.height);
+            let png = self.push(c.png, info, css);
+            if svg {
+                let svg_info = ImageInfo {
+                    ext: "svg",
+                    content_type: "image/svg+xml",
+                    width: c.width,
+                    height: c.height,
+                };
+                let at = self.push(bytes.clone(), svg_info, css);
+                self.svg_of[png] = Some(at);
+            }
+            Some(png)
+        });
+        if budget.alloc(bytes.len() + 32) {
+            self.converted.push((bytes, made));
+        }
+        made
+    }
+
     /// Keep `bytes` (already charged as decoded) when they are an image:
     /// the medium holding the same bytes when there is one.
     fn add(&mut self, bytes: Vec<u8>, budget: &Budget) -> Option<usize> {
-        let info = image::sniff(&bytes)?;
+        let Some(info) = image::sniff(&bytes) else {
+            return self.add_converted(bytes, budget);
+        };
         for (i, m) in self.media.iter().enumerate() {
             if m.bytes.len() == bytes.len() {
                 if !budget.scanned(bytes.len()) {
@@ -231,14 +348,7 @@ impl<'a> Images<'a> {
         {
             return None;
         }
-        self.media_bytes += bytes.len();
-        let index = self.media.len();
-        self.media.push(ImportedMedia {
-            rid: local_rid(index),
-            bytes,
-            info,
-        });
-        Some(index)
+        Some(self.push(bytes, info, (info.width, info.height)))
     }
 
     /// The rid of the shared placeholder medium, made on first use (its
@@ -251,13 +361,7 @@ impl<'a> Images<'a> {
         if !budget.keep::<ImportedMedia>(PLACEHOLDER_PNG.len() + 16) {
             return None;
         }
-        let index = self.media.len();
-        self.media_bytes += PLACEHOLDER_PNG.len();
-        self.media.push(ImportedMedia {
-            rid: local_rid(index),
-            bytes: PLACEHOLDER_PNG.to_vec(),
-            info,
-        });
+        let index = self.push(PLACEHOLDER_PNG.to_vec(), info, (info.width, info.height));
         self.placeholder = Some(index);
         Some(self.media[index].rid.clone())
     }
@@ -488,6 +592,57 @@ fn remove_dot_segments(path: &str) -> String {
         joined.insert(0, '/');
     }
     joined
+}
+
+/// What a caller's converter could make of `bytes` (#1898): an SVG
+/// document (`<svg` after an optional byte-order mark, white space, XML
+/// declaration, processing instructions, comments and doctype, within the
+/// first 4 KiB) or a WebP (`RIFF`, a size, `WEBP`).
+pub(crate) fn convertible(bytes: &[u8]) -> Option<ConvertKind> {
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some(ConvertKind::Webp);
+    }
+    let head = &bytes[..bytes.len().min(4096)];
+    let mut s = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    loop {
+        s = s.trim_ascii_start();
+        let skip = |s: &[u8], open: &[u8], close: &[u8]| -> Option<usize> {
+            s.starts_with(open).then(|| {
+                super::find(&s[open.len()..], close).map(|i| open.len() + i + close.len())
+            })?
+        };
+        if let Some(n) = skip(s, b"<?", b"?>")
+            .or_else(|| skip(s, b"<!--", b"-->"))
+            .or_else(|| {
+                (s.len() >= 9 && s[..9].eq_ignore_ascii_case(b"<!doctype"))
+                    .then(|| doctype_end(s))
+                    .flatten()
+            })
+        {
+            s = &s[n..];
+            continue;
+        }
+        break;
+    }
+    (s.starts_with(b"<svg")
+        && s.get(4)
+            .is_some_and(|&b| b.is_ascii_whitespace() || b == b'>' || b == b'/'))
+    .then_some(ConvertKind::Svg)
+}
+
+/// The length of a `<!DOCTYPE …>` at the start of `s`, its internal subset
+/// (`[…]`) included.
+fn doctype_end(s: &[u8]) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, &b) in s.iter().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => depth = depth.saturating_sub(1),
+            b'>' if depth == 0 => return Some(i + 1),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Whether `src` is a `data:` URI (scheme case-insensitive).
