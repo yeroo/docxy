@@ -27,8 +27,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   table, scaled down to 100 in all); a spanned cell's width spreads what its
   columns lack over those without one; the rest share what is left, each at
   least 15 twips. The table is its own width, else its columns' when all
-  are known, else the room it has (outermost, the page's 11790-twip body,
-  #1928). Declared columns
+  are known, else the room it has (outermost, the page's body,
+  `Page::body`, #1944; 11790 twips on #1928's default page). Declared columns
   narrower than a declared table grow to it; wider ones widen the grid
   (tblW stays as declared). `tblW` is dxa, pct (fiftieths) or auto; every
   cell's `tcW` is its columns' sum. Web Layout and `ext::DocView` fit a pct or auto
@@ -106,9 +106,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
 - Fixed-width blocks: a `Kind::Block` with an absolute CSS `width` (not a
   percentage or `auto`; a negative or invalid one leaves the width
   before it) and both side margins auto gets
-  `max(0, (BODY_TWIPS - indent - indent_right - width) / 2)` more indent on
+  `max(0, (body - indent - indent_right - width) / 2)` more indent on
   each side, after its own box is added: a content box, so its padding is
-  outside the width. Its text alignment is unchanged. Inside a cell or a
+  outside the width (`body` is the page's, `Page::body`, #1944;
+  `BODY_TWIPS`, 11790, on #1928's default page). Its text alignment is
+  unchanged. Inside a cell or a
   card, centred in the cell's inner width when the table is laid out, only
   in a cell whose width the page declares (#1930: see "HTML import
   centring in cells").
@@ -140,7 +142,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
 - `layout` centres each paragraph in the cell's `inner` width (the one a
   nested table gets): box by box, outermost first, each in the room the
   enclosing ones' centring leaves, the body-level formula with `inner` for
-  `BODY_TWIPS`. A box wider than its room gets nothing. The indent stays
+  the page's body. A box wider than its room gets nothing. The indent stays
   at least 0 as at body level, and `ZERO_IND` goes once it moves.
 - Paragraph lines: `Look::border_left_boxes` / `border_right_boxes` count
   the boxes the block drawing each line is in. A line moves with those
@@ -252,7 +254,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   is of the containing width and a percentage height is `auto` (#1898,
   below); one side gives the other by the pixels' aspect, none the
   pixels; `max-width`/`max-height` clamp it (#1898); scaled down to the
-  body (11790 twips, #1928).
+  page's body (`Page::body`, #1944; 11790 twips on #1928's default page).
   Of the rest, only `tr`, `td` and `th` read `height`, as a row height
   (#1894).
 - Unresolved (refused, no room, not an image): sized, a picture over one
@@ -880,9 +882,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   skipped with every other at-rule. `StyleSheet::page_decls`: the unnamed
   pages' declarations, then the selected named page's, then the
   `!important` ones of both, each in source order (a later one wins). The
-  selected page is the one the first `page` declaration in the sheet's
-  source order names (a kept `@page` of that name, ASCII case-insensitive;
-  `auto` or an unknown name selects none). Whether an element matches that
+  selected page is the one named by the first `page` declaration (in
+  source order, of the blocks that may select one) that names a kept
+  `@page` (ASCII case-insensitive); `auto` and unknown names are passed
+  over, and with none left no page is selected. Whether an element matches that
   rule is not checked: Word's `div.WordSection1` wraps the whole body, and
   the import has one section, so a page of several WordSections takes the
   first selected page throughout.

@@ -171,14 +171,7 @@ fn page_size(value: &str) -> Option<(Option<u32>, Option<u32>)> {
             for t in &toks {
                 let len = css::length(t).filter(|l| l.unit != css::Unit::Percent)?;
                 // Out of range (negative too) is ignored, not unreadable.
-                let pt = len.points(css::BASE_PT)?;
-                let twips = (pt * 20.0).round();
-                sides.push(
-                    (0.0..=f64::from(u32::MAX))
-                        .contains(&twips)
-                        .then(|| side(twips as u32))
-                        .flatten(),
-                );
+                sides.push(page_twips(len).and_then(side));
             }
             let w = sides[0];
             let h = sides.get(1).copied().unwrap_or(w);

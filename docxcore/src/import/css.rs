@@ -1009,13 +1009,22 @@ impl StyleSheet {
     /// order, so that a later one wins per property: the unnamed `@page`'s,
     /// then the selected named page's, each in source order; then the
     /// `!important` ones of both, in the same order. The selected page is
-    /// the one the first `page` declaration (in source order, of the rule
-    /// blocks that may select a page) names, when a kept `@page` has that
-    /// name (ASCII case-insensitive); `auto` or an unknown name selects
-    /// none. Its importance is not considered, and nor is whether an
-    /// element matches its rule: a Word page's `div.WordSection1` wraps the
-    /// whole body, and an import has one section.
-    pub(crate) fn page_decls(&self) -> Vec<&Decl> {
+    /// the one named by the first `page` declaration (in source order, of
+    /// the blocks that may select one) that names a kept `@page` (ASCII
+    /// case-insensitive); `auto` and unknown names are passed over, and
+    /// with none left no page is selected. Its importance is not
+    /// considered, and nor is whether an element matches its rule: a Word
+    /// page's `div.WordSection1` wraps the whole body, and an import has
+    /// one section.
+    ///
+    /// Charged to `budget` up front: the head blocks' declarations, each
+    /// compared with at most [`MAX_PAGE_RULES`] page names (work
+    /// (decls × pages / 16 + 1)); once per import.
+    pub(crate) fn page_decls(&self, budget: &Budget) -> Vec<&Decl> {
+        let decls: usize = self.blocks[..self.page_blocks].iter().map(Vec::len).sum();
+        if !budget.work(decls.saturating_mul(self.pages.len()) / 16 + 1) {
+            return Vec::new();
+        }
         let named = |n: &str| {
             self.pages
                 .iter()
@@ -2796,7 +2805,7 @@ mod tests {
     #[test]
     fn page_decls_cascade_the_unnamed_then_the_selected_page_1944() {
         let b = budget();
-        let decls = |css: &str| values(StyleSheet::parse(css, &b).page_decls());
+        let decls = |css: &str| values(StyleSheet::parse(css, &b).page_decls(&b));
         // No page selected: the unnamed pages, in order.
         assert_eq!(
             decls("@page {margin:1in} @page N {margin:2in} @page {size:a4}"),
@@ -2820,6 +2829,10 @@ mod tests {
         );
         // `auto` and unknown names select none.
         assert!(decls("@page N {margin:1in} p {page:auto} q {page:M}").is_empty());
+        // The selection is charged: with no work left, no page (r2).
+        let sheet = StyleSheet::parse("@page {margin:1in}", &b);
+        assert_eq!(sheet.page_decls(&b).len(), 1);
+        assert!(sheet.page_decls(&Budget::new(1 << 20, 0)).is_empty());
         // Every rule named as selected applies, in order.
         assert_eq!(
             decls("@page N {margin:1in} @page n {size:a4} p {page:N}"),
@@ -2837,7 +2850,7 @@ mod tests {
         // The body part's rules apply, its page rule and `page` do not.
         assert_eq!(sheet.len(), 3);
         assert_eq!(sheet.pages.len(), 1);
-        assert!(sheet.page_decls().is_empty());
+        assert!(sheet.page_decls(&b).is_empty());
         // Rule order runs on across the parts.
         let hits = sheet.matching(&[key("q", None, None)][..], &b);
         assert_eq!(sheet.decls(hits[0])[0].value, "blue");

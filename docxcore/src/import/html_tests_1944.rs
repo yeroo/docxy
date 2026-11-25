@@ -307,8 +307,9 @@ fn the_outlook_fixture_s_generator_is_found_1944() {
     assert!(scan.outlook_mail);
     assert!(scan.css.contains("@page WordSection1"));
     // Its sheet would select Word's 1" page: only the Generator keeps it.
-    let sheet = StyleSheet::parse_split(&scan.css, scan.head_css, &Budget::standard());
-    let word = html_table::Page::from_decls(&sheet.page_decls());
+    let b = Budget::standard();
+    let sheet = StyleSheet::parse_split(&scan.css, scan.head_css, &b);
+    let word = html_table::Page::from_decls(&sheet.page_decls(&b));
     assert_eq!((word.left, word.top), (1440, 1440));
     let d = doc(html);
     assert_eq!(page(&d), DEFAULT);

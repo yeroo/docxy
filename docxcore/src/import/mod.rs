@@ -54,9 +54,10 @@
 //! | rtf `\listtext`, stylesheet names | text kept | ≤ 64 bytes each (`MAX_NAME`) |
 //! | rtf font table, heading styles | map entries | built per new entry |
 //! | `html::import_html` | decoding, the `<style>` scan, tokenizing | work (3 × input/16), up front |
-//! | html `prescan` | the `<style>` texts joined; each `<a>` tag's attributes read (#1912) | ≤ input; forward only (comments and raw-text elements skipped by one search each, an `<a>` tag passed over whole; an `<a` that never closes read to the end once, and no `<a` after it, r1); anchor names ≤ `MAX_BOOKMARKS` |
+//! | html `prescan` | the `<style>` texts joined; each `<a>` tag's attributes read (#1912); `<meta>` tags' attributes until the first Generator one, and the first `<body` tag's offset into the CSS (#1944) | ≤ input; forward only (comments and raw-text elements skipped by one search each, an `<a>` or `<meta>` tag passed over whole; an `<a` that never closes read to the end once, and no `<a` after it, r1; a `<meta` that never closes ends the Generator search); anchor names ≤ `MAX_BOOKMARKS` |
 //! | html `open_void` (#1912 r1) | a void or raw-text element's attributes, for a linked `id` | only when the page has an anchor link; scanned (attrs/16) |
-//! | `css::StyleSheet::parse` | the CSS, once; rules, declaration blocks | work (css/16); each rule and block built; ≤ `MAX_RULES` (10 000) rules, more ignored; brace nesting counted, never recursed |
+//! | `css::StyleSheet::parse_split` | the CSS, once, in two parts (head, body; #1944); rules, declaration blocks, `@page` rules | each part `scanned` (work css/16); each rule, block and `@page` rule built; ≤ `MAX_RULES` (10 000) rules and ≤ `MAX_PAGE_RULES` (64) `@page` rules, more ignored; an `@page` prelude read only to the first `;`, `{`, `}` or quote, bytes the at-rule skip passes anyway (#1944 r1); brace nesting counted, never recursed |
+//! | `css::StyleSheet::page_decls` (#1944) | the head blocks' declarations, each against ≤ 64 page names | work (decls × pages / 16 + 1), once per import |
 //! | css selector | compounds | ≤ `MAX_COMPOUNDS` (32), longer dropped; names ≤ 64 bytes |
 //! | `css::StyleSheet::matching` | rules examined per element opened | work per rule examined (only those indexed by the element's id, classes, tag, or universal) |
 //! | `css::Selector::matches` | reach sets, one per compound | work (depth/4 + 1) a compound: O(compounds × depth), no backtracking |

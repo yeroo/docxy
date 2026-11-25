@@ -337,7 +337,7 @@ fn import_decoded(
     // document with a page of its own) and a classic-Outlook mail (whose
     // `@page` is Word's default, not the sender's): #1928's page.
     let page = if package && !outlook_mail {
-        html_table::Page::from_decls(&sheet.page_decls())
+        html_table::Page::from_decls(&sheet.page_decls(budget))
     } else {
         html_table::Page::DEFAULT
     };
