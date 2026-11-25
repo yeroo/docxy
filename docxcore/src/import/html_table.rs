@@ -11,34 +11,250 @@
 //! Units: widths are twips (a CSS px is 15), border sizes eighths of a
 //! point (a px is 6).
 
-use super::{Budget, MAX_COLUMNS};
+use super::{Budget, MAX_COLUMNS, css};
 use crate::model::{Block, Cell, ParBorder, Paragraph, Row, Table, VMerge};
 
 /// The narrowest column, in twips (one px).
 pub(crate) const MIN_COL: u32 = 15;
 /// Word's widest page measure, in twips (22"): no width exceeds it.
 pub(crate) const MAX_TWIPS: u32 = 31_680;
-/// The page an HTML import is laid out for (#1928): US Letter, written
-/// explicitly so a reader's locale (A4) never changes the body width.
+/// The page an HTML import is laid out for when the page declares none
+/// (#1928): US Letter, written explicitly so a reader's locale (A4) never
+/// changes the body width.
 pub(crate) const PAGE_W_TWIPS: u32 = 12_240;
 pub(crate) const PAGE_H_TWIPS: u32 = 15_840;
 /// The page's margin on every side (#1928): 15 px, about the inset Outlook's
 /// reading pane gives a mail body (a browser's own body margin is 8 px),
 /// instead of Word's 1".
 pub(crate) const PAGE_MARGIN_TWIPS: u32 = 225;
-/// The room an outermost table has: the body of that page, 786 px.
+/// The room an outermost table has on that page: its body, 786 px.
 pub(crate) const BODY_TWIPS: u32 = PAGE_W_TWIPS - 2 * PAGE_MARGIN_TWIPS;
 
-/// The final section of an HTML import (#1928): the page and margins
-/// [`BODY_TWIPS`] is laid out for. Header and footer sit in the same 15 px
-/// band (an imported page has neither); no gutter.
-pub(crate) fn page_section() -> crate::model::SectionProperties {
-    let m = PAGE_MARGIN_TWIPS;
+/// The smallest page side `@page`'s `size` gives (#1944), 1"; the largest
+/// is Word's [`MAX_TWIPS`].
+const MIN_PAGE_TWIPS: u32 = 1_440;
+/// The narrowest and shortest body `@page`'s margins may leave (#1944),
+/// 0.5": margins leaving less are all ignored.
+const MIN_BODY_TWIPS: u32 = 720;
+/// The furthest a header or footer is from its page edge when the page
+/// does not say (#1944): Word's 0.5", or the margin when that is less.
+const HEADER_TWIPS: u32 = 720;
+
+/// The page of an HTML import (#1928, #1944), in twips: its size, margins,
+/// and header and footer distances. The reader lays outermost tables, wide
+/// pictures and centred fixed-width boxes out in its [`Page::body`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Page {
+    pub w: u32,
+    pub h: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+    pub left: u32,
+    pub header: u32,
+    pub footer: u32,
+}
+
+impl Page {
+    /// #1928's page: Letter, 15 px on every side.
+    pub(crate) const DEFAULT: Page = Page {
+        w: PAGE_W_TWIPS,
+        h: PAGE_H_TWIPS,
+        top: PAGE_MARGIN_TWIPS,
+        right: PAGE_MARGIN_TWIPS,
+        bottom: PAGE_MARGIN_TWIPS,
+        left: PAGE_MARGIN_TWIPS,
+        header: PAGE_MARGIN_TWIPS,
+        footer: PAGE_MARGIN_TWIPS,
+    };
+
+    /// The width between the side margins.
+    pub(crate) fn body(&self) -> u32 {
+        self.w.saturating_sub(self.left + self.right)
+    }
+
+    /// The page `@page`'s declarations give (#1944), in cascade order
+    /// ([`css::StyleSheet::page_decls`]): [`Page::DEFAULT`] with each
+    /// readable one applied, a later one winning.
+    ///
+    /// - `size`: one length (a square) or two, `auto`, a paper keyword
+    ///   (`letter`, `legal`, `ledger`, `a3`-`a5`, `b4`, `b5`) and
+    ///   `portrait` / `landscape`, either or both. A side outside 1"..22"
+    ///   is ignored (the page keeps that side as it was).
+    /// - `margin` and its longhands; `mso-header-margin` and
+    ///   `mso-footer-margin` (Word's), else each is its side's margin, at
+    ///   most 0.5" (ours: Word's filtered HTML drops them, and Word's own
+    ///   default is 0.5"). A percentage, a negative or unreadable value is
+    ///   ignored, as are all four margins when they would leave a body
+    ///   narrower or shorter than 0.5".
+    pub(crate) fn from_decls(decls: &[&css::Decl]) -> Page {
+        let mut page = Page::DEFAULT;
+        let mut margins = [None::<u32>; 4];
+        let (mut header, mut footer) = (None, None);
+        for d in decls {
+            let v = d.value.as_str();
+            match d.name.as_str() {
+                "size" => {
+                    if let Some((w, h)) = page_size(v) {
+                        page.w = w.unwrap_or(page.w);
+                        page.h = h.unwrap_or(page.h);
+                    }
+                }
+                "margin" => {
+                    if let Some(sides) = css::box_sides(v) {
+                        for (m, side) in margins.iter_mut().zip(sides) {
+                            if let Some(t) = side.and_then(page_twips) {
+                                *m = Some(t);
+                            }
+                        }
+                    }
+                }
+                "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
+                    let i = match d.name.as_str() {
+                        "margin-top" => 0,
+                        "margin-right" => 1,
+                        "margin-bottom" => 2,
+                        _ => 3,
+                    };
+                    if let Some(t) = css::side(v).ok().flatten().and_then(page_twips) {
+                        margins[i] = Some(t);
+                    }
+                }
+                "mso-header-margin" | "mso-footer-margin" => {
+                    let t = css::length(v)
+                        .filter(|l| l.unit != css::Unit::Percent)
+                        .and_then(page_twips);
+                    if t.is_some() {
+                        if d.name == "mso-header-margin" {
+                            header = t;
+                        } else {
+                            footer = t;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let [top, right, bottom, left] = margins.map(|m| m.unwrap_or(PAGE_MARGIN_TWIPS));
+        let fits = |side: u32, a: u32, b: u32| {
+            u64::from(side) >= u64::from(a) + u64::from(b) + u64::from(MIN_BODY_TWIPS)
+        };
+        if fits(page.w, left, right) && fits(page.h, top, bottom) {
+            (page.top, page.right, page.bottom, page.left) = (top, right, bottom, left);
+        }
+        page.header = header.unwrap_or(page.top.min(HEADER_TWIPS));
+        page.footer = footer.unwrap_or(page.bottom.min(HEADER_TWIPS));
+        page
+    }
+}
+
+/// A length on the page in twips (#1944): non-negative and at most
+/// [`MAX_TWIPS`], else `None`. `em` and `rem` count from the base size.
+fn page_twips(len: css::Len) -> Option<u32> {
+    let t = (len.points(css::BASE_PT)? * 20.0).round();
+    (0.0..=f64::from(MAX_TWIPS))
+        .contains(&t)
+        .then_some(t as u32)
+}
+
+/// A `size` value (#1944): its width and height, each `None` when it is
+/// ignored (a length outside 1"..22"); `auto` is the default page's.
+/// `None` when it cannot be read.
+fn page_size(value: &str) -> Option<(Option<u32>, Option<u32>)> {
+    let v = value.to_ascii_lowercase();
+    let toks: Vec<&str> = v.split_ascii_whitespace().collect();
+    let side = |t: u32| (MIN_PAGE_TWIPS..=MAX_TWIPS).contains(&t).then_some(t);
+    match toks.as_slice() {
+        ["auto"] => return Some((Some(PAGE_W_TWIPS), Some(PAGE_H_TWIPS))),
+        [a] | [a, _] if css::length(a).is_some() => {
+            let mut sides = Vec::with_capacity(2);
+            for t in &toks {
+                let len = css::length(t).filter(|l| l.unit != css::Unit::Percent)?;
+                // Out of range (negative too) is ignored, not unreadable.
+                let pt = len.points(css::BASE_PT)?;
+                let twips = (pt * 20.0).round();
+                sides.push(
+                    (0.0..=f64::from(u32::MAX))
+                        .contains(&twips)
+                        .then(|| side(twips as u32))
+                        .flatten(),
+                );
+            }
+            let w = sides[0];
+            let h = sides.get(1).copied().unwrap_or(w);
+            return Some((w, h));
+        }
+        _ => {}
+    }
+    // A paper keyword and an orientation, either or both, in any order.
+    let mut paper: Option<(u32, u32)> = None;
+    let mut orient: Option<bool> = None;
+    for t in &toks {
+        if let Some(p) = paper_size(t) {
+            if paper.replace(p).is_some() {
+                return None;
+            }
+        } else if *t == "portrait" || *t == "landscape" {
+            if orient.replace(*t == "landscape").is_some() {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+    if toks.is_empty() {
+        return None;
+    }
+    let (w, h) = paper.unwrap_or((PAGE_W_TWIPS, PAGE_H_TWIPS));
+    let (short, long) = (w.min(h), w.max(h));
+    Some(match orient {
+        Some(true) => (Some(long), Some(short)),
+        Some(false) => (Some(short), Some(long)),
+        None => (Some(w), Some(h)),
+    })
+}
+
+/// A CSS paper keyword's portrait size in twips (#1944).
+fn paper_size(name: &str) -> Option<(u32, u32)> {
+    let mm = |w: f64, h: f64| {
+        let t = |v: f64| (v * 1440.0 / 25.4).round() as u32;
+        (t(w), t(h))
+    };
+    Some(match name {
+        "letter" => (12_240, 15_840),
+        "legal" => (12_240, 20_160),
+        "ledger" => (15_840, 24_480),
+        "a3" => mm(297.0, 420.0),
+        "a4" => mm(210.0, 297.0),
+        "a5" => mm(148.0, 210.0),
+        "b4" => mm(250.0, 353.0),
+        "b5" => mm(176.0, 250.0),
+        _ => return None,
+    })
+}
+
+/// The final section of an HTML import (#1928): `page`, the page the
+/// reader laid the body out for, with every `w:pgMar` attribute (an
+/// imported page has no header or footer; no gutter), and
+/// `w:orient="landscape"` when it is wider than tall (#1944).
+pub(crate) fn page_section(page: &Page) -> crate::model::SectionProperties {
+    let Page {
+        w,
+        h,
+        top,
+        right,
+        bottom,
+        left,
+        header,
+        footer,
+    } = *page;
+    let orient = if w > h { " w:orient=\"landscape\"" } else { "" };
     crate::model::SectionProperties {
         raw: format!(
-            "<w:sectPr><w:pgSz w:w=\"{PAGE_W_TWIPS}\" w:h=\"{PAGE_H_TWIPS}\"/>\
-             <w:pgMar w:top=\"{m}\" w:right=\"{m}\" w:bottom=\"{m}\" w:left=\"{m}\" \
-             w:header=\"{m}\" w:footer=\"{m}\" w:gutter=\"0\"/></w:sectPr>"
+            "<w:sectPr><w:pgSz w:w=\"{w}\" w:h=\"{h}\"{orient}/>\
+             <w:pgMar w:top=\"{top}\" w:right=\"{right}\" w:bottom=\"{bottom}\" \
+             w:left=\"{left}\" w:header=\"{header}\" w:footer=\"{footer}\" \
+             w:gutter=\"0\"/></w:sectPr>"
         ),
         property_change: None,
     }

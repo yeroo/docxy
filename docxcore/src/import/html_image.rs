@@ -10,7 +10,6 @@
 //! once per distinct `src`, and is told how many bytes it may return.
 
 use super::Budget;
-use super::html_table::BODY_TWIPS;
 use crate::image::{self, ImageInfo};
 use std::collections::HashMap;
 
@@ -837,10 +836,10 @@ impl MaxBox {
     }
 }
 
-/// A declared box wider than the body scaled down to the body's width,
-/// keeping its aspect.
-pub(crate) fn fit_to_body((w, h): (u128, u128)) -> (u64, u64) {
-    let body = u128::from(BODY_TWIPS);
+/// A declared box wider than the body, `body` twips (the page's, #1944),
+/// scaled down to the body's width, keeping its aspect.
+pub(crate) fn fit_to_body(body: u32, (w, h): (u128, u128)) -> (u64, u64) {
+    let body = u128::from(body);
     let (w, h) = if w > body {
         (body, h * body / w)
     } else {
@@ -1082,7 +1081,8 @@ mod tests {
         height: Option<u32>,
         pixels: Option<(u32, u32)>,
     ) -> Option<(u64, u64)> {
-        declared_box(width, height, pixels).map(fit_to_body)
+        declared_box(width, height, pixels)
+            .map(|b| fit_to_body(super::super::html_table::BODY_TWIPS, b))
     }
 
     #[test]

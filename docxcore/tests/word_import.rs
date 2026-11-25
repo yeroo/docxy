@@ -324,3 +324,42 @@ fn every_prefix_of_every_fixture_imports_without_panicking() {
         let _ = import::recover_any_text(prefix);
     }
 }
+
+/// One attribute of the first `<el …>` in `xml`.
+fn attr_of(xml: &str, el: &str, name: &str) -> Option<String> {
+    let at = xml.find(&format!("<{el} "))?;
+    let tag = &xml[at..at + xml[at..].find('>')?];
+    let key = format!(" {name}=\"");
+    let v = tag.find(&key)? + key.len();
+    Some(tag[v..v + tag[v..].find('"')?].to_string())
+}
+
+/// #1944: the Web Page's `@page WordSection1` (its size and 1" margins)
+/// gives the import Word's own page, the `.docx`'s.
+#[test]
+fn word_web_page_keeps_word_page() {
+    let want = docxcore::package::load_package(&fixture("source.docx"))
+        .expect("Word's .docx loads")
+        .sect_pr()
+        .to_string();
+    let got = import::import_html(&fixture("source.htm")).expect("HTML imports");
+    let got = got
+        .trailing_section_properties()
+        .expect("an HTML import has its own section")
+        .raw
+        .clone();
+    let page = |xml: &str| {
+        let g = docxcore::model::PageGeom::from_sect_pr(xml);
+        (g.w, g.h, g.mt, g.mr, g.mb, g.ml)
+    };
+    assert_eq!(page(&got), page(&want));
+    assert_eq!(page(&got), (12_240, 15_840, 1440, 1440, 1440, 1440));
+    for a in ["w:header", "w:footer", "w:gutter"] {
+        assert_eq!(
+            attr_of(&got, "w:pgMar", a),
+            attr_of(&want, "w:pgMar", a),
+            "{a}"
+        );
+    }
+    assert_eq!(attr_of(&got, "w:pgMar", "w:header").as_deref(), Some("720"));
+}

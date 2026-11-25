@@ -596,6 +596,8 @@ pub(crate) struct Builder<'b> {
     /// How many times content that keeps a paragraph has been written
     /// (#1936, [`Builder::shown`]).
     shown: u64,
+    /// The page's body width, in twips ([`Builder::set_body`], #1944).
+    body_twips: u32,
 }
 
 #[derive(Default)]
@@ -690,7 +692,14 @@ impl<'b> Builder<'b> {
             keeps: false,
             link_style: false,
             shown: 0,
+            body_twips: html_table::BODY_TWIPS,
         }
+    }
+
+    /// The page's body width (#1944): the room an outermost HTML table has
+    /// (its own declared room aside). [`html_table::BODY_TWIPS`] until set.
+    pub(crate) fn set_body(&mut self, twips: u32) {
+        self.body_twips = twips;
     }
 
     /// A count that grows whenever content that keeps a paragraph is
@@ -1448,7 +1457,7 @@ impl<'b> Builder<'b> {
                 {
                     self.body.push(Block::Paragraph(Paragraph::default()));
                 }
-                let avail = raw.spec.room.map_or(html_table::BODY_TWIPS, |r| r.width);
+                let avail = raw.spec.room.map_or(self.body_twips, |r| r.width);
                 let table = html_table::layout(raw, avail, self.budget);
                 self.body.push(Block::Table(table));
             }
