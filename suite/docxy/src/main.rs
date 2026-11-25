@@ -75,6 +75,7 @@ mod hf_tab;
 mod hl_mode;
 mod html_bundle;
 mod hyphenation_dialog;
+mod image_convert;
 mod info_props;
 mod inputs;
 mod inspector;
@@ -13170,9 +13171,10 @@ fn sheet_bytes(v: &SheetView, target: Option<&std::path::Path>) -> (Vec<u8>, usi
 
 /// The documents the Open dialog takes: Word 97-2003 `.doc` imports (#634);
 /// RTF, web pages and PDFs opened converted (#633); Word templates, opened
-/// as new documents (#636).
-const DOC_OPEN_EXTENSIONS: [&str; 11] = [
-    "docx", "docm", "dotx", "dotm", "doc", "md", "markdown", "html", "htm", "rtf", "pdf",
+/// as new documents (#636); a single-file Web Page (MHTML, #1898) as one.
+const DOC_OPEN_EXTENSIONS: [&str; 13] = [
+    "docx", "docm", "dotx", "dotm", "doc", "md", "markdown", "html", "htm", "mht", "mhtml", "rtf",
+    "pdf",
 ];
 
 /// What the Open dialog's "All supported" filter lists: documents,
@@ -28752,7 +28754,10 @@ impl Docxy {
             // Opened as a new document from the template (#636).
             .add_filter("Word Template", &["dotx", "dotm"])
             // Opened converted (#633); Save writes a Word document.
-            .add_filter("Rich Text, Web Page or PDF", &["rtf", "htm", "html", "pdf"])
+            .add_filter(
+                "Rich Text, Web Page or PDF",
+                &["rtf", "htm", "html", "mht", "mhtml", "pdf"],
+            )
             .add_filter("Word 97-2003 Document", &["doc"])
             .add_filter("Editable HTML (*.docx.html)", &["html"])
             .add_filter("Excel workbook", &SHEET_EXTENSIONS);
@@ -40207,6 +40212,26 @@ fn picture_frame_px(cx: i64, cy: i64, zoom: f32) -> (f32, f32) {
     (px_of(cx), px_of(cy))
 }
 
+/// A picture frame's Alt Text (#1898), laid over its `w` x `h` px frame:
+/// 12 px (9 pt) at `zoom`, 15 px lines, in `ink`, inset 2 px at the zoom
+/// (at most a quarter of the frame each way), wrapped at the frame's width
+/// and clipped to it.
+fn picture_alt_el(text: &str, w: f32, h: f32, zoom: f32, ink: Hsla) -> Div {
+    let inset = (2.0 * zoom).min(w / 4.0).min(h / 4.0);
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .w(px(w))
+        .h(px(h))
+        .p(px(inset))
+        .overflow_hidden()
+        .text_size(px(12.0 * zoom))
+        .line_height(px(15.0 * zoom))
+        .text_color(ink)
+        .child(text.to_string())
+}
+
 /// An inline picture's drawn size in px (#1963): its frame
 /// ([`picture_frame_px`]), scaled down with its aspect kept to `room` (a
 /// flow view's width for it) when wider; `None` draws its frame's size.
@@ -41323,13 +41348,18 @@ fn paragraph_el(
                 // rectangle (Word's Crop to Shape, an HTML `border-radius`,
                 // #1926), the picture and the frame's border are clipped to
                 // its corners. A flow view draws one wider than its room
-                // scaled down to it, its aspect kept (#1963).
+                // scaled down to it, its aspect kept (#1963). A frame that
+                // shows no image, or an HTML import's placeholder (an image
+                // the import could not get), shows the picture's Alt Text
+                // inside it, dim, small, wrapped and clipped (#1898).
                 if let Some((cx_emu, cy_emu)) = docxcore::image::inline_extent(xml) {
                     let (w, h) = shown_picture_px(cx_emu, cy_emu, zoom, pic_room);
                     let shape = docxcore::image::inline_shape(xml);
                     let radius = pictures::picture_radius(shape, w, h);
-                    let frame = div().flex_none().w(px(w)).h(px(h));
-                    let frame = match pics.and_then(|p| p.image(xml)) {
+                    let frame = div().flex_none().w(px(w)).h(px(h)).relative();
+                    let image = pics.and_then(|p| p.image(xml));
+                    let alt = pictures::frame_alt(xml, image.as_deref());
+                    let frame = match image {
                         Some(image) => frame.child(
                             img(image)
                                 .w(px(w))
@@ -41338,6 +41368,10 @@ fn paragraph_el(
                                 .rounded(px(radius)),
                         ),
                         None => frame.border_1().border_color(pal.dim),
+                    };
+                    let frame = match &alt {
+                        Some(text) => frame.child(picture_alt_el(text, w, h, zoom, pal.dim)),
+                        None => frame,
                     };
                     let frame = frame.rounded(px(radius));
                     let frame = match flow.pictures {
@@ -41359,6 +41393,7 @@ fn paragraph_el(
                             height: h,
                             radius,
                             shape,
+                            alt,
                         });
                     }
                     // Its Alt Text as a tooltip on hover, in the embedded

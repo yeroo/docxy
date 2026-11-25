@@ -201,12 +201,16 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   distinct src, at most `MAX_IMAGES` (1000) calls, told the most bytes it
   may return (budget room, `MAX_IMAGE_BYTES` 64 MiB, what `MAX_MEDIA_BYTES`
   128 MiB leaves); a longer answer is dropped. Kind and extension come from
-  `image::sniff` only (PNG/JPEG/GIF/BMP); equal bytes are one medium.
+  `image::sniff` only (PNG/JPEG/GIF/BMP), but for SVG and WebP made PNG by
+  a caller's converter (#1898, below); equal bytes are one medium. Since
+  #1898 the src is resolved against the page's `<base href>` (or an MHTML
+  root's location) first, and an MHTML part answers before the resolver.
 - Size (twips, ×635 to EMU): CSS `width`/`height` lengths over the
-  attributes, `auto` clears a side, a CSS percentage leaves the attribute's,
-  an attribute percentage is ignored; one side gives the other by the
-  pixels' aspect, none the pixels; scaled down to the body (11790 twips,
-  #1928).
+  attributes, `auto` clears a side; a percentage width (CSS or attribute)
+  is of the containing width and a percentage height is `auto` (#1898,
+  below); one side gives the other by the pixels' aspect, none the
+  pixels; `max-width`/`max-height` clamp it (#1898); scaled down to the
+  body (11790 twips, #1928).
   Of the rest, only `tr`, `td` and `th` read `height`, as a row height
   (#1894).
 - Unresolved (refused, no room, not an image): sized, a picture over one
@@ -235,9 +239,121 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   checked first. The page folder itself may be on a share or behind a link.
   So opening a page never reaches the network. The child writes the
   package with its media (`ConvertedDoc::docx`).
-- Out of scope: `<base href>`, MHTML, `<a>` around images, `srcset`,
-  `<picture>`, background images, SVG/WebP (placeholders), `max-width`,
-  float/align, the suite drawing a placeholder's alt text.
+- Out of scope here, done since: `<a>` around images (#1999); `<base
+  href>`, MHTML, `srcset`, `<picture>`, SVG/WebP, percentage sizes,
+  `max-width`, the suite drawing a placeholder's alt text (#1898, below).
+  Still out: background images, float/align (#1898's "Not done").
+
+## HTML import images, leftovers (#1898)
+
+- Percentage widths: an `<img>`'s `width="50%"` or CSS `width:50%` is a
+  `Width::Pct` in its look, resolved in `Html::image` against
+  `Html::image_room`, at import time (no layout refit): outside a cell the
+  body less the paragraph look's `indent`/`indent_right` (so a centred
+  `max-width:600px; margin:0 auto` wrapper, which #1922/#1894 turn into
+  indents, gives 600 px); inside one the innermost cell's (or card's,
+  #1927) content width less the indents of the blocks inside it, walked
+  outside in: a table is its own width (a percentage of the room around
+  it), else that room; a cell its own width (a percentage of its table's),
+  else its table's, less its `own_padding` left and right (not the table's
+  `cellpadding`); a card its own width, else the room around it, less its
+  padding. Every step is clamped to the body. A cell of a many-column
+  table without widths is taken as its whole table (an upper bound; the
+  fit to the body still caps it). A percentage `height` (either way) is
+  `auto`, as a browser computes it against an auto-height container, so it
+  clears the attribute's. Two expectations changed with it:
+  `css_lengths_beat_the_attributes_and_auto_and_a_percent_is_of_the_body`
+  and `cid-message.html`'s `width=150 style="width:100%;max-width:600px"`
+  (now 600 x 200, as a browser draws it).
+- `max-width` (absolute, or a percentage of the same room; `none` clears)
+  and `max-height` (absolute; a percentage is none) on an `img`
+  (`Look::own_max_width`, `own_max_height`) clamp the declared box before
+  `fit_to_body` (`html_image::MaxBox::clamp`): a side over its bound takes
+  it, and the other side scales with it only when it came from the
+  aspect (or a placeholder's square), not when declared, as a browser
+  clamps a replaced element. The crop (#1926) is measured in the clamped
+  box. An unsized placeholder has no box to clamp: its alt text stays a
+  run.
+- `<base href>`: the first `<base>` with an `href`, head or body, found
+  by the `collect_styles` pre-pass (so it applies to an `<img>` before
+  it; `skip_head` is unchanged), unless empty, over `MAX_BASE` (4096)
+  bytes, `data:` or `javascript:` (`html_image::page_base`). Every src but
+  a `data:` one is resolved against it (`html_image::resolve_ref`, RFC
+  3986 section 5.2: a src with a scheme, `cid:` included, is itself) before
+  the cache and the resolver. A relative base gives a relative src (a
+  leading `..` it cannot remove is kept, and the suite refuses one that
+  leaves the page's folder); an absolute one an absolute src, which the
+  suite refuses. No base: srcs as before. `<base>` for links (`<a href>`)
+  is not read.
+- `srcset` and `<picture>`: an `<img>` whose `src` gives nothing (empty,
+  refused, not an image) tries its own `srcset`, then the `<source>`s of
+  the `<picture>` that is its innermost open element (`Html::picture`, by
+  the picture's serial; at most `MAX_SOURCES` (16), each a `<source>`
+  without `media` and with no `type` or a PNG/JPEG/GIF/BMP/WebP/SVG one,
+  `html_image::usable_type`; each kept source's list parsed once, when it
+  is kept, into `PictureSources`; the `<img>`'s own list only once its
+  `src` gave nothing). `html_image::srcset_candidates` splits a
+  list as the HTML standard's parser does (a URL runs to white space, so a
+  `data:` URI keeps its commas) and orders it `1x`/bare first, then as
+  written; at most `MAX_CANDIDATES` (16) tries, each a resolver call within
+  `MAX_IMAGES`. The first that gives an image wins, its CSS size its
+  pixels over its density (`2x`: half); a `w` descriptor counts as `1x`
+  (`sizes` is not read). A `src` that resolves asks for no candidate.
+- MHTML (`import/mhtml.rs`): `import_html_converting` (behind both
+  `import_html_within` and `import_html_with_converter`) first tries
+  `mhtml::parse`. A top header block (unfolded, within `MAX_HEADER` 16 KiB
+  up to its blank line) whose `Content-Type` is `multipart/related` with a
+  `boundary` is a message; its parts are split at `--boundary` lines (the
+  line break before one is the delimiter's), at most `MAX_PARTS` (4096).
+  The root is the part `start` names by Content-ID, else the first part of
+  the `type` parameter's type, else the first `text/html` one, and must be
+  HTML; it is decoded (base64, quoted-printable with soft breaks, else as
+  it is; charged as decoded) and read in its part's `charset` when this
+  reads it (`decode_with`: a byte-order mark first, then the transport
+  charset, then the page's `<meta>`), its `Content-Location` the page's
+  URL, which the page's `<base href>` and srcs resolve against. The import
+  wraps the caller's resolver: a src that is a part's `Content-Location`
+  (exactly, or both percent-decoded), or a `cid:` naming a part's
+  Content-ID (percent-decoded, no brackets or case), takes that part's
+  body (`Mhtml::part_for`: decoded then, refused unread when its decoded
+  bound passes the image's limit); only a src no part holds reaches the
+  caller (absolute, so the suite refuses it). Anything malformed is not
+  MHTML: the bytes are read as a page. `sniff` takes MHTML by its header
+  block (`mhtml::looks_like`) and by `.mht`/`.mhtml`; the suite's Open
+  lists both. Parts other than images (stylesheets, frames) are not read.
+- SVG and WebP: `html_image::convertible` tells them apart (`<svg` after a
+  BOM, white space, XML declaration, processing instructions, comments
+  and doctype within the first 4 KiB; `RIFF`…`WEBP`). `image::sniff` is not
+  extended: its callers mean "gpui and PDF export can draw this". They go
+  to a caller's `ImageConverter` (`FnMut(ConvertKind, &[u8], limit) ->
+  Option<ConvertedImage>`: PNG bytes and the CSS size), given only through
+  `import_html_with_converter`; without one (`import_html_with` and every
+  other entry) they stay placeholders and every medium sniffs. With one, a
+  WebP is a PNG medium; an SVG a PNG medium and the SVG kept as its own
+  (`svg`, `image/svg+xml`), the run's blip naming the PNG with Word's
+  `asvg:svgBlip` extension naming the SVG (`image::with_svg_blip`, over
+  the `image::svg_blip_ext` that `mermaid_embed` uses too); `embed_tags`
+  renames that `r:embed` in `package()`. Each medium keeps its CSS size
+  apart from its sniffed pixels (`Images::css`; an SVG rasterised at 2x
+  takes its intrinsic size, a srcset density divides it). Conversions are
+  cached by source bytes. An answer that is not a nonzero-sized PNG within
+  the limit is dropped (a placeholder).
+- The suite's converter (`suite/docxy/src/image_convert.rs`, in the
+  converting child): WebP through `image` (`webp` feature) within
+  `Limits` (16384 px a side, 256 MiB); SVG through `resvg` 0.46 (gpui's,
+  no package added to the lock) at twice its intrinsic size (its
+  `width`/`height`, else its `viewBox`, else, as usvg sizes one with
+  neither, its content's box from the origin), the long side at most 2048
+  px. usvg's default `ImageHrefResolver` reads any file path that exists,
+  absolute ones too, so the converter's resolves `data:` URLs only: an
+  SVG's `<image>` never reaches the disk or the network. Its text uses the
+  system fonts, loaded once on the first SVG.
+- Not done: floating pictures (`float`, `align=left|right` as `wp:anchor`:
+  the suite draws no anchored picture, so they would vanish from the view;
+  they stay inline), CSS `background-image` and `<td>`/`<body
+  background>` (no picture fill for a cell, block or page in the model or
+  the suite), percentage `min-*`, `object-fit`, `<base>` for links, MHTML
+  parts other than images.
 
 ## HTML import rounded images (#1926)
 

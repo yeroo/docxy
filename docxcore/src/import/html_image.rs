@@ -14,12 +14,44 @@ use super::html_table::BODY_TWIPS;
 use crate::image::{self, ImageInfo};
 use std::collections::HashMap;
 
-/// What an `<img src>` other than `data:` resolves to, given the src as the
-/// page writes it (character references decoded, trimmed) and the most
-/// bytes the import will take: the image's bytes, or `None` (refused,
-/// missing) for a placeholder. Called once per distinct src. A longer
-/// answer is dropped, as is one whose bytes are not PNG, JPEG, GIF or BMP.
+/// What an `<img src>` other than `data:` resolves to, given the src
+/// (character references decoded, trimmed; resolved against the page's
+/// `<base href>` or an MHTML root part's `Content-Location` when it has
+/// one, #1898, else as the page writes it) and the most bytes the import
+/// will take: the image's bytes, or `None` (refused, missing) for a
+/// placeholder. Called once per distinct src; a src an MHTML message's
+/// part holds never reaches it. A longer answer is dropped, as is one
+/// whose bytes are not PNG, JPEG, GIF or BMP, or, with a converter
+/// ([`crate::import::import_html_with_converter`], #1898), SVG or WebP it
+/// turns into PNG.
 pub type ImageResolver<'r> = dyn FnMut(&str, usize) -> Option<Vec<u8>> + 'r;
+
+/// What a caller's [`ImageConverter`] is asked to turn into PNG (#1898).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConvertKind {
+    /// An SVG document (`<svg` after an optional XML prolog, comments and
+    /// doctype).
+    Svg,
+    /// A WebP image (`RIFF` … `WEBP`).
+    Webp,
+}
+
+/// A picture a caller's [`ImageConverter`] made (#1898): PNG bytes and the
+/// size in CSS pixels the picture takes when the page gives none (for an
+/// SVG, its intrinsic size, whatever the PNG's pixels).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConvertedImage {
+    pub png: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Turns an image the import cannot embed as it is (SVG, WebP) into PNG
+/// (#1898), given its kind, its bytes and the most PNG bytes the import
+/// will take; `None` leaves it a placeholder. A longer answer, or one that
+/// is not a PNG of a nonzero size, is dropped. Called once per distinct
+/// image.
+pub type ImageConverter<'r> = dyn FnMut(ConvertKind, &[u8], usize) -> Option<ConvertedImage> + 'r;
 
 /// The most distinct srcs an import asks its resolver for; later ones are
 /// placeholders.
@@ -40,8 +72,10 @@ const MAX_NAME: usize = 64;
 /// By estimate: there is no Word oracle for a missing HTML image.
 pub(crate) const PLACEHOLDER_OUTLINE: &str = "A6A6A6";
 
-/// A 1 x 1 RGB PNG of `#F2F2F2`, stretched over a placeholder's box.
-pub(crate) const PLACEHOLDER_PNG: [u8; 69] = [
+/// A 1 x 1 RGB PNG of `#F2F2F2`, stretched over a placeholder's box: a
+/// picture whose media is these bytes is an image the import could not
+/// get, which the suite draws its Alt Text in (#1898).
+pub const PLACEHOLDER_PNG: [u8; 69] = [
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
     0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
     0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xf8, 0xf4, 0xe9, 0x13,
@@ -75,11 +109,13 @@ pub struct ImportedLink {
 
 /// What one `<img>` came to.
 pub(crate) enum Source {
-    /// A medium of the import: its rid and pixel size.
+    /// A medium of the import: its rid, its size in CSS pixels, and the rid
+    /// of the SVG it was converted from (#1898), if it was.
     Media {
         rid: String,
         width: u32,
         height: u32,
+        svg: Option<String>,
     },
     /// Nothing usable: a placeholder, or the alt text.
     Unresolved,
@@ -99,6 +135,18 @@ pub(crate) struct Images<'a> {
     /// The pictures' click links (#1999), each URL once.
     links: Vec<ImportedLink>,
     link_index: HashMap<String, usize>,
+    /// The page's base URL (#1898): its `<base href>`, which every src
+    /// but a `data:` one is resolved against ([`resolve_ref`]).
+    base: Option<String>,
+    /// The caller's converter of SVG and WebP pictures (#1898), if any.
+    convert: Option<&'a mut ImageConverter<'a>>,
+    /// Each medium's size in CSS pixels (its pixels, or a conversion's
+    /// size) and the index of the SVG medium it was made from (#1898).
+    css: Vec<(u32, u32)>,
+    svg_of: Vec<Option<usize>>,
+    /// Each image converted so far, its source bytes and the PNG medium it
+    /// made (`None`: refused), so equal images convert once (#1898).
+    converted: Vec<(Vec<u8>, Option<usize>)>,
 }
 
 impl<'a> Images<'a> {
@@ -113,7 +161,22 @@ impl<'a> Images<'a> {
             last_id: 0,
             links: Vec::new(),
             link_index: HashMap::new(),
+            base: None,
+            convert: None,
+            css: Vec::new(),
+            svg_of: Vec::new(),
+            converted: Vec::new(),
         }
+    }
+
+    /// Turn SVG and WebP pictures into PNG through `convert` (#1898).
+    pub(crate) fn set_converter(&mut self, convert: &'a mut ImageConverter<'a>) {
+        self.convert = Some(convert);
+    }
+
+    /// Resolve every later src against `base` (#1898).
+    pub(crate) fn set_base(&mut self, base: Option<String>) {
+        self.base = base;
     }
 
     /// The media and the picture links the import made.
@@ -162,6 +225,14 @@ impl<'a> Images<'a> {
         if src.is_empty() {
             return Source::Unresolved;
         }
+        let resolved;
+        let src = match self.base.as_deref() {
+            Some(base) if !has_data_scheme(src) => {
+                resolved = resolve_ref(base, src);
+                resolved.as_str()
+            }
+            _ => src,
+        };
         let index = if has_data_scheme(src) {
             let limit = self.limit(budget);
             decode_data_uri(src, limit, budget).and_then(|bytes| self.add(bytes, budget))
@@ -184,21 +255,91 @@ impl<'a> Images<'a> {
         };
         match index {
             Some(i) => {
-                let m = &self.media[i];
+                let (width, height) = self.css[i];
                 Source::Media {
-                    rid: m.rid.clone(),
-                    width: m.info.width,
-                    height: m.info.height,
+                    rid: self.media[i].rid.clone(),
+                    width,
+                    height,
+                    svg: self.svg_of[i].map(|s| self.media[s].rid.clone()),
                 }
             }
             None => Source::Unresolved,
         }
     }
 
+    /// Push a medium (its bytes already charged as decoded and within
+    /// [`MAX_MEDIA_BYTES`]): its index.
+    fn push(&mut self, bytes: Vec<u8>, info: ImageInfo, css: (u32, u32)) -> usize {
+        let index = self.media.len();
+        self.media_bytes += bytes.len();
+        self.media.push(ImportedMedia {
+            rid: local_rid(index),
+            bytes,
+            info,
+        });
+        self.css.push(css);
+        self.svg_of.push(None);
+        index
+    }
+
+    /// `bytes`, an SVG or WebP, as a PNG medium made by the caller's
+    /// converter (#1898), an SVG keeping its own medium beside it: the PNG
+    /// medium's index. `None` without a converter, or when it refuses.
+    fn add_converted(&mut self, bytes: Vec<u8>, budget: &Budget) -> Option<usize> {
+        let kind = convertible(&bytes)?;
+        for (src, made) in &self.converted {
+            if src.len() == bytes.len() {
+                if !budget.scanned(bytes.len()) {
+                    return None;
+                }
+                if *src == bytes {
+                    return *made;
+                }
+            }
+        }
+        let limit = self.limit(budget);
+        let convert = self.convert.as_mut()?;
+        let made = convert(kind, &bytes, limit)
+            .filter(|c| c.width > 0 && c.height > 0 && c.png.len() <= limit)
+            .and_then(|c| {
+                let info = image::sniff(&c.png).filter(|i| i.ext == "png")?;
+                Some((c, info))
+            });
+        let made = made.and_then(|(c, info)| {
+            let svg = kind == ConvertKind::Svg;
+            let kept = c.png.len() + if svg { bytes.len() } else { 0 };
+            if kept > MAX_MEDIA_BYTES.saturating_sub(self.media_bytes)
+                || !budget.take_bytes(c.png.len())
+                || !budget.keep::<ImportedMedia>(32)
+            {
+                return None;
+            }
+            let css = (c.width, c.height);
+            let png = self.push(c.png, info, css);
+            if svg {
+                let svg_info = ImageInfo {
+                    ext: "svg",
+                    content_type: "image/svg+xml",
+                    width: c.width,
+                    height: c.height,
+                };
+                let at = self.push(bytes.clone(), svg_info, css);
+                self.svg_of[png] = Some(at);
+            }
+            Some(png)
+        });
+        if budget.alloc(bytes.len() + 32) {
+            self.converted.push((bytes, made));
+        }
+        made
+    }
+
     /// Keep `bytes` (already charged as decoded) when they are an image:
     /// the medium holding the same bytes when there is one.
     fn add(&mut self, bytes: Vec<u8>, budget: &Budget) -> Option<usize> {
-        let info = image::sniff(&bytes)?;
+        let Some(info) = image::sniff(&bytes) else {
+            return self.add_converted(bytes, budget);
+        };
         for (i, m) in self.media.iter().enumerate() {
             if m.bytes.len() == bytes.len() {
                 if !budget.scanned(bytes.len()) {
@@ -214,14 +355,7 @@ impl<'a> Images<'a> {
         {
             return None;
         }
-        self.media_bytes += bytes.len();
-        let index = self.media.len();
-        self.media.push(ImportedMedia {
-            rid: local_rid(index),
-            bytes,
-            info,
-        });
-        Some(index)
+        Some(self.push(bytes, info, (info.width, info.height)))
     }
 
     /// The rid of the shared placeholder medium, made on first use (its
@@ -234,16 +368,289 @@ impl<'a> Images<'a> {
         if !budget.keep::<ImportedMedia>(PLACEHOLDER_PNG.len() + 16) {
             return None;
         }
-        let index = self.media.len();
-        self.media_bytes += PLACEHOLDER_PNG.len();
-        self.media.push(ImportedMedia {
-            rid: local_rid(index),
-            bytes: PLACEHOLDER_PNG.to_vec(),
-            info,
-        });
+        let index = self.push(PLACEHOLDER_PNG.to_vec(), info, (info.width, info.height));
         self.placeholder = Some(index);
         Some(self.media[index].rid.clone())
     }
+}
+
+/// The most `<source>`s of one `<picture>` kept (#1898).
+pub(crate) const MAX_SOURCES: usize = 16;
+/// The most `srcset` candidates one `<img>` tries (#1898).
+pub(crate) const MAX_CANDIDATES: usize = 16;
+
+/// Whether a `<source type>` names an image the import may use (#1898):
+/// PNG, JPEG, GIF, BMP, or (through a caller's converter) WebP and SVG;
+/// parameters and case ignored.
+pub(crate) fn usable_type(mime: &str) -> bool {
+    let t = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        t.as_str(),
+        "image/png"
+            | "image/jpeg"
+            | "image/jpg"
+            | "image/pjpeg"
+            | "image/gif"
+            | "image/bmp"
+            | "image/webp"
+            | "image/svg+xml"
+    )
+}
+
+/// A `srcset`'s candidates (#1898), each URL with its density, in the order
+/// an import tries them: those with no descriptor or `1x` first, then the
+/// rest as written. A density descriptor `Nx` (N > 0) is N; a width one
+/// (`Nw`) is 1, as the `sizes` it needs is not read; a candidate with a
+/// descriptor that is neither is dropped. Parsed as the HTML standard's
+/// srcset parser splits it: a URL runs to white space (so a `data:` URI's
+/// commas are its own), a trailing comma ends a candidate with no
+/// descriptors, and descriptors run to a comma outside parentheses. It
+/// stops at [`MAX_CANDIDATES`] candidates (r2).
+pub(crate) fn srcset_candidates(srcset: &str) -> Vec<(String, f64)> {
+    let mut first = Vec::new();
+    let mut rest = Vec::new();
+    let mut s = srcset;
+    while first.len() + rest.len() < MAX_CANDIDATES {
+        s = s.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == ',');
+        if s.is_empty() {
+            break;
+        }
+        let end = s.find(|c: char| c.is_ascii_whitespace()).unwrap_or(s.len());
+        let raw_url = &s[..end];
+        s = &s[end..];
+        let url = raw_url.trim_end_matches(',');
+        let descriptors = if url.len() < raw_url.len() {
+            ""
+        } else {
+            // To the first comma outside parentheses.
+            let mut depth = 0usize;
+            let mut stop = s.len();
+            for (i, c) in s.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth = depth.saturating_sub(1),
+                    ',' if depth == 0 => {
+                        stop = i;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let d = &s[..stop];
+            s = &s[stop..];
+            d
+        };
+        let words: Vec<&str> = descriptors.split_ascii_whitespace().collect();
+        let density = match words.as_slice() {
+            [] => Some(1.0),
+            [d] => {
+                let d = d.to_ascii_lowercase();
+                if let Some(x) = d.strip_suffix('x') {
+                    x.parse::<f64>().ok().filter(|x| x.is_finite() && *x > 0.0)
+                } else if let Some(w) = d.strip_suffix('w') {
+                    w.parse::<u32>().ok().filter(|&w| w > 0).map(|_| 1.0)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(density) = density.filter(|_| !url.is_empty()) {
+            let one = descriptors.trim().is_empty()
+                || (density == 1.0 && !descriptors.contains(['w', 'W']));
+            if one {
+                first.push((url.to_string(), density));
+            } else {
+                rest.push((url.to_string(), density));
+            }
+        }
+    }
+    first.extend(rest);
+    first
+}
+
+/// The longest `<base href>` kept (#1898), in bytes: a longer one is none.
+const MAX_BASE: usize = 4096;
+
+/// A `<base href>` as the page's base URL (#1898): trimmed, references
+/// already decoded; none when empty, too long, or a `data:` or
+/// `javascript:` URL (a browser takes neither as a base).
+pub(crate) fn page_base(href: &str) -> Option<String> {
+    let href = href.trim();
+    let scheme = scheme_of(href).map(str::to_ascii_lowercase);
+    (!href.is_empty()
+        && href.len() <= MAX_BASE
+        && !matches!(scheme.as_deref(), Some("data" | "javascript")))
+    .then(|| href.to_string())
+}
+
+/// `s`'s URI scheme (RFC 3986: a letter, then letters, digits, `+`, `-`,
+/// `.`, before a `:`), if it has one.
+pub(crate) fn scheme_of(s: &str) -> Option<&str> {
+    let colon = s.find(':')?;
+    let scheme = &s[..colon];
+    let mut bytes = scheme.bytes();
+    let first = bytes.next()?;
+    (first.is_ascii_alphabetic()
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')))
+    .then_some(scheme)
+}
+
+/// `reference` resolved against `base` (#1898), as RFC 3986 section 5.2
+/// does: one with a scheme is itself; `//host…` takes the base's scheme;
+/// `/path` the base's scheme and authority; `?query` and `#fragment` the
+/// base's path; any other path is merged with the base's directory, its
+/// `.` and `..` segments removed. A relative base (no scheme, such as
+/// `img/`) gives a relative result, which keeps a leading `..` it cannot
+/// remove (the caller decides whether that leaves its folder).
+pub(crate) fn resolve_ref(base: &str, reference: &str) -> String {
+    if scheme_of(reference).is_some() {
+        return reference.to_string();
+    }
+    let base = base.split('#').next().unwrap_or("");
+    let (scheme, rest) = match scheme_of(base) {
+        Some(s) => (Some(s), &base[s.len() + 1..]),
+        None => (None, base),
+    };
+    let (authority, rest) = match rest.strip_prefix("//") {
+        Some(r) => {
+            let end = r.find(['/', '?']).unwrap_or(r.len());
+            (Some(&r[..end]), &r[end..])
+        }
+        None => (None, rest),
+    };
+    let (base_path, base_query) = match rest.find('?') {
+        Some(q) => (&rest[..q], Some(&rest[q..])),
+        None => (rest, None),
+    };
+    let mut out = String::new();
+    if let Some(s) = scheme {
+        out.push_str(s);
+        out.push(':');
+    }
+    if reference.starts_with("//") {
+        out.push_str(reference);
+        return out;
+    }
+    if let Some(a) = authority {
+        out.push_str("//");
+        out.push_str(a);
+    }
+    if reference.is_empty() || reference.starts_with('#') {
+        out.push_str(base_path);
+        out.push_str(base_query.unwrap_or(""));
+        out.push_str(reference);
+        return out;
+    }
+    if reference.starts_with('?') {
+        out.push_str(base_path);
+        out.push_str(reference);
+        return out;
+    }
+    let path_end = reference.find(['?', '#']).unwrap_or(reference.len());
+    let (path, tail) = reference.split_at(path_end);
+    let merged = if path.starts_with('/') {
+        path.to_string()
+    } else if authority.is_some() && base_path.is_empty() {
+        format!("/{path}")
+    } else {
+        let dir = base_path.rfind('/').map_or("", |i| &base_path[..=i]);
+        format!("{dir}{path}")
+    };
+    out.push_str(&remove_dot_segments(&merged));
+    out.push_str(tail);
+    out
+}
+
+/// `path` without its `.` and `..` segments (RFC 3986 section 5.2.4); a
+/// relative path keeps a leading `..` that has nothing to remove.
+fn remove_dot_segments(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    let segments: Vec<&str> = path.split('/').collect();
+    let last = segments.len() - 1;
+    for (i, seg) in segments.iter().enumerate() {
+        let dir_end = i == last;
+        match *seg {
+            "." => {
+                if dir_end {
+                    out.push("");
+                }
+            }
+            ".." => {
+                if out.last().is_some_and(|s| !s.is_empty() && *s != "..") {
+                    out.pop();
+                } else if !absolute {
+                    out.push("..");
+                }
+                if dir_end {
+                    out.push("");
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    let mut joined = out.join("/");
+    if absolute && !joined.starts_with('/') {
+        joined.insert(0, '/');
+    }
+    joined
+}
+
+/// What a caller's converter could make of `bytes` (#1898): an SVG
+/// document (`<svg` after an optional byte-order mark, white space, XML
+/// declaration, processing instructions, comments and doctype, within the
+/// first 4 KiB) or a WebP (`RIFF`, a size, `WEBP`).
+pub(crate) fn convertible(bytes: &[u8]) -> Option<ConvertKind> {
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some(ConvertKind::Webp);
+    }
+    let head = &bytes[..bytes.len().min(4096)];
+    let mut s = head.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(head);
+    loop {
+        s = s.trim_ascii_start();
+        let skip = |s: &[u8], open: &[u8], close: &[u8]| -> Option<usize> {
+            s.starts_with(open).then(|| {
+                super::find(&s[open.len()..], close).map(|i| open.len() + i + close.len())
+            })?
+        };
+        if let Some(n) = skip(s, b"<?", b"?>")
+            .or_else(|| skip(s, b"<!--", b"-->"))
+            .or_else(|| {
+                (s.len() >= 9 && s[..9].eq_ignore_ascii_case(b"<!doctype"))
+                    .then(|| doctype_end(s))
+                    .flatten()
+            })
+        {
+            s = &s[n..];
+            continue;
+        }
+        break;
+    }
+    (s.starts_with(b"<svg")
+        && s.get(4)
+            .is_some_and(|&b| b.is_ascii_whitespace() || b == b'>' || b == b'/'))
+    .then_some(ConvertKind::Svg)
+}
+
+/// The length of a `<!DOCTYPE …>` at the start of `s`, its internal subset
+/// (`[…]`) included.
+fn doctype_end(s: &[u8]) -> Option<usize> {
+    let mut depth = 0usize;
+    for (i, &b) in s.iter().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => depth = depth.saturating_sub(1),
+            b'>' if depth == 0 => return Some(i + 1),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Whether `src` is a `data:` URI (scheme case-insensitive).
@@ -334,7 +741,7 @@ pub(crate) fn percent_decode(s: &str) -> Vec<u8> {
 
 /// Standard base64 (`+/`, also the URL-safe `-_`), ASCII white space
 /// skipped, `=` padding only at the end; `None` for any other character.
-fn base64_decode(b: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(b: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(b.len() / 4 * 3 + 3);
     let mut acc: u32 = 0;
     let mut bits = 0;
@@ -393,6 +800,41 @@ pub(crate) fn declared_box(
         (None, None, Some((pw, ph))) => (u128::from(pw) * 15, u128::from(ph) * 15),
         (None, None, None) => return None,
     })
+}
+
+/// An image's `max-width` and `max-height` in twips (#1898), resolved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MaxBox {
+    pub(crate) width: Option<u32>,
+    pub(crate) height: Option<u32>,
+}
+
+impl MaxBox {
+    /// The declared box `(w, h)` within these bounds, as a browser
+    /// clamps a replaced element: a side over its bound takes the bound,
+    /// and the other side scales with it when it was not declared
+    /// (`width` / `height`, the declared sides) but came from the aspect
+    /// (or a placeholder's square); a declared side stays as it is.
+    pub(crate) fn clamp(
+        self,
+        (mut w, mut h): (u128, u128),
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> (u128, u128) {
+        if let Some(m) = self.width.map(u128::from).filter(|&m| w > m) {
+            if height.is_none() {
+                h = h * m / w;
+            }
+            w = m;
+        }
+        if let Some(m) = self.height.map(u128::from).filter(|&m| h > m) {
+            if width.is_none() {
+                w = w * m / h;
+            }
+            h = m;
+        }
+        (w, h)
+    }
 }
 
 /// A declared box wider than the body scaled down to the body's width,
@@ -766,5 +1208,109 @@ mod tests {
         let c = images.placeholder_rid(&b).unwrap();
         assert_eq!(a, c);
         assert_eq!(images.into_parts().0.len(), 1);
+    }
+    #[test]
+    fn resolve_ref_follows_rfc_3986_1898() {
+        let r = resolve_ref;
+        let base = "http://a/b/c/d;p?q";
+        // RFC 3986 section 5.4.1's normal examples.
+        for (reference, want) in [
+            ("g:h", "g:h"),
+            ("g", "http://a/b/c/g"),
+            ("./g", "http://a/b/c/g"),
+            ("g/", "http://a/b/c/g/"),
+            ("/g", "http://a/g"),
+            ("//g", "http://g"),
+            ("?y", "http://a/b/c/d;p?y"),
+            ("g?y", "http://a/b/c/g?y"),
+            ("#s", "http://a/b/c/d;p?q#s"),
+            ("g#s", "http://a/b/c/g#s"),
+            ("g?y#s", "http://a/b/c/g?y#s"),
+            (";x", "http://a/b/c/;x"),
+            ("g;x", "http://a/b/c/g;x"),
+            (".", "http://a/b/c/"),
+            ("./", "http://a/b/c/"),
+            ("..", "http://a/b/"),
+            ("../", "http://a/b/"),
+            ("../g", "http://a/b/g"),
+            ("../..", "http://a/"),
+            ("../../g", "http://a/g"),
+            // Abnormal: no `..` above the root.
+            ("../../../g", "http://a/g"),
+            ("/./g", "http://a/g"),
+            ("g/./h", "http://a/b/c/g/h"),
+            ("g/../h", "http://a/b/c/h"),
+        ] {
+            assert_eq!(r(base, reference), want, "{reference}");
+        }
+        // A host with no path.
+        assert_eq!(
+            r("https://example.com", "a.png"),
+            "https://example.com/a.png"
+        );
+        // A `file:` base, as Word's MHTML root.
+        assert_eq!(
+            r("file:///C:/X/doc.htm", "doc_files/image001.png"),
+            "file:///C:/X/doc_files/image001.png"
+        );
+        // A relative base gives a relative src; a `..` it cannot remove stays.
+        assert_eq!(r("img/", "a.png"), "img/a.png");
+        assert_eq!(r("img/x/", "../a.png"), "img/a.png");
+        assert_eq!(r("../shared/", "a.png"), "../shared/a.png");
+        // A src with a scheme is itself.
+        assert_eq!(r("img/", "cid:logo@x"), "cid:logo@x");
+    }
+    #[test]
+    fn srcset_candidates_parse_as_the_html_standard_splits_them_1898() {
+        let c = srcset_candidates;
+        let own = |v: &[(&str, f64)]| -> Vec<(String, f64)> {
+            v.iter().map(|(u, d)| (u.to_string(), *d)).collect()
+        };
+        // `1x` and bare first, then the rest as written; `w` is 1.
+        assert_eq!(
+            c("big.png 2x, small.png 1x, plain.png, wide.png 800w"),
+            own(&[
+                ("small.png", 1.0),
+                ("plain.png", 1.0),
+                ("big.png", 2.0),
+                ("wide.png", 1.0)
+            ])
+        );
+        // A `data:` URI keeps its commas; a trailing comma ends a candidate.
+        assert_eq!(
+            c("data:image/png;base64,AA,BB 2x,a.png, b.png 1.5x"),
+            own(&[
+                ("a.png", 1.0),
+                ("data:image/png;base64,AA,BB", 2.0),
+                ("b.png", 1.5)
+            ])
+        );
+        // A URL runs to white space, commas and all, as the standard reads it.
+        assert_eq!(c("a.png,b.png 2x"), own(&[("a.png,b.png", 2.0)]));
+        // Bad descriptors drop the candidate: two, zero, unknown, negative.
+        assert_eq!(
+            c("a.png 1x 2x, b.png 0x, c.png 3q, d.png -1x, e.png 2X"),
+            own(&[("e.png", 2.0)])
+        );
+        // Parentheses hold a comma inside descriptors (a future descriptor).
+        assert_eq!(c("a.png foo(1,2), b.png"), own(&[("b.png", 1.0)]));
+        assert!(c("  , ,").is_empty());
+    }
+    /// An SVG with a prolog, a comment and a doctype, and a WebP header.
+    const SVG: &str = "<?xml version=\"1.0\"?>\n<!-- logo -->\n<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"x\" [<!ENTITY a \"b\">]>\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"30\" height=\"10\"/>";
+    const WEBP: &[u8] = b"RIFF\x1a\x00\x00\x00WEBPVP8L\x0d\x00\x00\x00";
+
+    #[test]
+    fn convertible_tells_svg_and_webp_apart_from_the_rest_1898() {
+        let c = convertible;
+        assert_eq!(c(SVG.as_bytes()), Some(ConvertKind::Svg));
+        assert_eq!(c(b"\xEF\xBB\xBF  <svg>"), Some(ConvertKind::Svg));
+        assert_eq!(c(b"<svg\nviewBox='0 0 1 1'/>"), Some(ConvertKind::Svg));
+        assert_eq!(c(WEBP), Some(ConvertKind::Webp));
+        assert_eq!(c(b"<svgx>"), None);
+        assert_eq!(c(b"<html><svg></svg></html>"), None);
+        assert_eq!(c(b"<!-- unclosed <svg>"), None);
+        assert_eq!(c(b"RIFF\0\0\0\0WAVEfmt "), None);
+        assert_eq!(c(b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR"), None);
     }
 }

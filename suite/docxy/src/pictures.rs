@@ -365,6 +365,18 @@ impl<'a> Pictures<'a> {
     }
 }
 
+/// The Alt Text a picture's frame shows inside it (#1898): the run's
+/// [`docxcore::image::inline_alt_text`] when the frame shows no `image`, or
+/// shows an HTML import's placeholder (its bytes are
+/// [`docxcore::import::html_image::PLACEHOLDER_PNG`], an image the import
+/// could not get).
+pub fn frame_alt(raw: &str, image: Option<&Image>) -> Option<String> {
+    if image.is_some_and(|i| i.bytes != docxcore::import::html_image::PLACEHOLDER_PNG) {
+        return None;
+    }
+    docxcore::image::inline_alt_text(raw).filter(|a| !a.trim().is_empty())
+}
+
 /// A story's pictures: the tab's pictures and the part the story came from.
 #[derive(Clone, Copy)]
 pub struct Scope<'a> {
@@ -377,12 +389,14 @@ pub struct Scope<'a> {
 
 /// One inline picture as the view drew it (#1926): its frame (px) and the
 /// corner radius its crop shape gave the image's clip.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DrawnPicture {
     pub width: f32,
     pub height: f32,
     pub radius: f32,
     pub shape: docxcore::image::PictureShape,
+    /// The Alt Text drawn inside its frame (#1898), if any.
+    pub alt: Option<String>,
 }
 
 /// The body's inline pictures built in the frame last drawn, in order
@@ -410,7 +424,8 @@ pub fn picture_radius(shape: docxcore::image::PictureShape, w: f32, h: f32) -> f
 /// The harness's view of [`DrawnPictures`] (#1926): each picture's
 /// `width`, `height` and clip `radius` in px (to 0.1), its `shape`
 /// (`rect`, `ellipse`, `roundRect`) and `round`, whether its clip is a
-/// circle's or a stadium's (the radius is half the shorter side).
+/// circle's or a stadium's (the radius is half the shorter side), and the
+/// `alt` text drawn in its frame (#1898), else null.
 pub fn drawn_pictures_json(drawn: &DrawnPictures) -> ctlcore::json::Json {
     use ctlcore::json::Json;
     let tenth = |v: f32| Json::Num((f64::from(v) * 10.0).round() / 10.0);
@@ -433,6 +448,7 @@ pub fn drawn_pictures_json(drawn: &DrawnPictures) -> ctlcore::json::Json {
                         "round",
                         Json::Bool(p.radius > 0.0 && p.radius * 2.0 >= p.width.min(p.height) - 0.1),
                     ),
+                    ("alt", p.alt.clone().map_or(Json::Null, Json::Str)),
                 ])
             })
             .collect(),
@@ -1028,14 +1044,64 @@ mod tests {
                 height: h,
                 radius: picture_radius(shape, w, h),
                 shape,
+                alt: (shape == Rect).then(|| "Logo".to_string()),
             });
         }
         let json = drawn_pictures_json(&drawn).to_string();
         assert_eq!(
             json,
-            "[{\"width\":32,\"height\":32,\"radius\":16,\"shape\":\"ellipse\",\"round\":true},\
-             {\"width\":120,\"height\":40,\"radius\":8,\"shape\":\"roundRect\",\"round\":false},\
-             {\"width\":200,\"height\":100,\"radius\":0,\"shape\":\"rect\",\"round\":false}]"
+            "[{\"width\":32,\"height\":32,\"radius\":16,\"shape\":\"ellipse\",\"round\":true,\"alt\":null},\
+             {\"width\":120,\"height\":40,\"radius\":8,\"shape\":\"roundRect\",\"round\":false,\"alt\":null},\
+             {\"width\":200,\"height\":100,\"radius\":0,\"shape\":\"rect\",\"round\":false,\"alt\":\"Logo\"}]"
         );
+    }
+
+    /// A picture run naming `rid` with Alt Text `alt`.
+    fn run_with_alt(rid: &str, alt: &str) -> String {
+        docxcore::image::inline_picture_run_shaped(
+            rid,
+            9525,
+            9525,
+            1,
+            "x",
+            alt,
+            None,
+            docxcore::image::PictureShape::Rect,
+        )
+    }
+
+    /// A frame shows its Alt Text only when it shows no image or the HTML
+    /// import's placeholder (#1898): the image the view drew from the
+    /// package, its bytes the placeholder's; another 1 x 1 PNG is a
+    /// picture.
+    #[test]
+    fn a_frame_shows_its_alt_text_without_an_image_or_over_the_placeholder_1898() {
+        use docxcore::import::html_image::PLACEHOLDER_PNG;
+        let mut pkg = new_package(Document { body: vec![] });
+        let body = "word/document.xml";
+        let held = add(&mut pkg, body, &PLACEHOLDER_PNG);
+        let mut other = PLACEHOLDER_PNG.to_vec();
+        // The same 1 x 1 header, another pixel.
+        let at = other.len() - 20;
+        other[at] ^= 1;
+        let real = add(&mut pkg, body, &other);
+        let cache = RefCell::new(Cache::default());
+        let pics = Pictures::new(&pkg, &cache);
+        let shown = |raw: &str| frame_alt(raw, pics.image(body, raw).as_deref());
+        let placeholder = run_with_alt(&held, "Company logo");
+        assert!(
+            pics.image(body, &placeholder).is_some(),
+            "drawn as an image"
+        );
+        assert_eq!(shown(&placeholder).as_deref(), Some("Company logo"));
+        assert_eq!(shown(&run_with_alt(&real, "Company logo")), None);
+        // No image: the frame alone.
+        assert_eq!(
+            shown(&run_with_alt("rIdNone", "Company logo")).as_deref(),
+            Some("Company logo")
+        );
+        // No text to show.
+        assert_eq!(shown(&run_with_alt("rIdNone", " ")), None);
+        assert_eq!(shown(&run_with_alt(&held, "")), None);
     }
 }

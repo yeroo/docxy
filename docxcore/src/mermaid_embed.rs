@@ -96,6 +96,7 @@ fn picture_drawing_xml(rid_png: &str, rid_svg: &str, w: i64, h: i64, source: &st
         "mermaid:{}",
         crate::mermaid::escape_source(source)
     ));
+    let svg = crate::image::svg_blip_ext(rid_svg);
     format!(
         "<w:r><w:drawing><wp:inline distT=\"0\" distB=\"0\" distL=\"0\" distR=\"0\" \
          xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\">\
@@ -106,10 +107,7 @@ fn picture_drawing_xml(rid_png: &str, rid_svg: &str, w: i64, h: i64, source: &st
          <a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
          <pic:pic xmlns:pic=\"http://schemas.openxmlformats.org/drawingml/2006/picture\">\
          <pic:nvPicPr><pic:cNvPr id=\"1\" name=\"mermaid.png\" descr=\"{descr}\"/><pic:cNvPicPr/></pic:nvPicPr>\
-         <pic:blipFill><a:blip r:embed=\"{rid_png}\">\
-         <a:extLst><a:ext uri=\"{{96DAC541-7B7A-43D3-8B79-37D633B846F1}}\">\
-         <asvg:svgBlip xmlns:asvg=\"http://schemas.microsoft.com/office/drawing/2016/SVG/main\" r:embed=\"{rid_svg}\"/>\
-         </a:ext></a:extLst></a:blip>\
+         <pic:blipFill><a:blip r:embed=\"{rid_png}\">{svg}</a:blip>\
          <a:stretch><a:fillRect/></a:stretch></pic:blipFill>\
          <pic:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"{w}\" cy=\"{h}\"/></a:xfrm>\
          <a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></pic:spPr>\

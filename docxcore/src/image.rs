@@ -446,6 +446,36 @@ fn start_tag(s: &str, tag: &str) -> Option<usize> {
     }
 }
 
+/// The URI of Office 2016's SVG blip extension: Word reads an
+/// `asvg:svgBlip` only under an `a:ext` of exactly this URI.
+pub const SVG_BLIP_EXT_URI: &str = "{96DAC541-7B7A-43D3-8B79-37D633B846F1}";
+
+/// The `a:extLst` a picture's `a:blip` holds to name `rid_svg` as its SVG
+/// (#1639, #1898): Word draws the SVG and keeps the blip's own `r:embed`
+/// (a PNG) as the fallback older readers draw.
+pub fn svg_blip_ext(rid_svg: &str) -> String {
+    format!(
+        "<a:extLst><a:ext uri=\"{SVG_BLIP_EXT_URI}\">\
+         <asvg:svgBlip xmlns:asvg=\"http://schemas.microsoft.com/office/drawing/2016/SVG/main\" r:embed=\"{rid_svg}\"/>\
+         </a:ext></a:extLst>"
+    )
+}
+
+/// An inline picture run whose self-closing `a:blip` (what this crate's
+/// picture runs write) also names `rid_svg` as its SVG ([`svg_blip_ext`],
+/// #1898). `None` for a blip with children already, or anything that is
+/// not an inline picture.
+pub fn with_svg_blip(raw: &str, rid_svg: &str) -> Option<String> {
+    let (_, end) = picture_blip(raw)?;
+    let slash = end.checked_sub(1).filter(|&i| raw.as_bytes()[i] == b'/')?;
+    Some(format!(
+        "{}>{}</a:blip>{}",
+        raw[..slash].trim_end(),
+        svg_blip_ext(rid_svg),
+        &raw[end + 1..]
+    ))
+}
+
 /// Where the `<a:blip ...>` start tag of an inline picture run sits
 /// (`raw[at..end]`, `end` at its `>`), with [`inline_embed`]'s guards.
 fn picture_blip(raw: &str) -> Option<(usize, usize)> {
@@ -1211,5 +1241,15 @@ mod tests {
             replace_click_link(&quoted, &map),
             Some(quoted.replace("'rIdHtmlLink1'", "'rId9'"))
         );
+    }
+    #[test]
+    fn with_svg_blip_opens_a_self_closing_blip_only_1898() {
+        let raw = inline_picture_run_shaped("rId1", 10, 10, 1, "x", "", None, PictureShape::Rect);
+        let with = with_svg_blip(&raw, "rId2").unwrap();
+        assert_eq!(inline_embeds(&with), ["rId1", "rId2"]);
+        assert!(with.contains("</a:blip><a:stretch>"), "{with}");
+        // A blip with children already is left alone.
+        assert_eq!(with_svg_blip(&with, "rId3"), None);
+        assert_eq!(with_svg_blip("<w:r/>", "rId3"), None);
     }
 }

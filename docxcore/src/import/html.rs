@@ -47,13 +47,18 @@
 //!
 //! Images (#1880) only through [`import_html_with`] ([`html_image`]): an
 //! `<img>` is an inline picture sized by its `width` / `height` (attributes,
-//! CSS lengths over them; `auto` clears a side, a percentage leaves the
-//! attribute's) and its pixels, scaled down to the body width. A `data:`
-//! src is decoded, any other goes to the caller's resolver; one that gives
-//! no PNG, JPEG, GIF or BMP is a grey placeholder of the declared size with
-//! its `alt` as Alt Text, or, unsized, the `alt` text itself. Word's
-//! `<![if !vml]>` image is read (its VML twin in a comment is not); a
-//! hidden one, a zero-sized one and one in a list marker make nothing.
+//! CSS lengths over them; `auto` clears a side; a percentage width is of
+//! the containing width, a percentage height `auto`, #1898), its pixels and
+//! its `max-width` / `max-height` (#1898), scaled down to the body width. A
+//! `data:` src is decoded, any other is resolved against the page's `<base
+//! href>` (#1898) and goes to the caller's resolver (or an MHTML message's
+//! part, #1898); one that gives nothing tries its `srcset` and its
+//! `<picture>`'s sources (#1898). One that gives no PNG, JPEG, GIF or BMP
+//! (nor, through [`import_html_with_converter`], an SVG or WebP) is a grey
+//! placeholder of the declared size with its `alt` as Alt Text, or,
+//! unsized, the `alt` text itself. Word's `<![if !vml]>` image is read (its
+//! VML twin in a comment is not); a hidden one, a zero-sized one and one in
+//! a list marker make nothing.
 //!
 //! Tables (#1878) are laid out by [`html_table`]: `colspan` / `rowspan`,
 //! the table's and cells' `width` (attribute or CSS), cell shading from the
@@ -73,7 +78,9 @@
 //! side margins auto is indented evenly.
 
 use super::css::{self, Color, Decl, ElemKey, Len, LineHeight, Path, StyleSheet};
-use super::html_image::{self, ImageResolver, Images, ImportedLink, ImportedMedia, Source};
+use super::html_image::{
+    self, ImageConverter, ImageResolver, Images, ImportedLink, ImportedMedia, Source,
+};
 use super::html_table::{self, CellSpec, MAX_TABLE_NESTING, TableSpec, VAlign, Width};
 use super::{
     Budget, Builder, FlowTail, Link, MAX_DEPTH, TOO_BIG, heading_props, marker_is_numbered,
@@ -212,6 +219,22 @@ pub fn import_html_with(
     import_html_within(bytes, &Budget::standard(), Some(resolve))
 }
 
+/// [`import_html_with`], with SVG and WebP pictures (#1898) turned into
+/// PNG by `convert` ([`ImageConverter`]): a WebP is then a PNG medium; an
+/// SVG is a PNG medium and the SVG kept as a medium of its own (`svg`,
+/// `image/svg+xml`, not an image [`crate::image::sniff`] reads), which its
+/// picture's blip names in Word's `asvg:svgBlip` extension, so a caller
+/// that builds its package without [`HtmlImport::package`] maps that rid
+/// too. Without this (every other entry) every medium sniffs as PNG, JPEG,
+/// GIF or BMP, and an SVG or WebP is a placeholder.
+pub fn import_html_with_converter(
+    bytes: &[u8],
+    resolve: &mut ImageResolver<'_>,
+    convert: &mut ImageConverter<'_>,
+) -> Result<HtmlImport, String> {
+    import_html_converting(bytes, &Budget::standard(), Some(resolve), Some(convert))
+}
+
 /// [`import_html`] against `budget`, with images when `images` gives a
 /// resolver. Decoding, the `<style>` scan and the tokenizer are each one
 /// forward pass over the input (charged once here); the style sheet is
@@ -223,11 +246,40 @@ pub(crate) fn import_html_within(
     budget: &Budget,
     images: Option<&mut ImageResolver<'_>>,
 ) -> Result<HtmlImport, String> {
+    import_html_converting(bytes, budget, images, None)
+}
+
+/// [`import_html_within`] with a converter of SVG and WebP pictures
+/// (#1898), used only when `images` gives a resolver.
+fn import_html_converting(
+    bytes: &[u8],
+    budget: &Budget,
+    images: Option<&mut ImageResolver<'_>>,
+    convert: Option<&mut ImageConverter<'_>>,
+) -> Result<HtmlImport, String> {
     // Three passes: decoding, the `<style>` scan, then the tokenizer.
     if !budget.work(3 * (bytes.len() / 16 + 1)) {
         return Err(TOO_BIG.into());
     }
-    import_decoded(&decode(bytes), budget, images)
+    // An MHTML message (#1898): its root part is the page, in the charset
+    // its part gives, at the URL its `Content-Location` gives; an image
+    // src naming one of its parts takes that part, and only one naming
+    // none goes to the caller's resolver.
+    if let Some(m) = super::mhtml::parse(bytes, budget) {
+        let text = decode_with(&m.html, m.charset.as_deref());
+        let url = m.location.as_deref();
+        return match images {
+            Some(caller) => {
+                let mut resolve = |src: &str, limit: usize| match m.part_for(src, limit) {
+                    Some(part) => part,
+                    None => caller(src, limit),
+                };
+                import_decoded(&text, budget, Some(&mut resolve), convert, url)
+            }
+            None => import_decoded(&text, budget, None, None, url),
+        };
+    }
+    import_decoded(&decode(bytes), budget, images, convert, None)
 }
 
 /// [`import_html_within`] of a page already decoded, so no charset is read
@@ -238,19 +290,33 @@ pub(crate) fn import_html_str_within(text: &str, budget: &Budget) -> Result<Docu
     if !budget.work(2 * (text.len() / 16 + 1)) {
         return Err(TOO_BIG.into());
     }
-    import_decoded(text, budget, None).map(|h| h.document)
+    import_decoded(text, budget, None, None, None).map(|h| h.document)
 }
 
-/// The import of the decoded page `text`, as [`import_html_within`] says.
+/// The import of the decoded page `text`, as [`import_html_within`] says;
+/// `url` is the page's own URL when it has one (an MHTML root part's,
+/// #1898), which its `<base href>` and its srcs are resolved against.
 fn import_decoded(
     text: &str,
     budget: &Budget,
     images: Option<&mut ImageResolver<'_>>,
+    convert: Option<&mut ImageConverter<'_>>,
+    url: Option<&str>,
 ) -> Result<HtmlImport, String> {
-    let sheet = StyleSheet::parse(&collect_styles(text), budget);
+    let (css, base) = collect_styles(text);
+    let base = match (base, url) {
+        (Some(b), Some(u)) => Some(html_image::resolve_ref(u, &b)),
+        (b, u) => b.or(u.map(str::to_string)),
+    };
+    let sheet = StyleSheet::parse(&css, budget);
     let mut h = Html::new(text, budget, sheet);
     if let Some(resolve) = images {
-        h.images = Some(Images::new(resolve));
+        let mut images = Images::new(resolve);
+        images.set_base(base);
+        if let Some(convert) = convert {
+            images.set_converter(convert);
+        }
+        h.images = Some(images);
     }
     h.run();
     // Cards left open at the end of the page end as `</div>` would end them
@@ -288,6 +354,14 @@ fn import_decoded(
 
 /// The page's text, in the encoding it declares.
 pub(crate) fn decode(bytes: &[u8]) -> String {
+    decode_with(bytes, None)
+}
+
+/// The page's text in `charset` when a transport header gives one (an
+/// MHTML part's `Content-Type`, #1898) and it is one this reads, as a
+/// browser lets the header win over a `<meta charset>`; a byte-order mark
+/// still wins over both. Otherwise as [`decode`].
+pub(crate) fn decode_with(bytes: &[u8], charset: Option<&str>) -> String {
     if let Some(rest) = bytes.strip_prefix(b"\xEF\xBB\xBF") {
         return String::from_utf8_lossy(rest).into_owned();
     }
@@ -297,7 +371,10 @@ pub(crate) fn decode(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(b"\xFE\xFF") {
         return utf16(rest, true);
     }
-    match declared_charset(bytes).as_deref() {
+    let known = charset
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| matches!(c.as_str(), "utf-8" | "utf8") || code_page(c).is_some());
+    match known.or_else(|| declared_charset(bytes)).as_deref() {
         Some("utf-8" | "utf8") => String::from_utf8_lossy(bytes).into_owned(),
         Some(cs) => match code_page(cs) {
             Some(page) => single_byte(bytes, page),
@@ -581,8 +658,12 @@ struct Look {
     /// An image's, row's or cell's own `height` (not inherited; a row's
     /// and cell's in twips only, #1894).
     own_height: Option<Width>,
-    /// A table's own `max-width` (not inherited, #1894).
+    /// A table's or image's own `max-width` (not inherited, #1894; an
+    /// image's, #1898).
     own_max_width: Option<Width>,
+    /// An image's own `max-height` in twips (not inherited, #1898): an
+    /// absolute length only (a percentage of an auto height is none).
+    own_max_height: Option<u32>,
     /// A table's or cell's own border lines (not inherited, #1894), top,
     /// right, bottom, left: its `tblBorders` / `tcBorders`.
     own_frame: [Option<ParBorder>; 4],
@@ -698,6 +779,16 @@ const FORMATTING: [&str; 14] = [
     "a", "b", "big", "code", "em", "font", "i", "nobr", "s", "small", "strike", "strong", "tt", "u",
 ];
 
+/// The `<source>`s of an open `<picture>` (#1898): that `picture`'s serial,
+/// how many sources were kept (at most [`html_image::MAX_SOURCES`]) and
+/// their `srcset` candidates, each list parsed once when kept, in order,
+/// at most [`html_image::MAX_CANDIDATES`] in all (r2).
+struct PictureSources {
+    serial: u64,
+    sources: usize,
+    candidates: Vec<(String, f64)>,
+}
+
 /// Elements whose content is not markup: skipped by the tokenizer and by
 /// the `<style>` scan (whose own `style` is the one it reads).
 const RAW_TEXT: [&str; 11] = [
@@ -807,6 +898,11 @@ struct Attrs {
     rules: Option<String>,
     bordercolor: Option<String>,
     span: Option<String>,
+    /// An `<img>`'s or `<source>`'s `srcset`, a `<source>`'s `type` and
+    /// `media` (#1898).
+    srcset: Option<String>,
+    mime: Option<String>,
+    media: Option<String>,
 }
 
 /// One element's style, being computed: its look so far, and the box
@@ -1069,6 +1165,29 @@ fn img_attr_twips(v: &str) -> Option<u32> {
     (!pct).then(|| saturating_twips(n * 15.0))
 }
 
+/// An `<img>`'s `width` attribute (#1898): [`img_attr_twips`]'s pixels,
+/// or a percentage of the containing width, resolved when it is placed.
+fn img_attr_width(v: &str) -> Option<Width> {
+    let (n, pct) = attr_length(v)?;
+    Some(if pct {
+        Width::Pct(n)
+    } else {
+        Width::Twips(saturating_twips(n * 15.0))
+    })
+}
+
+/// An image's absolute CSS length in twips, not capped at a page (#1880
+/// r2): `None` when negative or not absolute.
+fn img_twips(len: Len, font_pt: f64) -> Option<u32> {
+    let t = len.points(font_pt).map(|p| (p * 20.0).round())?;
+    (t >= 0.0).then(|| saturating_twips(t))
+}
+
+/// `pct` percent of `of` twips, rounded, saturating (#1898).
+fn pct_of(of: u32, pct: f64) -> u32 {
+    saturating_twips(f64::from(of) * pct / 100.0)
+}
+
 /// Twips as a `u32`, rounded, saturating at its range.
 fn saturating_twips(t: f64) -> u32 {
     t.round().clamp(0.0, f64::from(u32::MAX)) as u32
@@ -1228,6 +1347,7 @@ impl Cascade {
         look.own_width = None;
         look.own_height = None;
         look.own_max_width = None;
+        look.own_max_height = None;
         look.own_frame = [None; 4];
         look.own_rule_ink = [Some(None); 2];
         look.own_radius = None;
@@ -1480,10 +1600,11 @@ impl Cascade {
             }
         }
         if tag == "img" {
-            // An image's box is in pixels; a percentage has no container
-            // width to resolve against.
+            // An image's box is in pixels; a percentage `width` is of its
+            // containing width, resolved when it is placed (#1898), and a
+            // percentage `height` is of an auto height: none.
             let px = |v: Option<&str>| v.and_then(img_attr_twips).map(Width::Twips);
-            self.look.own_width = px(attrs.width.as_deref());
+            self.look.own_width = attrs.width.as_deref().and_then(img_attr_width);
             self.look.own_height = px(attrs.height.as_deref());
         }
         if tag == "font" {
@@ -1540,15 +1661,46 @@ impl Cascade {
                 };
                 if w.eq_ignore_ascii_case("auto") {
                     *side = None;
-                } else if let Some(len) = css::length(w) {
-                    // A percentage leaves the attribute's size (an e-mail's
-                    // `width="600" style="width:100%"`).
-                    if len.unit != css::Unit::Percent {
+                } else if let Some(len) = css::length(w).filter(|l| l.v >= 0.0) {
+                    if len.unit == css::Unit::Percent {
+                        // A percentage width is of the containing width,
+                        // resolved when the picture is placed (#1898); a
+                        // percentage height is of an auto height, so
+                        // `auto`, as a browser computes it.
+                        *side = (d.name == "width").then_some(Width::Pct(len.v));
+                    } else if let Some(t) = img_twips(len, pt) {
                         // Not capped at a page's width (#1880 r2): the
                         // box is scaled to the body as a whole.
-                        let twips = len.points(pt).map(|p| (p * 20.0).round());
-                        if let Some(t) = twips.filter(|&t| t >= 0.0) {
-                            *side = Some(Width::Twips(saturating_twips(t)));
+                        *side = Some(Width::Twips(t));
+                    }
+                }
+            }
+            // An image's `max-width` / `max-height` (#1898): `none` clears
+            // it; a width's percentage is of the containing width, a
+            // height's is none (its container's height is auto).
+            "max-width" | "max-height" if self.is_img => {
+                let m = v.trim();
+                let pt = font_pt(&self.look.run);
+                let width = d.name == "max-width";
+                if m.eq_ignore_ascii_case("none") {
+                    if width {
+                        self.look.own_max_width = None;
+                    } else {
+                        self.look.own_max_height = None;
+                    }
+                } else if let Some(len) = css::length(m).filter(|l| l.v >= 0.0) {
+                    match (width, len.unit == css::Unit::Percent) {
+                        (true, true) => self.look.own_max_width = Some(Width::Pct(len.v)),
+                        (true, false) => {
+                            if let Some(t) = img_twips(len, pt) {
+                                self.look.own_max_width = Some(Width::Twips(t));
+                            }
+                        }
+                        (false, true) => self.look.own_max_height = None,
+                        (false, false) => {
+                            if let Some(t) = img_twips(len, pt) {
+                                self.look.own_max_height = Some(t);
+                            }
                         }
                     }
                 }
@@ -2463,11 +2615,21 @@ const QUIRKS_PUBLIC_NO_SYSTEM: [&str; 2] = [
     "-//w3c//dtd html 4.01 transitional//",
 ];
 
-/// The CSS text of every `<style>` element of the page, in order: one
-/// forward scan, skipping comments and the contents of elements whose text
-/// is not markup (a `<style>` inside a comment or a script does not apply).
-fn collect_styles(s: &str) -> String {
+/// The CSS text of every `<style>` element of the page, in order, and its
+/// `<base href>` (#1898): one forward scan, skipping comments and the
+/// contents of elements whose text is not markup (a `<style>` or `<base>`
+/// inside a comment or a script does not apply). The base is the first
+/// `<base>` with an `href`, in head or body, as a browser's document base
+/// URL: found before the tokenizer runs, it applies to an `<img>` before
+/// it too. A first `<base href>` that is no base (`page_base` refuses it)
+/// still ends the search, as in a browser (#1898 r1). Each `<base>` tag is
+/// read once and passed over whole; one that never closes ends the search
+/// (no later tag can close either), so the scan stays linear.
+fn collect_styles(s: &str) -> (String, Option<String>) {
     let mut css = String::new();
+    // Until the first `<base>` with an `href`, or a `<base` that never closes.
+    let mut looking = true;
+    let mut base = None;
     let mut i = 0;
     while let Some(off) = s[i..].find('<') {
         let at = i + off;
@@ -2483,6 +2645,20 @@ fn collect_styles(s: &str) -> String {
             .find(|c: char| !c.is_ascii_alphanumeric())
             .unwrap_or(rest.len() - 1);
         let name = rest[1..1 + name_len.min(MAX_TAG)].to_ascii_lowercase();
+        if name == "base" && looking {
+            let Some(end) = tag_end(rest) else {
+                looking = false;
+                i = at + 1;
+                continue;
+            };
+            let attrs = attrs_of(&rest[1 + name_len..end - 1]);
+            if let Some(href) = attrs.href {
+                base = html_image::page_base(&href);
+                looking = false;
+            }
+            i = at + end;
+            continue;
+        }
         if !RAW_TEXT.contains(&name.as_str()) {
             i = at + 1;
             continue;
@@ -2499,7 +2675,7 @@ fn collect_styles(s: &str) -> String {
         }
         i = end;
     }
-    css
+    (css, base)
 }
 
 struct Html<'a> {
@@ -2552,6 +2728,9 @@ struct Html<'a> {
     root_kids: Kids,
     /// The serial the next element opened takes ([`Elem::serial`]).
     next_serial: u64,
+    /// The `<source>`s an open `<picture>` has had so far (#1898): the
+    /// ones a browser may pick (no `media`, a known `type`).
+    picture: Option<PictureSources>,
     /// The `html` and `body` elements' backgrounds (#1894), once each is
     /// seen: the page colour.
     page_fill: [Option<Option<String>>; 2],
@@ -2583,6 +2762,7 @@ impl<'a> Html<'a> {
             break_pending: false,
             root_kids: Kids::default(),
             next_serial: 0,
+            picture: None,
             page_fill: [None, None],
         }
     }
@@ -2835,6 +3015,7 @@ impl<'a> Html<'a> {
                 && self.visible()
                 && (!text.trim().is_empty() || self.sheet.may_match_tag("br")))
             || (name == "img" && self.images.is_some() && self.image_in_view())
+            || (name == "source" && self.images.is_some() && self.in_picture().is_some())
             || (name == "col" && self.kept_table() && self.at_table_level());
         let read = (wanted && self.budget.scanned(text.len())).then(|| {
             let attrs = attrs_of(text);
@@ -2858,6 +3039,13 @@ impl<'a> Html<'a> {
             "img" => {
                 if let Some((attrs, key)) = &read {
                     self.image(attrs, key);
+                }
+            }
+            // A `<picture>`'s source (#1898): its `srcset` kept for the
+            // `<img>` in it.
+            "source" => {
+                if let (Some((attrs, _)), Some(serial)) = (&read, self.in_picture()) {
+                    self.picture_source(serial, attrs);
                 }
             }
             // A table's column (#1894).
@@ -3745,15 +3933,22 @@ impl<'a> Html<'a> {
         if look.run.vanish {
             return;
         }
+        // A percentage is of the containing width (#1898).
+        let room = self.image_room(&look);
         let side = |w: Option<Width>| match w {
             Some(Width::Twips(t)) => Some(t),
-            _ => None,
+            Some(Width::Pct(p)) => Some(pct_of(room, p)),
+            None => None,
         };
         let (width, height) = (side(look.own_width), side(look.own_height));
         if width == Some(0) || height == Some(0) {
             return;
         }
-        let src = attrs.src.as_deref().unwrap_or("").trim();
+        let max = html_image::MaxBox {
+            width: side(look.own_max_width),
+            height: look.own_max_height,
+        };
+        let mut src = attrs.src.as_deref().unwrap_or("").trim().to_string();
         let alt = html_image::alt_text(attrs.alt.as_deref().unwrap_or(""));
         let props = self.run_props();
         // A picture in a URL link keeps it as its click link (#1999), as
@@ -3763,16 +3958,57 @@ impl<'a> Html<'a> {
         let Some(images) = self.images.as_mut() else {
             return;
         };
-        let (rid, pixels) = match images.source(src, budget) {
-            Source::Media { rid, width, height } => (Some(rid), Some((width, height))),
-            Source::Unresolved => (None, None),
+        // A `src` that gives nothing falls back on the `srcset`s (#1898):
+        // the first candidate that gives an image, its size in CSS pixels
+        // by its density. They are read only then (r2).
+        let mut found = images.source(&src, budget);
+        if matches!(found, Source::Unresolved) {
+            let candidates = self.image_candidates(attrs);
+            let Some(images) = self.images.as_mut() else {
+                return;
+            };
+            for (url, density) in candidates {
+                if let Source::Media {
+                    rid,
+                    width,
+                    height,
+                    svg,
+                } = images.source(&url, budget)
+                {
+                    let css = |px: u32| ((f64::from(px) / density).round() as u32).max(1);
+                    found = Source::Media {
+                        rid,
+                        width: css(width),
+                        height: css(height),
+                        svg,
+                    };
+                    src = url;
+                    break;
+                }
+            }
+        }
+        let src = src.as_str();
+        let Some(images) = self.images.as_mut() else {
+            return;
+        };
+        let (rid, pixels, svg) = match found {
+            Source::Media {
+                rid,
+                width,
+                height,
+                svg,
+            } => (Some(rid), Some((width, height)), svg),
+            Source::Unresolved => (None, None, None),
         };
         // A block image (#1922) is a paragraph of its own, placed by its
         // margins or its container's `-webkit-` alignment.
         let block = look
             .own_block
             .then(|| look.own_place.unwrap_or(Align::Left));
-        let declared = html_image::declared_box(width, height, pixels);
+        // Its `max-width` / `max-height` (#1898) bound the box the page
+        // declares, before the fit to the body.
+        let declared =
+            html_image::declared_box(width, height, pixels).map(|b| max.clamp(b, width, height));
         let Some(box_twips) = declared.map(html_image::fit_to_body) else {
             if !alt.is_empty() {
                 self.begin_block_object(block);
@@ -3799,6 +4035,11 @@ impl<'a> Html<'a> {
         });
         let raw =
             crate::image::inline_picture_run_shaped(&rid, cx, cy, id, &name, &alt, outline, shape);
+        // A picture converted from an SVG names it too (#1898), as Word's
+        // own SVG pictures do: the PNG is the fallback.
+        let raw = svg
+            .and_then(|s| crate::image::with_svg_blip(&raw, &s))
+            .unwrap_or(raw);
         let raw = match link.as_deref() {
             Some(Link::Url(url)) => images
                 .link_rid(url, budget)
@@ -3812,6 +4053,121 @@ impl<'a> Html<'a> {
         self.out.object(Inline::Raw(raw), heap);
         self.para_start = false;
         self.end_block_object(block);
+    }
+
+    /// The width an image whose look is `look` is laid out in, in twips
+    /// (#1898), as the page declares it, at most the body's: outside a
+    /// cell, the body less the indents of the blocks around it (a centred
+    /// fixed-width box's included, #1922); inside one, the innermost
+    /// cell's (or card's, #1927) content width less the indents of the
+    /// blocks inside it. A cell is as wide as its own width, else its
+    /// table's; a percentage is of its table's, a table's of the room
+    /// around it. Walked from the outside in, one step per open element.
+    fn image_room(&self, look: &Look) -> u32 {
+        let body = i64::from(html_table::BODY_TWIPS);
+        let width = |w: Option<Width>, of: i64| match w {
+            Some(Width::Twips(t)) => i64::from(t),
+            Some(Width::Pct(p)) => i64::from(pct_of(of.clamp(0, body) as u32, p)),
+            None => of,
+        };
+        let pads =
+            |l: &Look| i64::from(l.own_padding[1].unwrap_or(0) + l.own_padding[3].unwrap_or(0));
+        let outside = |room: i64, l: &Look| room - i64::from(l.indent) - i64::from(l.indent_right);
+        // The content width of the innermost cell so far, and the width of
+        // the innermost table.
+        let mut room = body;
+        let mut table = body;
+        let mut parent: Option<&Look> = None;
+        for e in &self.elems {
+            if e.key.tag == "table" {
+                table = width(e.look.own_width, outside(room, &e.look).max(0));
+            } else if e.kind == Kind::Cell {
+                room = width(e.look.own_width, table) - pads(&e.look);
+            } else if e.look.own_card {
+                // A card's look starts afresh (#1927): its parent's indents
+                // are around it.
+                let around = parent.map_or(room, |p| outside(room, p)).max(0);
+                room = width(e.look.own_width, around) - pads(&e.look);
+            }
+            room = room.clamp(0, body);
+            parent = Some(&e.look);
+        }
+        outside(room, look).clamp(0, body) as u32
+    }
+
+    /// The serial of the `<picture>` that is the innermost open element,
+    /// if it is one (#1898).
+    fn in_picture(&self) -> Option<u64> {
+        self.elems
+            .last()
+            .filter(|e| e.key.tag == "picture")
+            .map(|e| e.serial)
+    }
+
+    /// Keep a `<source>`'s `srcset` for the `<img>` of the `<picture>`
+    /// `serial` (#1898), unless a browser might not pick it: one with a
+    /// `media` query, or a `type` that is no image the import can use.
+    fn picture_source(&mut self, serial: u64, attrs: &Attrs) {
+        if attrs.media.is_some()
+            || attrs
+                .mime
+                .as_deref()
+                .is_some_and(|t| !html_image::usable_type(t))
+        {
+            return;
+        }
+        let Some(srcset) = attrs.srcset.as_deref() else {
+            return;
+        };
+        if self.picture.as_ref().is_none_or(|p| p.serial != serial) {
+            self.picture = Some(PictureSources {
+                serial,
+                sources: 0,
+                candidates: Vec::new(),
+            });
+        }
+        let budget = self.budget;
+        let Some(p) = self.picture.as_mut() else {
+            return;
+        };
+        // Each kept source's list parsed once, here (r2), within the cap.
+        if p.sources >= html_image::MAX_SOURCES
+            || p.candidates.len() >= html_image::MAX_CANDIDATES
+            || !budget.scanned(srcset.len())
+        {
+            return;
+        }
+        p.sources += 1;
+        for c in html_image::srcset_candidates(srcset) {
+            if p.candidates.len() >= html_image::MAX_CANDIDATES || !budget.alloc(c.0.len() + 32) {
+                break;
+            }
+            p.candidates.push(c);
+        }
+    }
+
+    /// Where an `<img>` whose `src` gave nothing looks next (#1898), in
+    /// order: its own `srcset`, then the kept `<source>`s of the
+    /// `<picture>` it is in, each list's candidates as
+    /// [`html_image::srcset_candidates`] orders them; at most
+    /// [`html_image::MAX_CANDIDATES`] in all.
+    /// Called only once its `src` has given nothing (r2): its own list is
+    /// scanned then (charged), the sources' were parsed when kept.
+    fn image_candidates(&self, attrs: &Attrs) -> Vec<(String, f64)> {
+        let mut out = Vec::new();
+        if let Some(own) = attrs.srcset.as_deref() {
+            if self.budget.scanned(own.len()) {
+                out = html_image::srcset_candidates(own);
+            }
+        }
+        if let (Some(serial), Some(p)) = (self.in_picture(), self.picture.as_ref()) {
+            if serial == p.serial {
+                let room = html_image::MAX_CANDIDATES.saturating_sub(out.len());
+                out.extend(p.candidates.iter().take(room).cloned());
+            }
+        }
+        out.truncate(html_image::MAX_CANDIDATES);
+        out
     }
 
     /// Before a block image's content (`block`: its place): end the text
@@ -4523,6 +4879,9 @@ fn attrs_of(attrs: &str) -> Attrs {
             "rules" => Some(&mut out.rules),
             "bordercolor" => Some(&mut out.bordercolor),
             "span" => Some(&mut out.span),
+            "srcset" => Some(&mut out.srcset),
+            "type" => Some(&mut out.mime),
+            "media" => Some(&mut out.media),
             _ => None,
         };
         if let Some(slot) = slot.filter(|s| s.is_none()) {
@@ -6621,7 +6980,7 @@ mod tests {
         }
         let page = format!("<style>{css_text}</style><p class=c5>five</p><p class=c50000>late</p>");
         let budget = Budget::standard();
-        let sheet = StyleSheet::parse(&collect_styles(&page), &budget);
+        let sheet = StyleSheet::parse(&collect_styles(&page).0, &budget);
         assert_eq!(sheet.len(), css::MAX_RULES);
         let d = doc(&page);
         assert_eq!(run_of(&d, "five").props.color.as_deref(), Some("FF0000"));
@@ -7221,7 +7580,7 @@ mod image_tests {
     }
 
     #[test]
-    fn css_lengths_beat_the_attributes_and_auto_and_percent_do_not() {
+    fn css_lengths_beat_the_attributes_and_auto_and_a_percent_is_of_the_body() {
         let (d, _, _) = with_images(
             "<style>img.w { width: 80px }</style>\
              <p><img src=a.png width=200 style='width:100px'>\
@@ -7239,8 +7598,10 @@ mod image_tests {
                 (200 * PX, 100 * PX),
                 // `auto` clears the attribute: the pixels.
                 (40 * PX, 20 * PX),
-                (200 * PX, 100 * PX),
-                (40 * PX, 20 * PX),
+                // A percentage, CSS or attribute, is of the containing
+                // width (#1898): half the body, the height by the aspect.
+                (5895 * 635, 2947 * 635),
+                (5895 * 635, 2947 * 635),
                 // The rule's width beats the attribute's height's aspect.
                 (80 * PX, 10 * PX),
                 (96 * PX, 48 * PX),
@@ -11109,3 +11470,8 @@ mod table_1894_tests {
         assert!(!pkg.has_display_background_shape());
     }
 }
+
+// The images leftovers of #1880 (#1898), kept out of this long file.
+#[cfg(test)]
+#[path = "html_tests_1898.rs"]
+mod tests_1898;
