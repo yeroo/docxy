@@ -286,6 +286,25 @@ fn the_shipped_web_ui_wraps() {
     assert_eq!(unwrap(&html).unwrap().payload, b"PK");
 }
 
+/// No JS test runs here, so a source check (#1936): the page draws a
+/// cropped picture's `radius` (docxwasm's richdoc `img` segment) as its
+/// `<img>`'s CSS `border-radius`, escaped, and a picture without one as
+/// before.
+#[test]
+fn the_page_draws_a_pictures_crop_as_border_radius_1936() {
+    let app = include_str!("../web/app.js");
+    let at = app.find("case 'img': {").expect("the img segment case");
+    let case = &app[at..at + app[at..].find("default:").expect("the case's end")];
+    assert!(
+        case.contains(r#"s.radius ? ' style="border-radius:' + esc(s.radius) + '"' : ''"#),
+        "{case}"
+    );
+    assert!(
+        case.contains(r#"'" height="' + ht + '"' + round + '>'"#),
+        "{case}"
+    );
+}
+
 #[test]
 fn meta_json_round_trips_awkward_text() {
     let mut meta = Meta::default();

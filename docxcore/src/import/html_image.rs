@@ -850,56 +850,133 @@ pub(crate) fn fit_to_body((w, h): (u128, u128)) -> (u64, u64) {
     (side(w), side(h))
 }
 
-/// An `<img>`'s computed `border-radius` (#1926): one radius for all four
-/// corners (horizontal radii; a vertical part is dropped), or `NonUniform`
-/// when the corners differ.
+/// One half of a corner's computed radius (#1926, #1936): a percentage of
+/// the box's side (the width for a horizontal radius, the height for a
+/// vertical one) or a length in twips against the element's font. A zero
+/// percentage is `Twips(0)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum Radius {
-    /// A percentage of the box's sides.
+pub(crate) enum RLen {
     Pct(f64),
-    /// A length, in twips against the element's font.
     Twips(u64),
-    NonUniform,
+}
+
+impl RLen {
+    /// This radius in twips, in a box side of `side` twips: at most 1e300,
+    /// so that a sum of four stays finite (a page's digits can spell an
+    /// infinite percentage) and the clamp's factor never makes a NaN.
+    fn in_side(self, side: f64) -> f64 {
+        let r = match self {
+            RLen::Pct(p) => p / 100.0 * side,
+            RLen::Twips(t) => t as f64,
+        };
+        r.min(1e300)
+    }
+}
+
+/// An element's computed `border-radius` (#1926, #1936): each corner's
+/// horizontal and vertical radius, top left, top right, bottom right,
+/// bottom left. A corner left unset is a square one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Radius(pub(crate) [(RLen, RLen); 4]);
+
+impl Radius {
+    /// The same circular radius at all four corners.
+    #[cfg(test)]
+    pub(crate) fn uniform(r: RLen) -> Radius {
+        Radius([(r, r); 4])
+    }
+
+    /// Every corner square.
+    pub(crate) fn is_square(&self) -> bool {
+        self.0
+            .iter()
+            .all(|&(h, v)| h == RLen::Twips(0) || v == RLen::Twips(0))
+    }
+
+    /// Each corner's `(rx, ry)` in twips, in the box `(w, h)`.
+    fn in_box(&self, w: f64, h: f64) -> [(f64, f64); 4] {
+        self.0.map(|(rx, ry)| (rx.in_side(w), ry.in_side(h)))
+    }
 }
 
 /// The crop shape a picture of declared box `(w, h)` (twips, before
 /// [`fit_to_body`]: the fit is uniform, so the ratio holds) gets from its
-/// `radius` (#1926), as Word's Crop to Shape writes it:
-///
-/// - a percentage of 50 or more: the box's ellipse; under 50, a
-///   `roundRect` whose circular corner is the browser's elliptical corner's
-///   short radius, `p% * min(w, h)` (`adj` is `p * 1000`);
-/// - a length: a square box's circle once it reaches half the side (a
-///   browser clamps it there), else a `roundRect` of `r / min(w, h)`,
-///   clamped at half the shorter side (a browser's stadium);
-/// - none, zero, corners that differ, or an empty box: a rectangle.
+/// own `radius` (#1926); [`clipped_shape`] without a wrapper's clip.
+#[cfg(test)]
 pub(crate) fn shape(radius: Option<Radius>, (w, h): (u128, u128)) -> image::PictureShape {
+    clipped_shape(radius, None, (w, h))
+}
+
+/// The crop shape a picture of declared box `(w, h)` gets from its own
+/// `radius` and the rounded clip of a wrapper around it (#1936), as Word's
+/// Crop to Shape writes it. Each corner is resolved to `(rx, ry)` in the
+/// box (a percentage of the width, of the height), the larger of the two's
+/// halves (a browser shows the intersection of the two clips), then all
+/// scaled as CSS does when the radii on a side add up past it (one factor,
+/// the smallest `side / sum` under 1).
+///
+/// - Every corner reaching half of both sides: the box's ellipse.
+/// - Else each corner is circular, of its short radius `min(rx, ry)` (Word's
+///   presets are circular), an `adj` of `r / min(w, h)` in 100000, at most
+///   50000: all square is a rectangle, all equal a `roundRect`, the top
+///   pair and the bottom pair each equal a `round2SameRect`, the diagonal
+///   pairs a `round2DiagRect`, only the top right a `round1Rect`.
+/// - Anything else (a side pair on the left or right, another lone corner,
+///   three corners: no preset without turning the picture), none, or an
+///   empty box: a rectangle.
+pub(crate) fn clipped_shape(
+    radius: Option<Radius>,
+    clip: Option<Radius>,
+    (w, h): (u128, u128),
+) -> image::PictureShape {
     use image::{PictureShape, ROUND_RECT_MAX_ADJ};
-    let round = |adj: f64| {
-        let adj = adj.round().min(f64::from(ROUND_RECT_MAX_ADJ));
-        if adj >= 1.0 {
-            PictureShape::RoundRect { adj: adj as u32 }
-        } else {
-            PictureShape::Rect
+    if w == 0 || h == 0 {
+        return PictureShape::Rect;
+    }
+    let (w, h) = (w as f64, h as f64);
+    let mut corners = [(0.0f64, 0.0f64); 4];
+    for r in [radius, clip].into_iter().flatten() {
+        for (c, (rx, ry)) in corners.iter_mut().zip(r.in_box(w, h)) {
+            *c = (c.0.max(rx), c.1.max(ry));
         }
-    };
+    }
+    // CSS's overlap clamp: the radii on each side (top, right, bottom,
+    // left) add up to at most that side, by one factor for all.
+    let [tl, tr, br, bl] = corners;
+    let mut f = 1.0f64;
+    for (side, sum) in [
+        (w, tl.0 + tr.0),
+        (h, tr.1 + br.1),
+        (w, br.0 + bl.0),
+        (h, tl.1 + bl.1),
+    ] {
+        if sum > side {
+            f = f.min(side / sum);
+        }
+    }
+    let corners = corners.map(|(rx, ry)| (rx * f, ry * f));
+    let half = |r: f64, side: f64| r >= side / 2.0 * (1.0 - 1e-9);
+    if corners.iter().all(|&(rx, ry)| half(rx, w) && half(ry, h)) {
+        return PictureShape::Ellipse;
+    }
     let short = w.min(h);
-    match radius {
-        None | Some(Radius::NonUniform) => PictureShape::Rect,
-        _ if short == 0 => PictureShape::Rect,
-        Some(Radius::Pct(p)) if p >= 50.0 => PictureShape::Ellipse,
-        Some(Radius::Pct(p)) if p > 0.0 => round(p * 1000.0),
-        Some(Radius::Pct(_)) | Some(Radius::Twips(0)) => PictureShape::Rect,
-        Some(Radius::Twips(r)) => {
-            let r = u128::from(r);
-            if w == h && 2 * r >= w {
-                PictureShape::Ellipse
-            } else {
-                // `r / short` as a fraction of 100000, in f64 only once it
-                // is at most a few times the clamp.
-                round(100_000.0 * (r.min(short) as f64) / short as f64)
-            }
-        }
+    let adj = corners.map(|(rx, ry)| {
+        let a = (100_000.0 * rx.min(ry) / short).round();
+        a.clamp(0.0, f64::from(ROUND_RECT_MAX_ADJ)) as u32
+    });
+    let [tl, tr, br, bl] = adj;
+    if adj.iter().all(|&a| a == 0) {
+        PictureShape::Rect
+    } else if tl == tr && tr == br && br == bl {
+        PictureShape::RoundRect { adj: tl }
+    } else if tl == tr && br == bl {
+        PictureShape::Round2Same { adj1: tl, adj2: br }
+    } else if tl == br && tr == bl {
+        PictureShape::Round2Diag { adj1: tl, adj2: tr }
+    } else if tl == 0 && br == 0 && bl == 0 {
+        PictureShape::Round1 { adj: tr }
+    } else {
+        PictureShape::Rect
     }
 }
 
@@ -1042,55 +1119,183 @@ mod tests {
         let px = |n: u128| n * 15;
         let avatar = (px(32), px(32));
         let card = (px(120), px(40));
+        // Uniform corners, as #1926 wrote them.
+        let pct = |p: f64| {
+            Radius::uniform(if p > 0.0 {
+                RLen::Pct(p)
+            } else {
+                RLen::Twips(0)
+            })
+        };
+        let tw = |t: u64| Radius::uniform(RLen::Twips(t));
         // Percentages: 50 or more is the ellipse, square or not.
-        assert_eq!(shape(Some(Radius::Pct(50.0)), avatar), Ellipse);
-        assert_eq!(shape(Some(Radius::Pct(80.0)), card), Ellipse);
+        assert_eq!(shape(Some(pct(50.0)), avatar), Ellipse);
+        assert_eq!(shape(Some(pct(80.0)), card), Ellipse);
         // Under 50: the short radius, whatever the box.
-        assert_eq!(
-            shape(Some(Radius::Pct(10.0)), card),
-            RoundRect { adj: 10_000 }
-        );
-        assert_eq!(
-            shape(Some(Radius::Pct(25.0)), avatar),
-            RoundRect { adj: 25_000 }
-        );
+        assert_eq!(shape(Some(pct(10.0)), card), RoundRect { adj: 10_000 });
+        assert_eq!(shape(Some(pct(25.0)), avatar), RoundRect { adj: 25_000 });
         // Lengths, against the shorter side.
         assert_eq!(
-            shape(Some(Radius::Twips(px(8) as u64)), card),
+            shape(Some(tw(px(8) as u64)), card),
             RoundRect { adj: 20_000 }
         );
-        assert_eq!(shape(Some(Radius::Twips(px(16) as u64)), avatar), Ellipse);
-        assert_eq!(shape(Some(Radius::Twips(px(99) as u64)), avatar), Ellipse);
+        assert_eq!(shape(Some(tw(px(16) as u64)), avatar), Ellipse);
+        assert_eq!(shape(Some(tw(px(99) as u64)), avatar), Ellipse);
         assert_eq!(
-            shape(Some(Radius::Twips(px(15) as u64)), avatar),
+            shape(Some(tw(px(15) as u64)), avatar),
             RoundRect { adj: 46_875 }
         );
         // Past half a non-square box's short side: the stadium.
         assert_eq!(
-            shape(Some(Radius::Twips(px(30) as u64)), card),
+            shape(Some(tw(px(30) as u64)), card),
             RoundRect { adj: 50_000 }
         );
-        assert_eq!(
-            shape(Some(Radius::Twips(u64::MAX)), card),
-            RoundRect { adj: 50_000 }
-        );
+        assert_eq!(shape(Some(tw(u64::MAX)), card), RoundRect { adj: 50_000 });
         // The ratio is the box's, so a box later fitted to the body keeps
         // it: 8px on 1200x400 px is 2000 in 100000.
         assert_eq!(
-            shape(Some(Radius::Twips(px(8) as u64)), (px(1200), px(400))),
+            shape(Some(tw(px(8) as u64)), (px(1200), px(400))),
             RoundRect { adj: 2000 }
         );
         // Nothing to round.
         for r in [
             None,
-            Some(Radius::NonUniform),
-            Some(Radius::Pct(0.0)),
-            Some(Radius::Twips(0)),
-            Some(Radius::Pct(0.0001)),
+            // One corner alone (#1926 r0 `NonUniform`): no preset.
+            Some(Radius([
+                (RLen::Twips(120), RLen::Twips(120)),
+                (RLen::Twips(0), RLen::Twips(0)),
+                (RLen::Twips(0), RLen::Twips(0)),
+                (RLen::Twips(0), RLen::Twips(0)),
+            ])),
+            Some(pct(0.0)),
+            Some(tw(0)),
+            Some(pct(0.0001)),
         ] {
             assert_eq!(shape(r, card), Rect, "{r:?}");
         }
-        assert_eq!(shape(Some(Radius::Pct(50.0)), (0, px(4))), Rect);
+        assert_eq!(shape(Some(pct(50.0)), (0, px(4))), Rect);
+    }
+
+    #[test]
+    fn corners_that_differ_and_elliptical_corners_map_to_presets_1936() {
+        use crate::image::PictureShape::{
+            Ellipse, Rect, Round1, Round2Diag, Round2Same, RoundRect,
+        };
+        let px = |n: u64| RLen::Twips(n * 15);
+        let card = (120 * 15, 40 * 15);
+        // `border-radius: a b c d`, each corner circular.
+        let corners = |c: [RLen; 4]| Some(Radius(c.map(|r| (r, r))));
+        let (r8, r0) = (px(8), px(0));
+        assert_eq!(
+            shape(corners([r8, r8, r0, r0]), card),
+            Round2Same {
+                adj1: 20_000,
+                adj2: 0
+            }
+        );
+        assert_eq!(
+            shape(corners([r0, r0, r8, r8]), card),
+            Round2Same {
+                adj1: 0,
+                adj2: 20_000
+            }
+        );
+        assert_eq!(
+            shape(corners([r8, r0, r8, r0]), card),
+            Round2Diag {
+                adj1: 20_000,
+                adj2: 0
+            }
+        );
+        assert_eq!(
+            shape(corners([r0, r8, r0, r8]), card),
+            Round2Diag {
+                adj1: 0,
+                adj2: 20_000
+            }
+        );
+        assert_eq!(
+            shape(corners([r0, r8, r0, r0]), card),
+            Round1 { adj: 20_000 }
+        );
+        assert_eq!(
+            shape(corners([px(4), px(4), px(16), px(16)]), card),
+            Round2Same {
+                adj1: 10_000,
+                adj2: 40_000
+            }
+        );
+        // No preset without turning the picture: a lone corner other than
+        // the top right, a side pair on the left or right, three corners.
+        for c in [
+            [r8, r0, r0, r0],
+            [r0, r0, r8, r0],
+            [r8, r0, r0, r8],
+            [r0, r8, r8, r0],
+            [r8, r8, r8, r0],
+            [px(1), px(2), px(3), px(4)],
+        ] {
+            assert_eq!(shape(corners(c), card), Rect, "{c:?}");
+        }
+        // Elliptical corners: the short radius, `min(rx, ry)`.
+        let ell = |rx: RLen, ry: RLen| Some(Radius([(rx, ry); 4]));
+        assert_eq!(
+            shape(ell(RLen::Pct(50.0), RLen::Pct(10.0)), (1500, 1500)),
+            RoundRect { adj: 10_000 }
+        );
+        assert_eq!(shape(ell(px(20), px(10)), card), RoundRect { adj: 25_000 });
+        // Half of both sides: the ellipse, a length's too.
+        assert_eq!(shape(ell(px(60), px(20)), card), Ellipse);
+        // A corner square in either half is square.
+        assert_eq!(shape(ell(px(8), px(0)), card), Rect);
+        // The overlap clamp: 60% of each side is scaled back to 50%.
+        assert_eq!(shape(ell(RLen::Pct(60.0), RLen::Pct(60.0)), card), Ellipse);
+        // One factor for all corners: the top's 30 + 30 px on 120 px fit,
+        // the sides' 30 + 15 px on 40 px scale all by 8/9, to 26.7 px (past
+        // half the short side: 50000) and 13.3 px.
+        assert_eq!(
+            shape(corners([px(30), px(30), px(15), px(15)]), card),
+            Round2Same {
+                adj1: 50_000,
+                adj2: 33_333
+            }
+        );
+        // Huge radii stay finite: the stadium.
+        let huge = RLen::Pct(f64::INFINITY);
+        assert_eq!(shape(ell(huge, huge), card), RoundRect { adj: 50_000 });
+        assert_eq!(
+            shape(ell(RLen::Twips(u64::MAX), RLen::Twips(u64::MAX)), card),
+            RoundRect { adj: 50_000 }
+        );
+        // As in CSS, one huge half scales the other to nothing.
+        assert_eq!(shape(ell(huge, px(10)), card), Rect);
+    }
+
+    #[test]
+    fn a_wrappers_clip_adds_its_corners_1936() {
+        use crate::image::PictureShape::{Ellipse, Rect, Round2Same, RoundRect};
+        let avatar = (64 * 15, 64 * 15);
+        let circle = Some(Radius::uniform(RLen::Pct(50.0)));
+        let small = Some(Radius::uniform(RLen::Twips(4 * 15)));
+        // The larger corner wins: the intersection of the two clips.
+        assert_eq!(clipped_shape(None, circle, avatar), Ellipse);
+        assert_eq!(clipped_shape(small, circle, avatar), Ellipse);
+        assert_eq!(clipped_shape(circle, small, avatar), Ellipse);
+        assert_eq!(clipped_shape(None, small, avatar), RoundRect { adj: 6250 });
+        let top = Some(Radius([
+            (RLen::Twips(8 * 15), RLen::Twips(8 * 15)),
+            (RLen::Twips(8 * 15), RLen::Twips(8 * 15)),
+            (RLen::Twips(0), RLen::Twips(0)),
+            (RLen::Twips(0), RLen::Twips(0)),
+        ]));
+        assert_eq!(
+            clipped_shape(top, small, avatar),
+            Round2Same {
+                adj1: 12_500,
+                adj2: 6250
+            }
+        );
+        assert_eq!(clipped_shape(None, None, avatar), Rect);
     }
 
     #[test]

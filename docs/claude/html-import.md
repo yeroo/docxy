@@ -403,40 +403,122 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   `pic:spPr/a:prstGeom` (`image::inline_picture_run_shaped`,
   `image::PictureShape`): `ellipse` (`<a:avLst/>`), or `roundRect` with
   `<a:gd name="adj" fmla="val N"/>` (the corner is `min(w, h) * N / 100000`,
-  N in 0..=50000). No radius, zero, or corners that differ write `rect`, the
-  run exactly as before. So it saves unchanged (the run is `Inline::Raw`),
-  Word and LibreOffice draw it, and the suite draws it (and a Word
-  document's own oval or rounded crop) clipped
-  (`docs/claude/suite-document.md`, "Suite inline pictures").
-- The cascade: only an `img` reads `border-radius` and the four longhands
-  (`Cascade::radius`, per corner, top left, top right, bottom right,
-  bottom left; not inherited, so a card's radius never reaches the picture
-  in it). Only the horizontal radius counts: the shorthand's part before
-  `/` (`css::radius_corners`), a longhand's first value
-  (`css::radius_corner`); the vertical part is checked and dropped. A
-  negative or unreadable value is invalid (ignored, the earlier one stands);
-  `initial`/`unset` is square. `Cascade::finish` resolves the corners with
-  the element's final font (`image_radius`: an `em` declared before the
-  `font-size` takes the new size) into `Look::own_radius`
-  (`html_image::Radius`: `Pct`, `Twips`, or `NonUniform`; a corner left
-  unset is a square one, and zero lengths and zero percentages are equal).
-- The mapping (`html_image::shape`), measured in the box the page declares
-  (`html_image::declared_box`, before `fit_to_body` scales a wide picture
-  to the body; the scale is uniform, so the ratio holds): a percentage of
-  50 or more is the ellipse, square or not; under 50 a `roundRect` of the
-  corner's short radius, `p% * min(w, h)` (adj `p * 1000`); a length on a
-  square box reaching half its side is the ellipse (a browser clamps there),
-  else a `roundRect` of `r / min(w, h)`, at most 50000 (a browser's
-  stadium). The unresolved placeholder takes the shape too; its outline
-  follows it in Word.
-- Every other element's `border-radius` (a card's cell, `div`, `span`) is
-  ignored as before: its background and padding import, its radius is
-  never text.
-- Known limits: corners that differ (`8px 8px 0 0`, Word's
-  `round2SameRect` and others not mapped), elliptical corners (a browser's
-  non-square percentage corner is `p%w x p%h`; the long radius is lost),
-  a wrapper's `overflow: hidden` rounding the image inside it, a rounded
-  card background, PDF export and the editable-HTML page drawing the crop.
+  N in 0..=50000), and since #1936 the presets for corners that differ. No
+  radius, zero, or corners no preset draws write `rect`, the run exactly as
+  before. So it saves unchanged (the run is `Inline::Raw`), Word and
+  LibreOffice draw it, and the suite draws it (and a Word document's own
+  oval or rounded crop) clipped (`docs/claude/suite-document.md`, "Suite
+  inline pictures").
+- The cascade (`Cascade::radius`, per corner, top left, top right, bottom
+  right, bottom left; not inherited, so a card's radius never reaches the
+  picture in it): a negative or unreadable value is invalid (ignored, the
+  earlier one stands); `initial`/`unset` is square. `Cascade::finish`
+  resolves the corners with the element's final font (`image_radius`: an
+  `em` declared before the `font-size` takes the new size) into
+  `Look::own_radius`. Since #1936 every element reads it, each corner keeps
+  its vertical radius, and it is `html_image::Radius([(RLen, RLen); 4])`
+  (the #1936 section).
+- The mapping (`html_image::clipped_shape` since #1936, which holds the
+  rule), measured in the box the page declares (`html_image::declared_box`,
+  before `fit_to_body` scales a wide picture to the body; the scale is
+  uniform, so the ratio holds). Uniform corners map as #1926 did: a
+  percentage of 50 or more is the ellipse, square or not; under 50 a
+  `roundRect` of the corner's short radius, `p% * min(w, h)` (adj
+  `p * 1000`); a length on a square box reaching half its side is the
+  ellipse (a browser clamps there), else a `roundRect` of `r / min(w, h)`,
+  at most 50000 (a browser's stadium). The unresolved placeholder takes the
+  shape too; its outline follows it in Word.
+- Another element's `border-radius` (a card's cell, `div`, `span`) crops
+  nothing unless it is a clipping wrapper the picture fills (#1936): its
+  background and padding import, its radius is never text.
+- Known limits (#1926; most lifted by #1936, below): corners that differ,
+  elliptical corners, a wrapper's `overflow: hidden` rounding the image
+  inside it and the editable-HTML page drawing the crop are #1936's. Still
+  open: a rounded card background and PDF export (see #1936's limits).
+
+## HTML import corners that differ, rounded wrappers, the editable page (#1936)
+
+- Presets (`image::PictureShape`): besides `ellipse` and `roundRect`,
+  `round1Rect` (`Round1 { adj }`, the top-right corner only),
+  `round2SameRect` (`Round2Same { adj1, adj2 }`: both top corners, both
+  bottom ones) and `round2DiagRect` (`Round2Diag { adj1, adj2 }`: top left
+  and bottom right, top right and bottom left), each guide in
+  `0..=50000`, written as `<a:gd name="adj1" fmla="val N"/>`... and read
+  by name (`image::guide_value`), the preset's default when absent or
+  unreadable (`adj`/`adj1` 16667, `adj2` 0, ECMA-376's), clamped.
+  `PictureShape::corner_radii(w, h)` gives each corner's circular radius,
+  `min(w, h) * adj / 100000`, an ellipse half the shorter side: the one
+  geometry the suite and docxwasm draw from.
+- The cascade keeps each corner's vertical radius: the shorthand's part
+  after `/` (each half expanded one to four values alone; none: the
+  horizontal one) and a longhand's second value (`css::radius_corners`,
+  `css::radius_corner`, `css::CornerRadius`). `image_radius` resolves both
+  halves in the final font into `html_image::Radius` (`[(RLen, RLen); 4]`,
+  `RLen::Pct` / `RLen::Twips`), `None` when every corner is square (a
+  corner square in either half is square). Every element reads
+  `border-radius` now (`Look::own_radius`, boxed, not inherited); it is
+  still never text, and only an `img`'s or a clipping wrapper's counts.
+- The mapping (`html_image::clipped_shape`, in the declared box): each
+  corner `(rx, ry)` (a percentage of the width, of the height), then CSS's
+  overlap clamp, one factor for all, the smallest `side / sum` under 1 of
+  the four sides (each radius capped at 1e300, so a page's digits spelling
+  infinity make no NaN). Every corner at half of both sides (within 1e-9)
+  is the ellipse. Else each corner is circular, `min(rx, ry)`, as `adj =
+  round(100000 * r / min(w, h))`, at most 50000: all 0 a rectangle, all
+  equal `roundRect`, top pair and bottom pair each equal `round2SameRect`,
+  the diagonal pairs `round2DiagRect`, only the top right `round1Rect`.
+  Anything else is a rectangle: a left or right side pair, a lone corner
+  other than the top right, three corners (none has a preset without
+  flipping or rotating, which turns the picture too). So `8px 8px 0 0` is
+  `round2SameRect`, `50% / 10%` on a square `roundRect` 10000 (it was the
+  ellipse), and `border-bottom-left-radius: 8px 2px` with three 8 px
+  corners a rectangle (it was `roundRect`: the corner really is 8 x 2).
+- A rounded wrapper (`Cascade::clip_box`, `Html::wrapper_clip`): an `img`
+  takes the corners of its nearest open ancestor with a non-square radius
+  of its own when that ancestor clips: `overflow` (or `overflow-x` and
+  `-y`) `hidden` or `clip` on both axes (`auto`, `scroll` are not a crop
+  here); a block container (`Cascade::container`: a block, cell, list or
+  HTML5 container unless its own `display` is not one; an inline element
+  or a custom tag only with `display: inline-block`, `block` and the like,
+  `block_container`); no border (`own_borders`) and no non-zero padding of
+  its own; an absolute declared width and height (a cell's attributes or
+  CSS, another element's CSS `width`/`height`, `Cascade::css_box`, in its
+  final font; a percentage or `auto` is none) the picture's declared box
+  matches within a CSS pixel, 15 twips, each way (`FILL_SLACK`,
+  `Look::own_clip`, `Clip`). Every open element between the two is
+  `Kind::Inline` (an `<a>` link avatar). The
+  picture comes first in it: `Builder::shown` (bumped by
+  `flush_marks(true)`: non-blank text, an object, a page break) is what it
+  was when the wrapper opened (`Elem::shown_at`; `u64::MAX` for a reopened
+  element), and the img and each element below the wrapper are their
+  parents' first element child (`key.index == 0`: no `<br>` before it).
+  A cell whose own CSS padding leaves a side to the table needs its
+  table's `cellpadding` absent (a browser's 1) or at most 1
+  (`thin_cellpadding`). Each corner is then the larger of the picture's
+  own and the wrapper's, both in the picture's box (the intersection a
+  browser shows; an img's `border-radius: 0` never undoes the clip). The
+  nearest rounded ancestor decides: when it does not clip, an outer one is
+  not looked at. No look-ahead: content after the picture in a wrapper
+  its size is clipped out of view in a browser anyway (here it stays, as
+  before).
+- The editable-HTML page (`htmlbundle/web/`, no area file of its own):
+  docxwasm's richdoc `img` segment has `"radius"`, a CSS `border-radius`,
+  when the picture is cropped (`richdoc::crop_radius`): `50%` for an
+  ellipse (a true oval in a browser), else the four `corner_radii` of its
+  `cx` x `cy` in px (9525 EMUs a px) to a tenth, `"8px 8px 0px 0px"`.
+  `app.js` puts it on the `<img>` as `style="border-radius:..."`
+  (escaped); a rectangle's segment and markup are as before. No JS test
+  runs, so `htmlbundle`'s tests check `app.js`'s `case 'img'` source.
+- Known limits: a rounded card background (a card is a one-cell table
+  with `w:shd`; Word has no rounded cell or paragraph shading); PDF
+  export (it draws no inline body pictures at all, only a header's picture
+  watermarks, so there is nothing to clip); Word's presets are circular,
+  so an elliptical corner is its short radius; patterns with no preset are
+  rectangles; `<img style="width:100%;height:100%">` in a fixed-size `div`
+  wrapper is a rectangle (`image_room` resolves an img's percentage only
+  against a cell or card, and a percentage height is none); the suite
+  draws a non-square ellipse as a stadium (gpui's corners are circular),
+  the editable page as a true oval.
 
 ## HTML import nested cards (#1927)
 

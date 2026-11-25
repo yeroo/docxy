@@ -1807,21 +1807,26 @@ fn radius_value(t: &str) -> Option<Len> {
     length(t).filter(|l| l.v >= 0.0)
 }
 
-/// `border-radius` (#1926): the horizontal radius of each corner, top
-/// left, top right, bottom right, bottom left, expanded from one to four
-/// values as a box's sides are. A vertical part after `/` is checked (one
-/// to four radii) and dropped: a picture's crop corner is circular. A
-/// negative, unreadable or missing value, or a fifth, makes the whole
-/// declaration invalid (`None`). `initial` and `unset` are square corners.
-pub(crate) fn radius_corners(value: &str) -> Option<[Len; 4]> {
+/// A corner's radius (#1926, #1936): its horizontal and its vertical
+/// radius, each a length or a percentage (of the box's width and of its
+/// height).
+pub(crate) type CornerRadius = (Len, Len);
+
+/// `border-radius` (#1926, #1936): each corner's horizontal and vertical
+/// radius, top left, top right, bottom right, bottom left, each half
+/// expanded from one to four values as a box's sides are. The vertical
+/// part, after `/`, is one to four radii; without one each corner's
+/// vertical radius is its horizontal one. A negative, unreadable or missing
+/// value, or a fifth, makes the whole declaration invalid (`None`).
+/// `initial` and `unset` are square corners.
+pub(crate) fn radius_corners(value: &str) -> Option<[CornerRadius; 4]> {
     let v = value.trim();
     if v.eq_ignore_ascii_case("initial") || v.eq_ignore_ascii_case("unset") {
-        return Some(
-            [Len {
-                v: 0.0,
-                unit: Unit::Px,
-            }; 4],
-        );
+        let zero = Len {
+            v: 0.0,
+            unit: Unit::Px,
+        };
+        return Some([(zero, zero); 4]);
     }
     let corners = |part: &str| -> Option<[Len; 4]> {
         let vals = tokens(part)
@@ -1834,28 +1839,29 @@ pub(crate) fn radius_corners(value: &str) -> Option<[Len; 4]> {
         Some((h, rest)) => (h, Some(rest)),
         None => (v, None),
     };
-    if let Some(vertical) = vertical {
-        corners(vertical)?;
-    }
-    corners(horizontal)
+    let h = corners(horizontal)?;
+    let v = match vertical {
+        Some(vertical) => corners(vertical)?,
+        None => h,
+    };
+    Some([(h[0], v[0]), (h[1], v[1]), (h[2], v[2]), (h[3], v[3])])
 }
 
-/// One corner's longhand (`border-top-left-radius`, #1926): its
-/// horizontal radius, the first of one or two values; `None` when invalid.
-pub(crate) fn radius_corner(value: &str) -> Option<Len> {
+/// One corner's longhand (`border-top-left-radius`, #1926, #1936): its
+/// horizontal and vertical radius, one value for both or two; `None` when
+/// invalid.
+pub(crate) fn radius_corner(value: &str) -> Option<CornerRadius> {
     let v = value.trim();
     if v.eq_ignore_ascii_case("initial") || v.eq_ignore_ascii_case("unset") {
-        return Some(Len {
+        let zero = Len {
             v: 0.0,
             unit: Unit::Px,
-        });
+        };
+        return Some((zero, zero));
     }
     match tokens(v).as_slice() {
-        [h] => radius_value(h),
-        [h, w] => {
-            radius_value(w)?;
-            radius_value(h)
-        }
+        [r] => radius_value(r).map(|r| (r, r)),
+        [h, w] => Some((radius_value(h)?, radius_value(w)?)),
         _ => None,
     }
 }
@@ -2361,23 +2367,36 @@ mod tests {
             v,
             unit: Unit::Percent,
         };
-        assert_eq!(radius_corners("50%"), Some([pct(50.0); 4]));
-        assert_eq!(radius_corners(" 8PX "), Some([px(8.0); 4]));
+        let same = |l: Len| (l, l);
+        assert_eq!(radius_corners("50%"), Some([same(pct(50.0)); 4]));
+        assert_eq!(radius_corners(" 8PX "), Some([same(px(8.0)); 4]));
         assert_eq!(
             radius_corners("1px 2px"),
-            Some([px(1.0), px(2.0), px(1.0), px(2.0)])
+            Some([px(1.0), px(2.0), px(1.0), px(2.0)].map(same))
         );
         assert_eq!(
             radius_corners("1px 2px 3px"),
-            Some([px(1.0), px(2.0), px(3.0), px(2.0)])
+            Some([px(1.0), px(2.0), px(3.0), px(2.0)].map(same))
         );
         assert_eq!(
             radius_corners("1px 2px 3px 4px"),
-            Some([px(1.0), px(2.0), px(3.0), px(4.0)])
+            Some([px(1.0), px(2.0), px(3.0), px(4.0)].map(same))
         );
-        // The vertical radii are checked, then dropped.
-        assert_eq!(radius_corners("10px / 20px"), Some([px(10.0); 4]));
-        assert_eq!(radius_corners("50%/10%"), Some([pct(50.0); 4]));
+        // The vertical radii are kept (#1936), each half expanded alone.
+        assert_eq!(
+            radius_corners("10px / 20px"),
+            Some([(px(10.0), px(20.0)); 4])
+        );
+        assert_eq!(radius_corners("50%/10%"), Some([(pct(50.0), pct(10.0)); 4]));
+        assert_eq!(
+            radius_corners("1px 2px / 3px"),
+            Some([
+                (px(1.0), px(3.0)),
+                (px(2.0), px(3.0)),
+                (px(1.0), px(3.0)),
+                (px(2.0), px(3.0))
+            ])
+        );
         assert_eq!(radius_corners("10px / red"), None);
         assert_eq!(radius_corners("10px / "), None);
         assert_eq!(radius_corners("10px / 1px / 2px"), None);
@@ -2388,18 +2407,18 @@ mod tests {
         assert_eq!(
             radius_corners("0"),
             Some(
-                [Len {
+                [same(Len {
                     v: 0.0,
                     unit: Unit::Pt
-                }; 4]
+                }); 4]
             )
         );
-        assert_eq!(radius_corners("initial"), Some([px(0.0); 4]));
+        assert_eq!(radius_corners("initial"), Some([same(px(0.0)); 4]));
 
-        assert_eq!(radius_corner("16px"), Some(px(16.0)));
-        assert_eq!(radius_corner("16px 4px"), Some(px(16.0)));
-        assert_eq!(radius_corner("50%"), Some(pct(50.0)));
-        assert_eq!(radius_corner("Unset"), Some(px(0.0)));
+        assert_eq!(radius_corner("16px"), Some(same(px(16.0))));
+        assert_eq!(radius_corner("16px 4px"), Some((px(16.0), px(4.0))));
+        assert_eq!(radius_corner("50%"), Some(same(pct(50.0))));
+        assert_eq!(radius_corner("Unset"), Some(same(px(0.0))));
         for bad in ["-1px", "1px 2px 3px", "1px red", "x", ""] {
             assert_eq!(radius_corner(bad), None, "{bad}");
         }

@@ -4,7 +4,9 @@
 //! `span`) with `border-radius` and a background. Each picture keeps its
 //! crop as Word's Crop to Shape writes it (`a:prstGeom`), through save and
 //! load; a card's `border-radius` is dropped, never text, and its shading
-//! and padding stay.
+//! and padding stay. Since #1936: a card header rounded at the top only
+//! (`round2SameRect`) and an avatar rounded by its `overflow: hidden`
+//! wrapper keep their crops through save and load too.
 
 use docxcore::image::{PictureShape, inline_embed, inline_shape};
 use docxcore::import::import_html_with;
@@ -136,4 +138,44 @@ fn a_cards_border_radius_is_never_text_and_its_shading_stays() {
     for junk in ["radius", "50%", "8px", "16px", "12px"] {
         assert!(!all.contains(junk), "{junk} in {all}");
     }
+}
+
+/// A card with a header rounded at the top only and an avatar rounded by
+/// its wrapper (#1936).
+const CARD_1936: &str = "<table width=600 cellpadding=0><tr><td>\
+    <img src=header.png width=120 height=40 style='border-radius:8px 8px 0 0'>\
+    <p>This week</p>\
+    <div style='width:32px;height:32px;border-radius:50%;overflow:hidden'>\
+    <img src=ann.png width=32 height=32></div>\
+    <p>Ann posted.</p></td></tr></table>";
+
+fn card_1936() -> docxcore::import::HtmlImport {
+    let mut resolve = |_: &str, _: usize| Some(png(64, 64));
+    import_html_with(CARD_1936.as_bytes(), &mut resolve).unwrap()
+}
+
+const EXPECTED_1936: [PictureShape; 2] = [
+    PictureShape::Round2Same {
+        adj1: 20_000,
+        adj2: 0,
+    },
+    PictureShape::Ellipse,
+];
+
+#[test]
+fn a_top_rounded_header_and_a_wrapped_avatar_survive_save_and_load_1936() {
+    let got = card_1936();
+    assert_eq!(shapes(&got.document), EXPECTED_1936);
+    let saved = save_package(&got.package());
+    let archive = docxcore::zip::ZipArchive::open(&saved).expect("a ZIP package");
+    let xml = String::from_utf8(archive.read("word/document.xml").expect("document.xml")).unwrap();
+    assert!(
+        xml.contains(
+            r#"<a:prstGeom prst="round2SameRect"><a:avLst><a:gd name="adj1" fmla="val 20000"/><a:gd name="adj2" fmla="val 0"/></a:avLst></a:prstGeom>"#
+        ),
+        "{xml}"
+    );
+    assert!(xml.contains(r#"<a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom>"#));
+    let back = load_package(&saved).unwrap();
+    assert_eq!(shapes(&back.document), EXPECTED_1936);
 }

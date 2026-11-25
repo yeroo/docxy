@@ -41346,8 +41346,8 @@ fn paragraph_el(
                 // image gpui can show (#1432), else a bordered frame. It is
                 // one offset (#1242). Cropped to an oval or rounded
                 // rectangle (Word's Crop to Shape, an HTML `border-radius`,
-                // #1926), the picture and the frame's border are clipped to
-                // its corners. A flow view draws one wider than its room
+                // #1926), or to corners that differ (#1936), the picture and
+                // the frame's border are clipped to its corners. A flow view draws one wider than its room
                 // scaled down to it, its aspect kept (#1963). A frame that
                 // shows no image, or an HTML import's placeholder (an image
                 // the import could not get), shows the picture's Alt Text
@@ -41355,7 +41355,15 @@ fn paragraph_el(
                 if let Some((cx_emu, cy_emu)) = docxcore::image::inline_extent(xml) {
                     let (w, h) = shown_picture_px(cx_emu, cy_emu, zoom, pic_room);
                     let shape = docxcore::image::inline_shape(xml);
-                    let radius = pictures::picture_radius(shape, w, h);
+                    // Each corner its own (#1936): `round2SameRect` and the
+                    // like round only some.
+                    let corners = shape.corner_radii(w, h);
+                    let round = |e: Div| {
+                        e.rounded_tl(px(corners[0]))
+                            .rounded_tr(px(corners[1]))
+                            .rounded_br(px(corners[2]))
+                            .rounded_bl(px(corners[3]))
+                    };
                     let frame = div().flex_none().w(px(w)).h(px(h)).relative();
                     let image = pics.and_then(|p| p.image(xml));
                     let alt = pictures::frame_alt(xml, image.as_deref());
@@ -41365,7 +41373,10 @@ fn paragraph_el(
                                 .w(px(w))
                                 .h(px(h))
                                 .object_fit(ObjectFit::Fill)
-                                .rounded(px(radius)),
+                                .rounded_tl(px(corners[0]))
+                                .rounded_tr(px(corners[1]))
+                                .rounded_br(px(corners[2]))
+                                .rounded_bl(px(corners[3])),
                         ),
                         None => frame.border_1().border_color(pal.dim),
                     };
@@ -41373,7 +41384,7 @@ fn paragraph_el(
                         Some(text) => frame.child(picture_alt_el(text, w, h, zoom, pal.dim)),
                         None => frame,
                     };
-                    let frame = frame.rounded(px(radius));
+                    let frame = round(frame);
                     let frame = match flow.pictures {
                         Some((painted, block)) => {
                             let at = UnitCell::default();
@@ -41391,7 +41402,7 @@ fn paragraph_el(
                         p.record(pictures::DrawnPicture {
                             width: w,
                             height: h,
-                            radius,
+                            corners,
                             shape,
                             alt,
                         });

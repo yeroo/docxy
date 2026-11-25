@@ -593,6 +593,9 @@ pub(crate) struct Builder<'b> {
     /// Text in a link in its user-agent look takes Word's `Hyperlink`
     /// character style (#1912, [`Builder::set_link_style`]).
     link_style: bool,
+    /// How many times content that keeps a paragraph has been written
+    /// (#1936, [`Builder::shown`]).
+    shown: u64,
 }
 
 #[derive(Default)]
@@ -686,7 +689,16 @@ impl<'b> Builder<'b> {
             para_marks: Vec::new(),
             keeps: false,
             link_style: false,
+            shown: 0,
         }
+    }
+
+    /// A count that grows whenever content that keeps a paragraph is
+    /// written (#1936): text that is not all white space, an object (a
+    /// picture), a page break. The HTML import compares it with what it was
+    /// when an element opened to tell whether anything showed in it since.
+    pub(crate) fn shown(&self) -> u64 {
+        self.shown
     }
 
     /// Give text in a link Word's `Hyperlink` character style (#1912) when
@@ -725,6 +737,9 @@ impl<'b> Builder<'b> {
     /// typed list marker taken off can leave none, `clear_para`).
     fn flush_marks(&mut self, keeps: bool) {
         self.keeps |= keeps;
+        if keeps {
+            self.shown += 1;
+        }
         if !self.keeps || self.marks.is_empty() {
             return;
         }

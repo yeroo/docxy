@@ -174,16 +174,24 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
 - A crop to a shape (#1926: Word's Crop to Shape, or an HTML `img`'s
   `border-radius` from the import, `docs/claude/html-import.md`) is read by
   `docxcore::image::inline_shape` from the picture's `pic:spPr/a:prstGeom`
-  (`ellipse`; `roundRect` with its `adj` guide; anything else a rectangle)
-  and drawn as gpui's rounded clip (`Img` hands `corner_radii` to
-  `paint_image`): `pictures::picture_radius`, half the shorter side for an
-  ellipse (a stadium when not square: gpui's corners are circular) and
-  `min(w, h) * adj / 100000` for a `roundRect`, at most that half. The
-  frame-only fallback's border takes the same corners. The harness's
-  `doc {}` `flow.pictures` lists each body picture the last frame built
-  (`pictures::Scope::recording`, `Docxy::drawn_pictures`, cleared at the
-  frame's start like `painted_tables`): `width`, `height`, `radius`,
-  `shape`, `round`; `uiharness/cases/html-rounded-images.uit` drives it.
+  (`ellipse`; `roundRect` with its `adj` guide; since #1936 `round1Rect`,
+  `round2SameRect` and `round2DiagRect` with theirs; anything else a
+  rectangle). It is drawn as gpui's rounded clip, each corner its own
+  (`Img` hands `corner_radii` to `paint_image`; `rounded_tl`/`_tr`/`_br`/
+  `_bl`): `PictureShape::corner_radii(w, h)` in docxcore (#1936, the one
+  geometry the editable-HTML page draws from too), half the shorter side
+  at every corner for an ellipse (a stadium when not square: gpui's
+  corners are circular) and `min(w, h) * adj / 100000` per corner for the
+  others, at most that half. The frame-only fallback's border takes the
+  same corners. The harness's `doc {}` `flow.pictures` lists each body
+  picture the last frame built (`pictures::Scope::recording`,
+  `Docxy::drawn_pictures`, cleared at the frame's start like
+  `painted_tables`): `width`, `height`, `radius` (the largest corner, so a
+  uniform shape reads as before #1936), `corners` (top left, top right,
+  bottom right, bottom left), `shape` (`rect`, `ellipse`, `roundRect`,
+  `round1Rect`, `round2SameRect`, `round2DiagRect`), `round` (every corner
+  half the shorter side); `uiharness/cases/html-rounded-images.uit` drives
+  it.
 - A frame that shows no image (the frame-only fallback), or shows an HTML
   import's placeholder (its media is exactly
   `docxcore::import::html_image::PLACEHOLDER_PNG`, an image the import

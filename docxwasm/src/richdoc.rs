@@ -446,15 +446,45 @@ fn image_extra(xml: &str, rels: &Relationships) -> Option<String> {
     rels.target(&rid)?;
     let mut extra = String::from(",\"rid\":");
     json::push_str(&mut extra, &rid);
+    let mut size = None;
     if let Some(ext) = xml.find("<wp:extent") {
         let el = &xml[ext..];
         if let (Some(cx), Some(cy)) = (attr_value(el, "cx="), attr_value(el, "cy=")) {
             if let (Ok(cx), Ok(cy)) = (cx.parse::<u64>(), cy.parse::<u64>()) {
                 extra.push_str(&format!(",\"cx\":{cx},\"cy\":{cy}"));
+                size = Some((cx, cy));
             }
         }
     }
+    if let Some(radius) = crop_radius(xml, size) {
+        extra.push_str(",\"radius\":");
+        json::push_str(&mut extra, &radius);
+    }
     Some(extra)
+}
+
+/// The CSS `border-radius` the editable page draws a cropped picture with
+/// (#1936), from its `a:prstGeom` (`docxcore::image::inline_shape`): an
+/// ellipse is `50%`, a true oval in a browser; another shape its four
+/// corners in px (`PictureShape::corner_radii` of its size, `cx` x `cy`
+/// EMUs at 9525 a px, each to a tenth), top left, top right, bottom right,
+/// bottom left. `None` for a rectangle, or a rounded shape of no size.
+fn crop_radius(xml: &str, size: Option<(u64, u64)>) -> Option<String> {
+    use docxcore::image::PictureShape;
+    match docxcore::image::inline_shape(xml) {
+        PictureShape::Rect => None,
+        PictureShape::Ellipse => Some("50%".into()),
+        shape => {
+            let (cx, cy) = size?;
+            let px = |emu: u64| emu as f32 / 9525.0;
+            let corners = shape.corner_radii(px(cx), px(cy));
+            let css: Vec<String> = corners
+                .iter()
+                .map(|r| format!("{}px", (r * 10.0).round() / 10.0))
+                .collect();
+            Some(css.join(" "))
+        }
+    }
 }
 
 /// The value of `name` on the first `<tag …>` element in `xml`.

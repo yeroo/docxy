@@ -174,6 +174,68 @@ fn pictures_are_atoms_the_page_can_fetch() {
     assert_eq!(s.media("rId9"), Some(png));
 }
 
+/// A body of one paragraph per picture run, each `rId9`'s PNG.
+fn pictures_docx(runs: &[String]) -> Vec<u8> {
+    let body: String = runs.iter().map(|r| format!("<w:p>{r}</w:p>")).collect();
+    let document_xml = format!(
+        r#"<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>{body}</w:body></w:document>"#
+    );
+    let rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/></Relationships>"#;
+    let root_rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#;
+    docxcore::zipwrite::write_zip(&[
+        ("[Content_Types].xml".into(), b"<Types/>".to_vec()),
+        ("_rels/.rels".into(), root_rels.as_bytes().to_vec()),
+        ("word/document.xml".into(), document_xml.into_bytes()),
+        (
+            "word/_rels/document.xml.rels".into(),
+            rels.as_bytes().to_vec(),
+        ),
+        (
+            "word/media/image1.png".into(),
+            b"\x89PNG\r\n\x1a\nfake".to_vec(),
+        ),
+    ])
+}
+
+#[test]
+fn a_cropped_picture_segment_carries_its_css_radius_1936() {
+    use docxcore::image::{PictureShape, inline_picture_run_shaped};
+    // 120 x 40 px.
+    let run =
+        |shape| inline_picture_run_shaped("rId9", 1_143_000, 381_000, 1, "a.png", "", None, shape);
+    let s = open(&pictures_docx(&[
+        run(PictureShape::Ellipse),
+        run(PictureShape::Round2Same {
+            adj1: 20_000,
+            adj2: 0,
+        }),
+        run(PictureShape::RoundRect { adj: 12_345 }),
+        run(PictureShape::Rect),
+    ]));
+    let radii: Vec<Option<String>> = all_paragraphs(&s)
+        .iter()
+        .map(|p| {
+            let img = arr(p.get("segs").unwrap())
+                .iter()
+                .find(|s| s.get_str("k") == Some("img"))
+                .expect("a picture segment")
+                .clone();
+            assert_eq!(img.get_str("rid"), Some("rId9"));
+            img.get_str("radius").map(str::to_string)
+        })
+        .collect();
+    assert_eq!(
+        radii,
+        [
+            Some("50%".to_string()),
+            Some("8px 8px 0px 0px".to_string()),
+            // 4.938 px, to a tenth.
+            Some("4.9px 4.9px 4.9px 4.9px".to_string()),
+            None,
+        ]
+    );
+}
+
 #[test]
 fn tracked_changes_are_zero_width_atoms() {
     let bytes = docx_from_body(

@@ -711,9 +711,15 @@ struct Look {
     /// separate }` resets it at every table, so only a table's own rules,
     /// style or `rules` make one collapse.
     collapse: bool,
-    /// An image's own `border-radius` (not inherited, #1926): the crop
-    /// shape of its picture. Only `img` reads one.
-    own_radius: Option<html_image::Radius>,
+    /// An element's own `border-radius` (not inherited, #1926, #1936): an
+    /// image's is the crop shape of its picture, another element's may
+    /// clip a picture in it ([`Look::own_clip`]). Boxed: rare, and a
+    /// look's clone stays small.
+    own_radius: Option<Box<html_image::Radius>>,
+    /// A rounded element's clip (not inherited, #1936): its declared box
+    /// when it clips what is in it to its corners ([`Cascade::clip_box`]),
+    /// so a picture filling it takes its corners.
+    own_clip: Option<Clip>,
     /// A table's or block image's own place in its line (not inherited,
     /// #1922): `Center`, `Right`, else `None` (the left), by its auto
     /// margins, else its parent's [`Look::block_align`].
@@ -735,6 +741,16 @@ struct Look {
     /// `href` is not a usable link), inherited. Shared, so a look's clone
     /// stays O(1) whatever the target's length.
     link: Option<Rc<Link>>,
+}
+
+/// A rounded element that clips its content (#1936): its declared box in
+/// twips, and whether a table's `cellpadding` may pad it (a cell whose own
+/// CSS padding leaves a side to the table).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Clip {
+    width: u32,
+    height: u32,
+    table_padded: bool,
 }
 
 /// The element children an element (or the page's root) has had so far
@@ -770,6 +786,10 @@ struct Elem {
     top_placed: bool,
     /// Its own element children so far (#1883).
     kids: Kids,
+    /// [`Builder::shown`] when it opened (#1936): unchanged while nothing
+    /// that shows has been written in it. `u64::MAX` for a reopened
+    /// element, which had content before.
+    shown_at: u64,
     kind: Kind,
     look: Look,
     /// Where its attribute text is in the page: what its look is computed
@@ -971,10 +991,20 @@ struct Cascade {
     /// absolute, the fixed-width centring (#1922); a percentage too, a
     /// card's table width (#1927).
     block_width: Option<Len>,
-    /// An image's corner radii, top left, top right, bottom right, bottom
-    /// left (#1926): kept until its font size is known, then one
-    /// [`Look::own_radius`].
-    radius: [Option<Len>; 4],
+    /// An element's corner radii, top left, top right, bottom right,
+    /// bottom left, each horizontal and vertical (#1926, #1936): an
+    /// image's crop, or a wrapper's clip of the picture in it. Kept until
+    /// its font size is known, then [`Look::own_radius`].
+    radius: [Option<css::CornerRadius>; 4],
+    /// `overflow` clips (`hidden`, `clip`) horizontally and vertically
+    /// (#1936).
+    overflow: [bool; 2],
+    /// Its own `display` makes it a block container, or not (#1936): what
+    /// `overflow` applies to. `None` leaves its kind's default.
+    container: Option<bool>,
+    /// Its own absolute CSS `width` and `height` (#1936), a non-cell's
+    /// box when it clips; a percentage or `auto` is none.
+    css_box: [Option<Len>; 2],
     /// Whether it may be, or is, a card (#1927).
     card: CardMode,
     /// Its own `display` is neither `block` nor unset (nor `none`): an
@@ -1390,6 +1420,7 @@ impl Cascade {
         look.own_frame = [None; 4];
         look.own_rule_ink = [Some(None); 2];
         look.own_radius = None;
+        look.own_clip = None;
         look.own_padding = [None; 4];
         look.own_place = None;
         look.own_block = false;
@@ -1430,6 +1461,9 @@ impl Cascade {
             parent_block_align,
             block_width: None,
             radius: [None; 4],
+            overflow: [false; 2],
+            container: None,
+            css_box: [None; 2],
             card,
             not_block: false,
             margin_declared: [false; 4],
@@ -1682,6 +1716,17 @@ impl Cascade {
             "left" => Some(3),
             _ => None,
         };
+        if !self.is_img && matches!(d.name.as_str(), "width" | "height") {
+            // A wrapper's box (#1936): an absolute length; `auto` or a
+            // percentage is none, an invalid value leaves it.
+            let at = usize::from(d.name == "height");
+            let t = v.trim();
+            if t.eq_ignore_ascii_case("auto") {
+                self.css_box[at] = None;
+            } else if let Some(len) = css::length(t).filter(|l| l.v >= 0.0) {
+                self.css_box[at] = (len.unit != css::Unit::Percent).then_some(len);
+            }
+        }
         match d.name.as_str() {
             "color" => match css::color(v) {
                 Some(Color::Rgb(c)) => run.color = Some(c),
@@ -1925,9 +1970,10 @@ impl Cascade {
                     }
                 }
             }
-            "border-radius" if self.is_img => {
-                // A picture's crop (#1926); other elements' rounded boxes
-                // are not drawn, and the value is never text.
+            "border-radius" => {
+                // A picture's crop (#1926), or a rounded wrapper's clip of
+                // one (#1936); a rounded box is not drawn, and the value is
+                // never text.
                 if let Some(corners) = css::radius_corners(v) {
                     self.radius = corners.map(Some);
                 }
@@ -1935,9 +1981,7 @@ impl Cascade {
             "border-top-left-radius"
             | "border-top-right-radius"
             | "border-bottom-right-radius"
-            | "border-bottom-left-radius"
-                if self.is_img =>
-            {
+            | "border-bottom-left-radius" => {
                 let corner = match d.name.as_str() {
                     "border-top-left-radius" => 0,
                     "border-top-right-radius" => 1,
@@ -1946,6 +1990,20 @@ impl Cascade {
                 };
                 if let Some(len) = css::radius_corner(v) {
                     self.radius[corner] = Some(len);
+                }
+            }
+            "overflow" => {
+                // One keyword for both axes or two, x then y (#1936).
+                let keys: Option<Vec<bool>> = v.split_whitespace().map(overflow_clips).collect();
+                match keys.as_deref() {
+                    Some([both]) => self.overflow = [*both; 2],
+                    Some([x, y]) => self.overflow = [*x, *y],
+                    _ => {}
+                }
+            }
+            "overflow-x" | "overflow-y" => {
+                if let Some(c) = overflow_clips(v.trim()) {
+                    self.overflow[usize::from(d.name == "overflow-y")] = c;
                 }
             }
             "text-indent" => {
@@ -1963,6 +2021,7 @@ impl Cascade {
                     // The last declaration wins (#1883): a later `block`
                     // shows what an earlier `none` hid.
                     self.display_none = Some(false);
+                    self.container = Some(block_container(v));
                     if self.card != CardMode::No {
                         // An inline or inline-block `div` is no card (#1927).
                         self.not_block = !v.eq_ignore_ascii_case("block");
@@ -2267,6 +2326,14 @@ impl Cascade {
             self.look.own_break_before = self.break_before == Some(true);
             self.look.own_break_after = self.break_after == Some(true) && !self.is_br;
         }
+        // Any element's corners (#1926, #1936): an image's crop, another's
+        // clip when it clips.
+        let radius = image_radius(self.radius, pt);
+        let clip = if radius.is_some() && !self.is_img {
+            self.clip_box(pt)
+        } else {
+            None
+        };
         let card = self.kind == Kind::Block
             && match self.card {
                 CardMode::Yes(_) => true,
@@ -2488,42 +2555,118 @@ impl Cascade {
                 if self.is_img && look.own_block {
                     look.own_place = block_position(self.margin_auto, self.parent_block_align);
                 }
-                if self.is_img {
-                    look.own_radius = image_radius(self.radius, pt);
-                }
             }
         }
+        self.look.own_clip = clip;
+        self.look.own_radius = radius.map(Box::new);
         self.look
+    }
+
+    /// A rounded element's [`Clip`] (#1936), when it clips its content to
+    /// its corners as a browser does: `overflow` hidden or clip on both
+    /// axes, a block container (a div, cell or block-level container unless
+    /// `display: inline`; an inline element only `inline-block` or `block`
+    /// and the like), no border and no padding of its own, and a declared
+    /// absolute width and height (a cell's attributes or CSS, another's
+    /// CSS), in its final font.
+    fn clip_box(&self, pt: f64) -> Option<Clip> {
+        if self.overflow != [true; 2] {
+            return None;
+        }
+        let container = self.container.unwrap_or(matches!(
+            self.kind,
+            Kind::Block | Kind::Cell | Kind::Container | Kind::List
+        ));
+        if !container || self.own_borders(pt).iter().any(Option::is_some) {
+            return None;
+        }
+        if self.padding.iter().flatten().any(|l| l.v != 0.0) {
+            return None;
+        }
+        let twips = |l: Option<Len>| {
+            l?.twips(pt)
+                .filter(|&t| t >= 0)
+                .and_then(|t| u32::try_from(t).ok())
+        };
+        let (width, height) = if self.kind == Kind::Cell {
+            let side = |w: Option<Width>| match w {
+                Some(Width::Twips(t)) => Some(t),
+                _ => None,
+            };
+            (side(self.look.own_width)?, side(self.look.own_height)?)
+        } else {
+            (twips(self.css_box[0])?, twips(self.css_box[1])?)
+        };
+        Some(Clip {
+            width,
+            height,
+            table_padded: self.kind == Kind::Cell && self.padding.iter().any(Option::is_none),
+        })
     }
 }
 
-/// An image's one radius from its four corners (#1926), each resolved
-/// against its font: `None` with none set or all of them zero, `NonUniform`
-/// when they differ (a corner left unset is a square one). A zero length
-/// and a zero percentage are the same square corner.
-fn image_radius(corners: [Option<Len>; 4], font_pt: f64) -> Option<html_image::Radius> {
-    use html_image::Radius;
+/// An element's radius from its four corners (#1926, #1936), each half
+/// resolved against its font: `None` with none set or every corner square
+/// (a corner left unset is a square one). A zero length and a zero
+/// percentage are the same square corner.
+fn image_radius(
+    corners: [Option<css::CornerRadius>; 4],
+    font_pt: f64,
+) -> Option<html_image::Radius> {
+    use html_image::RLen;
     if corners.iter().all(Option::is_none) {
         return None;
     }
-    let resolve = |c: Option<Len>| match c {
-        Some(l) if l.unit == css::Unit::Percent && l.v > 0.0 => Radius::Pct(l.v),
-        Some(l) => {
-            let t = l.points(font_pt).map_or(0.0, |p| (p * 20.0).round());
-            // `t` is finite and non-negative (the parser refuses negative
-            // radii), so the cast saturates at most.
-            Radius::Twips(t.max(0.0) as u64)
+    let resolve = |l: Len| {
+        if l.unit == css::Unit::Percent {
+            return if l.v > 0.0 {
+                RLen::Pct(l.v)
+            } else {
+                RLen::Twips(0)
+            };
         }
-        None => Radius::Twips(0),
+        let t = l.points(font_pt).map_or(0.0, |p| (p * 20.0).round());
+        // `t` is non-negative (the parser refuses negative radii), so the
+        // cast saturates at most.
+        RLen::Twips(t.max(0.0) as u64)
     };
-    let first = resolve(corners[0]);
-    if corners[1..].iter().any(|&c| resolve(c) != first) {
-        return Some(Radius::NonUniform);
+    let radius = html_image::Radius(corners.map(|c| match c {
+        Some((h, v)) => (resolve(h), resolve(v)),
+        None => (RLen::Twips(0), RLen::Twips(0)),
+    }));
+    (!radius.is_square()).then_some(radius)
+}
+
+/// How far a picture's declared side may be from its rounded wrapper's
+/// and still fill it (#1936): one CSS pixel, 15 twips.
+const FILL_SLACK: u128 = 15;
+
+/// Whether an `overflow` keyword clips (#1936): `hidden` and `clip` do,
+/// `visible`, `auto` and `scroll` do not here (a scrolled box is not a
+/// crop); `None` for anything else.
+fn overflow_clips(v: &str) -> Option<bool> {
+    match v.to_ascii_lowercase().as_str() {
+        "hidden" | "clip" => Some(true),
+        "visible" | "auto" | "scroll" | "overlay" => Some(false),
+        _ => None,
     }
-    match first {
-        Radius::Twips(0) => None,
-        r => Some(r),
-    }
+}
+
+/// Whether a `display` keyword makes a box `overflow` applies to (#1936):
+/// a block container, flex or grid container, inline-level or not.
+fn block_container(v: &str) -> bool {
+    matches!(
+        v.to_ascii_lowercase().as_str(),
+        "block"
+            | "inline-block"
+            | "flow-root"
+            | "list-item"
+            | "table-cell"
+            | "flex"
+            | "inline-flex"
+            | "grid"
+            | "inline-grid"
+    )
 }
 
 /// What computing a look reads besides the element stack.
@@ -3410,11 +3553,13 @@ impl<'a> Html<'a> {
                 .then(|| self.out.flow_len(self.table_depth > 0))
                 .flatten()
                 .map(|n| (self.table_depth, n));
+            let shown_at = self.out.shown();
             self.elems.push(Elem {
                 key,
                 serial,
                 top_placed: false,
                 kids: Kids::default(),
+                shown_at,
                 kind,
                 look,
                 attrs: attrs_at,
@@ -3656,6 +3801,7 @@ impl<'a> Html<'a> {
                         serial: 0,
                         top_placed: false,
                         kids: Kids::default(),
+                        shown_at: u64::MAX,
                         kind: e.kind,
                         look: Look::default(),
                         attrs: e.attrs,
@@ -4084,6 +4230,9 @@ impl<'a> Html<'a> {
         if look.run.vanish {
             return;
         }
+        // A rounded wrapper it may fill (#1936), looked up before the
+        // picture is written.
+        let wrapper = self.wrapper_clip(key);
         // A percentage is of the containing width (#1898).
         let room = self.image_room(&look);
         let side = |w: Option<Width>| match w {
@@ -4180,9 +4329,16 @@ impl<'a> Html<'a> {
         let (cx, cy) = html_image::twips_emu(box_twips);
         let name = html_image::picture_name(src, id);
         // Its crop by its `border-radius` (#1926), measured in the box the
-        // page declares (the fit to the body is uniform).
+        // page declares (the fit to the body is uniform), and by the corners
+        // of a rounded wrapper whose declared box it fills, within a pixel
+        // each way (#1936).
         let shape = declared.map_or(crate::image::PictureShape::Rect, |b| {
-            html_image::shape(look.own_radius, b)
+            let fills = |clip: &Clip| {
+                b.0.abs_diff(u128::from(clip.width)) <= FILL_SLACK
+                    && b.1.abs_diff(u128::from(clip.height)) <= FILL_SLACK
+            };
+            let clip = wrapper.filter(|(_, c)| fills(c)).map(|(r, _)| r);
+            html_image::clipped_shape(look.own_radius.as_deref().copied(), clip, b)
         });
         let raw =
             crate::image::inline_picture_run_shaped(&rid, cx, cy, id, &name, &alt, outline, shape);
@@ -4250,6 +4406,56 @@ impl<'a> Html<'a> {
             parent = Some(&e.look);
         }
         outside(room, look).clamp(0, body) as u32
+    }
+
+    /// The rounded wrapper a picture keyed `key` would fill (#1936): its
+    /// nearest open ancestor with corners of its own, when that one clips
+    /// ([`Look::own_clip`]), every element between the two is inline, the
+    /// picture comes first in it (nothing that shows written since it
+    /// opened, [`Builder::shown`], and the picture and each element below
+    /// the wrapper its parent's first element child, so no `<br>` or other
+    /// element before it), and a cell's table pads it by at most a pixel
+    /// (`cellpadding`; a browser's default is one). The caller checks that
+    /// the picture fills its box. O(depth).
+    fn wrapper_clip(&self, key: &ElemKey) -> Option<(html_image::Radius, Clip)> {
+        let mut first = key.index == 0;
+        for (at, e) in self.elems.iter().enumerate().rev() {
+            if let Some(radius) = e.look.own_radius.as_deref() {
+                let clip = e.look.own_clip?;
+                if !first || e.shown_at != self.out.shown() {
+                    return None;
+                }
+                if clip.table_padded && !self.thin_cellpadding(at) {
+                    return None;
+                }
+                return Some((*radius, clip));
+            }
+            if e.kind != Kind::Inline {
+                return None;
+            }
+            first &= e.key.index == 0;
+        }
+        None
+    }
+
+    /// Whether the table around the open cell at `at` pads its cells by at
+    /// most one pixel (#1936): no `cellpadding` (a browser's default is 1)
+    /// or one of 0 or 1.
+    fn thin_cellpadding(&self, at: usize) -> bool {
+        let Some(table) = self.elems[..at].iter().rev().find(|e| e.key.tag == "table") else {
+            return true;
+        };
+        let mut pad = None;
+        each_attr(&self.s[table.attrs.0..table.attrs.1], |n, v| {
+            // The first of a repeated attribute counts, as in HTML.
+            if pad.is_none() && n.eq_ignore_ascii_case("cellpadding") {
+                pad = Some(html_int(v));
+            }
+        });
+        match pad {
+            None => true,
+            Some(n) => n.is_some_and(|n| n <= 1),
+        }
     }
 
     /// The serial of the `<picture>` that is the innermost open element,
@@ -7941,7 +8147,7 @@ mod image_tests {
 
     #[test]
     fn border_radius_longhands_count_when_all_four_agree() {
-        use crate::image::PictureShape::{Ellipse, Rect, RoundRect};
+        use crate::image::PictureShape::{Rect, Round2Same, RoundRect};
         let all = "border-top-left-radius:8px;border-top-right-radius:8px;\
                    border-bottom-right-radius:8px;border-bottom-left-radius:8px 2px";
         let (d, _, _) = with_images(&format!(
@@ -7956,15 +8162,25 @@ mod image_tests {
         assert_eq!(
             shapes(&d),
             [
-                RoundRect { adj: 20_000 },
-                // One corner rounded alone: Word has no such crop here.
+                // The last corner's vertical radius counts since #1936: it
+                // is 8 x 2 px, circular 2 px, so the corners are 8, 8, 8, 2,
+                // which no preset draws.
                 Rect,
+                // One corner rounded alone (not the top right): Word has no
+                // such crop here.
                 Rect,
+                // Three corners.
                 Rect,
+                // The top pair (#1936; it was a rectangle).
+                Round2Same {
+                    adj1: 25_000,
+                    adj2: 0
+                },
                 // 6pt is 8px: the same corner.
                 RoundRect { adj: 25_000 },
-                // The vertical radii are dropped.
-                Ellipse,
+                // The vertical radii count since #1936: 16 x 3.2 px corners,
+                // circular 3.2 px (it was the ellipse).
+                RoundRect { adj: 10_000 },
                 Rect,
             ]
         );
@@ -8017,6 +8233,203 @@ mod image_tests {
                 .contains(r#"<a:prstGeom prst="ellipse"><a:avLst/></a:prstGeom><a:ln w="9525">"#)
         );
         assert!(placeholder.contains(r#"descr="Ann""#));
+    }
+
+    #[test]
+    fn a_card_header_rounded_at_the_top_is_round2same_1936() {
+        use crate::image::PictureShape::{Round1, Round2Diag, Round2Same};
+        let (d, _, _) = with_images(
+            "<p><img src=a.png width=120 height=40 style='border-radius:8px 8px 0 0'>\
+             <img src=a.png width=120 height=40 style='border-radius:8px 0'>\
+             <img src=a.png width=120 height=40 style='border-top-right-radius:8px'>\
+             <img src=a.png width=120 height=40 style='border-radius:20px / 10px;\
+             border-bottom-left-radius:0;border-bottom-right-radius:0'></p>",
+        );
+        assert_eq!(
+            shapes(&d),
+            [
+                Round2Same {
+                    adj1: 20_000,
+                    adj2: 0
+                },
+                Round2Diag {
+                    adj1: 20_000,
+                    adj2: 0
+                },
+                Round1 { adj: 20_000 },
+                Round2Same {
+                    adj1: 25_000,
+                    adj2: 0
+                },
+            ]
+        );
+        let raw = all_pictures(&d)[0];
+        assert!(raw.contains(
+            r#"<a:prstGeom prst="round2SameRect"><a:avLst><a:gd name="adj1" fmla="val 20000"/><a:gd name="adj2" fmla="val 0"/></a:avLst></a:prstGeom>"#
+        ));
+    }
+
+    #[test]
+    fn a_rounded_wrapper_that_clips_crops_the_picture_filling_it_1936() {
+        use crate::image::PictureShape::{Ellipse, Rect, Round2Same};
+        let wrap = "width:64px;height:64px;border-radius:50%;overflow:hidden";
+        let img = "<img src=a.png width=64 height=64>";
+        // Every picture's shape, in cells too.
+        fn walk(blocks: &[DocBlock], out: &mut Vec<crate::image::PictureShape>) {
+            for b in blocks {
+                match b {
+                    DocBlock::Paragraph(p) => {
+                        out.extend(pictures(p).into_iter().map(crate::image::inline_shape))
+                    }
+                    DocBlock::Table(t) => {
+                        for c in t.rows.iter().flat_map(|r| &r.cells) {
+                            walk(&c.blocks, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let case = |html: &str| {
+            let mut out = Vec::new();
+            walk(&with_images(html).0.body, &mut out);
+            out
+        };
+        // The avatar: a 64 px circle around a 64 px picture.
+        assert_eq!(case(&format!("<div style='{wrap}'>{img}</div>")), [Ellipse]);
+        // `overflow: clip`, the two axes apart, white space before it, a
+        // link around it, a class rule.
+        assert_eq!(
+            case(&format!(
+                "<div style='{wrap};overflow:visible;overflow-x:clip;overflow-y:hidden'>\n  {img}</div>"
+            )),
+            [Ellipse]
+        );
+        assert_eq!(
+            case(&format!(
+                "<div style='{wrap}'><a href='https://x.test/'>{img}</a></div>"
+            )),
+            [Ellipse]
+        );
+        assert_eq!(
+            case(&format!(
+                "<style>.av {{ {wrap} }}</style><p>Ann</p><div class=av>{img}</div>"
+            )),
+            [Ellipse]
+        );
+        // Its own corners and the wrapper's: the larger (the intersection a
+        // browser shows), the img's own radius never undoing the clip.
+        assert_eq!(
+            case(&format!(
+                "<div style='{wrap}'><img src=a.png width=64 height=64 style='border-radius:4px'></div>"
+            )),
+            [Ellipse]
+        );
+        assert_eq!(
+            case(&format!(
+                "<div style='{wrap}'><img src=a.png width=64 height=64 style='border-radius:0'></div>"
+            )),
+            [Ellipse]
+        );
+        assert_eq!(
+            case(
+                "<div style='width:120px;height:40px;border-radius:8px 8px 0 0;overflow:hidden'>\
+                 <img src=a.png width=120 height=40></div>"
+            ),
+            [Round2Same {
+                adj1: 20_000,
+                adj2: 0
+            }]
+        );
+        // A size within a pixel matches; the box in `em` takes its font.
+        assert_eq!(
+            case(
+                "<div style='width:4em;height:4em;font-size:16px;border-radius:50%;overflow:hidden'>\
+                 <img src=a.png width=65 height=64></div>"
+            ),
+            [Ellipse]
+        );
+        // 15 twips off (47.25pt is 945 of the picture's 960) is within the
+        // pixel; 16 (47.2pt, 944) is not (r1 i1).
+        let off = |w: &str| {
+            case(&format!(
+                "<div style='width:{w};height:64px;border-radius:50%;overflow:hidden'>{img}</div>"
+            ))
+        };
+        assert_eq!(off("47.25pt"), [Ellipse]);
+        assert_eq!(off("47.2pt"), [Rect]);
+        // A span clips only as an inline-block (or block).
+        let span = |display: &str| {
+            case(&format!(
+                "<p><span style='{wrap}{display}'>{img}</span></p>"
+            ))
+        };
+        assert_eq!(span(""), [Rect]);
+        assert_eq!(span(";display:inline-block"), [Ellipse]);
+        // A div made inline does not clip.
+        assert_eq!(
+            case(&format!("<div style='{wrap};display:inline'>{img}</div>")),
+            [Rect]
+        );
+        // A rounded cell, by its attributes.
+        assert_eq!(
+            case(&format!(
+                "<table cellpadding=0><tr><td width=64 height=64 \
+                 style='border-radius:50%;overflow:hidden'>{img}</td></tr></table>"
+            )),
+            [Ellipse]
+        );
+        // Its table's padding moves the picture in: no clip of it, unless
+        // the cell's own CSS padding is none.
+        assert_eq!(
+            case(&format!(
+                "<table cellpadding=8><tr><td width=64 height=64 \
+                 style='border-radius:50%;overflow:hidden'>{img}</td></tr></table>"
+            )),
+            [Rect]
+        );
+        assert_eq!(
+            case(&format!(
+                "<table cellpadding=8><tr><td width=64 height=64 \
+                 style='border-radius:50%;overflow:hidden;padding:0'>{img}</td></tr></table>"
+            )),
+            [Ellipse]
+        );
+        // What does not clip it.
+        for html in [
+            // No overflow, or only one axis.
+            format!("<div style='width:64px;height:64px;border-radius:50%'>{img}</div>"),
+            format!("<div style='{wrap};overflow-y:visible'>{img}</div>"),
+            format!("<div style='{wrap};overflow:auto'>{img}</div>"),
+            // Another size, a percentage, no height.
+            format!("<div style='{wrap};width:80px'>{img}</div>"),
+            format!("<div style='{wrap};width:50%'>{img}</div>"),
+            format!("<div style='{wrap};height:auto'>{img}</div>"),
+            // Padding or a border of its own.
+            format!("<div style='{wrap};padding:4px'>{img}</div>"),
+            format!("<div style='{wrap};border:1px solid red'>{img}</div>"),
+            // Something shows before it: text, a picture, a line break.
+            format!("<div style='{wrap}'>Ann {img}</div>"),
+            format!("<div style='{wrap}'><b>A</b>{img}</div>"),
+            format!("<div style='{wrap}'><br>{img}</div>"),
+            // A block between the two.
+            format!("<div style='{wrap}'><p style='margin:0'>{img}</p></div>"),
+            // The nearest rounded ancestor does not clip, though an outer
+            // one would.
+            format!("<div style='{wrap}'><span style='border-radius:2px'>{img}</span></div>"),
+        ] {
+            assert_eq!(case(&html), [Rect], "{html}");
+        }
+        // A second picture in the same wrapper is not first.
+        assert_eq!(
+            case(&format!("<div style='{wrap}'>{img}{img}</div>")),
+            [Ellipse, Rect]
+        );
+        // The wrapper's radius is never text, and adds no shading.
+        let (d, _, _) = with_images(&format!("<div style='{wrap}'>{img}</div>"));
+        for t in paragraph_texts(&d) {
+            assert!(!t.contains('%') && !t.contains("px"), "{t}");
+        }
     }
 
     #[test]
