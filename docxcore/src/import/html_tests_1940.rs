@@ -452,3 +452,25 @@ fn a_stray_table_part_open_in_a_body_card_is_ignored_1940() {
     let inner = tables(card_cell(&d))[0];
     assert_eq!(inner.rows[0].cells.len(), 2);
 }
+
+#[test]
+fn a_heading_keeps_its_level_over_a_body_card_1940() {
+    let h2 = "<h2><div style='background:#eee;padding:8px'>Title</div></h2>";
+    let d = doc(h2);
+    assert_eq!(table_count(&d.body), 0);
+    let t = para(&d, "Title");
+    assert_eq!(t.props.style_id.as_deref(), Some("Heading2"));
+    assert!(shaded(t));
+    // In a body card: the wrapper is the only table, the heading in it.
+    let d = doc(&format!(
+        "<div style='background:#f4f4f4;padding:20px'>{h2}</div>"
+    ));
+    assert_eq!(table_count(&d.body), 1);
+    let t = para(&d, "Title");
+    assert_eq!(t.props.style_id.as_deref(), Some("Heading2"));
+    assert!(
+        all_paras(card_cell(&d))
+            .iter()
+            .any(|p| p.plain_text() == "Title")
+    );
+}

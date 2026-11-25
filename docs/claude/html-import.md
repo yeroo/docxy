@@ -579,7 +579,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
 - Known limits: a card's side margins other than `auto` in a cell and its
   vertical margins (stacked cards are one empty paragraph apart);
   `border-radius` (#1926) and borders on a card; a card in a list item or
-  heading in a cell loses the item's indent and the heading level. The
+  heading in a cell loses the item's indent and the heading level (in the
+  body and a body card, neither is a card: #1940). The
   suite's document view and PDF export do not draw `w:tcMar` (a fixed
   inset), so imported padding is in the model, Word and the saved file
   but not on screen there.
@@ -601,7 +602,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   padded `.wrapper`) is one card holding the content table.
 - Guards (`Html::body_card_fits`), where the paragraph model carries
   something a card's table would drop, so the `div` stays paragraph
-  shading: in a list (`in_list`: an item's number and indent), under a
+  shading: in a list (`in_list`: an item's number and indent), in a
+  heading (the open block entry's `heading`: its level; r3), under a
   parent whose look has shading or side lines (a quoted reply's left
   rule, a shaded block that is no card), or under any open block with a
   top or bottom line of its own (`own_top`/`own_bottom`: Outlook's reply

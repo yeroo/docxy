@@ -4182,13 +4182,15 @@ impl<'a> Html<'a> {
 
     /// Whether a card may open in the body here (#1940), or in a body
     /// card whose content starts at `elems[from]` (r2): not in a list (its
-    /// number and indent are its paragraphs'), nor in a block whose
+    /// number and indent are its paragraphs'), nor in a heading (its level,
+    /// which the card's fresh block entry would drop; r3), nor in a block whose
     /// shading, side lines or own top or bottom line go on its paragraphs
     /// (a quoted reply's rule, Outlook's reply header): a card's table
     /// would drop them.
     fn body_card_fits(&self, from: usize) -> bool {
         let parent = self.elems.last().map(|e| &e.look);
         parent.is_none_or(|l| !l.in_list && l.shade.is_none() && l.borders == ParBorders::default())
+            && self.blocks.last().is_none_or(|(_, b)| b.heading.is_none())
             && !self.elems.get(from..).unwrap_or_default().iter().any(|e| {
                 e.kind == Kind::Block && (e.look.own_top.is_some() || e.look.own_bottom.is_some())
             })
