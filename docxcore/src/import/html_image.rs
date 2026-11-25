@@ -99,6 +99,9 @@ pub(crate) struct Images<'a> {
     /// The pictures' click links (#1999), each URL once.
     links: Vec<ImportedLink>,
     link_index: HashMap<String, usize>,
+    /// The page's base URL (#1898): its `<base href>`, which every src
+    /// but a `data:` one is resolved against ([`resolve_ref`]).
+    base: Option<String>,
 }
 
 impl<'a> Images<'a> {
@@ -113,7 +116,13 @@ impl<'a> Images<'a> {
             last_id: 0,
             links: Vec::new(),
             link_index: HashMap::new(),
+            base: None,
         }
+    }
+
+    /// Resolve every later src against `base` (#1898).
+    pub(crate) fn set_base(&mut self, base: Option<String>) {
+        self.base = base;
     }
 
     /// The media and the picture links the import made.
@@ -162,6 +171,14 @@ impl<'a> Images<'a> {
         if src.is_empty() {
             return Source::Unresolved;
         }
+        let resolved;
+        let src = match self.base.as_deref() {
+            Some(base) if !has_data_scheme(src) => {
+                resolved = resolve_ref(base, src);
+                resolved.as_str()
+            }
+            _ => src,
+        };
         let index = if has_data_scheme(src) {
             let limit = self.limit(budget);
             decode_data_uri(src, limit, budget).and_then(|bytes| self.add(bytes, budget))
@@ -244,6 +261,134 @@ impl<'a> Images<'a> {
         self.placeholder = Some(index);
         Some(self.media[index].rid.clone())
     }
+}
+
+/// The longest `<base href>` kept (#1898), in bytes: a longer one is none.
+const MAX_BASE: usize = 4096;
+
+/// A `<base href>` as the page's base URL (#1898): trimmed, references
+/// already decoded; none when empty, too long, or a `data:` or
+/// `javascript:` URL (a browser takes neither as a base).
+pub(crate) fn page_base(href: &str) -> Option<String> {
+    let href = href.trim();
+    let scheme = scheme_of(href).map(str::to_ascii_lowercase);
+    (!href.is_empty()
+        && href.len() <= MAX_BASE
+        && !matches!(scheme.as_deref(), Some("data" | "javascript")))
+    .then(|| href.to_string())
+}
+
+/// `s`'s URI scheme (RFC 3986: a letter, then letters, digits, `+`, `-`,
+/// `.`, before a `:`), if it has one.
+pub(crate) fn scheme_of(s: &str) -> Option<&str> {
+    let colon = s.find(':')?;
+    let scheme = &s[..colon];
+    let mut bytes = scheme.bytes();
+    let first = bytes.next()?;
+    (first.is_ascii_alphabetic()
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')))
+    .then_some(scheme)
+}
+
+/// `reference` resolved against `base` (#1898), as RFC 3986 section 5.2
+/// does: one with a scheme is itself; `//host…` takes the base's scheme;
+/// `/path` the base's scheme and authority; `?query` and `#fragment` the
+/// base's path; any other path is merged with the base's directory, its
+/// `.` and `..` segments removed. A relative base (no scheme, such as
+/// `img/`) gives a relative result, which keeps a leading `..` it cannot
+/// remove (the caller decides whether that leaves its folder).
+pub(crate) fn resolve_ref(base: &str, reference: &str) -> String {
+    if scheme_of(reference).is_some() {
+        return reference.to_string();
+    }
+    let base = base.split('#').next().unwrap_or("");
+    let (scheme, rest) = match scheme_of(base) {
+        Some(s) => (Some(s), &base[s.len() + 1..]),
+        None => (None, base),
+    };
+    let (authority, rest) = match rest.strip_prefix("//") {
+        Some(r) => {
+            let end = r.find(['/', '?']).unwrap_or(r.len());
+            (Some(&r[..end]), &r[end..])
+        }
+        None => (None, rest),
+    };
+    let (base_path, base_query) = match rest.find('?') {
+        Some(q) => (&rest[..q], Some(&rest[q..])),
+        None => (rest, None),
+    };
+    let mut out = String::new();
+    if let Some(s) = scheme {
+        out.push_str(s);
+        out.push(':');
+    }
+    if reference.starts_with("//") {
+        out.push_str(reference);
+        return out;
+    }
+    if let Some(a) = authority {
+        out.push_str("//");
+        out.push_str(a);
+    }
+    if reference.is_empty() || reference.starts_with('#') {
+        out.push_str(base_path);
+        out.push_str(base_query.unwrap_or(""));
+        out.push_str(reference);
+        return out;
+    }
+    if reference.starts_with('?') {
+        out.push_str(base_path);
+        out.push_str(reference);
+        return out;
+    }
+    let path_end = reference.find(['?', '#']).unwrap_or(reference.len());
+    let (path, tail) = reference.split_at(path_end);
+    let merged = if path.starts_with('/') {
+        path.to_string()
+    } else if authority.is_some() && base_path.is_empty() {
+        format!("/{path}")
+    } else {
+        let dir = base_path.rfind('/').map_or("", |i| &base_path[..=i]);
+        format!("{dir}{path}")
+    };
+    out.push_str(&remove_dot_segments(&merged));
+    out.push_str(tail);
+    out
+}
+
+/// `path` without its `.` and `..` segments (RFC 3986 section 5.2.4); a
+/// relative path keeps a leading `..` that has nothing to remove.
+fn remove_dot_segments(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    let segments: Vec<&str> = path.split('/').collect();
+    let last = segments.len() - 1;
+    for (i, seg) in segments.iter().enumerate() {
+        let dir_end = i == last;
+        match *seg {
+            "." => {
+                if dir_end {
+                    out.push("");
+                }
+            }
+            ".." => {
+                if out.last().is_some_and(|s| !s.is_empty() && *s != "..") {
+                    out.pop();
+                } else if !absolute {
+                    out.push("..");
+                }
+                if dir_end {
+                    out.push("");
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    let mut joined = out.join("/");
+    if absolute && !joined.starts_with('/') {
+        joined.insert(0, '/');
+    }
+    joined
 }
 
 /// Whether `src` is a `data:` URI (scheme case-insensitive).

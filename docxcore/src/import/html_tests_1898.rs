@@ -212,3 +212,91 @@ fn max_width_bounds_a_sized_placeholder_and_leaves_an_unsized_one_1898() {
     assert!(pictures(&got.document.body).is_empty());
     assert_eq!(paragraph_texts(&got.document), ["Logo"]);
 }
+
+#[test]
+fn resolve_ref_follows_rfc_3986_1898() {
+    use html_image::resolve_ref as r;
+    let base = "http://a/b/c/d;p?q";
+    // RFC 3986 section 5.4.1's normal examples.
+    for (reference, want) in [
+        ("g:h", "g:h"),
+        ("g", "http://a/b/c/g"),
+        ("./g", "http://a/b/c/g"),
+        ("g/", "http://a/b/c/g/"),
+        ("/g", "http://a/g"),
+        ("//g", "http://g"),
+        ("?y", "http://a/b/c/d;p?y"),
+        ("g?y", "http://a/b/c/g?y"),
+        ("#s", "http://a/b/c/d;p?q#s"),
+        ("g#s", "http://a/b/c/g#s"),
+        ("g?y#s", "http://a/b/c/g?y#s"),
+        (";x", "http://a/b/c/;x"),
+        ("g;x", "http://a/b/c/g;x"),
+        (".", "http://a/b/c/"),
+        ("./", "http://a/b/c/"),
+        ("..", "http://a/b/"),
+        ("../", "http://a/b/"),
+        ("../g", "http://a/b/g"),
+        ("../..", "http://a/"),
+        ("../../g", "http://a/g"),
+        // Abnormal: no `..` above the root.
+        ("../../../g", "http://a/g"),
+        ("/./g", "http://a/g"),
+        ("g/./h", "http://a/b/c/g/h"),
+        ("g/../h", "http://a/b/c/h"),
+    ] {
+        assert_eq!(r(base, reference), want, "{reference}");
+    }
+    // A host with no path.
+    assert_eq!(
+        r("https://example.com", "a.png"),
+        "https://example.com/a.png"
+    );
+    // A `file:` base, as Word's MHTML root.
+    assert_eq!(
+        r("file:///C:/X/doc.htm", "doc_files/image001.png"),
+        "file:///C:/X/doc_files/image001.png"
+    );
+    // A relative base gives a relative src; a `..` it cannot remove stays.
+    assert_eq!(r("img/", "a.png"), "img/a.png");
+    assert_eq!(r("img/x/", "../a.png"), "img/a.png");
+    assert_eq!(r("../shared/", "a.png"), "../shared/a.png");
+    // A src with a scheme is itself.
+    assert_eq!(r("img/", "cid:logo@x"), "cid:logo@x");
+}
+
+#[test]
+fn a_base_href_resolves_every_src_but_a_data_one_1898() {
+    let data = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAQAAAACCAIAAAA=";
+    let (_, asked) = import(&format!(
+        "<html><head><base href='img/'></head><body><p><img src=a.png>\
+         <img src=/root.png><img src=cid:x@y><img src='{data}'></p></body></html>"
+    ));
+    assert_eq!(asked, ["img/a.png", "/root.png", "cid:x@y"]);
+}
+
+#[test]
+fn the_first_base_href_applies_to_an_img_before_it_1898() {
+    let (_, asked) =
+        import("<p><img src=a.png><base target=_top><base href='img/'><base href='other/'></p>");
+    assert_eq!(asked, ["img/a.png"]);
+    // In a comment or a script it is not one; `data:` and `javascript:`
+    // are no base.
+    let (_, asked) = import(
+        "<!-- <base href='c/'> --><script>'<base href=\"s/\">'</script>\
+         <base href='javascript:x'><p><img src=a.png></p>",
+    );
+    assert_eq!(asked, ["a.png"]);
+}
+
+#[test]
+fn an_absolute_base_makes_an_absolute_src_1898() {
+    let (_, asked) = import("<base href='https://example.com/mail/'><p><img src=../a.png></p>");
+    assert_eq!(asked, ["https://example.com/a.png"]);
+}
+
+#[test]
+fn no_base_leaves_srcs_as_they_were_1898() {
+    let (_, asked) = import("<p><img src='x_files/a.png'><img src='../b.png'></p>");
+    assert_eq!(asked, ["x_files/a.png", "../b.png"]);
+}

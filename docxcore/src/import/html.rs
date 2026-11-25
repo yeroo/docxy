@@ -247,10 +247,13 @@ fn import_decoded(
     budget: &Budget,
     images: Option<&mut ImageResolver<'_>>,
 ) -> Result<HtmlImport, String> {
-    let sheet = StyleSheet::parse(&collect_styles(text), budget);
+    let (css, base) = collect_styles(text);
+    let sheet = StyleSheet::parse(&css, budget);
     let mut h = Html::new(text, budget, sheet);
     if let Some(resolve) = images {
-        h.images = Some(Images::new(resolve));
+        let mut images = Images::new(resolve);
+        images.set_base(base);
+        h.images = Some(images);
     }
     h.run();
     // Cards left open at the end of the page end as `</div>` would end them
@@ -2523,11 +2526,16 @@ const QUIRKS_PUBLIC_NO_SYSTEM: [&str; 2] = [
     "-//w3c//dtd html 4.01 transitional//",
 ];
 
-/// The CSS text of every `<style>` element of the page, in order: one
-/// forward scan, skipping comments and the contents of elements whose text
-/// is not markup (a `<style>` inside a comment or a script does not apply).
-fn collect_styles(s: &str) -> String {
+/// The CSS text of every `<style>` element of the page, in order, and its
+/// `<base href>` (#1898): one forward scan, skipping comments and the
+/// contents of elements whose text is not markup (a `<style>` or `<base>`
+/// inside a comment or a script does not apply). The base is the first
+/// `<base>` with an `href`, in head or body, as a browser's document base
+/// URL: found before the tokenizer runs, it applies to an `<img>` before
+/// it too.
+fn collect_styles(s: &str) -> (String, Option<String>) {
     let mut css = String::new();
+    let mut base = None;
     let mut i = 0;
     while let Some(off) = s[i..].find('<') {
         let at = i + off;
@@ -2543,6 +2551,12 @@ fn collect_styles(s: &str) -> String {
             .find(|c: char| !c.is_ascii_alphanumeric())
             .unwrap_or(rest.len() - 1);
         let name = rest[1..1 + name_len.min(MAX_TAG)].to_ascii_lowercase();
+        if name == "base" && base.is_none() {
+            if let Some(end) = tag_end(rest) {
+                let attrs = attrs_of(&rest[1 + name_len..end - 1]);
+                base = attrs.href.and_then(|h| html_image::page_base(&h));
+            }
+        }
         if !RAW_TEXT.contains(&name.as_str()) {
             i = at + 1;
             continue;
@@ -2559,7 +2573,7 @@ fn collect_styles(s: &str) -> String {
         }
         i = end;
     }
-    css
+    (css, base)
 }
 
 struct Html<'a> {
@@ -6731,7 +6745,7 @@ mod tests {
         }
         let page = format!("<style>{css_text}</style><p class=c5>five</p><p class=c50000>late</p>");
         let budget = Budget::standard();
-        let sheet = StyleSheet::parse(&collect_styles(&page), &budget);
+        let sheet = StyleSheet::parse(&collect_styles(&page).0, &budget);
         assert_eq!(sheet.len(), css::MAX_RULES);
         let d = doc(&page);
         assert_eq!(run_of(&d, "five").props.color.as_deref(), Some("FF0000"));
