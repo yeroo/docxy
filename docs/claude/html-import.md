@@ -509,10 +509,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
 - Known limits: CSS text decorations propagate in a browser (a
   `text-decoration:none` span inside a link still shows the link's
   underline), but here underline is an inherited run property, so that
-  span's text loses it. No bookmarks for `<a name>`/`id` (an anchor link
-  has nowhere to jump yet), no `Hyperlink` character style (`w:rStyle`; the
-  Markdown package defines none), no `<base href>` or relative links, no
-  `title` (`w:tooltip`) or `target` (`w:tgtFrame`).
+  span's text loses it. Bookmarks, the `Hyperlink` style, relative links,
+  `title` and `target` came with #1912 (below).
 
 ## HTML import picture links (#1999)
 
@@ -544,13 +542,99 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   child only; `pic:cNvPr`'s copy and an anchored drawing are not read).
 - An anchor link (`#name`) on a picture stays as before (the picture
   outside the link): DrawingML's `hlinkClick` has no bookmark form, and
-  Word wraps the run in `w:hyperlink w:anchor` instead. Not done: `<a
-  title>` as the `hlinkClick`'s `tooltip`, `a:hlinkHover`, the e-mail
+  Word wraps the run in `w:hyperlink w:anchor` instead. `<a title>` is
+  the `hlinkClick`'s `tooltip` since #1912. Not done: `a:hlinkHover`, the e-mail
   export writing such a picture back as `<a href><img></a>`, and a paste
   carrying the link's relationship (`docs/claude/suite-document.md`).
 - Tests: `link_tests` in `import/html.rs` (`…_1999`), the `with_click_link`
   / `inline_click_link` / `replace_click_link` tests in `image.rs`,
   `add_part_hyperlinks_…` in `package.rs`.
+
+## HTML import links, leftovers (#1912)
+
+- Bookmarks: `<a name>` always makes one, and any element's `id` makes
+  one only when the page links to it. `prescan` (the scan that finds the
+  `<style>`s and `<base>`, formerly `collect_styles`) collects the mapped
+  names of every `<a href="#…">`, so a table of contents ahead of its
+  sections finds them. Outlook mail is full of unlinked ids, which would
+  clutter Insert > Bookmark. Void elements' ids (`<img id>`, `<br id>`)
+  make none: their attributes are mostly not read.
+- One mapping, `html::bookmark_name`, serves a link's `w:anchor` (in
+  `link_of`) and the bookmark's `w:name`, so `href="#my%20section"` jumps
+  to `id="my section"`, both `my_section`. Word's rule as far as it can be
+  kept: each character that is not a letter, a digit or `_` is `_`; a
+  digit-led name gets a leading `_` (a hidden bookmark, as `_Toc…`); a
+  `_`-led one (Outlook's `_MailEndCompose`) is kept; cut to 40 characters.
+  A mapped name already made is not made again (first wins).
+- A bookmark is a point, two `Inline::Raw`s (`<w:bookmarkStart w:id="N"
+  w:name="…"/><w:bookmarkEnd w:id="N"/>`, `w:id`s 0, 1, … in the import),
+  queued by `Builder::bookmark` when its element opens and written right
+  before the next content (`link_text`, `tab`, the breaks, `object`), in a
+  cell when that content is. It never makes or keeps a paragraph: the
+  Builder's content checks pass over it (`is_mark`: `is_object`, `shows`,
+  `drop_trailing_break` counts the rest, `take_leading_marker` keeps it
+  in front), and `clear_para` puts a cleared paragraph's marks back in the
+  queue (`<p id=x>&nbsp;</p>`'s mark goes to the next text). What is still
+  queued at the end ends the body's last paragraph, or is dropped after a
+  table. At most `MAX_BOOKMARKS` (10 000), charged to the budget.
+- `Hyperlink` style: a Markdown package style now (`markdown_style_def`,
+  so `markdown_styles_xml` and `ensure_styles`): character, colour
+  `0563C1`, single underline, `uiPriority` 99, `unhideWhenUsed`. Link
+  text takes it (`Builder::set_link_style`, in `link_text`, after the
+  page's rules) only when its props are underlined and coloured and name
+  no style: the direct formatting then holds all the style sets, so
+  nothing drawn changes (`shown_run` ORs underline and takes the style's
+  colour only for a run with none). A link the page restyled (no
+  underline, `color:inherit` to none) gets no style, as before.
+- Relative links: `link_of(href, base)` resolves an `href` with no scheme
+  against the page's base (`Html::base`: `<base href>`, else an MHTML
+  root's `Content-Location`, the base images use since #1898) with
+  `html_image::resolve_ref`, then the allow-list and encoding as before.
+  Only an `http`, `https` or `ftp` base with an authority resolves
+  (`hierarchical_base`): a relative base, `mailto:` or `cid:` (a browser's
+  cannot-be-a-base URL; `mailto:a@b` + `x` must not be `mailto:x`) leaves
+  plain text; a `file:` base gives `file:`, no link. `#name` stays an
+  anchor link whatever the base (Word's and Outlook's reading). A page
+  opened from disk does not resolve against its own path (that would make
+  `file:` links).
+- `title` and `target`: `Link` is a struct now (`to: LinkTo` `Url` /
+  `Anchor`, `tooltip`, `frame`). `title` is trimmed, characters XML cannot
+  hold dropped, cut to 255 characters (`MAX_LINK_ATTR`, Word's ScreenTip
+  limit); `target` is trimmed and none when empty, `_self`, longer than
+  255 (a cut name would name another frame) or holding a control
+  character. A link with either keeps the opener the importer writes as
+  its `raw` (`<w:hyperlink [w:anchor] [w:tooltip] [w:tgtFrame]/>`,
+  `content_changed: true`): serialize writes it, then the runs, and
+  `save_package` writes its minted `r:id` into it (`with_opener_rel_id`),
+  as for a loaded link edited (#1952). No new `Hyperlink` fields: a loaded
+  link keeps these in its opener already. `Link::made` compares that
+  opener, so a titled link joins only its twin, its continuation after a
+  break or picture included. A picture in a titled URL link: the title is
+  its `hlinkClick`'s `tooltip` (`image::with_titled_click_link`; the
+  public `with_click_link` the suite calls is the untitled one), after its
+  `r:id`, escaped for either quote, so `inline_click_link` and
+  `replace_click_link` never read a title spelling `r:id="…"`.
+- A clipboard paste (`import_html_str_within`, only `Clip::from_html`)
+  makes no bookmarks and no `Hyperlink` style (`import_decoded`'s
+  `package: false`): nothing renumbers a paste's bookmark `w:id`s or
+  dedups names against the document it goes into (`_GoBack` is usually
+  `w:id="0"`), and that document may define no `Hyperlink`. Its anchor
+  links stay anchor links, through the mapping.
+- Markdown (r1-pre1, `markdown.rs`): `to_markdown` writes a destination
+  holding a space, a parenthesis, `<`, `>` or a control character as
+  `[text](<dest>)` (`md_destination`: `<`, `>` and `\` escaped, a line
+  break `%0A`/`%0D`), and `parse_link` reads that form
+  (`bracketed_destination`; unclosed, the bare reading of old).
+  Percent-encoding instead would not round-trip (`from_markdown` does not
+  decode). `from_markdown` reads `#name` as an anchor link, so a save
+  mints no external relationship with `Target="#name"`.
+- Not done: range bookmarks around an `<a name>`'s text, `a:hlinkHover`,
+  the e-mail export writing tooltips, targets or bookmarks back, the
+  suite showing a link's tooltip on hover, explicit-off underline or
+  colour so a restyled link could carry the style too, bookmarks and the
+  style on a paste.
+- Tests: `import/html_tests_1912.rs`, the `…_1912` Builder tests in
+  `import/mod.rs`, `markdown.rs`, `image.rs` and `package.rs`.
 
 ## HTML import page margins (#1928)
 
