@@ -972,9 +972,9 @@ struct Cascade {
     /// card's table width (#1927).
     block_width: Option<Len>,
     /// An image's corner radii, top left, top right, bottom right, bottom
-    /// left (#1926): kept until its font size is known, then one
-    /// [`Look::own_radius`].
-    radius: [Option<Len>; 4],
+    /// left, each horizontal and vertical (#1926, #1936): kept until its
+    /// font size is known, then [`Look::own_radius`].
+    radius: [Option<css::CornerRadius>; 4],
     /// Whether it may be, or is, a card (#1927).
     card: CardMode,
     /// Its own `display` is neither `block` nor unset (nor `none`): an
@@ -2497,33 +2497,36 @@ impl Cascade {
     }
 }
 
-/// An image's one radius from its four corners (#1926), each resolved
-/// against its font: `None` with none set or all of them zero, `NonUniform`
-/// when they differ (a corner left unset is a square one). A zero length
-/// and a zero percentage are the same square corner.
-fn image_radius(corners: [Option<Len>; 4], font_pt: f64) -> Option<html_image::Radius> {
-    use html_image::Radius;
+/// An element's radius from its four corners (#1926, #1936), each half
+/// resolved against its font: `None` with none set or every corner square
+/// (a corner left unset is a square one). A zero length and a zero
+/// percentage are the same square corner.
+fn image_radius(
+    corners: [Option<css::CornerRadius>; 4],
+    font_pt: f64,
+) -> Option<html_image::Radius> {
+    use html_image::RLen;
     if corners.iter().all(Option::is_none) {
         return None;
     }
-    let resolve = |c: Option<Len>| match c {
-        Some(l) if l.unit == css::Unit::Percent && l.v > 0.0 => Radius::Pct(l.v),
-        Some(l) => {
-            let t = l.points(font_pt).map_or(0.0, |p| (p * 20.0).round());
-            // `t` is finite and non-negative (the parser refuses negative
-            // radii), so the cast saturates at most.
-            Radius::Twips(t.max(0.0) as u64)
+    let resolve = |l: Len| {
+        if l.unit == css::Unit::Percent {
+            return if l.v > 0.0 {
+                RLen::Pct(l.v)
+            } else {
+                RLen::Twips(0)
+            };
         }
-        None => Radius::Twips(0),
+        let t = l.points(font_pt).map_or(0.0, |p| (p * 20.0).round());
+        // `t` is non-negative (the parser refuses negative radii), so the
+        // cast saturates at most.
+        RLen::Twips(t.max(0.0) as u64)
     };
-    let first = resolve(corners[0]);
-    if corners[1..].iter().any(|&c| resolve(c) != first) {
-        return Some(Radius::NonUniform);
-    }
-    match first {
-        Radius::Twips(0) => None,
-        r => Some(r),
-    }
+    let radius = html_image::Radius(corners.map(|c| match c {
+        Some((h, v)) => (resolve(h), resolve(v)),
+        None => (RLen::Twips(0), RLen::Twips(0)),
+    }));
+    (!radius.is_square()).then_some(radius)
 }
 
 /// What computing a look reads besides the element stack.
@@ -7941,7 +7944,7 @@ mod image_tests {
 
     #[test]
     fn border_radius_longhands_count_when_all_four_agree() {
-        use crate::image::PictureShape::{Ellipse, Rect, RoundRect};
+        use crate::image::PictureShape::{Rect, Round2Same, RoundRect};
         let all = "border-top-left-radius:8px;border-top-right-radius:8px;\
                    border-bottom-right-radius:8px;border-bottom-left-radius:8px 2px";
         let (d, _, _) = with_images(&format!(
@@ -7956,15 +7959,25 @@ mod image_tests {
         assert_eq!(
             shapes(&d),
             [
-                RoundRect { adj: 20_000 },
-                // One corner rounded alone: Word has no such crop here.
+                // The last corner's vertical radius counts since #1936: it
+                // is 8 x 2 px, circular 2 px, so the corners are 8, 8, 8, 2,
+                // which no preset draws.
                 Rect,
+                // One corner rounded alone (not the top right): Word has no
+                // such crop here.
                 Rect,
+                // Three corners.
                 Rect,
+                // The top pair (#1936; it was a rectangle).
+                Round2Same {
+                    adj1: 25_000,
+                    adj2: 0
+                },
                 // 6pt is 8px: the same corner.
                 RoundRect { adj: 25_000 },
-                // The vertical radii are dropped.
-                Ellipse,
+                // The vertical radii count since #1936: 16 x 3.2 px corners,
+                // circular 3.2 px (it was the ellipse).
+                RoundRect { adj: 10_000 },
                 Rect,
             ]
         );
