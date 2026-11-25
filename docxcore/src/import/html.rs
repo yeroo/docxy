@@ -2627,10 +2627,9 @@ const QUIRKS_PUBLIC_NO_SYSTEM: [&str; 2] = [
 /// (no later tag can close either), so the scan stays linear.
 fn collect_styles(s: &str) -> (String, Option<String>) {
     let mut css = String::new();
-    // `Some(base)` once the first `<base>` with an `href` is read; `looking`
-    // until then, or until a `<base` that never closes.
-    let mut base: Option<Option<String>> = None;
+    // Until the first `<base>` with an `href`, or a `<base` that never closes.
     let mut looking = true;
+    let mut base = None;
     let mut i = 0;
     while let Some(off) = s[i..].find('<') {
         let at = i + off;
@@ -2654,7 +2653,7 @@ fn collect_styles(s: &str) -> (String, Option<String>) {
             };
             let attrs = attrs_of(&rest[1 + name_len..end - 1]);
             if let Some(href) = attrs.href {
-                base = Some(html_image::page_base(&href));
+                base = html_image::page_base(&href);
                 looking = false;
             }
             i = at + end;
@@ -2676,7 +2675,7 @@ fn collect_styles(s: &str) -> (String, Option<String>) {
         }
         i = end;
     }
-    (css, base.flatten())
+    (css, base)
 }
 
 struct Html<'a> {
