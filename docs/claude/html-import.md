@@ -1451,12 +1451,24 @@ was #1922's.
   `Inline::Tab`: Word's usual blank line, which `export_email` writes as a
   tab span in the run's span.
 - An empty paragraph's mark takes its line's look (`empty_line_mark`):
-  of its own visible runs (not a link's), the one with the largest
+  of its own visible runs, tabs and line breaks (not a link's; a lone
+  `<br>`, Gmail's empty line, too), the one with the largest
   `size_half_pts`, the first among ties, else the first; `mark_rpr` of it
-  replaces the block's. None visible leaves the block's mark. A list
-  item's mark stays its marker's (#1979). A run with no look of its own
-  gives the block's mark, as before.
-- ASCII spaces alone never reach the builder outside `pre` (`on_text`
-  writes an owed space only before other text), so they stay no line.
+  replaces the block's. In standards mode the size is at least the
+  block's own (`para_look`'s), a line box's strut; quirks mode (Outlook's
+  mail, no doctype) has none, so a smaller span sizes the line. None
+  visible leaves the block's mark. A list item's mark stays its marker's
+  (#1979). The runs inherit the block's look, so a span with no look of
+  its own gives the block's mark as before; a span that turns the block's
+  look off (`font-weight:normal` in a bold block) gives a plain line, and
+  the block's mark goes with nothing in its place.
+- A typed list marker's spacer (`take_leading_marker`'s gap) stops before
+  white space in a look drawn on it: `1.<span>&nbsp;&nbsp;</span><u>&nbsp;…</u>`
+  keeps the underlined blank. The inline the marker ends in is cut as
+  before.
+- ASCII spaces alone never reach the builder outside `pre`: `Html::text`
+  owes a space (`self.space`) and pays it only before a non-space
+  character (`pay_space` before an object or alt text), so they stay no
+  line.
 - Tests: `import/html_tests_1973.rs`;
   `export_email::tests::underlined_spaces_alone_round_trip_1973`.
