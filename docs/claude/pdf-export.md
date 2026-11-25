@@ -94,9 +94,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the PDF export (
 
 ## PDF export: tables placed by `w:jc` (#1930)
 
-- `emit_table` reads the table's own `w:tblPr/w:jc` (`table_place`, the
-  suite's `table_view::h_align` mapping: `center`, `right`/`end`, else
-  left; a style's `jc` and `bidiVisual` are not read). Its width is the
+- `emit_table` reads the table's own `w:tblPr/w:jc` through
+  `docxcore::table::h_align`, the one mapping the suite's view uses too
+  (`center`, `right`/`end`, else left; a style's `jc` and `bidiVisual` are
+  not read). Its width is the
   sum of `t.grid`, in points.
 - Left, or a table with no grid width, takes the old path, byte for byte
   (`pdf_legacy_bytes`). Otherwise the flattened rows go through `Placed`,

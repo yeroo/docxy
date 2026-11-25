@@ -39,6 +39,7 @@ use crate::pdf_font::{PdfFontProvider, PdfReport};
 use crate::render::{BidiBaseDirection, BidiInputGlyph, BidiProjector, BidiRunDirection};
 use crate::sect::LnRestart;
 use crate::styles::{PprFlag, StyleSheet};
+use crate::table::HAlign;
 
 mod cid;
 mod pic;
@@ -1152,36 +1153,15 @@ fn emit_paragraph(flow: &mut dyn Flow, p: &Paragraph, opts: &PdfOptions) {
     emit_segments(flow, segs, size, p.props.align, (m, base));
 }
 
-/// Where a table sits across its text column: its own `w:jc` (#1930), as
-/// the suite's document view reads it (`table_view::h_align`); a style's
-/// `jc` and `bidiVisual` are not read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TablePlace {
-    Left,
-    Center,
-    Right,
-}
-
-fn table_place(t: &Table) -> TablePlace {
-    match crate::table::table_props(t)
-        .attr("w:jc", "w:val")
-        .as_deref()
-    {
-        Some("center") => TablePlace::Center,
-        Some("right" | "end") => TablePlace::Right,
-        _ => TablePlace::Left,
-    }
-}
-
 /// How far right of the column's left a table `table_w` points wide sits in
 /// a `col_w` column (#1930): `None` at the left, also for a table with no
 /// width or one wider than the column (the suite's view keeps those there).
-fn place_offset(col_w: f32, table_w: f32, place: TablePlace) -> Option<f32> {
-    if place == TablePlace::Left || table_w <= 0.0 || table_w > col_w {
+fn place_offset(col_w: f32, table_w: f32, place: HAlign) -> Option<f32> {
+    if place == HAlign::Left || table_w <= 0.0 || table_w > col_w {
         return None;
     }
     Some(match place {
-        TablePlace::Center => (col_w - table_w) / 2.0,
+        HAlign::Center => (col_w - table_w) / 2.0,
         _ => col_w - table_w,
     })
 }
@@ -1191,7 +1171,7 @@ fn place_offset(col_w: f32, table_w: f32, place: TablePlace) -> Option<f32> {
 /// Everything else is the inner flow's.
 struct Placed<'a> {
     inner: &'a mut dyn Flow,
-    place: TablePlace,
+    place: HAlign,
     /// The table's width, in points.
     width: f32,
 }
@@ -1229,9 +1209,10 @@ impl Flow for Placed<'_> {
 fn emit_table(flow: &mut dyn Flow, t: &Table, opts: &PdfOptions) {
     // Word doesn't number table lines.
     flow.begin_paragraph(ParaInfo { numbered: false });
-    let place = table_place(t);
+    // Its own `w:jc`, as the suite's document view places it (#1922).
+    let place = crate::table::h_align(t);
     let width = t.grid.iter().map(|&w| u64::from(w)).sum::<u64>() as f32 / 20.0;
-    if place == TablePlace::Left || width <= 0.0 {
+    if place == HAlign::Left || width <= 0.0 {
         // At the column's left, as every table printed before #1930.
         return emit_rows(flow, t, opts);
     }
@@ -5775,13 +5756,13 @@ mod tests {
 
     #[test]
     fn place_offset_centres_or_right_aligns_a_table_that_fits() {
-        assert_eq!(place_offset(468.0, 288.0, TablePlace::Center), Some(90.0));
-        assert_eq!(place_offset(468.0, 288.0, TablePlace::Right), Some(180.0));
-        assert_eq!(place_offset(468.0, 468.0, TablePlace::Center), Some(0.0));
+        assert_eq!(place_offset(468.0, 288.0, HAlign::Center), Some(90.0));
+        assert_eq!(place_offset(468.0, 288.0, HAlign::Right), Some(180.0));
+        assert_eq!(place_offset(468.0, 468.0, HAlign::Center), Some(0.0));
         // Wider than the column, or no width: at the left, unplaced.
-        assert_eq!(place_offset(468.0, 500.0, TablePlace::Center), None);
-        assert_eq!(place_offset(468.0, 0.0, TablePlace::Right), None);
-        assert_eq!(place_offset(468.0, 288.0, TablePlace::Left), None);
+        assert_eq!(place_offset(468.0, 500.0, HAlign::Center), None);
+        assert_eq!(place_offset(468.0, 0.0, HAlign::Right), None);
+        assert_eq!(place_offset(468.0, 288.0, HAlign::Left), None);
     }
 
     #[test]

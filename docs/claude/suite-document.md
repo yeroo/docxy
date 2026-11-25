@@ -365,7 +365,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
 ## Table placement by `w:jc` (#1922)
 
 - `table_el` places a table by its own `w:tblPr/w:jc`
-  (`table_view::h_align`: `center`; `right`/`end`; anything else, a table
+  (`docxcore::table::h_align`, re-exported by `table_view`, PDF export's
+  too since #1930: `center`; `right`/`end`; anything else, a table
   style's `jc` and right-to-left are not read) with auto side margins
   (`mx_auto` / `ml_auto`) on its root, in Web and Print Layout, headers,
   footers, cells and `ext::DocView`.
