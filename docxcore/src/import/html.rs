@@ -5296,11 +5296,18 @@ impl<'a> Html<'a> {
             _ => {}
         }
         // Only spaces (Word's `&nbsp;` in an empty paragraph) is empty; a
-        // picture is content (#1880).
-        if !self.out.has_object()
-            && !self.out.has_page_break()
-            && self.out.para_text().chars().all(|c| c.is_whitespace())
-        {
+        // picture is content (#1880), and so are spaces or a tab in a look
+        // drawn on them, a blank to fill in (#1973): what the builder keeps.
+        if !self.out.keeps() {
+            // The empty line is as tall as its tallest run, in its look
+            // (#1973): its mark takes it, outside a list item, whose mark
+            // is its marker's (#1979).
+            if props.num_id.is_none() {
+                if let Some(rpr) = self.empty_line_mark() {
+                    props.raw_props.retain(|r| !r.starts_with("<w:rPr"));
+                    props.raw_props.extend(rpr);
+                }
+            }
             self.out.clear_para();
         }
         // A paragraph that shows nothing (hidden) takes neither a forced
@@ -5339,6 +5346,26 @@ impl<'a> Html<'a> {
             }
         }
         self.reset_para();
+    }
+
+    /// The mark of an empty paragraph about to be cleared (#1973): its
+    /// visible runs' look, the one with the largest size (the first among
+    /// ties, the first visible run when none has one), as a browser's line
+    /// box is its tallest run's. `None` with no visible run: the block's
+    /// mark stays; `Some(None)` for a run with no look of its own.
+    fn empty_line_mark(&self) -> Option<Option<String>> {
+        let mut best: Option<&RunProps> = None;
+        for run in self.out.para_runs().filter(|r| !r.props.vanish) {
+            let p = &run.props;
+            match best {
+                None => best = Some(p),
+                Some(b) if p.size_half_pts.is_some() && p.size_half_pts > b.size_half_pts => {
+                    best = Some(p);
+                }
+                _ => {}
+            }
+        }
+        best.map(mark_rpr)
     }
 
     /// Make `props` its item's numbered paragraph: the list's number and
@@ -12423,3 +12450,9 @@ mod tests_1940;
 #[cfg(test)]
 #[path = "html_tests_1944.rs"]
 mod tests_1944;
+
+// A whitespace-only paragraph (#1973): a blank to fill in keeps its run,
+// an empty line's size goes on its mark.
+#[cfg(test)]
+#[path = "html_tests_1973.rs"]
+mod tests_1973;
