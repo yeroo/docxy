@@ -24,6 +24,8 @@ use worker::{
 pub(crate) mod convert;
 pub(crate) mod form;
 pub(crate) mod host;
+pub(crate) mod output;
+pub(crate) mod print;
 pub(crate) mod render;
 pub(crate) mod worker;
 
@@ -429,6 +431,13 @@ pub(crate) struct PdfView {
     /// An encrypted file's password prompt (#2256): until it opens, the view
     /// has no pages and no engine.
     pub lock: Option<Box<PdfLock>>,
+    /// The printers the open Print dialog lists, in its order (#2258).
+    pub printers: Vec<print::PrinterInfo>,
+    /// An export a harness's `save-as` names the file of (#2258): a harness
+    /// never opens the Save dialog.
+    pub export_waiting: Option<worker::Export>,
+    /// The files the last export wrote (#2258; the harness's `exported`).
+    pub exported: Vec<PathBuf>,
     /// The questions sent so far (the scheduler's tests).
     #[cfg(test)]
     pub sent: Vec<Op>,
@@ -483,6 +492,9 @@ impl PdfView {
             open_url: None,
             values_lost: false,
             lock: None,
+            printers: Vec::new(),
+            export_waiting: None,
+            exported: Vec::new(),
             #[cfg(test)]
             sent: Vec::new(),
             meta,
@@ -799,6 +811,13 @@ impl PdfView {
                     s.outcome = Some(Ok(path));
                 }
             }
+            (Op::Print { job }, Answer::Printed(p)) => {
+                self.notice = Some(print::printed_status(&job, p.sheets));
+            }
+            (Op::ExportTo { .. }, Answer::Exported(e)) => {
+                self.notice = Some(print::exported_status(&e.files, e.dpi_used, &e.left));
+                self.exported = e.files;
+            }
             (op, Answer::Failed(why)) => self.fail(&op, why),
             _ => {}
         }
@@ -851,6 +870,9 @@ impl PdfView {
                     s.outcome = Some(Err(why));
                 }
             }
+            Op::Print { .. } => self.notice = Some(format!("Not printed: {why}")),
+            Op::ExportTo { .. } => self.notice = Some(format!("Not exported: {why}")),
+            Op::Png { .. } | Op::ExtractPages { .. } => {}
             Op::Info
             | Op::Fields
             | Op::SetFields { .. }

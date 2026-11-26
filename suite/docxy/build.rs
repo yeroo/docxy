@@ -17,6 +17,8 @@ fn main() {
         }
     }
 
+    delay_load_print_dlls();
+
     #[cfg(windows)]
     {
         // GPUI's debug render path can exceed the PE default 1 MiB main-thread
@@ -34,4 +36,26 @@ fn main() {
             println!("cargo:warning=failed to embed the app icon: {e:?}");
         }
     }
+}
+
+/// The in-box DLLs only printing uses (#2258): Windows.Data.Pdf draws a
+/// print job, prntvpt reads the driver's print capabilities. They are
+/// delay-loaded, as PdfCraft's own applications do (`apps/pdfcraft/build.rs`,
+/// the same list as `pdfcraft-print`'s `spool::PRINT_DLLS`), so the suite
+/// still starts on a Windows without them: `pdfcraft-print` checks for them
+/// before it prints and says which one is missing. For every executable of
+/// the package (`rustc-link-arg`, not `-bin=suite`): the test executables
+/// link `winprint` too. MSVC only; nothing elsewhere. Read from the target's
+/// cfg, not `cfg!`, which is the build script's own host.
+fn delay_load_print_dlls() {
+    const DELAY_LOADED: [&str; 2] = ["windows.data.pdf.dll", "prntvpt.dll"];
+    let os = std::env::var("CARGO_CFG_TARGET_OS");
+    let env = std::env::var("CARGO_CFG_TARGET_ENV");
+    if os.as_deref() != Ok("windows") || env.as_deref() != Ok("msvc") {
+        return;
+    }
+    for dll in DELAY_LOADED {
+        println!("cargo:rustc-link-arg=/DELAYLOAD:{dll}");
+    }
+    println!("cargo:rustc-link-arg=delayimp.lib");
 }

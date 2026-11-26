@@ -214,18 +214,7 @@ pub(crate) fn pdf_save_step(tab: &mut DocTab, target: Option<std::path::PathBuf>
 /// a workbook's Save As refuses one, since the dialog confirmed replacing
 /// that name and no other.
 pub(crate) fn pdf_save_as_target(path: std::path::PathBuf) -> Result<std::path::PathBuf, String> {
-    match path.extension() {
-        None => {
-            let mut name = path.file_name().unwrap_or_default().to_os_string();
-            name.push(".pdf");
-            Ok(path.with_file_name(name))
-        }
-        Some(e) if e.eq_ignore_ascii_case("pdf") => Ok(path),
-        Some(e) => Err(format!(
-            "A PDF is saved as a .pdf file, not .{}: choose a name that ends in .pdf",
-            e.to_string_lossy()
-        )),
-    }
+    super::print::with_extension(path, "pdf", "A PDF is").map(|(p, _)| p)
 }
 
 /// The signed PDF's question (#2255): Save goes on, Cancel writes nothing.

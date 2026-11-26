@@ -706,13 +706,13 @@ fn text_of(w: &mut Worker, page: usize) -> Arc<PageText> {
 /// (`source`, a sparse page). Single pixels separate them far worse: a
 /// dense page with 14.85 pt line pitch differs on 7.6 % of its pixels, a
 /// blank one on 11.7 %.
-const CHANNEL: u32 = 48;
+pub(crate) const CHANNEL: u32 = 48;
 const BLOCK: u32 = 3;
-const SHARE: f64 = 0.01;
+pub(crate) const SHARE: f64 = 0.01;
 
 /// The share of `BLOCK`-square blocks of `ours` (BGRA, or blank white)
 /// that differ from `reference`'s.
-fn differing(ours: &[u8], reference: &image::RgbaImage, white: bool) -> f64 {
+pub(crate) fn differing(ours: &[u8], reference: &image::RgbaImage, white: bool) -> f64 {
     let (w, h) = reference.dimensions();
     let (bw, bh) = (w / BLOCK, h / BLOCK);
     let mut bad = 0usize;

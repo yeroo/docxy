@@ -44,6 +44,25 @@ macro_rules! pick {
     };
 }
 
+// A PDF's Print and exports (#2258): what OK did, as the harness reads it
+// back (its job file; the export waiting for its save-as).
+const PRINTED_TWO_COPIES: &[&str] = &[
+    r#"call pdf-read {"until_idle":true}"#,
+    "assert reply.printed.copies is 2",
+];
+const PRINTED_PAGE_TWO: &[&str] = &[
+    r#"call pdf-read {"until_idle":true}"#,
+    "assert reply.printed.pages.0 is 2",
+    "assert reply.printed.sheets is 1",
+];
+const PRINTED_AT_HALF: &[&str] = &[
+    r#"call pdf-read {"until_idle":true}"#,
+    "assert reply.printed.sizing is custom",
+    "assert reply.printed.percent is 50",
+];
+const EXPORT_PNG_WAITS: &[&str] = &["call pdf-read {}", "assert reply.export_waiting is png"];
+const EXPORT_PDF_WAITS: &[&str] = &["call pdf-read {}", "assert reply.export_waiting is pdf"];
+
 // Prep: the choices that show or enable a field.
 // Task Information: a constraint type with a date (Start No Earlier Than).
 const PICK_SNET: &[&str] = &[
@@ -1656,6 +1675,66 @@ dialogs! {
             "call close-tab {}",
         ],
         fields: &[],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
+    // ---- A PDF view's Print and exports (#2258) ------------------------------
+    // A harness's printers are made up and its jobs go to a folder, so OK
+    // prints nothing; an export's Save… waits for the harness's save-as.
+    PDF_PRINT = "pdf-print" {
+        surface: Surface::Doc,
+        file: "doc-app",
+        fixture: "copy:../fixtures/pdf-view-text.pdf",
+        open: &[r#"call pdf-read {"until_drawn":[1]}"#, "key ctrl+p"],
+        fields: &[
+            dropdown("printer"),
+            Field::number("copies", "2").applied(PRINTED_TWO_COPIES),
+            radio("pages"),
+            Field::text("range").sample("2").applied(PRINTED_PAGE_TWO),
+            radio("sizing"),
+            Field::number("percent", "50").applied(PRINTED_AT_HALF),
+            radio("orientation"),
+            dropdown("paper"),
+            dropdown("content"),
+        ],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
+    PDF_EXPORT_PNG = "pdf-export-png" {
+        surface: Surface::Doc,
+        file: "doc-app",
+        fixture: "copy:../fixtures/pdf-view-text.pdf",
+        open: &[
+            r#"call pdf-read {"until_drawn":[1]}"#,
+            r#"call backstage {"action":"open"}"#,
+            r#"call pointer-click {"region":"bs-rail:pdf-export"}"#,
+            r#"call pointer-click {"region":"pdf-export-png"}"#,
+        ],
+        fields: &[
+            radio("pages"),
+            Field::text("range").sample("1").applied(EXPORT_PNG_WAITS),
+            dropdown("dpi"),
+        ],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
+    PDF_EXPORT_PDF = "pdf-export-pdf" {
+        surface: Surface::Doc,
+        file: "doc-app",
+        fixture: "copy:../fixtures/pdf-view-text.pdf",
+        open: &[
+            r#"call pdf-read {"until_drawn":[1]}"#,
+            r#"call backstage {"action":"open"}"#,
+            r#"call pointer-click {"region":"bs-rail:pdf-export"}"#,
+            r#"call pointer-click {"region":"pdf-export-pdf"}"#,
+        ],
+        fields: &[
+            radio("pages"),
+            Field::text("range").sample("1").applied(EXPORT_PDF_WAITS),
+        ],
         reopen: &[],
         accept_closes: true,
         unreachable: None,
