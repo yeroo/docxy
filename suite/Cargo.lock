@@ -1730,6 +1730,7 @@ dependencies = [
  "serde_json",
  "unicode-segmentation",
  "x11rb",
+ "zeroize",
 ]
 
 [[package]]

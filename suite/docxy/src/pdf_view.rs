@@ -17,7 +17,8 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use worker::{
-    Answer, Bookmark, DocMeta, Done, Engine, FieldMeta, FormState, LinkMeta, NoteMeta, Op, PageMeta,
+    Answer, Bookmark, DocMeta, Done, Engine, FieldMeta, FormState, LinkMeta, NoteMeta, Op,
+    PageMeta, Secret,
 };
 
 pub(crate) mod form;
@@ -321,6 +322,35 @@ pub(crate) struct Find {
     pub searched: usize,
 }
 
+/// An encrypted PDF waiting for its password (#2256): the view shows the
+/// prompt instead of pages, and asks its worker itself, one try at a time.
+pub(crate) struct PdfLock {
+    /// Taken when the file opens, to read its pages.
+    worker: Option<worker::Worker>,
+    /// The password being typed: emptied by each try.
+    pub field: Field,
+    /// The last try's password did not open it.
+    pub wrong: bool,
+}
+
+impl Drop for PdfLock {
+    /// The password being typed is cleared, not only freed (#2256).
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.field.text);
+    }
+}
+
+/// What a try of the typed password did (#2256).
+#[derive(Debug, PartialEq)]
+pub(crate) enum Unlocked {
+    /// It opened: the view shows its pages now.
+    Opened,
+    /// Not the password: the prompt asks again.
+    Wrong,
+    /// The file could not be read after all.
+    Failed(String),
+}
+
 /// One PDF, open in a tab.
 pub(crate) struct PdfView {
     pub path: PathBuf,
@@ -395,6 +425,9 @@ pub(crate) struct PdfView {
     pub notice: Option<String>,
     pub open_url: Option<String>,
     pub values_lost: bool,
+    /// An encrypted file's password prompt (#2256): until it opens, the view
+    /// has no pages and no engine.
+    pub lock: Option<Box<PdfLock>>,
     /// The questions sent so far (the scheduler's tests).
     #[cfg(test)]
     pub sent: Vec<Op>,
@@ -448,6 +481,7 @@ impl PdfView {
             notice: None,
             open_url: None,
             values_lost: false,
+            lock: None,
             #[cfg(test)]
             sent: Vec::new(),
             meta,
@@ -476,13 +510,78 @@ impl PdfView {
 
     /// Open `path`: start a worker and ask its `info`, waiting at most the
     /// worker's timeout (as a conversion waits). `Err` says why the file is
-    /// no PDF the view can show.
+    /// no PDF the view can show. An encrypted file that needs a password is
+    /// a view with its prompt ([`PdfView::lock`], #2256).
     pub(crate) fn open(path: &Path, spawn: worker::Spawn) -> Result<PdfView, String> {
         let mut w = worker::Worker::new(path, spawn, worker::TIMEOUT);
         match w.ask(&Op::Info) {
             Answer::Info(meta) => Ok(PdfView::new(path, meta, Some(Engine::new(w)))),
+            Answer::Locked { .. } => {
+                let mut v = PdfView::new(path, DocMeta::default(), None);
+                v.lock = Some(Box::new(PdfLock {
+                    worker: Some(w),
+                    field: Field {
+                        focused: true,
+                        ..Field::default()
+                    },
+                    wrong: false,
+                }));
+                Ok(v)
+            }
             Answer::Failed(why) => Err(why),
             _ => Err(worker::DIED.into()),
+        }
+    }
+
+    /// Try the password typed into the prompt (#2256), waiting for the
+    /// worker as the open did. The field is emptied whatever the outcome;
+    /// a password that opens the file stays with the view's worker (a new
+    /// reader is unlocked with it), and the view shows the pages, where the
+    /// session left it.
+    pub(crate) fn try_unlock(&mut self) -> Unlocked {
+        let Some(lock) = self.lock.as_mut() else {
+            return Unlocked::Opened;
+        };
+        // The typed text moves into the secret, which clears it when dropped.
+        let password = Secret::new(std::mem::take(&mut lock.field.text));
+        lock.field = Field {
+            focused: true,
+            ..Field::default()
+        };
+        let Some(w) = lock.worker.as_mut() else {
+            return Unlocked::Failed(worker::DIED.into());
+        };
+        match w.unlock(password) {
+            Answer::Info(meta) => {
+                let engine = lock.worker.take().map(Engine::new);
+                let mut v = PdfView::new(&self.path, meta, engine);
+                v.zoom = self.zoom;
+                v.restore_page = self.restore_page.take();
+                *self = v;
+                Unlocked::Opened
+            }
+            Answer::Locked { wrong } => {
+                lock.wrong = wrong;
+                Unlocked::Wrong
+            }
+            Answer::Failed(why) => Unlocked::Failed(why),
+            _ => Unlocked::Failed(worker::DIED.into()),
+        }
+    }
+
+    /// The status line's word on what the file withholds (#2256):
+    /// `; restricted: printing, copying` or nothing.
+    pub(crate) fn restricted_note(&self) -> String {
+        let r = self
+            .meta
+            .security
+            .as_ref()
+            .map(worker::SecurityMeta::restrictions)
+            .unwrap_or_default();
+        if r.is_empty() {
+            String::new()
+        } else {
+            format!("; restricted: {}", r.join(", "))
         }
     }
 
@@ -751,7 +850,12 @@ impl PdfView {
                     s.outcome = Some(Err(why));
                 }
             }
-            Op::Info | Op::Fields | Op::SetFields { .. } | Op::Save | Op::Saved => {}
+            Op::Info
+            | Op::Fields
+            | Op::SetFields { .. }
+            | Op::Save
+            | Op::Saved
+            | Op::Unlock { .. } => {}
         }
     }
 
@@ -1448,6 +1552,35 @@ impl PdfView {
             ("incremental", Json::Bool(self.form.incremental)),
             ("title", self.meta.title.as_deref().map_or(Json::Null, s)),
             ("author", self.meta.author.as_deref().map_or(Json::Null, s)),
+            // The password prompt (#2256): never the password typed, nor
+            // its length.
+            ("locked", Json::Bool(self.lock.is_some())),
+            (
+                "wrong_password",
+                Json::Bool(self.lock.as_ref().is_some_and(|l| l.wrong)),
+            ),
+            (
+                "password_focused",
+                Json::Bool(self.lock.as_ref().is_some_and(|l| l.field.focused)),
+            ),
+            (
+                "permissions",
+                self.meta.security.as_ref().map_or(Json::Null, |m| {
+                    Json::obj(vec![
+                        ("method", s(&m.method)),
+                        ("owner", Json::Bool(m.owner)),
+                        ("print", Json::Bool(m.print)),
+                        ("copy", Json::Bool(m.copy)),
+                        ("modify", Json::Bool(m.modify)),
+                        ("annotate", Json::Bool(m.annotate)),
+                        ("fill_forms", Json::Bool(m.fill_forms)),
+                        (
+                            "restricted",
+                            Json::Arr(m.restrictions().into_iter().map(s).collect()),
+                        ),
+                    ])
+                }),
+            ),
         ])
     }
 }
@@ -1506,6 +1639,6 @@ pub(crate) fn image_of(r: worker::Raster) -> Option<Arc<RenderImage>> {
 }
 
 #[cfg(test)]
-mod form_tests;
+pub(crate) mod form_tests;
 #[cfg(test)]
 mod tests;

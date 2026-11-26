@@ -1,7 +1,8 @@
 # PDF view
 
 Notes for the suite's PDF view: opening a PDF as it looks; its links,
-comments and form, the only thing it writes back (#2255).
+comments and form, the only thing it writes back (#2255); encrypted,
+updated and damaged files (#2256).
 
 ## PDF view: the renderer and its patch table (#2245)
 
@@ -198,3 +199,64 @@ comments and form, the only thing it writes back (#2255).
   `python3 scripts/make-pdf-view-corpus.py links annots annots-noap forms
   signed` to write only them; the slice 1 files are not written byte for
   byte again by cairo and gs.
+
+## PDF view: encrypted, incremental and damaged files (#2256)
+
+- Protocol 3: `unlock {password}` (`Op::Unlock`, `Worker::unlock`); `info`
+  or `unlock` answers `locked: needs|wrong` (`Answer::Locked`) only for
+  PdfCraft's `NeedsPassword`/`WrongPassword`; anything else (an
+  unsupported handler) is a failure with its reason, never the prompt.
+  `DocMeta.security` (`SecurityMeta`: cipher, owner, the permissions) for
+  an encrypted file.
+- The child opens the working copy first with the typed password (user or
+  owner), then gives the renderer `recovered_user_password()` when there is
+  one (`doc.rs` `render_password`): hayro authenticates only the user
+  password of revisions 2-4 (RC4, AES-128), so an owner password typed for
+  one of those is refused by `inspect` without it (PdfCraft's engine does
+  the same, `render_password_for`). The display copy is written with the
+  file's own encryption, so the renderer takes the same password for it.
+  `saved` reopens with `open_with_same_credentials` (the key, no password).
+- `Secret` (`zeroize::Zeroizing<String>`): `Debug` is `Secret(..)`, cleared
+  on drop; the request line holding it is cleared after its write. It goes
+  on stdin only. The parent holds it only in that view's `Worker`, which
+  sends `unlock` first in `connect` to every new child, before the form
+  replay (so the clean child after a failed replay is unlocked too).
+  The prompt's typed text moves into the `Secret` on a try, is cleared when
+  the `PdfLock` drops, is never cloned to draw (bullets from its length),
+  and a pasted line is cleared after its insert. Not cleared: the freed
+  buffers typing leaves behind as the field's `String` grows
+  (`field_edit`'s inserts reallocate), the clipboard's own copy, and
+  PdfCraft's copies (`LoadOptions`, `RenderConfig`'s `Arc<str>`).
+- Permissions: shown (status `; restricted: printing, copying, changes`,
+  `pdf-read` `permissions`), not enforced, but for filling: a file whose
+  password does not allow `fill_forms` has every field read-only, and the
+  child refuses `set-field(s)` (`NO_FILLING`) whatever sends it.
+- The view: a locked file is a `Surface::Pdf` whose `PdfView::lock`
+  (`PdfLock`: the `Worker`, the masked `Field`, `wrong`) is set and that
+  has no pages and no `Engine` (not a `Surface` of its own: every PDF arm
+  already handles it). Its body is the prompt (`pdf-password`, `pdf-unlock`
+  probes); `try_unlock` is synchronous, as the open is; the field is
+  emptied each try. `pdf_tick` skips a locked view, so `restore_page` and
+  `zoom` (the session's `PdfAt`) wait for the pages; Save refuses
+  (`PDF_NOT_OPEN`); the harness's `open` takes a locked view as opened.
+  `field-read {"input":"pdf-password"}` says only `focused` and `empty`.
+- On Linux the child's `run` (never `serve`, the in-process path) sets
+  `RLIMIT_DATA` to `MEMORY_LIMIT` and `RLIMIT_CORE` to 0 (`limit_memory`):
+  an allocation past it aborts the child, and the parent fails the page.
+  The `limits` test child reads them back from `/proc/self/limits`.
+- A failed PDF tab draws "This PDF can't be opened" and its reason
+  (`pdf_failed_reason`: the status line, so Save and Save As refusals,
+  `note_save_refusal`, leave a failed PDF tab's status alone; `main.rs`
+  `pdf_failed_body`); `pdf-read` gives it as `failed`. A try the reader
+  cannot answer leaves the tab `PdfPending` with `load_failed` where the
+  view was (`unlock_tab`), as a restored tab whose file cannot be read. The
+  harness's `open` refuses a failed load by design, so no case opens
+  `damaged-unreadable.pdf`.
+- PdfCraft finds the objects of a file whose xref offsets are only wrong
+  without a rebuild (no repair log): its save appends. One with no xref or
+  trailer is rebuilt from its object headers and saved in full.
+- Corpus: `enc-*`, `incremental`, `objstm`, `damaged-*` (README there);
+  every one but `damaged-unreadable` has a reference, the damaged ones drawn
+  from the file before its damage. The mutation test adds them (encrypted
+  ones unlocked) and `structural` mutations; `a_flate_bomb_answers_in_time`
+  makes its bombs in the test (`zero_bomb`).

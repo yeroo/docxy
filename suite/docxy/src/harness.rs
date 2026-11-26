@@ -1976,6 +1976,12 @@ fn pdf_read(app: &crate::Docxy, args: &Json) -> Result<Done, String> {
                 "pdf_tab",
                 Json::Bool(tab.is_some_and(|t| t.kind == crate::Kind::Pdf)),
             ),
+            // A PDF that could not be opened: why, as its body says (#2256).
+            (
+                "failed",
+                tab.and_then(crate::pdf_view::host::pdf_failed_reason)
+                    .map_or(Json::Null, Json::Str),
+            ),
         ]));
     };
     let pages = |key: &str| -> Result<Vec<usize>, String> {
@@ -5473,6 +5479,11 @@ fn sheet_editing_json(o: &gridcore::options::EditOptions) -> Json {
 /// not.
 fn load_failure(app: &crate::Docxy) -> Option<String> {
     let t = app.tabs.get(app.active)?;
+    // An encrypted PDF that asks for its password (#2256) opened as far as
+    // it can without it: its prompt is the tab.
+    if matches!(&t.surface, crate::Surface::Pdf(v) if v.lock.is_some()) {
+        return None;
+    }
     load_failed(&t.status).then(|| t.status.to_string())
 }
 

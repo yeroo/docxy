@@ -1,0 +1,44 @@
+%PDF-1.7
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [5 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+4 0 obj
+<<  /Length 214 >>
+stream
+0.15 0.35 0.75 rg 72 560 220 140 re f
+0.85 0.25 0.2 rg 320 560 200 140 re f
+0.2 0.65 0.3 rg 72 380 448 120 re f
+0 G 3 w 72 330 m 520 330 l S
+0 g BT
+/F1 14 Tf
+1 0 0 1 72 760 Tm (Damaged: every offset is wrong) Tj
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R /Annots []  >>
+endobj
+6 0 obj
+<< /Title (Damaged corpus) /Producer (make-pdf-view-corpus.py) >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000022 00000 n 
+0000000071 00000 n 
+0000000128 00000 n 
+0000000225 00000 n 
+0000000491 00000 n 
+0000000629 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R /Info 6 0 R /ID [<22552255225522552255225522552255> <22552255225522552255225522552255>] >>
+startxref
+703
+%%EOF

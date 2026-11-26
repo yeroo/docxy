@@ -46,8 +46,9 @@ const EXIT_USAGE: i32 = 2;
 /// The first line a worker writes.
 const HELLO: &str = "docxy-pdf-worker";
 /// The protocol's revision, in the hello line: 2 adds links, notes and the
-/// form to `info`, and the form's operations (#2255).
-const PROTOCOL: u32 = 2;
+/// form to `info`, and the form's operations (#2255); 3 the password
+/// (`unlock`), a locked file's answer and the file's security (#2256).
+const PROTOCOL: u32 = 3;
 /// The longest answer line read (a page's text as JSON).
 const MAX_LINE: u64 = 256 << 20;
 /// The most pixel bytes one answer may carry (8192 × 8192 BGRA).
@@ -63,6 +64,40 @@ pub(crate) const CHANGED: &str = "the file was changed by another program since 
 /// a new reader (#2255).
 pub(crate) const VALUES_LOST: &str = "the PDF reader stopped and the form values \
      not yet saved could not be restored";
+
+/// A PDF's password (#2256): never printed (`Debug` shows `Secret(..)`),
+/// cleared from memory when dropped. It goes to the child on its stdin
+/// only, never on its command line or in its environment.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub(crate) struct Secret(zeroize::Zeroizing<String>);
+
+impl Secret {
+    pub(crate) fn new(password: String) -> Secret {
+        Secret(zeroize::Zeroizing::new(password))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
+impl Serialize for Secret {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Secret {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Secret, D::Error> {
+        String::deserialize(d).map(Secret::new)
+    }
+}
 
 /// What the worker is asked.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -93,6 +128,10 @@ pub(crate) enum Op {
     /// [`Worker`] asks the child for the bytes and writes them; never sent
     /// to the child.
     SaveTo { path: PathBuf },
+    /// Open an encrypted file with `password` (#2256), user or owner: the
+    /// answer is `info`'s, or locked (`wrong`) when it does not open it.
+    /// The [`Worker`] sends it again first to every new child.
+    Unlock { password: Secret },
 }
 
 impl Op {
@@ -320,6 +359,58 @@ pub(crate) struct DocMeta {
     pub notes: Vec<NoteMeta>,
     #[serde(default)]
     pub form: FormMeta,
+    /// An encrypted file's security handler and what its password allows
+    /// (#2256); `None` for a file that is not encrypted.
+    #[serde(default)]
+    pub security: Option<SecurityMeta>,
+}
+
+/// What an encrypted file allows (#2256), as the password it was opened
+/// with reads `/P`: the owner password allows everything.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SecurityMeta {
+    /// The cipher, as the status line names it: `RC4 40-bit`, `AES 256-bit`.
+    pub method: String,
+    /// Opened with the owner password.
+    pub owner: bool,
+    pub print: bool,
+    pub copy: bool,
+    pub modify: bool,
+    pub annotate: bool,
+    pub fill_forms: bool,
+}
+
+impl SecurityMeta {
+    /// What the file withholds, as the status line lists it: empty when
+    /// nothing is (the owner password, or a file that allows everything).
+    pub(crate) fn restrictions(&self) -> Vec<&'static str> {
+        if self.owner {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (allowed, what) in [
+            (self.print, "printing"),
+            (self.copy, "copying"),
+            (self.modify, "changes"),
+            (self.annotate, "comments"),
+            (self.fill_forms, "filling in forms"),
+        ] {
+            if !allowed {
+                out.push(what);
+            }
+        }
+        out
+    }
+}
+
+/// Why `info` or `unlock` did not open the file (#2256).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Locked {
+    /// Encrypted: it needs a password.
+    Needs,
+    /// The password given does not open it.
+    Wrong,
 }
 
 /// A glyph on the wire: [`TextGlyph`] with short names.
@@ -359,6 +450,9 @@ struct Head {
     /// working document may be half changed): the parent starts another.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     fatal: bool,
+    /// The file needs a password, or the one given is wrong (#2256).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    locked: Option<Locked>,
     /// A raster's size; `len` pixel bytes follow the line.
     #[serde(default)]
     w: u32,
@@ -400,6 +494,11 @@ pub(crate) enum Answer {
     Saved(PathBuf),
     /// Done, nothing to say ([`Op::Saved`]).
     Ok,
+    /// The file is encrypted (#2256): it needs a password (`wrong`: the one
+    /// given does not open it).
+    Locked {
+        wrong: bool,
+    },
     /// Why it could not: the file's fault, or the child's fate.
     Failed(String),
 }
@@ -429,6 +528,7 @@ pub(crate) fn child_main(args: &[OsString]) -> Option<i32> {
 /// sees each request first (the tests' misbehaving children).
 pub(crate) fn run(path: &Path, timeout: Duration, before: impl FnMut(&Op)) -> i32 {
     first_to_go();
+    limit_memory();
     let bytes = std::fs::read(path)
         .map(Arc::new)
         .map_err(|e| format!("the file could not be read: {e}"));
@@ -446,6 +546,40 @@ pub(crate) fn run(path: &Path, timeout: Duration, before: impl FnMut(&Op)) -> i3
 fn first_to_go() {
     #[cfg(target_os = "linux")]
     let _ = std::fs::write("/proc/self/oom_score_adj", "1000");
+}
+
+/// On Linux, the child limits its own memory (#2256), as Windows' job
+/// limits it from outside: past [`crate::convert_child::MEMORY_LIMIT`] of
+/// data an allocation fails and the child aborts, and the parent answers
+/// the page with why. `RLIMIT_DATA`, not `RLIMIT_AS`: glibc's per-thread
+/// arenas reserve address space they never use, which an address-space
+/// limit counts. No core is written for that abort (`RLIMIT_CORE` 0).
+/// Only here, in the child's own `run`: never in [`serve`], which also runs
+/// in the suite's process ([`Spawn::InProcess`]).
+pub(crate) fn limit_memory() {
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::{c_int, c_ulong};
+        #[repr(C)]
+        struct Rlimit {
+            cur: c_ulong,
+            max: c_ulong,
+        }
+        // The asm-generic numbering, which x86_64 and aarch64 Linux use.
+        const RLIMIT_DATA: c_int = 2;
+        const RLIMIT_CORE: c_int = 4;
+        unsafe extern "C" {
+            fn setrlimit(resource: c_int, rlim: *const Rlimit) -> c_int;
+        }
+        let set = |resource, n: usize| {
+            let n = c_ulong::try_from(n).unwrap_or(c_ulong::MAX);
+            let r = Rlimit { cur: n, max: n };
+            // SAFETY: `r` is a valid `struct rlimit` for the call's length.
+            unsafe { setrlimit(resource, &r) };
+        };
+        set(RLIMIT_CORE, 0);
+        set(RLIMIT_DATA, crate::convert_child::MEMORY_LIMIT);
+    }
 }
 
 /// When the request being answered started (ms since `base`, 0: none).
@@ -722,6 +856,10 @@ pub(crate) struct Worker {
     /// A new child could not be given the values: they are gone, and the
     /// next answer says so ([`Self::take_lost`]).
     lost: bool,
+    /// The password that opened the file (#2256): every new child is
+    /// unlocked with it first, so a child killed after the prompt is
+    /// replaced without asking again. Held only here, for this view.
+    password: Option<Secret>,
     /// Children started so far (the tests' respawn check).
     #[cfg(test)]
     pub(crate) started: usize,
@@ -754,6 +892,7 @@ impl Worker {
             edits: Vec::new(),
             stamp: None,
             lost: false,
+            password: None,
             #[cfg(test)]
             started: 0,
         }
@@ -778,6 +917,21 @@ impl Worker {
         answer
     }
 
+    /// Try `password` on the file (#2256): its `info` when it opens it (and
+    /// the password is kept, for every new child), else
+    /// [`Answer::Locked`] or why not.
+    pub(crate) fn unlock(&mut self, password: Secret) -> Answer {
+        let op = Op::Unlock { password };
+        let answer = match self.ask_raw(&op) {
+            Ok((head, body)) => decode(&op, head, body),
+            Err(why) => Answer::Failed(why),
+        };
+        if let (Answer::Info(_), Op::Unlock { password }) = (&answer, op) {
+            self.password = Some(password);
+        }
+        answer
+    }
+
     /// Whether the form values filled were lost since the last call: a new
     /// child could not take them again (#2255).
     pub(crate) fn take_lost(&mut self) -> bool {
@@ -790,11 +944,20 @@ impl Worker {
         &self.edits
     }
 
+    /// The file this worker reads (the tests' look).
+    #[cfg(test)]
+    pub(crate) fn path_for_tests(&self) -> &Path {
+        &self.path
+    }
+
     fn ask_raw(&mut self, op: &Op) -> Reply {
         self.ensure()?;
         self.exchange(op)
     }
 
+    /// A new child, unlocked with the file's password first when it has
+    /// one (#2256): before the form values are given again, and before any
+    /// question. A child the password does not open fails, with why.
     fn connect(&mut self) -> Result<(), String> {
         let conn = self
             .start()
@@ -803,6 +966,20 @@ impl Worker {
         #[cfg(test)]
         {
             self.started += 1;
+        }
+        if let Some(password) = self.password.clone() {
+            let op = Op::Unlock { password };
+            let why = match self.exchange(&op) {
+                Ok((head, body)) => match decode(&op, head, body) {
+                    Answer::Info(_) => return Ok(()),
+                    Answer::Locked { .. } => "the PDF's password no longer opens it".to_string(),
+                    Answer::Failed(why) => why,
+                    _ => DIED.to_string(),
+                },
+                Err(why) => why,
+            };
+            self.stop();
+            return Err(why);
         }
         Ok(())
     }
@@ -880,15 +1057,21 @@ impl Worker {
         let id = self.next_id;
         let deadline = Instant::now() + self.timeout;
         let conn = self.conn.as_mut().expect("started above");
-        let line =
-            serde_json::to_string(&Request { id, op: op.clone() }).map_err(|e| e.to_string())?;
-        if writeln!(conn.input, "{line}")
+        let mut line = zeroize::Zeroizing::new(
+            serde_json::to_string(&Request { id, op: op.clone() }).map_err(|e| e.to_string())?,
+        );
+        line.push('\n');
+        // The line is cleared when dropped: an `unlock`'s holds the password.
+        if conn
+            .input
+            .write_all(line.as_bytes())
             .and_then(|()| conn.input.flush())
             .is_err()
         {
             self.stop();
             return Err(DIED.into());
         }
+        drop(line);
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.conn.as_ref().expect("live").replies.recv_timeout(left) {
@@ -1057,11 +1240,16 @@ fn read_replies(mut out: impl BufRead, tx: mpsc::Sender<Reply>) {
 
 /// An answer's line and bytes as what `op` asked for.
 fn decode(op: &Op, head: Head, body: Vec<u8>) -> Answer {
+    if let Some(locked) = head.locked {
+        return Answer::Locked {
+            wrong: locked == Locked::Wrong,
+        };
+    }
     if let Some(why) = head.error {
         return Answer::Failed(why);
     }
     match op {
-        Op::Info => head
+        Op::Info | Op::Unlock { .. } => head
             .info
             .map_or_else(|| Answer::Failed(DIED.into()), Answer::Info),
         Op::Pixels { .. } if head.len > 0 => Answer::Pixels(Raster {
@@ -1169,3 +1357,10 @@ impl Drop for Engine {
 mod doc;
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// What a fill of a form its permissions keep from being filled answers
+/// (the tests' look).
+#[cfg(test)]
+pub(crate) fn doc_no_filling() -> &'static str {
+    doc::NO_FILLING
+}

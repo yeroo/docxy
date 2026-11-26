@@ -937,3 +937,87 @@ fn a_converted_tab_without_kept_bytes_rolls_back_from_its_file() {
     assert!(!back.dirty);
     assert_eq!(texts(&back), before);
 }
+
+/// #2256 criteria 3 and 5: an encrypted PDF opens as a PDF tab whose body
+/// is its password prompt; restored from the session it asks again where
+/// the view was. A wrong try empties the field and says so; the right one
+/// shows the pages there. The session row never holds the password.
+#[test]
+fn an_encrypted_pdf_asks_for_its_password_and_its_session_row_keeps_none() {
+    use crate::pdf_view::Unlocked;
+    use crate::pdf_view::host::{PDF_LOCKED, PdfAt, pdf_at, pending_pdf_tab};
+    let dir = Scratch::new();
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pdf-view/enc-aes-256.pdf");
+    let path = write(&dir, "enc.pdf", &std::fs::read(src).unwrap());
+    let hot = dir.path("hot");
+    std::fs::create_dir_all(&hot).unwrap();
+    // Opened: a PDF tab with the prompt.
+    let tab = tab_from_path(&path);
+    assert!(tab.kind == Kind::Pdf);
+    assert_eq!(tab.status.as_ref(), PDF_LOCKED);
+    let Surface::Pdf(v) = &tab.surface else {
+        panic!("not a PDF view: {}", tab.status)
+    };
+    assert!(v.lock.is_some());
+    assert_eq!(v.page_count(), 0);
+    // Restored from a session where it was on page 1 at 150 %: it waits,
+    // then asks, keeping that place.
+    let at = PdfAt { page: 0, zoom: 1.5 };
+    let mut tab = pending_pdf_tab(&path, "enc.pdf", at);
+    finish_pending_conversion(&mut tab);
+    assert_eq!(tab.status.as_ref(), PDF_LOCKED);
+    assert_eq!(pdf_at(&tab), Some(at), "its place is kept while it asks");
+    let Surface::Pdf(v) = &mut tab.surface else {
+        panic!("not a PDF view")
+    };
+    // A wrong try: emptied, focused, wrong.
+    v.lock.as_mut().unwrap().field.text = "not-it".into();
+    assert_eq!(v.try_unlock(), Unlocked::Wrong);
+    let lock = v.lock.as_ref().unwrap();
+    assert!(lock.wrong && lock.field.focused && lock.field.text.is_empty());
+    let row = serde_json::to_string(&persist_tab(&hot, 0, 0, &tab)).unwrap();
+    assert!(!row.contains("not-it"), "{row}");
+    // The right one: the pages, where the session left the view.
+    let Surface::Pdf(v) = &mut tab.surface else {
+        panic!("not a PDF view")
+    };
+    v.lock.as_mut().unwrap().field.text = "user-aes-256".into();
+    assert_eq!(v.try_unlock(), Unlocked::Opened);
+    assert!(v.lock.is_none());
+    assert_eq!(v.page_count(), 1);
+    assert_eq!((v.zoom, v.restore_page), (1.5, Some(0)));
+    assert!(v.restricted_note().contains("printing"));
+    let row = serde_json::to_string(&persist_tab(&hot, 0, 0, &tab)).unwrap();
+    assert!(!row.contains("user-aes-256"), "{row}");
+    assert!(!row.contains("password"), "{row}");
+    // FIX r1 3: a try the reader cannot answer (it dies) leaves a failed
+    // tab that keeps where the view was, and says why in its body.
+    let child = crate::pdf_view::worker::tests::test_child(
+        &path,
+        std::time::Duration::from_secs(60),
+        Some("abort-on-unlock"),
+    );
+    let mut tab = crate::pdf_view::host::pdf_view_tab_with(&path, Some(at), child).unwrap();
+    let Surface::Pdf(v) = &mut tab.surface else {
+        panic!("not a PDF view")
+    };
+    v.lock.as_mut().unwrap().field.text = "user-aes-256".into();
+    crate::pdf_view::host::unlock_tab(&mut tab);
+    assert!(tab.load_failed);
+    assert!(matches!(tab.surface, Surface::PdfPending(a) if a == at));
+    assert_eq!(pdf_at(&tab), Some(at), "the place is kept");
+    let why = crate::pdf_view::host::pdf_failed_reason(&tab).expect("a reason");
+    assert_eq!(why, crate::pdf_view::worker::DIED);
+    // FIX r1 2: Save and Save As on it leave the reason its body shows.
+    crate::pdf_view::host::note_save_refusal(&mut tab, crate::pdf_view::host::PDF_NOT_OPEN);
+    assert_eq!(
+        crate::pdf_view::host::pdf_failed_reason(&tab).as_deref(),
+        Some(crate::pdf_view::worker::DIED)
+    );
+    // Save has nothing to write while it asks.
+    let mut tab = tab_from_path(&path);
+    assert_eq!(
+        crate::pdf_view::host::pdf_save_step(&mut tab, Some(dir.path("copy.pdf"))),
+        crate::pdf_view::host::PdfSaveStep::Nothing(crate::pdf_view::host::PDF_NOT_OPEN)
+    );
+}
