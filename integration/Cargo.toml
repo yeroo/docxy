@@ -18,14 +18,11 @@ name = "docxy_integration"
 workspace = true
 
 [features]
-# A plugin depends on this crate with `default-features = false`: the ABI
-# types and the protocol only.
 default = ["host"]
 host = ["dep:libloading", "dep:libc", "dep:windows-sys"]
 
 [dependencies]
-# The JSON value that crosses projcore's plugin ABI; projcore's default build
-# is std-only apart from opccore.
+# For its JSON value, `projcore::json`.
 projcore = { version = "0.1.0", path = "../projcore" }
 libloading = { version = "0.8", optional = true }
 

@@ -2,9 +2,7 @@
 //! ([`load_from`]) on a worker thread of its own, and calling it there with a
 //! deadline, a crash marker written around each call.
 //!
-//! A process calls [`start`] once, before anything reads [`global`]. With no
-//! folder configured nothing is loaded, no file is opened, and every typed
-//! method answers as if there were no plugin.
+//! A process calls [`start`] once, before anything reads [`global`].
 
 use crate::abi::{self, DxiBuf};
 use crate::protocol::{
@@ -46,8 +44,7 @@ pub enum Source {
 
 impl Source {
     /// HKLM [`REGISTRY_KEY`] [`REGISTRY_VALUE`] on Windows, [`ENV_VAR`]
-    /// elsewhere. A user can set neither on Windows; there the plugin gets
-    /// tokens and the user's identity.
+    /// elsewhere.
     pub fn for_this_os() -> Source {
         if cfg!(windows) {
             Source::Registry {
@@ -674,9 +671,7 @@ impl Loaded {
     }
 }
 
-/// The crash marker of one application in one process: a file
-/// `dxi-<app>-<pid>.marker` in the application's config folder that names
-/// the call in progress, written before each call and removed after it.
+/// One application's crash marker in this process, named by [`marker_name`].
 struct Marker {
     dir: PathBuf,
     app: App,

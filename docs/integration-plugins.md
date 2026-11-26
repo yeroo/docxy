@@ -107,13 +107,9 @@ keeps the answers. It asks `token` each time it needs a token. An `ok` answer wi
 - **Status:** not configured, loaded (the file and the plugin's version), or refused (the file or
   folder, and why). A plugin that stopped answering is refused from then on.
 - **The notice:** the message about a refusal or a stop, given once, for the host to show.
-- **Never logged or shown:** the access token and the login hint. A token answer's `Debug` text
-  leaves the token out.
+- **Never logged or shown:** the access token and the login hint.
 
 ## Tests
 
-`integration/tests/integration_fixture` is a plugin with no dependencies. A mode file beside it
-chooses its behaviour, and it records its calls in files beside it; its `src/lib.rs` header lists
-both. The cargo feature `missing-call` builds it without exporting `dxi_call`.
-`integration/tests/host.rs` builds it, copies it into a scratch folder per test, and loads it from
-there.
+`integration/tests/integration_fixture` is the test plugin; its `src/lib.rs` header lists its
+modes. `integration/tests/host.rs` loads it.

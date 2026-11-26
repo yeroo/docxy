@@ -1,9 +1,7 @@
 //! The JSON a host and an integration plugin exchange: what `dxi_init`
 //! takes and answers, and each method's request and answer. Each type
 //! encodes and decodes, so a host and a plugin written in Rust share it.
-//!
-//! Decoding is lenient by field: a field that is absent, null, of another
-//! type or empty is `None`, and the host keeps its own value for it.
+//! A field that is absent, null, of another type or empty decodes as `None`.
 
 use projcore::json::Json;
 
