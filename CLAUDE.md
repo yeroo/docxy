@@ -109,7 +109,8 @@ issue number to find its notes.
   lives (#1473), Open File's native picker off the App borrow on Windows
   (#2192), every other native dialog the same way, a save's `AfterSave` and
   the workbook save's steps (#2194), the real Open picker in the Windows
-  sweep, a harness's Open refused off Windows (#2195).
+  sweep, a harness's Open refused off Windows (#2195), the integration plugin's
+  names, icon and context in titles and About (#2317).
 - `docs/claude/suite-extensions.md`: before changing the suite as a library
   (`run(ext::Extensions)`), extension surfaces (Mail tabs), tab tear-off or the embedded
   `ext::DocView` (#1873), its editing mode (#1947), host insert, copy and cut (#1977),

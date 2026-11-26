@@ -179,3 +179,19 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
 - No test runs a real Windows dialog. The crash fix is guarded by the source
   scan and the route tests (`dialog_route_per_os`, and that the two routes
   agree off Linux). The step tests guard the split of the workbook save.
+
+## The integration plugin's names, icon and context (#2317)
+
+- `brand.rs` is the one place the suite reads its integration plugin (`docs/integration-plugins.md`).
+  `run()` calls `brand::start` after the harness gate and the format plugins, before the app loop
+  and so before any `docxy_integration::global()`. A harness instance loads no integration plugin,
+  as it inherits no plugin folders.
+- Names: the About commands and the About dialog's title use `brand::about_label()` ("About" and
+  the plugin's `product`). The window title (`doc_name::window_title`) and the message-dialog
+  titles use `brand::short()`. With no plugin, both are today's text.
+- The plugin's refusal or stop at start goes to stderr, `crash.log` and, when no format plugin
+  failed, the first window's status line (`brand::startup_notice`). About adds the integration's
+  rows (`brand::about_rows`) only when a plugin is configured. `app-info` carries `integration`.
+- Each window gets the plugin's icon in `open_docxy_window` (`brand::set_window_icon`, Windows).
+- Left as they are: the sheet ribbon's "About docxy suite" (`sheet_ribbon.rs`, a static table),
+  the title-bar label per tab type, `--version`, the crash log's name, and the default author.
