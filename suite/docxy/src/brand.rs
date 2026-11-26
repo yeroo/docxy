@@ -393,4 +393,252 @@ mod tests {
             ]
         );
     }
+
+    /// Product-name literals the guard below lets through, by file and the
+    /// literal's start: logs, panics, harness data and the terminal editor's
+    /// inputs, none of them text the suite shows.
+    const NAME_LITERALS_KEPT: &[(&str, &str)] = &[
+        // The crash log's version block and its entry line.
+        ("crashlog.rs", "docxy suite"),
+        ("crashlog.rs", "=== {kind} {} pid {pid} docxy "),
+        // Panics, which go to the crash log.
+        ("main.rs", "failed to open docxy window"),
+        (
+            "native_dialog.rs",
+            "native_modal( outside Docxy::native_dialog",
+        ),
+        (
+            "dialog.rs",
+            "dialog '{}' ({}) does not match its catalogue entry",
+        ),
+        // A family name no font has, to find the fallback.
+        ("font_subst.rs", "\\u{1}docxy no such font"),
+        // The sheet ribbon's table, whose About label `own_label` replaces.
+        ("sheet_ribbon.rs", "About docxy suite"),
+        // The harness's test extension and a harness case: a harness loads
+        // no integration plugin.
+        ("ext_fixture.rs", "docxy link"),
+        (
+            "dialog/catalog/entries.rs",
+            "call ribbon-click {\"tab\":\"Help\",\"command\":\"About docxy suite\"}",
+        ),
+        // The terminal docxy editor's inputs, in the inputs catalogue.
+        ("inputs.rs", "docxy's "),
+        // The headers of generated files: harness cases and the ribbon export.
+        (
+            "dialog/catalog/cases.rs",
+            "# GENERATED from suite/docxy/src/",
+        ),
+        ("ribbon_export.rs", "From suite/docxy (docxy_ribbon,"),
+    ];
+
+    /// Whether a literal holding the product name is an identifier or a log
+    /// line: an environment variable, a word with no space (a file or
+    /// folder name, an id, a URL) other than the bare name, the config
+    /// folder (`.join("docxy")`), or an stderr line's `docxy: ` prefix.
+    fn kept_name_literal(file: &str, literal: &str, before: &str) -> bool {
+        let bare = literal.eq_ignore_ascii_case("docxy");
+        literal.starts_with("DOCXY_")
+            || (!bare && !literal.contains(char::is_whitespace))
+            || (bare && before.ends_with(".join("))
+            || literal.starts_with("docxy: ")
+            || NAME_LITERALS_KEPT
+                .iter()
+                .any(|(f, start)| *f == file && literal.starts_with(start))
+    }
+
+    /// `src` without the items under `#[cfg(test)]`, in rustfmt's layout: a
+    /// block item ends at the line that closes it at its attribute's
+    /// indentation.
+    fn without_test_items(src: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with("#[cfg(test)]") {
+                out.push_str(line);
+                out.push('\n');
+                i += 1;
+                continue;
+            }
+            let indent = &line[..line.len() - trimmed.len()];
+            i += 1;
+            while i < lines.len() && lines[i].trim_start().starts_with("#[") {
+                i += 1;
+            }
+            while i < lines.len() && !lines[i].trim_end().ends_with(['{', ';']) {
+                i += 1;
+            }
+            if i < lines.len() && lines[i].trim_end().ends_with('{') {
+                let close = format!("{indent}}}");
+                while i < lines.len() && !lines[i].trim_end().starts_with(&close) {
+                    i += 1;
+                }
+                while i < lines.len() && !is_close(lines[i], &close) {
+                    i += 1;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Whether `line` is `close` (an indentation and `}`), with a `;` or `,`
+    /// at most after it.
+    fn is_close(line: &str, close: &str) -> bool {
+        let line = line.trim_end();
+        line.strip_prefix(close)
+            .is_some_and(|rest| matches!(rest, "" | ";" | ","))
+    }
+
+    /// The string literals of `src` outside comments, each with the source
+    /// text before it: `"..."`, `b"..."` and raw strings. The text between
+    /// the quotes is the source's, escapes unread.
+    fn string_literals(src: &str) -> Vec<(String, String)> {
+        let b = src.as_bytes();
+        let ident = |k: usize| k > 0 && (b[k - 1].is_ascii_alphanumeric() || b[k - 1] == b'_');
+        let mut found = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 2;
+                }
+                b'\'' => {
+                    // A char literal, or a lifetime.
+                    let close = (i + 2..(i + 12).min(b.len())).find(|&k| b[k] == b'\'');
+                    match close {
+                        Some(k)
+                            if b[i + 1] == b'\\'
+                                || src.get(i + 1..k).is_some_and(|c| c.chars().count() == 1) =>
+                        {
+                            i = k + 1
+                        }
+                        _ => i += 1,
+                    }
+                }
+                b'r' if !ident(i) || (b[i - 1] == b'b' && !ident(i - 1)) => {
+                    let hashes = b[i + 1..].iter().take_while(|&&c| c == b'#').count();
+                    if b.get(i + 1 + hashes) != Some(&b'"') {
+                        i += 1;
+                        continue;
+                    }
+                    let start = i + 2 + hashes;
+                    let end_mark = format!("\"{}", "#".repeat(hashes));
+                    let end = src[start..].find(&end_mark).map_or(b.len(), |e| start + e);
+                    found.push((src[..i].to_string(), src[start..end].to_string()));
+                    i = end + end_mark.len();
+                }
+                b'"' => {
+                    let start = i + 1;
+                    let mut k = start;
+                    while k < b.len() && b[k] != b'"' {
+                        k += if b[k] == b'\\' { 2 } else { 1 };
+                    }
+                    let end = k.min(b.len());
+                    found.push((src[..i].to_string(), src[start..end].to_string()));
+                    i = end + 1;
+                }
+                _ => i += 1,
+            }
+        }
+        found
+    }
+
+    /// Each product-name literal of the suite's non-test source outside
+    /// this file that [`kept_name_literal`] does not keep, as `file: literal`.
+    fn product_name_literals(root: &std::path::Path) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    if name != "tests" {
+                        dirs.push(path);
+                    }
+                    continue;
+                }
+                if !name.ends_with(".rs") || name.ends_with("tests.rs") {
+                    continue;
+                }
+                let file = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if file == "brand.rs" {
+                    continue;
+                }
+                let src = without_test_items(&std::fs::read_to_string(&path).unwrap());
+                for (before, literal) in string_literals(&src) {
+                    if literal.to_ascii_lowercase().contains("docxy")
+                        && !kept_name_literal(&file, &literal, &before)
+                    {
+                        found.push(format!("{file}: {literal}"));
+                    }
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// The suite shows its name only through this module, so an integration
+    /// plugin's name replaces it everywhere.
+    #[test]
+    fn the_product_name_is_written_only_here() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let found = product_name_literals(&root);
+        assert!(found.is_empty(), "take brand:: for these: {found:#?}");
+    }
+
+    /// The guard's scanner: a literal in code counts, one in a comment, a
+    /// test item or a char literal does not, and an identifier is kept.
+    #[test]
+    fn the_guard_finds_a_name_in_code_and_not_in_comments_or_tests() {
+        let src = concat!(
+            "// \"About docxy\" in a comment\n",
+            "/* \"docxy\" in a block */\n",
+            "const A: &str = \"Quit docxy\";\n",
+            "const B: char = '\"';\n",
+            "fn f<'a>(x: &'a str) -> &'a str { x }\n",
+            "const C: &str = r#\"docxy \"raw\"\"#;\n",
+            "const D: &str = \"a \\\" docxy\";\n",
+            "fn g() { root.join(\"docxy\"); env(\"DOCXY_X\"); id(\"docxy-find\"); }\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    const T: &str = \"docxy in a test\";\n",
+            "}\n",
+            "const E: &str = \"After docxy\";\n",
+            "const F: &str = \"docxy\";\n",
+        );
+        let named: Vec<String> = string_literals(&without_test_items(src))
+            .into_iter()
+            .filter(|(before, l)| l.contains("docxy") && !kept_name_literal("x.rs", l, before))
+            .map(|(_, l)| l)
+            .collect();
+        assert_eq!(
+            named,
+            [
+                "Quit docxy",
+                "docxy \"raw\"",
+                "a \\\" docxy",
+                "After docxy",
+                "docxy"
+            ]
+        );
+    }
 }

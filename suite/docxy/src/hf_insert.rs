@@ -200,13 +200,16 @@ pub(crate) fn apply_alignment_tab(ed: &mut Editor, d: &Dialog) -> Result<bool, S
 /// The Online Pictures button's label in its dialog: it runs Pictures....
 pub(crate) const FROM_A_FILE: &str = "From a File...";
 
-/// Online Pictures...: docxy does not search the web, so its dialog offers
-/// a picture from a file instead.
+/// Online Pictures...: the suite does not search the web, so its dialog
+/// offers a picture from a file instead.
 pub(crate) fn online_pictures_dialog() -> Dialog {
     let mut d = Dialog::message(
         catalog::HF_ONLINE_PICTURES,
         "Online Pictures",
-        "docxy does not search the web for pictures. Insert a picture from a file instead.".into(),
+        format!(
+            "{} does not search the web for pictures. Insert a picture from a file instead.",
+            crate::brand::short()
+        ),
         &[],
         DialogOwner::HfOnlinePictures,
     );

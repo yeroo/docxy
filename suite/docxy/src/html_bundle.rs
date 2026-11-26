@@ -96,9 +96,12 @@ pub(crate) fn bundle_bytes(
     if let Some(old) = opened {
         return htmlbundle::rewrap(old, docx).map_err(|e| e.to_string());
     }
-    let engine = ENGINE.ok_or(
-        "this build of docxy cannot make editable HTML (build it with --features html-export)",
-    )?;
+    let engine = ENGINE.ok_or_else(|| {
+        format!(
+            "this build of {} cannot make editable HTML (build it with --features html-export)",
+            crate::brand::short()
+        )
+    })?;
     let file = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())

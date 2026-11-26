@@ -518,7 +518,7 @@ fn link_go(pages: &[PageInfo], target: &LinkTarget) -> LinkGo {
             },
         },
         LinkTarget::Other(what) => LinkGo::Other {
-            what: format!("an action docxy does not take ({what})"),
+            what: format!("an action this viewer does not take ({what})"),
         },
     }
 }

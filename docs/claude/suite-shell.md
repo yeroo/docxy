@@ -201,5 +201,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   theme (`docxy_integration::accent::check`); sheet's and project's own accents stay.
   `brand::apply_accents_to_theme`, after every `Theme::change`, sets gpui-component's `primary`,
   `ring`, `selection` and `link` tokens. A refusal goes to stderr once per theme.
-- Left as they are: the title-bar label per tab type, `--version`, the crash log's name, and the
-  default author.
+- Every other text that names the suite takes `brand::short()` too: the macOS menu bar
+  (`macos_menu::shown` fills `{app}`), messages, the Document Recovery dialog, a kind's
+  placeholder, and the default author of comments and the AUTHOR field. The PDF worker, a child
+  with no plugin, names no app. Left as they are: identifiers (config folders, environment
+  variables, `app_id`, temp names), stderr and crash-log lines, `--version` and the title-bar
+  label per tab type. `brand::tests::the_product_name_is_written_only_here` fails on any other
+  product-name literal in non-test source outside `brand.rs`; its `NAME_LITERALS_KEPT` names the
+  rest it keeps.

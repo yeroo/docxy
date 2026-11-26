@@ -10702,7 +10702,7 @@ const FIELDS: &[(&str, &str, &str)] = &[
     ("Time", "TIME \\@ \"h:mm AM/PM\"", ""),
     ("Page", "PAGE", "1"),
     ("Pages", "NUMPAGES", "1"),
-    ("Author", "AUTHOR", "docxy"),
+    ("Author", "AUTHOR", ""),
     ("File name", "FILENAME", ""),
 ];
 
@@ -17871,7 +17871,7 @@ fn set_doc_comment_resolved(tab: &mut DocTab, id: &str, resolved: Option<bool>) 
 
 /// The name and initials new comments are stamped with (#620), as Word's
 /// user name and initials: the configured ones, else the OS account name
-/// (`USERNAME`, else `USER`), else `docxy`; initials not configured are
+/// (`USERNAME`, else `USER`), else [`brand::short`]; initials not configured are
 /// derived from the name.
 fn review_identity(user_name: &str, user_initials: &str) -> (String, String) {
     let name = Some(user_name.trim().to_string())
@@ -17883,7 +17883,7 @@ fn review_identity(user_name: &str, user_initials: &str) -> (String, String) {
                 .map(|v| v.trim().to_string()),
         )
         .find(|v| !v.is_empty())
-        .unwrap_or_else(|| "docxy".to_string());
+        .unwrap_or_else(|| brand::short().to_string());
     let initials = match user_initials.trim() {
         "" => docxcore::comments::initials(&name),
         set => set.to_string(),
@@ -17909,7 +17909,7 @@ pub(crate) fn local_clock() -> docxcore::field::DateTime {
 
 /// What a field inserted into `tab` evaluates against: the local clock, the
 /// document's core properties (`docProps/core.xml`), its title as the file
-/// name and its path. A document with no author keeps showing "docxy".
+/// name and its path. A document with no author shows [`brand::short`].
 pub(crate) fn tab_field_context(tab: Option<&DocTab>) -> docxcore::field::FieldContext {
     let mut props = tab
         .and_then(|t| t.pkg.as_ref())
@@ -17917,7 +17917,7 @@ pub(crate) fn tab_field_context(tab: Option<&DocTab>) -> docxcore::field::FieldC
         .map(|xml| docxcore::field::parse_core_props(&xml))
         .unwrap_or_default();
     if props.author.trim().is_empty() {
-        props.author = "docxy".to_string();
+        props.author = brand::short().to_string();
     }
     docxcore::field::FieldContext {
         now: Some(local_clock()),
@@ -29958,7 +29958,14 @@ impl Docxy {
             PickKind::Field => {
                 for (i, &(label, instr, fallback)) in FIELDS.iter().enumerate() {
                     row = row.child(chip(i, label.into(), "fld").on_click(cx.listener(
-                        move |this, _, window, cx| this.insert_field(instr, fallback, window, cx),
+                        move |this, _, window, cx| {
+                            let fallback = if instr == "AUTHOR" {
+                                brand::short()
+                            } else {
+                                fallback
+                            };
+                            this.insert_field(instr, fallback, window, cx)
+                        },
                     )));
                 }
             }
@@ -54501,7 +54508,7 @@ fn placeholder_text(kind: Kind) -> (&'static str, &'static str) {
             "lookxy",
             "mail list + reading pane (mailcore) lands here next",
         ),
-        Kind::Docx | Kind::Help | Kind::Pdf | Kind::Ext(_) => ("docxy", ""),
+        Kind::Docx | Kind::Help | Kind::Pdf | Kind::Ext(_) => (brand::short(), ""),
         Kind::Project => (
             "Project",
             "The schedule could not be loaded; see the status below.",

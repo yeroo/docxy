@@ -142,20 +142,21 @@ pub(crate) struct MenuSpec {
 use Entry::{Item, Separator};
 
 /// The menu bar, left to right. The first menu is the application menu,
-/// which macOS titles with the app's name whatever it is called here.
+/// which macOS titles with the app's name whatever it is called here. Each
+/// label is shown through [`shown`].
 pub(crate) const MENUS: &[MenuSpec] = &[
     MenuSpec {
-        name: "docxy",
+        name: APP,
         entries: &[
-            Item("About docxy", Cmd::About),
+            Item("About {app}", Cmd::About),
             Separator,
             Item("Settings…", Cmd::Settings),
             Separator,
-            Item("Hide docxy", Cmd::Hide),
+            Item("Hide {app}", Cmd::Hide),
             Item("Hide Others", Cmd::HideOthers),
             Item("Show All", Cmd::ShowAll),
             Separator,
-            Item("Quit docxy", Cmd::Quit),
+            Item("Quit {app}", Cmd::Quit),
         ],
     },
     MenuSpec {
@@ -194,7 +195,7 @@ pub(crate) const MENUS: &[MenuSpec] = &[
     },
     MenuSpec {
         name: "Help",
-        entries: &[Item("docxy Help", Cmd::Help)],
+        entries: &[Item("{app} Help", Cmd::Help)],
     },
 ];
 
@@ -302,6 +303,15 @@ impl Cmd {
     fn keystroke(self) -> Option<Keystroke> {
         self.chord().and_then(|c| Keystroke::parse(c).ok())
     }
+}
+
+/// Where a [`MENUS`] label names the app.
+const APP: &str = "{app}";
+
+/// `label` as the bar shows it, the app's name ([`crate::brand::short`]) in
+/// place of [`APP`].
+pub(crate) fn shown(label: &str) -> String {
+    label.replace(APP, crate::brand::short())
 }
 
 /// Every command on the bar, in menu order.
@@ -713,10 +723,10 @@ pub(crate) fn install(cx: &mut App) {
         .collect();
     cx.bind_keys(bindings);
     cx.set_menus(MENUS.iter().map(|m| {
-        gpui::Menu::new(m.name).items(m.entries.iter().map(|e| match *e {
+        gpui::Menu::new(shown(m.name)).items(m.entries.iter().map(|e| match *e {
             Separator => gpui::MenuItem::separator(),
             Item(name, cmd) => gpui::MenuItem::Action {
-                name: name.into(),
+                name: shown(name).into(),
                 action: cmd.action(),
                 os_action: cmd.os_action(),
                 checked: false,
@@ -757,7 +767,14 @@ mod native {
             let bar = NSMenu::new(mtm);
             let app_menu = NSMenu::new(mtm);
             // NSApplication answers hide: itself, before its delegate.
-            app_menu.addItem(&item(mtm, "Hide docxy", sel!(hide:), "h", cmd, None));
+            app_menu.addItem(&item(
+                mtm,
+                &shown("Hide {app}"),
+                sel!(hide:),
+                "h",
+                cmd,
+                None,
+            ));
             bar.addItem(&holder(mtm, &app_menu));
             let edit = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Edit"));
             for (title, action, key, mask) in [
@@ -973,7 +990,7 @@ mod tests {
     #[test]
     fn the_bar_has_the_mac_menus_in_order() {
         let names: Vec<_> = MENUS.iter().map(|m| m.name).collect();
-        assert_eq!(names, ["docxy", "File", "Edit", "View", "Window", "Help"]);
+        assert_eq!(names, ["{app}", "File", "Edit", "View", "Window", "Help"]);
         let labels = |name: &str| -> Vec<&str> {
             MENUS
                 .iter()
@@ -988,14 +1005,14 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            labels("docxy"),
+            labels("{app}"),
             [
-                "About docxy",
+                "About {app}",
                 "Settings…",
-                "Hide docxy",
+                "Hide {app}",
                 "Hide Others",
                 "Show All",
-                "Quit docxy"
+                "Quit {app}"
             ]
         );
         assert_eq!(
@@ -1008,7 +1025,11 @@ mod tests {
         );
         assert_eq!(labels("View"), ["Enter Full Screen"]);
         assert_eq!(labels("Window"), ["Minimize", "Zoom"]);
-        assert_eq!(labels("Help"), ["docxy Help"]);
+        assert_eq!(labels("Help"), ["{app} Help"]);
+        // With no integration plugin the app is docxy.
+        assert_eq!(shown("Quit {app}"), "Quit docxy");
+        assert_eq!(shown("{app} Help"), "docxy Help");
+        assert_eq!(shown("Hide Others"), "Hide Others");
     }
 
     #[test]
