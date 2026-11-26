@@ -118,9 +118,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing `docxcore::impor
   `docs/claude/suite-document.md`).
 - An outermost table inside a centred fixed-width block is laid out in
   that block's width and placed in it (#2114: see "HTML import margins,
-  breaks, hangs and wrapper tables").
-- Known limits: a table in a merely
-  indented block keeps the body's width; a percentage `max-width` (an
+  breaks, hangs and wrapper tables"), and so is one in an indented block
+  (#2151: see "HTML import leftovers of #2114").
+- Known limits: a percentage `max-width` (an
   absolute one came with #1894);
   CSS `float`; `<img align>`; `box-sizing`;
   right-to-left.
@@ -978,7 +978,8 @@ Outlook-like 20 px inset on this mail (`docs/claude/suite-extensions.md`).
     card's), measured in Chrome (#2114 r2):
     - The top: when its paragraph is its flow's first, every block and
       list from the outermost in loses its UA top margin, up to and
-      including the first with top padding (`Html::top_spacing`). So
+      including the first with top padding (`Html::top_spacing`); through
+      a padding-less card at its cell's edge too (#2151). So
       `<div dir=ltr><ol><li>` and `<td><div><p>` start at 0, while
       `<div style="padding-top:1px"><ol>` keeps the list's 1em.
     - The bottom: a block's UA bottom margin is dropped when its paragraph
@@ -1129,18 +1130,70 @@ A batch from #1989 and #1930 (plan-2), import only.
   - The Markdown package has no `compatibilityMode`, so Word lays it out
     in an older mode, which measures `tblInd` to the first cell's text.
     The left cell margin is therefore added: `cellpadding`, else 108.
-  - The suite does not draw `tblInd`, so such a table stays at the body's
-    left there, as before.
+  - The suite draws `tblInd` since #2151 (`docs/claude/suite-document.md`).
+    The cell margin added is the first cell's own (`tcMar`, a `td`'s
+    padding), else `cellpadding`, else 108 (#2151).
 - Tests: `batch_2114_tests` in `import/html.rs`;
   `a_table_in_a_room_is_laid_out_and_placed_there` in `html_table.rs`.
-- Known limits:
-  - A block's bottom box is lost when it ends in a table (it used to sit
-    on the paragraph above the table), and a block whose first child is a
-    table gives no top.
-  - A table in an indented block that is not a centred fixed-width box
-    keeps the body's width.
-  - The suite's `list_markers` restarts its count at an item's unnumbered
-    continuation (a follow-up).
+- Known limits: see #2151's section below (a block next to a child
+  table, tables in indented blocks and the suite's continuation count were
+  done there).
+
+## HTML import leftovers of #2114 (#2151)
+
+- A block's box next to a child table (`docxcore/src/import/html.rs`):
+  - Bottom: a block whose flow ends in a plain table that ended in it
+    folds its bottom box (`fold_bottom`) onto the flow's pending box
+    (`Builder::set_pending` / `pending`, anchored on the flow's length: a
+    block added after it makes it stale). `top_spacing` starts the next
+    paragraph's top from it, owed there, its open margin group what that
+    paragraph's margins collapse with:
+    `<div style=margin-bottom:20px>a<table>…</div><p>b` gives b 300.
+  - Top: when a `<table>` opens, the blocks still fresh around it give
+    the paragraph above what `top_spacing` gives a paragraph ended there
+    (`Html::table_top_box`), added to its `after`. With no paragraph above
+    it is dropped, as before; the table makes them stale.
+  - Cards are left out: a card's table is marked where it ends
+    (`TableAcc::card_at`, `Builder::ends_in_plain_table`), and a card's
+    own close sets no pending box ("Margins through a card's top" stays).
+- Margins through an empty block (`Html::collapse_through`, as each block
+  closes, before its bottom): a block or list in which nothing ended,
+  with no top or bottom padding or line, collapses its two margins into
+  one (the largest positive less the most negative), folded onto the
+  paragraph above (its `bare` too) or the pending box. `<p></p>` is not
+  one (a `p` always ends a paragraph, as Word writes its empty ones); a
+  `display:none` block has no box.
+- Borders separating margins were done by #1883 (`border_before` /
+  `border_after` close the group); `a_bottom_line_keeps_the_margins_apart`
+  pins it.
+- Tables in indented blocks: `table_spec`'s room is given to an outermost
+  table outside cells in a centred box or in any block with an indent
+  (`blockquote`, a `margin-left` div, a list item). `body_room` is
+  unchanged: equal indents make a centred room, where a full table gets
+  `jc center` (a box centred in a room centred in the body is centred in
+  the body); a narrower one gets `tblInd` at the room's left.
+- Quirks mode, a padding-less card at a quirky edge (measured in Chrome:
+  `<td><div style=background:#eee><p>x` is flush, 0 / 0):
+  - Top: `top_spacing`'s walk goes on past a card with no top padding
+    (`own_padding[0]`) or line that opened at its enclosing flow's start,
+    through that flow's fresh, padding-less blocks to its `td`/`th` or the
+    body (`Html::card_at_quirky_top`, `Builder::flow_len_at`).
+  - Bottom: `bottom_unseparated` passes a card with no bottom padding or
+    line. Its flow's end keeps the last paragraph's quirky bottom
+    (`Html::card_ending`) instead of applying it; with no padded block
+    below the card up to its cell it waits in `Html::card_bottoms`, and
+    the enclosing flow's end gives it to the card's last paragraph
+    (`Builder::card_last_para_mut`) if the card is still its last block.
+- Tests: `html_tests_2151.rs`; the #2114 r2 card pin reads 0 / 0.
+- Not done:
+  - An empty `<p></p>`'s margins collapsing through it.
+  - An empty block's `height` (not kept): one with a height still
+    collapses through.
+  - Quirks mode's dropping of an empty block's user-agent margins at a
+    cell's edge, and a card in a card passing the bottom quirk on.
+  - A block's box beside a table when no paragraph is there to carry it
+    (the flow's start, between two tables, the flow's end).
+  - Cards' own margins beside their tables.
 
 ## HTML mail as Word draws it (#2249)
 

@@ -107,5 +107,6 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the PDF export (
   to a new column or page is placed there. A table wider than its column
   stays at the column's left, as in the suite. Header and footer bands
   (`BandFlow`) take the same path.
-- Not done: `w:tblInd` (the #2114 room tables placed by indent); real
+- Not done: `w:tblInd` (the #2114 room tables placed by indent, and
+  #2151's tables in indented blocks; the suite draws it); real
   cells and borders (rows are still flattened text).

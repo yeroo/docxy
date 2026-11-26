@@ -386,6 +386,18 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
 - The probe, the table pen's `TableGeom` (its `left` comes from the row
   canvas) and the #1477 margin rows are measured where the cells are
   drawn, so they follow the table.
+- `w:tblInd` (#2151): a left table (`jc` none or `left`) is drawn at
+  `docxcore::table::left_edge` right of the text's left, a left margin
+  on its root, kept on a table wider than its room (Word keeps it, and a
+  left margin never pushes it past the left, so the sideways scroll still
+  reaches its right edge). `left_edge` is the `dxa` `tblInd`, less the
+  first cell's left margin (`tcMar`, else `tblCellMar`, else 108) where
+  Word measures it to that cell's text: `compatibilityMode` below 15 or
+  none (the HTML and Markdown packages), from `TableCtx::compat_mode`;
+  never left of the text, so a Word document's `tblInd 0` table stays.
+  A table style's `tblInd` is not read; PDF export does not draw it.
+  `flow.tables.N.inset` is a table's left less the text column's, in px
+  (`table-jc.uit`).
 - The harness: `doc {}`'s `flow.tables.N.place` is `left`, `center`,
   `right` or `other` across `flow.text_column` (Web Layout's column, else
   Print Layout's first page's first band, whose rect is 2 px narrower than
