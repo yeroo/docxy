@@ -1455,7 +1455,7 @@ mod tests {
             .iter()
             .filter(|i| i.surface == Surface::Terminal)
             .collect();
-        assert_eq!(terminal.len(), 13);
+        assert_eq!(terminal.len(), 14);
         for i in terminal {
             let (app, file) = terminal_case_file(i.id);
             let (_, case) = cases
