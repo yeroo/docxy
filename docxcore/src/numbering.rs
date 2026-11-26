@@ -449,6 +449,13 @@ fn parse_abstract(p: &mut XmlParser) -> AbstractNum {
             Event::Start => match p.name() {
                 "w:lvl" => {
                     let ilvl = parse_int(p.attr("w:ilvl")).max(0) as usize;
+                    // OOXML has nine levels, and every reader clamps to
+                    // them: a level past the ninth must not grow the list
+                    // to its index (#2002 r1).
+                    if ilvl > 8 {
+                        p.skip_element();
+                        continue;
+                    }
                     let lvl = parse_level(p);
                     while an.levels.len() <= ilvl {
                         an.levels.push(Level::default());
@@ -1194,6 +1201,30 @@ mod tests {
 
     /// A huge `w:ilvl` is level 8: the counters never grow past nine
     /// levels (#1948 r3).
+    #[test]
+    fn a_level_past_the_ninth_is_skipped_not_grown_to_2002() {
+        let lvl = |i: i64, text: &str| {
+            format!(
+                "<w:lvl w:ilvl=\"{i}\"><w:numFmt w:val=\"decimal\"/><w:lvlText w:val=\"{text}\"/>\
+                 <w:rPr><w:b/></w:rPr></w:lvl>"
+            )
+        };
+        let levels: String = (0..9).map(|i| lvl(i, &format!("%{}.", i + 1))).collect();
+        let n = parse_numbering_xml(&format!(
+            "<w:numbering><w:abstractNum w:abstractNumId=\"1\">{levels}{}{}</w:abstractNum>\
+             <w:num w:numId=\"1\"><w:abstractNumId w:val=\"1\"/></w:num></w:numbering>",
+            lvl(9, "nine"),
+            lvl(2_147_483_647, "max"),
+        ));
+        assert_eq!(n.abstracts[&1].levels.len(), 9);
+        assert_eq!(n.level(1, 9), None);
+        assert_eq!(n.level_run_props(1, 9), None);
+        for i in 0..9 {
+            assert_eq!(n.level(1, i).map(|l| l.text), Some(format!("%{}.", i + 1)));
+            assert!(n.level_run_props(1, i).is_some_and(|r| r.bold));
+        }
+    }
+
     #[test]
     fn a_huge_ilvl_is_the_last_level() {
         let n = parse_numbering_xml(
