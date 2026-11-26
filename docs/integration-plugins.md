@@ -112,8 +112,8 @@ keeps the answers. It asks `token` each time it needs a token. An `ok` answer wi
 
 ## Tests
 
-`integration/tests/integration_fixture` is a plugin with no dependencies. The first word of a
-`fixture-mode` file beside it chooses its behaviour (the list is in its `src/lib.rs`), and it appends
-each call's method and OS thread id to `fixture-calls`. The cargo feature `missing-call` builds it
-without exporting `dxi_call`. `integration/tests/host.rs` builds it, copies it into a scratch folder
-per test, and loads it from there.
+`integration/tests/integration_fixture` is a plugin with no dependencies. A mode file beside it
+chooses its behaviour, and it records its calls in files beside it; its `src/lib.rs` header lists
+both. The cargo feature `missing-call` builds it without exporting `dxi_call`.
+`integration/tests/host.rs` builds it, copies it into a scratch folder per test, and loads it from
+there.
