@@ -207,7 +207,11 @@ fn form(
     d.text = None;
     d.controls = controls;
     d.buttons = vec![
-        Button::new(accept, ButtonRole::Accept),
+        // Enter presses it, as OK.
+        Button {
+            default: true,
+            ..Button::new(accept, ButtonRole::Accept)
+        },
         Button::new("Cancel", ButtonRole::Cancel),
     ];
     d.react = Some(crate::dialog::Reaction(react));

@@ -199,6 +199,18 @@ fn the_print_dialog_has_acrobats_choices() {
             ("Cancel", ButtonRole::Cancel)
         ]
     );
+    // Enter presses Print, and Save… on an export, as OK; Escape cancels.
+    for d in [
+        print_dialog(&facts(3), &printers),
+        png_dialog(),
+        pdf_dialog(),
+    ] {
+        let accept = d.buttons[0].label.clone();
+        let mut stack = crate::dialog::DialogStack::default();
+        stack.push(d);
+        assert_eq!(stack.key_button("enter", true), Some(accept));
+        assert_eq!(stack.key_button("escape", true).as_deref(), Some("Cancel"));
+    }
     // None found: the list says so, and OK refuses.
     let d = print_dialog(&facts(3), &[]);
     assert_eq!(d.controls[0].items, [NO_PRINTERS.to_string()]);
