@@ -402,28 +402,43 @@ fn decoded_path(src: &str) -> Option<String> {
     (!path.is_empty()).then_some(path)
 }
 
-/// The parent's side: convert `path` as `what` in a child process; a PDF
-/// whose child died ([`DIED`]: an abort, out of memory past the limit) is
-/// tried once more by its text alone ([`What::PdfText`]), as it converted
-/// before the layout conversion (#2257). One that ran out of time is not:
-/// the layout step stops itself at half the time
-/// (`pdf_view::convert::LAYOUT_TIME`) and falls back in the same child, and
-/// the suite waits for the child on its UI thread.
+/// The parent's side: convert `path` as `what` in a child process, within
+/// [`TIMEOUT`] in all. A PDF whose child died ([`DIED`]: an abort, out of
+/// memory past the limit) is tried once more by its text alone
+/// ([`What::PdfText`]), as it converted before the layout conversion
+/// (#2257), in what is left of the same [`TIMEOUT`]: the suite waits on its
+/// UI thread, so a retry never makes the wait longer. One that ran out of
+/// time is not retried; the layout step bounds itself
+/// (`pdf_view::convert::Limits`) and falls back in its own child.
 pub(crate) fn convert(what: What, path: &Path) -> Outcome {
-    retrying(what, |what| convert_once(what, path))
+    retrying(what, TIMEOUT, |what, timeout| {
+        convert_once(what, path, timeout)
+    })
 }
 
-/// `run(what)`, and for a PDF whose child died, `run(What::PdfText)`.
-fn retrying(what: What, run: impl Fn(What) -> Outcome) -> Outcome {
-    let first = run(what);
+/// The least time worth a retry.
+const RETRY_MIN: Duration = Duration::from_secs(1);
+
+/// `run(what, total)`, and for a PDF whose child died, `run(What::PdfText,
+/// what is left of total)` when that is at least [`RETRY_MIN`].
+fn retrying(what: What, total: Duration, run: impl Fn(What, Duration) -> Outcome) -> Outcome {
+    let start = Instant::now();
+    let first = run(what, total);
     match first {
-        Outcome::Failed(ref why) if what == What::Pdf && why == DIED => run(What::PdfText),
+        Outcome::Failed(ref why) if what == What::Pdf && why == DIED => {
+            let left = total.saturating_sub(start.elapsed());
+            if left >= RETRY_MIN {
+                run(What::PdfText, left)
+            } else {
+                first
+            }
+        }
         first => first,
     }
 }
 
-/// [`convert`] without the retry.
-fn convert_once(what: What, path: &Path) -> Outcome {
+/// [`convert`] without the retry, waiting at most `timeout`.
+fn convert_once(what: What, path: &Path, timeout: Duration) -> Outcome {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => return cannot_start(e),
@@ -435,7 +450,7 @@ fn convert_once(what: What, path: &Path) -> Outcome {
     let out = dir.0.join("converted.docx");
     let mut cmd = Command::new(exe);
     cmd.arg(FLAG).arg(what.arg()).arg(path).arg(&out);
-    run_child(cmd, &dir.0, &out, TIMEOUT, MEMORY_LIMIT)
+    run_child(cmd, &dir.0, &out, timeout, MEMORY_LIMIT)
 }
 
 /// Run a converting child: wait at most `timeout` (killing it past that),
@@ -830,9 +845,9 @@ pub(crate) mod tests {
             &docxcore::export::to_pdf(&md, &docxcore::export::PdfOptions::default()),
         );
         let tried = std::cell::RefCell::new(Vec::new());
-        let got = retrying(What::Pdf, |what| {
+        let got = retrying(What::Pdf, TIMEOUT, |what, timeout| {
             tried.borrow_mut().push(what);
-            convert_by_test_child(what, &pdf, Some("abort-layout"), TIMEOUT, MEMORY_LIMIT)
+            convert_by_test_child(what, &pdf, Some("abort-layout"), timeout, MEMORY_LIMIT)
         });
         assert_eq!(*tried.borrow(), vec![What::Pdf, What::PdfText]);
         let Outcome::Converted(docx) = got else {
@@ -842,8 +857,8 @@ pub(crate) mod tests {
         let text: String = doc.body.iter().map(|b| b.plain_text()).collect();
         assert!(text.contains("Text the retry reads."), "{text}");
         // Dying again, or another kind dying, is not retried further.
-        let again = retrying(What::Pdf, |what| {
-            convert_by_test_child(what, &pdf, Some("abort"), TIMEOUT, MEMORY_LIMIT)
+        let again = retrying(What::Pdf, TIMEOUT, |what, timeout| {
+            convert_by_test_child(what, &pdf, Some("abort"), timeout, MEMORY_LIMIT)
         });
         assert!(
             matches!(again, Outcome::Failed(ref why) if why == DIED),
@@ -851,13 +866,57 @@ pub(crate) mod tests {
         );
         let rtf = write(&dir, "in.rtf", br"{\rtf1 x\par}");
         let tried = std::cell::Cell::new(0);
-        let rtf_died = retrying(What::Rtf, |what| {
+        let rtf_died = retrying(What::Rtf, TIMEOUT, |what, timeout| {
             tried.set(tried.get() + 1);
-            convert_by_test_child(what, &rtf, Some("abort"), TIMEOUT, MEMORY_LIMIT)
+            convert_by_test_child(what, &rtf, Some("abort"), timeout, MEMORY_LIMIT)
         });
         assert!(matches!(rtf_died, Outcome::Failed(_)));
         assert_eq!(tried.get(), 1);
         assert_eq!(What::parse(What::PdfText.arg()), Some(What::PdfText));
+    }
+
+    /// #2257 r2: the retry has only what is left of the one timeout, and
+    /// none when too little is left: the suite never waits longer than
+    /// [`TIMEOUT`].
+    #[test]
+    fn a_retry_shares_the_one_timeout() {
+        let total = Duration::from_millis(1500);
+        let given = std::cell::RefCell::new(Vec::new());
+        let got = retrying(What::Pdf, total, |what, timeout| {
+            given.borrow_mut().push((what, timeout));
+            if what == What::Pdf {
+                std::thread::sleep(Duration::from_millis(200));
+                Outcome::Failed(DIED.into())
+            } else {
+                Outcome::NothingRecovered
+            }
+        });
+        assert!(matches!(got, Outcome::NothingRecovered), "{got:?}");
+        let given = given.into_inner();
+        assert_eq!(given.len(), 2);
+        assert_eq!(given[0], (What::Pdf, total));
+        assert_eq!(given[1].0, What::PdfText);
+        assert!(
+            given[1].1 <= total - Duration::from_millis(200),
+            "{:?}",
+            given[1]
+        );
+        // Less than RETRY_MIN left: the death stands.
+        let tried = std::cell::Cell::new(0);
+        let got = retrying(What::Pdf, Duration::from_millis(900), |_, _| {
+            tried.set(tried.get() + 1);
+            Outcome::Failed(DIED.into())
+        });
+        assert!(matches!(got, Outcome::Failed(ref why) if why == DIED));
+        assert_eq!(tried.get(), 1);
+        // A first child that ran out of time is never retried.
+        let tried = std::cell::Cell::new(0);
+        let got = retrying(What::Pdf, TIMEOUT, |_, _| {
+            tried.set(tried.get() + 1);
+            Outcome::Failed(TOO_LONG.into())
+        });
+        assert!(matches!(got, Outcome::Failed(ref why) if why == TOO_LONG));
+        assert_eq!(tried.get(), 1);
     }
 
     #[test]

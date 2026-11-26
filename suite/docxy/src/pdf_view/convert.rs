@@ -37,15 +37,51 @@ mod columns;
 mod fonts;
 mod running;
 
-/// How long the layout step may take: half the child's whole
-/// [`crate::convert_child::TIMEOUT`], so a slow file leaves the text
-/// importer the other half. Checked per page, before each page's pictures,
-/// and before the export and its loading.
-pub(crate) const LAYOUT_TIME: Duration =
-    Duration::from_secs(crate::convert_child::TIMEOUT.as_secs() / 2);
+/// How long the layout step may read pages, from its start: checked after
+/// `inspect`, at every page, before each picture, and before the export.
+/// Reading is the step's slow part and grows with the pages (in release on
+/// a 2026 laptop, 300 pages of text 0.5 s, 600 pages 1.6 s).
+pub(crate) const READ_TIME: Duration = Duration::from_secs(8);
+/// When, from the step's start, the export and its loading must be done:
+/// checked after each. [`MAX_LAYOUT_BLOCKS`] keeps that work to about 2.5 s
+/// (measured below), so a step that read until [`READ_TIME`] still ends
+/// before it, and a step that does not leaves the text importer 8 of the
+/// child's 20 s ([`crate::convert_child::TIMEOUT`]).
+pub(crate) const DONE_TIME: Duration = Duration::from_secs(12);
+/// The most text blocks the layout step converts; past it the text
+/// importer converts the file with all the time left. The export and the
+/// load after it grow with the blocks: 86,700 blocks (300 pages of table
+/// cells) took 0.3 s to export, 7.0 s to load and 0.6 s to save in release,
+/// about 0.1 ms a block in all, so 20,000 take about 2.3 s (and the suite
+/// loads the result again).
+pub(crate) const MAX_LAYOUT_BLOCKS: usize = 20_000;
 
-/// What the layout step says past [`LAYOUT_TIME`].
+/// What the layout step says past its time ([`READ_TIME`], [`DONE_TIME`]).
 pub(crate) const LAYOUT_TOO_LONG: &str = "the layout conversion took too long";
+/// What it says past [`MAX_LAYOUT_BLOCKS`].
+pub(crate) const LAYOUT_TOO_BIG: &str = "the PDF has too much text for the layout conversion";
+
+/// The bounds of one layout step.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Limits {
+    /// Reading pages ends here ([`READ_TIME`]).
+    pub(crate) read: Instant,
+    /// The export and its loading end here ([`DONE_TIME`]).
+    pub(crate) done: Instant,
+    /// At most this many blocks ([`MAX_LAYOUT_BLOCKS`]).
+    pub(crate) blocks: usize,
+}
+
+impl Limits {
+    /// The limits of a step starting at `start`.
+    pub(crate) fn from(start: Instant) -> Limits {
+        Limits {
+            read: start + READ_TIME,
+            done: start + DONE_TIME,
+            blocks: MAX_LAYOUT_BLOCKS,
+        }
+    }
+}
 
 /// The most blocks that get a code colour: every 24-bit colour but black.
 /// Blocks past it keep their colour and no font.
@@ -93,10 +129,10 @@ pub(crate) fn convert_with(
     }
 }
 
-/// The PDF converted with its layout within [`LAYOUT_TIME`]; `Ok(None)`
+/// The PDF converted with its layout within [`Limits`] from now; `Ok(None)`
 /// when it keeps nothing.
 pub(crate) fn layout(bytes: &[u8]) -> Result<Option<ConvertedDoc>, String> {
-    layout_until(bytes, Instant::now() + LAYOUT_TIME)
+    layout_within(bytes, Limits::from(Instant::now()))
 }
 
 /// Past `deadline`, an error ([`LAYOUT_TOO_LONG`]).
@@ -108,16 +144,13 @@ fn on_time(deadline: Instant) -> Result<(), String> {
     }
 }
 
-/// [`layout`], given up at `deadline`.
-pub(crate) fn layout_until(
-    bytes: &[u8],
-    deadline: Instant,
-) -> Result<Option<ConvertedDoc>, String> {
+/// [`layout`] within `limits`.
+pub(crate) fn layout_within(bytes: &[u8], limits: Limits) -> Result<Option<ConvertedDoc>, String> {
     let Read {
         mut pages,
         mut sources,
         title,
-    } = read_pages(bytes, deadline)?;
+    } = read_pages(bytes, limits)?;
     if pages
         .iter()
         .all(|p| p.blocks.is_empty() && p.images.is_empty())
@@ -175,13 +208,14 @@ pub(crate) fn layout_until(
         .iter_mut()
         .map(|v| std::mem::take(&mut v.page))
         .collect();
-    on_time(deadline)?;
+    on_time(limits.read)?;
     let docx = pdfcraft_export::docx_with_language(&export, &title, None);
     if docx.is_empty() {
         return Err("PdfCraft could not write the converted document".into());
     }
-    on_time(deadline)?;
+    on_time(limits.done)?;
     let mut pkg = docxcore::package::load_package(&docx).map_err(|e| e.to_string())?;
+    on_time(limits.done)?;
     pkg.ensure_styles(&["Heading1", "Heading2"]);
     sections(
         &mut pkg.document.body,
@@ -202,23 +236,28 @@ pub(crate) fn layout_until(
 }
 
 /// The PDF's pages as `pdfcraft_export` takes them, each block's source
-/// beside it (same order), as `pdfcraft-engine`'s `export_pages_within`
-/// builds them; pictures within `docxcore`'s HTML import budgets
-/// (`html_image`), which the suite holds the converted document in too;
-/// given up at `deadline`.
-pub(crate) fn read_pages(bytes: &[u8], deadline: Instant) -> Result<Read, String> {
+/// beside it (same order), built as `pdfcraft-engine`'s
+/// `export_pages_within` builds them, but for what that reports and this
+/// drops: a page whose forms run past PdfCraft's reading limits converts
+/// without their text, and a picture past the budgets without it.
+/// Pictures stay within `docxcore`'s HTML import budgets (`html_image`),
+/// as the suite holds the converted document; past `limits.read` or
+/// `limits.blocks`, an error.
+pub(crate) fn read_pages(bytes: &[u8], limits: Limits) -> Result<Read, String> {
     use docxcore::import::html_image::{MAX_IMAGE_BYTES, MAX_MEDIA_BYTES};
     let bytes = Arc::new(bytes.to_vec());
     let cos = pdfcraft_cos::Document::open_with_password(bytes.clone(), None)
         .map_err(|e| e.to_string())?;
     let info = pdfcraft_render::inspect(bytes, None).map_err(|e| e.to_string())?;
+    on_time(limits.read)?;
+    let mut total = 0usize;
     let mut encoded: HashMap<pdfcraft_cos::ObjRef, Option<Picture>> = HashMap::new();
     let mut work = pdfcraft_cos::ImageBudget::new(&cos);
     let mut left = MAX_MEDIA_BYTES;
     let mut pages = Vec::with_capacity(info.pages.len());
     let mut sources = Vec::with_capacity(info.pages.len());
     for (i, page) in info.pages.iter().enumerate() {
-        on_time(deadline)?;
+        on_time(limits.read)?;
         let visible = |r: [f64; 4]| {
             let a = page.user_to_view(r[0] as f32, r[1] as f32);
             let b = page.user_to_view(r[2] as f32, r[3] as f32);
@@ -237,6 +276,10 @@ pub(crate) fn read_pages(bytes: &[u8], deadline: Instant) -> Result<Read, String
         for b in reading.blocks {
             if b.text.trim().is_empty() {
                 continue;
+            }
+            total += 1;
+            if total > limits.blocks {
+                return Err(LAYOUT_TOO_BIG.into());
             }
             let (bold, italic) = weight_and_slant(&b.base_font);
             let space_around = [
@@ -258,11 +301,11 @@ pub(crate) fn read_pages(bytes: &[u8], deadline: Instant) -> Result<Read, String
                 rotation: b.rotation - f64::from(page.rotation),
             });
         }
-        on_time(deadline)?;
+        on_time(limits.read)?;
         let placed = pdfcraft_edit::reading_images(&cos, i).unwrap_or_default();
         let mut images = Vec::new();
         for im in &placed {
-            on_time(deadline)?;
+            on_time(limits.read)?;
             let Some(object) = im.object else { continue };
             let prepared = encoded.entry(object).or_insert_with(|| {
                 let (ext, data) =

@@ -7,7 +7,7 @@ use super::*;
 use crate::pdf_view::tests::{ENCRYPTED, UNREADABLE, corpus_path, user_password};
 use docxcore::model::{Document, PageGeom};
 use docxcore::package::Package;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn corpus(name: &str) -> Vec<u8> {
     std::fs::read(corpus_path(name)).unwrap()
@@ -535,27 +535,52 @@ fn a_failing_or_panicking_pdfcraft_step_falls_back() {
     assert!(own.base.is_some());
 }
 
-/// The layout step stops at its deadline, so the text importer still has
-/// time in the same child (#2257 r1).
+/// The layout step stops at its clock checks and its block cap, so the
+/// text importer still has time in the same child (#2257 r1, r2).
 #[test]
-fn a_layout_past_its_deadline_falls_back_to_the_text_importer() {
+fn a_layout_past_its_limits_falls_back_to_the_text_importer() {
     let bytes = corpus("convert");
-    let past = Instant::now();
-    assert_eq!(
-        layout_until(&bytes, past).err().as_deref(),
-        Some(LAYOUT_TOO_LONG)
+    let now = Instant::now();
+    let far = now + Duration::from_secs(600);
+    let falls_back = |limits: Limits, why: &str| {
+        assert_eq!(layout_within(&bytes, limits).err().as_deref(), Some(why));
+        let c = convert_with(&bytes, |b| layout_within(b, limits)).unwrap();
+        assert!(c.base.is_none(), "the text importer's document");
+        let all: String = c.doc.body.iter().map(text).collect();
+        assert!(all.contains("spoonbills"), "{all}");
+    };
+    // Reading past its time.
+    falls_back(
+        Limits {
+            read: now,
+            done: far,
+            blocks: MAX_LAYOUT_BLOCKS,
+        },
+        LAYOUT_TOO_LONG,
     );
-    let c = convert_with(&bytes, |b| layout_until(b, past)).unwrap();
-    assert!(c.base.is_none(), "the text importer's document");
-    let all: String = c.doc.body.iter().map(text).collect();
-    assert!(all.contains("spoonbills"), "{all}");
-    // Half the child's time, the other half left to the fallback.
-    assert_eq!(LAYOUT_TIME * 2, crate::convert_child::TIMEOUT);
-    assert!(
-        layout_until(&bytes, Instant::now() + LAYOUT_TIME)
-            .unwrap()
-            .is_some()
+    // Read in time, but the export and its loading late.
+    falls_back(
+        Limits {
+            read: far,
+            done: now,
+            blocks: MAX_LAYOUT_BLOCKS,
+        },
+        LAYOUT_TOO_LONG,
     );
+    // More blocks than the cap (convert.pdf has about 50).
+    falls_back(
+        Limits {
+            read: far,
+            done: far,
+            blocks: 10,
+        },
+        LAYOUT_TOO_BIG,
+    );
+    // The real limits convert it, and leave the text importer a third of
+    // the child's time after the export's.
+    assert!(layout(&bytes).unwrap().is_some());
+    assert!(READ_TIME < DONE_TIME);
+    assert!(crate::convert_child::TIMEOUT - DONE_TIME >= Duration::from_secs(6));
 }
 
 #[test]

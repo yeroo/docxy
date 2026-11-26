@@ -305,19 +305,39 @@ fn slot(g: &[usize], cands: &[Cand], width: f64) -> Slot {
     }
 }
 
-/// Whether every digit run of a group is the same on all its pages, or is
-/// each page's number, or the page count: otherwise the text differs from
-/// page to page (dates, amounts, Bates numbers, a count that does not start
-/// at 1) and stays in the body, where each page has its own.
+/// What one digit run of a group is across its pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Digits {
+    /// Each page's own number: the PAGE field.
+    Page,
+    /// The page count everywhere: NUMPAGES.
+    NumPages,
+    /// The same digits on every page: kept as they are.
+    Same,
+}
+
+/// What digit run `j` of group `g` is; `None` when it differs from page to
+/// page and counts nothing (a date, an amount, a Bates number, a count that
+/// does not start at 1).
+fn digits_of(g: &[usize], cands: &[Cand], n: usize, j: usize) -> Option<Digits> {
+    let digits = |k: usize| cands[k].digits.get(j);
+    let value = |k: usize| digits(k).and_then(|d| d.parse::<usize>().ok());
+    if g.iter().all(|&k| value(k) == Some(cands[k].page + 1)) {
+        Some(Digits::Page)
+    } else if g.iter().all(|&k| value(k) == Some(n)) {
+        Some(Digits::NumPages)
+    } else if g.iter().all(|&k| digits(k) == digits(g[0])) {
+        Some(Digits::Same)
+    } else {
+        None
+    }
+}
+
+/// Whether every digit run of a group repeats ([`digits_of`]): otherwise
+/// the group is no running piece and stays in the body, where each page
+/// has its own text.
 fn digits_repeat(g: &[usize], cands: &[Cand], n: usize) -> bool {
-    let count = cands[g[0]].digits.len();
-    (0..count).all(|j| {
-        let digits = |k: usize| cands[k].digits.get(j);
-        let value = |k: usize| digits(k).and_then(|d| d.parse::<usize>().ok());
-        g.iter().all(|&k| digits(k) == digits(g[0]))
-            || g.iter().all(|&k| value(k) == Some(cands[k].page + 1))
-            || g.iter().all(|&k| value(k) == Some(n))
-    })
+    (0..cands[g[0]].digits.len()).all(|j| digits_of(g, cands, n, j).is_some())
 }
 
 /// A field's [`Seg`] made from what the first page shows.
@@ -328,21 +348,10 @@ type Field = fn(String) -> Seg;
 fn segs(text: &str, g: &[usize], cands: &[Cand], n: usize) -> Vec<Seg> {
     let count = cands[g[0]].digits.len();
     let field = |j: usize| -> Option<Field> {
-        let values: Vec<(usize, Option<usize>)> = g
-            .iter()
-            .map(|&k| {
-                (
-                    cands[k].page,
-                    cands[k].digits.get(j).and_then(|d| d.parse().ok()),
-                )
-            })
-            .collect();
-        if values.iter().all(|(p, v)| *v == Some(p + 1)) {
-            Some(Seg::Page)
-        } else if values.iter().all(|(_, v)| *v == Some(n)) {
-            Some(Seg::NumPages)
-        } else {
-            None
+        match digits_of(g, cands, n, j)? {
+            Digits::Page => Some(Seg::Page),
+            Digits::NumPages => Some(Seg::NumPages),
+            Digits::Same => None,
         }
     };
     let fields: Vec<Option<Field>> = (0..count).map(field).collect();

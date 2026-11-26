@@ -343,7 +343,8 @@ pub(crate) fn detect(page: &Page) -> Option<Layout> {
 
 /// Blocks of the region wholly above where every column has begun (a
 /// heading over the first column) belong to the band above: unless the
-/// band already has text beside another column. Where a column begins is
+/// band already has text beside another column; only from the first
+/// column, unless that text is over another one. Where a column begins is
 /// its highest block or picture, so a column that opens with a picture
 /// lifts nothing of the others; and a column keeps at least one block of
 /// its own.
@@ -376,7 +377,9 @@ fn lift_heads(layout: &mut Layout, blocks: &[Block], images: &[Image], beside: O
             continue;
         };
         let above = blocks[i].rect[1] >= start - 1.0;
-        if above && beside.is_none_or(|k| k == j) && left[j] > 1 {
+        // From the first column only (a heading over it), or the one the
+        // band's own text is over.
+        if above && beside.map_or(j == 0, |k| k == j) && left[j] > 1 {
             layout.block_band[i] = None;
             left[j] -= 1;
         }
@@ -585,22 +588,35 @@ mod tests {
 
     #[test]
     fn a_column_keeps_one_block_of_its_own() {
-        // Two one-block columns under a heading over the first: the heading
-        // goes to the band, each column keeps its block.
+        // A staggered page: the left column's blocks all lie above the
+        // right column's first one. The ones above are lifted, the lowest
+        // stays in its column.
+        let tall =
+            |x0: f64, top: f64, w: f64| block("Column text", [x0, top - 30.0, x0 + w, top], 9.0);
         let blocks = vec![
-            block("Two columns", [54.0, 715.0, 186.0, 737.0], 18.0),
-            block("Left column text", [54.0, 327.0, 188.0, 690.0], 9.0),
-            block("Right column text", [324.0, 327.0, 473.0, 690.0], 9.0),
-        ];
-        let l = detect(&letter(blocks.clone())).unwrap();
-        assert_eq!(l.block_band, vec![None, Some(0), Some(1)]);
-        // A right column of one block level with the start is never lifted.
-        let blocks = vec![
-            block("Left text", [54.0, 600.0, 188.0, 690.0], 9.0),
-            block("Right text", [324.0, 600.0, 473.0, 690.0], 9.0),
+            tall(72.0, 690.0, 210.0),
+            tall(72.0, 650.0, 210.0),
+            tall(72.0, 610.0, 210.0),
+            tall(324.0, 560.0, 214.0),
+            tall(324.0, 520.0, 214.0),
+            tall(324.0, 480.0, 214.0),
         ];
         let l = detect(&letter(blocks)).unwrap();
-        assert_eq!(l.block_band, vec![Some(0), Some(1)]);
+        assert_eq!(
+            l.block_band,
+            vec![None, None, Some(0), Some(1), Some(1), Some(1)]
+        );
+    }
+
+    #[test]
+    fn a_line_over_the_second_column_is_not_lifted() {
+        // The right column opens with a one-line block above the left
+        // column's top: it stays the right column's.
+        let mut blocks = vec![line(324.0, 690.0, 214.0)];
+        blocks.extend(two_columns(12, 650.0));
+        let l = detect(&letter(blocks)).unwrap();
+        assert_eq!(l.block_band[0], Some(1));
+        assert!(l.block_band.iter().all(|b| b.is_some()));
     }
 
     #[test]

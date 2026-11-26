@@ -285,15 +285,27 @@ with its layout (#2257).
   error`) goes to the text importer (`import_pdf`, #951), whose encrypted
   message covers a file that needs its password (the convert child has
   none; an owner-only file converts). Tests inject the step.
-- Time and memory (r1): the layout step stops itself at `LAYOUT_TIME`
-  (half of `convert_child::TIMEOUT`; checked per page, per picture, before
-  the export and before loading it) and falls back in the same child with
-  the other half. An abort (an allocation past `limit_memory`'s
+- Time and memory (r1, r2): the layout step's `Limits` from its start.
+  Reading (after `inspect`, each page, each picture, before the export)
+  stops at `READ_TIME` (8 s); the export and its loading are checked after
+  each against `DONE_TIME` (12 s); more than `MAX_LAYOUT_BLOCKS` (20,000)
+  text blocks stops it at once. Each gives an `Err` and the text importer
+  runs in the same child. Measured in release on this laptop: 300 pages of
+  text read in 0.5 s, 600 in 1.6 s (reading grows faster than the pages;
+  the export, load and save of those under 0.2 s); 300 pages of table
+  cells (86,700 blocks) export in 0.3 s, load in 7.0 s, save in 0.6 s,
+  about 0.1 ms a block, so the cap keeps that to about 2.3 s; the text
+  importer took 0.2 s on each. Not bounded: one page or one `inspect` that
+  alone runs past the 20 s (PdfCraft's own decode budgets bound them), and
+  the work after `DONE_TIME`'s last check (the passes and the child's
+  save, about 0.1 s for 20,000 blocks). Then the parent kills the child,
+  and the tab says it took too long; that is not retried, as the suite
+  waits on its UI thread. An abort (an allocation past `limit_memory`'s
   `RLIMIT_DATA`, which `catch_unwind` cannot reach) kills the child: the
   parent (`convert_child::convert`, `retrying`) tries a PDF whose child
   died (`DIED`) once more as `What::PdfText` (`--convert-import
-  pdf-text`, `import_pdf` alone, no limit set). A child killed for time is
-  not retried: the suite waits on its UI thread.
+  pdf-text`, `import_pdf` alone, no limit set), within what is left of
+  the same `TIMEOUT` (none under `RETRY_MIN`, 1 s).
 - Running headers and footers (`convert/running.rs`), on the pages before
   the export: an unrotated block wholly in the top or bottom 12 % whose
   text, with digit runs as `#`, repeats on at least 2 and more than half
@@ -320,7 +332,8 @@ with its layout (#2257).
   `w:cols`, a continuous start and the real page's `pgSz`/`pgMar` back.
   Where a column begins is its highest block or picture; a block above
   where every column has begun is lifted into the band (a heading over
-  the first column), never a column's last block.
+  the first column; from another column only when the band's own text is
+  over it), never a column's last block.
   The export sizes headings against each virtual page, so a band's
   paragraphs get their level again against the real page's body
   (`heading_level`, PdfCraft's `level` rule). A positioned page
@@ -345,4 +358,8 @@ with its layout (#2257).
   (`UNREFERENCED`).
 - Not done: links as hyperlinks, form values as text, footnotes,
   even/odd headers, floating pictures, unequal or more than 3 columns,
-  text below columns, fonts by metrics; terminal docxy and wasm (slice 6).
+  text below columns, fonts by metrics, page numbers that do not start at
+  1 as a field; a page whose forms run past PdfCraft's reading limits, or
+  a picture past the budgets, converts without it and says nothing
+  (`export_pages_within`'s `truncated` is not carried across the child);
+  terminal docxy and wasm (slice 6).
