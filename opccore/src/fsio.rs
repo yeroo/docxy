@@ -80,11 +80,12 @@ pub fn write_atomic_with(
     write_atomic_with_ownership(path, writer, restore_ownership)
 }
 
-fn write_atomic_with_ownership(
-    path: &Path,
-    writer: impl FnOnce(&mut File) -> io::Result<()>,
-    restore: impl FnOnce(&File, &fs::Metadata) -> io::Result<bool>,
-) -> io::Result<()> {
+/// The file a write to `path` replaces or creates, as [`write_atomic`]
+/// decides it: a symlink is followed to its target (a dangling one fails),
+/// and an existing destination this caller cannot write, or one marked
+/// read-only, is refused (`destination is read-only`). The open handle and
+/// metadata of a destination that exists.
+fn destination(path: &Path) -> io::Result<(PathBuf, Option<(File, fs::Metadata)>)> {
     let dest = match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path)?,
         Ok(_) => path.to_path_buf(),
@@ -110,6 +111,32 @@ fn write_atomic_with_ownership(
             "destination is read-only",
         ));
     }
+    Ok((dest, destination))
+}
+
+/// [`destination`] for a caller that puts several files in place itself
+/// (an export of many pages): the path to write, and the permissions of the
+/// file it replaces, to give the new one.
+pub fn write_destination(path: &Path) -> io::Result<(PathBuf, Option<fs::Permissions>)> {
+    destination(path).map(|(dest, existing)| (dest, existing.map(|(_, m)| m.permissions())))
+}
+
+/// A new temporary file beside `dest`, made as [`write_atomic`] makes its
+/// own: exclusively (`create_new`), named with the process and a
+/// process-wide counter, so two writers never share one. The caller removes
+/// it, or renames it into place.
+pub fn temp_sibling(dest: &Path) -> io::Result<(PathBuf, File)> {
+    let (mut temp, file) = create_temp(dest, false, || NEXT_TEMP.fetch_add(1, Ordering::Relaxed))?;
+    temp.1 = false;
+    Ok((temp.0.clone(), file))
+}
+
+fn write_atomic_with_ownership(
+    path: &Path,
+    writer: impl FnOnce(&mut File) -> io::Result<()>,
+    restore: impl FnOnce(&File, &fs::Metadata) -> io::Result<bool>,
+) -> io::Result<()> {
+    let (dest, destination) = destination(path)?;
     // Declare the guard before the file so unwinding also closes before cleanup.
     let (mut temp, file) = create_temp(&dest, destination.is_some(), || {
         NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
@@ -318,6 +345,45 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn write_destination_follows_a_link_and_refuses_a_read_only_file() {
+        let dir = Dir::new();
+        let path = dir.file();
+        let (dest, perms) = write_destination(&path).unwrap();
+        assert_eq!((dest, perms.is_none()), (path.clone(), true), "a new file");
+        fs::write(&path, b"old").unwrap();
+        assert!(write_destination(&path).unwrap().1.is_some());
+        #[cfg(unix)]
+        {
+            let link = dir.0.join("link");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert_eq!(
+                write_destination(&link).unwrap().0,
+                fs::canonicalize(&path).unwrap()
+            );
+        }
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&path, perms).unwrap();
+        let err = write_destination(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(&path, perms).unwrap();
+    }
+
+    #[test]
+    fn temp_siblings_are_never_shared() {
+        let dir = Dir::new();
+        let (a, _) = temp_sibling(&dir.file()).unwrap();
+        let (b, _) = temp_sibling(&dir.file()).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), Some(dir.0.as_path()));
+        assert!(a.exists() && b.exists(), "the caller removes them");
+        assert_eq!(dir.count(), 2);
     }
 
     #[test]
