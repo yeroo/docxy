@@ -622,6 +622,34 @@ fn share_edges(rows: &mut [RowBox]) {
     }
 }
 
+/// Whether a flow view scales `t` to its width (#1895, [`fitted_grid`]):
+/// a `pct` or `auto` table; a `dxa` one keeps its grid (#2151 r2).
+pub fn scales_to_view(t: &Table) -> bool {
+    wants(t) != Wants::Fixed
+}
+
+/// How far right of the text a left table's `w:tblInd` draws it, in px
+/// (#2151): its edge `indent`, except where a flow view fits this table to
+/// its `fit` width (#1895: the caller passes `None` for one it does not
+/// scale, [`scales_to_view`], or while a table pen is on), where it is at
+/// most what the drawn `width` leaves of that, so a fitted table and its
+/// indent stay in the view (a quoted reply's table in a narrow mail
+/// pane). Never negative.
+pub fn fitted_indent(indent: f32, width: f32, fit: Option<f32>) -> f32 {
+    let indent = indent.max(0.0);
+    match fit {
+        Some(fit) => indent.min((fit - width).max(0.0)),
+        None => indent,
+    }
+}
+
+/// [`fitted_indent`] of table `t` in a view fitting tables to `fit` px
+/// (`None` with no fitting, or while a table pen is on): only a table the
+/// view scales ([`scales_to_view`]) has its indent cut (#2151 r2).
+pub fn table_indent(t: &Table, indent: f32, width: f32, fit: Option<f32>) -> f32 {
+    fitted_indent(indent, width, fit.filter(|_| scales_to_view(t)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1275,5 +1303,67 @@ mod tests {
         );
         assert_eq!(rows[1].before, 1000);
         assert_eq!(rows[1].cells[0].width, 2000);
+    }
+
+    /// A table an HTML page lays out in an indented block (#2151 r1): its
+    /// `pct` `tblW` is its room's share of the body, so a narrow flow view
+    /// still fits it as its share, and its indent is cut to what is left,
+    /// so the two stay in the view.
+    #[test]
+    fn an_imported_room_table_fits_a_narrow_view_with_its_indent_2151() {
+        for (page, share) in [
+            (
+                "<blockquote><table width=100%><tr><td>t</td></tr></table></blockquote>",
+                4491,
+            ),
+            (
+                "<div style='margin-left:40px'><table width=100%><tr><td>t</td></tr></table></div>",
+                4746,
+            ),
+            (
+                "<ul><li><table width=100%><tr><td>t</td></tr></table></li></ul>",
+                4746,
+            ),
+        ] {
+            let d =
+                docxcore::import::html::import_html(format!("<!DOCTYPE html>{page}").as_bytes())
+                    .unwrap();
+            let docxcore::model::Block::Table(t) = &d.body[0] else {
+                panic!("no table in {page}");
+            };
+            assert_eq!(wants(t), Wants::Pct(share), "{page}");
+            let fit = 3000;
+            let w: u32 = fitted_grid(t, Some(fit)).iter().sum();
+            assert_eq!(u64::from(w), u64::from(fit) * share / 5000, "{page}");
+            // At 15 twips a px, Web Layout's indent and width in that fit.
+            let edge = docxcore::table::left_edge(t, None) as f32 / 15.0;
+            let (w, fit) = (w as f32 / 15.0, fit as f32 / 15.0);
+            let indent = fitted_indent(edge, w, Some(fit));
+            assert!(indent + w <= fit + 0.01, "{page}: {indent} + {w} > {fit}");
+        }
+        // A `dxa` table is never scaled, so its caller keeps its whole
+        // indent (r2); a `pct` one is.
+        let mut fixed = new_table(1, 1, 4000, AutoFit::Default);
+        edit_table_props(&mut fixed, |p| {
+            p.set("<w:tblW w:w=\"4000\" w:type=\"dxa\"/>");
+            p.set("<w:tblInd w:w=\"708\" w:type=\"dxa\"/>");
+        });
+        assert!(!scales_to_view(&fixed));
+        let mut share = fixed.clone();
+        edit_table_props(&mut share, |p| {
+            p.set("<w:tblW w:w=\"4746\" w:type=\"pct\"/>")
+        });
+        assert!(scales_to_view(&share));
+        // Under a narrow fit: the `dxa` one keeps its 40 px, the `pct` one
+        // is cut to what it leaves.
+        assert_eq!(table_indent(&fixed, 40.0, 267.0, Some(280.0)), 40.0);
+        assert_eq!(table_indent(&share, 40.0, 265.0, Some(280.0)), 15.0);
+        assert_eq!(table_indent(&share, 40.0, 265.0, None), 40.0);
+        // Wide enough: the whole indent; Print Layout: always.
+        assert_eq!(fitted_indent(40.0, 300.0, Some(800.0)), 40.0);
+        assert_eq!(fitted_indent(40.0, 790.0, Some(800.0)), 10.0);
+        assert_eq!(fitted_indent(40.0, 900.0, Some(800.0)), 0.0);
+        assert_eq!(fitted_indent(40.0, 900.0, None), 40.0);
+        assert_eq!(fitted_indent(-5.0, 10.0, None), 0.0);
     }
 }

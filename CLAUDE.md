@@ -45,7 +45,8 @@ issue number to find its notes.
   pasted with only the characters XML can hold, `\u{0B}` a line break (#1993),
   an alignment tab deleted out of a field marker's run (#1463), a
   tracked clear of table cells keeping equations, Reject All (#1471),
-  the suite's markers from each level's `w:start` (#1989).
+  the suite's markers from each level's `w:start` (#1989), an item's
+  continuation keeping the count (#2151).
 - `docs/claude/suite-document.md`: before changing the suite's document tab: save-as
   names (#807), Home Font / Font Size boxes (#1361), File > Info Properties (#1364), the
   comment editor and its draft per tab (#1362, #1329), inline pictures (#1432), run
@@ -61,7 +62,7 @@ issue number to find its notes.
   list numbers, All caps and Small caps drawn, Table Styles tiles on a
   dark page, Switch Modes not persisted (#2087), a pasted picture in a
   link or a tracked change bringing its media (#1853), a placeholder
-  picture's Alt Text drawn in its frame (#1898).
+  picture's Alt Text drawn in its frame (#1898), `w:tblInd` drawn (#2151).
 - `docs/claude/pdf-export.md`: before changing PDF export: embedded fonts (#1508),
   borders, picture watermarks and unequal columns (#797), tables placed by
   their `w:jc` (#1930).
@@ -93,7 +94,9 @@ issue number to find its notes.
   `<picture>`, MHTML, SVG and WebP through a converter (#1898),
   whitespace-only paragraphs keeping a look drawn on spaces, an empty
   line's size on its mark (#1973), each `<ol>` its own count, `start`
-  and `value` (#1989).
+  and `value` (#1989), a block's box beside a child table, margins
+  through empty blocks, tables in indented blocks, a padding-less card's
+  quirky edges (#2151).
 - `docs/claude/email-html.md`: before changing `docxcore::export_email` (a `Document` as an
   e-mail body): inline styles only, lists and their `start`, safe links, `cid:` pictures and
   their media, the import round trip (#1948).

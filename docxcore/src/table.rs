@@ -250,6 +250,60 @@ pub fn h_align(t: &Table) -> HAlign {
     }
 }
 
+/// A `dxa` width child's `w:w` in twips: `nil` and an absent type are 0
+/// and `dxa`; `pct`, `auto` or anything unparsable is `None`.
+fn dxa_width(props: &PropsXml, name: &str) -> Option<i32> {
+    match props.attr(name, "w:type").as_deref() {
+        Some("nil") => return Some(0),
+        None | Some("dxa") => {}
+        Some(_) => return None,
+    }
+    props.attr(name, "w:w")?.trim().parse().ok()
+}
+
+/// `t`'s own `w:tblInd` in twips (#2151): a `dxa` (or untyped) one, else 0.
+/// A table style's is not read.
+pub fn left_indent(t: &Table) -> i32 {
+    dxa_width(&table_props(t), "w:tblInd").unwrap_or(0)
+}
+
+/// The left (or start) side of `props`' margins child `container`
+/// (`w:tcMar`, `w:tblCellMar`), in twips, when it is `dxa`.
+fn left_margin_of(props: &PropsXml, container: &str) -> Option<i32> {
+    let mar = PropsXml::parse(props.get(container)?, container, &[]);
+    dxa_width(&mar, "w:left").or_else(|| dxa_width(&mar, "w:start"))
+}
+
+/// The left cell margin Word measures an older-mode `w:tblInd` to (#2151):
+/// the first cell's `w:tcMar` left (or start), else the table's
+/// `w:tblCellMar`, else Word's 108 twips (0.08"). A table style's is not read.
+/// HTML import places its tables by the same margin.
+pub(crate) fn first_cell_left_margin(t: &Table) -> i32 {
+    t.rows
+        .first()
+        .and_then(|r| r.cells.first())
+        .and_then(|c| left_margin_of(&cell_props(c), "w:tcMar"))
+        .or_else(|| left_margin_of(&table_props(t), "w:tblCellMar"))
+        .unwrap_or(108)
+}
+
+/// Where a left-placed table's left edge sits right of its text's left, in
+/// twips (#2151): its [`left_indent`], which Word before 2013's layout
+/// (`compat` below 15, or no `compatibilityMode` at all, as the HTML and
+/// Markdown packages have) measures to the first cell's text, so that
+/// cell's left margin is taken off. Never left of the text: a Word
+/// document's `tblInd 0` table, which Word hangs its border into the
+/// margin by, stays where it was drawn before.
+pub fn left_edge(t: &Table, compat: Option<u32>) -> i32 {
+    let ind = left_indent(t);
+    let edge = if compat.is_some_and(|m| m >= 15) {
+        ind
+    } else {
+        ind.saturating_sub(first_cell_left_margin(t))
+    };
+    edge.max(0)
+}
+
 /// Edit a table's `w:tblPr` in place.
 pub fn edit_table_props(table: &mut Table, edit: impl FnOnce(&mut PropsXml)) {
     let mut p = table_props(table);
@@ -639,5 +693,38 @@ mod tests {
             c.raw_tcpr.as_deref(),
             Some("<w:tcPr><w:gridSpan w:val=\"2\"/><w:shd w:fill=\"FF0000\"/></w:tcPr>")
         );
+    }
+    /// #2151: `w:tblInd` read as twips, and the left edge Word draws.
+    #[test]
+    fn left_indent_reads_dxa_tbl_ind() {
+        let with = |tblpr: &str, tcpr: Option<&str>| {
+            let mut t = new_table(1, 1, 9000, AutoFit::Default);
+            t.raw_tblpr = Some(format!("<w:tblPr>{tblpr}</w:tblPr>"));
+            t.rows[0].cells[0].raw_tcpr = tcpr.map(str::to_string);
+            t
+        };
+        let t = with("<w:tblInd w:w=\"708\" w:type=\"dxa\"/>", None);
+        assert_eq!(left_indent(&t), 708);
+        // Older layout (no compatibilityMode, or 14): to the cell's text.
+        assert_eq!(left_edge(&t, None), 600);
+        assert_eq!(left_edge(&t, Some(14)), 600);
+        assert_eq!(left_edge(&t, Some(15)), 708);
+        assert_eq!(left_indent(&with("<w:tblInd w:w=\"300\"/>", None)), 300);
+        for other in ["nil", "pct", "auto"] {
+            let t = with(&format!("<w:tblInd w:w=\"500\" w:type=\"{other}\"/>"), None);
+            assert_eq!(left_indent(&t), 0, "{other}");
+        }
+        assert_eq!(left_indent(&with("", None)), 0);
+        // Never left of the text.
+        let t = with("<w:tblInd w:w=\"0\" w:type=\"dxa\"/>", None);
+        assert_eq!(left_edge(&t, None), 0);
+        let t = with("<w:tblInd w:w=\"-108\" w:type=\"dxa\"/>", None);
+        assert_eq!(left_edge(&t, Some(15)), 0);
+        // The table's cell margin, then the first cell's own.
+        let mar = "<w:tblInd w:w=\"708\" w:type=\"dxa\"/>\
+                   <w:tblCellMar><w:left w:w=\"0\" w:type=\"dxa\"/></w:tblCellMar>";
+        assert_eq!(left_edge(&with(mar, None), None), 708);
+        let tc = "<w:tcPr><w:tcMar><w:start w:w=\"200\" w:type=\"dxa\"/></w:tcMar></w:tcPr>";
+        assert_eq!(left_edge(&with(mar, Some(tc)), None), 508);
     }
 }

@@ -24,7 +24,19 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   1. The view's own rule, not Word's: every
   count restarts after a paragraph that is not a list item (docxy's own
   lists share numId 1 and 2); in a table they count on from cell to cell
-  (`TableListCounts`, `docs/claude/suite-document.md` §#2087). Not done:
+  (`TableListCounts`, `docs/claude/suite-document.md` §#2087). An item's
+  continuation does not restart them (#2151, `ListRun`): a paragraph
+  (its `indent`) or table (its `table::left_edge` in the package's
+  compat mode) between items whose left edge reaches the text indent of
+  the shallowest item counted since the last restart. An item's text
+  indent is its direct left, else its numbering level's `w:ind`; an
+  unknown one lets nothing continue, so docxy's own undefined lists and
+  an unindented block restart as before. The clipboard's HTML import
+  folds every `<ol>` onto numId 2, so a pasted
+  `<ol><li>a</ol><blockquote>q</blockquote><ol><li>b</ol>` draws b `2.`,
+  as Word draws one numId 2. Tests:
+  `list_markers_continue_across_an_items_continuation_2151`,
+  `imported_html_list_continuations_keep_the_count_2151`. Not done:
   `w:lvlOverride` / `w:startOverride` restarts.
 - The lists Bullets, Numbers, AutoCorrect's `* ` / `1. ` and another app's
   pasted list items (r3, `doc_paste::numbering_for_paste`) apply

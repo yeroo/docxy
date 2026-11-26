@@ -594,6 +594,10 @@ pub(crate) struct Builder<'b> {
     tables: Vec<TableAcc>,
     /// The body's [`TableAcc::tail`].
     body_tail: Tail,
+    /// The body's [`TableAcc::pending`].
+    body_pending: Tail,
+    /// The body's [`TableAcc::card_at`].
+    body_card_at: Option<usize>,
     /// Bookmarks waiting for the next content written (#1912): each `w:id`
     /// and name ([`Builder::bookmark`]).
     marks: Vec<(usize, String)>,
@@ -633,6 +637,14 @@ struct TableAcc {
     /// What the importer said of `blocks`' last paragraph, and how many
     /// blocks there were then ([`Builder::set_tail`]).
     tail: Tail,
+    /// A vertical box waiting for the next paragraph of `blocks`, and how
+    /// many blocks there were then (#2151, [`Builder::set_pending`]): the
+    /// bottom of a block that ended in a table, or an empty block's
+    /// margins, with no paragraph to carry them.
+    pending: Tail,
+    /// How many blocks there were when a card's table was the last one
+    /// pushed (#2151): that table is a card's.
+    card_at: Option<usize>,
 }
 
 /// A flow's [`FlowTail`] and how many blocks it held when it was said.
@@ -705,6 +717,8 @@ impl<'b> Builder<'b> {
             para: Vec::new(),
             tables: Vec::new(),
             body_tail: None,
+            body_pending: None,
+            body_card_at: None,
             marks: Vec::new(),
             marked: std::collections::HashSet::new(),
             para_marks: Vec::new(),
@@ -1182,6 +1196,89 @@ impl<'b> Builder<'b> {
             .map(|(_, tail)| tail)
     }
 
+    /// The flow's blocks, its pending box and where a card last ended in
+    /// it (#2151).
+    fn flow_parts(&self, in_table: bool) -> Option<(&Vec<Block>, Tail, Option<usize>)> {
+        match self.tables.last() {
+            Some(t) if in_table => Some((&t.blocks, t.pending, t.card_at)),
+            None if !in_table => Some((&self.body, self.body_pending, self.body_card_at)),
+            _ => None,
+        }
+    }
+
+    /// How many blocks the flow `depth` tables down holds (#2151): the body's
+    /// at 0, else that open table's cell's.
+    pub(crate) fn flow_len_at(&self, depth: usize) -> Option<usize> {
+        match depth {
+            0 => Some(self.body.len()),
+            d => self.tables.get(d - 1).map(|t| t.blocks.len()),
+        }
+    }
+
+    /// The box waiting for the flow's next paragraph (#2151), while nothing
+    /// has been added to the flow since it was said.
+    pub(crate) fn pending(&self, in_table: bool) -> Option<FlowTail> {
+        let (blocks, pending, _) = self.flow_parts(in_table)?;
+        pending
+            .filter(|(len, _)| *len == blocks.len())
+            .map(|(_, tail)| tail)
+    }
+
+    /// Keep `tail` for the flow's next paragraph (#2151), anchored on the
+    /// flow as it is now: a block added first makes it stale.
+    pub(crate) fn set_pending(&mut self, in_table: bool, tail: FlowTail) {
+        let slot = match self.tables.last_mut() {
+            Some(t) if in_table => (t.blocks.len(), &mut t.pending),
+            None if !in_table => (self.body.len(), &mut self.body_pending),
+            _ => return,
+        };
+        *slot.1 = Some((slot.0, tail));
+    }
+
+    /// Whether the flow's last block is a table (a nested one's
+    /// placeholder in a cell) that is not a card's (#2151).
+    pub(crate) fn ends_in_plain_table(&self, in_table: bool) -> bool {
+        self.flow_parts(in_table)
+            .is_some_and(|(blocks, _, card_at)| {
+                matches!(blocks.last(), Some(b) if matches!(b, Block::Table(_)) || html_table::is_placeholder(b))
+                    && card_at != Some(blocks.len())
+            })
+    }
+
+    /// The flow's length when its last block is a card's table (#2151).
+    pub(crate) fn card_end(&self, in_table: bool) -> Option<usize> {
+        let (blocks, _, card_at) = self.flow_parts(in_table)?;
+        card_at.filter(|&n| n == blocks.len())
+    }
+
+    /// The last paragraph's properties of the card whose table is the
+    /// flow's last block (#2151): laid out in the body, or waiting as a
+    /// nested table in a cell. `None` when its last cell ends otherwise.
+    pub(crate) fn card_last_para_mut(&mut self, in_table: bool) -> Option<&mut ParProps> {
+        fn last(blocks: &mut [Block]) -> Option<&mut ParProps> {
+            match blocks.last_mut() {
+                Some(Block::Paragraph(p)) => Some(&mut p.props),
+                _ => None,
+            }
+        }
+        self.card_end(in_table)?;
+        match self.tables.last_mut() {
+            Some(t) if in_table => {
+                let at = t.blocks.len().checked_sub(1)?;
+                let (i, raw) = t.html.as_mut()?.nested.last_mut()?;
+                if *i != at {
+                    return None;
+                }
+                last(&mut raw.rows.last_mut()?.last_mut()?.blocks)
+            }
+            None if !in_table => match self.body.last_mut()? {
+                Block::Table(t) => last(&mut t.rows.last_mut()?.cells.last_mut()?.blocks),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// The flow's last block's properties, if it is a paragraph.
     pub(crate) fn flow_last_mut(&mut self, in_table: bool) -> Option<&mut ParProps> {
         let index = self.flow_len(in_table)?.checked_sub(1)?;
@@ -1314,7 +1411,11 @@ impl<'b> Builder<'b> {
         }
         let t = self.top();
         let blocks = std::mem::take(&mut t.blocks);
+        // What is said of the cell's blocks goes with them: anchored on a
+        // block count only, it would match in the next cell (#2151 r1).
         t.tail = None;
+        t.pending = None;
+        t.card_at = None;
         t.cell_has_para = false;
         if let Some(h) = t.html.as_mut() {
             let cell = html_table::RawCell {
@@ -1385,8 +1486,25 @@ impl<'b> Builder<'b> {
             self.tables.pop();
             return;
         }
+        // The enclosing flow's length, to tell whether the card's table
+        // was pushed onto it (#2151).
+        let n = self.tables.len();
+        let below = |b: &Self| match n {
+            0 | 1 => b.body.len(),
+            _ => b.tables[n - 2].blocks.len(),
+        };
+        let before = below(self);
         self.end_row(props);
         self.end_table();
+        if self.tables.len() + 1 == n {
+            let after = below(self);
+            if after > before {
+                match self.tables.last_mut() {
+                    Some(t) => t.card_at = Some(after),
+                    None => self.body_card_at = Some(after),
+                }
+            }
+        }
     }
 
     /// Close every open table, innermost first.

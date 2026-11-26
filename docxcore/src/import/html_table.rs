@@ -326,10 +326,15 @@ pub(crate) struct Room {
     pub width: u32,
     /// The room is centred in the body (equal indents on both sides).
     pub centred: bool,
+    /// The body's width, which Word resolves a `pct` `tblW` against
+    /// (#2151 r1).
+    pub body: u32,
+    /// An indented block's room (#2151 r2): a percentage width is written
+    /// as its share of the body, so a flow view fits it as the block's
+    /// table. A centred fixed-width box's or a body card's room keeps it
+    /// as the twips it is, so the box's width stands.
+    pub body_share: bool,
 }
-
-/// Word's left cell margin when a table names none (Normal Table's 0.075").
-const WORD_CELL_MARGIN: u32 = 108;
 
 /// What a `<td>` / `<th>` says about itself, its row and its table.
 #[derive(Clone, Debug, PartialEq)]
@@ -751,20 +756,33 @@ fn layout_in(t: RawTable, avail: u32, declared: bool, budget: &Budget) -> Table 
         out_rows.push(row);
     }
 
-    let indent = spec
-        .room
-        .and_then(|room| place_in_room(&mut spec, room, &grid, avail));
-    Table {
+    let mut table = Table {
         grid,
         rows: out_rows,
-        raw_tblpr: Some(tblpr(&spec, indent)),
         ..Table::default()
-    }
+    };
+    let indent = match spec.room {
+        Some(room) => {
+            // Word measures the indent to the first cell's text: its own
+            // left padding (`tcMar`) if it has one, else the table's
+            // `cellpadding`, else Word's 108 (#2151).
+            table.raw_tblpr = Some(tblpr(&spec, None));
+            let margin = u32::try_from(crate::table::first_cell_left_margin(&table)).unwrap_or(0);
+            place_in_room(&mut spec, room, &table.grid, avail, margin)
+        }
+        None => None,
+    };
+    table.raw_tblpr = Some(tblpr(&spec, indent));
+    table
 }
 
 /// Place a table laid out in `room` (#2114, #1930 plan-2) on the body: its
 /// percentage width as the twips it is in the room (Word resolves `pct`
-/// against the body and would stretch it back), and `jc center` when it
+/// against the body and would stretch it back), or in an indented block's
+/// room ([`Room::body_share`]) as the share of the body those twips are
+/// (Word gets the same width, and a flow view fits a `pct` table to its
+/// width, #1895, where `dxa` would keep it wide: #2151 r1, r2), and
+/// `jc center` when it
 /// fills the room exactly or is centred in it and the room is centred in
 /// the body (its own `align` then moves nothing). Otherwise (a wider table
 /// too, which a browser starts at the room's left) no `jc` and the
@@ -772,10 +790,22 @@ fn layout_in(t: RawTable, avail: u32, declared: bool, budget: &Budget) -> Table 
 /// at the room's left, right or middle. A package with no
 /// `compatibilityMode` (the Markdown one) is laid out by Word in an older
 /// mode, where `tblInd` is measured to the first cell's text: its left
-/// cell margin is added.
-fn place_in_room(spec: &mut TableSpec, room: Room, grid: &[u32], avail: u32) -> Option<u32> {
+/// cell margin (`cell_margin`, its own padding or the table's, #2151) is
+/// added.
+fn place_in_room(
+    spec: &mut TableSpec,
+    room: Room,
+    grid: &[u32],
+    avail: u32,
+    cell_margin: u32,
+) -> Option<u32> {
     if let Some(w @ Width::Pct(_)) = spec.width {
-        spec.width = Some(Width::Twips(resolve(w, avail)));
+        let twips = resolve(w, avail);
+        spec.width = Some(if room.body_share {
+            Width::Pct(f64::from(twips) * 100.0 / f64::from(room.body.max(1)))
+        } else {
+            Width::Twips(twips)
+        });
     }
     let width: u32 = grid.iter().fold(0u32, |a, &w| a.saturating_add(w));
     let place = spec.jc.take();
@@ -792,7 +822,6 @@ fn place_in_room(spec: &mut TableSpec, room: Room, grid: &[u32], avail: u32) -> 
             Some("right") => free,
             _ => 0,
         };
-    let cell_margin = spec.cellpadding.map_or(WORD_CELL_MARGIN, px_twips);
     Some(offset.saturating_add(cell_margin).min(MAX_TWIPS))
 }
 
@@ -1434,6 +1463,8 @@ mod tests {
             indent: 1395,
             width: 9000,
             centred: true,
+            body: 11790,
+            body_share: false,
         };
         let table = |width, jc| {
             layout(

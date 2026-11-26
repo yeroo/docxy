@@ -11873,6 +11873,8 @@ fn bounds_probe(cell: UnitCell) -> AnyElement {
 /// where it sits across the text `column` it is drawn in (its x and width,
 /// window coordinates): `left` (at the column's left, as a table wider
 /// than it is), `center`, `right`, else `other`; `null` with no column.
+/// `inset` (#2151) is its left edge less the column's left, in px: where a
+/// `w:tblInd` put it (`null` with no column).
 fn painted_tables_json(
     tables: &PaintedTables,
     text_w: Option<f32>,
@@ -11924,6 +11926,10 @@ fn painted_tables_json(
                         Json::Bool(view.is_some() && right > 0. && right <= view_w + 1.),
                     ),
                     ("place", place),
+                    (
+                        "inset",
+                        column.map_or(Json::Null, |(cx, _)| round(f32::from(b.origin.x) - cx)),
+                    ),
                 ])
             })
             .collect(),
@@ -11949,6 +11955,10 @@ struct TableCtx<'a> {
     /// While a table pen is on (#763): where the tables and top-level
     /// paragraphs this frame lays out are recorded.
     draw: Option<std::rc::Rc<std::cell::RefCell<table_draw::DrawGeom>>>,
+    /// The package's `compatibilityMode` (#2151): below 15, or none, Word
+    /// measures a table's `w:tblInd` to its first cell's text
+    /// ([`docxcore::table::left_edge`]).
+    compat_mode: Option<u32>,
 }
 
 impl<'a> TableCtx<'a> {
@@ -11963,6 +11973,7 @@ impl<'a> TableCtx<'a> {
             cache: Default::default(),
             gridlines,
             draw: None,
+            compat_mode: pkg.and_then(Package::compatibility_mode),
         }
     }
 
@@ -36479,6 +36490,132 @@ mod repeat_tests {
         );
     }
 
+    /// An item's unnumbered continuation (#2151): a paragraph, or a table,
+    /// at its item's text indent, as an HTML import writes `<li>a<p>b</p>`,
+    /// keeps the count going, as a browser and Word number the next item.
+    #[test]
+    fn imported_html_list_continuations_keep_the_count_2151() {
+        let drawn = |html: &str| {
+            let pkg = docxcore::import::html::import_html_with(html.as_bytes(), &mut |_, _| None)
+                .unwrap()
+                .package();
+            let numbering = docxcore::numbering::parse_numbering_xml(
+                &pkg.part_text("word/numbering.xml").unwrap(),
+            );
+            list_markers_in(
+                &pkg.document.body,
+                Some(&numbering),
+                pkg.compatibility_mode(),
+            )
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+        };
+        let table = "<table><tr><td>t</td></tr></table>";
+        assert_eq!(
+            drawn("<ol><li>a<p>b</p></li><li>c</li></ol>"),
+            ["1. ", "2. "]
+        );
+        assert_eq!(
+            drawn("<ol><li><div>a</div><div>b</div></li><li>c</li></ol>"),
+            ["1. ", "2. "]
+        );
+        assert_eq!(
+            drawn("<ol><li>a<ul><li>x</li></ul>c</li><li>d</li></ol>"),
+            ["1. ", "\u{25E6} ", "2. "]
+        );
+        assert_eq!(
+            drawn(&format!("<ol><li>a{table}</li><li>c</li></ol>")),
+            ["1. ", "2. "]
+        );
+        // Separate lists still count on their own, a paragraph between or not.
+        assert_eq!(
+            drawn("<ol><li>a</ol><p>t</p><ol><li>b</ol>"),
+            ["1. ", "1. "]
+        );
+    }
+
+    /// A block between items continues their count only when it reaches
+    /// the shallowest one's text (#2151): an unindented paragraph or table,
+    /// or one less indented, restarts it as before, and so does any block
+    /// after an item whose text indent is unknown.
+    #[test]
+    fn list_markers_continue_across_an_items_continuation_2151() {
+        use docxcore::model::{Block, ParProps, Paragraph};
+        let item = |indent: i32| {
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    num_id: Some(NUM_DECIMAL),
+                    indent,
+                    ..ParProps::default()
+                },
+                content: Vec::new(),
+            })
+        };
+        let text = |indent: i32| {
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    indent,
+                    ..ParProps::default()
+                },
+                content: Vec::new(),
+            })
+        };
+        let table = |ind: i32| {
+            let mut t = docxcore::table::new_table(1, 1, 4000, docxcore::table::AutoFit::Default);
+            t.raw_tblpr = Some(format!(
+                "<w:tblPr><w:tblInd w:w=\"{ind}\" w:type=\"dxa\"/></w:tblPr>"
+            ));
+            Block::Table(t)
+        };
+        let s = |m: &str| Some(m.to_string());
+        let shown = |body: &[Block], compat: Option<u32>| list_markers_in(body, None, compat);
+        assert_eq!(
+            shown(&[item(720), text(720), item(720)], None),
+            [s("1. "), None, s("2. ")]
+        );
+        assert_eq!(
+            shown(&[item(720), text(1440), item(720)], None),
+            [s("1. "), None, s("2. ")]
+        );
+        for restart in [text(0), text(360), table(0)] {
+            assert_eq!(
+                shown(&[item(720), restart, item(720)], None),
+                [s("1. "), None, s("1. ")]
+            );
+        }
+        // An unknown text indent (no direct one, no numbering part).
+        assert_eq!(
+            shown(&[item(0), text(720), item(0)], None),
+            [s("1. "), None, s("1. ")]
+        );
+        // A table by its drawn edge: 828 less the 108 cell margin reaches
+        // 720 in the older layout; in Word 2013's it is at 828 already.
+        for compat in [None, Some(15)] {
+            assert_eq!(
+                shown(&[item(720), table(828), item(720)], compat),
+                [s("1. "), None, s("2. ")]
+            );
+        }
+        assert_eq!(
+            shown(&[item(720), table(720), item(720)], None),
+            [s("1. "), None, s("1. ")]
+        );
+        assert_eq!(
+            shown(&[item(720), table(720), item(720)], Some(15)),
+            [s("1. "), None, s("2. ")]
+        );
+        // A restart forgets the items before it: the next run's own indent
+        // decides.
+        assert_eq!(
+            shown(
+                &[item(360), text(0), item(1440), text(720), item(1440)],
+                None
+            ),
+            [s("1. "), None, s("1. "), None, s("1. ")]
+        );
+    }
+
     /// A table's list counts on from cell to cell (#2087): an item per row
     /// beside a cell of other text is 1., 2., 3., as Word draws it; a
     /// paragraph after an item in the same cell restarts it.
@@ -40756,13 +40893,26 @@ fn has_page_break(b: &Block) -> bool {
 /// from its `w:start` where the numbering defines the list (#1989: an HTML
 /// `<ol start>`), else from 1. The view's own rule, not Word's: every count
 /// restarts (to its start) after a paragraph that is not a list item
-/// (docxy's own lists share numId 1 and 2). Not done: `w:lvlOverride` /
-/// `w:startOverride` restarts.
+/// (docxy's own lists share numId 1 and 2), unless it is indented as far as
+/// the items' text, an item's continuation (#2151, [`ListRun`]). Not done:
+/// `w:lvlOverride` / `w:startOverride` restarts.
+#[cfg(test)]
 fn list_markers(
     body: &[Block],
     numbering: Option<&docxcore::numbering::Numbering>,
 ) -> Vec<Option<String>> {
-    list_markers_counting(body, numbering, &mut ListCounts::new(), true)
+    list_markers_in(body, numbering, None)
+}
+
+/// [`list_markers`] in a package whose `compatibilityMode` is `compat`
+/// (#2151): a table between items is placed by its `w:tblInd` as
+/// [`docxcore::table::left_edge`] measures it there.
+fn list_markers_in(
+    body: &[Block],
+    numbering: Option<&docxcore::numbering::Numbering>,
+    compat: Option<u32>,
+) -> Vec<Option<String>> {
+    list_markers_counting(body, numbering, compat, &mut ListCounts::new(), true)
 }
 
 /// Each list's count per level, for [`list_markers`], keyed by
@@ -40927,11 +41077,24 @@ fn list_level_numbered(
 /// numbers a list with an item per row 1, 2, 3. Within a cell a paragraph
 /// that is not a list item restarts the count only after an item of that
 /// cell, so a cell of other text beside the items keeps the count going.
-struct TableListCounts(ListCounts);
+struct TableListCounts {
+    counts: ListCounts,
+    /// The package's `compatibilityMode`, for [`list_markers_in`].
+    compat: Option<u32>,
+}
 
 impl TableListCounts {
+    #[cfg(test)]
     fn new() -> Self {
-        TableListCounts(ListCounts::new())
+        TableListCounts::in_package(None)
+    }
+
+    /// A table's counts in a package whose `compatibilityMode` is `compat`.
+    fn in_package(compat: Option<u32>) -> Self {
+        TableListCounts {
+            counts: ListCounts::new(),
+            compat,
+        }
     }
 
     /// The markers of the next cell's `blocks`.
@@ -40940,16 +41103,62 @@ impl TableListCounts {
         blocks: &[Block],
         numbering: Option<&docxcore::numbering::Numbering>,
     ) -> Vec<Option<String>> {
-        list_markers_counting(blocks, numbering, &mut self.0, false)
+        list_markers_counting(blocks, numbering, self.compat, &mut self.counts, false)
     }
 }
 
-/// [`list_markers`] from `counts` on, left as the last block leaves them. A
-/// block that is not a list item restarts every count when `restart_any`,
-/// or else only after a list item of `blocks`.
+/// The items counted since the counts last restarted (#2151): how far in
+/// the shallowest one's text starts, which a block between items must
+/// reach to be one's continuation (an HTML import writes `<li>a<p>b</p>`'s
+/// `b` at its item's text indent, and an `<li>`'s table indented to it).
+/// An item whose text indent is unknown (no direct one, and none its
+/// numbering level gives) lets no block continue it.
+#[derive(Default)]
+struct ListRun {
+    /// The least text indent of those items, in twips; `None` before one.
+    least: Option<i32>,
+    unknown: bool,
+}
+
+impl ListRun {
+    /// An item at `text` twips (`None`, unknown) is counted.
+    fn item(&mut self, text: Option<i32>) {
+        match text {
+            Some(t) => self.least = Some(self.least.map_or(t, |l| l.min(t))),
+            None => self.unknown = true,
+        }
+    }
+
+    /// Whether a block whose left edge is at `indent` twips continues the
+    /// items before it rather than restarting their counts.
+    fn continued_by(&self, indent: i32) -> bool {
+        !self.unknown && indent > 0 && self.least.is_some_and(|l| indent >= l)
+    }
+}
+
+/// How far in list item `p`'s text starts, in twips: its direct left
+/// indent, else its numbering level's; `None` when neither says (or says 0).
+fn item_text_indent(
+    p: &docxcore::model::Paragraph,
+    numbering: Option<&docxcore::numbering::Numbering>,
+) -> Option<i32> {
+    if p.props.has_direct_left_indent() {
+        return Some(p.props.indent).filter(|&i| i > 0);
+    }
+    numbering
+        .and_then(|n| n.level_indent(p.props.num_id?, p.props.ilvl.clamp(0, 8)))
+        .and_then(|i| i.left)
+        .filter(|&i| i > 0)
+}
+
+/// [`list_markers_in`] from `counts` on, left as the last block leaves
+/// them. A block that is not a list item restarts every count when
+/// `restart_any`, or else only after a list item of `blocks`, unless it
+/// continues the items before it ([`ListRun`]).
 fn list_markers_counting(
     body: &[Block],
     numbering: Option<&docxcore::numbering::Numbering>,
+    compat: Option<u32>,
     counts: &mut ListCounts,
     restart_any: bool,
 ) -> Vec<Option<String>> {
@@ -40962,10 +41171,12 @@ fn list_markers_counting(
     };
     let mut out = Vec::with_capacity(body.len());
     let mut had_item = false;
+    let mut run = ListRun::default();
     for b in body {
         let marker = match b {
             Block::Paragraph(p) if p.props.in_list() => {
                 had_item = true;
+                run.item(item_text_indent(p, numbering));
                 // OOXML's nine levels, as `Numbering::count` clamps them
                 // (#2087 r3): a negative or huge `w:ilvl` must not index or
                 // grow the counts.
@@ -40994,8 +41205,15 @@ fn list_markers_counting(
                 }
             }
             _ => {
-                if restart_any || had_item {
+                let indent = match b {
+                    Block::Paragraph(p) => Some(p.props.indent),
+                    Block::Table(t) => Some(docxcore::table::left_edge(t, compat)),
+                    _ => None,
+                };
+                let continues = indent.is_some_and(|i| run.continued_by(i));
+                if !continues && (restart_any || had_item) {
                     counts.clear();
+                    run = ListRun::default();
                 }
                 None
             }
@@ -42150,7 +42368,7 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
     let margin_rows = ctx.active && !hf && path.len() == 1 && ctx.ent.is_suite();
     let mut rows = Vec::new();
     // The cells' list numbers count on from cell to cell (#2087).
-    let mut list_counts = TableListCounts::new();
+    let mut list_counts = TableListCounts::in_package(ctx.tbl.compat_mode);
     for (ri, rb) in boxes.iter().enumerate() {
         let row = &t.rows[ri];
         let mut cells: Vec<AnyElement> = Vec::new();
@@ -42455,6 +42673,22 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
     // unknown, the table stays at the left.
     let room = ctx.fit_width.or(ctx.line_width).or(ctx.hf_width);
     let fits = room.is_some_and(|r| tw_px(widest.min(i32::MAX as u32) as i32, zoom) <= r + 0.5);
+    let align = table_view::h_align(t);
+    // A left table's `w:tblInd` moves it right of the text's left (#2151),
+    // whether or not it fits: Word keeps the indent on a wider one, and a
+    // left margin (unlike gpui's auto ones) never pushes it past the left,
+    // so the sideways scroll still reaches its right edge. A view that
+    // fits this table to its width (`fit`, not while a pen is on, and only
+    // a table it scales) cuts it to what the table leaves (r1, r2).
+    let indent = match align {
+        table_view::HAlign::Left => table_view::table_indent(
+            t,
+            tw_px(docxcore::table::left_edge(t, ctx.tbl.compat_mode), zoom),
+            tw_px(widest.min(i32::MAX as u32) as i32, zoom),
+            ctx.fit_width.filter(|_| fit.is_some()),
+        ),
+        _ => 0.0,
+    };
     v_flex()
         .relative()
         .flex_none()
@@ -42463,7 +42697,8 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
         // The flow column's 4 px below a top-level table (#1986), past its
         // own 8 px: a later `mb` replaces the bottom margin.
         .when(ctx.gap_below && path.len() == 1, |d| d.mb(px(8. + 4.)))
-        .when(fits, |d| match table_view::h_align(t) {
+        .when(indent > 0.0, |d| d.ml(px(indent)))
+        .when(fits, |d| match align {
             table_view::HAlign::Left => d,
             table_view::HAlign::Center => d.mx_auto(),
             table_view::HAlign::Right => d.ml_auto(),
@@ -48632,7 +48867,8 @@ impl Render for Docxy {
                     if self.draw_tool().is_some() {
                         tbl.draw = Some(self.draw_geom.clone());
                     }
-                    let markers = list_markers(&shown.body, tbl.numbering.as_deref());
+                    let markers =
+                        list_markers_in(&shown.body, tbl.numbering.as_deref(), tbl.compat_mode);
                     let body_range = editor.cell_range();
                     // Inline pictures (#1432), kept across frames in the tab.
                     let pictures = tab
