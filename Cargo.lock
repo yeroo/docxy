@@ -1123,6 +1123,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "integration_dependency_fixture"
+version = "0.0.0"
+
+[[package]]
 name = "integration_fixture"
 version = "0.0.0"
 

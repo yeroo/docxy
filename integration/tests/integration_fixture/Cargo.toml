@@ -22,6 +22,8 @@ workspace = true
 [features]
 # Leaves `dxi_call` out: a mode file cannot remove an export.
 missing-call = []
+# Windows: imports `fixture_needed.dll` by name, for the load-flags test.
+needs-dependency = []
 
 # Dependency-free on purpose: it implements the C ABI by hand, as a plugin in
 # any language would, rather than through docxy-integration's Rust types.

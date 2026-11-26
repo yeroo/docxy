@@ -303,7 +303,7 @@ What CI runs (`.github/workflows/ci.yml`):
   ctlcore, ribboncore, ribbonspec, backstagecore, docxy, xlsxy, projcore, projctl, yppxy,
   mppread, docxwasm, gridwasm, htmlbundle, mailcore, lookxy, editcore, comshimcore,
   xlcomshim, wordcomshim, uiharness, buildinfo, helpdocs, projcore/tests/plugin_fixture,
-  integration, integration/tests/integration_fixture):
+  integration, integration/tests/integration_fixture, integration/tests/dependency_fixture):
   `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo clippy -p docxy --all-targets --features html-export -- -D warnings`,
   `cargo test --workspace --locked --features docxy/html-export`.

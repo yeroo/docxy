@@ -1,0 +1,22 @@
+[package]
+name = "integration_dependency_fixture"
+description = "Test fixture: a library the fixture plugin's needs-dependency build imports, for docxy-integration's load-flags test."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+# The test copies the built file as `fixture_needed.dll`, the name the plugin
+# imports, which no build writes beside a test binary.
+[lib]
+name = "integration_dependency_fixture"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]

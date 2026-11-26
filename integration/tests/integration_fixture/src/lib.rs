@@ -181,8 +181,17 @@ fn is(mode: &[String], word: &str) -> bool {
     mode.first().is_some_and(|m| m == word)
 }
 
+#[cfg(all(windows, feature = "needs-dependency"))]
+#[link(name = "fixture_needed", kind = "raw-dylib")]
+unsafe extern "C" {
+    fn fixture_needed_value() -> u32;
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn dxi_abi() -> u32 {
+    #[cfg(all(windows, feature = "needs-dependency"))]
+    // SAFETY: no arguments; the import keeps the dependency in the import table.
+    let _ = unsafe { fixture_needed_value() };
     let mode = mode();
     if is(&mode, "abi0") {
         0
