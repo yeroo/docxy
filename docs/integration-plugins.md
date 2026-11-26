@@ -106,7 +106,7 @@ host keeps its own colour for it.
 
 | Role | What the host draws with it | The host takes it when (WCAG 2.x contrast) |
 |---|---|---|
-| `primary` | primary buttons, the selection, the focus ring | black or white text, whichever is higher, reaches 4.5:1 on it; that text is drawn on it |
+| `primary` | primary buttons, the selection, the focus ring | always; it draws black or white text on it, whichever has the higher contrast (one of them always reaches 4.5:1) |
 | `link` | links and the secondary accent | it reaches 4.5:1 on the theme's background |
 | `highlight` | small marks only (the active tab's, an unread mark), never a large fill | it reaches 4.5:1 on the theme's background |
 
