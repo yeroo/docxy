@@ -634,6 +634,15 @@ without one nothing changes.
   `projcore/tests/plugins.rs` round-trips them through `libloading`, and
   `yppxy/tests/plugins.rs` runs `--command fixture.rename`.
 
+## Integration plugins
+
+Beside format plugins, a host built on docxy's crates can load one
+**integration plugin**: a `dxi_*` shared library that gives it product names
+and icons, Microsoft 365 sign-in settings, a silent token source and the
+person's organization and desktop. The crate is `docxy-integration`
+(`integration/`); its contract, where a host finds the library and how it
+differs from a format plugin are in `docs/integration-plugins.md`.
+
 ## Desktop suite entry table
 
 The suite's Project tab edits Task Mode, Name, Duration, Start, Finish,

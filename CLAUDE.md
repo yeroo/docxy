@@ -302,7 +302,8 @@ What CI runs (`.github/workflows/ci.yml`):
 - The root workspace (`Cargo.toml` members: opccore, docxcore, pdffont, gridcore,
   ctlcore, ribboncore, ribbonspec, backstagecore, docxy, xlsxy, projcore, projctl, yppxy,
   mppread, docxwasm, gridwasm, htmlbundle, mailcore, lookxy, editcore, comshimcore,
-  xlcomshim, wordcomshim, uiharness, buildinfo, helpdocs, projcore/tests/plugin_fixture):
+  xlcomshim, wordcomshim, uiharness, buildinfo, helpdocs, projcore/tests/plugin_fixture,
+  integration, integration/tests/integration_fixture):
   `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo clippy -p docxy --all-targets --features html-export -- -D warnings`,
   `cargo test --workspace --locked --features docxy/html-export`.
