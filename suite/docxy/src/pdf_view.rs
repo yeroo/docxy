@@ -21,6 +21,7 @@ use worker::{
     PageMeta, Secret,
 };
 
+pub(crate) mod convert;
 pub(crate) mod form;
 pub(crate) mod host;
 pub(crate) mod render;

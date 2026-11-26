@@ -152,6 +152,11 @@ pub(crate) fn child_main(args: &[OsString]) -> Option<i32> {
         eprintln!("docxy: {FLAG} <rtf|html|pdf|recover|recover-text> <in> <out.docx>");
         return Some(EXIT_FAILED);
     };
+    // A PDF is read by PdfCraft here (#2257): on Linux under the PDF
+    // view's worker's own memory limit, which only a child may set.
+    if what == What::Pdf {
+        crate::pdf_view::worker::limit_memory();
+    }
     Some(run(what, Path::new(input), Path::new(output)))
 }
 
@@ -191,7 +196,7 @@ pub(crate) struct ConvertedDoc {
 }
 
 impl ConvertedDoc {
-    fn plain(doc: docxcore::model::Document) -> Self {
+    pub(crate) fn plain(doc: docxcore::model::Document) -> Self {
         ConvertedDoc { doc, base: None }
     }
 
@@ -231,7 +236,9 @@ pub(crate) fn convert_bytes(
                 base: Some(pkg),
             }))
         }
-        What::Pdf => plain(import::import_pdf(bytes)),
+        // With the layout, through PdfCraft (#2257); the text importer
+        // when that fails or keeps nothing.
+        What::Pdf => crate::pdf_view::convert::convert(bytes).map(Some),
         What::Recover => Ok(import::recover_docx_text(bytes)?.map(ConvertedDoc::plain)),
         What::RecoverText => match import::recover_docx_text(bytes)? {
             Some(doc) => Ok(Some(ConvertedDoc::plain(doc))),
