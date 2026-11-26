@@ -622,17 +622,32 @@ fn share_edges(rows: &mut [RowBox]) {
     }
 }
 
+/// Whether a flow view scales `t` to its width (#1895, [`fitted_grid`]):
+/// a `pct` or `auto` table; a `dxa` one keeps its grid (#2151 r2).
+pub fn scales_to_view(t: &Table) -> bool {
+    wants(t) != Wants::Fixed
+}
+
 /// How far right of the text a left table's `w:tblInd` draws it, in px
-/// (#2151): its edge `indent`, except in a flow view that fits tables to
-/// its `fit` width (#1895), where it is at most what the drawn `width`
-/// leaves of that, so a fitted table and its indent stay in the view (a
-/// quoted reply's table in a narrow mail pane). Never negative.
+/// (#2151): its edge `indent`, except where a flow view fits this table to
+/// its `fit` width (#1895: the caller passes `None` for one it does not
+/// scale, [`scales_to_view`], or while a table pen is on), where it is at
+/// most what the drawn `width` leaves of that, so a fitted table and its
+/// indent stay in the view (a quoted reply's table in a narrow mail
+/// pane). Never negative.
 pub fn fitted_indent(indent: f32, width: f32, fit: Option<f32>) -> f32 {
     let indent = indent.max(0.0);
     match fit {
         Some(fit) => indent.min((fit - width).max(0.0)),
         None => indent,
     }
+}
+
+/// [`fitted_indent`] of table `t` in a view fitting tables to `fit` px
+/// (`None` with no fitting, or while a table pen is on): only a table the
+/// view scales ([`scales_to_view`]) has its indent cut (#2151 r2).
+pub fn table_indent(t: &Table, indent: f32, width: f32, fit: Option<f32>) -> f32 {
+    fitted_indent(indent, width, fit.filter(|_| scales_to_view(t)))
 }
 
 #[cfg(test)]
@@ -1326,6 +1341,24 @@ mod tests {
             let indent = fitted_indent(edge, w, Some(fit));
             assert!(indent + w <= fit + 0.01, "{page}: {indent} + {w} > {fit}");
         }
+        // A `dxa` table is never scaled, so its caller keeps its whole
+        // indent (r2); a `pct` one is.
+        let mut fixed = new_table(1, 1, 4000, AutoFit::Default);
+        edit_table_props(&mut fixed, |p| {
+            p.set("<w:tblW w:w=\"4000\" w:type=\"dxa\"/>");
+            p.set("<w:tblInd w:w=\"708\" w:type=\"dxa\"/>");
+        });
+        assert!(!scales_to_view(&fixed));
+        let mut share = fixed.clone();
+        edit_table_props(&mut share, |p| {
+            p.set("<w:tblW w:w=\"4746\" w:type=\"pct\"/>")
+        });
+        assert!(scales_to_view(&share));
+        // Under a narrow fit: the `dxa` one keeps its 40 px, the `pct` one
+        // is cut to what it leaves.
+        assert_eq!(table_indent(&fixed, 40.0, 267.0, Some(280.0)), 40.0);
+        assert_eq!(table_indent(&share, 40.0, 265.0, Some(280.0)), 15.0);
+        assert_eq!(table_indent(&share, 40.0, 265.0, None), 40.0);
         // Wide enough: the whole indent; Print Layout: always.
         assert_eq!(fitted_indent(40.0, 300.0, Some(800.0)), 40.0);
         assert_eq!(fitted_indent(40.0, 790.0, Some(800.0)), 10.0);

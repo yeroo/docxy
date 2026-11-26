@@ -42677,13 +42677,15 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
     // A left table's `w:tblInd` moves it right of the text's left (#2151),
     // whether or not it fits: Word keeps the indent on a wider one, and a
     // left margin (unlike gpui's auto ones) never pushes it past the left,
-    // so the sideways scroll still reaches its right edge. A view fitting
-    // tables to its width cuts it to what the table leaves (r1).
+    // so the sideways scroll still reaches its right edge. A view that
+    // fits this table to its width (`fit`, not while a pen is on, and only
+    // a table it scales) cuts it to what the table leaves (r1, r2).
     let indent = match align {
-        table_view::HAlign::Left => table_view::fitted_indent(
+        table_view::HAlign::Left => table_view::table_indent(
+            t,
             tw_px(docxcore::table::left_edge(t, ctx.tbl.compat_mode), zoom),
             tw_px(widest.min(i32::MAX as u32) as i32, zoom),
-            ctx.fit_width,
+            ctx.fit_width.filter(|_| fit.is_some()),
         ),
         _ => 0.0,
     };
