@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::model::{Block, Document, Paragraph};
+use crate::model::{Block, Document, Paragraph, RunProps};
 use crate::styles::StyleSheet;
 use crate::xml::{Event, XmlParser};
 
@@ -43,6 +43,9 @@ struct Level {
     p_style: Option<String>,
     /// `w:pPr/w:ind`: the indent an item at this level takes (#2231).
     indent: LevelIndent,
+    /// `w:rPr`: what the level's number is drawn in, over its paragraph
+    /// mark's look (#2002).
+    run_props: Option<RunProps>,
 }
 
 impl Default for Level {
@@ -53,6 +56,7 @@ impl Default for Level {
             start: 1,
             p_style: None,
             indent: LevelIndent::default(),
+            run_props: None,
         }
     }
 }
@@ -126,6 +130,57 @@ impl Numbering {
         (ind.left.is_some() || ind.first.is_some()).then_some(ind)
     }
 
+    /// Level `ilvl` of list `num_id`'s own run properties (`w:lvl/w:rPr`),
+    /// a list-style link followed; `None` when the list or the level is not
+    /// defined or the level has no `w:rPr` (#2002).
+    pub fn level_run_props(&self, num_id: i32, ilvl: i32) -> Option<&RunProps> {
+        let (_, abs) = self.resolve(num_id)?;
+        abs.levels
+            .get(usize::try_from(ilvl).ok()?)?
+            .run_props
+            .as_ref()
+    }
+
+    /// What level `ilvl` of list `num_id` draws its number in (#2002): the
+    /// paragraph mark's look `mark` with the level's `w:rPr` over it, as
+    /// Word draws it. Of what a list number is drawn in: bold and italic
+    /// (on, or an explicit off), colour (an explicit `auto` drops the
+    /// mark's), size and font. A bullet level keeps the mark's font: the
+    /// view draws its own `•`/`◦`, not the level's `w:lvlText` glyph, which
+    /// its font (Symbol, Wingdings) maps. `None` when the level has no
+    /// `w:rPr` ([`Self::level_run_props`]): the number is the mark's.
+    pub fn marker_props(&self, num_id: i32, ilvl: i32, mark: &RunProps) -> Option<RunProps> {
+        use crate::styles::has_raw_child;
+        let level = self.level_run_props(num_id, ilvl)?;
+        let bullet = self
+            .level(num_id, ilvl)
+            .is_some_and(|l| l.format == NumFmt::Bullet);
+        let mut out = mark.clone();
+        let toggle = |on: bool, local: &str, mark: bool| {
+            if on {
+                true
+            } else if has_raw_child(&level.raw_props, local) {
+                false
+            } else {
+                mark
+            }
+        };
+        out.bold = toggle(level.bold, "b", mark.bold);
+        out.italic = toggle(level.italic, "i", mark.italic);
+        if level.color.is_some() {
+            out.color = level.color.clone();
+        } else if crate::table_styles::explicit_auto_color(level) {
+            out.color = None;
+        }
+        if level.size_half_pts.is_some() {
+            out.size_half_pts = level.size_half_pts;
+        }
+        if level.font.is_some() && !bullet {
+            out.font = level.font.clone();
+        }
+        Some(out)
+    }
+
     /// The abstract numbering list `num_id` counts in, a list-style link
     /// followed; `None` when the numbering does not define it (#2087). Lists
     /// sharing one abstract share their counts, as [`compute_markers`]
@@ -161,7 +216,15 @@ impl Numbering {
         counters: &mut HashMap<i32, Vec<i32>>,
     ) -> Option<String> {
         let (absn, ilvl, c) = self.count(num_id, ilvl, counters)?;
-        let level = absn.levels.get(ilvl).cloned().unwrap_or_default();
+        // Borrowed: a level holds its run properties (#2002).
+        let default;
+        let level = match absn.levels.get(ilvl) {
+            Some(l) => l,
+            None => {
+                default = Level::default();
+                &default
+            }
+        };
         if level.fmt == NumFmt::Bullet {
             return Some(bullet_for(ilvl));
         }
@@ -231,7 +294,15 @@ impl Numbering {
         counters: &mut HashMap<i32, Vec<i32>>,
     ) -> Option<String> {
         let (absn, ilvl, c) = self.count(num_id, ilvl, counters)?;
-        let level = absn.levels.get(ilvl).cloned().unwrap_or_default();
+        // Borrowed: a level holds its run properties (#2002).
+        let default;
+        let level = match absn.levels.get(ilvl) {
+            Some(l) => l,
+            None => {
+                default = Level::default();
+                &default
+            }
+        };
         if level.fmt == NumFmt::Bullet {
             return None;
         }
@@ -424,6 +495,12 @@ fn parse_level(p: &mut XmlParser) -> Level {
                     }
                     "w:pPr" => {
                         lvl.indent = parse_level_ind(p);
+                        continue;
+                    }
+                    "w:rPr" => {
+                        let mut props = RunProps::default();
+                        crate::load::parse_rpr(p, &mut props);
+                        lvl.run_props = Some(props);
                         continue;
                     }
                     _ => {}
@@ -693,6 +770,116 @@ mod tests {
         assert!(!n.defines(3), "an unresolved link defines nothing");
         assert_eq!(n.level_indent(3, 0), None);
         assert_eq!(n.level(3, 0), None);
+    }
+
+    /// #2002: a level's `w:rPr` is read (bold, colour, size, font, an
+    /// explicit off kept), through a list-style link too; a level without
+    /// one, an undefined level or list, has none.
+    #[test]
+    fn level_rpr_is_read_2002() {
+        let n = parse_numbering_xml(
+            r#"<w:numbering>
+            <w:abstractNum w:abstractNumId="1"><w:styleLink w:val="Corp"/>
+              <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/>
+                <w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>
+                <w:rPr><w:rFonts w:ascii="Georgia" w:hAnsi="Georgia"/><w:b/><w:color w:val="ff0000"/><w:sz w:val="28"/></w:rPr></w:lvl>
+              <w:lvl w:ilvl="1"><w:numFmt w:val="lowerLetter"/><w:rPr><w:b w:val="0"/><w:i/></w:rPr><w:lvlText w:val="%2)"/></w:lvl>
+              <w:lvl w:ilvl="2"><w:numFmt w:val="decimal"/></w:lvl>
+            </w:abstractNum>
+            <w:abstractNum w:abstractNumId="2"><w:numStyleLink w:val="Corp"/></w:abstractNum>
+            <w:num w:numId="3"><w:abstractNumId w:val="1"/></w:num>
+            <w:num w:numId="4"><w:abstractNumId w:val="2"/></w:num>
+            </w:numbering>"#,
+        );
+        for num_id in [3, 4] {
+            let l0 = n.level_run_props(num_id, 0).expect("level 0 has a w:rPr");
+            assert!(l0.bold && !l0.italic);
+            assert_eq!(l0.color.as_deref(), Some("FF0000"));
+            assert_eq!(l0.size_half_pts, Some(28));
+            assert_eq!(l0.font.as_deref(), Some("Georgia"));
+            let l1 = n.level_run_props(num_id, 1).expect("level 1 has a w:rPr");
+            assert!(!l1.bold && l1.italic);
+            assert!(crate::styles::has_raw_child(&l1.raw_props, "b"));
+            assert_eq!(n.level_run_props(num_id, 2), None);
+            assert_eq!(n.level_run_props(num_id, 3), None);
+            assert_eq!(n.level_run_props(num_id, -1), None);
+        }
+        assert_eq!(n.level_run_props(9, 0), None);
+        // The rest of the level still reads past its w:rPr.
+        assert_eq!(n.level(3, 1).map(|l| l.text), Some("%2)".to_string()));
+        assert_eq!(n.level_indent(3, 0).and_then(|i| i.left), Some(720));
+    }
+
+    /// #2002: the level's `w:rPr` over the paragraph mark's look: each of
+    /// bold, italic, colour, size and font where the level sets it, the
+    /// mark's where it does not; an explicit off and an explicit `auto`
+    /// colour clear the mark's; a bullet level keeps the mark's font; no
+    /// `w:rPr` gives `None`.
+    #[test]
+    fn marker_props_lays_the_level_over_the_mark_2002() {
+        let n = parse_numbering_xml(
+            r#"<w:numbering><w:abstractNum w:abstractNumId="0">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:rPr><w:rFonts w:ascii="Georgia"/><w:b/><w:color w:val="FF0000"/><w:sz w:val="28"/></w:rPr></w:lvl>
+            <w:lvl w:ilvl="1"><w:numFmt w:val="decimal"/><w:rPr><w:b w:val="0"/><w:i w:val="0"/><w:color w:val="auto"/></w:rPr></w:lvl>
+            <w:lvl w:ilvl="2"><w:numFmt w:val="bullet"/><w:lvlText w:val="&#xF0B7;"/><w:rPr><w:rFonts w:ascii="Symbol" w:hAnsi="Symbol" w:hint="default"/><w:i/><w:color w:val="00B050"/></w:rPr></w:lvl>
+            <w:lvl w:ilvl="3"><w:numFmt w:val="decimal"/><w:rPr><w:rFonts w:hint="default"/></w:rPr></w:lvl>
+            <w:lvl w:ilvl="4"><w:numFmt w:val="decimal"/></w:lvl>
+            </w:abstractNum><w:num w:numId="5"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
+        );
+        let mark = RunProps {
+            bold: true,
+            italic: true,
+            color: Some("000000".into()),
+            size_half_pts: Some(24),
+            font: Some("Segoe UI".into()),
+            ..RunProps::default()
+        };
+        let on = n.marker_props(5, 0, &mark).unwrap();
+        assert!(on.bold && on.italic);
+        assert_eq!(on.color.as_deref(), Some("FF0000"));
+        assert_eq!(on.size_half_pts, Some(28));
+        assert_eq!(on.font.as_deref(), Some("Georgia"));
+        let off = n.marker_props(5, 1, &mark).unwrap();
+        assert!(
+            !off.bold && !off.italic,
+            "an explicit off clears the mark's"
+        );
+        assert_eq!(off.color, None, "an explicit auto colour clears the mark's");
+        assert_eq!(off.size_half_pts, Some(24));
+        assert_eq!(off.font.as_deref(), Some("Segoe UI"));
+        let bullet = n.marker_props(5, 2, &mark).unwrap();
+        assert_eq!(
+            bullet.font.as_deref(),
+            Some("Segoe UI"),
+            "a bullet keeps the mark's font"
+        );
+        assert!(bullet.bold && bullet.italic);
+        assert_eq!(bullet.color.as_deref(), Some("00B050"));
+        // A level setting nothing drawn keeps the mark's look whole.
+        let hint = n.marker_props(5, 3, &mark).unwrap();
+        assert_eq!(
+            (
+                hint.bold,
+                hint.italic,
+                hint.color,
+                hint.size_half_pts,
+                hint.font
+            ),
+            (
+                true,
+                true,
+                Some("000000".into()),
+                Some(24),
+                Some("Segoe UI".into())
+            )
+        );
+        // Off where the level is on: on; the mark's plain look elsewhere.
+        let plain = RunProps::default();
+        let from_plain = n.marker_props(5, 0, &plain).unwrap();
+        assert!(from_plain.bold && !from_plain.italic);
+        assert_eq!(n.marker_props(5, 4, &mark), None);
+        assert_eq!(n.marker_props(5, 9, &mark), None);
+        assert_eq!(n.marker_props(6, 0, &mark), None);
     }
 
     const NUM_XML: &str = r#"<w:numbering>

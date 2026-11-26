@@ -2815,7 +2815,7 @@ impl RprPairs {
     }
 }
 
-fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
+pub(crate) fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
     let mut pairs = RprPairs::default();
     loop {
         match p.next() {
