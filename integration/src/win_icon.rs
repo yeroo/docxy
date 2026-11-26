@@ -41,13 +41,16 @@ pub fn pick_image(ico: &[u8], size: u32) -> Option<&[u8]> {
 }
 
 /// Give the window `hwnd` (a Win32 `HWND`, as `raw-window-handle` gives it)
-/// the big and small images of `ico`.
+/// the big and small images of `ico`. The icons an earlier call set are
+/// destroyed; the last call's two stay with the window, as Windows does not
+/// destroy a window's own icons with it.
 #[cfg(windows)]
 pub fn set_window_icon(hwnd: isize, ico: &[u8]) -> Result<(), String> {
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateIconFromResourceEx, GetSystemMetrics, ICON_BIG, ICON_SMALL, LR_DEFAULTCOLOR,
-        SM_CXICON, SM_CXSMICON, SendMessageW, WM_SETICON,
+        CreateIconFromResourceEx, DestroyIcon, GCLP_HICON, GCLP_HICONSM, GetClassLongPtrW,
+        GetSystemMetrics, ICON_BIG, ICON_SMALL, LR_DEFAULTCOLOR, SM_CXICON, SM_CXSMICON,
+        SendMessageW, WM_SETICON,
     };
     // The version `CreateIconFromResourceEx` takes for icon images.
     const ICON_FORMAT: u32 = 0x0003_0000;
@@ -76,7 +79,21 @@ pub fn set_window_icon(hwnd: isize, ico: &[u8]) -> Result<(), String> {
         }
         // SAFETY: a message with an icon handle; an `hwnd` that is no window
         // makes the call fail, nothing more.
-        unsafe { SendMessageW(hwnd as HWND, WM_SETICON, kind as usize, icon as isize) };
+        let previous =
+            unsafe { SendMessageW(hwnd as HWND, WM_SETICON, kind as usize, icon as isize) };
+        // `WM_SETICON` answers the window's own earlier icon. The class's icons
+        // are shared by its windows, so neither is destroyed here.
+        // SAFETY: reads the class's icon handles.
+        let class = unsafe {
+            [
+                GetClassLongPtrW(hwnd as HWND, GCLP_HICON),
+                GetClassLongPtrW(hwnd as HWND, GCLP_HICONSM),
+            ]
+        };
+        if previous != 0 && !class.contains(&(previous as usize)) {
+            // SAFETY: an icon an earlier call made, no longer the window's.
+            unsafe { DestroyIcon(previous as _) };
+        }
     }
     Ok(())
 }
@@ -154,8 +171,8 @@ mod tests {
     #[test]
     fn a_window_takes_the_icon() {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, ICON_BIG, ICON_SMALL, SendMessageW, WM_GETICON,
-            WS_OVERLAPPED,
+            CreateWindowExW, DestroyIcon, DestroyWindow, ICON_BIG, ICON_SMALL, SendMessageW,
+            WM_GETICON, WS_OVERLAPPED,
         };
         let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
         // SAFETY: a hidden window of a system class, destroyed below.
@@ -183,11 +200,24 @@ mod tests {
         assert_eq!(icon(ICON_BIG), 0);
         let result = set_window_icon(hwnd as isize, &ico(&[16, 32, 48]));
         let (big, small) = (icon(ICON_BIG), icon(ICON_SMALL));
+        // A second icon replaces the first, which is destroyed: destroying
+        // it again fails.
+        let again = set_window_icon(hwnd as isize, &ico(&[16, 32, 48]));
+        let (big2, small2) = (icon(ICON_BIG), icon(ICON_SMALL));
+        // SAFETY: each handle is an icon the calls made or one destroyed.
+        let destroyed = |h: isize| unsafe { DestroyIcon(h as _) } == 0;
+        let (old_destroyed, new_alive) = (
+            [destroyed(big), destroyed(small)],
+            [!destroyed(big2), !destroyed(small2)],
+        );
         // SAFETY: the window made above.
         unsafe { DestroyWindow(hwnd) };
         assert_eq!(result, Ok(()));
+        assert_eq!(again, Ok(()));
         assert_ne!(big, 0);
         assert_ne!(small, 0);
+        assert_eq!(old_destroyed, [true, true]);
+        assert_eq!(new_alive, [true, true]);
         assert_eq!(
             set_window_icon(0, b"not an icon"),
             Err("the icon is not an .ico file".into())
