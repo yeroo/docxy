@@ -1,5 +1,6 @@
 //! The host against the fixture plugin (`tests/integration_fixture`), built
 //! and copied into a scratch plugin folder per test, its mode file beside it.
+#![cfg(feature = "host")]
 
 use docxy_integration::host::{
     Deadlines, HostConfig, Integration, Source, Status, load_from, plugin_dir,
