@@ -1292,3 +1292,991 @@ test doc pdf-save-on-close: matches the catalogue
   assert dialog is pdf-save-on-close
   call dialog-catalog-check {}
   call real-key {"key":"escape"}
+
+test doc pdf-print: matches the catalogue
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc pdf-print/printer: focus by click
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"copies"}
+  call field-read {"dialog-field":"printer"}
+  assert reply.focused is false
+  call pointer-click {"dialog-control":"printer"}
+  call field-read {"dialog-field":"printer"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc pdf-print/printer: Up and Down step
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"printer"}
+  call field-read {"dialog-field":"printer"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"printer"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"printer"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"printer"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc pdf-print/copies: focus by click
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"range"}
+  call field-read {"dialog-field":"copies"}
+  assert reply.focused is false
+  call pointer-click {"dialog-field":"copies"}
+  call field-read {"dialog-field":"copies"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc pdf-print/copies: focus by Tab
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"range"}
+  call field-read {"dialog-field":"copies"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"copies"}
+  call field-read {"dialog-field":"copies"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc pdf-print/copies: types
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"copies"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call field-read {"dialog-field":"copies"}
+  assert reply.value is 2
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc pdf-print/copies: edits
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"copies"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"copies"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"copies"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"copies"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"copies"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"copies"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc pdf-print/copies: select-all replaces
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"copies"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"copies"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"copies"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc pdf-print/copies: pastes
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"copies"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"copies"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc pdf-print/copies: copies
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"copies"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc pdf-print/copies: OK applies
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"copies"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-key {"key":"enter"}
+  assert dialog is not pdf-print
+
+test doc pdf-print/copies: Escape cancels
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"copies"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not pdf-print
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"copies"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc pdf-print/copies: refuses invalid
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"copies"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"copies"}
+  assert reply.value is 2
+  call real-key {"key":"escape"}
+
+test doc pdf-print/range: focus by click
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"copies"}
+  call field-read {"dialog-field":"range"}
+  assert reply.focused is false
+  call pointer-click {"dialog-field":"range"}
+  call field-read {"dialog-field":"range"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc pdf-print/range: focus by Tab
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"copies"}
+  call field-read {"dialog-field":"range"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"range"}
+  call field-read {"dialog-field":"range"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc pdf-print/range: types
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is 1
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc pdf-print/range: edits
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"range"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"range"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc pdf-print/range: select-all replaces
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"range"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc pdf-print/range: pastes
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc pdf-print/range: copies
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc pdf-print/range: OK applies
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1"}
+  call real-key {"key":"enter"}
+  assert dialog is not pdf-print
+
+test doc pdf-print/range: Escape cancels
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not pdf-print
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc pdf-print/percent: focus by click
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"copies"}
+  call field-read {"dialog-field":"percent"}
+  assert reply.focused is false
+  call pointer-click {"dialog-field":"percent"}
+  call field-read {"dialog-field":"percent"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc pdf-print/percent: focus by Tab
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"copies"}
+  call field-read {"dialog-field":"percent"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"percent"}
+  call field-read {"dialog-field":"percent"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc pdf-print/percent: types
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"percent"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"50"}
+  call field-read {"dialog-field":"percent"}
+  assert reply.value is 50
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc pdf-print/percent: edits
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"percent"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"percent"}
+  assert reply.value is 123
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"percent"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"percent"}
+  assert reply.value is 13
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"percent"}
+  assert reply.caret is 1
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"percent"}
+  assert reply.value is 193
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc pdf-print/percent: select-all replaces
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"percent"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"percent"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"9"}
+  call field-read {"dialog-field":"percent"}
+  assert reply.value is 9
+  call real-key {"key":"escape"}
+
+test doc pdf-print/percent: pastes
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"42"}
+  call pointer-click {"dialog-field":"percent"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"percent"}
+  assert reply.value is 42
+  call real-key {"key":"escape"}
+
+test doc pdf-print/percent: copies
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"percent"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1234"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is 1234
+  call real-key {"key":"escape"}
+
+test doc pdf-print/percent: OK applies
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"percent"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"50"}
+  call real-key {"key":"enter"}
+  assert dialog is not pdf-print
+
+test doc pdf-print/percent: Escape cancels
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"percent"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"77"}
+  call real-key {"key":"escape"}
+  assert dialog is not pdf-print
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"percent"}
+  assert reply.value is not 77
+  call real-key {"key":"escape"}
+
+test doc pdf-print/percent: refuses invalid
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"percent"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"50"}
+  call real-type {"text":"x"}
+  call field-read {"dialog-field":"percent"}
+  assert reply.value is 50
+  call real-key {"key":"escape"}
+
+test doc pdf-print/paper: focus by click
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"copies"}
+  call field-read {"dialog-field":"paper"}
+  assert reply.focused is false
+  call pointer-click {"dialog-control":"paper"}
+  call field-read {"dialog-field":"paper"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc pdf-print/paper: Up and Down step
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"paper"}
+  call field-read {"dialog-field":"paper"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"paper"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"paper"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"paper"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc pdf-print/content: focus by click
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"copies"}
+  call field-read {"dialog-field":"content"}
+  assert reply.focused is false
+  call pointer-click {"dialog-control":"content"}
+  call field-read {"dialog-field":"content"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc pdf-print/content: Up and Down step
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  key ctrl+p
+  assert dialog is pdf-print
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"content"}
+  call field-read {"dialog-field":"content"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"content"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"content"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"content"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc pdf-export-png: matches the catalogue
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-png"}
+  assert dialog is pdf-export-png
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc pdf-export-png/range: focus by click
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-png"}
+  assert dialog is pdf-export-png
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"dpi"}
+  call field-read {"dialog-field":"range"}
+  assert reply.focused is false
+  call pointer-click {"dialog-field":"range"}
+  call field-read {"dialog-field":"range"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc pdf-export-png/range: focus by Tab
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-png"}
+  assert dialog is pdf-export-png
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"dpi"}
+  call field-read {"dialog-field":"range"}
+  assert reply.focused is false
+  call real-key {"key":"tab","to-field":"range"}
+  call field-read {"dialog-field":"range"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc pdf-export-png/range: types
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-png"}
+  assert dialog is pdf-export-png
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is 1
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc pdf-export-png/range: edits
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-png"}
+  assert dialog is pdf-export-png
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"range"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"range"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc pdf-export-png/range: select-all replaces
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-png"}
+  assert dialog is pdf-export-png
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"range"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc pdf-export-png/range: pastes
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-png"}
+  assert dialog is pdf-export-png
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc pdf-export-png/range: copies
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-png"}
+  assert dialog is pdf-export-png
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc pdf-export-png/range: OK applies
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-png"}
+  assert dialog is pdf-export-png
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1"}
+  call real-key {"key":"enter"}
+  assert dialog is not pdf-export-png
+
+test doc pdf-export-png/range: Escape cancels
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-png"}
+  assert dialog is pdf-export-png
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not pdf-export-png
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-png"}
+  assert dialog is pdf-export-png
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}
+
+test doc pdf-export-png/dpi: focus by click
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-png"}
+  assert dialog is pdf-export-png
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"range"}
+  call field-read {"dialog-field":"dpi"}
+  assert reply.focused is false
+  call pointer-click {"dialog-control":"dpi"}
+  call field-read {"dialog-field":"dpi"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc pdf-export-png/dpi: Up and Down step
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-png"}
+  assert dialog is pdf-export-png
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"dpi"}
+  call field-read {"dialog-field":"dpi"}
+  assert reply.focused is true
+  call real-key {"key":"down"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"dpi"}
+  assert reply.index is not 0
+  assert reply.index is not null
+  call real-key {"key":"up","times":100}
+  call field-read {"dialog-field":"dpi"}
+  assert reply.index is 0
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"dpi"}
+  assert reply.index is 1
+  call real-key {"key":"escape"}
+
+test doc pdf-export-pdf: matches the catalogue
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-pdf"}
+  assert dialog is pdf-export-pdf
+  call dialog-catalog-check {}
+  call real-key {"key":"escape"}
+
+test doc pdf-export-pdf/range: focus by click
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-pdf"}
+  assert dialog is pdf-export-pdf
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"range"}
+  call field-read {"dialog-field":"range"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc pdf-export-pdf/range: focus by Tab
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-pdf"}
+  assert dialog is pdf-export-pdf
+  call dialog-catalog-check {}
+  call real-key {"key":"tab","to-field":"range"}
+  call field-read {"dialog-field":"range"}
+  assert reply.focused is true
+  call real-key {"key":"escape"}
+
+test doc pdf-export-pdf/range: types
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-pdf"}
+  assert dialog is pdf-export-pdf
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is 1
+  assert reply.caret is 1
+  call real-key {"key":"escape"}
+
+test doc pdf-export-pdf/range: edits
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-pdf"}
+  assert dialog is pdf-export-pdf
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"backspace"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is abc
+  call real-key {"key":"home"}
+  call field-read {"dialog-field":"range"}
+  assert reply.caret is 0
+  call real-key {"key":"right"}
+  call real-key {"key":"delete"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is ac
+  call real-key {"key":"end"}
+  call real-key {"key":"left"}
+  call field-read {"dialog-field":"range"}
+  assert reply.caret is 1
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is aXc
+  assert reply.caret is 2
+  call real-key {"key":"escape"}
+
+test doc pdf-export-pdf/range: select-all replaces
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-pdf"}
+  assert dialog is pdf-export-pdf
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call field-read {"dialog-field":"range"}
+  assert reply.selection.0 is 0
+  assert reply.selection.1 is 4
+  call real-type {"text":"X"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is X
+  call real-key {"key":"escape"}
+
+test doc pdf-export-pdf/range: pastes
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-pdf"}
+  assert dialog is pdf-export-pdf
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"Pasted"}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+v"}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is Pasted
+  call real-key {"key":"escape"}
+
+test doc pdf-export-pdf/range: copies
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-pdf"}
+  assert dialog is pdf-export-pdf
+  call dialog-catalog-check {}
+  call clipboard {"action":"write","text":"before"}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"abcd"}
+  call real-key {"key":"ctrl+a"}
+  call real-key {"key":"ctrl+c"}
+  call clipboard {"action":"read"}
+  assert reply.text is abcd
+  call real-key {"key":"escape"}
+
+test doc pdf-export-pdf/range: OK applies
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-pdf"}
+  assert dialog is pdf-export-pdf
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"1"}
+  call real-key {"key":"enter"}
+  assert dialog is not pdf-export-pdf
+
+test doc pdf-export-pdf/range: Escape cancels
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-pdf"}
+  assert dialog is pdf-export-pdf
+  call dialog-catalog-check {}
+  call pointer-click {"dialog-field":"range"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"Esc9"}
+  call real-key {"key":"escape"}
+  assert dialog is not pdf-export-pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-pdf"}
+  assert dialog is pdf-export-pdf
+  call dialog-catalog-check {}
+  call field-read {"dialog-field":"range"}
+  assert reply.value is not Esc9
+  call real-key {"key":"escape"}

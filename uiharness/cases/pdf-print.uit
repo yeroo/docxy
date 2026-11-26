@@ -1,0 +1,102 @@
+# A PDF view's Print and exports (#2258): Ctrl+P and File > Print open
+# Acrobat's Print dialog; OK lays the pages out on sheets as drawn and
+# hands them to the spooler. A harness instance never spools: its printers
+# are made up (Test Printer, the default, and Second Printer) and its jobs
+# go to print-jobs in its sandbox, which `pdf-read`'s `printed` reads back
+# (the job file the worker wrote: printer, copies, pages, sheets, paper,
+# options and the `lp` command). File > Export saves pages as PNG pictures
+# or as a PDF of their own; the Save dialog's file is named by the
+# harness's save-as verb, and `pdf-read`'s `exported` lists what was
+# written. The PDFs are uiharness/fixtures/pdf-view-{slides,text}.pdf,
+# byte-identical copies of corpus/pdf-view's. Each test closes the tabs it
+# opened.
+
+test issue 2258 Ctrl+P prints a range at actual size, as drawn, to the chosen printer
+  open copy:"../fixtures/pdf-view-slides.pdf" as slides.pdf
+  call pdf-read {"until_drawn":[1]}
+  assert reply.printed is null
+  call real-key {"key":"ctrl+p"}
+  assert dialog is pdf-print
+  shot window
+  # The second printer, two copies, pages 2-3 typed (which picks Pages),
+  # Actual size.
+  call real-key {"key":"tab","to-field":"printer"}
+  call real-key {"key":"down"}
+  call pointer-click {"dialog-field":"copies"}
+  call real-key {"key":"ctrl+a"}
+  call real-type {"text":"2"}
+  call pointer-click {"dialog-field":"range"}
+  call real-type {"text":"2-3"}
+  call field-read {"dialog-field":"pages"}
+  assert reply.index is 2
+  call real-key {"key":"tab","to-field":"sizing"}
+  call real-key {"key":"down"}
+  call field-read {"dialog-field":"sizing"}
+  assert reply.index is 1
+  call pointer-click {"dialog-button":"Print"}
+  assert dialog is none
+  call pdf-read {"until_idle":true}
+  assert status is Sent 2 pages to Second Printer, 2 copies
+  assert reply.printed.jobs is 1
+  assert reply.printed.printer is Second Printer
+  assert reply.printed.copies is 2
+  assert reply.printed.sheets is 2
+  assert reply.printed.pages.0 is 2
+  assert reply.printed.pages.1 is 3
+  # Slides match no standard paper and the made-up printers have no
+  # default: US Letter, turned for the landscape slides.
+  assert reply.printed.paper is US Letter
+  assert reply.printed.options.0.0 is media
+  assert reply.printed.options.1.1 is 4
+  call real-key {"key":"ctrl+w"}
+
+test issue 2258 a bad range keeps the Print dialog open and says why, and File > Print opens it too
+  open copy:"../fixtures/pdf-view-text.pdf" as text.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-print"}
+  assert dialog is pdf-print
+  call pointer-click {"dialog-field":"range"}
+  call real-type {"text":"5"}
+  call pointer-click {"dialog-button":"Print"}
+  assert dialog is pdf-print
+  assert status is page 5 is out of range (1–2)
+  call real-key {"key":"escape"}
+  assert dialog is none
+  call real-key {"key":"ctrl+w"}
+
+test issue 2258 File > Export saves pages as PNG pictures and as a PDF
+  open copy:"../fixtures/pdf-view-slides.pdf" as slides.pdf
+  call pdf-read {"until_drawn":[1]}
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  shot window
+  call pointer-click {"region":"pdf-export-png"}
+  assert dialog is pdf-export-png
+  call pointer-click {"dialog-field":"range"}
+  call real-type {"text":"1, 3"}
+  call pointer-click {"dialog-button":"Save…"}
+  assert dialog is none
+  call pdf-read {}
+  assert reply.export_waiting is png
+  call save-as {"path":"pictures.png"}
+  call pdf-read {"until_idle":true}
+  assert reply.exported.0 is pictures_Page_1.png
+  assert reply.exported.1 is pictures_Page_3.png
+  assert reply.export_waiting is null
+  # Pages 2-3 as a PDF of their own, which opens with them.
+  call backstage {"action":"open"}
+  call pointer-click {"region":"bs-rail:pdf-export"}
+  call pointer-click {"region":"pdf-export-pdf"}
+  assert dialog is pdf-export-pdf
+  call pointer-click {"dialog-field":"range"}
+  call real-type {"text":"2-3"}
+  call pointer-click {"dialog-button":"Save…"}
+  call save-as {"path":"two-slides.pdf"}
+  call pdf-read {"until_idle":true}
+  assert reply.exported.0 is two-slides.pdf
+  call open {"path":"two-slides.pdf"}
+  call pdf-read {"until_drawn":[1]}
+  assert status is loaded (PDF, 2 pages)
+  call real-key {"key":"ctrl+w"}
+  call real-key {"key":"ctrl+w"}
