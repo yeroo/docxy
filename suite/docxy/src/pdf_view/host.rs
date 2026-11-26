@@ -103,6 +103,43 @@ pub(crate) fn pdf_view_tab_with(path: &Path, at: Option<PdfAt>, spawn: Spawn) ->
     Some(tab)
 }
 
+/// Try the password typed into `tab`'s prompt (#2256): the pages; the
+/// prompt again; or, when the file could not be read after all, a failed
+/// tab that keeps where the view was (pending, `load_failed`: its next
+/// activation tries again, as a restored tab's does) and says why.
+pub(crate) fn unlock_tab(tab: &mut DocTab) {
+    let Surface::Pdf(v) = &mut tab.surface else {
+        return;
+    };
+    if v.lock.is_none() {
+        return;
+    }
+    let at = PdfAt {
+        page: v.restore_page.unwrap_or(0),
+        zoom: v.zoom,
+    };
+    match v.try_unlock() {
+        super::Unlocked::Opened => {
+            tab.status = format!("{}{}", loaded_status(v.page_count()), v.restricted_note()).into();
+        }
+        super::Unlocked::Wrong => tab.status = PDF_LOCKED.into(),
+        super::Unlocked::Failed(why) => {
+            tab.status = format!("load error: {why}").into();
+            tab.load_failed = true;
+            tab.surface = Surface::PdfPending(at);
+        }
+    }
+}
+
+/// A Save or Save As that writes nothing says why on the status line, but
+/// on a PDF tab that could not be opened (#2256): its status is the reason
+/// its body shows, which a refusal must not replace.
+pub(crate) fn note_save_refusal(tab: &mut DocTab, why: &'static str) {
+    if !(tab.kind == Kind::Pdf && tab.load_failed) {
+        tab.status = why.into();
+    }
+}
+
 /// Why a failed PDF tab could not open it, for its body (#2256): its
 /// status line's reason, without the `load error: ` it starts with.
 pub(crate) fn pdf_failed_reason(tab: &DocTab) -> Option<String> {
@@ -552,7 +589,7 @@ impl Docxy {
         };
         match pdf_save_step(tab, target) {
             PdfSaveStep::Nothing(why) => {
-                tab.status = why.into();
+                note_save_refusal(tab, why);
                 self.refocus(window, cx);
                 Some(after)
             }
@@ -640,7 +677,9 @@ impl Docxy {
             return;
         };
         if !matches!(tab.surface, Surface::Pdf(_)) {
-            self.set_status(PDF_NOT_OPEN);
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                note_save_refusal(tab, PDF_NOT_OPEN);
+            }
             return self.refocus(window, cx);
         }
         if self.harness {
@@ -919,8 +958,9 @@ impl Docxy {
             FieldKey::Enter => self.pdf_unlock(cx),
             FieldKey::Edit(op) => with_lock(self, cx, &|f| f.edit(op)),
             FieldKey::Paste => {
-                if let Some(line) = self.field_paste(false, cx) {
+                if let Some(mut line) = self.field_paste(false, cx) {
                     with_lock(self, cx, &|f| f.edit(crate::field_edit::Op::Insert(&line)));
+                    zeroize::Zeroize::zeroize(&mut line);
                 }
             }
             FieldKey::Escape | FieldKey::Copy | FieldKey::Cut | FieldKey::Ignore => {}
@@ -931,28 +971,10 @@ impl Docxy {
     /// pages, where the session left them; the prompt again, saying the
     /// password is wrong; or a failed tab that says why.
     pub(crate) fn pdf_unlock(&mut self, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            return;
-        };
-        let Surface::Pdf(v) = &mut tab.surface else {
-            return;
-        };
-        if v.lock.is_none() {
-            return;
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            unlock_tab(tab);
+            cx.notify();
         }
-        match v.try_unlock() {
-            super::Unlocked::Opened => {
-                tab.status =
-                    format!("{}{}", loaded_status(v.page_count()), v.restricted_note()).into();
-            }
-            super::Unlocked::Wrong => tab.status = PDF_LOCKED.into(),
-            super::Unlocked::Failed(why) => {
-                tab.status = format!("load error: {why}").into();
-                tab.load_failed = true;
-                tab.surface = Surface::Placeholder;
-            }
-        }
-        cx.notify();
     }
 
     /// A press on the password prompt's field (#2256).

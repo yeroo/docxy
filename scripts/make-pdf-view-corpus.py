@@ -1131,7 +1131,8 @@ def damaged(lines):
 
 
 def make_damaged_offsets(path):
-    """Every xref offset 7 bytes past its object: the table must be rebuilt."""
+    """Every xref offset 7 bytes past its object. PdfCraft finds the objects
+    near their offsets without rebuilding the table; poppler rebuilds it."""
     out, xref = damaged([(72, 760, "Damaged: every offset is wrong")])
     table = out[xref:]
     fixed = re.sub(rb"(\d{10}) 00000 n", lambda m: b"%010d 00000 n" % (int(m.group(1)) + 7), table)

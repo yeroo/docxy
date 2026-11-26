@@ -20,8 +20,10 @@ const CHILD_ENV: &str = "DOCXY_PDF_WORKER_TEST_CHILD";
 /// `garbage-on-text`; `abort-on-text` and `abort-on-replay` (#2255) abort
 /// on any text and on the form values given again, and a mode may name
 /// both; `hog` (#2256) asks for more memory than the child may have when
-/// asked for page 1's pixels, and `check-secret` aborts when the password
-/// an `unlock` gives is in its command line or environment.
+/// asked for page 1's pixels, `check-secret` aborts when the password
+/// an `unlock` gives is in its command line or environment, `limits`
+/// aborts on `info` unless its data limit is `MEMORY_LIMIT` and its core
+/// limit 0, and `abort-on-unlock` aborts on any `unlock`.
 const MODE_ENV: &str = "DOCXY_PDF_WORKER_TEST_MODE";
 
 /// The child half of the tests below: the same `run` the suite's child
@@ -43,6 +45,23 @@ fn child_entry() {
             ("hog", Op::Pixels { page: 0, .. }) => {
                 let v: Vec<u8> = Vec::with_capacity(crate::convert_child::MEMORY_LIMIT + (1 << 30));
                 std::hint::black_box(&v);
+            }
+            ("abort-on-unlock", Op::Unlock { .. }) => std::process::abort(),
+            ("limits", Op::Info) => {
+                let limits = std::fs::read_to_string("/proc/self/limits").unwrap_or_default();
+                let soft = |name: &str| {
+                    limits
+                        .lines()
+                        .find_map(|l| l.strip_prefix(name))
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .map(str::to_owned)
+                };
+                let data = crate::convert_child::MEMORY_LIMIT.to_string();
+                if soft("Max core file size").as_deref() != Some("0")
+                    || soft("Max data size").as_deref() != Some(data.as_str())
+                {
+                    std::process::abort();
+                }
             }
             ("check-secret", Op::Unlock { password }) => {
                 let pw = std::ffi::OsStr::new(password.as_str());
@@ -74,7 +93,11 @@ fn child_entry() {
 
 /// A spawn that runs this test binary as a worker child on `path`, its own
 /// watchdog at twice `child_timeout`.
-fn test_child(path: &Path, child_timeout: Duration, mode: Option<&'static str>) -> Spawn {
+pub(crate) fn test_child(
+    path: &Path,
+    child_timeout: Duration,
+    mode: Option<&'static str>,
+) -> Spawn {
     let spec = format!("{}|{}", path.display(), child_timeout.as_millis());
     Spawn::Command(Arc::new(move || {
         let mut cmd = Command::new(std::env::current_exe().expect("the test binary"));
@@ -854,6 +877,35 @@ fn a_child_past_its_memory_budget_fails_with_a_reason() {
         Answer::Pixels(_)
     ));
     assert_eq!(w.started, 2);
+}
+
+/// Criterion 11: the child's own limits, as its `run` set them: no core
+/// file, and `MEMORY_LIMIT` of data (it aborts on `info` otherwise). It is
+/// started with a core limit of its own (a shell's `ulimit`), as a desktop
+/// session may give one: many default to 0 already, which would prove
+/// nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_child_runs_with_no_core_and_its_data_limit() {
+    let path = corpus_path("text");
+    let spec = format!("{}|{}", path.display(), LONG.as_millis());
+    let spawn = Spawn::Command(Arc::new(move || {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("ulimit -S -c 1024 2>/dev/null || ulimit -c 1024; exec \"$0\" \"$@\"")
+            .arg(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "pdf_view::worker::tests::child_entry",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, &spec)
+            .env(MODE_ENV, "limits");
+        cmd
+    }));
+    let mut w = Worker::new(&path, spawn, LONG);
+    assert!(matches!(w.ask(&Op::Info), Answer::Info(_)));
+    assert_eq!(w.started, 1);
 }
 
 /// A zlib stream of `len` zero bytes, about 600 times smaller (one fixed

@@ -124,10 +124,13 @@ impl Docxy {
         bg: Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Bullets, one a character: the field draws them, never the text.
+        // Bullets, one a character: the field draws them, and the typed
+        // text is never copied.
         let shown = Field {
             text: "\u{2022}".repeat(lock.field.text.chars().count()),
-            ..lock.field.clone()
+            caret: lock.field.caret,
+            sel: lock.field.sel,
+            focused: lock.field.focused,
         };
         let field = self
             .pdf_field(&shown, shown.text.clone(), 240., "pdf-password", pal)

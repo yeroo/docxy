@@ -325,11 +325,19 @@ pub(crate) struct Find {
 /// An encrypted PDF waiting for its password (#2256): the view shows the
 /// prompt instead of pages, and asks its worker itself, one try at a time.
 pub(crate) struct PdfLock {
-    worker: worker::Worker,
+    /// Taken when the file opens, to read its pages.
+    worker: Option<worker::Worker>,
     /// The password being typed: emptied by each try.
     pub field: Field,
     /// The last try's password did not open it.
     pub wrong: bool,
+}
+
+impl Drop for PdfLock {
+    /// The password being typed is cleared, not only freed (#2256).
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.field.text);
+    }
 }
 
 /// What a try of the typed password did (#2256).
@@ -511,7 +519,7 @@ impl PdfView {
             Answer::Locked { .. } => {
                 let mut v = PdfView::new(path, DocMeta::default(), None);
                 v.lock = Some(Box::new(PdfLock {
-                    worker: w,
+                    worker: Some(w),
                     field: Field {
                         focused: true,
                         ..Field::default()
@@ -534,17 +542,19 @@ impl PdfView {
         let Some(lock) = self.lock.as_mut() else {
             return Unlocked::Opened;
         };
+        // The typed text moves into the secret, which clears it when dropped.
         let password = Secret::new(std::mem::take(&mut lock.field.text));
         lock.field = Field {
             focused: true,
             ..Field::default()
         };
-        match lock.worker.unlock(password) {
+        let Some(w) = lock.worker.as_mut() else {
+            return Unlocked::Failed(worker::DIED.into());
+        };
+        match w.unlock(password) {
             Answer::Info(meta) => {
-                let Some(lock) = self.lock.take() else {
-                    return Unlocked::Opened;
-                };
-                let mut v = PdfView::new(&self.path, meta, Some(Engine::new(lock.worker)));
+                let engine = lock.worker.take().map(Engine::new);
+                let mut v = PdfView::new(&self.path, meta, engine);
                 v.zoom = self.zoom;
                 v.restore_page = self.restore_page.take();
                 *self = v;

@@ -990,6 +990,30 @@ fn an_encrypted_pdf_asks_for_its_password_and_its_session_row_keeps_none() {
     let row = serde_json::to_string(&persist_tab(&hot, 0, 0, &tab)).unwrap();
     assert!(!row.contains("user-aes-256"), "{row}");
     assert!(!row.contains("password"), "{row}");
+    // FIX r1 3: a try the reader cannot answer (it dies) leaves a failed
+    // tab that keeps where the view was, and says why in its body.
+    let child = crate::pdf_view::worker::tests::test_child(
+        &path,
+        std::time::Duration::from_secs(60),
+        Some("abort-on-unlock"),
+    );
+    let mut tab = crate::pdf_view::host::pdf_view_tab_with(&path, Some(at), child).unwrap();
+    let Surface::Pdf(v) = &mut tab.surface else {
+        panic!("not a PDF view")
+    };
+    v.lock.as_mut().unwrap().field.text = "user-aes-256".into();
+    crate::pdf_view::host::unlock_tab(&mut tab);
+    assert!(tab.load_failed);
+    assert!(matches!(tab.surface, Surface::PdfPending(a) if a == at));
+    assert_eq!(pdf_at(&tab), Some(at), "the place is kept");
+    let why = crate::pdf_view::host::pdf_failed_reason(&tab).expect("a reason");
+    assert_eq!(why, crate::pdf_view::worker::DIED);
+    // FIX r1 2: Save and Save As on it leave the reason its body shows.
+    crate::pdf_view::host::note_save_refusal(&mut tab, crate::pdf_view::host::PDF_NOT_OPEN);
+    assert_eq!(
+        crate::pdf_view::host::pdf_failed_reason(&tab).as_deref(),
+        Some(crate::pdf_view::worker::DIED)
+    );
     // Save has nothing to write while it asks.
     let mut tab = tab_from_path(&path);
     assert_eq!(

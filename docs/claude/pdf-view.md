@@ -221,8 +221,12 @@ updated and damaged files (#2256).
   on stdin only. The parent holds it only in that view's `Worker`, which
   sends `unlock` first in `connect` to every new child, before the form
   replay (so the clean child after a failed replay is unlocked too).
-  PdfCraft's own copies (`LoadOptions`, `RenderConfig`'s `Arc<str>`) are
-  not cleared.
+  The prompt's typed text moves into the `Secret` on a try, is cleared when
+  the `PdfLock` drops, is never cloned to draw (bullets from its length),
+  and a pasted line is cleared after its insert. Not cleared: the freed
+  buffers typing leaves behind as the field's `String` grows
+  (`field_edit`'s inserts reallocate), the clipboard's own copy, and
+  PdfCraft's copies (`LoadOptions`, `RenderConfig`'s `Arc<str>`).
 - Permissions: shown (status `; restricted: printing, copying, changes`,
   `pdf-read` `permissions`), not enforced, but for filling: a file whose
   password does not allow `fill_forms` has every field read-only, and the
@@ -239,10 +243,15 @@ updated and damaged files (#2256).
 - On Linux the child's `run` (never `serve`, the in-process path) sets
   `RLIMIT_DATA` to `MEMORY_LIMIT` and `RLIMIT_CORE` to 0 (`limit_memory`):
   an allocation past it aborts the child, and the parent fails the page.
+  The `limits` test child reads them back from `/proc/self/limits`.
 - A failed PDF tab draws "This PDF can't be opened" and its reason
-  (`pdf_failed_reason`, `main.rs` `pdf_failed_body`); `pdf-read` gives it
-  as `failed`. The harness's `open` refuses a failed load by design, so no
-  case opens `damaged-unreadable.pdf`.
+  (`pdf_failed_reason`: the status line, so Save and Save As refusals,
+  `note_save_refusal`, leave a failed PDF tab's status alone; `main.rs`
+  `pdf_failed_body`); `pdf-read` gives it as `failed`. A try the reader
+  cannot answer leaves the tab `PdfPending` with `load_failed` where the
+  view was (`unlock_tab`), as a restored tab whose file cannot be read. The
+  harness's `open` refuses a failed load by design, so no case opens
+  `damaged-unreadable.pdf`.
 - PdfCraft finds the objects of a file whose xref offsets are only wrong
   without a rebuild (no repair log): its save appends. One with no xref or
   trailer is rebuilt from its object headers and saved in full.

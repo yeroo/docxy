@@ -896,8 +896,9 @@ fn a_rebuilt_file_is_saved_in_full() {
 }
 
 /// #2256 criterion 9: a file nothing can be read from is a failed PDF tab
-/// whose body says why (`pdf_failed_reason`, what `main.rs` draws), not a
-/// blank view.
+/// whose body says why, not a blank view. This checks the tab and the
+/// reason `pdf_failed_reason` gives; the drawing is `main.rs`'s
+/// `pdf_failed_body` arm, which no test renders.
 #[test]
 fn unreadable_pdf_says_why_in_its_body() {
     let path = corpus(UNREADABLE);
@@ -909,6 +910,22 @@ fn unreadable_pdf_says_why_in_its_body() {
     let why = crate::pdf_view::host::pdf_failed_reason(&tab).expect("a reason");
     assert!(why.contains("not a readable PDF"), "{why}");
     assert!(!why.starts_with("load error"), "{why}");
+    // FIX r1 2: a Save on it refuses without replacing that reason.
+    let mut tab = tab;
+    let step = crate::pdf_view::host::pdf_save_step(&mut tab, None);
+    let crate::pdf_view::host::PdfSaveStep::Nothing(refusal) = step else {
+        panic!("{step:?}")
+    };
+    crate::pdf_view::host::note_save_refusal(&mut tab, refusal);
+    assert_eq!(
+        crate::pdf_view::host::pdf_failed_reason(&tab).as_deref(),
+        Some(why.as_str())
+    );
+    // A tab that opened takes the refusal on its status line.
+    let mut ok =
+        crate::pdf_view::host::pdf_view_tab_with(&corpus("text"), None, Spawn::InProcess).unwrap();
+    crate::pdf_view::host::note_save_refusal(&mut ok, crate::pdf_view::host::PDF_NO_CHANGES);
+    assert_eq!(ok.status.as_ref(), crate::pdf_view::host::PDF_NO_CHANGES);
     // A tab that opened has none.
     let tab =
         crate::pdf_view::host::pdf_view_tab_with(&corpus("text"), None, Spawn::InProcess).unwrap();
