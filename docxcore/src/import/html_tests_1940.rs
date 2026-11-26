@@ -173,13 +173,6 @@ fn a_body_card_takes_its_width_place_and_max_width_1940() {
     assert!(card.grid.iter().sum::<u32>() <= 4500, "{:?}", card.grid);
 }
 
-/// A room's width as the `pct` `tblW` it is written as (#2151 r1): its
-/// share of the body, in fiftieths, which Word resolves to the same twips
-/// and a flow view fits.
-fn body_share(twips: u32) -> u32 {
-    (f64::from(twips) * 5000.0 / f64::from(BODY)).round() as u32
-}
-
 #[test]
 fn a_body_card_is_laid_out_in_the_room_around_it_1940() {
     // A blockquote's 40 px margins: the room between them, centred, so
@@ -188,10 +181,7 @@ fn a_body_card_is_laid_out_in_the_room_around_it_1940() {
     let tp = tblpr(only_table(&d));
     let room = BODY - 2 * 600;
     assert!(
-        tp.contains(&format!(
-            r#"<w:tblW w:w="{}" w:type="pct"/>"#,
-            body_share(room)
-        )),
+        tp.contains(&format!(r#"<w:tblW w:w="{room}" w:type="dxa"/>"#)),
         "{tp}"
     );
     assert!(tp.contains(r#"<w:jc w:val="center"/>"#), "{tp}");
@@ -200,10 +190,7 @@ fn a_body_card_is_laid_out_in_the_room_around_it_1940() {
     let tp = tblpr(only_table(&d));
     let room = BODY - 2 * 360;
     assert!(
-        tp.contains(&format!(
-            r#"<w:tblW w:w="{}" w:type="pct"/>"#,
-            body_share(room)
-        )),
+        tp.contains(&format!(r#"<w:tblW w:w="{room}" w:type="dxa"/>"#)),
         "{tp}"
     );
     // One side only: no longer centred, at its indent.
@@ -211,10 +198,7 @@ fn a_body_card_is_laid_out_in_the_room_around_it_1940() {
     let tp = tblpr(only_table(&d));
     let room = BODY - 360;
     assert!(
-        tp.contains(&format!(
-            r#"<w:tblW w:w="{}" w:type="pct"/>"#,
-            body_share(room)
-        )),
+        tp.contains(&format!(r#"<w:tblW w:w="{room}" w:type="dxa"/>"#)),
         "{tp}"
     );
     // Word (no compatibilityMode) measures the indent to the cell's text:
@@ -225,13 +209,7 @@ fn a_body_card_is_laid_out_in_the_room_around_it_1940() {
     let d = doc("<div style='max-width:600px;margin:0 auto'>\
          <div style='background:#eee;padding:8px'>x</div></div>");
     let tp = tblpr(only_table(&d));
-    assert!(
-        tp.contains(&format!(
-            r#"<w:tblW w:w="{}" w:type="pct"/>"#,
-            body_share(9000)
-        )),
-        "{tp}"
-    );
+    assert!(tp.contains(r#"<w:tblW w:w="9000" w:type="dxa"/>"#), "{tp}");
     assert!(tp.contains(r#"<w:jc w:val="center"/>"#), "{tp}");
 }
 

@@ -1534,7 +1534,12 @@ fn table_spec(attrs: &Attrs, look: &Look, body: u32) -> TableSpec {
         // any cell: the room left between its indents, which is centred in
         // the body when they are equal.
         room: (!look.in_cell && (look.centred_box || look.indent != 0 || look.indent_right != 0))
-            .then(|| body_room(body, look.indent, look.indent_right)),
+            .then(|| html_table::Room {
+                // A centred box's width stands; an indented block's table
+                // is fitted as a share of the body (#2151 r2).
+                body_share: !look.centred_box,
+                ..body_room(body, look.indent, look.indent_right)
+            }),
     }
 }
 
@@ -1552,6 +1557,7 @@ fn body_room(body: u32, indent: i32, right: i32) -> html_table::Room {
             .clamp(html_table::MIN_COL, body),
         centred: indent == right,
         body,
+        body_share: false,
     }
 }
 
@@ -12042,9 +12048,7 @@ mod batch_2114_tests {
             "{WRAP}<table width='100%'><tr><td>x</td></tr></table></div>"
         ));
         let pr = tblpr(tables(&d)[0]);
-        // As its share of the body, which Word resolves to the same 9000
-        // and a flow view fits (#2151 r1): 9000 / 11790.
-        assert!(pr.contains("<w:tblW w:w=\"3817\" w:type=\"pct\"/>"), "{pr}");
+        assert!(pr.contains("<w:tblW w:w=\"9000\" w:type=\"dxa\"/>"), "{pr}");
     }
 
     #[test]
