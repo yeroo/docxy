@@ -384,14 +384,20 @@ with its layout (#2257); printing and exporting it as drawn (#2258).
   `png {page, dpi}` and `extract-pages {pages}` (bytes after the line);
   the parent's `Op::ExportTo {export, path}` asks the child per page
   (each PNG its own request and timeout) and writes every file or none
-  (`Staged`, r1: each answer written and synced to `.<name>.<pid>.part`
-  as it comes, so the suite holds paths, not pictures; `commit` moves a
-  file already at a name aside to `.<name>.<pid>.old`, renames, and on
-  any failure puts every done name back; the temporary files go on drop;
-  the same name twice is refused). A page named twice is one picture
+  (r2: one file, a PDF or a page's PNG, through `fsio::export_atomic`;
+  several through `Staged`, by fsio's rules (`write_destination`: a
+  symlink writes its target, a read-only file is refused up front, the
+  replaced file's permissions kept; `temp_sibling`: exclusive temporary
+  names never shared between writers). Each page is written and synced
+  as it comes, so the suite holds paths, not pictures. `commit` renames
+  in order, a file already at a name moved aside first but at the last
+  name, whose rename replaces it atomically; on a failure it puts every
+  done name back, best effort, and the error says where a file it could
+  not put back is; a file moved aside that cannot be removed after is
+  named in the status (`Exported::left`). The temporary files go on drop;
+  the same file twice is refused.) A page named twice is one picture
   (`distinct`, where the export is built). No export replaces the PDF the
-  view reads (`EXPORT_OVER_ITSELF`, `fsio::same_file`). A replaced file's
-  own permissions are not carried over.
+  view reads (`EXPORT_OVER_ITSELF`, `fsio::same_file`).
   `Op::timeout`: print and extract get `JOB_FACTOR` (3) × the child's
   timeout, in the parent's `exchange` and in the child's watchdog
   (`Busy` holds each request's limit, twice it). A print or export goes
