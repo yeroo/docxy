@@ -252,12 +252,18 @@ fn fill(absn: &AbstractNum, text: &str, c: &[i32]) -> String {
     for k in 1..=9usize {
         let pat = format!("%{k}");
         if s.contains(&pat) {
-            let val = c.get(k - 1).copied().unwrap_or(0).max(1);
             let fmt = absn
                 .levels
                 .get(k - 1)
                 .map(|l| l.fmt)
                 .unwrap_or(NumFmt::Decimal);
+            // A decimal counter at 0 draws 0, as Word draws it (#1989): a
+            // `w:start 0` level (an HTML `<ol start=0>`), and a parent level
+            // not yet advanced (`%1.%2` before any level-0 item is "0.1",
+            // Word's "1.0.1" for a heading under a skipped level). A letter
+            // or roman numeral has no 0: it draws as 1.
+            let least = if fmt == NumFmt::Decimal { 0 } else { 1 };
+            let val = c.get(k - 1).copied().map_or(1, |v| v.max(least));
             s = s.replace(&pat, &format_num(val, fmt));
         }
     }
@@ -746,6 +752,44 @@ mod tests {
         assert_eq!(m.get(&vec![2]).map(String::as_str), Some("b)"));
         assert_eq!(m.get(&vec![3]).map(String::as_str), Some("2."));
         assert_eq!(m.get(&vec![4]).map(String::as_str), Some("a)")); // level restarted
+    }
+
+    /// A decimal counter at 0 draws 0 (#1989), as Word does: a `w:start 0`
+    /// level, and a parent level not yet advanced; a letter or roman level
+    /// at 0 still draws as 1.
+    #[test]
+    fn a_decimal_counter_at_zero_draws_zero() {
+        let num = parse_numbering_xml(
+            r#"<w:numbering>
+            <w:abstractNum w:abstractNumId="0">
+              <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+              <w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2"/></w:lvl></w:abstractNum>
+            <w:abstractNum w:abstractNumId="1">
+              <w:lvl w:ilvl="0"><w:start w:val="0"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>
+            <w:abstractNum w:abstractNumId="2">
+              <w:lvl w:ilvl="0"><w:start w:val="0"/><w:numFmt w:val="lowerLetter"/><w:lvlText w:val="%1)"/></w:lvl></w:abstractNum>
+            <w:abstractNum w:abstractNumId="3">
+              <w:lvl w:ilvl="0"><w:start w:val="0"/><w:numFmt w:val="lowerRoman"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>
+            <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+            <w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>
+            <w:num w:numId="3"><w:abstractNumId w:val="2"/></w:num>
+            <w:num w:numId="4"><w:abstractNumId w:val="3"/></w:num>
+            </w:numbering>"#,
+        );
+        let doc = Document {
+            body: vec![
+                list_para(1, 1),
+                list_para(1, 0),
+                list_para(1, 1),
+                list_para(2, 0),
+                list_para(2, 0),
+                list_para(3, 0),
+                list_para(4, 0),
+            ],
+        };
+        let m = compute_markers(&doc, &num);
+        let got: Vec<&str> = (0..7).map(|i| m[&vec![i]].as_str()).collect();
+        assert_eq!(got, ["0.1", "1.", "1.1", "0.", "1.", "a)", "i."]);
     }
 
     #[test]

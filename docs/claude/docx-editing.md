@@ -18,7 +18,10 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   Numbers count per list within the body, numIds on one abstract sharing a
   count (`ListKey`, `Numbering::abstract_of`, r2), as `compute_markers`
   and Word count them, and a deeper level, a bullet one included, restarts
-  only the levels below it (r1). The view's own rule, not Word's: every
+  only the levels below it (r1). A level counts from its `w:start` where
+  the part defines the list (#1989, counts `i32`, a level skipped on the
+  way in starting at its own start too, as `Numbering::count`), else from
+  1. The view's own rule, not Word's: every
   count restarts after a paragraph that is not a list item (docxy's own
   lists share numId 1 and 2); in a table they count on from cell to cell
   (`TableListCounts`, `docs/claude/suite-document.md` §#2087). Not done:
@@ -239,6 +242,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   `numbering::heading_chapters` is `heading_numbers` for the top-level
   headings by body block (a heading in a table cell moves the numbering but
   sets no page's chapter, as in the export).
+- A decimal counter at 0 draws 0 in `numbering::fill` (#1989), so in
+  `compute_markers` and the chapter prefixes too: a `w:start 0` level, and
+  a parent level not yet advanced (`%1.%2` before any level-0 item is
+  "0.1", a heading under a skipped level "1.0.1"), as Word draws them;
+  before, every counter drew at least 1. Letters and roman numerals at 0
+  still draw as 1.
 - The suite's `Page` carries its `number` (restarts and fillers included).
   `page_fields::page_values` turns a `PageFlow` plus the headings into a
   `PageVals` per page; the page view's headers and footers (the editable one

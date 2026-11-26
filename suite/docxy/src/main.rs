@@ -36260,6 +36260,80 @@ mod repeat_tests {
         );
     }
 
+    /// A level counts from its `w:start` (#1989): from the first item, after
+    /// a paragraph that is not one, and a skipped level entered later too; a
+    /// start of 0 draws 0; a list no part defines counts from 1.
+    #[test]
+    fn list_markers_count_from_the_levels_start_1989() {
+        use docxcore::model::{Block, ParProps, Paragraph};
+        let p = |num_id, ilvl| {
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    num_id: Some(num_id),
+                    ilvl,
+                    ..ParProps::default()
+                },
+                content: Vec::new(),
+            })
+        };
+        let text = Block::Paragraph(Paragraph::default());
+        let numbering = docxcore::numbering::parse_numbering_xml(
+            r#"<w:numbering>
+            <w:abstractNum w:abstractNumId="0">
+              <w:lvl w:ilvl="0"><w:start w:val="5"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+              <w:lvl w:ilvl="1"><w:start w:val="3"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%2."/></w:lvl>
+              <w:lvl w:ilvl="2"><w:start w:val="7"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%3."/></w:lvl></w:abstractNum>
+            <w:abstractNum w:abstractNumId="1">
+              <w:lvl w:ilvl="0"><w:start w:val="0"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum>
+            <w:num w:numId="4"><w:abstractNumId w:val="0"/></w:num>
+            <w:num w:numId="5"><w:abstractNumId w:val="1"/></w:num>
+            </w:numbering>"#,
+        );
+        let n = Some(&numbering);
+        let s = |m: &str| Some(m.to_string());
+        assert_eq!(
+            list_markers(&[p(4, 0), p(4, 0), text.clone(), p(4, 0)], n),
+            [s("5. "), s("6. "), None, s("5. ")]
+        );
+        assert_eq!(list_markers(&[p(5, 0), p(5, 0)], n), [s("0. "), s("1. ")]);
+        // Level 2 first, then level 1, skipped on the way: each from its own
+        // start; back at level 0 the deeper ones start over.
+        assert_eq!(
+            list_markers(&[p(4, 2), p(4, 1), p(4, 1), p(4, 0), p(4, 1)], n),
+            [s("7. "), s("3. "), s("4. "), s("5. "), s("3. ")]
+        );
+        // NUM_DECIMAL, which this part does not define: from 1.
+        assert_eq!(
+            list_markers(&[p(NUM_DECIMAL, 0), p(NUM_DECIMAL, 0)], n),
+            [s("1. "), s("2. ")]
+        );
+    }
+
+    /// An imported HTML page's ordered lists draw as Word numbers them
+    /// (#1989): an `<ol start>` from its start, and two adjacent `<ol>`s
+    /// each from 1 (both on one Markdown list before, so 1. and 2.).
+    #[test]
+    fn imported_html_lists_draw_their_own_counts_1989() {
+        let drawn = |html: &str| {
+            let pkg = docxcore::import::html::import_html_with(html.as_bytes(), &mut |_, _| None)
+                .unwrap()
+                .package();
+            let numbering = docxcore::numbering::parse_numbering_xml(
+                &pkg.part_text("word/numbering.xml").unwrap(),
+            );
+            list_markers(&pkg.document.body, Some(&numbering))
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(drawn("<ol start=5><li>a<li>b</ol>"), ["5. ", "6. "]);
+        assert_eq!(drawn("<ol><li>a</ol><ol><li>b</ol>"), ["1. ", "1. "]);
+        assert_eq!(
+            drawn("<ol><li>a<li value=7>b<li>c</ol>"),
+            ["1. ", "7. ", "8. "]
+        );
+    }
+
     /// A table's list counts on from cell to cell (#2087): an item per row
     /// beside a cell of other text is 1., 2., 3., as Word draws it; a
     /// paragraph after an item in the same cell restarts it.
@@ -40515,10 +40589,12 @@ fn has_page_break(b: &Block) -> bool {
 /// first save writes their definitions. Numbers count per list, lists on
 /// one abstract numbering sharing a count, as Word and
 /// `docxcore::numbering::compute_markers` count them, and a deeper level, a
-/// bullet one included, restarts only the levels below it. The view's own
-/// rule, not Word's: every count restarts after a paragraph that is not a
-/// list item (docxy's own lists share numId 1 and 2). Not done:
-/// `w:lvlOverride` / `w:startOverride` restarts.
+/// bullet one included, restarts only the levels below it. A level counts
+/// from its `w:start` where the numbering defines the list (#1989: an HTML
+/// `<ol start>`), else from 1. The view's own rule, not Word's: every count
+/// restarts (to its start) after a paragraph that is not a list item
+/// (docxy's own lists share numId 1 and 2). Not done: `w:lvlOverride` /
+/// `w:startOverride` restarts.
 fn list_markers(
     body: &[Block],
     numbering: Option<&docxcore::numbering::Numbering>,
@@ -40528,7 +40604,9 @@ fn list_markers(
 
 /// Each list's count per level, for [`list_markers`], keyed by
 /// [`ListKey`].
-type ListCounts = std::collections::HashMap<ListKey, Vec<u32>>;
+/// Signed, as docxcore's counters (#1989): a level counting from
+/// `w:start 0` starts at -1.
+type ListCounts = std::collections::HashMap<ListKey, Vec<i32>>;
 
 /// What a list counts in (#2087 r2): its abstract numbering where the
 /// package defines it (`Numbering::abstract_of`), so two numIds on one
@@ -40713,6 +40791,12 @@ fn list_markers_counting(
     restart_any: bool,
 ) -> Vec<Option<String>> {
     let numbered = |num_id: i32, ilvl: i32| list_level_numbered(numbering, num_id, ilvl);
+    // Level `k`'s first number (#1989), as `Numbering::count` reads it.
+    let start = |num_id: i32, k: usize| {
+        numbering
+            .and_then(|n| n.level(num_id, k as i32))
+            .map_or(1, |l| l.start)
+    };
     let mut out = Vec::with_capacity(body.len());
     let mut had_item = false;
     for b in body {
@@ -40727,11 +40811,13 @@ fn list_markers_counting(
                 let num_id = p.props.num_id.unwrap_or_default();
                 let list = counts.entry(ListKey::of(num_id, numbering)).or_default();
                 if numbered(num_id, level) {
-                    if list.len() <= ilvl {
-                        list.resize(ilvl + 1, 0);
+                    // A level entering the count, the ones skipped to reach
+                    // it too, starts one before its own start (#1989).
+                    while list.len() <= ilvl {
+                        list.push(start(num_id, list.len()).saturating_sub(1));
                     }
                     list.truncate(ilvl + 1); // returning to a shallower level restarts deeper ones
-                    list[ilvl] += 1;
+                    list[ilvl] = list[ilvl].saturating_add(1);
                     Some(format!("{}. ", list[ilvl]))
                 } else {
                     // A bullet level restarts the levels below it, not the
