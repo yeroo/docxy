@@ -6432,3 +6432,21 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   PATCHed in the same drain, a local answer draft, an offline PATCH, a 400
   and a 404, a plain send, a moved original, a moved draft, and no reminder
   dedupe).
+
+## A token broker and a login hint (#2317)
+
+- `EngineOptions::broker` (`TokenBroker`, `Broker`) is a token source outside the engine, asked on
+  the engine's thread; the trait's doc says when. A brokered token (`Engine::brokered`) is never
+  saved, and `try_refresh` and `renew_brokered_near_expiry` ask the broker for it in place of the
+  refresh-token grant. An explicit `SignIn` asks the broker only with no token held, so a re-consent
+  with a token held (#2213) still goes to the browser. `ask_broker` repeats #2218's fallback: the
+  full sign-in scope, then `AuthConfig::scope` alone when the first answer needs the person.
+- `AuthConfig::login_hint` replaces `prompt=select_account` in the authorize URL.
+- `EngineOptions::app_name` names the browser tab's pages (`SignInPages`); `None` keeps the
+  terminal client's.
+- mailcore does not depend on `docxy-integration`: a host wraps its plugin's `token` method as the
+  broker.
+- Tests: `auth::tests::a_login_hint_replaces_the_account_picker`; engine `tests::a_brokered_token_*`,
+  `a_saved_token_comes_before_the_broker`, `the_required_scopes_alone_*`,
+  `a_broker_without_a_token_leads_to_the_browser`, `a_401_asks_the_broker_once_*`,
+  `the_sign_in_pages_name_the_app_when_told`, `a_sign_in_ends_on_the_named_app_page`.

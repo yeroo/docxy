@@ -293,7 +293,8 @@ issue number to find its notes.
   or SendDraft following its draft's move (#2265), a save kept at a
   shutdown never replacing a file made at its path (#2267), each
   message's last verb (replied, replied all, forwarded) on its row, and
-  an answer sent here marking its original with one PATCH (#2301).
+  an answer sent here marking its original with one PATCH (#2301), a token
+  broker asked before the browser sign-in and a login hint (#2317).
 
 ## Build and test
 
