@@ -44,10 +44,12 @@ test issue 2258 Ctrl+P prints a range at actual size, as drawn, to the chosen pr
   assert reply.printed.pages.0 is 2
   assert reply.printed.pages.1 is 3
   # Slides match no standard paper and the made-up printers have no
-  # default: US Letter, turned for the landscape slides.
+  # default: US Letter. The sheets' CUPS orientation option is CUPS only
+  # (Windows' print ticket turns each sheet itself), so this case, which
+  # also runs on Windows, does not read it: print_tests.rs checks it off
+  # Windows and its absence on Windows.
   assert reply.printed.paper is US Letter
   assert reply.printed.options.0.0 is media
-  assert reply.printed.options.1.1 is 4
   call real-key {"key":"ctrl+w"}
 
 test issue 2258 a bad range keeps the Print dialog open and says why, and File > Print opens it too

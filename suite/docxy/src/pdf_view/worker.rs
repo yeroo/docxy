@@ -1278,13 +1278,11 @@ impl Worker {
                 dpi_used,
                 left: Vec::new(),
             }),
-            Err(e) => Answer::Failed(format!("the file could not be written: {e}")),
+            Err(e) => Answer::Failed(write_error(&e)),
         };
         let mut staged = Staged::default();
         let stage = |staged: &mut Staged, name: &Path, bytes: &[u8]| {
-            staged
-                .add(name, bytes)
-                .map_err(|e| format!("the file could not be written: {e}"))
+            staged.add(name, bytes).map_err(|e| write_error(&e))
         };
         let dpi_used = match export {
             Export::Pdf { pages } => {
@@ -1348,7 +1346,7 @@ impl Worker {
                 dpi_used,
                 left,
             }),
-            Err(e) => Answer::Failed(format!("the file could not be written: {e}")),
+            Err(e) => Answer::Failed(write_error(&e)),
         }
     }
 
@@ -1489,6 +1487,22 @@ pub(crate) fn png_names(path: &Path, pages: &[usize]) -> Vec<PathBuf> {
         .map(|p| path.with_file_name(format!("{stem}_Page_{:0width$}.png", p + 1)))
         .collect()
 }
+
+/// Why an export's file could not be written (#2258): a file this user may
+/// not write, or one marked read-only, in the same words on every platform
+/// (Linux says "Permission denied", Windows "Access is denied"), the
+/// system's own after them.
+pub(crate) fn write_error(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        format!("{WRITE_REFUSED} ({e})")
+    } else {
+        format!("the file could not be written: {e}")
+    }
+}
+
+/// What [`write_error`] says of a file that may not be written.
+pub(crate) const WRITE_REFUSED: &str =
+    "the file could not be written: it is read-only, or you may not change it";
 
 /// `pages` without repeats, the first of each kept in its place (#2258):
 /// a range may name a page twice ("1-3, 2"), and a page is one picture.

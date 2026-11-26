@@ -405,6 +405,8 @@ impl Served {
             let pdf = pdfcraft_print::impose(&shown, &settings).map_err(|e| e.to_string())?;
             // CUPS is told which way the sheets run, as PdfCraft's own Print
             // does: it would shrink a landscape sheet into portrait paper.
+            // CUPS only: on Windows the print ticket sets each sheet's
+            // orientation itself, and this adds nothing.
             let sizes: Vec<(f64, f64)> = pdfcraft_model::pages(&shown)
                 .iter()
                 .map(|p| p.display_size(&shown))
@@ -739,9 +741,21 @@ fn spool_to_dir(
     sheets: usize,
 ) -> Result<String, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("the print folder: {e}"))?;
-    let n = (1..)
-        .find(|n| !dir.join(format!("job-{n}.json")).exists())
-        .unwrap_or(1);
+    // The number is taken by creating its job file (`create_new`): two
+    // children printing into one folder never share one.
+    let (n, mut json_file) = (1..10_000)
+        .find_map(|n| {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dir.join(format!("job-{n}.json")))
+            {
+                Ok(f) => Some(Ok((n, f))),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(e) => Some(Err(format!("the print folder: {e}"))),
+            }
+        })
+        .unwrap_or_else(|| Err("the print folder is full".into()))?;
     let pdf_path = dir.join(format!("job-{n}.pdf"));
     std::fs::write(&pdf_path, pdf).map_err(|e| format!("the print folder: {e}"))?;
     let options: Vec<serde_json::Value> = spec
@@ -772,12 +786,9 @@ fn spool_to_dir(
         "paper_size": [job.paper.0, job.paper.1],
         "pdf": pdf_path.file_name().map(|n| n.to_string_lossy().into_owned()),
     });
-    let json_path = dir.join(format!("job-{n}.json"));
-    std::fs::write(
-        &json_path,
-        serde_json::to_vec_pretty(&meta).unwrap_or_default(),
-    )
-    .map_err(|e| format!("the print folder: {e}"))?;
+    json_file
+        .write_all(&serde_json::to_vec_pretty(&meta).unwrap_or_default())
+        .map_err(|e| format!("the print folder: {e}"))?;
     Ok(format!("job-{n}"))
 }
 

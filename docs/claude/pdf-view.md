@@ -413,7 +413,8 @@ with its layout (#2257); printing and exporting it as drawn (#2258).
   bytes are written from it, and print and extract take it, so unsaved
   values and PdfCraft's appearances print. Print: `impose`, `layout` (the
   pages' `display_size`, as `impose` reads them) for
-  `add_cups_orientation`, the job's options `paper_media_option` (as
+  `add_cups_orientation` (CUPS only: nothing on Windows, whose print
+  ticket turns each sheet), the job's options `paper_media_option` (as
   PdfCraft's Print dialog), `Scaling::Exact`, duplex left to the printer.
   PNG: dpi clamped 18–1200 and capped by `effective_scale` (the answer
   says the dpi drawn; the status says so when lower). `extract_pages`

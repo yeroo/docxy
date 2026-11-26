@@ -1106,7 +1106,9 @@ fn a_print_past_a_pages_timeout_is_answered_and_a_hung_one_given_up() {
     let spool = Spool::Dir {
         dir: dir.path("jobs"),
     };
-    let t = Duration::from_millis(1500);
+    // Wide enough for a child that starts slowly (Windows): the slow print
+    // sleeps 1.5 t of the 3 t it may take.
+    let t = Duration::from_secs(3);
     let mut w = child_worker("text", Some("slow-print"), t, t);
     let job = crate::pdf_view::print::tests::job(vec![0], Sizing::Fit, spool.clone());
     let t0 = Instant::now();
@@ -1127,6 +1129,8 @@ fn a_print_past_a_pages_timeout_is_answered_and_a_hung_one_given_up() {
         took >= t * 3 && took < t * 3 + Duration::from_secs(5),
         "{took:?}"
     );
+    // Only the hung print is bounded: the new child may start slowly.
+    w.timeout = LONG;
     assert!(matches!(
         w.ask(&Op::Pixels {
             page: 0,

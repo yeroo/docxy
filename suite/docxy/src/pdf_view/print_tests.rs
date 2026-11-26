@@ -489,7 +489,13 @@ fn a_job_is_a_sheet_a_page_on_the_paper_with_the_spoolers_options() {
     assert!(has("-o", &format!("media={}", media.1)), "{lp:?}");
     assert_eq!(json["options"][0], serde_json::json!(["media", media.1]));
     // Slides are landscape: Auto turns the A4 sheet, and CUPS is told.
-    assert!(has("-o", "orientation-requested=4"), "{lp:?}");
+    // Windows' print ticket sets each sheet's orientation itself, and
+    // `add_cups_orientation` adds nothing there.
+    assert_eq!(
+        has("-o", "orientation-requested=4"),
+        !cfg!(windows),
+        "{lp:?}"
+    );
     let mut sheets = worker_on(&pdf);
     let m = info_of(&mut sheets);
     for s in &m.pages {
@@ -1305,7 +1311,7 @@ fn the_export_writer_follows_fsios_rules() {
     }) {
         Answer::Failed(why) => {
             assert!(
-                why.contains("read-only") || why.contains("ermission denied"),
+                why.starts_with(crate::pdf_view::worker::WRITE_REFUSED),
                 "{why}"
             )
         }
