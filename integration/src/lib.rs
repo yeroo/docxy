@@ -8,6 +8,7 @@
 //! [`host`] and [`win_icon`].
 
 pub mod abi;
+pub mod accent;
 pub mod protocol;
 
 #[cfg(feature = "host")]

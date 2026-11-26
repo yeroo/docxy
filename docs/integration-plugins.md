@@ -93,10 +93,26 @@ the host's own value.
 
 | Method | Request | Answer |
 |---|---|---|
-| `branding` | `{"app":"<app>"}` | `{"product","short","about_line","icon_ico_b64","icon_png_b64"}`: the names in window titles and About, an `.ico` file and a PNG, each base64 (RFC 4648, with padding) |
+| `branding` | `{"app":"<app>"}` | `{"product","short","about_line","icon_ico_b64","icon_png_b64","accents"}`: the names in window titles and About, an `.ico` file and a PNG, each base64 (RFC 4648, with padding), and the accent colours ([Accents](#accents)) |
 | `sign_in` | `{"app":"<app>"}` | `{"client_id","tenant","login_hint","cloud"}` |
 | `token` | `{"app","scopes","client_id","tenant"}`, `scopes` space-separated | `{"status":"ok","access_token","expires_at_unix","account","scopes"}`, `{"status":"interaction_required","why"}` or `{"status":"unavailable","why"}` |
 | `context` | `{}` | `{"organization":{"id","name"},"desktop":{"id","name"}}` |
+
+### Accents
+
+`accents` is `{"light":{"primary","link","highlight"},"dark":{...}}`, each colour `#RRGGBB` (`#` and
+six hex digits, in either case). A role that is missing or written otherwise is absent, and the
+host keeps its own colour for it.
+
+| Role | What the host draws with it | The host takes it when (WCAG 2.x contrast) |
+|---|---|---|
+| `primary` | primary buttons, the selection, the focus ring | black or white text, whichever is higher, reaches 4.5:1 on it; that text is drawn on it |
+| `link` | links and the secondary accent | it reaches 4.5:1 on the theme's background |
+| `highlight` | small marks only (the active tab's, an unread mark), never a large fill | it reaches 4.5:1 on the theme's background |
+
+The host draws the set of its current theme and follows a theme switch. For a colour it does not
+take it keeps its own and says so once in its log. `integration/src/accent.rs` holds the rule, for
+every host. Window and background colours do not change.
 
 The host asks `branding` and `sign_in` once per application and `context` once per process, and
 keeps the answers. It asks `token` each time it needs a token. An `ok` answer without

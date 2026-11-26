@@ -272,8 +272,10 @@ fn answer(mode: &[String], method: &str, request: &str) -> Result<String, (i32, 
         .find(|app| request.contains(&format!(r#""app":"{app}""#)))
         .unwrap_or("none");
     Ok(match method {
+        // Made-up accents: a valid light set, and a dark set whose highlight
+        // has five digits.
         "branding" => format!(
-            r#"{{"product":"Fixture {app}","short":"F","about_line":"From the fixture"}}"#
+            r##"{{"product":"Fixture {app}","short":"F","about_line":"From the fixture","accents":{{"light":{{"primary":"#1F4E9A","link":"#1B5FA8","highlight":"#6A3FB0"}},"dark":{{"primary":"#7FD4FF","link":"#9CC2FF","highlight":"#C4A6F"}}}}}}"##
         ),
         "sign_in" => format!(
             r#"{{"client_id":"fixture-client","tenant":"fixture-tenant","login_hint":"person@example.com","cloud":"global","for":"{app}"}}"#

@@ -131,6 +131,7 @@ pub struct Branding {
     pub icon_ico: Option<Vec<u8>>,
     /// A PNG's bytes.
     pub icon_png: Option<Vec<u8>>,
+    pub accents: Option<Accents>,
 }
 
 impl Branding {
@@ -141,6 +142,9 @@ impl Branding {
         push_text(&mut pairs, "about_line", &self.about_line);
         push_bytes(&mut pairs, "icon_ico_b64", &self.icon_ico);
         push_bytes(&mut pairs, "icon_png_b64", &self.icon_png);
+        if let Some(accents) = &self.accents {
+            pairs.push(("accents".into(), accents.to_json()));
+        }
         Json::Obj(pairs).to_string()
     }
 
@@ -152,7 +156,111 @@ impl Branding {
             about_line: text_of(&json, "about_line"),
             icon_ico: bytes_of(&json, "icon_ico_b64"),
             icon_png: bytes_of(&json, "icon_png_b64"),
+            accents: json.get("accents").and_then(Accents::from_json),
         })
+    }
+}
+
+/// A colour, written `#RRGGBB`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rgb(pub u8, pub u8, pub u8);
+
+impl Rgb {
+    /// `#` and six hex digits, in either case; `None` for anything else.
+    pub fn parse(text: &str) -> Option<Rgb> {
+        let hex = text.strip_prefix('#')?;
+        if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+        Some(Rgb(byte(0)?, byte(2)?, byte(4)?))
+    }
+
+    pub fn to_hex(self) -> String {
+        format!("#{:02X}{:02X}{:02X}", self.0, self.1, self.2)
+    }
+
+    /// `0xRRGGBB`.
+    pub fn to_u32(self) -> u32 {
+        (u32::from(self.0) << 16) | (u32::from(self.1) << 8) | u32::from(self.2)
+    }
+
+    /// From `0xRRGGBB`; higher bits are ignored.
+    pub fn from_u32(value: u32) -> Rgb {
+        Rgb((value >> 16) as u8, (value >> 8) as u8, value as u8)
+    }
+}
+
+/// One theme's accent colours. A role the answer leaves out or writes
+/// malformed is `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AccentSet {
+    /// Primary buttons, the selection and the focus ring.
+    pub primary: Option<Rgb>,
+    /// Links and the secondary accent.
+    pub link: Option<Rgb>,
+    /// Small marks only, such as the active tab's and an unread mark.
+    pub highlight: Option<Rgb>,
+}
+
+impl AccentSet {
+    fn to_json(self) -> Json {
+        let mut pairs = Vec::new();
+        for (key, value) in [
+            ("primary", self.primary),
+            ("link", self.link),
+            ("highlight", self.highlight),
+        ] {
+            if let Some(value) = value {
+                pairs.push((key.to_string(), Json::Str(value.to_hex())));
+            }
+        }
+        Json::Obj(pairs)
+    }
+
+    /// `None` when no role is valid.
+    fn from_json(json: &Json) -> Option<AccentSet> {
+        json.as_object()?;
+        let role = |key: &str| json.get_str(key).and_then(Rgb::parse);
+        let set = AccentSet {
+            primary: role("primary"),
+            link: role("link"),
+            highlight: role("highlight"),
+        };
+        (set != AccentSet::default()).then_some(set)
+    }
+}
+
+/// `branding`'s `accents`: a set for the light theme and one for the dark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Accents {
+    pub light: Option<AccentSet>,
+    pub dark: Option<AccentSet>,
+}
+
+impl Accents {
+    /// The set for the dark theme when `dark`, else the light one.
+    pub fn for_theme(&self, dark: bool) -> Option<AccentSet> {
+        if dark { self.dark } else { self.light }
+    }
+
+    fn to_json(self) -> Json {
+        let mut pairs = Vec::new();
+        for (key, set) in [("light", self.light), ("dark", self.dark)] {
+            if let Some(set) = set {
+                pairs.push((key.to_string(), set.to_json()));
+            }
+        }
+        Json::Obj(pairs)
+    }
+
+    /// `None` when neither set holds a valid role.
+    fn from_json(json: &Json) -> Option<Accents> {
+        let accents = Accents {
+            light: json.get("light").and_then(AccentSet::from_json),
+            dark: json.get("dark").and_then(AccentSet::from_json),
+        };
+        (accents != Accents::default()).then_some(accents)
     }
 }
 
@@ -519,6 +627,14 @@ mod tests {
             about_line: None,
             icon_ico: Some(vec![0, 0, 1, 0]),
             icon_png: Some(vec![0x89, b'P', b'N', b'G']),
+            accents: Some(Accents {
+                light: Some(AccentSet {
+                    primary: Some(Rgb(0x12, 0xAB, 0xEF)),
+                    link: None,
+                    highlight: Some(Rgb(0, 0, 0)),
+                }),
+                dark: None,
+            }),
         };
         assert_eq!(Branding::from_json(&branding.to_json()), Ok(branding));
         let sign_in = SignIn {
@@ -572,6 +688,65 @@ mod tests {
                 ),
                 "{text}"
             );
+        }
+    }
+
+    #[test]
+    fn an_accent_colour_is_a_hash_and_six_hex_digits() {
+        assert_eq!(Rgb::parse("#12abEF"), Some(Rgb(0x12, 0xAB, 0xEF)));
+        assert_eq!(Rgb::parse("#000000"), Some(Rgb(0, 0, 0)));
+        for bad in [
+            "",
+            "#",
+            "12abef",
+            "#12abe",
+            "#12abef0",
+            "#12abeg",
+            "#+2abef",
+            " #12abef",
+            "#12abef ",
+            "##12abef",
+            "#12\u{e9}bef",
+        ] {
+            assert_eq!(Rgb::parse(bad), None, "{bad:?}");
+        }
+        assert_eq!(Rgb(0x12, 0xAB, 0xEF).to_hex(), "#12ABEF");
+        assert_eq!(Rgb(0x12, 0xAB, 0xEF).to_u32(), 0x12ABEF);
+        assert_eq!(Rgb::from_u32(0xFF12ABEF), Rgb(0x12, 0xAB, 0xEF));
+    }
+
+    #[test]
+    fn a_malformed_accent_is_absent_for_its_role_alone() {
+        let branding = Branding::from_json(
+            r##"{"accents":{"light":{"primary":"#102030","link":"#405060","highlight":"#708090"},
+                "dark":{"primary":"#10203","link":"#a0B0c0","highlight":7}}}"##,
+        )
+        .unwrap();
+        let accents = branding.accents.unwrap();
+        assert_eq!(
+            accents.light,
+            Some(AccentSet {
+                primary: Some(Rgb(0x10, 0x20, 0x30)),
+                link: Some(Rgb(0x40, 0x50, 0x60)),
+                highlight: Some(Rgb(0x70, 0x80, 0x90)),
+            })
+        );
+        assert_eq!(
+            accents.dark,
+            Some(AccentSet {
+                link: Some(Rgb(0xA0, 0xB0, 0xC0)),
+                ..AccentSet::default()
+            })
+        );
+        assert_eq!(accents.for_theme(false), accents.light);
+        assert_eq!(accents.for_theme(true), accents.dark);
+        for none in [
+            r##"{"accents":"#102030"}"##,
+            r##"{"accents":{"light":"#102030"}}"##,
+            r#"{"accents":{"light":{"primary":"red"},"dark":{}}}"#,
+            r#"{}"#,
+        ] {
+            assert_eq!(Branding::from_json(none).unwrap().accents, None, "{none}");
         }
     }
 

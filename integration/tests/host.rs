@@ -5,7 +5,7 @@
 use docxy_integration::host::{
     Deadlines, HostConfig, Integration, Source, Status, load_from, plugin_dir,
 };
-use docxy_integration::protocol::{App, TokenAnswer, TokenRequest};
+use docxy_integration::protocol::{AccentSet, App, Rgb, TokenAnswer, TokenRequest};
 use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -134,6 +134,23 @@ fn one_library_loads_and_answers_every_method() {
     let branding = plugin.branding(App::Mail).unwrap();
     assert_eq!(branding.product.as_deref(), Some("Fixture mail"));
     assert_eq!(branding.icon_ico, None);
+    let accents = branding.accents.unwrap();
+    assert_eq!(
+        accents.light,
+        Some(AccentSet {
+            primary: Some(Rgb(0x1F, 0x4E, 0x9A)),
+            link: Some(Rgb(0x1B, 0x5F, 0xA8)),
+            highlight: Some(Rgb(0x6A, 0x3F, 0xB0)),
+        })
+    );
+    assert_eq!(
+        accents.dark,
+        Some(AccentSet {
+            primary: Some(Rgb(0x7F, 0xD4, 0xFF)),
+            link: Some(Rgb(0x9C, 0xC2, 0xFF)),
+            highlight: None,
+        })
+    );
     let sign_in = plugin.sign_in(App::Chat).unwrap();
     assert_eq!(sign_in.client_id.as_deref(), Some("fixture-client"));
     assert_eq!(sign_in.login_hint.as_deref(), Some("person@example.com"));
