@@ -9296,7 +9296,14 @@ mod flow_view_tests {
             ..Default::default()
         };
         let pal = page_pal(0xffffff, hsla_u(0x3388ff));
-        let look = |p: &Paragraph| marker_look(&marker_mark(p, styler), 14.5, 1.0, &pal);
+        let look = |p: &Paragraph| {
+            marker_look(
+                &marker_mark(p, styler, &shown_mark(p, styler)),
+                14.5,
+                1.0,
+                &pal,
+            )
+        };
         let black = r#"<w:rPr><w:rFonts w:ascii="Aptos"/><w:color w:val="000000"/><w:sz w:val="24"/></w:rPr>"#;
         let red = look(&list_item_2002(7, 0, black, None));
         assert!(red.bold && !red.italic);
@@ -9324,7 +9331,10 @@ mod flow_view_tests {
         // No numbering part: the mark's.
         let bare = run_look::RunStyler::default();
         let p = list_item_2002(7, 0, black, None);
-        assert_eq!(marker_mark(&p, bare), shown_mark(&p, bare));
+        assert_eq!(
+            marker_mark(&p, bare, &shown_mark(&p, bare)),
+            shown_mark(&p, bare)
+        );
     }
 
     /// #2002: the `word-compare` fixture's Symbol bullet level keeps its
@@ -9345,7 +9355,12 @@ mod flow_view_tests {
         .for_paragraph(Some("ListParagraph"));
         let p = list_item_2002(1, 0, mark, Some("ListParagraph"));
         assert!(numbering.level_run_props(1, 0).is_some());
-        assert_eq!(marker_mark(&p, styler).font.as_deref(), Some("Segoe UI"));
+        assert_eq!(
+            marker_mark(&p, styler, &shown_mark(&p, styler))
+                .font
+                .as_deref(),
+            Some("Segoe UI")
+        );
         let coloured = ext_fixture::WORD_COMPARE_NUMBERING.replace(
             "<w:rFonts w:ascii=\"Symbol\" w:hAnsi=\"Symbol\" w:hint=\"default\"/>",
             "<w:rFonts w:ascii=\"Symbol\" w:hAnsi=\"Symbol\" w:hint=\"default\"/><w:b/><w:color w:val=\"C0504D\"/>",
@@ -9356,7 +9371,7 @@ mod flow_view_tests {
             numbering: Some(&numbering),
             ..styler
         };
-        let shown = marker_mark(&p, styler);
+        let shown = marker_mark(&p, styler, &shown_mark(&p, styler));
         assert_eq!(shown.font.as_deref(), Some("Segoe UI"));
         assert!(shown.bold);
         assert_eq!(shown.color.as_deref(), Some("C0504D"));
@@ -9386,7 +9401,7 @@ mod flow_view_tests {
             list_item_2002(1, 0, black, None),
             list_item_2002(7, 0, plain, None),
         ] {
-            let mark = marker_mark(&p, styler);
+            let mark = marker_mark(&p, styler, &shown_mark(&p, styler));
             assert_eq!(mark.color.as_deref(), Some("000000"));
             assert_eq!(marker_look(&mark, 14.5, 1.0, &pal).ink, light);
         }
@@ -40298,7 +40313,8 @@ fn para_text_px(
 }
 
 /// A paragraph mark's run properties as its styles show them (#1986):
-/// what its list number is drawn in, as Word does.
+/// what its line's empty size is, and what its list number is drawn in
+/// below its level's `w:rPr` ([`marker_mark`], #2002).
 fn shown_mark(p: &Paragraph, styler: run_look::RunStyler) -> RunProps {
     let mark = docxcore::model::Run {
         props: p.props.mark_run_props().unwrap_or_default(),
@@ -40308,20 +40324,19 @@ fn shown_mark(p: &Paragraph, styler: run_look::RunStyler) -> RunProps {
 }
 
 /// What a list item's number is drawn in (#2002): its paragraph mark's
-/// look ([`shown_mark`]) with its numbering level's own `w:rPr` over it
+/// look (`mark`, [`shown_mark`]) with its numbering level's own `w:rPr` over it
 /// (`Numbering::marker_props`: bold, italic, colour, size, and a number's
 /// font; a bullet keeps the mark's). A paragraph that is no list item, or
 /// whose level has no `w:rPr` (docxy's own lists), draws it in the mark's.
 /// The line keeps the mark's size: a larger level size does not grow it.
-fn marker_mark(p: &Paragraph, styler: run_look::RunStyler) -> RunProps {
-    let mark = shown_mark(p, styler);
+fn marker_mark(p: &Paragraph, styler: run_look::RunStyler, mark: &RunProps) -> RunProps {
     let level = p.props.ilvl.clamp(0, 8);
     p.props
         .num_id
         .filter(|_| p.props.in_list())
         .zip(styler.numbering)
-        .and_then(|(num_id, n)| n.marker_props(num_id, level, &mark))
-        .unwrap_or(mark)
+        .and_then(|(num_id, n)| n.marker_props(num_id, level, mark))
+        .unwrap_or_else(|| mark.clone())
 }
 
 /// How a list number is drawn (#1986): in its paragraph mark's look, with
@@ -41207,7 +41222,8 @@ fn paragraph_el(
     let styler = styler.for_paragraph(p.props.style_id.as_deref());
     let base = para_base(p, zoom);
     let is_heading = p.props.heading_level.is_some();
-    // The mark's look: the list number's (#1986), and an empty line's size.
+    // The mark's look: an empty line's size (#1986), and what the list
+    // number is drawn in below its level's `w:rPr` (`marker_mark`, #2002).
     let mark = shown_mark(p, styler);
     let text_px = para_text_px(p, styler, &mark, base, zoom);
     let pbox = para_box(&p.props.spacing, flow.flow, is_heading, base, text_px, zoom);
@@ -41335,13 +41351,14 @@ fn paragraph_el(
     };
     // The first flex item shifts just the first line. Subsequent wrapped lines
     // start at the paragraph's left padding, including hanging indents.
-    // The number in its paragraph mark's look, measured in it (#1986). In a
+    // The number in its level's `w:rPr` over its paragraph mark's look
+    // (`marker_mark`, #2002; #1986), measured in it. In a
     // hanging indent the gap after it separates it from the text, so its
     // trailing space goes: "1. " in a browser's 17.8 px hang would pass the
     // indent and push the text to the next stop.
     let hangs = indent_layout.first_x + 0.5 < indent_layout.continuation_x;
     let marker = marker.map(|m| if hangs { m.trim_end() } else { m });
-    let look = marker_look(&marker_mark(p, styler), base, zoom, &pal);
+    let look = marker_look(&marker_mark(p, styler, &mark), base, zoom, &pal);
     let marker_width = marker.map(|s| {
         meas.map(|m| m.width_in(s, look.size, look.bold, look.italic, look.font.as_deref()))
             .unwrap_or(0.0)
