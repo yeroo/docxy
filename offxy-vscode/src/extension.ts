@@ -14,6 +14,7 @@ import * as vscode from 'vscode';
 import { docxToMarkdown, markdownToDocx } from './engine';
 import { newWorkbook } from './gridengine';
 import { CtlHost, CtlServer } from './ctlserver';
+import { PDF_VIEW_TYPE, PdfViewerProvider } from './pdfviewer';
 
 export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(register(context));
@@ -366,6 +367,15 @@ function register(context: vscode.ExtensionContext): vscode.Disposable {
       docxProvider = provider;
     }
   }
+
+  // PDFs open read-only, their pages drawn by the suite's renderer in wasm
+  // (#2259): no edits, so not an `EDITORS` entry.
+  disposables.push(
+    vscode.window.registerCustomEditorProvider(PDF_VIEW_TYPE, new PdfViewerProvider(context), {
+      webviewOptions: { retainContextWhenHidden: true },
+      supportsMultipleEditorsPerDocument: true,
+    }),
+  );
 
   // Tear down every open tab's ctl server (TCP listener + discovery file) on
   // extension deactivate. Each panel's own dispose already does this when the

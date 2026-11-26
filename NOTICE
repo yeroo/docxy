@@ -5,7 +5,10 @@ Third-party material
 
 The desktop suite's PDF view (#2245) draws, reads, searches and fills PDF
 pages, converts a PDF to an editable document with its layout (#2257), and
-prints and exports it as drawn (#2258), with the following crates and the data they embed. Each is used under its
+prints and exports it as drawn (#2258), with the following crates and the data they embed.
+Terminal docxy's `docxy-pdf` and the VS Code extension's `pdfpages.wasm`
+(#2259) draw and read pages with the same renderer (pdfcraft-render and what
+it brings: PdfCraft, hayro, Vello, lopdf and their embedded data below). Each is used under its
 own licence; the crates' licence texts are in their sources, at the revisions
 suite/Cargo.toml and suite/Cargo.lock pin.
 

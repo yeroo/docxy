@@ -1,0 +1,72 @@
+terminal docxy
+# Terminal docxy's PDF viewer (#2259): `docxy <file.pdf>` opens the pages
+# read-only, drawn and read by docxy-pdf, the suite's renderer in a child
+# process. The sweep sets DOCXY_PDF to the docxy-pdf built beside the suite
+# (suite/target/release), so these cases run the real child.
+#
+# The harness's pseudo-terminal answers no picture protocol, so the viewer
+# starts in text mode (each page's text in reading order) and `t` draws the
+# page in half blocks. `pdf-read {"until_idle":true}` answers once nothing
+# is pending: `lines` are the body's text rows as drawn, `drawn` whether the
+# page shown has its raster. The Go to page prompt is typed into by
+# terminal-docxy-inputs-typing.uit. Without docxy-pdf the viewer shows the
+# text importer's text; that and the child's failures are unit tests
+# (docxy/src/pdf_view/tests.rs), since a case cannot unset DOCXY_PDF.
+
+test docxy pdf: opens on page 1 with its text, the outline and the child
+  open copy:../fixtures/pdf-view-slides.pdf
+  call pdf-read {"until_idle":true}
+  assert reply.source is exactly child
+  assert reply.pages is 3
+  assert reply.page is 1
+  assert reply.mode is exactly text
+  assert reply.lines.0 is exactly Quarterly review
+  assert reply.lines.1 is exactly Slide 1 of 3
+  assert reply.outline.2.title is exactly Revenue by region
+  assert reply.outline.2.page is 2
+  assert reply.unopened is null
+
+test docxy pdf: Page Down, End and Home turn the pages
+  open copy:../fixtures/pdf-view-slides.pdf
+  call real-key {"key":"pagedown"}
+  call pdf-read {"until_idle":true}
+  assert reply.page is 2
+  assert reply.lines.0 is exactly Revenue by region
+  call real-key {"key":"end"}
+  call pdf-read {"until_idle":true}
+  assert reply.page is 3
+  assert reply.lines.1 is exactly Slide 3 of 3
+  call real-key {"key":"pagedown"}
+  call pdf-read {}
+  assert reply.page is 3
+  call real-key {"key":"home"}
+  call pdf-read {"until_idle":true}
+  assert reply.page is 1
+
+test docxy pdf: t draws the page, w fits its width, t again its text
+  open copy:../fixtures/pdf-view-slides.pdf
+  call real-key {"key":"t"}
+  call pdf-read {"until_idle":true}
+  assert reply.mode is exactly image
+  assert reply.fit is exactly page
+  assert reply.drawn is true
+  call real-key {"key":"w"}
+  call pdf-read {"until_idle":true}
+  assert reply.fit is exactly width
+  assert reply.drawn is true
+  call real-key {"key":"t"}
+  call pdf-read {"until_idle":true}
+  assert reply.mode is exactly text
+  assert reply.lines.0 is exactly Quarterly review
+
+test docxy pdf: a file that needs a password says to open it in the suite
+  open copy:../fixtures/pdf-view-enc-aes-256.pdf
+  call pdf-read {"until_idle":true}
+  assert reply.unopened is exactly This PDF is protected by a password: open it in the docxy suite, which asks for it.
+  assert reply.pages is 0
+
+test docxy pdf: the viewer answers only its own verbs
+  open copy:../fixtures/pdf-view-text.pdf
+  call pdf-read {"until_idle":true}
+  assert reply.pages is 2
+  call-error doc.insert {"text":"x"} => PDF viewer answers field-read and pdf-read

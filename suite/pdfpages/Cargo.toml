@@ -1,0 +1,36 @@
+[package]
+name = "pdfpages"
+description = "A PDF's pages drawn and read by PdfCraft's pdfcraft-render, for terminal docxy (the docxy-pdf child) and the wasm editors (pdfpages.wasm)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+# `cdylib` is the wasm module the VS Code webview loads; `rlib` is what the
+# `docxy-pdf` child and the native tests link. The wasm ABI (`abi`) is built
+# on every target, so native clippy and tests cover it (#2259).
+crate-type = ["cdylib", "rlib"]
+
+# The child terminal docxy spawns to draw and read a PDF's pages: terminal
+# docxy is in the root workspace (Rust 1.88, published to crates.io), which
+# cannot link PdfCraft (Rust 1.95, a git dependency).
+[[bin]]
+name = "docxy-pdf"
+path = "src/bin/docxy-pdf.rs"
+
+[dependencies]
+# The suite's renderer at the suite's rev: its patched hayro/lopdf/vello copies
+# come from the workspace's `[patch.crates-io]` table (suite/Cargo.toml).
+pdfcraft-render = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# The corpus's `pdftoppm` references are PNGs.
+image = { version = "0.25", default-features = false, features = ["png"] }

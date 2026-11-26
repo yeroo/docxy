@@ -127,6 +127,13 @@ docxy assets/sample.docx
   terminal editors, a dialog with Copy in the suite, where F1 is Help too).
 - **Vim mode** (`--vim`): motions, operators, visual mode, `/` search, `:w`/`:q`.
 - **PDF export**, including headless.
+- **PDF viewing** (`docxy file.pdf`): the pages as they look, through the
+  terminal's picture protocol (kitty, iTerm2, Sixel), or each page's text,
+  read-only. The pages are drawn by `docxy-pdf`, the desktop suite's PDF
+  renderer, shipped beside `docxy` in the release downloads (name it
+  `docxy-pdf`, next to `docxy` or on your `PATH`, or point `DOCXY_PDF` at
+  it; from source: `cargo build --release --manifest-path suite/Cargo.toml
+  -p pdfpages`). Without it docxy shows the PDF's text only and says why.
 
 ## Usage
 
@@ -134,6 +141,7 @@ docxy assets/sample.docx
 docxy <file.docx|.md>           # open a Word or Markdown file
 docxy                           # welcome screen (new .docx/.md, or open)
 docxy <file> --vim              # open with Vim keybindings
+docxy <file.pdf>                # view a PDF's pages read-only (needs docxy-pdf)
 
 # Headless conversion / export (no UI):
 docxy in.docx  --pdf  out.pdf   # export to PDF (embeds system fonts: most scripts; Arabic is not joined)
@@ -384,6 +392,9 @@ formula bar, and full `gridcore` recalculation on edit.
 
 The engines are two small `.wasm` builds — [`docxwasm`](docxwasm) and
 [`gridwasm`](gridwasm), each a hand-written C-ABI bridge, no `wasm-bindgen`.
+A `.pdf` opens read-only in the same extension (`offxy.pdfViewer`), its pages
+drawn by the desktop suite's PDF renderer built for WebAssembly
+([`suite/pdfpages`](suite/pdfpages)), in a worker of its own.
 The architecture — the wasm ABIs, the host ↔ webview split, and how VS Code's
 edit events stay in lockstep with each engine's own undo stack — is written up
 in [VSCODE.md](VSCODE.md).
@@ -507,6 +518,7 @@ cargo run -p mppread  --example tasknames -- some.mpp  # decode a .mpp's tasks +
 
 MIT © yeroo
 
-The desktop suite's PDF view uses PdfCraft, hayro, Vello and lopdf, and the
-fonts, character maps and colour profile they embed, under their own
-licences: see [NOTICE](NOTICE).
+The desktop suite's PDF view, terminal docxy's `docxy-pdf` and the VS Code
+extension's PDF viewer use PdfCraft, hayro, Vello and lopdf, and the fonts,
+character maps and colour profile they embed, under their own licences: see
+[NOTICE](NOTICE).

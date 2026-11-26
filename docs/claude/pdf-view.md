@@ -3,7 +3,8 @@
 Notes for the suite's PDF view: opening a PDF as it looks; its links,
 comments and form, the only thing it writes back (#2255); encrypted,
 updated and damaged files (#2256); converting it to an editable document
-with its layout (#2257); printing and exporting it as drawn (#2258).
+with its layout (#2257); printing and exporting it as drawn (#2258); and
+the same renderer for terminal docxy and the VS Code extension (#2259).
 
 ## PDF view: the renderer and its patch table (#2245)
 
@@ -362,7 +363,7 @@ with its layout (#2257); printing and exporting it as drawn (#2258).
   1 as a field; a page whose forms run past PdfCraft's reading limits, or
   a picture past the budgets, converts without it and says nothing
   (`export_pages_within`'s `truncated` is not carried across the child);
-  terminal docxy and wasm (slice 6).
+  converting in terminal docxy or VS Code (#2259 views only).
 
 ## PDF view: print and export (#2258)
 
@@ -463,5 +464,126 @@ with its layout (#2257); printing and exporting it as drawn (#2258).
 - Not done: print preview, pages per sheet, booklet, poster, print as
   image, grayscale, duplex choice, printer properties; lifting an
   owner-only file's restrictions (no UI takes its owner password);
-  printing documents, sheets or projects; terminal docxy and wasm
-  (slice 6).
+  printing documents, sheets or projects; printing from terminal docxy
+  or VS Code (#2259 views only).
+
+## Terminal docxy and the wasm editors (#2259)
+
+- `suite/pdfpages`, a suite-workspace member (the PdfCraft rev, lock and
+  patch table are the suite's; no new lock entry but its own), is the one
+  core: `Doc` answers `info` (pages' displayed size and label, the outline
+  flattened, the title), `pixels(page, scale)` (straight RGBA over white,
+  within the suite's 4096 px / 16 MP caps by `capped_scale`) and
+  `text(page)` (`PageText::plain_text`, reading order), from
+  `pdfcraft-render` alone. No password, link, form, annotation (but what
+  hayro draws), Find, select or print: those are the suite's.
+- Terminal docxy cannot link PdfCraft: the root workspace's MSRV is 1.88,
+  and docxy is published to crates.io, which refuses a git dependency even
+  optional. So **`docxy-pdf <file> [<ms>]`** (`pdfpages/src/bin`,
+  `pdfpages::child`) serves it, protocol 1: a hello line
+  `{"hello":"docxy-pdf","protocol":1}`, then one JSON line per request
+  (`info`, `pixels {page, scale}`, `text {page}`) and per answer
+  (`{"ok":false,"error","locked"}` for a failure; RGBA after a pixels line,
+  `len` bytes). It is the suite worker's rules without its code (the suite
+  crate is gpui): the watchdog at twice the timeout, `RLIMIT_DATA` 2 GiB
+  and `RLIMIT_CORE` 0 and `oom_score_adj` 1000 on Linux. Its protocol is
+  its own, not the suite's `--pdf-worker` (forms, print, protocol 4).
+- Terminal docxy (`docxy/src/pdf_view.rs`, `pdf_view/child.rs`): `main`
+  sends a PDF by its bytes (`opens_as_pdf`: `%PDF-` in the first 1 KB,
+  never a `.md` or web page by `format_for`, a `.pdf` without it goes the
+  old way) to `pdf_view::run`, its own loop beside `App`; `--pdf|--md|
+  --docx|--html` with a PDF input exit 2 (`headless_refusal`). `Child`
+  finds `docxy-pdf` as `$DOCXY_PDF`, beside `current_exe`, or on `PATH`
+  (`find_child_in`); stderr is null (it would draw over the viewer), lines
+  before the hello are skipped, one question at a time on `Engine`'s
+  thread, `recv_timeout` 20 s; a timeout, death or nonsense kills it, the
+  question answers why, the next starts a new child. A page that failed is
+  never asked again (`failed`). No child (none found, or `Ans::NoChild`: it
+  cannot be started) or a reasoned `Failed` on `info` (`Next::TextOnly`):
+  `TextOnly` runs `import_pdf` (#951) on the engine thread and shows its
+  text as one stream; the status gives why, and `HOW_TO_GET_PAGES` only
+  when there is no child (`t` repeats it). A child that died (`DIED`) or
+  ran out of time (`TOO_LONG`) opening the file: the reason, no text (the
+  file is not read again in docxy's process). A locked file says `LOCKED`
+  (no prompt). A panic in a source answers `DIED` (`Engine` catches it; the
+  panic hook leaves the engine thread's alone). Quitting, or dropping the
+  `Engine`, kills the child through its shared `Killer`, mid-question too.
+  The hello wait has one deadline. Every text drawn (a page's, a reason,
+  the file name) goes through `clean_text`/`clean_line`: C0/C1 controls and
+  DEL become U+FFFD, `\r` is a line break, tabs expand to 8, bidi controls
+  and invisible format characters are dropped.
+- The viewer: Image mode when the `Picker` has a protocol (not
+  Halfblocks), Text otherwise; `t` toggles (Halfblocks pages too), `w` fit
+  page / fit width (Up/Down scroll; a fit-width raster is cropped to the
+  viewport per step, never asked again), PgDn/Space/n/Right,
+  PgUp/p/Left, Home/End, `g` + digits + Enter (`docxy-pdf-page`, #2259 in
+  `suite/docxy/src/inputs.rs`), q/Esc/Ctrl+Q. A raster is asked at the
+  body's pixel size (`font_size` x cells), keyed by `Want` (page, fit,
+  box); 4 kept. The shown page is asked first, then the next. No F1, theme
+  or prefs.
+- Its control server (`control::control_dir`/`instance_name`, as `App`)
+  answers `field-read` (`ctlcore::field` counters; every key counted, a
+  frame after each) and `pdf-read` (`pages`, `page`, `label`, `mode`,
+  `fit`, `scroll`, `source` child|text-only, `status`, `unopened`,
+  `failed`, `drawn`, `busy`, `outline`, `lines`: the body's text rows);
+  `{"until_idle":true}` replies once nothing is pending, at most 5 s. Any
+  other verb is refused. The harness's terminal `open` of a `.pdf` in docxy
+  waits on it (`term::waits_for_pdf`), so a case's first key finds the
+  pages read.
+- VS Code: `offxy.pdfViewer` (`src/pdfviewer.ts`, a
+  `CustomReadonlyEditorProvider`, `*.pdf` at priority `default`) posts the
+  bytes to `media/pdf.js`. **wasm32 has no unwinding**: a panic, the memory
+  cap or a stack overflow traps and leaves the instance unusable, and a
+  slow page would block the webview. So the engine runs in one blob Worker
+  per view (`pdfengine.js` + `pdfworker.js`; the main thread compiles the
+  module and posts it; CSP `worker-src blob:`), behind `pdfhost.js`: one
+  request at a time, 20 s each (the open too); past it, or on a trap or a
+  dead worker, the worker is ended, the page shows why and is not asked
+  again, and a new worker opens the same bytes. A worker that dies opening
+  the file is not started again. Pages are stacked at their size, drawn
+  near the viewport (IntersectionObserver, `100%` margin; far pages give
+  their canvas back) at zoom x devicePixelRatio; fit width follows the
+  view's width (ResizeObserver: the scrollbar's arrival too).
+- `pdfpages.wasm`: the hand-written ABI (`abi.rs`, docxwasm's style,
+  length-prefixed answers; `pdf_render` is `[u32 w][u32 h][RGBA]` or zeros
+  and why) is built on every target, so native clippy and tests cover it.
+  `build.rs` caps linear memory at 1 GiB (`--max-memory`).
+  `[profile.wasm]` (opt-level `s`, LTO, one codegen unit, stripped, abort)
+  leaves the suite's release alone; `build:wasm` builds it and
+  `copy-wasm.mjs` copies `suite/target/wasm32-unknown-unknown/wasm/`.
+  PdfCraft builds for wasm32 as it is (its `Stopwatch` and getrandom's
+  `wasm_js` are there for it). Its only imports are getrandom's
+  wasm-bindgen placeholders (lopdf's `rand`, for writing encrypted files);
+  getrandom 0.4 cannot switch backend with `wasm_js` on, so each import is
+  a throwing stub (`stubImports`), and the module carries js-sys's 1,366
+  unused `__wbindgen_describe_*` exports (the wasm-bindgen CLI would strip
+  them; not used, to keep the ABI hand-written).
+- Measured (this laptop, 22 cores): `docxy-pdf` clean release build 70 s,
+  10.1 MB stripped (the release step strips it: the suite profile's line
+  tables make it 79 MB); `pdfpages.wasm` 6.90 MB, 2.39 MB gzipped at `s`
+  (`z`: 6.73 / 2.33 MB, 30 % slower on the corpus); the VSIX 2.94 MB to
+  5.36 MB.
+- Tests: `pdfpages` (page 1 of each referenced corpus file against
+  `ref/` in the suite's block tolerance, text order, sizes and outline,
+  locked and unreadable files, the ABI natively; `tests/child.rs` the built
+  child end to end, its Linux limits read from `/proc`, every corpus file
+  and 21 mutations of each); docxy's `pdf_view::tests` (state, keys,
+  drawing, verbs on fake answers; the client against the test binary as a
+  fake child; `real_child_*`, ignored unless `DOCXY_PDF`, which CI's
+  `suite-linux` runs, the only place both halves of the protocol meet);
+  `offxy-vscode/media/pdf.test.mjs` (the import list, the corpus with no
+  stub called, a trap past the cap and a fresh instance, `pdfhost.js` with
+  fake workers); `uiharness/cases/terminal-docxy-pdf.uit` and the
+  `docxy-pdf-page` cases in `terminal-docxy-inputs-typing.uit` through the
+  real child (the sweep sets `DOCXY_PDF` to the `docxy-pdf` beside
+  `--suite`, `pdf_child`).
+- Shipping: the release `build` matrix builds `docxy-pdf` stripped and
+  ships `docxy-pdf-<suffix>` beside `docxy-<suffix>` (renamed `docxy-pdf`
+  to be found); `tui.iss` installs it (`PdfSrcDir`); the macOS CLI tarball
+  has it. `cargo install docxy` users build it from `suite/`.
+- Not done: a password prompt, links, select/copy, Find, outline
+  navigation, print and convert in the terminal and VS Code; the
+  JetBrains plugin (Chicory runs wasm in the JVM, Swing draws: the same
+  module would load, the viewer is its own work); the editable-HTML page;
+  tiles past the caps; `NOTICE` is not bundled in the VSIX or the CLI
+  downloads (nor in the suite's installers).

@@ -79,7 +79,9 @@ issue number to find its notes.
   text importer as fallback, running headers and footers, columns as
   virtual pages, fonts through code colours, text-box twins (#2257);
   print and export as drawn: imposition, the spooler and its test seam,
-  PNG and page-range export (#2258).
+  PNG and page-range export (#2258); terminal docxy and VS Code: the
+  `docxy-pdf` child and `pdfpages.wasm` in a worker, the text fallback,
+  the wasm profile and imports (#2259).
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),
   images (#1880), links (#1879), centring (#1922), in cells (#1930),
   bookmarks, the Hyperlink style, relative links, titles and targets,
@@ -207,7 +209,7 @@ issue number to find its notes.
 - `docs/claude/terminal-editors.md`: before changing terminal `docxy`, `xlsxy` or
   `yppxy`, or `backstagecore`'s Save As name field: docxy's Layout tab (#1274), prompts
   editing at a caret (#1372, #1373, #1374, #1375, #1379), Ctrl+C/X/V (#1377, #1378),
-  Ctrl+A (#1376), the F1 help reader (#1856).
+  Ctrl+A (#1376), the F1 help reader (#1856), the PDF viewer (#2259).
 - `docs/claude/mail.md`: before changing `mailcore` or Mail: drafts keep their `local:`
   id (#1884, #1881), the body format (#1901), sync one folder, the fast cycle and Sent
   Items after a send (#1885), folders and counts on every tick, deleted folders (#1886),
@@ -320,6 +322,11 @@ What CI runs (`.github/workflows/ci.yml`):
   `cargo fmt --all --check --manifest-path suite/Cargo.toml`,
   `cargo clippy --manifest-path suite/Cargo.toml --all-targets --locked -- -D warnings`,
   `cargo test --manifest-path suite/Cargo.toml --locked` (on Linux under `xvfb-run -a`).
+- The PDF viewers outside the suite (#2259), in `suite-linux`: terminal docxy against
+  the real child, `DOCXY_PDF=$PWD/suite/target/debug/docxy-pdf cargo test -p docxy
+  --locked -- --ignored pdf_view::`; the wasm engine, `cargo build --manifest-path
+  suite/Cargo.toml -p pdfpages --lib --target wasm32-unknown-unknown --profile wasm
+  --locked`, then `node offxy-vscode/media/pdf.test.mjs`.
 - The UI sweep runs every `uiharness/cases/*.uit` against release builds
   (`cargo build --release --locked --manifest-path suite/Cargo.toml`, then
   `cargo build --release --locked -p uiharness -p docxy -p xlsxy -p yppxy -p plugin_fixture`):

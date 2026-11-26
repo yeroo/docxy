@@ -1,0 +1,106 @@
+/* The PDF viewer webview (#2259). Pages stay white in a dark theme, as the
+   suite draws them. */
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-editor-foreground);
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size);
+}
+
+#toolbar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  box-sizing: border-box;
+  border-bottom: 1px solid var(--vscode-panel-border, transparent);
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+}
+
+#toolbar button {
+  min-width: 28px;
+  height: 24px;
+  color: var(--vscode-button-secondaryForeground, inherit);
+  background: var(--vscode-button-secondaryBackground, transparent);
+  border: 1px solid var(--vscode-button-border, transparent);
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+#toolbar button:hover {
+  background: var(--vscode-button-secondaryHoverBackground, transparent);
+}
+
+#zoom {
+  min-width: 44px;
+  text-align: center;
+}
+
+#page {
+  width: 48px;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent);
+}
+
+#status {
+  margin-left: auto;
+  opacity: 0.8;
+}
+
+#pages {
+  position: absolute;
+  top: 32px;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  overflow: auto;
+  outline: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 16px 0;
+  box-sizing: border-box;
+}
+
+.page {
+  position: relative;
+  flex: none;
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+
+.page canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.failed-page {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  text-align: center;
+  color: #444;
+}
+
+.failed-doc {
+  max-width: 560px;
+  margin: 48px auto;
+  padding: 0 16px;
+}
