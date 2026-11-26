@@ -25,6 +25,7 @@ mod metafile;
 #[cfg(test)]
 #[path = "../../docxcore/tests/common/pdf_read.rs"]
 mod pdf_read;
+mod pdf_view;
 mod protection;
 mod ribbon;
 mod skill;
@@ -312,6 +313,27 @@ fn main() -> ExitCode {
     if parsed.help {
         print_usage();
         return ExitCode::SUCCESS;
+    }
+    // A PDF (by its bytes, not its name; never a Markdown or web page that
+    // only mentions `%PDF-`) opens in the read-only page viewer (#2259).
+    if let Some(input) = parsed.input.as_deref() {
+        if pdf_view::opens_as_pdf(input) {
+            if parsed.pdf_out.is_some()
+                || parsed.md_out.is_some()
+                || parsed.docx_out.is_some()
+                || parsed.html_out.is_some()
+            {
+                eprintln!("error: {}", pdf_view::headless_refusal(input));
+                return ExitCode::from(2);
+            }
+            return match pdf_view::run(input) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
     }
     // No file argument → open on the welcome screen instead of a blank document.
     let start = parsed.input.is_none();
@@ -776,6 +798,7 @@ fn print_usage() {
            docxy                           welcome screen (new .docx/.md, open)\n  \
            docxy <file.docx|.md>           open a Word or Markdown file\n  \
            docxy <file> --vim              open with vim keybindings\n  \
+           docxy <file.pdf>                view a PDF's pages read-only (with docxy-pdf)\n  \
            docxy <file> --pdf <out>        export to PDF and exit\n  \
            docxy <file> --md <out.md>      convert to Markdown and exit\n  \
            docxy <file> --docx <out.docx>  convert to Word .docx and exit\n  \
