@@ -20,11 +20,15 @@ corpus/pdf-view/README.md):
   `-dAutoRotatePages=/None` keeps gs from rotating pages by itself;
 - Pillow, for the JPEG of the "scanned" page;
 - pdftoppm (poppler), for the references: `pdftoppm -r 72 -png`, one pixel
-  per point, which is what the test renders at scale 1.
+  per point, which is what the test renders at scale 1;
+- cryptography (AES) and pdftotext (poppler), for the encrypted files of
+  slice 3 (#2256): written by the generator's own security handler, and
+  checked by poppler with each password as they are made.
 """
 
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -312,11 +316,19 @@ class RawPdf:
         res = f" /Resources << {resources} >>" if resources else ""
         return self.stream(ops, f"/Type /XObject /Subtype /Form /BBox [0 0 {w:g} {h:g}]{res}")
 
-    def write(self, path, root, info=None):
-        out = bytearray(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n")
+    def build(self, root, info=None, security=None, file_id=None, version="1.7"):
+        """The file's bytes and its xref's offset. `security` (a [`Security`])
+        encrypts every object but its own `/Encrypt` dictionary (#2256)."""
+        file_id = file_id or "2255" * 8
+        enc_ref = None
+        if security:
+            enc_ref = self.add(security.dictionary())
+        out = bytearray(f"%PDF-{version}\n%\xe2\xe3\xcf\xd3\n".encode("latin-1"))
         offsets = []
         for i, body in enumerate(self.objs, 1):
             assert body is not None, f"object {i} reserved and never set"
+            if security and i != enc_ref:
+                body = security.encrypt_object(i, body)
             offsets.append(len(out))
             out += f"{i} 0 obj\n".encode() + body + b"\nendobj\n"
         xref = len(out)
@@ -324,10 +336,15 @@ class RawPdf:
         for o in offsets:
             out += f"{o:010d} 00000 n \n".encode()
         info_ref = f" /Info {info} 0 R" if info else ""
+        enc = f" /Encrypt {enc_ref} 0 R" if enc_ref else ""
         out += (
-            f"trailer\n<< /Size {len(self.objs) + 1} /Root {root} 0 R{info_ref}"
-            f" /ID [<{'2255' * 8}> <{'2255' * 8}>] >>\nstartxref\n{xref}\n%%EOF\n"
+            f"trailer\n<< /Size {len(self.objs) + 1} /Root {root} 0 R{info_ref}{enc}"
+            f" /ID [<{file_id}> <{file_id}>] >>\nstartxref\n{xref}\n%%EOF\n"
         ).encode()
+        return bytes(out), xref
+
+    def write(self, path, root, info=None, **kw):
+        out, _ = self.build(root, info, **kw)
         with open(path, "wb") as f:
             f.write(out)
 
@@ -691,6 +708,481 @@ SLICE2 = {
 }
 
 
+# ---- slice 3 (#2256): encrypted, incremental, object-stream and damaged files ----
+#
+# The standard security handler written by hand (ISO 32000-2 §7.6.4), so the
+# files test PdfCraft against an independent writer; their references are
+# drawn by poppler from the encrypted files (`pdftoppm -upw`), so a mistake
+# here fails when the corpus is made, not in the suite's tests. Every salt,
+# IV and key is fixed: a run writes the same bytes again.
+
+PAD = bytes.fromhex("28BF4E5E4E758A4164004E56FFFA01082E2E00B6D0683E802F0CA9FE6453697A")
+
+
+def rc4(key, data):
+    s = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + s[i] + key[i % len(key)]) % 256
+        s[i], s[j] = s[j], s[i]
+    out = bytearray()
+    i = j = 0
+    for b in data:
+        i = (i + 1) % 256
+        j = (j + s[i]) % 256
+        s[i], s[j] = s[j], s[i]
+        out.append(b ^ s[(s[i] + s[j]) % 256])
+    return bytes(out)
+
+
+def aes_cbc(key, iv, data):
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    e = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+    return e.update(data) + e.finalize()
+
+
+def aes_ecb(key, data):
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    e = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+    return e.update(data) + e.finalize()
+
+
+def pkcs7(data):
+    n = 16 - len(data) % 16
+    return data + bytes([n]) * n
+
+
+def md5(*parts):
+    import hashlib
+
+    h = hashlib.md5()
+    for p in parts:
+        h.update(p)
+    return h.digest()
+
+
+def padded(pw):
+    return (pw.encode("latin-1") + PAD)[:32]
+
+
+def hash_2b(pw, salt, udata):
+    """Algorithm 2.B (revision 6)."""
+    import hashlib
+
+    k = hashlib.sha256(pw + salt + udata).digest()
+    i = 0
+    while True:
+        k1 = (pw + k + udata) * 64
+        e = aes_cbc(k[:16], k[16:32], k1)
+        h = (hashlib.sha256, hashlib.sha384, hashlib.sha512)[int.from_bytes(e[:16], "big") % 3]
+        k = h(e).digest()
+        i += 1
+        if i >= 64 and e[-1] <= i - 32:
+            return k[:32]
+
+
+# Print (bit 3), modify (bit 4) and copy (bit 5) withheld; annotate (6) and
+# fill forms (9) kept. Bits 7-8 and 13-32 are 1 (Table 22).
+RESTRICTED = -32
+
+
+class Security:
+    """One file's standard security handler: `method` is rc4-40, rc4-128,
+    aes-128 or aes-256."""
+
+    def __init__(self, method, user, owner, file_id, p=RESTRICTED):
+        self.method, self.user, self.owner, self.p = method, user, owner, p
+        self.id0 = bytes.fromhex(file_id)
+        self.aes = method.startswith("aes")
+        if method == "aes-256":
+            self._r6()
+        else:
+            self.r = {"rc4-40": 2, "rc4-128": 3, "aes-128": 4}[method]
+            self.n = 5 if self.r == 2 else 16
+            self.o = self._o()
+            self.key = self._key(user)
+            self.u = self._u()
+
+    # Algorithm 3: /O.
+    def _o(self):
+        k = md5(padded(self.owner or self.user))
+        if self.r >= 3:
+            for _ in range(50):
+                k = md5(k[: self.n])
+        k = k[: self.n]
+        o = rc4(k, padded(self.user))
+        if self.r >= 3:
+            for i in range(1, 20):
+                o = rc4(bytes(b ^ i for b in k), o)
+        return o
+
+    # Algorithm 2: the file key.
+    def _key(self, pw):
+        k = md5(padded(pw), self.o, (self.p & 0xFFFFFFFF).to_bytes(4, "little"), self.id0)
+        if self.r >= 3:
+            for _ in range(50):
+                k = md5(k[: self.n])
+        return k[: self.n]
+
+    # Algorithms 4 and 5: /U.
+    def _u(self):
+        if self.r == 2:
+            return rc4(self.key, PAD)
+        u = rc4(self.key, md5(PAD, self.id0))
+        for i in range(1, 20):
+            u = rc4(bytes(b ^ i for b in self.key), u)
+        return u + bytes(16)
+
+    # Algorithms 8, 9 and 10 (revision 6).
+    def _r6(self):
+        self.r = 6
+        self.key = md5(b"2256 file key a") + md5(b"2256 file key b")
+        user, owner = self.user.encode("utf-8"), (self.owner or self.user).encode("utf-8")
+        uvs, uks = b"uvsalt01", b"ukssalt1"
+        self.u = hash_2b(user, uvs, b"") + uvs + uks
+        self.ue = aes_cbc(hash_2b(user, uks, b""), bytes(16), self.key)
+        ovs, oks = b"ovsalt01", b"okssalt1"
+        self.o = hash_2b(owner, ovs, self.u) + ovs + oks
+        self.oe = aes_cbc(hash_2b(owner, oks, self.u), bytes(16), self.key)
+        perms = (self.p & 0xFFFFFFFF).to_bytes(4, "little") + b"\xff\xff\xff\xff" + b"Tadb" + b"2256"
+        self.perms = aes_ecb(self.key, perms)
+
+    def dictionary(self):
+        hx = lambda b: "<" + b.hex() + ">"
+        head = f"<< /Filter /Standard /P {self.p} /O {hx(self.o)} /U {hx(self.u)}"
+        if self.method == "rc4-40":
+            return head + " /V 1 /R 2 >>"
+        if self.method == "rc4-128":
+            return head + " /V 2 /R 3 /Length 128 >>"
+        if self.method == "aes-128":
+            cf = "/CF << /StdCF << /AuthEvent /DocOpen /CFM /AESV2 /Length 16 >> >>"
+            return head + f" /V 4 /R 4 /Length 128 {cf} /StmF /StdCF /StrF /StdCF >>"
+        cf = "/CF << /StdCF << /AuthEvent /DocOpen /CFM /AESV3 /Length 32 >> >>"
+        return (
+            head + f" /OE {hx(self.oe)} /UE {hx(self.ue)} /Perms {hx(self.perms)}"
+            f" /V 5 /R 6 /Length 256 {cf} /StmF /StdCF /StrF /StdCF >>"
+        )
+
+    # Algorithm 1 (and 1.A for revision 6): one string or stream.
+    def encrypt(self, num, data, nth):
+        if self.r == 6:
+            key = self.key
+        else:
+            extra = b"sAlT" if self.aes else b""
+            key = md5(self.key, num.to_bytes(3, "little"), b"\0\0", extra)[: min(self.n + 5, 16)]
+        if not self.aes:
+            return rc4(key, data)
+        iv = md5(b"iv", num.to_bytes(4, "little"), nth.to_bytes(4, "little"))
+        return iv + aes_cbc(key, iv, pkcs7(data))
+
+    def encrypt_object(self, num, body):
+        """`body` with each string and its stream's data encrypted: strings
+        are written as hex, a stream's `/Length` follows its new data."""
+        data = None
+        if b"\nstream\n" in body:
+            cut = body.index(b"\nstream\n")
+            head, data = body[:cut], body[cut + 8 :]
+            assert data.endswith(b"\nendstream"), num
+            data = data[: -len(b"\nendstream")]
+        else:
+            head = body
+        out, nth = bytearray(), 0
+        i = 0
+        while i < len(head):
+            c = head[i : i + 1]
+            if head[i : i + 2] in (b"<<", b">>"):
+                out += head[i : i + 2]
+                i += 2
+            elif c == b"<":
+                end = head.index(b">", i)
+                raw = bytes.fromhex(head[i + 1 : end].decode())
+                nth += 1
+                out += b"<" + self.encrypt(num, raw, nth).hex().encode() + b">"
+                i = end + 1
+            elif c == b"(":
+                raw, i = literal(head, i)
+                nth += 1
+                out += b"<" + self.encrypt(num, raw, nth).hex().encode() + b">"
+            else:
+                out += c
+                i += 1
+        if data is None:
+            return bytes(out)
+        data = self.encrypt(num, data, 0)
+        head = re.sub(rb"/Length \d+", f"/Length {len(data)}".encode(), bytes(out), count=1)
+        return head + b"\nstream\n" + data + b"\nendstream"
+
+
+def literal(b, i):
+    """The literal string starting at `b[i]` (a `(`): its bytes and the index past it."""
+    assert b[i : i + 1] == b"("
+    i += 1
+    depth, out = 1, bytearray()
+    esc = {b"n": b"\n", b"r": b"\r", b"t": b"\t", b"b": b"\b", b"f": b"\f"}
+    while True:
+        c = b[i : i + 1]
+        if c == b"\\":
+            n = b[i + 1 : i + 2]
+            if n in esc:
+                out += esc[n]
+                i += 2
+            elif n.isdigit():
+                j = i + 1
+                while j < i + 4 and b[j : j + 1].isdigit():
+                    j += 1
+                out.append(int(b[i + 1 : j], 8) & 0xFF)
+                i = j
+            else:
+                out += n
+                i += 2
+            continue
+        if c == b"(":
+            depth += 1
+        elif c == b")":
+            depth -= 1
+            if depth == 0:
+                return bytes(out), i + 1
+        out += c
+        i += 1
+
+
+# Every slice 3 page: large colour blocks (so a reference comparison has
+# enough on it: a blank page fails it) and Helvetica lines the text tests read.
+def blocks_page(pdf, pages_ref, font, lines, size=A4):
+    ops = [
+        "0.15 0.35 0.75 rg 72 560 220 140 re f",
+        "0.85 0.25 0.2 rg 320 560 200 140 re f",
+        "0.2 0.65 0.3 rg 72 380 448 120 re f",
+        "0 G 3 w 72 330 m 520 330 l S",
+        labels(lines, 14),
+    ]
+    return page(pdf, pages_ref, "\n".join(ops), font=font, size=size)
+
+
+def one_page(lines):
+    """A RawPdf with one blocks page: (pdf, catalog)."""
+    pdf = RawPdf()
+    catalog, pages = pdf.reserve(), pdf.reserve()
+    font = pdf.add(HELV)
+    p1 = blocks_page(pdf, pages, font, lines)
+    pdf.set(pages, f"<< /Type /Pages /Kids [{p1} 0 R] /Count 1 >>")
+    pdf.set(catalog, f"<< /Type /Catalog /Pages {pages} 0 R >>")
+    return pdf, catalog
+
+
+# The made-up passwords of the encrypted files (corpus/pdf-view/README.md);
+# the suite's tests hold the same table.
+ENCRYPTED = {
+    "enc-rc4-40": ("rc4-40", "user-rc4-40", "owner-rc4-40", "RC4 40"),
+    "enc-rc4-128": ("rc4-128", "user-rc4-128", "owner-rc4-128", "RC4 128"),
+    "enc-aes-128": ("aes-128", "user-aes-128", "owner-aes-128", "AES 128"),
+    "enc-aes-256": ("aes-256", "user-aes-256", "owner-aes-256", "AES 256"),
+    "enc-owner-only": ("aes-128", "", "owner-only", "AES 128, owner password only"),
+}
+ENC_ID = "2256" * 8
+
+
+def make_encrypted(name):
+    method, user, owner, label = ENCRYPTED[name]
+
+    def make(path):
+        pdf, catalog = one_page([(72, 760, f"Encrypted with {label}"), (72, 735, "Protected page text")])
+        info = pdf.add("<< /Title (Encrypted corpus) /Author (docxy) >>")
+        pdf.write(path, catalog, info, security=Security(method, user, owner, ENC_ID), file_id=ENC_ID)
+        check_encrypted(path, name)
+
+    return make
+
+
+def run_ok(args):
+    return subprocess.run(args, capture_output=True).returncode == 0
+
+
+def text_by_poppler(path, *pw):
+    r = subprocess.run(["pdftotext", *pw, path, "-"], capture_output=True)
+    return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None
+
+
+def check_encrypted(path, name):
+    """poppler, an independent reader, opens the file with each password the
+    tests use and refuses it without one (but the owner-only file)."""
+    method, user, owner, label = ENCRYPTED[name]
+    want = f"Encrypted with {label}"
+    if user:
+        assert text_by_poppler(path) is None, f"{name} opens without a password"
+        assert text_by_poppler(path, "-upw", "wrong") is None, f"{name} opens with a wrong password"
+        assert want in (text_by_poppler(path, "-upw", user) or ""), f"{name}: user password"
+    else:
+        assert want in (text_by_poppler(path) or ""), f"{name} needs a password"
+    assert want in (text_by_poppler(path, "-opw", owner) or ""), f"{name}: owner password"
+
+
+def make_incremental(path):
+    """A file and one update appended to it (§7.5.6): the update rewrites
+    page 1's content and the page tree, and adds a page. A reader of the
+    first revision shows one page saying "First revision"."""
+    pdf = RawPdf()
+    catalog, pages = pdf.reserve(), pdf.reserve()
+    font = pdf.add(HELV)
+    p1 = blocks_page(pdf, pages, font, [(72, 760, "First revision")])
+    pdf.set(pages, f"<< /Type /Pages /Kids [{p1} 0 R] /Count 1 >>")
+    pdf.set(catalog, f"<< /Type /Catalog /Pages {pages} 0 R >>")
+    base, prev = pdf.build(catalog)
+    first = len(pdf.objs)
+    # The update: objects past the first revision's, and new versions of
+    # the page tree and page 1.
+    upd = RawPdf()
+    upd.objs = [None] * first
+    p2 = blocks_page(upd, pages, font, [(72, 760, "Added in the update")])
+    content = upd.stream(
+        "\n".join(
+            [
+                "0.15 0.35 0.75 rg 72 560 220 140 re f",
+                "0.85 0.25 0.2 rg 320 560 200 140 re f",
+                "0.6 0.2 0.7 rg 72 380 448 120 re f",
+                labels([(72, 760, "Latest revision"), (72, 735, "Written by an incremental update")], 14),
+            ]
+        )
+    )
+    page1 = (
+        f"<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 {A4[0]:g} {A4[1]:g}]"
+        f" /Resources << /Font << /F1 {font} 0 R >> >> /Contents {content} 0 R /Annots [] >>"
+    )
+    changed = {pages: f"<< /Type /Pages /Kids [{p1} 0 R {p2} 0 R] /Count 2 >>", p1: page1}
+    out = bytearray(base)
+    offsets = {}
+    for n, body in changed.items():
+        offsets[n] = len(out)
+        out += f"{n} 0 obj\n{body}\nendobj\n".encode()
+    for n in range(first + 1, len(upd.objs) + 1):
+        offsets[n] = len(out)
+        out += f"{n} 0 obj\n".encode() + upd.objs[n - 1] + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n"
+    for n in sorted(offsets):
+        out += f"{n} 1\n{offsets[n]:010d} 00000 n \n".encode()
+    out += (
+        f"trailer\n<< /Size {len(upd.objs) + 1} /Root {catalog} 0 R /Prev {prev}"
+        f" /ID [<{'2255' * 8}> <{'2256' * 8}>] >>\nstartxref\n{xref}\n%%EOF\n"
+    ).encode()
+    with open(path, "wb") as f:
+        f.write(out)
+    t = text_by_poppler(path) or ""
+    assert "Latest revision" in t and "Added in the update" in t and "First revision" not in t, t
+
+
+def make_objstm(path):
+    """PDF 1.5 (§7.5.7, §7.5.8): the catalog, page tree, page and font in
+    one Flate-compressed object stream, found through a cross-reference
+    stream; only the page's content is a plain object."""
+    import zlib
+
+    pdf, catalog = one_page([(72, 760, "Object and cross-reference streams"), (72, 735, "PDF 1.5")])
+    # objects: 1 catalog, 2 pages, 3 font, 4 content, 5 page.
+    assert [b.startswith(b"<< /Type /Page ") for b in pdf.objs] == [False, False, False, False, True]
+    members = [1, 2, 3, 5]
+    head, body = [], bytearray()
+    for n in members:
+        head.append(f"{n} {len(body)}")
+        body += pdf.objs[n - 1] + b"\n"
+    head = (" ".join(head) + "\n").encode()
+    packed = zlib.compress(head + bytes(body), 9)
+    objstm = 6
+    out = bytearray(b"%PDF-1.5\n%\xe2\xe3\xcf\xd3\n")
+    offsets = {}
+    offsets[4] = len(out)
+    out += b"4 0 obj\n" + pdf.objs[3] + b"\nendobj\n"
+    offsets[objstm] = len(out)
+    out += (
+        f"{objstm} 0 obj\n<< /Type /ObjStm /N {len(members)} /First {len(head)}"
+        f" /Filter /FlateDecode /Length {len(packed)} >>\nstream\n"
+    ).encode() + packed + b"\nendstream\nendobj\n"
+    xref_num = 7
+    offsets[xref_num] = len(out)
+    rows = bytearray()
+    for n in range(xref_num + 1):
+        if n == 0:
+            rows += bytes([0]) + (0).to_bytes(4, "big") + (65535).to_bytes(2, "big")
+        elif n in members:
+            rows += bytes([2]) + objstm.to_bytes(4, "big") + members.index(n).to_bytes(2, "big")
+        else:
+            rows += bytes([1]) + offsets[n].to_bytes(4, "big") + (0).to_bytes(2, "big")
+    rows = zlib.compress(bytes(rows), 9)
+    out += (
+        f"{xref_num} 0 obj\n<< /Type /XRef /Size {xref_num + 1} /W [1 4 2] /Root 1 0 R"
+        f" /ID [<{'2256' * 8}> <{'2256' * 8}>] /Filter /FlateDecode /Length {len(rows)} >>\nstream\n"
+    ).encode() + rows + b"\nendstream\nendobj\n"
+    out += f"startxref\n{offsets[xref_num]}\n%%EOF\n".encode()
+    with open(path, "wb") as f:
+        f.write(out)
+    assert "Object and cross-reference streams" in (text_by_poppler(path) or "")
+
+
+def damaged(lines):
+    """A plain one-page file before it is damaged: its bytes (the
+    reference is drawn from them, as poppler cannot rebuild a file without
+    a trailer) and its xref's offset."""
+    pdf, catalog = one_page(lines)
+    info = pdf.add("<< /Title (Damaged corpus) /Producer (make-pdf-view-corpus.py) >>")
+    out, xref = pdf.build(catalog, info)
+    return out, xref
+
+
+def make_damaged_offsets(path):
+    """Every xref offset 7 bytes past its object: the table must be rebuilt."""
+    out, xref = damaged([(72, 760, "Damaged: every offset is wrong")])
+    table = out[xref:]
+    fixed = re.sub(rb"(\d{10}) 00000 n", lambda m: b"%010d 00000 n" % (int(m.group(1)) + 7), table)
+    with open(path, "wb") as f:
+        f.write(out[:xref] + fixed)
+    return out
+
+
+def make_damaged_noxref(path):
+    """No xref table, trailer or startxref: the objects only."""
+    out, xref = damaged([(72, 760, "Damaged: no cross-reference table")])
+    with open(path, "wb") as f:
+        f.write(out[:xref])
+    return out
+
+
+def make_damaged_truncated(path):
+    """Cut in the middle of its last object (the /Info dictionary), so no
+    xref or trailer: the page's objects are all whole."""
+    out, xref = damaged([(72, 760, "Damaged: the file is cut short")])
+    last = out.rindex(b" 0 obj\n", 0, xref)
+    with open(path, "wb") as f:
+        f.write(out[: last + 20])
+    return out
+
+
+def make_damaged_unreadable(path):
+    """A PDF header and nothing a reader can use: no object, no xref."""
+    import hashlib
+
+    junk = bytearray()
+    seed = b"2256"
+    while len(junk) < 4096:
+        seed = hashlib.sha256(seed).digest()
+        junk += seed
+    junk = bytes(junk).replace(b"obj", b"ojb").replace(b"trailer", b"trailor")
+    with open(path, "wb") as f:
+        f.write(b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n" + junk + b"\n%%EOF\n")
+
+
+SLICE3 = {
+    **{name: make_encrypted(name) for name in ENCRYPTED},
+    "incremental": make_incremental,
+    "objstm": make_objstm,
+    "damaged-offsets": make_damaged_offsets,
+    "damaged-noxref": make_damaged_noxref,
+    "damaged-truncated": make_damaged_truncated,
+    "damaged-unreadable": make_damaged_unreadable,
+}
+
+
 def gs(ps, path):
     src = path + ".ps"
     with open(src, "w") as f:
@@ -718,10 +1210,11 @@ def gs(ps, path):
         os.remove(src)
 
 
-def references(pdf, name):
+def references(pdf, name, password=None):
     """pdftoppm -r 72: <name>-<page>.png, the page number unpadded."""
     tmp = os.path.join(REF, f".{name}")
-    subprocess.run(["pdftoppm", "-r", "72", "-png", pdf, tmp], check=True)
+    pw = ["-upw", password] if password else []
+    subprocess.run(["pdftoppm", "-r", "72", "-png", *pw, pdf, tmp], check=True)
     made = sorted(f for f in os.listdir(REF) if f.startswith(f".{name}-"))
     for f in made:
         page = int(f[len(name) + 2 : -4])
@@ -737,7 +1230,7 @@ def main():
         if not shutil.which(tool):
             sys.exit(f"{tool} is needed")
     only = set(sys.argv[1:])
-    unknown = only - {"text", "columns", "scanned", "slides", "vector", "rotated", "source", *SLICE2}
+    unknown = only - {"text", "columns", "scanned", "slides", "vector", "rotated", "source", *SLICE2, *SLICE3}
     if unknown:
         sys.exit(f"no such corpus file: {', '.join(sorted(unknown))}")
     want = lambda name: not only or name in only
@@ -758,9 +1251,14 @@ def main():
         gs(VECTOR_PS, os.path.join(OUT, "vector.pdf"))
     if want("rotated"):
         gs(ROTATED_PS, os.path.join(OUT, "rotated.pdf"))
-    for name, make in SLICE2.items():
+    # A damaged file's maker hands back the file as it was before the
+    # damage: its reference is drawn from that.
+    intacts = {}
+    for name, make in {**SLICE2, **SLICE3}.items():
         if want(name):
-            make(os.path.join(OUT, f"{name}.pdf"))
+            intact = make(os.path.join(OUT, f"{name}.pdf"))
+            if name in SLICE3 and intact:
+                intacts[name] = intact
     # References for the files drawn against poppler; the slice 2 files
     # other than annots.pdf are checked by what they hold, not by pixels.
     for name in [*made, "vector", "rotated", "annots"]:
@@ -768,10 +1266,24 @@ def main():
             references(os.path.join(OUT, f"{name}.pdf"), name)
     if want("source"):
         references(SOURCE_PDF, "source")
+    # Slice 3 (#2256): every file a reader opens, the encrypted ones drawn
+    # with their user password; damaged-unreadable has nothing to draw.
+    for name in SLICE3:
+        if want(name) and name != "damaged-unreadable":
+            password = ENCRYPTED[name][1] if name in ENCRYPTED else None
+            pdf = os.path.join(OUT, f"{name}.pdf")
+            intact = intacts.get(name)
+            if intact:
+                pdf = os.path.join(REF, f".{name}.intact.pdf")
+                with open(pdf, "wb") as f:
+                    f.write(intact)
+            references(pdf, name, password)
+            if intact:
+                os.remove(pdf)
     # The UI cases open only the harness's own files (uiharness/tests/
     # cases.rs): byte-identical copies of the ones they use.
     fixtures = os.path.join(ROOT, "uiharness", "fixtures")
-    for name in ("slides", "text", "forms", "links", "annots", "signed"):
+    for name in ("slides", "text", "forms", "links", "annots", "signed", "enc-aes-256", "enc-owner-only"):
         if want(name):
             shutil.copyfile(
                 os.path.join(OUT, f"{name}.pdf"),
