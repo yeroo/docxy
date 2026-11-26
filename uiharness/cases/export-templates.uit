@@ -21,7 +21,7 @@ test a document's File screen has an Export page
 test a workbook's File screen has no Export page
   open copy:../fixtures/basic.xlsx
   call backstage {"action":"open"}
-  call-error backstage-page {"page":"export"} => the Export page is for a document tab
+  call-error backstage-page {"page":"export"} => the Export page is for a document or PDF tab
 
 test a template opens as a new untitled document that never saves over it
   open copy:../fixtures/basic.docx

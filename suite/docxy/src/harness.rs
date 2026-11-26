@@ -2026,6 +2026,18 @@ fn pdf_read(app: &crate::Docxy, args: &Json) -> Result<Done, String> {
             None => Json::Null,
         };
         pairs.push(("export_waiting".into(), waiting));
+        let names = v
+            .exported
+            .iter()
+            .map(|p| {
+                Json::Str(
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        pairs.push(("exported".into(), Json::Arr(names)));
     }
     let mut done = Done::ok(json)?;
     done.retry = (!settled).then(|| std::time::Duration::from_millis(within as u64));

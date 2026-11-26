@@ -436,6 +436,8 @@ pub(crate) struct PdfView {
     /// An export a harness's `save-as` names the file of (#2258): a harness
     /// never opens the Save dialog.
     pub export_waiting: Option<worker::Export>,
+    /// The files the last export wrote (#2258; the harness's `exported`).
+    pub exported: Vec<PathBuf>,
     /// The questions sent so far (the scheduler's tests).
     #[cfg(test)]
     pub sent: Vec<Op>,
@@ -492,6 +494,7 @@ impl PdfView {
             lock: None,
             printers: Vec::new(),
             export_waiting: None,
+            exported: Vec::new(),
             #[cfg(test)]
             sent: Vec::new(),
             meta,
@@ -813,6 +816,7 @@ impl PdfView {
             }
             (Op::ExportTo { .. }, Answer::Exported(e)) => {
                 self.notice = Some(print::exported_status(&e.files, e.dpi_used));
+                self.exported = e.files;
             }
             (op, Answer::Failed(why)) => self.fail(&op, why),
             _ => {}

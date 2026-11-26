@@ -226,8 +226,8 @@ fn page_controls() -> [Control; 2] {
 
 /// Typing a range picks Pages, and typing a percent picks Custom scale, as
 /// in Acrobat's dialog.
-fn react(d: &mut Dialog, i: usize, v: &Value) {
-    let pick = match (d.controls[i].name, v) {
+fn react(d: &mut Dialog, i: usize, _before: &Value) {
+    let pick = match (d.controls[i].name, &d.controls[i].value) {
         ("range", Value::Text(t)) if !t.trim().is_empty() => Some(("pages", 2)),
         ("percent", Value::Text(t)) if !t.trim().is_empty() => Some(("sizing", 3)),
         _ => None,

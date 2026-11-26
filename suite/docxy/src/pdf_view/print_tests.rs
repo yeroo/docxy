@@ -137,9 +137,11 @@ fn facts(count: usize) -> ViewFacts {
 
 fn set(d: &mut Dialog, name: &str, v: Value) {
     let i = d.controls.iter().position(|c| c.name == name).unwrap();
-    d.controls[i].value = v.clone();
+    // As the dialog does: the value set, then the reaction told the one
+    // before.
+    let before = std::mem::replace(&mut d.controls[i].value, v);
     if let Some(r) = d.react {
-        (r.0)(d, i, &v);
+        (r.0)(d, i, &before);
     }
 }
 
@@ -988,6 +990,7 @@ fn the_view_sends_prints_before_pages_and_says_how_they_went() {
         }),
         lost: false,
     });
+    assert_eq!(v.exported.len(), 2);
     let n = v.notice.take().unwrap();
     assert!(
         n.starts_with("Saved 2 pictures in /d") && n.contains("491 dpi"),
