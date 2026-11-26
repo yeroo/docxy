@@ -221,6 +221,19 @@ fn on_linux_the_child_limits_its_memory_and_writes_no_core() {
     assert_eq!(adj.trim(), "1000");
 }
 
+/// The exit code of a child whose output has ended, once it has exited
+/// (at most 10 s); `None` when killed by a signal or still running.
+fn exit_code(child: &mut Child) -> Option<i32> {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        if let Ok(Some(status)) = child.try_wait() {
+            return status.code();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
 /// A small deterministic generator, so a failure names its mutation.
 struct Seeded(u64);
 
@@ -325,8 +338,21 @@ fn no_corpus_file_or_mutation_hangs_or_answers_nonsense() {
                     }
                     // The child died (an abort past its memory limit): its
                     // output ended, or reading it failed. The parent fails
-                    // the page; the next request starts another.
-                    Err(_) => {
+                    // the page; the next request starts another. But not on
+                    // a file as the corpus has it, and never by its watchdog,
+                    // which ends a child that hung (twice its timeout, before
+                    // this wait ends): that is a hang.
+                    Err(e) => {
+                        assert!(
+                            k != 0,
+                            "{what}: {req}: the child died on the file itself: {e}"
+                        );
+                        let code = exit_code(&mut c.child);
+                        assert_ne!(
+                            code,
+                            Some(pdfpages::child::EXIT_WATCHDOG),
+                            "{what}: {req}: hung (its watchdog ended it)"
+                        );
                         outcome.push("died");
                         break;
                     }

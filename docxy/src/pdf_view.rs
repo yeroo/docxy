@@ -582,17 +582,20 @@ impl Viewer {
     }
 
     fn draw_page(&mut self, f: &mut Frame, body: Rect) {
-        let raster = self
-            .want(self.page)
-            .and_then(|want| self.rasters.iter().find(|r| r.0 == want))
-            .map(|(w, r)| (*w, r.clone()));
-        let Some((want, r)) = raster else {
+        // The raster's size only: its bytes are taken when a protocol is
+        // built, never each frame.
+        let raster = self.want(self.page).and_then(|want| {
+            let i = self.rasters.iter().position(|r| r.0 == want)?;
+            let r = &self.rasters[i].1;
+            Some((want, i, r.width, r.height))
+        });
+        let Some((want, i, width, height)) = raster else {
             let wait = format!("Drawing page {}…", self.page + 1);
             f.render_widget(Paragraph::new(Line::from(Span::raw(wait))), body);
             return;
         };
         let (fw, fh) = (u32::from(self.font.0), u32::from(self.font.1));
-        let rows = r.height.div_ceil(fh) as usize;
+        let rows = height.div_ceil(fh) as usize;
         let max = rows.saturating_sub(usize::from(body.height));
         self.scroll = if want.fit == Fit::Width {
             self.scroll.min(max)
@@ -600,11 +603,8 @@ impl Viewer {
             0
         };
         let top = self.scroll as u32 * fh;
-        let crop_h = r
-            .height
-            .saturating_sub(top)
-            .min(u32::from(body.height) * fh);
-        let cols = (r.width.div_ceil(fw) as u16).min(body.width);
+        let crop_h = height.saturating_sub(top).min(u32::from(body.height) * fh);
+        let cols = (width.div_ceil(fw) as u16).min(body.width);
         let rows = (crop_h.div_ceil(fh) as u16).min(body.height).max(1);
         let rect = Rect {
             x: body.x + (body.width - cols) / 2,
@@ -618,10 +618,11 @@ impl Viewer {
             let Some(picker) = self.picker.as_ref() else {
                 return;
             };
-            let Some(img) = image::RgbaImage::from_raw(r.width, r.height, r.rgba) else {
+            let rgba = self.rasters[i].1.rgba.clone();
+            let Some(img) = image::RgbaImage::from_raw(width, height, rgba) else {
                 return;
             };
-            let img = image::DynamicImage::ImageRgba8(img).crop_imm(0, top, r.width, crop_h.max(1));
+            let img = image::DynamicImage::ImageRgba8(img).crop_imm(0, top, width, crop_h.max(1));
             let size = Rect {
                 x: 0,
                 y: 0,
@@ -785,6 +786,13 @@ pub(crate) fn clean_text(text: &str) -> String {
     out
 }
 
+/// The terminal's title for `path`, as the editor names its window
+/// (`docxy - <file>`), cleaned: it goes inside an OSC sequence, which a BEL
+/// or ST in the file's name would end.
+pub(crate) fn window_title(path: &str) -> String {
+    clean_line(&crate::window_title("docxy", path, false))
+}
+
 /// [`clean_text`] on one line: its line breaks are spaces.
 pub(crate) fn clean_line(text: &str) -> String {
     clean_text(text).replace('\n', " ")
@@ -916,7 +924,7 @@ pub(crate) fn run(path: &str) -> std::io::Result<()> {
     let name = file
         .file_name()
         .map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned());
-    let _ = execute!(std::io::stdout(), SetTitle(format!("{name} - docxy")));
+    let _ = execute!(std::io::stdout(), SetTitle(window_title(path)));
     let (source, no_child): (Box<dyn Source>, Option<String>) = match child::find_child() {
         Ok(exe) => (Box::new(Child::new(exe, file.clone())), None),
         Err(why) => (Box::new(TextOnly::new(file.clone())), Some(why)),

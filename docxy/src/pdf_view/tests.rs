@@ -600,6 +600,11 @@ fn fake_child() {
         let line = line.unwrap();
         match mode.as_str() {
             "hang" => std::thread::sleep(Duration::from_secs(600)),
+            // `hang-at:<file>`: say the question came (the file), then hang.
+            m if m.starts_with("hang-at:") => {
+                std::fs::write(&m["hang-at:".len()..], b"asked").unwrap();
+                std::thread::sleep(Duration::from_secs(600));
+            }
             "die" => std::process::exit(9),
             "nonsense" => writeln!(out, "this is no answer").unwrap(),
             _ => {
@@ -724,24 +729,27 @@ fn a_source_that_panics_answers_died_and_the_engine_goes_on() {
 /// its watchdog.
 #[test]
 fn killing_the_engine_ends_a_child_that_hangs() {
-    let child = fake("hang", Duration::from_secs(60));
+    let asked = std::env::temp_dir().join(format!("docxy-pdf-hang-at-{}", std::process::id()));
+    let _ = std::fs::remove_file(&asked);
+    let child = fake(
+        &format!("hang-at:{}", asked.display()),
+        Duration::from_secs(60),
+    );
     let killer = child.killer().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     let engine = Engine::start(Box::new(child), move |req, ans| tx.send((req, ans)).is_ok());
     engine.ask(Req::Info);
-    // Started, and its hello read: the question is with it now.
+    // The child writes `asked` when the question reaches it: from then on
+    // it hangs on it, and the engine thread waits.
     let start = std::time::Instant::now();
-    let pid = loop {
-        if let Some(pid) = killer.pid() {
-            break pid;
-        }
+    while !asked.exists() {
         assert!(
             start.elapsed() < Duration::from_secs(30),
-            "the child never started"
+            "the question never reached the child"
         );
         std::thread::sleep(Duration::from_millis(20));
-    };
-    std::thread::sleep(Duration::from_millis(300));
+    }
+    let pid = killer.pid().expect("the child runs");
     let killed = std::time::Instant::now();
     engine.kill();
     let (_, ans) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -754,6 +762,17 @@ fn killing_the_engine_ends_a_child_that_hangs() {
         "the child {pid} still runs"
     );
     let _ = pid;
+    let _ = std::fs::remove_file(&asked);
+}
+
+/// The title goes inside an OSC sequence: a BEL or an ST in the file's
+/// name would end it early, and what follows would act on the terminal.
+#[test]
+fn the_terminal_title_is_the_editors_cleaned() {
+    assert_eq!(window_title("/a/slides.pdf"), "docxy - slides.pdf");
+    let t = window_title("/a/x\x07\x1b\\]0;pwned\x07.pdf");
+    assert!(!t.chars().any(|c| c.is_control()), "{t:?}");
+    assert!(t.starts_with("docxy - x"), "{t:?}");
 }
 
 #[test]
