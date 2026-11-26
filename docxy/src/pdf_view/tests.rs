@@ -765,12 +765,14 @@ fn killing_the_engine_ends_a_child_that_hangs() {
     let _ = std::fs::remove_file(&asked);
 }
 
-/// The title goes inside an OSC sequence: a BEL or an ST in the file's
-/// name would end it early, and what follows would act on the terminal.
+/// The title goes inside an OSC sequence: a BEL, an ESC or an ST (U+009C)
+/// in the file's name would end it early, and what follows would act on
+/// the terminal.
 #[test]
 fn the_terminal_title_is_the_editors_cleaned() {
     assert_eq!(window_title("/a/slides.pdf"), "docxy - slides.pdf");
-    let t = window_title("/a/x\x07\x1b\\]0;pwned\x07.pdf");
+    // No `\` in the name: on Windows it separates the path (ST is C1's).
+    let t = window_title("/a/x\x07\x1b\u{9c}]0;pwned\x07.pdf");
     assert!(!t.chars().any(|c| c.is_control()), "{t:?}");
     assert!(t.starts_with("docxy - x"), "{t:?}");
 }
