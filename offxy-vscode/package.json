@@ -60,6 +60,16 @@
         "priority": "default"
       },
       {
+        "viewType": "offxy.pdfViewer",
+        "displayName": "Docxy PDF",
+        "selector": [
+          {
+            "filenamePattern": "*.pdf"
+          }
+        ],
+        "priority": "default"
+      },
+      {
         "viewType": "offxy.markdownEditor",
         "displayName": "Docxy Markdown",
         "selector": [
@@ -198,7 +208,7 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run build",
-    "build:wasm": "cargo build -p docxwasm -p gridwasm --target wasm32-unknown-unknown --release && node ./scripts/copy-wasm.mjs",
+    "build:wasm": "cargo build -p docxwasm -p gridwasm --target wasm32-unknown-unknown --release && cargo build --manifest-path ../suite/Cargo.toml -p pdfpages --lib --target wasm32-unknown-unknown --profile wasm --locked && node ./scripts/copy-wasm.mjs",
     "build:mermaid": "node ./scripts/copy-mermaid.mjs",
     "build:ext": "esbuild src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node18",
     "build": "npm run build:wasm && npm run build:mermaid && npm run build:ext",
@@ -212,6 +222,7 @@
     "test:mermaid-live": "node media/mermaid-live.test.mjs",
     "test:mermaid-render": "node media/mermaid-render.test.mjs",
     "test:mermaid-embed": "node media/mermaid-embed.test.mjs",
+    "test:pdf": "node media/pdf.test.mjs",
     "package": "vsce package --no-dependencies"
   },
   "devDependencies": {
